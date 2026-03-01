@@ -1316,8 +1316,6 @@ impl ModelDownloader {
                     ModelVariant::Qwen34BGguf => 2_500_000_000,
                     ModelVariant::Qwen38BGguf => 5_200_000_000,
                     ModelVariant::Qwen314BGguf => 9_200_000_000,
-                    ModelVariant::ParakeetTdt06BV24Bit => 2_656_300_000,
-                    ModelVariant::ParakeetTdt06BV34Bit => 3_160_000_000,
                     ModelVariant::Gemma31BIt => 2_100_000_000,
                     ModelVariant::Gemma34BIt => 2_400_000_000,
                     ModelVariant::Lfm2Audio15B | ModelVariant::Lfm25Audio15B => 2_900_000_000,

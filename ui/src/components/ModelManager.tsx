@@ -429,14 +429,6 @@ const MODEL_DETAILS: Record<
     features: ["English ASR", "Word timestamps", ".nemo checkpoint"],
     size: "4.6 GB",
   },
-  "Parakeet-TDT-0.6B-v2-4bit": {
-    shortName: "Parakeet v2 4-bit",
-    fullName: "Parakeet-TDT 0.6B v2 (MLX 4-bit)",
-    description: "Quantized Parakeet v2 for lower-memory English ASR",
-    features: ["English ASR", "Word timestamps", "4-bit quantized"],
-    size: "2.5 GB",
-    quantization: "4-bit",
-  },
   "Parakeet-TDT-0.6B-v3": {
     shortName: "Parakeet v3",
     fullName: "Parakeet-TDT 0.6B v3",
@@ -444,14 +436,6 @@ const MODEL_DETAILS: Record<
       "Multilingual FastConformer-TDT ASR model distributed as .nemo",
     features: ["Multilingual ASR", "Word timestamps", ".nemo checkpoint"],
     size: "9.3 GB",
-  },
-  "Parakeet-TDT-0.6B-v3-4bit": {
-    shortName: "Parakeet v3 4-bit",
-    fullName: "Parakeet-TDT 0.6B v3 (MLX 4-bit)",
-    description: "Quantized Parakeet v3 for lower-memory multilingual ASR",
-    features: ["Multilingual ASR", "Word timestamps", "4-bit quantized"],
-    size: "2.9 GB",
-    quantization: "4-bit",
   },
   "diar_streaming_sortformer_4spk-v2.1": {
     shortName: "Sortformer 4spk",

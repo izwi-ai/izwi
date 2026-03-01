@@ -396,14 +396,6 @@ export const MODEL_DETAILS: Record<
     capabilities: ["Transcription", "Word timestamps"],
     size: "4.6 GB",
   },
-  "Parakeet-TDT-0.6B-v2-4bit": {
-    shortName: "Parakeet v2 4-bit",
-    fullName: "Parakeet-TDT 0.6B v2 (MLX 4-bit)",
-    description: "Quantized English Parakeet model for lower-memory ASR",
-    category: "asr",
-    capabilities: ["Transcription", "Word timestamps", "4-bit"],
-    size: "2.5 GB",
-  },
   "Parakeet-TDT-0.6B-v3": {
     shortName: "Parakeet v3",
     fullName: "Parakeet-TDT 0.6B v3",
@@ -411,14 +403,6 @@ export const MODEL_DETAILS: Record<
     category: "asr",
     capabilities: ["Transcription", "25 EU languages"],
     size: "9.3 GB",
-  },
-  "Parakeet-TDT-0.6B-v3-4bit": {
-    shortName: "Parakeet v3 4-bit",
-    fullName: "Parakeet-TDT 0.6B v3 (MLX 4-bit)",
-    description: "Quantized multilingual Parakeet model for lower-memory ASR",
-    category: "asr",
-    capabilities: ["Transcription", "Word timestamps", "4-bit"],
-    size: "2.9 GB",
   },
   "diar_streaming_sortformer_4spk-v2.1": {
     shortName: "Sortformer 4spk",

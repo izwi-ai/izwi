@@ -101,9 +101,7 @@ impl ModelVariant {
             Lfm2Audio15B | Lfm25Audio15B | Lfm25Audio15B4Bit => ModelFamily::Lfm2Audio,
             Qwen3Asr06B | Qwen3Asr06B4Bit | Qwen3Asr06B8Bit | Qwen3Asr06BBf16 | Qwen3Asr17B
             | Qwen3Asr17B4Bit | Qwen3Asr17B8Bit | Qwen3Asr17BBf16 => ModelFamily::Qwen3Asr,
-            ParakeetTdt06BV2 | ParakeetTdt06BV3 | ParakeetTdt06BV24Bit | ParakeetTdt06BV34Bit => {
-                ModelFamily::ParakeetAsr
-            }
+            ParakeetTdt06BV2 | ParakeetTdt06BV3 => ModelFamily::ParakeetAsr,
             DiarStreamingSortformer4SpkV21 => ModelFamily::SortformerDiarization,
             Qwen306B | Qwen306B4Bit | Qwen306BGguf | Qwen317B | Qwen317B4Bit | Qwen317BGguf
             | Qwen34BGguf | Qwen38BGguf | Qwen314BGguf => ModelFamily::Qwen3Chat,
@@ -213,14 +211,8 @@ pub fn resolve_asr_model_variant(input: Option<&str>) -> ModelVariant {
             } else if let Some(lfm2_variant) = resolve_lfm2_audio_variant(&normalized) {
                 lfm2_variant
             } else if normalized.contains("parakeet") {
-                if normalized.contains("v3")
-                    && (normalized.contains("4bit") || normalized.contains("int4"))
-                {
-                    ParakeetTdt06BV34Bit
-                } else if normalized.contains("v3") {
+                if normalized.contains("v3") {
                     ParakeetTdt06BV3
-                } else if normalized.contains("4bit") || normalized.contains("int4") {
-                    ParakeetTdt06BV24Bit
                 } else {
                     ParakeetTdt06BV2
                 }
@@ -266,15 +258,8 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
     }
 
     if normalized.contains("parakeet") && normalized.contains("tdt") {
-        let q4 = normalized.contains("4bit") || normalized.contains("int4");
         if normalized.contains("v3") {
-            if q4 {
-                return Some(ParakeetTdt06BV34Bit);
-            }
             return Some(ParakeetTdt06BV3);
-        }
-        if q4 {
-            return Some(ParakeetTdt06BV24Bit);
         }
         return Some(ParakeetTdt06BV2);
     }
@@ -563,7 +548,13 @@ mod tests {
     #[test]
     fn parse_mlx_parakeet_repo() {
         let parsed = parse_model_variant("mlx-community/parakeet-tdt-0.6b-v3").unwrap();
-        assert_eq!(parsed, ModelVariant::ParakeetTdt06BV34Bit);
+        assert_eq!(parsed, ModelVariant::ParakeetTdt06BV3);
+    }
+
+    #[test]
+    fn parse_deprecated_parakeet_4bit_alias_demotes_to_nemo_variant() {
+        let parsed = parse_model_variant("Parakeet-TDT-0.6B-v3-4bit").unwrap();
+        assert_eq!(parsed, ModelVariant::ParakeetTdt06BV3);
     }
 
     #[test]
