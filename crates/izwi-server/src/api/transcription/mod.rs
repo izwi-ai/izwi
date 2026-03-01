@@ -1,6 +1,7 @@
 //! First-party transcription history routes for the desktop UI.
 
 mod handlers;
+mod realtime;
 
 use axum::{extract::DefaultBodyLimit, routing::get, Router};
 
@@ -16,6 +17,7 @@ pub fn router() -> Router<AppState> {
                 .post(handlers::create_record)
                 .layer(DefaultBodyLimit::max(AUDIO_UPLOAD_LIMIT_BYTES)),
         )
+        .merge(realtime::router())
         .route(
             "/transcription/records/:record_id",
             get(handlers::get_record).delete(handlers::delete_record),
