@@ -176,4 +176,23 @@ mod tests {
             .as_deref()
             .is_some_and(|text| text.contains("disabled")));
     }
+
+    #[test]
+    fn required_choice_errors_without_tools() {
+        let err = tool_choice_instruction(&ToolChoice::Required, &[])
+            .expect_err("required without tools must fail");
+        assert!(err.message.contains("required"));
+    }
+
+    #[test]
+    fn function_choice_errors_when_function_is_missing() {
+        let tools = vec![json!({
+            "type": "function",
+            "function": {"name": "get_time"}
+        })];
+
+        let err = tool_choice_instruction(&ToolChoice::Function("get_weather".to_string()), &tools)
+            .expect_err("missing function should fail");
+        assert!(err.message.contains("get_weather"));
+    }
 }
