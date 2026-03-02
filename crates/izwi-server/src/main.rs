@@ -1,6 +1,7 @@
 //! Izwi TTS Server - HTTP API for Qwen3-TTS inference
 
 use clap::Parser;
+use std::time::Duration;
 use tokio::signal;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -148,6 +149,26 @@ async fn shutdown_signal(state: AppState) {
             info!("Received SIGTERM, shutting down...");
         },
     }
+
+    const CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
+    match tokio::time::timeout(CLEANUP_TIMEOUT, state.runtime.unload_all_models()).await {
+        Ok(Ok(unloaded)) => {
+            info!(
+                "Runtime shutdown cleanup completed; unloaded {} model(s)",
+                unloaded
+            );
+        }
+        Ok(Err(err)) => {
+            warn!("Runtime shutdown cleanup failed: {}", err);
+        }
+        Err(_) => {
+            warn!(
+                "Runtime shutdown cleanup timed out after {}s; continuing shutdown",
+                CLEANUP_TIMEOUT.as_secs()
+            );
+        }
+    }
+
     drop(state);
 }
 

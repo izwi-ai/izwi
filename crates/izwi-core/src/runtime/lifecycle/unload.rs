@@ -1,5 +1,6 @@
 use crate::catalog::ModelFamily;
 use crate::error::Result;
+use crate::model::ModelStatus;
 use crate::model::ModelVariant;
 use crate::runtime::service::RuntimeService;
 
@@ -40,5 +41,25 @@ impl RuntimeService {
         }
 
         self.model_manager.unload_model(variant).await
+    }
+
+    /// Unload every model currently resident in memory.
+    pub async fn unload_all_models(&self) -> Result<usize> {
+        let loaded_variants = self
+            .model_manager
+            .list_models()
+            .await
+            .into_iter()
+            .filter(|info| matches!(info.status, ModelStatus::Ready | ModelStatus::Loading))
+            .map(|info| info.variant)
+            .collect::<Vec<_>>();
+
+        let mut unloaded_count = 0usize;
+        for variant in loaded_variants {
+            self.unload_model(variant).await?;
+            unloaded_count += 1;
+        }
+
+        Ok(unloaded_count)
     }
 }

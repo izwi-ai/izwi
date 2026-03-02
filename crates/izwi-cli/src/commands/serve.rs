@@ -4,6 +4,7 @@ use crate::ServeMode;
 use console::style;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 pub struct ServeArgs {
@@ -445,6 +446,18 @@ fn shutdown_child(child: &mut Child, name: &str) -> Result<()> {
         return Ok(());
     }
 
+    request_graceful_termination(child);
+
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
+    const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
+    let start = Instant::now();
+    while start.elapsed() < SHUTDOWN_TIMEOUT {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        thread::sleep(SHUTDOWN_POLL);
+    }
+
     child
         .kill()
         .map_err(|e| CliError::Other(format!("Failed to stop {}: {}", name, e)))?;
@@ -454,6 +467,21 @@ fn shutdown_child(child: &mut Child, name: &str) -> Result<()> {
         .map_err(|e| CliError::Other(format!("Failed while waiting for {}: {}", name, e)))?;
 
     Ok(())
+}
+
+fn request_graceful_termination(child: &Child) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(child.id().to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    #[cfg(not(unix))]
+    let _ = child;
 }
 
 fn platform_binary_name(base: &str) -> String {
