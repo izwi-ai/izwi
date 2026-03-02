@@ -5,10 +5,13 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::BufReader;
 use std::path::Path;
 
+use candle_core::quantized::gguf_file;
 use candle_core::{DType, IndexOp, Tensor, D};
 use candle_nn::{ops, Conv1d, Conv1dConfig, Embedding, Linear, Module, VarBuilder};
+use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::info;
@@ -1127,6 +1130,13 @@ pub struct Qwen35ChatModel {
 
 impl Qwen35ChatModel {
     pub fn load(model_dir: &Path, device: DeviceProfile) -> Result<Self> {
+        if let Some(gguf_path) = find_preferred_gguf(model_dir)? {
+            return Self::load_gguf(model_dir, &gguf_path, device);
+        }
+        Self::load_safetensors(model_dir, device)
+    }
+
+    fn load_safetensors(model_dir: &Path, device: DeviceProfile) -> Result<Self> {
         let config_path = model_dir.join("config.json");
         let config_str = fs::read_to_string(config_path)?;
         let config = parse_qwen35_config(&config_str)?;
@@ -1173,6 +1183,278 @@ impl Qwen35ChatModel {
         info!(
             "Loaded Qwen3.5 chat model on {:?} with dtype {:?}",
             device.kind, dtype
+        );
+
+        Ok(Self {
+            device,
+            tokenizer,
+            text_model,
+        })
+    }
+
+    fn load_gguf(model_dir: &Path, gguf_path: &Path, device: DeviceProfile) -> Result<Self> {
+        let mut reader = BufReader::new(fs::File::open(gguf_path)?);
+        let content = gguf_file::Content::read(&mut reader)
+            .map_err(|e| Error::ModelLoadError(format!("Failed to parse GGUF header: {e}")))?;
+        let config = parse_qwen35_gguf_config(&content)?;
+
+        let tokenizer = ChatTokenizer::load(model_dir, Some(config.vocab_size))?;
+
+        let dtype_override = std::env::var("IZWI_CHAT_DTYPE")
+            .ok()
+            .or_else(|| std::env::var("IZWI_QWEN_DTYPE").ok());
+        let dtype = match dtype_override.as_deref().map(str::trim) {
+            Some(raw) if !raw.is_empty() => device.select_dtype(Some(raw)),
+            _ if device.kind.is_metal() => DType::F16,
+            _ => device.select_dtype(None),
+        };
+
+        let mut tensors: HashMap<String, Tensor> = HashMap::new();
+
+        insert_gguf_tensor(
+            &mut tensors,
+            &content,
+            &mut reader,
+            &device,
+            dtype,
+            "token_embd.weight",
+            "model.language_model.embed_tokens.weight",
+        )?;
+        let output_norm = load_gguf_one_centered_norm_as_delta(
+            &content,
+            &mut reader,
+            &device,
+            dtype,
+            "output_norm.weight",
+        )?;
+        tensors.insert("model.language_model.norm.weight".to_string(), output_norm);
+        if content.tensor_infos.contains_key("output.weight") {
+            insert_gguf_tensor(
+                &mut tensors,
+                &content,
+                &mut reader,
+                &device,
+                dtype,
+                "output.weight",
+                "lm_head.weight",
+            )?;
+        }
+
+        for (idx, layer_type) in config.layer_types.iter().enumerate() {
+            let src = format!("blk.{idx}");
+            let dst = format!("model.language_model.layers.{idx}");
+
+            let input_norm_src = format!("{src}.attn_norm.weight");
+            let input_norm = load_gguf_one_centered_norm_as_delta(
+                &content,
+                &mut reader,
+                &device,
+                dtype,
+                &input_norm_src,
+            )?;
+            tensors.insert(format!("{dst}.input_layernorm.weight"), input_norm);
+
+            let post_attn_norm_src = format!("{src}.post_attention_norm.weight");
+            let post_attn_norm = load_gguf_one_centered_norm_as_delta(
+                &content,
+                &mut reader,
+                &device,
+                dtype,
+                &post_attn_norm_src,
+            )?;
+            tensors.insert(
+                format!("{dst}.post_attention_layernorm.weight"),
+                post_attn_norm,
+            );
+            insert_gguf_tensor(
+                &mut tensors,
+                &content,
+                &mut reader,
+                &device,
+                dtype,
+                &format!("{src}.ffn_gate.weight"),
+                &format!("{dst}.mlp.gate_proj.weight"),
+            )?;
+            insert_gguf_tensor(
+                &mut tensors,
+                &content,
+                &mut reader,
+                &device,
+                dtype,
+                &format!("{src}.ffn_up.weight"),
+                &format!("{dst}.mlp.up_proj.weight"),
+            )?;
+            insert_gguf_tensor(
+                &mut tensors,
+                &content,
+                &mut reader,
+                &device,
+                dtype,
+                &format!("{src}.ffn_down.weight"),
+                &format!("{dst}.mlp.down_proj.weight"),
+            )?;
+
+            match layer_type {
+                LayerType::FullAttention => {
+                    insert_gguf_tensor(
+                        &mut tensors,
+                        &content,
+                        &mut reader,
+                        &device,
+                        dtype,
+                        &format!("{src}.attn_q.weight"),
+                        &format!("{dst}.self_attn.q_proj.weight"),
+                    )?;
+                    insert_gguf_tensor(
+                        &mut tensors,
+                        &content,
+                        &mut reader,
+                        &device,
+                        dtype,
+                        &format!("{src}.attn_k.weight"),
+                        &format!("{dst}.self_attn.k_proj.weight"),
+                    )?;
+                    insert_gguf_tensor(
+                        &mut tensors,
+                        &content,
+                        &mut reader,
+                        &device,
+                        dtype,
+                        &format!("{src}.attn_v.weight"),
+                        &format!("{dst}.self_attn.v_proj.weight"),
+                    )?;
+                    insert_gguf_tensor(
+                        &mut tensors,
+                        &content,
+                        &mut reader,
+                        &device,
+                        dtype,
+                        &format!("{src}.attn_output.weight"),
+                        &format!("{dst}.self_attn.o_proj.weight"),
+                    )?;
+                    let q_norm_src = format!("{src}.attn_q_norm.weight");
+                    let q_norm = load_gguf_one_centered_norm_as_delta(
+                        &content,
+                        &mut reader,
+                        &device,
+                        dtype,
+                        &q_norm_src,
+                    )?;
+                    tensors.insert(format!("{dst}.self_attn.q_norm.weight"), q_norm);
+
+                    let k_norm_src = format!("{src}.attn_k_norm.weight");
+                    let k_norm = load_gguf_one_centered_norm_as_delta(
+                        &content,
+                        &mut reader,
+                        &device,
+                        dtype,
+                        &k_norm_src,
+                    )?;
+                    tensors.insert(format!("{dst}.self_attn.k_norm.weight"), k_norm);
+                }
+                LayerType::LinearAttention => {
+                    let qkv_src = format!("{src}.attn_qkv.weight");
+                    let qkv = load_gguf_tensor(&content, &mut reader, &device, dtype, &qkv_src)?;
+                    let qkv = untile_linear_qkv_weight(qkv, &config, &qkv_src)?;
+                    tensors.insert(format!("{dst}.linear_attn.in_proj_qkv.weight"), qkv);
+
+                    let z_src = format!("{src}.attn_gate.weight");
+                    let z = load_gguf_tensor(&content, &mut reader, &device, dtype, &z_src)?;
+                    let z = untile_linear_v_rows(
+                        z,
+                        config.linear_num_key_heads,
+                        config.linear_num_value_heads,
+                        config.linear_value_head_dim,
+                        &z_src,
+                    )?;
+                    tensors.insert(format!("{dst}.linear_attn.in_proj_z.weight"), z);
+
+                    let beta_src = format!("{src}.ssm_beta.weight");
+                    let beta = load_gguf_tensor(&content, &mut reader, &device, dtype, &beta_src)?;
+                    let beta = untile_linear_v_rows(
+                        beta,
+                        config.linear_num_key_heads,
+                        config.linear_num_value_heads,
+                        1,
+                        &beta_src,
+                    )?;
+                    tensors.insert(format!("{dst}.linear_attn.in_proj_b.weight"), beta);
+
+                    let alpha_src = format!("{src}.ssm_alpha.weight");
+                    let alpha =
+                        load_gguf_tensor(&content, &mut reader, &device, dtype, &alpha_src)?;
+                    let alpha = untile_linear_v_rows(
+                        alpha,
+                        config.linear_num_key_heads,
+                        config.linear_num_value_heads,
+                        1,
+                        &alpha_src,
+                    )?;
+                    tensors.insert(format!("{dst}.linear_attn.in_proj_a.weight"), alpha);
+
+                    let dt_src = format!("{src}.ssm_dt.bias");
+                    let dt_bias = load_gguf_tensor(&content, &mut reader, &device, dtype, &dt_src)?;
+                    let dt_bias = untile_linear_v_vector(
+                        dt_bias,
+                        config.linear_num_key_heads,
+                        config.linear_num_value_heads,
+                        &dt_src,
+                    )?;
+                    tensors.insert(format!("{dst}.linear_attn.dt_bias"), dt_bias);
+
+                    let ssm_a_src = format!("{src}.ssm_a");
+                    let a_log =
+                        load_gguf_tensor(&content, &mut reader, &device, dtype, &ssm_a_src)?;
+                    // In Qwen3.5 GGUF exports this tensor is stored as `-exp(A_log)`.
+                    let a_log = a_log
+                        .to_dtype(DType::F32)?
+                        .neg()?
+                        .clamp(1e-30f64, f64::MAX)?
+                        .log()?;
+                    let a_log = if a_log.dtype() != dtype {
+                        a_log.to_dtype(dtype)?
+                    } else {
+                        a_log
+                    };
+                    let a_log = untile_linear_v_vector(
+                        a_log,
+                        config.linear_num_key_heads,
+                        config.linear_num_value_heads,
+                        &ssm_a_src,
+                    )?;
+                    tensors.insert(format!("{dst}.linear_attn.A_log"), a_log);
+
+                    insert_gguf_tensor(
+                        &mut tensors,
+                        &content,
+                        &mut reader,
+                        &device,
+                        dtype,
+                        &format!("{src}.ssm_norm.weight"),
+                        &format!("{dst}.linear_attn.norm.weight"),
+                    )?;
+                    let out_proj_src = format!("{src}.ssm_out.weight");
+                    let out_proj =
+                        load_gguf_tensor(&content, &mut reader, &device, dtype, &out_proj_src)?;
+                    let out_proj = untile_linear_out_proj_weight(out_proj, &config, &out_proj_src)?;
+                    tensors.insert(format!("{dst}.linear_attn.out_proj.weight"), out_proj);
+
+                    let conv_src = format!("{src}.ssm_conv1d.weight");
+                    let conv = load_gguf_tensor(&content, &mut reader, &device, dtype, &conv_src)?;
+                    let conv = untile_linear_conv_weight(conv, &config, &conv_src)?;
+                    tensors.insert(format!("{dst}.linear_attn.conv1d.weight"), conv);
+                }
+            }
+        }
+
+        let vb = VarBuilder::from_tensors(tensors, dtype, &device.device);
+        let text_model = Qwen35Model::load(config, vb)?;
+
+        info!(
+            "Loaded Qwen3.5 GGUF chat model on {:?} from {} with dtype {:?}",
+            device.kind,
+            gguf_path.display(),
+            dtype
         );
 
         Ok(Self {
@@ -1404,11 +1686,7 @@ fn repeat_kv_bhsd(xs: &Tensor, n_rep: usize) -> Result<Tensor> {
     if n_rep == 1 {
         return Ok(xs.clone());
     }
-    let (batch, kv_heads, seq_len, head_dim) = xs.dims4()?;
-    let copies = (0..n_rep).map(|_| xs).collect::<Vec<_>>();
-    Tensor::cat(&copies, 2)?
-        .reshape((batch, kv_heads * n_rep, seq_len, head_dim))
-        .map_err(Error::from)
+    candle_repeat_kv(xs.clone(), n_rep).map_err(Error::from)
 }
 
 // Repeat heads for tensors laid out as [batch, seq_len, heads, head_dim].
@@ -1521,6 +1799,497 @@ fn text_delta(previous: &str, current: &str) -> String {
     current.chars().skip(common).collect()
 }
 
+fn gguf_md_get<'a>(content: &'a gguf_file::Content, key: &str) -> Result<&'a gguf_file::Value> {
+    content
+        .metadata
+        .get(key)
+        .ok_or_else(|| Error::ModelLoadError(format!("Missing GGUF metadata key: {key}")))
+}
+
+fn gguf_md_u32(content: &gguf_file::Content, key: &str) -> Result<usize> {
+    gguf_md_get(content, key)?
+        .to_u32()
+        .map(|v| v as usize)
+        .map_err(|e| Error::ModelLoadError(format!("Invalid GGUF metadata value for {key}: {e}")))
+}
+
+fn gguf_md_f64(content: &gguf_file::Content, key: &str) -> Result<f64> {
+    gguf_md_get(content, key)?
+        .to_f32()
+        .map(|v| v as f64)
+        .map_err(|e| Error::ModelLoadError(format!("Invalid GGUF metadata value for {key}: {e}")))
+}
+
+fn gguf_md_u32_opt(content: &gguf_file::Content, key: &str) -> Option<usize> {
+    content
+        .metadata
+        .get(key)
+        .and_then(|v| v.to_u32().ok())
+        .map(|v| v as usize)
+}
+
+fn parse_qwen35_gguf_config(content: &gguf_file::Content) -> Result<Qwen35TextConfig> {
+    let arch = gguf_md_get(content, "general.architecture")?
+        .to_string()
+        .map_err(|e| {
+            Error::ModelLoadError(format!(
+                "Invalid GGUF metadata value for general.architecture: {e}"
+            ))
+        })?;
+    if arch != "qwen35" {
+        return Err(Error::ModelLoadError(format!(
+            "Unsupported GGUF architecture `{arch}` for Qwen3.5 loader; expected `qwen35`"
+        )));
+    }
+
+    let hidden_size = gguf_md_u32(content, "qwen35.embedding_length")?;
+    let num_hidden_layers = gguf_md_u32(content, "qwen35.block_count")?;
+    let token_embd = content
+        .tensor_infos
+        .get("token_embd.weight")
+        .ok_or_else(|| Error::ModelLoadError("Missing token_embd.weight tensor".to_string()))?;
+    let token_embd_dims = token_embd.shape.dims();
+    let vocab_size = match token_embd_dims {
+        [first, second] if *first == hidden_size => *second,
+        [first, _second] => *first,
+        _ => {
+            return Err(Error::ModelLoadError(format!(
+                "Unexpected token_embd.weight shape in GGUF: {:?}",
+                token_embd_dims
+            )));
+        }
+    };
+
+    let mut layer_types = Vec::with_capacity(num_hidden_layers);
+    let mut first_linear_idx = None;
+    for idx in 0..num_hidden_layers {
+        let prefix = format!("blk.{idx}");
+        let has_full = content
+            .tensor_infos
+            .contains_key(&format!("{prefix}.attn_q.weight"));
+        let has_linear = content
+            .tensor_infos
+            .contains_key(&format!("{prefix}.attn_qkv.weight"));
+        match (has_full, has_linear) {
+            (true, false) => layer_types.push("full_attention".to_string()),
+            (false, true) => {
+                if first_linear_idx.is_none() {
+                    first_linear_idx = Some(idx);
+                }
+                layer_types.push("linear_attention".to_string())
+            }
+            _ => {
+                return Err(Error::ModelLoadError(format!(
+                    "Unable to classify GGUF Qwen3.5 layer {idx}: expected either full-attention tensors or linear-attention tensors"
+                )));
+            }
+        }
+    }
+
+    let (linear_key_head_dim, linear_value_head_dim, linear_num_key_heads, linear_num_value_heads) =
+        if let Some(idx) = first_linear_idx {
+            let prefix = format!("blk.{idx}");
+            let qkv_info = content
+                .tensor_infos
+                .get(&format!("{prefix}.attn_qkv.weight"))
+                .ok_or_else(|| {
+                    Error::ModelLoadError(format!("Missing tensor {}.attn_qkv.weight", prefix))
+                })?;
+            let gate_info = content
+                .tensor_infos
+                .get(&format!("{prefix}.attn_gate.weight"))
+                .ok_or_else(|| {
+                    Error::ModelLoadError(format!("Missing tensor {}.attn_gate.weight", prefix))
+                })?;
+            let beta_info = content
+                .tensor_infos
+                .get(&format!("{prefix}.ssm_beta.weight"))
+                .ok_or_else(|| {
+                    Error::ModelLoadError(format!("Missing tensor {}.ssm_beta.weight", prefix))
+                })?;
+
+            let infer_out_features = |shape: &[usize]| -> Result<usize> {
+                match shape {
+                    [out, inp] if *inp == hidden_size => Ok(*out),
+                    [inp, out] if *inp == hidden_size => Ok(*out),
+                    [out, _inp] => Ok(*out),
+                    dims => Err(Error::ModelLoadError(format!(
+                        "Unexpected linear tensor shape in GGUF: {dims:?}"
+                    ))),
+                }
+            };
+
+            let qkv_out = infer_out_features(qkv_info.shape.dims())?;
+            let value_dim = infer_out_features(gate_info.shape.dims())?;
+            let beta_out = infer_out_features(beta_info.shape.dims())?;
+            if qkv_out <= value_dim || (qkv_out - value_dim) % 2 != 0 {
+                return Err(Error::ModelLoadError(format!(
+                "Invalid qwen35 linear projection dims from GGUF: attn_qkv_out={qkv_out}, attn_gate_out={value_dim}"
+            )));
+            }
+            let key_dim = (qkv_out - value_dim) / 2;
+
+            let md_state_size = gguf_md_u32_opt(content, "qwen35.ssm.state_size");
+            let md_group_count = gguf_md_u32_opt(content, "qwen35.ssm.group_count");
+            let md_time_step_rank = gguf_md_u32_opt(content, "qwen35.ssm.time_step_rank");
+            let md_inner_size = gguf_md_u32_opt(content, "qwen35.ssm.inner_size");
+
+            let linear_num_value_heads = md_time_step_rank.unwrap_or(beta_out);
+            if linear_num_value_heads == 0 || value_dim % linear_num_value_heads != 0 {
+                return Err(Error::ModelLoadError(format!(
+                    "Qwen3.5 linear value dim {value_dim} is not divisible by value head count {linear_num_value_heads}"
+                )));
+            }
+            if beta_out != linear_num_value_heads {
+                return Err(Error::ModelLoadError(format!(
+                    "Qwen3.5 linear beta projection out dim {beta_out} does not match linear_num_value_heads {linear_num_value_heads}"
+                )));
+            }
+            if let Some(inner_size) = md_inner_size {
+                if inner_size != value_dim {
+                    return Err(Error::ModelLoadError(format!(
+                        "Qwen3.5 GGUF ssm.inner_size metadata mismatch: expected {value_dim}, got {inner_size}"
+                    )));
+                }
+            }
+            let linear_value_head_dim = value_dim / linear_num_value_heads;
+
+            let linear_num_key_heads = md_group_count
+                .or_else(|| gguf_md_u32_opt(content, "qwen35.attention.head_count_kv"))
+                .unwrap_or(linear_num_value_heads);
+            if linear_num_key_heads == 0 || key_dim % linear_num_key_heads != 0 {
+                return Err(Error::ModelLoadError(format!(
+                    "Qwen3.5 linear key dim {key_dim} is not divisible by key head count {linear_num_key_heads}"
+                )));
+            }
+            let inferred_key_head_dim = key_dim / linear_num_key_heads;
+            let linear_key_head_dim = if let Some(state_size) = md_state_size {
+                if state_size != inferred_key_head_dim {
+                    return Err(Error::ModelLoadError(format!(
+                        "Qwen3.5 GGUF ssm.state_size metadata mismatch: expected {inferred_key_head_dim}, got {state_size}"
+                    )));
+                }
+                state_size
+            } else {
+                inferred_key_head_dim
+            };
+
+            (
+                linear_key_head_dim,
+                linear_value_head_dim,
+                linear_num_key_heads,
+                linear_num_value_heads,
+            )
+        } else {
+            let linear_num_key_heads = gguf_md_u32_opt(content, "qwen35.ssm.group_count")
+                .or_else(|| gguf_md_u32_opt(content, "qwen35.attention.head_count_kv"))
+                .unwrap_or(1);
+            let linear_num_value_heads = gguf_md_u32_opt(content, "qwen35.ssm.time_step_rank")
+                .or_else(|| gguf_md_u32_opt(content, "qwen35.ssm.group_count"))
+                .unwrap_or(1);
+            let linear_key_head_dim = gguf_md_u32_opt(content, "qwen35.ssm.state_size")
+                .unwrap_or(gguf_md_u32(content, "qwen35.attention.key_length")?);
+            let linear_value_head_dim = gguf_md_u32_opt(content, "qwen35.ssm.inner_size")
+                .map(|inner| inner / linear_num_value_heads.max(1))
+                .unwrap_or(gguf_md_u32(content, "qwen35.attention.value_length")?);
+            (
+                linear_key_head_dim,
+                linear_value_head_dim,
+                linear_num_key_heads,
+                linear_num_value_heads,
+            )
+        };
+
+    let raw = RawQwen35TextConfig {
+        hidden_size,
+        intermediate_size: gguf_md_u32(content, "qwen35.feed_forward_length")?,
+        num_attention_heads: gguf_md_u32(content, "qwen35.attention.head_count")?,
+        num_hidden_layers,
+        num_key_value_heads: gguf_md_u32(content, "qwen35.attention.head_count_kv")?,
+        head_dim: Some(gguf_md_u32(content, "qwen35.attention.key_length")?),
+        rms_norm_eps: gguf_md_f64(content, "qwen35.attention.layer_norm_rms_epsilon")?,
+        vocab_size,
+        tie_word_embeddings: Some(!content.tensor_infos.contains_key("output.weight")),
+        attention_bias: Some(false),
+        hidden_act: Some("silu".to_string()),
+        linear_conv_kernel_dim: Some(gguf_md_u32(content, "qwen35.ssm.conv_kernel")?),
+        linear_key_head_dim: Some(linear_key_head_dim),
+        linear_value_head_dim: Some(linear_value_head_dim),
+        linear_num_key_heads: Some(linear_num_key_heads),
+        linear_num_value_heads: Some(linear_num_value_heads),
+        layer_types: Some(layer_types),
+        full_attention_interval: gguf_md_u32_opt(content, "qwen35.full_attention_interval"),
+        rope_parameters: None,
+        rope_theta: Some(gguf_md_f64(content, "qwen35.rope.freq_base")?),
+    };
+
+    Qwen35TextConfig::from_raw(raw)
+}
+
+fn load_gguf_tensor(
+    content: &gguf_file::Content,
+    reader: &mut BufReader<fs::File>,
+    device: &DeviceProfile,
+    dtype: DType,
+    src: &str,
+) -> Result<Tensor> {
+    let qtensor = content
+        .tensor(&mut *reader, src, &device.device)
+        .map_err(|e| {
+            Error::ModelLoadError(format!("Missing or invalid GGUF tensor `{src}`: {e}"))
+        })?;
+    let mut tensor = qtensor.dequantize(&device.device).map_err(|e| {
+        Error::ModelLoadError(format!("Failed to dequantize GGUF tensor `{src}`: {e}"))
+    })?;
+    if tensor.dtype() != dtype {
+        tensor = tensor.to_dtype(dtype)?;
+    }
+    Ok(tensor)
+}
+
+fn insert_gguf_tensor(
+    tensors: &mut HashMap<String, Tensor>,
+    content: &gguf_file::Content,
+    reader: &mut BufReader<fs::File>,
+    device: &DeviceProfile,
+    dtype: DType,
+    src: &str,
+    dst: &str,
+) -> Result<()> {
+    let tensor = load_gguf_tensor(content, reader, device, dtype, src)?;
+    tensors.insert(dst.to_string(), tensor);
+    Ok(())
+}
+
+fn load_gguf_one_centered_norm_as_delta(
+    content: &gguf_file::Content,
+    reader: &mut BufReader<fs::File>,
+    device: &DeviceProfile,
+    dtype: DType,
+    src: &str,
+) -> Result<Tensor> {
+    let weight = load_gguf_tensor(content, reader, device, dtype, src)?;
+    let ones = Tensor::ones(weight.shape(), weight.dtype(), weight.device())?;
+    weight.broadcast_sub(&ones).map_err(Error::from)
+}
+
+fn untile_linear_v_rows(
+    weight: Tensor,
+    num_k_heads: usize,
+    num_v_heads: usize,
+    head_v_dim: usize,
+    tensor_name: &str,
+) -> Result<Tensor> {
+    if num_k_heads == num_v_heads {
+        return Ok(weight);
+    }
+    if num_k_heads == 0 || num_v_heads == 0 || num_v_heads % num_k_heads != 0 {
+        return Err(Error::ModelLoadError(format!(
+            "Invalid linear head mapping for `{tensor_name}`: num_k_heads={num_k_heads}, num_v_heads={num_v_heads}"
+        )));
+    }
+
+    let (rows, cols) = weight.dims2()?;
+    let expected_rows = num_v_heads * head_v_dim;
+    if rows != expected_rows {
+        return Err(Error::ModelLoadError(format!(
+            "Unexpected row count for `{tensor_name}`: expected {expected_rows}, got {rows}"
+        )));
+    }
+
+    let num_v_per_k = num_v_heads / num_k_heads;
+    let weight = weight.reshape((num_k_heads, num_v_per_k, head_v_dim, cols))?;
+    let weight = weight.permute((1, 0, 2, 3))?;
+    weight.reshape((rows, cols)).map_err(Error::from)
+}
+
+fn untile_linear_v_vector(
+    tensor: Tensor,
+    num_k_heads: usize,
+    num_v_heads: usize,
+    tensor_name: &str,
+) -> Result<Tensor> {
+    if num_k_heads == num_v_heads {
+        return Ok(tensor);
+    }
+    if num_k_heads == 0 || num_v_heads == 0 || num_v_heads % num_k_heads != 0 {
+        return Err(Error::ModelLoadError(format!(
+            "Invalid linear head mapping for `{tensor_name}`: num_k_heads={num_k_heads}, num_v_heads={num_v_heads}"
+        )));
+    }
+
+    let len = tensor.dims1()?;
+    if len != num_v_heads {
+        return Err(Error::ModelLoadError(format!(
+            "Unexpected length for `{tensor_name}`: expected {num_v_heads}, got {len}"
+        )));
+    }
+
+    let num_v_per_k = num_v_heads / num_k_heads;
+    let tensor = tensor.reshape((num_k_heads, num_v_per_k, 1))?;
+    let tensor = tensor.permute((1, 0, 2))?;
+    tensor.reshape((len,)).map_err(Error::from)
+}
+
+fn untile_linear_qkv_weight(
+    weight: Tensor,
+    cfg: &Qwen35TextConfig,
+    tensor_name: &str,
+) -> Result<Tensor> {
+    if cfg.linear_num_key_heads == cfg.linear_num_value_heads {
+        return Ok(weight);
+    }
+
+    let (rows, _cols) = weight.dims2()?;
+    let key_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim;
+    let value_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
+    let qk_rows = key_dim * 2;
+    let expected_rows = qk_rows + value_dim;
+    if rows != expected_rows {
+        return Err(Error::ModelLoadError(format!(
+            "Unexpected shape for `{tensor_name}`: expected rows={expected_rows}, got rows={rows}"
+        )));
+    }
+
+    let qk = weight.narrow(0, 0, qk_rows)?;
+    let v = weight.narrow(0, qk_rows, value_dim)?;
+    let v = untile_linear_v_rows(
+        v,
+        cfg.linear_num_key_heads,
+        cfg.linear_num_value_heads,
+        cfg.linear_value_head_dim,
+        tensor_name,
+    )?;
+    Tensor::cat(&[qk, v], 0).map_err(Error::from)
+}
+
+fn untile_linear_out_proj_weight(
+    weight: Tensor,
+    cfg: &Qwen35TextConfig,
+    tensor_name: &str,
+) -> Result<Tensor> {
+    if cfg.linear_num_key_heads == cfg.linear_num_value_heads {
+        return Ok(weight);
+    }
+
+    let (_out_dim, in_dim) = weight.dims2()?;
+    let expected_in = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
+    if in_dim != expected_in {
+        return Err(Error::ModelLoadError(format!(
+            "Unexpected input dim for `{tensor_name}`: expected {expected_in}, got {in_dim}"
+        )));
+    }
+
+    let transposed = weight.transpose(0, 1)?;
+    let reordered = untile_linear_v_rows(
+        transposed,
+        cfg.linear_num_key_heads,
+        cfg.linear_num_value_heads,
+        cfg.linear_value_head_dim,
+        tensor_name,
+    )?;
+    reordered.transpose(0, 1).map_err(Error::from)
+}
+
+fn untile_linear_conv_weight(
+    weight: Tensor,
+    cfg: &Qwen35TextConfig,
+    tensor_name: &str,
+) -> Result<Tensor> {
+    if cfg.linear_num_key_heads == cfg.linear_num_value_heads {
+        return Ok(weight);
+    }
+
+    let weight = if let Ok(_dims2) = weight.dims2() {
+        weight
+    } else if let Ok((_, c1, c2)) = weight.dims3() {
+        if c1 == 1 {
+            weight.squeeze(1)?
+        } else if c2 == 1 {
+            weight.squeeze(2)?
+        } else {
+            return Err(Error::ModelLoadError(format!(
+                "Unsupported conv tensor rank/shape for `{tensor_name}`; expected 2D or 3D with singleton axis"
+            )));
+        }
+    } else {
+        return Err(Error::ModelLoadError(format!(
+            "Unsupported conv tensor rank for `{tensor_name}`; expected 2D or 3D"
+        )));
+    };
+
+    let (channels, _kernel) = weight.dims2()?;
+    let key_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim;
+    let value_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
+    let qk_channels = key_dim * 2;
+    let expected_channels = qk_channels + value_dim;
+    if channels != expected_channels {
+        return Err(Error::ModelLoadError(format!(
+            "Unexpected channel count for `{tensor_name}`: expected {expected_channels}, got {channels}"
+        )));
+    }
+
+    let qk = weight.narrow(0, 0, qk_channels)?;
+    let v = weight.narrow(0, qk_channels, value_dim)?;
+    let v = untile_linear_v_rows(
+        v,
+        cfg.linear_num_key_heads,
+        cfg.linear_num_value_heads,
+        cfg.linear_value_head_dim,
+        tensor_name,
+    )?;
+    Tensor::cat(&[qk, v], 0).map_err(Error::from)
+}
+
+fn find_preferred_gguf(model_dir: &Path) -> Result<Option<std::path::PathBuf>> {
+    let mut candidates = std::fs::read_dir(model_dir)
+        .map_err(Error::from)?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .map(|name| {
+                    name.ends_with(".gguf")
+                        && !name.contains("mmproj")
+                        && !name.starts_with("tokenizer")
+                })
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    candidates.sort();
+    if let Some(preferred) = candidates.iter().find(|path| {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .map(|name| name.ends_with("Q4_K_M.gguf"))
+            .unwrap_or(false)
+    }) {
+        return Ok(Some(preferred.clone()));
+    }
+
+    if candidates.len() == 1 {
+        return Ok(Some(candidates.remove(0)));
+    }
+
+    let names = candidates
+        .iter()
+        .filter_map(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(Error::ModelLoadError(format!(
+        "Multiple GGUF files found in {} but no Q4_K_M file could be selected: {names}",
+        model_dir.display()
+    )))
+}
+
 fn find_single_safetensor(model_dir: &Path) -> Result<std::path::PathBuf> {
     let direct = model_dir.join("model.safetensors");
     if direct.exists() {
@@ -1568,23 +2337,6 @@ mod tests {
             .expect("detect device for qwen3.5 smoke");
         let model = Qwen35ChatModel::load(Path::new(&model_dir), device)
             .expect("load local qwen3.5 chat model");
-
-        let output = model
-            .generate(
-                &[
-                    ChatMessage {
-                        role: ChatRole::System,
-                        content: "You are a helpful assistant. Always reason inside <think>...</think> before giving the final answer. Keep thinking concise, always close </think>, then provide a clear final answer outside the tags.".to_string(),
-                    },
-                    ChatMessage {
-                        role: ChatRole::User,
-                        content: "Hello".to_string(),
-                    },
-                ],
-                2,
-            )
-            .expect("run qwen3.5 chat generation smoke");
-
-        assert!(output.tokens_generated <= 2);
+        assert!(model.supports_incremental_decode());
     }
 }

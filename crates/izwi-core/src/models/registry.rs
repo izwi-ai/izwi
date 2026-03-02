@@ -104,11 +104,11 @@ fn load_qwen_chat_model(
 
 fn load_qwen35_chat_model(
     model_dir: &Path,
-    variant: ModelVariant,
+    _variant: ModelVariant,
     device: DeviceProfile,
 ) -> Result<NativeChatModel> {
-    Ok(NativeChatModel::Qwen3(Qwen3ChatModel::load(
-        model_dir, variant, device,
+    Ok(NativeChatModel::Qwen35(Qwen35ChatModel::load(
+        model_dir, device,
     )?))
 }
 
