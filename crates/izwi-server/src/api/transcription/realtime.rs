@@ -34,6 +34,16 @@ const MAX_STREAM_BUFFER_SECS: f32 = 32.0;
 const INFERENCE_WINDOW_SECS: f32 = 14.0;
 const INFERENCE_MIN_INTERVAL_MS: u64 = 350;
 const MIN_INFERENCE_AUDIO_MS: u32 = 180;
+// LocalAgreement-2 style stabilization (as used in whisper_streaming):
+// commit only the common prefix between the previous and current hypothesis.
+// Text-only approximation of whisper_streaming's timestamp boundary filtering:
+// allow a small leading drift while still anchoring overlap to committed tail.
+const COMMITTED_OVERLAP_LOOKAHEAD_WORDS: usize = 6;
+const COMMITTED_OVERLAP_MIN_WORDS: usize = 4;
+const REPETITION_MIN_NGRAM_WORDS: usize = 3;
+const REPETITION_MAX_NGRAM_WORDS: usize = 14;
+const REPETITION_LOOKBACK_WORDS: usize = 48;
+const REPETITION_MAX_GAP_WORDS: usize = 8;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -623,63 +633,276 @@ fn merge_online_transcript(
 ) -> String {
     let candidate = candidate.trim_start();
     if candidate.is_empty() {
-        return format!("{committed}{trailing}");
+        return concat_transcript(committed, trailing);
     }
 
-    if trailing.is_empty() {
+    let mut candidate = collapse_unstable_repetition(candidate)
+        .trim_start()
+        .to_string();
+    candidate =
+        strip_suffix_prefix_overlap_with_lookahead_by_words(committed.as_str(), candidate.as_str());
+    if candidate.is_empty() {
         trailing.clear();
-        trailing.push_str(candidate);
-        return format!("{committed}{trailing}");
+        return concat_transcript(committed, trailing);
     }
 
-    let shared_prefix_len = longest_common_prefix_bytes(trailing, candidate);
-    let commit_len = stable_commit_boundary(&trailing[..shared_prefix_len]);
-
-    if commit_len > 0 {
-        committed.push_str(&trailing[..commit_len]);
-        trailing.clear();
-        trailing.push_str(&candidate[commit_len..]);
-    } else {
-        trailing.clear();
-        trailing.push_str(candidate);
+    let commit_words = common_prefix_word_count(trailing.as_str(), candidate.as_str());
+    if commit_words > 0 {
+        let commit_bytes = byte_after_n_words(candidate.as_str(), commit_words);
+        if commit_bytes > 0 {
+            append_text(committed, &candidate[..commit_bytes]);
+            candidate = drop_n_words(candidate.as_str(), commit_words).to_string();
+        }
     }
 
-    format!("{committed}{trailing}")
+    trailing.clear();
+    trailing.push_str(candidate.as_str());
+
+    concat_transcript(committed, trailing)
 }
 
-fn longest_common_prefix_bytes(a: &str, b: &str) -> usize {
-    let mut a_iter = a.char_indices();
-    let mut b_iter = b.char_indices();
-    let mut end = 0usize;
+fn common_prefix_word_count(a: &str, b: &str) -> usize {
+    let words_a = collect_word_spans(a);
+    let words_b = collect_word_spans(b);
+    let max = words_a.len().min(words_b.len());
+    if max == 0 {
+        return 0;
+    }
 
-    loop {
-        match (a_iter.next(), b_iter.next()) {
-            (Some((a_idx, a_char)), Some((b_idx, b_char))) => {
-                if a_char != b_char || a_idx != b_idx {
-                    break;
+    let mut shared = 0usize;
+    while shared < max && words_a[shared].normalized == words_b[shared].normalized {
+        shared += 1;
+    }
+    shared
+}
+
+fn strip_suffix_prefix_overlap_with_lookahead_by_words(reference: &str, candidate: &str) -> String {
+    let candidate_words = collect_word_spans(candidate);
+    if candidate_words.is_empty() {
+        return String::new();
+    }
+
+    let max_shift = COMMITTED_OVERLAP_LOOKAHEAD_WORDS.min(candidate_words.len().saturating_sub(1));
+    let mut best_match: Option<(usize, usize)> = None;
+
+    for shift in 0..=max_shift {
+        let start = candidate_words[shift].start;
+        let shifted_candidate = candidate.get(start..).unwrap_or("");
+        let overlap_words = longest_suffix_prefix_word_count(reference, shifted_candidate);
+        if overlap_words == 0 {
+            continue;
+        }
+        match best_match {
+            None => best_match = Some((shift, overlap_words)),
+            Some((best_shift, best_overlap)) => {
+                if overlap_words > best_overlap
+                    || (overlap_words == best_overlap && shift < best_shift)
+                {
+                    best_match = Some((shift, overlap_words));
                 }
-                end = a_idx + a_char.len_utf8();
             }
-            _ => break,
         }
     }
 
-    end
+    let Some((shift, overlap_words)) = best_match else {
+        return candidate.trim_start().to_string();
+    };
+
+    let should_strip = if shift == 0 {
+        true
+    } else {
+        overlap_words >= COMMITTED_OVERLAP_MIN_WORDS
+    };
+    if !should_strip {
+        return candidate.trim_start().to_string();
+    }
+
+    let cut_words = shift.saturating_add(overlap_words);
+    if cut_words == 0 {
+        return candidate.trim_start().to_string();
+    }
+    let cut_idx = cut_words
+        .saturating_sub(1)
+        .min(candidate_words.len().saturating_sub(1));
+    let cut_byte = candidate_words[cut_idx].end;
+    candidate
+        .get(cut_byte..)
+        .unwrap_or("")
+        .trim_start()
+        .to_string()
 }
 
-fn stable_commit_boundary(prefix: &str) -> usize {
-    let mut boundary = 0usize;
-    for (idx, ch) in prefix.char_indices() {
-        if ch.is_whitespace()
-            || matches!(
-                ch,
-                '.' | ',' | '!' | '?' | ';' | ':' | '，' | '。' | '！' | '？' | '、'
-            )
+fn concat_transcript(committed: &str, trailing: &str) -> String {
+    if committed.is_empty() {
+        return trailing.to_string();
+    }
+    if trailing.is_empty() {
+        return committed.to_string();
+    }
+    let left_last = committed.chars().last().unwrap_or(' ');
+    let right_first = trailing.chars().next().unwrap_or(' ');
+    if is_word_char(left_last) && is_word_char(right_first) {
+        format!("{committed} {trailing}")
+    } else {
+        format!("{committed}{trailing}")
+    }
+}
+
+fn append_text(base: &mut String, segment: &str) {
+    if segment.is_empty() {
+        return;
+    }
+    if base.is_empty() {
+        base.push_str(segment);
+        return;
+    }
+    let left_last = base.chars().last().unwrap_or(' ');
+    let right_first = segment.chars().next().unwrap_or(' ');
+    if is_word_char(left_last) && is_word_char(right_first) {
+        base.push(' ');
+    }
+    base.push_str(segment);
+}
+
+fn longest_suffix_prefix_word_count(a: &str, b: &str) -> usize {
+    let words_a = collect_word_spans(a);
+    let words_b = collect_word_spans(b);
+    let max = words_a.len().min(words_b.len());
+    if max == 0 {
+        return 0;
+    }
+
+    for len in (1..=max).rev() {
+        let a_start = words_a.len() - len;
+        if words_a[a_start..]
+            .iter()
+            .zip(words_b[..len].iter())
+            .all(|(lhs, rhs)| lhs.normalized == rhs.normalized)
         {
-            boundary = idx + ch.len_utf8();
+            return len;
         }
     }
-    boundary
+
+    0
+}
+
+fn byte_after_n_words(text: &str, n_words: usize) -> usize {
+    if n_words == 0 {
+        return 0;
+    }
+    let words = collect_word_spans(text);
+    if words.is_empty() {
+        return 0;
+    }
+    let index = n_words.saturating_sub(1).min(words.len().saturating_sub(1));
+    words[index].end
+}
+
+fn drop_n_words(text: &str, n_words: usize) -> &str {
+    if n_words == 0 {
+        return text;
+    }
+    let cut = byte_after_n_words(text, n_words);
+    text.get(cut..).unwrap_or("").trim_start()
+}
+
+#[derive(Debug)]
+struct WordSpan {
+    normalized: String,
+    start: usize,
+    end: usize,
+}
+
+fn collect_word_spans(text: &str) -> Vec<WordSpan> {
+    let mut spans = Vec::new();
+    let mut current_start: Option<usize> = None;
+
+    for (idx, ch) in text.char_indices() {
+        if is_word_char(ch) {
+            if current_start.is_none() {
+                current_start = Some(idx);
+            }
+        } else if let Some(start) = current_start.take() {
+            let token = &text[start..idx];
+            let normalized = normalize_word(token);
+            if !normalized.is_empty() {
+                spans.push(WordSpan {
+                    normalized,
+                    start,
+                    end: idx,
+                });
+            }
+        }
+    }
+
+    if let Some(start) = current_start {
+        let token = &text[start..];
+        let normalized = normalize_word(token);
+        if !normalized.is_empty() {
+            spans.push(WordSpan {
+                normalized,
+                start,
+                end: text.len(),
+            });
+        }
+    }
+
+    spans
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '\''
+}
+
+fn collapse_unstable_repetition(text: &str) -> String {
+    let mut collapsed = text.to_string();
+    loop {
+        let words = collect_word_spans(collapsed.as_str());
+        if words.len() < REPETITION_MIN_NGRAM_WORDS * 2 {
+            break;
+        }
+
+        let max_ngram = REPETITION_MAX_NGRAM_WORDS.min(words.len() / 2);
+        let mut remove_range: Option<(usize, usize)> = None;
+
+        'outer: for n in (REPETITION_MIN_NGRAM_WORDS..=max_ngram).rev() {
+            let mut start = 0usize;
+            while start + n <= words.len() {
+                let lookback_start = start.saturating_sub(REPETITION_LOOKBACK_WORDS);
+                let mut prev = lookback_start;
+                while prev + n <= start {
+                    let gap = start.saturating_sub(prev + n);
+                    if gap <= REPETITION_MAX_GAP_WORDS
+                        && words[prev..prev + n]
+                            .iter()
+                            .zip(words[start..start + n].iter())
+                            .all(|(lhs, rhs)| lhs.normalized == rhs.normalized)
+                    {
+                        remove_range = Some((words[start].start, words[start + n - 1].end));
+                        break 'outer;
+                    }
+                    prev += 1;
+                }
+                start += 1;
+            }
+        }
+
+        let Some((remove_start, remove_end)) = remove_range else {
+            break;
+        };
+
+        let left = collapsed[..remove_start].trim_end();
+        let right = collapsed[remove_end..].trim_start();
+        collapsed = concat_transcript(left, right);
+    }
+
+    collapsed
+}
+
+fn normalize_word(token: &str) -> String {
+    token
+        .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '\'')
+        .to_lowercase()
 }
 
 fn parse_binary_message(data: &[u8]) -> Result<BinaryMessageKind, String> {
@@ -727,4 +950,181 @@ fn wav_bytes_from_pcm16_mono(samples_i16: &[i16], sample_rate: u32) -> Result<Ve
 
 fn send_json(tx: &mpsc::UnboundedSender<Message>, value: serde_json::Value) {
     let _ = tx.send(Message::Text(value.to_string().into()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        collapse_unstable_repetition, merge_online_transcript,
+        strip_suffix_prefix_overlap_with_lookahead_by_words,
+    };
+
+    #[test]
+    fn merge_online_transcript_deduplicates_committed_prefix_restarts() {
+        let mut committed = "So I want to ".to_string();
+        let mut trailing = "test uh ".to_string();
+
+        let merged = merge_online_transcript(
+            &mut committed,
+            &mut trailing,
+            "So I want to test uh all time streaming to see if it's working",
+        );
+
+        assert_eq!(
+            merged,
+            "So I want to test uh all time streaming to see if it's working"
+        );
+        assert!(!merged.contains("So I want to So I want to"));
+    }
+
+    #[test]
+    fn merge_online_transcript_allows_tail_extension_after_restart() {
+        let mut committed = "hello ".to_string();
+        let mut trailing = "world".to_string();
+
+        let merged = merge_online_transcript(
+            &mut committed,
+            &mut trailing,
+            "hello world from realtime model",
+        );
+
+        assert_eq!(merged, "hello world from realtime model");
+    }
+
+    #[test]
+    fn merge_online_transcript_handles_punctuation_spacing_variation_without_duplication() {
+        let mut committed = String::new();
+        let mut trailing = "Hi,so we are going to start doing another test.".to_string();
+
+        let merged = merge_online_transcript(
+            &mut committed,
+            &mut trailing,
+            "Hi, so we are going to start doing another test to see if this is going to work.",
+        );
+
+        assert!(merged.ends_with("to see if this is going to work."));
+        assert!(merged.contains("start doing another test"));
+        assert!(!merged.contains("Hi,so we Hi, so we"));
+    }
+
+    #[test]
+    fn collapse_unstable_repetition_removes_recent_duplicate_ngram() {
+        let text = "Iran seemed to be bombing some other countries and I'm not Iran seemed to be bombing some other countries and I'm not sure what's going on";
+        let collapsed = collapse_unstable_repetition(text);
+        assert_eq!(
+            collapsed,
+            "Iran seemed to be bombing some other countries and I'm not sure what's going on"
+        );
+    }
+
+    #[test]
+    fn strip_suffix_prefix_overlap_with_lookahead_ignores_spacing_and_commas() {
+        let stripped = strip_suffix_prefix_overlap_with_lookahead_by_words(
+            "Hi,so we are going",
+            "Hi, so we are going to test",
+        );
+        assert_eq!(stripped, "to test");
+    }
+
+    #[test]
+    fn local_agreement_two_commits_common_prefix() {
+        let mut committed = String::new();
+        let mut trailing = String::new();
+
+        let first = merge_online_transcript(
+            &mut committed,
+            &mut trailing,
+            "Now so today is not a good day for me",
+        );
+        assert_eq!(committed, "");
+        assert_eq!(first, "Now so today is not a good day for me");
+
+        let second = merge_online_transcript(
+            &mut committed,
+            &mut trailing,
+            "Now, so today is not a good day for me. I'm a little bit sad",
+        );
+        assert!(committed.contains("today is not a good day for me"));
+        assert!(second.contains("I'm a little bit sad"));
+        assert!(!second.contains("Now so today is not a good day for me Now"));
+    }
+
+    #[test]
+    fn committed_overlap_lookahead_handles_changed_leading_words() {
+        let stripped = strip_suffix_prefix_overlap_with_lookahead_by_words(
+            "Now, so today is not a good day for me",
+            "Yeah, so today is not a good day for me. I'm a little bit sad",
+        );
+        assert!(!stripped.contains("today is not a good day for me"));
+        assert!(stripped.contains("I'm a little bit sad"));
+    }
+
+    #[test]
+    fn collapse_unstable_repetition_handles_glued_punctuation_restarts() {
+        let text = "Hi,so we Hi, so we are going to start doing another test.Hi,so we are going to start doing another test to see if this is going to work.";
+        let collapsed = collapse_unstable_repetition(text);
+        assert!(
+            !collapsed.contains("Hi,so we Hi, so we"),
+            "collapsed transcript still contains duplicated restart: {collapsed}"
+        );
+        assert!(collapsed.contains("to see if this is going to work"));
+    }
+
+    #[test]
+    fn merge_online_transcript_handles_restart_with_changed_leading_words() {
+        let mut committed = String::new();
+        let mut trailing = String::new();
+
+        let _ = merge_online_transcript(
+            &mut committed,
+            &mut trailing,
+            "Now, so today is nota good day for me",
+        );
+        let second = merge_online_transcript(
+            &mut committed,
+            &mut trailing,
+            "Yeah, so today is not a good day for me. I'm a little bit sad",
+        );
+        assert!(
+            !second.contains("meYeah"),
+            "restart should not be concatenated without boundary spacing"
+        );
+        assert!(
+            !second.contains("Now, so today is nota good day for meYeah"),
+            "stale prefix should remain mutable before local agreement commit"
+        );
+
+        let third = merge_online_transcript(
+            &mut committed,
+            &mut trailing,
+            "Yeah, so today is not a good day for me. I'm a little bit sad Day is not a good day for me. I'm a little bit sad, so things are not good.",
+        );
+        assert!(
+            !third.contains("Day is not a good day for me. I'm a little bit sad"),
+            "restart repetition should be collapsed in unstable tail: {third}"
+        );
+    }
+
+    #[test]
+    fn local_agreement_two_stays_stable_over_longer_partial_sequence() {
+        let mut committed = String::new();
+        let mut trailing = String::new();
+
+        let updates = [
+            "Now, so today is nota good day for me",
+            "Yeah, so today is not a good day for me. I'm a little bit sad",
+            "Yeah, so today is not a good day for me. I'm a little bit sad, so things are not good.",
+            "Yeah, so today is not a good day for me. I'm a little bit sad, so things are not good. I don't know.",
+            "Yeah, so today is not a good day for me. I'm a little bit sad, so things are not good. I don't know. I don't really know what to do now.",
+        ];
+
+        let mut final_text = String::new();
+        for update in updates {
+            final_text = merge_online_transcript(&mut committed, &mut trailing, update);
+        }
+
+        assert!(final_text.contains("I don't really know what to do now"));
+        assert!(!final_text.contains("good day for meYeah"));
+        assert!(!final_text.contains("sad Day is not a good day for me"));
+    }
 }
