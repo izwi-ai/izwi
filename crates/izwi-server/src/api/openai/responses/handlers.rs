@@ -10,6 +10,7 @@ use axum::{
 };
 use tokio::sync::mpsc;
 
+use crate::api::openai::common::{parse_tool_choice, should_inject_tools, tool_choice_instruction};
 use crate::api::request_context::RequestContext;
 use crate::error::ApiError;
 use crate::state::{AppState, StoredResponseInputItem, StoredResponseRecord};
@@ -47,6 +48,7 @@ pub async fn create_response(
         req.input.clone(),
         req.enable_thinking,
         req.tools.clone(),
+        req.tool_choice.clone(),
     )?;
     if messages.is_empty() {
         return Err(ApiError::bad_request(
@@ -420,11 +422,15 @@ fn build_input_messages(
     input: Option<ResponseInput>,
     enable_thinking: Option<bool>,
     tools: Option<Vec<serde_json::Value>>,
+    tool_choice: Option<serde_json::Value>,
 ) -> Result<(Vec<ChatMessage>, Vec<StoredResponseInputItem>), ApiError> {
     let mut messages = Vec::new();
     let mut stored = Vec::new();
 
     if is_qwen35_chat_variant(model_variant) {
+        let tool_choice = parse_tool_choice(tool_choice.as_ref())?;
+        let tools_for_choice = tools.as_deref().unwrap_or(&[]);
+
         if let Some(enable_thinking) = enable_thinking {
             messages.push(ChatMessage {
                 role: ChatRole::System,
@@ -432,13 +438,26 @@ fn build_input_messages(
             });
         }
 
-        if let Some(tools) = tools.filter(|entries| !entries.is_empty()) {
-            if let Some(control) = qwen35_tools_control_content(&tools) {
-                messages.push(ChatMessage {
-                    role: ChatRole::System,
-                    content: control,
-                });
+        if should_inject_tools(&tool_choice) {
+            if let Some(tools) = tools.as_ref().filter(|entries| !entries.is_empty()) {
+                if let Some(control) = qwen35_tools_control_content(tools) {
+                    messages.push(ChatMessage {
+                        role: ChatRole::System,
+                        content: control,
+                    });
+                }
             }
+        }
+
+        if let Some(instruction) = tool_choice_instruction(&tool_choice, tools_for_choice)? {
+            messages.push(ChatMessage {
+                role: ChatRole::System,
+                content: instruction.clone(),
+            });
+            stored.push(StoredResponseInputItem {
+                role: "system".to_string(),
+                content: instruction,
+            });
         }
     }
 
@@ -762,6 +781,7 @@ mod tests {
                     "parameters": {"type": "object"}
                 }
             })]),
+            Some(json!("auto")),
         )
         .expect("build input messages");
 
@@ -893,5 +913,43 @@ mod tests {
         }]);
 
         assert!(response_input_contains_multimodal_content(Some(&input)));
+    }
+
+    #[test]
+    fn tool_choice_none_adds_disable_instruction_without_tools_control() {
+        let (messages, _) = build_input_messages(
+            ModelVariant::Qwen352B,
+            None,
+            Some(ResponseInput::Text("hi".to_string())),
+            None,
+            Some(vec![json!({
+                "type": "function",
+                "function": {"name": "ping", "parameters": {"type": "object"}}
+            })]),
+            Some(json!("none")),
+        )
+        .expect("build input messages");
+
+        assert!(!messages
+            .iter()
+            .any(|msg| izwi_core::parse_qwen35_tools_control_content(&msg.content).is_some()));
+        assert!(messages
+            .iter()
+            .any(|msg| msg.content.contains("Tool use is disabled")));
+    }
+
+    #[test]
+    fn tool_choice_required_rejects_missing_tools() {
+        let err = build_input_messages(
+            ModelVariant::Qwen352B,
+            None,
+            Some(ResponseInput::Text("hi".to_string())),
+            None,
+            None,
+            Some(json!("required")),
+        )
+        .expect_err("required without tools should fail");
+
+        assert!(err.message.contains("required"));
     }
 }

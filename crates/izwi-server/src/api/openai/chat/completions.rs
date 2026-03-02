@@ -12,6 +12,7 @@ use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use crate::api::openai::common::{parse_tool_choice, should_inject_tools, tool_choice_instruction};
 use crate::api::request_context::RequestContext;
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -220,10 +221,14 @@ fn to_core_messages(
     messages: Vec<OpenAiInboundMessage>,
     enable_thinking: Option<bool>,
     tools: Option<Vec<serde_json::Value>>,
+    tool_choice: Option<serde_json::Value>,
 ) -> Result<Vec<ChatMessage>, ApiError> {
     let mut core = Vec::with_capacity(messages.len() + 2);
 
     if is_qwen35_chat_variant(variant) {
+        let tool_choice = parse_tool_choice(tool_choice.as_ref())?;
+        let tools_for_choice = tools.as_deref().unwrap_or(&[]);
+
         if let Some(enable_thinking) = enable_thinking {
             core.push(ChatMessage {
                 role: ChatRole::System,
@@ -231,13 +236,22 @@ fn to_core_messages(
             });
         }
 
-        if let Some(tools) = tools.filter(|entries| !entries.is_empty()) {
-            if let Some(control) = izwi_core::qwen35_tools_control_content(&tools) {
-                core.push(ChatMessage {
-                    role: ChatRole::System,
-                    content: control,
-                });
+        if should_inject_tools(&tool_choice) {
+            if let Some(tools) = tools.as_ref().filter(|entries| !entries.is_empty()) {
+                if let Some(control) = izwi_core::qwen35_tools_control_content(tools) {
+                    core.push(ChatMessage {
+                        role: ChatRole::System,
+                        content: control,
+                    });
+                }
             }
+        }
+
+        if let Some(instruction) = tool_choice_instruction(&tool_choice, tools_for_choice)? {
+            core.push(ChatMessage {
+                role: ChatRole::System,
+                content: instruction,
+            });
         }
     }
 
@@ -591,6 +605,7 @@ pub async fn completions(
         req.messages.clone(),
         req.enable_thinking,
         req.tools.clone(),
+        req.tool_choice.clone(),
     )?;
     if messages.is_empty() {
         return Err(ApiError::bad_request(
@@ -964,5 +979,49 @@ mod tests {
         ];
 
         assert!(request_contains_multimodal_content(&messages));
+    }
+
+    #[test]
+    fn tool_choice_none_skips_tools_control_marker() {
+        let core_messages = to_core_messages(
+            ModelVariant::Qwen352B,
+            vec![OpenAiInboundMessage {
+                role: "user".to_string(),
+                content: Some(OpenAiInboundContent::Text("hello".to_string())),
+                tool_calls: None,
+            }],
+            None,
+            Some(vec![json!({
+                "type": "function",
+                "function": {"name": "ping", "parameters": {"type": "object"}}
+            })]),
+            Some(json!("none")),
+        )
+        .expect("to_core_messages");
+
+        assert!(!core_messages
+            .iter()
+            .any(|msg| izwi_core::parse_qwen35_tools_control_content(&msg.content).is_some()));
+        assert!(core_messages
+            .iter()
+            .any(|msg| msg.content.contains("Tool use is disabled")));
+    }
+
+    #[test]
+    fn tool_choice_required_rejects_missing_tools() {
+        let err = to_core_messages(
+            ModelVariant::Qwen352B,
+            vec![OpenAiInboundMessage {
+                role: "user".to_string(),
+                content: Some(OpenAiInboundContent::Text("hello".to_string())),
+                tool_calls: None,
+            }],
+            None,
+            None,
+            Some(json!("required")),
+        )
+        .expect_err("required without tools should fail");
+
+        assert!(err.message.contains("required"));
     }
 }
