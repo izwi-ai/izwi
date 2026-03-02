@@ -75,12 +75,12 @@ export function TranscriptionPage({
   );
 
   const preferredModelOrder = [
+    "Parakeet-TDT-0.6B-v3",
+    "Parakeet-TDT-0.6B-v2",
     "LFM2.5-Audio-1.5B-4bit",
     "LFM2.5-Audio-1.5B",
     "LFM2-Audio-1.5B",
     "Qwen3-ASR-0.6B",
-    "Parakeet-TDT-0.6B-v3",
-    "Parakeet-TDT-0.6B-v2",
     "Qwen3-ASR-1.7B-4bit",
     "Qwen3-ASR-1.7B",
   ];
@@ -94,11 +94,11 @@ export function TranscriptionPage({
     }
 
     for (const variant of preferredModelOrder) {
-      const readyPreferred = transcriptionModels.find(
-        (model) => model.variant === variant && model.status === "ready",
+      const preferred = transcriptionModels.find(
+        (model) => model.variant === variant,
       );
-      if (readyPreferred) {
-        return readyPreferred.variant;
+      if (preferred) {
+        return preferred.variant;
       }
     }
 
@@ -107,15 +107,6 @@ export function TranscriptionPage({
     );
     if (readyModel) {
       return readyModel.variant;
-    }
-
-    for (const variant of preferredModelOrder) {
-      const preferred = transcriptionModels.find(
-        (model) => model.variant === variant,
-      );
-      if (preferred) {
-        return preferred.variant;
-      }
     }
 
     return transcriptionModels[0]?.variant ?? null;
