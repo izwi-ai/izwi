@@ -82,10 +82,10 @@ fn load_qwen_asr_model(
 fn load_parakeet_asr_model(
     model_dir: &Path,
     variant: ModelVariant,
-    _device: DeviceProfile,
+    device: DeviceProfile,
 ) -> Result<NativeAsrModel> {
     Ok(NativeAsrModel::Parakeet(ParakeetAsrModel::load(
-        model_dir, variant,
+        model_dir, variant, device,
     )?))
 }
 

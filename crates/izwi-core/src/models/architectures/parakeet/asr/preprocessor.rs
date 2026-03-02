@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use candle_core::{DType, Tensor};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
@@ -18,6 +18,7 @@ const NORMALIZE_EPS: f32 = 1e-5;
 
 #[derive(Debug, Clone)]
 pub struct ParakeetPreprocessor {
+    device: Device,
     _window: Vec<f32>,       // [win_length]
     padded_window: Vec<f32>, // [n_fft]
     fb: Vec<f32>,            // [n_mels * (n_fft/2+1)]
@@ -27,6 +28,7 @@ pub struct ParakeetPreprocessor {
 
 impl ParakeetPreprocessor {
     pub fn load(vb: &VarBuilder, model_dir: &Path) -> Result<Self> {
+        let device = vb.device().clone();
         let preproc_vb = vb.pp("preprocessor.featurizer");
 
         let window = match preproc_vb.get_unchecked_dtype("window", DType::F32) {
@@ -94,6 +96,7 @@ impl ParakeetPreprocessor {
         padded_window[offset..offset + WIN_LENGTH].copy_from_slice(&window);
 
         Ok(Self {
+            device,
             _window: window,
             padded_window,
             fb,
@@ -180,11 +183,7 @@ impl ParakeetPreprocessor {
             }
         }
 
-        let features = Tensor::from_vec(
-            mel,
-            (1, self.n_mels, frame_count),
-            &candle_core::Device::Cpu,
-        )?;
+        let features = Tensor::from_vec(mel, (1, self.n_mels, frame_count), &self.device)?;
 
         Ok((features, valid_frames.min(frame_count)))
     }

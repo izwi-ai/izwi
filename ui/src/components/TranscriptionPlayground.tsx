@@ -97,10 +97,15 @@ const LANGUAGE_OPTIONS = [
   "Macedonian",
 ];
 
-const LIVE_MIC_TIMESLICE_MS = 1200;
+const TRANSCRIPTION_WS_BIN_MAGIC = "ITRW";
+const TRANSCRIPTION_WS_BIN_VERSION = 1;
+const TRANSCRIPTION_WS_BIN_KIND_CLIENT_PCM16 = 1;
+const TRANSCRIPTION_WS_BIN_CLIENT_HEADER_LEN = 16;
+const LIVE_MIC_PCM_FRAME_SIZE = 2048;
 
 type TranscriptionRealtimeServerEvent =
   | { type: "session_ready"; protocol?: string }
+  | { type: "session_started" }
   | {
       type: "transcript_partial";
       sequence: number;
@@ -131,15 +136,38 @@ function isTranscriptionRealtimeServerEvent(
   );
 }
 
-async function blobToBase64Payload(blob: Blob): Promise<string> {
-  const bytes = new Uint8Array(await blob.arrayBuffer());
-  const chunkSize = 0x8000;
-  let binary = "";
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    const chunk = bytes.subarray(i, i + chunkSize);
-    binary += String.fromCharCode(...chunk);
+function encodeFloat32ToPcm16Bytes(samples: Float32Array): Uint8Array {
+  const out = new Uint8Array(samples.length * 2);
+  const view = new DataView(out.buffer);
+  for (let i = 0; i < samples.length; i += 1) {
+    const clamped = Math.max(-1, Math.min(1, samples[i]));
+    const int16 = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+    view.setInt16(i * 2, int16, true);
   }
-  return btoa(binary);
+  return out;
+}
+
+function encodeTranscriptionRealtimePcm16Frame(
+  pcm16Bytes: Uint8Array,
+  sampleRate: number,
+  frameSeq: number,
+): Uint8Array {
+  const frame = new Uint8Array(
+    TRANSCRIPTION_WS_BIN_CLIENT_HEADER_LEN + pcm16Bytes.length,
+  );
+  frame[0] = TRANSCRIPTION_WS_BIN_MAGIC.charCodeAt(0);
+  frame[1] = TRANSCRIPTION_WS_BIN_MAGIC.charCodeAt(1);
+  frame[2] = TRANSCRIPTION_WS_BIN_MAGIC.charCodeAt(2);
+  frame[3] = TRANSCRIPTION_WS_BIN_MAGIC.charCodeAt(3);
+  frame[4] = TRANSCRIPTION_WS_BIN_VERSION;
+  frame[5] = TRANSCRIPTION_WS_BIN_KIND_CLIENT_PCM16;
+  frame[6] = 0;
+  frame[7] = 0;
+  const view = new DataView(frame.buffer);
+  view.setUint32(8, sampleRate >>> 0, true);
+  view.setUint32(12, frameSeq >>> 0, true);
+  frame.set(pcm16Bytes, TRANSCRIPTION_WS_BIN_CLIENT_HEADER_LEN);
+  return frame;
 }
 
 function encodeWavPcm16(samples: Float32Array, sampleRate: number): Blob {
@@ -367,13 +395,11 @@ export function TranscriptionPlayground({
   const liveMicWsRef = useRef<WebSocket | null>(null);
   const liveMicWsReadyRef = useRef(false);
   const liveMicSessionRef = useRef(0);
-  const liveMicRequestSeqRef = useRef(0);
-  const liveMicStreamInFlightRef = useRef(false);
-  const liveMicPendingSnapshotRef = useRef<{
-    audioBlob: Blob;
-    sessionId: number;
-    mimeType: string;
-  } | null>(null);
+  const liveMicInputFrameSeqRef = useRef(0);
+  const liveMicAudioContextRef = useRef<AudioContext | null>(null);
+  const liveMicAudioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const liveMicProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const liveMicProcessorSinkRef = useRef<GainNode | null>(null);
   const modelMenuRef = useRef<HTMLDivElement | null>(null);
   const historyAudioRef = useRef<HTMLAudioElement | null>(null);
 
@@ -609,11 +635,51 @@ export function TranscriptionPlayground({
     setHistoryIsPlaying(false);
   }, [isHistoryModalOpen]);
 
+  const stopLiveMicAudioPipeline = useCallback(() => {
+    const processor = liveMicProcessorRef.current;
+    liveMicProcessorRef.current = null;
+    if (processor) {
+      processor.onaudioprocess = null;
+      try {
+        processor.disconnect();
+      } catch {
+        // Best effort cleanup.
+      }
+    }
+
+    const source = liveMicAudioSourceRef.current;
+    liveMicAudioSourceRef.current = null;
+    if (source) {
+      try {
+        source.disconnect();
+      } catch {
+        // Best effort cleanup.
+      }
+    }
+
+    const sink = liveMicProcessorSinkRef.current;
+    liveMicProcessorSinkRef.current = null;
+    if (sink) {
+      try {
+        sink.disconnect();
+      } catch {
+        // Best effort cleanup.
+      }
+    }
+
+    const context = liveMicAudioContextRef.current;
+    liveMicAudioContextRef.current = null;
+    if (context) {
+      void context.close().catch(() => {});
+    }
+
+    liveMicInputFrameSeqRef.current = 0;
+  }, []);
+
   const abortLiveMicStream = useCallback(() => {
-    liveMicPendingSnapshotRef.current = null;
-    liveMicStreamInFlightRef.current = false;
+    stopLiveMicAudioPipeline();
     liveMicWsReadyRef.current = false;
-    liveMicRequestSeqRef.current = 0;
+    liveMicInputFrameSeqRef.current = 0;
     const ws = liveMicWsRef.current;
     liveMicWsRef.current = null;
     if (
@@ -627,73 +693,7 @@ export function TranscriptionPlayground({
         // Best effort cleanup.
       }
     }
-  }, []);
-
-  const streamLiveRecordingSnapshot = useCallback(
-    async (audioBlob: Blob, sessionId: number, mimeType: string) => {
-      if (!selectedModel || audioBlob.size === 0) {
-        return;
-      }
-
-      if (liveMicSessionRef.current !== sessionId) {
-        return;
-      }
-
-      if (liveMicStreamInFlightRef.current) {
-        liveMicPendingSnapshotRef.current = { audioBlob, sessionId, mimeType };
-        return;
-      }
-
-      const ws = liveMicWsRef.current;
-      if (
-        !ws ||
-        ws.readyState !== WebSocket.OPEN ||
-        !liveMicWsReadyRef.current
-      ) {
-        liveMicPendingSnapshotRef.current = { audioBlob, sessionId, mimeType };
-        return;
-      }
-
-      const requestSeq = liveMicRequestSeqRef.current + 1;
-      liveMicRequestSeqRef.current = requestSeq;
-      liveMicStreamInFlightRef.current = true;
-
-      let audioBase64 = "";
-      try {
-        const wavSnapshot = await transcodeToWav(audioBlob, 16000);
-        audioBase64 = await blobToBase64Payload(wavSnapshot);
-      } catch (err) {
-        liveMicStreamInFlightRef.current = false;
-        setError(
-          err instanceof Error
-            ? err.message
-            : "Failed to encode live recording snapshot.",
-        );
-        return;
-      }
-
-      if (liveMicSessionRef.current !== sessionId) {
-        liveMicStreamInFlightRef.current = false;
-        return;
-      }
-
-      try {
-        ws.send(
-          JSON.stringify({
-            type: "audio_snapshot",
-            sequence: requestSeq,
-            audio_base64: audioBase64,
-            audio_mime_type: "audio/wav",
-            audio_filename: "live-mic.wav",
-          }),
-        );
-      } catch {
-        liveMicStreamInFlightRef.current = false;
-        setError("Failed to send live recording snapshot.");
-      }
-    },
-    [selectedModel],
-  );
+  }, [stopLiveMicAudioPipeline]);
 
   const processAudio = useCallback(
     async (audioBlob: Blob, options: ProcessAudioOptions = {}) => {
@@ -813,8 +813,10 @@ export function TranscriptionPlayground({
       return;
     }
 
+    let stream: MediaStream | null = null;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const liveStream = stream;
       let mediaRecorder: MediaRecorder | null = null;
       const mimeCandidates = [
         "audio/webm;codecs=opus",
@@ -834,13 +836,14 @@ export function TranscriptionPlayground({
       audioChunksRef.current = [];
       const recordingSession = liveMicSessionRef.current + 1;
       liveMicSessionRef.current = recordingSession;
-      liveMicRequestSeqRef.current = 0;
       abortLiveMicStream();
       liveMicSessionRef.current = recordingSession;
+      liveMicInputFrameSeqRef.current = 0;
 
       const ws = new WebSocket(
         buildTranscriptionRealtimeWebSocketUrl(api.baseUrl),
       );
+      ws.binaryType = "arraybuffer";
       liveMicWsRef.current = ws;
       liveMicWsReadyRef.current = false;
 
@@ -858,10 +861,6 @@ export function TranscriptionPlayground({
             type: "session_start",
             model_id: selectedModel || undefined,
             language: selectedLanguage,
-            audio_mime_type: mediaRecorder?.mimeType || "audio/webm",
-            audio_filename: `live-mic.${
-              mediaRecorder?.mimeType.includes("mp4") ? "mp4" : "webm"
-            }`,
           }),
         );
       };
@@ -870,9 +869,12 @@ export function TranscriptionPlayground({
         if (liveMicSessionRef.current !== recordingSession) {
           return;
         }
+        if (typeof messageEvent.data !== "string") {
+          return;
+        }
         let parsed: unknown;
         try {
-          parsed = JSON.parse(String(messageEvent.data ?? ""));
+          parsed = JSON.parse(messageEvent.data);
         } catch {
           return;
         }
@@ -883,32 +885,14 @@ export function TranscriptionPlayground({
         switch (parsed.type) {
           case "session_ready":
             liveMicWsReadyRef.current = true;
-            if (liveMicPendingSnapshotRef.current) {
-              const pending = liveMicPendingSnapshotRef.current;
-              liveMicPendingSnapshotRef.current = null;
-              void streamLiveRecordingSnapshot(
-                pending.audioBlob,
-                pending.sessionId,
-                pending.mimeType,
-              );
-            }
+            break;
+          case "session_started":
             break;
           case "transcript_partial":
-            liveMicStreamInFlightRef.current = false;
             setTranscription(parsed.text || "");
             setDetectedLanguage(parsed.language || null);
-            if (liveMicPendingSnapshotRef.current) {
-              const pending = liveMicPendingSnapshotRef.current;
-              liveMicPendingSnapshotRef.current = null;
-              void streamLiveRecordingSnapshot(
-                pending.audioBlob,
-                pending.sessionId,
-                pending.mimeType,
-              );
-            }
             break;
           case "error":
-            liveMicStreamInFlightRef.current = false;
             setError(parsed.message || "Realtime transcription error");
             break;
           case "session_done":
@@ -922,7 +906,6 @@ export function TranscriptionPlayground({
           liveMicWsRef.current = null;
         }
         liveMicWsReadyRef.current = false;
-        liveMicStreamInFlightRef.current = false;
       };
 
       ws.onerror = () => {
@@ -942,17 +925,77 @@ export function TranscriptionPlayground({
       setProcessingStats(null);
       setIsStreaming(true);
 
+      const audioContext = new AudioContext();
+      await audioContext.resume();
+      liveMicAudioContextRef.current = audioContext;
+
+      const source = audioContext.createMediaStreamSource(liveStream);
+      liveMicAudioSourceRef.current = source;
+
+      const processor = audioContext.createScriptProcessor(
+        LIVE_MIC_PCM_FRAME_SIZE,
+        1,
+        1,
+      );
+      liveMicProcessorRef.current = processor;
+
+      const sink = audioContext.createGain();
+      sink.gain.value = 0;
+      liveMicProcessorSinkRef.current = sink;
+
+      processor.onaudioprocess = (event) => {
+        if (liveMicSessionRef.current !== recordingSession) {
+          return;
+        }
+        const socket = liveMicWsRef.current;
+        if (
+          !socket ||
+          socket.readyState !== WebSocket.OPEN ||
+          !liveMicWsReadyRef.current
+        ) {
+          return;
+        }
+
+        const inputBuffer = event.inputBuffer;
+        const channelCount = inputBuffer.numberOfChannels;
+        const frameCount = inputBuffer.length;
+        if (frameCount <= 0 || channelCount <= 0) {
+          return;
+        }
+
+        const mono = new Float32Array(frameCount);
+        for (let channelIndex = 0; channelIndex < channelCount; channelIndex += 1) {
+          const channel = inputBuffer.getChannelData(channelIndex);
+          for (let sampleIndex = 0; sampleIndex < frameCount; sampleIndex += 1) {
+            mono[sampleIndex] +=
+              (channel[sampleIndex] ?? 0) / channelCount;
+          }
+        }
+
+        const pcm16 = encodeFloat32ToPcm16Bytes(mono);
+        const frameSeq = (liveMicInputFrameSeqRef.current + 1) >>> 0;
+        liveMicInputFrameSeqRef.current = frameSeq;
+
+        try {
+          socket.send(
+            encodeTranscriptionRealtimePcm16Frame(
+              pcm16,
+              Math.round(inputBuffer.sampleRate),
+              frameSeq,
+            ),
+          );
+        } catch {
+          // Best effort send while websocket is open.
+        }
+      };
+
+      source.connect(processor);
+      processor.connect(sink);
+      sink.connect(audioContext.destination);
+
       mediaRecorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
           audioChunksRef.current.push(event.data);
-          const snapshot = new Blob(audioChunksRef.current, {
-            type: mediaRecorder?.mimeType || "audio/webm",
-          });
-          void streamLiveRecordingSnapshot(
-            snapshot,
-            recordingSession,
-            mediaRecorder?.mimeType || "audio/webm",
-          );
         }
       };
 
@@ -963,14 +1006,18 @@ export function TranscriptionPlayground({
         const audioBlob = new Blob(audioChunksRef.current, {
           type: mediaRecorder?.mimeType || "audio/webm",
         });
-        stream.getTracks().forEach((track) => track.stop());
+        liveStream.getTracks().forEach((track) => track.stop());
         await processAudio(audioBlob, { preserveTranscript: true });
       };
 
-      mediaRecorder.start(LIVE_MIC_TIMESLICE_MS);
+      mediaRecorder.start(1000);
       setIsRecording(true);
       setError(null);
     } catch {
+      if (stream) {
+        stream.getTracks().forEach((track) => track.stop());
+      }
+      abortLiveMicStream();
       setError("Could not access microphone. Please grant permission.");
     }
   }, [
@@ -979,12 +1026,19 @@ export function TranscriptionPlayground({
     requireReadyModel,
     selectedLanguage,
     selectedModel,
-    streamLiveRecordingSnapshot,
   ]);
 
   const stopRecording = useCallback(() => {
     if (mediaRecorderRef.current && isRecording) {
       liveMicSessionRef.current = 0;
+      const ws = liveMicWsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({ type: "session_stop" }));
+        } catch {
+          // Best effort.
+        }
+      }
       abortLiveMicStream();
       setIsStreaming(false);
       mediaRecorderRef.current.stop();

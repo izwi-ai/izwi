@@ -13,6 +13,7 @@ use candle_nn::{
 
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
+use crate::models::shared::device::DeviceProfile;
 use crate::models::shared::weights::mlx;
 use crate::tokenizer::Tokenizer;
 
@@ -62,7 +63,11 @@ impl ParakeetDecoder {
 }
 
 impl ParakeetAsrModel {
-    pub fn load(model_dir: &Path, variant: ModelVariant) -> Result<Self> {
+    pub fn load(
+        model_dir: &Path,
+        variant: ModelVariant,
+        device_profile: DeviceProfile,
+    ) -> Result<Self> {
         if !variant.is_parakeet() {
             return Err(Error::InvalidInput(format!(
                 "Variant {} is not a Parakeet model",
@@ -70,7 +75,7 @@ impl ParakeetAsrModel {
             )));
         }
 
-        let device = select_device_for_parakeet();
+        let device = select_device_for_parakeet(&device_profile);
         let (artifacts, decoder, vb) = if variant.is_parakeet_nemo() {
             let artifacts = ensure_parakeet_artifacts(model_dir, variant)?;
             let tokenizer_vocab = decode::load_tokenizer_vocab(&artifacts.tokenizer_vocab_path)?;
@@ -204,10 +209,8 @@ fn load_mlx_decoder(model_dir: &Path) -> Result<ParakeetDecoder> {
     )))
 }
 
-fn select_device_for_parakeet() -> Device {
-    // Keep CPU default for parity across hosts and to reduce OOM risk for large
-    // F32 checkpoints.
-    Device::Cpu
+fn select_device_for_parakeet(device_profile: &DeviceProfile) -> Device {
+    device_profile.device.clone()
 }
 
 struct ParakeetNetwork {
