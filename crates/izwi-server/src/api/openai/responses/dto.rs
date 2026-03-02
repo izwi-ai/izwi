@@ -22,6 +22,12 @@ pub struct ResponsesCreateRequest {
     pub top_p: Option<f32>,
     #[serde(default)]
     pub store: Option<bool>,
+    #[serde(default)]
+    pub tools: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -36,7 +42,10 @@ pub enum ResponseInput {
 pub struct ResponseInputItem {
     #[serde(default)]
     pub role: Option<String>,
-    pub content: ResponseInputContent,
+    #[serde(default)]
+    pub content: Option<ResponseInputContent>,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -54,6 +63,16 @@ pub struct ResponseInputContentPart {
     pub text: Option<String>,
     #[serde(default)]
     pub input_text: Option<String>,
+    #[serde(default)]
+    pub image_url: Option<serde_json::Value>,
+    #[serde(default)]
+    pub input_image: Option<serde_json::Value>,
+    #[serde(default)]
+    pub image: Option<serde_json::Value>,
+    #[serde(default)]
+    pub video: Option<serde_json::Value>,
+    #[serde(default)]
+    pub input_video: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]

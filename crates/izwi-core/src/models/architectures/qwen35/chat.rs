@@ -18,7 +18,10 @@ use tracing::info;
 
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::core::{build_rope_cache, causal_mask};
-use crate::models::shared::chat::{parse_qwen35_thinking_control_content, ChatMessage, ChatRole};
+use crate::models::shared::chat::{
+    parse_qwen35_thinking_control_content, parse_qwen35_tools_control_content, ChatMessage,
+    ChatRole,
+};
 use crate::models::shared::device::DeviceProfile;
 use crate::models::shared::weights::mlx;
 use crate::tokenizer::Tokenizer;
@@ -1593,6 +1596,7 @@ fn build_qwen35_prompt_ids(
     }
 
     let mut enable_thinking = None;
+    let mut tools: Option<Vec<Value>> = None;
     let mut prompt_messages = Vec::with_capacity(messages.len());
     for message in messages {
         if matches!(message.role, ChatRole::System) {
@@ -1600,11 +1604,37 @@ fn build_qwen35_prompt_ids(
                 enable_thinking = Some(control);
                 continue;
             }
+            if let Some(control) = parse_qwen35_tools_control_content(&message.content) {
+                if !control.is_empty() {
+                    tools = Some(control);
+                }
+                continue;
+            }
         }
         prompt_messages.push(message.clone());
     }
 
-    if !matches!(
+    let mut ids = Vec::new();
+    let mut consumed_first_system = false;
+    if let Some(tools) = tools.as_ref().filter(|entries| !entries.is_empty()) {
+        let first_system = prompt_messages.first().and_then(|message| {
+            if matches!(message.role, ChatRole::System) {
+                consumed_first_system = true;
+                Some(message.content.trim().to_string())
+            } else {
+                None
+            }
+        });
+
+        let tools_system_content = qwen35_tools_system_content(tools, first_system.as_deref());
+        if !tools_system_content.trim().is_empty() {
+            ids.push(tokenizer.specials.im_start);
+            ids.extend(tokenizer.encode_text("system\n")?);
+            ids.extend(tokenizer.encode_text(&tools_system_content)?);
+            ids.push(tokenizer.specials.im_end);
+            ids.extend(tokenizer.encode_text("\n")?);
+        }
+    } else if !matches!(
         prompt_messages.first().map(|m| &m.role),
         Some(ChatRole::System)
     ) {
@@ -1617,8 +1647,8 @@ fn build_qwen35_prompt_ids(
         );
     }
 
-    let mut ids = Vec::new();
-    for message in &prompt_messages {
+    let iter_start = if consumed_first_system { 1 } else { 0 };
+    for message in prompt_messages.iter().skip(iter_start) {
         let content = if matches!(message.role, ChatRole::Assistant) {
             strip_think_blocks(message.content.trim())
         } else {
@@ -1645,6 +1675,30 @@ fn build_qwen35_prompt_ids(
     }
 
     Ok(ids)
+}
+
+fn qwen35_tools_system_content(tools: &[Value], first_system_content: Option<&str>) -> String {
+    let mut out = String::new();
+    out.push_str("# Tools\n\nYou have access to the following functions:\n\n<tools>");
+    for tool in tools {
+        out.push('\n');
+        let tool_json = serde_json::to_string(tool).unwrap_or_else(|_| "{}".to_string());
+        out.push_str(&tool_json);
+    }
+    out.push_str("\n</tools>");
+    out.push_str(
+        "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>",
+    );
+
+    if let Some(content) = first_system_content
+        .map(str::trim)
+        .filter(|content| !content.is_empty())
+    {
+        out.push_str("\n\n");
+        out.push_str(content);
+    }
+
+    out
 }
 
 fn load_depthwise_conv_weight(
@@ -2346,6 +2400,28 @@ mod tests {
     use super::*;
     use crate::models::shared::chat::qwen35_thinking_control_content;
     use crate::models::shared::device::DeviceSelector;
+    use serde_json::json;
+
+    #[test]
+    fn qwen35_tools_system_content_includes_schema_and_instructions() {
+        let rendered = qwen35_tools_system_content(
+            &[json!({
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {"type": "object"}
+                }
+            })],
+            Some("Use tools when needed."),
+        );
+
+        assert!(rendered.contains("# Tools"));
+        assert!(rendered.contains("<tools>"));
+        assert!(rendered.contains("\"get_weather\""));
+        assert!(rendered.contains("<tool_call>"));
+        assert!(rendered.contains("<IMPORTANT>"));
+        assert!(rendered.contains("Use tools when needed."));
+    }
 
     #[test]
     fn qwen35_local_load_smoke_if_env_set() {
