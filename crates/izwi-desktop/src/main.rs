@@ -6,7 +6,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use url::Url;
 
 #[derive(Debug, Parser)]
@@ -98,7 +98,18 @@ fn main() -> Result<()> {
         .build(tauri::generate_context!())
         .map_err(|e| anyhow::anyhow!("failed to build desktop app: {}", e))?;
 
-    let exit_code = app.run_return(|_, _| {});
+    let exit_code = app.run_return(|app_handle, event| {
+        if let RunEvent::WindowEvent { label, event, .. } = event {
+            if label == "main" {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    // Standard desktop behavior for this app: closing the primary
+                    // window exits the process so managed server teardown always runs.
+                    api.prevent_close();
+                    app_handle.exit(0);
+                }
+            }
+        }
+    });
 
     if let Ok(mut child_slot) = managed_server.lock() {
         if let Some(mut child) = child_slot.take() {
@@ -330,8 +341,41 @@ fn platform_binary_name(name: &str) -> String {
 }
 
 fn shutdown_child(child: &mut Child) {
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
+    const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
+
+    if child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+
+    request_graceful_termination(child);
+
+    let start = Instant::now();
+    while start.elapsed() < SHUTDOWN_TIMEOUT {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => thread::sleep(SHUTDOWN_POLL),
+            Err(_) => break,
+        }
+    }
+
     let _ = child.kill();
     let _ = child.wait();
+}
+
+fn request_graceful_termination(child: &Child) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(child.id().to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    #[cfg(not(unix))]
+    let _ = child;
 }
 
 fn ensure_cli_setup<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<()> {
