@@ -129,6 +129,18 @@ pub enum ModelVariant {
     /// Qwen3 14B text model (GGUF Q4_K_M)
     #[serde(rename = "Qwen3-14B-GGUF")]
     Qwen314BGguf,
+    /// Qwen3.5 0.8B text model
+    #[serde(rename = "Qwen3.5-0.8B")]
+    Qwen3508B,
+    /// Qwen3.5 2B text model
+    #[serde(rename = "Qwen3.5-2B")]
+    Qwen352B,
+    /// Qwen3.5 4B text model
+    #[serde(rename = "Qwen3.5-4B")]
+    Qwen354B,
+    /// Qwen3.5 9B text model
+    #[serde(rename = "Qwen3.5-9B")]
+    Qwen359B,
     /// Gemma 3 1B instruction-tuned chat model
     #[serde(rename = "Gemma-3-1b-it")]
     Gemma31BIt,
@@ -211,6 +223,10 @@ impl ModelVariant {
             Self::Qwen34BGguf => "Qwen/Qwen3-4B-GGUF",
             Self::Qwen38BGguf => "Qwen/Qwen3-8B-GGUF",
             Self::Qwen314BGguf => "Qwen/Qwen3-14B-GGUF",
+            Self::Qwen3508B => "Qwen/Qwen3.5-0.8B",
+            Self::Qwen352B => "Qwen/Qwen3.5-2B",
+            Self::Qwen354B => "Qwen/Qwen3.5-4B",
+            Self::Qwen359B => "Qwen/Qwen3.5-9B",
             Self::Gemma31BIt => "google/gemma-3-1b-it",
             Self::Gemma34BIt => "google/gemma-3-4b-it",
             Self::Qwen3ForcedAligner06B => "Qwen/Qwen3-ForcedAligner-0.6B",
@@ -263,6 +279,10 @@ impl ModelVariant {
             Self::Qwen34BGguf => "Qwen3 4B GGUF",
             Self::Qwen38BGguf => "Qwen3 8B GGUF",
             Self::Qwen314BGguf => "Qwen3 14B GGUF",
+            Self::Qwen3508B => "Qwen3.5 0.8B",
+            Self::Qwen352B => "Qwen3.5 2B",
+            Self::Qwen354B => "Qwen3.5 4B",
+            Self::Qwen359B => "Qwen3.5 9B",
             Self::Gemma31BIt => "Gemma 3 1B Instruct",
             Self::Gemma34BIt => "Gemma 3 4B Instruct",
             Self::Qwen3ForcedAligner06B => "Qwen3-ForcedAligner 0.6B",
@@ -315,6 +335,10 @@ impl ModelVariant {
             Self::Qwen34BGguf => "Qwen3-4B-GGUF",
             Self::Qwen38BGguf => "Qwen3-8B-GGUF",
             Self::Qwen314BGguf => "Qwen3-14B-GGUF",
+            Self::Qwen3508B => "Qwen3.5-0.8B",
+            Self::Qwen352B => "Qwen3.5-2B",
+            Self::Qwen354B => "Qwen3.5-4B",
+            Self::Qwen359B => "Qwen3.5-9B",
             Self::Gemma31BIt => "Gemma-3-1b-it",
             Self::Gemma34BIt => "Gemma-3-4b-it",
             Self::Qwen3ForcedAligner06B => "Qwen3-ForcedAligner-0.6B",
@@ -367,6 +391,10 @@ impl ModelVariant {
             Self::Qwen34BGguf => 2_500_000_000, // ~2.33 GB (Q4_K_M GGUF, HF file size, Feb 2026)
             Self::Qwen38BGguf => 5_200_000_000, // ~4.84 GB (Q4_K_M est)
             Self::Qwen314BGguf => 9_200_000_000, // ~8.57 GB (Q4_K_M est)
+            Self::Qwen3508B => 1_750_000_000,   // ~1.63 GB (model shard total, est)
+            Self::Qwen352B => 4_400_000_000,    // ~4.10 GB (bf16 shard total, est)
+            Self::Qwen354B => 8_800_000_000,    // ~8.20 GB (bf16 shard total, est)
+            Self::Qwen359B => 19_000_000_000,   // ~17.70 GB (bf16 shard total, est)
             Self::Gemma31BIt => 2_200_000_000,  // ~2.05 GB (est)
             Self::Gemma34BIt => 8_600_000_000,  // ~8.01 GB (est)
             Self::Qwen3ForcedAligner06B => 1_840_072_459, // ~1.71 GB
@@ -418,6 +446,10 @@ impl ModelVariant {
             Self::Qwen34BGguf => 6.0,
             Self::Qwen38BGguf => 10.0,
             Self::Qwen314BGguf => 16.0,
+            Self::Qwen3508B => 3.0,
+            Self::Qwen352B => 6.0,
+            Self::Qwen354B => 10.0,
+            Self::Qwen359B => 20.0,
             Self::Gemma31BIt => 3.5,
             Self::Gemma34BIt => 11.0,
             Self::Qwen3ForcedAligner06B => 2.5,
@@ -469,7 +501,9 @@ impl ModelVariant {
     pub fn is_chat(&self) -> bool {
         matches!(
             self.family(),
-            crate::catalog::ModelFamily::Qwen3Chat | crate::catalog::ModelFamily::Gemma3Chat
+            crate::catalog::ModelFamily::Qwen3Chat
+                | crate::catalog::ModelFamily::Qwen35Chat
+                | crate::catalog::ModelFamily::Gemma3Chat
         )
     }
 
@@ -662,6 +696,10 @@ impl ModelVariant {
             Self::Qwen34BGguf,
             Self::Qwen38BGguf,
             Self::Qwen314BGguf,
+            Self::Qwen3508B,
+            Self::Qwen352B,
+            Self::Qwen354B,
+            Self::Qwen359B,
             Self::Gemma31BIt,
             Self::Gemma34BIt,
             Self::Qwen3ForcedAligner06B,

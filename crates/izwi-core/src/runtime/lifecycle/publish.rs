@@ -21,6 +21,7 @@ impl RuntimeService {
             | ModelFamily::Qwen3ForcedAligner
             | ModelFamily::SortformerDiarization
             | ModelFamily::Qwen3Chat
+            | ModelFamily::Qwen35Chat
             | ModelFamily::Gemma3Chat
             | ModelFamily::Voxtral => {
                 self.model_manager.mark_loaded(variant).await;

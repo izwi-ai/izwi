@@ -57,6 +57,18 @@ function getChatModelName(variant: string): string {
   if (variant === "Qwen3-14B-GGUF") {
     return withQwen3Prefix("Chat 14B GGUF (Q4_K_M)", variant);
   }
+  if (variant === "Qwen3.5-0.8B") {
+    return withQwen3Prefix("Chat 0.8B", variant);
+  }
+  if (variant === "Qwen3.5-2B") {
+    return withQwen3Prefix("Chat 2B", variant);
+  }
+  if (variant === "Qwen3.5-4B") {
+    return withQwen3Prefix("Chat 4B", variant);
+  }
+  if (variant === "Qwen3.5-9B") {
+    return withQwen3Prefix("Chat 9B", variant);
+  }
   if (variant === "Gemma-3-1b-it") {
     return "Gemma 3 1B Instruct";
   }
@@ -69,7 +81,7 @@ function getChatModelName(variant: string): string {
 function isThinkingChatModel(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   return (
-    normalized.startsWith("qwen3-") &&
+    (normalized.startsWith("qwen3-") || normalized.startsWith("qwen3.5-")) &&
     !normalized.includes("-asr-") &&
     !normalized.includes("-tts-") &&
     !normalized.includes("forcedaligner")

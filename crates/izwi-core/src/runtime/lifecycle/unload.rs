@@ -14,7 +14,7 @@ impl RuntimeService {
             ModelFamily::SortformerDiarization => {
                 self.model_registry.unload_diarization(variant).await;
             }
-            ModelFamily::Qwen3Chat | ModelFamily::Gemma3Chat => {
+            ModelFamily::Qwen3Chat | ModelFamily::Qwen35Chat | ModelFamily::Gemma3Chat => {
                 self.model_registry.unload_chat(variant).await;
             }
             ModelFamily::Lfm2Audio => {

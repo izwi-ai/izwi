@@ -1,18 +1,23 @@
 export function withQwen3Prefix(name: string, variant: string): string {
   const trimmed = name.trim();
-  const isQwen3Variant = variant.toLowerCase().startsWith("qwen3");
+  const normalizedVariant = variant.toLowerCase();
+  const qwenPrefix = normalizedVariant.startsWith("qwen3.5")
+    ? "Qwen3.5"
+    : normalizedVariant.startsWith("qwen3")
+      ? "Qwen3"
+      : null;
 
-  if (!isQwen3Variant) {
+  if (!qwenPrefix) {
     return trimmed || variant;
   }
 
   if (!trimmed) {
-    return "Qwen3";
+    return qwenPrefix;
   }
 
-  if (/^qwen3\b/i.test(trimmed)) {
+  if (/^qwen3(\.5)?\b/i.test(trimmed)) {
     return trimmed;
   }
 
-  return `Qwen3 ${trimmed}`;
+  return `${qwenPrefix} ${trimmed}`;
 }

@@ -10,5 +10,6 @@ pub mod kokoro;
 pub mod lfm2;
 pub mod parakeet;
 pub mod qwen3;
+pub mod qwen35;
 pub mod sortformer;
 pub mod voxtral;

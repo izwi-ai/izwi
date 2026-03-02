@@ -385,7 +385,9 @@ impl ModelDownloader {
                         e.file_name()
                             .to_str()
                             .map(|name| {
-                                name.starts_with("model-") && name.ends_with(".safetensors")
+                                (name.starts_with("model-")
+                                    || name.starts_with("model.safetensors-"))
+                                    && name.ends_with(".safetensors")
                             })
                             .unwrap_or(false)
                     })
@@ -439,7 +441,7 @@ impl ModelDownloader {
             ModelFamily::SortformerDiarization => path
                 .join("diar_streaming_sortformer_4spk-v2.1.nemo")
                 .exists(),
-            ModelFamily::Qwen3Chat | ModelFamily::Gemma3Chat => {
+            ModelFamily::Qwen3Chat | ModelFamily::Qwen35Chat | ModelFamily::Gemma3Chat => {
                 if variant.is_qwen_chat_gguf() {
                     let gguf_file = match variant {
                         ModelVariant::Qwen306BGguf => "Qwen3-0.6B-Q8_0.gguf",
@@ -982,7 +984,7 @@ impl ModelDownloader {
                 "privacy.md".to_string(),
                 "safety.md".to_string(),
             ],
-            ModelFamily::Qwen3Chat | ModelFamily::Gemma3Chat => {
+            ModelFamily::Qwen3Chat | ModelFamily::Qwen35Chat | ModelFamily::Gemma3Chat => {
                 if variant.is_qwen_chat_gguf() {
                     let gguf_file = match variant {
                         ModelVariant::Qwen306BGguf => "Qwen3-0.6B-Q8_0.gguf",
@@ -1018,6 +1020,13 @@ impl ModelDownloader {
                 for total in [2usize, 3, 4] {
                     for idx in 1..=total {
                         files.push(format!("model-{idx:05}-of-{total:05}.safetensors"));
+                    }
+                }
+                for total in [1usize, 2, 3, 4, 5, 6, 7, 8] {
+                    for idx in 1..=total {
+                        files.push(format!(
+                            "model.safetensors-{idx:05}-of-{total:05}.safetensors"
+                        ));
                     }
                 }
                 files

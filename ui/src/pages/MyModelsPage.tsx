@@ -290,6 +290,38 @@ export const MODEL_DETAILS: Record<
     capabilities: ["Text Chat", "GGUF", "Q4_K_M"],
     size: "9.2 GB",
   },
+  "Qwen3.5-0.8B": {
+    shortName: "Qwen3.5 Chat 0.8B",
+    fullName: "Qwen3.5 0.8B",
+    description: "Compact Qwen3.5 hybrid-attention chat model",
+    category: "chat",
+    capabilities: ["Text Chat", "Full precision"],
+    size: "1.6 GB",
+  },
+  "Qwen3.5-2B": {
+    shortName: "Qwen3.5 Chat 2B",
+    fullName: "Qwen3.5 2B",
+    description: "Balanced Qwen3.5 hybrid-attention chat model",
+    category: "chat",
+    capabilities: ["Text Chat", "Full precision"],
+    size: "4.1 GB",
+  },
+  "Qwen3.5-4B": {
+    shortName: "Qwen3.5 Chat 4B",
+    fullName: "Qwen3.5 4B",
+    description: "Higher-quality Qwen3.5 hybrid-attention chat model",
+    category: "chat",
+    capabilities: ["Text Chat", "Full precision"],
+    size: "8.2 GB",
+  },
+  "Qwen3.5-9B": {
+    shortName: "Qwen3.5 Chat 9B",
+    fullName: "Qwen3.5 9B",
+    description: "High-capacity Qwen3.5 hybrid-attention chat model",
+    category: "chat",
+    capabilities: ["Text Chat", "Full precision"],
+    size: "17.7 GB",
+  },
   "Gemma-3-1b-it": {
     shortName: "Gemma 3 1B",
     fullName: "Gemma 3 1B Instruct",
@@ -476,7 +508,9 @@ function getStatusDotClass(status: ModelInfo["status"]): string {
 }
 
 function getProviderLabel(variant: string): string {
-  if (variant.startsWith("Qwen3-")) return "Qwen";
+  if (variant.startsWith("Qwen3-") || variant.startsWith("Qwen3.5-")) {
+    return "Qwen";
+  }
   if (variant.startsWith("LFM2")) return "Liquid AI";
   if (variant.startsWith("Gemma-")) return "Google";
   if (
