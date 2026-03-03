@@ -226,30 +226,6 @@ export const MODEL_DETAILS: Record<
     size: "346 MB",
   },
   // Text Chat
-  "Qwen3-0.6B": {
-    shortName: "Qwen3 Chat 0.6B",
-    fullName: "Qwen3 0.6B",
-    description: "Compact text-to-text model for local chat",
-    category: "chat",
-    capabilities: ["Text Chat", "Full precision"],
-    size: "1.4 GB",
-  },
-  "Qwen3-0.6B-4bit": {
-    shortName: "Qwen3 Chat 0.6B",
-    fullName: "Qwen3 0.6B (MLX 4-bit)",
-    description: "Compact text-to-text model for local chat",
-    category: "chat",
-    capabilities: ["Text Chat", "4-bit"],
-    size: "0.9 GB",
-  },
-  "Qwen3-1.7B-4bit": {
-    shortName: "Qwen3 Chat 1.7B",
-    fullName: "Qwen3 1.7B (MLX 4-bit)",
-    description: "Higher-quality 1.7B chat model in 4-bit precision",
-    category: "chat",
-    capabilities: ["Text Chat", "4-bit"],
-    size: "1.1 GB",
-  },
   "Qwen3-0.6B-GGUF": {
     shortName: "Qwen3 Chat 0.6B GGUF",
     fullName: "Qwen3 0.6B (GGUF Q8_0)",
@@ -281,14 +257,6 @@ export const MODEL_DETAILS: Record<
     category: "chat",
     capabilities: ["Text Chat", "GGUF", "Q4_K_M"],
     size: "5.2 GB",
-  },
-  "Qwen3-14B-GGUF": {
-    shortName: "Qwen3 Chat 14B GGUF",
-    fullName: "Qwen3 14B (GGUF Q4_K_M)",
-    description: "14B chat model in GGUF format (Q4_K_M only)",
-    category: "chat",
-    capabilities: ["Text Chat", "GGUF", "Q4_K_M"],
-    size: "9.2 GB",
   },
   "Qwen3.5-0.8B": {
     shortName: "Qwen3.5 Chat 0.8B GGUF",

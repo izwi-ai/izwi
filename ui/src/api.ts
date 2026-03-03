@@ -2402,7 +2402,7 @@ class ApiClient {
       {
         method: "POST",
         body: JSON.stringify({
-          model: request.model_id ?? "Qwen3-0.6B-4bit",
+          model: request.model_id ?? "Qwen3.5-0.8B",
           content: request.content,
           content_parts: request.content_parts,
           max_tokens: request.max_tokens,
@@ -2431,7 +2431,7 @@ class ApiClient {
               "Content-Type": "application/json",
             },
             body: JSON.stringify({
-              model: request.model_id ?? "Qwen3-0.6B-4bit",
+              model: request.model_id ?? "Qwen3.5-0.8B",
               content: request.content,
               content_parts: request.content_parts,
               max_tokens: request.max_tokens,
@@ -2579,7 +2579,7 @@ class ApiClient {
       {
         method: "POST",
         body: JSON.stringify({
-          model: request.model_id ?? "Qwen3-0.6B-4bit",
+          model: request.model_id ?? "Qwen3.5-0.8B",
           messages: request.messages,
           max_tokens: request.max_tokens,
           stream: false,
@@ -2619,7 +2619,7 @@ class ApiClient {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
-            model: request.model_id ?? "Qwen3-0.6B-4bit",
+            model: request.model_id ?? "Qwen3.5-0.8B",
             messages: request.messages,
             max_tokens: request.max_tokens,
             stream: true,
@@ -2635,7 +2635,7 @@ class ApiClient {
           return;
         }
 
-        callbacks.onStart?.(request.model_id ?? "Qwen3-0.6B-4bit");
+        callbacks.onStart?.(request.model_id ?? "Qwen3.5-0.8B");
 
         const reader = response.body?.getReader();
         if (!reader) {
@@ -2717,7 +2717,7 @@ class ApiClient {
     const payload = await this.request<OpenAiResponseObject>("/responses", {
       method: "POST",
       body: JSON.stringify({
-        model: request.model_id ?? "Qwen3-0.6B-4bit",
+        model: request.model_id ?? "Qwen3.5-0.8B",
         input: request.input,
         instructions: request.instructions,
         max_output_tokens: request.max_output_tokens,
@@ -2743,7 +2743,7 @@ class ApiClient {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
-            model: request.model_id ?? "Qwen3-0.6B-4bit",
+            model: request.model_id ?? "Qwen3.5-0.8B",
             input: request.input,
             instructions: request.instructions,
             max_output_tokens: request.max_output_tokens,

@@ -168,7 +168,7 @@ pub fn parse_tts_model_variant(input: &str) -> Result<ModelVariant, ParseModelVa
 pub fn parse_chat_model_variant(
     input: Option<&str>,
 ) -> Result<ModelVariant, ParseModelVariantError> {
-    match input.unwrap_or("Qwen3-0.6B-4bit") {
+    match input.unwrap_or("Qwen3.5-0.8B") {
         id => {
             let variant = parse_model_variant(id)?;
             if variant.is_chat() {
@@ -631,6 +631,12 @@ mod tests {
     #[test]
     fn parse_qwen35_chat_08b() {
         let parsed = parse_chat_model_variant(Some("Qwen3.5-0.8B")).unwrap();
+        assert_eq!(parsed, ModelVariant::Qwen3508B);
+    }
+
+    #[test]
+    fn parse_chat_defaults_to_qwen35_08b() {
+        let parsed = parse_chat_model_variant(None).unwrap();
         assert_eq!(parsed, ModelVariant::Qwen3508B);
     }
 

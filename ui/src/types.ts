@@ -93,15 +93,10 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     description: "Text-to-text chat with Qwen3, Qwen3.5, and Gemma 3",
     icon: "MessageSquare",
     modelFilter: (variant) =>
-      variant === "Qwen3-0.6B" ||
-      variant === "Qwen3-0.6B-4bit" ||
       variant === "Qwen3-0.6B-GGUF" ||
-      variant === "Qwen3-1.7B" ||
-      variant === "Qwen3-1.7B-4bit" ||
       variant === "Qwen3-1.7B-GGUF" ||
       variant === "Qwen3-4B-GGUF" ||
       variant === "Qwen3-8B-GGUF" ||
-      variant === "Qwen3-14B-GGUF" ||
       variant === "Qwen3.5-0.8B" ||
       variant === "Qwen3.5-2B" ||
       variant === "Qwen3.5-4B" ||

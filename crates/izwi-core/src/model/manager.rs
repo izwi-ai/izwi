@@ -177,6 +177,13 @@ impl ModelManager {
 
     /// Download a model from HuggingFace
     pub async fn download_model(&self, variant: ModelVariant) -> Result<PathBuf> {
+        if !variant.is_enabled() {
+            return Err(Error::ConfigError(format!(
+                "Model {} is disabled and cannot be downloaded",
+                variant.dir_name()
+            )));
+        }
+
         // Update status to downloading
         {
             let mut models = self.models.write().await;
@@ -209,6 +216,13 @@ impl ModelManager {
         variant: ModelVariant,
         progress_tx: broadcast::Sender<DownloadProgress>,
     ) -> Result<PathBuf> {
+        if !variant.is_enabled() {
+            return Err(Error::ConfigError(format!(
+                "Model {} is disabled and cannot be downloaded",
+                variant.dir_name()
+            )));
+        }
+
         // Update status
         {
             let mut models = self.models.write().await;
@@ -355,6 +369,13 @@ impl ModelManager {
         &self,
         variant: ModelVariant,
     ) -> Result<broadcast::Receiver<DownloadProgress>> {
+        if !variant.is_enabled() {
+            return Err(Error::ConfigError(format!(
+                "Model {} is disabled and cannot be downloaded",
+                variant.dir_name()
+            )));
+        }
+
         // Update status
         {
             let mut models = self.models.write().await;

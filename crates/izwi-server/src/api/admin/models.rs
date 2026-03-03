@@ -42,6 +42,9 @@ pub async fn get_model_info(
     Path(variant): Path<String>,
 ) -> Result<Json<ModelInfo>, ApiError> {
     let variant = parse_variant(&variant)?;
+    if !variant.is_enabled() {
+        return Err(ApiError::not_found("Model not found"));
+    }
 
     let info = state
         .runtime
@@ -81,6 +84,12 @@ pub async fn download_model(
     Path(variant): Path<String>,
 ) -> Result<Json<DownloadResponse>, ApiError> {
     let variant = parse_variant(&variant)?;
+    if !variant.is_enabled() {
+        return Err(ApiError::not_found(format!(
+            "Model {} is not available for download",
+            variant.dir_name()
+        )));
+    }
     info!("Starting non-blocking download for model: {}", variant);
 
     // Check if already downloading

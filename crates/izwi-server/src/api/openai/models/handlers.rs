@@ -59,6 +59,9 @@ pub async fn list_models_openai(
 pub async fn get_model_openai(Path(model): Path<String>) -> Result<Json<OpenAiModel>, ApiError> {
     let variant =
         parse_model_variant(&model).map_err(|err| ApiError::bad_request(err.to_string()))?;
+    if !variant.is_enabled() {
+        return Err(ApiError::not_found("Model not found"));
+    }
 
     Ok(Json(OpenAiModel {
         id: variant.dir_name().to_string(),

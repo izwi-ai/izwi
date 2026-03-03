@@ -23,7 +23,7 @@ const DEFAULT_AGENT_ID: &str = "voice-agent";
 const DEFAULT_AGENT_NAME: &str = "Voice Agent";
 const DEFAULT_AGENT_SYSTEM_PROMPT: &str =
     "You are a helpful voice assistant. Reply with concise spoken-friendly language. Avoid markdown. Do not output <think> tags or internal reasoning. Return only the final spoken answer. Keep responses brief unless asked for details.";
-const DEFAULT_CHAT_MODEL: &str = "Qwen3-0.6B-4bit";
+const DEFAULT_CHAT_MODEL: &str = "Qwen3.5-0.8B";
 
 #[derive(Debug, Deserialize)]
 pub struct CreateAgentSessionRequest {

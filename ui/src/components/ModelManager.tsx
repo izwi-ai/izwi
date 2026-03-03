@@ -259,30 +259,6 @@ const MODEL_DETAILS: Record<
     ],
     size: "346 MB",
   },
-  "Qwen3-0.6B": {
-    shortName: "Qwen3 Chat 0.6B",
-    fullName: "Qwen3 0.6B",
-    description: "Compact text-to-text chat model for local inference",
-    features: ["Text chat", "Full precision", "Fast response"],
-    size: "1.4 GB",
-  },
-  "Qwen3-0.6B-4bit": {
-    shortName: "Qwen3 Chat 0.6B",
-    fullName: "Qwen3 0.6B (MLX 4-bit)",
-    description:
-      "Compact text-to-text chat model optimized for local inference",
-    features: ["Text chat", "4-bit quantized", "Fast response"],
-    size: "0.9 GB",
-    quantization: "4-bit",
-  },
-  "Qwen3-1.7B-4bit": {
-    shortName: "Qwen3 Chat 1.7B",
-    fullName: "Qwen3 1.7B (MLX 4-bit)",
-    description: "Higher-quality 1.7B local chat model with 4-bit quantization",
-    features: ["Text chat", "4-bit quantized", "Improved quality"],
-    size: "1.1 GB",
-    quantization: "4-bit",
-  },
   "Qwen3-0.6B-GGUF": {
     shortName: "Qwen3 Chat 0.6B GGUF",
     fullName: "Qwen3 0.6B (GGUF Q8_0)",
@@ -315,15 +291,6 @@ const MODEL_DETAILS: Record<
       "Qwen3 8B chat model in GGUF format (only the Q4_K_M quantization is bundled)",
     features: ["Text chat", "GGUF", "Q4_K_M quantized"],
     size: "5.2 GB",
-    quantization: "Q4_K_M",
-  },
-  "Qwen3-14B-GGUF": {
-    shortName: "Qwen3 Chat 14B GGUF",
-    fullName: "Qwen3 14B (GGUF Q4_K_M)",
-    description:
-      "Qwen3 14B chat model in GGUF format (only the Q4_K_M quantization is bundled)",
-    features: ["Text chat", "GGUF", "Q4_K_M quantized"],
-    size: "9.2 GB",
     quantization: "Q4_K_M",
   },
   "Gemma-3-1b-it": {

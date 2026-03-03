@@ -637,13 +637,13 @@ impl ModelVariant {
         match self {
             Self::Qwen306B
             | Self::Qwen306B4Bit
-            | Self::Qwen306BGguf
             | Self::Qwen317B
             | Self::Qwen317B4Bit
+            | Self::Qwen314BGguf => false,
+            Self::Qwen306BGguf
             | Self::Qwen317BGguf
             | Self::Qwen34BGguf
             | Self::Qwen38BGguf
-            | Self::Qwen314BGguf
             | Self::Qwen3508B
             | Self::Qwen352B
             | Self::Qwen354B
@@ -820,5 +820,23 @@ mod tests {
         assert_eq!(q8.repo_id(), "mlx-community/Qwen3-ASR-0.6B-8bit");
         assert!(!q4.is_enabled());
         assert!(!q8.is_enabled());
+    }
+
+    #[test]
+    fn retired_qwen3_chat_variants_are_disabled() {
+        let retired = [
+            ModelVariant::Qwen306B,
+            ModelVariant::Qwen306B4Bit,
+            ModelVariant::Qwen317B,
+            ModelVariant::Qwen317B4Bit,
+            ModelVariant::Qwen314BGguf,
+        ];
+        for variant in retired {
+            assert!(
+                !variant.is_enabled(),
+                "{} should be disabled",
+                variant.dir_name()
+            );
+        }
     }
 }
