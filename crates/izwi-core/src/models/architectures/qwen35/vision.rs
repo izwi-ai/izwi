@@ -103,8 +103,9 @@ impl VisionAttention {
         let mut k = qkv.i((.., 1, .., ..))?;
         let mut v = qkv.i((.., 2, .., ..))?;
 
-        let cos = cos.unsqueeze(1)?; // [seq, 1, head_dim]
-        let sin = sin.unsqueeze(1)?;
+        // Rotary terms must match the explicit F32 attention path below.
+        let cos = cos.unsqueeze(1)?.to_dtype(DType::F32)?; // [seq, 1, head_dim]
+        let sin = sin.unsqueeze(1)?.to_dtype(DType::F32)?;
         q = apply_rotary(&q.to_dtype(DType::F32)?, &cos, &sin)?;
         k = apply_rotary(&k.to_dtype(DType::F32)?, &cos, &sin)?;
         v = v.to_dtype(DType::F32)?;
@@ -426,6 +427,14 @@ impl Qwen35VisionRuntime {
     }
 
     fn forward_vision(&self, patches: &Tensor) -> Result<Tensor> {
+        let patch_dtype = self.patch_weight_0.dtype();
+        let aligned_patches = if patches.dtype() == patch_dtype {
+            None
+        } else {
+            Some(patches.to_dtype(patch_dtype)?)
+        };
+        let patches = aligned_patches.as_ref().unwrap_or(patches);
+
         let in_per_frame = 3 * self.config.patch_size * self.config.patch_size;
         let p0 = patches.narrow(1, 0, in_per_frame)?;
         let p1 = patches.narrow(1, in_per_frame, in_per_frame)?;
