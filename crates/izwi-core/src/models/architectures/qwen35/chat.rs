@@ -7,7 +7,8 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+use std::time::UNIX_EPOCH;
 
 use candle_core::quantized::{gguf_file, GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, IndexOp, Tensor, D};
@@ -64,6 +65,132 @@ pub struct ChatDecodeStep {
     pub tokens_generated: usize,
     pub finished: bool,
 }
+
+#[derive(Clone)]
+struct PrefixCacheEntry {
+    ids: Vec<u32>,
+    cache: Qwen35Cache,
+    logits: Tensor,
+}
+
+#[derive(Default)]
+struct PrefixCacheStore {
+    entries: VecDeque<PrefixCacheEntry>,
+}
+
+impl PrefixCacheStore {
+    fn lookup_longest_prefix(&self, ids: &[u32]) -> Option<PrefixCacheEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| ids.starts_with(&entry.ids))
+            .max_by_key(|entry| entry.ids.len())
+            .cloned()
+    }
+
+    fn insert(&mut self, entry: PrefixCacheEntry, capacity: usize) {
+        if capacity == 0 {
+            self.entries.clear();
+            return;
+        }
+        self.entries.retain(|existing| existing.ids != entry.ids);
+        self.entries.push_front(entry);
+        while self.entries.len() > capacity {
+            self.entries.pop_back();
+        }
+    }
+}
+
+#[derive(Default)]
+struct VisualEmbeddingCache {
+    entries: HashMap<String, Tensor>,
+    order: VecDeque<String>,
+}
+
+impl VisualEmbeddingCache {
+    fn get(&mut self, key: &str) -> Option<Tensor> {
+        let value = self.entries.get(key)?.clone();
+        if let Some(idx) = self.order.iter().position(|existing| existing == key) {
+            self.order.remove(idx);
+        }
+        self.order.push_back(key.to_string());
+        Some(value)
+    }
+
+    fn insert(&mut self, key: String, value: Tensor, capacity: usize) {
+        if capacity == 0 {
+            self.entries.clear();
+            self.order.clear();
+            return;
+        }
+
+        if self.entries.contains_key(&key) {
+            self.entries.insert(key.clone(), value);
+            if let Some(idx) = self.order.iter().position(|existing| existing == &key) {
+                self.order.remove(idx);
+            }
+            self.order.push_back(key);
+            return;
+        }
+
+        while self.entries.len() >= capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+
+        self.order.push_back(key.clone());
+        self.entries.insert(key, value);
+    }
+}
+
+#[derive(Default)]
+struct TransformedQMatMulCache {
+    entries: HashMap<String, QMatMul>,
+    order: VecDeque<String>,
+}
+
+impl TransformedQMatMulCache {
+    fn get(&mut self, key: &str) -> Option<QMatMul> {
+        let value = self.entries.get(key)?.clone();
+        if let Some(idx) = self.order.iter().position(|existing| existing == key) {
+            self.order.remove(idx);
+        }
+        self.order.push_back(key.to_string());
+        Some(value)
+    }
+
+    fn insert(&mut self, key: String, value: QMatMul, capacity: usize) {
+        if capacity == 0 {
+            self.entries.clear();
+            self.order.clear();
+            return;
+        }
+
+        if self.entries.contains_key(&key) {
+            self.entries.insert(key.clone(), value);
+            if let Some(idx) = self.order.iter().position(|existing| existing == &key) {
+                self.order.remove(idx);
+            }
+            self.order.push_back(key);
+            return;
+        }
+
+        while self.entries.len() >= capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+
+        self.order.push_back(key.clone());
+        self.entries.insert(key, value);
+    }
+}
+
+static QWEN35_TRANSFORMED_QMATMUL_CACHE: OnceLock<Mutex<TransformedQMatMulCache>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct SpecialTokenIds {
@@ -327,6 +454,7 @@ fn parse_qwen35_config(config_str: &str) -> Result<Qwen35TextConfig> {
     Qwen35TextConfig::from_raw(raw)
 }
 
+#[derive(Clone)]
 enum Qwen35LayerCache {
     Full {
         k_pages: Vec<KvPage>,
@@ -340,6 +468,7 @@ enum Qwen35LayerCache {
     },
 }
 
+#[derive(Clone)]
 struct Qwen35Cache {
     layers: Vec<Qwen35LayerCache>,
 }
@@ -895,6 +1024,41 @@ impl Qwen35LinearAttention {
         hidden_states: &Tensor,
         layer_cache: Option<&mut Qwen35LayerCache>,
     ) -> Result<Tensor> {
+        let seq_len = hidden_states.dim(1)?;
+        let chunk_size = qwen35_linear_prefill_chunk_size();
+        if chunk_size > 0 && seq_len > chunk_size && layer_cache.is_some() {
+            return self.forward_chunked(hidden_states, layer_cache, chunk_size);
+        }
+        self.forward_impl(hidden_states, layer_cache)
+    }
+
+    fn forward_chunked(
+        &self,
+        hidden_states: &Tensor,
+        mut layer_cache: Option<&mut Qwen35LayerCache>,
+        chunk_size: usize,
+    ) -> Result<Tensor> {
+        let total_seq = hidden_states.dim(1)?;
+        let mut outputs = Vec::new();
+        let mut start = 0usize;
+        while start < total_seq {
+            let take = chunk_size.min(total_seq - start);
+            let chunk = hidden_states.narrow(1, start, take)?;
+            outputs.push(self.forward_impl(&chunk, layer_cache.as_deref_mut())?);
+            start += take;
+        }
+        if outputs.len() == 1 {
+            return Ok(outputs.remove(0));
+        }
+        let refs: Vec<&Tensor> = outputs.iter().collect();
+        Tensor::cat(&refs, 1).map_err(Error::from)
+    }
+
+    fn forward_impl(
+        &self,
+        hidden_states: &Tensor,
+        layer_cache: Option<&mut Qwen35LayerCache>,
+    ) -> Result<Tensor> {
         let (batch_size, seq_len, hidden_size) = hidden_states.dims3()?;
         if hidden_size != self.hidden_size {
             return Err(Error::InferenceError(format!(
@@ -1380,6 +1544,8 @@ fn load_gguf_transformed_qmatmul<R, F>(
     reader: &mut R,
     device: &DeviceProfile,
     dtype: DType,
+    cache_scope: Option<&str>,
+    transform_name: &str,
     src: &str,
     transform: F,
 ) -> Result<QMatMul>
@@ -1387,6 +1553,18 @@ where
     R: std::io::Read + std::io::Seek,
     F: FnOnce(Tensor) -> Result<Tensor>,
 {
+    let cache_key = cache_scope.map(|scope| {
+        format!(
+            "{scope}|{src}|{transform_name}|{:?}|{:?}",
+            dtype, device.kind
+        )
+    });
+    if let Some(key) = cache_key.as_deref() {
+        if let Some(cached) = transformed_qmatmul_cache_get(key) {
+            return Ok(cached);
+        }
+    }
+
     let source = content.tensor(reader, src, &device.device).map_err(|e| {
         Error::ModelLoadError(format!("Failed to load GGUF quantized tensor `{src}`: {e}"))
     })?;
@@ -1408,9 +1586,14 @@ where
                 "Failed to requantize transformed GGUF tensor `{src}`: {e}"
             ))
         })?;
-    QMatMul::from_qtensor(qtensor).map_err(|e| {
+    let qmatmul = QMatMul::from_qtensor(qtensor).map_err(|e| {
         Error::ModelLoadError(format!("Failed to build quantized matmul for `{src}`: {e}"))
-    })
+    })?;
+
+    if let Some(key) = cache_key {
+        transformed_qmatmul_cache_insert(key, qmatmul.clone());
+    }
+    Ok(qmatmul)
 }
 
 struct Qwen35QuantizedMlp {
@@ -1760,6 +1943,7 @@ impl Qwen35QuantizedLinearAttention {
         dtype: DType,
         cfg: &Qwen35TextConfig,
         layer_src_prefix: &str,
+        cache_scope: Option<&str>,
     ) -> Result<Self> {
         let num_v_heads = cfg.linear_num_value_heads;
         let num_k_heads = cfg.linear_num_key_heads;
@@ -1771,14 +1955,27 @@ impl Qwen35QuantizedLinearAttention {
         let conv_dim = key_dim * 2 + value_dim;
 
         let qkv_src = format!("{layer_src_prefix}.attn_qkv.weight");
-        let in_proj_qkv =
-            load_gguf_transformed_qmatmul(content, reader, device, dtype, &qkv_src, |tensor| {
-                untile_linear_qkv_weight(tensor, cfg, &qkv_src)
-            })?;
+        let in_proj_qkv = load_gguf_transformed_qmatmul(
+            content,
+            reader,
+            device,
+            dtype,
+            cache_scope,
+            "linear_qkv",
+            &qkv_src,
+            |tensor| untile_linear_qkv_weight(tensor, cfg, &qkv_src),
+        )?;
 
         let z_src = format!("{layer_src_prefix}.attn_gate.weight");
-        let in_proj_z =
-            load_gguf_transformed_qmatmul(content, reader, device, dtype, &z_src, |tensor| {
+        let in_proj_z = load_gguf_transformed_qmatmul(
+            content,
+            reader,
+            device,
+            dtype,
+            cache_scope,
+            "linear_gate",
+            &z_src,
+            |tensor| {
                 untile_linear_v_rows(
                     tensor,
                     cfg.linear_num_key_heads,
@@ -1786,11 +1983,19 @@ impl Qwen35QuantizedLinearAttention {
                     cfg.linear_value_head_dim,
                     &z_src,
                 )
-            })?;
+            },
+        )?;
 
         let beta_src = format!("{layer_src_prefix}.ssm_beta.weight");
-        let in_proj_b =
-            load_gguf_transformed_qmatmul(content, reader, device, dtype, &beta_src, |tensor| {
+        let in_proj_b = load_gguf_transformed_qmatmul(
+            content,
+            reader,
+            device,
+            dtype,
+            cache_scope,
+            "linear_beta",
+            &beta_src,
+            |tensor| {
                 untile_linear_v_rows(
                     tensor,
                     cfg.linear_num_key_heads,
@@ -1798,11 +2003,19 @@ impl Qwen35QuantizedLinearAttention {
                     1,
                     &beta_src,
                 )
-            })?;
+            },
+        )?;
 
         let alpha_src = format!("{layer_src_prefix}.ssm_alpha.weight");
-        let in_proj_a =
-            load_gguf_transformed_qmatmul(content, reader, device, dtype, &alpha_src, |tensor| {
+        let in_proj_a = load_gguf_transformed_qmatmul(
+            content,
+            reader,
+            device,
+            dtype,
+            cache_scope,
+            "linear_alpha",
+            &alpha_src,
+            |tensor| {
                 untile_linear_v_rows(
                     tensor,
                     cfg.linear_num_key_heads,
@@ -1810,7 +2023,8 @@ impl Qwen35QuantizedLinearAttention {
                     1,
                     &alpha_src,
                 )
-            })?;
+            },
+        )?;
 
         let dt_src = format!("{layer_src_prefix}.ssm_dt.bias");
         let dt_bias = untile_linear_v_vector(
@@ -1854,6 +2068,8 @@ impl Qwen35QuantizedLinearAttention {
             reader,
             device,
             dtype,
+            cache_scope,
+            "linear_out_proj",
             &out_proj_src,
             |tensor| untile_linear_out_proj_weight(tensor, cfg, &out_proj_src),
         )?;
@@ -1897,6 +2113,41 @@ impl Qwen35QuantizedLinearAttention {
     }
 
     fn forward(
+        &self,
+        hidden_states: &Tensor,
+        layer_cache: Option<&mut Qwen35LayerCache>,
+    ) -> Result<Tensor> {
+        let seq_len = hidden_states.dim(1)?;
+        let chunk_size = qwen35_linear_prefill_chunk_size();
+        if chunk_size > 0 && seq_len > chunk_size && layer_cache.is_some() {
+            return self.forward_chunked(hidden_states, layer_cache, chunk_size);
+        }
+        self.forward_impl(hidden_states, layer_cache)
+    }
+
+    fn forward_chunked(
+        &self,
+        hidden_states: &Tensor,
+        mut layer_cache: Option<&mut Qwen35LayerCache>,
+        chunk_size: usize,
+    ) -> Result<Tensor> {
+        let total_seq = hidden_states.dim(1)?;
+        let mut outputs = Vec::new();
+        let mut start = 0usize;
+        while start < total_seq {
+            let take = chunk_size.min(total_seq - start);
+            let chunk = hidden_states.narrow(1, start, take)?;
+            outputs.push(self.forward_impl(&chunk, layer_cache.as_deref_mut())?);
+            start += take;
+        }
+        if outputs.len() == 1 {
+            return Ok(outputs.remove(0));
+        }
+        let refs: Vec<&Tensor> = outputs.iter().collect();
+        Tensor::cat(&refs, 1).map_err(Error::from)
+    }
+
+    fn forward_impl(
         &self,
         hidden_states: &Tensor,
         layer_cache: Option<&mut Qwen35LayerCache>,
@@ -2194,6 +2445,7 @@ impl Qwen35QuantizedLayer {
         dtype: DType,
         cfg: &Qwen35TextConfig,
         layer_idx: usize,
+        cache_scope: Option<&str>,
     ) -> Result<Self> {
         let src = format!("blk.{layer_idx}");
         let input_layernorm = Qwen35RmsNorm::from_weight(
@@ -2225,9 +2477,17 @@ impl Qwen35QuantizedLayer {
             LayerType::FullAttention => Qwen35QuantizedTokenMixer::Full(
                 Qwen35QuantizedFullAttention::load(content, reader, device, dtype, cfg, &src)?,
             ),
-            LayerType::LinearAttention => Qwen35QuantizedTokenMixer::Linear(
-                Qwen35QuantizedLinearAttention::load(content, reader, device, dtype, cfg, &src)?,
-            ),
+            LayerType::LinearAttention => {
+                Qwen35QuantizedTokenMixer::Linear(Qwen35QuantizedLinearAttention::load(
+                    content,
+                    reader,
+                    device,
+                    dtype,
+                    cfg,
+                    &src,
+                    cache_scope,
+                )?)
+            }
         };
         let mlp = Qwen35QuantizedMlp::load(content, reader, device, &src)?;
 
@@ -2278,6 +2538,7 @@ impl Qwen35QuantizedModel {
         device: &DeviceProfile,
         dtype: DType,
         cfg: Qwen35TextConfig,
+        cache_scope: Option<&str>,
     ) -> Result<Self> {
         let embed_q = content
             .tensor(reader, "token_embd.weight", &device.device)
@@ -2296,7 +2557,13 @@ impl Qwen35QuantizedModel {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for idx in 0..cfg.num_hidden_layers {
             layers.push(Qwen35QuantizedLayer::load(
-                content, reader, device, dtype, &cfg, idx,
+                content,
+                reader,
+                device,
+                dtype,
+                &cfg,
+                idx,
+                cache_scope,
             )?);
         }
 
@@ -2418,6 +2685,7 @@ enum Qwen35TextBackend {
 struct PromptBuildOutput {
     ids: Vec<u32>,
     multimodal: Vec<Qwen35MultimodalInput>,
+    assistant_prefix_start: usize,
 }
 
 enum GgufReader {
@@ -2474,11 +2742,109 @@ fn open_gguf_reader(path: &Path) -> Result<GgufReader> {
     Ok(GgufReader::Buffered(BufReader::new(file)))
 }
 
+fn env_flag_enabled(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|raw| {
+            !matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(default)
+}
+
+fn qwen35_prefix_cache_entries() -> usize {
+    std::env::var("IZWI_QWEN35_PREFIX_CACHE_ENTRIES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(4)
+}
+
+fn qwen35_linear_prefill_chunk_size() -> usize {
+    std::env::var("IZWI_QWEN35_LINEAR_PREFILL_CHUNK")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(256)
+}
+
+fn qwen35_mm_embed_cache_size() -> usize {
+    std::env::var("IZWI_QWEN35_MM_EMBED_CACHE_SIZE")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(16)
+}
+
+fn qwen35_warmup_enabled() -> bool {
+    env_flag_enabled("IZWI_QWEN35_WARMUP", true)
+}
+
+fn qwen35_warmup_prefill_tokens() -> usize {
+    std::env::var("IZWI_QWEN35_WARMUP_PREFILL_TOKENS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(16)
+        .max(1)
+}
+
+fn qwen35_transform_cache_enabled() -> bool {
+    env_flag_enabled("IZWI_QWEN35_TRANSFORM_CACHE", true)
+}
+
+fn qwen35_transform_cache_entries() -> usize {
+    std::env::var("IZWI_QWEN35_TRANSFORM_CACHE_ENTRIES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(512)
+}
+
+fn qwen35_transform_cache_scope(gguf_path: &Path) -> Result<Option<String>> {
+    if !qwen35_transform_cache_enabled() || qwen35_transform_cache_entries() == 0 {
+        return Ok(None);
+    }
+    let canonical = fs::canonicalize(gguf_path).unwrap_or_else(|_| gguf_path.to_path_buf());
+    let metadata = fs::metadata(gguf_path)?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|ts| ts.duration_since(UNIX_EPOCH).ok())
+        .map(|dur| dur.as_secs())
+        .unwrap_or(0);
+    Ok(Some(format!(
+        "{}|{}|{}",
+        canonical.display(),
+        metadata.len(),
+        modified
+    )))
+}
+
+fn transformed_qmatmul_cache_get(key: &str) -> Option<QMatMul> {
+    if !qwen35_transform_cache_enabled() || qwen35_transform_cache_entries() == 0 {
+        return None;
+    }
+    let cache = QWEN35_TRANSFORMED_QMATMUL_CACHE.get_or_init(|| Mutex::new(Default::default()));
+    let mut guard = cache.lock().ok()?;
+    guard.get(key)
+}
+
+fn transformed_qmatmul_cache_insert(key: String, value: QMatMul) {
+    let capacity = qwen35_transform_cache_entries();
+    if !qwen35_transform_cache_enabled() || capacity == 0 {
+        return;
+    }
+    let cache = QWEN35_TRANSFORMED_QMATMUL_CACHE.get_or_init(|| Mutex::new(Default::default()));
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key, value, capacity);
+    }
+}
+
 pub struct Qwen35ChatModel {
     device: DeviceProfile,
     tokenizer: ChatTokenizer,
     backend: Qwen35TextBackend,
     vision_support: Qwen35VisionSupport,
+    prefix_cache: Mutex<PrefixCacheStore>,
+    vision_embed_cache: Mutex<VisualEmbeddingCache>,
 }
 
 impl Qwen35ChatModel {
@@ -2552,12 +2918,16 @@ impl Qwen35ChatModel {
             device.kind, dtype
         );
 
-        Ok(Self {
+        let model = Self {
             device,
             tokenizer,
             backend: Qwen35TextBackend::Dense { text_model },
             vision_support,
-        })
+            prefix_cache: Mutex::new(Default::default()),
+            vision_embed_cache: Mutex::new(Default::default()),
+        };
+        model.maybe_warmup();
+        Ok(model)
     }
 
     fn load_gguf(model_dir: &Path, gguf_path: &Path, device: DeviceProfile) -> Result<Self> {
@@ -2581,8 +2951,15 @@ impl Qwen35ChatModel {
         let tokenizer = ChatTokenizer::load(model_dir, Some(config.vocab_size))?;
         let dtype = select_qwen35_gguf_quantized_dtype(&content, &device);
 
-        let text_model =
-            Qwen35QuantizedModel::load_gguf(&content, &mut reader, &device, dtype, config)?;
+        let transform_cache_scope = qwen35_transform_cache_scope(gguf_path)?;
+        let text_model = Qwen35QuantizedModel::load_gguf(
+            &content,
+            &mut reader,
+            &device,
+            dtype,
+            config,
+            transform_cache_scope.as_deref(),
+        )?;
         let vision_support = if let Some(mmproj_path) = find_mmproj_gguf(model_dir)? {
             let runtime = Qwen35VisionRuntime::load(&mmproj_path, &device, dtype, projection_dim)?;
             info!(
@@ -2603,14 +2980,18 @@ impl Qwen35ChatModel {
             dtype
         );
 
-        Ok(Self {
+        let model = Self {
             device,
             tokenizer,
             backend: Qwen35TextBackend::QuantizedGguf {
                 text_model: Mutex::new(text_model),
             },
             vision_support,
-        })
+            prefix_cache: Mutex::new(Default::default()),
+            vision_embed_cache: Mutex::new(Default::default()),
+        };
+        model.maybe_warmup();
+        Ok(model)
     }
 
     fn load_gguf_dense(model_dir: &Path, gguf_path: &Path, device: DeviceProfile) -> Result<Self> {
@@ -2892,12 +3273,16 @@ impl Qwen35ChatModel {
             dtype
         );
 
-        Ok(Self {
+        let model = Self {
             device,
             tokenizer,
             backend: Qwen35TextBackend::Dense { text_model },
             vision_support,
-        })
+            prefix_cache: Mutex::new(Default::default()),
+            vision_embed_cache: Mutex::new(Default::default()),
+        };
+        model.maybe_warmup();
+        Ok(model)
     }
 
     pub fn generate(
@@ -2941,16 +3326,15 @@ impl Qwen35ChatModel {
         let prompt = self.build_prompt(messages)?;
         let mut cache = self.new_cache()?;
         let logits = if prompt.multimodal.is_empty() {
-            let input_ids = Tensor::from_vec(
-                prompt.ids.clone(),
-                (1, prompt.ids.len()),
-                &self.device.device,
-            )?;
-            self.forward_text(&input_ids, 0, Some(&mut cache))?
+            self.prefill_text_with_prefix_cache(&prompt, &mut cache)?
         } else {
             self.prefill_with_multimodal(&prompt.ids, &prompt.multimodal, &mut cache)?
         };
-        let pos = logits.dim(1)?;
+        let pos = if prompt.multimodal.is_empty() {
+            prompt.ids.len()
+        } else {
+            logits.dim(1)?
+        };
 
         Ok(ChatDecodeState {
             cache,
@@ -3023,6 +3407,165 @@ impl Qwen35ChatModel {
 
     pub fn supports_incremental_decode(&self) -> bool {
         true
+    }
+
+    fn maybe_warmup(&self) {
+        if !qwen35_warmup_enabled() {
+            return;
+        }
+        let tokens = qwen35_warmup_prefill_tokens();
+        match self.run_warmup(tokens) {
+            Ok(()) => {
+                info!("Qwen3.5 warmup completed (prefill_tokens={tokens})");
+            }
+            Err(err) => {
+                warn!("Qwen3.5 warmup skipped after failure: {err}");
+            }
+        }
+    }
+
+    fn run_warmup(&self, prefill_tokens: usize) -> Result<()> {
+        let warm_token = self.tokenizer.specials.im_start;
+        let mut cache = self.new_cache()?;
+        let warm_ids = vec![warm_token; prefill_tokens.max(1)];
+        let input = Tensor::from_vec(warm_ids.clone(), (1, warm_ids.len()), &self.device.device)?;
+        let _ = self.forward_text(&input, 0, Some(&mut cache))?;
+        let decode = Tensor::from_vec(vec![warm_token], (1, 1), &self.device.device)?;
+        let _ = self.forward_text(&decode, warm_ids.len(), Some(&mut cache))?;
+        Ok(())
+    }
+
+    fn prefill_text_with_prefix_cache(
+        &self,
+        prompt: &PromptBuildOutput,
+        cache: &mut Qwen35Cache,
+    ) -> Result<Tensor> {
+        if prompt.ids.is_empty() {
+            return Err(Error::InvalidInput(
+                "Qwen3.5 prompt produced no tokens".to_string(),
+            ));
+        }
+
+        let mut logits = None;
+        let mut consumed = 0usize;
+        if let Some(prefix) = self.lookup_prefix_snapshot(&prompt.ids) {
+            *cache = prefix.cache;
+            logits = Some(prefix.logits);
+            consumed = prefix.ids.len();
+        }
+
+        let context_end = prompt.assistant_prefix_start.min(prompt.ids.len());
+        let mut context_snapshot = None;
+        if consumed < context_end {
+            logits = Some(self.prefill_text_segment(
+                &prompt.ids[consumed..context_end],
+                consumed,
+                cache,
+            )?);
+            consumed = context_end;
+        }
+
+        if context_end > 0 && consumed == context_end {
+            if let Some(ctx_logits) = logits.as_ref() {
+                context_snapshot = Some(PrefixCacheEntry {
+                    ids: prompt.ids[..context_end].to_vec(),
+                    cache: cache.clone(),
+                    logits: ctx_logits.clone(),
+                });
+            }
+        }
+
+        if consumed < prompt.ids.len() {
+            logits = Some(self.prefill_text_segment(&prompt.ids[consumed..], consumed, cache)?);
+        } else if logits.is_none() {
+            logits = Some(self.prefill_text_segment(&prompt.ids, 0, cache)?);
+        }
+
+        let logits = logits.ok_or_else(|| {
+            Error::InferenceError("Qwen3.5 prefill did not produce logits".to_string())
+        })?;
+
+        self.store_prefix_snapshot(PrefixCacheEntry {
+            ids: prompt.ids.clone(),
+            cache: cache.clone(),
+            logits: logits.clone(),
+        });
+        if let Some(entry) = context_snapshot {
+            self.store_prefix_snapshot(entry);
+        }
+        Ok(logits)
+    }
+
+    fn prefill_text_segment(
+        &self,
+        token_ids: &[u32],
+        start_pos: usize,
+        cache: &mut Qwen35Cache,
+    ) -> Result<Tensor> {
+        if token_ids.is_empty() {
+            return Err(Error::InvalidInput(
+                "Qwen3.5 prefill segment cannot be empty".to_string(),
+            ));
+        }
+        let input = Tensor::from_vec(
+            token_ids.to_vec(),
+            (1, token_ids.len()),
+            &self.device.device,
+        )?;
+        self.forward_text(&input, start_pos, Some(cache))
+    }
+
+    fn lookup_prefix_snapshot(&self, prompt_ids: &[u32]) -> Option<PrefixCacheEntry> {
+        let capacity = qwen35_prefix_cache_entries();
+        if capacity == 0 || prompt_ids.is_empty() {
+            return None;
+        }
+        let guard = self.prefix_cache.lock().ok()?;
+        guard.lookup_longest_prefix(prompt_ids)
+    }
+
+    fn store_prefix_snapshot(&self, entry: PrefixCacheEntry) {
+        let capacity = qwen35_prefix_cache_entries();
+        if capacity == 0 {
+            return;
+        }
+        if let Ok(mut guard) = self.prefix_cache.lock() {
+            guard.insert(entry, capacity);
+        }
+    }
+
+    fn encode_media_with_cache(
+        &self,
+        runtime: &Qwen35VisionRuntime,
+        media: &Qwen35MultimodalInput,
+    ) -> Result<Tensor> {
+        let capacity = qwen35_mm_embed_cache_size();
+        let kind = match media.kind {
+            Qwen35MultimodalKind::Image => "image",
+            Qwen35MultimodalKind::Video => "video",
+        };
+        let key = format!(
+            "{}|{}|{}",
+            runtime.source_path().display(),
+            kind,
+            media.source
+        );
+
+        if capacity > 0 {
+            if let Ok(mut guard) = self.vision_embed_cache.lock() {
+                if let Some(hit) = guard.get(&key) {
+                    return Ok(hit);
+                }
+            }
+        }
+
+        let encoded = runtime.encode_media(media)?;
+        if capacity > 0 {
+            if let Ok(mut guard) = self.vision_embed_cache.lock() {
+                guard.insert(key, encoded.clone(), capacity);
+            }
+        }
+        Ok(encoded)
     }
 
     fn new_cache(&self) -> Result<Qwen35Cache> {
@@ -3179,7 +3722,7 @@ impl Qwen35ChatModel {
 
         let mut visual_embeds = Vec::with_capacity(multimodal.len());
         for media in multimodal {
-            visual_embeds.push(runtime.encode_media(media)?);
+            visual_embeds.push(self.encode_media_with_cache(runtime, media)?);
         }
 
         let mut merged = Vec::with_capacity(placeholder_positions.len() * 2 + 1);
@@ -3323,6 +3866,7 @@ fn build_qwen35_prompt_ids(
         multimodal.extend(entry.multimodal.iter().cloned());
     }
 
+    let assistant_prefix_start = ids.len();
     ids.push(tokenizer.specials.im_start);
     ids.extend(tokenizer.encode_text("assistant\n")?);
     if enable_thinking.unwrap_or(false) {
@@ -3331,7 +3875,11 @@ fn build_qwen35_prompt_ids(
         ids.extend(tokenizer.encode_text("<think>\n\n</think>\n\n")?);
     }
 
-    Ok(PromptBuildOutput { ids, multimodal })
+    Ok(PromptBuildOutput {
+        ids,
+        multimodal,
+        assistant_prefix_start,
+    })
 }
 
 fn qwen35_tools_system_content(tools: &[Value], first_system_content: Option<&str>) -> String {
@@ -4305,6 +4853,14 @@ mod tests {
         assert!(enabled_prompt.ids.ends_with(&enabled_suffix));
         assert!(disabled_prompt.ids.ends_with(&disabled_suffix));
         assert!(no_control_prompt.ids.ends_with(&disabled_suffix));
+        assert_eq!(
+            enabled_prompt.assistant_prefix_start + enabled_suffix.len(),
+            enabled_prompt.ids.len()
+        );
+        assert_eq!(
+            disabled_prompt.assistant_prefix_start + disabled_suffix.len(),
+            disabled_prompt.ids.len()
+        );
     }
 
     #[test]
@@ -4372,5 +4928,40 @@ mod tests {
     fn does_not_flag_short_sequences_as_loop() {
         let ids: Vec<u32> = (1..30).collect();
         assert!(!has_token_repetition_loop(&ids));
+    }
+
+    #[test]
+    fn prefix_cache_store_uses_longest_prefix_match() {
+        let device = candle_core::Device::Cpu;
+        let logits = Tensor::zeros((1, 1), DType::F32, &device).expect("build logits");
+        let mk_entry = |ids: Vec<u32>| PrefixCacheEntry {
+            ids,
+            cache: Qwen35Cache { layers: Vec::new() },
+            logits: logits.clone(),
+        };
+
+        let mut store = PrefixCacheStore::default();
+        store.insert(mk_entry(vec![1, 2]), 4);
+        store.insert(mk_entry(vec![1, 2, 3]), 4);
+        store.insert(mk_entry(vec![9, 9]), 4);
+
+        let hit = store
+            .lookup_longest_prefix(&[1, 2, 3, 4, 5])
+            .expect("expected prefix hit");
+        assert_eq!(hit.ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn visual_embedding_cache_respects_capacity() {
+        let device = candle_core::Device::Cpu;
+        let mut cache = VisualEmbeddingCache::default();
+        let a = Tensor::zeros((1, 2), DType::F32, &device).expect("tensor a");
+        let b = Tensor::ones((1, 2), DType::F32, &device).expect("tensor b");
+
+        cache.insert("a".to_string(), a, 1);
+        assert!(cache.get("a").is_some());
+        cache.insert("b".to_string(), b, 1);
+        assert!(cache.get("a").is_none());
+        assert!(cache.get("b").is_some());
     }
 }
