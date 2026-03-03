@@ -222,6 +222,16 @@ pub async fn create_thread_message(
     Extension(ctx): Extension<RequestContext>,
     Json(req): Json<CreateThreadMessageRequest>,
 ) -> Result<Response, ApiError> {
+    let model_variant = parse_chat_model(&req.model)?;
+    let model_id = model_variant.dir_name().to_string();
+    if !is_qwen35_chat_variant(model_variant)
+        && content_parts_contain_media(req.content_parts.as_deref())
+    {
+        return Err(ApiError::bad_request(
+            "Image/video inputs in threaded chat are currently supported only for Qwen3.5 models",
+        ));
+    }
+
     let prepared_content_parts = persist_chat_media_parts(req.content_parts.clone())?;
     let flattened_content = flatten_thread_content(&req.content, prepared_content_parts.as_deref())
         .map_err(|err| {
@@ -238,8 +248,6 @@ pub async fn create_thread_message(
         .await
         .map_err(map_store_error)?;
 
-    let model_variant = parse_chat_model(&req.model)?;
-    let model_id = model_variant.dir_name().to_string();
     if !flattened_content.multimodal.is_empty() && !is_qwen35_chat_variant(model_variant) {
         return Err(ApiError::bad_request(
             "Image/video inputs in threaded chat are currently supported only for Qwen3.5 models",
@@ -982,6 +990,15 @@ fn content_part_is_video(part: &serde_json::Value) -> bool {
     map.contains_key("video") || map.contains_key("video_url") || map.contains_key("input_video")
 }
 
+fn content_parts_contain_media(content_parts: Option<&[serde_json::Value]>) -> bool {
+    let Some(parts) = content_parts else {
+        return false;
+    };
+    parts
+        .iter()
+        .any(|part| content_part_is_image(part) || content_part_is_video(part))
+}
+
 fn media_from_part_value(
     value: &serde_json::Value,
     kind: Qwen35MultimodalKind,
@@ -1161,6 +1178,20 @@ mod tests {
         let err = flatten_thread_content("", Some(&[json!({"type":"image_url","image_url":{}})]))
             .expect_err("missing source should fail");
         assert!(err.contains("missing a usable source"));
+    }
+
+    #[test]
+    fn content_parts_contain_media_detects_multimodal_parts() {
+        assert!(!content_parts_contain_media(None));
+        assert!(!content_parts_contain_media(Some(&[
+            json!({"type":"text","text":"hello"})
+        ])));
+        assert!(content_parts_contain_media(Some(&[
+            json!({"type":"image_url","image_url":{"url":"https://example.com/cat.png"}})
+        ])));
+        assert!(content_parts_contain_media(Some(&[
+            json!({"type":"input_video","input_video":{"url":"https://example.com/clip.mp4"}})
+        ])));
     }
 
     #[test]

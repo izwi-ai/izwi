@@ -663,6 +663,7 @@ export function ChatPlayground({
     !!activeThreadId &&
     (visibleMessages.length > 0 || isStreaming || messagesLoading);
   const thinkingEnabledForModel = supportsThinking && isThinkingEnabled;
+  const selectedModelSupportsMedia = isQwen35ChatModel(selectedModel);
   const renderModelId = activeThread?.model_id ?? selectedModel;
   const implicitQwen35Thinking = isQwen35ChatModel(renderModelId);
 
@@ -1037,6 +1038,10 @@ export function ChatPlayground({
         if (pickedFiles.length === 0) {
           return;
         }
+        if (!selectedModelSupportsMedia) {
+          setError("Image/video chat is currently supported only on Qwen3.5 models.");
+          return;
+        }
 
         const availableSlots = Math.max(0, MAX_MEDIA_ATTACHMENTS - mediaItems.length);
         if (availableSlots <= 0) {
@@ -1120,7 +1125,7 @@ export function ChatPlayground({
         setError(getErrorMessage(error, "Failed to read selected media files."));
       }
     },
-    [mediaItems.length, revokeMediaPreviews],
+    [mediaItems.length, revokeMediaPreviews, selectedModelSupportsMedia],
   );
 
   const sendMessage = async () => {
@@ -1524,10 +1529,15 @@ export function ChatPlayground({
             disabled={
               isStreaming ||
               isPreparingThread ||
-              mediaItems.length >= MAX_MEDIA_ATTACHMENTS
+              mediaItems.length >= MAX_MEDIA_ATTACHMENTS ||
+              !selectedModelSupportsMedia
             }
             className="h-8 gap-1.5 text-xs text-muted-foreground hover:text-foreground"
-            title="Attach image or video"
+            title={
+              selectedModelSupportsMedia
+                ? "Attach image or video"
+                : "Image/video upload is available only for Qwen3.5 models"
+            }
           >
             <Paperclip className="w-3.5 h-3.5" />
             Add Media
@@ -1602,6 +1612,7 @@ export function ChatPlayground({
         type="file"
         accept="image/*,video/*"
         multiple
+        disabled={!selectedModelSupportsMedia}
         onChange={handleSelectMedia}
         className="hidden"
       />
