@@ -3,6 +3,7 @@
 use anyhow::{anyhow, Context};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
+use serde_json::Value as JsonValue;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task;
@@ -28,6 +29,8 @@ pub struct ChatThreadMessage {
     pub thread_id: String,
     pub role: String,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_parts: Option<Vec<JsonValue>>,
     pub created_at: u64,
     pub tokens_generated: Option<usize>,
     pub generation_time_ms: Option<f64>,
@@ -63,6 +66,7 @@ impl ChatStore {
                 thread_id TEXT NOT NULL,
                 role TEXT NOT NULL CHECK(role IN ('system', 'user', 'assistant')),
                 content TEXT NOT NULL,
+                content_parts TEXT NULL,
                 created_at INTEGER NOT NULL,
                 tokens_generated INTEGER NULL,
                 generation_time_ms REAL NULL,
@@ -76,6 +80,7 @@ impl ChatStore {
             "#,
         )
         .context("Failed to initialize chat database schema")?;
+        ensure_chat_messages_content_parts_column(&conn)?;
 
         Ok(Self { db_path })
     }
@@ -179,6 +184,7 @@ impl ChatStore {
                     thread_id,
                     role,
                     content,
+                    content_parts,
                     created_at,
                     tokens_generated,
                     generation_time_ms
@@ -227,6 +233,7 @@ impl ChatStore {
         thread_id: String,
         role: String,
         content: String,
+        content_parts: Option<Vec<JsonValue>>,
         model_id: Option<String>,
         tokens_generated: Option<usize>,
         generation_time_ms: Option<f64>,
@@ -251,6 +258,11 @@ impl ChatStore {
             let now = now_unix_millis_i64();
             let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
             let tokens_i64 = opt_usize_to_i64(tokens_generated)?;
+            let serialized_content_parts = content_parts
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .context("Failed serializing chat message content_parts")?;
 
             tx.execute(
                 r#"
@@ -259,17 +271,19 @@ impl ChatStore {
                     thread_id,
                     role,
                     content,
+                    content_parts,
                     created_at,
                     tokens_generated,
                     generation_time_ms
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                 "#,
                 params![
                     message_id,
                     thread_id,
                     role,
                     content,
+                    serialized_content_parts,
                     now,
                     tokens_i64,
                     generation_time_ms
@@ -288,6 +302,7 @@ impl ChatStore {
                 thread_id,
                 role,
                 content,
+                content_parts,
                 created_at: now as u64,
                 tokens_generated,
                 generation_time_ms,
@@ -357,16 +372,49 @@ fn map_thread_summary(row: &Row<'_>) -> rusqlite::Result<ChatThreadSummary> {
 }
 
 fn map_thread_message(row: &Row<'_>) -> rusqlite::Result<ChatThreadMessage> {
-    let tokens_generated_raw: Option<i64> = row.get(5)?;
+    let content_parts_raw: Option<String> = row.get(4)?;
+    let content_parts = content_parts_raw
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Vec<JsonValue>>(raw).ok());
+    let tokens_generated_raw: Option<i64> = row.get(6)?;
     Ok(ChatThreadMessage {
         id: row.get(0)?,
         thread_id: row.get(1)?,
         role: row.get(2)?,
         content: row.get(3)?,
-        created_at: i64_to_u64(row.get(4)?),
+        content_parts,
+        created_at: i64_to_u64(row.get(5)?),
         tokens_generated: tokens_generated_raw.map(i64_to_usize),
-        generation_time_ms: row.get(6)?,
+        generation_time_ms: row.get(7)?,
     })
+}
+
+fn ensure_chat_messages_content_parts_column(conn: &Connection) -> anyhow::Result<()> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(chat_messages)")
+        .context("Failed to inspect chat_messages schema")?;
+    let mut rows = stmt
+        .query([])
+        .context("Failed to query chat_messages schema info")?;
+
+    while let Some(row) = rows
+        .next()
+        .context("Failed reading chat_messages schema row")?
+    {
+        let name: String = row
+            .get(1)
+            .context("Failed reading chat_messages column name")?;
+        if name == "content_parts" {
+            return Ok(());
+        }
+    }
+
+    conn.execute(
+        "ALTER TABLE chat_messages ADD COLUMN content_parts TEXT NULL",
+        [],
+    )
+    .context("Failed adding chat_messages.content_parts column")?;
+    Ok(())
 }
 
 fn now_unix_millis_i64() -> i64 {

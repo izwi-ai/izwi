@@ -92,6 +92,7 @@ export interface ChatThreadMessageRecord {
   thread_id: string;
   role: "system" | "user" | "assistant";
   content: string;
+  content_parts?: ChatThreadContentPart[] | null;
   created_at: number;
   tokens_generated: number | null;
   generation_time_ms: number | null;

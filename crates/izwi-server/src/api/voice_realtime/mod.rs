@@ -1370,6 +1370,7 @@ impl MemoryStore for ChatStoreMemory {
                 thread_id.to_string(),
                 role.as_str().to_string(),
                 content,
+                None,
                 meta.model_id,
                 meta.tokens_generated,
                 meta.generation_time_ms,

@@ -5,6 +5,7 @@ pub mod agent;
 pub mod chat;
 pub mod diarization;
 pub mod internal;
+pub mod media;
 pub mod openai;
 pub mod request_context;
 mod router;

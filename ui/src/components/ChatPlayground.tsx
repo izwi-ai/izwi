@@ -97,6 +97,17 @@ interface ParseAssistantContentOptions {
   implicitOpenThinkTag?: boolean;
 }
 
+interface ParsedUserAttachment {
+  kind: ComposerMediaKind;
+  source: string | null;
+  label: string;
+}
+
+interface ParsedUserMessageDisplay {
+  text: string;
+  attachments: ParsedUserAttachment[];
+}
+
 function parseAssistantContent(
   content: string,
   options?: ParseAssistantContentOptions,
@@ -371,6 +382,194 @@ function buildThreadContentParts(
     });
   }
   return parts;
+}
+
+function extractMarkdownImageSource(value: string): string | null {
+  const match = value.match(/^!\[[^\]]*\]\((.+)\)$/);
+  if (!match) {
+    return null;
+  }
+  const source = match[1]?.trim();
+  return source ? source : null;
+}
+
+function resolveAttachmentSource(
+  value: string,
+  kind: ComposerMediaKind,
+): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const source = extractMarkdownImageSource(trimmed) ?? trimmed;
+  const lowered = source.toLowerCase();
+  if (kind === "image") {
+    if (lowered.startsWith("data:image/")) {
+      return source;
+    }
+    if (
+      lowered.startsWith("https://") ||
+      lowered.startsWith("http://") ||
+      lowered.startsWith("blob:") ||
+      lowered.startsWith("/")
+    ) {
+      return source;
+    }
+    return null;
+  }
+
+  if (
+    lowered.startsWith("data:video/") ||
+    lowered.startsWith("https://") ||
+    lowered.startsWith("http://") ||
+    lowered.startsWith("blob:") ||
+    lowered.startsWith("/")
+  ) {
+    return source;
+  }
+  return null;
+}
+
+function attachmentLabel(value: string, kind: ComposerMediaKind): string {
+  const fallback = kind === "image" ? "Attached image" : "Attached video";
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return fallback;
+  }
+
+  const candidate = extractMarkdownImageSource(trimmed) ?? trimmed;
+  if (candidate.toLowerCase().startsWith("data:")) {
+    return fallback;
+  }
+
+  try {
+    const url = new URL(candidate);
+    const pathSegments = url.pathname.split("/").filter(Boolean);
+    const lastSegment = decodeURIComponent(
+      pathSegments[pathSegments.length - 1] || "",
+    ).trim();
+    if (lastSegment) {
+      return lastSegment;
+    }
+  } catch {
+    // Ignore invalid URLs and keep original string fallback below.
+  }
+
+  return trimmed;
+}
+
+function readObjectField(
+  value: unknown,
+  keys: string[],
+): string | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  for (const key of keys) {
+    const entry = record[key];
+    if (typeof entry === "string" && entry.trim()) {
+      return entry.trim();
+    }
+  }
+  return null;
+}
+
+function extractMediaSourceForDisplay(value: unknown): string | null {
+  if (typeof value === "string" && value.trim()) {
+    return value.trim();
+  }
+
+  return readObjectField(value, ["url", "src", "uri", "source"]);
+}
+
+function extractMediaLabel(value: unknown, kind: ComposerMediaKind): string {
+  if (typeof value === "string" && value.trim()) {
+    return attachmentLabel(value, kind);
+  }
+
+  const explicitName = readObjectField(value, ["name", "file_name", "filename"]);
+  if (explicitName) {
+    return explicitName;
+  }
+
+  const source = extractMediaSourceForDisplay(value);
+  if (source) {
+    return attachmentLabel(source, kind);
+  }
+
+  return kind === "image" ? "Attached image" : "Attached video";
+}
+
+function parseUserMessageDisplayFromContentParts(
+  message: ChatThreadMessageRecord,
+): ParsedUserMessageDisplay | null {
+  const parts = message.content_parts;
+  if (!parts || parts.length === 0) {
+    return null;
+  }
+
+  const textSegments: string[] = [];
+  const attachments: ParsedUserAttachment[] = [];
+
+  for (const part of parts) {
+    const type = (part.type || "").toLowerCase();
+    if (type === "text" || type === "input_text") {
+      const textCandidate =
+        (typeof part.text === "string" && part.text.trim()
+          ? part.text
+          : null) ||
+        (typeof part.input_text === "string" && part.input_text.trim()
+          ? part.input_text
+          : null);
+      if (textCandidate) {
+        textSegments.push(textCandidate.trim());
+      }
+      continue;
+    }
+
+    if (
+      type === "input_image" ||
+      type === "image_url" ||
+      type === "image" ||
+      part.input_image
+    ) {
+      const payload = part.input_image ?? part.image_url ?? part.image ?? null;
+      const source = extractMediaSourceForDisplay(payload);
+      attachments.push({
+        kind: "image",
+        source: source ? resolveAttachmentSource(source, "image") : null,
+        label: extractMediaLabel(payload, "image"),
+      });
+      continue;
+    }
+
+    if (
+      type === "input_video" ||
+      type === "video_url" ||
+      type === "video" ||
+      part.input_video
+    ) {
+      const payload = part.input_video ?? part.video_url ?? part.video ?? null;
+      const source = extractMediaSourceForDisplay(payload);
+      attachments.push({
+        kind: "video",
+        source: source ? resolveAttachmentSource(source, "video") : null,
+        label: extractMediaLabel(payload, "video"),
+      });
+      continue;
+    }
+  }
+
+  if (attachments.length === 0 && textSegments.length === 0) {
+    return null;
+  }
+
+  return {
+    text: textSegments.join("\n").trim(),
+    attachments,
+  };
 }
 
 interface GenerateTitleArgs {
@@ -1588,6 +1787,9 @@ export function ChatPlayground({
                   <div className="max-w-4xl mx-auto space-y-6">
                     {visibleMessages.map((message, index) => {
                       const isUser = message.role === "user";
+                      const parsedUserMessage = isUser
+                        ? parseUserMessageDisplayFromContentParts(message)
+                        : null;
                       const isLastAssistant =
                         !isUser &&
                         index === visibleMessages.length - 1 &&
@@ -1662,10 +1864,68 @@ export function ChatPlayground({
                               )}
                             >
                               {isUser ? (
-                                <MarkdownContent
-                                  content={message.content}
-                                  className="prose-p:leading-relaxed prose-pre:bg-black/10 dark:prose-pre:bg-white/10 prose-pre:border-none prose-a:text-primary-foreground underline"
-                                />
+                                <>
+                                  {(!parsedUserMessage ||
+                                    parsedUserMessage.text ||
+                                    parsedUserMessage.attachments.length === 0) && (
+                                    <MarkdownContent
+                                      content={
+                                        parsedUserMessage &&
+                                        parsedUserMessage.attachments.length > 0
+                                          ? parsedUserMessage.text
+                                          : message.content
+                                      }
+                                      className="prose-p:leading-relaxed prose-pre:bg-black/10 dark:prose-pre:bg-white/10 prose-pre:border-none prose-a:text-primary-foreground underline"
+                                    />
+                                  )}
+                                  {parsedUserMessage &&
+                                    parsedUserMessage.attachments.length > 0 && (
+                                      <div
+                                        className={cn(
+                                          "flex flex-wrap gap-2",
+                                          parsedUserMessage.text && "mt-2",
+                                        )}
+                                      >
+                                        {parsedUserMessage.attachments.map(
+                                          (attachment, attachmentIndex) => (
+                                            <div
+                                              key={`${messageKey}-attachment-${attachmentIndex}`}
+                                            >
+                                              {attachment.kind === "image" &&
+                                              attachment.source ? (
+                                                <a
+                                                  href={attachment.source}
+                                                  target="_blank"
+                                                  rel="noreferrer"
+                                                  title={attachment.label}
+                                                  className="block h-16 w-16 overflow-hidden rounded-md border border-primary-foreground/20 bg-primary-foreground/10 hover:bg-primary-foreground/15 transition-colors"
+                                                >
+                                                  <img
+                                                    src={attachment.source}
+                                                    alt={attachment.label}
+                                                    loading="lazy"
+                                                    className="h-full w-full object-cover"
+                                                  />
+                                                </a>
+                                              ) : (
+                                                <div className="inline-flex max-w-[220px] items-center gap-1.5 rounded-md border border-primary-foreground/20 bg-primary-foreground/10 px-2 py-1 text-xs text-primary-foreground/90">
+                                                  {attachment.kind ===
+                                                  "image" ? (
+                                                    <ImageIcon className="h-3.5 w-3.5 shrink-0" />
+                                                  ) : (
+                                                    <Film className="h-3.5 w-3.5 shrink-0" />
+                                                  )}
+                                                  <span className="truncate">
+                                                    {attachment.label}
+                                                  </span>
+                                                </div>
+                                              )}
+                                            </div>
+                                          ),
+                                        )}
+                                      </div>
+                                    )}
+                                </>
                               ) : (
                                 <>
                                   {showStreamingThinking && parsed && (

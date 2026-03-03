@@ -25,6 +25,21 @@ impl MediaGroup {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatMediaKind {
+    Image,
+    Video,
+}
+
+impl ChatMediaKind {
+    pub const fn as_dir(self) -> &'static str {
+        match self {
+            Self::Image => "images",
+            Self::Video => "videos",
+        }
+    }
+}
+
 pub fn resolve_db_path() -> PathBuf {
     if let Some(path) = env_path(DB_ENV_PRIMARY) {
         return path;
@@ -57,6 +72,16 @@ pub fn ensure_storage_dirs(db_path: &Path, media_root: &Path) -> anyhow::Result<
             media_root.display()
         )
     })?;
+
+    for child in ["images", "videos"] {
+        let child_dir = media_root.join(child);
+        std::fs::create_dir_all(&child_dir).with_context(|| {
+            format!(
+                "Failed to create media child directory: {}",
+                child_dir.display()
+            )
+        })?;
+    }
 
     Ok(())
 }
@@ -96,6 +121,68 @@ pub fn persist_audio_file(
             .join(namespace)
             .join(format!("{record_id}.{}.tmp", uuid::Uuid::new_v4().simple())),
     );
+
+    if let Some(parent) = full_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create media directory: {}", parent.display()))?;
+    }
+
+    std::fs::write(&temp_path, bytes).with_context(|| {
+        format!(
+            "Failed writing media file to temporary path: {}",
+            temp_path.display()
+        )
+    })?;
+
+    if let Err(err) = std::fs::rename(&temp_path, &full_path) {
+        if full_path.exists() {
+            std::fs::remove_file(&full_path).with_context(|| {
+                format!(
+                    "Failed replacing existing media file: {}",
+                    full_path.display()
+                )
+            })?;
+            std::fs::rename(&temp_path, &full_path).with_context(|| {
+                format!(
+                    "Failed moving media file from '{}' to '{}': {err}",
+                    temp_path.display(),
+                    full_path.display()
+                )
+            })?;
+        } else {
+            return Err(err).with_context(|| {
+                format!(
+                    "Failed moving media file from '{}' to '{}'",
+                    temp_path.display(),
+                    full_path.display()
+                )
+            });
+        }
+    }
+
+    Ok(normalize_relative_path(relative_path))
+}
+
+pub fn persist_chat_media_file(
+    media_root: &Path,
+    kind: ChatMediaKind,
+    preferred_filename: Option<&str>,
+    mime_type: Option<&str>,
+    bytes: &[u8],
+) -> anyhow::Result<String> {
+    if bytes.is_empty() {
+        return Err(anyhow!("Media payload cannot be empty"));
+    }
+
+    let extension = resolve_chat_media_extension(preferred_filename, mime_type, kind);
+    let relative_path = PathBuf::from(kind.as_dir()).join(format!(
+        "{}.{}",
+        uuid::Uuid::new_v4().simple(),
+        extension
+    ));
+    let full_path = media_root.join(&relative_path);
+    let temp_path = media_root
+        .join(PathBuf::from(kind.as_dir()).join(format!("{}.tmp", uuid::Uuid::new_v4().simple())));
 
     if let Some(parent) = full_path.parent() {
         std::fs::create_dir_all(parent)
@@ -205,6 +292,56 @@ fn resolve_audio_extension(preferred_filename: Option<&str>, mime_type: &str) ->
         "audio/aac" => "aac",
         "audio/basic" => "au",
         _ => "bin",
+    };
+
+    mapped.to_string()
+}
+
+fn resolve_chat_media_extension(
+    preferred_filename: Option<&str>,
+    mime_type: Option<&str>,
+    kind: ChatMediaKind,
+) -> String {
+    if let Some(ext) = preferred_filename
+        .and_then(|name| Path::new(name).extension())
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.trim().to_ascii_lowercase())
+        .filter(|ext| is_safe_extension(ext.as_str()))
+    {
+        return ext;
+    }
+
+    let mime = mime_type
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    let mapped = match mime.as_str() {
+        "image/jpeg" | "image/jpg" | "image/pjpeg" => "jpg",
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/bmp" => "bmp",
+        "image/tiff" | "image/tif" => "tiff",
+        "image/avif" => "avif",
+        "image/heic" => "heic",
+        "image/heif" => "heif",
+        "image/svg+xml" => "svg",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "video/ogg" => "ogv",
+        "video/quicktime" => "mov",
+        "video/x-msvideo" => "avi",
+        "video/x-matroska" => "mkv",
+        "video/mpeg" => "mpeg",
+        "video/3gpp" => "3gp",
+        _ => match kind {
+            ChatMediaKind::Image => "png",
+            ChatMediaKind::Video => "mp4",
+        },
     };
 
     mapped.to_string()

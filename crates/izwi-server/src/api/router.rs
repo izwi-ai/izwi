@@ -26,6 +26,7 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::api::internal::router())
         .merge(crate::api::agent::router())
         .merge(crate::api::chat::router())
+        .merge(crate::api::media::router())
         .merge(crate::api::transcription::router())
         .merge(crate::api::diarization::router())
         .merge(crate::api::speech_history::router())
