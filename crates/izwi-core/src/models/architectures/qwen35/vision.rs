@@ -582,8 +582,14 @@ fn extract_video_frames_with_ffmpeg(bytes: &[u8], source: &str) -> Result<Vec<Rg
     let input_path = temp_root.join(format!("input.{extension}"));
     fs::write(&input_path, bytes)?;
     let pattern = temp_root.join("frame_%02d.png");
+    let ffmpeg = resolve_ffmpeg_binary().ok_or_else(|| {
+        Error::InferenceError(
+            "Video decoding requires `ffmpeg`, but it was not found in PATH. Install ffmpeg or set `IZWI_QWEN35_FFMPEG_PATH` (or `IZWI_FFMPEG_PATH`) to the ffmpeg binary."
+                .to_string(),
+        )
+    })?;
 
-    let output = Command::new("ffmpeg")
+    let output = Command::new(&ffmpeg)
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("error")
@@ -595,7 +601,8 @@ fn extract_video_frames_with_ffmpeg(bytes: &[u8], source: &str) -> Result<Vec<Rg
         .output()
         .map_err(|e| {
             Error::InferenceError(format!(
-                "Video decoding requires `ffmpeg` in PATH; failed to launch for `{source}`: {e}"
+                "Failed to launch ffmpeg (`{}`) for `{source}`: {e}",
+                ffmpeg.display()
             ))
         })?;
 
@@ -633,6 +640,54 @@ fn extract_video_frames_with_ffmpeg(bytes: &[u8], source: &str) -> Result<Vec<Rg
         )));
     }
     Ok(frames)
+}
+
+fn resolve_ffmpeg_binary() -> Option<PathBuf> {
+    for var in ["IZWI_QWEN35_FFMPEG_PATH", "IZWI_FFMPEG_PATH"] {
+        if let Ok(raw) = std::env::var(var) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return Some(PathBuf::from(trimmed));
+            }
+        }
+    }
+
+    if let Some(path_env) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_env) {
+            let candidate = dir.join("ffmpeg");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    for candidate in [
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        "/usr/bin/ffmpeg",
+        "/bin/ffmpeg",
+    ] {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            for candidate in [
+                parent.join("ffmpeg"),
+                parent.join("../Resources/ffmpeg"),
+                parent.join("../Resources/bin/ffmpeg"),
+            ] {
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn source_extension(source: &str) -> Option<&str> {
