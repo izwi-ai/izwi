@@ -2030,7 +2030,21 @@ impl Qwen35QuantizedModel {
         start_pos: usize,
         cache: Option<&mut Qwen35Cache>,
     ) -> Result<Tensor> {
-        let mut x = self.embed_tokens.forward(input_ids)?;
+        let embeds = self.embeddings(input_ids)?;
+        self.forward_with_embeds(&embeds, start_pos, cache)
+    }
+
+    fn embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.embed_tokens.forward(input_ids).map_err(Error::from)
+    }
+
+    fn forward_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        cache: Option<&mut Qwen35Cache>,
+    ) -> Result<Tensor> {
+        let mut x = embeds.clone();
         let mut cache = cache;
         for (idx, layer) in self.layers.iter().enumerate() {
             let layer_cache = if let Some(cache_ref) = cache.as_deref_mut() {
@@ -2180,12 +2194,26 @@ impl Qwen35ChatModel {
         let content = gguf_file::Content::read(&mut reader)
             .map_err(|e| Error::ModelLoadError(format!("Failed to parse GGUF header: {e}")))?;
         let config = parse_qwen35_gguf_config(&content)?;
+        let projection_dim = config.hidden_size;
 
         let tokenizer = ChatTokenizer::load(model_dir, Some(config.vocab_size))?;
         let dtype = select_qwen35_gguf_quantized_dtype(&content, &device);
 
         let text_model =
             Qwen35QuantizedModel::load_gguf(&content, &mut reader, &device, dtype, config)?;
+        let vision_support = if let Some(mmproj_path) = find_mmproj_gguf(model_dir)? {
+            let runtime = Qwen35VisionRuntime::load(&mmproj_path, &device, dtype, projection_dim)?;
+            info!(
+                "Loaded Qwen3.5 multimodal projector runtime from {}",
+                mmproj_path.display()
+            );
+            Qwen35VisionSupport::Ready {
+                path: mmproj_path,
+                runtime,
+            }
+        } else {
+            Qwen35VisionSupport::MissingProjector
+        };
         info!(
             "Loaded Qwen3.5 quantized GGUF chat model on {:?} from {} with dtype {:?}",
             device.kind,
@@ -2199,8 +2227,7 @@ impl Qwen35ChatModel {
             backend: Qwen35TextBackend::QuantizedGguf {
                 text_model: Mutex::new(text_model),
             },
-            // Quantized GGUF path is text-only; multimodal requires native backend.
-            vision_support: Qwen35VisionSupport::MissingProjector,
+            vision_support,
         })
     }
 
@@ -2647,6 +2674,37 @@ impl Qwen35ChatModel {
         }
     }
 
+    fn text_embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
+        match &self.backend {
+            Qwen35TextBackend::Dense { text_model } => text_model.embeddings(input_ids),
+            Qwen35TextBackend::QuantizedGguf { text_model, .. } => {
+                let model = text_model.lock().map_err(|_| {
+                    Error::InferenceError("Qwen3.5 quantized GGUF model mutex poisoned".to_string())
+                })?;
+                model.embeddings(input_ids)
+            }
+        }
+    }
+
+    fn forward_text_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        cache: Option<&mut Qwen35Cache>,
+    ) -> Result<Tensor> {
+        match &self.backend {
+            Qwen35TextBackend::Dense { text_model } => {
+                text_model.forward_with_embeds(embeds, start_pos, cache)
+            }
+            Qwen35TextBackend::QuantizedGguf { text_model, .. } => {
+                let model = text_model.lock().map_err(|_| {
+                    Error::InferenceError("Qwen3.5 quantized GGUF model mutex poisoned".to_string())
+                })?;
+                model.forward_with_embeds(embeds, start_pos, cache)
+            }
+        }
+    }
+
     fn build_prompt(&self, messages: &[ChatMessage]) -> Result<PromptBuildOutput> {
         let prompt = build_qwen35_prompt_ids(&self.tokenizer, messages)?;
         self.ensure_multimodal_ready(&prompt)?;
@@ -2684,13 +2742,6 @@ impl Qwen35ChatModel {
             )));
         }
 
-        if matches!(&self.backend, Qwen35TextBackend::QuantizedGguf { .. }) {
-            return Err(Error::InvalidInput(
-                "Qwen3.5 multimodal input is unavailable on the quantized GGUF backend. Set `IZWI_QWEN35_GGUF_BACKEND=native` and reload the model."
-                    .to_string(),
-            ));
-        }
-
         match &self.vision_support {
             Qwen35VisionSupport::MissingProjector => Err(Error::InvalidInput(
                 "Qwen3.5 multimodal input requested, but projector weights are missing. Download `mmproj-F16.gguf` for this model variant first.".to_string(),
@@ -2705,16 +2756,6 @@ impl Qwen35ChatModel {
         multimodal: &[Qwen35MultimodalInput],
         cache: &mut Qwen35Cache,
     ) -> Result<Tensor> {
-        let text_model = match &self.backend {
-            Qwen35TextBackend::Dense { text_model } => text_model,
-            Qwen35TextBackend::QuantizedGguf { .. } => {
-                return Err(Error::InvalidInput(
-                    "Qwen3.5 multimodal input is unavailable on the quantized GGUF backend."
-                        .to_string(),
-                ))
-            }
-        };
-
         let runtime = match &self.vision_support {
             Qwen35VisionSupport::Ready { runtime, .. } => runtime,
             Qwen35VisionSupport::MissingProjector => {
@@ -2730,7 +2771,7 @@ impl Qwen35ChatModel {
             (1, prompt_ids.len()),
             &self.device.device,
         )?;
-        let input_embeds = text_model.embeddings(&input_ids)?;
+        let input_embeds = self.text_embeddings(&input_ids)?;
 
         let placeholder_positions = prompt_ids
             .iter()
@@ -2782,7 +2823,7 @@ impl Qwen35ChatModel {
         }
 
         let fused_embeds = Tensor::cat(&merged, 1)?;
-        text_model.forward_with_embeds(&fused_embeds, 0, Some(cache))
+        self.forward_text_with_embeds(&fused_embeds, 0, Some(cache))
     }
 }
 
