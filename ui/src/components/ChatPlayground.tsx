@@ -93,9 +93,48 @@ interface ParsedAssistantContent {
   hasIncompleteThink: boolean;
 }
 
-function parseAssistantContent(content: string): ParsedAssistantContent {
+interface ParseAssistantContentOptions {
+  implicitOpenThinkTag?: boolean;
+}
+
+function parseAssistantContent(
+  content: string,
+  options?: ParseAssistantContentOptions,
+): ParsedAssistantContent {
   const openTag = "<think>";
   const closeTag = "</think>";
+  const raw = content ?? "";
+  const implicitOpenThinkTag = !!options?.implicitOpenThinkTag;
+  const lowered = raw.toLowerCase();
+  const firstOpen = lowered.indexOf(openTag);
+  const firstClose = lowered.indexOf(closeTag);
+
+  if (
+    implicitOpenThinkTag &&
+    firstClose >= 0 &&
+    (firstOpen === -1 || firstClose < firstOpen)
+  ) {
+    const thinking = raw.slice(0, firstClose).trim();
+    const answer = raw.slice(firstClose + closeTag.length).trim();
+    return {
+      thinking,
+      answer,
+      hasThink: thinking.length > 0,
+      hasIncompleteThink: false,
+    };
+  }
+
+  if (implicitOpenThinkTag && firstOpen === -1 && firstClose === -1) {
+    const thinking = raw.trim();
+    if (thinking.length > 0) {
+      return {
+        thinking,
+        answer: "",
+        hasThink: true,
+        hasIncompleteThink: true,
+      };
+    }
+  }
 
   const thinkingParts: string[] = [];
   const answerParts: string[] = [];
@@ -103,23 +142,23 @@ function parseAssistantContent(content: string): ParsedAssistantContent {
   let hasIncompleteThink = false;
 
   while (true) {
-    const openIdx = content.indexOf(openTag, cursor);
+    const openIdx = raw.indexOf(openTag, cursor);
     if (openIdx === -1) {
-      answerParts.push(content.slice(cursor));
+      answerParts.push(raw.slice(cursor));
       break;
     }
 
-    answerParts.push(content.slice(cursor, openIdx));
+    answerParts.push(raw.slice(cursor, openIdx));
     const thinkStart = openIdx + openTag.length;
-    const closeIdx = content.indexOf(closeTag, thinkStart);
+    const closeIdx = raw.indexOf(closeTag, thinkStart);
 
     if (closeIdx === -1) {
-      thinkingParts.push(content.slice(thinkStart));
+      thinkingParts.push(raw.slice(thinkStart));
       hasIncompleteThink = true;
       break;
     }
 
-    thinkingParts.push(content.slice(thinkStart, closeIdx));
+    thinkingParts.push(raw.slice(thinkStart, closeIdx));
     cursor = closeIdx + closeTag.length;
   }
 
@@ -180,7 +219,17 @@ function normalizeWhitespace(text: string): string {
 }
 
 function stripThinkingArtifacts(text: string): string {
-  return text
+  let output = text;
+  const openTag = "<think>";
+  const closeTag = "</think>";
+  const lowered = output.toLowerCase();
+  const firstOpen = lowered.indexOf(openTag);
+  const firstClose = lowered.indexOf(closeTag);
+  if (firstClose >= 0 && (firstOpen === -1 || firstClose < firstOpen)) {
+    output = output.slice(firstClose + closeTag.length);
+  }
+
+  return output
     .replace(/<think>[\s\S]*?<\/think>/gi, " ")
     .replace(/<think>[\s\S]*$/gi, " ")
     .replace(/<think>/gi, " ")
@@ -402,6 +451,8 @@ export function ChatPlayground({
     !!activeThreadId &&
     (visibleMessages.length > 0 || isStreaming || messagesLoading);
   const thinkingEnabledForModel = supportsThinking && isThinkingEnabled;
+  const renderModelId = activeThread?.model_id ?? selectedModel;
+  const implicitQwen35Thinking = isQwen35ChatModel(renderModelId);
 
   const setActiveThreadInUrl = useCallback(
     (threadId: string | null, replace = false) => {
@@ -1550,7 +1601,10 @@ export function ChatPlayground({
                       const parsed = isUser
                         ? null
                         : thinkingEnabledForModel
-                          ? parseAssistantContent(message.content || "")
+                          ? parseAssistantContent(message.content || "", {
+                              implicitOpenThinkTag:
+                                implicitQwen35Thinking && thinkingEnabledForModel,
+                            })
                           : null;
                       const messageKey = message.id;
                       const isThoughtExpanded = !!expandedThoughts[messageKey];

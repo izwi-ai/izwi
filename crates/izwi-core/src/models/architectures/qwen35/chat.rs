@@ -2052,6 +2052,14 @@ fn strip_think_blocks(input: &str) -> String {
     let open = "<think>";
     let close = "</think>";
 
+    if let Some(close_idx) = output.find(close) {
+        let has_open_before_close = output[..close_idx].find(open).is_some();
+        if !has_open_before_close {
+            let start = close_idx + close.len();
+            output = output[start..].to_string();
+        }
+    }
+
     loop {
         let Some(start) = output.find(open) else {
             break;
@@ -2068,7 +2076,7 @@ fn strip_think_blocks(input: &str) -> String {
         break;
     }
 
-    output.trim().to_string()
+    output.replace(close, " ").trim().to_string()
 }
 
 fn argmax(logits: &Tensor) -> Result<u32> {
@@ -2833,5 +2841,12 @@ mod tests {
             .filter(|&&id| id == tokenizer.specials.image_pad)
             .count();
         assert_eq!(image_pad_count, 1);
+    }
+
+    #[test]
+    fn strip_think_blocks_handles_implicit_qwen35_open_tag() {
+        let input = "reasoning line one\nreasoning line two</think>\n\nFinal answer.";
+        let stripped = strip_think_blocks(input);
+        assert_eq!(stripped, "Final answer.");
     }
 }

@@ -520,6 +520,14 @@ fn strip_think_blocks(input: &str) -> String {
     let open = "<think>";
     let close = "</think>";
 
+    if let Some(close_idx) = output.find(close) {
+        let has_open_before_close = output[..close_idx].find(open).is_some();
+        if !has_open_before_close {
+            let start = close_idx + close.len();
+            output = output[start..].to_string();
+        }
+    }
+
     loop {
         let Some(start) = output.find(open) else {
             break;
@@ -536,7 +544,7 @@ fn strip_think_blocks(input: &str) -> String {
         break;
     }
 
-    output.trim().to_string()
+    output.replace(close, " ").trim().to_string()
 }
 
 fn parse_qwen3_config(config_str: &str) -> Result<Qwen3Config> {
@@ -584,4 +592,21 @@ fn text_delta(previous: &str, current: &str) -> String {
         .take_while(|(a, b)| a == b)
         .count();
     current.chars().skip(common).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_think_blocks;
+
+    #[test]
+    fn strip_think_blocks_handles_explicit_tags() {
+        let stripped = strip_think_blocks("<think>reasoning</think>\nFinal answer");
+        assert_eq!(stripped, "Final answer");
+    }
+
+    #[test]
+    fn strip_think_blocks_handles_implicit_open_pattern() {
+        let stripped = strip_think_blocks("reasoning only</think>\nFinal answer");
+        assert_eq!(stripped, "Final answer");
+    }
 }
