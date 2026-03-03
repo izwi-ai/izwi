@@ -436,11 +436,17 @@ impl Qwen35VisionRuntime {
         let patches = aligned_patches.as_ref().unwrap_or(patches);
 
         let in_per_frame = 3 * self.config.patch_size * self.config.patch_size;
-        let p0 = patches.narrow(1, 0, in_per_frame)?;
-        let p1 = patches.narrow(1, in_per_frame, in_per_frame)?;
+        // `narrow` on the last dim of `[seq, in*2]` yields strided views.
+        // Metal matmul requires contiguous inputs in this path.
+        let p0 = patches.narrow(1, 0, in_per_frame)?.contiguous()?;
+        let p1 = patches
+            .narrow(1, in_per_frame, in_per_frame)?
+            .contiguous()?;
+        let w0_t = self.patch_weight_0.transpose(0, 1)?.contiguous()?;
+        let w1_t = self.patch_weight_1.transpose(0, 1)?.contiguous()?;
 
-        let mut x = p0.matmul(&self.patch_weight_0.transpose(0, 1)?)?;
-        x = x.broadcast_add(&p1.matmul(&self.patch_weight_1.transpose(0, 1)?)?)?;
+        let mut x = p0.matmul(&w0_t)?;
+        x = x.broadcast_add(&p1.matmul(&w1_t)?)?;
         x = x.broadcast_add(&self.patch_bias.unsqueeze(0)?)?;
         x = x.broadcast_add(&self.position_embeddings)?;
 
