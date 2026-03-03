@@ -7,8 +7,9 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use candle_core::quantized::gguf_file;
+use candle_core::quantized::{gguf_file, GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, IndexOp, Tensor, D};
 use candle_nn::{ops, Conv1d, Conv1dConfig, Embedding, Linear, Module, VarBuilder};
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
@@ -362,8 +363,7 @@ struct Qwen35RmsNorm {
 }
 
 impl Qwen35RmsNorm {
-    fn load(dim: usize, eps: f64, one_centered: bool, vb: VarBuilder) -> Result<Self> {
-        let weight = vb.get_unchecked_dtype("weight", vb.dtype())?;
+    fn from_weight(dim: usize, eps: f64, one_centered: bool, weight: Tensor) -> Result<Self> {
         let got = weight.dims1()?;
         if got != dim {
             return Err(Error::ModelLoadError(format!(
@@ -375,6 +375,11 @@ impl Qwen35RmsNorm {
             eps,
             one_centered,
         })
+    }
+
+    fn load(dim: usize, eps: f64, one_centered: bool, vb: VarBuilder) -> Result<Self> {
+        let weight = vb.get_unchecked_dtype("weight", vb.dtype())?;
+        Self::from_weight(dim, eps, one_centered, weight)
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -405,8 +410,7 @@ struct Qwen35RmsNormGated {
 }
 
 impl Qwen35RmsNormGated {
-    fn load(dim: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
-        let weight = vb.get_unchecked_dtype("weight", vb.dtype())?;
+    fn from_weight(dim: usize, eps: f64, weight: Tensor) -> Result<Self> {
         let got = weight.dims1()?;
         if got != dim {
             return Err(Error::ModelLoadError(format!(
@@ -414,6 +418,11 @@ impl Qwen35RmsNormGated {
             )));
         }
         Ok(Self { weight, eps })
+    }
+
+    fn load(dim: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
+        let weight = vb.get_unchecked_dtype("weight", vb.dtype())?;
+        Self::from_weight(dim, eps, weight)
     }
 
     fn forward(&self, hidden_states: &Tensor, gate: &Tensor) -> Result<Tensor> {
@@ -1155,11 +1164,911 @@ impl Qwen35Model {
     }
 }
 
+fn load_gguf_qmatmul<R: std::io::Read + std::io::Seek>(
+    content: &gguf_file::Content,
+    reader: &mut R,
+    device: &DeviceProfile,
+    src: &str,
+) -> Result<QMatMul> {
+    let qtensor = content.tensor(reader, src, &device.device).map_err(|e| {
+        Error::ModelLoadError(format!("Failed to load GGUF quantized tensor `{src}`: {e}"))
+    })?;
+    QMatMul::from_qtensor(qtensor).map_err(|e| {
+        Error::ModelLoadError(format!("Failed to build quantized matmul for `{src}`: {e}"))
+    })
+}
+
+fn load_gguf_transformed_qmatmul<R, F>(
+    content: &gguf_file::Content,
+    reader: &mut R,
+    device: &DeviceProfile,
+    dtype: DType,
+    src: &str,
+    transform: F,
+) -> Result<QMatMul>
+where
+    R: std::io::Read + std::io::Seek,
+    F: FnOnce(Tensor) -> Result<Tensor>,
+{
+    let source = content.tensor(reader, src, &device.device).map_err(|e| {
+        Error::ModelLoadError(format!("Failed to load GGUF quantized tensor `{src}`: {e}"))
+    })?;
+    let source_dtype = source.dtype();
+    let tensor = dequantize_qtensor_to_dtype(&source, device, dtype).map_err(|e| {
+        Error::ModelLoadError(format!("Failed to dequantize GGUF tensor `{src}`: {e}"))
+    })?;
+    let tensor = transform(tensor)?;
+    let tensor = if tensor.dtype() != dtype {
+        tensor.to_dtype(dtype)?
+    } else {
+        tensor
+    };
+    let tensor = tensor.contiguous()?;
+    let qtensor = QTensor::quantize(&tensor, source_dtype)
+        .or_else(|_| QTensor::quantize(&tensor, GgmlDType::F16))
+        .map_err(|e| {
+            Error::ModelLoadError(format!(
+                "Failed to requantize transformed GGUF tensor `{src}`: {e}"
+            ))
+        })?;
+    QMatMul::from_qtensor(qtensor).map_err(|e| {
+        Error::ModelLoadError(format!("Failed to build quantized matmul for `{src}`: {e}"))
+    })
+}
+
+struct Qwen35QuantizedMlp {
+    gate_proj: QMatMul,
+    up_proj: QMatMul,
+    down_proj: QMatMul,
+}
+
+impl Qwen35QuantizedMlp {
+    fn load<R: std::io::Read + std::io::Seek>(
+        content: &gguf_file::Content,
+        reader: &mut R,
+        device: &DeviceProfile,
+        layer_src_prefix: &str,
+    ) -> Result<Self> {
+        let gate_proj = load_gguf_qmatmul(
+            content,
+            reader,
+            device,
+            &format!("{layer_src_prefix}.ffn_gate.weight"),
+        )?;
+        let up_proj = load_gguf_qmatmul(
+            content,
+            reader,
+            device,
+            &format!("{layer_src_prefix}.ffn_up.weight"),
+        )?;
+        let down_proj = load_gguf_qmatmul(
+            content,
+            reader,
+            device,
+            &format!("{layer_src_prefix}.ffn_down.weight"),
+        )?;
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let gate = self.gate_proj.forward(x)?;
+        let up = self.up_proj.forward(x)?;
+        let gated = ops::silu(&gate)?.broadcast_mul(&up)?;
+        self.down_proj.forward(&gated).map_err(Error::from)
+    }
+}
+
+struct Qwen35QuantizedFullAttention {
+    q_proj: QMatMul,
+    k_proj: QMatMul,
+    v_proj: QMatMul,
+    o_proj: QMatMul,
+    q_norm: Qwen35RmsNorm,
+    k_norm: Qwen35RmsNorm,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+}
+
+impl Qwen35QuantizedFullAttention {
+    fn load<R: std::io::Read + std::io::Seek>(
+        content: &gguf_file::Content,
+        reader: &mut R,
+        device: &DeviceProfile,
+        dtype: DType,
+        cfg: &Qwen35TextConfig,
+        layer_src_prefix: &str,
+    ) -> Result<Self> {
+        let q_proj = load_gguf_qmatmul(
+            content,
+            reader,
+            device,
+            &format!("{layer_src_prefix}.attn_q.weight"),
+        )?;
+        let k_proj = load_gguf_qmatmul(
+            content,
+            reader,
+            device,
+            &format!("{layer_src_prefix}.attn_k.weight"),
+        )?;
+        let v_proj = load_gguf_qmatmul(
+            content,
+            reader,
+            device,
+            &format!("{layer_src_prefix}.attn_v.weight"),
+        )?;
+        let o_proj = load_gguf_qmatmul(
+            content,
+            reader,
+            device,
+            &format!("{layer_src_prefix}.attn_output.weight"),
+        )?;
+        let q_norm = Qwen35RmsNorm::from_weight(
+            cfg.head_dim,
+            cfg.rms_norm_eps,
+            true,
+            load_gguf_one_centered_norm_as_delta(
+                content,
+                reader,
+                device,
+                dtype,
+                &format!("{layer_src_prefix}.attn_q_norm.weight"),
+            )?,
+        )?;
+        let k_norm = Qwen35RmsNorm::from_weight(
+            cfg.head_dim,
+            cfg.rms_norm_eps,
+            true,
+            load_gguf_one_centered_norm_as_delta(
+                content,
+                reader,
+                device,
+                dtype,
+                &format!("{layer_src_prefix}.attn_k_norm.weight"),
+            )?,
+        )?;
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
+            num_heads: cfg.num_attention_heads,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            rotary_dim: cfg.rotary_dim(),
+        })
+    }
+
+    fn forward(
+        &self,
+        x: &Tensor,
+        start_pos: usize,
+        rope_theta: f64,
+        layer_cache: Option<&mut Qwen35LayerCache>,
+    ) -> Result<Tensor> {
+        let (batch_size, seq_len, _) = x.dims3()?;
+
+        let q_with_gate = self.q_proj.forward(x)?.reshape((
+            batch_size,
+            seq_len,
+            self.num_heads,
+            self.head_dim * 2,
+        ))?;
+        let query = q_with_gate.narrow(3, 0, self.head_dim)?;
+        let gate = q_with_gate.narrow(3, self.head_dim, self.head_dim)?;
+        let gate = gate.reshape((batch_size, seq_len, ()))?;
+
+        let query = self.q_norm.forward(&query)?;
+        let key = self.k_norm.forward(&self.k_proj.forward(x)?.reshape((
+            batch_size,
+            seq_len,
+            self.num_kv_heads,
+            self.head_dim,
+        ))?)?;
+        let value = self.v_proj.forward(x)?.reshape((
+            batch_size,
+            seq_len,
+            self.num_kv_heads,
+            self.head_dim,
+        ))?;
+
+        let mut query = query.transpose(1, 2)?.contiguous()?;
+        let mut key = key.transpose(1, 2)?.contiguous()?;
+        let value = value.transpose(1, 2)?.contiguous()?;
+
+        if self.rotary_dim > 0 {
+            let (cos_half, sin_half) = build_rope_cache(
+                seq_len,
+                self.rotary_dim,
+                start_pos,
+                rope_theta,
+                x.device(),
+                query.dtype(),
+            )?;
+            let cos = Tensor::cat(&[cos_half.clone(), cos_half], 1)?
+                .unsqueeze(0)?
+                .unsqueeze(0)?;
+            let sin = Tensor::cat(&[sin_half.clone(), sin_half], 1)?
+                .unsqueeze(0)?
+                .unsqueeze(0)?;
+            query = apply_partial_rotary(&query, &cos, &sin, self.rotary_dim)?.contiguous()?;
+            key = apply_partial_rotary(&key, &cos, &sin, self.rotary_dim)?.contiguous()?;
+        }
+
+        let (k_all, v_all) = if let Some(layer_cache) = layer_cache {
+            match layer_cache {
+                Qwen35LayerCache::Full { k, v } => {
+                    let next_k = if let Some(prev) = k.as_ref() {
+                        Tensor::cat(&[prev.clone(), key.clone()], 2)?
+                    } else {
+                        key.clone()
+                    };
+                    let next_v = if let Some(prev) = v.as_ref() {
+                        Tensor::cat(&[prev.clone(), value.clone()], 2)?
+                    } else {
+                        value.clone()
+                    };
+                    *k = Some(next_k.clone());
+                    *v = Some(next_v.clone());
+                    (next_k, next_v)
+                }
+                _ => {
+                    return Err(Error::InferenceError(
+                        "Qwen3.5 full-attention layer received a linear-attention cache entry"
+                            .to_string(),
+                    ))
+                }
+            }
+        } else {
+            (key, value)
+        };
+
+        let n_rep = self.num_heads / self.num_kv_heads;
+        let key = repeat_kv_bhsd(&k_all, n_rep)?.contiguous()?;
+        let value = repeat_kv_bhsd(&v_all, n_rep)?.contiguous()?;
+
+        let mut att = query.matmul(&key.transpose(2, 3)?.contiguous()?)?;
+        let scale =
+            Tensor::new((self.head_dim as f32).sqrt(), x.device())?.to_dtype(att.dtype())?;
+        att = att.broadcast_div(&scale)?;
+
+        let total_len = key.dim(2)?;
+        if seq_len > 1 || total_len > seq_len {
+            let mask = causal_mask(seq_len, total_len, start_pos, x.device(), att.dtype())?
+                .unsqueeze(1)?;
+            att = att.broadcast_add(&mask)?;
+        }
+
+        let att = ops::softmax(&att.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(query.dtype())?;
+        let att_out = att.matmul(&value)?;
+        let att_out = att_out
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((batch_size, seq_len, ()))?;
+
+        let att_out = att_out.broadcast_mul(&ops::sigmoid(&gate)?)?;
+        self.o_proj.forward(&att_out).map_err(Error::from)
+    }
+}
+
+struct Qwen35QuantizedLinearAttention {
+    hidden_size: usize,
+    num_v_heads: usize,
+    num_k_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    key_dim: usize,
+    value_dim: usize,
+    conv_kernel_size: usize,
+    conv: Conv1d,
+    conv_weight: Tensor,
+    in_proj_qkv: QMatMul,
+    in_proj_z: QMatMul,
+    in_proj_b: QMatMul,
+    in_proj_a: QMatMul,
+    dt_bias: Tensor,
+    a_log: Tensor,
+    norm: Qwen35RmsNormGated,
+    out_proj: QMatMul,
+}
+
+impl Qwen35QuantizedLinearAttention {
+    fn load<R: std::io::Read + std::io::Seek>(
+        content: &gguf_file::Content,
+        reader: &mut R,
+        device: &DeviceProfile,
+        dtype: DType,
+        cfg: &Qwen35TextConfig,
+        layer_src_prefix: &str,
+    ) -> Result<Self> {
+        let num_v_heads = cfg.linear_num_value_heads;
+        let num_k_heads = cfg.linear_num_key_heads;
+        let head_k_dim = cfg.linear_key_head_dim;
+        let head_v_dim = cfg.linear_value_head_dim;
+        let key_dim = head_k_dim * num_k_heads;
+        let value_dim = head_v_dim * num_v_heads;
+        let conv_kernel_size = cfg.linear_conv_kernel_dim;
+        let conv_dim = key_dim * 2 + value_dim;
+
+        let qkv_src = format!("{layer_src_prefix}.attn_qkv.weight");
+        let in_proj_qkv =
+            load_gguf_transformed_qmatmul(content, reader, device, dtype, &qkv_src, |tensor| {
+                untile_linear_qkv_weight(tensor, cfg, &qkv_src)
+            })?;
+
+        let z_src = format!("{layer_src_prefix}.attn_gate.weight");
+        let in_proj_z =
+            load_gguf_transformed_qmatmul(content, reader, device, dtype, &z_src, |tensor| {
+                untile_linear_v_rows(
+                    tensor,
+                    cfg.linear_num_key_heads,
+                    cfg.linear_num_value_heads,
+                    cfg.linear_value_head_dim,
+                    &z_src,
+                )
+            })?;
+
+        let beta_src = format!("{layer_src_prefix}.ssm_beta.weight");
+        let in_proj_b =
+            load_gguf_transformed_qmatmul(content, reader, device, dtype, &beta_src, |tensor| {
+                untile_linear_v_rows(
+                    tensor,
+                    cfg.linear_num_key_heads,
+                    cfg.linear_num_value_heads,
+                    1,
+                    &beta_src,
+                )
+            })?;
+
+        let alpha_src = format!("{layer_src_prefix}.ssm_alpha.weight");
+        let in_proj_a =
+            load_gguf_transformed_qmatmul(content, reader, device, dtype, &alpha_src, |tensor| {
+                untile_linear_v_rows(
+                    tensor,
+                    cfg.linear_num_key_heads,
+                    cfg.linear_num_value_heads,
+                    1,
+                    &alpha_src,
+                )
+            })?;
+
+        let dt_src = format!("{layer_src_prefix}.ssm_dt.bias");
+        let dt_bias = untile_linear_v_vector(
+            load_gguf_tensor(content, reader, device, dtype, &dt_src)?,
+            cfg.linear_num_key_heads,
+            cfg.linear_num_value_heads,
+            &dt_src,
+        )?;
+
+        let ssm_a_src = format!("{layer_src_prefix}.ssm_a");
+        let a_log = load_gguf_tensor(content, reader, device, dtype, &ssm_a_src)?;
+        let a_log = a_log
+            .to_dtype(DType::F32)?
+            .neg()?
+            .clamp(1e-30f64, f64::MAX)?
+            .log()?;
+        let a_log = if a_log.dtype() != dtype {
+            a_log.to_dtype(dtype)?
+        } else {
+            a_log
+        };
+        let a_log = untile_linear_v_vector(
+            a_log,
+            cfg.linear_num_key_heads,
+            cfg.linear_num_value_heads,
+            &ssm_a_src,
+        )?;
+
+        let norm_weight = load_gguf_tensor(
+            content,
+            reader,
+            device,
+            dtype,
+            &format!("{layer_src_prefix}.ssm_norm.weight"),
+        )?;
+        let norm = Qwen35RmsNormGated::from_weight(head_v_dim, cfg.rms_norm_eps, norm_weight)?;
+
+        let out_proj_src = format!("{layer_src_prefix}.ssm_out.weight");
+        let out_proj = load_gguf_transformed_qmatmul(
+            content,
+            reader,
+            device,
+            dtype,
+            &out_proj_src,
+            |tensor| untile_linear_out_proj_weight(tensor, cfg, &out_proj_src),
+        )?;
+
+        let conv_src = format!("{layer_src_prefix}.ssm_conv1d.weight");
+        let conv_weight = untile_linear_conv_weight(
+            load_gguf_tensor(content, reader, device, dtype, &conv_src)?,
+            cfg,
+            &conv_src,
+        )?;
+        let conv = Conv1d::new(
+            conv_weight.unsqueeze(1)?,
+            None,
+            Conv1dConfig {
+                groups: conv_dim,
+                padding: conv_kernel_size.saturating_sub(1),
+                ..Default::default()
+            },
+        );
+
+        Ok(Self {
+            hidden_size: cfg.hidden_size,
+            num_v_heads,
+            num_k_heads,
+            head_k_dim,
+            head_v_dim,
+            key_dim,
+            value_dim,
+            conv_kernel_size,
+            conv,
+            conv_weight,
+            in_proj_qkv,
+            in_proj_z,
+            in_proj_b,
+            in_proj_a,
+            dt_bias,
+            a_log,
+            norm,
+            out_proj,
+        })
+    }
+
+    fn forward(
+        &self,
+        hidden_states: &Tensor,
+        layer_cache: Option<&mut Qwen35LayerCache>,
+    ) -> Result<Tensor> {
+        let (batch_size, seq_len, hidden_size) = hidden_states.dims3()?;
+        if hidden_size != self.hidden_size {
+            return Err(Error::InferenceError(format!(
+                "Qwen3.5 linear-attention hidden size mismatch: expected {}, got {}",
+                self.hidden_size, hidden_size
+            )));
+        }
+
+        let (conv_state, recurrent_state) = if let Some(layer_cache) = layer_cache {
+            match layer_cache {
+                Qwen35LayerCache::Linear {
+                    conv_state,
+                    recurrent_state,
+                } => (Some(conv_state), Some(recurrent_state)),
+                _ => {
+                    return Err(Error::InferenceError(
+                        "Qwen3.5 linear-attention layer received a full-attention cache entry"
+                            .to_string(),
+                    ));
+                }
+            }
+        } else {
+            (None, None)
+        };
+
+        let projected_qkv = self.in_proj_qkv.forward(hidden_states)?;
+        let z = self.in_proj_z.forward(hidden_states)?.reshape((
+            batch_size,
+            seq_len,
+            self.num_v_heads,
+            self.head_v_dim,
+        ))?;
+        let b = self.in_proj_b.forward(hidden_states)?;
+        let a = self.in_proj_a.forward(hidden_states)?;
+
+        let mut mixed_qkv = projected_qkv.transpose(1, 2)?.contiguous()?;
+        let use_precomputed_states =
+            conv_state.as_ref().and_then(|slot| slot.as_ref()).is_some() && seq_len == 1;
+
+        mixed_qkv = if use_precomputed_states {
+            let prev_state = conv_state
+                .as_ref()
+                .and_then(|slot| slot.as_ref())
+                .ok_or_else(|| {
+                    Error::InferenceError(
+                        "Missing Qwen3.5 linear conv state for decode step".to_string(),
+                    )
+                })?;
+            let (out, next_state) = self.depthwise_conv_step(&mixed_qkv, prev_state)?;
+            if let Some(slot) = conv_state {
+                *slot = Some(next_state);
+            }
+            out
+        } else {
+            if let Some(slot) = conv_state {
+                *slot = Some(self.build_conv_state(&mixed_qkv)?);
+            }
+            let out = self.conv.forward(&mixed_qkv.contiguous()?)?;
+            let out = out.narrow(2, 0, seq_len)?;
+            ops::silu(&out)?
+        };
+
+        mixed_qkv = mixed_qkv.transpose(1, 2)?;
+
+        let query = mixed_qkv.narrow(2, 0, self.key_dim)?.reshape((
+            batch_size,
+            seq_len,
+            self.num_k_heads,
+            self.head_k_dim,
+        ))?;
+        let key = mixed_qkv.narrow(2, self.key_dim, self.key_dim)?.reshape((
+            batch_size,
+            seq_len,
+            self.num_k_heads,
+            self.head_k_dim,
+        ))?;
+        let value = mixed_qkv
+            .narrow(2, self.key_dim * 2, self.value_dim)?
+            .reshape((batch_size, seq_len, self.num_v_heads, self.head_v_dim))?;
+
+        let beta = ops::sigmoid(&b)?;
+        let dt = a.broadcast_add(&self.dt_bias.reshape((1, 1, self.num_v_heads))?)?;
+        let softplus = stable_softplus(&dt)?;
+        let a_exp =
+            self.a_log
+                .to_dtype(softplus.dtype())?
+                .exp()?
+                .reshape((1, 1, self.num_v_heads))?;
+        let g = softplus.broadcast_mul(&a_exp)?.neg()?;
+
+        let repeats = self.num_v_heads / self.num_k_heads;
+        let query = if repeats > 1 {
+            repeat_kv_bshd(&query, repeats)?
+        } else {
+            query
+        };
+        let key = if repeats > 1 {
+            repeat_kv_bshd(&key, repeats)?
+        } else {
+            key
+        };
+
+        let initial_state = recurrent_state
+            .as_ref()
+            .and_then(|slot| slot.as_ref())
+            .cloned();
+        let (core_attn_out, last_recurrent_state) = self.recurrent_gated_delta_rule(
+            &query,
+            &key,
+            &value,
+            &g,
+            &beta,
+            initial_state.as_ref(),
+        )?;
+
+        if let Some(slot) = recurrent_state {
+            *slot = Some(last_recurrent_state);
+        }
+
+        let core_flat = core_attn_out.reshape(((), self.head_v_dim))?;
+        let z_flat = z.reshape(((), self.head_v_dim))?;
+        let core_norm = self.norm.forward(&core_flat, &z_flat)?;
+        let core_norm = core_norm.reshape((batch_size, seq_len, self.value_dim))?;
+        self.out_proj.forward(&core_norm).map_err(Error::from)
+    }
+
+    fn build_conv_state(&self, mixed_qkv: &Tensor) -> Result<Tensor> {
+        let (batch, channels, seq_len) = mixed_qkv.dims3()?;
+        if seq_len >= self.conv_kernel_size {
+            mixed_qkv
+                .narrow(2, seq_len - self.conv_kernel_size, self.conv_kernel_size)
+                .map_err(Error::from)
+        } else {
+            let pad = Tensor::zeros(
+                (batch, channels, self.conv_kernel_size - seq_len),
+                mixed_qkv.dtype(),
+                mixed_qkv.device(),
+            )?;
+            Tensor::cat(&[pad, mixed_qkv.clone()], 2).map_err(Error::from)
+        }
+    }
+
+    fn depthwise_conv_step(
+        &self,
+        mixed_qkv: &Tensor,
+        prev_state: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let (_batch, channels, seq_len) = mixed_qkv.dims3()?;
+        if seq_len != 1 {
+            return Err(Error::InferenceError(format!(
+                "Qwen3.5 linear conv step expects seq_len=1, got {seq_len}"
+            )));
+        }
+        if prev_state.dim(1)? != channels || prev_state.dim(2)? != self.conv_kernel_size {
+            return Err(Error::InferenceError(format!(
+                "Invalid Qwen3.5 conv state shape: expected [batch,{channels},{}]",
+                self.conv_kernel_size
+            )));
+        }
+
+        let next_state = if self.conv_kernel_size > 1 {
+            let tail = prev_state.narrow(2, 1, self.conv_kernel_size - 1)?;
+            Tensor::cat(&[tail, mixed_qkv.clone()], 2)?
+        } else {
+            mixed_qkv.clone()
+        };
+
+        let weight = self.conv_weight.unsqueeze(0)?;
+        let conv = next_state
+            .broadcast_mul(&weight)?
+            .sum_keepdim(2)
+            .map_err(Error::from)?;
+        let conv = ops::silu(&conv)?;
+        Ok((conv, next_state))
+    }
+
+    fn recurrent_gated_delta_rule(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        g: &Tensor,
+        beta: &Tensor,
+        initial_state: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        let initial_dtype = query.dtype();
+        let (batch_size, seq_len, num_heads, _head_k_dim) = query.dims4()?;
+
+        let query = l2norm_last_dim(&query.to_dtype(DType::F32)?)?;
+        let key = l2norm_last_dim(&key.to_dtype(DType::F32)?)?;
+        let value = value.to_dtype(DType::F32)?;
+        let beta = beta.to_dtype(DType::F32)?;
+        let g = g.to_dtype(DType::F32)?.exp()?;
+
+        let scale = Tensor::new((self.head_k_dim as f32).sqrt(), query.device())?
+            .to_dtype(query.dtype())?;
+        let query = query.broadcast_div(&scale)?;
+
+        let mut state = if let Some(state) = initial_state {
+            state.to_dtype(DType::F32)?
+        } else {
+            Tensor::zeros(
+                (batch_size, num_heads, self.head_k_dim, self.head_v_dim),
+                DType::F32,
+                query.device(),
+            )?
+        };
+
+        let mut outputs = Vec::with_capacity(seq_len);
+        for idx in 0..seq_len {
+            let q_t = query.narrow(1, idx, 1)?.squeeze(1)?;
+            let k_t = key.narrow(1, idx, 1)?.squeeze(1)?;
+            let v_t = value.narrow(1, idx, 1)?.squeeze(1)?;
+            let beta_t = beta.narrow(1, idx, 1)?.squeeze(1)?;
+            let g_t = g.narrow(1, idx, 1)?.squeeze(1)?;
+
+            let g_scale = g_t.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?;
+            state = state.broadcast_mul(&g_scale)?;
+
+            let kv_mem = state
+                .broadcast_mul(&k_t.unsqueeze(D::Minus1)?)?
+                .sum(D::Minus2)
+                .map_err(Error::from)?;
+            let delta = v_t
+                .broadcast_sub(&kv_mem)?
+                .broadcast_mul(&beta_t.unsqueeze(D::Minus1)?)?;
+            let update = k_t
+                .unsqueeze(D::Minus1)?
+                .broadcast_mul(&delta.unsqueeze(D::Minus2)?)?;
+            state = state.broadcast_add(&update)?;
+
+            let out_t = state
+                .broadcast_mul(&q_t.unsqueeze(D::Minus1)?)?
+                .sum(D::Minus2)
+                .map_err(Error::from)?;
+            outputs.push(out_t.unsqueeze(1)?);
+        }
+
+        let output = Tensor::cat(&outputs, 1)?.to_dtype(initial_dtype)?;
+        Ok((output, state))
+    }
+}
+
+enum Qwen35QuantizedTokenMixer {
+    Full(Qwen35QuantizedFullAttention),
+    Linear(Qwen35QuantizedLinearAttention),
+}
+
+struct Qwen35QuantizedLayer {
+    mixer: Qwen35QuantizedTokenMixer,
+    input_layernorm: Qwen35RmsNorm,
+    post_attention_layernorm: Qwen35RmsNorm,
+    mlp: Qwen35QuantizedMlp,
+}
+
+impl Qwen35QuantizedLayer {
+    fn load<R: std::io::Read + std::io::Seek>(
+        content: &gguf_file::Content,
+        reader: &mut R,
+        device: &DeviceProfile,
+        dtype: DType,
+        cfg: &Qwen35TextConfig,
+        layer_idx: usize,
+    ) -> Result<Self> {
+        let src = format!("blk.{layer_idx}");
+        let input_layernorm = Qwen35RmsNorm::from_weight(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            true,
+            load_gguf_one_centered_norm_as_delta(
+                content,
+                reader,
+                device,
+                dtype,
+                &format!("{src}.attn_norm.weight"),
+            )?,
+        )?;
+        let post_attention_layernorm = Qwen35RmsNorm::from_weight(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            true,
+            load_gguf_one_centered_norm_as_delta(
+                content,
+                reader,
+                device,
+                dtype,
+                &format!("{src}.post_attention_norm.weight"),
+            )?,
+        )?;
+
+        let mixer = match cfg.layer_types[layer_idx] {
+            LayerType::FullAttention => Qwen35QuantizedTokenMixer::Full(
+                Qwen35QuantizedFullAttention::load(content, reader, device, dtype, cfg, &src)?,
+            ),
+            LayerType::LinearAttention => Qwen35QuantizedTokenMixer::Linear(
+                Qwen35QuantizedLinearAttention::load(content, reader, device, dtype, cfg, &src)?,
+            ),
+        };
+        let mlp = Qwen35QuantizedMlp::load(content, reader, device, &src)?;
+
+        Ok(Self {
+            mixer,
+            input_layernorm,
+            post_attention_layernorm,
+            mlp,
+        })
+    }
+
+    fn forward(
+        &self,
+        x: &Tensor,
+        start_pos: usize,
+        rope_theta: f64,
+        layer_cache: Option<&mut Qwen35LayerCache>,
+    ) -> Result<Tensor> {
+        let residual = x;
+        let x = self.input_layernorm.forward(x)?;
+        let x = match &self.mixer {
+            Qwen35QuantizedTokenMixer::Full(attn) => {
+                attn.forward(&x, start_pos, rope_theta, layer_cache)?
+            }
+            Qwen35QuantizedTokenMixer::Linear(linear) => linear.forward(&x, layer_cache)?,
+        };
+        let x = x.broadcast_add(residual)?;
+        let residual = &x;
+        let x = self.post_attention_layernorm.forward(&x)?;
+        let x = self.mlp.forward(&x)?;
+        x.broadcast_add(residual).map_err(Error::from)
+    }
+}
+
+struct Qwen35QuantizedModel {
+    embed_tokens: Embedding,
+    layers: Vec<Qwen35QuantizedLayer>,
+    norm: Qwen35RmsNorm,
+    lm_head: QMatMul,
+    cfg: Qwen35TextConfig,
+}
+
+impl Qwen35QuantizedModel {
+    fn load_gguf<R: std::io::Read + std::io::Seek>(
+        content: &gguf_file::Content,
+        reader: &mut R,
+        device: &DeviceProfile,
+        dtype: DType,
+        cfg: Qwen35TextConfig,
+    ) -> Result<Self> {
+        let embed_q = content
+            .tensor(reader, "token_embd.weight", &device.device)
+            .map_err(|e| {
+                Error::ModelLoadError(format!(
+                    "Failed to load GGUF tensor `token_embd.weight`: {e}"
+                ))
+            })?;
+        let embed_weight = dequantize_qtensor_to_dtype(&embed_q, device, dtype).map_err(|e| {
+            Error::ModelLoadError(format!(
+                "Failed to dequantize GGUF tensor `token_embd.weight`: {e}"
+            ))
+        })?;
+        let embed_tokens = Embedding::new(embed_weight, cfg.hidden_size);
+
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        for idx in 0..cfg.num_hidden_layers {
+            layers.push(Qwen35QuantizedLayer::load(
+                content, reader, device, dtype, &cfg, idx,
+            )?);
+        }
+
+        let norm = Qwen35RmsNorm::from_weight(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            true,
+            load_gguf_one_centered_norm_as_delta(
+                content,
+                reader,
+                device,
+                dtype,
+                "output_norm.weight",
+            )?,
+        )?;
+
+        let lm_head = if content.tensor_infos.contains_key("output.weight") {
+            load_gguf_qmatmul(content, reader, device, "output.weight")?
+        } else {
+            load_gguf_qmatmul(content, reader, device, "token_embd.weight")?
+        };
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            cfg,
+        })
+    }
+
+    fn forward(
+        &self,
+        input_ids: &Tensor,
+        start_pos: usize,
+        cache: Option<&mut Qwen35Cache>,
+    ) -> Result<Tensor> {
+        let mut x = self.embed_tokens.forward(input_ids)?;
+        let mut cache = cache;
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let layer_cache = if let Some(cache_ref) = cache.as_deref_mut() {
+                Some(cache_ref.layer_mut(idx)?)
+            } else {
+                None
+            };
+            x = layer.forward(&x, start_pos, self.cfg.rope_theta, layer_cache)?;
+        }
+        let x = self.norm.forward(&x)?;
+        self.lm_head.forward(&x).map_err(Error::from)
+    }
+
+    fn new_cache(&self) -> Qwen35Cache {
+        Qwen35Cache::new(&self.cfg.layer_types)
+    }
+}
+
 enum Qwen35VisionSupport {
     MissingProjector,
     Ready {
         path: PathBuf,
         runtime: Qwen35VisionRuntime,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Qwen35GgufBackend {
+    Quantized,
+    Native,
+}
+
+enum Qwen35TextBackend {
+    Dense {
+        text_model: Qwen35Model,
+    },
+    QuantizedGguf {
+        text_model: Mutex<Qwen35QuantizedModel>,
     },
 }
 
@@ -1172,7 +2081,7 @@ struct PromptBuildOutput {
 pub struct Qwen35ChatModel {
     device: DeviceProfile,
     tokenizer: ChatTokenizer,
-    text_model: Qwen35Model,
+    backend: Qwen35TextBackend,
     vision_support: Qwen35VisionSupport,
 }
 
@@ -1250,12 +2159,52 @@ impl Qwen35ChatModel {
         Ok(Self {
             device,
             tokenizer,
-            text_model,
+            backend: Qwen35TextBackend::Dense { text_model },
             vision_support,
         })
     }
 
     fn load_gguf(model_dir: &Path, gguf_path: &Path, device: DeviceProfile) -> Result<Self> {
+        match select_qwen35_gguf_backend()? {
+            Qwen35GgufBackend::Quantized => Self::load_gguf_quantized(model_dir, gguf_path, device),
+            Qwen35GgufBackend::Native => Self::load_gguf_dense(model_dir, gguf_path, device),
+        }
+    }
+
+    fn load_gguf_quantized(
+        model_dir: &Path,
+        gguf_path: &Path,
+        device: DeviceProfile,
+    ) -> Result<Self> {
+        let mut reader = BufReader::new(fs::File::open(gguf_path)?);
+        let content = gguf_file::Content::read(&mut reader)
+            .map_err(|e| Error::ModelLoadError(format!("Failed to parse GGUF header: {e}")))?;
+        let config = parse_qwen35_gguf_config(&content)?;
+
+        let tokenizer = ChatTokenizer::load(model_dir, Some(config.vocab_size))?;
+        let dtype = select_qwen35_gguf_quantized_dtype(&content, &device);
+
+        let text_model =
+            Qwen35QuantizedModel::load_gguf(&content, &mut reader, &device, dtype, config)?;
+        info!(
+            "Loaded Qwen3.5 quantized GGUF chat model on {:?} from {} with dtype {:?}",
+            device.kind,
+            gguf_path.display(),
+            dtype
+        );
+
+        Ok(Self {
+            device,
+            tokenizer,
+            backend: Qwen35TextBackend::QuantizedGguf {
+                text_model: Mutex::new(text_model),
+            },
+            // Quantized GGUF path is text-only; multimodal requires native backend.
+            vision_support: Qwen35VisionSupport::MissingProjector,
+        })
+    }
+
+    fn load_gguf_dense(model_dir: &Path, gguf_path: &Path, device: DeviceProfile) -> Result<Self> {
         let mut reader = BufReader::new(fs::File::open(gguf_path)?);
         let content = gguf_file::Content::read(&mut reader)
             .map_err(|e| Error::ModelLoadError(format!("Failed to parse GGUF header: {e}")))?;
@@ -1537,7 +2486,7 @@ impl Qwen35ChatModel {
         Ok(Self {
             device,
             tokenizer,
-            text_model,
+            backend: Qwen35TextBackend::Dense { text_model },
             vision_support,
         })
     }
@@ -1581,14 +2530,14 @@ impl Qwen35ChatModel {
         max_new_tokens: usize,
     ) -> Result<ChatDecodeState> {
         let prompt = self.build_prompt(messages)?;
-        let mut cache = self.text_model.new_cache();
+        let mut cache = self.new_cache()?;
         let logits = if prompt.multimodal.is_empty() {
             let input_ids = Tensor::from_vec(
                 prompt.ids.clone(),
                 (1, prompt.ids.len()),
                 &self.device.device,
             )?;
-            self.text_model.forward(&input_ids, 0, Some(&mut cache))?
+            self.forward_text(&input_ids, 0, Some(&mut cache))?
         } else {
             self.prefill_with_multimodal(&prompt.ids, &prompt.multimodal, &mut cache)?
         };
@@ -1638,9 +2587,7 @@ impl Qwen35ChatModel {
         state.assembled = decoded;
 
         let next_tensor = Tensor::from_vec(vec![next], (1, 1), &self.device.device)?;
-        state.logits = self
-            .text_model
-            .forward(&next_tensor, state.pos, Some(&mut state.cache))?;
+        state.logits = self.forward_text(&next_tensor, state.pos, Some(&mut state.cache))?;
         state.pos += 1;
 
         if state.generated_ids.len() >= state.max_new_tokens {
@@ -1657,6 +2604,37 @@ impl Qwen35ChatModel {
 
     pub fn supports_incremental_decode(&self) -> bool {
         true
+    }
+
+    fn new_cache(&self) -> Result<Qwen35Cache> {
+        match &self.backend {
+            Qwen35TextBackend::Dense { text_model } => Ok(text_model.new_cache()),
+            Qwen35TextBackend::QuantizedGguf { text_model, .. } => {
+                let model = text_model.lock().map_err(|_| {
+                    Error::InferenceError("Qwen3.5 quantized GGUF model mutex poisoned".to_string())
+                })?;
+                Ok(model.new_cache())
+            }
+        }
+    }
+
+    fn forward_text(
+        &self,
+        input_ids: &Tensor,
+        start_pos: usize,
+        cache: Option<&mut Qwen35Cache>,
+    ) -> Result<Tensor> {
+        match &self.backend {
+            Qwen35TextBackend::Dense { text_model } => {
+                text_model.forward(input_ids, start_pos, cache)
+            }
+            Qwen35TextBackend::QuantizedGguf { text_model, .. } => {
+                let model = text_model.lock().map_err(|_| {
+                    Error::InferenceError("Qwen3.5 quantized GGUF model mutex poisoned".to_string())
+                })?;
+                model.forward(input_ids, start_pos, cache)
+            }
+        }
     }
 
     fn build_prompt(&self, messages: &[ChatMessage]) -> Result<PromptBuildOutput> {
@@ -1696,6 +2674,13 @@ impl Qwen35ChatModel {
             )));
         }
 
+        if matches!(&self.backend, Qwen35TextBackend::QuantizedGguf { .. }) {
+            return Err(Error::InvalidInput(
+                "Qwen3.5 multimodal input is unavailable on the quantized GGUF backend. Set `IZWI_QWEN35_GGUF_BACKEND=native` and reload the model."
+                    .to_string(),
+            ));
+        }
+
         match &self.vision_support {
             Qwen35VisionSupport::MissingProjector => Err(Error::InvalidInput(
                 "Qwen3.5 multimodal input requested, but projector weights are missing. Download `mmproj-F16.gguf` for this model variant first.".to_string(),
@@ -1710,6 +2695,16 @@ impl Qwen35ChatModel {
         multimodal: &[Qwen35MultimodalInput],
         cache: &mut Qwen35Cache,
     ) -> Result<Tensor> {
+        let text_model = match &self.backend {
+            Qwen35TextBackend::Dense { text_model } => text_model,
+            Qwen35TextBackend::QuantizedGguf { .. } => {
+                return Err(Error::InvalidInput(
+                    "Qwen3.5 multimodal input is unavailable on the quantized GGUF backend."
+                        .to_string(),
+                ))
+            }
+        };
+
         let runtime = match &self.vision_support {
             Qwen35VisionSupport::Ready { runtime, .. } => runtime,
             Qwen35VisionSupport::MissingProjector => {
@@ -1725,7 +2720,7 @@ impl Qwen35ChatModel {
             (1, prompt_ids.len()),
             &self.device.device,
         )?;
-        let input_embeds = self.text_model.embeddings(&input_ids)?;
+        let input_embeds = text_model.embeddings(&input_ids)?;
 
         let placeholder_positions = prompt_ids
             .iter()
@@ -1777,8 +2772,7 @@ impl Qwen35ChatModel {
         }
 
         let fused_embeds = Tensor::cat(&merged, 1)?;
-        self.text_model
-            .forward_with_embeds(&fused_embeds, 0, Some(cache))
+        text_model.forward_with_embeds(&fused_embeds, 0, Some(cache))
     }
 }
 
@@ -2347,9 +3341,54 @@ fn parse_qwen35_gguf_config(content: &gguf_file::Content) -> Result<Qwen35TextCo
     Qwen35TextConfig::from_raw(raw)
 }
 
-fn load_gguf_tensor(
+fn dequantize_qtensor_to_dtype(
+    qtensor: &QTensor,
+    device: &DeviceProfile,
+    dtype: DType,
+) -> Result<Tensor> {
+    let mut tensor = if dtype == DType::F16 {
+        qtensor.dequantize_f16(&device.device)?
+    } else {
+        qtensor.dequantize(&device.device)?
+    };
+    if tensor.dtype() != dtype {
+        tensor = tensor.to_dtype(dtype)?;
+    }
+    Ok(tensor)
+}
+
+fn gguf_general_dtype(content: &gguf_file::Content) -> Option<DType> {
+    let value = content.metadata.get("general.dtype")?.to_u32().ok()?;
+    match value {
+        0 => Some(DType::F32),
+        1 => Some(DType::F16),
+        _ => None,
+    }
+}
+
+fn select_qwen35_gguf_quantized_dtype(
     content: &gguf_file::Content,
-    reader: &mut BufReader<fs::File>,
+    device: &DeviceProfile,
+) -> DType {
+    let dtype_override = std::env::var("IZWI_CHAT_DTYPE")
+        .ok()
+        .or_else(|| std::env::var("IZWI_QWEN_DTYPE").ok());
+    let requested = match dtype_override.as_deref().map(str::trim) {
+        Some(raw) if !raw.is_empty() => device.select_dtype(Some(raw)),
+        _ => gguf_general_dtype(content).unwrap_or(DType::F16),
+    };
+    // Candle's quantized Metal kernel requires F32 activation input for QTensor matmul.
+    // Keep quantized GGUF Qwen3.5 on Metal in F32 to avoid runtime dtype assertion panics.
+    if device.kind.is_metal() {
+        DType::F32
+    } else {
+        requested
+    }
+}
+
+fn load_gguf_tensor<R: std::io::Read + std::io::Seek>(
+    content: &gguf_file::Content,
+    reader: &mut R,
     device: &DeviceProfile,
     dtype: DType,
     src: &str,
@@ -2359,19 +3398,16 @@ fn load_gguf_tensor(
         .map_err(|e| {
             Error::ModelLoadError(format!("Missing or invalid GGUF tensor `{src}`: {e}"))
         })?;
-    let mut tensor = qtensor.dequantize(&device.device).map_err(|e| {
+    let tensor = dequantize_qtensor_to_dtype(&qtensor, device, dtype).map_err(|e| {
         Error::ModelLoadError(format!("Failed to dequantize GGUF tensor `{src}`: {e}"))
     })?;
-    if tensor.dtype() != dtype {
-        tensor = tensor.to_dtype(dtype)?;
-    }
     Ok(tensor)
 }
 
-fn insert_gguf_tensor(
+fn insert_gguf_tensor<R: std::io::Read + std::io::Seek>(
     tensors: &mut HashMap<String, Tensor>,
     content: &gguf_file::Content,
-    reader: &mut BufReader<fs::File>,
+    reader: &mut R,
     device: &DeviceProfile,
     dtype: DType,
     src: &str,
@@ -2382,9 +3418,9 @@ fn insert_gguf_tensor(
     Ok(())
 }
 
-fn load_gguf_one_centered_norm_as_delta(
+fn load_gguf_one_centered_norm_as_delta<R: std::io::Read + std::io::Seek>(
     content: &gguf_file::Content,
-    reader: &mut BufReader<fs::File>,
+    reader: &mut R,
     device: &DeviceProfile,
     dtype: DType,
     src: &str,
@@ -2560,6 +3596,18 @@ fn untile_linear_conv_weight(
         tensor_name,
     )?;
     Tensor::cat(&[qk, v], 0).map_err(Error::from)
+}
+
+fn select_qwen35_gguf_backend() -> Result<Qwen35GgufBackend> {
+    let raw = std::env::var("IZWI_QWEN35_GGUF_BACKEND").unwrap_or_default();
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "" | "quantized" => Ok(Qwen35GgufBackend::Quantized),
+        "native" | "dense" => Ok(Qwen35GgufBackend::Native),
+        other => Err(Error::InvalidInput(format!(
+            "Invalid IZWI_QWEN35_GGUF_BACKEND value `{other}`. Expected `quantized` or `native`."
+        ))),
+    }
 }
 
 fn find_preferred_gguf(model_dir: &Path) -> Result<Option<std::path::PathBuf>> {
