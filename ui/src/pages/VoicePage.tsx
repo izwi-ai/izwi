@@ -567,6 +567,10 @@ export function VoicePage({
   const voiceWsSessionReadyRef = useRef(false);
   const voiceWsInputStreamStartedRef = useRef(false);
   const voiceWsInputStreamStartingRef = useRef<Promise<void> | null>(null);
+  const voiceWsInputStreamReadyPromiseRef = useRef<Promise<void> | null>(null);
+  const voiceWsInputStreamReadySettleRef = useRef<
+    ((error?: Error) => void) | null
+  >(null);
   const voiceWsInputFrameSeqRef = useRef(0);
   const voiceMinAcceptedAssistantSeqRef = useRef(0);
   const voiceUserEntryIdsRef = useRef<Map<string, string>>(new Map());
@@ -953,12 +957,62 @@ export function VoicePage({
     }
   }, [stopTtsStreamingPlayback]);
 
+  const settleVoiceRealtimeInputStreamReady = useCallback((error?: Error) => {
+    const settle = voiceWsInputStreamReadySettleRef.current;
+    if (!settle) return;
+
+    voiceWsInputStreamReadySettleRef.current = null;
+    voiceWsInputStreamReadyPromiseRef.current = null;
+    settle(error);
+  }, []);
+
+  const waitForVoiceRealtimeInputStreamReady = useCallback(
+    (timeoutMs = 8000): Promise<void> => {
+      if (voiceWsInputStreamStartedRef.current) {
+        return Promise.resolve();
+      }
+      if (voiceWsInputStreamReadyPromiseRef.current) {
+        return voiceWsInputStreamReadyPromiseRef.current;
+      }
+
+      const promise = new Promise<void>((resolve, reject) => {
+        const settle = (error?: Error) => {
+          window.clearTimeout(timeoutId);
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        };
+
+        const timeoutId = window.setTimeout(() => {
+          if (voiceWsInputStreamReadySettleRef.current === settle) {
+            voiceWsInputStreamReadySettleRef.current = null;
+            voiceWsInputStreamReadyPromiseRef.current = null;
+          }
+          reject(
+            new Error("Voice realtime input stream did not become ready in time"),
+          );
+        }, timeoutMs);
+
+        voiceWsInputStreamReadySettleRef.current = settle;
+      });
+
+      voiceWsInputStreamReadyPromiseRef.current = promise;
+      return promise;
+    },
+    [],
+  );
+
   const closeVoiceRealtimeSocket = useCallback((reason?: string) => {
     voiceWsSessionReadyRef.current = false;
     voiceWsInputStreamStartedRef.current = false;
     voiceWsInputFrameSeqRef.current = 0;
     voiceWsInputStreamStartingRef.current = null;
     voiceWsConnectingRef.current = null;
+    settleVoiceRealtimeInputStreamReady(
+      new Error("Voice realtime input stream stopped"),
+    );
 
     const socket = voiceWsRef.current;
     voiceWsRef.current = null;
@@ -974,7 +1028,7 @@ export function VoicePage({
         // Ignore close failures.
       }
     }
-  }, []);
+  }, [settleVoiceRealtimeInputStreamReady]);
 
   const stopSession = useCallback(() => {
     isSessionActiveRef.current = false;
@@ -1258,9 +1312,13 @@ export function VoicePage({
           return;
         case "input_stream_ready":
           voiceWsInputStreamStartedRef.current = true;
+          settleVoiceRealtimeInputStreamReady();
           return;
         case "input_stream_stopped":
           voiceWsInputStreamStartedRef.current = false;
+          settleVoiceRealtimeInputStreamReady(
+            new Error("Voice realtime input stream stopped"),
+          );
           return;
         case "listening":
           if (
@@ -1443,6 +1501,9 @@ export function VoicePage({
         }
         case "error": {
           const message = event.message || "Voice realtime error";
+          if (!voiceWsInputStreamStartedRef.current) {
+            settleVoiceRealtimeInputStreamReady(new Error(message));
+          }
           setError(message);
           onError?.(message);
           processingRef.current = false;
@@ -1465,6 +1526,7 @@ export function VoicePage({
       finalizeVoiceWsPlaybackIfComplete,
       onError,
       removeTranscriptEntry,
+      settleVoiceRealtimeInputStreamReady,
       setTranscriptEntryText,
     ],
   );
@@ -1577,6 +1639,9 @@ export function VoicePage({
           voiceWsInputFrameSeqRef.current = 0;
           voiceWsInputStreamStartingRef.current = null;
           voiceWsConnectingRef.current = null;
+          settleVoiceRealtimeInputStreamReady(
+            new Error("Voice realtime connection closed"),
+          );
           if (wasActive && wasCurrent) {
             processingRef.current = false;
             if (runtimeStatusRef.current !== "idle") {
@@ -1601,6 +1666,7 @@ export function VoicePage({
       handleVoiceRealtimeAssistantAudioBinaryChunk,
       handleVoiceRealtimeServerEvent,
       onError,
+      settleVoiceRealtimeInputStreamReady,
     ]);
 
   const ensureVoiceRealtimeInputStreamStarted = useCallback(
@@ -1622,6 +1688,7 @@ export function VoicePage({
         if (socket.readyState !== WebSocket.OPEN) {
           throw new Error("Voice realtime websocket is not connected");
         }
+        const readyPromise = waitForVoiceRealtimeInputStreamReady();
         sendVoiceRealtimeJson({
           type: "input_stream_start",
           asr_model_id: selectedAsrModel,
@@ -1637,6 +1704,7 @@ export function VoicePage({
           pre_roll_ms: 160,
           input_sample_rate: Math.round(inputSampleRate),
         });
+        await readyPromise;
       })();
 
       voiceWsInputStreamStartingRef.current = startPromise.finally(() => {
@@ -1657,6 +1725,7 @@ export function VoicePage({
       sendVoiceRealtimeJson,
       silenceDurationMs,
       vadThreshold,
+      waitForVoiceRealtimeInputStreamReady,
     ],
   );
 
@@ -2504,6 +2573,11 @@ export function VoicePage({
     processing: "Thinking",
     assistant_speaking: "Assistant speaking",
   }[runtimeStatus];
+  const formatTranscriptTimestamp = (timestamp: number) =>
+    new Date(timestamp).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
 
   const vadPercent = Math.min(
     100,
@@ -2705,6 +2779,62 @@ export function VoicePage({
             )}
           </div>
         </div>
+
+        {(runtimeStatus !== "idle" || transcript.length > 0) && (
+          <div className="absolute inset-x-4 bottom-24 sm:bottom-28 z-10 mx-auto w-full max-w-3xl">
+            <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)]/95 backdrop-blur p-3 sm:p-4 shadow-2xl">
+              <div className="flex items-center justify-between gap-2 mb-2">
+                <span className="text-xs font-medium text-[var(--text-secondary)]">
+                  Conversation Transcript
+                </span>
+                <span className="text-[11px] text-[var(--text-muted)]">
+                  {transcript.length} {transcript.length === 1 ? "turn" : "turns"}
+                </span>
+              </div>
+
+              <div className="max-h-48 overflow-y-auto pr-1 space-y-2">
+                {transcript.length === 0 ? (
+                  <p className="text-xs text-[var(--text-muted)]">
+                    Listening...
+                  </p>
+                ) : (
+                  transcript.map((entry) => {
+                    const isUser = entry.role === "user";
+                    return (
+                      <div
+                        key={entry.id}
+                        className={clsx(
+                          "rounded-lg border px-3 py-2 text-sm whitespace-pre-wrap",
+                          isUser
+                            ? "bg-white text-black border-white"
+                            : "bg-[var(--bg-surface-2)] text-[var(--text-primary)] border-[var(--border-muted)]",
+                        )}
+                      >
+                        <div
+                          className={clsx(
+                            "text-[10px] mb-1 uppercase tracking-wide flex items-center justify-between gap-2",
+                            isUser
+                              ? "text-black/60"
+                              : "text-[var(--text-muted)]",
+                          )}
+                        >
+                          <span>{isUser ? "User" : "Assistant"}</span>
+                          <span className="normal-case tracking-normal opacity-80">
+                            {formatTranscriptTimestamp(entry.timestamp)}
+                          </span>
+                        </div>
+                        {entry.text || (
+                          <span className="opacity-70">Waiting for text...</span>
+                        )}
+                      </div>
+                    );
+                  })
+                )}
+                <div ref={transcriptEndRef} />
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Floating Action Bar */}
         <AnimatePresence>
