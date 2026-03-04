@@ -116,11 +116,14 @@ type VoiceRealtimeClientMessage =
   | { type: "session_start"; system_prompt?: string }
   | {
       type: "input_stream_start";
-      asr_model_id: string;
-      text_model_id: string;
-      tts_model_id: string;
+      mode?: "modular" | "unified";
+      asr_model_id?: string;
+      text_model_id?: string;
+      tts_model_id?: string;
+      s2s_model_id?: string;
       speaker?: string;
       asr_language?: string;
+      language?: string;
       max_output_tokens?: number;
       vad_threshold?: number;
       min_speech_ms?: number;
@@ -178,6 +181,7 @@ interface VoicePageProps {
 
 const VOICE_AGENT_SYSTEM_PROMPT =
   "You are a helpful voice assistant. Reply with concise spoken-friendly language. Avoid markdown. Do not output <think> tags or internal reasoning. Return only the final spoken answer. Keep responses brief unless asked for details.";
+const ENABLE_LEGACY_LOCAL_UNIFIED_PATH = false;
 
 const PIPELINE_LABELS: Record<PipelineMode, string> = {
   s2s: "Unified Speech Model",
@@ -1667,11 +1671,6 @@ export function VoicePage({
       if (voiceWsInputStreamStartingRef.current) {
         return voiceWsInputStreamStartingRef.current;
       }
-      if (!selectedAsrModel || !selectedTextModel || !selectedTtsModel) {
-        throw new Error(
-          "Required modular stack models are unavailable. Open Config.",
-        );
-      }
 
       const startPromise = (async () => {
         const socket = await ensureVoiceRealtimeSocket();
@@ -1679,21 +1678,47 @@ export function VoicePage({
           throw new Error("Voice realtime websocket is not connected");
         }
         const readyPromise = waitForVoiceRealtimeInputStreamReady();
-        sendVoiceRealtimeJson({
-          type: "input_stream_start",
-          asr_model_id: selectedAsrModel,
-          text_model_id: selectedTextModel,
-          tts_model_id: selectedTtsModel,
-          speaker: selectedSpeaker,
-          asr_language: "Auto",
-          max_output_tokens: 1536,
-          vad_threshold: vadThreshold,
-          min_speech_ms: minSpeechMs,
-          silence_duration_ms: silenceDurationMs,
-          max_utterance_ms: 20_000,
-          pre_roll_ms: 160,
-          input_sample_rate: Math.round(inputSampleRate),
-        });
+        if (lfm2DirectMode) {
+          if (!selectedS2sModel) {
+            throw new Error(
+              "Select a speech-to-speech model before starting voice mode.",
+            );
+          }
+          sendVoiceRealtimeJson({
+            type: "input_stream_start",
+            mode: "unified",
+            s2s_model_id: selectedS2sModel,
+            language: "English",
+            vad_threshold: vadThreshold,
+            min_speech_ms: minSpeechMs,
+            silence_duration_ms: silenceDurationMs,
+            max_utterance_ms: 20_000,
+            pre_roll_ms: 160,
+            input_sample_rate: Math.round(inputSampleRate),
+          });
+        } else {
+          if (!selectedAsrModel || !selectedTextModel || !selectedTtsModel) {
+            throw new Error(
+              "Required modular stack models are unavailable. Open Config.",
+            );
+          }
+          sendVoiceRealtimeJson({
+            type: "input_stream_start",
+            mode: "modular",
+            asr_model_id: selectedAsrModel,
+            text_model_id: selectedTextModel,
+            tts_model_id: selectedTtsModel,
+            speaker: selectedSpeaker,
+            asr_language: "Auto",
+            max_output_tokens: 1536,
+            vad_threshold: vadThreshold,
+            min_speech_ms: minSpeechMs,
+            silence_duration_ms: silenceDurationMs,
+            max_utterance_ms: 20_000,
+            pre_roll_ms: 160,
+            input_sample_rate: Math.round(inputSampleRate),
+          });
+        }
         await readyPromise;
       })();
 
@@ -1707,8 +1732,10 @@ export function VoicePage({
     },
     [
       ensureVoiceRealtimeSocket,
+      lfm2DirectMode,
       minSpeechMs,
       selectedAsrModel,
+      selectedS2sModel,
       selectedSpeaker,
       selectedTextModel,
       selectedTtsModel,
@@ -2332,8 +2359,10 @@ export function VoicePage({
       source.connect(analyser);
       analyserRef.current = analyser;
 
+      const useLegacyLocalUnifiedPath =
+        lfm2DirectMode && ENABLE_LEGACY_LOCAL_UNIFIED_PATH;
       let recorder: MediaRecorder | null = null;
-      if (lfm2DirectMode) {
+      if (useLegacyLocalUnifiedPath) {
         const mimeCandidates = [
           "audio/webm;codecs=opus",
           "audio/webm",
@@ -2427,7 +2456,7 @@ export function VoicePage({
       speechStartRef.current = null;
       setRuntimeStatus("listening");
 
-      if (!lfm2DirectMode) {
+      if (!useLegacyLocalUnifiedPath) {
         // Warm up realtime websocket + server-side VAD stream without blocking mic startup.
         void ensureVoiceRealtimeInputStreamStarted(
           audioContext.sampleRate,
@@ -2464,7 +2493,7 @@ export function VoicePage({
         const isSpeech = rms >= vadThreshold;
         const now = Date.now();
 
-        if (!lfm2DirectMode) {
+        if (!useLegacyLocalUnifiedPath) {
           if (isSpeech && runtimeStatusRef.current === "assistant_speaking") {
             const nextAccepted =
               (voiceWsPlaybackRef.current?.utteranceSeq ?? 0) + 1;
