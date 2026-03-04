@@ -313,7 +313,7 @@ export function Layout({
                     >
                       <div
                         className={cn(
-                          "text-sm truncate leading-none",
+                          "text-sm truncate leading-tight",
                           isActive
                             ? "sidebar-link-title-active"
                             : "sidebar-link-title-idle group-hover:sidebar-link-title-hover",
@@ -375,7 +375,7 @@ export function Layout({
                     >
                       <div
                         className={cn(
-                          "text-sm truncate leading-none",
+                          "text-sm truncate leading-tight",
                           isActive
                             ? "sidebar-link-title-active"
                             : "sidebar-link-title-idle group-hover:sidebar-link-title-hover",
@@ -430,7 +430,7 @@ export function Layout({
                     >
                       <div
                         className={cn(
-                          "text-sm truncate leading-none",
+                          "text-sm truncate leading-tight",
                           isActive
                             ? "sidebar-link-title-active"
                             : "sidebar-link-title-idle group-hover:sidebar-link-title-hover",
