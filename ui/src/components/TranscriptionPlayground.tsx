@@ -1634,24 +1634,22 @@ export function TranscriptionPlayground({
         </AnimatePresence>
       </div>
 
-      <aside className="card border-[var(--border-muted)] p-4 sm:p-5 h-[440px] xl:h-full flex flex-col overflow-hidden bg-[var(--bg-surface-0)]">
-        <div className="flex items-start justify-between gap-3 mb-4">
+      <aside className="card app-sidebar-panel p-4 sm:p-5 h-[440px] xl:h-full flex flex-col overflow-hidden">
+        <div className="flex items-start justify-between gap-3 mb-3">
           <div>
-            <div className="inline-flex items-center gap-2 text-xs font-semibold text-[var(--text-muted)] uppercase tracking-wider">
+            <div className="inline-flex items-center gap-2 app-sidebar-header-eyebrow">
               <History className="w-3.5 h-3.5" />
               History
             </div>
-            <h3 className="text-base font-semibold text-[var(--text-primary)] mt-1.5">
-              Transcriptions
-            </h3>
-            <p className="text-xs font-medium text-[var(--text-subtle)] mt-1">
+            <h3 className="app-sidebar-header-title">Transcriptions</h3>
+            <p className="app-sidebar-header-count">
               {historyRecords.length}{" "}
               {historyRecords.length === 1 ? "record" : "records"}
             </p>
           </div>
           <button
             onClick={() => void loadHistory()}
-            className="p-2 rounded-lg text-[var(--text-muted)] hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)] transition-colors"
+            className="btn btn-ghost app-sidebar-refresh-btn"
             disabled={historyLoading}
             title="Refresh history"
           >
@@ -1661,14 +1659,14 @@ export function TranscriptionPlayground({
           </button>
         </div>
 
-        <div className="mt-1 flex-1 min-h-0 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-2.5 overflow-y-auto scrollbar-thin">
+        <div className="app-sidebar-list scrollbar-thin">
           {historyLoading ? (
-            <div className="h-full min-h-full flex flex-col items-center justify-center gap-3 text-sm text-[var(--text-muted)]">
-              <Loader2 className="w-5 h-5 animate-spin" />
+            <div className="app-sidebar-loading">
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
               Loading history...
             </div>
           ) : historyRecords.length === 0 ? (
-            <div className="h-full min-h-full flex items-center justify-center text-center px-4 text-sm font-medium text-[var(--text-subtle)]">
+            <div className="app-sidebar-empty">
               No saved transcriptions yet.
             </div>
           ) : (
@@ -1688,20 +1686,20 @@ export function TranscriptionPlayground({
                     role="button"
                     tabIndex={0}
                     className={cn(
-                      "group w-full h-[110px] text-left rounded-lg border p-3.5 transition-all overflow-hidden cursor-pointer relative focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--bg-surface-1)]",
+                      "group app-sidebar-row relative focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--bg-surface-1)]",
                       isActive
-                        ? "border-[var(--border-strong)] bg-[var(--bg-surface-2)] shadow-sm"
-                        : "border-[var(--border-muted)] bg-[var(--bg-surface-0)] hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-2)] hover:shadow-sm",
+                        ? "app-sidebar-row-active"
+                        : "app-sidebar-row-idle",
                     )}
                   >
-                    <div className="flex items-center justify-between gap-3 mb-2">
-                      <span className="text-[11px] font-medium text-[var(--text-secondary)] truncate">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="app-sidebar-row-label truncate">
                         {record.audio_filename ||
                           record.model_id ||
                           "Audio input"}
                       </span>
-                      <div className="inline-flex items-center gap-2 shrink-0">
-                        <span className="text-[10px] font-medium text-[var(--text-subtle)]">
+                      <div className="inline-flex items-center gap-1.5 shrink-0">
+                        <span className="app-sidebar-row-meta">
                           {formatCreatedAt(record.created_at)}
                         </span>
                         <button
@@ -1710,7 +1708,7 @@ export function TranscriptionPlayground({
                             event.stopPropagation();
                             openDeleteRecordConfirm(record.id);
                           }}
-                          className="inline-flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-subtle)] transition-colors opacity-0 group-hover:opacity-100 hover:bg-[var(--danger-bg)] hover:text-[var(--danger-text)]"
+                          className="app-sidebar-delete-btn"
                           title="Delete record"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
@@ -1718,10 +1716,10 @@ export function TranscriptionPlayground({
                       </div>
                     </div>
                     <p
-                      className="text-sm text-[var(--text-primary)] leading-relaxed"
+                      className="app-sidebar-row-preview"
                       style={{
                         display: "-webkit-box",
-                        WebkitLineClamp: 2,
+                        WebkitLineClamp: 3,
                         WebkitBoxOrient: "vertical",
                         overflow: "hidden",
                       }}

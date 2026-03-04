@@ -550,27 +550,27 @@ export function DiarizationHistoryPanel({
     <>
       <aside
         className={clsx(
-          "card border-[var(--border-muted)] p-4 sm:p-5 h-[560px] flex flex-col overflow-hidden",
+          "card app-sidebar-panel p-4 sm:p-5 h-[560px] flex flex-col overflow-hidden",
           desktopHeightClassName,
         )}
       >
         <div className="flex items-start justify-between gap-3 mb-3">
           <div>
-            <div className="inline-flex items-center gap-2 text-xs text-[var(--text-muted)]">
+            <div className="inline-flex items-center gap-2 app-sidebar-header-eyebrow">
               <History className="w-3.5 h-3.5" />
               History
             </div>
-            <h3 className="text-sm font-medium text-[var(--text-primary)] mt-1">
+            <h3 className="app-sidebar-header-title">
               Diarization History
             </h3>
-            <p className="text-xs text-[var(--text-subtle)] mt-1">
+            <p className="app-sidebar-header-count">
               {historyRecords.length}{" "}
               {historyRecords.length === 1 ? "record" : "records"}
             </p>
           </div>
           <button
             onClick={() => void loadHistory()}
-            className="btn btn-ghost px-2.5 py-1.5 text-xs"
+            className="btn btn-ghost app-sidebar-refresh-btn"
             disabled={historyLoading}
             title="Refresh history"
           >
@@ -581,14 +581,14 @@ export function DiarizationHistoryPanel({
           </button>
         </div>
 
-        <div className="mt-1 flex-1 min-h-0 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-2 overflow-y-auto">
+        <div className="app-sidebar-list">
           {historyLoading ? (
-            <div className="h-full min-h-full flex items-center justify-center gap-2 text-xs text-[var(--text-muted)]">
+            <div className="app-sidebar-loading">
               <Loader2 className="w-3.5 h-3.5 animate-spin" />
               Loading history...
             </div>
           ) : historyRecords.length === 0 ? (
-            <div className="h-full min-h-full flex items-center justify-center text-center px-3 text-xs text-[var(--text-subtle)]">
+            <div className="app-sidebar-empty">
               No saved diarization records yet.
             </div>
           ) : (
@@ -608,20 +608,20 @@ export function DiarizationHistoryPanel({
                       }
                     }}
                     className={clsx(
-                      "w-full h-[102px] text-left rounded-lg border px-3 py-2.5 transition-colors overflow-hidden cursor-pointer",
+                      "app-sidebar-row",
                       isActive
-                        ? "border-[var(--border-strong)] bg-[var(--bg-surface-3)]"
-                        : "border-[var(--border-muted)] bg-[var(--bg-surface-2)] hover:border-[var(--border-strong)]",
+                        ? "app-sidebar-row-active"
+                        : "app-sidebar-row-idle",
                     )}
                   >
                     <div className="flex items-center justify-between gap-2">
-                      <span className="text-[11px] text-[var(--text-secondary)] truncate">
+                      <span className="app-sidebar-row-label truncate">
                         {record.audio_filename ||
                           record.model_id ||
                           "Diarization run"}
                       </span>
                       <div className="inline-flex items-center gap-1.5 shrink-0">
-                        <span className="text-[10px] text-[var(--text-subtle)]">
+                        <span className="app-sidebar-row-meta">
                           {formatCreatedAt(record.created_at)}
                         </span>
                         <button
@@ -630,7 +630,7 @@ export function DiarizationHistoryPanel({
                             event.stopPropagation();
                             openDeleteRecordConfirm(record.id);
                           }}
-                          className="inline-flex h-6 w-6 items-center justify-center rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-1)] text-[var(--text-subtle)] transition-colors hover:border-[var(--danger-border)] hover:bg-[var(--danger-bg)] hover:text-[var(--danger-text)]"
+                          className="app-sidebar-delete-btn"
                           title="Delete record"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
@@ -638,7 +638,7 @@ export function DiarizationHistoryPanel({
                       </div>
                     </div>
                     <p
-                      className="text-xs text-[var(--text-primary)] mt-1.5 leading-[1.35]"
+                      className="app-sidebar-row-preview"
                       style={{
                         display: "-webkit-box",
                         WebkitLineClamp: 3,
