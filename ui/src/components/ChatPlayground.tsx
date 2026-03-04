@@ -305,6 +305,17 @@ function isQwen35ChatModel(variant: string | null): boolean {
   return variant.trim().toLowerCase().startsWith("qwen3.5-");
 }
 
+function isLfm25ThinkingModel(variant: string | null): boolean {
+  if (!variant) {
+    return false;
+  }
+  return variant.trim().toLowerCase() === "lfm2.5-1.2b-thinking-gguf";
+}
+
+function supportsImplicitOpenThinkTagParsing(variant: string | null): boolean {
+  return isQwen35ChatModel(variant) || isLfm25ThinkingModel(variant);
+}
+
 function formatBytes(size: number): string {
   if (!Number.isFinite(size) || size <= 0) {
     return "0 B";
@@ -677,7 +688,8 @@ export function ChatPlayground({
   const thinkingEnabledForModel = supportsThinking && isThinkingEnabled;
   const selectedModelSupportsMedia = isQwen35ChatModel(selectedModel);
   const renderModelId = activeThread?.model_id ?? selectedModel;
-  const implicitQwen35Thinking = isQwen35ChatModel(renderModelId);
+  const implicitOpenThinkTagModel =
+    supportsImplicitOpenThinkTagParsing(renderModelId);
 
   const setActiveThreadInUrl = useCallback(
     (threadId: string | null, replace = false) => {
@@ -1883,7 +1895,7 @@ export function ChatPlayground({
                         : thinkingEnabledForModel
                           ? parseAssistantContent(message.content || "", {
                               implicitOpenThinkTag:
-                                implicitQwen35Thinking &&
+                                implicitOpenThinkTagModel &&
                                 thinkingEnabledForModel,
                             })
                           : null;

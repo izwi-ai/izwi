@@ -71,12 +71,15 @@ function getChatModelName(variant: string): string {
 
 function isThinkingChatModel(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
-  return (
+  const isQwenThinkingFamily =
     (normalized.startsWith("qwen3-") || normalized.startsWith("qwen3.5-")) &&
     !normalized.includes("-asr-") &&
     !normalized.includes("-tts-") &&
-    !normalized.includes("forcedaligner")
-  );
+    !normalized.includes("forcedaligner");
+
+  const isLfmThinkingVariant = normalized === "lfm2.5-1.2b-thinking-gguf";
+
+  return isQwenThinkingFamily || isLfmThinkingVariant;
 }
 
 function getStatusLabel(status: ModelInfo["status"]): string {
