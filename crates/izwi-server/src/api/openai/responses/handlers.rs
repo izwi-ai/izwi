@@ -76,7 +76,7 @@ pub async fn create_response(
         .chat_generate_with_correlation(
             model_variant,
             messages,
-            req.max_output_tokens.unwrap_or(1536).clamp(1, 4096),
+            max_output_tokens(model_variant, req.max_output_tokens),
             Some(&ctx.correlation_id),
         )
         .await?;
@@ -276,7 +276,7 @@ async fn create_streaming_response(
                 .chat_generate_streaming_with_correlation(
                     model_variant,
                     messages,
-                    req.max_output_tokens.unwrap_or(1536).clamp(1, 4096),
+                    max_output_tokens(model_variant, req.max_output_tokens),
                     Some(correlation_id.as_str()),
                     move |delta| {
                         if let Ok(mut text) = full_text_for_cb.lock() {
@@ -383,6 +383,18 @@ async fn create_streaming_response(
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from_stream(stream))
         .unwrap())
+}
+
+fn max_output_tokens(variant: ModelVariant, requested: Option<usize>) -> usize {
+    let default = match variant {
+        ModelVariant::Gemma34BIt => 4096,
+        ModelVariant::Gemma31BIt => 4096,
+        ModelVariant::Lfm2512BInstructGguf => 4096,
+        ModelVariant::Lfm2512BThinkingGguf => 4096,
+        _ => 1536,
+    };
+
+    requested.unwrap_or(default).clamp(1, 4096)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

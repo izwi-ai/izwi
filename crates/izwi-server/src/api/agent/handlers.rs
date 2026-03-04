@@ -190,7 +190,10 @@ pub async fn create_turn(
             &planner,
             &tools,
             AgentTurnOptions {
-                max_output_tokens: req.max_output_tokens.unwrap_or(1536).clamp(1, 4096),
+                max_output_tokens: resolve_max_output_tokens_for_model(
+                    &resolved_model_id,
+                    req.max_output_tokens,
+                )?,
                 max_tool_calls: 1,
             },
         )
@@ -236,6 +239,22 @@ fn resolve_chat_model_id(raw: Option<&str>) -> Result<String, ApiError> {
     let variant = parse_chat_model_variant(Some(requested))
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
     Ok(variant.dir_name().to_string())
+}
+
+fn resolve_max_output_tokens_for_model(
+    model_id: &str,
+    requested: Option<usize>,
+) -> Result<usize, ApiError> {
+    let variant = parse_chat_model_variant(Some(model_id))
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let default = match variant {
+        izwi_core::ModelVariant::Gemma34BIt => 4096,
+        izwi_core::ModelVariant::Gemma31BIt => 4096,
+        izwi_core::ModelVariant::Lfm2512BInstructGguf => 4096,
+        izwi_core::ModelVariant::Lfm2512BThinkingGguf => 4096,
+        _ => 1536,
+    };
+    Ok(requested.unwrap_or(default).clamp(1, 4096))
 }
 
 fn now_unix_millis() -> u64 {
