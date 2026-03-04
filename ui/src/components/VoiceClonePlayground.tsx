@@ -422,9 +422,9 @@ export function VoiceClonePlayground({
 
           <div className="space-y-6">
             {/* Voice Reference Section */}
-            <div className="p-4 sm:p-5 rounded-xl bg-[var(--bg-surface-1)] border border-[var(--border-muted)]">
+            <div className="p-5 rounded-2xl bg-[var(--bg-surface-0)] border border-[var(--border-muted)]">
               <div className="flex items-center gap-2 mb-4">
-                <Users className="w-4 h-4 text-[var(--text-muted)]" />
+                <Users className="w-5 h-5 text-[var(--text-muted)]" />
                 <span className="text-sm font-semibold text-[var(--text-primary)]">
                   Voice Reference
                 </span>
@@ -441,8 +441,8 @@ export function VoiceClonePlayground({
             </div>
 
             {/* Text to speak */}
-            <div>
-              <label className="block text-xs font-semibold text-[var(--text-primary)] uppercase tracking-wide mb-2">
+            <div className="p-5 rounded-2xl bg-[var(--bg-surface-0)] border border-[var(--border-muted)]">
+              <label className="block text-xs font-semibold text-[var(--text-primary)] uppercase tracking-wide mb-3">
                 Text to Speak
               </label>
               <div className="relative">
@@ -453,9 +453,9 @@ export function VoiceClonePlayground({
                   placeholder="Enter the text you want to synthesize with the cloned voice..."
                   rows={5}
                   disabled={generating}
-                  className="textarea text-base py-4 leading-relaxed bg-[var(--bg-surface-1)]"
+                  className="textarea text-base py-4 leading-relaxed bg-[var(--bg-surface-1)] border-[var(--border-muted)] w-full"
                 />
-                <div className="absolute bottom-3 right-3 bg-[var(--bg-surface-1)] px-1">
+                <div className="absolute bottom-3 right-3 px-1">
                   <span className="text-[11px] font-medium text-[var(--text-muted)]">
                     {text.length} characters
                   </span>

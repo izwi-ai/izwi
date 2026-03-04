@@ -777,9 +777,9 @@ export function CustomVoicePlayground({
                 placeholder="What would you like the voice to say?"
                 rows={5}
                 disabled={generating}
-                className="textarea text-base py-4 leading-relaxed bg-[var(--bg-surface-1)]"
+                className="textarea text-base py-4 leading-relaxed bg-[var(--bg-surface-0)] border-[var(--border-muted)] w-full"
               />
-              <div className="absolute bottom-3 right-3 bg-[var(--bg-surface-1)] px-1">
+              <div className="absolute bottom-3 right-3 bg-[var(--bg-surface-0)] px-1">
                 <span className="text-[11px] font-medium text-[var(--text-muted)]">
                   {text.length} characters
                 </span>
@@ -835,7 +835,7 @@ export function CustomVoicePlayground({
                       value={instruct}
                       onChange={(e) => setInstruct(e.target.value)}
                       placeholder="e.g., 'Speak with excitement' or 'Very calm and soothing'"
-                      className="input bg-[var(--bg-surface-1)]"
+                      className="input bg-[var(--bg-surface-0)] border-[var(--border-muted)] w-full"
                     />
                   </div>
                 </motion.div>
@@ -875,7 +875,7 @@ export function CustomVoicePlayground({
               <button
                 onClick={handleGenerate}
                 disabled={generating || !selectedModelReady}
-                className="btn btn-primary flex-1 h-11 text-sm font-semibold rounded-lg"
+                className="btn btn-primary flex-1 h-11 text-sm font-semibold gap-2 rounded-lg"
               >
                 {generating ? (
                   <>
@@ -894,7 +894,7 @@ export function CustomVoicePlayground({
                 <>
                   <button
                     onClick={handleStop}
-                    className="btn btn-secondary h-11 w-11 p-0 rounded-lg shrink-0"
+                    className="btn btn-secondary h-11 w-11 p-0 rounded-lg shrink-0 border-[var(--border-muted)]"
                     title="Stop"
                   >
                     <Square className="w-4 h-4" />
@@ -904,7 +904,7 @@ export function CustomVoicePlayground({
                       onClick={handleDownload}
                       disabled={isDownloading}
                       className={cn(
-                        "btn btn-secondary h-11 w-11 p-0 rounded-lg shrink-0",
+                        "btn btn-secondary h-11 w-11 p-0 rounded-lg shrink-0 border-[var(--border-muted)]",
                         isDownloading && "opacity-75",
                       )}
                       title="Download"

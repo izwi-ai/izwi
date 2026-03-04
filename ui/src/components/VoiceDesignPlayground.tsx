@@ -535,7 +535,7 @@ export function VoiceDesignPlayground({
                 onChange={(e) => setVoiceDescription(e.target.value)}
                 placeholder="Describe the voice you want to create... (e.g., 'A warm, friendly female voice with a slight British accent, speaking in a calm and reassuring tone')"
                 rows={4}
-                className="textarea text-base py-4 leading-relaxed bg-[var(--bg-surface-0)]"
+                className="textarea text-base py-4 leading-relaxed bg-[var(--bg-surface-0)] border-[var(--border-muted)] w-full"
               />
               <p className="text-[11px] font-medium text-[var(--text-muted)] mt-2">
                 Describe voice characteristics like gender, age, tone, emotion,
@@ -557,9 +557,9 @@ export function VoiceDesignPlayground({
                   placeholder="Enter the text you want the designed voice to synthesize..."
                   rows={4}
                   disabled={generating}
-                  className="textarea text-base py-4 leading-relaxed bg-[var(--bg-surface-1)]"
+                  className="textarea text-base py-4 leading-relaxed bg-[var(--bg-surface-1)] border-[var(--border-muted)] w-full"
                 />
-                <div className="absolute bottom-3 right-3 bg-[var(--bg-surface-1)] px-1">
+                <div className="absolute bottom-3 right-3 px-1">
                   <span className="text-[11px] font-medium text-[var(--text-muted)]">
                     {text.length} characters
                   </span>

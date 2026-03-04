@@ -549,8 +549,6 @@ export function VoiceClone({ onVoiceCloneReady, onClear }: VoiceCloneProps) {
     }
   };
 
-
-
   const handleSaveVoice = async () => {
     if (!audioBlob || !transcript.trim() || isSavingVoice) {
       return;
@@ -673,7 +671,7 @@ export function VoiceClone({ onVoiceCloneReady, onClear }: VoiceCloneProps) {
   };
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-4">
       {/* Error */}
       <AnimatePresence>
         {error && (
@@ -681,35 +679,36 @@ export function VoiceClone({ onVoiceCloneReady, onClear }: VoiceCloneProps) {
             initial={{ opacity: 0, height: 0 }}
             animate={{ opacity: 1, height: "auto" }}
             exit={{ opacity: 0, height: 0 }}
-            className="p-2 rounded bg-red-950/50 border border-red-900/50 text-red-400 text-xs"
+            className="p-3 rounded-lg bg-[var(--danger-bg)] border border-[var(--danger-border)] text-[var(--danger-text)] text-sm flex items-start gap-2"
           >
-            {error}
+            <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+            <p>{error}</p>
           </motion.div>
         )}
       </AnimatePresence>
 
       {/* Transcript input - always visible */}
       <div>
-        <label className="block text-xs text-gray-500 mb-1.5">
+        <label className="block text-xs font-semibold text-[var(--text-primary)] uppercase tracking-wide mb-2">
           Transcript
-          <span className="text-red-400 ml-1">*</span>
+          <span className="text-red-500 ml-1">*</span>
         </label>
         <textarea
           value={transcript}
           onChange={(e) => setTranscript(e.target.value)}
           placeholder="Enter what you will say in the recording..."
           rows={3}
-          className="textarea text-sm"
+          className="textarea text-sm py-3 leading-relaxed bg-[var(--bg-surface-0)]"
         />
-        <p className="text-xs text-gray-600 mt-1">
+        <p className="text-[11px] font-medium text-[var(--text-muted)] mt-1.5">
           Type transcript text, then upload, record, or choose a saved voice
         </p>
       </div>
 
       {/* Audio controls */}
       {!audioBlob ? (
-        <div className="space-y-2">
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+        <div className="space-y-2 mt-4">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             {/* Upload button */}
             <button
               onClick={() => {
@@ -717,14 +716,30 @@ export function VoiceClone({ onVoiceCloneReady, onClear }: VoiceCloneProps) {
                 fileInputRef.current?.click();
               }}
               className={clsx(
-                "flex flex-col items-center gap-2 p-4 rounded-lg border transition-colors min-h-[80px]",
+                "flex flex-col items-center gap-2 p-4 rounded-xl border transition-colors min-h-[96px] justify-center group",
                 mode === "upload"
-                  ? "border-white/40 bg-[var(--bg-surface-1)]"
-                  : "border-[var(--border-muted)] bg-[var(--bg-surface-2)] hover:bg-[var(--bg-surface-1)]",
+                  ? "border-[var(--border-strong)] bg-[var(--bg-surface-1)] shadow-sm"
+                  : "border-[var(--border-muted)] bg-[var(--bg-surface-0)] hover:bg-[var(--bg-surface-1)] hover:border-[var(--border-strong)]",
               )}
             >
-              <Upload className="w-5 h-5 text-gray-400" />
-              <span className="text-xs text-gray-400">Upload Audio</span>
+              <Upload
+                className={clsx(
+                  "w-6 h-6",
+                  mode === "upload"
+                    ? "text-[var(--text-primary)]"
+                    : "text-[var(--text-muted)] group-hover:text-[var(--text-primary)] transition-colors",
+                )}
+              />
+              <span
+                className={clsx(
+                  "text-xs font-medium",
+                  mode === "upload"
+                    ? "text-[var(--text-primary)]"
+                    : "text-[var(--text-secondary)] group-hover:text-[var(--text-primary)] transition-colors",
+                )}
+              >
+                Upload Audio
+              </span>
             </button>
             <input
               ref={fileInputRef}
@@ -738,21 +753,42 @@ export function VoiceClone({ onVoiceCloneReady, onClear }: VoiceCloneProps) {
             <button
               onClick={isRecording ? stopRecording : startRecording}
               className={clsx(
-                "flex flex-col items-center gap-2 p-4 rounded-lg border transition-colors min-h-[80px]",
-                isRecording || mode === "record"
-                  ? "border-white/50 bg-[var(--bg-surface-1)]"
-                  : "border-[var(--border-muted)] bg-[var(--bg-surface-2)] hover:bg-[var(--bg-surface-1)]",
+                "flex flex-col items-center gap-2 p-4 rounded-xl border transition-colors min-h-[96px] justify-center group relative overflow-hidden",
+                isRecording
+                  ? "border-red-500/30 bg-red-500/10 text-red-500 shadow-[0_0_15px_rgba(239,68,68,0.1)]"
+                  : mode === "record"
+                    ? "border-[var(--border-strong)] bg-[var(--bg-surface-1)] shadow-sm"
+                    : "border-[var(--border-muted)] bg-[var(--bg-surface-0)] hover:bg-[var(--bg-surface-1)] hover:border-[var(--border-strong)]",
               )}
             >
               {isRecording ? (
                 <>
-                  <Square className="w-5 h-5 text-white" />
-                  <span className="text-xs text-white">Stop Recording</span>
+                  <div className="absolute inset-0 bg-red-500/5 animate-pulse" />
+                  <Square className="w-6 h-6 fill-current relative" />
+                  <span className="text-xs font-semibold relative">
+                    Stop Recording
+                  </span>
                 </>
               ) : (
                 <>
-                  <Mic className="w-5 h-5 text-gray-400" />
-                  <span className="text-xs text-gray-400">Record Voice</span>
+                  <Mic
+                    className={clsx(
+                      "w-6 h-6",
+                      mode === "record"
+                        ? "text-[var(--text-primary)]"
+                        : "text-[var(--text-muted)] group-hover:text-[var(--text-primary)] transition-colors",
+                    )}
+                  />
+                  <span
+                    className={clsx(
+                      "text-xs font-medium",
+                      mode === "record"
+                        ? "text-[var(--text-primary)]"
+                        : "text-[var(--text-secondary)] group-hover:text-[var(--text-primary)] transition-colors",
+                    )}
+                  >
+                    Record Voice
+                  </span>
                 </>
               )}
             </button>
@@ -767,24 +803,40 @@ export function VoiceClone({ onVoiceCloneReady, onClear }: VoiceCloneProps) {
                 }
               }}
               className={clsx(
-                "flex flex-col items-center gap-2 p-4 rounded-lg border transition-colors min-h-[80px]",
+                "flex flex-col items-center gap-2 p-4 rounded-xl border transition-colors min-h-[96px] justify-center group",
                 mode === "saved"
-                  ? "border-white/40 bg-[var(--bg-surface-1)]"
-                  : "border-[var(--border-muted)] bg-[var(--bg-surface-2)] hover:bg-[var(--bg-surface-1)]",
+                  ? "border-[var(--border-strong)] bg-[var(--bg-surface-1)] shadow-sm"
+                  : "border-[var(--border-muted)] bg-[var(--bg-surface-0)] hover:bg-[var(--bg-surface-1)] hover:border-[var(--border-strong)]",
               )}
             >
-              <Library className="w-5 h-5 text-gray-400" />
-              <span className="text-xs text-gray-400">Saved Voice</span>
+              <Library
+                className={clsx(
+                  "w-6 h-6",
+                  mode === "saved"
+                    ? "text-[var(--text-primary)]"
+                    : "text-[var(--text-muted)] group-hover:text-[var(--text-primary)] transition-colors",
+                )}
+              />
+              <span
+                className={clsx(
+                  "text-xs font-medium",
+                  mode === "saved"
+                    ? "text-[var(--text-primary)]"
+                    : "text-[var(--text-secondary)] group-hover:text-[var(--text-primary)] transition-colors",
+                )}
+              >
+                Saved Voice
+              </span>
             </button>
           </div>
 
-          <div className="flex justify-end">
+          <div className="flex justify-end pt-2">
             <button
               onClick={openCreateVoiceModal}
-              className="btn btn-secondary text-xs min-h-[34px]"
+              className="btn btn-secondary text-xs h-9 px-4 gap-1.5 rounded-lg border-[var(--border-muted)]"
             >
-              <BookmarkPlus className="w-3.5 h-3.5" />
-              Create Voice
+              <BookmarkPlus className="w-4 h-4" />
+              Save New Voice
             </button>
           </div>
 
