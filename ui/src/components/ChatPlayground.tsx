@@ -19,6 +19,7 @@ import {
   Settings2,
   Plus,
   Trash2,
+  AlertTriangle,
   MessageSquare,
   History,
   Paperclip,
@@ -626,6 +627,10 @@ export function ChatPlayground({
   const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(
     null,
   );
+  const [deleteTargetThreadId, setDeleteTargetThreadId] = useState<
+    string | null
+  >(null);
+  const [deleteThreadPending, setDeleteThreadPending] = useState(false);
 
   const initializedRef = useRef(false);
   const activeThreadIdRef = useRef<string | null>(null);
@@ -652,6 +657,13 @@ export function ChatPlayground({
   const activeThread = useMemo(
     () => threads.find((thread) => thread.id === activeThreadId) ?? null,
     [threads, activeThreadId],
+  );
+  const deleteTargetThread = useMemo(
+    () =>
+      deleteTargetThreadId
+        ? threads.find((thread) => thread.id === deleteTargetThreadId) ?? null
+        : null,
+    [deleteTargetThreadId, threads],
   );
 
   const visibleMessages = useMemo(
@@ -992,17 +1004,30 @@ export function ChatPlayground({
     }
   }, [clearMediaItems, isStreaming, selectedModel, setActiveThreadInUrl]);
 
+  const openDeleteThreadConfirm = useCallback((threadId: string) => {
+    setDeleteTargetThreadId(threadId);
+  }, []);
+
+  const closeDeleteThreadConfirm = useCallback(() => {
+    if (deleteThreadPending) {
+      return;
+    }
+    setDeleteTargetThreadId(null);
+  }, [deleteThreadPending]);
+
   const handleDeleteThread = useCallback(
     async (threadId: string) => {
-      if (isStreaming) {
+      if (isStreaming || isPreparingThread || deleteThreadPending) {
         return;
       }
 
+      setDeleteThreadPending(true);
       try {
         await api.deleteChatThread(threadId);
         setThreads((previous) =>
           previous.filter((thread) => thread.id !== threadId),
         );
+        setDeleteTargetThreadId(null);
 
         if (activeThreadIdRef.current === threadId) {
           setActiveThreadInUrl(null, true);
@@ -1012,10 +1037,24 @@ export function ChatPlayground({
         }
       } catch (deleteError) {
         setError(getErrorMessage(deleteError, "Failed to delete this chat."));
+      } finally {
+        setDeleteThreadPending(false);
       }
     },
-    [isStreaming, setActiveThreadInUrl],
+    [
+      deleteThreadPending,
+      isPreparingThread,
+      isStreaming,
+      setActiveThreadInUrl,
+    ],
   );
+
+  const confirmDeleteThread = useCallback(() => {
+    if (!deleteTargetThreadId) {
+      return;
+    }
+    void handleDeleteThread(deleteTargetThreadId);
+  }, [deleteTargetThreadId, handleDeleteThread]);
 
   const removeMediaItem = useCallback(
     (id: string) => {
@@ -1616,38 +1655,36 @@ export function ChatPlayground({
         onChange={handleSelectMedia}
         className="hidden"
       />
-      <aside className="w-full lg:w-80 lg:min-w-[20rem] max-h-[38dvh] lg:max-h-none shrink-0 card border-[var(--border-muted)] p-4 sm:p-5 flex flex-col overflow-hidden">
+      <aside className="w-full lg:w-80 lg:min-w-[20rem] max-h-[38dvh] lg:max-h-none shrink-0 card app-sidebar-panel p-4 sm:p-5 flex flex-col overflow-hidden">
         <div className="flex items-start justify-between gap-3 mb-3">
           <div>
-            <div className="inline-flex items-center gap-2 text-xs text-[var(--text-muted)]">
+            <div className="inline-flex items-center gap-2 app-sidebar-header-eyebrow">
               <History className="w-3.5 h-3.5" />
               History
             </div>
-            <h2 className="text-sm font-medium text-[var(--text-primary)] mt-1">
-              Chat History
-            </h2>
-            <p className="text-xs text-[var(--text-subtle)] mt-1">
+            <h2 className="app-sidebar-header-title">Chat History</h2>
+            <p className="app-sidebar-header-count">
               {threads.length} {threads.length === 1 ? "thread" : "threads"}
             </p>
           </div>
           <button
             onClick={handleCreateThread}
             disabled={isStreaming || isPreparingThread}
-            className="btn btn-ghost px-2.5 py-1.5 text-xs"
+            className="btn btn-ghost app-sidebar-refresh-btn"
           >
             <Plus className="w-3.5 h-3.5" />
             New
           </button>
         </div>
 
-        <div className="mt-1 flex-1 min-h-0 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-2 overflow-y-auto">
+        <div className="app-sidebar-list">
           {threadsLoading ? (
-            <div className="h-full min-h-full flex items-center justify-center gap-2 text-xs text-[var(--text-muted)]">
+            <div className="app-sidebar-loading">
               <Loader2 className="w-3.5 h-3.5 animate-spin" />
               Loading chats...
             </div>
           ) : threads.length === 0 ? (
-            <div className="h-full min-h-full flex items-center justify-center text-center px-3 text-xs text-[var(--text-subtle)]">
+            <div className="app-sidebar-empty">
               No chats yet. Create one to begin.
             </div>
           ) : (
@@ -1681,19 +1718,19 @@ export function ChatPlayground({
                       }
                     }}
                     className={cn(
-                      "w-full h-[102px] text-left rounded-lg border px-3 py-2.5 transition-colors overflow-hidden cursor-pointer",
+                      "group app-sidebar-row",
                       isActive
-                        ? "border-[var(--border-strong)] bg-[var(--bg-surface-3)]"
-                        : "border-[var(--border-muted)] bg-[var(--bg-surface-2)] hover:border-[var(--border-strong)]",
+                        ? "app-sidebar-row-active"
+                        : "app-sidebar-row-idle",
                       (isStreaming || isPreparingThread) && "opacity-70",
                     )}
                   >
                     <div className="flex items-center justify-between gap-2">
-                      <p className="text-[11px] text-[var(--text-secondary)] truncate">
+                      <p className="app-sidebar-row-label truncate">
                         {displayThreadTitle(thread.title)}
                       </p>
                       <div className="inline-flex items-center gap-1.5 shrink-0">
-                        <span className="text-[10px] text-[var(--text-subtle)]">
+                        <span className="app-sidebar-row-meta">
                           {formatThreadTimestamp(thread.updated_at)}
                         </span>
                         <button
@@ -1703,10 +1740,13 @@ export function ChatPlayground({
                             if (isStreaming || isPreparingThread) {
                               return;
                             }
-                            void handleDeleteThread(thread.id);
+                            openDeleteThreadConfirm(thread.id);
                           }}
                           disabled={isStreaming || isPreparingThread}
-                          className="inline-flex h-6 w-6 items-center justify-center rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-1)] text-[var(--text-subtle)] transition-colors hover:border-[var(--danger-border)] hover:bg-[var(--danger-bg)] hover:text-[var(--danger-text)] disabled:opacity-50"
+                          className={cn(
+                            "app-sidebar-delete-btn",
+                            (isStreaming || isPreparingThread) && "opacity-50",
+                          )}
                           title="Delete chat"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
@@ -1714,7 +1754,7 @@ export function ChatPlayground({
                       </div>
                     </div>
                     <p
-                      className="text-xs text-[var(--text-primary)] mt-1.5 leading-[1.35]"
+                      className="app-sidebar-row-preview"
                       style={{
                         display: "-webkit-box",
                         WebkitLineClamp: 3,
@@ -2076,6 +2116,67 @@ export function ChatPlayground({
           </div>
         )}
       </div>
+
+      <AnimatePresence>
+        {deleteTargetThread && (
+          <motion.div
+            className="fixed inset-0 z-[60] bg-black/75 p-4 backdrop-blur-sm"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={closeDeleteThreadConfirm}
+          >
+            <motion.div
+              initial={{ y: 10, opacity: 0, scale: 0.98 }}
+              animate={{ y: 0, opacity: 1, scale: 1 }}
+              exit={{ y: 10, opacity: 0, scale: 0.98 }}
+              transition={{ duration: 0.16 }}
+              className="mx-auto mt-[18vh] max-w-md rounded-xl border border-[var(--danger-border)] bg-[var(--bg-surface-1)] p-5"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="flex items-start gap-3">
+                <div className="mt-0.5 rounded-full border border-[var(--danger-border)] bg-[var(--danger-bg)] p-2 text-[var(--danger-text)]">
+                  <AlertTriangle className="h-4 w-4" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+                    Delete chat thread?
+                  </h3>
+                  <p className="mt-1 text-sm text-[var(--text-muted)]">
+                    This permanently removes the selected conversation and all
+                    of its messages.
+                  </p>
+                  <p className="mt-2 truncate text-xs text-[var(--text-subtle)]">
+                    {displayThreadTitle(deleteTargetThread.title)}
+                  </p>
+                </div>
+              </div>
+
+              <div className="mt-5 flex items-center justify-end gap-2">
+                <button
+                  onClick={closeDeleteThreadConfirm}
+                  className="rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-surface-3)] disabled:opacity-50"
+                  disabled={deleteThreadPending}
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={confirmDeleteThread}
+                  className="flex items-center gap-1.5 rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] px-3 py-1.5 text-xs font-medium text-[var(--danger-text)] transition-colors hover:bg-[var(--danger-bg-hover)] disabled:opacity-50"
+                  disabled={deleteThreadPending}
+                >
+                  {deleteThreadPending ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Trash2 className="h-3.5 w-3.5" />
+                  )}
+                  Delete thread
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <Dialog
         open={!!imagePreview}

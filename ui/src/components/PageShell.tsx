@@ -39,14 +39,14 @@ export function PageHeader({
       <div className="min-w-0">
         <h1
           className={cn(
-            "text-xl font-semibold tracking-tight text-[var(--text-primary)]",
+            "app-page-title text-[var(--text-primary)]",
             titleClassName,
           )}
         >
           {title}
         </h1>
         {description ? (
-          <p className="mt-1 text-sm text-[var(--text-muted)] max-w-3xl">
+          <p className="mt-1 app-page-description text-[var(--text-muted)] max-w-3xl">
             {description}
           </p>
         ) : null}
