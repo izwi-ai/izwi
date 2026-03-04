@@ -34,6 +34,7 @@ import {
   type TranscriptionRecordSummary,
 } from "../api";
 import { ASRStats, GenerationStats } from "./GenerationStats";
+import { MiniWaveform } from "./ui/Waveform";
 import {
   Select,
   SelectContent,
@@ -402,6 +403,17 @@ export function TranscriptionPlayground({
   const liveMicProcessorSinkRef = useRef<GainNode | null>(null);
   const modelMenuRef = useRef<HTMLDivElement | null>(null);
   const historyAudioRef = useRef<HTMLAudioElement | null>(null);
+  const transcriptContainerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (isStreaming && transcriptContainerRef.current) {
+      const { scrollHeight, clientHeight } = transcriptContainerRef.current;
+      transcriptContainerRef.current.scrollTo({
+        top: scrollHeight - clientHeight,
+        behavior: "smooth",
+      });
+    }
+  }, [transcription, isStreaming]);
 
   const selectedOption = useMemo(() => {
     if (!selectedModel) {
@@ -1451,7 +1463,17 @@ export function TranscriptionPlayground({
               disabled={!selectedModelReady || isProcessing}
             >
               {isRecording ? (
-                <Square className="w-10 h-10 text-white fill-current" />
+                <div className="relative flex items-center justify-center">
+                  <div
+                    className="absolute inset-0 rounded-full bg-red-500/20 animate-ping"
+                    style={{ animationDuration: "1.5s" }}
+                  />
+                  <div
+                    className="absolute inset-[-10px] rounded-full bg-red-500/10 animate-ping"
+                    style={{ animationDuration: "2s" }}
+                  />
+                  <Square className="w-10 h-10 text-white fill-current relative z-10" />
+                </div>
               ) : (
                 <Mic className="w-10 h-10 text-[var(--text-primary)]" />
               )}
@@ -1480,17 +1502,19 @@ export function TranscriptionPlayground({
                   fileInputRef.current?.click();
                 }}
                 className={cn(
-                  "mt-4 flex flex-col items-center justify-center rounded-xl border-2 border-dashed p-6 transition-colors cursor-pointer",
+                  "mt-4 flex flex-col items-center justify-center rounded-xl border-2 border-dashed p-6 transition-all duration-200 cursor-pointer group",
                   selectedModelReady && !isProcessing
-                    ? "border-[var(--border-strong)] hover:border-primary/50 hover:bg-[var(--bg-surface-2)] bg-[var(--bg-surface-1)]"
+                    ? "border-[var(--border-strong)] hover:border-primary hover:bg-[var(--bg-surface-2)] bg-[var(--bg-surface-1)] hover:shadow-sm"
                     : "border-[var(--border-muted)] bg-[var(--bg-surface-1)] opacity-50 cursor-not-allowed",
                 )}
               >
-                <Upload className="w-6 h-6 text-[var(--text-muted)] mb-2" />
-                <p className="text-sm font-medium text-[var(--text-primary)]">
+                <div className="p-3 bg-background rounded-full mb-3 shadow-sm group-hover:scale-105 transition-transform duration-200 border border-[var(--border-muted)]">
+                  <Upload className="w-5 h-5 text-muted-foreground group-hover:text-primary transition-colors" />
+                </div>
+                <p className="text-sm font-medium text-[var(--text-primary)] group-hover:text-primary transition-colors">
                   Upload audio file
                 </p>
-                <p className="text-xs text-[var(--text-muted)] mt-1">
+                <p className="text-xs text-[var(--text-muted)] mt-1.5">
                   WAV, MP3, M4A, AAC
                 </p>
                 <input
@@ -1607,7 +1631,10 @@ export function TranscriptionPlayground({
           </div>
         </div>
 
-        <div className="flex-1 rounded-lg border border-[var(--border-muted)] bg-background/50 p-4 sm:p-5 overflow-y-auto shadow-inner">
+        <div
+          ref={transcriptContainerRef}
+          className="flex-1 rounded-lg border border-[var(--border-muted)] bg-background/50 p-4 sm:p-5 overflow-y-auto shadow-inner scroll-smooth"
+        >
           {showResult ? (
             <>
               {isProcessing && !transcription ? (
@@ -1618,10 +1645,17 @@ export function TranscriptionPlayground({
                     : "Transcribing..."}
                 </div>
               ) : (
-                <p className="text-sm text-foreground/90 whitespace-pre-wrap min-h-[2em] font-medium leading-relaxed">
-                  {transcription ||
-                    (isStreaming ? "Listening for speech..." : "")}
-                </p>
+                <div className="flex flex-col h-full">
+                  <p className="text-base text-[var(--text-primary)] whitespace-pre-wrap flex-1 leading-relaxed tracking-wide">
+                    {transcription}
+                  </p>
+                  {isStreaming && (
+                    <div className="flex items-center gap-2 text-sm text-[var(--text-secondary)] mt-4 p-3 bg-[var(--bg-surface-0)] rounded-lg border border-[var(--border-muted)] sticky bottom-0">
+                      <MiniWaveform isActive={true} />
+                      <span className="italic">Listening for speech...</span>
+                    </div>
+                  )}
+                </div>
               )}
             </>
           ) : (
@@ -1692,8 +1726,14 @@ export function TranscriptionPlayground({
               Loading history...
             </div>
           ) : historyRecords.length === 0 ? (
-            <div className="app-sidebar-empty">
-              No saved transcriptions yet.
+            <div className="flex flex-col items-center justify-center text-center p-6 mt-10 opacity-60">
+              <History className="w-10 h-10 mb-3 text-muted-foreground" />
+              <p className="text-sm font-medium text-muted-foreground">
+                No history yet
+              </p>
+              <p className="text-xs text-muted-foreground/70 mt-1">
+                Transcriptions will appear here
+              </p>
             </div>
           ) : (
             <div className="flex flex-col gap-2.5">
@@ -1718,14 +1758,14 @@ export function TranscriptionPlayground({
                         : "app-sidebar-row-idle",
                     )}
                   >
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="app-sidebar-row-label truncate">
+                    <div className="flex items-center justify-between gap-2 mb-1.5">
+                      <span className="app-sidebar-row-label truncate font-medium group-hover:text-primary transition-colors">
                         {record.audio_filename ||
                           record.model_id ||
                           "Audio input"}
                       </span>
-                      <div className="inline-flex items-center gap-1.5 shrink-0">
-                        <span className="app-sidebar-row-meta">
+                      <div className="inline-flex items-center gap-1.5 shrink-0 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+                        <span className="app-sidebar-row-meta mr-1 group-hover:hidden hidden sm:block">
                           {formatCreatedAt(record.created_at)}
                         </span>
                         <button
@@ -1734,15 +1774,24 @@ export function TranscriptionPlayground({
                             event.stopPropagation();
                             openDeleteRecordConfirm(record.id);
                           }}
-                          className="app-sidebar-delete-btn"
+                          className="p-1.5 rounded-md text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors focus:opacity-100"
                           title="Delete record"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
                       </div>
+                      <span className="app-sidebar-row-meta sm:hidden group-hover:hidden">
+                        {formatCreatedAt(record.created_at)}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between mt-1 mb-1.5 opacity-60 text-[10px] uppercase tracking-wide font-medium">
+                      <span>{formatCreatedAt(record.created_at)}</span>
+                      {record.duration_secs && (
+                        <span>{formatAudioDuration(record.duration_secs)}</span>
+                      )}
                     </div>
                     <p
-                      className="app-sidebar-row-preview"
+                      className="app-sidebar-row-preview text-[13px] leading-snug"
                       style={{
                         display: "-webkit-box",
                         WebkitLineClamp: 3,
