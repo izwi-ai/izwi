@@ -209,6 +209,8 @@ fn max_new_tokens(
     let default = match variant {
         ModelVariant::Gemma34BIt => 4096,
         ModelVariant::Gemma31BIt => 4096,
+        ModelVariant::Lfm2512BInstructGguf => 4096,
+        ModelVariant::Lfm2512BThinkingGguf => 4096,
         _ => 1536,
     };
 
