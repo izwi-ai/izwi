@@ -8,12 +8,16 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
 
 use candle_core::{DType, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::whisper::{self, model::Whisper, Config as WhisperConfig};
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
+use rand::Rng;
 use serde::Deserialize;
 use tracing::info;
 
@@ -25,6 +29,9 @@ use crate::tokenizer::Tokenizer;
 const SAMPLE_RATE: u32 = whisper::SAMPLE_RATE as u32;
 const DEFAULT_MAX_NEW_TOKENS: usize = 448;
 const MAX_AUDIO_SECONDS_HINT: f32 = whisper::CHUNK_LENGTH as f32;
+const DEFAULT_TEMPERATURE_FALLBACK_INC: f32 = 0.2;
+const DEFAULT_LOGPROB_THRESHOLD: f32 = -1.0;
+const DEFAULT_NO_SPEECH_THRESHOLD: f32 = 0.6;
 const REPETITION_GUARD_MIN_SPAN_TOKENS: usize = 8;
 const REPETITION_GUARD_MAX_SPAN_TOKENS: usize = 96;
 const REPETITION_GUARD_MIN_TOTAL_TOKENS: usize = 20;
@@ -45,6 +52,16 @@ struct WhisperGenerationConfig {
     max_length: Option<usize>,
     #[serde(default)]
     eos_token_id: Option<u32>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    temperature_increment_on_fallback: Option<f32>,
+    #[serde(default)]
+    compression_ratio_threshold: Option<f32>,
+    #[serde(default)]
+    logprob_threshold: Option<f32>,
+    #[serde(default)]
+    no_speech_threshold: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -53,12 +70,23 @@ struct WhisperSpecialTokens {
     transcribe: u32,
     eot: u32,
     no_timestamps: Option<u32>,
+    no_speech: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AsrTranscriptionOutput {
     pub text: String,
     pub language: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WhisperDecodeAttempt {
+    text: String,
+    avg_logprob: f32,
+    no_speech_prob: Option<f32>,
+    ended_with_eot: bool,
+    repetition_loop: bool,
+    compression_ratio: Option<f32>,
 }
 
 pub struct WhisperTurboAsrModel {
@@ -207,7 +235,7 @@ impl WhisperTurboAsrModel {
         audio: &[f32],
         sample_rate: u32,
         language: Option<&str>,
-        on_delta: &mut dyn FnMut(&str),
+        _on_delta: &mut dyn FnMut(&str),
     ) -> Result<AsrTranscriptionOutput> {
         if audio.is_empty() {
             return Err(Error::InvalidInput("Empty audio input".to_string()));
@@ -241,61 +269,67 @@ impl WhisperTurboAsrModel {
             prompt.push(no_timestamps);
         }
 
-        let mut generated_tokens = Vec::<u32>::new();
-        let mut assembled = String::new();
-
         let max_steps = decode_step_budget(
             prompt.len(),
             self.config.max_target_positions,
             self.generation.max_length.unwrap_or(DEFAULT_MAX_NEW_TOKENS),
         )?;
+        let temperatures = self.decode_temperatures();
+        let logprob_threshold = self
+            .generation
+            .logprob_threshold
+            .unwrap_or(DEFAULT_LOGPROB_THRESHOLD);
+        let no_speech_threshold = self
+            .generation
+            .no_speech_threshold
+            .unwrap_or(DEFAULT_NO_SPEECH_THRESHOLD);
+        let compression_ratio_threshold = self.generation.compression_ratio_threshold;
 
-        for step_idx in 0..max_steps {
-            let tokens_t = Tensor::new(prompt.as_slice(), &self.device.device)?.unsqueeze(0)?;
-            let ys = whisper
-                .decoder
-                .forward(&tokens_t, &audio_features, step_idx == 0)?;
-            let (_, seq_len, _) = ys.dims3()?;
-            let logits = whisper
-                .decoder
-                .final_linear(&ys.i((..1, seq_len - 1..))?)?
-                .i(0)?
-                .i(0)?;
+        let mut best_attempt: Option<WhisperDecodeAttempt> = None;
+        for (idx, temperature) in temperatures.iter().copied().enumerate() {
+            let attempt = self.decode_attempt(
+                &mut whisper,
+                &audio_features,
+                &prompt,
+                max_steps,
+                temperature,
+            )?;
 
-            let mut logits_vec = logits.to_vec1::<f32>()?;
-            self.apply_decode_constraints(&mut logits_vec, step_idx == 0);
-            let next = select_next_token(&logits_vec, self.special.eot);
-            if next == self.special.eot {
+            if should_skip_as_no_speech(&attempt, logprob_threshold, no_speech_threshold) {
+                best_attempt = Some(WhisperDecodeAttempt {
+                    text: String::new(),
+                    ..attempt
+                });
                 break;
             }
 
-            generated_tokens.push(next);
-            prompt.push(next);
-
-            if let Some((span, repeats)) = find_suffix_token_repetition(&generated_tokens) {
-                // Degenerate greedy loops can repeat an entire phrase verbatim.
-                // Keep the first span and stop decoding before the transcript explodes.
-                let trim = span.saturating_mul(repeats.saturating_sub(1));
-                if trim > 0 && trim <= generated_tokens.len() {
-                    generated_tokens.truncate(generated_tokens.len() - trim);
-                    prompt.truncate(prompt.len() - trim);
-                    assembled = self.decode_generated_text(&generated_tokens)?;
-                }
+            let is_last_temperature = idx + 1 == temperatures.len();
+            let should_retry = !is_last_temperature
+                && should_retry_decode(&attempt, logprob_threshold, compression_ratio_threshold);
+            if !should_retry {
+                best_attempt = Some(attempt);
                 break;
             }
 
-            let decoded = self.decode_generated_text(&generated_tokens)?;
-            let delta = text_delta(&assembled, &decoded);
-            if !delta.is_empty() {
-                for ch in delta.chars() {
-                    let mut buf = [0u8; 4];
-                    on_delta(ch.encode_utf8(&mut buf));
-                }
+            if best_attempt
+                .as_ref()
+                .map(|best| is_better_attempt(&attempt, best))
+                .unwrap_or(true)
+            {
+                best_attempt = Some(attempt);
             }
-            assembled = decoded;
         }
 
-        let text = assembled.trim().to_string();
+        let final_attempt = best_attempt.unwrap_or_else(|| WhisperDecodeAttempt {
+            text: String::new(),
+            avg_logprob: f32::NEG_INFINITY,
+            no_speech_prob: None,
+            ended_with_eot: false,
+            repetition_loop: false,
+            compression_ratio: None,
+        });
+
+        let text = final_attempt.text.trim().to_string();
         let language = resolved_language.map(|(_token_id, code)| code);
         Ok(AsrTranscriptionOutput { text, language })
     }
@@ -421,6 +455,116 @@ impl WhisperTurboAsrModel {
         self.tokenizer.decode(token_ids)
     }
 
+    fn decode_temperatures(&self) -> Vec<f32> {
+        // Mirrors whisper.cpp/transformers temperature fallback ladder.
+        let mut temperatures = Vec::new();
+        let start = self.generation.temperature.unwrap_or(0.0).clamp(0.0, 1.0);
+        let inc = self
+            .generation
+            .temperature_increment_on_fallback
+            .unwrap_or(DEFAULT_TEMPERATURE_FALLBACK_INC);
+
+        if inc <= 0.0 {
+            temperatures.push(start);
+            return temperatures;
+        }
+
+        let mut t = start;
+        while t <= 1.0 + 1e-6 {
+            temperatures.push((t * 100.0).round() / 100.0);
+            t += inc;
+        }
+
+        if temperatures.is_empty() {
+            temperatures.push(start);
+        }
+        temperatures
+    }
+
+    fn decode_attempt(
+        &self,
+        whisper: &mut Whisper,
+        audio_features: &Tensor,
+        prompt_prefix: &[u32],
+        max_steps: usize,
+        temperature: f32,
+    ) -> Result<WhisperDecodeAttempt> {
+        let mut rng = rand::thread_rng();
+        let mut prompt = prompt_prefix.to_vec();
+        let mut generated_tokens = Vec::<u32>::new();
+        let mut sum_logprobs = 0.0f64;
+        let mut sampled_token_count = 0usize;
+        let mut no_speech_prob: Option<f32> = None;
+        let mut ended_with_eot = false;
+        let mut repetition_loop = false;
+
+        for step_idx in 0..max_steps {
+            let tokens_t = Tensor::new(prompt.as_slice(), &self.device.device)?.unsqueeze(0)?;
+            let ys = whisper
+                .decoder
+                .forward(&tokens_t, audio_features, step_idx == 0)?;
+            let (_, seq_len, _) = ys.dims3()?;
+            let logits = whisper
+                .decoder
+                .final_linear(&ys.i((..1, seq_len - 1..))?)?
+                .i(0)?
+                .i(0)?;
+
+            let mut logits_vec = logits.to_vec1::<f32>()?;
+            self.apply_decode_constraints(&mut logits_vec, step_idx == 0);
+            let log_probs = logits_to_log_probs(&logits_vec, temperature);
+
+            if step_idx == 0 {
+                no_speech_prob = self
+                    .special
+                    .no_speech
+                    .and_then(|token_id| probability_for_token(&log_probs, token_id));
+            }
+
+            let (next, next_logprob) =
+                sample_token_from_log_probs(&log_probs, temperature, self.special.eot, &mut rng);
+            sum_logprobs += next_logprob as f64;
+            sampled_token_count = sampled_token_count.saturating_add(1);
+
+            if next == self.special.eot {
+                ended_with_eot = true;
+                break;
+            }
+
+            generated_tokens.push(next);
+            prompt.push(next);
+
+            if let Some((span, repeats)) = find_suffix_token_repetition(&generated_tokens) {
+                let trim = span.saturating_mul(repeats.saturating_sub(1));
+                if trim > 0 && trim <= generated_tokens.len() {
+                    generated_tokens.truncate(generated_tokens.len() - trim);
+                }
+                repetition_loop = true;
+                break;
+            }
+        }
+
+        let text = self
+            .decode_generated_text(&generated_tokens)?
+            .trim()
+            .to_string();
+        let avg_logprob = if sampled_token_count > 0 {
+            (sum_logprobs / sampled_token_count as f64) as f32
+        } else {
+            f32::NEG_INFINITY
+        };
+        let compression_ratio = token_compression_ratio(&generated_tokens, self.config.vocab_size);
+
+        Ok(WhisperDecodeAttempt {
+            text,
+            avg_logprob,
+            no_speech_prob,
+            ended_with_eot,
+            repetition_loop,
+            compression_ratio,
+        })
+    }
+
     fn apply_decode_constraints(&self, logits: &mut [f32], at_begin: bool) {
         for token_id in &self.suppress_tokens {
             mask_token(logits, *token_id);
@@ -477,12 +621,16 @@ fn resolve_special_tokens(
     let no_timestamps = generation
         .no_timestamps_token_id
         .or_else(|| tokenizer.token_to_id(whisper::NO_TIMESTAMPS_TOKEN));
+    let no_speech = whisper::NO_SPEECH_TOKENS
+        .iter()
+        .find_map(|token| tokenizer.token_to_id(token));
 
     Ok(WhisperSpecialTokens {
         sot,
         transcribe,
         eot,
         no_timestamps,
+        no_speech,
     })
 }
 
@@ -534,20 +682,191 @@ fn mask_token(logits: &mut [f32], token_id: u32) {
     }
 }
 
-fn select_next_token(logits: &[f32], fallback_token: u32) -> u32 {
-    let mut best_idx = fallback_token as usize;
-    let mut best_val = f32::NEG_INFINITY;
-    for (idx, value) in logits.iter().enumerate() {
-        if *value > best_val {
-            best_idx = idx;
-            best_val = *value;
+fn logits_to_log_probs(logits: &[f32], temperature: f32) -> Vec<f32> {
+    let inv_temperature = if temperature > 0.0 {
+        1.0 / temperature
+    } else {
+        1.0
+    };
+
+    let mut max_logit = f32::NEG_INFINITY;
+    for logit in logits {
+        if !logit.is_finite() {
+            continue;
+        }
+        let scaled = *logit * inv_temperature;
+        if scaled > max_logit {
+            max_logit = scaled;
         }
     }
-    if !best_val.is_finite() {
-        fallback_token
-    } else {
-        best_idx as u32
+
+    if !max_logit.is_finite() {
+        return vec![f32::NEG_INFINITY; logits.len()];
     }
+
+    let mut sum_exp = 0.0f64;
+    for logit in logits {
+        if !logit.is_finite() {
+            continue;
+        }
+        let scaled = *logit * inv_temperature;
+        sum_exp += (scaled - max_logit).exp() as f64;
+    }
+
+    if sum_exp <= 0.0 {
+        return vec![f32::NEG_INFINITY; logits.len()];
+    }
+
+    let logsumexp = max_logit + (sum_exp as f32).ln();
+    logits
+        .iter()
+        .map(|logit| {
+            if !logit.is_finite() {
+                f32::NEG_INFINITY
+            } else {
+                (*logit * inv_temperature) - logsumexp
+            }
+        })
+        .collect()
+}
+
+fn probability_for_token(log_probs: &[f32], token_id: u32) -> Option<f32> {
+    let idx = token_id as usize;
+    if idx >= log_probs.len() {
+        return None;
+    }
+    let log_prob = log_probs[idx];
+    if !log_prob.is_finite() {
+        return None;
+    }
+    Some(log_prob.exp())
+}
+
+fn sample_token_from_log_probs<R: Rng + ?Sized>(
+    log_probs: &[f32],
+    temperature: f32,
+    fallback_token: u32,
+    rng: &mut R,
+) -> (u32, f32) {
+    if temperature <= 0.0 {
+        let mut best_idx = fallback_token as usize;
+        let mut best_logprob = f32::NEG_INFINITY;
+        for (idx, logprob) in log_probs.iter().enumerate() {
+            if *logprob > best_logprob {
+                best_idx = idx;
+                best_logprob = *logprob;
+            }
+        }
+        if !best_logprob.is_finite() {
+            return (fallback_token, f32::NEG_INFINITY);
+        }
+        return (best_idx as u32, best_logprob);
+    }
+
+    let mut sum = 0.0f64;
+    for logprob in log_probs {
+        if logprob.is_finite() {
+            sum += logprob.exp() as f64;
+        }
+    }
+
+    if sum <= 0.0 {
+        return (fallback_token, f32::NEG_INFINITY);
+    }
+
+    let mut threshold = rng.gen_range(0.0..sum);
+    for (idx, logprob) in log_probs.iter().enumerate() {
+        if !logprob.is_finite() {
+            continue;
+        }
+        threshold -= logprob.exp() as f64;
+        if threshold <= 0.0 {
+            return (idx as u32, *logprob);
+        }
+    }
+
+    let mut best_idx = fallback_token as usize;
+    let mut best_logprob = f32::NEG_INFINITY;
+    for (idx, logprob) in log_probs.iter().enumerate() {
+        if *logprob > best_logprob {
+            best_idx = idx;
+            best_logprob = *logprob;
+        }
+    }
+    (best_idx as u32, best_logprob)
+}
+
+fn token_compression_ratio(tokens: &[u32], vocab_size: usize) -> Option<f32> {
+    if tokens.is_empty() || vocab_size == 0 {
+        return None;
+    }
+
+    let width = ((vocab_size as f64).log2().floor() as usize / 8).saturating_add(1);
+    let mut raw = Vec::with_capacity(tokens.len() * width);
+    for token in tokens {
+        let value = *token as u64;
+        for byte in 0..width {
+            raw.push(((value >> (8 * byte)) & 0xFF) as u8);
+        }
+    }
+
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&raw).ok()?;
+    let compressed = encoder.finish().ok()?;
+    if compressed.is_empty() {
+        return None;
+    }
+    Some(raw.len() as f32 / compressed.len() as f32)
+}
+
+fn should_skip_as_no_speech(
+    attempt: &WhisperDecodeAttempt,
+    logprob_threshold: f32,
+    no_speech_threshold: f32,
+) -> bool {
+    attempt.avg_logprob < logprob_threshold
+        && attempt
+            .no_speech_prob
+            .map(|prob| prob > no_speech_threshold)
+            .unwrap_or(false)
+}
+
+fn should_retry_decode(
+    attempt: &WhisperDecodeAttempt,
+    logprob_threshold: f32,
+    compression_ratio_threshold: Option<f32>,
+) -> bool {
+    // Fallback criteria aligned with upstream Whisper implementations:
+    // repetition/unfinished decode, low avg logprob, and optional compression ratio.
+    if attempt.repetition_loop || !attempt.ended_with_eot {
+        return true;
+    }
+    if attempt.avg_logprob < logprob_threshold {
+        return true;
+    }
+    if let (Some(ratio), Some(threshold)) = (attempt.compression_ratio, compression_ratio_threshold)
+    {
+        if ratio > threshold {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_better_attempt(
+    candidate: &WhisperDecodeAttempt,
+    current_best: &WhisperDecodeAttempt,
+) -> bool {
+    if candidate.ended_with_eot != current_best.ended_with_eot {
+        return candidate.ended_with_eot;
+    }
+    if candidate.repetition_loop != current_best.repetition_loop {
+        return !candidate.repetition_loop;
+    }
+    if candidate.avg_logprob != current_best.avg_logprob {
+        return candidate.avg_logprob > current_best.avg_logprob;
+    }
+    candidate.text.len() > current_best.text.len()
 }
 
 fn text_delta(previous: &str, current: &str) -> String {
