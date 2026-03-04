@@ -17,7 +17,7 @@ impl RuntimeService {
     const LFM2_S2S_DEFAULT_AUDIO_TOP_K: usize = 4;
 
     fn default_lfm2_variant() -> ModelVariant {
-        ModelVariant::Lfm2Audio15B
+        ModelVariant::Lfm25Audio15B
     }
 
     async fn resolve_active_lfm2_variant(&self) -> ModelVariant {

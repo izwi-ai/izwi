@@ -544,7 +544,7 @@ mod tests {
     #[test]
     fn non_qwen_tts_uses_default_timeout() {
         let req = SpeechRequest {
-            model: "LFM2-Audio-1.5B".to_string(),
+            model: "LFM2.5-Audio-1.5B".to_string(),
             input: "hello".to_string(),
             voice: None,
             response_format: Some("wav".to_string()),
@@ -560,7 +560,7 @@ mod tests {
             reference_text: None,
         };
 
-        let timeout = resolve_speech_timeout_secs(300, ModelVariant::Lfm2Audio15B, &req);
+        let timeout = resolve_speech_timeout_secs(300, ModelVariant::Lfm25Audio15B, &req);
         assert_eq!(timeout, 300);
     }
 }

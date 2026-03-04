@@ -43,13 +43,13 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
   "custom-voice": {
     id: "custom-voice",
     label: "Text to Speech",
-    description: "Generate speech with built-in voice profiles (Qwen3, Kokoro, LFM2)",
+    description: "Generate speech with built-in voice profiles (Qwen3, Kokoro, LFM2.5)",
     icon: "Volume2",
     modelFilter: (variant) =>
       variant.includes("CustomVoice") || isLfmAudioVariant(variant) || isKokoroVariant(variant),
     emptyStateTitle: "No TTS Model Loaded",
     emptyStateDescription:
-      "Load a CustomVoice, Kokoro, or LFM2 model to generate speech",
+      "Load a CustomVoice, Kokoro, or LFM2.5 model to generate speech",
   },
   "voice-clone": {
     id: "voice-clone",
@@ -76,7 +76,7 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     id: "transcription",
     label: "Transcription",
     description:
-      "Speech-to-text with Qwen3-ASR, Whisper, Parakeet-TDT, Voxtral, and LFM2 models",
+      "Speech-to-text with Qwen3-ASR, Whisper, Parakeet-TDT, Voxtral, and LFM2.5 models",
     icon: "FileText",
     modelFilter: (variant) =>
       variant.includes("Qwen3-ASR") ||
@@ -86,7 +86,7 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
       isLfmAudioVariant(variant),
     emptyStateTitle: "No ASR Model Loaded",
     emptyStateDescription:
-      "Download and load a Qwen3-ASR, Whisper, Parakeet-TDT, Voxtral, or LFM2 model for speech transcription",
+      "Download and load a Qwen3-ASR, Whisper, Parakeet-TDT, Voxtral, or LFM2.5 model for speech transcription",
   },
   chat: {
     id: "chat",

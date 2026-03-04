@@ -268,8 +268,7 @@ function formatModelVariantLabel(variant: string): string {
 
   if (isLfmAudioVariant(normalized)) {
     return normalized
-      .replace("LFM2.5-Audio-", "LFM2.5 Audio ")
-      .replace("LFM2-Audio-", "LFM2 Audio ");
+      .replace("LFM2.5-Audio-", "LFM2.5 Audio ");
   }
 
   if (isKokoroVariant(normalized)) {
@@ -604,13 +603,6 @@ export function VoicePage({
     () => asrModels.filter((m) => isLfm2Variant(m.variant)),
     [asrModels],
   );
-  const lfm2UnifiedInfo = useMemo(
-    () =>
-      s2sModels.find((m) => m.variant === "LFM2-Audio-1.5B") ??
-      s2sModels.find((m) => m.variant.startsWith("LFM2-Audio-")) ??
-      null,
-    [s2sModels],
-  );
   const lfm25UnifiedInfo = useMemo(
     () =>
       s2sModels.find((m) => m.variant === "LFM2.5-Audio-1.5B") ??
@@ -622,12 +614,6 @@ export function VoicePage({
   const unifiedModelOptions = useMemo(
     () => [
       {
-        key: "lfm2",
-        label: "LFM2",
-        description: "Balanced local speech model for unified realtime voice.",
-        model: lfm2UnifiedInfo,
-      },
-      {
         key: "lfm2_5",
         label: "LFM2.5",
         description:
@@ -635,7 +621,7 @@ export function VoicePage({
         model: lfm25UnifiedInfo,
       },
     ],
-    [lfm2UnifiedInfo, lfm25UnifiedInfo],
+    [lfm25UnifiedInfo],
   );
   const selectedAsrInfo = useMemo(
     () =>
@@ -734,12 +720,7 @@ export function VoicePage({
         (model) =>
           model.variant.startsWith("LFM2.5-Audio-") && model.status === "ready",
       ) ||
-      candidates.find(
-        (model) =>
-          model.variant.startsWith("LFM2-Audio-") && model.status === "ready",
-      ) ||
       candidates.find((model) => model.variant.startsWith("LFM2.5-Audio-")) ||
-      candidates.find((model) => model.variant.startsWith("LFM2-Audio-")) ||
       candidates[0];
 
     setSelectedS2sModel(preferredS2s?.variant ?? null);
@@ -2943,7 +2924,7 @@ export function VoicePage({
                         Unified Speech Model
                       </div>
                       <p className="text-xs text-muted-foreground mt-1">
-                        One LFM2 model handles user speech understanding and
+                        One LFM2.5 model handles user speech understanding and
                         assistant speech output.
                       </p>
                     </button>
@@ -2978,7 +2959,7 @@ export function VoicePage({
                           Unified Models
                         </h3>
                         <span className="text-[11px] text-[var(--text-muted)]">
-                          Choose LFM2 or LFM2.5.
+                          Choose an LFM2.5 model.
                         </span>
                       </div>
                       <div className="grid md:grid-cols-2 gap-3">

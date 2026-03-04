@@ -1,4 +1,4 @@
-//! Speech-to-speech endpoint backed by LFM2-Audio interleaved generation.
+//! Speech-to-speech endpoint backed by LFM2.5-Audio interleaved generation.
 
 use axum::{
     body::Body,
@@ -478,12 +478,12 @@ async fn field_text(field: axum::extract::multipart::Field<'_>) -> Result<String
 }
 
 fn resolve_lfm2_variant(model_id: Option<&str>) -> Result<ModelVariant, ApiError> {
-    let model_id = model_id.unwrap_or("LFM2-Audio-1.5B");
+    let model_id = model_id.unwrap_or("LFM2.5-Audio-1.5B");
     let variant =
         parse_model_variant(model_id).map_err(|err| ApiError::bad_request(err.to_string()))?;
     if !variant.is_lfm2() {
         return Err(ApiError::bad_request(format!(
-            "Unsupported speech-to-speech model '{}'. Supported: LFM2-Audio-1.5B, LFM2.5-Audio-1.5B",
+            "Unsupported speech-to-speech model '{}'. Supported: LFM2.5-Audio-1.5B, LFM2.5-Audio-1.5B-4bit",
             model_id
         )));
     }

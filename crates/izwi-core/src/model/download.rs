@@ -1450,7 +1450,7 @@ impl ModelDownloader {
                     ModelVariant::Qwen314BGguf => 9_200_000_000,
                     ModelVariant::Gemma31BIt => 2_100_000_000,
                     ModelVariant::Gemma34BIt => 2_400_000_000,
-                    ModelVariant::Lfm2Audio15B | ModelVariant::Lfm25Audio15B => 2_900_000_000,
+                    ModelVariant::Lfm25Audio15B => 2_900_000_000,
                     ModelVariant::VoxtralMini4BRealtime2602 => 8_900_000_000,
                     _ => 1_500_000_000,
                 }

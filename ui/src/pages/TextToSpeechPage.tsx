@@ -59,7 +59,6 @@ export function TextToSpeechPage({
     "Kokoro-82M",
     "LFM2.5-Audio-1.5B-4bit",
     "LFM2.5-Audio-1.5B",
-    "LFM2-Audio-1.5B",
     "Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit",
     "Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit",
     "Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit",
@@ -185,7 +184,7 @@ export function TextToSpeechPage({
           setAutoCloseOnIntentReady(true);
           setIsModelModalOpen(true);
           onError(
-            "Select and load a CustomVoice, Kokoro, or LFM2 model to generate speech.",
+            "Select and load a CustomVoice, Kokoro, or LFM2.5 model to generate speech.",
           );
         }}
       />
@@ -194,7 +193,7 @@ export function TextToSpeechPage({
         isOpen={isModelModalOpen}
         onClose={closeModelModal}
         title="Text-to-Speech Models"
-        description="Manage CustomVoice, Kokoro, and LFM2 models for this route."
+        description="Manage CustomVoice, Kokoro, and LFM2.5 models for this route."
         models={routeModels}
         loading={loading}
         selectedVariant={resolvedSelectedModel}

@@ -101,7 +101,7 @@ impl ModelVariant {
             | Qwen3Tts12Hz17BVoiceDesignBf16 => ModelFamily::Qwen3Tts,
             Kokoro82M => ModelFamily::KokoroTts,
             Qwen3TtsTokenizer12Hz => ModelFamily::Tokenizer,
-            Lfm2Audio15B | Lfm25Audio15B | Lfm25Audio15B4Bit => ModelFamily::Lfm2Audio,
+            Lfm25Audio15B | Lfm25Audio15B4Bit => ModelFamily::Lfm2Audio,
             Qwen3Asr06B | Qwen3Asr06B4Bit | Qwen3Asr06B8Bit | Qwen3Asr06BBf16 | Qwen3Asr17B
             | Qwen3Asr17B4Bit | Qwen3Asr17B8Bit | Qwen3Asr17BBf16 => ModelFamily::Qwen3Asr,
             ParakeetTdt06BV2 | ParakeetTdt06BV3 => ModelFamily::ParakeetAsr,
@@ -492,13 +492,6 @@ fn resolve_lfm2_audio_variant(normalized: &str) -> Option<ModelVariant> {
         return Some(Lfm25Audio15B);
     }
 
-    if normalized.contains("lfm2") {
-        if normalized.contains("gguf") {
-            return None;
-        }
-        return Some(Lfm2Audio15B);
-    }
-
     None
 }
 
@@ -574,9 +567,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_tts_accepts_lfm2_audio() {
-        let parsed = parse_tts_model_variant("LFM2-Audio-1.5B").unwrap();
-        assert_eq!(parsed, ModelVariant::Lfm2Audio15B);
+    fn parse_tts_rejects_legacy_lfm2_audio() {
+        assert!(parse_tts_model_variant("LFM2-Audio-1.5B").is_err());
     }
 
     #[test]
@@ -586,9 +578,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_asr_accepts_lfm2_audio() {
+    fn resolve_asr_rejects_legacy_lfm2_audio() {
         let resolved = resolve_asr_model_variant(Some("LFM2-Audio-1.5B"));
-        assert_eq!(resolved, ModelVariant::Lfm2Audio15B);
+        assert_eq!(resolved, ModelVariant::Qwen3Asr06B);
     }
 
     #[test]

@@ -957,7 +957,7 @@ export function CustomVoicePlayground({
 
             {!selectedModelReady && (
               <p className="text-xs text-[var(--text-secondary)]">
-                Load a compatible Qwen3 CustomVoice, Kokoro, or LFM2 model to
+                Load a compatible Qwen3 CustomVoice, Kokoro, or LFM2.5 model to
                 generate speech
               </p>
             )}

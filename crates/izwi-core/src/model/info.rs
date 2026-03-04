@@ -57,9 +57,6 @@ pub enum ModelVariant {
     /// Tokenizer for 12Hz codec
     #[serde(rename = "Qwen3-TTS-Tokenizer-12Hz")]
     Qwen3TtsTokenizer12Hz,
-    /// LFM2-Audio 1.5B model from Liquid AI
-    #[serde(rename = "LFM2-Audio-1.5B")]
-    Lfm2Audio15B,
     /// LFM2.5-Audio 1.5B model from Liquid AI
     #[serde(rename = "LFM2.5-Audio-1.5B")]
     Lfm25Audio15B,
@@ -220,7 +217,6 @@ impl ModelVariant {
                 "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16"
             }
             Self::Qwen3TtsTokenizer12Hz => "Qwen/Qwen3-TTS-Tokenizer-12Hz",
-            Self::Lfm2Audio15B => "LiquidAI/LFM2-Audio-1.5B",
             Self::Lfm25Audio15B => "LiquidAI/LFM2.5-Audio-1.5B",
             Self::Lfm25Audio15B4Bit => "mlx-community/LFM2.5-Audio-1.5B-4bit",
             Self::Lfm2512BInstructGguf => "LiquidAI/LFM2.5-1.2B-Instruct-GGUF",
@@ -279,7 +275,6 @@ impl ModelVariant {
             Self::Qwen3Tts12Hz17BVoiceDesign8Bit => "Qwen3-TTS 1.7B VoiceDesign 8-bit",
             Self::Qwen3Tts12Hz17BVoiceDesignBf16 => "Qwen3-TTS 1.7B VoiceDesign bf16",
             Self::Qwen3TtsTokenizer12Hz => "Qwen3-TTS Tokenizer 12Hz",
-            Self::Lfm2Audio15B => "LFM2-Audio 1.5B",
             Self::Lfm25Audio15B => "LFM2.5-Audio 1.5B",
             Self::Lfm25Audio15B4Bit => "LFM2.5-Audio 1.5B 4-bit",
             Self::Lfm2512BInstructGguf => "LFM2.5 1.2B Instruct GGUF",
@@ -338,7 +333,6 @@ impl ModelVariant {
             Self::Qwen3Tts12Hz17BVoiceDesign8Bit => "Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit",
             Self::Qwen3Tts12Hz17BVoiceDesignBf16 => "Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16",
             Self::Qwen3TtsTokenizer12Hz => "Qwen3-TTS-Tokenizer-12Hz",
-            Self::Lfm2Audio15B => "LFM2-Audio-1.5B",
             Self::Lfm25Audio15B => "LFM2.5-Audio-1.5B",
             Self::Lfm25Audio15B4Bit => "LFM2.5-Audio-1.5B-4bit",
             Self::Lfm2512BInstructGguf => "LFM2.5-1.2B-Instruct-GGUF",
@@ -397,7 +391,6 @@ impl ModelVariant {
             Self::Qwen3Tts12Hz17BVoiceDesign8Bit => 3_080_140_867, // ~2.87 GB
             Self::Qwen3Tts12Hz17BVoiceDesignBf16 => 4_520_194_992, // ~4.21 GB
             Self::Qwen3TtsTokenizer12Hz => 682_300_739, // ~0.64 GB
-            Self::Lfm2Audio15B => 3_000_000_000,        // ~2.79 GB (est)
             Self::Lfm25Audio15B => 3_200_000_000,       // ~2.98 GB (est)
             Self::Lfm25Audio15B4Bit => 884_000_000,     // ~0.82 GB
             Self::Lfm2512BInstructGguf => 730_895_168,  // ~0.68 GB (GGUF Q4_K_M, HF tree)
@@ -456,7 +449,7 @@ impl ModelVariant {
             | Self::Qwen3Tts12Hz17BVoiceDesign8Bit
             | Self::Qwen3Tts12Hz17BVoiceDesignBf16 => 6.0,
             Self::Qwen3TtsTokenizer12Hz => 1.0,
-            Self::Lfm2Audio15B | Self::Lfm25Audio15B => 6.0,
+            Self::Lfm25Audio15B => 6.0,
             Self::Lfm25Audio15B4Bit => 4.5,
             Self::Lfm2512BInstructGguf | Self::Lfm2512BThinkingGguf => 2.0,
             Self::Kokoro82M => 2.0,
@@ -711,7 +704,7 @@ impl ModelVariant {
             | Self::Lfm2512BThinkingGguf
             | Self::Kokoro82M => true,
             Self::Gemma34BIt => false,
-            Self::Lfm2Audio15B | Self::Lfm25Audio15B => true,
+            Self::Lfm25Audio15B => true,
             Self::VoxtralMini4BRealtime2602 => false,
             Self::ParakeetTdt06BV2 | Self::ParakeetTdt06BV3 => true,
             Self::WhisperLargeV3Turbo => true,
@@ -741,7 +734,6 @@ impl ModelVariant {
             Self::Qwen3Tts12Hz17BVoiceDesign8Bit,
             Self::Qwen3Tts12Hz17BVoiceDesignBf16,
             Self::Qwen3TtsTokenizer12Hz,
-            Self::Lfm2Audio15B,
             Self::Lfm25Audio15B,
             Self::Lfm25Audio15B4Bit,
             Self::Lfm2512BInstructGguf,
@@ -862,7 +854,7 @@ mod tests {
 
     #[test]
     fn non_qwen3_tts_variants_do_not_expose_qwen_output_hints() {
-        let variant = ModelVariant::Lfm2Audio15B;
+        let variant = ModelVariant::Lfm25Audio15B;
         assert_eq!(variant.tts_max_output_frames_hint(), None);
         assert_eq!(variant.tts_output_frame_rate_hz_hint(), None);
         assert_eq!(variant.tts_max_output_seconds_hint(), None);

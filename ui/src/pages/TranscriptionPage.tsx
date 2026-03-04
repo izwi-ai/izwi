@@ -80,7 +80,6 @@ export function TranscriptionPage({
     "Whisper-Large-v3-Turbo",
     "LFM2.5-Audio-1.5B-4bit",
     "LFM2.5-Audio-1.5B",
-    "LFM2-Audio-1.5B",
     "Qwen3-ASR-0.6B",
     "Qwen3-ASR-1.7B-4bit",
     "Qwen3-ASR-1.7B",
