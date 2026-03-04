@@ -301,7 +301,7 @@ export function VoiceDesignPlayground({
       option.statusLabel.toLowerCase().includes("downloading") ||
       option.statusLabel.toLowerCase().includes("loading")
     ) {
-      return "text-[var(--text-muted)] bg-amber-500/10";
+      return "text-amber-400 bg-amber-500/10";
     }
     if (option.statusLabel.toLowerCase().includes("error")) {
       return "text-red-400 bg-red-500/10";
@@ -464,7 +464,7 @@ export function VoiceDesignPlayground({
                     "mt-2 text-xs",
                     selectedModelReady
                       ? "text-[var(--text-secondary)]"
-                      : "text-[var(--text-muted)]",
+                      : "text-amber-400",
                   )}
                 >
                   {selectedModelReady
