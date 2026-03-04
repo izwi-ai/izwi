@@ -283,12 +283,12 @@ export function Layout({
                 onClick={() => handleNavClick(item.path)}
                 className={({ isActive }) =>
                   cn(
-                    "sidebar-link flex items-center rounded-md border transition-all group",
+                    "sidebar-link flex items-center rounded-lg border transition-all group",
                     isSidebarCollapsed
-                      ? "justify-center p-2"
-                      : "gap-3 px-3 py-2",
+                      ? "justify-center p-2.5 mx-auto w-10 h-10"
+                      : "gap-3 px-3 py-2.5 mx-2",
                     isActive
-                      ? "sidebar-link-active text-foreground font-medium"
+                      ? "sidebar-link-active text-foreground font-medium shadow-sm"
                       : "sidebar-link-idle text-muted-foreground hover:text-foreground",
                   )
                 }
@@ -345,12 +345,12 @@ export function Layout({
                 onClick={() => handleNavClick(item.path)}
                 className={({ isActive }) =>
                   cn(
-                    "sidebar-link flex items-center rounded-md border transition-all group",
+                    "sidebar-link flex items-center rounded-lg border transition-all group",
                     isSidebarCollapsed
-                      ? "justify-center p-2"
-                      : "gap-3 px-3 py-2",
+                      ? "justify-center p-2.5 mx-auto w-10 h-10"
+                      : "gap-3 px-3 py-2.5 mx-2",
                     isActive
-                      ? "sidebar-link-active text-foreground font-medium"
+                      ? "sidebar-link-active text-foreground font-medium shadow-sm"
                       : "sidebar-link-idle text-muted-foreground hover:text-foreground",
                   )
                 }
@@ -400,12 +400,12 @@ export function Layout({
                 onClick={() => handleNavClick(item.path)}
                 className={({ isActive }) =>
                   cn(
-                    "sidebar-link flex items-center rounded-md border transition-all group",
+                    "sidebar-link flex items-center rounded-lg border transition-all group",
                     isSidebarCollapsed
-                      ? "justify-center p-2"
-                      : "gap-3 px-3 py-2",
+                      ? "justify-center p-2.5 mx-auto w-10 h-10"
+                      : "gap-3 px-3 py-2.5 mx-2",
                     isActive
-                      ? "sidebar-link-active text-foreground font-medium"
+                      ? "sidebar-link-active text-foreground font-medium shadow-sm"
                       : "sidebar-link-idle text-muted-foreground hover:text-foreground",
                   )
                 }
@@ -595,7 +595,7 @@ export function Layout({
         </AnimatePresence>
 
         {/* Page content */}
-        <main className="p-5 sm:p-6 lg:px-10 lg:pb-10 lg:pt-6 max-w-[1500px] mx-auto">
+        <main className="p-6 sm:p-8 lg:px-12 lg:pb-12 lg:pt-8 max-w-[1600px] mx-auto">
           <Outlet />
         </main>
       </div>

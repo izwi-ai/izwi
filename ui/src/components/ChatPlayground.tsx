@@ -30,11 +30,7 @@ import {
 import { useSearchParams } from "react-router-dom";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import {
   api,
   ChatMessage,
@@ -325,7 +321,10 @@ function formatBytes(size: number): string {
 }
 
 function createMediaItemId(): string {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+  if (
+    typeof crypto !== "undefined" &&
+    typeof crypto.randomUUID === "function"
+  ) {
     return crypto.randomUUID();
   }
   return `media-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -470,10 +469,7 @@ function attachmentLabel(value: string, kind: ComposerMediaKind): string {
   return trimmed;
 }
 
-function readObjectField(
-  value: unknown,
-  keys: string[],
-): string | null {
+function readObjectField(value: unknown, keys: string[]): string | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
   }
@@ -500,7 +496,11 @@ function extractMediaLabel(value: unknown, kind: ComposerMediaKind): string {
     return attachmentLabel(value, kind);
   }
 
-  const explicitName = readObjectField(value, ["name", "file_name", "filename"]);
+  const explicitName = readObjectField(value, [
+    "name",
+    "file_name",
+    "filename",
+  ]);
   if (explicitName) {
     return explicitName;
   }
@@ -661,7 +661,7 @@ export function ChatPlayground({
   const deleteTargetThread = useMemo(
     () =>
       deleteTargetThreadId
-        ? threads.find((thread) => thread.id === deleteTargetThreadId) ?? null
+        ? (threads.find((thread) => thread.id === deleteTargetThreadId) ?? null)
         : null,
     [deleteTargetThreadId, threads],
   );
@@ -1041,12 +1041,7 @@ export function ChatPlayground({
         setDeleteThreadPending(false);
       }
     },
-    [
-      deleteThreadPending,
-      isPreparingThread,
-      isStreaming,
-      setActiveThreadInUrl,
-    ],
+    [deleteThreadPending, isPreparingThread, isStreaming, setActiveThreadInUrl],
   );
 
   const confirmDeleteThread = useCallback(() => {
@@ -1078,13 +1073,20 @@ export function ChatPlayground({
           return;
         }
         if (!selectedModelSupportsMedia) {
-          setError("Image/video chat is currently supported only on Qwen3.5 models.");
+          setError(
+            "Image/video chat is currently supported only on Qwen3.5 models.",
+          );
           return;
         }
 
-        const availableSlots = Math.max(0, MAX_MEDIA_ATTACHMENTS - mediaItems.length);
+        const availableSlots = Math.max(
+          0,
+          MAX_MEDIA_ATTACHMENTS - mediaItems.length,
+        );
         if (availableSlots <= 0) {
-          setError(`You can attach up to ${MAX_MEDIA_ATTACHMENTS} files per message.`);
+          setError(
+            `You can attach up to ${MAX_MEDIA_ATTACHMENTS} files per message.`,
+          );
           return;
         }
 
@@ -1123,7 +1125,9 @@ export function ChatPlayground({
 
         if (parsedItems.length === 0) {
           if (unsupportedCount > 0) {
-            setError("Only image and video files are supported for chat attachments.");
+            setError(
+              "Only image and video files are supported for chat attachments.",
+            );
             return;
           }
           if (oversizeCount > 0) {
@@ -1146,7 +1150,9 @@ export function ChatPlayground({
         ) {
           const warnings: string[] = [];
           if (pickedFiles.length > availableSlots) {
-            warnings.push(`Only ${availableSlots} attachment slot(s) were available.`);
+            warnings.push(
+              `Only ${availableSlots} attachment slot(s) were available.`,
+            );
           }
           if (unsupportedCount > 0) {
             warnings.push(`${unsupportedCount} file(s) were not image/video.`);
@@ -1161,7 +1167,9 @@ export function ChatPlayground({
           setError(null);
         }
       } catch (error) {
-        setError(getErrorMessage(error, "Failed to read selected media files."));
+        setError(
+          getErrorMessage(error, "Failed to read selected media files."),
+        );
       }
     },
     [mediaItems.length, revokeMediaPreviews, selectedModelSupportsMedia],
@@ -1169,7 +1177,11 @@ export function ChatPlayground({
 
   const sendMessage = async () => {
     const text = input.trim();
-    if ((!text && mediaItems.length === 0) || isStreaming || isPreparingThread) {
+    if (
+      (!text && mediaItems.length === 0) ||
+      isStreaming ||
+      isPreparingThread
+    ) {
       return;
     }
 
@@ -1179,7 +1191,9 @@ export function ChatPlayground({
     }
 
     if (mediaItems.length > 0 && !isQwen35ChatModel(selectedModel)) {
-      setError("Image/video chat is currently supported only on Qwen3.5 models.");
+      setError(
+        "Image/video chat is currently supported only on Qwen3.5 models.",
+      );
       return;
     }
 
@@ -1553,13 +1567,13 @@ export function ChatPlayground({
                 : "Ask anything..."
         }
         className={cn(
-          "w-full bg-transparent px-4 pt-4 pb-3 text-sm resize-none focus:outline-none placeholder:text-muted-foreground",
-          centered ? "min-h-[132px]" : "min-h-[96px]",
+          "w-full bg-transparent px-4 pt-4 pb-3 text-[0.9375rem] resize-none focus:outline-none placeholder:text-[var(--text-muted)]",
+          centered ? "min-h-[140px]" : "min-h-[104px]",
         )}
         disabled={isStreaming || isPreparingThread}
       />
 
-      <div className="flex flex-wrap items-center justify-between gap-2 px-3 pb-3 pt-1">
+      <div className="flex flex-wrap items-center justify-between gap-2 px-3 pb-3 pt-1 border-t border-[var(--border-muted)]/30 mt-1">
         <div className="flex items-center gap-2 flex-wrap">
           <Button
             variant="ghost"
@@ -1869,7 +1883,8 @@ export function ChatPlayground({
                         : thinkingEnabledForModel
                           ? parseAssistantContent(message.content || "", {
                               implicitOpenThinkTag:
-                                implicitQwen35Thinking && thinkingEnabledForModel,
+                                implicitQwen35Thinking &&
+                                thinkingEnabledForModel,
                             })
                           : null;
                       const messageKey = message.id;
@@ -1894,16 +1909,16 @@ export function ChatPlayground({
                           initial={{ opacity: 0, y: 8 }}
                           animate={{ opacity: 1, y: 0 }}
                           className={cn(
-                            "flex gap-4",
+                            "flex gap-4 sm:gap-6",
                             isUser && "flex-row-reverse",
                           )}
                         >
                           <div
                             className={cn(
-                              "w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 border shadow-sm",
+                              "w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 mt-1",
                               isUser
-                                ? "bg-primary text-primary-foreground border-primary/20"
-                                : "bg-muted text-muted-foreground border-[var(--border-muted)]",
+                                ? "bg-[var(--bg-surface-3)] text-[var(--text-primary)] border border-[var(--border-muted)]"
+                                : "bg-[var(--accent-solid)] text-[var(--text-on-accent)] shadow-sm",
                             )}
                           >
                             {isUser ? (
@@ -1915,23 +1930,24 @@ export function ChatPlayground({
 
                           <div
                             className={cn(
-                              "max-w-[85%] text-sm break-words flex flex-col",
+                              "max-w-[85%] text-[0.9375rem] leading-relaxed break-words flex flex-col",
                               isUser ? "items-end" : "items-start",
                             )}
                           >
                             <div
                               className={cn(
-                                "rounded-2xl px-4 py-2.5 shadow-sm",
+                                "rounded-2xl px-5 py-3 shadow-sm",
                                 isUser
-                                  ? "bg-primary text-primary-foreground rounded-tr-sm"
-                                  : "bg-card border border-[var(--border-muted)] text-card-foreground rounded-tl-sm",
+                                  ? "bg-[var(--bg-surface-3)] text-[var(--text-primary)] rounded-tr-sm border border-[var(--border-muted)]"
+                                  : "bg-transparent text-[var(--text-primary)]",
                               )}
                             >
                               {isUser ? (
                                 <>
                                   {(!parsedUserMessage ||
                                     parsedUserMessage.text ||
-                                    parsedUserMessage.attachments.length === 0) && (
+                                    parsedUserMessage.attachments.length ===
+                                      0) && (
                                     <MarkdownContent
                                       content={
                                         parsedUserMessage &&
@@ -1943,7 +1959,8 @@ export function ChatPlayground({
                                     />
                                   )}
                                   {parsedUserMessage &&
-                                    parsedUserMessage.attachments.length > 0 && (
+                                    parsedUserMessage.attachments.length >
+                                      0 && (
                                       <div
                                         className={cn(
                                           "flex flex-wrap gap-2",
@@ -1961,7 +1978,8 @@ export function ChatPlayground({
                                                   type="button"
                                                   onClick={() =>
                                                     setImagePreview({
-                                                      source: attachment.source!,
+                                                      source:
+                                                        attachment.source!,
                                                       label: attachment.label,
                                                     })
                                                   }

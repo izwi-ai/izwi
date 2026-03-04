@@ -542,54 +542,70 @@ export function DiarizationPlayground({
           </div>
         </div>
 
-        <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-5">
-          <div className="flex items-center justify-center">
+        <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
+          <div className="flex flex-col items-center">
             <button
               onClick={isRecording ? stopRecording : startRecording}
               className={cn(
-                "h-24 w-24 rounded-full border transition-all duration-200 flex items-center justify-center outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--bg-surface-1)]",
+                "w-24 h-24 rounded-full flex items-center justify-center transition-all duration-300 shadow-md",
                 isRecording
-                  ? "bg-red-500/10 border-red-500/30 text-red-500 shadow-[0_0_20px_rgba(239,68,68,0.15)]"
-                  : "bg-[var(--bg-surface-0)] border-[var(--border-muted)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-2)]",
+                  ? "bg-red-500 hover:bg-red-600 scale-110 shadow-red-500/20 shadow-xl"
+                  : "bg-[var(--bg-surface-3)] hover:bg-[var(--border-muted)] border-2 border-[var(--border-strong)] hover:border-[var(--text-muted)]",
+                (!selectedModelReady || isProcessing) &&
+                  "opacity-50 cursor-not-allowed",
               )}
               disabled={!selectedModelReady || isProcessing}
             >
               {isRecording ? (
-                <div className="relative flex items-center justify-center">
-                  <span className="absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75 animate-ping"></span>
-                  <Square className="w-8 h-8 relative fill-current" />
-                </div>
+                <Square className="w-10 h-10 text-white fill-current" />
               ) : (
-                <Mic className="w-8 h-8" />
+                <Mic className="w-10 h-10 text-[var(--text-primary)]" />
               )}
             </button>
-          </div>
-          <p className="text-center text-xs font-medium text-[var(--text-subtle)] mt-4">
-            {isRecording
-              ? "Recording... click again to stop"
-              : "Tap to record from microphone"}
-          </p>
+            <p className="mt-4 text-sm font-medium text-[var(--text-secondary)]">
+              {isRecording
+                ? "Recording... click to stop"
+                : "Tap to record audio"}
+            </p>
 
-          <div className="relative pt-4 mt-5">
-            <div className="absolute -top-3 left-1/2 -translate-x-1/2 bg-[var(--bg-surface-1)] px-3 text-[10px] text-[var(--text-subtle)] font-semibold uppercase tracking-widest">
-              Or upload
+            <div className="w-full mt-6">
+              <div className="relative">
+                <div className="absolute inset-0 flex items-center">
+                  <div className="w-full border-t border-[var(--border-muted)]" />
+                </div>
+                <div className="relative flex justify-center text-xs uppercase">
+                  <span className="bg-[var(--bg-surface-0)] px-2 text-[var(--text-muted)]">
+                    Or
+                  </span>
+                </div>
+              </div>
+
+              <div
+                onClick={openFilePicker}
+                className={cn(
+                  "mt-4 flex flex-col items-center justify-center rounded-xl border-2 border-dashed p-6 transition-colors cursor-pointer",
+                  canRunInput
+                    ? "border-[var(--border-strong)] hover:border-primary/50 hover:bg-[var(--bg-surface-2)] bg-[var(--bg-surface-1)]"
+                    : "border-[var(--border-muted)] bg-[var(--bg-surface-1)] opacity-50 cursor-not-allowed",
+                )}
+              >
+                <Upload className="w-6 h-6 text-[var(--text-muted)] mb-2" />
+                <p className="text-sm font-medium text-[var(--text-primary)]">
+                  Upload audio file
+                </p>
+                <p className="text-xs text-[var(--text-muted)] mt-1">
+                  WAV, MP3, M4A, AAC
+                </p>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="audio/*"
+                  onChange={handleFileUpload}
+                  className="hidden"
+                  disabled={!canRunInput}
+                />
+              </div>
             </div>
-            <button
-              onClick={openFilePicker}
-              className="btn w-full h-11 bg-[var(--bg-surface-0)] border border-[var(--border-muted)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-surface-2)] hover:border-[var(--border-strong)] text-sm shadow-sm transition-all"
-              disabled={!canRunInput}
-            >
-              <Upload className="w-4 h-4" />
-              Upload Audio File
-            </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="audio/*"
-              onChange={handleFileUpload}
-              className="hidden"
-              disabled={!canRunInput}
-            />
           </div>
         </div>
 

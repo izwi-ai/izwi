@@ -12,7 +12,6 @@ import {
   History,
   Loader2,
   Mic,
-  MicOff,
   Pause,
   Play,
   Radio,
@@ -21,6 +20,7 @@ import {
   Settings2,
   SkipBack,
   SkipForward,
+  Square,
   Trash2,
   Upload,
   X,
@@ -1111,7 +1111,6 @@ export function TranscriptionPlayground({
     };
   }, [abortLiveMicStream]);
 
-  const canRunInput = !isProcessing && !isRecording && selectedModelReady;
   const showResult = Boolean(transcription || isStreaming || isProcessing);
   const hasDraft = Boolean(transcription || audioUrl || error);
   const selectedHistorySummary = useMemo(
@@ -1432,51 +1431,78 @@ export function TranscriptionPlayground({
         </div>
 
         <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
-          <div className="flex items-center justify-center">
+          <div className="flex flex-col items-center py-4">
             <button
-              onClick={isRecording ? stopRecording : startRecording}
+              onClick={() => {
+                if (isRecording) {
+                  stopRecording();
+                } else {
+                  void startRecording();
+                }
+              }}
               className={cn(
-                "h-24 w-24 rounded-full border transition-all duration-150 flex items-center justify-center",
+                "w-24 h-24 rounded-full flex items-center justify-center transition-all duration-300 shadow-md",
                 isRecording
-                  ? "bg-[var(--accent-solid)] border-[var(--accent-solid)] text-[var(--text-on-accent)] shadow-[0_0_0_8px_rgba(255,255,255,0.08)]"
-                  : "bg-[var(--bg-surface-2)] border-[var(--border-muted)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-[var(--border-strong)]",
+                  ? "bg-red-500 hover:bg-red-600 scale-110 shadow-red-500/20 shadow-xl"
+                  : "bg-[var(--bg-surface-3)] hover:bg-[var(--border-muted)] border-2 border-[var(--border-strong)] hover:border-[var(--text-muted)]",
+                (!selectedModelReady || isProcessing) &&
+                  "opacity-50 cursor-not-allowed",
               )}
               disabled={!selectedModelReady || isProcessing}
             >
               {isRecording ? (
-                <MicOff className="w-8 h-8" />
+                <Square className="w-10 h-10 text-white fill-current" />
               ) : (
-                <Mic className="w-8 h-8" />
+                <Mic className="w-10 h-10 text-[var(--text-primary)]" />
               )}
             </button>
-          </div>
-          <p className="text-center text-xs text-[var(--text-subtle)] mt-3">
-            {isRecording
-              ? "Recording... click again to stop"
-              : "Tap to record from microphone"}
-          </p>
+            <p className="mt-4 text-sm font-medium text-[var(--text-secondary)]">
+              {isRecording
+                ? "Recording... click to stop"
+                : "Tap to record audio"}
+            </p>
 
-          <div className="mt-4">
-            <button
-              onClick={() => {
-                if (!requireReadyModel()) {
-                  return;
-                }
-                fileInputRef.current?.click();
-              }}
-              className="btn btn-secondary w-full text-sm"
-              disabled={!canRunInput}
-            >
-              <Upload className="w-4 h-4" />
-              Upload Audio File
-            </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="audio/*"
-              onChange={handleFileUpload}
-              className="hidden"
-            />
+            <div className="w-full mt-6">
+              <div className="relative">
+                <div className="absolute inset-0 flex items-center">
+                  <div className="w-full border-t border-[var(--border-muted)]" />
+                </div>
+                <div className="relative flex justify-center text-xs uppercase">
+                  <span className="bg-[var(--bg-surface-0)] px-2 text-[var(--text-muted)]">
+                    Or
+                  </span>
+                </div>
+              </div>
+
+              <div
+                onClick={() => {
+                  if (!requireReadyModel()) return;
+                  fileInputRef.current?.click();
+                }}
+                className={cn(
+                  "mt-4 flex flex-col items-center justify-center rounded-xl border-2 border-dashed p-6 transition-colors cursor-pointer",
+                  selectedModelReady && !isProcessing
+                    ? "border-[var(--border-strong)] hover:border-primary/50 hover:bg-[var(--bg-surface-2)] bg-[var(--bg-surface-1)]"
+                    : "border-[var(--border-muted)] bg-[var(--bg-surface-1)] opacity-50 cursor-not-allowed",
+                )}
+              >
+                <Upload className="w-6 h-6 text-[var(--text-muted)] mb-2" />
+                <p className="text-sm font-medium text-[var(--text-primary)]">
+                  Upload audio file
+                </p>
+                <p className="text-xs text-[var(--text-muted)] mt-1">
+                  WAV, MP3, M4A, AAC
+                </p>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="audio/*"
+                  onChange={handleFileUpload}
+                  className="hidden"
+                  disabled={!selectedModelReady || isProcessing}
+                />
+              </div>
+            </div>
           </div>
         </div>
 
@@ -2031,8 +2057,7 @@ export function TranscriptionPlayground({
                               RTF
                             </div>
                             <div className="text-sm font-medium text-[var(--text-primary)]">
-                              {activeHistoryRecord.rtf ??
-                                "Unknown"}
+                              {activeHistoryRecord.rtf ?? "Unknown"}
                             </div>
                           </div>
                           <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-4 py-3 shadow-sm">

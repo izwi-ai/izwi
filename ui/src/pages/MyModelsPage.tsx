@@ -277,7 +277,8 @@ export const MODEL_DETAILS: Record<
   "Qwen3.5-4B": {
     shortName: "Qwen3.5 Chat 4B GGUF",
     fullName: "Qwen3.5 4B (GGUF Q4_K_M)",
-    description: "Higher-quality Qwen3.5 chat model in GGUF format (Q4_K_M only)",
+    description:
+      "Higher-quality Qwen3.5 chat model in GGUF format (Q4_K_M only)",
     category: "chat",
     capabilities: ["Text Chat", "GGUF", "Q4_K_M"],
     size: "2.6 GB",
@@ -285,7 +286,8 @@ export const MODEL_DETAILS: Record<
   "Qwen3.5-9B": {
     shortName: "Qwen3.5 Chat 9B GGUF",
     fullName: "Qwen3.5 9B (GGUF Q4_K_M)",
-    description: "High-capacity Qwen3.5 chat model in GGUF format (Q4_K_M only)",
+    description:
+      "High-capacity Qwen3.5 chat model in GGUF format (Q4_K_M only)",
     category: "chat",
     capabilities: ["Text Chat", "GGUF", "Q4_K_M"],
     size: "5.3 GB",
@@ -462,7 +464,7 @@ function getModelSizeLabel(model: ModelInfo): string {
 function getStatusDotClass(status: ModelInfo["status"]): string {
   switch (status) {
     case "ready":
-      return "bg-[var(--status-positive-solid)]";
+      return "bg-[var(--status-positive-solid)] shadow-[0_0_8px_var(--status-positive-solid)]";
     case "downloaded":
       return "bg-[var(--text-secondary)]";
     case "downloading":
@@ -472,6 +474,22 @@ function getStatusDotClass(status: ModelInfo["status"]): string {
       return "bg-[var(--danger-text)]";
     default:
       return "bg-[var(--text-subtle)]";
+  }
+}
+
+function getStatusTextClass(status: ModelInfo["status"]): string {
+  switch (status) {
+    case "ready":
+      return "text-[var(--status-positive-solid)]";
+    case "downloaded":
+      return "text-[var(--text-secondary)]";
+    case "downloading":
+    case "loading":
+      return "text-[var(--status-warning-text)]";
+    case "error":
+      return "text-[var(--danger-text)]";
+    default:
+      return "text-[var(--text-subtle)]";
   }
 }
 
@@ -493,11 +511,14 @@ function getProviderLabel(variant: string): string {
 }
 
 function compareProviders(left: string, right: string): number {
-  const leftRank = PROVIDER_ORDER.indexOf(left as (typeof PROVIDER_ORDER)[number]);
+  const leftRank = PROVIDER_ORDER.indexOf(
+    left as (typeof PROVIDER_ORDER)[number],
+  );
   const rightRank = PROVIDER_ORDER.indexOf(
     right as (typeof PROVIDER_ORDER)[number],
   );
-  const normalizedLeftRank = leftRank === -1 ? Number.MAX_SAFE_INTEGER : leftRank;
+  const normalizedLeftRank =
+    leftRank === -1 ? Number.MAX_SAFE_INTEGER : leftRank;
   const normalizedRightRank =
     rightRank === -1 ? Number.MAX_SAFE_INTEGER : rightRank;
   if (normalizedLeftRank !== normalizedRightRank) {
@@ -786,7 +807,7 @@ export function MyModelsPage({
                 <div className="h-px flex-1 bg-[var(--border-muted)]" />
               </div>
 
-              <div className="space-y-2">
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
                 {section.models.map((model) => {
                   const details = MODEL_DETAILS[model.variant];
                   if (!details) return null;
@@ -806,48 +827,75 @@ export function MyModelsPage({
                   return (
                     <div
                       key={model.variant}
-                      className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2.5"
+                      className="group flex flex-col justify-between rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 transition-all duration-200 hover:border-[var(--border-strong)] hover:shadow-md"
                     >
-                      <div className="flex items-center justify-between gap-3">
-                        <div className="min-w-0 flex items-center gap-2">
-                          {isDownloading || isLoading ? (
-                            <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-[var(--status-warning-text)]" />
-                          ) : (
-                            <span
-                              className={clsx(
-                                "h-2 w-2 shrink-0 rounded-full",
-                                getStatusDotClass(model.status),
-                              )}
-                            />
-                          )}
-                          <h3 className="truncate text-sm font-medium text-[var(--text-primary)]">
-                            {displayName}
-                          </h3>
+                      <div className="flex items-start justify-between gap-3 mb-3">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2 mb-1">
+                            {isDownloading || isLoading ? (
+                              <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-[var(--status-warning-text)]" />
+                            ) : (
+                              <span
+                                className={clsx(
+                                  "h-2 w-2 shrink-0 rounded-full",
+                                  getStatusDotClass(model.status),
+                                )}
+                              />
+                            )}
+                            <h3 className="truncate text-sm font-semibold text-[var(--text-primary)]">
+                              {displayName}
+                            </h3>
+                          </div>
+                          <p className="text-xs text-[var(--text-subtle)] line-clamp-1">
+                            {details.description}
+                          </p>
                         </div>
 
-                        <div className="shrink-0 flex items-center gap-1.5">
-                          <span className="mr-1 text-xs text-[var(--text-subtle)] whitespace-nowrap">
+                        <div className="shrink-0 flex flex-col items-end gap-1">
+                          <span className="text-xs font-medium px-2 py-0.5 rounded-md bg-[var(--bg-surface-2)] text-[var(--text-secondary)] border border-[var(--border-muted)]">
                             {getModelSizeLabel(model)}
                           </span>
                           {isDownloading && (
-                            <span className="text-xs text-[var(--status-warning-text)] whitespace-nowrap">
+                            <span className="text-[10px] font-bold tracking-wider text-[var(--status-warning-text)]">
                               {Math.round(progress)}%
                             </span>
                           )}
+                        </div>
+                      </div>
+
+                      <div className="flex items-center justify-between mt-auto pt-3 border-t border-[var(--border-muted)]/50">
+                        <div className="text-xs font-medium">
+                          <span className={getStatusTextClass(model.status)}>
+                            {model.status === "not_downloaded"
+                              ? "Not downloaded"
+                              : model.status === "downloading"
+                                ? "Downloading..."
+                                : model.status === "downloaded"
+                                  ? "Downloaded"
+                                  : model.status === "loading"
+                                    ? "Loading..."
+                                    : model.status === "ready"
+                                      ? "Ready to use"
+                                      : model.status === "error"
+                                        ? "Error"
+                                        : model.status}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2">
                           {model.status === "not_downloaded" &&
                             (requiresManualDownload(model.variant) ? (
                               <button
-                                className="flex items-center gap-1.5 rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface-2)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)] disabled:cursor-not-allowed disabled:opacity-60"
+                                className="flex items-center gap-1.5 rounded-lg border border-[var(--border-strong)] bg-[var(--bg-surface-2)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)] disabled:cursor-not-allowed disabled:opacity-60"
                                 disabled
                                 title="Manual download required. See docs/user/manual-gemma-3-1b-download.md."
                               >
                                 <Download className="h-3.5 w-3.5" />
-                                Manual download
+                                Manual DL
                               </button>
                             ) : (
                               <button
                                 onClick={() => onDownload(model.variant)}
-                                className="flex items-center gap-1.5 rounded-md bg-[var(--accent-solid)] px-3 py-1.5 text-xs font-medium text-[var(--text-on-accent)] transition-opacity hover:opacity-90"
+                                className="flex items-center gap-1.5 rounded-lg bg-[var(--accent-solid)] px-3 py-1.5 text-xs font-medium text-[var(--text-on-accent)] transition-opacity hover:opacity-90 shadow-sm"
                               >
                                 <Download className="h-3.5 w-3.5" />
                                 Download
@@ -874,7 +922,9 @@ export function MyModelsPage({
                                 Load
                               </button>
                               <button
-                                onClick={() => setDeleteModalVariant(model.variant)}
+                                onClick={() =>
+                                  setDeleteModalVariant(model.variant)
+                                }
                                 className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] text-[var(--danger-text)] transition-colors hover:bg-[var(--danger-bg-hover)]"
                                 title="Delete model"
                                 aria-label={`Delete ${displayName}`}
@@ -894,7 +944,9 @@ export function MyModelsPage({
                                 Unload
                               </button>
                               <button
-                                onClick={() => setDeleteModalVariant(model.variant)}
+                                onClick={() =>
+                                  setDeleteModalVariant(model.variant)
+                                }
                                 className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] text-[var(--danger-text)] transition-colors hover:bg-[var(--danger-bg-hover)]"
                                 title="Delete model"
                                 aria-label={`Delete ${displayName}`}

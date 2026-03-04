@@ -33,10 +33,10 @@
   --scroll-thumb: rgba(255, 255, 255, 0.1);
   --scroll-thumb-hover: rgba(255, 255, 255, 0.2);
   --sidebar-link-bg: transparent;
-  --sidebar-link-hover-bg: rgba(255, 255, 255, 0.05);
+  --sidebar-link-hover-bg: rgba(255, 255, 255, 0.04);
   --sidebar-link-active-bg: rgba(255, 255, 255, 0.08);
   --sidebar-link-border: transparent;
-  --sidebar-link-active-border: rgba(255, 255, 255, 0.1);
+  --sidebar-link-active-border: rgba(255, 255, 255, 0.08);
   --sidebar-link-icon-bg: transparent;
   --sidebar-link-icon-color: #a1a1aa;
   --sidebar-link-icon-hover-bg: transparent;
@@ -63,13 +63,13 @@
   --app-shadow-hard: 0 8px 32px rgba(0, 0, 0, 0.6);
   --font-ui: "Inter", "Manrope", "Plus Jakarta Sans", "Segoe UI Variable", sans-serif;
   --font-mono: "JetBrains Mono", "SFMono-Regular", monospace;
-  --type-size-page-title: 1.25rem;
-  --type-size-section-title: 0.9375rem;
+  --type-size-page-title: 1.75rem;
+  --type-size-section-title: 1.125rem;
   --type-size-body: 0.875rem;
-  --type-size-caption: 0.75rem;
+  --type-size-caption: 0.8125rem;
   --type-size-micro: 0.6875rem;
-  --type-line-tight: 1.25;
-  --type-line-body: 1.5;
+  --type-line-tight: 1.2;
+  --type-line-body: 1.6;
 }
 
 html.theme-light {

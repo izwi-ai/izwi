@@ -32,27 +32,27 @@ export function PageHeader({
   return (
     <div
       className={cn(
-        "mb-6 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between",
+        "mb-8 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between",
         className,
       )}
     >
-      <div className="min-w-0">
+      <div className="min-w-0 flex-1">
         <h1
           className={cn(
-            "app-page-title text-[var(--text-primary)]",
+            "app-page-title text-[var(--text-primary)] tracking-tight",
             titleClassName,
           )}
         >
           {title}
         </h1>
         {description ? (
-          <p className="mt-1 app-page-description text-[var(--text-muted)] max-w-3xl">
+          <p className="mt-1.5 app-page-description text-[var(--text-muted)] max-w-3xl leading-relaxed">
             {description}
           </p>
         ) : null}
       </div>
       {actions ? (
-        <div className="flex shrink-0 items-center gap-2">{actions}</div>
+        <div className="flex shrink-0 items-center gap-3 pt-1">{actions}</div>
       ) : null}
     </div>
   );

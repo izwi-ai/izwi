@@ -2,8 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Mic,
-  MicOff,
-  Volume2,
   Loader2,
   PhoneOff,
   AudioLines,
@@ -24,7 +22,7 @@ import {
 
 import { Slider } from "../components/ui/slider";
 import { Button } from "../components/ui/button";
-import { PageHeader, PageShell } from "../components/PageShell";
+import { PageShell } from "../components/PageShell";
 import { cn } from "@/lib/utils";
 
 type RuntimeStatus =
@@ -700,7 +698,10 @@ export function VoicePage({
   }, [transcript, runtimeStatus]);
 
   useEffect(() => {
-    if (pipelineMode === "s2s" && unifiedModelOptions.every((option) => !option.model)) {
+    if (
+      pipelineMode === "s2s" &&
+      unifiedModelOptions.every((option) => !option.model)
+    ) {
       setPipelineMode("stt_chat_tts");
     }
   }, [pipelineMode, unifiedModelOptions]);
@@ -781,7 +782,10 @@ export function VoicePage({
     () =>
       modularStackModels.some((item) => {
         const model = item.model;
-        return !!model && (model.status === "downloading" || model.status === "loading");
+        return (
+          !!model &&
+          (model.status === "downloading" || model.status === "loading")
+        );
       }),
     [modularStackModels],
   );
@@ -2500,31 +2504,11 @@ export function VoicePage({
     processing: "Thinking",
     assistant_speaking: "Assistant speaking",
   }[runtimeStatus];
-  const statusDetail = {
-    idle: hasRunnableConfig
-      ? "Session is ready. Start when you want to speak."
-      : "Finish configuration to enable the local voice stack.",
-    listening: "Listening for your voice. Barge-in stays enabled.",
-    user_speaking: "Capturing your speech in realtime.",
-    processing: "Running local inference for the next response.",
-    assistant_speaking: "Assistant audio is streaming.",
-  }[runtimeStatus];
 
   const vadPercent = Math.min(
     100,
     Math.round((audioLevel / Math.max(vadThreshold, 0.001)) * 40),
   );
-  const sessionReadinessLabel = hasRunnableConfig
-    ? "Stack ready"
-    : "Setup required";
-  const sessionReadinessClass = hasRunnableConfig
-    ? "border-[var(--status-positive-border)] bg-[var(--status-positive-bg)] text-[var(--status-positive-text)]"
-    : "border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] text-[var(--status-warning-text)]";
-  const formatTranscriptTimestamp = (timestamp: number) =>
-    new Date(timestamp).toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-    });
 
   const getStatusClass = (status: ModelInfo["status"]) => {
     switch (status) {
@@ -2583,199 +2567,178 @@ export function VoicePage({
   }
 
   return (
-    <PageShell>
-      <PageHeader
-        title="Realtime Voice"
-        description="Private, low-latency local voice conversations."
-        actions={
-          <button
-            onClick={() => setIsConfigOpen(true)}
-            className="btn btn-secondary text-sm"
-          >
-            <Settings2 className="w-4 h-4" />
-            Config
-          </button>
-        }
-      />
-
-      <div className="grid xl:grid-cols-[380px,1fr] gap-4 lg:gap-6">
-        <div className="card p-5 sm:p-6">
-          <div className="flex items-center justify-between gap-2">
-            <p className="text-[11px] uppercase tracking-[0.16em] text-[var(--text-subtle)]">
-              Session Control
-            </p>
-            <span
-              className={cn(
-                "inline-flex items-center rounded-md border px-2 py-0.5 text-[11px]",
-                sessionReadinessClass,
-              )}
-            >
-              {sessionReadinessLabel}
-            </span>
-          </div>
-
-          <div className="mt-5 flex flex-col items-center text-center">
-            <div className="relative mb-4">
-              {runtimeStatus !== "idle" && (
-                <motion.div
-                  className="absolute -inset-3 rounded-full bg-white/10 blur-md"
-                  animate={{ opacity: [0.25, 0.55, 0.25], scale: [0.96, 1, 0.96] }}
-                  transition={{ duration: 2.2, repeat: Infinity, ease: "easeInOut" }}
-                />
-              )}
-              <div className="relative w-28 h-28 rounded-full bg-[var(--bg-surface-0)] border border-[var(--border-strong)] flex items-center justify-center">
-                {runtimeStatus === "assistant_speaking" ? (
-                  <Volume2 className="w-8 h-8 text-white" />
-                ) : runtimeStatus === "user_speaking" ? (
-                  <AudioLines className="w-8 h-8 text-white" />
-                ) : runtimeStatus === "processing" ? (
-                  <Loader2 className="w-8 h-8 text-white animate-spin" />
-                ) : runtimeStatus === "listening" ? (
-                  <Mic className="w-8 h-8 text-white" />
-                ) : (
-                  <MicOff className="w-8 h-8 text-[var(--text-muted)]" />
-                )}
-              </div>
-              <div className="absolute -inset-2 rounded-full border border-white/10" />
-            </div>
-
-            <div className="text-base text-white font-semibold">{statusLabel}</div>
-            <p className="mt-1 max-w-[270px] text-xs text-[var(--text-muted)]">
-              {statusDetail}
-            </p>
-
-            <Button
-              onClick={toggleSession}
-              variant={runtimeStatus === "idle" ? "default" : "destructive"}
-              className="w-full mt-5 text-sm min-h-[46px] gap-2"
-              disabled={startDisabled}
-            >
-              {runtimeStatus === "idle" ? (
-                <>
-                  <Mic className="w-4 h-4" />
-                  Start Session
-                </>
-              ) : (
-                <>
-                  <PhoneOff className="w-4 h-4" />
-                  Stop Session
-                </>
-              )}
-            </Button>
-
-            {!hasRunnableConfig && (
-              <p className="mt-2 text-[11px] text-[var(--status-warning-text)]">
-                Open Config to load required models.
-              </p>
-            )}
-          </div>
-
-          <div className="mt-6 space-y-3">
-            <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-2)] p-3">
-              <div className="flex items-center justify-between gap-2 text-xs">
-                <span className="text-[var(--text-muted)]">Input level</span>
-                <span className="text-[var(--text-secondary)]">{vadPercent}%</span>
-              </div>
-              <div className="mt-2 h-2 rounded bg-[var(--bg-surface-3)] border border-[var(--border-muted)] overflow-hidden">
-                <div
-                  className="h-full bg-white transition-all duration-100"
-                  style={{ width: `${vadPercent}%` }}
-                />
-              </div>
-              <p className="mt-2 text-[11px] text-[var(--text-subtle)]">
-                Voice activity detection is tuned for interruptible conversation.
-              </p>
-            </div>
-          </div>
-        </div>
-
-        <div className="card p-4 sm:p-5 flex flex-col h-[420px] sm:h-[520px] lg:h-[640px] overflow-hidden">
-          <div className="flex items-center justify-between gap-2 mb-4">
-            <div>
-              <span className="text-sm text-white font-medium">Live Transcript</span>
-              <p className="text-[11px] text-[var(--text-subtle)] mt-0.5">
-                Streaming user and assistant turns in realtime.
-              </p>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-xs px-2 py-1 rounded bg-[var(--bg-surface-1)] border border-[var(--border-muted)] text-[var(--text-secondary)]">
-                {statusLabel}
-              </span>
-              <span className="text-xs px-2 py-1 rounded border border-[var(--border-strong)] bg-[var(--bg-surface-3)] text-[var(--text-secondary)]">
-                On-device
-              </span>
-            </div>
-          </div>
-
-          <div
+    <PageShell className="flex flex-col h-full lg:h-[calc(100vh-6rem)] relative overflow-hidden">
+      <div className="absolute top-4 right-4 z-10 flex items-center gap-3">
+        <div className="flex items-center gap-2">
+          <span
             className={cn(
-              "min-h-0 flex-1 pr-1 space-y-3",
-              transcript.length > 0 ? "overflow-y-auto" : "overflow-y-hidden",
+              "inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-medium transition-colors",
+              hasRunnableConfig
+                ? "bg-green-500/10 text-green-500 border border-green-500/20"
+                : "bg-yellow-500/10 text-yellow-500 border border-yellow-500/20",
             )}
           >
-            {transcript.length === 0 ? (
-              <div className="h-full flex items-center justify-center text-center">
-                <div>
-                  <p className="text-sm text-[var(--text-muted)]">No conversation yet.</p>
-                  <p className="text-xs text-[var(--text-subtle)] mt-1">
-                    Configure your voice stack and start a realtime session.
-                  </p>
-                </div>
-              </div>
-            ) : (
-              transcript.map((entry) => {
-                const isUser = entry.role === "user";
-                return (
-                  <div
-                    key={entry.id}
-                    className={clsx(
-                      "flex",
-                      isUser ? "justify-end" : "justify-start",
-                    )}
-                  >
-                    <div
-                      className={clsx(
-                        "max-w-[85%] rounded-lg px-3 py-2.5 border text-sm whitespace-pre-wrap",
-                        isUser
-                          ? "bg-white text-black border-white"
-                          : "bg-[var(--bg-surface-2)] text-[var(--text-primary)] border-[var(--border-muted)]",
-                      )}
-                    >
-                      <div
-                        className={clsx(
-                          "text-[10px] mb-1 uppercase tracking-wide flex items-center justify-between gap-2",
-                          isUser ? "text-black/60" : "text-[var(--text-muted)]",
-                        )}
-                      >
-                        <span>{isUser ? "User" : "Assistant"}</span>
-                        <span className="normal-case tracking-normal text-[10px] opacity-80">
-                          {formatTranscriptTimestamp(entry.timestamp)}
-                        </span>
-                      </div>
-                      {entry.text}
-                    </div>
-                  </div>
-                );
-              })
-            )}
-            <div ref={transcriptEndRef} />
-          </div>
-
-          <AnimatePresence>
-            {error && (
-              <motion.div
-                initial={{ opacity: 0, height: 0 }}
-                animate={{ opacity: 1, height: "auto" }}
-                exit={{ opacity: 0, height: 0 }}
-                className="mt-3 p-2 rounded bg-red-950/50 border border-red-900/50 text-red-300 text-xs"
-              >
-                {error}
-              </motion.div>
-            )}
-          </AnimatePresence>
+            {hasRunnableConfig ? "Ready" : "Models Required"}
+          </span>
+          <span className="text-[11px] font-medium text-[var(--text-muted)] bg-[var(--bg-surface-2)] border border-[var(--border-muted)] px-2.5 py-1 rounded-full">
+            {currentPipelineLabel}
+          </span>
         </div>
+        <button
+          onClick={() => setIsConfigOpen(true)}
+          className="btn btn-secondary h-8 px-3 rounded-full text-[11px] gap-1.5"
+        >
+          <Settings2 className="w-3.5 h-3.5" />
+          Settings
+        </button>
       </div>
 
+      <div className="flex-1 flex flex-col items-center justify-center relative min-h-[400px]">
+        {/* Dynamic Background Glow */}
+        {runtimeStatus !== "idle" && (
+          <motion.div
+            className={cn(
+              "absolute inset-0 z-0 pointer-events-none transition-opacity duration-1000",
+              runtimeStatus === "user_speaking" ? "opacity-20" : "opacity-0",
+            )}
+            style={{
+              background: `radial-gradient(circle at center, rgba(250,250,250,${Math.min(vadPercent / 100, 0.4)}) 0%, transparent 50%)`,
+            }}
+          />
+        )}
+
+        {/* Central Orb / Main Visualizer */}
+        <div className="relative z-10 flex flex-col items-center justify-center mb-8">
+          <motion.div
+            className="relative flex items-center justify-center"
+            animate={{
+              scale:
+                runtimeStatus === "user_speaking"
+                  ? 1 + vadPercent / 150
+                  : runtimeStatus === "assistant_speaking"
+                    ? [1, 1.1, 1]
+                    : 1,
+            }}
+            transition={
+              runtimeStatus === "assistant_speaking"
+                ? { duration: 1.5, repeat: Infinity, ease: "easeInOut" }
+                : { type: "spring", stiffness: 300, damping: 20 }
+            }
+          >
+            <div
+              className={cn(
+                "w-48 h-48 sm:w-64 sm:h-64 rounded-full flex items-center justify-center transition-all duration-500",
+                runtimeStatus === "idle"
+                  ? "bg-[var(--bg-surface-1)] border-2 border-[var(--border-muted)]"
+                  : runtimeStatus === "listening"
+                    ? "bg-[var(--bg-surface-2)] border-2 border-[var(--border-strong)] shadow-[0_0_40px_rgba(255,255,255,0.05)]"
+                    : runtimeStatus === "user_speaking"
+                      ? "bg-white shadow-[0_0_60px_rgba(255,255,255,0.2)]"
+                      : runtimeStatus === "processing"
+                        ? "bg-[var(--bg-surface-3)] border-2 border-[var(--border-strong)]"
+                        : runtimeStatus === "assistant_speaking"
+                          ? "bg-black shadow-[0_0_60px_rgba(255,255,255,0.15)] border-2 border-white/20"
+                          : "",
+              )}
+            >
+              {runtimeStatus === "idle" ? (
+                <button
+                  onClick={toggleSession}
+                  disabled={startDisabled}
+                  className="w-full h-full rounded-full flex flex-col items-center justify-center gap-3 group hover:bg-[var(--bg-surface-2)] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <div className="w-16 h-16 rounded-full bg-[var(--bg-surface-3)] flex items-center justify-center group-hover:scale-110 transition-transform">
+                    <Mic className="w-8 h-8 text-[var(--text-primary)]" />
+                  </div>
+                  <span className="text-sm font-medium text-[var(--text-secondary)]">
+                    Start Conversation
+                  </span>
+                </button>
+              ) : (
+                <button
+                  onClick={toggleSession}
+                  className="w-full h-full rounded-full flex items-center justify-center group relative"
+                >
+                  {runtimeStatus === "assistant_speaking" ? (
+                    <div className="flex gap-1.5 items-center justify-center h-12">
+                      {[0, 1, 2, 3, 4].map((i) => (
+                        <motion.div
+                          key={i}
+                          className="w-2 bg-white rounded-full"
+                          animate={{ height: ["20%", "100%", "20%"] }}
+                          transition={{
+                            duration: 1,
+                            repeat: Infinity,
+                            delay: i * 0.1,
+                            ease: "easeInOut",
+                          }}
+                        />
+                      ))}
+                    </div>
+                  ) : runtimeStatus === "user_speaking" ? (
+                    <AudioLines className="w-16 h-16 text-black" />
+                  ) : runtimeStatus === "processing" ? (
+                    <Loader2 className="w-12 h-12 text-white animate-spin" />
+                  ) : (
+                    <Mic className="w-12 h-12 text-white" />
+                  )}
+
+                  {/* Hover Overlay for stopping */}
+                  <div className="absolute inset-0 bg-black/60 rounded-full opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity backdrop-blur-sm">
+                    <Square className="w-10 h-10 text-white fill-white" />
+                  </div>
+                </button>
+              )}
+            </div>
+          </motion.div>
+
+          <div className="mt-8 text-center h-16 flex flex-col justify-center">
+            <h2 className="text-2xl font-medium tracking-tight text-[var(--text-primary)]">
+              {statusLabel}
+            </h2>
+            {runtimeStatus !== "idle" && (
+              <p className="text-sm text-[var(--text-muted)] mt-1 max-w-md mx-auto line-clamp-1">
+                {transcript.length > 0
+                  ? transcript[transcript.length - 1].text
+                  : "Listening..."}
+              </p>
+            )}
+          </div>
+        </div>
+
+        {/* Floating Action Bar */}
+        <AnimatePresence>
+          {error && (
+            <motion.div
+              initial={{ y: -20, opacity: 0 }}
+              animate={{ y: 0, opacity: 1 }}
+              exit={{ y: -20, opacity: 0 }}
+              className="absolute top-16 left-1/2 -translate-x-1/2 z-20 w-full max-w-sm"
+            >
+              <div className="bg-red-500/10 border border-red-500/20 text-red-500 text-xs px-4 py-2.5 rounded-xl shadow-lg backdrop-blur-md text-center mx-4">
+                {error}
+              </div>
+            </motion.div>
+          )}
+          {runtimeStatus !== "idle" && (
+            <motion.div
+              initial={{ y: 20, opacity: 0 }}
+              animate={{ y: 0, opacity: 1 }}
+              exit={{ y: 20, opacity: 0 }}
+              className="absolute bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-3 p-2 bg-[var(--bg-surface-1)] border border-[var(--border-muted)] rounded-full shadow-2xl backdrop-blur-xl"
+            >
+              <button
+                onClick={toggleSession}
+                className="w-12 h-12 rounded-full bg-red-500/10 hover:bg-red-500/20 text-red-500 flex items-center justify-center transition-colors"
+              >
+                <PhoneOff className="w-5 h-5" />
+              </button>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+
+      {/* Slide-out Config Panel */}
       <AnimatePresence>
         {isConfigOpen && (
           <motion.div
@@ -2833,7 +2796,9 @@ export function VoicePage({
                       )}
                       onClick={() => setPipelineMode("s2s")}
                     >
-                      <div className="text-sm font-medium">Unified Speech Model</div>
+                      <div className="text-sm font-medium">
+                        Unified Speech Model
+                      </div>
                       <p className="text-xs text-muted-foreground mt-1">
                         One LFM2 model handles user speech understanding and
                         assistant speech output.
@@ -2848,7 +2813,9 @@ export function VoicePage({
                       )}
                       onClick={() => setPipelineMode("stt_chat_tts")}
                     >
-                      <div className="text-sm font-medium">Modular Voice Stack</div>
+                      <div className="text-sm font-medium">
+                        Modular Voice Stack
+                      </div>
                       <p className="text-xs text-muted-foreground mt-1">
                         Uses a fixed local stack: Parakeet ASR, Qwen3-8B-GGUF,
                         and Kokoro-82M.
@@ -2901,7 +2868,9 @@ export function VoicePage({
                                       : "bg-[var(--bg-surface-2)] border-[var(--border-muted)] text-[var(--text-muted)]",
                                   )}
                                 >
-                                  {model ? getStatusLabel(model.status) : "Unavailable"}
+                                  {model
+                                    ? getStatusLabel(model.status)
+                                    : "Unavailable"}
                                 </span>
                               </div>
                               <p className="text-xs text-[var(--text-muted)]">
@@ -2911,7 +2880,9 @@ export function VoicePage({
                                 {model?.status === "downloading" &&
                                   onCancelDownload && (
                                     <Button
-                                      onClick={() => onCancelDownload(model.variant)}
+                                      onClick={() =>
+                                        onCancelDownload(model.variant)
+                                      }
                                       variant="destructive"
                                       size="sm"
                                       className="text-xs h-8 gap-2"
@@ -2921,14 +2892,19 @@ export function VoicePage({
                                     </Button>
                                   )}
                                 <Button
-                                  onClick={() => model && handleUseUnifiedModel(model)}
+                                  onClick={() =>
+                                    model && handleUseUnifiedModel(model)
+                                  }
                                   size="sm"
                                   variant={
                                     model?.status === "ready" && isSelected
                                       ? "outline"
                                       : "default"
                                   }
-                                  disabled={isUnifiedModelButtonDisabled(model, isSelected)}
+                                  disabled={isUnifiedModelButtonDisabled(
+                                    model,
+                                    isSelected,
+                                  )}
                                   className="text-xs h-8 gap-2"
                                 >
                                   {(model?.status === "loading" ||
@@ -2940,40 +2916,51 @@ export function VoicePage({
                                     <Download className="w-3.5 h-3.5" />
                                   )}
                                   {(model?.status === "downloaded" ||
-                                    (model?.status === "ready" && !isSelected)) && (
+                                    (model?.status === "ready" &&
+                                      !isSelected)) && (
                                     <Play className="w-3.5 h-3.5" />
                                   )}
-                                  {getUnifiedModelButtonLabel(model, isSelected)}
+                                  {getUnifiedModelButtonLabel(
+                                    model,
+                                    isSelected,
+                                  )}
                                 </Button>
                               </div>
-                              {model?.status === "downloading" && progressMeta && (
-                                <div>
-                                  <div className="h-1.5 rounded bg-[var(--bg-surface-3)] overflow-hidden">
-                                    <div
-                                      className="h-full rounded bg-white transition-all duration-300"
-                                      style={{ width: `${progressMeta.progress}%` }}
-                                    />
+                              {model?.status === "downloading" &&
+                                progressMeta && (
+                                  <div>
+                                    <div className="h-1.5 rounded bg-[var(--bg-surface-3)] overflow-hidden">
+                                      <div
+                                        className="h-full rounded bg-white transition-all duration-300"
+                                        style={{
+                                          width: `${progressMeta.progress}%`,
+                                        }}
+                                      />
+                                    </div>
+                                    <div className="mt-1 text-[11px] text-[var(--text-muted)]">
+                                      Downloading{" "}
+                                      {Math.round(progressMeta.progress)}%
+                                      {progressMeta.progressValue &&
+                                        progressMeta.progressValue.totalBytes >
+                                          0 && (
+                                          <>
+                                            {" "}
+                                            (
+                                            {formatBytes(
+                                              progressMeta.progressValue
+                                                .downloadedBytes,
+                                            )}{" "}
+                                            /{" "}
+                                            {formatBytes(
+                                              progressMeta.progressValue
+                                                .totalBytes,
+                                            )}
+                                            )
+                                          </>
+                                        )}
+                                    </div>
                                   </div>
-                                  <div className="mt-1 text-[11px] text-[var(--text-muted)]">
-                                    Downloading {Math.round(progressMeta.progress)}%
-                                    {progressMeta.progressValue &&
-                                      progressMeta.progressValue.totalBytes > 0 && (
-                                        <>
-                                          {" "}
-                                          (
-                                          {formatBytes(
-                                            progressMeta.progressValue.downloadedBytes,
-                                          )}{" "}
-                                          /{" "}
-                                          {formatBytes(
-                                            progressMeta.progressValue.totalBytes,
-                                          )}
-                                          )
-                                        </>
-                                      )}
-                                  </div>
-                                </div>
-                              )}
+                                )}
                             </div>
                           );
                         })}
@@ -3038,7 +3025,9 @@ export function VoicePage({
                                       : "bg-[var(--bg-surface-2)] border-[var(--border-muted)] text-[var(--text-muted)]",
                                   )}
                                 >
-                                  {model ? getStatusLabel(model.status) : "Unavailable"}
+                                  {model
+                                    ? getStatusLabel(model.status)
+                                    : "Unavailable"}
                                 </span>
                               </div>
 
@@ -3046,7 +3035,9 @@ export function VoicePage({
                                 {model?.status === "downloading" &&
                                   onCancelDownload && (
                                     <Button
-                                      onClick={() => onCancelDownload(model.variant)}
+                                      onClick={() =>
+                                        onCancelDownload(model.variant)
+                                      }
                                       variant="destructive"
                                       size="sm"
                                       className="text-xs h-7 gap-2"
@@ -3099,34 +3090,41 @@ export function VoicePage({
                                   )}
                               </div>
 
-                              {model?.status === "downloading" && progressMeta && (
-                                <div>
-                                  <div className="h-1.5 rounded bg-[var(--bg-surface-3)] overflow-hidden">
-                                    <div
-                                      className="h-full rounded bg-white transition-all duration-300"
-                                      style={{ width: `${progressMeta.progress}%` }}
-                                    />
+                              {model?.status === "downloading" &&
+                                progressMeta && (
+                                  <div>
+                                    <div className="h-1.5 rounded bg-[var(--bg-surface-3)] overflow-hidden">
+                                      <div
+                                        className="h-full rounded bg-white transition-all duration-300"
+                                        style={{
+                                          width: `${progressMeta.progress}%`,
+                                        }}
+                                      />
+                                    </div>
+                                    <div className="mt-1 text-[11px] text-[var(--text-muted)]">
+                                      Downloading{" "}
+                                      {Math.round(progressMeta.progress)}%
+                                      {progressMeta.progressValue &&
+                                        progressMeta.progressValue.totalBytes >
+                                          0 && (
+                                          <>
+                                            {" "}
+                                            (
+                                            {formatBytes(
+                                              progressMeta.progressValue
+                                                .downloadedBytes,
+                                            )}{" "}
+                                            /{" "}
+                                            {formatBytes(
+                                              progressMeta.progressValue
+                                                .totalBytes,
+                                            )}
+                                            )
+                                          </>
+                                        )}
+                                    </div>
                                   </div>
-                                  <div className="mt-1 text-[11px] text-[var(--text-muted)]">
-                                    Downloading {Math.round(progressMeta.progress)}%
-                                    {progressMeta.progressValue &&
-                                      progressMeta.progressValue.totalBytes > 0 && (
-                                        <>
-                                          {" "}
-                                          (
-                                          {formatBytes(
-                                            progressMeta.progressValue.downloadedBytes,
-                                          )}{" "}
-                                          /{" "}
-                                          {formatBytes(
-                                            progressMeta.progressValue.totalBytes,
-                                          )}
-                                          )
-                                        </>
-                                      )}
-                                  </div>
-                                </div>
-                              )}
+                                )}
                             </div>
                           );
                         })}
