@@ -1969,7 +1969,7 @@ export function ChatPlayground({
                                           ? parsedUserMessage.text
                                           : message.content
                                       }
-                                      className="prose-p:leading-relaxed prose-pre:bg-black/10 dark:prose-pre:bg-white/10 prose-pre:border-none prose-a:text-primary-foreground underline"
+                                      className="leading-relaxed [&_p]:m-0 [&_p]:bg-transparent [&_mark]:bg-transparent [&_code]:bg-transparent [&_code]:border-0 [&_code]:px-0 [&_code]:py-0 [&_code]:font-inherit"
                                     />
                                   )}
                                   {parsedUserMessage &&
