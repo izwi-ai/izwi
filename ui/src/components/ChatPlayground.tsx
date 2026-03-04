@@ -1274,7 +1274,9 @@ export function ChatPlayground({
     const systemPrompt = isQwen35ChatModel(selectedModel)
       ? "You are a helpful assistant."
       : thinkingEnabledForModel
-        ? THINKING_SYSTEM_PROMPT.content
+        ? isLfm25ThinkingModel(selectedModel)
+          ? "You are a helpful assistant."
+          : THINKING_SYSTEM_PROMPT.content
         : DEFAULT_SYSTEM_PROMPT.content;
 
     setMessages((previous) => [

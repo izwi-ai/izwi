@@ -220,6 +220,10 @@ impl Lfm2ChatModel {
             }
             assembled = decoded;
 
+            if has_token_repetition_loop(&generated_ids) {
+                break;
+            }
+
             let next_tensor = Tensor::from_vec(vec![next], (1, 1), &self.device.device)?;
             logits = model
                 .forward(&next_tensor, position)
@@ -259,9 +263,17 @@ impl Lfm2ChatModel {
             ids.push(bos);
         }
 
-        for message in &prompt_messages {
+        let last_assistant_index = prompt_messages
+            .iter()
+            .rposition(|message| matches!(message.role, ChatRole::Assistant));
+
+        for (index, message) in prompt_messages.iter().enumerate() {
             let content = if matches!(message.role, ChatRole::Assistant) {
-                strip_think_blocks(message.content.trim())
+                if Some(index) == last_assistant_index {
+                    message.content.trim().to_string()
+                } else {
+                    strip_past_assistant_thinking(message.content.trim())
+                }
             } else {
                 message.content.trim().to_string()
             };
@@ -285,38 +297,6 @@ impl Lfm2ChatModel {
 
         Ok(ids)
     }
-}
-
-fn strip_think_blocks(input: &str) -> String {
-    let mut output = input.to_string();
-    let open = "<think>";
-    let close = "</think>";
-
-    if let Some(close_idx) = output.find(close) {
-        let has_open_before_close = output[..close_idx].find(open).is_some();
-        if !has_open_before_close {
-            let start = close_idx + close.len();
-            output = output[start..].to_string();
-        }
-    }
-
-    loop {
-        let Some(start) = output.find(open) else {
-            break;
-        };
-
-        let search_from = start + open.len();
-        if let Some(end_rel) = output[search_from..].find(close) {
-            let end = search_from + end_rel + close.len();
-            output.replace_range(start..end, "");
-            continue;
-        }
-
-        output.truncate(start);
-        break;
-    }
-
-    output.replace(close, " ").trim().to_string()
 }
 
 fn argmax(logits: &Tensor) -> Result<u32> {
@@ -358,4 +338,73 @@ fn text_delta(previous: &str, current: &str) -> String {
         .take_while(|(a, b)| a == b)
         .count();
     current.chars().skip(common).collect()
+}
+
+fn strip_past_assistant_thinking(input: &str) -> String {
+    if let Some((_reasoning, tail)) = input.rsplit_once("</think>") {
+        tail.trim().to_string()
+    } else {
+        input.trim().to_string()
+    }
+}
+
+fn has_suffix_repeat(ids: &[u32], span: usize, repeats: usize) -> bool {
+    if span == 0 || repeats < 2 || ids.len() < span * repeats {
+        return false;
+    }
+    let tail_start = ids.len() - span;
+    let tail = &ids[tail_start..];
+    (2..=repeats).all(|rep| {
+        let start = ids.len() - (span * rep);
+        &ids[start..start + span] == tail
+    })
+}
+
+fn has_token_repetition_loop(ids: &[u32]) -> bool {
+    // Catch common degenerate loops from greedy decode where the same token span
+    // is emitted repeatedly (frequent in tiny reasoning models).
+    if ids.len() < 48 {
+        return false;
+    }
+    const PATTERNS: &[(usize, usize)] = &[(24, 3), (16, 3), (12, 3), (8, 4), (6, 5)];
+    PATTERNS
+        .iter()
+        .any(|(span, repeats)| has_suffix_repeat(ids, *span, *repeats))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{has_token_repetition_loop, strip_past_assistant_thinking};
+
+    #[test]
+    fn strip_past_assistant_thinking_keeps_only_tail_after_close_tag() {
+        let input = "<think>reasoning</think>\nFinal answer";
+        assert_eq!(strip_past_assistant_thinking(input), "Final answer");
+    }
+
+    #[test]
+    fn strip_past_assistant_thinking_keeps_unclosed_content() {
+        let input = "<think>still reasoning";
+        assert_eq!(
+            strip_past_assistant_thinking(input),
+            "<think>still reasoning"
+        );
+    }
+
+    #[test]
+    fn detects_token_repetition_loop() {
+        let mut ids = Vec::new();
+        let phrase = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        for _ in 0..5 {
+            ids.extend(phrase.iter().copied());
+        }
+        ids.splice(0..0, vec![42; 16]);
+        assert!(has_token_repetition_loop(&ids));
+    }
+
+    #[test]
+    fn does_not_flag_short_sequences_as_loop() {
+        let ids: Vec<u32> = (1..30).collect();
+        assert!(!has_token_repetition_loop(&ids));
+    }
 }
