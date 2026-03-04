@@ -186,7 +186,7 @@ const PIPELINE_LABELS: Record<PipelineMode, string> = {
 
 const MODULAR_STACK_VARIANTS = {
   asr: "Parakeet-TDT-0.6B-v3",
-  text: "Qwen3-8B-GGUF",
+  text: "Qwen3-1.7B-GGUF",
   tts: "Kokoro-82M",
 } as const;
 
@@ -2947,7 +2947,7 @@ export function VoicePage({
                         Modular Voice Stack
                       </div>
                       <p className="text-xs text-muted-foreground mt-1">
-                        Uses a fixed local stack: Parakeet ASR, Qwen3-8B-GGUF,
+                        Uses a fixed local stack: Parakeet ASR, Qwen3-1.7B-GGUF,
                         and Kokoro-82M.
                       </p>
                     </button>
@@ -3104,7 +3104,7 @@ export function VoicePage({
                             Modular Stack Models
                           </h3>
                           <p className="text-[11px] text-[var(--text-muted)] mt-1">
-                            Fixed stack: Parakeet-TDT-0.6B-v3, Qwen3-8B-GGUF,
+                            Fixed stack: Parakeet-TDT-0.6B-v3, Qwen3-1.7B-GGUF,
                             Kokoro-82M.
                           </p>
                         </div>
