@@ -25,6 +25,9 @@ use crate::tokenizer::Tokenizer;
 const SAMPLE_RATE: u32 = whisper::SAMPLE_RATE as u32;
 const DEFAULT_MAX_NEW_TOKENS: usize = 448;
 const MAX_AUDIO_SECONDS_HINT: f32 = whisper::CHUNK_LENGTH as f32;
+const REPETITION_GUARD_MIN_SPAN_TOKENS: usize = 8;
+const REPETITION_GUARD_MAX_SPAN_TOKENS: usize = 96;
+const REPETITION_GUARD_MIN_TOTAL_TOKENS: usize = 20;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 struct WhisperGenerationConfig {
@@ -268,6 +271,18 @@ impl WhisperTurboAsrModel {
 
             generated_tokens.push(next);
             prompt.push(next);
+
+            if let Some((span, repeats)) = find_suffix_token_repetition(&generated_tokens) {
+                // Degenerate greedy loops can repeat an entire phrase verbatim.
+                // Keep the first span and stop decoding before the transcript explodes.
+                let trim = span.saturating_mul(repeats.saturating_sub(1));
+                if trim > 0 && trim <= generated_tokens.len() {
+                    generated_tokens.truncate(generated_tokens.len() - trim);
+                    prompt.truncate(prompt.len() - trim);
+                    assembled = self.decode_generated_text(&generated_tokens)?;
+                }
+                break;
+            }
 
             let decoded = self.decode_generated_text(&generated_tokens)?;
             let delta = text_delta(&assembled, &decoded);
@@ -547,6 +562,39 @@ fn text_delta(previous: &str, current: &str) -> String {
     current.chars().skip(common).collect()
 }
 
+fn find_suffix_token_repetition(ids: &[u32]) -> Option<(usize, usize)> {
+    if ids.len() < REPETITION_GUARD_MIN_TOTAL_TOKENS {
+        return None;
+    }
+
+    let max_span = (ids.len() / 2).min(REPETITION_GUARD_MAX_SPAN_TOKENS);
+    if max_span < REPETITION_GUARD_MIN_SPAN_TOKENS {
+        return None;
+    }
+
+    for span in (REPETITION_GUARD_MIN_SPAN_TOKENS..=max_span).rev() {
+        let tail_start = ids.len() - span;
+        let tail = &ids[tail_start..];
+        let mut repeats = 1usize;
+
+        while ids.len() >= span.saturating_mul(repeats + 1) {
+            let start = ids.len() - span * (repeats + 1);
+            let end = start + span;
+            if &ids[start..end] == tail {
+                repeats += 1;
+            } else {
+                break;
+            }
+        }
+
+        if repeats >= 2 {
+            return Some((span, repeats));
+        }
+    }
+
+    None
+}
+
 fn decode_step_budget(
     prompt_len: usize,
     max_target_positions: usize,
@@ -568,7 +616,7 @@ fn decode_step_budget(
 
 #[cfg(test)]
 mod tests {
-    use super::decode_step_budget;
+    use super::{decode_step_budget, find_suffix_token_repetition};
 
     #[test]
     fn decode_step_budget_clamps_generation_to_remaining_context() {
@@ -580,6 +628,21 @@ mod tests {
     fn decode_step_budget_rejects_prompt_overflow() {
         assert!(decode_step_budget(448, 448, 448).is_err());
         assert!(decode_step_budget(449, 448, 448).is_err());
+    }
+
+    #[test]
+    fn detects_suffix_token_repetition() {
+        let mut ids = Vec::new();
+        ids.extend(1u32..=12);
+        ids.extend(1u32..=12);
+        let repetition = find_suffix_token_repetition(&ids);
+        assert_eq!(repetition, Some((12, 2)));
+    }
+
+    #[test]
+    fn ignores_short_or_non_repeating_suffixes() {
+        let ids: Vec<u32> = (1..=16).collect();
+        assert_eq!(find_suffix_token_repetition(&ids), None);
     }
 }
 
