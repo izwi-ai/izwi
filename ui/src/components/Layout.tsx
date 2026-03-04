@@ -148,7 +148,7 @@ export function Layout({
   };
 
   return (
-    <div className="min-h-dvh flex bg-transparent text-foreground selection:bg-primary/25 selection:text-foreground">
+    <div className="h-dvh flex overflow-hidden bg-transparent text-foreground selection:bg-primary/25 selection:text-foreground">
       {/* Mobile header */}
       <div className="lg:hidden fixed top-0 left-0 right-0 z-40 border-b border-border/80 bg-background/78 backdrop-blur-xl">
         <div className="flex items-center justify-between px-4 py-3.5">
@@ -534,11 +534,11 @@ export function Layout({
       {/* Main content */}
       <div
         className={cn(
-          "flex-1 pt-16 lg:pt-0 transition-all duration-300 min-w-0",
+          "flex-1 flex flex-col pt-16 lg:pt-0 transition-all duration-300 min-w-0 overflow-hidden",
           isSidebarCollapsed ? "lg:ml-[88px]" : "lg:ml-[18rem]",
         )}
       >
-        <div className="hidden lg:flex justify-end px-6 lg:px-8 pt-4">
+        <div className="hidden lg:flex justify-end px-6 lg:px-8 pt-4 shrink-0">
           <div className="flex flex-col items-end">
             <Button
               variant="outline"
@@ -595,7 +595,7 @@ export function Layout({
         </AnimatePresence>
 
         {/* Page content */}
-        <main className="p-6 sm:p-8 lg:px-12 lg:pb-12 lg:pt-8 max-w-[1600px] mx-auto">
+        <main className="flex-1 overflow-y-auto w-full p-6 sm:p-8 lg:px-12 lg:pb-12 lg:pt-8 flex flex-col">
           <Outlet />
         </main>
       </div>

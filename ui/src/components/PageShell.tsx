@@ -16,7 +16,9 @@ interface PageHeaderProps {
 
 export function PageShell({ children, className }: PageShellProps) {
   return (
-    <div className={cn("w-full max-w-[1460px] mx-auto", className)}>
+    <div
+      className={cn("w-full max-w-[1460px] mx-auto h-full flex-1", className)}
+    >
       {children}
     </div>
   );

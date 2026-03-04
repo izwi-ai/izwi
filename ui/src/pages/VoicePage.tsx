@@ -267,8 +267,7 @@ function formatModelVariantLabel(variant: string): string {
   }
 
   if (isLfmAudioVariant(normalized)) {
-    return normalized
-      .replace("LFM2.5-Audio-", "LFM2.5 Audio ");
+    return normalized.replace("LFM2.5-Audio-", "LFM2.5 Audio ");
   }
 
   if (isKokoroVariant(normalized)) {
@@ -977,7 +976,9 @@ export function VoicePage({
             voiceWsInputStreamReadyPromiseRef.current = null;
           }
           reject(
-            new Error("Voice realtime input stream did not become ready in time"),
+            new Error(
+              "Voice realtime input stream did not become ready in time",
+            ),
           );
         }, timeoutMs);
 
@@ -990,31 +991,34 @@ export function VoicePage({
     [],
   );
 
-  const closeVoiceRealtimeSocket = useCallback((reason?: string) => {
-    voiceWsSessionReadyRef.current = false;
-    voiceWsInputStreamStartedRef.current = false;
-    voiceWsInputFrameSeqRef.current = 0;
-    voiceWsInputStreamStartingRef.current = null;
-    voiceWsConnectingRef.current = null;
-    settleVoiceRealtimeInputStreamReady(
-      new Error("Voice realtime input stream stopped"),
-    );
+  const closeVoiceRealtimeSocket = useCallback(
+    (reason?: string) => {
+      voiceWsSessionReadyRef.current = false;
+      voiceWsInputStreamStartedRef.current = false;
+      voiceWsInputFrameSeqRef.current = 0;
+      voiceWsInputStreamStartingRef.current = null;
+      voiceWsConnectingRef.current = null;
+      settleVoiceRealtimeInputStreamReady(
+        new Error("Voice realtime input stream stopped"),
+      );
 
-    const socket = voiceWsRef.current;
-    voiceWsRef.current = null;
-    if (socket) {
-      try {
-        if (
-          socket.readyState === WebSocket.OPEN ||
-          socket.readyState === WebSocket.CONNECTING
-        ) {
-          socket.close(1000, reason || "session_closed");
+      const socket = voiceWsRef.current;
+      voiceWsRef.current = null;
+      if (socket) {
+        try {
+          if (
+            socket.readyState === WebSocket.OPEN ||
+            socket.readyState === WebSocket.CONNECTING
+          ) {
+            socket.close(1000, reason || "session_closed");
+          }
+        } catch {
+          // Ignore close failures.
         }
-      } catch {
-        // Ignore close failures.
       }
-    }
-  }, [settleVoiceRealtimeInputStreamReady]);
+    },
+    [settleVoiceRealtimeInputStreamReady],
+  );
 
   const stopSession = useCallback(() => {
     isSessionActiveRef.current = false;
@@ -2628,7 +2632,7 @@ export function VoicePage({
   }
 
   return (
-    <PageShell className="flex flex-col h-full lg:h-[calc(100vh-6rem)] relative overflow-hidden">
+    <PageShell className="flex flex-col h-full min-h-[500px] relative overflow-hidden">
       <div className="absolute top-4 right-4 z-10 flex items-center gap-3">
         <div className="flex items-center gap-2">
           <span
@@ -2782,7 +2786,8 @@ export function VoicePage({
                   Conversation Transcript
                 </span>
                 <span className="text-[11px] text-[var(--text-muted)]">
-                  {transcript.length} {transcript.length === 1 ? "turn" : "turns"}
+                  {transcript.length}{" "}
+                  {transcript.length === 1 ? "turn" : "turns"}
                 </span>
               </div>
 
@@ -2818,7 +2823,9 @@ export function VoicePage({
                           </span>
                         </div>
                         {entry.text || (
-                          <span className="opacity-70">Waiting for text...</span>
+                          <span className="opacity-70">
+                            Waiting for text...
+                          </span>
                         )}
                       </div>
                     );
