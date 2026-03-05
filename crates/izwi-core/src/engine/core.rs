@@ -20,6 +20,7 @@ use super::scheduler::{Scheduler, SchedulerConfig};
 use super::types::{AudioOutput, EngineOutput, LatencyBreakdown, RequestId};
 use crate::backends::{kv_dtype_bytes, BackendKind};
 use crate::error::{Error, Result};
+use crate::model::ModelVariant;
 use crate::models::DeviceSelector;
 
 enum KvCacheBackend {
@@ -680,10 +681,11 @@ impl EngineCore {
 
     /// Abort a request.
     pub async fn abort_request(&mut self, request_id: &RequestId) -> bool {
-        if self
+        let existed = self.scheduler.has_request(request_id);
+        let removed_running = self
             .scheduler
-            .abort_request(request_id, self.kv_cache.inner_mut())
-        {
+            .abort_request(request_id, self.kv_cache.inner_mut());
+        if removed_running || (existed && !self.scheduler.has_request(request_id)) {
             self.executor.cleanup_request(request_id).await;
             self.requests.remove(request_id);
             self.request_start_times.remove(request_id);
@@ -693,6 +695,29 @@ impl EngineCore {
         } else {
             false
         }
+    }
+
+    /// Abort all active requests that target a specific model variant.
+    pub async fn abort_requests_for_variant(&mut self, variant: ModelVariant) -> Vec<RequestId> {
+        let request_ids: Vec<RequestId> = self
+            .requests
+            .iter()
+            .filter_map(|(request_id, request)| {
+                if request.model_variant == Some(variant) {
+                    Some(request_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut aborted = Vec::with_capacity(request_ids.len());
+        for request_id in request_ids {
+            if self.abort_request(&request_id).await {
+                aborted.push(request_id);
+            }
+        }
+        aborted
     }
 
     /// Get number of pending (waiting) requests.
@@ -750,6 +775,7 @@ mod tests {
     use super::super::scheduler::ScheduledRequest;
     use super::super::types::{AudioOutput, Priority};
     use super::*;
+    use crate::model::ModelVariant;
     use std::sync::{Arc, Mutex};
 
     struct MockExecutor {
@@ -951,6 +977,37 @@ mod tests {
             core.get_request_status(&"low-priority".to_string()),
             Some(RequestStatus::Running)
         );
+    }
+
+    #[tokio::test]
+    async fn test_abort_requests_for_variant_only_aborts_matching_requests() {
+        let cleanup_calls = Arc::new(Mutex::new(Vec::new()));
+        let executor =
+            UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(cleanup_calls.clone())));
+        let config = EngineCoreConfig::default();
+        let mut core = EngineCore::new_with_unified_executor(config, executor).unwrap();
+
+        let mut req_a = EngineCoreRequest::tts("variant-a");
+        req_a.id = "req-a".to_string();
+        req_a.model_variant = Some(ModelVariant::Qwen34BGguf);
+
+        let mut req_b = EngineCoreRequest::tts("variant-b");
+        req_b.id = "req-b".to_string();
+        req_b.model_variant = Some(ModelVariant::Qwen38BGguf);
+
+        core.add_request(req_a).unwrap();
+        core.add_request(req_b).unwrap();
+
+        let aborted = core
+            .abort_requests_for_variant(ModelVariant::Qwen34BGguf)
+            .await;
+        assert_eq!(aborted, vec!["req-a".to_string()]);
+        assert!(!core.has_request(&"req-a".to_string()));
+        assert!(core.has_request(&"req-b".to_string()));
+
+        let calls = cleanup_calls.lock().unwrap().clone();
+        assert!(calls.iter().any(|id| id == "req-a"));
+        assert!(!calls.iter().any(|id| id == "req-b"));
     }
 
     #[test]
