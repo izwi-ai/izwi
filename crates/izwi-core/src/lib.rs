@@ -71,7 +71,8 @@ pub use models::shared::chat::{
 };
 
 // Canonical native registry/device exports.
-pub use models::{DeviceProfile, DeviceSelector, ModelRegistry};
+pub use backends::{DeviceProfile, DeviceSelector};
+pub use models::ModelRegistry;
 
 #[cfg(test)]
 pub(crate) fn env_test_lock() -> &'static std::sync::Mutex<()> {

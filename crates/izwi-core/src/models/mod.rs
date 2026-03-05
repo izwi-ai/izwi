@@ -10,4 +10,4 @@ pub mod registry;
 pub mod shared;
 
 pub use registry::ModelRegistry;
-pub use shared::device::{DeviceProfile, DeviceSelector};
+pub use crate::backends::{DeviceProfile, DeviceSelector};
