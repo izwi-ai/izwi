@@ -1,6 +1,5 @@
 use std::convert::Infallible;
 use std::path::Path as FsPath;
-use std::time::Duration;
 
 use axum::{
     body::Body,
@@ -11,17 +10,20 @@ use axum::{
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
 
 use crate::api::request_context::RequestContext;
+use crate::app::chat::{
+    generate_chat, is_qwen35_chat_variant, parse_chat_model, spawn_chat_stream,
+    ChatExecutionRequest, ChatStreamEvent,
+};
 use crate::chat_store::{ChatThreadMessage, ChatThreadSummary};
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::storage_layout::{self, ChatMediaKind};
 use izwi_core::ModelVariant;
 use izwi_core::{
-    parse_chat_model_variant, qwen35_multimodal_control_content, qwen35_thinking_control_content,
-    ChatMessage, ChatRole, Qwen35MultimodalInput, Qwen35MultimodalKind,
+    qwen35_multimodal_control_content, qwen35_thinking_control_content, ChatMessage, ChatRole,
+    Qwen35MultimodalInput, Qwen35MultimodalKind,
 };
 
 const QWEN_VISION_IMAGE_TOKEN: &str = "<|vision_start|><|image_pad|><|vision_end|>";
@@ -276,31 +278,26 @@ pub async fn create_thread_message(
         req.enable_thinking,
         &flattened_content.multimodal,
     )?;
+    let execution_request = ChatExecutionRequest {
+        variant: model_variant,
+        messages: runtime_messages,
+        max_completion_tokens: req.max_completion_tokens,
+        max_tokens: req.max_tokens,
+        correlation_id: Some(ctx.correlation_id),
+    };
 
     if req.stream.unwrap_or(false) {
         return create_streaming_thread_message(
             state,
-            req,
-            model_variant,
             model_id,
             thread_id,
             user_message,
-            runtime_messages,
-            ctx.correlation_id,
+            execution_request,
         )
         .await;
     }
 
-    let _permit = state.acquire_permit().await;
-    let generation = state
-        .runtime
-        .chat_generate_with_correlation(
-            model_variant,
-            runtime_messages,
-            max_new_tokens(model_variant, req.max_completion_tokens, req.max_tokens),
-            Some(&ctx.correlation_id),
-        )
-        .await?;
+    let generation = generate_chat(&state, execution_request).await?;
 
     let assistant_message = state
         .chat_store
@@ -332,148 +329,101 @@ pub async fn create_thread_message(
 
 async fn create_streaming_thread_message(
     state: AppState,
-    req: CreateThreadMessageRequest,
-    model_variant: ModelVariant,
     model_id: String,
     thread_id: String,
     user_message: ChatThreadMessage,
-    runtime_messages: Vec<ChatMessage>,
-    correlation_id: String,
+    execution_request: ChatExecutionRequest,
 ) -> Result<Response, ApiError> {
-    let timeout = Duration::from_secs(state.request_timeout_secs);
-    let max_tokens = max_new_tokens(model_variant, req.max_completion_tokens, req.max_tokens);
-    let semaphore = state.request_semaphore.clone();
-    let runtime = state.runtime.clone();
     let chat_store = state.chat_store.clone();
-
     let thread_id_for_task = thread_id.clone();
     let model_id_for_task = model_id.clone();
     let user_message_for_start = user_message.clone();
+    let mut event_rx = spawn_chat_stream(state, execution_request);
 
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<String>();
-
-    tokio::spawn(async move {
-        let _permit = match semaphore.acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => {
-                let _ = event_tx.send(
-                    serde_json::to_string(&ThreadStreamErrorEvent {
-                        event: "error",
-                        error: "Server is shutting down".to_string(),
+    let stream = async_stream::stream! {
+        while let Some(event) = event_rx.recv().await {
+            let (payload, terminal) = match event {
+                ChatStreamEvent::Started => (
+                    serde_json::to_string(&ThreadStreamStartEvent {
+                        event: "start",
+                        thread_id: thread_id_for_task.clone(),
+                        model_id: model_id_for_task.clone(),
+                        user_message: user_message_for_start.clone(),
                     })
                     .unwrap_or_default(),
-                );
-                let _ = event_tx.send("[DONE]".to_string());
-                return;
-            }
-        };
-
-        let _ = event_tx.send(
-            serde_json::to_string(&ThreadStreamStartEvent {
-                event: "start",
-                thread_id: thread_id_for_task.clone(),
-                model_id: model_id_for_task.clone(),
-                user_message: user_message_for_start,
-            })
-            .unwrap_or_default(),
-        );
-
-        let full_text = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let full_text_for_delta = full_text.clone();
-        let delta_tx = event_tx.clone();
-
-        let generation_result = tokio::time::timeout(timeout, async {
-            runtime
-                .chat_generate_streaming_with_correlation(
-                    model_variant,
-                    runtime_messages,
-                    max_tokens,
-                    Some(correlation_id.as_str()),
-                    move |delta| {
-                        if let Ok(mut output_text) = full_text_for_delta.lock() {
-                            output_text.push_str(&delta);
-                        }
-                        let payload = ThreadStreamDeltaEvent {
-                            event: "delta",
-                            delta,
-                        };
-                        let _ = delta_tx.send(serde_json::to_string(&payload).unwrap_or_default());
-                    },
-                )
-                .await
-        })
-        .await;
-
-        match generation_result {
-            Ok(Ok(generation)) => {
-                let assistant_text = full_text.lock().map(|s| s.clone()).unwrap_or_default();
-                match chat_store
-                    .append_message(
-                        thread_id_for_task.clone(),
-                        "assistant".to_string(),
-                        assistant_text,
-                        None,
-                        Some(model_id_for_task.clone()),
-                        Some(generation.tokens_generated),
-                        Some(generation.generation_time_ms),
-                    )
-                    .await
-                {
-                    Ok(assistant_message) => {
-                        let done_event = ThreadStreamDoneEvent {
+                    false,
+                ),
+                ChatStreamEvent::Delta(delta) => (
+                    serde_json::to_string(&ThreadStreamDeltaEvent {
+                        event: "delta",
+                        delta,
+                    })
+                    .unwrap_or_default(),
+                    false,
+                ),
+                ChatStreamEvent::Completed(generation) => {
+                    let payload = match chat_store
+                        .append_message(
+                            thread_id_for_task.clone(),
+                            "assistant".to_string(),
+                            generation.text.clone(),
+                            None,
+                            Some(model_id_for_task.clone()),
+                            Some(generation.tokens_generated),
+                            Some(generation.generation_time_ms),
+                        )
+                        .await
+                    {
+                        Ok(assistant_message) => serde_json::to_string(&ThreadStreamDoneEvent {
                             event: "done",
-                            thread_id: thread_id_for_task,
-                            model_id: model_id_for_task,
+                            thread_id: thread_id_for_task.clone(),
+                            model_id: model_id_for_task.clone(),
                             assistant_message,
                             stats: ChatGenerationStats {
                                 tokens_generated: generation.tokens_generated,
                                 generation_time_ms: generation.generation_time_ms,
                             },
-                        };
-                        let _ =
-                            event_tx.send(serde_json::to_string(&done_event).unwrap_or_default());
-                    }
-                    Err(err) => {
-                        let _ = event_tx.send(
-                            serde_json::to_string(&ThreadStreamErrorEvent {
-                                event: "error",
-                                error: format!("Failed to persist assistant message: {err}"),
-                            })
-                            .unwrap_or_default(),
-                        );
-                    }
+                        })
+                        .unwrap_or_default(),
+                        Err(err) => serde_json::to_string(&ThreadStreamErrorEvent {
+                            event: "error",
+                            error: format!("Failed to persist assistant message: {err}"),
+                        })
+                        .unwrap_or_default(),
+                    };
+                    (payload, true)
                 }
-            }
-            Ok(Err(err)) => {
-                let _ = event_tx.send(
+                ChatStreamEvent::Failed(error) => (
                     serde_json::to_string(&ThreadStreamErrorEvent {
                         event: "error",
-                        error: err.to_string(),
+                        error,
                     })
                     .unwrap_or_default(),
-                );
-            }
-            Err(_) => {
-                let _ = event_tx.send(
+                    true,
+                ),
+                ChatStreamEvent::TimedOut => (
                     serde_json::to_string(&ThreadStreamErrorEvent {
                         event: "error",
                         error: "Chat request timed out".to_string(),
                     })
                     .unwrap_or_default(),
-                );
-            }
-        }
-
-        let _ = event_tx.send("[DONE]".to_string());
-    });
-
-    let stream = async_stream::stream! {
-        while let Some(payload) = event_rx.recv().await {
+                    true,
+                ),
+                ChatStreamEvent::ShuttingDown => (
+                    serde_json::to_string(&ThreadStreamErrorEvent {
+                        event: "error",
+                        error: "Server is shutting down".to_string(),
+                    })
+                    .unwrap_or_default(),
+                    true,
+                ),
+            };
             yield Ok::<_, Infallible>(format!("data: {payload}\n\n"));
-            if payload == "[DONE]" {
+            if terminal {
                 break;
             }
         }
+        yield Ok::<_, Infallible>("data: [DONE]\n\n".to_string());
     };
 
     Ok(Response::builder()
@@ -482,28 +432,6 @@ async fn create_streaming_thread_message(
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from_stream(stream))
         .unwrap())
-}
-
-fn max_new_tokens(
-    variant: ModelVariant,
-    max_completion_tokens: Option<usize>,
-    max_tokens: Option<usize>,
-) -> usize {
-    let requested = max_completion_tokens.or(max_tokens);
-
-    let default = match variant {
-        ModelVariant::Gemma34BIt => 4096,
-        ModelVariant::Gemma31BIt => 4096,
-        ModelVariant::Lfm2512BInstructGguf => 4096,
-        ModelVariant::Lfm2512BThinkingGguf => 4096,
-        _ => 1536,
-    };
-
-    requested.unwrap_or(default).clamp(1, 4096)
-}
-
-fn parse_chat_model(model_id: &str) -> Result<ModelVariant, ApiError> {
-    parse_chat_model_variant(Some(model_id)).map_err(|err| ApiError::bad_request(err.to_string()))
 }
 
 fn build_runtime_messages(
@@ -564,16 +492,6 @@ fn build_runtime_messages(
     });
 
     Ok(messages)
-}
-
-fn is_qwen35_chat_variant(variant: ModelVariant) -> bool {
-    matches!(
-        variant,
-        ModelVariant::Qwen3508B
-            | ModelVariant::Qwen352B
-            | ModelVariant::Qwen354B
-            | ModelVariant::Qwen359B
-    )
 }
 
 fn persist_chat_media_parts(

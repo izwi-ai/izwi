@@ -1,7 +1,7 @@
 //! OpenAI-compatible chat completions endpoints.
 
 use std::convert::Infallible;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{Extension, State},
@@ -10,15 +10,18 @@ use axum::{
 };
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
 
 use crate::api::openai::common::{parse_tool_choice, should_inject_tools, tool_choice_instruction};
 use crate::api::request_context::RequestContext;
+use crate::app::chat::{
+    generate_chat, is_qwen35_chat_variant, parse_chat_model, spawn_chat_stream,
+    ChatExecutionRequest, ChatStreamEvent,
+};
 use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::{
-    parse_chat_model_variant, qwen35_multimodal_control_content, ChatMessage, ChatRole,
-    ModelVariant, Qwen35MultimodalInput, Qwen35MultimodalKind,
+    qwen35_multimodal_control_content, ChatMessage, ChatRole, ModelVariant, Qwen35MultimodalInput,
+    Qwen35MultimodalKind,
 };
 
 #[allow(dead_code)]
@@ -197,28 +200,6 @@ const QWEN_VISION_VIDEO_TOKEN: &str = "<|vision_start|><|video_pad|><|vision_end
 struct FlattenedContent {
     text: String,
     multimodal: Vec<Qwen35MultimodalInput>,
-}
-
-fn max_new_tokens(
-    variant: ModelVariant,
-    max_completion_tokens: Option<usize>,
-    max_tokens: Option<usize>,
-) -> usize {
-    let requested = max_completion_tokens.or(max_tokens);
-
-    let default = match variant {
-        ModelVariant::Gemma34BIt => 4096,
-        ModelVariant::Gemma31BIt => 4096,
-        ModelVariant::Lfm2512BInstructGguf => 4096,
-        ModelVariant::Lfm2512BThinkingGguf => 4096,
-        _ => 1536,
-    };
-
-    requested.unwrap_or(default).clamp(1, 4096)
-}
-
-fn parse_chat_model(model_id: &str) -> Result<ModelVariant, ApiError> {
-    parse_chat_model_variant(Some(model_id)).map_err(|err| ApiError::bad_request(err.to_string()))
 }
 
 fn now_unix_secs() -> u64 {
@@ -700,16 +681,6 @@ fn parse_tool_call_block(block: &str) -> Option<OpenAiOutputToolCall> {
     })
 }
 
-fn is_qwen35_chat_variant(variant: ModelVariant) -> bool {
-    matches!(
-        variant,
-        ModelVariant::Qwen3508B
-            | ModelVariant::Qwen352B
-            | ModelVariant::Qwen354B
-            | ModelVariant::Qwen359B
-    )
-}
-
 fn request_contains_multimodal_content(messages: &[OpenAiInboundMessage]) -> bool {
     messages.iter().any(|message| match &message.content {
         Some(OpenAiInboundContent::Parts(parts)) => parts
@@ -768,24 +739,20 @@ pub async fn completions(
             "Chat request must include at least one message",
         ));
     }
+    let execution_request = ChatExecutionRequest {
+        variant,
+        messages,
+        max_completion_tokens: req.max_completion_tokens,
+        max_tokens: req.max_tokens,
+        correlation_id: Some(ctx.correlation_id),
+    };
 
     if req.stream.unwrap_or(false) {
-        let stream_response =
-            complete_stream(state, req, variant, messages, ctx.correlation_id).await?;
+        let stream_response = complete_stream(state, req, execution_request).await?;
         return Ok(stream_response.into_response());
     }
 
-    let _permit = state.acquire_permit().await;
-
-    let generation = state
-        .runtime
-        .chat_generate_with_correlation(
-            variant,
-            messages,
-            max_new_tokens(variant, req.max_completion_tokens, req.max_tokens),
-            Some(&ctx.correlation_id),
-        )
-        .await?;
+    let generation = generate_chat(&state, execution_request).await?;
 
     let completion_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
     let created = now_unix_secs();
@@ -822,139 +789,105 @@ pub async fn completions(
 async fn complete_stream(
     state: AppState,
     req: ChatCompletionRequest,
-    variant: ModelVariant,
-    messages: Vec<ChatMessage>,
-    correlation_id: String,
+    execution_request: ChatExecutionRequest,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let include_usage = req
         .stream_options
         .as_ref()
         .and_then(|opts| opts.include_usage)
         .unwrap_or(false);
-    let max_tokens = max_new_tokens(variant, req.max_completion_tokens, req.max_tokens);
-    let model_id = variant.dir_name().to_string();
-    let timeout = Duration::from_secs(state.request_timeout_secs);
+    let model_id = execution_request.variant.dir_name().to_string();
 
     let completion_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
     let created = now_unix_secs();
+    let mut event_rx = spawn_chat_stream(state, execution_request);
 
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<String>();
-    let engine = state.runtime.clone();
-    let semaphore = state.request_semaphore.clone();
-    let completion_id_for_task = completion_id.clone();
-    let model_id_for_task = model_id.clone();
-
-    tokio::spawn(async move {
-        let _permit = match semaphore.acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => {
-                let _ = event_tx.send(
-                    serde_json::json!({
-                        "error": {
-                            "message": "Server is shutting down",
-                            "type": "server_error"
-                        }
+    let stream = async_stream::stream! {
+        while let Some(event) = event_rx.recv().await {
+            let (payload, terminal) = match event {
+                ChatStreamEvent::Started => (
+                    serde_json::to_string(&OpenAiChatChunk {
+                        id: completion_id.clone(),
+                        object: "chat.completion.chunk",
+                        created,
+                        model: model_id.clone(),
+                        choices: vec![OpenAiChunkChoice {
+                            index: 0,
+                            delta: OpenAiDelta {
+                                role: Some("assistant"),
+                                content: None,
+                            },
+                            finish_reason: None,
+                        }],
+                        usage: None,
+                        izwi_generation_time_ms: None,
                     })
-                    .to_string(),
-                );
-                let _ = event_tx.send("[DONE]".to_string());
-                return;
-            }
-        };
-
-        let start_chunk = OpenAiChatChunk {
-            id: completion_id_for_task.clone(),
-            object: "chat.completion.chunk",
-            created,
-            model: model_id_for_task.clone(),
-            choices: vec![OpenAiChunkChoice {
-                index: 0,
-                delta: OpenAiDelta {
-                    role: Some("assistant"),
-                    content: None,
-                },
-                finish_reason: None,
-            }],
-            usage: None,
-            izwi_generation_time_ms: None,
-        };
-        let _ = event_tx.send(serde_json::to_string(&start_chunk).unwrap_or_default());
-
-        let delta_tx = event_tx.clone();
-        let result = tokio::time::timeout(timeout, async {
-            engine
-                .chat_generate_streaming_with_correlation(
-                    variant,
-                    messages,
-                    max_tokens,
-                    Some(correlation_id.as_str()),
-                    move |delta| {
-                        let chunk = OpenAiChatChunk {
-                            id: completion_id_for_task.clone(),
+                    .unwrap_or_default(),
+                    false,
+                ),
+                ChatStreamEvent::Delta(delta) => (
+                    serde_json::to_string(&OpenAiChatChunk {
+                        id: completion_id.clone(),
+                        object: "chat.completion.chunk",
+                        created,
+                        model: model_id.clone(),
+                        choices: vec![OpenAiChunkChoice {
+                            index: 0,
+                            delta: OpenAiDelta {
+                                role: None,
+                                content: Some(delta),
+                            },
+                            finish_reason: None,
+                        }],
+                        usage: None,
+                        izwi_generation_time_ms: None,
+                    })
+                    .unwrap_or_default(),
+                    false,
+                ),
+                ChatStreamEvent::Completed(generation) => {
+                    let (_, tool_calls, finish_reason) =
+                        build_assistant_response_parts(generation.text);
+                    (
+                        serde_json::to_string(&OpenAiChatChunk {
+                            id: completion_id.clone(),
                             object: "chat.completion.chunk",
                             created,
-                            model: model_id_for_task.clone(),
+                            model: model_id.clone(),
                             choices: vec![OpenAiChunkChoice {
                                 index: 0,
                                 delta: OpenAiDelta {
                                     role: None,
-                                    content: Some(delta),
+                                    content: None,
                                 },
-                                finish_reason: None,
+                                finish_reason: Some(if tool_calls.is_some() {
+                                    "tool_calls"
+                                } else {
+                                    finish_reason
+                                }),
                             }],
-                            usage: None,
-                            izwi_generation_time_ms: None,
-                        };
-                        let _ = delta_tx.send(serde_json::to_string(&chunk).unwrap_or_default());
-                    },
-                )
-                .await
-        })
-        .await;
-
-        match result {
-            Ok(Ok(generation)) => {
-                let (_, tool_calls, finish_reason) =
-                    build_assistant_response_parts(generation.text);
-                let final_chunk = OpenAiChatChunk {
-                    id: completion_id,
-                    object: "chat.completion.chunk",
-                    created,
-                    model: model_id,
-                    choices: vec![OpenAiChunkChoice {
-                        index: 0,
-                        delta: OpenAiDelta {
-                            role: None,
-                            content: None,
-                        },
-                        finish_reason: Some(if tool_calls.is_some() {
-                            "tool_calls"
-                        } else {
-                            finish_reason
-                        }),
-                    }],
-                    usage: include_usage.then_some(OpenAiUsage {
-                        prompt_tokens: 0,
-                        completion_tokens: generation.tokens_generated,
-                        total_tokens: generation.tokens_generated,
-                    }),
-                    izwi_generation_time_ms: Some(generation.generation_time_ms),
-                };
-                let _ = event_tx.send(serde_json::to_string(&final_chunk).unwrap_or_default());
-            }
-            Ok(Err(err)) => {
-                let _ = event_tx.send(
+                            usage: include_usage.then_some(OpenAiUsage {
+                                prompt_tokens: 0,
+                                completion_tokens: generation.tokens_generated,
+                                total_tokens: generation.tokens_generated,
+                            }),
+                            izwi_generation_time_ms: Some(generation.generation_time_ms),
+                        })
+                        .unwrap_or_default(),
+                        true,
+                    )
+                }
+                ChatStreamEvent::Failed(error) => (
                     serde_json::json!({
                         "error": {
-                            "message": err.to_string(),
+                            "message": error,
                             "type": "server_error"
                         }
                     })
                     .to_string(),
-                );
-            }
-            Err(_) => {
-                let _ = event_tx.send(
+                    true,
+                ),
+                ChatStreamEvent::TimedOut => (
                     serde_json::json!({
                         "error": {
                             "message": "Chat request timed out",
@@ -962,20 +895,25 @@ async fn complete_stream(
                         }
                     })
                     .to_string(),
-                );
-            }
-        }
-
-        let _ = event_tx.send("[DONE]".to_string());
-    });
-
-    let stream = async_stream::stream! {
-        while let Some(event) = event_rx.recv().await {
-            yield Ok(Event::default().data(event.clone()));
-            if event == "[DONE]" {
+                    true,
+                ),
+                ChatStreamEvent::ShuttingDown => (
+                    serde_json::json!({
+                        "error": {
+                            "message": "Server is shutting down",
+                            "type": "server_error"
+                        }
+                    })
+                    .to_string(),
+                    true,
+                ),
+            };
+            yield Ok(Event::default().data(payload));
+            if terminal {
                 break;
             }
         }
+        yield Ok(Event::default().data("[DONE]"));
     };
 
     Ok(Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()))

@@ -7,6 +7,7 @@ use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod api;
+mod app;
 mod chat_store;
 mod diarization_store;
 mod error;
@@ -242,7 +243,10 @@ mod tests {
     #[test]
     fn invalid_backend_value_is_rejected() {
         let result = ServerArgs::try_parse_from(["izwi-server", "--backend", "invalid"]);
-        assert!(result.is_err(), "invalid backend should fail argument parsing");
+        assert!(
+            result.is_err(),
+            "invalid backend should fail argument parsing"
+        );
     }
 
     #[test]
