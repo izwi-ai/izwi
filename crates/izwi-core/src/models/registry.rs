@@ -21,6 +21,7 @@ use crate::models::architectures::qwen3::asr::{
 use crate::models::architectures::qwen3::chat::{
     ChatDecodeState as Qwen3ChatDecodeState, ChatGenerationOutput, Qwen3ChatModel,
 };
+use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::models::architectures::qwen35::chat::{
     ChatDecodeState as Qwen35ChatDecodeState, Qwen35ChatModel,
 };
@@ -37,6 +38,7 @@ type AsrLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeAsrMod
 type ChatLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeChatModel>;
 type DiarizationLoaderFn = fn(&Path, ModelVariant) -> Result<NativeDiarizationModel>;
 type VoxtralLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VoxtralRealtimeModel>;
+type QwenTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile, usize, &str) -> Result<Qwen3TtsModel>;
 type Lfm2LoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<Lfm2AudioModel>;
 type KokoroLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<KokoroTtsModel>;
 
@@ -62,6 +64,12 @@ struct VoxtralLoaderRegistration {
     name: &'static str,
     family: ModelFamily,
     loader: VoxtralLoaderFn,
+}
+
+struct QwenTtsLoaderRegistration {
+    name: &'static str,
+    family: ModelFamily,
+    loader: QwenTtsLoaderFn,
 }
 
 struct Lfm2LoaderRegistration {
@@ -163,6 +171,16 @@ fn load_voxtral_model(
     VoxtralRealtimeModel::load(model_dir, device)
 }
 
+fn load_qwen_tts_model(
+    model_dir: &Path,
+    _variant: ModelVariant,
+    device: DeviceProfile,
+    kv_page_size: usize,
+    kv_cache_dtype: &str,
+) -> Result<Qwen3TtsModel> {
+    Qwen3TtsModel::load(model_dir, device, kv_page_size, kv_cache_dtype)
+}
+
 fn load_lfm2_model(
     model_dir: &Path,
     _variant: ModelVariant,
@@ -233,6 +251,12 @@ const VOXTRAL_LOADER_REGISTRY: &[VoxtralLoaderRegistration] = &[VoxtralLoaderReg
     loader: load_voxtral_model,
 }];
 
+const QWEN_TTS_LOADER_REGISTRY: &[QwenTtsLoaderRegistration] = &[QwenTtsLoaderRegistration {
+    name: "qwen3_tts",
+    family: ModelFamily::Qwen3Tts,
+    loader: load_qwen_tts_model,
+}];
+
 const LFM2_LOADER_REGISTRY: &[Lfm2LoaderRegistration] = &[Lfm2LoaderRegistration {
     name: "lfm2_audio",
     family: ModelFamily::Lfm2Audio,
@@ -283,6 +307,15 @@ fn resolve_voxtral_loader_registration(
 ) -> Option<&'static VoxtralLoaderRegistration> {
     let family = variant.family();
     VOXTRAL_LOADER_REGISTRY
+        .iter()
+        .find(|registration| registration.family == family)
+}
+
+fn resolve_qwen_tts_loader_registration(
+    variant: ModelVariant,
+) -> Option<&'static QwenTtsLoaderRegistration> {
+    let family = variant.family();
+    QWEN_TTS_LOADER_REGISTRY
         .iter()
         .find(|registration| registration.family == family)
 }
@@ -622,6 +655,7 @@ pub struct ModelRegistry {
         Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<NativeDiarizationModel>>>>>>,
     chat_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<NativeChatModel>>>>>>,
     voxtral_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<VoxtralRealtimeModel>>>>>>,
+    qwen_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<Qwen3TtsModel>>>>>>,
     lfm2_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<Lfm2AudioModel>>>>>>,
     kokoro_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<KokoroTtsModel>>>>>>,
 }
@@ -635,6 +669,7 @@ impl ModelRegistry {
             diarization_models: Arc::new(RwLock::new(HashMap::new())),
             chat_models: Arc::new(RwLock::new(HashMap::new())),
             voxtral_models: Arc::new(RwLock::new(HashMap::new())),
+            qwen_tts_models: Arc::new(RwLock::new(HashMap::new())),
             lfm2_models: Arc::new(RwLock::new(HashMap::new())),
             kokoro_models: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -814,6 +849,56 @@ impl ModelRegistry {
         Ok(model.clone())
     }
 
+    pub async fn load_qwen_tts(
+        &self,
+        variant: ModelVariant,
+        model_dir: &Path,
+        kv_page_size: usize,
+        kv_cache_dtype: &str,
+    ) -> Result<Arc<Qwen3TtsModel>> {
+        let registration = resolve_qwen_tts_loader_registration(variant).ok_or_else(|| {
+            Error::InvalidInput(format!("Unsupported Qwen TTS model variant: {variant}"))
+        })?;
+
+        let cell = {
+            let mut guard = self.qwen_tts_models.write().await;
+            guard
+                .entry(variant)
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+
+        info!(
+            "Loading Qwen TTS model {variant} ({}) from {model_dir:?}",
+            registration.name
+        );
+
+        let model = cell
+            .get_or_try_init({
+                let model_dir = model_dir.to_path_buf();
+                let device = self.device.clone();
+                let loader = registration.loader;
+                let kv_cache_dtype = kv_cache_dtype.to_string();
+                move || async move {
+                    tokio::task::spawn_blocking(move || {
+                        loader(
+                            &model_dir,
+                            variant,
+                            device,
+                            kv_page_size.max(1),
+                            &kv_cache_dtype,
+                        )
+                    })
+                    .await
+                    .map_err(|e| Error::ModelLoadError(e.to_string()))?
+                    .map(Arc::new)
+                }
+            })
+            .await?;
+
+        Ok(model.clone())
+    }
+
     pub async fn load_lfm2(
         &self,
         variant: ModelVariant,
@@ -938,6 +1023,16 @@ impl ModelRegistry {
         guard.get(&variant).and_then(|cell| cell.get().cloned())
     }
 
+    pub async fn get_qwen_tts(&self, variant: ModelVariant) -> Option<Arc<Qwen3TtsModel>> {
+        let guard = self.qwen_tts_models.read().await;
+        guard.get(&variant).and_then(|cell| cell.get().cloned())
+    }
+
+    pub fn try_get_qwen_tts(&self, variant: ModelVariant) -> Option<Arc<Qwen3TtsModel>> {
+        let guard = self.qwen_tts_models.try_read().ok()?;
+        guard.get(&variant).and_then(|cell| cell.get().cloned())
+    }
+
     pub async fn get_lfm2(&self, variant: ModelVariant) -> Option<Arc<Lfm2AudioModel>> {
         let guard = self.lfm2_models.read().await;
         guard.get(&variant).and_then(|cell| cell.get().cloned())
@@ -975,6 +1070,11 @@ impl ModelRegistry {
 
     pub async fn unload_voxtral(&self, variant: ModelVariant) {
         let mut guard = self.voxtral_models.write().await;
+        guard.remove(&variant);
+    }
+
+    pub async fn unload_qwen_tts(&self, variant: ModelVariant) {
+        let mut guard = self.qwen_tts_models.write().await;
         guard.remove(&variant);
     }
 
