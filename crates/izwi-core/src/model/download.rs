@@ -436,20 +436,7 @@ impl ModelDownloader {
                     && path.join("tokenizer.json").exists();
                 let has_detokenizer = path.join("audio_detokenizer/config.json").exists()
                     && path.join("audio_detokenizer/model.safetensors").exists();
-                let has_mimi = path
-                    .join("tokenizer-e351c8d8-checkpoint125.safetensors")
-                    .exists();
-
-                // LFM2.5 quality depends on the new LFM detokenizer path. Keep legacy Mimi
-                // support for backward compatibility if a checkpoint provides it.
-                if matches!(
-                    variant,
-                    ModelVariant::Lfm25Audio15B | ModelVariant::Lfm25Audio15B4Bit
-                ) {
-                    has_base && has_detokenizer
-                } else {
-                    has_base && (has_detokenizer || has_mimi)
-                }
+                has_base && has_detokenizer
             }
             ModelFamily::KokoroTts => {
                 path.join("config.json").exists()
@@ -932,8 +919,7 @@ impl ModelDownloader {
                 "tokenizer.json".to_string(),
                 "tokenizer_config.json".to_string(),
                 "special_tokens_map.json".to_string(),
-                "tokenizer-e351c8d8-checkpoint125.safetensors".to_string(),
-                // Present on newer checkpoints such as LFM2.5; missing files are skipped.
+                // Required LFM2.5 audio detokenizer assets.
                 "audio_detokenizer/config.json".to_string(),
                 "audio_detokenizer/model.safetensors".to_string(),
                 "audio_detokenizer/tokenizer.json".to_string(),

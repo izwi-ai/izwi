@@ -5,7 +5,6 @@ mod config;
 mod conformer;
 mod depthformer;
 mod lfm_backbone;
-mod mimi_decoder;
 mod preprocessor;
 mod tokenizer;
 
@@ -19,10 +18,9 @@ use config::Lfm2AudioConfig;
 use conformer::ConformerEncoder;
 use depthformer::Depthformer;
 use lfm_backbone::{LfmBackbone, LfmCache};
-use mimi_decoder::MimiDecoder;
 use preprocessor::{resample_audio, Lfm2AudioPreprocessor};
 use tokenizer::{ChatState, Lfm2Tokenizer, LfmModality};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::error::{Error, Result};
 use crate::models::shared::device::DeviceProfile;
@@ -36,23 +34,8 @@ const TTS_UK_FEMALE_PROMPT: &str = "Perform TTS. Use the UK female voice.";
 
 const END_OF_AUDIO_TOKEN: u32 = 2048;
 const ASR_SYSTEM_PROMPT: &str = "Perform ASR.";
-const MIMI_TOKENIZER_CHECKPOINT: &str = "tokenizer-e351c8d8-checkpoint125.safetensors";
 const DETOKENIZER_CONFIG_FILE: &str = "audio_detokenizer/config.json";
 const DETOKENIZER_MODEL_FILE: &str = "audio_detokenizer/model.safetensors";
-
-enum WaveDecoder {
-    Mimi(MimiDecoder),
-    Lfm25Detokenizer(AudioDetokenizer),
-}
-
-impl WaveDecoder {
-    fn decode_tokens(&self, codebooks: &[Vec<u32>]) -> Result<Vec<f32>> {
-        match self {
-            Self::Mimi(decoder) => decoder.decode_tokens(codebooks),
-            Self::Lfm25Detokenizer(decoder) => decoder.decode_tokens(codebooks),
-        }
-    }
-}
 
 pub struct Lfm2AudioModel {
     model_dir: PathBuf,
@@ -64,7 +47,7 @@ pub struct Lfm2AudioModel {
     audio_adapter: AudioAdapter,
     lfm: LfmBackbone,
     depthformer: Depthformer,
-    wave_decoder: WaveDecoder,
+    wave_decoder: AudioDetokenizer,
 }
 
 pub struct SpeechToSpeechDecodeState {
@@ -220,40 +203,10 @@ impl Lfm2AudioModel {
         let audio_adapter = AudioAdapter::load(vb.pp("audio_adapter"))?;
         let lfm = LfmBackbone::load(cfg.lfm.clone(), vb.pp("lfm"))?;
         let depthformer = Depthformer::load(&cfg, vb.clone())?;
-        let has_detokenizer = model_dir.join("audio_detokenizer").exists();
-        let has_mimi = model_dir.join(MIMI_TOKENIZER_CHECKPOINT).exists();
-        let allow_mimi_fallback = env_flag_enabled("IZWI_LFM2_ALLOW_MIMI_FALLBACK") && has_mimi;
-
-        let wave_decoder = if has_detokenizer {
-            match AudioDetokenizer::load(model_dir, &device.device) {
-                Ok(detokenizer) => {
-                    info!("Using native LFM2.5 audio detokenizer");
-                    WaveDecoder::Lfm25Detokenizer(detokenizer)
-                }
-                Err(err) => {
-                    if allow_mimi_fallback {
-                        warn!(
-                            "Failed to load LFM2.5 audio detokenizer ({}); IZWI_LFM2_ALLOW_MIMI_FALLBACK=1 is set, falling back to Mimi",
-                            err
-                        );
-                        WaveDecoder::Mimi(MimiDecoder::load(model_dir, &device.device)?)
-                    } else {
-                        return Err(Error::ModelLoadError(format!(
-                            "Failed to load LFM2.5 audio detokenizer: {err}. \
-Set IZWI_LFM2_ALLOW_MIMI_FALLBACK=1 to force legacy Mimi fallback."
-                        )));
-                    }
-                }
-            }
-        } else if has_mimi {
-            info!("audio_detokenizer is unavailable, using legacy Mimi decoder");
-            WaveDecoder::Mimi(MimiDecoder::load(model_dir, &device.device)?)
-        } else {
-            return Err(Error::ModelLoadError(
-                "LFM2 model is missing both audio_detokenizer and Mimi tokenizer weights"
-                    .to_string(),
-            ));
-        };
+        let wave_decoder = AudioDetokenizer::load(model_dir, &device.device).map_err(|err| {
+            Error::ModelLoadError(format!("Failed to load LFM2.5 audio detokenizer: {err}"))
+        })?;
+        info!("Using native LFM2.5 audio detokenizer");
 
         info!("Loaded native LFM2 model from {:?}", model_dir);
 
@@ -1258,32 +1211,15 @@ fn validate_model_dir(model_dir: &Path) -> Result<()> {
 
     let detok_cfg = model_dir.join(DETOKENIZER_CONFIG_FILE);
     let detok_model = model_dir.join(DETOKENIZER_MODEL_FILE);
-    let has_detokenizer = detok_cfg.exists() && detok_model.exists();
-
-    let mimi = model_dir.join(MIMI_TOKENIZER_CHECKPOINT);
-    let has_mimi = mimi.exists();
-
-    if !has_detokenizer && !has_mimi {
+    if !detok_cfg.exists() || !detok_model.exists() {
         return Err(Error::ModelLoadError(format!(
-            "LFM2 model is missing audio decoder weights: expected either [{} + {}] or {}",
+            "LFM2 model is missing required LFM2.5 audio detokenizer files: expected [{} + {}]",
             detok_cfg.display(),
             detok_model.display(),
-            mimi.display()
         )));
     }
 
     Ok(())
-}
-
-fn env_flag_enabled(key: &str) -> bool {
-    std::env::var(key)
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
 }
 
 fn is_end_of_audio_frame(frame: &[u32]) -> bool {
