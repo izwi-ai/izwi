@@ -22,7 +22,7 @@ use lfm_backbone::{LfmBackbone, LfmCache};
 use mimi_decoder::MimiDecoder;
 use preprocessor::{resample_audio, Lfm2AudioPreprocessor};
 use tokenizer::{ChatState, Lfm2Tokenizer, LfmModality};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::error::{Error, Result};
 use crate::models::shared::device::DeviceProfile;
@@ -36,6 +36,9 @@ const TTS_UK_FEMALE_PROMPT: &str = "Perform TTS. Use the UK female voice.";
 
 const END_OF_AUDIO_TOKEN: u32 = 2048;
 const ASR_SYSTEM_PROMPT: &str = "Perform ASR.";
+const MIMI_TOKENIZER_CHECKPOINT: &str = "tokenizer-e351c8d8-checkpoint125.safetensors";
+const DETOKENIZER_CONFIG_FILE: &str = "audio_detokenizer/config.json";
+const DETOKENIZER_MODEL_FILE: &str = "audio_detokenizer/model.safetensors";
 
 enum WaveDecoder {
     Mimi(MimiDecoder),
@@ -114,6 +117,13 @@ pub struct SpeechToSpeechDecodeStep {
     pub audio_frame: Option<Vec<u32>>,
     pub tokens_generated: usize,
     pub finished: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Lfm2TtsReference<'a> {
+    pub audio: &'a [f32],
+    pub sample_rate: u32,
+    pub text: &'a str,
 }
 
 struct AudioAdapter {
@@ -210,22 +220,39 @@ impl Lfm2AudioModel {
         let audio_adapter = AudioAdapter::load(vb.pp("audio_adapter"))?;
         let lfm = LfmBackbone::load(cfg.lfm.clone(), vb.pp("lfm"))?;
         let depthformer = Depthformer::load(&cfg, vb.clone())?;
-        let wave_decoder = if model_dir.join("audio_detokenizer").exists() {
+        let has_detokenizer = model_dir.join("audio_detokenizer").exists();
+        let has_mimi = model_dir.join(MIMI_TOKENIZER_CHECKPOINT).exists();
+        let allow_mimi_fallback = env_flag_enabled("IZWI_LFM2_ALLOW_MIMI_FALLBACK") && has_mimi;
+
+        let wave_decoder = if has_detokenizer {
             match AudioDetokenizer::load(model_dir, &device.device) {
                 Ok(detokenizer) => {
                     info!("Using native LFM2.5 audio detokenizer");
                     WaveDecoder::Lfm25Detokenizer(detokenizer)
                 }
                 Err(err) => {
-                    info!(
-                        "Failed to load LFM2.5 audio detokenizer ({}), falling back to Mimi",
-                        err
-                    );
-                    WaveDecoder::Mimi(MimiDecoder::load(model_dir, &device.device)?)
+                    if allow_mimi_fallback {
+                        warn!(
+                            "Failed to load LFM2.5 audio detokenizer ({}); IZWI_LFM2_ALLOW_MIMI_FALLBACK=1 is set, falling back to Mimi",
+                            err
+                        );
+                        WaveDecoder::Mimi(MimiDecoder::load(model_dir, &device.device)?)
+                    } else {
+                        return Err(Error::ModelLoadError(format!(
+                            "Failed to load LFM2.5 audio detokenizer: {err}. \
+Set IZWI_LFM2_ALLOW_MIMI_FALLBACK=1 to force legacy Mimi fallback."
+                        )));
+                    }
                 }
             }
-        } else {
+        } else if has_mimi {
+            info!("audio_detokenizer is unavailable, using legacy Mimi decoder");
             WaveDecoder::Mimi(MimiDecoder::load(model_dir, &device.device)?)
+        } else {
+            return Err(Error::ModelLoadError(
+                "LFM2 model is missing both audio_detokenizer and Mimi tokenizer weights"
+                    .to_string(),
+            ));
         };
 
         info!("Loaded native LFM2 model from {:?}", model_dir);
@@ -261,7 +288,7 @@ impl Lfm2AudioModel {
         &self,
         audio: &[f32],
         sample_rate: u32,
-        _language: Option<&str>,
+        language: Option<&str>,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<String> {
         let mel = self.prepare_audio_mel(audio, sample_rate)?;
@@ -272,7 +299,8 @@ impl Lfm2AudioModel {
             self.preprocessor.features(),
         );
         state.new_turn(&self.tokenizer, "system")?;
-        state.add_text(&self.tokenizer, ASR_SYSTEM_PROMPT)?;
+        let asr_prompt = asr_system_prompt(language);
+        state.add_text(&self.tokenizer, asr_prompt.as_str())?;
         state.end_turn(&self.tokenizer)?;
 
         state.new_turn(&self.tokenizer, "user")?;
@@ -320,20 +348,28 @@ impl Lfm2AudioModel {
         max_new_tokens: usize,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<Vec<f32>> {
-        let mut state = ChatState::new(
-            &self.tokenizer,
-            self.cfg.codebooks,
-            self.preprocessor.features(),
-        );
-        state.new_turn(&self.tokenizer, "system")?;
-        state.add_text(&self.tokenizer, speaker_prompt)?;
-        state.end_turn(&self.tokenizer)?;
+        self.synthesize_with_callback_with_reference(
+            text,
+            speaker_prompt,
+            None,
+            temperature,
+            top_k,
+            max_new_tokens,
+            on_delta,
+        )
+    }
 
-        state.new_turn(&self.tokenizer, "user")?;
-        state.add_text(&self.tokenizer, text)?;
-        state.end_turn(&self.tokenizer)?;
-
-        state.new_turn(&self.tokenizer, "assistant")?;
+    pub fn synthesize_with_callback_with_reference(
+        &self,
+        text: &str,
+        speaker_prompt: &str,
+        reference: Option<Lfm2TtsReference<'_>>,
+        temperature: Option<f32>,
+        top_k: Option<usize>,
+        max_new_tokens: usize,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<Vec<f32>> {
+        let state = self.build_tts_chat_state(text, speaker_prompt, reference)?;
 
         let mut text_tokens = Vec::new();
         let mut assembled = String::new();
@@ -384,20 +420,26 @@ impl Lfm2AudioModel {
         top_k: Option<usize>,
         max_new_tokens: usize,
     ) -> Result<TtsDecodeState> {
-        let mut state = ChatState::new(
-            &self.tokenizer,
-            self.cfg.codebooks,
-            self.preprocessor.features(),
-        );
-        state.new_turn(&self.tokenizer, "system")?;
-        state.add_text(&self.tokenizer, speaker_prompt)?;
-        state.end_turn(&self.tokenizer)?;
+        self.start_tts_decode_with_reference(
+            text,
+            speaker_prompt,
+            None,
+            temperature,
+            top_k,
+            max_new_tokens,
+        )
+    }
 
-        state.new_turn(&self.tokenizer, "user")?;
-        state.add_text(&self.tokenizer, text)?;
-        state.end_turn(&self.tokenizer)?;
-
-        state.new_turn(&self.tokenizer, "assistant")?;
+    pub fn start_tts_decode_with_reference(
+        &self,
+        text: &str,
+        speaker_prompt: &str,
+        reference: Option<Lfm2TtsReference<'_>>,
+        temperature: Option<f32>,
+        top_k: Option<usize>,
+        max_new_tokens: usize,
+    ) -> Result<TtsDecodeState> {
+        let state = self.build_tts_chat_state(text, speaker_prompt, reference)?;
 
         Ok(TtsDecodeState {
             cache: LfmCache::new(self.lfm.config()),
@@ -518,6 +560,7 @@ impl Lfm2AudioModel {
         &self,
         audio: &[f32],
         sample_rate: u32,
+        language: Option<&str>,
         system_prompt: Option<&str>,
         temperature: Option<f32>,
         top_k: Option<usize>,
@@ -532,10 +575,8 @@ impl Lfm2AudioModel {
             self.preprocessor.features(),
         );
         state.new_turn(&self.tokenizer, "system")?;
-        state.add_text(
-            &self.tokenizer,
-            system_prompt.unwrap_or(LFM2_DEFAULT_S2S_PROMPT),
-        )?;
+        let s2s_prompt = s2s_system_prompt(system_prompt, language);
+        state.add_text(&self.tokenizer, s2s_prompt.as_str())?;
         state.end_turn(&self.tokenizer)?;
 
         state.new_turn(&self.tokenizer, "user")?;
@@ -588,6 +629,7 @@ impl Lfm2AudioModel {
         &self,
         audio: &[f32],
         sample_rate: u32,
+        language: Option<&str>,
         system_prompt: Option<&str>,
         audio_temperature: Option<f32>,
         audio_top_k: Option<usize>,
@@ -601,10 +643,8 @@ impl Lfm2AudioModel {
             self.preprocessor.features(),
         );
         state.new_turn(&self.tokenizer, "system")?;
-        state.add_text(
-            &self.tokenizer,
-            system_prompt.unwrap_or(LFM2_DEFAULT_S2S_PROMPT),
-        )?;
+        let s2s_prompt = s2s_system_prompt(system_prompt, language);
+        state.add_text(&self.tokenizer, s2s_prompt.as_str())?;
         state.end_turn(&self.tokenizer)?;
 
         state.new_turn(&self.tokenizer, "user")?;
@@ -803,6 +843,56 @@ impl Lfm2AudioModel {
         let (mel, frames) = self.preprocessor.compute_features(&mono)?;
         let mel = mel.squeeze(0)?.flatten_all()?.to_vec1::<f32>()?;
         Ok((mel, frames))
+    }
+
+    fn build_tts_chat_state(
+        &self,
+        text: &str,
+        speaker_prompt: &str,
+        reference: Option<Lfm2TtsReference<'_>>,
+    ) -> Result<ChatState> {
+        let mut state = ChatState::new(
+            &self.tokenizer,
+            self.cfg.codebooks,
+            self.preprocessor.features(),
+        );
+        state.new_turn(&self.tokenizer, "system")?;
+        state.add_text(&self.tokenizer, speaker_prompt)?;
+        if reference.is_some() {
+            state.add_text(
+                &self.tokenizer,
+                " Match the speaker characteristics in the reference input.",
+            )?;
+        }
+        state.end_turn(&self.tokenizer)?;
+
+        if let Some(reference) = reference {
+            let reference_text = reference.text.trim();
+            if reference_text.is_empty() {
+                return Err(Error::InvalidInput(
+                    "reference_text cannot be empty".to_string(),
+                ));
+            }
+            if reference.sample_rate == 0 {
+                return Err(Error::InvalidInput(
+                    "reference_audio sample rate must be > 0".to_string(),
+                ));
+            }
+
+            let (reference_mel, reference_frames) =
+                self.prepare_audio_mel(reference.audio, reference.sample_rate)?;
+            state.new_turn(&self.tokenizer, "user")?;
+            state.add_text(&self.tokenizer, reference_text)?;
+            state.add_audio_mel(&reference_mel, reference_frames);
+            state.end_turn(&self.tokenizer)?;
+        }
+
+        state.new_turn(&self.tokenizer, "user")?;
+        state.add_text(&self.tokenizer, text)?;
+        state.end_turn(&self.tokenizer)?;
+
+        state.new_turn(&self.tokenizer, "assistant")?;
+        Ok(state)
     }
 
     fn build_prefill_embeddings(&self, state: &ChatState) -> Result<Tensor> {
@@ -1126,13 +1216,36 @@ pub fn lfm2_tts_voice_prompt(speaker: Option<&str>) -> &'static str {
     TTS_US_FEMALE_PROMPT
 }
 
+fn normalize_language(language: Option<&str>) -> Option<String> {
+    language
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn asr_system_prompt(language: Option<&str>) -> String {
+    if let Some(language) = normalize_language(language) {
+        format!("{ASR_SYSTEM_PROMPT} Transcribe in {language}.")
+    } else {
+        ASR_SYSTEM_PROMPT.to_string()
+    }
+}
+
+fn s2s_system_prompt(system_prompt: Option<&str>, language: Option<&str>) -> String {
+    let base = system_prompt.unwrap_or(LFM2_DEFAULT_S2S_PROMPT).trim();
+    if let Some(language) = normalize_language(language) {
+        if base.is_empty() {
+            format!("Respond in {language}.")
+        } else {
+            format!("{base} Respond in {language}.")
+        }
+    } else {
+        base.to_string()
+    }
+}
+
 fn validate_model_dir(model_dir: &Path) -> Result<()> {
-    let required_files = [
-        "config.json",
-        "model.safetensors",
-        "tokenizer.json",
-        "tokenizer-e351c8d8-checkpoint125.safetensors",
-    ];
+    let required_files = ["config.json", "model.safetensors", "tokenizer.json"];
     for file in &required_files {
         let path = model_dir.join(file);
         if !path.exists() {
@@ -1143,7 +1256,34 @@ fn validate_model_dir(model_dir: &Path) -> Result<()> {
         }
     }
 
+    let detok_cfg = model_dir.join(DETOKENIZER_CONFIG_FILE);
+    let detok_model = model_dir.join(DETOKENIZER_MODEL_FILE);
+    let has_detokenizer = detok_cfg.exists() && detok_model.exists();
+
+    let mimi = model_dir.join(MIMI_TOKENIZER_CHECKPOINT);
+    let has_mimi = mimi.exists();
+
+    if !has_detokenizer && !has_mimi {
+        return Err(Error::ModelLoadError(format!(
+            "LFM2 model is missing audio decoder weights: expected either [{} + {}] or {}",
+            detok_cfg.display(),
+            detok_model.display(),
+            mimi.display()
+        )));
+    }
+
     Ok(())
+}
+
+fn env_flag_enabled(key: &str) -> bool {
+    std::env::var(key)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn is_end_of_audio_frame(frame: &[u32]) -> bool {
@@ -1302,6 +1442,11 @@ impl SimpleRng {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn maps_known_speakers_to_expected_prompts() {
@@ -1309,6 +1454,18 @@ mod tests {
         assert_eq!(lfm2_tts_voice_prompt(Some("Serena")), TTS_US_FEMALE_PROMPT);
         assert_eq!(lfm2_tts_voice_prompt(Some("Dylan")), TTS_UK_MALE_PROMPT);
         assert_eq!(lfm2_tts_voice_prompt(Some("Vivian")), TTS_UK_FEMALE_PROMPT);
+    }
+
+    #[test]
+    fn asr_prompt_includes_language_hint_when_provided() {
+        let prompt = asr_system_prompt(Some("fr"));
+        assert_eq!(prompt, "Perform ASR. Transcribe in fr.");
+    }
+
+    #[test]
+    fn s2s_prompt_appends_language_hint() {
+        let prompt = s2s_system_prompt(Some("Respond helpfully."), Some("es"));
+        assert_eq!(prompt, "Respond helpfully. Respond in es.");
     }
 
     #[test]
@@ -1331,5 +1488,54 @@ mod tests {
         assert_eq!(codebooks[0], vec![10, 11]);
         assert_eq!(codebooks[1], vec![20, 21]);
         assert_eq!(codebooks[2], vec![30, END_OF_AUDIO_TOKEN]);
+    }
+
+    #[test]
+    fn validate_model_dir_accepts_detokenizer_without_mimi() {
+        let dir = make_temp_dir("lfm2_detok_only");
+        write_empty_file(dir.join("config.json"));
+        write_empty_file(dir.join("model.safetensors"));
+        write_empty_file(dir.join("tokenizer.json"));
+        write_empty_file(dir.join("audio_detokenizer/config.json"));
+        write_empty_file(dir.join("audio_detokenizer/model.safetensors"));
+
+        let result = validate_model_dir(&dir);
+        cleanup_temp_dir(&dir);
+
+        assert!(
+            result.is_ok(),
+            "expected detokenizer-only model dir to be valid"
+        );
+    }
+
+    #[test]
+    fn validate_model_dir_rejects_missing_audio_decoder_assets() {
+        let dir = make_temp_dir("lfm2_missing_decoder");
+        write_empty_file(dir.join("config.json"));
+        write_empty_file(dir.join("model.safetensors"));
+        write_empty_file(dir.join("tokenizer.json"));
+
+        let result = validate_model_dir(&dir);
+        cleanup_temp_dir(&dir);
+
+        assert!(result.is_err(), "expected missing decoder assets to fail");
+    }
+
+    fn make_temp_dir(prefix: &str) -> PathBuf {
+        let unique = TEST_DIR_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+        let path = std::env::temp_dir().join(format!("{prefix}_{}_{}", std::process::id(), unique));
+        fs::create_dir_all(&path).expect("create temp test dir");
+        path
+    }
+
+    fn write_empty_file(path: PathBuf) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create parent dir");
+        }
+        fs::write(path, []).expect("write test file");
+    }
+
+    fn cleanup_temp_dir(path: &PathBuf) {
+        let _ = fs::remove_dir_all(path);
     }
 }

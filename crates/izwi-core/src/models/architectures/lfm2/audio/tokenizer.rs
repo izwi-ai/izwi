@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::Path;
 
 use tokenizers::Tokenizer;
@@ -24,6 +25,7 @@ pub struct SpecialTokens {
 pub struct Lfm2Tokenizer {
     inner: Tokenizer,
     specials: SpecialTokens,
+    turn_format: ChatTurnFormat,
 }
 
 impl Lfm2Tokenizer {
@@ -46,7 +48,20 @@ impl Lfm2Tokenizer {
             text_end: lookup("<|text_end|>")?,
         };
 
-        Ok(Self { inner, specials })
+        let template_path = model_dir.join("chat_template.jinja");
+        let template = fs::read_to_string(&template_path).map_err(|e| {
+            Error::ModelLoadError(format!(
+                "Failed to read LFM2 chat template {}: {e}",
+                template_path.display()
+            ))
+        })?;
+        let turn_format = ChatTurnFormat::from_chat_template(&template)?;
+
+        Ok(Self {
+            inner,
+            specials,
+            turn_format,
+        })
     }
 
     pub fn specials(&self) -> &SpecialTokens {
@@ -65,6 +80,93 @@ impl Lfm2Tokenizer {
         self.inner
             .decode(ids, true)
             .map_err(|e| Error::InferenceError(format!("LFM2 tokenizer decode error: {e}")))
+    }
+
+    pub fn render_turn_start(&self, role: &str) -> String {
+        self.turn_format.render_turn_start(role)
+    }
+
+    pub fn turn_end(&self) -> &str {
+        self.turn_format.turn_end()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ChatTurnFormat {
+    turn_start_prefix: String,
+    turn_start_suffix: String,
+    turn_end: String,
+}
+
+impl ChatTurnFormat {
+    fn from_chat_template(template: &str) -> Result<Self> {
+        if !template.contains("<|im_start|>") {
+            return Err(Error::ModelLoadError(
+                "LFM2 chat template is missing <|im_start|>".to_string(),
+            ));
+        }
+        if !template.contains("<|im_end|>") {
+            return Err(Error::ModelLoadError(
+                "LFM2 chat template is missing <|im_end|>".to_string(),
+            ));
+        }
+
+        let turn_start_suffix = Self::suffix_after_any(
+            template,
+            &[
+                "<|im_start|>\" + message[\"role\"] + \"",
+                "<|im_start|>\" + message['role'] + \"",
+                "<|im_start|>' + message[\"role\"] + '",
+                "<|im_start|>' + message['role'] + '",
+                "<|im_start|>assistant",
+            ],
+        )
+        .unwrap_or_else(|| "\n".to_string());
+
+        let turn_end_suffix = Self::suffix_after_any(
+            template,
+            &[
+                "content + \"<|im_end|>",
+                "content + '<|im_end|>",
+                "<|im_end|>",
+            ],
+        )
+        .unwrap_or_else(|| "\n".to_string());
+
+        Ok(Self {
+            turn_start_prefix: "<|im_start|>".to_string(),
+            turn_start_suffix,
+            turn_end: format!("<|im_end|>{turn_end_suffix}"),
+        })
+    }
+
+    fn suffix_after_any(template: &str, markers: &[&str]) -> Option<String> {
+        markers
+            .iter()
+            .find_map(|marker| template.find(marker).map(|start| (marker, start)))
+            .map(|(marker, start)| {
+                let rest = &template[start + marker.len()..];
+                if rest.starts_with("\\r\\n") {
+                    "\r\n".to_string()
+                } else if rest.starts_with("\\n") || rest.starts_with('\n') {
+                    "\n".to_string()
+                } else if rest.starts_with("\\r") || rest.starts_with('\r') {
+                    "\r".to_string()
+                } else {
+                    String::new()
+                }
+            })
+    }
+
+    fn render_turn_start(&self, role: &str) -> String {
+        format!(
+            "{}{}{}",
+            self.turn_start_prefix, role, self.turn_start_suffix
+        )
+    }
+
+    fn turn_end(&self) -> &str {
+        self.turn_end.as_str()
     }
 }
 
@@ -112,11 +214,12 @@ impl ChatState {
     }
 
     pub fn end_turn(&mut self, tok: &Lfm2Tokenizer) -> Result<()> {
-        self.add_text(tok, "<|im_end|>\n")
+        self.add_text(tok, tok.turn_end())
     }
 
     pub fn new_turn(&mut self, tok: &Lfm2Tokenizer, role: &str) -> Result<()> {
-        self.add_text(tok, format!("<|im_start|>{role}\n").as_str())
+        let turn = tok.render_turn_start(role);
+        self.add_text(tok, &turn)
     }
 
     pub fn to_text_tensor(&self) -> Vec<u32> {
@@ -134,4 +237,28 @@ impl ChatState {
 
 pub fn mel_to_embed_len(frames: usize) -> usize {
     frames.div_ceil(8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChatTurnFormat;
+
+    #[test]
+    fn parses_turn_wrappers_from_chat_template() {
+        let template = "{{- \"<|im_start|>\" + message[\"role\"] + \"\\n\" -}} {{- content + \"<|im_end|>\\n\" -}}";
+        let fmt = ChatTurnFormat::from_chat_template(template).expect("parse chat template");
+        assert_eq!(
+            fmt.render_turn_start("assistant"),
+            "<|im_start|>assistant\n"
+        );
+        assert_eq!(fmt.turn_end(), "<|im_end|>\n");
+    }
+
+    #[test]
+    fn rejects_template_missing_required_markers() {
+        let err = ChatTurnFormat::from_chat_template("{{- message['content'] -}}")
+            .expect_err("missing im markers should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("<|im_start|>") || msg.contains("<|im_end|>"));
+    }
 }

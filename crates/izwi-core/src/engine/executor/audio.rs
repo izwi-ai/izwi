@@ -9,6 +9,11 @@ use super::super::output::StreamingOutput;
 use super::NativeExecutor;
 
 impl NativeExecutor {
+    // LFM2/LFM2.5 detokenizers rely on overlap-add reconstruction; the newest
+    // tail can shift when subsequent frames arrive. Hold back one overlap
+    // region to avoid streaming seam artifacts.
+    pub(super) const LFM2_STREAM_TAIL_HOLDBACK_SAMPLES: usize = 960;
+
     pub(super) fn env_f32(key: &str) -> Option<f32> {
         std::env::var(key)
             .ok()
@@ -97,6 +102,23 @@ impl NativeExecutor {
         *emitted_samples = all_samples.len();
         delta
     }
+
+    pub(super) fn next_audio_delta_stable(
+        all_samples: &[f32],
+        emitted_samples: &mut usize,
+        holdback_samples: usize,
+        is_final: bool,
+    ) -> Vec<f32> {
+        let stable_end = if is_final {
+            all_samples.len()
+        } else {
+            all_samples.len().saturating_sub(holdback_samples)
+        };
+        let start = (*emitted_samples).min(stable_end);
+        let delta = all_samples[start..stable_end].to_vec();
+        *emitted_samples = stable_end;
+        delta
+    }
 }
 
 pub(super) fn decode_audio_base64_with_rate(audio_b64: &str) -> Result<(Vec<f32>, u32)> {
@@ -129,5 +151,27 @@ mod tests {
         let delta = NativeExecutor::next_audio_delta(&all, &mut emitted);
         assert!(delta.is_empty());
         assert_eq!(emitted, 2);
+    }
+
+    #[test]
+    fn next_audio_delta_stable_holds_back_tail_until_final() {
+        let mut emitted = 0usize;
+        let all = vec![0.1f32, 0.2, 0.3, 0.4, 0.5];
+        let delta = NativeExecutor::next_audio_delta_stable(&all, &mut emitted, 2, false);
+        assert_eq!(delta, vec![0.1, 0.2, 0.3]);
+        assert_eq!(emitted, 3);
+
+        let delta_final = NativeExecutor::next_audio_delta_stable(&all, &mut emitted, 2, true);
+        assert_eq!(delta_final, vec![0.4, 0.5]);
+        assert_eq!(emitted, 5);
+    }
+
+    #[test]
+    fn next_audio_delta_stable_emits_nothing_when_window_is_unstable() {
+        let mut emitted = 0usize;
+        let all = vec![0.1f32, 0.2, 0.3];
+        let delta = NativeExecutor::next_audio_delta_stable(&all, &mut emitted, 8, false);
+        assert!(delta.is_empty());
+        assert_eq!(emitted, 0);
     }
 }

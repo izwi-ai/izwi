@@ -431,11 +431,25 @@ impl ModelDownloader {
 
         match variant.family() {
             ModelFamily::Lfm2Audio => {
-                // LFM2-Audio safetensors checkpoints require model.safetensors, config.json,
-                // and tokenizer files.
-                path.join("model.safetensors").exists()
+                let has_base = path.join("model.safetensors").exists()
                     && path.join("config.json").exists()
-                    && path.join("tokenizer.json").exists()
+                    && path.join("tokenizer.json").exists();
+                let has_detokenizer = path.join("audio_detokenizer/config.json").exists()
+                    && path.join("audio_detokenizer/model.safetensors").exists();
+                let has_mimi = path
+                    .join("tokenizer-e351c8d8-checkpoint125.safetensors")
+                    .exists();
+
+                // LFM2.5 quality depends on the new LFM detokenizer path. Keep legacy Mimi
+                // support for backward compatibility if a checkpoint provides it.
+                if matches!(
+                    variant,
+                    ModelVariant::Lfm25Audio15B | ModelVariant::Lfm25Audio15B4Bit
+                ) {
+                    has_base && has_detokenizer
+                } else {
+                    has_base && (has_detokenizer || has_mimi)
+                }
             }
             ModelFamily::KokoroTts => {
                 path.join("config.json").exists()
@@ -914,15 +928,14 @@ impl ModelDownloader {
             ModelFamily::Lfm2Audio => vec![
                 "config.json".to_string(),
                 "model.safetensors".to_string(),
+                "model.safetensors.index.json".to_string(),
                 "tokenizer.json".to_string(),
                 "tokenizer_config.json".to_string(),
                 "special_tokens_map.json".to_string(),
                 "tokenizer-e351c8d8-checkpoint125.safetensors".to_string(),
-                "chat_template.jinja".to_string(),
                 // Present on newer checkpoints such as LFM2.5; missing files are skipped.
                 "audio_detokenizer/config.json".to_string(),
                 "audio_detokenizer/model.safetensors".to_string(),
-                "audio_detokenizer/special_tokens_map.json".to_string(),
                 "audio_detokenizer/tokenizer.json".to_string(),
                 "audio_detokenizer/tokenizer_config.json".to_string(),
             ],

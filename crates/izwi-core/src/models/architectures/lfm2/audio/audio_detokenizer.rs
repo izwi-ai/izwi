@@ -283,22 +283,68 @@ impl AudioDetokenizer {
         }
 
         let pad = (self.n_fft.saturating_sub(self.hop_length)) / 2;
-        let trimmed = if output.len() > 2 * pad {
+        let mut trimmed = if output.len() > 2 * pad {
             output[pad..output.len() - pad].to_vec()
         } else {
             output
         };
+        normalize_detokenized_audio(&mut trimmed);
 
-        Ok(trimmed
-            .into_iter()
-            .map(|s| {
-                if s.is_finite() {
-                    s.clamp(-1.0, 1.0)
-                } else {
-                    0.0
-                }
-            })
-            .collect())
+        Ok(trimmed)
+    }
+}
+
+fn normalize_detokenized_audio(samples: &mut [f32]) {
+    if samples.is_empty() {
+        return;
+    }
+
+    let mut sum = 0.0f64;
+    let mut finite_count = 0usize;
+    for sample in samples.iter_mut() {
+        if !sample.is_finite() {
+            *sample = 0.0;
+            continue;
+        }
+        sum += *sample as f64;
+        finite_count += 1;
+    }
+    if finite_count > 0 {
+        let mean = (sum / finite_count as f64) as f32;
+        for sample in samples.iter_mut() {
+            *sample -= mean;
+        }
+    }
+
+    let mut peak = 0.0f32;
+    for &sample in samples.iter() {
+        peak = peak.max(sample.abs());
+    }
+    if peak > 0.95 {
+        let scale = 0.95 / peak;
+        for sample in samples.iter_mut() {
+            *sample *= scale;
+        }
+    }
+
+    let power = samples
+        .iter()
+        .map(|&sample| {
+            let sample = sample as f64;
+            sample * sample
+        })
+        .sum::<f64>();
+    let rms = (power / samples.len() as f64).sqrt() as f32;
+    let max_rms = 0.25f32;
+    if rms > max_rms {
+        let scale = max_rms / rms;
+        for sample in samples.iter_mut() {
+            *sample *= scale;
+        }
+    }
+
+    for sample in samples.iter_mut() {
+        *sample = sample.clamp(-1.0, 1.0);
     }
 }
 
@@ -341,7 +387,7 @@ fn upsample_nearest_time(x: &Tensor, factor: usize) -> Result<Tensor> {
 
 #[cfg(test)]
 mod tests {
-    use super::upsample_nearest_time;
+    use super::{normalize_detokenized_audio, upsample_nearest_time};
     use candle_core::{Device, Tensor};
 
     #[test]
@@ -362,5 +408,37 @@ mod tests {
                 vec![3.0, 4.0],
             ]]
         );
+    }
+
+    #[test]
+    fn normalize_detokenized_audio_sanitizes_invalid_and_hot_samples() {
+        let mut samples = vec![
+            f32::NAN,
+            f32::INFINITY,
+            -f32::INFINITY,
+            3.5,
+            -2.75,
+            0.2,
+            -0.2,
+        ];
+        normalize_detokenized_audio(&mut samples);
+
+        assert!(samples.iter().all(|s| s.is_finite()));
+
+        let peak = samples
+            .iter()
+            .fold(0.0f32, |acc, sample| acc.max(sample.abs()));
+        assert!(peak <= 0.95 + 1e-6);
+    }
+
+    #[test]
+    fn normalize_detokenized_audio_preserves_reasonable_levels() {
+        let mut samples = vec![0.05f32, -0.08, 0.11, -0.07, 0.03];
+        let before = samples.clone();
+        normalize_detokenized_audio(&mut samples);
+
+        for (lhs, rhs) in samples.iter().zip(before.iter()) {
+            assert!((*lhs - *rhs).abs() < 0.2);
+        }
     }
 }

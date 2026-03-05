@@ -33,12 +33,6 @@ impl RuntimeService {
         request: &GenerationRequest,
         variant: ModelVariant,
     ) -> Result<EngineCoreRequest> {
-        if request.reference_audio.is_some() || request.reference_text.is_some() {
-            return Err(Error::InvalidInput(
-                "LFM2 native runtime does not support reference-audio voice cloning".to_string(),
-            ));
-        }
-
         let opts = &request.config.options;
         let using_generic_defaults =
             opts.top_k == 0 && (opts.temperature - 0.7).abs() < f32::EPSILON;
@@ -59,6 +53,8 @@ impl RuntimeService {
         core_request.model_variant = Some(variant);
         core_request.language = request.language.clone();
         core_request.voice_description = request.voice_description.clone();
+        core_request.reference_audio = request.reference_audio.clone();
+        core_request.reference_text = request.reference_text.clone();
         core_request.params = CoreGenParams {
             temperature,
             top_p: opts.top_p,

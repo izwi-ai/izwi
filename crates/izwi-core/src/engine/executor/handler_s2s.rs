@@ -18,6 +18,7 @@ impl NativeExecutor {
             .system_prompt
             .as_deref()
             .unwrap_or(LFM2_DEFAULT_S2S_PROMPT);
+        let language = request.language.as_deref();
         let resolved_temperature = request.params.audio_temperature.unwrap_or(1.0);
         let resolved_top_k = request.params.audio_top_k.unwrap_or_else(|| {
             if request.params.top_k > 0 {
@@ -64,6 +65,7 @@ impl NativeExecutor {
                     model.start_speech_to_speech_decode(
                         &samples,
                         sample_rate,
+                        language,
                         Some(system_prompt),
                         Some(resolved_temperature),
                         Some(resolved_top_k),
@@ -121,8 +123,12 @@ impl NativeExecutor {
                     let all_samples = Self::run_blocking(|| {
                         model.decode_audio_frames(&active_state.audio_frames_accum)
                     })?;
-                    let chunk_samples =
-                        Self::next_audio_delta(&all_samples, &mut active_state.emitted_samples);
+                    let chunk_samples = Self::next_audio_delta_stable(
+                        &all_samples,
+                        &mut active_state.emitted_samples,
+                        Self::LFM2_STREAM_TAIL_HOLDBACK_SAMPLES,
+                        step.finished,
+                    );
                     active_state.audio_samples_accum = all_samples;
                     if !chunk_samples.is_empty() {
                         Self::stream_audio(
@@ -137,6 +143,28 @@ impl NativeExecutor {
                 }
 
                 if step.finished {
+                    if !active_state.audio_frames_accum.is_empty() {
+                        let all_samples = Self::run_blocking(|| {
+                            model.decode_audio_frames(&active_state.audio_frames_accum)
+                        })?;
+                        let final_tail = Self::next_audio_delta_stable(
+                            &all_samples,
+                            &mut active_state.emitted_samples,
+                            Self::LFM2_STREAM_TAIL_HOLDBACK_SAMPLES,
+                            true,
+                        );
+                        active_state.audio_samples_accum = all_samples;
+                        if !final_tail.is_empty() {
+                            Self::stream_audio(
+                                tx,
+                                &request.id,
+                                &mut active_state.stream_sequence,
+                                final_tail,
+                                24_000,
+                                false,
+                            )?;
+                        }
+                    }
                     Self::stream_final_marker(tx, &request.id, &mut active_state.stream_sequence)?;
                     finished = true;
                     break;
@@ -193,6 +221,7 @@ impl NativeExecutor {
             model.speech_to_speech_with_callback(
                 &samples,
                 sample_rate,
+                language,
                 Some(system_prompt),
                 Some(resolved_temperature),
                 Some(resolved_top_k),

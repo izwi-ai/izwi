@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::models::architectures::lfm2::audio::lfm2_tts_voice_prompt;
+use crate::models::architectures::lfm2::audio::{lfm2_tts_voice_prompt, Lfm2TtsReference};
 use crate::models::architectures::qwen3::tts::{
     SpeakerReference, TtsGenerationParams, TtsStreamingConfig,
 };
@@ -250,11 +250,6 @@ impl NativeExecutor {
             .text
             .as_deref()
             .ok_or_else(|| Error::InvalidInput("LFM2 TTS request missing text".to_string()))?;
-        if request.reference_audio.is_some() || request.reference_text.is_some() {
-            return Err(Error::InvalidInput(
-                "LFM2 does not support reference-audio voice cloning".to_string(),
-            ));
-        }
 
         let speaker = request
             .params
@@ -305,10 +300,17 @@ impl NativeExecutor {
         let mut active_state = if let Some(state) = active_state {
             state
         } else {
+            let reference = Self::reference_from_request(request)?;
+            let reference = reference.as_ref().map(|reference| Lfm2TtsReference {
+                audio: reference.audio_samples.as_slice(),
+                sample_rate: reference.sample_rate,
+                text: reference.text.as_str(),
+            });
             let decode_state = Self::run_blocking(|| {
-                model.start_tts_decode(
+                model.start_tts_decode_with_reference(
                     text,
                     &voice_instruction,
+                    reference,
                     Some(temperature),
                     Some(top_k),
                     max_new_tokens,
@@ -363,8 +365,12 @@ impl NativeExecutor {
                     let all_samples = Self::run_blocking(|| {
                         model.decode_audio_frames(&active_state.audio_frames_accum)
                     })?;
-                    let chunk_samples =
-                        Self::next_audio_delta(&all_samples, &mut active_state.emitted_samples);
+                    let chunk_samples = Self::next_audio_delta_stable(
+                        &all_samples,
+                        &mut active_state.emitted_samples,
+                        Self::LFM2_STREAM_TAIL_HOLDBACK_SAMPLES,
+                        step.finished,
+                    );
                     if !chunk_samples.is_empty() {
                         Self::stream_audio(
                             tx,
@@ -380,6 +386,27 @@ impl NativeExecutor {
 
             if step.finished {
                 if let Some(tx) = stream_tx.as_ref() {
+                    if !active_state.audio_frames_accum.is_empty() {
+                        let all_samples = Self::run_blocking(|| {
+                            model.decode_audio_frames(&active_state.audio_frames_accum)
+                        })?;
+                        let final_tail = Self::next_audio_delta_stable(
+                            &all_samples,
+                            &mut active_state.emitted_samples,
+                            Self::LFM2_STREAM_TAIL_HOLDBACK_SAMPLES,
+                            true,
+                        );
+                        if !final_tail.is_empty() {
+                            Self::stream_audio(
+                                tx,
+                                &request.id,
+                                &mut active_state.stream_sequence,
+                                final_tail,
+                                24_000,
+                                false,
+                            )?;
+                        }
+                    }
                     Self::stream_final_marker(tx, &request.id, &mut active_state.stream_sequence)?;
                 }
                 finished = true;
