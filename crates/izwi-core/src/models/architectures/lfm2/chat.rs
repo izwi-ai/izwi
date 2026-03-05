@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -12,6 +11,7 @@ use candle_transformers::models::quantized_lfm2::ModelWeights as QuantizedLfm2Mo
 use serde::Deserialize;
 use tracing::info;
 
+use crate::backends::{open_gguf_reader, BackendKind};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
@@ -142,7 +142,14 @@ impl Lfm2ChatModel {
         }
 
         let tokenizer = ChatTokenizer::load(model_dir)?;
-        let mut reader = BufReader::new(fs::File::open(&gguf_path)?);
+        let backend = if device.kind.is_metal() {
+            BackendKind::Metal
+        } else if device.kind.is_cuda() {
+            BackendKind::Cuda
+        } else {
+            BackendKind::Cpu
+        };
+        let mut reader = open_gguf_reader(&gguf_path, backend)?;
         let content = gguf_file::Content::read(&mut reader)
             .map_err(|e| Error::ModelLoadError(format!("Failed to parse GGUF header: {e}")))?;
         let text_model = QuantizedLfm2Model::from_gguf(content, &mut reader, &device.device)

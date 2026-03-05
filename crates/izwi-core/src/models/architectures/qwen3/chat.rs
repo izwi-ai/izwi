@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -14,6 +13,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::info;
 
+use crate::backends::{open_gguf_reader, BackendKind};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::core::{Qwen3Cache, Qwen3Config, Qwen3Model};
@@ -236,7 +236,14 @@ impl Qwen3ChatModel {
         }
 
         let tokenizer = ChatTokenizer::load(model_dir, None)?;
-        let mut reader = BufReader::new(fs::File::open(&gguf_path)?);
+        let backend = if device.kind.is_metal() {
+            BackendKind::Metal
+        } else if device.kind.is_cuda() {
+            BackendKind::Cuda
+        } else {
+            BackendKind::Cpu
+        };
+        let mut reader = open_gguf_reader(&gguf_path, backend)?;
         let content = gguf_file::Content::read(&mut reader)
             .map_err(|e| Error::ModelLoadError(format!("Failed to parse GGUF header: {e}")))?;
         let text_model = QuantizedQwen3Model::from_gguf(content, &mut reader, &device.device)
