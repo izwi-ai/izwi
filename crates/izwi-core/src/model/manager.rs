@@ -1,5 +1,6 @@
 //! Model lifecycle management
 
+use super::residency::{ModelResidency, ModelResidencyState};
 use futures::stream::{self, StreamExt};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -18,6 +19,7 @@ pub struct ModelManager {
     _config: EngineConfig,
     downloader: ModelDownloader,
     models: RwLock<HashMap<ModelVariant, ModelState>>,
+    residency: Arc<ModelResidency>,
 }
 
 struct ModelState {
@@ -58,25 +60,18 @@ impl ModelManager {
             _config: config,
             downloader,
             models: RwLock::new(models),
+            residency: Arc::new(ModelResidency::default()),
         })
     }
 
     async fn refresh_model_states(&self) {
-        let variants: Vec<(ModelVariant, ModelStatus)> = {
+        let variants: Vec<ModelVariant> = {
             let models = self.models.read().await;
-            models
-                .iter()
-                .map(|(variant, state)| (*variant, state.info.status))
-                .collect()
+            models.keys().copied().collect()
         };
 
         let updates = stream::iter(variants.into_iter())
-            .filter(|(_, status)| {
-                futures::future::ready(
-                    *status != ModelStatus::Ready && *status != ModelStatus::Loading,
-                )
-            })
-            .map(|(variant, _)| async move {
+            .map(|variant| async move {
                 let download_state = self.downloader.state_manager().get_state(variant).await;
                 let latest_progress = if download_state == DownloadState::Downloading {
                     self.downloader.get_latest_progress(variant).await
@@ -96,6 +91,7 @@ impl ModelManager {
                 } else {
                     Some(self.downloader.expected_size_bytes(variant).await)
                 };
+                let residency = self.residency.state(variant).await;
 
                 (
                     variant,
@@ -103,6 +99,7 @@ impl ModelManager {
                     latest_progress,
                     is_downloaded,
                     size_bytes,
+                    residency,
                 )
             })
             .buffer_unordered(8)
@@ -110,15 +107,12 @@ impl ModelManager {
             .await;
 
         let mut models = self.models.write().await;
-        for (variant, download_state, latest_progress, is_downloaded, size_bytes) in updates {
+        for (variant, download_state, latest_progress, is_downloaded, size_bytes, residency) in
+            updates
+        {
             let Some(state) = models.get_mut(&variant) else {
                 continue;
             };
-
-            if state.info.status == ModelStatus::Ready || state.info.status == ModelStatus::Loading
-            {
-                continue;
-            }
 
             if download_state == DownloadState::Downloading {
                 state.info.status = ModelStatus::Downloading;
@@ -133,7 +127,11 @@ impl ModelManager {
             }
 
             if is_downloaded {
-                state.info.status = ModelStatus::Downloaded;
+                state.info.status = match residency {
+                    ModelResidencyState::Loading => ModelStatus::Loading,
+                    ModelResidencyState::Ready => ModelStatus::Ready,
+                    ModelResidencyState::NotResident => ModelStatus::Downloaded,
+                };
                 state.info.local_path = Some(self.downloader.model_path(variant));
                 state.info.size_bytes = size_bytes;
                 state.info.download_progress = Some(100.0);
@@ -270,31 +268,38 @@ impl ModelManager {
                 .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?
         };
 
-        // Update status
-        {
-            let mut models = self.models.write().await;
-            if let Some(state) = models.get_mut(&variant) {
-                state.info.status = ModelStatus::Loading;
-            }
-        }
+        self.residency.mark_loading(variant).await;
 
         info!("Loading model {} from {:?}", variant, model_path);
 
         // Load weights (blocking operation)
-        let weights = tokio::task::spawn_blocking(move || ModelWeights::load(&model_path))
+        let weights = match tokio::task::spawn_blocking(move || ModelWeights::load(&model_path))
             .await
-            .map_err(|e| Error::ModelLoadError(e.to_string()))??;
+            .map_err(|e| Error::ModelLoadError(e.to_string()))
+        {
+            Ok(result) => match result {
+                Ok(weights) => weights,
+                Err(err) => {
+                    self.residency.clear(variant).await;
+                    return Err(err);
+                }
+            },
+            Err(err) => {
+                self.residency.clear(variant).await;
+                return Err(err);
+            }
+        };
 
         let weights = Arc::new(weights);
 
-        // Store loaded weights
+        // Store loaded weights and update residency state.
         {
             let mut models = self.models.write().await;
             if let Some(state) = models.get_mut(&variant) {
-                state.info.status = ModelStatus::Ready;
                 state.weights = Some(weights.clone());
             }
         }
+        self.residency.mark_ready(variant).await;
 
         info!("Model {} loaded successfully", variant);
         Ok(weights)
@@ -305,22 +310,15 @@ impl ModelManager {
         let mut models = self.models.write().await;
         if let Some(state) = models.get_mut(&variant) {
             state.weights = None;
-            state.info.status = if state.info.local_path.is_some() {
-                ModelStatus::Downloaded
-            } else {
-                ModelStatus::NotDownloaded
-            };
         }
+        drop(models);
+        self.residency.clear(variant).await;
         Ok(())
     }
 
     /// Mark a model as loaded without storing weights (native implementations).
     pub async fn mark_loaded(&self, variant: ModelVariant) {
-        let mut models = self.models.write().await;
-        if let Some(state) = models.get_mut(&variant) {
-            state.info.status = ModelStatus::Ready;
-            state.weights = None;
-        }
+        self.residency.mark_ready(variant).await;
     }
 
     /// Get loaded model weights
@@ -331,11 +329,7 @@ impl ModelManager {
 
     /// Check if model is ready for inference
     pub async fn is_ready(&self, variant: ModelVariant) -> bool {
-        let models = self.models.read().await;
-        models
-            .get(&variant)
-            .map(|s| s.info.status == ModelStatus::Ready)
-            .unwrap_or(false)
+        self.residency.state(variant).await == ModelResidencyState::Ready
     }
 
     /// Delete downloaded model files
@@ -358,8 +352,10 @@ impl ModelManager {
             let mut models = self.models.write().await;
             if let Some(state) = models.get_mut(&variant) {
                 state.info = ModelInfo::new(variant);
+                state.weights = None;
             }
         }
+        self.residency.clear(variant).await;
 
         Ok(())
     }
@@ -407,6 +403,7 @@ impl ModelManager {
                 state.info.download_progress = None;
             }
         }
+        self.residency.clear(variant).await;
 
         self.downloader.cancel_download(variant).await
     }

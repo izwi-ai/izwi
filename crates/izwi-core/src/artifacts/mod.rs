@@ -4,4 +4,7 @@
 //! artifact-management state. Legacy `crate::model` imports remain available as
 //! compatibility shims.
 
-pub use crate::model::{DownloadProgress, ModelDownloader, ModelManager, ModelWeights};
+pub use crate::model::{
+    DownloadProgress, ModelDownloader, ModelManager, ModelResidency, ModelResidencyState,
+    ModelWeights,
+};
