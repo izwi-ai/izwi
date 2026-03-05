@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::future::Future;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -27,7 +26,6 @@ use crate::engine::{
     WorkerConfig,
 };
 use crate::error::{Error, Result};
-use crate::runtime_models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::runtime_models::ModelRegistry;
 use crate::tokenizer::Tokenizer;
 
@@ -262,14 +260,12 @@ pub struct RuntimeService {
     pub(crate) codec: RwLock<AudioCodec>,
     #[allow(dead_code)]
     pub(crate) streaming_config: StreamingConfig,
-    pub(crate) tts_model: Arc<RwLock<Option<Qwen3TtsModel>>>,
     pub(crate) core_engine: Arc<CoreEngine>,
     telemetry: Arc<RuntimeTelemetryCollector>,
     completion_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<Result<EngineOutput>>>>>,
     step_driver_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     step_driver_wakeup: Arc<Notify>,
     step_driver_started: AtomicBool,
-    pub(crate) loaded_model_path: RwLock<Option<PathBuf>>,
     pub(crate) loaded_tts_variant: RwLock<Option<ModelVariant>>,
     pub(crate) device: DeviceProfile,
 }
@@ -374,7 +370,6 @@ impl RuntimeService {
             device.clone(),
         ));
 
-        let tts_model = Arc::new(RwLock::new(None));
         let default_backend = match selected_backend_kind {
             BackendKind::Metal => ExecutionBackend::CandleMetal,
             BackendKind::Cuda => ExecutionBackend::CandleCuda,
@@ -394,7 +389,6 @@ impl RuntimeService {
         worker_config.models_dir = config.models_dir.clone();
         worker_config.kv_cache_dtype = config.kv_cache_dtype.clone();
         worker_config.kv_page_size = config.kv_page_size.max(1);
-        worker_config.shared_tts_model = Some(tts_model.clone());
         worker_config.model_registry = Some(model_registry.clone());
         worker_config.backend = selected_backend_kind;
         let core_engine = Arc::new(CoreEngine::new_with_worker(core_config, worker_config)?);
@@ -407,14 +401,12 @@ impl RuntimeService {
             tokenizer: RwLock::new(None),
             codec: RwLock::new(AudioCodec::new()),
             streaming_config: StreamingConfig::default(),
-            tts_model,
             core_engine,
             telemetry: Arc::new(RuntimeTelemetryCollector::new(2048)),
             completion_waiters: Arc::new(Mutex::new(HashMap::new())),
             step_driver_task: Mutex::new(None),
             step_driver_wakeup: Arc::new(Notify::new()),
             step_driver_started: AtomicBool::new(false),
-            loaded_model_path: RwLock::new(None),
             loaded_tts_variant: RwLock::new(None),
             device,
         })
@@ -467,28 +459,38 @@ impl RuntimeService {
 
     /// Get available speakers for loaded TTS model.
     pub async fn available_speakers(&self) -> Result<Vec<String>> {
-        let loaded_variant = *self.loaded_tts_variant.read().await;
-        if let Some(variant) = loaded_variant
-            .filter(|variant| matches!(variant.family(), crate::catalog::ModelFamily::KokoroTts))
-        {
-            if let Some(model) = self.model_registry.get_kokoro(variant).await {
-                return model.available_speakers();
-            }
-        }
-        if let Some(variant) = loaded_variant
-            .filter(|variant| matches!(variant.family(), crate::catalog::ModelFamily::Lfm2Audio))
-        {
-            if let Some(model) = self.model_registry.get_lfm2(variant).await {
-                return Ok(model.available_voices());
-            }
-        }
-
-        let tts_model = self.tts_model.read().await;
-        let model = tts_model
-            .as_ref()
+        let variant = (*self.loaded_tts_variant.read().await)
             .ok_or_else(|| Error::InferenceError("No TTS model loaded".to_string()))?;
 
-        Ok(model.available_speakers().into_iter().cloned().collect())
+        match variant.family() {
+            crate::catalog::ModelFamily::Qwen3Tts => {
+                let model = self
+                    .model_registry
+                    .get_qwen_tts(variant)
+                    .await
+                    .ok_or_else(|| Error::InferenceError("No TTS model loaded".to_string()))?;
+                Ok(model.available_speakers().into_iter().cloned().collect())
+            }
+            crate::catalog::ModelFamily::KokoroTts => {
+                let model = self
+                    .model_registry
+                    .get_kokoro(variant)
+                    .await
+                    .ok_or_else(|| Error::InferenceError("No TTS model loaded".to_string()))?;
+                model.available_speakers()
+            }
+            crate::catalog::ModelFamily::Lfm2Audio => {
+                let model = self
+                    .model_registry
+                    .get_lfm2(variant)
+                    .await
+                    .ok_or_else(|| Error::InferenceError("No TTS model loaded".to_string()))?;
+                Ok(model.available_voices())
+            }
+            _ => Err(Error::InferenceError(format!(
+                "Model {variant} does not expose TTS speakers"
+            ))),
+        }
     }
 
     async fn ensure_step_driver_started(&self) {

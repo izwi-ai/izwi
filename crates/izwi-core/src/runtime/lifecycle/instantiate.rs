@@ -2,45 +2,13 @@ use tracing::info;
 
 use crate::catalog::ModelFamily;
 use crate::catalog::ModelVariant;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::runtime::lifecycle::phases::AcquiredModelLoad;
 use crate::runtime::service::RuntimeService;
-use crate::runtime_models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::tokenizer::Tokenizer;
-
-type TtsLoaderFn =
-    fn(&std::path::Path, crate::backends::DeviceProfile, usize, &str) -> Result<Qwen3TtsModel>;
-
-struct TtsLoaderRegistration {
-    name: &'static str,
-    family: ModelFamily,
-    loader: TtsLoaderFn,
-}
-
-fn load_qwen_tts_model(
-    model_dir: &std::path::Path,
-    device: crate::backends::DeviceProfile,
-    kv_page_size: usize,
-    kv_cache_dtype: &str,
-) -> Result<Qwen3TtsModel> {
-    Qwen3TtsModel::load(model_dir, device, kv_page_size, kv_cache_dtype)
-}
-
-const TTS_LOADER_REGISTRY: &[TtsLoaderRegistration] = &[TtsLoaderRegistration {
-    name: "qwen3_tts",
-    family: ModelFamily::Qwen3Tts,
-    loader: load_qwen_tts_model,
-}];
-
-fn resolve_tts_loader_registration(family: ModelFamily) -> Option<&'static TtsLoaderRegistration> {
-    TTS_LOADER_REGISTRY
-        .iter()
-        .find(|registration| registration.family == family)
-}
 
 pub(super) enum InstantiatedPayload {
     None,
-    TtsModel(Qwen3TtsModel),
     Tokenizer(Option<Tokenizer>),
 }
 
@@ -100,24 +68,16 @@ impl RuntimeService {
                 InstantiatedPayload::None
             }
             ModelFamily::Qwen3Tts => {
-                let registration = resolve_tts_loader_registration(family).ok_or_else(|| {
-                    Error::InvalidInput(format!("Unsupported TTS model variant: {variant}"))
-                })?;
-                if self.is_tts_model_already_loaded(&model_path).await {
-                    InstantiatedPayload::None
-                } else {
-                    info!(
-                        "Loading native TTS model {variant} ({}) from {:?}",
-                        registration.name, model_path
-                    );
-                    let model = (registration.loader)(
+                info!("Loading native TTS model {variant} via shared model registry");
+                self.model_registry
+                    .load_qwen_tts(
+                        variant,
                         &model_path,
-                        self.device.clone(),
                         self.config.kv_page_size,
                         &self.config.kv_cache_dtype,
-                    )?;
-                    InstantiatedPayload::TtsModel(model)
-                }
+                    )
+                    .await?;
+                InstantiatedPayload::None
             }
             ModelFamily::Tokenizer => {
                 let tokenizer = match Tokenizer::from_path(&model_path) {
@@ -137,16 +97,5 @@ impl RuntimeService {
             model_path,
             payload,
         })
-    }
-
-    async fn is_tts_model_already_loaded(&self, model_path: &std::path::Path) -> bool {
-        let loaded_path = self.loaded_model_path.read().await;
-        let tts_model = self.tts_model.read().await;
-
-        tts_model.is_some()
-            && loaded_path
-                .as_ref()
-                .map(|p| p.as_path() == model_path)
-                .unwrap_or(false)
     }
 }

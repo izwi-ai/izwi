@@ -75,7 +75,7 @@ impl NativeExecutor {
         let params = Self::to_tts_params(request);
         let language = request.language.as_deref();
 
-        self.with_model(|model| {
+        self.with_qwen_model(variant, |model| {
             let mut active_state = {
                 let mut guard = self.qwen_tts_decode_states.lock().map_err(|_| {
                     Error::InferenceError("Qwen TTS decode state mutex poisoned".to_string())

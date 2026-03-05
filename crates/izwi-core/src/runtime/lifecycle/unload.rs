@@ -35,20 +35,18 @@ impl RuntimeService {
             }
             ModelFamily::Lfm2Audio => {
                 self.model_registry.unload_lfm2(variant).await;
-                self.clear_active_tts_variant().await;
+                self.clear_active_tts_variant(variant).await;
             }
             ModelFamily::Voxtral => {
                 self.model_registry.unload_voxtral(variant).await;
             }
             ModelFamily::Qwen3Tts => {
-                let mut model_guard = self.tts_model.write().await;
-                *model_guard = None;
-                drop(model_guard);
-                self.clear_active_tts_variant().await;
+                self.model_registry.unload_qwen_tts(variant).await;
+                self.clear_active_tts_variant(variant).await;
             }
             ModelFamily::KokoroTts => {
                 self.model_registry.unload_kokoro(variant).await;
-                self.clear_active_tts_variant().await;
+                self.clear_active_tts_variant(variant).await;
             }
             ModelFamily::Tokenizer => {
                 let mut tokenizer_guard = self.tokenizer.write().await;

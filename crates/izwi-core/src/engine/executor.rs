@@ -29,6 +29,7 @@ use super::scheduler::ScheduledRequest;
 use super::types::AudioOutput;
 use crate::backends::BackendKind;
 use crate::error::{Error, Result};
+use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::models::DeviceSelector;
 use crate::models::ModelRegistry;
@@ -62,9 +63,7 @@ pub struct WorkerConfig {
     pub num_threads: usize,
     /// Decode-time KV cache page size.
     pub kv_page_size: usize,
-    /// Optional shared model handle provided by higher-level runtime.
-    pub shared_tts_model: Option<Arc<RwLock<Option<Qwen3TtsModel>>>>,
-    /// Optional shared model registry for non-TTS tasks (ASR/Chat/LFM2).
+    /// Optional shared model registry for loaded runtime models.
     pub model_registry: Option<Arc<ModelRegistry>>,
 }
 
@@ -77,10 +76,6 @@ impl std::fmt::Debug for WorkerConfig {
             .field("kv_cache_dtype", &self.kv_cache_dtype)
             .field("num_threads", &self.num_threads)
             .field("kv_page_size", &self.kv_page_size)
-            .field(
-                "shared_tts_model",
-                &self.shared_tts_model.as_ref().map(|_| "<shared>"),
-            )
             .field(
                 "model_registry",
                 &self.model_registry.as_ref().map(|_| "<shared>"),
@@ -105,7 +100,6 @@ impl Default for WorkerConfig {
             kv_cache_dtype: "float16".to_string(),
             num_threads: 4,
             kv_page_size: 64,
-            shared_tts_model: None,
             model_registry: None,
         }
     }
@@ -120,7 +114,6 @@ impl From<&EngineCoreConfig> for WorkerConfig {
             kv_cache_dtype: config.kv_cache_dtype.clone(),
             num_threads: config.num_threads,
             kv_page_size: config.block_size.max(1),
-            shared_tts_model: None,
             model_registry: None,
         }
     }
@@ -241,15 +234,19 @@ impl NativeExecutor {
         }
     }
 
-    fn with_model<T>(&self, f: impl FnOnce(&Qwen3TtsModel) -> Result<T>) -> Result<T> {
-        if let Some(shared_model) = &self.config.shared_tts_model {
-            let guard = shared_model.try_read().map_err(|_| {
-                Error::InferenceError("Shared TTS model is busy (try again)".to_string())
+    fn with_qwen_model<T>(
+        &self,
+        variant: Option<ModelVariant>,
+        f: impl FnOnce(&Qwen3TtsModel) -> Result<T>,
+    ) -> Result<T> {
+        if let Some(registry) = &self.config.model_registry {
+            let variant = variant.ok_or_else(|| {
+                Error::InferenceError("Qwen TTS request is missing model variant".to_string())
             })?;
-            let model = guard
-                .as_ref()
-                .ok_or_else(|| Error::InferenceError("No TTS model loaded".to_string()))?;
-            return f(model);
+            let model = registry.try_get_qwen_tts(variant).ok_or_else(|| {
+                Error::InferenceError(format!("Qwen TTS model {variant} is not loaded"))
+            })?;
+            return f(model.as_ref());
         }
 
         let model = self
@@ -333,7 +330,7 @@ impl ModelExecutor for NativeExecutor {
 
     fn initialize(&mut self) -> Result<()> {
         info!("Initializing native executor");
-        if self.config.shared_tts_model.is_none() {
+        if self.config.model_registry.is_none() {
             let device = match self.config.backend {
                 BackendKind::Metal => DeviceSelector::detect_with_preference(Some("metal"))?,
                 BackendKind::Cuda => DeviceSelector::detect_with_preference(Some("cuda"))?,
@@ -351,7 +348,7 @@ impl ModelExecutor for NativeExecutor {
                 self.config.models_dir
             );
         } else {
-            debug!("Native executor will use shared TTS model handle");
+            debug!("Native executor will use shared model registry");
         }
         self.initialized = true;
         Ok(())

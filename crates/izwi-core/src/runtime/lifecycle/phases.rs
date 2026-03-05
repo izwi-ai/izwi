@@ -68,18 +68,14 @@ impl RuntimeService {
         )))
     }
 
-    pub(super) async fn clear_active_tts_variant(&self) {
-        let mut path_guard = self.loaded_model_path.write().await;
-        *path_guard = None;
-
+    pub(super) async fn clear_active_tts_variant(&self, variant: ModelVariant) {
         let mut variant_guard = self.loaded_tts_variant.write().await;
-        *variant_guard = None;
+        if *variant_guard == Some(variant) {
+            *variant_guard = None;
+        }
     }
 
-    pub(super) async fn set_active_tts_variant(&self, variant: ModelVariant, model_path: PathBuf) {
-        let mut path_guard = self.loaded_model_path.write().await;
-        *path_guard = Some(model_path);
-
+    pub(super) async fn set_active_tts_variant(&self, variant: ModelVariant) {
         let mut variant_guard = self.loaded_tts_variant.write().await;
         *variant_guard = Some(variant);
     }

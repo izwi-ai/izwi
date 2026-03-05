@@ -25,33 +25,16 @@ impl RuntimeService {
             | ModelFamily::Qwen35Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Gemma3Chat
-            | ModelFamily::Voxtral => {
-                self.model_manager.mark_loaded(variant).await;
-            }
-            ModelFamily::Lfm2Audio => {
-                // LFM2 owns active TTS routing and does not use the legacy Qwen slot.
-                let mut tts_guard = self.tts_model.write().await;
-                *tts_guard = None;
-                drop(tts_guard);
-
-                self.set_active_tts_variant(variant, model_path).await;
-                self.model_manager.mark_loaded(variant).await;
-            }
-            ModelFamily::Qwen3Tts => {
-                if let InstantiatedPayload::TtsModel(model) = payload {
-                    let mut model_guard = self.tts_model.write().await;
-                    *model_guard = Some(model);
-                    drop(model_guard);
+            | ModelFamily::Voxtral
+            | ModelFamily::Lfm2Audio
+            | ModelFamily::Qwen3Tts
+            | ModelFamily::KokoroTts => {
+                if matches!(
+                    family,
+                    ModelFamily::Lfm2Audio | ModelFamily::Qwen3Tts | ModelFamily::KokoroTts
+                ) {
+                    self.set_active_tts_variant(variant).await;
                 }
-                self.set_active_tts_variant(variant, model_path).await;
-                self.model_manager.mark_loaded(variant).await;
-            }
-            ModelFamily::KokoroTts => {
-                // Kokoro owns active TTS routing and does not use the legacy Qwen slot.
-                let mut model_guard = self.tts_model.write().await;
-                *model_guard = None;
-                drop(model_guard);
-                self.set_active_tts_variant(variant, model_path).await;
                 self.model_manager.mark_loaded(variant).await;
             }
             ModelFamily::Tokenizer => {
