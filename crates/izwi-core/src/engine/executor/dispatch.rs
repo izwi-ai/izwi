@@ -2,6 +2,7 @@ use std::thread;
 
 use tracing::error;
 
+use crate::backends::can_parallelize_requests;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 
@@ -153,7 +154,7 @@ impl NativeExecutor {
             return false;
         }
         // Keep Metal execution serialized to avoid command-queue contention.
-        !self.config.device.eq_ignore_ascii_case("mps")
+        can_parallelize_requests(self.config.backend)
     }
 
     fn execute_requests_parallel(

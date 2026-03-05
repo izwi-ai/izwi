@@ -15,7 +15,7 @@ use tokio::task::yield_now;
 use tracing::{debug, error, info_span};
 
 use crate::audio::{AudioCodec, AudioEncoder, StreamingConfig};
-use crate::backends::{BackendRouter, ExecutionBackend};
+use crate::backends::{BackendKind, BackendPreference, BackendRouter, ExecutionBackend};
 use crate::config::EngineConfig;
 use crate::engine::{
     Engine as CoreEngine, EngineCoreConfig, EngineCoreRequest, EngineOutput, StreamingOutput,
@@ -325,17 +325,19 @@ impl RuntimeService {
         configure_runtime_threading(config.num_threads.max(1));
         let model_manager = Arc::new(ModelManager::new(config.clone())?);
 
-        let device = if cfg!(target_os = "macos") {
-            let preference = if config.use_metal {
-                Some("metal")
-            } else {
-                Some("cpu")
-            };
-            DeviceSelector::detect_with_preference(preference)?
-        } else {
-            DeviceSelector::detect()?
+        let device = match config.backend {
+            BackendPreference::Auto => DeviceSelector::detect()?,
+            BackendPreference::Cpu => DeviceSelector::detect_with_preference(Some("cpu"))?,
+            BackendPreference::Metal => DeviceSelector::detect_with_preference(Some("metal"))?,
+            BackendPreference::Cuda => DeviceSelector::detect_with_preference(Some("cuda"))?,
         };
-        let use_metal_backend = config.use_metal && device.kind.is_metal();
+        let selected_backend_kind = if device.kind.is_metal() {
+            BackendKind::Metal
+        } else if device.kind.is_cuda() {
+            BackendKind::Cuda
+        } else {
+            BackendKind::Cpu
+        };
 
         let model_registry = Arc::new(ModelRegistry::new(
             config.models_dir.clone(),
@@ -343,17 +345,17 @@ impl RuntimeService {
         ));
 
         let tts_model = Arc::new(RwLock::new(None));
-        let default_backend = if device.kind.is_metal() {
-            ExecutionBackend::CandleMetal
-        } else {
-            ExecutionBackend::CandleNative
+        let default_backend = match selected_backend_kind {
+            BackendKind::Metal => ExecutionBackend::CandleMetal,
+            BackendKind::Cuda => ExecutionBackend::CandleCuda,
+            BackendKind::Cpu | BackendKind::Mlx => ExecutionBackend::CandleNative,
         };
 
         let mut core_config = EngineCoreConfig::for_qwen3_tts();
         core_config.models_dir = config.models_dir.clone();
         core_config.max_batch_size = config.max_batch_size.max(1);
         core_config.max_seq_len = config.max_sequence_length.max(1);
-        core_config.use_metal = use_metal_backend;
+        core_config.backend = selected_backend_kind;
         core_config.num_threads = config.num_threads.max(1);
         core_config.block_size = config.kv_page_size.max(1);
         core_config.kv_cache_dtype = config.kv_cache_dtype.clone();
@@ -364,11 +366,7 @@ impl RuntimeService {
         worker_config.kv_page_size = config.kv_page_size.max(1);
         worker_config.shared_tts_model = Some(tts_model.clone());
         worker_config.model_registry = Some(model_registry.clone());
-        worker_config.device = if use_metal_backend {
-            "mps".to_string()
-        } else {
-            "cpu".to_string()
-        };
+        worker_config.backend = selected_backend_kind;
         let core_engine = Arc::new(CoreEngine::new_with_worker(core_config, worker_config)?);
 
         Ok(Self {

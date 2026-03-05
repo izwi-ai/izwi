@@ -1,13 +1,14 @@
 use candle_core::DType;
 
-use super::device::DeviceKind;
+use super::types::BackendKind;
 
-pub fn default_dtype_for_device(kind: DeviceKind) -> DType {
+pub fn default_dtype_for_device(kind: BackendKind) -> DType {
     match kind {
-        DeviceKind::Cpu => DType::F32,
+        BackendKind::Cpu => DType::F32,
         // Keep existing stability/perf preference on Metal.
-        DeviceKind::Metal => DType::F32,
-        DeviceKind::Cuda => DType::BF16,
+        BackendKind::Metal => DType::F32,
+        BackendKind::Cuda => DType::BF16,
+        BackendKind::Mlx => DType::F32,
     }
 }
 
@@ -25,6 +26,6 @@ pub fn kv_dtype_bytes(requested_dtype: &str, is_metal: bool) -> usize {
     }
 }
 
-pub fn can_parallelize_requests(kind: DeviceKind) -> bool {
-    !matches!(kind, DeviceKind::Metal)
+pub fn can_parallelize_requests(kind: BackendKind) -> bool {
+    !matches!(kind, BackendKind::Metal)
 }

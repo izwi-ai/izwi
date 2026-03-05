@@ -27,6 +27,7 @@ use super::config::EngineCoreConfig;
 use super::request::EngineCoreRequest;
 use super::scheduler::ScheduledRequest;
 use super::types::{AudioOutput, ModelType};
+use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::models::DeviceSelector;
@@ -53,8 +54,8 @@ pub struct WorkerConfig {
     pub model_type: ModelType,
     /// Path to models directory
     pub models_dir: PathBuf,
-    /// Device to use (cpu, mps, cuda)
-    pub device: String,
+    /// Backend to use (cpu, metal, cuda)
+    pub backend: BackendKind,
     /// Data type (float32, float16, bfloat16)
     pub dtype: String,
     /// KV cache storage dtype hint (e.g. float16, int8).
@@ -74,7 +75,7 @@ impl std::fmt::Debug for WorkerConfig {
         f.debug_struct("WorkerConfig")
             .field("model_type", &self.model_type)
             .field("models_dir", &self.models_dir)
-            .field("device", &self.device)
+            .field("backend", &self.backend)
             .field("dtype", &self.dtype)
             .field("kv_cache_dtype", &self.kv_cache_dtype)
             .field("num_threads", &self.num_threads)
@@ -99,10 +100,10 @@ impl Default for WorkerConfig {
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("izwi")
                 .join("models"),
-            device: if cfg!(target_os = "macos") {
-                "mps".to_string()
+            backend: if cfg!(target_os = "macos") {
+                BackendKind::Metal
             } else {
-                "cpu".to_string()
+                BackendKind::Cpu
             },
             dtype: "float32".to_string(),
             kv_cache_dtype: "float16".to_string(),
@@ -119,11 +120,7 @@ impl From<&EngineCoreConfig> for WorkerConfig {
         Self {
             model_type: config.model_type,
             models_dir: config.models_dir.clone(),
-            device: if config.use_metal {
-                "mps".to_string()
-            } else {
-                "cpu".to_string()
-            },
+            backend: config.backend,
             dtype: "float32".to_string(),
             kv_cache_dtype: config.kv_cache_dtype.clone(),
             num_threads: config.num_threads,
@@ -342,10 +339,12 @@ impl ModelExecutor for NativeExecutor {
     fn initialize(&mut self) -> Result<()> {
         info!("Initializing native executor");
         if self.config.shared_tts_model.is_none() {
-            let device = if self.config.device.eq_ignore_ascii_case("mps") {
-                DeviceSelector::detect_with_preference(Some("metal"))?
-            } else {
-                DeviceSelector::detect_with_preference(Some("cpu"))?
+            let device = match self.config.backend {
+                BackendKind::Metal => DeviceSelector::detect_with_preference(Some("metal"))?,
+                BackendKind::Cuda => DeviceSelector::detect_with_preference(Some("cuda"))?,
+                BackendKind::Cpu | BackendKind::Mlx => {
+                    DeviceSelector::detect_with_preference(Some("cpu"))?
+                }
             };
             let model = Qwen3TtsModel::load(
                 &self.config.models_dir,

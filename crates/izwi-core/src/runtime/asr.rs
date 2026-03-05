@@ -221,6 +221,7 @@ pub(crate) fn resolve_forced_aligner_variant(model_id: Option<&str>) -> Result<M
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::backends::BackendPreference;
     use crate::config::EngineConfig;
     use std::sync::{Mutex, OnceLock};
     use uuid::Uuid;
@@ -241,7 +242,7 @@ mod tests {
 
         let mut config = EngineConfig::default();
         config.models_dir = root.clone();
-        config.use_metal = false;
+        config.backend = BackendPreference::Cpu;
 
         let engine = RuntimeService::new(config).unwrap();
         let err = engine

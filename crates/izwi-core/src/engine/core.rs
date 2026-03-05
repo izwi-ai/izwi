@@ -18,6 +18,7 @@ use super::output::OutputProcessor;
 use super::request::{EngineCoreRequest, RequestStatus};
 use super::scheduler::{Scheduler, SchedulerConfig};
 use super::types::{AudioOutput, EngineOutput, LatencyBreakdown, RequestId};
+use crate::backends::{kv_dtype_bytes, BackendKind};
 use crate::error::{Error, Result};
 use crate::models::DeviceSelector;
 
@@ -28,18 +29,9 @@ enum KvCacheBackend {
 
 impl KvCacheBackend {
     fn new(config: &EngineCoreConfig) -> Result<Self> {
-        let requested_dtype_bytes = match config.kv_cache_dtype.trim().to_ascii_lowercase().as_str()
-        {
-            "float32" | "f32" => 4,
-            "int8" | "i8" | "q8" | "q8_0" => 1,
-            _ => 2,
-        };
+        let is_metal = config.backend == BackendKind::Metal;
         // Keep Metal KV manager on its tuned F32 layout unless explicit int8 KV is requested.
-        let dtype_bytes = if config.use_metal && requested_dtype_bytes != 1 {
-            4
-        } else {
-            requested_dtype_bytes
-        };
+        let dtype_bytes = kv_dtype_bytes(&config.kv_cache_dtype, is_metal);
         let kv_config = KVCacheConfig {
             num_layers: 24,
             num_heads: 16,
@@ -49,7 +41,7 @@ impl KvCacheBackend {
             dtype_bytes,
         };
 
-        if config.use_metal && kv_config.dtype_bytes == 4 {
+        if is_metal && kv_config.dtype_bytes == 4 {
             if let Ok(profile) = DeviceSelector::detect_with_preference(Some("metal")) {
                 if profile.kind.is_metal() {
                     let mut metal_config = MetalKVCacheConfig::default();
@@ -540,7 +532,7 @@ impl EngineCore {
         };
 
         let (mut decode_outputs, decode_elapsed, mut prefill_outputs, prefill_elapsed) =
-            if self.config.use_metal
+            if self.config.backend == BackendKind::Metal
                 && !decode_request_refs.is_empty()
                 && !prefill_request_refs.is_empty()
             {
@@ -931,7 +923,7 @@ mod tests {
             enable_chunked_prefill: false,
             enable_preemption: true,
             enable_adaptive_batching: false,
-            use_metal: false,
+            backend: BackendKind::Cpu,
             ..Default::default()
         };
         let mut core = EngineCore::new_with_unified_executor(config, executor).unwrap();

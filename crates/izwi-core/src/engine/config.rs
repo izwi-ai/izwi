@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use super::scheduler::SchedulingPolicy;
 use super::types::ModelType;
+use crate::backends::{BackendKind, BackendPreference};
 
 /// Configuration for the engine core.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,9 +66,9 @@ pub struct EngineCoreConfig {
     #[serde(default = "default_streaming_chunk_size")]
     pub streaming_chunk_size: usize,
 
-    /// Enable Metal/MPS acceleration (macOS)
-    #[serde(default = "default_use_metal")]
-    pub use_metal: bool,
+    /// Selected backend for execution and device policy.
+    #[serde(default = "default_backend_kind")]
+    pub backend: BackendKind,
 
     /// Number of CPU threads
     #[serde(default = "default_num_threads")]
@@ -171,8 +172,29 @@ fn default_num_codebooks() -> usize {
 fn default_streaming_chunk_size() -> usize {
     4800
 } // 200ms at 24kHz
-fn default_use_metal() -> bool {
-    cfg!(target_os = "macos")
+fn default_backend_kind() -> BackendKind {
+    if let Ok(raw) = std::env::var("IZWI_BACKEND") {
+        if let Some(preference) = BackendPreference::parse(&raw) {
+            return match preference {
+                BackendPreference::Auto => {
+                    if cfg!(target_os = "macos") {
+                        BackendKind::Metal
+                    } else {
+                        BackendKind::Cpu
+                    }
+                }
+                BackendPreference::Cpu => BackendKind::Cpu,
+                BackendPreference::Metal => BackendKind::Metal,
+                BackendPreference::Cuda => BackendKind::Cuda,
+            };
+        }
+    }
+
+    if cfg!(target_os = "macos") {
+        BackendKind::Metal
+    } else {
+        BackendKind::Cpu
+    }
 }
 fn default_num_threads() -> usize {
     std::thread::available_parallelism()
@@ -259,7 +281,7 @@ impl Default for EngineCoreConfig {
             sample_rate: default_sample_rate(),
             num_codebooks: default_num_codebooks(),
             streaming_chunk_size: default_streaming_chunk_size(),
-            use_metal: default_use_metal(),
+            backend: default_backend_kind(),
             num_threads: default_num_threads(),
             enable_preemption: default_enable_preemption(),
             enable_adaptive_batching: default_enable_adaptive_batching(),
@@ -304,7 +326,7 @@ impl EngineCoreConfig {
             "int8" | "i8" | "q8" | "q8_0" => 1,
             _ => 2,
         };
-        let dtype_bytes = if self.use_metal && requested_dtype_bytes != 1 {
+        let dtype_bytes = if self.backend == BackendKind::Metal && requested_dtype_bytes != 1 {
             4
         } else {
             requested_dtype_bytes

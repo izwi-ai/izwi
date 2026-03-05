@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::backends::BackendPreference;
+
 /// Main engine configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
@@ -30,9 +32,9 @@ pub struct EngineConfig {
     #[serde(default = "default_kv_page_size")]
     pub kv_page_size: usize,
 
-    /// Enable Metal GPU acceleration
-    #[serde(default = "default_use_metal")]
-    pub use_metal: bool,
+    /// Preferred backend selection strategy.
+    #[serde(default = "default_backend_preference")]
+    pub backend: BackendPreference,
 
     /// Number of threads for CPU operations
     #[serde(default = "default_num_threads")]
@@ -48,7 +50,7 @@ impl Default for EngineConfig {
             chunk_size: default_chunk_size(),
             kv_cache_dtype: default_kv_cache_dtype(),
             kv_page_size: default_kv_page_size(),
-            use_metal: default_use_metal(),
+            backend: default_backend_preference(),
             num_threads: default_num_threads(),
         }
     }
@@ -92,8 +94,21 @@ fn default_kv_page_size() -> usize {
         .unwrap_or(64)
 }
 
-fn default_use_metal() -> bool {
-    cfg!(target_os = "macos")
+fn default_backend_preference() -> BackendPreference {
+    if let Ok(raw) = std::env::var("IZWI_BACKEND") {
+        if let Some(parsed) = BackendPreference::parse(&raw) {
+            return parsed;
+        }
+    }
+
+    if let Ok(raw) = std::env::var("IZWI_USE_METAL") {
+        let value = raw.trim().to_ascii_lowercase();
+        if matches!(value.as_str(), "1" | "true" | "yes" | "on") {
+            return BackendPreference::Metal;
+        }
+    }
+
+    BackendPreference::Auto
 }
 
 fn default_num_threads() -> usize {
