@@ -4,16 +4,11 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use super::scheduler::SchedulingPolicy;
-use super::types::ModelType;
 use crate::backends::{BackendKind, BackendPreference, DeviceSelector};
 
 /// Configuration for the engine core.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineCoreConfig {
-    /// Model type to use
-    #[serde(default)]
-    pub model_type: ModelType,
-
     /// Directory containing models
     #[serde(default = "default_models_dir")]
     pub models_dir: PathBuf,
@@ -272,7 +267,6 @@ fn default_enable_kv_tiering() -> bool {
 impl Default for EngineCoreConfig {
     fn default() -> Self {
         Self {
-            model_type: ModelType::default(),
             models_dir: default_models_dir(),
             max_batch_size: default_max_batch_size(),
             max_seq_len: default_max_seq_len(),
@@ -313,7 +307,6 @@ impl EngineCoreConfig {
     /// Create config for Qwen3-TTS model
     pub fn for_qwen3_tts() -> Self {
         Self {
-            model_type: ModelType::Qwen3TTS,
             sample_rate: 24000,
             num_codebooks: 8,
             ..Default::default()

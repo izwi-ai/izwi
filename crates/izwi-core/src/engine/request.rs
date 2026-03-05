@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use super::config::EngineCoreConfig;
 use super::output::StreamingOutput;
-use super::types::{GenerationParams, ModelType, Priority, RequestId, TaskType, TokenId};
+use super::types::{GenerationParams, Priority, RequestId, TaskType, TokenId};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::shared::chat::ChatMessage;
@@ -34,8 +34,6 @@ pub struct EngineCoreRequest {
     pub id: RequestId,
     /// Task type (TTS, ASR, AudioChat)
     pub task_type: TaskType,
-    /// Model type to use
-    pub model_type: ModelType,
     /// Specific model variant to route to.
     pub model_variant: Option<ModelVariant>,
     /// Input text (for TTS)
@@ -77,7 +75,6 @@ impl EngineCoreRequest {
         Self {
             id: Uuid::new_v4().to_string(),
             task_type: TaskType::TTS,
-            model_type: ModelType::Qwen3TTS,
             model_variant: None,
             text: Some(text.into()),
             chat_messages: None,
@@ -102,7 +99,6 @@ impl EngineCoreRequest {
         Self {
             id: Uuid::new_v4().to_string(),
             task_type: TaskType::ASR,
-            model_type: ModelType::Qwen3TTS,
             model_variant: None,
             text: None,
             chat_messages: None,
@@ -127,7 +123,6 @@ impl EngineCoreRequest {
         Self {
             id: Uuid::new_v4().to_string(),
             task_type: TaskType::Chat,
-            model_type: ModelType::Qwen3TTS,
             model_variant: None,
             text: None,
             chat_messages: Some(messages),
@@ -152,7 +147,6 @@ impl EngineCoreRequest {
         Self {
             id: Uuid::new_v4().to_string(),
             task_type: TaskType::SpeechToSpeech,
-            model_type: ModelType::Qwen3TTS,
             model_variant: None,
             text: None,
             chat_messages: None,
@@ -170,12 +164,6 @@ impl EngineCoreRequest {
             streaming: false,
             streaming_tx: None,
         }
-    }
-
-    /// Set model type.
-    pub fn with_model_type(mut self, model_type: ModelType) -> Self {
-        self.model_type = model_type;
-        self
     }
 
     /// Set model variant.
@@ -312,11 +300,6 @@ impl RequestProcessor {
             &mut request.params,
         )?;
 
-        // Set model type from config if not specified
-        if request.model_type == ModelType::default() {
-            request.model_type = self.config.model_type;
-        }
-
         // Tokenize text input (simplified - actual tokenization would be more complex)
         if let Some(text) = &request.text {
             let estimated_tokens = (text.len() / 4).max(1);
@@ -411,12 +394,6 @@ impl RequestBuilder {
     /// Set the request ID.
     pub fn id(mut self, id: impl Into<String>) -> Self {
         self.request.id = id.into();
-        self
-    }
-
-    /// Set the model type.
-    pub fn model(mut self, model_type: ModelType) -> Self {
-        self.request.model_type = model_type;
         self
     }
 

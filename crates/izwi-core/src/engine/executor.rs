@@ -26,7 +26,7 @@ mod streaming;
 use super::config::EngineCoreConfig;
 use super::request::EngineCoreRequest;
 use super::scheduler::ScheduledRequest;
-use super::types::{AudioOutput, ModelType};
+use super::types::AudioOutput;
 use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
@@ -50,8 +50,6 @@ fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
 /// Configuration for the model executor.
 #[derive(Clone)]
 pub struct WorkerConfig {
-    /// Model type
-    pub model_type: ModelType,
     /// Path to models directory
     pub models_dir: PathBuf,
     /// Backend to use (cpu, metal, cuda)
@@ -73,7 +71,6 @@ pub struct WorkerConfig {
 impl std::fmt::Debug for WorkerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkerConfig")
-            .field("model_type", &self.model_type)
             .field("models_dir", &self.models_dir)
             .field("backend", &self.backend)
             .field("dtype", &self.dtype)
@@ -95,7 +92,6 @@ impl std::fmt::Debug for WorkerConfig {
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
-            model_type: ModelType::Qwen3TTS,
             models_dir: dirs::data_local_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("izwi")
@@ -118,7 +114,6 @@ impl Default for WorkerConfig {
 impl From<&EngineCoreConfig> for WorkerConfig {
     fn from(config: &EngineCoreConfig) -> Self {
         Self {
-            model_type: config.model_type,
             models_dir: config.models_dir.clone(),
             backend: config.backend,
             dtype: "float32".to_string(),
@@ -499,7 +494,14 @@ mod tests {
     #[test]
     fn test_worker_config_default() {
         let config = WorkerConfig::default();
-        assert_eq!(config.model_type, ModelType::Qwen3TTS);
+        assert_eq!(
+            config.backend,
+            if cfg!(target_os = "macos") {
+                BackendKind::Metal
+            } else {
+                BackendKind::Cpu
+            }
+        );
     }
 
     #[test]
