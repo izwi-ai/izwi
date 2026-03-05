@@ -19,8 +19,8 @@ use tokio::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use crate::catalog::ModelFamily;
+use crate::catalog::ModelVariant;
 use crate::error::{Error, Result};
-use crate::model::info::ModelVariant;
 
 const HF_BASE_URL: &str = "https://huggingface.co";
 const CHUNK_SIZE: usize = 8192; // 8KB chunks for streaming

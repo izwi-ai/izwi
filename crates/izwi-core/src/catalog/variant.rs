@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::model::ModelVariant;
+use super::ModelVariant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelFamily {

@@ -24,6 +24,7 @@
 //! ```
 #![allow(dead_code)]
 
+pub mod artifacts;
 pub mod audio;
 pub mod backends;
 pub mod catalog;
@@ -34,6 +35,7 @@ pub mod error;
 pub mod model;
 mod models;
 pub mod runtime;
+pub mod runtime_models;
 pub mod tokenizer;
 
 // Re-export main types from the new engine module
@@ -57,13 +59,14 @@ pub use runtime::{
     SpeechToSpeechGeneration,
 };
 
-// Catalog/model metadata re-exports
+// Canonical catalog/artifact/runtime-model re-exports
+pub use artifacts::{DownloadProgress, ModelDownloader, ModelManager, ModelWeights};
 pub use catalog::{
     parse_chat_model_variant, parse_model_variant, parse_tts_model_variant,
-    resolve_asr_model_variant, resolve_diarization_model_variant,
+    resolve_asr_model_variant, resolve_diarization_model_variant, ModelInfo, ModelStatus,
+    ModelVariant,
 };
-pub use model::{DownloadProgress, ModelInfo, ModelManager, ModelStatus, ModelVariant};
-pub use models::shared::chat::{
+pub use runtime_models::shared::chat::{
     parse_qwen35_multimodal_control_content, parse_qwen35_thinking_control_content,
     parse_qwen35_tools_control_content, qwen35_multimodal_control_content,
     qwen35_thinking_control_content, qwen35_tools_control_content, ChatMessage, ChatRole,
@@ -72,7 +75,7 @@ pub use models::shared::chat::{
 
 // Canonical native registry/device exports.
 pub use backends::{DeviceProfile, DeviceSelector};
-pub use models::ModelRegistry;
+pub use runtime_models::ModelRegistry;
 
 #[cfg(test)]
 pub(crate) fn env_test_lock() -> &'static std::sync::Mutex<()> {

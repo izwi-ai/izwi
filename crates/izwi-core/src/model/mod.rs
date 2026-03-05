@@ -1,11 +1,13 @@
-//! Model management for Qwen3-TTS
+//! Legacy compatibility surface for model metadata and artifact management.
+//!
+//! Prefer `crate::catalog` for model metadata/parsing and `crate::artifacts`
+//! for downloads, manager state, and weights.
 
 pub mod download;
-mod info;
 mod manager;
 pub mod weights;
 
+pub use crate::catalog::{ModelInfo, ModelStatus, ModelVariant};
 pub use download::{DownloadProgress, ModelDownloader};
-pub use info::{ModelInfo, ModelStatus, ModelVariant};
 pub use manager::ModelManager;
 pub use weights::ModelWeights;

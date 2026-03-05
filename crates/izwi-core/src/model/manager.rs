@@ -7,11 +7,11 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tracing::info;
 
+use crate::artifacts::ModelWeights;
+use crate::catalog::{ModelInfo, ModelStatus, ModelVariant};
 use crate::config::EngineConfig;
 use crate::error::{Error, Result};
 use crate::model::download::{DownloadProgress, DownloadState, ModelDownloader};
-use crate::model::info::{ModelInfo, ModelStatus, ModelVariant};
-use crate::model::weights::ModelWeights;
 
 /// Manages model downloading, loading, and lifecycle
 pub struct ModelManager {

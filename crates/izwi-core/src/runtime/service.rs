@@ -14,20 +14,21 @@ use tokio::sync::{broadcast, oneshot, Mutex, Notify, RwLock};
 use tokio::task::yield_now;
 use tracing::{debug, error, info_span};
 
+use crate::artifacts::{DownloadProgress, ModelManager};
 use crate::audio::{AudioCodec, AudioEncoder, StreamingConfig};
 use crate::backends::{
-    BackendKind, BackendPreference, BackendRouter, DeviceKind, ExecutionBackend,
+    BackendKind, BackendPreference, BackendRouter, DeviceKind, DeviceProfile, DeviceSelector,
+    ExecutionBackend,
 };
+use crate::catalog::{ModelInfo, ModelVariant};
 use crate::config::EngineConfig;
 use crate::engine::{
     Engine as CoreEngine, EngineCoreConfig, EngineCoreRequest, EngineOutput, StreamingOutput,
     WorkerConfig,
 };
 use crate::error::{Error, Result};
-use crate::model::download::DownloadProgress;
-use crate::model::{ModelInfo, ModelManager, ModelVariant};
-use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
-use crate::models::{DeviceProfile, DeviceSelector, ModelRegistry};
+use crate::runtime_models::architectures::qwen3::tts::Qwen3TtsModel;
+use crate::runtime_models::ModelRegistry;
 use crate::tokenizer::Tokenizer;
 
 fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {

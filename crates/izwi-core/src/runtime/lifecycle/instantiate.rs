@@ -1,15 +1,15 @@
 use tracing::info;
 
 use crate::catalog::ModelFamily;
+use crate::catalog::ModelVariant;
 use crate::error::{Error, Result};
-use crate::model::ModelVariant;
-use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::runtime::lifecycle::phases::AcquiredModelLoad;
 use crate::runtime::service::RuntimeService;
+use crate::runtime_models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::tokenizer::Tokenizer;
 
 type TtsLoaderFn =
-    fn(&std::path::Path, crate::models::DeviceProfile, usize, &str) -> Result<Qwen3TtsModel>;
+    fn(&std::path::Path, crate::backends::DeviceProfile, usize, &str) -> Result<Qwen3TtsModel>;
 
 struct TtsLoaderRegistration {
     name: &'static str,
@@ -19,7 +19,7 @@ struct TtsLoaderRegistration {
 
 fn load_qwen_tts_model(
     model_dir: &std::path::Path,
-    device: crate::models::DeviceProfile,
+    device: crate::backends::DeviceProfile,
     kv_page_size: usize,
     kv_cache_dtype: &str,
 ) -> Result<Qwen3TtsModel> {
