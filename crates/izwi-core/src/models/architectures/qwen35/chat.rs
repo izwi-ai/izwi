@@ -5,7 +5,6 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
@@ -14,11 +13,11 @@ use candle_core::quantized::{gguf_file, GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, IndexOp, Tensor, D};
 use candle_nn::{ops, Conv1d, Conv1dConfig, Embedding, Linear, Module, VarBuilder};
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
-use memmap2::MmapOptions;
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::{info, warn};
 
+use crate::backends::{open_gguf_reader, BackendKind};
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::core::{build_rope_cache, causal_mask};
 use crate::models::architectures::qwen35::vision::Qwen35VisionRuntime;
@@ -2715,58 +2714,14 @@ struct PromptBuildOutput {
     assistant_prefix_start: usize,
 }
 
-enum GgufReader {
-    Buffered(BufReader<fs::File>),
-    Mapped(Cursor<memmap2::Mmap>),
-}
-
-impl Read for GgufReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Self::Buffered(reader) => reader.read(buf),
-            Self::Mapped(reader) => reader.read(buf),
-        }
+fn backend_kind_for_device_profile(device: &DeviceProfile) -> BackendKind {
+    if device.kind.is_metal() {
+        BackendKind::Metal
+    } else if device.kind.is_cuda() {
+        BackendKind::Cuda
+    } else {
+        BackendKind::Cpu
     }
-}
-
-impl Seek for GgufReader {
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        match self {
-            Self::Buffered(reader) => reader.seek(pos),
-            Self::Mapped(reader) => reader.seek(pos),
-        }
-    }
-}
-
-fn gguf_mmap_enabled() -> bool {
-    std::env::var("IZWI_GGUF_MMAP")
-        .ok()
-        .map(|raw| {
-            !matches!(
-                raw.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "off" | "no"
-            )
-        })
-        .unwrap_or(true)
-}
-
-fn open_gguf_reader(path: &Path) -> Result<GgufReader> {
-    let file = fs::File::open(path)?;
-    if gguf_mmap_enabled() {
-        // SAFETY: the mapping is read-only and the underlying file descriptor
-        // remains valid for the lifetime of the mapping object.
-        match unsafe { MmapOptions::new().map(&file) } {
-            Ok(mmap) => return Ok(GgufReader::Mapped(Cursor::new(mmap))),
-            Err(err) => {
-                warn!(
-                    "Failed to memory-map GGUF file {}; falling back to buffered I/O: {}",
-                    path.display(),
-                    err
-                );
-            }
-        }
-    }
-    Ok(GgufReader::Buffered(BufReader::new(file)))
 }
 
 fn env_flag_enabled(name: &str, default: bool) -> bool {
@@ -2995,7 +2950,7 @@ impl Qwen35ChatModel {
         gguf_path: &Path,
         device: DeviceProfile,
     ) -> Result<Self> {
-        let mut reader = open_gguf_reader(gguf_path)?;
+        let mut reader = open_gguf_reader(gguf_path, backend_kind_for_device_profile(&device))?;
         let content = gguf_file::Content::read(&mut reader)
             .map_err(|e| Error::ModelLoadError(format!("Failed to parse GGUF header: {e}")))?;
         let config = parse_qwen35_gguf_config(&content)?;
@@ -3048,7 +3003,7 @@ impl Qwen35ChatModel {
     }
 
     fn load_gguf_dense(model_dir: &Path, gguf_path: &Path, device: DeviceProfile) -> Result<Self> {
-        let mut reader = open_gguf_reader(gguf_path)?;
+        let mut reader = open_gguf_reader(gguf_path, backend_kind_for_device_profile(&device))?;
         let content = gguf_file::Content::read(&mut reader)
             .map_err(|e| Error::ModelLoadError(format!("Failed to parse GGUF header: {e}")))?;
         let config = parse_qwen35_gguf_config(&content)?;
