@@ -313,19 +313,6 @@ impl Default for Priority {
     }
 }
 
-/// Model type being used for inference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ModelType {
-    /// Qwen3-TTS models
-    Qwen3TTS,
-}
-
-impl Default for ModelType {
-    fn default() -> Self {
-        Self::Qwen3TTS
-    }
-}
-
 /// Task type for the request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TaskType {
