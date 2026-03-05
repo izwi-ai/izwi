@@ -188,6 +188,33 @@ impl TransformedQMatMulCache {
         self.order.push_back(key.clone());
         self.entries.insert(key, value);
     }
+
+    fn remove_scope(&mut self, scope: &str) -> usize {
+        let scoped_prefix = format!("{scope}|");
+        let keys_to_remove: Vec<String> = self
+            .entries
+            .keys()
+            .filter(|key| key.starts_with(&scoped_prefix))
+            .cloned()
+            .collect();
+        let removed = keys_to_remove.len();
+        if removed == 0 {
+            return 0;
+        }
+        for key in &keys_to_remove {
+            self.entries.remove(key);
+        }
+        self.order
+            .retain(|existing| !existing.starts_with(&scoped_prefix));
+        removed
+    }
+
+    fn clear(&mut self) -> usize {
+        let removed = self.entries.len();
+        self.entries.clear();
+        self.order.clear();
+        removed
+    }
 }
 
 static QWEN35_TRANSFORMED_QMATMUL_CACHE: OnceLock<Mutex<TransformedQMatMulCache>> = OnceLock::new();
@@ -2838,6 +2865,32 @@ fn transformed_qmatmul_cache_insert(key: String, value: QMatMul) {
     }
 }
 
+fn clear_qwen35_transform_cache_scope(scope: &str) -> usize {
+    let cache = QWEN35_TRANSFORMED_QMATMUL_CACHE.get_or_init(|| Mutex::new(Default::default()));
+    let Ok(mut guard) = cache.lock() else {
+        return 0;
+    };
+    guard.remove_scope(scope)
+}
+
+pub fn clear_qwen35_transform_cache() -> usize {
+    let cache = QWEN35_TRANSFORMED_QMATMUL_CACHE.get_or_init(|| Mutex::new(Default::default()));
+    let Ok(mut guard) = cache.lock() else {
+        return 0;
+    };
+    guard.clear()
+}
+
+pub fn clear_qwen35_transform_cache_for_model_dir(model_dir: &Path) -> Result<usize> {
+    let Some(gguf_path) = find_preferred_gguf(model_dir)? else {
+        return Ok(0);
+    };
+    let Some(scope) = qwen35_transform_cache_scope(&gguf_path)? else {
+        return Ok(clear_qwen35_transform_cache());
+    };
+    Ok(clear_qwen35_transform_cache_scope(&scope))
+}
+
 pub struct Qwen35ChatModel {
     device: DeviceProfile,
     tokenizer: ChatTokenizer,
@@ -4743,6 +4796,7 @@ mod tests {
     };
     use crate::models::shared::device::DeviceSelector;
     use serde_json::json;
+    use std::sync::MutexGuard;
 
     #[test]
     fn qwen35_tools_system_content_includes_schema_and_instructions() {
@@ -4963,5 +5017,69 @@ mod tests {
         cache.insert("b".to_string(), b, 1);
         assert!(cache.get("a").is_none());
         assert!(cache.get("b").is_some());
+    }
+
+    fn dummy_qmatmul() -> QMatMul {
+        let device = candle_core::Device::Cpu;
+        let tensor = Tensor::zeros((2, 2), DType::F32, &device).expect("dummy tensor");
+        let qtensor = QTensor::quantize(&tensor, GgmlDType::F16).expect("dummy quantize");
+        QMatMul::from_qtensor(qtensor).expect("dummy qmatmul")
+    }
+
+    fn insert_transform_cache_entry(key: &str) {
+        let cache = QWEN35_TRANSFORMED_QMATMUL_CACHE.get_or_init(|| Mutex::new(Default::default()));
+        let mut guard = cache.lock().expect("lock transform cache");
+        guard.insert(key.to_string(), dummy_qmatmul(), 16);
+    }
+
+    fn cache_contains_transform_key(key: &str) -> bool {
+        let cache = QWEN35_TRANSFORMED_QMATMUL_CACHE.get_or_init(|| Mutex::new(Default::default()));
+        let guard = cache.lock().expect("lock transform cache");
+        guard.entries.contains_key(key)
+    }
+
+    fn cache_test_lock() -> MutexGuard<'static, ()> {
+        static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("lock cache test mutex")
+    }
+
+    #[test]
+    fn transformed_qmatmul_cache_scope_clear_evicts_only_matching_scope() {
+        let _lock = cache_test_lock();
+        clear_qwen35_transform_cache();
+        insert_transform_cache_entry("scope-a|tensor|xform|F16|Cpu");
+        insert_transform_cache_entry("scope-b|tensor|xform|F16|Cpu");
+
+        assert!(cache_contains_transform_key("scope-a|tensor|xform|F16|Cpu"));
+        assert!(cache_contains_transform_key("scope-b|tensor|xform|F16|Cpu"));
+
+        let removed = clear_qwen35_transform_cache_scope("scope-a");
+        assert_eq!(removed, 1);
+        assert!(!cache_contains_transform_key(
+            "scope-a|tensor|xform|F16|Cpu"
+        ));
+        assert!(cache_contains_transform_key("scope-b|tensor|xform|F16|Cpu"));
+
+        clear_qwen35_transform_cache();
+    }
+
+    #[test]
+    fn transformed_qmatmul_cache_clear_all_drops_everything() {
+        let _lock = cache_test_lock();
+        clear_qwen35_transform_cache();
+        insert_transform_cache_entry("scope-a|tensor-a|xform|F16|Cpu");
+        insert_transform_cache_entry("scope-b|tensor-b|xform|F16|Cpu");
+
+        let removed = clear_qwen35_transform_cache();
+        assert_eq!(removed, 2);
+        assert!(!cache_contains_transform_key(
+            "scope-a|tensor-a|xform|F16|Cpu"
+        ));
+        assert!(!cache_contains_transform_key(
+            "scope-b|tensor-b|xform|F16|Cpu"
+        ));
     }
 }

@@ -51,6 +51,7 @@ pub use types::{
 };
 
 use crate::error::Result;
+use crate::model::ModelVariant;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Notify, RwLock};
 use tracing::{debug, info, warn};
@@ -252,6 +253,12 @@ impl Engine {
     pub async fn abort_request(&self, request_id: &RequestId) -> Result<bool> {
         let mut core = self.core.write().await;
         Ok(core.abort_request(request_id).await)
+    }
+
+    /// Abort all requests currently routed to a specific model variant.
+    pub async fn abort_requests_for_variant(&self, variant: ModelVariant) -> Vec<RequestId> {
+        let mut core = self.core.write().await;
+        core.abort_requests_for_variant(variant).await
     }
 
     /// Check if a request is still tracked by the engine core.
