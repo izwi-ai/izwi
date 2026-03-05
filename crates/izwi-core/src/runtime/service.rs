@@ -377,7 +377,7 @@ impl RuntimeService {
         let default_backend = match selected_backend_kind {
             BackendKind::Metal => ExecutionBackend::CandleMetal,
             BackendKind::Cuda => ExecutionBackend::CandleCuda,
-            BackendKind::Cpu | BackendKind::Mlx => ExecutionBackend::CandleNative,
+            BackendKind::Cpu => ExecutionBackend::CandleNative,
         };
 
         let mut core_config = EngineCoreConfig::for_qwen3_tts();

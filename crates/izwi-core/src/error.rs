@@ -46,9 +46,6 @@ pub enum Error {
     #[error("Safetensors error: {0}")]
     SafetensorsError(String),
 
-    #[error("MLX error: {0}")]
-    MlxError(String),
-
     #[error("Unsupported platform: {0}")]
     UnsupportedPlatform(String),
 }

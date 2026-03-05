@@ -8,7 +8,6 @@ pub fn default_dtype_for_device(kind: BackendKind) -> DType {
         // Keep existing stability/perf preference on Metal.
         BackendKind::Metal => DType::F32,
         BackendKind::Cuda => DType::BF16,
-        BackendKind::Mlx => DType::F32,
     }
 }
 

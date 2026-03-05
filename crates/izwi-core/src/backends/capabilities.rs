@@ -21,8 +21,6 @@ impl BackendCapabilities {
             BackendKind::Cpu => self.cpu_compiled,
             BackendKind::Metal => self.metal_compiled,
             BackendKind::Cuda => self.cuda_compiled,
-            // MLX support is not implemented yet.
-            BackendKind::Mlx => false,
         }
     }
 }
@@ -38,8 +36,15 @@ mod tests {
     }
 
     #[test]
-    fn mlx_backend_is_reported_unavailable() {
+    fn metal_and_cuda_compile_flags_reflect_features() {
         let caps = BackendCapabilities::detect();
-        assert!(!caps.is_compiled_for(BackendKind::Mlx));
+        assert_eq!(
+            caps.is_compiled_for(BackendKind::Metal),
+            cfg!(feature = "metal")
+        );
+        assert_eq!(
+            caps.is_compiled_for(BackendKind::Cuda),
+            cfg!(feature = "cuda")
+        );
     }
 }

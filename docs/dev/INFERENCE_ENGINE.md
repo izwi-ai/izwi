@@ -51,7 +51,7 @@ Izwi is a **multi-modal audio inference server** built in Rust. Its inference en
 | High throughput | Continuous batching, chunked prefill |
 | Low latency | Paged KV-cache, streaming output |
 | Memory efficiency | Block-level KV-cache with reference counting |
-| Hardware flexibility | `BackendRouter` selects CPU / Metal / MLX at runtime |
+| Hardware flexibility | `BackendRouter` selects CPU / Metal / CUDA at runtime |
 | OpenAI compatibility | Drop-in replacement for `/v1/audio/*`, `/v1/chat/*` |
 | Extensibility | Trait-based model executor, pluggable scheduler policies |
 
@@ -86,7 +86,7 @@ Izwi is a **multi-modal audio inference server** built in Rust. Its inference en
 │                         │                                       │
 │  ┌──────────────────────▼──────────────────────────────────┐    │
 │  │            Backend Router (backends/)                   │    │
-│  │   CandleNative │ CandleMetal │ MlxNative                │    │
+│  │   CandleNative │ CandleMetal │ CandleCuda               │    │
 │  └──────────────────────┬──────────────────────────────────┘    │
 │                         │                                       │
 │  ┌──────────────────────▼──────────────────────────────────┐    │
@@ -157,7 +157,7 @@ Sub-modules handle task-specific orchestration:
 ```rust
 pub enum ModelFamily { Whisper, Qwen, Lfm2, Dia, … }
 pub enum ModelTask   { Asr, Tts, Chat, Diarization, … }
-pub enum InferenceBackendHint { Native, Metal, Mlx }
+pub enum InferenceBackendHint { CandleNative }
 ```
 
 `ModelVariant` implements:
@@ -175,7 +175,7 @@ The `parse_model_variant` function and task-specific resolvers (`resolve_tts_var
 pub enum ExecutionBackend {
     CandleNative,   // CPU via candle
     CandleMetal,    // Apple GPU via candle + Metal
-    MlxNative,      // Apple Silicon via MLX-Swift bridge
+    CandleCuda,     // NVIDIA GPU via candle + CUDA
 }
 ```
 

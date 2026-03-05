@@ -342,9 +342,7 @@ impl ModelExecutor for NativeExecutor {
             let device = match self.config.backend {
                 BackendKind::Metal => DeviceSelector::detect_with_preference(Some("metal"))?,
                 BackendKind::Cuda => DeviceSelector::detect_with_preference(Some("cuda"))?,
-                BackendKind::Cpu | BackendKind::Mlx => {
-                    DeviceSelector::detect_with_preference(Some("cpu"))?
-                }
+                BackendKind::Cpu => DeviceSelector::detect_with_preference(Some("cpu"))?,
             };
             let model = Qwen3TtsModel::load(
                 &self.config.models_dir,

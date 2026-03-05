@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use tracing::info;
 
-use crate::backends::{BackendPlan, ExecutionBackend};
+use crate::backends::BackendPlan;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::runtime::service::RuntimeService;
@@ -27,13 +27,6 @@ impl RuntimeService {
             "Selected backend {:?} for {} ({})",
             backend_plan.backend, variant, backend_plan.reason
         );
-
-        if matches!(backend_plan.backend, ExecutionBackend::MlxNative) {
-            return Err(Error::MlxError(format!(
-                "MLX runtime backend selected for {} but native MLX execution is not implemented yet",
-                variant.dir_name()
-            )));
-        }
 
         Ok(ResolvedModelLoad {
             variant,

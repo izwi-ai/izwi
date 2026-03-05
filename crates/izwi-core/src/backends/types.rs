@@ -6,7 +6,6 @@ pub enum BackendKind {
     Cpu,
     Metal,
     Cuda,
-    Mlx,
 }
 
 impl BackendKind {
@@ -15,7 +14,6 @@ impl BackendKind {
             Self::Cpu => "cpu",
             Self::Metal => "metal",
             Self::Cuda => "cuda",
-            Self::Mlx => "mlx",
         }
     }
 }
@@ -65,7 +63,6 @@ pub enum ExecutionBackend {
     CandleNative,
     CandleMetal,
     CandleCuda,
-    MlxNative,
 }
 
 impl ExecutionBackend {
@@ -74,7 +71,6 @@ impl ExecutionBackend {
             Self::CandleNative => BackendKind::Cpu,
             Self::CandleMetal => BackendKind::Metal,
             Self::CandleCuda => BackendKind::Cuda,
-            Self::MlxNative => BackendKind::Mlx,
         }
     }
 
@@ -83,7 +79,6 @@ impl ExecutionBackend {
             BackendKind::Cpu => Self::CandleNative,
             BackendKind::Metal => Self::CandleMetal,
             BackendKind::Cuda => Self::CandleCuda,
-            BackendKind::Mlx => Self::MlxNative,
         }
     }
 }
@@ -94,12 +89,30 @@ mod tests {
 
     #[test]
     fn parse_backend_preference_variants() {
-        assert_eq!(BackendPreference::parse("auto"), Some(BackendPreference::Auto));
-        assert_eq!(BackendPreference::parse("cpu"), Some(BackendPreference::Cpu));
-        assert_eq!(BackendPreference::parse("metal"), Some(BackendPreference::Metal));
-        assert_eq!(BackendPreference::parse("mps"), Some(BackendPreference::Metal));
-        assert_eq!(BackendPreference::parse("cuda"), Some(BackendPreference::Cuda));
-        assert_eq!(BackendPreference::parse("gpu"), Some(BackendPreference::Cuda));
+        assert_eq!(
+            BackendPreference::parse("auto"),
+            Some(BackendPreference::Auto)
+        );
+        assert_eq!(
+            BackendPreference::parse("cpu"),
+            Some(BackendPreference::Cpu)
+        );
+        assert_eq!(
+            BackendPreference::parse("metal"),
+            Some(BackendPreference::Metal)
+        );
+        assert_eq!(
+            BackendPreference::parse("mps"),
+            Some(BackendPreference::Metal)
+        );
+        assert_eq!(
+            BackendPreference::parse("cuda"),
+            Some(BackendPreference::Cuda)
+        );
+        assert_eq!(
+            BackendPreference::parse("gpu"),
+            Some(BackendPreference::Cuda)
+        );
     }
 
     #[test]
@@ -114,7 +127,6 @@ mod tests {
             ExecutionBackend::CandleNative,
             ExecutionBackend::CandleMetal,
             ExecutionBackend::CandleCuda,
-            ExecutionBackend::MlxNative,
         ] {
             assert_eq!(ExecutionBackend::from_kind(backend.kind()), backend);
         }

@@ -36,7 +36,6 @@ pub enum ModelTask {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InferenceBackendHint {
     CandleNative,
-    MlxCandidate,
 }
 
 #[derive(Debug, Clone)]
@@ -136,11 +135,7 @@ impl ModelVariant {
     }
 
     pub fn backend_hint(&self) -> InferenceBackendHint {
-        if self.repo_id().starts_with("mlx-community/") {
-            InferenceBackendHint::MlxCandidate
-        } else {
-            InferenceBackendHint::CandleNative
-        }
+        InferenceBackendHint::CandleNative
     }
 }
 

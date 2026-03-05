@@ -37,16 +37,14 @@ impl BackendRouter {
                 _ => Some(Self::backend_for_preference(preference)),
             })
             .or_else(|| {
-                std::env::var("IZWI_USE_METAL")
-                    .ok()
-                    .and_then(|raw| {
-                        let value = raw.trim().to_ascii_lowercase();
-                        if matches!(value.as_str(), "1" | "true" | "yes" | "on") {
-                            Some(ExecutionBackend::CandleMetal)
-                        } else {
-                            None
-                        }
-                    })
+                std::env::var("IZWI_USE_METAL").ok().and_then(|raw| {
+                    let value = raw.trim().to_ascii_lowercase();
+                    if matches!(value.as_str(), "1" | "true" | "yes" | "on") {
+                        Some(ExecutionBackend::CandleMetal)
+                    } else {
+                        None
+                    }
+                })
             });
 
         Self::with_default(override_backend.unwrap_or(default_backend))
@@ -90,18 +88,9 @@ impl BackendRouter {
             ExecutionBackend::CandleMetal => "Metal backend",
             ExecutionBackend::CandleNative => "native CPU backend",
             ExecutionBackend::CandleCuda => "CUDA backend",
-            ExecutionBackend::MlxNative => "MLX runtime",
         };
 
         match variant.backend_hint() {
-            InferenceBackendHint::MlxCandidate => BackendPlan {
-                backend: self.default_backend,
-                reason: format!(
-                    "{} is MLX-compatible; using {}",
-                    variant.dir_name(),
-                    default_desc
-                ),
-            },
             InferenceBackendHint::CandleNative => BackendPlan {
                 backend: self.default_backend,
                 reason: format!(
