@@ -15,9 +15,7 @@ use tracing::{debug, error, info_span};
 
 use crate::artifacts::{DownloadProgress, ModelManager};
 use crate::audio::{AudioCodec, AudioEncoder, StreamingConfig};
-use crate::backends::{
-    BackendPreference, BackendRouter, BackendSelectionSource, DeviceKind, DeviceProfile,
-};
+use crate::backends::{BackendRouter, BackendSelectionSource, DeviceProfile};
 use crate::catalog::{ModelInfo, ModelVariant};
 use crate::config::EngineConfig;
 use crate::engine::{
@@ -319,28 +317,16 @@ impl Drop for PendingRequestGuard {
 
 impl RuntimeService {
     fn ensure_requested_backend_available(
-        preference: BackendPreference,
-        detected: DeviceKind,
+        backend_context: &crate::backends::BackendContext,
     ) -> Result<()> {
-        let matched = match preference {
-            BackendPreference::Auto => true,
-            BackendPreference::Cpu => detected == DeviceKind::Cpu,
-            BackendPreference::Metal => detected == DeviceKind::Metal,
-            BackendPreference::Cuda => detected == DeviceKind::Cuda,
-        };
-
-        if matched {
+        if backend_context.matches_preference() {
             return Ok(());
         }
 
         Err(Error::InferenceError(format!(
             "Requested backend `{}` is not available on this runtime (detected `{}`)",
-            preference.as_str(),
-            match detected {
-                DeviceKind::Cpu => "cpu",
-                DeviceKind::Metal => "metal",
-                DeviceKind::Cuda => "cuda",
-            }
+            backend_context.preference.as_str(),
+            backend_context.backend_kind.as_str(),
         )))
     }
 
@@ -352,7 +338,7 @@ impl RuntimeService {
         let backend_context =
             BackendRouter::resolve_context(config.backend, BackendSelectionSource::Config);
         let device = backend_context.device.clone();
-        Self::ensure_requested_backend_available(config.backend, device.kind)?;
+        Self::ensure_requested_backend_available(&backend_context)?;
         let selected_backend_kind = backend_context.backend_kind;
 
         let model_registry = Arc::new(ModelRegistry::new(
