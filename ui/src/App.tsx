@@ -1,19 +1,13 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Navigate, Route, Routes } from "react-router-dom";
 import { api, ModelInfo } from "./api";
 import { useTheme } from "@/app/providers/ThemeProvider";
-import { Layout } from "./components/Layout";
+import { AppRoutes } from "@/app/router/AppRoutes";
+import type {
+  ModelsRouteProps,
+  SharedPageProps,
+  VoiceRouteProps,
+} from "@/app/router/types";
 import { VIEW_CONFIGS } from "./types";
-import {
-  TextToSpeechPage,
-  VoiceCloningPage,
-  VoiceDesignPage,
-  TranscriptionPage,
-  DiarizationPage,
-  ChatPage,
-  VoicePage,
-  MyModelsPage,
-} from "./pages";
 
 function App() {
   const { resolvedTheme, themePreference, setThemePreference } = useTheme();
@@ -481,7 +475,7 @@ function App() {
 
   const readyModelsCount = models.filter((m) => m.status === "ready").length;
 
-  const pageProps = {
+  const pageProps: SharedPageProps = {
     models,
     selectedModel,
     loading,
@@ -496,75 +490,42 @@ function App() {
     onRefresh: loadModels,
   };
 
+  const voicePageProps: VoiceRouteProps = {
+    models,
+    loading,
+    downloadProgress,
+    onDownload: handleDownload,
+    onCancelDownload: handleCancelDownload,
+    onLoad: handleLoad,
+    onUnload: handleUnload,
+    onDelete: handleDelete,
+    onError: setError,
+  };
+
+  const modelsPageProps: ModelsRouteProps = {
+    models,
+    loading,
+    downloadProgress,
+    onDownload: handleDownload,
+    onCancelDownload: handleCancelDownload,
+    onLoad: handleLoad,
+    onUnload: handleUnload,
+    onDelete: handleDelete,
+    onRefresh: loadModels,
+  };
+
   return (
-    <Routes>
-      <Route
-        element={
-          <Layout
-            error={error}
-            onErrorDismiss={() => setError(null)}
-            readyModelsCount={readyModelsCount}
-            resolvedTheme={resolvedTheme}
-            themePreference={themePreference}
-            onThemePreferenceChange={setThemePreference}
-          />
-        }
-      >
-        <Route
-          path="/text-to-speech"
-          element={<TextToSpeechPage {...pageProps} />}
-        />
-        <Route
-          path="/voice-cloning"
-          element={<VoiceCloningPage {...pageProps} />}
-        />
-        <Route
-          path="/voice-design"
-          element={<VoiceDesignPage {...pageProps} />}
-        />
-        <Route
-          path="/transcription"
-          element={<TranscriptionPage {...pageProps} />}
-        />
-        <Route path="/diarization" element={<DiarizationPage {...pageProps} />} />
-        <Route path="/chat" element={<ChatPage {...pageProps} />} />
-        <Route
-          path="/voice"
-          element={
-            <VoicePage
-              models={models}
-              loading={loading}
-              downloadProgress={downloadProgress}
-              onDownload={handleDownload}
-              onCancelDownload={handleCancelDownload}
-              onLoad={handleLoad}
-              onUnload={handleUnload}
-              onDelete={handleDelete}
-              onError={setError}
-            />
-          }
-        />
-        <Route
-          path="/models"
-          element={
-            <MyModelsPage
-              models={models}
-              loading={loading}
-              downloadProgress={downloadProgress}
-              onDownload={handleDownload}
-              onCancelDownload={handleCancelDownload}
-              onLoad={handleLoad}
-              onUnload={handleUnload}
-              onDelete={handleDelete}
-              onRefresh={loadModels}
-            />
-          }
-        />
-        <Route path="/my-models" element={<Navigate to="/models" replace />} />
-        <Route path="/" element={<Navigate to="/voice" replace />} />
-        <Route path="*" element={<Navigate to="/voice" replace />} />
-      </Route>
-    </Routes>
+    <AppRoutes
+      error={error}
+      onErrorDismiss={() => setError(null)}
+      readyModelsCount={readyModelsCount}
+      resolvedTheme={resolvedTheme}
+      themePreference={themePreference}
+      onThemePreferenceChange={setThemePreference}
+      pageProps={pageProps}
+      voicePageProps={voicePageProps}
+      modelsPageProps={modelsPageProps}
+    />
   );
 }
 

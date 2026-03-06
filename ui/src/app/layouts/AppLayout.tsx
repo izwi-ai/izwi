@@ -104,7 +104,7 @@ const BOTTOM_NAV_ITEMS: NavItem[] = [
   },
 ];
 
-export function Layout({
+export function AppLayout({
   error,
   onErrorDismiss,
   readyModelsCount,
