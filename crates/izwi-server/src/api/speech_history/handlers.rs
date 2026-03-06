@@ -25,6 +25,7 @@ use izwi_core::{
 };
 
 const HISTORY_LIST_LIMIT: usize = 200;
+const DEFAULT_STREAM_EVENT_QUEUE_CAPACITY: usize = 32;
 
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct RecordAudioQuery {
@@ -100,6 +101,21 @@ struct SpeechStreamEvent {
     record: Option<SpeechHistoryRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+fn stream_event_queue_capacity() -> usize {
+    std::env::var("IZWI_AUDIO_STREAM_EVENT_QUEUE_CAPACITY")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_STREAM_EVENT_QUEUE_CAPACITY)
+}
+
+async fn send_stream_event(
+    event_tx: &mpsc::Sender<String>,
+    event: SpeechStreamEvent,
+) -> Result<(), ()> {
+    event_tx.send(to_stream_json(event)).await.map_err(|_| ())
 }
 
 pub async fn list_text_to_speech_records(
@@ -385,62 +401,78 @@ async fn stream_record_creation(
     let speech_store = state.speech_history_store.clone();
     let semaphore = state.request_semaphore.clone();
 
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<String>();
+    let (event_tx, mut event_rx) = mpsc::channel::<String>(stream_event_queue_capacity());
 
     tokio::spawn(async move {
         let _permit = match semaphore.acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => {
-                let _ = event_tx.send(to_stream_json(SpeechStreamEvent {
-                    event: "error",
-                    request_id: Some(stream_request_id.clone()),
-                    sequence: None,
-                    audio_base64: None,
-                    sample_count: None,
-                    sample_rate: None,
-                    audio_format: None,
-                    tokens_generated: None,
-                    generation_time_ms: None,
-                    audio_duration_secs: None,
-                    rtf: None,
-                    record: None,
-                    error: Some("Server is shutting down".to_string()),
-                }));
-                let _ = event_tx.send(to_stream_json(SpeechStreamEvent {
-                    event: "done",
-                    request_id: Some(stream_request_id),
-                    sequence: None,
-                    audio_base64: None,
-                    sample_count: None,
-                    sample_rate: None,
-                    audio_format: None,
-                    tokens_generated: None,
-                    generation_time_ms: None,
-                    audio_duration_secs: None,
-                    rtf: None,
-                    record: None,
-                    error: None,
-                }));
+                let _ = send_stream_event(
+                    &event_tx,
+                    SpeechStreamEvent {
+                        event: "error",
+                        request_id: Some(stream_request_id.clone()),
+                        sequence: None,
+                        audio_base64: None,
+                        sample_count: None,
+                        sample_rate: None,
+                        audio_format: None,
+                        tokens_generated: None,
+                        generation_time_ms: None,
+                        audio_duration_secs: None,
+                        rtf: None,
+                        record: None,
+                        error: Some("Server is shutting down".to_string()),
+                    },
+                )
+                .await;
+                let _ = send_stream_event(
+                    &event_tx,
+                    SpeechStreamEvent {
+                        event: "done",
+                        request_id: Some(stream_request_id),
+                        sequence: None,
+                        audio_base64: None,
+                        sample_count: None,
+                        sample_rate: None,
+                        audio_format: None,
+                        tokens_generated: None,
+                        generation_time_ms: None,
+                        audio_duration_secs: None,
+                        rtf: None,
+                        record: None,
+                        error: None,
+                    },
+                )
+                .await;
                 return;
             }
         };
 
         let sample_rate = runtime.sample_rate().await;
-        let _ = event_tx.send(to_stream_json(SpeechStreamEvent {
-            event: "start",
-            request_id: Some(stream_request_id.clone()),
-            sequence: None,
-            audio_base64: None,
-            sample_count: None,
-            sample_rate: Some(sample_rate),
-            audio_format: Some("pcm_i16"),
-            tokens_generated: None,
-            generation_time_ms: None,
-            audio_duration_secs: None,
-            rtf: None,
-            record: None,
-            error: None,
-        }));
+        if send_stream_event(
+            &event_tx,
+            SpeechStreamEvent {
+                event: "start",
+                request_id: Some(stream_request_id.clone()),
+                sequence: None,
+                audio_base64: None,
+                sample_count: None,
+                sample_rate: Some(sample_rate),
+                audio_format: Some("pcm_i16"),
+                tokens_generated: None,
+                generation_time_ms: None,
+                audio_duration_secs: None,
+                rtf: None,
+                record: None,
+                error: None,
+            },
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
 
         let mut total_samples = 0usize;
         let mut total_tokens = 0usize;
@@ -459,6 +491,7 @@ async fn stream_record_creation(
             });
 
             let mut encoding_failed = false;
+            let mut stream_closed = false;
             while let Some(chunk) = chunk_rx.recv().await {
                 if chunk.samples.is_empty() {
                     continue;
@@ -473,7 +506,73 @@ async fn stream_record_creation(
                 let chunk_bytes = match stream_encoder.encode(&chunk.samples, AudioFormat::RawI16) {
                     Ok(bytes) => bytes,
                     Err(err) => {
-                        let _ = event_tx.send(to_stream_json(SpeechStreamEvent {
+                        let _ = send_stream_event(
+                            &event_tx,
+                            SpeechStreamEvent {
+                                event: "error",
+                                request_id: Some(stream_request_id.clone()),
+                                sequence: None,
+                                audio_base64: None,
+                                sample_count: None,
+                                sample_rate: None,
+                                audio_format: None,
+                                tokens_generated: None,
+                                generation_time_ms: None,
+                                audio_duration_secs: None,
+                                rtf: None,
+                                record: None,
+                                error: Some(format!("Failed to encode stream chunk: {err}")),
+                            },
+                        )
+                        .await;
+                        encoding_failed = true;
+                        break;
+                    }
+                };
+
+                if send_stream_event(
+                    &event_tx,
+                    SpeechStreamEvent {
+                        event: "chunk",
+                        request_id: Some(stream_request_id.clone()),
+                        sequence: Some(global_sequence),
+                        audio_base64: Some(
+                            base64::engine::general_purpose::STANDARD.encode(chunk_bytes),
+                        ),
+                        sample_count: Some(chunk.samples.len()),
+                        sample_rate: None,
+                        audio_format: None,
+                        tokens_generated: None,
+                        generation_time_ms: None,
+                        audio_duration_secs: None,
+                        rtf: None,
+                        record: None,
+                        error: None,
+                    },
+                )
+                .await
+                .is_err()
+                {
+                    stream_closed = true;
+                    break;
+                }
+                global_sequence = global_sequence.saturating_add(1);
+            }
+
+            drop(chunk_rx);
+            let generation_outcome = generation_task.await;
+            if encoding_failed || stream_closed {
+                let _ = generation_outcome;
+                failed = true;
+                break;
+            }
+
+            match generation_outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    let _ = send_stream_event(
+                        &event_tx,
+                        SpeechStreamEvent {
                             event: "error",
                             request_id: Some(stream_request_id.clone()),
                             sequence: None,
@@ -486,77 +585,33 @@ async fn stream_record_creation(
                             audio_duration_secs: None,
                             rtf: None,
                             record: None,
-                            error: Some(format!("Failed to encode stream chunk: {err}")),
-                        }));
-                        encoding_failed = true;
-                        break;
-                    }
-                };
-
-                let _ = event_tx.send(to_stream_json(SpeechStreamEvent {
-                    event: "chunk",
-                    request_id: Some(stream_request_id.clone()),
-                    sequence: Some(global_sequence),
-                    audio_base64: Some(
-                        base64::engine::general_purpose::STANDARD.encode(chunk_bytes),
-                    ),
-                    sample_count: Some(chunk.samples.len()),
-                    sample_rate: None,
-                    audio_format: None,
-                    tokens_generated: None,
-                    generation_time_ms: None,
-                    audio_duration_secs: None,
-                    rtf: None,
-                    record: None,
-                    error: None,
-                }));
-                global_sequence = global_sequence.saturating_add(1);
-            }
-
-            let generation_outcome = generation_task.await;
-            if encoding_failed {
-                let _ = generation_outcome;
-                failed = true;
-                break;
-            }
-
-            match generation_outcome {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    let _ = event_tx.send(to_stream_json(SpeechStreamEvent {
-                        event: "error",
-                        request_id: Some(stream_request_id.clone()),
-                        sequence: None,
-                        audio_base64: None,
-                        sample_count: None,
-                        sample_rate: None,
-                        audio_format: None,
-                        tokens_generated: None,
-                        generation_time_ms: None,
-                        audio_duration_secs: None,
-                        rtf: None,
-                        record: None,
-                        error: Some(err.to_string()),
-                    }));
+                            error: Some(err.to_string()),
+                        },
+                    )
+                    .await;
                     failed = true;
                     break;
                 }
                 Err(err) => {
-                    let _ = event_tx.send(to_stream_json(SpeechStreamEvent {
-                        event: "error",
-                        request_id: Some(stream_request_id.clone()),
-                        sequence: None,
-                        audio_base64: None,
-                        sample_count: None,
-                        sample_rate: None,
-                        audio_format: None,
-                        tokens_generated: None,
-                        generation_time_ms: None,
-                        audio_duration_secs: None,
-                        rtf: None,
-                        record: None,
-                        error: Some(format!("Streaming task failed: {err}")),
-                    }));
+                    let _ = send_stream_event(
+                        &event_tx,
+                        SpeechStreamEvent {
+                            event: "error",
+                            request_id: Some(stream_request_id.clone()),
+                            sequence: None,
+                            audio_base64: None,
+                            sample_count: None,
+                            sample_rate: None,
+                            audio_format: None,
+                            tokens_generated: None,
+                            generation_time_ms: None,
+                            audio_duration_secs: None,
+                            rtf: None,
+                            record: None,
+                            error: Some(format!("Streaming task failed: {err}")),
+                        },
+                    )
+                    .await;
                     failed = true;
                     break;
                 }
@@ -600,76 +655,94 @@ async fn stream_record_creation(
 
                     match record_result {
                         Ok(record) => {
-                            let _ = event_tx.send(to_stream_json(SpeechStreamEvent {
-                                event: "final",
-                                request_id: Some(stream_request_id.clone()),
-                                sequence: None,
-                                audio_base64: None,
-                                sample_count: None,
-                                sample_rate: None,
-                                audio_format: None,
-                                tokens_generated: Some(total_tokens),
-                                generation_time_ms: Some(generation_time_ms),
-                                audio_duration_secs: Some(audio_duration_secs),
-                                rtf: Some(rtf),
-                                record: Some(record),
-                                error: None,
-                            }));
+                            let _ = send_stream_event(
+                                &event_tx,
+                                SpeechStreamEvent {
+                                    event: "final",
+                                    request_id: Some(stream_request_id.clone()),
+                                    sequence: None,
+                                    audio_base64: None,
+                                    sample_count: None,
+                                    sample_rate: None,
+                                    audio_format: None,
+                                    tokens_generated: Some(total_tokens),
+                                    generation_time_ms: Some(generation_time_ms),
+                                    audio_duration_secs: Some(audio_duration_secs),
+                                    rtf: Some(rtf),
+                                    record: Some(record),
+                                    error: None,
+                                },
+                            )
+                            .await;
                         }
                         Err(err) => {
-                            let _ = event_tx.send(to_stream_json(SpeechStreamEvent {
-                                event: "error",
-                                request_id: Some(stream_request_id.clone()),
-                                sequence: None,
-                                audio_base64: None,
-                                sample_count: None,
-                                sample_rate: None,
-                                audio_format: None,
-                                tokens_generated: None,
-                                generation_time_ms: None,
-                                audio_duration_secs: None,
-                                rtf: None,
-                                record: None,
-                                error: Some(format!("Failed to save speech history record: {err}")),
-                            }));
+                            let _ = send_stream_event(
+                                &event_tx,
+                                SpeechStreamEvent {
+                                    event: "error",
+                                    request_id: Some(stream_request_id.clone()),
+                                    sequence: None,
+                                    audio_base64: None,
+                                    sample_count: None,
+                                    sample_rate: None,
+                                    audio_format: None,
+                                    tokens_generated: None,
+                                    generation_time_ms: None,
+                                    audio_duration_secs: None,
+                                    rtf: None,
+                                    record: None,
+                                    error: Some(format!(
+                                        "Failed to save speech history record: {err}"
+                                    )),
+                                },
+                            )
+                            .await;
                         }
                     }
                 }
                 Err(err) => {
-                    let _ = event_tx.send(to_stream_json(SpeechStreamEvent {
-                        event: "error",
-                        request_id: Some(stream_request_id.clone()),
-                        sequence: None,
-                        audio_base64: None,
-                        sample_count: None,
-                        sample_rate: None,
-                        audio_format: None,
-                        tokens_generated: None,
-                        generation_time_ms: None,
-                        audio_duration_secs: None,
-                        rtf: None,
-                        record: None,
-                        error: Some(format!("Failed to encode final WAV output: {err}")),
-                    }));
+                    let _ = send_stream_event(
+                        &event_tx,
+                        SpeechStreamEvent {
+                            event: "error",
+                            request_id: Some(stream_request_id.clone()),
+                            sequence: None,
+                            audio_base64: None,
+                            sample_count: None,
+                            sample_rate: None,
+                            audio_format: None,
+                            tokens_generated: None,
+                            generation_time_ms: None,
+                            audio_duration_secs: None,
+                            rtf: None,
+                            record: None,
+                            error: Some(format!("Failed to encode final WAV output: {err}")),
+                        },
+                    )
+                    .await;
                 }
             }
         }
 
-        let _ = event_tx.send(to_stream_json(SpeechStreamEvent {
-            event: "done",
-            request_id: Some(stream_request_id),
-            sequence: None,
-            audio_base64: None,
-            sample_count: None,
-            sample_rate: None,
-            audio_format: None,
-            tokens_generated: None,
-            generation_time_ms: None,
-            audio_duration_secs: None,
-            rtf: None,
-            record: None,
-            error: None,
-        }));
+        let _ = send_stream_event(
+            &event_tx,
+            SpeechStreamEvent {
+                event: "done",
+                request_id: Some(stream_request_id),
+                sequence: None,
+                audio_base64: None,
+                sample_count: None,
+                sample_rate: None,
+                audio_format: None,
+                tokens_generated: None,
+                generation_time_ms: None,
+                audio_duration_secs: None,
+                rtf: None,
+                record: None,
+                error: None,
+            },
+        )
+        .await;
     });
 
     let stream = async_stream::stream! {

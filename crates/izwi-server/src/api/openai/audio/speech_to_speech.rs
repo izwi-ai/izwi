@@ -16,7 +16,9 @@ use crate::api::request_context::RequestContext;
 use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::audio::{AudioEncoder, AudioFormat};
-use izwi_core::{parse_model_variant, ModelVariant};
+use izwi_core::{parse_model_variant, Error as CoreError, ModelVariant};
+
+const DEFAULT_STREAM_EVENT_QUEUE_CAPACITY: usize = 32;
 
 #[derive(Debug, Default)]
 struct SpeechToSpeechRequest {
@@ -77,6 +79,35 @@ struct SpeechToSpeechJsonPayload {
     top_k: Option<usize>,
     #[serde(default)]
     stream: Option<bool>,
+}
+
+fn stream_event_queue_capacity() -> usize {
+    std::env::var("IZWI_AUDIO_STREAM_EVENT_QUEUE_CAPACITY")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_STREAM_EVENT_QUEUE_CAPACITY)
+}
+
+async fn send_stream_event(
+    event_tx: &mpsc::Sender<String>,
+    event: SpeechToSpeechStreamEvent,
+) -> Result<(), ()> {
+    let payload = serde_json::to_string(&event).unwrap_or_default();
+    event_tx.send(payload).await.map_err(|_| ())
+}
+
+fn try_send_stream_event(
+    event_tx: &mpsc::Sender<String>,
+    event: SpeechToSpeechStreamEvent,
+) -> std::result::Result<(), String> {
+    let payload = serde_json::to_string(&event).unwrap_or_default();
+    event_tx.try_send(payload).map_err(|err| match err {
+        mpsc::error::TrySendError::Full(_) => {
+            "Streaming response backpressure exceeded queue capacity".to_string()
+        }
+        mpsc::error::TrySendError::Closed(_) => "Streaming response channel closed".to_string(),
+    })
 }
 
 pub async fn speech_to_speech(
@@ -145,7 +176,7 @@ async fn stream_response(
     let temperature = req.temperature;
     let top_k = req.top_k;
 
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<String>();
+    let (event_tx, mut event_rx) = mpsc::channel::<String>(stream_event_queue_capacity());
     let engine = state.runtime.clone();
     let semaphore = state.request_semaphore.clone();
 
@@ -153,8 +184,9 @@ async fn stream_response(
         let _permit = match semaphore.acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => {
-                let _ = event_tx.send(
-                    serde_json::to_string(&SpeechToSpeechStreamEvent {
+                let _ = send_stream_event(
+                    &event_tx,
+                    SpeechToSpeechStreamEvent {
                         event: "error",
                         sequence: None,
                         is_final: None,
@@ -165,11 +197,12 @@ async fn stream_response(
                         sample_rate: None,
                         generation_time_ms: None,
                         error: Some("Server is shutting down".to_string()),
-                    })
-                    .unwrap_or_default(),
-                );
-                let _ = event_tx.send(
-                    serde_json::to_string(&SpeechToSpeechStreamEvent {
+                    },
+                )
+                .await;
+                let _ = send_stream_event(
+                    &event_tx,
+                    SpeechToSpeechStreamEvent {
                         event: "done",
                         sequence: None,
                         is_final: None,
@@ -180,15 +213,16 @@ async fn stream_response(
                         sample_rate: None,
                         generation_time_ms: None,
                         error: None,
-                    })
-                    .unwrap_or_default(),
-                );
+                    },
+                )
+                .await;
                 return;
             }
         };
 
-        let _ = event_tx.send(
-            serde_json::to_string(&SpeechToSpeechStreamEvent {
+        if send_stream_event(
+            &event_tx,
+            SpeechToSpeechStreamEvent {
                 event: "start",
                 sequence: None,
                 is_final: None,
@@ -199,9 +233,13 @@ async fn stream_response(
                 sample_rate: None,
                 generation_time_ms: None,
                 error: None,
-            })
-            .unwrap_or_default(),
-        );
+            },
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
 
         let delta_tx = event_tx.clone();
         let audio_tx = event_tx.clone();
@@ -217,8 +255,9 @@ async fn stream_response(
                     top_k,
                     Some(correlation_id.as_str()),
                     move |delta| {
-                        let _ = delta_tx.send(
-                            serde_json::to_string(&SpeechToSpeechStreamEvent {
+                        try_send_stream_event(
+                            &delta_tx,
+                            SpeechToSpeechStreamEvent {
                                 event: "delta",
                                 sequence: None,
                                 is_final: None,
@@ -229,56 +268,41 @@ async fn stream_response(
                                 sample_rate: None,
                                 generation_time_ms: None,
                                 error: None,
-                            })
-                            .unwrap_or_default(),
-                        );
+                            },
+                        )
+                        .map_err(CoreError::InferenceError)
                     },
                     move |audio_chunk| {
                         if audio_chunk.samples.is_empty() && !audio_chunk.is_final {
-                            return;
+                            return Ok(());
                         }
 
-                        match stream_encoder.encode(&audio_chunk.samples, AudioFormat::RawI16) {
-                            Ok(bytes) => {
-                                let _ = audio_tx.send(
-                                    serde_json::to_string(&SpeechToSpeechStreamEvent {
-                                        event: "audio_chunk",
-                                        sequence: Some(audio_chunk.sequence),
-                                        is_final: Some(audio_chunk.is_final),
-                                        delta: None,
-                                        text: None,
-                                        transcription: None,
-                                        audio_base64: Some(
-                                            base64::engine::general_purpose::STANDARD.encode(bytes),
-                                        ),
-                                        sample_rate: Some(stream_sample_rate),
-                                        generation_time_ms: None,
-                                        error: None,
-                                    })
-                                    .unwrap_or_default(),
-                                );
-                            }
-                            Err(err) => {
-                                let _ = audio_tx.send(
-                                    serde_json::to_string(&SpeechToSpeechStreamEvent {
-                                        event: "error",
-                                        sequence: None,
-                                        is_final: None,
-                                        delta: None,
-                                        text: None,
-                                        transcription: None,
-                                        audio_base64: None,
-                                        sample_rate: None,
-                                        generation_time_ms: None,
-                                        error: Some(format!(
-                                            "Failed to encode audio chunk: {}",
-                                            err
-                                        )),
-                                    })
-                                    .unwrap_or_default(),
-                                );
-                            }
-                        }
+                        let bytes = stream_encoder
+                            .encode(&audio_chunk.samples, AudioFormat::RawI16)
+                            .map_err(|err| {
+                                CoreError::InferenceError(format!(
+                                    "Failed to encode audio chunk: {}",
+                                    err
+                                ))
+                            })?;
+                        try_send_stream_event(
+                            &audio_tx,
+                            SpeechToSpeechStreamEvent {
+                                event: "audio_chunk",
+                                sequence: Some(audio_chunk.sequence),
+                                is_final: Some(audio_chunk.is_final),
+                                delta: None,
+                                text: None,
+                                transcription: None,
+                                audio_base64: Some(
+                                    base64::engine::general_purpose::STANDARD.encode(bytes),
+                                ),
+                                sample_rate: Some(stream_sample_rate),
+                                generation_time_ms: None,
+                                error: None,
+                            },
+                        )
+                        .map_err(CoreError::InferenceError)
                     },
                 )
                 .await
@@ -288,8 +312,9 @@ async fn stream_response(
         match result {
             Ok(Ok(output)) => match samples_to_wav_base64(&output.samples, output.sample_rate) {
                 Ok(audio_base64) => {
-                    let _ = event_tx.send(
-                        serde_json::to_string(&SpeechToSpeechStreamEvent {
+                    let _ = send_stream_event(
+                        &event_tx,
+                        SpeechToSpeechStreamEvent {
                             event: "final",
                             sequence: None,
                             is_final: None,
@@ -300,13 +325,14 @@ async fn stream_response(
                             sample_rate: Some(output.sample_rate),
                             generation_time_ms: Some(output.generation_time_ms),
                             error: None,
-                        })
-                        .unwrap_or_default(),
-                    );
+                        },
+                    )
+                    .await;
                 }
                 Err(err) => {
-                    let _ = event_tx.send(
-                        serde_json::to_string(&SpeechToSpeechStreamEvent {
+                    let _ = send_stream_event(
+                        &event_tx,
+                        SpeechToSpeechStreamEvent {
                             event: "error",
                             sequence: None,
                             is_final: None,
@@ -317,14 +343,15 @@ async fn stream_response(
                             sample_rate: None,
                             generation_time_ms: None,
                             error: Some(err.message),
-                        })
-                        .unwrap_or_default(),
-                    );
+                        },
+                    )
+                    .await;
                 }
             },
             Ok(Err(err)) => {
-                let _ = event_tx.send(
-                    serde_json::to_string(&SpeechToSpeechStreamEvent {
+                let _ = send_stream_event(
+                    &event_tx,
+                    SpeechToSpeechStreamEvent {
                         event: "error",
                         sequence: None,
                         is_final: None,
@@ -335,13 +362,14 @@ async fn stream_response(
                         sample_rate: None,
                         generation_time_ms: None,
                         error: Some(err.to_string()),
-                    })
-                    .unwrap_or_default(),
-                );
+                    },
+                )
+                .await;
             }
             Err(_) => {
-                let _ = event_tx.send(
-                    serde_json::to_string(&SpeechToSpeechStreamEvent {
+                let _ = send_stream_event(
+                    &event_tx,
+                    SpeechToSpeechStreamEvent {
                         event: "error",
                         sequence: None,
                         is_final: None,
@@ -352,14 +380,15 @@ async fn stream_response(
                         sample_rate: None,
                         generation_time_ms: None,
                         error: Some("Request timed out".to_string()),
-                    })
-                    .unwrap_or_default(),
-                );
+                    },
+                )
+                .await;
             }
         }
 
-        let _ = event_tx.send(
-            serde_json::to_string(&SpeechToSpeechStreamEvent {
+        let _ = send_stream_event(
+            &event_tx,
+            SpeechToSpeechStreamEvent {
                 event: "done",
                 sequence: None,
                 is_final: None,
@@ -370,9 +399,9 @@ async fn stream_response(
                 sample_rate: None,
                 generation_time_ms: None,
                 error: None,
-            })
-            .unwrap_or_default(),
-        );
+            },
+        )
+        .await;
     });
 
     let stream = async_stream::stream! {

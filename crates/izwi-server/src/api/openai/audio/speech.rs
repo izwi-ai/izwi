@@ -22,6 +22,8 @@ use izwi_core::{
     parse_tts_model_variant, AudioChunk, GenerationConfig, GenerationRequest, ModelVariant,
 };
 
+const DEFAULT_STREAM_EVENT_QUEUE_CAPACITY: usize = 32;
+
 /// OpenAI-compatible speech synthesis request.
 #[derive(Debug, Deserialize)]
 pub struct SpeechRequest {
@@ -94,6 +96,22 @@ struct SpeechStreamEvent {
     rtf: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+fn stream_event_queue_capacity() -> usize {
+    std::env::var("IZWI_AUDIO_STREAM_EVENT_QUEUE_CAPACITY")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_STREAM_EVENT_QUEUE_CAPACITY)
+}
+
+async fn send_stream_event(
+    event_tx: &mpsc::Sender<String>,
+    event: SpeechStreamEvent,
+) -> Result<(), ()> {
+    let payload = serde_json::to_string(&event).unwrap_or_default();
+    event_tx.send(payload).await.map_err(|_| ())
 }
 
 pub async fn speech(
@@ -209,7 +227,7 @@ async fn stream_speech(
     let gen_request = build_generation_request(&req, correlation_id, true);
     let stream_request_id = gen_request.id.clone();
     let stream_audio_format = stream_audio_format_label(format);
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<String>();
+    let (event_tx, mut event_rx) = mpsc::channel::<String>(stream_event_queue_capacity());
 
     let engine = state.runtime.clone();
     let semaphore = state.request_semaphore.clone();
@@ -232,7 +250,7 @@ async fn stream_speech(
                     rtf: None,
                     error: Some("Server is shutting down".to_string()),
                 };
-                let _ = event_tx.send(serde_json::to_string(&error_event).unwrap_or_default());
+                let _ = send_stream_event(&event_tx, error_event).await;
 
                 let done_event = SpeechStreamEvent {
                     event: "done",
@@ -249,7 +267,7 @@ async fn stream_speech(
                     rtf: None,
                     error: None,
                 };
-                let _ = event_tx.send(serde_json::to_string(&done_event).unwrap_or_default());
+                let _ = send_stream_event(&event_tx, done_event).await;
                 return;
             }
         };
@@ -270,7 +288,9 @@ async fn stream_speech(
             rtf: None,
             error: None,
         };
-        let _ = event_tx.send(serde_json::to_string(&start_event).unwrap_or_default());
+        if send_stream_event(&event_tx, start_event).await.is_err() {
+            return;
+        }
 
         let (chunk_tx, mut chunk_rx) = mpsc::channel::<AudioChunk>(32);
         let generation_engine = engine.clone();
@@ -283,6 +303,8 @@ async fn stream_speech(
         let mut total_samples = 0usize;
         let stream_started = Instant::now();
         let encoder = izwi_core::audio::AudioEncoder::new(sample_rate, 1);
+        let mut client_closed = false;
+        let mut stream_failed = false;
         while let Some(chunk) = chunk_rx.recv().await {
             if chunk.samples.is_empty() {
                 continue;
@@ -307,7 +329,8 @@ async fn stream_speech(
                         rtf: None,
                         error: Some(format!("Failed to encode audio chunk: {}", err)),
                     };
-                    let _ = event_tx.send(serde_json::to_string(&error_event).unwrap_or_default());
+                    let _ = send_stream_event(&event_tx, error_event).await;
+                    stream_failed = true;
                     break;
                 }
             };
@@ -327,7 +350,37 @@ async fn stream_speech(
                 rtf: None,
                 error: None,
             };
-            let _ = event_tx.send(serde_json::to_string(&chunk_event).unwrap_or_default());
+            if send_stream_event(&event_tx, chunk_event).await.is_err() {
+                client_closed = true;
+                break;
+            }
+        }
+
+        drop(chunk_rx);
+        if client_closed {
+            let _ = generation_task.await;
+            return;
+        }
+
+        if stream_failed {
+            let _ = generation_task.await;
+            let done_event = SpeechStreamEvent {
+                event: "done",
+                request_id: Some(stream_request_id),
+                sequence: None,
+                audio_base64: None,
+                sample_count: None,
+                is_final: None,
+                sample_rate: None,
+                audio_format: None,
+                tokens_generated: None,
+                generation_time_ms: None,
+                audio_duration_secs: None,
+                rtf: None,
+                error: None,
+            };
+            let _ = send_stream_event(&event_tx, done_event).await;
+            return;
         }
 
         let generation_outcome = generation_task.await;
@@ -357,7 +410,7 @@ async fn stream_speech(
                     rtf: Some(rtf),
                     error: None,
                 };
-                let _ = event_tx.send(serde_json::to_string(&final_event).unwrap_or_default());
+                let _ = send_stream_event(&event_tx, final_event).await;
             }
             Ok(Err(err)) => {
                 let error_event = SpeechStreamEvent {
@@ -375,7 +428,7 @@ async fn stream_speech(
                     rtf: None,
                     error: Some(err.to_string()),
                 };
-                let _ = event_tx.send(serde_json::to_string(&error_event).unwrap_or_default());
+                let _ = send_stream_event(&event_tx, error_event).await;
             }
             Err(err) => {
                 let error_event = SpeechStreamEvent {
@@ -393,7 +446,7 @@ async fn stream_speech(
                     rtf: None,
                     error: Some(format!("Streaming task failed: {}", err)),
                 };
-                let _ = event_tx.send(serde_json::to_string(&error_event).unwrap_or_default());
+                let _ = send_stream_event(&event_tx, error_event).await;
             }
         }
 
@@ -412,7 +465,7 @@ async fn stream_speech(
             rtf: None,
             error: None,
         };
-        let _ = event_tx.send(serde_json::to_string(&done_event).unwrap_or_default());
+        let _ = send_stream_event(&event_tx, done_event).await;
     });
 
     let stream = async_stream::stream! {

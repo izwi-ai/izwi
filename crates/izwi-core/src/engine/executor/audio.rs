@@ -51,7 +51,7 @@ impl NativeExecutor {
 
     pub(super) fn transcribe_with_chunk_plan<F>(
         request_id: &str,
-        stream_tx: Option<&mpsc::UnboundedSender<StreamingOutput>>,
+        stream_tx: Option<&mpsc::Sender<StreamingOutput>>,
         sequence: &mut usize,
         samples: &[f32],
         sample_rate: u32,

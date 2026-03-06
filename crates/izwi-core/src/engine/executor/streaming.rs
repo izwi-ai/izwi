@@ -9,7 +9,7 @@ use super::NativeExecutor;
 impl NativeExecutor {
     pub(super) fn stream_sender(
         request: &EngineCoreRequest,
-    ) -> Option<mpsc::UnboundedSender<StreamingOutput>> {
+    ) -> Option<mpsc::Sender<StreamingOutput>> {
         if request.streaming {
             request.streaming_tx.clone()
         } else {
@@ -18,12 +18,12 @@ impl NativeExecutor {
     }
 
     pub(super) fn stream_text(
-        tx: &mpsc::UnboundedSender<StreamingOutput>,
+        tx: &mpsc::Sender<StreamingOutput>,
         request_id: &str,
         sequence: &mut usize,
         text: String,
     ) -> Result<()> {
-        tx.send(StreamingOutput {
+        tx.try_send(StreamingOutput {
             request_id: request_id.to_string(),
             sequence: *sequence,
             samples: Vec::new(),
@@ -32,20 +32,20 @@ impl NativeExecutor {
             text: Some(text),
             stats: None,
         })
-        .map_err(|_| Error::InferenceError("Streaming output channel closed".to_string()))?;
+        .map_err(stream_send_error)?;
         *sequence += 1;
         Ok(())
     }
 
     pub(super) fn stream_audio(
-        tx: &mpsc::UnboundedSender<StreamingOutput>,
+        tx: &mpsc::Sender<StreamingOutput>,
         request_id: &str,
         sequence: &mut usize,
         samples: Vec<f32>,
         sample_rate: u32,
         is_final: bool,
     ) -> Result<()> {
-        tx.send(StreamingOutput {
+        tx.try_send(StreamingOutput {
             request_id: request_id.to_string(),
             sequence: *sequence,
             samples,
@@ -54,16 +54,27 @@ impl NativeExecutor {
             text: None,
             stats: None,
         })
-        .map_err(|_| Error::InferenceError("Streaming output channel closed".to_string()))?;
+        .map_err(stream_send_error)?;
         *sequence += 1;
         Ok(())
     }
 
     pub(super) fn stream_final_marker(
-        tx: &mpsc::UnboundedSender<StreamingOutput>,
+        tx: &mpsc::Sender<StreamingOutput>,
         request_id: &str,
         sequence: &mut usize,
     ) -> Result<()> {
         Self::stream_audio(tx, request_id, sequence, Vec::new(), 0, true)
+    }
+}
+
+fn stream_send_error(err: mpsc::error::TrySendError<StreamingOutput>) -> Error {
+    match err {
+        mpsc::error::TrySendError::Closed(_) => {
+            Error::InferenceError("Streaming output channel closed".to_string())
+        }
+        mpsc::error::TrySendError::Full(_) => Error::InferenceError(
+            "Streaming output backpressure exceeded queue capacity".to_string(),
+        ),
     }
 }

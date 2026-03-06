@@ -56,6 +56,8 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Notify, RwLock};
 use tracing::{debug, info, warn};
 
+use self::types::TaskType;
+
 /// Main inference engine - the primary interface for audio generation.
 ///
 /// The engine orchestrates all components and provides both synchronous
@@ -78,6 +80,33 @@ pub struct Engine {
 }
 
 impl Engine {
+    fn queue_capacity_from_env(key: &str) -> Option<usize> {
+        std::env::var(key)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+    }
+
+    fn streaming_queue_capacity(request: &EngineCoreRequest) -> usize {
+        let default_capacity = match request.task_type {
+            TaskType::TTS | TaskType::SpeechToSpeech => 8usize,
+            TaskType::ASR | TaskType::Chat => 64usize,
+        };
+
+        let task_override = match request.task_type {
+            TaskType::TTS | TaskType::SpeechToSpeech => {
+                Self::queue_capacity_from_env("IZWI_STREAM_AUDIO_QUEUE_CAPACITY")
+            }
+            TaskType::ASR | TaskType::Chat => {
+                Self::queue_capacity_from_env("IZWI_STREAM_TEXT_QUEUE_CAPACITY")
+            }
+        };
+
+        task_override
+            .or_else(|| Self::queue_capacity_from_env("IZWI_STREAM_QUEUE_CAPACITY"))
+            .unwrap_or(default_capacity)
+    }
+
     /// Create a new inference engine with the given configuration.
     pub fn new(config: EngineCoreConfig) -> Result<Self> {
         let worker_config = WorkerConfig::from(&config);
@@ -157,8 +186,9 @@ impl Engine {
     pub async fn generate_streaming(
         &self,
         request: EngineCoreRequest,
-    ) -> Result<(RequestId, mpsc::UnboundedReceiver<StreamingOutput>)> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    ) -> Result<(RequestId, mpsc::Receiver<StreamingOutput>)> {
+        let capacity = Self::streaming_queue_capacity(&request);
+        let (tx, rx) = mpsc::channel(capacity);
         let request_id = request.id.clone();
 
         // Add request with streaming callback

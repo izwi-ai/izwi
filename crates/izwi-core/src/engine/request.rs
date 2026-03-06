@@ -68,7 +68,7 @@ pub struct EngineCoreRequest {
     pub streaming: bool,
     /// Channel for streaming output (internal use)
     #[allow(dead_code)]
-    pub(crate) streaming_tx: Option<mpsc::UnboundedSender<StreamingOutput>>,
+    pub(crate) streaming_tx: Option<mpsc::Sender<StreamingOutput>>,
 }
 
 impl EngineCoreRequest {

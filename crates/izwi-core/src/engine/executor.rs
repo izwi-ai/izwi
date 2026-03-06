@@ -543,7 +543,7 @@ mod tests {
             .expect("failed to build runtime");
 
         let result = runtime.block_on(async {
-            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (tx, mut rx) = mpsc::channel(4);
             let mut sequence = 0usize;
             NativeExecutor::stream_audio(
                 &tx,
@@ -569,7 +569,7 @@ mod tests {
 
     #[test]
     fn test_stream_audio_send_returns_error_when_channel_closed() {
-        let (tx, rx) = mpsc::unbounded_channel::<StreamingOutput>();
+        let (tx, rx) = mpsc::channel::<StreamingOutput>(1);
         drop(rx);
 
         let mut sequence = 0usize;
@@ -585,6 +585,37 @@ mod tests {
             panic!("expected inference error when streaming channel is closed");
         };
         assert!(message.contains("Streaming output channel closed"));
+    }
+
+    #[test]
+    fn test_stream_audio_send_returns_backpressure_error_when_queue_full() {
+        let (tx, _rx) = mpsc::channel::<StreamingOutput>(1);
+
+        let mut first_sequence = 0usize;
+        NativeExecutor::stream_audio(
+            &tx,
+            "req-full",
+            &mut first_sequence,
+            vec![0.1],
+            24_000,
+            false,
+        )
+        .expect("first chunk should fit");
+
+        let mut second_sequence = 1usize;
+        let result = NativeExecutor::stream_audio(
+            &tx,
+            "req-full",
+            &mut second_sequence,
+            vec![0.2],
+            24_000,
+            false,
+        );
+
+        let Err(Error::InferenceError(message)) = result else {
+            panic!("expected inference error when streaming queue is full");
+        };
+        assert!(message.contains("backpressure"));
     }
 
     #[test]

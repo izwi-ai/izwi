@@ -245,8 +245,8 @@ impl RuntimeService {
         on_audio_chunk: G,
     ) -> Result<SpeechToSpeechGeneration>
     where
-        F: FnMut(String) + Send + 'static,
-        G: FnMut(AudioChunk) + Send + 'static,
+        F: FnMut(String) -> Result<()> + Send + 'static,
+        G: FnMut(AudioChunk) -> Result<()> + Send + 'static,
     {
         self.lfm2_speech_to_speech_streaming_with_correlation(
             audio_base64,
@@ -273,8 +273,8 @@ impl RuntimeService {
         mut on_audio_chunk: G,
     ) -> Result<SpeechToSpeechGeneration>
     where
-        F: FnMut(String) + Send + 'static,
-        G: FnMut(AudioChunk) + Send + 'static,
+        F: FnMut(String) -> Result<()> + Send + 'static,
+        G: FnMut(AudioChunk) -> Result<()> + Send + 'static,
     {
         let variant = self.resolve_active_lfm2_variant().await;
         self.load_model(variant).await?;
@@ -291,20 +291,27 @@ impl RuntimeService {
         let mut streamed_text = String::new();
         let output = self
             .run_streaming_request(request, |chunk| {
-                if !chunk.samples.is_empty() || chunk.is_final {
-                    let mut audio_chunk =
-                        AudioChunk::new(chunk.request_id.clone(), chunk.sequence, chunk.samples);
-                    audio_chunk.is_final = chunk.is_final;
-                    on_audio_chunk(audio_chunk);
-                }
-
-                if let Some(delta) = chunk.text {
-                    if !delta.is_empty() {
-                        streamed_text.push_str(&delta);
-                        on_delta(delta);
+                let callback_result = (|| -> Result<()> {
+                    if !chunk.samples.is_empty() || chunk.is_final {
+                        let mut audio_chunk = AudioChunk::new(
+                            chunk.request_id.clone(),
+                            chunk.sequence,
+                            chunk.samples,
+                        );
+                        audio_chunk.is_final = chunk.is_final;
+                        on_audio_chunk(audio_chunk)?;
                     }
-                }
-                std::future::ready(Ok(()))
+
+                    if let Some(delta) = chunk.text {
+                        if !delta.is_empty() {
+                            streamed_text.push_str(&delta);
+                            on_delta(delta)?;
+                        }
+                    }
+
+                    Ok(())
+                })();
+                std::future::ready(callback_result)
             })
             .await?;
         let text = output.text.unwrap_or(streamed_text);
@@ -330,8 +337,8 @@ impl RuntimeService {
         mut on_audio_chunk: G,
     ) -> Result<SpeechToSpeechGeneration>
     where
-        F: FnMut(String) + Send + 'static,
-        G: FnMut(AudioChunk) + Send + 'static,
+        F: FnMut(String) -> Result<()> + Send + 'static,
+        G: FnMut(AudioChunk) -> Result<()> + Send + 'static,
     {
         let variant = self.resolve_active_lfm2_variant().await;
         self.load_model(variant).await?;
@@ -348,20 +355,27 @@ impl RuntimeService {
         let mut streamed_text = String::new();
         let output = self
             .run_streaming_request(request, |chunk| {
-                if !chunk.samples.is_empty() || chunk.is_final {
-                    let mut audio_chunk =
-                        AudioChunk::new(chunk.request_id.clone(), chunk.sequence, chunk.samples);
-                    audio_chunk.is_final = chunk.is_final;
-                    on_audio_chunk(audio_chunk);
-                }
-
-                if let Some(delta) = chunk.text {
-                    if !delta.is_empty() {
-                        streamed_text.push_str(&delta);
-                        on_delta(delta);
+                let callback_result = (|| -> Result<()> {
+                    if !chunk.samples.is_empty() || chunk.is_final {
+                        let mut audio_chunk = AudioChunk::new(
+                            chunk.request_id.clone(),
+                            chunk.sequence,
+                            chunk.samples,
+                        );
+                        audio_chunk.is_final = chunk.is_final;
+                        on_audio_chunk(audio_chunk)?;
                     }
-                }
-                std::future::ready(Ok(()))
+
+                    if let Some(delta) = chunk.text {
+                        if !delta.is_empty() {
+                            streamed_text.push_str(&delta);
+                            on_delta(delta)?;
+                        }
+                    }
+
+                    Ok(())
+                })();
+                std::future::ready(callback_result)
             })
             .await?;
         let text = output.text.unwrap_or(streamed_text);
@@ -410,8 +424,8 @@ impl RuntimeService {
             temperature,
             top_k,
             correlation_id,
-            |_delta| {},
-            |_chunk| {},
+            |_delta| Ok(()),
+            |_chunk| Ok(()),
         )
         .await
     }
@@ -432,8 +446,8 @@ impl RuntimeService {
             temperature,
             top_k,
             correlation_id,
-            |_delta| {},
-            |_chunk| {},
+            |_delta| Ok(()),
+            |_chunk| Ok(()),
         )
         .await
     }

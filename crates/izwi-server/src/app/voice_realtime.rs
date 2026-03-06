@@ -24,7 +24,7 @@ use izwi_agent::{
 use izwi_core::{
     audio::{AudioEncoder, AudioFormat},
     parse_chat_model_variant, parse_model_variant, parse_tts_model_variant, ChatMessage, ChatRole,
-    GenerationConfig, GenerationRequest,
+    Error as CoreError, GenerationConfig, GenerationRequest,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -1145,7 +1145,6 @@ fn spawn_turn_task(
                     );
 
                     let audio_tx = out_tx.clone();
-                    let utt_id = commit.utterance_id.clone();
                     let utt_seq = commit.utterance_seq;
                     let stream_result = state
                         .runtime
@@ -1156,26 +1155,19 @@ fn spawn_turn_task(
                             None,
                             None,
                             Some(&correlation_id),
-                            |_delta| {},
+                            |_delta| Ok(()),
                             move |audio_chunk| {
                                 if audio_chunk.samples.is_empty() && !audio_chunk.is_final {
-                                    return;
+                                    return Ok(());
                                 }
 
-                                let encoded = match AudioEncoder::new(sample_rate, 1)
+                                let encoded = AudioEncoder::new(sample_rate, 1)
                                     .encode(&audio_chunk.samples, AudioFormat::RawI16)
-                                {
-                                    Ok(bytes) => bytes,
-                                    Err(err) => {
-                                        send_error(
-                                            &audio_tx,
-                                            Some(utt_id.clone()),
-                                            Some(utt_seq),
-                                            format!("Failed to encode unified speech chunk: {err}"),
-                                        );
-                                        return;
-                                    }
-                                };
+                                    .map_err(|err| {
+                                        CoreError::InferenceError(format!(
+                                            "Failed to encode unified speech chunk: {err}"
+                                        ))
+                                    })?;
 
                                 let chunk_seq =
                                     u32::try_from(audio_chunk.sequence).unwrap_or(u32::MAX);
@@ -1186,7 +1178,11 @@ fn spawn_turn_task(
                                     audio_chunk.is_final,
                                     &encoded,
                                 );
-                                let _ = audio_tx.send(Message::Binary(frame.into()));
+                                audio_tx.send(Message::Binary(frame.into())).map_err(|_| {
+                                    CoreError::InferenceError(
+                                        "Voice websocket output channel closed".to_string(),
+                                    )
+                                })
                             },
                         )
                         .await
