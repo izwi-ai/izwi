@@ -2,6 +2,7 @@ use izwi_asr_toolkit::{plan_audio_chunks, AsrLongFormConfig, AudioChunk, Transcr
 use tokio::sync::mpsc;
 use tracing::debug;
 
+use crate::engine::EngineCoreRequest;
 use crate::error::{Error, Result};
 use crate::runtime::audio_io::{base64_decode, decode_audio_bytes};
 
@@ -124,6 +125,20 @@ impl NativeExecutor {
 pub(super) fn decode_audio_base64_with_rate(audio_b64: &str) -> Result<(Vec<f32>, u32)> {
     let audio_bytes = base64_decode(audio_b64)?;
     decode_audio_bytes(&audio_bytes)
+}
+
+pub(super) fn decode_request_audio_with_rate(
+    request: &EngineCoreRequest,
+) -> Result<(Vec<f32>, u32)> {
+    if let Some(audio_bytes) = request.audio_bytes.as_deref() {
+        return decode_audio_bytes(audio_bytes);
+    }
+
+    let audio_b64 = request
+        .audio_input
+        .as_deref()
+        .ok_or_else(|| Error::InvalidInput("Request missing audio input".to_string()))?;
+    decode_audio_base64_with_rate(audio_b64)
 }
 
 #[cfg(test)]

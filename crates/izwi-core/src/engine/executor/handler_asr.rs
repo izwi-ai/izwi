@@ -4,8 +4,9 @@ use crate::error::{Error, Result};
 use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
+use super::audio::decode_request_audio_with_rate;
 use super::state::ActiveAsrDecode;
-use super::{decode_audio_base64_with_rate, ExecutorOutput, NativeExecutor};
+use super::{ExecutorOutput, NativeExecutor};
 
 const MAX_ASR_NEW_TOKENS: usize = 512;
 
@@ -47,10 +48,7 @@ impl NativeExecutor {
                     let mut active_state = if let Some(state) = active_state {
                         state
                     } else {
-                        let audio_b64 = request.audio_input.as_deref().ok_or_else(|| {
-                            Error::InvalidInput("ASR request missing audio input".to_string())
-                        })?;
-                        let (samples, sample_rate) = decode_audio_base64_with_rate(audio_b64)?;
+                        let (samples, sample_rate) = decode_request_audio_with_rate(request)?;
                         let samples_len = samples.len();
 
                         let (chunk_cfg, chunk_plan) = Self::asr_chunk_plan(
@@ -205,11 +203,7 @@ impl NativeExecutor {
             }
         }
 
-        let audio_b64 = request
-            .audio_input
-            .as_deref()
-            .ok_or_else(|| Error::InvalidInput("ASR request missing audio input".to_string()))?;
-        let (samples, sample_rate) = decode_audio_base64_with_rate(audio_b64)?;
+        let (samples, sample_rate) = decode_request_audio_with_rate(request)?;
         let samples_len = samples.len();
 
         let text = Self::run_blocking(|| {

@@ -8,7 +8,31 @@ use crate::runtime::audio_io::{base64_decode, decode_audio_bytes};
 use crate::runtime::service::RuntimeService;
 use crate::runtime::types::AsrTranscription;
 
+enum AsrAudioInput<'a> {
+    Base64(&'a str),
+    Bytes(&'a [u8]),
+}
+
 impl RuntimeService {
+    async fn build_asr_request(
+        &self,
+        variant: ModelVariant,
+        audio_input: AsrAudioInput<'_>,
+        language: Option<&str>,
+        correlation_id: Option<&str>,
+    ) -> Result<EngineCoreRequest> {
+        self.load_model(variant).await?;
+
+        let mut request = match audio_input {
+            AsrAudioInput::Base64(audio_base64) => EngineCoreRequest::asr(audio_base64.to_string()),
+            AsrAudioInput::Bytes(audio_bytes) => EngineCoreRequest::asr_bytes(audio_bytes.to_vec()),
+        };
+        request.model_variant = Some(variant);
+        request.language = language.map(|s| s.to_string());
+        request.correlation_id = correlation_id.map(|s| s.to_string());
+        Ok(request)
+    }
+
     pub(crate) async fn asr_transcribe_with_variant(
         &self,
         variant: ModelVariant,
@@ -16,13 +40,14 @@ impl RuntimeService {
         language: Option<&str>,
         correlation_id: Option<&str>,
     ) -> Result<AsrTranscription> {
-        self.load_model(variant).await?;
-
-        let mut request = EngineCoreRequest::asr(audio_base64.to_string());
-        request.model_variant = Some(variant);
-        request.language = language.map(|s| s.to_string());
-        request.correlation_id = correlation_id.map(|s| s.to_string());
-
+        let request = self
+            .build_asr_request(
+                variant,
+                AsrAudioInput::Base64(audio_base64),
+                language,
+                correlation_id,
+            )
+            .await?;
         let output = self.run_request(request).await?;
         let text = output.text.unwrap_or_default();
 
@@ -44,13 +69,79 @@ impl RuntimeService {
     where
         F: FnMut(String) + Send + 'static,
     {
-        self.load_model(variant).await?;
+        let request = self
+            .build_asr_request(
+                variant,
+                AsrAudioInput::Base64(audio_base64),
+                language,
+                correlation_id,
+            )
+            .await?;
+        let mut streamed_text = String::new();
+        let output = self
+            .run_streaming_request(request, |chunk| {
+                if let Some(delta) = chunk.text {
+                    if !delta.is_empty() {
+                        streamed_text.push_str(&delta);
+                        on_delta(delta);
+                    }
+                }
+                std::future::ready(Ok(()))
+            })
+            .await?;
+        let text = output.text.unwrap_or(streamed_text);
 
-        let mut request = EngineCoreRequest::asr(audio_base64.to_string());
-        request.model_variant = Some(variant);
-        request.language = language.map(|s| s.to_string());
-        request.correlation_id = correlation_id.map(|s| s.to_string());
+        Ok(AsrTranscription {
+            text,
+            language: language.map(|s| s.to_string()),
+            duration_secs: output.audio.duration_secs,
+        })
+    }
 
+    pub(crate) async fn asr_transcribe_bytes_with_variant(
+        &self,
+        variant: ModelVariant,
+        audio_bytes: &[u8],
+        language: Option<&str>,
+        correlation_id: Option<&str>,
+    ) -> Result<AsrTranscription> {
+        let request = self
+            .build_asr_request(
+                variant,
+                AsrAudioInput::Bytes(audio_bytes),
+                language,
+                correlation_id,
+            )
+            .await?;
+        let output = self.run_request(request).await?;
+        let text = output.text.unwrap_or_default();
+
+        Ok(AsrTranscription {
+            text,
+            language: language.map(|s| s.to_string()),
+            duration_secs: output.audio.duration_secs,
+        })
+    }
+
+    pub(crate) async fn asr_transcribe_bytes_with_variant_streaming<F>(
+        &self,
+        variant: ModelVariant,
+        audio_bytes: &[u8],
+        language: Option<&str>,
+        correlation_id: Option<&str>,
+        mut on_delta: F,
+    ) -> Result<AsrTranscription>
+    where
+        F: FnMut(String) + Send + 'static,
+    {
+        let request = self
+            .build_asr_request(
+                variant,
+                AsrAudioInput::Bytes(audio_bytes),
+                language,
+                correlation_id,
+            )
+            .await?;
         let mut streamed_text = String::new();
         let output = self
             .run_streaming_request(request, |chunk| {
@@ -114,6 +205,17 @@ impl RuntimeService {
             .await
     }
 
+    pub async fn asr_transcribe_bytes(
+        &self,
+        audio_bytes: &[u8],
+        model_id: Option<&str>,
+        language: Option<&str>,
+    ) -> Result<AsrTranscription> {
+        let variant = resolve_asr_model_variant(model_id);
+        self.asr_transcribe_bytes_with_variant(variant, audio_bytes, language, None)
+            .await
+    }
+
     /// Transcribe audio and emit deltas.
     pub async fn asr_transcribe_streaming<F>(
         &self,
@@ -127,6 +229,26 @@ impl RuntimeService {
     {
         self.asr_transcribe_streaming_with_correlation(
             audio_base64,
+            model_id,
+            language,
+            None,
+            on_delta,
+        )
+        .await
+    }
+
+    pub async fn asr_transcribe_streaming_bytes<F>(
+        &self,
+        audio_bytes: &[u8],
+        model_id: Option<&str>,
+        language: Option<&str>,
+        on_delta: F,
+    ) -> Result<AsrTranscription>
+    where
+        F: FnMut(String) + Send + 'static,
+    {
+        self.asr_transcribe_streaming_bytes_with_correlation(
+            audio_bytes,
             model_id,
             language,
             None,
@@ -151,6 +273,28 @@ impl RuntimeService {
         self.asr_transcribe_with_variant_streaming(
             variant,
             audio_base64,
+            language,
+            correlation_id,
+            on_delta,
+        )
+        .await
+    }
+
+    pub async fn asr_transcribe_streaming_bytes_with_correlation<F>(
+        &self,
+        audio_bytes: &[u8],
+        model_id: Option<&str>,
+        language: Option<&str>,
+        correlation_id: Option<&str>,
+        on_delta: F,
+    ) -> Result<AsrTranscription>
+    where
+        F: FnMut(String) + Send + 'static,
+    {
+        let variant = resolve_asr_model_variant(model_id);
+        self.asr_transcribe_bytes_with_variant_streaming(
+            variant,
+            audio_bytes,
             language,
             correlation_id,
             on_delta,
@@ -186,6 +330,23 @@ impl RuntimeService {
         language: Option<&str>,
         model_id: Option<&str>,
     ) -> Result<Vec<(String, u32, u32)>> {
+        let audio_bytes = base64_decode(audio_base64)?;
+        self.force_align_bytes_with_model_and_language(
+            &audio_bytes,
+            reference_text,
+            language,
+            model_id,
+        )
+        .await
+    }
+
+    pub async fn force_align_bytes_with_model_and_language(
+        &self,
+        audio_bytes: &[u8],
+        reference_text: &str,
+        language: Option<&str>,
+        model_id: Option<&str>,
+    ) -> Result<Vec<(String, u32, u32)>> {
         let variant = resolve_forced_aligner_variant(model_id)?;
         self.load_model(variant).await?;
 
@@ -195,7 +356,7 @@ impl RuntimeService {
             .await
             .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?;
 
-        let (samples, sample_rate) = decode_audio_bytes(&base64_decode(audio_base64)?)?;
+        let (samples, sample_rate) = decode_audio_bytes(audio_bytes)?;
         model.force_align(&samples, sample_rate, reference_text, language)
     }
 }

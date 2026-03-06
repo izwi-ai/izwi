@@ -3,7 +3,6 @@
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket};
-use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use izwi_core::audio::{AudioEncoder, AudioFormat};
 use serde::Deserialize;
@@ -584,13 +583,12 @@ async fn run_inference(
     language: Option<String>,
 ) -> Result<InferenceResult, String> {
     let wav_bytes = wav_bytes_from_pcm16_mono(&samples_i16, sample_rate)?;
-    let audio_base64 = base64::engine::general_purpose::STANDARD.encode(wav_bytes);
 
     let _permit = state.acquire_permit().await;
     let output = state
         .runtime
-        .asr_transcribe(
-            audio_base64.as_str(),
+        .asr_transcribe_bytes(
+            wav_bytes.as_slice(),
             model_id.as_deref(),
             language.as_deref(),
         )

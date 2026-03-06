@@ -4,8 +4,9 @@ use crate::models::architectures::lfm2::audio::LFM2_DEFAULT_S2S_PROMPT;
 use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
+use super::audio::decode_request_audio_with_rate;
 use super::state::ActiveSpeechToSpeechDecode;
-use super::{decode_audio_base64_with_rate, ExecutorOutput, NativeExecutor};
+use super::{ExecutorOutput, NativeExecutor};
 
 impl NativeExecutor {
     pub(super) fn speech_to_speech_request(
@@ -57,10 +58,7 @@ impl NativeExecutor {
             let mut active_state = if let Some(state) = active_state {
                 state
             } else {
-                let audio_b64 = request.audio_input.as_deref().ok_or_else(|| {
-                    Error::InvalidInput("Speech-to-speech request missing audio input".to_string())
-                })?;
-                let (samples, sample_rate) = decode_audio_base64_with_rate(audio_b64)?;
+                let (samples, sample_rate) = decode_request_audio_with_rate(request)?;
                 let decode_state = Self::run_blocking(|| {
                     model.start_speech_to_speech_decode(
                         &samples,
@@ -207,10 +205,7 @@ impl NativeExecutor {
             });
         }
 
-        let audio_b64 = request.audio_input.as_deref().ok_or_else(|| {
-            Error::InvalidInput("Speech-to-speech request missing audio input".to_string())
-        })?;
-        let (samples, sample_rate) = decode_audio_base64_with_rate(audio_b64)?;
+        let (samples, sample_rate) = decode_request_audio_with_rate(request)?;
         let model = self.with_registry(|registry| {
             registry
                 .try_get_lfm2(variant)

@@ -44,8 +44,10 @@ pub struct EngineCoreRequest {
     pub language: Option<String>,
     /// Request correlation ID propagated from API/runtime boundaries.
     pub correlation_id: Option<String>,
-    /// Input audio (base64 encoded, for ASR/chat)
+    /// Input audio (base64 encoded, primarily for OpenAI-compatible routes).
     pub audio_input: Option<String>,
+    /// Input audio bytes for first-party routes that already parsed uploads.
+    pub audio_bytes: Option<Vec<u8>>,
     /// Reference audio for voice cloning (base64 encoded)
     pub reference_audio: Option<String>,
     /// Reference text for voice cloning
@@ -81,6 +83,7 @@ impl EngineCoreRequest {
             language: None,
             correlation_id: None,
             audio_input: None,
+            audio_bytes: None,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -105,6 +108,32 @@ impl EngineCoreRequest {
             language: None,
             correlation_id: None,
             audio_input: Some(audio_base64.into()),
+            audio_bytes: None,
+            reference_audio: None,
+            reference_text: None,
+            voice_description: None,
+            system_prompt: None,
+            params: GenerationParams::default(),
+            priority: Priority::Normal,
+            arrival_time: Instant::now(),
+            prompt_tokens: Vec::new(),
+            streaming: false,
+            streaming_tx: None,
+        }
+    }
+
+    /// Create a new ASR request from already-decoded audio bytes.
+    pub fn asr_bytes(audio_bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            task_type: TaskType::ASR,
+            model_variant: None,
+            text: None,
+            chat_messages: None,
+            language: None,
+            correlation_id: None,
+            audio_input: None,
+            audio_bytes: Some(audio_bytes.into()),
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -129,6 +158,7 @@ impl EngineCoreRequest {
             language: None,
             correlation_id: None,
             audio_input: None,
+            audio_bytes: None,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -153,6 +183,32 @@ impl EngineCoreRequest {
             language: None,
             correlation_id: None,
             audio_input: Some(audio_base64.into()),
+            audio_bytes: None,
+            reference_audio: None,
+            reference_text: None,
+            voice_description: None,
+            system_prompt: None,
+            params: GenerationParams::default(),
+            priority: Priority::Normal,
+            arrival_time: Instant::now(),
+            prompt_tokens: Vec::new(),
+            streaming: false,
+            streaming_tx: None,
+        }
+    }
+
+    /// Create a new speech-to-speech request from already-decoded audio bytes.
+    pub fn speech_to_speech_bytes(audio_bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            task_type: TaskType::SpeechToSpeech,
+            model_variant: None,
+            text: None,
+            chat_messages: None,
+            language: None,
+            correlation_id: None,
+            audio_input: None,
+            audio_bytes: Some(audio_bytes.into()),
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -266,7 +322,7 @@ impl RequestProcessor {
                 }
             }
             TaskType::ASR => {
-                if request.audio_input.is_none() {
+                if request.audio_input.is_none() && request.audio_bytes.is_none() {
                     return Err(Error::InvalidInput(
                         "ASR request requires audio input".into(),
                     ));
@@ -285,7 +341,7 @@ impl RequestProcessor {
                 }
             }
             TaskType::SpeechToSpeech => {
-                if request.audio_input.is_none() {
+                if request.audio_input.is_none() && request.audio_bytes.is_none() {
                     return Err(Error::InvalidInput(
                         "Speech-to-speech request requires audio input".into(),
                     ));
@@ -380,6 +436,13 @@ impl RequestBuilder {
         }
     }
 
+    /// Create a new ASR request builder from audio bytes.
+    pub fn asr_bytes(audio_bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            request: EngineCoreRequest::asr_bytes(audio_bytes),
+        }
+    }
+
     /// Create a new chat request builder.
     pub fn chat(messages: Vec<ChatMessage>) -> Self {
         Self {
@@ -391,6 +454,13 @@ impl RequestBuilder {
     pub fn speech_to_speech(audio_base64: impl Into<String>) -> Self {
         Self {
             request: EngineCoreRequest::speech_to_speech(audio_base64),
+        }
+    }
+
+    /// Create a new speech-to-speech request builder from audio bytes.
+    pub fn speech_to_speech_bytes(audio_bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            request: EngineCoreRequest::speech_to_speech_bytes(audio_bytes),
         }
     }
 
@@ -482,6 +552,14 @@ impl RequestBuilder {
     /// Set audio input (for ASR/chat).
     pub fn audio_input(mut self, audio: impl Into<String>) -> Self {
         self.request.audio_input = Some(audio.into());
+        self.request.audio_bytes = None;
+        self
+    }
+
+    /// Set audio input bytes for first-party ASR/speech routes.
+    pub fn audio_bytes(mut self, audio: impl Into<Vec<u8>>) -> Self {
+        self.request.audio_bytes = Some(audio.into());
+        self.request.audio_input = None;
         self
     }
 
@@ -622,6 +700,16 @@ mod tests {
 
         let processed = processor.process(request).expect("request should process");
         assert_eq!(processed.prompt_tokens, vec![41, 42, 43]);
+    }
+
+    #[test]
+    fn test_request_processor_accepts_audio_bytes_for_asr() {
+        let config = EngineCoreConfig::default();
+        let processor = RequestProcessor::new(config);
+
+        let request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]);
+        let processed = processor.process(request);
+        assert!(processed.is_ok());
     }
 
     #[test]

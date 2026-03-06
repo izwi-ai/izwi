@@ -73,7 +73,17 @@ impl RuntimeService {
         model_id: Option<&str>,
         config: &DiarizationConfig,
     ) -> Result<DiarizationResult> {
-        let audio = decode_pipeline_audio(audio_base64)?;
+        let audio_bytes = base64_decode(audio_base64)?;
+        self.diarize_bytes(&audio_bytes, model_id, config).await
+    }
+
+    pub async fn diarize_bytes(
+        &self,
+        audio_bytes: &[u8],
+        model_id: Option<&str>,
+        config: &DiarizationConfig,
+    ) -> Result<DiarizationResult> {
+        let audio = decode_pipeline_audio_bytes(audio_bytes)?;
         self.diarize_samples(&audio.samples, audio.sample_rate, model_id, config)
             .await
     }
@@ -89,7 +99,30 @@ impl RuntimeService {
         config: &DiarizationConfig,
         enable_llm_refinement: bool,
     ) -> Result<DiarizationTranscriptResult> {
-        let audio = decode_pipeline_audio(audio_base64)?;
+        let audio_bytes = base64_decode(audio_base64)?;
+        self.diarize_with_transcript_bytes(
+            &audio_bytes,
+            diarization_model_id,
+            asr_model_id,
+            aligner_model_id,
+            llm_model_id,
+            config,
+            enable_llm_refinement,
+        )
+        .await
+    }
+
+    pub async fn diarize_with_transcript_bytes(
+        &self,
+        audio_bytes: &[u8],
+        diarization_model_id: Option<&str>,
+        asr_model_id: Option<&str>,
+        aligner_model_id: Option<&str>,
+        llm_model_id: Option<&str>,
+        config: &DiarizationConfig,
+        enable_llm_refinement: bool,
+    ) -> Result<DiarizationTranscriptResult> {
+        let audio = decode_pipeline_audio_bytes(audio_bytes)?;
         let diarization = self
             .diarize_samples(
                 &audio.samples,
@@ -166,8 +199,8 @@ impl RuntimeService {
             Vec::new()
         } else if use_single_pass_asr && aligner_model.is_some() {
             match self
-                .force_align_with_model_and_language(
-                    audio_base64,
+                .force_align_bytes_with_model_and_language(
+                    audio_bytes,
                     &asr_text,
                     detected_language.as_deref(),
                     aligner_model_id,
@@ -315,7 +348,12 @@ fn resolve_chat_variant(model_id: Option<&str>) -> Result<ModelVariant> {
 }
 
 fn decode_pipeline_audio(audio_base64: &str) -> Result<PipelineAudio> {
-    let (samples, sample_rate) = decode_audio_bytes(&base64_decode(audio_base64)?)?;
+    let audio_bytes = base64_decode(audio_base64)?;
+    decode_pipeline_audio_bytes(&audio_bytes)
+}
+
+fn decode_pipeline_audio_bytes(audio_bytes: &[u8]) -> Result<PipelineAudio> {
+    let (samples, sample_rate) = decode_audio_bytes(audio_bytes)?;
     let normalized = resample_linear(&samples, sample_rate, PIPELINE_SAMPLE_RATE);
     let duration_secs = if PIPELINE_SAMPLE_RATE > 0 {
         normalized.len() as f32 / PIPELINE_SAMPLE_RATE as f32
