@@ -4,6 +4,8 @@ use std::process::Child;
 use std::sync::{Arc, Mutex};
 use url::Url;
 
+pub mod downloads;
+pub mod install;
 pub mod server;
 pub mod window;
 
@@ -50,7 +52,7 @@ pub fn run(args: DesktopArgs) -> Result<()> {
     let setup_server_handle = Arc::clone(&managed_server);
 
     let app = tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![crate::download_audio_file])
+        .invoke_handler(tauri::generate_handler![downloads::download_audio_file])
         .setup(move |app| {
             if let Some(server_child) = maybe_start_local_server(app.handle(), &server_url)? {
                 let mut child_slot = setup_server_handle
@@ -59,7 +61,7 @@ pub fn run(args: DesktopArgs) -> Result<()> {
                 *child_slot = Some(server_child);
             }
 
-            if let Err(err) = crate::ensure_cli_setup(app.handle()) {
+            if let Err(err) = install::ensure_cli_setup(app.handle()) {
                 eprintln!("warning: could not configure terminal commands automatically: {err}");
             }
 
