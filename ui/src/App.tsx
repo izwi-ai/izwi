@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { Navigate, Route, Routes } from "react-router-dom";
 import { api, ModelInfo } from "./api";
+import { useTheme } from "@/app/providers/ThemeProvider";
 import { Layout } from "./components/Layout";
 import { VIEW_CONFIGS } from "./types";
 import {
@@ -14,38 +15,12 @@ import {
   MyModelsPage,
 } from "./pages";
 
-type ThemePreference = "system" | "light" | "dark";
-type ResolvedTheme = "light" | "dark";
-
-const THEME_STORAGE_KEY = "izwi.theme.preference";
-
-function resolveSystemTheme(): ResolvedTheme {
-  if (typeof window === "undefined") {
-    return "dark";
-  }
-  return window.matchMedia("(prefers-color-scheme: dark)").matches
-    ? "dark"
-    : "light";
-}
-
 function App() {
+  const { resolvedTheme, themePreference, setThemePreference } = useTheme();
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [themePreference, setThemePreference] = useState<ThemePreference>(() => {
-    if (typeof window === "undefined") {
-      return "system";
-    }
-    const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
-    if (stored === "light" || stored === "dark" || stored === "system") {
-      return stored;
-    }
-    return "system";
-  });
-  const [resolvedTheme, setResolvedTheme] = useState<ResolvedTheme>(() =>
-    resolveSystemTheme(),
-  );
   const [downloadProgress, setDownloadProgress] = useState<
     Record<
       string,
@@ -116,38 +91,6 @@ function App() {
     };
     init();
   }, []);
-
-  useEffect(() => {
-    const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
-
-    const applyResolvedTheme = () => {
-      const resolved =
-        themePreference === "system" ? resolveSystemTheme() : themePreference;
-      setResolvedTheme(resolved);
-
-      const root = document.documentElement;
-      root.classList.remove("theme-light", "theme-dark");
-      root.classList.add(resolved === "dark" ? "theme-dark" : "theme-light");
-      root.style.colorScheme = resolved;
-    };
-
-    applyResolvedTheme();
-
-    const onSystemThemeChange = () => {
-      if (themePreference === "system") {
-        applyResolvedTheme();
-      }
-    };
-    mediaQuery.addEventListener("change", onSystemThemeChange);
-
-    return () => {
-      mediaQuery.removeEventListener("change", onSystemThemeChange);
-    };
-  }, [themePreference]);
-
-  useEffect(() => {
-    window.localStorage.setItem(THEME_STORAGE_KEY, themePreference);
-  }, [themePreference]);
 
   // Smart polling: only poll when there are active operations, use ref to prevent duplicates
   useEffect(() => {
@@ -554,76 +497,74 @@ function App() {
   };
 
   return (
-    <BrowserRouter>
-      <Routes>
+    <Routes>
+      <Route
+        element={
+          <Layout
+            error={error}
+            onErrorDismiss={() => setError(null)}
+            readyModelsCount={readyModelsCount}
+            resolvedTheme={resolvedTheme}
+            themePreference={themePreference}
+            onThemePreferenceChange={setThemePreference}
+          />
+        }
+      >
         <Route
+          path="/text-to-speech"
+          element={<TextToSpeechPage {...pageProps} />}
+        />
+        <Route
+          path="/voice-cloning"
+          element={<VoiceCloningPage {...pageProps} />}
+        />
+        <Route
+          path="/voice-design"
+          element={<VoiceDesignPage {...pageProps} />}
+        />
+        <Route
+          path="/transcription"
+          element={<TranscriptionPage {...pageProps} />}
+        />
+        <Route path="/diarization" element={<DiarizationPage {...pageProps} />} />
+        <Route path="/chat" element={<ChatPage {...pageProps} />} />
+        <Route
+          path="/voice"
           element={
-            <Layout
-              error={error}
-              onErrorDismiss={() => setError(null)}
-              readyModelsCount={readyModelsCount}
-              resolvedTheme={resolvedTheme}
-              themePreference={themePreference}
-              onThemePreferenceChange={setThemePreference}
+            <VoicePage
+              models={models}
+              loading={loading}
+              downloadProgress={downloadProgress}
+              onDownload={handleDownload}
+              onCancelDownload={handleCancelDownload}
+              onLoad={handleLoad}
+              onUnload={handleUnload}
+              onDelete={handleDelete}
+              onError={setError}
             />
           }
-        >
-          <Route
-            path="/text-to-speech"
-            element={<TextToSpeechPage {...pageProps} />}
-          />
-          <Route
-            path="/voice-cloning"
-            element={<VoiceCloningPage {...pageProps} />}
-          />
-          <Route
-            path="/voice-design"
-            element={<VoiceDesignPage {...pageProps} />}
-          />
-          <Route
-            path="/transcription"
-            element={<TranscriptionPage {...pageProps} />}
-          />
-          <Route path="/diarization" element={<DiarizationPage {...pageProps} />} />
-          <Route path="/chat" element={<ChatPage {...pageProps} />} />
-          <Route
-            path="/voice"
-            element={
-              <VoicePage
-                models={models}
-                loading={loading}
-                downloadProgress={downloadProgress}
-                onDownload={handleDownload}
-                onCancelDownload={handleCancelDownload}
-                onLoad={handleLoad}
-                onUnload={handleUnload}
-                onDelete={handleDelete}
-                onError={setError}
-              />
-            }
-          />
-          <Route
-            path="/models"
-            element={
-              <MyModelsPage
-                models={models}
-                loading={loading}
-                downloadProgress={downloadProgress}
-                onDownload={handleDownload}
-                onCancelDownload={handleCancelDownload}
-                onLoad={handleLoad}
-                onUnload={handleUnload}
-                onDelete={handleDelete}
-                onRefresh={loadModels}
-              />
-            }
-          />
-          <Route path="/my-models" element={<Navigate to="/models" replace />} />
-          <Route path="/" element={<Navigate to="/voice" replace />} />
-          <Route path="*" element={<Navigate to="/voice" replace />} />
-        </Route>
-      </Routes>
-    </BrowserRouter>
+        />
+        <Route
+          path="/models"
+          element={
+            <MyModelsPage
+              models={models}
+              loading={loading}
+              downloadProgress={downloadProgress}
+              onDownload={handleDownload}
+              onCancelDownload={handleCancelDownload}
+              onLoad={handleLoad}
+              onUnload={handleUnload}
+              onDelete={handleDelete}
+              onRefresh={loadModels}
+            />
+          }
+        />
+        <Route path="/my-models" element={<Navigate to="/models" replace />} />
+        <Route path="/" element={<Navigate to="/voice" replace />} />
+        <Route path="*" element={<Navigate to="/voice" replace />} />
+      </Route>
+    </Routes>
   );
 }
 

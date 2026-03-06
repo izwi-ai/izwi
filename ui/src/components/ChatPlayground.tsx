@@ -280,7 +280,7 @@ function normalizeGeneratedThreadTitle(raw: string): string | null {
     return null;
   }
 
-  let title = compact.replace(/^title\s*[:\-]\s*/i, "").trim();
+  let title = compact.replace(/^title\s*[:-]\s*/i, "").trim();
   title = normalizeWhitespace(title.replace(/^['"`]+|['"`]+$/g, "").trim());
 
   if (!title || /^user\s*:/i.test(title) || /^assistant\s*:/i.test(title)) {
