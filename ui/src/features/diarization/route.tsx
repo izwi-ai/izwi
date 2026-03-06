@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ModelInfo } from "../api";
-import { DiarizationPlayground } from "../components/DiarizationPlayground";
-import { PageHeader, PageShell } from "../components/PageShell";
-import { RouteModelModal } from "../components/RouteModelModal";
+import type { ModelInfo } from "@/api";
+import { DiarizationPlayground } from "@/components/DiarizationPlayground";
+import { PageHeader, PageShell } from "@/components/PageShell";
+import { RouteModelModal } from "@/features/models/components/RouteModelModal";
 
 interface DiarizationPageProps {
   models: ModelInfo[];

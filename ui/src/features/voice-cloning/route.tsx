@@ -1,15 +1,15 @@
-import { ModelInfo } from "../api";
-import { RouteModelModal } from "../components/RouteModelModal";
-import { VoiceDesignPlayground } from "../components/VoiceDesignPlayground";
-import { PageHeader, PageShell } from "../components/PageShell";
-import { VIEW_CONFIGS } from "../types";
+import type { ModelInfo } from "@/api";
+import { PageHeader, PageShell } from "@/components/PageShell";
+import { VIEW_CONFIGS } from "@/types";
 import {
-  VOICE_DESIGN_PREFERRED_MODELS,
+  VOICE_CLONING_PREFERRED_MODELS,
   resolvePreferredRouteModel,
 } from "@/features/models/catalog/routeModelCatalog";
+import { RouteModelModal } from "@/features/models/components/RouteModelModal";
 import { useRouteModelSelection } from "@/features/models/hooks/useRouteModelSelection";
+import { VoiceClonePlayground } from "@/components/VoiceClonePlayground";
 
-interface VoiceDesignPageProps {
+interface VoiceCloningPageProps {
   models: ModelInfo[];
   selectedModel: string | null;
   loading: boolean;
@@ -32,7 +32,7 @@ interface VoiceDesignPageProps {
   onError: (message: string) => void;
 }
 
-export function VoiceDesignPage({
+export function VoiceCloningPage({
   models,
   selectedModel,
   loading,
@@ -44,8 +44,8 @@ export function VoiceDesignPage({
   onDelete,
   onSelect,
   onError,
-}: VoiceDesignPageProps) {
-  const viewConfig = VIEW_CONFIGS["voice-design"];
+}: VoiceCloningPageProps) {
+  const viewConfig = VIEW_CONFIGS["voice-clone"];
   const {
     routeModels,
     resolvedSelectedModel,
@@ -66,18 +66,18 @@ export function VoiceDesignPage({
       resolvePreferredRouteModel({
         models: routeModels,
         selectedModel: currentModel,
-        preferredVariants: VOICE_DESIGN_PREFERRED_MODELS,
+        preferredVariants: VOICE_CLONING_PREFERRED_MODELS,
       }),
   });
 
   return (
     <PageShell>
       <PageHeader
-        title="Voice Design"
-        description="Design new voices from textual prompts and iterate with instant previews."
+        title="Voice Cloning"
+        description="Clone custom voices from reference audio with local model inference."
       />
 
-      <VoiceDesignPlayground
+      <VoiceClonePlayground
         selectedModel={resolvedSelectedModel}
         selectedModelReady={selectedModelReady}
         modelOptions={modelOptions}
@@ -85,15 +85,15 @@ export function VoiceDesignPage({
         onOpenModelManager={openModelManager}
         onModelRequired={() => {
           requestModel();
-          onError("Select and load a VoiceDesign model to continue.");
+          onError("Select and load a Base model to clone voices.");
         }}
       />
 
       <RouteModelModal
         isOpen={isModelModalOpen}
         onClose={closeModelModal}
-        title="Voice Design Models"
-        description="Manage VoiceDesign models for this route."
+        title="Voice Cloning Models"
+        description="Manage Base models for this route."
         models={routeModels}
         loading={loading}
         selectedVariant={resolvedSelectedModel}

@@ -1,14 +1,14 @@
-import { ModelInfo } from "../api";
-import { ChatPlayground } from "../components/ChatPlayground";
-import { PageHeader, PageShell } from "../components/PageShell";
-import { RouteModelModal } from "../components/RouteModelModal";
-import { VIEW_CONFIGS } from "../types";
+import type { ModelInfo } from "@/api";
+import { PageHeader, PageShell } from "@/components/PageShell";
+import { VIEW_CONFIGS } from "@/types";
+import { ChatPlayground } from "@/features/chat/components/ChatPlayground";
 import {
   CHAT_PREFERRED_MODELS,
   getChatRouteModelLabel,
   isThinkingChatModel,
   resolvePreferredRouteModel,
 } from "@/features/models/catalog/routeModelCatalog";
+import { RouteModelModal } from "@/features/models/components/RouteModelModal";
 import { useRouteModelSelection } from "@/features/models/hooks/useRouteModelSelection";
 
 interface ChatPageProps {

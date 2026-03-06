@@ -11,8 +11,9 @@ import {
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { ModelInfo } from "../api";
-import { withQwen3Prefix } from "../utils/modelDisplay";
+import type { ModelInfo } from "@/api";
+import { PROVIDER_ORDER } from "@/features/models/catalog/modelMetadata";
+import { withQwen3Prefix } from "@/utils/modelDisplay";
 
 interface RouteModelSection {
   key: string;
@@ -60,17 +61,6 @@ interface RouteModelModalProps {
   canUseModel?: (variant: string) => boolean;
   getModelLabel?: (variant: string) => string;
 }
-
-const PROVIDER_ORDER = [
-  "Qwen",
-  "OpenAI",
-  "Liquid AI",
-  "Google",
-  "NVIDIA",
-  "Mistral AI",
-  "hexgrad",
-  "Other",
-] as const;
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;

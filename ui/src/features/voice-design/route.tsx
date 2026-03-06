@@ -1,15 +1,15 @@
-import { ModelInfo } from "../api";
-import { PageHeader, PageShell } from "../components/PageShell";
-import { RouteModelModal } from "../components/RouteModelModal";
-import { TranscriptionPlayground } from "../components/TranscriptionPlayground";
-import { VIEW_CONFIGS } from "../types";
+import type { ModelInfo } from "@/api";
+import { PageHeader, PageShell } from "@/components/PageShell";
+import { VIEW_CONFIGS } from "@/types";
 import {
-  TRANSCRIPTION_PREFERRED_MODELS,
+  VOICE_DESIGN_PREFERRED_MODELS,
   resolvePreferredRouteModel,
 } from "@/features/models/catalog/routeModelCatalog";
+import { RouteModelModal } from "@/features/models/components/RouteModelModal";
 import { useRouteModelSelection } from "@/features/models/hooks/useRouteModelSelection";
+import { VoiceDesignPlayground } from "@/components/VoiceDesignPlayground";
 
-interface TranscriptionPageProps {
+interface VoiceDesignPageProps {
   models: ModelInfo[];
   selectedModel: string | null;
   loading: boolean;
@@ -32,7 +32,7 @@ interface TranscriptionPageProps {
   onError: (message: string) => void;
 }
 
-export function TranscriptionPage({
+export function VoiceDesignPage({
   models,
   selectedModel,
   loading,
@@ -44,10 +44,10 @@ export function TranscriptionPage({
   onDelete,
   onSelect,
   onError,
-}: TranscriptionPageProps) {
-  const viewConfig = VIEW_CONFIGS.transcription;
+}: VoiceDesignPageProps) {
+  const viewConfig = VIEW_CONFIGS["voice-design"];
   const {
-    routeModels: transcriptionModels,
+    routeModels,
     resolvedSelectedModel,
     selectedModelReady,
     isModelModalOpen,
@@ -66,19 +66,18 @@ export function TranscriptionPage({
       resolvePreferredRouteModel({
         models: routeModels,
         selectedModel: currentModel,
-        preferredVariants: TRANSCRIPTION_PREFERRED_MODELS,
-        preferAnyPreferredBeforeReadyAny: true,
+        preferredVariants: VOICE_DESIGN_PREFERRED_MODELS,
       }),
   });
 
   return (
     <PageShell>
       <PageHeader
-        title="Transcription"
-        description="Capture audio, transcribe live, and browse saved transcription history."
+        title="Voice Design"
+        description="Design new voices from textual prompts and iterate with instant previews."
       />
 
-      <TranscriptionPlayground
+      <VoiceDesignPlayground
         selectedModel={resolvedSelectedModel}
         selectedModelReady={selectedModelReady}
         modelOptions={modelOptions}
@@ -86,16 +85,16 @@ export function TranscriptionPage({
         onOpenModelManager={openModelManager}
         onModelRequired={() => {
           requestModel();
-          onError("Select and load an ASR model to start transcribing.");
+          onError("Select and load a VoiceDesign model to continue.");
         }}
       />
 
       <RouteModelModal
         isOpen={isModelModalOpen}
         onClose={closeModelModal}
-        title="Transcription Models"
-        description="Manage ASR models for this route."
-        models={transcriptionModels}
+        title="Voice Design Models"
+        description="Manage VoiceDesign models for this route."
+        models={routeModels}
         loading={loading}
         selectedVariant={resolvedSelectedModel}
         intentVariant={intentVariant}
@@ -106,7 +105,7 @@ export function TranscriptionPage({
         onUnload={onUnload}
         onDelete={onDelete}
         onUseModel={onSelect}
-        emptyMessage="No transcription models available for this route."
+        emptyMessage={viewConfig.emptyStateDescription}
       />
     </PageShell>
   );

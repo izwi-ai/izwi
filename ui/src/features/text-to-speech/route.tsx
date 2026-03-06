@@ -1,12 +1,12 @@
-import { ModelInfo } from "../api";
-import { CustomVoicePlayground } from "../components/CustomVoicePlayground";
-import { PageHeader, PageShell } from "../components/PageShell";
-import { RouteModelModal } from "../components/RouteModelModal";
-import { VIEW_CONFIGS } from "../types";
+import type { ModelInfo } from "@/api";
+import { CustomVoicePlayground } from "@/components/CustomVoicePlayground";
+import { PageHeader, PageShell } from "@/components/PageShell";
+import { VIEW_CONFIGS } from "@/types";
 import {
   TEXT_TO_SPEECH_PREFERRED_MODELS,
   resolvePreferredRouteModel,
 } from "@/features/models/catalog/routeModelCatalog";
+import { RouteModelModal } from "@/features/models/components/RouteModelModal";
 import { useRouteModelSelection } from "@/features/models/hooks/useRouteModelSelection";
 
 interface TextToSpeechPageProps {
