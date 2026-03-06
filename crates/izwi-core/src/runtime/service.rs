@@ -280,6 +280,8 @@ pub struct RuntimeService {
     step_driver_wakeup: Arc<Notify>,
     step_driver_started: AtomicBool,
     pub(crate) loaded_tts_variant: RwLock<Option<ModelVariant>>,
+    pub(crate) max_loaded_models: Option<usize>,
+    pub(crate) model_last_used: Arc<Mutex<HashMap<ModelVariant, u64>>>,
     pub(crate) device: DeviceProfile,
 }
 
@@ -395,6 +397,8 @@ impl RuntimeService {
             step_driver_wakeup: Arc::new(Notify::new()),
             step_driver_started: AtomicBool::new(false),
             loaded_tts_variant: RwLock::new(None),
+            max_loaded_models: positive_usize_env("IZWI_MAX_LOADED_MODELS"),
+            model_last_used: Arc::new(Mutex::new(HashMap::new())),
             device,
         })
     }
@@ -757,4 +761,11 @@ fn configure_runtime_threading(num_threads: usize) {
         }
     }
     debug!("Configured runtime threading hints to {} threads", value);
+}
+
+fn positive_usize_env(key: &str) -> Option<usize> {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
 }

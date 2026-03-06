@@ -700,6 +700,14 @@ impl EngineCore {
         self.requests.contains_key(request_id)
     }
 
+    /// Get the set of model variants currently referenced by active engine requests.
+    pub fn active_model_variants(&self) -> HashSet<ModelVariant> {
+        self.requests
+            .values()
+            .filter_map(|request| request.model_variant)
+            .collect()
+    }
+
     /// Get request status.
     pub fn get_request_status(&self, request_id: &RequestId) -> Option<RequestStatus> {
         self.scheduler.get_status(request_id)

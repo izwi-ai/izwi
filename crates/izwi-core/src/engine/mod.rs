@@ -52,6 +52,7 @@ pub use types::{
 
 use crate::error::Result;
 use crate::model::ModelVariant;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Notify, RwLock};
 use tracing::{debug, info, warn};
@@ -295,6 +296,12 @@ impl Engine {
     pub async fn has_request(&self, request_id: &RequestId) -> bool {
         let core = self.core.read().await;
         core.has_request(request_id)
+    }
+
+    /// Get model variants currently referenced by active engine requests.
+    pub async fn active_model_variants(&self) -> HashSet<ModelVariant> {
+        let core = self.core.read().await;
+        core.active_model_variants()
     }
 
     /// Get the number of pending requests.

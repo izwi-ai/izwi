@@ -90,6 +90,8 @@ impl RuntimeService {
             MetalPoolManager::global().clear_all();
         }
 
+        self.forget_model_usage(variant).await;
+
         Ok(())
     }
 

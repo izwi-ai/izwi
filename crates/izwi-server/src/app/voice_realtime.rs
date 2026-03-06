@@ -1410,11 +1410,7 @@ async fn ensure_agent_session(
         updated_at: now,
     };
 
-    state
-        .agent_session_store
-        .write()
-        .await
-        .insert(session_id.clone(), record);
+    state.store_agent_session_record(record).await;
 
     *agent_session_id = Some(session_id.clone());
     *agent_session_system_prompt = Some(system_prompt.to_string());
@@ -1488,13 +1484,9 @@ async fn run_agent_turn(
             other => other.to_string(),
         })?;
 
-    {
-        let mut store = state.agent_session_store.write().await;
-        if let Some(record) = store.get_mut(session_id) {
-            record.updated_at = now_unix_millis();
-            record.model_id = resolved_model_id;
-        }
-    }
+    state
+        .touch_agent_session_record(session_id, now_unix_millis(), resolved_model_id)
+        .await;
 
     Ok(result.assistant_text)
 }
