@@ -300,14 +300,17 @@ impl RequestProcessor {
             &mut request.params,
         )?;
 
-        // Tokenize text input (simplified - actual tokenization would be more complex)
-        if let Some(text) = &request.text {
-            let estimated_tokens = (text.len() / 4).max(1);
-            request.prompt_tokens = (0..estimated_tokens as u32).collect();
-        } else if let Some(messages) = &request.chat_messages {
-            let estimated_tokens =
-                (messages.iter().map(|m| m.content.len()).sum::<usize>() / 4).max(1);
-            request.prompt_tokens = (0..estimated_tokens as u32).collect();
+        // Preserve exact prompt tokens when the caller already computed them.
+        if request.prompt_tokens.is_empty() {
+            // Tokenize text input (simplified - actual tokenization would be more complex)
+            if let Some(text) = &request.text {
+                let estimated_tokens = (text.len() / 4).max(1);
+                request.prompt_tokens = (0..estimated_tokens as u32).collect();
+            } else if let Some(messages) = &request.chat_messages {
+                let estimated_tokens =
+                    (messages.iter().map(|m| m.content.len()).sum::<usize>() / 4).max(1);
+                request.prompt_tokens = (0..estimated_tokens as u32).collect();
+            }
         }
 
         Ok(request)
@@ -604,6 +607,21 @@ mod tests {
 
         let processed = processor.process(request).expect("request should process");
         assert_eq!(processed.params.max_tokens, expected_default);
+    }
+
+    #[test]
+    fn test_request_processor_preserves_precomputed_prompt_tokens() {
+        let config = EngineCoreConfig::default();
+        let processor = RequestProcessor::new(config);
+
+        let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+            role: ChatRole::User,
+            content: "Hello".to_string(),
+        }]);
+        request.prompt_tokens = vec![41, 42, 43];
+
+        let processed = processor.process(request).expect("request should process");
+        assert_eq!(processed.prompt_tokens, vec![41, 42, 43]);
     }
 
     #[test]

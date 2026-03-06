@@ -92,6 +92,7 @@ struct RequestPhaseTiming {
     queue_wait_ms: f64,
     prefill_ms: f64,
     decode_ms: f64,
+    first_output_ms: Option<f64>,
     prefill_steps: u32,
     decode_steps: u32,
 }
@@ -249,6 +250,18 @@ impl EngineCore {
         }
 
         merged
+    }
+
+    fn has_user_visible_output(exec_output: &ExecutorOutput) -> bool {
+        exec_output.tokens_generated > 0
+            || exec_output
+                .text
+                .as_ref()
+                .is_some_and(|text| !text.is_empty())
+            || exec_output
+                .audio
+                .as_ref()
+                .is_some_and(|audio| !audio.samples.is_empty())
     }
 
     async fn execute_decode_subbatch(
@@ -622,11 +635,23 @@ impl EngineCore {
             let mut engine_output =
                 self.output_processor
                     .process(exec_output.clone(), sequence_id, generation_time);
+            engine_output.token_stats.prompt_tokens = self
+                .requests
+                .get(&request_id)
+                .map(|request| request.num_prompt_tokens())
+                .unwrap_or(engine_output.token_stats.prompt_tokens);
             if exec_output.finished {
                 if let Some((_, total_generated)) = self.scheduler.get_running_info(&request_id) {
                     let resolved_total = total_generated.max(engine_output.num_tokens);
                     engine_output.num_tokens = resolved_total;
                     engine_output.token_stats.generated_tokens = resolved_total;
+                }
+            }
+            if Self::has_user_visible_output(&exec_output) {
+                if let Some(phase) = self.request_phase_timings.get_mut(&request_id) {
+                    phase
+                        .first_output_ms
+                        .get_or_insert_with(|| generation_time.as_secs_f64() * 1000.0);
                 }
             }
             if let Some(phase) = self.request_phase_timings.get(&request_id).cloned() {
@@ -641,6 +666,7 @@ impl EngineCore {
                     queue_wait_ms: phase.queue_wait_ms,
                     prefill_ms: phase.prefill_ms,
                     decode_ms: phase.decode_ms,
+                    ttft_ms: phase.first_output_ms,
                     total_ms: generation_time.as_secs_f64() * 1000.0,
                     prefill_steps: phase.prefill_steps,
                     decode_steps: phase.decode_steps,
@@ -776,6 +802,7 @@ mod tests {
     use super::super::types::{AudioOutput, Priority};
     use super::*;
     use crate::model::ModelVariant;
+    use crate::models::shared::chat::{ChatMessage, ChatRole};
     use std::sync::{Arc, Mutex};
 
     struct MockExecutor {
@@ -900,6 +927,49 @@ mod tests {
                     error: None,
                 })
                 .collect())
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ImmediateFinishExecutor;
+
+    impl ModelExecutor for ImmediateFinishExecutor {
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorOutput>> {
+            Ok(scheduled
+                .iter()
+                .map(|entry| ExecutorOutput {
+                    request_id: entry.request_id.clone(),
+                    audio: None,
+                    text: Some(format!("done-{}", entry.request_id)),
+                    tokens_processed: entry.num_tokens.max(1),
+                    tokens_generated: 1,
+                    finished: true,
+                    error: None,
+                })
+                .collect())
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorOutput>> {
+            Ok(Vec::new())
         }
 
         fn is_ready(&self) -> bool {
@@ -1097,5 +1167,36 @@ mod tests {
             vec![("req-a".to_string(), 1), ("req-b".to_string(), 1)]
         );
         assert_eq!(calls[2], vec![("req-a".to_string(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn test_step_records_exact_prompt_tokens_and_ttft() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(ImmediateFinishExecutor));
+        let config = EngineCoreConfig {
+            enable_chunked_prefill: false,
+            block_size: 1,
+            max_blocks: 8,
+            ..Default::default()
+        };
+        let mut core = EngineCore::new_with_unified_executor(config, executor).unwrap();
+
+        let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+            role: ChatRole::User,
+            content: "Hello".to_string(),
+        }]);
+        request.id = "chat-req".to_string();
+        request.prompt_tokens = vec![11, 22, 33, 44];
+
+        core.add_request(request).unwrap();
+        let outputs = core.step().await.unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].token_stats.prompt_tokens, 4);
+        let latency = outputs[0]
+            .latency_breakdown
+            .as_ref()
+            .expect("latency breakdown");
+        assert!(latency.ttft_ms.is_some());
+        assert!(latency.ttft_ms.unwrap() >= 0.0);
     }
 }

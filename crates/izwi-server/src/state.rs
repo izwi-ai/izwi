@@ -26,6 +26,8 @@ pub struct StoredResponseRecord {
     pub model: String,
     pub input_items: Vec<StoredResponseInputItem>,
     pub output_text: Option<String>,
+    #[serde(default)]
+    pub input_tokens: usize,
     pub output_tokens: usize,
     pub error: Option<String>,
     pub metadata: Option<serde_json::Value>,

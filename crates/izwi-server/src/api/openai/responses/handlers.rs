@@ -85,9 +85,9 @@ pub async fn create_response(
     let created_at = now_unix_secs();
 
     let usage = ResponseUsage {
-        input_tokens: 0,
+        input_tokens: output.prompt_tokens,
         output_tokens: output.tokens_generated,
-        total_tokens: output.tokens_generated,
+        total_tokens: output.prompt_tokens + output.tokens_generated,
     };
 
     let response = ResponseObject {
@@ -111,6 +111,7 @@ pub async fn create_response(
             model: model_variant.dir_name().to_string(),
             input_items,
             output_text: Some(output.text),
+            input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             error: None,
             metadata: req.metadata,
@@ -310,9 +311,9 @@ async fn create_streaming_response(
                     model: model_name.clone(),
                     output: vec![assistant_output_item(output_text.clone())],
                     usage: ResponseUsage {
-                        input_tokens: 0,
+                        input_tokens: generation.prompt_tokens,
                         output_tokens: generation.tokens_generated,
-                        total_tokens: generation.tokens_generated,
+                        total_tokens: generation.prompt_tokens + generation.tokens_generated,
                     },
                     error: None,
                     metadata: metadata.clone(),
@@ -327,6 +328,7 @@ async fn create_streaming_response(
                         model: model_name,
                         input_items,
                         output_text: Some(output_text),
+                        input_tokens: generation.prompt_tokens,
                         output_tokens: generation.tokens_generated,
                         error: None,
                         metadata,
@@ -897,9 +899,9 @@ fn record_to_response(record: StoredResponseRecord) -> ResponseObject {
             .into_iter()
             .collect(),
         usage: ResponseUsage {
-            input_tokens: 0,
+            input_tokens: record.input_tokens,
             output_tokens: record.output_tokens,
-            total_tokens: record.output_tokens,
+            total_tokens: record.input_tokens + record.output_tokens,
         },
         error: record.error.map(|message| ResponseError {
             message,

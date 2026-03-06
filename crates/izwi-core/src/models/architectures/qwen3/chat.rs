@@ -465,6 +465,10 @@ impl Qwen3ChatModel {
         })
     }
 
+    pub fn prompt_token_ids(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
+        self.build_prompt(messages)
+    }
+
     fn build_prompt(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
         if messages.is_empty() {
             return Err(Error::InvalidInput(

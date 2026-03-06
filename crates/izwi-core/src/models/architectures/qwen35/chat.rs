@@ -3345,6 +3345,10 @@ impl Qwen35ChatModel {
         })
     }
 
+    pub fn prompt_token_ids(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
+        Ok(self.build_prompt(messages)?.ids)
+    }
+
     pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
         if state.finished || state.generated_ids.len() >= state.max_new_tokens {
             state.finished = true;

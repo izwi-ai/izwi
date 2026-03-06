@@ -81,6 +81,7 @@ pub struct DiarizationConfig {
 #[derive(Debug, Clone)]
 pub struct ChatGeneration {
     pub text: String,
+    pub prompt_tokens: usize,
     pub tokens_generated: usize,
     pub generation_time_ms: f64,
 }

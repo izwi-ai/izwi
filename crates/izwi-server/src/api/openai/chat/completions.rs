@@ -757,7 +757,7 @@ pub async fn completions(
     let completion_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
     let created = now_unix_secs();
     let completion_tokens = generation.tokens_generated;
-    let prompt_tokens = 0usize;
+    let prompt_tokens = generation.prompt_tokens;
     let (assistant_content, assistant_tool_calls, finish_reason) =
         build_assistant_response_parts(generation.text);
 
@@ -867,9 +867,10 @@ async fn complete_stream(
                                 }),
                             }],
                             usage: include_usage.then_some(OpenAiUsage {
-                                prompt_tokens: 0,
+                                prompt_tokens: generation.prompt_tokens,
                                 completion_tokens: generation.tokens_generated,
-                                total_tokens: generation.tokens_generated,
+                                total_tokens: generation.prompt_tokens
+                                    + generation.tokens_generated,
                             }),
                             izwi_generation_time_ms: Some(generation.generation_time_ms),
                         })

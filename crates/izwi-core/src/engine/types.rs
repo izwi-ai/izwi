@@ -217,6 +217,8 @@ pub struct LatencyBreakdown {
     pub prefill_ms: f64,
     /// Total scheduler decode phase wall-clock time attributed to this request.
     pub decode_ms: f64,
+    /// Time to first user-visible output in milliseconds, when observed.
+    pub ttft_ms: Option<f64>,
     /// End-to-end request time in milliseconds.
     pub total_ms: f64,
     /// Number of prefill steps.

@@ -54,6 +54,9 @@ pub struct RuntimeTelemetrySnapshot {
     pub decode_ms_avg: f64,
     pub decode_ms_p50: f64,
     pub decode_ms_p95: f64,
+    pub ttft_ms_avg: f64,
+    pub ttft_ms_p50: f64,
+    pub ttft_ms_p95: f64,
     pub end_to_end_ms_avg: f64,
     pub end_to_end_ms_p50: f64,
     pub end_to_end_ms_p95: f64,
@@ -72,6 +75,7 @@ struct RuntimeTelemetryCollector {
     queue_wait_ms_samples: Mutex<VecDeque<f64>>,
     prefill_ms_samples: Mutex<VecDeque<f64>>,
     decode_ms_samples: Mutex<VecDeque<f64>>,
+    ttft_ms_samples: Mutex<VecDeque<f64>>,
     end_to_end_ms_samples: Mutex<VecDeque<f64>>,
 }
 
@@ -89,6 +93,7 @@ impl RuntimeTelemetryCollector {
             queue_wait_ms_samples: Mutex::new(VecDeque::with_capacity(max_samples.max(64))),
             prefill_ms_samples: Mutex::new(VecDeque::with_capacity(max_samples.max(64))),
             decode_ms_samples: Mutex::new(VecDeque::with_capacity(max_samples.max(64))),
+            ttft_ms_samples: Mutex::new(VecDeque::with_capacity(max_samples.max(64))),
             end_to_end_ms_samples: Mutex::new(VecDeque::with_capacity(max_samples.max(64))),
         }
     }
@@ -119,6 +124,9 @@ impl RuntimeTelemetryCollector {
             )
             .await;
             Self::push_sample(&self.decode_ms_samples, self.max_samples, latency.decode_ms).await;
+            if let Some(ttft_ms) = latency.ttft_ms {
+                Self::push_sample(&self.ttft_ms_samples, self.max_samples, ttft_ms).await;
+            }
             Self::push_sample(
                 &self.end_to_end_ms_samples,
                 self.max_samples,
@@ -162,6 +170,7 @@ impl RuntimeTelemetryCollector {
         let queue = self.queue_wait_ms_samples.lock().await.clone();
         let prefill = self.prefill_ms_samples.lock().await.clone();
         let decode = self.decode_ms_samples.lock().await.clone();
+        let ttft = self.ttft_ms_samples.lock().await.clone();
         let end_to_end = self.end_to_end_ms_samples.lock().await.clone();
 
         RuntimeTelemetrySnapshot {
@@ -181,6 +190,9 @@ impl RuntimeTelemetryCollector {
             decode_ms_avg: mean(&decode),
             decode_ms_p50: percentile(&decode, 0.50),
             decode_ms_p95: percentile(&decode, 0.95),
+            ttft_ms_avg: mean(&ttft),
+            ttft_ms_p50: percentile(&ttft, 0.50),
+            ttft_ms_p95: percentile(&ttft, 0.95),
             end_to_end_ms_avg: mean(&end_to_end),
             end_to_end_ms_p50: percentile(&end_to_end, 0.50),
             end_to_end_ms_p95: percentile(&end_to_end, 0.95),
@@ -199,6 +211,7 @@ impl RuntimeTelemetryCollector {
 # TYPE izwi_latency_queue_wait_ms gauge\nizwi_latency_queue_wait_ms{{quantile=\"avg\"}} {:.6}\nizwi_latency_queue_wait_ms{{quantile=\"p50\"}} {:.6}\nizwi_latency_queue_wait_ms{{quantile=\"p95\"}} {:.6}\n\
 # TYPE izwi_latency_prefill_ms gauge\nizwi_latency_prefill_ms{{quantile=\"avg\"}} {:.6}\nizwi_latency_prefill_ms{{quantile=\"p50\"}} {:.6}\nizwi_latency_prefill_ms{{quantile=\"p95\"}} {:.6}\n\
 # TYPE izwi_latency_decode_ms gauge\nizwi_latency_decode_ms{{quantile=\"avg\"}} {:.6}\nizwi_latency_decode_ms{{quantile=\"p50\"}} {:.6}\nizwi_latency_decode_ms{{quantile=\"p95\"}} {:.6}\n\
+# TYPE izwi_latency_ttft_ms gauge\nizwi_latency_ttft_ms{{quantile=\"avg\"}} {:.6}\nizwi_latency_ttft_ms{{quantile=\"p50\"}} {:.6}\nizwi_latency_ttft_ms{{quantile=\"p95\"}} {:.6}\n\
 # TYPE izwi_latency_end_to_end_ms gauge\nizwi_latency_end_to_end_ms{{quantile=\"avg\"}} {:.6}\nizwi_latency_end_to_end_ms{{quantile=\"p50\"}} {:.6}\nizwi_latency_end_to_end_ms{{quantile=\"p95\"}} {:.6}\n",
             snapshot.requests_queued,
             snapshot.requests_completed,
@@ -215,6 +228,9 @@ impl RuntimeTelemetryCollector {
             snapshot.decode_ms_avg,
             snapshot.decode_ms_p50,
             snapshot.decode_ms_p95,
+            snapshot.ttft_ms_avg,
+            snapshot.ttft_ms_p50,
+            snapshot.ttft_ms_p95,
             snapshot.end_to_end_ms_avg,
             snapshot.end_to_end_ms_p50,
             snapshot.end_to_end_ms_p95,
