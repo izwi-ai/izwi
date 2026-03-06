@@ -10,42 +10,42 @@ import type {
 } from "@/app/router/types";
 
 const TextToSpeechPage = lazy(async () => {
-  const module = await import("@/pages/TextToSpeechPage");
+  const module = await import("@/features/text-to-speech/route");
   return { default: module.TextToSpeechPage };
 });
 
 const VoiceCloningPage = lazy(async () => {
-  const module = await import("@/pages/VoiceCloningPage");
+  const module = await import("@/features/voice-cloning/route");
   return { default: module.VoiceCloningPage };
 });
 
 const VoiceDesignPage = lazy(async () => {
-  const module = await import("@/pages/VoiceDesignPage");
+  const module = await import("@/features/voice-design/route");
   return { default: module.VoiceDesignPage };
 });
 
 const TranscriptionPage = lazy(async () => {
-  const module = await import("@/pages/TranscriptionPage");
+  const module = await import("@/features/transcription/route");
   return { default: module.TranscriptionPage };
 });
 
 const DiarizationPage = lazy(async () => {
-  const module = await import("@/pages/DiarizationPage");
+  const module = await import("@/features/diarization/route");
   return { default: module.DiarizationPage };
 });
 
 const ChatPage = lazy(async () => {
-  const module = await import("@/pages/ChatPage");
+  const module = await import("@/features/chat/route");
   return { default: module.ChatPage };
 });
 
 const VoicePage = lazy(async () => {
-  const module = await import("@/pages/VoicePage");
+  const module = await import("@/features/voice/route");
   return { default: module.VoicePage };
 });
 
 const MyModelsPage = lazy(async () => {
-  const module = await import("@/pages/MyModelsPage");
+  const module = await import("@/features/models/route");
   return { default: module.MyModelsPage };
 });
 

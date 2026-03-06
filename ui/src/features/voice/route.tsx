@@ -13,6 +13,10 @@ import {
 } from "lucide-react";
 import clsx from "clsx";
 import { cn } from "@/lib/utils";
+import { api, type ModelInfo } from "@/api";
+import { PageShell } from "@/components/PageShell";
+import { Button } from "@/components/ui/button";
+import { Slider } from "@/components/ui/slider";
 import {
   ENABLE_LEGACY_LOCAL_UNIFIED_PATH,
   MODULAR_STACK_VARIANTS,
@@ -43,11 +47,7 @@ import {
   type VoiceRealtimeClientMessage,
   type VoiceRealtimeServerEvent,
 } from "@/features/voice/realtime/support";
-import { api, ModelInfo } from "../api";
-import { Button } from "../components/ui/button";
-import { PageShell } from "../components/PageShell";
-import { Slider } from "../components/ui/slider";
-import { getSpeakerProfilesForVariant } from "../types";
+import { getSpeakerProfilesForVariant } from "@/types";
 
 export function VoicePage({
   models,

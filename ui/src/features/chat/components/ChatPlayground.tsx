@@ -62,8 +62,8 @@ import {
   supportsImplicitOpenThinkTagParsing,
   threadPreviewFromContent,
 } from "@/features/chat/playground/support";
-import { api, type ChatThread, type ChatThreadMessageRecord } from "../api";
-import { MarkdownContent } from "./ui/MarkdownContent";
+import { api, type ChatThread, type ChatThreadMessageRecord } from "@/api";
+import { MarkdownContent } from "@/components/ui/MarkdownContent";
 
 export function ChatPlayground({
   selectedModel,

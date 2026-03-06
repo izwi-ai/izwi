@@ -1,15 +1,15 @@
-import { ModelInfo } from "../api";
-import { RouteModelModal } from "../components/RouteModelModal";
-import { VoiceClonePlayground } from "../components/VoiceClonePlayground";
-import { PageHeader, PageShell } from "../components/PageShell";
-import { VIEW_CONFIGS } from "../types";
+import type { ModelInfo } from "@/api";
+import { PageHeader, PageShell } from "@/components/PageShell";
+import { VIEW_CONFIGS } from "@/types";
+import { TranscriptionPlayground } from "@/features/transcription/components/TranscriptionPlayground";
 import {
-  VOICE_CLONING_PREFERRED_MODELS,
+  TRANSCRIPTION_PREFERRED_MODELS,
   resolvePreferredRouteModel,
 } from "@/features/models/catalog/routeModelCatalog";
+import { RouteModelModal } from "@/features/models/components/RouteModelModal";
 import { useRouteModelSelection } from "@/features/models/hooks/useRouteModelSelection";
 
-interface VoiceCloningPageProps {
+interface TranscriptionPageProps {
   models: ModelInfo[];
   selectedModel: string | null;
   loading: boolean;
@@ -32,7 +32,7 @@ interface VoiceCloningPageProps {
   onError: (message: string) => void;
 }
 
-export function VoiceCloningPage({
+export function TranscriptionPage({
   models,
   selectedModel,
   loading,
@@ -44,10 +44,10 @@ export function VoiceCloningPage({
   onDelete,
   onSelect,
   onError,
-}: VoiceCloningPageProps) {
-  const viewConfig = VIEW_CONFIGS["voice-clone"];
+}: TranscriptionPageProps) {
+  const viewConfig = VIEW_CONFIGS.transcription;
   const {
-    routeModels,
+    routeModels: transcriptionModels,
     resolvedSelectedModel,
     selectedModelReady,
     isModelModalOpen,
@@ -66,18 +66,19 @@ export function VoiceCloningPage({
       resolvePreferredRouteModel({
         models: routeModels,
         selectedModel: currentModel,
-        preferredVariants: VOICE_CLONING_PREFERRED_MODELS,
+        preferredVariants: TRANSCRIPTION_PREFERRED_MODELS,
+        preferAnyPreferredBeforeReadyAny: true,
       }),
   });
 
   return (
     <PageShell>
       <PageHeader
-        title="Voice Cloning"
-        description="Clone custom voices from reference audio with local model inference."
+        title="Transcription"
+        description="Capture audio, transcribe live, and browse saved transcription history."
       />
 
-      <VoiceClonePlayground
+      <TranscriptionPlayground
         selectedModel={resolvedSelectedModel}
         selectedModelReady={selectedModelReady}
         modelOptions={modelOptions}
@@ -85,16 +86,16 @@ export function VoiceCloningPage({
         onOpenModelManager={openModelManager}
         onModelRequired={() => {
           requestModel();
-          onError("Select and load a Base model to clone voices.");
+          onError("Select and load an ASR model to start transcribing.");
         }}
       />
 
       <RouteModelModal
         isOpen={isModelModalOpen}
         onClose={closeModelModal}
-        title="Voice Cloning Models"
-        description="Manage Base models for this route."
-        models={routeModels}
+        title="Transcription Models"
+        description="Manage ASR models for this route."
+        models={transcriptionModels}
         loading={loading}
         selectedVariant={resolvedSelectedModel}
         intentVariant={intentVariant}
@@ -105,7 +106,7 @@ export function VoiceCloningPage({
         onUnload={onUnload}
         onDelete={onDelete}
         onUseModel={onSelect}
-        emptyMessage={viewConfig.emptyStateDescription}
+        emptyMessage="No transcription models available for this route."
       />
     </PageShell>
   );

@@ -48,16 +48,16 @@ import {
   api,
   type TranscriptionRecord,
   type TranscriptionRecordSummary,
-} from "../api";
-import { ASRStats, GenerationStats } from "./GenerationStats";
-import { MiniWaveform } from "./ui/Waveform";
+} from "@/api";
+import { ASRStats, GenerationStats } from "@/components/GenerationStats";
+import { MiniWaveform } from "@/components/ui/Waveform";
 import {
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from "./ui/select";
+} from "@/components/ui/select";
 
 export function TranscriptionPlayground({
   selectedModel,
