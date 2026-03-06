@@ -109,11 +109,7 @@ pub async fn create_session(
         updated_at: now,
     };
 
-    state
-        .agent_session_store
-        .write()
-        .await
-        .insert(session_id.clone(), record.clone());
+    state.store_agent_session_record(record.clone()).await;
 
     Ok(Json(session_response(record)))
 }
@@ -200,13 +196,9 @@ pub async fn create_turn(
         .await
         .map_err(map_agent_error)?;
 
-    {
-        let mut store = state.agent_session_store.write().await;
-        if let Some(record) = store.get_mut(&session_id) {
-            record.updated_at = now_unix_millis();
-            record.model_id = resolved_model_id.clone();
-        }
-    }
+    state
+        .touch_agent_session_record(&session_id, now_unix_millis(), resolved_model_id.clone())
+        .await;
 
     Ok(Json(AgentTurnResponse {
         session_id,

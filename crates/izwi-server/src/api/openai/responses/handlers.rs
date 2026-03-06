@@ -916,8 +916,7 @@ async fn persist_response(state: &AppState, record: StoredResponseRecord, store:
         return;
     }
 
-    let mut response_store = state.response_store.write().await;
-    response_store.insert(record.id.clone(), record);
+    state.store_response_record(record).await;
 }
 
 fn now_unix_secs() -> u64 {
