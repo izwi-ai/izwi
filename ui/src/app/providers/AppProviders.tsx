@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { ModelCatalogProvider } from "@/app/providers/ModelCatalogProvider";
 import { ThemeProvider } from "@/app/providers/ThemeProvider";
 
 interface AppProvidersProps {
@@ -6,5 +7,9 @@ interface AppProvidersProps {
 }
 
 export function AppProviders({ children }: AppProvidersProps) {
-  return <ThemeProvider>{children}</ThemeProvider>;
+  return (
+    <ThemeProvider>
+      <ModelCatalogProvider>{children}</ModelCatalogProvider>
+    </ThemeProvider>
+  );
 }
