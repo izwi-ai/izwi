@@ -27,7 +27,7 @@ pub(super) struct ActiveSpeechToSpeechDecode {
     pub(super) prompt_accounted: bool,
     pub(super) last_tokens_generated: usize,
     pub(super) stream_sequence: usize,
-    pub(super) audio_frames_accum: Vec<Vec<u32>>,
+    pub(super) audio_codebooks_accum: Vec<Vec<u32>>,
     pub(super) emitted_samples: usize,
     pub(super) audio_samples_accum: Vec<f32>,
 }
@@ -47,6 +47,6 @@ pub(super) struct ActiveLfm2TtsDecode {
     pub(super) prompt_accounted: bool,
     pub(super) last_tokens_generated: usize,
     pub(super) stream_sequence: usize,
-    pub(super) audio_frames_accum: Vec<Vec<u32>>,
+    pub(super) audio_codebooks_accum: Vec<Vec<u32>>,
     pub(super) emitted_samples: usize,
 }
