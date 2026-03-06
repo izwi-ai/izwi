@@ -1,10 +1,15 @@
-import { useEffect, useMemo, useState } from "react";
 import { ModelInfo } from "../api";
 import { ChatPlayground } from "../components/ChatPlayground";
 import { PageHeader, PageShell } from "../components/PageShell";
 import { RouteModelModal } from "../components/RouteModelModal";
 import { VIEW_CONFIGS } from "../types";
-import { withQwen3Prefix } from "../utils/modelDisplay";
+import {
+  CHAT_PREFERRED_MODELS,
+  getChatRouteModelLabel,
+  isThinkingChatModel,
+  resolvePreferredRouteModel,
+} from "@/features/models/catalog/routeModelCatalog";
+import { useRouteModelSelection } from "@/features/models/hooks/useRouteModelSelection";
 
 interface ChatPageProps {
   models: ModelInfo[];
@@ -29,80 +34,6 @@ interface ChatPageProps {
   onError: (message: string) => void;
 }
 
-function getChatModelName(variant: string): string {
-  if (variant === "Qwen3-0.6B-GGUF") {
-    return withQwen3Prefix("Chat 0.6B GGUF", variant);
-  }
-  if (variant === "Qwen3-1.7B-GGUF") {
-    return withQwen3Prefix("Chat 1.7B GGUF", variant);
-  }
-  if (variant === "Qwen3-4B-GGUF") {
-    return withQwen3Prefix("Chat 4B GGUF (Q4_K_M)", variant);
-  }
-  if (variant === "Qwen3-8B-GGUF") {
-    return withQwen3Prefix("Chat 8B GGUF (Q4_K_M)", variant);
-  }
-  if (variant === "Qwen3.5-0.8B") {
-    return withQwen3Prefix("Chat 0.8B GGUF (Q4_K_M)", variant);
-  }
-  if (variant === "Qwen3.5-2B") {
-    return withQwen3Prefix("Chat 2B GGUF (Q4_K_M)", variant);
-  }
-  if (variant === "Qwen3.5-4B") {
-    return withQwen3Prefix("Chat 4B GGUF (Q4_K_M)", variant);
-  }
-  if (variant === "Qwen3.5-9B") {
-    return withQwen3Prefix("Chat 9B GGUF (Q4_K_M)", variant);
-  }
-  if (variant === "LFM2.5-1.2B-Instruct-GGUF") {
-    return "LFM2.5 1.2B Instruct GGUF (Q4_K_M)";
-  }
-  if (variant === "LFM2.5-1.2B-Thinking-GGUF") {
-    return "LFM2.5 1.2B Thinking GGUF (Q4_K_M)";
-  }
-  if (variant === "Gemma-3-1b-it") {
-    return "Gemma 3 1B Instruct";
-  }
-  if (variant === "Gemma-3-4b-it") {
-    return "Gemma 3 4B Instruct";
-  }
-  return variant;
-}
-
-function isThinkingChatModel(variant: string): boolean {
-  const normalized = variant.trim().toLowerCase();
-  const isQwenThinkingFamily =
-    (normalized.startsWith("qwen3-") || normalized.startsWith("qwen3.5-")) &&
-    !normalized.includes("-asr-") &&
-    !normalized.includes("-tts-") &&
-    !normalized.includes("forcedaligner");
-
-  const isLfmThinkingVariant = normalized === "lfm2.5-1.2b-thinking-gguf";
-
-  return isQwenThinkingFamily || isLfmThinkingVariant;
-}
-
-function getStatusLabel(status: ModelInfo["status"]): string {
-  switch (status) {
-    case "ready":
-      return "Loaded";
-    case "loading":
-      return "Loading";
-    case "downloading":
-      return "Downloading";
-    case "downloaded":
-      return "Downloaded";
-    case "not_downloaded":
-      return "Not downloaded";
-    case "error":
-      return "Error";
-    default:
-      return status;
-  }
-}
-
-const DEFAULT_CHAT_MODEL_VARIANT = "Qwen3-8B-GGUF";
-
 export function ChatPage({
   models,
   selectedModel,
@@ -117,83 +48,32 @@ export function ChatPage({
   onError,
 }: ChatPageProps) {
   const viewConfig = VIEW_CONFIGS.chat;
-  const [isModelModalOpen, setIsModelModalOpen] = useState(false);
-  const [modalIntentModel, setModalIntentModel] = useState<string | null>(null);
-  const [autoCloseOnIntentReady, setAutoCloseOnIntentReady] = useState(false);
-
-  const chatModels = useMemo(
-    () =>
-      models
-        .filter((model) => viewConfig.modelFilter(model.variant))
-        .sort((a, b) => a.variant.localeCompare(b.variant)),
-    [models, viewConfig],
-  );
-
-  const resolvedSelectedModel = (() => {
-    if (selectedModel && viewConfig.modelFilter(selectedModel)) {
-      return selectedModel;
-    }
-    const preferredModel = chatModels.find(
-      (model) => model.variant === DEFAULT_CHAT_MODEL_VARIANT,
-    );
-    if (preferredModel) {
-      return preferredModel.variant;
-    }
-    const readyModel = chatModels.find((model) => model.status === "ready");
-    if (readyModel) {
-      return readyModel.variant;
-    }
-    return chatModels[0]?.variant ?? null;
-  })();
-
-  const selectedModelInfo =
-    chatModels.find((model) => model.variant === resolvedSelectedModel) ?? null;
-  const selectedModelReady = selectedModelInfo?.status === "ready";
-
-  const closeModelModal = () => {
-    setIsModelModalOpen(false);
-    setAutoCloseOnIntentReady(false);
-  };
-
-  useEffect(() => {
-    if (!isModelModalOpen || !modalIntentModel || !autoCloseOnIntentReady) {
-      return;
-    }
-    const targetModel = chatModels.find(
-      (model) => model.variant === modalIntentModel,
-    );
-    if (targetModel?.status === "ready") {
-      closeModelModal();
-    }
-  }, [autoCloseOnIntentReady, chatModels, isModelModalOpen, modalIntentModel]);
-
-  const handleModelSelect = (variant: string) => {
-    const model = chatModels.find((entry) => entry.variant === variant);
-    if (!model) {
-      return;
-    }
-
-    onSelect(variant);
-
-    if (model.status !== "ready") {
-      setModalIntentModel(variant);
-      setAutoCloseOnIntentReady(true);
-      setIsModelModalOpen(true);
-    }
-  };
-
-  const openModelManager = () => {
-    setModalIntentModel(resolvedSelectedModel);
-    setAutoCloseOnIntentReady(false);
-    setIsModelModalOpen(true);
-  };
-
-  const modelOptions = chatModels.map((model) => ({
-    value: model.variant,
-    label: getChatModelName(model.variant),
-    statusLabel: getStatusLabel(model.status),
-    isReady: model.status === "ready",
-  }));
+  const {
+    routeModels: chatModels,
+    resolvedSelectedModel,
+    selectedModelInfo,
+    selectedModelReady,
+    isModelModalOpen,
+    intentVariant,
+    closeModelModal,
+    openModelManager,
+    requestModel,
+    handleModelSelect,
+    modelOptions,
+  } = useRouteModelSelection({
+    models,
+    selectedModel,
+    onSelect,
+    modelFilter: viewConfig.modelFilter,
+    getModelLabel: getChatRouteModelLabel,
+    resolveSelectedModel: (routeModels, currentModel) =>
+      resolvePreferredRouteModel({
+        models: routeModels,
+        selectedModel: currentModel,
+        preferredVariants: CHAT_PREFERRED_MODELS,
+        preferAnyPreferredBeforeReadyAny: true,
+      }),
+  });
 
   return (
     <PageShell>
@@ -205,7 +85,9 @@ export function ChatPage({
         selectedModel={resolvedSelectedModel}
         selectedModelReady={selectedModelReady}
         modelLabel={
-          selectedModelInfo ? getChatModelName(selectedModelInfo.variant) : null
+          selectedModelInfo
+            ? getChatRouteModelLabel(selectedModelInfo.variant)
+            : null
         }
         supportsThinking={
           resolvedSelectedModel
@@ -216,9 +98,7 @@ export function ChatPage({
         onSelectModel={handleModelSelect}
         onOpenModelManager={openModelManager}
         onModelRequired={() => {
-          setModalIntentModel(resolvedSelectedModel);
-          setAutoCloseOnIntentReady(true);
-          setIsModelModalOpen(true);
+          requestModel();
           onError("Select a model and load it to start chatting.");
         }}
       />
@@ -231,7 +111,7 @@ export function ChatPage({
         models={chatModels}
         loading={loading}
         selectedVariant={resolvedSelectedModel}
-        intentVariant={modalIntentModel}
+        intentVariant={intentVariant}
         downloadProgress={downloadProgress}
         onDownload={onDownload}
         onCancelDownload={onCancelDownload}
@@ -239,7 +119,7 @@ export function ChatPage({
         onUnload={onUnload}
         onDelete={onDelete}
         onUseModel={onSelect}
-        getModelLabel={getChatModelName}
+        getModelLabel={getChatRouteModelLabel}
         emptyMessage="No chat models available for this route."
       />
     </PageShell>
