@@ -64,6 +64,8 @@ pub struct WorkerConfig {
     pub kv_cache_dtype: String,
     /// Number of threads
     pub num_threads: usize,
+    /// Maximum number of requests to execute in parallel.
+    pub request_parallelism: usize,
     /// Decode-time KV cache page size.
     pub kv_page_size: usize,
     /// Optional shared model registry for loaded runtime models.
@@ -79,6 +81,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("dtype", &self.dtype)
             .field("kv_cache_dtype", &self.kv_cache_dtype)
             .field("num_threads", &self.num_threads)
+            .field("request_parallelism", &self.request_parallelism)
             .field("kv_page_size", &self.kv_page_size)
             .field(
                 "model_registry",
@@ -94,16 +97,19 @@ impl Default for WorkerConfig {
             BackendPreference::Auto,
             BackendSelectionSource::Default,
         );
+        let backend_kind = backend_context.backend_kind;
+        let num_threads = 4;
         Self {
             models_dir: dirs::data_local_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("izwi")
                 .join("models"),
-            backend: backend_context.backend_kind,
+            backend: backend_kind,
             backend_context,
             dtype: "float32".to_string(),
             kv_cache_dtype: "float16".to_string(),
-            num_threads: 4,
+            num_threads,
+            request_parallelism: Self::request_parallelism_for(backend_kind, num_threads),
             kv_page_size: 64,
             model_registry: None,
         }
@@ -114,16 +120,51 @@ impl From<&EngineCoreConfig> for WorkerConfig {
     fn from(config: &EngineCoreConfig) -> Self {
         let backend_context =
             BackendRouter::resolve_context_for_kind(config.backend, BackendSelectionSource::Config);
+        let backend_kind = backend_context.backend_kind;
+        let num_threads = config.num_threads.max(1);
         Self {
             models_dir: config.models_dir.clone(),
-            backend: backend_context.backend_kind,
+            backend: backend_kind,
             backend_context,
             dtype: "float32".to_string(),
             kv_cache_dtype: config.kv_cache_dtype.clone(),
-            num_threads: config.num_threads,
+            num_threads,
+            request_parallelism: Self::request_parallelism_for(backend_kind, num_threads),
             kv_page_size: config.block_size.max(1),
             model_registry: None,
         }
+    }
+}
+
+impl WorkerConfig {
+    fn request_parallelism_override() -> Option<usize> {
+        std::env::var("IZWI_REQUEST_PARALLELISM")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+    }
+
+    fn resolve_request_parallelism(
+        backend: BackendKind,
+        num_threads: usize,
+        override_value: Option<usize>,
+    ) -> usize {
+        let default_parallelism = match backend {
+            // CPU workloads already use `num_threads` for BLAS/Rayon/intra-op work, so
+            // keep inter-request fan-out conservative unless explicitly overridden.
+            BackendKind::Cpu | BackendKind::Metal => 1,
+            BackendKind::Cuda => num_threads.max(1),
+        };
+
+        override_value.unwrap_or(default_parallelism).max(1)
+    }
+
+    fn request_parallelism_for(backend: BackendKind, num_threads: usize) -> usize {
+        Self::resolve_request_parallelism(
+            backend,
+            num_threads,
+            Self::request_parallelism_override(),
+        )
     }
 }
 
@@ -505,9 +546,30 @@ mod tests {
 
         let config = WorkerConfig::from(&engine);
         assert_eq!(config.backend, config.backend_context.backend_kind);
+        assert_eq!(config.request_parallelism, 1);
         assert_eq!(
             config.backend_context.source,
             BackendSelectionSource::Config
+        );
+    }
+
+    #[test]
+    fn test_request_parallelism_defaults_are_backend_aware() {
+        assert_eq!(
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 8, None),
+            1
+        );
+        assert_eq!(
+            WorkerConfig::resolve_request_parallelism(BackendKind::Metal, 8, None),
+            1
+        );
+        assert_eq!(
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cuda, 8, None),
+            8
+        );
+        assert_eq!(
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 8, Some(3)),
+            3
         );
     }
 

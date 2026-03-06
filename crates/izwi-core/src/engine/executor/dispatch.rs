@@ -150,7 +150,7 @@ impl NativeExecutor {
     }
 
     fn can_parallelize_requests(&self, scheduled_len: usize) -> bool {
-        if scheduled_len <= 1 || self.config.num_threads <= 1 {
+        if scheduled_len <= 1 || self.config.request_parallelism <= 1 {
             return false;
         }
         // Keep Metal execution serialized to avoid command-queue contention.
@@ -162,7 +162,7 @@ impl NativeExecutor {
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
     ) -> Result<Vec<ExecutorOutput>> {
-        let worker_count = self.config.num_threads.min(scheduled.len()).max(1);
+        let worker_count = self.config.request_parallelism.min(scheduled.len()).max(1);
         let mut partitions: Vec<Vec<(usize, ScheduledRequest)>> = vec![Vec::new(); worker_count];
         for (idx, item) in scheduled.iter().enumerate() {
             partitions[idx % worker_count].push((idx, item.clone()));
