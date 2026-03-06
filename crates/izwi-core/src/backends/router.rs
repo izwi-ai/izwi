@@ -154,19 +154,28 @@ mod tests {
     use crate::env_test_lock;
 
     #[test]
-    fn preference_maps_to_expected_default_backend() {
+    fn cpu_preference_maps_to_native_backend() {
         assert_eq!(
             BackendRouter::from_preference(BackendPreference::Cpu).default_backend(),
             ExecutionBackend::CandleNative
         );
-        assert_eq!(
-            BackendRouter::from_preference(BackendPreference::Metal).default_backend(),
-            ExecutionBackend::CandleMetal
-        );
-        assert_eq!(
-            BackendRouter::from_preference(BackendPreference::Cuda).default_backend(),
-            ExecutionBackend::CandleCuda
-        );
+    }
+
+    #[test]
+    fn explicit_preferences_record_requested_backend_even_on_fallback() {
+        for preference in [BackendPreference::Metal, BackendPreference::Cuda] {
+            let router = BackendRouter::from_preference(preference);
+            let context = router.context();
+            let requested = preference.requested_kind().expect("explicit backend kind");
+
+            assert_eq!(context.preference, preference);
+            if context.matches_preference() {
+                assert_eq!(router.default_backend().kind(), requested);
+            } else {
+                assert_ne!(router.default_backend().kind(), requested);
+                assert!(context.reason.contains("fell back"));
+            }
+        }
     }
 
     #[test]
