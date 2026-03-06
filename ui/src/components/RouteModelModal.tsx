@@ -12,7 +12,6 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { ModelInfo } from "../api";
-import { MODEL_DETAILS } from "../pages/MyModelsPage";
 import { withQwen3Prefix } from "../utils/modelDisplay";
 
 interface RouteModelSection {
@@ -151,11 +150,7 @@ function groupModelsByProvider(models: ModelInfo[]): ProviderGroup[] {
 }
 
 function defaultModelLabel(variant: string): string {
-  const details = MODEL_DETAILS[variant];
-  if (!details) {
-    return variant;
-  }
-  return withQwen3Prefix(details.shortName, variant);
+  return withQwen3Prefix(variant, variant);
 }
 
 function getModelSizeLabel(
@@ -173,10 +168,6 @@ function getModelSizeLabel(
   }
   if (model.size_bytes !== null) {
     return formatBytes(model.size_bytes);
-  }
-  const knownSize = MODEL_DETAILS[model.variant]?.size;
-  if (knownSize) {
-    return knownSize;
   }
   return "Size unknown";
 }
