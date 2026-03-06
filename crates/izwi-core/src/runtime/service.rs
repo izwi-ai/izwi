@@ -375,6 +375,7 @@ impl RuntimeService {
         worker_config.kv_page_size = config.kv_page_size.max(1);
         worker_config.model_registry = Some(model_registry.clone());
         worker_config.backend = selected_backend_kind;
+        worker_config.backend_context = backend_context.clone();
         let core_engine = Arc::new(CoreEngine::new_with_worker(core_config, worker_config)?);
 
         Ok(Self {

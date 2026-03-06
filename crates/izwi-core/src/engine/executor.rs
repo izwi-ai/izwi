@@ -27,11 +27,12 @@ use super::config::EngineCoreConfig;
 use super::request::EngineCoreRequest;
 use super::scheduler::ScheduledRequest;
 use super::types::AudioOutput;
-use crate::backends::BackendKind;
+use crate::backends::{
+    BackendContext, BackendKind, BackendPreference, BackendRouter, BackendSelectionSource,
+};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
-use crate::models::DeviceSelector;
 use crate::models::ModelRegistry;
 use state::{
     ActiveAsrDecode, ActiveChatDecode, ActiveLfm2TtsDecode, ActiveQwenTtsDecode,
@@ -55,6 +56,8 @@ pub struct WorkerConfig {
     pub models_dir: PathBuf,
     /// Backend to use (cpu, metal, cuda)
     pub backend: BackendKind,
+    /// Resolved backend/device context for this worker.
+    pub backend_context: BackendContext,
     /// Data type (float32, float16, bfloat16)
     pub dtype: String,
     /// KV cache storage dtype hint (e.g. float16, int8).
@@ -72,6 +75,7 @@ impl std::fmt::Debug for WorkerConfig {
         f.debug_struct("WorkerConfig")
             .field("models_dir", &self.models_dir)
             .field("backend", &self.backend)
+            .field("backend_context", &self.backend_context)
             .field("dtype", &self.dtype)
             .field("kv_cache_dtype", &self.kv_cache_dtype)
             .field("num_threads", &self.num_threads)
@@ -86,16 +90,17 @@ impl std::fmt::Debug for WorkerConfig {
 
 impl Default for WorkerConfig {
     fn default() -> Self {
+        let backend_context = BackendRouter::resolve_context(
+            BackendPreference::Auto,
+            BackendSelectionSource::Default,
+        );
         Self {
             models_dir: dirs::data_local_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("izwi")
                 .join("models"),
-            backend: if cfg!(target_os = "macos") {
-                BackendKind::Metal
-            } else {
-                BackendKind::Cpu
-            },
+            backend: backend_context.backend_kind,
+            backend_context,
             dtype: "float32".to_string(),
             kv_cache_dtype: "float16".to_string(),
             num_threads: 4,
@@ -107,9 +112,12 @@ impl Default for WorkerConfig {
 
 impl From<&EngineCoreConfig> for WorkerConfig {
     fn from(config: &EngineCoreConfig) -> Self {
+        let backend_context =
+            BackendRouter::resolve_context_for_kind(config.backend, BackendSelectionSource::Config);
         Self {
             models_dir: config.models_dir.clone(),
-            backend: config.backend,
+            backend: backend_context.backend_kind,
+            backend_context,
             dtype: "float32".to_string(),
             kv_cache_dtype: config.kv_cache_dtype.clone(),
             num_threads: config.num_threads,
@@ -331,11 +339,7 @@ impl ModelExecutor for NativeExecutor {
     fn initialize(&mut self) -> Result<()> {
         info!("Initializing native executor");
         if self.config.model_registry.is_none() {
-            let device = match self.config.backend {
-                BackendKind::Metal => DeviceSelector::detect_with_preference(Some("metal"))?,
-                BackendKind::Cuda => DeviceSelector::detect_with_preference(Some("cuda"))?,
-                BackendKind::Cpu => DeviceSelector::detect_with_preference(Some("cpu"))?,
-            };
+            let device = self.config.backend_context.device.clone();
             let model = Qwen3TtsModel::load(
                 &self.config.models_dir,
                 device,
@@ -491,13 +495,19 @@ mod tests {
     #[test]
     fn test_worker_config_default() {
         let config = WorkerConfig::default();
+        assert_eq!(config.backend, config.backend_context.backend_kind);
+    }
+
+    #[test]
+    fn test_worker_config_from_engine_config_uses_backend_context() {
+        let mut engine = EngineCoreConfig::default();
+        engine.backend = BackendKind::Cpu;
+
+        let config = WorkerConfig::from(&engine);
+        assert_eq!(config.backend, config.backend_context.backend_kind);
         assert_eq!(
-            config.backend,
-            if cfg!(target_os = "macos") {
-                BackendKind::Metal
-            } else {
-                BackendKind::Cpu
-            }
+            config.backend_context.source,
+            BackendSelectionSource::Config
         );
     }
 

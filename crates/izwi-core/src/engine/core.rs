@@ -18,10 +18,9 @@ use super::output::OutputProcessor;
 use super::request::{EngineCoreRequest, RequestStatus};
 use super::scheduler::{Scheduler, SchedulerConfig};
 use super::types::{AudioOutput, EngineOutput, LatencyBreakdown, RequestId};
-use crate::backends::{kv_dtype_bytes, BackendKind};
+use crate::backends::{kv_dtype_bytes, BackendKind, BackendRouter, BackendSelectionSource};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
-use crate::models::DeviceSelector;
 
 enum KvCacheBackend {
     Standard(KVCacheManager),
@@ -30,7 +29,9 @@ enum KvCacheBackend {
 
 impl KvCacheBackend {
     fn new(config: &EngineCoreConfig) -> Result<Self> {
-        let is_metal = config.backend == BackendKind::Metal;
+        let backend_context =
+            BackendRouter::resolve_context_for_kind(config.backend, BackendSelectionSource::Config);
+        let is_metal = backend_context.backend_kind == BackendKind::Metal;
         // Keep Metal KV manager on its tuned F32 layout unless explicit int8 KV is requested.
         let dtype_bytes = kv_dtype_bytes(&config.kv_cache_dtype, is_metal);
         let kv_config = KVCacheConfig {
@@ -43,13 +44,12 @@ impl KvCacheBackend {
         };
 
         if is_metal && kv_config.dtype_bytes == 4 {
-            if let Ok(profile) = DeviceSelector::detect_with_preference(Some("metal")) {
-                if profile.kind.is_metal() {
-                    let mut metal_config = MetalKVCacheConfig::default();
-                    metal_config.base_config = kv_config.clone();
-                    let manager = MetalKVCacheManager::new(metal_config, profile)?;
-                    return Ok(Self::Metal(manager));
-                }
+            let profile = backend_context.device.clone();
+            if profile.kind.is_metal() {
+                let mut metal_config = MetalKVCacheConfig::default();
+                metal_config.base_config = kv_config.clone();
+                let manager = MetalKVCacheManager::new(metal_config, profile)?;
+                return Ok(Self::Metal(manager));
             }
         }
 

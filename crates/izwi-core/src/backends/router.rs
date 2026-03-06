@@ -85,6 +85,13 @@ impl BackendRouter {
         BackendContext::new(preference, source, capabilities, device, reason)
     }
 
+    pub fn resolve_context_for_kind(
+        kind: super::types::BackendKind,
+        source: BackendSelectionSource,
+    ) -> BackendContext {
+        Self::resolve_context(BackendPreference::from(kind), source)
+    }
+
     pub fn resolve_context_from_env_or(
         preference: BackendPreference,
         source: BackendSelectionSource,
