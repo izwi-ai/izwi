@@ -735,46 +735,42 @@ impl Lfm2AudioModel {
     }
 
     pub fn decode_audio_frame(&self, frame: &[u32]) -> Result<Vec<f32>> {
-        if frame.is_empty() || is_end_of_audio_frame(frame) {
+        let mut codebooks = Vec::new();
+        append_audio_frame_to_codebooks(&mut codebooks, frame, self.cfg.codebooks)?;
+        self.decode_audio_codebooks(&codebooks)
+    }
+
+    pub fn append_audio_frame_to_codebooks(
+        &self,
+        codebooks: &mut Vec<Vec<u32>>,
+        frame: &[u32],
+    ) -> Result<()> {
+        append_audio_frame_to_codebooks(codebooks, frame, self.cfg.codebooks)
+    }
+
+    pub fn decode_audio_codebooks(&self, codebooks: &[Vec<u32>]) -> Result<Vec<f32>> {
+        if codebooks.is_empty() || codebooks[0].is_empty() {
             return Ok(Vec::new());
         }
-
-        let mut codebooks: Vec<Vec<u32>> = vec![Vec::new(); self.cfg.codebooks];
-        for (i, &tok) in frame.iter().enumerate() {
-            if i >= codebooks.len() {
-                break;
-            }
-            codebooks[i].push(tok);
+        if codebooks.len() != self.cfg.codebooks {
+            return Err(Error::InferenceError(format!(
+                "Expected {} codebooks for LFM2 audio decode, got {}",
+                self.cfg.codebooks,
+                codebooks.len()
+            )));
         }
-        self.wave_decoder.decode_tokens(&codebooks)
+
+        let mut owned_codebooks = codebooks.to_vec();
+        trim_audio_frames(&mut owned_codebooks);
+        self.wave_decoder.decode_tokens(&owned_codebooks)
     }
 
     pub fn decode_audio_frames(&self, frames: &[Vec<u32>]) -> Result<Vec<f32>> {
-        if frames.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut codebooks: Vec<Vec<u32>> = vec![Vec::new(); self.cfg.codebooks];
+        let mut codebooks = Vec::new();
         for frame in frames {
-            if frame.is_empty() || is_end_of_audio_frame(frame) {
-                break;
-            }
-
-            if frame.len() < self.cfg.codebooks {
-                return Err(Error::InferenceError(format!(
-                    "LFM2 audio frame length {} is smaller than expected codebooks {}",
-                    frame.len(),
-                    self.cfg.codebooks
-                )));
-            }
-
-            for (i, &tok) in frame.iter().take(self.cfg.codebooks).enumerate() {
-                codebooks[i].push(tok);
-            }
+            append_audio_frame_to_codebooks(&mut codebooks, frame, self.cfg.codebooks)?;
         }
-
-        trim_audio_frames(&mut codebooks);
-        self.wave_decoder.decode_tokens(&codebooks)
+        self.decode_audio_codebooks(&codebooks)
     }
 
     fn prepare_audio_mel(&self, audio: &[f32], sample_rate: u32) -> Result<(Vec<f32>, usize)> {
@@ -1222,6 +1218,38 @@ fn is_end_of_audio_frame(frame: &[u32]) -> bool {
     frame.first().copied() == Some(END_OF_AUDIO_TOKEN)
 }
 
+fn append_audio_frame_to_codebooks(
+    codebooks: &mut Vec<Vec<u32>>,
+    frame: &[u32],
+    expected_codebooks: usize,
+) -> Result<()> {
+    if frame.is_empty() || is_end_of_audio_frame(frame) {
+        return Ok(());
+    }
+    if frame.len() < expected_codebooks {
+        return Err(Error::InferenceError(format!(
+            "LFM2 audio frame length {} is smaller than expected codebooks {}",
+            frame.len(),
+            expected_codebooks
+        )));
+    }
+
+    if codebooks.is_empty() {
+        *codebooks = vec![Vec::new(); expected_codebooks];
+    } else if codebooks.len() != expected_codebooks {
+        return Err(Error::InferenceError(format!(
+            "Expected {} accumulated codebooks for LFM2 audio decode, got {}",
+            expected_codebooks,
+            codebooks.len()
+        )));
+    }
+
+    for (idx, &token) in frame.iter().take(expected_codebooks).enumerate() {
+        codebooks[idx].push(token);
+    }
+    Ok(())
+}
+
 fn trim_audio_frames(codebooks: &mut [Vec<u32>]) {
     if codebooks.is_empty() || codebooks[0].is_empty() {
         return;
@@ -1420,6 +1448,24 @@ mod tests {
         assert_eq!(codebooks[0], vec![10, 11]);
         assert_eq!(codebooks[1], vec![20, 21]);
         assert_eq!(codebooks[2], vec![30, END_OF_AUDIO_TOKEN]);
+    }
+
+    #[test]
+    fn append_audio_frame_to_codebooks_accumulates_per_codebook_tokens() {
+        let mut codebooks = Vec::new();
+        append_audio_frame_to_codebooks(&mut codebooks, &[10, 20, 30], 3).unwrap();
+        append_audio_frame_to_codebooks(&mut codebooks, &[11, 21, 31], 3).unwrap();
+
+        assert_eq!(codebooks, vec![vec![10, 11], vec![20, 21], vec![30, 31]]);
+    }
+
+    #[test]
+    fn append_audio_frame_to_codebooks_ignores_end_marker_frames() {
+        let mut codebooks = Vec::new();
+        append_audio_frame_to_codebooks(&mut codebooks, &[10, 20, 30], 3).unwrap();
+        append_audio_frame_to_codebooks(&mut codebooks, &[END_OF_AUDIO_TOKEN, 0, 0], 3).unwrap();
+
+        assert_eq!(codebooks, vec![vec![10], vec![20], vec![30]]);
     }
 
     #[test]
