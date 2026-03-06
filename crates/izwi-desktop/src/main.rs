@@ -1,37 +1,12 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
-use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::Manager;
 use url::Url;
 
-#[derive(Debug, Parser)]
-#[command(
-    name = "izwi-desktop",
-    about = "Tauri desktop shell for Izwi local inference",
-    version
-)]
-struct DesktopArgs {
-    /// Base URL of the Izwi local server
-    #[arg(long, default_value = "http://localhost:8080")]
-    server_url: String,
+mod app;
 
-    /// Desktop window title
-    #[arg(long, default_value = "Izwi")]
-    window_title: String,
-
-    /// Initial window width
-    #[arg(long, default_value = "1360")]
-    width: f64,
-
-    /// Initial window height
-    #[arg(long, default_value = "900")]
-    height: f64,
-}
+use app::server::{is_local_server_host, platform_binary_name};
 
 #[tauri::command]
 async fn download_audio_file(
@@ -51,80 +26,7 @@ async fn download_audio_file(
 }
 
 fn main() -> Result<()> {
-    let args = DesktopArgs::parse();
-    let server_url = Url::parse(&args.server_url)
-        .with_context(|| format!("invalid --server-url value: {}", args.server_url))?;
-    let (server_host, server_port) = server_host_port(&server_url)?;
-    let server_origin = format!("{}://{}:{}", server_url.scheme(), server_host, server_port);
-    let window_title = args.window_title.clone();
-    let width = args.width;
-    let height = args.height;
-    let managed_server = Arc::new(Mutex::new(None::<Child>));
-    let setup_server_handle = Arc::clone(&managed_server);
-
-    let app = tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![download_audio_file])
-        .setup(move |app| {
-            if let Some(server_child) = maybe_start_local_server(app.handle(), &server_url)? {
-                let mut child_slot = setup_server_handle
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("failed to acquire server startup lock"))?;
-                *child_slot = Some(server_child);
-            }
-
-            if let Err(err) = ensure_cli_setup(app.handle()) {
-                eprintln!("warning: could not configure terminal commands automatically: {err}");
-            }
-
-            let init_script = format!(
-                "window.__IZWI_SERVER_URL__ = {};",
-                js_string_literal(&server_origin)
-            );
-            let mut window_builder =
-                WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-                    .initialization_script(init_script)
-                    .title(window_title.as_str())
-                    .inner_size(width, height)
-                    .min_inner_size(960.0, 680.0)
-                    .resizable(true);
-
-            if let Some(icon) = app.default_window_icon() {
-                window_builder = window_builder.icon(icon.clone())?;
-            }
-
-            window_builder.build()?;
-            Ok(())
-        })
-        .build(tauri::generate_context!())
-        .map_err(|e| anyhow::anyhow!("failed to build desktop app: {}", e))?;
-
-    let exit_code = app.run_return(|app_handle, event| {
-        if let RunEvent::WindowEvent { label, event, .. } = event {
-            if label == "main" {
-                if let WindowEvent::CloseRequested { api, .. } = event {
-                    // Standard desktop behavior for this app: closing the primary
-                    // window exits the process so managed server teardown always runs.
-                    api.prevent_close();
-                    app_handle.exit(0);
-                }
-            }
-        }
-    });
-
-    if let Ok(mut child_slot) = managed_server.lock() {
-        if let Some(mut child) = child_slot.take() {
-            shutdown_child(&mut child);
-        }
-    }
-
-    if exit_code != 0 {
-        return Err(anyhow::anyhow!(
-            "desktop app exited with code {}",
-            exit_code
-        ));
-    }
-
-    Ok(())
+    app::run(app::DesktopArgs::parse())
 }
 
 fn save_audio_from_url(url: &str, suggested_filename: Option<&str>) -> Result<PathBuf> {
@@ -214,168 +116,6 @@ fn unique_download_path(downloads_dir: &Path, filename: &str) -> PathBuf {
     }
 
     downloads_dir.join(format!("{stem}-{}.wav", std::process::id()))
-}
-
-fn js_string_literal(value: &str) -> String {
-    let escaped = value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r");
-    format!("\"{}\"", escaped)
-}
-
-fn server_host_port(server_url: &Url) -> Result<(String, u16)> {
-    let host = server_url
-        .host_str()
-        .context("--server-url must include a host")?
-        .to_string();
-    let port = server_url
-        .port_or_known_default()
-        .context("--server-url must include a port or use a known scheme")?;
-    Ok((host, port))
-}
-
-fn maybe_start_local_server<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    server_url: &Url,
-) -> Result<Option<Child>> {
-    const START_TIMEOUT: Duration = Duration::from_secs(15);
-    const POLL_INTERVAL: Duration = Duration::from_millis(200);
-    const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
-
-    let (host, port) = server_host_port(server_url)?;
-    if !is_local_server_host(&host) {
-        return Ok(None);
-    }
-
-    if is_server_reachable(&host, port, CONNECT_TIMEOUT) {
-        return Ok(None);
-    }
-
-    let mut cmd = match resolve_server_binary(app) {
-        Some(path) => Command::new(path),
-        None => Command::new(platform_binary_name("izwi-server")),
-    };
-
-    let bind_host = if host == "localhost" {
-        "127.0.0.1"
-    } else {
-        host.as_str()
-    };
-
-    cmd.env("IZWI_HOST", bind_host)
-        .env("IZWI_PORT", port.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null());
-
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("failed to start izwi-server for {}:{}", host, port))?;
-
-    let started = Instant::now();
-    while started.elapsed() < START_TIMEOUT {
-        if is_server_reachable(&host, port, CONNECT_TIMEOUT) {
-            return Ok(Some(child));
-        }
-
-        if let Some(status) = child
-            .try_wait()
-            .context("failed while checking izwi-server status")?
-        {
-            anyhow::bail!(
-                "izwi-server exited before becoming ready on {}:{} (status: {})",
-                host,
-                port,
-                status
-            );
-        }
-
-        thread::sleep(POLL_INTERVAL);
-    }
-
-    shutdown_child(&mut child);
-    anyhow::bail!("timed out waiting for izwi-server on {}:{}", host, port)
-}
-
-fn is_local_server_host(host: &str) -> bool {
-    matches!(host, "localhost" | "127.0.0.1" | "::1" | "0.0.0.0" | "::")
-}
-
-fn is_server_reachable(host: &str, port: u16, timeout: Duration) -> bool {
-    let addrs = match (host, port).to_socket_addrs() {
-        Ok(addrs) => addrs.collect::<Vec<_>>(),
-        Err(_) => return false,
-    };
-
-    addrs
-        .iter()
-        .any(|addr| TcpStream::connect_timeout(addr, timeout).is_ok())
-}
-
-fn resolve_server_binary<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Option<PathBuf> {
-    let binary_name = platform_binary_name("izwi-server");
-    let mut candidates = Vec::new();
-
-    if let Ok(resource_dir) = app.path().resource_dir() {
-        candidates.push(resource_dir.join("bin").join(&binary_name));
-        candidates.push(resource_dir.join(&binary_name));
-    }
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            candidates.push(parent.join(&binary_name));
-        }
-    }
-
-    candidates.into_iter().find(|candidate| candidate.exists())
-}
-
-fn platform_binary_name(name: &str) -> String {
-    if cfg!(windows) {
-        format!("{}.exe", name)
-    } else {
-        name.to_string()
-    }
-}
-
-fn shutdown_child(child: &mut Child) {
-    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
-    const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
-
-    if child.try_wait().ok().flatten().is_some() {
-        return;
-    }
-
-    request_graceful_termination(child);
-
-    let start = Instant::now();
-    while start.elapsed() < SHUTDOWN_TIMEOUT {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) => thread::sleep(SHUTDOWN_POLL),
-            Err(_) => break,
-        }
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn request_graceful_termination(child: &Child) {
-    #[cfg(unix)]
-    {
-        let _ = Command::new("kill")
-            .arg("-TERM")
-            .arg(child.id().to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-
-    #[cfg(not(unix))]
-    let _ = child;
 }
 
 fn ensure_cli_setup<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<()> {
@@ -556,7 +296,7 @@ fn add_windows_user_path(path: &std::path::Path) -> Result<()> {
         escaped
     );
 
-    let status = Command::new("powershell")
+    let status = std::process::Command::new("powershell")
         .arg("-NoProfile")
         .arg("-NonInteractive")
         .arg("-Command")
