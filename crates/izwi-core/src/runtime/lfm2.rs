@@ -113,6 +113,42 @@ impl RuntimeService {
         request
     }
 
+    fn build_lfm2_s2s_request_bytes(
+        audio_bytes: &[u8],
+        variant: ModelVariant,
+        language: Option<&str>,
+        system_prompt: Option<&str>,
+        temperature: Option<f32>,
+        top_k: Option<usize>,
+        correlation_id: Option<&str>,
+    ) -> EngineCoreRequest {
+        let resolved_temperature = temperature.unwrap_or(Self::LFM2_S2S_DEFAULT_AUDIO_TEMPERATURE);
+        let resolved_top_k = top_k
+            .filter(|&v| v > 0)
+            .unwrap_or(Self::LFM2_S2S_DEFAULT_AUDIO_TOP_K);
+
+        let mut request = EngineCoreRequest::speech_to_speech_bytes(audio_bytes.to_vec());
+        request.model_variant = Some(variant);
+        request.correlation_id = correlation_id.map(|s| s.to_string());
+        request.language = language.map(|s| s.to_string());
+        request.system_prompt = system_prompt.map(|s| s.to_string());
+        request.params = CoreGenParams {
+            temperature: resolved_temperature,
+            top_p: 1.0,
+            top_k: resolved_top_k,
+            repetition_penalty: 1.0,
+            max_tokens: 1024,
+            speaker: None,
+            voice: None,
+            audio_temperature: Some(resolved_temperature),
+            audio_top_k: Some(resolved_top_k),
+            speed: 1.0,
+            stop_sequences: Vec::new(),
+            stop_token_ids: Vec::new(),
+        };
+        request
+    }
+
     pub async fn lfm2_asr_transcribe_streaming<F>(
         &self,
         variant: ModelVariant,
@@ -282,6 +318,63 @@ impl RuntimeService {
         })
     }
 
+    pub async fn lfm2_speech_to_speech_streaming_bytes_with_correlation<F, G>(
+        &self,
+        audio_bytes: &[u8],
+        language: Option<&str>,
+        system_prompt: Option<&str>,
+        temperature: Option<f32>,
+        top_k: Option<usize>,
+        correlation_id: Option<&str>,
+        mut on_delta: F,
+        mut on_audio_chunk: G,
+    ) -> Result<SpeechToSpeechGeneration>
+    where
+        F: FnMut(String) + Send + 'static,
+        G: FnMut(AudioChunk) + Send + 'static,
+    {
+        let variant = self.resolve_active_lfm2_variant().await;
+        self.load_model(variant).await?;
+        let request = Self::build_lfm2_s2s_request_bytes(
+            audio_bytes,
+            variant,
+            language,
+            system_prompt,
+            temperature,
+            top_k,
+            correlation_id,
+        );
+
+        let mut streamed_text = String::new();
+        let output = self
+            .run_streaming_request(request, |chunk| {
+                if !chunk.samples.is_empty() || chunk.is_final {
+                    let mut audio_chunk =
+                        AudioChunk::new(chunk.request_id.clone(), chunk.sequence, chunk.samples);
+                    audio_chunk.is_final = chunk.is_final;
+                    on_audio_chunk(audio_chunk);
+                }
+
+                if let Some(delta) = chunk.text {
+                    if !delta.is_empty() {
+                        streamed_text.push_str(&delta);
+                        on_delta(delta);
+                    }
+                }
+                std::future::ready(Ok(()))
+            })
+            .await?;
+        let text = output.text.unwrap_or(streamed_text);
+
+        Ok(SpeechToSpeechGeneration {
+            text,
+            samples: output.audio.samples,
+            sample_rate: output.audio.sample_rate,
+            input_transcription: None,
+            generation_time_ms: output.generation_time.as_secs_f64() * 1000.0,
+        })
+    }
+
     pub async fn lfm2_speech_to_speech(
         &self,
         audio_base64: &str,
@@ -312,6 +405,28 @@ impl RuntimeService {
     ) -> Result<SpeechToSpeechGeneration> {
         self.lfm2_speech_to_speech_streaming_with_correlation(
             audio_base64,
+            language,
+            system_prompt,
+            temperature,
+            top_k,
+            correlation_id,
+            |_delta| {},
+            |_chunk| {},
+        )
+        .await
+    }
+
+    pub async fn lfm2_speech_to_speech_bytes_with_correlation(
+        &self,
+        audio_bytes: &[u8],
+        language: Option<&str>,
+        system_prompt: Option<&str>,
+        temperature: Option<f32>,
+        top_k: Option<usize>,
+        correlation_id: Option<&str>,
+    ) -> Result<SpeechToSpeechGeneration> {
+        self.lfm2_speech_to_speech_streaming_bytes_with_correlation(
+            audio_bytes,
             language,
             system_prompt,
             temperature,

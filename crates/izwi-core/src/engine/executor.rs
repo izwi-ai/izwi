@@ -642,4 +642,40 @@ mod tests {
         );
         assert!(samples[1].abs() < 0.02, "second sample was {}", samples[1]);
     }
+
+    #[test]
+    fn decode_request_audio_with_rate_accepts_raw_audio_bytes() {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+
+        let mut wav_bytes = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut wav_bytes);
+            let mut writer = hound::WavWriter::new(cursor, spec).expect("writer");
+            writer.write_sample((0.25f32 * 32767.0) as i16).unwrap();
+            writer.write_sample((-0.25f32 * 32767.0) as i16).unwrap();
+            writer.finalize().unwrap();
+        }
+
+        let request = EngineCoreRequest::asr_bytes(wav_bytes);
+        let (samples, sample_rate) =
+            audio::decode_request_audio_with_rate(&request).expect("decode should succeed");
+
+        assert_eq!(sample_rate, 16_000);
+        assert_eq!(samples.len(), 2);
+        assert!(
+            (samples[0] - 0.25).abs() < 0.02,
+            "first sample was {}",
+            samples[0]
+        );
+        assert!(
+            (samples[1] + 0.25).abs() < 0.02,
+            "second sample was {}",
+            samples[1]
+        );
+    }
 }

@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket};
-use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use izwi_agent::{
     planner::{PlanningMode, SimplePlanner},
@@ -908,9 +907,6 @@ fn spawn_turn_task(
                     "utterance_seq": commit.utterance_seq,
                 }),
             );
-
-            let audio_base64 = base64::engine::general_purpose::STANDARD.encode(audio_bytes);
-
             match &commit.turn_config {
                 VoiceTurnConfig::Modular(config) => {
                     send_json(
@@ -930,8 +926,8 @@ fn spawn_turn_task(
                         let asr_language = config.asr_language.clone();
                         state
                             .runtime
-                            .asr_transcribe_streaming_with_correlation(
-                                &audio_base64,
+                            .asr_transcribe_streaming_bytes_with_correlation(
+                                audio_bytes.as_slice(),
                                 Some(&asr_model_id),
                                 asr_language.as_deref(),
                                 Some(&correlation_id),
@@ -1068,8 +1064,8 @@ fn spawn_turn_task(
                         let language = config.language.clone();
                         state
                             .runtime
-                            .asr_transcribe_streaming_with_correlation(
-                                &audio_base64,
+                            .asr_transcribe_streaming_bytes_with_correlation(
+                                audio_bytes.as_slice(),
                                 Some(&model_id),
                                 language.as_deref(),
                                 Some(&correlation_id),
@@ -1153,8 +1149,8 @@ fn spawn_turn_task(
                     let utt_seq = commit.utterance_seq;
                     let stream_result = state
                         .runtime
-                        .lfm2_speech_to_speech_streaming_with_correlation(
-                            &audio_base64,
+                        .lfm2_speech_to_speech_streaming_bytes_with_correlation(
+                            audio_bytes.as_slice(),
                             config.language.as_deref(),
                             config.system_prompt.as_deref(),
                             None,

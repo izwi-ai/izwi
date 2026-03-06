@@ -159,12 +159,11 @@ pub async fn create_record(
 
     let _permit = state.acquire_permit().await;
     let started = Instant::now();
-    let audio_base64 = base64::engine::general_purpose::STANDARD.encode(&parsed.audio_bytes);
 
     let output = state
         .runtime
-        .diarize_with_transcript(
-            audio_base64.as_str(),
+        .diarize_with_transcript_bytes(
+            parsed.audio_bytes.as_slice(),
             parsed.model_id.as_deref(),
             parsed.asr_model_id.as_deref(),
             parsed.aligner_model_id.as_deref(),

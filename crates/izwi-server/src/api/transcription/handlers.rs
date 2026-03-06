@@ -160,12 +160,11 @@ pub async fn create_record(
 
     let _permit = state.acquire_permit().await;
     let started = Instant::now();
-    let audio_base64 = base64::engine::general_purpose::STANDARD.encode(&parsed.audio_bytes);
 
     let output = state
         .runtime
-        .asr_transcribe_streaming_with_correlation(
-            &audio_base64,
+        .asr_transcribe_streaming_bytes_with_correlation(
+            parsed.audio_bytes.as_slice(),
             parsed.model_id.as_deref(),
             parsed.language.as_deref(),
             Some(&ctx.correlation_id),
@@ -242,14 +241,13 @@ async fn create_record_stream(
         let _ = event_tx
             .send(serde_json::to_string(&StreamStartEvent { event: "start" }).unwrap_or_default());
 
-        let audio_base64 = base64::engine::general_purpose::STANDARD.encode(&audio_bytes);
         let delta_tx = event_tx.clone();
         let started = Instant::now();
 
         let generation_result = tokio::time::timeout(timeout, async {
             runtime
-                .asr_transcribe_streaming_with_correlation(
-                    &audio_base64,
+                .asr_transcribe_streaming_bytes_with_correlation(
+                    audio_bytes.as_slice(),
                     model_id.as_deref(),
                     requested_language.as_deref(),
                     Some(correlation_id.as_str()),
