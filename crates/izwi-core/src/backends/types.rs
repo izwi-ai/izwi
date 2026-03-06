@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+use super::capabilities::BackendCapabilities;
+use super::device::DeviceProfile;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
@@ -48,6 +51,25 @@ impl BackendPreference {
             Self::Cuda => "cuda",
         }
     }
+
+    pub fn requested_kind(self) -> Option<BackendKind> {
+        match self {
+            Self::Auto => None,
+            Self::Cpu => Some(BackendKind::Cpu),
+            Self::Metal => Some(BackendKind::Metal),
+            Self::Cuda => Some(BackendKind::Cuda),
+        }
+    }
+}
+
+impl From<BackendKind> for BackendPreference {
+    fn from(value: BackendKind) -> Self {
+        match value {
+            BackendKind::Cpu => Self::Cpu,
+            BackendKind::Metal => Self::Metal,
+            BackendKind::Cuda => Self::Cuda,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +78,17 @@ pub enum BackendSelectionSource {
     Config,
     Env,
     Cli,
+}
+
+impl BackendSelectionSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Config => "config",
+            Self::Env => "environment",
+            Self::Cli => "cli",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +113,47 @@ impl ExecutionBackend {
             BackendKind::Metal => Self::CandleMetal,
             BackendKind::Cuda => Self::CandleCuda,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BackendContext {
+    pub preference: BackendPreference,
+    pub source: BackendSelectionSource,
+    pub capabilities: BackendCapabilities,
+    pub device: DeviceProfile,
+    pub backend_kind: BackendKind,
+    pub execution_backend: ExecutionBackend,
+    pub reason: String,
+}
+
+impl BackendContext {
+    pub fn new(
+        preference: BackendPreference,
+        source: BackendSelectionSource,
+        capabilities: BackendCapabilities,
+        device: DeviceProfile,
+        reason: impl Into<String>,
+    ) -> Self {
+        let backend_kind = BackendKind::from(device.kind);
+        let execution_backend = ExecutionBackend::from_kind(backend_kind);
+
+        Self {
+            preference,
+            source,
+            capabilities,
+            device,
+            backend_kind,
+            execution_backend,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn matches_preference(&self) -> bool {
+        self.preference
+            .requested_kind()
+            .map(|requested| requested == self.backend_kind)
+            .unwrap_or(true)
     }
 }
 
@@ -130,5 +204,21 @@ mod tests {
         ] {
             assert_eq!(ExecutionBackend::from_kind(backend.kind()), backend);
         }
+    }
+
+    #[test]
+    fn backend_kind_maps_to_preference() {
+        assert_eq!(
+            BackendPreference::from(BackendKind::Cpu),
+            BackendPreference::Cpu
+        );
+        assert_eq!(
+            BackendPreference::from(BackendKind::Metal),
+            BackendPreference::Metal
+        );
+        assert_eq!(
+            BackendPreference::from(BackendKind::Cuda),
+            BackendPreference::Cuda
+        );
     }
 }

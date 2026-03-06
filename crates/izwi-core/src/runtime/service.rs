@@ -16,8 +16,7 @@ use tracing::{debug, error, info_span};
 use crate::artifacts::{DownloadProgress, ModelManager};
 use crate::audio::{AudioCodec, AudioEncoder, StreamingConfig};
 use crate::backends::{
-    BackendKind, BackendPreference, BackendRouter, DeviceKind, DeviceProfile, DeviceSelector,
-    ExecutionBackend,
+    BackendPreference, BackendRouter, BackendSelectionSource, DeviceKind, DeviceProfile,
 };
 use crate::catalog::{ModelInfo, ModelVariant};
 use crate::config::EngineConfig;
@@ -350,31 +349,16 @@ impl RuntimeService {
         configure_runtime_threading(config.num_threads.max(1));
         let model_manager = Arc::new(ModelManager::new(config.clone())?);
 
-        let device = match config.backend {
-            BackendPreference::Auto => DeviceSelector::detect()?,
-            BackendPreference::Cpu => DeviceSelector::detect_with_preference(Some("cpu"))?,
-            BackendPreference::Metal => DeviceSelector::detect_with_preference(Some("metal"))?,
-            BackendPreference::Cuda => DeviceSelector::detect_with_preference(Some("cuda"))?,
-        };
+        let backend_context =
+            BackendRouter::resolve_context(config.backend, BackendSelectionSource::Config);
+        let device = backend_context.device.clone();
         Self::ensure_requested_backend_available(config.backend, device.kind)?;
-        let selected_backend_kind = if device.kind.is_metal() {
-            BackendKind::Metal
-        } else if device.kind.is_cuda() {
-            BackendKind::Cuda
-        } else {
-            BackendKind::Cpu
-        };
+        let selected_backend_kind = backend_context.backend_kind;
 
         let model_registry = Arc::new(ModelRegistry::new(
             config.models_dir.clone(),
             device.clone(),
         ));
-
-        let default_backend = match selected_backend_kind {
-            BackendKind::Metal => ExecutionBackend::CandleMetal,
-            BackendKind::Cuda => ExecutionBackend::CandleCuda,
-            BackendKind::Cpu => ExecutionBackend::CandleNative,
-        };
 
         let mut core_config = EngineCoreConfig::for_qwen3_tts();
         core_config.models_dir = config.models_dir.clone();
@@ -395,7 +379,7 @@ impl RuntimeService {
 
         Ok(Self {
             config,
-            backend_router: BackendRouter::with_default(default_backend),
+            backend_router: BackendRouter::from_context(backend_context),
             model_manager,
             model_registry,
             tokenizer: RwLock::new(None),

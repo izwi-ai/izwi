@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use super::scheduler::SchedulingPolicy;
-use crate::backends::{BackendKind, BackendPreference, DeviceSelector};
+use crate::backends::{BackendKind, BackendPreference, BackendRouter, BackendSelectionSource};
 
 /// Configuration for the engine core.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,33 +168,12 @@ fn default_streaming_chunk_size() -> usize {
     4800
 } // 200ms at 24kHz
 
-fn detect_auto_backend_kind() -> BackendKind {
-    if let Ok(profile) = DeviceSelector::detect() {
-        if profile.kind.is_metal() {
-            return BackendKind::Metal;
-        }
-        if profile.kind.is_cuda() {
-            return BackendKind::Cuda;
-        }
-        return BackendKind::Cpu;
-    }
-
-    BackendKind::Cpu
-}
-
 fn default_backend_kind() -> BackendKind {
-    if let Ok(raw) = std::env::var("IZWI_BACKEND") {
-        if let Some(preference) = BackendPreference::parse(&raw) {
-            return match preference {
-                BackendPreference::Auto => detect_auto_backend_kind(),
-                BackendPreference::Cpu => BackendKind::Cpu,
-                BackendPreference::Metal => BackendKind::Metal,
-                BackendPreference::Cuda => BackendKind::Cuda,
-            };
-        }
-    }
-
-    detect_auto_backend_kind()
+    BackendRouter::resolve_context_from_env_or(
+        BackendPreference::Auto,
+        BackendSelectionSource::Default,
+    )
+    .backend_kind
 }
 fn default_num_threads() -> usize {
     std::thread::available_parallelism()

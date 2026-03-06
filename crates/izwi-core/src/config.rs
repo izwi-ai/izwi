@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::backends::BackendPreference;
+use crate::backends::{BackendPreference, BackendRouter};
 
 /// Main engine configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,20 +95,7 @@ fn default_kv_page_size() -> usize {
 }
 
 fn default_backend_preference() -> BackendPreference {
-    if let Ok(raw) = std::env::var("IZWI_BACKEND") {
-        if let Some(parsed) = BackendPreference::parse(&raw) {
-            return parsed;
-        }
-    }
-
-    if let Ok(raw) = std::env::var("IZWI_USE_METAL") {
-        let value = raw.trim().to_ascii_lowercase();
-        if matches!(value.as_str(), "1" | "true" | "yes" | "on") {
-            return BackendPreference::Metal;
-        }
-    }
-
-    BackendPreference::Auto
+    BackendRouter::env_preference().unwrap_or(BackendPreference::Auto)
 }
 
 fn default_num_threads() -> usize {

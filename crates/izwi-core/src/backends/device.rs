@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use super::types::BackendKind;
+use super::types::{BackendKind, BackendPreference};
 use crate::error::Result;
 use crate::models::shared::memory::metal::{metal_pool_for_device, MetalMemoryPool};
 
@@ -83,6 +83,15 @@ pub struct DeviceProfile {
 }
 
 impl DeviceProfile {
+    pub fn cpu() -> Self {
+        Self {
+            device: Device::Cpu,
+            kind: DeviceKind::Cpu,
+            capabilities: DeviceCapabilities::default(),
+            memory_pool: None,
+        }
+    }
+
     /// Select optimal dtype based on device kind and requested preference
     ///
     /// # Optimization Notes:
@@ -281,17 +290,21 @@ impl DeviceSelector {
         }
 
         info!("Falling back to CPU for inference");
-        Ok(DeviceProfile {
-            device: Device::Cpu,
-            kind: DeviceKind::Cpu,
-            capabilities: DeviceCapabilities::default(),
-            memory_pool: None,
-        })
+        Ok(DeviceProfile::cpu())
     }
 
-    pub fn detect_with_preference(preference: Option<&str>) -> Result<DeviceProfile> {
-        match preference.unwrap_or("") {
-            "cuda" => {
+    pub fn detect_for_preference(preference: BackendPreference) -> Result<DeviceProfile> {
+        match preference {
+            BackendPreference::Auto => Self::detect(),
+            BackendPreference::Cpu => Ok(DeviceProfile::cpu()),
+            BackendPreference::Metal => {
+                if let Some(profile) = Self::try_metal() {
+                    Ok(profile)
+                } else {
+                    Self::detect()
+                }
+            }
+            BackendPreference::Cuda => {
                 if cfg!(target_os = "macos") {
                     return Self::detect();
                 }
@@ -301,21 +314,14 @@ impl DeviceSelector {
                     Self::detect()
                 }
             }
-            "metal" | "mps" => {
-                if let Some(profile) = Self::try_metal() {
-                    Ok(profile)
-                } else {
-                    Self::detect()
-                }
-            }
-            "cpu" => Ok(DeviceProfile {
-                device: Device::Cpu,
-                kind: DeviceKind::Cpu,
-                capabilities: DeviceCapabilities::default(),
-                memory_pool: None,
-            }),
-            _ => Self::detect(),
         }
+    }
+
+    pub fn detect_with_preference(preference: Option<&str>) -> Result<DeviceProfile> {
+        preference
+            .and_then(BackendPreference::parse)
+            .map(Self::detect_for_preference)
+            .unwrap_or_else(Self::detect)
     }
 }
 
@@ -329,6 +335,13 @@ mod tests {
         assert_eq!(profile.kind, DeviceKind::Cpu);
         assert!(profile.device.is_cpu());
         assert!(!profile.has_unified_memory());
+    }
+
+    #[test]
+    fn test_detect_for_cpu_preference_returns_cpu() {
+        let profile = DeviceSelector::detect_for_preference(BackendPreference::Cpu).unwrap();
+        assert_eq!(profile.kind, DeviceKind::Cpu);
+        assert!(profile.device.is_cpu());
     }
 
     #[test]

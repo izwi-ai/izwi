@@ -1,7 +1,8 @@
 use crate::catalog::{InferenceBackendHint, ModelVariant};
 
-use super::device::DeviceSelector;
-use super::types::{BackendPreference, ExecutionBackend};
+use super::capabilities::BackendCapabilities;
+use super::device::{DeviceProfile, DeviceSelector};
+use super::types::{BackendContext, BackendPreference, BackendSelectionSource, ExecutionBackend};
 
 #[derive(Debug, Clone)]
 pub struct BackendPlan {
@@ -11,80 +12,126 @@ pub struct BackendPlan {
 
 #[derive(Debug, Clone)]
 pub struct BackendRouter {
-    default_backend: ExecutionBackend,
+    context: BackendContext,
 }
 
 impl Default for BackendRouter {
     fn default() -> Self {
-        Self {
-            default_backend: ExecutionBackend::CandleNative,
-        }
+        Self::from_context(Self::resolve_context(
+            BackendPreference::Auto,
+            BackendSelectionSource::Default,
+        ))
     }
 }
 
 impl BackendRouter {
-    pub fn with_default(default_backend: ExecutionBackend) -> Self {
-        Self { default_backend }
+    pub fn from_context(context: BackendContext) -> Self {
+        Self { context }
     }
 
-    pub fn from_env_with_default(default_backend: ExecutionBackend) -> Self {
-        let override_backend = std::env::var("IZWI_BACKEND")
+    pub fn with_default(default_backend: ExecutionBackend) -> Self {
+        Self::from_context(Self::resolve_context(
+            BackendPreference::from(default_backend.kind()),
+            BackendSelectionSource::Default,
+        ))
+    }
+
+    pub fn env_preference() -> Option<BackendPreference> {
+        std::env::var("IZWI_BACKEND")
             .ok()
             .as_deref()
             .and_then(BackendPreference::parse)
-            .and_then(|preference| match preference {
-                BackendPreference::Auto => None,
-                _ => Some(Self::backend_for_preference(preference)),
-            })
             .or_else(|| {
                 std::env::var("IZWI_USE_METAL").ok().and_then(|raw| {
                     let value = raw.trim().to_ascii_lowercase();
                     if matches!(value.as_str(), "1" | "true" | "yes" | "on") {
-                        Some(ExecutionBackend::CandleMetal)
+                        Some(BackendPreference::Metal)
                     } else {
                         None
                     }
                 })
-            });
+            })
+    }
 
-        Self::with_default(override_backend.unwrap_or(default_backend))
+    pub fn resolve_context(
+        preference: BackendPreference,
+        source: BackendSelectionSource,
+    ) -> BackendContext {
+        let capabilities = BackendCapabilities::detect();
+        let device = DeviceSelector::detect_for_preference(preference)
+            .unwrap_or_else(|_| DeviceProfile::cpu());
+        let actual_backend = ExecutionBackend::from_kind(device.kind.into());
+        let reason = match preference.requested_kind() {
+            None => format!(
+                "Selected {} backend via {} auto detection",
+                actual_backend.kind().as_str(),
+                source.as_str()
+            ),
+            Some(requested) if requested == actual_backend.kind() => format!(
+                "Selected {} backend from {} {} preference",
+                requested.as_str(),
+                source.as_str(),
+                preference.as_str()
+            ),
+            Some(requested) => format!(
+                "Requested {} backend from {} {} preference was unavailable; fell back to {}",
+                requested.as_str(),
+                source.as_str(),
+                preference.as_str(),
+                actual_backend.kind().as_str()
+            ),
+        };
+
+        BackendContext::new(preference, source, capabilities, device, reason)
+    }
+
+    pub fn resolve_context_from_env_or(
+        preference: BackendPreference,
+        source: BackendSelectionSource,
+    ) -> BackendContext {
+        Self::env_preference()
+            .map(|env_preference| {
+                Self::resolve_context(env_preference, BackendSelectionSource::Env)
+            })
+            .unwrap_or_else(|| Self::resolve_context(preference, source))
+    }
+
+    pub fn from_env_with_default(default_backend: ExecutionBackend) -> Self {
+        Self::from_context(Self::env_preference().map_or_else(
+            || {
+                Self::resolve_context(
+                    BackendPreference::from(default_backend.kind()),
+                    BackendSelectionSource::Default,
+                )
+            },
+            |preference| Self::resolve_context(preference, BackendSelectionSource::Env),
+        ))
     }
 
     pub fn from_env() -> Self {
-        Self::from_env_with_default(ExecutionBackend::CandleNative)
+        Self::from_context(Self::resolve_context_from_env_or(
+            BackendPreference::Auto,
+            BackendSelectionSource::Default,
+        ))
     }
 
     pub fn from_preference(preference: BackendPreference) -> Self {
-        Self::with_default(Self::backend_for_preference(preference))
+        Self::from_context(Self::resolve_context(
+            preference,
+            BackendSelectionSource::Config,
+        ))
     }
 
-    fn backend_for_preference(preference: BackendPreference) -> ExecutionBackend {
-        match preference {
-            BackendPreference::Auto => Self::detect_auto_backend(),
-            BackendPreference::Cpu => ExecutionBackend::CandleNative,
-            BackendPreference::Metal => ExecutionBackend::CandleMetal,
-            BackendPreference::Cuda => ExecutionBackend::CandleCuda,
-        }
-    }
-
-    fn detect_auto_backend() -> ExecutionBackend {
-        if let Ok(profile) = DeviceSelector::detect() {
-            if profile.kind.is_metal() {
-                return ExecutionBackend::CandleMetal;
-            }
-            if profile.kind.is_cuda() {
-                return ExecutionBackend::CandleCuda;
-            }
-        }
-        ExecutionBackend::CandleNative
+    pub fn context(&self) -> &BackendContext {
+        &self.context
     }
 
     pub fn default_backend(&self) -> ExecutionBackend {
-        self.default_backend
+        self.context.execution_backend
     }
 
     pub fn select(&self, variant: ModelVariant) -> BackendPlan {
-        let default_desc = match self.default_backend {
+        let default_desc = match self.context.execution_backend {
             ExecutionBackend::CandleMetal => "Metal backend",
             ExecutionBackend::CandleNative => "native CPU backend",
             ExecutionBackend::CandleCuda => "CUDA backend",
@@ -92,7 +139,7 @@ impl BackendRouter {
 
         match variant.backend_hint() {
             InferenceBackendHint::CandleNative => BackendPlan {
-                backend: self.default_backend,
+                backend: self.context.execution_backend,
                 reason: format!(
                     "{} targets the native Candle execution path ({})",
                     variant.dir_name(),
@@ -150,8 +197,23 @@ mod tests {
         std::env::remove_var("IZWI_USE_METAL");
 
         let router = BackendRouter::from_env_with_default(ExecutionBackend::CandleMetal);
-        assert_eq!(router.default_backend(), ExecutionBackend::CandleMetal);
+        assert!(matches!(
+            router.default_backend(),
+            ExecutionBackend::CandleNative
+                | ExecutionBackend::CandleMetal
+                | ExecutionBackend::CandleCuda
+        ));
+        assert_eq!(router.context().preference, BackendPreference::Auto);
+        assert_eq!(router.context().source, BackendSelectionSource::Env);
 
         std::env::remove_var("IZWI_BACKEND");
+    }
+
+    #[test]
+    fn context_tracks_requested_backend_match() {
+        let context =
+            BackendRouter::resolve_context(BackendPreference::Cpu, BackendSelectionSource::Config);
+        assert!(context.matches_preference());
+        assert_eq!(context.backend_kind, crate::backends::BackendKind::Cpu);
     }
 }
