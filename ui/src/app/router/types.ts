@@ -1,8 +1,4 @@
 import type { ModelInfo } from "@/api";
-import type {
-  ResolvedTheme,
-  ThemePreference,
-} from "@/app/bootstrap/theme";
 
 export interface DownloadProgressEntry {
   percent: number;
@@ -51,16 +47,4 @@ export interface ModelsRouteProps {
   onUnload: (variant: string) => void;
   onDelete: (variant: string) => void;
   onRefresh: () => Promise<void>;
-}
-
-export interface AppRoutesProps {
-  error: string | null;
-  onErrorDismiss: () => void;
-  readyModelsCount: number;
-  resolvedTheme: ResolvedTheme;
-  themePreference: ThemePreference;
-  onThemePreferenceChange: (preference: ThemePreference) => void;
-  pageProps: SharedPageProps;
-  voicePageProps: VoiceRouteProps;
-  modelsPageProps: ModelsRouteProps;
 }
