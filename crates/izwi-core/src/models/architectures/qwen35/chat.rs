@@ -6,7 +6,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
 use candle_core::quantized::{gguf_file, GgmlDType, QMatMul, QTensor};
@@ -2741,9 +2741,11 @@ impl Qwen35QuantizedModel {
 
 enum Qwen35VisionSupport {
     MissingProjector,
-    Ready {
+    Available {
         path: PathBuf,
-        runtime: Qwen35VisionRuntime,
+        projection_dim: usize,
+        dtype: DType,
+        runtime: Mutex<Option<Arc<Qwen35VisionRuntime>>>,
     },
 }
 
@@ -2952,19 +2954,7 @@ impl Qwen35ChatModel {
         };
 
         let text_model = Qwen35Model::load(config, vb)?;
-        let vision_support = if let Some(mmproj_path) = find_mmproj_gguf(model_dir)? {
-            let runtime = Qwen35VisionRuntime::load(&mmproj_path, &device, dtype, projection_dim)?;
-            info!(
-                "Loaded Qwen3.5 multimodal projector runtime from {}",
-                mmproj_path.display()
-            );
-            Qwen35VisionSupport::Ready {
-                path: mmproj_path,
-                runtime,
-            }
-        } else {
-            Qwen35VisionSupport::MissingProjector
-        };
+        let vision_support = discover_qwen35_vision_support(model_dir, projection_dim, dtype)?;
 
         info!(
             "Loaded Qwen3.5 chat model on {:?} with dtype {:?}",
@@ -3013,19 +3003,7 @@ impl Qwen35ChatModel {
             config,
             transform_cache_scope.as_deref(),
         )?;
-        let vision_support = if let Some(mmproj_path) = find_mmproj_gguf(model_dir)? {
-            let runtime = Qwen35VisionRuntime::load(&mmproj_path, &device, dtype, projection_dim)?;
-            info!(
-                "Loaded Qwen3.5 multimodal projector runtime from {}",
-                mmproj_path.display()
-            );
-            Qwen35VisionSupport::Ready {
-                path: mmproj_path,
-                runtime,
-            }
-        } else {
-            Qwen35VisionSupport::MissingProjector
-        };
+        let vision_support = discover_qwen35_vision_support(model_dir, projection_dim, dtype)?;
         info!(
             "Loaded Qwen3.5 quantized GGUF chat model on {:?} from {} with dtype {:?}",
             device.kind,
@@ -3305,19 +3283,7 @@ impl Qwen35ChatModel {
 
         let vb = VarBuilder::from_tensors(tensors, dtype, &device.device);
         let text_model = Qwen35Model::load(config, vb)?;
-        let vision_support = if let Some(mmproj_path) = find_mmproj_gguf(model_dir)? {
-            let runtime = Qwen35VisionRuntime::load(&mmproj_path, &device, dtype, projection_dim)?;
-            info!(
-                "Loaded Qwen3.5 multimodal projector runtime from {}",
-                mmproj_path.display()
-            );
-            Qwen35VisionSupport::Ready {
-                path: mmproj_path,
-                runtime,
-            }
-        } else {
-            Qwen35VisionSupport::MissingProjector
-        };
+        let vision_support = discover_qwen35_vision_support(model_dir, projection_dim, dtype)?;
 
         info!(
             "Loaded Qwen3.5 GGUF chat model on {:?} from {} with dtype {:?}",
@@ -3625,6 +3591,50 @@ impl Qwen35ChatModel {
         Ok(encoded)
     }
 
+    fn vision_runtime(&self) -> Result<Arc<Qwen35VisionRuntime>> {
+        let (path, projection_dim, dtype, runtime_slot) = match &self.vision_support {
+            Qwen35VisionSupport::Available {
+                path,
+                projection_dim,
+                dtype,
+                runtime,
+            } => (path, *projection_dim, *dtype, runtime),
+            Qwen35VisionSupport::MissingProjector => {
+                return Err(Error::InvalidInput(
+                    "Qwen3.5 multimodal input requested, but projector weights are missing."
+                        .to_string(),
+                ))
+            }
+        };
+
+        if let Ok(guard) = runtime_slot.lock() {
+            if let Some(runtime) = guard.as_ref() {
+                return Ok(Arc::clone(runtime));
+            }
+        }
+
+        let loaded = Arc::new(Qwen35VisionRuntime::load(
+            path,
+            &self.device,
+            dtype,
+            projection_dim,
+        )?);
+
+        let mut guard = runtime_slot.lock().map_err(|_| {
+            Error::InferenceError("Qwen3.5 vision runtime mutex poisoned".to_string())
+        })?;
+        if let Some(runtime) = guard.as_ref() {
+            return Ok(Arc::clone(runtime));
+        }
+
+        info!(
+            "Loaded Qwen3.5 multimodal projector runtime from {}",
+            path.display()
+        );
+        *guard = Some(Arc::clone(&loaded));
+        Ok(loaded)
+    }
+
     fn new_cache(&self) -> Result<Qwen35Cache> {
         match &self.backend {
             Qwen35TextBackend::Dense { text_model } => Ok(text_model.new_cache()),
@@ -3728,7 +3738,7 @@ impl Qwen35ChatModel {
             Qwen35VisionSupport::MissingProjector => Err(Error::InvalidInput(
                 "Qwen3.5 multimodal input requested, but projector weights are missing. Download `mmproj-F16.gguf` for this model variant first.".to_string(),
             )),
-            Qwen35VisionSupport::Ready { .. } => Ok(()),
+            Qwen35VisionSupport::Available { .. } => Ok(()),
         }
     }
 
@@ -3738,15 +3748,7 @@ impl Qwen35ChatModel {
         multimodal: &[Qwen35MultimodalInput],
         cache: &mut Qwen35Cache,
     ) -> Result<Tensor> {
-        let runtime = match &self.vision_support {
-            Qwen35VisionSupport::Ready { runtime, .. } => runtime,
-            Qwen35VisionSupport::MissingProjector => {
-                return Err(Error::InvalidInput(
-                    "Qwen3.5 multimodal input requested, but projector weights are missing."
-                        .to_string(),
-                ))
-            }
-        };
+        let runtime = self.vision_runtime()?;
 
         let input_ids = Tensor::from_vec(
             prompt_ids.to_vec(),
@@ -3779,7 +3781,7 @@ impl Qwen35ChatModel {
 
         let mut visual_embeds = Vec::with_capacity(multimodal.len());
         for media in multimodal {
-            visual_embeds.push(self.encode_media_with_cache(runtime, media)?);
+            visual_embeds.push(self.encode_media_with_cache(runtime.as_ref(), media)?);
         }
 
         let mut merged = Vec::with_capacity(placeholder_positions.len() * 2 + 1);
@@ -3806,6 +3808,27 @@ impl Qwen35ChatModel {
 
         let fused_embeds = Tensor::cat(&merged, 1)?;
         self.forward_text_with_embeds(&fused_embeds, 0, Some(cache))
+    }
+}
+
+fn discover_qwen35_vision_support(
+    model_dir: &Path,
+    projection_dim: usize,
+    dtype: DType,
+) -> Result<Qwen35VisionSupport> {
+    if let Some(mmproj_path) = find_mmproj_gguf(model_dir)? {
+        info!(
+            "Discovered Qwen3.5 multimodal projector at {}; runtime will load on first multimodal request",
+            mmproj_path.display()
+        );
+        Ok(Qwen35VisionSupport::Available {
+            path: mmproj_path,
+            projection_dim,
+            dtype,
+            runtime: Mutex::new(None),
+        })
+    } else {
+        Ok(Qwen35VisionSupport::MissingProjector)
     }
 }
 
@@ -4800,7 +4823,7 @@ mod tests {
         Qwen35MultimodalKind,
     };
     use serde_json::json;
-    use std::sync::MutexGuard;
+    use std::sync::{Arc, MutexGuard};
 
     #[test]
     fn qwen35_tools_system_content_includes_schema_and_instructions() {
@@ -4882,6 +4905,35 @@ mod tests {
         let model = Qwen35ChatModel::load(Path::new(&model_dir), device)
             .expect("load local qwen3.5 chat model");
         assert!(model.supports_incremental_decode());
+    }
+
+    #[test]
+    fn qwen35_vision_runtime_loads_lazily_if_env_set() {
+        let Some(model_dir) = std::env::var_os("IZWI_QWEN35_CHAT_MODEL_DIR") else {
+            return;
+        };
+
+        let preferred_device = std::env::var("IZWI_QWEN35_SMOKE_DEVICE").ok();
+        let device = DeviceSelector::detect_with_preference(preferred_device.as_deref())
+            .expect("detect device for qwen3.5 smoke");
+        let model = Qwen35ChatModel::load(Path::new(&model_dir), device)
+            .expect("load local qwen3.5 chat model");
+
+        let Qwen35VisionSupport::Available { runtime, .. } = &model.vision_support else {
+            return;
+        };
+
+        assert!(runtime.lock().expect("lock empty vision runtime").is_none());
+        let first = model.vision_runtime().expect("load lazy vision runtime");
+        assert!(runtime
+            .lock()
+            .expect("lock loaded vision runtime")
+            .is_some());
+
+        let second = model
+            .vision_runtime()
+            .expect("reuse already-loaded vision runtime");
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]
