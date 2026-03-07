@@ -234,6 +234,8 @@ struct TokenizerConfig {
     added_tokens_decoder: HashMap<String, AddedToken>,
     #[serde(default)]
     eos_token: Option<String>,
+    #[serde(default)]
+    chat_template: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -241,10 +243,24 @@ struct AddedToken {
     content: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PromptTemplateBehavior {
+    default_enable_thinking: bool,
+}
+
+impl Default for PromptTemplateBehavior {
+    fn default() -> Self {
+        Self {
+            default_enable_thinking: false,
+        }
+    }
+}
+
 struct ChatTokenizer {
     inner: Tokenizer,
     vocab_size: usize,
     specials: SpecialTokenIds,
+    prompt_behavior: PromptTemplateBehavior,
 }
 
 impl ChatTokenizer {
@@ -255,6 +271,8 @@ impl ChatTokenizer {
         let config_path = model_dir.join("tokenizer_config.json");
         let config_str = fs::read_to_string(config_path)?;
         let config: TokenizerConfig = serde_json::from_str(&config_str)?;
+        let prompt_behavior =
+            infer_qwen35_prompt_template_behavior(config.chat_template.as_deref());
 
         let id_for = |token: &str| -> Option<u32> {
             config.added_tokens_decoder.iter().find_map(|(id, entry)| {
@@ -294,6 +312,7 @@ impl ChatTokenizer {
                 eos,
                 eos_alt,
             },
+            prompt_behavior,
         })
     }
 
@@ -309,6 +328,42 @@ impl ChatTokenizer {
             .collect();
         self.inner.decode(&filtered)
     }
+
+    fn default_enable_thinking(&self) -> bool {
+        self.prompt_behavior.default_enable_thinking
+    }
+}
+
+fn infer_qwen35_prompt_template_behavior(chat_template: Option<&str>) -> PromptTemplateBehavior {
+    let Some(chat_template) = chat_template else {
+        return PromptTemplateBehavior::default();
+    };
+
+    // Qwen3.5 tokenizer templates differ by size family:
+    // - 4B/9B: `enable_thinking is defined and enable_thinking is false` => thinking by default.
+    // - 0.8B/2B: `enable_thinking is defined and enable_thinking is true` => non-thinking by default.
+    if chat_template.contains("enable_thinking is defined and enable_thinking is false") {
+        PromptTemplateBehavior {
+            default_enable_thinking: true,
+        }
+    } else if chat_template.contains("enable_thinking is defined and enable_thinking is true") {
+        PromptTemplateBehavior {
+            default_enable_thinking: false,
+        }
+    } else {
+        PromptTemplateBehavior::default()
+    }
+}
+
+fn qwen35_enable_thinking(tokenizer: &ChatTokenizer, requested: Option<bool>) -> bool {
+    resolve_qwen35_enable_thinking(tokenizer.prompt_behavior, requested)
+}
+
+fn resolve_qwen35_enable_thinking(
+    prompt_behavior: PromptTemplateBehavior,
+    requested: Option<bool>,
+) -> bool {
+    requested.unwrap_or(prompt_behavior.default_enable_thinking)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3871,7 +3926,7 @@ fn build_qwen35_prompt_ids(
     let assistant_prefix_start = ids.len();
     ids.push(tokenizer.specials.im_start);
     ids.extend(tokenizer.encode_text("assistant\n")?);
-    if enable_thinking.unwrap_or(false) {
+    if qwen35_enable_thinking(tokenizer, enable_thinking) {
         ids.extend(tokenizer.encode_text("<think>\n")?);
     } else {
         ids.extend(tokenizer.encode_text("<think>\n\n</think>\n\n")?);
@@ -4784,6 +4839,38 @@ mod tests {
     }
 
     #[test]
+    fn qwen35_prompt_behavior_defaults_to_non_thinking_without_template_signal() {
+        let behavior = infer_qwen35_prompt_template_behavior(None);
+        assert!(!behavior.default_enable_thinking);
+    }
+
+    #[test]
+    fn qwen35_prompt_behavior_detects_thinking_default_from_false_guard_template() {
+        let behavior = infer_qwen35_prompt_template_behavior(Some(
+            "{%- if add_generation_prompt %}{%- if enable_thinking is defined and enable_thinking is false %}<think>\\n\\n</think>\\n\\n{%- else %}<think>\\n{%- endif %}{%- endif %}",
+        ));
+        assert!(behavior.default_enable_thinking);
+    }
+
+    #[test]
+    fn qwen35_prompt_behavior_detects_non_thinking_default_from_true_guard_template() {
+        let behavior = infer_qwen35_prompt_template_behavior(Some(
+            "{%- if add_generation_prompt %}{%- if enable_thinking is defined and enable_thinking is true %}<think>\\n{%- else %}<think>\\n\\n</think>\\n\\n{%- endif %}{%- endif %}",
+        ));
+        assert!(!behavior.default_enable_thinking);
+    }
+
+    #[test]
+    fn qwen35_enable_thinking_uses_template_default_when_control_is_absent() {
+        let behavior = PromptTemplateBehavior {
+            default_enable_thinking: true,
+        };
+
+        assert!(resolve_qwen35_enable_thinking(behavior, None));
+        assert!(!resolve_qwen35_enable_thinking(behavior, Some(false)));
+    }
+
+    #[test]
     fn qwen35_local_load_smoke_if_env_set() {
         let Some(model_dir) = std::env::var_os("IZWI_QWEN35_CHAT_MODEL_DIR") else {
             return;
@@ -4853,9 +4940,15 @@ mod tests {
                 .expect("encode disabled suffix"),
         );
 
+        let default_suffix = if tokenizer.default_enable_thinking() {
+            &enabled_suffix
+        } else {
+            &disabled_suffix
+        };
+
         assert!(enabled_prompt.ids.ends_with(&enabled_suffix));
         assert!(disabled_prompt.ids.ends_with(&disabled_suffix));
-        assert!(no_control_prompt.ids.ends_with(&disabled_suffix));
+        assert!(no_control_prompt.ids.ends_with(default_suffix));
         assert_eq!(
             enabled_prompt.assistant_prefix_start + enabled_suffix.len(),
             enabled_prompt.ids.len()
