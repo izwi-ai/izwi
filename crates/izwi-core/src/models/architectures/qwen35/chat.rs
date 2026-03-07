@@ -6,7 +6,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
 use candle_core::quantized::{gguf_file, GgmlDType, QMatMul, QTensor};
@@ -85,6 +85,35 @@ struct VisionGridThw {
 struct VisualEmbeddingCacheEntry {
     embeddings: Tensor,
     grid: VisionGridThw,
+}
+
+enum VisionRuntimeState {
+    Unloaded,
+    Loading,
+    Ready(Arc<Qwen35VisionRuntime>),
+}
+
+struct LazyVisionRuntime {
+    state: Mutex<VisionRuntimeState>,
+    ready: Condvar,
+}
+
+impl Default for LazyVisionRuntime {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(VisionRuntimeState::Unloaded),
+            ready: Condvar::new(),
+        }
+    }
+}
+
+impl LazyVisionRuntime {
+    fn is_loaded(&self) -> bool {
+        self.state
+            .lock()
+            .ok()
+            .is_some_and(|guard| matches!(*guard, VisionRuntimeState::Ready(_)))
+    }
 }
 
 #[derive(Clone)]
@@ -2968,7 +2997,7 @@ enum Qwen35VisionSupport {
         path: PathBuf,
         projection_dim: usize,
         dtype: DType,
-        runtime: Mutex<Option<Arc<Qwen35VisionRuntime>>>,
+        runtime: LazyVisionRuntime,
     },
 }
 
@@ -3907,32 +3936,48 @@ impl Qwen35ChatModel {
             }
         };
 
-        if let Ok(guard) = runtime_slot.lock() {
-            if let Some(runtime) = guard.as_ref() {
-                return Ok(Arc::clone(runtime));
+        loop {
+            let mut guard = runtime_slot.state.lock().map_err(|_| {
+                Error::InferenceError("Qwen3.5 vision runtime mutex poisoned".to_string())
+            })?;
+            match &*guard {
+                VisionRuntimeState::Ready(runtime) => return Ok(Arc::clone(runtime)),
+                VisionRuntimeState::Loading => {
+                    guard = runtime_slot.ready.wait(guard).map_err(|_| {
+                        Error::InferenceError("Qwen3.5 vision runtime mutex poisoned".to_string())
+                    })?;
+                    drop(guard);
+                    continue;
+                }
+                VisionRuntimeState::Unloaded => {
+                    *guard = VisionRuntimeState::Loading;
+                    drop(guard);
+
+                    let loaded =
+                        Qwen35VisionRuntime::load(path, &self.device, dtype, projection_dim)
+                            .map(Arc::new);
+                    let mut guard = runtime_slot.state.lock().map_err(|_| {
+                        Error::InferenceError("Qwen3.5 vision runtime mutex poisoned".to_string())
+                    })?;
+                    match loaded {
+                        Ok(runtime) => {
+                            info!(
+                                "Loaded Qwen3.5 multimodal projector runtime from {}",
+                                path.display()
+                            );
+                            *guard = VisionRuntimeState::Ready(Arc::clone(&runtime));
+                            runtime_slot.ready.notify_all();
+                            return Ok(runtime);
+                        }
+                        Err(err) => {
+                            *guard = VisionRuntimeState::Unloaded;
+                            runtime_slot.ready.notify_all();
+                            return Err(err);
+                        }
+                    }
+                }
             }
         }
-
-        let loaded = Arc::new(Qwen35VisionRuntime::load(
-            path,
-            &self.device,
-            dtype,
-            projection_dim,
-        )?);
-
-        let mut guard = runtime_slot.lock().map_err(|_| {
-            Error::InferenceError("Qwen3.5 vision runtime mutex poisoned".to_string())
-        })?;
-        if let Some(runtime) = guard.as_ref() {
-            return Ok(Arc::clone(runtime));
-        }
-
-        info!(
-            "Loaded Qwen3.5 multimodal projector runtime from {}",
-            path.display()
-        );
-        *guard = Some(Arc::clone(&loaded));
-        Ok(loaded)
     }
 
     fn new_cache(&self) -> Result<Qwen35Cache> {
@@ -4160,7 +4205,7 @@ fn discover_qwen35_vision_support(
             path: mmproj_path,
             projection_dim,
             dtype,
-            runtime: Mutex::new(None),
+            runtime: LazyVisionRuntime::default(),
         })
     } else {
         Ok(Qwen35VisionSupport::MissingProjector)
@@ -5594,12 +5639,9 @@ mod tests {
             return;
         };
 
-        assert!(runtime.lock().expect("lock empty vision runtime").is_none());
+        assert!(!runtime.is_loaded());
         let first = model.vision_runtime().expect("load lazy vision runtime");
-        assert!(runtime
-            .lock()
-            .expect("lock loaded vision runtime")
-            .is_some());
+        assert!(runtime.is_loaded());
 
         let second = model
             .vision_runtime()

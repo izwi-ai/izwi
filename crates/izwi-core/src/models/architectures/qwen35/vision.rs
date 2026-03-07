@@ -698,6 +698,9 @@ fn sample_video_frame_indices(total_frames: usize, max_frames: usize) -> Vec<usi
     if total_frames == 0 || max_frames == 0 {
         return Vec::new();
     }
+    if max_frames == 1 {
+        return vec![0];
+    }
     if total_frames <= max_frames {
         return (0..total_frames).collect();
     }
@@ -890,6 +893,12 @@ mod tests {
         assert_eq!(indices[0], 0);
         assert_eq!(indices.last().copied(), Some(11));
         assert!(indices.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn sample_video_frame_indices_support_single_frame_budget_without_panicking() {
+        let indices = sample_video_frame_indices(12, 1);
+        assert_eq!(indices, vec![0]);
     }
 
     #[test]
