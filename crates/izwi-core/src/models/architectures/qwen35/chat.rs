@@ -97,6 +97,7 @@ struct PrefixCacheEntry {
 #[derive(Default)]
 struct PrefixCacheStore {
     entries: VecDeque<PrefixCacheEntry>,
+    total_bytes: usize,
 }
 
 impl PrefixCacheStore {
@@ -108,15 +109,40 @@ impl PrefixCacheStore {
             .cloned()
     }
 
-    fn insert(&mut self, entry: PrefixCacheEntry, capacity: usize) {
-        if capacity == 0 {
+    fn insert(&mut self, entry: PrefixCacheEntry, capacity: usize, max_bytes: usize) {
+        if capacity == 0 || max_bytes == 0 {
             self.entries.clear();
+            self.total_bytes = 0;
             return;
         }
-        self.entries.retain(|existing| existing.ids != entry.ids);
+        self.remove_ids(&entry.ids);
+        let entry_bytes = prefix_cache_entry_nbytes(&entry);
+        if entry_bytes > max_bytes {
+            return;
+        }
         self.entries.push_front(entry);
-        while self.entries.len() > capacity {
-            self.entries.pop_back();
+        self.total_bytes = self.total_bytes.saturating_add(entry_bytes);
+        while self.entries.len() > capacity || self.total_bytes > max_bytes {
+            self.pop_back();
+        }
+    }
+
+    fn remove_ids(&mut self, ids: &[u32]) {
+        let Some(idx) = self.entries.iter().position(|existing| existing.ids == ids) else {
+            return;
+        };
+        if let Some(existing) = self.entries.remove(idx) {
+            self.total_bytes = self
+                .total_bytes
+                .saturating_sub(prefix_cache_entry_nbytes(&existing));
+        }
+    }
+
+    fn pop_back(&mut self) {
+        if let Some(existing) = self.entries.pop_back() {
+            self.total_bytes = self
+                .total_bytes
+                .saturating_sub(prefix_cache_entry_nbytes(&existing));
         }
     }
 }
@@ -125,6 +151,7 @@ impl PrefixCacheStore {
 struct VisualEmbeddingCache {
     entries: HashMap<String, VisualEmbeddingCacheEntry>,
     order: VecDeque<String>,
+    total_bytes: usize,
 }
 
 impl VisualEmbeddingCache {
@@ -137,32 +164,57 @@ impl VisualEmbeddingCache {
         Some(value)
     }
 
-    fn insert(&mut self, key: String, value: VisualEmbeddingCacheEntry, capacity: usize) {
-        if capacity == 0 {
+    fn insert(
+        &mut self,
+        key: String,
+        value: VisualEmbeddingCacheEntry,
+        capacity: usize,
+        max_bytes: usize,
+    ) {
+        if capacity == 0 || max_bytes == 0 {
             self.entries.clear();
             self.order.clear();
+            self.total_bytes = 0;
             return;
         }
 
-        if self.entries.contains_key(&key) {
-            self.entries.insert(key.clone(), value);
-            if let Some(idx) = self.order.iter().position(|existing| existing == &key) {
-                self.order.remove(idx);
-            }
-            self.order.push_back(key);
+        self.remove_entry(&key);
+        let entry_bytes = visual_embedding_cache_entry_nbytes(&key, &value);
+        if entry_bytes > max_bytes {
             return;
         }
 
-        while self.entries.len() >= capacity {
-            if let Some(oldest) = self.order.pop_front() {
-                self.entries.remove(&oldest);
-            } else {
-                break;
-            }
+        while self.entries.len() >= capacity
+            || self.total_bytes.saturating_add(entry_bytes) > max_bytes
+        {
+            self.pop_front();
         }
 
         self.order.push_back(key.clone());
+        self.total_bytes = self.total_bytes.saturating_add(entry_bytes);
         self.entries.insert(key, value);
+    }
+
+    fn remove_entry(&mut self, key: &str) {
+        if let Some(existing) = self.entries.remove(key) {
+            self.total_bytes = self
+                .total_bytes
+                .saturating_sub(visual_embedding_cache_entry_nbytes(key, &existing));
+        }
+        if let Some(idx) = self.order.iter().position(|existing| existing == key) {
+            self.order.remove(idx);
+        }
+    }
+
+    fn pop_front(&mut self) {
+        let Some(oldest) = self.order.pop_front() else {
+            return;
+        };
+        if let Some(existing) = self.entries.remove(&oldest) {
+            self.total_bytes = self
+                .total_bytes
+                .saturating_sub(visual_embedding_cache_entry_nbytes(&oldest, &existing));
+        }
     }
 }
 
@@ -614,6 +666,58 @@ impl Qwen35Cache {
             Error::InferenceError(format!("Invalid Qwen3.5 cache layer index: {idx}"))
         })
     }
+}
+
+fn prefix_cache_entry_nbytes(entry: &PrefixCacheEntry) -> usize {
+    entry.ids.len() * std::mem::size_of::<u32>()
+        + tensor_nbytes(&entry.logits)
+        + qwen35_cache_nbytes(&entry.cache)
+}
+
+fn visual_embedding_cache_entry_nbytes(key: &str, entry: &VisualEmbeddingCacheEntry) -> usize {
+    key.len() + tensor_nbytes(&entry.embeddings)
+}
+
+fn qwen35_cache_nbytes(cache: &Qwen35Cache) -> usize {
+    cache
+        .layers
+        .iter()
+        .map(qwen35_layer_cache_nbytes)
+        .sum::<usize>()
+}
+
+fn qwen35_layer_cache_nbytes(layer: &Qwen35LayerCache) -> usize {
+    match layer {
+        Qwen35LayerCache::Full {
+            k_pages, v_pages, ..
+        } => {
+            k_pages.iter().map(kv_page_nbytes).sum::<usize>()
+                + v_pages.iter().map(kv_page_nbytes).sum::<usize>()
+        }
+        Qwen35LayerCache::Linear {
+            conv_state,
+            recurrent_state,
+        } => conv_state
+            .as_ref()
+            .map(tensor_nbytes)
+            .unwrap_or(0)
+            .saturating_add(recurrent_state.as_ref().map(tensor_nbytes).unwrap_or(0)),
+    }
+}
+
+fn kv_page_nbytes(page: &KvPage) -> usize {
+    match page {
+        KvPage::Dense(tensor) => tensor_nbytes(tensor),
+        KvPage::Int8 { values, .. } => {
+            tensor_nbytes(values) + std::mem::size_of::<f32>() + std::mem::size_of::<DType>()
+        }
+    }
+}
+
+fn tensor_nbytes(tensor: &Tensor) -> usize {
+    tensor
+        .elem_count()
+        .saturating_mul(tensor.dtype().size_in_bytes())
 }
 
 #[derive(Clone)]
@@ -2909,6 +3013,13 @@ fn qwen35_prefix_cache_entries() -> usize {
         .unwrap_or(4)
 }
 
+fn qwen35_prefix_cache_max_bytes() -> usize {
+    std::env::var("IZWI_QWEN35_PREFIX_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(512 * 1024 * 1024)
+}
+
 fn qwen35_linear_prefill_chunk_size() -> usize {
     std::env::var("IZWI_QWEN35_LINEAR_PREFILL_CHUNK")
         .ok()
@@ -2921,6 +3032,13 @@ fn qwen35_mm_embed_cache_size() -> usize {
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
         .unwrap_or(16)
+}
+
+fn qwen35_mm_embed_cache_max_bytes() -> usize {
+    std::env::var("IZWI_QWEN35_MM_EMBED_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(128 * 1024 * 1024)
 }
 
 fn qwen35_warmup_enabled() -> bool {
@@ -3720,11 +3838,12 @@ impl Qwen35ChatModel {
 
     fn store_prefix_snapshot(&self, entry: PrefixCacheEntry) {
         let capacity = qwen35_prefix_cache_entries();
-        if capacity == 0 {
+        let max_bytes = qwen35_prefix_cache_max_bytes();
+        if capacity == 0 || max_bytes == 0 {
             return;
         }
         if let Ok(mut guard) = self.prefix_cache.lock() {
-            guard.insert(entry, capacity);
+            guard.insert(entry, capacity, max_bytes);
         }
     }
 
@@ -3734,6 +3853,7 @@ impl Qwen35ChatModel {
         media: &Qwen35MultimodalInput,
     ) -> Result<VisualEmbeddingCacheEntry> {
         let capacity = qwen35_mm_embed_cache_size();
+        let max_bytes = qwen35_mm_embed_cache_max_bytes();
         let kind = match media.kind {
             Qwen35MultimodalKind::Image => "image",
             Qwen35MultimodalKind::Video => "video",
@@ -3745,7 +3865,7 @@ impl Qwen35ChatModel {
             media.source
         );
 
-        if capacity > 0 {
+        if capacity > 0 && max_bytes > 0 {
             if let Ok(mut guard) = self.vision_embed_cache.lock() {
                 if let Some(hit) = guard.get(&key) {
                     return Ok(hit);
@@ -3763,9 +3883,9 @@ impl Qwen35ChatModel {
                 w: grid_w,
             },
         };
-        if capacity > 0 {
+        if capacity > 0 && max_bytes > 0 {
             if let Ok(mut guard) = self.vision_embed_cache.lock() {
-                guard.insert(key, encoded.clone(), capacity);
+                guard.insert(key, encoded.clone(), capacity, max_bytes);
             }
         }
         Ok(encoded)
@@ -5765,14 +5885,35 @@ mod tests {
         };
 
         let mut store = PrefixCacheStore::default();
-        store.insert(mk_entry(vec![1, 2]), 4);
-        store.insert(mk_entry(vec![1, 2, 3]), 4);
-        store.insert(mk_entry(vec![9, 9]), 4);
+        store.insert(mk_entry(vec![1, 2]), 4, usize::MAX);
+        store.insert(mk_entry(vec![1, 2, 3]), 4, usize::MAX);
+        store.insert(mk_entry(vec![9, 9]), 4, usize::MAX);
 
         let hit = store
             .lookup_longest_prefix(&[1, 2, 3, 4, 5])
             .expect("expected prefix hit");
         assert_eq!(hit.ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn prefix_cache_store_evicts_oldest_entry_when_byte_budget_is_exceeded() {
+        let device = candle_core::Device::Cpu;
+        let logits = Tensor::zeros((1, 1), DType::F32, &device).expect("build logits");
+        let mk_entry = |ids: Vec<u32>| PrefixCacheEntry {
+            ids,
+            cache: Qwen35Cache { layers: Vec::new() },
+            logits: logits.clone(),
+        };
+
+        let mut store = PrefixCacheStore::default();
+        store.insert(mk_entry(vec![1, 2, 3, 4]), 4, 24);
+        store.insert(mk_entry(vec![5, 6, 7, 8]), 4, 24);
+
+        assert_eq!(store.entries.len(), 1);
+        assert_eq!(
+            store.entries.front().map(|entry| entry.ids.clone()),
+            Some(vec![5, 6, 7, 8])
+        );
     }
 
     #[test]
@@ -5788,9 +5929,29 @@ mod tests {
             grid: VisionGridThw { t: 1, h: 1, w: 2 },
         };
 
-        cache.insert("a".to_string(), a, 1);
+        cache.insert("a".to_string(), a, 1, usize::MAX);
         assert!(cache.get("a").is_some());
-        cache.insert("b".to_string(), b, 1);
+        cache.insert("b".to_string(), b, 1, usize::MAX);
+        assert!(cache.get("a").is_none());
+        assert!(cache.get("b").is_some());
+    }
+
+    #[test]
+    fn visual_embedding_cache_evicts_oldest_entry_when_byte_budget_is_exceeded() {
+        let device = candle_core::Device::Cpu;
+        let mut cache = VisualEmbeddingCache::default();
+        let a = VisualEmbeddingCacheEntry {
+            embeddings: Tensor::zeros((1, 4), DType::F32, &device).expect("tensor a"),
+            grid: VisionGridThw { t: 1, h: 1, w: 4 },
+        };
+        let b = VisualEmbeddingCacheEntry {
+            embeddings: Tensor::ones((1, 4), DType::F32, &device).expect("tensor b"),
+            grid: VisionGridThw { t: 1, h: 1, w: 4 },
+        };
+
+        cache.insert("a".to_string(), a, 8, 24);
+        cache.insert("b".to_string(), b, 8, 24);
+
         assert!(cache.get("a").is_none());
         assert!(cache.get("b").is_some());
     }
