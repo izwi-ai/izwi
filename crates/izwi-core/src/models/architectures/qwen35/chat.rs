@@ -2917,7 +2917,7 @@ enum Qwen35TextBackend {
         text_model: Qwen35Model,
     },
     QuantizedGguf {
-        text_model: Mutex<Qwen35QuantizedModel>,
+        text_model: Arc<Qwen35QuantizedModel>,
     },
 }
 
@@ -2958,7 +2958,7 @@ fn qwen35_linear_prefill_chunk_size() -> usize {
     std::env::var("IZWI_QWEN35_LINEAR_PREFILL_CHUNK")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(256)
+        .unwrap_or(0)
 }
 
 fn qwen35_mm_embed_cache_size() -> usize {
@@ -3179,7 +3179,7 @@ impl Qwen35ChatModel {
             device,
             tokenizer,
             backend: Qwen35TextBackend::QuantizedGguf {
-                text_model: Mutex::new(text_model),
+                text_model: Arc::new(text_model),
             },
             vision_support,
             prefix_cache: Mutex::new(Default::default()),
@@ -3881,12 +3881,7 @@ impl Qwen35ChatModel {
     fn new_cache(&self) -> Result<Qwen35Cache> {
         match &self.backend {
             Qwen35TextBackend::Dense { text_model } => Ok(text_model.new_cache()),
-            Qwen35TextBackend::QuantizedGguf { text_model, .. } => {
-                let model = text_model.lock().map_err(|_| {
-                    Error::InferenceError("Qwen3.5 quantized GGUF model mutex poisoned".to_string())
-                })?;
-                Ok(model.new_cache())
-            }
+            Qwen35TextBackend::QuantizedGguf { text_model, .. } => Ok(text_model.new_cache()),
         }
     }
 
@@ -3911,10 +3906,7 @@ impl Qwen35ChatModel {
                 text_model.forward_with_position_ids(input_ids, start_pos, cache, position_ids)
             }
             Qwen35TextBackend::QuantizedGguf { text_model, .. } => {
-                let model = text_model.lock().map_err(|_| {
-                    Error::InferenceError("Qwen3.5 quantized GGUF model mutex poisoned".to_string())
-                })?;
-                model.forward_with_position_ids(input_ids, start_pos, cache, position_ids)
+                text_model.forward_with_position_ids(input_ids, start_pos, cache, position_ids)
             }
         }
     }
@@ -3922,12 +3914,7 @@ impl Qwen35ChatModel {
     fn text_embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
         match &self.backend {
             Qwen35TextBackend::Dense { text_model } => text_model.embeddings(input_ids),
-            Qwen35TextBackend::QuantizedGguf { text_model, .. } => {
-                let model = text_model.lock().map_err(|_| {
-                    Error::InferenceError("Qwen3.5 quantized GGUF model mutex poisoned".to_string())
-                })?;
-                model.embeddings(input_ids)
-            }
+            Qwen35TextBackend::QuantizedGguf { text_model, .. } => text_model.embeddings(input_ids),
         }
     }
 
@@ -3950,12 +3937,8 @@ impl Qwen35ChatModel {
         match &self.backend {
             Qwen35TextBackend::Dense { text_model } => text_model
                 .forward_with_embeds_and_position_ids(embeds, start_pos, cache, position_ids),
-            Qwen35TextBackend::QuantizedGguf { text_model, .. } => {
-                let model = text_model.lock().map_err(|_| {
-                    Error::InferenceError("Qwen3.5 quantized GGUF model mutex poisoned".to_string())
-                })?;
-                model.forward_with_embeds_and_position_ids(embeds, start_pos, cache, position_ids)
-            }
+            Qwen35TextBackend::QuantizedGguf { text_model, .. } => text_model
+                .forward_with_embeds_and_position_ids(embeds, start_pos, cache, position_ids),
         }
     }
 
