@@ -31,7 +31,7 @@ use crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel;
 use crate::models::architectures::whisper::asr::{
     AsrTranscriptionOutput as WhisperAsrTranscriptionOutput, WhisperTurboAsrModel,
 };
-use crate::models::shared::chat::ChatMessage;
+use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage};
 use crate::runtime::{DiarizationConfig, DiarizationResult};
 
 type AsrLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeAsrModel>;
@@ -540,10 +540,20 @@ impl NativeChatModel {
         messages: &[ChatMessage],
         max_new_tokens: usize,
     ) -> Result<ChatGenerationOutput> {
+        let config = ChatGenerationConfig::default();
+        self.generate_with_config(messages, max_new_tokens, &config)
+    }
+
+    pub fn generate_with_config(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+    ) -> Result<ChatGenerationOutput> {
         match self {
             Self::Qwen3(model) => model.generate(messages, max_new_tokens),
             Self::Qwen35(model) => {
-                let output = model.generate(messages, max_new_tokens)?;
+                let output = model.generate_with_config(messages, max_new_tokens, config)?;
                 Ok(ChatGenerationOutput {
                     text: output.text,
                     tokens_generated: output.tokens_generated,
@@ -572,10 +582,26 @@ impl NativeChatModel {
         max_new_tokens: usize,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ChatGenerationOutput> {
+        let config = ChatGenerationConfig::default();
+        self.generate_with_callback_and_config(messages, max_new_tokens, &config, on_delta)
+    }
+
+    pub fn generate_with_callback_and_config(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ChatGenerationOutput> {
         match self {
             Self::Qwen3(model) => model.generate_with_callback(messages, max_new_tokens, on_delta),
             Self::Qwen35(model) => {
-                let output = model.generate_with_callback(messages, max_new_tokens, on_delta)?;
+                let output = model.generate_with_callback_and_config(
+                    messages,
+                    max_new_tokens,
+                    config,
+                    on_delta,
+                )?;
                 Ok(ChatGenerationOutput {
                     text: output.text,
                     tokens_generated: output.tokens_generated,
@@ -612,12 +638,22 @@ impl NativeChatModel {
         messages: &[ChatMessage],
         max_new_tokens: usize,
     ) -> Result<NativeChatDecodeState> {
+        let config = ChatGenerationConfig::default();
+        self.start_decode_state_with_config(messages, max_new_tokens, &config)
+    }
+
+    pub fn start_decode_state_with_config(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+    ) -> Result<NativeChatDecodeState> {
         match self {
             Self::Qwen3(model) => Ok(NativeChatDecodeState::Qwen3(
                 model.start_decode(messages, max_new_tokens)?,
             )),
             Self::Qwen35(model) => Ok(NativeChatDecodeState::Qwen35(
-                model.start_decode(messages, max_new_tokens)?,
+                model.start_decode_with_config(messages, max_new_tokens, config)?,
             )),
             Self::Gemma3(_) => Err(Error::InvalidInput(
                 "Incremental decode state is not available for this chat model".to_string(),

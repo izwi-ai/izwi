@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::models::shared::chat::ChatGenerationConfig;
 use crate::models::shared::chat::ChatMessage;
 
 use super::super::request::EngineCoreRequest;
@@ -8,6 +9,29 @@ use super::state::ActiveChatDecode;
 use super::{ExecutorOutput, NativeExecutor};
 
 impl NativeExecutor {
+    fn chat_generation_config(request: &EngineCoreRequest) -> ChatGenerationConfig {
+        ChatGenerationConfig {
+            temperature: request.params.temperature.max(0.0),
+            top_p: request.params.top_p.clamp(0.0, 1.0),
+            top_k: request.params.top_k,
+            repetition_penalty: request.params.repetition_penalty.max(1.0),
+            stop_token_ids: request.params.stop_token_ids.clone(),
+            seed: Self::chat_request_seed(&request.id),
+        }
+    }
+
+    fn chat_request_seed(request_id: &str) -> u64 {
+        const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+
+        let mut hash = FNV_OFFSET_BASIS;
+        for byte in request_id.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
+
     fn chat_messages(request: &EngineCoreRequest) -> Result<&[ChatMessage]> {
         request
             .chat_messages
@@ -24,6 +48,7 @@ impl NativeExecutor {
         let messages = Self::chat_messages(request)?;
         let max_new_tokens = request.params.max_tokens.max(1);
         let stream_tx = Self::stream_sender(request);
+        let generation_config = Self::chat_generation_config(request);
 
         let model = self.with_registry(|registry| {
             registry
@@ -46,15 +71,19 @@ impl NativeExecutor {
                             }
                         }
                     };
-                    let output =
-                        model.generate_with_callback(messages, max_new_tokens, &mut emit)?;
+                    let output = model.generate_with_callback_and_config(
+                        messages,
+                        max_new_tokens,
+                        &generation_config,
+                        &mut emit,
+                    )?;
                     if let Some(err) = stream_err {
                         return Err(err);
                     }
                     Self::stream_final_marker(tx, &request.id, &mut sequence)?;
                     Ok(output)
                 } else {
-                    model.generate(messages, max_new_tokens)
+                    model.generate_with_config(messages, max_new_tokens, &generation_config)
                 }
             })?;
 
@@ -92,8 +121,9 @@ impl NativeExecutor {
         let mut active_state = if let Some(state) = active_state {
             state
         } else {
-            let decode_state =
-                Self::run_blocking(|| model.start_decode_state(messages, max_new_tokens))?;
+            let decode_state = Self::run_blocking(|| {
+                model.start_decode_state_with_config(messages, max_new_tokens, &generation_config)
+            })?;
             ActiveChatDecode {
                 variant,
                 state: decode_state,
@@ -170,5 +200,50 @@ impl NativeExecutor {
             finished,
             error: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::GenerationParams;
+    use crate::models::shared::chat::{ChatMessage, ChatRole};
+
+    #[test]
+    fn chat_generation_config_preserves_request_sampling_controls() {
+        let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+            role: ChatRole::User,
+            content: "hello".to_string(),
+        }]);
+        request.id = "req-sampling".to_string();
+        request.params = GenerationParams {
+            temperature: 0.85,
+            top_p: 0.92,
+            top_k: 40,
+            repetition_penalty: 1.2,
+            stop_token_ids: vec![7, 9],
+            ..GenerationParams::default()
+        };
+
+        let config = NativeExecutor::chat_generation_config(&request);
+        assert_eq!(config.temperature, 0.85);
+        assert_eq!(config.top_p, 0.92);
+        assert_eq!(config.top_k, 40);
+        assert_eq!(config.repetition_penalty, 1.2);
+        assert_eq!(config.stop_token_ids, vec![7, 9]);
+        assert_eq!(
+            config.seed,
+            NativeExecutor::chat_request_seed("req-sampling")
+        );
+    }
+
+    #[test]
+    fn chat_request_seed_is_stable_for_same_request_id() {
+        let first = NativeExecutor::chat_request_seed("req-123");
+        let second = NativeExecutor::chat_request_seed("req-123");
+        let other = NativeExecutor::chat_request_seed("req-456");
+
+        assert_eq!(first, second);
+        assert_ne!(first, other);
     }
 }

@@ -28,6 +28,32 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+/// Model-agnostic chat generation controls used by native chat backends.
+///
+/// The default preserves legacy deterministic greedy decoding for direct callers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatGenerationConfig {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: usize,
+    pub repetition_penalty: f32,
+    pub stop_token_ids: Vec<u32>,
+    pub seed: u64,
+}
+
+impl Default for ChatGenerationConfig {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            stop_token_ids: Vec::new(),
+            seed: 0,
+        }
+    }
+}
+
 const QWEN35_THINKING_CONTROL_PREFIX: &str = "__izwi_qwen35_enable_thinking=";
 const QWEN35_TOOLS_CONTROL_PREFIX: &str = "__izwi_qwen35_tools_json=";
 const QWEN35_MULTIMODAL_CONTROL_PREFIX: &str = "__izwi_qwen35_multimodal_json=";
@@ -106,8 +132,8 @@ mod tests {
     use super::{
         parse_qwen35_multimodal_control_content, parse_qwen35_thinking_control_content,
         parse_qwen35_tools_control_content, qwen35_multimodal_control_content,
-        qwen35_thinking_control_content, qwen35_tools_control_content, Qwen35MultimodalInput,
-        Qwen35MultimodalKind,
+        qwen35_thinking_control_content, qwen35_tools_control_content, ChatGenerationConfig,
+        Qwen35MultimodalInput, Qwen35MultimodalKind,
     };
     use serde_json::json;
 
@@ -196,5 +222,16 @@ mod tests {
             parse_qwen35_multimodal_control_content("not a control payload"),
             None
         );
+    }
+
+    #[test]
+    fn chat_generation_config_defaults_to_legacy_greedy_decode() {
+        let config = ChatGenerationConfig::default();
+        assert_eq!(config.temperature, 0.0);
+        assert_eq!(config.top_p, 1.0);
+        assert_eq!(config.top_k, 0);
+        assert_eq!(config.repetition_penalty, 1.0);
+        assert!(config.stop_token_ids.is_empty());
+        assert_eq!(config.seed, 0);
     }
 }

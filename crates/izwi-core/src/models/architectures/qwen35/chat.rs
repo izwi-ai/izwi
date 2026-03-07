@@ -12,6 +12,7 @@ use std::time::UNIX_EPOCH;
 use candle_core::quantized::{gguf_file, GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, IndexOp, Tensor, D};
 use candle_nn::{ops, Conv1d, Conv1dConfig, Embedding, Linear, Module, VarBuilder};
+use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 use serde::Deserialize;
 use serde_json::Value;
@@ -31,8 +32,8 @@ use crate::models::shared::attention::paged::{
 };
 use crate::models::shared::chat::{
     parse_qwen35_multimodal_control_content, parse_qwen35_thinking_control_content,
-    parse_qwen35_tools_control_content, ChatMessage, ChatRole, Qwen35MultimodalInput,
-    Qwen35MultimodalKind,
+    parse_qwen35_tools_control_content, ChatGenerationConfig, ChatMessage, ChatRole,
+    Qwen35MultimodalInput, Qwen35MultimodalKind,
 };
 use crate::models::shared::weights::mlx;
 use crate::tokenizer::Tokenizer;
@@ -53,6 +54,7 @@ pub struct ChatDecodeState {
     pos: usize,
     generated_ids: Vec<u32>,
     assembled: String,
+    sampling: ChatSamplingState,
     max_new_tokens: usize,
     finished: bool,
 }
@@ -63,6 +65,12 @@ pub struct ChatDecodeStep {
     pub text: String,
     pub tokens_generated: usize,
     pub finished: bool,
+}
+
+struct ChatSamplingState {
+    logits_processor: LogitsProcessor,
+    repetition_penalty: f32,
+    stop_token_ids: Vec<u32>,
 }
 
 #[derive(Clone)]
@@ -3330,8 +3338,18 @@ impl Qwen35ChatModel {
         messages: &[ChatMessage],
         max_new_tokens: usize,
     ) -> Result<ChatGenerationOutput> {
+        let config = ChatGenerationConfig::default();
+        self.generate_with_config(messages, max_new_tokens, &config)
+    }
+
+    pub fn generate_with_config(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+    ) -> Result<ChatGenerationOutput> {
         let mut no_op = |_delta: &str| {};
-        self.generate_with_callback(messages, max_new_tokens, &mut no_op)
+        self.generate_with_callback_and_config(messages, max_new_tokens, config, &mut no_op)
     }
 
     pub fn generate_with_callback(
@@ -3340,7 +3358,18 @@ impl Qwen35ChatModel {
         max_new_tokens: usize,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ChatGenerationOutput> {
-        let mut state = self.start_decode(messages, max_new_tokens)?;
+        let config = ChatGenerationConfig::default();
+        self.generate_with_callback_and_config(messages, max_new_tokens, &config, on_delta)
+    }
+
+    pub fn generate_with_callback_and_config(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ChatGenerationOutput> {
+        let mut state = self.start_decode_with_config(messages, max_new_tokens, config)?;
         loop {
             let step = self.decode_step(&mut state)?;
             if !step.delta.is_empty() {
@@ -3363,6 +3392,16 @@ impl Qwen35ChatModel {
         messages: &[ChatMessage],
         max_new_tokens: usize,
     ) -> Result<ChatDecodeState> {
+        let config = ChatGenerationConfig::default();
+        self.start_decode_with_config(messages, max_new_tokens, &config)
+    }
+
+    pub fn start_decode_with_config(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+    ) -> Result<ChatDecodeState> {
         let prompt = self.build_prompt(messages)?;
         let mut cache = self.new_cache()?;
         let logits = if prompt.multimodal.is_empty() {
@@ -3382,6 +3421,7 @@ impl Qwen35ChatModel {
             pos,
             generated_ids: Vec::new(),
             assembled: String::new(),
+            sampling: build_qwen35_sampling_state(config),
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
         })
@@ -3403,11 +3443,12 @@ impl Qwen35ChatModel {
         }
 
         let logits = state.logits.i((0, state.logits.dim(1)? - 1))?;
-        let next = argmax(&logits)?;
+        let next = sample_qwen35_next_token(&logits, &state.generated_ids, &mut state.sampling)?;
 
         if next == self.tokenizer.specials.im_end
             || next == self.tokenizer.specials.eos
             || self.tokenizer.specials.eos_alt == Some(next)
+            || state.sampling.stop_token_ids.contains(&next)
         {
             state.finished = true;
             return Ok(ChatDecodeStep {
@@ -4155,32 +4196,98 @@ fn strip_think_blocks(input: &str) -> String {
     output.replace(close, " ").trim().to_string()
 }
 
-fn argmax(logits: &Tensor) -> Result<u32> {
-    let logits = match logits.rank() {
-        1 => logits.clone(),
+fn build_qwen35_sampling_state(config: &ChatGenerationConfig) -> ChatSamplingState {
+    ChatSamplingState {
+        logits_processor: LogitsProcessor::from_sampling(
+            config.seed,
+            qwen35_sampling_strategy(config),
+        ),
+        repetition_penalty: config.repetition_penalty.max(1.0),
+        stop_token_ids: config.stop_token_ids.clone(),
+    }
+}
+
+fn qwen35_sampling_strategy(config: &ChatGenerationConfig) -> Sampling {
+    let temperature = f64::from(config.temperature.max(0.0));
+    if temperature <= f64::EPSILON {
+        return Sampling::ArgMax;
+    }
+
+    let top_p = f64::from(config.top_p.clamp(0.0, 1.0));
+    match (config.top_k, top_p) {
+        (top_k, top_p) if top_k > 0 && top_p > 0.0 && top_p < 1.0 => Sampling::TopKThenTopP {
+            k: top_k,
+            p: top_p,
+            temperature,
+        },
+        (top_k, _) if top_k > 0 => Sampling::TopK {
+            k: top_k,
+            temperature,
+        },
+        (0, top_p) if top_p > 0.0 && top_p < 1.0 => Sampling::TopP {
+            p: top_p,
+            temperature,
+        },
+        _ => Sampling::All { temperature },
+    }
+}
+
+fn normalize_qwen35_decode_logits(logits: &Tensor) -> Result<Tensor> {
+    match logits.rank() {
+        1 => Ok(logits.clone()),
         2 => {
             let (batch, _vocab) = logits.dims2()?;
             if batch != 1 {
                 return Err(Error::InferenceError(format!(
-                    "Unexpected batched logits for argmax: expected batch=1, got {batch}"
+                    "Unexpected batched logits for Qwen3.5 sampling: expected batch=1, got {batch}"
                 )));
             }
-            logits.i(0)?
+            logits.i(0).map_err(Error::from)
         }
-        rank => {
-            return Err(Error::InferenceError(format!(
-                "Unexpected logits rank for argmax: {rank}"
-            )));
+        rank => Err(Error::InferenceError(format!(
+            "Unexpected logits rank for Qwen3.5 sampling: {rank}"
+        ))),
+    }
+}
+
+fn apply_qwen35_repetition_penalty(
+    logits: &Tensor,
+    generated: &[u32],
+    penalty: f32,
+) -> Result<Tensor> {
+    let logits = normalize_qwen35_decode_logits(logits)?;
+    if generated.is_empty() || (penalty - 1.0).abs() <= f32::EPSILON {
+        return Ok(logits);
+    }
+
+    let logits = logits.to_dtype(DType::F32)?;
+    let device = logits.device();
+    let len = logits.dims1()?;
+    let mut values = logits.to_vec1::<f32>()?;
+    for &token in generated {
+        let idx = token as usize;
+        if idx >= values.len() {
+            continue;
         }
-    };
-    let idx = logits.argmax(D::Minus1)?;
-    let idx = if idx.rank() == 0 {
-        idx
-    } else {
-        idx.squeeze(0)?
-    };
-    idx.to_dtype(DType::U32)?
-        .to_scalar::<u32>()
+        if values[idx] > 0.0 {
+            values[idx] /= penalty;
+        } else {
+            values[idx] *= penalty;
+        }
+    }
+
+    Tensor::from_vec(values, len, device).map_err(Error::from)
+}
+
+fn sample_qwen35_next_token(
+    logits: &Tensor,
+    generated: &[u32],
+    sampling: &mut ChatSamplingState,
+) -> Result<u32> {
+    let logits = apply_qwen35_repetition_penalty(logits, generated, sampling.repetition_penalty)?;
+    sampling
+        .logits_processor
+        .sample(&logits)
         .map_err(Error::from)
 }
 
@@ -4912,6 +5019,63 @@ mod tests {
 
         assert!(resolve_qwen35_enable_thinking(behavior, None));
         assert!(!resolve_qwen35_enable_thinking(behavior, Some(false)));
+    }
+
+    #[test]
+    fn qwen35_sampling_strategy_uses_argmax_when_temperature_is_zero() {
+        let config = ChatGenerationConfig {
+            temperature: 0.0,
+            top_p: 0.9,
+            top_k: 40,
+            repetition_penalty: 1.1,
+            stop_token_ids: vec![11],
+            seed: 7,
+        };
+
+        assert_eq!(qwen35_sampling_strategy(&config), Sampling::ArgMax);
+    }
+
+    #[test]
+    fn qwen35_sampling_strategy_prefers_topk_then_topp_when_both_are_set() {
+        let config = ChatGenerationConfig {
+            temperature: 0.8,
+            top_p: 0.92,
+            top_k: 32,
+            repetition_penalty: 1.0,
+            stop_token_ids: Vec::new(),
+            seed: 99,
+        };
+
+        match qwen35_sampling_strategy(&config) {
+            Sampling::TopKThenTopP { k, p, temperature } => {
+                assert_eq!(k, 32);
+                assert!((p - 0.92).abs() < 1e-6, "unexpected top-p: {p}");
+                assert!(
+                    (temperature - 0.8).abs() < 1e-6,
+                    "unexpected temperature: {temperature}"
+                );
+            }
+            other => panic!("expected top-k then top-p sampling, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qwen35_sampling_applies_repetition_penalty_before_selection() {
+        let device = candle_core::Device::Cpu;
+        let logits = Tensor::from_vec(vec![0.2f32, 10.0f32], 2, &device).expect("logits");
+        let config = ChatGenerationConfig {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 100.0,
+            stop_token_ids: Vec::new(),
+            seed: 0,
+        };
+        let mut sampling = build_qwen35_sampling_state(&config);
+
+        let next =
+            sample_qwen35_next_token(&logits, &[1], &mut sampling).expect("sample next token");
+        assert_eq!(next, 0);
     }
 
     #[test]
