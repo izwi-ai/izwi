@@ -414,6 +414,16 @@ impl Qwen35VisionRuntime {
         &self.source_path
     }
 
+    pub(crate) fn llm_grid_thw(&self, _media: &Qwen35MultimodalInput) -> (usize, usize, usize) {
+        // The current projector folds the paired frames into channel space before the LLM,
+        // so the language model receives one temporal step and a spatially merged 2D grid.
+        (
+            1,
+            self.config.target_grid / self.config.spatial_merge_size,
+            self.config.target_grid / self.config.spatial_merge_size,
+        )
+    }
+
     pub(crate) fn encode_media(&self, media: &Qwen35MultimodalInput) -> Result<Tensor> {
         let (frame0, frame1) = self.decode_frames(media)?;
         let patches = self.patchify_pair(&frame0, &frame1)?;

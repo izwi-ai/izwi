@@ -21,7 +21,7 @@ use tracing::{info, warn};
 use crate::backends::DeviceProfile;
 use crate::backends::{open_gguf_reader, BackendKind};
 use crate::error::{Error, Result};
-use crate::models::architectures::qwen3::core::{build_rope_cache, causal_mask};
+use crate::models::architectures::qwen3::core::{build_mrope_cache, build_rope_cache, causal_mask};
 use crate::models::architectures::qwen35::vision::Qwen35VisionRuntime;
 use crate::models::shared::attention::flash::{
     flash_attention_requested, try_fused_self_attention,
@@ -52,6 +52,7 @@ pub struct ChatDecodeState {
     cache: Qwen35Cache,
     logits: Tensor,
     pos: usize,
+    next_text_position: Option<usize>,
     generated_ids: Vec<u32>,
     assembled: String,
     sampling: ChatSamplingState,
@@ -71,6 +72,13 @@ struct ChatSamplingState {
     logits_processor: LogitsProcessor,
     repetition_penalty: f32,
     stop_token_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VisionGridThw {
+    t: usize,
+    h: usize,
+    w: usize,
 }
 
 #[derive(Clone)]
@@ -380,6 +388,8 @@ struct RopeParameters {
     rope_theta: Option<f64>,
     #[serde(default)]
     partial_rotary_factor: Option<f64>,
+    #[serde(default)]
+    mrope_section: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -417,6 +427,8 @@ struct RawQwen35TextConfig {
     rope_parameters: Option<RopeParameters>,
     #[serde(default)]
     rope_theta: Option<f64>,
+    #[serde(default)]
+    mrope_section: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -439,6 +451,7 @@ struct Qwen35TextConfig {
     attention_bias: bool,
     rope_theta: f64,
     partial_rotary_factor: f64,
+    mrope_section: Option<Vec<usize>>,
     linear_conv_kernel_dim: usize,
     linear_key_head_dim: usize,
     linear_value_head_dim: usize,
@@ -472,6 +485,11 @@ impl Qwen35TextConfig {
             .as_ref()
             .and_then(|p| p.partial_rotary_factor)
             .unwrap_or(0.25);
+        let mrope_section = raw
+            .rope_parameters
+            .as_ref()
+            .and_then(|p| p.mrope_section.clone())
+            .or(raw.mrope_section);
 
         let layer_types = if let Some(layer_types) = raw.layer_types {
             if layer_types.len() != raw.num_hidden_layers {
@@ -517,6 +535,7 @@ impl Qwen35TextConfig {
             attention_bias: raw.attention_bias.unwrap_or(false),
             rope_theta,
             partial_rotary_factor,
+            mrope_section,
             linear_conv_kernel_dim: raw.linear_conv_kernel_dim.unwrap_or(4).max(1),
             linear_key_head_dim: raw.linear_key_head_dim.unwrap_or(128),
             linear_value_head_dim: raw.linear_value_head_dim.unwrap_or(128),
@@ -607,10 +626,26 @@ impl Qwen35FullAttentionContext {
         rope_theta: f64,
         device: &candle_core::Device,
         dtype: DType,
+        position_ids: Option<&Tensor>,
+        mrope_section: Option<&[usize]>,
     ) -> Result<Self> {
         let (cos, sin) = if rotary_dim > 0 {
-            let (cos_half, sin_half) =
-                build_rope_cache(seq_len, rotary_dim, start_pos, rope_theta, device, dtype)?;
+            let (cos_half, sin_half) = if let (Some(position_ids), Some(mrope_section)) = (
+                position_ids,
+                mrope_section.filter(|section| section.len() >= 3),
+            ) {
+                build_mrope_cache(
+                    seq_len,
+                    rotary_dim,
+                    rope_theta,
+                    device,
+                    dtype,
+                    position_ids,
+                    mrope_section,
+                )?
+            } else {
+                build_rope_cache(seq_len, rotary_dim, start_pos, rope_theta, device, dtype)?
+            };
             let cos = Tensor::cat(&[cos_half.clone(), cos_half], 1)?
                 .unsqueeze(0)?
                 .unsqueeze(0)?;
@@ -1585,8 +1620,18 @@ impl Qwen35Model {
         start_pos: usize,
         cache: Option<&mut Qwen35Cache>,
     ) -> Result<Tensor> {
+        self.forward_with_position_ids(input_ids, start_pos, cache, None)
+    }
+
+    fn forward_with_position_ids(
+        &self,
+        input_ids: &Tensor,
+        start_pos: usize,
+        cache: Option<&mut Qwen35Cache>,
+        position_ids: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let embeds = self.embeddings(input_ids)?;
-        self.forward_with_embeds(&embeds, start_pos, cache)
+        self.forward_with_embeds_and_position_ids(&embeds, start_pos, cache, position_ids)
     }
 
     fn embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
@@ -1598,6 +1643,16 @@ impl Qwen35Model {
         embeds: &Tensor,
         start_pos: usize,
         cache: Option<&mut Qwen35Cache>,
+    ) -> Result<Tensor> {
+        self.forward_with_embeds_and_position_ids(embeds, start_pos, cache, None)
+    }
+
+    fn forward_with_embeds_and_position_ids(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        cache: Option<&mut Qwen35Cache>,
+        position_ids: Option<&Tensor>,
     ) -> Result<Tensor> {
         let mut x = embeds.clone();
         let seq_len = embeds.dim(1)?;
@@ -1614,6 +1669,8 @@ impl Qwen35Model {
                 self.cfg.rope_theta,
                 embeds.device(),
                 embeds.dtype(),
+                position_ids,
+                self.cfg.mrope_section.as_deref(),
             )?)
         } else {
             None
@@ -2711,8 +2768,18 @@ impl Qwen35QuantizedModel {
         start_pos: usize,
         cache: Option<&mut Qwen35Cache>,
     ) -> Result<Tensor> {
+        self.forward_with_position_ids(input_ids, start_pos, cache, None)
+    }
+
+    fn forward_with_position_ids(
+        &self,
+        input_ids: &Tensor,
+        start_pos: usize,
+        cache: Option<&mut Qwen35Cache>,
+        position_ids: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let embeds = self.embeddings(input_ids)?;
-        self.forward_with_embeds(&embeds, start_pos, cache)
+        self.forward_with_embeds_and_position_ids(&embeds, start_pos, cache, position_ids)
     }
 
     fn embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
@@ -2724,6 +2791,16 @@ impl Qwen35QuantizedModel {
         embeds: &Tensor,
         start_pos: usize,
         cache: Option<&mut Qwen35Cache>,
+    ) -> Result<Tensor> {
+        self.forward_with_embeds_and_position_ids(embeds, start_pos, cache, None)
+    }
+
+    fn forward_with_embeds_and_position_ids(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        cache: Option<&mut Qwen35Cache>,
+        position_ids: Option<&Tensor>,
     ) -> Result<Tensor> {
         let mut x = embeds.clone();
         let seq_len = embeds.dim(1)?;
@@ -2740,6 +2817,8 @@ impl Qwen35QuantizedModel {
                 self.cfg.rope_theta,
                 embeds.device(),
                 embeds.dtype(),
+                position_ids,
+                self.cfg.mrope_section.as_deref(),
             )?)
         } else {
             None
@@ -3404,8 +3483,11 @@ impl Qwen35ChatModel {
     ) -> Result<ChatDecodeState> {
         let prompt = self.build_prompt(messages)?;
         let mut cache = self.new_cache()?;
-        let logits = if prompt.multimodal.is_empty() {
-            self.prefill_text_with_prefix_cache(&prompt, &mut cache)?
+        let (logits, next_text_position) = if prompt.multimodal.is_empty() {
+            (
+                self.prefill_text_with_prefix_cache(&prompt, &mut cache)?,
+                None,
+            )
         } else {
             self.prefill_with_multimodal(&prompt.ids, &prompt.multimodal, &mut cache)?
         };
@@ -3419,6 +3501,7 @@ impl Qwen35ChatModel {
             cache,
             logits,
             pos,
+            next_text_position,
             generated_ids: Vec::new(),
             assembled: String::new(),
             sampling: build_qwen35_sampling_state(config),
@@ -3475,7 +3558,22 @@ impl Qwen35ChatModel {
         }
 
         let next_tensor = Tensor::from_vec(vec![next], (1, 1), &self.device.device)?;
-        state.logits = self.forward_text(&next_tensor, state.pos, Some(&mut state.cache))?;
+        let decode_position_ids = if let Some(next_text_position) =
+            state.next_text_position.as_mut()
+        {
+            let position_ids =
+                build_qwen35_text_decode_position_ids(*next_text_position, &self.device.device)?;
+            *next_text_position += 1;
+            Some(position_ids)
+        } else {
+            None
+        };
+        state.logits = self.forward_text_with_position_ids(
+            &next_tensor,
+            state.pos,
+            Some(&mut state.cache),
+            decode_position_ids.as_ref(),
+        )?;
         state.pos += 1;
 
         if state.generated_ids.len() >= state.max_new_tokens {
@@ -3715,15 +3813,25 @@ impl Qwen35ChatModel {
         start_pos: usize,
         cache: Option<&mut Qwen35Cache>,
     ) -> Result<Tensor> {
+        self.forward_text_with_position_ids(input_ids, start_pos, cache, None)
+    }
+
+    fn forward_text_with_position_ids(
+        &self,
+        input_ids: &Tensor,
+        start_pos: usize,
+        cache: Option<&mut Qwen35Cache>,
+        position_ids: Option<&Tensor>,
+    ) -> Result<Tensor> {
         match &self.backend {
             Qwen35TextBackend::Dense { text_model } => {
-                text_model.forward(input_ids, start_pos, cache)
+                text_model.forward_with_position_ids(input_ids, start_pos, cache, position_ids)
             }
             Qwen35TextBackend::QuantizedGguf { text_model, .. } => {
                 let model = text_model.lock().map_err(|_| {
                     Error::InferenceError("Qwen3.5 quantized GGUF model mutex poisoned".to_string())
                 })?;
-                model.forward(input_ids, start_pos, cache)
+                model.forward_with_position_ids(input_ids, start_pos, cache, position_ids)
             }
         }
     }
@@ -3746,15 +3854,24 @@ impl Qwen35ChatModel {
         start_pos: usize,
         cache: Option<&mut Qwen35Cache>,
     ) -> Result<Tensor> {
+        self.forward_text_with_embeds_and_position_ids(embeds, start_pos, cache, None)
+    }
+
+    fn forward_text_with_embeds_and_position_ids(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        cache: Option<&mut Qwen35Cache>,
+        position_ids: Option<&Tensor>,
+    ) -> Result<Tensor> {
         match &self.backend {
-            Qwen35TextBackend::Dense { text_model } => {
-                text_model.forward_with_embeds(embeds, start_pos, cache)
-            }
+            Qwen35TextBackend::Dense { text_model } => text_model
+                .forward_with_embeds_and_position_ids(embeds, start_pos, cache, position_ids),
             Qwen35TextBackend::QuantizedGguf { text_model, .. } => {
                 let model = text_model.lock().map_err(|_| {
                     Error::InferenceError("Qwen3.5 quantized GGUF model mutex poisoned".to_string())
                 })?;
-                model.forward_with_embeds(embeds, start_pos, cache)
+                model.forward_with_embeds_and_position_ids(embeds, start_pos, cache, position_ids)
             }
         }
     }
@@ -3809,7 +3926,7 @@ impl Qwen35ChatModel {
         prompt_ids: &[u32],
         multimodal: &[Qwen35MultimodalInput],
         cache: &mut Qwen35Cache,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Option<usize>)> {
         let runtime = self.vision_runtime()?;
 
         let input_ids = Tensor::from_vec(
@@ -3842,8 +3959,11 @@ impl Qwen35ChatModel {
         }
 
         let mut visual_embeds = Vec::with_capacity(multimodal.len());
+        let mut vision_grids = Vec::with_capacity(multimodal.len());
         for media in multimodal {
             visual_embeds.push(self.encode_media_with_cache(runtime.as_ref(), media)?);
+            let (t, h, w) = runtime.llm_grid_thw(media);
+            vision_grids.push(VisionGridThw { t, h, w });
         }
 
         let mut merged = Vec::with_capacity(placeholder_positions.len() * 2 + 1);
@@ -3869,7 +3989,20 @@ impl Qwen35ChatModel {
         }
 
         let fused_embeds = Tensor::cat(&merged, 1)?;
-        self.forward_text_with_embeds(&fused_embeds, 0, Some(cache))
+        let (position_ids, next_text_position) = build_qwen35_multimodal_position_ids(
+            prompt_ids,
+            &placeholder_positions,
+            &vision_grids,
+            &visual_embeds,
+            &self.device.device,
+        )?;
+        let logits = self.forward_text_with_embeds_and_position_ids(
+            &fused_embeds,
+            0,
+            Some(cache),
+            Some(&position_ids),
+        )?;
+        Ok((logits, Some(next_text_position)))
     }
 }
 
@@ -4164,6 +4297,118 @@ fn apply_partial_rotary(
     }
 }
 
+fn build_qwen35_text_decode_position_ids(
+    next_text_position: usize,
+    device: &candle_core::Device,
+) -> Result<Tensor> {
+    let position = next_text_position as i64;
+    Tensor::from_vec(vec![position, position, position], (3, 1), device).map_err(Error::from)
+}
+
+fn build_qwen35_multimodal_position_ids(
+    prompt_ids: &[u32],
+    placeholder_positions: &[(usize, Qwen35MultimodalKind)],
+    vision_grids: &[VisionGridThw],
+    visual_embeds: &[Tensor],
+    device: &candle_core::Device,
+) -> Result<(Tensor, usize)> {
+    if placeholder_positions.len() != vision_grids.len()
+        || placeholder_positions.len() != visual_embeds.len()
+    {
+        return Err(Error::InferenceError(
+            "Qwen3.5 multimodal position inputs are inconsistent".to_string(),
+        ));
+    }
+
+    let mut axes = [Vec::<i64>::new(), Vec::<i64>::new(), Vec::<i64>::new()];
+    let mut fused_len = prompt_ids.len() - placeholder_positions.len();
+    for visual in visual_embeds {
+        fused_len += visual.dim(0)?;
+    }
+    for axis in &mut axes {
+        axis.reserve(fused_len);
+    }
+
+    let mut consumed_prompt = 0usize;
+    let mut next_text_position = 0usize;
+
+    for (((placeholder_idx, _kind), grid), visual) in placeholder_positions
+        .iter()
+        .zip(vision_grids.iter())
+        .zip(visual_embeds.iter())
+    {
+        if *placeholder_idx < consumed_prompt || *placeholder_idx >= prompt_ids.len() {
+            return Err(Error::InferenceError(format!(
+                "Invalid Qwen3.5 multimodal placeholder index {placeholder_idx}"
+            )));
+        }
+
+        let text_len = placeholder_idx.saturating_sub(consumed_prompt);
+        append_qwen35_text_positions(&mut axes, next_text_position, text_len);
+        next_text_position += text_len;
+
+        let visual_len = visual.dim(0)?;
+        next_text_position =
+            append_qwen35_vision_positions(&mut axes, next_text_position, *grid, visual_len)?;
+        consumed_prompt = placeholder_idx + 1;
+    }
+
+    let tail_len = prompt_ids.len().saturating_sub(consumed_prompt);
+    append_qwen35_text_positions(&mut axes, next_text_position, tail_len);
+    next_text_position += tail_len;
+
+    let seq_len = axes[0].len();
+    if axes.iter().any(|axis| axis.len() != seq_len) || seq_len != fused_len {
+        return Err(Error::InferenceError(format!(
+            "Qwen3.5 multimodal position builder produced inconsistent lengths: expected {fused_len}, got {:?}",
+            axes.iter().map(Vec::len).collect::<Vec<_>>()
+        )));
+    }
+
+    let mut data = Vec::with_capacity(3 * seq_len);
+    for axis in &axes {
+        data.extend_from_slice(axis);
+    }
+    let tensor = Tensor::from_vec(data, (3, seq_len), device).map_err(Error::from)?;
+    Ok((tensor, next_text_position))
+}
+
+fn append_qwen35_text_positions(axes: &mut [Vec<i64>; 3], start_position: usize, len: usize) {
+    for offset in 0..len {
+        let position = (start_position + offset) as i64;
+        axes[0].push(position);
+        axes[1].push(position);
+        axes[2].push(position);
+    }
+}
+
+fn append_qwen35_vision_positions(
+    axes: &mut [Vec<i64>; 3],
+    start_position: usize,
+    grid: VisionGridThw,
+    expected_len: usize,
+) -> Result<usize> {
+    let token_count = grid.t.saturating_mul(grid.h).saturating_mul(grid.w);
+    if token_count != expected_len {
+        return Err(Error::InferenceError(format!(
+            "Qwen3.5 multimodal grid/token mismatch: grid={:?} produces {token_count} tokens, embed len={expected_len}",
+            grid
+        )));
+    }
+
+    for t in 0..grid.t {
+        for h in 0..grid.h {
+            for w in 0..grid.w {
+                axes[0].push((start_position + t) as i64);
+                axes[1].push((start_position + h) as i64);
+                axes[2].push((start_position + w) as i64);
+            }
+        }
+    }
+
+    Ok(start_position + grid.t.max(grid.h).max(grid.w).max(1))
+}
+
 fn strip_think_blocks(input: &str) -> String {
     let mut output = input.to_string();
     let open = "<think>";
@@ -4355,6 +4600,20 @@ fn gguf_md_u32_opt(content: &gguf_file::Content, key: &str) -> Option<usize> {
         .get(key)
         .and_then(|v| v.to_u32().ok())
         .map(|v| v as usize)
+}
+
+fn gguf_md_u32_vec_opt(content: &gguf_file::Content, key: &str) -> Option<Vec<usize>> {
+    content
+        .metadata
+        .get(key)
+        .and_then(|value| value.to_vec().ok())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.to_u64().ok().map(|v| v as usize))
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
 }
 
 fn parse_qwen35_gguf_config(content: &gguf_file::Content) -> Result<Qwen35TextConfig> {
@@ -4550,6 +4809,7 @@ fn parse_qwen35_gguf_config(content: &gguf_file::Content) -> Result<Qwen35TextCo
         full_attention_interval: gguf_md_u32_opt(content, "qwen35.full_attention_interval"),
         rope_parameters: None,
         rope_theta: Some(gguf_md_f64(content, "qwen35.rope.freq_base")?),
+        mrope_section: gguf_md_u32_vec_opt(content, "qwen35.rope.dimension_sections"),
     };
 
     Qwen35TextConfig::from_raw(raw)
@@ -4950,7 +5210,10 @@ mod tests {
         qwen35_multimodal_control_content, qwen35_thinking_control_content, Qwen35MultimodalInput,
         Qwen35MultimodalKind,
     };
+    use base64::Engine;
+    use image::{DynamicImage, Rgb, RgbImage};
     use serde_json::json;
+    use std::io::Cursor;
     use std::sync::{Arc, MutexGuard};
 
     #[test]
@@ -5079,6 +5342,41 @@ mod tests {
     }
 
     #[test]
+    fn qwen35_multimodal_position_ids_use_spatial_mrope_layout() {
+        let device = candle_core::Device::Cpu;
+        let visual = Tensor::zeros((4, 8), DType::F32, &device).expect("visual embeds");
+        let prompt_ids = vec![10u32, 99u32, 11u32];
+        let placeholder_positions = vec![(1usize, Qwen35MultimodalKind::Image)];
+        let vision_grids = vec![VisionGridThw { t: 1, h: 2, w: 2 }];
+
+        let (position_ids, next_text_position) = build_qwen35_multimodal_position_ids(
+            &prompt_ids,
+            &placeholder_positions,
+            &vision_grids,
+            &[visual],
+            &device,
+        )
+        .expect("build multimodal position ids");
+
+        assert_eq!(next_text_position, 4);
+        let axes = position_ids.to_vec2::<i64>().expect("position ids vec");
+        assert_eq!(axes[0], vec![0, 1, 1, 1, 1, 3]);
+        assert_eq!(axes[1], vec![0, 1, 1, 2, 2, 3]);
+        assert_eq!(axes[2], vec![0, 1, 2, 1, 2, 3]);
+    }
+
+    #[test]
+    fn qwen35_text_decode_position_ids_repeat_across_axes() {
+        let device = candle_core::Device::Cpu;
+        let position_ids =
+            build_qwen35_text_decode_position_ids(7, &device).expect("decode positions");
+        assert_eq!(
+            position_ids.to_vec2::<i64>().expect("position ids vec"),
+            vec![vec![7], vec![7], vec![7]]
+        );
+    }
+
+    #[test]
     fn qwen35_local_load_smoke_if_env_set() {
         let Some(model_dir) = std::env::var_os("IZWI_QWEN35_CHAT_MODEL_DIR") else {
             return;
@@ -5119,6 +5417,58 @@ mod tests {
             .vision_runtime()
             .expect("reuse already-loaded vision runtime");
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn qwen35_multimodal_prefill_tracks_next_text_position_if_env_set() {
+        let Some(model_dir) = std::env::var_os("IZWI_QWEN35_CHAT_MODEL_DIR") else {
+            return;
+        };
+
+        let preferred_device = std::env::var("IZWI_QWEN35_SMOKE_DEVICE").ok();
+        let device = DeviceSelector::detect_with_preference(preferred_device.as_deref())
+            .expect("detect device for qwen3.5 smoke");
+        let model = Qwen35ChatModel::load(Path::new(&model_dir), device)
+            .expect("load local qwen3.5 chat model");
+
+        let image = RgbImage::from_pixel(4, 4, Rgb([32, 128, 224]));
+        let mut png = Vec::new();
+        DynamicImage::ImageRgb8(image)
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode png");
+        let source = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png)
+        );
+        let control = qwen35_multimodal_control_content(&[Qwen35MultimodalInput {
+            kind: Qwen35MultimodalKind::Image,
+            source,
+        }])
+        .expect("build multimodal control");
+
+        let messages = vec![
+            ChatMessage {
+                role: ChatRole::System,
+                content: control,
+            },
+            ChatMessage {
+                role: ChatRole::User,
+                content: format!(
+                    "Describe this image {QWEN_VISION_START_TOKEN}{QWEN_IMAGE_PAD_TOKEN}<|vision_end|>"
+                ),
+            },
+        ];
+
+        let prompt_len = model
+            .prompt_token_ids(&messages)
+            .expect("build prompt token ids")
+            .len();
+        let state = model
+            .start_decode_with_config(&messages, 8, &ChatGenerationConfig::default())
+            .expect("start multimodal decode");
+
+        assert!(state.next_text_position.is_some());
+        assert!(state.pos > prompt_len);
     }
 
     #[test]
