@@ -198,10 +198,10 @@ mod tests {
         };
 
         let params = request.resolved_generation_params();
-        assert_eq!(params.temperature, 1.0);
-        assert_eq!(params.top_p, 0.95);
+        assert_eq!(params.temperature, 0.7);
+        assert_eq!(params.top_p, 0.8);
         assert_eq!(params.top_k, 20);
-        assert_eq!(params.presence_penalty, 1.5);
+        assert_eq!(params.presence_penalty, 1.0);
         assert_eq!(params.max_tokens, 64);
     }
 

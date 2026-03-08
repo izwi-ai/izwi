@@ -189,11 +189,14 @@ pub fn qwen35_sampling_defaults(
         ModelVariant::Qwen354B | ModelVariant::Qwen359B => {
             if enable_thinking {
                 Some(Qwen35SamplingDefaults {
-                    temperature: 1.0,
-                    top_p: 0.95,
+                    // Large Qwen3.5 GGUF variants can drift into low-signal
+                    // "self-talk" with high-temperature thinking defaults.
+                    // Use a tighter profile for more stable first-turn answers.
+                    temperature: 0.7,
+                    top_p: 0.8,
                     top_k: 20,
                     repetition_penalty: 1.0,
-                    presence_penalty: 1.5,
+                    presence_penalty: 1.0,
                 })
             } else {
                 Some(Qwen35SamplingDefaults {
@@ -369,11 +372,11 @@ mod tests {
         )
         .expect("qwen3.5 params");
 
-        assert_eq!(params.temperature, 1.0);
-        assert_eq!(params.top_p, 0.95);
+        assert_eq!(params.temperature, 0.7);
+        assert_eq!(params.top_p, 0.8);
         assert_eq!(params.top_k, 20);
         assert_eq!(params.repetition_penalty, 1.0);
-        assert_eq!(params.presence_penalty, 1.5);
+        assert_eq!(params.presence_penalty, 1.0);
         assert_eq!(params.max_tokens, 32);
     }
 

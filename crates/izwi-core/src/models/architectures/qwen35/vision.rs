@@ -212,9 +212,10 @@ impl Qwen35VisionRuntime {
         let image_size = gguf_md_u32(&content, "clip.vision.image_size")?;
         let spatial_merge_size = gguf_md_u32(&content, "clip.vision.spatial_merge_size")?.max(1);
         let projection_dim = gguf_md_u32(&content, "clip.vision.projection_dim")?;
-        let layer_norm_eps =
-            gguf_md_f32_opt(&content, "clip.vision.attention.layer_norm_rms_epsilon")
-                .unwrap_or(1e-6) as f64;
+        let layer_norm_eps = resolve_layer_norm_eps(
+            gguf_md_f32_opt(&content, "clip.vision.attention.layer_norm_rms_epsilon"),
+            gguf_md_f32_opt(&content, "clip.vision.attention.layer_norm_epsilon"),
+        );
 
         if projection_dim != expected_projection_dim {
             return Err(Error::ModelLoadError(format!(
@@ -882,7 +883,7 @@ mod tests {
     use image::Rgb;
 
     use super::{
-        sample_video_fps, sample_video_frame_indices, sample_video_frames,
+        resolve_layer_norm_eps, sample_video_fps, sample_video_frame_indices, sample_video_frames,
         sampled_video_temporal_steps,
     };
 
@@ -929,6 +930,24 @@ mod tests {
         let fps = sample_video_fps(4.0, 8).expect("sample fps");
         assert!((fps - 2.0).abs() < f64::EPSILON);
         assert!(sample_video_fps(0.0, 8).is_none());
+    }
+
+    #[test]
+    fn layer_norm_epsilon_prefers_rms_metadata_key_when_present() {
+        let eps = resolve_layer_norm_eps(Some(1.25e-5), Some(9.9e-6));
+        assert!((eps - 1.25e-5_f64).abs() < 1e-12);
+    }
+
+    #[test]
+    fn layer_norm_epsilon_falls_back_to_non_rms_metadata_key() {
+        let eps = resolve_layer_norm_eps(None, Some(9.9e-6));
+        assert!((eps - 9.9e-6_f64).abs() < 1e-12);
+    }
+
+    #[test]
+    fn layer_norm_epsilon_uses_default_when_metadata_keys_are_missing() {
+        let eps = resolve_layer_norm_eps(None, None);
+        assert!((eps - 1e-6_f64).abs() < 1e-12);
     }
 }
 
@@ -1213,6 +1232,15 @@ fn gguf_md_u32(content: &gguf_file::Content, key: &str) -> Result<usize> {
 
 fn gguf_md_f32_opt(content: &gguf_file::Content, key: &str) -> Option<f32> {
     content.metadata.get(key).and_then(|v| v.to_f32().ok())
+}
+
+fn resolve_layer_norm_eps(
+    layer_norm_rms_epsilon: Option<f32>,
+    layer_norm_epsilon: Option<f32>,
+) -> f64 {
+    layer_norm_rms_epsilon
+        .or(layer_norm_epsilon)
+        .unwrap_or(1e-6) as f64
 }
 
 fn gguf_md_string(content: &gguf_file::Content, key: &str) -> Result<String> {

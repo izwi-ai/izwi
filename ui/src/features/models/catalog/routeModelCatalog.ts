@@ -42,7 +42,12 @@ export const TRANSCRIPTION_PREFERRED_MODELS = [
   "Qwen3-ASR-1.7B",
 ] as const;
 
-export const CHAT_PREFERRED_MODELS = ["Qwen3-8B-GGUF"] as const;
+export const CHAT_PREFERRED_MODELS = [
+  "Qwen3.5-4B",
+  "Qwen3.5-2B",
+  "Qwen3.5-0.8B",
+  "Qwen3-8B-GGUF",
+] as const;
 
 export function getModelStatusLabel(status: ModelInfo["status"]): string {
   switch (status) {

@@ -5672,6 +5672,42 @@ mod tests {
     }
 
     #[test]
+    fn qwen35_local_first_decode_step_if_env_set() {
+        let Some(model_dir) = std::env::var_os("IZWI_QWEN35_CHAT_MODEL_DIR") else {
+            return;
+        };
+
+        let preferred_device = std::env::var("IZWI_QWEN35_SMOKE_DEVICE").ok();
+        let device = DeviceSelector::detect_with_preference(preferred_device.as_deref())
+            .expect("detect device for qwen3.5 decode smoke");
+        let model = Qwen35ChatModel::load(Path::new(&model_dir), device)
+            .expect("load local qwen3.5 chat model");
+
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "Reply with exactly: OK".to_string(),
+        }];
+
+        let mut state = model
+            .start_decode_with_config(&messages, 8, &ChatGenerationConfig::default())
+            .expect("start qwen3.5 decode state");
+        let initial_pos = state.pos;
+
+        let step = model
+            .decode_step(&mut state)
+            .expect("decode one qwen3.5 token");
+
+        assert!(
+            step.tokens_generated >= 1,
+            "expected first decode step to emit at least one token"
+        );
+        assert!(
+            state.pos > initial_pos,
+            "decode step should advance KV position"
+        );
+    }
+
+    #[test]
     fn qwen35_vision_runtime_loads_lazily_if_env_set() {
         let Some(model_dir) = std::env::var_os("IZWI_QWEN35_CHAT_MODEL_DIR") else {
             return;
