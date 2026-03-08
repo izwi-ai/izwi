@@ -146,8 +146,10 @@ pub fn qwen35_effective_enable_thinking(
     messages: &[ChatMessage],
 ) -> Option<bool> {
     let default = match variant {
-        ModelVariant::Qwen3508B | ModelVariant::Qwen352B => false,
-        ModelVariant::Qwen354B | ModelVariant::Qwen359B => true,
+        ModelVariant::Qwen3508B
+        | ModelVariant::Qwen352B
+        | ModelVariant::Qwen354B
+        | ModelVariant::Qwen359B => false,
         _ => return None,
     };
 
@@ -167,44 +169,27 @@ pub fn qwen35_sampling_defaults(
     enable_thinking: bool,
 ) -> Option<Qwen35SamplingDefaults> {
     match variant {
-        ModelVariant::Qwen3508B | ModelVariant::Qwen352B => {
+        ModelVariant::Qwen3508B
+        | ModelVariant::Qwen352B
+        | ModelVariant::Qwen354B
+        | ModelVariant::Qwen359B => {
             if enable_thinking {
                 Some(Qwen35SamplingDefaults {
-                    temperature: 1.0,
+                    // Qwen3.5 official guidance for thinking mode.
+                    temperature: 0.6,
                     top_p: 0.95,
                     top_k: 20,
                     repetition_penalty: 1.0,
-                    presence_penalty: 1.5,
+                    presence_penalty: 0.0,
                 })
             } else {
                 Some(Qwen35SamplingDefaults {
-                    temperature: 1.0,
-                    top_p: 1.0,
-                    top_k: 20,
-                    repetition_penalty: 1.0,
-                    presence_penalty: 2.0,
-                })
-            }
-        }
-        ModelVariant::Qwen354B | ModelVariant::Qwen359B => {
-            if enable_thinking {
-                Some(Qwen35SamplingDefaults {
-                    // Large Qwen3.5 GGUF variants can drift into low-signal
-                    // "self-talk" with high-temperature thinking defaults.
-                    // Use a tighter profile for more stable first-turn answers.
+                    // Qwen3.5 official guidance for non-thinking mode.
                     temperature: 0.7,
                     top_p: 0.8,
                     top_k: 20,
                     repetition_penalty: 1.0,
-                    presence_penalty: 1.0,
-                })
-            } else {
-                Some(Qwen35SamplingDefaults {
-                    temperature: 0.7,
-                    top_p: 0.8,
-                    top_k: 20,
-                    repetition_penalty: 1.0,
-                    presence_penalty: 1.5,
+                    presence_penalty: 0.0,
                 })
             }
         }
@@ -352,16 +337,16 @@ mod tests {
         )
         .expect("qwen3.5 params");
 
-        assert_eq!(params.temperature, 1.0);
-        assert_eq!(params.top_p, 1.0);
+        assert_eq!(params.temperature, 0.7);
+        assert_eq!(params.top_p, 0.8);
         assert_eq!(params.top_k, 20);
         assert_eq!(params.repetition_penalty, 1.0);
-        assert_eq!(params.presence_penalty, 2.0);
+        assert_eq!(params.presence_penalty, 0.0);
         assert_eq!(params.max_tokens, 64);
     }
 
     #[test]
-    fn qwen35_large_model_defaults_to_thinking_sampling() {
+    fn qwen35_large_model_defaults_to_non_thinking_sampling() {
         let params = qwen35_recommended_generation_params(
             ModelVariant::Qwen354B,
             &[ChatMessage {
@@ -376,18 +361,18 @@ mod tests {
         assert_eq!(params.top_p, 0.8);
         assert_eq!(params.top_k, 20);
         assert_eq!(params.repetition_penalty, 1.0);
-        assert_eq!(params.presence_penalty, 1.0);
+        assert_eq!(params.presence_penalty, 0.0);
         assert_eq!(params.max_tokens, 32);
     }
 
     #[test]
-    fn qwen35_thinking_control_switches_large_model_to_non_thinking_defaults() {
+    fn qwen35_thinking_control_switches_large_model_to_thinking_defaults() {
         let params = qwen35_recommended_generation_params(
             ModelVariant::Qwen354B,
             &[
                 ChatMessage {
                     role: ChatRole::System,
-                    content: qwen35_thinking_control_content(false),
+                    content: qwen35_thinking_control_content(true),
                 },
                 ChatMessage {
                     role: ChatRole::User,
@@ -398,11 +383,11 @@ mod tests {
         )
         .expect("qwen3.5 params");
 
-        assert_eq!(params.temperature, 0.7);
-        assert_eq!(params.top_p, 0.8);
+        assert_eq!(params.temperature, 0.6);
+        assert_eq!(params.top_p, 0.95);
         assert_eq!(params.top_k, 20);
         assert_eq!(params.repetition_penalty, 1.0);
-        assert_eq!(params.presence_penalty, 1.5);
+        assert_eq!(params.presence_penalty, 0.0);
     }
 
     #[test]

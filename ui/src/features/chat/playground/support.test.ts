@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_THREAD_TITLE,
   buildThreadContentParts,
+  defaultThinkingEnabledForModel,
   displayThreadTitle,
   parseAssistantContent,
   parseUserMessageDisplayFromContentParts,
@@ -34,6 +35,14 @@ describe("chat playground support", () => {
       hasThink: true,
       hasIncompleteThink: false,
     });
+  });
+
+  it("uses non-thinking defaults for Qwen3.5 variants", () => {
+    expect(defaultThinkingEnabledForModel("Qwen3.5-4B")).toBe(false);
+    expect(defaultThinkingEnabledForModel("Qwen3.5-2B")).toBe(false);
+    expect(defaultThinkingEnabledForModel("LFM2.5-1.2B-thinking-gguf")).toBe(
+      true,
+    );
   });
 
   it("treats no-tag output as final answer when implicit no-tag thinking is disabled", () => {

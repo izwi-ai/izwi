@@ -42,8 +42,6 @@ const QWEN_VISION_START_TOKEN: &str = "<|vision_start|>";
 const QWEN_IMAGE_PAD_TOKEN: &str = "<|image_pad|>";
 const QWEN_VIDEO_PAD_TOKEN: &str = "<|video_pad|>";
 const QWEN35_GENERIC_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
-const QWEN35_THINKING_SYSTEM_PROMPT: &str = "You are a helpful assistant. Always reason inside <think>...</think> before giving the final answer. Keep thinking concise, always close </think>, then provide a clear final answer outside the tags.";
-const QWEN35_NON_THINKING_SYSTEM_PROMPT: &str = "You are a helpful assistant. Provide only the final answer and do not output <think> tags or internal reasoning.";
 
 #[derive(Debug, Clone)]
 pub struct ChatGenerationOutput {
@@ -439,27 +437,39 @@ impl ChatTokenizer {
     fn default_enable_thinking(&self) -> bool {
         self.prompt_behavior.default_enable_thinking
     }
+
+    fn override_prompt_behavior_from_template(&mut self, chat_template: Option<&str>) {
+        if let Some(behavior) = detect_qwen35_prompt_template_behavior(chat_template) {
+            self.prompt_behavior = behavior;
+        }
+    }
+}
+
+fn detect_qwen35_prompt_template_behavior(
+    chat_template: Option<&str>,
+) -> Option<PromptTemplateBehavior> {
+    let Some(chat_template) = chat_template else {
+        return None;
+    };
+
+    // Qwen3.5 tokenizer templates differ by checkpoint family:
+    // - `... enable_thinking is false` => thinking by default.
+    // - `... enable_thinking is true` => non-thinking by default.
+    if chat_template.contains("enable_thinking is defined and enable_thinking is false") {
+        Some(PromptTemplateBehavior {
+            default_enable_thinking: true,
+        })
+    } else if chat_template.contains("enable_thinking is defined and enable_thinking is true") {
+        Some(PromptTemplateBehavior {
+            default_enable_thinking: false,
+        })
+    } else {
+        None
+    }
 }
 
 fn infer_qwen35_prompt_template_behavior(chat_template: Option<&str>) -> PromptTemplateBehavior {
-    let Some(chat_template) = chat_template else {
-        return PromptTemplateBehavior::default();
-    };
-
-    // Qwen3.5 tokenizer templates differ by size family:
-    // - 4B/9B: `enable_thinking is defined and enable_thinking is false` => thinking by default.
-    // - 0.8B/2B: `enable_thinking is defined and enable_thinking is true` => non-thinking by default.
-    if chat_template.contains("enable_thinking is defined and enable_thinking is false") {
-        PromptTemplateBehavior {
-            default_enable_thinking: true,
-        }
-    } else if chat_template.contains("enable_thinking is defined and enable_thinking is true") {
-        PromptTemplateBehavior {
-            default_enable_thinking: false,
-        }
-    } else {
-        PromptTemplateBehavior::default()
-    }
+    detect_qwen35_prompt_template_behavior(chat_template).unwrap_or_default()
 }
 
 fn qwen35_enable_thinking(tokenizer: &ChatTokenizer, requested: Option<bool>) -> bool {
@@ -3172,7 +3182,10 @@ impl Qwen35ChatModel {
         let config = parse_qwen35_gguf_config(&content)?;
         let projection_dim = config.hidden_size;
 
-        let tokenizer = ChatTokenizer::load(model_dir, Some(config.vocab_size))?;
+        let mut tokenizer = ChatTokenizer::load(model_dir, Some(config.vocab_size))?;
+        tokenizer.override_prompt_behavior_from_template(
+            gguf_md_str_opt(&content, "tokenizer.chat_template").as_deref(),
+        );
         let dtype = select_qwen35_gguf_quantized_dtype(&content, &device);
 
         let text_model =
@@ -3206,7 +3219,10 @@ impl Qwen35ChatModel {
         let config = parse_qwen35_gguf_config(&content)?;
         let projection_dim = config.hidden_size;
 
-        let tokenizer = ChatTokenizer::load(model_dir, Some(config.vocab_size))?;
+        let mut tokenizer = ChatTokenizer::load(model_dir, Some(config.vocab_size))?;
+        tokenizer.override_prompt_behavior_from_template(
+            gguf_md_str_opt(&content, "tokenizer.chat_template").as_deref(),
+        );
 
         let dtype_override = std::env::var("IZWI_CHAT_DTYPE")
             .ok()
@@ -4103,35 +4119,17 @@ fn discover_qwen35_vision_support(
     }
 }
 
-fn qwen35_structured_system_prompt(enable_thinking: bool) -> &'static str {
-    if enable_thinking {
-        QWEN35_THINKING_SYSTEM_PROMPT
-    } else {
-        QWEN35_NON_THINKING_SYSTEM_PROMPT
-    }
-}
-
-fn normalize_qwen35_system_prompt(content: Option<&str>, enable_thinking: bool) -> String {
-    let fallback = qwen35_structured_system_prompt(enable_thinking);
+fn normalize_qwen35_system_prompt(content: Option<&str>) -> String {
     let Some(content) = content.map(str::trim).filter(|content| !content.is_empty()) else {
-        return fallback.to_string();
+        return QWEN35_GENERIC_SYSTEM_PROMPT.to_string();
     };
-
-    if content == QWEN35_GENERIC_SYSTEM_PROMPT {
-        fallback.to_string()
-    } else {
-        content.to_string()
-    }
+    content.to_string()
 }
 
-fn ensure_qwen35_system_prompt(
-    prompt_messages: &mut Vec<PromptMessageEntry>,
-    enable_thinking: bool,
-) {
+fn ensure_qwen35_system_prompt(prompt_messages: &mut Vec<PromptMessageEntry>) {
     if let Some(first) = prompt_messages.first_mut() {
         if matches!(first.message.role, ChatRole::System) {
-            first.message.content =
-                normalize_qwen35_system_prompt(Some(&first.message.content), enable_thinking);
+            first.message.content = normalize_qwen35_system_prompt(Some(&first.message.content));
             return;
         }
     }
@@ -4141,7 +4139,7 @@ fn ensure_qwen35_system_prompt(
         PromptMessageEntry {
             message: ChatMessage {
                 role: ChatRole::System,
-                content: normalize_qwen35_system_prompt(None, enable_thinking),
+                content: normalize_qwen35_system_prompt(None),
             },
             multimodal: Vec::new(),
         },
@@ -4194,7 +4192,7 @@ fn build_qwen35_prompt_ids(
     }
 
     let enable_thinking = qwen35_enable_thinking(tokenizer, requested_enable_thinking);
-    ensure_qwen35_system_prompt(&mut prompt_messages, enable_thinking);
+    ensure_qwen35_system_prompt(&mut prompt_messages);
 
     let mut ids = Vec::new();
     let mut multimodal = Vec::new();
@@ -4735,6 +4733,13 @@ fn gguf_md_u32_opt(content: &gguf_file::Content, key: &str) -> Option<usize> {
         .get(key)
         .and_then(|v| v.to_u32().ok())
         .map(|v| v as usize)
+}
+
+fn gguf_md_str_opt(content: &gguf_file::Content, key: &str) -> Option<String> {
+    content.metadata.get(key).and_then(|value| match value {
+        gguf_file::Value::String(raw) => Some(raw.clone()),
+        _ => None,
+    })
 }
 
 fn gguf_md_u32_vec_opt(content: &gguf_file::Content, key: &str) -> Option<Vec<usize>> {
@@ -5541,26 +5546,23 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_system_prompt_normalization_uses_structured_fallbacks() {
+    fn qwen35_prompt_behavior_detection_ignores_unknown_templates() {
+        assert!(detect_qwen35_prompt_template_behavior(Some("{{ messages }}")).is_none());
+    }
+
+    #[test]
+    fn qwen35_system_prompt_normalization_uses_generic_fallback() {
         assert_eq!(
-            normalize_qwen35_system_prompt(None, true),
-            QWEN35_THINKING_SYSTEM_PROMPT
-        );
-        assert_eq!(
-            normalize_qwen35_system_prompt(None, false),
-            QWEN35_NON_THINKING_SYSTEM_PROMPT
+            normalize_qwen35_system_prompt(None),
+            QWEN35_GENERIC_SYSTEM_PROMPT
         );
     }
 
     #[test]
-    fn qwen35_system_prompt_normalization_rewrites_generic_prompt() {
+    fn qwen35_system_prompt_normalization_preserves_generic_prompt() {
         assert_eq!(
-            normalize_qwen35_system_prompt(Some(QWEN35_GENERIC_SYSTEM_PROMPT), true),
-            QWEN35_THINKING_SYSTEM_PROMPT
-        );
-        assert_eq!(
-            normalize_qwen35_system_prompt(Some(QWEN35_GENERIC_SYSTEM_PROMPT), false),
-            QWEN35_NON_THINKING_SYSTEM_PROMPT
+            normalize_qwen35_system_prompt(Some(QWEN35_GENERIC_SYSTEM_PROMPT)),
+            QWEN35_GENERIC_SYSTEM_PROMPT
         );
     }
 
@@ -5568,7 +5570,7 @@ mod tests {
     fn qwen35_system_prompt_normalization_preserves_custom_prompt() {
         let custom = "Be concise and cite only verifiable facts.";
         assert_eq!(
-            normalize_qwen35_system_prompt(Some(custom), true),
+            normalize_qwen35_system_prompt(Some(custom)),
             custom.to_string()
         );
     }
@@ -5853,6 +5855,39 @@ mod tests {
 
         assert!(state.next_text_position.is_some());
         assert!(state.pos > prompt_len);
+    }
+
+    #[test]
+    fn qwen35_prompt_behavior_prefers_gguf_template_if_env_set() {
+        let Some(model_dir) = std::env::var_os("IZWI_QWEN35_CHAT_MODEL_DIR") else {
+            return;
+        };
+        let model_dir = Path::new(&model_dir);
+        let Some(gguf_path) = find_preferred_gguf(model_dir).expect("resolve gguf path") else {
+            return;
+        };
+
+        let mut tokenizer = ChatTokenizer::load(model_dir, None).expect("load tokenizer config");
+        let tokenizer_default = tokenizer.default_enable_thinking();
+
+        let mut reader =
+            open_gguf_reader(&gguf_path, BackendKind::Cpu).expect("open gguf for metadata");
+        let content = gguf_file::Content::read(&mut reader).expect("read gguf metadata");
+        let gguf_template = gguf_md_str_opt(&content, "tokenizer.chat_template");
+        let Some(gguf_behavior) = detect_qwen35_prompt_template_behavior(gguf_template.as_deref())
+        else {
+            return;
+        };
+
+        tokenizer.override_prompt_behavior_from_template(gguf_template.as_deref());
+        assert_eq!(
+            tokenizer.default_enable_thinking(),
+            gguf_behavior.default_enable_thinking
+        );
+
+        if tokenizer_default != gguf_behavior.default_enable_thinking {
+            assert_ne!(tokenizer.default_enable_thinking(), tokenizer_default);
+        }
     }
 
     #[test]

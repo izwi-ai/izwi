@@ -46,6 +46,7 @@ import {
   buildThreadContentParts,
   buildUserDisplayContent,
   createMediaItemId,
+  defaultThinkingEnabledForModel,
   displayThreadTitle,
   extractLatestStats,
   fallbackThreadTitleFromUserMessage,
@@ -85,7 +86,9 @@ export function ChatPlayground({
   >({});
   const [input, setInput] = useState("");
   const [mediaItems, setMediaItems] = useState<ComposerMediaItem[]>([]);
-  const [isThinkingEnabled, setIsThinkingEnabled] = useState(true);
+  const [isThinkingEnabled, setIsThinkingEnabled] = useState(() =>
+    defaultThinkingEnabledForModel(selectedModel),
+  );
   const [isStreaming, setIsStreaming] = useState(false);
   const [isPreparingThread, setIsPreparingThread] = useState(false);
   const [streamingThreadId, setStreamingThreadId] = useState<string | null>(
@@ -167,6 +170,14 @@ export function ChatPlayground({
     },
     [searchParams, setSearchParams],
   );
+
+  useEffect(() => {
+    if (!supportsThinking) {
+      setIsThinkingEnabled(false);
+      return;
+    }
+    setIsThinkingEnabled(defaultThinkingEnabledForModel(selectedModel));
+  }, [selectedModel, supportsThinking]);
 
   const refreshThreadList = useCallback(
     async (preferredThreadId?: string | null) => {
@@ -733,7 +744,9 @@ export function ChatPlayground({
     };
 
     const qwen35ThinkingControl = isQwen35ChatModel(selectedModel)
-      ? thinkingEnabledForModel
+      ? thinkingEnabledForModel === defaultThinkingEnabledForModel(selectedModel)
+        ? undefined
+        : thinkingEnabledForModel
       : undefined;
     const systemPrompt = isQwen35ChatModel(selectedModel)
       ? "You are a helpful assistant."

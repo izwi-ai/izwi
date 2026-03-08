@@ -288,6 +288,14 @@ export function isQwen35ChatModel(variant: string | null): boolean {
   return variant.trim().toLowerCase().startsWith("qwen3.5-");
 }
 
+export function defaultThinkingEnabledForModel(variant: string | null): boolean {
+  if (isQwen35ChatModel(variant)) {
+    // Qwen3.5 GGUF templates default to non-thinking unless explicitly enabled.
+    return false;
+  }
+  return true;
+}
+
 export function isLfm25ThinkingModel(variant: string | null): boolean {
   if (!variant) {
     return false;

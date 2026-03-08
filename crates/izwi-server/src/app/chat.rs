@@ -185,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_large_models_use_recommended_thinking_defaults() {
+    fn qwen35_large_models_use_recommended_non_thinking_defaults() {
         let request = ChatExecutionRequest {
             variant: ModelVariant::Qwen354B,
             messages: user_message(),
@@ -201,8 +201,37 @@ mod tests {
         assert_eq!(params.temperature, 0.7);
         assert_eq!(params.top_p, 0.8);
         assert_eq!(params.top_k, 20);
-        assert_eq!(params.presence_penalty, 1.0);
+        assert_eq!(params.presence_penalty, 0.0);
         assert_eq!(params.max_tokens, 64);
+    }
+
+    #[test]
+    fn qwen35_thinking_control_switches_to_thinking_defaults() {
+        let request = ChatExecutionRequest {
+            variant: ModelVariant::Qwen354B,
+            messages: vec![
+                ChatMessage {
+                    role: ChatRole::System,
+                    content: qwen35_thinking_control_content(true),
+                },
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: "hello".to_string(),
+                },
+            ],
+            max_completion_tokens: Some(64),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            presence_penalty: None,
+            correlation_id: None,
+        };
+
+        let params = request.resolved_generation_params();
+        assert_eq!(params.temperature, 0.6);
+        assert_eq!(params.top_p, 0.95);
+        assert_eq!(params.top_k, 20);
+        assert_eq!(params.presence_penalty, 0.0);
     }
 
     #[test]
