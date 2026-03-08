@@ -72,6 +72,10 @@ pub fn max_new_tokens(
         ModelVariant::Gemma31BIt => 4096,
         ModelVariant::Lfm2512BInstructGguf => 4096,
         ModelVariant::Lfm2512BThinkingGguf => 4096,
+        ModelVariant::Qwen3508B => 4096,
+        ModelVariant::Qwen352B => 4096,
+        ModelVariant::Qwen354B => 4096,
+        ModelVariant::Qwen359B => 4096,
         _ => 1536,
     };
 
