@@ -2245,12 +2245,7 @@ impl Qwen35QuantizedLinearAttention {
         )?;
 
         let dt_src = format!("{layer_src_prefix}.ssm_dt.bias");
-        let dt_bias = untile_linear_v_vector(
-            load_gguf_tensor(content, reader, device, dtype, &dt_src)?,
-            cfg.linear_num_key_heads,
-            cfg.linear_num_value_heads,
-            &dt_src,
-        )?;
+        let dt_bias = load_gguf_tensor(content, reader, device, dtype, &dt_src)?;
 
         let ssm_a_src = format!("{layer_src_prefix}.ssm_a");
         let a_log = load_gguf_tensor(content, reader, device, dtype, &ssm_a_src)?;
@@ -2264,12 +2259,6 @@ impl Qwen35QuantizedLinearAttention {
         } else {
             a_log
         };
-        let a_log = untile_linear_v_vector(
-            a_log,
-            cfg.linear_num_key_heads,
-            cfg.linear_num_value_heads,
-            &ssm_a_src,
-        )?;
 
         let norm_weight = load_gguf_tensor(
             content,
@@ -2288,11 +2277,7 @@ impl Qwen35QuantizedLinearAttention {
         )?;
 
         let conv_src = format!("{layer_src_prefix}.ssm_conv1d.weight");
-        let conv_weight = untile_linear_conv_weight(
-            load_gguf_tensor(content, reader, device, dtype, &conv_src)?,
-            cfg,
-            &conv_src,
-        )?;
+        let conv_weight = load_gguf_tensor(content, reader, device, dtype, &conv_src)?;
         let conv = Conv1d::new(
             conv_weight.unsqueeze(1)?,
             None,
@@ -2390,36 +2375,15 @@ impl Qwen35QuantizedLinearAttention {
             (None, None)
         };
 
-        let projected_qkv = untile_linear_qkv_last_dim(
-            self.in_proj_qkv.forward(hidden_states)?,
-            self.key_dim,
-            self.num_k_heads,
+        let projected_qkv = self.in_proj_qkv.forward(hidden_states)?;
+        let z = self.in_proj_z.forward(hidden_states)?.reshape((
+            batch_size,
+            seq_len,
             self.num_v_heads,
             self.head_v_dim,
-            "Qwen3.5 quantized linear QKV projection",
-        )?;
-        let z = untile_linear_v_last_dim(
-            self.in_proj_z.forward(hidden_states)?,
-            self.num_k_heads,
-            self.num_v_heads,
-            self.head_v_dim,
-            "Qwen3.5 quantized linear gate projection",
-        )?
-        .reshape((batch_size, seq_len, self.num_v_heads, self.head_v_dim))?;
-        let b = untile_linear_v_last_dim(
-            self.in_proj_b.forward(hidden_states)?,
-            self.num_k_heads,
-            self.num_v_heads,
-            1,
-            "Qwen3.5 quantized linear beta projection",
-        )?;
-        let a = untile_linear_v_last_dim(
-            self.in_proj_a.forward(hidden_states)?,
-            self.num_k_heads,
-            self.num_v_heads,
-            1,
-            "Qwen3.5 quantized linear alpha projection",
-        )?;
+        ))?;
+        let b = self.in_proj_b.forward(hidden_states)?;
+        let a = self.in_proj_a.forward(hidden_states)?;
 
         let mut mixed_qkv = projected_qkv.transpose(1, 2)?.contiguous()?;
         let use_precomputed_states =
@@ -2509,13 +2473,6 @@ impl Qwen35QuantizedLinearAttention {
         let z_flat = z.reshape(((), self.head_v_dim))?;
         let core_norm = self.norm.forward(&core_flat, &z_flat)?;
         let core_norm = core_norm.reshape((batch_size, seq_len, self.value_dim))?;
-        let core_norm = retile_linear_v_last_dim(
-            core_norm,
-            self.num_k_heads,
-            self.num_v_heads,
-            self.head_v_dim,
-            "Qwen3.5 quantized linear output projection input",
-        )?;
         self.out_proj.forward(&core_norm).map_err(Error::from)
     }
 
@@ -3379,51 +3336,23 @@ impl Qwen35ChatModel {
                 LayerType::LinearAttention => {
                     let qkv_src = format!("{src}.attn_qkv.weight");
                     let qkv = load_gguf_tensor(&content, &mut reader, &device, dtype, &qkv_src)?;
-                    let qkv = untile_linear_qkv_weight(qkv, &config, &qkv_src)?;
                     tensors.insert(format!("{dst}.linear_attn.in_proj_qkv.weight"), qkv);
 
                     let z_src = format!("{src}.attn_gate.weight");
                     let z = load_gguf_tensor(&content, &mut reader, &device, dtype, &z_src)?;
-                    let z = untile_linear_v_rows(
-                        z,
-                        config.linear_num_key_heads,
-                        config.linear_num_value_heads,
-                        config.linear_value_head_dim,
-                        &z_src,
-                    )?;
                     tensors.insert(format!("{dst}.linear_attn.in_proj_z.weight"), z);
 
                     let beta_src = format!("{src}.ssm_beta.weight");
                     let beta = load_gguf_tensor(&content, &mut reader, &device, dtype, &beta_src)?;
-                    let beta = untile_linear_v_rows(
-                        beta,
-                        config.linear_num_key_heads,
-                        config.linear_num_value_heads,
-                        1,
-                        &beta_src,
-                    )?;
                     tensors.insert(format!("{dst}.linear_attn.in_proj_b.weight"), beta);
 
                     let alpha_src = format!("{src}.ssm_alpha.weight");
                     let alpha =
                         load_gguf_tensor(&content, &mut reader, &device, dtype, &alpha_src)?;
-                    let alpha = untile_linear_v_rows(
-                        alpha,
-                        config.linear_num_key_heads,
-                        config.linear_num_value_heads,
-                        1,
-                        &alpha_src,
-                    )?;
                     tensors.insert(format!("{dst}.linear_attn.in_proj_a.weight"), alpha);
 
                     let dt_src = format!("{src}.ssm_dt.bias");
                     let dt_bias = load_gguf_tensor(&content, &mut reader, &device, dtype, &dt_src)?;
-                    let dt_bias = untile_linear_v_vector(
-                        dt_bias,
-                        config.linear_num_key_heads,
-                        config.linear_num_value_heads,
-                        &dt_src,
-                    )?;
                     tensors.insert(format!("{dst}.linear_attn.dt_bias"), dt_bias);
 
                     let ssm_a_src = format!("{src}.ssm_a");
@@ -3440,12 +3369,6 @@ impl Qwen35ChatModel {
                     } else {
                         a_log
                     };
-                    let a_log = untile_linear_v_vector(
-                        a_log,
-                        config.linear_num_key_heads,
-                        config.linear_num_value_heads,
-                        &ssm_a_src,
-                    )?;
                     tensors.insert(format!("{dst}.linear_attn.A_log"), a_log);
 
                     insert_gguf_tensor(
@@ -3460,12 +3383,10 @@ impl Qwen35ChatModel {
                     let out_proj_src = format!("{src}.ssm_out.weight");
                     let out_proj =
                         load_gguf_tensor(&content, &mut reader, &device, dtype, &out_proj_src)?;
-                    let out_proj = untile_linear_out_proj_weight(out_proj, &config, &out_proj_src)?;
                     tensors.insert(format!("{dst}.linear_attn.out_proj.weight"), out_proj);
 
                     let conv_src = format!("{src}.ssm_conv1d.weight");
                     let conv = load_gguf_tensor(&content, &mut reader, &device, dtype, &conv_src)?;
-                    let conv = untile_linear_conv_weight(conv, &config, &conv_src)?;
                     tensors.insert(format!("{dst}.linear_attn.conv1d.weight"), conv);
                 }
             }
@@ -5063,273 +4984,6 @@ fn load_gguf_one_centered_norm_as_delta<R: std::io::Read + std::io::Seek>(
     weight.broadcast_sub(&ones).map_err(Error::from)
 }
 
-fn untile_linear_v_rows(
-    weight: Tensor,
-    num_k_heads: usize,
-    num_v_heads: usize,
-    head_v_dim: usize,
-    tensor_name: &str,
-) -> Result<Tensor> {
-    if num_k_heads == num_v_heads {
-        return Ok(weight);
-    }
-    if num_k_heads == 0 || num_v_heads == 0 || num_v_heads % num_k_heads != 0 {
-        return Err(Error::ModelLoadError(format!(
-            "Invalid linear head mapping for `{tensor_name}`: num_k_heads={num_k_heads}, num_v_heads={num_v_heads}"
-        )));
-    }
-
-    let (rows, cols) = weight.dims2()?;
-    let expected_rows = num_v_heads * head_v_dim;
-    if rows != expected_rows {
-        return Err(Error::ModelLoadError(format!(
-            "Unexpected row count for `{tensor_name}`: expected {expected_rows}, got {rows}"
-        )));
-    }
-
-    let num_v_per_k = num_v_heads / num_k_heads;
-    let weight = weight.reshape((num_k_heads, num_v_per_k, head_v_dim, cols))?;
-    let weight = weight.permute((1, 0, 2, 3))?;
-    weight.reshape((rows, cols)).map_err(Error::from)
-}
-
-fn reorder_linear_v_last_dim(
-    tensor: Tensor,
-    num_k_heads: usize,
-    num_v_heads: usize,
-    head_v_dim: usize,
-    tensor_name: &str,
-    runtime_to_gguf: bool,
-) -> Result<Tensor> {
-    if num_k_heads == num_v_heads {
-        return Ok(tensor);
-    }
-    if num_k_heads == 0 || num_v_heads == 0 || num_v_heads % num_k_heads != 0 {
-        return Err(Error::ModelLoadError(format!(
-            "Invalid linear head mapping for `{tensor_name}`: num_k_heads={num_k_heads}, num_v_heads={num_v_heads}"
-        )));
-    }
-
-    let (batch, seq_len, last_dim) = tensor.dims3()?;
-    let expected_last_dim = num_v_heads * head_v_dim;
-    if last_dim != expected_last_dim {
-        return Err(Error::ModelLoadError(format!(
-            "Unexpected last dim for `{tensor_name}`: expected {expected_last_dim}, got {last_dim}"
-        )));
-    }
-
-    let num_v_per_k = num_v_heads / num_k_heads;
-    let tensor = if runtime_to_gguf {
-        tensor.reshape((batch, seq_len, num_v_per_k, num_k_heads, head_v_dim))?
-    } else {
-        tensor.reshape((batch, seq_len, num_k_heads, num_v_per_k, head_v_dim))?
-    };
-    let tensor = tensor.transpose(2, 3)?.contiguous()?;
-    tensor
-        .reshape((batch, seq_len, last_dim))
-        .map_err(Error::from)
-}
-
-fn untile_linear_v_last_dim(
-    tensor: Tensor,
-    num_k_heads: usize,
-    num_v_heads: usize,
-    head_v_dim: usize,
-    tensor_name: &str,
-) -> Result<Tensor> {
-    reorder_linear_v_last_dim(
-        tensor,
-        num_k_heads,
-        num_v_heads,
-        head_v_dim,
-        tensor_name,
-        false,
-    )
-}
-
-fn retile_linear_v_last_dim(
-    tensor: Tensor,
-    num_k_heads: usize,
-    num_v_heads: usize,
-    head_v_dim: usize,
-    tensor_name: &str,
-) -> Result<Tensor> {
-    reorder_linear_v_last_dim(
-        tensor,
-        num_k_heads,
-        num_v_heads,
-        head_v_dim,
-        tensor_name,
-        true,
-    )
-}
-
-fn untile_linear_v_vector(
-    tensor: Tensor,
-    num_k_heads: usize,
-    num_v_heads: usize,
-    tensor_name: &str,
-) -> Result<Tensor> {
-    if num_k_heads == num_v_heads {
-        return Ok(tensor);
-    }
-    if num_k_heads == 0 || num_v_heads == 0 || num_v_heads % num_k_heads != 0 {
-        return Err(Error::ModelLoadError(format!(
-            "Invalid linear head mapping for `{tensor_name}`: num_k_heads={num_k_heads}, num_v_heads={num_v_heads}"
-        )));
-    }
-
-    let len = tensor.dims1()?;
-    if len != num_v_heads {
-        return Err(Error::ModelLoadError(format!(
-            "Unexpected length for `{tensor_name}`: expected {num_v_heads}, got {len}"
-        )));
-    }
-
-    let num_v_per_k = num_v_heads / num_k_heads;
-    let tensor = tensor.reshape((num_k_heads, num_v_per_k, 1))?;
-    let tensor = tensor.permute((1, 0, 2))?;
-    tensor.reshape((len,)).map_err(Error::from)
-}
-
-fn untile_linear_qkv_weight(
-    weight: Tensor,
-    cfg: &Qwen35TextConfig,
-    tensor_name: &str,
-) -> Result<Tensor> {
-    if cfg.linear_num_key_heads == cfg.linear_num_value_heads {
-        return Ok(weight);
-    }
-
-    let (rows, _cols) = weight.dims2()?;
-    let key_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim;
-    let value_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
-    let qk_rows = key_dim * 2;
-    let expected_rows = qk_rows + value_dim;
-    if rows != expected_rows {
-        return Err(Error::ModelLoadError(format!(
-            "Unexpected shape for `{tensor_name}`: expected rows={expected_rows}, got rows={rows}"
-        )));
-    }
-
-    let qk = weight.narrow(0, 0, qk_rows)?;
-    let v = weight.narrow(0, qk_rows, value_dim)?;
-    let v = untile_linear_v_rows(
-        v,
-        cfg.linear_num_key_heads,
-        cfg.linear_num_value_heads,
-        cfg.linear_value_head_dim,
-        tensor_name,
-    )?;
-    Tensor::cat(&[qk, v], 0).map_err(Error::from)
-}
-
-fn untile_linear_qkv_last_dim(
-    tensor: Tensor,
-    key_dim: usize,
-    num_k_heads: usize,
-    num_v_heads: usize,
-    head_v_dim: usize,
-    tensor_name: &str,
-) -> Result<Tensor> {
-    if num_k_heads == num_v_heads {
-        return Ok(tensor);
-    }
-
-    let (_batch, _seq_len, last_dim) = tensor.dims3()?;
-    let value_dim = num_v_heads * head_v_dim;
-    let qk_dim = key_dim * 2;
-    let expected_last_dim = qk_dim + value_dim;
-    if last_dim != expected_last_dim {
-        return Err(Error::ModelLoadError(format!(
-            "Unexpected last dim for `{tensor_name}`: expected {expected_last_dim}, got {last_dim}"
-        )));
-    }
-
-    let qk = tensor.narrow(2, 0, qk_dim)?;
-    let v = tensor.narrow(2, qk_dim, value_dim)?;
-    let v = untile_linear_v_last_dim(v, num_k_heads, num_v_heads, head_v_dim, tensor_name)?;
-    Tensor::cat(&[qk, v], 2).map_err(Error::from)
-}
-
-fn untile_linear_out_proj_weight(
-    weight: Tensor,
-    cfg: &Qwen35TextConfig,
-    tensor_name: &str,
-) -> Result<Tensor> {
-    if cfg.linear_num_key_heads == cfg.linear_num_value_heads {
-        return Ok(weight);
-    }
-
-    let (_out_dim, in_dim) = weight.dims2()?;
-    let expected_in = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
-    if in_dim != expected_in {
-        return Err(Error::ModelLoadError(format!(
-            "Unexpected input dim for `{tensor_name}`: expected {expected_in}, got {in_dim}"
-        )));
-    }
-
-    let transposed = weight.transpose(0, 1)?;
-    let reordered = untile_linear_v_rows(
-        transposed,
-        cfg.linear_num_key_heads,
-        cfg.linear_num_value_heads,
-        cfg.linear_value_head_dim,
-        tensor_name,
-    )?;
-    reordered.transpose(0, 1).map_err(Error::from)
-}
-
-fn untile_linear_conv_weight(
-    weight: Tensor,
-    cfg: &Qwen35TextConfig,
-    tensor_name: &str,
-) -> Result<Tensor> {
-    if cfg.linear_num_key_heads == cfg.linear_num_value_heads {
-        return Ok(weight);
-    }
-
-    let weight = if let Ok(_dims2) = weight.dims2() {
-        weight
-    } else if let Ok((_, c1, c2)) = weight.dims3() {
-        if c1 == 1 {
-            weight.squeeze(1)?
-        } else if c2 == 1 {
-            weight.squeeze(2)?
-        } else {
-            return Err(Error::ModelLoadError(format!(
-                "Unsupported conv tensor rank/shape for `{tensor_name}`; expected 2D or 3D with singleton axis"
-            )));
-        }
-    } else {
-        return Err(Error::ModelLoadError(format!(
-            "Unsupported conv tensor rank for `{tensor_name}`; expected 2D or 3D"
-        )));
-    };
-
-    let (channels, _kernel) = weight.dims2()?;
-    let key_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim;
-    let value_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
-    let qk_channels = key_dim * 2;
-    let expected_channels = qk_channels + value_dim;
-    if channels != expected_channels {
-        return Err(Error::ModelLoadError(format!(
-            "Unexpected channel count for `{tensor_name}`: expected {expected_channels}, got {channels}"
-        )));
-    }
-
-    let qk = weight.narrow(0, 0, qk_channels)?;
-    let v = weight.narrow(0, qk_channels, value_dim)?;
-    let v = untile_linear_v_rows(
-        v,
-        cfg.linear_num_key_heads,
-        cfg.linear_num_value_heads,
-        cfg.linear_value_head_dim,
-        tensor_name,
-    )?;
-    Tensor::cat(&[qk, v], 0).map_err(Error::from)
-}
-
 fn select_qwen35_gguf_backend() -> Result<Qwen35GgufBackend> {
     let raw = std::env::var("IZWI_QWEN35_GGUF_BACKEND").unwrap_or_default();
     let normalized = raw.trim().to_ascii_lowercase();
@@ -5474,18 +5128,6 @@ mod tests {
     use serde_json::json;
     use std::io::Cursor;
     use std::sync::{Arc, MutexGuard};
-
-    fn project_last_dim(hidden: &Tensor, weight: &Tensor) -> Tensor {
-        let (batch, seq_len, hidden_size) = hidden.dims3().expect("hidden dims");
-        let out_dim = weight.dim(0).expect("weight rows");
-        hidden
-            .reshape((batch * seq_len, hidden_size))
-            .expect("flatten hidden")
-            .matmul(&weight.transpose(0, 1).expect("weight transpose"))
-            .expect("matmul")
-            .reshape((batch, seq_len, out_dim))
-            .expect("restore hidden shape")
-    }
 
     #[test]
     fn qwen35_tools_system_content_includes_schema_and_instructions() {
@@ -6103,163 +5745,6 @@ mod tests {
             .expect("value scalar");
         assert!(key_diff <= f32::EPSILON, "key diff was {key_diff}");
         assert!(value_diff <= f32::EPSILON, "value diff was {value_diff}");
-    }
-
-    fn test_linear_head_mapping_config() -> Qwen35TextConfig {
-        Qwen35TextConfig::from_raw(RawQwen35TextConfig {
-            hidden_size: 4,
-            intermediate_size: 8,
-            num_attention_heads: 2,
-            num_hidden_layers: 1,
-            num_key_value_heads: 1,
-            head_dim: Some(2),
-            rms_norm_eps: 1e-6,
-            vocab_size: 32,
-            tie_word_embeddings: Some(false),
-            attention_bias: Some(false),
-            hidden_act: Some("silu".to_string()),
-            linear_conv_kernel_dim: Some(2),
-            linear_key_head_dim: Some(2),
-            linear_value_head_dim: Some(3),
-            linear_num_key_heads: Some(1),
-            linear_num_value_heads: Some(2),
-            layer_types: Some(vec!["linear_attention".to_string()]),
-            full_attention_interval: None,
-            rope_parameters: None,
-            rope_theta: Some(10_000.0),
-            mrope_section: None,
-        })
-        .expect("build test config")
-    }
-
-    #[test]
-    fn untile_linear_v_last_dim_matches_untiled_weight_outputs() {
-        let cfg = test_linear_head_mapping_config();
-        let device = candle_core::Device::Cpu;
-        let hidden = Tensor::from_vec(
-            vec![1.0f32, 2.0, 3.0, 4.0, 4.0, 3.0, 2.0, 1.0],
-            (1, 2, cfg.hidden_size),
-            &device,
-        )
-        .expect("hidden states");
-        let raw_weight = Tensor::from_vec(
-            (1..=(cfg.linear_num_value_heads * cfg.linear_value_head_dim * cfg.hidden_size))
-                .map(|v| v as f32)
-                .collect::<Vec<_>>(),
-            (
-                cfg.linear_num_value_heads * cfg.linear_value_head_dim,
-                cfg.hidden_size,
-            ),
-            &device,
-        )
-        .expect("raw weight");
-
-        let actual = untile_linear_v_last_dim(
-            project_last_dim(&hidden, &raw_weight),
-            cfg.linear_num_key_heads,
-            cfg.linear_num_value_heads,
-            cfg.linear_value_head_dim,
-            "test linear activations",
-        )
-        .expect("untile activations");
-        let expected_weight = untile_linear_v_rows(
-            raw_weight,
-            cfg.linear_num_key_heads,
-            cfg.linear_num_value_heads,
-            cfg.linear_value_head_dim,
-            "test linear weight",
-        )
-        .expect("untile weight");
-        let expected = project_last_dim(&hidden, &expected_weight);
-
-        assert_eq!(
-            actual.to_vec3::<f32>().expect("actual vec"),
-            expected.to_vec3::<f32>().expect("expected vec")
-        );
-    }
-
-    #[test]
-    fn untile_linear_qkv_last_dim_matches_untiled_weight_outputs() {
-        let cfg = test_linear_head_mapping_config();
-        let device = candle_core::Device::Cpu;
-        let hidden = Tensor::from_vec(
-            vec![1.0f32, 0.0, 1.0, 0.0, 0.5, 1.5, 2.5, 3.5],
-            (1, 2, cfg.hidden_size),
-            &device,
-        )
-        .expect("hidden states");
-        let key_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim;
-        let value_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
-        let raw_weight = Tensor::from_vec(
-            (1..=((key_dim * 2 + value_dim) * cfg.hidden_size))
-                .map(|v| (v as f32) / 10.0)
-                .collect::<Vec<_>>(),
-            (key_dim * 2 + value_dim, cfg.hidden_size),
-            &device,
-        )
-        .expect("raw qkv weight");
-
-        let actual = untile_linear_qkv_last_dim(
-            project_last_dim(&hidden, &raw_weight),
-            key_dim,
-            cfg.linear_num_key_heads,
-            cfg.linear_num_value_heads,
-            cfg.linear_value_head_dim,
-            "test qkv activations",
-        )
-        .expect("untile qkv activations");
-        let expected_weight =
-            untile_linear_qkv_weight(raw_weight, &cfg, "test qkv weight").expect("untile qkv");
-        let expected = project_last_dim(&hidden, &expected_weight);
-
-        assert_eq!(
-            actual.to_vec3::<f32>().expect("actual vec"),
-            expected.to_vec3::<f32>().expect("expected vec")
-        );
-    }
-
-    #[test]
-    fn retile_linear_v_last_dim_matches_raw_out_proj_weight_inputs() {
-        let cfg = test_linear_head_mapping_config();
-        let device = candle_core::Device::Cpu;
-        let runtime_input = Tensor::from_vec(
-            vec![
-                1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0,
-            ],
-            (1, 2, cfg.linear_num_value_heads * cfg.linear_value_head_dim),
-            &device,
-        )
-        .expect("runtime input");
-        let raw_weight = Tensor::from_vec(
-            (1..=(cfg.hidden_size * cfg.linear_num_value_heads * cfg.linear_value_head_dim))
-                .map(|v| (v as f32) / 7.0)
-                .collect::<Vec<_>>(),
-            (
-                cfg.hidden_size,
-                cfg.linear_num_value_heads * cfg.linear_value_head_dim,
-            ),
-            &device,
-        )
-        .expect("raw out proj weight");
-
-        let actual = retile_linear_v_last_dim(
-            runtime_input.clone(),
-            cfg.linear_num_key_heads,
-            cfg.linear_num_value_heads,
-            cfg.linear_value_head_dim,
-            "test out proj input",
-        )
-        .expect("retile input");
-        let actual = project_last_dim(&actual, &raw_weight);
-        let expected_weight =
-            untile_linear_out_proj_weight(raw_weight, &cfg, "test out proj weight")
-                .expect("untile out proj weight");
-        let expected = project_last_dim(&runtime_input, &expected_weight);
-
-        assert_eq!(
-            actual.to_vec3::<f32>().expect("actual vec"),
-            expected.to_vec3::<f32>().expect("expected vec")
-        );
     }
 
     #[test]
