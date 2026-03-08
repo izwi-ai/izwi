@@ -220,7 +220,7 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     description: "Compact Qwen3.5 chat model in GGUF format (Q4_K_M only)",
     category: "chat",
     capabilities: ["Text Chat", "GGUF", "Q4_K_M"],
-    size: "0.5 GB",
+    size: "0.8 GB",
   },
   "Qwen3.5-2B": {
     shortName: "Qwen3.5 Chat 2B GGUF",
@@ -228,7 +228,7 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     description: "Balanced Qwen3.5 chat model in GGUF format (Q4_K_M only)",
     category: "chat",
     capabilities: ["Text Chat", "GGUF", "Q4_K_M"],
-    size: "1.2 GB",
+    size: "2.0 GB",
   },
   "Qwen3.5-4B": {
     shortName: "Qwen3.5 Chat 4B GGUF",
@@ -237,7 +237,7 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
       "Higher-quality Qwen3.5 chat model in GGUF format (Q4_K_M only)",
     category: "chat",
     capabilities: ["Text Chat", "GGUF", "Q4_K_M"],
-    size: "2.6 GB",
+    size: "3.4 GB",
   },
   "Qwen3.5-9B": {
     shortName: "Qwen3.5 Chat 9B GGUF",
@@ -246,7 +246,7 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
       "High-capacity Qwen3.5 chat model in GGUF format (Q4_K_M only)",
     category: "chat",
     capabilities: ["Text Chat", "GGUF", "Q4_K_M"],
-    size: "5.3 GB",
+    size: "6.4 GB",
   },
   "LFM2.5-1.2B-Instruct-GGUF": {
     shortName: "LFM2.5 1.2B Instruct",

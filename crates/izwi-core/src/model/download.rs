@@ -25,6 +25,23 @@ use crate::error::{Error, Result};
 const HF_BASE_URL: &str = "https://huggingface.co";
 const CHUNK_SIZE: usize = 8192; // 8KB chunks for streaming
 const QWEN35_MMPROJ_FILE: &str = "mmproj-F16.gguf";
+const QWEN35_08B_MMPROJ_ESTIMATED_BYTES: u64 = 204_987_232;
+const QWEN35_2B_MMPROJ_ESTIMATED_BYTES: u64 = 668_227_264;
+const QWEN35_4B_MMPROJ_ESTIMATED_BYTES: u64 = 672_423_616;
+const QWEN35_9B_MMPROJ_ESTIMATED_BYTES: u64 = 672_423_616;
+
+fn qwen35_mmproj_estimated_bytes(variant: ModelVariant) -> Option<u64> {
+    match variant {
+        ModelVariant::Qwen3508B => Some(QWEN35_08B_MMPROJ_ESTIMATED_BYTES),
+        ModelVariant::Qwen352B => Some(QWEN35_2B_MMPROJ_ESTIMATED_BYTES),
+        ModelVariant::Qwen354B => Some(QWEN35_4B_MMPROJ_ESTIMATED_BYTES),
+        // The 9B projector is not bundled locally in this workspace, so keep the
+        // offline fallback aligned with the observed 4B projector footprint until
+        // the Hugging Face tree can provide an exact size.
+        ModelVariant::Qwen359B => Some(QWEN35_9B_MMPROJ_ESTIMATED_BYTES),
+        _ => None,
+    }
+}
 
 fn qwen_chat_gguf_filename(variant: ModelVariant) -> Option<&'static str> {
     match variant {
@@ -1398,7 +1415,11 @@ impl ModelDownloader {
     /// Get estimated size for a single file (fallback when HEAD fails)
     fn get_single_file_size_estimate(&self, variant: ModelVariant, file: &str) -> u64 {
         if file.ends_with(".gguf") {
-            if file.contains("Qwen3-0.6B") {
+            if (file == QWEN35_MMPROJ_FILE || file.starts_with("mmproj-"))
+                && is_qwen35_chat_variant(variant)
+            {
+                qwen35_mmproj_estimated_bytes(variant).unwrap_or(1_000_000_000)
+            } else if file.contains("Qwen3-0.6B") {
                 1_100_000_000
             } else if file.contains("Qwen3-1.7B") {
                 2_400_000_000
@@ -1585,5 +1606,32 @@ impl ModelDownloader {
             }
         }
         Ok(size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn qwen35_mmproj_fallback_sizes_are_variant_specific() {
+        let temp_dir = std::env::temp_dir().join(format!("izwi-download-test-{}", Uuid::new_v4()));
+        let downloader = ModelDownloader::new(temp_dir.clone()).expect("create downloader");
+
+        assert_eq!(
+            downloader.get_single_file_size_estimate(ModelVariant::Qwen3508B, QWEN35_MMPROJ_FILE),
+            QWEN35_08B_MMPROJ_ESTIMATED_BYTES
+        );
+        assert_eq!(
+            downloader.get_single_file_size_estimate(ModelVariant::Qwen352B, QWEN35_MMPROJ_FILE),
+            QWEN35_2B_MMPROJ_ESTIMATED_BYTES
+        );
+        assert_eq!(
+            downloader.get_single_file_size_estimate(ModelVariant::Qwen354B, QWEN35_MMPROJ_FILE),
+            QWEN35_4B_MMPROJ_ESTIMATED_BYTES
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

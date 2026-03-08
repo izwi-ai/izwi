@@ -417,12 +417,12 @@ impl ModelVariant {
             Self::Qwen34BGguf => 2_500_000_000, // ~2.33 GB (Q4_K_M GGUF, HF file size, Feb 2026)
             Self::Qwen38BGguf => 5_200_000_000, // ~4.84 GB (Q4_K_M est)
             Self::Qwen314BGguf => 9_200_000_000, // ~8.57 GB (Q4_K_M est)
-            Self::Qwen3508B => 532_517_120,     // ~0.50 GB (Q4_K_M GGUF, Unsloth)
-            Self::Qwen352B => 1_280_835_840,    // ~1.19 GB (Q4_K_M GGUF, Unsloth)
-            Self::Qwen354B => 2_740_937_888,    // ~2.55 GB (Q4_K_M GGUF, Unsloth)
-            Self::Qwen359B => 5_680_522_464,    // ~5.29 GB (Q4_K_M GGUF, Unsloth)
-            Self::Gemma31BIt => 2_200_000_000,  // ~2.05 GB (est)
-            Self::Gemma34BIt => 8_600_000_000,  // ~8.01 GB (est)
+            Self::Qwen3508B => 750_391_993,     // ~0.70 GB (GGUF + mmproj + tokenizer assets)
+            Self::Qwen352B => 1_961_951_854,    // ~1.83 GB (GGUF + mmproj + tokenizer assets)
+            Self::Qwen354B => 3_426_265_102,    // ~3.19 GB (GGUF + mmproj + tokenizer assets)
+            Self::Qwen359B => 6_365_849_678, // ~5.93 GB (GGUF + projected mmproj/tokenizer assets)
+            Self::Gemma31BIt => 2_200_000_000, // ~2.05 GB (est)
+            Self::Gemma34BIt => 8_600_000_000, // ~8.01 GB (est)
             Self::Qwen3ForcedAligner06B => 1_840_072_459, // ~1.71 GB
             Self::Qwen3ForcedAligner06B4Bit => 703_200_000, // ~0.65 GB
             Self::VoxtralMini4BRealtime2602 => 8_000_000_000, // ~7.45 GB (est)
@@ -858,6 +858,25 @@ mod tests {
         assert_eq!(variant.tts_max_output_frames_hint(), None);
         assert_eq!(variant.tts_output_frame_rate_hz_hint(), None);
         assert_eq!(variant.tts_max_output_seconds_hint(), None);
+    }
+
+    #[test]
+    fn qwen35_estimated_sizes_include_projector_and_tokenizer_assets() {
+        assert_eq!(ModelVariant::Qwen3508B.estimated_size(), 750_391_993);
+        assert_eq!(ModelVariant::Qwen352B.estimated_size(), 1_961_951_854);
+        assert_eq!(ModelVariant::Qwen354B.estimated_size(), 3_426_265_102);
+
+        for (variant, gguf_only_bytes) in [
+            (ModelVariant::Qwen3508B, 532_517_120_u64),
+            (ModelVariant::Qwen352B, 1_280_835_840_u64),
+            (ModelVariant::Qwen354B, 2_740_937_888_u64),
+            (ModelVariant::Qwen359B, 5_680_522_464_u64),
+        ] {
+            assert!(
+                variant.estimated_size() > gguf_only_bytes,
+                "{variant:?} estimate should exceed the main GGUF size"
+            );
+        }
     }
 
     #[test]
