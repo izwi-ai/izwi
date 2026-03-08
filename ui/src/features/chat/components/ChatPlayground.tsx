@@ -1363,6 +1363,7 @@ export function ChatPlayground({
                               implicitOpenThinkTag:
                                 implicitOpenThinkTagModel &&
                                 thinkingEnabledForModel,
+                              treatNoTagAsThinking: isLastAssistant && isStreaming,
                             })
                           : null;
                       const messageKey = message.id;

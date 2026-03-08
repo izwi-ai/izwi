@@ -41,6 +41,9 @@ use crate::tokenizer::Tokenizer;
 const QWEN_VISION_START_TOKEN: &str = "<|vision_start|>";
 const QWEN_IMAGE_PAD_TOKEN: &str = "<|image_pad|>";
 const QWEN_VIDEO_PAD_TOKEN: &str = "<|video_pad|>";
+const QWEN35_GENERIC_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
+const QWEN35_THINKING_SYSTEM_PROMPT: &str = "You are a helpful assistant. Always reason inside <think>...</think> before giving the final answer. Keep thinking concise, always close </think>, then provide a clear final answer outside the tags.";
+const QWEN35_NON_THINKING_SYSTEM_PROMPT: &str = "You are a helpful assistant. Provide only the final answer and do not output <think> tags or internal reasoning.";
 
 #[derive(Debug, Clone)]
 pub struct ChatGenerationOutput {
@@ -2929,6 +2932,12 @@ struct PromptBuildOutput {
     assistant_prefix_start: usize,
 }
 
+#[derive(Clone)]
+struct PromptMessageEntry {
+    message: ChatMessage,
+    multimodal: Vec<Qwen35MultimodalInput>,
+}
+
 fn env_flag_enabled(name: &str, default: bool) -> bool {
     std::env::var(name)
         .ok()
@@ -4094,6 +4103,51 @@ fn discover_qwen35_vision_support(
     }
 }
 
+fn qwen35_structured_system_prompt(enable_thinking: bool) -> &'static str {
+    if enable_thinking {
+        QWEN35_THINKING_SYSTEM_PROMPT
+    } else {
+        QWEN35_NON_THINKING_SYSTEM_PROMPT
+    }
+}
+
+fn normalize_qwen35_system_prompt(content: Option<&str>, enable_thinking: bool) -> String {
+    let fallback = qwen35_structured_system_prompt(enable_thinking);
+    let Some(content) = content.map(str::trim).filter(|content| !content.is_empty()) else {
+        return fallback.to_string();
+    };
+
+    if content == QWEN35_GENERIC_SYSTEM_PROMPT {
+        fallback.to_string()
+    } else {
+        content.to_string()
+    }
+}
+
+fn ensure_qwen35_system_prompt(
+    prompt_messages: &mut Vec<PromptMessageEntry>,
+    enable_thinking: bool,
+) {
+    if let Some(first) = prompt_messages.first_mut() {
+        if matches!(first.message.role, ChatRole::System) {
+            first.message.content =
+                normalize_qwen35_system_prompt(Some(&first.message.content), enable_thinking);
+            return;
+        }
+    }
+
+    prompt_messages.insert(
+        0,
+        PromptMessageEntry {
+            message: ChatMessage {
+                role: ChatRole::System,
+                content: normalize_qwen35_system_prompt(None, enable_thinking),
+            },
+            multimodal: Vec::new(),
+        },
+    );
+}
+
 fn build_qwen35_prompt_ids(
     tokenizer: &ChatTokenizer,
     messages: &[ChatMessage],
@@ -4104,21 +4158,15 @@ fn build_qwen35_prompt_ids(
         ));
     }
 
-    let mut enable_thinking = None;
+    let mut requested_enable_thinking = None;
     let mut tools: Option<Vec<Value>> = None;
     let mut pending_multimodal = VecDeque::<Vec<Qwen35MultimodalInput>>::new();
     let mut prompt_messages = Vec::with_capacity(messages.len());
 
-    #[derive(Clone)]
-    struct PromptMessageEntry {
-        message: ChatMessage,
-        multimodal: Vec<Qwen35MultimodalInput>,
-    }
-
     for message in messages {
         if matches!(message.role, ChatRole::System) {
             if let Some(control) = parse_qwen35_thinking_control_content(&message.content) {
-                enable_thinking = Some(control);
+                requested_enable_thinking = Some(control);
                 continue;
             }
             if let Some(control) = parse_qwen35_tools_control_content(&message.content) {
@@ -4145,6 +4193,9 @@ fn build_qwen35_prompt_ids(
         ));
     }
 
+    let enable_thinking = qwen35_enable_thinking(tokenizer, requested_enable_thinking);
+    ensure_qwen35_system_prompt(&mut prompt_messages, enable_thinking);
+
     let mut ids = Vec::new();
     let mut multimodal = Vec::new();
     let mut consumed_first_system = false;
@@ -4166,20 +4217,6 @@ fn build_qwen35_prompt_ids(
             ids.push(tokenizer.specials.im_end);
             ids.extend(tokenizer.encode_text("\n")?);
         }
-    } else if !matches!(
-        prompt_messages.first().map(|m| &m.message.role),
-        Some(ChatRole::System)
-    ) {
-        prompt_messages.insert(
-            0,
-            PromptMessageEntry {
-                message: ChatMessage {
-                    role: ChatRole::System,
-                    content: "You are a helpful assistant.".to_string(),
-                },
-                multimodal: Vec::new(),
-            },
-        );
     }
 
     let iter_start = if consumed_first_system { 1 } else { 0 };
@@ -4211,7 +4248,7 @@ fn build_qwen35_prompt_ids(
     let assistant_prefix_start = ids.len();
     ids.push(tokenizer.specials.im_start);
     ids.extend(tokenizer.encode_text("assistant\n")?);
-    if qwen35_enable_thinking(tokenizer, enable_thinking) {
+    if enable_thinking {
         ids.extend(tokenizer.encode_text("<think>\n")?);
     } else {
         ids.extend(tokenizer.encode_text("<think>\n\n</think>\n\n")?);
@@ -5501,6 +5538,39 @@ mod tests {
             "{%- if add_generation_prompt %}{%- if enable_thinking is defined and enable_thinking is true %}<think>\\n{%- else %}<think>\\n\\n</think>\\n\\n{%- endif %}{%- endif %}",
         ));
         assert!(!behavior.default_enable_thinking);
+    }
+
+    #[test]
+    fn qwen35_system_prompt_normalization_uses_structured_fallbacks() {
+        assert_eq!(
+            normalize_qwen35_system_prompt(None, true),
+            QWEN35_THINKING_SYSTEM_PROMPT
+        );
+        assert_eq!(
+            normalize_qwen35_system_prompt(None, false),
+            QWEN35_NON_THINKING_SYSTEM_PROMPT
+        );
+    }
+
+    #[test]
+    fn qwen35_system_prompt_normalization_rewrites_generic_prompt() {
+        assert_eq!(
+            normalize_qwen35_system_prompt(Some(QWEN35_GENERIC_SYSTEM_PROMPT), true),
+            QWEN35_THINKING_SYSTEM_PROMPT
+        );
+        assert_eq!(
+            normalize_qwen35_system_prompt(Some(QWEN35_GENERIC_SYSTEM_PROMPT), false),
+            QWEN35_NON_THINKING_SYSTEM_PROMPT
+        );
+    }
+
+    #[test]
+    fn qwen35_system_prompt_normalization_preserves_custom_prompt() {
+        let custom = "Be concise and cite only verifiable facts.";
+        assert_eq!(
+            normalize_qwen35_system_prompt(Some(custom), true),
+            custom.to_string()
+        );
     }
 
     #[test]
