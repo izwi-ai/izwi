@@ -853,16 +853,20 @@ fn prepare_qwen35_full_attention_kv(
     append_to_pages(page_size, k_pages, &key_page, quantization)?;
     append_to_pages(page_size, v_pages, &value_page, quantization)?;
 
-    if seq_len == 1 && start_pos > 0 {
+    if start_pos == 0 {
+        return Ok((key.clone(), value.clone(), None));
+    }
+
+    if seq_len == 1 {
         let query_page = query.transpose(1, 2)?.contiguous()?;
         let att_out = paged_decode_attention(&query_page, k_pages, v_pages, num_heads, head_dim)?;
         let att_out = att_out.reshape((batch_size, seq_len, ()))?;
         return Ok((key.clone(), value.clone(), Some(att_out)));
     }
 
-    let key = materialize_pages(k_pages)?.transpose(1, 2)?.contiguous()?;
-    let value = materialize_pages(v_pages)?.transpose(1, 2)?.contiguous()?;
-    Ok((key, value, None))
+    let mat_key = materialize_pages(k_pages)?.transpose(1, 2)?.contiguous()?;
+    let mat_value = materialize_pages(v_pages)?.transpose(1, 2)?.contiguous()?;
+    Ok((mat_key, mat_value, None))
 }
 
 struct Qwen35RmsNorm {
@@ -2404,11 +2408,27 @@ impl Qwen35QuantizedLinearAttention {
             }
             out
         } else {
+            let (padded_qkv, pad_len) = if let Some(Some(prev)) = conv_state.as_ref().map(|s| s.as_ref()) {
+                let tail = if self.conv_kernel_size > 1 {
+                    prev.narrow(2, 1, self.conv_kernel_size - 1)?
+                } else {
+                    prev.clone()
+                };
+                let padded = Tensor::cat(&[&tail, &mixed_qkv], 2)?;
+                (padded, self.conv_kernel_size.saturating_sub(1))
+            } else {
+                (mixed_qkv.clone(), 0)
+            };
+
             if let Some(slot) = conv_state {
                 *slot = Some(self.build_conv_state(&mixed_qkv)?);
             }
-            let out = self.conv.forward(&mixed_qkv.contiguous()?)?;
-            let out = out.narrow(2, 0, seq_len)?;
+            let mut out = self.conv.forward(&padded_qkv.contiguous()?)?;
+            if pad_len > 0 {
+                out = out.narrow(2, pad_len, seq_len)?;
+            } else {
+                out = out.narrow(2, 0, seq_len)?;
+            }
             ops::silu(&out)?
         };
 
