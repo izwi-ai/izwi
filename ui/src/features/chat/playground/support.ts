@@ -3,6 +3,7 @@ import type {
   ChatThreadContentPart,
   ChatThreadMessageRecord,
 } from "@/api";
+import { API_BASE_URL } from "@/shared/config/runtime";
 
 export interface ModelOption {
   value: string;
@@ -409,6 +410,7 @@ function resolveAttachmentSource(
 
   const source = extractMarkdownImageSource(trimmed) ?? trimmed;
   const lowered = source.toLowerCase();
+  const resolvedRelativeSource = resolveRelativeSourceToApiOrigin(source);
   if (kind === "image") {
     if (lowered.startsWith("data:image/")) {
       return source;
@@ -419,7 +421,7 @@ function resolveAttachmentSource(
       lowered.startsWith("blob:") ||
       lowered.startsWith("/")
     ) {
-      return source;
+      return lowered.startsWith("/") ? resolvedRelativeSource : source;
     }
     return null;
   }
@@ -431,9 +433,22 @@ function resolveAttachmentSource(
     lowered.startsWith("blob:") ||
     lowered.startsWith("/")
   ) {
-    return source;
+    return lowered.startsWith("/") ? resolvedRelativeSource : source;
   }
   return null;
+}
+
+function resolveRelativeSourceToApiOrigin(source: string): string {
+  if (!source.startsWith("/") || typeof window === "undefined") {
+    return source;
+  }
+
+  try {
+    const apiBase = new URL(API_BASE_URL, window.location.origin);
+    return new URL(source, apiBase.origin).toString();
+  } catch {
+    return source;
+  }
 }
 
 function attachmentLabel(value: string, kind: ComposerMediaKind): string {

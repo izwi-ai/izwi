@@ -131,4 +131,41 @@ describe("chat playground support", () => {
       ],
     });
   });
+
+  it("resolves relative media URLs to the API origin for desktop-safe rendering", () => {
+    const expected = new URL(
+      "/v1/media/images/example.png",
+      window.location.origin,
+    ).toString();
+
+    expect(
+      parseUserMessageDisplayFromContentParts({
+        id: "message-2",
+        thread_id: "thread-2",
+        role: "user",
+        content: "",
+        created_at: Date.now(),
+        tokens_generated: null,
+        generation_time_ms: null,
+        content_parts: [
+          {
+            type: "input_image",
+            input_image: {
+              url: "/v1/media/images/example.png",
+              name: "example.png",
+            },
+          },
+        ],
+      }),
+    ).toEqual({
+      text: "",
+      attachments: [
+        {
+          kind: "image",
+          source: expected,
+          label: "example.png",
+        },
+      ],
+    });
+  });
 });
