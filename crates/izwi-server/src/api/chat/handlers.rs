@@ -283,6 +283,9 @@ pub async fn create_thread_message(
         messages: runtime_messages,
         max_completion_tokens: req.max_completion_tokens,
         max_tokens: req.max_tokens,
+        temperature: req.temperature,
+        top_p: req.top_p,
+        presence_penalty: None,
         correlation_id: Some(ctx.correlation_id),
     };
 

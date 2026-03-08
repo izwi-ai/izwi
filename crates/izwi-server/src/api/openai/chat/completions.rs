@@ -744,6 +744,9 @@ pub async fn completions(
         messages,
         max_completion_tokens: req.max_completion_tokens,
         max_tokens: req.max_tokens,
+        temperature: req.temperature,
+        top_p: req.top_p,
+        presence_penalty: req.presence_penalty,
         correlation_id: Some(ctx.correlation_id),
     };
 

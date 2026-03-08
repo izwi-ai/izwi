@@ -412,6 +412,9 @@ impl RequestProcessor {
             params.repetition_penalty = 1.0;
         }
 
+        // Clamp presence penalty to the OpenAI-compatible range.
+        params.presence_penalty = params.presence_penalty.clamp(-2.0, 2.0);
+
         Ok(())
     }
 }

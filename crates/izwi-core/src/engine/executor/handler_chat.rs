@@ -15,6 +15,7 @@ impl NativeExecutor {
             top_p: request.params.top_p.clamp(0.0, 1.0),
             top_k: request.params.top_k,
             repetition_penalty: request.params.repetition_penalty.max(1.0),
+            presence_penalty: request.params.presence_penalty.clamp(-2.0, 2.0),
             stop_token_ids: request.params.stop_token_ids.clone(),
             seed: Self::chat_request_seed(&request.id),
         }
@@ -221,6 +222,7 @@ mod tests {
             top_p: 0.92,
             top_k: 40,
             repetition_penalty: 1.2,
+            presence_penalty: 1.5,
             stop_token_ids: vec![7, 9],
             ..GenerationParams::default()
         };
@@ -230,6 +232,7 @@ mod tests {
         assert_eq!(config.top_p, 0.92);
         assert_eq!(config.top_k, 40);
         assert_eq!(config.repetition_penalty, 1.2);
+        assert_eq!(config.presence_penalty, 1.5);
         assert_eq!(config.stop_token_ids, vec![7, 9]);
         assert_eq!(
             config.seed,
