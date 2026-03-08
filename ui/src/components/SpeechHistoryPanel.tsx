@@ -7,7 +7,6 @@ import {
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
-  Clock3,
   Copy,
   Download,
   Loader2,
@@ -21,6 +20,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { RouteHistoryDrawer } from "@/components/RouteHistoryDrawer";
 import {
   api,
   type SpeechHistoryRecord,
@@ -35,7 +35,6 @@ interface SpeechHistoryPanelProps {
   title: string;
   emptyMessage: string;
   latestRecord?: SpeechHistoryRecord | null;
-  desktopHeightClassName?: string;
 }
 
 function formatCreatedAt(timestampMs: number): string {
@@ -132,7 +131,6 @@ export function SpeechHistoryPanel({
   title,
   emptyMessage,
   latestRecord = null,
-  desktopHeightClassName = "lg:h-[calc(100dvh-6.5rem)]",
 }: SpeechHistoryPanelProps) {
   const [records, setRecords] = useState<SpeechHistoryRecordSummary[]>([]);
   const [historyLoading, setHistoryLoading] = useState(true);
@@ -695,23 +693,11 @@ export function SpeechHistoryPanel({
 
   return (
     <>
-      <aside
-        className={cn(
-          "card app-sidebar-panel p-4 sm:p-5 h-[440px] flex flex-col overflow-hidden",
-          desktopHeightClassName,
-        )}
-      >
-        <div className="flex items-start justify-between gap-3 mb-3">
-          <div>
-            <div className="inline-flex items-center gap-2 app-sidebar-header-eyebrow">
-              <Clock3 className="w-3.5 h-3.5" />
-              History
-            </div>
-            <h3 className="app-sidebar-header-title">{title}</h3>
-            <p className="app-sidebar-header-count">
-              {records.length} {records.length === 1 ? "record" : "records"}
-            </p>
-          </div>
+      <RouteHistoryDrawer
+        title={title}
+        countLabel={`${records.length} ${records.length === 1 ? "record" : "records"}`}
+        triggerCount={records.length}
+        headerActions={
           <button
             onClick={() => void loadHistory()}
             className="btn btn-ghost app-sidebar-refresh-btn"
@@ -723,94 +709,102 @@ export function SpeechHistoryPanel({
             />
             Refresh
           </button>
-        </div>
-
-        <div className="app-sidebar-list">
-          {historyLoading ? (
-            <div className="app-sidebar-loading">
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              Loading history...
-            </div>
-          ) : records.length === 0 ? (
-            <div className="app-sidebar-empty">{emptyMessage}</div>
-          ) : (
-            <div className="flex flex-col gap-2.5">
-              {records.map((record) => {
-                const isActive = record.id === selectedRecordId;
-                return (
-                  <div
-                    key={record.id}
-                    onClick={() => openHistoryRecord(record.id)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" || event.key === " ") {
-                        event.preventDefault();
-                        openHistoryRecord(record.id);
-                      }
-                    }}
-                    role="button"
-                    tabIndex={0}
-                    className={cn(
-                      "group app-sidebar-row relative focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-                      isActive
-                        ? "app-sidebar-row-active"
-                        : "app-sidebar-row-idle",
-                    )}
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="app-sidebar-row-label truncate">
-                        {record.audio_filename ||
-                          record.model_id ||
-                          record.speaker ||
-                          "Speech generation"}
-                      </span>
-                      <div className="inline-flex items-center gap-1.5 shrink-0">
-                        <span className="app-sidebar-row-meta">
-                          {formatCreatedAt(record.created_at)}
-                        </span>
-                        <button
-                          onClick={(event) => {
+        }
+      >
+        {({ close }) => (
+          <>
+            <div className="app-sidebar-list">
+              {historyLoading ? (
+                <div className="app-sidebar-loading">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  Loading history...
+                </div>
+              ) : records.length === 0 ? (
+                <div className="app-sidebar-empty">{emptyMessage}</div>
+              ) : (
+                <div className="flex flex-col gap-2.5">
+                  {records.map((record) => {
+                    const isActive = record.id === selectedRecordId;
+                    return (
+                      <div
+                        key={record.id}
+                        onClick={() => {
+                          openHistoryRecord(record.id);
+                          close();
+                        }}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" || event.key === " ") {
                             event.preventDefault();
-                            event.stopPropagation();
-                            openDeleteRecordConfirm(record.id);
+                            openHistoryRecord(record.id);
+                            close();
+                          }
+                        }}
+                        role="button"
+                        tabIndex={0}
+                        className={cn(
+                          "group app-sidebar-row relative focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+                          isActive
+                            ? "app-sidebar-row-active"
+                            : "app-sidebar-row-idle",
+                        )}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="app-sidebar-row-label truncate">
+                            {record.audio_filename ||
+                              record.model_id ||
+                              record.speaker ||
+                              "Speech generation"}
+                          </span>
+                          <div className="inline-flex items-center gap-1.5 shrink-0">
+                            <span className="app-sidebar-row-meta">
+                              {formatCreatedAt(record.created_at)}
+                            </span>
+                            <button
+                              onClick={(event) => {
+                                event.preventDefault();
+                                event.stopPropagation();
+                                openDeleteRecordConfirm(record.id);
+                              }}
+                              className="app-sidebar-delete-btn"
+                              title="Delete record"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                        <p
+                          className="app-sidebar-row-preview"
+                          style={{
+                            display: "-webkit-box",
+                            WebkitLineClamp: 3,
+                            WebkitBoxOrient: "vertical",
+                            overflow: "hidden",
                           }}
-                          className="app-sidebar-delete-btn"
-                          title="Delete record"
                         >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                          {record.input_preview}
+                        </p>
                       </div>
-                    </div>
-                    <p
-                      className="app-sidebar-row-preview"
-                      style={{
-                        display: "-webkit-box",
-                        WebkitLineClamp: 3,
-                        WebkitBoxOrient: "vertical",
-                        overflow: "hidden",
-                      }}
-                    >
-                      {record.input_preview}
-                    </p>
-                  </div>
-                );
-              })}
+                    );
+                  })}
+                </div>
+              )}
             </div>
-          )}
-        </div>
 
-        <AnimatePresence>
-          {historyError && (
-            <motion.div
-              initial={{ opacity: 0, height: 0 }}
-              animate={{ opacity: 1, height: "auto" }}
-              exit={{ opacity: 0, height: 0 }}
-              className="p-2 rounded border text-xs mt-2 bg-[var(--danger-bg)] border-[var(--danger-border)] text-[var(--danger-text)]"
-            >
-              {historyError}
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </aside>
+            <AnimatePresence>
+              {historyError && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: "auto" }}
+                  exit={{ opacity: 0, height: 0 }}
+                  className="rounded border bg-[var(--danger-bg)] p-2 text-xs text-[var(--danger-text)] border-[var(--danger-border)]"
+                >
+                  {historyError}
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </>
+        )}
+      </RouteHistoryDrawer>
 
       <AnimatePresence>
         {isHistoryModalOpen && (

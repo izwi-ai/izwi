@@ -7,7 +7,6 @@ import {
   ChevronRight,
   Copy,
   Download,
-  History,
   Loader2,
   Pause,
   Play,
@@ -19,6 +18,7 @@ import {
 } from "lucide-react";
 import clsx from "clsx";
 
+import { RouteHistoryDrawer } from "@/components/RouteHistoryDrawer";
 import {
   api,
   type DiarizationRecord,
@@ -32,7 +32,6 @@ import {
 
 interface DiarizationHistoryPanelProps {
   latestRecord?: DiarizationRecord | null;
-  desktopHeightClassName?: string;
 }
 
 function formatCreatedAt(timestampMs: number): string {
@@ -102,7 +101,6 @@ function summarizeRecord(record: DiarizationRecord): DiarizationRecordSummary {
 
 export function DiarizationHistoryPanel({
   latestRecord = null,
-  desktopHeightClassName = "xl:h-full",
 }: DiarizationHistoryPanelProps) {
   const [historyRecords, setHistoryRecords] = useState<
     DiarizationRecordSummary[]
@@ -548,26 +546,11 @@ export function DiarizationHistoryPanel({
 
   return (
     <>
-      <aside
-        className={clsx(
-          "card app-sidebar-panel p-4 sm:p-5 h-[560px] flex flex-col overflow-hidden",
-          desktopHeightClassName,
-        )}
-      >
-        <div className="flex items-start justify-between gap-3 mb-3">
-          <div>
-            <div className="inline-flex items-center gap-2 app-sidebar-header-eyebrow">
-              <History className="w-3.5 h-3.5" />
-              History
-            </div>
-            <h3 className="app-sidebar-header-title">
-              Diarization History
-            </h3>
-            <p className="app-sidebar-header-count">
-              {historyRecords.length}{" "}
-              {historyRecords.length === 1 ? "record" : "records"}
-            </p>
-          </div>
+      <RouteHistoryDrawer
+        title="Diarization History"
+        countLabel={`${historyRecords.length} ${historyRecords.length === 1 ? "record" : "records"}`}
+        triggerCount={historyRecords.length}
+        headerActions={
           <button
             onClick={() => void loadHistory()}
             className="btn btn-ghost app-sidebar-refresh-btn"
@@ -579,95 +562,103 @@ export function DiarizationHistoryPanel({
             />
             Refresh
           </button>
-        </div>
-
-        <div className="app-sidebar-list">
-          {historyLoading ? (
-            <div className="app-sidebar-loading">
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              Loading history...
-            </div>
-          ) : historyRecords.length === 0 ? (
-            <div className="app-sidebar-empty">
-              No saved diarization records yet.
-            </div>
-          ) : (
-            <div className="flex flex-col gap-2.5">
-              {historyRecords.map((record) => {
-                const isActive = record.id === selectedHistoryRecordId;
-                return (
-                  <div
-                    key={record.id}
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => openHistoryRecord(record.id)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" || event.key === " ") {
-                        event.preventDefault();
-                        openHistoryRecord(record.id);
-                      }
-                    }}
-                    className={clsx(
-                      "app-sidebar-row",
-                      isActive
-                        ? "app-sidebar-row-active"
-                        : "app-sidebar-row-idle",
-                    )}
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="app-sidebar-row-label truncate">
-                        {record.audio_filename ||
-                          record.model_id ||
-                          "Diarization run"}
-                      </span>
-                      <div className="inline-flex items-center gap-1.5 shrink-0">
-                        <span className="app-sidebar-row-meta">
-                          {formatCreatedAt(record.created_at)}
-                        </span>
-                        <button
-                          onClick={(event) => {
+        }
+      >
+        {({ close }) => (
+          <>
+            <div className="app-sidebar-list">
+              {historyLoading ? (
+                <div className="app-sidebar-loading">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  Loading history...
+                </div>
+              ) : historyRecords.length === 0 ? (
+                <div className="app-sidebar-empty">
+                  No saved diarization records yet.
+                </div>
+              ) : (
+                <div className="flex flex-col gap-2.5">
+                  {historyRecords.map((record) => {
+                    const isActive = record.id === selectedHistoryRecordId;
+                    return (
+                      <div
+                        key={record.id}
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => {
+                          openHistoryRecord(record.id);
+                          close();
+                        }}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" || event.key === " ") {
                             event.preventDefault();
-                            event.stopPropagation();
-                            openDeleteRecordConfirm(record.id);
+                            openHistoryRecord(record.id);
+                            close();
+                          }
+                        }}
+                        className={clsx(
+                          "app-sidebar-row",
+                          isActive
+                            ? "app-sidebar-row-active"
+                            : "app-sidebar-row-idle",
+                        )}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="app-sidebar-row-label truncate">
+                            {record.audio_filename ||
+                              record.model_id ||
+                              "Diarization run"}
+                          </span>
+                          <div className="inline-flex items-center gap-1.5 shrink-0">
+                            <span className="app-sidebar-row-meta">
+                              {formatCreatedAt(record.created_at)}
+                            </span>
+                            <button
+                              onClick={(event) => {
+                                event.preventDefault();
+                                event.stopPropagation();
+                                openDeleteRecordConfirm(record.id);
+                              }}
+                              className="app-sidebar-delete-btn"
+                              title="Delete record"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                        <p
+                          className="app-sidebar-row-preview"
+                          style={{
+                            display: "-webkit-box",
+                            WebkitLineClamp: 3,
+                            WebkitBoxOrient: "vertical",
+                            overflow: "hidden",
                           }}
-                          className="app-sidebar-delete-btn"
-                          title="Delete record"
                         >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                          {record.transcript_preview}
+                        </p>
                       </div>
-                    </div>
-                    <p
-                      className="app-sidebar-row-preview"
-                      style={{
-                        display: "-webkit-box",
-                        WebkitLineClamp: 3,
-                        WebkitBoxOrient: "vertical",
-                        overflow: "hidden",
-                      }}
-                    >
-                      {record.transcript_preview}
-                    </p>
-                  </div>
-                );
-              })}
+                    );
+                  })}
+                </div>
+              )}
             </div>
-          )}
-        </div>
 
-        <AnimatePresence>
-          {historyError && (
-            <motion.div
-              initial={{ opacity: 0, height: 0 }}
-              animate={{ opacity: 1, height: "auto" }}
-              exit={{ opacity: 0, height: 0 }}
-              className="p-2 rounded border text-xs mt-2 bg-[var(--danger-bg)] border-[var(--danger-border)] text-[var(--danger-text)]"
-            >
-              {historyError}
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </aside>
+            <AnimatePresence>
+              {historyError && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: "auto" }}
+                  exit={{ opacity: 0, height: 0 }}
+                  className="rounded border bg-[var(--danger-bg)] p-2 text-xs text-[var(--danger-text)] border-[var(--danger-border)]"
+                >
+                  {historyError}
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </>
+        )}
+      </RouteHistoryDrawer>
 
       <AnimatePresence>
         {isHistoryModalOpen && (

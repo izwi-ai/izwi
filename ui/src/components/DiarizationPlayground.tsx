@@ -414,7 +414,7 @@ export function DiarizationPlayground({
   const hasOutput = speakerTranscript.trim().length > 0;
 
   return (
-    <div className="grid gap-4 lg:gap-6 xl:grid-cols-[340px,minmax(0,1fr),320px] xl:h-[calc(100dvh-11.75rem)]">
+    <div className="grid gap-4 lg:gap-6 xl:grid-cols-[340px,minmax(0,1fr)] xl:h-[calc(100dvh-11.75rem)]">
       <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-4 sm:p-5 space-y-4 xl:h-full xl:min-h-0 xl:overflow-y-auto">
         <div className="flex items-center justify-between gap-3">
           <div>
@@ -742,10 +742,7 @@ export function DiarizationPlayground({
         </AnimatePresence>
       </div>
 
-      <DiarizationHistoryPanel
-        latestRecord={latestRecord}
-        desktopHeightClassName="xl:h-full"
-      />
+      <DiarizationHistoryPanel latestRecord={latestRecord} />
     </div>
   );
 }

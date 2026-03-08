@@ -28,6 +28,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { RouteHistoryDrawer } from "@/components/RouteHistoryDrawer";
 import {
   LANGUAGE_OPTIONS,
   LIVE_MIC_PCM_FRAME_SIZE,
@@ -1116,7 +1117,7 @@ export function TranscriptionPlayground({
   );
 
   return (
-    <div className="grid gap-4 lg:gap-6 xl:grid-cols-[340px,minmax(0,1fr),320px] xl:h-[calc(100dvh-11.75rem)]">
+    <div className="grid gap-4 lg:gap-6 xl:grid-cols-[340px,minmax(0,1fr)] xl:h-[calc(100dvh-11.75rem)]">
       <div className="rounded-xl border border-[var(--border-muted)] bg-card text-card-foreground shadow-sm p-4 sm:p-5 space-y-4 xl:h-full xl:min-h-0 xl:overflow-y-auto">
         <div className="flex items-center justify-between gap-3">
           <div>
@@ -1415,19 +1416,11 @@ export function TranscriptionPlayground({
         </AnimatePresence>
       </div>
 
-      <aside className="card app-sidebar-panel p-4 sm:p-5 h-[440px] xl:h-full flex flex-col overflow-hidden">
-        <div className="flex items-start justify-between gap-3 mb-3">
-          <div>
-            <div className="inline-flex items-center gap-2 app-sidebar-header-eyebrow">
-              <History className="w-3.5 h-3.5" />
-              History
-            </div>
-            <h3 className="app-sidebar-header-title">Transcriptions</h3>
-            <p className="app-sidebar-header-count">
-              {historyRecords.length}{" "}
-              {historyRecords.length === 1 ? "record" : "records"}
-            </p>
-          </div>
+      <RouteHistoryDrawer
+        title="Transcriptions"
+        countLabel={`${historyRecords.length} ${historyRecords.length === 1 ? "record" : "records"}`}
+        triggerCount={historyRecords.length}
+        headerActions={
           <button
             onClick={() => void loadHistory()}
             className="btn btn-ghost app-sidebar-refresh-btn"
@@ -1438,111 +1431,119 @@ export function TranscriptionPlayground({
               className={cn("w-4 h-4", historyLoading && "animate-spin")}
             />
           </button>
-        </div>
-
-        <div className="app-sidebar-list scrollbar-thin">
-          {historyLoading ? (
-            <div className="app-sidebar-loading">
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              Loading history...
-            </div>
-          ) : historyRecords.length === 0 ? (
-            <div className="flex flex-col items-center justify-center text-center p-6 mt-10 opacity-60">
-              <History className="w-10 h-10 mb-3 text-muted-foreground" />
-              <p className="text-sm font-medium text-muted-foreground">
-                No history yet
-              </p>
-              <p className="text-xs text-muted-foreground/70 mt-1">
-                Transcriptions will appear here
-              </p>
-            </div>
-          ) : (
-            <div className="flex flex-col gap-2.5">
-              {historyRecords.map((record) => {
-                const isActive = record.id === selectedHistoryRecordId;
-                return (
-                  <div
-                    key={record.id}
-                    onClick={() => openHistoryRecord(record.id)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" || event.key === " ") {
-                        event.preventDefault();
-                        openHistoryRecord(record.id);
-                      }
-                    }}
-                    role="button"
-                    tabIndex={0}
-                    className={cn(
-                      "group app-sidebar-row relative focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--bg-surface-1)]",
-                      isActive
-                        ? "app-sidebar-row-active"
-                        : "app-sidebar-row-idle",
-                    )}
-                  >
-                    <div className="flex items-center justify-between gap-2 mb-1.5">
-                      <span className="app-sidebar-row-label truncate font-medium group-hover:text-primary transition-colors">
-                        {record.audio_filename ||
-                          record.model_id ||
-                          "Audio input"}
-                      </span>
-                      <div className="inline-flex items-center gap-1.5 shrink-0 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
-                        <span className="app-sidebar-row-meta mr-1 group-hover:hidden hidden sm:block">
-                          {formatCreatedAt(record.created_at)}
-                        </span>
-                        <button
-                          onClick={(event) => {
+        }
+      >
+        {({ close }) => (
+          <>
+            <div className="app-sidebar-list scrollbar-thin">
+              {historyLoading ? (
+                <div className="app-sidebar-loading">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  Loading history...
+                </div>
+              ) : historyRecords.length === 0 ? (
+                <div className="flex flex-col items-center justify-center p-6 text-center opacity-60">
+                  <History className="mb-3 h-10 w-10 text-muted-foreground" />
+                  <p className="text-sm font-medium text-muted-foreground">
+                    No history yet
+                  </p>
+                  <p className="mt-1 text-xs text-muted-foreground/70">
+                    Transcriptions will appear here
+                  </p>
+                </div>
+              ) : (
+                <div className="flex flex-col gap-2.5">
+                  {historyRecords.map((record) => {
+                    const isActive = record.id === selectedHistoryRecordId;
+                    return (
+                      <div
+                        key={record.id}
+                        onClick={() => {
+                          openHistoryRecord(record.id);
+                          close();
+                        }}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" || event.key === " ") {
                             event.preventDefault();
-                            event.stopPropagation();
-                            openDeleteRecordConfirm(record.id);
+                            openHistoryRecord(record.id);
+                            close();
+                          }
+                        }}
+                        role="button"
+                        tabIndex={0}
+                        className={cn(
+                          "group app-sidebar-row relative focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--bg-surface-1)]",
+                          isActive
+                            ? "app-sidebar-row-active"
+                            : "app-sidebar-row-idle",
+                        )}
+                      >
+                        <div className="mb-1.5 flex items-center justify-between gap-2">
+                          <span className="app-sidebar-row-label truncate font-medium transition-colors group-hover:text-primary">
+                            {record.audio_filename ||
+                              record.model_id ||
+                              "Audio input"}
+                          </span>
+                          <div className="inline-flex items-center gap-1.5 shrink-0 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+                            <span className="app-sidebar-row-meta mr-1 hidden group-hover:hidden sm:block">
+                              {formatCreatedAt(record.created_at)}
+                            </span>
+                            <button
+                              onClick={(event) => {
+                                event.preventDefault();
+                                event.stopPropagation();
+                                openDeleteRecordConfirm(record.id);
+                              }}
+                              className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive focus:opacity-100"
+                              title="Delete record"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                          <span className="app-sidebar-row-meta group-hover:hidden sm:hidden">
+                            {formatCreatedAt(record.created_at)}
+                          </span>
+                        </div>
+                        <div className="mt-1 mb-1.5 flex items-center justify-between text-[10px] font-medium uppercase tracking-wide opacity-60">
+                          <span>{formatCreatedAt(record.created_at)}</span>
+                          {record.duration_secs && (
+                            <span>{formatAudioDuration(record.duration_secs)}</span>
+                          )}
+                        </div>
+                        <p
+                          className="app-sidebar-row-preview text-[13px] leading-snug"
+                          style={{
+                            display: "-webkit-box",
+                            WebkitLineClamp: 3,
+                            WebkitBoxOrient: "vertical",
+                            overflow: "hidden",
                           }}
-                          className="p-1.5 rounded-md text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors focus:opacity-100"
-                          title="Delete record"
                         >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                          {record.transcription_preview}
+                        </p>
                       </div>
-                      <span className="app-sidebar-row-meta sm:hidden group-hover:hidden">
-                        {formatCreatedAt(record.created_at)}
-                      </span>
-                    </div>
-                    <div className="flex items-center justify-between mt-1 mb-1.5 opacity-60 text-[10px] uppercase tracking-wide font-medium">
-                      <span>{formatCreatedAt(record.created_at)}</span>
-                      {record.duration_secs && (
-                        <span>{formatAudioDuration(record.duration_secs)}</span>
-                      )}
-                    </div>
-                    <p
-                      className="app-sidebar-row-preview text-[13px] leading-snug"
-                      style={{
-                        display: "-webkit-box",
-                        WebkitLineClamp: 3,
-                        WebkitBoxOrient: "vertical",
-                        overflow: "hidden",
-                      }}
-                    >
-                      {record.transcription_preview}
-                    </p>
-                  </div>
-                );
-              })}
+                    );
+                  })}
+                </div>
+              )}
             </div>
-          )}
-        </div>
 
-        <AnimatePresence>
-          {historyError && (
-            <motion.div
-              initial={{ opacity: 0, height: 0 }}
-              animate={{ opacity: 1, height: "auto" }}
-              exit={{ opacity: 0, height: 0 }}
-              className="p-3 rounded-lg border text-sm mt-4 bg-[var(--danger-bg)] border-[var(--danger-border)] text-[var(--danger-text)] flex items-start gap-2"
-            >
-              <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
-              <p>{historyError}</p>
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </aside>
+            <AnimatePresence>
+              {historyError && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: "auto" }}
+                  exit={{ opacity: 0, height: 0 }}
+                  className="mt-1 flex items-start gap-2 rounded-lg border bg-[var(--danger-bg)] p-3 text-sm text-[var(--danger-text)] border-[var(--danger-border)]"
+                >
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                  <p>{historyError}</p>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </>
+        )}
+      </RouteHistoryDrawer>
 
       <AnimatePresence>
         {isHistoryModalOpen && (

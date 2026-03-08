@@ -384,7 +384,7 @@ export function VoiceDesignPlayground({
   );
 
   return (
-    <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr),320px] items-stretch xl:h-[calc(100dvh-11.75rem)]">
+    <div className="grid gap-4 items-stretch xl:h-[calc(100dvh-11.75rem)]">
       <div className="card p-4 flex min-h-0 flex-col">
         <div className="flex-1 min-h-0 overflow-y-auto pr-1 scrollbar-thin">
           {/* Header */}
@@ -805,7 +805,6 @@ export function VoiceDesignPlayground({
         title="Voice Design History"
         emptyMessage="No saved voice design generations yet."
         latestRecord={latestRecord}
-        desktopHeightClassName="xl:h-[calc(100dvh-11.75rem)]"
       />
     </div>
   );
