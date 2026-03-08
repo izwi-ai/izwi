@@ -585,7 +585,7 @@ impl Qwen35TextConfig {
             .rope_parameters
             .as_ref()
             .and_then(|p| p.partial_rotary_factor)
-            .unwrap_or(0.25);
+            .unwrap_or(1.0);
         let mrope_section = raw
             .rope_parameters
             .as_ref()
