@@ -61,6 +61,7 @@ export interface ParsedAssistantContent {
 
 interface ParseAssistantContentOptions {
   implicitOpenThinkTag?: boolean;
+  treatNoTagAsThinking?: boolean;
 }
 
 interface ParsedUserAttachment {
@@ -94,6 +95,7 @@ export function parseAssistantContent(
   const closeTag = "</think>";
   const raw = content ?? "";
   const implicitOpenThinkTag = !!options?.implicitOpenThinkTag;
+  const treatNoTagAsThinking = options?.treatNoTagAsThinking ?? true;
   const lowered = raw.toLowerCase();
   const firstOpen = lowered.indexOf(openTag);
   const firstClose = lowered.indexOf(closeTag);
@@ -113,7 +115,12 @@ export function parseAssistantContent(
     };
   }
 
-  if (implicitOpenThinkTag && firstOpen === -1 && firstClose === -1) {
+  if (
+    implicitOpenThinkTag &&
+    treatNoTagAsThinking &&
+    firstOpen === -1 &&
+    firstClose === -1
+  ) {
     const thinking = raw.trim();
     if (thinking.length > 0) {
       return {

@@ -36,6 +36,20 @@ describe("chat playground support", () => {
     });
   });
 
+  it("treats no-tag output as final answer when implicit no-tag thinking is disabled", () => {
+    expect(
+      parseAssistantContent("Plain final answer", {
+        implicitOpenThinkTag: true,
+        treatNoTagAsThinking: false,
+      }),
+    ).toEqual({
+      thinking: "",
+      answer: "Plain final answer",
+      hasThink: false,
+      hasIncompleteThink: false,
+    });
+  });
+
   it("falls back to a default title when cleaned content is empty", () => {
     expect(displayThreadTitle("<think>hidden</think>")).toBe(
       DEFAULT_THREAD_TITLE,
