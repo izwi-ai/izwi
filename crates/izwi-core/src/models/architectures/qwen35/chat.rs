@@ -71,6 +71,7 @@ pub struct ChatDecodeStep {
 struct ChatSamplingState {
     logits_processor: LogitsProcessor,
     repetition_penalty: f32,
+    presence_penalty: f32,
     stop_token_ids: Vec<u32>,
 }
 
@@ -4514,6 +4515,7 @@ fn build_qwen35_sampling_state(config: &ChatGenerationConfig) -> ChatSamplingSta
             qwen35_sampling_strategy(config),
         ),
         repetition_penalty: config.repetition_penalty.max(1.0),
+        presence_penalty: config.presence_penalty.clamp(-2.0, 2.0),
         stop_token_ids: config.stop_token_ids.clone(),
     }
 }
@@ -4590,12 +4592,42 @@ fn apply_qwen35_repetition_penalty(
     Tensor::from_vec(values, len, device).map_err(Error::from)
 }
 
+fn apply_qwen35_presence_penalty(
+    logits: &Tensor,
+    generated: &[u32],
+    penalty: f32,
+) -> Result<Tensor> {
+    let logits = normalize_qwen35_decode_logits(logits)?;
+    if generated.is_empty() || penalty.abs() <= f32::EPSILON {
+        return Ok(logits);
+    }
+
+    let logits = logits.to_dtype(DType::F32)?;
+    let device = logits.device();
+    let len = logits.dims1()?;
+    let mut values = logits.to_vec1::<f32>()?;
+    let mut seen = std::collections::HashSet::new();
+    for &token in generated {
+        if !seen.insert(token) {
+            continue;
+        }
+        let idx = token as usize;
+        if idx >= values.len() {
+            continue;
+        }
+        values[idx] -= penalty;
+    }
+
+    Tensor::from_vec(values, len, device).map_err(Error::from)
+}
+
 fn sample_qwen35_next_token(
     logits: &Tensor,
     generated: &[u32],
     sampling: &mut ChatSamplingState,
 ) -> Result<u32> {
-    let logits = apply_qwen35_repetition_penalty(logits, generated, sampling.repetition_penalty)?;
+    let logits = apply_qwen35_presence_penalty(logits, generated, sampling.presence_penalty)?;
+    let logits = apply_qwen35_repetition_penalty(&logits, generated, sampling.repetition_penalty)?;
     sampling
         .logits_processor
         .sample(&logits)
@@ -5488,6 +5520,7 @@ mod tests {
             top_p: 0.9,
             top_k: 40,
             repetition_penalty: 1.1,
+            presence_penalty: 0.0,
             stop_token_ids: vec![11],
             seed: 7,
         };
@@ -5531,6 +5564,7 @@ mod tests {
             top_p: 0.92,
             top_k: 32,
             repetition_penalty: 1.0,
+            presence_penalty: 0.0,
             stop_token_ids: Vec::new(),
             seed: 99,
         };
@@ -5557,6 +5591,27 @@ mod tests {
             top_p: 1.0,
             top_k: 0,
             repetition_penalty: 100.0,
+            presence_penalty: 0.0,
+            stop_token_ids: Vec::new(),
+            seed: 0,
+        };
+        let mut sampling = build_qwen35_sampling_state(&config);
+
+        let next =
+            sample_qwen35_next_token(&logits, &[1], &mut sampling).expect("sample next token");
+        assert_eq!(next, 0);
+    }
+
+    #[test]
+    fn qwen35_sampling_applies_presence_penalty_before_selection() {
+        let device = candle_core::Device::Cpu;
+        let logits = Tensor::from_vec(vec![0.2f32, 1.0f32], 2, &device).expect("logits");
+        let config = ChatGenerationConfig {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            presence_penalty: 2.0,
             stop_token_ids: Vec::new(),
             seed: 0,
         };

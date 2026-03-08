@@ -60,6 +60,7 @@ impl RuntimeService {
             top_p: opts.top_p,
             top_k,
             repetition_penalty: opts.repetition_penalty,
+            presence_penalty: 0.0,
             max_tokens: if opts.max_tokens == 0 {
                 512
             } else {
@@ -101,6 +102,7 @@ impl RuntimeService {
             top_p: 1.0,
             top_k: resolved_top_k,
             repetition_penalty: 1.0,
+            presence_penalty: 0.0,
             max_tokens: 1024,
             speaker: None,
             voice: None,
@@ -137,6 +139,7 @@ impl RuntimeService {
             top_p: 1.0,
             top_k: resolved_top_k,
             repetition_penalty: 1.0,
+            presence_penalty: 0.0,
             max_tokens: 1024,
             speaker: None,
             voice: None,

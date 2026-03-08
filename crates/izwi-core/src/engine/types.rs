@@ -34,6 +34,10 @@ pub struct GenerationParams {
     #[serde(default = "default_repetition_penalty")]
     pub repetition_penalty: f32,
 
+    /// Presence penalty applied once to previously generated tokens.
+    #[serde(default)]
+    pub presence_penalty: f32,
+
     /// Maximum number of tokens to generate
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
@@ -90,6 +94,7 @@ impl Default for GenerationParams {
             top_p: default_top_p(),
             top_k: 0,
             repetition_penalty: default_repetition_penalty(),
+            presence_penalty: 0.0,
             max_tokens: default_max_tokens(),
             speaker: None,
             voice: None,

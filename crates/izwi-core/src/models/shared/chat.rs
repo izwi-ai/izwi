@@ -4,6 +4,9 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::engine::GenerationParams;
+use crate::model::ModelVariant;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChatRole {
@@ -37,6 +40,7 @@ pub struct ChatGenerationConfig {
     pub top_p: f32,
     pub top_k: usize,
     pub repetition_penalty: f32,
+    pub presence_penalty: f32,
     pub stop_token_ids: Vec<u32>,
     pub seed: u64,
 }
@@ -48,10 +52,20 @@ impl Default for ChatGenerationConfig {
             top_p: 1.0,
             top_k: 0,
             repetition_penalty: 1.0,
+            presence_penalty: 0.0,
             stop_token_ids: Vec::new(),
             seed: 0,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Qwen35SamplingDefaults {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: usize,
+    pub repetition_penalty: f32,
+    pub presence_penalty: f32,
 }
 
 const QWEN35_THINKING_CONTROL_PREFIX: &str = "__izwi_qwen35_enable_thinking=";
@@ -127,14 +141,101 @@ pub fn parse_qwen35_multimodal_control_content(
     serde_json::from_slice::<Vec<Qwen35MultimodalInput>>(&decoded).ok()
 }
 
+pub fn qwen35_effective_enable_thinking(
+    variant: ModelVariant,
+    messages: &[ChatMessage],
+) -> Option<bool> {
+    let default = match variant {
+        ModelVariant::Qwen3508B | ModelVariant::Qwen352B => false,
+        ModelVariant::Qwen354B | ModelVariant::Qwen359B => true,
+        _ => return None,
+    };
+
+    let override_value = messages.iter().filter_map(|message| {
+        if matches!(message.role, ChatRole::System) {
+            parse_qwen35_thinking_control_content(&message.content)
+        } else {
+            None
+        }
+    });
+
+    Some(override_value.last().unwrap_or(default))
+}
+
+pub fn qwen35_sampling_defaults(
+    variant: ModelVariant,
+    enable_thinking: bool,
+) -> Option<Qwen35SamplingDefaults> {
+    match variant {
+        ModelVariant::Qwen3508B | ModelVariant::Qwen352B => {
+            if enable_thinking {
+                Some(Qwen35SamplingDefaults {
+                    temperature: 1.0,
+                    top_p: 0.95,
+                    top_k: 20,
+                    repetition_penalty: 1.0,
+                    presence_penalty: 1.5,
+                })
+            } else {
+                Some(Qwen35SamplingDefaults {
+                    temperature: 1.0,
+                    top_p: 1.0,
+                    top_k: 20,
+                    repetition_penalty: 1.0,
+                    presence_penalty: 2.0,
+                })
+            }
+        }
+        ModelVariant::Qwen354B | ModelVariant::Qwen359B => {
+            if enable_thinking {
+                Some(Qwen35SamplingDefaults {
+                    temperature: 1.0,
+                    top_p: 0.95,
+                    top_k: 20,
+                    repetition_penalty: 1.0,
+                    presence_penalty: 1.5,
+                })
+            } else {
+                Some(Qwen35SamplingDefaults {
+                    temperature: 0.7,
+                    top_p: 0.8,
+                    top_k: 20,
+                    repetition_penalty: 1.0,
+                    presence_penalty: 1.5,
+                })
+            }
+        }
+        _ => None,
+    }
+}
+
+pub fn qwen35_recommended_generation_params(
+    variant: ModelVariant,
+    messages: &[ChatMessage],
+    max_tokens: usize,
+) -> Option<GenerationParams> {
+    let enable_thinking = qwen35_effective_enable_thinking(variant, messages)?;
+    let defaults = qwen35_sampling_defaults(variant, enable_thinking)?;
+    let mut params = GenerationParams::default();
+    params.temperature = defaults.temperature;
+    params.top_p = defaults.top_p;
+    params.top_k = defaults.top_k;
+    params.repetition_penalty = defaults.repetition_penalty;
+    params.presence_penalty = defaults.presence_penalty;
+    params.max_tokens = max_tokens.max(1);
+    Some(params)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         parse_qwen35_multimodal_control_content, parse_qwen35_thinking_control_content,
         parse_qwen35_tools_control_content, qwen35_multimodal_control_content,
+        qwen35_recommended_generation_params, qwen35_sampling_defaults,
         qwen35_thinking_control_content, qwen35_tools_control_content, ChatGenerationConfig,
-        Qwen35MultimodalInput, Qwen35MultimodalKind,
+        ChatMessage, ChatRole, Qwen35MultimodalInput, Qwen35MultimodalKind,
     };
+    use crate::model::ModelVariant;
     use serde_json::json;
 
     #[test]
@@ -231,7 +332,79 @@ mod tests {
         assert_eq!(config.top_p, 1.0);
         assert_eq!(config.top_k, 0);
         assert_eq!(config.repetition_penalty, 1.0);
+        assert_eq!(config.presence_penalty, 0.0);
         assert!(config.stop_token_ids.is_empty());
         assert_eq!(config.seed, 0);
+    }
+
+    #[test]
+    fn qwen35_small_model_defaults_to_non_thinking_sampling() {
+        let params = qwen35_recommended_generation_params(
+            ModelVariant::Qwen352B,
+            &[ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+            }],
+            64,
+        )
+        .expect("qwen3.5 params");
+
+        assert_eq!(params.temperature, 1.0);
+        assert_eq!(params.top_p, 1.0);
+        assert_eq!(params.top_k, 20);
+        assert_eq!(params.repetition_penalty, 1.0);
+        assert_eq!(params.presence_penalty, 2.0);
+        assert_eq!(params.max_tokens, 64);
+    }
+
+    #[test]
+    fn qwen35_large_model_defaults_to_thinking_sampling() {
+        let params = qwen35_recommended_generation_params(
+            ModelVariant::Qwen354B,
+            &[ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+            }],
+            32,
+        )
+        .expect("qwen3.5 params");
+
+        assert_eq!(params.temperature, 1.0);
+        assert_eq!(params.top_p, 0.95);
+        assert_eq!(params.top_k, 20);
+        assert_eq!(params.repetition_penalty, 1.0);
+        assert_eq!(params.presence_penalty, 1.5);
+        assert_eq!(params.max_tokens, 32);
+    }
+
+    #[test]
+    fn qwen35_thinking_control_switches_large_model_to_non_thinking_defaults() {
+        let params = qwen35_recommended_generation_params(
+            ModelVariant::Qwen354B,
+            &[
+                ChatMessage {
+                    role: ChatRole::System,
+                    content: qwen35_thinking_control_content(false),
+                },
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: "hello".to_string(),
+                },
+            ],
+            16,
+        )
+        .expect("qwen3.5 params");
+
+        assert_eq!(params.temperature, 0.7);
+        assert_eq!(params.top_p, 0.8);
+        assert_eq!(params.top_k, 20);
+        assert_eq!(params.repetition_penalty, 1.0);
+        assert_eq!(params.presence_penalty, 1.5);
+    }
+
+    #[test]
+    fn qwen35_sampling_defaults_ignore_non_qwen35_variants() {
+        assert!(qwen35_sampling_defaults(ModelVariant::Qwen306B, false).is_none());
+        assert!(qwen35_recommended_generation_params(ModelVariant::Qwen306B, &[], 8).is_none());
     }
 }
