@@ -43,6 +43,7 @@ import {
   type ComposerMediaKind,
   type GenerateTitleArgs,
   type ImagePreviewState,
+  type ModelOption,
   buildThreadContentParts,
   buildUserDisplayContent,
   createMediaItemId,
@@ -937,6 +938,27 @@ export function ChatPlayground({
     onOpenModelManager();
   };
 
+  const getStatusToneClassName = (option: ModelOption): string => {
+    if (option.isReady) {
+      return "chat-model-status-ready";
+    }
+
+    const normalizedStatus = option.statusLabel.toLowerCase();
+
+    if (
+      normalizedStatus.includes("downloading") ||
+      normalizedStatus.includes("loading")
+    ) {
+      return "chat-model-status-loading";
+    }
+
+    if (normalizedStatus.includes("error")) {
+      return "chat-model-status-error";
+    }
+
+    return "chat-model-status-idle";
+  };
+
   const renderModelSelector = (
     placement: "composer" | "header" = "composer",
   ) => (
@@ -953,14 +975,21 @@ export function ChatPlayground({
         variant="outline"
         onClick={() => setIsModelMenuOpen((previous) => !previous)}
         className={cn(
-          "w-full justify-between font-normal h-9",
-          selectedOption?.isReady ? "border-primary/20 bg-primary/5" : "",
+          "h-9 w-full justify-between rounded-lg border px-3 text-xs font-medium shadow-none",
+          selectedOption?.isReady
+            ? "chat-model-selector-btn-ready"
+            : "chat-model-selector-btn-idle",
         )}
       >
         <span className="flex-1 min-w-0 truncate text-left">
           {selectedOption?.label || "Select model"}
         </span>
-        <ChevronDown className="w-3.5 h-3.5 shrink-0 opacity-50" />
+        <ChevronDown
+          className={cn(
+            "w-3.5 h-3.5 shrink-0 opacity-50 transition-transform",
+            isModelMenuOpen && "rotate-180",
+          )}
+        />
       </Button>
 
       <AnimatePresence>
@@ -971,11 +1000,11 @@ export function ChatPlayground({
             exit={{ opacity: 0, y: 6, scale: 0.98 }}
             transition={{ duration: 0.16 }}
             className={cn(
-              "absolute left-0 right-0 rounded-md border bg-popover text-popover-foreground p-1 shadow-md z-[90]",
-              placement === "header" ? "top-11" : "bottom-11",
+              "chat-model-menu absolute left-0 right-0 z-[90] rounded-xl border p-1.5 shadow-2xl",
+              placement === "header" ? "top-full mt-2" : "bottom-11",
             )}
           >
-            <div className="max-h-64 overflow-y-auto">
+            <div className="max-h-64 space-y-0.5 overflow-y-auto pr-1">
               {modelOptions.map((option) => (
                 <button
                   key={option.value}
@@ -984,21 +1013,21 @@ export function ChatPlayground({
                     setIsModelMenuOpen(false);
                   }}
                   className={cn(
-                    "relative flex w-full cursor-default select-none items-center rounded-sm py-1.5 px-2 text-sm outline-none transition-colors hover:bg-accent hover:text-accent-foreground focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
+                    "relative flex w-full cursor-default select-none items-center rounded-lg border px-3 py-2 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/45 focus-visible:ring-offset-2 focus-visible:ring-offset-background",
                     selectedOption?.value === option.value &&
-                      "bg-accent text-accent-foreground",
+                      "chat-model-option-active",
+                    selectedOption?.value !== option.value &&
+                      "chat-model-option-idle",
                   )}
                 >
-                  <div className="flex flex-col items-start min-w-0">
-                    <span className="truncate w-full text-left font-medium">
+                  <div className="flex min-w-0 w-full flex-col items-start">
+                    <span className="chat-model-option-label w-full truncate text-left font-medium">
                       {option.label}
                     </span>
                     <span
                       className={cn(
-                        "mt-1 text-[10px] uppercase tracking-wider font-semibold",
-                        option.isReady
-                          ? "text-green-500"
-                          : "text-muted-foreground",
+                        "mt-1 inline-flex items-center rounded-sm border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider",
+                        getStatusToneClassName(option),
                       )}
                     >
                       {option.statusLabel}
@@ -1016,8 +1045,10 @@ export function ChatPlayground({
   const renderComposer = (centered = false) => (
     <div
       className={cn(
-        "relative rounded-xl border border-[var(--border-muted)] bg-background shadow-sm overflow-visible",
-        centered && "max-w-3xl mx-auto shadow-md",
+        "chat-composer-body relative overflow-visible rounded-xl border shadow-sm",
+        centered
+          ? "chat-composer-shell-centered mx-auto max-w-3xl shadow-md"
+          : "chat-composer-shell-docked",
       )}
     >
       {mediaItems.length > 0 && (
@@ -1106,7 +1137,7 @@ export function ChatPlayground({
                 ? "Model selected but not loaded. Open Models to load it."
                 : "Ask anything..."
         }
-        className="w-full resize-none bg-transparent px-4 pt-4 pb-3 text-[0.9375rem] focus:outline-none placeholder:text-[var(--text-muted)]"
+        className="chat-composer-input w-full resize-none bg-transparent px-4 pt-4 pb-3 text-[0.9375rem] focus:outline-none placeholder:text-[var(--text-muted)]"
         disabled={isStreaming || isPreparingThread}
       />
 
@@ -1132,34 +1163,40 @@ export function ChatPlayground({
                 ? "Attach image or video"
                 : "Image/video upload is available only for Qwen3.5 models"
             }
-            className="h-8 w-8 rounded-full border-border/70 text-muted-foreground hover:text-foreground"
+            className="h-8 w-8 rounded-full border-[var(--border-muted)] bg-[var(--bg-surface-2)] text-[var(--text-muted)] shadow-none hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-3)] hover:text-[var(--text-primary)]"
           >
             <Plus className="w-4 h-4" />
           </Button>
           <Button
-            variant="ghost"
+            variant="outline"
             size="sm"
             onClick={handleOpenModels}
-            className="h-8 gap-1.5 text-xs text-muted-foreground hover:text-foreground"
+            className="chat-models-button h-8 gap-1.5 border text-xs shadow-none"
           >
             <Settings2 className="w-3.5 h-3.5" />
             Models
           </Button>
           {supportsThinking && (
             <Button
-              variant={thinkingEnabledForModel ? "secondary" : "ghost"}
+              variant="outline"
               size="sm"
               onClick={() => setIsThinkingEnabled((previous) => !previous)}
               disabled={isStreaming || isPreparingThread}
               className={cn(
-                "h-8 gap-1.5 text-xs",
-                !thinkingEnabledForModel &&
-                  "text-muted-foreground hover:text-foreground",
+                "h-8 gap-1.5 border text-xs shadow-none",
+                thinkingEnabledForModel
+                  ? "chat-thinking-mode-btn-on"
+                  : "chat-thinking-mode-btn-off",
               )}
               title={
                 thinkingEnabledForModel
                   ? "Thinking mode is enabled"
                   : "Thinking mode is disabled"
+              }
+              aria-label={
+                thinkingEnabledForModel
+                  ? "Disable thinking mode"
+                  : "Enable thinking mode"
               }
             >
               <Brain className="w-3.5 h-3.5" />
@@ -1176,8 +1213,25 @@ export function ChatPlayground({
               (!isStreaming && !input.trim() && mediaItems.length === 0)
             }
             variant={isStreaming ? "destructive" : "default"}
-            size="sm"
-            className="h-9 gap-1.5 font-medium px-4"
+            size="icon"
+            title={
+              isStreaming
+                ? "Cancel response"
+                : isPreparingThread
+                  ? "Starting chat"
+                  : "Send message"
+            }
+            aria-label={
+              isStreaming
+                ? "Cancel response"
+                : isPreparingThread
+                  ? "Starting chat"
+                  : "Send message"
+            }
+            className={cn(
+              "h-9 w-9 shrink-0",
+              !isStreaming && "chat-send-button shadow-none",
+            )}
           >
             {isStreaming ? (
               <Square className="w-3.5 h-3.5" />
@@ -1186,11 +1240,6 @@ export function ChatPlayground({
             ) : (
               <Send className="w-3.5 h-3.5" />
             )}
-            {isStreaming
-              ? "Cancel"
-              : isPreparingThread
-                ? "Starting..."
-                : "Send"}
           </Button>
         </div>
       </div>
@@ -1208,8 +1257,8 @@ export function ChatPlayground({
         onChange={handleSelectMedia}
         className="hidden"
       />
-      <div className="mb-0 flex items-center gap-3 overflow-x-auto pb-1">
-        <div className="min-w-[220px] flex-1">
+      <div className="mb-0 flex flex-wrap items-center justify-between gap-3">
+        <div className="min-w-[220px] max-w-full flex-1 sm:max-w-[320px]">
           {renderModelSelector("header")}
         </div>
 
@@ -1222,11 +1271,11 @@ export function ChatPlayground({
                 type="button"
                 variant="outline"
                 size="sm"
-                className="h-9 gap-2 rounded-lg"
+                className="h-9 gap-2 rounded-lg border-[var(--border-muted)] bg-[var(--bg-surface-2)] text-[var(--text-secondary)] shadow-none hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-3)] hover:text-[var(--text-primary)]"
               >
                 <History className="h-4 w-4" />
                 <span>History</span>
-                <span className="inline-flex min-w-5 items-center justify-center rounded-full border border-border/70 bg-primary/10 px-1.5 py-0.5 text-[10px] font-semibold text-foreground">
+                <span className="inline-flex min-w-5 items-center justify-center rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-3)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--text-primary)]">
                   {historyBadgeLabel}
                 </span>
               </Button>
@@ -1335,7 +1384,7 @@ export function ChatPlayground({
           <Button
             type="button"
             size="sm"
-            className="h-9 gap-2 rounded-lg"
+            className="h-9 gap-2 rounded-lg bg-[var(--accent-solid)] text-[var(--text-on-accent)] shadow-none hover:opacity-90"
             onClick={() => void handleCreateThread()}
             disabled={isEmptyChatWorkspace || isStreaming || isPreparingThread}
           >
