@@ -1,5 +1,5 @@
 import type { ModelInfo } from "@/api";
-import { PageHeader, PageShell } from "@/components/PageShell";
+import { PageShell } from "@/components/PageShell";
 import { VIEW_CONFIGS } from "@/types";
 import { ChatPlayground } from "@/features/chat/components/ChatPlayground";
 import {
@@ -76,11 +76,7 @@ export function ChatPage({
   });
 
   return (
-    <PageShell>
-      <PageHeader
-        title="Chat"
-        description="Run local text conversations with selectable reasoning-capable models."
-      />
+    <PageShell className="flex min-h-0 flex-col">
       <ChatPlayground
         selectedModel={resolvedSelectedModel}
         selectedModelReady={selectedModelReady}

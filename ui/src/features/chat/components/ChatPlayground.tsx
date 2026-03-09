@@ -10,6 +10,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import {
   Bot,
   Brain,
+  History,
   Send,
   Square,
   User,
@@ -21,7 +22,6 @@ import {
   Trash2,
   AlertTriangle,
   MessageSquare,
-  Paperclip,
   ImageIcon,
   Film,
   X,
@@ -30,6 +30,7 @@ import { useSearchParams } from "react-router-dom";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { RouteHistoryDrawer } from "@/components/RouteHistoryDrawer";
+import { PageHeader } from "@/components/PageShell";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import {
   DEFAULT_SYSTEM_PROMPT,
@@ -148,6 +149,12 @@ export function ChatPlayground({
     () => messages.filter((message) => message.role !== "system"),
     [messages],
   );
+  const historyBadgeLabel = useMemo(() => {
+    if (threads.length > 99) {
+      return "99+";
+    }
+    return String(Math.max(0, threads.length));
+  }, [threads.length]);
 
   const hasConversation =
     !!activeThreadId &&
@@ -470,7 +477,7 @@ export function ChatPlayground({
   }, [refreshThreadList]);
 
   const handleCreateThread = useCallback(async () => {
-    if (isStreaming) {
+    if (isStreaming || isPreparingThread) {
       return;
     }
 
@@ -489,7 +496,13 @@ export function ChatPlayground({
     } catch (createError) {
       setError(getErrorMessage(createError, "Failed to create a new chat."));
     }
-  }, [clearMediaItems, isStreaming, selectedModel, setActiveThreadInUrl]);
+  }, [
+    clearMediaItems,
+    isPreparingThread,
+    isStreaming,
+    selectedModel,
+    setActiveThreadInUrl,
+  ]);
 
   const openDeleteThreadConfirm = useCallback((threadId: string) => {
     setDeleteTargetThreadId(threadId);
@@ -1067,8 +1080,8 @@ export function ChatPlayground({
       <div className="flex flex-wrap items-center justify-between gap-2 px-3 pb-3 pt-1 border-t border-[var(--border-muted)]/30 mt-1">
         <div className="flex items-center gap-2 flex-wrap">
           <Button
-            variant="ghost"
-            size="sm"
+            variant="outline"
+            size="icon"
             onClick={() => mediaInputRef.current?.click()}
             disabled={
               isStreaming ||
@@ -1076,15 +1089,19 @@ export function ChatPlayground({
               mediaItems.length >= MAX_MEDIA_ATTACHMENTS ||
               !selectedModelSupportsMedia
             }
-            className="h-8 gap-1.5 text-xs text-muted-foreground hover:text-foreground"
             title={
               selectedModelSupportsMedia
                 ? "Attach image or video"
                 : "Image/video upload is available only for Qwen3.5 models"
             }
+            aria-label={
+              selectedModelSupportsMedia
+                ? "Attach image or video"
+                : "Image/video upload is available only for Qwen3.5 models"
+            }
+            className="h-8 w-8 rounded-full border-border/70 text-muted-foreground hover:text-foreground"
           >
-            <Paperclip className="w-3.5 h-3.5" />
-            Add Media
+            <Plus className="w-4 h-4" />
           </Button>
           <Button
             variant="ghost"
@@ -1150,7 +1167,7 @@ export function ChatPlayground({
   );
 
   return (
-    <div className="relative flex flex-col gap-4 h-[calc(100dvh-12rem)] lg:h-[calc(100dvh-11.75rem)]">
+    <div className="flex min-h-0 flex-1 flex-col gap-4">
       <input
         ref={mediaInputRef}
         type="file"
@@ -1160,125 +1177,146 @@ export function ChatPlayground({
         onChange={handleSelectMedia}
         className="hidden"
       />
-      <RouteHistoryDrawer
-        title="Chat History"
-        countLabel={`${threads.length} ${threads.length === 1 ? "thread" : "threads"}`}
-        triggerCount={threads.length}
-        headerActions={({ close }) => (
-          <button
-            onClick={() => {
-              handleCreateThread();
-              close();
-            }}
-            disabled={isStreaming || isPreparingThread}
-            className="btn btn-ghost app-sidebar-refresh-btn"
-          >
-            <Plus className="w-3.5 h-3.5" />
-            New
-          </button>
-        )}
-      >
-        {({ close }) => (
-          <div className="app-sidebar-list">
-            {threadsLoading ? (
-              <div className="app-sidebar-loading">
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                Loading chats...
-              </div>
-            ) : threads.length === 0 ? (
-              <div className="app-sidebar-empty">
-                No chats yet. Create one to begin.
-              </div>
-            ) : (
-              <div className="flex flex-col gap-2.5">
-                {threads.map((thread) => {
-                  const isActive = thread.id === activeThreadId;
-                  const preview = threadPreviewFromContent(
-                    thread.last_message_preview,
-                  );
+      <PageHeader
+        title="Chat"
+        description="Run local text conversations with selectable reasoning-capable models."
+        className="mb-0 flex-row flex-wrap items-start justify-between gap-3"
+        actions={
+          <div className="flex flex-wrap items-center gap-2">
+            <RouteHistoryDrawer
+              title="Chat History"
+              countLabel={`${threads.length} ${threads.length === 1 ? "thread" : "threads"}`}
+              trigger={
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-9 gap-2 rounded-lg"
+                >
+                  <History className="h-4 w-4" />
+                  <span>History</span>
+                  <span className="inline-flex min-w-5 items-center justify-center rounded-full border border-border/70 bg-primary/10 px-1.5 py-0.5 text-[10px] font-semibold text-foreground">
+                    {historyBadgeLabel}
+                  </span>
+                </Button>
+              }
+            >
+              {({ close }) => (
+                <div className="app-sidebar-list">
+                  {threadsLoading ? (
+                    <div className="app-sidebar-loading">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      Loading chats...
+                    </div>
+                  ) : threads.length === 0 ? (
+                    <div className="app-sidebar-empty">
+                      No chats yet. Create one to begin.
+                    </div>
+                  ) : (
+                    <div className="flex flex-col gap-2.5">
+                      {threads.map((thread) => {
+                        const isActive = thread.id === activeThreadId;
+                        const preview = threadPreviewFromContent(
+                          thread.last_message_preview,
+                        );
 
-                  return (
-                    <div
-                      key={thread.id}
-                      role="button"
-                      tabIndex={0}
-                      onClick={() => {
-                        if (isStreaming || isPreparingThread) {
-                          return;
-                        }
-                        setActiveThreadInUrl(thread.id);
-                        setError(null);
-                        close();
-                      }}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter" || event.key === " ") {
-                          event.preventDefault();
-                          if (isStreaming || isPreparingThread) {
-                            return;
-                          }
-                          setActiveThreadInUrl(thread.id);
-                          setError(null);
-                          close();
-                        }
-                      }}
-                      className={cn(
-                        "group app-sidebar-row",
-                        isActive
-                          ? "app-sidebar-row-active"
-                          : "app-sidebar-row-idle",
-                        (isStreaming || isPreparingThread) && "opacity-70",
-                      )}
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <p className="app-sidebar-row-label truncate">
-                          {displayThreadTitle(thread.title)}
-                        </p>
-                        <div className="inline-flex items-center gap-1.5 shrink-0">
-                          <span className="app-sidebar-row-meta">
-                            {formatThreadTimestamp(thread.updated_at)}
-                          </span>
-                          <button
-                            onClick={(event) => {
-                              event.preventDefault();
-                              event.stopPropagation();
+                        return (
+                          <div
+                            key={thread.id}
+                            role="button"
+                            tabIndex={0}
+                            onClick={() => {
                               if (isStreaming || isPreparingThread) {
                                 return;
                               }
-                              openDeleteThreadConfirm(thread.id);
+                              setActiveThreadInUrl(thread.id);
+                              setError(null);
+                              close();
                             }}
-                            disabled={isStreaming || isPreparingThread}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter" || event.key === " ") {
+                                event.preventDefault();
+                                if (isStreaming || isPreparingThread) {
+                                  return;
+                                }
+                                setActiveThreadInUrl(thread.id);
+                                setError(null);
+                                close();
+                              }
+                            }}
                             className={cn(
-                              "app-sidebar-delete-btn",
+                              "group app-sidebar-row",
+                              isActive
+                                ? "app-sidebar-row-active"
+                                : "app-sidebar-row-idle",
                               (isStreaming || isPreparingThread) &&
-                                "opacity-50",
+                                "opacity-70",
                             )}
-                            title="Delete chat"
                           >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
-                      </div>
-                      <p
-                        className="app-sidebar-row-preview"
-                        style={{
-                          display: "-webkit-box",
-                          WebkitLineClamp: 3,
-                          WebkitBoxOrient: "vertical",
-                          overflow: "hidden",
-                        }}
-                      >
-                        {preview}
-                      </p>
+                            <div className="flex items-center justify-between gap-2">
+                              <p className="app-sidebar-row-label truncate">
+                                {displayThreadTitle(thread.title)}
+                              </p>
+                              <div className="inline-flex items-center gap-1.5 shrink-0">
+                                <span className="app-sidebar-row-meta">
+                                  {formatThreadTimestamp(thread.updated_at)}
+                                </span>
+                                <button
+                                  onClick={(event) => {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+                                    if (isStreaming || isPreparingThread) {
+                                      return;
+                                    }
+                                    openDeleteThreadConfirm(thread.id);
+                                  }}
+                                  disabled={isStreaming || isPreparingThread}
+                                  className={cn(
+                                    "app-sidebar-delete-btn",
+                                    (isStreaming || isPreparingThread) &&
+                                      "opacity-50",
+                                  )}
+                                  title="Delete chat"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            </div>
+                            <p
+                              className="app-sidebar-row-preview"
+                              style={{
+                                display: "-webkit-box",
+                                WebkitLineClamp: 3,
+                                WebkitBoxOrient: "vertical",
+                                overflow: "hidden",
+                              }}
+                            >
+                              {preview}
+                            </p>
+                          </div>
+                        );
+                      })}
                     </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-        )}
-      </RouteHistoryDrawer>
+                  )}
+                </div>
+              )}
+            </RouteHistoryDrawer>
 
-      <div className="relative flex-1 min-h-0 flex flex-col">
+            <Button
+              type="button"
+              size="sm"
+              className="h-9 gap-2 rounded-lg"
+              onClick={() => void handleCreateThread()}
+              disabled={isStreaming || isPreparingThread}
+            >
+              <Plus className="h-4 w-4" />
+              New chat
+            </Button>
+          </div>
+        }
+      />
+
+      <div className="relative flex min-h-0 flex-1 flex-col">
         {!hasConversation ? (
           <div className="relative flex-1 flex items-center justify-center px-1 sm:px-4">
             <div className="w-full max-w-3xl">

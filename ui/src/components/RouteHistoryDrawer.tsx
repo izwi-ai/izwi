@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useMemo, useState, type ReactElement, type ReactNode } from "react";
 import { History, type LucideIcon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
@@ -23,6 +23,7 @@ interface RouteHistoryDrawerProps {
   headerIcon?: LucideIcon;
   triggerLabel?: string;
   triggerCount?: number;
+  trigger?: ReactElement;
   headerActions?: ReactNode | ((controls: RouteHistoryDrawerControls) => ReactNode);
   children: ReactNode | ((controls: RouteHistoryDrawerControls) => ReactNode);
   bodyClassName?: string;
@@ -35,6 +36,7 @@ export function RouteHistoryDrawer({
   headerIcon: HeaderIcon = History,
   triggerLabel = "History",
   triggerCount,
+  trigger,
   headerActions,
   children,
   bodyClassName,
@@ -61,25 +63,29 @@ export function RouteHistoryDrawer({
   return (
     <Sheet open={open} onOpenChange={setOpen}>
       <SheetTrigger asChild>
-        <Button
-          type="button"
-          variant="outline"
-          className={cn(
-            "fixed bottom-4 right-4 z-30 h-11 rounded-full border-border/80 bg-background/94 px-4 shadow-lg backdrop-blur-xl hover:bg-background sm:bottom-6 sm:right-6",
-            "lg:bottom-auto lg:top-1/2 lg:right-0 lg:h-auto lg:w-14 lg:-translate-y-1/2 lg:flex-col lg:gap-3 lg:rounded-l-2xl lg:rounded-r-none lg:px-2 lg:py-4",
-          )}
-        >
-          <History className="h-4 w-4 shrink-0" />
-          <span className="text-xs font-semibold lg:hidden">{triggerLabel}</span>
-          <span className="hidden text-[10px] font-semibold uppercase tracking-[0.2em] lg:block [writing-mode:vertical-rl] rotate-180">
-            {triggerLabel}
-          </span>
-          {triggerBadge ? (
-            <span className="inline-flex min-w-5 items-center justify-center rounded-full border border-border/70 bg-primary/10 px-1.5 py-0.5 text-[10px] font-semibold text-foreground">
-              {triggerBadge}
+        {trigger ?? (
+          <Button
+            type="button"
+            variant="outline"
+            className={cn(
+              "fixed bottom-4 right-4 z-30 h-11 rounded-full border-border/80 bg-background/94 px-4 shadow-lg backdrop-blur-xl hover:bg-background sm:bottom-6 sm:right-6",
+              "lg:bottom-auto lg:top-1/2 lg:right-0 lg:h-auto lg:w-14 lg:-translate-y-1/2 lg:flex-col lg:gap-3 lg:rounded-l-2xl lg:rounded-r-none lg:px-2 lg:py-4",
+            )}
+          >
+            <History className="h-4 w-4 shrink-0" />
+            <span className="text-xs font-semibold lg:hidden">
+              {triggerLabel}
             </span>
-          ) : null}
-        </Button>
+            <span className="hidden text-[10px] font-semibold uppercase tracking-[0.2em] lg:block [writing-mode:vertical-rl] rotate-180">
+              {triggerLabel}
+            </span>
+            {triggerBadge ? (
+              <span className="inline-flex min-w-5 items-center justify-center rounded-full border border-border/70 bg-primary/10 px-1.5 py-0.5 text-[10px] font-semibold text-foreground">
+                {triggerBadge}
+              </span>
+            ) : null}
+          </Button>
+        )}
       </SheetTrigger>
 
       <SheetContent
