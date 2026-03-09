@@ -30,7 +30,6 @@ import { useSearchParams } from "react-router-dom";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { RouteHistoryDrawer } from "@/components/RouteHistoryDrawer";
-import { PageHeader } from "@/components/PageShell";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import {
   DEFAULT_SYSTEM_PROMPT,
@@ -160,6 +159,7 @@ export function ChatPlayground({
   const hasConversation =
     !!activeThreadId &&
     (visibleMessages.length > 0 || isStreaming || messagesLoading);
+  const isEmptyChatWorkspace = !hasConversation;
   const thinkingEnabledForModel = supportsThinking && isThinkingEnabled;
   const selectedModelSupportsMedia = isQwen35ChatModel(selectedModel);
   const renderModelId = activeThread?.model_id ?? selectedModel;
@@ -343,6 +343,24 @@ export function ChatPlayground({
   }, [isStreaming, messages]);
 
   useEffect(() => {
+    if (!textareaRef.current) {
+      return;
+    }
+
+    const minHeight = hasConversation ? 72 : 88;
+    const maxHeight = hasConversation ? 104 : 140;
+
+    textareaRef.current.style.height = "0px";
+    const nextHeight = Math.min(
+      maxHeight,
+      Math.max(textareaRef.current.scrollHeight, minHeight),
+    );
+    textareaRef.current.style.height = `${nextHeight}px`;
+    textareaRef.current.style.overflowY =
+      textareaRef.current.scrollHeight > maxHeight ? "auto" : "hidden";
+  }, [hasConversation, input]);
+
+  useEffect(() => {
     const onPointerDown = (event: MouseEvent) => {
       if (
         modelMenuRef.current &&
@@ -486,7 +504,7 @@ export function ChatPlayground({
   }, [refreshThreadList]);
 
   const handleCreateThread = useCallback(async () => {
-    if (isStreaming || isPreparingThread) {
+    if (isEmptyChatWorkspace || isStreaming || isPreparingThread) {
       return;
     }
 
@@ -507,6 +525,7 @@ export function ChatPlayground({
     }
   }, [
     clearMediaItems,
+    isEmptyChatWorkspace,
     isPreparingThread,
     isStreaming,
     selectedModel,
@@ -918,10 +937,15 @@ export function ChatPlayground({
     onOpenModelManager();
   };
 
-  const renderModelSelector = () => (
+  const renderModelSelector = (
+    placement: "composer" | "header" = "composer",
+  ) => (
     <div
       className={cn(
-        "relative z-40 inline-block w-[240px] sm:w-[300px] max-w-[calc(100vw-9rem)]",
+        "relative z-40 inline-block",
+        placement === "header"
+          ? "w-full max-w-full sm:w-[320px]"
+          : "w-[240px] max-w-[calc(100vw-9rem)] sm:w-[300px]",
       )}
       ref={modelMenuRef}
     >
@@ -946,7 +970,10 @@ export function ChatPlayground({
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: 6, scale: 0.98 }}
             transition={{ duration: 0.16 }}
-            className="absolute left-0 right-0 bottom-11 rounded-md border bg-popover text-popover-foreground p-1 shadow-md z-[90]"
+            className={cn(
+              "absolute left-0 right-0 rounded-md border bg-popover text-popover-foreground p-1 shadow-md z-[90]",
+              placement === "header" ? "top-11" : "bottom-11",
+            )}
           >
             <div className="max-h-64 overflow-y-auto">
               {modelOptions.map((option) => (
@@ -1079,10 +1106,7 @@ export function ChatPlayground({
                 ? "Model selected but not loaded. Open Models to load it."
                 : "Ask anything..."
         }
-        className={cn(
-          "w-full bg-transparent px-4 pt-4 pb-3 text-[0.9375rem] resize-none focus:outline-none placeholder:text-[var(--text-muted)]",
-          centered ? "min-h-[140px]" : "min-h-[104px]",
-        )}
+        className="w-full resize-none bg-transparent px-4 pt-4 pb-3 text-[0.9375rem] focus:outline-none placeholder:text-[var(--text-muted)]"
         disabled={isStreaming || isPreparingThread}
       />
 
@@ -1145,8 +1169,6 @@ export function ChatPlayground({
         </div>
 
         <div className="flex items-center gap-2 w-full sm:w-auto justify-end flex-wrap sm:flex-nowrap">
-          {renderModelSelector()}
-
           <Button
             onClick={isStreaming ? stopStreaming : () => void sendMessage()}
             disabled={
@@ -1186,144 +1208,147 @@ export function ChatPlayground({
         onChange={handleSelectMedia}
         className="hidden"
       />
-      <PageHeader
-        title="Chat"
-        description="Run local text conversations with selectable reasoning-capable models."
-        className="mb-0 flex-row flex-wrap items-start justify-between gap-3"
-        actions={
-          <div className="flex flex-wrap items-center gap-2">
-            <RouteHistoryDrawer
-              title="Chat History"
-              countLabel={`${threads.length} ${threads.length === 1 ? "thread" : "threads"}`}
-              trigger={
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className="h-9 gap-2 rounded-lg"
-                >
-                  <History className="h-4 w-4" />
-                  <span>History</span>
-                  <span className="inline-flex min-w-5 items-center justify-center rounded-full border border-border/70 bg-primary/10 px-1.5 py-0.5 text-[10px] font-semibold text-foreground">
-                    {historyBadgeLabel}
-                  </span>
-                </Button>
-              }
-            >
-              {({ close }) => (
-                <div className="app-sidebar-list">
-                  {threadsLoading ? (
-                    <div className="app-sidebar-loading">
-                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      Loading chats...
-                    </div>
-                  ) : threads.length === 0 ? (
-                    <div className="app-sidebar-empty">
-                      No chats yet. Create one to begin.
-                    </div>
-                  ) : (
-                    <div className="flex flex-col gap-2.5">
-                      {threads.map((thread) => {
-                        const isActive = thread.id === activeThreadId;
-                        const preview = threadPreviewFromContent(
-                          thread.last_message_preview,
-                        );
+      <div className="mb-0 flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <h1 className="app-page-title text-[var(--text-primary)] tracking-tight">
+            Chat
+          </h1>
+          <div className="mt-3 max-w-full sm:max-w-[320px]">
+            {renderModelSelector("header")}
+          </div>
+        </div>
 
-                        return (
-                          <div
-                            key={thread.id}
-                            role="button"
-                            tabIndex={0}
-                            onClick={() => {
+        <div className="flex shrink-0 flex-wrap items-center gap-2 pt-1">
+          <RouteHistoryDrawer
+            title="Chat History"
+            countLabel={`${threads.length} ${threads.length === 1 ? "thread" : "threads"}`}
+            trigger={
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-9 gap-2 rounded-lg"
+              >
+                <History className="h-4 w-4" />
+                <span>History</span>
+                <span className="inline-flex min-w-5 items-center justify-center rounded-full border border-border/70 bg-primary/10 px-1.5 py-0.5 text-[10px] font-semibold text-foreground">
+                  {historyBadgeLabel}
+                </span>
+              </Button>
+            }
+          >
+            {({ close }) => (
+              <div className="app-sidebar-list">
+                {threadsLoading ? (
+                  <div className="app-sidebar-loading">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    Loading chats...
+                  </div>
+                ) : threads.length === 0 ? (
+                  <div className="app-sidebar-empty">
+                    No chats yet. Create one to begin.
+                  </div>
+                ) : (
+                  <div className="flex flex-col gap-2.5">
+                    {threads.map((thread) => {
+                      const isActive = thread.id === activeThreadId;
+                      const preview = threadPreviewFromContent(
+                        thread.last_message_preview,
+                      );
+
+                      return (
+                        <div
+                          key={thread.id}
+                          role="button"
+                          tabIndex={0}
+                          onClick={() => {
+                            if (isStreaming || isPreparingThread) {
+                              return;
+                            }
+                            setActiveThreadInUrl(thread.id);
+                            setError(null);
+                            close();
+                          }}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" || event.key === " ") {
+                              event.preventDefault();
                               if (isStreaming || isPreparingThread) {
                                 return;
                               }
                               setActiveThreadInUrl(thread.id);
                               setError(null);
                               close();
-                            }}
-                            onKeyDown={(event) => {
-                              if (event.key === "Enter" || event.key === " ") {
-                                event.preventDefault();
-                                if (isStreaming || isPreparingThread) {
-                                  return;
-                                }
-                                setActiveThreadInUrl(thread.id);
-                                setError(null);
-                                close();
-                              }
-                            }}
-                            className={cn(
-                              "group app-sidebar-row",
-                              isActive
-                                ? "app-sidebar-row-active"
-                                : "app-sidebar-row-idle",
-                              (isStreaming || isPreparingThread) &&
-                                "opacity-70",
-                            )}
-                          >
-                            <div className="flex items-center justify-between gap-2">
-                              <p className="app-sidebar-row-label truncate">
-                                {displayThreadTitle(thread.title)}
-                              </p>
-                              <div className="inline-flex items-center gap-1.5 shrink-0">
-                                <span className="app-sidebar-row-meta">
-                                  {formatThreadTimestamp(thread.updated_at)}
-                                </span>
-                                <button
-                                  onClick={(event) => {
-                                    event.preventDefault();
-                                    event.stopPropagation();
-                                    if (isStreaming || isPreparingThread) {
-                                      return;
-                                    }
-                                    openDeleteThreadConfirm(thread.id);
-                                  }}
-                                  disabled={isStreaming || isPreparingThread}
-                                  className={cn(
-                                    "app-sidebar-delete-btn",
-                                    (isStreaming || isPreparingThread) &&
-                                      "opacity-50",
-                                  )}
-                                  title="Delete chat"
-                                >
-                                  <Trash2 className="w-3.5 h-3.5" />
-                                </button>
-                              </div>
-                            </div>
-                            <p
-                              className="app-sidebar-row-preview"
-                              style={{
-                                display: "-webkit-box",
-                                WebkitLineClamp: 3,
-                                WebkitBoxOrient: "vertical",
-                                overflow: "hidden",
-                              }}
-                            >
-                              {preview}
+                            }
+                          }}
+                          className={cn(
+                            "group app-sidebar-row",
+                            isActive
+                              ? "app-sidebar-row-active"
+                              : "app-sidebar-row-idle",
+                            (isStreaming || isPreparingThread) && "opacity-70",
+                          )}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <p className="app-sidebar-row-label truncate">
+                              {displayThreadTitle(thread.title)}
                             </p>
+                            <div className="inline-flex items-center gap-1.5 shrink-0">
+                              <span className="app-sidebar-row-meta">
+                                {formatThreadTimestamp(thread.updated_at)}
+                              </span>
+                              <button
+                                onClick={(event) => {
+                                  event.preventDefault();
+                                  event.stopPropagation();
+                                  if (isStreaming || isPreparingThread) {
+                                    return;
+                                  }
+                                  openDeleteThreadConfirm(thread.id);
+                                }}
+                                disabled={isStreaming || isPreparingThread}
+                                className={cn(
+                                  "app-sidebar-delete-btn",
+                                  (isStreaming || isPreparingThread) &&
+                                    "opacity-50",
+                                )}
+                                title="Delete chat"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
                           </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              )}
-            </RouteHistoryDrawer>
+                          <p
+                            className="app-sidebar-row-preview"
+                            style={{
+                              display: "-webkit-box",
+                              WebkitLineClamp: 3,
+                              WebkitBoxOrient: "vertical",
+                              overflow: "hidden",
+                            }}
+                          >
+                            {preview}
+                          </p>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+          </RouteHistoryDrawer>
 
-            <Button
-              type="button"
-              size="sm"
-              className="h-9 gap-2 rounded-lg"
-              onClick={() => void handleCreateThread()}
-              disabled={isStreaming || isPreparingThread}
-            >
-              <Plus className="h-4 w-4" />
-              New chat
-            </Button>
-          </div>
-        }
-      />
+          <Button
+            type="button"
+            size="sm"
+            className="h-9 gap-2 rounded-lg"
+            onClick={() => void handleCreateThread()}
+            disabled={isEmptyChatWorkspace || isStreaming || isPreparingThread}
+          >
+            <Plus className="h-4 w-4" />
+            New chat
+          </Button>
+        </div>
+      </div>
 
       <div className="relative flex min-h-0 flex-1 flex-col">
         {!hasConversation ? (
