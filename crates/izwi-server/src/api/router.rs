@@ -1,13 +1,15 @@
-use axum::{extract::Request, middleware, Router};
+use axum::{extract::Request, http::HeaderValue, middleware, Router};
+use izwi_core::ServeRuntimeConfig;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
-use tracing::info_span;
+use tracing::{info_span, warn};
 
 use crate::api::request_context::attach_request_context;
 use crate::state::AppState;
 
 /// Create the main API router.
-pub fn create_router(state: AppState) -> Router {
+pub fn create_router(state: AppState, serve_config: &ServeRuntimeConfig) -> Router {
     let trace_layer = TraceLayer::new_for_http().make_span_with(|request: &Request| {
         let request_id = request
             .headers()
@@ -35,24 +37,198 @@ pub fn create_router(state: AppState) -> Router {
         .merge(crate::api::openai::router())
         .merge(crate::api::admin::router());
 
-    // Get UI directory from environment or use default relative path
-    let ui_dir = std::env::var("IZWI_UI_DIR").unwrap_or_else(|_| "ui/dist".to_string());
-    let index_path = format!("{}/index.html", ui_dir);
+    let app = Router::new().nest("/v1", v1_routes).with_state(state);
 
-    Router::new()
-        .nest("/v1", v1_routes)
-        // Serve static files for UI
-        .fallback_service(
-            tower_http::services::ServeDir::new(&ui_dir)
-                .fallback(tower_http::services::ServeFile::new(&index_path)),
-        )
+    apply_runtime_contract(app, serve_config)
         .layer(trace_layer)
         .layer(middleware::from_fn(attach_request_context))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
+}
+
+fn apply_runtime_contract(mut app: Router, serve_config: &ServeRuntimeConfig) -> Router {
+    if serve_config.ui_enabled {
+        let index_path = serve_config.ui_dir.join("index.html");
+        app = app.fallback_service(
+            ServeDir::new(serve_config.ui_dir.clone()).fallback(ServeFile::new(index_path)),
+        );
+    }
+
+    if let Some(cors_layer) = build_cors_layer(serve_config) {
+        app = app.layer(cors_layer);
+    }
+
+    app
+}
+
+fn build_cors_layer(serve_config: &ServeRuntimeConfig) -> Option<CorsLayer> {
+    if !serve_config.cors_enabled {
+        return None;
+    }
+
+    let layer = CorsLayer::new().allow_methods(Any).allow_headers(Any);
+    if serve_config.cors_origins.is_empty()
+        || serve_config.cors_origins.iter().any(|origin| origin == "*")
+    {
+        return Some(layer.allow_origin(Any));
+    }
+
+    let allowed_origins: Vec<HeaderValue> = serve_config
+        .cors_origins
+        .iter()
+        .filter_map(|origin| match HeaderValue::from_str(origin) {
+            Ok(value) => Some(value),
+            Err(_) => {
+                warn!("Ignoring invalid CORS origin '{}'", origin);
+                None
+            }
+        })
+        .collect();
+
+    if allowed_origins.is_empty() {
+        warn!("CORS is enabled but no valid origins were configured; disabling CORS");
+        None
+    } else {
+        Some(layer.allow_origin(allowed_origins))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{header, Method, Request, StatusCode},
+        response::Response,
+        routing::get,
+    };
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tower::Service;
+
+    #[tokio::test]
+    async fn enabled_wildcard_cors_adds_allow_origin_header() {
+        let app = apply_runtime_contract(
+            Router::new().route("/hello", get(|| async { "ok" })),
+            &ServeRuntimeConfig {
+                cors_enabled: true,
+                cors_origins: vec!["*".to_string()],
+                ..ServeRuntimeConfig::default()
+            },
+        );
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .method(Method::GET)
+                .uri("/hello")
+                .header(header::ORIGIN, "http://localhost:3000")
+                .body(Body::empty())
+                .expect("request should build"),
         )
-        .with_state(state)
+        .await;
+
+        assert_eq!(
+            response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static("*"))
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_cors_emits_no_allow_origin_header() {
+        let app = apply_runtime_contract(
+            Router::new().route("/hello", get(|| async { "ok" })),
+            &ServeRuntimeConfig {
+                cors_enabled: false,
+                ..ServeRuntimeConfig::default()
+            },
+        );
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .method(Method::GET)
+                .uri("/hello")
+                .header(header::ORIGIN, "http://localhost:3000")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await;
+
+        assert!(response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn enabled_ui_serves_index_as_fallback() {
+        let ui_dir = test_ui_dir("enabled_ui_serves_index_as_fallback");
+        std::fs::create_dir_all(&ui_dir).expect("ui dir should be created");
+        std::fs::write(ui_dir.join("index.html"), "<html>ui</html>")
+            .expect("index should be written");
+
+        let app = apply_runtime_contract(
+            Router::new().route("/hello", get(|| async { "ok" })),
+            &ServeRuntimeConfig {
+                ui_enabled: true,
+                ui_dir: ui_dir.clone(),
+                ..ServeRuntimeConfig::default()
+            },
+        );
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri("/missing")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        assert_eq!(body, "<html>ui</html>");
+
+        std::fs::remove_dir_all(ui_dir).expect("ui dir should be removed");
+    }
+
+    #[tokio::test]
+    async fn disabled_ui_returns_not_found_for_unknown_routes() {
+        let app = apply_runtime_contract(
+            Router::new().route("/hello", get(|| async { "ok" })),
+            &ServeRuntimeConfig {
+                ui_enabled: false,
+                ..ServeRuntimeConfig::default()
+            },
+        );
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .uri("/missing")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn send_request(mut app: Router, request: Request<Body>) -> Response {
+        app.as_service::<Body>()
+            .call(request)
+            .await
+            .expect("request should succeed")
+    }
+
+    fn test_ui_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+
+        std::env::temp_dir().join(format!("izwi-router-{name}-{nanos}"))
+    }
 }

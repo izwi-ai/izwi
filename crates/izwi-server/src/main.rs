@@ -91,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
     info!("Runtime service initialized");
 
     // Build router
-    let app = api::create_router(state.clone());
+    let app = api::create_router(state.clone(), &serve_config);
 
     // Start server
     let bind = BindConfig {
@@ -196,6 +196,10 @@ mod tests {
         std::env::remove_var("IZWI_NUM_THREADS");
         std::env::remove_var("IZWI_MAX_CONCURRENT");
         std::env::remove_var("IZWI_TIMEOUT");
+        std::env::remove_var("IZWI_CORS");
+        std::env::remove_var("IZWI_CORS_ORIGINS");
+        std::env::remove_var("IZWI_NO_UI");
+        std::env::remove_var("IZWI_UI_DIR");
         std::env::remove_var("MAX_CONCURRENT_REQUESTS");
         std::env::remove_var("REQUEST_TIMEOUT_SECS");
     }
@@ -318,6 +322,33 @@ mod tests {
 
         assert_eq!(resolved.max_concurrent_requests, 45);
         assert_eq!(resolved.request_timeout_secs, 721);
+        clear_bind_env();
+    }
+
+    #[test]
+    fn ui_and_cors_env_values_flow_into_serve_config() {
+        let _guard = env_lock();
+        clear_bind_env();
+        std::env::set_var("IZWI_CORS", "1");
+        std::env::set_var(
+            "IZWI_CORS_ORIGINS",
+            "http://localhost:3000,https://example.com",
+        );
+        std::env::set_var("IZWI_NO_UI", "1");
+        std::env::set_var("IZWI_UI_DIR", "/tmp/izwi-ui");
+
+        let resolved = resolve_serve_runtime_config(&parse(&["izwi-server"]));
+
+        assert!(resolved.cors_enabled);
+        assert_eq!(
+            resolved.cors_origins,
+            vec![
+                "http://localhost:3000".to_string(),
+                "https://example.com".to_string()
+            ]
+        );
+        assert!(!resolved.ui_enabled);
+        assert_eq!(resolved.ui_dir, std::path::PathBuf::from("/tmp/izwi-ui"));
         clear_bind_env();
     }
 }

@@ -192,7 +192,7 @@ fn default_request_timeout_secs() -> u64 {
 }
 
 fn default_cors_enabled() -> bool {
-    true
+    false
 }
 
 fn default_cors_origins() -> Vec<String> {

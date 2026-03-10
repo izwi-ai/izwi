@@ -54,6 +54,7 @@ pub async fn execute(args: ServeArgs) -> Result<()> {
     let connect_host = server_connect_host(&args.host);
     let api_endpoint = format!("http://{}:{}/v1", connect_host, args.port);
     let web_ui = format!("http://{}:{}", connect_host, args.port);
+    let browser_target = browser_target(&connect_host, args.port, args.no_ui);
 
     match &args.mode {
         ServeMode::Server => {
@@ -104,19 +105,24 @@ pub async fn execute(args: ServeArgs) -> Result<()> {
             if args.no_ui {
                 eprintln!(
                     "{}",
-                    style("Web mode requested with --no-ui; opening API root instead.").yellow()
+                    style("Web mode requested with --no-ui; opening the health endpoint instead.")
+                        .yellow()
                 );
             }
 
-            println!("  Web URL:      {}", style(&web_ui).cyan());
+            println!(
+                "  {}:      {}",
+                if args.no_ui { "API URL" } else { "Web URL" },
+                style(&browser_target).cyan()
+            );
             println!("  Launching browser...");
 
-            if let Err(err) = open_in_browser(&web_ui) {
+            if let Err(err) = open_in_browser(&browser_target) {
                 eprintln!(
                     "{}",
                     style(format!(
                         "Could not launch browser automatically: {}. Open {} manually.",
-                        err, web_ui
+                        err, browser_target
                     ))
                     .yellow()
                 );
@@ -170,6 +176,10 @@ fn set_server_env(args: &ServeArgs) {
 
     if args.cors {
         std::env::set_var("IZWI_CORS", "1");
+    }
+
+    if args.no_ui {
+        std::env::set_var("IZWI_NO_UI", "1");
     }
 }
 
@@ -489,6 +499,14 @@ fn server_connect_host(host: &str) -> String {
     }
 }
 
+fn browser_target(host: &str, port: u16, no_ui: bool) -> String {
+    if no_ui {
+        format!("http://{}:{}/v1/health", host, port)
+    } else {
+        format!("http://{}:{}", host, port)
+    }
+}
+
 fn detect_platform() -> String {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
@@ -509,4 +527,65 @@ fn detect_platform() -> String {
     };
 
     format!("{}-{}{}", os, arch, feature_str)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clear_serve_env() {
+        std::env::remove_var("RUST_LOG");
+        std::env::remove_var("IZWI_HOST");
+        std::env::remove_var("IZWI_PORT");
+        std::env::remove_var("IZWI_MAX_BATCH_SIZE");
+        std::env::remove_var("IZWI_MAX_CONCURRENT");
+        std::env::remove_var("IZWI_TIMEOUT");
+        std::env::remove_var("IZWI_SERVE_MODE");
+        std::env::remove_var("IZWI_BACKEND");
+        std::env::remove_var("IZWI_NUM_THREADS");
+        std::env::remove_var("IZWI_MODELS_DIR");
+        std::env::remove_var("IZWI_CORS");
+        std::env::remove_var("IZWI_NO_UI");
+    }
+
+    fn sample_args() -> ServeArgs {
+        ServeArgs {
+            mode: ServeMode::Web,
+            host: "0.0.0.0".to_string(),
+            port: 8080,
+            models_dir: Some(PathBuf::from("/tmp/models")),
+            max_batch_size: 8,
+            backend: "auto".to_string(),
+            threads: Some(4),
+            max_concurrent: 100,
+            timeout: 300,
+            log_level: "info".to_string(),
+            dev: false,
+            cors: true,
+            no_ui: true,
+        }
+    }
+
+    #[test]
+    fn set_server_env_sets_ui_and_cors_flags() {
+        clear_serve_env();
+
+        set_server_env(&sample_args());
+
+        assert_eq!(std::env::var("IZWI_CORS").as_deref(), Ok("1"));
+        assert_eq!(std::env::var("IZWI_NO_UI").as_deref(), Ok("1"));
+        clear_serve_env();
+    }
+
+    #[test]
+    fn browser_target_uses_health_when_ui_is_disabled() {
+        assert_eq!(
+            browser_target("127.0.0.1", 8080, true),
+            "http://127.0.0.1:8080/v1/health"
+        );
+        assert_eq!(
+            browser_target("127.0.0.1", 8080, false),
+            "http://127.0.0.1:8080"
+        );
+    }
 }
