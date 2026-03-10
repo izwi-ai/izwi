@@ -354,6 +354,8 @@ export interface DiarizationRecordSummary {
   created_at: number;
   model_id: string | null;
   speaker_count: number;
+  corrected_speaker_count?: number;
+  speaker_name_override_count?: number;
   duration_secs: number | null;
   processing_time_ms: number;
   rtf: number | null;
@@ -379,6 +381,7 @@ export interface DiarizationRecord {
   duration_secs: number | null;
   rtf: number | null;
   speaker_count: number;
+  corrected_speaker_count?: number;
   alignment_coverage: number | null;
   unattributed_words: number;
   llm_refined: boolean;
@@ -388,6 +391,7 @@ export interface DiarizationRecord {
   segments: DiarizationSegment[];
   words: DiarizationWord[];
   utterances: DiarizationUtterance[];
+  speaker_name_overrides?: Record<string, string>;
   audio_mime_type: string;
   audio_filename: string | null;
 }
@@ -405,6 +409,10 @@ export interface DiarizationRecordCreateRequest {
   min_speech_duration_ms?: number;
   min_silence_duration_ms?: number;
   enable_llm_refinement?: boolean;
+}
+
+export interface DiarizationRecordUpdateRequest {
+  speaker_name_overrides: Record<string, string>;
 }
 
 export type ASRStreamEvent =
@@ -1166,6 +1174,18 @@ export class AudioApiClient {
 
   async getDiarizationRecord(recordId: string): Promise<DiarizationRecord> {
     return this.http.request(`/diarization/records/${encodeURIComponent(recordId)}`);
+  }
+
+  async updateDiarizationRecord(
+    recordId: string,
+    request: DiarizationRecordUpdateRequest,
+  ): Promise<DiarizationRecord> {
+    return this.http.request(`/diarization/records/${encodeURIComponent(recordId)}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        speaker_name_overrides: request.speaker_name_overrides,
+      }),
+    });
   }
 
   async createDiarizationRecord(
