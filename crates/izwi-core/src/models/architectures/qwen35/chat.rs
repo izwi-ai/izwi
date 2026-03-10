@@ -2408,17 +2408,18 @@ impl Qwen35QuantizedLinearAttention {
             }
             out
         } else {
-            let (padded_qkv, pad_len) = if let Some(Some(prev)) = conv_state.as_ref().map(|s| s.as_ref()) {
-                let tail = if self.conv_kernel_size > 1 {
-                    prev.narrow(2, 1, self.conv_kernel_size - 1)?
+            let (padded_qkv, pad_len) =
+                if let Some(Some(prev)) = conv_state.as_ref().map(|s| s.as_ref()) {
+                    let tail = if self.conv_kernel_size > 1 {
+                        prev.narrow(2, 1, self.conv_kernel_size - 1)?
+                    } else {
+                        prev.clone()
+                    };
+                    let padded = Tensor::cat(&[&tail, &mixed_qkv], 2)?;
+                    (padded, self.conv_kernel_size.saturating_sub(1))
                 } else {
-                    prev.clone()
+                    (mixed_qkv.clone(), 0)
                 };
-                let padded = Tensor::cat(&[&tail, &mixed_qkv], 2)?;
-                (padded, self.conv_kernel_size.saturating_sub(1))
-            } else {
-                (mixed_qkv.clone(), 0)
-            };
 
             if let Some(slot) = conv_state {
                 *slot = Some(self.build_conv_state(&mixed_qkv)?);

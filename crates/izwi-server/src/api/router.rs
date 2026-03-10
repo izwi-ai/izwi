@@ -8,6 +8,12 @@ use tracing::{info_span, warn};
 use crate::api::request_context::attach_request_context;
 use crate::state::AppState;
 
+const DESKTOP_CORS_ORIGINS: &[&str] = &[
+    "tauri://localhost",
+    "http://tauri.localhost",
+    "https://tauri.localhost",
+];
+
 /// Create the main API router.
 pub fn create_router(state: AppState, serve_config: &ServeRuntimeConfig) -> Router {
     let trace_layer = TraceLayer::new_for_http().make_span_with(|request: &Request| {
@@ -60,31 +66,36 @@ fn apply_runtime_contract(mut app: Router, serve_config: &ServeRuntimeConfig) ->
 }
 
 fn build_cors_layer(serve_config: &ServeRuntimeConfig) -> Option<CorsLayer> {
-    if !serve_config.cors_enabled {
-        return None;
-    }
-
     let layer = CorsLayer::new().allow_methods(Any).allow_headers(Any);
-    if serve_config.cors_origins.is_empty()
-        || serve_config.cors_origins.iter().any(|origin| origin == "*")
+    if serve_config.cors_enabled
+        && (serve_config.cors_origins.is_empty()
+            || serve_config.cors_origins.iter().any(|origin| origin == "*"))
     {
         return Some(layer.allow_origin(Any));
     }
 
-    let allowed_origins: Vec<HeaderValue> = serve_config
-        .cors_origins
+    let mut allowed_origins: Vec<HeaderValue> = DESKTOP_CORS_ORIGINS
         .iter()
-        .filter_map(|origin| match HeaderValue::from_str(origin) {
-            Ok(value) => Some(value),
-            Err(_) => {
-                warn!("Ignoring invalid CORS origin '{}'", origin);
-                None
-            }
-        })
+        .map(|origin| HeaderValue::from_static(origin))
         .collect();
 
+    if serve_config.cors_enabled {
+        for origin in &serve_config.cors_origins {
+            match HeaderValue::from_str(origin) {
+                Ok(value) => {
+                    if !allowed_origins.iter().any(|existing| existing == &value) {
+                        allowed_origins.push(value);
+                    }
+                }
+                Err(_) => {
+                    warn!("Ignoring invalid CORS origin '{}'", origin);
+                }
+            }
+        }
+    }
+
     if allowed_origins.is_empty() {
-        warn!("CORS is enabled but no valid origins were configured; disabling CORS");
+        warn!("Desktop CORS allowlist is empty; disabling CORS");
         None
     } else {
         Some(layer.allow_origin(allowed_origins))
@@ -133,7 +144,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabled_cors_emits_no_allow_origin_header() {
+    async fn disabled_cors_emits_no_allow_origin_header_for_browser_origin() {
         let app = apply_runtime_contract(
             Router::new().route("/hello", get(|| async { "ok" })),
             &ServeRuntimeConfig {
@@ -157,6 +168,81 @@ mod tests {
             .headers()
             .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn disabled_cors_still_allows_desktop_origin() {
+        let app = apply_runtime_contract(
+            Router::new().route("/hello", get(|| async { "ok" })),
+            &ServeRuntimeConfig {
+                cors_enabled: false,
+                ..ServeRuntimeConfig::default()
+            },
+        );
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .method(Method::GET)
+                .uri("/hello")
+                .header(header::ORIGIN, "tauri://localhost")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await;
+
+        assert_eq!(
+            response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static("tauri://localhost"))
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_custom_cors_keeps_desktop_allowlist() {
+        let app = apply_runtime_contract(
+            Router::new().route("/hello", get(|| async { "ok" })),
+            &ServeRuntimeConfig {
+                cors_enabled: true,
+                cors_origins: vec!["http://localhost:3000".to_string()],
+                ..ServeRuntimeConfig::default()
+            },
+        );
+
+        let browser_response = send_request(
+            app.clone(),
+            Request::builder()
+                .method(Method::GET)
+                .uri("/hello")
+                .header(header::ORIGIN, "http://localhost:3000")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await;
+
+        assert_eq!(
+            browser_response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static("http://localhost:3000"))
+        );
+
+        let desktop_response = send_request(
+            app,
+            Request::builder()
+                .method(Method::GET)
+                .uri("/hello")
+                .header(header::ORIGIN, "tauri://localhost")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await;
+
+        assert_eq!(
+            desktop_response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static("tauri://localhost"))
+        );
     }
 
     #[tokio::test]
