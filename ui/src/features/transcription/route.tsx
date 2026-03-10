@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { ModelInfo } from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import { VIEW_CONFIGS } from "@/types";
@@ -45,6 +46,8 @@ export function TranscriptionPage({
   onSelect,
   onError,
 }: TranscriptionPageProps) {
+  const [historyActionContainer, setHistoryActionContainer] =
+    useState<HTMLDivElement | null>(null);
   const viewConfig = VIEW_CONFIGS.transcription;
   const {
     routeModels: transcriptionModels,
@@ -76,6 +79,13 @@ export function TranscriptionPage({
       <PageHeader
         title="Transcription"
         description="Capture audio, transcribe live, and browse saved transcription history."
+        actions={
+          <div
+            ref={setHistoryActionContainer}
+            data-testid="page-header-history-slot"
+            className="flex min-h-9 items-center"
+          />
+        }
       />
 
       <TranscriptionPlayground
@@ -88,6 +98,7 @@ export function TranscriptionPage({
           requestModel();
           onError("Select and load an ASR model to start transcribing.");
         }}
+        historyActionContainer={historyActionContainer}
       />
 
       <RouteModelModal

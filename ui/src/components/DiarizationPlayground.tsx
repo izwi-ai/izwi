@@ -43,6 +43,7 @@ interface DiarizationPlaygroundProps {
   pipelineLlmModelReady?: boolean;
   pipelineModelsReady?: boolean;
   onPipelineModelsRequired?: () => void;
+  historyActionContainer?: HTMLElement | null;
 }
 
 function encodeWavPcm16(samples: Float32Array, sampleRate: number): Blob {
@@ -168,6 +169,7 @@ export function DiarizationPlayground({
   pipelineLlmModelId = null,
   pipelineModelsReady = true,
   onPipelineModelsRequired,
+  historyActionContainer = null,
 }: DiarizationPlaygroundProps) {
   const [speakerTranscript, setSpeakerTranscript] = useState("");
   const [isRecording, setIsRecording] = useState(false);
@@ -741,8 +743,10 @@ export function DiarizationPlayground({
           )}
         </AnimatePresence>
       </div>
-
-      <DiarizationHistoryPanel latestRecord={latestRecord} />
+      <DiarizationHistoryPanel
+        latestRecord={latestRecord}
+        historyActionContainer={historyActionContainer}
+      />
     </div>
   );
 }

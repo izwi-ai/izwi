@@ -17,6 +17,7 @@ export interface TranscriptionPlaygroundProps {
   onSelectModel?: (variant: string) => void;
   onOpenModelManager?: () => void;
   onModelRequired: () => void;
+  historyActionContainer?: HTMLElement | null;
 }
 
 export interface ProcessAudioOptions {

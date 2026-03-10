@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { ModelInfo } from "@/api";
 import { CustomVoicePlayground } from "@/components/CustomVoicePlayground";
 import { PageHeader, PageShell } from "@/components/PageShell";
@@ -45,6 +46,8 @@ export function TextToSpeechPage({
   onSelect,
   onError,
 }: TextToSpeechPageProps) {
+  const [historyActionContainer, setHistoryActionContainer] =
+    useState<HTMLDivElement | null>(null);
   const viewConfig = VIEW_CONFIGS["custom-voice"];
   const {
     routeModels,
@@ -75,6 +78,13 @@ export function TextToSpeechPage({
       <PageHeader
         title="Text to Speech"
         description="Generate natural speech from text with local voice models and reusable presets."
+        actions={
+          <div
+            ref={setHistoryActionContainer}
+            data-testid="page-header-history-slot"
+            className="flex min-h-9 items-center"
+          />
+        }
       />
 
       <CustomVoicePlayground
@@ -89,6 +99,7 @@ export function TextToSpeechPage({
             "Select and load a CustomVoice, Kokoro, or LFM2.5 model to generate speech.",
           );
         }}
+        historyActionContainer={historyActionContainer}
       />
 
       <RouteModelModal

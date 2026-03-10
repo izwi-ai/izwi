@@ -35,6 +35,7 @@ interface CustomVoicePlaygroundProps {
   onSelectModel?: (variant: string) => void;
   onOpenModelManager?: () => void;
   onModelRequired: () => void;
+  historyActionContainer?: HTMLElement | null;
 }
 
 const MAX_BUFFERED_PCM_BYTES = 256 * 1024 * 1024;
@@ -147,6 +148,7 @@ export function CustomVoicePlayground({
   onSelectModel,
   onOpenModelManager,
   onModelRequired,
+  historyActionContainer = null,
 }: CustomVoicePlaygroundProps) {
   const [text, setText] = useState("");
   const [speaker, setSpeaker] = useState("Vivian");
@@ -652,7 +654,7 @@ export function CustomVoicePlayground({
               </div>
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center justify-end gap-2">
               <div className="relative w-full sm:w-auto">
                 <button
                   onClick={() => setShowSpeakerSelect(!showSpeakerSelect)}
@@ -994,6 +996,7 @@ export function CustomVoicePlayground({
         title="Speech History"
         emptyMessage="No saved text-to-speech generations yet."
         latestRecord={latestRecord}
+        historyActionContainer={historyActionContainer}
       />
     </div>
   );

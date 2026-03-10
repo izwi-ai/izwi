@@ -35,6 +35,7 @@ interface VoiceDesignPlaygroundProps {
   onSelectModel?: (variant: string) => void;
   onOpenModelManager?: () => void;
   onModelRequired: () => void;
+  historyActionContainer?: HTMLElement | null;
 }
 
 function revokeObjectUrlIfNeeded(url: string | null): void {
@@ -59,6 +60,7 @@ export function VoiceDesignPlayground({
   onSelectModel,
   onOpenModelManager,
   onModelRequired,
+  historyActionContainer = null,
 }: VoiceDesignPlaygroundProps) {
   const [text, setText] = useState("");
   const [voiceDescription, setVoiceDescription] = useState("");
@@ -400,7 +402,7 @@ export function VoiceDesignPlayground({
               </div>
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center justify-end gap-2">
               <div className="relative">
                 <button
                   onClick={() => setShowLanguageSelect(!showLanguageSelect)}
@@ -805,6 +807,7 @@ export function VoiceDesignPlayground({
         title="Voice Design History"
         emptyMessage="No saved voice design generations yet."
         latestRecord={latestRecord}
+        historyActionContainer={historyActionContainer}
       />
     </div>
   );

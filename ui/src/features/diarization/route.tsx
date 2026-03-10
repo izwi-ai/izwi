@@ -92,6 +92,8 @@ export function DiarizationPage({
   onSelect,
   onError,
 }: DiarizationPageProps) {
+  const [historyActionContainer, setHistoryActionContainer] =
+    useState<HTMLDivElement | null>(null);
   const [isModelModalOpen, setIsModelModalOpen] = useState(false);
   const [modalIntentModel, setModalIntentModel] = useState<string | null>(null);
   const [autoCloseOnIntentReady, setAutoCloseOnIntentReady] = useState(false);
@@ -361,6 +363,13 @@ export function DiarizationPage({
       <PageHeader
         title="Diarization"
         description="Separate speakers from audio streams and review timestamped transcript segments."
+        actions={
+          <div
+            ref={setHistoryActionContainer}
+            data-testid="page-header-history-slot"
+            className="flex min-h-9 items-center"
+          />
+        }
       />
 
       <DiarizationPlayground
@@ -381,6 +390,7 @@ export function DiarizationPage({
         pipelineLlmModelId={resolvedLlmModel}
         pipelineLlmModelReady={llmModelReady}
         pipelineModelsReady={pipelineModelsReady}
+        historyActionContainer={historyActionContainer}
         onPipelineModelsRequired={() => {
           openModelManagerForPipeline();
           onError("Load ASR and forced aligner models before diarization.");

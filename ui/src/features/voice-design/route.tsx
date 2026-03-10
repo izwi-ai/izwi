@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { ModelInfo } from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import { VIEW_CONFIGS } from "@/types";
@@ -45,6 +46,8 @@ export function VoiceDesignPage({
   onSelect,
   onError,
 }: VoiceDesignPageProps) {
+  const [historyActionContainer, setHistoryActionContainer] =
+    useState<HTMLDivElement | null>(null);
   const viewConfig = VIEW_CONFIGS["voice-design"];
   const {
     routeModels,
@@ -75,6 +78,13 @@ export function VoiceDesignPage({
       <PageHeader
         title="Voice Design"
         description="Design new voices from textual prompts and iterate with instant previews."
+        actions={
+          <div
+            ref={setHistoryActionContainer}
+            data-testid="page-header-history-slot"
+            className="flex min-h-9 items-center"
+          />
+        }
       />
 
       <VoiceDesignPlayground
@@ -87,6 +97,7 @@ export function VoiceDesignPage({
           requestModel();
           onError("Select and load a VoiceDesign model to continue.");
         }}
+        historyActionContainer={historyActionContainer}
       />
 
       <RouteModelModal

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, useMemo } from "react";
+import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   AlertTriangle,
@@ -28,6 +29,12 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { RouteHistoryDrawer } from "@/components/RouteHistoryDrawer";
 import {
   LANGUAGE_OPTIONS,
@@ -67,6 +74,7 @@ export function TranscriptionPlayground({
   onSelectModel,
   onOpenModelManager,
   onModelRequired,
+  historyActionContainer,
 }: TranscriptionPlaygroundProps) {
   const [transcription, setTranscription] = useState("");
   const [detectedLanguage, setDetectedLanguage] = useState<string | null>(null);
@@ -94,6 +102,7 @@ export function TranscriptionPlayground({
   const [selectedHistoryError, setSelectedHistoryError] = useState<
     string | null
   >(null);
+  const [isHistoryDrawerOpen, setIsHistoryDrawerOpen] = useState(false);
   const [isHistoryModalOpen, setIsHistoryModalOpen] = useState(false);
   const [historyCurrentTime, setHistoryCurrentTime] = useState(0);
   const [historyDuration, setHistoryDuration] = useState(0);
@@ -276,6 +285,16 @@ export function TranscriptionPlayground({
     setDeleteTargetRecordId(null);
     setDeleteRecordError(null);
   }, [deleteRecordPending]);
+
+  const handleHistoryDrawerOpenChange = useCallback(
+    (nextOpen: boolean) => {
+      if (!nextOpen && deleteTargetRecordId) {
+        return;
+      }
+      setIsHistoryDrawerOpen(nextOpen);
+    },
+    [deleteTargetRecordId],
+  );
 
   const confirmDeleteRecord = useCallback(async () => {
     if (!deleteTargetRecordId || deleteRecordPending) {
@@ -1116,6 +1135,143 @@ export function TranscriptionPlayground({
     </div>
   );
 
+  const historyDrawer = (
+    <RouteHistoryDrawer
+      title="Transcriptions"
+      countLabel={`${historyRecords.length} ${historyRecords.length === 1 ? "record" : "records"}`}
+      triggerCount={historyRecords.length}
+      open={isHistoryDrawerOpen}
+      onOpenChange={handleHistoryDrawerOpenChange}
+      headerActions={
+        <button
+          onClick={() => void loadHistory()}
+          className="btn btn-ghost app-sidebar-refresh-btn"
+          disabled={historyLoading}
+          title="Refresh history"
+        >
+          <RefreshCw
+            className={cn("w-4 h-4", historyLoading && "animate-spin")}
+          />
+        </button>
+      }
+    >
+      {({ close }) => (
+        <>
+          <div className="app-sidebar-list scrollbar-thin">
+            {historyLoading ? (
+              <div className="app-sidebar-loading">
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                Loading history...
+              </div>
+            ) : historyRecords.length === 0 ? (
+              <div className="flex flex-col items-center justify-center p-6 text-center opacity-60">
+                <History className="mb-3 h-10 w-10 text-muted-foreground" />
+                <p className="text-sm font-medium text-muted-foreground">
+                  No history yet
+                </p>
+                <p className="mt-1 text-xs text-muted-foreground/70">
+                  Transcriptions will appear here
+                </p>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-2.5">
+                {historyRecords.map((record) => {
+                  const isActive = record.id === selectedHistoryRecordId;
+                  return (
+                    <div
+                      key={record.id}
+                      onClick={() => {
+                        openHistoryRecord(record.id);
+                        close();
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          openHistoryRecord(record.id);
+                          close();
+                        }
+                      }}
+                      role="button"
+                      tabIndex={0}
+                      className={cn(
+                        "group app-sidebar-row relative focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--bg-surface-1)]",
+                        isActive
+                          ? "app-sidebar-row-active"
+                          : "app-sidebar-row-idle",
+                      )}
+                    >
+                      <div className="mb-1.5 flex items-center justify-between gap-2">
+                        <span className="app-sidebar-row-label truncate font-medium transition-colors group-hover:text-primary">
+                          {record.audio_filename ||
+                            record.model_id ||
+                            "Audio input"}
+                        </span>
+                        <div className="inline-flex items-center gap-1.5 shrink-0 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+                          <span className="app-sidebar-row-meta mr-1 hidden group-hover:hidden sm:block">
+                            {formatCreatedAt(record.created_at)}
+                          </span>
+                          <button
+                            onPointerDown={(event) => {
+                              event.stopPropagation();
+                            }}
+                            onClick={(event) => {
+                              event.preventDefault();
+                              event.stopPropagation();
+                              openDeleteRecordConfirm(record.id);
+                            }}
+                            className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive focus:opacity-100"
+                            title="Delete record"
+                            aria-label={`Delete ${record.audio_filename || record.model_id || "audio input"}`}
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                        <span className="app-sidebar-row-meta group-hover:hidden sm:hidden">
+                          {formatCreatedAt(record.created_at)}
+                        </span>
+                      </div>
+                      <div className="mt-1 mb-1.5 flex items-center justify-between text-[10px] font-medium uppercase tracking-wide opacity-60">
+                        <span>{formatCreatedAt(record.created_at)}</span>
+                        {record.duration_secs && (
+                          <span>{formatAudioDuration(record.duration_secs)}</span>
+                        )}
+                      </div>
+                      <p
+                        className="app-sidebar-row-preview text-[13px] leading-snug"
+                        style={{
+                          display: "-webkit-box",
+                          WebkitLineClamp: 3,
+                          WebkitBoxOrient: "vertical",
+                          overflow: "hidden",
+                        }}
+                      >
+                        {record.transcription_preview}
+                      </p>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          <AnimatePresence>
+            {historyError && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: "auto" }}
+                exit={{ opacity: 0, height: 0 }}
+                className="mt-1 flex items-start gap-2 rounded-lg border bg-[var(--danger-bg)] p-3 text-sm text-[var(--danger-text)] border-[var(--danger-border)]"
+              >
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                <p>{historyError}</p>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </>
+      )}
+    </RouteHistoryDrawer>
+  );
+
   return (
     <div className="grid gap-4 lg:gap-6 xl:grid-cols-[340px,minmax(0,1fr)] xl:h-[calc(100dvh-11.75rem)]">
       <div className="rounded-xl border border-[var(--border-muted)] bg-card text-card-foreground shadow-sm p-4 sm:p-5 space-y-4 xl:h-full xl:min-h-0 xl:overflow-y-auto">
@@ -1416,134 +1572,11 @@ export function TranscriptionPlayground({
         </AnimatePresence>
       </div>
 
-      <RouteHistoryDrawer
-        title="Transcriptions"
-        countLabel={`${historyRecords.length} ${historyRecords.length === 1 ? "record" : "records"}`}
-        triggerCount={historyRecords.length}
-        headerActions={
-          <button
-            onClick={() => void loadHistory()}
-            className="btn btn-ghost app-sidebar-refresh-btn"
-            disabled={historyLoading}
-            title="Refresh history"
-          >
-            <RefreshCw
-              className={cn("w-4 h-4", historyLoading && "animate-spin")}
-            />
-          </button>
-        }
-      >
-        {({ close }) => (
-          <>
-            <div className="app-sidebar-list scrollbar-thin">
-              {historyLoading ? (
-                <div className="app-sidebar-loading">
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  Loading history...
-                </div>
-              ) : historyRecords.length === 0 ? (
-                <div className="flex flex-col items-center justify-center p-6 text-center opacity-60">
-                  <History className="mb-3 h-10 w-10 text-muted-foreground" />
-                  <p className="text-sm font-medium text-muted-foreground">
-                    No history yet
-                  </p>
-                  <p className="mt-1 text-xs text-muted-foreground/70">
-                    Transcriptions will appear here
-                  </p>
-                </div>
-              ) : (
-                <div className="flex flex-col gap-2.5">
-                  {historyRecords.map((record) => {
-                    const isActive = record.id === selectedHistoryRecordId;
-                    return (
-                      <div
-                        key={record.id}
-                        onClick={() => {
-                          openHistoryRecord(record.id);
-                          close();
-                        }}
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter" || event.key === " ") {
-                            event.preventDefault();
-                            openHistoryRecord(record.id);
-                            close();
-                          }
-                        }}
-                        role="button"
-                        tabIndex={0}
-                        className={cn(
-                          "group app-sidebar-row relative focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--bg-surface-1)]",
-                          isActive
-                            ? "app-sidebar-row-active"
-                            : "app-sidebar-row-idle",
-                        )}
-                      >
-                        <div className="mb-1.5 flex items-center justify-between gap-2">
-                          <span className="app-sidebar-row-label truncate font-medium transition-colors group-hover:text-primary">
-                            {record.audio_filename ||
-                              record.model_id ||
-                              "Audio input"}
-                          </span>
-                          <div className="inline-flex items-center gap-1.5 shrink-0 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
-                            <span className="app-sidebar-row-meta mr-1 hidden group-hover:hidden sm:block">
-                              {formatCreatedAt(record.created_at)}
-                            </span>
-                            <button
-                              onClick={(event) => {
-                                event.preventDefault();
-                                event.stopPropagation();
-                                openDeleteRecordConfirm(record.id);
-                              }}
-                              className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive focus:opacity-100"
-                              title="Delete record"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
-                          <span className="app-sidebar-row-meta group-hover:hidden sm:hidden">
-                            {formatCreatedAt(record.created_at)}
-                          </span>
-                        </div>
-                        <div className="mt-1 mb-1.5 flex items-center justify-between text-[10px] font-medium uppercase tracking-wide opacity-60">
-                          <span>{formatCreatedAt(record.created_at)}</span>
-                          {record.duration_secs && (
-                            <span>{formatAudioDuration(record.duration_secs)}</span>
-                          )}
-                        </div>
-                        <p
-                          className="app-sidebar-row-preview text-[13px] leading-snug"
-                          style={{
-                            display: "-webkit-box",
-                            WebkitLineClamp: 3,
-                            WebkitBoxOrient: "vertical",
-                            overflow: "hidden",
-                          }}
-                        >
-                          {record.transcription_preview}
-                        </p>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-
-            <AnimatePresence>
-              {historyError && (
-                <motion.div
-                  initial={{ opacity: 0, height: 0 }}
-                  animate={{ opacity: 1, height: "auto" }}
-                  exit={{ opacity: 0, height: 0 }}
-                  className="mt-1 flex items-start gap-2 rounded-lg border bg-[var(--danger-bg)] p-3 text-sm text-[var(--danger-text)] border-[var(--danger-border)]"
-                >
-                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-                  <p>{historyError}</p>
-                </motion.div>
-              )}
-            </AnimatePresence>
-          </>
-        )}
-      </RouteHistoryDrawer>
+      {historyActionContainer === undefined
+        ? historyDrawer
+        : historyActionContainer
+          ? createPortal(historyDrawer, historyActionContainer)
+          : null}
 
       <AnimatePresence>
         {isHistoryModalOpen && (
@@ -1929,93 +1962,86 @@ export function TranscriptionPlayground({
         )}
       </AnimatePresence>
 
-      <AnimatePresence>
-        {deleteTargetRecord && (
-          <motion.div
-            className="fixed inset-0 z-[60] bg-black/60 p-4 backdrop-blur-sm flex items-center justify-center"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            onClick={closeDeleteRecordConfirm}
-          >
-            <motion.div
-              initial={{ y: 20, opacity: 0, scale: 0.95 }}
-              animate={{ y: 0, opacity: 1, scale: 1 }}
-              exit={{ y: 20, opacity: 0, scale: 0.95 }}
-              transition={{ type: "spring", duration: 0.4, bounce: 0.2 }}
-              className="w-full max-w-md rounded-2xl border border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-6 shadow-2xl"
-              onClick={(event) => event.stopPropagation()}
-            >
-              <div className="flex items-start gap-4">
-                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[var(--danger-bg)] text-[var(--danger-text)]">
-                  <AlertTriangle className="h-5 w-5" />
-                </div>
-                <div className="min-w-0 flex-1">
-                  <h3 className="text-base font-semibold text-[var(--text-primary)]">
-                    Delete transcription?
-                  </h3>
-                  <p className="mt-1.5 text-sm text-[var(--text-muted)] leading-relaxed">
-                    This permanently removes the saved audio and transcript from
-                    history. This action cannot be undone.
+      <Dialog
+        open={!!deleteTargetRecord}
+        onOpenChange={(open) => {
+          if (!open) {
+            closeDeleteRecordConfirm();
+          }
+        }}
+      >
+        {deleteTargetRecord ? (
+          <DialogContent className="max-w-md border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-6">
+            <DialogTitle className="sr-only">Delete transcription?</DialogTitle>
+            <div className="flex items-start gap-4">
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[var(--danger-bg)] text-[var(--danger-text)]">
+                <AlertTriangle className="h-5 w-5" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <h3 className="text-base font-semibold text-[var(--text-primary)]">
+                  Delete transcription?
+                </h3>
+                <DialogDescription className="mt-1.5 text-sm leading-relaxed text-[var(--text-muted)]">
+                  This permanently removes the saved audio and transcript from
+                  history. This action cannot be undone.
+                </DialogDescription>
+                <div className="mt-4 rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3">
+                  <p className="truncate text-xs font-medium text-[var(--text-secondary)]">
+                    {deleteTargetRecord.audio_filename ||
+                      deleteTargetRecord.model_id ||
+                      deleteTargetRecord.id}
                   </p>
-                  <div className="mt-4 rounded-lg bg-[var(--bg-surface-1)] p-3 border border-[var(--border-muted)]">
-                    <p className="truncate text-xs font-medium text-[var(--text-secondary)]">
-                      {deleteTargetRecord.audio_filename ||
-                        deleteTargetRecord.model_id ||
-                        deleteTargetRecord.id}
-                    </p>
-                  </div>
                 </div>
               </div>
+            </div>
 
-              <AnimatePresence>
-                {deleteRecordError && (
-                  <motion.div
-                    initial={{ opacity: 0, height: 0, marginTop: 0 }}
-                    animate={{ opacity: 1, height: "auto", marginTop: 16 }}
-                    exit={{ opacity: 0, height: 0, marginTop: 0 }}
-                    className="overflow-hidden"
-                  >
-                    <div className="rounded-lg border border-[var(--danger-border)] bg-[var(--danger-bg)] px-4 py-3 text-sm text-[var(--danger-text)] flex items-start gap-2">
-                      <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
-                      <p>{deleteRecordError}</p>
-                    </div>
-                  </motion.div>
+            <AnimatePresence>
+              {deleteRecordError && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0, marginTop: 0 }}
+                  animate={{ opacity: 1, height: "auto", marginTop: 16 }}
+                  exit={{ opacity: 0, height: 0, marginTop: 0 }}
+                  className="overflow-hidden"
+                >
+                  <div className="flex items-start gap-2 rounded-lg border border-[var(--danger-border)] bg-[var(--danger-bg)] px-4 py-3 text-sm text-[var(--danger-text)]">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                    <p>{deleteRecordError}</p>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            <div className="mt-6 flex items-center justify-end gap-3 border-t border-[var(--border-muted)] pt-5">
+              <Button
+                onClick={closeDeleteRecordConfirm}
+                variant="outline"
+                disabled={deleteRecordPending}
+                className="h-10 border-[var(--border-muted)]"
+              >
+                Cancel
+              </Button>
+              <Button
+                onClick={() => void confirmDeleteRecord()}
+                variant="destructive"
+                disabled={deleteRecordPending}
+                className="h-10 gap-2"
+              >
+                {deleteRecordPending ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Deleting...
+                  </>
+                ) : (
+                  <>
+                    <Trash2 className="h-4 w-4" />
+                    Delete record
+                  </>
                 )}
-              </AnimatePresence>
-
-              <div className="mt-6 pt-5 border-t border-[var(--border-muted)] flex items-center justify-end gap-3">
-                <Button
-                  onClick={closeDeleteRecordConfirm}
-                  variant="outline"
-                  disabled={deleteRecordPending}
-                  className="h-10 border-[var(--border-muted)]"
-                >
-                  Cancel
-                </Button>
-                <Button
-                  onClick={() => void confirmDeleteRecord()}
-                  variant="destructive"
-                  disabled={deleteRecordPending}
-                  className="gap-2 h-10"
-                >
-                  {deleteRecordPending ? (
-                    <>
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                      Deleting...
-                    </>
-                  ) : (
-                    <>
-                      <Trash2 className="h-4 w-4" />
-                      Delete record
-                    </>
-                  )}
-                </Button>
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+              </Button>
+            </div>
+          </DialogContent>
+        ) : null}
+      </Dialog>
     </div>
   );
 }

@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { ModelInfo } from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import { VIEW_CONFIGS } from "@/types";
@@ -45,6 +46,8 @@ export function VoiceCloningPage({
   onSelect,
   onError,
 }: VoiceCloningPageProps) {
+  const [historyActionContainer, setHistoryActionContainer] =
+    useState<HTMLDivElement | null>(null);
   const viewConfig = VIEW_CONFIGS["voice-clone"];
   const {
     routeModels,
@@ -75,6 +78,13 @@ export function VoiceCloningPage({
       <PageHeader
         title="Voice Cloning"
         description="Clone custom voices from reference audio with local model inference."
+        actions={
+          <div
+            ref={setHistoryActionContainer}
+            data-testid="page-header-history-slot"
+            className="flex min-h-9 items-center"
+          />
+        }
       />
 
       <VoiceClonePlayground
@@ -87,6 +97,7 @@ export function VoiceCloningPage({
           requestModel();
           onError("Select and load a Base model to clone voices.");
         }}
+        historyActionContainer={historyActionContainer}
       />
 
       <RouteModelModal

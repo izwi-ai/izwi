@@ -34,6 +34,7 @@ interface VoiceClonePlaygroundProps {
   onSelectModel?: (variant: string) => void;
   onOpenModelManager?: () => void;
   onModelRequired: () => void;
+  historyActionContainer?: HTMLElement | null;
 }
 
 function revokeObjectUrlIfNeeded(url: string | null): void {
@@ -58,6 +59,7 @@ export function VoiceClonePlayground({
   onSelectModel,
   onOpenModelManager,
   onModelRequired,
+  historyActionContainer = null,
 }: VoiceClonePlaygroundProps) {
   const [text, setText] = useState("");
   const [language, setLanguage] = useState("Auto");
@@ -327,7 +329,7 @@ export function VoiceClonePlayground({
               </div>
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center justify-end gap-2">
               <div className="relative w-full sm:w-auto">
                 <button
                   onClick={() => setShowLanguageSelect(!showLanguageSelect)}
@@ -611,6 +613,7 @@ export function VoiceClonePlayground({
         title="Voice Cloning History"
         emptyMessage="No saved voice-cloning generations yet."
         latestRecord={latestRecord}
+        historyActionContainer={historyActionContainer}
       />
     </div>
   );
