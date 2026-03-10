@@ -11,6 +11,7 @@ export type {
   DiarizationRecord,
   DiarizationRecordCreateRequest,
   DiarizationRecordSummary,
+  DiarizationRecordUpdateRequest,
   DiarizationRequest,
   DiarizationResponse,
   DiarizationSegment,

@@ -56,6 +56,7 @@ const audioMethodNames = [
   "asrTranscribe",
   "listDiarizationRecords",
   "getDiarizationRecord",
+  "updateDiarizationRecord",
   "createDiarizationRecord",
   "diarizationRecordAudioUrl",
   "deleteDiarizationRecord",

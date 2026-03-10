@@ -7,6 +7,7 @@ use axum::{
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use crate::diarization_store::{
@@ -29,6 +30,12 @@ pub struct DiarizationRecordListResponse {
 pub struct DeleteDiarizationRecordResponse {
     pub id: String,
     pub deleted: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateDiarizationRecordRequest {
+    #[serde(default)]
+    pub speaker_name_overrides: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default)]
@@ -135,6 +142,21 @@ pub async fn delete_record(
         id: record_id,
         deleted: true,
     }))
+}
+
+pub async fn update_record(
+    State(state): State<AppState>,
+    Path(record_id): Path<String>,
+    Json(req): Json<UpdateDiarizationRecordRequest>,
+) -> Result<Json<DiarizationRecord>, ApiError> {
+    let updated = state
+        .diarization_store
+        .update_speaker_name_overrides(record_id, req.speaker_name_overrides)
+        .await
+        .map_err(map_store_error)?;
+
+    let record = updated.ok_or_else(|| ApiError::not_found("Diarization record not found"))?;
+    Ok(Json(record))
 }
 
 pub async fn create_record(
@@ -245,6 +267,7 @@ pub async fn create_record(
                 .audio_mime_type
                 .unwrap_or_else(|| "audio/wav".to_string()),
             audio_filename: parsed.audio_filename,
+            speaker_name_overrides: BTreeMap::new(),
             audio_bytes: parsed.audio_bytes,
         })
         .await
