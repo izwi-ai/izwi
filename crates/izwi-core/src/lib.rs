@@ -36,6 +36,7 @@ pub mod model;
 mod models;
 pub mod runtime;
 pub mod runtime_models;
+pub mod serve_runtime;
 pub mod tokenizer;
 
 // Re-export main types from the new engine module
@@ -58,6 +59,7 @@ pub use runtime::{
     AudioChunk, GenerationConfig, InferenceOptions, RuntimeService, RuntimeTelemetrySnapshot,
     SpeechToSpeechGeneration,
 };
+pub use serve_runtime::{ServeRuntimeConfig, ServeRuntimeConfigOverrides};
 
 // Canonical catalog/artifact/runtime-model re-exports
 pub use artifacts::{DownloadProgress, ModelDownloader, ModelManager, ModelWeights};
