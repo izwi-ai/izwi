@@ -2,6 +2,7 @@ use crate::error::{CliError, Result};
 use crate::style::Theme;
 use crate::ServeMode;
 use console::style;
+use izwi_core::ServeRuntimeConfig;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -9,18 +10,9 @@ use std::time::{Duration, Instant};
 
 pub struct ServeArgs {
     pub mode: ServeMode,
-    pub host: String,
-    pub port: u16,
-    pub models_dir: Option<PathBuf>,
-    pub max_batch_size: usize,
-    pub backend: String,
-    pub threads: Option<usize>,
-    pub max_concurrent: usize,
-    pub timeout: u64,
+    pub runtime: ServeRuntimeConfig,
     pub log_level: String,
     pub dev: bool,
-    pub cors: bool,
-    pub no_ui: bool,
 }
 
 pub async fn execute(args: ServeArgs) -> Result<()> {
@@ -36,14 +28,15 @@ pub async fn execute(args: ServeArgs) -> Result<()> {
         "  Mode:           {}",
         style(serve_mode_label(&args.mode)).cyan()
     );
-    println!("  Host:           {}:{}", args.host, args.port);
-    if let Some(ref dir) = args.models_dir {
-        println!("  Models dir:     {}", dir.display());
-    }
-    println!("  Max batch:      {}", args.max_batch_size);
-    println!("  Max concurrent: {}", args.max_concurrent);
-    println!("  Timeout:        {}s", args.timeout);
-    println!("  Backend:        {}", args.backend);
+    println!(
+        "  Host:           {}:{}",
+        args.runtime.host, args.runtime.port
+    );
+    println!("  Models dir:     {}", args.runtime.models_dir.display());
+    println!("  Max batch:      {}", args.runtime.max_batch_size);
+    println!("  Max concurrent: {}", args.runtime.max_concurrent_requests);
+    println!("  Timeout:        {}s", args.runtime.request_timeout_secs);
+    println!("  Backend:        {}", args.runtime.backend.as_str());
     println!("  Log level:      {}", args.log_level);
 
     set_server_env(&args);
@@ -51,16 +44,16 @@ pub async fn execute(args: ServeArgs) -> Result<()> {
     println!("\n{}", style("Starting server...").bold());
     let mut server_child = spawn_server(&args)?;
 
-    let connect_host = server_connect_host(&args.host);
-    let api_endpoint = format!("http://{}:{}/v1", connect_host, args.port);
-    let web_ui = format!("http://{}:{}", connect_host, args.port);
-    let browser_target = browser_target(&connect_host, args.port, args.no_ui);
+    let connect_host = server_connect_host(&args.runtime.host);
+    let api_endpoint = format!("http://{}:{}/v1", connect_host, args.runtime.port);
+    let web_ui = format!("http://{}:{}", connect_host, args.runtime.port);
+    let browser_target = browser_target(&connect_host, args.runtime.port, !args.runtime.ui_enabled);
 
     match &args.mode {
         ServeMode::Server => {
             println!("\n{}", style("Server is running!").green().bold());
             println!("  API endpoint: {}", style(&api_endpoint).cyan());
-            if !args.no_ui {
+            if args.runtime.ui_enabled {
                 println!("  Web UI:       {}", style(&web_ui).cyan());
             }
             println!("\nPress Ctrl+C to stop the server.\n");
@@ -102,7 +95,7 @@ pub async fn execute(args: ServeArgs) -> Result<()> {
             println!("\n{}", style("Server is running!").green().bold());
             println!("  API endpoint: {}", style(&api_endpoint).cyan());
 
-            if args.no_ui {
+            if !args.runtime.ui_enabled {
                 eprintln!(
                     "{}",
                     style("Web mode requested with --no-ui; opening the health endpoint instead.")
@@ -112,7 +105,11 @@ pub async fn execute(args: ServeArgs) -> Result<()> {
 
             println!(
                 "  {}:      {}",
-                if args.no_ui { "API URL" } else { "Web URL" },
+                if args.runtime.ui_enabled {
+                    "Web URL"
+                } else {
+                    "API URL"
+                },
                 style(&browser_target).cyan()
             );
             println!("  Launching browser...");
@@ -158,29 +155,40 @@ fn serve_mode_label(mode: &ServeMode) -> &'static str {
 
 fn set_server_env(args: &ServeArgs) {
     std::env::set_var("RUST_LOG", &args.log_level);
-    std::env::set_var("IZWI_HOST", &args.host);
-    std::env::set_var("IZWI_PORT", args.port.to_string());
-    std::env::set_var("IZWI_MAX_BATCH_SIZE", args.max_batch_size.to_string());
-    std::env::set_var("IZWI_MAX_CONCURRENT", args.max_concurrent.to_string());
-    std::env::set_var("IZWI_TIMEOUT", args.timeout.to_string());
+    std::env::set_var("IZWI_HOST", &args.runtime.host);
+    std::env::set_var("IZWI_PORT", args.runtime.port.to_string());
+    std::env::set_var(
+        "IZWI_MODELS_DIR",
+        args.runtime.models_dir.to_string_lossy().to_string(),
+    );
+    std::env::set_var(
+        "IZWI_MAX_BATCH_SIZE",
+        args.runtime.max_batch_size.to_string(),
+    );
+    std::env::set_var("IZWI_BACKEND", args.runtime.backend.as_str());
+    std::env::set_var("IZWI_NUM_THREADS", args.runtime.num_threads.to_string());
+    std::env::set_var(
+        "IZWI_MAX_CONCURRENT",
+        args.runtime.max_concurrent_requests.to_string(),
+    );
+    std::env::set_var(
+        "IZWI_TIMEOUT",
+        args.runtime.request_timeout_secs.to_string(),
+    );
+    std::env::set_var(
+        "IZWI_CORS",
+        if args.runtime.cors_enabled { "1" } else { "0" },
+    );
+    std::env::set_var("IZWI_CORS_ORIGINS", args.runtime.cors_origins.join(","));
+    std::env::set_var(
+        "IZWI_NO_UI",
+        if args.runtime.ui_enabled { "0" } else { "1" },
+    );
+    std::env::set_var(
+        "IZWI_UI_DIR",
+        args.runtime.ui_dir.to_string_lossy().to_string(),
+    );
     std::env::set_var("IZWI_SERVE_MODE", serve_mode_label(&args.mode));
-    std::env::set_var("IZWI_BACKEND", args.backend.trim().to_ascii_lowercase());
-
-    if let Some(threads) = args.threads {
-        std::env::set_var("IZWI_NUM_THREADS", threads.to_string());
-    }
-
-    if let Some(ref dir) = args.models_dir {
-        std::env::set_var("IZWI_MODELS_DIR", dir.to_string_lossy().to_string());
-    }
-
-    if args.cors {
-        std::env::set_var("IZWI_CORS", "1");
-    }
-
-    if args.no_ui {
-        std::env::set_var("IZWI_NO_UI", "1");
-    }
 }
 
 fn spawn_server(args: &ServeArgs) -> Result<Child> {
@@ -532,6 +540,7 @@ fn detect_platform() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use izwi_core::backends::BackendPreference;
 
     fn clear_serve_env() {
         std::env::remove_var("RUST_LOG");
@@ -545,24 +554,30 @@ mod tests {
         std::env::remove_var("IZWI_NUM_THREADS");
         std::env::remove_var("IZWI_MODELS_DIR");
         std::env::remove_var("IZWI_CORS");
+        std::env::remove_var("IZWI_CORS_ORIGINS");
         std::env::remove_var("IZWI_NO_UI");
+        std::env::remove_var("IZWI_UI_DIR");
     }
 
     fn sample_args() -> ServeArgs {
         ServeArgs {
             mode: ServeMode::Web,
-            host: "0.0.0.0".to_string(),
-            port: 8080,
-            models_dir: Some(PathBuf::from("/tmp/models")),
-            max_batch_size: 8,
-            backend: "auto".to_string(),
-            threads: Some(4),
-            max_concurrent: 100,
-            timeout: 300,
+            runtime: ServeRuntimeConfig {
+                host: "0.0.0.0".to_string(),
+                port: 8080,
+                models_dir: PathBuf::from("/tmp/models"),
+                max_batch_size: 8,
+                backend: BackendPreference::Auto,
+                num_threads: 4,
+                max_concurrent_requests: 100,
+                request_timeout_secs: 300,
+                cors_enabled: true,
+                cors_origins: vec!["*".to_string()],
+                ui_enabled: false,
+                ui_dir: PathBuf::from("/tmp/ui"),
+            },
             log_level: "info".to_string(),
             dev: false,
-            cors: true,
-            no_ui: true,
         }
     }
 
@@ -574,6 +589,10 @@ mod tests {
 
         assert_eq!(std::env::var("IZWI_CORS").as_deref(), Ok("1"));
         assert_eq!(std::env::var("IZWI_NO_UI").as_deref(), Ok("1"));
+        assert_eq!(
+            std::env::var("IZWI_MODELS_DIR").as_deref(),
+            Ok("/tmp/models")
+        );
         clear_serve_env();
     }
 

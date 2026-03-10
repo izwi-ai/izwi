@@ -3,6 +3,8 @@ pub mod cli;
 use crate::commands;
 use crate::error::Result;
 use crate::style::Theme;
+use izwi_core::{ServeRuntimeConfig, ServeRuntimeConfigOverrides};
+use std::path::PathBuf;
 
 use self::cli::{Backend, Cli, Commands, ServeMode};
 
@@ -32,7 +34,8 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
             cors,
             no_ui,
         } => {
-            commands::serve::execute(serve_args(
+            commands::serve::execute(build_serve_args(
+                config.as_ref(),
                 mode,
                 host,
                 port,
@@ -46,7 +49,7 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
                 dev,
                 cors,
                 no_ui,
-            ))
+            )?)
             .await?;
         }
         Commands::Models { command } => {
@@ -188,62 +191,141 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
     Ok(())
 }
 
-fn serve_args(
+fn build_serve_args(
+    config_path: Option<&PathBuf>,
     mode: ServeMode,
-    host: String,
-    port: u16,
+    host: Option<String>,
+    port: Option<u16>,
     models_dir: Option<std::path::PathBuf>,
-    max_batch_size: usize,
-    backend: Backend,
+    max_batch_size: Option<usize>,
+    backend: Option<Backend>,
     threads: Option<usize>,
-    max_concurrent: usize,
-    timeout: u64,
+    max_concurrent: Option<usize>,
+    timeout: Option<u64>,
     log_level: String,
     dev: bool,
     cors: bool,
     no_ui: bool,
-) -> commands::serve::ServeArgs {
-    commands::serve::ServeArgs {
-        mode,
+) -> Result<commands::serve::ServeArgs> {
+    let cli_overrides = ServeRuntimeConfigOverrides {
         host,
         port,
         models_dir,
+        backend: backend.as_ref().map(Backend::as_preference),
         max_batch_size,
-        backend: backend.as_str().to_string(),
-        threads,
-        max_concurrent,
-        timeout,
+        num_threads: threads,
+        max_concurrent_requests: max_concurrent,
+        request_timeout_secs: timeout,
+        cors_enabled: cors.then_some(true),
+        ui_enabled: no_ui.then_some(false),
+        ..ServeRuntimeConfigOverrides::default()
+    };
+    let runtime = resolve_serve_runtime_config(config_path, &cli_overrides)?;
+
+    Ok(commands::serve::ServeArgs {
+        mode,
+        runtime,
         log_level,
         dev,
-        cors,
-        no_ui,
-    }
+    })
+}
+
+fn resolve_serve_runtime_config(
+    config_path: Option<&PathBuf>,
+    cli_overrides: &ServeRuntimeConfigOverrides,
+) -> Result<ServeRuntimeConfig> {
+    let file_config = crate::config::Config::load(config_path)?;
+    let config_overrides = file_config.serve_runtime_overrides();
+    let env_overrides = ServeRuntimeConfigOverrides::from_env();
+
+    Ok(ServeRuntimeConfig::from_sources(
+        &config_overrides,
+        &env_overrides,
+        cli_overrides,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use izwi_core::backends::BackendPreference;
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::tempdir;
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("environment lock poisoned")
+    }
+
+    fn clear_serve_env() {
+        std::env::remove_var(izwi_core::serve_runtime::ENV_HOST);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_PORT);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_MODELS_DIR);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_BACKEND);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_MAX_BATCH_SIZE);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_NUM_THREADS);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_MAX_CONCURRENT);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_TIMEOUT);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_CORS);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_CORS_ORIGINS);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_NO_UI);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_UI_DIR);
+        std::env::remove_var(izwi_core::serve_runtime::LEGACY_ENV_MAX_CONCURRENT[0]);
+        std::env::remove_var(izwi_core::serve_runtime::LEGACY_ENV_TIMEOUT[0]);
+    }
 
     #[test]
-    fn serve_args_converts_backend_enum_to_string() {
-        let args = serve_args(
+    fn build_serve_args_resolves_cli_env_then_config() {
+        let _guard = env_lock();
+        clear_serve_env();
+
+        let dir = tempdir().expect("temp dir should be created");
+        let config_path = dir.path().join("config.toml");
+        let mut config = crate::config::Config::default();
+        config
+            .set_value("server.host", "config-host")
+            .expect("host should be set");
+        config
+            .set_value("runtime.max_batch_size", "4")
+            .expect("batch size should be set");
+        config
+            .set_value("ui.enabled", "false")
+            .expect("ui.enabled should be set");
+        config
+            .save(Some(&config_path))
+            .expect("config should be saved");
+
+        std::env::set_var(izwi_core::serve_runtime::ENV_MAX_BATCH_SIZE, "5");
+        std::env::set_var(izwi_core::serve_runtime::ENV_TIMEOUT, "600");
+
+        let args = build_serve_args(
+            Some(&config_path),
             ServeMode::Server,
-            "127.0.0.1".to_string(),
-            8080,
+            Some("cli-host".to_string()),
             None,
-            8,
-            Backend::Cuda,
-            Some(4),
-            32,
-            120,
+            None,
+            None,
+            Some(Backend::Cuda),
+            None,
+            None,
+            None,
             "info".to_string(),
             false,
             true,
             false,
-        );
+        )
+        .expect("serve args should resolve");
 
-        assert_eq!(args.backend, "cuda");
+        assert_eq!(args.runtime.host, "cli-host");
+        assert_eq!(args.runtime.max_batch_size, 5);
+        assert_eq!(args.runtime.request_timeout_secs, 600);
+        assert_eq!(args.runtime.backend, BackendPreference::Cuda);
+        assert!(args.runtime.cors_enabled);
+        assert!(!args.runtime.ui_enabled);
         assert!(matches!(args.mode, ServeMode::Server));
-        assert_eq!(args.host, "127.0.0.1");
+        clear_serve_env();
     }
 }

@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 use clap::{Parser, Subcommand, ValueEnum};
+use izwi_core::backends::BackendPreference;
 use std::path::PathBuf;
 
 use crate::style;
@@ -87,36 +88,36 @@ pub enum Commands {
         mode: ServeMode,
 
         /// Host to bind to
-        #[arg(short = 'H', long, default_value = "0.0.0.0", env = "IZWI_HOST")]
-        host: String,
+        #[arg(short = 'H', long)]
+        host: Option<String>,
 
         /// Port to listen on
-        #[arg(short, long, default_value = "8080", env = "IZWI_PORT")]
-        port: u16,
+        #[arg(short, long)]
+        port: Option<u16>,
 
         /// Models directory
-        #[arg(short, long, env = "IZWI_MODELS_DIR")]
+        #[arg(short, long)]
         models_dir: Option<PathBuf>,
 
         /// Maximum batch size
-        #[arg(long, default_value = "8", env = "IZWI_MAX_BATCH_SIZE")]
-        max_batch_size: usize,
+        #[arg(long)]
+        max_batch_size: Option<usize>,
 
         /// Backend preference (`auto`, `cpu`, `metal`, `cuda`)
-        #[arg(long, value_enum, default_value = "auto", env = "IZWI_BACKEND")]
-        backend: Backend,
+        #[arg(long, value_enum)]
+        backend: Option<Backend>,
 
         /// Number of CPU threads
-        #[arg(short, long, env = "IZWI_NUM_THREADS")]
+        #[arg(short, long)]
         threads: Option<usize>,
 
         /// Maximum concurrent requests
-        #[arg(long, default_value = "100", env = "IZWI_MAX_CONCURRENT")]
-        max_concurrent: usize,
+        #[arg(long)]
+        max_concurrent: Option<usize>,
 
         /// Request timeout in seconds
-        #[arg(long, default_value = "300", env = "IZWI_TIMEOUT")]
-        timeout: u64,
+        #[arg(long)]
+        timeout: Option<u64>,
 
         /// Log level
         #[arg(long, default_value = "warn", env = "RUST_LOG")]
@@ -590,6 +591,15 @@ impl Backend {
             Self::Cpu => "cpu",
             Self::Metal => "metal",
             Self::Cuda => "cuda",
+        }
+    }
+
+    pub fn as_preference(&self) -> BackendPreference {
+        match self {
+            Self::Auto => BackendPreference::Auto,
+            Self::Cpu => BackendPreference::Cpu,
+            Self::Metal => BackendPreference::Metal,
+            Self::Cuda => BackendPreference::Cuda,
         }
     }
 }
