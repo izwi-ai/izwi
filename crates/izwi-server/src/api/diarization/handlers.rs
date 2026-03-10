@@ -38,6 +38,20 @@ pub struct UpdateDiarizationRecordRequest {
     pub speaker_name_overrides: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct RerunDiarizationRecordRequest {
+    #[serde(default)]
+    pub min_speakers: Option<usize>,
+    #[serde(default)]
+    pub max_speakers: Option<usize>,
+    #[serde(default)]
+    pub min_speech_duration_ms: Option<f64>,
+    #[serde(default)]
+    pub min_silence_duration_ms: Option<f64>,
+    #[serde(default)]
+    pub enable_llm_refinement: Option<bool>,
+}
+
 #[derive(Debug, Default)]
 struct ParsedDiarizationCreateRequest {
     audio_bytes: Vec<u8>,
@@ -159,6 +173,30 @@ pub async fn update_record(
     Ok(Json(record))
 }
 
+pub async fn rerun_record(
+    State(state): State<AppState>,
+    Path(record_id): Path<String>,
+    Json(req): Json<RerunDiarizationRecordRequest>,
+) -> Result<Json<DiarizationRecord>, ApiError> {
+    let source_record = state
+        .diarization_store
+        .get_record(record_id.clone())
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("Diarization record not found"))?;
+    let source_audio = state
+        .diarization_store
+        .get_audio(record_id)
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("Diarization audio not found"))?;
+
+    let rerun_request = build_rerun_create_request(&source_record, source_audio, req);
+    let record = execute_diarization_record(&state, rerun_request).await?;
+
+    Ok(Json(record))
+}
+
 pub async fn create_record(
     State(state): State<AppState>,
     req: Request,
@@ -171,13 +209,16 @@ pub async fn create_record(
         ));
     }
 
-    if let (Some(min), Some(max)) = (parsed.min_speakers, parsed.max_speakers) {
-        if min > max {
-            return Err(ApiError::bad_request(
-                "`min_speakers` cannot be greater than `max_speakers`.",
-            ));
-        }
-    }
+    let record = execute_diarization_record(&state, parsed).await?;
+
+    Ok(Json(record).into_response())
+}
+
+async fn execute_diarization_record(
+    state: &AppState,
+    parsed: ParsedDiarizationCreateRequest,
+) -> Result<DiarizationRecord, ApiError> {
+    validate_speaker_bounds(parsed.min_speakers, parsed.max_speakers)?;
 
     let _permit = state.acquire_permit().await;
     let started = Instant::now();
@@ -207,7 +248,7 @@ pub async fn create_record(
         None
     };
 
-    let record = state
+    state
         .diarization_store
         .create_record(NewDiarizationRecord {
             model_id: parsed.model_id,
@@ -271,9 +312,52 @@ pub async fn create_record(
             audio_bytes: parsed.audio_bytes,
         })
         .await
-        .map_err(map_store_error)?;
+        .map_err(map_store_error)
+}
 
-    Ok(Json(record).into_response())
+fn build_rerun_create_request(
+    source_record: &DiarizationRecord,
+    source_audio: StoredDiarizationAudio,
+    rerun: RerunDiarizationRecordRequest,
+) -> ParsedDiarizationCreateRequest {
+    ParsedDiarizationCreateRequest {
+        audio_bytes: source_audio.audio_bytes,
+        audio_mime_type: Some(source_audio.audio_mime_type),
+        audio_filename: source_audio.audio_filename,
+        model_id: source_record.model_id.clone(),
+        asr_model_id: source_record.asr_model_id.clone(),
+        aligner_model_id: source_record.aligner_model_id.clone(),
+        llm_model_id: source_record.llm_model_id.clone(),
+        min_speakers: rerun.min_speakers.or(source_record.min_speakers),
+        max_speakers: rerun.max_speakers.or(source_record.max_speakers),
+        min_speech_duration_ms: rerun
+            .min_speech_duration_ms
+            .or(source_record.min_speech_duration_ms),
+        min_silence_duration_ms: rerun
+            .min_silence_duration_ms
+            .or(source_record.min_silence_duration_ms),
+        enable_llm_refinement: Some(
+            rerun
+                .enable_llm_refinement
+                .unwrap_or(source_record.enable_llm_refinement),
+        ),
+        stream: false,
+    }
+}
+
+fn validate_speaker_bounds(
+    min_speakers: Option<usize>,
+    max_speakers: Option<usize>,
+) -> Result<(), ApiError> {
+    if let (Some(min), Some(max)) = (min_speakers, max_speakers) {
+        if min > max {
+            return Err(ApiError::bad_request(
+                "`min_speakers` cannot be greater than `max_speakers`.",
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateRequest, ApiError> {
@@ -518,6 +602,109 @@ fn audio_response(audio: StoredDiarizationAudio) -> Response {
     response
         .body(Body::from(audio.audio_bytes))
         .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_record() -> DiarizationRecord {
+        DiarizationRecord {
+            id: "dir_test".to_string(),
+            created_at: 1,
+            model_id: Some("diar_streaming_sortformer_4spk-v2.1".to_string()),
+            asr_model_id: Some("Qwen3-ASR-0.6B".to_string()),
+            aligner_model_id: Some("Qwen3-ForcedAligner-0.6B".to_string()),
+            llm_model_id: Some("Qwen3-1.7B-GGUF".to_string()),
+            min_speakers: Some(1),
+            max_speakers: Some(4),
+            min_speech_duration_ms: Some(240.0),
+            min_silence_duration_ms: Some(200.0),
+            enable_llm_refinement: true,
+            processing_time_ms: 120.0,
+            duration_secs: Some(9.5),
+            rtf: Some(0.4),
+            speaker_count: 2,
+            corrected_speaker_count: 2,
+            alignment_coverage: Some(0.94),
+            unattributed_words: 0,
+            llm_refined: true,
+            asr_text: "hello there".to_string(),
+            raw_transcript: "SPEAKER_00: hello there".to_string(),
+            transcript: "SPEAKER_00: hello there".to_string(),
+            segments: Vec::new(),
+            words: Vec::new(),
+            utterances: Vec::new(),
+            speaker_name_overrides: BTreeMap::new(),
+            audio_mime_type: "audio/wav".to_string(),
+            audio_filename: Some("meeting.wav".to_string()),
+        }
+    }
+
+    fn sample_audio() -> StoredDiarizationAudio {
+        StoredDiarizationAudio {
+            audio_bytes: vec![1_u8, 2_u8, 3_u8],
+            audio_mime_type: "audio/wav".to_string(),
+            audio_filename: Some("meeting.wav".to_string()),
+        }
+    }
+
+    #[test]
+    fn rerun_request_inherits_existing_record_settings() {
+        let parsed = build_rerun_create_request(
+            &sample_record(),
+            sample_audio(),
+            RerunDiarizationRecordRequest::default(),
+        );
+
+        assert_eq!(
+            parsed.model_id.as_deref(),
+            Some("diar_streaming_sortformer_4spk-v2.1")
+        );
+        assert_eq!(parsed.asr_model_id.as_deref(), Some("Qwen3-ASR-0.6B"));
+        assert_eq!(
+            parsed.aligner_model_id.as_deref(),
+            Some("Qwen3-ForcedAligner-0.6B")
+        );
+        assert_eq!(parsed.llm_model_id.as_deref(), Some("Qwen3-1.7B-GGUF"));
+        assert_eq!(parsed.min_speakers, Some(1));
+        assert_eq!(parsed.max_speakers, Some(4));
+        assert_eq!(parsed.min_speech_duration_ms, Some(240.0));
+        assert_eq!(parsed.min_silence_duration_ms, Some(200.0));
+        assert_eq!(parsed.enable_llm_refinement, Some(true));
+        assert_eq!(parsed.audio_bytes, vec![1_u8, 2_u8, 3_u8]);
+    }
+
+    #[test]
+    fn rerun_request_applies_requested_overrides() {
+        let parsed = build_rerun_create_request(
+            &sample_record(),
+            sample_audio(),
+            RerunDiarizationRecordRequest {
+                min_speakers: Some(2),
+                max_speakers: Some(5),
+                min_speech_duration_ms: Some(180.0),
+                min_silence_duration_ms: Some(140.0),
+                enable_llm_refinement: Some(false),
+            },
+        );
+
+        assert_eq!(parsed.min_speakers, Some(2));
+        assert_eq!(parsed.max_speakers, Some(5));
+        assert_eq!(parsed.min_speech_duration_ms, Some(180.0));
+        assert_eq!(parsed.min_silence_duration_ms, Some(140.0));
+        assert_eq!(parsed.enable_llm_refinement, Some(false));
+    }
+
+    #[test]
+    fn rejects_invalid_speaker_bounds() {
+        let err = validate_speaker_bounds(Some(4), Some(2))
+            .expect_err("min speakers should not exceed max speakers");
+        assert_eq!(
+            err.message,
+            "`min_speakers` cannot be greater than `max_speakers`."
+        );
+    }
 }
 
 fn map_store_error(err: anyhow::Error) -> ApiError {

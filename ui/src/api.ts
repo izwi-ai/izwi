@@ -10,6 +10,7 @@ export type {
   ASRTranscribeResponse,
   DiarizationRecord,
   DiarizationRecordCreateRequest,
+  DiarizationRecordRerunRequest,
   DiarizationRecordSummary,
   DiarizationRecordUpdateRequest,
   DiarizationRequest,

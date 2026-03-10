@@ -26,4 +26,8 @@ pub fn router() -> Router<AppState> {
             "/diarization/records/:record_id/audio",
             get(handlers::get_record_audio),
         )
+        .route(
+            "/diarization/records/:record_id/rerun",
+            axum::routing::post(handlers::rerun_record),
+        )
 }

@@ -415,6 +415,14 @@ export interface DiarizationRecordUpdateRequest {
   speaker_name_overrides: Record<string, string>;
 }
 
+export interface DiarizationRecordRerunRequest {
+  min_speakers?: number;
+  max_speakers?: number;
+  min_speech_duration_ms?: number;
+  min_silence_duration_ms?: number;
+  enable_llm_refinement?: boolean;
+}
+
 export type ASRStreamEvent =
   | { event: "start"; audio_duration_secs: number | null }
   | { event: "delta"; delta: string }
@@ -1188,6 +1196,25 @@ export class AudioApiClient {
     });
   }
 
+  async rerunDiarizationRecord(
+    recordId: string,
+    request: DiarizationRecordRerunRequest,
+  ): Promise<DiarizationRecord> {
+    return this.http.request(
+      `/diarization/records/${encodeURIComponent(recordId)}/rerun`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          min_speakers: request.min_speakers,
+          max_speakers: request.max_speakers,
+          min_speech_duration_ms: request.min_speech_duration_ms,
+          min_silence_duration_ms: request.min_silence_duration_ms,
+          enable_llm_refinement: request.enable_llm_refinement,
+        }),
+      },
+    );
+  }
+
   async createDiarizationRecord(
     request: DiarizationRecordCreateRequest,
   ): Promise<DiarizationRecord> {
@@ -1629,7 +1656,7 @@ export class AudioApiClient {
   private buildDiarizationRecordRequestInit(
     request: DiarizationRecordCreateRequest,
   ): RequestInit {
-    const enableLlmRefinement = true;
+    const enableLlmRefinement = request.enable_llm_refinement ?? true;
 
     if (request.audio_file) {
       const form = new FormData();
@@ -1650,7 +1677,10 @@ export class AudioApiClient {
       if (request.llm_model_id) {
         form.append("llm_model", request.llm_model_id);
       }
-      form.append("enable_llm_refinement", "true");
+      form.append(
+        "enable_llm_refinement",
+        enableLlmRefinement ? "true" : "false",
+      );
       if (typeof request.min_speakers === "number") {
         form.append("min_speakers", String(request.min_speakers));
       }
