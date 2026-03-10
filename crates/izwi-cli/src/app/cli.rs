@@ -127,11 +127,11 @@ pub enum Commands {
         #[arg(long, hide = true)]
         dev: bool,
 
-        /// Enable CORS for all origins
+        /// Enable wildcard CORS responses
         #[arg(long)]
         cors: bool,
 
-        /// Disable the web UI
+        /// Disable static web UI serving
         #[arg(long)]
         no_ui: bool,
     },
@@ -495,7 +495,7 @@ pub enum ConfigCommands {
 
     /// Set a configuration value
     Set {
-        /// Configuration key (e.g., server.host, models.dir)
+        /// Configuration key (e.g., server.host, runtime.max_batch_size, ui.enabled)
         key: String,
         /// Configuration value
         value: String,

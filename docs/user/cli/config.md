@@ -1,6 +1,6 @@
 # izwi config
 
-Manage configuration.
+Manage the local `config.toml` used by `izwi serve`.
 
 ---
 
@@ -16,22 +16,34 @@ izwi config <COMMAND>
 
 | Command | Description |
 |---------|-------------|
-| `show` | Show current configuration |
-| `set` | Set a configuration value |
-| `get` | Get a configuration value |
-| `edit` | Edit in default editor |
-| `reset` | Reset to defaults |
-| `path` | Show config file path |
+| `show` | Show the current config file, or the default template when no file exists |
+| `set` | Set a typed configuration value |
+| `get` | Get a configuration value, falling back to the built-in default |
+| `edit` | Edit the config file in your default editor |
+| `reset` | Remove the config file |
+| `path` | Show the config file path |
 
 ---
 
-## izwi config show
+## Supported Keys
 
-Display the current configuration.
+`izwi config set` and `izwi config get` support these keys:
 
-```bash
-izwi config show
-```
+- `server.host`
+- `server.port`
+- `server.cors`
+- `server.cors_origins`
+- `models.dir`
+- `runtime.backend`
+- `runtime.max_batch_size`
+- `runtime.threads`
+- `runtime.max_concurrent`
+- `runtime.timeout`
+- `ui.enabled`
+- `ui.dir`
+- `defaults.model`
+- `defaults.speaker`
+- `defaults.format`
 
 ---
 
@@ -43,13 +55,19 @@ Set a configuration value.
 izwi config set <KEY> <VALUE>
 ```
 
-### Examples
+Examples:
 
 ```bash
-izwi config set server.host 0.0.0.0
-izwi config set server.port 9000
-izwi config set models.dir /path/to/models
+izwi config set server.host 127.0.0.1
+izwi config set server.cors true
+izwi config set server.cors_origins http://localhost:3000,https://example.com
+izwi config set runtime.backend metal
+izwi config set runtime.max_batch_size 16
+izwi config set runtime.timeout 600
+izwi config set ui.enabled false
 ```
+
+`server.cors_origins` accepts either a comma-separated list or a TOML array literal.
 
 ---
 
@@ -61,12 +79,27 @@ Get a specific configuration value.
 izwi config get <KEY>
 ```
 
-### Examples
+Examples:
 
 ```bash
 izwi config get server.port
-izwi config get models.dir
+izwi config get runtime.backend
+izwi config get ui.enabled
 ```
+
+If a key is not set in the file, `izwi config get` prints the built-in default.
+
+---
+
+## izwi config show
+
+Display the current configuration file.
+
+```bash
+izwi config show
+```
+
+If no file exists yet, `show` prints the default template instead.
 
 ---
 
@@ -78,13 +111,13 @@ Open the configuration file in your default editor.
 izwi config edit
 ```
 
-Uses `$EDITOR` environment variable, or falls back to system default.
+Uses `$EDITOR`, or falls back to `vi`.
 
 ---
 
 ## izwi config reset
 
-Reset configuration to defaults.
+Remove the configuration file.
 
 ```bash
 izwi config reset
@@ -111,20 +144,36 @@ izwi config path
 
 ## Configuration File
 
-The configuration file is TOML format:
+The config file is TOML:
 
 ```toml
 [server]
 host = "0.0.0.0"
 port = 8080
+cors = false
+cors_origins = ["http://localhost:3000"]
 
 [models]
 dir = "/path/to/models"
 
-[inference]
-max_batch_size = 8
+[runtime]
 backend = "auto"
+max_batch_size = 8
+threads = 8
+max_concurrent = 100
+timeout = 300
+
+[ui]
+enabled = true
+dir = "ui/dist"
 ```
+
+Only keys you set need to be present in the file. `izwi serve` resolves runtime values in this order:
+
+1. CLI flags
+2. Environment variables
+3. `config.toml`
+4. Built-in defaults
 
 ### File Locations
 
@@ -138,4 +187,4 @@ backend = "auto"
 
 ## See Also
 
-- [`izwi serve`](./serve.md) — Server options
+- [`izwi serve`](./serve.md) — Server options and runtime precedence

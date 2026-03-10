@@ -328,4 +328,35 @@ mod tests {
         assert!(matches!(args.mode, ServeMode::Server));
         clear_serve_env();
     }
+
+    #[test]
+    fn build_serve_args_honors_legacy_runtime_env_aliases() {
+        let _guard = env_lock();
+        clear_serve_env();
+
+        std::env::set_var(izwi_core::serve_runtime::LEGACY_ENV_MAX_CONCURRENT[0], "45");
+        std::env::set_var(izwi_core::serve_runtime::LEGACY_ENV_TIMEOUT[0], "721");
+
+        let args = build_serve_args(
+            None,
+            ServeMode::Server,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "warn".to_string(),
+            false,
+            false,
+            false,
+        )
+        .expect("serve args should resolve");
+
+        assert_eq!(args.runtime.max_concurrent_requests, 45);
+        assert_eq!(args.runtime.request_timeout_secs, 721);
+        clear_serve_env();
+    }
 }
