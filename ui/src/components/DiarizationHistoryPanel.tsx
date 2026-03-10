@@ -40,6 +40,7 @@ import {
   previewTranscript,
   transcriptEntriesFromRecord,
 } from "../utils/diarizationTranscript";
+import { DiarizationExportDialog } from "./DiarizationExportDialog";
 import { DiarizationReviewWorkspace } from "./DiarizationReviewWorkspace";
 import { DiarizationSpeakerManager } from "./DiarizationSpeakerManager";
 
@@ -443,26 +444,6 @@ export function DiarizationHistoryPanel({
     window.setTimeout(() => setHistoryTranscriptCopied(false), 1800);
   }, [normalizedActiveTranscript]);
 
-  const handleDownloadHistoryTranscript = useCallback(() => {
-    if (!activeHistoryRecord) {
-      return;
-    }
-    const content =
-      normalizedActiveTranscript ||
-      activeHistoryRecord.transcript ||
-      activeHistoryRecord.raw_transcript ||
-      "";
-    const blob = new Blob([content], {
-      type: "text/plain",
-    });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `diarization-${activeHistoryRecord.id}.txt`;
-    anchor.click();
-    URL.revokeObjectURL(url);
-  }, [activeHistoryRecord, normalizedActiveTranscript]);
-
   const handleSaveSpeakerCorrections = useCallback(
     async (speakerNameOverrides: Record<string, string>) => {
       if (!activeHistoryRecord || speakerUpdatePending) {
@@ -786,14 +767,18 @@ export function DiarizationHistoryPanel({
                               </>
                             )}
                           </button>
-                          <button
-                            onClick={handleDownloadHistoryTranscript}
-                            className="inline-flex items-center gap-1 rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-2.5 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:border-[var(--border-strong)] hover:text-[var(--text-primary)] disabled:opacity-45"
-                            disabled={!normalizedActiveTranscript}
-                          >
-                            <Download className="w-3.5 h-3.5" />
-                            TXT
-                          </button>
+                          <DiarizationExportDialog record={activeHistoryRecord}>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              className="h-8 border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-2.5 text-xs text-[var(--text-secondary)]"
+                              disabled={!normalizedActiveTranscript}
+                            >
+                              <Download className="w-3.5 h-3.5" />
+                              Export
+                            </Button>
+                          </DiarizationExportDialog>
                         </div>
                       </div>
 
