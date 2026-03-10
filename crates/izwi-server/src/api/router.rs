@@ -306,116 +306,231 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canonical_and_legacy_history_routes_return_matching_responses() {
-        let (app, temp_dir) =
-            test_api_app("canonical_and_legacy_history_routes_return_matching_responses");
+    async fn canonical_history_routes_still_resolve() {
+        let (app, temp_dir) = test_api_app("canonical_history_routes_still_resolve");
 
-        assert_route_pair(
+        assert_route_status(
             app.clone(),
             Method::GET,
             "/v1/transcriptions",
-            "/v1/transcription/records",
             None,
+            StatusCode::OK,
         )
         .await;
-        assert_route_pair(
+        assert_route_status(
             app.clone(),
             Method::GET,
             "/v1/transcriptions/missing",
-            "/v1/transcription/records/missing",
             None,
+            StatusCode::NOT_FOUND,
         )
         .await;
-        assert_route_pair(
+        assert_route_status(
             app.clone(),
             Method::GET,
             "/v1/transcriptions/missing/audio",
-            "/v1/transcription/records/missing/audio",
             None,
+            StatusCode::NOT_FOUND,
         )
         .await;
 
-        assert_route_pair(
+        assert_route_status(
             app.clone(),
             Method::GET,
             "/v1/diarizations",
-            "/v1/diarization/records",
             None,
+            StatusCode::OK,
         )
         .await;
-        assert_route_pair(
+        assert_route_status(
             app.clone(),
             Method::PATCH,
             "/v1/diarizations/missing",
-            "/v1/diarization/records/missing",
             Some("{}"),
+            StatusCode::NOT_FOUND,
         )
         .await;
-        assert_route_pair(
+        assert_route_status(
             app.clone(),
             Method::GET,
             "/v1/diarizations/missing/audio",
-            "/v1/diarization/records/missing/audio",
             None,
+            StatusCode::NOT_FOUND,
         )
         .await;
-        assert_route_pair(
+        assert_route_status(
             app.clone(),
             Method::POST,
             "/v1/diarizations/missing/reruns",
-            "/v1/diarization/records/missing/rerun",
             Some("{}"),
+            StatusCode::NOT_FOUND,
         )
         .await;
 
-        assert_route_pair(
+        assert_route_status(
             app.clone(),
             Method::GET,
             "/v1/text-to-speech-generations",
-            "/v1/text-to-speech/records",
             None,
+            StatusCode::OK,
         )
         .await;
-        assert_route_pair(
+        assert_route_status(
             app.clone(),
             Method::GET,
             "/v1/text-to-speech-generations/missing/audio",
-            "/v1/text-to-speech/records/missing/audio",
             None,
+            StatusCode::NOT_FOUND,
         )
         .await;
 
-        assert_route_pair(
+        assert_route_status(
             app.clone(),
             Method::GET,
             "/v1/voice-design-generations",
-            "/v1/voice-design/records",
             None,
+            StatusCode::OK,
         )
         .await;
-        assert_route_pair(
+        assert_route_status(
             app.clone(),
             Method::GET,
             "/v1/voice-design-generations/missing",
-            "/v1/voice-design/records/missing",
             None,
+            StatusCode::NOT_FOUND,
         )
         .await;
 
-        assert_route_pair(
+        assert_route_status(
             app.clone(),
             Method::GET,
             "/v1/voice-clone-generations",
-            "/v1/voice-cloning/records",
             None,
+            StatusCode::OK,
         )
         .await;
-        assert_route_pair(
+        assert_route_status(
             app,
             Method::GET,
             "/v1/voice-clone-generations/missing/audio",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+
+        drop(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn legacy_history_routes_return_not_found() {
+        let (app, temp_dir) = test_api_app("legacy_history_routes_return_not_found");
+
+        assert_route_status(
+            app.clone(),
+            Method::GET,
+            "/v1/transcription/records",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::GET,
+            "/v1/transcription/records/missing",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::GET,
+            "/v1/transcription/records/missing/audio",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+
+        assert_route_status(
+            app.clone(),
+            Method::GET,
+            "/v1/diarization/records",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::PATCH,
+            "/v1/diarization/records/missing",
+            Some("{}"),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::GET,
+            "/v1/diarization/records/missing/audio",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::POST,
+            "/v1/diarization/records/missing/rerun",
+            Some("{}"),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+
+        assert_route_status(
+            app.clone(),
+            Method::GET,
+            "/v1/text-to-speech/records",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::GET,
+            "/v1/text-to-speech/records/missing/audio",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+
+        assert_route_status(
+            app.clone(),
+            Method::GET,
+            "/v1/voice-design/records",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::GET,
+            "/v1/voice-design/records/missing",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+
+        assert_route_status(
+            app.clone(),
+            Method::GET,
+            "/v1/voice-cloning/records",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_route_status(
+            app,
+            Method::GET,
             "/v1/voice-cloning/records/missing/audio",
             None,
+            StatusCode::NOT_FOUND,
         )
         .await;
 
@@ -438,32 +553,18 @@ mod tests {
         std::env::temp_dir().join(format!("izwi-router-{name}-{nanos}"))
     }
 
-    async fn assert_route_pair(
+    async fn assert_route_status(
         app: Router,
         method: Method,
-        canonical_path: &str,
-        legacy_path: &str,
+        path: &str,
         body: Option<&str>,
+        expected_status: StatusCode,
     ) {
-        let canonical = send_request(
-            app.clone(),
-            build_request(method.clone(), canonical_path, body),
-        )
-        .await;
-        let legacy = send_request(app, build_request(method, legacy_path, body)).await;
-
-        let canonical_status = canonical.status();
-        let legacy_status = legacy.status();
-        let canonical_body = response_body(canonical).await;
-        let legacy_body = response_body(legacy).await;
-
+        let response = send_request(app, build_request(method, path, body)).await;
         assert_eq!(
-            canonical_status, legacy_status,
-            "status mismatch for {canonical_path} vs {legacy_path}"
-        );
-        assert_eq!(
-            canonical_body, legacy_body,
-            "body mismatch for {canonical_path} vs {legacy_path}"
+            response.status(),
+            expected_status,
+            "unexpected status for {path}"
         );
     }
 
@@ -482,12 +583,6 @@ mod tests {
                 Body::empty()
             })
             .expect("request should build")
-    }
-
-    async fn response_body(response: Response) -> bytes::Bytes {
-        axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body should read")
     }
 
     fn test_api_app(name: &str) -> (Router, TempDirGuard) {
@@ -509,8 +604,9 @@ mod tests {
             models_dir,
             ..ServeRuntimeConfig::default()
         };
-        let runtime = with_suppressed_panic_hook(|| RuntimeService::new(serve_config.engine_config()))
-            .expect("runtime should initialize");
+        let runtime =
+            with_suppressed_panic_hook(|| RuntimeService::new(serve_config.engine_config()))
+                .expect("runtime should initialize");
         let state = AppState::new(runtime, &serve_config).expect("app state should initialize");
 
         std::env::remove_var("IZWI_DB_PATH");

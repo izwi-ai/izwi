@@ -487,7 +487,7 @@ Static UI assets are served from the same router.
 
 ### 10.1 First-Party Persisted Resource Endpoints
 
-These routes back the desktop UI's saved history and reusable assets. Canonical routes follow plural resource naming; legacy `/records` aliases are kept temporarily for compatibility.
+These routes back the desktop UI's saved history and reusable assets. Canonical routes follow plural resource naming.
 
 | Method | Path | Description |
 |---|---|---|

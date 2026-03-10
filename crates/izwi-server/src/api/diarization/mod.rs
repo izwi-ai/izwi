@@ -9,23 +9,13 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     const AUDIO_UPLOAD_LIMIT_BYTES: usize = 64 * 1024 * 1024;
     const CANONICAL_COLLECTION: &str = "/diarizations";
-    const LEGACY_COLLECTION: &str = "/diarization/records";
     const CANONICAL_MEMBER: &str = "/diarizations/:record_id";
-    const LEGACY_MEMBER: &str = "/diarization/records/:record_id";
     const CANONICAL_AUDIO: &str = "/diarizations/:record_id/audio";
-    const LEGACY_AUDIO: &str = "/diarization/records/:record_id/audio";
     const CANONICAL_RERUNS: &str = "/diarizations/:record_id/reruns";
-    const LEGACY_RERUN: &str = "/diarization/records/:record_id/rerun";
 
     Router::new()
         .route(
             CANONICAL_COLLECTION,
-            get(handlers::list_records)
-                .post(handlers::create_record)
-                .layer(DefaultBodyLimit::max(AUDIO_UPLOAD_LIMIT_BYTES)),
-        )
-        .route(
-            LEGACY_COLLECTION,
             get(handlers::list_records)
                 .post(handlers::create_record)
                 .layer(DefaultBodyLimit::max(AUDIO_UPLOAD_LIMIT_BYTES)),
@@ -37,18 +27,9 @@ pub fn router() -> Router<AppState> {
                 .put(handlers::update_record)
                 .delete(handlers::delete_record),
         )
-        .route(
-            LEGACY_MEMBER,
-            get(handlers::get_record)
-                .patch(handlers::update_record)
-                .put(handlers::update_record)
-                .delete(handlers::delete_record),
-        )
         .route(CANONICAL_AUDIO, get(handlers::get_record_audio))
-        .route(LEGACY_AUDIO, get(handlers::get_record_audio))
         .route(
             CANONICAL_RERUNS,
             axum::routing::post(handlers::rerun_record),
         )
-        .route(LEGACY_RERUN, axum::routing::post(handlers::rerun_record))
 }
