@@ -88,4 +88,103 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
       expect.objectContaining({ method: "PUT" }),
     );
   });
+
+  it("lists transcriptions through the canonical collection route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ records: [] }), {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }),
+    );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+    const result = await client.listTranscriptionRecords();
+
+    expect(result).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost/v1/transcriptions",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          "Content-Type": "application/json",
+        }),
+      }),
+    );
+  });
+
+  it("posts text-to-speech history to the canonical generation route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: "tts-1",
+          created_at: 1,
+          route_kind: "text_to_speech",
+          model_id: "model",
+          speaker: "Narrator",
+          language: "en",
+          input_text: "Hello",
+          voice_description: null,
+          reference_text: null,
+          generation_time_ms: 10,
+          audio_duration_secs: 1,
+          rtf: 0.5,
+          tokens_generated: 10,
+          audio_mime_type: "audio/wav",
+          audio_filename: "tts.wav",
+        }),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+          },
+        },
+      ),
+    );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+    await client.createTextToSpeechRecord({
+      model_id: "model",
+      text: "Hello",
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost/v1/text-to-speech-generations",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
+  it("posts diarization reruns to the canonical reruns resource", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(updatedRecord), {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }),
+    );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+    const result = await client.rerunDiarizationRecord("diar-1", {});
+
+    expect(result).toEqual(updatedRecord);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost/v1/diarizations/diar-1/reruns",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
+  it("builds canonical voice clone audio urls", () => {
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+
+    expect(client.voiceCloningRecordAudioUrl("clone-1")).toBe(
+      "http://localhost/v1/voice-clone-generations/clone-1/audio",
+    );
+  });
 });
