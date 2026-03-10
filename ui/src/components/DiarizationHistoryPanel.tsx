@@ -26,6 +26,7 @@ import {
   DialogDescription,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   api,
   type DiarizationRecord,
@@ -36,6 +37,7 @@ import {
   previewTranscript,
   transcriptEntriesFromRecord,
 } from "../utils/diarizationTranscript";
+import { DiarizationSpeakerManager } from "./DiarizationSpeakerManager";
 
 interface DiarizationHistoryPanelProps {
   latestRecord?: DiarizationRecord | null;
@@ -97,6 +99,11 @@ function summarizeRecord(record: DiarizationRecord): DiarizationRecordSummary {
     created_at: record.created_at,
     model_id: record.model_id,
     speaker_count: record.speaker_count ?? 0,
+    corrected_speaker_count:
+      record.corrected_speaker_count ?? record.speaker_count ?? 0,
+    speaker_name_override_count: Object.keys(
+      record.speaker_name_overrides ?? {},
+    ).length,
     duration_secs: record.duration_secs,
     processing_time_ms: record.processing_time_ms,
     rtf: record.rtf,
@@ -135,6 +142,11 @@ export function DiarizationHistoryPanel({
     null,
   );
   const [historyTranscriptCopied, setHistoryTranscriptCopied] = useState(false);
+  const [recordWorkspaceTab, setRecordWorkspaceTab] = useState("transcript");
+  const [speakerUpdatePending, setSpeakerUpdatePending] = useState(false);
+  const [speakerUpdateError, setSpeakerUpdateError] = useState<string | null>(
+    null,
+  );
   const [deleteTargetRecordId, setDeleteTargetRecordId] = useState<
     string | null
   >(null);
@@ -549,6 +561,31 @@ export function DiarizationHistoryPanel({
     URL.revokeObjectURL(url);
   }, [activeHistoryRecord, normalizedActiveTranscript]);
 
+  const handleSaveSpeakerCorrections = useCallback(
+    async (speakerNameOverrides: Record<string, string>) => {
+      if (!activeHistoryRecord || speakerUpdatePending) {
+        return;
+      }
+
+      setSpeakerUpdatePending(true);
+      setSpeakerUpdateError(null);
+      try {
+        const updatedRecord = await api.updateDiarizationRecord(activeHistoryRecord.id, {
+          speaker_name_overrides: speakerNameOverrides,
+        });
+        setSelectedHistoryRecord(updatedRecord);
+        mergeHistorySummary(summarizeRecord(updatedRecord));
+      } catch (err) {
+        setSpeakerUpdateError(
+          err instanceof Error ? err.message : "Failed to save speaker corrections.",
+        );
+      } finally {
+        setSpeakerUpdatePending(false);
+      }
+    },
+    [activeHistoryRecord, mergeHistorySummary, speakerUpdatePending],
+  );
+
   useEffect(() => {
     const audio = historyAudioRef.current;
     if (audio) {
@@ -562,6 +599,8 @@ export function DiarizationHistoryPanel({
     setHistoryPlaybackRate(1);
     setHistoryAudioError(null);
     setHistoryTranscriptCopied(false);
+    setRecordWorkspaceTab("transcript");
+    setSpeakerUpdateError(null);
   }, [selectedHistoryRecordId]);
 
   const historyDrawer = (
@@ -771,7 +810,9 @@ export function DiarizationHistoryPanel({
                           {activeHistoryRecord.model_id || "Unknown model"}
                         </span>
                         <span className="rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-2 py-1 text-[11px] text-[var(--text-secondary)]">
-                          {activeHistoryRecord.speaker_count} speakers
+                          {activeHistoryRecord.corrected_speaker_count ??
+                            activeHistoryRecord.speaker_count}{" "}
+                          speakers
                         </span>
                         <span className="rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-2 py-1 text-[11px] text-[var(--text-secondary)]">
                           {formatAudioDuration(
@@ -927,74 +968,98 @@ export function DiarizationHistoryPanel({
                 </div>
 
                 <div className="p-4 sm:p-5 overflow-y-auto">
-                  <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
-                    <h4 className="text-sm font-medium text-[var(--text-primary)]">
-                      Transcript
-                    </h4>
-                    <div className="flex items-center gap-2">
-                      <button
-                        onClick={() => void handleCopyHistoryTranscript()}
-                        className="inline-flex items-center gap-1 rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-2.5 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:border-[var(--border-strong)] hover:text-[var(--text-primary)] disabled:opacity-45"
-                        disabled={!normalizedActiveTranscript}
-                      >
-                        {historyTranscriptCopied ? (
-                          <>
-                            <Check className="w-3.5 h-3.5" />
-                            Copied
-                          </>
-                        ) : (
-                          <>
-                            <Copy className="w-3.5 h-3.5" />
-                            Copy
-                          </>
-                        )}
-                      </button>
-                      <button
-                        onClick={handleDownloadHistoryTranscript}
-                        className="inline-flex items-center gap-1 rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-2.5 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:border-[var(--border-strong)] hover:text-[var(--text-primary)] disabled:opacity-45"
-                        disabled={!normalizedActiveTranscript}
-                      >
-                        <Download className="w-3.5 h-3.5" />
-                        TXT
-                      </button>
-                    </div>
-                  </div>
+                  <Tabs
+                    value={recordWorkspaceTab}
+                    onValueChange={setRecordWorkspaceTab}
+                    className="space-y-4"
+                  >
+                    <TabsList className="w-full justify-start bg-[var(--bg-surface-1)]">
+                      <TabsTrigger value="transcript">Transcript</TabsTrigger>
+                      <TabsTrigger value="speakers">Speakers</TabsTrigger>
+                    </TabsList>
 
-                  <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-3 min-h-[320px]">
-                    {selectedHistoryLoading ? (
-                      <div className="h-[320px] flex items-center justify-center gap-2 text-sm text-[var(--text-muted)]">
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                        Loading transcript...
-                      </div>
-                    ) : activeEntries.length > 0 ? (
-                      <div className="space-y-2">
-                        {activeEntries.map((entry, index) => (
-                          <div
-                            key={`${entry.speaker}-${entry.start}-${entry.end}-${index}`}
-                            className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-2)] p-3"
+                    <TabsContent value="transcript" className="mt-0 space-y-4">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <h4 className="text-sm font-medium text-[var(--text-primary)]">
+                          Transcript
+                        </h4>
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => void handleCopyHistoryTranscript()}
+                            className="inline-flex items-center gap-1 rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-2.5 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:border-[var(--border-strong)] hover:text-[var(--text-primary)] disabled:opacity-45"
+                            disabled={!normalizedActiveTranscript}
                           >
-                            <div className="flex items-center justify-between gap-2 mb-1">
-                              <span className="text-xs font-medium text-[var(--text-primary)]">
-                                {entry.speaker}
-                              </span>
-                              <span className="text-[11px] text-[var(--text-subtle)]">
-                                {entry.start.toFixed(2)}s -{" "}
-                                {entry.end.toFixed(2)}s
-                              </span>
-                            </div>
-                            <p className="text-sm text-[var(--text-secondary)] whitespace-pre-wrap break-words">
-                              {entry.text}
-                            </p>
-                          </div>
-                        ))}
+                            {historyTranscriptCopied ? (
+                              <>
+                                <Check className="w-3.5 h-3.5" />
+                                Copied
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="w-3.5 h-3.5" />
+                                Copy
+                              </>
+                            )}
+                          </button>
+                          <button
+                            onClick={handleDownloadHistoryTranscript}
+                            className="inline-flex items-center gap-1 rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-2.5 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:border-[var(--border-strong)] hover:text-[var(--text-primary)] disabled:opacity-45"
+                            disabled={!normalizedActiveTranscript}
+                          >
+                            <Download className="w-3.5 h-3.5" />
+                            TXT
+                          </button>
+                        </div>
                       </div>
-                    ) : (
-                      <p className="text-sm text-[var(--text-secondary)] whitespace-pre-wrap leading-relaxed">
-                        {normalizedActiveTranscript ||
-                          "No transcript text available for this record."}
-                      </p>
-                    )}
-                  </div>
+
+                      <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-3 min-h-[320px]">
+                        {selectedHistoryLoading ? (
+                          <div className="h-[320px] flex items-center justify-center gap-2 text-sm text-[var(--text-muted)]">
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                            Loading transcript...
+                          </div>
+                        ) : activeEntries.length > 0 ? (
+                          <div className="space-y-2">
+                            {activeEntries.map((entry, index) => (
+                              <div
+                                key={`${entry.speaker}-${entry.start}-${entry.end}-${index}`}
+                                className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-2)] p-3"
+                              >
+                                <div className="flex items-center justify-between gap-2 mb-1">
+                                  <span className="text-xs font-medium text-[var(--text-primary)]">
+                                    {entry.speaker}
+                                  </span>
+                                  <span className="text-[11px] text-[var(--text-subtle)]">
+                                    {entry.start.toFixed(2)}s -{" "}
+                                    {entry.end.toFixed(2)}s
+                                  </span>
+                                </div>
+                                <p className="text-sm text-[var(--text-secondary)] whitespace-pre-wrap break-words">
+                                  {entry.text}
+                                </p>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="text-sm text-[var(--text-secondary)] whitespace-pre-wrap leading-relaxed">
+                            {normalizedActiveTranscript ||
+                              "No transcript text available for this record."}
+                          </p>
+                        )}
+                      </div>
+                    </TabsContent>
+
+                    <TabsContent value="speakers" className="mt-0">
+                      {activeHistoryRecord ? (
+                        <DiarizationSpeakerManager
+                          record={activeHistoryRecord}
+                          isSaving={speakerUpdatePending}
+                          error={speakerUpdateError}
+                          onSave={handleSaveSpeakerCorrections}
+                        />
+                      ) : null}
+                    </TabsContent>
+                  </Tabs>
                 </div>
               </div>
             </motion.div>

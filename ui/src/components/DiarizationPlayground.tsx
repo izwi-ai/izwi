@@ -16,12 +16,14 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api, type DiarizationRecord } from "../api";
 import {
   formattedTranscriptFromResult,
   transcriptEntriesFromResult,
 } from "../utils/diarizationTranscript";
 import { DiarizationHistoryPanel } from "./DiarizationHistoryPanel";
+import { DiarizationSpeakerManager } from "./DiarizationSpeakerManager";
 
 function revokeObjectUrlIfNeeded(url: string | null): void {
   if (url && url.startsWith("blob:")) {
@@ -180,6 +182,11 @@ export function DiarizationPlayground({
   const [latestRecord, setLatestRecord] = useState<DiarizationRecord | null>(
     null,
   );
+  const [workspaceTab, setWorkspaceTab] = useState("transcript");
+  const [speakerUpdatePending, setSpeakerUpdatePending] = useState(false);
+  const [speakerUpdateError, setSpeakerUpdateError] = useState<string | null>(
+    null,
+  );
   const [minSpeakers, setMinSpeakers] = useState(1);
   const [maxSpeakers, setMaxSpeakers] = useState(4);
   const [minSpeechMs, setMinSpeechMs] = useState(240);
@@ -228,6 +235,7 @@ export function DiarizationPlayground({
 
       setIsProcessing(true);
       setError(null);
+      setSpeakerUpdateError(null);
       setSpeakerTranscript("");
 
       try {
@@ -260,6 +268,7 @@ export function DiarizationPlayground({
         });
 
         setLatestRecord(record);
+        setWorkspaceTab("transcript");
         setAudioUrl(api.diarizationRecordAudioUrl(record.id));
         setSpeakerTranscript(formattedTranscriptFromResult(record));
       } catch (err) {
@@ -364,6 +373,8 @@ export function DiarizationPlayground({
     setSpeakerTranscript("");
     setAudioUrl(null);
     setLatestRecord(null);
+    setWorkspaceTab("transcript");
+    setSpeakerUpdateError(null);
     setError(null);
     setIsProcessing(false);
   };
@@ -399,6 +410,31 @@ export function DiarizationPlayground({
     link.click();
     URL.revokeObjectURL(url);
   };
+
+  const handleSpeakerCorrectionsSave = useCallback(
+    async (speakerNameOverrides: Record<string, string>) => {
+      if (!latestRecord || speakerUpdatePending) {
+        return;
+      }
+
+      setSpeakerUpdatePending(true);
+      setSpeakerUpdateError(null);
+      try {
+        const updatedRecord = await api.updateDiarizationRecord(latestRecord.id, {
+          speaker_name_overrides: speakerNameOverrides,
+        });
+        setLatestRecord(updatedRecord);
+        setSpeakerTranscript(formattedTranscriptFromResult(updatedRecord));
+      } catch (err) {
+        setSpeakerUpdateError(
+          err instanceof Error ? err.message : "Failed to save speaker corrections.",
+        );
+      } finally {
+        setSpeakerUpdatePending(false);
+      }
+    },
+    [latestRecord, speakerUpdatePending],
+  );
 
   useEffect(() => {
     if (minSpeakers > maxSpeakers) {
@@ -675,41 +711,59 @@ export function DiarizationPlayground({
               Running diarization and transcript pipeline...
             </div>
           ) : hasOutput ? (
-            <div className="space-y-4">
-              {transcriptEntries.length > 0 ? (
-                <div className="space-y-4">
-                  {transcriptEntries.map((entry, index) => (
-                    <div
-                      key={`${entry.speaker}-${entry.start}-${entry.end}-${index}`}
-                      className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-5 shadow-sm"
-                    >
-                      <div className="flex items-center justify-between gap-3 mb-3">
-                        <div className="flex items-center gap-2.5">
-                          <div className="flex h-6 w-6 items-center justify-center rounded-full bg-[var(--bg-surface-2)] border border-[var(--border-strong)] text-[10px] font-semibold text-[var(--text-primary)] shadow-sm">
-                            {entry.speaker?.charAt(0) ?? "S"}
+            <Tabs value={workspaceTab} onValueChange={setWorkspaceTab} className="space-y-4">
+              <TabsList className="w-full justify-start bg-[var(--bg-surface-1)]">
+                <TabsTrigger value="transcript">Transcript</TabsTrigger>
+                <TabsTrigger value="speakers">Speakers</TabsTrigger>
+              </TabsList>
+
+              <TabsContent value="transcript" className="mt-0 space-y-4">
+                {transcriptEntries.length > 0 ? (
+                  <div className="space-y-4">
+                    {transcriptEntries.map((entry, index) => (
+                      <div
+                        key={`${entry.speaker}-${entry.start}-${entry.end}-${index}`}
+                        className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-5 shadow-sm"
+                      >
+                        <div className="flex items-center justify-between gap-3 mb-3">
+                          <div className="flex items-center gap-2.5">
+                            <div className="flex h-6 w-6 items-center justify-center rounded-full bg-[var(--bg-surface-2)] border border-[var(--border-strong)] text-[10px] font-semibold text-[var(--text-primary)] shadow-sm">
+                              {entry.speaker?.charAt(0) ?? "S"}
+                            </div>
+                            <span className="text-sm font-semibold text-[var(--text-primary)]">
+                              {entry.speaker}
+                            </span>
                           </div>
-                          <span className="text-sm font-semibold text-[var(--text-primary)]">
-                            {entry.speaker}
+                          <span className="text-[11px] font-medium text-[var(--text-secondary)] bg-[var(--bg-surface-2)] px-2 py-0.5 rounded-md border border-[var(--border-muted)]">
+                            {entry.start.toFixed(2)}s - {entry.end.toFixed(2)}s
                           </span>
                         </div>
-                        <span className="text-[11px] font-medium text-[var(--text-secondary)] bg-[var(--bg-surface-2)] px-2 py-0.5 rounded-md border border-[var(--border-muted)]">
-                          {entry.start.toFixed(2)}s - {entry.end.toFixed(2)}s
-                        </span>
+                        <p className="text-base text-[var(--text-secondary)] whitespace-pre-wrap break-words leading-relaxed selection:bg-[var(--accent-soft)]">
+                          {entry.text}
+                        </p>
                       </div>
-                      <p className="text-base text-[var(--text-secondary)] whitespace-pre-wrap break-words leading-relaxed selection:bg-[var(--accent-soft)]">
-                        {entry.text}
-                      </p>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-5 sm:p-6 shadow-sm">
-                  <pre className="text-base text-[var(--text-secondary)] whitespace-pre-wrap break-words leading-relaxed font-sans selection:bg-[var(--accent-soft)]">
-                    {speakerTranscript}
-                  </pre>
-                </div>
-              )}
-            </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-5 sm:p-6 shadow-sm">
+                    <pre className="text-base text-[var(--text-secondary)] whitespace-pre-wrap break-words leading-relaxed font-sans selection:bg-[var(--accent-soft)]">
+                      {speakerTranscript}
+                    </pre>
+                  </div>
+                )}
+              </TabsContent>
+
+              <TabsContent value="speakers" className="mt-0">
+                {latestRecord ? (
+                  <DiarizationSpeakerManager
+                    record={latestRecord}
+                    isSaving={speakerUpdatePending}
+                    error={speakerUpdateError}
+                    onSave={handleSpeakerCorrectionsSave}
+                  />
+                ) : null}
+              </TabsContent>
+            </Tabs>
           ) : (
             <div className="h-full flex items-center justify-center text-center px-6">
               <div className="max-w-sm">
