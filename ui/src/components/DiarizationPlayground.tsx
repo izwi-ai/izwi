@@ -17,10 +17,15 @@ import {
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { api, type DiarizationRecord } from "../api";
+import {
+  api,
+  type DiarizationRecord,
+  type DiarizationRecordRerunRequest,
+} from "../api";
 import { formattedTranscriptFromResult } from "../utils/diarizationTranscript";
 import { DiarizationExportDialog } from "./DiarizationExportDialog";
 import { DiarizationHistoryPanel } from "./DiarizationHistoryPanel";
+import { DiarizationQualityPanel } from "./DiarizationQualityPanel";
 import { DiarizationReviewWorkspace } from "./DiarizationReviewWorkspace";
 import { DiarizationSpeakerManager } from "./DiarizationSpeakerManager";
 
@@ -186,6 +191,8 @@ export function DiarizationPlayground({
   const [speakerUpdateError, setSpeakerUpdateError] = useState<string | null>(
     null,
   );
+  const [rerunPending, setRerunPending] = useState(false);
+  const [rerunError, setRerunError] = useState<string | null>(null);
   const [minSpeakers, setMinSpeakers] = useState(1);
   const [maxSpeakers, setMaxSpeakers] = useState(4);
   const [minSpeechMs, setMinSpeechMs] = useState(240);
@@ -235,6 +242,7 @@ export function DiarizationPlayground({
       setIsProcessing(true);
       setError(null);
       setSpeakerUpdateError(null);
+      setRerunError(null);
       setSpeakerTranscript("");
 
       try {
@@ -374,6 +382,7 @@ export function DiarizationPlayground({
     setLatestRecord(null);
     setWorkspaceTab("transcript");
     setSpeakerUpdateError(null);
+    setRerunError(null);
     setError(null);
     setIsProcessing(false);
   };
@@ -409,6 +418,47 @@ export function DiarizationPlayground({
       }
     },
     [latestRecord, speakerUpdatePending],
+  );
+
+  const handleRerunRecord = useCallback(
+    async (request: DiarizationRecordRerunRequest) => {
+      if (!latestRecord || rerunPending) {
+        return;
+      }
+
+      setRerunPending(true);
+      setRerunError(null);
+      setSpeakerUpdateError(null);
+      setError(null);
+
+      try {
+        const rerunRecord = await api.rerunDiarizationRecord(latestRecord.id, request);
+        revokeObjectUrlIfNeeded(audioUrl);
+        setLatestRecord(rerunRecord);
+        setSpeakerTranscript(formattedTranscriptFromResult(rerunRecord));
+        setAudioUrl(api.diarizationRecordAudioUrl(rerunRecord.id));
+        setWorkspaceTab("transcript");
+        setMinSpeakers(rerunRecord.min_speakers ?? minSpeakers);
+        setMaxSpeakers(rerunRecord.max_speakers ?? maxSpeakers);
+        setMinSpeechMs(rerunRecord.min_speech_duration_ms ?? minSpeechMs);
+        setMinSilenceMs(rerunRecord.min_silence_duration_ms ?? minSilenceMs);
+      } catch (err) {
+        setRerunError(
+          err instanceof Error ? err.message : "Failed to rerun diarization.",
+        );
+      } finally {
+        setRerunPending(false);
+      }
+    },
+    [
+      audioUrl,
+      latestRecord,
+      maxSpeakers,
+      minSilenceMs,
+      minSpeakers,
+      minSpeechMs,
+      rerunPending,
+    ],
   );
 
   useEffect(() => {
@@ -694,6 +744,7 @@ export function DiarizationPlayground({
               <TabsList className="w-full justify-start bg-[var(--bg-surface-1)]">
                 <TabsTrigger value="transcript">Transcript</TabsTrigger>
                 <TabsTrigger value="speakers">Speakers</TabsTrigger>
+                <TabsTrigger value="quality">Quality</TabsTrigger>
               </TabsList>
 
               <TabsContent value="transcript" className="mt-0 space-y-4">
@@ -721,6 +772,15 @@ export function DiarizationPlayground({
                     onSave={handleSpeakerCorrectionsSave}
                   />
                 ) : null}
+              </TabsContent>
+
+              <TabsContent value="quality" className="mt-0">
+                <DiarizationQualityPanel
+                  record={latestRecord}
+                  isRerunning={rerunPending}
+                  error={rerunError}
+                  onRerun={handleRerunRecord}
+                />
               </TabsContent>
             </Tabs>
           ) : (

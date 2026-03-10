@@ -18,6 +18,7 @@ const apiMocks = vi.hoisted(() => ({
   listDiarizationRecords: vi.fn(),
   getDiarizationRecord: vi.fn(),
   updateDiarizationRecord: vi.fn(),
+  rerunDiarizationRecord: vi.fn(),
   deleteDiarizationRecord: vi.fn(),
   diarizationRecordAudioUrl: vi.fn(),
 }));
@@ -31,6 +32,7 @@ vi.mock("../api", () => ({
     listDiarizationRecords: apiMocks.listDiarizationRecords,
     getDiarizationRecord: apiMocks.getDiarizationRecord,
     updateDiarizationRecord: apiMocks.updateDiarizationRecord,
+    rerunDiarizationRecord: apiMocks.rerunDiarizationRecord,
     deleteDiarizationRecord: apiMocks.deleteDiarizationRecord,
     diarizationRecordAudioUrl: apiMocks.diarizationRecordAudioUrl,
   },
@@ -45,6 +47,7 @@ describe("History panels", () => {
     apiMocks.listDiarizationRecords.mockReset();
     apiMocks.getDiarizationRecord.mockReset();
     apiMocks.updateDiarizationRecord.mockReset();
+    apiMocks.rerunDiarizationRecord.mockReset();
     apiMocks.deleteDiarizationRecord.mockReset();
     apiMocks.diarizationRecordAudioUrl.mockReset();
 
@@ -311,5 +314,138 @@ describe("History panels", () => {
 
     activateTab(scope, "Transcript");
     expect((await scope.findAllByText("Alice")).length).toBeGreaterThan(0);
+  });
+
+  it("reruns a diarization history record from the quality tab", async () => {
+    const initialRecord = {
+      id: "diar-1",
+      created_at: 1,
+      model_id: "diar_streaming_sortformer_4spk-v2.1",
+      asr_model_id: "Qwen3-ASR-0.6B",
+      aligner_model_id: "Qwen3-ForcedAligner-0.6B",
+      llm_model_id: "Qwen3-1.7B-GGUF",
+      min_speakers: 1,
+      max_speakers: 4,
+      min_speech_duration_ms: 240,
+      min_silence_duration_ms: 200,
+      enable_llm_refinement: true,
+      speaker_count: 2,
+      corrected_speaker_count: 2,
+      duration_secs: 6.4,
+      processing_time_ms: 120,
+      rtf: 0.5,
+      alignment_coverage: 0.82,
+      unattributed_words: 4,
+      llm_refined: false,
+      asr_text: "Hello there. Hi back.",
+      audio_mime_type: "audio/wav",
+      audio_filename: "meeting.wav",
+      transcript: "",
+      raw_transcript: "",
+      speaker_name_overrides: {},
+      utterances: [
+        {
+          speaker: "SPEAKER_00",
+          start: 0,
+          end: 1,
+          text: "Hello there.",
+          word_start: 0,
+          word_end: 1,
+        },
+      ],
+      words: [],
+      segments: [],
+    };
+
+    apiMocks.listDiarizationRecords.mockResolvedValue([
+      {
+        id: "diar-1",
+        created_at: 1,
+        model_id: "diar_streaming_sortformer_4spk-v2.1",
+        speaker_count: 2,
+        corrected_speaker_count: 2,
+        duration_secs: 6.4,
+        processing_time_ms: 120,
+        rtf: 0.5,
+        audio_mime_type: "audio/wav",
+        audio_filename: "meeting.wav",
+        transcript_preview: "SPEAKER_00 [0.00s - 1.00s]: Hello there.",
+        transcript_chars: 40,
+      },
+    ]);
+    apiMocks.getDiarizationRecord.mockResolvedValue(initialRecord);
+    apiMocks.rerunDiarizationRecord.mockResolvedValue({
+      ...initialRecord,
+      id: "diar-2",
+      created_at: 2,
+      min_speakers: 2,
+      max_speakers: 5,
+      min_speech_duration_ms: 180,
+      min_silence_duration_ms: 120,
+      enable_llm_refinement: false,
+      alignment_coverage: 0.95,
+      unattributed_words: 0,
+      utterances: [
+        {
+          speaker: "SPEAKER_01",
+          start: 0,
+          end: 1,
+          text: "Updated turn.",
+          word_start: 0,
+          word_end: 1,
+        },
+      ],
+    });
+
+    const { container } = render(
+      <DiarizationHistoryPanel latestRecord={initialRecord} />,
+    );
+    const scope = within(container);
+
+    await waitFor(() =>
+      expect(apiMocks.listDiarizationRecords).toHaveBeenCalled(),
+    );
+
+    fireEvent.click(scope.getByRole("button", { name: /History/i }));
+    const historyRecordEntries = await screen.findAllByText("meeting.wav");
+    const historyRecordEntry = historyRecordEntries[historyRecordEntries.length - 1];
+    fireEvent.click(historyRecordEntry!);
+
+    await scope.findByText("Diarization Record");
+
+    activateTab(scope, "Quality");
+    fireEvent.change(scope.getByLabelText("Min speakers"), {
+      target: { value: "2" },
+    });
+    fireEvent.change(scope.getByLabelText("Max speakers"), {
+      target: { value: "5" },
+    });
+    fireEvent.change(scope.getByLabelText("Min speech (ms)"), {
+      target: { value: "180" },
+    });
+    fireEvent.change(scope.getByLabelText("Min silence (ms)"), {
+      target: { value: "120" },
+    });
+    fireEvent.click(
+      scope.getByRole("switch", { name: "LLM transcript refinement" }),
+    );
+    fireEvent.click(scope.getByRole("button", { name: "Rerun saved audio" }));
+
+    await waitFor(() =>
+      expect(apiMocks.rerunDiarizationRecord).toHaveBeenCalledWith("diar-1", {
+        min_speakers: 2,
+        max_speakers: 5,
+        min_speech_duration_ms: 180,
+        min_silence_duration_ms: 120,
+        enable_llm_refinement: false,
+      }),
+    );
+
+    await waitFor(() =>
+      expect(apiMocks.diarizationRecordAudioUrl).toHaveBeenCalledWith("diar-2"),
+    );
+
+    activateTab(scope, "Transcript");
+    expect(await scope.findByText("Updated turn.")).toBeInTheDocument();
   });
 });

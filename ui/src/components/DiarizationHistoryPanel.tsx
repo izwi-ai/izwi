@@ -33,6 +33,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   api,
   type DiarizationRecord,
+  type DiarizationRecordRerunRequest,
   type DiarizationRecordSummary,
 } from "../api";
 import {
@@ -41,6 +42,7 @@ import {
   transcriptEntriesFromRecord,
 } from "../utils/diarizationTranscript";
 import { DiarizationExportDialog } from "./DiarizationExportDialog";
+import { DiarizationQualityPanel } from "./DiarizationQualityPanel";
 import { DiarizationReviewWorkspace } from "./DiarizationReviewWorkspace";
 import { DiarizationSpeakerManager } from "./DiarizationSpeakerManager";
 
@@ -136,6 +138,8 @@ export function DiarizationHistoryPanel({
   const [speakerUpdateError, setSpeakerUpdateError] = useState<string | null>(
     null,
   );
+  const [rerunPending, setRerunPending] = useState(false);
+  const [rerunError, setRerunError] = useState<string | null>(null);
   const [deleteTargetRecordId, setDeleteTargetRecordId] = useState<
     string | null
   >(null);
@@ -469,10 +473,42 @@ export function DiarizationHistoryPanel({
     [activeHistoryRecord, mergeHistorySummary, speakerUpdatePending],
   );
 
+  const handleRerunRecord = useCallback(
+    async (request: DiarizationRecordRerunRequest) => {
+      if (!activeHistoryRecord || rerunPending) {
+        return;
+      }
+
+      setRerunPending(true);
+      setRerunError(null);
+      setSpeakerUpdateError(null);
+      setSelectedHistoryError(null);
+
+      try {
+        const rerunRecord = await api.rerunDiarizationRecord(
+          activeHistoryRecord.id,
+          request,
+        );
+        setSelectedHistoryRecord(rerunRecord);
+        setSelectedHistoryRecordId(rerunRecord.id);
+        setRecordWorkspaceTab("transcript");
+        mergeHistorySummary(summarizeRecord(rerunRecord));
+      } catch (err) {
+        setRerunError(
+          err instanceof Error ? err.message : "Failed to rerun diarization.",
+        );
+      } finally {
+        setRerunPending(false);
+      }
+    },
+    [activeHistoryRecord, mergeHistorySummary, rerunPending],
+  );
+
   useEffect(() => {
     setHistoryTranscriptCopied(false);
     setRecordWorkspaceTab("transcript");
     setSpeakerUpdateError(null);
+    setRerunError(null);
   }, [selectedHistoryRecordId]);
 
   const historyDrawer = (
@@ -718,8 +754,8 @@ export function DiarizationHistoryPanel({
                             </div>
                             <p className="mt-1 leading-relaxed">
                               Click any timeline block or transcript row to jump to that
-                              moment, then switch to the speakers tab if a label needs
-                              correction.
+                              moment, then switch to the speakers or quality tab if a
+                              label needs correction or the run needs tuning.
                             </p>
                           </div>
                         </CardContent>
@@ -742,6 +778,7 @@ export function DiarizationHistoryPanel({
                     <TabsList className="w-full justify-start bg-[var(--bg-surface-1)]">
                       <TabsTrigger value="transcript">Transcript</TabsTrigger>
                       <TabsTrigger value="speakers">Speakers</TabsTrigger>
+                      <TabsTrigger value="quality">Quality</TabsTrigger>
                     </TabsList>
 
                     <TabsContent value="transcript" className="mt-0 space-y-4">
@@ -802,6 +839,15 @@ export function DiarizationHistoryPanel({
                           onSave={handleSaveSpeakerCorrections}
                         />
                       ) : null}
+                    </TabsContent>
+
+                    <TabsContent value="quality" className="mt-0">
+                      <DiarizationQualityPanel
+                        record={activeHistoryRecord}
+                        isRerunning={rerunPending}
+                        error={rerunError}
+                        onRerun={handleRerunRecord}
+                      />
                     </TabsContent>
                   </Tabs>
                 </div>
