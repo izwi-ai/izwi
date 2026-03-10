@@ -19,6 +19,7 @@ import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api, type DiarizationRecord } from "../api";
 import { formattedTranscriptFromResult } from "../utils/diarizationTranscript";
+import { DiarizationExportDialog } from "./DiarizationExportDialog";
 import { DiarizationHistoryPanel } from "./DiarizationHistoryPanel";
 import { DiarizationReviewWorkspace } from "./DiarizationReviewWorkspace";
 import { DiarizationSpeakerManager } from "./DiarizationSpeakerManager";
@@ -385,18 +386,6 @@ export function DiarizationPlayground({
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const handleDownload = () => {
-    const blob = new Blob([asText], {
-      type: "text/plain; charset=utf-8",
-    });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `diarization-${Date.now()}.txt`;
-    link.click();
-    URL.revokeObjectURL(url);
-  };
-
   const handleSpeakerCorrectionsSave = useCallback(
     async (speakerNameOverrides: Record<string, string>) => {
       if (!latestRecord || speakerUpdatePending) {
@@ -680,16 +669,17 @@ export function DiarizationPlayground({
                 <Copy className="w-4 h-4" />
               )}
             </Button>
-            <Button
-              onClick={handleDownload}
-              variant="outline"
-              size="icon"
-              className="h-9 w-9 bg-[var(--bg-surface-1)] border-[var(--border-muted)] text-[var(--text-secondary)] hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)]"
-              disabled={!hasOutput || isProcessing}
-              title="Download transcript text"
-            >
-              <Download className="w-4 h-4" />
-            </Button>
+            <DiarizationExportDialog record={latestRecord}>
+              <Button
+                variant="outline"
+                size="icon"
+                className="h-9 w-9 bg-[var(--bg-surface-1)] border-[var(--border-muted)] text-[var(--text-secondary)] hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)]"
+                disabled={!latestRecord || isProcessing}
+                title="Export transcript"
+              >
+                <Download className="w-4 h-4" />
+              </Button>
+            </DiarizationExportDialog>
           </div>
         </div>
 
