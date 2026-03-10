@@ -1,4 +1,4 @@
-//! First-party transcription history routes for the desktop UI.
+//! First-party persisted transcription resource routes for the desktop UI.
 
 mod handlers;
 mod realtime;

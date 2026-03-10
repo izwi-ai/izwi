@@ -473,18 +473,45 @@ All engine parameters are centralised in `EngineCoreConfig` (`engine/config.rs`)
 
 ## 10. API Surface
 
-The HTTP layer is implemented in `crates/izwi-server/src/api/`. The main router (`router.rs`) merges three namespaces under `/v1`:
+The HTTP layer is implemented in `crates/izwi-server/src/api/`. The main router (`router.rs`) nests a mixed first-party and compatibility surface under `/v1`:
 
 ```
 /v1
  ├── (internal)
- ├── openai/   → OpenAI-compatible endpoints
- └── admin/    → Administrative endpoints
+ ├── first-party persisted resources and realtime APIs
+ ├── openai-compatible endpoints
+ └── admin
 ```
 
 Static UI assets are served from the same router.
 
-### 10.1 OpenAI-Compatible Endpoints
+### 10.1 First-Party Persisted Resource Endpoints
+
+These routes back the desktop UI's saved history and reusable assets. Canonical routes follow plural resource naming; legacy `/records` aliases are kept temporarily for compatibility.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET, POST` | `/v1/transcriptions` | List or create saved transcription records |
+| `GET, DELETE` | `/v1/transcriptions/:id` | Fetch or delete a saved transcription record |
+| `GET` | `/v1/transcriptions/:id/audio` | Fetch stored transcription source audio |
+| `GET, POST` | `/v1/diarizations` | List or create saved diarization records |
+| `GET, PATCH, PUT, DELETE` | `/v1/diarizations/:id` | Fetch, update, or delete a saved diarization record |
+| `GET` | `/v1/diarizations/:id/audio` | Fetch stored diarization source audio |
+| `POST` | `/v1/diarizations/:id/reruns` | Re-run diarization from a saved record's source audio |
+| `GET, POST` | `/v1/text-to-speech-generations` | List or create saved TTS generations |
+| `GET, DELETE` | `/v1/text-to-speech-generations/:id` | Fetch or delete a saved TTS generation |
+| `GET` | `/v1/text-to-speech-generations/:id/audio` | Fetch generated TTS audio |
+| `GET, POST` | `/v1/voice-design-generations` | List or create saved voice design generations |
+| `GET, DELETE` | `/v1/voice-design-generations/:id` | Fetch or delete a saved voice design generation |
+| `GET` | `/v1/voice-design-generations/:id/audio` | Fetch generated voice design audio |
+| `GET, POST` | `/v1/voice-clone-generations` | List or create saved voice clone generations |
+| `GET, DELETE` | `/v1/voice-clone-generations/:id` | Fetch or delete a saved voice clone generation |
+| `GET` | `/v1/voice-clone-generations/:id/audio` | Fetch generated voice clone audio |
+| `GET, POST` | `/v1/voices` | List or create reusable saved voices |
+| `GET, DELETE` | `/v1/voices/:voice_id` | Fetch or delete a saved voice |
+| `GET` | `/v1/voices/:voice_id/audio` | Fetch saved voice reference audio |
+
+### 10.2 OpenAI-Compatible Endpoints
 
 | Method | Path | Description |
 |---|---|---|
@@ -497,7 +524,7 @@ Static UI assets are served from the same router.
 
 Sub-routers: `audio`, `chat`, `models`, `responses` (defined in `api/openai/mod.rs`).
 
-### 10.2 Admin Endpoints
+### 10.3 Admin Endpoints
 
 | Method | Path | Description |
 |---|---|---|

@@ -1,4 +1,5 @@
-//! First-party speech history routes for Text-to-Speech, Voice Design, and Voice Cloning.
+//! First-party persisted speech generation resource routes for Text-to-Speech,
+//! Voice Design, and Voice Cloning.
 
 mod handlers;
 

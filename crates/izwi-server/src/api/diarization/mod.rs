@@ -1,4 +1,4 @@
-//! First-party diarization history routes for the desktop UI.
+//! First-party persisted diarization resource routes for the desktop UI.
 
 pub mod handlers;
 
