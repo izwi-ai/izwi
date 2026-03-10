@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::backends::BackendPreference;
+use crate::config::EngineConfig;
 
 pub const ENV_HOST: &str = "IZWI_HOST";
 pub const ENV_PORT: &str = "IZWI_PORT";
@@ -105,6 +106,15 @@ impl ServeRuntimeConfig {
         }
 
         self
+    }
+
+    pub fn engine_config(&self) -> EngineConfig {
+        let mut config = EngineConfig::default();
+        config.models_dir = self.models_dir.clone();
+        config.max_batch_size = self.max_batch_size.max(1);
+        config.backend = self.backend;
+        config.num_threads = self.num_threads.max(1);
+        config
     }
 }
 
@@ -375,5 +385,23 @@ mod tests {
         );
         assert_eq!(overrides.ui_enabled, Some(false));
         clear_env();
+    }
+
+    #[test]
+    fn engine_config_uses_runtime_contract_values() {
+        let resolved = ServeRuntimeConfig {
+            models_dir: PathBuf::from("/tmp/izwi-models"),
+            backend: BackendPreference::Cpu,
+            max_batch_size: 12,
+            num_threads: 6,
+            ..ServeRuntimeConfig::default()
+        };
+
+        let engine = resolved.engine_config();
+
+        assert_eq!(engine.models_dir, PathBuf::from("/tmp/izwi-models"));
+        assert_eq!(engine.max_batch_size, 12);
+        assert_eq!(engine.backend, BackendPreference::Cpu);
+        assert_eq!(engine.num_threads, 6);
     }
 }

@@ -6,7 +6,7 @@ use crate::saved_voice_store::SavedVoiceStore;
 use crate::speech_history_store::SpeechHistoryStore;
 use crate::transcription_store::TranscriptionStore;
 use izwi_agent::planner::PlanningMode;
-use izwi_core::RuntimeService;
+use izwi_core::{RuntimeService, ServeRuntimeConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -78,18 +78,8 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(runtime: RuntimeService) -> anyhow::Result<Self> {
-        // Limit concurrent requests to prevent overwhelming the system
-        // Default: 100 concurrent requests (tunable based on hardware)
-        let max_concurrent = std::env::var("MAX_CONCURRENT_REQUESTS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100);
-
-        let timeout = std::env::var("REQUEST_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(300); // 5 minutes default
+    pub fn new(runtime: RuntimeService, serve_config: &ServeRuntimeConfig) -> anyhow::Result<Self> {
+        let (max_concurrent_requests, request_timeout_secs) = request_limits(serve_config);
         let response_store_limit = store_limit_from_env(
             "IZWI_MAX_RESPONSE_STORE_ENTRIES",
             DEFAULT_RESPONSE_STORE_LIMIT,
@@ -107,8 +97,8 @@ impl AppState {
 
         Ok(Self {
             runtime: Arc::new(runtime),
-            request_semaphore: Arc::new(Semaphore::new(max_concurrent)),
-            request_timeout_secs: timeout,
+            request_semaphore: Arc::new(Semaphore::new(max_concurrent_requests)),
+            request_timeout_secs,
             response_store_limit,
             agent_session_store_limit,
             response_store: Arc::new(RwLock::new(HashMap::new())),
@@ -159,6 +149,13 @@ impl AppState {
     }
 }
 
+fn request_limits(serve_config: &ServeRuntimeConfig) -> (usize, u64) {
+    (
+        serve_config.max_concurrent_requests.max(1),
+        serve_config.request_timeout_secs.max(1),
+    )
+}
+
 fn store_limit_from_env(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
@@ -191,9 +188,11 @@ fn trim_store_by<T>(
 #[cfg(test)]
 mod tests {
     use super::{
-        trim_store_by, StoredAgentSessionRecord, StoredResponseInputItem, StoredResponseRecord,
+        request_limits, trim_store_by, StoredAgentSessionRecord, StoredResponseInputItem,
+        StoredResponseRecord,
     };
     use izwi_agent::planner::PlanningMode;
+    use izwi_core::ServeRuntimeConfig;
     use std::collections::HashMap;
 
     #[test]
@@ -273,5 +272,19 @@ mod tests {
 
         assert!(store.contains_key("sess-new"));
         assert!(!store.contains_key("sess-old"));
+    }
+
+    #[test]
+    fn request_limits_use_serve_runtime_limits() {
+        let serve_config = ServeRuntimeConfig {
+            max_concurrent_requests: 7,
+            request_timeout_secs: 91,
+            ..ServeRuntimeConfig::default()
+        };
+
+        let (max_concurrent_requests, request_timeout_secs) = request_limits(&serve_config);
+
+        assert_eq!(request_timeout_secs, 91);
+        assert_eq!(max_concurrent_requests, 7);
     }
 }

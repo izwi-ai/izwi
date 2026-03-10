@@ -17,7 +17,7 @@ mod state;
 mod storage_layout;
 mod transcription_store;
 
-use izwi_core::{EngineConfig, RuntimeService};
+use izwi_core::{RuntimeService, ServeRuntimeConfig, ServeRuntimeConfigOverrides};
 use state::AppState;
 
 #[derive(Debug, Parser)]
@@ -49,12 +49,12 @@ enum BackendArg {
 }
 
 impl BackendArg {
-    fn as_str(&self) -> &'static str {
+    fn as_preference(&self) -> izwi_core::backends::BackendPreference {
         match self {
-            Self::Auto => "auto",
-            Self::Cpu => "cpu",
-            Self::Metal => "metal",
-            Self::Cuda => "cuda",
+            Self::Auto => izwi_core::backends::BackendPreference::Auto,
+            Self::Cpu => izwi_core::backends::BackendPreference::Cpu,
+            Self::Metal => izwi_core::backends::BackendPreference::Metal,
+            Self::Cuda => izwi_core::backends::BackendPreference::Cuda,
         }
     }
 }
@@ -69,8 +69,6 @@ struct BindConfig {
 async fn main() -> anyhow::Result<()> {
     let args = ServerArgs::parse();
 
-    apply_backend_override(&args);
-
     // Initialize logging
     tracing_subscriber::registry()
         .with(
@@ -82,13 +80,13 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting Izwi TTS Server");
 
-    // Load configuration
-    let config = EngineConfig::default();
+    let serve_config = resolve_serve_runtime_config(&args);
+    let config = serve_config.engine_config();
     info!("Models directory: {:?}", config.models_dir);
 
     // Create runtime service
     let runtime = RuntimeService::new(config)?;
-    let state = AppState::new(runtime)?;
+    let state = AppState::new(runtime, &serve_config)?;
 
     info!("Runtime service initialized");
 
@@ -96,7 +94,10 @@ async fn main() -> anyhow::Result<()> {
     let app = api::create_router(state.clone());
 
     // Start server
-    let bind = resolve_bind_config(args);
+    let bind = BindConfig {
+        host: serve_config.host.clone(),
+        port: serve_config.port,
+    };
     let addr = format!("{}:{}", bind.host, bind.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("Server listening on http://{}", addr);
@@ -113,45 +114,15 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn apply_backend_override(args: &ServerArgs) {
-    if let Some(backend) = args.backend.as_ref() {
-        std::env::set_var("IZWI_BACKEND", backend.as_str());
-    }
-}
-
-fn resolve_bind_config(args: ServerArgs) -> BindConfig {
-    BindConfig {
-        host: args.host.unwrap_or_else(host_from_env_or_default),
-        port: args.port.unwrap_or_else(port_from_env_or_default),
-    }
-}
-
-fn host_from_env_or_default() -> String {
-    match std::env::var("IZWI_HOST") {
-        Ok(raw) => {
-            let host = raw.trim();
-            if host.is_empty() {
-                warn!("Empty IZWI_HOST, falling back to 0.0.0.0");
-                "0.0.0.0".to_string()
-            } else {
-                host.to_string()
-            }
-        }
-        Err(_) => "0.0.0.0".to_string(),
-    }
-}
-
-fn port_from_env_or_default() -> u16 {
-    match std::env::var("IZWI_PORT") {
-        Ok(raw) => match raw.trim().parse::<u16>() {
-            Ok(parsed) => parsed,
-            Err(_) => {
-                warn!("Invalid IZWI_PORT='{}', falling back to 8080", raw);
-                8080
-            }
-        },
-        Err(_) => 8080,
-    }
+fn resolve_serve_runtime_config(args: &ServerArgs) -> ServeRuntimeConfig {
+    let cli = ServeRuntimeConfigOverrides {
+        host: args.host.clone(),
+        port: args.port,
+        backend: args.backend.as_ref().map(BackendArg::as_preference),
+        ..ServeRuntimeConfigOverrides::default()
+    };
+    let env = ServeRuntimeConfigOverrides::from_env();
+    ServeRuntimeConfig::from_sources(&ServeRuntimeConfigOverrides::default(), &env, &cli)
 }
 
 /// Wait for shutdown signal and cleanup
@@ -221,6 +192,12 @@ mod tests {
         std::env::remove_var("IZWI_HOST");
         std::env::remove_var("IZWI_PORT");
         std::env::remove_var("IZWI_BACKEND");
+        std::env::remove_var("IZWI_MAX_BATCH_SIZE");
+        std::env::remove_var("IZWI_NUM_THREADS");
+        std::env::remove_var("IZWI_MAX_CONCURRENT");
+        std::env::remove_var("IZWI_TIMEOUT");
+        std::env::remove_var("MAX_CONCURRENT_REQUESTS");
+        std::env::remove_var("REQUEST_TIMEOUT_SECS");
     }
 
     fn parse(args: &[&str]) -> ServerArgs {
@@ -234,9 +211,12 @@ mod tests {
         std::env::set_var("IZWI_BACKEND", "cpu");
 
         let args = parse(&["izwi-server", "--backend", "cuda"]);
-        apply_backend_override(&args);
+        let resolved = resolve_serve_runtime_config(&args);
 
-        assert_eq!(std::env::var("IZWI_BACKEND").unwrap(), "cuda");
+        assert_eq!(
+            resolved.backend,
+            izwi_core::backends::BackendPreference::Cuda
+        );
         clear_bind_env();
     }
 
@@ -256,7 +236,7 @@ mod tests {
         std::env::set_var("IZWI_HOST", "0.0.0.0");
         std::env::set_var("IZWI_PORT", "8080");
 
-        let bind = resolve_bind_config(parse(&[
+        let resolved = resolve_serve_runtime_config(&parse(&[
             "izwi-server",
             "--host",
             "127.0.0.1",
@@ -264,8 +244,8 @@ mod tests {
             "9000",
         ]));
 
-        assert_eq!(bind.host, "127.0.0.1");
-        assert_eq!(bind.port, 9000);
+        assert_eq!(resolved.host, "127.0.0.1");
+        assert_eq!(resolved.port, 9000);
         clear_bind_env();
     }
 
@@ -276,10 +256,10 @@ mod tests {
         std::env::set_var("IZWI_HOST", "127.0.0.1");
         std::env::set_var("IZWI_PORT", "8088");
 
-        let bind = resolve_bind_config(parse(&["izwi-server"]));
+        let resolved = resolve_serve_runtime_config(&parse(&["izwi-server"]));
 
-        assert_eq!(bind.host, "127.0.0.1");
-        assert_eq!(bind.port, 8088);
+        assert_eq!(resolved.host, "127.0.0.1");
+        assert_eq!(resolved.port, 8088);
         clear_bind_env();
     }
 
@@ -288,10 +268,13 @@ mod tests {
         let _guard = env_lock();
         clear_bind_env();
 
-        let bind = resolve_bind_config(parse(&["izwi-server"]));
+        let resolved = resolve_serve_runtime_config(&parse(&["izwi-server"]));
 
-        assert_eq!(bind.host, "0.0.0.0");
-        assert_eq!(bind.port, 8080);
+        assert_eq!(resolved.host, "0.0.0.0");
+        assert_eq!(resolved.port, 8080);
+        assert_eq!(resolved.max_batch_size, 8);
+        assert!(resolved.num_threads >= 1);
+        clear_bind_env();
     }
 
     #[test]
@@ -300,9 +283,41 @@ mod tests {
         clear_bind_env();
         std::env::set_var("IZWI_PORT", "not-a-port");
 
-        let bind = resolve_bind_config(parse(&["izwi-server"]));
+        let resolved = resolve_serve_runtime_config(&parse(&["izwi-server"]));
 
-        assert_eq!(bind.port, 8080);
+        assert_eq!(resolved.port, 8080);
+        clear_bind_env();
+    }
+
+    #[test]
+    fn canonical_runtime_env_values_flow_into_serve_config() {
+        let _guard = env_lock();
+        clear_bind_env();
+        std::env::set_var("IZWI_MAX_BATCH_SIZE", "16");
+        std::env::set_var("IZWI_NUM_THREADS", "6");
+        std::env::set_var("IZWI_MAX_CONCURRENT", "44");
+        std::env::set_var("IZWI_TIMEOUT", "720");
+
+        let resolved = resolve_serve_runtime_config(&parse(&["izwi-server"]));
+
+        assert_eq!(resolved.max_batch_size, 16);
+        assert_eq!(resolved.num_threads, 6);
+        assert_eq!(resolved.max_concurrent_requests, 44);
+        assert_eq!(resolved.request_timeout_secs, 720);
+        clear_bind_env();
+    }
+
+    #[test]
+    fn legacy_runtime_env_aliases_are_still_supported() {
+        let _guard = env_lock();
+        clear_bind_env();
+        std::env::set_var("MAX_CONCURRENT_REQUESTS", "45");
+        std::env::set_var("REQUEST_TIMEOUT_SECS", "721");
+
+        let resolved = resolve_serve_runtime_config(&parse(&["izwi-server"]));
+
+        assert_eq!(resolved.max_concurrent_requests, 45);
+        assert_eq!(resolved.request_timeout_secs, 721);
         clear_bind_env();
     }
 }
