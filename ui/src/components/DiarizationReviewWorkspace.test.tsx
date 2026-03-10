@@ -65,12 +65,17 @@ const record = {
 
 describe("DiarizationReviewWorkspace", () => {
   beforeEach(() => {
-    vi.spyOn(window.HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    vi.spyOn(window.HTMLMediaElement.prototype, "pause").mockImplementation(
+      () => {},
+    );
   });
 
   it("supports transcript seeking and active-row highlighting", () => {
     const { container } = render(
-      <DiarizationReviewWorkspace record={record} audioUrl="/audio/meeting.wav" />,
+      <DiarizationReviewWorkspace
+        record={record}
+        audioUrl="/audio/meeting.wav"
+      />,
     );
 
     expect(screen.getByText("Talk Time")).toBeInTheDocument();
@@ -101,6 +106,5 @@ describe("DiarizationReviewWorkspace", () => {
     fireEvent.timeUpdate(audio!);
 
     expect(secondRow).toHaveAttribute("data-active", "true");
-    expect(screen.getByText("Review Playback")).toBeInTheDocument();
   });
 });

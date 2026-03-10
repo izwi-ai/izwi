@@ -17,13 +17,6 @@ import clsx from "clsx";
 import { RouteHistoryDrawer } from "@/components/RouteHistoryDrawer";
 import { Button } from "@/components/ui/button";
 import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
-import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -435,7 +428,10 @@ export function DiarizationHistoryPanel({
   );
 
   const normalizedActiveTranscript = useMemo(
-    () => (activeHistoryRecord ? formattedTranscriptFromRecord(activeHistoryRecord) : ""),
+    () =>
+      activeHistoryRecord
+        ? formattedTranscriptFromRecord(activeHistoryRecord)
+        : "",
     [activeHistoryRecord],
   );
 
@@ -457,14 +453,19 @@ export function DiarizationHistoryPanel({
       setSpeakerUpdatePending(true);
       setSpeakerUpdateError(null);
       try {
-        const updatedRecord = await api.updateDiarizationRecord(activeHistoryRecord.id, {
-          speaker_name_overrides: speakerNameOverrides,
-        });
+        const updatedRecord = await api.updateDiarizationRecord(
+          activeHistoryRecord.id,
+          {
+            speaker_name_overrides: speakerNameOverrides,
+          },
+        );
         setSelectedHistoryRecord(updatedRecord);
         mergeHistorySummary(summarizeRecord(updatedRecord));
       } catch (err) {
         setSpeakerUpdateError(
-          err instanceof Error ? err.message : "Failed to save speaker corrections.",
+          err instanceof Error
+            ? err.message
+            : "Failed to save speaker corrections.",
         );
       } finally {
         setSpeakerUpdatePending(false);
@@ -646,22 +647,44 @@ export function DiarizationHistoryPanel({
               className="mx-auto flex max-h-[92vh] w-full max-w-6xl flex-col overflow-hidden rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] shadow-2xl"
             >
               <div className="flex items-center justify-between gap-3 border-b border-[var(--border-muted)] px-4 py-3 sm:px-6">
-                <div className="min-w-0">
+                <div className="min-w-0 flex-1">
                   <p className="text-[11px] uppercase tracking-wide text-[var(--text-subtle)]">
                     Diarization Record
                   </p>
-                  <h3 className="truncate text-sm font-medium text-[var(--text-primary)] mt-1">
-                    {selectedHistorySummary?.audio_filename ||
-                      selectedHistorySummary?.model_id ||
-                      "Diarization transcript"}
-                  </h3>
-                  <p className="text-xs text-[var(--text-muted)] mt-1">
-                    {selectedHistorySummary
-                      ? formatCreatedAt(selectedHistorySummary.created_at)
-                      : "No record selected"}
-                  </p>
+                  <div className="mt-1 flex items-center gap-3">
+                    <h3 className="truncate text-base font-semibold text-[var(--text-primary)]">
+                      {selectedHistorySummary?.audio_filename ||
+                        selectedHistorySummary?.model_id ||
+                        "Diarization transcript"}
+                    </h3>
+                  </div>
+                  <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                    <p className="text-xs text-[var(--text-muted)]">
+                      {selectedHistorySummary
+                        ? formatCreatedAt(selectedHistorySummary.created_at)
+                        : "No record selected"}
+                    </p>
+                    {activeHistoryRecord ? (
+                      <>
+                        <span className="text-[var(--text-subtle)]">•</span>
+                        <span className="rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-1.5 py-0.5 text-[10px] text-[var(--text-secondary)]">
+                          {formatAudioDuration(
+                            activeHistoryRecord.duration_secs,
+                          )}
+                        </span>
+                        <span className="rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-1.5 py-0.5 text-[10px] text-[var(--text-secondary)]">
+                          {activeHistoryRecord.corrected_speaker_count ??
+                            activeHistoryRecord.speaker_count}{" "}
+                          speakers
+                        </span>
+                        <span className="rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-1.5 py-0.5 text-[10px] text-[var(--text-secondary)] truncate max-w-[150px]">
+                          {activeHistoryRecord.model_id || "Unknown model"}
+                        </span>
+                      </>
+                    ) : null}
+                  </div>
                 </div>
-                <div className="flex items-center gap-1.5">
+                <div className="flex items-center gap-1.5 shrink-0">
                   {activeHistoryRecord && (
                     <button
                       onClick={() =>
@@ -700,157 +723,111 @@ export function DiarizationHistoryPanel({
                 </div>
               </div>
 
-              <div className="grid flex-1 overflow-hidden lg:grid-cols-[360px,minmax(0,1fr)]">
-                <div className="border-b border-[var(--border-muted)] p-4 sm:p-5 lg:border-b-0 lg:border-r">
-                  {selectedHistoryLoading ? (
-                    <div className="h-full min-h-[220px] flex items-center justify-center gap-2 text-sm text-[var(--text-muted)]">
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                      Loading record...
-                    </div>
-                  ) : selectedHistoryError ? (
+              <div className="flex-1 overflow-y-auto flex flex-col">
+                {selectedHistoryLoading ? (
+                  <div className="h-full min-h-[220px] flex items-center justify-center gap-2 text-sm text-[var(--text-muted)]">
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Loading record...
+                  </div>
+                ) : selectedHistoryError ? (
+                  <div className="p-4 sm:p-5">
                     <div className="rounded-lg border border-[var(--danger-border)] bg-[var(--danger-bg)] px-3 py-2 text-xs text-[var(--danger-text)]">
                       {selectedHistoryError}
                     </div>
-                  ) : activeHistoryRecord ? (
-                    <>
-                      <div className="flex flex-wrap gap-1.5 mb-4">
-                        <span className="rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-2 py-1 text-[11px] text-[var(--text-secondary)]">
-                          {activeHistoryRecord.model_id || "Unknown model"}
-                        </span>
-                        <span className="rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-2 py-1 text-[11px] text-[var(--text-secondary)]">
-                          {activeHistoryRecord.corrected_speaker_count ??
-                            activeHistoryRecord.speaker_count}{" "}
-                          speakers
-                        </span>
-                        <span className="rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-2 py-1 text-[11px] text-[var(--text-secondary)]">
-                          {formatAudioDuration(
-                            activeHistoryRecord.duration_secs,
-                          )}
-                        </span>
-                      </div>
+                  </div>
+                ) : activeHistoryRecord ? (
+                  <div className="p-4 sm:p-5">
+                    <Tabs
+                      value={recordWorkspaceTab}
+                      onValueChange={setRecordWorkspaceTab}
+                      className="space-y-4"
+                    >
+                      <TabsList className="w-full justify-start bg-[var(--bg-surface-1)]">
+                        <TabsTrigger value="transcript">Transcript</TabsTrigger>
+                        <TabsTrigger value="speakers">Speakers</TabsTrigger>
+                        <TabsTrigger value="quality">Quality</TabsTrigger>
+                      </TabsList>
 
-                      <Card className="border-[var(--border-muted)] bg-[var(--bg-surface-1)] shadow-none">
-                        <CardHeader className="pb-3">
-                          <CardTitle className="text-sm text-[var(--text-primary)]">
-                            Review Workspace
-                          </CardTitle>
-                          <CardDescription className="text-[var(--text-muted)]">
-                            Use the transcript tab to scrub the recording, inspect the
-                            speaker timeline, and validate corrected speaker turns.
-                          </CardDescription>
-                        </CardHeader>
-                        <CardContent className="space-y-3 text-sm text-[var(--text-secondary)]">
-                          <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-4 py-3">
-                            <div className="text-[11px] uppercase tracking-wider text-[var(--text-subtle)]">
-                              Saved audio
-                            </div>
-                            <div className="mt-1 font-medium text-[var(--text-primary)]">
-                              {activeHistoryRecord.audio_filename || "Attached to this record"}
-                            </div>
-                          </div>
-                          <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-4 py-3">
-                            <div className="text-[11px] uppercase tracking-wider text-[var(--text-subtle)]">
-                              Review flow
-                            </div>
-                            <p className="mt-1 leading-relaxed">
-                              Click any timeline block or transcript row to jump to that
-                              moment, then switch to the speakers or quality tab if a
-                              label needs correction or the run needs tuning.
-                            </p>
-                          </div>
-                        </CardContent>
-                      </Card>
-                    </>
-                  ) : (
-                    <div className="h-full min-h-[220px] flex items-center justify-center text-sm text-[var(--text-subtle)] text-center">
-                      Select a history record to inspect playback and
-                      transcript.
-                    </div>
-                  )}
-                </div>
-
-                <div className="p-4 sm:p-5 overflow-y-auto">
-                  <Tabs
-                    value={recordWorkspaceTab}
-                    onValueChange={setRecordWorkspaceTab}
-                    className="space-y-4"
-                  >
-                    <TabsList className="w-full justify-start bg-[var(--bg-surface-1)]">
-                      <TabsTrigger value="transcript">Transcript</TabsTrigger>
-                      <TabsTrigger value="speakers">Speakers</TabsTrigger>
-                      <TabsTrigger value="quality">Quality</TabsTrigger>
-                    </TabsList>
-
-                    <TabsContent value="transcript" className="mt-0 space-y-4">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <h4 className="text-sm font-medium text-[var(--text-primary)]">
-                          Transcript
-                        </h4>
-                        <div className="flex items-center gap-2">
-                          <button
-                            onClick={() => void handleCopyHistoryTranscript()}
-                            className="inline-flex items-center gap-1 rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-2.5 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:border-[var(--border-strong)] hover:text-[var(--text-primary)] disabled:opacity-45"
-                            disabled={!normalizedActiveTranscript}
-                          >
-                            {historyTranscriptCopied ? (
-                              <>
-                                <Check className="w-3.5 h-3.5" />
-                                Copied
-                              </>
-                            ) : (
-                              <>
-                                <Copy className="w-3.5 h-3.5" />
-                                Copy
-                              </>
-                            )}
-                          </button>
-                          <DiarizationExportDialog record={activeHistoryRecord}>
-                            <Button
-                              type="button"
-                              variant="outline"
-                              size="sm"
-                              className="h-8 border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-2.5 text-xs text-[var(--text-secondary)]"
+                      <TabsContent
+                        value="transcript"
+                        className="mt-0 space-y-4"
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <h4 className="text-sm font-medium text-[var(--text-primary)]">
+                            Transcript
+                          </h4>
+                          <div className="flex items-center gap-2">
+                            <button
+                              onClick={() => void handleCopyHistoryTranscript()}
+                              className="inline-flex items-center gap-1 rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-2.5 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:border-[var(--border-strong)] hover:text-[var(--text-primary)] disabled:opacity-45"
                               disabled={!normalizedActiveTranscript}
                             >
-                              <Download className="w-3.5 h-3.5" />
-                              Export
-                            </Button>
-                          </DiarizationExportDialog>
+                              {historyTranscriptCopied ? (
+                                <>
+                                  <Check className="w-3.5 h-3.5" />
+                                  Copied
+                                </>
+                              ) : (
+                                <>
+                                  <Copy className="w-3.5 h-3.5" />
+                                  Copy
+                                </>
+                              )}
+                            </button>
+                            <DiarizationExportDialog
+                              record={activeHistoryRecord}
+                            >
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                className="h-8 border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-2.5 text-xs text-[var(--text-secondary)]"
+                                disabled={!normalizedActiveTranscript}
+                              >
+                                <Download className="w-3.5 h-3.5" />
+                                Export
+                              </Button>
+                            </DiarizationExportDialog>
+                          </div>
                         </div>
-                      </div>
 
-                      <DiarizationReviewWorkspace
-                        record={activeHistoryRecord}
-                        audioUrl={selectedHistoryAudioUrl}
-                        loading={selectedHistoryLoading}
-                        emptyMessage={
-                          normalizedActiveTranscript ||
-                          "No transcript text available for this record."
-                        }
-                      />
-                    </TabsContent>
-
-                    <TabsContent value="speakers" className="mt-0">
-                      {activeHistoryRecord ? (
-                        <DiarizationSpeakerManager
+                        <DiarizationReviewWorkspace
                           record={activeHistoryRecord}
-                          isSaving={speakerUpdatePending}
-                          error={speakerUpdateError}
-                          onSave={handleSaveSpeakerCorrections}
+                          audioUrl={selectedHistoryAudioUrl}
+                          loading={selectedHistoryLoading}
+                          emptyMessage={
+                            normalizedActiveTranscript ||
+                            "No transcript text available for this record."
+                          }
                         />
-                      ) : null}
-                    </TabsContent>
+                      </TabsContent>
 
-                    <TabsContent value="quality" className="mt-0">
-                      <DiarizationQualityPanel
-                        record={activeHistoryRecord}
-                        isRerunning={rerunPending}
-                        error={rerunError}
-                        onRerun={handleRerunRecord}
-                      />
-                    </TabsContent>
-                  </Tabs>
-                </div>
+                      <TabsContent value="speakers" className="mt-0">
+                        {activeHistoryRecord ? (
+                          <DiarizationSpeakerManager
+                            record={activeHistoryRecord}
+                            isSaving={speakerUpdatePending}
+                            error={speakerUpdateError}
+                            onSave={handleSaveSpeakerCorrections}
+                          />
+                        ) : null}
+                      </TabsContent>
+
+                      <TabsContent value="quality" className="mt-0">
+                        <DiarizationQualityPanel
+                          record={activeHistoryRecord}
+                          isRerunning={rerunPending}
+                          error={rerunError}
+                          onRerun={handleRerunRecord}
+                        />
+                      </TabsContent>
+                    </Tabs>
+                  </div>
+                ) : (
+                  <div className="h-full min-h-[220px] flex items-center justify-center text-sm text-[var(--text-subtle)] text-center">
+                    Select a history record to inspect playback and transcript.
+                  </div>
+                )}
               </div>
             </motion.div>
           </motion.div>
