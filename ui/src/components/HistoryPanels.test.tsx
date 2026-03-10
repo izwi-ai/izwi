@@ -99,6 +99,7 @@ describe("History panels", () => {
     fireEvent.click(historyButton);
 
     expect(await screen.findByText("Speech History")).toBeInTheDocument();
+    expect(screen.queryByTitle("Refresh history")).not.toBeInTheDocument();
 
     fireEvent.pointerDown(
       screen.getByRole("button", { name: "Delete speech.wav" }),
@@ -170,6 +171,7 @@ describe("History panels", () => {
     fireEvent.click(historyButton);
 
     expect(await screen.findByText("Diarization History")).toBeInTheDocument();
+    expect(screen.queryByTitle("Refresh history")).not.toBeInTheDocument();
 
     fireEvent.pointerDown(
       screen.getByRole("button", { name: "Delete meeting.wav" }),

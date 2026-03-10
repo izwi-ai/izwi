@@ -16,7 +16,6 @@ import {
   Pause,
   Play,
   Radio,
-  RefreshCw,
   RotateCcw,
   Settings2,
   SkipBack,
@@ -1142,18 +1141,6 @@ export function TranscriptionPlayground({
       triggerCount={historyRecords.length}
       open={isHistoryDrawerOpen}
       onOpenChange={handleHistoryDrawerOpenChange}
-      headerActions={
-        <button
-          onClick={() => void loadHistory()}
-          className="btn btn-ghost app-sidebar-refresh-btn"
-          disabled={historyLoading}
-          title="Refresh history"
-        >
-          <RefreshCw
-            className={cn("w-4 h-4", historyLoading && "animate-spin")}
-          />
-        </button>
-      }
     >
       {({ close }) => (
         <>

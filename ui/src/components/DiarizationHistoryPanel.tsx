@@ -11,7 +11,6 @@ import {
   Loader2,
   Pause,
   Play,
-  RefreshCw,
   SkipBack,
   SkipForward,
   Trash2,
@@ -572,19 +571,6 @@ export function DiarizationHistoryPanel({
       triggerCount={historyRecords.length}
       open={isHistoryDrawerOpen}
       onOpenChange={handleHistoryDrawerOpenChange}
-      headerActions={
-        <button
-          onClick={() => void loadHistory()}
-          className="btn btn-ghost app-sidebar-refresh-btn"
-          disabled={historyLoading}
-          title="Refresh history"
-        >
-          <RefreshCw
-            className={clsx("w-3.5 h-3.5", historyLoading && "animate-spin")}
-          />
-          Refresh
-        </button>
-      }
     >
       {({ close }) => (
         <>

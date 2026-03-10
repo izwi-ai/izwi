@@ -90,6 +90,7 @@ describe("TranscriptionPlayground history", () => {
     fireEvent.click(historyButton);
 
     expect(await screen.findByText("Transcriptions")).toBeInTheDocument();
+    expect(screen.queryByTitle("Refresh history")).not.toBeInTheDocument();
 
     fireEvent.pointerDown(
       screen.getByRole("button", { name: "Delete clip.wav" }),
