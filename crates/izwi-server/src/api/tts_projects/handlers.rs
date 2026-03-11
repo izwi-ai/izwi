@@ -76,6 +76,12 @@ pub struct UpdateTtsProjectSegmentRequest {
     pub text: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SplitTtsProjectSegmentRequest {
+    pub before_text: String,
+    pub after_text: String,
+}
+
 pub async fn list_tts_projects(
     State(state): State<AppState>,
 ) -> Result<Json<TtsProjectListResponse>, ApiError> {
@@ -102,8 +108,13 @@ pub async fn create_tts_project(
         }
     });
 
-    validate_project_voice_state(&state, voice_mode, req.speaker.as_deref(), req.saved_voice_id.as_deref())
-        .await?;
+    validate_project_voice_state(
+        &state,
+        voice_mode,
+        req.speaker.as_deref(),
+        req.saved_voice_id.as_deref(),
+    )
+    .await?;
 
     let variant = parse_tts_model_variant(model_id.as_str())
         .map_err(|err| ApiError::bad_request(format!("Unsupported TTS model: {err}")))?;
@@ -244,6 +255,51 @@ pub async fn update_tts_project_segment(
     Ok(Json(project))
 }
 
+pub async fn split_tts_project_segment(
+    State(state): State<AppState>,
+    Path((project_id, segment_id)): Path<(String, String)>,
+    Json(req): Json<SplitTtsProjectSegmentRequest>,
+) -> Result<Json<TtsProjectRecord>, ApiError> {
+    let before_text = required_trimmed(Some(req.before_text.as_str()), "before_text")?;
+    let after_text = required_trimmed(Some(req.after_text.as_str()), "after_text")?;
+
+    let project = state
+        .tts_project_store
+        .split_segment(project_id, segment_id, before_text, after_text)
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("TTS project segment not found"))?;
+
+    Ok(Json(project))
+}
+
+pub async fn delete_tts_project_segment(
+    State(state): State<AppState>,
+    Path((project_id, segment_id)): Path<(String, String)>,
+) -> Result<Json<TtsProjectRecord>, ApiError> {
+    let existing = state
+        .tts_project_store
+        .get_project(project_id.clone())
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("TTS project not found"))?;
+
+    if existing.segments.len() <= 1 {
+        return Err(ApiError::bad_request(
+            "A project must keep at least one segment.",
+        ));
+    }
+
+    let project = state
+        .tts_project_store
+        .delete_segment(project_id, segment_id)
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("TTS project segment not found"))?;
+
+    Ok(Json(project))
+}
+
 pub async fn render_tts_project_segment(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,
@@ -358,7 +414,9 @@ pub async fn get_tts_project_audio(
     })?;
     let wav_bytes = AudioEncoder::new(sample_rate, 1)
         .encode(merged_samples.as_slice(), AudioFormat::Wav)
-        .map_err(|err| ApiError::internal(format!("Failed to encode merged project audio: {err}")))?;
+        .map_err(|err| {
+            ApiError::internal(format!("Failed to encode merged project audio: {err}"))
+        })?;
 
     Ok(audio_response(
         StoredSpeechAudio {
@@ -423,7 +481,8 @@ async fn validate_project_voice_state(
             }
         }
         TtsProjectVoiceMode::Saved => {
-            let Some(voice_id) = saved_voice_id.filter(|value| has_non_empty_text(Some(value))) else {
+            let Some(voice_id) = saved_voice_id.filter(|value| has_non_empty_text(Some(value)))
+            else {
                 return Err(ApiError::bad_request(
                     "Saved-voice TTS projects require a saved_voice_id selection.",
                 ));
@@ -462,7 +521,9 @@ fn normalize_optional_trimmed(raw: Option<String>) -> Option<String> {
 }
 
 fn has_non_empty_text(raw: Option<&str>) -> bool {
-    raw.map(str::trim).map(|value| !value.is_empty()).unwrap_or(false)
+    raw.map(str::trim)
+        .map(|value| !value.is_empty())
+        .unwrap_or(false)
 }
 
 fn voice_mode_speaker(voice_mode: TtsProjectVoiceMode, speaker: Option<String>) -> Option<String> {
@@ -491,7 +552,11 @@ fn default_project_name(source_text: &str) -> String {
     if snippet.is_empty() {
         "TTS Project".to_string()
     } else {
-        format!("{}{}", snippet, if snippet.ends_with('.') { "" } else { "..." })
+        format!(
+            "{}{}",
+            snippet,
+            if snippet.ends_with('.') { "" } else { "..." }
+        )
     }
 }
 

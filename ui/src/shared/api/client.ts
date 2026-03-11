@@ -51,6 +51,8 @@ const audioMethodNames = [
   "getTtsProject",
   "updateTtsProject",
   "updateTtsProjectSegment",
+  "splitTtsProjectSegment",
+  "deleteTtsProjectSegment",
   "renderTtsProjectSegment",
   "ttsProjectAudioUrl",
   "deleteTtsProject",

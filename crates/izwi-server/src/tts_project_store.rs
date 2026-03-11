@@ -127,10 +127,7 @@ impl TtsProjectStore {
             .context("Failed to prepare TTS project storage layout")?;
 
         let conn = storage_layout::open_sqlite_connection(&db_path).with_context(|| {
-            format!(
-                "Failed to open TTS project database: {}",
-                db_path.display()
-            )
+            format!("Failed to open TTS project database: {}", db_path.display())
         })?;
 
         conn.execute_batch(
@@ -410,6 +407,143 @@ impl TtsProjectStore {
                 return Ok(None);
             }
 
+            sync_project_source_text(&tx, project_id.as_str())?;
+            touch_project(&tx, project_id.as_str(), now)?;
+            tx.commit()?;
+            fetch_project(&conn, &project_id)
+        })
+        .await
+    }
+
+    pub async fn split_segment(
+        &self,
+        project_id: String,
+        segment_id: String,
+        before_text: String,
+        after_text: String,
+    ) -> anyhow::Result<Option<TtsProjectRecord>> {
+        self.run_blocking(move |db_path| {
+            let mut conn = storage_layout::open_sqlite_connection(&db_path)?;
+            let tx = conn.transaction()?;
+            let now = now_unix_millis_i64();
+
+            let position = tx
+                .query_row(
+                    r#"
+                    SELECT position
+                    FROM tts_project_segments
+                    WHERE project_id = ?1 AND id = ?2
+                    "#,
+                    params![project_id.as_str(), segment_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+
+            let Some(position) = position else {
+                tx.rollback()?;
+                return Ok(None);
+            };
+
+            tx.execute(
+                r#"
+                UPDATE tts_project_segments
+                SET position = position + 1
+                WHERE project_id = ?1 AND position > ?2
+                "#,
+                params![project_id.as_str(), position],
+            )?;
+
+            tx.execute(
+                r#"
+                UPDATE tts_project_segments
+                SET
+                    text = ?3,
+                    speech_record_id = NULL,
+                    updated_at = ?4
+                WHERE project_id = ?1 AND id = ?2
+                "#,
+                params![project_id.as_str(), segment_id.as_str(), before_text, now],
+            )?;
+
+            let next_segment_id = format!("ttss_{}", uuid::Uuid::new_v4().simple());
+            tx.execute(
+                r#"
+                INSERT INTO tts_project_segments (
+                    id,
+                    project_id,
+                    position,
+                    text,
+                    speech_record_id,
+                    updated_at
+                ) VALUES (?1, ?2, ?3, ?4, NULL, ?5)
+                "#,
+                params![
+                    next_segment_id,
+                    project_id.as_str(),
+                    position + 1,
+                    after_text,
+                    now
+                ],
+            )?;
+
+            sync_project_source_text(&tx, project_id.as_str())?;
+            touch_project(&tx, project_id.as_str(), now)?;
+            tx.commit()?;
+            fetch_project(&conn, &project_id)
+        })
+        .await
+    }
+
+    pub async fn delete_segment(
+        &self,
+        project_id: String,
+        segment_id: String,
+    ) -> anyhow::Result<Option<TtsProjectRecord>> {
+        self.run_blocking(move |db_path| {
+            let mut conn = storage_layout::open_sqlite_connection(&db_path)?;
+            let tx = conn.transaction()?;
+            let now = now_unix_millis_i64();
+
+            let position = tx
+                .query_row(
+                    r#"
+                    SELECT position
+                    FROM tts_project_segments
+                    WHERE project_id = ?1 AND id = ?2
+                    "#,
+                    params![project_id.as_str(), segment_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+
+            let Some(position) = position else {
+                tx.rollback()?;
+                return Ok(None);
+            };
+
+            let deleted = tx.execute(
+                r#"
+                DELETE FROM tts_project_segments
+                WHERE project_id = ?1 AND id = ?2
+                "#,
+                params![project_id.as_str(), segment_id.as_str()],
+            )?;
+
+            if deleted == 0 {
+                tx.rollback()?;
+                return Ok(None);
+            }
+
+            tx.execute(
+                r#"
+                UPDATE tts_project_segments
+                SET position = position - 1
+                WHERE project_id = ?1 AND position > ?2
+                "#,
+                params![project_id.as_str(), position],
+            )?;
+
+            sync_project_source_text(&tx, project_id.as_str())?;
             touch_project(&tx, project_id.as_str(), now)?;
             tx.commit()?;
             fetch_project(&conn, &project_id)
@@ -612,6 +746,29 @@ fn touch_project(conn: &Connection, project_id: &str, updated_at: i64) -> anyhow
     Ok(())
 }
 
+fn sync_project_source_text(conn: &Connection, project_id: &str) -> anyhow::Result<()> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT text
+        FROM tts_project_segments
+        WHERE project_id = ?1
+        ORDER BY position ASC, id ASC
+        "#,
+    )?;
+    let rows = stmt.query_map(params![project_id], |row| row.get::<_, String>(0))?;
+
+    let mut segment_texts = Vec::new();
+    for row in rows {
+        segment_texts.push(row?);
+    }
+
+    conn.execute(
+        "UPDATE tts_projects SET source_text = ?2 WHERE id = ?1",
+        params![project_id, segment_texts.join("\n\n")],
+    )?;
+    Ok(())
+}
+
 fn now_unix_millis_i64() -> i64 {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -746,6 +903,104 @@ mod tests {
 
         assert_eq!(refreshed.segments[0].text, "Updated line.");
         assert_eq!(refreshed.segments[0].speech_record_id, None);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn split_and_delete_segment_reorders_project_blocks() {
+        let root = test_env_root("tts-project-segment-ops");
+        let db_path = root.join("test.sqlite3");
+        let media_dir = root.join("media");
+        std::fs::create_dir_all(&root).expect("root should be created");
+
+        let store =
+            TtsProjectStore::initialize_at(db_path, media_dir).expect("store should initialize");
+        let conn = storage_layout::open_sqlite_connection(&store.db_path)
+            .expect("speech schema connection should open");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS speech_history_records (
+                id TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL,
+                route_kind TEXT NOT NULL,
+                model_id TEXT NULL,
+                speaker TEXT NULL,
+                language TEXT NULL,
+                saved_voice_id TEXT NULL,
+                speed REAL NULL,
+                input_text TEXT NOT NULL,
+                voice_description TEXT NULL,
+                reference_text TEXT NULL,
+                generation_time_ms REAL NULL,
+                audio_duration_secs REAL NULL,
+                rtf REAL NULL,
+                tokens_generated INTEGER NULL,
+                audio_mime_type TEXT NOT NULL,
+                audio_filename TEXT NULL,
+                audio_storage_path TEXT NOT NULL
+            );
+            "#,
+        )
+        .expect("speech schema should initialize");
+
+        let created = store
+            .create_project(NewTtsProjectRecord {
+                name: "Narration project".to_string(),
+                source_filename: Some("script.txt".to_string()),
+                source_text: "Hello world. Another sentence.".to_string(),
+                model_id: Some("Qwen3-TTS".to_string()),
+                voice_mode: TtsProjectVoiceMode::BuiltIn,
+                speaker: Some("Vivian".to_string()),
+                saved_voice_id: None,
+                speed: Some(1.0),
+                segments: vec![
+                    NewTtsProjectSegment {
+                        position: 0,
+                        text: "Hello world. Another sentence.".to_string(),
+                    },
+                    NewTtsProjectSegment {
+                        position: 1,
+                        text: "Closing line.".to_string(),
+                    },
+                ],
+            })
+            .await
+            .expect("project should be created");
+
+        let first_segment = created.segments.first().expect("segment should exist");
+        let split = store
+            .split_segment(
+                created.id.clone(),
+                first_segment.id.clone(),
+                "Hello world.".to_string(),
+                "Another sentence.".to_string(),
+            )
+            .await
+            .expect("split should succeed")
+            .expect("project should exist");
+
+        assert_eq!(split.segments.len(), 3);
+        assert_eq!(split.segments[0].text, "Hello world.");
+        assert_eq!(split.segments[1].text, "Another sentence.");
+        assert_eq!(split.segments[2].text, "Closing line.");
+        assert_eq!(
+            split.source_text,
+            "Hello world.\n\nAnother sentence.\n\nClosing line."
+        );
+
+        let deleted = store
+            .delete_segment(split.id.clone(), split.segments[1].id.clone())
+            .await
+            .expect("delete should succeed")
+            .expect("project should exist");
+
+        assert_eq!(deleted.segments.len(), 2);
+        assert_eq!(deleted.segments[0].position, 0);
+        assert_eq!(deleted.segments[1].position, 1);
+        assert_eq!(deleted.segments[0].text, "Hello world.");
+        assert_eq!(deleted.segments[1].text, "Closing line.");
+        assert_eq!(deleted.source_text, "Hello world.\n\nClosing line.");
 
         let _ = std::fs::remove_dir_all(root);
     }

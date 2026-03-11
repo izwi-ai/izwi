@@ -24,7 +24,13 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/tts-projects/:project_id/segments/:segment_id",
-            get(handlers::get_tts_project_segment).patch(handlers::update_tts_project_segment),
+            get(handlers::get_tts_project_segment)
+                .patch(handlers::update_tts_project_segment)
+                .delete(handlers::delete_tts_project_segment),
+        )
+        .route(
+            "/tts-projects/:project_id/segments/:segment_id/split",
+            axum::routing::post(handlers::split_tts_project_segment),
         )
         .route(
             "/tts-projects/:project_id/segments/:segment_id/render",
