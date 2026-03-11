@@ -1207,8 +1207,10 @@ export function TranscriptionPlayground({
         variant="outline"
         onClick={() => setIsModelMenuOpen((prev) => !prev)}
         className={cn(
-          "w-full justify-between font-normal h-9",
-          selectedOption?.isReady ? "border-primary/20 bg-primary/5" : "",
+          "h-10 w-full justify-between rounded-lg border-[var(--border-muted)] bg-[var(--bg-surface-0)] font-normal text-[var(--text-primary)] shadow-sm hover:bg-[var(--bg-surface-2)]",
+          selectedOption?.isReady
+            ? "border-[var(--border-strong)]"
+            : "text-[var(--text-secondary)]",
         )}
       >
         <span className="flex-1 min-w-0 truncate text-left">
@@ -1229,7 +1231,7 @@ export function TranscriptionPlayground({
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: 6, scale: 0.98 }}
             transition={{ duration: 0.16 }}
-            className="absolute left-0 right-0 top-full mt-2 rounded-md border bg-popover text-popover-foreground p-1 shadow-md z-[90]"
+            className="absolute left-0 right-0 top-full z-[90] mt-2 rounded-xl border border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-1.5 text-[var(--text-primary)] shadow-xl"
           >
             <div className="max-h-64 overflow-y-auto">
               {modelOptions.map((option) => (
@@ -1240,9 +1242,9 @@ export function TranscriptionPlayground({
                     setIsModelMenuOpen(false);
                   }}
                   className={cn(
-                    "relative flex w-full cursor-default select-none items-center rounded-sm py-1.5 px-2 text-sm outline-none transition-colors hover:bg-accent hover:text-accent-foreground focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
+                    "relative flex w-full cursor-default select-none items-center rounded-lg px-2.5 py-2 text-sm outline-none transition-colors hover:bg-[var(--bg-surface-1)] focus:bg-[var(--bg-surface-1)] data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
                     selectedOption?.value === option.value &&
-                      "bg-accent text-accent-foreground",
+                      "bg-[var(--bg-surface-1)]",
                   )}
                 >
                   <div className="flex flex-col items-start min-w-0 w-full">
@@ -1416,7 +1418,7 @@ export function TranscriptionPlayground({
           )}
         </div>
 
-        <div className="rounded-xl border border-[var(--border-muted)] bg-muted/30 p-4 space-y-3 shadow-inner">
+      <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 space-y-3">
           <div>
             <div className="text-[11px] text-[var(--text-subtle)] uppercase tracking-wide mb-2">
               Active Model
@@ -1527,15 +1529,6 @@ export function TranscriptionPlayground({
             </div>
           </div>
         </div>
-
-        {audioUrl && (
-          <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-2)] p-3">
-            <div className="text-xs text-[var(--text-subtle)] mb-2">
-              Latest input
-            </div>
-            <audio src={audioUrl} controls className="w-full h-9" />
-          </div>
-        )}
 
         {hasDraft && (
           <button
