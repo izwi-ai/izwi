@@ -849,118 +849,114 @@ export function TextToSpeechProjectsWorkspace({
         )
       : 0;
   const projectLibraryActions = (
-    <div className="flex items-center gap-2">
-      <Button
-        size="sm"
-        onClick={openCreateProjectDialog}
-        className="h-9 gap-2 rounded-lg"
-      >
-        <FilePlus2 className="h-4 w-4" />
-        New project
-      </Button>
-      <RouteHistoryDrawer
-        title="TTS Projects"
-        eyebrow="Project Library"
-        countLabel={
-          projectsLoading
-            ? "Loading your reusable script projects."
-            : projects.length === 0
-              ? "No TTS projects yet."
-              : `${projects.length} reusable script project${projects.length === 1 ? "" : "s"}.`
-        }
-        trigger={
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className="h-9 shrink-0 gap-2 rounded-lg border-[var(--border-muted)] bg-[var(--bg-surface-2)] text-[var(--text-secondary)] shadow-none hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-3)] hover:text-[var(--text-primary)]"
-          >
-            <Library className="h-4 w-4 shrink-0" />
-            <span>Project Library</span>
-            <span className="inline-flex min-w-5 items-center justify-center rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-3)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--text-primary)]">
-              {projects.length > 99 ? "99+" : projects.length}
-            </span>
-          </Button>
-        }
-        open={isProjectLibraryOpen}
-        onOpenChange={setIsProjectLibraryOpen}
-        headerActions={() => (
-          <Button
-            size="sm"
-            onClick={() => {
-              setIsProjectLibraryOpen(false);
-              openCreateProjectDialog();
-            }}
-            className="h-8 gap-2 rounded-lg"
-          >
-            <FilePlus2 className="h-3.5 w-3.5" />
-            New project
-          </Button>
-        )}
-      >
-        <div className="space-y-3">
-          <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3.5 py-3 text-sm leading-relaxed text-[var(--text-secondary)]">
-            Select a saved project to continue rendering, or create a fresh one
-            from a longer script.
-          </div>
-
+    <RouteHistoryDrawer
+      title="TTS Projects"
+      eyebrow="Project Library"
+      headerIcon={Library}
+      triggerLabel="Project Library"
+      triggerCount={projects.length}
+      countLabel={
+        projectsLoading
+          ? "Loading your reusable script projects."
+          : projects.length === 0
+            ? "No TTS projects yet."
+            : `${projects.length} reusable script project${projects.length === 1 ? "" : "s"}.`
+      }
+      open={isProjectLibraryOpen}
+      onOpenChange={setIsProjectLibraryOpen}
+    >
+      {({ close }) => (
+        <div className="app-sidebar-list">
           {projectsLoading ? (
-            <div className="flex min-h-[220px] items-center justify-center gap-2 rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-6 text-sm text-[var(--text-muted)]">
-              <Loader2 className="h-4 w-4 animate-spin" />
+            <div className="app-sidebar-loading">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
               Loading projects...
             </div>
           ) : projects.length === 0 ? (
-            <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-8 text-center text-sm text-[var(--text-muted)]">
-              No TTS projects yet. Create one to split a script into reusable
+            <div className="app-sidebar-empty">
+              Create a project from the workspace to split a script into reusable
               renderable segments.
             </div>
           ) : (
-            <div className="space-y-2">
-              {projects.map((project) => (
-                <button
-                  key={project.id}
-                  type="button"
-                  onClick={() => {
-                    setSelectedProjectId(project.id);
-                    setIsProjectLibraryOpen(false);
-                  }}
-                  className={cn(
-                    "w-full rounded-xl border px-3.5 py-3 text-left transition-all",
-                    project.id === selectedProjectId
-                      ? "border-[var(--accent-solid)] bg-[var(--accent-soft)] shadow-sm"
-                      : "border-[var(--border-muted)] bg-[var(--bg-surface-1)] hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-1)]/80",
-                  )}
-                >
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <div className="truncate text-sm font-semibold text-[var(--text-primary)]">
+            <div className="flex flex-col gap-2.5">
+              {projects.map((project) => {
+                const isActive = project.id === selectedProjectId;
+                const completionLabel = `${project.rendered_segment_count}/${project.segment_count} segments rendered`;
+                const previewParts = [
+                  completionLabel,
+                  `${project.total_chars} chars`,
+                  project.model_id,
+                ].filter((value): value is string => Boolean(value));
+
+                return (
+                  <button
+                    key={project.id}
+                    type="button"
+                    onClick={() => {
+                      setSelectedProjectId(project.id);
+                      close();
+                    }}
+                    className={cn(
+                      "group app-sidebar-row h-auto min-h-[110px] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+                      isActive
+                        ? "app-sidebar-row-active"
+                        : "app-sidebar-row-idle",
+                    )}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="app-sidebar-row-label truncate font-medium text-[var(--text-primary)]">
                         {project.name}
-                      </div>
-                      <div className="mt-1 text-xs text-[var(--text-muted)]">
-                        {project.rendered_segment_count}/{project.segment_count} segments rendered
-                      </div>
-                      <div className="mt-2 flex flex-wrap gap-1.5">
-                        <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2 py-0.5 text-[10px] font-medium text-[var(--text-muted)]">
-                          {project.total_chars} chars
-                        </span>
-                        {project.model_id ? (
-                          <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2 py-0.5 text-[10px] font-medium text-[var(--text-muted)]">
-                            {project.model_id}
-                          </span>
-                        ) : null}
-                      </div>
+                      </span>
+                      <span className="app-sidebar-row-meta shrink-0">
+                        {formatRelativeDate(project.updated_at)}
+                      </span>
                     </div>
-                    <div className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--text-muted)]">
-                      {formatRelativeDate(project.updated_at)}
+                    <div className="mt-2 flex items-center gap-2">
+                      <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-[var(--bg-surface-3)]">
+                        <div
+                          className="h-full rounded-full bg-[var(--accent-solid)] transition-[width] duration-300"
+                          style={{
+                            width: `${
+                              project.segment_count > 0
+                                ? Math.round(
+                                    (project.rendered_segment_count /
+                                      project.segment_count) *
+                                      100,
+                                  )
+                                : 0
+                            }%`,
+                          }}
+                        />
+                      </div>
+                      <span className="app-sidebar-row-meta shrink-0">
+                        {project.segment_count > 0
+                          ? `${Math.round(
+                              (project.rendered_segment_count /
+                                project.segment_count) *
+                                100,
+                            )}%`
+                          : "0%"}
+                      </span>
                     </div>
-                  </div>
-                </button>
-              ))}
+                    <p
+                      className="app-sidebar-row-preview"
+                      style={{
+                        display: "-webkit-box",
+                        WebkitLineClamp: 3,
+                        WebkitBoxOrient: "vertical",
+                        overflow: "hidden",
+                      }}
+                    >
+                      {previewParts.join(" · ")}
+                    </p>
+                  </button>
+                );
+              })}
             </div>
           )}
         </div>
-      </RouteHistoryDrawer>
-    </div>
+      )}
+    </RouteHistoryDrawer>
   );
 
   return (
@@ -1552,6 +1548,14 @@ export function TextToSpeechProjectsWorkspace({
                       <Download className="h-4 w-4" />
                     )}
                     Export merged WAV
+                  </Button>
+                  <Button
+                    variant="outline"
+                    onClick={openCreateProjectDialog}
+                    className="w-full justify-center bg-[var(--bg-surface-1)]"
+                  >
+                    <FilePlus2 className="h-4 w-4" />
+                    New project
                   </Button>
                   <Button
                     variant="ghost"
