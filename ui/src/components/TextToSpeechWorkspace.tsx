@@ -273,7 +273,8 @@ export function TextToSpeechWorkspace({
 
   const capabilities = selectedModelInfo?.speech_capabilities ?? null;
   const supportsBuiltInVoices = capabilities?.supports_builtin_voices ?? false;
-  const supportsReferenceVoices = capabilities?.supports_reference_voice ?? false;
+  const supportsReferenceVoices =
+    capabilities?.supports_reference_voice ?? false;
   const supportsVoiceDescription =
     capabilities?.supports_voice_description ?? false;
   const supportsStreaming = capabilities?.supports_streaming ?? false;
@@ -418,7 +419,11 @@ export function TextToSpeechWorkspace({
   }, [loadSavedVoices]);
 
   useEffect(() => {
-    if (voiceMode === "saved" && selectedSavedVoiceId && !supportsReferenceVoices) {
+    if (
+      voiceMode === "saved" &&
+      selectedSavedVoiceId &&
+      !supportsReferenceVoices
+    ) {
       const nextModel = resolvePreferredRouteModel({
         models: savedVoiceCompatibleModels,
         selectedModel,
@@ -516,36 +521,40 @@ export function TextToSpeechWorkspace({
     });
   }, [availableSpeakers, voiceSearch]);
 
-  const savedVoiceItems: VoicePickerItem[] = filteredSavedVoices.map((voice) => ({
-    id: voice.id,
-    name: voice.name,
-    categoryLabel: savedVoiceSourceLabel(voice.source_route_kind),
-    description: voice.reference_text_preview,
-    meta: [
-      `${voice.reference_text_chars} chars`,
-      formatSavedVoiceDate(voice.updated_at || voice.created_at),
-    ],
-    previewUrl: api.savedVoiceAudioUrl(voice.id),
-    selected: voiceMode === "saved" && selectedSavedVoiceId === voice.id,
-    onSelect: () => {
-      setVoiceMode("saved");
-      setSelectedSavedVoiceId(voice.id);
-    },
-  }));
+  const savedVoiceItems: VoicePickerItem[] = filteredSavedVoices.map(
+    (voice) => ({
+      id: voice.id,
+      name: voice.name,
+      categoryLabel: savedVoiceSourceLabel(voice.source_route_kind),
+      description: voice.reference_text_preview,
+      meta: [
+        `${voice.reference_text_chars} chars`,
+        formatSavedVoiceDate(voice.updated_at || voice.created_at),
+      ],
+      previewUrl: api.savedVoiceAudioUrl(voice.id),
+      selected: voiceMode === "saved" && selectedSavedVoiceId === voice.id,
+      onSelect: () => {
+        setVoiceMode("saved");
+        setSelectedSavedVoiceId(voice.id);
+      },
+    }),
+  );
 
-  const builtInVoiceItems: VoicePickerItem[] = filteredBuiltInVoices.map((voice) => ({
-    id: voice.id,
-    name: voice.name,
-    categoryLabel: selectedModelInfo?.variant ?? "Built-in voice",
-    description: voice.description,
-    meta: [voice.language],
-    previewMessage: "Select this voice, then generate speech to audition it.",
-    selected: voiceMode === "built_in" && speaker === voice.id,
-    onSelect: () => {
-      setVoiceMode("built_in");
-      setSpeaker(voice.id);
-    },
-  }));
+  const builtInVoiceItems: VoicePickerItem[] = filteredBuiltInVoices.map(
+    (voice) => ({
+      id: voice.id,
+      name: voice.name,
+      categoryLabel: selectedModelInfo?.variant ?? "Built-in voice",
+      description: voice.description,
+      meta: [voice.language],
+      previewMessage: "Select this voice, then generate speech to audition it.",
+      selected: voiceMode === "built_in" && speaker === voice.id,
+      onSelect: () => {
+        setVoiceMode("built_in");
+        setSpeaker(voice.id);
+      },
+    }),
+  );
 
   const handleGenerate = async () => {
     if (!selectedModel || !selectedModelReady) {
@@ -852,7 +861,10 @@ export function TextToSpeechWorkspace({
           {selectedOption?.label || "Select model"}
         </span>
         <ChevronDown
-          className={cn("h-4 w-4 transition-transform", isModelMenuOpen && "rotate-180")}
+          className={cn(
+            "h-4 w-4 transition-transform",
+            isModelMenuOpen && "rotate-180",
+          )}
         />
       </button>
 
@@ -880,7 +892,9 @@ export function TextToSpeechWorkspace({
                       : "hover:bg-accent/70",
                   )}
                 >
-                  <div className="truncate text-sm font-medium">{option.label}</div>
+                  <div className="truncate text-sm font-medium">
+                    {option.label}
+                  </div>
                   <div className="mt-1 text-[11px] text-muted-foreground">
                     {option.statusLabel}
                   </div>
@@ -904,7 +918,8 @@ export function TextToSpeechWorkspace({
             Quick render or project workflow
           </h2>
           <p className="text-sm text-muted-foreground">
-            Use quick mode for one-off generations, or switch to projects for reusable scripts and merged export.
+            Use quick mode for one-off generations, or switch to projects for
+            reusable scripts and merged export.
           </p>
         </div>
 
@@ -943,9 +958,9 @@ export function TextToSpeechWorkspace({
   return (
     <div className="space-y-4">
       {renderWorkspaceModeToggle()}
-      <div className="grid gap-4 xl:grid-cols-[minmax(0,1.1fr)_420px]">
+      <div className="grid gap-6 xl:grid-cols-[minmax(0,1.1fr)_420px]">
         <Card>
-          <CardContent className="space-y-5 p-5">
+          <CardContent className="space-y-6 p-6">
             <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
               <div className="space-y-1">
                 <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
@@ -963,7 +978,7 @@ export function TextToSpeechWorkspace({
 
               <div className="flex w-full max-w-md flex-col gap-3 lg:items-end">
                 {renderModelSelector()}
-                <div className="flex w-full items-center justify-between rounded-xl border border-border/75 bg-muted/30 px-3 py-2 text-xs">
+                <div className="flex w-full items-center justify-between rounded-xl border border-border/60 bg-muted/20 px-3.5 py-2.5 text-xs">
                   <span className="text-muted-foreground">Model status</span>
                   <span
                     className={cn(
@@ -975,7 +990,11 @@ export function TextToSpeechWorkspace({
                   </span>
                 </div>
                 {onOpenModelManager ? (
-                  <Button variant="outline" size="sm" onClick={onOpenModelManager}>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={onOpenModelManager}
+                  >
                     <Settings2 className="h-4 w-4" />
                     Models
                   </Button>
@@ -983,11 +1002,11 @@ export function TextToSpeechWorkspace({
               </div>
             </div>
 
-            <div className="rounded-2xl border border-border/75 bg-muted/35 p-4 text-sm text-muted-foreground">
+            <div className="rounded-2xl border border-border/60 bg-muted/20 p-4.5 px-5 py-4 text-sm text-muted-foreground">
               {compatibilityNotice}
             </div>
 
-            <div className="space-y-2">
+            <div className="space-y-2.5">
               <label className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
                 Script
               </label>
@@ -1001,13 +1020,13 @@ export function TextToSpeechWorkspace({
               />
             </div>
 
-            <div className="rounded-2xl border border-border/75 bg-muted/25 p-4">
+            <div className="rounded-2xl border border-border/60 bg-muted/20 p-5">
               <div className="flex items-center justify-between gap-3">
                 <div>
-                  <div className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+                  <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
                     Delivery controls
                   </div>
-                  <div className="mt-1 text-sm text-muted-foreground">
+                  <div className="mt-1.5 text-sm text-muted-foreground">
                     Speed is persisted with the generation history. Streaming is
                     available only on compatible models.
                   </div>
@@ -1022,11 +1041,13 @@ export function TextToSpeechWorkspace({
                 </Button>
               </div>
 
-              <div className="mt-4 space-y-4">
+              <div className="mt-5 space-y-4">
                 <div className="space-y-2">
                   <div className="flex items-center justify-between text-sm">
                     <span className="font-medium text-foreground">Speed</span>
-                    <span className="text-muted-foreground">{speed.toFixed(2)}x</span>
+                    <span className="text-muted-foreground">
+                      {speed.toFixed(2)}x
+                    </span>
                   </div>
                   <Slider
                     value={[speed]}
@@ -1037,16 +1058,20 @@ export function TextToSpeechWorkspace({
                   />
                 </div>
 
-                <label className="flex items-center gap-3 rounded-xl border border-border/70 bg-background/70 px-3 py-2.5 text-sm">
+                <label className="flex items-center gap-3 rounded-xl border border-border/60 bg-background/50 px-3.5 py-3 text-sm">
                   <input
                     type="checkbox"
                     checked={streamingEnabled && supportsStreaming}
-                    onChange={(event) => setStreamingEnabled(event.target.checked)}
+                    onChange={(event) =>
+                      setStreamingEnabled(event.target.checked)
+                    }
                     disabled={!supportsStreaming}
                     className="h-4 w-4 rounded border-border"
                   />
                   <span className="min-w-0 flex-1">
-                    <span className="font-medium text-foreground">Stream audio</span>
+                    <span className="font-medium text-foreground">
+                      Stream audio
+                    </span>
                     <span className="block text-xs text-muted-foreground">
                       {supportsStreaming
                         ? "Play chunks as they arrive."
@@ -1070,7 +1095,9 @@ export function TextToSpeechWorkspace({
                         </label>
                         <Input
                           value={instructions}
-                          onChange={(event) => setInstructions(event.target.value)}
+                          onChange={(event) =>
+                            setInstructions(event.target.value)
+                          }
                           disabled={!supportsVoiceDescription}
                           placeholder={
                             supportsVoiceDescription
@@ -1202,7 +1229,7 @@ export function TextToSpeechWorkspace({
         </Card>
 
         <Card>
-          <CardContent className="space-y-4 p-5">
+          <CardContent className="space-y-5 p-6">
             <div className="space-y-1">
               <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
                 Voice picker
@@ -1215,7 +1242,7 @@ export function TextToSpeechWorkspace({
             <Tabs
               value={voiceMode}
               onValueChange={(value) => setVoiceMode(value as VoiceMode)}
-              className="space-y-4"
+              className="space-y-5"
             >
               <TabsList>
                 <TabsTrigger value="saved">
@@ -1228,7 +1255,7 @@ export function TextToSpeechWorkspace({
                 </TabsTrigger>
               </TabsList>
 
-              <div className="space-y-2">
+              <div className="space-y-2.5">
                 <label className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
                   Search voices
                 </label>
@@ -1236,6 +1263,7 @@ export function TextToSpeechWorkspace({
                   value={voiceSearch}
                   onChange={(event) => setVoiceSearch(event.target.value)}
                   placeholder="Search by name, transcript, or language"
+                  className="bg-muted/20"
                 />
               </div>
 
@@ -1248,7 +1276,9 @@ export function TextToSpeechWorkspace({
                 <VoicePicker
                   items={savedVoiceItems}
                   emptyTitle={
-                    savedVoicesLoading ? "Loading saved voices" : "No saved voices yet"
+                    savedVoicesLoading
+                      ? "Loading saved voices"
+                      : "No saved voices yet"
                   }
                   emptyDescription={
                     savedVoicesLoading

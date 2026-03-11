@@ -95,7 +95,8 @@ function previewTextForLanguage(language: string): string {
   if (normalized.includes("french")) return BUILT_IN_PREVIEW_TEXT.french;
   if (normalized.includes("hindi")) return BUILT_IN_PREVIEW_TEXT.hindi;
   if (normalized.includes("italian")) return BUILT_IN_PREVIEW_TEXT.italian;
-  if (normalized.includes("portuguese")) return BUILT_IN_PREVIEW_TEXT.portuguese;
+  if (normalized.includes("portuguese"))
+    return BUILT_IN_PREVIEW_TEXT.portuguese;
   return BUILT_IN_PREVIEW_TEXT.english;
 }
 
@@ -245,17 +246,24 @@ export function VoicesPage({
     setDeletingVoiceId(voiceId);
     try {
       await api.deleteSavedVoice(voiceId);
-      setSavedVoices((current) => current.filter((voice) => voice.id !== voiceId));
+      setSavedVoices((current) =>
+        current.filter((voice) => voice.id !== voiceId),
+      );
     } catch (error) {
       onError(
-        error instanceof Error ? error.message : "Failed to delete saved voice.",
+        error instanceof Error
+          ? error.message
+          : "Failed to delete saved voice.",
       );
     } finally {
       setDeletingVoiceId(null);
     }
   };
 
-  const handlePreviewBuiltInVoice = async (voiceId: string, language: string) => {
+  const handlePreviewBuiltInVoice = async (
+    voiceId: string,
+    language: string,
+  ) => {
     if (!resolvedSelectedModel) {
       requestModel();
       onError("Select and load a built-in voice model to generate previews.");
@@ -290,47 +298,49 @@ export function VoicesPage({
     }
   };
 
-  const savedVoiceItems: VoicePickerItem[] = filteredSavedVoices.map((voice) => ({
-    id: voice.id,
-    name: voice.name,
-    categoryLabel: savedVoiceSourceLabel(voice.source_route_kind),
-    description: voice.reference_text_preview,
-    meta: [
-      `${voice.reference_text_chars} chars`,
-      formatRelativeDate(voice.updated_at || voice.created_at),
-    ],
-    previewUrl: api.savedVoiceAudioUrl(voice.id),
-    actions: (
-      <>
-        <Button
-          size="sm"
-          onClick={(event) => {
-            event.stopPropagation();
-            handleUseSavedVoice(voice.id);
-          }}
-        >
-          <Mic2 className="h-4 w-4" />
-          Use in TTS
-        </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={(event) => {
-            event.stopPropagation();
-            void handleDeleteVoice(voice.id);
-          }}
-          disabled={deletingVoiceId === voice.id}
-        >
-          {deletingVoiceId === voice.id ? (
-            <Loader2 className="h-4 w-4 animate-spin" />
-          ) : (
-            <Trash2 className="h-4 w-4" />
-          )}
-          Delete
-        </Button>
-      </>
-    ),
-  }));
+  const savedVoiceItems: VoicePickerItem[] = filteredSavedVoices.map(
+    (voice) => ({
+      id: voice.id,
+      name: voice.name,
+      categoryLabel: savedVoiceSourceLabel(voice.source_route_kind),
+      description: voice.reference_text_preview,
+      meta: [
+        `${voice.reference_text_chars} chars`,
+        formatRelativeDate(voice.updated_at || voice.created_at),
+      ],
+      previewUrl: api.savedVoiceAudioUrl(voice.id),
+      actions: (
+        <>
+          <Button
+            size="sm"
+            onClick={(event) => {
+              event.stopPropagation();
+              handleUseSavedVoice(voice.id);
+            }}
+          >
+            <Mic2 className="h-4 w-4" />
+            Use in TTS
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={(event) => {
+              event.stopPropagation();
+              void handleDeleteVoice(voice.id);
+            }}
+            disabled={deletingVoiceId === voice.id}
+          >
+            {deletingVoiceId === voice.id ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Trash2 className="h-4 w-4" />
+            )}
+            Delete
+          </Button>
+        </>
+      ),
+    }),
+  );
 
   const builtInVoiceItems: VoicePickerItem[] = filteredBuiltInVoices.map(
     (voice) => ({
@@ -383,9 +393,9 @@ export function VoicesPage({
         description="Manage saved cloned and designed voices, browse built-in voice libraries, and hand them off into text-to-speech."
       />
 
-      <div className="grid gap-5 xl:grid-cols-[320px_minmax(0,1fr)]">
+      <div className="grid gap-6 xl:grid-cols-[340px_minmax(0,1fr)]">
         <Card>
-          <CardContent className="space-y-5 p-5">
+          <CardContent className="space-y-6 p-6">
             <div className="space-y-1">
               <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
                 Voice Library
@@ -399,7 +409,7 @@ export function VoicesPage({
               </p>
             </div>
 
-            <div className="space-y-2">
+            <div className="space-y-2.5">
               <label className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
                 Search voices
               </label>
@@ -407,10 +417,11 @@ export function VoicesPage({
                 value={search}
                 onChange={(event) => setSearch(event.target.value)}
                 placeholder="Search by name, language, or transcript"
+                className="bg-muted/20"
               />
             </div>
 
-            <div className="space-y-3 rounded-2xl border border-border/70 bg-muted/35 p-4">
+            <div className="space-y-4 rounded-2xl border border-border/60 bg-muted/20 p-5">
               <div className="flex items-center justify-between gap-3">
                 <div>
                   <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
@@ -429,23 +440,25 @@ export function VoicesPage({
                   Models
                 </Button>
               </div>
-              <div className="rounded-xl border border-border/70 bg-background/70 px-3 py-2.5 text-xs text-muted-foreground">
+              <div className="rounded-xl border border-border/60 bg-background/50 px-3.5 py-3 text-xs leading-relaxed text-muted-foreground">
                 {selectedModelInfo?.speech_capabilities?.built_in_voice_count
                   ? `${selectedModelInfo.speech_capabilities.built_in_voice_count} built-in voices available on the active model.`
                   : "Built-in voices appear when a CustomVoice, Kokoro, or LFM2 Audio model is selected."}
               </div>
             </div>
 
-            <div className="space-y-2">
+            <div className="space-y-3">
               <div className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
                 Saved voice filters
               </div>
-              <div className="flex flex-wrap gap-2">
-                {([
-                  ["all", "All voices"],
-                  ["voice_cloning", "Cloned"],
-                  ["voice_design", "Designed"],
-                ] as const).map(([value, label]) => (
+              <div className="flex flex-wrap gap-2.5">
+                {(
+                  [
+                    ["all", "All voices"],
+                    ["voice_cloning", "Cloned"],
+                    ["voice_design", "Designed"],
+                  ] as const
+                ).map(([value, label]) => (
                   <Button
                     key={value}
                     type="button"
@@ -478,10 +491,12 @@ export function VoicesPage({
         </Card>
 
         <Card className="min-h-[36rem]">
-          <CardContent className="p-5">
+          <CardContent className="p-6">
             <Tabs
               value={activeTab}
-              onValueChange={(value) => setActiveTab(value as "saved" | "built-in")}
+              onValueChange={(value) =>
+                setActiveTab(value as "saved" | "built-in")
+              }
               className="space-y-5"
             >
               <TabsList>
@@ -506,7 +521,9 @@ export function VoicesPage({
                 <VoicePicker
                   items={savedVoiceItems}
                   emptyTitle={
-                    savedVoicesLoading ? "Loading saved voices" : "No saved voices yet"
+                    savedVoicesLoading
+                      ? "Loading saved voices"
+                      : "No saved voices yet"
                   }
                   emptyDescription={
                     savedVoicesLoading

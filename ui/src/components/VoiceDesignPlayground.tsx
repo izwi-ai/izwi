@@ -386,17 +386,17 @@ export function VoiceDesignPlayground({
   );
 
   return (
-    <div className="grid gap-4 items-stretch xl:h-[calc(100dvh-11.75rem)]">
-      <div className="card p-4 flex min-h-0 flex-col">
+    <div className="grid gap-6 items-stretch xl:h-[calc(100dvh-11.75rem)]">
+      <div className="card p-6 flex min-h-0 flex-col">
         <div className="flex-1 min-h-0 overflow-y-auto pr-1 scrollbar-thin">
           {/* Header */}
-          <div className="flex items-center justify-between mb-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between mb-6 gap-4">
             <div className="flex items-center gap-3">
-              <div className="p-2 rounded bg-[var(--bg-surface-2)] border border-[var(--border-muted)]">
-                <Wand2 className="w-5 h-5 text-[var(--text-muted)]" />
+              <div className="p-2.5 rounded-lg bg-[var(--bg-surface-2)]">
+                <Wand2 className="w-5 h-5 text-[var(--text-primary)]" />
               </div>
               <div>
-                <h2 className="text-sm font-medium text-[var(--text-primary)]">
+                <h2 className="text-base font-semibold text-[var(--text-primary)]">
                   Voice Design
                 </h2>
               </div>
@@ -452,30 +452,36 @@ export function VoiceDesignPlayground({
             </div>
           </div>
 
-          <div className="mb-4 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
-            <div className="flex items-start justify-between gap-4">
+          <div className="mb-6 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 sm:p-5">
+            <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
               <div className="min-w-0 flex-1">
-                <div className="text-[11px] text-[var(--text-subtle)] uppercase tracking-wide">
+                <div className="text-[11px] font-semibold text-[var(--text-subtle)] uppercase tracking-wider mb-2.5">
                   Active Model
                 </div>
-                {modelOptions.length > 0 && (
-                  <div className="mt-2">{renderModelSelector()}</div>
-                )}
+                {modelOptions.length > 0 && <div>{renderModelSelector()}</div>}
                 <div
                   className={clsx(
-                    "mt-2 text-xs",
+                    "mt-2 text-xs font-medium flex items-center gap-1.5",
                     selectedModelReady
                       ? "text-[var(--text-secondary)]"
-                      : "text-amber-400",
+                      : "text-amber-500",
                   )}
                 >
-                  {selectedModelReady
-                    ? "Loaded and ready"
-                    : "Open Models and load a VoiceDesign model"}
+                  {selectedModelReady ? (
+                    <>
+                      <div className="w-1.5 h-1.5 rounded-full bg-green-500" />
+                      Loaded and ready
+                    </>
+                  ) : (
+                    <>
+                      <div className="w-1.5 h-1.5 rounded-full bg-[var(--text-muted)]" />
+                      Open Models and load a VoiceDesign model
+                    </>
+                  )}
                 </div>
               </div>
               {onOpenModelManager && (
-                <div className="shrink-0">
+                <div className="shrink-0 pt-6 sm:pt-0">
                   <button
                     onClick={handleOpenModels}
                     className="btn btn-secondary text-xs"
@@ -490,10 +496,10 @@ export function VoiceDesignPlayground({
 
           <div className="space-y-6">
             {/* Voice Description */}
-            <div>
-              <div className="flex items-center justify-between mb-2">
-                <label className="text-xs font-semibold text-[var(--text-primary)] uppercase tracking-wide">
-                  Voice Description
+            <div className="p-6 rounded-2xl bg-[var(--bg-surface-0)] border border-[var(--border-muted)]">
+              <div className="flex items-center justify-between mb-4">
+                <label className="block text-[11px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">
+                  Voice Direction
                   <span className="text-red-500 ml-1">*</span>
                 </label>
                 <button
@@ -510,19 +516,19 @@ export function VoiceDesignPlayground({
                     initial={{ opacity: 0, height: 0 }}
                     animate={{ opacity: 1, height: "auto" }}
                     exit={{ opacity: 0, height: 0 }}
-                    className="mb-3 overflow-hidden"
+                    className="mb-4 overflow-hidden"
                   >
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 p-3 rounded-xl bg-[var(--bg-surface-1)] border border-[var(--border-muted)]">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 p-4 rounded-xl bg-[var(--bg-surface-1)] border border-[var(--border-muted)]">
                       {VOICE_DESIGN_PRESETS.map((preset) => (
                         <button
                           key={preset.name}
                           onClick={() => handlePresetSelect(preset.description)}
-                          className="p-3 rounded-lg bg-[var(--bg-surface-0)] hover:bg-[var(--bg-surface-2)] border border-[var(--border-muted)] hover:border-[var(--border-strong)] text-left transition-colors group"
+                          className="p-4 rounded-xl bg-[var(--bg-surface-0)] hover:bg-[var(--bg-surface-2)] border border-[var(--border-muted)] hover:border-[var(--border-strong)] text-left transition-colors group shadow-sm"
                         >
-                          <div className="text-sm font-semibold text-[var(--text-primary)] mb-1">
+                          <div className="text-sm font-semibold text-[var(--text-primary)] mb-1.5">
                             {preset.name}
                           </div>
-                          <div className="text-[11px] text-[var(--text-secondary)] line-clamp-2 leading-relaxed group-hover:text-[var(--text-primary)] transition-colors">
+                          <div className="text-xs text-[var(--text-secondary)] line-clamp-2 leading-relaxed group-hover:text-[var(--text-primary)] transition-colors">
                             {preset.description}
                           </div>
                         </button>
@@ -537,18 +543,18 @@ export function VoiceDesignPlayground({
                 onChange={(e) => setVoiceDescription(e.target.value)}
                 placeholder="Describe the voice you want to create... (e.g., 'A warm, friendly female voice with a slight British accent, speaking in a calm and reassuring tone')"
                 rows={4}
-                className="textarea text-base py-4 leading-relaxed bg-[var(--bg-surface-0)] border-[var(--border-muted)] w-full"
+                className="textarea text-sm py-4 px-5 leading-relaxed bg-[var(--bg-surface-1)] border-[var(--border-muted)] w-full rounded-xl"
               />
-              <p className="text-[11px] font-medium text-[var(--text-muted)] mt-2">
+              <p className="text-xs leading-relaxed text-[var(--text-muted)] mt-4">
                 Describe voice characteristics like gender, age, tone, emotion,
                 accent, and speaking style.
               </p>
             </div>
 
             {/* Text to speak */}
-            <div>
-              <label className="block text-xs font-semibold text-[var(--text-primary)] uppercase tracking-wide mb-2">
-                Text to Speak
+            <div className="p-6 rounded-2xl bg-[var(--bg-surface-0)] border border-[var(--border-muted)]">
+              <label className="block text-[11px] font-semibold text-[var(--text-muted)] uppercase tracking-wider mb-4">
+                Preview Script
                 <span className="text-red-500 ml-1">*</span>
               </label>
               <div className="relative">
@@ -559,9 +565,9 @@ export function VoiceDesignPlayground({
                   placeholder="Enter the text you want the designed voice to synthesize..."
                   rows={4}
                   disabled={generating}
-                  className="textarea text-base py-4 leading-relaxed bg-[var(--bg-surface-1)] border-[var(--border-muted)] w-full"
+                  className="textarea text-sm py-4 px-5 leading-relaxed bg-[var(--bg-surface-1)] border-[var(--border-muted)] w-full rounded-xl"
                 />
-                <div className="absolute bottom-3 right-3 px-1">
+                <div className="absolute bottom-4 right-4 px-1">
                   <span className="text-[11px] font-medium text-[var(--text-muted)]">
                     {text.length} characters
                   </span>
@@ -701,7 +707,7 @@ export function VoiceDesignPlayground({
                   <GenerationStats stats={generationStats} type="tts" />
                 )}
                 {latestRecord && (
-                  <div className="p-4 rounded-xl bg-[var(--bg-surface-1)] border border-[var(--border-muted)] space-y-4">
+                  <div className="p-6 rounded-2xl bg-[var(--bg-surface-0)] border border-[var(--border-muted)] space-y-5">
                     <div className="flex items-center justify-between gap-2">
                       <div className="text-sm font-semibold text-[var(--text-primary)]">
                         Save for Voice Cloning
@@ -713,7 +719,7 @@ export function VoiceDesignPlayground({
 
                     <div className="space-y-4">
                       <div>
-                        <label className="block text-[11px] font-medium text-[var(--text-secondary)] mb-1.5">
+                        <label className="block text-[11px] font-medium text-[var(--text-secondary)] mb-2">
                           Voice Name
                         </label>
                         <input
@@ -722,13 +728,13 @@ export function VoiceDesignPlayground({
                             setSaveVoiceName(event.target.value)
                           }
                           placeholder="e.g. Support Voice"
-                          className="input h-10 text-sm bg-[var(--bg-surface-0)] border-[var(--border-muted)] w-full"
+                          className="input h-10 text-sm bg-[var(--bg-surface-1)] border-[var(--border-muted)] w-full rounded-xl px-4"
                           disabled={savingVoice}
                         />
                       </div>
 
                       <div>
-                        <label className="block text-[11px] font-medium text-[var(--text-secondary)] mb-1.5">
+                        <label className="block text-[11px] font-medium text-[var(--text-secondary)] mb-2">
                           Reference Transcript
                         </label>
                         <textarea
@@ -737,17 +743,17 @@ export function VoiceDesignPlayground({
                             setSaveReferenceText(event.target.value)
                           }
                           rows={2}
-                          className="textarea text-sm bg-[var(--bg-surface-0)] border-[var(--border-muted)] w-full"
+                          className="textarea text-sm py-3 px-4 leading-relaxed bg-[var(--bg-surface-1)] border-[var(--border-muted)] w-full rounded-xl"
                           disabled={savingVoice}
                           placeholder="Reference transcript for cloning"
                         />
-                        <p className="text-[10px] text-[var(--text-subtle)] mt-1.5">
+                        <p className="text-[10.5px] leading-relaxed text-[var(--text-subtle)] mt-2">
                           Keep this transcript exactly aligned with the
                           generated audio sample.
                         </p>
                       </div>
 
-                      <div className="flex justify-end pt-2">
+                      <div className="flex justify-end pt-3">
                         <button
                           onClick={handleSaveVoice}
                           disabled={savingVoice || !saveVoiceName.trim()}

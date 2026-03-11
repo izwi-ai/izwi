@@ -37,7 +37,9 @@ export function VoicePicker({
             <Music4 className="h-6 w-6 text-muted-foreground" />
           </div>
           <div className="space-y-1">
-            <p className="text-sm font-semibold text-foreground">{emptyTitle}</p>
+            <p className="text-sm font-semibold text-foreground">
+              {emptyTitle}
+            </p>
             <p className="max-w-md text-sm text-muted-foreground">
               {emptyDescription}
             </p>
@@ -48,7 +50,12 @@ export function VoicePicker({
   }
 
   return (
-    <div className={cn("grid gap-4 md:grid-cols-2 xl:grid-cols-3", className)}>
+    <div
+      className={cn(
+        "grid gap-4 grid-cols-[repeat(auto-fill,minmax(280px,1fr))]",
+        className,
+      )}
+    >
       {items.map((item) => {
         return (
           <Card

@@ -339,8 +339,8 @@ export function VoiceClonePlayground({
   );
 
   return (
-    <div className="grid gap-4 items-stretch xl:h-[calc(100dvh-11.75rem)]">
-      <div className="card p-4 sm:p-6 flex min-h-0 flex-col">
+    <div className="grid gap-6 items-stretch xl:h-[calc(100dvh-11.75rem)]">
+      <div className="card p-6 flex min-h-0 flex-col">
         <div className="flex-1 min-h-0 overflow-y-auto pr-1 scrollbar-thin">
           {/* Header */}
           <div className="flex flex-col sm:flex-row sm:items-center justify-between mb-6 gap-4">
@@ -450,8 +450,8 @@ export function VoiceClonePlayground({
 
           <div className="space-y-6">
             {/* Voice Reference Section */}
-            <div className="p-5 rounded-2xl bg-[var(--bg-surface-0)] border border-[var(--border-muted)]">
-              <div className="flex items-center gap-2 mb-4">
+            <div className="p-6 rounded-2xl bg-[var(--bg-surface-0)] border border-[var(--border-muted)]">
+              <div className="flex items-center gap-2 mb-5">
                 <Users className="w-5 h-5 text-[var(--text-muted)]" />
                 <span className="text-sm font-semibold text-[var(--text-primary)]">
                   Voice Reference
@@ -469,12 +469,12 @@ export function VoiceClonePlayground({
                 onSavedVoiceCreated={setSavedVoiceId}
               />
 
-              <div className="mt-4 grid gap-4 xl:grid-cols-2">
-                <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
-                  <div className="text-[11px] font-semibold text-[var(--text-muted)] uppercase tracking-wider mb-2">
+              <div className="mt-5 grid gap-4 xl:grid-cols-2">
+                <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-5">
+                  <div className="text-[11px] font-semibold text-[var(--text-muted)] uppercase tracking-wider mb-3">
                     Quality Checks
                   </div>
-                  <div className="space-y-2 text-sm">
+                  <div className="space-y-2.5 text-sm">
                     <div className="flex items-center justify-between gap-3">
                       <span className="text-[var(--text-secondary)]">
                         Reference length
@@ -495,7 +495,8 @@ export function VoiceClonePlayground({
                     </div>
                     {!referenceState?.sampleReady ? (
                       <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2 text-xs text-[var(--text-muted)]">
-                        Add a clean reference sample and transcript to see cloning guidance.
+                        Add a clean reference sample and transcript to see
+                        cloning guidance.
                       </div>
                     ) : referenceState.warnings?.length ? (
                       <div className="rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-700">
@@ -517,11 +518,14 @@ export function VoiceClonePlayground({
                     <input
                       type="checkbox"
                       checked={consentConfirmed}
-                      onChange={(event) => setConsentConfirmed(event.target.checked)}
+                      onChange={(event) =>
+                        setConsentConfirmed(event.target.checked)
+                      }
                       className="mt-0.5 h-4 w-4 rounded border-[var(--border-muted)]"
                     />
                     <span className="text-[var(--text-secondary)]">
-                      I have permission to clone this voice and use the resulting audio.
+                      I have permission to clone this voice and use the
+                      resulting audio.
                     </span>
                   </label>
 
@@ -536,7 +540,8 @@ export function VoiceClonePlayground({
                       </button>
                     ) : (
                       <div className="text-xs text-[var(--text-muted)]">
-                        Save the reference as a voice profile to reuse it directly in text-to-speech.
+                        Save the reference as a voice profile to reuse it
+                        directly in text-to-speech.
                       </div>
                     )}
                   </div>
@@ -545,8 +550,8 @@ export function VoiceClonePlayground({
             </div>
 
             {/* Text to speak */}
-            <div className="p-5 rounded-2xl bg-[var(--bg-surface-0)] border border-[var(--border-muted)]">
-              <label className="block text-xs font-semibold text-[var(--text-primary)] uppercase tracking-wide mb-3">
+            <div className="p-6 rounded-2xl bg-[var(--bg-surface-0)] border border-[var(--border-muted)]">
+              <label className="block text-[11px] font-semibold text-[var(--text-muted)] uppercase tracking-wider mb-4">
                 Audition Text
               </label>
               <div className="relative">
@@ -557,16 +562,17 @@ export function VoiceClonePlayground({
                   placeholder="Write a short preview line to audition the cloned voice..."
                   rows={5}
                   disabled={generating}
-                  className="textarea text-base py-4 leading-relaxed bg-[var(--bg-surface-1)] border-[var(--border-muted)] w-full"
+                  className="textarea text-sm py-4 px-5 leading-relaxed bg-[var(--bg-surface-1)] border-[var(--border-muted)] w-full rounded-xl"
                 />
-                <div className="absolute bottom-3 right-3 px-1">
+                <div className="absolute bottom-4 right-4 px-1">
                   <span className="text-[11px] font-medium text-[var(--text-muted)]">
                     {text.length} characters
                   </span>
                 </div>
               </div>
-              <p className="mt-3 text-xs text-[var(--text-muted)]">
-                Start with a short proof clip before moving the saved voice into the TTS route for longer scripts.
+              <p className="mt-4 text-xs leading-relaxed text-[var(--text-muted)]">
+                Start with a short proof clip before moving the saved voice into
+                the TTS route for longer scripts.
               </p>
             </div>
 
@@ -693,7 +699,8 @@ export function VoiceClonePlayground({
 
             {selectedModelReady && isVoiceReady && !consentConfirmed && (
               <p className="text-xs font-medium text-[var(--text-muted)] text-center pb-2">
-                Confirm rights to the reference voice before generating a preview.
+                Confirm rights to the reference voice before generating a
+                preview.
               </p>
             )}
           </div>
