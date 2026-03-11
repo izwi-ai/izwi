@@ -24,6 +24,11 @@ const VoiceDesignPage = lazy(async () => {
   return { default: module.VoiceDesignPage };
 });
 
+const VoicesPage = lazy(async () => {
+  const module = await import("@/features/voices/route");
+  return { default: module.VoicesPage };
+});
+
 const TranscriptionPage = lazy(async () => {
   const module = await import("@/features/transcription/route");
   return { default: module.TranscriptionPage };
@@ -145,6 +150,10 @@ export function AppRoutes() {
         <Route
           path="/voice-design"
           element={withSuspense(<VoiceDesignPage {...pageProps} />)}
+        />
+        <Route
+          path="/voices"
+          element={withSuspense(<VoicesPage {...pageProps} />)}
         />
         <Route
           path="/transcription"
