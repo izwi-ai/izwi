@@ -157,4 +157,51 @@ describe("TranscriptionPlayground history", () => {
     expect(onTimestampAlignerRequired).toHaveBeenCalledTimes(1);
     expect(screen.getByText(/Load the timestamp aligner model/i)).toBeInTheDocument();
   });
+
+  it("keeps streaming and timestamps mutually exclusive", async () => {
+    apiMocks.listTranscriptionRecords.mockResolvedValue([]);
+
+    render(
+      <TranscriptionPlayground
+        selectedModel="Qwen3-ASR-0.6B"
+        selectedModelReady={true}
+        modelOptions={[
+          {
+            value: "Qwen3-ASR-0.6B",
+            label: "Qwen3 ASR 0.6B",
+            statusLabel: "Ready",
+            isReady: true,
+          },
+        ]}
+        onSelectModel={vi.fn()}
+        onOpenModelManager={vi.fn()}
+        onModelRequired={vi.fn()}
+        onTimestampAlignerRequired={vi.fn()}
+        timestampAlignerModelId="Qwen3-ForcedAligner-0.6B"
+        timestampAlignerReady={true}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(apiMocks.listTranscriptionRecords).toHaveBeenCalled(),
+    );
+
+    const streamToggle = screen.getByLabelText(/Stream/i) as HTMLInputElement;
+    const timestampToggle = screen.getByLabelText(
+      /Timestamps/i,
+    ) as HTMLInputElement;
+
+    expect(streamToggle.checked).toBe(true);
+    expect(timestampToggle.checked).toBe(false);
+
+    fireEvent.click(timestampToggle);
+
+    expect(timestampToggle.checked).toBe(true);
+    expect(streamToggle.checked).toBe(false);
+
+    fireEvent.click(streamToggle);
+
+    expect(streamToggle.checked).toBe(true);
+    expect(timestampToggle.checked).toBe(false);
+  });
 });

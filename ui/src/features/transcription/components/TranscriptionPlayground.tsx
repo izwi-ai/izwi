@@ -884,6 +884,7 @@ export function TranscriptionPlayground({
 
       if (timestampAlignerModelId && timestampAlignerReady) {
         setIncludeTimestamps(true);
+        setStreamingEnabled(false);
         return;
       }
 
@@ -896,6 +897,13 @@ export function TranscriptionPlayground({
       timestampAlignerReady,
     ],
   );
+
+  const handleStreamingEnabledChange = useCallback((nextValue: boolean) => {
+    setStreamingEnabled(nextValue);
+    if (nextValue) {
+      setIncludeTimestamps(false);
+    }
+  }, []);
 
   const handleCopy = async () => {
     const exportText = currentOutputExportText;
@@ -1562,6 +1570,9 @@ export function TranscriptionPlayground({
             <p className="text-[11px] text-muted-foreground mt-1">
               Saved automatically to transcription history.
             </p>
+            <p className="mt-1 text-[11px] text-[var(--text-subtle)]">
+              Streaming and timestamps are separate modes.
+            </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <Select
@@ -1602,7 +1613,9 @@ export function TranscriptionPlayground({
               <input
                 type="checkbox"
                 checked={streamingEnabled}
-                onChange={(event) => setStreamingEnabled(event.target.checked)}
+                onChange={(event) =>
+                  handleStreamingEnabledChange(event.target.checked)
+                }
                 className="app-checkbox w-3.5 h-3.5 disabled:opacity-50 ml-1"
                 disabled={isProcessing}
               />
