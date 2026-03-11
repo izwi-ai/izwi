@@ -52,7 +52,7 @@ export function VoicePicker({
   return (
     <div
       className={cn(
-        "grid gap-4 grid-cols-[repeat(auto-fill,minmax(280px,1fr))]",
+        "grid gap-3 grid-cols-[repeat(auto-fill,minmax(250px,1fr))]",
         className,
       )}
     >
@@ -79,14 +79,14 @@ export function VoicePicker({
               }
             }}
           >
-            <CardContent className="flex h-full flex-col gap-4 p-5">
-              <div className="space-y-2">
+            <CardContent className="flex h-full flex-col gap-3 p-4">
+              <div className="space-y-1.5">
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0">
                     <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
                       {item.categoryLabel}
                     </div>
-                    <div className="mt-1 text-base font-semibold text-foreground">
+                    <div className="mt-1 text-[1rem] font-semibold leading-tight text-foreground">
                       {item.name}
                     </div>
                   </div>
@@ -97,18 +97,18 @@ export function VoicePicker({
                   ) : null}
                 </div>
                 {item.description ? (
-                  <p className="text-sm leading-relaxed text-muted-foreground">
+                  <p className="line-clamp-4 text-sm leading-6 text-muted-foreground">
                     {item.description}
                   </p>
                 ) : null}
               </div>
 
               {item.meta && item.meta.length > 0 ? (
-                <div className="flex flex-wrap gap-2">
+                <div className="flex flex-wrap gap-1.5">
                   {item.meta.map((meta) => (
                     <span
                       key={`${item.id}-${meta}`}
-                      className="rounded-full border border-border/75 bg-muted/55 px-2.5 py-1 text-[11px] font-medium text-muted-foreground"
+                      className="rounded-full border border-border/75 bg-muted/55 px-2.5 py-0.5 text-[11px] font-medium text-muted-foreground"
                     >
                       {meta}
                     </span>
@@ -116,7 +116,7 @@ export function VoicePicker({
                 </div>
               ) : null}
 
-              <div className="mt-auto space-y-3">
+              <div className="mt-auto space-y-2.5">
                 {item.previewUrl ? (
                   <audio
                     src={item.previewUrl}
@@ -133,7 +133,7 @@ export function VoicePicker({
 
                 {item.actions ? (
                   <div
-                    className="flex flex-wrap items-center gap-2"
+                    className="flex flex-wrap items-center gap-2 pt-0.5"
                     onClick={(event) => event.stopPropagation()}
                   >
                     {item.actions}

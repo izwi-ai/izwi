@@ -13,9 +13,8 @@ import { api } from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import { VoicePicker, type VoicePickerItem } from "@/components/VoicePicker";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { getSpeakerProfilesForVariant } from "@/types";
 import {
   TEXT_TO_SPEECH_PREFERRED_MODELS,
@@ -23,6 +22,7 @@ import {
 } from "@/features/models/catalog/routeModelCatalog";
 import { RouteModelModal } from "@/features/models/components/RouteModelModal";
 import { useRouteModelSelection } from "@/features/models/hooks/useRouteModelSelection";
+import { cn } from "@/lib/utils";
 
 interface VoicesPageProps {
   models: ModelInfo[];
@@ -386,6 +386,31 @@ export function VoicesPage({
     }),
   );
 
+  const totalSavedVoices = savedVoices.length;
+  const clonedVoiceCount = savedVoices.filter(
+    (voice) => voice.source_route_kind === "voice_cloning",
+  ).length;
+  const designedVoiceCount = savedVoices.filter(
+    (voice) => voice.source_route_kind === "voice_design",
+  ).length;
+  const activeResultCount =
+    activeTab === "saved"
+      ? filteredSavedVoices.length
+      : filteredBuiltInVoices.length;
+  const activeSearchPlaceholder =
+    activeTab === "saved"
+      ? "Search saved voices by name or transcript"
+      : "Search built-in voices by name or language";
+  const activeItems = activeTab === "saved" ? savedVoiceItems : builtInVoiceItems;
+  const activeResultsLabel =
+    activeResultCount === 1 ? "1 result" : `${activeResultCount} results`;
+  const activePanelTitle =
+    activeTab === "saved" ? "Reusable voice library" : "Built-in voice library";
+  const activePanelDescription =
+    activeTab === "saved"
+      ? "Saved voices come from voice cloning and voice design and are ready to reuse in TTS."
+      : "Built-in voices belong to the active model. Generate a preview first, then jump into TTS with the selected speaker.";
+
   return (
     <PageShell>
       <PageHeader
@@ -393,160 +418,275 @@ export function VoicesPage({
         description="Manage saved cloned and designed voices, browse built-in voice libraries, and hand them off into text-to-speech."
       />
 
-      <div className="grid gap-6 xl:grid-cols-[340px_minmax(0,1fr)]">
-        <Card>
-          <CardContent className="space-y-6 p-6">
-            <div className="space-y-1">
-              <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-                Voice Library
-              </div>
-              <h2 className="text-lg font-semibold text-foreground">
-                Reusable voices first
+      <div className="card flex min-h-0 flex-col p-4 xl:h-[calc(100dvh-11.75rem)]">
+        <div className="mb-4 flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <div className="flex items-center gap-3">
+            <div className="rounded border border-[var(--border-muted)] bg-[var(--bg-surface-2)] p-2">
+              <Library className="h-5 w-5 text-[var(--text-muted)]" />
+            </div>
+            <div>
+              <h2 className="text-sm font-medium text-[var(--text-primary)]">
+                Voice browser
               </h2>
-              <p className="text-sm leading-relaxed text-muted-foreground">
-                Saved voices are reusable assets. Built-in voices depend on the
-                active model and can be previewed here before opening TTS.
+              <p className="mt-0.5 text-xs text-[var(--text-muted)]">
+                Reusable saved voices stay ready for TTS. Built-in speakers come
+                from the active model.
               </p>
             </div>
+          </div>
 
-            <div className="space-y-2.5">
-              <label className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-                Search voices
-              </label>
+          <Tabs
+            value={activeTab}
+            onValueChange={(value) => setActiveTab(value as "saved" | "built-in")}
+            className="w-full max-w-md"
+          >
+            <TabsList className="grid w-full grid-cols-2 border-[var(--border-strong)] bg-[var(--bg-surface-2)] p-1 shadow-sm">
+              <TabsTrigger
+                value="saved"
+                className="justify-between gap-2 text-[var(--text-muted)] hover:text-[var(--text-primary)] data-[state=active]:bg-[var(--accent-solid)] data-[state=active]:text-[var(--text-on-accent)] data-[state=active]:shadow-[0_8px_20px_-14px_rgba(17,17,17,0.55)]"
+              >
+                <span className="inline-flex items-center gap-2">
+                  <Library className="h-4 w-4" />
+                  My Voices
+                </span>
+                <span className="rounded-full border border-current/15 px-2 py-0.5 text-[10px] font-semibold">
+                  {totalSavedVoices}
+                </span>
+              </TabsTrigger>
+              <TabsTrigger
+                value="built-in"
+                className="justify-between gap-2 text-[var(--text-muted)] hover:text-[var(--text-primary)] data-[state=active]:bg-[var(--accent-solid)] data-[state=active]:text-[var(--text-on-accent)] data-[state=active]:shadow-[0_8px_20px_-14px_rgba(17,17,17,0.55)]"
+              >
+                <span className="inline-flex items-center gap-2">
+                  <Sparkles className="h-4 w-4" />
+                  Built-in Voices
+                </span>
+                <span className="rounded-full border border-current/15 px-2 py-0.5 text-[10px] font-semibold">
+                  {builtInVoices.length}
+                </span>
+              </TabsTrigger>
+            </TabsList>
+          </Tabs>
+        </div>
+
+        <div className="grid min-h-0 flex-1 gap-5 xl:grid-cols-[290px_minmax(0,1fr)]">
+          <aside className="space-y-4">
+            <section className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
+              <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--text-muted)]">
+                Search
+              </div>
               <Input
                 value={search}
                 onChange={(event) => setSearch(event.target.value)}
-                placeholder="Search by name, language, or transcript"
-                className="bg-muted/20"
+                placeholder={activeSearchPlaceholder}
+                className="mt-3 bg-[var(--bg-surface-1)]"
               />
-            </div>
+              <div className="mt-3 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
+                {activeResultsLabel} matching the current tab.
+              </div>
+            </section>
 
-            <div className="space-y-4 rounded-2xl border border-border/60 bg-muted/20 p-5">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-                    Built-in model
+            {activeTab === "saved" ? (
+              <section className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--text-muted)]">
+                      Saved Library
+                    </div>
+                    <h3 className="mt-1 text-base font-semibold text-[var(--text-primary)]">
+                      Reusable saved voices
+                    </h3>
                   </div>
-                  <div className="mt-1 text-sm font-semibold text-foreground">
-                    {resolvedSelectedModel ?? "No model selected"}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void loadSavedVoices()}
+                    disabled={savedVoicesLoading}
+                    className="bg-[var(--bg-surface-1)]"
+                  >
+                    {savedVoicesLoading ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <RefreshCw className="h-4 w-4" />
+                    )}
+                    Refresh
+                  </Button>
+                </div>
+
+                <div className="mt-4 grid gap-2 sm:grid-cols-3 xl:grid-cols-1">
+                  <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-3">
+                    <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--text-muted)]">
+                      Total
+                    </div>
+                    <div className="mt-1 text-xl font-semibold text-[var(--text-primary)]">
+                      {totalSavedVoices}
+                    </div>
                   </div>
-                  <div className="mt-1 text-xs text-muted-foreground">
-                    {selectedModelReady
-                      ? "Loaded and ready for built-in previews"
-                      : "Choose a built-in voice model before previewing"}
+                  <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-3">
+                    <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--text-muted)]">
+                      Cloned
+                    </div>
+                    <div className="mt-1 text-xl font-semibold text-[var(--text-primary)]">
+                      {clonedVoiceCount}
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-3">
+                    <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--text-muted)]">
+                      Designed
+                    </div>
+                    <div className="mt-1 text-xl font-semibold text-[var(--text-primary)]">
+                      {designedVoiceCount}
+                    </div>
                   </div>
                 </div>
-                <Button variant="outline" size="sm" onClick={openModelManager}>
-                  Models
-                </Button>
-              </div>
-              <div className="rounded-xl border border-border/60 bg-background/50 px-3.5 py-3 text-xs leading-relaxed text-muted-foreground">
-                {selectedModelInfo?.speech_capabilities?.built_in_voice_count
-                  ? `${selectedModelInfo.speech_capabilities.built_in_voice_count} built-in voices available on the active model.`
-                  : "Built-in voices appear when a CustomVoice, Kokoro, or LFM2 Audio model is selected."}
-              </div>
-            </div>
 
-            <div className="space-y-3">
-              <div className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-                Saved voice filters
-              </div>
-              <div className="flex flex-wrap gap-2.5">
-                {(
-                  [
-                    ["all", "All voices"],
-                    ["voice_cloning", "Cloned"],
-                    ["voice_design", "Designed"],
-                  ] as const
-                ).map(([value, label]) => (
+                <div className="mt-4 space-y-3">
+                  <div className="text-xs font-semibold uppercase tracking-[0.18em] text-[var(--text-muted)]">
+                    Filters
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    {(
+                      [
+                        ["all", "All voices"],
+                        ["voice_cloning", "Cloned"],
+                        ["voice_design", "Designed"],
+                      ] as const
+                    ).map(([value, label]) => (
+                      <Button
+                        key={value}
+                        type="button"
+                        size="sm"
+                        variant={savedVoiceFilter === value ? "default" : "outline"}
+                        onClick={() => setSavedVoiceFilter(value)}
+                      >
+                        {label}
+                      </Button>
+                    ))}
+                  </div>
+                </div>
+              </section>
+            ) : (
+              <section className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--text-muted)]">
+                      Built-in Model
+                    </div>
+                    <h3 className="mt-1 text-base font-semibold text-[var(--text-primary)]">
+                      {resolvedSelectedModel ?? "No model selected"}
+                    </h3>
+                    <div
+                      className={cn(
+                        "mt-2 text-xs",
+                        selectedModelReady
+                          ? "text-[var(--text-secondary)]"
+                          : "text-amber-500",
+                      )}
+                    >
+                      {selectedModelReady
+                        ? "Loaded and ready for voice previews"
+                        : "Choose and load a supported model before previewing"}
+                    </div>
+                  </div>
                   <Button
-                    key={value}
-                    type="button"
+                    variant="outline"
                     size="sm"
-                    variant={savedVoiceFilter === value ? "default" : "outline"}
-                    onClick={() => setSavedVoiceFilter(value)}
+                    onClick={openModelManager}
+                    className="bg-[var(--bg-surface-1)]"
                   >
-                    {label}
+                    Models
                   </Button>
-                ))}
+                </div>
+
+                <div className="mt-4 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3.5 py-3 text-xs leading-relaxed text-[var(--text-muted)]">
+                  {selectedModelInfo?.speech_capabilities?.built_in_voice_count
+                    ? `${selectedModelInfo.speech_capabilities.built_in_voice_count} built-in speakers are available on the active model.`
+                    : "Built-in voices appear when a CustomVoice, Kokoro, or LFM2 Audio model is selected."}
+                </div>
+
+                <div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-1">
+                  <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-3">
+                    <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--text-muted)]">
+                      Visible voices
+                    </div>
+                    <div className="mt-1 text-xl font-semibold text-[var(--text-primary)]">
+                      {filteredBuiltInVoices.length}
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-3">
+                    <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--text-muted)]">
+                      Route models
+                    </div>
+                    <div className="mt-1 text-xl font-semibold text-[var(--text-primary)]">
+                      {routeModels.length}
+                    </div>
+                  </div>
+                </div>
+              </section>
+            )}
+          </aside>
+
+          <section className="flex min-h-0 flex-col rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 sm:p-6">
+            <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+              <div>
+                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--text-muted)]">
+                  {activeTab === "saved" ? "Saved voices" : "Built-in voices"}
+                </div>
+                <h3 className="mt-1 text-lg font-semibold text-[var(--text-primary)]">
+                  {activePanelTitle}
+                </h3>
+                <p className="mt-1 max-w-3xl text-sm leading-relaxed text-[var(--text-secondary)]">
+                  {activePanelDescription}
+                </p>
+              </div>
+
+              <div className="flex flex-wrap gap-2 text-xs">
+                <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[var(--text-muted)]">
+                  {activeResultsLabel}
+                </span>
+                {activeTab === "saved" && savedVoiceFilter !== "all" ? (
+                  <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[var(--text-muted)]">
+                    {savedVoiceFilter === "voice_cloning" ? "Cloned only" : "Designed only"}
+                  </span>
+                ) : null}
+                {activeTab === "built-in" && resolvedSelectedModel ? (
+                  <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[var(--text-muted)]">
+                    {resolvedSelectedModel}
+                  </span>
+                ) : null}
               </div>
             </div>
 
-            <div className="flex flex-wrap gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => void loadSavedVoices()}
-                disabled={savedVoicesLoading}
-              >
-                {savedVoicesLoading ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : (
-                  <RefreshCw className="h-4 w-4" />
-                )}
-                Refresh voices
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
+            {activeTab === "saved" && savedVoicesError ? (
+              <div className="mt-4 rounded-xl border border-[var(--danger-border)] bg-[var(--danger-bg)] px-4 py-3 text-sm text-[var(--danger-text)]">
+                {savedVoicesError}
+              </div>
+            ) : null}
 
-        <Card className="min-h-[36rem]">
-          <CardContent className="p-6">
-            <Tabs
-              value={activeTab}
-              onValueChange={(value) =>
-                setActiveTab(value as "saved" | "built-in")
-              }
-              className="space-y-5"
-            >
-              <TabsList>
-                <TabsTrigger value="saved">
-                  <Library className="h-4 w-4" />
-                  My Voices
-                </TabsTrigger>
-                <TabsTrigger value="built-in">
-                  <Sparkles className="h-4 w-4" />
-                  Built-in Voices
-                </TabsTrigger>
-              </TabsList>
-
-              <TabsContent value="saved" className="mt-0">
-                {savedVoicesError ? (
-                  <Card className="border-destructive/40 bg-destructive/5">
-                    <CardContent className="p-5 text-sm text-destructive">
-                      {savedVoicesError}
-                    </CardContent>
-                  </Card>
-                ) : null}
-                <VoicePicker
-                  items={savedVoiceItems}
-                  emptyTitle={
-                    savedVoicesLoading
+            <div className="mt-5 min-h-0 flex-1 overflow-y-auto pr-1 scrollbar-thin">
+              <VoicePicker
+                items={activeItems}
+                emptyTitle={
+                  activeTab === "saved"
+                    ? savedVoicesLoading
                       ? "Loading saved voices"
                       : "No saved voices yet"
-                  }
-                  emptyDescription={
-                    savedVoicesLoading
+                    : "No built-in voices available"
+                }
+                emptyDescription={
+                  activeTab === "saved"
+                    ? savedVoicesLoading
                       ? "Fetching your reusable cloned and designed voices."
                       : "Save a result from voice cloning or voice design to build a reusable voice library."
-                  }
-                />
-              </TabsContent>
-
-              <TabsContent value="built-in" className="mt-0">
-                <VoicePicker
-                  items={builtInVoiceItems}
-                  emptyTitle="No built-in voices available"
-                  emptyDescription={
-                    routeModels.length === 0
+                    : routeModels.length === 0
                       ? "Load a CustomVoice, Kokoro, or LFM2 Audio model to browse built-in voices."
                       : "Try a different built-in voice model or search term."
-                  }
-                />
-              </TabsContent>
-            </Tabs>
-          </CardContent>
-        </Card>
+                }
+                className="grid-cols-[repeat(auto-fill,minmax(248px,1fr))]"
+              />
+            </div>
+          </section>
+        </div>
       </div>
 
       <RouteModelModal
