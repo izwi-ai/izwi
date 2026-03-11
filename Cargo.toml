@@ -35,7 +35,7 @@ serde_json = "1.0"
 toml = "0.8"
 
 # Model loading
-hf-hub = "0.3"
+hf-hub = { version = "0.5", default-features = false, features = [ "rustls-tls", "tokio", "ureq"] }
 safetensors = "0.4"
 tokenizers = "0.22.2"
 
@@ -62,7 +62,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.0", features = ["v4", "serde"] }
 bytes = "1.9"
 base64 = "0.22"
-reqwest = { version = "0.11", features = ["json", "stream", "blocking"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "stream", "blocking", "rustls-tls"] }
 indicatif = "0.17"
 dirs = "5.0"
 sha2 = "0.10"
