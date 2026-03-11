@@ -38,6 +38,7 @@ import {
 } from "@/features/models/catalog/routeModelCatalog";
 import type { VoicePickerItem } from "@/components/VoicePicker";
 import { VoiceSelect } from "@/components/VoiceSelect";
+import { RouteModelSelect } from "@/components/RouteModelSelect";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -1272,20 +1273,15 @@ export function TextToSpeechProjectsWorkspace({
                     <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
                       Render model
                     </label>
-                    <select
+                    <RouteModelSelect
                       value={projectModelId}
-                      onChange={(event) => {
-                        setProjectModelId(event.target.value);
+                      options={modelOptions}
+                      onSelect={(value) => {
+                        setProjectModelId(value);
                         setWorkspaceStatus(null);
                       }}
-                      className="flex h-11 w-full rounded-xl border border-input/85 bg-background/70 px-3.5 text-sm shadow-sm transition-[border-color,box-shadow,background-color] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35 focus-visible:border-ring/50"
-                    >
-                      {modelOptions.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label} · {option.statusLabel}
-                        </option>
-                      ))}
-                    </select>
+                      className="w-full"
+                    />
                   </div>
                 </div>
 

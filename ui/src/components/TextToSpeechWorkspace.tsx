@@ -28,6 +28,7 @@ import {
 } from "@/features/models/catalog/routeModelCatalog";
 import type { VoicePickerItem } from "@/components/VoicePicker";
 import { VoiceSelect } from "@/components/VoiceSelect";
+import { RouteModelSelect } from "@/components/RouteModelSelect";
 import { GenerationStats } from "@/components/GenerationStats";
 import { TextToSpeechProjectsWorkspace } from "@/components/TextToSpeechProjectsWorkspace";
 import { Button } from "@/components/ui/button";
@@ -867,25 +868,12 @@ export function TextToSpeechWorkspace({
   };
 
   const renderModelSelector = () => (
-    <select
-      value={selectedModel ?? ""}
-      onChange={(event) => onSelectModel?.(event.target.value)}
-      className={cn(
-        "flex h-11 w-full rounded-xl border border-input/85 bg-background/70 px-3.5 text-sm shadow-sm transition-[border-color,box-shadow,background-color] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35 focus-visible:border-ring/50",
-        !selectedOption?.isReady && "text-muted-foreground",
-      )}
-    >
-      {!selectedModel ? (
-        <option value="" disabled>
-          Select model
-        </option>
-      ) : null}
-      {modelOptions.map((option) => (
-        <option key={option.value} value={option.value}>
-          {option.label} · {option.statusLabel}
-        </option>
-      ))}
-    </select>
+    <RouteModelSelect
+      value={selectedModel}
+      options={modelOptions}
+      onSelect={onSelectModel}
+      className="w-full"
+    />
   );
 
   const renderWorkflowTabs = () => (
