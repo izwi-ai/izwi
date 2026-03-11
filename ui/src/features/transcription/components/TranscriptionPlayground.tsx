@@ -58,6 +58,8 @@ import {
 } from "@/api";
 import { ASRStats, GenerationStats } from "@/components/GenerationStats";
 import { MiniWaveform } from "@/components/ui/Waveform";
+import { TranscriptionReviewWorkspace } from "@/features/transcription/components/TranscriptionReviewWorkspace";
+import { formatTranscriptionText } from "@/features/transcription/transcript";
 import {
   Select,
   SelectContent,
@@ -73,6 +75,9 @@ export function TranscriptionPlayground({
   onSelectModel,
   onOpenModelManager,
   onModelRequired,
+  timestampAlignerModelId = null,
+  timestampAlignerReady = false,
+  onTimestampAlignerRequired,
   historyActionContainer,
 }: TranscriptionPlaygroundProps) {
   const [transcription, setTranscription] = useState("");
@@ -85,8 +90,11 @@ export function TranscriptionPlayground({
   const [processingStats, setProcessingStats] = useState<ASRStats | null>(null);
   const [streamingEnabled, setStreamingEnabled] = useState(true);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [includeTimestamps, setIncludeTimestamps] = useState(false);
   const [selectedLanguage, setSelectedLanguage] = useState("English");
   const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
+  const [currentOutputRecord, setCurrentOutputRecord] =
+    useState<TranscriptionRecord | null>(null);
   const [historyRecords, setHistoryRecords] = useState<
     TranscriptionRecordSummary[]
   >([]);
@@ -133,17 +141,6 @@ export function TranscriptionPlayground({
   const liveMicProcessorSinkRef = useRef<GainNode | null>(null);
   const modelMenuRef = useRef<HTMLDivElement | null>(null);
   const historyAudioRef = useRef<HTMLAudioElement | null>(null);
-  const transcriptContainerRef = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    if (isStreaming && transcriptContainerRef.current) {
-      const { scrollHeight, clientHeight } = transcriptContainerRef.current;
-      transcriptContainerRef.current.scrollTo({
-        top: scrollHeight - clientHeight,
-        behavior: "smooth",
-      });
-    }
-  }, [transcription, isStreaming]);
 
   const selectedOption = useMemo(() => {
     if (!selectedModel) {
@@ -175,6 +172,23 @@ export function TranscriptionPlayground({
     }
     return true;
   }, [selectedModel, selectedModelReady, onModelRequired]);
+
+  const requireTimestampAligner = useCallback(() => {
+    if (!includeTimestamps) {
+      return true;
+    }
+    if (timestampAlignerModelId && timestampAlignerReady) {
+      return true;
+    }
+    onTimestampAlignerRequired?.();
+    setError("Load the timestamp aligner model to enable timestamps.");
+    return false;
+  }, [
+    includeTimestamps,
+    onTimestampAlignerRequired,
+    timestampAlignerModelId,
+    timestampAlignerReady,
+  ]);
 
   const mergeHistorySummary = useCallback(
     (summary: TranscriptionRecordSummary) => {
@@ -452,10 +466,14 @@ export function TranscriptionPlayground({
       if (!requireReadyModel()) {
         return;
       }
+      if (!requireTimestampAligner()) {
+        return;
+      }
 
       setIsProcessing(true);
       setError(null);
       setProcessingStats(null);
+      setCurrentOutputRecord(null);
       if (!options.preserveTranscript) {
         setTranscription("");
       }
@@ -489,7 +507,11 @@ export function TranscriptionPlayground({
               audio_file: uploadBlob,
               audio_filename: uploadFilename,
               model_id: selectedModel || undefined,
+              aligner_model_id: includeTimestamps
+                ? timestampAlignerModelId || undefined
+                : undefined,
               language: selectedLanguage,
+              include_timestamps: includeTimestamps,
             },
             {
               onStart: () => {},
@@ -505,6 +527,7 @@ export function TranscriptionPlayground({
                   audio_duration_secs: record.duration_secs,
                   rtf: record.rtf,
                 });
+                setCurrentOutputRecord(record);
                 mergeHistorySummary(summarizeRecord(record));
                 setSelectedHistoryRecord(record);
                 setSelectedHistoryRecordId(record.id);
@@ -528,7 +551,11 @@ export function TranscriptionPlayground({
             audio_file: uploadBlob,
             audio_filename: uploadFilename,
             model_id: selectedModel || undefined,
+            aligner_model_id: includeTimestamps
+              ? timestampAlignerModelId || undefined
+              : undefined,
             language: selectedLanguage,
+            include_timestamps: includeTimestamps,
           });
 
           setTranscription(record.transcription);
@@ -538,6 +565,7 @@ export function TranscriptionPlayground({
             audio_duration_secs: record.duration_secs,
             rtf: record.rtf,
           });
+          setCurrentOutputRecord(record);
           mergeHistorySummary(summarizeRecord(record));
           setSelectedHistoryRecord(record);
           setSelectedHistoryRecordId(record.id);
@@ -554,14 +582,20 @@ export function TranscriptionPlayground({
       loadHistory,
       mergeHistorySummary,
       requireReadyModel,
+      requireTimestampAligner,
+      includeTimestamps,
       selectedModel,
       selectedLanguage,
       streamingEnabled,
+      timestampAlignerModelId,
     ],
   );
 
   const startRecording = useCallback(async () => {
     if (!requireReadyModel()) {
+      return;
+    }
+    if (!requireTimestampAligner()) {
       return;
     }
 
@@ -675,6 +709,7 @@ export function TranscriptionPlayground({
       setTranscription("");
       setDetectedLanguage(null);
       setProcessingStats(null);
+      setCurrentOutputRecord(null);
       setIsStreaming(true);
 
       const audioContext = new AudioContext();
@@ -783,6 +818,7 @@ export function TranscriptionPlayground({
     abortLiveMicStream,
     processAudio,
     requireReadyModel,
+    requireTimestampAligner,
     selectedLanguage,
     selectedModel,
   ]);
@@ -831,6 +867,7 @@ export function TranscriptionPlayground({
     }
     setTranscription("");
     setDetectedLanguage(null);
+    setCurrentOutputRecord(null);
     setAudioUrl(null);
     setError(null);
     setProcessingStats(null);
@@ -838,18 +875,48 @@ export function TranscriptionPlayground({
     setIsProcessing(false);
   };
 
+  const handleIncludeTimestampsChange = useCallback(
+    (nextValue: boolean) => {
+      if (!nextValue) {
+        setIncludeTimestamps(false);
+        return;
+      }
+
+      if (timestampAlignerModelId && timestampAlignerReady) {
+        setIncludeTimestamps(true);
+        return;
+      }
+
+      onTimestampAlignerRequired?.();
+      setError("Load the timestamp aligner model to enable timestamps.");
+    },
+    [
+      onTimestampAlignerRequired,
+      timestampAlignerModelId,
+      timestampAlignerReady,
+    ],
+  );
+
   const handleCopy = async () => {
-    await navigator.clipboard.writeText(transcription);
+    const exportText = currentOutputExportText;
+    if (!exportText) {
+      return;
+    }
+    await navigator.clipboard.writeText(exportText);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
 
   const handleDownload = () => {
-    const blob = new Blob([transcription], { type: "text/plain" });
+    const exportText = currentOutputExportText;
+    if (!exportText) {
+      return;
+    }
+    const blob = new Blob([exportText], { type: "text/plain" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `transcription-${Date.now()}.txt`;
+    link.download = `transcription-${Date.now()}${currentOutputHasTimestamps ? "-timestamps" : ""}.txt`;
     link.click();
     URL.revokeObjectURL(url);
   };
@@ -863,7 +930,60 @@ export function TranscriptionPlayground({
     };
   }, [abortLiveMicStream]);
 
-  const showResult = Boolean(transcription || isStreaming || isProcessing);
+  const outputRecord = useMemo<
+    Pick<
+      TranscriptionRecord,
+      | "id"
+      | "aligner_model_id"
+      | "audio_filename"
+      | "duration_secs"
+      | "language"
+      | "transcription"
+      | "segments"
+      | "words"
+    > | null
+  >(() => {
+    if (currentOutputRecord) {
+      return currentOutputRecord;
+    }
+    if (!transcription && !isStreaming && !isProcessing) {
+      return null;
+    }
+    return {
+      id: "transcription-draft",
+      aligner_model_id: null,
+      audio_filename: null,
+      duration_secs: processingStats?.audio_duration_secs ?? null,
+      language: detectedLanguage ?? selectedLanguage,
+      transcription,
+      segments: [],
+      words: [],
+    };
+  }, [
+    currentOutputRecord,
+    detectedLanguage,
+    isProcessing,
+    isStreaming,
+    processingStats?.audio_duration_secs,
+    selectedLanguage,
+    transcription,
+  ]);
+  const currentOutputHasTimestamps = useMemo(
+    () =>
+      Boolean(
+        currentOutputRecord &&
+          ((currentOutputRecord.segments ?? []).length > 0 ||
+            (currentOutputRecord.words ?? []).length > 0),
+      ),
+    [currentOutputRecord],
+  );
+  const currentOutputExportText = useMemo(() => {
+    if (currentOutputRecord) {
+      return formatTranscriptionText(currentOutputRecord);
+    }
+    return transcription.trim();
+  }, [currentOutputRecord, transcription]);
+  const showResult = Boolean(outputRecord || isStreaming || isProcessing);
   const hasDraft = Boolean(transcription || audioUrl || error);
   const selectedHistorySummary = useMemo(
     () =>
@@ -879,6 +999,19 @@ export function TranscriptionPlayground({
     selectedHistoryRecord.id === selectedHistoryRecordId
       ? selectedHistoryRecord
       : null;
+  const activeHistoryExportText = useMemo(
+    () => formatTranscriptionText(activeHistoryRecord),
+    [activeHistoryRecord],
+  );
+  const activeHistoryHasTimestamps = useMemo(
+    () =>
+      Boolean(
+        activeHistoryRecord &&
+          ((activeHistoryRecord.segments ?? []).length > 0 ||
+            (activeHistoryRecord.words ?? []).length > 0),
+      ),
+    [activeHistoryRecord],
+  );
   const deleteTargetRecord = useMemo(() => {
     if (!deleteTargetRecordId) {
       return null;
@@ -1009,28 +1142,28 @@ export function TranscriptionPlayground({
   }, []);
 
   const handleCopyHistoryTranscript = useCallback(async () => {
-    if (!activeHistoryRecord?.transcription) {
+    if (!activeHistoryExportText) {
       return;
     }
-    await navigator.clipboard.writeText(activeHistoryRecord.transcription);
+    await navigator.clipboard.writeText(activeHistoryExportText);
     setHistoryTranscriptCopied(true);
     window.setTimeout(() => setHistoryTranscriptCopied(false), 1800);
-  }, [activeHistoryRecord]);
+  }, [activeHistoryExportText]);
 
   const handleDownloadHistoryTranscript = useCallback(() => {
-    if (!activeHistoryRecord) {
+    if (!activeHistoryRecord || !activeHistoryExportText) {
       return;
     }
-    const blob = new Blob([activeHistoryRecord.transcription], {
+    const blob = new Blob([activeHistoryExportText], {
       type: "text/plain",
     });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
-    anchor.download = `transcription-${activeHistoryRecord.id}.txt`;
+    anchor.download = `transcription-${activeHistoryRecord.id}${activeHistoryHasTimestamps ? "-timestamps" : ""}.txt`;
     anchor.click();
     URL.revokeObjectURL(url);
-  }, [activeHistoryRecord]);
+  }, [activeHistoryExportText, activeHistoryHasTimestamps, activeHistoryRecord]);
 
   useEffect(() => {
     const audio = historyAudioRef.current;
@@ -1415,8 +1548,8 @@ export function TranscriptionPlayground({
         )}
       </div>
 
-      <div className="card p-4 sm:p-5 min-h-[460px] lg:min-h-[560px] xl:min-h-0 flex flex-col xl:h-full">
-        <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+      <div className="flex min-h-[460px] flex-col rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-4 shadow-sm sm:p-5 lg:min-h-[560px] xl:h-full xl:min-h-0">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-3">
           <div className="min-w-0">
             <div className="flex items-center gap-2 min-w-0">
               <FileText className="w-4 h-4 text-muted-foreground" />
@@ -1459,6 +1592,18 @@ export function TranscriptionPlayground({
               </SelectContent>
             </Select>
             <label className="flex items-center gap-2 rounded-md border border-[var(--border-muted)] bg-muted/30 px-2 py-1.5 text-xs text-muted-foreground shadow-sm">
+              <span className="font-medium">Timestamps</span>
+              <input
+                type="checkbox"
+                checked={includeTimestamps}
+                onChange={(event) =>
+                  handleIncludeTimestampsChange(event.target.checked)
+                }
+                className="app-checkbox h-3.5 w-3.5 disabled:opacity-50"
+                disabled={isProcessing}
+              />
+            </label>
+            <label className="flex items-center gap-2 rounded-md border border-[var(--border-muted)] bg-muted/30 px-2 py-1.5 text-xs text-muted-foreground shadow-sm">
               <Radio className="w-3.5 h-3.5" />
               <span className="font-medium">Stream</span>
               <input
@@ -1474,7 +1619,7 @@ export function TranscriptionPlayground({
               variant="outline"
               size="sm"
               className="h-8 w-8 p-0"
-              disabled={!transcription || isStreaming}
+              disabled={!currentOutputExportText || isStreaming}
               title="Copy transcript"
             >
               {copied ? (
@@ -1488,7 +1633,7 @@ export function TranscriptionPlayground({
               variant="outline"
               size="sm"
               className="h-8 w-8 p-0"
-              disabled={!transcription || isStreaming}
+              disabled={!currentOutputExportText || isStreaming}
               title="Download transcript"
             >
               <Download className="w-4 h-4" />
@@ -1496,35 +1641,26 @@ export function TranscriptionPlayground({
           </div>
         </div>
 
-        <div
-          ref={transcriptContainerRef}
-          className="flex-1 rounded-lg border border-[var(--border-muted)] bg-background/50 p-4 sm:p-5 overflow-y-auto shadow-inner scroll-smooth"
-        >
+        <div className="flex-1 min-h-0">
           {showResult ? (
             <>
               {isProcessing && !transcription ? (
-                <div className="h-full flex items-center justify-center text-sm text-muted-foreground gap-2">
+                <div className="flex h-full items-center justify-center gap-2 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] text-sm text-muted-foreground">
                   <Loader2 className="w-4 h-4 animate-spin text-primary" />
                   {isStreaming
                     ? "Streaming transcription..."
                     : "Transcribing..."}
                 </div>
               ) : (
-                <div className="flex flex-col h-full">
-                  <p className="text-base text-[var(--text-primary)] whitespace-pre-wrap flex-1 leading-relaxed tracking-wide">
-                    {transcription}
-                  </p>
-                  {isStreaming && (
-                    <div className="flex items-center gap-2 text-sm text-[var(--text-secondary)] mt-4 p-3 bg-[var(--bg-surface-0)] rounded-lg border border-[var(--border-muted)] sticky bottom-0">
-                      <MiniWaveform isActive={true} />
-                      <span className="italic">Listening for speech...</span>
-                    </div>
-                  )}
-                </div>
+                <TranscriptionReviewWorkspace
+                  record={outputRecord}
+                  audioUrl={audioUrl}
+                  emptyMessage="Record audio or upload a file to start."
+                />
               )}
             </>
           ) : (
-            <div className="h-full flex items-center justify-center text-center px-6">
+            <div className="flex h-full items-center justify-center rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-6 text-center">
               <div className="max-w-xs">
                 <FileText className="w-8 h-8 mx-auto mb-3 opacity-20 text-muted-foreground" />
                 <p className="text-sm font-medium text-muted-foreground">
@@ -1537,6 +1673,13 @@ export function TranscriptionPlayground({
             </div>
           )}
         </div>
+
+        {isStreaming ? (
+          <div className="mt-3 flex items-center gap-2 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-3 text-sm text-[var(--text-secondary)]">
+            <MiniWaveform isActive={true} />
+            <span className="italic">Listening for speech...</span>
+          </div>
+        ) : null}
 
         {processingStats && !isStreaming && (
           <div className="mt-4 pt-3 border-t border-[var(--border-muted)]">
@@ -1900,7 +2043,7 @@ export function TranscriptionPlayground({
                         variant="outline"
                         size="sm"
                         className="h-9 gap-2 text-xs border-[var(--border-muted)] bg-[var(--bg-surface-1)] hover:bg-[var(--bg-surface-2)]"
-                        disabled={!activeHistoryRecord?.transcription}
+                        disabled={!activeHistoryExportText}
                       >
                         {historyTranscriptCopied ? (
                           <>
@@ -1919,28 +2062,20 @@ export function TranscriptionPlayground({
                         variant="outline"
                         size="icon"
                         className="h-9 w-9 border-[var(--border-muted)] bg-[var(--bg-surface-1)] hover:bg-[var(--bg-surface-2)]"
-                        disabled={!activeHistoryRecord?.transcription}
+                        disabled={!activeHistoryExportText}
                         title="Download text file"
                       >
                         <Download className="w-4 h-4" />
                       </Button>
                     </div>
                   </div>
-                  <div className="flex-1 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-5 sm:p-6 overflow-y-auto shadow-inner min-h-[320px]">
-                    {selectedHistoryLoading ? (
-                      <div className="h-full flex flex-col items-center justify-center gap-3 text-sm text-[var(--text-muted)]">
-                        <Loader2 className="w-5 h-5 animate-spin" />
-                        Loading transcript...
-                      </div>
-                    ) : (
-                      <p className="text-base text-[var(--text-primary)] whitespace-pre-wrap leading-relaxed selection:bg-[var(--accent-soft)]">
-                        {activeHistoryRecord?.transcription || (
-                          <span className="text-[var(--text-muted)] italic">
-                            No transcript text available for this record.
-                          </span>
-                        )}
-                      </p>
-                    )}
+                  <div className="flex-1 min-h-0">
+                    <TranscriptionReviewWorkspace
+                      record={activeHistoryRecord}
+                      loading={selectedHistoryLoading}
+                      emptyMessage="No transcript text available for this record."
+                      showPlayback={false}
+                    />
                   </div>
                 </div>
               </div>

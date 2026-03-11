@@ -115,6 +115,60 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     );
   });
 
+  it("posts transcription records with optional timestamp settings", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: "txr-1",
+          created_at: 1,
+          model_id: "Qwen3-ASR-0.6B",
+          aligner_model_id: "Qwen3-ForcedAligner-0.6B",
+          language: "English",
+          duration_secs: 4,
+          processing_time_ms: 120,
+          rtf: 0.5,
+          audio_mime_type: "audio/wav",
+          audio_filename: "clip.wav",
+          transcription: "Hello there.",
+          segments: [],
+          words: [],
+        }),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+          },
+        },
+      ),
+    );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+    await client.createTranscriptionRecord({
+      audio_base64: "UklGRg==",
+      model_id: "Qwen3-ASR-0.6B",
+      aligner_model_id: "Qwen3-ForcedAligner-0.6B",
+      language: "English",
+      include_timestamps: true,
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost/v1/transcriptions",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          audio_base64: "UklGRg==",
+          model: "Qwen3-ASR-0.6B",
+          aligner_model: "Qwen3-ForcedAligner-0.6B",
+          language: "English",
+          include_timestamps: true,
+          stream: false,
+        }),
+      }),
+    );
+  });
+
   it("posts text-to-speech history to the canonical generation route", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(

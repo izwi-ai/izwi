@@ -17,6 +17,9 @@ export interface TranscriptionPlaygroundProps {
   onSelectModel?: (variant: string) => void;
   onOpenModelManager?: () => void;
   onModelRequired: () => void;
+  timestampAlignerModelId?: string | null;
+  timestampAlignerReady?: boolean;
+  onTimestampAlignerRequired?: () => void;
   historyActionContainer?: HTMLElement | null;
 }
 

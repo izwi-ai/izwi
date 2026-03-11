@@ -8,6 +8,8 @@ const apiMocks = vi.hoisted(() => ({
   getTranscriptionRecord: vi.fn(),
   deleteTranscriptionRecord: vi.fn(),
   transcriptionRecordAudioUrl: vi.fn(),
+  createTranscriptionRecord: vi.fn(),
+  createTranscriptionRecordStream: vi.fn(),
 }));
 
 vi.mock("@/api", () => ({
@@ -16,6 +18,8 @@ vi.mock("@/api", () => ({
     getTranscriptionRecord: apiMocks.getTranscriptionRecord,
     deleteTranscriptionRecord: apiMocks.deleteTranscriptionRecord,
     transcriptionRecordAudioUrl: apiMocks.transcriptionRecordAudioUrl,
+    createTranscriptionRecord: apiMocks.createTranscriptionRecord,
+    createTranscriptionRecordStream: apiMocks.createTranscriptionRecordStream,
   },
 }));
 
@@ -25,9 +29,14 @@ describe("TranscriptionPlayground history", () => {
     apiMocks.getTranscriptionRecord.mockReset();
     apiMocks.deleteTranscriptionRecord.mockReset();
     apiMocks.transcriptionRecordAudioUrl.mockReset();
+    apiMocks.createTranscriptionRecord.mockReset();
+    apiMocks.createTranscriptionRecordStream.mockReset();
 
     apiMocks.transcriptionRecordAudioUrl.mockReturnValue(
       "/audio/transcription.wav",
+    );
+    apiMocks.createTranscriptionRecordStream.mockReturnValue(
+      new AbortController(),
     );
 
     HTMLElement.prototype.scrollIntoView = vi.fn();
@@ -53,6 +62,7 @@ describe("TranscriptionPlayground history", () => {
       id: "transcription-1",
       created_at: 1,
       model_id: "Qwen3-ASR-0.6B",
+      aligner_model_id: null,
       language: "English",
       duration_secs: 3.2,
       processing_time_ms: 160,
@@ -60,6 +70,8 @@ describe("TranscriptionPlayground history", () => {
       audio_mime_type: "audio/wav",
       audio_filename: "clip.wav",
       transcription: "Testing saved transcription history.",
+      segments: [],
+      words: [],
     });
     apiMocks.deleteTranscriptionRecord.mockResolvedValue(undefined);
 
@@ -109,5 +121,40 @@ describe("TranscriptionPlayground history", () => {
         "transcription-1",
       ),
     );
+  });
+
+  it("asks for the timestamp aligner before enabling timestamps", async () => {
+    apiMocks.listTranscriptionRecords.mockResolvedValue([]);
+    const onTimestampAlignerRequired = vi.fn();
+
+    render(
+      <TranscriptionPlayground
+        selectedModel="Qwen3-ASR-0.6B"
+        selectedModelReady={true}
+        modelOptions={[
+          {
+            value: "Qwen3-ASR-0.6B",
+            label: "Qwen3 ASR 0.6B",
+            statusLabel: "Ready",
+            isReady: true,
+          },
+        ]}
+        onSelectModel={vi.fn()}
+        onOpenModelManager={vi.fn()}
+        onModelRequired={vi.fn()}
+        onTimestampAlignerRequired={onTimestampAlignerRequired}
+        timestampAlignerModelId={null}
+        timestampAlignerReady={false}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(apiMocks.listTranscriptionRecords).toHaveBeenCalled(),
+    );
+
+    fireEvent.click(screen.getByLabelText(/Timestamps/i));
+
+    expect(onTimestampAlignerRequired).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(/Load the timestamp aligner model/i)).toBeInTheDocument();
   });
 });

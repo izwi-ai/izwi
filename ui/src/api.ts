@@ -38,8 +38,10 @@ export type {
   TTSStreamCallbacks,
   TranscriptionRecord,
   TranscriptionRecordCreateRequest,
+  TranscriptionSegment,
   TranscriptionRecordStreamCallbacks,
   TranscriptionRecordSummary,
+  TranscriptionWord,
 } from "@/shared/api/audio";
 
 export type {

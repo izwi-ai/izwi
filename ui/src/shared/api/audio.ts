@@ -255,10 +255,25 @@ export interface TranscriptionRecordSummary {
   transcription_chars: number;
 }
 
+export interface TranscriptionSegment {
+  start: number;
+  end: number;
+  text: string;
+  word_start: number;
+  word_end: number;
+}
+
+export interface TranscriptionWord {
+  word: string;
+  start: number;
+  end: number;
+}
+
 export interface TranscriptionRecord {
   id: string;
   created_at: number;
   model_id: string | null;
+  aligner_model_id: string | null;
   language: string | null;
   duration_secs: number | null;
   processing_time_ms: number;
@@ -266,6 +281,8 @@ export interface TranscriptionRecord {
   audio_mime_type: string;
   audio_filename: string | null;
   transcription: string;
+  segments: TranscriptionSegment[];
+  words: TranscriptionWord[];
 }
 
 export interface TranscriptionRecordCreateRequest {
@@ -273,7 +290,9 @@ export interface TranscriptionRecordCreateRequest {
   audio_file?: Blob;
   audio_filename?: string;
   model_id?: string;
+  aligner_model_id?: string;
   language?: string;
+  include_timestamps?: boolean;
 }
 
 type TranscriptionRecordStreamEvent =
@@ -1670,8 +1689,14 @@ export class AudioApiClient {
       if (request.model_id) {
         form.append("model", request.model_id);
       }
+      if (request.aligner_model_id) {
+        form.append("aligner_model", request.aligner_model_id);
+      }
       if (request.language) {
         form.append("language", request.language);
+      }
+      if (request.include_timestamps) {
+        form.append("include_timestamps", "true");
       }
       if (stream) {
         form.append("stream", "true");
@@ -1694,7 +1719,9 @@ export class AudioApiClient {
       body: JSON.stringify({
         audio_base64: request.audio_base64,
         model: request.model_id,
+        aligner_model: request.aligner_model_id,
         language: request.language,
+        include_timestamps: Boolean(request.include_timestamps),
         stream,
       }),
     };

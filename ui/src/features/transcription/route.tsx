@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type { ModelInfo } from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import { VIEW_CONFIGS } from "@/types";
@@ -9,6 +9,12 @@ import {
 } from "@/features/models/catalog/routeModelCatalog";
 import { RouteModelModal } from "@/features/models/components/RouteModelModal";
 import { useRouteModelSelection } from "@/features/models/hooks/useRouteModelSelection";
+
+const TRANSCRIPTION_PREFERRED_ALIGNERS = ["Qwen3-ForcedAligner-0.6B"] as const;
+
+function isTranscriptionAlignerVariant(variant: string): boolean {
+  return variant === "Qwen3-ForcedAligner-0.6B";
+}
 
 interface TranscriptionPageProps {
   models: ModelInfo[];
@@ -49,6 +55,13 @@ export function TranscriptionPage({
   const [historyActionContainer, setHistoryActionContainer] =
     useState<HTMLDivElement | null>(null);
   const viewConfig = VIEW_CONFIGS.transcription;
+  const transcriptionAlignerModels = useMemo(
+    () =>
+      models
+        .filter((model) => isTranscriptionAlignerVariant(model.variant))
+        .sort((a, b) => a.variant.localeCompare(b.variant)),
+    [models],
+  );
   const {
     routeModels: transcriptionModels,
     resolvedSelectedModel,
@@ -73,12 +86,46 @@ export function TranscriptionPage({
         preferAnyPreferredBeforeReadyAny: true,
       }),
   });
+  const resolvedAlignerModel = useMemo(
+    () =>
+      resolvePreferredRouteModel({
+        models: transcriptionAlignerModels,
+        selectedModel: null,
+        preferredVariants: TRANSCRIPTION_PREFERRED_ALIGNERS,
+        preferAnyPreferredBeforeReadyAny: true,
+      }),
+    [transcriptionAlignerModels],
+  );
+  const timestampAlignerReady =
+    resolvedAlignerModel != null &&
+    transcriptionAlignerModels.some(
+      (model) =>
+        model.variant === resolvedAlignerModel && model.status === "ready",
+    );
+  const modelSections = useMemo(
+    () => [
+      {
+        key: "asr",
+        title: "ASR Models",
+        description: "Speech-to-text models available for transcription.",
+        models: transcriptionModels,
+      },
+      {
+        key: "aligner",
+        title: "Timestamp Aligners",
+        description:
+          "Optional forced aligner models used when timestamped transcription is enabled.",
+        models: transcriptionAlignerModels,
+      },
+    ],
+    [transcriptionAlignerModels, transcriptionModels],
+  );
 
   return (
     <PageShell>
       <PageHeader
         title="Transcription"
-        description="Capture audio, transcribe live, and browse saved transcription history."
+        description="Capture audio, transcribe live, add optional timestamps, and browse saved transcription history."
         actions={
           <div
             ref={setHistoryActionContainer}
@@ -98,6 +145,12 @@ export function TranscriptionPage({
           requestModel();
           onError("Select and load an ASR model to start transcribing.");
         }}
+        timestampAlignerModelId={resolvedAlignerModel}
+        timestampAlignerReady={timestampAlignerReady}
+        onTimestampAlignerRequired={() => {
+          openModelManager();
+          onError("Load the timestamp aligner model to enable timestamps.");
+        }}
         historyActionContainer={historyActionContainer}
       />
 
@@ -105,8 +158,8 @@ export function TranscriptionPage({
         isOpen={isModelModalOpen}
         onClose={closeModelModal}
         title="Transcription Models"
-        description="Manage ASR models for this route."
-        models={transcriptionModels}
+        description="Manage ASR models and the optional timestamp aligner for this route."
+        models={[...transcriptionModels, ...transcriptionAlignerModels]}
         loading={loading}
         selectedVariant={resolvedSelectedModel}
         intentVariant={intentVariant}
@@ -118,6 +171,10 @@ export function TranscriptionPage({
         onDelete={onDelete}
         onUseModel={onSelect}
         emptyMessage="No transcription models available for this route."
+        sections={modelSections}
+        canUseModel={(variant) =>
+          transcriptionModels.some((model) => model.variant === variant)
+        }
       />
     </PageShell>
   );
