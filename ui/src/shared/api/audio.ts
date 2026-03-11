@@ -288,6 +288,11 @@ export interface TtsProjectSegmentUpdateRequest {
   text: string;
 }
 
+export interface TtsProjectSegmentSplitRequest {
+  before_text: string;
+  after_text: string;
+}
+
 export interface STTRequest {
   audio_base64: string;
   model_id?: string;
@@ -1214,6 +1219,32 @@ export class AudioApiClient {
       body: JSON.stringify({
         text: request.text,
       }),
+    });
+  }
+
+  async splitTtsProjectSegment(
+    projectId: string,
+    segmentId: string,
+    request: TtsProjectSegmentSplitRequest,
+  ): Promise<TtsProjectRecord> {
+    return this.http.request(
+      `${this.ttsProjectSegmentPath(projectId, segmentId)}/split`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          before_text: request.before_text,
+          after_text: request.after_text,
+        }),
+      },
+    );
+  }
+
+  async deleteTtsProjectSegment(
+    projectId: string,
+    segmentId: string,
+  ): Promise<TtsProjectRecord> {
+    return this.http.request(this.ttsProjectSegmentPath(projectId, segmentId), {
+      method: "DELETE",
     });
   }
 

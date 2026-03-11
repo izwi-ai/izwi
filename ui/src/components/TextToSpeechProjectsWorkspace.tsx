@@ -149,6 +149,9 @@ export function TextToSpeechProjectsWorkspace({
   const [renderingAll, setRenderingAll] = useState(false);
   const [deletingProject, setDeletingProject] = useState(false);
   const [segmentDrafts, setSegmentDrafts] = useState<Record<string, string>>({});
+  const [segmentSelections, setSegmentSelections] = useState<
+    Record<string, number | null>
+  >({});
   const fileInputRef = useRef<HTMLInputElement>(null);
   const {
     downloadState,
@@ -309,6 +312,7 @@ export function TextToSpeechProjectsWorkspace({
       setProjectSavedVoiceId("");
       setProjectSpeed(1);
       setSegmentDrafts({});
+      setSegmentSelections({});
       return;
     }
 
@@ -323,6 +327,7 @@ export function TextToSpeechProjectsWorkspace({
         selectedProject.segments.map((segment) => [segment.id, segment.text]),
       ),
     );
+    setSegmentSelections({});
   }, [selectedModel, selectedProject]);
 
   useEffect(() => {
@@ -729,6 +734,101 @@ export function TextToSpeechProjectsWorkspace({
       onError(message);
     } finally {
       setSavingSegmentId(null);
+    }
+  };
+
+  const handleSplitSegment = async (segmentId: string) => {
+    if (!selectedProject) {
+      return;
+    }
+
+    const segment = selectedProject.segments.find((candidate) => candidate.id === segmentId);
+    if (!segment) {
+      return;
+    }
+
+    const draft = segmentDrafts[segmentId] ?? segment.text;
+    const splitIndex = segmentSelections[segmentId];
+    if (
+      typeof splitIndex !== "number" ||
+      splitIndex <= 0 ||
+      splitIndex >= draft.length
+    ) {
+      const message = "Place the text cursor where the next segment should start.";
+      setWorkspaceError(message);
+      onError(message);
+      return;
+    }
+
+    const beforeText = draft.slice(0, splitIndex).trim();
+    const afterText = draft.slice(splitIndex).trim();
+    if (!beforeText || !afterText) {
+      const message =
+        "Split the block so both resulting segments contain text.";
+      setWorkspaceError(message);
+      onError(message);
+      return;
+    }
+
+    try {
+      setWorkspaceError(null);
+      const project = await api.splitTtsProjectSegment(selectedProject.id, segmentId, {
+        before_text: beforeText,
+        after_text: afterText,
+      });
+      setSelectedProject(project);
+      setWorkspaceStatus({
+        tone: "success",
+        message: `Split segment ${segment.position + 1} into two blocks.`,
+      });
+      await loadProjects();
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Failed to split the segment.";
+      setWorkspaceError(message);
+      onError(message);
+    }
+  };
+
+  const handleDeleteSegment = async (segmentId: string) => {
+    if (!selectedProject) {
+      return;
+    }
+    if (selectedProject.segments.length <= 1) {
+      const message = "A project must keep at least one segment.";
+      setWorkspaceError(message);
+      onError(message);
+      return;
+    }
+
+    const segment = selectedProject.segments.find((candidate) => candidate.id === segmentId);
+    if (!segment) {
+      return;
+    }
+
+    if (typeof window !== "undefined") {
+      const confirmed = window.confirm(
+        `Delete segment ${segment.position + 1} from "${selectedProject.name}"?`,
+      );
+      if (!confirmed) {
+        return;
+      }
+    }
+
+    try {
+      setWorkspaceError(null);
+      const project = await api.deleteTtsProjectSegment(selectedProject.id, segmentId);
+      setSelectedProject(project);
+      setWorkspaceStatus({
+        tone: "success",
+        message: `Deleted segment ${segment.position + 1}.`,
+      });
+      await loadProjects();
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Failed to delete the segment.";
+      setWorkspaceError(message);
+      onError(message);
     }
   };
 
@@ -1504,6 +1604,11 @@ export function TextToSpeechProjectsWorkspace({
                     const segmentNeedsRender = segmentDirty || !segment.speech_record_id;
                     const isSaving = savingSegmentId === segment.id;
                     const isRendering = renderingSegmentId === segment.id;
+                    const splitIndex = segmentSelections[segment.id];
+                    const canSplitSegment =
+                      typeof splitIndex === "number" &&
+                      splitIndex > 0 &&
+                      splitIndex < draft.length;
 
                     return (
                       <div
@@ -1557,6 +1662,15 @@ export function TextToSpeechProjectsWorkspace({
                               Save draft
                             </Button>
                             <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => void handleSplitSegment(segment.id)}
+                              disabled={!canSplitSegment}
+                              className="bg-[var(--bg-surface-0)]"
+                            >
+                              Split at cursor
+                            </Button>
+                            <Button
                               size="sm"
                               onClick={() => void handleRenderSegment(segment.id)}
                               disabled={isRendering}
@@ -1572,6 +1686,15 @@ export function TextToSpeechProjectsWorkspace({
                                   ? "Render block"
                                   : "Re-render"}
                             </Button>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => void handleDeleteSegment(segment.id)}
+                              disabled={selectedProject.segments.length <= 1}
+                            >
+                              <Trash2 className="h-4 w-4" />
+                              Delete
+                            </Button>
                           </div>
                         </div>
 
@@ -1584,7 +1707,19 @@ export function TextToSpeechProjectsWorkspace({
                               [segment.id]: event.target.value,
                             }))
                           }
+                          onSelect={(event) =>
+                            setSegmentSelections((current) => ({
+                              ...current,
+                              [segment.id]: event.currentTarget.selectionStart,
+                            }))
+                          }
                         />
+
+                        <div className="mt-2 text-xs text-[var(--text-muted)]">
+                          {canSplitSegment
+                            ? "Split will create a new block where the cursor is placed."
+                            : "Place the text cursor inside this block to enable splitting."}
+                        </div>
 
                         {segmentDirty ? (
                           <div className="mt-4 rounded-xl border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-3 py-2 text-xs text-[var(--status-warning-text)]">

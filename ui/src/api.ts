@@ -43,6 +43,7 @@ export type {
   TtsProjectCreateRequest,
   TtsProjectRecord,
   TtsProjectSegmentRecord,
+  TtsProjectSegmentSplitRequest,
   TtsProjectSegmentUpdateRequest,
   TtsProjectSummary,
   TtsProjectUpdateRequest,

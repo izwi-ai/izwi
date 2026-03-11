@@ -321,6 +321,91 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     );
   });
 
+  it("posts TTS project segment splits to the canonical split route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: "ttsp-1",
+          created_at: 1,
+          updated_at: 1,
+          name: "Narration",
+          source_filename: "script.txt",
+          source_text: "Hello world.\n\nAnother sentence.",
+          model_id: "Qwen3-TTS-0.6B-CustomVoice",
+          voice_mode: "built_in",
+          speaker: "Vivian",
+          saved_voice_id: null,
+          speed: 1,
+          segments: [],
+        }),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+          },
+        },
+      ),
+    );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+    await client.splitTtsProjectSegment("ttsp-1", "ttss-1", {
+      before_text: "Hello world.",
+      after_text: "Another sentence.",
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost/v1/tts-projects/ttsp-1/segments/ttss-1/split",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          before_text: "Hello world.",
+          after_text: "Another sentence.",
+        }),
+      }),
+    );
+  });
+
+  it("deletes TTS project segments through the canonical segment route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: "ttsp-1",
+          created_at: 1,
+          updated_at: 1,
+          name: "Narration",
+          source_filename: "script.txt",
+          source_text: "Hello world.",
+          model_id: "Qwen3-TTS-0.6B-CustomVoice",
+          voice_mode: "built_in",
+          speaker: "Vivian",
+          saved_voice_id: null,
+          speed: 1,
+          segments: [],
+        }),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+          },
+        },
+      ),
+    );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+    await client.deleteTtsProjectSegment("ttsp-1", "ttss-1");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost/v1/tts-projects/ttsp-1/segments/ttss-1",
+      expect.objectContaining({
+        method: "DELETE",
+      }),
+    );
+  });
+
   it("builds canonical TTS project export urls", () => {
     const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
 
