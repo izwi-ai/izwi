@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import type { ModelInfo } from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import { VIEW_CONFIGS } from "@/types";
@@ -8,7 +9,7 @@ import {
 } from "@/features/models/catalog/routeModelCatalog";
 import { RouteModelModal } from "@/features/models/components/RouteModelModal";
 import { useRouteModelSelection } from "@/features/models/hooks/useRouteModelSelection";
-import { VoiceDesignPlayground } from "@/components/VoiceDesignPlayground";
+import { VoiceDesignWorkspace } from "@/components/VoiceDesignWorkspace";
 
 interface VoiceDesignPageProps {
   models: ModelInfo[];
@@ -46,6 +47,7 @@ export function VoiceDesignPage({
   onSelect,
   onError,
 }: VoiceDesignPageProps) {
+  const navigate = useNavigate();
   const [historyActionContainer, setHistoryActionContainer] =
     useState<HTMLDivElement | null>(null);
   const viewConfig = VIEW_CONFIGS["voice-design"];
@@ -87,7 +89,7 @@ export function VoiceDesignPage({
         }
       />
 
-      <VoiceDesignPlayground
+      <VoiceDesignWorkspace
         selectedModel={resolvedSelectedModel}
         selectedModelReady={selectedModelReady}
         modelOptions={modelOptions}
@@ -97,6 +99,9 @@ export function VoiceDesignPage({
           requestModel();
           onError("Select and load a VoiceDesign model to continue.");
         }}
+        onUseInTts={(voiceId) =>
+          navigate(`/text-to-speech?voiceId=${encodeURIComponent(voiceId)}`)
+        }
         historyActionContainer={historyActionContainer}
       />
 
