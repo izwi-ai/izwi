@@ -6,12 +6,14 @@ import {
   useState,
   type ChangeEvent,
 } from "react";
+import { createPortal } from "react-dom";
 import {
   AlertCircle,
   CheckCircle2,
   Download,
   FileAudio,
   FilePlus2,
+  Library,
   Loader2,
   PencilLine,
   Play,
@@ -37,7 +39,14 @@ import {
 import type { VoicePickerItem } from "@/components/VoicePicker";
 import { VoiceSelect } from "@/components/VoiceSelect";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { RouteHistoryDrawer } from "@/components/RouteHistoryDrawer";
 import { Slider } from "@/components/ui/slider";
 import { Textarea } from "@/components/ui/textarea";
 import { useDownloadIndicator } from "@/utils/useDownloadIndicator";
@@ -55,6 +64,7 @@ interface TextToSpeechProjectsWorkspaceProps {
   selectedModelInfo: ModelInfo | null;
   availableModels: ModelInfo[];
   modelOptions?: ModelOption[];
+  headerActionContainer?: HTMLElement | null;
   onSelectModel?: (variant: string) => void;
   onOpenModelManager?: () => void;
   onModelRequired: () => void;
@@ -95,6 +105,7 @@ export function TextToSpeechProjectsWorkspace({
   selectedModelInfo,
   availableModels,
   modelOptions = [],
+  headerActionContainer,
   onSelectModel,
   onOpenModelManager,
   onModelRequired,
@@ -113,6 +124,9 @@ export function TextToSpeechProjectsWorkspace({
   const [newProjectName, setNewProjectName] = useState("");
   const [newProjectText, setNewProjectText] = useState("");
   const [newProjectFilename, setNewProjectFilename] = useState("");
+  const [isCreateProjectDialogOpen, setIsCreateProjectDialogOpen] =
+    useState(false);
+  const [isProjectLibraryOpen, setIsProjectLibraryOpen] = useState(false);
   const [creatingProject, setCreatingProject] = useState(false);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [workspaceStatus, setWorkspaceStatus] = useState<{
@@ -549,6 +563,16 @@ export function TextToSpeechProjectsWorkspace({
     selectedModel,
     selectedModelInfo,
   ]);
+  const newProjectDefaults = useMemo(
+    () => resolveNewProjectDefaults(),
+    [resolveNewProjectDefaults],
+  );
+
+  const openCreateProjectDialog = useCallback(() => {
+    setWorkspaceError(null);
+    setWorkspaceStatus(null);
+    setIsCreateProjectDialogOpen(true);
+  }, []);
 
   const handleCreateProject = async () => {
     if (!newProjectText.trim()) {
@@ -589,6 +613,8 @@ export function TextToSpeechProjectsWorkspace({
       setNewProjectName("");
       setNewProjectText("");
       setNewProjectFilename("");
+      setIsCreateProjectDialogOpen(false);
+      setIsProjectLibraryOpen(false);
       setWorkspaceStatus({
         tone: "success",
         message: `Created project "${project.name}" with ${project.segments.length} segments.`,
@@ -822,128 +848,84 @@ export function TextToSpeechProjectsWorkspace({
           (selectedProjectRenderedCount / selectedProjectSegmentCount) * 100,
         )
       : 0;
-
-  return (
-    <div className="grid gap-6 xl:grid-cols-[320px_minmax(0,1fr)]">
-      <div className="space-y-5">
-        <section className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 sm:p-6">
-          <div className="space-y-2">
-            <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-              Create Project
-            </div>
-            <h3 className="text-lg font-semibold text-[var(--text-primary)]">
-              Import and split a script
-            </h3>
-            <p className="text-sm leading-relaxed text-[var(--text-secondary)]">
-              Start with a script. Izwi splits it into editable narration
-              segments, then you assign a global voice and render the project.
-            </p>
+  const projectLibraryActions = (
+    <div className="flex items-center gap-2">
+      <Button
+        size="sm"
+        onClick={openCreateProjectDialog}
+        className="h-9 gap-2 rounded-lg"
+      >
+        <FilePlus2 className="h-4 w-4" />
+        New project
+      </Button>
+      <RouteHistoryDrawer
+        title="TTS Projects"
+        eyebrow="Project Library"
+        countLabel={
+          projectsLoading
+            ? "Loading your reusable script projects."
+            : projects.length === 0
+              ? "No TTS projects yet."
+              : `${projects.length} reusable script project${projects.length === 1 ? "" : "s"}.`
+        }
+        trigger={
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-9 shrink-0 gap-2 rounded-lg border-[var(--border-muted)] bg-[var(--bg-surface-2)] text-[var(--text-secondary)] shadow-none hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-3)] hover:text-[var(--text-primary)]"
+          >
+            <Library className="h-4 w-4 shrink-0" />
+            <span>Project Library</span>
+            <span className="inline-flex min-w-5 items-center justify-center rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-3)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--text-primary)]">
+              {projects.length > 99 ? "99+" : projects.length}
+            </span>
+          </Button>
+        }
+        open={isProjectLibraryOpen}
+        onOpenChange={setIsProjectLibraryOpen}
+        headerActions={() => (
+          <Button
+            size="sm"
+            onClick={() => {
+              setIsProjectLibraryOpen(false);
+              openCreateProjectDialog();
+            }}
+            className="h-8 gap-2 rounded-lg"
+          >
+            <FilePlus2 className="h-3.5 w-3.5" />
+            New project
+          </Button>
+        )}
+      >
+        <div className="space-y-3">
+          <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3.5 py-3 text-sm leading-relaxed text-[var(--text-secondary)]">
+            Select a saved project to continue rendering, or create a fresh one
+            from a longer script.
           </div>
 
-          <div className="mt-4 space-y-3">
-            <Input
-              value={newProjectName}
-              onChange={(event) => setNewProjectName(event.target.value)}
-              placeholder="Optional project name"
-            />
-            <Textarea
-              value={newProjectText}
-              onChange={(event) => setNewProjectText(event.target.value)}
-              rows={10}
-              placeholder="Paste the script you want to split into renderable segments..."
-              className="bg-[var(--bg-surface-1)] border-[var(--border-muted)]"
-            />
-          </div>
-
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".txt,.md,text/plain"
-            className="hidden"
-            onChange={handleImportFile}
-          />
-          <div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-1">
-            <Button
-              variant="outline"
-              onClick={() => fileInputRef.current?.click()}
-              className="w-full justify-center bg-[var(--bg-surface-1)]"
-            >
-              <Upload className="h-4 w-4" />
-              Import text file
-            </Button>
-            <Button
-              onClick={handleCreateProject}
-              disabled={creatingProject}
-              className="w-full justify-center"
-            >
-              {creatingProject ? (
-                <>
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  Creating...
-                </>
-              ) : (
-                <>
-                  <FilePlus2 className="h-4 w-4" />
-                  Create project
-                </>
-              )}
-            </Button>
-          </div>
-
-          {newProjectFilename ? (
-            <div className="mt-3 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
-              Imported file: {newProjectFilename}
+          {projectsLoading ? (
+            <div className="flex min-h-[220px] items-center justify-center gap-2 rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-6 text-sm text-[var(--text-muted)]">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Loading projects...
             </div>
-          ) : null}
-
-          <div className="mt-5 grid gap-2 text-xs sm:grid-cols-3 xl:grid-cols-1">
-            <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-3 text-[var(--text-secondary)]">
-              1. Paste or import a script
+          ) : projects.length === 0 ? (
+            <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-8 text-center text-sm text-[var(--text-muted)]">
+              No TTS projects yet. Create one to split a script into reusable
+              renderable segments.
             </div>
-            <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-3 text-[var(--text-secondary)]">
-              2. Configure the project voice and model
-            </div>
-            <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-3 text-[var(--text-secondary)]">
-              3. Render segments, then export one merged WAV
-            </div>
-          </div>
-        </section>
-
-        <section className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 sm:p-6">
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                Project Library
-              </div>
-              <h3 className="mt-1 text-base font-semibold text-[var(--text-primary)]">
-                Saved scripts
-              </h3>
-              <p className="mt-1 text-sm text-[var(--text-secondary)]">
-                Pick an active project to continue editing or rendering.
-              </p>
-            </div>
-            <div className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--text-muted)]">
-              {projects.length}
-            </div>
-          </div>
-
-          <div className="mt-4 space-y-2.5">
-            {projectsLoading ? (
-              <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-6 text-center text-sm text-[var(--text-muted)]">
-                Loading projects...
-              </div>
-            ) : projects.length === 0 ? (
-              <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-6 text-center text-sm text-[var(--text-muted)]">
-                No TTS projects yet.
-              </div>
-            ) : (
-              projects.map((project) => (
+          ) : (
+            <div className="space-y-2">
+              {projects.map((project) => (
                 <button
                   key={project.id}
                   type="button"
-                  onClick={() => setSelectedProjectId(project.id)}
+                  onClick={() => {
+                    setSelectedProjectId(project.id);
+                    setIsProjectLibraryOpen(false);
+                  }}
                   className={cn(
-                    "w-full rounded-xl border px-3 py-3 text-left transition-all",
+                    "w-full rounded-xl border px-3.5 py-3 text-left transition-all",
                     project.id === selectedProjectId
                       ? "border-[var(--accent-solid)] bg-[var(--accent-soft)] shadow-sm"
                       : "border-[var(--border-muted)] bg-[var(--bg-surface-1)] hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-1)]/80",
@@ -958,11 +940,11 @@ export function TextToSpeechProjectsWorkspace({
                         {project.rendered_segment_count}/{project.segment_count} segments rendered
                       </div>
                       <div className="mt-2 flex flex-wrap gap-1.5">
-                        <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2 py-0.5 text-[10px] font-medium text-[var(--text-muted)]">
+                        <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2 py-0.5 text-[10px] font-medium text-[var(--text-muted)]">
                           {project.total_chars} chars
                         </span>
                         {project.model_id ? (
-                          <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2 py-0.5 text-[10px] font-medium text-[var(--text-muted)]">
+                          <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2 py-0.5 text-[10px] font-medium text-[var(--text-muted)]">
                             {project.model_id}
                           </span>
                         ) : null}
@@ -973,11 +955,174 @@ export function TextToSpeechProjectsWorkspace({
                     </div>
                   </div>
                 </button>
-              ))
-            )}
+              ))}
+            </div>
+          )}
+        </div>
+      </RouteHistoryDrawer>
+    </div>
+  );
+
+  return (
+    <>
+      {headerActionContainer === undefined
+        ? projectLibraryActions
+        : headerActionContainer
+          ? createPortal(projectLibraryActions, headerActionContainer)
+          : null}
+
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".txt,.md,text/plain"
+        className="hidden"
+        onChange={handleImportFile}
+      />
+
+      <Dialog
+        open={isCreateProjectDialogOpen}
+        onOpenChange={(open) => {
+          if (!creatingProject) {
+            setIsCreateProjectDialogOpen(open);
+          }
+        }}
+      >
+        <DialogContent className="max-w-4xl border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0">
+          <DialogTitle className="sr-only">Create TTS project</DialogTitle>
+          <div className="border-b border-[var(--border-muted)] px-5 py-4 sm:px-6">
+            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--text-muted)]">
+              New Project
+            </div>
+            <h3 className="mt-2 text-lg font-semibold text-[var(--text-primary)]">
+              Import and split a script
+            </h3>
+            <DialogDescription className="mt-1 max-w-2xl text-sm leading-relaxed text-[var(--text-muted)]">
+              Start with a long-form script. Izwi splits it into editable
+              narration segments, then keeps the shared voice, model, progress,
+              and merged export together.
+            </DialogDescription>
           </div>
-        </section>
-      </div>
+
+          <div className="grid gap-5 p-5 sm:p-6 lg:grid-cols-[minmax(0,1fr)_280px]">
+            <div className="space-y-4">
+              <div className="space-y-2">
+                <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
+                  Project name
+                </label>
+                <Input
+                  value={newProjectName}
+                  onChange={(event) => setNewProjectName(event.target.value)}
+                  placeholder="Optional project name"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
+                  Source script
+                </label>
+                <Textarea
+                  value={newProjectText}
+                  onChange={(event) => setNewProjectText(event.target.value)}
+                  rows={14}
+                  placeholder="Paste the script you want to split into renderable segments..."
+                  className="bg-[var(--bg-surface-1)] border-[var(--border-muted)]"
+                />
+              </div>
+
+              {newProjectFilename ? (
+                <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
+                  Imported file: {newProjectFilename}
+                </div>
+              ) : null}
+
+              <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[var(--border-muted)] pt-4">
+                <Button
+                  variant="outline"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="bg-[var(--bg-surface-1)]"
+                >
+                  <Upload className="h-4 w-4" />
+                  Import text file
+                </Button>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    variant="outline"
+                    onClick={() => setIsCreateProjectDialogOpen(false)}
+                    disabled={creatingProject}
+                    className="bg-[var(--bg-surface-1)]"
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    onClick={handleCreateProject}
+                    disabled={creatingProject}
+                  >
+                    {creatingProject ? (
+                      <>
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        Creating...
+                      </>
+                    ) : (
+                      <>
+                        <FilePlus2 className="h-4 w-4" />
+                        Create project
+                      </>
+                    )}
+                  </Button>
+                </div>
+              </div>
+            </div>
+
+            <div className="space-y-4">
+              <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
+                <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                  Workflow
+                </div>
+                <div className="mt-3 grid gap-2 text-xs">
+                  <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-3 text-[var(--text-secondary)]">
+                    1. Paste or import a full script
+                  </div>
+                  <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-3 text-[var(--text-secondary)]">
+                    2. Izwi splits it into editable segments
+                  </div>
+                  <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-3 text-[var(--text-secondary)]">
+                    3. Set one project voice and render/export
+                  </div>
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
+                <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                  Initial render profile
+                </div>
+                <div className="mt-3 text-sm text-[var(--text-secondary)]">
+                  {newProjectDefaults ? (
+                    <>
+                      {newProjectDefaults.modelId}
+                      {newProjectDefaults.voiceMode === "built_in" &&
+                      newProjectDefaults.speaker
+                        ? ` with built-in voice ${newProjectDefaults.speaker}`
+                        : ""}
+                      {newProjectDefaults.voiceMode === "saved" &&
+                      newProjectDefaults.savedVoiceId
+                        ? ` with your first saved voice`
+                        : ""}
+                    </>
+                  ) : (
+                    "Choose a compatible model before creating a TTS project."
+                  )}
+                </div>
+                <p className="mt-2 text-xs leading-relaxed text-[var(--text-muted)]">
+                  The project starts with the best available compatible render
+                  profile, and you can refine model, voice, and speed after
+                  creation.
+                </p>
+              </div>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       <div className="space-y-5">
         {workspaceError ? (
@@ -1042,6 +1187,22 @@ export function TextToSpeechProjectsWorkspace({
                   Projects keep script segments, global render settings, per-segment
                   progress, and merged export in one place.
                 </p>
+              </div>
+              <div className="flex flex-wrap items-center justify-center gap-3">
+                <Button onClick={openCreateProjectDialog}>
+                  <FilePlus2 className="h-4 w-4" />
+                  New project
+                </Button>
+                {projects.length > 0 ? (
+                  <Button
+                    variant="outline"
+                    onClick={() => setIsProjectLibraryOpen(true)}
+                    className="bg-[var(--bg-surface-1)]"
+                  >
+                    <Library className="h-4 w-4" />
+                    Open project library
+                  </Button>
+                ) : null}
               </div>
               <div className="grid w-full max-w-3xl gap-3 sm:grid-cols-3">
                 <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-4 text-left">
@@ -1461,6 +1622,6 @@ export function TextToSpeechProjectsWorkspace({
           </div>
         )}
       </div>
-    </div>
+    </>
   );
 }

@@ -939,6 +939,7 @@ export function TextToSpeechWorkspace({
               selectedModelInfo={selectedModelInfo}
               availableModels={availableModels}
               modelOptions={modelOptions}
+              headerActionContainer={historyActionContainer}
               onSelectModel={onSelectModel}
               onOpenModelManager={onOpenModelManager}
               onModelRequired={onModelRequired}
@@ -1302,13 +1303,15 @@ export function TextToSpeechWorkspace({
           </div>
         </div>
       </div>
-      <SpeechHistoryPanel
-        route="text-to-speech"
-        title="Text to Speech History"
-        emptyMessage="No saved text-to-speech generations yet."
-        latestRecord={latestRecord}
-        historyActionContainer={historyActionContainer}
-      />
+      {workspaceMode === "quick" ? (
+        <SpeechHistoryPanel
+          route="text-to-speech"
+          title="Text to Speech History"
+          emptyMessage="No saved text-to-speech generations yet."
+          latestRecord={latestRecord}
+          historyActionContainer={historyActionContainer}
+        />
+      ) : null}
     </div>
   );
 }
