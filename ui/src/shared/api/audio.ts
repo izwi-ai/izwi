@@ -12,6 +12,7 @@ export interface TTSRequest {
   voice_description?: string;
   reference_audio?: string;
   reference_text?: string;
+  saved_voice_id?: string;
   max_tokens?: number;
   format?: "wav" | "pcm" | "raw_f32" | "raw_i16";
   temperature?: number;
@@ -86,6 +87,8 @@ export interface SpeechHistoryRecordSummary {
   model_id: string | null;
   speaker: string | null;
   language: string | null;
+  saved_voice_id?: string | null;
+  speed?: number | null;
   input_preview: string;
   input_chars: number;
   generation_time_ms: number;
@@ -103,6 +106,8 @@ export interface SpeechHistoryRecord {
   model_id: string | null;
   speaker: string | null;
   language: string | null;
+  saved_voice_id?: string | null;
+  speed?: number | null;
   input_text: string;
   voice_description: string | null;
   reference_text: string | null;
@@ -122,6 +127,7 @@ export interface SpeechHistoryRecordCreateRequest {
   voice_description?: string;
   reference_audio?: string;
   reference_text?: string;
+  saved_voice_id?: string;
   temperature?: number;
   speed?: number;
   max_tokens?: number;
@@ -541,6 +547,7 @@ export class AudioApiClient {
         instructions: request.voice_description,
         reference_audio: request.reference_audio,
         reference_text: request.reference_text,
+        saved_voice_id: request.saved_voice_id,
         max_tokens: request.max_tokens,
         temperature: request.temperature,
         speed: request.speed,
@@ -592,6 +599,7 @@ export class AudioApiClient {
             instructions: request.voice_description,
             reference_audio: request.reference_audio,
             reference_text: request.reference_text,
+            saved_voice_id: request.saved_voice_id,
             max_tokens: request.max_tokens,
             temperature: request.temperature,
             speed: request.speed,
@@ -712,6 +720,7 @@ export class AudioApiClient {
       voice_description: request.voice_description,
       reference_audio: request.reference_audio,
       reference_text: request.reference_text,
+      saved_voice_id: request.saved_voice_id,
       temperature: request.temperature,
       speed: request.speed,
       max_tokens: request.max_tokens,

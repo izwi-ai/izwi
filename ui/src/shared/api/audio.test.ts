@@ -179,6 +179,8 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
           model_id: "model",
           speaker: "Narrator",
           language: "en",
+          saved_voice_id: "voice-1",
+          speed: 1.1,
           input_text: "Hello",
           voice_description: null,
           reference_text: null,
@@ -204,11 +206,31 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     await client.createTextToSpeechRecord({
       model_id: "model",
       text: "Hello",
+      saved_voice_id: "voice-1",
+      speed: 1.1,
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
       "http://localhost/v1/text-to-speech-generations",
-      expect.objectContaining({ method: "POST" }),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          model_id: "model",
+          text: "Hello",
+          speaker: undefined,
+          language: undefined,
+          voice_description: undefined,
+          reference_audio: undefined,
+          reference_text: undefined,
+          saved_voice_id: "voice-1",
+          temperature: undefined,
+          speed: 1.1,
+          max_tokens: undefined,
+          max_output_tokens: undefined,
+          top_k: undefined,
+          stream: false,
+        }),
+      }),
     );
   });
 

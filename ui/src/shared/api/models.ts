@@ -1,5 +1,15 @@
 import { ApiHttpClient } from "@/shared/api/http";
 
+export interface SpeechModelCapabilities {
+  supports_builtin_voices: boolean;
+  built_in_voice_count: number | null;
+  supports_reference_voice: boolean;
+  supports_voice_description: boolean;
+  supports_streaming: boolean;
+  supports_speed_control: boolean;
+  supports_auto_long_form: boolean;
+}
+
 export interface ModelInfo {
   variant: string;
   status:
@@ -13,6 +23,7 @@ export interface ModelInfo {
   size_bytes: number | null;
   download_progress: number | null;
   error_message: string | null;
+  speech_capabilities?: SpeechModelCapabilities | null;
 }
 
 export interface ModelsResponse {

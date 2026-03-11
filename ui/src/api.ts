@@ -1,7 +1,11 @@
 export { createApiClient, type ApiClient } from "@/shared/api/client";
 export { api } from "@/shared/api/runtime";
 
-export type { ModelInfo, ModelsResponse } from "@/shared/api/models";
+export type {
+  ModelInfo,
+  ModelsResponse,
+  SpeechModelCapabilities,
+} from "@/shared/api/models";
 
 export type {
   ASRStatusResponse,
