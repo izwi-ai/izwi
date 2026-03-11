@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Upload,
@@ -26,9 +26,21 @@ import {
 } from "./ui/select";
 import { Button } from "./ui/button";
 
+export interface VoiceCloneReferenceState {
+  mode: "upload" | "record" | "saved" | null;
+  sampleReady: boolean;
+  sampleDurationSecs: number | null;
+  transcriptChars: number;
+  activeSavedVoiceId: string | null;
+  warnings: string[];
+  canClone: boolean;
+}
+
 interface VoiceCloneProps {
   onVoiceCloneReady: (audioBase64: string, transcript: string) => void;
   onClear: () => void;
+  onReferenceStateChange?: (state: VoiceCloneReferenceState) => void;
+  onSavedVoiceCreated?: (voiceId: string) => void;
 }
 
 function downmixToMono(audioBuffer: AudioBuffer): Float32Array {
@@ -92,7 +104,9 @@ function encodeWavPcm16(
   return buffer;
 }
 
-async function normalizeToWavBlob(inputBlob: Blob): Promise<Blob> {
+async function normalizeToWavBlob(
+  inputBlob: Blob,
+): Promise<{ blob: Blob; durationSecs: number }> {
   const arrayBuffer = await inputBlob.arrayBuffer();
   const audioContext = new AudioContext();
 
@@ -100,17 +114,26 @@ async function normalizeToWavBlob(inputBlob: Blob): Promise<Blob> {
     const decoded = await audioContext.decodeAudioData(arrayBuffer.slice(0));
     const monoSamples = downmixToMono(decoded);
     const wavBuffer = encodeWavPcm16(monoSamples, decoded.sampleRate);
-    return new Blob([wavBuffer], { type: "audio/wav" });
+    return {
+      blob: new Blob([wavBuffer], { type: "audio/wav" }),
+      durationSecs: decoded.duration,
+    };
   } finally {
     void audioContext.close();
   }
 }
 
-export function VoiceClone({ onVoiceCloneReady, onClear }: VoiceCloneProps) {
+export function VoiceClone({
+  onVoiceCloneReady,
+  onClear,
+  onReferenceStateChange,
+  onSavedVoiceCreated,
+}: VoiceCloneProps) {
   const [mode, setMode] = useState<"upload" | "record" | "saved" | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [audioDurationSecs, setAudioDurationSecs] = useState<number | null>(null);
   const [transcript, setTranscript] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [isConfirmed, setIsConfirmed] = useState(false);
@@ -179,12 +202,13 @@ export function VoiceClone({ onVoiceCloneReady, onClear }: VoiceCloneProps) {
   const prepareAudioBlob = useCallback(
     async (inputBlob: Blob, inputMode: "upload" | "record" | "saved") => {
       try {
-        const wavBlob = await normalizeToWavBlob(inputBlob);
+        const normalizedAudio = await normalizeToWavBlob(inputBlob);
         if (audioUrl) {
           URL.revokeObjectURL(audioUrl);
         }
-        setAudioBlob(wavBlob);
-        setAudioUrl(URL.createObjectURL(wavBlob));
+        setAudioBlob(normalizedAudio.blob);
+        setAudioUrl(URL.createObjectURL(normalizedAudio.blob));
+        setAudioDurationSecs(normalizedAudio.durationSecs);
         setMode(inputMode);
         setError(null);
         setIsConfirmed(false);
@@ -207,20 +231,20 @@ export function VoiceClone({ onVoiceCloneReady, onClear }: VoiceCloneProps) {
     setCreateVoiceAudioBlob(null);
     setCreateVoiceAudioUrl(null);
     setCreateVoiceInputMode(null);
-    setCreateVoiceError(null);
-    setCreateVoiceSaving(false);
-    setCreateVoiceIsRecording(false);
+      setCreateVoiceError(null);
+      setCreateVoiceSaving(false);
+      setCreateVoiceIsRecording(false);
   }, [createVoiceAudioUrl]);
 
   const prepareCreateVoiceAudioBlob = useCallback(
     async (inputBlob: Blob) => {
       try {
-        const wavBlob = await normalizeToWavBlob(inputBlob);
+        const normalizedAudio = await normalizeToWavBlob(inputBlob);
         if (createVoiceAudioUrl) {
           URL.revokeObjectURL(createVoiceAudioUrl);
         }
-        setCreateVoiceAudioBlob(wavBlob);
-        setCreateVoiceAudioUrl(URL.createObjectURL(wavBlob));
+        setCreateVoiceAudioBlob(normalizedAudio.blob);
+        setCreateVoiceAudioUrl(URL.createObjectURL(normalizedAudio.blob));
         setCreateVoiceError(null);
       } catch (err) {
         console.error(
@@ -266,6 +290,46 @@ export function VoiceClone({ onVoiceCloneReady, onClear }: VoiceCloneProps) {
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [closeCreateVoiceModal, isCreateVoiceModalOpen]);
+
+  const qualityWarnings = useMemo(() => {
+    const warnings: string[] = [];
+    const transcriptChars = transcript.trim().length;
+
+    if (audioDurationSecs !== null && audioDurationSecs < 3) {
+      warnings.push("Reference sample is short. Aim for at least 3 seconds of clean speech.");
+    }
+    if (audioDurationSecs !== null && audioDurationSecs > 45) {
+      warnings.push("Reference sample is long. Trim it to the cleanest 30-45 seconds.");
+    }
+    if (transcriptChars > 0 && transcriptChars < 20) {
+      warnings.push("Transcript is short. Include the full spoken line for better matching.");
+    }
+    if (audioBlob && transcriptChars === 0) {
+      warnings.push("Add the transcript for the spoken sample before cloning.");
+    }
+
+    return warnings;
+  }, [audioBlob, audioDurationSecs, transcript]);
+
+  useEffect(() => {
+    onReferenceStateChange?.({
+      mode,
+      sampleReady: Boolean(audioBlob && transcript.trim()),
+      sampleDurationSecs: audioDurationSecs,
+      transcriptChars: transcript.trim().length,
+      activeSavedVoiceId: mode === "saved" ? selectedSavedVoiceId || null : null,
+      warnings: qualityWarnings,
+      canClone: Boolean(audioBlob && transcript.trim()),
+    });
+  }, [
+    audioBlob,
+    audioDurationSecs,
+    mode,
+    onReferenceStateChange,
+    qualityWarnings,
+    selectedSavedVoiceId,
+    transcript,
+  ]);
 
   // Auto-confirm voice cloning when both audio and transcript are available
   const autoConfirm = useCallback(() => {
@@ -568,7 +632,7 @@ export function VoiceClone({ onVoiceCloneReady, onClear }: VoiceCloneProps) {
 
     try {
       const audioBase64 = await blobToBase64Payload(audioBlob);
-      await api.createSavedVoice({
+      const createdVoice = await api.createSavedVoice({
         name: trimmedName,
         reference_text: transcript.trim(),
         audio_base64: audioBase64,
@@ -582,6 +646,7 @@ export function VoiceClone({ onVoiceCloneReady, onClear }: VoiceCloneProps) {
         tone: "success",
         message: `Saved voice profile "${trimmedName}".`,
       });
+      onSavedVoiceCreated?.(createdVoice.id);
       await loadSavedVoices();
     } catch (err) {
       setSaveVoiceStatus({
@@ -624,6 +689,7 @@ export function VoiceClone({ onVoiceCloneReady, onClear }: VoiceCloneProps) {
       });
 
       await loadSavedVoices();
+      onSavedVoiceCreated?.(createdVoice.id);
       setMode("saved");
       setIsCreateVoiceModalOpen(false);
       resetCreateVoiceDraft();
@@ -963,6 +1029,7 @@ export function VoiceClone({ onVoiceCloneReady, onClear }: VoiceCloneProps) {
                 }
                 setAudioBlob(null);
                 setAudioUrl(null);
+                setAudioDurationSecs(null);
                 setIsConfirmed(false);
                 setError(null);
                 onClear();

@@ -8,12 +8,14 @@ import {
   Loader2,
   CheckCircle2,
   AlertCircle,
+  ArrowRight,
+  BadgeCheck,
   Globe,
   ChevronDown,
   Settings2,
 } from "lucide-react";
 import { api, type SpeechHistoryRecord, type TTSGenerationStats } from "../api";
-import { VoiceClone } from "./VoiceClone";
+import { VoiceClone, type VoiceCloneReferenceState } from "./VoiceClone";
 import { LANGUAGES } from "../types";
 import clsx from "clsx";
 import { GenerationStats } from "./GenerationStats";
@@ -34,6 +36,7 @@ interface VoiceClonePlaygroundProps {
   onSelectModel?: (variant: string) => void;
   onOpenModelManager?: () => void;
   onModelRequired: () => void;
+  onUseInTts?: (voiceId: string) => void;
   historyActionContainer?: HTMLElement | null;
 }
 
@@ -52,6 +55,9 @@ function mapRecordToStats(record: SpeechHistoryRecord): TTSGenerationStats {
   };
 }
 
+const DEFAULT_AUDITION_TEXT =
+  "Thanks for calling Izwi. This is a short preview of your cloned voice for your next project.";
+
 export function VoiceClonePlayground({
   selectedModel,
   selectedModelReady = false,
@@ -59,9 +65,10 @@ export function VoiceClonePlayground({
   onSelectModel,
   onOpenModelManager,
   onModelRequired,
+  onUseInTts,
   historyActionContainer = null,
 }: VoiceClonePlaygroundProps) {
-  const [text, setText] = useState("");
+  const [text, setText] = useState(DEFAULT_AUDITION_TEXT);
   const [language, setLanguage] = useState("Auto");
   const [showLanguageSelect, setShowLanguageSelect] = useState(false);
   const [generating, setGenerating] = useState(false);
@@ -77,6 +84,10 @@ export function VoiceClonePlayground({
     string | null
   >(null);
   const [isVoiceReady, setIsVoiceReady] = useState(false);
+  const [referenceState, setReferenceState] =
+    useState<VoiceCloneReferenceState | null>(null);
+  const [consentConfirmed, setConsentConfirmed] = useState(false);
+  const [savedVoiceId, setSavedVoiceId] = useState<string | null>(null);
   const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
   const {
     downloadState,
@@ -127,6 +138,13 @@ export function VoiceClonePlayground({
 
     if (!voiceCloneAudio || !voiceCloneTranscript) {
       setError("Please provide a voice reference (audio + transcript)");
+      return;
+    }
+
+    if (!consentConfirmed) {
+      setError(
+        "Confirm that you have permission to clone this voice before generating audio.",
+      );
       return;
     }
 
@@ -202,7 +220,7 @@ export function VoiceClonePlayground({
   };
 
   const handleReset = () => {
-    setText("");
+    setText(DEFAULT_AUDITION_TEXT);
     setError(null);
     setGenerationStats(null);
     revokeObjectUrlIfNeeded(audioUrl);
@@ -214,13 +232,21 @@ export function VoiceClonePlayground({
     setVoiceCloneAudio(audio);
     setVoiceCloneTranscript(transcript);
     setIsVoiceReady(true);
+    setSavedVoiceId(null);
+    setError(null);
   };
 
   const handleVoiceCloneClear = () => {
     setVoiceCloneAudio(null);
     setVoiceCloneTranscript(null);
     setIsVoiceReady(false);
+    setReferenceState(null);
+    setSavedVoiceId(null);
+    setConsentConfirmed(false);
   };
+
+  const reusableVoiceId =
+    savedVoiceId || referenceState?.activeSavedVoiceId || null;
 
   const getStatusTone = (option: ModelOption): string => {
     if (option.isReady) {
@@ -439,20 +465,96 @@ export function VoiceClonePlayground({
               <VoiceClone
                 onVoiceCloneReady={handleVoiceCloneReady}
                 onClear={handleVoiceCloneClear}
+                onReferenceStateChange={setReferenceState}
+                onSavedVoiceCreated={setSavedVoiceId}
               />
+
+              <div className="mt-4 grid gap-4 xl:grid-cols-2">
+                <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
+                  <div className="text-[11px] font-semibold text-[var(--text-muted)] uppercase tracking-wider mb-2">
+                    Quality Checks
+                  </div>
+                  <div className="space-y-2 text-sm">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-[var(--text-secondary)]">
+                        Reference length
+                      </span>
+                      <span className="font-medium text-[var(--text-primary)]">
+                        {referenceState?.sampleDurationSecs
+                          ? `${referenceState.sampleDurationSecs.toFixed(1)}s`
+                          : "No sample yet"}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-[var(--text-secondary)]">
+                        Transcript coverage
+                      </span>
+                      <span className="font-medium text-[var(--text-primary)]">
+                        {referenceState?.transcriptChars ?? 0} chars
+                      </span>
+                    </div>
+                    {!referenceState?.sampleReady ? (
+                      <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2 text-xs text-[var(--text-muted)]">
+                        Add a clean reference sample and transcript to see cloning guidance.
+                      </div>
+                    ) : referenceState.warnings?.length ? (
+                      <div className="rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-700">
+                        {referenceState.warnings[0]}
+                      </div>
+                    ) : (
+                      <div className="rounded-lg border border-green-500/25 bg-green-500/10 px-3 py-2 text-xs text-green-600">
+                        Clean sample and transcript are ready for cloning.
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
+                  <div className="text-[11px] font-semibold text-[var(--text-muted)] uppercase tracking-wider mb-2">
+                    Rights and Reuse
+                  </div>
+                  <label className="flex items-start gap-3 rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-3 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={consentConfirmed}
+                      onChange={(event) => setConsentConfirmed(event.target.checked)}
+                      className="mt-0.5 h-4 w-4 rounded border-[var(--border-muted)]"
+                    />
+                    <span className="text-[var(--text-secondary)]">
+                      I have permission to clone this voice and use the resulting audio.
+                    </span>
+                  </label>
+
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    {reusableVoiceId && onUseInTts ? (
+                      <button
+                        onClick={() => onUseInTts(reusableVoiceId)}
+                        className="btn btn-secondary h-9 px-4 rounded-lg text-xs"
+                      >
+                        <ArrowRight className="w-4 h-4" />
+                        Use in TTS
+                      </button>
+                    ) : (
+                      <div className="text-xs text-[var(--text-muted)]">
+                        Save the reference as a voice profile to reuse it directly in text-to-speech.
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
             </div>
 
             {/* Text to speak */}
             <div className="p-5 rounded-2xl bg-[var(--bg-surface-0)] border border-[var(--border-muted)]">
               <label className="block text-xs font-semibold text-[var(--text-primary)] uppercase tracking-wide mb-3">
-                Text to Speak
+                Audition Text
               </label>
               <div className="relative">
                 <textarea
                   ref={textareaRef}
                   value={text}
                   onChange={(e) => setText(e.target.value)}
-                  placeholder="Enter the text you want to synthesize with the cloned voice..."
+                  placeholder="Write a short preview line to audition the cloned voice..."
                   rows={5}
                   disabled={generating}
                   className="textarea text-base py-4 leading-relaxed bg-[var(--bg-surface-1)] border-[var(--border-muted)] w-full"
@@ -463,6 +565,9 @@ export function VoiceClonePlayground({
                   </span>
                 </div>
               </div>
+              <p className="mt-3 text-xs text-[var(--text-muted)]">
+                Start with a short proof clip before moving the saved voice into the TTS route for longer scripts.
+              </p>
             </div>
 
             {/* Error */}
@@ -486,18 +591,23 @@ export function VoiceClonePlayground({
             <div className="flex items-center gap-3 flex-wrap sm:flex-nowrap pt-2">
               <button
                 onClick={handleGenerate}
-                disabled={generating || !selectedModelReady || !isVoiceReady}
+                disabled={
+                  generating ||
+                  !selectedModelReady ||
+                  !isVoiceReady ||
+                  !consentConfirmed
+                }
                 className="btn btn-primary flex-1 h-11 text-sm font-semibold rounded-lg"
               >
                 {generating ? (
                   <>
                     <Loader2 className="w-4 h-4 animate-spin" />
-                    Cloning Voice...
+                    Creating Preview...
                   </>
                 ) : (
                   <>
-                    <Users className="w-4 h-4" />
-                    Generate Audio
+                    <BadgeCheck className="w-4 h-4" />
+                    Create Preview
                   </>
                 )}
               </button>
@@ -578,6 +688,12 @@ export function VoiceClonePlayground({
             {selectedModelReady && !isVoiceReady && (
               <p className="text-xs font-medium text-[var(--text-muted)] text-center pb-2">
                 Upload, record, or select a saved voice sample to get started
+              </p>
+            )}
+
+            {selectedModelReady && isVoiceReady && !consentConfirmed && (
+              <p className="text-xs font-medium text-[var(--text-muted)] text-center pb-2">
+                Confirm rights to the reference voice before generating a preview.
               </p>
             )}
           </div>

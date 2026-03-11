@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import type { ModelInfo } from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import { VIEW_CONFIGS } from "@/types";
@@ -46,6 +47,7 @@ export function VoiceCloningPage({
   onSelect,
   onError,
 }: VoiceCloningPageProps) {
+  const navigate = useNavigate();
   const [historyActionContainer, setHistoryActionContainer] =
     useState<HTMLDivElement | null>(null);
   const viewConfig = VIEW_CONFIGS["voice-clone"];
@@ -97,6 +99,9 @@ export function VoiceCloningPage({
           requestModel();
           onError("Select and load a Base model to clone voices.");
         }}
+        onUseInTts={(voiceId) =>
+          navigate(`/text-to-speech?voiceId=${encodeURIComponent(voiceId)}`)
+        }
         historyActionContainer={historyActionContainer}
       />
 
