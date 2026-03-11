@@ -571,12 +571,6 @@ export function TextToSpeechWorkspace({
     voiceMode,
   ]);
 
-  const voiceAvailabilityDetail = selectedVoiceItem?.name
-    ? `Selected voice: ${selectedVoiceItem.name}`
-    : voiceMode === "saved"
-      ? "Select a saved voice"
-      : "Select a built-in voice";
-
   const canGenerate =
     selectedModelReady &&
     (voiceMode !== "saved" || Boolean(selectedSavedVoiceId)) &&
@@ -926,7 +920,7 @@ export function TextToSpeechWorkspace({
 
   if (workspaceMode === "projects") {
     return (
-      <div className="mx-auto max-w-[1240px] space-y-6">
+      <div className="space-y-4">
         {renderWorkspaceModeToggle()}
         <TextToSpeechProjectsWorkspace
           selectedModel={selectedModel}
@@ -943,80 +937,74 @@ export function TextToSpeechWorkspace({
   }
 
   return (
-    <div className="mx-auto max-w-[1180px] space-y-6">
-      {renderWorkspaceModeToggle()}
-      <Card>
-        <CardContent className="space-y-8 p-6 lg:p-7">
-          <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_360px]">
-            <div className="space-y-4">
-              <div className="space-y-2">
-                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-                  Render setup
-                </div>
-                <h2 className="text-xl font-semibold text-foreground">
-                  Choose a model, then a compatible voice
-                </h2>
-                <p className="max-w-2xl text-sm leading-relaxed text-muted-foreground">
-                  The selected model drives which built-in speakers or reusable
-                  saved voices are available, keeping the quick workflow compact
-                  and predictable.
-                </p>
+    <div className="grid gap-4 items-stretch xl:h-[calc(100dvh-11.75rem)]">
+      <div className="card p-4 flex min-h-0 flex-col">
+        <div className="flex-1 min-h-0 overflow-y-auto pr-1 scrollbar-thin">
+          <div className="mb-4 flex items-center justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <div className="rounded bg-[var(--bg-surface-2)] border border-[var(--border-muted)] p-2">
+                <Mic2 className="h-5 w-5 text-[var(--text-muted)]" />
               </div>
-
-              <div className="grid gap-3 sm:grid-cols-2">
-                <div className="rounded-2xl border border-border/60 bg-muted/20 p-4">
-                  <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-                    Model status
-                  </div>
-                  <div
-                    className={cn(
-                      "mt-2 text-base font-semibold",
-                      selectedModelReady ? "text-foreground" : "text-amber-500",
-                    )}
-                  >
-                    {selectedOption?.statusLabel || "No model selected"}
-                  </div>
-                  <p className="mt-1 text-sm text-muted-foreground">
-                    {selectedOption?.label || "Choose a TTS model to continue."}
-                  </p>
-                </div>
-
-                <div className="rounded-2xl border border-border/60 bg-muted/20 p-4">
-                  <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-                    Available voices
-                  </div>
-                  <div className="mt-2 text-base font-semibold text-foreground">
-                    {voiceAvailabilitySummary}
-                  </div>
-                  <p className="mt-1 text-sm text-muted-foreground">
-                    {voiceAvailabilityDetail}
-                  </p>
-                </div>
+              <div>
+                <h2 className="text-sm font-medium text-[var(--text-primary)]">
+                  Text to Speech
+                </h2>
+                <p className="mt-0.5 text-xs text-[var(--text-muted)]">
+                  Choose a model, then a compatible voice, then render.
+                </p>
               </div>
             </div>
 
-            <div className="space-y-4">
-              <div className="space-y-2.5">
-                <div className="flex items-center justify-between gap-3">
-                  <label className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-                    Render model
-                  </label>
-                  {onOpenModelManager ? (
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={onOpenModelManager}
-                    >
-                      <Settings2 className="h-4 w-4" />
-                      Models
-                    </Button>
-                  ) : null}
-                </div>
-                {renderModelSelector()}
-              </div>
+            <Tabs
+              value={workspaceMode}
+              onValueChange={(value) => setWorkspaceMode(value as WorkspaceMode)}
+              className="w-full max-w-sm"
+            >
+              <TabsList className="grid w-full grid-cols-2">
+                <TabsTrigger value="quick">Quick</TabsTrigger>
+                <TabsTrigger value="projects">Projects</TabsTrigger>
+              </TabsList>
+            </Tabs>
+          </div>
 
-              <div className="space-y-2.5">
-                <label className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+          <div className="mb-4 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
+            <div className="flex items-start justify-between gap-4">
+              <div className="min-w-0 flex-1">
+                <div className="text-[11px] uppercase tracking-wide text-[var(--text-subtle)]">
+                  Active Model
+                </div>
+                <div className="mt-2">{renderModelSelector()}</div>
+                <div
+                  className={cn(
+                    "mt-2 text-xs",
+                    selectedModelReady
+                      ? "text-[var(--text-secondary)]"
+                      : "text-amber-500",
+                  )}
+                >
+                  {selectedOption?.statusLabel ||
+                    "Select and load a TTS model to continue"}
+                </div>
+              </div>
+              {onOpenModelManager ? (
+                <div className="shrink-0">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={onOpenModelManager}
+                  >
+                    <Settings2 className="h-4 w-4" />
+                    Models
+                  </Button>
+                </div>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_420px]">
+            <div className="space-y-6">
+              <div>
+                <label className="mb-2 block text-xs font-semibold uppercase tracking-wide text-[var(--text-primary)]">
                   Voice
                 </label>
                 <VoiceSelect
@@ -1032,148 +1020,139 @@ export function TextToSpeechWorkspace({
                   disabled={!selectedModel}
                   modelLabel={selectedModelInfo?.variant ?? selectedModel}
                 />
+                <p className="mt-2 text-[11px] font-medium text-[var(--text-muted)]">
+                  Voice availability follows the selected model instead of
+                  switching models automatically.
+                </p>
               </div>
 
-              <div className="rounded-2xl border border-border/60 bg-muted/20 px-4 py-3 text-sm leading-relaxed text-muted-foreground">
-                {compatibilityNotice}
-              </div>
-            </div>
-          </div>
-
-          <div className="space-y-2.5">
-            <label className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-              Script
-            </label>
-            <textarea
-              ref={textareaRef}
-              value={text}
-              onChange={(event) => setText(event.target.value)}
-              rows={8}
-              placeholder="Paste the text you want this voice to speak..."
-              className="min-h-[220px] w-full rounded-2xl border border-input/85 bg-background/70 px-4 py-3.5 text-sm leading-relaxed shadow-sm transition-[border-color,box-shadow,background-color] placeholder:text-muted-foreground/85 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35 focus-visible:border-ring/50"
-            />
-          </div>
-
-          <div className="rounded-2xl border border-border/60 bg-muted/20 p-5">
-            <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
               <div>
-                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-                  Delivery controls
-                </div>
-                <div className="mt-1.5 text-sm text-muted-foreground">
-                  Speed is saved with the generation history. Streaming appears
-                  only when the selected model exposes it.
-                </div>
-              </div>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => setShowAdvanced((current) => !current)}
-              >
-                <Sparkles className="h-4 w-4" />
-                {showAdvanced ? "Hide" : "Show"} advanced
-              </Button>
-            </div>
-
-            <div className="mt-5 grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(260px,320px)]">
-              <div className="space-y-2">
-                <div className="flex items-center justify-between text-sm">
-                  <span className="font-medium text-foreground">Speed</span>
-                  <span className="text-muted-foreground">
-                    {speed.toFixed(2)}x
-                  </span>
-                </div>
-                <Slider
-                  value={[speed]}
-                  min={0.5}
-                  max={1.5}
-                  step={0.05}
-                  onValueChange={([value]) => setSpeed(value ?? 1)}
+                <label className="mb-2 block text-xs font-semibold uppercase tracking-wide text-[var(--text-primary)]">
+                  Script
+                </label>
+                <textarea
+                  ref={textareaRef}
+                  value={text}
+                  onChange={(event) => setText(event.target.value)}
+                  rows={8}
+                  placeholder="Paste the text you want this voice to speak..."
+                  className="textarea min-h-[220px] w-full bg-[var(--bg-surface-1)] border-[var(--border-muted)] py-4 text-base leading-relaxed"
                 />
               </div>
 
-              <label className="flex items-center gap-3 rounded-xl border border-border/60 bg-background/50 px-3.5 py-3 text-sm">
-                <input
-                  type="checkbox"
-                  checked={streamingEnabled && supportsStreaming}
-                  onChange={(event) => setStreamingEnabled(event.target.checked)}
-                  disabled={!supportsStreaming}
-                  className="h-4 w-4 rounded border-border"
-                />
-                <span className="min-w-0 flex-1">
-                  <span className="font-medium text-foreground">
-                    Stream audio
-                  </span>
-                  <span className="block text-xs text-muted-foreground">
-                    {supportsStreaming
-                      ? "Play chunks as they arrive."
-                      : "Current model does not expose streaming on this route."}
-                  </span>
-                </span>
-                <Radio className="h-4 w-4 text-muted-foreground" />
-              </label>
-            </div>
+              <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
+                <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                  <div>
+                    <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                      Delivery Controls
+                    </div>
+                    <div className="text-sm text-[var(--text-secondary)]">
+                      Speed is saved with the generation history. Streaming
+                      appears only when the selected model exposes it.
+                    </div>
+                  </div>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setShowAdvanced((current) => !current)}
+                  >
+                    <Sparkles className="h-4 w-4" />
+                    {showAdvanced ? "Hide" : "Show"} advanced
+                  </Button>
+                </div>
 
-            <AnimatePresence>
-              {showAdvanced ? (
-                <motion.div
-                  initial={{ opacity: 0, height: 0 }}
-                  animate={{ opacity: 1, height: "auto" }}
-                  exit={{ opacity: 0, height: 0 }}
-                  className="overflow-hidden"
-                >
-                  <div className="space-y-2 pt-4">
-                    <label className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-                      Style prompt
-                    </label>
-                    <Input
-                      value={instructions}
-                      onChange={(event) => setInstructions(event.target.value)}
-                      disabled={!supportsVoiceDescription}
-                      placeholder={
-                        supportsVoiceDescription
-                          ? "Optional style guidance such as calm, energetic, or formal"
-                          : "This renderer does not support style prompts"
-                      }
+                <div className="mt-4 grid gap-4 sm:grid-cols-[minmax(0,1fr)_320px]">
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="font-medium text-[var(--text-primary)]">
+                        Speed
+                      </span>
+                      <span className="text-[var(--text-muted)]">
+                        {speed.toFixed(2)}x
+                      </span>
+                    </div>
+                    <Slider
+                      value={[speed]}
+                      min={0.5}
+                      max={1.5}
+                      step={0.05}
+                      onValueChange={([value]) => setSpeed(value ?? 1)}
                     />
                   </div>
-                </motion.div>
-              ) : null}
-            </AnimatePresence>
-          </div>
 
-          <AnimatePresence>
-            {error ? (
-              <motion.div
-                initial={{ opacity: 0, height: 0 }}
-                animate={{ opacity: 1, height: "auto" }}
-                exit={{ opacity: 0, height: 0 }}
-                className="overflow-hidden"
-              >
-                <div className="flex items-start gap-2 rounded-xl border border-destructive/45 bg-destructive/5 px-3 py-3 text-sm text-destructive">
-                  <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-                  <p>{error}</p>
+                  <label className="flex items-center gap-3 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3.5 py-3 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={streamingEnabled && supportsStreaming}
+                      onChange={(event) =>
+                        setStreamingEnabled(event.target.checked)
+                      }
+                      disabled={!supportsStreaming}
+                      className="h-4 w-4 rounded border-border"
+                    />
+                    <span className="min-w-0 flex-1">
+                      <span className="font-medium text-[var(--text-primary)]">
+                        Stream audio
+                      </span>
+                      <span className="block text-xs text-[var(--text-muted)]">
+                        {supportsStreaming
+                          ? "Play chunks as they arrive."
+                          : "Current model does not expose streaming on this route."}
+                      </span>
+                    </span>
+                    <Radio className="h-4 w-4 text-[var(--text-muted)]" />
+                  </label>
                 </div>
-              </motion.div>
-            ) : null}
-          </AnimatePresence>
 
-          <div className="space-y-4 rounded-2xl border border-border/60 bg-muted/15 p-4 sm:p-5">
-            <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-              <div>
-                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-                  Output
-                </div>
-                <div className="mt-1 text-sm text-muted-foreground">
-                  Generate audio once the model and voice are ready.
-                </div>
+                <AnimatePresence>
+                  {showAdvanced ? (
+                    <motion.div
+                      initial={{ opacity: 0, height: 0 }}
+                      animate={{ opacity: 1, height: "auto" }}
+                      exit={{ opacity: 0, height: 0 }}
+                      className="overflow-hidden"
+                    >
+                      <div className="space-y-2 pt-4">
+                        <label className="text-xs font-semibold uppercase tracking-wide text-[var(--text-primary)]">
+                          Style prompt
+                        </label>
+                        <Input
+                          value={instructions}
+                          onChange={(event) => setInstructions(event.target.value)}
+                          disabled={!supportsVoiceDescription}
+                          placeholder={
+                            supportsVoiceDescription
+                              ? "Optional style guidance such as calm, energetic, or formal"
+                              : "This renderer does not support style prompts"
+                          }
+                        />
+                      </div>
+                    </motion.div>
+                  ) : null}
+                </AnimatePresence>
               </div>
+
+              <AnimatePresence>
+                {error ? (
+                  <motion.div
+                    initial={{ opacity: 0, height: 0 }}
+                    animate={{ opacity: 1, height: "auto" }}
+                    exit={{ opacity: 0, height: 0 }}
+                    className="overflow-hidden"
+                  >
+                    <div className="flex items-start gap-2 rounded-lg border border-[var(--danger-border)] bg-[var(--danger-bg)] p-3 text-sm text-[var(--danger-text)]">
+                      <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                      <p>{error}</p>
+                    </div>
+                  </motion.div>
+                ) : null}
+              </AnimatePresence>
 
               <div className="flex flex-wrap items-center gap-3">
                 <Button
                   onClick={handleGenerate}
                   disabled={generating || !canGenerate}
-                  className="min-w-[180px]"
+                  className="min-w-[190px]"
                 >
                   {generating ? (
                     <>
@@ -1216,57 +1195,108 @@ export function TextToSpeechWorkspace({
                   </>
                 ) : null}
               </div>
+
+              {downloadState !== "idle" && downloadMessage ? (
+                <div
+                  className={cn(
+                    "flex items-center gap-2 rounded-lg border px-3 py-2.5 text-xs font-medium",
+                    downloadState === "downloading" &&
+                      "bg-[var(--status-warning-bg)] border-[var(--status-warning-border)] text-[var(--status-warning-text)]",
+                    downloadState === "success" &&
+                      "bg-[var(--status-positive-bg)] border-[var(--status-positive-border)] text-[var(--status-positive-text)]",
+                    downloadState === "error" &&
+                      "bg-[var(--danger-bg)] border-[var(--danger-border)] text-[var(--danger-text)]",
+                  )}
+                >
+                  {downloadState === "downloading" ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : downloadState === "success" ? (
+                    <CheckCircle2 className="h-4 w-4" />
+                  ) : (
+                    <AlertCircle className="h-4 w-4" />
+                  )}
+                  {downloadMessage}
+                </div>
+              ) : null}
             </div>
 
-            <AnimatePresence>
-              {downloadState !== "idle" && downloadMessage ? (
-                <motion.div
-                  initial={{ opacity: 0, height: 0 }}
-                  animate={{ opacity: 1, height: "auto" }}
-                  exit={{ opacity: 0, height: 0 }}
-                  className="overflow-hidden"
-                >
-                  <div
-                    className={cn(
-                      "flex items-center gap-2 rounded-xl border px-3 py-2 text-xs font-medium",
-                      downloadState === "downloading" &&
-                        "border-amber-500/30 bg-amber-500/10 text-amber-700",
-                      downloadState === "success" &&
-                        "border-emerald-500/25 bg-emerald-500/10 text-emerald-700",
-                      downloadState === "error" &&
-                        "border-destructive/35 bg-destructive/5 text-destructive",
-                    )}
-                  >
-                    {downloadState === "downloading" ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : downloadState === "success" ? (
-                      <CheckCircle2 className="h-4 w-4" />
-                    ) : (
-                      <AlertCircle className="h-4 w-4" />
-                    )}
-                    {downloadMessage}
+            <div className="space-y-4">
+              <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
+                <div className="mb-3 text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                  Voice Summary
+                </div>
+                <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-4">
+                  <div className="text-sm font-semibold text-[var(--text-primary)]">
+                    {selectedVoiceItem?.name || "Select a voice"}
                   </div>
-                </motion.div>
-              ) : null}
-            </AnimatePresence>
-
-            {audioUrl ? (
-              <div className="space-y-4 rounded-2xl border border-border/75 bg-background/70 p-4">
-                <audio
-                  ref={audioRef}
-                  src={audioUrl}
-                  className="h-11 w-full"
-                  controls
-                />
-                {generationStats ? (
-                  <GenerationStats stats={generationStats} type="tts" />
-                ) : null}
+                  <div className="mt-1 text-xs text-[var(--text-secondary)]">
+                    {voiceMode === "saved" ? "Saved voice" : "Built-in voice"}
+                  </div>
+                  <p className="mt-3 text-sm leading-relaxed text-[var(--text-muted)]">
+                    {compatibilityNotice}
+                  </p>
+                  <div className="mt-3 grid gap-2 sm:grid-cols-2 text-xs">
+                    <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-[var(--text-secondary)]">
+                      {selectedOption?.label || "No model selected"}
+                    </div>
+                    <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-[var(--text-secondary)]">
+                      {voiceAvailabilitySummary}
+                    </div>
+                  </div>
+                </div>
               </div>
-            ) : null}
-          </div>
-        </CardContent>
-      </Card>
 
+              <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
+                <div className="mb-3 text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                  Output
+                </div>
+
+                {!audioUrl && !isStreaming ? (
+                  <div className="rounded-lg border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-4 py-8 text-center text-sm text-[var(--text-muted)]">
+                    Generate audio to review the rendered result here.
+                  </div>
+                ) : (
+                  <div className="space-y-4 rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-4">
+                    {audioUrl ? (
+                      <audio
+                        ref={audioRef}
+                        src={audioUrl}
+                        className="h-11 w-full"
+                        controls
+                      />
+                    ) : null}
+                    {isStreaming && !audioUrl ? (
+                      <div className="rounded-lg border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-3 py-2 text-xs font-medium text-[var(--status-warning-text)]">
+                        Streaming live audio...
+                      </div>
+                    ) : null}
+                    {generationStats ? (
+                      <GenerationStats stats={generationStats} type="tts" />
+                    ) : null}
+                  </div>
+                )}
+              </div>
+
+              <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
+                <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                  Quick Workflow
+                </div>
+                <div className="grid gap-2 text-xs">
+                  <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2 text-[var(--text-secondary)]">
+                    1. Choose a TTS model
+                  </div>
+                  <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2 text-[var(--text-secondary)]">
+                    2. Pick a compatible voice
+                  </div>
+                  <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2 text-[var(--text-secondary)]">
+                    3. Generate and review the result
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
       <SpeechHistoryPanel
         route="text-to-speech"
         title="Text to Speech History"
