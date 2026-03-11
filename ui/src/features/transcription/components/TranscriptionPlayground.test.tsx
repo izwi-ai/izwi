@@ -206,12 +206,11 @@ describe("TranscriptionPlayground history", () => {
     fireEvent.click(await screen.findByText("Testing saved transcription history."));
 
     expect(await screen.findByText("Timed transcript")).toBeInTheDocument();
-    expect(
-      screen.getAllByRole("button", { name: /Copy/i }).at(-1),
-    ).toBeInTheDocument();
-    expect(
-      screen.getAllByRole("button", { name: /Download/i }).at(-1),
-    ).toBeInTheDocument();
+    const copyButtons = screen.getAllByRole("button", { name: /Copy/i });
+    const exportButtons = screen.getAllByRole("button", { name: /Export/i });
+
+    expect(copyButtons[copyButtons.length - 1]).toBeInTheDocument();
+    expect(exportButtons[exportButtons.length - 1]).toBeInTheDocument();
     expect(screen.getByTitle("Open older record")).toBeInTheDocument();
     expect(screen.queryByText("Performance")).not.toBeInTheDocument();
   });

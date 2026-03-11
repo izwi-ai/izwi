@@ -53,6 +53,7 @@ import {
 } from "@/api";
 import { ASRStats, GenerationStats } from "@/components/GenerationStats";
 import { MiniWaveform } from "@/components/ui/Waveform";
+import { TranscriptionExportDialog } from "@/features/transcription/components/TranscriptionExportDialog";
 import { TranscriptionReviewWorkspace } from "@/features/transcription/components/TranscriptionReviewWorkspace";
 import { formatTranscriptionText } from "@/features/transcription/transcript";
 import {
@@ -891,20 +892,6 @@ export function TranscriptionPlayground({
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const handleDownload = () => {
-    const exportText = currentOutputExportText;
-    if (!exportText) {
-      return;
-    }
-    const blob = new Blob([exportText], { type: "text/plain" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `transcription-${Date.now()}${currentOutputHasTimestamps ? "-timestamps" : ""}.txt`;
-    link.click();
-    URL.revokeObjectURL(url);
-  };
-
   useEffect(() => {
     return () => {
       if (streamAbortRef.current) {
@@ -917,6 +904,8 @@ export function TranscriptionPlayground({
   const outputRecord = useMemo<
     Pick<
       TranscriptionRecord,
+      | "created_at"
+      | "model_id"
       | "id"
       | "aligner_model_id"
       | "audio_filename"
@@ -934,8 +923,10 @@ export function TranscriptionPlayground({
       return null;
     }
     return {
+      created_at: Date.now(),
+      model_id: selectedModel,
       id: "transcription-draft",
-      aligner_model_id: null,
+      aligner_model_id: includeTimestamps ? timestampAlignerModelId : null,
       audio_filename: null,
       duration_secs: processingStats?.audio_duration_secs ?? null,
       language: detectedLanguage ?? selectedLanguage,
@@ -946,27 +937,18 @@ export function TranscriptionPlayground({
   }, [
     currentOutputRecord,
     detectedLanguage,
+    includeTimestamps,
     isProcessing,
     isStreaming,
     processingStats?.audio_duration_secs,
     selectedLanguage,
+    selectedModel,
+    timestampAlignerModelId,
     transcription,
   ]);
-  const currentOutputHasTimestamps = useMemo(
-    () =>
-      Boolean(
-        currentOutputRecord &&
-          ((currentOutputRecord.segments ?? []).length > 0 ||
-            (currentOutputRecord.words ?? []).length > 0),
-      ),
-    [currentOutputRecord],
-  );
   const currentOutputExportText = useMemo(() => {
-    if (currentOutputRecord) {
-      return formatTranscriptionText(currentOutputRecord);
-    }
-    return transcription.trim();
-  }, [currentOutputRecord, transcription]);
+    return formatTranscriptionText(outputRecord);
+  }, [outputRecord]);
   const showResult = Boolean(outputRecord || isStreaming || isProcessing);
   const hasDraft = Boolean(transcription || audioUrl || error);
   const selectedHistorySummary = useMemo(
@@ -1066,21 +1048,6 @@ export function TranscriptionPlayground({
     setHistoryTranscriptCopied(true);
     window.setTimeout(() => setHistoryTranscriptCopied(false), 1800);
   }, [activeHistoryExportText]);
-
-  const handleDownloadHistoryTranscript = useCallback(() => {
-    if (!activeHistoryRecord || !activeHistoryExportText) {
-      return;
-    }
-    const blob = new Blob([activeHistoryExportText], {
-      type: "text/plain",
-    });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `transcription-${activeHistoryRecord.id}${activeHistoryHasTimestamps ? "-timestamps" : ""}.txt`;
-    anchor.click();
-    URL.revokeObjectURL(url);
-  }, [activeHistoryExportText, activeHistoryHasTimestamps, activeHistoryRecord]);
 
   useEffect(() => {
     setHistoryTranscriptCopied(false);
@@ -1532,16 +1499,17 @@ export function TranscriptionPlayground({
                 <Copy className="w-4 h-4" />
               )}
             </Button>
-            <Button
-              onClick={handleDownload}
-              variant="outline"
-              size="sm"
-              className="h-8 w-8 p-0"
-              disabled={!currentOutputExportText || isStreaming}
-              title="Download transcript"
-            >
-              <Download className="w-4 h-4" />
-            </Button>
+            <TranscriptionExportDialog record={outputRecord}>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-8 w-8 p-0"
+                disabled={!currentOutputExportText || isStreaming}
+                title="Export transcript"
+              >
+                <Download className="w-4 h-4" />
+              </Button>
+            </TranscriptionExportDialog>
           </div>
         </div>
 
@@ -1740,16 +1708,17 @@ export function TranscriptionPlayground({
                             </>
                           )}
                         </button>
-                        <Button
-                          onClick={handleDownloadHistoryTranscript}
-                          variant="outline"
-                          size="sm"
-                          className="h-8 rounded-full border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 text-[12px] font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-surface-2)]"
-                          disabled={!activeHistoryExportText}
-                        >
-                          <Download className="mr-1.5 w-3.5 h-3.5" />
-                          Download
-                        </Button>
+                        <TranscriptionExportDialog record={activeHistoryRecord}>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-8 rounded-full border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 text-[12px] font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-surface-2)]"
+                            disabled={!activeHistoryExportText}
+                          >
+                            <Download className="mr-1.5 w-3.5 h-3.5" />
+                            Export
+                          </Button>
+                        </TranscriptionExportDialog>
                       </div>
                       <p className="text-[11px] text-[var(--text-subtle)]">
                         Playback, transcript review, and export for this saved transcription.
