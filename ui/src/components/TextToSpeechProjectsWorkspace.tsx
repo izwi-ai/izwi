@@ -376,33 +376,6 @@ export function TextToSpeechProjectsWorkspace({
     },
   }));
 
-  const projectVoiceAvailabilitySummary = useMemo(() => {
-    if (!projectModelId) {
-      return "Choose a model";
-    }
-
-    if (supportsBuiltInVoices && supportsSavedVoices) {
-      return `${availableSpeakers.length} built-in voices plus saved voices`;
-    }
-
-    if (supportsBuiltInVoices) {
-      return availableSpeakers.length > 0
-        ? `${availableSpeakers.length} built-in voices`
-        : "Built-in voices unavailable";
-    }
-
-    if (supportsSavedVoices) {
-      return "Saved voices only";
-    }
-
-    return "No voices on this model";
-  }, [
-    availableSpeakers.length,
-    projectModelId,
-    supportsBuiltInVoices,
-    supportsSavedVoices,
-  ]);
-
   const projectVoiceNotice = useMemo(() => {
     if (!projectModelId) {
       return "Choose a render model before assigning a project voice.";
@@ -631,6 +604,43 @@ export function TextToSpeechProjectsWorkspace({
     }
   };
 
+  const persistSegmentDraft = useCallback(
+    async (
+      project: TtsProjectRecord,
+      segmentId: string,
+      options?: {
+        requireChanges?: boolean;
+      },
+    ) => {
+      const currentSegment = project.segments.find((segment) => segment.id === segmentId);
+      if (!currentSegment) {
+        return null;
+      }
+
+      const requireChanges = options?.requireChanges ?? false;
+      const draft = segmentDrafts[segmentId] ?? currentSegment.text;
+      const text = draft.trim();
+
+      if (!text) {
+        const message = "Segment text cannot be empty.";
+        setWorkspaceError(message);
+        onError(message);
+        return null;
+      }
+
+      if (requireChanges && draft === currentSegment.text) {
+        return project;
+      }
+
+      const updated = await api.updateTtsProjectSegment(project.id, segmentId, {
+        text,
+      });
+      setSelectedProject(updated);
+      return updated;
+    },
+    [onError, segmentDrafts],
+  );
+
   const persistProjectSettings = useCallback(async () => {
     if (!selectedProject) {
       return null;
@@ -700,19 +710,14 @@ export function TextToSpeechProjectsWorkspace({
     if (!selectedProject) {
       return;
     }
-    const text = segmentDrafts[segmentId]?.trim() ?? "";
-    if (!text) {
-      const message = "Segment text cannot be empty.";
-      setWorkspaceError(message);
-      onError(message);
-      return;
-    }
     try {
       setSavingSegmentId(segmentId);
-      const project = await api.updateTtsProjectSegment(selectedProject.id, segmentId, {
-        text,
+      const project = await persistSegmentDraft(selectedProject, segmentId, {
+        requireChanges: true,
       });
-      setSelectedProject(project);
+      if (!project) {
+        return;
+      }
       setWorkspaceStatus({
         tone: "success",
         message: "Segment text saved. Re-render to refresh the audio.",
@@ -737,11 +742,29 @@ export function TextToSpeechProjectsWorkspace({
     }
     try {
       setRenderingSegmentId(segmentId);
-      const updated = await api.renderTtsProjectSegment(project.id, segmentId);
+      let currentProject = project;
+      const currentSegment = currentProject.segments.find(
+        (segment) => segment.id === segmentId,
+      );
+      const segmentDirty =
+        currentSegment &&
+        (segmentDrafts[segmentId] ?? currentSegment.text) !== currentSegment.text;
+
+      if (segmentDirty) {
+        const synced = await persistSegmentDraft(currentProject, segmentId);
+        if (!synced) {
+          return;
+        }
+        currentProject = synced;
+      }
+
+      const updated = await api.renderTtsProjectSegment(currentProject.id, segmentId);
       setSelectedProject(updated);
       setWorkspaceStatus({
         tone: "success",
-        message: "Segment rendered and attached to the project.",
+        message: segmentDirty
+          ? "Saved the latest text and rendered the segment."
+          : "Segment rendered and attached to the project.",
       });
       await loadProjects();
     } catch (err) {
@@ -765,13 +788,46 @@ export function TextToSpeechProjectsWorkspace({
     try {
       setRenderingAll(true);
       let current = project;
+
+      const segmentIdsToRender = new Set(
+        current.segments
+          .filter((segment) => {
+            const draft = segmentDrafts[segment.id] ?? segment.text;
+            return draft !== segment.text || !segment.speech_record_id;
+          })
+          .map((segment) => segment.id),
+      );
+
+      if (segmentIdsToRender.size === 0) {
+        setWorkspaceStatus({
+          tone: "success",
+          message: "All segments already have current rendered audio.",
+        });
+        return;
+      }
+
       for (const segment of current.segments) {
+        const draft = segmentDrafts[segment.id] ?? segment.text;
+        if (draft !== segment.text) {
+          const synced = await persistSegmentDraft(current, segment.id);
+          if (!synced) {
+            return;
+          }
+          current = synced;
+        }
+      }
+
+      for (const segment of current.segments) {
+        if (!segmentIdsToRender.has(segment.id)) {
+          continue;
+        }
+
         current = await api.renderTtsProjectSegment(current.id, segment.id);
         setSelectedProject(current);
       }
       setWorkspaceStatus({
         tone: "success",
-        message: `Rendered ${current.segments.length} project segments.`,
+        message: `Rendered ${segmentIdsToRender.size} segment${segmentIdsToRender.size === 1 ? "" : "s"} that needed updates.`,
       });
       await loadProjects();
     } catch (err) {
@@ -849,6 +905,27 @@ export function TextToSpeechProjectsWorkspace({
           (selectedProjectRenderedCount / selectedProjectSegmentCount) * 100,
         )
       : 0;
+  const editedSegmentCount =
+    selectedProject?.segments.filter(
+      (segment) => (segmentDrafts[segment.id] ?? segment.text) !== segment.text,
+    ).length ?? 0;
+  const pendingRenderSegmentCount =
+    selectedProject?.segments.filter((segment) => {
+      const draft = segmentDrafts[segment.id] ?? segment.text;
+      return draft !== segment.text || !segment.speech_record_id;
+    }).length ?? 0;
+  const readySegmentCount =
+    selectedProjectSegmentCount > 0
+      ? Math.max(0, selectedProjectSegmentCount - pendingRenderSegmentCount)
+      : 0;
+  const exportReady =
+    selectedProjectSegmentCount > 0 &&
+    pendingRenderSegmentCount === 0 &&
+    selectedProjectRenderedCount === selectedProjectSegmentCount;
+  const primaryRenderLabel =
+    pendingRenderSegmentCount > 0
+      ? `Render ${pendingRenderSegmentCount} remaining`
+      : "All blocks rendered";
   const projectLibraryActions = (
     <div className="flex items-center gap-2">
       <Button
@@ -1240,88 +1317,152 @@ export function TextToSpeechProjectsWorkspace({
             </div>
           </section>
         ) : (
-          <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_320px]">
-            <div className="space-y-5">
-              <section className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 sm:p-6">
+          <div className="space-y-5">
+            <section className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 sm:p-6">
+              <div className="flex flex-col gap-5 xl:flex-row xl:items-start xl:justify-between">
+                <div className="min-w-0 flex-1">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                    Active Project
+                  </div>
+                  <h3 className="mt-2 text-2xl font-semibold tracking-tight text-[var(--text-primary)]">
+                    {selectedProject.name}
+                  </h3>
+                  <p className="mt-2 max-w-3xl text-sm leading-relaxed text-[var(--text-secondary)]">
+                    Keep the profile stable, review the split blocks, render only
+                    the ones that still need updates, then export a merged narration
+                    file when the project is ready.
+                  </p>
+
+                  <div className="mt-4 flex flex-wrap gap-2 text-xs">
+                    <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[var(--text-muted)]">
+                      Updated {formatRelativeDate(selectedProject.updated_at)}
+                    </span>
+                    <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[var(--text-muted)]">
+                      {selectedProject.source_filename || "Manual paste"}
+                    </span>
+                    {projectModelId ? (
+                      <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[var(--text-muted)]">
+                        {projectModelId}
+                      </span>
+                    ) : null}
+                    {selectedVoiceItem?.name ? (
+                      <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[var(--text-muted)]">
+                        {selectedVoiceItem.name}
+                      </span>
+                    ) : null}
+                  </div>
+                </div>
+
+                <div className="grid gap-2 sm:grid-cols-2 xl:w-[360px] xl:grid-cols-1">
+                  <Button
+                    onClick={() => void handleRenderAll()}
+                    disabled={renderingAll || pendingRenderSegmentCount === 0}
+                    className="w-full justify-center"
+                  >
+                    {renderingAll ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Waves className="h-4 w-4" />
+                    )}
+                    {primaryRenderLabel}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    onClick={handleExport}
+                    disabled={isDownloading}
+                    className="w-full justify-center bg-[var(--bg-surface-1)]"
+                  >
+                    {isDownloading ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Download className="h-4 w-4" />
+                    )}
+                    Export merged WAV
+                  </Button>
+                </div>
+              </div>
+
+              <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-3">
+                  <div className="text-[11px] uppercase tracking-wider text-[var(--text-muted)]">
+                    Segments
+                  </div>
+                  <div className="mt-1 text-2xl font-semibold text-[var(--text-primary)]">
+                    {selectedProjectSegmentCount}
+                  </div>
+                </div>
+                <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-3">
+                  <div className="text-[11px] uppercase tracking-wider text-[var(--text-muted)]">
+                    Ready
+                  </div>
+                  <div className="mt-1 text-2xl font-semibold text-[var(--text-primary)]">
+                    {readySegmentCount}
+                  </div>
+                </div>
+                <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-3">
+                  <div className="text-[11px] uppercase tracking-wider text-[var(--text-muted)]">
+                    Needs Render
+                  </div>
+                  <div className="mt-1 text-2xl font-semibold text-[var(--text-primary)]">
+                    {pendingRenderSegmentCount}
+                  </div>
+                </div>
+                <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-3">
+                  <div className="text-[11px] uppercase tracking-wider text-[var(--text-muted)]">
+                    Script Size
+                  </div>
+                  <div className="mt-1 text-2xl font-semibold text-[var(--text-primary)]">
+                    {selectedProjectTotalChars}
+                  </div>
+                  <div className="text-xs text-[var(--text-muted)]">chars</div>
+                </div>
+              </div>
+
+              <div className="mt-5 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
                 <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-                  <div className="space-y-2">
+                  <div>
                     <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                      Project Setup
+                      Workflow Status
                     </div>
-                    <h3 className="text-xl font-semibold text-[var(--text-primary)]">
-                      Configure the render profile
-                    </h3>
-                    <p className="max-w-2xl text-sm leading-relaxed text-[var(--text-secondary)]">
-                      Each TTS project keeps one shared model, voice, and speed
-                      profile. Update those first, then render the split script
-                      blocks below.
-                    </p>
+                    <div className="mt-2 text-sm font-medium text-[var(--text-primary)]">
+                      {exportReady
+                        ? "Merged export is current and ready."
+                        : `${pendingRenderSegmentCount} segment${pendingRenderSegmentCount === 1 ? "" : "s"} still need rendering before the export is fully current.`}
+                    </div>
+                    <div className="mt-1 text-xs leading-relaxed text-[var(--text-muted)]">
+                      Render actions use the latest saved project profile, and block
+                      renders save edited text automatically before generating audio.
+                    </div>
                   </div>
-                  {projectDirty ? (
-                    <div className="rounded-full border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--status-warning-text)]">
-                      Unsaved changes
-                    </div>
-                  ) : (
-                    <div className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--text-muted)]">
-                      Settings synced
-                    </div>
-                  )}
-                </div>
-
-                <div className="mt-5 grid gap-4 md:grid-cols-2">
-                  <div className="space-y-2">
-                    <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
-                      Project name
-                    </label>
-                    <Input
-                      value={projectName}
-                      onChange={(event) => setProjectName(event.target.value)}
-                    />
-                  </div>
-
-                  <div className="space-y-2">
-                    <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
-                      Render model
-                    </label>
-                    <RouteModelSelect
-                      value={projectModelId}
-                      options={modelOptions}
-                      onSelect={(value) => {
-                        setProjectModelId(value);
-                        setWorkspaceStatus(null);
-                      }}
-                      className="w-full"
-                    />
+                  <div className="flex flex-wrap gap-2 text-[11px]">
+                    <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2.5 py-1 text-[var(--text-muted)]">
+                      Prepare profile
+                    </span>
+                    <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2.5 py-1 text-[var(--text-muted)]">
+                      Review blocks
+                    </span>
+                    <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2.5 py-1 text-[var(--text-muted)]">
+                      Render remaining
+                    </span>
+                    <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2.5 py-1 text-[var(--text-muted)]">
+                      Export
+                    </span>
                   </div>
                 </div>
 
-                <div className="mt-5 space-y-2">
-                  <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
-                    Project voice
-                  </label>
-                  <VoiceSelect
-                    voiceMode={projectVoiceMode}
-                    onVoiceModeChange={(value) => {
-                      setProjectVoiceMode(value);
-                      setWorkspaceStatus(null);
-                    }}
-                    savedVoiceItems={savedVoiceItems}
-                    builtInVoiceItems={builtInVoiceItems}
-                    selectedItem={selectedVoiceItem}
-                    savedVoicesLoading={savedVoicesLoading}
-                    savedVoicesError={savedVoicesError}
-                    savedEnabled={supportsSavedVoices}
-                    builtInEnabled={supportsBuiltInVoices}
-                    disabled={!projectModelId}
-                    modelLabel={currentProjectModelInfo?.variant ?? projectModelId}
+                <div className="mt-4 h-2 overflow-hidden rounded-full bg-[var(--bg-surface-2)]">
+                  <div
+                    className="h-full rounded-full bg-[var(--accent-solid)] transition-[width] duration-300"
+                    style={{ width: `${selectedProjectCompletionPercent}%` }}
                   />
                 </div>
-
-                <div className="mt-5 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-4 text-sm leading-relaxed text-[var(--text-secondary)]">
-                  {projectVoiceNotice}
+                <div className="mt-2 text-xs text-[var(--text-muted)]">
+                  {selectedProjectRenderedCount}/{selectedProjectSegmentCount} segments have attached audio in the project.
                 </div>
-              </section>
+              </div>
+            </section>
 
+            <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
               <section className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 sm:p-6">
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                   <div>
@@ -1332,8 +1473,8 @@ export function TextToSpeechProjectsWorkspace({
                       Review and render script blocks
                     </h3>
                     <p className="mt-1 max-w-2xl text-sm text-[var(--text-secondary)]">
-                      Edit segment text, save any changes, and render each block
-                      with the project profile above.
+                      Edit the narration block, save a draft when needed, or render
+                      immediately to refresh the attached audio.
                     </p>
                   </div>
                   {projectLoading ? (
@@ -1344,10 +1485,23 @@ export function TextToSpeechProjectsWorkspace({
                   ) : null}
                 </div>
 
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[11px] text-[var(--text-muted)]">
+                    {editedSegmentCount} edited
+                  </span>
+                  <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[11px] text-[var(--text-muted)]">
+                    {pendingRenderSegmentCount} awaiting render
+                  </span>
+                  <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[11px] text-[var(--text-muted)]">
+                    {readySegmentCount} ready
+                  </span>
+                </div>
+
                 <div className="mt-5 space-y-4">
                   {selectedProject.segments.map((segment) => {
                     const draft = segmentDrafts[segment.id] ?? segment.text;
                     const segmentDirty = draft !== segment.text;
+                    const segmentNeedsRender = segmentDirty || !segment.speech_record_id;
                     const isSaving = savingSegmentId === segment.id;
                     const isRendering = renderingSegmentId === segment.id;
 
@@ -1365,12 +1519,18 @@ export function TextToSpeechProjectsWorkspace({
                               <span
                                 className={cn(
                                   "rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em]",
-                                  segment.speech_record_id
-                                    ? "bg-[var(--status-positive-bg)] border-[var(--status-positive-border)] text-[var(--status-positive-text)]"
-                                    : "bg-[var(--bg-surface-0)] border-[var(--border-muted)] text-[var(--text-muted)]",
+                                  segmentDirty
+                                    ? "border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] text-[var(--status-warning-text)]"
+                                    : segment.speech_record_id
+                                      ? "bg-[var(--status-positive-bg)] border-[var(--status-positive-border)] text-[var(--status-positive-text)]"
+                                      : "bg-[var(--bg-surface-0)] border-[var(--border-muted)] text-[var(--text-muted)]",
                                 )}
                               >
-                                {segment.speech_record_id ? "Rendered" : "Draft"}
+                                {segmentDirty
+                                  ? "Edited"
+                                  : segment.speech_record_id
+                                    ? "Rendered"
+                                    : "Needs render"}
                               </span>
                             </div>
                             <div className="text-sm text-[var(--text-secondary)]">
@@ -1394,7 +1554,7 @@ export function TextToSpeechProjectsWorkspace({
                               ) : (
                                 <PencilLine className="h-4 w-4" />
                               )}
-                              Save text
+                              Save draft
                             </Button>
                             <Button
                               size="sm"
@@ -1406,7 +1566,11 @@ export function TextToSpeechProjectsWorkspace({
                               ) : (
                                 <Play className="h-4 w-4" />
                               )}
-                              Render
+                              {segmentDirty
+                                ? "Save & render"
+                                : segmentNeedsRender
+                                  ? "Render block"
+                                  : "Re-render"}
                             </Button>
                           </div>
                         </div>
@@ -1422,6 +1586,13 @@ export function TextToSpeechProjectsWorkspace({
                           }
                         />
 
+                        {segmentDirty ? (
+                          <div className="mt-4 rounded-xl border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-3 py-2 text-xs text-[var(--status-warning-text)]">
+                            This block has local edits. Rendering will save the latest
+                            text first and then refresh the audio.
+                          </div>
+                        ) : null}
+
                         {segment.speech_record_id ? (
                           <div className="mt-4 space-y-2 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-3">
                             <audio
@@ -1431,7 +1602,9 @@ export function TextToSpeechProjectsWorkspace({
                               className="h-10 w-full"
                             />
                             <div className="text-xs text-[var(--text-muted)]">
-                              Linked generation: {segment.speech_record_id}
+                              {segmentDirty
+                                ? "Preview reflects the last rendered audio until you render this edited block again."
+                                : `Linked generation: ${segment.speech_record_id}`}
                             </div>
                           </div>
                         ) : (
@@ -1444,182 +1617,168 @@ export function TextToSpeechProjectsWorkspace({
                   })}
                 </div>
               </section>
-            </div>
 
-            <div className="space-y-5">
-              <section className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
-                <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                  Active Project
-                </div>
-                <h3 className="mt-2 text-xl font-semibold text-[var(--text-primary)]">
-                  {selectedProject.name}
-                </h3>
-                <p className="mt-2 text-sm leading-relaxed text-[var(--text-secondary)]">
-                  Keep the project profile stable, render the remaining blocks,
-                  then export a merged narration file.
-                </p>
-
-                <div className="mt-4 flex flex-wrap gap-2 text-xs">
-                  <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[var(--text-muted)]">
-                    Updated {formatRelativeDate(selectedProject.updated_at)}
-                  </span>
-                  <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[var(--text-muted)]">
-                    {selectedProject.source_filename || "Manual paste"}
-                  </span>
-                </div>
-
-                <div className="mt-5 grid gap-3 sm:grid-cols-3 xl:grid-cols-1">
-                  <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-3">
-                    <div className="text-[11px] uppercase tracking-wider text-[var(--text-muted)]">
-                      Segments
+              <div className="space-y-5">
+                <section className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                        Project Profile
+                      </div>
+                      <h3 className="mt-1 text-lg font-semibold text-[var(--text-primary)]">
+                        Shared render settings
+                      </h3>
                     </div>
-                    <div className="mt-1 text-2xl font-semibold text-[var(--text-primary)]">
-                      {selectedProjectSegmentCount}
-                    </div>
-                  </div>
-                  <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-3">
-                    <div className="text-[11px] uppercase tracking-wider text-[var(--text-muted)]">
-                      Rendered
-                    </div>
-                    <div className="mt-1 text-2xl font-semibold text-[var(--text-primary)]">
-                      {selectedProjectRenderedCount}
-                    </div>
-                  </div>
-                  <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-3">
-                    <div className="text-[11px] uppercase tracking-wider text-[var(--text-muted)]">
-                      Script Size
-                    </div>
-                    <div className="mt-1 text-2xl font-semibold text-[var(--text-primary)]">
-                      {selectedProjectTotalChars}
-                    </div>
-                    <div className="text-xs text-[var(--text-muted)]">chars</div>
-                  </div>
-                </div>
-
-                <div className="mt-5 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
-                  <div className="flex items-center justify-between gap-3 text-sm">
-                    <span className="font-medium text-[var(--text-primary)]">
-                      Render completion
-                    </span>
-                    <span className="text-[var(--text-muted)]">
-                      {selectedProjectCompletionPercent}%
-                    </span>
-                  </div>
-                  <div className="mt-3 h-2 overflow-hidden rounded-full bg-[var(--bg-surface-2)]">
-                    <div
-                      className="h-full rounded-full bg-[var(--accent-solid)] transition-[width] duration-300"
-                      style={{ width: `${selectedProjectCompletionPercent}%` }}
-                    />
-                  </div>
-                  <div className="mt-2 text-xs text-[var(--text-muted)]">
-                    {selectedProjectRenderedCount}/{selectedProjectSegmentCount} segments are ready for the merged export.
-                  </div>
-                </div>
-
-                <div className="mt-5 grid gap-2">
-                  <Button
-                    onClick={() => void handleRenderAll()}
-                    disabled={renderingAll}
-                    className="w-full justify-center"
-                  >
-                    {renderingAll ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
+                    {projectDirty ? (
+                      <div className="rounded-full border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--status-warning-text)]">
+                        Unsaved
+                      </div>
                     ) : (
-                      <Waves className="h-4 w-4" />
+                      <div className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--text-muted)]">
+                        Synced
+                      </div>
                     )}
-                    Render all segments
-                  </Button>
+                  </div>
+
+                  <p className="mt-2 text-sm leading-relaxed text-[var(--text-secondary)]">
+                    These defaults apply across the full project. Save them before
+                    you start a long render pass, or let render actions sync them automatically.
+                  </p>
+
+                  <div className="mt-5 space-y-4">
+                    <div className="space-y-2">
+                      <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
+                        Project name
+                      </label>
+                      <Input
+                        value={projectName}
+                        onChange={(event) => setProjectName(event.target.value)}
+                      />
+                    </div>
+
+                    <div className="space-y-2">
+                      <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
+                        Render model
+                      </label>
+                      <RouteModelSelect
+                        value={projectModelId}
+                        options={modelOptions}
+                        onSelect={(value) => {
+                          setProjectModelId(value);
+                          setWorkspaceStatus(null);
+                        }}
+                        className="w-full"
+                      />
+                    </div>
+
+                    <div className="space-y-2">
+                      <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
+                        Project voice
+                      </label>
+                      <VoiceSelect
+                        voiceMode={projectVoiceMode}
+                        onVoiceModeChange={(value) => {
+                          setProjectVoiceMode(value);
+                          setWorkspaceStatus(null);
+                        }}
+                        savedVoiceItems={savedVoiceItems}
+                        builtInVoiceItems={builtInVoiceItems}
+                        selectedItem={selectedVoiceItem}
+                        savedVoicesLoading={savedVoicesLoading}
+                        savedVoicesError={savedVoicesError}
+                        savedEnabled={supportsSavedVoices}
+                        builtInEnabled={supportsBuiltInVoices}
+                        disabled={!projectModelId}
+                        modelLabel={currentProjectModelInfo?.variant ?? projectModelId}
+                      />
+                    </div>
+
+                    <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-4 text-sm leading-relaxed text-[var(--text-secondary)]">
+                      {projectVoiceNotice}
+                    </div>
+
+                    <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
+                      <div className="flex items-center justify-between text-sm">
+                        <span className="font-medium text-[var(--text-primary)]">
+                          Speed
+                        </span>
+                        <span className="text-[var(--text-muted)]">
+                          {projectSpeed.toFixed(2)}x
+                        </span>
+                      </div>
+                      <Slider
+                        value={[projectSpeed]}
+                        min={0.5}
+                        max={1.5}
+                        step={0.05}
+                        onValueChange={([value]) => setProjectSpeed(value ?? 1)}
+                        className="mt-4"
+                      />
+                      <div className="mt-3 text-xs leading-relaxed text-[var(--text-muted)]">
+                        This speed applies to every rendered segment in the project.
+                      </div>
+                    </div>
+                  </div>
+
                   <Button
                     variant="outline"
                     onClick={() => void persistProjectSettings()}
                     disabled={!projectDirty || savingProject}
-                    className="w-full justify-center bg-[var(--bg-surface-1)]"
+                    className="mt-5 w-full justify-center bg-[var(--bg-surface-1)]"
                   >
                     {savingProject ? (
                       <Loader2 className="h-4 w-4 animate-spin" />
                     ) : (
                       <Settings2 className="h-4 w-4" />
                     )}
-                    Save project settings
+                    Save profile
                   </Button>
-                  <Button
-                    variant="outline"
-                    onClick={handleExport}
-                    disabled={isDownloading}
-                    className="w-full justify-center bg-[var(--bg-surface-1)]"
-                  >
-                    {isDownloading ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <Download className="h-4 w-4" />
-                    )}
-                    Export merged WAV
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    onClick={() => void handleDeleteProject()}
-                    disabled={deletingProject}
-                    className="w-full justify-center"
-                  >
-                    {deletingProject ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <Trash2 className="h-4 w-4" />
-                    )}
-                    Delete project
-                  </Button>
-                </div>
-              </section>
+                </section>
 
-              <section className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
-                <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                  Render Profile
-                </div>
-                <div className="mt-3 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
-                  <div className="text-sm font-semibold text-[var(--text-primary)]">
-                    {projectVoiceAvailabilitySummary}
+                <section className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                    Delivery
                   </div>
-                  <div className="mt-1 text-sm text-[var(--text-secondary)]">
-                    {selectedVoiceItem?.name
-                      ? `Selected voice: ${selectedVoiceItem.name}`
-                      : "Choose a project voice"}
+                  <div className="mt-2 text-sm font-semibold text-[var(--text-primary)]">
+                    {exportReady
+                      ? "Everything is ready for merged export."
+                      : pendingRenderSegmentCount > 0
+                        ? `${pendingRenderSegmentCount} block${pendingRenderSegmentCount === 1 ? "" : "s"} still need rendering.`
+                        : "Render progress is in sync with the current project state."}
                   </div>
-                </div>
+                  <div className="mt-2 text-sm leading-relaxed text-[var(--text-secondary)]">
+                    Use export once the project sounds right. If you changed text in a
+                    block, re-render that block before downloading the merged file.
+                  </div>
 
-                <div className="mt-4 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
-                  <div className="flex items-center justify-between text-sm">
-                    <span className="font-medium text-[var(--text-primary)]">
-                      Speed
-                    </span>
-                    <span className="text-[var(--text-muted)]">
-                      {projectSpeed.toFixed(2)}x
-                    </span>
+                  <div className="mt-5 grid gap-2">
+                    {onOpenModelManager ? (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="w-full justify-center bg-[var(--bg-surface-1)]"
+                        onClick={onOpenModelManager}
+                      >
+                        <Settings2 className="h-4 w-4" />
+                        Open model manager
+                      </Button>
+                    ) : null}
+                    <Button
+                      variant="ghost"
+                      onClick={() => void handleDeleteProject()}
+                      disabled={deletingProject}
+                      className="w-full justify-center"
+                    >
+                      {deletingProject ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Trash2 className="h-4 w-4" />
+                      )}
+                      Delete project
+                    </Button>
                   </div>
-                  <Slider
-                    value={[projectSpeed]}
-                    min={0.5}
-                    max={1.5}
-                    step={0.05}
-                    onValueChange={([value]) => setProjectSpeed(value ?? 1)}
-                    className="mt-4"
-                  />
-                  <div className="mt-3 text-xs leading-relaxed text-[var(--text-muted)]">
-                    This speed applies to every rendered segment in the project.
-                  </div>
-                </div>
-
-                {onOpenModelManager ? (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="mt-4 w-full justify-center bg-[var(--bg-surface-1)]"
-                    onClick={onOpenModelManager}
-                  >
-                    <Settings2 className="h-4 w-4" />
-                    Open model manager
-                  </Button>
-                ) : null}
-              </section>
+                </section>
+              </div>
             </div>
           </div>
         )}
