@@ -46,6 +46,8 @@ pub struct SpeechHistoryRecordSummary {
     pub model_id: Option<String>,
     pub speaker: Option<String>,
     pub language: Option<String>,
+    pub saved_voice_id: Option<String>,
+    pub speed: Option<f64>,
     pub input_preview: String,
     pub input_chars: usize,
     pub generation_time_ms: f64,
@@ -64,6 +66,8 @@ pub struct SpeechHistoryRecord {
     pub model_id: Option<String>,
     pub speaker: Option<String>,
     pub language: Option<String>,
+    pub saved_voice_id: Option<String>,
+    pub speed: Option<f64>,
     pub input_text: String,
     pub voice_description: Option<String>,
     pub reference_text: Option<String>,
@@ -88,6 +92,8 @@ pub struct NewSpeechHistoryRecord {
     pub model_id: Option<String>,
     pub speaker: Option<String>,
     pub language: Option<String>,
+    pub saved_voice_id: Option<String>,
+    pub speed: Option<f64>,
     pub input_text: String,
     pub voice_description: Option<String>,
     pub reference_text: Option<String>,
@@ -130,6 +136,8 @@ impl SpeechHistoryStore {
                 model_id TEXT NULL,
                 speaker TEXT NULL,
                 language TEXT NULL,
+                saved_voice_id TEXT NULL,
+                speed REAL NULL,
                 input_text TEXT NOT NULL,
                 voice_description TEXT NULL,
                 reference_text TEXT NULL,
@@ -147,6 +155,9 @@ impl SpeechHistoryStore {
             "#,
         )
         .context("Failed to initialize speech history database schema")?;
+
+        ensure_speech_history_records_saved_voice_id_column(&conn)?;
+        ensure_speech_history_records_speed_column(&conn)?;
 
         Ok(Self {
             db_path,
@@ -172,6 +183,8 @@ impl SpeechHistoryStore {
                     model_id,
                     speaker,
                     language,
+                    saved_voice_id,
+                    speed,
                     input_text,
                     generation_time_ms,
                     audio_duration_secs,
@@ -187,7 +200,7 @@ impl SpeechHistoryStore {
             )?;
 
             let rows = stmt.query_map(params![route_kind.as_db_value(), list_limit], |row| {
-                let input_text: String = row.get(6)?;
+                let input_text: String = row.get(8)?;
                 let route_raw: String = row.get(2)?;
                 let route_kind = SpeechRouteKind::from_db_value(route_raw.as_str())
                     .unwrap_or(SpeechRouteKind::TextToSpeech);
@@ -198,16 +211,18 @@ impl SpeechHistoryStore {
                     model_id: row.get(3)?,
                     speaker: row.get(4)?,
                     language: row.get(5)?,
+                    saved_voice_id: row.get(6)?,
+                    speed: row.get(7)?,
                     input_preview: input_preview(input_text.as_str()),
                     input_chars: input_text.chars().count(),
-                    generation_time_ms: row.get(7)?,
-                    audio_duration_secs: row.get(8)?,
-                    rtf: row.get(9)?,
+                    generation_time_ms: row.get(9)?,
+                    audio_duration_secs: row.get(10)?,
+                    rtf: row.get(11)?,
                     tokens_generated: row
-                        .get::<_, Option<i64>>(10)?
+                        .get::<_, Option<i64>>(12)?
                         .and_then(|value| i64_to_usize(value)),
-                    audio_mime_type: row.get(11)?,
-                    audio_filename: row.get(12)?,
+                    audio_mime_type: row.get(13)?,
+                    audio_filename: row.get(14)?,
                 })
             })?;
 
@@ -287,6 +302,10 @@ impl SpeechHistoryStore {
             let model_id = sanitize_optional_text(record.model_id.as_deref(), 160);
             let speaker = sanitize_optional_text(record.speaker.as_deref(), 120);
             let language = sanitize_optional_text(record.language.as_deref(), 80);
+            let saved_voice_id = sanitize_optional_text(record.saved_voice_id.as_deref(), 160);
+            let speed = record
+                .speed
+                .filter(|value| value.is_finite() && *value > 0.0);
             let input_text = sanitize_required_text(record.input_text.as_str(), 20_000);
             let voice_description =
                 sanitize_optional_text(record.voice_description.as_deref(), 2_000);
@@ -333,6 +352,8 @@ impl SpeechHistoryStore {
                     model_id,
                     speaker,
                     language,
+                    saved_voice_id,
+                    speed,
                     input_text,
                     voice_description,
                     reference_text,
@@ -344,7 +365,26 @@ impl SpeechHistoryStore {
                     audio_filename,
                     audio_storage_path
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                VALUES (
+                    ?1,
+                    ?2,
+                    ?3,
+                    ?4,
+                    ?5,
+                    ?6,
+                    ?7,
+                    ?8,
+                    ?9,
+                    ?10,
+                    ?11,
+                    ?12,
+                    ?13,
+                    ?14,
+                    ?15,
+                    ?16,
+                    ?17,
+                    ?18
+                )
                 "#,
                 params![
                     &record_id,
@@ -353,6 +393,8 @@ impl SpeechHistoryStore {
                     model_id,
                     speaker,
                     language,
+                    saved_voice_id,
+                    speed,
                     input_text,
                     voice_description,
                     reference_text,
@@ -436,6 +478,8 @@ fn fetch_record_without_audio(
                 model_id,
                 speaker,
                 language,
+                saved_voice_id,
+                speed,
                 input_text,
                 voice_description,
                 reference_text,
@@ -467,18 +511,69 @@ fn map_speech_history_record(row: &Row<'_>) -> rusqlite::Result<SpeechHistoryRec
         model_id: row.get(3)?,
         speaker: row.get(4)?,
         language: row.get(5)?,
-        input_text: row.get(6)?,
-        voice_description: row.get(7)?,
-        reference_text: row.get(8)?,
-        generation_time_ms: row.get(9)?,
-        audio_duration_secs: row.get(10)?,
-        rtf: row.get(11)?,
+        saved_voice_id: row.get(6)?,
+        speed: row.get(7)?,
+        input_text: row.get(8)?,
+        voice_description: row.get(9)?,
+        reference_text: row.get(10)?,
+        generation_time_ms: row.get(11)?,
+        audio_duration_secs: row.get(12)?,
+        rtf: row.get(13)?,
         tokens_generated: row
-            .get::<_, Option<i64>>(12)?
+            .get::<_, Option<i64>>(14)?
             .and_then(|value| i64_to_usize(value)),
-        audio_mime_type: row.get(13)?,
-        audio_filename: row.get(14)?,
+        audio_mime_type: row.get(15)?,
+        audio_filename: row.get(16)?,
     })
+}
+
+fn ensure_speech_history_records_saved_voice_id_column(conn: &Connection) -> anyhow::Result<()> {
+    if speech_history_records_has_column(conn, "saved_voice_id")? {
+        return Ok(());
+    }
+
+    conn.execute(
+        "ALTER TABLE speech_history_records ADD COLUMN saved_voice_id TEXT NULL",
+        [],
+    )
+    .context("Failed adding speech_history_records.saved_voice_id column")?;
+    Ok(())
+}
+
+fn ensure_speech_history_records_speed_column(conn: &Connection) -> anyhow::Result<()> {
+    if speech_history_records_has_column(conn, "speed")? {
+        return Ok(());
+    }
+
+    conn.execute(
+        "ALTER TABLE speech_history_records ADD COLUMN speed REAL NULL",
+        [],
+    )
+    .context("Failed adding speech_history_records.speed column")?;
+    Ok(())
+}
+
+fn speech_history_records_has_column(conn: &Connection, target: &str) -> anyhow::Result<bool> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(speech_history_records)")
+        .context("Failed to inspect speech_history_records schema")?;
+    let mut rows = stmt
+        .query([])
+        .context("Failed to query speech_history_records schema info")?;
+
+    while let Some(row) = rows
+        .next()
+        .context("Failed reading speech_history_records schema row")?
+    {
+        let name: String = row
+            .get(1)
+            .context("Failed reading speech_history_records column name")?;
+        if name == target {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn input_preview(content: &str) -> String {

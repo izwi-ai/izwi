@@ -182,6 +182,9 @@ impl ModelVariant {
     pub const QWEN3_TTS_MAX_OUTPUT_FRAMES: usize = 8192;
     /// Qwen3-TTS codec frame rate encoded in model variant naming ("12Hz").
     pub const QWEN3_TTS_FRAME_RATE_HZ: f32 = 12.0;
+    pub const QWEN_CUSTOMVOICE_BUILT_IN_VOICE_COUNT: usize = 9;
+    pub const LFM2_AUDIO_BUILT_IN_VOICE_COUNT: usize = 4;
+    pub const KOKORO_BUILT_IN_VOICE_COUNT: usize = 54;
 
     /// Get HuggingFace repository ID
     pub fn repo_id(&self) -> &'static str {
@@ -545,6 +548,81 @@ impl ModelVariant {
         )
     }
 
+    pub fn speech_capabilities(&self) -> Option<SpeechModelCapabilities> {
+        let capabilities = match self {
+            Self::Qwen3Tts12Hz06BBase
+            | Self::Qwen3Tts12Hz06BBase4Bit
+            | Self::Qwen3Tts12Hz06BBase8Bit
+            | Self::Qwen3Tts12Hz06BBaseBf16
+            | Self::Qwen3Tts12Hz17BBase
+            | Self::Qwen3Tts12Hz17BBase4Bit => SpeechModelCapabilities {
+                supports_builtin_voices: false,
+                built_in_voice_count: None,
+                supports_reference_voice: true,
+                supports_voice_description: false,
+                supports_streaming: true,
+                supports_speed_control: true,
+                supports_auto_long_form: true,
+            },
+            Self::Qwen3Tts12Hz06BCustomVoice
+            | Self::Qwen3Tts12Hz06BCustomVoice4Bit
+            | Self::Qwen3Tts12Hz06BCustomVoice8Bit
+            | Self::Qwen3Tts12Hz06BCustomVoiceBf16 => SpeechModelCapabilities {
+                supports_builtin_voices: true,
+                built_in_voice_count: Some(Self::QWEN_CUSTOMVOICE_BUILT_IN_VOICE_COUNT),
+                supports_reference_voice: false,
+                supports_voice_description: false,
+                supports_streaming: true,
+                supports_speed_control: true,
+                supports_auto_long_form: true,
+            },
+            Self::Qwen3Tts12Hz17BCustomVoice | Self::Qwen3Tts12Hz17BCustomVoice4Bit => {
+                SpeechModelCapabilities {
+                    supports_builtin_voices: true,
+                    built_in_voice_count: Some(Self::QWEN_CUSTOMVOICE_BUILT_IN_VOICE_COUNT),
+                    supports_reference_voice: false,
+                    supports_voice_description: true,
+                    supports_streaming: true,
+                    supports_speed_control: true,
+                    supports_auto_long_form: true,
+                }
+            }
+            Self::Qwen3Tts12Hz17BVoiceDesign
+            | Self::Qwen3Tts12Hz17BVoiceDesign4Bit
+            | Self::Qwen3Tts12Hz17BVoiceDesign8Bit
+            | Self::Qwen3Tts12Hz17BVoiceDesignBf16 => SpeechModelCapabilities {
+                supports_builtin_voices: false,
+                built_in_voice_count: None,
+                supports_reference_voice: false,
+                supports_voice_description: true,
+                supports_streaming: true,
+                supports_speed_control: true,
+                supports_auto_long_form: true,
+            },
+            Self::Lfm25Audio15B | Self::Lfm25Audio15B4Bit => SpeechModelCapabilities {
+                supports_builtin_voices: true,
+                built_in_voice_count: Some(Self::LFM2_AUDIO_BUILT_IN_VOICE_COUNT),
+                supports_reference_voice: true,
+                supports_voice_description: true,
+                supports_streaming: true,
+                supports_speed_control: true,
+                supports_auto_long_form: false,
+            },
+            Self::Kokoro82M => SpeechModelCapabilities {
+                supports_builtin_voices: true,
+                built_in_voice_count: Some(Self::KOKORO_BUILT_IN_VOICE_COUNT),
+                supports_reference_voice: false,
+                supports_voice_description: false,
+                supports_streaming: true,
+                supports_speed_control: true,
+                supports_auto_long_form: false,
+            },
+            _ => return None,
+        };
+
+        Some(capabilities)
+    }
+
     /// Max output codec frames for this TTS variant, if known.
     pub fn tts_max_output_frames_hint(&self) -> Option<usize> {
         if matches!(self.family(), crate::catalog::ModelFamily::Qwen3Tts) {
@@ -797,6 +875,18 @@ pub enum ModelStatus {
     Error,
 }
 
+/// Machine-readable speech feature contract for voice workflows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeechModelCapabilities {
+    pub supports_builtin_voices: bool,
+    pub built_in_voice_count: Option<usize>,
+    pub supports_reference_voice: bool,
+    pub supports_voice_description: bool,
+    pub supports_streaming: bool,
+    pub supports_speed_control: bool,
+    pub supports_auto_long_form: bool,
+}
+
 /// Complete model information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
@@ -807,6 +897,7 @@ pub struct ModelInfo {
     pub size_bytes: Option<u64>,
     pub download_progress: Option<f32>,
     pub error_message: Option<String>,
+    pub speech_capabilities: Option<SpeechModelCapabilities>,
 }
 
 impl ModelInfo {
@@ -819,6 +910,7 @@ impl ModelInfo {
             size_bytes: None,
             download_progress: None,
             error_message: None,
+            speech_capabilities: variant.speech_capabilities(),
         }
     }
 
@@ -831,7 +923,7 @@ impl ModelInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::ModelVariant;
+    use super::{ModelVariant, SpeechModelCapabilities};
 
     #[test]
     fn qwen3_tts_variants_expose_output_hints() {
@@ -905,5 +997,83 @@ mod tests {
                 variant.dir_name()
             );
         }
+    }
+
+    #[test]
+    fn qwen_base_capabilities_match_saved_voice_workflow() {
+        assert_eq!(
+            ModelVariant::Qwen3Tts12Hz17BBase.speech_capabilities(),
+            Some(SpeechModelCapabilities {
+                supports_builtin_voices: false,
+                built_in_voice_count: None,
+                supports_reference_voice: true,
+                supports_voice_description: false,
+                supports_streaming: true,
+                supports_speed_control: true,
+                supports_auto_long_form: true,
+            })
+        );
+    }
+
+    #[test]
+    fn custom_voice_capabilities_distinguish_instruction_support() {
+        assert_eq!(
+            ModelVariant::Qwen3Tts12Hz06BCustomVoice.speech_capabilities(),
+            Some(SpeechModelCapabilities {
+                supports_builtin_voices: true,
+                built_in_voice_count: Some(ModelVariant::QWEN_CUSTOMVOICE_BUILT_IN_VOICE_COUNT),
+                supports_reference_voice: false,
+                supports_voice_description: false,
+                supports_streaming: true,
+                supports_speed_control: true,
+                supports_auto_long_form: true,
+            })
+        );
+        assert_eq!(
+            ModelVariant::Qwen3Tts12Hz17BCustomVoice.speech_capabilities(),
+            Some(SpeechModelCapabilities {
+                supports_builtin_voices: true,
+                built_in_voice_count: Some(ModelVariant::QWEN_CUSTOMVOICE_BUILT_IN_VOICE_COUNT),
+                supports_reference_voice: false,
+                supports_voice_description: true,
+                supports_streaming: true,
+                supports_speed_control: true,
+                supports_auto_long_form: true,
+            })
+        );
+    }
+
+    #[test]
+    fn kokoro_and_lfm2_capabilities_reflect_runtime_constraints() {
+        assert_eq!(
+            ModelVariant::Kokoro82M.speech_capabilities(),
+            Some(SpeechModelCapabilities {
+                supports_builtin_voices: true,
+                built_in_voice_count: Some(ModelVariant::KOKORO_BUILT_IN_VOICE_COUNT),
+                supports_reference_voice: false,
+                supports_voice_description: false,
+                supports_streaming: true,
+                supports_speed_control: true,
+                supports_auto_long_form: false,
+            })
+        );
+        assert_eq!(
+            ModelVariant::Lfm25Audio15B.speech_capabilities(),
+            Some(SpeechModelCapabilities {
+                supports_builtin_voices: true,
+                built_in_voice_count: Some(ModelVariant::LFM2_AUDIO_BUILT_IN_VOICE_COUNT),
+                supports_reference_voice: true,
+                supports_voice_description: true,
+                supports_streaming: true,
+                supports_speed_control: true,
+                supports_auto_long_form: false,
+            })
+        );
+    }
+
+    #[test]
+    fn non_speech_variants_do_not_expose_speech_capabilities() {
+        assert_eq!(ModelVariant::Qwen3Asr06B.speech_capabilities(), None);
+        assert_eq!(ModelVariant::Qwen3508B.speech_capabilities(), None);
     }
 }

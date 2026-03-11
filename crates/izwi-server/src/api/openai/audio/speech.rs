@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::api::request_context::RequestContext;
+use crate::api::saved_voices::resolve_saved_voice_reference;
 use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::audio::AudioFormat;
@@ -67,6 +68,9 @@ pub struct SpeechRequest {
     /// Optional reference transcript for cloning.
     #[serde(default)]
     pub reference_text: Option<String>,
+    /// Optional saved voice identifier resolved server-side.
+    #[serde(default)]
+    pub saved_voice_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -119,6 +123,7 @@ pub async fn speech(
     Extension(ctx): Extension<RequestContext>,
     Json(req): Json<SpeechRequest>,
 ) -> Result<Response<Body>, ApiError> {
+    let req = resolve_saved_voice_request(&state, normalize_speech_request(req)).await?;
     info!("OpenAI speech request: {} chars", req.input.len());
 
     let variant = parse_tts_model_variant(&req.model)
@@ -216,6 +221,48 @@ fn resolve_speech_timeout_secs(
         .min(timeout_max_secs.max(1));
 
     default_timeout_secs.max(suggested_secs).max(1)
+}
+
+fn normalize_speech_request(mut req: SpeechRequest) -> SpeechRequest {
+    req.voice = normalize_optional_trimmed(req.voice);
+    req.response_format = normalize_optional_trimmed(req.response_format);
+    req.language = normalize_optional_trimmed(req.language);
+    req.instructions = normalize_optional_trimmed(req.instructions);
+    req.reference_audio = normalize_optional_trimmed(req.reference_audio);
+    req.reference_text = normalize_optional_trimmed(req.reference_text);
+    req.saved_voice_id = normalize_optional_trimmed(req.saved_voice_id);
+    req
+}
+
+async fn resolve_saved_voice_request(
+    state: &AppState,
+    mut req: SpeechRequest,
+) -> Result<SpeechRequest, ApiError> {
+    let Some(saved_voice_id) = req.saved_voice_id.as_deref() else {
+        return Ok(req);
+    };
+
+    let has_direct_reference_audio = req
+        .reference_audio
+        .as_deref()
+        .map(has_non_empty_text)
+        .unwrap_or(false);
+    let has_direct_reference_text = req
+        .reference_text
+        .as_deref()
+        .map(has_non_empty_text)
+        .unwrap_or(false);
+    if has_direct_reference_audio || has_direct_reference_text {
+        return Err(ApiError::bad_request(
+            "Use either `saved_voice_id` or direct `reference_audio`/`reference_text`, not both.",
+        ));
+    }
+
+    let saved_voice = resolve_saved_voice_reference(state, saved_voice_id).await?;
+    req.saved_voice_id = Some(saved_voice.voice_id);
+    req.reference_audio = Some(saved_voice.reference_audio_base64);
+    req.reference_text = Some(saved_voice.reference_text);
+    Ok(req)
 }
 
 async fn stream_speech(
@@ -517,6 +564,19 @@ fn build_generation_request(
     }
 }
 
+fn normalize_optional_trimmed(raw: Option<String>) -> Option<String> {
+    let trimmed = raw.unwrap_or_default().trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn has_non_empty_text(raw: &str) -> bool {
+    !raw.trim().is_empty()
+}
+
 fn parse_response_format(format: &str) -> Result<AudioFormat, ApiError> {
     match format.to_ascii_lowercase().as_str() {
         "wav" => Ok(AudioFormat::Wav),
@@ -563,6 +623,7 @@ mod tests {
             instructions: None,
             reference_audio: None,
             reference_text: None,
+            saved_voice_id: None,
         };
 
         let timeout =
@@ -587,6 +648,7 @@ mod tests {
             instructions: None,
             reference_audio: None,
             reference_text: None,
+            saved_voice_id: None,
         };
 
         let timeout =
@@ -611,6 +673,7 @@ mod tests {
             instructions: None,
             reference_audio: None,
             reference_text: None,
+            saved_voice_id: None,
         };
 
         let timeout = resolve_speech_timeout_secs(300, ModelVariant::Lfm25Audio15B, &req);

@@ -66,7 +66,7 @@ pub use artifacts::{DownloadProgress, ModelDownloader, ModelManager, ModelWeight
 pub use catalog::{
     parse_chat_model_variant, parse_model_variant, parse_tts_model_variant,
     resolve_asr_model_variant, resolve_diarization_model_variant, ModelInfo, ModelStatus,
-    ModelVariant,
+    ModelVariant, SpeechModelCapabilities,
 };
 pub use runtime_models::shared::chat::{
     parse_qwen35_multimodal_control_content, parse_qwen35_thinking_control_content,

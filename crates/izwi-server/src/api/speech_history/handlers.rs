@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::api::request_context::RequestContext;
+use crate::api::saved_voices::resolve_saved_voice_reference;
 use crate::api::tts_long_form::{expand_generation_requests_for_long_form, generate_long_form_tts};
 use crate::error::ApiError;
 use crate::speech_history_store::{
@@ -60,6 +61,8 @@ pub struct CreateSpeechHistoryRecordRequest {
     pub reference_audio: Option<String>,
     #[serde(default)]
     pub reference_text: Option<String>,
+    #[serde(default)]
+    pub saved_voice_id: Option<String>,
     #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]
@@ -312,9 +315,12 @@ async fn create_record(
     req: CreateSpeechHistoryRecordRequest,
     route_kind: SpeechRouteKind,
 ) -> Result<Response, ApiError> {
+    let mut req = normalize_create_request(req);
     let model_id = required_trimmed(req.model_id.as_deref(), "model_id")?;
     let input_text = required_trimmed(req.text.as_deref(), "text")?;
 
+    validate_reference_voice_selection(&req)?;
+    req = resolve_saved_voice_selection(&state, req).await?;
     validate_route_requirements(route_kind, &req)?;
 
     let variant = parse_tts_model_variant(model_id.as_str())
@@ -366,6 +372,8 @@ async fn create_record(
             model_id: Some(model_id),
             speaker: req.speaker,
             language: req.language,
+            saved_voice_id: req.saved_voice_id,
+            speed: req.speed.map(f64::from),
             input_text,
             voice_description: req.voice_description,
             reference_text: req.reference_text,
@@ -639,6 +647,8 @@ async fn stream_record_creation(
                             model_id: Some(model_id),
                             speaker: req.speaker,
                             language: req.language,
+                            saved_voice_id: req.saved_voice_id,
+                            speed: req.speed.map(f64::from),
                             input_text,
                             voice_description: req.voice_description,
                             reference_text: req.reference_text,
@@ -759,6 +769,66 @@ async fn stream_record_creation(
         .unwrap_or_else(|_| Response::new(Body::empty())))
 }
 
+fn normalize_create_request(
+    mut req: CreateSpeechHistoryRecordRequest,
+) -> CreateSpeechHistoryRecordRequest {
+    req.model_id = normalize_optional_trimmed(req.model_id);
+    req.text = normalize_optional_trimmed(req.text);
+    req.speaker = normalize_optional_trimmed(req.speaker);
+    req.language = normalize_optional_trimmed(req.language);
+    req.voice_description = normalize_optional_trimmed(req.voice_description);
+    req.reference_audio = normalize_optional_trimmed(req.reference_audio);
+    req.reference_text = normalize_optional_trimmed(req.reference_text);
+    req.saved_voice_id = normalize_optional_trimmed(req.saved_voice_id);
+    req
+}
+
+async fn resolve_saved_voice_selection(
+    state: &AppState,
+    mut req: CreateSpeechHistoryRecordRequest,
+) -> Result<CreateSpeechHistoryRecordRequest, ApiError> {
+    let Some(saved_voice_id) = req.saved_voice_id.as_deref() else {
+        return Ok(req);
+    };
+
+    let saved_voice = resolve_saved_voice_reference(state, saved_voice_id).await?;
+    req.saved_voice_id = Some(saved_voice.voice_id);
+    req.reference_audio = Some(saved_voice.reference_audio_base64);
+    req.reference_text = Some(saved_voice.reference_text);
+    Ok(req)
+}
+
+fn validate_reference_voice_selection(
+    req: &CreateSpeechHistoryRecordRequest,
+) -> Result<(), ApiError> {
+    let has_saved_voice = req
+        .saved_voice_id
+        .as_deref()
+        .map(has_non_empty_text)
+        .unwrap_or(false);
+    if !has_saved_voice {
+        return Ok(());
+    }
+
+    let has_direct_reference_audio = req
+        .reference_audio
+        .as_deref()
+        .map(has_non_empty_text)
+        .unwrap_or(false);
+    let has_direct_reference_text = req
+        .reference_text
+        .as_deref()
+        .map(has_non_empty_text)
+        .unwrap_or(false);
+    if has_direct_reference_audio || has_direct_reference_text {
+        return Err(ApiError::bad_request(
+            "Use either `saved_voice_id` or direct `reference_audio`/`reference_text`, not both.",
+        ));
+    }
+
+    Ok(())
+}
+
 fn build_generation_request(
     req: CreateSpeechHistoryRecordRequest,
     correlation_id: String,
@@ -817,18 +887,16 @@ fn validate_route_requirements(
             let has_reference_audio = req
                 .reference_audio
                 .as_deref()
-                .map(str::trim)
-                .map(|text| !text.is_empty())
+                .map(has_non_empty_text)
                 .unwrap_or(false);
             let has_reference_text = req
                 .reference_text
                 .as_deref()
-                .map(str::trim)
-                .map(|text| !text.is_empty())
+                .map(has_non_empty_text)
                 .unwrap_or(false);
             if !has_reference_audio || !has_reference_text {
                 return Err(ApiError::bad_request(
-                    "Voice cloning requests require `reference_audio` and `reference_text`.",
+                    "Voice cloning requests require `saved_voice_id` or both `reference_audio` and `reference_text`.",
                 ));
             }
         }
@@ -846,6 +914,19 @@ fn required_trimmed(raw: Option<&str>, field_name: &str) -> Result<String, ApiEr
         )));
     }
     Ok(trimmed.to_string())
+}
+
+fn normalize_optional_trimmed(raw: Option<String>) -> Option<String> {
+    let trimmed = raw.unwrap_or_default().trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn has_non_empty_text(raw: &str) -> bool {
+    !raw.trim().is_empty()
 }
 
 fn resolve_generation_timeout_secs(
@@ -916,6 +997,71 @@ fn default_audio_filename(route_kind: SpeechRouteKind, extension: &str) -> Strin
 
 fn to_stream_json(event: SpeechStreamEvent) -> String {
     serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_request() -> CreateSpeechHistoryRecordRequest {
+        CreateSpeechHistoryRecordRequest {
+            model_id: Some("Qwen3-TTS-12Hz-1.7B-Base".to_string()),
+            text: Some("Hello".to_string()),
+            speaker: None,
+            language: None,
+            voice_description: None,
+            reference_audio: None,
+            reference_text: None,
+            saved_voice_id: None,
+            temperature: None,
+            speed: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            top_k: None,
+            stream: None,
+        }
+    }
+
+    #[test]
+    fn normalize_create_request_trims_optional_fields() {
+        let normalized = normalize_create_request(CreateSpeechHistoryRecordRequest {
+            model_id: Some("  Qwen3-TTS-12Hz-1.7B-Base  ".to_string()),
+            text: Some("  Hello there  ".to_string()),
+            saved_voice_id: Some("  voice-1  ".to_string()),
+            ..base_request()
+        });
+
+        assert_eq!(
+            normalized.model_id.as_deref(),
+            Some("Qwen3-TTS-12Hz-1.7B-Base")
+        );
+        assert_eq!(normalized.text.as_deref(), Some("Hello there"));
+        assert_eq!(normalized.saved_voice_id.as_deref(), Some("voice-1"));
+    }
+
+    #[test]
+    fn mixed_saved_voice_and_direct_reference_is_rejected() {
+        let err = validate_reference_voice_selection(&CreateSpeechHistoryRecordRequest {
+            saved_voice_id: Some("voice-1".to_string()),
+            reference_audio: Some("abc".to_string()),
+            ..base_request()
+        })
+        .expect_err("expected mixed reference inputs to fail");
+
+        assert!(err
+            .message
+            .contains("Use either `saved_voice_id` or direct `reference_audio`/`reference_text`"));
+    }
+
+    #[test]
+    fn voice_cloning_requires_reference_source_after_resolution() {
+        let err = validate_route_requirements(SpeechRouteKind::VoiceCloning, &base_request())
+            .expect_err("expected missing reference source to fail");
+
+        assert!(err
+            .message
+            .contains("Voice cloning requests require `saved_voice_id` or both"));
+    }
 }
 
 fn audio_response(audio: StoredSpeechAudio, as_attachment: bool) -> Response {
