@@ -1,4 +1,8 @@
-use axum::{extract::Request, http::HeaderValue, middleware, Router};
+use axum::{
+    extract::Request,
+    http::{HeaderValue, StatusCode},
+    middleware, Router,
+};
 use izwi_core::ServeRuntimeConfig;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
@@ -13,6 +17,10 @@ const DESKTOP_CORS_ORIGINS: &[&str] = &[
     "http://tauri.localhost",
     "https://tauri.localhost",
 ];
+
+async fn api_not_found() -> StatusCode {
+    StatusCode::NOT_FOUND
+}
 
 /// Create the main API router.
 pub fn create_router(state: AppState, serve_config: &ServeRuntimeConfig) -> Router {
@@ -41,7 +49,8 @@ pub fn create_router(state: AppState, serve_config: &ServeRuntimeConfig) -> Rout
         .merge(crate::api::saved_voices::router())
         .merge(crate::api::voice_realtime::router())
         .merge(crate::api::openai::router())
-        .merge(crate::api::admin::router());
+        .merge(crate::api::admin::router())
+        .fallback(api_not_found);
 
     let app = Router::new().nest("/v1", v1_routes).with_state(state);
 
@@ -307,7 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn canonical_history_routes_still_resolve() {
-        let (app, temp_dir) = test_api_app("canonical_history_routes_still_resolve");
+        let (app, temp_dir) = test_api_app("canonical_history_routes_still_resolve", true);
 
         assert_route_status(
             app.clone(),
@@ -422,8 +431,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canonical_history_mutation_routes_still_resolve() {
+        let (app, temp_dir) = test_api_app("canonical_history_mutation_routes_still_resolve", true);
+
+        assert_route_status(
+            app.clone(),
+            Method::POST,
+            "/v1/transcriptions",
+            Some("{}"),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::DELETE,
+            "/v1/transcriptions/missing",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+
+        assert_route_status(
+            app.clone(),
+            Method::POST,
+            "/v1/diarizations",
+            Some("{}"),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::PUT,
+            "/v1/diarizations/missing",
+            Some("{}"),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::DELETE,
+            "/v1/diarizations/missing",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::POST,
+            "/v1/diarizations/missing/reruns",
+            Some("{}"),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+
+        assert_route_status(
+            app.clone(),
+            Method::POST,
+            "/v1/text-to-speech-generations",
+            Some("{}"),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::DELETE,
+            "/v1/text-to-speech-generations/missing",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+
+        assert_route_status(
+            app.clone(),
+            Method::POST,
+            "/v1/voice-design-generations",
+            Some("{}"),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::DELETE,
+            "/v1/voice-design-generations/missing",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+
+        assert_route_status(
+            app.clone(),
+            Method::POST,
+            "/v1/voice-clone-generations",
+            Some("{}"),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_route_status(
+            app,
+            Method::DELETE,
+            "/v1/voice-clone-generations/missing",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+
+        drop(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn api_namespace_does_not_fall_back_to_ui_when_enabled() {
+        let (app, temp_dir) =
+            test_api_app("api_namespace_does_not_fall_back_to_ui_when_enabled", true);
+
+        assert_route_status(
+            app.clone(),
+            Method::GET,
+            "/v1/not-a-route",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::POST,
+            "/v1/not-a-route",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::PUT,
+            "/v1/not-a-route",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_route_status(
+            app,
+            Method::DELETE,
+            "/v1/not-a-route",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+
+        drop(temp_dir);
+    }
+
+    #[tokio::test]
     async fn legacy_history_routes_return_not_found() {
-        let (app, temp_dir) = test_api_app("legacy_history_routes_return_not_found");
+        let (app, temp_dir) = test_api_app("legacy_history_routes_return_not_found", true);
 
         assert_route_status(
             app.clone(),
@@ -435,7 +593,23 @@ mod tests {
         .await;
         assert_route_status(
             app.clone(),
+            Method::POST,
+            "/v1/transcription/records",
+            Some("{}"),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
             Method::GET,
+            "/v1/transcription/records/missing",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::DELETE,
             "/v1/transcription/records/missing",
             None,
             StatusCode::NOT_FOUND,
@@ -460,9 +634,33 @@ mod tests {
         .await;
         assert_route_status(
             app.clone(),
+            Method::POST,
+            "/v1/diarization/records",
+            Some("{}"),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
             Method::PATCH,
             "/v1/diarization/records/missing",
             Some("{}"),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::PUT,
+            "/v1/diarization/records/missing",
+            Some("{}"),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::DELETE,
+            "/v1/diarization/records/missing",
+            None,
             StatusCode::NOT_FOUND,
         )
         .await;
@@ -493,8 +691,24 @@ mod tests {
         .await;
         assert_route_status(
             app.clone(),
+            Method::POST,
+            "/v1/text-to-speech/records",
+            Some("{}"),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
             Method::GET,
             "/v1/text-to-speech/records/missing/audio",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::DELETE,
+            "/v1/text-to-speech/records/missing",
             None,
             StatusCode::NOT_FOUND,
         )
@@ -510,7 +724,23 @@ mod tests {
         .await;
         assert_route_status(
             app.clone(),
+            Method::POST,
+            "/v1/voice-design/records",
+            Some("{}"),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
             Method::GET,
+            "/v1/voice-design/records/missing",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::DELETE,
             "/v1/voice-design/records/missing",
             None,
             StatusCode::NOT_FOUND,
@@ -521,6 +751,22 @@ mod tests {
             app.clone(),
             Method::GET,
             "/v1/voice-cloning/records",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::POST,
+            "/v1/voice-cloning/records",
+            Some("{}"),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::DELETE,
+            "/v1/voice-cloning/records/missing",
             None,
             StatusCode::NOT_FOUND,
         )
@@ -585,10 +831,16 @@ mod tests {
             .expect("request should build")
     }
 
-    fn test_api_app(name: &str) -> (Router, TempDirGuard) {
+    fn test_api_app(name: &str, ui_enabled: bool) -> (Router, TempDirGuard) {
         let temp_dir = test_ui_dir(name);
+        let ui_dir = temp_dir.join("ui");
         let models_dir = temp_dir.join("models");
         std::fs::create_dir_all(&models_dir).expect("models dir should be created");
+        if ui_enabled {
+            std::fs::create_dir_all(&ui_dir).expect("ui dir should be created");
+            std::fs::write(ui_dir.join("index.html"), "<html>ui</html>")
+                .expect("index should be written");
+        }
 
         let db_path = temp_dir.join("izwi.sqlite3");
         let media_dir = temp_dir.join("media");
@@ -599,8 +851,8 @@ mod tests {
 
         let serve_config = ServeRuntimeConfig {
             backend: izwi_core::backends::BackendPreference::Cpu,
-            ui_enabled: false,
-            ui_dir: temp_dir.join("ui"),
+            ui_enabled,
+            ui_dir,
             models_dir,
             ..ServeRuntimeConfig::default()
         };
