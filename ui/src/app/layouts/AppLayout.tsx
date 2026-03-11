@@ -9,6 +9,7 @@ import {
   MessageSquare,
   AudioLines,
   Box,
+  Library,
   Github,
   AlertCircle,
   X,
@@ -72,6 +73,13 @@ const TOP_NAV_ITEMS: NavItem[] = [
 ];
 
 const CREATION_NAV_ITEMS: NavItem[] = [
+  {
+    id: "voices",
+    label: "Voices",
+    description: "Reusable saved and built-in voice library",
+    icon: Library,
+    path: "/voices",
+  },
   {
     id: "text-to-speech",
     label: "Text to Speech",
