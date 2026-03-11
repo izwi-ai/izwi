@@ -1,5 +1,5 @@
 import { useMemo, useState, type ReactElement, type ReactNode } from "react";
-import { History, type LucideIcon } from "lucide-react";
+import { type LucideIcon, History } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -87,7 +87,7 @@ export function RouteHistoryDrawer({
               "h-9 shrink-0 gap-2 rounded-lg border-[var(--border-muted)] bg-[var(--bg-surface-2)] text-[var(--text-secondary)] shadow-none hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-3)] hover:text-[var(--text-primary)]",
             )}
           >
-            <History className="h-4 w-4 shrink-0" />
+            <HeaderIcon className="h-4 w-4 shrink-0" />
             <span>{triggerLabel}</span>
             {triggerBadge ? (
               <span className="inline-flex min-w-5 items-center justify-center rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-3)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--text-primary)]">
