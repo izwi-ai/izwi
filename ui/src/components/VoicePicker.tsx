@@ -28,6 +28,10 @@ interface VoicePickerProps {
   className?: string;
 }
 
+function itemInitial(name: string): string {
+  return name.trim().charAt(0).toUpperCase() || "V";
+}
+
 export function VoicePicker({
   items,
   emptyTitle,
@@ -64,10 +68,11 @@ export function VoicePicker({
           <Card
             key={item.id}
             className={cn(
-              "h-full border-border/75 bg-card/90 transition-colors",
+              "h-full border-border/75 bg-card/90 transition-[border-color,transform,box-shadow] duration-150",
               item.selected &&
                 "border-primary/60 shadow-[0_18px_40px_-34px_hsl(var(--primary)/0.9)]",
-              item.onSelect && "cursor-pointer hover:border-primary/40",
+              item.onSelect &&
+                "cursor-pointer hover:-translate-y-[1px] hover:border-primary/40 hover:shadow-[0_22px_44px_-34px_rgba(0,0,0,0.38)]",
             )}
             role={item.onSelect ? "button" : undefined}
             tabIndex={item.onSelect ? 0 : undefined}
@@ -82,44 +87,57 @@ export function VoicePicker({
               }
             }}
           >
-            <CardContent className="flex h-full flex-col gap-3 p-4">
-              <div className="space-y-1.5">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>
+            <CardContent className="flex h-full flex-col gap-4 p-5">
+              <div className="flex items-start gap-3">
+                <div className="speaker-avatar flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl text-sm font-semibold">
+                  {itemInitial(item.name)}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--text-muted)]">
                       {item.categoryLabel}
-                    </div>
-                    <div className={cn(VOICE_ROUTE_PANEL_TITLE_CLASS, "mt-1")}>
-                      {item.name}
-                    </div>
+                    </span>
+                    {item.selected ? (
+                      <div className="rounded-full border border-primary/35 bg-primary/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-primary">
+                        Selected
+                      </div>
+                    ) : null}
                   </div>
-                  {item.selected ? (
-                    <div className="rounded-full border border-primary/35 bg-primary/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-primary">
-                      Selected
+                  <div className={cn(VOICE_ROUTE_PANEL_TITLE_CLASS, "mt-2")}>
+                    {item.name}
+                  </div>
+
+                  {item.meta && item.meta.length > 0 ? (
+                    <div className="mt-3 flex flex-wrap gap-1.5">
+                      {item.meta.map((meta) => (
+                        <span
+                          key={`${item.id}-${meta}`}
+                          className="rounded-full border border-border/75 bg-muted/55 px-2.5 py-0.5 text-[11px] font-medium text-muted-foreground"
+                        >
+                          {meta}
+                        </span>
+                      ))}
                     </div>
                   ) : null}
                 </div>
-                {item.description ? (
+              </div>
+
+              {item.description ? (
+                <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-3.5">
+                  <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-2")}>
+                    Voice Notes
+                  </div>
                   <p className={cn(VOICE_ROUTE_BODY_COPY_CLASS, "line-clamp-4")}>
                     {item.description}
                   </p>
-                ) : null}
-              </div>
-
-              {item.meta && item.meta.length > 0 ? (
-                <div className="flex flex-wrap gap-1.5">
-                  {item.meta.map((meta) => (
-                    <span
-                      key={`${item.id}-${meta}`}
-                      className="rounded-full border border-border/75 bg-muted/55 px-2.5 py-0.5 text-[11px] font-medium text-muted-foreground"
-                    >
-                      {meta}
-                    </span>
-                  ))}
                 </div>
               ) : null}
 
-              <div className="mt-auto space-y-2.5">
+              <div className="mt-auto space-y-3">
+                <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-3.5">
+                  <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-2")}>
+                    Preview
+                  </div>
                 {item.previewUrl ? (
                   <audio
                     src={item.previewUrl}
@@ -129,14 +147,15 @@ export function VoicePicker({
                     className="h-10 w-full"
                   />
                 ) : item.previewMessage ? (
-                  <div className="rounded-xl border border-dashed border-border/75 bg-muted/35 px-3 py-2 text-xs text-muted-foreground">
+                  <div className="rounded-xl border border-dashed border-border/75 bg-[var(--bg-surface-0)] px-3 py-2 text-xs text-muted-foreground">
                     {item.previewMessage}
                   </div>
                 ) : null}
+                </div>
 
                 {item.actions ? (
                   <div
-                    className="flex flex-wrap items-center gap-2 pt-0.5"
+                    className="grid gap-2 sm:grid-cols-2 [&>*]:w-full [&>*]:justify-center [&>*:only-child]:sm:col-span-2"
                     onClick={(event) => event.stopPropagation()}
                   >
                     {item.actions}

@@ -690,7 +690,7 @@ export function VoicesPage({
                       ? "Load a CustomVoice, Kokoro, or LFM2 Audio model to browse built-in voices."
                       : "Try a different built-in voice model or search term."
                 }
-                className="grid-cols-[repeat(auto-fill,minmax(248px,1fr))]"
+                className="grid-cols-[repeat(auto-fill,minmax(300px,1fr))]"
               />
             </div>
           </section>
