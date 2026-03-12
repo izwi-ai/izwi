@@ -970,43 +970,28 @@ export function TextToSpeechWorkspace({
           </div>
 
           <div className="mb-4 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
-            <div className="grid gap-5 xl:grid-cols-[minmax(0,360px)_minmax(0,1fr)]">
+            <div className="grid gap-x-5 gap-y-4 xl:grid-cols-[minmax(0,360px)_minmax(0,360px)_minmax(0,1fr)_auto]">
               <div className="min-w-0">
                 <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>
                   Active Model
                 </div>
-                <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:items-start">
-                  <div className="min-w-0 flex-1">
-                    <div className="w-full max-w-[360px]">{renderModelSelector()}</div>
-                    <div
-                      className={cn(
-                        "mt-2 text-xs",
-                        selectedModelReady
-                          ? "text-[var(--text-secondary)]"
-                          : "text-amber-500",
-                      )}
-                    >
-                      {selectedOption?.statusLabel ||
-                        "Select and load a TTS model to continue"}
-                    </div>
-                  </div>
-
-                  {onOpenModelManager ? (
-                    <Button
-                      variant="outline"
-                      onClick={onOpenModelManager}
-                      className="h-11 shrink-0 rounded-xl px-4"
-                    >
-                      <Settings2 className="h-4 w-4" />
-                      Models
-                    </Button>
-                  ) : null}
+                <div className="mt-3 w-full max-w-[360px]">{renderModelSelector()}</div>
+                <div
+                  className={cn(
+                    "mt-2 text-xs",
+                    selectedModelReady
+                      ? "text-[var(--text-secondary)]"
+                      : "text-amber-500",
+                  )}
+                >
+                  {selectedOption?.statusLabel ||
+                    "Select and load a TTS model to continue"}
                 </div>
               </div>
 
               <div className="min-w-0">
                 <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>Voice</div>
-                <div className="mt-3">
+                <div className="mt-3 w-full max-w-[360px]">
                   <VoiceSelect
                     voiceMode={voiceMode}
                     onVoiceModeChange={setVoiceMode}
@@ -1019,6 +1004,7 @@ export function TextToSpeechWorkspace({
                     builtInEnabled={supportsBuiltInVoices}
                     disabled={!selectedModel}
                     modelLabel={selectedModelInfo?.variant ?? selectedModel}
+                    compact
                   />
                 </div>
                 <p className="mt-2 text-[11px] font-medium text-[var(--text-muted)]">
@@ -1026,6 +1012,19 @@ export function TextToSpeechWorkspace({
                   switching models automatically.
                 </p>
               </div>
+
+              {onOpenModelManager ? (
+                <div className="xl:col-start-4 xl:row-start-1 xl:mt-[1.8rem] xl:justify-self-end">
+                  <Button
+                    variant="outline"
+                    onClick={onOpenModelManager}
+                    className="h-11 shrink-0 rounded-xl px-4"
+                  >
+                    <Settings2 className="h-4 w-4" />
+                    Models
+                  </Button>
+                </div>
+              ) : null}
             </div>
           </div>
 
