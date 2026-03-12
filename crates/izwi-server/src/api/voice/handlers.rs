@@ -7,6 +7,7 @@ use serde::Deserialize;
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::voice_defaults::DEFAULT_VOICE_AGENT_SYSTEM_PROMPT;
+use crate::voice_observation_store::VoiceObservation;
 use crate::voice_store::{VoiceProfile, VoiceSessionDetail, VoiceSessionSummary};
 
 #[derive(Debug, Deserialize)]
@@ -21,6 +22,12 @@ pub struct UpdateVoiceProfileRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct ListVoiceSessionsQuery {
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListVoiceObservationsQuery {
     #[serde(default)]
     pub limit: Option<usize>,
 }
@@ -75,6 +82,59 @@ pub async fn list_voice_sessions(
     Ok(Json(sessions))
 }
 
+pub async fn list_voice_observations(
+    State(state): State<AppState>,
+    Query(query): Query<ListVoiceObservationsQuery>,
+) -> Result<Json<Vec<VoiceObservation>>, ApiError> {
+    let profile = state
+        .voice_store
+        .get_default_profile()
+        .await
+        .map_err(map_store_error)?;
+    let observations = state
+        .voice_observation_store
+        .list_active(profile.id, query.limit.unwrap_or(25).clamp(1, 100))
+        .await
+        .map_err(map_observation_store_error)?;
+    Ok(Json(observations))
+}
+
+pub async fn delete_voice_observation(
+    State(state): State<AppState>,
+    Path(observation_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let deleted = state
+        .voice_observation_store
+        .forget_observation(observation_id.clone())
+        .await
+        .map_err(map_observation_store_error)?;
+    if !deleted {
+        return Err(ApiError::not_found("Voice observation not found"));
+    }
+    Ok(Json(serde_json::json!({
+        "id": observation_id,
+        "deleted": true,
+    })))
+}
+
+pub async fn clear_voice_observations(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let profile = state
+        .voice_store
+        .get_default_profile()
+        .await
+        .map_err(map_store_error)?;
+    let cleared = state
+        .voice_observation_store
+        .clear_profile(profile.id)
+        .await
+        .map_err(map_observation_store_error)?;
+    Ok(Json(serde_json::json!({
+        "cleared": cleared,
+    })))
+}
+
 pub async fn get_voice_session(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -102,4 +162,8 @@ fn map_profile_response(profile: VoiceProfile) -> VoiceProfileResponse {
 
 fn map_store_error(err: anyhow::Error) -> ApiError {
     ApiError::internal(format!("Voice storage error: {err}"))
+}
+
+fn map_observation_store_error(err: anyhow::Error) -> ApiError {
+    ApiError::internal(format!("Voice memory storage error: {err}"))
 }

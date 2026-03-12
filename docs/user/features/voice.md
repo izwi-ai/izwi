@@ -85,6 +85,10 @@ Configure which models to use:
 
 Use the **Voice Agent Prompt** section in settings to customize the assistant's speaking style and behavior. Prompt changes are saved locally and apply the next time you start a voice session.
 
+### Observational Memory
+
+Use **Observational Memory** in settings to review, enable, disable, or delete the stable user memories captured from modular voice conversations. You can forget individual memories or clear them all at any time.
+
 ### Audio Settings
 
 - **Auto-detect silence** — Automatically stop recording when you stop speaking
