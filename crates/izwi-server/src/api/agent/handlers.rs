@@ -18,11 +18,9 @@ use crate::api::request_context::RequestContext;
 use crate::chat_store::ChatStore;
 use crate::error::ApiError;
 use crate::state::{AppState, StoredAgentSessionRecord};
-
-const DEFAULT_AGENT_ID: &str = "voice-agent";
-const DEFAULT_AGENT_NAME: &str = "Voice Agent";
-const DEFAULT_AGENT_SYSTEM_PROMPT: &str =
-    "You are a helpful voice assistant. Reply with concise spoken-friendly language. Avoid markdown. Do not output <think> tags or internal reasoning. Return only the final spoken answer. Keep responses brief unless asked for details.";
+use crate::voice_defaults::{
+    DEFAULT_VOICE_AGENT_ID, DEFAULT_VOICE_AGENT_NAME, DEFAULT_VOICE_AGENT_SYSTEM_PROMPT,
+};
 const DEFAULT_CHAT_MODEL: &str = "Qwen3.5-0.8B";
 
 #[derive(Debug, Deserialize)]
@@ -78,7 +76,7 @@ pub async fn create_session(
         .agent_id
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_AGENT_ID.to_string());
+        .unwrap_or_else(|| DEFAULT_VOICE_AGENT_ID.to_string());
 
     let model_id = resolve_chat_model_id(req.model_id.as_deref())?;
     let system_prompt = req
@@ -86,7 +84,7 @@ pub async fn create_session(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or(DEFAULT_AGENT_SYSTEM_PROMPT)
+        .unwrap_or(DEFAULT_VOICE_AGENT_SYSTEM_PROMPT)
         .to_string();
     let planning_mode = req.planning_mode.unwrap_or(PlanningMode::Auto);
 
@@ -150,7 +148,7 @@ pub async fn create_turn(
 
     let agent = AgentDefinition {
         id: session_record.agent_id.clone(),
-        name: DEFAULT_AGENT_NAME.to_string(),
+        name: DEFAULT_VOICE_AGENT_NAME.to_string(),
         system_prompt: session_record.system_prompt.clone(),
         default_model: session_record.model_id.clone(),
         capabilities: Default::default(),

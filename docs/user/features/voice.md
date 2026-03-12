@@ -81,6 +81,10 @@ Configure which models to use:
 - **TTS Model** — For speech synthesis
 - **Chat Model** — For response generation
 
+### Voice Agent Prompt
+
+Use the **Voice Agent Prompt** section in settings to customize the assistant's speaking style and behavior. Prompt changes are saved locally and apply the next time you start a voice session.
+
 ### Audio Settings
 
 - **Auto-detect silence** — Automatically stop recording when you stop speaking

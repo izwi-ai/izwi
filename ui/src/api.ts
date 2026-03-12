@@ -82,3 +82,8 @@ export type {
   ResponsesObject,
   ResponsesStreamCallbacks,
 } from "@/shared/api/chat";
+
+export type {
+  VoiceProfile,
+  VoiceProfileUpdateRequest,
+} from "@/shared/api/voice";

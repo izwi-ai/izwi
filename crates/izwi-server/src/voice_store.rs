@@ -936,4 +936,34 @@ mod tests {
         std::env::remove_var("IZWI_DB_PATH");
         std::env::remove_var("IZWI_MEDIA_DIR");
     }
+
+    #[tokio::test]
+    async fn updates_default_profile_prompt() {
+        let _guard = env_lock();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("voice-profile.sqlite3");
+        let media_dir = temp_dir.path().join("media");
+        std::env::set_var("IZWI_DB_PATH", &db_path);
+        std::env::set_var("IZWI_MEDIA_DIR", &media_dir);
+
+        let store = VoiceStore::initialize().expect("store");
+        let updated = store
+            .update_default_profile(
+                None,
+                Some("Keep answers ultra concise.".to_string()),
+                Some(false),
+            )
+            .await
+            .expect("profile update");
+
+        assert_eq!(updated.system_prompt, "Keep answers ultra concise.");
+        assert!(!updated.observational_memory_enabled);
+
+        let fetched = store.get_default_profile().await.expect("profile");
+        assert_eq!(fetched.system_prompt, "Keep answers ultra concise.");
+        assert!(!fetched.observational_memory_enabled);
+
+        std::env::remove_var("IZWI_DB_PATH");
+        std::env::remove_var("IZWI_MEDIA_DIR");
+    }
 }

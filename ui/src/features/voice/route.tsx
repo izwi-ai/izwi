@@ -19,6 +19,7 @@ import { api, type ModelInfo } from "@/api";
 import { PageShell } from "@/components/PageShell";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
+import { Textarea } from "@/components/ui/textarea";
 import {
   ENABLE_LEGACY_LOCAL_UNIFIED_PATH,
   MODULAR_STACK_VARIANTS,
@@ -108,6 +109,17 @@ export function VoicePage({
     );
     return Number.isFinite(raw) ? clampPlaybackSpeed(raw) : 1;
   });
+  const [savedSystemPrompt, setSavedSystemPrompt] = useState(
+    VOICE_AGENT_SYSTEM_PROMPT,
+  );
+  const [systemPromptDraft, setSystemPromptDraft] = useState(
+    VOICE_AGENT_SYSTEM_PROMPT,
+  );
+  const [defaultSystemPrompt, setDefaultSystemPrompt] = useState(
+    VOICE_AGENT_SYSTEM_PROMPT,
+  );
+  const [isVoiceProfileLoading, setIsVoiceProfileLoading] = useState(true);
+  const [isVoiceProfileSaving, setIsVoiceProfileSaving] = useState(false);
 
   const streamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -251,6 +263,12 @@ export function VoicePage({
   );
   const lfm2DirectMode = pipelineMode === "s2s";
   const currentPipelineLabel = PIPELINE_LABELS[pipelineMode];
+  const activeVoiceSystemPrompt =
+    savedSystemPrompt.trim() ||
+    defaultSystemPrompt.trim() ||
+    VOICE_AGENT_SYSTEM_PROMPT;
+  const isSystemPromptDirty =
+    systemPromptDraft.trim() !== activeVoiceSystemPrompt.trim();
 
   useEffect(() => {
     if (!assistantSpeakers.some((speaker) => speaker.id === selectedSpeaker)) {
@@ -261,6 +279,43 @@ export function VoicePage({
   useEffect(() => {
     runtimeStatusRef.current = runtimeStatus;
   }, [runtimeStatus]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadVoiceProfile = async () => {
+      try {
+        const profile = await api.getVoiceProfile();
+        if (cancelled) return;
+
+        setSavedSystemPrompt(profile.system_prompt || VOICE_AGENT_SYSTEM_PROMPT);
+        setSystemPromptDraft(
+          profile.system_prompt || profile.default_system_prompt,
+        );
+        setDefaultSystemPrompt(
+          profile.default_system_prompt || VOICE_AGENT_SYSTEM_PROMPT,
+        );
+      } catch (err) {
+        if (cancelled) return;
+        const message =
+          err instanceof Error
+            ? err.message
+            : "Failed to load voice profile settings";
+        setError(message);
+        onError?.(message);
+      } finally {
+        if (!cancelled) {
+          setIsVoiceProfileLoading(false);
+        }
+      }
+    };
+
+    void loadVoiceProfile();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [onError]);
 
   useEffect(() => {
     playbackSpeedRef.current = playbackSpeed;
@@ -634,6 +689,7 @@ export function VoicePage({
   const stopSession = useCallback(() => {
     isSessionActiveRef.current = false;
     turnIdRef.current += 1;
+    agentSessionIdRef.current = null;
     processingRef.current = false;
     silenceMsRef.current = 0;
     speechStartRef.current = null;
@@ -1169,7 +1225,7 @@ export function VoicePage({
             ws.send(
               JSON.stringify({
                 type: "session_start",
-                system_prompt: VOICE_AGENT_SYSTEM_PROMPT,
+                system_prompt: activeVoiceSystemPrompt,
               } satisfies VoiceRealtimeClientMessage),
             );
           } catch (error) {
@@ -1270,6 +1326,7 @@ export function VoicePage({
         }
       }
     }, [
+      activeVoiceSystemPrompt,
       handleVoiceRealtimeAssistantAudioBinaryChunk,
       handleVoiceRealtimeServerEvent,
       onError,
@@ -1437,14 +1494,40 @@ export function VoicePage({
     const session = await api.createAgentSession({
       agent_id: "voice-agent",
       model_id: modelId,
-      system_prompt: VOICE_AGENT_SYSTEM_PROMPT,
+      system_prompt: activeVoiceSystemPrompt,
       planning_mode: "auto",
       title: "Voice Session",
     });
 
     agentSessionIdRef.current = session.id;
     return session.id;
-  }, []);
+  }, [activeVoiceSystemPrompt]);
+
+  const handleSaveSystemPrompt = useCallback(async () => {
+    const nextPrompt =
+      systemPromptDraft.trim() ||
+      defaultSystemPrompt.trim() ||
+      VOICE_AGENT_SYSTEM_PROMPT;
+
+    try {
+      setIsVoiceProfileSaving(true);
+      const profile = await api.updateVoiceProfile({
+        system_prompt: nextPrompt,
+      });
+      setSavedSystemPrompt(profile.system_prompt || nextPrompt);
+      setSystemPromptDraft(profile.system_prompt || nextPrompt);
+      setDefaultSystemPrompt(
+        profile.default_system_prompt || defaultSystemPrompt,
+      );
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Failed to save system prompt";
+      setError(message);
+      onError?.(message);
+    } finally {
+      setIsVoiceProfileSaving(false);
+    }
+  }, [defaultSystemPrompt, onError, systemPromptDraft]);
 
   const streamAssistantResponse = useCallback(
     (userText: string, modelId: string): Promise<string> =>
@@ -2657,6 +2740,71 @@ export function VoicePage({
                   <div className="text-[11px] text-[var(--text-muted)]">
                     Current mode: {currentPipelineLabel}
                   </div>
+                </section>
+
+                <section className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3 space-y-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <h3 className="text-sm font-medium text-white">
+                        Voice Agent Prompt
+                      </h3>
+                      <p className="text-xs text-[var(--text-muted)] mt-1">
+                        Customize how the assistant responds in voice mode.
+                        Prompt updates apply the next time you start a voice
+                        session.
+                      </p>
+                    </div>
+                    {runtimeStatus !== "idle" && (
+                      <span className="text-[11px] rounded-full border border-amber-500/30 bg-amber-500/10 px-2.5 py-1 text-amber-200">
+                        Restart required
+                      </span>
+                    )}
+                  </div>
+
+                  {isVoiceProfileLoading ? (
+                    <p className="text-xs text-[var(--text-muted)]">
+                      Loading saved prompt...
+                    </p>
+                  ) : (
+                    <>
+                      <Textarea
+                        value={systemPromptDraft}
+                        onChange={(event) =>
+                          setSystemPromptDraft(event.target.value)
+                        }
+                        placeholder={defaultSystemPrompt}
+                        className="min-h-[140px] bg-[var(--bg-surface-2)] border-[var(--border-muted)]"
+                      />
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <p className="text-[11px] text-[var(--text-muted)]">
+                          Saved prompt is used for websocket `session_start` and
+                          the legacy agent-session fallback path.
+                        </p>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() =>
+                              setSystemPromptDraft(defaultSystemPrompt)
+                            }
+                            disabled={
+                              isVoiceProfileSaving ||
+                              systemPromptDraft === defaultSystemPrompt
+                            }
+                          >
+                            Restore Default
+                          </Button>
+                          <Button
+                            size="sm"
+                            onClick={() => void handleSaveSystemPrompt()}
+                            disabled={isVoiceProfileSaving || !isSystemPromptDirty}
+                          >
+                            {isVoiceProfileSaving ? "Saving..." : "Save Prompt"}
+                          </Button>
+                        </div>
+                      </div>
+                    </>
+                  )}
                 </section>
 
                 <section className="space-y-3">
