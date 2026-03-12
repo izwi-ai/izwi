@@ -15,10 +15,11 @@ import {
 } from "lucide-react";
 import clsx from "clsx";
 import { cn } from "@/lib/utils";
-import { api, type ModelInfo } from "@/api";
+import { api, type ModelInfo, type VoiceObservation } from "@/api";
 import { PageShell } from "@/components/PageShell";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
+import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import {
   ENABLE_LEGACY_LOCAL_UNIFIED_PATH,
@@ -120,6 +121,15 @@ export function VoicePage({
   );
   const [isVoiceProfileLoading, setIsVoiceProfileLoading] = useState(true);
   const [isVoiceProfileSaving, setIsVoiceProfileSaving] = useState(false);
+  const [observationalMemoryEnabled, setObservationalMemoryEnabled] =
+    useState(true);
+  const [voiceObservations, setVoiceObservations] = useState<VoiceObservation[]>(
+    [],
+  );
+  const [isVoiceObservationsLoading, setIsVoiceObservationsLoading] =
+    useState(false);
+  const [isVoiceObservationsMutating, setIsVoiceObservationsMutating] =
+    useState(false);
 
   const streamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -295,6 +305,9 @@ export function VoicePage({
         setDefaultSystemPrompt(
           profile.default_system_prompt || VOICE_AGENT_SYSTEM_PROMPT,
         );
+        setObservationalMemoryEnabled(
+          profile.observational_memory_enabled ?? true,
+        );
       } catch (err) {
         if (cancelled) return;
         const message =
@@ -316,6 +329,28 @@ export function VoicePage({
       cancelled = true;
     };
   }, [onError]);
+
+  const loadVoiceObservations = useCallback(async () => {
+    try {
+      setIsVoiceObservationsLoading(true);
+      const observations = await api.listVoiceObservations(25);
+      setVoiceObservations(observations);
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : "Failed to load observational memory";
+      setError(message);
+      onError?.(message);
+    } finally {
+      setIsVoiceObservationsLoading(false);
+    }
+  }, [onError]);
+
+  useEffect(() => {
+    if (!isConfigOpen) return;
+    void loadVoiceObservations();
+  }, [isConfigOpen, loadVoiceObservations]);
 
   useEffect(() => {
     playbackSpeedRef.current = playbackSpeed;
@@ -1528,6 +1563,69 @@ export function VoicePage({
       setIsVoiceProfileSaving(false);
     }
   }, [defaultSystemPrompt, onError, systemPromptDraft]);
+
+  const handleSetObservationalMemoryEnabled = useCallback(
+    async (nextValue: boolean) => {
+      try {
+        setIsVoiceObservationsMutating(true);
+        const profile = await api.updateVoiceProfile({
+          observational_memory_enabled: nextValue,
+        });
+        setObservationalMemoryEnabled(
+          profile.observational_memory_enabled ?? nextValue,
+        );
+      } catch (err) {
+        const message =
+          err instanceof Error
+            ? err.message
+            : "Failed to update observational memory";
+        setError(message);
+        onError?.(message);
+      } finally {
+        setIsVoiceObservationsMutating(false);
+      }
+    },
+    [onError],
+  );
+
+  const handleForgetObservation = useCallback(
+    async (observationId: string) => {
+      try {
+        setIsVoiceObservationsMutating(true);
+        await api.deleteVoiceObservation(observationId);
+        setVoiceObservations((current) =>
+          current.filter((item) => item.id !== observationId),
+        );
+      } catch (err) {
+        const message =
+          err instanceof Error
+            ? err.message
+            : "Failed to forget voice memory";
+        setError(message);
+        onError?.(message);
+      } finally {
+        setIsVoiceObservationsMutating(false);
+      }
+    },
+    [onError],
+  );
+
+  const handleClearObservations = useCallback(async () => {
+    try {
+      setIsVoiceObservationsMutating(true);
+      await api.clearVoiceObservations();
+      setVoiceObservations([]);
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : "Failed to clear voice memories";
+      setError(message);
+      onError?.(message);
+    } finally {
+      setIsVoiceObservationsMutating(false);
+    }
+  }, [onError]);
 
   const streamAssistantResponse = useCallback(
     (userText: string, modelId: string): Promise<string> =>
@@ -2805,6 +2903,110 @@ export function VoicePage({
                       </div>
                     </>
                   )}
+                </section>
+
+                <section className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3 space-y-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <h3 className="text-sm font-medium text-white">
+                        Observational Memory
+                      </h3>
+                      <p className="text-xs text-[var(--text-muted)] mt-1">
+                        Save stable user preferences and facts from modular
+                        voice turns so future responses can stay grounded.
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <span className="text-[11px] text-[var(--text-muted)]">
+                        {observationalMemoryEnabled ? "Enabled" : "Disabled"}
+                      </span>
+                      <Switch
+                        checked={observationalMemoryEnabled}
+                        onCheckedChange={(checked) => {
+                          void handleSetObservationalMemoryEnabled(checked);
+                        }}
+                        disabled={isVoiceObservationsMutating}
+                        aria-label="Toggle observational memory"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <p className="text-[11px] text-[var(--text-muted)]">
+                      Memory is currently applied only to modular `/voice`
+                      conversations and can be reviewed or deleted here.
+                    </p>
+                    <div className="flex items-center gap-2">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => void loadVoiceObservations()}
+                        disabled={isVoiceObservationsLoading}
+                      >
+                        Refresh
+                      </Button>
+                      <Button
+                        variant="destructive"
+                        size="sm"
+                        onClick={() => void handleClearObservations()}
+                        disabled={
+                          isVoiceObservationsMutating ||
+                          voiceObservations.length === 0
+                        }
+                      >
+                        Clear All
+                      </Button>
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    {isVoiceObservationsLoading ? (
+                      <p className="text-xs text-[var(--text-muted)]">
+                        Loading voice memories...
+                      </p>
+                    ) : voiceObservations.length === 0 ? (
+                      <p className="text-xs text-[var(--text-muted)]">
+                        No voice memories stored yet.
+                      </p>
+                    ) : (
+                      voiceObservations.map((observation) => (
+                        <div
+                          key={observation.id}
+                          className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-3 py-2.5"
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className="text-[10px] uppercase tracking-wide text-[var(--text-muted)]">
+                                  {observation.category}
+                                </span>
+                                <span className="text-[10px] text-[var(--text-muted)]">
+                                  confidence {observation.confidence.toFixed(2)}
+                                </span>
+                                <span className="text-[10px] text-[var(--text-muted)]">
+                                  seen {observation.times_seen}x
+                                </span>
+                              </div>
+                              <p className="mt-1 text-sm text-[var(--text-primary)]">
+                                {observation.summary}
+                              </p>
+                            </div>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="shrink-0"
+                              onClick={() =>
+                                void handleForgetObservation(observation.id)
+                              }
+                              disabled={isVoiceObservationsMutating}
+                            >
+                              Forget
+                            </Button>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
                 </section>
 
                 <section className="space-y-3">

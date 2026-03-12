@@ -36,6 +36,7 @@ use crate::state::{AppState, StoredAgentSessionRecord};
 use crate::voice_defaults::{
     DEFAULT_VOICE_AGENT_ID, DEFAULT_VOICE_AGENT_NAME, DEFAULT_VOICE_AGENT_SYSTEM_PROMPT,
 };
+use crate::voice_memory::extract_observation_candidates;
 use crate::voice_store::CreateVoiceTurnRequest;
 const DEFAULT_CHAT_MODEL: &str = "Qwen3.5-0.8B";
 const MAX_UTTERANCE_BYTES: usize = 16 * 1024 * 1024;
@@ -487,11 +488,12 @@ async fn finalize_stream_vad_utterance(
         .voice_session_id
         .clone()
         .ok_or_else(|| "Voice session not initialized".to_string())?;
+    let voice_profile_id = conn.voice_profile_id.clone();
     let model_ids = commit.turn_config.model_ids();
     let turn_record = state
         .voice_store
         .create_turn(CreateVoiceTurnRequest {
-            session_id: voice_session_id,
+            session_id: voice_session_id.clone(),
             utterance_id: commit.utterance_id.clone(),
             utterance_seq: commit.utterance_seq,
             mode: commit.turn_config.mode_str().to_string(),
@@ -526,6 +528,8 @@ async fn finalize_stream_vad_utterance(
         commit.clone(),
         wav_bytes,
         agent_session_id,
+        voice_session_id,
+        voice_profile_id,
         turn_record.id.clone(),
     );
 
@@ -1005,6 +1009,8 @@ fn spawn_turn_task(
     commit: PendingAudioCommit,
     audio_bytes: Vec<u8>,
     agent_session_id: Option<String>,
+    voice_session_id: String,
+    voice_profile_id: Option<String>,
     turn_record_id: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -1129,6 +1135,7 @@ fn spawn_turn_task(
                         &user_text,
                         &config.text_model_id,
                         config.max_output_tokens,
+                        voice_profile_id.as_deref(),
                         &correlation_id,
                     )
                     .await?;
@@ -1188,6 +1195,16 @@ fn spawn_turn_task(
                         .complete_turn(turn_record_id.clone(), "ok", None)
                         .await
                         .map_err(|err| format!("Voice storage error: {err}"))?;
+                    maybe_spawn_observation_extraction(
+                        state.clone(),
+                        voice_profile_id.clone(),
+                        voice_session_id.clone(),
+                        turn_record_id.clone(),
+                        config.text_model_id.clone(),
+                        correlation_id.clone(),
+                        user_text.clone(),
+                        assistant_text.clone(),
+                    );
 
                     send_json(
                         &out_tx,
@@ -1623,6 +1640,7 @@ async fn run_agent_turn(
     input: &str,
     model_id: &str,
     max_output_tokens: usize,
+    voice_profile_id: Option<&str>,
     correlation_id: &str,
 ) -> Result<String, String> {
     let session_record = {
@@ -1651,7 +1669,25 @@ async fn run_agent_turn(
         updated_at: session_record.updated_at,
     };
 
-    let memory = ChatStoreMemory::new(state.chat_store.clone());
+    let memory_context = if let Some(profile_id) = voice_profile_id {
+        match state
+            .voice_store
+            .get_profile(profile_id.to_string())
+            .await
+            .map_err(|err| format!("Voice storage error: {err}"))?
+        {
+            Some(profile) if profile.observational_memory_enabled => state
+                .voice_observation_store
+                .build_context(profile.id, 8)
+                .await
+                .map_err(|err| format!("Voice memory storage error: {err}"))?,
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let memory = VoiceContextMemoryStore::new(state.chat_store.clone(), memory_context);
     let backend = IzwiRuntimeBackend {
         runtime: state.runtime.clone(),
         correlation_id: correlation_id.to_string(),
@@ -1689,6 +1725,71 @@ async fn run_agent_turn(
         .await;
 
     Ok(result.assistant_text)
+}
+
+fn maybe_spawn_observation_extraction(
+    state: AppState,
+    voice_profile_id: Option<String>,
+    _voice_session_id: String,
+    turn_record_id: String,
+    model_id: String,
+    correlation_id: String,
+    user_text: String,
+    assistant_text: String,
+) {
+    let Some(profile_id) = voice_profile_id else {
+        return;
+    };
+    if user_text.trim().is_empty() {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let profile = match state.voice_store.get_profile(profile_id.clone()).await {
+            Ok(Some(profile)) => profile,
+            Ok(None) => return,
+            Err(err) => {
+                warn!("failed to load voice profile for memory extraction: {err}");
+                return;
+            }
+        };
+        if !profile.observational_memory_enabled {
+            return;
+        }
+
+        let candidates = match extract_observation_candidates(
+            &state,
+            model_id.as_str(),
+            correlation_id.as_str(),
+            user_text.as_str(),
+            assistant_text.as_str(),
+        )
+        .await
+        {
+            Ok(candidates) => candidates,
+            Err(err) => {
+                warn!("observation extraction failed: {err}");
+                return;
+            }
+        };
+        if candidates.is_empty() {
+            return;
+        }
+
+        if let Err(err) = state
+            .voice_observation_store
+            .upsert_candidates(
+                profile.id,
+                Some(turn_record_id),
+                Some(user_text),
+                Some(assistant_text),
+                candidates,
+            )
+            .await
+        {
+            warn!("failed to persist extracted voice observations: {err}");
+        }
+    });
 }
 
 fn resolve_chat_model_id(raw: Option<&str>) -> Result<String, String> {
@@ -1760,18 +1861,22 @@ fn strip_think_tags(input: &str) -> String {
     out.trim().to_string()
 }
 
-struct ChatStoreMemory {
+struct VoiceContextMemoryStore {
     chat_store: Arc<ChatStore>,
+    memory_context: Option<String>,
 }
 
-impl ChatStoreMemory {
-    fn new(chat_store: Arc<ChatStore>) -> Self {
-        Self { chat_store }
+impl VoiceContextMemoryStore {
+    fn new(chat_store: Arc<ChatStore>, memory_context: Option<String>) -> Self {
+        Self {
+            chat_store,
+            memory_context,
+        }
     }
 }
 
 #[async_trait::async_trait]
-impl MemoryStore for ChatStoreMemory {
+impl MemoryStore for VoiceContextMemoryStore {
     async fn load_messages(&self, thread_id: &str) -> izwi_agent::Result<Vec<MemoryMessage>> {
         let records = self
             .chat_store
@@ -1779,7 +1884,14 @@ impl MemoryStore for ChatStoreMemory {
             .await
             .map_err(|err| izwi_agent::AgentError::Memory(err.to_string()))?;
 
-        let mut out = Vec::with_capacity(records.len());
+        let mut out =
+            Vec::with_capacity(records.len() + usize::from(self.memory_context.is_some()));
+        if let Some(memory_context) = self.memory_context.clone() {
+            out.push(MemoryMessage {
+                role: MemoryMessageRole::System,
+                content: memory_context,
+            });
+        }
         for record in records {
             let role = match record.role.as_str() {
                 "system" => MemoryMessageRole::System,

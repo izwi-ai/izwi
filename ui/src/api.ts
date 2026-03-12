@@ -84,6 +84,7 @@ export type {
 } from "@/shared/api/chat";
 
 export type {
+  VoiceObservation,
   VoiceProfile,
   VoiceProfileUpdateRequest,
 } from "@/shared/api/voice";

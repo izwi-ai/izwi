@@ -101,7 +101,13 @@ const chatMethodNames = [
   "deleteResponse",
 ] as const;
 
-const voiceMethodNames = ["getVoiceProfile", "updateVoiceProfile"] as const;
+const voiceMethodNames = [
+  "getVoiceProfile",
+  "updateVoiceProfile",
+  "listVoiceObservations",
+  "deleteVoiceObservation",
+  "clearVoiceObservations",
+] as const;
 
 function bindMethods<T extends object, K extends readonly (keyof T)[]>(
   instance: T,

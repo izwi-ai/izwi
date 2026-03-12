@@ -158,11 +158,18 @@ impl VoiceStore {
     }
 
     pub async fn get_default_profile(&self) -> anyhow::Result<VoiceProfile> {
+        self.get_profile(DEFAULT_VOICE_PROFILE_ID.to_string())
+            .await?
+            .ok_or_else(|| anyhow!("Default voice profile not found"))
+    }
+
+    pub async fn get_profile(&self, profile_id: String) -> anyhow::Result<Option<VoiceProfile>> {
         self.run_blocking(move |db_path| {
             let conn = storage_layout::open_sqlite_connection(&db_path)?;
             ensure_default_profile(&conn)?;
-            conn.query_row(
-                r#"
+            let profile = conn
+                .query_row(
+                    r#"
                 SELECT
                     id,
                     name,
@@ -173,10 +180,11 @@ impl VoiceStore {
                 FROM voice_profiles
                 WHERE id = ?1
                 "#,
-                params![DEFAULT_VOICE_PROFILE_ID],
-                map_voice_profile,
-            )
-            .context("Default voice profile not found")
+                    params![profile_id],
+                    map_voice_profile,
+                )
+                .optional()?;
+            Ok(profile)
         })
         .await
     }
