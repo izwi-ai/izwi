@@ -31,6 +31,11 @@ import { VoiceSelect } from "@/components/VoiceSelect";
 import { RouteModelSelect } from "@/components/RouteModelSelect";
 import { GenerationStats } from "@/components/GenerationStats";
 import { TextToSpeechProjectsWorkspace } from "@/components/TextToSpeechProjectsWorkspace";
+import {
+  VOICE_ROUTE_SECTION_LABEL_CLASS,
+  VOICE_ROUTE_WORKSPACE_DESCRIPTION_CLASS,
+  VOICE_ROUTE_WORKSPACE_TITLE_CLASS,
+} from "@/components/voiceRouteTypography";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
@@ -909,10 +914,10 @@ export function TextToSpeechWorkspace({
                 <Waves className="h-5 w-5 text-[var(--text-muted)]" />
               </div>
               <div>
-                <h2 className="text-sm font-medium text-[var(--text-primary)]">
+                <h2 className={VOICE_ROUTE_WORKSPACE_TITLE_CLASS}>
                   TTS Projects
                 </h2>
-                <p className="mt-0.5 text-xs text-[var(--text-muted)]">
+                <p className={VOICE_ROUTE_WORKSPACE_DESCRIPTION_CLASS}>
                   Import scripts, render segments, and export merged narration.
                 </p>
               </div>
@@ -949,10 +954,10 @@ export function TextToSpeechWorkspace({
                 <Mic2 className="h-5 w-5 text-[var(--text-muted)]" />
               </div>
               <div>
-                <h2 className="text-sm font-medium text-[var(--text-primary)]">
+                <h2 className={VOICE_ROUTE_WORKSPACE_TITLE_CLASS}>
                   Text to Speech
                 </h2>
-                <p className="mt-0.5 text-xs text-[var(--text-muted)]">
+                <p className={VOICE_ROUTE_WORKSPACE_DESCRIPTION_CLASS}>
                   Choose a model, then a compatible voice, then render.
                 </p>
               </div>
@@ -962,64 +967,67 @@ export function TextToSpeechWorkspace({
           </div>
 
           <div className="mb-4 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
-            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--text-subtle)]">
-              Active Model
-            </div>
+            <div className="grid gap-5 xl:grid-cols-[minmax(0,360px)_minmax(0,1fr)]">
+              <div className="min-w-0">
+                <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>
+                  Active Model
+                </div>
+                <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:items-start">
+                  <div className="min-w-0 flex-1">
+                    <div className="w-full max-w-[360px]">{renderModelSelector()}</div>
+                    <div
+                      className={cn(
+                        "mt-2 text-xs",
+                        selectedModelReady
+                          ? "text-[var(--text-secondary)]"
+                          : "text-amber-500",
+                      )}
+                    >
+                      {selectedOption?.statusLabel ||
+                        "Select and load a TTS model to continue"}
+                    </div>
+                  </div>
 
-            <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-              <div className="min-w-0 flex-1">
-                <div className="w-full max-w-[360px]">{renderModelSelector()}</div>
-                <div
-                  className={cn(
-                    "mt-2 text-xs",
-                    selectedModelReady
-                      ? "text-[var(--text-secondary)]"
-                      : "text-amber-500",
-                  )}
-                >
-                  {selectedOption?.statusLabel ||
-                    "Select and load a TTS model to continue"}
+                  {onOpenModelManager ? (
+                    <Button
+                      variant="outline"
+                      onClick={onOpenModelManager}
+                      className="h-11 shrink-0 rounded-xl px-4"
+                    >
+                      <Settings2 className="h-4 w-4" />
+                      Models
+                    </Button>
+                  ) : null}
                 </div>
               </div>
 
-              {onOpenModelManager ? (
-                <Button
-                  variant="outline"
-                  onClick={onOpenModelManager}
-                  className="h-11 shrink-0 rounded-xl px-4"
-                >
-                  <Settings2 className="h-4 w-4" />
-                  Models
-                </Button>
-              ) : null}
-            </div>
-          </div>
-
-          <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_420px]">
-            <div className="space-y-6">
-              <div>
-                <label className="mb-2 block text-xs font-semibold uppercase tracking-wide text-[var(--text-primary)]">
-                  Voice
-                </label>
-                <VoiceSelect
-                  voiceMode={voiceMode}
-                  onVoiceModeChange={setVoiceMode}
-                  savedVoiceItems={savedVoiceItems}
-                  builtInVoiceItems={builtInVoiceItems}
-                  selectedItem={selectedVoiceItem}
-                  savedVoicesLoading={savedVoicesLoading}
-                  savedVoicesError={savedVoicesError}
-                  savedEnabled={supportsReferenceVoices}
-                  builtInEnabled={supportsBuiltInVoices}
-                  disabled={!selectedModel}
-                  modelLabel={selectedModelInfo?.variant ?? selectedModel}
-                />
+              <div className="min-w-0">
+                <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>Voice</div>
+                <div className="mt-3">
+                  <VoiceSelect
+                    voiceMode={voiceMode}
+                    onVoiceModeChange={setVoiceMode}
+                    savedVoiceItems={savedVoiceItems}
+                    builtInVoiceItems={builtInVoiceItems}
+                    selectedItem={selectedVoiceItem}
+                    savedVoicesLoading={savedVoicesLoading}
+                    savedVoicesError={savedVoicesError}
+                    savedEnabled={supportsReferenceVoices}
+                    builtInEnabled={supportsBuiltInVoices}
+                    disabled={!selectedModel}
+                    modelLabel={selectedModelInfo?.variant ?? selectedModel}
+                  />
+                </div>
                 <p className="mt-2 text-[11px] font-medium text-[var(--text-muted)]">
                   Voice availability follows the selected model instead of
                   switching models automatically.
                 </p>
               </div>
+            </div>
+          </div>
 
+          <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_420px]">
+            <div className="space-y-6">
               <div>
                 <label className="mb-2 block text-xs font-semibold uppercase tracking-wide text-[var(--text-primary)]">
                   Script

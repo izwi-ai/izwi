@@ -12,6 +12,10 @@ import type { ModelInfo, SavedVoiceSummary } from "@/api";
 import { api } from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import { VoicePicker, type VoicePickerItem } from "@/components/VoicePicker";
+import {
+  VOICE_ROUTE_WORKSPACE_DESCRIPTION_CLASS,
+  VOICE_ROUTE_WORKSPACE_TITLE_CLASS,
+} from "@/components/voiceRouteTypography";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -425,10 +429,10 @@ export function VoicesPage({
               <Library className="h-5 w-5 text-[var(--text-muted)]" />
             </div>
             <div>
-              <h2 className="text-sm font-medium text-[var(--text-primary)]">
+              <h2 className={VOICE_ROUTE_WORKSPACE_TITLE_CLASS}>
                 Voice browser
               </h2>
-              <p className="mt-0.5 text-xs text-[var(--text-muted)]">
+              <p className={VOICE_ROUTE_WORKSPACE_DESCRIPTION_CLASS}>
                 Reusable saved voices stay ready for TTS. Built-in speakers come
                 from the active model.
               </p>

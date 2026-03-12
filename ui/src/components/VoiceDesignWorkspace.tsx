@@ -15,6 +15,11 @@ import {
 } from "lucide-react";
 import clsx from "clsx";
 import { api, type SpeechHistoryRecord, type TTSGenerationStats } from "../api";
+import {
+  VOICE_ROUTE_SECTION_LABEL_CLASS,
+  VOICE_ROUTE_WORKSPACE_DESCRIPTION_CLASS,
+  VOICE_ROUTE_WORKSPACE_TITLE_CLASS,
+} from "@/components/voiceRouteTypography";
 import { LANGUAGES, VOICE_DESIGN_PRESETS } from "../types";
 import { GenerationStats } from "./GenerationStats";
 import { SpeechHistoryPanel } from "./SpeechHistoryPanel";
@@ -419,9 +424,13 @@ export function VoiceDesignWorkspace({
                 <Wand2 className="w-5 h-5 text-[var(--text-muted)]" />
               </div>
               <div>
-                <h2 className="text-sm font-medium text-[var(--text-primary)]">
+                <h2 className={VOICE_ROUTE_WORKSPACE_TITLE_CLASS}>
                   Voice Design
                 </h2>
+                <p className={VOICE_ROUTE_WORKSPACE_DESCRIPTION_CLASS}>
+                  Describe a voice, compare nearby candidates, and save the
+                  best option for TTS reuse.
+                </p>
               </div>
             </div>
 
@@ -478,7 +487,7 @@ export function VoiceDesignWorkspace({
           <div className="mb-4 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
             <div className="flex items-start justify-between gap-4">
               <div className="min-w-0 flex-1">
-                <div className="text-[11px] text-[var(--text-subtle)] uppercase tracking-wide">
+                <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>
                   Active Model
                 </div>
                 {modelOptions.length > 0 && (

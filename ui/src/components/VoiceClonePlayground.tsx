@@ -15,6 +15,11 @@ import {
   Settings2,
 } from "lucide-react";
 import { api, type SpeechHistoryRecord, type TTSGenerationStats } from "../api";
+import {
+  VOICE_ROUTE_SECTION_LABEL_CLASS,
+  VOICE_ROUTE_WORKSPACE_DESCRIPTION_CLASS,
+  VOICE_ROUTE_WORKSPACE_TITLE_CLASS,
+} from "@/components/voiceRouteTypography";
 import { VoiceClone, type VoiceCloneReferenceState } from "./VoiceClone";
 import { LANGUAGES } from "../types";
 import clsx from "clsx";
@@ -349,9 +354,13 @@ export function VoiceClonePlayground({
                 <Users className="w-5 h-5 text-[var(--text-primary)]" />
               </div>
               <div>
-                <h2 className="text-base font-semibold text-[var(--text-primary)]">
+                <h2 className={VOICE_ROUTE_WORKSPACE_TITLE_CLASS}>
                   Voice Cloning
                 </h2>
+                <p className={VOICE_ROUTE_WORKSPACE_DESCRIPTION_CLASS}>
+                  Prepare a reference, confirm quality, and audition a reusable
+                  cloned voice before sending it to TTS.
+                </p>
               </div>
             </div>
 
@@ -409,7 +418,7 @@ export function VoiceClonePlayground({
           <div className="mb-6 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 sm:p-5">
             <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
               <div className="min-w-0 flex-1">
-                <div className="text-[11px] font-semibold text-[var(--text-subtle)] uppercase tracking-wider mb-2.5">
+                <div className={clsx(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-2.5")}>
                   Active Model
                 </div>
                 {modelOptions.length > 0 && <div>{renderModelSelector()}</div>}
