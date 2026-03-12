@@ -3232,10 +3232,13 @@ export function VoicePage({
             {currentPipelineLabel}
           </span>
         </div>
-        <button
+        <Button
           onClick={() => setIsOutputMuted((current) => !current)}
-          className="btn btn-secondary h-8 w-8 rounded-full p-0"
+          variant="outline"
+          size="sm"
+          className="h-8 rounded-full border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-3 text-[11px] font-medium text-[var(--text-primary)] hover:bg-[var(--bg-surface-3)]"
           aria-label={isOutputMuted ? "Unmute assistant audio" : "Mute assistant audio"}
+          aria-pressed={isOutputMuted}
           title={isOutputMuted ? "Unmute assistant audio (M)" : "Mute assistant audio (M)"}
         >
           {isOutputMuted ? (
@@ -3243,7 +3246,8 @@ export function VoicePage({
           ) : (
             <Volume2 className="w-3.5 h-3.5" />
           )}
-        </button>
+          <span>{isOutputMuted ? "Muted" : "Audio"}</span>
+        </Button>
         <button
           onClick={() => openConfig("setup")}
           className="btn btn-secondary h-8 px-3 rounded-full text-[11px] gap-1.5"
