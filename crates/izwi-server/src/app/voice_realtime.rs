@@ -33,11 +33,10 @@ use tracing::{debug, warn};
 
 use crate::chat_store::ChatStore;
 use crate::state::{AppState, StoredAgentSessionRecord};
-
-const DEFAULT_AGENT_ID: &str = "voice-agent";
-const DEFAULT_AGENT_NAME: &str = "Voice Agent";
-const DEFAULT_AGENT_SYSTEM_PROMPT: &str =
-    "You are a helpful voice assistant. Reply with concise spoken-friendly language. Avoid markdown. Do not output <think> tags or internal reasoning. Return only the final spoken answer. Keep responses brief unless asked for details.";
+use crate::voice_defaults::{
+    DEFAULT_VOICE_AGENT_ID, DEFAULT_VOICE_AGENT_NAME, DEFAULT_VOICE_AGENT_SYSTEM_PROMPT,
+};
+use crate::voice_store::CreateVoiceTurnRequest;
 const DEFAULT_CHAT_MODEL: &str = "Qwen3.5-0.8B";
 const MAX_UTTERANCE_BYTES: usize = 16 * 1024 * 1024;
 const WS_BIN_MAGIC: &[u8; 4] = b"IVWS";
@@ -110,6 +109,15 @@ enum RealtimeVoiceMode {
     Unified,
 }
 
+impl RealtimeVoiceMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Modular => "modular",
+            Self::Unified => "unified",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ModularVoiceTurnConfig {
     asr_model_id: String,
@@ -140,10 +148,11 @@ struct PendingAudioCommit {
     turn_config: VoiceTurnConfig,
 }
 
-#[derive(Debug)]
 struct ActiveTurn {
     utterance_id: String,
     utterance_seq: u64,
+    turn_record_id: String,
+    state: AppState,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -204,8 +213,51 @@ impl UtteranceEndReason {
     }
 }
 
+impl VoiceTurnConfig {
+    fn mode_str(&self) -> &'static str {
+        match self {
+            Self::Modular(_) => RealtimeVoiceMode::Modular.as_str(),
+            Self::Unified(_) => RealtimeVoiceMode::Unified.as_str(),
+        }
+    }
+
+    fn speaker(&self) -> Option<String> {
+        match self {
+            Self::Modular(config) => config.speaker.clone(),
+            Self::Unified(_) => None,
+        }
+    }
+
+    fn model_ids(&self) -> VoiceTurnModelIds {
+        match self {
+            Self::Modular(config) => VoiceTurnModelIds {
+                asr_model_id: Some(config.asr_model_id.clone()),
+                text_model_id: Some(config.text_model_id.clone()),
+                tts_model_id: Some(config.tts_model_id.clone()),
+                s2s_model_id: None,
+            },
+            Self::Unified(config) => VoiceTurnModelIds {
+                asr_model_id: None,
+                text_model_id: None,
+                tts_model_id: None,
+                s2s_model_id: Some(config.s2s_model_id.clone()),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VoiceTurnModelIds {
+    asr_model_id: Option<String>,
+    text_model_id: Option<String>,
+    tts_model_id: Option<String>,
+    s2s_model_id: Option<String>,
+}
+
 struct ConnectionState {
     system_prompt: String,
+    voice_profile_id: Option<String>,
+    voice_session_id: Option<String>,
     agent_session_id: Option<String>,
     agent_session_system_prompt: Option<String>,
     streaming_input: Option<StreamingInputState>,
@@ -216,7 +268,9 @@ struct ConnectionState {
 impl Default for ConnectionState {
     fn default() -> Self {
         Self {
-            system_prompt: DEFAULT_AGENT_SYSTEM_PROMPT.to_string(),
+            system_prompt: DEFAULT_VOICE_AGENT_SYSTEM_PROMPT.to_string(),
+            voice_profile_id: None,
+            voice_session_id: None,
             agent_session_id: None,
             agent_session_system_prompt: None,
             streaming_input: None,
@@ -425,8 +479,31 @@ async fn finalize_stream_vad_utterance(
     conn: &mut ConnectionState,
     commit: PendingAudioCommit,
     wav_bytes: Vec<u8>,
+    end_reason: UtteranceEndReason,
 ) -> Result<(), String> {
     interrupt_active_turn(out_tx, &mut conn.active_turn, "preempted_by_new_turn");
+
+    let voice_session_id = conn
+        .voice_session_id
+        .clone()
+        .ok_or_else(|| "Voice session not initialized".to_string())?;
+    let model_ids = commit.turn_config.model_ids();
+    let turn_record = state
+        .voice_store
+        .create_turn(CreateVoiceTurnRequest {
+            session_id: voice_session_id,
+            utterance_id: commit.utterance_id.clone(),
+            utterance_seq: commit.utterance_seq,
+            mode: commit.turn_config.mode_str().to_string(),
+            vad_end_reason: Some(end_reason.as_str().to_string()),
+            asr_model_id: model_ids.asr_model_id,
+            text_model_id: model_ids.text_model_id,
+            tts_model_id: model_ids.tts_model_id,
+            s2s_model_id: model_ids.s2s_model_id,
+            speaker: commit.turn_config.speaker(),
+        })
+        .await
+        .map_err(|err| format!("Voice storage error: {err}"))?;
 
     let agent_session_id = match &commit.turn_config {
         VoiceTurnConfig::Modular(config) => Some(
@@ -449,11 +526,14 @@ async fn finalize_stream_vad_utterance(
         commit.clone(),
         wav_bytes,
         agent_session_id,
+        turn_record.id.clone(),
     );
 
     conn.active_turn = Some(ActiveTurn {
         utterance_id: commit.utterance_id,
         utterance_seq: commit.utterance_seq,
+        turn_record_id: turn_record.id,
+        state: state.clone(),
         task,
     });
 
@@ -600,6 +680,11 @@ pub async fn handle_socket(socket: WebSocket, state: AppState, correlation_id: S
     }
 
     interrupt_active_turn(&out_tx, &mut conn.active_turn, "socket_closed");
+    if let Some(session_id) = conn.voice_session_id.take() {
+        if let Err(err) = state.voice_store.end_session(session_id).await {
+            warn!("failed to end voice session on socket close: {err}");
+        }
+    }
     drop(out_tx);
     let _ = writer.await;
 }
@@ -616,6 +701,13 @@ async fn handle_text_message(
 
     match event {
         ClientEvent::SessionStart { system_prompt } => {
+            let profile = state
+                .voice_store
+                .get_default_profile()
+                .await
+                .map_err(|err| format!("Voice storage error: {err}"))?;
+            conn.voice_profile_id = Some(profile.id.clone());
+
             if let Some(prompt) = system_prompt
                 .map(|p| p.trim().to_string())
                 .filter(|p| !p.is_empty())
@@ -624,6 +716,8 @@ async fn handle_text_message(
                     conn.agent_session_id = None;
                 }
                 conn.system_prompt = prompt;
+            } else {
+                conn.system_prompt = profile.system_prompt;
             }
             conn.started = true;
             send_json(
@@ -733,6 +827,22 @@ async fn handle_text_message(
                 }
             };
 
+            if conn.voice_session_id.is_none() {
+                let profile_id = conn.voice_profile_id.clone().ok_or_else(|| {
+                    "Voice profile not initialized. Send `session_start` first.".to_string()
+                })?;
+                let session = state
+                    .voice_store
+                    .create_session(crate::voice_store::CreateVoiceSessionRequest {
+                        profile_id,
+                        mode: mode.as_str().to_string(),
+                        system_prompt: conn.system_prompt.clone(),
+                    })
+                    .await
+                    .map_err(|err| format!("Voice storage error: {err}"))?;
+                conn.voice_session_id = Some(session.id);
+            }
+
             conn.streaming_input = Some(StreamingInputState::new(StreamingInputConfig {
                 turn_config,
                 vad_threshold: vad_threshold
@@ -788,11 +898,19 @@ async fn handle_text_message(
                         conn,
                         commit,
                         wav_bytes,
+                        end_reason,
                     )
                     .await?;
                 }
             }
             send_json(out_tx, json!({ "type": "input_stream_stopped" }));
+            if let Some(session_id) = conn.voice_session_id.take() {
+                state
+                    .voice_store
+                    .end_session(session_id)
+                    .await
+                    .map_err(|err| format!("Voice storage error: {err}"))?;
+            }
         }
         ClientEvent::Interrupt { reason } => {
             let reason = reason.unwrap_or_else(|| "client_interrupt".to_string());
@@ -811,7 +929,7 @@ async fn handle_text_message(
     }
 
     // Silence unused parameters in some branches (kept for future per-message needs).
-    let _ = (state, correlation_id);
+    let _ = correlation_id;
     Ok(())
 }
 
@@ -870,6 +988,7 @@ async fn handle_binary_message(
                     conn,
                     commit,
                     wav_bytes,
+                    end_reason,
                 )
                 .await?;
             }
@@ -886,6 +1005,7 @@ fn spawn_turn_task(
     commit: PendingAudioCommit,
     audio_bytes: Vec<u8>,
     agent_session_id: Option<String>,
+    turn_record_id: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let timeout_secs = state.request_timeout_secs.max(1);
@@ -957,13 +1077,28 @@ fn spawn_turn_task(
                             "type": "user_transcript_final",
                             "utterance_id": commit.utterance_id,
                             "utterance_seq": commit.utterance_seq,
-                            "text": user_text,
-                            "language": transcript.language,
+                            "text": user_text.clone(),
+                            "language": transcript.language.clone(),
                             "audio_duration_secs": transcript.duration_secs,
                         }),
                     );
+                    state
+                        .voice_store
+                        .update_turn_transcript(
+                            turn_record_id.clone(),
+                            user_text.clone(),
+                            transcript.language.clone(),
+                            Some(transcript.duration_secs),
+                        )
+                        .await
+                        .map_err(|err| format!("Voice storage error: {err}"))?;
 
                     if user_text.is_empty() {
+                        state
+                            .voice_store
+                            .complete_turn(turn_record_id.clone(), "no_input", None)
+                            .await
+                            .map_err(|err| format!("Voice storage error: {err}"))?;
                         send_json(
                             &out_tx,
                             json!({
@@ -1005,12 +1140,26 @@ fn spawn_turn_task(
                             "type": "assistant_text_final",
                             "utterance_id": commit.utterance_id,
                             "utterance_seq": commit.utterance_seq,
-                            "text": assistant_text,
-                            "raw_text": assistant_raw,
+                            "text": assistant_text.clone(),
+                            "raw_text": assistant_raw.clone(),
                         }),
                     );
+                    state
+                        .voice_store
+                        .update_turn_assistant(
+                            turn_record_id.clone(),
+                            Some(assistant_text.clone()),
+                            Some(assistant_raw.clone()),
+                        )
+                        .await
+                        .map_err(|err| format!("Voice storage error: {err}"))?;
 
                     if assistant_text.is_empty() {
+                        state
+                            .voice_store
+                            .complete_turn(turn_record_id.clone(), "ok", None)
+                            .await
+                            .map_err(|err| format!("Voice storage error: {err}"))?;
                         send_json(
                             &out_tx,
                             json!({
@@ -1034,6 +1183,11 @@ fn spawn_turn_task(
                         assistant_text.as_str(),
                     )
                     .await?;
+                    state
+                        .voice_store
+                        .complete_turn(turn_record_id.clone(), "ok", None)
+                        .await
+                        .map_err(|err| format!("Voice storage error: {err}"))?;
 
                     send_json(
                         &out_tx,
@@ -1117,11 +1271,21 @@ fn spawn_turn_task(
                             "type": "user_transcript_final",
                             "utterance_id": commit.utterance_id,
                             "utterance_seq": commit.utterance_seq,
-                            "text": user_text,
-                            "language": user_language,
+                            "text": user_text.clone(),
+                            "language": user_language.clone(),
                             "audio_duration_secs": user_audio_duration_secs,
                         }),
                     );
+                    state
+                        .voice_store
+                        .update_turn_transcript(
+                            turn_record_id.clone(),
+                            user_text.clone(),
+                            user_language.clone(),
+                            user_audio_duration_secs,
+                        )
+                        .await
+                        .map_err(|err| format!("Voice storage error: {err}"))?;
 
                     send_json(
                         &out_tx,
@@ -1195,10 +1359,19 @@ fn spawn_turn_task(
                             "type": "assistant_text_final",
                             "utterance_id": commit.utterance_id,
                             "utterance_seq": commit.utterance_seq,
-                            "text": assistant_text,
-                            "raw_text": stream_result.text,
+                            "text": assistant_text.clone(),
+                            "raw_text": stream_result.text.clone(),
                         }),
                     );
+                    state
+                        .voice_store
+                        .update_turn_assistant(
+                            turn_record_id.clone(),
+                            Some(assistant_text.clone()),
+                            Some(stream_result.text.clone()),
+                        )
+                        .await
+                        .map_err(|err| format!("Voice storage error: {err}"))?;
 
                     send_json(
                         &out_tx,
@@ -1208,6 +1381,11 @@ fn spawn_turn_task(
                             "utterance_seq": commit.utterance_seq,
                         }),
                     );
+                    state
+                        .voice_store
+                        .complete_turn(turn_record_id.clone(), "ok", None)
+                        .await
+                        .map_err(|err| format!("Voice storage error: {err}"))?;
 
                     send_json(
                         &out_tx,
@@ -1226,6 +1404,10 @@ fn spawn_turn_task(
         match tokio::time::timeout(timeout, turn_future).await {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
+                let _ = state
+                    .voice_store
+                    .complete_turn(turn_record_id.clone(), "error", Some(err.clone()))
+                    .await;
                 send_error(
                     &out_tx,
                     Some(commit.utterance_id.clone()),
@@ -1243,11 +1425,20 @@ fn spawn_turn_task(
                 );
             }
             Err(_) => {
+                let timeout_reason = format!("Turn timed out after {timeout_secs} seconds");
+                let _ = state
+                    .voice_store
+                    .complete_turn(
+                        turn_record_id.clone(),
+                        "timeout",
+                        Some(timeout_reason.clone()),
+                    )
+                    .await;
                 send_error(
                     &out_tx,
                     Some(commit.utterance_id.clone()),
                     Some(commit.utterance_seq),
-                    format!("Turn timed out after {timeout_secs} seconds"),
+                    timeout_reason,
                 );
                 send_json(
                     &out_tx,
@@ -1364,6 +1555,15 @@ fn interrupt_active_turn(
             return;
         }
         turn.task.abort();
+        let state = turn.state.clone();
+        let turn_record_id = turn.turn_record_id.clone();
+        let reason_text = reason.to_string();
+        tokio::spawn(async move {
+            let _ = state
+                .voice_store
+                .complete_turn(turn_record_id, "interrupted", Some(reason_text))
+                .await;
+        });
         send_json(
             out_tx,
             json!({
@@ -1401,7 +1601,7 @@ async fn ensure_agent_session(
     let session_id = format!("agent_sess_{}", uuid::Uuid::new_v4().simple());
     let record = StoredAgentSessionRecord {
         id: session_id.clone(),
-        agent_id: DEFAULT_AGENT_ID.to_string(),
+        agent_id: DEFAULT_VOICE_AGENT_ID.to_string(),
         thread_id: thread.id,
         model_id,
         system_prompt: system_prompt.to_string(),
@@ -1437,7 +1637,7 @@ async fn run_agent_turn(
 
     let agent = AgentDefinition {
         id: session_record.agent_id.clone(),
-        name: DEFAULT_AGENT_NAME.to_string(),
+        name: DEFAULT_VOICE_AGENT_NAME.to_string(),
         system_prompt: session_record.system_prompt.clone(),
         default_model: session_record.model_id.clone(),
         capabilities: Default::default(),

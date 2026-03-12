@@ -5,6 +5,8 @@ import {
   Loader2,
   PhoneOff,
   AudioLines,
+  Volume2,
+  VolumeX,
   Settings2,
   Download,
   Play,
@@ -49,6 +51,27 @@ import {
 } from "@/features/voice/realtime/support";
 import { getSpeakerProfilesForVariant } from "@/types";
 
+const VOICE_OUTPUT_MUTED_STORAGE_KEY = "izwi.voice.output_muted";
+const VOICE_PLAYBACK_SPEED_STORAGE_KEY = "izwi.voice.playback_speed";
+
+function clampPlaybackSpeed(value: number) {
+  return Math.min(1.75, Math.max(0.75, value));
+}
+
+function isEditableShortcutTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) {
+    return false;
+  }
+
+  const tagName = target.tagName.toLowerCase();
+  return (
+    tagName === "input" ||
+    tagName === "textarea" ||
+    tagName === "select" ||
+    target.isContentEditable
+  );
+}
+
 export function VoicePage({
   models,
   loading,
@@ -74,6 +97,17 @@ export function VoicePage({
   const [minSpeechMs, setMinSpeechMs] = useState(300);
   const [isConfigOpen, setIsConfigOpen] = useState(false);
   const [isLoadAllRequested, setIsLoadAllRequested] = useState(false);
+  const [isOutputMuted, setIsOutputMuted] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return window.localStorage.getItem(VOICE_OUTPUT_MUTED_STORAGE_KEY) === "1";
+  });
+  const [playbackSpeed, setPlaybackSpeed] = useState(() => {
+    if (typeof window === "undefined") return 1;
+    const raw = Number.parseFloat(
+      window.localStorage.getItem(VOICE_PLAYBACK_SPEED_STORAGE_KEY) ?? "1",
+    );
+    return Number.isFinite(raw) ? clampPlaybackSpeed(raw) : 1;
+  });
 
   const streamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -98,11 +132,14 @@ export function VoicePage({
   const chatStreamAbortRef = useRef<AbortController | null>(null);
   const ttsStreamAbortRef = useRef<AbortController | null>(null);
   const ttsPlaybackContextRef = useRef<AudioContext | null>(null);
+  const ttsPlaybackGainRef = useRef<GainNode | null>(null);
   const ttsPlaybackSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const ttsNextPlaybackTimeRef = useRef(0);
   const ttsSampleRateRef = useRef(24000);
   const ttsSamplesRef = useRef<Float32Array[]>([]);
   const ttsStreamSessionRef = useRef(0);
+  const playbackSpeedRef = useRef(1);
+  const isOutputMutedRef = useRef(false);
   const voiceWsRef = useRef<WebSocket | null>(null);
   const voiceWsConnectingRef = useRef<Promise<WebSocket> | null>(null);
   const voiceWsSessionReadyRef = useRef(false);
@@ -224,6 +261,41 @@ export function VoicePage({
   useEffect(() => {
     runtimeStatusRef.current = runtimeStatus;
   }, [runtimeStatus]);
+
+  useEffect(() => {
+    playbackSpeedRef.current = playbackSpeed;
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(
+        VOICE_PLAYBACK_SPEED_STORAGE_KEY,
+        playbackSpeed.toString(),
+      );
+    }
+
+    const audio = audioRef.current;
+    if (audio) {
+      audio.playbackRate = playbackSpeed;
+      audio.defaultPlaybackRate = playbackSpeed;
+    }
+  }, [playbackSpeed]);
+
+  useEffect(() => {
+    isOutputMutedRef.current = isOutputMuted;
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(
+        VOICE_OUTPUT_MUTED_STORAGE_KEY,
+        isOutputMuted ? "1" : "0",
+      );
+    }
+
+    const audio = audioRef.current;
+    if (audio) {
+      audio.muted = isOutputMuted;
+    }
+
+    if (ttsPlaybackGainRef.current) {
+      ttsPlaybackGainRef.current.gain.value = isOutputMuted ? 0 : 1;
+    }
+  }, [isOutputMuted]);
 
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -458,6 +530,7 @@ export function VoicePage({
       ttsPlaybackContextRef.current.close().catch(() => {});
       ttsPlaybackContextRef.current = null;
     }
+    ttsPlaybackGainRef.current = null;
 
     ttsNextPlaybackTimeRef.current = 0;
     ttsSampleRateRef.current = 24000;
@@ -782,14 +855,16 @@ export function VoicePage({
 
       const source = context.createBufferSource();
       source.buffer = buffer;
-      source.connect(context.destination);
+      source.playbackRate.value = playbackSpeedRef.current;
+      source.connect(ttsPlaybackGainRef.current ?? context.destination);
 
       const scheduledAt = Math.max(
         context.currentTime + 0.02,
         ttsNextPlaybackTimeRef.current,
       );
       source.start(scheduledAt);
-      ttsNextPlaybackTimeRef.current = scheduledAt + buffer.duration;
+      ttsNextPlaybackTimeRef.current =
+        scheduledAt + buffer.duration / playbackSpeedRef.current;
 
       const streamSession = playback.streamSession;
       const utteranceSeq = playback.utteranceSeq;
@@ -965,7 +1040,11 @@ export function VoicePage({
           clearAudioPlayback();
 
           const playbackContext = new AudioContext();
+          const playbackGain = playbackContext.createGain();
+          playbackGain.gain.value = isOutputMutedRef.current ? 0 : 1;
+          playbackGain.connect(playbackContext.destination);
           ttsPlaybackContextRef.current = playbackContext;
+          ttsPlaybackGainRef.current = playbackGain;
           ttsNextPlaybackTimeRef.current = playbackContext.currentTime + 0.05;
           ttsSampleRateRef.current = event.sample_rate || 24000;
           ttsSamplesRef.current = [];
@@ -1468,7 +1547,11 @@ export function VoicePage({
         clearAudioPlayback();
 
         const playbackContext = new AudioContext();
+        const playbackGain = playbackContext.createGain();
+        playbackGain.gain.value = isOutputMutedRef.current ? 0 : 1;
+        playbackGain.connect(playbackContext.destination);
         ttsPlaybackContextRef.current = playbackContext;
+        ttsPlaybackGainRef.current = playbackGain;
         ttsNextPlaybackTimeRef.current = playbackContext.currentTime + 0.05;
         ttsSampleRateRef.current = 24000;
         ttsSamplesRef.current = [];
@@ -1504,6 +1587,7 @@ export function VoicePage({
               ttsPlaybackContextRef.current.close().catch(() => {});
               ttsPlaybackContextRef.current = null;
             }
+            ttsPlaybackGainRef.current = null;
 
             ttsPlaybackSourcesRef.current.clear();
             ttsNextPlaybackTimeRef.current = 0;
@@ -1576,14 +1660,16 @@ export function VoicePage({
 
               const source = context.createBufferSource();
               source.buffer = buffer;
-              source.connect(context.destination);
+              source.playbackRate.value = playbackSpeedRef.current;
+              source.connect(ttsPlaybackGainRef.current ?? context.destination);
 
               const scheduledAt = Math.max(
                 context.currentTime + 0.02,
                 ttsNextPlaybackTimeRef.current,
               );
               source.start(scheduledAt);
-              ttsNextPlaybackTimeRef.current = scheduledAt + buffer.duration;
+              ttsNextPlaybackTimeRef.current =
+                scheduledAt + buffer.duration / playbackSpeedRef.current;
 
               ttsPlaybackSourcesRef.current.add(source);
               source.onended = () => {
@@ -1659,6 +1745,9 @@ export function VoicePage({
         };
 
         audio.src = nextUrl;
+        audio.muted = isOutputMutedRef.current;
+        audio.playbackRate = playbackSpeedRef.current;
+        audio.defaultPlaybackRate = playbackSpeedRef.current;
         audio.onended = () => finalize();
         audio.onerror = () =>
           finalize(new Error("Failed to play assistant audio"));
@@ -2111,13 +2200,50 @@ export function VoicePage({
     vadThreshold,
   ]);
 
-  const toggleSession = () => {
+  const toggleSession = useCallback(() => {
     if (runtimeStatus === "idle") {
       void startSession();
     } else {
       stopSession();
     }
-  };
+  }, [runtimeStatus, startSession, stopSession]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.defaultPrevented ||
+        event.repeat ||
+        event.altKey ||
+        event.ctrlKey ||
+        event.metaKey ||
+        isEditableShortcutTarget(event.target)
+      ) {
+        return;
+      }
+
+      if (event.code === "Space") {
+        event.preventDefault();
+        toggleSession();
+        return;
+      }
+
+      if (event.key === "Escape") {
+        if (runtimeStatus !== "idle") {
+          event.preventDefault();
+          stopSession();
+        }
+        return;
+      }
+
+      if (event.key.toLowerCase() === "m") {
+        event.preventDefault();
+        setIsOutputMuted((current) => !current);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [runtimeStatus, stopSession, toggleSession]);
 
   const statusLabel = {
     idle: "Idle",
@@ -2212,6 +2338,18 @@ export function VoicePage({
             {currentPipelineLabel}
           </span>
         </div>
+        <button
+          onClick={() => setIsOutputMuted((current) => !current)}
+          className="btn btn-secondary h-8 w-8 rounded-full p-0"
+          aria-label={isOutputMuted ? "Unmute assistant audio" : "Mute assistant audio"}
+          title={isOutputMuted ? "Unmute assistant audio (M)" : "Mute assistant audio (M)"}
+        >
+          {isOutputMuted ? (
+            <VolumeX className="w-3.5 h-3.5" />
+          ) : (
+            <Volume2 className="w-3.5 h-3.5" />
+          )}
+        </button>
         <button
           onClick={() => setIsConfigOpen(true)}
           className="btn btn-secondary h-8 px-3 rounded-full text-[11px] gap-1.5"
@@ -2825,6 +2963,55 @@ export function VoicePage({
                       </div>
                     </>
                   )}
+                </section>
+
+                <section className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3 space-y-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <h3 className="text-sm font-medium text-white">
+                        Audio Output
+                      </h3>
+                      <p className="text-xs text-[var(--text-muted)] mt-1">
+                        Control assistant playback without leaving voice mode.
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => setIsOutputMuted((current) => !current)}
+                      className="btn btn-secondary h-8 px-3 rounded-full text-[11px] gap-1.5"
+                    >
+                      {isOutputMuted ? (
+                        <VolumeX className="w-3.5 h-3.5" />
+                      ) : (
+                        <Volume2 className="w-3.5 h-3.5" />
+                      )}
+                      {isOutputMuted ? "Muted" : "Unmuted"}
+                    </button>
+                  </div>
+
+                  <div>
+                    <label className="text-xs text-[var(--text-muted)]">
+                      Playback Speed ({playbackSpeed.toFixed(2)}x)
+                    </label>
+                    <Slider
+                      aria-label="Playback speed"
+                      min={0.75}
+                      max={1.75}
+                      step={0.05}
+                      value={[playbackSpeed]}
+                      onValueChange={(value) => {
+                        const next = value[0];
+                        if (typeof next === "number") {
+                          setPlaybackSpeed(clampPlaybackSpeed(next));
+                        }
+                      }}
+                      className="mt-2"
+                    />
+                  </div>
+
+                  <div className="text-[11px] text-[var(--text-muted)]">
+                    Shortcuts: `Space` start or stop, `Escape` stop, `M`
+                    mute.
+                  </div>
                 </section>
 
                 <section className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3">

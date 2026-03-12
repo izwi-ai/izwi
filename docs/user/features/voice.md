@@ -63,8 +63,8 @@ izwi pull qwen3-0.6b
 | Control | Action |
 |---------|--------|
 | **Microphone** | Start/stop recording |
-| **Speaker** | Mute/unmute responses |
-| **Settings** | Configure voice and model |
+| **Speaker** | Mute/unmute assistant responses |
+| **Settings** | Configure models, playback speed, and speech detection |
 
 ---
 
@@ -84,7 +84,8 @@ Configure which models to use:
 ### Audio Settings
 
 - **Auto-detect silence** — Automatically stop recording when you stop speaking
-- **Playback speed** — Adjust response playback speed
+- **Playback speed** — Adjust response playback speed from `0.75x` to `1.75x`
+- **Mute output** — Silence assistant playback without ending the session
 
 ---
 
@@ -101,9 +102,11 @@ Configure which models to use:
 
 | Shortcut | Action |
 |----------|--------|
-| `Space` | Toggle recording |
-| `Escape` | Cancel current recording |
+| `Space` | Start or stop the current voice session |
+| `Escape` | Stop the current voice session |
 | `M` | Mute/unmute |
+
+> Shortcuts are ignored while focus is inside a text field or other editable control.
 
 ---
 

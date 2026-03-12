@@ -6,6 +6,7 @@ use crate::saved_voice_store::SavedVoiceStore;
 use crate::speech_history_store::SpeechHistoryStore;
 use crate::transcription_store::TranscriptionStore;
 use crate::tts_project_store::TtsProjectStore;
+use crate::voice_store::VoiceStore;
 use izwi_agent::planner::PlanningMode;
 use izwi_core::{RuntimeService, ServeRuntimeConfig};
 use serde::{Deserialize, Serialize};
@@ -78,6 +79,8 @@ pub struct AppState {
     pub saved_voice_store: Arc<SavedVoiceStore>,
     /// SQLite-backed TTS project store.
     pub tts_project_store: Arc<TtsProjectStore>,
+    /// SQLite-backed voice profile/session store.
+    pub voice_store: Arc<VoiceStore>,
 }
 
 impl AppState {
@@ -98,6 +101,7 @@ impl AppState {
         let speech_history_store = Arc::new(SpeechHistoryStore::initialize()?);
         let saved_voice_store = Arc::new(SavedVoiceStore::initialize()?);
         let tts_project_store = Arc::new(TtsProjectStore::initialize()?);
+        let voice_store = Arc::new(VoiceStore::initialize()?);
 
         Ok(Self {
             runtime: Arc::new(runtime),
@@ -113,6 +117,7 @@ impl AppState {
             speech_history_store,
             saved_voice_store,
             tts_project_store,
+            voice_store,
         })
     }
 
