@@ -39,6 +39,7 @@ interface VoiceSelectProps {
   builtInEnabled?: boolean;
   disabled?: boolean;
   modelLabel?: string | null;
+  compact?: boolean;
 }
 
 const MODE_COPY: Record<
@@ -93,6 +94,7 @@ export function VoiceSelect({
   builtInEnabled = true,
   disabled = false,
   modelLabel = null,
+  compact = false,
 }: VoiceSelectProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [search, setSearch] = useState("");
@@ -243,14 +245,20 @@ export function VoiceSelect({
         }}
         disabled={!canOpen}
         className={cn(
-          "flex w-full items-center justify-between gap-3 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3.5 py-2.5 text-left shadow-none transition-[border-color,box-shadow,background-color] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35 focus-visible:border-ring/50",
+          "flex w-full items-center justify-between gap-3 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3.5 text-left shadow-none transition-[border-color,box-shadow,background-color] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35 focus-visible:border-ring/50",
+          compact ? "h-11 py-0" : "py-2.5",
           canOpen
             ? "hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-1)]"
             : "cursor-not-allowed bg-[var(--bg-surface-1)]/60 text-[var(--text-muted)]",
           isOpen && "border-ring/50 ring-2 ring-ring/35",
         )}
       >
-        <div className="speaker-avatar flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-xs font-medium">
+        <div
+          className={cn(
+            "speaker-avatar shrink-0 items-center justify-center rounded-full text-xs font-medium",
+            compact ? "flex h-7 w-7" : "flex h-8 w-8",
+          )}
+        >
           {itemInitial(selectedItem, activeMode === "saved" ? "S" : "B")}
         </div>
         <div className="min-w-0 flex-1">
@@ -262,9 +270,11 @@ export function VoiceSelect({
               {MODE_COPY[activeMode].triggerLabel}
             </span>
           </div>
-          <div className={cn(VOICE_ROUTE_META_COPY_CLASS, "mt-0.5 truncate")}>
-            {triggerSubtitle}
-          </div>
+          {!compact ? (
+            <div className={cn(VOICE_ROUTE_META_COPY_CLASS, "mt-0.5 truncate")}>
+              {triggerSubtitle}
+            </div>
+          ) : null}
         </div>
         <ChevronDown
           className={cn(
