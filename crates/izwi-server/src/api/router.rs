@@ -48,6 +48,7 @@ pub fn create_router(state: AppState, serve_config: &ServeRuntimeConfig) -> Rout
         .merge(crate::api::speech_history::router())
         .merge(crate::api::tts_projects::router())
         .merge(crate::api::saved_voices::router())
+        .merge(crate::api::voice::router())
         .merge(crate::api::voice_realtime::router())
         .merge(crate::api::openai::router())
         .merge(crate::api::admin::router())

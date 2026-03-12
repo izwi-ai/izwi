@@ -49,3 +49,6 @@ izwi-core = { path = "../izwi-core", default-features = false, features = ["meta
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 izwi-core = { path = "../izwi-core", default-features = false }
+
+[dev-dependencies]
+tempfile = "3.10"
