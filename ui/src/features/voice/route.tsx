@@ -20,6 +20,7 @@ import { PageShell } from "@/components/PageShell";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import {
   ENABLE_LEGACY_LOCAL_UNIFIED_PATH,
@@ -60,6 +61,8 @@ function clampPlaybackSpeed(value: number) {
   return Math.min(1.75, Math.max(0.75, value));
 }
 
+type VoiceConfigTab = "setup" | "models" | "agent" | "memory";
+
 function isEditableShortcutTarget(target: EventTarget | null) {
   if (!(target instanceof HTMLElement)) {
     return false;
@@ -98,6 +101,7 @@ export function VoicePage({
   const [silenceDurationMs, setSilenceDurationMs] = useState(900);
   const [minSpeechMs, setMinSpeechMs] = useState(300);
   const [isConfigOpen, setIsConfigOpen] = useState(false);
+  const [configTab, setConfigTab] = useState<VoiceConfigTab>("setup");
   const [isLoadAllRequested, setIsLoadAllRequested] = useState(false);
   const [isOutputMuted, setIsOutputMuted] = useState(() => {
     if (typeof window === "undefined") return false;
@@ -1948,6 +1952,11 @@ export function VoicePage({
     [clearAudioPlayback],
   );
 
+  const openConfig = useCallback((tab: VoiceConfigTab = "setup") => {
+    setConfigTab(tab);
+    setIsConfigOpen(true);
+  }, []);
+
   const processUtterance = useCallback(
     async (audioBlob: Blob) => {
       if (!isSessionActiveRef.current) {
@@ -1964,7 +1973,7 @@ export function VoicePage({
             ? "Select a speech-to-speech model before starting voice mode."
             : "Required modular stack models are unavailable. Open Config.",
         );
-        setIsConfigOpen(true);
+        openConfig("models");
         setRuntimeStatus("listening");
         processingRef.current = false;
         return;
@@ -1974,7 +1983,7 @@ export function VoicePage({
         setError(
           "Required models are not loaded. Open Config and load the stack.",
         );
-        setIsConfigOpen(true);
+        openConfig("models");
         setRuntimeStatus("listening");
         processingRef.current = false;
         return;
@@ -2107,6 +2116,7 @@ export function VoicePage({
       hasRunnableConfig,
       lfm2DirectMode,
       onError,
+      openConfig,
       playAssistantBlob,
       selectedAsrModel,
       selectedS2sModel,
@@ -2130,7 +2140,7 @@ export function VoicePage({
         : "Required modular stack models are unavailable. Open Config.";
       setError(message);
       onError?.(message);
-      setIsConfigOpen(true);
+      openConfig("models");
       return;
     }
 
@@ -2139,7 +2149,7 @@ export function VoicePage({
         "Required models are not loaded. Open Config and load the stack.";
       setError(message);
       onError?.(message);
-      setIsConfigOpen(true);
+      openConfig("models");
       return;
     }
 
@@ -2369,6 +2379,7 @@ export function VoicePage({
     lfm2DirectMode,
     minSpeechMs,
     onError,
+    openConfig,
     processUtterance,
     selectedAsrModel,
     selectedS2sModel,
@@ -2479,6 +2490,708 @@ export function VoicePage({
     }
   };
 
+  const promptStatusLabel = isVoiceProfileLoading
+    ? "Loading prompt"
+    : isSystemPromptDirty
+      ? "Unsaved edits"
+      : savedSystemPrompt === defaultSystemPrompt
+        ? "Default prompt"
+        : "Custom prompt";
+
+  const promptSummaryText = isVoiceProfileLoading
+    ? "Fetching the saved voice agent instructions."
+    : isSystemPromptDirty
+      ? "You have local prompt edits that have not been saved yet."
+      : savedSystemPrompt === defaultSystemPrompt
+        ? "Voice mode is using the default assistant behavior."
+        : "A custom saved prompt will apply to the next voice session.";
+
+  const memoryStatusLabel = observationalMemoryEnabled
+    ? voiceObservations.length === 0
+      ? "Enabled"
+      : `${voiceObservations.length} saved`
+    : "Disabled";
+
+  const memorySummaryText = observationalMemoryEnabled
+    ? voiceObservations.length === 0
+      ? "Memory is ready to capture stable preferences from modular conversations."
+      : "Review or remove stored voice memories without leaving this modal."
+    : "Memory capture is currently turned off for voice mode.";
+
+  const modelStatusLabel = hasRunnableConfig
+    ? "Ready to start"
+    : "Needs model action";
+
+  const modelSummaryText = lfm2DirectMode
+    ? "Unified LFM2.5 handles the full speech loop in one model."
+    : "Parakeet, Qwen, and Kokoro stay separate so each stage is inspectable.";
+
+  const renderSetupTab = () => (
+    <div className="space-y-4">
+      <section className="grid gap-3 md:grid-cols-3">
+        <button
+          type="button"
+          onClick={() => setConfigTab("models")}
+          className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 text-left transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-2)]"
+        >
+          <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--text-muted)]">
+            Models
+          </span>
+          <div className="mt-3 flex items-start justify-between gap-3">
+            <div>
+              <p className="text-sm font-medium text-[var(--text-primary)]">
+                {modelStatusLabel}
+              </p>
+              <p className="mt-1 text-xs leading-relaxed text-[var(--text-muted)]">
+                {modelSummaryText}
+              </p>
+            </div>
+            <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-2 py-1 text-[10px] text-[var(--text-muted)]">
+              {currentPipelineLabel}
+            </span>
+          </div>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setConfigTab("agent")}
+          className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 text-left transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-2)]"
+        >
+          <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--text-muted)]">
+            Agent
+          </span>
+          <div className="mt-3">
+            <p className="text-sm font-medium text-[var(--text-primary)]">
+              {promptStatusLabel}
+            </p>
+            <p className="mt-1 text-xs leading-relaxed text-[var(--text-muted)]">
+              {promptSummaryText}
+            </p>
+          </div>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setConfigTab("memory")}
+          className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 text-left transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-2)]"
+        >
+          <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--text-muted)]">
+            Memory
+          </span>
+          <div className="mt-3">
+            <p className="text-sm font-medium text-[var(--text-primary)]">
+              {memoryStatusLabel}
+            </p>
+            <p className="mt-1 text-xs leading-relaxed text-[var(--text-muted)]">
+              {memorySummaryText}
+            </p>
+          </div>
+        </button>
+      </section>
+
+      <section className="space-y-4">
+        <div className="flex items-center justify-between gap-2">
+          <h3 className="text-sm font-medium text-white">Runtime Profile</h3>
+          <span className="text-[11px] text-[var(--text-muted)]">
+            Choose how inference is orchestrated.
+          </span>
+        </div>
+        <div className="grid md:grid-cols-2 gap-3">
+          <button
+            className={cn(
+              "rounded-lg border p-3 text-left transition-colors",
+              lfm2DirectMode
+                ? "border-primary bg-primary/5 ring-1 ring-primary/20"
+                : "border-border bg-card hover:bg-accent hover:text-accent-foreground",
+            )}
+            onClick={() => setPipelineMode("s2s")}
+          >
+            <div className="text-sm font-medium">Unified Speech Model</div>
+            <p className="text-xs text-muted-foreground mt-1">
+              One LFM2.5 model handles user speech understanding and assistant
+              speech output.
+            </p>
+          </button>
+          <button
+            className={cn(
+              "rounded-lg border p-3 text-left transition-colors",
+              !lfm2DirectMode
+                ? "border-primary bg-primary/5 ring-1 ring-primary/20"
+                : "border-border bg-card hover:bg-accent hover:text-accent-foreground",
+            )}
+            onClick={() => setPipelineMode("stt_chat_tts")}
+          >
+            <div className="text-sm font-medium">Modular Voice Stack</div>
+            <p className="text-xs text-muted-foreground mt-1">
+              Uses a fixed local stack: Parakeet ASR, Qwen3-1.7B-GGUF, and
+              Kokoro-82M.
+            </p>
+          </button>
+        </div>
+        <div className="text-[11px] text-[var(--text-muted)]">
+          Current mode: {currentPipelineLabel}
+        </div>
+      </section>
+
+      {renderAudioOutputSettings()}
+      {renderAdvancedSpeechSettings()}
+    </div>
+  );
+
+  const renderPromptSettings = () => (
+    <section className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 space-y-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h3 className="text-sm font-medium text-white">Voice Agent Prompt</h3>
+          <p className="text-xs text-[var(--text-muted)] mt-1">
+            Customize how the assistant responds in voice mode. Prompt updates
+            apply the next time you start a voice session.
+          </p>
+        </div>
+        {runtimeStatus !== "idle" && (
+          <span className="text-[11px] rounded-full border border-amber-500/30 bg-amber-500/10 px-2.5 py-1 text-amber-200">
+            Restart required
+          </span>
+        )}
+      </div>
+
+      {isVoiceProfileLoading ? (
+        <p className="text-xs text-[var(--text-muted)]">
+          Loading saved prompt...
+        </p>
+      ) : (
+        <>
+          <Textarea
+            value={systemPromptDraft}
+            onChange={(event) => setSystemPromptDraft(event.target.value)}
+            placeholder={defaultSystemPrompt}
+            className="min-h-[220px] bg-[var(--bg-surface-2)] border-[var(--border-muted)]"
+          />
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="text-[11px] text-[var(--text-muted)]">
+              Saved prompt is used for websocket `session_start` and the legacy
+              agent-session fallback path.
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setSystemPromptDraft(defaultSystemPrompt)}
+                disabled={
+                  isVoiceProfileSaving ||
+                  systemPromptDraft === defaultSystemPrompt
+                }
+              >
+                Restore Default
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => void handleSaveSystemPrompt()}
+                disabled={isVoiceProfileSaving || !isSystemPromptDirty}
+              >
+                {isVoiceProfileSaving ? "Saving..." : "Save Prompt"}
+              </Button>
+            </div>
+          </div>
+        </>
+      )}
+    </section>
+  );
+
+  const renderMemorySettings = () => (
+    <section className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 space-y-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h3 className="text-sm font-medium text-white">
+            Observational Memory
+          </h3>
+          <p className="text-xs text-[var(--text-muted)] mt-1">
+            Save stable user preferences and facts from modular voice turns so
+            future responses can stay grounded.
+          </p>
+        </div>
+        <div className="flex items-center gap-3">
+          <span className="text-[11px] text-[var(--text-muted)]">
+            {observationalMemoryEnabled ? "Enabled" : "Disabled"}
+          </span>
+          <Switch
+            checked={observationalMemoryEnabled}
+            onCheckedChange={(checked) => {
+              void handleSetObservationalMemoryEnabled(checked);
+            }}
+            disabled={isVoiceObservationsMutating}
+            aria-label="Toggle observational memory"
+          />
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="text-[11px] text-[var(--text-muted)]">
+          Memory is currently applied only to modular `/voice` conversations
+          and can be reviewed or deleted here.
+        </p>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => void loadVoiceObservations()}
+            disabled={isVoiceObservationsLoading}
+          >
+            Refresh
+          </Button>
+          <Button
+            variant="destructive"
+            size="sm"
+            onClick={() => void handleClearObservations()}
+            disabled={
+              isVoiceObservationsMutating || voiceObservations.length === 0
+            }
+          >
+            Clear All
+          </Button>
+        </div>
+      </div>
+
+      <div className="space-y-2 max-h-[360px] overflow-y-auto pr-1">
+        {isVoiceObservationsLoading ? (
+          <p className="text-xs text-[var(--text-muted)]">
+            Loading voice memories...
+          </p>
+        ) : voiceObservations.length === 0 ? (
+          <p className="text-xs text-[var(--text-muted)]">
+            No voice memories stored yet.
+          </p>
+        ) : (
+          voiceObservations.map((observation) => (
+            <div
+              key={observation.id}
+              className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-3 py-2.5"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-[10px] uppercase tracking-wide text-[var(--text-muted)]">
+                      {observation.category}
+                    </span>
+                    <span className="text-[10px] text-[var(--text-muted)]">
+                      confidence {observation.confidence.toFixed(2)}
+                    </span>
+                    <span className="text-[10px] text-[var(--text-muted)]">
+                      seen {observation.times_seen}x
+                    </span>
+                  </div>
+                  <p className="mt-1 text-sm text-[var(--text-primary)]">
+                    {observation.summary}
+                  </p>
+                </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="shrink-0"
+                  onClick={() => void handleForgetObservation(observation.id)}
+                  disabled={isVoiceObservationsMutating}
+                >
+                  Forget
+                </Button>
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+    </section>
+  );
+
+  const renderModelSettings = () => (
+    <section className="space-y-3">
+      {lfm2DirectMode ? (
+        <>
+          <div className="flex items-center justify-between gap-2">
+            <h3 className="text-sm font-medium text-white">Unified Models</h3>
+            <span className="text-[11px] text-[var(--text-muted)]">
+              Choose an LFM2.5 model.
+            </span>
+          </div>
+          <div className="grid md:grid-cols-2 gap-3">
+            {unifiedModelOptions.map((option) => {
+              const model = option.model;
+              const isSelected =
+                !!model && selectedS2sModel === model.variant;
+              const progressMeta = getModelProgress(model);
+              return (
+                <div
+                  key={option.key}
+                  className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3 space-y-3"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium text-white">
+                        {option.label}
+                      </div>
+                      <div className="mt-0.5 text-xs text-[var(--text-muted)] truncate">
+                        {model
+                          ? formatModelVariantLabel(model.variant)
+                          : "Model not available in current catalog"}
+                      </div>
+                    </div>
+                    <span
+                      className={clsx(
+                        "text-[10px] px-1.5 py-0.5 rounded border whitespace-nowrap",
+                        model
+                          ? getStatusClass(model.status)
+                          : "bg-[var(--bg-surface-2)] border-[var(--border-muted)] text-[var(--text-muted)]",
+                      )}
+                    >
+                      {model ? getStatusLabel(model.status) : "Unavailable"}
+                    </span>
+                  </div>
+                  <p className="text-xs text-[var(--text-muted)]">
+                    {option.description}
+                  </p>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {model?.status === "downloading" && onCancelDownload && (
+                      <Button
+                        onClick={() => onCancelDownload(model.variant)}
+                        variant="destructive"
+                        size="sm"
+                        className="text-xs h-8 gap-2"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                        Cancel
+                      </Button>
+                    )}
+                    <Button
+                      onClick={() => model && handleUseUnifiedModel(model)}
+                      size="sm"
+                      variant={
+                        model?.status === "ready" && isSelected
+                          ? "outline"
+                          : "default"
+                      }
+                      disabled={isUnifiedModelButtonDisabled(model, isSelected)}
+                      className="text-xs h-8 gap-2"
+                    >
+                      {(model?.status === "loading" ||
+                        model?.status === "downloading") && (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      )}
+                      {(model?.status === "not_downloaded" ||
+                        model?.status === "error") && (
+                        <Download className="w-3.5 h-3.5" />
+                      )}
+                      {(model?.status === "downloaded" ||
+                        (model?.status === "ready" && !isSelected)) && (
+                        <Play className="w-3.5 h-3.5" />
+                      )}
+                      {getUnifiedModelButtonLabel(model, isSelected)}
+                    </Button>
+                  </div>
+                  {model?.status === "downloading" && progressMeta && (
+                    <div>
+                      <div className="h-1.5 rounded bg-[var(--bg-surface-3)] overflow-hidden">
+                        <div
+                          className="h-full rounded bg-white transition-all duration-300"
+                          style={{
+                            width: `${progressMeta.progress}%`,
+                          }}
+                        />
+                      </div>
+                      <div className="mt-1 text-[11px] text-[var(--text-muted)]">
+                        Downloading {Math.round(progressMeta.progress)}%
+                        {progressMeta.progressValue &&
+                          progressMeta.progressValue.totalBytes > 0 && (
+                            <>
+                              {" "}
+                              (
+                              {formatBytes(
+                                progressMeta.progressValue.downloadedBytes,
+                              )}{" "}
+                              /{" "}
+                              {formatBytes(
+                                progressMeta.progressValue.totalBytes,
+                              )}
+                              )
+                            </>
+                          )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-medium text-white">
+                Modular Stack Models
+              </h3>
+              <p className="text-[11px] text-[var(--text-muted)] mt-1">
+                Fixed stack: Parakeet-TDT-0.6B-v3, Qwen3-1.7B-GGUF, Kokoro-82M.
+              </p>
+            </div>
+            <Button
+              onClick={handleLoadAllModularStack}
+              size="sm"
+              className="text-xs h-8 gap-2"
+              disabled={
+                !hasRequiredModularModels ||
+                !hasLoadableModularModels ||
+                isLoadAllRequested ||
+                isLoadAllBusy
+              }
+            >
+              {isLoadAllRequested ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Play className="w-3.5 h-3.5" />
+              )}
+              {isLoadAllRequested ? "Loading all..." : "Load all"}
+            </Button>
+          </div>
+          <div className="space-y-3">
+            {modularStackModels.map((item) => {
+              const model = item.model;
+              const progressMeta = getModelProgress(model);
+              return (
+                <div
+                  key={item.key}
+                  className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-2.5 space-y-2"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium text-white">
+                        {item.role}
+                      </div>
+                      <div className="mt-0.5 text-xs text-[var(--text-muted)] truncate">
+                        {model
+                          ? formatModelVariantLabel(model.variant)
+                          : item.requiredVariant}
+                      </div>
+                    </div>
+                    <span
+                      className={clsx(
+                        "text-[10px] px-1.5 py-0.5 rounded border whitespace-nowrap",
+                        model
+                          ? getStatusClass(model.status)
+                          : "bg-[var(--bg-surface-2)] border-[var(--border-muted)] text-[var(--text-muted)]",
+                      )}
+                    >
+                      {model ? getStatusLabel(model.status) : "Unavailable"}
+                    </span>
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-end gap-2">
+                    {model?.status === "downloading" && onCancelDownload && (
+                      <Button
+                        onClick={() => onCancelDownload(model.variant)}
+                        variant="destructive"
+                        size="sm"
+                        className="text-xs h-7 gap-2"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                        Cancel
+                      </Button>
+                    )}
+                    {model?.status === "loading" && (
+                      <Button
+                        disabled
+                        variant="outline"
+                        size="sm"
+                        className="text-xs h-7 gap-2"
+                      >
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        Loading
+                      </Button>
+                    )}
+                    {model &&
+                      model.status !== "loading" &&
+                      model.status !== "downloading" && (
+                        <Button
+                          onClick={() => onModelAction(model)}
+                          variant={
+                            model.status === "ready" ? "outline" : "default"
+                          }
+                          size="sm"
+                          className="text-xs h-7 gap-2"
+                        >
+                          {(model.status === "not_downloaded" ||
+                            model.status === "error") && (
+                            <Download className="w-3.5 h-3.5" />
+                          )}
+                          {model.status === "downloaded" && (
+                            <Play className="w-3.5 h-3.5" />
+                          )}
+                          {model.status === "ready" && (
+                            <Square className="w-3.5 h-3.5" />
+                          )}
+                          {model.status === "not_downloaded" ||
+                          model.status === "error"
+                            ? "Download"
+                            : model.status === "downloaded"
+                              ? "Load"
+                              : "Unload"}
+                        </Button>
+                      )}
+                  </div>
+
+                  {model?.status === "downloading" && progressMeta && (
+                    <div>
+                      <div className="h-1.5 rounded bg-[var(--bg-surface-3)] overflow-hidden">
+                        <div
+                          className="h-full rounded bg-white transition-all duration-300"
+                          style={{
+                            width: `${progressMeta.progress}%`,
+                          }}
+                        />
+                      </div>
+                      <div className="mt-1 text-[11px] text-[var(--text-muted)]">
+                        Downloading {Math.round(progressMeta.progress)}%
+                        {progressMeta.progressValue &&
+                          progressMeta.progressValue.totalBytes > 0 && (
+                            <>
+                              {" "}
+                              (
+                              {formatBytes(
+                                progressMeta.progressValue.downloadedBytes,
+                              )}{" "}
+                              /{" "}
+                              {formatBytes(
+                                progressMeta.progressValue.totalBytes,
+                              )}
+                              )
+                            </>
+                          )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </section>
+  );
+
+  const renderAudioOutputSettings = () => (
+    <section className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3 space-y-4">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <h3 className="text-sm font-medium text-white">Audio Output</h3>
+          <p className="text-xs text-[var(--text-muted)] mt-1">
+            Control assistant playback without leaving voice mode.
+          </p>
+        </div>
+        <button
+          onClick={() => setIsOutputMuted((current) => !current)}
+          className="btn btn-secondary h-8 px-3 rounded-full text-[11px] gap-1.5"
+        >
+          {isOutputMuted ? (
+            <VolumeX className="w-3.5 h-3.5" />
+          ) : (
+            <Volume2 className="w-3.5 h-3.5" />
+          )}
+          {isOutputMuted ? "Muted" : "Unmuted"}
+        </button>
+      </div>
+
+      <div>
+        <label className="text-xs text-[var(--text-muted)]">
+          Playback Speed ({playbackSpeed.toFixed(2)}x)
+        </label>
+        <Slider
+          aria-label="Playback speed"
+          min={0.75}
+          max={1.75}
+          step={0.05}
+          value={[playbackSpeed]}
+          onValueChange={(value) => {
+            const next = value[0];
+            if (typeof next === "number") {
+              setPlaybackSpeed(clampPlaybackSpeed(next));
+            }
+          }}
+          className="mt-2"
+        />
+      </div>
+
+      <div className="text-[11px] text-[var(--text-muted)]">
+        Shortcuts: `Space` start or stop, `Escape` stop, `M` mute.
+      </div>
+    </section>
+  );
+
+  const renderAdvancedSpeechSettings = () => (
+    <section className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3">
+      <details>
+        <summary className="cursor-pointer text-sm text-white">
+          Advanced Speech Detection
+        </summary>
+        <div className="mt-3 grid md:grid-cols-3 gap-4">
+          <div>
+            <label className="text-xs text-[var(--text-muted)]">
+              VAD Sensitivity ({vadThreshold.toFixed(3)})
+            </label>
+            <Slider
+              aria-label="VAD sensitivity"
+              min={0.005}
+              max={0.08}
+              step={0.001}
+              value={[vadThreshold]}
+              onValueChange={(value) => {
+                const next = value[0];
+                if (typeof next === "number") {
+                  setVadThreshold(next);
+                }
+              }}
+              className="mt-2"
+            />
+          </div>
+          <div>
+            <label className="text-xs text-[var(--text-muted)]">
+              End Silence (ms): {silenceDurationMs}
+            </label>
+            <Slider
+              aria-label="End silence duration"
+              min={400}
+              max={1800}
+              step={50}
+              value={[silenceDurationMs]}
+              onValueChange={(value) => {
+                const next = value[0];
+                if (typeof next === "number") {
+                  setSilenceDurationMs(next);
+                }
+              }}
+              className="mt-2"
+            />
+          </div>
+          <div>
+            <label className="text-xs text-[var(--text-muted)]">
+              Minimum Speech (ms): {minSpeechMs}
+            </label>
+            <Slider
+              aria-label="Minimum speech duration"
+              min={150}
+              max={1200}
+              step={50}
+              value={[minSpeechMs]}
+              onValueChange={(value) => {
+                const next = value[0];
+                if (typeof next === "number") {
+                  setMinSpeechMs(next);
+                }
+              }}
+              className="mt-2"
+            />
+          </div>
+        </div>
+      </details>
+    </section>
+  );
+
   const startDisabled =
     (lfm2DirectMode && !selectedS2sModel) ||
     (!lfm2DirectMode &&
@@ -2532,7 +3245,7 @@ export function VoicePage({
           )}
         </button>
         <button
-          onClick={() => setIsConfigOpen(true)}
+          onClick={() => openConfig("setup")}
           className="btn btn-secondary h-8 px-3 rounded-full text-[11px] gap-1.5"
         >
           <Settings2 className="w-3.5 h-3.5" />
@@ -2789,647 +3502,54 @@ export function VoicePage({
                 </Button>
               </div>
 
-              <div className="p-4 sm:p-5 overflow-y-auto max-h-[calc(90vh-88px)] space-y-5">
-                <section className="space-y-4">
-                  <div className="flex items-center justify-between gap-2">
-                    <h3 className="text-sm font-medium text-white">
-                      Runtime Profile
-                    </h3>
-                    <span className="text-[11px] text-[var(--text-muted)]">
-                      Choose how inference is orchestrated.
-                    </span>
-                  </div>
-                  <div className="grid md:grid-cols-2 gap-3">
-                    <button
-                      className={cn(
-                        "rounded-lg border p-3 text-left transition-colors",
-                        lfm2DirectMode
-                          ? "border-primary bg-primary/5 ring-1 ring-primary/20"
-                          : "border-border bg-card hover:bg-accent hover:text-accent-foreground",
-                      )}
-                      onClick={() => setPipelineMode("s2s")}
+              <div className="p-4 sm:p-5 overflow-y-auto max-h-[calc(90vh-88px)]">
+                <Tabs
+                  value={configTab}
+                  onValueChange={(value) =>
+                    setConfigTab(value as VoiceConfigTab)
+                  }
+                  className="space-y-4"
+                >
+                  <TabsList className="grid w-full grid-cols-2 gap-1 border-[var(--border-strong)] bg-[var(--bg-surface-2)] p-1 shadow-sm sm:grid-cols-4">
+                    <TabsTrigger
+                      value="setup"
+                      className="text-[var(--text-muted)] data-[state=active]:bg-[var(--accent-solid)] data-[state=active]:text-[var(--text-on-accent)] data-[state=active]:shadow-[0_8px_20px_-14px_rgba(17,17,17,0.55)]"
                     >
-                      <div className="text-sm font-medium">
-                        Unified Speech Model
-                      </div>
-                      <p className="text-xs text-muted-foreground mt-1">
-                        One LFM2.5 model handles user speech understanding and
-                        assistant speech output.
-                      </p>
-                    </button>
-                    <button
-                      className={cn(
-                        "rounded-lg border p-3 text-left transition-colors",
-                        !lfm2DirectMode
-                          ? "border-primary bg-primary/5 ring-1 ring-primary/20"
-                          : "border-border bg-card hover:bg-accent hover:text-accent-foreground",
-                      )}
-                      onClick={() => setPipelineMode("stt_chat_tts")}
+                      Setup
+                    </TabsTrigger>
+                    <TabsTrigger
+                      value="models"
+                      className="text-[var(--text-muted)] data-[state=active]:bg-[var(--accent-solid)] data-[state=active]:text-[var(--text-on-accent)] data-[state=active]:shadow-[0_8px_20px_-14px_rgba(17,17,17,0.55)]"
                     >
-                      <div className="text-sm font-medium">
-                        Modular Voice Stack
-                      </div>
-                      <p className="text-xs text-muted-foreground mt-1">
-                        Uses a fixed local stack: Parakeet ASR, Qwen3-1.7B-GGUF,
-                        and Kokoro-82M.
-                      </p>
-                    </button>
-                  </div>
-                  <div className="text-[11px] text-[var(--text-muted)]">
-                    Current mode: {currentPipelineLabel}
-                  </div>
-                </section>
-
-                <section className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3 space-y-4">
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <h3 className="text-sm font-medium text-white">
-                        Voice Agent Prompt
-                      </h3>
-                      <p className="text-xs text-[var(--text-muted)] mt-1">
-                        Customize how the assistant responds in voice mode.
-                        Prompt updates apply the next time you start a voice
-                        session.
-                      </p>
-                    </div>
-                    {runtimeStatus !== "idle" && (
-                      <span className="text-[11px] rounded-full border border-amber-500/30 bg-amber-500/10 px-2.5 py-1 text-amber-200">
-                        Restart required
-                      </span>
-                    )}
-                  </div>
-
-                  {isVoiceProfileLoading ? (
-                    <p className="text-xs text-[var(--text-muted)]">
-                      Loading saved prompt...
-                    </p>
-                  ) : (
-                    <>
-                      <Textarea
-                        value={systemPromptDraft}
-                        onChange={(event) =>
-                          setSystemPromptDraft(event.target.value)
-                        }
-                        placeholder={defaultSystemPrompt}
-                        className="min-h-[140px] bg-[var(--bg-surface-2)] border-[var(--border-muted)]"
-                      />
-                      <div className="flex flex-wrap items-center justify-between gap-3">
-                        <p className="text-[11px] text-[var(--text-muted)]">
-                          Saved prompt is used for websocket `session_start` and
-                          the legacy agent-session fallback path.
-                        </p>
-                        <div className="flex flex-wrap items-center gap-2">
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() =>
-                              setSystemPromptDraft(defaultSystemPrompt)
-                            }
-                            disabled={
-                              isVoiceProfileSaving ||
-                              systemPromptDraft === defaultSystemPrompt
-                            }
-                          >
-                            Restore Default
-                          </Button>
-                          <Button
-                            size="sm"
-                            onClick={() => void handleSaveSystemPrompt()}
-                            disabled={isVoiceProfileSaving || !isSystemPromptDirty}
-                          >
-                            {isVoiceProfileSaving ? "Saving..." : "Save Prompt"}
-                          </Button>
-                        </div>
-                      </div>
-                    </>
-                  )}
-                </section>
-
-                <section className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3 space-y-4">
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <h3 className="text-sm font-medium text-white">
-                        Observational Memory
-                      </h3>
-                      <p className="text-xs text-[var(--text-muted)] mt-1">
-                        Save stable user preferences and facts from modular
-                        voice turns so future responses can stay grounded.
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <span className="text-[11px] text-[var(--text-muted)]">
-                        {observationalMemoryEnabled ? "Enabled" : "Disabled"}
-                      </span>
-                      <Switch
-                        checked={observationalMemoryEnabled}
-                        onCheckedChange={(checked) => {
-                          void handleSetObservationalMemoryEnabled(checked);
-                        }}
-                        disabled={isVoiceObservationsMutating}
-                        aria-label="Toggle observational memory"
-                      />
-                    </div>
-                  </div>
-
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <p className="text-[11px] text-[var(--text-muted)]">
-                      Memory is currently applied only to modular `/voice`
-                      conversations and can be reviewed or deleted here.
-                    </p>
-                    <div className="flex items-center gap-2">
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => void loadVoiceObservations()}
-                        disabled={isVoiceObservationsLoading}
-                      >
-                        Refresh
-                      </Button>
-                      <Button
-                        variant="destructive"
-                        size="sm"
-                        onClick={() => void handleClearObservations()}
-                        disabled={
-                          isVoiceObservationsMutating ||
-                          voiceObservations.length === 0
-                        }
-                      >
-                        Clear All
-                      </Button>
-                    </div>
-                  </div>
-
-                  <div className="space-y-2">
-                    {isVoiceObservationsLoading ? (
-                      <p className="text-xs text-[var(--text-muted)]">
-                        Loading voice memories...
-                      </p>
-                    ) : voiceObservations.length === 0 ? (
-                      <p className="text-xs text-[var(--text-muted)]">
-                        No voice memories stored yet.
-                      </p>
-                    ) : (
-                      voiceObservations.map((observation) => (
-                        <div
-                          key={observation.id}
-                          className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-3 py-2.5"
-                        >
-                          <div className="flex items-start justify-between gap-3">
-                            <div className="min-w-0">
-                              <div className="flex flex-wrap items-center gap-2">
-                                <span className="text-[10px] uppercase tracking-wide text-[var(--text-muted)]">
-                                  {observation.category}
-                                </span>
-                                <span className="text-[10px] text-[var(--text-muted)]">
-                                  confidence {observation.confidence.toFixed(2)}
-                                </span>
-                                <span className="text-[10px] text-[var(--text-muted)]">
-                                  seen {observation.times_seen}x
-                                </span>
-                              </div>
-                              <p className="mt-1 text-sm text-[var(--text-primary)]">
-                                {observation.summary}
-                              </p>
-                            </div>
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="shrink-0"
-                              onClick={() =>
-                                void handleForgetObservation(observation.id)
-                              }
-                              disabled={isVoiceObservationsMutating}
-                            >
-                              Forget
-                            </Button>
-                          </div>
-                        </div>
-                      ))
-                    )}
-                  </div>
-                </section>
-
-                <section className="space-y-3">
-                  {lfm2DirectMode ? (
-                    <>
-                      <div className="flex items-center justify-between gap-2">
-                        <h3 className="text-sm font-medium text-white">
-                          Unified Models
-                        </h3>
-                        <span className="text-[11px] text-[var(--text-muted)]">
-                          Choose an LFM2.5 model.
-                        </span>
-                      </div>
-                      <div className="grid md:grid-cols-2 gap-3">
-                        {unifiedModelOptions.map((option) => {
-                          const model = option.model;
-                          const isSelected =
-                            !!model && selectedS2sModel === model.variant;
-                          const progressMeta = getModelProgress(model);
-                          return (
-                            <div
-                              key={option.key}
-                              className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3 space-y-3"
-                            >
-                              <div className="flex items-start justify-between gap-2">
-                                <div className="min-w-0">
-                                  <div className="text-sm font-medium text-white">
-                                    {option.label}
-                                  </div>
-                                  <div className="mt-0.5 text-xs text-[var(--text-muted)] truncate">
-                                    {model
-                                      ? formatModelVariantLabel(model.variant)
-                                      : "Model not available in current catalog"}
-                                  </div>
-                                </div>
-                                <span
-                                  className={clsx(
-                                    "text-[10px] px-1.5 py-0.5 rounded border whitespace-nowrap",
-                                    model
-                                      ? getStatusClass(model.status)
-                                      : "bg-[var(--bg-surface-2)] border-[var(--border-muted)] text-[var(--text-muted)]",
-                                  )}
-                                >
-                                  {model
-                                    ? getStatusLabel(model.status)
-                                    : "Unavailable"}
-                                </span>
-                              </div>
-                              <p className="text-xs text-[var(--text-muted)]">
-                                {option.description}
-                              </p>
-                              <div className="flex flex-wrap items-center gap-2">
-                                {model?.status === "downloading" &&
-                                  onCancelDownload && (
-                                    <Button
-                                      onClick={() =>
-                                        onCancelDownload(model.variant)
-                                      }
-                                      variant="destructive"
-                                      size="sm"
-                                      className="text-xs h-8 gap-2"
-                                    >
-                                      <X className="w-3.5 h-3.5" />
-                                      Cancel
-                                    </Button>
-                                  )}
-                                <Button
-                                  onClick={() =>
-                                    model && handleUseUnifiedModel(model)
-                                  }
-                                  size="sm"
-                                  variant={
-                                    model?.status === "ready" && isSelected
-                                      ? "outline"
-                                      : "default"
-                                  }
-                                  disabled={isUnifiedModelButtonDisabled(
-                                    model,
-                                    isSelected,
-                                  )}
-                                  className="text-xs h-8 gap-2"
-                                >
-                                  {(model?.status === "loading" ||
-                                    model?.status === "downloading") && (
-                                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                  )}
-                                  {(model?.status === "not_downloaded" ||
-                                    model?.status === "error") && (
-                                    <Download className="w-3.5 h-3.5" />
-                                  )}
-                                  {(model?.status === "downloaded" ||
-                                    (model?.status === "ready" &&
-                                      !isSelected)) && (
-                                    <Play className="w-3.5 h-3.5" />
-                                  )}
-                                  {getUnifiedModelButtonLabel(
-                                    model,
-                                    isSelected,
-                                  )}
-                                </Button>
-                              </div>
-                              {model?.status === "downloading" &&
-                                progressMeta && (
-                                  <div>
-                                    <div className="h-1.5 rounded bg-[var(--bg-surface-3)] overflow-hidden">
-                                      <div
-                                        className="h-full rounded bg-white transition-all duration-300"
-                                        style={{
-                                          width: `${progressMeta.progress}%`,
-                                        }}
-                                      />
-                                    </div>
-                                    <div className="mt-1 text-[11px] text-[var(--text-muted)]">
-                                      Downloading{" "}
-                                      {Math.round(progressMeta.progress)}%
-                                      {progressMeta.progressValue &&
-                                        progressMeta.progressValue.totalBytes >
-                                          0 && (
-                                          <>
-                                            {" "}
-                                            (
-                                            {formatBytes(
-                                              progressMeta.progressValue
-                                                .downloadedBytes,
-                                            )}{" "}
-                                            /{" "}
-                                            {formatBytes(
-                                              progressMeta.progressValue
-                                                .totalBytes,
-                                            )}
-                                            )
-                                          </>
-                                        )}
-                                    </div>
-                                  </div>
-                                )}
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </>
-                  ) : (
-                    <>
-                      <div className="flex items-center justify-between gap-3">
-                        <div>
-                          <h3 className="text-sm font-medium text-white">
-                            Modular Stack Models
-                          </h3>
-                          <p className="text-[11px] text-[var(--text-muted)] mt-1">
-                            Fixed stack: Parakeet-TDT-0.6B-v3, Qwen3-1.7B-GGUF,
-                            Kokoro-82M.
-                          </p>
-                        </div>
-                        <Button
-                          onClick={handleLoadAllModularStack}
-                          size="sm"
-                          className="text-xs h-8 gap-2"
-                          disabled={
-                            !hasRequiredModularModels ||
-                            !hasLoadableModularModels ||
-                            isLoadAllRequested ||
-                            isLoadAllBusy
-                          }
-                        >
-                          {isLoadAllRequested ? (
-                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                          ) : (
-                            <Play className="w-3.5 h-3.5" />
-                          )}
-                          {isLoadAllRequested ? "Loading all..." : "Load all"}
-                        </Button>
-                      </div>
-                      <div className="space-y-3">
-                        {modularStackModels.map((item) => {
-                          const model = item.model;
-                          const progressMeta = getModelProgress(model);
-                          return (
-                            <div
-                              key={item.key}
-                              className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-2.5 space-y-2"
-                            >
-                              <div className="flex items-start justify-between gap-2">
-                                <div className="min-w-0">
-                                  <div className="text-sm font-medium text-white">
-                                    {item.role}
-                                  </div>
-                                  <div className="mt-0.5 text-xs text-[var(--text-muted)] truncate">
-                                    {model
-                                      ? formatModelVariantLabel(model.variant)
-                                      : item.requiredVariant}
-                                  </div>
-                                </div>
-                                <span
-                                  className={clsx(
-                                    "text-[10px] px-1.5 py-0.5 rounded border whitespace-nowrap",
-                                    model
-                                      ? getStatusClass(model.status)
-                                      : "bg-[var(--bg-surface-2)] border-[var(--border-muted)] text-[var(--text-muted)]",
-                                  )}
-                                >
-                                  {model
-                                    ? getStatusLabel(model.status)
-                                    : "Unavailable"}
-                                </span>
-                              </div>
-
-                              <div className="flex flex-wrap items-center justify-end gap-2">
-                                {model?.status === "downloading" &&
-                                  onCancelDownload && (
-                                    <Button
-                                      onClick={() =>
-                                        onCancelDownload(model.variant)
-                                      }
-                                      variant="destructive"
-                                      size="sm"
-                                      className="text-xs h-7 gap-2"
-                                    >
-                                      <X className="w-3.5 h-3.5" />
-                                      Cancel
-                                    </Button>
-                                  )}
-                                {model?.status === "loading" && (
-                                  <Button
-                                    disabled
-                                    variant="outline"
-                                    size="sm"
-                                    className="text-xs h-7 gap-2"
-                                  >
-                                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                    Loading
-                                  </Button>
-                                )}
-                                {model &&
-                                  model.status !== "loading" &&
-                                  model.status !== "downloading" && (
-                                    <Button
-                                      onClick={() => onModelAction(model)}
-                                      variant={
-                                        model.status === "ready"
-                                          ? "outline"
-                                          : "default"
-                                      }
-                                      size="sm"
-                                      className="text-xs h-7 gap-2"
-                                    >
-                                      {(model.status === "not_downloaded" ||
-                                        model.status === "error") && (
-                                        <Download className="w-3.5 h-3.5" />
-                                      )}
-                                      {model.status === "downloaded" && (
-                                        <Play className="w-3.5 h-3.5" />
-                                      )}
-                                      {model.status === "ready" && (
-                                        <Square className="w-3.5 h-3.5" />
-                                      )}
-                                      {model.status === "not_downloaded" ||
-                                      model.status === "error"
-                                        ? "Download"
-                                        : model.status === "downloaded"
-                                          ? "Load"
-                                          : "Unload"}
-                                    </Button>
-                                  )}
-                              </div>
-
-                              {model?.status === "downloading" &&
-                                progressMeta && (
-                                  <div>
-                                    <div className="h-1.5 rounded bg-[var(--bg-surface-3)] overflow-hidden">
-                                      <div
-                                        className="h-full rounded bg-white transition-all duration-300"
-                                        style={{
-                                          width: `${progressMeta.progress}%`,
-                                        }}
-                                      />
-                                    </div>
-                                    <div className="mt-1 text-[11px] text-[var(--text-muted)]">
-                                      Downloading{" "}
-                                      {Math.round(progressMeta.progress)}%
-                                      {progressMeta.progressValue &&
-                                        progressMeta.progressValue.totalBytes >
-                                          0 && (
-                                          <>
-                                            {" "}
-                                            (
-                                            {formatBytes(
-                                              progressMeta.progressValue
-                                                .downloadedBytes,
-                                            )}{" "}
-                                            /{" "}
-                                            {formatBytes(
-                                              progressMeta.progressValue
-                                                .totalBytes,
-                                            )}
-                                            )
-                                          </>
-                                        )}
-                                    </div>
-                                  </div>
-                                )}
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </>
-                  )}
-                </section>
-
-                <section className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3 space-y-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <h3 className="text-sm font-medium text-white">
-                        Audio Output
-                      </h3>
-                      <p className="text-xs text-[var(--text-muted)] mt-1">
-                        Control assistant playback without leaving voice mode.
-                      </p>
-                    </div>
-                    <button
-                      onClick={() => setIsOutputMuted((current) => !current)}
-                      className="btn btn-secondary h-8 px-3 rounded-full text-[11px] gap-1.5"
+                      Models
+                    </TabsTrigger>
+                    <TabsTrigger
+                      value="agent"
+                      className="text-[var(--text-muted)] data-[state=active]:bg-[var(--accent-solid)] data-[state=active]:text-[var(--text-on-accent)] data-[state=active]:shadow-[0_8px_20px_-14px_rgba(17,17,17,0.55)]"
                     >
-                      {isOutputMuted ? (
-                        <VolumeX className="w-3.5 h-3.5" />
-                      ) : (
-                        <Volume2 className="w-3.5 h-3.5" />
-                      )}
-                      {isOutputMuted ? "Muted" : "Unmuted"}
-                    </button>
-                  </div>
+                      Agent
+                    </TabsTrigger>
+                    <TabsTrigger
+                      value="memory"
+                      className="text-[var(--text-muted)] data-[state=active]:bg-[var(--accent-solid)] data-[state=active]:text-[var(--text-on-accent)] data-[state=active]:shadow-[0_8px_20px_-14px_rgba(17,17,17,0.55)]"
+                    >
+                      Memory
+                    </TabsTrigger>
+                  </TabsList>
 
-                  <div>
-                    <label className="text-xs text-[var(--text-muted)]">
-                      Playback Speed ({playbackSpeed.toFixed(2)}x)
-                    </label>
-                    <Slider
-                      aria-label="Playback speed"
-                      min={0.75}
-                      max={1.75}
-                      step={0.05}
-                      value={[playbackSpeed]}
-                      onValueChange={(value) => {
-                        const next = value[0];
-                        if (typeof next === "number") {
-                          setPlaybackSpeed(clampPlaybackSpeed(next));
-                        }
-                      }}
-                      className="mt-2"
-                    />
-                  </div>
-
-                  <div className="text-[11px] text-[var(--text-muted)]">
-                    Shortcuts: `Space` start or stop, `Escape` stop, `M`
-                    mute.
-                  </div>
-                </section>
-
-                <section className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3">
-                  <details>
-                    <summary className="cursor-pointer text-sm text-white">
-                      Advanced Speech Detection
-                    </summary>
-                    <div className="mt-3 grid md:grid-cols-3 gap-4">
-                      <div>
-                        <label className="text-xs text-[var(--text-muted)]">
-                          VAD Sensitivity ({vadThreshold.toFixed(3)})
-                        </label>
-                        <Slider
-                          aria-label="VAD sensitivity"
-                          min={0.005}
-                          max={0.08}
-                          step={0.001}
-                          value={[vadThreshold]}
-                          onValueChange={(value) => {
-                            const next = value[0];
-                            if (typeof next === "number") {
-                              setVadThreshold(next);
-                            }
-                          }}
-                          className="mt-2"
-                        />
-                      </div>
-                      <div>
-                        <label className="text-xs text-[var(--text-muted)]">
-                          End Silence (ms): {silenceDurationMs}
-                        </label>
-                        <Slider
-                          aria-label="End silence duration"
-                          min={400}
-                          max={1800}
-                          step={50}
-                          value={[silenceDurationMs]}
-                          onValueChange={(value) => {
-                            const next = value[0];
-                            if (typeof next === "number") {
-                              setSilenceDurationMs(next);
-                            }
-                          }}
-                          className="mt-2"
-                        />
-                      </div>
-                      <div>
-                        <label className="text-xs text-[var(--text-muted)]">
-                          Minimum Speech (ms): {minSpeechMs}
-                        </label>
-                        <Slider
-                          aria-label="Minimum speech duration"
-                          min={150}
-                          max={1200}
-                          step={50}
-                          value={[minSpeechMs]}
-                          onValueChange={(value) => {
-                            const next = value[0];
-                            if (typeof next === "number") {
-                              setMinSpeechMs(next);
-                            }
-                          }}
-                          className="mt-2"
-                        />
-                      </div>
-                    </div>
-                  </details>
-                </section>
+                  <TabsContent value="setup" className="mt-0">
+                    {renderSetupTab()}
+                  </TabsContent>
+                  <TabsContent value="models" className="mt-0">
+                    {renderModelSettings()}
+                  </TabsContent>
+                  <TabsContent value="agent" className="mt-0">
+                    {renderPromptSettings()}
+                  </TabsContent>
+                  <TabsContent value="memory" className="mt-0">
+                    {renderMemorySettings()}
+                  </TabsContent>
+                </Tabs>
               </div>
             </motion.div>
           </motion.div>
