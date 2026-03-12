@@ -962,12 +962,13 @@ export function TextToSpeechWorkspace({
           </div>
 
           <div className="mb-4 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
-            <div className="flex items-start justify-between gap-4">
+            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--text-subtle)]">
+              Active Model
+            </div>
+
+            <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
               <div className="min-w-0 flex-1">
-                <div className="text-[11px] uppercase tracking-wide text-[var(--text-subtle)]">
-                  Active Model
-                </div>
-                <div className="mt-2">{renderModelSelector()}</div>
+                <div className="w-full max-w-[360px]">{renderModelSelector()}</div>
                 <div
                   className={cn(
                     "mt-2 text-xs",
@@ -980,17 +981,16 @@ export function TextToSpeechWorkspace({
                     "Select and load a TTS model to continue"}
                 </div>
               </div>
+
               {onOpenModelManager ? (
-                <div className="shrink-0">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={onOpenModelManager}
-                  >
-                    <Settings2 className="h-4 w-4" />
-                    Models
-                  </Button>
-                </div>
+                <Button
+                  variant="outline"
+                  onClick={onOpenModelManager}
+                  className="h-11 shrink-0 rounded-xl px-4"
+                >
+                  <Settings2 className="h-4 w-4" />
+                  Models
+                </Button>
               ) : null}
             </div>
           </div>
