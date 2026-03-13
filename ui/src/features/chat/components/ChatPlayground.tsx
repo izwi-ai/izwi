@@ -1,4 +1,5 @@
 import {
+  type ChangeEvent,
   useCallback,
   useEffect,
   useMemo,
@@ -34,6 +35,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import {
+  buildChatThreadMessagePayload,
   DEFAULT_SYSTEM_PROMPT,
   DEFAULT_THREAD_TITLE,
   THINKING_SYSTEM_PROMPT,
@@ -41,6 +43,7 @@ import {
   type GenerateTitleArgs,
   type ImagePreviewState,
   type ModelOption,
+  type PendingImageAttachment,
   defaultThinkingEnabledForModel,
   displayThreadTitle,
   extractLatestStats,
@@ -51,7 +54,9 @@ import {
   normalizeGeneratedThreadTitle,
   parseAssistantContent,
   parseUserMessageDisplayFromContentParts,
+  readImageFileAsDataUrl,
   stripThinkingArtifacts,
+  supportsImageAttachmentsForModel,
   supportsImplicitOpenThinkTagParsing,
   threadPreviewFromContent,
 } from "@/features/chat/playground/support";
@@ -96,6 +101,10 @@ export function ChatPlayground({
   const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(
     null,
   );
+  const [pendingImages, setPendingImages] = useState<PendingImageAttachment[]>(
+    [],
+  );
+  const [isReadingImages, setIsReadingImages] = useState(false);
   const [isHistoryDrawerOpen, setIsHistoryDrawerOpen] = useState(false);
   const [deleteTargetThreadId, setDeleteTargetThreadId] = useState<
     string | null
@@ -113,6 +122,8 @@ export function ChatPlayground({
   const streamingThinkingRef = useRef<HTMLDivElement | null>(null);
   const modelMenuRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
+  const pendingImageSeqRef = useRef(0);
 
   const selectedOption = useMemo(() => {
     if (!selectedModel) {
@@ -151,6 +162,8 @@ export function ChatPlayground({
     (visibleMessages.length > 0 || isStreaming || messagesLoading);
   const isEmptyChatWorkspace = !hasConversation;
   const thinkingEnabledForModel = supportsThinking && isThinkingEnabled;
+  const supportsImageAttachments =
+    supportsImageAttachmentsForModel(selectedModel);
   const renderModelId = activeThread?.model_id ?? selectedModel;
   const implicitOpenThinkTagModel =
     supportsImplicitOpenThinkTagParsing(renderModelId);
@@ -183,6 +196,16 @@ export function ChatPlayground({
     }
     setIsThinkingEnabled(defaultThinkingEnabledForModel(selectedModel));
   }, [selectedModel, supportsThinking]);
+
+  useEffect(() => {
+    if (supportsImageAttachments) {
+      return;
+    }
+    setPendingImages([]);
+    if (imageInputRef.current) {
+      imageInputRef.current.value = "";
+    }
+  }, [supportsImageAttachments]);
 
   const refreshThreadList = useCallback(
     async (preferredThreadId?: string | null) => {
@@ -491,6 +514,7 @@ export function ChatPlayground({
       setStats(null);
       setError(null);
       setInput("");
+      setPendingImages([]);
     } catch (createError) {
       setError(getErrorMessage(createError, "Failed to create a new chat."));
     }
@@ -499,6 +523,7 @@ export function ChatPlayground({
     isPreparingThread,
     isStreaming,
     selectedModel,
+    setPendingImages,
     setActiveThreadInUrl,
   ]);
 
@@ -559,9 +584,60 @@ export function ChatPlayground({
     [deleteTargetThreadId],
   );
 
+  const removePendingImage = useCallback((imageId: string) => {
+    setPendingImages((previous) =>
+      previous.filter((image) => image.id !== imageId),
+    );
+  }, []);
+
+  const handleComposerImageChange = useCallback(
+    async (event: ChangeEvent<HTMLInputElement>) => {
+      const files = Array.from(event.target.files ?? []);
+      if (files.length === 0) {
+        return;
+      }
+
+      const invalidFile = files.find((file) => !file.type.startsWith("image/"));
+      if (invalidFile) {
+        setError(`Only image files are supported here, not ${invalidFile.name}.`);
+        event.target.value = "";
+        return;
+      }
+
+      setError(null);
+      setIsReadingImages(true);
+      try {
+        const nextImages = await Promise.all(
+          files.map(async (file) => {
+            pendingImageSeqRef.current += 1;
+            return {
+              id: `image-${pendingImageSeqRef.current}`,
+              source: await readImageFileAsDataUrl(file),
+              label: file.name || `image-${pendingImageSeqRef.current}.png`,
+            } satisfies PendingImageAttachment;
+          }),
+        );
+
+        setPendingImages((previous) => [...previous, ...nextImages]);
+      } catch (imageError) {
+        setError(
+          getErrorMessage(imageError, "Failed to read the selected image."),
+        );
+      } finally {
+        setIsReadingImages(false);
+        event.target.value = "";
+      }
+    },
+    [],
+  );
+
+  const openImagePicker = useCallback(() => {
+    imageInputRef.current?.click();
+  }, []);
+
   const sendMessage = async () => {
     const text = input.trim();
-    if (!text || isStreaming || isPreparingThread) {
+    if ((text.length === 0 && pendingImages.length === 0) || isStreaming || isPreparingThread) {
       return;
     }
 
@@ -598,6 +674,11 @@ export function ChatPlayground({
     setError(null);
     setStats(null);
 
+    const requestPayload = buildChatThreadMessagePayload({
+      text,
+      images: pendingImages,
+    });
+
     const isFirstTurn =
       targetThreadId === activeThreadId
         ? messages.filter((message) => message.role === "user").length === 0
@@ -611,7 +692,8 @@ export function ChatPlayground({
       id: userTempId,
       thread_id: targetThreadId,
       role: "user",
-      content: text,
+      content: requestPayload.content,
+      content_parts: requestPayload.contentParts,
       created_at: timestamp,
       tokens_generated: null,
       generation_time_ms: null,
@@ -639,6 +721,7 @@ export function ChatPlayground({
       optimisticAssistantMessage,
     ]);
     setInput("");
+    setPendingImages([]);
     setIsStreaming(true);
     setStreamingThreadId(targetThreadId);
 
@@ -646,7 +729,8 @@ export function ChatPlayground({
       targetThreadId,
       {
         model_id: selectedModel,
-        content: text,
+        content: requestPayload.content,
+        content_parts: requestPayload.contentParts,
         system_prompt: systemPrompt,
       },
       {
@@ -725,7 +809,7 @@ export function ChatPlayground({
           if (isFirstTurn) {
             void maybeGenerateThreadTitle({
               threadId: targetThreadId,
-              userContent: text,
+              userContent: requestPayload.content,
               assistantContent: assistantMessage.content,
               modelId,
             });
@@ -883,6 +967,47 @@ export function ChatPlayground({
           : "chat-composer-shell-docked",
       )}
     >
+      {pendingImages.length > 0 && (
+        <div className="flex flex-wrap gap-3 border-b border-[var(--border-muted)] px-4 pb-3 pt-4">
+          {pendingImages.map((image) => (
+            <div
+              key={image.id}
+              className="group relative h-20 w-20 overflow-hidden rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-2)]"
+            >
+              <button
+                type="button"
+                onClick={() =>
+                  setImagePreview({
+                    source: image.source,
+                    label: image.label,
+                  })
+                }
+                className="h-full w-full"
+                title={`Preview ${image.label}`}
+              >
+                <img
+                  src={image.source}
+                  alt={image.label}
+                  className="h-full w-full object-cover"
+                />
+              </button>
+              <button
+                type="button"
+                onClick={() => removePendingImage(image.id)}
+                className="absolute right-1 top-1 inline-flex h-6 w-6 items-center justify-center rounded-full border border-black/10 bg-black/70 text-white opacity-0 transition-opacity group-hover:opacity-100 focus:opacity-100"
+                title={`Remove ${image.label}`}
+                aria-label={`Remove ${image.label}`}
+              >
+                <Trash2 className="h-3 w-3" />
+              </button>
+              <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/70 to-transparent px-2 pb-1.5 pt-4 text-[10px] font-medium text-white">
+                <span className="block truncate">{image.label}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
       <textarea
         ref={textareaRef}
         value={input}
@@ -895,15 +1020,31 @@ export function ChatPlayground({
         }}
         placeholder={
           !activeThreadId
-            ? "Ask anything..."
+            ? supportsImageAttachments
+              ? "Ask anything or attach an image..."
+              : "Ask anything..."
             : !selectedModel
               ? "Choose a model and ask anything..."
               : !selectedModelReady
                 ? "Model selected but not loaded. Open Models to load it."
-                : "Ask anything..."
+                : supportsImageAttachments
+                  ? "Ask anything or attach an image..."
+                  : "Ask anything..."
         }
         className="chat-composer-input w-full resize-none bg-transparent px-5 pt-5 pb-2 text-[0.9375rem] focus:outline-none placeholder:text-[var(--text-muted)]"
-        disabled={isStreaming || isPreparingThread}
+        disabled={isStreaming || isPreparingThread || isReadingImages}
+      />
+
+      <input
+        ref={imageInputRef}
+        data-testid="chat-image-input"
+        type="file"
+        accept="image/*"
+        multiple
+        className="hidden"
+        onChange={(event) => {
+          void handleComposerImageChange(event);
+        }}
       />
 
       <div
@@ -920,6 +1061,24 @@ export function ChatPlayground({
             <Settings2 className="w-3.5 h-3.5" />
             Models
           </Button>
+          {supportsImageAttachments && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={openImagePicker}
+              disabled={isStreaming || isPreparingThread || isReadingImages}
+              className={cn("h-8 gap-1.5 border text-xs", chatSecondaryButtonClass)}
+              title="Attach image"
+              aria-label="Attach image"
+            >
+              {isReadingImages ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <ImageIcon className="w-3.5 h-3.5" />
+              )}
+              Attach image
+            </Button>
+          )}
           {supportsThinking && (
             <Button
               variant="outline"
@@ -952,7 +1111,13 @@ export function ChatPlayground({
         <div className="ml-auto flex items-center justify-end">
           <Button
             onClick={isStreaming ? stopStreaming : () => void sendMessage()}
-            disabled={isPreparingThread || (!isStreaming && !input.trim())}
+            disabled={
+              isPreparingThread ||
+              isReadingImages ||
+              (!isStreaming &&
+                input.trim().length === 0 &&
+                pendingImages.length === 0)
+            }
             variant="default"
             size="icon"
             title={
