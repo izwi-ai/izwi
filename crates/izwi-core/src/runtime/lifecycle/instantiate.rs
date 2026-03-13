@@ -44,7 +44,10 @@ impl RuntimeService {
                     .await?;
                 InstantiatedPayload::None
             }
-            ModelFamily::Qwen3Chat | ModelFamily::Lfm2Chat | ModelFamily::Gemma3Chat => {
+            ModelFamily::Qwen3Chat
+            | ModelFamily::Qwen35Chat
+            | ModelFamily::Lfm2Chat
+            | ModelFamily::Gemma3Chat => {
                 self.model_registry.load_chat(variant, &model_path).await?;
                 InstantiatedPayload::None
             }

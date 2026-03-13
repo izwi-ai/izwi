@@ -138,6 +138,18 @@ export function getChatRouteModelLabel(variant: string): string {
   if (variant === "Qwen3-8B-GGUF") {
     return withQwen3Prefix("Chat 8B GGUF (Q4_K_M)", variant);
   }
+  if (variant === "Qwen3.5-0.8B") {
+    return "Qwen3.5 0.8B GGUF (Q4_K_M)";
+  }
+  if (variant === "Qwen3.5-2B") {
+    return "Qwen3.5 2B GGUF (Q4_K_M)";
+  }
+  if (variant === "Qwen3.5-4B") {
+    return "Qwen3.5 4B GGUF (Q4_K_M)";
+  }
+  if (variant === "Qwen3.5-9B") {
+    return "Qwen3.5 9B GGUF (Q4_K_M)";
+  }
   if (variant === "LFM2.5-1.2B-Instruct-GGUF") {
     return "LFM2.5 1.2B Instruct GGUF (Q4_K_M)";
   }

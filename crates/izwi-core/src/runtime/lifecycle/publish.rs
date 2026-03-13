@@ -22,6 +22,7 @@ impl RuntimeService {
             | ModelFamily::Qwen3ForcedAligner
             | ModelFamily::SortformerDiarization
             | ModelFamily::Qwen3Chat
+            | ModelFamily::Qwen35Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Gemma3Chat
             | ModelFamily::Voxtral

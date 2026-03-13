@@ -147,6 +147,38 @@ pub enum ModelVariant {
     /// Qwen3 14B text model (GGUF Q4_K_M)
     #[serde(rename = "Qwen3-14B-GGUF")]
     Qwen314BGguf,
+    /// Qwen3.5 0.8B multimodal chat model (GGUF Q4_K_M only)
+    #[serde(
+        rename = "Qwen3.5-0.8B",
+        alias = "Qwen3.5-0.8B-GGUF",
+        alias = "unsloth/Qwen3.5-0.8B-GGUF",
+        alias = "Qwen3.5-0.8B-Q4_K_M.gguf"
+    )]
+    Qwen3508BGguf,
+    /// Qwen3.5 2B multimodal chat model (GGUF Q4_K_M only)
+    #[serde(
+        rename = "Qwen3.5-2B",
+        alias = "Qwen3.5-2B-GGUF",
+        alias = "unsloth/Qwen3.5-2B-GGUF",
+        alias = "Qwen3.5-2B-Q4_K_M.gguf"
+    )]
+    Qwen352BGguf,
+    /// Qwen3.5 4B multimodal chat model (GGUF Q4_K_M only)
+    #[serde(
+        rename = "Qwen3.5-4B",
+        alias = "Qwen3.5-4B-GGUF",
+        alias = "unsloth/Qwen3.5-4B-GGUF",
+        alias = "Qwen3.5-4B-Q4_K_M.gguf"
+    )]
+    Qwen354BGguf,
+    /// Qwen3.5 9B multimodal chat model (GGUF Q4_K_M only)
+    #[serde(
+        rename = "Qwen3.5-9B",
+        alias = "Qwen3.5-9B-GGUF",
+        alias = "unsloth/Qwen3.5-9B-GGUF",
+        alias = "Qwen3.5-9B-Q4_K_M.gguf"
+    )]
+    Qwen359BGguf,
     /// Gemma 3 1B instruction-tuned chat model
     #[serde(rename = "Gemma-3-1b-it")]
     Gemma31BIt,
@@ -234,6 +266,10 @@ impl ModelVariant {
             Self::Qwen34BGguf => "Qwen/Qwen3-4B-GGUF",
             Self::Qwen38BGguf => "Qwen/Qwen3-8B-GGUF",
             Self::Qwen314BGguf => "Qwen/Qwen3-14B-GGUF",
+            Self::Qwen3508BGguf => "unsloth/Qwen3.5-0.8B-GGUF",
+            Self::Qwen352BGguf => "unsloth/Qwen3.5-2B-GGUF",
+            Self::Qwen354BGguf => "unsloth/Qwen3.5-4B-GGUF",
+            Self::Qwen359BGguf => "unsloth/Qwen3.5-9B-GGUF",
             Self::Gemma31BIt => "google/gemma-3-1b-it",
             Self::Gemma34BIt => "google/gemma-3-4b-it",
             Self::Qwen3ForcedAligner06B => "Qwen/Qwen3-ForcedAligner-0.6B",
@@ -288,6 +324,10 @@ impl ModelVariant {
             Self::Qwen34BGguf => "Qwen3 4B GGUF",
             Self::Qwen38BGguf => "Qwen3 8B GGUF",
             Self::Qwen314BGguf => "Qwen3 14B GGUF",
+            Self::Qwen3508BGguf => "Qwen3.5 0.8B GGUF",
+            Self::Qwen352BGguf => "Qwen3.5 2B GGUF",
+            Self::Qwen354BGguf => "Qwen3.5 4B GGUF",
+            Self::Qwen359BGguf => "Qwen3.5 9B GGUF",
             Self::Gemma31BIt => "Gemma 3 1B Instruct",
             Self::Gemma34BIt => "Gemma 3 4B Instruct",
             Self::Qwen3ForcedAligner06B => "Qwen3-ForcedAligner 0.6B",
@@ -342,6 +382,10 @@ impl ModelVariant {
             Self::Qwen34BGguf => "Qwen3-4B-GGUF",
             Self::Qwen38BGguf => "Qwen3-8B-GGUF",
             Self::Qwen314BGguf => "Qwen3-14B-GGUF",
+            Self::Qwen3508BGguf => "Qwen3.5-0.8B",
+            Self::Qwen352BGguf => "Qwen3.5-2B",
+            Self::Qwen354BGguf => "Qwen3.5-4B",
+            Self::Qwen359BGguf => "Qwen3.5-9B",
             Self::Gemma31BIt => "Gemma-3-1b-it",
             Self::Gemma34BIt => "Gemma-3-4b-it",
             Self::Qwen3ForcedAligner06B => "Qwen3-ForcedAligner-0.6B",
@@ -396,6 +440,10 @@ impl ModelVariant {
             Self::Qwen34BGguf => 2_500_000_000, // ~2.33 GB (Q4_K_M GGUF, HF file size, Feb 2026)
             Self::Qwen38BGguf => 5_200_000_000, // ~4.84 GB (Q4_K_M est)
             Self::Qwen314BGguf => 9_200_000_000, // ~8.57 GB (Q4_K_M est)
+            Self::Qwen3508BGguf => 737_504_352, // local GGUF + mmproj + tokenizer assets
+            Self::Qwen352BGguf => 1_949_063_104, // local GGUF + mmproj + tokenizer assets
+            Self::Qwen354BGguf => 3_413_361_504, // local GGUF + mmproj + tokenizer assets
+            Self::Qwen359BGguf => 6_598_688_544, // local GGUF + mmproj + tokenizer assets
             Self::Gemma31BIt => 2_200_000_000,  // ~2.05 GB (est)
             Self::Gemma34BIt => 8_600_000_000,  // ~8.01 GB (est)
             Self::Qwen3ForcedAligner06B => 1_840_072_459, // ~1.71 GB
@@ -449,6 +497,10 @@ impl ModelVariant {
             Self::Qwen34BGguf => 6.0,
             Self::Qwen38BGguf => 10.0,
             Self::Qwen314BGguf => 16.0,
+            Self::Qwen3508BGguf => 3.5,
+            Self::Qwen352BGguf => 5.5,
+            Self::Qwen354BGguf => 9.0,
+            Self::Qwen359BGguf => 16.0,
             Self::Gemma31BIt => 3.5,
             Self::Gemma34BIt => 11.0,
             Self::Qwen3ForcedAligner06B => 2.5,
@@ -503,6 +555,7 @@ impl ModelVariant {
         matches!(
             self.family(),
             crate::catalog::ModelFamily::Qwen3Chat
+                | crate::catalog::ModelFamily::Qwen35Chat
                 | crate::catalog::ModelFamily::Gemma3Chat
                 | crate::catalog::ModelFamily::Lfm2Chat
         )
@@ -670,6 +723,10 @@ impl ModelVariant {
                 | Self::Qwen34BGguf
                 | Self::Qwen38BGguf
                 | Self::Qwen314BGguf
+                | Self::Qwen3508BGguf
+                | Self::Qwen352BGguf
+                | Self::Qwen354BGguf
+                | Self::Qwen359BGguf
                 | Self::Qwen3ForcedAligner06B4Bit
         )
     }
@@ -683,6 +740,10 @@ impl ModelVariant {
                 | Self::Qwen34BGguf
                 | Self::Qwen38BGguf
                 | Self::Qwen314BGguf
+                | Self::Qwen3508BGguf
+                | Self::Qwen352BGguf
+                | Self::Qwen354BGguf
+                | Self::Qwen359BGguf
                 | Self::Lfm2512BInstructGguf
                 | Self::Lfm2512BThinkingGguf
         )
@@ -697,6 +758,17 @@ impl ModelVariant {
                 | Self::Qwen34BGguf
                 | Self::Qwen38BGguf
                 | Self::Qwen314BGguf
+        )
+    }
+
+    /// Whether this is a Qwen3.5 chat GGUF variant.
+    pub fn is_qwen35_chat_gguf(&self) -> bool {
+        matches!(
+            self,
+            Self::Qwen3508BGguf
+                | Self::Qwen352BGguf
+                | Self::Qwen354BGguf
+                | Self::Qwen359BGguf
         )
     }
 
@@ -720,6 +792,10 @@ impl ModelVariant {
             | Self::Qwen317BGguf
             | Self::Qwen34BGguf
             | Self::Qwen38BGguf
+            | Self::Qwen3508BGguf
+            | Self::Qwen352BGguf
+            | Self::Qwen354BGguf
+            | Self::Qwen359BGguf
             | Self::Gemma31BIt
             | Self::Qwen3Asr17B4Bit
             | Self::Qwen3Tts12Hz06BBase4Bit
@@ -789,6 +865,10 @@ impl ModelVariant {
             Self::Qwen34BGguf,
             Self::Qwen38BGguf,
             Self::Qwen314BGguf,
+            Self::Qwen3508BGguf,
+            Self::Qwen352BGguf,
+            Self::Qwen354BGguf,
+            Self::Qwen359BGguf,
             Self::Gemma31BIt,
             Self::Gemma34BIt,
             Self::Qwen3ForcedAligner06B,
@@ -922,6 +1002,28 @@ mod tests {
             assert!(
                 !variant.is_enabled(),
                 "{} should be disabled",
+                variant.dir_name()
+            );
+        }
+    }
+
+    #[test]
+    fn qwen35_chat_variants_are_enabled_gguf_models() {
+        let active = [
+            ModelVariant::Qwen3508BGguf,
+            ModelVariant::Qwen352BGguf,
+            ModelVariant::Qwen354BGguf,
+            ModelVariant::Qwen359BGguf,
+        ];
+
+        for variant in active {
+            assert!(variant.is_enabled(), "{} should be enabled", variant.dir_name());
+            assert!(variant.is_chat(), "{} should be chat", variant.dir_name());
+            assert!(variant.is_quantized(), "{} should be quantized", variant.dir_name());
+            assert!(variant.is_gguf(), "{} should be gguf", variant.dir_name());
+            assert!(
+                variant.is_qwen35_chat_gguf(),
+                "{} should be a qwen3.5 gguf",
                 variant.dir_name()
             );
         }

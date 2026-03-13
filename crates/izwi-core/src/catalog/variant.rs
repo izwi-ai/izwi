@@ -13,6 +13,7 @@ pub enum ModelFamily {
     WhisperAsr,
     SortformerDiarization,
     Qwen3Chat,
+    Qwen35Chat,
     Lfm2Chat,
     Gemma3Chat,
     Qwen3ForcedAligner,
@@ -107,6 +108,9 @@ impl ModelVariant {
             DiarStreamingSortformer4SpkV21 => ModelFamily::SortformerDiarization,
             Qwen306B | Qwen306B4Bit | Qwen306BGguf | Qwen317B | Qwen317B4Bit | Qwen317BGguf
             | Qwen34BGguf | Qwen38BGguf | Qwen314BGguf => ModelFamily::Qwen3Chat,
+            Qwen3508BGguf | Qwen352BGguf | Qwen354BGguf | Qwen359BGguf => {
+                ModelFamily::Qwen35Chat
+            }
             Lfm2512BInstructGguf | Lfm2512BThinkingGguf => ModelFamily::Lfm2Chat,
             Gemma31BIt | Gemma34BIt => ModelFamily::Gemma3Chat,
             Qwen3ForcedAligner06B | Qwen3ForcedAligner06B4Bit => ModelFamily::Qwen3ForcedAligner,
@@ -121,7 +125,10 @@ impl ModelVariant {
                 ModelTask::Asr
             }
             ModelFamily::SortformerDiarization => ModelTask::Diarization,
-            ModelFamily::Qwen3Chat | ModelFamily::Lfm2Chat | ModelFamily::Gemma3Chat => {
+            ModelFamily::Qwen3Chat
+            | ModelFamily::Qwen35Chat
+            | ModelFamily::Lfm2Chat
+            | ModelFamily::Gemma3Chat => {
                 ModelTask::Chat
             }
             ModelFamily::Qwen3ForcedAligner => ModelTask::ForcedAlign,
@@ -358,6 +365,10 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
         return Some(Kokoro82M);
     }
 
+    if let Some(qwen35_variant) = resolve_qwen35_chat_variant(normalized) {
+        return Some(qwen35_variant);
+    }
+
     if normalized.contains("qwen3") && !normalized.contains("asr") && !normalized.contains("tts") {
         let is_14b = normalized.contains("14b");
         let is_17b = normalized.contains("17b") || normalized.contains("17");
@@ -413,6 +424,36 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
 
     if let Some(lfm2_variant) = resolve_lfm2_audio_variant(normalized) {
         return Some(lfm2_variant);
+    }
+
+    None
+}
+
+fn resolve_qwen35_chat_variant(normalized: &str) -> Option<ModelVariant> {
+    use ModelVariant::*;
+
+    if !normalized.contains("qwen35") {
+        return None;
+    }
+
+    if normalized.contains("asr")
+        || normalized.contains("tts")
+        || normalized.contains("forcedaligner")
+    {
+        return None;
+    }
+
+    if normalized.contains("09b") || normalized.contains("9b") {
+        return Some(Qwen359BGguf);
+    }
+    if normalized.contains("08b") || normalized.contains("08") {
+        return Some(Qwen3508BGguf);
+    }
+    if normalized.contains("2b") {
+        return Some(Qwen352BGguf);
+    }
+    if normalized.contains("4b") {
+        return Some(Qwen354BGguf);
     }
 
     None
@@ -566,6 +607,25 @@ mod tests {
     fn parse_gemma_by_repo_tail() {
         let parsed = parse_model_variant("gemma-3-4b-it").unwrap();
         assert_eq!(parsed, ModelVariant::Gemma34BIt);
+    }
+
+    #[test]
+    fn parse_qwen35_chat_repo_alias() {
+        let parsed = parse_chat_model_variant(Some("unsloth/Qwen3.5-4B-GGUF")).unwrap();
+        assert_eq!(parsed, ModelVariant::Qwen354BGguf);
+        assert_eq!(parsed.family(), ModelFamily::Qwen35Chat);
+    }
+
+    #[test]
+    fn parse_qwen35_chat_base_name() {
+        let parsed = parse_chat_model_variant(Some("Qwen3.5-0.8B")).unwrap();
+        assert_eq!(parsed, ModelVariant::Qwen3508BGguf);
+    }
+
+    #[test]
+    fn parse_qwen35_chat_q4_file_alias() {
+        let parsed = parse_chat_model_variant(Some("Qwen3.5-9B-Q4_K_M.gguf")).unwrap();
+        assert_eq!(parsed, ModelVariant::Qwen359BGguf);
     }
 
     #[test]

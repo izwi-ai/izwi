@@ -36,6 +36,16 @@ fn qwen_chat_gguf_filename(variant: ModelVariant) -> Option<&'static str> {
     }
 }
 
+fn qwen35_chat_gguf_filename(variant: ModelVariant) -> Option<&'static str> {
+    match variant {
+        ModelVariant::Qwen3508BGguf => Some("Qwen3.5-0.8B-Q4_K_M.gguf"),
+        ModelVariant::Qwen352BGguf => Some("Qwen3.5-2B-Q4_K_M.gguf"),
+        ModelVariant::Qwen354BGguf => Some("Qwen3.5-4B-Q4_K_M.gguf"),
+        ModelVariant::Qwen359BGguf => Some("Qwen3.5-9B-Q4_K_M.gguf"),
+        _ => None,
+    }
+}
+
 fn lfm2_chat_gguf_filename(variant: ModelVariant) -> Option<&'static str> {
     match variant {
         ModelVariant::Lfm2512BInstructGguf => Some("LFM2.5-1.2B-Instruct-Q4_K_M.gguf"),
@@ -468,11 +478,22 @@ impl ModelDownloader {
             ModelFamily::SortformerDiarization => path
                 .join("diar_streaming_sortformer_4spk-v2.1.nemo")
                 .exists(),
-            ModelFamily::Qwen3Chat | ModelFamily::Lfm2Chat | ModelFamily::Gemma3Chat => {
+            ModelFamily::Qwen3Chat
+            | ModelFamily::Qwen35Chat
+            | ModelFamily::Lfm2Chat
+            | ModelFamily::Gemma3Chat => {
                 if variant.is_qwen_chat_gguf() {
                     let gguf_file =
                         qwen_chat_gguf_filename(variant).expect("checked by is_qwen_chat_gguf");
                     path.join(gguf_file).exists()
+                        && path.join("tokenizer.json").exists()
+                        && path.join("tokenizer_config.json").exists()
+                } else if variant.is_qwen35_chat_gguf() {
+                    let gguf_file = qwen35_chat_gguf_filename(variant)
+                        .expect("checked by is_qwen35_chat_gguf");
+                    path.join(gguf_file).exists()
+                        && path.join("mmproj-F16.gguf").exists()
+                        && path.join("README.md").exists()
                         && path.join("tokenizer.json").exists()
                         && path.join("tokenizer_config.json").exists()
                 } else if variant.is_lfm2_chat_gguf() {
@@ -1026,13 +1047,26 @@ impl ModelDownloader {
                 "privacy.md".to_string(),
                 "safety.md".to_string(),
             ],
-            ModelFamily::Qwen3Chat | ModelFamily::Lfm2Chat | ModelFamily::Gemma3Chat => {
+            ModelFamily::Qwen3Chat
+            | ModelFamily::Qwen35Chat
+            | ModelFamily::Lfm2Chat
+            | ModelFamily::Gemma3Chat => {
                 if variant.is_qwen_chat_gguf() {
                     let gguf_file =
                         qwen_chat_gguf_filename(variant).expect("checked by is_qwen_chat_gguf");
                     return vec![
                         gguf_file.to_string(),
                         "params".to_string(),
+                        "README.md".to_string(),
+                        "tokenizer.json".to_string(),
+                        "tokenizer_config.json".to_string(),
+                    ];
+                } else if variant.is_qwen35_chat_gguf() {
+                    let gguf_file = qwen35_chat_gguf_filename(variant)
+                        .expect("checked by is_qwen35_chat_gguf");
+                    return vec![
+                        gguf_file.to_string(),
+                        "mmproj-F16.gguf".to_string(),
                         "README.md".to_string(),
                         "tokenizer.json".to_string(),
                         "tokenizer_config.json".to_string(),
@@ -1184,6 +1218,18 @@ impl ModelDownloader {
                         source_file: file.clone(),
                         local_file: file,
                     }
+                })
+                .collect();
+        }
+
+        if variant.is_qwen35_chat_gguf() {
+            return self
+                .get_model_files(variant)
+                .into_iter()
+                .map(|file| ModelFileSpec {
+                    source_repo: default_repo.clone(),
+                    source_file: file.clone(),
+                    local_file: file,
                 })
                 .collect();
         }
@@ -1362,7 +1408,15 @@ impl ModelDownloader {
 
     /// Get estimated size for a single file (fallback when HEAD fails)
     fn get_single_file_size_estimate(&self, variant: ModelVariant, file: &str) -> u64 {
-        if file.ends_with(".gguf") {
+        if file == "mmproj-F16.gguf" {
+            match variant {
+                ModelVariant::Qwen3508BGguf => 52_000_000,
+                ModelVariant::Qwen352BGguf => 98_000_000,
+                ModelVariant::Qwen354BGguf => 140_000_000,
+                ModelVariant::Qwen359BGguf => 230_000_000,
+                _ => 120_000_000,
+            }
+        } else if file.ends_with(".gguf") {
             if file.contains("Qwen3-0.6B") {
                 1_100_000_000
             } else if file.contains("Qwen3-1.7B") {
@@ -1373,6 +1427,14 @@ impl ModelDownloader {
                 5_200_000_000
             } else if file.contains("Qwen3-14B") {
                 9_200_000_000
+            } else if file.contains("Qwen3.5-0.8B") {
+                685_000_000
+            } else if file.contains("Qwen3.5-2B") {
+                1_850_000_000
+            } else if file.contains("Qwen3.5-4B") {
+                3_250_000_000
+            } else if file.contains("Qwen3.5-9B") {
+                6_350_000_000
             } else if file.contains("LFM2.5-1.2B-Instruct") {
                 730_895_168
             } else if file.contains("LFM2.5-1.2B-Thinking") {
@@ -1404,6 +1466,10 @@ impl ModelDownloader {
                     ModelVariant::Qwen34BGguf => 2_500_000_000,
                     ModelVariant::Qwen38BGguf => 5_200_000_000,
                     ModelVariant::Qwen314BGguf => 9_200_000_000,
+                    ModelVariant::Qwen3508BGguf => 685_000_000,
+                    ModelVariant::Qwen352BGguf => 1_850_000_000,
+                    ModelVariant::Qwen354BGguf => 3_250_000_000,
+                    ModelVariant::Qwen359BGguf => 6_350_000_000,
                     ModelVariant::Gemma31BIt => 2_100_000_000,
                     ModelVariant::Gemma34BIt => 2_400_000_000,
                     ModelVariant::Lfm25Audio15B => 2_900_000_000,

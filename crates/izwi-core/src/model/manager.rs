@@ -503,4 +503,35 @@ mod tests {
 
         std::fs::remove_dir_all(&temp_dir).unwrap();
     }
+
+    #[tokio::test]
+    async fn qwen35_gguf_manual_layout_is_detected_as_downloaded() {
+        let temp_dir = std::env::temp_dir().join(format!("izwi-manager-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let variant = ModelVariant::Qwen354BGguf;
+        let model_dir = temp_dir.join(variant.dir_name());
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("Qwen3.5-4B-Q4_K_M.gguf"), [0u8]).unwrap();
+        std::fs::write(model_dir.join("mmproj-F16.gguf"), [0u8]).unwrap();
+        std::fs::write(model_dir.join("README.md"), "# Qwen3.5\n").unwrap();
+        std::fs::write(model_dir.join("tokenizer.json"), "{}").unwrap();
+        std::fs::write(model_dir.join("tokenizer_config.json"), "{}").unwrap();
+
+        let config = EngineConfig {
+            models_dir: temp_dir.clone(),
+            ..EngineConfig::default()
+        };
+        let manager = ModelManager::new(config).unwrap();
+        let info = manager
+            .get_model_info(variant)
+            .await
+            .expect("qwen3.5 GGUF model info should exist");
+
+        assert_eq!(info.status, ModelStatus::Downloaded);
+        assert_eq!(info.local_path, Some(model_dir));
+        assert!(info.size_bytes.is_some_and(|bytes| bytes >= 5));
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
 }
