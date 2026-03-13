@@ -22,8 +22,8 @@ use crate::models::architectures::qwen3::asr::{
 use crate::models::architectures::qwen3::chat::{
     ChatDecodeState as Qwen3ChatDecodeState, ChatGenerationOutput, Qwen3ChatModel,
 };
-use crate::models::architectures::qwen35::chat::Qwen35ChatModel;
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
+use crate::models::architectures::qwen35::chat::Qwen35ChatModel;
 use crate::models::architectures::sortformer::diarization::SortformerDiarizerModel;
 use crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel;
 use crate::models::architectures::whisper::asr::{
@@ -545,12 +545,12 @@ impl NativeChatModel {
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
-        _config: &ChatGenerationConfig,
+        config: &ChatGenerationConfig,
     ) -> Result<ChatGenerationOutput> {
         match self {
             Self::Qwen3(model) => model.generate(messages, max_new_tokens),
             Self::Qwen35(model) => {
-                let output = model.generate(messages, max_new_tokens)?;
+                let output = model.generate_with_config(messages, max_new_tokens, config)?;
                 Ok(ChatGenerationOutput {
                     text: output.text,
                     tokens_generated: output.tokens_generated,
@@ -587,14 +587,18 @@ impl NativeChatModel {
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
-        _config: &ChatGenerationConfig,
+        config: &ChatGenerationConfig,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ChatGenerationOutput> {
         match self {
             Self::Qwen3(model) => model.generate_with_callback(messages, max_new_tokens, on_delta),
             Self::Qwen35(model) => {
-                let output =
-                    model.generate_with_callback(messages, max_new_tokens, on_delta)?;
+                let output = model.generate_with_callback_and_config(
+                    messages,
+                    max_new_tokens,
+                    config,
+                    on_delta,
+                )?;
                 Ok(ChatGenerationOutput {
                     text: output.text,
                     tokens_generated: output.tokens_generated,

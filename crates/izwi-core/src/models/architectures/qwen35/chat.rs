@@ -1,22 +1,24 @@
-//! Native Qwen3.5 chat loader scaffolding.
-//!
-//! Phase 2 intentionally stops at asset/config loading. The hybrid text decoder
-//! and multimodal execution land in later commits.
+//! Native Qwen3.5 chat model loader and text generation.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use candle_core::quantized::gguf_file::Value as GgufValue;
+use candle_core::{DType, IndexOp, Tensor, D};
 use serde::Deserialize;
 use tracing::info;
 
 use crate::backends::{BackendKind, DeviceProfile};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
-use crate::models::shared::chat::{ChatMessage, ChatRole};
+use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
 use crate::models::shared::weights::gguf::{GgufLoader, GgufModelInfo};
 use crate::tokenizer::Tokenizer;
+
+use super::text::Qwen35TextModel;
 
 #[derive(Debug, Clone)]
 pub struct ChatGenerationOutput {
@@ -49,9 +51,10 @@ pub struct Qwen35TextConfig {
 
 #[derive(Debug, Clone)]
 struct SpecialTokenIds {
-    _im_start: u32,
-    _im_end: u32,
-    _eos: u32,
+    im_start: u32,
+    im_end: u32,
+    eos: u32,
+    eos_alt: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,11 +75,11 @@ struct AddedToken {
 
 struct Qwen35Tokenizer {
     inner: Tokenizer,
-    _vocab_size: usize,
-    _specials: SpecialTokenIds,
+    vocab_size: usize,
+    specials: SpecialTokenIds,
     chat_template: String,
     default_enable_thinking: bool,
-    _bos_token: Option<String>,
+    bos_token: Option<String>,
 }
 
 impl Qwen35Tokenizer {
@@ -107,35 +110,47 @@ impl Qwen35Tokenizer {
             .as_deref()
             .and_then(id_for)
             .unwrap_or(im_end);
+        let eos_alt = id_for("<|endoftext|>");
         let default_enable_thinking =
             resolve_default_enable_thinking(&config.chat_template, variant);
 
         Ok(Self {
             inner,
-            _vocab_size: vocab_size,
-            _specials: SpecialTokenIds {
-                _im_start: im_start,
-                _im_end: im_end,
-                _eos: eos,
+            vocab_size,
+            specials: SpecialTokenIds {
+                im_start,
+                im_end,
+                eos,
+                eos_alt,
             },
             chat_template: config.chat_template,
             default_enable_thinking,
-            _bos_token: config.bos_token,
+            bos_token: config.bos_token,
         })
     }
 
     fn encode_text(&self, text: &str) -> Result<Vec<u32>> {
         self.inner.encode(text)
     }
+
+    fn decode_text(&self, ids: &[u32]) -> Result<String> {
+        let filtered: Vec<u32> = ids
+            .iter()
+            .copied()
+            .filter(|id| (*id as usize) < self.vocab_size)
+            .collect();
+        self.inner.decode(&filtered)
+    }
 }
 
 pub struct Qwen35ChatModel {
-    device: DeviceProfile,
+    device_kind: BackendKind,
     variant: ModelVariant,
     tokenizer: Qwen35Tokenizer,
     text_config: Qwen35TextConfig,
     text_checkpoint: GgufModelInfo,
     projector_checkpoint: GgufModelInfo,
+    text_model: Qwen35TextModel,
 }
 
 impl Qwen35ChatModel {
@@ -173,6 +188,7 @@ impl Qwen35ChatModel {
 
         let text_config = parse_text_config(&text_loader)?;
         let tokenizer = Qwen35Tokenizer::load(model_dir, variant)?;
+        let text_model = Qwen35TextModel::load(&text_loader, &text_config, &device.device)?;
 
         let projector_loader = GgufLoader::from_path_with_backend(&mmproj_path, backend)?;
         let projector_checkpoint = projector_loader.get_model_info();
@@ -186,12 +202,13 @@ impl Qwen35ChatModel {
         );
 
         Ok(Self {
-            device,
+            device_kind: backend,
             variant,
             tokenizer,
             text_config,
             text_checkpoint,
             projector_checkpoint,
+            text_model,
         })
     }
 
@@ -226,19 +243,81 @@ impl Qwen35ChatModel {
 
     pub fn generate(
         &self,
-        _messages: &[ChatMessage],
-        _max_new_tokens: usize,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
     ) -> Result<ChatGenerationOutput> {
-        Err(not_ready_generation_error())
+        let config = ChatGenerationConfig::default();
+        self.generate_with_config(messages, max_new_tokens, &config)
     }
 
     pub fn generate_with_callback(
         &self,
-        _messages: &[ChatMessage],
-        _max_new_tokens: usize,
-        _on_delta: &mut dyn FnMut(&str),
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        on_delta: &mut dyn FnMut(&str),
     ) -> Result<ChatGenerationOutput> {
-        Err(not_ready_generation_error())
+        let config = ChatGenerationConfig::default();
+        self.generate_with_callback_and_config(messages, max_new_tokens, &config, on_delta)
+    }
+
+    pub fn generate_with_config(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+    ) -> Result<ChatGenerationOutput> {
+        let mut no_op = |_delta: &str| {};
+        self.generate_with_callback_and_config(messages, max_new_tokens, config, &mut no_op)
+    }
+
+    pub fn generate_with_callback_and_config(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ChatGenerationOutput> {
+        let prompt_ids = self.prompt_token_ids(messages)?;
+        if prompt_ids.is_empty() {
+            return Err(Error::InvalidInput(
+                "Chat request must include at least one tokenizable message".to_string(),
+            ));
+        }
+
+        let mut state = self.text_model.new_state();
+        let mut logits: Option<Tensor> = None;
+        for token_id in prompt_ids {
+            logits = Some(self.text_model.forward_token_id(token_id, &mut state)?);
+        }
+        let mut logits = logits.ok_or_else(|| {
+            Error::InferenceError("Qwen3.5 prompt prefill did not produce logits".to_string())
+        })?;
+
+        let max_new_tokens = max_new_tokens.max(1);
+        let mut generated_ids = Vec::new();
+        let mut assembled = String::new();
+        let mut rng = SimpleRng::new(config.seed);
+
+        while generated_ids.len() < max_new_tokens {
+            let next = sample_next_token(&logits, config, &generated_ids, &mut rng)?;
+            if self.is_stop_token(next, config) {
+                break;
+            }
+
+            generated_ids.push(next);
+            let decoded = self.tokenizer.decode_text(&generated_ids)?;
+            let delta = text_delta(&assembled, &decoded);
+            if !delta.is_empty() {
+                on_delta(&delta);
+            }
+            assembled = decoded;
+            logits = self.text_model.forward_token_id(next, &mut state)?;
+        }
+
+        Ok(ChatGenerationOutput {
+            text: assembled.trim().to_string(),
+            tokens_generated: generated_ids.len(),
+        })
     }
 
     pub fn supports_incremental_decode(&self) -> bool {
@@ -246,7 +325,14 @@ impl Qwen35ChatModel {
     }
 
     pub fn device_kind(&self) -> BackendKind {
-        BackendKind::from(self.device.kind)
+        self.device_kind
+    }
+
+    fn is_stop_token(&self, token_id: u32, config: &ChatGenerationConfig) -> bool {
+        token_id == self.tokenizer.specials.im_end
+            || token_id == self.tokenizer.specials.eos
+            || self.tokenizer.specials.eos_alt == Some(token_id)
+            || config.stop_token_ids.contains(&token_id)
     }
 }
 
@@ -267,12 +353,6 @@ fn render_fallback_prompt(messages: &[ChatMessage]) -> String {
     prompt
 }
 
-fn not_ready_generation_error() -> Error {
-    Error::InvalidInput(
-        "Qwen3.5 asset loading is available, but generation lands in a later phase".to_string(),
-    )
-}
-
 fn qwen35_gguf_filename(variant: ModelVariant) -> Result<&'static str> {
     match variant {
         ModelVariant::Qwen3508BGguf => Ok("Qwen3.5-0.8B-Q4_K_M.gguf"),
@@ -291,7 +371,10 @@ fn resolve_default_enable_thinking(chat_template: &str, variant: ModelVariant) -
     } else if chat_template.contains("enable_thinking is defined and enable_thinking is true") {
         false
     } else {
-        matches!(variant, ModelVariant::Qwen354BGguf | ModelVariant::Qwen359BGguf)
+        matches!(
+            variant,
+            ModelVariant::Qwen354BGguf | ModelVariant::Qwen359BGguf
+        )
     }
 }
 
@@ -340,9 +423,9 @@ fn required_f64(loader: &GgufLoader, key: &str) -> Result<f64> {
 }
 
 fn required_usize_array(loader: &GgufLoader, key: &str) -> Result<Vec<usize>> {
-    let value = loader.metadata_value(key).ok_or_else(|| {
-        Error::ModelLoadError(format!("Missing or invalid GGUF metadata: {key}"))
-    })?;
+    let value = loader
+        .metadata_value(key)
+        .ok_or_else(|| Error::ModelLoadError(format!("Missing or invalid GGUF metadata: {key}")))?;
     let GgufValue::Array(items) = value else {
         return Err(Error::ModelLoadError(format!(
             "Expected GGUF array metadata for {key}"
@@ -394,6 +477,253 @@ fn gguf_to_f64(value: &GgufValue) -> Option<f64> {
     }
 }
 
+fn sample_next_token(
+    logits: &Tensor,
+    config: &ChatGenerationConfig,
+    history: &[u32],
+    rng: &mut SimpleRng,
+) -> Result<u32> {
+    let mut values = logits_to_vec(logits)?;
+
+    if config.repetition_penalty > 1.0 && !history.is_empty() {
+        let mut seen = vec![false; values.len()];
+        for &token in history {
+            let idx = token as usize;
+            if idx < seen.len() {
+                seen[idx] = true;
+            }
+        }
+
+        for (idx, seen_flag) in seen.iter().enumerate() {
+            if !*seen_flag {
+                continue;
+            }
+            let value = &mut values[idx];
+            if !value.is_finite() {
+                continue;
+            }
+            if *value > 0.0 {
+                *value /= config.repetition_penalty;
+            } else {
+                *value *= config.repetition_penalty;
+            }
+        }
+    }
+
+    if config.presence_penalty.abs() > f32::EPSILON && !history.is_empty() {
+        let mut seen = vec![false; values.len()];
+        for &token in history {
+            let idx = token as usize;
+            if idx < seen.len() {
+                seen[idx] = true;
+            }
+        }
+
+        for (idx, seen_flag) in seen.iter().enumerate() {
+            if *seen_flag && values[idx].is_finite() {
+                values[idx] -= config.presence_penalty;
+            }
+        }
+    }
+
+    if config.temperature <= 1e-5 {
+        return argmax_values(&values);
+    }
+
+    let temperature = config.temperature.max(1e-5);
+    for value in &mut values {
+        if value.is_finite() {
+            *value /= temperature;
+        }
+    }
+
+    let mut candidates: Vec<usize> = values
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, value)| value.is_finite().then_some(idx))
+        .collect();
+    if candidates.is_empty() {
+        return argmax_values(&values);
+    }
+
+    if config.top_k > 0 && config.top_k < candidates.len() {
+        candidates.sort_by(|&a, &b| values[b].partial_cmp(&values[a]).unwrap_or(Ordering::Equal));
+        candidates.truncate(config.top_k);
+    }
+
+    let max_logit = candidates
+        .iter()
+        .map(|&idx| values[idx])
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut probs: Vec<(usize, f32)> = candidates
+        .iter()
+        .map(|&idx| (idx, (values[idx] - max_logit).exp()))
+        .collect();
+
+    let mut sum: f32 = probs.iter().map(|(_, prob)| *prob).sum();
+    if !sum.is_finite() || sum <= 0.0 {
+        return argmax_values(&values);
+    }
+    for (_, prob) in &mut probs {
+        *prob /= sum;
+    }
+
+    if config.top_p < 1.0 {
+        probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        let cutoff = config.top_p.max(1e-6);
+        let mut cumulative = 0.0f32;
+        let mut keep = 0usize;
+        for (_, prob) in &probs {
+            cumulative += *prob;
+            keep += 1;
+            if cumulative >= cutoff {
+                break;
+            }
+        }
+        probs.truncate(keep.max(1));
+        sum = probs.iter().map(|(_, prob)| *prob).sum();
+        if sum > 0.0 {
+            for (_, prob) in &mut probs {
+                *prob /= sum;
+            }
+        }
+    }
+
+    let sample = rng.next_f32();
+    let mut cumulative = 0.0f32;
+    for (idx, prob) in &probs {
+        cumulative += *prob;
+        if sample <= cumulative {
+            return Ok(*idx as u32);
+        }
+    }
+
+    probs
+        .iter()
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
+        .map(|(idx, _)| *idx as u32)
+        .ok_or_else(|| Error::InferenceError("Failed to sample Qwen3.5 token".to_string()))
+}
+
+fn logits_to_vec(logits: &Tensor) -> Result<Vec<f32>> {
+    let logits = match logits.rank() {
+        1 => logits.clone(),
+        2 => {
+            let (rows, _cols) = logits.dims2()?;
+            if rows != 1 {
+                return Err(Error::InferenceError(format!(
+                    "Unexpected Qwen3.5 logits shape for sampling: {:?}",
+                    logits.shape().dims()
+                )));
+            }
+            logits.i(0)?
+        }
+        rank => {
+            return Err(Error::InferenceError(format!(
+                "Unexpected Qwen3.5 logits rank for sampling: {rank}"
+            )))
+        }
+    };
+
+    logits
+        .to_dtype(DType::F32)?
+        .to_vec1::<f32>()
+        .map_err(Error::from)
+}
+
+fn argmax_values(values: &[f32]) -> Result<u32> {
+    let mut max_idx = None;
+    let mut max_value = f32::NEG_INFINITY;
+
+    for (idx, value) in values.iter().enumerate() {
+        if value.is_finite() && *value > max_value {
+            max_value = *value;
+            max_idx = Some(idx);
+        }
+    }
+
+    max_idx
+        .map(|idx| idx as u32)
+        .ok_or_else(|| Error::InferenceError("No valid Qwen3.5 logits to sample".to_string()))
+}
+
+fn argmax(logits: &Tensor) -> Result<u32> {
+    let logits = match logits.rank() {
+        1 => logits.clone(),
+        2 => {
+            let (rows, _cols) = logits.dims2()?;
+            if rows != 1 {
+                return Err(Error::InferenceError(format!(
+                    "Unexpected Qwen3.5 logits shape for argmax: {:?}",
+                    logits.shape().dims()
+                )));
+            }
+            logits.i(0)?
+        }
+        rank => {
+            return Err(Error::InferenceError(format!(
+                "Unexpected Qwen3.5 logits rank for argmax: {rank}"
+            )))
+        }
+    };
+
+    let idx = logits.argmax(D::Minus1)?;
+    let idx = if idx.rank() == 0 {
+        idx
+    } else {
+        idx.squeeze(0)?
+    };
+    idx.to_dtype(DType::U32)?
+        .to_scalar::<u32>()
+        .map_err(Error::from)
+}
+
+fn text_delta(previous: &str, current: &str) -> String {
+    if let Some(delta) = current.strip_prefix(previous) {
+        return delta.to_string();
+    }
+
+    let common = previous
+        .chars()
+        .zip(current.chars())
+        .take_while(|(left, right)| left == right)
+        .count();
+    current.chars().skip(common).collect()
+}
+
+struct SimpleRng {
+    state: u64,
+}
+
+impl SimpleRng {
+    fn new(seed: u64) -> Self {
+        let seed = if seed == 0 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos() as u64)
+                .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        } else {
+            seed
+        };
+        Self {
+            state: seed ^ 0xA076_1D64_78BD_642F,
+        }
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u32
+    }
+
+    fn next_f32(&mut self) -> f32 {
+        (self.next_u32() as f64 / (u32::MAX as f64 + 1.0)) as f32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,7 +767,47 @@ mod tests {
         assert_eq!(model.text_config().architecture, "qwen35");
         assert_eq!(model.text_config().full_attention_interval, 4);
         assert!(model.default_enable_thinking());
-        assert_eq!(model.text_checkpoint().architecture.as_deref(), Some("qwen35"));
-        assert!(model.projector_checkpoint().path.ends_with("mmproj-F16.gguf"));
+        assert_eq!(
+            model.text_checkpoint().architecture.as_deref(),
+            Some("qwen35")
+        );
+        assert!(model
+            .projector_checkpoint()
+            .path
+            .ends_with("mmproj-F16.gguf"));
+    }
+
+    #[test]
+    fn generate_local_qwen35_text_smoke_if_available() {
+        let model_dir = local_model_dir("Qwen3.5-0.8B");
+        if !model_dir.exists() {
+            return;
+        }
+
+        let model = Qwen35ChatModel::load(
+            &model_dir,
+            ModelVariant::Qwen3508BGguf,
+            DeviceProfile::cpu(),
+        )
+        .expect("qwen3.5 assets should load");
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "Reply with one short word.".to_string(),
+        }];
+        let config = ChatGenerationConfig {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            stop_token_ids: Vec::new(),
+            seed: 7,
+        };
+
+        let output = model
+            .generate_with_config(&messages, 4, &config)
+            .expect("qwen3.5 text generation should run");
+
+        assert!(output.tokens_generated <= 4);
     }
 }
