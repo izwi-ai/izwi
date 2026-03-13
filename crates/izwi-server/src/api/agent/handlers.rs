@@ -21,7 +21,7 @@ use crate::state::{AppState, StoredAgentSessionRecord};
 use crate::voice_defaults::{
     DEFAULT_VOICE_AGENT_ID, DEFAULT_VOICE_AGENT_NAME, DEFAULT_VOICE_AGENT_SYSTEM_PROMPT,
 };
-const DEFAULT_CHAT_MODEL: &str = "Qwen3.5-0.8B";
+const DEFAULT_CHAT_MODEL: &str = "Qwen3-1.7B-GGUF";
 
 #[derive(Debug, Deserialize)]
 pub struct CreateAgentSessionRequest {

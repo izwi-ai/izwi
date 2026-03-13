@@ -43,10 +43,10 @@ export const TRANSCRIPTION_PREFERRED_MODELS = [
 ] as const;
 
 export const CHAT_PREFERRED_MODELS = [
-  "Qwen3.5-4B",
-  "Qwen3.5-2B",
-  "Qwen3.5-0.8B",
   "Qwen3-8B-GGUF",
+  "Qwen3-4B-GGUF",
+  "Qwen3-1.7B-GGUF",
+  "Qwen3-0.6B-GGUF",
 ] as const;
 
 export function getModelStatusLabel(status: ModelInfo["status"]): string {
@@ -138,18 +138,6 @@ export function getChatRouteModelLabel(variant: string): string {
   if (variant === "Qwen3-8B-GGUF") {
     return withQwen3Prefix("Chat 8B GGUF (Q4_K_M)", variant);
   }
-  if (variant === "Qwen3.5-0.8B") {
-    return withQwen3Prefix("Chat 0.8B GGUF (Q4_K_M)", variant);
-  }
-  if (variant === "Qwen3.5-2B") {
-    return withQwen3Prefix("Chat 2B GGUF (Q4_K_M)", variant);
-  }
-  if (variant === "Qwen3.5-4B") {
-    return withQwen3Prefix("Chat 4B GGUF (Q4_K_M)", variant);
-  }
-  if (variant === "Qwen3.5-9B") {
-    return withQwen3Prefix("Chat 9B GGUF (Q4_K_M)", variant);
-  }
   if (variant === "LFM2.5-1.2B-Instruct-GGUF") {
     return "LFM2.5 1.2B Instruct GGUF (Q4_K_M)";
   }
@@ -168,7 +156,7 @@ export function getChatRouteModelLabel(variant: string): string {
 export function isThinkingChatModel(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   const isQwenThinkingFamily =
-    (normalized.startsWith("qwen3-") || normalized.startsWith("qwen3.5-")) &&
+    normalized.startsWith("qwen3-") &&
     !normalized.includes("-asr-") &&
     !normalized.includes("-tts-") &&
     !normalized.includes("forcedaligner");

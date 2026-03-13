@@ -81,8 +81,8 @@ describe("ChatPlayground", () => {
     expect(sendButton).toBeInTheDocument();
     expect(sendButton).not.toHaveTextContent(/\bSend\b/i);
     expect(
-      screen.getByRole("button", { name: "Image/video upload is available only for Qwen3.5 models" }),
-    ).toBeDisabled();
+      screen.queryByRole("button", { name: /Attach image or video/i }),
+    ).not.toBeInTheDocument();
     expect(screen.getByTestId("chat-composer-actions")).not.toHaveClass(
       "border-t",
     );

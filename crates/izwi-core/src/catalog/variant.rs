@@ -13,7 +13,6 @@ pub enum ModelFamily {
     WhisperAsr,
     SortformerDiarization,
     Qwen3Chat,
-    Qwen35Chat,
     Lfm2Chat,
     Gemma3Chat,
     Qwen3ForcedAligner,
@@ -108,7 +107,6 @@ impl ModelVariant {
             DiarStreamingSortformer4SpkV21 => ModelFamily::SortformerDiarization,
             Qwen306B | Qwen306B4Bit | Qwen306BGguf | Qwen317B | Qwen317B4Bit | Qwen317BGguf
             | Qwen34BGguf | Qwen38BGguf | Qwen314BGguf => ModelFamily::Qwen3Chat,
-            Qwen3508B | Qwen352B | Qwen354B | Qwen359B => ModelFamily::Qwen35Chat,
             Lfm2512BInstructGguf | Lfm2512BThinkingGguf => ModelFamily::Lfm2Chat,
             Gemma31BIt | Gemma34BIt => ModelFamily::Gemma3Chat,
             Qwen3ForcedAligner06B | Qwen3ForcedAligner06B4Bit => ModelFamily::Qwen3ForcedAligner,
@@ -123,10 +121,9 @@ impl ModelVariant {
                 ModelTask::Asr
             }
             ModelFamily::SortformerDiarization => ModelTask::Diarization,
-            ModelFamily::Qwen3Chat
-            | ModelFamily::Qwen35Chat
-            | ModelFamily::Lfm2Chat
-            | ModelFamily::Gemma3Chat => ModelTask::Chat,
+            ModelFamily::Qwen3Chat | ModelFamily::Lfm2Chat | ModelFamily::Gemma3Chat => {
+                ModelTask::Chat
+            }
             ModelFamily::Qwen3ForcedAligner => ModelTask::ForcedAlign,
             ModelFamily::Voxtral => ModelTask::AudioChat,
             ModelFamily::Lfm2Audio => ModelTask::AudioChat,
@@ -170,7 +167,7 @@ pub fn parse_tts_model_variant(input: &str) -> Result<ModelVariant, ParseModelVa
 pub fn parse_chat_model_variant(
     input: Option<&str>,
 ) -> Result<ModelVariant, ParseModelVariantError> {
-    match input.unwrap_or("Qwen3.5-0.8B") {
+    match input.unwrap_or("Qwen3-8B-GGUF") {
         id => {
             let variant = parse_model_variant(id)?;
             if variant.is_chat() {
@@ -355,25 +352,6 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
             (_, _, true) => Qwen3Tts12Hz06BBaseBf16,
             _ => Qwen3Tts12Hz06BBase,
         });
-    }
-
-    if normalized.contains("qwen35") {
-        if normalized.contains("08b")
-            || normalized.contains("08")
-            || normalized.contains("0dot8b")
-            || normalized.contains("0p8b")
-        {
-            return Some(Qwen3508B);
-        }
-        if normalized.contains("2b") {
-            return Some(Qwen352B);
-        }
-        if normalized.contains("4b") {
-            return Some(Qwen354B);
-        }
-        if normalized.contains("9b") {
-            return Some(Qwen359B);
-        }
     }
 
     if normalized.contains("kokoro") && normalized.contains("82m") {
@@ -682,40 +660,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_qwen35_chat_08b() {
-        let parsed = parse_chat_model_variant(Some("Qwen3.5-0.8B")).unwrap();
-        assert_eq!(parsed, ModelVariant::Qwen3508B);
-    }
-
-    #[test]
-    fn parse_chat_defaults_to_qwen35_08b() {
+    fn parse_chat_defaults_to_qwen3_8b_gguf() {
         let parsed = parse_chat_model_variant(None).unwrap();
-        assert_eq!(parsed, ModelVariant::Qwen3508B);
-    }
-
-    #[test]
-    fn parse_qwen35_chat_2b_unsloth_repo() {
-        let parsed = parse_chat_model_variant(Some("unsloth/Qwen3.5-2B-GGUF")).unwrap();
-        assert_eq!(parsed, ModelVariant::Qwen352B);
-    }
-
-    #[test]
-    fn parse_qwen35_chat_4b_lowercase_alias() {
-        let parsed = parse_chat_model_variant(Some("qwen3.5-4b")).unwrap();
-        assert_eq!(parsed, ModelVariant::Qwen354B);
-    }
-
-    #[test]
-    fn parse_qwen35_chat_9b_has_qwen35_family() {
-        let parsed = parse_chat_model_variant(Some("Qwen3.5-9B")).unwrap();
-        assert_eq!(parsed, ModelVariant::Qwen359B);
-        assert_eq!(parsed.family(), ModelFamily::Qwen35Chat);
-    }
-
-    #[test]
-    fn parse_qwen35_chat_4b_q4_gguf_file_alias() {
-        let parsed = parse_chat_model_variant(Some("Qwen3.5-4B-Q4_K_M.gguf")).unwrap();
-        assert_eq!(parsed, ModelVariant::Qwen354B);
+        assert_eq!(parsed, ModelVariant::Qwen38BGguf);
     }
 
     #[test]

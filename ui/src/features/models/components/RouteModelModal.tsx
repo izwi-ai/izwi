@@ -87,7 +87,7 @@ function getStatusDotClass(status: ModelInfo["status"]): string {
 }
 
 function getProviderLabel(variant: string): string {
-  if (variant.startsWith("Qwen3-") || variant.startsWith("Qwen3.5-")) {
+  if (variant.startsWith("Qwen3-")) {
     return "Qwen";
   }
   if (variant.startsWith("Whisper-")) return "OpenAI";

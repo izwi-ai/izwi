@@ -10,15 +10,10 @@ use axum::{
 };
 use tokio::sync::mpsc;
 
-use crate::api::openai::common::{parse_tool_choice, should_inject_tools, tool_choice_instruction};
 use crate::api::request_context::RequestContext;
 use crate::error::ApiError;
 use crate::state::{AppState, StoredResponseInputItem, StoredResponseRecord};
-use izwi_core::{
-    parse_chat_model_variant, qwen35_multimodal_control_content, qwen35_thinking_control_content,
-    qwen35_tools_control_content, ChatMessage, ChatRole, ModelVariant, Qwen35MultimodalInput,
-    Qwen35MultimodalKind,
-};
+use izwi_core::{parse_chat_model_variant, ChatMessage, ChatRole, ModelVariant};
 
 use super::dto::{
     ResponseDeletedObject, ResponseError, ResponseInput, ResponseInputContent,
@@ -35,11 +30,9 @@ pub async fn create_response(
 ) -> Result<Response<Body>, ApiError> {
     let model_variant = parse_chat_model_variant(Some(&req.model))
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    if response_input_contains_multimodal_content(req.input.as_ref())
-        && !is_qwen35_chat_variant(model_variant)
-    {
+    if response_input_contains_multimodal_content(req.input.as_ref()) {
         return Err(ApiError::bad_request(
-            "Multimodal responses input is currently supported only for Qwen3.5 chat variants",
+            "Multimodal responses input is not currently supported",
         ));
     }
 
@@ -407,13 +400,10 @@ enum ResponseInboundRole {
     Tool,
 }
 
-const QWEN_VISION_IMAGE_TOKEN: &str = "<|vision_start|><|image_pad|><|vision_end|>";
-const QWEN_VISION_VIDEO_TOKEN: &str = "<|vision_start|><|video_pad|><|vision_end|>";
-
 #[derive(Debug, Default)]
 struct FlattenedContent {
     text: String,
-    multimodal: Vec<Qwen35MultimodalInput>,
+    contains_media: bool,
 }
 
 fn response_input_contains_multimodal_content(input: Option<&ResponseInput>) -> bool {
@@ -438,49 +428,15 @@ fn response_input_contains_multimodal_content(input: Option<&ResponseInput>) -> 
 }
 
 fn build_input_messages(
-    model_variant: ModelVariant,
+    _model_variant: ModelVariant,
     instructions: Option<&str>,
     input: Option<ResponseInput>,
-    enable_thinking: Option<bool>,
-    tools: Option<Vec<serde_json::Value>>,
-    tool_choice: Option<serde_json::Value>,
+    _enable_thinking: Option<bool>,
+    _tools: Option<Vec<serde_json::Value>>,
+    _tool_choice: Option<serde_json::Value>,
 ) -> Result<(Vec<ChatMessage>, Vec<StoredResponseInputItem>), ApiError> {
     let mut messages = Vec::new();
     let mut stored = Vec::new();
-
-    if is_qwen35_chat_variant(model_variant) {
-        let tool_choice = parse_tool_choice(tool_choice.as_ref())?;
-        let tools_for_choice = tools.as_deref().unwrap_or(&[]);
-
-        if let Some(enable_thinking) = enable_thinking {
-            messages.push(ChatMessage {
-                role: ChatRole::System,
-                content: qwen35_thinking_control_content(enable_thinking),
-            });
-        }
-
-        if should_inject_tools(&tool_choice) {
-            if let Some(tools) = tools.as_ref().filter(|entries| !entries.is_empty()) {
-                if let Some(control) = qwen35_tools_control_content(tools) {
-                    messages.push(ChatMessage {
-                        role: ChatRole::System,
-                        content: control,
-                    });
-                }
-            }
-        }
-
-        if let Some(instruction) = tool_choice_instruction(&tool_choice, tools_for_choice)? {
-            messages.push(ChatMessage {
-                role: ChatRole::System,
-                content: instruction.clone(),
-            });
-            stored.push(StoredResponseInputItem {
-                role: "system".to_string(),
-                content: instruction,
-            });
-        }
-    }
 
     if let Some(instructions) = instructions {
         if !instructions.trim().is_empty() {
@@ -497,9 +453,7 @@ fn build_input_messages(
 
     let input_items = match input {
         None => Vec::new(),
-        Some(ResponseInput::Text(text)) => {
-            vec![("user".to_string(), text, false, Vec::new())]
-        }
+        Some(ResponseInput::Text(text)) => vec![("user".to_string(), text, false, false)],
         Some(ResponseInput::One(item)) => vec![normalize_input_item(item)?],
         Some(ResponseInput::Many(items)) => items
             .into_iter()
@@ -507,20 +461,17 @@ fn build_input_messages(
             .collect::<Result<Vec<_>, _>>()?,
     };
 
-    for (role, content, is_tool, multimodal) in input_items {
+    for (role, content, is_tool, contains_media) in input_items {
         let parsed_role = parse_input_role(&role)?;
         if content.trim().is_empty() {
             return Err(ApiError::bad_request(
                 "Response input item content cannot be empty",
             ));
         }
-        if is_qwen35_chat_variant(model_variant) {
-            if let Some(control) = qwen35_multimodal_control_content(&multimodal) {
-                messages.push(ChatMessage {
-                    role: ChatRole::System,
-                    content: control,
-                });
-            }
+        if contains_media {
+            return Err(ApiError::bad_request(
+                "Multimodal responses input is not currently supported",
+            ));
         }
 
         match parsed_role {
@@ -565,7 +516,7 @@ fn build_input_messages(
 
 fn normalize_input_item(
     item: super::dto::ResponseInputItem,
-) -> Result<(String, String, bool, Vec<Qwen35MultimodalInput>), ApiError> {
+) -> Result<(String, String, bool, bool), ApiError> {
     let role = item
         .role
         .unwrap_or_else(|| "user".to_string())
@@ -595,7 +546,12 @@ fn normalize_input_item(
         ));
     }
 
-    Ok((role.clone(), content, role == "tool", flattened.multimodal))
+    Ok((
+        role.clone(),
+        content,
+        role == "tool",
+        flattened.contains_media,
+    ))
 }
 
 fn flatten_content(content: Option<ResponseInputContent>) -> Result<FlattenedContent, ApiError> {
@@ -603,31 +559,19 @@ fn flatten_content(content: Option<ResponseInputContent>) -> Result<FlattenedCon
         None => Ok(FlattenedContent::default()),
         Some(ResponseInputContent::Text(text)) => Ok(FlattenedContent {
             text,
-            multimodal: Vec::new(),
+            contains_media: false,
         }),
         Some(ResponseInputContent::Parts(parts)) => {
             let mut out = FlattenedContent::default();
             for part in parts {
                 if content_part_is_image(&part) {
-                    out.text.push_str(QWEN_VISION_IMAGE_TOKEN);
-                    let media =
-                        media_from_part(&part, Qwen35MultimodalKind::Image).ok_or_else(|| {
-                            ApiError::bad_request(
-                                "Image content part is missing a usable source URL/data",
-                            )
-                        })?;
-                    out.multimodal.push(media);
+                    ensure_media_part_has_source(&part, InboundMediaKind::Image)?;
+                    out.contains_media = true;
                     continue;
                 }
                 if content_part_is_video(&part) {
-                    out.text.push_str(QWEN_VISION_VIDEO_TOKEN);
-                    let media =
-                        media_from_part(&part, Qwen35MultimodalKind::Video).ok_or_else(|| {
-                            ApiError::bad_request(
-                                "Video content part is missing a usable source URL/data",
-                            )
-                        })?;
-                    out.multimodal.push(media);
+                    ensure_media_part_has_source(&part, InboundMediaKind::Video)?;
+                    out.contains_media = true;
                     continue;
                 }
                 if let Some(text) = part.input_text.or(part.text) {
@@ -637,6 +581,12 @@ fn flatten_content(content: Option<ResponseInputContent>) -> Result<FlattenedCon
             Ok(out)
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundMediaKind {
+    Image,
+    Video,
 }
 
 fn parse_input_role(raw: &str) -> Result<ResponseInboundRole, ApiError> {
@@ -672,12 +622,12 @@ fn content_part_is_video(part: &super::dto::ResponseInputContentPart) -> bool {
     part.video.is_some() || part.video_url.is_some() || part.input_video.is_some()
 }
 
-fn media_from_part(
+fn ensure_media_part_has_source(
     part: &super::dto::ResponseInputContentPart,
-    kind: Qwen35MultimodalKind,
-) -> Option<Qwen35MultimodalInput> {
+    kind: InboundMediaKind,
+) -> Result<(), ApiError> {
     let source = match kind {
-        Qwen35MultimodalKind::Image => [
+        InboundMediaKind::Image => [
             part.image_url.as_ref(),
             part.input_image.as_ref(),
             part.image.as_ref(),
@@ -685,7 +635,7 @@ fn media_from_part(
         .into_iter()
         .flatten()
         .find_map(|value| resolve_media_source(value, 3)),
-        Qwen35MultimodalKind::Video => [
+        InboundMediaKind::Video => [
             part.video.as_ref(),
             part.video_url.as_ref(),
             part.input_video.as_ref(),
@@ -693,9 +643,15 @@ fn media_from_part(
         .into_iter()
         .flatten()
         .find_map(|value| resolve_media_source(value, 3)),
-    }?;
+    };
 
-    Some(Qwen35MultimodalInput { kind, source })
+    if source.is_some() {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(
+            "Multimodal content part is missing a usable source URL/data",
+        ))
+    }
 }
 
 fn resolve_media_source(value: &serde_json::Value, max_depth: usize) -> Option<String> {
@@ -864,16 +820,6 @@ fn tool_parameter_text(value: &serde_json::Value) -> String {
     }
 }
 
-fn is_qwen35_chat_variant(variant: ModelVariant) -> bool {
-    matches!(
-        variant,
-        ModelVariant::Qwen3508B
-            | ModelVariant::Qwen352B
-            | ModelVariant::Qwen354B
-            | ModelVariant::Qwen359B
-    )
-}
-
 fn assistant_output_item(text: String) -> ResponseOutputItem {
     ResponseOutputItem {
         id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
@@ -935,22 +881,16 @@ mod tests {
     #[test]
     fn builds_messages_from_text_and_instructions() {
         let (messages, stored) = build_input_messages(
-            ModelVariant::Qwen359B,
+            ModelVariant::Qwen38BGguf,
             Some("Be concise."),
             Some(ResponseInput::Text("Hello".to_string())),
-            Some(true),
-            Some(vec![json!({
-                "type": "function",
-                "function": {
-                    "name": "ping",
-                    "parameters": {"type": "object"}
-                }
-            })]),
-            Some(json!("auto")),
+            None,
+            None,
+            None,
         )
         .expect("build input messages");
 
-        assert_eq!(messages.len(), 4);
+        assert_eq!(messages.len(), 2);
         assert_eq!(stored.len(), 2);
         assert_eq!(stored[0].role, "system");
         assert_eq!(stored[1].role, "user");
@@ -984,11 +924,11 @@ mod tests {
         ])))
         .expect("flatten");
         assert_eq!(flattened.text, "part1part2");
-        assert!(flattened.multimodal.is_empty());
+        assert!(!flattened.contains_media);
     }
 
     #[test]
-    fn flattens_multimodal_parts_to_qwen_tokens() {
+    fn flattens_multimodal_parts_without_inlining_tokens() {
         let flattened = flatten_content(Some(ResponseInputContent::Parts(vec![
             ResponseInputContentPart {
                 kind: Some("text".to_string()),
@@ -1025,13 +965,8 @@ mod tests {
             },
         ])))
         .expect("flatten");
-        assert_eq!(
-            flattened.text,
-            format!("Look {QWEN_VISION_IMAGE_TOKEN}{QWEN_VISION_VIDEO_TOKEN}")
-        );
-        assert_eq!(flattened.multimodal.len(), 2);
-        assert_eq!(flattened.multimodal[0].kind, Qwen35MultimodalKind::Image);
-        assert_eq!(flattened.multimodal[1].kind, Qwen35MultimodalKind::Video);
+        assert_eq!(flattened.text, "Look ");
+        assert!(flattened.contains_media);
     }
 
     #[test]
@@ -1061,11 +996,11 @@ mod tests {
             content: Some(ResponseInputContent::Text("hello".to_string())),
             tool_calls: None,
         };
-        let (role, text, is_tool, multimodal) = normalize_input_item(item).expect("normalize");
+        let (role, text, is_tool, contains_media) = normalize_input_item(item).expect("normalize");
         assert_eq!(role, "user");
         assert_eq!(text, "hello");
         assert!(!is_tool);
-        assert!(multimodal.is_empty());
+        assert!(!contains_media);
     }
 
     #[test]
@@ -1082,11 +1017,11 @@ mod tests {
             })]),
         };
 
-        let (role, content, is_tool, multimodal) =
+        let (role, content, is_tool, contains_media) =
             normalize_input_item(item).expect("normalize tool call");
         assert_eq!(role, "assistant");
         assert!(!is_tool);
-        assert!(multimodal.is_empty());
+        assert!(!contains_media);
         assert!(content.contains("<tool_call>"));
         assert!(content.contains("<function=get_weather>"));
         assert!(content.contains("<parameter=city>"));
@@ -1116,40 +1051,33 @@ mod tests {
     }
 
     #[test]
-    fn tool_choice_none_adds_disable_instruction_without_tools_control() {
-        let (messages, _) = build_input_messages(
-            ModelVariant::Qwen352B,
-            None,
-            Some(ResponseInput::Text("hi".to_string())),
-            None,
-            Some(vec![json!({
-                "type": "function",
-                "function": {"name": "ping", "parameters": {"type": "object"}}
-            })]),
-            Some(json!("none")),
-        )
-        .expect("build input messages");
-
-        assert!(!messages
-            .iter()
-            .any(|msg| izwi_core::parse_qwen35_tools_control_content(&msg.content).is_some()));
-        assert!(messages
-            .iter()
-            .any(|msg| msg.content.contains("Tool use is disabled")));
-    }
-
-    #[test]
-    fn tool_choice_required_rejects_missing_tools() {
+    fn build_input_messages_rejects_multimodal_input() {
         let err = build_input_messages(
-            ModelVariant::Qwen352B,
+            ModelVariant::Qwen38BGguf,
             None,
-            Some(ResponseInput::Text("hi".to_string())),
+            Some(ResponseInput::Many(vec![ResponseInputItem {
+                role: Some("user".to_string()),
+                content: Some(ResponseInputContent::Parts(vec![
+                    ResponseInputContentPart {
+                        kind: Some("image_url".to_string()),
+                        text: None,
+                        input_text: None,
+                        image_url: Some(json!({"url":"https://example.com/img.png"})),
+                        input_image: None,
+                        image: None,
+                        video: None,
+                        video_url: None,
+                        input_video: None,
+                    },
+                ])),
+                tool_calls: None,
+            }])),
             None,
             None,
-            Some(json!("required")),
+            None,
         )
-        .expect_err("required without tools should fail");
+        .expect_err("multimodal input should fail");
 
-        assert!(err.message.contains("required"));
+        assert!(err.message.contains("not currently supported"));
     }
 }

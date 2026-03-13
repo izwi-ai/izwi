@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_THREAD_TITLE,
-  buildThreadContentParts,
   defaultThinkingEnabledForModel,
   displayThreadTitle,
   parseAssistantContent,
@@ -22,7 +21,7 @@ describe("chat playground support", () => {
   });
 
   it("supports implicit open-think parsing for matching models", () => {
-    expect(supportsImplicitOpenThinkTagParsing("Qwen3.5-4B-Instruct")).toBe(
+    expect(supportsImplicitOpenThinkTagParsing("LFM2.5-1.2B-Thinking-GGUF")).toBe(
       true,
     );
     expect(
@@ -37,9 +36,8 @@ describe("chat playground support", () => {
     });
   });
 
-  it("uses non-thinking defaults for Qwen3.5 variants", () => {
-    expect(defaultThinkingEnabledForModel("Qwen3.5-4B")).toBe(false);
-    expect(defaultThinkingEnabledForModel("Qwen3.5-2B")).toBe(false);
+  it("keeps thinking enabled by default for supported chat models", () => {
+    expect(defaultThinkingEnabledForModel("Qwen3-4B-GGUF")).toBe(true);
     expect(defaultThinkingEnabledForModel("LFM2.5-1.2B-thinking-gguf")).toBe(
       true,
     );
@@ -63,49 +61,6 @@ describe("chat playground support", () => {
     expect(displayThreadTitle("<think>hidden</think>")).toBe(
       DEFAULT_THREAD_TITLE,
     );
-  });
-
-  it("builds thread content parts for text plus media", () => {
-    expect(
-      buildThreadContentParts("hello", [
-        {
-          id: "image-1",
-          kind: "image",
-          name: "cat.png",
-          size: 10,
-          mimeType: "image/png",
-          dataUrl: "data:image/png;base64,abc",
-          previewUrl: "blob:image",
-        },
-        {
-          id: "video-1",
-          kind: "video",
-          name: "clip.mp4",
-          size: 20,
-          mimeType: "video/mp4",
-          dataUrl: "data:video/mp4;base64,def",
-          previewUrl: "blob:video",
-        },
-      ]),
-    ).toEqual([
-      { type: "text", text: "hello" },
-      {
-        type: "input_image",
-        input_image: {
-          url: "data:image/png;base64,abc",
-          media_type: "image/png",
-          name: "cat.png",
-        },
-      },
-      {
-        type: "input_video",
-        input_video: {
-          url: "data:video/mp4;base64,def",
-          media_type: "video/mp4",
-          name: "clip.mp4",
-        },
-      },
-    ]);
   });
 
   it("parses user content parts into display text and attachments", () => {

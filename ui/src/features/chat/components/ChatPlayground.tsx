@@ -4,7 +4,6 @@ import {
   useMemo,
   useRef,
   useState,
-  type ChangeEvent,
 } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -23,7 +22,6 @@ import {
   AlertTriangle,
   ImageIcon,
   Film,
-  X,
 } from "lucide-react";
 import { useSearchParams } from "react-router-dom";
 import { cn } from "@/lib/utils";
@@ -38,29 +36,18 @@ import {
 import {
   DEFAULT_SYSTEM_PROMPT,
   DEFAULT_THREAD_TITLE,
-  MAX_MEDIA_ATTACHMENTS,
-  MAX_MEDIA_ATTACHMENT_BYTES,
-  MAX_MEDIA_ATTACHMENT_MB,
   THINKING_SYSTEM_PROMPT,
   type ChatPlaygroundProps,
-  type ComposerMediaItem,
-  type ComposerMediaKind,
   type GenerateTitleArgs,
   type ImagePreviewState,
   type ModelOption,
-  buildThreadContentParts,
-  buildUserDisplayContent,
-  createMediaItemId,
   defaultThinkingEnabledForModel,
   displayThreadTitle,
   extractLatestStats,
   fallbackThreadTitleFromUserMessage,
-  fileToDataUrl,
-  formatBytes,
   formatThreadTimestamp,
   getErrorMessage,
   isLfm25ThinkingModel,
-  isQwen35ChatModel,
   normalizeGeneratedThreadTitle,
   parseAssistantContent,
   parseUserMessageDisplayFromContentParts,
@@ -90,7 +77,6 @@ export function ChatPlayground({
     Record<string, boolean>
   >({});
   const [input, setInput] = useState("");
-  const [mediaItems, setMediaItems] = useState<ComposerMediaItem[]>([]);
   const [isThinkingEnabled, setIsThinkingEnabled] = useState(() =>
     defaultThinkingEnabledForModel(selectedModel),
   );
@@ -127,8 +113,6 @@ export function ChatPlayground({
   const streamingThinkingRef = useRef<HTMLDivElement | null>(null);
   const modelMenuRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-  const mediaInputRef = useRef<HTMLInputElement | null>(null);
-  const mediaItemsRef = useRef<ComposerMediaItem[]>([]);
 
   const selectedOption = useMemo(() => {
     if (!selectedModel) {
@@ -167,7 +151,6 @@ export function ChatPlayground({
     (visibleMessages.length > 0 || isStreaming || messagesLoading);
   const isEmptyChatWorkspace = !hasConversation;
   const thinkingEnabledForModel = supportsThinking && isThinkingEnabled;
-  const selectedModelSupportsMedia = isQwen35ChatModel(selectedModel);
   const renderModelId = activeThread?.model_id ?? selectedModel;
   const implicitOpenThinkTagModel =
     supportsImplicitOpenThinkTagParsing(renderModelId);
@@ -177,8 +160,6 @@ export function ChatPlayground({
     "rounded-lg border-[var(--border-strong)] bg-[var(--bg-surface-3)] text-[var(--text-primary)] shadow-none";
   const chatAccentButtonClass =
     "rounded-lg bg-[var(--accent-solid)] text-[var(--text-on-accent)] shadow-none hover:opacity-90";
-  const chatComposerIconButtonClass =
-    "chat-composer-icon-button rounded-full border-transparent bg-transparent text-[var(--text-muted)] shadow-none hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)]";
   const chatComposerSendButtonClass =
     "chat-composer-send-button rounded-full border-transparent text-[var(--text-primary)] shadow-none";
 
@@ -320,31 +301,6 @@ export function ChatPlayground({
       }
     };
   }, []);
-
-  const revokeMediaPreviews = useCallback((items: ComposerMediaItem[]) => {
-    for (const item of items) {
-      if (item.previewUrl.startsWith("blob:")) {
-        URL.revokeObjectURL(item.previewUrl);
-      }
-    }
-  }, []);
-
-  const clearMediaItems = useCallback(() => {
-    setMediaItems((previous) => {
-      revokeMediaPreviews(previous);
-      return [];
-    });
-  }, [revokeMediaPreviews]);
-
-  useEffect(() => {
-    mediaItemsRef.current = mediaItems;
-  }, [mediaItems]);
-
-  useEffect(() => {
-    return () => {
-      revokeMediaPreviews(mediaItemsRef.current);
-    };
-  }, [revokeMediaPreviews]);
 
   useEffect(() => {
     listEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -535,12 +491,10 @@ export function ChatPlayground({
       setStats(null);
       setError(null);
       setInput("");
-      clearMediaItems();
     } catch (createError) {
       setError(getErrorMessage(createError, "Failed to create a new chat."));
     }
   }, [
-    clearMediaItems,
     isEmptyChatWorkspace,
     isPreparingThread,
     isStreaming,
@@ -605,149 +559,14 @@ export function ChatPlayground({
     [deleteTargetThreadId],
   );
 
-  const removeMediaItem = useCallback(
-    (id: string) => {
-      setMediaItems((previous) => {
-        const item = previous.find((entry) => entry.id === id);
-        if (item && item.previewUrl.startsWith("blob:")) {
-          URL.revokeObjectURL(item.previewUrl);
-        }
-        return previous.filter((entry) => entry.id !== id);
-      });
-    },
-    [setMediaItems],
-  );
-
-  const handleSelectMedia = useCallback(
-    async (event: ChangeEvent<HTMLInputElement>) => {
-      try {
-        const pickedFiles = Array.from(event.target.files ?? []);
-        event.target.value = "";
-        if (pickedFiles.length === 0) {
-          return;
-        }
-        if (!selectedModelSupportsMedia) {
-          setError(
-            "Image/video chat is currently supported only on Qwen3.5 models.",
-          );
-          return;
-        }
-
-        const availableSlots = Math.max(
-          0,
-          MAX_MEDIA_ATTACHMENTS - mediaItems.length,
-        );
-        if (availableSlots <= 0) {
-          setError(
-            `You can attach up to ${MAX_MEDIA_ATTACHMENTS} files per message.`,
-          );
-          return;
-        }
-
-        let unsupportedCount = 0;
-        let oversizeCount = 0;
-        const parsedItems: ComposerMediaItem[] = [];
-
-        for (const file of pickedFiles) {
-          const mime = file.type || "";
-          const kind: ComposerMediaKind | null = mime.startsWith("image/")
-            ? "image"
-            : mime.startsWith("video/")
-              ? "video"
-              : null;
-
-          if (!kind) {
-            unsupportedCount += 1;
-            continue;
-          }
-          if (file.size > MAX_MEDIA_ATTACHMENT_BYTES) {
-            oversizeCount += 1;
-            continue;
-          }
-
-          const dataUrl = await fileToDataUrl(file);
-          parsedItems.push({
-            id: createMediaItemId(),
-            kind,
-            name: file.name || `${kind}-attachment`,
-            size: file.size,
-            mimeType: mime,
-            dataUrl,
-            previewUrl: URL.createObjectURL(file),
-          });
-        }
-
-        if (parsedItems.length === 0) {
-          if (unsupportedCount > 0) {
-            setError(
-              "Only image and video files are supported for chat attachments.",
-            );
-            return;
-          }
-          if (oversizeCount > 0) {
-            setError(
-              `Attachments must be ${MAX_MEDIA_ATTACHMENT_MB} MB or smaller per file.`,
-            );
-            return;
-          }
-        }
-
-        const acceptedItems = parsedItems.slice(0, availableSlots);
-        const droppedItems = parsedItems.slice(availableSlots);
-        revokeMediaPreviews(droppedItems);
-        setMediaItems((previous) => [...previous, ...acceptedItems]);
-
-        if (
-          pickedFiles.length > availableSlots ||
-          unsupportedCount > 0 ||
-          oversizeCount > 0
-        ) {
-          const warnings: string[] = [];
-          if (pickedFiles.length > availableSlots) {
-            warnings.push(
-              `Only ${availableSlots} attachment slot(s) were available.`,
-            );
-          }
-          if (unsupportedCount > 0) {
-            warnings.push(`${unsupportedCount} file(s) were not image/video.`);
-          }
-          if (oversizeCount > 0) {
-            warnings.push(
-              `${oversizeCount} file(s) exceeded ${MAX_MEDIA_ATTACHMENT_MB} MB.`,
-            );
-          }
-          setError(warnings.join(" "));
-        } else {
-          setError(null);
-        }
-      } catch (error) {
-        setError(
-          getErrorMessage(error, "Failed to read selected media files."),
-        );
-      }
-    },
-    [mediaItems.length, revokeMediaPreviews, selectedModelSupportsMedia],
-  );
-
   const sendMessage = async () => {
     const text = input.trim();
-    if (
-      (!text && mediaItems.length === 0) ||
-      isStreaming ||
-      isPreparingThread
-    ) {
+    if (!text || isStreaming || isPreparingThread) {
       return;
     }
 
     if (!selectedModel || !selectedModelReady) {
       onModelRequired();
-      return;
-    }
-
-    if (mediaItems.length > 0 && !isQwen35ChatModel(selectedModel)) {
-      setError(
-        "Image/video chat is currently supported only on Qwen3.5 models.",
-      );
       return;
     }
 
@@ -788,13 +607,11 @@ export function ChatPlayground({
     const userTempId = `tmp-user-${timestamp}`;
     const assistantTempId = `tmp-assistant-${timestamp}`;
 
-    const userDisplayContent = buildUserDisplayContent(text, mediaItems);
-    const contentParts = buildThreadContentParts(text, mediaItems);
     const optimisticUserMessage: ChatThreadMessageRecord = {
       id: userTempId,
       thread_id: targetThreadId,
       role: "user",
-      content: userDisplayContent,
+      content: text,
       created_at: timestamp,
       tokens_generated: null,
       generation_time_ms: null,
@@ -810,18 +627,11 @@ export function ChatPlayground({
       generation_time_ms: null,
     };
 
-    const qwen35ThinkingControl = isQwen35ChatModel(selectedModel)
-      ? thinkingEnabledForModel === defaultThinkingEnabledForModel(selectedModel)
-        ? undefined
-        : thinkingEnabledForModel
-      : undefined;
-    const systemPrompt = isQwen35ChatModel(selectedModel)
-      ? "You are a helpful assistant."
-      : thinkingEnabledForModel
-        ? isLfm25ThinkingModel(selectedModel)
-          ? "You are a helpful assistant."
-          : THINKING_SYSTEM_PROMPT.content
-        : DEFAULT_SYSTEM_PROMPT.content;
+    const systemPrompt = thinkingEnabledForModel
+      ? isLfm25ThinkingModel(selectedModel)
+        ? "You are a helpful assistant."
+        : THINKING_SYSTEM_PROMPT.content
+      : DEFAULT_SYSTEM_PROMPT.content;
 
     setMessages((previous) => [
       ...previous,
@@ -829,7 +639,6 @@ export function ChatPlayground({
       optimisticAssistantMessage,
     ]);
     setInput("");
-    clearMediaItems();
     setIsStreaming(true);
     setStreamingThreadId(targetThreadId);
 
@@ -838,9 +647,7 @@ export function ChatPlayground({
       {
         model_id: selectedModel,
         content: text,
-        content_parts: contentParts,
         system_prompt: systemPrompt,
-        enable_thinking: qwen35ThinkingControl,
       },
       {
         onStart: ({ userMessage }) => {
@@ -918,7 +725,7 @@ export function ChatPlayground({
           if (isFirstTurn) {
             void maybeGenerateThreadTitle({
               threadId: targetThreadId,
-              userContent: userDisplayContent,
+              userContent: text,
               assistantContent: assistantMessage.content,
               modelId,
             });
@@ -1076,73 +883,6 @@ export function ChatPlayground({
           : "chat-composer-shell-docked",
       )}
     >
-      {mediaItems.length > 0 && (
-        <div className="px-4 pt-3 pb-2 border-b border-[var(--border-muted)] bg-muted/20">
-          <div className="flex items-center justify-between gap-2 mb-2">
-            <p className="text-[11px] font-medium text-muted-foreground">
-              Attachments ({mediaItems.length}/{MAX_MEDIA_ATTACHMENTS})
-            </p>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={clearMediaItems}
-              disabled={isStreaming || isPreparingThread}
-              className="h-7 px-2 text-[11px] text-muted-foreground"
-            >
-              Clear
-            </Button>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            {mediaItems.map((item) => (
-              <div
-                key={item.id}
-                className="relative w-[92px] h-[92px] rounded-md border border-[var(--border-muted)] overflow-hidden bg-muted/40"
-              >
-                {item.kind === "image" ? (
-                  <img
-                    src={item.previewUrl}
-                    alt={item.name}
-                    className="w-full h-full object-cover"
-                  />
-                ) : (
-                  <>
-                    <video
-                      src={item.previewUrl}
-                      className="w-full h-full object-cover"
-                      preload="metadata"
-                      muted
-                    />
-                    <div className="absolute inset-0 bg-black/25 flex items-center justify-center">
-                      <Film className="w-4 h-4 text-white" />
-                    </div>
-                  </>
-                )}
-                <button
-                  type="button"
-                  onClick={() => removeMediaItem(item.id)}
-                  disabled={isStreaming || isPreparingThread}
-                  className="absolute top-1 right-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-black/40 bg-black/70 text-white transition-colors hover:bg-black/90 disabled:opacity-50"
-                  title={`Remove ${item.name}`}
-                >
-                  <X className="w-3 h-3" />
-                </button>
-                <div className="absolute left-0 right-0 bottom-0 bg-black/65 px-1.5 py-1 text-[10px] leading-tight text-white">
-                  <p className="truncate inline-flex items-center gap-1">
-                    {item.kind === "image" ? (
-                      <ImageIcon className="w-3 h-3 shrink-0" />
-                    ) : (
-                      <Film className="w-3 h-3 shrink-0" />
-                    )}
-                    <span className="truncate">{item.name}</span>
-                  </p>
-                  <p className="text-white/80">{formatBytes(item.size)}</p>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
       <textarea
         ref={textareaRef}
         value={input}
@@ -1171,30 +911,6 @@ export function ChatPlayground({
         className="chat-composer-actions flex flex-wrap items-center justify-between gap-x-3 gap-y-2 px-4 pb-4 pt-2"
       >
         <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => mediaInputRef.current?.click()}
-            disabled={
-              isStreaming ||
-              isPreparingThread ||
-              mediaItems.length >= MAX_MEDIA_ATTACHMENTS ||
-              !selectedModelSupportsMedia
-            }
-            title={
-              selectedModelSupportsMedia
-                ? "Attach image or video"
-                : "Image/video upload is available only for Qwen3.5 models"
-            }
-            aria-label={
-              selectedModelSupportsMedia
-                ? "Attach image or video"
-                : "Image/video upload is available only for Qwen3.5 models"
-            }
-            className={cn("h-9 w-9", chatComposerIconButtonClass)}
-          >
-            <Plus className="w-4 h-4" />
-          </Button>
           <Button
             variant="outline"
             size="sm"
@@ -1236,10 +952,7 @@ export function ChatPlayground({
         <div className="ml-auto flex items-center justify-end">
           <Button
             onClick={isStreaming ? stopStreaming : () => void sendMessage()}
-            disabled={
-              isPreparingThread ||
-              (!isStreaming && !input.trim() && mediaItems.length === 0)
-            }
+            disabled={isPreparingThread || (!isStreaming && !input.trim())}
             variant="default"
             size="icon"
             title={
@@ -1273,15 +986,6 @@ export function ChatPlayground({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-4">
-      <input
-        ref={mediaInputRef}
-        type="file"
-        accept="image/*,video/*"
-        multiple
-        disabled={!selectedModelSupportsMedia}
-        onChange={handleSelectMedia}
-        className="hidden"
-      />
       <div className="mb-0 flex flex-wrap items-center justify-between gap-3">
         <div className="min-w-[220px] max-w-full flex-1 sm:max-w-[420px]">
           {renderModelSelector("header")}

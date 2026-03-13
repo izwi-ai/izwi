@@ -248,7 +248,7 @@ mod tests {
             id: "voice".to_string(),
             name: "Voice Agent".to_string(),
             system_prompt: "Be helpful".to_string(),
-            default_model: "Qwen3.5-0.8B".to_string(),
+            default_model: "Qwen3-1.7B-GGUF".to_string(),
             capabilities: AgentCapabilities::default(),
             planning_mode: PlanningMode::Auto,
         };

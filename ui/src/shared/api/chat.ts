@@ -4,6 +4,8 @@ import {
   isAbortError,
 } from "@/shared/api/http";
 
+const DEFAULT_CHAT_MODEL = "Qwen3-8B-GGUF";
+
 export interface ChatMessage {
   role: "system" | "user" | "assistant";
   content: string;
@@ -372,11 +374,11 @@ export class ChatApiClient {
     request: ChatThreadSendMessageRequest,
   ): Promise<ChatThreadSendMessageResponse> {
     return this.http.request(
-      `/chat/threads/${encodeURIComponent(threadId)}/messages`,
+        `/chat/threads/${encodeURIComponent(threadId)}/messages`,
       {
         method: "POST",
         body: JSON.stringify({
-          model: request.model_id ?? "Qwen3.5-0.8B",
+          model: request.model_id ?? DEFAULT_CHAT_MODEL,
           content: request.content,
           content_parts: request.content_parts,
           max_tokens: request.max_tokens,
@@ -407,7 +409,7 @@ export class ChatApiClient {
               "Content-Type": "application/json",
             },
             body: JSON.stringify({
-              model: request.model_id ?? "Qwen3.5-0.8B",
+              model: request.model_id ?? DEFAULT_CHAT_MODEL,
               content: request.content,
               content_parts: request.content_parts,
               max_tokens: request.max_tokens,
@@ -532,7 +534,7 @@ export class ChatApiClient {
       {
         method: "POST",
         body: JSON.stringify({
-          model: request.model_id ?? "Qwen3.5-0.8B",
+          model: request.model_id ?? DEFAULT_CHAT_MODEL,
           messages: request.messages,
           max_tokens: request.max_tokens,
           stream: false,
@@ -572,7 +574,7 @@ export class ChatApiClient {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
-            model: request.model_id ?? "Qwen3.5-0.8B",
+            model: request.model_id ?? DEFAULT_CHAT_MODEL,
             messages: request.messages,
             max_tokens: request.max_tokens,
             stream: true,
@@ -588,7 +590,7 @@ export class ChatApiClient {
           return;
         }
 
-        callbacks.onStart?.(request.model_id ?? "Qwen3.5-0.8B");
+        callbacks.onStart?.(request.model_id ?? DEFAULT_CHAT_MODEL);
 
         let fullText = "";
         const streamStartedAt = performance.now();
@@ -648,7 +650,7 @@ export class ChatApiClient {
     const payload = await this.http.request<OpenAiResponseObject>("/responses", {
       method: "POST",
       body: JSON.stringify({
-        model: request.model_id ?? "Qwen3.5-0.8B",
+        model: request.model_id ?? DEFAULT_CHAT_MODEL,
         input: request.input,
         instructions: request.instructions,
         max_output_tokens: request.max_output_tokens,
@@ -674,7 +676,7 @@ export class ChatApiClient {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
-            model: request.model_id ?? "Qwen3.5-0.8B",
+            model: request.model_id ?? DEFAULT_CHAT_MODEL,
             input: request.input,
             instructions: request.instructions,
             max_output_tokens: request.max_output_tokens,

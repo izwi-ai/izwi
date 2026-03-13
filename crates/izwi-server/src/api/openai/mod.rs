@@ -2,7 +2,6 @@
 
 pub mod audio;
 pub mod chat;
-pub mod common;
 pub mod models;
 pub mod responses;
 

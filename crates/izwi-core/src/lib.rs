@@ -68,13 +68,7 @@ pub use catalog::{
     resolve_asr_model_variant, resolve_diarization_model_variant, ModelInfo, ModelStatus,
     ModelVariant, SpeechModelCapabilities,
 };
-pub use runtime_models::shared::chat::{
-    parse_qwen35_multimodal_control_content, parse_qwen35_thinking_control_content,
-    parse_qwen35_tools_control_content, qwen35_multimodal_control_content,
-    qwen35_recommended_generation_params, qwen35_thinking_control_content,
-    qwen35_tools_control_content, ChatMessage, ChatRole, Qwen35MultimodalInput,
-    Qwen35MultimodalKind,
-};
+pub use runtime_models::shared::chat::{ChatMessage, ChatRole};
 
 // Canonical native registry/device exports.
 pub use backends::{DeviceProfile, DeviceSelector};

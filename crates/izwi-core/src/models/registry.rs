@@ -23,9 +23,6 @@ use crate::models::architectures::qwen3::chat::{
     ChatDecodeState as Qwen3ChatDecodeState, ChatGenerationOutput, Qwen3ChatModel,
 };
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
-use crate::models::architectures::qwen35::chat::{
-    ChatDecodeState as Qwen35ChatDecodeState, Qwen35ChatModel,
-};
 use crate::models::architectures::sortformer::diarization::SortformerDiarizerModel;
 use crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel;
 use crate::models::architectures::whisper::asr::{
@@ -124,16 +121,6 @@ fn load_qwen_chat_model(
     )?))
 }
 
-fn load_qwen35_chat_model(
-    model_dir: &Path,
-    _variant: ModelVariant,
-    device: DeviceProfile,
-) -> Result<NativeChatModel> {
-    Ok(NativeChatModel::Qwen35(Qwen35ChatModel::load(
-        model_dir, device,
-    )?))
-}
-
 fn load_gemma_chat_model(
     model_dir: &Path,
     variant: ModelVariant,
@@ -220,11 +207,6 @@ const CHAT_LOADER_REGISTRY: &[ChatLoaderRegistration] = &[
         name: "qwen_chat",
         family: ModelFamily::Qwen3Chat,
         loader: load_qwen_chat_model,
-    },
-    ChatLoaderRegistration {
-        name: "qwen35_chat",
-        family: ModelFamily::Qwen35Chat,
-        loader: load_qwen35_chat_model,
     },
     ChatLoaderRegistration {
         name: "gemma_chat",
@@ -507,14 +489,12 @@ impl NativeDiarizationModel {
 
 pub enum NativeChatModel {
     Qwen3(Qwen3ChatModel),
-    Qwen35(Qwen35ChatModel),
     Gemma3(Gemma3ChatModel),
     Lfm2(Lfm2ChatModel),
 }
 
 pub enum NativeChatDecodeState {
     Qwen3(Qwen3ChatDecodeState),
-    Qwen35(Qwen35ChatDecodeState),
 }
 
 #[derive(Debug, Clone)]
@@ -529,7 +509,6 @@ impl NativeChatModel {
     pub fn prompt_token_ids(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
         match self {
             Self::Qwen3(model) => model.prompt_token_ids(messages),
-            Self::Qwen35(model) => model.prompt_token_ids(messages),
             Self::Gemma3(model) => model.prompt_token_ids(messages),
             Self::Lfm2(model) => model.prompt_token_ids(messages),
         }
@@ -548,17 +527,10 @@ impl NativeChatModel {
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
-        config: &ChatGenerationConfig,
+        _config: &ChatGenerationConfig,
     ) -> Result<ChatGenerationOutput> {
         match self {
             Self::Qwen3(model) => model.generate(messages, max_new_tokens),
-            Self::Qwen35(model) => {
-                let output = model.generate_with_config(messages, max_new_tokens, config)?;
-                Ok(ChatGenerationOutput {
-                    text: output.text,
-                    tokens_generated: output.tokens_generated,
-                })
-            }
             Self::Gemma3(model) => {
                 let output = model.generate(messages, max_new_tokens)?;
                 Ok(ChatGenerationOutput {
@@ -590,23 +562,11 @@ impl NativeChatModel {
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
-        config: &ChatGenerationConfig,
+        _config: &ChatGenerationConfig,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ChatGenerationOutput> {
         match self {
             Self::Qwen3(model) => model.generate_with_callback(messages, max_new_tokens, on_delta),
-            Self::Qwen35(model) => {
-                let output = model.generate_with_callback_and_config(
-                    messages,
-                    max_new_tokens,
-                    config,
-                    on_delta,
-                )?;
-                Ok(ChatGenerationOutput {
-                    text: output.text,
-                    tokens_generated: output.tokens_generated,
-                })
-            }
             Self::Gemma3(model) => {
                 let output = model.generate_with_callback(messages, max_new_tokens, on_delta)?;
                 Ok(ChatGenerationOutput {
@@ -627,7 +587,6 @@ impl NativeChatModel {
     pub fn supports_incremental_decode(&self) -> bool {
         match self {
             Self::Qwen3(model) => model.supports_incremental_decode(),
-            Self::Qwen35(model) => model.supports_incremental_decode(),
             Self::Gemma3(_) => false,
             Self::Lfm2(model) => model.supports_incremental_decode(),
         }
@@ -646,14 +605,11 @@ impl NativeChatModel {
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
-        config: &ChatGenerationConfig,
+        _config: &ChatGenerationConfig,
     ) -> Result<NativeChatDecodeState> {
         match self {
             Self::Qwen3(model) => Ok(NativeChatDecodeState::Qwen3(
                 model.start_decode(messages, max_new_tokens)?,
-            )),
-            Self::Qwen35(model) => Ok(NativeChatDecodeState::Qwen35(
-                model.start_decode_with_config(messages, max_new_tokens, config)?,
             )),
             Self::Gemma3(_) => Err(Error::InvalidInput(
                 "Incremental decode state is not available for this chat model".to_string(),
@@ -667,15 +623,6 @@ impl NativeChatModel {
     pub fn decode_step(&self, state: &mut NativeChatDecodeState) -> Result<NativeChatDecodeStep> {
         match (self, state) {
             (Self::Qwen3(model), NativeChatDecodeState::Qwen3(state)) => {
-                let step = model.decode_step(state)?;
-                Ok(NativeChatDecodeStep {
-                    delta: step.delta,
-                    text: step.text,
-                    tokens_generated: step.tokens_generated,
-                    finished: step.finished,
-                })
-            }
-            (Self::Qwen35(model), NativeChatDecodeState::Qwen35(state)) => {
                 let step = model.decode_step(state)?;
                 Ok(NativeChatDecodeStep {
                     delta: step.delta,

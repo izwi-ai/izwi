@@ -1,8 +1,4 @@
-import type {
-  ChatMessage,
-  ChatThreadContentPart,
-  ChatThreadMessageRecord,
-} from "@/api";
+import type { ChatMessage, ChatThreadMessageRecord } from "@/api";
 import { API_BASE_URL } from "@/shared/config/runtime";
 
 export interface ModelOption {
@@ -37,21 +33,6 @@ export const DEFAULT_SYSTEM_PROMPT: ChatMessage = {
 
 export const DEFAULT_THREAD_TITLE = "New chat";
 const MAX_THREAD_TITLE_CHARS = 80;
-export const MAX_MEDIA_ATTACHMENTS = 4;
-export const MAX_MEDIA_ATTACHMENT_MB = 32;
-export const MAX_MEDIA_ATTACHMENT_BYTES = MAX_MEDIA_ATTACHMENT_MB * 1024 * 1024;
-
-export type ComposerMediaKind = "image" | "video";
-
-export interface ComposerMediaItem {
-  id: string;
-  kind: ComposerMediaKind;
-  name: string;
-  size: number;
-  mimeType: string;
-  dataUrl: string;
-  previewUrl: string;
-}
 
 export interface ParsedAssistantContent {
   thinking: string;
@@ -66,7 +47,7 @@ interface ParseAssistantContentOptions {
 }
 
 interface ParsedUserAttachment {
-  kind: ComposerMediaKind;
+  kind: "image" | "video";
   source: string | null;
   label: string;
 }
@@ -281,18 +262,8 @@ export function fallbackThreadTitleFromUserMessage(content: string): string {
   return truncateText(normalized, MAX_THREAD_TITLE_CHARS);
 }
 
-export function isQwen35ChatModel(variant: string | null): boolean {
-  if (!variant) {
-    return false;
-  }
-  return variant.trim().toLowerCase().startsWith("qwen3.5-");
-}
-
 export function defaultThinkingEnabledForModel(variant: string | null): boolean {
-  if (isQwen35ChatModel(variant)) {
-    // Qwen3.5 GGUF templates default to non-thinking unless explicitly enabled.
-    return false;
-  }
+  void variant;
   return true;
 }
 
@@ -306,96 +277,7 @@ export function isLfm25ThinkingModel(variant: string | null): boolean {
 export function supportsImplicitOpenThinkTagParsing(
   variant: string | null,
 ): boolean {
-  return isQwen35ChatModel(variant) || isLfm25ThinkingModel(variant);
-}
-
-export function formatBytes(size: number): string {
-  if (!Number.isFinite(size) || size <= 0) {
-    return "0 B";
-  }
-  const units = ["B", "KB", "MB", "GB"];
-  let value = size;
-  let unitIndex = 0;
-  while (value >= 1024 && unitIndex < units.length - 1) {
-    value /= 1024;
-    unitIndex += 1;
-  }
-  const precision = unitIndex === 0 ? 0 : value >= 10 ? 1 : 2;
-  return `${value.toFixed(precision)} ${units[unitIndex]}`;
-}
-
-export function createMediaItemId(): string {
-  if (
-    typeof crypto !== "undefined" &&
-    typeof crypto.randomUUID === "function"
-  ) {
-    return crypto.randomUUID();
-  }
-  return `media-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-}
-
-export function fileToDataUrl(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === "string") {
-        resolve(reader.result);
-        return;
-      }
-      reject(new Error(`Failed reading ${file.name}`));
-    };
-    reader.onerror = () => {
-      reject(new Error(`Failed reading ${file.name}`));
-    };
-    reader.readAsDataURL(file);
-  });
-}
-
-export function buildUserDisplayContent(
-  text: string,
-  mediaItems: ComposerMediaItem[],
-): string {
-  const lines: string[] = [];
-  if (text.trim()) {
-    lines.push(text.trim());
-  }
-  for (const item of mediaItems) {
-    const label = item.kind === "image" ? "[image]" : "[video]";
-    lines.push(`${label} ${item.name}`);
-  }
-  return lines.join("\n").trim();
-}
-
-export function buildThreadContentParts(
-  text: string,
-  mediaItems: ComposerMediaItem[],
-): ChatThreadContentPart[] {
-  const parts: ChatThreadContentPart[] = [];
-  if (text.trim()) {
-    parts.push({
-      type: "text",
-      text: text.trim(),
-    });
-  }
-  for (const item of mediaItems) {
-    const mediaPayload = {
-      url: item.dataUrl,
-      media_type: item.mimeType || undefined,
-      name: item.name,
-    };
-    if (item.kind === "image") {
-      parts.push({
-        type: "input_image",
-        input_image: mediaPayload,
-      });
-      continue;
-    }
-    parts.push({
-      type: "input_video",
-      input_video: mediaPayload,
-    });
-  }
-  return parts;
+  return isLfm25ThinkingModel(variant);
 }
 
 function extractMarkdownImageSource(value: string): string | null {
@@ -409,7 +291,7 @@ function extractMarkdownImageSource(value: string): string | null {
 
 function resolveAttachmentSource(
   value: string,
-  kind: ComposerMediaKind,
+  kind: "image" | "video",
 ): string | null {
   const trimmed = value.trim();
   if (!trimmed) {
@@ -459,7 +341,7 @@ function resolveRelativeSourceToApiOrigin(source: string): string {
   }
 }
 
-function attachmentLabel(value: string, kind: ComposerMediaKind): string {
+function attachmentLabel(value: string, kind: "image" | "video"): string {
   const fallback = kind === "image" ? "Attached image" : "Attached video";
   const trimmed = value.trim();
   if (!trimmed) {
@@ -509,7 +391,7 @@ function extractMediaSourceForDisplay(value: unknown): string | null {
   return readObjectField(value, ["url", "src", "uri", "source"]);
 }
 
-function extractMediaLabel(value: unknown, kind: ComposerMediaKind): string {
+function extractMediaLabel(value: unknown, kind: "image" | "video"): string {
   if (typeof value === "string" && value.trim()) {
     return attachmentLabel(value, kind);
   }

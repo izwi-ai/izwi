@@ -2,19 +2,12 @@ use crate::catalog::ModelFamily;
 use crate::error::Result;
 use crate::model::ModelStatus;
 use crate::model::ModelVariant;
-use crate::models::architectures::qwen35::chat::clear_qwen35_transform_cache_for_model_dir;
 use crate::models::shared::memory::metal::MetalPoolManager;
 use crate::runtime::service::RuntimeService;
-use tracing::warn;
 
 impl RuntimeService {
     /// Unload a model from memory.
     pub async fn unload_model(&self, variant: ModelVariant) -> Result<()> {
-        let model_dir = self
-            .model_manager
-            .get_model_info(variant)
-            .await
-            .and_then(|info| info.local_path);
         let _ = self.core_engine.abort_requests_for_variant(variant).await;
 
         match variant.family() {
@@ -27,10 +20,7 @@ impl RuntimeService {
             ModelFamily::SortformerDiarization => {
                 self.model_registry.unload_diarization(variant).await;
             }
-            ModelFamily::Qwen3Chat
-            | ModelFamily::Qwen35Chat
-            | ModelFamily::Lfm2Chat
-            | ModelFamily::Gemma3Chat => {
+            ModelFamily::Qwen3Chat | ModelFamily::Lfm2Chat | ModelFamily::Gemma3Chat => {
                 self.model_registry.unload_chat(variant).await;
             }
             ModelFamily::Lfm2Audio => {
@@ -55,27 +45,6 @@ impl RuntimeService {
         }
 
         self.model_manager.unload_model(variant).await?;
-
-        if matches!(variant.family(), ModelFamily::Qwen35Chat) {
-            if let Some(model_dir) = model_dir.as_deref() {
-                match clear_qwen35_transform_cache_for_model_dir(model_dir) {
-                    Ok(cleared) if cleared > 0 => {
-                        tracing::info!(
-                            "Cleared {} cached Qwen3.5 transformed tensors while unloading {}",
-                            cleared,
-                            variant
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(err) => warn!(
-                        "Failed to clear scoped Qwen3.5 transform cache for {} ({}): {}",
-                        variant,
-                        model_dir.display(),
-                        err
-                    ),
-                }
-            }
-        }
 
         let has_other_loaded_models =
             self.model_manager

@@ -4,7 +4,7 @@ use crate::engine::EngineCoreRequest;
 use crate::engine::GenerationParams;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
-use crate::models::shared::chat::{qwen35_recommended_generation_params, ChatMessage};
+use crate::models::shared::chat::ChatMessage;
 use crate::runtime::service::RuntimeService;
 use crate::runtime::types::ChatGeneration;
 
@@ -41,12 +41,8 @@ impl RuntimeService {
         max_new_tokens: usize,
         correlation_id: Option<&str>,
     ) -> Result<EngineCoreRequest> {
-        let params = qwen35_recommended_generation_params(variant, &messages, max_new_tokens)
-            .unwrap_or_else(|| {
-                let mut params = GenerationParams::default();
-                params.max_tokens = max_new_tokens.max(1);
-                params
-            });
+        let mut params = GenerationParams::default();
+        params.max_tokens = max_new_tokens.max(1);
         self.build_chat_request_with_params(variant, messages, params, correlation_id)
             .await
     }

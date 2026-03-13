@@ -24,24 +24,6 @@ use crate::error::{Error, Result};
 
 const HF_BASE_URL: &str = "https://huggingface.co";
 const CHUNK_SIZE: usize = 8192; // 8KB chunks for streaming
-const QWEN35_MMPROJ_FILE: &str = "mmproj-F16.gguf";
-const QWEN35_08B_MMPROJ_ESTIMATED_BYTES: u64 = 204_987_232;
-const QWEN35_2B_MMPROJ_ESTIMATED_BYTES: u64 = 668_227_264;
-const QWEN35_4B_MMPROJ_ESTIMATED_BYTES: u64 = 672_423_616;
-const QWEN35_9B_MMPROJ_ESTIMATED_BYTES: u64 = 672_423_616;
-
-fn qwen35_mmproj_estimated_bytes(variant: ModelVariant) -> Option<u64> {
-    match variant {
-        ModelVariant::Qwen3508B => Some(QWEN35_08B_MMPROJ_ESTIMATED_BYTES),
-        ModelVariant::Qwen352B => Some(QWEN35_2B_MMPROJ_ESTIMATED_BYTES),
-        ModelVariant::Qwen354B => Some(QWEN35_4B_MMPROJ_ESTIMATED_BYTES),
-        // The 9B projector is not bundled locally in this workspace, so keep the
-        // offline fallback aligned with the observed 4B projector footprint until
-        // the Hugging Face tree can provide an exact size.
-        ModelVariant::Qwen359B => Some(QWEN35_9B_MMPROJ_ESTIMATED_BYTES),
-        _ => None,
-    }
-}
 
 fn qwen_chat_gguf_filename(variant: ModelVariant) -> Option<&'static str> {
     match variant {
@@ -50,10 +32,6 @@ fn qwen_chat_gguf_filename(variant: ModelVariant) -> Option<&'static str> {
         ModelVariant::Qwen34BGguf => Some("Qwen3-4B-Q4_K_M.gguf"),
         ModelVariant::Qwen38BGguf => Some("Qwen3-8B-Q4_K_M.gguf"),
         ModelVariant::Qwen314BGguf => Some("Qwen3-14B-Q4_K_M.gguf"),
-        ModelVariant::Qwen3508B => Some("Qwen3.5-0.8B-Q4_K_M.gguf"),
-        ModelVariant::Qwen352B => Some("Qwen3.5-2B-Q4_K_M.gguf"),
-        ModelVariant::Qwen354B => Some("Qwen3.5-4B-Q4_K_M.gguf"),
-        ModelVariant::Qwen359B => Some("Qwen3.5-9B-Q4_K_M.gguf"),
         _ => None,
     }
 }
@@ -64,16 +42,6 @@ fn lfm2_chat_gguf_filename(variant: ModelVariant) -> Option<&'static str> {
         ModelVariant::Lfm2512BThinkingGguf => Some("LFM2.5-1.2B-Thinking-Q4_K_M.gguf"),
         _ => None,
     }
-}
-
-fn is_qwen35_chat_variant(variant: ModelVariant) -> bool {
-    matches!(
-        variant,
-        ModelVariant::Qwen3508B
-            | ModelVariant::Qwen352B
-            | ModelVariant::Qwen354B
-            | ModelVariant::Qwen359B
-    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -500,20 +468,11 @@ impl ModelDownloader {
             ModelFamily::SortformerDiarization => path
                 .join("diar_streaming_sortformer_4spk-v2.1.nemo")
                 .exists(),
-            ModelFamily::Qwen3Chat
-            | ModelFamily::Qwen35Chat
-            | ModelFamily::Lfm2Chat
-            | ModelFamily::Gemma3Chat => {
+            ModelFamily::Qwen3Chat | ModelFamily::Lfm2Chat | ModelFamily::Gemma3Chat => {
                 if variant.is_qwen_chat_gguf() {
                     let gguf_file =
                         qwen_chat_gguf_filename(variant).expect("checked by is_qwen_chat_gguf");
-                    let has_required_mmproj = if is_qwen35_chat_variant(variant) {
-                        path.join(QWEN35_MMPROJ_FILE).exists()
-                    } else {
-                        true
-                    };
                     path.join(gguf_file).exists()
-                        && has_required_mmproj
                         && path.join("tokenizer.json").exists()
                         && path.join("tokenizer_config.json").exists()
                 } else if variant.is_lfm2_chat_gguf() {
@@ -1067,24 +1026,17 @@ impl ModelDownloader {
                 "privacy.md".to_string(),
                 "safety.md".to_string(),
             ],
-            ModelFamily::Qwen3Chat
-            | ModelFamily::Qwen35Chat
-            | ModelFamily::Lfm2Chat
-            | ModelFamily::Gemma3Chat => {
+            ModelFamily::Qwen3Chat | ModelFamily::Lfm2Chat | ModelFamily::Gemma3Chat => {
                 if variant.is_qwen_chat_gguf() {
                     let gguf_file =
                         qwen_chat_gguf_filename(variant).expect("checked by is_qwen_chat_gguf");
-                    let mut files = vec![
+                    return vec![
                         gguf_file.to_string(),
                         "params".to_string(),
                         "README.md".to_string(),
                         "tokenizer.json".to_string(),
                         "tokenizer_config.json".to_string(),
                     ];
-                    if is_qwen35_chat_variant(variant) {
-                        files.push(QWEN35_MMPROJ_FILE.to_string());
-                    }
-                    return files;
                 } else if variant.is_lfm2_chat_gguf() {
                     let gguf_file =
                         lfm2_chat_gguf_filename(variant).expect("checked by is_lfm2_chat_gguf");
@@ -1187,10 +1139,6 @@ impl ModelDownloader {
                 ModelVariant::Qwen34BGguf => "Qwen/Qwen3-4B",
                 ModelVariant::Qwen38BGguf => "Qwen/Qwen3-8B",
                 ModelVariant::Qwen314BGguf => "Qwen/Qwen3-14B",
-                ModelVariant::Qwen3508B => "Qwen/Qwen3.5-0.8B",
-                ModelVariant::Qwen352B => "Qwen/Qwen3.5-2B",
-                ModelVariant::Qwen354B => "Qwen/Qwen3.5-4B",
-                ModelVariant::Qwen359B => "Qwen/Qwen3.5-9B",
                 _ => variant.repo_id(),
             };
 
@@ -1415,11 +1363,7 @@ impl ModelDownloader {
     /// Get estimated size for a single file (fallback when HEAD fails)
     fn get_single_file_size_estimate(&self, variant: ModelVariant, file: &str) -> u64 {
         if file.ends_with(".gguf") {
-            if (file == QWEN35_MMPROJ_FILE || file.starts_with("mmproj-"))
-                && is_qwen35_chat_variant(variant)
-            {
-                qwen35_mmproj_estimated_bytes(variant).unwrap_or(1_000_000_000)
-            } else if file.contains("Qwen3-0.6B") {
+            if file.contains("Qwen3-0.6B") {
                 1_100_000_000
             } else if file.contains("Qwen3-1.7B") {
                 2_400_000_000
@@ -1429,14 +1373,6 @@ impl ModelDownloader {
                 5_200_000_000
             } else if file.contains("Qwen3-14B") {
                 9_200_000_000
-            } else if file.contains("Qwen3.5-0.8B") {
-                532_517_120
-            } else if file.contains("Qwen3.5-2B") {
-                1_280_835_840
-            } else if file.contains("Qwen3.5-4B") {
-                2_740_937_888
-            } else if file.contains("Qwen3.5-9B") {
-                5_680_522_464
             } else if file.contains("LFM2.5-1.2B-Instruct") {
                 730_895_168
             } else if file.contains("LFM2.5-1.2B-Thinking") {
@@ -1606,32 +1542,5 @@ impl ModelDownloader {
             }
         }
         Ok(size)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use uuid::Uuid;
-
-    #[test]
-    fn qwen35_mmproj_fallback_sizes_are_variant_specific() {
-        let temp_dir = std::env::temp_dir().join(format!("izwi-download-test-{}", Uuid::new_v4()));
-        let downloader = ModelDownloader::new(temp_dir.clone()).expect("create downloader");
-
-        assert_eq!(
-            downloader.get_single_file_size_estimate(ModelVariant::Qwen3508B, QWEN35_MMPROJ_FILE),
-            QWEN35_08B_MMPROJ_ESTIMATED_BYTES
-        );
-        assert_eq!(
-            downloader.get_single_file_size_estimate(ModelVariant::Qwen352B, QWEN35_MMPROJ_FILE),
-            QWEN35_2B_MMPROJ_ESTIMATED_BYTES
-        );
-        assert_eq!(
-            downloader.get_single_file_size_estimate(ModelVariant::Qwen354B, QWEN35_MMPROJ_FILE),
-            QWEN35_4B_MMPROJ_ESTIMATED_BYTES
-        );
-
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

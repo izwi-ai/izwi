@@ -112,14 +112,14 @@ mod tests {
     fn select_lru_eviction_candidate_skips_requested_and_active_models() {
         let loaded_variants = vec![
             ModelVariant::Qwen3Tts12Hz06BCustomVoice,
-            ModelVariant::Qwen359B,
+            ModelVariant::Qwen38BGguf,
             ModelVariant::Lfm25Audio15B,
         ];
         let requested_variant = ModelVariant::Lfm25Audio15B;
-        let active_variants = HashSet::from([ModelVariant::Qwen359B]);
+        let active_variants = HashSet::from([ModelVariant::Qwen38BGguf]);
         let last_used = HashMap::from([
             (ModelVariant::Qwen3Tts12Hz06BCustomVoice, 10_u64),
-            (ModelVariant::Qwen359B, 5_u64),
+            (ModelVariant::Qwen38BGguf, 5_u64),
             (ModelVariant::Lfm25Audio15B, 20_u64),
         ]);
 
