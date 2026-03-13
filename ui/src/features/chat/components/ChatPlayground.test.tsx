@@ -389,4 +389,86 @@ describe("ChatPlayground", () => {
       expect.any(Object),
     );
   });
+
+  it("allows attachment-only Qwen3.5 turns and sends a preview summary", async () => {
+    const thread = {
+      id: "thread-2",
+      title: "Vision thread",
+      model_id: "Qwen3.5-2B",
+      created_at: 1,
+      updated_at: 2,
+      last_message_preview: null,
+      message_count: 0,
+    };
+
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread.mockResolvedValue({
+      thread,
+      messages: [],
+    });
+    apiMocks.sendChatThreadMessageStream.mockReturnValue(new AbortController());
+
+    render(
+      <MemoryRouter initialEntries={["/chat?threadId=thread-2"]}>
+        <ChatPlayground
+          selectedModel="Qwen3.5-2B"
+          selectedModelReady={true}
+          supportsThinking={true}
+          modelLabel="Qwen3.5 2B GGUF (Q4_K_M)"
+          modelOptions={[
+            {
+              value: "Qwen3.5-2B",
+              label: "Qwen3.5 2B GGUF (Q4_K_M)",
+              statusLabel: "Ready",
+              isReady: true,
+            },
+          ]}
+          onSelectModel={vi.fn()}
+          onOpenModelManager={vi.fn()}
+          onModelRequired={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() =>
+      expect(apiMocks.getChatThread).toHaveBeenCalledWith("thread-2"),
+    );
+
+    const imageInput = screen.getByTestId("chat-image-input");
+    fireEvent.change(imageInput, {
+      target: {
+        files: [new File(["vision"], "cat.png", { type: "image/png" })],
+      },
+    });
+
+    expect(
+      await screen.findByRole("button", { name: "Remove cat.png" }),
+    ).toBeInTheDocument();
+
+    const sendButton = screen.getByRole("button", { name: "Send message" });
+    expect(sendButton).toBeEnabled();
+    fireEvent.click(sendButton);
+
+    await waitFor(() =>
+      expect(apiMocks.sendChatThreadMessageStream).toHaveBeenCalled(),
+    );
+
+    expect(apiMocks.sendChatThreadMessageStream).toHaveBeenCalledWith(
+      "thread-2",
+      expect.objectContaining({
+        model_id: "Qwen3.5-2B",
+        content: "Attached image: cat.png",
+        content_parts: [
+          {
+            type: "input_image",
+            input_image: {
+              url: "data:image/png;base64,dmlzaW9u",
+              name: "cat.png",
+            },
+          },
+        ],
+      }),
+      expect.any(Object),
+    );
+  });
 });

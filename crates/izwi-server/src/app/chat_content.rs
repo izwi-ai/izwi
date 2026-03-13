@@ -299,4 +299,40 @@ mod tests {
 
         assert!(err.contains("currently supported only for Qwen3.5"));
     }
+
+    #[test]
+    fn flatten_thread_content_uses_raw_summary_for_attachment_only_messages() {
+        let flattened = flatten_thread_content(
+            "Attached image: cat.png",
+            Some(&[json!({
+                "type":"input_image",
+                "input_image":{"url":"https://example.com/cat.png","name":"cat.png"}
+            })]),
+        )
+        .expect("flatten attachment-only thread message");
+
+        assert_eq!(flattened.display_text, "Attached image: cat.png");
+        assert_eq!(flattened.runtime_text, IMAGE_PLACEHOLDER);
+        assert_eq!(
+            flattened.media_inputs,
+            vec![ChatMediaInput {
+                kind: ChatMediaKind::Image,
+                source: "https://example.com/cat.png".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn validate_media_inputs_rejects_video_inputs() {
+        let err = validate_media_inputs_for_variant(
+            ModelVariant::Qwen354BGguf,
+            &[ChatMediaInput {
+                kind: ChatMediaKind::Video,
+                source: "https://example.com/demo.mp4".to_string(),
+            }],
+        )
+        .expect_err("video inputs should fail");
+
+        assert!(err.contains("video inputs are not implemented"));
+    }
 }
