@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildChatThreadMessagePayload,
   DEFAULT_THREAD_TITLE,
   defaultThinkingEnabledForModel,
   displayThreadTitle,
   parseAssistantContent,
   parseUserMessageDisplayFromContentParts,
+  supportsImageAttachmentsForModel,
   supportsImplicitOpenThinkTagParsing,
 } from "./support";
 
@@ -38,9 +40,68 @@ describe("chat playground support", () => {
 
   it("keeps thinking enabled by default for supported chat models", () => {
     expect(defaultThinkingEnabledForModel("Qwen3-4B-GGUF")).toBe(true);
+    expect(defaultThinkingEnabledForModel("Qwen3.5-4B")).toBe(true);
     expect(defaultThinkingEnabledForModel("LFM2.5-1.2B-thinking-gguf")).toBe(
       true,
     );
+  });
+
+  it("recognizes Qwen3.5 as the image-capable chat family", () => {
+    expect(supportsImageAttachmentsForModel("Qwen3.5-4B")).toBe(true);
+    expect(supportsImageAttachmentsForModel("Qwen3-4B-GGUF")).toBe(false);
+  });
+
+  it("builds multimodal request content with image parts", () => {
+    expect(
+      buildChatThreadMessagePayload({
+        text: "Describe this",
+        images: [
+          {
+            id: "image-1",
+            source: "data:image/png;base64,AAAA",
+            label: "example.png",
+          },
+        ],
+      }),
+    ).toEqual({
+      content: "Describe this",
+      contentParts: [
+        { type: "text", text: "Describe this" },
+        {
+          type: "input_image",
+          input_image: {
+            url: "data:image/png;base64,AAAA",
+            name: "example.png",
+          },
+        },
+      ],
+    });
+  });
+
+  it("summarizes attachment-only prompts for previews and titles", () => {
+    expect(
+      buildChatThreadMessagePayload({
+        text: "   ",
+        images: [
+          {
+            id: "image-1",
+            source: "data:image/png;base64,AAAA",
+            label: "cat.png",
+          },
+        ],
+      }),
+    ).toEqual({
+      content: "Attached image: cat.png",
+      contentParts: [
+        {
+          type: "input_image",
+          input_image: {
+            url: "data:image/png;base64,AAAA",
+            name: "cat.png",
+          },
+        },
+      ],
+    });
   });
 
   it("treats no-tag output as final answer when implicit no-tag thinking is disabled", () => {

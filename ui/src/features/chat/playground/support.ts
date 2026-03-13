@@ -1,4 +1,8 @@
-import type { ChatMessage, ChatThreadMessageRecord } from "@/api";
+import type {
+  ChatMessage,
+  ChatThreadContentPart,
+  ChatThreadMessageRecord,
+} from "@/api";
 import { API_BASE_URL } from "@/shared/config/runtime";
 
 export interface ModelOption {
@@ -58,6 +62,12 @@ interface ParsedUserMessageDisplay {
 }
 
 export interface ImagePreviewState {
+  source: string;
+  label: string;
+}
+
+export interface PendingImageAttachment {
+  id: string;
   source: string;
   label: string;
 }
@@ -267,6 +277,15 @@ export function defaultThinkingEnabledForModel(variant: string | null): boolean 
   return true;
 }
 
+export function supportsImageAttachmentsForModel(
+  variant: string | null,
+): boolean {
+  if (!variant) {
+    return false;
+  }
+  return variant.trim().toLowerCase().startsWith("qwen3.5-");
+}
+
 export function isLfm25ThinkingModel(variant: string | null): boolean {
   if (!variant) {
     return false;
@@ -278,6 +297,72 @@ export function supportsImplicitOpenThinkTagParsing(
   variant: string | null,
 ): boolean {
   return isLfm25ThinkingModel(variant);
+}
+
+export function buildChatThreadMessagePayload(options: {
+  text: string;
+  images: PendingImageAttachment[];
+}): {
+  content: string;
+  contentParts?: ChatThreadContentPart[];
+} {
+  const trimmedText = options.text.trim();
+  if (options.images.length === 0) {
+    return {
+      content: trimmedText,
+    };
+  }
+
+  const contentParts: ChatThreadContentPart[] = [];
+  if (trimmedText) {
+    contentParts.push({
+      type: "text",
+      text: trimmedText,
+    });
+  }
+
+  for (const image of options.images) {
+    contentParts.push({
+      type: "input_image",
+      input_image: {
+        url: image.source,
+        name: image.label,
+      },
+    });
+  }
+
+  return {
+    content:
+      trimmedText || summarizePendingImages(options.images.length, options.images),
+    contentParts,
+  };
+}
+
+export async function readImageFileAsDataUrl(file: File): Promise<string> {
+  const mimeType = file.type?.trim() || "application/octet-stream";
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = "";
+  const chunkSize = 0x8000;
+
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    const chunk = bytes.subarray(offset, offset + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+
+  return `data:${mimeType};base64,${window.btoa(binary)}`;
+}
+
+function summarizePendingImages(
+  imageCount: number,
+  images: PendingImageAttachment[],
+): string {
+  if (imageCount <= 0) {
+    return "";
+  }
+  if (imageCount === 1) {
+    return `Attached image: ${images[0]?.label || "image"}`;
+  }
+  return `Attached ${imageCount} images`;
 }
 
 function extractMarkdownImageSource(value: string): string | null {

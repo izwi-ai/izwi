@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   CHAT_PREFERRED_MODELS,
+  isThinkingChatModel,
   resolvePreferredRouteModel,
 } from "./routeModelCatalog";
 
@@ -33,5 +34,24 @@ describe("route model catalog", () => {
     });
 
     expect(selected).toBe("Qwen3-1.7B-GGUF");
+  });
+
+  it("picks a ready Qwen3.5 model before an unloaded older preference", () => {
+    const selected = resolvePreferredRouteModel({
+      models: [
+        { variant: "Qwen3-8B-GGUF", status: "downloaded" },
+        { variant: "Qwen3.5-4B", status: "ready" },
+      ],
+      selectedModel: null,
+      preferredVariants: CHAT_PREFERRED_MODELS,
+      preferAnyPreferredBeforeReadyAny: true,
+    });
+
+    expect(selected).toBe("Qwen3.5-4B");
+  });
+
+  it("treats Qwen3.5 models as thinking-capable chat models", () => {
+    expect(isThinkingChatModel("Qwen3.5-4B")).toBe(true);
+    expect(isThinkingChatModel("Qwen3-ASR-0.6B")).toBe(false);
   });
 });

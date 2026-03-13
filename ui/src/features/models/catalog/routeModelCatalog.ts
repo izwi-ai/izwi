@@ -45,8 +45,12 @@ export const TRANSCRIPTION_PREFERRED_MODELS = [
 export const CHAT_PREFERRED_MODELS = [
   "Qwen3-8B-GGUF",
   "Qwen3-4B-GGUF",
+  "Qwen3.5-9B",
+  "Qwen3.5-4B",
   "Qwen3-1.7B-GGUF",
+  "Qwen3.5-2B",
   "Qwen3-0.6B-GGUF",
+  "Qwen3.5-0.8B",
 ] as const;
 
 export function getModelStatusLabel(status: ModelInfo["status"]): string {
@@ -168,7 +172,7 @@ export function getChatRouteModelLabel(variant: string): string {
 export function isThinkingChatModel(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   const isQwenThinkingFamily =
-    normalized.startsWith("qwen3-") &&
+    (normalized.startsWith("qwen3-") || normalized.startsWith("qwen3.5-")) &&
     !normalized.includes("-asr-") &&
     !normalized.includes("-tts-") &&
     !normalized.includes("forcedaligner");
