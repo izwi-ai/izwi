@@ -22,6 +22,7 @@ use crate::models::architectures::qwen3::asr::{
 use crate::models::architectures::qwen3::chat::{
     ChatDecodeState as Qwen3ChatDecodeState, ChatGenerationOutput, Qwen3ChatModel,
 };
+use crate::models::architectures::qwen35::chat::Qwen35ChatModel;
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::models::architectures::sortformer::diarization::SortformerDiarizerModel;
 use crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel;
@@ -150,6 +151,16 @@ fn load_lfm2_chat_model(
     )?))
 }
 
+fn load_qwen35_chat_model(
+    model_dir: &Path,
+    variant: ModelVariant,
+    device: DeviceProfile,
+) -> Result<NativeChatModel> {
+    Ok(NativeChatModel::Qwen35(Qwen35ChatModel::load(
+        model_dir, variant, device,
+    )?))
+}
+
 fn load_voxtral_model(
     model_dir: &Path,
     _variant: ModelVariant,
@@ -207,6 +218,11 @@ const CHAT_LOADER_REGISTRY: &[ChatLoaderRegistration] = &[
         name: "qwen_chat",
         family: ModelFamily::Qwen3Chat,
         loader: load_qwen_chat_model,
+    },
+    ChatLoaderRegistration {
+        name: "qwen35_chat",
+        family: ModelFamily::Qwen35Chat,
+        loader: load_qwen35_chat_model,
     },
     ChatLoaderRegistration {
         name: "gemma_chat",
@@ -489,6 +505,7 @@ impl NativeDiarizationModel {
 
 pub enum NativeChatModel {
     Qwen3(Qwen3ChatModel),
+    Qwen35(Qwen35ChatModel),
     Gemma3(Gemma3ChatModel),
     Lfm2(Lfm2ChatModel),
 }
@@ -509,6 +526,7 @@ impl NativeChatModel {
     pub fn prompt_token_ids(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
         match self {
             Self::Qwen3(model) => model.prompt_token_ids(messages),
+            Self::Qwen35(model) => model.prompt_token_ids(messages),
             Self::Gemma3(model) => model.prompt_token_ids(messages),
             Self::Lfm2(model) => model.prompt_token_ids(messages),
         }
@@ -531,6 +549,13 @@ impl NativeChatModel {
     ) -> Result<ChatGenerationOutput> {
         match self {
             Self::Qwen3(model) => model.generate(messages, max_new_tokens),
+            Self::Qwen35(model) => {
+                let output = model.generate(messages, max_new_tokens)?;
+                Ok(ChatGenerationOutput {
+                    text: output.text,
+                    tokens_generated: output.tokens_generated,
+                })
+            }
             Self::Gemma3(model) => {
                 let output = model.generate(messages, max_new_tokens)?;
                 Ok(ChatGenerationOutput {
@@ -567,6 +592,14 @@ impl NativeChatModel {
     ) -> Result<ChatGenerationOutput> {
         match self {
             Self::Qwen3(model) => model.generate_with_callback(messages, max_new_tokens, on_delta),
+            Self::Qwen35(model) => {
+                let output =
+                    model.generate_with_callback(messages, max_new_tokens, on_delta)?;
+                Ok(ChatGenerationOutput {
+                    text: output.text,
+                    tokens_generated: output.tokens_generated,
+                })
+            }
             Self::Gemma3(model) => {
                 let output = model.generate_with_callback(messages, max_new_tokens, on_delta)?;
                 Ok(ChatGenerationOutput {
@@ -587,6 +620,7 @@ impl NativeChatModel {
     pub fn supports_incremental_decode(&self) -> bool {
         match self {
             Self::Qwen3(model) => model.supports_incremental_decode(),
+            Self::Qwen35(model) => model.supports_incremental_decode(),
             Self::Gemma3(_) => false,
             Self::Lfm2(model) => model.supports_incremental_decode(),
         }
@@ -610,6 +644,9 @@ impl NativeChatModel {
         match self {
             Self::Qwen3(model) => Ok(NativeChatDecodeState::Qwen3(
                 model.start_decode(messages, max_new_tokens)?,
+            )),
+            Self::Qwen35(_) => Err(Error::InvalidInput(
+                "Incremental decode state is not available for this chat model".to_string(),
             )),
             Self::Gemma3(_) => Err(Error::InvalidInput(
                 "Incremental decode state is not available for this chat model".to_string(),

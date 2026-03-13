@@ -139,8 +139,18 @@ impl GgufLoader {
         self.content.tensor_infos.keys().cloned().collect()
     }
 
+    /// Number of tensors present in the GGUF checkpoint.
+    pub fn tensor_count(&self) -> usize {
+        self.tensor_count
+    }
+
+    /// Get a raw metadata value.
+    pub fn metadata_value(&self, key: &str) -> Option<&GgufValue> {
+        self.metadata.get(key)
+    }
+
     /// Get a string metadata value.
-    fn get_metadata_string(&self, key: &str) -> Option<String> {
+    pub fn get_metadata_string(&self, key: &str) -> Option<String> {
         self.metadata.get(key).and_then(|v| {
             if let GgufValue::String(s) = v {
                 Some(s.clone())
@@ -151,7 +161,7 @@ impl GgufLoader {
     }
 
     /// Get a u64 metadata value.
-    fn get_metadata_u64(&self, key: &str) -> Option<u64> {
+    pub fn get_metadata_u64(&self, key: &str) -> Option<u64> {
         self.metadata.get(key).and_then(|v| match v {
             GgufValue::U64(n) => Some(*n),
             GgufValue::I64(n) => Some(*n as u64),
