@@ -1055,6 +1055,23 @@ export function ChatPlayground({
         className="chat-composer-actions flex flex-wrap items-center justify-between gap-x-3 gap-y-2 px-4 pb-4 pt-2"
       >
         <div className="flex min-w-0 flex-wrap items-center gap-2">
+          {supportsImageAttachments && (
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={openImagePicker}
+              disabled={isStreaming || isPreparingThread || isReadingImages}
+              className={cn("h-8 w-8 border p-0", chatSecondaryButtonClass)}
+              title="Attach image"
+              aria-label="Attach image"
+            >
+              {isReadingImages ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Plus className="h-3.5 w-3.5" />
+              )}
+            </Button>
+          )}
           <Button
             variant="outline"
             size="sm"
@@ -1064,24 +1081,6 @@ export function ChatPlayground({
             <Settings2 className="w-3.5 h-3.5" />
             Models
           </Button>
-          {supportsImageAttachments && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={openImagePicker}
-              disabled={isStreaming || isPreparingThread || isReadingImages}
-              className={cn("h-8 gap-1.5 border text-xs", chatSecondaryButtonClass)}
-              title="Attach image"
-              aria-label="Attach image"
-            >
-              {isReadingImages ? (
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              ) : (
-                <ImageIcon className="w-3.5 h-3.5" />
-              )}
-              Attach image
-            </Button>
-          )}
           {supportsThinking && (
             <Button
               variant="outline"
