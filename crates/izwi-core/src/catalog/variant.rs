@@ -15,6 +15,7 @@ pub enum ModelFamily {
     Qwen3Chat,
     Qwen35Chat,
     Lfm2Chat,
+    Lfm25Audio,
     Gemma3Chat,
     Qwen3ForcedAligner,
     Voxtral,
@@ -110,6 +111,7 @@ impl ModelVariant {
                 ModelFamily::Qwen35Chat
             }
             Lfm2512BInstructGguf | Lfm2512BThinkingGguf => ModelFamily::Lfm2Chat,
+            Lfm25Audio15BGguf => ModelFamily::Lfm25Audio,
             Gemma31BIt | Gemma34BIt => ModelFamily::Gemma3Chat,
             Qwen3ForcedAligner06B | Qwen3ForcedAligner06B4Bit => ModelFamily::Qwen3ForcedAligner,
             VoxtralMini4BRealtime2602 => ModelFamily::Voxtral,
@@ -130,7 +132,7 @@ impl ModelVariant {
                 ModelTask::Chat
             }
             ModelFamily::Qwen3ForcedAligner => ModelTask::ForcedAlign,
-            ModelFamily::Voxtral => ModelTask::AudioChat,
+            ModelFamily::Voxtral | ModelFamily::Lfm25Audio => ModelTask::AudioChat,
             ModelFamily::Tokenizer => ModelTask::Tokenizer,
         }
     }
@@ -417,6 +419,10 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
         return Some(lfm2_variant);
     }
 
+    if let Some(lfm25_audio_variant) = resolve_lfm25_audio_variant(normalized) {
+        return Some(lfm25_audio_variant);
+    }
+
     None
 }
 
@@ -478,6 +484,28 @@ fn resolve_lfm2_chat_variant(normalized: &str) -> Option<ModelVariant> {
     }
 
     None
+}
+
+fn resolve_lfm25_audio_variant(normalized: &str) -> Option<ModelVariant> {
+    use ModelVariant::*;
+
+    if !normalized.contains("audio") {
+        return None;
+    }
+
+    if !normalized.contains("lfm25") && !normalized.contains("lfm2dot5") {
+        return None;
+    }
+
+    if !(normalized.contains("15b") || normalized.contains("15")) {
+        return None;
+    }
+
+    if !(normalized.contains("gguf") || normalized.contains("q40")) {
+        return None;
+    }
+
+    Some(Lfm25Audio15BGguf)
 }
 
 fn matches_variant_alias(variant: ModelVariant, raw: &str, normalized: &str) -> bool {
@@ -690,6 +718,24 @@ mod tests {
     #[test]
     fn parse_lfm25_non_gguf_repo_is_rejected_for_chat() {
         assert!(parse_chat_model_variant(Some("LiquidAI/LFM2.5-1.2B-Instruct")).is_err());
+    }
+
+    #[test]
+    fn parse_lfm25_audio_repo_alias() {
+        let parsed = parse_model_variant("LiquidAI/LFM2.5-Audio-1.5B-GGUF").unwrap();
+        assert_eq!(parsed, ModelVariant::Lfm25Audio15BGguf);
+        assert_eq!(parsed.family(), ModelFamily::Lfm25Audio);
+    }
+
+    #[test]
+    fn parse_lfm25_audio_q40_file_alias() {
+        let parsed = parse_model_variant("LFM2.5-Audio-1.5B-Q4_0.gguf").unwrap();
+        assert_eq!(parsed, ModelVariant::Lfm25Audio15BGguf);
+    }
+
+    #[test]
+    fn parse_chat_rejects_lfm25_audio_bundle() {
+        assert!(parse_chat_model_variant(Some("LiquidAI/LFM2.5-Audio-1.5B-GGUF")).is_err());
     }
 
     #[test]

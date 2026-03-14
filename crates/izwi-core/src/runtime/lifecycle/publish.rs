@@ -26,6 +26,7 @@ impl RuntimeService {
             | ModelFamily::Lfm2Chat
             | ModelFamily::Gemma3Chat
             | ModelFamily::Voxtral
+            | ModelFamily::Lfm25Audio
             | ModelFamily::Qwen3Tts
             | ModelFamily::KokoroTts => {
                 if matches!(

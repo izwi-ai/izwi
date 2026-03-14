@@ -71,6 +71,13 @@ pub enum ModelVariant {
         alias = "LFM2.5-1.2B-Thinking-Q4_K_M.gguf"
     )]
     Lfm2512BThinkingGguf,
+    /// LFM2.5 Audio 1.5B model from Liquid AI (GGUF Q4_0 bundle)
+    #[serde(
+        rename = "LFM2.5-Audio-1.5B-GGUF",
+        alias = "LiquidAI/LFM2.5-Audio-1.5B-GGUF",
+        alias = "LFM2.5-Audio-1.5B-Q4_0.gguf"
+    )]
+    Lfm25Audio15BGguf,
     /// Kokoro-82M TTS model from hexgrad
     #[serde(rename = "Kokoro-82M")]
     Kokoro82M,
@@ -235,6 +242,7 @@ impl ModelVariant {
             Self::Qwen3TtsTokenizer12Hz => "Qwen/Qwen3-TTS-Tokenizer-12Hz",
             Self::Lfm2512BInstructGguf => "LiquidAI/LFM2.5-1.2B-Instruct-GGUF",
             Self::Lfm2512BThinkingGguf => "LiquidAI/LFM2.5-1.2B-Thinking-GGUF",
+            Self::Lfm25Audio15BGguf => "LiquidAI/LFM2.5-Audio-1.5B-GGUF",
             Self::Kokoro82M => "hexgrad/Kokoro-82M",
             Self::Qwen3Asr06B => "Qwen/Qwen3-ASR-0.6B",
             Self::Qwen3Asr06B4Bit => "mlx-community/Qwen3-ASR-0.6B-4bit",
@@ -291,6 +299,7 @@ impl ModelVariant {
             Self::Qwen3TtsTokenizer12Hz => "Qwen3-TTS Tokenizer 12Hz",
             Self::Lfm2512BInstructGguf => "LFM2.5 1.2B Instruct GGUF",
             Self::Lfm2512BThinkingGguf => "LFM2.5 1.2B Thinking GGUF",
+            Self::Lfm25Audio15BGguf => "LFM2.5 Audio 1.5B GGUF",
             Self::Kokoro82M => "Kokoro 82M",
             Self::Qwen3Asr06B => "Qwen3-ASR 0.6B",
             Self::Qwen3Asr06B4Bit => "Qwen3-ASR 0.6B 4-bit",
@@ -347,6 +356,7 @@ impl ModelVariant {
             Self::Qwen3TtsTokenizer12Hz => "Qwen3-TTS-Tokenizer-12Hz",
             Self::Lfm2512BInstructGguf => "LFM2.5-1.2B-Instruct-GGUF",
             Self::Lfm2512BThinkingGguf => "LFM2.5-1.2B-Thinking-GGUF",
+            Self::Lfm25Audio15BGguf => "LFM2.5-Audio-1.5B-GGUF",
             Self::Kokoro82M => "Kokoro-82M",
             Self::Qwen3Asr06B => "Qwen3-ASR-0.6B",
             Self::Qwen3Asr06B4Bit => "Qwen3-ASR-0.6B-4bit",
@@ -403,6 +413,7 @@ impl ModelVariant {
             Self::Qwen3TtsTokenizer12Hz => 682_300_739, // ~0.64 GB
             Self::Lfm2512BInstructGguf => 730_895_168,  // ~0.68 GB (GGUF Q4_K_M, HF tree)
             Self::Lfm2512BThinkingGguf => 730_895_360,  // ~0.68 GB (GGUF Q4_K_M, HF tree)
+            Self::Lfm25Audio15BGguf => 1_220_000_000,  // ~1.14 GB (four-file GGUF bundle, est)
             Self::Kokoro82M => 363_323_757,             // ~346 MB (HF tree total, Apr 2025)
             Self::Qwen3Asr06B => 1_880_619_678,         // ~1.75 GB
             Self::Qwen3Asr06B4Bit => 712_781_279,       // ~0.66 GB
@@ -458,6 +469,7 @@ impl ModelVariant {
             | Self::Qwen3Tts12Hz17BVoiceDesignBf16 => 6.0,
             Self::Qwen3TtsTokenizer12Hz => 1.0,
             Self::Lfm2512BInstructGguf | Self::Lfm2512BThinkingGguf => 2.0,
+            Self::Lfm25Audio15BGguf => 5.0,
             Self::Kokoro82M => 2.0,
             Self::Qwen3Asr06B
             | Self::Qwen3Asr06B4Bit
@@ -536,6 +548,14 @@ impl ModelVariant {
                 | crate::catalog::ModelFamily::Qwen35Chat
                 | crate::catalog::ModelFamily::Gemma3Chat
                 | crate::catalog::ModelFamily::Lfm2Chat
+        )
+    }
+
+    /// Whether this is an audio-chat model.
+    pub fn is_audio_chat(&self) -> bool {
+        matches!(
+            self.family(),
+            crate::catalog::ModelFamily::Voxtral | crate::catalog::ModelFamily::Lfm25Audio
         )
     }
 
@@ -678,6 +698,7 @@ impl ModelVariant {
                 | Self::Qwen3Tts12Hz17BVoiceDesignBf16
                 | Self::Lfm2512BInstructGguf
                 | Self::Lfm2512BThinkingGguf
+                | Self::Lfm25Audio15BGguf
                 | Self::Qwen3Asr06B4Bit
                 | Self::Qwen3Asr06B8Bit
                 | Self::Qwen3Asr06BBf16
@@ -714,6 +735,7 @@ impl ModelVariant {
                 | Self::Qwen359BGguf
                 | Self::Lfm2512BInstructGguf
                 | Self::Lfm2512BThinkingGguf
+                | Self::Lfm25Audio15BGguf
         )
     }
 
@@ -748,6 +770,11 @@ impl ModelVariant {
         )
     }
 
+    /// Whether this is an LFM2.5 Audio GGUF bundle variant.
+    pub fn is_lfm25_audio_gguf(&self) -> bool {
+        matches!(self, Self::Lfm25Audio15BGguf)
+    }
+
     /// Whether this variant is currently enabled in the application catalog.
     pub fn is_enabled(&self) -> bool {
         match self {
@@ -775,6 +802,7 @@ impl ModelVariant {
             | Self::Lfm2512BInstructGguf
             | Self::Lfm2512BThinkingGguf
             | Self::Kokoro82M => true,
+            Self::Lfm25Audio15BGguf => false,
             Self::Gemma34BIt => false,
             Self::VoxtralMini4BRealtime2602 => false,
             Self::ParakeetTdt06BV2 | Self::ParakeetTdt06BV3 => true,
@@ -807,6 +835,7 @@ impl ModelVariant {
             Self::Qwen3TtsTokenizer12Hz,
             Self::Lfm2512BInstructGguf,
             Self::Lfm2512BThinkingGguf,
+            Self::Lfm25Audio15BGguf,
             Self::Kokoro82M,
             Self::Qwen3Asr06B,
             Self::Qwen3Asr06B4Bit,

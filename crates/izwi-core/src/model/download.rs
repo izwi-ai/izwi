@@ -54,6 +54,18 @@ fn lfm2_chat_gguf_filename(variant: ModelVariant) -> Option<&'static str> {
     }
 }
 
+fn lfm25_audio_gguf_filenames(variant: ModelVariant) -> Option<[&'static str; 4]> {
+    match variant {
+        ModelVariant::Lfm25Audio15BGguf => Some([
+            "LFM2.5-Audio-1.5B-Q4_0.gguf",
+            "mmproj-LFM2.5-Audio-1.5B-Q4_0.gguf",
+            "tokenizer-LFM2.5-Audio-1.5B-Q4_0.gguf",
+            "vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf",
+        ]),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct HfRepoTreeEntry {
     path: String,
@@ -503,6 +515,10 @@ impl ModelDownloader {
                     has_config && has_tokenizer && has_model
                 }
             }
+            ModelFamily::Lfm25Audio => lfm25_audio_gguf_filenames(variant)
+                .expect("checked by is_lfm25_audio_gguf")
+                .into_iter()
+                .all(|file| path.join(file).exists()),
             ModelFamily::Qwen3ForcedAligner => {
                 path.join("config.json").exists()
                     && path.join("vocab.json").exists()
@@ -1082,6 +1098,11 @@ impl ModelDownloader {
                 }
                 files
             }
+            ModelFamily::Lfm25Audio => lfm25_audio_gguf_filenames(variant)
+                .expect("checked by is_lfm25_audio_gguf")
+                .into_iter()
+                .map(|file| file.to_string())
+                .collect(),
             ModelFamily::Qwen3ForcedAligner => {
                 let mut files = vec![
                     "config.json".to_string(),
@@ -1187,6 +1208,18 @@ impl ModelDownloader {
                         source_file: file.clone(),
                         local_file: file,
                     }
+                })
+                .collect();
+        }
+
+        if variant.is_lfm25_audio_gguf() {
+            return self
+                .get_model_files(variant)
+                .into_iter()
+                .map(|file| ModelFileSpec {
+                    source_repo: default_repo.clone(),
+                    source_file: file.clone(),
+                    local_file: file,
                 })
                 .collect();
         }
@@ -1385,6 +1418,12 @@ impl ModelDownloader {
                 ModelVariant::Qwen359BGguf => 230_000_000,
                 _ => 120_000_000,
             }
+        } else if file == "mmproj-LFM2.5-Audio-1.5B-Q4_0.gguf" {
+            220_000_000
+        } else if file == "tokenizer-LFM2.5-Audio-1.5B-Q4_0.gguf" {
+            110_000_000
+        } else if file == "vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf" {
+            150_000_000
         } else if file.ends_with(".gguf") {
             if file.contains("Qwen3-0.6B") {
                 1_100_000_000
@@ -1408,6 +1447,8 @@ impl ModelDownloader {
                 730_895_168
             } else if file.contains("LFM2.5-1.2B-Thinking") {
                 730_895_360
+            } else if file.contains("LFM2.5-Audio-1.5B") {
+                740_000_000
             } else {
                 1_000_000_000
             }
@@ -1612,6 +1653,49 @@ mod tests {
         std::fs::create_dir_all(&model_dir).expect("model dir");
         std::fs::write(model_dir.join("Qwen3.5-4B-Q4_K_M.gguf"), [0u8]).expect("gguf");
         std::fs::write(model_dir.join("mmproj-F16.gguf"), [0u8]).expect("mmproj");
+        assert!(downloader.is_downloaded(variant));
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn lfm25_audio_model_files_include_full_q40_bundle() {
+        let (downloader, temp_dir) = test_downloader();
+        let files = downloader.get_model_files(ModelVariant::Lfm25Audio15BGguf);
+        assert_eq!(
+            files,
+            vec![
+                "LFM2.5-Audio-1.5B-Q4_0.gguf".to_string(),
+                "mmproj-LFM2.5-Audio-1.5B-Q4_0.gguf".to_string(),
+                "tokenizer-LFM2.5-Audio-1.5B-Q4_0.gguf".to_string(),
+                "vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf".to_string(),
+            ]
+        );
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn lfm25_audio_is_downloaded_only_when_all_bundle_files_exist() {
+        let (downloader, temp_dir) = test_downloader();
+        let variant = ModelVariant::Lfm25Audio15BGguf;
+        let model_dir = downloader.model_path(variant);
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+        std::fs::write(model_dir.join("LFM2.5-Audio-1.5B-Q4_0.gguf"), [0u8]).expect("main");
+        std::fs::write(
+            model_dir.join("mmproj-LFM2.5-Audio-1.5B-Q4_0.gguf"),
+            [0u8],
+        )
+        .expect("mmproj");
+        std::fs::write(
+            model_dir.join("tokenizer-LFM2.5-Audio-1.5B-Q4_0.gguf"),
+            [0u8],
+        )
+        .expect("tokenizer");
+        assert!(!downloader.is_downloaded(variant));
+        std::fs::write(
+            model_dir.join("vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf"),
+            [0u8],
+        )
+        .expect("vocoder");
         assert!(downloader.is_downloaded(variant));
         std::fs::remove_dir_all(temp_dir).ok();
     }

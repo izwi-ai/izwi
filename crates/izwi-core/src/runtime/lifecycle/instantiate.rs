@@ -57,6 +57,11 @@ impl RuntimeService {
                     .await?;
                 InstantiatedPayload::None
             }
+            ModelFamily::Lfm25Audio => {
+                return Err(crate::error::Error::InvalidInput(
+                    "LFM2.5 Audio is registered in the catalog, but the native runtime is not loaded until the lfm25_audio architecture lands".to_string(),
+                ));
+            }
             ModelFamily::KokoroTts => {
                 self.model_registry
                     .load_kokoro(variant, &model_path)
