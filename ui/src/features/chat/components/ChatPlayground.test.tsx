@@ -346,9 +346,19 @@ describe("ChatPlayground", () => {
       expect(apiMocks.getChatThread).toHaveBeenCalledWith("thread-1"),
     );
 
-    expect(
-      screen.getByRole("button", { name: "Attach image" }),
-    ).toBeInTheDocument();
+    const composerActions = screen.getByTestId("chat-composer-actions");
+    const attachImageButton = screen.getByRole("button", { name: "Attach image" });
+    const modelsButton = screen.getByRole("button", { name: "Models" });
+    const thinkingButton = screen.getByRole("button", {
+      name: "Disable thinking mode",
+    });
+
+    expect(attachImageButton).not.toHaveTextContent(/Attach image/i);
+
+    const actionButtons = within(composerActions).getAllByRole("button");
+    expect(actionButtons[0]).toBe(attachImageButton);
+    expect(actionButtons[1]).toBe(modelsButton);
+    expect(actionButtons[2]).toBe(thinkingButton);
 
     const imageInput = screen.getByTestId("chat-image-input");
     const imageFile = new File(["image"], "sample.png", { type: "image/png" });
