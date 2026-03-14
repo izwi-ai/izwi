@@ -489,13 +489,9 @@ impl ModelDownloader {
                         && path.join("tokenizer.json").exists()
                         && path.join("tokenizer_config.json").exists()
                 } else if variant.is_qwen35_chat_gguf() {
-                    let gguf_file = qwen35_chat_gguf_filename(variant)
-                        .expect("checked by is_qwen35_chat_gguf");
-                    path.join(gguf_file).exists()
-                        && path.join("mmproj-F16.gguf").exists()
-                        && path.join("README.md").exists()
-                        && path.join("tokenizer.json").exists()
-                        && path.join("tokenizer_config.json").exists()
+                    let gguf_file =
+                        qwen35_chat_gguf_filename(variant).expect("checked by is_qwen35_chat_gguf");
+                    path.join(gguf_file).exists() && path.join("mmproj-F16.gguf").exists()
                 } else if variant.is_lfm2_chat_gguf() {
                     let gguf_file =
                         lfm2_chat_gguf_filename(variant).expect("checked by is_lfm2_chat_gguf");
@@ -1062,15 +1058,9 @@ impl ModelDownloader {
                         "tokenizer_config.json".to_string(),
                     ];
                 } else if variant.is_qwen35_chat_gguf() {
-                    let gguf_file = qwen35_chat_gguf_filename(variant)
-                        .expect("checked by is_qwen35_chat_gguf");
-                    return vec![
-                        gguf_file.to_string(),
-                        "mmproj-F16.gguf".to_string(),
-                        "README.md".to_string(),
-                        "tokenizer.json".to_string(),
-                        "tokenizer_config.json".to_string(),
-                    ];
+                    let gguf_file =
+                        qwen35_chat_gguf_filename(variant).expect("checked by is_qwen35_chat_gguf");
+                    return vec![gguf_file.to_string(), "mmproj-F16.gguf".to_string()];
                 } else if variant.is_lfm2_chat_gguf() {
                     let gguf_file =
                         lfm2_chat_gguf_filename(variant).expect("checked by is_lfm2_chat_gguf");
@@ -1608,5 +1598,44 @@ impl ModelDownloader {
             }
         }
         Ok(size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn test_downloader() -> (ModelDownloader, PathBuf) {
+        let temp_dir =
+            std::env::temp_dir().join(format!("izwi-downloader-test-{}", Uuid::new_v4()));
+        let downloader = ModelDownloader::new(temp_dir.clone()).expect("downloader");
+        (downloader, temp_dir)
+    }
+
+    #[test]
+    fn qwen35_model_files_only_include_core_assets() {
+        let (downloader, temp_dir) = test_downloader();
+        let files = downloader.get_model_files(ModelVariant::Qwen354BGguf);
+        assert_eq!(
+            files,
+            vec![
+                "Qwen3.5-4B-Q4_K_M.gguf".to_string(),
+                "mmproj-F16.gguf".to_string(),
+            ]
+        );
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn qwen35_is_downloaded_with_gguf_and_mmproj_only() {
+        let (downloader, temp_dir) = test_downloader();
+        let variant = ModelVariant::Qwen354BGguf;
+        let model_dir = downloader.model_path(variant);
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+        std::fs::write(model_dir.join("Qwen3.5-4B-Q4_K_M.gguf"), [0u8]).expect("gguf");
+        std::fs::write(model_dir.join("mmproj-F16.gguf"), [0u8]).expect("mmproj");
+        assert!(downloader.is_downloaded(variant));
+        std::fs::remove_dir_all(temp_dir).ok();
     }
 }

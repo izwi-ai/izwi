@@ -3,14 +3,19 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use uuid::Uuid;
 
 use serde::Deserialize;
 use tokenizers::decoders::byte_fallback::ByteFallback;
-use tokenizers::decoders::sequence::Sequence;
+use tokenizers::decoders::sequence::Sequence as DecoderSequence;
 use tokenizers::decoders::DecoderWrapper;
 use tokenizers::models::bpe::BPE;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+use tokenizers::pre_tokenizers::sequence::Sequence as PreTokenizerSequence;
+use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
+use tokenizers::pre_tokenizers::PreTokenizerWrapper;
 use tokenizers::AddedToken;
+use tokenizers::SplitDelimiterBehavior;
 use tokenizers::Tokenizer as HfTokenizer;
 use tracing::{debug, info, warn};
 
@@ -29,6 +34,9 @@ pub struct Tokenizer {
     inner: HfTokenizer,
     special_tokens: SpecialTokens,
 }
+
+const QWEN2_PRETOKENIZER_REGEX: &str =
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
 impl Tokenizer {
     pub fn from_path(model_dir: &Path) -> Result<Self> {
@@ -105,7 +113,7 @@ impl Tokenizer {
             .unwrap_or(true);
         let byte_level = ByteLevel::new(add_prefix_space, true, true);
         inner.with_pre_tokenizer(Some(byte_level.clone()));
-        let decoder = DecoderWrapper::Sequence(Sequence::new(vec![
+        let decoder = DecoderWrapper::Sequence(DecoderSequence::new(vec![
             DecoderWrapper::ByteFallback(ByteFallback::new()),
             DecoderWrapper::ByteLevel(byte_level),
         ]));
@@ -165,6 +173,97 @@ impl Tokenizer {
         }
 
         debug!("Loaded BPE tokenizer with byte-level fallback");
+        Self::new_with_tokenizer(inner)
+    }
+
+    pub fn from_gguf_bpe(
+        tokens: &[String],
+        merges: &[String],
+        pre_tokenizer: Option<&str>,
+        add_prefix_space: bool,
+    ) -> Result<Self> {
+        if tokens.is_empty() {
+            return Err(Error::TokenizationError(
+                "Cannot build tokenizer from empty GGUF token list".to_string(),
+            ));
+        }
+
+        let mut vocab = HashMap::with_capacity(tokens.len());
+        for (idx, token) in tokens.iter().enumerate() {
+            let id = u32::try_from(idx).map_err(|_| {
+                Error::TokenizationError(format!("GGUF tokenizer id out of range: {idx}"))
+            })?;
+            vocab.insert(token.clone(), id);
+        }
+
+        let mut merge_lines = Vec::with_capacity(merges.len());
+        for merge in merges {
+            let merge = merge.trim();
+            if merge.is_empty() || merge.starts_with('#') {
+                continue;
+            }
+            merge_lines.push(merge.to_string());
+        }
+
+        let temp_dir = std::env::temp_dir().join(format!("izwi-gguf-tokenizer-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).map_err(|e| {
+            Error::TokenizationError(format!("Failed to create GGUF tokenizer temp dir: {e}"))
+        })?;
+        let vocab_path = temp_dir.join("vocab.json");
+        let merges_path = temp_dir.join("merges.txt");
+        fs::write(
+            &vocab_path,
+            serde_json::to_vec(&vocab).map_err(Error::from)?,
+        )
+        .map_err(|e| {
+            Error::TokenizationError(format!("Failed to write GGUF vocab.json temp file: {e}"))
+        })?;
+        fs::write(&merges_path, merge_lines.join("\n")).map_err(|e| {
+            Error::TokenizationError(format!("Failed to write GGUF merges.txt temp file: {e}"))
+        })?;
+        let vocab_str = vocab_path
+            .to_str()
+            .ok_or_else(|| Error::TokenizationError("Invalid temporary vocab path".to_string()))?;
+        let merges_str = merges_path
+            .to_str()
+            .ok_or_else(|| Error::TokenizationError("Invalid temporary merges path".to_string()))?;
+
+        let bpe = BPE::from_file(vocab_str, merges_str)
+            .byte_fallback(true)
+            .build()
+            .map_err(|e| Error::TokenizationError(format!("BPE build failed: {e}")))?;
+        let _ = fs::remove_file(&vocab_path);
+        let _ = fs::remove_file(&merges_path);
+        let _ = fs::remove_dir(&temp_dir);
+        let mut inner = HfTokenizer::new(bpe);
+
+        let byte_level = if matches!(pre_tokenizer, Some("qwen2")) {
+            let split = Split::new(
+                SplitPattern::Regex(QWEN2_PRETOKENIZER_REGEX.to_string()),
+                SplitDelimiterBehavior::Isolated,
+                false,
+            )
+            .map_err(|e| Error::TokenizationError(format!("Invalid Qwen2 split regex: {e}")))?;
+            let byte_level = ByteLevel::new(add_prefix_space, false, false);
+            let sequence = PreTokenizerSequence::new(vec![
+                PreTokenizerWrapper::Split(split),
+                PreTokenizerWrapper::ByteLevel(byte_level.clone()),
+            ]);
+            inner.with_pre_tokenizer(Some(sequence));
+            byte_level
+        } else {
+            let byte_level = ByteLevel::new(add_prefix_space, true, true);
+            inner.with_pre_tokenizer(Some(byte_level.clone()));
+            byte_level
+        };
+
+        let decoder = DecoderWrapper::Sequence(DecoderSequence::new(vec![
+            DecoderWrapper::ByteFallback(ByteFallback::new()),
+            DecoderWrapper::ByteLevel(byte_level),
+        ]));
+        inner.with_decoder(Some(decoder));
+
+        debug!("Loaded BPE tokenizer from GGUF metadata");
         Self::new_with_tokenizer(inner)
     }
 
