@@ -79,7 +79,8 @@ struct TokenizerConfigFile {
     bos_token: Option<String>,
     #[serde(default)]
     eos_token: Option<String>,
-    chat_template: String,
+    #[serde(default)]
+    chat_template: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,30 +92,52 @@ struct Qwen35Tokenizer {
     inner: Tokenizer,
     vocab_size: usize,
     specials: SpecialTokenIds,
+    literal_special_tokens: Vec<(String, u32)>,
     chat_template: String,
     default_enable_thinking: bool,
     bos_token: Option<String>,
 }
 
+#[derive(Debug)]
+struct GgufTokenizerMetadata {
+    tokens: Vec<String>,
+    merges: Vec<String>,
+    pre_tokenizer: Option<String>,
+    chat_template: String,
+    eos_token_id: Option<u32>,
+}
+
 impl Qwen35Tokenizer {
-    fn load(model_dir: &Path, variant: ModelVariant) -> Result<Self> {
-        let inner = Tokenizer::from_path(model_dir)?;
+    fn load(model_dir: &Path, variant: ModelVariant, loader: &GgufLoader) -> Result<Self> {
+        let gguf_meta = parse_gguf_tokenizer_metadata(loader)?;
+        let config = load_tokenizer_config_file(model_dir)?;
+        let inner = match Tokenizer::from_path(model_dir) {
+            Ok(inner) => inner,
+            Err(_) => Tokenizer::from_gguf_bpe(
+                &gguf_meta.tokens,
+                &gguf_meta.merges,
+                gguf_meta.pre_tokenizer.as_deref(),
+                false,
+            )?,
+        };
         let vocab_size = inner.vocab_size();
 
-        let config_path = model_dir.join("tokenizer_config.json");
-        let config_str = fs::read_to_string(config_path)?;
-        let config: TokenizerConfigFile = serde_json::from_str(&config_str)?;
-
-        let id_for = |token: &str| -> Option<u32> {
-            config.added_tokens_decoder.iter().find_map(|(id, entry)| {
-                if entry.content == token {
-                    id.parse().ok()
-                } else {
-                    None
+        let mut token_to_id: HashMap<String, u32> = HashMap::new();
+        if let Some(cfg) = &config {
+            for (id, entry) in &cfg.added_tokens_decoder {
+                if let Ok(parsed) = id.parse::<u32>() {
+                    token_to_id.insert(entry.content.clone(), parsed);
                 }
-            })
-        };
+            }
+        }
+        for (idx, token) in gguf_meta.tokens.iter().enumerate() {
+            let id = u32::try_from(idx).map_err(|_| {
+                Error::TokenizationError(format!("GGUF tokenizer id out of range: {idx}"))
+            })?;
+            token_to_id.entry(token.clone()).or_insert(id);
+        }
 
+        let id_for = |token: &str| token_to_id.get(token).copied();
         let im_start = id_for("<|im_start|>")
             .ok_or_else(|| Error::TokenizationError("Missing <|im_start|> token id".to_string()))?;
         let im_end = id_for("<|im_end|>")
@@ -125,14 +148,30 @@ impl Qwen35Tokenizer {
         let video_pad = id_for("<|video_pad|>").ok_or_else(|| {
             Error::TokenizationError("Missing <|video_pad|> token id".to_string())
         })?;
+
         let eos = config
-            .eos_token
-            .as_deref()
+            .as_ref()
+            .and_then(|cfg| cfg.eos_token.as_deref())
             .and_then(id_for)
+            .or(gguf_meta.eos_token_id)
             .unwrap_or(im_end);
         let eos_alt = id_for("<|endoftext|>");
-        let default_enable_thinking =
-            resolve_default_enable_thinking(&config.chat_template, variant);
+
+        let chat_template = config
+            .as_ref()
+            .and_then(|cfg| cfg.chat_template.clone())
+            .unwrap_or_else(|| gguf_meta.chat_template.clone());
+        let default_enable_thinking = resolve_default_enable_thinking(&chat_template, variant);
+
+        let mut literal_special_tokens: Vec<(String, u32)> = token_to_id
+            .iter()
+            .filter_map(|(token, id)| {
+                (token.starts_with("<|") && token.ends_with("|>")).then_some((token.clone(), *id))
+            })
+            .collect();
+        literal_special_tokens.sort_by(|(left, _), (right, _)| {
+            right.len().cmp(&left.len()).then_with(|| left.cmp(right))
+        });
 
         Ok(Self {
             inner,
@@ -145,14 +184,52 @@ impl Qwen35Tokenizer {
                 eos,
                 eos_alt,
             },
-            chat_template: config.chat_template,
+            literal_special_tokens,
+            chat_template,
             default_enable_thinking,
-            bos_token: config.bos_token,
+            bos_token: config.and_then(|cfg| cfg.bos_token),
         })
     }
 
     fn encode_text(&self, text: &str) -> Result<Vec<u32>> {
-        self.inner.encode(text)
+        if self.literal_special_tokens.is_empty() {
+            return self.inner.encode(text);
+        }
+
+        let mut ids = Vec::new();
+        let mut offset = 0usize;
+        while offset < text.len() {
+            let tail = &text[offset..];
+            let mut next_match: Option<(usize, &str, u32)> = None;
+            for (token, token_id) in &self.literal_special_tokens {
+                if let Some(rel_idx) = tail.find(token) {
+                    let candidate = (rel_idx, token.as_str(), *token_id);
+                    match next_match {
+                        None => next_match = Some(candidate),
+                        Some((best_idx, best_token, _)) => {
+                            if rel_idx < best_idx
+                                || (rel_idx == best_idx && token.len() > best_token.len())
+                            {
+                                next_match = Some(candidate);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let Some((rel_idx, matched_token, matched_id)) = next_match else {
+                ids.extend(self.inner.encode(tail)?);
+                break;
+            };
+
+            if rel_idx > 0 {
+                ids.extend(self.inner.encode(&tail[..rel_idx])?);
+            }
+            ids.push(matched_id);
+            offset += rel_idx + matched_token.len();
+        }
+
+        Ok(ids)
     }
 
     fn decode_text(&self, ids: &[u32]) -> Result<String> {
@@ -210,7 +287,7 @@ impl Qwen35ChatModel {
         }
 
         let text_config = parse_text_config(&text_loader)?;
-        let tokenizer = Qwen35Tokenizer::load(model_dir, variant)?;
+        let tokenizer = Qwen35Tokenizer::load(model_dir, variant, &text_loader)?;
         let text_model = Qwen35TextModel::load(&text_loader, &text_config, &device.device)?;
 
         let projector_loader = GgufLoader::from_path_with_backend(&mmproj_path, backend)?;
@@ -373,7 +450,13 @@ impl Qwen35ChatModel {
         let mut next_text_position = prepared_prompt.next_text_position;
 
         while generated_ids.len() < max_new_tokens {
-            let next = sample_next_token(&logits, config, &generated_ids, &mut rng)?;
+            let next = sample_next_token(
+                &logits,
+                self.tokenizer.vocab_size,
+                config,
+                &generated_ids,
+                &mut rng,
+            )?;
             if self.is_stop_token(next, config) {
                 break;
             }
@@ -786,6 +869,34 @@ fn resolve_default_enable_thinking(chat_template: &str, variant: ModelVariant) -
     }
 }
 
+fn parse_gguf_tokenizer_metadata(loader: &GgufLoader) -> Result<GgufTokenizerMetadata> {
+    Ok(GgufTokenizerMetadata {
+        tokens: required_string_array(loader, "tokenizer.ggml.tokens")?,
+        merges: required_string_array(loader, "tokenizer.ggml.merges")?,
+        pre_tokenizer: loader.get_metadata_string("tokenizer.ggml.pre"),
+        chat_template: loader
+            .get_metadata_string("tokenizer.chat_template")
+            .ok_or_else(|| {
+                Error::ModelLoadError(
+                    "Missing or invalid GGUF metadata: tokenizer.chat_template".to_string(),
+                )
+            })?,
+        eos_token_id: loader
+            .get_metadata_u64("tokenizer.ggml.eos_token_id")
+            .and_then(|value| u32::try_from(value).ok()),
+    })
+}
+
+fn load_tokenizer_config_file(model_dir: &Path) -> Result<Option<TokenizerConfigFile>> {
+    let config_path = model_dir.join("tokenizer_config.json");
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    let config_str = fs::read_to_string(config_path)?;
+    let config: TokenizerConfigFile = serde_json::from_str(&config_str)?;
+    Ok(Some(config))
+}
+
 fn parse_text_config(loader: &GgufLoader) -> Result<Qwen35TextConfig> {
     Ok(Qwen35TextConfig {
         architecture: loader
@@ -855,6 +966,28 @@ fn required_usize_array(loader: &GgufLoader, key: &str) -> Result<Vec<usize>> {
     Ok(values)
 }
 
+fn required_string_array(loader: &GgufLoader, key: &str) -> Result<Vec<String>> {
+    let value = loader
+        .metadata_value(key)
+        .ok_or_else(|| Error::ModelLoadError(format!("Missing or invalid GGUF metadata: {key}")))?;
+    let GgufValue::Array(items) = value else {
+        return Err(Error::ModelLoadError(format!(
+            "Expected GGUF array metadata for {key}"
+        )));
+    };
+
+    let mut values = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(raw) = gguf_to_string(item) else {
+            return Err(Error::ModelLoadError(format!(
+                "Expected string array values for {key}"
+            )));
+        };
+        values.push(raw);
+    }
+    Ok(values)
+}
+
 fn gguf_to_u64(value: &GgufValue) -> Option<u64> {
     match value {
         GgufValue::U64(n) => Some(*n),
@@ -865,6 +998,13 @@ fn gguf_to_u64(value: &GgufValue) -> Option<u64> {
         GgufValue::I16(n) => Some(*n as u64),
         GgufValue::U8(n) => Some(*n as u64),
         GgufValue::I8(n) => Some(*n as u64),
+        _ => None,
+    }
+}
+
+fn gguf_to_string(value: &GgufValue) -> Option<String> {
+    match value {
+        GgufValue::String(s) => Some(s.clone()),
         _ => None,
     }
 }
@@ -887,11 +1027,13 @@ fn gguf_to_f64(value: &GgufValue) -> Option<f64> {
 
 fn sample_next_token(
     logits: &Tensor,
+    vocab_size: usize,
     config: &ChatGenerationConfig,
     history: &[u32],
     rng: &mut SimpleRng,
 ) -> Result<u32> {
     let mut values = logits_to_vec(logits)?;
+    clamp_logits_to_vocab(&mut values, vocab_size);
 
     if config.repetition_penalty > 1.0 && !history.is_empty() {
         let mut seen = vec![false; values.len()];
@@ -1037,6 +1179,12 @@ fn logits_to_vec(logits: &Tensor) -> Result<Vec<f32>> {
         .to_dtype(DType::F32)?
         .to_vec1::<f32>()
         .map_err(Error::from)
+}
+
+fn clamp_logits_to_vocab(values: &mut [f32], vocab_size: usize) {
+    if vocab_size < values.len() {
+        values[vocab_size..].fill(f32::NEG_INFINITY);
+    }
 }
 
 fn argmax_values(values: &[f32]) -> Result<u32> {
@@ -1269,6 +1417,48 @@ mod tests {
     }
 
     #[test]
+    fn sample_next_token_masks_logits_above_vocab_limit() {
+        let logits = Tensor::from_vec(
+            vec![0.1f32, 0.2, 0.3, 12.0, 9.0],
+            (5,),
+            &candle_core::Device::Cpu,
+        )
+        .expect("logits");
+        let config = ChatGenerationConfig {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            stop_token_ids: Vec::new(),
+            seed: 7,
+            request: ChatRequestConfig::default(),
+        };
+        let mut rng = SimpleRng::new(7);
+        let token = sample_next_token(&logits, 3, &config, &[], &mut rng).expect("sample token");
+        assert_eq!(token, 2);
+    }
+
+    #[test]
+    fn sample_next_token_errors_when_vocab_limit_is_zero() {
+        let logits = Tensor::from_vec(vec![0.1f32, 0.2, 0.3], (3,), &candle_core::Device::Cpu)
+            .expect("logits");
+        let config = ChatGenerationConfig {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            stop_token_ids: Vec::new(),
+            seed: 7,
+            request: ChatRequestConfig::default(),
+        };
+        let mut rng = SimpleRng::new(7);
+        let result = sample_next_token(&logits, 0, &config, &[], &mut rng);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn load_local_qwen35_assets_smoke_if_available() {
         let model_dir = local_model_dir("Qwen3.5-4B");
         if !model_dir.exists() {
@@ -1282,7 +1472,10 @@ mod tests {
         assert_eq!(model.variant(), ModelVariant::Qwen354BGguf);
         assert_eq!(model.text_config().architecture, "qwen35");
         assert_eq!(model.text_config().full_attention_interval, 4);
-        assert!(model.default_enable_thinking());
+        assert_eq!(
+            model.default_enable_thinking(),
+            resolve_default_enable_thinking(model.chat_template(), ModelVariant::Qwen354BGguf)
+        );
         assert_eq!(
             model.text_checkpoint().architecture.as_deref(),
             Some("qwen35")
