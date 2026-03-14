@@ -5,8 +5,6 @@ type RouteModelLike = Pick<ModelInfo, "variant" | "status">;
 
 export const TEXT_TO_SPEECH_PREFERRED_MODELS = [
   "Kokoro-82M",
-  "LFM2.5-Audio-1.5B-4bit",
-  "LFM2.5-Audio-1.5B",
   "Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit",
   "Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit",
   "Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit",
@@ -35,8 +33,6 @@ export const TRANSCRIPTION_PREFERRED_MODELS = [
   "Parakeet-TDT-0.6B-v3",
   "Parakeet-TDT-0.6B-v2",
   "Whisper-Large-v3-Turbo",
-  "LFM2.5-Audio-1.5B-4bit",
-  "LFM2.5-Audio-1.5B",
   "Qwen3-ASR-0.6B",
   "Qwen3-ASR-1.7B-4bit",
   "Qwen3-ASR-1.7B",

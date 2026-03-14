@@ -46,7 +46,7 @@ pub struct GenerationParams {
     #[serde(default)]
     pub speaker: Option<String>,
 
-    /// Voice for LFM2 models
+    /// Voice identifier alias used by some TTS models.
     #[serde(default)]
     pub voice: Option<String>,
 

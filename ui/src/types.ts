@@ -16,11 +16,6 @@ export interface ViewConfig {
   disabled?: boolean;
 }
 
-export function isLfmAudioVariant(variant: string): boolean {
-  const normalized = variant.toLowerCase();
-  return normalized.includes("lfm2") && normalized.includes("audio");
-}
-
 export function isKokoroVariant(variant: string): boolean {
   const normalized = variant.toLowerCase();
   return normalized === "kokoro-82m" || normalized.includes("kokoro-82m");
@@ -29,9 +24,6 @@ export function isKokoroVariant(variant: string): boolean {
 export function getSpeakerProfilesForVariant(variant: string | null): SpeakerProfile[] {
   if (!variant) {
     return QWEN_SPEAKERS;
-  }
-  if (isLfmAudioVariant(variant)) {
-    return LFM2_SPEAKERS;
   }
   if (isKokoroVariant(variant)) {
     return KOKORO_SPEAKERS;
@@ -43,13 +35,13 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
   "custom-voice": {
     id: "custom-voice",
     label: "Text to Speech",
-    description: "Generate speech with built-in voice profiles (Qwen3, Kokoro, LFM2.5)",
+    description: "Generate speech with built-in voice profiles (Qwen3, Kokoro)",
     icon: "Volume2",
     modelFilter: (variant) =>
-      variant.includes("CustomVoice") || isLfmAudioVariant(variant) || isKokoroVariant(variant),
+      variant.includes("CustomVoice") || isKokoroVariant(variant),
     emptyStateTitle: "No TTS Model Loaded",
     emptyStateDescription:
-      "Load a CustomVoice, Kokoro, or LFM2.5 model to generate speech",
+      "Load a CustomVoice or Kokoro model to generate speech",
   },
   "voice-clone": {
     id: "voice-clone",
@@ -76,17 +68,16 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     id: "transcription",
     label: "Transcription",
     description:
-      "Speech-to-text with Qwen3-ASR, Whisper, Parakeet-TDT, Voxtral, and LFM2.5 models",
+      "Speech-to-text with Qwen3-ASR, Whisper, Parakeet-TDT, and Voxtral models",
     icon: "FileText",
     modelFilter: (variant) =>
       variant.includes("Qwen3-ASR") ||
       variant.includes("Whisper-Large-v3-Turbo") ||
       variant.includes("Parakeet-TDT") ||
-      variant.includes("Voxtral") ||
-      isLfmAudioVariant(variant),
+      variant.includes("Voxtral"),
     emptyStateTitle: "No ASR Model Loaded",
     emptyStateDescription:
-      "Download and load a Qwen3-ASR, Whisper, Parakeet-TDT, Voxtral, or LFM2.5 model for speech transcription",
+      "Download and load a Qwen3-ASR, Whisper, Parakeet-TDT, or Voxtral model for speech transcription",
   },
   chat: {
     id: "chat",
@@ -173,33 +164,6 @@ export const QWEN_SPEAKERS: SpeakerProfile[] = [
     name: "Uncle Fu",
     language: "Chinese",
     description: "Mature and wise male voice",
-  },
-];
-
-export const LFM2_SPEAKERS: SpeakerProfile[] = [
-  {
-    id: "US Female",
-    name: "US Female",
-    language: "English",
-    description: "US female preset voice",
-  },
-  {
-    id: "US Male",
-    name: "US Male",
-    language: "English",
-    description: "US male preset voice",
-  },
-  {
-    id: "UK Female",
-    name: "UK Female",
-    language: "English",
-    description: "UK female preset voice",
-  },
-  {
-    id: "UK Male",
-    name: "UK Male",
-    language: "English",
-    description: "UK male preset voice",
   },
 ];
 

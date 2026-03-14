@@ -470,14 +470,6 @@ impl RuntimeService {
                     .ok_or_else(|| Error::InferenceError("No TTS model loaded".to_string()))?;
                 model.available_speakers()
             }
-            crate::catalog::ModelFamily::Lfm2Audio => {
-                let model = self
-                    .model_registry
-                    .get_lfm2(variant)
-                    .await
-                    .ok_or_else(|| Error::InferenceError("No TTS model loaded".to_string()))?;
-                Ok(model.available_voices())
-            }
             _ => Err(Error::InferenceError(format!(
                 "Model {variant} does not expose TTS speakers"
             ))),

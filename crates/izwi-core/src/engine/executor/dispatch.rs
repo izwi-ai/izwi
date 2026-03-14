@@ -35,17 +35,7 @@ impl DispatchRoute {
     }
 }
 
-fn is_lfm2_variant(variant: ModelVariant) -> bool {
-    matches!(variant.family(), crate::catalog::ModelFamily::Lfm2Audio)
-}
-
 const DISPATCH_ROUTES: &[DispatchRoute] = &[
-    DispatchRoute {
-        name: "lfm2_tts",
-        task: TaskType::TTS,
-        variant_matcher: Some(is_lfm2_variant),
-        handler: NativeExecutor::lfm2_tts_request,
-    },
     DispatchRoute {
         name: "tts",
         task: TaskType::TTS,
@@ -63,12 +53,6 @@ const DISPATCH_ROUTES: &[DispatchRoute] = &[
         task: TaskType::Chat,
         variant_matcher: None,
         handler: NativeExecutor::chat_request,
-    },
-    DispatchRoute {
-        name: "speech_to_speech",
-        task: TaskType::SpeechToSpeech,
-        variant_matcher: None,
-        handler: NativeExecutor::speech_to_speech_request,
     },
 ];
 

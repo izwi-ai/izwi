@@ -110,7 +110,7 @@ IZWI_ASR_CHUNK_OVERLAP_SECS=3
 
 | Category | Models |
 |----------|--------|
-| **TTS** | Qwen3-TTS (0.6B, 1.7B), LFM2-Audio |
+| **TTS** | Qwen3-TTS (0.6B, 1.7B), Kokoro-82M |
 | **ASR** | Qwen3-ASR (0.6B, 1.7B), Parakeet TDT |
 | **Diarization** | Sortformer 4-speaker |
 | **Chat** | Qwen3 (0.6B, 1.7B), Gemma 3 (1B, 4B) |
@@ -144,5 +144,4 @@ Apache 2.0
 - [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) by Alibaba
 - [Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) by NVIDIA
 - [Gemma](https://ai.google.dev/gemma) by Google
-- [LFM2-Audio](https://www.liquid.ai/) by Liquid AI
 - [HuggingFace Hub](https://huggingface.co/) for model hosting

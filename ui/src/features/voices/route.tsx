@@ -609,7 +609,7 @@ export function VoicesPage({
                 >
                   {selectedModelInfo?.speech_capabilities?.built_in_voice_count
                     ? `${selectedModelInfo.speech_capabilities.built_in_voice_count} built-in speakers are available on the active model.`
-                    : "Built-in voices appear when a CustomVoice, Kokoro, or LFM2 Audio model is selected."}
+                    : "Built-in voices appear when a CustomVoice or Kokoro model is selected."}
                 </div>
 
                 <div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-1">
@@ -687,7 +687,7 @@ export function VoicesPage({
                       ? "Fetching your reusable cloned and designed voices."
                       : "Save a result from voice cloning or voice design to build a reusable voice library."
                     : routeModels.length === 0
-                      ? "Load a CustomVoice, Kokoro, or LFM2 Audio model to browse built-in voices."
+                      ? "Load a CustomVoice or Kokoro model to browse built-in voices."
                       : "Try a different built-in voice model or search term."
                 }
                 className="grid-cols-[repeat(auto-fill,minmax(300px,1fr))]"
@@ -713,7 +713,7 @@ export function VoicesPage({
         onUnload={onUnload}
         onDelete={onDelete}
         onUseModel={handleModelSelect}
-        emptyMessage="Load a CustomVoice, Kokoro, or LFM2 Audio model to browse built-in voices."
+        emptyMessage="Load a CustomVoice or Kokoro model to browse built-in voices."
       />
     </PageShell>
   );

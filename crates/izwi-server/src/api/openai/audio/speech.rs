@@ -181,7 +181,7 @@ fn resolve_speech_timeout_secs(
     variant: ModelVariant,
     req: &SpeechRequest,
 ) -> u64 {
-    // Keep global timeout behavior for non-Qwen TTS families (e.g. LFM2).
+    // Keep global timeout behavior for non-Qwen TTS families.
     let Some(model_max_frames) = variant.tts_max_output_frames_hint() else {
         return default_timeout_secs.max(1);
     };
@@ -659,7 +659,7 @@ mod tests {
     #[test]
     fn non_qwen_tts_uses_default_timeout() {
         let req = SpeechRequest {
-            model: "LFM2.5-Audio-1.5B".to_string(),
+            model: "Kokoro-82M".to_string(),
             input: "hello".to_string(),
             voice: None,
             response_format: Some("wav".to_string()),
@@ -676,7 +676,7 @@ mod tests {
             saved_voice_id: None,
         };
 
-        let timeout = resolve_speech_timeout_secs(300, ModelVariant::Lfm25Audio15B, &req);
+        let timeout = resolve_speech_timeout_secs(300, ModelVariant::Kokoro82M, &req);
         assert_eq!(timeout, 300);
     }
 }

@@ -2,7 +2,6 @@
 
 pub mod diarizations;
 pub mod speech;
-pub mod speech_to_speech;
 pub mod transcriptions;
 
 use axum::{extract::DefaultBodyLimit, routing::post, Router};
@@ -27,10 +26,5 @@ pub fn router() -> Router<AppState> {
         .route(
             "/audio/diarizations",
             post(diarizations::diarizations).layer(DefaultBodyLimit::max(AUDIO_UPLOAD_LIMIT_BYTES)),
-        )
-        .route(
-            "/audio/speech-to-speech",
-            post(speech_to_speech::speech_to_speech)
-                .layer(DefaultBodyLimit::max(AUDIO_UPLOAD_LIMIT_BYTES)),
         )
 }

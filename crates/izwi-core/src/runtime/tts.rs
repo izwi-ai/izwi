@@ -18,12 +18,6 @@ impl RuntimeService {
         {
             return self.kokoro_tts_generate(request).await;
         }
-        if loaded_variant
-            .map(|variant| matches!(variant.family(), crate::catalog::ModelFamily::Lfm2Audio))
-            .unwrap_or(false)
-        {
-            return self.lfm2_tts_generate(request).await;
-        }
 
         let mut core_request = EngineCoreRequest::tts(request.text.clone());
         core_request.id = request.id.clone();
@@ -71,12 +65,6 @@ impl RuntimeService {
             .unwrap_or(false)
         {
             return self.kokoro_tts_generate_streaming(request, chunk_tx).await;
-        }
-        if loaded_variant
-            .map(|variant| matches!(variant.family(), crate::catalog::ModelFamily::Lfm2Audio))
-            .unwrap_or(false)
-        {
-            return self.lfm2_tts_generate_streaming(request, chunk_tx).await;
         }
 
         let mut core_request = EngineCoreRequest::tts(request.text.clone());

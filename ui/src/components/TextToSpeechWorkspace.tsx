@@ -76,8 +76,6 @@ const MAX_BUFFERED_PCM_BYTES = 256 * 1024 * 1024;
 const ABORT_ERROR_NAME = "AbortError";
 const SAVED_VOICE_RENDERER_PREFERRED_MODELS = [
   ...VOICE_CLONING_PREFERRED_MODELS,
-  "LFM2.5-Audio-1.5B-4bit",
-  "LFM2.5-Audio-1.5B",
 ] as const;
 
 function createAbortError(message: string): Error {

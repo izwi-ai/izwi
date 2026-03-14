@@ -155,23 +155,6 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     capabilities: ["Voice Design", "BF16"],
     size: "4.2 GB",
   },
-  // LFM2 Audio
-  "LFM2.5-Audio-1.5B": {
-    shortName: "LFM2.5 Audio 1.5B",
-    fullName: "LFM2.5-Audio 1.5B by Liquid AI",
-    description: "Improved end-to-end audio foundation model",
-    category: "tts",
-    capabilities: ["TTS", "ASR", "Audio Chat"],
-    size: "3.2 GB",
-  },
-  "LFM2.5-Audio-1.5B-4bit": {
-    shortName: "LFM2.5 Audio 1.5B 4-bit",
-    fullName: "LFM2.5-Audio 1.5B (MLX 4-bit)",
-    description: "Quantized LFM2.5 audio model for lower memory usage",
-    category: "tts",
-    capabilities: ["TTS", "ASR", "Audio Chat", "4-bit"],
-    size: "0.8 GB",
-  },
   "Kokoro-82M": {
     shortName: "Kokoro 82M",
     fullName: "Kokoro-82M by hexgrad",

@@ -456,12 +456,10 @@ fn model_type_rank(variant: ModelVariant) -> u8 {
         4
     } else if variant.is_tokenizer() {
         5
-    } else if variant.is_lfm2() {
-        6
     } else if variant.is_voxtral() {
-        7
+        6
     } else {
-        8
+        7
     }
 }
 

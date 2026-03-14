@@ -113,14 +113,14 @@ mod tests {
         let loaded_variants = vec![
             ModelVariant::Qwen3Tts12Hz06BCustomVoice,
             ModelVariant::Qwen38BGguf,
-            ModelVariant::Lfm25Audio15B,
+            ModelVariant::Kokoro82M,
         ];
-        let requested_variant = ModelVariant::Lfm25Audio15B;
+        let requested_variant = ModelVariant::Kokoro82M;
         let active_variants = HashSet::from([ModelVariant::Qwen38BGguf]);
         let last_used = HashMap::from([
             (ModelVariant::Qwen3Tts12Hz06BCustomVoice, 10_u64),
             (ModelVariant::Qwen38BGguf, 5_u64),
-            (ModelVariant::Lfm25Audio15B, 20_u64),
+            (ModelVariant::Kokoro82M, 20_u64),
         ]);
 
         let candidate = select_lru_eviction_candidate(

@@ -18,7 +18,6 @@ Izwi supports several model families optimized for different tasks:
 | `Qwen3-TTS-12Hz-1.7B-Base` | ~4.2 GB | Higher quality TTS |
 | `Qwen3-TTS-12Hz-1.7B-CustomVoice` | ~4.2 GB | Higher quality with voice cloning |
 | `Qwen3-TTS-12Hz-1.7B-VoiceDesign` | ~4.2 GB | Voice design from descriptions |
-| `LFM2.5-Audio-1.5B` | ~3.0 GB | Liquid AI audio model (v2.5) |
 
 > `Kokoro-82M` uses `espeak-ng` for phonemization. Install it separately before using Kokoro:
 > [macOS](../installation/macos.md#optional-install-espeak-ng-for-kokoro-82m),

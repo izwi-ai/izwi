@@ -57,12 +57,6 @@ pub enum ModelVariant {
     /// Tokenizer for 12Hz codec
     #[serde(rename = "Qwen3-TTS-Tokenizer-12Hz")]
     Qwen3TtsTokenizer12Hz,
-    /// LFM2.5-Audio 1.5B model from Liquid AI
-    #[serde(rename = "LFM2.5-Audio-1.5B")]
-    Lfm25Audio15B,
-    /// LFM2.5-Audio 1.5B model from Liquid AI (MLX 4-bit)
-    #[serde(rename = "LFM2.5-Audio-1.5B-4bit")]
-    Lfm25Audio15B4Bit,
     /// LFM2.5 1.2B Instruct model from Liquid AI (GGUF Q4_K_M)
     #[serde(
         rename = "LFM2.5-1.2B-Instruct-GGUF",
@@ -203,7 +197,6 @@ impl ModelVariant {
     /// Qwen3-TTS codec frame rate encoded in model variant naming ("12Hz").
     pub const QWEN3_TTS_FRAME_RATE_HZ: f32 = 12.0;
     pub const QWEN_CUSTOMVOICE_BUILT_IN_VOICE_COUNT: usize = 9;
-    pub const LFM2_AUDIO_BUILT_IN_VOICE_COUNT: usize = 4;
     pub const KOKORO_BUILT_IN_VOICE_COUNT: usize = 54;
 
     /// Get HuggingFace repository ID
@@ -240,8 +233,6 @@ impl ModelVariant {
                 "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16"
             }
             Self::Qwen3TtsTokenizer12Hz => "Qwen/Qwen3-TTS-Tokenizer-12Hz",
-            Self::Lfm25Audio15B => "LiquidAI/LFM2.5-Audio-1.5B",
-            Self::Lfm25Audio15B4Bit => "mlx-community/LFM2.5-Audio-1.5B-4bit",
             Self::Lfm2512BInstructGguf => "LiquidAI/LFM2.5-1.2B-Instruct-GGUF",
             Self::Lfm2512BThinkingGguf => "LiquidAI/LFM2.5-1.2B-Thinking-GGUF",
             Self::Kokoro82M => "hexgrad/Kokoro-82M",
@@ -298,8 +289,6 @@ impl ModelVariant {
             Self::Qwen3Tts12Hz17BVoiceDesign8Bit => "Qwen3-TTS 1.7B VoiceDesign 8-bit",
             Self::Qwen3Tts12Hz17BVoiceDesignBf16 => "Qwen3-TTS 1.7B VoiceDesign bf16",
             Self::Qwen3TtsTokenizer12Hz => "Qwen3-TTS Tokenizer 12Hz",
-            Self::Lfm25Audio15B => "LFM2.5-Audio 1.5B",
-            Self::Lfm25Audio15B4Bit => "LFM2.5-Audio 1.5B 4-bit",
             Self::Lfm2512BInstructGguf => "LFM2.5 1.2B Instruct GGUF",
             Self::Lfm2512BThinkingGguf => "LFM2.5 1.2B Thinking GGUF",
             Self::Kokoro82M => "Kokoro 82M",
@@ -356,8 +345,6 @@ impl ModelVariant {
             Self::Qwen3Tts12Hz17BVoiceDesign8Bit => "Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit",
             Self::Qwen3Tts12Hz17BVoiceDesignBf16 => "Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16",
             Self::Qwen3TtsTokenizer12Hz => "Qwen3-TTS-Tokenizer-12Hz",
-            Self::Lfm25Audio15B => "LFM2.5-Audio-1.5B",
-            Self::Lfm25Audio15B4Bit => "LFM2.5-Audio-1.5B-4bit",
             Self::Lfm2512BInstructGguf => "LFM2.5-1.2B-Instruct-GGUF",
             Self::Lfm2512BThinkingGguf => "LFM2.5-1.2B-Thinking-GGUF",
             Self::Kokoro82M => "Kokoro-82M",
@@ -414,8 +401,6 @@ impl ModelVariant {
             Self::Qwen3Tts12Hz17BVoiceDesign8Bit => 3_080_140_867, // ~2.87 GB
             Self::Qwen3Tts12Hz17BVoiceDesignBf16 => 4_520_194_992, // ~4.21 GB
             Self::Qwen3TtsTokenizer12Hz => 682_300_739, // ~0.64 GB
-            Self::Lfm25Audio15B => 3_200_000_000,       // ~2.98 GB (est)
-            Self::Lfm25Audio15B4Bit => 884_000_000,     // ~0.82 GB
             Self::Lfm2512BInstructGguf => 730_895_168,  // ~0.68 GB (GGUF Q4_K_M, HF tree)
             Self::Lfm2512BThinkingGguf => 730_895_360,  // ~0.68 GB (GGUF Q4_K_M, HF tree)
             Self::Kokoro82M => 363_323_757,             // ~346 MB (HF tree total, Apr 2025)
@@ -472,8 +457,6 @@ impl ModelVariant {
             | Self::Qwen3Tts12Hz17BVoiceDesign8Bit
             | Self::Qwen3Tts12Hz17BVoiceDesignBf16 => 6.0,
             Self::Qwen3TtsTokenizer12Hz => 1.0,
-            Self::Lfm25Audio15B => 6.0,
-            Self::Lfm25Audio15B4Bit => 4.5,
             Self::Lfm2512BInstructGguf | Self::Lfm2512BThinkingGguf => 2.0,
             Self::Kokoro82M => 2.0,
             Self::Qwen3Asr06B
@@ -512,11 +495,6 @@ impl ModelVariant {
     /// Whether this is a tokenizer/codec model
     pub fn is_tokenizer(&self) -> bool {
         matches!(self.family(), crate::catalog::ModelFamily::Tokenizer)
-    }
-
-    /// Whether this is an LFM2-Audio model
-    pub fn is_lfm2(&self) -> bool {
-        matches!(self.family(), crate::catalog::ModelFamily::Lfm2Audio)
     }
 
     /// Whether this is a Kokoro TTS model
@@ -619,15 +597,6 @@ impl ModelVariant {
                 supports_speed_control: true,
                 supports_auto_long_form: true,
             },
-            Self::Lfm25Audio15B | Self::Lfm25Audio15B4Bit => SpeechModelCapabilities {
-                supports_builtin_voices: true,
-                built_in_voice_count: Some(Self::LFM2_AUDIO_BUILT_IN_VOICE_COUNT),
-                supports_reference_voice: true,
-                supports_voice_description: true,
-                supports_streaming: true,
-                supports_speed_control: true,
-                supports_auto_long_form: false,
-            },
             Self::Kokoro82M => SpeechModelCapabilities {
                 supports_builtin_voices: true,
                 built_in_voice_count: Some(Self::KOKORO_BUILT_IN_VOICE_COUNT),
@@ -707,7 +676,6 @@ impl ModelVariant {
                 | Self::Qwen3Tts12Hz17BVoiceDesign4Bit
                 | Self::Qwen3Tts12Hz17BVoiceDesign8Bit
                 | Self::Qwen3Tts12Hz17BVoiceDesignBf16
-                | Self::Lfm25Audio15B4Bit
                 | Self::Lfm2512BInstructGguf
                 | Self::Lfm2512BThinkingGguf
                 | Self::Qwen3Asr06B4Bit
@@ -804,12 +772,10 @@ impl ModelVariant {
             | Self::Qwen3Tts12Hz17BCustomVoice4Bit
             | Self::Qwen3Tts12Hz17BVoiceDesign4Bit
             | Self::Qwen3ForcedAligner06B4Bit
-            | Self::Lfm25Audio15B4Bit
             | Self::Lfm2512BInstructGguf
             | Self::Lfm2512BThinkingGguf
             | Self::Kokoro82M => true,
             Self::Gemma34BIt => false,
-            Self::Lfm25Audio15B => true,
             Self::VoxtralMini4BRealtime2602 => false,
             Self::ParakeetTdt06BV2 | Self::ParakeetTdt06BV3 => true,
             Self::WhisperLargeV3Turbo => true,
@@ -839,8 +805,6 @@ impl ModelVariant {
             Self::Qwen3Tts12Hz17BVoiceDesign8Bit,
             Self::Qwen3Tts12Hz17BVoiceDesignBf16,
             Self::Qwen3TtsTokenizer12Hz,
-            Self::Lfm25Audio15B,
-            Self::Lfm25Audio15B4Bit,
             Self::Lfm2512BInstructGguf,
             Self::Lfm2512BThinkingGguf,
             Self::Kokoro82M,
@@ -973,7 +937,7 @@ mod tests {
 
     #[test]
     fn non_qwen3_tts_variants_do_not_expose_qwen_output_hints() {
-        let variant = ModelVariant::Lfm25Audio15B;
+        let variant = ModelVariant::Kokoro82M;
         assert_eq!(variant.tts_max_output_frames_hint(), None);
         assert_eq!(variant.tts_output_frame_rate_hz_hint(), None);
         assert_eq!(variant.tts_max_output_seconds_hint(), None);
@@ -1074,7 +1038,7 @@ mod tests {
     }
 
     #[test]
-    fn kokoro_and_lfm2_capabilities_reflect_runtime_constraints() {
+    fn kokoro_capabilities_reflect_runtime_constraints() {
         assert_eq!(
             ModelVariant::Kokoro82M.speech_capabilities(),
             Some(SpeechModelCapabilities {
@@ -1082,18 +1046,6 @@ mod tests {
                 built_in_voice_count: Some(ModelVariant::KOKORO_BUILT_IN_VOICE_COUNT),
                 supports_reference_voice: false,
                 supports_voice_description: false,
-                supports_streaming: true,
-                supports_speed_control: true,
-                supports_auto_long_form: false,
-            })
-        );
-        assert_eq!(
-            ModelVariant::Lfm25Audio15B.speech_capabilities(),
-            Some(SpeechModelCapabilities {
-                supports_builtin_voices: true,
-                built_in_voice_count: Some(ModelVariant::LFM2_AUDIO_BUILT_IN_VOICE_COUNT),
-                supports_reference_voice: true,
-                supports_voice_description: true,
                 supports_streaming: true,
                 supports_speed_control: true,
                 supports_auto_long_form: false,

@@ -12,6 +12,17 @@ import { api, type ModelInfo } from "@/api";
 import { VIEW_CONFIGS } from "@/types";
 import type { DownloadProgressMap } from "@/app/router/types";
 
+const REMOVED_LFM_AUDIO_VARIANTS = new Set([
+  "LFM2.5-Audio-1.5B",
+  "LFM2.5-Audio-1.5B-4bit",
+  "LiquidAI/LFM2.5-Audio-1.5B",
+  "LiquidAI/LFM2.5-Audio-1.5B-4bit",
+]);
+
+function isRemovedLfmAudioVariant(variant: string): boolean {
+  return REMOVED_LFM_AUDIO_VARIANTS.has(variant.trim());
+}
+
 interface ModelCatalogContextValue {
   models: ModelInfo[];
   selectedModel: string | null;
@@ -76,11 +87,13 @@ export function ModelCatalogProvider({
   const refreshModels = useCallback(async () => {
     try {
       const response = await api.listModels();
-      const mergedModels = response.models.map((model) =>
-        activeModelLoadsRef.current.has(model.variant)
-          ? { ...model, status: "loading" as const }
-          : model,
-      );
+      const mergedModels = response.models
+        .filter((model) => !isRemovedLfmAudioVariant(model.variant))
+        .map((model) =>
+          activeModelLoadsRef.current.has(model.variant)
+            ? { ...model, status: "loading" as const }
+            : model,
+        );
 
       const downloadingVariants = new Set(
         mergedModels

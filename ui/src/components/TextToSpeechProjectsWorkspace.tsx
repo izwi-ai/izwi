@@ -74,8 +74,6 @@ interface TextToSpeechProjectsWorkspaceProps {
 
 const SAVED_VOICE_RENDERER_PREFERRED_MODELS = [
   ...VOICE_CLONING_PREFERRED_MODELS,
-  "LFM2.5-Audio-1.5B-4bit",
-  "LFM2.5-Audio-1.5B",
 ] as const;
 
 function formatRelativeDate(timestampMs: number): string {

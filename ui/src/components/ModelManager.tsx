@@ -222,22 +222,6 @@ const MODEL_DETAILS: Record<
     features: ["Text-to-voice", "Creative control", "Unique voices"],
     size: "4.2 GB",
   },
-  "LFM2.5-Audio-1.5B": {
-    shortName: "LFM2.5 1.5B",
-    fullName: "LFM2.5-Audio 1.5B by Liquid AI",
-    description:
-      "Improved LFM2 audio model for TTS, ASR, and audio-to-audio generation",
-    features: ["TTS", "ASR", "Audio-to-audio chat", "4 voice styles"],
-    size: "3.2 GB",
-  },
-  "LFM2.5-Audio-1.5B-4bit": {
-    shortName: "LFM2.5 1.5B 4-bit",
-    fullName: "LFM2.5-Audio 1.5B (MLX 4-bit)",
-    description: "Quantized LFM2.5 audio model for lower memory usage",
-    features: ["TTS", "ASR", "Audio-to-audio chat", "4-bit quantized"],
-    size: "0.8 GB",
-    quantization: "4-bit",
-  },
   "Kokoro-82M": {
     shortName: "Kokoro 82M",
     fullName: "Kokoro-82M by hexgrad",

@@ -26,12 +26,11 @@ impl RuntimeService {
             | ModelFamily::Lfm2Chat
             | ModelFamily::Gemma3Chat
             | ModelFamily::Voxtral
-            | ModelFamily::Lfm2Audio
             | ModelFamily::Qwen3Tts
             | ModelFamily::KokoroTts => {
                 if matches!(
                     family,
-                    ModelFamily::Lfm2Audio | ModelFamily::Qwen3Tts | ModelFamily::KokoroTts
+                    ModelFamily::Qwen3Tts | ModelFamily::KokoroTts
                 ) {
                     self.set_active_tts_variant(variant).await;
                 }

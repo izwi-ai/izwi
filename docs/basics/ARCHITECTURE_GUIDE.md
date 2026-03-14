@@ -25,7 +25,7 @@ When your request first arrives—whether through the CLI, HTTP API, or desktop 
 The Runtime Service does several things:
 
 1. **Validates your request**: Checks that you provided valid inputs (text for TTS, audio for ASR, etc.)
-2. **Routes to the right model**: Determines which model family and variant should handle your request (Qwen3-TTS, LFM2-Audio, etc.)
+2. **Routes to the right model**: Determines which model family and variant should handle your request (Qwen3-TTS, Kokoro-82M, Qwen3-ASR, etc.)
 3. **Sets up streaming**: If you want real-time output, it prepares the channels for delivering chunks as they're generated
 4. **Tracks telemetry**: Records metrics like queue wait time and processing latency
 

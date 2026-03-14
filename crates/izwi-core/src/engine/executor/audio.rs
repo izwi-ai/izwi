@@ -10,11 +10,6 @@ use super::super::output::StreamingOutput;
 use super::NativeExecutor;
 
 impl NativeExecutor {
-    // LFM2/LFM2.5 detokenizers rely on overlap-add reconstruction; the newest
-    // tail can shift when subsequent frames arrive. Hold back one overlap
-    // region to avoid streaming seam artifacts.
-    pub(super) const LFM2_STREAM_TAIL_HOLDBACK_SAMPLES: usize = 960;
-
     pub(super) fn env_f32(key: &str) -> Option<f32> {
         std::env::var(key)
             .ok()

@@ -14,8 +14,6 @@ mod dispatch;
 mod handler_asr;
 #[path = "executor/handler_chat.rs"]
 mod handler_chat;
-#[path = "executor/handler_s2s.rs"]
-mod handler_s2s;
 #[path = "executor/handler_tts.rs"]
 mod handler_tts;
 #[path = "executor/state.rs"]
@@ -34,10 +32,7 @@ use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::models::ModelRegistry;
-use state::{
-    ActiveAsrDecode, ActiveChatDecode, ActiveLfm2TtsDecode, ActiveQwenTtsDecode,
-    ActiveSpeechToSpeechDecode,
-};
+use state::{ActiveAsrDecode, ActiveChatDecode, ActiveQwenTtsDecode};
 
 fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(msg) = payload.downcast_ref::<&str>() {
@@ -264,8 +259,6 @@ pub struct NativeExecutor {
     chat_decode_states: Mutex<HashMap<String, ActiveChatDecode>>,
     asr_decode_states: Mutex<HashMap<String, ActiveAsrDecode>>,
     qwen_tts_decode_states: Mutex<HashMap<String, ActiveQwenTtsDecode>>,
-    lfm2_tts_decode_states: Mutex<HashMap<String, ActiveLfm2TtsDecode>>,
-    speech_to_speech_decode_states: Mutex<HashMap<String, ActiveSpeechToSpeechDecode>>,
 }
 
 impl NativeExecutor {
@@ -278,8 +271,6 @@ impl NativeExecutor {
             chat_decode_states: Mutex::new(HashMap::new()),
             asr_decode_states: Mutex::new(HashMap::new()),
             qwen_tts_decode_states: Mutex::new(HashMap::new()),
-            lfm2_tts_decode_states: Mutex::new(HashMap::new()),
-            speech_to_speech_decode_states: Mutex::new(HashMap::new()),
         }
     }
 
@@ -412,12 +403,6 @@ impl ModelExecutor for NativeExecutor {
         if let Ok(mut guard) = self.qwen_tts_decode_states.lock() {
             guard.clear();
         }
-        if let Ok(mut guard) = self.lfm2_tts_decode_states.lock() {
-            guard.clear();
-        }
-        if let Ok(mut guard) = self.speech_to_speech_decode_states.lock() {
-            guard.clear();
-        }
         Ok(())
     }
 
@@ -429,12 +414,6 @@ impl ModelExecutor for NativeExecutor {
             guard.remove(request_id);
         }
         if let Ok(mut guard) = self.qwen_tts_decode_states.lock() {
-            guard.remove(request_id);
-        }
-        if let Ok(mut guard) = self.lfm2_tts_decode_states.lock() {
-            guard.remove(request_id);
-        }
-        if let Ok(mut guard) = self.speech_to_speech_decode_states.lock() {
             guard.remove(request_id);
         }
     }

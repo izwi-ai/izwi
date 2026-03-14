@@ -74,8 +74,6 @@ const audioMethodNames = [
   "deleteDiarizationRecord",
   "diarize",
   "asrTranscribeStream",
-  "speechToSpeech",
-  "speechToSpeechStream",
   "synthesize",
   "transcribe",
 ] as const;

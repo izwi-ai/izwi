@@ -22,7 +22,7 @@ impl NativeExecutor {
         let stream_tx = Self::stream_sender(request);
 
         if let Some(tx) = stream_tx.as_ref() {
-            if !matches!(family, ModelFamily::Voxtral | ModelFamily::Lfm2Audio) {
+            if !matches!(family, ModelFamily::Voxtral) {
                 let model = self.with_registry(|registry| {
                     registry.try_get_asr(variant).ok_or_else(|| {
                         Error::ModelNotFound(format!("ASR model {variant} is not loaded"))
@@ -258,57 +258,6 @@ impl NativeExecutor {
                     return Ok(text);
                 }
                 return model.transcribe(&samples, sample_rate, language);
-            }
-
-            if matches!(family, ModelFamily::Lfm2Audio) {
-                let model = self.with_registry(|registry| {
-                    registry.try_get_lfm2(variant).ok_or_else(|| {
-                        Error::ModelNotFound(format!("LFM2 model {variant} is not loaded"))
-                    })
-                })?;
-
-                let (chunk_cfg, chunk_plan) = Self::asr_chunk_plan(&samples, sample_rate, None);
-                if chunk_plan.len() > 1 {
-                    return Self::transcribe_with_chunk_plan(
-                        &request.id,
-                        stream_tx.as_ref(),
-                        &mut sequence,
-                        &samples,
-                        sample_rate,
-                        &chunk_plan,
-                        &chunk_cfg,
-                        |chunk_audio, sr| {
-                            let mut sink = |_delta: &str| {};
-                            model.transcribe_with_callback(chunk_audio, sr, language, &mut sink)
-                        },
-                    );
-                }
-
-                if let Some(tx) = stream_tx.as_ref() {
-                    let mut stream_err: Option<Error> = None;
-                    let mut emit = |delta: &str| {
-                        if stream_err.is_none() {
-                            if let Err(err) =
-                                Self::stream_text(tx, &request.id, &mut sequence, delta.to_string())
-                            {
-                                stream_err = Some(err);
-                            }
-                        }
-                    };
-                    let text = model.transcribe_with_callback(
-                        &samples,
-                        sample_rate,
-                        language,
-                        &mut emit,
-                    )?;
-                    if let Some(err) = stream_err {
-                        return Err(err);
-                    }
-                    Self::stream_final_marker(tx, &request.id, &mut sequence)?;
-                    return Ok(text);
-                }
-                let mut sink = |_delta: &str| {};
-                return model.transcribe_with_callback(&samples, sample_rate, language, &mut sink);
             }
 
             let model = self.with_registry(|registry| {

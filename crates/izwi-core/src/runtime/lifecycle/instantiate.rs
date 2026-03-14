@@ -51,10 +51,6 @@ impl RuntimeService {
                 self.model_registry.load_chat(variant, &model_path).await?;
                 InstantiatedPayload::None
             }
-            ModelFamily::Lfm2Audio => {
-                self.model_registry.load_lfm2(variant, &model_path).await?;
-                InstantiatedPayload::None
-            }
             ModelFamily::Voxtral => {
                 self.model_registry
                     .load_voxtral(variant, &model_path)

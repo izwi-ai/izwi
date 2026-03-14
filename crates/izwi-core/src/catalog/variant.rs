@@ -18,7 +18,6 @@ pub enum ModelFamily {
     Gemma3Chat,
     Qwen3ForcedAligner,
     Voxtral,
-    Lfm2Audio,
     Tokenizer,
 }
 
@@ -100,7 +99,6 @@ impl ModelVariant {
             | Qwen3Tts12Hz17BVoiceDesignBf16 => ModelFamily::Qwen3Tts,
             Kokoro82M => ModelFamily::KokoroTts,
             Qwen3TtsTokenizer12Hz => ModelFamily::Tokenizer,
-            Lfm25Audio15B | Lfm25Audio15B4Bit => ModelFamily::Lfm2Audio,
             Qwen3Asr06B | Qwen3Asr06B4Bit | Qwen3Asr06B8Bit | Qwen3Asr06BBf16 | Qwen3Asr17B
             | Qwen3Asr17B4Bit | Qwen3Asr17B8Bit | Qwen3Asr17BBf16 => ModelFamily::Qwen3Asr,
             ParakeetTdt06BV2 | ParakeetTdt06BV3 => ModelFamily::ParakeetAsr,
@@ -133,7 +131,6 @@ impl ModelVariant {
             }
             ModelFamily::Qwen3ForcedAligner => ModelTask::ForcedAlign,
             ModelFamily::Voxtral => ModelTask::AudioChat,
-            ModelFamily::Lfm2Audio => ModelTask::AudioChat,
             ModelFamily::Tokenizer => ModelTask::Tokenizer,
         }
     }
@@ -164,7 +161,7 @@ pub fn parse_model_variant(input: &str) -> Result<ModelVariant, ParseModelVarian
 
 pub fn parse_tts_model_variant(input: &str) -> Result<ModelVariant, ParseModelVariantError> {
     let variant = parse_model_variant(input)?;
-    if variant.is_tts() || variant.is_lfm2() {
+    if variant.is_tts() {
         Ok(variant)
     } else {
         Err(ParseModelVariantError::new(input))
@@ -212,7 +209,7 @@ pub fn resolve_asr_model_variant(input: Option<&str>) -> ModelVariant {
 
     match parse_model_variant(raw) {
         Ok(Qwen3Asr06B4Bit | Qwen3Asr06B8Bit) => Qwen3Asr06B,
-        Ok(variant) if variant.is_asr() || variant.is_voxtral() || variant.is_lfm2() => variant,
+        Ok(variant) if variant.is_asr() || variant.is_voxtral() => variant,
         Ok(_) => Qwen3Asr06B,
         Err(_) => {
             let normalized = normalize_identifier(raw);
@@ -223,8 +220,6 @@ pub fn resolve_asr_model_variant(input: Option<&str>) -> ModelVariant {
                 && normalized.contains("turbo")
             {
                 WhisperLargeV3Turbo
-            } else if let Some(lfm2_variant) = resolve_lfm2_audio_variant(&normalized) {
-                lfm2_variant
             } else if normalized.contains("parakeet") {
                 if normalized.contains("v3") {
                     ParakeetTdt06BV3
@@ -422,10 +417,6 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
         return Some(lfm2_variant);
     }
 
-    if let Some(lfm2_variant) = resolve_lfm2_audio_variant(normalized) {
-        return Some(lfm2_variant);
-    }
-
     None
 }
 
@@ -484,26 +475,6 @@ fn resolve_lfm2_chat_variant(normalized: &str) -> Option<ModelVariant> {
 
     if normalized.contains("thinking") {
         return Some(Lfm2512BThinkingGguf);
-    }
-
-    None
-}
-
-fn resolve_lfm2_audio_variant(normalized: &str) -> Option<ModelVariant> {
-    use ModelVariant::*;
-
-    if !normalized.contains("audio") {
-        return None;
-    }
-
-    if normalized.contains("lfm25") || normalized.contains("lfm2dot5") {
-        if normalized.contains("4bit") || normalized.contains("int4") {
-            return Some(Lfm25Audio15B4Bit);
-        }
-        if normalized.contains("gguf") {
-            return None;
-        }
-        return Some(Lfm25Audio15B);
     }
 
     None
@@ -581,29 +552,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_tts_rejects_legacy_lfm2_audio() {
-        assert!(parse_tts_model_variant("LFM2-Audio-1.5B").is_err());
-    }
-
-    #[test]
-    fn parse_tts_accepts_lfm25_audio() {
-        let parsed = parse_tts_model_variant("LFM2.5-Audio-1.5B").unwrap();
-        assert_eq!(parsed, ModelVariant::Lfm25Audio15B);
-    }
-
-    #[test]
-    fn resolve_asr_rejects_legacy_lfm2_audio() {
-        let resolved = resolve_asr_model_variant(Some("LFM2-Audio-1.5B"));
-        assert_eq!(resolved, ModelVariant::Qwen3Asr06B);
-    }
-
-    #[test]
-    fn resolve_asr_accepts_lfm25_audio() {
-        let resolved = resolve_asr_model_variant(Some("LFM2.5-Audio-1.5B"));
-        assert_eq!(resolved, ModelVariant::Lfm25Audio15B);
-    }
-
-    #[test]
     fn parse_gemma_by_repo_tail() {
         let parsed = parse_model_variant("gemma-3-4b-it").unwrap();
         assert_eq!(parsed, ModelVariant::Gemma34BIt);
@@ -669,12 +617,6 @@ mod tests {
     fn parse_deprecated_parakeet_4bit_alias_demotes_to_nemo_variant() {
         let parsed = parse_model_variant("Parakeet-TDT-0.6B-v3-4bit").unwrap();
         assert_eq!(parsed, ModelVariant::ParakeetTdt06BV3);
-    }
-
-    #[test]
-    fn parse_lfm25_audio_4bit() {
-        let parsed = parse_model_variant("LFM2.5-Audio-1.5B-4bit").unwrap();
-        assert_eq!(parsed, ModelVariant::Lfm25Audio15B4Bit);
     }
 
     #[test]
@@ -792,11 +734,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_lfm2_audio_gguf_is_rejected() {
-        assert!(parse_tts_model_variant("LFM2-Audio-1.5B-GGUF").is_err());
-    }
-
-    #[test]
     fn parse_kokoro_by_repo_id() {
         let parsed = parse_tts_model_variant("hexgrad/Kokoro-82M").unwrap();
         assert_eq!(parsed, ModelVariant::Kokoro82M);
@@ -806,11 +743,6 @@ mod tests {
     fn parse_kokoro_by_display_name() {
         let parsed = parse_model_variant("Kokoro 82M").unwrap();
         assert_eq!(parsed, ModelVariant::Kokoro82M);
-    }
-
-    #[test]
-    fn parse_lfm25_audio_gguf_is_rejected() {
-        assert!(parse_tts_model_variant("LiquidAI/LFM2.5-Audio-1.5B-GGUF").is_err());
     }
 
     #[test]

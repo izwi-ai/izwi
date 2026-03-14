@@ -1,5 +1,5 @@
 import type { ModelInfo } from "@/api";
-import { isKokoroVariant, isLfmAudioVariant } from "@/types";
+import { isKokoroVariant } from "@/types";
 
 export type RuntimeStatus =
   | "idle"
@@ -7,8 +7,6 @@ export type RuntimeStatus =
   | "user_speaking"
   | "processing"
   | "assistant_speaking";
-
-export type PipelineMode = "s2s" | "stt_chat_tts";
 
 export type VoiceRealtimeServerEvent =
   | { type: "connected"; protocol: string; server_time_ms?: number }
@@ -93,14 +91,12 @@ export type VoiceRealtimeClientMessage =
   | { type: "session_start"; system_prompt?: string }
   | {
       type: "input_stream_start";
-      mode?: "modular" | "unified";
+      mode?: "modular";
       asr_model_id?: string;
       text_model_id?: string;
       tts_model_id?: string;
-      s2s_model_id?: string;
       speaker?: string;
       asr_language?: string;
-      language?: string;
       max_output_tokens?: number;
       vad_threshold?: number;
       min_speech_ms?: number;
@@ -158,12 +154,7 @@ export interface VoicePageProps {
 
 export const VOICE_AGENT_SYSTEM_PROMPT =
   "You are a helpful voice assistant. Reply with concise spoken-friendly language. Avoid markdown. Do not output <think> tags or internal reasoning. Return only the final spoken answer. Keep responses brief unless asked for details.";
-export const ENABLE_LEGACY_LOCAL_UNIFIED_PATH = false;
-
-export const PIPELINE_LABELS: Record<PipelineMode, string> = {
-  s2s: "Unified Speech Model",
-  stt_chat_tts: "Modular Voice Stack",
-};
+export const VOICE_PIPELINE_LABEL = "Modular Voice Stack";
 
 export const MODULAR_STACK_VARIANTS = {
   asr: "Parakeet-TDT-0.6B-v3",
@@ -204,13 +195,8 @@ export function isAsrVariant(variant: string): boolean {
     variant.includes("Qwen3-ASR") ||
     variant.includes("Whisper-Large-v3-Turbo") ||
     variant.includes("Parakeet-TDT") ||
-    variant.includes("Voxtral") ||
-    isLfmAudioVariant(variant)
+    variant.includes("Voxtral")
   );
-}
-
-export function isLfm2Variant(variant: string): boolean {
-  return isLfmAudioVariant(variant);
 }
 
 export function formatModelVariantLabel(variant: string): string {
@@ -246,10 +232,6 @@ export function formatModelVariantLabel(variant: string): string {
     return normalized
       .replace("Gemma-3-1b-it", "Gemma 3 1B Instruct")
       .replace("Gemma-3-4b-it", "Gemma 3 4B Instruct");
-  }
-
-  if (isLfmAudioVariant(normalized)) {
-    return normalized.replace("LFM2.5-Audio-", "LFM2.5 Audio ");
   }
 
   if (isKokoroVariant(normalized)) {

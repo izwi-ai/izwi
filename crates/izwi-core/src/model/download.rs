@@ -425,14 +425,6 @@ impl ModelDownloader {
         };
 
         match variant.family() {
-            ModelFamily::Lfm2Audio => {
-                let has_base = path.join("model.safetensors").exists()
-                    && path.join("config.json").exists()
-                    && path.join("tokenizer.json").exists();
-                let has_detokenizer = path.join("audio_detokenizer/config.json").exists()
-                    && path.join("audio_detokenizer/model.safetensors").exists();
-                has_base && has_detokenizer
-            }
             ModelFamily::KokoroTts => {
                 path.join("config.json").exists()
                     && path.join("kokoro-v1_0.pth").exists()
@@ -905,19 +897,6 @@ impl ModelDownloader {
     /// Based on actual repo structure on HuggingFace
     fn get_model_files(&self, variant: ModelVariant) -> Vec<String> {
         match variant.family() {
-            ModelFamily::Lfm2Audio => vec![
-                "config.json".to_string(),
-                "model.safetensors".to_string(),
-                "model.safetensors.index.json".to_string(),
-                "tokenizer.json".to_string(),
-                "tokenizer_config.json".to_string(),
-                "special_tokens_map.json".to_string(),
-                // Required LFM2.5 audio detokenizer assets.
-                "audio_detokenizer/config.json".to_string(),
-                "audio_detokenizer/model.safetensors".to_string(),
-                "audio_detokenizer/tokenizer.json".to_string(),
-                "audio_detokenizer/tokenizer_config.json".to_string(),
-            ],
             ModelFamily::KokoroTts => vec![
                 "config.json".to_string(),
                 "kokoro-v1_0.pth".to_string(),
@@ -1450,7 +1429,6 @@ impl ModelDownloader {
                     ModelVariant::Qwen306B4Bit => 800_000_000,
                     ModelVariant::Qwen317B4Bit => 1_115_000_000,
                     ModelVariant::Qwen3ForcedAligner06B4Bit => 703_000_000,
-                    ModelVariant::Lfm25Audio15B4Bit => 884_000_000,
                     ModelVariant::Qwen306BGguf => 1_100_000_000,
                     ModelVariant::Qwen317BGguf => 2_400_000_000,
                     ModelVariant::Qwen34BGguf => 2_500_000_000,
@@ -1462,7 +1440,6 @@ impl ModelDownloader {
                     ModelVariant::Qwen359BGguf => 6_350_000_000,
                     ModelVariant::Gemma31BIt => 2_100_000_000,
                     ModelVariant::Gemma34BIt => 2_400_000_000,
-                    ModelVariant::Lfm25Audio15B => 2_900_000_000,
                     ModelVariant::VoxtralMini4BRealtime2602 => 8_900_000_000,
                     _ => 1_500_000_000,
                 }

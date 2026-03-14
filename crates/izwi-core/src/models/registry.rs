@@ -12,7 +12,6 @@ use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::gemma3::chat::Gemma3ChatModel;
 use crate::models::architectures::kokoro::KokoroTtsModel;
-use crate::models::architectures::lfm2::audio::Lfm2AudioModel;
 use crate::models::architectures::lfm2::chat::Lfm2ChatModel;
 use crate::models::architectures::parakeet::asr::ParakeetAsrModel;
 use crate::models::architectures::qwen3::asr::{
@@ -37,7 +36,6 @@ type ChatLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeChatM
 type DiarizationLoaderFn = fn(&Path, ModelVariant) -> Result<NativeDiarizationModel>;
 type VoxtralLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VoxtralRealtimeModel>;
 type QwenTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile, usize, &str) -> Result<Qwen3TtsModel>;
-type Lfm2LoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<Lfm2AudioModel>;
 type KokoroLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<KokoroTtsModel>;
 
 struct AsrLoaderRegistration {
@@ -68,12 +66,6 @@ struct QwenTtsLoaderRegistration {
     name: &'static str,
     family: ModelFamily,
     loader: QwenTtsLoaderFn,
-}
-
-struct Lfm2LoaderRegistration {
-    name: &'static str,
-    family: ModelFamily,
-    loader: Lfm2LoaderFn,
 }
 
 struct KokoroLoaderRegistration {
@@ -179,14 +171,6 @@ fn load_qwen_tts_model(
     Qwen3TtsModel::load(model_dir, device, kv_page_size, kv_cache_dtype)
 }
 
-fn load_lfm2_model(
-    model_dir: &Path,
-    _variant: ModelVariant,
-    device: DeviceProfile,
-) -> Result<Lfm2AudioModel> {
-    Lfm2AudioModel::load(model_dir, device)
-}
-
 fn load_kokoro_model(
     model_dir: &Path,
     _variant: ModelVariant,
@@ -255,12 +239,6 @@ const QWEN_TTS_LOADER_REGISTRY: &[QwenTtsLoaderRegistration] = &[QwenTtsLoaderRe
     loader: load_qwen_tts_model,
 }];
 
-const LFM2_LOADER_REGISTRY: &[Lfm2LoaderRegistration] = &[Lfm2LoaderRegistration {
-    name: "lfm2_audio",
-    family: ModelFamily::Lfm2Audio,
-    loader: load_lfm2_model,
-}];
-
 const KOKORO_LOADER_REGISTRY: &[KokoroLoaderRegistration] = &[KokoroLoaderRegistration {
     name: "kokoro_tts",
     family: ModelFamily::KokoroTts,
@@ -314,15 +292,6 @@ fn resolve_qwen_tts_loader_registration(
 ) -> Option<&'static QwenTtsLoaderRegistration> {
     let family = variant.family();
     QWEN_TTS_LOADER_REGISTRY
-        .iter()
-        .find(|registration| registration.family == family)
-}
-
-fn resolve_lfm2_loader_registration(
-    variant: ModelVariant,
-) -> Option<&'static Lfm2LoaderRegistration> {
-    let family = variant.family();
-    LFM2_LOADER_REGISTRY
         .iter()
         .find(|registration| registration.family == family)
 }
@@ -697,7 +666,6 @@ pub struct ModelRegistry {
     chat_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<NativeChatModel>>>>>>,
     voxtral_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<VoxtralRealtimeModel>>>>>>,
     qwen_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<Qwen3TtsModel>>>>>>,
-    lfm2_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<Lfm2AudioModel>>>>>>,
     kokoro_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<KokoroTtsModel>>>>>>,
 }
 
@@ -711,7 +679,6 @@ impl ModelRegistry {
             chat_models: Arc::new(RwLock::new(HashMap::new())),
             voxtral_models: Arc::new(RwLock::new(HashMap::new())),
             qwen_tts_models: Arc::new(RwLock::new(HashMap::new())),
-            lfm2_models: Arc::new(RwLock::new(HashMap::new())),
             kokoro_models: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -940,45 +907,6 @@ impl ModelRegistry {
         Ok(model.clone())
     }
 
-    pub async fn load_lfm2(
-        &self,
-        variant: ModelVariant,
-        model_dir: &Path,
-    ) -> Result<Arc<Lfm2AudioModel>> {
-        let registration = resolve_lfm2_loader_registration(variant).ok_or_else(|| {
-            Error::InvalidInput(format!("Unsupported LFM2 model variant: {variant}"))
-        })?;
-
-        let cell = {
-            let mut guard = self.lfm2_models.write().await;
-            guard
-                .entry(variant)
-                .or_insert_with(|| Arc::new(OnceCell::new()))
-                .clone()
-        };
-
-        info!(
-            "Loading LFM2 model {variant} ({}) from {model_dir:?}",
-            registration.name
-        );
-
-        let model = cell
-            .get_or_try_init({
-                let model_dir = model_dir.to_path_buf();
-                let device = self.device.clone();
-                let loader = registration.loader;
-                move || async move {
-                    tokio::task::spawn_blocking(move || loader(&model_dir, variant, device))
-                        .await
-                        .map_err(|e| Error::ModelLoadError(e.to_string()))?
-                        .map(Arc::new)
-                }
-            })
-            .await?;
-
-        Ok(model.clone())
-    }
-
     pub async fn load_kokoro(
         &self,
         variant: ModelVariant,
@@ -1074,16 +1002,6 @@ impl ModelRegistry {
         guard.get(&variant).and_then(|cell| cell.get().cloned())
     }
 
-    pub async fn get_lfm2(&self, variant: ModelVariant) -> Option<Arc<Lfm2AudioModel>> {
-        let guard = self.lfm2_models.read().await;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
-    }
-
-    pub fn try_get_lfm2(&self, variant: ModelVariant) -> Option<Arc<Lfm2AudioModel>> {
-        let guard = self.lfm2_models.try_read().ok()?;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
-    }
-
     pub async fn get_kokoro(&self, variant: ModelVariant) -> Option<Arc<KokoroTtsModel>> {
         let guard = self.kokoro_models.read().await;
         guard.get(&variant).and_then(|cell| cell.get().cloned())
@@ -1116,11 +1034,6 @@ impl ModelRegistry {
 
     pub async fn unload_qwen_tts(&self, variant: ModelVariant) {
         let mut guard = self.qwen_tts_models.write().await;
-        guard.remove(&variant);
-    }
-
-    pub async fn unload_lfm2(&self, variant: ModelVariant) {
-        let mut guard = self.lfm2_models.write().await;
         guard.remove(&variant);
     }
 

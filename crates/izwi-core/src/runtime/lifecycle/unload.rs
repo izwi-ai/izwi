@@ -26,10 +26,6 @@ impl RuntimeService {
             | ModelFamily::Gemma3Chat => {
                 self.model_registry.unload_chat(variant).await;
             }
-            ModelFamily::Lfm2Audio => {
-                self.model_registry.unload_lfm2(variant).await;
-                self.clear_active_tts_variant(variant).await;
-            }
             ModelFamily::Voxtral => {
                 self.model_registry.unload_voxtral(variant).await;
             }

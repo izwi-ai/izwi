@@ -23,8 +23,8 @@ use izwi_agent::{
 };
 use izwi_core::{
     audio::{AudioEncoder, AudioFormat},
-    parse_chat_model_variant, parse_model_variant, parse_tts_model_variant, ChatMessage, ChatRole,
-    Error as CoreError, GenerationConfig, GenerationRequest,
+    parse_chat_model_variant, parse_tts_model_variant, ChatMessage, ChatRole, GenerationConfig,
+    GenerationRequest,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -69,13 +69,9 @@ enum ClientEvent {
         #[serde(default)]
         tts_model_id: Option<String>,
         #[serde(default)]
-        s2s_model_id: Option<String>,
-        #[serde(default)]
         speaker: Option<String>,
         #[serde(default)]
         asr_language: Option<String>,
-        #[serde(default)]
-        language: Option<String>,
         #[serde(default)]
         max_output_tokens: Option<usize>,
         #[serde(default)]
@@ -107,14 +103,12 @@ enum ClientEvent {
 enum RealtimeVoiceMode {
     #[default]
     Modular,
-    Unified,
 }
 
 impl RealtimeVoiceMode {
     fn as_str(self) -> &'static str {
         match self {
             Self::Modular => "modular",
-            Self::Unified => "unified",
         }
     }
 }
@@ -130,16 +124,8 @@ struct ModularVoiceTurnConfig {
 }
 
 #[derive(Debug, Clone)]
-struct UnifiedVoiceTurnConfig {
-    s2s_model_id: String,
-    language: Option<String>,
-    system_prompt: Option<String>,
-}
-
-#[derive(Debug, Clone)]
 enum VoiceTurnConfig {
     Modular(ModularVoiceTurnConfig),
-    Unified(UnifiedVoiceTurnConfig),
 }
 
 #[derive(Debug, Clone)]
@@ -218,14 +204,12 @@ impl VoiceTurnConfig {
     fn mode_str(&self) -> &'static str {
         match self {
             Self::Modular(_) => RealtimeVoiceMode::Modular.as_str(),
-            Self::Unified(_) => RealtimeVoiceMode::Unified.as_str(),
         }
     }
 
     fn speaker(&self) -> Option<String> {
         match self {
             Self::Modular(config) => config.speaker.clone(),
-            Self::Unified(_) => None,
         }
     }
 
@@ -236,12 +220,6 @@ impl VoiceTurnConfig {
                 text_model_id: Some(config.text_model_id.clone()),
                 tts_model_id: Some(config.tts_model_id.clone()),
                 s2s_model_id: None,
-            },
-            Self::Unified(config) => VoiceTurnModelIds {
-                asr_model_id: None,
-                text_model_id: None,
-                tts_model_id: None,
-                s2s_model_id: Some(config.s2s_model_id.clone()),
             },
         }
     }
@@ -507,19 +485,17 @@ async fn finalize_stream_vad_utterance(
         .await
         .map_err(|err| format!("Voice storage error: {err}"))?;
 
-    let agent_session_id = match &commit.turn_config {
-        VoiceTurnConfig::Modular(config) => Some(
-            ensure_agent_session(
-                state,
-                &mut conn.agent_session_id,
-                &mut conn.agent_session_system_prompt,
-                &conn.system_prompt,
-                &config.text_model_id,
-            )
-            .await?,
-        ),
-        VoiceTurnConfig::Unified(_) => None,
-    };
+    let VoiceTurnConfig::Modular(config) = &commit.turn_config;
+    let agent_session_id = Some(
+        ensure_agent_session(
+            state,
+            &mut conn.agent_session_id,
+            &mut conn.agent_session_system_prompt,
+            &conn.system_prompt,
+            &config.text_model_id,
+        )
+        .await?,
+    );
 
     let task = spawn_turn_task(
         state.clone(),
@@ -737,10 +713,8 @@ async fn handle_text_message(
             asr_model_id,
             text_model_id,
             tts_model_id,
-            s2s_model_id,
             speaker,
             asr_language,
-            language,
             max_output_tokens,
             vad_threshold,
             min_speech_ms,
@@ -762,74 +736,43 @@ async fn handle_text_message(
             let normalized_tts = tts_model_id
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
-            let normalized_s2s = s2s_model_id
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
             let normalized_asr_language = asr_language
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
-            let normalized_language = language
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
 
-            let turn_config = match mode {
-                RealtimeVoiceMode::Modular => {
-                    let Some(asr_model_id) = normalized_asr else {
-                        return Err(
-                            "Missing required model ids (`asr_model_id`, `text_model_id`, `tts_model_id`)."
-                                .to_string(),
-                        );
-                    };
-                    let Some(text_model_id) = normalized_text else {
-                        return Err(
-                            "Missing required model ids (`asr_model_id`, `text_model_id`, `tts_model_id`)."
-                                .to_string(),
-                        );
-                    };
-                    let Some(tts_model_id) = normalized_tts else {
-                        return Err(
-                            "Missing required model ids (`asr_model_id`, `text_model_id`, `tts_model_id`)."
-                                .to_string(),
-                        );
-                    };
-
-                    let _ = resolve_chat_model_id(Some(text_model_id.as_str()))?;
-                    parse_tts_model_variant(tts_model_id.as_str())
-                        .map_err(|err| format!("Unsupported TTS model: {err}"))?;
-
-                    VoiceTurnConfig::Modular(ModularVoiceTurnConfig {
-                        asr_model_id,
-                        text_model_id,
-                        tts_model_id,
-                        speaker: speaker
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty()),
-                        asr_language: normalized_asr_language,
-                        max_output_tokens: max_output_tokens.unwrap_or(1536).clamp(1, 4096),
-                    })
-                }
-                RealtimeVoiceMode::Unified => {
-                    let Some(s2s_model_id) = normalized_s2s.or(normalized_tts).or(normalized_asr)
-                    else {
-                        return Err("Missing unified model id (`s2s_model_id`).".to_string());
-                    };
-                    let variant = parse_model_variant(&s2s_model_id)
-                        .map_err(|err| format!("Unsupported speech-to-speech model: {err}"))?;
-                    if !variant.is_lfm2() {
-                        return Err(format!(
-                            "Unsupported unified speech model '{}'. Supported: LFM2.5-Audio-1.5B, LFM2.5-Audio-1.5B-4bit",
-                            s2s_model_id
-                        ));
-                    }
-
-                    VoiceTurnConfig::Unified(UnifiedVoiceTurnConfig {
-                        s2s_model_id,
-                        language: normalized_language.or(normalized_asr_language),
-                        system_prompt: Some(conn.system_prompt.clone())
-                            .filter(|s| !s.trim().is_empty()),
-                    })
-                }
+            let Some(asr_model_id) = normalized_asr else {
+                return Err(
+                    "Missing required model ids (`asr_model_id`, `text_model_id`, `tts_model_id`)."
+                        .to_string(),
+                );
             };
+            let Some(text_model_id) = normalized_text else {
+                return Err(
+                    "Missing required model ids (`asr_model_id`, `text_model_id`, `tts_model_id`)."
+                        .to_string(),
+                );
+            };
+            let Some(tts_model_id) = normalized_tts else {
+                return Err(
+                    "Missing required model ids (`asr_model_id`, `text_model_id`, `tts_model_id`)."
+                        .to_string(),
+                );
+            };
+
+            let _ = resolve_chat_model_id(Some(text_model_id.as_str()))?;
+            parse_tts_model_variant(tts_model_id.as_str())
+                .map_err(|err| format!("Unsupported TTS model: {err}"))?;
+
+            let turn_config = VoiceTurnConfig::Modular(ModularVoiceTurnConfig {
+                asr_model_id,
+                text_model_id,
+                tts_model_id,
+                speaker: speaker
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                asr_language: normalized_asr_language,
+                max_output_tokens: max_output_tokens.unwrap_or(1536).clamp(1, 4096),
+            });
 
             if conn.voice_session_id.is_none() {
                 let profile_id = conn.voice_profile_id.clone().ok_or_else(|| {
@@ -1205,204 +1148,6 @@ fn spawn_turn_task(
                         user_text.clone(),
                         assistant_text.clone(),
                     );
-
-                    send_json(
-                        &out_tx,
-                        json!({
-                            "type": "turn_done",
-                            "utterance_id": commit.utterance_id,
-                            "utterance_seq": commit.utterance_seq,
-                            "status": "ok",
-                        }),
-                    );
-                    Ok(())
-                }
-                VoiceTurnConfig::Unified(config) => {
-                    send_json(
-                        &out_tx,
-                        json!({
-                            "type": "user_transcript_start",
-                            "utterance_id": commit.utterance_id,
-                            "utterance_seq": commit.utterance_seq,
-                        }),
-                    );
-
-                    let transcript_result = {
-                        let tx = out_tx.clone();
-                        let utt_id = commit.utterance_id.clone();
-                        let utt_seq = commit.utterance_seq;
-                        let model_id = config.s2s_model_id.clone();
-                        let language = config.language.clone();
-                        state
-                            .runtime
-                            .asr_transcribe_streaming_bytes_with_correlation(
-                                audio_bytes.as_slice(),
-                                Some(&model_id),
-                                language.as_deref(),
-                                Some(&correlation_id),
-                                move |delta| {
-                                    if delta.is_empty() {
-                                        return;
-                                    }
-                                    send_json(
-                                        &tx,
-                                        json!({
-                                            "type": "user_transcript_delta",
-                                            "utterance_id": utt_id,
-                                            "utterance_seq": utt_seq,
-                                            "delta": delta,
-                                        }),
-                                    );
-                                },
-                            )
-                            .await
-                    };
-
-                    let (user_text, user_language, user_audio_duration_secs) =
-                        match transcript_result {
-                            Ok(transcript) => {
-                                let text = transcript.text.trim();
-                                let final_text = if text.is_empty() {
-                                    "User speech captured (transcription unavailable).".to_string()
-                                } else {
-                                    text.to_string()
-                                };
-                                (
-                                    final_text,
-                                    transcript.language,
-                                    Some(transcript.duration_secs),
-                                )
-                            }
-                            Err(err) => {
-                                warn!("unified websocket transcript failed, continuing with speech generation: {err}");
-                                (
-                                    "User speech captured (transcription unavailable).".to_string(),
-                                    None,
-                                    None,
-                                )
-                            }
-                        };
-                    send_json(
-                        &out_tx,
-                        json!({
-                            "type": "user_transcript_final",
-                            "utterance_id": commit.utterance_id,
-                            "utterance_seq": commit.utterance_seq,
-                            "text": user_text.clone(),
-                            "language": user_language.clone(),
-                            "audio_duration_secs": user_audio_duration_secs,
-                        }),
-                    );
-                    state
-                        .voice_store
-                        .update_turn_transcript(
-                            turn_record_id.clone(),
-                            user_text.clone(),
-                            user_language.clone(),
-                            user_audio_duration_secs,
-                        )
-                        .await
-                        .map_err(|err| format!("Voice storage error: {err}"))?;
-
-                    send_json(
-                        &out_tx,
-                        json!({
-                            "type": "assistant_text_start",
-                            "utterance_id": commit.utterance_id,
-                            "utterance_seq": commit.utterance_seq,
-                        }),
-                    );
-
-                    let sample_rate = state.runtime.sample_rate().await;
-                    send_json(
-                        &out_tx,
-                        json!({
-                            "type": "assistant_audio_start",
-                            "utterance_id": commit.utterance_id,
-                            "utterance_seq": commit.utterance_seq,
-                            "sample_rate": sample_rate,
-                            "audio_format": "pcm_i16",
-                        }),
-                    );
-
-                    let audio_tx = out_tx.clone();
-                    let utt_seq = commit.utterance_seq;
-                    let stream_result = state
-                        .runtime
-                        .lfm2_speech_to_speech_streaming_bytes_with_correlation(
-                            audio_bytes.as_slice(),
-                            config.language.as_deref(),
-                            config.system_prompt.as_deref(),
-                            None,
-                            None,
-                            Some(&correlation_id),
-                            |_delta| Ok(()),
-                            move |audio_chunk| {
-                                if audio_chunk.samples.is_empty() && !audio_chunk.is_final {
-                                    return Ok(());
-                                }
-
-                                let encoded = AudioEncoder::new(sample_rate, 1)
-                                    .encode(&audio_chunk.samples, AudioFormat::RawI16)
-                                    .map_err(|err| {
-                                        CoreError::InferenceError(format!(
-                                            "Failed to encode unified speech chunk: {err}"
-                                        ))
-                                    })?;
-
-                                let chunk_seq =
-                                    u32::try_from(audio_chunk.sequence).unwrap_or(u32::MAX);
-                                let frame = encode_assistant_audio_binary_frame(
-                                    utt_seq,
-                                    chunk_seq,
-                                    sample_rate,
-                                    audio_chunk.is_final,
-                                    &encoded,
-                                );
-                                audio_tx.send(Message::Binary(frame.into())).map_err(|_| {
-                                    CoreError::InferenceError(
-                                        "Voice websocket output channel closed".to_string(),
-                                    )
-                                })
-                            },
-                        )
-                        .await
-                        .map_err(|err| format!("Unified speech-to-speech failed: {err}"))?;
-
-                    let assistant_text = strip_think_tags(stream_result.text.as_str());
-                    send_json(
-                        &out_tx,
-                        json!({
-                            "type": "assistant_text_final",
-                            "utterance_id": commit.utterance_id,
-                            "utterance_seq": commit.utterance_seq,
-                            "text": assistant_text.clone(),
-                            "raw_text": stream_result.text.clone(),
-                        }),
-                    );
-                    state
-                        .voice_store
-                        .update_turn_assistant(
-                            turn_record_id.clone(),
-                            Some(assistant_text.clone()),
-                            Some(stream_result.text.clone()),
-                        )
-                        .await
-                        .map_err(|err| format!("Voice storage error: {err}"))?;
-
-                    send_json(
-                        &out_tx,
-                        json!({
-                            "type": "assistant_audio_done",
-                            "utterance_id": commit.utterance_id,
-                            "utterance_seq": commit.utterance_seq,
-                        }),
-                    );
-                    state
-                        .voice_store
-                        .complete_turn(turn_record_id.clone(), "ok", None)
-                        .await
-                        .map_err(|err| format!("Voice storage error: {err}"))?;
 
                     send_json(
                         &out_tx,

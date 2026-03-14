@@ -1,7 +1,7 @@
 //! Izwi Core - High-Performance Audio Inference Engine
 //!
 //! This crate provides a production-ready inference engine for audio models
-//! (Qwen3-TTS, LFM2-Audio) on Apple Silicon and CPU devices.
+//! (Qwen3-TTS, Kokoro) on Apple Silicon and CPU devices.
 //!
 //! # Architecture
 //!
@@ -16,7 +16,7 @@
 //! ```ignore
 //! use izwi_core::engine::{Engine, EngineCoreConfig, EngineCoreRequest};
 //!
-//! let config = EngineCoreConfig::for_lfm2();
+//! let config = EngineCoreConfig::default();
 //! let engine = Engine::new(config)?;
 //!
 //! let request = EngineCoreRequest::tts("Hello, world!");
