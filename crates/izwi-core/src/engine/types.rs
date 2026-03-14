@@ -155,6 +155,8 @@ pub struct EngineOutput {
     pub audio: AudioOutput,
     /// Generated text (for ASR/chat)
     pub text: Option<String>,
+    /// Optional input transcription for speech-to-speech requests.
+    pub input_transcription: Option<String>,
     /// Number of tokens generated
     pub num_tokens: usize,
     /// Generation time

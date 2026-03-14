@@ -165,6 +165,7 @@ impl OutputProcessor {
             sequence_id,
             audio,
             text: executor_output.text,
+            input_transcription: executor_output.input_transcription,
             num_tokens,
             generation_time,
             is_finished: executor_output.finished,

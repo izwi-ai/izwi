@@ -232,6 +232,7 @@ impl EngineCore {
             request_id: _,
             audio,
             text,
+            input_transcription,
             tokens_processed,
             tokens_generated,
             finished,
@@ -241,6 +242,9 @@ impl EngineCore {
         merged.audio = Self::merge_audio_output(merged.audio.take(), audio);
         if text.is_some() {
             merged.text = text;
+        }
+        if input_transcription.is_some() {
+            merged.input_transcription = input_transcription;
         }
         merged.tokens_processed = merged.tokens_processed.saturating_add(tokens_processed);
         merged.tokens_generated = merged.tokens_generated.saturating_add(tokens_generated);
@@ -833,6 +837,7 @@ mod tests {
                     request_id: entry.request_id.clone(),
                     audio: None,
                     text: None,
+                    input_transcription: None,
                     tokens_processed: entry.num_tokens.max(1),
                     tokens_generated: usize::from(!entry.is_prefill),
                     finished: false,
@@ -902,6 +907,7 @@ mod tests {
                     request_id: entry.request_id.clone(),
                     audio: Some(AudioOutput::empty(24_000)),
                     text: None,
+                    input_transcription: None,
                     tokens_processed: entry.num_tokens.max(1),
                     tokens_generated: 0,
                     finished: false,
@@ -929,6 +935,7 @@ mod tests {
                     request_id: entry.request_id.clone(),
                     audio: Some(AudioOutput::empty(24_000)),
                     text: Some(format!("step-{}", entry.request_id)),
+                    input_transcription: None,
                     tokens_processed: entry.num_tokens.max(1),
                     tokens_generated: entry.num_tokens.max(1),
                     finished: false,
@@ -964,6 +971,7 @@ mod tests {
                     request_id: entry.request_id.clone(),
                     audio: None,
                     text: Some(format!("done-{}", entry.request_id)),
+                    input_transcription: None,
                     tokens_processed: entry.num_tokens.max(1),
                     tokens_generated: 1,
                     finished: true,
@@ -1094,6 +1102,7 @@ mod tests {
             request_id: "req-a".to_string(),
             audio: Some(AudioOutput::new(vec![0.1, 0.2], 24_000)),
             text: Some("hello".to_string()),
+            input_transcription: None,
             tokens_processed: 1,
             tokens_generated: 1,
             finished: false,
@@ -1103,6 +1112,7 @@ mod tests {
             request_id: "req-a".to_string(),
             audio: Some(AudioOutput::new(vec![0.1, 0.2, 0.3], 24_000)),
             text: Some("hello world".to_string()),
+            input_transcription: Some("hello there".to_string()),
             tokens_processed: 1,
             tokens_generated: 1,
             finished: true,
@@ -1112,6 +1122,10 @@ mod tests {
         let merged = EngineCore::merge_executor_output(Some(first), second);
         let audio = merged.audio.expect("merged audio");
         assert_eq!(audio.samples, vec![0.1, 0.2, 0.3]);
+        assert_eq!(
+            merged.input_transcription.as_deref(),
+            Some("hello there")
+        );
         assert_eq!(merged.text.as_deref(), Some("hello world"));
         assert_eq!(merged.tokens_processed, 2);
         assert_eq!(merged.tokens_generated, 2);

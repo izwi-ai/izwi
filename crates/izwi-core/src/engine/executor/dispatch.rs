@@ -49,6 +49,12 @@ const DISPATCH_ROUTES: &[DispatchRoute] = &[
         handler: NativeExecutor::transcribe_request,
     },
     DispatchRoute {
+        name: "speech_to_speech",
+        task: TaskType::SpeechToSpeech,
+        variant_matcher: None,
+        handler: NativeExecutor::audio_chat_request,
+    },
+    DispatchRoute {
         name: "chat",
         task: TaskType::Chat,
         variant_matcher: None,

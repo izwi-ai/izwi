@@ -11,6 +11,7 @@ mod diarization;
 mod kokoro;
 mod lifecycle;
 mod service;
+mod speech_to_speech;
 mod tts;
 mod types;
 

@@ -231,6 +231,7 @@ impl NativeExecutor {
                 request_id: request.id.clone(),
                 audio: Some(AudioOutput::new(finished_samples, 24_000)),
                 text: None,
+                input_transcription: None,
                 tokens_processed,
                 tokens_generated: total_tokens_generated,
                 finished,

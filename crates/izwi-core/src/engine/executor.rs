@@ -12,6 +12,8 @@ mod audio;
 mod dispatch;
 #[path = "executor/handler_asr.rs"]
 mod handler_asr;
+#[path = "executor/handler_audio_chat.rs"]
+mod handler_audio_chat;
 #[path = "executor/handler_chat.rs"]
 mod handler_chat;
 #[path = "executor/handler_tts.rs"]
@@ -172,6 +174,8 @@ pub struct ExecutorOutput {
     pub audio: Option<AudioOutput>,
     /// Generated text (for ASR/chat)
     pub text: Option<String>,
+    /// Optional input transcription for speech-to-speech requests.
+    pub input_transcription: Option<String>,
     /// Number of tokens processed
     pub tokens_processed: usize,
     /// Number of tokens generated
@@ -188,6 +192,7 @@ impl ExecutorOutput {
             request_id,
             audio: None,
             text: None,
+            input_transcription: None,
             tokens_processed: 0,
             tokens_generated: 0,
             finished: true,

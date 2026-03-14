@@ -22,7 +22,7 @@ impl NativeExecutor {
         }
     }
 
-    fn chat_request_seed(request_id: &str) -> u64 {
+    pub(super) fn chat_request_seed(request_id: &str) -> u64 {
         const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
         const FNV_PRIME: u64 = 0x100000001b3;
 
@@ -93,6 +93,7 @@ impl NativeExecutor {
                 request_id: request.id.clone(),
                 audio: Some(AudioOutput::empty(24_000)),
                 text: Some(output.text),
+                input_transcription: None,
                 tokens_processed: request.num_prompt_tokens(),
                 tokens_generated: output.tokens_generated.max(1),
                 finished: true,
@@ -197,6 +198,7 @@ impl NativeExecutor {
             request_id: request.id.clone(),
             audio: Some(AudioOutput::empty(24_000)),
             text: Some(final_text),
+            input_transcription: None,
             tokens_processed,
             tokens_generated: total_tokens_generated,
             finished,
