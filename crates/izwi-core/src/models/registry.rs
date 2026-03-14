@@ -13,7 +13,9 @@ use crate::model::ModelVariant;
 use crate::models::architectures::gemma3::chat::Gemma3ChatModel;
 use crate::models::architectures::kokoro::KokoroTtsModel;
 use crate::models::architectures::lfm2::chat::Lfm2ChatModel;
-use crate::models::architectures::lfm25_audio::Lfm25AudioModel;
+use crate::models::architectures::lfm25_audio::{
+    Lfm25AudioGenerationConfig, Lfm25AudioModel, Lfm25AudioStreamConfig,
+};
 use crate::models::architectures::parakeet::asr::ParakeetAsrModel;
 use crate::models::architectures::qwen3::asr::{
     AsrDecodeState as Qwen3AsrDecodeState, AsrDecodeStep as Qwen3AsrDecodeStep,
@@ -348,6 +350,16 @@ pub enum NativeAudioChatModel {
     Lfm25Audio(Lfm25AudioModel),
 }
 
+#[derive(Debug, Clone)]
+pub struct NativeAudioChatGeneration {
+    pub text: String,
+    pub prompt_tokens: usize,
+    pub tokens_generated: usize,
+    pub audio_frames_generated: usize,
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+}
+
 pub enum NativeAsrDecodeState {
     Qwen3(Qwen3AsrDecodeState),
 }
@@ -492,6 +504,62 @@ impl NativeAsrModel {
             _ => Err(Error::InvalidInput(
                 "ASR decode state does not match loaded ASR model".to_string(),
             )),
+        }
+    }
+}
+
+impl NativeAudioChatModel {
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_interleaved_with_config_and_callback(
+        &self,
+        history_messages: &[ChatMessage],
+        audio: &[f32],
+        sample_rate: u32,
+        max_new_tokens: usize,
+        system_prompt: Option<&str>,
+        generation_config: &Lfm25AudioGenerationConfig,
+        stream_config: &Lfm25AudioStreamConfig,
+        on_text_delta: &mut dyn FnMut(&str),
+        on_audio_samples: &mut dyn FnMut(&[f32]),
+    ) -> Result<NativeAudioChatGeneration> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                let output = model.generate_interleaved_with_config_and_callback(
+                    history_messages,
+                    audio,
+                    sample_rate,
+                    max_new_tokens,
+                    system_prompt,
+                    generation_config,
+                    stream_config,
+                    on_text_delta,
+                    on_audio_samples,
+                )?;
+                Ok(NativeAudioChatGeneration {
+                    text: output.text,
+                    prompt_tokens: output.prompt_tokens,
+                    tokens_generated: output.tokens_generated,
+                    audio_frames_generated: output.audio_frames_generated,
+                    samples: output.samples,
+                    sample_rate: output.sample_rate,
+                })
+            }
+        }
+    }
+
+    pub fn transcribe(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+    ) -> Result<NativeAsrTranscription> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                let output = model.transcribe_to_output(audio, sample_rate, 1024)?;
+                Ok(NativeAsrTranscription {
+                    text: output.text,
+                    language: None,
+                })
+            }
         }
     }
 }

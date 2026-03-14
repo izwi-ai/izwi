@@ -8,6 +8,10 @@ mod config;
 mod detokenizer;
 mod model;
 mod preprocessor;
+mod sampling;
 mod tokenizer;
 
-pub use model::Lfm25AudioModel;
+pub use model::{
+    Lfm25AudioGenerationOutput, Lfm25AudioModel, Lfm25AudioStreamConfig, Lfm25AudioTextOutput,
+};
+pub use sampling::{Lfm25AudioGenerationConfig, Lfm25SamplingConfig};

@@ -10,6 +10,7 @@ use crate::models::architectures::qwen3::core::repeat_kv;
 use crate::models::shared::weights::gguf::GgufLoader;
 
 use super::config::Lfm25AudioDecoderConfig;
+use super::sampling::{sample_from_logits, Lfm25SamplingConfig, SimpleRng};
 
 const DEPTHFORMER_HEADS: usize = 32;
 const DEPTHFORMER_KV_HEADS: usize = 8;
@@ -107,7 +108,12 @@ impl Lfm25AudioHead {
         embeds.unsqueeze(1).map_err(Error::from)
     }
 
-    pub fn sample_audio_frame(&self, hidden: &Tensor) -> Result<Vec<u32>> {
+    pub fn sample_audio_frame(
+        &self,
+        hidden: &Tensor,
+        config: &Lfm25SamplingConfig,
+        rng: &mut SimpleRng,
+    ) -> Result<Vec<u32>> {
         let hidden = ensure_rank3(hidden)?;
         let depth_input = self.depth_linear.forward(&hidden)?;
         let depth_input = depth_input
@@ -127,7 +133,7 @@ impl Lfm25AudioHead {
             let cur = depth_input.i(codebook_idx)?.broadcast_add(&next_embed)?;
             let cur = cur.unsqueeze(0)?.unsqueeze(0)?;
             let out = self.depthformer.forward_cached(&cur, &mut caches)?;
-            let token = self.depth_embeddings[codebook_idx].sample_greedy(&out)?;
+            let token = self.depth_embeddings[codebook_idx].sample(&out, config, rng)?;
             next_embed = self.depth_embeddings[codebook_idx].embed(token, hidden.device())?;
             tokens.push(token);
         }
@@ -435,9 +441,14 @@ impl CodebookEmbeddingHead {
         logits.squeeze(0)?.squeeze(0).map_err(Error::from)
     }
 
-    fn sample_greedy(&self, hidden: &Tensor) -> Result<u32> {
+    fn sample(
+        &self,
+        hidden: &Tensor,
+        config: &Lfm25SamplingConfig,
+        rng: &mut SimpleRng,
+    ) -> Result<u32> {
         let logits = self.logits(hidden)?;
-        argmax_1d(&logits)
+        sample_from_logits(&logits, logits.dim(0)?, config, rng)
     }
 }
 
@@ -565,11 +576,4 @@ fn ensure_rank3(hidden: &Tensor) -> Result<Tensor> {
             "Expected 1D/2D/3D hidden state, got rank {rank}"
         ))),
     }
-}
-
-fn argmax_1d(logits: &Tensor) -> Result<u32> {
-    let idx = logits.argmax(candle_core::D::Minus1)?;
-    idx.to_dtype(DType::U32)?
-        .to_scalar::<u32>()
-        .map_err(Error::from)
 }
