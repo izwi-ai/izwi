@@ -6,8 +6,9 @@ use candle_nn::{Conv1d, Conv1dConfig, Embedding, Module};
 use candle_transformers::models::with_tracing::QMatMul;
 use candle_transformers::quantized_nn::RmsNorm;
 
+use candle_transformers::utils::repeat_kv as candle_repeat_kv;
+
 use crate::error::{Error, Result};
-use crate::models::architectures::qwen3::core::repeat_kv;
 use crate::models::shared::weights::gguf::GgufLoader;
 
 use super::config::Lfm2BackboneConfig;
@@ -178,8 +179,15 @@ impl AttentionLayer {
         };
         self.kv_cache = Some((all_keys.clone(), all_values.clone()));
 
-        let key_states = repeat_kv(&all_keys, self.n_head, self.n_kv_head)?;
-        let value_states = repeat_kv(&all_values, self.n_head, self.n_kv_head)?;
+        let (key_states, value_states) = if self.n_head != self.n_kv_head {
+            let repeats = self.n_head / self.n_kv_head;
+            (
+                candle_repeat_kv(all_keys, repeats)?,
+                candle_repeat_kv(all_values, repeats)?,
+            )
+        } else {
+            (all_keys, all_values)
+        };
 
         let attn_weights = (query_states.matmul(&key_states.transpose(2, 3)?.contiguous()?)?
             / (self.head_dim as f64).sqrt())?;
