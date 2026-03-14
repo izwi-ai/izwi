@@ -471,4 +471,155 @@ describe("ChatPlayground", () => {
       expect.any(Object),
     );
   });
+
+  it("uses Qwen3.5 variant defaults and forwards enable_thinking from the toggle", async () => {
+    const thread = {
+      id: "thread-3",
+      title: "Thinking thread",
+      model_id: "Qwen3.5-2B",
+      created_at: 1,
+      updated_at: 2,
+      last_message_preview: null,
+      message_count: 0,
+    };
+
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread.mockResolvedValue({
+      thread,
+      messages: [],
+    });
+    apiMocks.sendChatThreadMessageStream.mockReturnValue(new AbortController());
+
+    render(
+      <MemoryRouter initialEntries={["/chat?threadId=thread-3"]}>
+        <ChatPlayground
+          selectedModel="Qwen3.5-2B"
+          selectedModelReady={true}
+          supportsThinking={true}
+          modelLabel="Qwen3.5 2B GGUF (Q4_K_M)"
+          modelOptions={[
+            {
+              value: "Qwen3.5-2B",
+              label: "Qwen3.5 2B GGUF (Q4_K_M)",
+              statusLabel: "Ready",
+              isReady: true,
+            },
+          ]}
+          onSelectModel={vi.fn()}
+          onOpenModelManager={vi.fn()}
+          onModelRequired={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() =>
+      expect(apiMocks.getChatThread).toHaveBeenCalledWith("thread-3"),
+    );
+
+    expect(
+      screen.getByRole("button", { name: "Enable thinking mode" }),
+    ).toHaveTextContent("Thinking Off");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Enable thinking mode" }),
+    );
+    expect(
+      screen.getByRole("button", { name: "Disable thinking mode" }),
+    ).toHaveTextContent("Thinking On");
+
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "Think through this briefly." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expect(apiMocks.sendChatThreadMessageStream).toHaveBeenCalled(),
+    );
+
+    expect(apiMocks.sendChatThreadMessageStream).toHaveBeenCalledWith(
+      "thread-3",
+      expect.objectContaining({
+        model_id: "Qwen3.5-2B",
+        content: "Think through this briefly.",
+        enable_thinking: true,
+        system_prompt: "You are a helpful assistant.",
+      }),
+      expect.any(Object),
+    );
+  });
+
+  it("renders Qwen3.5 close-only think output as reasoning plus final answer", async () => {
+    const thread = {
+      id: "thread-4",
+      title: "Parsed thinking thread",
+      model_id: "Qwen3.5-4B",
+      created_at: 1,
+      updated_at: 2,
+      last_message_preview: null,
+      message_count: 2,
+    };
+
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread.mockResolvedValue({
+      thread,
+      messages: [
+        {
+          id: "message-1",
+          thread_id: "thread-4",
+          role: "user",
+          content: "Solve this",
+          created_at: 1,
+          tokens_generated: null,
+          generation_time_ms: null,
+        },
+        {
+          id: "message-2",
+          thread_id: "thread-4",
+          role: "assistant",
+          content: "reasoning first</think>\nFinal answer",
+          created_at: 2,
+          tokens_generated: 8,
+          generation_time_ms: 120,
+        },
+      ],
+    });
+
+    render(
+      <MemoryRouter initialEntries={["/chat?threadId=thread-4"]}>
+        <ChatPlayground
+          selectedModel="Qwen3.5-4B"
+          selectedModelReady={true}
+          supportsThinking={true}
+          modelLabel="Qwen3.5 4B GGUF (Q4_K_M)"
+          modelOptions={[
+            {
+              value: "Qwen3.5-4B",
+              label: "Qwen3.5 4B GGUF (Q4_K_M)",
+              statusLabel: "Ready",
+              isReady: true,
+            },
+          ]}
+          onSelectModel={vi.fn()}
+          onOpenModelManager={vi.fn()}
+          onModelRequired={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() =>
+      expect(apiMocks.getChatThread).toHaveBeenCalledWith("thread-4"),
+    );
+
+    expect(screen.getByText("Final answer")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Show thought process" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("reasoning first")).not.toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Show thought process" }),
+    );
+
+    expect(screen.getByText("reasoning first")).toBeInTheDocument();
+  });
 });

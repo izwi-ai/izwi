@@ -4,10 +4,12 @@ import {
   DEFAULT_THREAD_TITLE,
   defaultThinkingEnabledForModel,
   displayThreadTitle,
+  isQwen35ThinkingModel,
   parseAssistantContent,
   parseUserMessageDisplayFromContentParts,
   supportsImageAttachmentsForModel,
   supportsImplicitOpenThinkTagParsing,
+  systemPromptForModel,
 } from "./support";
 
 describe("chat playground support", () => {
@@ -26,6 +28,7 @@ describe("chat playground support", () => {
     expect(supportsImplicitOpenThinkTagParsing("LFM2.5-1.2B-Thinking-GGUF")).toBe(
       true,
     );
+    expect(supportsImplicitOpenThinkTagParsing("Qwen3.5-4B")).toBe(true);
     expect(
       parseAssistantContent("reasoning first</think>final answer", {
         implicitOpenThinkTag: true,
@@ -38,11 +41,24 @@ describe("chat playground support", () => {
     });
   });
 
-  it("keeps thinking enabled by default for supported chat models", () => {
+  it("uses variant-aware thinking defaults for supported chat models", () => {
     expect(defaultThinkingEnabledForModel("Qwen3-4B-GGUF")).toBe(true);
+    expect(defaultThinkingEnabledForModel("Qwen3.5-0.8B")).toBe(false);
+    expect(defaultThinkingEnabledForModel("Qwen3.5-2B")).toBe(false);
     expect(defaultThinkingEnabledForModel("Qwen3.5-4B")).toBe(true);
+    expect(defaultThinkingEnabledForModel("Qwen3.5-9B")).toBe(true);
     expect(defaultThinkingEnabledForModel("LFM2.5-1.2B-thinking-gguf")).toBe(
       true,
+    );
+  });
+
+  it("uses the neutral system prompt for Qwen3.5 thinking control", () => {
+    expect(isQwen35ThinkingModel("Qwen3.5-4B")).toBe(true);
+    expect(systemPromptForModel("Qwen3.5-4B", true)).toBe(
+      "You are a helpful assistant.",
+    );
+    expect(systemPromptForModel("Qwen3.5-2B", false)).toBe(
+      "You are a helpful assistant.",
     );
   });
 

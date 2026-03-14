@@ -35,6 +35,11 @@ export const DEFAULT_SYSTEM_PROMPT: ChatMessage = {
     "You are a helpful assistant. Provide only the final answer and do not output <think> tags or internal reasoning.",
 };
 
+export const NEUTRAL_SYSTEM_PROMPT: ChatMessage = {
+  role: "system",
+  content: "You are a helpful assistant.",
+};
+
 export const DEFAULT_THREAD_TITLE = "New chat";
 const MAX_THREAD_TITLE_CHARS = 80;
 
@@ -272,9 +277,29 @@ export function fallbackThreadTitleFromUserMessage(content: string): string {
   return truncateText(normalized, MAX_THREAD_TITLE_CHARS);
 }
 
+export function isQwen35ThinkingModel(variant: string | null): boolean {
+  if (!variant) {
+    return false;
+  }
+  return variant.trim().toLowerCase().startsWith("qwen3.5-");
+}
+
 export function defaultThinkingEnabledForModel(variant: string | null): boolean {
-  void variant;
-  return true;
+  if (!variant) {
+    return false;
+  }
+
+  const normalized = variant.trim().toLowerCase();
+  if (normalized === "qwen3.5-0.8b" || normalized === "qwen3.5-2b") {
+    return false;
+  }
+  if (normalized === "qwen3.5-4b" || normalized === "qwen3.5-9b") {
+    return true;
+  }
+  if (isLfm25ThinkingModel(variant)) {
+    return true;
+  }
+  return normalized.startsWith("qwen3-");
 }
 
 export function supportsImageAttachmentsForModel(
@@ -296,7 +321,23 @@ export function isLfm25ThinkingModel(variant: string | null): boolean {
 export function supportsImplicitOpenThinkTagParsing(
   variant: string | null,
 ): boolean {
-  return isLfm25ThinkingModel(variant);
+  return isLfm25ThinkingModel(variant) || isQwen35ThinkingModel(variant);
+}
+
+export function systemPromptForModel(
+  variant: string | null,
+  thinkingEnabled: boolean,
+): string {
+  if (isQwen35ThinkingModel(variant)) {
+    return NEUTRAL_SYSTEM_PROMPT.content;
+  }
+  if (thinkingEnabled) {
+    if (isLfm25ThinkingModel(variant)) {
+      return NEUTRAL_SYSTEM_PROMPT.content;
+    }
+    return THINKING_SYSTEM_PROMPT.content;
+  }
+  return DEFAULT_SYSTEM_PROMPT.content;
 }
 
 export function buildChatThreadMessagePayload(options: {

@@ -36,9 +36,7 @@ import {
 } from "@/components/ui/dialog";
 import {
   buildChatThreadMessagePayload,
-  DEFAULT_SYSTEM_PROMPT,
   DEFAULT_THREAD_TITLE,
-  THINKING_SYSTEM_PROMPT,
   type ChatPlaygroundProps,
   type GenerateTitleArgs,
   type ImagePreviewState,
@@ -50,12 +48,13 @@ import {
   fallbackThreadTitleFromUserMessage,
   formatThreadTimestamp,
   getErrorMessage,
-  isLfm25ThinkingModel,
+  isQwen35ThinkingModel,
   normalizeGeneratedThreadTitle,
   parseAssistantContent,
   parseUserMessageDisplayFromContentParts,
   readImageFileAsDataUrl,
   stripThinkingArtifacts,
+  systemPromptForModel,
   supportsImageAttachmentsForModel,
   supportsImplicitOpenThinkTagParsing,
   threadPreviewFromContent,
@@ -709,11 +708,14 @@ export function ChatPlayground({
       generation_time_ms: null,
     };
 
-    const systemPrompt = thinkingEnabledForModel
-      ? isLfm25ThinkingModel(selectedModel)
-        ? "You are a helpful assistant."
-        : THINKING_SYSTEM_PROMPT.content
-      : DEFAULT_SYSTEM_PROMPT.content;
+    const systemPrompt = systemPromptForModel(
+      selectedModel,
+      thinkingEnabledForModel,
+    );
+    const enableThinking =
+      isQwen35ThinkingModel(selectedModel) && supportsThinking
+        ? thinkingEnabledForModel
+        : undefined;
 
     setMessages((previous) => [
       ...previous,
@@ -732,6 +734,7 @@ export function ChatPlayground({
         content: requestPayload.content,
         content_parts: requestPayload.contentParts,
         system_prompt: systemPrompt,
+        enable_thinking: enableThinking,
       },
       {
         onStart: ({ userMessage }) => {

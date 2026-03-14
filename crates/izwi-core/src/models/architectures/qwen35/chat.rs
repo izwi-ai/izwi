@@ -707,7 +707,7 @@ fn render_prompt(
                     prompt.push_str("\n</think>\n\n");
                     prompt.push_str(content.trim_start());
                 } else {
-                    prompt.push_str(message.content.trim());
+                    prompt.push_str(content.trim());
                 }
                 prompt.push_str("<|im_end|>\n");
             }
@@ -750,10 +750,11 @@ fn split_assistant_reasoning(content: &str) -> (&str, &str) {
     let Some(end_idx) = content.find("</think>") else {
         return ("", content);
     };
-    let reasoning = content[..end_idx]
+    let reasoning_prefix = &content[..end_idx];
+    let reasoning = reasoning_prefix
         .rsplit_once("<think>")
         .map(|(_, reasoning)| reasoning)
-        .unwrap_or("");
+        .unwrap_or(reasoning_prefix);
     let answer = content[(end_idx + "</think>".len())..].trim_start_matches('\n');
     (reasoning.trim_matches('\n'), answer)
 }
@@ -1223,6 +1224,48 @@ mod tests {
         .expect("prompt should render");
 
         assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    }
+
+    #[test]
+    fn split_assistant_reasoning_handles_implicit_open_pattern() {
+        assert_eq!(
+            split_assistant_reasoning("reasoning first</think>\nFinal answer"),
+            ("reasoning first", "Final answer")
+        );
+    }
+
+    #[test]
+    fn render_prompt_strips_prior_assistant_reasoning_from_history() {
+        let config = ChatGenerationConfig {
+            request: ChatRequestConfig {
+                enable_thinking: Some(true),
+                tools: Vec::new(),
+                media_inputs: Vec::new(),
+            },
+            ..ChatGenerationConfig::default()
+        };
+        let prompt = render_prompt(
+            &[
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: "First question".to_string(),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: "reasoning first</think>\nFinal answer".to_string(),
+                },
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: "Follow-up".to_string(),
+                },
+            ],
+            &config,
+            true,
+        )
+        .expect("prompt should render");
+
+        assert!(prompt.contains("<|im_start|>assistant\nFinal answer<|im_end|>\n"));
+        assert!(!prompt.contains("reasoning first"));
     }
 
     #[test]
