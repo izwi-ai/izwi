@@ -91,7 +91,7 @@ impl ConvSubsamplingDw {
         )?;
 
         let mut dw_stride_cfg = stride_cfg;
-        dw_stride_cfg.groups = cfg.feed_forward_length / 2;
+        dw_stride_cfg.groups = cfg.subsampling_channels;
         let conv2 = load_conv2d_any(
             loader,
             device,
@@ -248,11 +248,13 @@ impl ConformerLayer {
             cfg.embedding_length,
             cfg.attention_layer_norm_epsilon,
             &[
+                format!("a.blk.{idx}.ln1.weight"),
                 format!("a.blk.{idx}.attn_norm.weight"),
                 format!("a.blk.{idx}.attention_norm.weight"),
                 format!("audio_encoder.layers.{idx}.attn_norm.weight"),
             ],
             &[
+                format!("a.blk.{idx}.ln1.bias"),
                 format!("a.blk.{idx}.attn_norm.bias"),
                 format!("a.blk.{idx}.attention_norm.bias"),
                 format!("audio_encoder.layers.{idx}.attn_norm.bias"),
@@ -298,10 +300,12 @@ impl ConformerLayer {
             cfg.embedding_length,
             cfg.attention_layer_norm_epsilon,
             &[
+                format!("a.blk.{idx}.ln2.weight"),
                 format!("a.blk.{idx}.final_norm.weight"),
                 format!("audio_encoder.layers.{idx}.final_norm.weight"),
             ],
             &[
+                format!("a.blk.{idx}.ln2.bias"),
                 format!("a.blk.{idx}.final_norm.bias"),
                 format!("audio_encoder.layers.{idx}.final_norm.bias"),
             ],
@@ -573,11 +577,13 @@ impl RelPosSelfAttention {
             cfg.embedding_length,
             cfg.embedding_length,
             &[
+                format!("a.blk.{idx}.attn_out.weight"),
                 format!("a.blk.{idx}.attn_output.weight"),
                 format!("a.blk.{idx}.attn_o.weight"),
                 format!("audio_encoder.layers.{idx}.attn.out_proj.weight"),
             ],
             &[
+                format!("a.blk.{idx}.attn_out.bias"),
                 format!("a.blk.{idx}.attn_output.bias"),
                 format!("a.blk.{idx}.attn_o.bias"),
                 format!("audio_encoder.layers.{idx}.attn.out_proj.bias"),
@@ -658,12 +664,12 @@ impl RelPosSelfAttention {
             .transpose(1, 2)?
             .contiguous()?;
 
-        let pos_bias_u =
-            self.pos_bias_u
-                .reshape((1, self.n_heads, 1, self.head_dim))?;
-        let pos_bias_v =
-            self.pos_bias_v
-                .reshape((1, self.n_heads, 1, self.head_dim))?;
+        let pos_bias_u = self
+            .pos_bias_u
+            .reshape((1, self.n_heads, 1, self.head_dim))?;
+        let pos_bias_v = self
+            .pos_bias_v
+            .reshape((1, self.n_heads, 1, self.head_dim))?;
 
         let q_u = q.broadcast_add(&pos_bias_u)?;
         let q_v = q.broadcast_add(&pos_bias_v)?;
@@ -676,10 +682,11 @@ impl RelPosSelfAttention {
             .affine(1.0 / (self.head_dim as f64).sqrt(), 0.0)?;
         let attn = ops::softmax(&scores, 3)?;
         let out = attn.matmul(&v)?;
-        let out = out
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((batch, seq_len, self.n_heads * self.head_dim))?;
+        let out = out.transpose(1, 2)?.contiguous()?.reshape((
+            batch,
+            seq_len,
+            self.n_heads * self.head_dim,
+        ))?;
 
         self.out_proj.forward(&out).map_err(Error::from)
     }
@@ -773,7 +780,9 @@ impl AffineNorm1d {
         let channels = self.weight.dim(0)?;
         let weight = self.weight.reshape((1, channels, 1))?;
         let bias = self.bias.reshape((1, channels, 1))?;
-        x.broadcast_mul(&weight)?.broadcast_add(&bias).map_err(Error::from)
+        x.broadcast_mul(&weight)?
+            .broadcast_add(&bias)
+            .map_err(Error::from)
     }
 }
 
@@ -786,8 +795,11 @@ fn load_layer_norm_any(
     bias_names: &[String],
 ) -> Result<LayerNorm> {
     let weight = load_vector_any(loader, device, weight_names, dim)?;
-    let bias = load_optional_vector_any(loader, device, bias_names, dim)?
-        .unwrap_or(Tensor::zeros(dim, DType::F32, device)?);
+    let bias = load_optional_vector_any(loader, device, bias_names, dim)?.unwrap_or(Tensor::zeros(
+        dim,
+        DType::F32,
+        device,
+    )?);
     Ok(LayerNorm::new(weight, bias, eps))
 }
 
@@ -799,17 +811,43 @@ fn load_linear_any(
     weight_names: &[String],
     bias_names: &[String],
 ) -> Result<Linear> {
-    let mut weight = load_tensor_any(loader, device, weight_names, DType::F32)?;
-    let dims = weight.dims2()?;
-    if dims == (out_dim, in_dim) {
-        // already in Candle layout.
-    } else if dims == (in_dim, out_dim) {
-        weight = weight.transpose(0, 1)?.contiguous()?;
-    } else {
+    let mut selected = None;
+    let mut mismatches = Vec::new();
+    for name in weight_names {
+        let Some(shape) = loader.tensor_shape(name) else {
+            continue;
+        };
+        match shape.as_slice() {
+            [rows, cols] if (*rows, *cols) == (out_dim, in_dim) => {
+                selected = Some((name.clone(), false));
+                break;
+            }
+            [rows, cols] if (*rows, *cols) == (in_dim, out_dim) => {
+                selected = Some((name.clone(), true));
+                break;
+            }
+            [rows, cols] => mismatches.push(format!("{name}: got ({rows}, {cols})")),
+            _ => mismatches.push(format!("{name}: expected rank 2, found shape {shape:?}")),
+        }
+    }
+
+    let Some((selected_name, transpose)) = selected else {
+        if mismatches.is_empty() {
+            return Err(Error::ModelLoadError(format!(
+                "Missing GGUF tensor; tried {}",
+                weight_names.join(" | ")
+            )));
+        }
         return Err(Error::ModelLoadError(format!(
-            "Linear weight shape mismatch for {}: got {dims:?}, expected ({out_dim}, {in_dim})",
-            weight_names.join(" | ")
+            "Linear weight shape mismatch for {}: expected ({out_dim}, {in_dim}), candidates {}",
+            weight_names.join(" | "),
+            mismatches.join("; ")
         )));
+    };
+
+    let mut weight = loader.load_tensor(&selected_name, DType::F32, device)?;
+    if transpose {
+        weight = weight.transpose(0, 1)?.contiguous()?;
     }
 
     let bias = load_optional_vector_any(loader, device, bias_names, out_dim)?;
@@ -826,19 +864,46 @@ fn load_conv2d_any(
     weight_names: &[String],
     bias_names: &[String],
 ) -> Result<Conv2d> {
-    let mut weight = load_tensor_any(loader, device, weight_names, DType::F32)?;
     let in_per_group = in_channels / cfg.groups.max(1);
     let expected_oihw = (out_channels, in_per_group, kernel_size, kernel_size);
     let expected_ohwi = (out_channels, kernel_size, kernel_size, in_per_group);
 
-    let dims = weight.dims4()?;
-    if dims == expected_ohwi {
-        weight = weight.permute((0, 3, 1, 2))?.contiguous()?;
-    } else if dims != expected_oihw {
+    let mut selected = None;
+    let mut mismatches = Vec::new();
+    for name in weight_names {
+        let Some(shape) = loader.tensor_shape(name) else {
+            continue;
+        };
+        match shape.as_slice() {
+            [o, i, kh, kw] if (*o, *i, *kh, *kw) == expected_oihw => {
+                selected = Some((name.clone(), false));
+                break;
+            }
+            [o, kh, kw, i] if (*o, *kh, *kw, *i) == expected_ohwi => {
+                selected = Some((name.clone(), true));
+                break;
+            }
+            _ => mismatches.push(format!("{name}: got {shape:?}")),
+        }
+    }
+
+    let Some((selected_name, permute_ohwi)) = selected else {
+        if mismatches.is_empty() {
+            return Err(Error::ModelLoadError(format!(
+                "Missing GGUF tensor; tried {}",
+                weight_names.join(" | ")
+            )));
+        }
         return Err(Error::ModelLoadError(format!(
-            "Conv2d weight shape mismatch for {}: got {dims:?}, expected OIHW={expected_oihw:?} or OHWI={expected_ohwi:?}",
-            weight_names.join(" | ")
+            "Conv2d weight shape mismatch for {}: expected OIHW={expected_oihw:?} or OHWI={expected_ohwi:?}, candidates {}",
+            weight_names.join(" | "),
+            mismatches.join("; ")
         )));
+    };
+
+    let mut weight = loader.load_tensor(&selected_name, DType::F32, device)?;
+    if permute_ohwi {
+        weight = weight.permute((0, 3, 1, 2))?.contiguous()?;
     }
 
     let bias = load_optional_vector_any(loader, device, bias_names, out_channels)?;
@@ -859,34 +924,69 @@ fn load_conv1d_any(
     let expected_oik = (out_channels, in_per_group, kernel_size);
     let expected_oki = (out_channels, kernel_size, in_per_group);
 
-    let mut weight = load_tensor_any(loader, device, weight_names, DType::F32)?;
-    match weight.rank() {
-        3 => {
-            let dims = weight.dims3()?;
-            if dims == expected_oki {
-                weight = weight.permute((0, 2, 1))?.contiguous()?;
-            } else if dims != expected_oik {
-                return Err(Error::ModelLoadError(format!(
-                    "Conv1d weight shape mismatch for {}: got {dims:?}, expected OIK={expected_oik:?} or OKI={expected_oki:?}",
-                    weight_names.join(" | ")
-                )));
+    enum Conv1dLayout {
+        Oik,
+        Oki,
+        Matrix,
+        DepthwiseMatrix,
+    }
+
+    let mut selected = None;
+    let mut mismatches = Vec::new();
+    for name in weight_names {
+        let Some(shape) = loader.tensor_shape(name) else {
+            continue;
+        };
+        match shape.as_slice() {
+            [o, i, k] if (*o, *i, *k) == expected_oik => {
+                selected = Some((name.clone(), Conv1dLayout::Oik));
+                break;
             }
-        }
-        2 => {
-            let dims = weight.dims2()?;
-            if kernel_size != 1 || dims != (out_channels, in_per_group) {
-                return Err(Error::ModelLoadError(format!(
-                    "Conv1d 2D weight shape mismatch for {}: got {dims:?}, expected ({out_channels}, {in_per_group})",
-                    weight_names.join(" | ")
-                )));
+            [o, k, i] if (*o, *k, *i) == expected_oki => {
+                selected = Some((name.clone(), Conv1dLayout::Oki));
+                break;
             }
-            weight = weight.unsqueeze(2)?;
+            [o, i] if kernel_size == 1 && (*o, *i) == (out_channels, in_per_group) => {
+                selected = Some((name.clone(), Conv1dLayout::Matrix));
+                break;
+            }
+            [o, k] if in_per_group == 1 && (*o, *k) == (out_channels, kernel_size) => {
+                selected = Some((name.clone(), Conv1dLayout::DepthwiseMatrix));
+                break;
+            }
+            [..] => mismatches.push(format!("{name}: got {shape:?}")),
         }
-        rank => {
+    }
+
+    let Some((selected_name, layout)) = selected else {
+        if mismatches.is_empty() {
             return Err(Error::ModelLoadError(format!(
-                "Conv1d weight rank mismatch for {}: expected 2 or 3, got {rank}",
+                "Missing GGUF tensor; tried {}",
                 weight_names.join(" | ")
             )));
+        }
+        return Err(Error::ModelLoadError(format!(
+            "Conv1d weight shape mismatch for {}: expected OIK={expected_oik:?}, OKI={expected_oki:?}, matrix=({}, {}), or depthwise-matrix=({}, {}), candidates {}",
+            weight_names.join(" | "),
+            out_channels,
+            in_per_group,
+            out_channels,
+            kernel_size,
+            mismatches.join("; ")
+        )));
+    };
+
+    let mut weight = loader.load_tensor(&selected_name, DType::F32, device)?;
+    match layout {
+        Conv1dLayout::Oik => {}
+        Conv1dLayout::Oki => {
+            weight = weight.permute((0, 2, 1))?.contiguous()?;
+        }
+        Conv1dLayout::Matrix => {
+            weight = weight.unsqueeze(2)?;
+        }
+        Conv1dLayout::DepthwiseMatrix => {
+            weight = weight.unsqueeze(1)?;
         }
     }
 
@@ -900,14 +1000,35 @@ fn load_vector_any(
     names: &[String],
     expected_len: usize,
 ) -> Result<Tensor> {
-    let tensor = load_tensor_any(loader, device, names, DType::F32)?;
-    let len = tensor.elem_count();
-    if len != expected_len {
-        return Err(Error::ModelLoadError(format!(
-            "Vector shape mismatch for {}: expected {expected_len} values, found {len}",
-            names.join(" | ")
-        )));
+    let mut selected = None;
+    let mut mismatches = Vec::new();
+    for name in names {
+        let Some(shape) = loader.tensor_shape(name) else {
+            continue;
+        };
+        let len = shape_elem_count(&shape);
+        if len == expected_len {
+            selected = Some(name.clone());
+            break;
+        }
+        mismatches.push(format!("{name}: found {len} values from shape {shape:?}"));
     }
+
+    let Some(selected_name) = selected else {
+        if mismatches.is_empty() {
+            return Err(Error::ModelLoadError(format!(
+                "Missing GGUF tensor; tried {}",
+                names.join(" | ")
+            )));
+        }
+        return Err(Error::ModelLoadError(format!(
+            "Vector shape mismatch for {}: expected {expected_len} values, candidates {}",
+            names.join(" | "),
+            mismatches.join("; ")
+        )));
+    };
+
+    let tensor = loader.load_tensor(&selected_name, DType::F32, device)?;
     if tensor.rank() == 1 {
         Ok(tensor)
     } else {
@@ -921,11 +1042,24 @@ fn load_optional_vector_any(
     names: &[String],
     expected_len: usize,
 ) -> Result<Option<Tensor>> {
+    let mut mismatches = Vec::new();
     for name in names {
-        if loader.has_tensor(name) {
+        let Some(shape) = loader.tensor_shape(name) else {
+            continue;
+        };
+        let len = shape_elem_count(&shape);
+        if len == expected_len {
             return load_vector_any(loader, device, std::slice::from_ref(name), expected_len)
                 .map(Some);
         }
+        mismatches.push(format!("{name}: found {len} values from shape {shape:?}"));
+    }
+    if !mismatches.is_empty() {
+        return Err(Error::ModelLoadError(format!(
+            "Vector shape mismatch for {}: expected {expected_len} values, candidates {}",
+            names.join(" | "),
+            mismatches.join("; ")
+        )));
     }
     Ok(None)
 }
@@ -945,6 +1079,10 @@ fn load_tensor_any(
         "Missing GGUF tensor; tried {}",
         names.join(" | ")
     )))
+}
+
+fn shape_elem_count(shape: &[usize]) -> usize {
+    shape.iter().copied().product()
 }
 
 fn build_rel_positional_embedding(len: usize, d_model: usize, device: &Device) -> Result<Tensor> {
@@ -978,7 +1116,8 @@ fn rel_shift(x: &Tensor) -> Result<Tensor> {
     let x = x.pad_with_zeros(3, 1, 0)?;
     let x = x.reshape((batch, heads, pos_len + 1, q_len))?;
     let x = x.narrow(2, 1, pos_len)?;
-    x.reshape((batch, heads, q_len, pos_len)).map_err(Error::from)
+    x.reshape((batch, heads, q_len, pos_len))
+        .map_err(Error::from)
 }
 
 fn swish(x: &Tensor) -> Result<Tensor> {
@@ -1008,8 +1147,58 @@ pub fn subsampled_len_3x(mut len: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_rel_positional_embedding, rel_shift, subsampled_len_3x};
-    use candle_core::{Device, Tensor};
+    use std::fs::{self, File};
+    use std::path::{Path, PathBuf};
+
+    use candle_core::quantized::gguf_file::{write as write_gguf, Value as GgufValue};
+    use candle_core::quantized::{GgmlDType, QTensor};
+    use candle_core::{Device, Module, Tensor};
+    use uuid::Uuid;
+
+    use super::{
+        build_rel_positional_embedding, load_linear_any, rel_shift, subsampled_len_3x,
+        Lfm25AudioEncoder,
+    };
+    use crate::models::architectures::lfm25_audio::config::parse_audio_encoder_config;
+    use crate::models::shared::weights::gguf::GgufLoader;
+
+    fn make_temp_dir() -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("izwi-lfm25-audio-conformer-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn write_test_gguf(
+        path: &Path,
+        metadata: Vec<(&'static str, GgufValue)>,
+        tensors: Vec<(&'static str, Tensor)>,
+    ) {
+        let quantized = tensors
+            .into_iter()
+            .map(|(name, tensor)| {
+                Ok::<_, candle_core::Error>((name, QTensor::quantize(&tensor, GgmlDType::F32)?))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("quantize tensors");
+        let metadata_refs = metadata
+            .iter()
+            .map(|(name, value)| (*name, value))
+            .collect::<Vec<_>>();
+        let tensor_refs = quantized
+            .iter()
+            .map(|(name, tensor)| (*name, tensor))
+            .collect::<Vec<_>>();
+        let mut file = File::create(path).expect("create gguf");
+        write_gguf(&mut file, &metadata_refs, &tensor_refs).expect("write gguf");
+    }
+
+    fn local_model_dir(name: &str) -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        PathBuf::from(home)
+            .join("Library/Application Support/izwi/models")
+            .join(name)
+    }
 
     #[test]
     fn subsampled_len_matches_three_stride_two_layers() {
@@ -1039,5 +1228,66 @@ mod tests {
             .unwrap();
         let shifted = rel_shift(&x).expect("rel shift");
         assert_eq!(shifted.dims4().unwrap(), (1, 1, 3, 5));
+    }
+
+    #[test]
+    fn load_linear_any_skips_incompatible_alias_shapes() {
+        let dir = make_temp_dir();
+        let path = dir.join("linear.gguf");
+        write_test_gguf(
+            &path,
+            vec![],
+            vec![
+                (
+                    "wrong.weight",
+                    Tensor::zeros((32, 32), candle_core::DType::F32, &Device::Cpu)
+                        .expect("wrong weight"),
+                ),
+                (
+                    "right.weight",
+                    Tensor::zeros((64, 32), candle_core::DType::F32, &Device::Cpu)
+                        .expect("right weight"),
+                ),
+                (
+                    "right.bias",
+                    Tensor::zeros(64, candle_core::DType::F32, &Device::Cpu).expect("right bias"),
+                ),
+            ],
+        );
+
+        let loader = GgufLoader::from_path(&path).expect("load gguf");
+        let linear = load_linear_any(
+            &loader,
+            &Device::Cpu,
+            32,
+            64,
+            &["wrong.weight".to_string(), "right.weight".to_string()],
+            &["wrong.bias".to_string(), "right.bias".to_string()],
+        )
+        .expect("load linear");
+
+        let input =
+            Tensor::zeros((1, 32), candle_core::DType::F32, &Device::Cpu).expect("input tensor");
+        let output = linear.forward(&input).expect("forward");
+        assert_eq!(output.dims2().unwrap(), (1, 64));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_local_lfm25_audio_encoder_smoke_if_available() {
+        let model_dir = local_model_dir("LFM2.5-Audio-1.5B-GGUF");
+        let path = model_dir.join("mmproj-LFM2.5-Audio-1.5B-Q4_0.gguf");
+        if !path.exists() {
+            return;
+        }
+
+        let loader = GgufLoader::from_path(&path).expect("load mmproj");
+        let config = parse_audio_encoder_config(&loader).expect("parse encoder config");
+        assert_eq!(config.embedding_length, 512);
+        assert_eq!(config.feed_forward_length, 2048);
+
+        let _encoder =
+            Lfm25AudioEncoder::load(&loader, config, &Device::Cpu).expect("load audio encoder");
     }
 }

@@ -1039,8 +1039,16 @@ mod tests {
     #[test]
     fn lfm25_audio_variant_is_enabled() {
         let variant = ModelVariant::Lfm25Audio15BGguf;
-        assert!(variant.is_enabled(), "{} should be enabled", variant.dir_name());
-        assert!(variant.is_audio_chat(), "{} should be audio-chat", variant.dir_name());
+        assert!(
+            variant.is_enabled(),
+            "{} should be enabled",
+            variant.dir_name()
+        );
+        assert!(
+            variant.is_audio_chat(),
+            "{} should be audio-chat",
+            variant.dir_name()
+        );
         assert!(variant.is_gguf(), "{} should be gguf", variant.dir_name());
     }
 

@@ -1122,10 +1122,7 @@ mod tests {
         let merged = EngineCore::merge_executor_output(Some(first), second);
         let audio = merged.audio.expect("merged audio");
         assert_eq!(audio.samples, vec![0.1, 0.2, 0.3]);
-        assert_eq!(
-            merged.input_transcription.as_deref(),
-            Some("hello there")
-        );
+        assert_eq!(merged.input_transcription.as_deref(), Some("hello there"));
         assert_eq!(merged.text.as_deref(), Some("hello world"));
         assert_eq!(merged.tokens_processed, 2);
         assert_eq!(merged.tokens_generated, 2);

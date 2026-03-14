@@ -9,9 +9,7 @@ use crate::error::{Error, Result};
 use crate::models::shared::weights::gguf::GgufLoader;
 
 use super::backbone::QuantizedLfm2Backbone;
-use super::config::{
-    Lfm2BackboneConfig, Lfm25AudioDecoderConfig, LFM25_AUDIO_AUDIO_VOCAB_SIZE,
-};
+use super::config::{Lfm25AudioDecoderConfig, Lfm2BackboneConfig, LFM25_AUDIO_AUDIO_VOCAB_SIZE};
 
 pub struct Lfm25AudioDetokenizer {
     fused_embedding: Embedding,
@@ -26,19 +24,22 @@ pub struct Lfm25AudioDetokenizer {
 
 impl Lfm25AudioDetokenizer {
     pub fn load(
-        loader: &GgufLoader,
+        backbone_loader: &GgufLoader,
+        decoder_loader: &GgufLoader,
         backbone_config: Lfm2BackboneConfig,
         decoder_config: &Lfm25AudioDecoderConfig,
         device: &Device,
     ) -> Result<Self> {
         let fused_embedding = load_embedding_any(
-            loader,
+            decoder_loader,
             device,
-            &["emb.emb.weight".to_string()],
+            &[
+                "emb.emb.weight".to_string(),
+            ],
         )?;
-        let backbone = QuantizedLfm2Backbone::load(loader, backbone_config, device)?;
+        let backbone = QuantizedLfm2Backbone::load(backbone_loader, backbone_config, device)?;
         let istft_window = load_vector_any(
-            loader,
+            decoder_loader,
             device,
             &["istft.window".to_string()],
             decoder_config.output_n_fft,
@@ -145,13 +146,17 @@ impl Lfm25AudioDetokenizer {
         }
 
         let log_abs = projected.narrow(1, 0, freq_bins)?.to_vec2::<f32>()?;
-        let angle = projected.narrow(1, freq_bins, freq_bins)?.to_vec2::<f32>()?;
+        let angle = projected
+            .narrow(1, freq_bins, freq_bins)?
+            .to_vec2::<f32>()?;
 
         let mut spectrum = vec![vec![Complex::<f32>::new(0.0, 0.0); frames]; freq_bins];
         for frame_idx in 0..frames {
             for freq_idx in 0..freq_bins {
-                spectrum[freq_idx][frame_idx] =
-                    Complex::from_polar(log_abs[frame_idx][freq_idx].exp(), angle[frame_idx][freq_idx]);
+                spectrum[freq_idx][frame_idx] = Complex::from_polar(
+                    log_abs[frame_idx][freq_idx].exp(),
+                    angle[frame_idx][freq_idx],
+                );
             }
         }
 
@@ -184,7 +189,8 @@ impl Lfm25AudioDetokenizer {
 
             ifft.process(&mut full);
             for sample_idx in 0..self.n_fft {
-                let sample = full[sample_idx].re / self.n_fft as f32 * self.istft_window[sample_idx];
+                let sample =
+                    full[sample_idx].re / self.n_fft as f32 * self.istft_window[sample_idx];
                 let out_idx = frame_idx * self.hop_length + sample_idx;
                 output[out_idx] += sample;
                 envelope[out_idx] += self.istft_window[sample_idx] * self.istft_window[sample_idx];

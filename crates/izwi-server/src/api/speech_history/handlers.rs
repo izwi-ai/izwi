@@ -337,8 +337,9 @@ async fn create_record(
             .await;
     }
 
-    let record = synthesize_record_internal(&state, &ctx, req, route_kind, variant, model_id, input_text)
-        .await?;
+    let record =
+        synthesize_record_internal(&state, &ctx, req, route_kind, variant, model_id, input_text)
+            .await?;
 
     Ok(Json(record).into_response())
 }
@@ -373,8 +374,12 @@ async fn synthesize_record_internal(
     model_id: String,
     input_text: String,
 ) -> Result<SpeechHistoryRecord, ApiError> {
-    let generation_request =
-        build_generation_request(req.clone(), ctx.correlation_id.clone(), input_text.clone(), false);
+    let generation_request = build_generation_request(
+        req.clone(),
+        ctx.correlation_id.clone(),
+        input_text.clone(),
+        false,
+    );
     let planned_request_count =
         expand_generation_requests_for_long_form(&generation_request, variant).len();
 

@@ -258,11 +258,8 @@ mod tests {
 
     #[test]
     fn non_qwen_variant_stays_single_chunk() {
-        let chunks = split_tts_text_for_long_form(
-            ModelVariant::Kokoro82M,
-            0,
-            "Sentence one. Sentence two.",
-        );
+        let chunks =
+            split_tts_text_for_long_form(ModelVariant::Kokoro82M, 0, "Sentence one. Sentence two.");
         assert_eq!(chunks.len(), 1);
     }
 

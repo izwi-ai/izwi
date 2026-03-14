@@ -31,8 +31,7 @@ impl Lfm25TextTokenizer {
         let tokens = required_string_array(loader, "tokenizer.ggml.tokens")?;
         let merges = required_string_array(loader, "tokenizer.ggml.merges")?;
         let pre_tokenizer = loader.get_metadata_string("tokenizer.ggml.pre");
-        let inner =
-            Tokenizer::from_gguf_bpe(&tokens, &merges, pre_tokenizer.as_deref(), false)?;
+        let inner = Tokenizer::from_gguf_bpe(&tokens, &merges, pre_tokenizer.as_deref(), false)?;
         let vocab_size = inner.vocab_size();
 
         let mut token_to_id = HashMap::with_capacity(tokens.len());

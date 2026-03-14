@@ -121,11 +121,7 @@ impl Lfm25AudioHead {
             .squeeze(0)?
             .squeeze(0)?; // [C, D]
 
-        let mut next_embed = Tensor::zeros(
-            self.depthformer_dim,
-            hidden.dtype(),
-            hidden.device(),
-        )?;
+        let mut next_embed = Tensor::zeros(self.depthformer_dim, hidden.dtype(), hidden.device())?;
         let mut caches = self.depthformer.empty_cache();
         let mut tokens = Vec::with_capacity(self.codebooks);
 
@@ -192,6 +188,7 @@ impl DepthformerBlock {
             &[
                 format!("audio_head.depthformer.blocks.{idx}.attn_norm.weight"),
                 format!("depthformer.blocks.{idx}.attn_norm.weight"),
+                format!("depthformer.layers.{idx}.operator_norm.weight"),
             ],
         )?;
         let ffn_norm = load_rms_norm_any(
@@ -200,6 +197,7 @@ impl DepthformerBlock {
             &[
                 format!("audio_head.depthformer.blocks.{idx}.ffn_norm.weight"),
                 format!("depthformer.blocks.{idx}.ffn_norm.weight"),
+                format!("depthformer.layers.{idx}.ffn_norm.weight"),
             ],
         )?;
         let attn = DepthAttention::load(loader, device, idx, dim)?;
@@ -212,11 +210,7 @@ impl DepthformerBlock {
         })
     }
 
-    fn forward_cached(
-        &self,
-        x: &Tensor,
-        cache: &mut Option<(Tensor, Tensor)>,
-    ) -> Result<Tensor> {
+    fn forward_cached(&self, x: &Tensor, cache: &mut Option<(Tensor, Tensor)>) -> Result<Tensor> {
         let hidden = self.attn.forward(&self.attn_norm.forward(x)?, cache)?;
         let hidden = hidden.broadcast_add(x)?;
         let ffn = self.mlp.forward(&self.ffn_norm.forward(&hidden)?)?;
@@ -225,9 +219,7 @@ impl DepthformerBlock {
 }
 
 struct DepthAttention {
-    q_proj: QLinear,
-    k_proj: QLinear,
-    v_proj: QLinear,
+    qkv: DepthQkvProjection,
     o_proj: QLinear,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
@@ -235,64 +227,74 @@ struct DepthAttention {
     sin: Tensor,
 }
 
+enum DepthQkvProjection {
+    Packed(QLinear),
+    Separate {
+        q_proj: QLinear,
+        k_proj: QLinear,
+        v_proj: QLinear,
+    },
+}
+
 impl DepthAttention {
     fn load(loader: &GgufLoader, device: &Device, idx: usize, dim: usize) -> Result<Self> {
-        let q_proj = QLinear::load(
-            loader,
-            device,
-            &[format!(
-                "audio_head.depthformer.blocks.{idx}.attn.q_proj.weight"
-            )],
-            &[],
-        )?;
-        let k_proj = QLinear::load(
-            loader,
-            device,
-            &[format!(
-                "audio_head.depthformer.blocks.{idx}.attn.k_proj.weight"
-            )],
-            &[],
-        )?;
-        let v_proj = QLinear::load(
-            loader,
-            device,
-            &[format!(
-                "audio_head.depthformer.blocks.{idx}.attn.v_proj.weight"
-            )],
-            &[],
-        )?;
+        let packed_qkv_names = vec![
+            format!("audio_head.depthformer.blocks.{idx}.attn.qkv_proj.weight"),
+            format!("depthformer.layers.{idx}.operator.qkv_proj.weight"),
+        ];
+        let qkv = if packed_qkv_names.iter().any(|name| loader.has_tensor(name)) {
+            DepthQkvProjection::Packed(QLinear::load(loader, device, &packed_qkv_names, &[])?)
+        } else {
+            DepthQkvProjection::Separate {
+                q_proj: QLinear::load(
+                    loader,
+                    device,
+                    &[format!("audio_head.depthformer.blocks.{idx}.attn.q_proj.weight")],
+                    &[],
+                )?,
+                k_proj: QLinear::load(
+                    loader,
+                    device,
+                    &[format!("audio_head.depthformer.blocks.{idx}.attn.k_proj.weight")],
+                    &[],
+                )?,
+                v_proj: QLinear::load(
+                    loader,
+                    device,
+                    &[format!("audio_head.depthformer.blocks.{idx}.attn.v_proj.weight")],
+                    &[],
+                )?,
+            }
+        };
         let o_proj = QLinear::load(
             loader,
             device,
-            &[format!(
-                "audio_head.depthformer.blocks.{idx}.attn.o_proj.weight"
-            )],
+            &[
+                format!("audio_head.depthformer.blocks.{idx}.attn.o_proj.weight"),
+                format!("depthformer.layers.{idx}.operator.out_proj.weight"),
+            ],
             &[],
         )?;
         let q_norm = load_rms_norm_any(
             loader,
             device,
-            &[format!(
-                "audio_head.depthformer.blocks.{idx}.attn.q_norm.weight"
-            )],
+            &[
+                format!("audio_head.depthformer.blocks.{idx}.attn.q_norm.weight"),
+                format!("depthformer.layers.{idx}.operator.attention.q_layernorm.weight"),
+            ],
         )?;
         let k_norm = load_rms_norm_any(
             loader,
             device,
-            &[format!(
-                "audio_head.depthformer.blocks.{idx}.attn.k_norm.weight"
-            )],
+            &[
+                format!("audio_head.depthformer.blocks.{idx}.attn.k_norm.weight"),
+                format!("depthformer.layers.{idx}.operator.attention.k_layernorm.weight"),
+            ],
         )?;
-        let (cos, sin) = precompute_freqs(
-            dim / DEPTHFORMER_HEADS,
-            DEPTHFORMER_ROPE_BASE,
-            32,
-            device,
-        )?;
+        let (cos, sin) =
+            precompute_freqs(dim / DEPTHFORMER_HEADS, DEPTHFORMER_ROPE_BASE, 32, device)?;
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv,
             o_proj,
             q_norm,
             k_norm,
@@ -301,29 +303,68 @@ impl DepthAttention {
         })
     }
 
-    fn forward(
-        &self,
-        hidden: &Tensor,
-        cache: &mut Option<(Tensor, Tensor)>,
-    ) -> Result<Tensor> {
+    fn forward(&self, hidden: &Tensor, cache: &mut Option<(Tensor, Tensor)>) -> Result<Tensor> {
         let (batch, seq_len, hidden_size) = hidden.dims3()?;
+        let head_dim = hidden_size / DEPTHFORMER_HEADS;
+        let kv_hidden = DEPTHFORMER_KV_HEADS * head_dim;
+
+        let (q_hidden, k_hidden, v_hidden) = match &self.qkv {
+            DepthQkvProjection::Packed(qkv_proj) => {
+                let qkv = qkv_proj.forward(hidden)?;
+                let total = qkv.dim(2)?;
+                let expected = hidden_size + (2 * kv_hidden);
+                if total != expected {
+                    return Err(Error::ModelLoadError(format!(
+                        "Packed depthformer qkv projection has unexpected width: got {total}, expected {expected}"
+                    )));
+                }
+                let q = qkv.i((.., .., ..hidden_size))?.contiguous()?;
+                let k = qkv
+                    .i((.., .., hidden_size..hidden_size + kv_hidden))?
+                    .contiguous()?;
+                let v = qkv.i((.., .., hidden_size + kv_hidden..))?.contiguous()?;
+                (q, k, v)
+            }
+            DepthQkvProjection::Separate {
+                q_proj,
+                k_proj,
+                v_proj,
+            } => (
+                q_proj.forward(hidden)?,
+                k_proj.forward(hidden)?,
+                v_proj.forward(hidden)?,
+            ),
+        };
 
         let q = self
-            .q_proj
-            .forward(hidden)?
-            .reshape((batch, seq_len, DEPTHFORMER_HEADS, hidden_size / DEPTHFORMER_HEADS))?
+            .q_norm
+            .forward(&q_hidden)?
+            .reshape((
+                batch,
+                seq_len,
+                DEPTHFORMER_HEADS,
+                head_dim,
+            ))?
             .transpose(1, 2)?
             .contiguous()?;
         let k = self
-            .k_proj
-            .forward(hidden)?
-            .reshape((batch, seq_len, DEPTHFORMER_KV_HEADS, hidden_size / DEPTHFORMER_HEADS))?
+            .k_norm
+            .forward(&k_hidden)?
+            .reshape((
+                batch,
+                seq_len,
+                DEPTHFORMER_KV_HEADS,
+                head_dim,
+            ))?
             .transpose(1, 2)?
             .contiguous()?;
-        let v = self
-            .v_proj
-            .forward(hidden)?
-            .reshape((batch, seq_len, DEPTHFORMER_KV_HEADS, hidden_size / DEPTHFORMER_HEADS))?
+        let v = v_hidden
+            .reshape((
+                batch,
+                seq_len,
+                DEPTHFORMER_KV_HEADS,
+                head_dim,
+            ))?
             .transpose(1, 2)?
             .contiguous()?;
 
@@ -331,16 +372,11 @@ impl DepthAttention {
             .as_ref()
             .map(|(keys, _values)| keys.dim(2).unwrap_or(0))
             .unwrap_or(0);
-        let q = self.q_norm.forward(&q)?;
-        let k = self.k_norm.forward(&k)?;
         let q = apply_rotary_emb(&q, &self.cos, &self.sin, index_pos)?;
         let k = apply_rotary_emb(&k, &self.cos, &self.sin, index_pos)?;
 
-        let (all_k, all_v) = if let Some((old_k, old_v)) = cache.as_ref() {
-            (
-                Tensor::cat(&[old_k, &k], 2)?,
-                Tensor::cat(&[old_v, &v], 2)?,
-            )
+        let (all_k, all_v): (Tensor, Tensor) = if let Some((old_k, old_v)) = cache.as_ref() {
+            (Tensor::cat(&[old_k, &k], 2)?, Tensor::cat(&[old_v, &v], 2)?)
         } else {
             (k, v)
         };
@@ -372,19 +408,28 @@ impl DepthMlp {
             w1: QLinear::load(
                 loader,
                 device,
-                &[format!("audio_head.depthformer.blocks.{idx}.ffn.w1.weight")],
+                &[
+                    format!("audio_head.depthformer.blocks.{idx}.ffn.w1.weight"),
+                    format!("depthformer.layers.{idx}.feed_forward.w1.weight"),
+                ],
                 &[],
             )?,
             w2: QLinear::load(
                 loader,
                 device,
-                &[format!("audio_head.depthformer.blocks.{idx}.ffn.w2.weight")],
+                &[
+                    format!("audio_head.depthformer.blocks.{idx}.ffn.w2.weight"),
+                    format!("depthformer.layers.{idx}.feed_forward.w2.weight"),
+                ],
                 &[],
             )?,
             w3: QLinear::load(
                 loader,
                 device,
-                &[format!("audio_head.depthformer.blocks.{idx}.ffn.w3.weight")],
+                &[
+                    format!("audio_head.depthformer.blocks.{idx}.ffn.w3.weight"),
+                    format!("depthformer.layers.{idx}.feed_forward.w3.weight"),
+                ],
                 &[],
             )?,
         })
@@ -490,8 +535,11 @@ fn load_embedding_any(loader: &GgufLoader, device: &Device, names: &[String]) ->
 }
 
 fn load_rms_norm_any(loader: &GgufLoader, device: &Device, names: &[String]) -> Result<RmsNorm> {
-    RmsNorm::from_qtensor(load_qtensor_any(loader, device, names)?, DEPTHFORMER_NORM_EPS)
-        .map_err(Error::from)
+    RmsNorm::from_qtensor(
+        load_qtensor_any(loader, device, names)?,
+        DEPTHFORMER_NORM_EPS,
+    )
+    .map_err(Error::from)
 }
 
 fn load_qtensor_any(

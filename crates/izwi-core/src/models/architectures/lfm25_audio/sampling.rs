@@ -215,8 +215,8 @@ mod tests {
         let logits = Tensor::from_vec(vec![0.1f32, 0.9, 0.3], (3,), &candle_core::Device::Cpu)
             .expect("logits");
         let config = Lfm25SamplingConfig::default();
-        let token = sample_from_logits(&logits, 3, &config, &mut SimpleRng::new(7))
-            .expect("sample token");
+        let token =
+            sample_from_logits(&logits, 3, &config, &mut SimpleRng::new(7)).expect("sample token");
         assert_eq!(token, 1);
     }
 }

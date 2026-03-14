@@ -75,11 +75,23 @@ pub fn parse_detokenizer_config(loader: &GgufLoader) -> Result<Lfm2BackboneConfi
 }
 
 pub fn parse_audio_encoder_config(loader: &GgufLoader) -> Result<Lfm25AudioEncoderConfig> {
+    let embedding_length = required_usize(loader, "clip.audio.embedding_length")?;
+    let metadata_feed_forward_length = required_usize(loader, "clip.audio.feed_forward_length")?;
+    let feed_forward_length = infer_audio_encoder_feed_forward_length(loader, embedding_length)?
+        .unwrap_or(metadata_feed_forward_length);
+    if feed_forward_length != metadata_feed_forward_length {
+        tracing::warn!(
+            metadata_feed_forward_length,
+            feed_forward_length,
+            "LFM2.5 Audio GGUF metadata feed-forward length disagrees with encoder tensors; using inferred tensor width"
+        );
+    }
+
     Ok(Lfm25AudioEncoderConfig {
         projector_type: loader.get_metadata_string("clip.projector_type"),
         num_mel_bins: required_usize(loader, "clip.audio.num_mel_bins")?,
-        embedding_length: required_usize(loader, "clip.audio.embedding_length")?,
-        feed_forward_length: required_usize(loader, "clip.audio.feed_forward_length")?,
+        embedding_length,
+        feed_forward_length,
         block_count: required_usize(loader, "clip.audio.block_count")?,
         projection_dim: required_usize(loader, "clip.audio.projection_dim")?,
         attention_head_count: required_usize(loader, "clip.audio.attention.head_count")?,
@@ -90,6 +102,36 @@ pub fn parse_audio_encoder_config(loader: &GgufLoader) -> Result<Lfm25AudioEncod
         subsampling_factor: LFM25_AUDIO_ENCODER_SUBSAMPLING_FACTOR,
         subsampling_channels: LFM25_AUDIO_ENCODER_SUBSAMPLING_CHANNELS,
     })
+}
+
+fn infer_audio_encoder_feed_forward_length(
+    loader: &GgufLoader,
+    embedding_length: usize,
+) -> Result<Option<usize>> {
+    for name in [
+        "a.blk.0.ffn_up.weight",
+        "audio_encoder.layers.0.ff1.linear1.weight",
+    ] {
+        let Some(shape) = loader.tensor_shape(name) else {
+            continue;
+        };
+        if shape.len() != 2 {
+            return Err(Error::ModelLoadError(format!(
+                "Audio encoder FFN tensor {name} must be rank 2, found shape {shape:?}"
+            )));
+        }
+        let dims = (shape[0], shape[1]);
+        if dims.1 == embedding_length {
+            return Ok(Some(dims.0));
+        }
+        if dims.0 == embedding_length {
+            return Ok(Some(dims.1));
+        }
+        return Err(Error::ModelLoadError(format!(
+            "Audio encoder FFN tensor {name} has shape {dims:?}, but neither dimension matches embedding length {embedding_length}"
+        )));
+    }
+    Ok(None)
 }
 
 pub fn parse_audio_decoder_config(loader: &GgufLoader) -> Result<Lfm25AudioDecoderConfig> {
@@ -226,5 +268,82 @@ fn gguf_to_f64(value: &GgufValue) -> Option<f64> {
         GgufValue::U8(n) => Some(*n as f64),
         GgufValue::I8(n) => Some(*n as f64),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::{self, File};
+    use std::path::{Path, PathBuf};
+
+    use candle_core::quantized::gguf_file::{write as write_gguf, Value as GgufValue};
+    use candle_core::quantized::{GgmlDType, QTensor};
+    use candle_core::{Device, Tensor};
+    use uuid::Uuid;
+
+    use super::parse_audio_encoder_config;
+    use crate::models::shared::weights::gguf::GgufLoader;
+
+    fn make_temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("izwi-lfm25-audio-config-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn write_test_gguf(
+        path: &Path,
+        metadata: Vec<(&'static str, GgufValue)>,
+        tensors: Vec<(&'static str, Tensor)>,
+    ) {
+        let quantized = tensors
+            .into_iter()
+            .map(|(name, tensor)| {
+                Ok::<_, candle_core::Error>((name, QTensor::quantize(&tensor, GgmlDType::F32)?))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("quantize tensors");
+        let metadata_refs = metadata
+            .iter()
+            .map(|(name, value)| (*name, value))
+            .collect::<Vec<_>>();
+        let tensor_refs = quantized
+            .iter()
+            .map(|(name, tensor)| (*name, tensor))
+            .collect::<Vec<_>>();
+        let mut file = File::create(path).expect("create gguf");
+        write_gguf(&mut file, &metadata_refs, &tensor_refs).expect("write gguf");
+    }
+
+    #[test]
+    fn parse_audio_encoder_config_prefers_ffn_width_inferred_from_tensors() {
+        let dir = make_temp_dir();
+        let path = dir.join("mmproj.gguf");
+        write_test_gguf(
+            &path,
+            vec![
+                ("clip.audio.num_mel_bins", GgufValue::U32(128)),
+                ("clip.audio.embedding_length", GgufValue::U32(512)),
+                ("clip.audio.feed_forward_length", GgufValue::U32(512)),
+                ("clip.audio.block_count", GgufValue::U32(1)),
+                ("clip.audio.projection_dim", GgufValue::U32(2048)),
+                ("clip.audio.attention.head_count", GgufValue::U32(8)),
+                (
+                    "clip.audio.attention.layer_norm_epsilon",
+                    GgufValue::F32(1e-5),
+                ),
+            ],
+            vec![(
+                "a.blk.0.ffn_up.weight",
+                Tensor::zeros((2048, 512), candle_core::DType::F32, &Device::Cpu)
+                    .expect("ffn tensor"),
+            )],
+        );
+
+        let loader = GgufLoader::from_path(&path).expect("load gguf");
+        let config = parse_audio_encoder_config(&loader).expect("parse config");
+        assert_eq!(config.embedding_length, 512);
+        assert_eq!(config.feed_forward_length, 2048);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

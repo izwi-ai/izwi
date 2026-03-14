@@ -12,17 +12,15 @@ use crate::models::shared::chat::{ChatMessage, ChatRole};
 use super::audio_output::Lfm25AudioHead;
 use super::backbone::QuantizedLfm2Backbone;
 use super::bundle::{Lfm25AudioBundle, Lfm25AudioBundleInfo};
-use super::conformer::Lfm25AudioEncoder;
 use super::config::{
     parse_audio_decoder_config, parse_audio_encoder_config, parse_detokenizer_config,
     parse_main_backbone_config, Lfm25AudioDecoderConfig, Lfm25AudioEncoderConfig,
     Lfm2BackboneConfig,
 };
+use super::conformer::Lfm25AudioEncoder;
 use super::detokenizer::Lfm25AudioDetokenizer;
 use super::preprocessor::Lfm25AudioPreprocessor;
-use super::sampling::{
-    sample_from_logits, Lfm25AudioGenerationConfig, SimpleRng,
-};
+use super::sampling::{sample_from_logits, Lfm25AudioGenerationConfig, SimpleRng};
 use super::tokenizer::Lfm25TextTokenizer;
 
 const DEFAULT_MAX_NEW_TOKENS: usize = 1024;
@@ -108,6 +106,7 @@ impl Lfm25AudioModel {
         )?;
         let detokenizer = Lfm25AudioDetokenizer::load(
             &bundle.tokenizer,
+            &bundle.vocoder,
             detokenizer_config.clone(),
             &decoder_config,
             &device.device,
@@ -215,8 +214,9 @@ impl Lfm25AudioModel {
             )
         };
 
-        let (features, feature_frames) =
-            self.preprocessor.compute_features(&mono_16khz, &self.device.device)?;
+        let (features, feature_frames) = self
+            .preprocessor
+            .compute_features(&mono_16khz, &self.device.device)?;
         let audio_embeds = self.encoder.encode(&features, feature_frames)?;
         let (prefix_ids, suffix_ids) = self.build_asr_prompt_segments()?;
         let vocab_limit = self.tokenizer.vocab_size();
@@ -225,14 +225,9 @@ impl Lfm25AudioModel {
         self.with_main_backbone(|main_backbone| {
             main_backbone.reset_state();
 
-            let prefix_embeds =
-                embed_token_ids(main_backbone, &self.device.device, &prefix_ids)?;
-            let suffix_embeds =
-                embed_token_ids(main_backbone, &self.device.device, &suffix_ids)?;
-            let prompt_embeds = Tensor::cat(
-                &[&prefix_embeds, &audio_embeds, &suffix_embeds],
-                1,
-            )?;
+            let prefix_embeds = embed_token_ids(main_backbone, &self.device.device, &prefix_ids)?;
+            let suffix_embeds = embed_token_ids(main_backbone, &self.device.device, &suffix_ids)?;
+            let prompt_embeds = Tensor::cat(&[&prefix_embeds, &audio_embeds, &suffix_embeds], 1)?;
             let prompt_tokens = prompt_embeds.dim(1)?;
 
             let hidden = main_backbone.forward_embeds(&prompt_embeds, 0)?;
@@ -268,8 +263,7 @@ impl Lfm25AudioModel {
                     break;
                 }
 
-                let next_tensor =
-                    Tensor::from_vec(vec![next], (1, 1), &self.device.device)?;
+                let next_tensor = Tensor::from_vec(vec![next], (1, 1), &self.device.device)?;
                 logits = main_backbone.forward_tokens(&next_tensor, position)?;
                 position += 1;
             }
@@ -385,18 +379,17 @@ impl Lfm25AudioModel {
                             &mut rng,
                         )?;
                         tokens_generated += 1;
-                        let is_end = frame
-                            .first()
-                            .copied()
-                            == Some(self.audio_head.audio_end_token_id());
+                        let is_end =
+                            frame.first().copied() == Some(self.audio_head.audio_end_token_id());
                         if !is_end {
                             for (codebook_idx, token) in frame.iter().copied().enumerate() {
                                 audio_codes[codebook_idx].push(token);
                             }
                         }
 
-                        let audio_embed =
-                            self.audio_head.embed_audio_frame(&frame, &self.device.device)?;
+                        let audio_embed = self
+                            .audio_head
+                            .embed_audio_frame(&frame, &self.device.device)?;
                         let step_hidden = main_backbone.forward_embeds(&audio_embed, position)?;
                         position += 1;
                         last_hidden = last_hidden_state(&step_hidden)?;
@@ -475,8 +468,8 @@ impl Lfm25AudioModel {
         let stride_frames = stream_config.decode_stride_frames.max(1);
         let holdback_samples = self.audio_stream_holdback_samples(stream_config);
 
-        let (text, prompt_tokens, tokens_generated, audio_codes, samples) =
-            self.with_main_backbone(|main_backbone| {
+        let (text, prompt_tokens, tokens_generated, audio_codes, samples) = self
+            .with_main_backbone(|main_backbone| {
                 let mut rng = SimpleRng::new(generation_config.seed);
                 let mut emitted_audio_samples = 0usize;
 
@@ -485,7 +478,8 @@ impl Lfm25AudioModel {
                     embed_token_ids(main_backbone, &self.device.device, &prefix_ids)?;
                 let suffix_embeds =
                     embed_token_ids(main_backbone, &self.device.device, &suffix_ids)?;
-                let prompt_embeds = Tensor::cat(&[&prefix_embeds, &audio_embeds, &suffix_embeds], 1)?;
+                let prompt_embeds =
+                    Tensor::cat(&[&prefix_embeds, &audio_embeds, &suffix_embeds], 1)?;
                 let prompt_tokens = prompt_embeds.dim(1)?;
                 let prompt_hidden = main_backbone.forward_embeds(&prompt_embeds, 0)?;
                 let mut last_hidden = last_hidden_state(&prompt_hidden)?;
@@ -555,8 +549,8 @@ impl Lfm25AudioModel {
                             &mut rng,
                         )?;
                         tokens_generated += 1;
-                        let is_end = frame.first().copied()
-                            == Some(self.audio_head.audio_end_token_id());
+                        let is_end =
+                            frame.first().copied() == Some(self.audio_head.audio_end_token_id());
                         if is_end {
                             frame.fill(self.audio_head.audio_end_token_id());
                             in_audio = false;
@@ -570,8 +564,9 @@ impl Lfm25AudioModel {
                             }
                         }
 
-                        let audio_embed =
-                            self.audio_head.embed_audio_frame(&frame, &self.device.device)?;
+                        let audio_embed = self
+                            .audio_head
+                            .embed_audio_frame(&frame, &self.device.device)?;
                         let step_hidden = main_backbone.forward_embeds(&audio_embed, position)?;
                         position += 1;
                         last_hidden = last_hidden_state(&step_hidden)?;
@@ -583,7 +578,8 @@ impl Lfm25AudioModel {
                                 || audio_codes[0].len() % stride_frames == 0
                                 || tokens_generated >= max_new_tokens);
                         if should_decode_partial {
-                            let partial = self.detokenizer.decode(&audio_codes, &self.device.device)?;
+                            let partial =
+                                self.detokenizer.decode(&audio_codes, &self.device.device)?;
                             let delta = next_audio_delta_stable(
                                 &partial,
                                 &mut emitted_audio_samples,
@@ -602,12 +598,8 @@ impl Lfm25AudioModel {
                 }
 
                 let samples = self.detokenizer.decode(&audio_codes, &self.device.device)?;
-                let final_delta = next_audio_delta_stable(
-                    &samples,
-                    &mut emitted_audio_samples,
-                    0,
-                    true,
-                );
+                let final_delta =
+                    next_audio_delta_stable(&samples, &mut emitted_audio_samples, 0, true);
                 if !final_delta.is_empty() {
                     on_audio_samples(&final_delta);
                 }
@@ -656,8 +648,9 @@ impl Lfm25AudioModel {
             )
         };
 
-        let (features, feature_frames) =
-            self.preprocessor.compute_features(&mono_16khz, &self.device.device)?;
+        let (features, feature_frames) = self
+            .preprocessor
+            .compute_features(&mono_16khz, &self.device.device)?;
         self.encoder.encode(&features, feature_frames)
     }
 
@@ -890,7 +883,11 @@ fn argmax(logits: &Tensor, vocab_limit: usize) -> Result<u32> {
     };
 
     let idx = logits.argmax(D::Minus1)?;
-    let idx = if idx.rank() == 0 { idx } else { idx.squeeze(0)? };
+    let idx = if idx.rank() == 0 {
+        idx
+    } else {
+        idx.squeeze(0)?
+    };
     idx.to_dtype(DType::U32)?
         .to_scalar::<u32>()
         .map_err(Error::from)
@@ -967,7 +964,10 @@ fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
     for idx in 0..out_len {
         let src_pos = idx as f64 / ratio;
         let left = src_pos.floor() as usize;
-        let right = left.min(audio.len() - 1).saturating_add(1).min(audio.len() - 1);
+        let right = left
+            .min(audio.len() - 1)
+            .saturating_add(1)
+            .min(audio.len() - 1);
         let frac = (src_pos - left as f64) as f32;
         let left_sample = audio[left.min(audio.len() - 1)];
         let right_sample = audio[right];
@@ -979,7 +979,18 @@ fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+    use crate::backends::DeviceProfile;
+    use crate::model::ModelVariant;
+
+    fn local_model_dir(name: &str) -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        PathBuf::from(home)
+            .join("Library/Application Support/izwi/models")
+            .join(name)
+    }
 
     #[test]
     fn next_audio_delta_stable_holds_back_tail_until_final() {
@@ -1000,5 +1011,25 @@ mod tests {
             strip_past_assistant_thinking("<think>plan</think>final answer"),
             "final answer"
         );
+    }
+
+    #[test]
+    fn load_local_lfm25_audio_model_smoke_if_available() {
+        let model_dir = local_model_dir("LFM2.5-Audio-1.5B-GGUF");
+        if !model_dir.exists() {
+            return;
+        }
+
+        let model = Lfm25AudioModel::load(
+            &model_dir,
+            ModelVariant::Lfm25Audio15BGguf,
+            DeviceProfile::cpu(),
+        )
+        .expect("lfm2.5 audio assets should load");
+
+        assert_eq!(model.main_config().architecture, "lfm2");
+        assert_eq!(model.encoder_config().embedding_length, 512);
+        assert_eq!(model.encoder_config().feed_forward_length, 2048);
+        assert_eq!(model.decoder_config().codebooks, 8);
     }
 }

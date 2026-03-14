@@ -80,7 +80,11 @@ impl Mlp {
         Self::load_with_prefixes(loader, device, &[prefix.to_string()])
     }
 
-    fn load_with_prefixes(loader: &GgufLoader, device: &Device, prefixes: &[String]) -> Result<Self> {
+    fn load_with_prefixes(
+        loader: &GgufLoader,
+        device: &Device,
+        prefixes: &[String],
+    ) -> Result<Self> {
         let mut gate_names = Vec::new();
         let mut down_names = Vec::new();
         let mut up_names = Vec::new();
@@ -177,9 +181,8 @@ impl AttentionLayer {
         let key_states = repeat_kv(&all_keys, self.n_head, self.n_kv_head)?;
         let value_states = repeat_kv(&all_values, self.n_head, self.n_kv_head)?;
 
-        let attn_weights =
-            (query_states.matmul(&key_states.transpose(2, 3)?.contiguous()?)?
-                / (self.head_dim as f64).sqrt())?;
+        let attn_weights = (query_states.matmul(&key_states.transpose(2, 3)?.contiguous()?)?
+            / (self.head_dim as f64).sqrt())?;
         let attn_weights = if let Some(mask) = mask {
             let mask = mask.broadcast_as(attn_weights.shape())?;
             masked_fill(&attn_weights, &mask, &self.neg_inf)?
@@ -187,10 +190,13 @@ impl AttentionLayer {
             attn_weights
         };
         let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.contiguous()?.matmul(&value_states.contiguous()?)?;
-        let attn_output = attn_output
-            .transpose(1, 2)?
-            .reshape((batch_size, seq_len, hidden_size))?;
+        let attn_output = attn_weights
+            .contiguous()?
+            .matmul(&value_states.contiguous()?)?;
+        let attn_output =
+            attn_output
+                .transpose(1, 2)?
+                .reshape((batch_size, seq_len, hidden_size))?;
         self.wo.forward(&attn_output).map_err(Error::from)
     }
 
@@ -225,7 +231,11 @@ impl ShortConvLayer {
             let mut state = if let Some(cache) = &self.cache {
                 cache.clone()
             } else {
-                Tensor::zeros((batch_size, hidden_size, self.l_cache), bx.dtype(), bx.device())?
+                Tensor::zeros(
+                    (batch_size, hidden_size, self.l_cache),
+                    bx.dtype(),
+                    bx.device(),
+                )?
             };
 
             if self.l_cache > 1 {
@@ -260,7 +270,11 @@ impl ShortConvLayer {
                 let mut cache = bx.narrow(2, start, cur_len - start)?;
                 if cache.dims3()?.2 < self.l_cache {
                     let pad = self.l_cache - cache.dims3()?.2;
-                    let zeros = Tensor::zeros((batch_size, hidden_size, pad), cache.dtype(), cache.device())?;
+                    let zeros = Tensor::zeros(
+                        (batch_size, hidden_size, pad),
+                        cache.dtype(),
+                        cache.device(),
+                    )?;
                     cache = Tensor::cat(&[&zeros, &cache], 2)?;
                 }
                 self.cache = Some(cache);
@@ -291,6 +305,7 @@ impl ProjectionHead {
                 "lfm.output.weight".to_string(),
                 "lfm.lm_head.weight".to_string(),
                 "dense_2_out.weight".to_string(),
+                "dense_2.weight".to_string(),
                 "lin.weight".to_string(),
                 "token_embd.weight".to_string(),
                 "tok_embeddings.weight".to_string(),
@@ -305,6 +320,7 @@ impl ProjectionHead {
                 "lfm.output.bias".to_string(),
                 "lfm.lm_head.bias".to_string(),
                 "dense_2_out.bias".to_string(),
+                "dense_2.bias".to_string(),
                 "lin.bias".to_string(),
             ],
         )?;
@@ -323,8 +339,12 @@ impl ProjectionHead {
 
 impl QuantizedLfm2Backbone {
     pub fn load(loader: &GgufLoader, cfg: Lfm2BackboneConfig, device: &Device) -> Result<Self> {
-        let (cos, sin) =
-            precompute_freqs(cfg.embedding_length / cfg.attention_head_count, cfg.rope_freq_base as f32, cfg.context_length, device)?;
+        let (cos, sin) = precompute_freqs(
+            cfg.embedding_length / cfg.attention_head_count,
+            cfg.rope_freq_base as f32,
+            cfg.context_length,
+            device,
+        )?;
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
 
         let token_embedding_q = load_qtensor_any(
@@ -335,6 +355,8 @@ impl QuantizedLfm2Backbone {
                 "tok_embeddings.weight".to_string(),
                 "model.embed_tokens.weight".to_string(),
                 "lfm.embed_tokens.weight".to_string(),
+                "emb.emb.weight".to_string(),
+                "emb.weight".to_string(),
             ],
         )?;
         let token_embeddings_weight = token_embedding_q.dequantize(device).map_err(Error::from)?;
@@ -396,11 +418,8 @@ impl QuantizedLfm2Backbone {
                 cfg.attention_layer_norm_rms_epsilon,
             )
             .map_err(Error::from)?;
-            let mlp = Mlp::load_with_prefixes(
-                loader,
-                device,
-                &[prefix.clone(), legacy_prefix.clone()],
-            )?;
+            let mlp =
+                Mlp::load_with_prefixes(loader, device, &[prefix.clone(), legacy_prefix.clone()])?;
 
             let is_attention = cfg
                 .attention_head_count_kv
@@ -551,7 +570,9 @@ impl QuantizedLfm2Backbone {
     }
 
     pub fn embed_tokens(&self, token_ids: &Tensor) -> Result<Tensor> {
-        self.token_embeddings.forward(token_ids).map_err(Error::from)
+        self.token_embeddings
+            .forward(token_ids)
+            .map_err(Error::from)
     }
 
     pub fn project_hidden(&self, hidden_states: &Tensor) -> Result<Tensor> {
@@ -615,9 +636,7 @@ impl QuantizedLfm2Backbone {
 
         let mask: Vec<u8> = if let Some(sliding_window) = self.cfg.attention_sliding_window {
             (0..seq_len)
-                .flat_map(|i| {
-                    (0..seq_len).map(move |j| u8::from(j > i || j + sliding_window < i))
-                })
+                .flat_map(|i| (0..seq_len).map(move |j| u8::from(j > i || j + sliding_window < i)))
                 .collect()
         } else {
             (0..seq_len)

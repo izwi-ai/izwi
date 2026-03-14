@@ -23,8 +23,8 @@ use izwi_agent::{
 };
 use izwi_core::{
     audio::{AudioEncoder, AudioFormat},
-    parse_chat_model_variant, parse_model_variant, parse_tts_model_variant, ChatMessage,
-    ChatRole, GenerationConfig, GenerationParams, GenerationRequest,
+    parse_chat_model_variant, parse_model_variant, parse_tts_model_variant, ChatMessage, ChatRole,
+    GenerationConfig, GenerationParams, GenerationRequest,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -1263,7 +1263,12 @@ fn spawn_turn_task(
                     );
                     state
                         .voice_store
-                        .update_turn_transcript(turn_record_id.clone(), user_text.clone(), None, None)
+                        .update_turn_transcript(
+                            turn_record_id.clone(),
+                            user_text.clone(),
+                            None,
+                            None,
+                        )
                         .await
                         .map_err(|err| format!("Voice storage error: {err}"))?;
 

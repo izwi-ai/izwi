@@ -28,8 +28,7 @@ impl Lfm25AudioPreprocessor {
             F_MIN,
             F_MAX,
         );
-        let window =
-            hann_window_padded(LFM25_AUDIO_INPUT_N_FFT, LFM25_AUDIO_INPUT_WIN_LENGTH);
+        let window = hann_window_padded(LFM25_AUDIO_INPUT_N_FFT, LFM25_AUDIO_INPUT_WIN_LENGTH);
         Ok(Self {
             mel_filterbank,
             window,
@@ -172,9 +171,8 @@ fn hann_window_padded(n_fft: usize, win_length: usize) -> Vec<f32> {
     let mut window = vec![0.0; n_fft];
     let left_pad = (n_fft.saturating_sub(win_length)) / 2;
     for idx in 0..win_length {
-        let value = 0.5
-            * (1.0
-                - f32::cos(2.0 * std::f32::consts::PI * idx as f32 / win_length as f32));
+        let value =
+            0.5 * (1.0 - f32::cos(2.0 * std::f32::consts::PI * idx as f32 / win_length as f32));
         window[left_pad + idx] = value;
     }
     window
@@ -294,11 +292,7 @@ mod tests {
 
     #[test]
     fn per_feature_normalization_zeroes_padded_tail() {
-        let mut features = vec![
-            vec![1.0, 10.0],
-            vec![3.0, 14.0],
-            vec![9.0, 99.0],
-        ];
+        let mut features = vec![vec![1.0, 10.0], vec![3.0, 14.0], vec![9.0, 99.0]];
         normalize_per_feature(&mut features, 2);
 
         assert!((features[0][0] + 0.70710677).abs() < 1e-4);

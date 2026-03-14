@@ -1680,22 +1680,16 @@ mod tests {
         let model_dir = downloader.model_path(variant);
         std::fs::create_dir_all(&model_dir).expect("model dir");
         std::fs::write(model_dir.join("LFM2.5-Audio-1.5B-Q4_0.gguf"), [0u8]).expect("main");
-        std::fs::write(
-            model_dir.join("mmproj-LFM2.5-Audio-1.5B-Q4_0.gguf"),
-            [0u8],
-        )
-        .expect("mmproj");
+        std::fs::write(model_dir.join("mmproj-LFM2.5-Audio-1.5B-Q4_0.gguf"), [0u8])
+            .expect("mmproj");
         std::fs::write(
             model_dir.join("tokenizer-LFM2.5-Audio-1.5B-Q4_0.gguf"),
             [0u8],
         )
         .expect("tokenizer");
         assert!(!downloader.is_downloaded(variant));
-        std::fs::write(
-            model_dir.join("vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf"),
-            [0u8],
-        )
-        .expect("vocoder");
+        std::fs::write(model_dir.join("vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf"), [0u8])
+            .expect("vocoder");
         assert!(downloader.is_downloaded(variant));
         std::fs::remove_dir_all(temp_dir).ok();
     }

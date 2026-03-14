@@ -16,8 +16,8 @@ enum SpeechAudioInput<'a> {
 fn resolve_audio_chat_variant(model_id: Option<&str>) -> Result<ModelVariant> {
     match model_id {
         Some(raw) => {
-            let variant = parse_model_variant(raw)
-                .map_err(|err| Error::InvalidInput(err.to_string()))?;
+            let variant =
+                parse_model_variant(raw).map_err(|err| Error::InvalidInput(err.to_string()))?;
             if variant.is_audio_chat() {
                 Ok(variant)
             } else {

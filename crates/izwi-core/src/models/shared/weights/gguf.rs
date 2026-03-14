@@ -102,6 +102,14 @@ impl GgufLoader {
         self.content.tensor_infos.contains_key(name)
     }
 
+    /// Get the logical shape of a tensor without loading its data.
+    pub fn tensor_shape(&self, name: &str) -> Option<Vec<usize>> {
+        self.content
+            .tensor_infos
+            .get(name)
+            .map(|info| info.shape.dims().to_vec())
+    }
+
     /// Load a quantized tensor from the GGUF file.
     ///
     /// Delegates to Candle's `Content::tensor`, which fully supports
