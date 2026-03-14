@@ -14,6 +14,7 @@ pub const LFM25_AUDIO_INPUT_HOP_LENGTH: usize = 160;
 pub const LFM25_AUDIO_OUTPUT_N_FFT: usize = 1_280;
 pub const LFM25_AUDIO_OUTPUT_HOP_LENGTH: usize = 320;
 pub const LFM25_AUDIO_ENCODER_SUBSAMPLING_FACTOR: usize = 8;
+pub const LFM25_AUDIO_ENCODER_SUBSAMPLING_CHANNELS: usize = 256;
 pub const LFM25_AUDIO_DETOKENIZER_UPSAMPLE: usize = 6;
 pub const LFM25_AUDIO_AUDIO_VOCAB_SIZE: usize = 2_049;
 pub const LFM25_AUDIO_AUDIO_END_TOKEN_ID: u32 = 2_048;
@@ -47,6 +48,7 @@ pub struct Lfm25AudioEncoderConfig {
     pub attention_head_count: usize,
     pub attention_layer_norm_epsilon: f64,
     pub subsampling_factor: usize,
+    pub subsampling_channels: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +88,7 @@ pub fn parse_audio_encoder_config(loader: &GgufLoader) -> Result<Lfm25AudioEncod
             "clip.audio.attention.layer_norm_epsilon",
         )?,
         subsampling_factor: LFM25_AUDIO_ENCODER_SUBSAMPLING_FACTOR,
+        subsampling_channels: LFM25_AUDIO_ENCODER_SUBSAMPLING_CHANNELS,
     })
 }
 
