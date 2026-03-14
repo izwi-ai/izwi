@@ -107,9 +107,7 @@ impl ModelVariant {
             DiarStreamingSortformer4SpkV21 => ModelFamily::SortformerDiarization,
             Qwen306B | Qwen306B4Bit | Qwen306BGguf | Qwen317B | Qwen317B4Bit | Qwen317BGguf
             | Qwen34BGguf | Qwen38BGguf | Qwen314BGguf => ModelFamily::Qwen3Chat,
-            Qwen3508BGguf | Qwen352BGguf | Qwen354BGguf | Qwen359BGguf => {
-                ModelFamily::Qwen35Chat
-            }
+            Qwen3508BGguf | Qwen352BGguf | Qwen354BGguf | Qwen359BGguf => ModelFamily::Qwen35Chat,
             Lfm2512BInstructGguf | Lfm2512BThinkingGguf => ModelFamily::Lfm2Chat,
             Lfm25Audio15BGguf => ModelFamily::Lfm25Audio,
             Gemma31BIt | Gemma34BIt => ModelFamily::Gemma3Chat,
@@ -128,9 +126,7 @@ impl ModelVariant {
             ModelFamily::Qwen3Chat
             | ModelFamily::Qwen35Chat
             | ModelFamily::Lfm2Chat
-            | ModelFamily::Gemma3Chat => {
-                ModelTask::Chat
-            }
+            | ModelFamily::Gemma3Chat => ModelTask::Chat,
             ModelFamily::Qwen3ForcedAligner => ModelTask::ForcedAlign,
             ModelFamily::Voxtral | ModelFamily::Lfm25Audio => ModelTask::AudioChat,
             ModelFamily::Tokenizer => ModelTask::Tokenizer,
@@ -163,7 +159,7 @@ pub fn parse_model_variant(input: &str) -> Result<ModelVariant, ParseModelVarian
 
 pub fn parse_tts_model_variant(input: &str) -> Result<ModelVariant, ParseModelVariantError> {
     let variant = parse_model_variant(input)?;
-    if variant.is_tts() {
+    if variant.is_tts() || variant.is_audio_chat() {
         Ok(variant)
     } else {
         Err(ParseModelVariantError::new(input))
@@ -211,7 +207,9 @@ pub fn resolve_asr_model_variant(input: Option<&str>) -> ModelVariant {
 
     match parse_model_variant(raw) {
         Ok(Qwen3Asr06B4Bit | Qwen3Asr06B8Bit) => Qwen3Asr06B,
-        Ok(variant) if variant.is_asr() || variant.is_voxtral() => variant,
+        Ok(variant) if variant.is_asr() || variant.is_voxtral() || variant.is_audio_chat() => {
+            variant
+        }
         Ok(_) => Qwen3Asr06B,
         Err(_) => {
             let normalized = normalize_identifier(raw);
@@ -566,6 +564,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_tts_accepts_lfm25_audio() {
+        let parsed = parse_tts_model_variant("LiquidAI/LFM2.5-Audio-1.5B-GGUF")
+            .expect("lfm25 audio should parse for tts");
+        assert_eq!(parsed, ModelVariant::Lfm25Audio15BGguf);
+    }
+
+    #[test]
     fn resolve_asr_fallback_defaults_to_06b() {
         let resolved = resolve_asr_model_variant(Some("not-a-real-model"));
         assert_eq!(resolved, ModelVariant::Qwen3Asr06B);
@@ -633,6 +638,12 @@ mod tests {
     fn resolve_asr_accepts_whisper_turbo() {
         let resolved = resolve_asr_model_variant(Some("whisper-large-v3-turbo"));
         assert_eq!(resolved, ModelVariant::WhisperLargeV3Turbo);
+    }
+
+    #[test]
+    fn resolve_asr_accepts_lfm25_audio() {
+        let resolved = resolve_asr_model_variant(Some("LFM2.5-Audio-1.5B-GGUF"));
+        assert_eq!(resolved, ModelVariant::Lfm25Audio15BGguf);
     }
 
     #[test]

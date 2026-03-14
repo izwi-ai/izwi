@@ -17,3 +17,11 @@ describe("VIEW_CONFIGS.chat.modelFilter", () => {
     );
   });
 });
+
+describe("speech route model filters", () => {
+  it("includes lfm25 audio on transcription routes", () => {
+    expect(VIEW_CONFIGS.transcription.modelFilter("LFM2.5-Audio-1.5B-GGUF")).toBe(
+      true,
+    );
+  });
+});

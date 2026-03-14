@@ -421,6 +421,8 @@ const MODEL_DETAILS: Record<
       "Unified native speech-to-speech model from Liquid AI for voice conversations",
     features: [
       "Speech-to-speech",
+      "Transcription",
+      "Text to Speech",
       "Native GGUF",
       "Interleaved text + audio",
       "Q4_0 bundle",

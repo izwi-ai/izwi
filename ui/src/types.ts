@@ -21,9 +21,16 @@ export function isKokoroVariant(variant: string): boolean {
   return normalized === "kokoro-82m" || normalized.includes("kokoro-82m");
 }
 
+export function isLfm25AudioVariant(variant: string): boolean {
+  return variant.trim() === "LFM2.5-Audio-1.5B-GGUF";
+}
+
 export function getSpeakerProfilesForVariant(variant: string | null): SpeakerProfile[] {
   if (!variant) {
     return QWEN_SPEAKERS;
+  }
+  if (isLfm25AudioVariant(variant)) {
+    return LFM25_AUDIO_SPEAKERS;
   }
   if (isKokoroVariant(variant)) {
     return KOKORO_SPEAKERS;
@@ -68,16 +75,17 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     id: "transcription",
     label: "Transcription",
     description:
-      "Speech-to-text with Qwen3-ASR, Whisper, Parakeet-TDT, and Voxtral models",
+      "Speech-to-text with Qwen3-ASR, Whisper, Parakeet-TDT, Voxtral, and LFM2.5 Audio models",
     icon: "FileText",
     modelFilter: (variant) =>
       variant.includes("Qwen3-ASR") ||
       variant.includes("Whisper-Large-v3-Turbo") ||
       variant.includes("Parakeet-TDT") ||
-      variant.includes("Voxtral"),
+      variant.includes("Voxtral") ||
+      isLfm25AudioVariant(variant),
     emptyStateTitle: "No ASR Model Loaded",
     emptyStateDescription:
-      "Download and load a Qwen3-ASR, Whisper, Parakeet-TDT, or Voxtral model for speech transcription",
+      "Download and load a Qwen3-ASR, Whisper, Parakeet-TDT, Voxtral, or LFM2.5 Audio model for speech transcription",
   },
   chat: {
     id: "chat",
@@ -164,6 +172,15 @@ export const QWEN_SPEAKERS: SpeakerProfile[] = [
     name: "Uncle Fu",
     language: "Chinese",
     description: "Mature and wise male voice",
+  },
+];
+
+export const LFM25_AUDIO_SPEAKERS: SpeakerProfile[] = [
+  {
+    id: "Default",
+    name: "Default",
+    language: "Multilingual",
+    description: "Native default voice for LFM2.5 Audio speech generation",
   },
 ];
 

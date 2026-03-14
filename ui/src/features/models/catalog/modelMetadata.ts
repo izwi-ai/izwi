@@ -14,6 +14,7 @@ export interface ModelDetail {
   fullName: string;
   description: string;
   category: "tts" | "asr" | "chat";
+  categories?: Array<"tts" | "asr" | "chat">;
   capabilities: string[];
   size: string;
 }
@@ -251,7 +252,15 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     description:
       "Native end-to-end speech model from Liquid AI with unified audio-chat generation",
     category: "asr",
-    capabilities: ["Speech-to-speech", "GGUF", "Q4_0", "Unified Voice"],
+    categories: ["asr", "tts"],
+    capabilities: [
+      "Speech-to-speech",
+      "Transcription",
+      "Text to Speech",
+      "GGUF",
+      "Q4_0",
+      "Unified Voice",
+    ],
     size: "1.14 GB",
   },
   "Gemma-3-1b-it": {

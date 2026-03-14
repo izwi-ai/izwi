@@ -413,7 +413,7 @@ impl ModelVariant {
             Self::Qwen3TtsTokenizer12Hz => 682_300_739, // ~0.64 GB
             Self::Lfm2512BInstructGguf => 730_895_168,  // ~0.68 GB (GGUF Q4_K_M, HF tree)
             Self::Lfm2512BThinkingGguf => 730_895_360,  // ~0.68 GB (GGUF Q4_K_M, HF tree)
-            Self::Lfm25Audio15BGguf => 1_220_000_000,  // ~1.14 GB (four-file GGUF bundle, est)
+            Self::Lfm25Audio15BGguf => 1_220_000_000,   // ~1.14 GB (four-file GGUF bundle, est)
             Self::Kokoro82M => 363_323_757,             // ~346 MB (HF tree total, Apr 2025)
             Self::Qwen3Asr06B => 1_880_619_678,         // ~1.75 GB
             Self::Qwen3Asr06B4Bit => 712_781_279,       // ~0.66 GB
@@ -626,6 +626,15 @@ impl ModelVariant {
                 supports_speed_control: true,
                 supports_auto_long_form: false,
             },
+            Self::Lfm25Audio15BGguf => SpeechModelCapabilities {
+                supports_builtin_voices: true,
+                built_in_voice_count: Some(1),
+                supports_reference_voice: false,
+                supports_voice_description: false,
+                supports_streaming: false,
+                supports_speed_control: false,
+                supports_auto_long_form: false,
+            },
             _ => return None,
         };
 
@@ -755,10 +764,7 @@ impl ModelVariant {
     pub fn is_qwen35_chat_gguf(&self) -> bool {
         matches!(
             self,
-            Self::Qwen3508BGguf
-                | Self::Qwen352BGguf
-                | Self::Qwen354BGguf
-                | Self::Qwen359BGguf
+            Self::Qwen3508BGguf | Self::Qwen352BGguf | Self::Qwen354BGguf | Self::Qwen359BGguf
         )
     }
 
@@ -801,8 +807,8 @@ impl ModelVariant {
             | Self::Qwen3ForcedAligner06B4Bit
             | Self::Lfm2512BInstructGguf
             | Self::Lfm2512BThinkingGguf
+            | Self::Lfm25Audio15BGguf
             | Self::Kokoro82M => true,
-            Self::Lfm25Audio15BGguf => false,
             Self::Gemma34BIt => false,
             Self::VoxtralMini4BRealtime2602 => false,
             Self::ParakeetTdt06BV2 | Self::ParakeetTdt06BV3 => true,
@@ -1010,9 +1016,17 @@ mod tests {
         ];
 
         for variant in active {
-            assert!(variant.is_enabled(), "{} should be enabled", variant.dir_name());
+            assert!(
+                variant.is_enabled(),
+                "{} should be enabled",
+                variant.dir_name()
+            );
             assert!(variant.is_chat(), "{} should be chat", variant.dir_name());
-            assert!(variant.is_quantized(), "{} should be quantized", variant.dir_name());
+            assert!(
+                variant.is_quantized(),
+                "{} should be quantized",
+                variant.dir_name()
+            );
             assert!(variant.is_gguf(), "{} should be gguf", variant.dir_name());
             assert!(
                 variant.is_qwen35_chat_gguf(),
@@ -1020,6 +1034,14 @@ mod tests {
                 variant.dir_name()
             );
         }
+    }
+
+    #[test]
+    fn lfm25_audio_variant_is_enabled() {
+        let variant = ModelVariant::Lfm25Audio15BGguf;
+        assert!(variant.is_enabled(), "{} should be enabled", variant.dir_name());
+        assert!(variant.is_audio_chat(), "{} should be audio-chat", variant.dir_name());
+        assert!(variant.is_gguf(), "{} should be gguf", variant.dir_name());
     }
 
     #[test]
@@ -1077,6 +1099,22 @@ mod tests {
                 supports_voice_description: false,
                 supports_streaming: true,
                 supports_speed_control: true,
+                supports_auto_long_form: false,
+            })
+        );
+    }
+
+    #[test]
+    fn lfm25_audio_capabilities_surface_default_tts_voice() {
+        assert_eq!(
+            ModelVariant::Lfm25Audio15BGguf.speech_capabilities(),
+            Some(SpeechModelCapabilities {
+                supports_builtin_voices: true,
+                built_in_voice_count: Some(1),
+                supports_reference_voice: false,
+                supports_voice_description: false,
+                supports_streaming: false,
+                supports_speed_control: false,
                 supports_auto_long_form: false,
             })
         );

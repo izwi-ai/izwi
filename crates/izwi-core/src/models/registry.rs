@@ -509,6 +509,39 @@ impl NativeAsrModel {
 }
 
 impl NativeAudioChatModel {
+    pub fn generate_sequential(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+    ) -> Result<NativeAudioChatGeneration> {
+        self.generate_sequential_with_callback(messages, max_new_tokens, &mut |_delta| {})
+    }
+
+    pub fn generate_sequential_with_callback(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        on_text_delta: &mut dyn FnMut(&str),
+    ) -> Result<NativeAudioChatGeneration> {
+        match self {
+            Self::Lfm25Audio(model) => {
+                let output = model.generate_sequential_with_callback(
+                    messages,
+                    max_new_tokens,
+                    on_text_delta,
+                )?;
+                Ok(NativeAudioChatGeneration {
+                    text: output.text,
+                    prompt_tokens: output.prompt_tokens,
+                    tokens_generated: output.tokens_generated,
+                    audio_frames_generated: output.audio_frames_generated,
+                    samples: output.samples,
+                    sample_rate: output.sample_rate,
+                })
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn generate_interleaved_with_config_and_callback(
         &self,
@@ -547,14 +580,20 @@ impl NativeAudioChatModel {
         }
     }
 
-    pub fn transcribe(
+    pub fn transcribe(&self, audio: &[f32], sample_rate: u32) -> Result<NativeAsrTranscription> {
+        self.transcribe_with_callback(audio, sample_rate, &mut |_delta| {})
+    }
+
+    pub fn transcribe_with_callback(
         &self,
         audio: &[f32],
         sample_rate: u32,
+        on_delta: &mut dyn FnMut(&str),
     ) -> Result<NativeAsrTranscription> {
         match self {
             Self::Lfm25Audio(model) => {
-                let output = model.transcribe_to_output(audio, sample_rate, 1024)?;
+                let output =
+                    model.transcribe_to_output_with_callback(audio, sample_rate, 1024, on_delta)?;
                 Ok(NativeAsrTranscription {
                     text: output.text,
                     language: None,
@@ -766,8 +805,7 @@ pub struct ModelRegistry {
     models_dir: PathBuf,
     device: DeviceProfile,
     asr_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<NativeAsrModel>>>>>>,
-    audio_chat_models:
-        Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<NativeAudioChatModel>>>>>>,
+    audio_chat_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<NativeAudioChatModel>>>>>>,
     diarization_models:
         Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<NativeDiarizationModel>>>>>>,
     chat_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<NativeChatModel>>>>>>,
@@ -1127,10 +1165,7 @@ impl ModelRegistry {
         guard.get(&variant).and_then(|cell| cell.get().cloned())
     }
 
-    pub async fn get_audio_chat(
-        &self,
-        variant: ModelVariant,
-    ) -> Option<Arc<NativeAudioChatModel>> {
+    pub async fn get_audio_chat(&self, variant: ModelVariant) -> Option<Arc<NativeAudioChatModel>> {
         let guard = self.audio_chat_models.read().await;
         guard.get(&variant).and_then(|cell| cell.get().cloned())
     }

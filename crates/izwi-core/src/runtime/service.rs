@@ -470,6 +470,7 @@ impl RuntimeService {
                     .ok_or_else(|| Error::InferenceError("No TTS model loaded".to_string()))?;
                 model.available_speakers()
             }
+            crate::catalog::ModelFamily::Lfm25Audio => Ok(vec!["Default".to_string()]),
             _ => Err(Error::InferenceError(format!(
                 "Model {variant} does not expose TTS speakers"
             ))),

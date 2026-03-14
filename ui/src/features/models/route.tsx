@@ -38,6 +38,16 @@ type FilterType = "all" | "downloaded" | "loaded" | "not_downloaded";
 type CategoryType = "all" | "tts" | "asr" | "chat";
 type ProviderSection = { provider: string; models: ModelInfo[] };
 
+function matchesCategory(
+  details: (typeof MODEL_DETAILS)[string],
+  category: Exclude<CategoryType, "all">,
+): boolean {
+  if (details.categories && details.categories.length > 0) {
+    return details.categories.includes(category);
+  }
+  return details.category === category;
+}
+
 function parseSize(sizeStr: string): number {
   const match = sizeStr.match(/^([\d.]+)\s*(GB|MB|KB|B)?$/i);
   if (!match) return 0;
@@ -196,7 +206,10 @@ export function MyModelsPage({
         }
 
         // Category filter
-        if (categoryFilter !== "all" && details.category !== categoryFilter) {
+        if (
+          categoryFilter !== "all" &&
+          !matchesCategory(details, categoryFilter)
+        ) {
           return false;
         }
 

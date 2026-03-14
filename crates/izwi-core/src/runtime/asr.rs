@@ -14,6 +14,72 @@ enum AsrAudioInput<'a> {
 }
 
 impl RuntimeService {
+    async fn asr_transcribe_audio_chat_samples<F>(
+        &self,
+        variant: ModelVariant,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        mut on_delta: F,
+    ) -> Result<AsrTranscription>
+    where
+        F: FnMut(String),
+    {
+        self.load_model(variant).await?;
+        let model = self
+            .model_registry
+            .get_audio_chat(variant)
+            .await
+            .ok_or_else(|| {
+                Error::ModelNotFound(format!("Audio-chat model {variant} is not loaded"))
+            })?;
+
+        let mut delta_sink = |delta: &str| {
+            if !delta.is_empty() {
+                on_delta(delta.to_string());
+            }
+        };
+        let output = model.transcribe_with_callback(&samples, sample_rate, &mut delta_sink)?;
+
+        Ok(AsrTranscription {
+            text: output.text,
+            language: output.language,
+            duration_secs: if sample_rate > 0 {
+                samples.len() as f32 / sample_rate as f32
+            } else {
+                0.0
+            },
+        })
+    }
+
+    async fn asr_transcribe_audio_chat_base64<F>(
+        &self,
+        variant: ModelVariant,
+        audio_base64: &str,
+        on_delta: F,
+    ) -> Result<AsrTranscription>
+    where
+        F: FnMut(String),
+    {
+        let audio_bytes = base64_decode(audio_base64)?;
+        let (samples, sample_rate) = decode_audio_bytes(&audio_bytes)?;
+        self.asr_transcribe_audio_chat_samples(variant, samples, sample_rate, on_delta)
+            .await
+    }
+
+    async fn asr_transcribe_audio_chat_bytes<F>(
+        &self,
+        variant: ModelVariant,
+        audio_bytes: &[u8],
+        on_delta: F,
+    ) -> Result<AsrTranscription>
+    where
+        F: FnMut(String),
+    {
+        let (samples, sample_rate) = decode_audio_bytes(audio_bytes)?;
+        self.asr_transcribe_audio_chat_samples(variant, samples, sample_rate, on_delta)
+            .await
+    }
+
     async fn build_asr_request(
         &self,
         variant: ModelVariant,
@@ -201,6 +267,11 @@ impl RuntimeService {
         language: Option<&str>,
     ) -> Result<AsrTranscription> {
         let variant = resolve_asr_model_variant(model_id);
+        if variant.is_audio_chat() {
+            return self
+                .asr_transcribe_audio_chat_base64(variant, audio_base64, |_delta| {})
+                .await;
+        }
         self.asr_transcribe_with_variant(variant, audio_base64, language, None)
             .await
     }
@@ -212,6 +283,11 @@ impl RuntimeService {
         language: Option<&str>,
     ) -> Result<AsrTranscription> {
         let variant = resolve_asr_model_variant(model_id);
+        if variant.is_audio_chat() {
+            return self
+                .asr_transcribe_audio_chat_bytes(variant, audio_bytes, |_delta| {})
+                .await;
+        }
         self.asr_transcribe_bytes_with_variant(variant, audio_bytes, language, None)
             .await
     }
@@ -227,6 +303,12 @@ impl RuntimeService {
     where
         F: FnMut(String) + Send + 'static,
     {
+        let variant = resolve_asr_model_variant(model_id);
+        if variant.is_audio_chat() {
+            return self
+                .asr_transcribe_audio_chat_base64(variant, audio_base64, on_delta)
+                .await;
+        }
         self.asr_transcribe_streaming_with_correlation(
             audio_base64,
             model_id,
@@ -247,6 +329,12 @@ impl RuntimeService {
     where
         F: FnMut(String) + Send + 'static,
     {
+        let variant = resolve_asr_model_variant(model_id);
+        if variant.is_audio_chat() {
+            return self
+                .asr_transcribe_audio_chat_bytes(variant, audio_bytes, on_delta)
+                .await;
+        }
         self.asr_transcribe_streaming_bytes_with_correlation(
             audio_bytes,
             model_id,

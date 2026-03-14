@@ -31,7 +31,7 @@ impl RuntimeService {
             | ModelFamily::KokoroTts => {
                 if matches!(
                     family,
-                    ModelFamily::Qwen3Tts | ModelFamily::KokoroTts
+                    ModelFamily::Qwen3Tts | ModelFamily::KokoroTts | ModelFamily::Lfm25Audio
                 ) {
                     self.set_active_tts_variant(variant).await;
                 }
