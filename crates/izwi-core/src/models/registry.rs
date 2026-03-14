@@ -13,6 +13,7 @@ use crate::model::ModelVariant;
 use crate::models::architectures::gemma3::chat::Gemma3ChatModel;
 use crate::models::architectures::kokoro::KokoroTtsModel;
 use crate::models::architectures::lfm2::chat::Lfm2ChatModel;
+use crate::models::architectures::lfm25_audio::Lfm25AudioModel;
 use crate::models::architectures::parakeet::asr::ParakeetAsrModel;
 use crate::models::architectures::qwen3::asr::{
     AsrDecodeState as Qwen3AsrDecodeState, AsrDecodeStep as Qwen3AsrDecodeStep,
@@ -32,6 +33,7 @@ use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage};
 use crate::runtime::{DiarizationConfig, DiarizationResult};
 
 type AsrLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeAsrModel>;
+type AudioChatLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeAudioChatModel>;
 type ChatLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeChatModel>;
 type DiarizationLoaderFn = fn(&Path, ModelVariant) -> Result<NativeDiarizationModel>;
 type VoxtralLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VoxtralRealtimeModel>;
@@ -42,6 +44,12 @@ struct AsrLoaderRegistration {
     name: &'static str,
     family: ModelFamily,
     loader: AsrLoaderFn,
+}
+
+struct AudioChatLoaderRegistration {
+    name: &'static str,
+    family: ModelFamily,
+    loader: AudioChatLoaderFn,
 }
 
 struct ChatLoaderRegistration {
@@ -153,6 +161,16 @@ fn load_qwen35_chat_model(
     )?))
 }
 
+fn load_lfm25_audio_model(
+    model_dir: &Path,
+    variant: ModelVariant,
+    device: DeviceProfile,
+) -> Result<NativeAudioChatModel> {
+    Ok(NativeAudioChatModel::Lfm25Audio(Lfm25AudioModel::load(
+        model_dir, variant, device,
+    )?))
+}
+
 fn load_voxtral_model(
     model_dir: &Path,
     _variant: ModelVariant,
@@ -196,6 +214,12 @@ const ASR_LOADER_REGISTRY: &[AsrLoaderRegistration] = &[
         loader: load_qwen_asr_model,
     },
 ];
+
+const AUDIO_CHAT_LOADER_REGISTRY: &[AudioChatLoaderRegistration] = &[AudioChatLoaderRegistration {
+    name: "lfm25_audio",
+    family: ModelFamily::Lfm25Audio,
+    loader: load_lfm25_audio_model,
+}];
 
 const CHAT_LOADER_REGISTRY: &[ChatLoaderRegistration] = &[
     ChatLoaderRegistration {
@@ -269,6 +293,15 @@ fn resolve_chat_loader_registration(
         .find(|registration| registration.family == family)
 }
 
+fn resolve_audio_chat_loader_registration(
+    variant: ModelVariant,
+) -> Option<&'static AudioChatLoaderRegistration> {
+    let family = variant.family();
+    AUDIO_CHAT_LOADER_REGISTRY
+        .iter()
+        .find(|registration| registration.family == family)
+}
+
 fn resolve_diarization_loader_registration(
     variant: ModelVariant,
 ) -> Option<&'static DiarizationLoaderRegistration> {
@@ -309,6 +342,10 @@ pub enum NativeAsrModel {
     Qwen3(Qwen3AsrModel),
     Parakeet(ParakeetAsrModel),
     WhisperTurbo(WhisperTurboAsrModel),
+}
+
+pub enum NativeAudioChatModel {
+    Lfm25Audio(Lfm25AudioModel),
 }
 
 pub enum NativeAsrDecodeState {
@@ -661,6 +698,8 @@ pub struct ModelRegistry {
     models_dir: PathBuf,
     device: DeviceProfile,
     asr_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<NativeAsrModel>>>>>>,
+    audio_chat_models:
+        Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<NativeAudioChatModel>>>>>>,
     diarization_models:
         Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<NativeDiarizationModel>>>>>>,
     chat_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<NativeChatModel>>>>>>,
@@ -675,6 +714,7 @@ impl ModelRegistry {
             models_dir,
             device,
             asr_models: Arc::new(RwLock::new(HashMap::new())),
+            audio_chat_models: Arc::new(RwLock::new(HashMap::new())),
             diarization_models: Arc::new(RwLock::new(HashMap::new())),
             chat_models: Arc::new(RwLock::new(HashMap::new())),
             voxtral_models: Arc::new(RwLock::new(HashMap::new())),
@@ -724,6 +764,48 @@ impl ModelRegistry {
                     tokio::task::spawn_blocking(move || {
                         let model = loader(&model_dir, variant, device)?;
                         Ok::<NativeAsrModel, Error>(model)
+                    })
+                    .await
+                    .map_err(|e| Error::ModelLoadError(e.to_string()))?
+                    .map(Arc::new)
+                }
+            })
+            .await?;
+
+        Ok(model.clone())
+    }
+
+    pub async fn load_audio_chat(
+        &self,
+        variant: ModelVariant,
+        model_dir: &Path,
+    ) -> Result<Arc<NativeAudioChatModel>> {
+        let registration = resolve_audio_chat_loader_registration(variant).ok_or_else(|| {
+            Error::InvalidInput(format!("Unsupported audio-chat model variant: {variant}"))
+        })?;
+
+        let cell = {
+            let mut guard = self.audio_chat_models.write().await;
+            guard
+                .entry(variant)
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+
+        info!(
+            "Loading native audio-chat model {variant} ({}) from {model_dir:?}",
+            registration.name
+        );
+
+        let model = cell
+            .get_or_try_init({
+                let model_dir = model_dir.to_path_buf();
+                let device = self.device.clone();
+                let loader = registration.loader;
+                move || async move {
+                    tokio::task::spawn_blocking(move || {
+                        let model = loader(&model_dir, variant, device)?;
+                        Ok::<NativeAudioChatModel, Error>(model)
                     })
                     .await
                     .map_err(|e| Error::ModelLoadError(e.to_string()))?
@@ -977,8 +1059,21 @@ impl ModelRegistry {
         guard.get(&variant).and_then(|cell| cell.get().cloned())
     }
 
+    pub async fn get_audio_chat(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<Arc<NativeAudioChatModel>> {
+        let guard = self.audio_chat_models.read().await;
+        guard.get(&variant).and_then(|cell| cell.get().cloned())
+    }
+
     pub fn try_get_chat(&self, variant: ModelVariant) -> Option<Arc<NativeChatModel>> {
         let guard = self.chat_models.try_read().ok()?;
+        guard.get(&variant).and_then(|cell| cell.get().cloned())
+    }
+
+    pub fn try_get_audio_chat(&self, variant: ModelVariant) -> Option<Arc<NativeAudioChatModel>> {
+        let guard = self.audio_chat_models.try_read().ok()?;
         guard.get(&variant).and_then(|cell| cell.get().cloned())
     }
 
@@ -1024,6 +1119,11 @@ impl ModelRegistry {
 
     pub async fn unload_chat(&self, variant: ModelVariant) {
         let mut guard = self.chat_models.write().await;
+        guard.remove(&variant);
+    }
+
+    pub async fn unload_audio_chat(&self, variant: ModelVariant) {
+        let mut guard = self.audio_chat_models.write().await;
         guard.remove(&variant);
     }
 

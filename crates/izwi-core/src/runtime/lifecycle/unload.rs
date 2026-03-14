@@ -29,7 +29,9 @@ impl RuntimeService {
             ModelFamily::Voxtral => {
                 self.model_registry.unload_voxtral(variant).await;
             }
-            ModelFamily::Lfm25Audio => {}
+            ModelFamily::Lfm25Audio => {
+                self.model_registry.unload_audio_chat(variant).await;
+            }
             ModelFamily::Qwen3Tts => {
                 self.model_registry.unload_qwen_tts(variant).await;
                 self.clear_active_tts_variant(variant).await;
