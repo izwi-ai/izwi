@@ -761,9 +761,11 @@ fn repeat_head_states(x: &Tensor, repeats: usize) -> Result<Tensor> {
         return Ok(x.clone());
     }
     let (batch, heads, dim) = x.dims3()?;
-    let expanded = x.unsqueeze(2)?.broadcast_as((batch, heads, repeats, dim))?;
+    // Match llama.cpp's tiled repeat layout for Qwen3.5 linear attention:
+    // [h0, h1, ...] -> [h0, h1, ..., h0, h1, ...].
+    let expanded = x.unsqueeze(1)?.broadcast_as((batch, repeats, heads, dim))?;
     expanded
-        .reshape((batch, heads * repeats, dim))
+        .reshape((batch, repeats * heads, dim))
         .map_err(Error::from)
 }
 
@@ -785,4 +787,28 @@ fn recurrent_gated_delta(
     let state = (&state + &key.unsqueeze(3)?.broadcast_mul(&delta.unsqueeze(2)?)?)?;
     let output = state.broadcast_mul(&query.unsqueeze(3)?)?.sum(2)?;
     Ok((output, state))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::repeat_head_states;
+    use candle_core::{Device, Tensor};
+
+    #[test]
+    fn repeat_head_states_uses_tiled_order() {
+        let x = Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (1, 2, 2), &Device::Cpu)
+            .expect("tensor should build");
+        let repeated = repeat_head_states(&x, 2).expect("repeat should succeed");
+        let values = repeated.to_vec3::<f32>().expect("values");
+
+        assert_eq!(
+            values,
+            vec![vec![
+                vec![1.0, 2.0],
+                vec![3.0, 4.0],
+                vec![1.0, 2.0],
+                vec![3.0, 4.0]
+            ]]
+        );
+    }
 }

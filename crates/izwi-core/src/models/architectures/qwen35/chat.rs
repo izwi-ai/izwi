@@ -1521,6 +1521,57 @@ mod tests {
         assert!(output.tokens_generated <= 4);
     }
 
+    fn generate_local_qwen35_variant_text_smoke_if_available(
+        model_name: &str,
+        variant: ModelVariant,
+    ) {
+        let model_dir = local_model_dir(model_name);
+        if !model_dir.exists() {
+            return;
+        }
+
+        let model =
+            Qwen35ChatModel::load(&model_dir, variant, DeviceProfile::cpu()).expect("model loads");
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "Who made you? Reply in one short sentence.".to_string(),
+        }];
+        let config = ChatGenerationConfig {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            stop_token_ids: Vec::new(),
+            seed: 7,
+            request: ChatRequestConfig {
+                enable_thinking: Some(false),
+                tools: Vec::new(),
+                media_inputs: Vec::new(),
+            },
+        };
+
+        let output = model
+            .generate_with_config(&messages, 32, &config)
+            .expect("qwen3.5 text generation should run");
+        let text = output.text.trim();
+
+        assert!(output.tokens_generated <= 32);
+        assert!(!text.is_empty(), "qwen3.5 output should not be empty");
+        assert!(
+            !text.starts_with("</think>") && !text.starts_with("think>"),
+            "qwen3.5 output should not start with malformed think closing tags: {text}"
+        );
+    }
+
+    #[test]
+    fn generate_local_qwen35_4b_text_smoke_if_available() {
+        generate_local_qwen35_variant_text_smoke_if_available(
+            "Qwen3.5-4B",
+            ModelVariant::Qwen354BGguf,
+        );
+    }
+
     #[test]
     fn generate_local_qwen35_text_metal_smoke_if_available() {
         let model_dir = local_model_dir("Qwen3.5-0.8B");
