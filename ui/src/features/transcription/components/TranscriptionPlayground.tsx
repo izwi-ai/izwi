@@ -61,13 +61,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { StatePanel } from "@/components/ui/state-panel";
 import { StatusBadge } from "@/components/ui/status-badge";
-import {
-  WorkspaceFrame,
-  WorkspaceHeader,
-  WorkspacePanel,
-} from "@/components/ui/workspace";
 import { useWorkspaceShortcuts } from "@/hooks/useWorkspaceShortcuts";
 import { RouteModelSelect } from "@/components/RouteModelSelect";
 
@@ -1366,149 +1360,136 @@ export function TranscriptionPlayground({
         ) : null}
       </div>
 
-      <WorkspaceFrame className="flex min-h-[460px] flex-col lg:min-h-[560px] xl:h-full xl:min-h-0">
-        <WorkspaceHeader
-          icon={FileText}
-          title="Transcript"
-          description={
-            <>
-              Saved automatically to transcription history.
-              <span className="mt-1 block text-[11px] text-[var(--text-subtle)]">
-                Streaming and timestamps are separate modes.
-              </span>
-            </>
-          }
-          actions={
-            <>
-              {isStreaming ? (
-                <StatusBadge tone="success">Live</StatusBadge>
-              ) : detectedLanguage ? (
-                <StatusBadge>{detectedLanguage}</StatusBadge>
-              ) : null}
-              <Select
-                value={selectedLanguage}
-                onValueChange={setSelectedLanguage}
+      <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] flex flex-col min-h-[460px] lg:min-h-[560px] xl:h-full xl:min-h-0 overflow-hidden">
+        <div className="px-4 sm:px-5 py-4 border-b border-[var(--border-muted)] flex items-center justify-between gap-3 bg-[var(--bg-surface-1)]">
+          <div className="flex items-center gap-2">
+            <h3 className="text-base font-semibold text-[var(--text-primary)]">
+              Transcript
+            </h3>
+          </div>
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            {isStreaming ? (
+              <StatusBadge tone="success">Live</StatusBadge>
+            ) : detectedLanguage ? (
+              <StatusBadge>{detectedLanguage}</StatusBadge>
+            ) : null}
+            <Select
+              value={selectedLanguage}
+              onValueChange={setSelectedLanguage}
+              disabled={isProcessing}
+            >
+              <SelectTrigger className="h-9 w-[140px] sm:w-[160px] text-xs bg-[var(--bg-surface-1)]">
+                <SelectValue placeholder="Language" />
+              </SelectTrigger>
+              <SelectContent>
+                {LANGUAGE_OPTIONS.map((language) => (
+                  <SelectItem
+                    key={language}
+                    value={language}
+                    className="text-xs"
+                  >
+                    {language}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <label className="flex items-center gap-2 rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
+              <span className="font-medium">Timestamps</span>
+              <input
+                type="checkbox"
+                checked={includeTimestamps}
+                onChange={(event) =>
+                  handleIncludeTimestampsChange(event.target.checked)
+                }
+                className="app-checkbox h-3.5 w-3.5 disabled:opacity-50"
                 disabled={isProcessing}
-              >
-                <SelectTrigger className="h-8 w-[140px] sm:w-[160px] text-xs">
-                  <SelectValue placeholder="Language" />
-                </SelectTrigger>
-                <SelectContent>
-                  {LANGUAGE_OPTIONS.map((language) => (
-                    <SelectItem
-                      key={language}
-                      value={language}
-                      className="text-xs"
-                    >
-                      {language}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <label className="flex items-center gap-2 rounded-md border border-[var(--border-muted)] bg-muted/30 px-2 py-1.5 text-xs text-muted-foreground shadow-sm">
-                <span className="font-medium">Timestamps</span>
-                <input
-                  type="checkbox"
-                  checked={includeTimestamps}
-                  onChange={(event) =>
-                    handleIncludeTimestampsChange(event.target.checked)
-                  }
-                  className="app-checkbox h-3.5 w-3.5 disabled:opacity-50"
-                  disabled={isProcessing}
-                />
-              </label>
-              <label className="flex items-center gap-2 rounded-md border border-[var(--border-muted)] bg-muted/30 px-2 py-1.5 text-xs text-muted-foreground shadow-sm">
-                <Radio className="w-3.5 h-3.5" />
-                <span className="font-medium">Stream</span>
-                <input
-                  type="checkbox"
-                  checked={streamingEnabled}
-                  onChange={(event) =>
-                    handleStreamingEnabledChange(event.target.checked)
-                  }
-                  className="app-checkbox w-3.5 h-3.5 disabled:opacity-50 ml-1"
-                  disabled={isProcessing}
-                />
-              </label>
-              <Button
-                onClick={handleCopy}
-                variant="outline"
-                size="sm"
-                className="h-8 w-8 p-0"
-                disabled={!currentOutputExportText || isStreaming}
-                title="Copy transcript"
-              >
-                {copied ? (
-                  <Check className="w-4 h-4 text-green-500" />
-                ) : (
-                  <Copy className="w-4 h-4" />
-                )}
-              </Button>
-              <TranscriptionExportDialog record={outputRecord}>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-8 w-8 p-0"
-                  disabled={!currentOutputExportText || isStreaming}
-                  title="Export transcript"
-                >
-                  <Download className="w-4 h-4" />
-                </Button>
-              </TranscriptionExportDialog>
-            </>
-          }
-        />
-
-        <div className="mt-4 flex-1 min-h-0">
-          {showResult ? (
-            <>
-              {isProcessing && !transcription ? (
-                <StatePanel
-                  title={
-                    isStreaming
-                      ? "Streaming transcription..."
-                      : "Transcribing..."
-                  }
-                  description="Izwi is processing the current audio input."
-                  icon={Loader2}
-                  tone="info"
-                  align="center"
-                />
+              />
+            </label>
+            <label className="flex items-center gap-2 rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
+              <Radio className="w-3.5 h-3.5" />
+              <span className="font-medium">Stream</span>
+              <input
+                type="checkbox"
+                checked={streamingEnabled}
+                onChange={(event) =>
+                  handleStreamingEnabledChange(event.target.checked)
+                }
+                className="app-checkbox w-3.5 h-3.5 disabled:opacity-50 ml-1"
+                disabled={isProcessing}
+              />
+            </label>
+            <Button
+              onClick={handleCopy}
+              variant="outline"
+              size="icon"
+              className="h-9 w-9 bg-[var(--bg-surface-1)] border-[var(--border-muted)] text-[var(--text-secondary)] hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)]"
+              disabled={!currentOutputExportText || isStreaming}
+              title="Copy transcript"
+            >
+              {copied ? (
+                <Check className="w-4 h-4 text-green-500" />
               ) : (
-                <TranscriptionReviewWorkspace
-                  record={outputRecord}
-                  audioUrl={audioUrl}
-                  emptyMessage="Record audio or upload a file to start."
-                />
+                <Copy className="w-4 h-4" />
               )}
-            </>
+            </Button>
+            <TranscriptionExportDialog record={outputRecord}>
+              <Button
+                variant="outline"
+                size="icon"
+                className="h-9 w-9 bg-[var(--bg-surface-1)] border-[var(--border-muted)] text-[var(--text-secondary)] hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)]"
+                disabled={!currentOutputExportText || isStreaming}
+                title="Export transcript"
+              >
+                <Download className="w-4 h-4" />
+              </Button>
+            </TranscriptionExportDialog>
+          </div>
+        </div>
+
+        <div className="flex-1 overflow-y-auto p-4 sm:p-6 bg-[var(--bg-surface-0)] scrollbar-thin">
+          {isProcessing && !transcription ? (
+            <div className="h-full flex flex-col items-center justify-center text-sm font-medium text-[var(--text-muted)] gap-3">
+              <Loader2 className="w-5 h-5 animate-spin text-[var(--text-primary)]" />
+              {isStreaming
+                ? "Streaming transcription..."
+                : "Transcribing audio..."}
+            </div>
+          ) : showResult ? (
+            <div className="space-y-4">
+              {isStreaming ? (
+                <div className="rounded-xl border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-4 py-3 text-sm text-[var(--status-warning-text)] flex items-center gap-3">
+                  <MiniWaveform isActive={true} />
+                  <span>Listening for speech...</span>
+                </div>
+              ) : null}
+
+              <TranscriptionReviewWorkspace
+                record={outputRecord}
+                audioUrl={audioUrl}
+                emptyMessage="Record audio or upload a file to start."
+              />
+
+              {processingStats && !isStreaming ? (
+                <GenerationStats stats={processingStats} type="asr" />
+              ) : null}
+            </div>
           ) : (
-            <StatePanel
-              title="Record audio or upload a file to start"
-              description="The transcript appears live and is stored automatically."
-              icon={FileText}
-              dashed
-              align="center"
-            />
+            <div className="h-full flex items-center justify-center text-center px-6">
+              <div className="max-w-sm">
+                <div className="w-16 h-16 rounded-full bg-[var(--bg-surface-2)] flex items-center justify-center mx-auto mb-4 border border-[var(--border-muted)]">
+                  <FileText className="w-8 h-8 text-[var(--text-subtle)]" />
+                </div>
+                <p className="text-base font-semibold text-[var(--text-secondary)] mb-2">
+                  Ready to transcribe
+                </p>
+                <p className="text-sm text-[var(--text-muted)] leading-relaxed">
+                  Record audio from your microphone or upload an audio file to
+                  start transcription. The transcript will appear here.
+                </p>
+              </div>
+            </div>
           )}
         </div>
-
-        {isStreaming ? (
-          <WorkspacePanel className="mt-4 flex items-center gap-2 px-4 py-3 text-sm text-[var(--text-secondary)]">
-            <MiniWaveform isActive={true} />
-            <span className="italic">Listening for speech...</span>
-          </WorkspacePanel>
-        ) : null}
-
-        <div className="mt-4 text-xs text-[var(--text-muted)]">
-          Shortcut: <span className="app-kbd">Ctrl/Cmd + Enter</span> start or stop capture, <span className="app-kbd">Esc</span> stop recording, <span className="app-kbd">Shift + Esc</span> reset.
-        </div>
-
-        {processingStats && !isStreaming && (
-          <div className="mt-4 pt-3 border-t border-[var(--border-muted)]">
-            <GenerationStats stats={processingStats} type="asr" />
-          </div>
-        )}
 
         <AnimatePresence>
           {error && (
@@ -1516,18 +1497,18 @@ export function TranscriptionPlayground({
               initial={{ opacity: 0, height: 0, y: 10 }}
               animate={{ opacity: 1, height: "auto", y: 0 }}
               exit={{ opacity: 0, height: 0, y: 10 }}
-              className="mt-4"
+              className="m-4 p-3.5 rounded-lg border border-[var(--danger-border)] bg-[var(--danger-bg)] text-[var(--danger-text)] text-sm font-medium flex items-start gap-3"
             >
-              <StatePanel
-                title="Transcription error"
-                description={error}
-                icon={AlertTriangle}
-                tone="danger"
-              />
+              <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+              {error}
             </motion.div>
           )}
         </AnimatePresence>
-      </WorkspaceFrame>
+      </div>
+
+      <div className="xl:col-start-2 text-xs text-[var(--text-muted)]">
+        Shortcut: <span className="app-kbd">Ctrl/Cmd + Enter</span> start or stop capture, <span className="app-kbd">Esc</span> stop recording, <span className="app-kbd">Shift + Esc</span> reset.
+      </div>
 
       {historyActionContainer === undefined
         ? historyDrawer
