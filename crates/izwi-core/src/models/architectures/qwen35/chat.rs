@@ -18,7 +18,7 @@ use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
 use crate::models::shared::weights::gguf::{GgufLoader, GgufModelInfo};
 use crate::tokenizer::Tokenizer;
 
-use super::text::Qwen35TextModel;
+use super::text::{Qwen35TextModel, Qwen35TextRuntimeState};
 use super::vision::{PreparedVisionInputs, Qwen35VisionModel};
 
 const IMAGE_PAD_PLACEHOLDER: &str = "<|image_pad|>";
@@ -36,6 +36,26 @@ struct PreparedPrompt {
 pub struct ChatGenerationOutput {
     pub text: String,
     pub tokens_generated: usize,
+}
+
+pub struct ChatDecodeState {
+    text_state: Qwen35TextRuntimeState,
+    logits: Tensor,
+    generated_ids: Vec<u32>,
+    assembled: String,
+    max_new_tokens: usize,
+    finished: bool,
+    next_text_position: usize,
+    config: ChatGenerationConfig,
+    rng: SimpleRng,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatDecodeStep {
+    pub delta: String,
+    pub text: String,
+    pub tokens_generated: usize,
+    pub finished: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -387,6 +407,47 @@ impl Qwen35ChatModel {
         config: &ChatGenerationConfig,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ChatGenerationOutput> {
+        let mut state = self.start_decode_state_with_config(messages, max_new_tokens, config)?;
+        loop {
+            let step = self.decode_step(&mut state)?;
+            if !step.delta.is_empty() {
+                on_delta(&step.delta);
+            }
+            if step.finished {
+                return Ok(ChatGenerationOutput {
+                    text: step.text,
+                    tokens_generated: step.tokens_generated,
+                });
+            }
+        }
+    }
+
+    pub fn supports_incremental_decode(&self) -> bool {
+        true
+    }
+
+    pub fn device_kind(&self) -> BackendKind {
+        self.device_kind
+    }
+
+    pub fn start_decode_state(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+    ) -> Result<ChatDecodeState> {
+        self.start_decode_state_with_config(
+            messages,
+            max_new_tokens,
+            &ChatGenerationConfig::default(),
+        )
+    }
+
+    pub fn start_decode_state_with_config(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+    ) -> Result<ChatDecodeState> {
         let prepared_prompt = self.prepare_prompt(messages, config)?;
         if prepared_prompt.prompt_ids.is_empty() {
             return Err(Error::InvalidInput(
@@ -394,7 +455,84 @@ impl Qwen35ChatModel {
             ));
         }
 
-        let mut state = self.text_model.new_state();
+        let mut text_state = self.text_model.new_state();
+        let logits = self.prefill_prompt(&prepared_prompt, &mut text_state)?;
+
+        Ok(ChatDecodeState {
+            text_state,
+            logits,
+            generated_ids: Vec::new(),
+            assembled: String::new(),
+            max_new_tokens: max_new_tokens.max(1),
+            finished: false,
+            next_text_position: prepared_prompt.next_text_position,
+            config: config.clone(),
+            rng: SimpleRng::new(config.seed),
+        })
+    }
+
+    pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
+        if state.finished || state.generated_ids.len() >= state.max_new_tokens {
+            state.finished = true;
+            return Ok(ChatDecodeStep {
+                delta: String::new(),
+                text: state.assembled.trim().to_string(),
+                tokens_generated: state.generated_ids.len(),
+                finished: true,
+            });
+        }
+
+        let next = sample_next_token(
+            &state.logits,
+            self.tokenizer.vocab_size,
+            &state.config,
+            &state.generated_ids,
+            &mut state.rng,
+        )?;
+        if self.is_stop_token(next, &state.config) {
+            state.finished = true;
+            return Ok(ChatDecodeStep {
+                delta: String::new(),
+                text: state.assembled.trim().to_string(),
+                tokens_generated: state.generated_ids.len(),
+                finished: true,
+            });
+        }
+
+        state.generated_ids.push(next);
+        let decoded = self.tokenizer.decode_text(&state.generated_ids)?;
+        let delta = text_delta(&state.assembled, &decoded);
+        state.assembled = decoded;
+        state.logits = self.text_model.forward_token_id_at(
+            next,
+            [state.next_text_position; 3],
+            &mut state.text_state,
+        )?;
+        state.next_text_position += 1;
+        if state.generated_ids.len() >= state.max_new_tokens {
+            state.finished = true;
+        }
+
+        Ok(ChatDecodeStep {
+            delta,
+            text: state.assembled.trim().to_string(),
+            tokens_generated: state.generated_ids.len(),
+            finished: state.finished,
+        })
+    }
+
+    fn is_stop_token(&self, token_id: u32, config: &ChatGenerationConfig) -> bool {
+        token_id == self.tokenizer.specials.im_end
+            || token_id == self.tokenizer.specials.eos
+            || self.tokenizer.specials.eos_alt == Some(token_id)
+            || config.stop_token_ids.contains(&token_id)
+    }
+
+    fn prefill_prompt(
+        &self,
+        prepared_prompt: &PreparedPrompt,
+        text_state: &mut Qwen35TextRuntimeState,
+    ) -> Result<Tensor> {
         let mut logits: Option<Tensor> = None;
         let mut vision_embedding_index = 0usize;
         for (token_id, position_ids) in prepared_prompt
@@ -421,16 +559,17 @@ impl Qwen35ChatModel {
                     .reshape((1, 1, self.text_model.hidden_size()))?;
                 vision_embedding_index += 1;
                 self.text_model
-                    .forward_input_embedding_at(&embedding, position_ids, &mut state)?
+                    .forward_input_embedding_at(&embedding, position_ids, text_state)?
             } else if token_id == self.tokenizer.specials.video_pad {
                 return Err(Error::InvalidInput(
                     "Qwen3.5 video inputs are not implemented yet".to_string(),
                 ));
             } else {
                 self.text_model
-                    .forward_token_id_at(token_id, position_ids, &mut state)?
+                    .forward_token_id_at(token_id, position_ids, text_state)?
             });
         }
+
         if let Some(vision_inputs) = prepared_prompt.vision_inputs.as_ref() {
             if vision_embedding_index != vision_inputs.embeddings.dim(0)? {
                 return Err(Error::InferenceError(format!(
@@ -439,60 +578,10 @@ impl Qwen35ChatModel {
                 )));
             }
         }
-        let mut logits = logits.ok_or_else(|| {
+
+        logits.ok_or_else(|| {
             Error::InferenceError("Qwen3.5 prompt prefill did not produce logits".to_string())
-        })?;
-
-        let max_new_tokens = max_new_tokens.max(1);
-        let mut generated_ids = Vec::new();
-        let mut assembled = String::new();
-        let mut rng = SimpleRng::new(config.seed);
-        let mut next_text_position = prepared_prompt.next_text_position;
-
-        while generated_ids.len() < max_new_tokens {
-            let next = sample_next_token(
-                &logits,
-                self.tokenizer.vocab_size,
-                config,
-                &generated_ids,
-                &mut rng,
-            )?;
-            if self.is_stop_token(next, config) {
-                break;
-            }
-
-            generated_ids.push(next);
-            let decoded = self.tokenizer.decode_text(&generated_ids)?;
-            let delta = text_delta(&assembled, &decoded);
-            if !delta.is_empty() {
-                on_delta(&delta);
-            }
-            assembled = decoded;
-            logits =
-                self.text_model
-                    .forward_token_id_at(next, [next_text_position; 3], &mut state)?;
-            next_text_position += 1;
-        }
-
-        Ok(ChatGenerationOutput {
-            text: assembled.trim().to_string(),
-            tokens_generated: generated_ids.len(),
         })
-    }
-
-    pub fn supports_incremental_decode(&self) -> bool {
-        false
-    }
-
-    pub fn device_kind(&self) -> BackendKind {
-        self.device_kind
-    }
-
-    fn is_stop_token(&self, token_id: u32, config: &ChatGenerationConfig) -> bool {
-        token_id == self.tokenizer.specials.im_end
-            || token_id == self.tokenizer.specials.eos
-            || self.tokenizer.specials.eos_alt == Some(token_id)
-            || config.stop_token_ids.contains(&token_id)
     }
 
     fn prepare_prompt(

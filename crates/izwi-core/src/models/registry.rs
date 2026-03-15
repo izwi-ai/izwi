@@ -25,7 +25,9 @@ use crate::models::architectures::qwen3::chat::{
     ChatDecodeState as Qwen3ChatDecodeState, ChatGenerationOutput, Qwen3ChatModel,
 };
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
-use crate::models::architectures::qwen35::chat::Qwen35ChatModel;
+use crate::models::architectures::qwen35::chat::{
+    ChatDecodeState as Qwen35ChatDecodeState, Qwen35ChatModel,
+};
 use crate::models::architectures::sortformer::diarization::SortformerDiarizerModel;
 use crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel;
 use crate::models::architectures::whisper::asr::{
@@ -625,6 +627,7 @@ pub enum NativeChatModel {
 
 pub enum NativeChatDecodeState {
     Qwen3(Qwen3ChatDecodeState),
+    Qwen35(Qwen35ChatDecodeState),
 }
 
 #[derive(Debug, Clone)]
@@ -770,8 +773,8 @@ impl NativeChatModel {
             Self::Qwen3(model) => Ok(NativeChatDecodeState::Qwen3(
                 model.start_decode(messages, max_new_tokens)?,
             )),
-            Self::Qwen35(_) => Err(Error::InvalidInput(
-                "Incremental decode state is not available for this chat model".to_string(),
+            Self::Qwen35(model) => Ok(NativeChatDecodeState::Qwen35(
+                model.start_decode_state_with_config(messages, max_new_tokens, _config)?,
             )),
             Self::Gemma3(_) => Err(Error::InvalidInput(
                 "Incremental decode state is not available for this chat model".to_string(),
@@ -785,6 +788,15 @@ impl NativeChatModel {
     pub fn decode_step(&self, state: &mut NativeChatDecodeState) -> Result<NativeChatDecodeStep> {
         match (self, state) {
             (Self::Qwen3(model), NativeChatDecodeState::Qwen3(state)) => {
+                let step = model.decode_step(state)?;
+                Ok(NativeChatDecodeStep {
+                    delta: step.delta,
+                    text: step.text,
+                    tokens_generated: step.tokens_generated,
+                    finished: step.finished,
+                })
+            }
+            (Self::Qwen35(model), NativeChatDecodeState::Qwen35(state)) => {
                 let step = model.decode_step(state)?;
                 Ok(NativeChatDecodeStep {
                     delta: step.delta,
