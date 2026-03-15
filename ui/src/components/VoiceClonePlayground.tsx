@@ -1,4 +1,4 @@
-import { useState, useRef, useMemo, useEffect } from "react";
+import { useState, useRef, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Users,
@@ -11,7 +11,6 @@ import {
   ArrowRight,
   BadgeCheck,
   Globe,
-  ChevronDown,
   Settings2,
 } from "lucide-react";
 import { api, type SpeechHistoryRecord, type TTSGenerationStats } from "../api";
@@ -26,8 +25,16 @@ import { LANGUAGES } from "../types";
 import clsx from "clsx";
 import { GenerationStats } from "./GenerationStats";
 import { SpeechHistoryPanel } from "./SpeechHistoryPanel";
+import { RouteModelSelect } from "@/components/RouteModelSelect";
 import { StatePanel } from "@/components/ui/state-panel";
 import { StatusBadge } from "@/components/ui/status-badge";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   WorkspaceFrame,
   WorkspaceHeader,
@@ -84,7 +91,6 @@ export function VoiceClonePlayground({
 }: VoiceClonePlaygroundProps) {
   const [text, setText] = useState(DEFAULT_AUDITION_TEXT);
   const [language, setLanguage] = useState("Auto");
-  const [showLanguageSelect, setShowLanguageSelect] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
@@ -102,7 +108,6 @@ export function VoiceClonePlayground({
     useState<VoiceCloneReferenceState | null>(null);
   const [consentConfirmed, setConsentConfirmed] = useState(false);
   const [savedVoiceId, setSavedVoiceId] = useState<string | null>(null);
-  const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
   const {
     downloadState,
     downloadMessage,
@@ -114,30 +119,6 @@ export function VoiceClonePlayground({
 
   const audioRef = useRef<HTMLAudioElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const modelMenuRef = useRef<HTMLDivElement>(null);
-
-  const selectedOption = useMemo(() => {
-    if (!selectedModel) {
-      return null;
-    }
-    return (
-      modelOptions.find((option) => option.value === selectedModel) || null
-    );
-  }, [selectedModel, modelOptions]);
-
-  useEffect(() => {
-    const onPointerDown = (event: MouseEvent) => {
-      if (
-        modelMenuRef.current &&
-        event.target instanceof Node &&
-        !modelMenuRef.current.contains(event.target)
-      ) {
-        setIsModelMenuOpen(false);
-      }
-    };
-    window.addEventListener("mousedown", onPointerDown);
-    return () => window.removeEventListener("mousedown", onPointerDown);
-  }, []);
 
   const handleGenerate = async () => {
     if (!selectedModel || !selectedModelReady) {
@@ -303,94 +284,17 @@ export function VoiceClonePlayground({
   const reusableVoiceId =
     savedVoiceId || referenceState?.activeSavedVoiceId || null;
 
-  const getStatusTone = (option: ModelOption): string => {
-    if (option.isReady) {
-      return "text-[var(--text-secondary)] bg-[var(--bg-surface-3)] border border-[var(--border-muted)]";
-    }
-    if (
-      option.statusLabel.toLowerCase().includes("downloading") ||
-      option.statusLabel.toLowerCase().includes("loading")
-    ) {
-      return "text-amber-400 bg-amber-500/10";
-    }
-    if (option.statusLabel.toLowerCase().includes("error")) {
-      return "text-red-400 bg-red-500/10";
-    }
-    return "text-[var(--text-muted)] bg-[var(--bg-surface-2)] border border-[var(--border-muted)]";
-  };
-
   const handleOpenModels = () => {
-    setIsModelMenuOpen(false);
     onOpenModelManager?.();
   };
 
   const renderModelSelector = () => (
-    <div
-      className="relative inline-block w-[280px] max-w-[85vw]"
-      ref={modelMenuRef}
-    >
-      <button
-        onClick={() => setIsModelMenuOpen((prev) => !prev)}
-        className={clsx(
-          "h-9 w-full px-3 rounded-lg border inline-flex items-center justify-between gap-2 text-xs transition-colors",
-          selectedOption?.isReady
-            ? "border-[var(--border-strong)] bg-[var(--bg-surface-3)] text-[var(--text-primary)]"
-            : "border-[var(--border-muted)] bg-[var(--bg-surface-2)] text-[var(--text-secondary)] hover:border-[var(--border-strong)]",
-        )}
-      >
-        <span className="flex-1 min-w-0 truncate text-left">
-          {selectedOption?.label || "Select model"}
-        </span>
-        <ChevronDown
-          className={clsx(
-            "w-3.5 h-3.5 shrink-0 transition-transform",
-            isModelMenuOpen && "rotate-180",
-          )}
-        />
-      </button>
-
-      <AnimatePresence>
-        {isModelMenuOpen && (
-          <motion.div
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 8 }}
-            transition={{ duration: 0.15 }}
-            className="absolute left-0 right-0 top-full mt-2 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-2)] p-1.5 shadow-2xl z-50"
-          >
-            <div className="max-h-64 overflow-y-auto pr-1 space-y-0.5">
-              {modelOptions.map((option) => (
-                <button
-                  key={option.value}
-                  onClick={() => {
-                    onSelectModel?.(option.value);
-                    setIsModelMenuOpen(false);
-                  }}
-                  className={clsx(
-                    "w-full text-left rounded-lg px-3 py-2 transition-colors",
-                    selectedOption?.value === option.value
-                      ? "bg-[var(--bg-surface-3)]"
-                      : "hover:bg-[var(--bg-surface-3)]",
-                  )}
-                >
-                  <div className="text-xs text-[var(--text-primary)] truncate">
-                    {option.label}
-                  </div>
-                  <span
-                    className={clsx(
-                      "mt-1 inline-flex items-center rounded px-1.5 py-0.5 text-[10px]",
-                      getStatusTone(option),
-                    )}
-                  >
-                    {option.statusLabel}
-                  </span>
-                </button>
-              ))}
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </div>
+    <RouteModelSelect
+      value={selectedModel}
+      options={modelOptions}
+      onSelect={onSelectModel}
+      className="w-full max-w-[280px]"
+    />
   );
 
   return (
@@ -402,53 +306,21 @@ export function VoiceClonePlayground({
             title="Voice Cloning"
             description="Prepare a reference, confirm quality, and audition a reusable cloned voice before sending it to TTS."
             actions={
-              <div className="relative w-full sm:w-auto">
-                <button
-                  onClick={() => setShowLanguageSelect(!showLanguageSelect)}
-                  className="flex w-full sm:w-56 items-center justify-between gap-2 px-3 py-2 rounded-lg bg-[var(--bg-surface-2)] border border-[var(--border-muted)] hover:border-[var(--border-strong)] transition-colors text-sm"
-                >
-                  <Globe className="w-4 h-4 text-[var(--text-muted)]" />
-                  <span className="text-[var(--text-primary)] font-medium flex-1 min-w-0 truncate text-left">
-                    {LANGUAGES.find((l) => l.id === language)?.name || language}
-                  </span>
-                  <ChevronDown
-                    className={clsx(
-                      "w-4 h-4 text-[var(--text-muted)] transition-transform",
-                      showLanguageSelect && "rotate-180",
-                    )}
-                  />
-                </button>
-
-                <AnimatePresence>
-                  {showLanguageSelect && (
-                    <motion.div
-                      initial={{ opacity: 0, y: -4 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      exit={{ opacity: 0, y: -4 }}
-                      transition={{ duration: 0.15 }}
-                      className="absolute left-0 right-0 top-full mt-2 max-h-64 overflow-y-auto p-1.5 rounded-xl bg-[var(--bg-surface-1)] border border-[var(--border-strong)] shadow-xl z-50"
-                    >
-                      {LANGUAGES.map((lang) => (
-                        <button
-                          key={lang.id}
-                          onClick={() => {
-                            setLanguage(lang.id);
-                            setShowLanguageSelect(false);
-                          }}
-                          className={clsx(
-                            "w-full px-3 py-2.5 rounded-lg text-left text-sm font-medium transition-colors",
-                            language === lang.id
-                              ? "bg-[var(--bg-surface-2)] text-[var(--text-primary)]"
-                              : "hover:bg-[var(--bg-surface-2)] text-[var(--text-secondary)]",
-                          )}
-                        >
-                          {lang.name}
-                        </button>
-                      ))}
-                    </motion.div>
-                  )}
-                </AnimatePresence>
-              </div>
+              <Select value={language} onValueChange={setLanguage}>
+                <SelectTrigger className="w-full sm:w-56">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <Globe className="h-4 w-4 text-[var(--text-muted)]" />
+                    <SelectValue placeholder="Language" />
+                  </div>
+                </SelectTrigger>
+                <SelectContent>
+                  {LANGUAGES.map((lang) => (
+                    <SelectItem key={lang.id} value={lang.id}>
+                      {lang.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             }
           />
 
