@@ -2,6 +2,8 @@ import type { ReactNode } from "react";
 import { Music4 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Card, CardContent } from "@/components/ui/card";
+import { StatePanel } from "@/components/ui/state-panel";
+import { StatusBadge } from "@/components/ui/status-badge";
 import {
   VOICE_ROUTE_BODY_COPY_CLASS,
   VOICE_ROUTE_PANEL_TITLE_CLASS,
@@ -40,19 +42,14 @@ export function VoicePicker({
 }: VoicePickerProps) {
   if (items.length === 0) {
     return (
-      <Card className={cn("border-dashed", className)}>
-        <CardContent className="flex min-h-48 flex-col items-center justify-center gap-3 text-center">
-          <div className="rounded-2xl border border-border/70 bg-muted/45 p-4">
-            <Music4 className="h-6 w-6 text-muted-foreground" />
-          </div>
-          <div className="space-y-1">
-            <p className={VOICE_ROUTE_PANEL_TITLE_CLASS}>{emptyTitle}</p>
-            <p className={cn(VOICE_ROUTE_BODY_COPY_CLASS, "max-w-md")}>
-              {emptyDescription}
-            </p>
-          </div>
-        </CardContent>
-      </Card>
+      <StatePanel
+        title={emptyTitle}
+        description={emptyDescription}
+        icon={Music4}
+        align="center"
+        dashed
+        className={className}
+      />
     );
   }
 
@@ -94,13 +91,9 @@ export function VoicePicker({
                 </div>
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-2">
-                    <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--text-muted)]">
-                      {item.categoryLabel}
-                    </span>
+                    <StatusBadge>{item.categoryLabel}</StatusBadge>
                     {item.selected ? (
-                      <div className="rounded-full border border-primary/35 bg-primary/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-primary">
-                        Selected
-                      </div>
+                      <StatusBadge tone="info">Selected</StatusBadge>
                     ) : null}
                   </div>
                   <div className={cn(VOICE_ROUTE_PANEL_TITLE_CLASS, "mt-2")}>

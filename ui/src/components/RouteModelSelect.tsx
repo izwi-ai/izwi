@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { ChevronDown } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { StatusBadge } from "@/components/ui/status-badge";
 import { cn } from "@/lib/utils";
 
 interface RouteModelSelectOption {
@@ -21,22 +22,24 @@ interface RouteModelSelectProps {
   disabled?: boolean;
 }
 
-function getStatusTone(option: RouteModelSelectOption): string {
+function getStatusTone(
+  option: RouteModelSelectOption,
+): ComponentProps<typeof StatusBadge>["tone"] {
   const normalizedStatus = option.statusLabel.toLowerCase();
 
   if (option.isReady) {
-    return "border-emerald-500/25 bg-emerald-500/10 text-emerald-600 dark:text-emerald-300";
+    return "success";
   }
   if (
     normalizedStatus.includes("downloading") ||
     normalizedStatus.includes("loading")
   ) {
-    return "border-amber-500/25 bg-amber-500/10 text-amber-600 dark:text-amber-300";
+    return "warning";
   }
   if (normalizedStatus.includes("error")) {
-    return "border-destructive/25 bg-destructive/10 text-destructive";
+    return "danger";
   }
-  return "border-border bg-muted text-muted-foreground";
+  return "neutral";
 }
 
 export function RouteModelSelect({
@@ -126,14 +129,12 @@ export function RouteModelSelect({
                     <div className="truncate text-sm font-medium text-[var(--text-primary)]">
                       {option.label}
                     </div>
-                    <span
-                      className={cn(
-                        "mt-1 inline-flex rounded-md border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider",
-                        getStatusTone(option),
-                      )}
+                    <StatusBadge
+                      tone={getStatusTone(option)}
+                      className="mt-1"
                     >
                       {option.statusLabel}
-                    </span>
+                    </StatusBadge>
                   </div>
                 </button>
               ))}
