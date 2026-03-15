@@ -20,7 +20,6 @@ import {
   Trash2,
   Upload,
   X,
-  ChevronDown,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -34,7 +33,6 @@ import { RouteHistoryDrawer } from "@/components/RouteHistoryDrawer";
 import {
   LANGUAGE_OPTIONS,
   LIVE_MIC_PCM_FRAME_SIZE,
-  type ModelOption,
   type ProcessAudioOptions,
   type TranscriptionPlaygroundProps,
   buildTranscriptionRealtimeWebSocketUrl,
@@ -72,6 +70,7 @@ import {
   WorkspaceSectionLabel,
 } from "@/components/ui/workspace";
 import { useWorkspaceShortcuts } from "@/hooks/useWorkspaceShortcuts";
+import { RouteModelSelect } from "@/components/RouteModelSelect";
 
 export function TranscriptionPlayground({
   selectedModel,
@@ -97,7 +96,6 @@ export function TranscriptionPlayground({
   const [isStreaming, setIsStreaming] = useState(false);
   const [includeTimestamps, setIncludeTimestamps] = useState(false);
   const [selectedLanguage, setSelectedLanguage] = useState("English");
-  const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
   const [currentOutputRecord, setCurrentOutputRecord] =
     useState<TranscriptionRecord | null>(null);
   const [historyRecords, setHistoryRecords] = useState<
@@ -137,30 +135,6 @@ export function TranscriptionPlayground({
   const liveMicAudioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const liveMicProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const liveMicProcessorSinkRef = useRef<GainNode | null>(null);
-  const modelMenuRef = useRef<HTMLDivElement | null>(null);
-
-  const selectedOption = useMemo(() => {
-    if (!selectedModel) {
-      return null;
-    }
-    return (
-      modelOptions.find((option) => option.value === selectedModel) || null
-    );
-  }, [selectedModel, modelOptions]);
-
-  useEffect(() => {
-    const onPointerDown = (event: MouseEvent) => {
-      if (
-        modelMenuRef.current &&
-        event.target instanceof Node &&
-        !modelMenuRef.current.contains(event.target)
-      ) {
-        setIsModelMenuOpen(false);
-      }
-    };
-    window.addEventListener("mousedown", onPointerDown);
-    return () => window.removeEventListener("mousedown", onPointerDown);
-  }, []);
 
   const requireReadyModel = useCallback(() => {
     if (!selectedModel || !selectedModelReady) {
@@ -1109,93 +1083,17 @@ export function TranscriptionPlayground({
     setHistoryTranscriptCopied(false);
   }, [selectedHistoryRecordId]);
 
-  const getStatusTone = (option: ModelOption): string => {
-    if (option.isReady) {
-      return "text-green-500 bg-green-500/10";
-    }
-    if (
-      option.statusLabel.toLowerCase().includes("downloading") ||
-      option.statusLabel.toLowerCase().includes("loading")
-    ) {
-      return "text-[var(--text-muted)] bg-amber-500/10";
-    }
-    if (option.statusLabel.toLowerCase().includes("error")) {
-      return "text-destructive bg-destructive/10";
-    }
-    return "text-muted-foreground bg-muted";
-  };
-
   const handleOpenModels = () => {
-    setIsModelMenuOpen(false);
     onOpenModelManager?.();
   };
 
   const renderModelSelector = () => (
-    <div className="relative w-full" ref={modelMenuRef}>
-      <Button
-        variant="outline"
-        onClick={() => setIsModelMenuOpen((prev) => !prev)}
-        className={cn(
-          "h-10 w-full justify-between rounded-lg border-[var(--border-muted)] bg-[var(--bg-surface-0)] font-normal text-[var(--text-primary)] shadow-sm hover:bg-[var(--bg-surface-2)]",
-          selectedOption?.isReady
-            ? "border-[var(--border-strong)]"
-            : "text-[var(--text-secondary)]",
-        )}
-      >
-        <span className="flex-1 min-w-0 truncate text-left">
-          {selectedOption?.label || "Select model"}
-        </span>
-        <ChevronDown
-          className={cn(
-            "w-3.5 h-3.5 transition-transform shrink-0 opacity-50",
-            isModelMenuOpen && "rotate-180",
-          )}
-        />
-      </Button>
-
-      <AnimatePresence>
-        {isModelMenuOpen && (
-          <motion.div
-            initial={{ opacity: 0, y: 6, scale: 0.98 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: 6, scale: 0.98 }}
-            transition={{ duration: 0.16 }}
-            className="absolute left-0 right-0 top-full z-[90] mt-2 rounded-xl border border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-1.5 text-[var(--text-primary)] shadow-xl"
-          >
-            <div className="max-h-64 overflow-y-auto">
-              {modelOptions.map((option) => (
-                <button
-                  key={option.value}
-                  onClick={() => {
-                    onSelectModel?.(option.value);
-                    setIsModelMenuOpen(false);
-                  }}
-                  className={cn(
-                    "relative flex w-full cursor-default select-none items-center rounded-lg px-2.5 py-2 text-sm outline-none transition-colors hover:bg-[var(--bg-surface-1)] focus:bg-[var(--bg-surface-1)] data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
-                    selectedOption?.value === option.value &&
-                      "bg-[var(--bg-surface-1)]",
-                  )}
-                >
-                  <div className="flex flex-col items-start min-w-0 w-full">
-                    <span className="truncate w-full text-left font-medium">
-                      {option.label}
-                    </span>
-                    <span
-                      className={cn(
-                        "mt-1 text-[10px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded-sm",
-                        getStatusTone(option),
-                      )}
-                    >
-                      {option.statusLabel}
-                    </span>
-                  </div>
-                </button>
-              ))}
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </div>
+    <RouteModelSelect
+      value={selectedModel}
+      options={modelOptions}
+      onSelect={onSelectModel}
+      className="w-full"
+    />
   );
 
   const historyDrawer = (

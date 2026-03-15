@@ -40,7 +40,6 @@ import {
   type ChatPlaygroundProps,
   type GenerateTitleArgs,
   type ImagePreviewState,
-  type ModelOption,
   type PendingImageAttachment,
   defaultThinkingEnabledForModel,
   displayThreadTitle,
@@ -61,6 +60,7 @@ import {
 } from "@/features/chat/playground/support";
 import { api, type ChatThread, type ChatThreadMessageRecord } from "@/api";
 import { MarkdownContent } from "@/components/ui/MarkdownContent";
+import { RouteModelSelect } from "@/components/RouteModelSelect";
 
 export function ChatPlayground({
   selectedModel,
@@ -96,7 +96,6 @@ export function ChatPlayground({
     tokens_generated: number;
     generation_time_ms: number;
   } | null>(null);
-  const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
   const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(
     null,
   );
@@ -119,19 +118,9 @@ export function ChatPlayground({
   const streamAbortRef = useRef<AbortController | null>(null);
   const listEndRef = useRef<HTMLDivElement | null>(null);
   const streamingThinkingRef = useRef<HTMLDivElement | null>(null);
-  const modelMenuRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const pendingImageSeqRef = useRef(0);
-
-  const selectedOption = useMemo(() => {
-    if (!selectedModel) {
-      return null;
-    }
-    return (
-      modelOptions.find((option) => option.value === selectedModel) || null
-    );
-  }, [selectedModel, modelOptions]);
 
   const activeThread = useMemo(
     () => threads.find((thread) => thread.id === activeThreadId) ?? null,
@@ -353,21 +342,6 @@ export function ChatPlayground({
     textareaRef.current.style.overflowY =
       textareaRef.current.scrollHeight > maxHeight ? "auto" : "hidden";
   }, [hasConversation, input]);
-
-  useEffect(() => {
-    const onPointerDown = (event: MouseEvent) => {
-      if (
-        modelMenuRef.current &&
-        event.target instanceof Node &&
-        !modelMenuRef.current.contains(event.target)
-      ) {
-        setIsModelMenuOpen(false);
-      }
-    };
-
-    window.addEventListener("mousedown", onPointerDown);
-    return () => window.removeEventListener("mousedown", onPointerDown);
-  }, []);
 
   useEffect(() => {
     if (initializedRef.current) {
@@ -853,112 +827,22 @@ export function ChatPlayground({
   };
 
   const handleOpenModels = () => {
-    setIsModelMenuOpen(false);
     onOpenModelManager();
-  };
-
-  const getStatusToneClassName = (option: ModelOption): string => {
-    if (option.isReady) {
-      return "chat-model-status-ready";
-    }
-
-    const normalizedStatus = option.statusLabel.toLowerCase();
-
-    if (
-      normalizedStatus.includes("downloading") ||
-      normalizedStatus.includes("loading")
-    ) {
-      return "chat-model-status-loading";
-    }
-
-    if (normalizedStatus.includes("error")) {
-      return "chat-model-status-error";
-    }
-
-    return "chat-model-status-idle";
   };
 
   const renderModelSelector = (
     placement: "composer" | "header" = "composer",
   ) => (
-    <div
+    <RouteModelSelect
+      value={selectedModel}
+      options={modelOptions}
+      onSelect={onSelectModel}
       className={cn(
-        "relative z-40 inline-block",
         placement === "header"
           ? "w-full max-w-[320px]"
           : "w-[240px] max-w-[calc(100vw-9rem)] sm:w-[300px]",
       )}
-      ref={modelMenuRef}
-    >
-      <Button
-        variant="outline"
-        onClick={() => setIsModelMenuOpen((previous) => !previous)}
-        className={cn(
-          "h-9 w-full justify-between rounded-lg border px-3 text-xs font-medium shadow-none",
-          selectedOption?.isReady
-            ? chatSecondaryButtonActiveClass
-            : chatSecondaryButtonClass,
-        )}
-      >
-        <span className="flex-1 min-w-0 truncate text-left">
-          {selectedOption?.label || "Select model"}
-        </span>
-        <ChevronDown
-          className={cn(
-            "w-3.5 h-3.5 shrink-0 opacity-50 transition-transform",
-            isModelMenuOpen && "rotate-180",
-          )}
-        />
-      </Button>
-
-      <AnimatePresence>
-        {isModelMenuOpen && (
-          <motion.div
-            initial={{ opacity: 0, y: 6, scale: 0.98 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: 6, scale: 0.98 }}
-            transition={{ duration: 0.16 }}
-            className={cn(
-              "chat-model-menu absolute left-0 right-0 z-[90] rounded-xl border p-1.5 shadow-2xl",
-              placement === "header" ? "top-full mt-2" : "bottom-11",
-            )}
-          >
-            <div className="max-h-64 space-y-0.5 overflow-y-auto pr-1">
-              {modelOptions.map((option) => (
-                <button
-                  key={option.value}
-                  onClick={() => {
-                    onSelectModel(option.value);
-                    setIsModelMenuOpen(false);
-                  }}
-                  className={cn(
-                    "relative flex w-full cursor-default select-none items-center rounded-lg border px-3 py-2 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/45 focus-visible:ring-offset-2 focus-visible:ring-offset-background",
-                    selectedOption?.value === option.value &&
-                      "chat-model-option-active",
-                    selectedOption?.value !== option.value &&
-                      "chat-model-option-idle",
-                  )}
-                >
-                  <div className="flex min-w-0 w-full flex-col items-start">
-                    <span className="chat-model-option-label w-full truncate text-left font-medium">
-                      {option.label}
-                    </span>
-                    <span
-                      className={cn(
-                        "mt-1 inline-flex items-center rounded-sm border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider",
-                        getStatusToneClassName(option),
-                      )}
-                    >
-                      {option.statusLabel}
-                    </span>
-                  </div>
-                </button>
-              ))}
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </div>
+    />
   );
 
   const renderComposer = (centered = false) => (
