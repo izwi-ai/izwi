@@ -2,6 +2,7 @@ import { AudioApiClient } from "@/shared/api/audio";
 import { ChatApiClient } from "@/shared/api/chat";
 import { ApiHttpClient, API_BASE } from "@/shared/api/http";
 import { ModelApiClient } from "@/shared/api/models";
+import { OnboardingApiClient } from "@/shared/api/onboarding";
 import { VoiceApiClient } from "@/shared/api/voice";
 
 const modelMethodNames = [
@@ -107,6 +108,11 @@ const voiceMethodNames = [
   "clearVoiceObservations",
 ] as const;
 
+const onboardingMethodNames = [
+  "getOnboardingState",
+  "completeOnboarding",
+] as const;
+
 function bindMethods<T extends object, K extends readonly (keyof T)[]>(
   instance: T,
   methodNames: K,
@@ -129,6 +135,7 @@ export function createApiClient(baseUrl: string = API_BASE) {
   const audioApi = new AudioApiClient(http);
   const chatApi = new ChatApiClient(http);
   const voiceApi = new VoiceApiClient(http);
+  const onboardingApi = new OnboardingApiClient(http);
 
   return {
     baseUrl: http.baseUrl,
@@ -136,6 +143,7 @@ export function createApiClient(baseUrl: string = API_BASE) {
     ...bindMethods(audioApi, audioMethodNames),
     ...bindMethods(chatApi, chatMethodNames),
     ...bindMethods(voiceApi, voiceMethodNames),
+    ...bindMethods(onboardingApi, onboardingMethodNames),
   };
 }
 

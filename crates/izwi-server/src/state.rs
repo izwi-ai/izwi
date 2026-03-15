@@ -2,6 +2,7 @@
 
 use crate::chat_store::ChatStore;
 use crate::diarization_store::DiarizationStore;
+use crate::onboarding_store::OnboardingStore;
 use crate::saved_voice_store::SavedVoiceStore;
 use crate::speech_history_store::SpeechHistoryStore;
 use crate::transcription_store::TranscriptionStore;
@@ -78,6 +79,8 @@ pub struct AppState {
     pub speech_history_store: Arc<SpeechHistoryStore>,
     /// SQLite-backed saved voice store.
     pub saved_voice_store: Arc<SavedVoiceStore>,
+    /// SQLite-backed onboarding completion store.
+    pub onboarding_store: Arc<OnboardingStore>,
     /// SQLite-backed TTS project store.
     pub tts_project_store: Arc<TtsProjectStore>,
     /// SQLite-backed voice profile/session store.
@@ -106,6 +109,7 @@ impl AppState {
         let tts_project_store = Arc::new(TtsProjectStore::initialize()?);
         let voice_store = Arc::new(VoiceStore::initialize()?);
         let voice_observation_store = Arc::new(VoiceObservationStore::initialize()?);
+        let onboarding_store = Arc::new(OnboardingStore::initialize()?);
 
         Ok(Self {
             runtime: Arc::new(runtime),
@@ -120,6 +124,7 @@ impl AppState {
             diarization_store,
             speech_history_store,
             saved_voice_store,
+            onboarding_store,
             tts_project_store,
             voice_store,
             voice_observation_store,

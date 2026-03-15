@@ -40,6 +40,7 @@ pub fn create_router(state: AppState, serve_config: &ServeRuntimeConfig) -> Rout
 
     let v1_routes = Router::new()
         .merge(crate::api::internal::router())
+        .merge(crate::api::onboarding::router())
         .merge(crate::api::agent::router())
         .merge(crate::api::chat::router())
         .merge(crate::api::media::router())

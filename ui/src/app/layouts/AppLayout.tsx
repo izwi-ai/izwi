@@ -18,6 +18,7 @@ import {
 import { APP_ICON_URL, APP_VERSION } from "@/shared/config/runtime";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { FirstRunOnboarding } from "@/app/onboarding/FirstRunOnboarding";
 
 const appIconUrl = APP_ICON_URL;
 const APP_VERSION_LABEL = `v${APP_VERSION}`;
@@ -154,6 +155,7 @@ export function AppLayout({
 
   return (
     <div className="h-dvh flex overflow-hidden bg-transparent text-foreground selection:bg-primary/25 selection:text-foreground">
+      <FirstRunOnboarding />
       {/* Mobile header */}
       <div className="lg:hidden fixed top-0 left-0 right-0 z-40 border-b border-border/80 bg-background/78 backdrop-blur-xl">
         <div className="flex items-center justify-between px-4 py-3.5">

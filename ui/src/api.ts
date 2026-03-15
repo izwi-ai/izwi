@@ -85,3 +85,5 @@ export type {
   VoiceProfile,
   VoiceProfileUpdateRequest,
 } from "@/shared/api/voice";
+
+export type { OnboardingStateResponse } from "@/shared/api/onboarding";
