@@ -67,7 +67,6 @@ import {
   WorkspaceFrame,
   WorkspaceHeader,
   WorkspacePanel,
-  WorkspaceSectionLabel,
 } from "@/components/ui/workspace";
 import { useWorkspaceShortcuts } from "@/hooks/useWorkspaceShortcuts";
 import { RouteModelSelect } from "@/components/RouteModelSelect";
@@ -1223,32 +1222,38 @@ export function TranscriptionPlayground({
 
   return (
     <div className="grid gap-5 lg:gap-6 xl:grid-cols-[340px,minmax(0,1fr)] xl:h-[calc(100dvh-11.75rem)]">
-      <WorkspaceFrame className="space-y-4 xl:h-full xl:min-h-0 xl:overflow-y-auto">
-        <WorkspaceHeader
-          icon={FileAudio}
-          title="Audio Input"
-          description="Capture live audio or upload a file, then save the transcript to history automatically."
-          actions={
-            onOpenModelManager ? (
-              <Button
-                onClick={handleOpenModels}
-                variant="outline"
-                size="sm"
-                className="h-8 gap-1.5 text-xs shadow-sm"
-              >
-                <Settings2 className="w-4 h-4" />
-                Models
-              </Button>
-            ) : null
-          }
-        />
-
-        <WorkspacePanel className="mt-5 space-y-3 p-4">
+      <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-4 sm:p-5 space-y-4">
+        <div className="flex items-center justify-between gap-3">
           <div>
-            <WorkspaceSectionLabel className="mb-2">
+            <div className="inline-flex items-center gap-2 text-xs font-semibold text-[var(--text-muted)] uppercase tracking-wider">
+              <FileAudio className="w-3.5 h-3.5" />
+              Capture
+            </div>
+            <h2 className="mt-1.5 text-base font-semibold text-[var(--text-primary)]">
+              Audio Input
+            </h2>
+          </div>
+          {onOpenModelManager ? (
+            <Button
+              onClick={handleOpenModels}
+              variant="outline"
+              size="sm"
+              className="h-8 gap-1.5 text-xs bg-[var(--bg-surface-1)] border-[var(--border-muted)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-surface-2)] shadow-sm"
+            >
+              <Settings2 className="w-4 h-4" />
+              Models
+            </Button>
+          ) : null}
+        </div>
+
+        <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 space-y-3">
+          <div>
+            <div className="text-xs font-semibold text-[var(--text-muted)] uppercase tracking-wider">
               Active Model
-            </WorkspaceSectionLabel>
-            {modelOptions.length > 0 && renderModelSelector()}
+            </div>
+            {modelOptions.length > 0 ? (
+              <div className="mt-3">{renderModelSelector()}</div>
+            ) : null}
           </div>
 
           <div className="pt-2 border-t border-[var(--border-muted)]">
@@ -1258,10 +1263,10 @@ export function TranscriptionPlayground({
                 : "Select and load a transcription model"}
             </StatusBadge>
           </div>
-        </WorkspacePanel>
+        </div>
 
-        <WorkspacePanel className="p-5">
-          <div className="flex flex-col items-center py-4">
+        <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
+          <div className="flex flex-col items-center">
             <button
               onClick={() => {
                 if (isRecording) {
@@ -1346,18 +1351,20 @@ export function TranscriptionPlayground({
               </div>
             </div>
           </div>
-        </WorkspacePanel>
+        </div>
 
-        {hasDraft && (
-          <button
+        {hasDraft ? (
+          <Button
             onClick={handleReset}
-            className="btn btn-ghost w-full text-xs"
+            variant="ghost"
+            size="sm"
+            className="w-full h-9 gap-2 text-xs border border-transparent hover:border-[var(--border-muted)] bg-transparent hover:bg-[var(--bg-surface-1)]"
           >
             <RotateCcw className="w-3.5 h-3.5" />
             Reset Session
-          </button>
-        )}
-      </WorkspaceFrame>
+          </Button>
+        ) : null}
+      </div>
 
       <WorkspaceFrame className="flex min-h-[460px] flex-col lg:min-h-[560px] xl:h-full xl:min-h-0">
         <WorkspaceHeader
