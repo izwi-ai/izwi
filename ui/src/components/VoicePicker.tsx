@@ -84,39 +84,41 @@ export function VoicePicker({
               }
             }}
           >
-            <CardContent className="flex h-full flex-col gap-4 p-5">
-              <div className="flex items-start gap-3">
-                <div className="speaker-avatar flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl text-sm font-semibold">
-                  {itemInitial(item.name)}
-                </div>
-                <div className="min-w-0 flex-1">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <StatusBadge>{item.categoryLabel}</StatusBadge>
-                    {item.selected ? (
-                      <StatusBadge tone="info">Selected</StatusBadge>
+            <CardContent className="flex h-full flex-col gap-4 p-6">
+              <div className="rounded-[var(--radius-lg)] border border-[var(--border-muted)] bg-[var(--bg-surface-1)]/82 px-4 py-4">
+                <div className="flex items-start gap-3.5">
+                  <div className="speaker-avatar flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl text-sm font-semibold">
+                    {itemInitial(item.name)}
+                  </div>
+                  <div className="min-w-0 flex-1 pt-0.5">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <StatusBadge>{item.categoryLabel}</StatusBadge>
+                      {item.selected ? (
+                        <StatusBadge tone="info">Selected</StatusBadge>
+                      ) : null}
+                    </div>
+                    <div className={cn(VOICE_ROUTE_PANEL_TITLE_CLASS, "mt-3")}>
+                      {item.name}
+                    </div>
+
+                    {item.meta && item.meta.length > 0 ? (
+                      <div className="mt-3 flex flex-wrap gap-1.5">
+                        {item.meta.map((meta) => (
+                          <span
+                            key={`${item.id}-${meta}`}
+                            className="rounded-full border border-border/75 bg-background/80 px-2.5 py-0.5 text-[11px] font-medium text-muted-foreground"
+                          >
+                            {meta}
+                          </span>
+                        ))}
+                      </div>
                     ) : null}
                   </div>
-                  <div className={cn(VOICE_ROUTE_PANEL_TITLE_CLASS, "mt-2")}>
-                    {item.name}
-                  </div>
-
-                  {item.meta && item.meta.length > 0 ? (
-                    <div className="mt-3 flex flex-wrap gap-1.5">
-                      {item.meta.map((meta) => (
-                        <span
-                          key={`${item.id}-${meta}`}
-                          className="rounded-full border border-border/75 bg-muted/55 px-2.5 py-0.5 text-[11px] font-medium text-muted-foreground"
-                        >
-                          {meta}
-                        </span>
-                      ))}
-                    </div>
-                  ) : null}
                 </div>
               </div>
 
               {item.description ? (
-                <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-3.5">
+                <div className="rounded-[var(--radius-lg)] border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-4">
                   <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-2")}>
                     Voice Notes
                   </div>
@@ -127,7 +129,7 @@ export function VoicePicker({
               ) : null}
 
               <div className="mt-auto space-y-3">
-                <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-3.5">
+                <div className="rounded-[var(--radius-lg)] border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-4">
                   <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-2")}>
                     Preview
                   </div>
