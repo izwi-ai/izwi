@@ -17,12 +17,17 @@ import {
   VOICE_ROUTE_META_COPY_CLASS,
   VOICE_ROUTE_PANEL_TITLE_CLASS,
   VOICE_ROUTE_SECTION_LABEL_CLASS,
-  VOICE_ROUTE_WORKSPACE_DESCRIPTION_CLASS,
-  VOICE_ROUTE_WORKSPACE_TITLE_CLASS,
 } from "@/components/voiceRouteTypography";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { StatePanel } from "@/components/ui/state-panel";
+import { StatusBadge } from "@/components/ui/status-badge";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import {
+  WorkspaceFrame,
+  WorkspaceHeader,
+  WorkspacePanel,
+} from "@/components/ui/workspace";
 import { getSpeakerProfilesForVariant, isLfm25AudioVariant } from "@/types";
 import {
   TEXT_TO_SPEECH_PREFERRED_MODELS,
@@ -427,60 +432,50 @@ export function VoicesPage({
         description="Manage saved cloned and designed voices, browse built-in voice libraries, and hand them off into text-to-speech."
       />
 
-      <div className="card flex min-h-0 flex-col p-4 xl:h-[calc(100dvh-11.75rem)]">
-        <div className="mb-4 flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-          <div className="flex items-center gap-3">
-            <div className="rounded border border-[var(--border-muted)] bg-[var(--bg-surface-2)] p-2">
-              <Library className="h-5 w-5 text-[var(--text-muted)]" />
-            </div>
-            <div>
-              <h2 className={VOICE_ROUTE_WORKSPACE_TITLE_CLASS}>
-                Voice browser
-              </h2>
-              <p className={VOICE_ROUTE_WORKSPACE_DESCRIPTION_CLASS}>
-                Reusable saved voices stay ready for TTS. Built-in speakers come
-                from the active model.
-              </p>
-            </div>
-          </div>
+      <WorkspaceFrame className="flex min-h-0 flex-col xl:h-[calc(100dvh-11.75rem)]">
+        <WorkspaceHeader
+          icon={Library}
+          title="Voice browser"
+          description="Reusable saved voices stay ready for TTS. Built-in speakers come from the active model."
+          actions={
+            <Tabs
+              value={activeTab}
+              onValueChange={(value) => setActiveTab(value as "saved" | "built-in")}
+              className="w-full max-w-md"
+            >
+              <TabsList className="grid w-full grid-cols-2 border-[var(--border-strong)] bg-[var(--bg-surface-2)] p-1 shadow-sm">
+                <TabsTrigger
+                  value="saved"
+                  className="justify-between gap-2 text-[var(--text-muted)] hover:text-[var(--text-primary)] data-[state=active]:bg-[var(--accent-solid)] data-[state=active]:text-[var(--text-on-accent)] data-[state=active]:shadow-[0_8px_20px_-14px_rgba(17,17,17,0.55)]"
+                >
+                  <span className="inline-flex items-center gap-2">
+                    <Library className="h-4 w-4" />
+                    My Voices
+                  </span>
+                  <span className="rounded-full border border-current/15 px-2 py-0.5 text-[10px] font-semibold">
+                    {totalSavedVoices}
+                  </span>
+                </TabsTrigger>
+                <TabsTrigger
+                  value="built-in"
+                  className="justify-between gap-2 text-[var(--text-muted)] hover:text-[var(--text-primary)] data-[state=active]:bg-[var(--accent-solid)] data-[state=active]:text-[var(--text-on-accent)] data-[state=active]:shadow-[0_8px_20px_-14px_rgba(17,17,17,0.55)]"
+                >
+                  <span className="inline-flex items-center gap-2">
+                    <Sparkles className="h-4 w-4" />
+                    Built-in Voices
+                  </span>
+                  <span className="rounded-full border border-current/15 px-2 py-0.5 text-[10px] font-semibold">
+                    {builtInVoices.length}
+                  </span>
+                </TabsTrigger>
+              </TabsList>
+            </Tabs>
+          }
+        />
 
-          <Tabs
-            value={activeTab}
-            onValueChange={(value) => setActiveTab(value as "saved" | "built-in")}
-            className="w-full max-w-md"
-          >
-            <TabsList className="grid w-full grid-cols-2 border-[var(--border-strong)] bg-[var(--bg-surface-2)] p-1 shadow-sm">
-              <TabsTrigger
-                value="saved"
-                className="justify-between gap-2 text-[var(--text-muted)] hover:text-[var(--text-primary)] data-[state=active]:bg-[var(--accent-solid)] data-[state=active]:text-[var(--text-on-accent)] data-[state=active]:shadow-[0_8px_20px_-14px_rgba(17,17,17,0.55)]"
-              >
-                <span className="inline-flex items-center gap-2">
-                  <Library className="h-4 w-4" />
-                  My Voices
-                </span>
-                <span className="rounded-full border border-current/15 px-2 py-0.5 text-[10px] font-semibold">
-                  {totalSavedVoices}
-                </span>
-              </TabsTrigger>
-              <TabsTrigger
-                value="built-in"
-                className="justify-between gap-2 text-[var(--text-muted)] hover:text-[var(--text-primary)] data-[state=active]:bg-[var(--accent-solid)] data-[state=active]:text-[var(--text-on-accent)] data-[state=active]:shadow-[0_8px_20px_-14px_rgba(17,17,17,0.55)]"
-              >
-                <span className="inline-flex items-center gap-2">
-                  <Sparkles className="h-4 w-4" />
-                  Built-in Voices
-                </span>
-                <span className="rounded-full border border-current/15 px-2 py-0.5 text-[10px] font-semibold">
-                  {builtInVoices.length}
-                </span>
-              </TabsTrigger>
-            </TabsList>
-          </Tabs>
-        </div>
-
-        <div className="grid min-h-0 flex-1 gap-5 xl:grid-cols-[290px_minmax(0,1fr)]">
+        <div className="mt-5 grid min-h-0 flex-1 gap-5 xl:grid-cols-[290px_minmax(0,1fr)]">
           <aside className="space-y-4">
-            <section className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
+            <WorkspacePanel className="p-5">
               <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>Search</div>
               <Input
                 value={search}
@@ -496,10 +491,10 @@ export function VoicesPage({
               >
                 {activeResultsLabel} matching the current tab.
               </div>
-            </section>
+            </WorkspacePanel>
 
             {activeTab === "saved" ? (
-              <section className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
+              <WorkspacePanel className="p-5">
                 <div className="flex items-start justify-between gap-3">
                   <div>
                     <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>
@@ -568,9 +563,9 @@ export function VoicesPage({
                     ))}
                   </div>
                 </div>
-              </section>
+              </WorkspacePanel>
             ) : (
-              <section className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
+              <WorkspacePanel className="p-5">
                 <div className="flex items-start justify-between gap-3">
                   <div>
                     <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>
@@ -631,11 +626,11 @@ export function VoicesPage({
                     </div>
                   </div>
                 </div>
-              </section>
+              </WorkspacePanel>
             )}
           </aside>
 
-          <section className="flex min-h-0 flex-col rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 sm:p-6">
+          <WorkspacePanel className="flex min-h-0 flex-col p-5 sm:p-6">
             <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
               <div>
                 <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>
@@ -650,25 +645,25 @@ export function VoicesPage({
               </div>
 
               <div className="flex flex-wrap gap-2 text-xs">
-                <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[var(--text-muted)]">
-                  {activeResultsLabel}
-                </span>
+                <StatusBadge>{activeResultsLabel}</StatusBadge>
                 {activeTab === "saved" && savedVoiceFilter !== "all" ? (
-                  <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[var(--text-muted)]">
+                  <StatusBadge>
                     {savedVoiceFilter === "voice_cloning" ? "Cloned only" : "Designed only"}
-                  </span>
+                  </StatusBadge>
                 ) : null}
                 {activeTab === "built-in" && resolvedSelectedModel ? (
-                  <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[var(--text-muted)]">
-                    {resolvedSelectedModel}
-                  </span>
+                  <StatusBadge>{resolvedSelectedModel}</StatusBadge>
                 ) : null}
               </div>
             </div>
 
             {activeTab === "saved" && savedVoicesError ? (
-              <div className="mt-4 rounded-xl border border-[var(--danger-border)] bg-[var(--danger-bg)] px-4 py-3 text-sm text-[var(--danger-text)]">
-                {savedVoicesError}
+              <div className="mt-4">
+                <StatePanel
+                  title="Saved voices unavailable"
+                  description={savedVoicesError}
+                  tone="danger"
+                />
               </div>
             ) : null}
 
@@ -694,9 +689,9 @@ export function VoicesPage({
                 className="grid-cols-[repeat(auto-fill,minmax(300px,1fr))]"
               />
             </div>
-          </section>
+          </WorkspacePanel>
         </div>
-      </div>
+      </WorkspaceFrame>
 
       <RouteModelModal
         isOpen={isModelModalOpen}

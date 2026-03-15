@@ -20,14 +20,19 @@ import {
   VOICE_ROUTE_META_COPY_CLASS,
   VOICE_ROUTE_PANEL_TITLE_CLASS,
   VOICE_ROUTE_SECTION_LABEL_CLASS,
-  VOICE_ROUTE_WORKSPACE_DESCRIPTION_CLASS,
-  VOICE_ROUTE_WORKSPACE_TITLE_CLASS,
 } from "@/components/voiceRouteTypography";
 import { VoiceClone, type VoiceCloneReferenceState } from "./VoiceClone";
 import { LANGUAGES } from "../types";
 import clsx from "clsx";
 import { GenerationStats } from "./GenerationStats";
 import { SpeechHistoryPanel } from "./SpeechHistoryPanel";
+import { StatePanel } from "@/components/ui/state-panel";
+import { StatusBadge } from "@/components/ui/status-badge";
+import {
+  WorkspaceFrame,
+  WorkspaceHeader,
+  WorkspacePanel,
+} from "@/components/ui/workspace";
 import { useDownloadIndicator } from "../utils/useDownloadIndicator";
 
 interface ModelOption {
@@ -348,26 +353,13 @@ export function VoiceClonePlayground({
 
   return (
     <div className="grid gap-6 items-stretch xl:h-[calc(100dvh-11.75rem)]">
-      <div className="card p-6 flex min-h-0 flex-col">
+      <WorkspaceFrame className="flex min-h-0 flex-col p-6">
         <div className="flex-1 min-h-0 overflow-y-auto pr-1 scrollbar-thin">
-          {/* Header */}
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between mb-6 gap-4">
-            <div className="flex items-center gap-3">
-              <div className="p-2.5 rounded-lg bg-[var(--bg-surface-2)]">
-                <Users className="w-5 h-5 text-[var(--text-primary)]" />
-              </div>
-              <div>
-                <h2 className={VOICE_ROUTE_WORKSPACE_TITLE_CLASS}>
-                  Voice Cloning
-                </h2>
-                <p className={VOICE_ROUTE_WORKSPACE_DESCRIPTION_CLASS}>
-                  Prepare a reference, confirm quality, and audition a reusable
-                  cloned voice before sending it to TTS.
-                </p>
-              </div>
-            </div>
-
-            <div className="flex flex-wrap items-center justify-end gap-2">
+          <WorkspaceHeader
+            icon={Users}
+            title="Voice Cloning"
+            description="Prepare a reference, confirm quality, and audition a reusable cloned voice before sending it to TTS."
+            actions={
               <div className="relative w-full sm:w-auto">
                 <button
                   onClick={() => setShowLanguageSelect(!showLanguageSelect)}
@@ -415,36 +407,24 @@ export function VoiceClonePlayground({
                   )}
                 </AnimatePresence>
               </div>
-            </div>
-          </div>
+            }
+          />
 
-          <div className="mb-6 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 sm:p-5">
+          <WorkspacePanel className="mb-6 mt-5 p-4 sm:p-5">
             <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
               <div className="min-w-0 flex-1">
                 <div className={clsx(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-2.5")}>
                   Active Model
                 </div>
                 {modelOptions.length > 0 && <div>{renderModelSelector()}</div>}
-                <div
-                  className={clsx(
-                    "mt-2.5 flex items-center gap-1.5 text-xs font-medium",
-                    selectedModelReady
-                      ? "text-green-500"
-                      : "text-[var(--text-muted)]",
-                  )}
+                <StatusBadge
+                  tone={selectedModelReady ? "success" : "warning"}
+                  className="mt-2.5"
                 >
-                  {selectedModelReady ? (
-                    <>
-                      <div className="w-1.5 h-1.5 rounded-full bg-green-500" />
-                      Ready for cloning
-                    </>
-                  ) : (
-                    <>
-                      <div className="w-1.5 h-1.5 rounded-full bg-[var(--text-muted)]" />
-                      Select a downloaded model to begin
-                    </>
-                  )}
-                </div>
+                  {selectedModelReady
+                    ? "Ready for cloning"
+                    : "Select a downloaded model to begin"}
+                </StatusBadge>
               </div>
               {onOpenModelManager && (
                 <div className="shrink-0 mt-2 sm:mt-0">
@@ -458,11 +438,11 @@ export function VoiceClonePlayground({
                 </div>
               )}
             </div>
-          </div>
+          </WorkspacePanel>
 
           <div className="space-y-6">
             {/* Voice Reference Section */}
-            <div className="p-6 rounded-2xl bg-[var(--bg-surface-0)] border border-[var(--border-muted)]">
+            <WorkspacePanel className="p-6">
               <div className="flex items-center gap-2 mb-5">
                 <Users className="w-5 h-5 text-[var(--text-muted)]" />
                 <span className={VOICE_ROUTE_PANEL_TITLE_CLASS}>
@@ -559,10 +539,10 @@ export function VoiceClonePlayground({
                   </div>
                 </div>
               </div>
-            </div>
+            </WorkspacePanel>
 
             {/* Text to speak */}
-            <div className="p-6 rounded-2xl bg-[var(--bg-surface-0)] border border-[var(--border-muted)]">
+            <WorkspacePanel className="p-6">
               <label className={clsx(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-4 block")}>
                 Audition Text
               </label>
@@ -586,7 +566,7 @@ export function VoiceClonePlayground({
                 Start with a short proof clip before moving the saved voice into
                 the TTS route for longer scripts.
               </p>
-            </div>
+            </WorkspacePanel>
 
             {/* Error */}
             <AnimatePresence>
@@ -597,10 +577,12 @@ export function VoiceClonePlayground({
                   exit={{ opacity: 0, height: 0 }}
                   className="overflow-hidden"
                 >
-                  <div className="p-3 rounded-lg bg-[var(--danger-bg)] border border-[var(--danger-border)] text-sm text-[var(--danger-text)] flex items-start gap-2 mt-2">
-                    <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
-                    <p>{error}</p>
-                  </div>
+                  <StatePanel
+                    title="Voice cloning error"
+                    description={error}
+                    icon={AlertCircle}
+                    tone="danger"
+                  />
                 </motion.div>
               )}
             </AnimatePresence>
@@ -741,7 +723,7 @@ export function VoiceClonePlayground({
             )}
           </AnimatePresence>
         </div>
-      </div>
+      </WorkspaceFrame>
 
       <SpeechHistoryPanel
         route="voice-cloning"
