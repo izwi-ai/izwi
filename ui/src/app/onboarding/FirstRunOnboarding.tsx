@@ -30,9 +30,10 @@ import { cn } from "@/lib/utils";
 import { APP_ICON_URL } from "@/shared/config/runtime";
 
 const QUICK_SETUP_VARIANTS = [
-  "Qwen3-4B-GGUF",
-  "Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit",
-  "Qwen3-ASR-0.6B-4bit",
+  "diar_streaming_sortformer_4spk-v2.1",
+  "Qwen3-ASR-0.6B",
+  "Qwen3-ForcedAligner-0.6B",
+  "Qwen3-1.7B-GGUF",
 ] as const;
 
 const MANUAL_DOWNLOAD_VARIANTS = new Set(["Gemma-3-1b-it"]);
