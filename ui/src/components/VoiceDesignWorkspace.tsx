@@ -31,6 +31,7 @@ import {
   WorkspaceHeader,
   WorkspacePanel,
 } from "@/components/ui/workspace";
+import { useWorkspaceShortcuts } from "@/hooks/useWorkspaceShortcuts";
 import { useDownloadIndicator } from "../utils/useDownloadIndicator";
 import { blobToBase64Payload } from "../utils/audioBase64";
 
@@ -344,6 +345,29 @@ export function VoiceDesignWorkspace({
     setSavedVoiceId(null);
     textareaRef.current?.focus();
   };
+
+  const workspaceShortcuts = useMemo(
+    () => [
+      {
+        key: "Enter",
+        metaKey: true,
+        allowInInputs: true,
+        enabled: !generating && selectedModelReady,
+        action: () => {
+          void handleGenerate();
+        },
+      },
+      {
+        key: "Escape",
+        shiftKey: true,
+        enabled: true,
+        action: handleReset,
+      },
+    ],
+    [generating, handleGenerate, handleReset, selectedModelReady],
+  );
+
+  useWorkspaceShortcuts(workspaceShortcuts);
 
   const handleDownloadCandidate = async (candidate: VoiceDesignCandidate) => {
     if (isDownloading) {
@@ -686,6 +710,10 @@ export function VoiceDesignWorkspace({
                   {downloadMessage}
                 </div>
               ) : null}
+
+              <div className="text-xs text-[var(--text-muted)]">
+                Shortcut: <span className="app-kbd">Ctrl/Cmd + Enter</span> generate options, <span className="app-kbd">Shift + Esc</span> reset.
+              </div>
             </div>
 
             <div className="space-y-4">

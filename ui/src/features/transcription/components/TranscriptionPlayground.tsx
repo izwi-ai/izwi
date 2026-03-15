@@ -71,6 +71,7 @@ import {
   WorkspacePanel,
   WorkspaceSectionLabel,
 } from "@/components/ui/workspace";
+import { useWorkspaceShortcuts } from "@/hooks/useWorkspaceShortcuts";
 
 export function TranscriptionPlayground({
   selectedModel,
@@ -860,6 +861,53 @@ export function TranscriptionPlayground({
     setIsProcessing(false);
   };
 
+  const workspaceShortcuts = useMemo(
+    () => [
+      {
+        key: "Enter",
+        metaKey: true,
+        enabled:
+          !isHistoryModalOpen &&
+          !deleteTargetRecordId &&
+          selectedModelReady &&
+          !isProcessing,
+        action: () => {
+          if (isRecording) {
+            stopRecording();
+            return;
+          }
+          void startRecording();
+        },
+      },
+      {
+        key: "Escape",
+        enabled: !isHistoryModalOpen && isRecording,
+        action: stopRecording,
+      },
+      {
+        key: "Escape",
+        shiftKey: true,
+        enabled: !isHistoryModalOpen && Boolean(transcription || audioUrl || error),
+        action: handleReset,
+      },
+    ],
+    [
+      audioUrl,
+      deleteTargetRecordId,
+      error,
+      handleReset,
+      isHistoryModalOpen,
+      isProcessing,
+      isRecording,
+      selectedModelReady,
+      startRecording,
+      stopRecording,
+      transcription,
+    ],
+  );
+
+  useWorkspaceShortcuts(workspaceShortcuts);
+
   const handleIncludeTimestampsChange = useCallback(
     (nextValue: boolean) => {
       if (!nextValue) {
@@ -1546,6 +1594,10 @@ export function TranscriptionPlayground({
             <span className="italic">Listening for speech...</span>
           </WorkspacePanel>
         ) : null}
+
+        <div className="mt-4 text-xs text-[var(--text-muted)]">
+          Shortcut: <span className="app-kbd">Ctrl/Cmd + Enter</span> start or stop capture, <span className="app-kbd">Esc</span> stop recording, <span className="app-kbd">Shift + Esc</span> reset.
+        </div>
 
         {processingStats && !isStreaming && (
           <div className="mt-4 pt-3 border-t border-[var(--border-muted)]">

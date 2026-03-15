@@ -50,6 +50,7 @@ import {
   WorkspaceSectionLabel,
 } from "@/components/ui/workspace";
 import { SpeechHistoryPanel } from "@/components/SpeechHistoryPanel";
+import { useWorkspaceShortcuts } from "@/hooks/useWorkspaceShortcuts";
 import { useDownloadIndicator } from "@/utils/useDownloadIndicator";
 import { getSpeakerProfilesForVariant } from "@/types";
 
@@ -879,6 +880,44 @@ export function TextToSpeechWorkspace({
     textareaRef.current?.focus();
   };
 
+  const workspaceShortcuts = useMemo(
+    () => [
+      {
+        key: "Enter",
+        metaKey: true,
+        allowInInputs: true,
+        enabled: workspaceMode === "quick" && !generating && canGenerate,
+        action: () => {
+          void handleGenerate();
+        },
+      },
+      {
+        key: "Escape",
+        enabled:
+          workspaceMode === "quick" && (Boolean(audioUrl) || isStreaming || generating),
+        action: handleStop,
+      },
+      {
+        key: "Escape",
+        shiftKey: true,
+        enabled: workspaceMode === "quick",
+        action: handleReset,
+      },
+    ],
+    [
+      audioUrl,
+      canGenerate,
+      generating,
+      handleGenerate,
+      handleReset,
+      handleStop,
+      isStreaming,
+      workspaceMode,
+    ],
+  );
+
+  useWorkspaceShortcuts(workspaceShortcuts);
+
   const renderModelSelector = () => (
     <RouteModelSelect
       value={selectedModel}
@@ -1202,6 +1241,10 @@ export function TextToSpeechWorkspace({
                     {downloadMessage}
                   </div>
                 ) : null}
+
+                <div className="text-xs text-[var(--text-muted)]">
+                  Shortcut: <span className="app-kbd">Ctrl/Cmd + Enter</span> generate, <span className="app-kbd">Esc</span> stop, <span className="app-kbd">Shift + Esc</span> reset.
+                </div>
               </WorkspacePanel>
             </div>
 

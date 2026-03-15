@@ -395,6 +395,18 @@ html.theme-light .btn-secondary:disabled {
   text-transform: uppercase;
 }
 
+.app-kbd {
+  display: inline-flex;
+  align-items: center;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--border-muted);
+  background-color: var(--bg-surface-1);
+  padding: 0.1rem 0.4rem;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
 .app-state-panel {
   border-radius: var(--radius-lg);
   border: 1px solid var(--border-muted);

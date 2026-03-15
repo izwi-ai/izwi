@@ -33,6 +33,7 @@ import {
   WorkspaceHeader,
   WorkspacePanel,
 } from "@/components/ui/workspace";
+import { useWorkspaceShortcuts } from "@/hooks/useWorkspaceShortcuts";
 import { useDownloadIndicator } from "../utils/useDownloadIndicator";
 
 interface ModelOption {
@@ -240,6 +241,47 @@ export function VoiceClonePlayground({
     setAudioUrl(null);
     textareaRef.current?.focus();
   };
+
+  const workspaceShortcuts = useMemo(
+    () => [
+      {
+        key: "Enter",
+        metaKey: true,
+        allowInInputs: true,
+        enabled:
+          !generating &&
+          selectedModelReady &&
+          isVoiceReady &&
+          consentConfirmed,
+        action: () => {
+          void handleGenerate();
+        },
+      },
+      {
+        key: "Escape",
+        enabled: Boolean(audioUrl),
+        action: handleStop,
+      },
+      {
+        key: "Escape",
+        shiftKey: true,
+        enabled: true,
+        action: handleReset,
+      },
+    ],
+    [
+      audioUrl,
+      consentConfirmed,
+      generating,
+      handleGenerate,
+      handleReset,
+      handleStop,
+      isVoiceReady,
+      selectedModelReady,
+    ],
+  );
+
+  useWorkspaceShortcuts(workspaceShortcuts);
 
   const handleVoiceCloneReady = (audio: string, transcript: string) => {
     setVoiceCloneAudio(audio);
@@ -697,6 +739,10 @@ export function VoiceClonePlayground({
                 preview.
               </p>
             )}
+
+            <div className="text-xs text-[var(--text-muted)]">
+              Shortcut: <span className="app-kbd">Ctrl/Cmd + Enter</span> create preview, <span className="app-kbd">Esc</span> stop playback, <span className="app-kbd">Shift + Esc</span> reset.
+            </div>
           </div>
 
           {/* Audio player */}
