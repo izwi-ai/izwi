@@ -7,6 +7,11 @@ use candle_transformers::quantized_nn::RmsNorm;
 
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::core::repeat_kv;
+use crate::models::shared::attention::flash::try_fused_self_attention;
+use crate::models::shared::attention::paged::{
+    append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
+    paged_decode_attention, KvCacheQuantization, KvPage,
+};
 use crate::models::shared::weights::gguf::GgufLoader;
 
 use super::chat::Qwen35TextConfig;
@@ -29,8 +34,8 @@ enum Qwen35LayerRuntimeState {
         recurrent_state: Option<Tensor>,
     },
     Full {
-        keys: Option<Tensor>,
-        values: Option<Tensor>,
+        k_pages: Vec<KvPage>,
+        v_pages: Vec<KvPage>,
     },
 }
 
@@ -65,6 +70,8 @@ struct Qwen35FullAttention {
     rope_dim: usize,
     rope_theta: f64,
     mrope_sections: Vec<usize>,
+    kv_page_size: usize,
+    kv_quantization: KvCacheQuantization,
 }
 
 struct Qwen35LinearAttention {
@@ -269,8 +276,8 @@ impl Qwen35Layer {
                 recurrent_state: None,
             },
             Qwen35Mixer::Full(_) => Qwen35LayerRuntimeState::Full {
-                keys: None,
-                values: None,
+                k_pages: Vec::new(),
+                v_pages: Vec::new(),
             },
         }
     }
@@ -338,6 +345,8 @@ impl Qwen35FullAttention {
                 .filter(|section| *section > 0)
                 .take(3)
                 .collect(),
+            kv_page_size: default_kv_page_size(),
+            kv_quantization: default_kv_quantization(),
         })
     }
 
@@ -347,8 +356,8 @@ impl Qwen35FullAttention {
         state: &mut Qwen35LayerRuntimeState,
         position_ids: [usize; 3],
     ) -> Result<Tensor> {
-        let (keys, values) = match state {
-            Qwen35LayerRuntimeState::Full { keys, values } => (keys, values),
+        let (k_pages, v_pages) = match state {
+            Qwen35LayerRuntimeState::Full { k_pages, v_pages } => (k_pages, v_pages),
             _ => {
                 return Err(Error::InferenceError(
                     "Qwen3.5 layer runtime state does not match full-attention layer".to_string(),
@@ -386,25 +395,57 @@ impl Qwen35FullAttention {
         let (query_states, key_states) =
             self.apply_rope(&query_states, &key_states, position_ids)?;
 
-        let all_keys = append_sequence_cache(keys, &key_states)?;
-        let all_values = append_sequence_cache(values, &value_states)?;
+        let key_states = repeat_kv(&key_states, self.num_heads, self.num_kv_heads)?;
+        let value_states = repeat_kv(&value_states, self.num_heads, self.num_kv_heads)?;
+        append_to_pages(
+            self.kv_page_size,
+            k_pages,
+            &key_states,
+            self.kv_quantization,
+        )?;
+        append_to_pages(
+            self.kv_page_size,
+            v_pages,
+            &value_states,
+            self.kv_quantization,
+        )?;
 
-        let key_states = repeat_kv(&all_keys, self.num_heads, self.num_kv_heads)?;
-        let value_states = repeat_kv(&all_values, self.num_heads, self.num_kv_heads)?;
-
-        let query_states = query_states.transpose(1, 2)?.contiguous()?;
-        let key_states = key_states.transpose(1, 2)?.contiguous()?;
-        let value_states = value_states.transpose(1, 2)?.contiguous()?;
-
-        let key_states_t = key_states.transpose(2, 3)?.contiguous()?;
-        let attn = query_states.matmul(&key_states_t)?;
-        let attn = (attn / (self.head_dim as f64).sqrt())?;
-        let attn = ops::softmax_last_dim(&attn)?;
-        let attn_output = attn.contiguous()?.matmul(&value_states)?;
-        let attn_output =
+        let attn_output = if query_states.dim(1)? == 1 && !k_pages.is_empty() && !v_pages.is_empty()
+        {
+            paged_decode_attention(
+                &query_states,
+                k_pages,
+                v_pages,
+                self.num_heads,
+                self.head_dim,
+            )?
+            .reshape((1, 1, self.num_heads * self.head_dim))?
+        } else {
+            let key_states = materialize_pages(k_pages)?;
+            let value_states = materialize_pages(v_pages)?;
+            let query_states = query_states.transpose(1, 2)?.contiguous()?;
+            let key_states = key_states.transpose(1, 2)?.contiguous()?;
+            let value_states = value_states.transpose(1, 2)?.contiguous()?;
+            let attn_output = if let Some(out) = try_fused_self_attention(
+                &query_states,
+                &key_states,
+                &value_states,
+                None,
+                self.head_dim,
+                true,
+            )? {
+                out
+            } else {
+                let key_states_t = key_states.transpose(2, 3)?.contiguous()?;
+                let attn = query_states.matmul(&key_states_t)?;
+                let attn = (attn / (self.head_dim as f64).sqrt())?;
+                let attn = ops::softmax_last_dim(&attn)?;
+                attn.contiguous()?.matmul(&value_states)?
+            };
             attn_output
                 .transpose(1, 2)?
-                .reshape((1, 1, self.num_heads * self.head_dim))?;
+                .reshape((1, 1, self.num_heads * self.head_dim))?
+        };
         let attn_output = (&attn_output * &ops::sigmoid(&gate)?)?;
         self.o_proj.forward(&attn_output).map_err(Error::from)
     }
@@ -732,16 +773,6 @@ fn normalize_conv_kernel(
             "Unexpected Qwen3.5 conv kernel rank {rank}"
         ))),
     }
-}
-
-fn append_sequence_cache(cache: &mut Option<Tensor>, current: &Tensor) -> Result<Tensor> {
-    let updated = if let Some(previous) = cache.take() {
-        Tensor::cat(&[&previous, current], 1)?
-    } else {
-        current.clone()
-    };
-    *cache = Some(updated.clone());
-    Ok(updated)
 }
 
 fn build_mrope(
