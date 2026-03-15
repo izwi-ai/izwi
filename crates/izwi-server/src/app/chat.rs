@@ -59,26 +59,13 @@ pub enum ChatStreamEvent {
 }
 
 pub fn max_new_tokens(
-    variant: ModelVariant,
+    _variant: ModelVariant,
     max_completion_tokens: Option<usize>,
     max_tokens: Option<usize>,
 ) -> usize {
     let requested = max_completion_tokens.or(max_tokens);
 
-    let default = match variant {
-        ModelVariant::Gemma34BIt => 4096,
-        ModelVariant::Gemma31BIt => 4096,
-        ModelVariant::Lfm2512BInstructGguf => 4096,
-        ModelVariant::Lfm2512BThinkingGguf => 4096,
-        ModelVariant::Qwen306BGguf => 4096,
-        ModelVariant::Qwen317BGguf => 4096,
-        ModelVariant::Qwen34BGguf => 4096,
-        ModelVariant::Qwen38BGguf => 4096,
-        ModelVariant::Qwen314BGguf => 4096,
-        _ => 1536,
-    };
-
-    requested.unwrap_or(default).clamp(1, 4096)
+    requested.unwrap_or(4096).clamp(1, 4096)
 }
 
 pub fn parse_chat_model(model_id: &str) -> Result<ModelVariant, ApiError> {
@@ -207,13 +194,16 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_chat_models_default_to_4096_max_tokens() {
+    fn chat_models_default_to_4096_max_tokens_when_request_omits_limits() {
         for variant in [
+            ModelVariant::Gemma34BIt,
+            ModelVariant::Lfm2512BInstructGguf,
             ModelVariant::Qwen306BGguf,
             ModelVariant::Qwen317BGguf,
             ModelVariant::Qwen34BGguf,
             ModelVariant::Qwen38BGguf,
             ModelVariant::Qwen314BGguf,
+            ModelVariant::Qwen352BGguf,
         ] {
             assert_eq!(max_new_tokens(variant, None, None), 4096);
         }
