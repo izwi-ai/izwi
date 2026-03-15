@@ -20,12 +20,17 @@ import {
   VOICE_ROUTE_PANEL_TITLE_CLASS,
   VOICE_ROUTE_SECTION_LABEL_CLASS,
   VOICE_ROUTE_TITLE_ACCENT_CLASS,
-  VOICE_ROUTE_WORKSPACE_DESCRIPTION_CLASS,
-  VOICE_ROUTE_WORKSPACE_TITLE_CLASS,
 } from "@/components/voiceRouteTypography";
 import { LANGUAGES, VOICE_DESIGN_PRESETS } from "../types";
 import { GenerationStats } from "./GenerationStats";
 import { SpeechHistoryPanel } from "./SpeechHistoryPanel";
+import { StatePanel } from "@/components/ui/state-panel";
+import { StatusBadge } from "@/components/ui/status-badge";
+import {
+  WorkspaceFrame,
+  WorkspaceHeader,
+  WorkspacePanel,
+} from "@/components/ui/workspace";
 import { useDownloadIndicator } from "../utils/useDownloadIndicator";
 import { blobToBase64Payload } from "../utils/audioBase64";
 
@@ -419,25 +424,13 @@ export function VoiceDesignWorkspace({
 
   return (
     <div className="grid gap-4 items-stretch xl:h-[calc(100dvh-11.75rem)]">
-      <div className="card p-4 flex min-h-0 flex-col">
+      <WorkspaceFrame className="flex min-h-0 flex-col">
         <div className="flex-1 min-h-0 overflow-y-auto pr-1 scrollbar-thin">
-          <div className="flex items-center justify-between mb-4">
-            <div className="flex items-center gap-3">
-              <div className="p-2 rounded bg-[var(--bg-surface-2)] border border-[var(--border-muted)]">
-                <Wand2 className="w-5 h-5 text-[var(--text-muted)]" />
-              </div>
-              <div>
-                <h2 className={VOICE_ROUTE_WORKSPACE_TITLE_CLASS}>
-                  Voice Design
-                </h2>
-                <p className={VOICE_ROUTE_WORKSPACE_DESCRIPTION_CLASS}>
-                  Describe a voice, compare nearby candidates, and save the
-                  best option for TTS reuse.
-                </p>
-              </div>
-            </div>
-
-            <div className="flex flex-wrap items-center justify-end gap-2">
+          <WorkspaceHeader
+            icon={Wand2}
+            title="Voice Design"
+            description="Describe a voice, compare nearby candidates, and save the best option for TTS reuse."
+            actions={
               <div className="relative">
                 <button
                   onClick={() => setShowLanguageSelect(!showLanguageSelect)}
@@ -484,10 +477,10 @@ export function VoiceDesignWorkspace({
                   )}
                 </AnimatePresence>
               </div>
-            </div>
-          </div>
+            }
+          />
 
-          <div className="mb-4 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
+          <WorkspacePanel className="mb-4 mt-5 p-4">
             <div className="flex items-start justify-between gap-4">
               <div className="min-w-0 flex-1">
                 <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>
@@ -496,18 +489,14 @@ export function VoiceDesignWorkspace({
                 {modelOptions.length > 0 && (
                   <div className="mt-2">{renderModelSelector()}</div>
                 )}
-                <div
-                  className={clsx(
-                    "mt-2 text-xs",
-                    selectedModelReady
-                      ? "text-[var(--text-secondary)]"
-                      : "text-amber-400",
-                  )}
+                <StatusBadge
+                  tone={selectedModelReady ? "success" : "warning"}
+                  className="mt-2"
                 >
                   {selectedModelReady
                     ? "Loaded and ready"
                     : "Open Models and load a VoiceDesign model"}
-                </div>
+                </StatusBadge>
               </div>
               {onOpenModelManager && (
                 <div className="shrink-0">
@@ -521,7 +510,7 @@ export function VoiceDesignWorkspace({
                 </div>
               )}
             </div>
-          </div>
+          </WorkspacePanel>
 
           <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_420px]">
             <div className="space-y-6">
@@ -632,10 +621,12 @@ export function VoiceDesignWorkspace({
                     exit={{ opacity: 0, height: 0 }}
                     className="overflow-hidden"
                   >
-                    <div className="p-3 rounded-lg bg-[var(--danger-bg)] border border-[var(--danger-border)] text-sm text-[var(--danger-text)] flex items-start gap-2">
-                      <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
-                      <p>{error}</p>
-                    </div>
+                    <StatePanel
+                      title="Voice design error"
+                      description={error}
+                      icon={AlertCircle}
+                      tone="danger"
+                    />
                   </motion.div>
                 )}
               </AnimatePresence>
@@ -731,9 +722,7 @@ export function VoiceDesignWorkspace({
                               </div>
                             </div>
                             {isSelected ? (
-                              <span className="rounded-full border border-[var(--border-strong)] bg-[var(--bg-surface-2)] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--text-primary)]">
-                                Selected
-                              </span>
+                              <StatusBadge tone="info">Selected</StatusBadge>
                             ) : null}
                           </div>
 
@@ -862,7 +851,7 @@ export function VoiceDesignWorkspace({
             </div>
           </div>
         </div>
-      </div>
+      </WorkspaceFrame>
 
       <SpeechHistoryPanel
         route="voice-design"
