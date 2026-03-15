@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_nn::{ops, Embedding};
@@ -72,6 +74,8 @@ struct Qwen35FullAttention {
     mrope_sections: Vec<usize>,
     kv_page_size: usize,
     kv_quantization: KvCacheQuantization,
+    rope_inv_freqs: Vec<f32>,
+    rope_cache: Mutex<HashMap<[usize; 3], (Tensor, Tensor)>>,
 }
 
 struct Qwen35LinearAttention {
@@ -347,6 +351,11 @@ impl Qwen35FullAttention {
                 .collect(),
             kv_page_size: default_kv_page_size(),
             kv_quantization: default_kv_quantization(),
+            rope_inv_freqs: build_rope_inv_freqs(
+                cfg.rope_dimension_count.min(cfg.attention_key_length),
+                cfg.rope_freq_base,
+            )?,
+            rope_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -460,14 +469,8 @@ impl Qwen35FullAttention {
             return Ok((query_states.clone(), key_states.clone()));
         }
 
-        let (cos, sin) = build_mrope(
-            self.rope_dim,
-            position_ids,
-            &self.mrope_sections,
-            self.rope_theta,
-            query_states.device(),
-            query_states.dtype(),
-        )?;
+        let (cos, sin) =
+            self.cached_mrope(position_ids, query_states.device(), query_states.dtype())?;
 
         let query_rot = query_states.narrow(3, 0, self.rope_dim)?;
         let key_rot = key_states.narrow(3, 0, self.rope_dim)?;
@@ -484,6 +487,32 @@ impl Qwen35FullAttention {
             Tensor::cat(&[&query_rot, &query_pass], 3)?,
             Tensor::cat(&[&key_rot, &key_pass], 3)?,
         ))
+    }
+
+    fn cached_mrope(
+        &self,
+        position_ids: [usize; 3],
+        device: &Device,
+        dtype: DType,
+    ) -> Result<(Tensor, Tensor)> {
+        if let Ok(cache) = self.rope_cache.lock() {
+            if let Some((cos, sin)) = cache.get(&position_ids) {
+                return Ok((cos.clone(), sin.clone()));
+            }
+        }
+
+        let (cos, sin) = build_mrope(
+            self.rope_dim,
+            position_ids,
+            &self.mrope_sections,
+            &self.rope_inv_freqs,
+            device,
+            dtype,
+        )?;
+        if let Ok(mut cache) = self.rope_cache.lock() {
+            cache.insert(position_ids, (cos.clone(), sin.clone()));
+        }
+        Ok((cos, sin))
     }
 }
 
@@ -779,15 +808,11 @@ fn build_mrope(
     rope_dim: usize,
     position_ids: [usize; 3],
     mrope_sections: &[usize],
-    rope_theta: f64,
+    inv_freqs: &[f32],
     device: &Device,
     dtype: DType,
 ) -> Result<(Tensor, Tensor)> {
     let half_dim = rope_dim / 2;
-    let inv_freqs: Vec<f32> = (0..rope_dim)
-        .step_by(2)
-        .map(|idx| (1.0f64 / rope_theta.powf(idx as f64 / rope_dim as f64)) as f32)
-        .collect();
     if inv_freqs.len() != half_dim {
         return Err(Error::InferenceError(format!(
             "Invalid Qwen3.5 rotary dimension {rope_dim}"
@@ -838,6 +863,20 @@ fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     x.broadcast_mul(cos)?
         .broadcast_add(&rotated.broadcast_mul(sin)?)
         .map_err(Error::from)
+}
+
+fn build_rope_inv_freqs(rope_dim: usize, rope_theta: f64) -> Result<Vec<f32>> {
+    let half_dim = rope_dim / 2;
+    let inv_freqs: Vec<f32> = (0..rope_dim)
+        .step_by(2)
+        .map(|idx| (1.0f64 / rope_theta.powf(idx as f64 / rope_dim as f64)) as f32)
+        .collect();
+    if inv_freqs.len() != half_dim {
+        return Err(Error::InferenceError(format!(
+            "Invalid Qwen3.5 rotary dimension {rope_dim}"
+        )));
+    }
+    Ok(inv_freqs)
 }
 
 fn softplus(x: &Tensor) -> Result<Tensor> {
