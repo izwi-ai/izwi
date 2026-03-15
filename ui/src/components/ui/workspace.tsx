@@ -60,7 +60,11 @@ export function WorkspaceHeader({
           </div>
         </div>
       </div>
-      {actions ? <div className="flex shrink-0 items-center gap-3">{actions}</div> : null}
+      {actions ? (
+        <div className="flex shrink-0 flex-wrap items-center justify-end gap-3">
+          {actions}
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -63,6 +63,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { StatePanel } from "@/components/ui/state-panel";
+import { StatusBadge } from "@/components/ui/status-badge";
+import {
+  WorkspaceFrame,
+  WorkspaceHeader,
+  WorkspacePanel,
+  WorkspaceSectionLabel,
+} from "@/components/ui/workspace";
 
 export function TranscriptionPlayground({
   selectedModel,
@@ -1268,54 +1276,45 @@ export function TranscriptionPlayground({
   );
 
   return (
-    <div className="grid gap-4 lg:gap-6 xl:grid-cols-[340px,minmax(0,1fr)] xl:h-[calc(100dvh-11.75rem)]">
-      <div className="rounded-xl border border-[var(--border-muted)] bg-card text-card-foreground shadow-sm p-4 sm:p-5 space-y-4 xl:h-full xl:min-h-0 xl:overflow-y-auto">
-        <div className="flex items-center justify-between gap-3">
-          <div>
-            <div className="inline-flex items-center gap-2 text-xs text-muted-foreground font-medium uppercase tracking-wider">
-              <FileAudio className="w-3.5 h-3.5" />
-              Capture
-            </div>
-            <h2 className="text-sm font-semibold mt-1">Audio Input</h2>
-          </div>
-          {onOpenModelManager && (
-            <Button
-              onClick={handleOpenModels}
-              variant="outline"
-              size="sm"
-              className="h-8 gap-1.5 text-xs shadow-sm"
-            >
-              <Settings2 className="w-4 h-4" />
-              Models
-            </Button>
-          )}
-        </div>
+    <div className="grid gap-5 lg:gap-6 xl:grid-cols-[340px,minmax(0,1fr)] xl:h-[calc(100dvh-11.75rem)]">
+      <WorkspaceFrame className="space-y-4 xl:h-full xl:min-h-0 xl:overflow-y-auto">
+        <WorkspaceHeader
+          icon={FileAudio}
+          title="Audio Input"
+          description="Capture live audio or upload a file, then save the transcript to history automatically."
+          actions={
+            onOpenModelManager ? (
+              <Button
+                onClick={handleOpenModels}
+                variant="outline"
+                size="sm"
+                className="h-8 gap-1.5 text-xs shadow-sm"
+              >
+                <Settings2 className="w-4 h-4" />
+                Models
+              </Button>
+            ) : null
+          }
+        />
 
-      <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 space-y-3">
+        <WorkspacePanel className="mt-5 space-y-3 p-4">
           <div>
-            <div className="text-[11px] text-[var(--text-subtle)] uppercase tracking-wide mb-2">
+            <WorkspaceSectionLabel className="mb-2">
               Active Model
-            </div>
+            </WorkspaceSectionLabel>
             {modelOptions.length > 0 && renderModelSelector()}
           </div>
 
           <div className="pt-2 border-t border-[var(--border-muted)]">
-            <div
-              className={cn(
-                "text-xs",
-                selectedModelReady
-                  ? "text-[var(--text-secondary)]"
-                  : "text-[var(--text-muted)]",
-              )}
-            >
+            <StatusBadge tone={selectedModelReady ? "success" : "warning"}>
               {selectedModelReady
                 ? "Loaded and ready"
                 : "Select and load a transcription model"}
-            </div>
+            </StatusBadge>
           </div>
-        </div>
+        </WorkspacePanel>
 
-        <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
+        <WorkspacePanel className="p-5">
           <div className="flex flex-col items-center py-4">
             <button
               onClick={() => {
@@ -1401,7 +1400,7 @@ export function TranscriptionPlayground({
               </div>
             </div>
           </div>
-        </div>
+        </WorkspacePanel>
 
         {hasDraft && (
           <button
@@ -1412,117 +1411,116 @@ export function TranscriptionPlayground({
             Reset Session
           </button>
         )}
-      </div>
+      </WorkspaceFrame>
 
-      <div className="flex min-h-[460px] flex-col rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-4 shadow-sm sm:p-5 lg:min-h-[560px] xl:h-full xl:min-h-0">
-        <div className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-3">
-          <div className="min-w-0">
-            <div className="flex items-center gap-2 min-w-0">
-              <FileText className="w-4 h-4 text-muted-foreground" />
-              <h3 className="text-sm font-medium">Transcript</h3>
-              {isStreaming && (
-                <span className="text-[10px] px-1.5 py-0.5 rounded flex items-center gap-1 bg-green-500/10 text-green-500">
-                  <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
-                  Live
-                </span>
-              )}
-              {detectedLanguage && !isStreaming && (
-                <span className="text-[10px] px-1.5 py-0.5 rounded bg-muted text-muted-foreground font-medium border border-[var(--border-muted)] shadow-sm">
-                  {detectedLanguage}
-                </span>
-              )}
-            </div>
-            <p className="text-[11px] text-muted-foreground mt-1">
+      <WorkspaceFrame className="flex min-h-[460px] flex-col lg:min-h-[560px] xl:h-full xl:min-h-0">
+        <WorkspaceHeader
+          icon={FileText}
+          title="Transcript"
+          description={
+            <>
               Saved automatically to transcription history.
-            </p>
-            <p className="mt-1 text-[11px] text-[var(--text-subtle)]">
-              Streaming and timestamps are separate modes.
-            </p>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <Select
-              value={selectedLanguage}
-              onValueChange={setSelectedLanguage}
-              disabled={isProcessing}
-            >
-              <SelectTrigger className="h-8 w-[140px] sm:w-[160px] text-xs">
-                <SelectValue placeholder="Language" />
-              </SelectTrigger>
-              <SelectContent>
-                {LANGUAGE_OPTIONS.map((language) => (
-                  <SelectItem
-                    key={language}
-                    value={language}
-                    className="text-xs"
-                  >
-                    {language}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <label className="flex items-center gap-2 rounded-md border border-[var(--border-muted)] bg-muted/30 px-2 py-1.5 text-xs text-muted-foreground shadow-sm">
-              <span className="font-medium">Timestamps</span>
-              <input
-                type="checkbox"
-                checked={includeTimestamps}
-                onChange={(event) =>
-                  handleIncludeTimestampsChange(event.target.checked)
-                }
-                className="app-checkbox h-3.5 w-3.5 disabled:opacity-50"
+              <span className="mt-1 block text-[11px] text-[var(--text-subtle)]">
+                Streaming and timestamps are separate modes.
+              </span>
+            </>
+          }
+          actions={
+            <>
+              {isStreaming ? (
+                <StatusBadge tone="success">Live</StatusBadge>
+              ) : detectedLanguage ? (
+                <StatusBadge>{detectedLanguage}</StatusBadge>
+              ) : null}
+              <Select
+                value={selectedLanguage}
+                onValueChange={setSelectedLanguage}
                 disabled={isProcessing}
-              />
-            </label>
-            <label className="flex items-center gap-2 rounded-md border border-[var(--border-muted)] bg-muted/30 px-2 py-1.5 text-xs text-muted-foreground shadow-sm">
-              <Radio className="w-3.5 h-3.5" />
-              <span className="font-medium">Stream</span>
-              <input
-                type="checkbox"
-                checked={streamingEnabled}
-                onChange={(event) =>
-                  handleStreamingEnabledChange(event.target.checked)
-                }
-                className="app-checkbox w-3.5 h-3.5 disabled:opacity-50 ml-1"
-                disabled={isProcessing}
-              />
-            </label>
-            <Button
-              onClick={handleCopy}
-              variant="outline"
-              size="sm"
-              className="h-8 w-8 p-0"
-              disabled={!currentOutputExportText || isStreaming}
-              title="Copy transcript"
-            >
-              {copied ? (
-                <Check className="w-4 h-4 text-green-500" />
-              ) : (
-                <Copy className="w-4 h-4" />
-              )}
-            </Button>
-            <TranscriptionExportDialog record={outputRecord}>
+              >
+                <SelectTrigger className="h-8 w-[140px] sm:w-[160px] text-xs">
+                  <SelectValue placeholder="Language" />
+                </SelectTrigger>
+                <SelectContent>
+                  {LANGUAGE_OPTIONS.map((language) => (
+                    <SelectItem
+                      key={language}
+                      value={language}
+                      className="text-xs"
+                    >
+                      {language}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <label className="flex items-center gap-2 rounded-md border border-[var(--border-muted)] bg-muted/30 px-2 py-1.5 text-xs text-muted-foreground shadow-sm">
+                <span className="font-medium">Timestamps</span>
+                <input
+                  type="checkbox"
+                  checked={includeTimestamps}
+                  onChange={(event) =>
+                    handleIncludeTimestampsChange(event.target.checked)
+                  }
+                  className="app-checkbox h-3.5 w-3.5 disabled:opacity-50"
+                  disabled={isProcessing}
+                />
+              </label>
+              <label className="flex items-center gap-2 rounded-md border border-[var(--border-muted)] bg-muted/30 px-2 py-1.5 text-xs text-muted-foreground shadow-sm">
+                <Radio className="w-3.5 h-3.5" />
+                <span className="font-medium">Stream</span>
+                <input
+                  type="checkbox"
+                  checked={streamingEnabled}
+                  onChange={(event) =>
+                    handleStreamingEnabledChange(event.target.checked)
+                  }
+                  className="app-checkbox w-3.5 h-3.5 disabled:opacity-50 ml-1"
+                  disabled={isProcessing}
+                />
+              </label>
               <Button
+                onClick={handleCopy}
                 variant="outline"
                 size="sm"
                 className="h-8 w-8 p-0"
                 disabled={!currentOutputExportText || isStreaming}
-                title="Export transcript"
+                title="Copy transcript"
               >
-                <Download className="w-4 h-4" />
+                {copied ? (
+                  <Check className="w-4 h-4 text-green-500" />
+                ) : (
+                  <Copy className="w-4 h-4" />
+                )}
               </Button>
-            </TranscriptionExportDialog>
-          </div>
-        </div>
+              <TranscriptionExportDialog record={outputRecord}>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-8 w-8 p-0"
+                  disabled={!currentOutputExportText || isStreaming}
+                  title="Export transcript"
+                >
+                  <Download className="w-4 h-4" />
+                </Button>
+              </TranscriptionExportDialog>
+            </>
+          }
+        />
 
-        <div className="flex-1 min-h-0">
+        <div className="mt-4 flex-1 min-h-0">
           {showResult ? (
             <>
               {isProcessing && !transcription ? (
-                <div className="flex h-full items-center justify-center gap-2 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] text-sm text-muted-foreground">
-                  <Loader2 className="w-4 h-4 animate-spin text-primary" />
-                  {isStreaming
-                    ? "Streaming transcription..."
-                    : "Transcribing..."}
-                </div>
+                <StatePanel
+                  title={
+                    isStreaming
+                      ? "Streaming transcription..."
+                      : "Transcribing..."
+                  }
+                  description="Izwi is processing the current audio input."
+                  icon={Loader2}
+                  tone="info"
+                  align="center"
+                />
               ) : (
                 <TranscriptionReviewWorkspace
                   record={outputRecord}
@@ -1532,25 +1530,21 @@ export function TranscriptionPlayground({
               )}
             </>
           ) : (
-            <div className="flex h-full items-center justify-center rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-6 text-center">
-              <div className="max-w-xs">
-                <FileText className="w-8 h-8 mx-auto mb-3 opacity-20 text-muted-foreground" />
-                <p className="text-sm font-medium text-muted-foreground">
-                  Record audio or upload a file to start.
-                </p>
-                <p className="text-xs text-muted-foreground/70 mt-1">
-                  The transcript appears live and is stored automatically.
-                </p>
-              </div>
-            </div>
+            <StatePanel
+              title="Record audio or upload a file to start"
+              description="The transcript appears live and is stored automatically."
+              icon={FileText}
+              dashed
+              align="center"
+            />
           )}
         </div>
 
         {isStreaming ? (
-          <div className="mt-3 flex items-center gap-2 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-3 text-sm text-[var(--text-secondary)]">
+          <WorkspacePanel className="mt-4 flex items-center gap-2 px-4 py-3 text-sm text-[var(--text-secondary)]">
             <MiniWaveform isActive={true} />
             <span className="italic">Listening for speech...</span>
-          </div>
+          </WorkspacePanel>
         ) : null}
 
         {processingStats && !isStreaming && (
@@ -1565,14 +1559,18 @@ export function TranscriptionPlayground({
               initial={{ opacity: 0, height: 0, y: 10 }}
               animate={{ opacity: 1, height: "auto", y: 0 }}
               exit={{ opacity: 0, height: 0, y: 10 }}
-              className="mt-3 p-3 rounded-lg border border-destructive/20 bg-destructive/10 text-destructive text-xs font-medium flex items-center gap-2"
+              className="mt-4"
             >
-              <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-              {error}
+              <StatePanel
+                title="Transcription error"
+                description={error}
+                icon={AlertTriangle}
+                tone="danger"
+              />
             </motion.div>
           )}
         </AnimatePresence>
-      </div>
+      </WorkspaceFrame>
 
       {historyActionContainer === undefined
         ? historyDrawer
