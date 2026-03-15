@@ -404,11 +404,11 @@ export function FirstRunOnboarding() {
         onInteractOutside={(event) => event.preventDefault()}
       >
         <div className="flex flex-col">
-          <div className="relative overflow-hidden border-b border-border/70 bg-[var(--bg-surface-1)] px-6 py-5 sm:px-8 sm:py-7">
+          <div className="relative overflow-hidden border-b border-border/70 bg-[var(--bg-surface-1)] px-6 py-4 sm:px-8 sm:py-5">
             <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(255,255,255,0.12),_transparent_55%)]" />
-            <div className="relative z-10 flex flex-col gap-4">
+            <div className="relative z-10 flex flex-col gap-3">
               <div className="flex flex-wrap items-center justify-between gap-4">
-                <div className="flex items-center gap-3">
+                <div className="flex flex-wrap items-center gap-3">
                   <div className="relative h-10 w-10 overflow-hidden rounded-[var(--radius-md)] border border-border/70 bg-[var(--bg-surface-2)] shadow-[var(--shadow-soft)]">
                     <img
                       src={APP_ICON_URL}
@@ -416,39 +416,17 @@ export function FirstRunOnboarding() {
                       className="h-full w-full object-cover p-1 brightness-110 contrast-110"
                     />
                   </div>
-                  <div>
-                    <div className="text-sm font-semibold tracking-tight">
-                      Izwi First Run
-                    </div>
-                    <div className="text-xs text-[var(--text-muted)]">
-                      Step {step + 1} of 3
-                    </div>
-                  </div>
+                  <DialogTitle className="text-xl font-semibold tracking-tight">
+                    {stepCopy.title}
+                  </DialogTitle>
                 </div>
-                <div className="flex flex-wrap gap-2 text-[11px] uppercase tracking-[0.28em] text-[var(--text-subtle)]">
-                  {["Welcome", "Setup", "All set"].map((label, index) => (
-                    <span
-                      key={label}
-                      className={cn(
-                        "rounded-full border px-3 py-1",
-                        index === step
-                          ? "border-[var(--text-primary)] text-[var(--text-primary)]"
-                          : "border-border/70",
-                      )}
-                    >
-                      {label}
-                    </span>
-                  ))}
+                <div className="text-xs text-[var(--text-muted)]">
+                  Step {step + 1} of 3
                 </div>
               </div>
-              <div>
-                <DialogTitle className="text-xl font-semibold tracking-tight">
-                  {stepCopy.title}
-                </DialogTitle>
-                <DialogDescription className="mt-1 text-sm text-[var(--text-muted)]">
-                  {stepCopy.description}
-                </DialogDescription>
-              </div>
+              <DialogDescription className="text-sm text-[var(--text-muted)]">
+                {stepCopy.description}
+              </DialogDescription>
             </div>
           </div>
 
