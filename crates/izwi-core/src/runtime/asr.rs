@@ -106,6 +106,12 @@ impl RuntimeService {
         language: Option<&str>,
         correlation_id: Option<&str>,
     ) -> Result<AsrTranscription> {
+        if variant.is_audio_chat() {
+            return self
+                .asr_transcribe_audio_chat_base64(variant, audio_base64, |_delta| {})
+                .await;
+        }
+
         let request = self
             .build_asr_request(
                 variant,
@@ -135,6 +141,12 @@ impl RuntimeService {
     where
         F: FnMut(String) + Send + 'static,
     {
+        if variant.is_audio_chat() {
+            return self
+                .asr_transcribe_audio_chat_base64(variant, audio_base64, on_delta)
+                .await;
+        }
+
         let request = self
             .build_asr_request(
                 variant,
@@ -171,6 +183,12 @@ impl RuntimeService {
         language: Option<&str>,
         correlation_id: Option<&str>,
     ) -> Result<AsrTranscription> {
+        if variant.is_audio_chat() {
+            return self
+                .asr_transcribe_audio_chat_bytes(variant, audio_bytes, |_delta| {})
+                .await;
+        }
+
         let request = self
             .build_asr_request(
                 variant,
@@ -200,6 +218,12 @@ impl RuntimeService {
     where
         F: FnMut(String) + Send + 'static,
     {
+        if variant.is_audio_chat() {
+            return self
+                .asr_transcribe_audio_chat_bytes(variant, audio_bytes, on_delta)
+                .await;
+        }
+
         let request = self
             .build_asr_request(
                 variant,
@@ -267,11 +291,6 @@ impl RuntimeService {
         language: Option<&str>,
     ) -> Result<AsrTranscription> {
         let variant = resolve_asr_model_variant(model_id);
-        if variant.is_audio_chat() {
-            return self
-                .asr_transcribe_audio_chat_base64(variant, audio_base64, |_delta| {})
-                .await;
-        }
         self.asr_transcribe_with_variant(variant, audio_base64, language, None)
             .await
     }
@@ -283,11 +302,6 @@ impl RuntimeService {
         language: Option<&str>,
     ) -> Result<AsrTranscription> {
         let variant = resolve_asr_model_variant(model_id);
-        if variant.is_audio_chat() {
-            return self
-                .asr_transcribe_audio_chat_bytes(variant, audio_bytes, |_delta| {})
-                .await;
-        }
         self.asr_transcribe_bytes_with_variant(variant, audio_bytes, language, None)
             .await
     }
@@ -303,12 +317,6 @@ impl RuntimeService {
     where
         F: FnMut(String) + Send + 'static,
     {
-        let variant = resolve_asr_model_variant(model_id);
-        if variant.is_audio_chat() {
-            return self
-                .asr_transcribe_audio_chat_base64(variant, audio_base64, on_delta)
-                .await;
-        }
         self.asr_transcribe_streaming_with_correlation(
             audio_base64,
             model_id,
@@ -329,12 +337,6 @@ impl RuntimeService {
     where
         F: FnMut(String) + Send + 'static,
     {
-        let variant = resolve_asr_model_variant(model_id);
-        if variant.is_audio_chat() {
-            return self
-                .asr_transcribe_audio_chat_bytes(variant, audio_bytes, on_delta)
-                .await;
-        }
         self.asr_transcribe_streaming_bytes_with_correlation(
             audio_bytes,
             model_id,

@@ -22,9 +22,9 @@ use super::detokenizer::Lfm25AudioDetokenizer;
 use super::preprocessor::Lfm25AudioPreprocessor;
 use super::sampling::{sample_from_logits, Lfm25AudioGenerationConfig, SimpleRng};
 use super::tokenizer::Lfm25TextTokenizer;
+use super::LFM25_AUDIO_DEFAULT_INTERLEAVED_SYSTEM_PROMPT;
 
 const DEFAULT_MAX_NEW_TOKENS: usize = 1024;
-const DEFAULT_INTERLEAVED_SYSTEM_PROMPT: &str = "Respond with interleaved text and audio.";
 const DEFAULT_AUDIO_STREAM_DECODE_STRIDE_FRAMES: usize = 6;
 const DEFAULT_AUDIO_STREAM_HOLDBACK_FRAMES: usize = 2;
 
@@ -726,7 +726,7 @@ impl Lfm25AudioModel {
                 0,
                 ChatMessage {
                     role: ChatRole::System,
-                    content: DEFAULT_INTERLEAVED_SYSTEM_PROMPT.to_string(),
+                    content: LFM25_AUDIO_DEFAULT_INTERLEAVED_SYSTEM_PROMPT.to_string(),
                 },
             );
         }

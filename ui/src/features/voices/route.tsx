@@ -23,7 +23,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { getSpeakerProfilesForVariant } from "@/types";
+import { getSpeakerProfilesForVariant, isLfm25AudioVariant } from "@/types";
 import {
   TEXT_TO_SPEECH_PREFERRED_MODELS,
   resolvePreferredRouteModel,
@@ -155,6 +155,7 @@ export function VoicesPage({
       const match = models.find((model) => model.variant === variant);
       return (
         match?.speech_capabilities?.supports_builtin_voices === true &&
+        !isLfm25AudioVariant(variant) &&
         !variant.includes("Tokenizer")
       );
     },

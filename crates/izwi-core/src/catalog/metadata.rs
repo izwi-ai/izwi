@@ -205,6 +205,7 @@ impl ModelVariant {
     pub const QWEN3_TTS_FRAME_RATE_HZ: f32 = 12.0;
     pub const QWEN_CUSTOMVOICE_BUILT_IN_VOICE_COUNT: usize = 9;
     pub const KOKORO_BUILT_IN_VOICE_COUNT: usize = 54;
+    pub const LFM25_AUDIO_BUILT_IN_VOICE_COUNT: usize = 4;
 
     /// Get HuggingFace repository ID
     pub fn repo_id(&self) -> &'static str {
@@ -628,7 +629,7 @@ impl ModelVariant {
             },
             Self::Lfm25Audio15BGguf => SpeechModelCapabilities {
                 supports_builtin_voices: true,
-                built_in_voice_count: Some(1),
+                built_in_voice_count: Some(Self::LFM25_AUDIO_BUILT_IN_VOICE_COUNT),
                 supports_reference_voice: false,
                 supports_voice_description: false,
                 supports_streaming: false,
@@ -1118,7 +1119,7 @@ mod tests {
             ModelVariant::Lfm25Audio15BGguf.speech_capabilities(),
             Some(SpeechModelCapabilities {
                 supports_builtin_voices: true,
-                built_in_voice_count: Some(1),
+                built_in_voice_count: Some(ModelVariant::LFM25_AUDIO_BUILT_IN_VOICE_COUNT),
                 supports_reference_voice: false,
                 supports_voice_description: false,
                 supports_streaming: false,

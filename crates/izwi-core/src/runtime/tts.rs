@@ -7,17 +7,18 @@ use tracing::info;
 
 use crate::engine::{EngineCoreRequest, GenerationParams as CoreGenParams};
 use crate::error::{Error, Result};
+use crate::models::architectures::lfm25_audio::lfm25_audio_tts_system_prompt;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 use crate::runtime::service::RuntimeService;
 use crate::runtime::types::{AudioChunk, GenerationConfig, GenerationRequest, GenerationResult};
 
 const LFM25_AUDIO_DEFAULT_MAX_NEW_TOKENS: usize = 1024;
 
-fn lfm25_audio_prompt_messages(text: &str) -> Vec<ChatMessage> {
+fn lfm25_audio_prompt_messages(text: &str, speaker: Option<&str>) -> Vec<ChatMessage> {
     vec![
         ChatMessage {
             role: ChatRole::System,
-            content: "Perform TTS.".to_string(),
+            content: lfm25_audio_tts_system_prompt(speaker).to_string(),
         },
         ChatMessage {
             role: ChatRole::User,
@@ -51,9 +52,16 @@ impl RuntimeService {
         } else {
             request.config.options.max_tokens
         };
+        let requested_speaker = request.config.options.speaker.as_deref().or(request
+            .config
+            .options
+            .voice
+            .as_deref());
         let started = Instant::now();
-        let output =
-            model.generate_sequential(&lfm25_audio_prompt_messages(text), max_new_tokens)?;
+        let output = model.generate_sequential(
+            &lfm25_audio_prompt_messages(text, requested_speaker),
+            max_new_tokens,
+        )?;
         let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
 
         Ok(GenerationResult {

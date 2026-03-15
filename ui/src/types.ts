@@ -22,7 +22,12 @@ export function isKokoroVariant(variant: string): boolean {
 }
 
 export function isLfm25AudioVariant(variant: string): boolean {
-  return variant.trim() === "LFM2.5-Audio-1.5B-GGUF";
+  const normalized = variant.trim().toLowerCase();
+  return (
+    normalized === "lfm2.5-audio-1.5b-gguf" ||
+    normalized === "liquidai/lfm2.5-audio-1.5b-gguf" ||
+    normalized === "liquidai/lfm2.5-audio-1.5b"
+  );
 }
 
 export function getSpeakerProfilesForVariant(variant: string | null): SpeakerProfile[] {
@@ -177,10 +182,28 @@ export const QWEN_SPEAKERS: SpeakerProfile[] = [
 
 export const LFM25_AUDIO_SPEAKERS: SpeakerProfile[] = [
   {
-    id: "Default",
-    name: "Default",
-    language: "Multilingual",
-    description: "Native default voice for LFM2.5 Audio speech generation",
+    id: "US Female",
+    name: "US Female",
+    language: "English",
+    description: "US female preset voice",
+  },
+  {
+    id: "US Male",
+    name: "US Male",
+    language: "English",
+    description: "US male preset voice",
+  },
+  {
+    id: "UK Female",
+    name: "UK Female",
+    language: "English",
+    description: "UK female preset voice",
+  },
+  {
+    id: "UK Male",
+    name: "UK Male",
+    language: "English",
+    description: "UK male preset voice",
   },
 ];
 

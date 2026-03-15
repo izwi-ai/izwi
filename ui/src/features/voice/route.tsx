@@ -20,6 +20,13 @@ import { PageShell } from "@/components/PageShell";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -235,9 +242,15 @@ export function VoicePage({
     ],
     [selectedAsrInfo, selectedTextInfo, selectedTtsInfo],
   );
+  const speakerModelVariant =
+    voiceMode === "unified" ? selectedUnifiedModel : selectedTtsModel;
   const assistantSpeakers = useMemo(
-    () => getSpeakerProfilesForVariant(selectedTtsModel),
-    [selectedTtsModel],
+    () => getSpeakerProfilesForVariant(speakerModelVariant),
+    [speakerModelVariant],
+  );
+  const selectedSpeakerProfile = useMemo(
+    () => assistantSpeakers.find((speaker) => speaker.id === selectedSpeaker) ?? null,
+    [assistantSpeakers, selectedSpeaker],
   );
   const currentPipelineLabel =
     voiceMode === "unified"
@@ -1282,6 +1295,7 @@ export function VoicePage({
             type: "input_stream_start",
             mode: "unified",
             s2s_model_id: selectedUnifiedModel,
+            speaker: selectedSpeaker,
             max_output_tokens: 1536,
             vad_threshold: vadThreshold,
             min_speech_ms: minSpeechMs,
@@ -1829,6 +1843,55 @@ export function VoicePage({
         <div className="text-[11px] text-[var(--text-muted)]">
           Current mode: {currentPipelineLabel}
         </div>
+      </section>
+
+      <section className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3 space-y-3">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h3 className="text-sm font-medium text-white">Assistant Voice</h3>
+            <p className="mt-1 text-xs text-[var(--text-muted)]">
+              {voiceMode === "unified"
+                ? "LFM2.5 Audio uses its native built-in voice inventory."
+                : "Choose the built-in speaker exposed by the active realtime TTS model."}
+            </p>
+          </div>
+          <span className="text-[11px] text-[var(--text-muted)]">
+            {speakerModelVariant
+              ? formatModelVariantLabel(speakerModelVariant)
+              : "No voice model selected"}
+          </span>
+        </div>
+        <Select
+          value={selectedSpeaker}
+          onValueChange={setSelectedSpeaker}
+          disabled={assistantSpeakers.length === 0}
+        >
+          <SelectTrigger className="border-[var(--border-muted)] bg-[var(--bg-surface-2)]">
+            <SelectValue placeholder="Select assistant voice" />
+          </SelectTrigger>
+          <SelectContent>
+            {assistantSpeakers.map((speaker) => (
+              <SelectItem key={speaker.id} value={speaker.id}>
+                {speaker.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <div className="flex flex-wrap items-center gap-2 text-[11px] text-[var(--text-muted)]">
+          {selectedSpeakerProfile ? (
+            <>
+              <span>{selectedSpeakerProfile.language}</span>
+              <span>{selectedSpeakerProfile.description}</span>
+            </>
+          ) : (
+            <span>No built-in voices are available for the selected realtime model.</span>
+          )}
+        </div>
+        {runtimeStatus !== "idle" && (
+          <p className="text-[11px] text-[var(--text-muted)]">
+            Voice changes apply the next time you start listening.
+          </p>
+        )}
       </section>
 
       {renderAudioOutputSettings()}

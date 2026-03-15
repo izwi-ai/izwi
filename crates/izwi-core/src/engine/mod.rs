@@ -90,7 +90,10 @@ impl Engine {
 
     fn streaming_queue_capacity(request: &EngineCoreRequest) -> usize {
         let default_capacity = match request.task_type {
-            TaskType::TTS | TaskType::SpeechToSpeech => 8usize,
+            TaskType::TTS => 8usize,
+            // Unified speech-to-speech emits bursty interleaved text and audio
+            // chunks, so it needs a deeper queue than plain TTS.
+            TaskType::SpeechToSpeech => 64usize,
             TaskType::ASR | TaskType::Chat => 64usize,
         };
 
@@ -332,5 +335,17 @@ mod tests {
         let config = EngineCoreConfig::default();
         let engine = Engine::new(config);
         assert!(engine.is_ok());
+    }
+
+    #[test]
+    fn speech_to_speech_streaming_queue_defaults_deeper_than_tts() {
+        let tts_request = EngineCoreRequest::tts("hello");
+        let speech_to_speech_request = EngineCoreRequest::speech_to_speech("audio");
+
+        assert_eq!(Engine::streaming_queue_capacity(&tts_request), 8);
+        assert_eq!(
+            Engine::streaming_queue_capacity(&speech_to_speech_request),
+            64
+        );
     }
 }

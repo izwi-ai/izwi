@@ -130,6 +130,7 @@ struct ModularVoiceTurnConfig {
 #[derive(Debug, Clone)]
 struct UnifiedVoiceTurnConfig {
     s2s_model_id: String,
+    speaker: Option<String>,
     max_output_tokens: usize,
 }
 
@@ -222,7 +223,7 @@ impl VoiceTurnConfig {
     fn speaker(&self) -> Option<String> {
         match self {
             Self::Modular(config) => config.speaker.clone(),
-            Self::Unified(_) => None,
+            Self::Unified(config) => config.speaker.clone(),
         }
     }
 
@@ -762,6 +763,9 @@ async fn handle_text_message(
             let normalized_s2s = s2s_model_id
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
+            let normalized_speaker = speaker
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
             let normalized_asr_language = asr_language
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
@@ -795,9 +799,7 @@ async fn handle_text_message(
                         asr_model_id,
                         text_model_id,
                         tts_model_id,
-                        speaker: speaker
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty()),
+                        speaker: normalized_speaker.clone(),
                         asr_language: normalized_asr_language,
                         max_output_tokens: max_output_tokens.unwrap_or(1536).clamp(1, 4096),
                     })
@@ -819,6 +821,7 @@ async fn handle_text_message(
                     }
                     VoiceTurnConfig::Unified(UnifiedVoiceTurnConfig {
                         s2s_model_id,
+                        speaker: normalized_speaker,
                         max_output_tokens: max_output_tokens.unwrap_or(1536).clamp(1, 4096),
                     })
                 }
@@ -1238,6 +1241,7 @@ fn spawn_turn_task(
                         &commit.utterance_id,
                         commit.utterance_seq,
                         &config.s2s_model_id,
+                        config.speaker.clone(),
                         &system_prompt,
                         history_messages,
                         config.max_output_tokens,
@@ -1520,6 +1524,7 @@ async fn stream_unified_s2s_to_socket(
     utterance_id: &str,
     utterance_seq: u64,
     s2s_model_id: &str,
+    speaker: Option<String>,
     system_prompt: &str,
     history_messages: Vec<ChatMessage>,
     max_output_tokens: usize,
@@ -1553,6 +1558,8 @@ async fn stream_unified_s2s_to_socket(
     let encoder = AudioEncoder::new(24_000, 1);
     let mut params = GenerationParams::default();
     params.max_tokens = max_output_tokens.clamp(1, 4096);
+    params.speaker = speaker.clone();
+    params.voice = speaker;
 
     let generation = state
         .runtime

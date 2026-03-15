@@ -90,7 +90,10 @@ export function TextToSpeechPage({
     }
 
     const requestedModel = searchParams.get("model");
-    if (requestedModel && routeModels.some((model) => model.variant === requestedModel)) {
+    if (
+      requestedModel &&
+      routeModels.some((model) => model.variant === requestedModel)
+    ) {
       onSelect(requestedModel);
     }
 

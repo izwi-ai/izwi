@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use crate::models::architectures::lfm25_audio::{
-    Lfm25AudioGenerationConfig, Lfm25AudioStreamConfig, Lfm25SamplingConfig,
+    lfm25_audio_interleaved_system_prompt, Lfm25AudioGenerationConfig, Lfm25AudioStreamConfig,
+    Lfm25SamplingConfig,
 };
 use crate::models::shared::chat::ChatMessage;
 
@@ -46,6 +47,15 @@ impl NativeExecutor {
         let stream_config = Lfm25AudioStreamConfig::default();
         let history_messages = Self::audio_chat_messages(request);
         let max_new_tokens = request.params.max_tokens.max(1);
+        let requested_speaker = request
+            .params
+            .speaker
+            .as_deref()
+            .or(request.params.voice.as_deref());
+        let system_prompt = lfm25_audio_interleaved_system_prompt(
+            request.system_prompt.as_deref(),
+            requested_speaker,
+        );
 
         let (samples, sample_rate) = decode_request_audio_with_rate(request)?;
         let model = self.with_registry(|registry| {
@@ -95,7 +105,7 @@ impl NativeExecutor {
                     &samples,
                     sample_rate,
                     max_new_tokens,
-                    request.system_prompt.as_deref(),
+                    Some(system_prompt.as_str()),
                     &generation_config,
                     &stream_config,
                     &mut emit_text,
@@ -115,7 +125,7 @@ impl NativeExecutor {
                     &samples,
                     sample_rate,
                     max_new_tokens,
-                    request.system_prompt.as_deref(),
+                    Some(system_prompt.as_str()),
                     &generation_config,
                     &stream_config,
                     &mut no_text,

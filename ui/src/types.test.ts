@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { VIEW_CONFIGS } from "@/types";
+import { VIEW_CONFIGS, getSpeakerProfilesForVariant } from "@/types";
 
 describe("VIEW_CONFIGS.chat.modelFilter", () => {
   it("includes the shipped Qwen3.5 chat variants", () => {
@@ -23,5 +23,21 @@ describe("speech route model filters", () => {
     expect(VIEW_CONFIGS.transcription.modelFilter("LFM2.5-Audio-1.5B-GGUF")).toBe(
       true,
     );
+  });
+
+  it("keeps lfm25 audio off the standalone tts route filter", () => {
+    expect(VIEW_CONFIGS["custom-voice"].modelFilter("LFM2.5-Audio-1.5B-GGUF")).toBe(
+      false,
+    );
+  });
+});
+
+describe("getSpeakerProfilesForVariant", () => {
+  it("maps lfm25 audio to its built-in speaker presets", () => {
+    expect(
+      getSpeakerProfilesForVariant("LFM2.5-Audio-1.5B-GGUF").map(
+        (speaker) => speaker.id,
+      ),
+    ).toEqual(["US Female", "US Male", "UK Female", "UK Male"]);
   });
 });
