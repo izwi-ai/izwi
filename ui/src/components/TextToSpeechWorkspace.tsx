@@ -36,13 +36,19 @@ import {
   VOICE_ROUTE_META_COPY_CLASS,
   VOICE_ROUTE_PANEL_TITLE_CLASS,
   VOICE_ROUTE_SECTION_LABEL_CLASS,
-  VOICE_ROUTE_WORKSPACE_DESCRIPTION_CLASS,
-  VOICE_ROUTE_WORKSPACE_TITLE_CLASS,
 } from "@/components/voiceRouteTypography";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
+import { StatePanel } from "@/components/ui/state-panel";
+import { StatusBadge } from "@/components/ui/status-badge";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import {
+  WorkspaceFrame,
+  WorkspaceHeader,
+  WorkspacePanel,
+  WorkspaceSectionLabel,
+} from "@/components/ui/workspace";
 import { SpeechHistoryPanel } from "@/components/SpeechHistoryPanel";
 import { useDownloadIndicator } from "@/utils/useDownloadIndicator";
 import { getSpeakerProfilesForVariant } from "@/types";
@@ -907,27 +913,16 @@ export function TextToSpeechWorkspace({
 
   if (workspaceMode === "projects") {
     return (
-      <div className="grid gap-4 items-stretch xl:h-[calc(100dvh-11.75rem)]">
-        <div className="card p-4 flex min-h-0 flex-col">
-          <div className="mb-4 flex items-center justify-between gap-4">
-            <div className="flex items-center gap-3">
-              <div className="rounded bg-[var(--bg-surface-2)] border border-[var(--border-muted)] p-2">
-                <Waves className="h-5 w-5 text-[var(--text-muted)]" />
-              </div>
-              <div>
-                <h2 className={VOICE_ROUTE_WORKSPACE_TITLE_CLASS}>
-                  TTS Projects
-                </h2>
-                <p className={VOICE_ROUTE_WORKSPACE_DESCRIPTION_CLASS}>
-                  Import scripts, render segments, and export merged narration.
-                </p>
-              </div>
-            </div>
+      <div className="grid gap-5 items-stretch xl:h-[calc(100dvh-11.75rem)]">
+        <WorkspaceFrame className="flex min-h-0 flex-col">
+          <WorkspaceHeader
+            icon={Waves}
+            title="TTS Projects"
+            description="Import scripts, render segments, and export merged narration."
+            actions={renderWorkflowTabs()}
+          />
 
-            {renderWorkflowTabs()}
-          </div>
-
-          <div className="flex-1 min-h-0 overflow-y-auto pr-1 scrollbar-thin">
+          <div className="mt-5 flex-1 min-h-0 overflow-y-auto pr-1 scrollbar-thin">
             <TextToSpeechProjectsWorkspace
               selectedModel={selectedModel}
               selectedModelInfo={selectedModelInfo}
@@ -940,55 +935,38 @@ export function TextToSpeechWorkspace({
               onError={onError}
             />
           </div>
-        </div>
+        </WorkspaceFrame>
       </div>
     );
   }
 
   return (
-    <div className="grid gap-4 items-stretch xl:h-[calc(100dvh-11.75rem)]">
-      <div className="card p-4 flex min-h-0 flex-col">
-        <div className="flex-1 min-h-0 overflow-y-auto pr-1 scrollbar-thin">
-          <div className="mb-4 flex items-center justify-between gap-4">
-            <div className="flex items-center gap-3">
-              <div className="rounded bg-[var(--bg-surface-2)] border border-[var(--border-muted)] p-2">
-                <Mic2 className="h-5 w-5 text-[var(--text-muted)]" />
-              </div>
-              <div>
-                <h2 className={VOICE_ROUTE_WORKSPACE_TITLE_CLASS}>
-                  Text to Speech
-                </h2>
-                <p className={VOICE_ROUTE_WORKSPACE_DESCRIPTION_CLASS}>
-                  Choose a model, then a compatible voice, then render.
-                </p>
-              </div>
-            </div>
+    <div className="grid gap-5 items-stretch xl:h-[calc(100dvh-11.75rem)]">
+      <WorkspaceFrame className="flex min-h-0 flex-col">
+        <WorkspaceHeader
+          icon={Mic2}
+          title="Text to Speech"
+          description="Choose a model, then a compatible voice, then render."
+          actions={renderWorkflowTabs()}
+        />
 
-            {renderWorkflowTabs()}
-          </div>
-
-          <div className="mb-4 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
+        <div className="mt-5 flex-1 min-h-0 overflow-y-auto pr-1 scrollbar-thin">
+          <WorkspacePanel className="mb-5 p-4">
             <div className="grid gap-x-5 gap-y-4 xl:grid-cols-[minmax(0,360px)_minmax(0,360px)_minmax(0,1fr)_auto]">
               <div className="min-w-0">
-                <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>
-                  Active Model
-                </div>
+                <WorkspaceSectionLabel>Active Model</WorkspaceSectionLabel>
                 <div className="mt-3 w-full max-w-[360px]">{renderModelSelector()}</div>
-                <div
-                  className={cn(
-                    "mt-2 text-xs",
-                    selectedModelReady
-                      ? "text-[var(--text-secondary)]"
-                      : "text-amber-500",
-                  )}
+                <StatusBadge
+                  tone={selectedModelReady ? "success" : "warning"}
+                  className="mt-3"
                 >
                   {selectedOption?.statusLabel ||
                     "Select and load a TTS model to continue"}
-                </div>
+                </StatusBadge>
               </div>
 
               <div className="min-w-0">
-                <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>Voice</div>
+                <WorkspaceSectionLabel>Voice</WorkspaceSectionLabel>
                 <div className="mt-3 w-full max-w-[360px]">
                   <VoiceSelect
                     voiceMode={voiceMode}
@@ -1005,7 +983,7 @@ export function TextToSpeechWorkspace({
                     compact
                   />
                 </div>
-                <p className="mt-2 text-[11px] font-medium text-[var(--text-muted)]">
+                <p className="mt-3 text-[11px] font-medium text-[var(--text-muted)]">
                   Voice availability follows the selected model instead of
                   switching models automatically.
                 </p>
@@ -1024,11 +1002,11 @@ export function TextToSpeechWorkspace({
                 </div>
               ) : null}
             </div>
-          </div>
+          </WorkspacePanel>
 
-          <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_420px]">
+          <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_420px]">
             <div className="space-y-6">
-              <div>
+              <WorkspacePanel className="p-5">
                 <label className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-2 block")}>
                   Script
                 </label>
@@ -1040,9 +1018,9 @@ export function TextToSpeechWorkspace({
                   placeholder="Paste the text you want this voice to speak..."
                   className="textarea min-h-[220px] w-full bg-[var(--bg-surface-1)] border-[var(--border-muted)] py-4 text-base leading-relaxed"
                 />
-              </div>
+              </WorkspacePanel>
 
-              <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
+              <WorkspacePanel className="p-5">
                 <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
                   <div>
                     <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-2")}>
@@ -1132,7 +1110,7 @@ export function TextToSpeechWorkspace({
                     </motion.div>
                   ) : null}
                 </AnimatePresence>
-              </div>
+              </WorkspacePanel>
 
               <AnimatePresence>
                 {error ? (
@@ -1142,88 +1120,93 @@ export function TextToSpeechWorkspace({
                     exit={{ opacity: 0, height: 0 }}
                     className="overflow-hidden"
                   >
-                    <div className="flex items-start gap-2 rounded-lg border border-[var(--danger-border)] bg-[var(--danger-bg)] p-3 text-sm text-[var(--danger-text)]">
-                      <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-                      <p>{error}</p>
-                    </div>
+                    <StatePanel
+                      title="Generation error"
+                      description={error}
+                      icon={AlertCircle}
+                      tone="danger"
+                    />
                   </motion.div>
                 ) : null}
               </AnimatePresence>
 
-              <div className="flex flex-wrap items-center gap-3">
-                <Button
-                  onClick={handleGenerate}
-                  disabled={generating || !canGenerate}
-                  className="min-w-[190px]"
-                >
-                  {generating ? (
-                    <>
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                      Generating...
-                    </>
-                  ) : (
-                    <>
-                      <Mic2 className="h-4 w-4" />
-                      Generate audio
-                    </>
-                  )}
-                </Button>
-
-                {(audioUrl || isStreaming) ? (
-                  <Button variant="outline" onClick={handleStop}>
-                    <Square className="h-4 w-4" />
-                    Stop
-                  </Button>
-                ) : null}
-
-                {audioUrl ? (
-                  <>
-                    <Button
-                      variant="outline"
-                      onClick={handleDownload}
-                      disabled={isDownloading}
-                    >
-                      {isDownloading ? (
+              <WorkspacePanel className="p-5">
+                <WorkspaceSectionLabel>Render</WorkspaceSectionLabel>
+                <div className="mt-4 flex flex-wrap items-center gap-3">
+                  <Button
+                    onClick={handleGenerate}
+                    disabled={generating || !canGenerate}
+                    className="min-w-[190px]"
+                  >
+                    {generating ? (
+                      <>
                         <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : (
-                        <Download className="h-4 w-4" />
-                      )}
-                      Download
-                    </Button>
-                    <Button variant="ghost" onClick={handleReset}>
-                      <RotateCcw className="h-4 w-4" />
-                      Reset
-                    </Button>
-                  </>
-                ) : null}
-              </div>
+                        Generating...
+                      </>
+                    ) : (
+                      <>
+                        <Mic2 className="h-4 w-4" />
+                        Generate audio
+                      </>
+                    )}
+                  </Button>
 
-              {downloadState !== "idle" && downloadMessage ? (
-                <div
-                  className={cn(
-                    "flex items-center gap-2 rounded-lg border px-3 py-2.5 text-xs font-medium",
-                    downloadState === "downloading" &&
-                      "bg-[var(--status-warning-bg)] border-[var(--status-warning-border)] text-[var(--status-warning-text)]",
-                    downloadState === "success" &&
-                      "bg-[var(--status-positive-bg)] border-[var(--status-positive-border)] text-[var(--status-positive-text)]",
-                    downloadState === "error" &&
-                      "bg-[var(--danger-bg)] border-[var(--danger-border)] text-[var(--danger-text)]",
-                  )}
-                >
-                  {downloadState === "downloading" ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : downloadState === "success" ? (
-                    <CheckCircle2 className="h-4 w-4" />
-                  ) : (
-                    <AlertCircle className="h-4 w-4" />
-                  )}
-                  {downloadMessage}
+                  {(audioUrl || isStreaming) ? (
+                    <Button variant="outline" onClick={handleStop}>
+                      <Square className="h-4 w-4" />
+                      Stop
+                    </Button>
+                  ) : null}
+
+                  {audioUrl ? (
+                    <>
+                      <Button
+                        variant="outline"
+                        onClick={handleDownload}
+                        disabled={isDownloading}
+                      >
+                        {isDownloading ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Download className="h-4 w-4" />
+                        )}
+                        Download
+                      </Button>
+                      <Button variant="ghost" onClick={handleReset}>
+                        <RotateCcw className="h-4 w-4" />
+                        Reset
+                      </Button>
+                    </>
+                  ) : null}
                 </div>
-              ) : null}
+
+                {downloadState !== "idle" && downloadMessage ? (
+                  <div
+                    className={cn(
+                      "mt-4 flex items-center gap-2 rounded-lg border px-3 py-2.5 text-xs font-medium",
+                      downloadState === "downloading" &&
+                        "bg-[var(--status-warning-bg)] border-[var(--status-warning-border)] text-[var(--status-warning-text)]",
+                      downloadState === "success" &&
+                        "bg-[var(--status-positive-bg)] border-[var(--status-positive-border)] text-[var(--status-positive-text)]",
+                      downloadState === "error" &&
+                        "bg-[var(--danger-bg)] border-[var(--danger-border)] text-[var(--danger-text)]",
+                    )}
+                  >
+                    {downloadState === "downloading" ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : downloadState === "success" ? (
+                      <CheckCircle2 className="h-4 w-4" />
+                    ) : (
+                      <AlertCircle className="h-4 w-4" />
+                    )}
+                    {downloadMessage}
+                  </div>
+                ) : null}
+              </WorkspacePanel>
             </div>
 
             <div className="space-y-4">
-              <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
+              <WorkspacePanel className="p-5">
                 <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-3")}>
                   Voice Summary
                 </div>
@@ -1246,17 +1229,21 @@ export function TextToSpeechWorkspace({
                     </div>
                   </div>
                 </div>
-              </div>
+              </WorkspacePanel>
 
-              <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
+              <WorkspacePanel className="p-5">
                 <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-3")}>
                   Output
                 </div>
 
                 {!audioUrl && !isStreaming ? (
-                  <div className="rounded-lg border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-4 py-8 text-center text-sm text-[var(--text-muted)]">
-                    Generate audio to review the rendered result here.
-                  </div>
+                  <StatePanel
+                    title="No rendered audio yet"
+                    description="Generate audio to review the rendered result here."
+                    tone="neutral"
+                    dashed
+                    align="center"
+                  />
                 ) : (
                   <div className="space-y-4 rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-4">
                     {audioUrl ? (
@@ -1277,9 +1264,9 @@ export function TextToSpeechWorkspace({
                     ) : null}
                   </div>
                 )}
-              </div>
+              </WorkspacePanel>
 
-              <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
+              <WorkspacePanel className="p-5">
                 <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-2")}>
                   Quick Workflow
                 </div>
@@ -1294,11 +1281,11 @@ export function TextToSpeechWorkspace({
                     3. Generate and review the result
                   </div>
                 </div>
-              </div>
+              </WorkspacePanel>
             </div>
           </div>
         </div>
-      </div>
+      </WorkspaceFrame>
       {workspaceMode === "quick" ? (
         <SpeechHistoryPanel
           route="text-to-speech"
