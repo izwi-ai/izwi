@@ -535,13 +535,12 @@ impl Qwen35ChatModel {
     ) -> Result<Tensor> {
         let mut logits: Option<Tensor> = None;
         let mut vision_embedding_index = 0usize;
-        for (token_id, position_ids) in prepared_prompt
-            .prompt_ids
-            .iter()
-            .copied()
-            .zip(prepared_prompt.prompt_positions.iter().copied())
-        {
-            logits = Some(if token_id == self.tokenizer.specials.image_pad {
+        let mut idx = 0usize;
+        while idx < prepared_prompt.prompt_ids.len() {
+            let token_id = prepared_prompt.prompt_ids[idx];
+            let position_ids = prepared_prompt.prompt_positions[idx];
+            let is_last = idx + 1 == prepared_prompt.prompt_ids.len();
+            if token_id == self.tokenizer.specials.image_pad {
                 let vision_inputs = prepared_prompt.vision_inputs.as_ref().ok_or_else(|| {
                     Error::InvalidInput(
                         "Qwen3.5 image placeholders require paired media inputs".to_string(),
@@ -558,16 +557,49 @@ impl Qwen35ChatModel {
                     .narrow(0, vision_embedding_index, 1)?
                     .reshape((1, 1, self.text_model.hidden_size()))?;
                 vision_embedding_index += 1;
-                self.text_model
-                    .forward_input_embedding_at(&embedding, position_ids, text_state)?
+                if is_last {
+                    logits = Some(self.text_model.forward_input_embedding_at(
+                        &embedding,
+                        position_ids,
+                        text_state,
+                    )?);
+                } else {
+                    self.text_model.forward_input_embedding_hidden_at(
+                        &embedding,
+                        position_ids,
+                        text_state,
+                    )?;
+                }
             } else if token_id == self.tokenizer.specials.video_pad {
                 return Err(Error::InvalidInput(
                     "Qwen3.5 video inputs are not implemented yet".to_string(),
                 ));
             } else {
-                self.text_model
-                    .forward_token_id_at(token_id, position_ids, text_state)?
-            });
+                let mut run_end = idx + 1;
+                while run_end < prepared_prompt.prompt_ids.len() {
+                    let candidate = prepared_prompt.prompt_ids[run_end];
+                    if candidate == self.tokenizer.specials.image_pad
+                        || candidate == self.tokenizer.specials.video_pad
+                    {
+                        break;
+                    }
+                    run_end += 1;
+                }
+
+                let compute_logits = run_end == prepared_prompt.prompt_ids.len();
+                if let Some(run_logits) = self.text_model.prefill_token_ids(
+                    &prepared_prompt.prompt_ids[idx..run_end],
+                    &prepared_prompt.prompt_positions[idx..run_end],
+                    text_state,
+                    compute_logits,
+                )? {
+                    logits = Some(run_logits);
+                }
+                idx = run_end;
+                continue;
+            }
+
+            idx += 1;
         }
 
         if let Some(vision_inputs) = prepared_prompt.vision_inputs.as_ref() {

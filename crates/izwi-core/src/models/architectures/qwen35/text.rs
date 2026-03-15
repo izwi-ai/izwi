@@ -182,7 +182,29 @@ impl Qwen35TextModel {
         self.forward_input_embedding_at(&hidden, position_ids, state)
     }
 
+    pub fn forward_token_id_hidden_at(
+        &self,
+        token_id: u32,
+        position_ids: [usize; 3],
+        state: &mut Qwen35TextRuntimeState,
+    ) -> Result<Tensor> {
+        let input = Tensor::from_vec(vec![token_id], (1, 1), &self.device)?;
+        let hidden = self.token_embeddings.forward(&input)?;
+        self.forward_input_embedding_hidden_at(&hidden, position_ids, state)
+    }
+
     pub fn forward_input_embedding_at(
+        &self,
+        input_embedding: &Tensor,
+        position_ids: [usize; 3],
+        state: &mut Qwen35TextRuntimeState,
+    ) -> Result<Tensor> {
+        let hidden =
+            self.forward_input_embedding_hidden_at(input_embedding, position_ids, state)?;
+        self.forward_hidden_to_logits(&hidden)
+    }
+
+    pub fn forward_input_embedding_hidden_at(
         &self,
         input_embedding: &Tensor,
         position_ids: [usize; 3],
@@ -192,8 +214,48 @@ impl Qwen35TextModel {
         for (layer, layer_state) in self.layers.iter().zip(state.layers.iter_mut()) {
             hidden = layer.forward(&hidden, layer_state, position_ids)?;
         }
+        Ok(hidden)
+    }
 
-        let hidden = self.output_norm.forward(&hidden)?;
+    pub fn prefill_token_ids(
+        &self,
+        token_ids: &[u32],
+        position_ids: &[[usize; 3]],
+        state: &mut Qwen35TextRuntimeState,
+        compute_logits: bool,
+    ) -> Result<Option<Tensor>> {
+        if token_ids.is_empty() {
+            return Ok(None);
+        }
+        if token_ids.len() != position_ids.len() {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3.5 prefill span mismatch: {} token ids for {} position ids",
+                token_ids.len(),
+                position_ids.len()
+            )));
+        }
+
+        let input = Tensor::from_vec(token_ids.to_vec(), (1, token_ids.len()), &self.device)?;
+        let embeddings = self.token_embeddings.forward(&input)?;
+        let mut last_hidden = None;
+        for (idx, &position_id) in position_ids.iter().enumerate() {
+            let hidden = embeddings.narrow(1, idx, 1)?;
+            last_hidden =
+                Some(self.forward_input_embedding_hidden_at(&hidden, position_id, state)?);
+        }
+
+        if !compute_logits {
+            return Ok(None);
+        }
+
+        let last_hidden = last_hidden.ok_or_else(|| {
+            Error::InferenceError("Qwen3.5 prefill span produced no hidden state".to_string())
+        })?;
+        self.forward_hidden_to_logits(&last_hidden).map(Some)
+    }
+
+    pub fn forward_hidden_to_logits(&self, hidden: &Tensor) -> Result<Tensor> {
+        let hidden = self.output_norm.forward(hidden)?;
         let logits = self.output.forward(&hidden)?;
         logits.i((0, 0)).map_err(Error::from)
     }
