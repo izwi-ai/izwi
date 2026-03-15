@@ -72,12 +72,10 @@ export function AppRoutes() {
     models,
     selectedModel,
     loading,
-    error,
     downloadProgress,
     readyModelsCount,
     selectModel,
     reportError,
-    clearError,
     refreshModels,
     downloadModel,
     cancelModelDownload,
@@ -124,15 +122,21 @@ export function AppRoutes() {
     onDelete: deleteModel,
     onRefresh: refreshModels,
   };
+  const activeModelOperationsCount = models.filter(
+    (model) => model.status === "downloading" || model.status === "loading",
+  ).length;
+  const selectedModelLabel =
+    models.find((model) => model.variant === selectedModel)?.variant ??
+    selectedModel;
 
   return (
     <Routes>
       <Route
         element={
           <AppLayout
-            error={error}
-            onErrorDismiss={clearError}
             readyModelsCount={readyModelsCount}
+            activeModelOperationsCount={activeModelOperationsCount}
+            selectedModelLabel={selectedModelLabel}
             resolvedTheme={resolvedTheme}
             themePreference={themePreference}
             onThemePreferenceChange={setThemePreference}

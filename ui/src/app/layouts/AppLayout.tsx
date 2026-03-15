@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
-import { motion, AnimatePresence } from "framer-motion";
+import { AnimatePresence, motion } from "framer-motion";
 import {
+  Activity,
   Mic,
   Users,
   Wand2,
@@ -11,13 +12,13 @@ import {
   Box,
   Library,
   Github,
-  AlertCircle,
-  X,
   Menu,
   Sun,
   Moon,
+  Loader2,
 } from "lucide-react";
 import { APP_ICON_URL, APP_VERSION } from "@/shared/config/runtime";
+import { StatusBadge } from "@/components/ui/status-badge";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 
@@ -25,9 +26,9 @@ const appIconUrl = APP_ICON_URL;
 const APP_VERSION_LABEL = `v${APP_VERSION}`;
 
 interface LayoutProps {
-  error: string | null;
-  onErrorDismiss: () => void;
   readyModelsCount: number;
+  activeModelOperationsCount: number;
+  selectedModelLabel: string | null;
   resolvedTheme: "light" | "dark";
   themePreference: "system" | "light" | "dark";
   onThemePreferenceChange: (preference: "system" | "light" | "dark") => void;
@@ -114,9 +115,9 @@ const BOTTOM_NAV_ITEMS: NavItem[] = [
 ];
 
 export function AppLayout({
-  error,
-  onErrorDismiss,
   readyModelsCount,
+  activeModelOperationsCount,
+  selectedModelLabel,
   resolvedTheme,
   themePreference,
   onThemePreferenceChange,
@@ -140,6 +141,10 @@ export function AppLayout({
     readyModelsCount > 0
       ? `${readyModelsCount} model${readyModelsCount !== 1 ? "s" : ""} loaded`
       : "No models loaded";
+  const activeOperationText =
+    activeModelOperationsCount > 0
+      ? `${activeModelOperationsCount} active task${activeModelOperationsCount === 1 ? "" : "s"}`
+      : "Idle";
 
   const switchTheme = () => {
     onThemePreferenceChange(resolvedTheme === "dark" ? "light" : "dark");
@@ -171,6 +176,9 @@ export function AppLayout({
             </div>
             <div>
               <h1 className="text-sm font-semibold text-foreground">Izwi</h1>
+              <div className="mt-0.5 text-[11px] text-muted-foreground">
+                {selectedModelLabel ?? loadedText}
+              </div>
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -548,60 +556,71 @@ export function AppLayout({
         )}
       >
         <div className="hidden lg:flex justify-end px-6 lg:px-8 pt-4 shrink-0">
-          <div className="flex flex-col items-end">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={switchTheme}
-              className="gap-2 rounded-full px-4 bg-card/65 backdrop-blur-sm"
-              title={
-                resolvedTheme === "dark"
-                  ? "Switch to light mode"
-                  : "Switch to dark mode"
-              }
-            >
-              {resolvedTheme === "dark" ? (
-                <>
-                  <Sun className="w-4 h-4" />
-                  <span className="text-xs font-medium">Light</span>
-                </>
-              ) : (
-                <>
-                  <Moon className="w-4 h-4" />
-                  <span className="text-xs font-medium">Dark</span>
-                </>
-              )}
-            </Button>
-            {themePreference === "system" && (
-              <div className="mt-1.5 text-[10px] font-medium text-muted-foreground uppercase tracking-wider pr-2">
-                System
+          <div className="flex w-full items-start justify-between gap-4">
+            <div className="min-w-0">
+              <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+                AI engine
               </div>
-            )}
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <StatusBadge
+                  tone={
+                    activeModelOperationsCount > 0
+                      ? "warning"
+                      : readyModelsCount > 0
+                        ? "success"
+                        : "neutral"
+                  }
+                >
+                  {activeModelOperationsCount > 0 ? "Processing" : readyModelsCount > 0 ? "Ready" : "Inactive"}
+                </StatusBadge>
+                <div className="inline-flex min-w-0 items-center gap-2 rounded-full border border-border/60 bg-card/55 px-3 py-2 text-xs text-muted-foreground shadow-[var(--shadow-soft)] backdrop-blur-sm">
+                  {activeModelOperationsCount > 0 ? (
+                    <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-[var(--status-warning-text)]" />
+                  ) : (
+                    <Activity className="h-3.5 w-3.5 shrink-0" />
+                  )}
+                  <span className="truncate text-foreground">
+                    {selectedModelLabel ?? loadedText}
+                  </span>
+                  <span className="hidden text-muted-foreground/80 xl:inline">
+                    {activeOperationText}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex flex-col items-end">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={switchTheme}
+                className="gap-2 rounded-full px-4 bg-card/65 backdrop-blur-sm"
+                title={
+                  resolvedTheme === "dark"
+                    ? "Switch to light mode"
+                    : "Switch to dark mode"
+                }
+              >
+                {resolvedTheme === "dark" ? (
+                  <>
+                    <Sun className="w-4 h-4" />
+                    <span className="text-xs font-medium">Light</span>
+                  </>
+                ) : (
+                  <>
+                    <Moon className="w-4 h-4" />
+                    <span className="text-xs font-medium">Dark</span>
+                  </>
+                )}
+              </Button>
+              {themePreference === "system" && (
+                <div className="mt-1.5 text-[10px] font-medium text-muted-foreground uppercase tracking-wider pr-2">
+                  System
+                </div>
+              )}
+            </div>
           </div>
         </div>
-
-        {/* Error toast */}
-        <AnimatePresence>
-          {error && (
-            <motion.div
-              initial={{ opacity: 0, y: -10, scale: 0.95 }}
-              animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{ opacity: 0, y: -10, scale: 0.95 }}
-              className="fixed top-4 left-1/2 -translate-x-1/2 z-50"
-            >
-              <div className="flex items-center gap-3 px-4 py-3 rounded-xl border border-destructive/45 bg-destructive/92 text-destructive-foreground shadow-[0_16px_40px_-24px_rgba(190,24,93,0.75)] font-medium text-sm">
-                <AlertCircle className="w-4 h-4" />
-                <span>{error}</span>
-                <button
-                  onClick={onErrorDismiss}
-                  className="p-1 rounded-md hover:bg-white/20 transition-colors ml-2"
-                >
-                  <X className="w-3.5 h-3.5" />
-                </button>
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
 
         {/* Page content */}
         <main className="flex-1 overflow-y-auto w-full p-6 sm:p-8 lg:px-12 lg:pb-12 lg:pt-8 flex flex-col">

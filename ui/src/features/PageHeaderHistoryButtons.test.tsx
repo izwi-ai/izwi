@@ -1,4 +1,5 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TextToSpeechPage } from "./text-to-speech/route";
@@ -98,7 +99,7 @@ describe("Page header history buttons", () => {
     ["DiarizationPage", <DiarizationPage {...baseProps} />],
     ["TranscriptionPage", <TranscriptionPage {...baseProps} />],
   ])("%s renders the history button in the page header slot", async (_, ui) => {
-    render(ui);
+    render(<MemoryRouter>{ui}</MemoryRouter>);
 
     const slot = screen.getByTestId("page-header-history-slot");
 

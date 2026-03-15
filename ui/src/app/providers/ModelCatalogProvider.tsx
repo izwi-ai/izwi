@@ -9,6 +9,7 @@ import {
   type ReactNode,
 } from "react";
 import { api, type ModelInfo } from "@/api";
+import { useNotifications } from "@/app/providers/NotificationProvider";
 import { VIEW_CONFIGS } from "@/types";
 import type { DownloadProgressMap } from "@/app/router/types";
 
@@ -39,6 +40,7 @@ interface ModelCatalogProviderProps {
 export function ModelCatalogProvider({
   children,
 }: ModelCatalogProviderProps) {
+  const { notify } = useNotifications();
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [selectedModel, setSelectedModelState] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -60,6 +62,13 @@ export function ModelCatalogProvider({
   const lastProgressAtRef = useRef<Record<string, number>>({});
   const suppressReconnectRef = useRef<Set<string>>(new Set());
   const initializedRef = useRef(false);
+  const lastDownloadTerminalStateRef = useRef<Record<string, string>>({});
+
+  const getModelLabel = useCallback(
+    (variant: string) =>
+      models.find((model) => model.variant === variant)?.variant ?? variant,
+    [models],
+  );
 
   const selectModel = useCallback((variant: string | null) => {
     setSelectedModelState(variant);
@@ -67,7 +76,12 @@ export function ModelCatalogProvider({
 
   const reportError = useCallback((message: string) => {
     setError(message);
-  }, []);
+    notify({
+      title: "Action failed",
+      description: message,
+      tone: "danger",
+    });
+  }, [notify]);
 
   const clearError = useCallback(() => {
     setError(null);
@@ -207,6 +221,30 @@ export function ModelCatalogProvider({
             data.status === "error" ||
             data.status === "cancelled"
           ) {
+            const previousTerminalState =
+              lastDownloadTerminalStateRef.current[variant];
+            if (previousTerminalState !== data.status) {
+              lastDownloadTerminalStateRef.current[variant] = data.status;
+              if (data.status === "completed") {
+                notify({
+                  title: "Model download complete",
+                  description: `${getModelLabel(variant)} is ready to load.`,
+                  tone: "success",
+                });
+              } else if (data.status === "cancelled") {
+                notify({
+                  title: "Model download cancelled",
+                  description: `${getModelLabel(variant)} download was stopped.`,
+                  tone: "info",
+                });
+              } else if (data.status === "error") {
+                notify({
+                  title: "Model download failed",
+                  description: `Izwi could not finish downloading ${getModelLabel(variant)}.`,
+                  tone: "danger",
+                });
+              }
+            }
             closeDownloadStream(variant);
             activeDownloadsRef.current.delete(variant);
             suppressReconnectRef.current.delete(variant);
@@ -373,6 +411,7 @@ export function ModelCatalogProvider({
         suppressReconnectRef.current.delete(variant);
         clearReconnectTimer(variant);
         activeDownloadsRef.current.add(variant);
+        delete lastDownloadTerminalStateRef.current[variant];
 
         setModels((prev) =>
           prev.map((model) =>
@@ -383,6 +422,11 @@ export function ModelCatalogProvider({
         );
 
         const response = await api.downloadModel(variant);
+        notify({
+          title: "Downloading model",
+          description: `${getModelLabel(variant)} download started in the background.`,
+          tone: "info",
+        });
 
         if (
           response.status === "started" ||
@@ -401,13 +445,27 @@ export function ModelCatalogProvider({
             ? err.message
             : "Failed to download model. Please try again.",
         );
+        notify({
+          title: "Model download failed",
+          description:
+            err instanceof Error
+              ? err.message
+              : `Izwi could not download ${getModelLabel(variant)}.`,
+          tone: "danger",
+        });
 
         closeDownloadStream(variant);
 
         await refreshModels();
       }
     },
-    [clearReconnectTimer, closeDownloadStream, refreshModels],
+    [
+      clearReconnectTimer,
+      closeDownloadStream,
+      getModelLabel,
+      notify,
+      refreshModels,
+    ],
   );
 
   const cancelModelDownload = useCallback(
@@ -419,6 +477,7 @@ export function ModelCatalogProvider({
         activeDownloadsRef.current.delete(variant);
 
         await api.cancelDownload(variant);
+        lastDownloadTerminalStateRef.current[variant] = "cancelled";
 
         clearDownloadProgress(variant);
 
@@ -441,10 +500,24 @@ export function ModelCatalogProvider({
         setError(
           err instanceof Error ? err.message : "Failed to cancel download.",
         );
+        notify({
+          title: "Cancel failed",
+          description:
+            err instanceof Error
+              ? err.message
+              : `Izwi could not cancel ${getModelLabel(variant)}.`,
+          tone: "danger",
+        });
         await refreshModels();
       }
     },
-    [clearDownloadProgress, closeDownloadStream, refreshModels],
+    [
+      clearDownloadProgress,
+      closeDownloadStream,
+      getModelLabel,
+      notify,
+      refreshModels,
+    ],
   );
 
   const loadModel = useCallback(
@@ -484,15 +557,25 @@ export function ModelCatalogProvider({
 
         await api.loadModel(variant);
         setSelectedModelState(variant);
+        notify({
+          title: "Model loaded",
+          description: `${getModelLabel(variant)} is now active.`,
+          tone: "success",
+        });
       } catch (err) {
         console.error("Load failed:", err);
         setError("Failed to load model. Please try again.");
+        notify({
+          title: "Model load failed",
+          description: `Izwi could not load ${getModelLabel(variant)}.`,
+          tone: "danger",
+        });
       } finally {
         activeModelLoadsRef.current.delete(variant);
         await refreshModels();
       }
     },
-    [models, refreshModels],
+    [getModelLabel, models, notify, refreshModels],
   );
 
   const unloadModel = useCallback(
@@ -503,12 +586,22 @@ export function ModelCatalogProvider({
         setSelectedModelState((current) =>
           current === variant ? null : current,
         );
+        notify({
+          title: "Model unloaded",
+          description: `${getModelLabel(variant)} was unloaded from memory.`,
+          tone: "info",
+        });
       } catch (err) {
         console.error("Unload failed:", err);
         setError("Failed to unload model. Please try again.");
+        notify({
+          title: "Model unload failed",
+          description: `Izwi could not unload ${getModelLabel(variant)}.`,
+          tone: "danger",
+        });
       }
     },
-    [refreshModels],
+    [getModelLabel, notify, refreshModels],
   );
 
   const deleteModel = useCallback(
@@ -524,14 +617,30 @@ export function ModelCatalogProvider({
         setSelectedModelState((current) =>
           current === variant ? null : current,
         );
+        notify({
+          title: "Model deleted",
+          description: `${getModelLabel(variant)} was removed from disk.`,
+          tone: "info",
+        });
       } catch (err) {
         suppressReconnectRef.current.delete(variant);
         console.error("Delete failed:", err);
         setError("Failed to delete model. Please try again.");
+        notify({
+          title: "Delete failed",
+          description: `Izwi could not delete ${getModelLabel(variant)}.`,
+          tone: "danger",
+        });
         await refreshModels();
       }
     },
-    [clearDownloadProgress, closeDownloadStream, refreshModels],
+    [
+      clearDownloadProgress,
+      closeDownloadStream,
+      getModelLabel,
+      notify,
+      refreshModels,
+    ],
   );
 
   const value = useMemo<ModelCatalogContextValue>(
