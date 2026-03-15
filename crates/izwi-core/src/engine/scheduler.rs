@@ -108,14 +108,14 @@ impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             max_batch_size: 8,
-            max_tokens_per_step: 512,
+            max_tokens_per_step: 384,
             policy: SchedulingPolicy::FCFS,
             enable_chunked_prefill: true,
-            chunked_prefill_threshold: 256,
+            chunked_prefill_threshold: 192,
             enable_preemption: true,
             enable_vad_preemption: true,
             enable_adaptive_batching: true,
-            min_tokens_per_step: 128,
+            min_tokens_per_step: 96,
             target_ttft_ms: 250.0,
             target_decode_tpot_ms: 40.0,
             priority_aging_ms: 1_000,
@@ -128,7 +128,7 @@ impl Default for SchedulerConfig {
             thermal_pressure_hint: 0.0,
             power_save_mode: false,
             enable_decode_quanta: true,
-            max_decode_tokens_per_request: 4,
+            max_decode_tokens_per_request: 2,
             enable_kv_tiering: true,
         }
     }
@@ -1200,7 +1200,11 @@ impl Scheduler {
         if !self.config.enable_decode_quanta {
             return 1.min(base);
         }
+        let active_decode_requests = self.running.values().filter(|r| r.prefill_complete).count();
         if has_waiting_work || overdue_ms > 0.0 || kv_utilization > 0.80 {
+            return 1.min(base);
+        }
+        if active_decode_requests > 1 {
             return 1.min(base);
         }
 
@@ -1936,5 +1940,47 @@ mod tests {
             second.decode_requests[0].num_tokens, 4,
             "decode quanta should grant multi-token decode when queue pressure is low"
         );
+    }
+
+    #[test]
+    fn test_decode_quanta_backs_off_when_multiple_decodes_are_active() {
+        let config = SchedulerConfig {
+            max_batch_size: 2,
+            max_tokens_per_step: 8,
+            min_tokens_per_step: 1,
+            policy: SchedulingPolicy::FCFS,
+            enable_chunked_prefill: false,
+            enable_preemption: false,
+            enable_adaptive_batching: false,
+            enable_decode_quanta: true,
+            max_decode_tokens_per_request: 4,
+            ..Default::default()
+        };
+        let mut scheduler = Scheduler::new(config);
+        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
+            max_blocks: 32,
+            block_size: 8,
+            ..Default::default()
+        });
+
+        for request_id in ["decode-a", "decode-b"] {
+            let mut request = EngineCoreRequest::tts("hello");
+            request.id = request_id.to_string();
+            request.prompt_tokens = vec![1];
+            scheduler.add_request(&request);
+        }
+
+        let first = scheduler.schedule(&mut kv_cache);
+        assert_eq!(first.prefill_requests.len(), 2);
+        for request_id in ["decode-a", "decode-b"] {
+            scheduler.update_after_step(&request_id.to_string(), 1, 1, Vec::new(), 1.0);
+        }
+
+        let second = scheduler.schedule(&mut kv_cache);
+        assert_eq!(second.decode_requests.len(), 2);
+        assert!(second
+            .decode_requests
+            .iter()
+            .all(|request| request.num_tokens == 1));
     }
 }

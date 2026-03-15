@@ -141,7 +141,7 @@ fn default_max_seq_len() -> usize {
     4096
 }
 fn default_max_tokens_per_step() -> usize {
-    512
+    384
 }
 fn default_block_size() -> usize {
     16
@@ -156,7 +156,7 @@ fn default_chunked_prefill() -> bool {
     true
 }
 fn default_chunked_prefill_threshold() -> usize {
-    256
+    192
 }
 fn default_sample_rate() -> u32 {
     24000
@@ -188,7 +188,7 @@ fn default_enable_adaptive_batching() -> bool {
     true
 }
 fn default_min_tokens_per_step() -> usize {
-    128
+    96
 }
 fn default_target_ttft_ms() -> f64 {
     250.0
@@ -237,7 +237,7 @@ fn default_enable_decode_quanta() -> bool {
     true
 }
 fn default_max_decode_tokens_per_request() -> usize {
-    4
+    2
 }
 fn default_enable_kv_tiering() -> bool {
     true
