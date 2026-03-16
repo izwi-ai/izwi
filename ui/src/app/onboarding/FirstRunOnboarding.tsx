@@ -30,9 +30,8 @@ import { cn } from "@/lib/utils";
 import { APP_ICON_URL } from "@/shared/config/runtime";
 
 const QUICK_SETUP_VARIANTS = [
-  "diar_streaming_sortformer_4spk-v2.1",
-  "Qwen3-ASR-0.6B",
-  "Qwen3-ForcedAligner-0.6B",
+  "Parakeet-TDT-0.6B-v3",
+  "Kokoro-82M",
   "Qwen3-1.7B-GGUF",
 ] as const;
 
