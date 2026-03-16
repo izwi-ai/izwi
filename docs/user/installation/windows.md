@@ -17,7 +17,7 @@ Izwi runs on Windows 10 and later with optional CUDA support for NVIDIA GPUs.
 
 ### Step 1: Download
 
-Download `Izwi-Setup-*.exe` from [GitHub Releases](https://github.com/agentem-ai/izwi/releases).
+Download `Izwi-Setup-*.exe` from [GitHub Releases](https://github.com/izwi-ai/izwi/releases).
 
 ### Step 2: Run Installer
 
@@ -216,7 +216,7 @@ If you can't access Izwi from other devices:
 ### Build
 
 ```powershell
-git clone https://github.com/agentem-ai/izwi.git
+git clone https://github.com/izwi-ai/izwi.git
 cd izwi
 cargo build --release
 ```

@@ -525,10 +525,10 @@ export function AppLayout({
                 )}
                 title={`App version ${APP_VERSION}`}
               >
-                  {APP_VERSION_LABEL}
+                {APP_VERSION_LABEL}
               </div>
               <a
-                href="https://github.com/agentem-ai/izwi"
+                href="https://github.com/izwi-ai/izwi"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="rounded-md p-1 text-muted-foreground hover:text-foreground transition-colors hover:bg-accent"

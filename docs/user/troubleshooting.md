@@ -366,7 +366,7 @@ Open an issue on GitHub with:
 3. Steps to reproduce
 4. Error messages and logs
 
-[GitHub Issues](https://github.com/agentem-ai/izwi/issues)
+[GitHub Issues](https://github.com/izwi-ai/izwi/issues)
 
 ---
 

@@ -47,7 +47,7 @@ source "$HOME/.cargo/env"
 ## Clone the Repository
 
 ```bash
-git clone https://github.com/agentem-ai/izwi.git
+git clone https://github.com/izwi-ai/izwi.git
 cd izwi
 ```
 

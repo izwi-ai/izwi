@@ -16,7 +16,7 @@ Izwi is optimized for macOS with native Apple Silicon (M1/M2/M3/M4) acceleration
 
 ### Step 1: Download
 
-Download the latest `Izwi-*.dmg` from [GitHub Releases](https://github.com/agentem-ai/izwi/releases).
+Download the latest `Izwi-*.dmg` from [GitHub Releases](https://github.com/izwi-ai/izwi/releases).
 
 ### Step 2: Install
 
@@ -77,7 +77,7 @@ If you only need the CLI tools without the desktop app:
 
 ```bash
 # Clone the repository
-git clone https://github.com/agentem-ai/izwi.git
+git clone https://github.com/izwi-ai/izwi.git
 cd izwi
 
 # Build with Metal support

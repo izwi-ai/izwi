@@ -8,7 +8,7 @@ Get Izwi running in under 5 minutes.
 
 ### macOS
 
-Download the latest `.dmg` from [GitHub Releases](https://github.com/agentem-ai/izwi/releases), then:
+Download the latest `.dmg` from [GitHub Releases](https://github.com/izwi-ai/izwi/releases), then:
 
 1. Open the downloaded `.dmg` file
 2. Drag **Izwi.app** to your Applications folder
@@ -18,7 +18,7 @@ On first launch, Izwi will set up the `izwi` command-line tool automatically.
 
 ### Linux
 
-Download the `.deb` package from [GitHub Releases](https://github.com/agentem-ai/izwi/releases):
+Download the `.deb` package from [GitHub Releases](https://github.com/izwi-ai/izwi/releases):
 
 ```bash
 sudo dpkg -i izwi_*.deb
@@ -26,7 +26,7 @@ sudo dpkg -i izwi_*.deb
 
 ### Windows
 
-Download and run the `.exe` installer from [GitHub Releases](https://github.com/agentem-ai/izwi/releases).
+Download and run the `.exe` installer from [GitHub Releases](https://github.com/izwi-ai/izwi/releases).
 
 > See [Installation](./installation/index.md) for detailed platform-specific instructions.
 

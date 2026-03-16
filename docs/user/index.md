@@ -54,11 +54,11 @@ Izwi is a powerful, privacy-focused audio AI platform that runs entirely on your
 
 ## Getting Help
 
-- **GitHub Issues** — [Report bugs or request features](https://github.com/agentem-ai/izwi/issues)
-- **Discussions** — [Ask questions and share ideas](https://github.com/agentem-ai/izwi/discussions)
+- **GitHub Issues** — [Report bugs or request features](https://github.com/izwi-ai/izwi/issues)
+- **Discussions** — [Ask questions and share ideas](https://github.com/izwi-ai/izwi/discussions)
 
 ---
 
 ## License
 
-Izwi is open source software licensed under [Apache 2.0](https://github.com/agentem-ai/izwi/blob/main/LICENSE).
+Izwi is open source software licensed under [Apache 2.0](https://github.com/izwi-ai/izwi/blob/main/LICENSE).

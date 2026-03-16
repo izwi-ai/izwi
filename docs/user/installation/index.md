@@ -21,20 +21,20 @@ Choose your platform for detailed installation instructions.
 
 ```bash
 # Download and install the .dmg from GitHub Releases
-open https://github.com/agentem-ai/izwi/releases
+open https://github.com/izwi-ai/izwi/releases
 ```
 
 ### Linux (Debian/Ubuntu)
 
 ```bash
 # Download the .deb package
-wget https://github.com/agentem-ai/izwi/releases/latest/download/izwi_amd64.deb
+wget https://github.com/izwi-ai/izwi/releases/latest/download/izwi_amd64.deb
 sudo dpkg -i izwi_amd64.deb
 ```
 
 ### Windows
 
-Download and run the installer from [GitHub Releases](https://github.com/agentem-ai/izwi/releases).
+Download and run the installer from [GitHub Releases](https://github.com/izwi-ai/izwi/releases).
 
 ---
 

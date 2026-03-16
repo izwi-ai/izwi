@@ -9,7 +9,7 @@
 <p align="center">
   <a href="https://izwiai.com">Website</a> •
   <a href="https://izwiai.com/docs">Documentation</a> •
-  <a href="https://github.com/agentem-ai/izwi/releases">Releases</a> •
+  <a href="https://github.com/izwi-ai/izwi/releases">Releases</a> •
   <a href="https://izwiai.com/docs/getting-started">Getting Started</a>
 </p>
 
@@ -42,7 +42,7 @@ The server exposes OpenAI-compatible API routes under `/v1`.
 
 ### macOS
 
-Download the latest `.dmg` from [GitHub Releases](https://github.com/agentem-ai/izwi/releases):
+Download the latest `.dmg` from [GitHub Releases](https://github.com/izwi-ai/izwi/releases):
 
 1. Open the `.dmg` file
 2. Drag **Izwi.app** to Applications
@@ -51,13 +51,13 @@ Download the latest `.dmg` from [GitHub Releases](https://github.com/agentem-ai/
 ### Linux
 
 ```bash
-wget https://github.com/agentem-ai/izwi/releases/latest/download/izwi_amd64.deb
+wget https://github.com/izwi-ai/izwi/releases/latest/download/izwi_amd64.deb
 sudo dpkg -i izwi_amd64.deb
 ```
 
 ### Windows
 
-Download and run the installer from [GitHub Releases](https://github.com/agentem-ai/izwi/releases).
+Download and run the installer from [GitHub Releases](https://github.com/izwi-ai/izwi/releases).
 
 > **Full installation guides:** [macOS](https://izwiai.com/docs/installation/macos) • [Linux](https://izwiai.com/docs/installation/linux) • [Windows](https://izwiai.com/docs/installation/windows) • [From Source](https://izwiai.com/docs/installation/from-source)
 

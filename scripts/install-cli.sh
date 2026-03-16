@@ -4,7 +4,7 @@
 
 set -e
 
-REPO_URL="https://github.com/agentem-ai/izwi"
+REPO_URL="https://github.com/izwi-ai/izwi"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.izwi}"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 
@@ -141,7 +141,7 @@ print_usage() {
     echo "  izwi pull qwen3-tts-0.6b-base  # Download a model"
     echo "  izwi tts 'Hello world'   # Generate speech"
     echo ""
-    echo "Documentation: https://github.com/agentem-ai/izwi"
+    echo "Documentation: https://github.com/izwi-ai/izwi"
 }
 
 main() {

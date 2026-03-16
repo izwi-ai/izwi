@@ -18,7 +18,7 @@ Izwi runs on most modern Linux distributions with optional CUDA support for NVID
 ### Step 1: Download
 
 ```bash
-wget https://github.com/agentem-ai/izwi/releases/latest/download/izwi_amd64.deb
+wget https://github.com/izwi-ai/izwi/releases/latest/download/izwi_amd64.deb
 ```
 
 ### Step 2: Install
@@ -101,7 +101,7 @@ rustup update stable
 
 ```bash
 # Clone the repository
-git clone https://github.com/agentem-ai/izwi.git
+git clone https://github.com/izwi-ai/izwi.git
 cd izwi
 
 # Build release binaries
