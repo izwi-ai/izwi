@@ -32,6 +32,7 @@ pub mod codecs;
 pub mod config;
 pub mod engine;
 pub mod error;
+pub mod kernels;
 pub mod model;
 mod models;
 pub mod runtime;

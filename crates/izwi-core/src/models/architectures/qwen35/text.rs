@@ -8,6 +8,7 @@ use candle_transformers::models::with_tracing::QMatMul;
 use candle_transformers::quantized_nn::RmsNorm;
 
 use crate::error::{Error, Result};
+use crate::kernels::metal::{try_fused_gated_delta_recurrent, try_fused_l2_norm};
 use crate::models::architectures::qwen3::core::repeat_kv;
 use crate::models::shared::attention::flash::try_fused_self_attention;
 use crate::models::shared::attention::paged::{
@@ -884,6 +885,14 @@ fn softplus(x: &Tensor) -> Result<Tensor> {
 }
 
 fn l2norm(x: &Tensor, eps: f64) -> Result<Tensor> {
+    // Try fused Metal kernel first for F32 tensors
+    if x.dtype() == DType::F32 {
+        if let Some(result) = try_fused_l2_norm(x, eps) {
+            return Ok(result);
+        }
+    }
+
+    // Fallback to standard implementation
     x.broadcast_div(&(x.sqr()?.sum_keepdim(D::Minus1)? + eps)?.sqrt()?)
         .map_err(Error::from)
 }
@@ -909,7 +918,17 @@ fn recurrent_gated_delta(
     beta: &Tensor,
     state: Tensor,
 ) -> Result<(Tensor, Tensor)> {
-    let query = (query * (1.0 / (query.dim(D::Minus1)? as f64).sqrt()))?;
+    // Try fused Metal kernel first (for F32 on Metal devices)
+    if query.dtype() == DType::F32 {
+        if let Some(result) = try_fused_gated_delta_recurrent(query, key, value, g, beta, &state) {
+            return Ok(result);
+        }
+    }
+
+    // Fallback to original implementation
+    let dim = query.dim(D::Minus1)?;
+    let scale = 1.0 / (dim as f64).sqrt();
+    let query = (query * scale)?;
     let g = g.exp()?.reshape((1, g.dim(1)?, 1, 1))?;
     let beta = beta.reshape((1, beta.dim(1)?, 1))?;
 
