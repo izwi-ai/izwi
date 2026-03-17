@@ -318,9 +318,20 @@ impl Qwen35Mlp {
     }
 
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
-        let gate = ops::silu(&self.gate.forward(hidden_states)?)?;
-        let up = self.up.forward(hidden_states)?;
-        self.down.forward(&(&gate * &up)?).map_err(Error::from)
+        // Use fused SiLU-gate-up if available (reduces memory bandwidth)
+        let gate_proj_out = self.gate.forward(hidden_states)?;
+        let up_proj_out = self.up.forward(hidden_states)?;
+
+        let hidden = if let Some(fused) =
+            crate::kernels::metal::try_fused_silu_mul(&gate_proj_out, &up_proj_out)
+        {
+            fused
+        } else {
+            let gate = ops::silu(&gate_proj_out)?;
+            (&gate * &up_proj_out)?
+        };
+
+        self.down.forward(&hidden).map_err(Error::from)
     }
 }
 
