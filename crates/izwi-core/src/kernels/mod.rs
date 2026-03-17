@@ -7,6 +7,7 @@
 //! - Metal (Apple Silicon) kernels for Qwen3.5 DeltaNet layers
 //! - Fallback to Candle operations for other backends
 
+pub mod buffer_pool;
 pub mod metal;
 
 use crate::error::Error;
