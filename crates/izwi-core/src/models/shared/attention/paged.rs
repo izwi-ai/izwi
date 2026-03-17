@@ -14,16 +14,29 @@ pub enum KvCacheQuantization {
     None,
     /// Store KV pages in int8 with per-page symmetric scale.
     Int8,
+    /// Store KV pages in Q4_0 format (4-bit, 32-element blocks).
+    /// This reduces memory by 75% compared to F16 at minor quality loss.
+    Q4_0,
 }
 
 impl KvCacheQuantization {
     /// Parse quantization mode from a KV cache dtype hint.
     ///
-    /// Accepts values such as `int8`, `i8`, `q8`, `float16`, `float32`, `bf16`.
+    /// Accepts values such as `int8`, `i8`, `q8`, `q4_0`, `q4`, `float16`, `float32`, `bf16`.
     pub fn from_dtype_hint(dtype: &str) -> Self {
         match dtype.trim().to_ascii_lowercase().as_str() {
             "int8" | "i8" | "q8" | "q8_0" => Self::Int8,
+            "q4_0" | "q4" => Self::Q4_0,
             _ => Self::None,
+        }
+    }
+
+    /// Get the compression ratio compared to F16.
+    pub fn compression_ratio(&self) -> f32 {
+        match self {
+            Self::None => 1.0,
+            Self::Int8 => 2.0,
+            Self::Q4_0 => 4.0,
         }
     }
 }
@@ -54,6 +67,14 @@ pub enum KvPage {
         scale: f32,
         target_dtype: DType,
     },
+    /// Q4_0 quantized page: 4-bit weights with per-32-element block scales.
+    /// Values are packed 2x4-bit per byte, with a block scale (f16/f32) every 32 values.
+    Q4_0 {
+        values: Tensor,    // U8 packed 4-bit values
+        scales: Tensor,    // F32 scale per block
+        num_blocks: usize, // Number of 32-element blocks
+        target_dtype: DType,
+    },
 }
 
 impl KvPage {
@@ -68,6 +89,15 @@ impl KvPage {
                     target_dtype,
                 })
             }
+            KvCacheQuantization::Q4_0 => {
+                let (values, scales, num_blocks, target_dtype) = quantize_tensor_q4_0(&tensor)?;
+                Ok(Self::Q4_0 {
+                    values,
+                    scales,
+                    num_blocks,
+                    target_dtype,
+                })
+            }
         }
     }
 
@@ -75,6 +105,7 @@ impl KvPage {
         match self {
             Self::Dense(t) => t.dim(1).map_err(Error::from),
             Self::Int8 { values, .. } => values.dim(1).map_err(Error::from),
+            Self::Q4_0 { values, .. } => values.dim(1).map_err(Error::from),
         }
     }
 
@@ -86,6 +117,12 @@ impl KvPage {
                 scale,
                 target_dtype,
             } => dequantize_tensor_int8(values, *scale, *target_dtype),
+            Self::Q4_0 {
+                values,
+                scales,
+                num_blocks,
+                target_dtype,
+            } => dequantize_tensor_q4_0(values, scales, *num_blocks, *target_dtype),
         }
     }
 }
@@ -126,6 +163,132 @@ fn dequantize_tensor_int8(values: &Tensor, scale: f32, target_dtype: DType) -> R
     }
     let scale_t = Tensor::from_vec(vec![scale], (1,), values.device())?.to_dtype(target_dtype)?;
     dense.broadcast_mul(&scale_t).map_err(Error::from)
+}
+
+/// Q4_0 quantization: 4-bit weights with per-32-element block scales.
+///
+/// Each block contains:
+/// - 32 4-bit values packed into 16 bytes (2 values per byte)
+/// - 1 f16/f32 scale factor for the block
+///
+/// Returns: (packed_values: U8, scales: F32, num_blocks, target_dtype)
+fn quantize_tensor_q4_0(tensor: &Tensor) -> Result<(Tensor, Tensor, usize, DType)> {
+    let target_dtype = tensor.dtype();
+    let device = tensor.device();
+
+    // Convert to F32 for quantization
+    let tensor_f32 = tensor.to_dtype(DType::F32)?;
+    let flat = tensor_f32.flatten_all()?;
+    let numel = flat.elem_count();
+
+    // Q4_0 uses 32-element blocks
+    const BLOCK_SIZE: usize = 32;
+    let num_blocks = (numel + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    // Get raw data
+    let data = flat.to_vec1::<f32>()?;
+
+    // Allocate output buffers
+    let mut packed_values: Vec<u8> = Vec::with_capacity(num_blocks * BLOCK_SIZE / 2);
+    let mut scales: Vec<f32> = Vec::with_capacity(num_blocks);
+
+    for block_idx in 0..num_blocks {
+        let start = block_idx * BLOCK_SIZE;
+        let end = ((start + BLOCK_SIZE).min(numel)) as usize;
+        let _block_len = end - start;
+
+        // Find max abs value in block for scale
+        let max_abs = data[start..end]
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0f32, f32::max);
+        let scale = if max_abs > 0.0 {
+            max_abs / 7.0 // Q4 range is -7 to +7 (we use 3 bits for magnitude + 1 for sign)
+        } else {
+            1.0
+        };
+        scales.push(scale);
+
+        // Quantize and pack values
+        let inv_scale = 1.0 / scale;
+        for i in (0..BLOCK_SIZE).step_by(2) {
+            let v0_idx = start + i;
+            let v1_idx = start + i + 1;
+
+            // Quantize first value
+            let v0 = if v0_idx < numel {
+                let q = (data[v0_idx] * inv_scale).round().clamp(-7.0, 7.0) as i8;
+                (q + 8) as u8 & 0x0F // Shift to 0-15 range, keep lower 4 bits
+            } else {
+                0u8
+            };
+
+            // Quantize second value
+            let v1 = if v1_idx < numel {
+                let q = (data[v1_idx] * inv_scale).round().clamp(-7.0, 7.0) as i8;
+                ((q + 8) as u8 & 0x0F) << 4 // Shift to 0-15 range, put in upper 4 bits
+            } else {
+                0u8
+            };
+
+            packed_values.push(v0 | v1);
+        }
+    }
+
+    let values_len = packed_values.len();
+    let values_tensor = Tensor::from_vec(packed_values, (values_len,), device)?;
+    let scales_tensor = Tensor::from_vec(scales, (num_blocks,), device)?;
+
+    Ok((values_tensor, scales_tensor, num_blocks, target_dtype))
+}
+
+/// Dequantize Q4_0 format back to dense tensor.
+fn dequantize_tensor_q4_0(
+    values: &Tensor,
+    scales: &Tensor,
+    num_blocks: usize,
+    target_dtype: DType,
+) -> Result<Tensor> {
+    let device = values.device();
+    const BLOCK_SIZE: usize = 32;
+
+    let packed = values.to_vec1::<u8>()?;
+    let scales_f32 = scales.to_vec1::<f32>()?;
+
+    // Calculate total elements
+    let total_elements = packed.len() * 2;
+    let mut dequantized: Vec<f32> = Vec::with_capacity(total_elements);
+
+    for block_idx in 0..num_blocks {
+        let scale = scales_f32[block_idx];
+        let packed_offset = block_idx * (BLOCK_SIZE / 2);
+
+        for i in 0..BLOCK_SIZE {
+            let packed_idx = packed_offset + i / 2;
+            if packed_idx >= packed.len() {
+                break;
+            }
+            let byte = packed[packed_idx];
+
+            // Extract 4-bit value
+            let q = if i % 2 == 0 {
+                (byte & 0x0F) as i8
+            } else {
+                ((byte >> 4) & 0x0F) as i8
+            };
+
+            // Convert from unsigned 0-15 to signed -7 to +7
+            let q_signed = q as f32 - 8.0;
+            let v = q_signed * scale;
+            dequantized.push(v);
+        }
+    }
+
+    let dequantized_len = dequantized.len();
+    let dequantized_tensor = Tensor::from_vec(dequantized, (dequantized_len,), device)?;
+    dequantized_tensor
+        .to_dtype(target_dtype)
+        .map_err(Error::from)
 }
 
 /// Append a `[batch, seq, heads, dim]` tensor into fixed-size pages along `seq`.
