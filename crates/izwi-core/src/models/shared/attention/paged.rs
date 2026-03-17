@@ -4,6 +4,8 @@ use candle_core::{DType, Tensor, D};
 
 use crate::error::{Error, Result};
 
+const Q4_0_BLOCK_SIZE: usize = 32;
+
 /// Default KV page size used when model-specific config is unavailable.
 pub const DEFAULT_KV_PAGE_SIZE: usize = 64;
 
@@ -72,7 +74,8 @@ pub enum KvPage {
     Q4_0 {
         values: Tensor,    // U8 packed 4-bit values
         scales: Tensor,    // F32 scale per block
-        num_blocks: usize, // Number of 32-element blocks
+        seq_len: usize,    // Original sequence length
+        num_elements: usize, // Total flat elements represented by the page
         target_dtype: DType,
     },
 }
@@ -90,11 +93,21 @@ impl KvPage {
                 })
             }
             KvCacheQuantization::Q4_0 => {
-                let (values, scales, num_blocks, target_dtype) = quantize_tensor_q4_0(&tensor)?;
+                let seq_len = tensor.dim(1)?;
+                let num_elements = tensor.elem_count();
+                let (values, scales, target_dtype) = quantize_tensor_q4_0(&tensor)?;
+                let num_blocks = scales.elem_count();
+                let expected_blocks = (num_elements + Q4_0_BLOCK_SIZE - 1) / Q4_0_BLOCK_SIZE;
+                if num_elements == 0 || num_blocks != expected_blocks {
+                    return Err(Error::InvalidInput(
+                        "Invalid Q4_0 quantization metadata".to_string(),
+                    ));
+                }
                 Ok(Self::Q4_0 {
                     values,
                     scales,
-                    num_blocks,
+                    seq_len,
+                    num_elements,
                     target_dtype,
                 })
             }
@@ -105,7 +118,7 @@ impl KvPage {
         match self {
             Self::Dense(t) => t.dim(1).map_err(Error::from),
             Self::Int8 { values, .. } => values.dim(1).map_err(Error::from),
-            Self::Q4_0 { values, .. } => values.dim(1).map_err(Error::from),
+            Self::Q4_0 { seq_len, .. } => Ok(*seq_len),
         }
     }
 
@@ -120,9 +133,9 @@ impl KvPage {
             Self::Q4_0 {
                 values,
                 scales,
-                num_blocks,
+                num_elements,
                 target_dtype,
-            } => dequantize_tensor_q4_0(values, scales, *num_blocks, *target_dtype),
+            } => dequantize_tensor_q4_0(values, scales, *num_elements, *target_dtype),
         }
     }
 }
@@ -171,8 +184,8 @@ fn dequantize_tensor_int8(values: &Tensor, scale: f32, target_dtype: DType) -> R
 /// - 32 4-bit values packed into 16 bytes (2 values per byte)
 /// - 1 f16/f32 scale factor for the block
 ///
-/// Returns: (packed_values: U8, scales: F32, num_blocks, target_dtype)
-fn quantize_tensor_q4_0(tensor: &Tensor) -> Result<(Tensor, Tensor, usize, DType)> {
+/// Returns: (packed_values: U8, scales: F32, target_dtype)
+fn quantize_tensor_q4_0(tensor: &Tensor) -> Result<(Tensor, Tensor, DType)> {
     let target_dtype = tensor.dtype();
     let device = tensor.device();
 
@@ -181,21 +194,18 @@ fn quantize_tensor_q4_0(tensor: &Tensor) -> Result<(Tensor, Tensor, usize, DType
     let flat = tensor_f32.flatten_all()?;
     let numel = flat.elem_count();
 
-    // Q4_0 uses 32-element blocks
-    const BLOCK_SIZE: usize = 32;
-    let num_blocks = (numel + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    let num_blocks = (numel + Q4_0_BLOCK_SIZE - 1) / Q4_0_BLOCK_SIZE;
 
     // Get raw data
     let data = flat.to_vec1::<f32>()?;
 
     // Allocate output buffers
-    let mut packed_values: Vec<u8> = Vec::with_capacity(num_blocks * BLOCK_SIZE / 2);
+    let mut packed_values: Vec<u8> = Vec::with_capacity(num_blocks * Q4_0_BLOCK_SIZE / 2);
     let mut scales: Vec<f32> = Vec::with_capacity(num_blocks);
 
     for block_idx in 0..num_blocks {
-        let start = block_idx * BLOCK_SIZE;
-        let end = ((start + BLOCK_SIZE).min(numel)) as usize;
-        let _block_len = end - start;
+        let start = block_idx * Q4_0_BLOCK_SIZE;
+        let end = (start + Q4_0_BLOCK_SIZE).min(numel);
 
         // Find max abs value in block for scale
         let max_abs = data[start..end]
@@ -211,7 +221,7 @@ fn quantize_tensor_q4_0(tensor: &Tensor) -> Result<(Tensor, Tensor, usize, DType
 
         // Quantize and pack values
         let inv_scale = 1.0 / scale;
-        for i in (0..BLOCK_SIZE).step_by(2) {
+        for i in (0..Q4_0_BLOCK_SIZE).step_by(2) {
             let v0_idx = start + i;
             let v1_idx = start + i + 1;
 
@@ -239,35 +249,52 @@ fn quantize_tensor_q4_0(tensor: &Tensor) -> Result<(Tensor, Tensor, usize, DType
     let values_tensor = Tensor::from_vec(packed_values, (values_len,), device)?;
     let scales_tensor = Tensor::from_vec(scales, (num_blocks,), device)?;
 
-    Ok((values_tensor, scales_tensor, num_blocks, target_dtype))
+    Ok((values_tensor, scales_tensor, target_dtype))
 }
 
 /// Dequantize Q4_0 format back to dense tensor.
 fn dequantize_tensor_q4_0(
     values: &Tensor,
     scales: &Tensor,
-    num_blocks: usize,
+    num_elements: usize,
     target_dtype: DType,
 ) -> Result<Tensor> {
     let device = values.device();
-    const BLOCK_SIZE: usize = 32;
+    if num_elements == 0 {
+        return Ok(Tensor::zeros(0, target_dtype, device).map_err(Error::from)?);
+    }
 
     let packed = values.to_vec1::<u8>()?;
     let scales_f32 = scales.to_vec1::<f32>()?;
+    let expected_num_blocks = (num_elements + Q4_0_BLOCK_SIZE - 1) / Q4_0_BLOCK_SIZE;
+    let expected_packed_len = expected_num_blocks * (Q4_0_BLOCK_SIZE / 2);
 
-    // Calculate total elements
-    let total_elements = packed.len() * 2;
-    let mut dequantized: Vec<f32> = Vec::with_capacity(total_elements);
+    if scales_f32.len() != expected_num_blocks {
+        return Err(Error::InvalidInput(format!(
+            "Q4_0 scale length mismatch: expected {}, got {}",
+            expected_num_blocks,
+            scales_f32.len()
+        )));
+    }
+    if packed.len() != expected_packed_len {
+        return Err(Error::InvalidInput(format!(
+            "Q4_0 packed length mismatch: expected {}, got {}",
+            expected_packed_len,
+            packed.len()
+        )));
+    }
 
-    for block_idx in 0..num_blocks {
+    let mut dequantized: Vec<f32> = Vec::with_capacity(num_elements);
+
+    for block_idx in 0..expected_num_blocks {
         let scale = scales_f32[block_idx];
-        let packed_offset = block_idx * (BLOCK_SIZE / 2);
-
-        for i in 0..BLOCK_SIZE {
-            let packed_idx = packed_offset + i / 2;
-            if packed_idx >= packed.len() {
+        let packed_offset = block_idx * (Q4_0_BLOCK_SIZE / 2);
+        for i in 0..Q4_0_BLOCK_SIZE {
+            let out_idx = block_idx * Q4_0_BLOCK_SIZE + i;
+            if out_idx >= num_elements {
                 break;
             }
+            let packed_idx = packed_offset + i / 2;
             let byte = packed[packed_idx];
 
             // Extract 4-bit value
@@ -284,8 +311,15 @@ fn dequantize_tensor_q4_0(
         }
     }
 
-    let dequantized_len = dequantized.len();
-    let dequantized_tensor = Tensor::from_vec(dequantized, (dequantized_len,), device)?;
+    if dequantized.len() != num_elements {
+        return Err(Error::InvalidInput(format!(
+            "Q4_0 dequantization length mismatch: expected {}, got {}",
+            num_elements,
+            dequantized.len()
+        )));
+    }
+
+    let dequantized_tensor = Tensor::from_vec(dequantized, (num_elements,), device)?;
     dequantized_tensor
         .to_dtype(target_dtype)
         .map_err(Error::from)
@@ -510,6 +544,23 @@ mod tests {
         let materialized = materialize_pages(&pages).unwrap();
         let diff = max_abs_diff(&materialized, &full);
         assert!(diff < 0.08, "max abs diff was {}", diff);
+    }
+
+    #[test]
+    fn test_q4_0_quantized_materialize_close_to_dense() {
+        let device = Device::Cpu;
+        let full = Tensor::randn(0.0f32, 1.0f32, (1, 17, 4, 8), &device).unwrap();
+        let mut pages = Vec::new();
+        append_to_pages(5, &mut pages, &full, KvCacheQuantization::Q4_0).unwrap();
+        let materialized = materialize_pages(&pages).unwrap();
+        let diff = max_abs_diff(&materialized, &full);
+        assert!(diff < 0.20, "max abs diff was {}", diff);
+
+        assert_eq!(pages.len(), 4, "unexpected page count");
+        assert_eq!(pages[0].seq_len().unwrap(), 5);
+        assert_eq!(pages[1].seq_len().unwrap(), 5);
+        assert_eq!(pages[2].seq_len().unwrap(), 5);
+        assert_eq!(pages[3].seq_len().unwrap(), 2);
     }
 
     #[test]
