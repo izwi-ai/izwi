@@ -133,6 +133,7 @@ impl KvPage {
             Self::Q4_0 {
                 values,
                 scales,
+                seq_len: _,
                 num_elements,
                 target_dtype,
             } => dequantize_tensor_q4_0(values, scales, *num_elements, *target_dtype),

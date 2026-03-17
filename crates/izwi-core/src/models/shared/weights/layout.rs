@@ -12,8 +12,6 @@
 use candle_core::quantized::QTensor;
 use candle_core::Device;
 
-use crate::error::Result;
-
 /// Configuration for row-interleaved layout optimization.
 #[derive(Debug, Clone, Copy)]
 pub struct RowInterleavedConfig {
