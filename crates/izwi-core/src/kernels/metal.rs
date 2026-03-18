@@ -111,7 +111,7 @@ fn fused_gated_delta_sequential(
                     .map_err(|e| FusedKernelError::ExecutionError(e.to_string()))?,
             )
             .map_err(|e| FusedKernelError::ExecutionError(e.to_string()))?)
-    .map_err(|e| FusedKernelError::ExecutionError(e.to_string()))?;
+        .map_err(|e| FusedKernelError::ExecutionError(e.to_string()))?;
 
     // Output via matmul: query (1,H,1,Dk) × state (1,H,Dk,Dv) → (1,H,1,Dv) → squeeze → (1,H,Dv)
     let output = scaled_query
@@ -229,12 +229,12 @@ pub fn try_fused_gated_rms_norm(
 /// (outputs, final_state) where outputs is [batch, seq, num_v_heads, head_v_dim]
 pub fn try_tiled_deltanet_recurrence(
     queries: &Tensor,
-    _keys: &Tensor,
-    _values: &Tensor,
-    _g: &Tensor,
-    _beta: &Tensor,
-    _initial_state: &Tensor,
-    _tile_size: usize,
+    keys: &Tensor,
+    values: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    initial_state: &Tensor,
+    tile_size: usize,
 ) -> Option<(Tensor, Tensor)> {
     if !use_fused_kernels() {
         return None;
@@ -249,34 +249,59 @@ pub fn try_tiled_deltanet_recurrence(
         return None;
     }
 
-    // For now, use optimized sequential operations
-    // In a future version with custom Metal kernels, this would use tile memory
-    //
-    // The ideal implementation:
-    // 1. Load initial_state into tile memory (threadgroup memory)
-    // 2. For each token in the tile:
-    //    - Compute gated_state = state * exp(g[t])
-    //    - Compute kv_mem = sum(gated_state * key[t], dim=2)
-    //    - Compute delta = (value[t] - kv_mem) * beta[t]
-    //    - Update state = gated_state + key[t] * delta
-    //    - Compute output[t] = sum(state * query[t], dim=2)
-    // 3. Write final state back to VRAM
-    // 4. Return all outputs and final state
+    let (batch, seq_len, num_heads, head_k_dim) = queries.dims4().ok()?;
+    let (k_batch, k_seq_len, k_num_heads, k_head_k_dim) = keys.dims4().ok()?;
+    let (v_batch, v_seq_len, v_num_heads, _v_head_dim) = values.dims4().ok()?;
+    let (g_batch, g_seq_len, g_heads) = g.dims3().ok()?;
+    let (b_batch, b_seq_len, b_heads) = beta.dims3().ok()?;
+    let (s_batch, s_heads, s_head_k_dim, _s_head_v_dim) = initial_state.dims4().ok()?;
 
-    // Current implementation: process token-by-token but in chunks
-    let seq_len = queries.dim(1).ok()?;
-    let _batch = queries.dim(0).ok()?;
-    let _num_heads = queries.dim(2).ok()?;
-    let _head_dim = queries.dim(3).ok()?;
+    if batch != 1
+        || k_batch != batch
+        || v_batch != batch
+        || g_batch != batch
+        || b_batch != batch
+        || s_batch != batch
+    {
+        return None;
+    }
+    if k_seq_len != seq_len || v_seq_len != seq_len || g_seq_len != seq_len || b_seq_len != seq_len
+    {
+        return None;
+    }
+    if k_num_heads != num_heads || g_heads != num_heads || b_heads != num_heads {
+        return None;
+    }
+    if k_head_k_dim != head_k_dim || s_heads != num_heads || s_head_k_dim != head_k_dim {
+        return None;
+    }
+    if v_num_heads != num_heads {
+        return None;
+    }
 
-    // Fall back to sequential processing for now
-    // The actual Metal tile memory implementation would require custom kernels
-    tracing::debug!(
-        "Tiled DeltaNet not yet implemented with tile memory, falling back to sequential (seq_len={})",
-        seq_len
-    );
+    let tile_size = tile_size.max(1).min(seq_len.max(1));
+    let mut outputs = Vec::with_capacity(seq_len);
+    let mut state = initial_state.clone();
 
-    None
+    for tile_start in (0..seq_len).step_by(tile_size) {
+        let tile_end = (tile_start + tile_size).min(seq_len);
+        for token_idx in tile_start..tile_end {
+            let query = queries.narrow(1, token_idx, 1).ok()?.squeeze(1).ok()?;
+            let key = keys.narrow(1, token_idx, 1).ok()?.squeeze(1).ok()?;
+            let value = values.narrow(1, token_idx, 1).ok()?.squeeze(1).ok()?;
+            let g_t = g.narrow(1, token_idx, 1).ok()?.squeeze(1).ok()?;
+            let beta_t = beta.narrow(1, token_idx, 1).ok()?.squeeze(1).ok()?;
+
+            let (output, next_state) =
+                fused_gated_delta_sequential(&query, &key, &value, &g_t, &beta_t, &state).ok()?;
+            outputs.push(output.unsqueeze(1).ok()?);
+            state = next_state;
+        }
+    }
+
+    let output_refs: Vec<&Tensor> = outputs.iter().collect();
+    let outputs = Tensor::cat(&output_refs, 1).ok()?;
+    Some((outputs, state))
 }
 
 /// Try SIMD-group softmax for attention.

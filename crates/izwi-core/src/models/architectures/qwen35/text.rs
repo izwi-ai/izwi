@@ -13,6 +13,7 @@ use crate::kernels::buffer_pool::{
 };
 use crate::kernels::metal::{
     try_fused_gated_delta_recurrent, try_fused_gated_rms_norm, try_fused_l2_norm,
+    try_tiled_deltanet_recurrence,
 };
 use crate::models::architectures::qwen3::core::repeat_kv;
 use crate::models::shared::attention::flash::try_fused_self_attention;
@@ -264,35 +265,17 @@ impl Qwen35TextModel {
 
         // Batch embedding lookup: single forward pass for all tokens.
         let input = Tensor::from_vec(token_ids.to_vec(), (1, token_ids.len()), &self.device)?;
-        let embeddings = self.token_embeddings.forward(&input)?;
-
-        // Process tokens through all layers. DeltaNet layers are inherently
-        // sequential (each token depends on prior recurrent state), so we
-        // iterate per-token but avoid redundant work:
-        // - Embeddings are computed once above
-        // - Layer states are pre-initialized
-        // - Logits are only computed for the final token
-        let token_count = token_ids.len();
-        let mut last_hidden = None;
-        for (idx, &position_id) in position_ids.iter().enumerate() {
-            let hidden = embeddings.narrow(1, idx, 1)?;
-            let mut h = hidden;
-            for (layer, layer_state) in self.layers.iter().zip(state.layers.iter_mut()) {
-                h = layer.forward(&h, layer_state, position_id)?;
-            }
-            // Only keep the last hidden state (we only need it for logits)
-            if idx == token_count - 1 {
-                last_hidden = Some(h);
-            }
+        let mut hidden = self.token_embeddings.forward(&input)?;
+        for (layer, layer_state) in self.layers.iter().zip(state.layers.iter_mut()) {
+            hidden = layer.forward_sequence(&hidden, layer_state, position_ids)?;
         }
 
         if !compute_logits {
             return Ok(None);
         }
 
-        let last_hidden = last_hidden.ok_or_else(|| {
-            Error::InferenceError("Qwen3.5 prefill span produced no hidden state".to_string())
-        })?;
+        let token_count = token_ids.len();
+        let last_hidden = hidden.narrow(1, token_count - 1, 1).map_err(Error::from)?;
         self.forward_hidden_to_logits(&last_hidden).map(Some)
     }
 
@@ -373,6 +356,51 @@ impl Qwen35Layer {
         let hidden_states = match &self.mixer {
             Qwen35Mixer::Linear(mixer) => mixer.forward(&hidden_states, state)?,
             Qwen35Mixer::Full(mixer) => mixer.forward(&hidden_states, state, position_ids)?,
+        };
+        let hidden_states = (&residual + &hidden_states)?;
+
+        let residual = hidden_states.clone();
+        let hidden_states = self.post_attention_norm.forward(&hidden_states)?;
+        let hidden_states = self.mlp.forward(&hidden_states)?;
+        (&residual + &hidden_states).map_err(Error::from)
+    }
+
+    fn forward_sequence(
+        &self,
+        hidden_states: &Tensor,
+        state: &mut Qwen35LayerRuntimeState,
+        position_ids: &[[usize; 3]],
+    ) -> Result<Tensor> {
+        let seq_len = hidden_states.dim(1)?;
+        if seq_len == 1 {
+            let position_id = *position_ids.first().ok_or_else(|| {
+                Error::InvalidInput(
+                    "Qwen3.5 forward_sequence expected at least one position id".to_string(),
+                )
+            })?;
+            return self.forward(hidden_states, state, position_id);
+        }
+        if seq_len != position_ids.len() {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3.5 layer sequence mismatch: seq_len={}, position_ids={}",
+                seq_len,
+                position_ids.len()
+            )));
+        }
+
+        let residual = hidden_states.clone();
+        let hidden_states = self.attn_norm.forward(hidden_states)?;
+        let hidden_states = match &self.mixer {
+            Qwen35Mixer::Linear(mixer) => mixer.forward_sequence(&hidden_states, state)?,
+            Qwen35Mixer::Full(mixer) => {
+                let mut outputs = Vec::with_capacity(seq_len);
+                for (idx, &position_id) in position_ids.iter().enumerate() {
+                    let token_hidden = hidden_states.narrow(1, idx, 1)?;
+                    outputs.push(mixer.forward(&token_hidden, state, position_id)?);
+                }
+                let output_refs: Vec<&Tensor> = outputs.iter().collect();
+                Tensor::cat(&output_refs, 1)?
+            }
         };
         let hidden_states = (&residual + &hidden_states)?;
 
@@ -756,6 +784,129 @@ impl Qwen35LinearAttention {
         self.out_proj.forward(&output).map_err(Error::from)
     }
 
+    fn forward_sequence(
+        &self,
+        hidden_states: &Tensor,
+        state: &mut Qwen35LayerRuntimeState,
+    ) -> Result<Tensor> {
+        let seq_len = hidden_states.dim(1)?;
+        if seq_len == 1 {
+            return self.forward(hidden_states, state);
+        }
+
+        let (conv_state, recurrent_state) = match state {
+            Qwen35LayerRuntimeState::Linear {
+                conv_state,
+                recurrent_state,
+            } => (conv_state, recurrent_state),
+            _ => {
+                return Err(Error::InferenceError(
+                    "Qwen3.5 layer runtime state does not match linear-attention layer".to_string(),
+                ))
+            }
+        };
+
+        let mixed_qkv = self.qkv_proj.forward(hidden_states)?;
+        let z = self.gate_proj.forward(hidden_states)?;
+        let beta = ops::sigmoid(&self.beta_proj.forward(hidden_states)?)?;
+        let alpha = self.alpha_proj.forward(hidden_states)?;
+        let g = softplus(&alpha.broadcast_add(&self.dt_bias)?)?.broadcast_mul(&self.a)?;
+
+        let mixed_qkv = self.depthwise_conv_sequence(&mixed_qkv, conv_state)?;
+
+        let key_width = self.num_k_heads * self.head_k_dim;
+        let value_width = self.num_v_heads * self.head_v_dim;
+        let query = mixed_qkv.narrow(2, 0, key_width)?.reshape((
+            1,
+            seq_len,
+            self.num_k_heads,
+            self.head_k_dim,
+        ))?;
+        let key = mixed_qkv.narrow(2, key_width, key_width)?.reshape((
+            1,
+            seq_len,
+            self.num_k_heads,
+            self.head_k_dim,
+        ))?;
+        let value = mixed_qkv.narrow(2, key_width * 2, value_width)?.reshape((
+            1,
+            seq_len,
+            self.num_v_heads,
+            self.head_v_dim,
+        ))?;
+
+        let mut query = l2norm(&query, 1e-6)?;
+        let mut key = l2norm(&key, 1e-6)?;
+        if self.num_v_heads != self.num_k_heads {
+            if self.num_k_heads == 0 || !self.num_v_heads.is_multiple_of(self.num_k_heads) {
+                return Err(Error::InferenceError(format!(
+                    "Invalid linear-attention head layout: num_v_heads={}, num_k_heads={}",
+                    self.num_v_heads, self.num_k_heads
+                )));
+            }
+            let repeats = self.num_v_heads / self.num_k_heads;
+            query = repeat_head_states_seq(&query, repeats)?;
+            key = repeat_head_states_seq(&key, repeats)?;
+        }
+
+        let current_state = if let Some(state) = recurrent_state.take() {
+            state
+        } else {
+            Tensor::zeros(
+                (1, self.num_v_heads, self.head_k_dim, self.head_v_dim),
+                value.dtype(),
+                value.device(),
+            )?
+        };
+
+        let beta = beta.reshape((1, seq_len, self.num_v_heads))?;
+        let g = g.reshape((1, seq_len, self.num_v_heads))?;
+        let tile_size = qwen35_tiled_recurrence_tile_size(seq_len);
+        let (output, next_state) = if qwen35_use_tiled_recurrence() {
+            if let Some((tiled_output, tiled_state)) = try_tiled_deltanet_recurrence(
+                &query,
+                &key,
+                &value,
+                &g,
+                &beta,
+                &current_state,
+                tile_size,
+            ) {
+                (tiled_output, tiled_state)
+            } else {
+                recurrent_gated_delta_sequence(&query, &key, &value, &g, &beta, current_state)?
+            }
+        } else {
+            recurrent_gated_delta_sequence(&query, &key, &value, &g, &beta, current_state)?
+        };
+        *recurrent_state = Some(next_state);
+
+        let output = output.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
+        let z = z.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
+        let output = self.norm.forward(&output, &z)?;
+        let output = output.reshape((1, seq_len, self.num_v_heads * self.head_v_dim))?;
+        self.out_proj.forward(&output).map_err(Error::from)
+    }
+
+    fn depthwise_conv_sequence(
+        &self,
+        mixed_qkv: &Tensor,
+        conv_state: &mut Option<Vec<Tensor>>,
+    ) -> Result<Tensor> {
+        let seq_len = mixed_qkv.dim(1)?;
+        if seq_len == 1 {
+            return self.depthwise_conv_step(mixed_qkv, conv_state);
+        }
+
+        let mut outputs = Vec::with_capacity(seq_len);
+        for idx in 0..seq_len {
+            let token = mixed_qkv.narrow(1, idx, 1)?;
+            outputs.push(self.depthwise_conv_step(&token, conv_state)?);
+        }
+        let output_refs: Vec<&Tensor> = outputs.iter().collect();
+        Tensor::cat(&output_refs, 1).map_err(Error::from)
+    }
+
     fn depthwise_conv_step(
         &self,
         mixed_qkv: &Tensor,
@@ -1055,6 +1206,78 @@ fn repeat_head_states(x: &Tensor, repeats: usize) -> Result<Tensor> {
         .map_err(Error::from)
 }
 
+fn repeat_head_states_seq(x: &Tensor, repeats: usize) -> Result<Tensor> {
+    if repeats <= 1 {
+        return Ok(x.clone());
+    }
+    let (batch, seq, heads, dim) = x.dims4()?;
+    let expanded = x
+        .unsqueeze(2)?
+        .broadcast_as((batch, seq, repeats, heads, dim))?;
+    expanded
+        .reshape((batch, seq, repeats * heads, dim))
+        .map_err(Error::from)
+}
+
+fn qwen35_use_tiled_recurrence() -> bool {
+    std::env::var("IZWI_QWEN35_TILED_RECURRENCE")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(true)
+}
+
+fn qwen35_tiled_recurrence_tile_size(seq_len: usize) -> usize {
+    if let Ok(raw) = std::env::var("IZWI_QWEN35_TILED_RECURRENCE_TILE_SIZE") {
+        if let Ok(parsed) = raw.trim().parse::<usize>() {
+            return parsed.max(1).min(seq_len.max(1));
+        }
+    }
+
+    if seq_len >= 256 {
+        64
+    } else if seq_len >= 64 {
+        32
+    } else if seq_len >= 16 {
+        16
+    } else {
+        seq_len.max(1)
+    }
+}
+
+fn recurrent_gated_delta_sequence(
+    query: &Tensor,
+    key: &Tensor,
+    value: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: Tensor,
+) -> Result<(Tensor, Tensor)> {
+    let seq_len = query.dim(1)?;
+    let mut outputs = Vec::with_capacity(seq_len);
+    let mut state = state;
+
+    for idx in 0..seq_len {
+        let q_t = query.narrow(1, idx, 1)?.squeeze(1)?;
+        let k_t = key.narrow(1, idx, 1)?.squeeze(1)?;
+        let v_t = value.narrow(1, idx, 1)?.squeeze(1)?;
+        let g_t = g.narrow(1, idx, 1)?.squeeze(1)?;
+        let beta_t = beta.narrow(1, idx, 1)?.squeeze(1)?;
+
+        let (output_t, next_state) = recurrent_gated_delta(&q_t, &k_t, &v_t, &g_t, &beta_t, state)?;
+        outputs.push(output_t.unsqueeze(1)?);
+        state = next_state;
+    }
+
+    let output_refs: Vec<&Tensor> = outputs.iter().collect();
+    let output = Tensor::cat(&output_refs, 1)?;
+    Ok((output, state))
+}
+
 fn recurrent_gated_delta(
     query: &Tensor,
     key: &Tensor,
@@ -1100,7 +1323,7 @@ fn recurrent_gated_delta(
 
 #[cfg(test)]
 mod tests {
-    use super::repeat_head_states;
+    use super::{repeat_head_states, repeat_head_states_seq};
     use candle_core::{Device, Tensor};
 
     #[test]
@@ -1117,6 +1340,35 @@ mod tests {
                 vec![3.0, 4.0],
                 vec![1.0, 2.0],
                 vec![3.0, 4.0]
+            ]]
+        );
+    }
+
+    #[test]
+    fn repeat_head_states_seq_uses_tiled_order() {
+        let x = Tensor::from_vec(
+            vec![
+                // seq 0
+                1f32, 2.0, 3.0, 4.0, // seq 1
+                5.0, 6.0, 7.0, 8.0,
+            ],
+            (1, 2, 2, 2),
+            &Device::Cpu,
+        )
+        .expect("tensor should build");
+
+        let repeated = repeat_head_states_seq(&x, 2).expect("repeat should succeed");
+        let values = repeated
+            .reshape((1, 2, 8))
+            .expect("reshape")
+            .to_vec3::<f32>()
+            .expect("values");
+
+        assert_eq!(
+            values,
+            vec![vec![
+                vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0],
+                vec![5.0, 6.0, 7.0, 8.0, 5.0, 6.0, 7.0, 8.0]
             ]]
         );
     }
