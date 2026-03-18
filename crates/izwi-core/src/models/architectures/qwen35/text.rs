@@ -477,8 +477,9 @@ impl Qwen35FullAttention {
         let (query_states, key_states) =
             self.apply_rope(&query_states, &key_states, position_ids)?;
 
-        let key_states = repeat_kv(&key_states, self.num_heads, self.num_kv_heads)?;
-        let value_states = repeat_kv(&value_states, self.num_heads, self.num_kv_heads)?;
+        // Phase 4 Optimization: DO NOT expand KV states before storing them in pages.
+        // This saves enormous memory bandwidth and cache capacity for GQA models.
+        // We will expand them at query time instead.
         append_to_pages(
             self.kv_page_size,
             k_pages,
@@ -499,12 +500,18 @@ impl Qwen35FullAttention {
                 k_pages,
                 v_pages,
                 self.num_heads,
+                self.num_kv_heads,
                 self.head_dim,
             )?
             .reshape((1, 1, self.num_heads * self.head_dim))?
         } else {
             let key_states = materialize_pages(k_pages)?;
             let value_states = materialize_pages(v_pages)?;
+            
+            // Expand materialized GQA states to full attention heads for math
+            let key_states = repeat_kv(&key_states, self.num_heads, self.num_kv_heads)?;
+            let value_states = repeat_kv(&value_states, self.num_heads, self.num_kv_heads)?;
+
             let query_states = query_states.transpose(1, 2)?.contiguous()?;
             let key_states = key_states.transpose(1, 2)?.contiguous()?;
             let value_states = value_states.transpose(1, 2)?.contiguous()?;

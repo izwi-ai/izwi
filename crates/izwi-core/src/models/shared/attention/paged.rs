@@ -391,15 +391,29 @@ pub fn materialize_pages(pages: &[KvPage]) -> Result<Tensor> {
     Tensor::cat(&refs, 1).map_err(Error::from)
 }
 
+pub fn repeat_kv(x: &Tensor, num_heads: usize, num_kv_heads: usize) -> Result<Tensor> {
+    if num_heads == num_kv_heads {
+        return Ok(x.clone());
+    }
+    let repeats = num_heads / num_kv_heads;
+    let (batch, seq_len, n_kv_heads, head_dim) = x.dims4()?;
+    let x = x
+        .unsqueeze(3)?
+        .expand((batch, seq_len, n_kv_heads, repeats, head_dim))?
+        .reshape((batch, seq_len, num_heads, head_dim))?;
+    Ok(x)
+}
+
 /// Compute exact single-token attention over paged K/V without materializing full K/V.
 ///
-/// `q` is `[batch, 1, heads, head_dim]` and page tensors are `[batch, page_seq, heads, head_dim]`.
+/// `q` is `[batch, 1, heads, head_dim]` and page tensors are `[batch, page_seq, kv_heads, head_dim]`.
 /// Returns `[batch, 1, heads, head_dim]`.
 pub fn paged_decode_attention(
     q: &Tensor,
     k_pages: &[KvPage],
     v_pages: &[KvPage],
     num_heads: usize,
+    num_kv_heads: usize,
     head_dim: usize,
 ) -> Result<Tensor> {
     if k_pages.is_empty() || v_pages.is_empty() || k_pages.len() != v_pages.len() {
@@ -434,10 +448,10 @@ pub fn paged_decode_attention(
             continue;
         }
 
-        let k = k_page
+        let k = repeat_kv(&k_page, num_heads, num_kv_heads)?
             .transpose(1, 2)?
             .reshape((bsz * num_heads, page_len, head_dim))?;
-        let v = v_page
+        let v = repeat_kv(&v_page, num_heads, num_kv_heads)?
             .transpose(1, 2)?
             .reshape((bsz * num_heads, page_len, head_dim))?;
 
@@ -593,7 +607,7 @@ mod tests {
         append_to_pages(3, &mut k_pages, &k_full, KvCacheQuantization::None).unwrap();
         append_to_pages(3, &mut v_pages, &v_full, KvCacheQuantization::None).unwrap();
 
-        let paged = paged_decode_attention(&q, &k_pages, &v_pages, num_heads, head_dim).unwrap();
+        let paged = paged_decode_attention(&q, &k_pages, &v_pages, num_heads, num_heads, head_dim).unwrap();
 
         // Dense reference implementation.
         let q_ref = q
@@ -660,7 +674,7 @@ mod tests {
         append_to_pages(4, &mut k_pages, &k_full, KvCacheQuantization::Int8).unwrap();
         append_to_pages(4, &mut v_pages, &v_full, KvCacheQuantization::Int8).unwrap();
 
-        let paged = paged_decode_attention(&q, &k_pages, &v_pages, num_heads, head_dim).unwrap();
+        let paged = paged_decode_attention(&q, &k_pages, &v_pages, num_heads, num_heads, head_dim).unwrap();
 
         // Dense reference implementation.
         let q_ref = q
