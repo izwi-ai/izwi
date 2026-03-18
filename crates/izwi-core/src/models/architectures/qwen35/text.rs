@@ -35,7 +35,7 @@ pub struct Qwen35TextRuntimeState {
 
 enum Qwen35LayerRuntimeState {
     Linear {
-        conv_state: Option<Tensor>,
+        conv_state: Option<Vec<Tensor>>,
         recurrent_state: Option<Tensor>,
     },
     Full {
@@ -327,11 +327,13 @@ impl Qwen35Layer {
                 },
             ) => {
                 if conv_state.is_none() && mixer.kernel_size > 1 {
-                    *conv_state = Some(Tensor::zeros(
-                        (mixer.conv_dim, mixer.kernel_size - 1),
-                        DType::F32,
-                        device,
-                    )?);
+                    // Initialize the ring buffer with zeros
+                    let mut buffer = Vec::with_capacity(mixer.kernel_size - 1);
+                    let zero = Tensor::zeros((mixer.conv_dim, 1), DType::F32, device)?;
+                    for _ in 0..(mixer.kernel_size - 1) {
+                        buffer.push(zero.clone());
+                    }
+                    *conv_state = Some(buffer);
                 }
                 if recurrent_state.is_none() {
                     *recurrent_state = Some(Tensor::zeros(
@@ -736,7 +738,7 @@ impl Qwen35LinearAttention {
     fn depthwise_conv_step(
         &self,
         mixed_qkv: &Tensor,
-        conv_state: &mut Option<Tensor>,
+        conv_state: &mut Option<Vec<Tensor>>,
     ) -> Result<Tensor> {
         let current = mixed_qkv.i((0, 0))?;
         let current = if current.dtype() != self.conv_kernel.dtype() {
@@ -746,24 +748,39 @@ impl Qwen35LinearAttention {
         };
         let current = current.reshape((self.conv_dim, 1))?;
 
-        let window = if self.kernel_size <= 1 {
-            current
+        let convolved = if self.kernel_size <= 1 {
+            (&current * &self.conv_kernel)?.sum(D::Minus1)?
         } else {
-            let previous = if let Some(state) = conv_state.take() {
+            let buffer = if let Some(state) = conv_state.as_mut() {
                 state
             } else {
-                Tensor::zeros(
-                    (self.conv_dim, self.kernel_size - 1),
-                    self.conv_kernel.dtype(),
-                    self.conv_kernel.device(),
-                )?
+                return Err(Error::InferenceError(
+                    "conv_state not initialized but kernel_size > 1".to_string(),
+                ));
             };
-            let window = Tensor::cat(&[&previous, &current], 1)?;
-            *conv_state = Some(window.narrow(1, 1, self.kernel_size - 1)?);
-            window
+
+            // Compute convolution as sum of elementwise products
+            // self.conv_kernel shape: (conv_dim, kernel_size)
+            // buffer contains kernel_size - 1 past states of shape (conv_dim, 1)
+
+            // Start with current * conv_kernel[:, kernel_size - 1]
+            let k_slice = self.conv_kernel.narrow(1, self.kernel_size - 1, 1)?;
+            let mut convolved = (&current * &k_slice)?;
+
+            // Add previous tokens * their respective kernel weights
+            for i in 0..(self.kernel_size - 1) {
+                let prev_token = &buffer[i];
+                let k_slice = self.conv_kernel.narrow(1, i, 1)?;
+                convolved = (&convolved + &(prev_token * &k_slice)?)?;
+            }
+
+            // Update the ring buffer: drop oldest, push current
+            buffer.remove(0);
+            buffer.push(current);
+
+            convolved.squeeze(1)?
         };
 
-        let convolved = (&window * &self.conv_kernel)?.sum(D::Minus1)?;
         let convolved = ops::silu(&convolved)?;
         convolved
             .reshape((1, 1, self.conv_dim))
