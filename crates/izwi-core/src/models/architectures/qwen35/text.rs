@@ -249,13 +249,35 @@ impl Qwen35TextModel {
             )));
         }
 
+        // Pre-initialize all lazy layer states before the hot loop to avoid
+        // allocation costs inside the per-token iteration. This moves all
+        // Tensor::zeros calls out of the N×L inner loop.
+        for (layer, layer_state) in self.layers.iter().zip(state.layers.iter_mut()) {
+            layer.ensure_state_initialized(layer_state, &self.device)?;
+        }
+
+        // Batch embedding lookup: single forward pass for all tokens.
         let input = Tensor::from_vec(token_ids.to_vec(), (1, token_ids.len()), &self.device)?;
         let embeddings = self.token_embeddings.forward(&input)?;
+
+        // Process tokens through all layers. DeltaNet layers are inherently
+        // sequential (each token depends on prior recurrent state), so we
+        // iterate per-token but avoid redundant work:
+        // - Embeddings are computed once above
+        // - Layer states are pre-initialized
+        // - Logits are only computed for the final token
+        let token_count = token_ids.len();
         let mut last_hidden = None;
         for (idx, &position_id) in position_ids.iter().enumerate() {
             let hidden = embeddings.narrow(1, idx, 1)?;
-            last_hidden =
-                Some(self.forward_input_embedding_hidden_at(&hidden, position_id, state)?);
+            let mut h = hidden;
+            for (layer, layer_state) in self.layers.iter().zip(state.layers.iter_mut()) {
+                h = layer.forward(&h, layer_state, position_id)?;
+            }
+            // Only keep the last hidden state (we only need it for logits)
+            if idx == token_count - 1 {
+                last_hidden = Some(h);
+            }
         }
 
         if !compute_logits {
@@ -287,6 +309,41 @@ impl Qwen35Layer {
                 v_pages: Vec::new(),
             },
         }
+    }
+
+    /// Pre-initialize lazy state tensors so the first-use allocation cost
+    /// does not happen inside the per-token hot loop during prefill.
+    fn ensure_state_initialized(
+        &self,
+        state: &mut Qwen35LayerRuntimeState,
+        device: &Device,
+    ) -> Result<()> {
+        match (&self.mixer, state) {
+            (
+                Qwen35Mixer::Linear(mixer),
+                Qwen35LayerRuntimeState::Linear {
+                    conv_state,
+                    recurrent_state,
+                },
+            ) => {
+                if conv_state.is_none() && mixer.kernel_size > 1 {
+                    *conv_state = Some(Tensor::zeros(
+                        (mixer.conv_dim, mixer.kernel_size - 1),
+                        DType::F32,
+                        device,
+                    )?);
+                }
+                if recurrent_state.is_none() {
+                    *recurrent_state = Some(Tensor::zeros(
+                        (1, mixer.num_v_heads, mixer.head_k_dim, mixer.head_v_dim),
+                        DType::F32,
+                        device,
+                    )?);
+                }
+            }
+            _ => {} // Full attention layers don't need pre-init
+        }
+        Ok(())
     }
 
     fn forward(
