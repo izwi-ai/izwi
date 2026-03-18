@@ -326,6 +326,7 @@ impl Qwen3Attention {
                         k_pages,
                         v_pages,
                         self.num_heads,
+                        self.num_kv_heads,
                         self.head_dim,
                     )?;
                     let out = out.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;

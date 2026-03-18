@@ -4,9 +4,8 @@
 //! has produced the first (semantic) codebook. It uses a smaller transformer
 //! for efficient multi-token prediction.
 
-use candle_core::{DType, Device, IndexOp, Tensor, D};
+use candle_core::{D, DType, Device, IndexOp, Tensor};
 use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
-use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::tts::config::CodePredictorConfig;
@@ -18,7 +17,7 @@ use crate::models::shared::attention::flash::{
 };
 use crate::models::shared::attention::paged::{
     append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
-    paged_decode_attention, KvCacheQuantization, KvPage,
+    paged_decode_attention, repeat_kv, KvCacheQuantization, KvPage,
 };
 use crate::models::shared::weights::mlx;
 
@@ -498,7 +497,7 @@ impl Attention {
         let k = repeat_kv(&k, self.num_heads, self.num_kv_heads)?;
         let v = repeat_kv(&v, self.num_heads, self.num_kv_heads)?;
 
-        let (k, v) = if let Some(cache) = cache {
+        let (mut k, mut v) = if let Some(cache) = cache {
             cache.append(layer_idx, k, v)?;
 
             // Decode path hot loop: for single-token decode, avoid rematerializing full KV.
@@ -509,6 +508,7 @@ impl Attention {
                         k_pages,
                         v_pages,
                         self.num_heads,
+                        self.num_kv_heads,
                         self.head_dim,
                     )?;
                     let out = out.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
@@ -523,8 +523,8 @@ impl Attention {
 
         if use_batched {
             let q = q.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
-            let k = k.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
-            let v = v.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
+            k = k.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
+            v = v.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
             let attention_mask = if seq_len > 1 {
                 Some(causal_mask(
                     seq_len,
@@ -634,22 +634,6 @@ impl Mlp {
         let hidden = act.broadcast_mul(&up)?;
         self.down_proj.forward(&hidden).map_err(Error::from)
     }
-}
-
-/// Repeat KV for Grouped Query Attention
-fn repeat_kv(x: &Tensor, num_heads: usize, num_kv_heads: usize) -> Result<Tensor> {
-    if num_heads == num_kv_heads {
-        return Ok(x.clone());
-    }
-    if num_kv_heads == 0 || !num_heads.is_multiple_of(num_kv_heads) {
-        return Err(Error::InvalidInput(format!(
-            "Invalid GQA head config: num_heads={num_heads}, num_kv_heads={num_kv_heads}"
-        )));
-    }
-    let repeats = num_heads / num_kv_heads;
-    let x = x.transpose(1, 2)?;
-    let out = candle_repeat_kv(x, repeats)?;
-    out.transpose(1, 2).map_err(Error::from)
 }
 
 /// Build RoPE cache
