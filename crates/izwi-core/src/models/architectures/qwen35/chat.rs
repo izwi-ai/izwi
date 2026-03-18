@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use candle_core::quantized::gguf_file::Value as GgufValue;
@@ -116,6 +117,7 @@ struct Qwen35Tokenizer {
     chat_template: String,
     default_enable_thinking: bool,
     bos_token: Option<String>,
+    decode_piece_cache: Mutex<HashMap<u32, String>>,
 }
 
 #[derive(Debug)]
@@ -208,6 +210,7 @@ impl Qwen35Tokenizer {
             chat_template,
             default_enable_thinking,
             bos_token: config.and_then(|cfg| cfg.bos_token),
+            decode_piece_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -259,6 +262,23 @@ impl Qwen35Tokenizer {
             .filter(|id| (*id as usize) < self.vocab_size)
             .collect();
         self.inner.decode(&filtered)
+    }
+
+    fn decode_token_piece(&self, token_id: u32) -> Result<String> {
+        if token_id as usize >= self.vocab_size {
+            return Ok(String::new());
+        }
+        if let Ok(cache) = self.decode_piece_cache.lock() {
+            if let Some(piece) = cache.get(&token_id) {
+                return Ok(piece.clone());
+            }
+        }
+
+        let piece = self.decode_text(&[token_id])?;
+        if let Ok(mut cache) = self.decode_piece_cache.lock() {
+            cache.insert(token_id, piece.clone());
+        }
+        Ok(piece)
     }
 }
 
@@ -499,7 +519,7 @@ impl Qwen35ChatModel {
             });
         }
 
-        let delta = self.tokenizer.decode_text(&[next])?;
+        let delta = self.tokenizer.decode_token_piece(next)?;
         state.generated_ids.push(next);
         state.assembled.push_str(&delta);
         state.logits = self.text_model.forward_token_id_at(
