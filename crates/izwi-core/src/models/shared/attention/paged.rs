@@ -72,9 +72,9 @@ pub enum KvPage {
     /// Q4_0 quantized page: 4-bit weights with per-32-element block scales.
     /// Values are packed 2x4-bit per byte, with a block scale (f16/f32) every 32 values.
     Q4_0 {
-        values: Tensor,    // U8 packed 4-bit values
-        scales: Tensor,    // F32 scale per block
-        seq_len: usize,    // Original sequence length
+        values: Tensor,      // U8 packed 4-bit values
+        scales: Tensor,      // F32 scale per block
+        seq_len: usize,      // Original sequence length
         num_elements: usize, // Total flat elements represented by the page
         target_dtype: DType,
     },
@@ -429,16 +429,34 @@ pub fn paged_decode_attention(
             q_len
         )));
     }
+    if num_kv_heads == 0 || num_heads == 0 || !num_heads.is_multiple_of(num_kv_heads) {
+        return Err(Error::InvalidInput(format!(
+            "Paged decode attention received invalid head layout: num_heads={}, num_kv_heads={}",
+            num_heads, num_kv_heads
+        )));
+    }
 
-    let q = q
-        .transpose(1, 2)?
-        .reshape((bsz * num_heads, q_len, head_dim))?;
+    let repeats = num_heads / num_kv_heads;
     let scale = (head_dim as f64).sqrt();
     let scale_t = Tensor::from_vec(vec![scale as f32], (1,), q.device())?.to_dtype(q.dtype())?;
+    let grouped_q = q
+        .reshape((bsz, q_len, num_kv_heads, repeats, head_dim))?
+        .contiguous()?;
 
     let mut running_max: Option<Tensor> = None; // [bh, 1, 1]
     let mut running_sum: Option<Tensor> = None; // [bh, 1, 1]
     let mut running_out: Option<Tensor> = None; // [bh, 1, d]
+
+    let q_by_kv_head: Vec<Tensor> = (0..num_kv_heads)
+        .map(|head_idx| {
+            grouped_q
+                .narrow(2, head_idx, 1)?
+                .squeeze(2)?
+                .transpose(1, 2)?
+                .reshape((bsz * repeats, q_len, head_dim))
+                .map_err(Error::from)
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     for (k_page, v_page) in k_pages.iter().zip(v_pages.iter()) {
         let k_page = k_page.to_dense()?;
@@ -448,20 +466,41 @@ pub fn paged_decode_attention(
             continue;
         }
 
-        let k = repeat_kv(&k_page, num_heads, num_kv_heads)?
-            .transpose(1, 2)?
-            .reshape((bsz * num_heads, page_len, head_dim))?;
-        let v = repeat_kv(&v_page, num_heads, num_kv_heads)?
-            .transpose(1, 2)?
-            .reshape((bsz * num_heads, page_len, head_dim))?;
+        let mut page_max_parts: Vec<Tensor> = Vec::with_capacity(num_kv_heads);
+        let mut page_sum_parts: Vec<Tensor> = Vec::with_capacity(num_kv_heads);
+        let mut page_out_parts: Vec<Tensor> = Vec::with_capacity(num_kv_heads);
+        for (head_idx, q_head) in q_by_kv_head.iter().enumerate() {
+            let k = k_page
+                .narrow(2, head_idx, 1)?
+                .squeeze(2)?
+                .unsqueeze(1)?
+                .expand((bsz, repeats, page_len, head_dim))?
+                .reshape((bsz * repeats, page_len, head_dim))?;
+            let v = v_page
+                .narrow(2, head_idx, 1)?
+                .squeeze(2)?
+                .unsqueeze(1)?
+                .expand((bsz, repeats, page_len, head_dim))?
+                .reshape((bsz * repeats, page_len, head_dim))?;
 
-        let mut scores = q.matmul(&k.transpose(1, 2)?)?;
-        scores = scores.broadcast_div(&scale_t)?;
+            let mut scores = q_head.matmul(&k.transpose(1, 2)?)?;
+            scores = scores.broadcast_div(&scale_t)?;
 
-        let page_max = scores.max_keepdim(D::Minus1)?;
-        let exp_scores = scores.broadcast_sub(&page_max)?.exp()?;
-        let page_sum = exp_scores.sum_keepdim(D::Minus1)?;
-        let page_out = exp_scores.matmul(&v)?;
+            let page_max = scores.max_keepdim(D::Minus1)?;
+            let exp_scores = scores.broadcast_sub(&page_max)?.exp()?;
+            let page_sum = exp_scores.sum_keepdim(D::Minus1)?;
+            let page_out = exp_scores.matmul(&v)?;
+            page_max_parts.push(page_max.reshape((bsz, repeats, q_len, 1))?);
+            page_sum_parts.push(page_sum.reshape((bsz, repeats, q_len, 1))?);
+            page_out_parts.push(page_out.reshape((bsz, repeats, q_len, head_dim))?);
+        }
+        let page_max_refs: Vec<&Tensor> = page_max_parts.iter().collect();
+        let page_sum_refs: Vec<&Tensor> = page_sum_parts.iter().collect();
+        let page_out_refs: Vec<&Tensor> = page_out_parts.iter().collect();
+        let page_max = Tensor::cat(&page_max_refs, 1)?.reshape((bsz * num_heads, q_len, 1))?;
+        let page_sum = Tensor::cat(&page_sum_refs, 1)?.reshape((bsz * num_heads, q_len, 1))?;
+        let page_out =
+            Tensor::cat(&page_out_refs, 1)?.reshape((bsz * num_heads, q_len, head_dim))?;
 
         match (&running_max, &running_sum, &running_out) {
             (None, None, None) => {
@@ -607,7 +646,8 @@ mod tests {
         append_to_pages(3, &mut k_pages, &k_full, KvCacheQuantization::None).unwrap();
         append_to_pages(3, &mut v_pages, &v_full, KvCacheQuantization::None).unwrap();
 
-        let paged = paged_decode_attention(&q, &k_pages, &v_pages, num_heads, num_heads, head_dim).unwrap();
+        let paged =
+            paged_decode_attention(&q, &k_pages, &v_pages, num_heads, num_heads, head_dim).unwrap();
 
         // Dense reference implementation.
         let q_ref = q
@@ -674,7 +714,8 @@ mod tests {
         append_to_pages(4, &mut k_pages, &k_full, KvCacheQuantization::Int8).unwrap();
         append_to_pages(4, &mut v_pages, &v_full, KvCacheQuantization::Int8).unwrap();
 
-        let paged = paged_decode_attention(&q, &k_pages, &v_pages, num_heads, num_heads, head_dim).unwrap();
+        let paged =
+            paged_decode_attention(&q, &k_pages, &v_pages, num_heads, num_heads, head_dim).unwrap();
 
         // Dense reference implementation.
         let q_ref = q
@@ -710,5 +751,76 @@ mod tests {
 
         let diff = max_abs_diff(&paged, &dense);
         assert!(diff < 0.12, "max abs diff was {}", diff);
+    }
+
+    #[test]
+    fn test_paged_decode_gqa_matches_dense_single_token() {
+        let device = Device::Cpu;
+        let bsz = 2usize;
+        let num_heads = 8usize;
+        let num_kv_heads = 2usize;
+        let head_dim = 8usize;
+        let total_len = 11usize;
+
+        let q = Tensor::randn(0.0f32, 1.0f32, (bsz, 1, num_heads, head_dim), &device).unwrap();
+        let k_full = Tensor::randn(
+            0.0f32,
+            1.0f32,
+            (bsz, total_len, num_kv_heads, head_dim),
+            &device,
+        )
+        .unwrap();
+        let v_full = Tensor::randn(
+            0.0f32,
+            1.0f32,
+            (bsz, total_len, num_kv_heads, head_dim),
+            &device,
+        )
+        .unwrap();
+
+        let mut k_pages = Vec::new();
+        let mut v_pages = Vec::new();
+        append_to_pages(3, &mut k_pages, &k_full, KvCacheQuantization::None).unwrap();
+        append_to_pages(3, &mut v_pages, &v_full, KvCacheQuantization::None).unwrap();
+
+        let paged =
+            paged_decode_attention(&q, &k_pages, &v_pages, num_heads, num_kv_heads, head_dim)
+                .unwrap();
+
+        let q_ref = q
+            .transpose(1, 2)
+            .unwrap()
+            .reshape((bsz * num_heads, 1, head_dim))
+            .unwrap();
+        let k_ref = repeat_kv(&k_full, num_heads, num_kv_heads)
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .reshape((bsz * num_heads, total_len, head_dim))
+            .unwrap();
+        let v_ref = repeat_kv(&v_full, num_heads, num_kv_heads)
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .reshape((bsz * num_heads, total_len, head_dim))
+            .unwrap();
+        let scale = (head_dim as f64).sqrt();
+        let mut scores = q_ref.matmul(&k_ref.transpose(1, 2).unwrap()).unwrap();
+        let scale_t = Tensor::from_vec(vec![scale as f32], (1,), &device)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+        scores = scores.broadcast_div(&scale_t).unwrap();
+        let weights = ops::softmax(&scores, D::Minus1).unwrap();
+        let dense = weights
+            .matmul(&v_ref)
+            .unwrap()
+            .reshape((bsz, num_heads, 1, head_dim))
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap();
+
+        let diff = max_abs_diff(&paged, &dense);
+        assert!(diff < 1e-4, "max abs diff was {}", diff);
     }
 }
