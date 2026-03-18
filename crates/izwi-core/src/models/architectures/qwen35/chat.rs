@@ -42,7 +42,9 @@ pub struct ChatGenerationOutput {
 pub struct ChatDecodeState {
     text_state: Qwen35TextRuntimeState,
     logits: Tensor,
-    generated_ids: Vec<u32>,
+    history_ids: Vec<u32>,
+    tokens_generated: usize,
+    track_history: bool,
     assembled: String,
     max_new_tokens: usize,
     finished: bool,
@@ -477,11 +479,19 @@ impl Qwen35ChatModel {
 
         let mut text_state = self.text_model.new_state();
         let logits = self.prefill_prompt(&prepared_prompt, &mut text_state)?;
+        let track_history =
+            config.repetition_penalty > 1.0 || config.presence_penalty.abs() > f32::EPSILON;
 
         Ok(ChatDecodeState {
             text_state,
             logits,
-            generated_ids: Vec::new(),
+            history_ids: if track_history {
+                Vec::with_capacity(max_new_tokens.max(1))
+            } else {
+                Vec::new()
+            },
+            tokens_generated: 0,
+            track_history,
             assembled: String::new(),
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
@@ -492,21 +502,26 @@ impl Qwen35ChatModel {
     }
 
     pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
-        if state.finished || state.generated_ids.len() >= state.max_new_tokens {
+        if state.finished || state.tokens_generated >= state.max_new_tokens {
             state.finished = true;
             return Ok(ChatDecodeStep {
                 delta: String::new(),
                 text: state.assembled.trim().to_string(),
-                tokens_generated: state.generated_ids.len(),
+                tokens_generated: state.tokens_generated,
                 finished: true,
             });
         }
 
+        let history: &[u32] = if state.track_history {
+            &state.history_ids
+        } else {
+            &[]
+        };
         let next = sample_next_token(
             &state.logits,
             self.tokenizer.vocab_size,
             &state.config,
-            &state.generated_ids,
+            history,
             &mut state.rng,
         )?;
         if self.is_stop_token(next, &state.config) {
@@ -514,13 +529,16 @@ impl Qwen35ChatModel {
             return Ok(ChatDecodeStep {
                 delta: String::new(),
                 text: state.assembled.trim().to_string(),
-                tokens_generated: state.generated_ids.len(),
+                tokens_generated: state.tokens_generated,
                 finished: true,
             });
         }
 
         let delta = self.tokenizer.decode_token_piece(next)?;
-        state.generated_ids.push(next);
+        if state.track_history {
+            state.history_ids.push(next);
+        }
+        state.tokens_generated = state.tokens_generated.saturating_add(1);
         state.assembled.push_str(&delta);
         state.logits = self.text_model.forward_token_id_at(
             next,
@@ -528,7 +546,7 @@ impl Qwen35ChatModel {
             &mut state.text_state,
         )?;
         state.next_text_position += 1;
-        if state.generated_ids.len() >= state.max_new_tokens {
+        if state.tokens_generated >= state.max_new_tokens {
             state.finished = true;
         }
         let final_text = if state.finished {
@@ -540,7 +558,7 @@ impl Qwen35ChatModel {
         Ok(ChatDecodeStep {
             delta,
             text: final_text,
-            tokens_generated: state.generated_ids.len(),
+            tokens_generated: state.tokens_generated,
             finished: state.finished,
         })
     }
