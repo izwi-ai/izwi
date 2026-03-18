@@ -602,8 +602,11 @@ impl Qwen35FullAttention {
             self.kv_quantization,
         )?;
 
-        let attn_output = if query_states.dim(1)? == 1 && !k_pages.is_empty() && !v_pages.is_empty()
-        {
+        let use_paged_decode = query_states.dim(1)? == 1
+            && !k_pages.is_empty()
+            && !v_pages.is_empty()
+            && !qwen35_use_dense_decode_attention(query_states.device(), k_pages.len());
+        let attn_output = if use_paged_decode {
             paged_decode_attention(
                 &query_states,
                 k_pages,
@@ -1351,6 +1354,20 @@ fn qwen35_use_block_fusion_prefill(device: &Device, seq_len: usize) -> bool {
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .unwrap_or(8);
     seq_len >= min_tokens
+}
+
+fn qwen35_use_dense_decode_attention(device: &Device, page_count: usize) -> bool {
+    if !device.is_metal() {
+        return false;
+    }
+    if !qwen35_env_bool("IZWI_QWEN35_DENSE_DECODE_ATTENTION", true) {
+        return false;
+    }
+    let max_pages = std::env::var("IZWI_QWEN35_DENSE_DECODE_MAX_PAGES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(6);
+    page_count <= max_pages.max(1)
 }
 
 fn recurrent_gated_delta_sequence(
