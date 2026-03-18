@@ -499,10 +499,9 @@ impl Qwen35ChatModel {
             });
         }
 
+        let delta = self.tokenizer.decode_text(&[next])?;
         state.generated_ids.push(next);
-        let decoded = self.tokenizer.decode_text(&state.generated_ids)?;
-        let delta = text_delta(&state.assembled, &decoded);
-        state.assembled = decoded;
+        state.assembled.push_str(&delta);
         state.logits = self.text_model.forward_token_id_at(
             next,
             [state.next_text_position; 3],
@@ -512,10 +511,15 @@ impl Qwen35ChatModel {
         if state.generated_ids.len() >= state.max_new_tokens {
             state.finished = true;
         }
+        let final_text = if state.finished {
+            state.assembled.trim().to_string()
+        } else {
+            String::new()
+        };
 
         Ok(ChatDecodeStep {
             delta,
-            text: state.assembled.trim().to_string(),
+            text: final_text,
             tokens_generated: state.generated_ids.len(),
             finished: state.finished,
         })
@@ -1153,6 +1157,23 @@ fn sample_next_token(
     history: &[u32],
     rng: &mut SimpleRng,
 ) -> Result<u32> {
+    if vocab_size == 0 {
+        return Err(Error::InvalidInput(
+            "Qwen3.5 sampler received vocab_size=0".to_string(),
+        ));
+    }
+
+    // Fast path for deterministic greedy decode (bench/default path):
+    // avoid copying full logits tensors to CPU each token.
+    let deterministic_greedy = config.temperature <= 1e-5
+        && (config.repetition_penalty - 1.0).abs() <= f32::EPSILON
+        && config.presence_penalty.abs() <= f32::EPSILON
+        && config.top_k == 0
+        && config.top_p >= 1.0;
+    if deterministic_greedy {
+        return argmax_clamped(logits, vocab_size);
+    }
+
     let mut values = logits_to_vec(logits)?;
     clamp_logits_to_vocab(&mut values, vocab_size);
 
@@ -1355,17 +1376,39 @@ fn argmax(logits: &Tensor) -> Result<u32> {
         .map_err(Error::from)
 }
 
-fn text_delta(previous: &str, current: &str) -> String {
-    if let Some(delta) = current.strip_prefix(previous) {
-        return delta.to_string();
+fn argmax_clamped(logits: &Tensor, vocab_size: usize) -> Result<u32> {
+    if vocab_size == 0 {
+        return Err(Error::InvalidInput(
+            "Qwen3.5 argmax received vocab_size=0".to_string(),
+        ));
     }
 
-    let common = previous
-        .chars()
-        .zip(current.chars())
-        .take_while(|(left, right)| left == right)
-        .count();
-    current.chars().skip(common).collect()
+    let logits = match logits.rank() {
+        1 => logits.clone(),
+        2 => {
+            let (rows, _cols) = logits.dims2()?;
+            if rows != 1 {
+                return Err(Error::InferenceError(format!(
+                    "Unexpected Qwen3.5 logits shape for argmax: {:?}",
+                    logits.shape().dims()
+                )));
+            }
+            logits.i(0)?
+        }
+        rank => {
+            return Err(Error::InferenceError(format!(
+                "Unexpected Qwen3.5 logits rank for argmax: {rank}"
+            )))
+        }
+    };
+
+    let cols = logits.dim(0)?;
+    let clamped = if vocab_size < cols {
+        logits.narrow(0, 0, vocab_size)?
+    } else {
+        logits
+    };
+    argmax(&clamped)
 }
 
 struct SimpleRng {
