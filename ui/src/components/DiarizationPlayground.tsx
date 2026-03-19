@@ -135,6 +135,64 @@ function isWavMimeType(mimeType: string | null | undefined): boolean {
   );
 }
 
+function hasSpecificMimeType(mimeType: string | null | undefined): boolean {
+  if (!mimeType) {
+    return false;
+  }
+  const normalized = mimeType.trim().toLowerCase();
+  return normalized.length > 0 && normalized !== "application/octet-stream";
+}
+
+function extensionForAudioMimeType(
+  mimeType: string | null | undefined,
+): string | null {
+  if (!mimeType) {
+    return null;
+  }
+
+  const normalized = mimeType.trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  if (isWavMimeType(normalized)) {
+    return "wav";
+  }
+  if (normalized.includes("webm")) {
+    return "webm";
+  }
+  if (normalized.includes("ogg")) {
+    return "ogg";
+  }
+  if (normalized.includes("flac")) {
+    return "flac";
+  }
+  if (normalized.includes("aac")) {
+    return "aac";
+  }
+  if (normalized.includes("mp4") || normalized.includes("m4a")) {
+    return "mp4";
+  }
+  if (normalized.includes("mpeg") || normalized.includes("mp3")) {
+    return "mp3";
+  }
+
+  return null;
+}
+
+function sourceAudioFilename(inputBlob: Blob): string | undefined {
+  if (!(inputBlob instanceof File)) {
+    return undefined;
+  }
+
+  const trimmed = inputBlob.name.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function fallbackAudioFilename(inputBlob: Blob): string {
+  const extension = extensionForAudioMimeType(inputBlob.type);
+  return extension ? `audio.${extension}` : "audio.bin";
+}
+
 async function transcodeToWav(
   inputBlob: Blob,
   targetSampleRate = 16000,
@@ -143,7 +201,10 @@ async function transcodeToWav(
   const filenameLooksWav = sourceFileName
     ? sourceFileName.toLowerCase().endsWith(".wav")
     : false;
-  if (isWavMimeType(inputBlob.type) || filenameLooksWav) {
+  if (
+    isWavMimeType(inputBlob.type) ||
+    (!hasSpecificMimeType(inputBlob.type) && filenameLooksWav)
+  ) {
     return inputBlob;
   }
 
@@ -323,10 +384,7 @@ export function DiarizationPlayground({
       setSpeakerTranscript("");
 
       try {
-        const sourceFileName =
-          audioBlob instanceof File && audioBlob.name
-            ? audioBlob.name
-            : "audio.wav";
+        const sourceFileName = sourceAudioFilename(audioBlob);
         const wavBlob = await transcodeToWav(
           audioBlob,
           16000,
@@ -334,7 +392,9 @@ export function DiarizationPlayground({
         ).catch(() => audioBlob);
 
         const uploadFilename =
-          wavBlob === audioBlob ? sourceFileName : "audio.wav";
+          wavBlob === audioBlob
+            ? sourceFileName ?? fallbackAudioFilename(audioBlob)
+            : "audio.wav";
 
         const record = await api.createDiarizationRecord({
           audio_file: wavBlob,
