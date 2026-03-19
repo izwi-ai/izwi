@@ -151,6 +151,13 @@ describe("TranscriptionPlayground history", () => {
       expect(apiMocks.createTranscriptionRecord).toHaveBeenCalled(),
     );
 
+    const languageCombobox = screen.getAllByRole("combobox")[0];
+    const timestampsToggle = screen.getByLabelText(/Timestamps/i);
+
+    expect(
+      languageCombobox.compareDocumentPosition(timestampsToggle) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
     expect(screen.getByText("Uploaded transcript text.")).toBeInTheDocument();
   });
 

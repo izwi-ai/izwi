@@ -1278,7 +1278,7 @@ export function TranscriptionPlayground({
           </div>
 
           <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5 sm:p-4 space-y-3.5">
-            <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr),auto] lg:items-end">
+            <div className="space-y-3">
               <div>
                 <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
                   Language
@@ -1305,8 +1305,8 @@ export function TranscriptionPlayground({
                 </Select>
               </div>
 
-              <div className="flex flex-wrap gap-2 lg:justify-end">
-                <label className="flex items-center gap-2 rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2 text-xs text-[var(--text-muted)]">
+              <div className="grid grid-cols-2 items-center gap-3">
+                <label className="flex w-fit items-center gap-2 rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2 text-xs text-[var(--text-muted)] justify-self-start">
                   <span className="font-medium">Timestamps</span>
                   <input
                     type="checkbox"
@@ -1318,7 +1318,7 @@ export function TranscriptionPlayground({
                     disabled={isProcessing}
                   />
                 </label>
-                <label className="flex items-center gap-2 rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2 text-xs text-[var(--text-muted)]">
+                <label className="flex w-fit items-center gap-2 rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2 text-xs text-[var(--text-muted)] justify-self-end">
                   <Radio className="w-3.5 h-3.5" />
                   <span className="font-medium">Stream</span>
                   <input
