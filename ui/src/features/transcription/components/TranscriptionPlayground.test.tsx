@@ -158,9 +158,76 @@ describe("TranscriptionPlayground history", () => {
       languageCombobox.compareDocumentPosition(timestampsToggle) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
+    expect(screen.queryByText("Workspace")).not.toBeInTheDocument();
     expect(screen.getByTestId("transcription-stats-footer")).toBeInTheDocument();
     expect(screen.getByText("220ms")).toBeInTheDocument();
     expect(screen.getByText("Uploaded transcript text.")).toBeInTheDocument();
+  });
+
+  it("restores the empty transcript state when the API returns no transcript text", async () => {
+    apiMocks.listTranscriptionRecords.mockResolvedValue([]);
+    apiMocks.createTranscriptionRecord.mockResolvedValue({
+      id: "transcription-empty",
+      created_at: 3,
+      model_id: "Qwen3-ASR-0.6B",
+      aligner_model_id: null,
+      language: "English",
+      duration_secs: 2.4,
+      processing_time_ms: 290,
+      rtf: 1.12,
+      audio_mime_type: "audio/wav",
+      audio_filename: "empty.wav",
+      transcription: "",
+      segments: [],
+      words: [],
+    });
+
+    const { container } = render(
+      <TranscriptionPlayground
+        selectedModel="Qwen3-ASR-0.6B"
+        selectedModelReady={true}
+        modelOptions={[
+          {
+            value: "Qwen3-ASR-0.6B",
+            label: "Qwen3 ASR 0.6B",
+            statusLabel: "Ready",
+            isReady: true,
+          },
+        ]}
+        onSelectModel={vi.fn()}
+        onOpenModelManager={vi.fn()}
+        onModelRequired={vi.fn()}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(apiMocks.listTranscriptionRecords).toHaveBeenCalled(),
+    );
+
+    fireEvent.click(screen.getByLabelText(/Stream/i));
+
+    const fileInput = container.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement | null;
+    expect(fileInput).not.toBeNull();
+
+    fireEvent.change(fileInput!, {
+      target: {
+        files: [new File(["audio"], "empty.wav", { type: "audio/wav" })],
+      },
+    });
+
+    await waitFor(() =>
+      expect(apiMocks.createTranscriptionRecord).toHaveBeenCalled(),
+    );
+
+    expect(screen.getByText("Ready to transcribe")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Record audio from your microphone or upload an audio file to start transcription\. The transcript will appear here\./i,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("transcription-stats-footer")).toBeInTheDocument();
   });
 
   it("keeps the transcription history drawer open while confirming a delete", async () => {

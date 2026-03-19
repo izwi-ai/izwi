@@ -19,6 +19,7 @@ interface GenerationStatsProps {
   stats: TTSStats | ASRStats | null;
   type: "tts" | "asr";
   className?: string;
+  surface?: "card" | "plain";
 }
 
 function isTTSStats(stats: TTSStats | ASRStats): stats is TTSStats {
@@ -29,6 +30,7 @@ export function GenerationStats({
   stats,
   type,
   className,
+  surface = "card",
 }: GenerationStatsProps) {
   if (!stats) return null;
 
@@ -66,8 +68,11 @@ export function GenerationStats({
       initial={{ opacity: 0, y: 5 }}
       animate={{ opacity: 1, y: 0 }}
       className={clsx(
-        "flex flex-wrap items-center gap-3 px-3 py-2 rounded-lg bg-[var(--bg-surface-2)] border border-[var(--border-muted)]",
-        className
+        "flex flex-wrap items-center gap-3 px-3 py-2",
+        surface === "card"
+          ? "rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-2)]"
+          : null,
+        className,
       )}
     >
       {/* Processing Time */}

@@ -24,6 +24,7 @@ interface TranscriptionReviewWorkspaceProps {
   > | null;
   audioUrl?: string | null;
   loading?: boolean;
+  emptyTitle?: string;
   emptyMessage?: string;
   showPlayback?: boolean;
 }
@@ -72,7 +73,9 @@ export function TranscriptionReviewWorkspace({
   record,
   audioUrl = null,
   loading = false,
-  emptyMessage = "No transcription is available yet.",
+  emptyTitle = "Ready to transcribe",
+  emptyMessage =
+    "Record audio from your microphone or upload an audio file to start transcription. The transcript will appear here.",
   showPlayback = true,
 }: TranscriptionReviewWorkspaceProps) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -173,11 +176,34 @@ export function TranscriptionReviewWorkspace({
 
   if (!record || transcriptEntries.length === 0) {
     return (
-      <Card className="border-[var(--border-muted)] bg-[var(--bg-surface-1)]">
-        <CardContent className="py-12 text-center text-sm text-[var(--text-muted)]">
-          {emptyMessage}
-        </CardContent>
-      </Card>
+      <div className="flex min-h-[320px] items-center justify-center px-6 py-12 text-center">
+        <div className="max-w-sm">
+          <div className="mx-auto mb-5 flex h-16 w-16 items-center justify-center rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] shadow-sm">
+            <svg
+              aria-hidden="true"
+              viewBox="0 0 24 24"
+              className="h-8 w-8 text-[var(--text-subtle)]"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M14 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7z" />
+              <path d="M14 2v5h5" />
+              <path d="M9 13h6" />
+              <path d="M9 17h6" />
+              <path d="M9 9h2" />
+            </svg>
+          </div>
+          <p className="mb-2 text-[1.75rem] font-semibold leading-none tracking-[-0.03em] text-[var(--text-primary)]">
+            {emptyTitle}
+          </p>
+          <p className="text-sm leading-relaxed text-[var(--text-muted)]">
+            {emptyMessage}
+          </p>
+        </div>
+      </div>
     );
   }
 

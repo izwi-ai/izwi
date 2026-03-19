@@ -1459,15 +1459,10 @@ export function TranscriptionPlayground({
 
       {isTranscriptSessionActive ? (
         <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] flex flex-col min-h-[460px] lg:min-h-[560px] xl:h-full xl:min-h-0 overflow-hidden">
-          <div className="px-4 sm:px-5 py-4 border-b border-[var(--border-muted)] flex items-center justify-between gap-3 bg-[var(--bg-surface-1)]">
-            <div>
-              <div className="text-xs font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                Workspace
-              </div>
-              <h3 className="mt-1 text-base font-semibold text-[var(--text-primary)]">
-                Transcript
-              </h3>
-            </div>
+          <div className="px-4 sm:px-5 py-3 border-b border-[var(--border-muted)] flex items-center justify-between gap-3 bg-[var(--bg-surface-1)]">
+            <h3 className="text-base font-semibold text-[var(--text-primary)]">
+              Transcript
+            </h3>
             <div className="flex flex-wrap items-center justify-end gap-2">
               {isStreaming ? <StatusBadge tone="success">Live</StatusBadge> : null}
               {activeTranscriptLanguage ? (
@@ -1523,7 +1518,8 @@ export function TranscriptionPlayground({
                     <TranscriptionReviewWorkspace
                       record={outputRecord}
                       audioUrl={audioUrl}
-                      emptyMessage="Record audio or upload a file to start."
+                      emptyTitle="Ready to transcribe"
+                      emptyMessage="Record audio from your microphone or upload an audio file to start transcription. The transcript will appear here."
                     />
                   </div>
                 </div>
@@ -1553,7 +1549,8 @@ export function TranscriptionPlayground({
                 <GenerationStats
                   stats={processingStats}
                   type="asr"
-                  className="w-full justify-between gap-2 bg-[var(--bg-surface-1)] sm:justify-start sm:gap-3"
+                  surface="plain"
+                  className="w-full justify-between gap-2 bg-transparent px-0 py-0 sm:justify-start sm:gap-3"
                 />
               </div>
             ) : null}
@@ -1727,6 +1724,7 @@ export function TranscriptionPlayground({
                       record={activeHistoryRecord}
                       audioUrl={selectedHistoryAudioUrl}
                       loading={selectedHistoryLoading}
+                      emptyTitle="No transcript available"
                       emptyMessage="No transcript text available for this record."
                     />
                   </div>
