@@ -158,6 +158,8 @@ describe("TranscriptionPlayground history", () => {
       languageCombobox.compareDocumentPosition(timestampsToggle) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
+    expect(screen.getByTestId("transcription-stats-footer")).toBeInTheDocument();
+    expect(screen.getByText("220ms")).toBeInTheDocument();
     expect(screen.getByText("Uploaded transcript text.")).toBeInTheDocument();
   });
 

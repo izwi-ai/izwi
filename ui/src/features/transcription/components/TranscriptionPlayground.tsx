@@ -1501,48 +1501,62 @@ export function TranscriptionPlayground({
             </div>
           </div>
 
-          <div className="flex-1 overflow-y-auto p-4 sm:p-6 bg-[var(--bg-surface-0)] scrollbar-thin">
-            {isProcessing && !transcription ? (
-              <div className="h-full flex flex-col items-center justify-center text-sm font-medium text-[var(--text-muted)] gap-3">
-                <Loader2 className="w-5 h-5 animate-spin text-[var(--text-primary)]" />
-                {isStreaming
-                  ? "Streaming transcription..."
-                  : "Transcribing audio..."}
-              </div>
-            ) : showResult ? (
-              <div className="space-y-4">
-                {isStreaming ? (
-                  <div className="rounded-xl border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-4 py-3 text-sm text-[var(--status-warning-text)] flex items-center gap-3">
-                    <MiniWaveform isActive={true} />
-                    <span>Listening for speech...</span>
-                  </div>
-                ) : null}
-
-                <TranscriptionReviewWorkspace
-                  record={outputRecord}
-                  audioUrl={audioUrl}
-                  emptyMessage="Record audio or upload a file to start."
-                />
-
-                {processingStats && !isStreaming ? (
-                  <GenerationStats stats={processingStats} type="asr" />
-                ) : null}
-              </div>
-            ) : (
-              <div className="h-full flex items-center justify-center text-center px-6">
-                <div className="max-w-sm">
-                  <div className="w-16 h-16 rounded-full bg-[var(--bg-surface-2)] flex items-center justify-center mx-auto mb-4 border border-[var(--border-muted)]">
-                    <FileText className="w-8 h-8 text-[var(--text-subtle)]" />
-                  </div>
-                  <p className="text-base font-semibold text-[var(--text-secondary)] mb-2">
-                    No transcript yet
-                  </p>
-                  <p className="text-sm text-[var(--text-muted)] leading-relaxed">
-                    Start recording or upload audio to populate this workspace.
-                  </p>
+          <div className="flex flex-1 min-h-0 flex-col bg-[var(--bg-surface-0)]">
+            <div className="flex-1 min-h-0 overflow-y-auto p-4 sm:p-6 scrollbar-thin">
+              {isProcessing && !transcription ? (
+                <div className="h-full flex flex-col items-center justify-center text-sm font-medium text-[var(--text-muted)] gap-3">
+                  <Loader2 className="w-5 h-5 animate-spin text-[var(--text-primary)]" />
+                  {isStreaming
+                    ? "Streaming transcription..."
+                    : "Transcribing audio..."}
                 </div>
+              ) : showResult ? (
+                <div className="flex min-h-full flex-col gap-4">
+                  {isStreaming ? (
+                    <div className="rounded-xl border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-4 py-3 text-sm text-[var(--status-warning-text)] flex items-center gap-3">
+                      <MiniWaveform isActive={true} />
+                      <span>Listening for speech...</span>
+                    </div>
+                  ) : null}
+
+                  <div className="flex-1 min-h-0">
+                    <TranscriptionReviewWorkspace
+                      record={outputRecord}
+                      audioUrl={audioUrl}
+                      emptyMessage="Record audio or upload a file to start."
+                    />
+                  </div>
+                </div>
+              ) : (
+                <div className="h-full flex items-center justify-center text-center px-6">
+                  <div className="max-w-sm">
+                    <div className="mx-auto mb-5 flex h-16 w-16 items-center justify-center rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] shadow-sm">
+                      <FileText className="h-8 w-8 text-[var(--text-subtle)]" />
+                    </div>
+                    <p className="mb-2 text-[1.75rem] font-semibold leading-none tracking-[-0.03em] text-[var(--text-primary)]">
+                      Ready to transcribe
+                    </p>
+                    <p className="text-sm leading-relaxed text-[var(--text-muted)]">
+                      Record audio from your microphone or upload an audio file to
+                      start transcription. The transcript will appear here.
+                    </p>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {processingStats && !isStreaming ? (
+              <div
+                data-testid="transcription-stats-footer"
+                className="border-t border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-4 py-4 sm:px-6"
+              >
+                <GenerationStats
+                  stats={processingStats}
+                  type="asr"
+                  className="w-full justify-between gap-2 bg-[var(--bg-surface-1)] sm:justify-start sm:gap-3"
+                />
               </div>
-            )}
+            ) : null}
           </div>
 
           <AnimatePresence>{renderErrorAlert("m-4")}</AnimatePresence>
