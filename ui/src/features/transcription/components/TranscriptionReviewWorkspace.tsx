@@ -196,10 +196,10 @@ export function TranscriptionReviewWorkspace({
               <path d="M9 9h2" />
             </svg>
           </div>
-          <p className="mb-2 text-[1.75rem] font-semibold leading-none tracking-[-0.03em] text-[var(--text-primary)]">
+          <p className="mb-2 text-base font-semibold text-[var(--text-secondary)]">
             {emptyTitle}
           </p>
-          <p className="text-sm leading-relaxed text-[var(--text-muted)]">
+          <p className="text-sm text-[var(--text-muted)] leading-relaxed">
             {emptyMessage}
           </p>
         </div>
