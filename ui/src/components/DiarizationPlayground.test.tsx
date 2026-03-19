@@ -130,6 +130,15 @@ describe("DiarizationPlayground speaker corrections", () => {
     const scope = within(container);
 
     expect(container.querySelectorAll('input[type="number"]')).toHaveLength(0);
+    expect(screen.getByTestId("diarization-session-panel")).not.toHaveClass(
+      "border",
+    );
+    expect(screen.getByTestId("diarization-settings-surface")).not.toHaveClass(
+      "border",
+    );
+    expect(
+      screen.queryByTestId("diarization-reset-rail"),
+    ).not.toBeInTheDocument();
 
     expect(
       screen.queryByRole("heading", { name: "Transcript" }),
@@ -150,6 +159,13 @@ describe("DiarizationPlayground speaker corrections", () => {
     expect(
       screen.getAllByRole("heading", { name: "Transcript" }).length,
     ).toBeGreaterThan(0);
+    expect(screen.getByTestId("diarization-session-panel")).toHaveClass(
+      "border",
+    );
+    expect(screen.getByTestId("diarization-settings-surface")).toHaveClass(
+      "border",
+    );
+    expect(screen.getByTestId("diarization-reset-rail")).toBeInTheDocument();
     expect(screen.getByTestId("diarization-stats-footer")).toBeInTheDocument();
 
     activateTab(scope, "Speakers");

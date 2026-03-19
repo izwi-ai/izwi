@@ -83,6 +83,15 @@ describe("TranscriptionPlayground history", () => {
       screen.getByRole("heading", { name: "Transcription Settings" }),
     ).toBeInTheDocument();
     expect(
+      screen.getByTestId("transcription-session-panel"),
+    ).not.toHaveClass("border");
+    expect(
+      screen.getByTestId("transcription-settings-surface"),
+    ).not.toHaveClass("border");
+    expect(
+      screen.queryByTestId("transcription-reset-rail"),
+    ).not.toBeInTheDocument();
+    expect(
       screen.queryByRole("heading", { name: "Audio Input" }),
     ).not.toBeInTheDocument();
     expect(screen.getByText("Record audio")).toBeInTheDocument();
@@ -159,6 +168,13 @@ describe("TranscriptionPlayground history", () => {
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
     expect(screen.queryByText("Workspace")).not.toBeInTheDocument();
+    expect(screen.getByTestId("transcription-session-panel")).toHaveClass(
+      "border",
+    );
+    expect(screen.getByTestId("transcription-settings-surface")).toHaveClass(
+      "border",
+    );
+    expect(screen.getByTestId("transcription-reset-rail")).toBeInTheDocument();
     expect(screen.getByTestId("transcription-stats-footer")).toBeInTheDocument();
     expect(screen.getByText("220ms")).toBeInTheDocument();
     expect(screen.getByText("Uploaded transcript text.")).toBeInTheDocument();

@@ -569,6 +569,7 @@ export function DiarizationPlayground({
     !isProcessing && !isRecording && selectedModelReady && pipelineModelsReady;
   const hasOutput = speakerTranscript.trim().length > 0;
   const canResetSession = isDiarizationSessionActive && !isRecording;
+  const isInactiveSessionLayout = !isDiarizationSessionActive;
   const processingStats = useMemo<ASRStats | null>(
     () =>
       latestRecord
@@ -648,9 +649,21 @@ export function DiarizationPlayground({
       )}
     >
       <div className="space-y-4">
-        <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-4 pt-5 sm:p-5 xl:pt-7 space-y-4">
+        <div
+          data-testid="diarization-session-panel"
+          className={cn(
+            isInactiveSessionLayout
+              ? "space-y-5 bg-transparent p-0"
+              : "rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-4 pt-5 sm:p-5 xl:pt-7 space-y-4",
+          )}
+        >
           <div className="space-y-2.5">
-            <div className="flex items-center justify-between gap-3">
+            <div
+              className={cn(
+                "flex items-center justify-between gap-3",
+                isInactiveSessionLayout ? "px-1" : "",
+              )}
+            >
               <div className="inline-flex items-center gap-2 text-xs font-semibold text-[var(--text-muted)] uppercase tracking-wider">
                 <Settings2 className="w-3.5 h-3.5" />
                 Session
@@ -696,7 +709,15 @@ export function DiarizationPlayground({
             </div>
           </div>
 
-          <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5 sm:p-4 space-y-3.5">
+          <div
+            data-testid="diarization-settings-surface"
+            className={cn(
+              "space-y-3.5",
+              isInactiveSessionLayout
+                ? "rounded-[24px] bg-[var(--bg-surface-1)] p-4 sm:p-5 shadow-[0_24px_55px_-42px_rgba(15,23,42,0.28)]"
+                : "rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5 sm:p-4",
+            )}
+          >
             <div className="space-y-3.5">
               <div>
                 <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
@@ -775,22 +796,29 @@ export function DiarizationPlayground({
                 }
               }}
               className={cn(
-                "rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 sm:p-5 text-center transition-all duration-300",
-                "flex min-h-[176px] flex-col items-center justify-center gap-3 hover:border-[var(--border-strong)]",
+                "p-4 sm:p-5 text-center transition-all duration-300",
+                "flex min-h-[176px] flex-col items-center justify-center gap-3",
+                isInactiveSessionLayout
+                  ? "rounded-[24px] bg-[var(--bg-surface-1)] shadow-[0_20px_45px_-36px_rgba(15,23,42,0.26)] hover:-translate-y-0.5 hover:bg-[var(--bg-surface-2)] hover:shadow-[0_26px_60px_-40px_rgba(15,23,42,0.32)]"
+                  : "rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-2)] shadow-sm",
                 isRecording
                   ? "border-red-300 bg-red-500/5 shadow-[0_18px_40px_-24px_rgba(239,68,68,0.55)]"
-                  : "hover:bg-[var(--bg-surface-2)] shadow-sm",
+                  : "",
                 (!selectedModelReady || !pipelineModelsReady || isProcessing) &&
-                  "opacity-50 cursor-not-allowed hover:border-[var(--border-muted)] hover:bg-[var(--bg-surface-1)]",
+                  (isInactiveSessionLayout
+                    ? "opacity-50 cursor-not-allowed hover:translate-y-0 hover:bg-[var(--bg-surface-1)] hover:shadow-[0_20px_45px_-36px_rgba(15,23,42,0.26)]"
+                    : "opacity-50 cursor-not-allowed hover:border-[var(--border-muted)] hover:bg-[var(--bg-surface-1)]"),
               )}
               disabled={!selectedModelReady || !pipelineModelsReady || isProcessing}
             >
               <div
                 className={cn(
-                  "relative flex h-20 w-20 items-center justify-center rounded-full border shadow-md",
+                  "relative flex h-20 w-20 items-center justify-center rounded-full shadow-md",
                   isRecording
                     ? "border-red-400 bg-red-500 text-white shadow-red-500/20"
-                    : "border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-[var(--text-primary)]",
+                    : isInactiveSessionLayout
+                      ? "bg-[var(--bg-surface-0)] text-[var(--text-primary)] shadow-[0_16px_35px_-24px_rgba(15,23,42,0.3)]"
+                      : "border border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-[var(--text-primary)]",
                 )}
               >
                 {isRecording ? (
@@ -822,14 +850,25 @@ export function DiarizationPlayground({
             <div
               onClick={openFilePicker}
               className={cn(
-                "rounded-xl border-2 border-dashed p-4 sm:p-5 transition-all duration-200 cursor-pointer group",
+                "p-4 sm:p-5 transition-all duration-200 group",
                 "flex min-h-[176px] flex-col items-center justify-center gap-3 text-center",
                 canRunInput
-                  ? "border-[var(--border-strong)] bg-[var(--bg-surface-1)] hover:border-primary hover:bg-[var(--bg-surface-2)] hover:shadow-sm"
-                  : "border-[var(--border-muted)] bg-[var(--bg-surface-1)] opacity-50 cursor-not-allowed",
+                  ? isInactiveSessionLayout
+                    ? "cursor-pointer rounded-[24px] bg-[var(--bg-surface-1)] shadow-[0_20px_45px_-36px_rgba(15,23,42,0.26)] hover:-translate-y-0.5 hover:bg-[var(--bg-surface-2)] hover:shadow-[0_26px_60px_-40px_rgba(15,23,42,0.32)]"
+                    : "cursor-pointer rounded-xl border-2 border-dashed border-[var(--border-strong)] bg-[var(--bg-surface-1)] hover:border-primary hover:bg-[var(--bg-surface-2)] hover:shadow-sm"
+                  : isInactiveSessionLayout
+                    ? "rounded-[24px] bg-[var(--bg-surface-1)] opacity-50 cursor-not-allowed shadow-[0_20px_45px_-36px_rgba(15,23,42,0.2)]"
+                    : "rounded-xl border-2 border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] opacity-50 cursor-not-allowed",
               )}
             >
-              <div className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-3 shadow-sm transition-transform duration-200 group-hover:scale-105">
+              <div
+                className={cn(
+                  "rounded-full bg-[var(--bg-surface-0)] p-3 shadow-sm transition-transform duration-200 group-hover:scale-105",
+                  isInactiveSessionLayout
+                    ? "shadow-[0_14px_30px_-24px_rgba(15,23,42,0.28)]"
+                    : "border border-[var(--border-muted)]",
+                )}
+              >
                 <Upload className="h-5 w-5 text-muted-foreground group-hover:text-primary transition-colors" />
               </div>
               <div className="space-y-1">
@@ -851,8 +890,11 @@ export function DiarizationPlayground({
             </div>
           </div>
 
-          <div className="flex items-center justify-end border-t border-[var(--border-muted)] pt-3">
-            {canResetSession ? (
+          {canResetSession ? (
+            <div
+              data-testid="diarization-reset-rail"
+              className="flex items-center justify-end border-t border-[var(--border-muted)] pt-3"
+            >
               <Button
                 onClick={handleReset}
                 variant="ghost"
@@ -862,8 +904,8 @@ export function DiarizationPlayground({
                 <RotateCcw className="w-3.5 h-3.5" />
                 Reset Session
               </Button>
-            ) : null}
-          </div>
+            </div>
+          ) : null}
 
           {!isDiarizationSessionActive ? (
             <AnimatePresence>{renderErrorAlert()}</AnimatePresence>
