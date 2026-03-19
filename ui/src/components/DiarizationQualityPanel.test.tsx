@@ -20,12 +20,14 @@ describe("DiarizationQualityPanel", () => {
   it("surfaces quality warnings and sends rerun settings", async () => {
     const onRerun = vi.fn().mockResolvedValue(undefined);
 
-    render(
+    const { container } = render(
       <DiarizationQualityPanel
         record={record}
         onRerun={onRerun}
       />,
     );
+
+    expect(container.querySelectorAll('input[type="number"]')).toHaveLength(0);
 
     expect(
       screen.getByText("Alignment coverage needs review"),

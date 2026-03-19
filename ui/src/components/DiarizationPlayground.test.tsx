@@ -129,6 +129,8 @@ describe("DiarizationPlayground speaker corrections", () => {
     );
     const scope = within(container);
 
+    expect(container.querySelectorAll('input[type="number"]')).toHaveLength(0);
+
     expect(
       screen.queryByRole("heading", { name: "Transcript" }),
     ).not.toBeInTheDocument();
@@ -266,6 +268,8 @@ describe("DiarizationPlayground speaker corrections", () => {
     );
     const scope = within(container);
 
+    expect(container.querySelectorAll('input[type="number"]')).toHaveLength(0);
+
     const fileInput = container.querySelector<HTMLInputElement>(
       'input[type="file"]',
     );
@@ -371,6 +375,8 @@ describe("DiarizationPlayground speaker corrections", () => {
     await waitFor(() =>
       expect(apiMocks.createDiarizationRecord).toHaveBeenCalled(),
     );
+
+    expect(container.querySelectorAll('input[type="number"]')).toHaveLength(0);
 
     expect(
       screen.getAllByRole("heading", { name: "Transcript" }).length,

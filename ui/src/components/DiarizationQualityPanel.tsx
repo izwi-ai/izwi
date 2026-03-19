@@ -343,9 +343,8 @@ export function DiarizationQualityPanel({
                 </Label>
                 <Input
                   id="quality-min-speakers"
-                  type="number"
-                  min={1}
-                  step={1}
+                  type="text"
+                  inputMode="numeric"
                   value={minSpeakers}
                   onChange={(event) => setMinSpeakers(event.target.value)}
                   className="h-9 border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-sm"
@@ -360,9 +359,8 @@ export function DiarizationQualityPanel({
                 </Label>
                 <Input
                   id="quality-max-speakers"
-                  type="number"
-                  min={1}
-                  step={1}
+                  type="text"
+                  inputMode="numeric"
                   value={maxSpeakers}
                   onChange={(event) => setMaxSpeakers(event.target.value)}
                   className="h-9 border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-sm"
@@ -377,9 +375,8 @@ export function DiarizationQualityPanel({
                 </Label>
                 <Input
                   id="quality-min-speech"
-                  type="number"
-                  min={0}
-                  step={10}
+                  type="text"
+                  inputMode="decimal"
                   value={minSpeechDurationMs}
                   onChange={(event) => setMinSpeechDurationMs(event.target.value)}
                   className="h-9 border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-sm"
@@ -394,9 +391,8 @@ export function DiarizationQualityPanel({
                 </Label>
                 <Input
                   id="quality-min-silence"
-                  type="number"
-                  min={0}
-                  step={10}
+                  type="text"
+                  inputMode="decimal"
                   value={minSilenceDurationMs}
                   onChange={(event) => setMinSilenceDurationMs(event.target.value)}
                   className="h-9 border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-sm"

@@ -37,6 +37,35 @@ function revokeObjectUrlIfNeeded(url: string | null): void {
   }
 }
 
+function formatDraftValue(value: number | null | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "";
+  }
+  if (Number.isInteger(value)) {
+    return String(value);
+  }
+  return value.toFixed(2).replace(/\.?0+$/, "");
+}
+
+function parseOptionalInteger(value: string): number | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const parsed = Number.parseInt(trimmed, 10);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function clampIntegerDraft(
+  value: string,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const parsed = parseOptionalInteger(value) ?? fallback;
+  return Math.max(min, Math.min(max, parsed));
+}
+
 interface DiarizationPlaygroundProps {
   selectedModel: string | null;
   selectedModelReady?: boolean;
@@ -197,10 +226,10 @@ export function DiarizationPlayground({
   );
   const [rerunPending, setRerunPending] = useState(false);
   const [rerunError, setRerunError] = useState<string | null>(null);
-  const [minSpeakers, setMinSpeakers] = useState(1);
-  const [maxSpeakers, setMaxSpeakers] = useState(4);
-  const [minSpeechMs, setMinSpeechMs] = useState(240);
-  const [minSilenceMs, setMinSilenceMs] = useState(200);
+  const [minSpeakers, setMinSpeakers] = useState("1");
+  const [maxSpeakers, setMaxSpeakers] = useState("4");
+  const [minSpeechMs, setMinSpeechMs] = useState("240");
+  const [minSilenceMs, setMinSilenceMs] = useState("200");
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
@@ -234,6 +263,42 @@ export function DiarizationPlayground({
     pipelineModelsReady,
   ]);
 
+  const normalizeSidebarSettings = useCallback(() => {
+    let nextMinSpeakers = clampIntegerDraft(minSpeakers, 1, 1, 4);
+    const nextMaxSpeakers = clampIntegerDraft(maxSpeakers, 4, 1, 4);
+    const nextMinSpeechMs = clampIntegerDraft(minSpeechMs, 240, 40, 5000);
+    const nextMinSilenceMs = clampIntegerDraft(minSilenceMs, 200, 40, 5000);
+
+    if (nextMinSpeakers > nextMaxSpeakers) {
+      nextMinSpeakers = nextMaxSpeakers;
+    }
+
+    const nextMinSpeakersText = formatDraftValue(nextMinSpeakers);
+    const nextMaxSpeakersText = formatDraftValue(nextMaxSpeakers);
+    const nextMinSpeechText = formatDraftValue(nextMinSpeechMs);
+    const nextMinSilenceText = formatDraftValue(nextMinSilenceMs);
+
+    if (minSpeakers !== nextMinSpeakersText) {
+      setMinSpeakers(nextMinSpeakersText);
+    }
+    if (maxSpeakers !== nextMaxSpeakersText) {
+      setMaxSpeakers(nextMaxSpeakersText);
+    }
+    if (minSpeechMs !== nextMinSpeechText) {
+      setMinSpeechMs(nextMinSpeechText);
+    }
+    if (minSilenceMs !== nextMinSilenceText) {
+      setMinSilenceMs(nextMinSilenceText);
+    }
+
+    return {
+      minSpeakers: nextMinSpeakers,
+      maxSpeakers: nextMaxSpeakers,
+      minSpeechMs: nextMinSpeechMs,
+      minSilenceMs: nextMinSilenceMs,
+    };
+  }, [maxSpeakers, minSilenceMs, minSpeakers, minSpeechMs]);
+
   const processAudio = useCallback(
     async (audioBlob: Blob) => {
       if (!requireReadyModel()) {
@@ -242,6 +307,8 @@ export function DiarizationPlayground({
       if (!requireReadyPipelineModels()) {
         return;
       }
+
+      const captureSettings = normalizeSidebarSettings();
 
       setIsDiarizationSessionActive(true);
       setIsProcessing(true);
@@ -276,10 +343,10 @@ export function DiarizationPlayground({
           asr_model_id: pipelineAsrModelId || undefined,
           aligner_model_id: pipelineAlignerModelId || undefined,
           llm_model_id: pipelineLlmModelId || undefined,
-          min_speakers: minSpeakers,
-          max_speakers: maxSpeakers,
-          min_speech_duration_ms: minSpeechMs,
-          min_silence_duration_ms: minSilenceMs,
+          min_speakers: captureSettings.minSpeakers,
+          max_speakers: captureSettings.maxSpeakers,
+          min_speech_duration_ms: captureSettings.minSpeechMs,
+          min_silence_duration_ms: captureSettings.minSilenceMs,
         });
 
         setLatestRecord(record);
@@ -294,10 +361,7 @@ export function DiarizationPlayground({
     },
     [
       audioUrl,
-      maxSpeakers,
-      minSilenceMs,
-      minSpeakers,
-      minSpeechMs,
+      normalizeSidebarSettings,
       pipelineAlignerModelId,
       pipelineAsrModelId,
       pipelineLlmModelId,
@@ -472,10 +536,14 @@ export function DiarizationPlayground({
         setSpeakerTranscript(formattedTranscriptFromResult(rerunRecord));
         setAudioUrl(api.diarizationRecordAudioUrl(rerunRecord.id));
         setWorkspaceTab("transcript");
-        setMinSpeakers(rerunRecord.min_speakers ?? minSpeakers);
-        setMaxSpeakers(rerunRecord.max_speakers ?? maxSpeakers);
-        setMinSpeechMs(rerunRecord.min_speech_duration_ms ?? minSpeechMs);
-        setMinSilenceMs(rerunRecord.min_silence_duration_ms ?? minSilenceMs);
+        setMinSpeakers(formatDraftValue(rerunRecord.min_speakers ?? 1));
+        setMaxSpeakers(formatDraftValue(rerunRecord.max_speakers ?? 4));
+        setMinSpeechMs(
+          formatDraftValue(rerunRecord.min_speech_duration_ms ?? 240),
+        );
+        setMinSilenceMs(
+          formatDraftValue(rerunRecord.min_silence_duration_ms ?? 200),
+        );
       } catch (err) {
         setRerunError(
           err instanceof Error ? err.message : "Failed to rerun diarization.",
@@ -487,19 +555,9 @@ export function DiarizationPlayground({
     [
       audioUrl,
       latestRecord,
-      maxSpeakers,
-      minSilenceMs,
-      minSpeakers,
-      minSpeechMs,
       rerunPending,
     ],
   );
-
-  useEffect(() => {
-    if (minSpeakers > maxSpeakers) {
-      setMinSpeakers(maxSpeakers);
-    }
-  }, [minSpeakers, maxSpeakers]);
 
   useEffect(() => {
     return () => {
@@ -649,15 +707,11 @@ export function DiarizationPlayground({
                     <span>Min speakers</span>
                     <input
                       aria-label="Min speakers"
-                      type="number"
-                      min={1}
-                      max={4}
+                      type="text"
+                      inputMode="numeric"
                       value={minSpeakers}
-                      onChange={(event) =>
-                        setMinSpeakers(
-                          Math.max(1, Math.min(4, Number(event.target.value) || 1)),
-                        )
-                      }
+                      onChange={(event) => setMinSpeakers(event.target.value)}
+                      onBlur={normalizeSidebarSettings}
                       className="flex h-10 w-full rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-1 text-sm text-[var(--text-primary)] transition-colors placeholder:text-[var(--text-subtle)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--bg-surface-1)] disabled:cursor-not-allowed disabled:opacity-50"
                     />
                   </label>
@@ -665,15 +719,11 @@ export function DiarizationPlayground({
                     <span>Max speakers</span>
                     <input
                       aria-label="Max speakers"
-                      type="number"
-                      min={1}
-                      max={4}
+                      type="text"
+                      inputMode="numeric"
                       value={maxSpeakers}
-                      onChange={(event) =>
-                        setMaxSpeakers(
-                          Math.max(1, Math.min(4, Number(event.target.value) || 4)),
-                        )
-                      }
+                      onChange={(event) => setMaxSpeakers(event.target.value)}
+                      onBlur={normalizeSidebarSettings}
                       className="flex h-10 w-full rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-1 text-sm text-[var(--text-primary)] transition-colors placeholder:text-[var(--text-subtle)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--bg-surface-1)] disabled:cursor-not-allowed disabled:opacity-50"
                     />
                   </label>
@@ -689,18 +739,11 @@ export function DiarizationPlayground({
                     <span>Min speech (ms)</span>
                     <input
                       aria-label="Min speech (ms)"
-                      type="number"
-                      min={40}
-                      max={5000}
+                      type="text"
+                      inputMode="numeric"
                       value={minSpeechMs}
-                      onChange={(event) =>
-                        setMinSpeechMs(
-                          Math.max(
-                            40,
-                            Math.min(5000, Number(event.target.value) || 240),
-                          ),
-                        )
-                      }
+                      onChange={(event) => setMinSpeechMs(event.target.value)}
+                      onBlur={normalizeSidebarSettings}
                       className="flex h-10 w-full rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-1 text-sm text-[var(--text-primary)] transition-colors placeholder:text-[var(--text-subtle)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--bg-surface-1)] disabled:cursor-not-allowed disabled:opacity-50"
                     />
                   </label>
@@ -708,18 +751,11 @@ export function DiarizationPlayground({
                     <span>Min silence (ms)</span>
                     <input
                       aria-label="Min silence (ms)"
-                      type="number"
-                      min={40}
-                      max={5000}
+                      type="text"
+                      inputMode="numeric"
                       value={minSilenceMs}
-                      onChange={(event) =>
-                        setMinSilenceMs(
-                          Math.max(
-                            40,
-                            Math.min(5000, Number(event.target.value) || 200),
-                          ),
-                        )
-                      }
+                      onChange={(event) => setMinSilenceMs(event.target.value)}
+                      onBlur={normalizeSidebarSettings}
                       className="flex h-10 w-full rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-1 text-sm text-[var(--text-primary)] transition-colors placeholder:text-[var(--text-subtle)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--bg-surface-1)] disabled:cursor-not-allowed disabled:opacity-50"
                     />
                   </label>
