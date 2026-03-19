@@ -1529,10 +1529,10 @@ export function TranscriptionPlayground({
                     <div className="mx-auto mb-5 flex h-16 w-16 items-center justify-center rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] shadow-sm">
                       <FileText className="h-8 w-8 text-[var(--text-subtle)]" />
                     </div>
-                    <p className="mb-2 text-[1.75rem] font-semibold leading-none tracking-[-0.03em] text-[var(--text-primary)]">
+                    <p className="mb-2 text-base font-semibold text-[var(--text-secondary)]">
                       Ready to transcribe
                     </p>
-                    <p className="text-sm leading-relaxed text-[var(--text-muted)]">
+                    <p className="text-sm text-[var(--text-muted)] leading-relaxed">
                       Record audio from your microphone or upload an audio file to
                       start transcription. The transcript will appear here.
                     </p>
