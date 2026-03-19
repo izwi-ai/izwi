@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Loader2, Pause, Play, SkipBack, SkipForward } from "lucide-react";
+import {
+  Loader2,
+  Pause,
+  Play,
+  SkipBack,
+  SkipForward,
+  Users,
+} from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -26,6 +33,7 @@ interface DiarizationReviewWorkspaceProps {
   > | null;
   audioUrl?: string | null;
   loading?: boolean;
+  emptyTitle?: string;
   emptyMessage?: string;
 }
 
@@ -82,6 +90,7 @@ export function DiarizationReviewWorkspace({
   record,
   audioUrl = null,
   loading = false,
+  emptyTitle = "Ready to diarize",
   emptyMessage = "No diarization transcript is available yet.",
 }: DiarizationReviewWorkspaceProps) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -193,11 +202,19 @@ export function DiarizationReviewWorkspace({
 
   if (!record || transcriptEntries.length === 0) {
     return (
-      <Card className="border-[var(--border-muted)] bg-[var(--bg-surface-1)]">
-        <CardContent className="py-12 text-center text-sm text-[var(--text-muted)]">
-          {emptyMessage}
-        </CardContent>
-      </Card>
+      <div className="flex min-h-[320px] items-center justify-center px-6 py-12 text-center">
+        <div className="max-w-sm">
+          <div className="mx-auto mb-5 flex h-16 w-16 items-center justify-center rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] shadow-sm">
+            <Users className="h-8 w-8 text-[var(--text-subtle)]" />
+          </div>
+          <p className="mb-2 text-base font-semibold text-[var(--text-secondary)]">
+            {emptyTitle}
+          </p>
+          <p className="text-sm text-[var(--text-muted)] leading-relaxed">
+            {emptyMessage}
+          </p>
+        </div>
+      </div>
     );
   }
 
