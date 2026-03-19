@@ -1,4 +1,10 @@
-import { fireEvent, render, waitFor, within } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { DiarizationPlayground } from "./DiarizationPlayground";
@@ -123,6 +129,10 @@ describe("DiarizationPlayground speaker corrections", () => {
     );
     const scope = within(container);
 
+    expect(
+      screen.queryByRole("heading", { name: "Transcript" }),
+    ).not.toBeInTheDocument();
+
     const fileInput = container.querySelector<HTMLInputElement>(
       'input[type="file"]',
     );
@@ -135,6 +145,10 @@ describe("DiarizationPlayground speaker corrections", () => {
     });
 
     expect((await scope.findAllByText("SPEAKER_00")).length).toBeGreaterThan(0);
+    expect(
+      screen.getAllByRole("heading", { name: "Transcript" }).length,
+    ).toBeGreaterThan(0);
+    expect(screen.getByTestId("diarization-stats-footer")).toBeInTheDocument();
 
     activateTab(scope, "Speakers");
     expect(await scope.findByText("Speaker Corrections")).toBeInTheDocument();
@@ -264,22 +278,23 @@ describe("DiarizationPlayground speaker corrections", () => {
     await scope.findByText("Talk Time");
 
     activateTab(scope, "Quality");
-    fireEvent.change(scope.getByLabelText("Min speakers"), {
+    const qualityPanel = within(scope.getByRole("tabpanel"));
+    fireEvent.change(qualityPanel.getByLabelText("Min speakers"), {
       target: { value: "2" },
     });
-    fireEvent.change(scope.getByLabelText("Max speakers"), {
+    fireEvent.change(qualityPanel.getByLabelText("Max speakers"), {
       target: { value: "5" },
     });
-    fireEvent.change(scope.getByLabelText("Min speech (ms)"), {
+    fireEvent.change(qualityPanel.getByLabelText("Min speech (ms)"), {
       target: { value: "180" },
     });
-    fireEvent.change(scope.getByLabelText("Min silence (ms)"), {
+    fireEvent.change(qualityPanel.getByLabelText("Min silence (ms)"), {
       target: { value: "120" },
     });
     fireEvent.click(
-      scope.getByRole("switch", { name: "LLM transcript refinement" }),
+      qualityPanel.getByRole("switch", { name: "LLM transcript refinement" }),
     );
-    fireEvent.click(scope.getByRole("button", { name: "Rerun saved audio" }));
+    fireEvent.click(qualityPanel.getByRole("button", { name: "Rerun saved audio" }));
 
     await waitFor(() =>
       expect(apiMocks.rerunDiarizationRecord).toHaveBeenCalledWith("diar-1", {
@@ -297,5 +312,75 @@ describe("DiarizationPlayground speaker corrections", () => {
 
     activateTab(scope, "Transcript");
     expect(await scope.findByText("Updated turn.")).toBeInTheDocument();
+  });
+
+  it("restores the richer empty state when diarization returns no transcript entries", async () => {
+    apiMocks.createDiarizationRecord.mockResolvedValue({
+      id: "diar-empty",
+      created_at: 3,
+      model_id: "diar_streaming_sortformer_4spk-v2.1",
+      asr_model_id: "Qwen3-ASR-0.6B",
+      aligner_model_id: "Qwen3-ForcedAligner-0.6B",
+      llm_model_id: "Qwen3-1.7B-GGUF",
+      min_speakers: 1,
+      max_speakers: 4,
+      min_speech_duration_ms: 240,
+      min_silence_duration_ms: 200,
+      enable_llm_refinement: true,
+      speaker_count: 0,
+      corrected_speaker_count: 0,
+      alignment_coverage: 0,
+      unattributed_words: 0,
+      llm_refined: false,
+      duration_secs: 6.4,
+      processing_time_ms: 140,
+      rtf: 0.9,
+      audio_mime_type: "audio/wav",
+      audio_filename: "empty.wav",
+      asr_text: "",
+      transcript: "",
+      raw_transcript: "",
+      speaker_name_overrides: {},
+      utterances: [],
+      words: [],
+      segments: [],
+    });
+
+    const { container } = render(
+      <DiarizationPlayground
+        selectedModel="diar_streaming_sortformer_4spk-v2.1"
+        selectedModelReady
+        onModelRequired={vi.fn()}
+        pipelineAsrModelId="Qwen3-ASR-0.6B"
+        pipelineAlignerModelId="Qwen3-ForcedAligner-0.6B"
+        pipelineModelsReady
+      />,
+    );
+
+    const fileInput = container.querySelector<HTMLInputElement>(
+      'input[type="file"]',
+    );
+    expect(fileInput).not.toBeNull();
+
+    fireEvent.change(fileInput!, {
+      target: {
+        files: [new File(["sample"], "empty.wav", { type: "audio/wav" })],
+      },
+    });
+
+    await waitFor(() =>
+      expect(apiMocks.createDiarizationRecord).toHaveBeenCalled(),
+    );
+
+    expect(
+      screen.getAllByRole("heading", { name: "Transcript" }).length,
+    ).toBeGreaterThan(0);
+    expect(screen.getByText("Ready to diarize")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Record audio from your microphone or upload an audio file to start diarization\. Your speaker-segmented transcript will appear here\./i,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("diarization-stats-footer")).toBeInTheDocument();
   });
 });

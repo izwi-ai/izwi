@@ -4,19 +4,21 @@ import {
   Check,
   Copy,
   Download,
-  FileAudio,
   Loader2,
   Mic,
   RotateCcw,
   Settings2,
   Upload,
   Square,
-  Users,
   AlertTriangle,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { GenerationStats, type ASRStats } from "@/components/GenerationStats";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { MiniWaveform } from "@/components/ui/Waveform";
+import { StatusBadge } from "@/components/ui/status-badge";
+import { useWorkspaceShortcuts } from "@/hooks/useWorkspaceShortcuts";
 import {
   api,
   type DiarizationRecord,
@@ -178,6 +180,8 @@ export function DiarizationPlayground({
   historyActionContainer = null,
 }: DiarizationPlaygroundProps) {
   const [speakerTranscript, setSpeakerTranscript] = useState("");
+  const [isDiarizationSessionActive, setIsDiarizationSessionActive] =
+    useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -239,10 +243,16 @@ export function DiarizationPlayground({
         return;
       }
 
+      setIsDiarizationSessionActive(true);
       setIsProcessing(true);
       setError(null);
       setSpeakerUpdateError(null);
       setRerunError(null);
+      revokeObjectUrlIfNeeded(audioUrl);
+      setAudioUrl(null);
+      setLatestRecord(null);
+      setWorkspaceTab("transcript");
+      setCopied(false);
       setSpeakerTranscript("");
 
       try {
@@ -255,8 +265,6 @@ export function DiarizationPlayground({
           16000,
           sourceFileName,
         ).catch(() => audioBlob);
-        revokeObjectUrlIfNeeded(audioUrl);
-        setAudioUrl(null);
 
         const uploadFilename =
           wavBlob === audioBlob ? sourceFileName : "audio.wav";
@@ -303,6 +311,20 @@ export function DiarizationPlayground({
     if (!requireReadyModel()) {
       return;
     }
+    if (!requireReadyPipelineModels()) {
+      return;
+    }
+
+    setIsDiarizationSessionActive(true);
+    revokeObjectUrlIfNeeded(audioUrl);
+    setAudioUrl(null);
+    setLatestRecord(null);
+    setSpeakerTranscript("");
+    setWorkspaceTab("transcript");
+    setSpeakerUpdateError(null);
+    setRerunError(null);
+    setCopied(false);
+    setError(null);
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -340,11 +362,15 @@ export function DiarizationPlayground({
 
       mediaRecorder.start();
       setIsRecording(true);
-      setError(null);
     } catch {
       setError("Could not access microphone. Please grant permission.");
     }
-  }, [processAudio, requireReadyModel]);
+  }, [
+    audioUrl,
+    processAudio,
+    requireReadyModel,
+    requireReadyPipelineModels,
+  ]);
 
   const stopRecording = useCallback(() => {
     if (mediaRecorderRef.current && isRecording) {
@@ -369,15 +395,19 @@ export function DiarizationPlayground({
     if (!requireReadyModel()) {
       return;
     }
+    if (!requireReadyPipelineModels()) {
+      return;
+    }
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
       fileInputRef.current.click();
     }
-  }, [requireReadyModel]);
+  }, [requireReadyModel, requireReadyPipelineModels]);
 
   const handleReset = () => {
     revokeObjectUrlIfNeeded(audioUrl);
     setSpeakerTranscript("");
+    setIsDiarizationSessionActive(false);
     setAudioUrl(null);
     setLatestRecord(null);
     setWorkspaceTab("transcript");
@@ -385,11 +415,15 @@ export function DiarizationPlayground({
     setRerunError(null);
     setError(null);
     setIsProcessing(false);
+    setCopied(false);
   };
 
   const asText = useMemo(() => speakerTranscript.trim(), [speakerTranscript]);
 
   const handleCopy = async () => {
+    if (!asText) {
+      return;
+    }
     await navigator.clipboard.writeText(asText);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
@@ -473,349 +507,468 @@ export function DiarizationPlayground({
     };
   }, [audioUrl]);
 
-  const canRunInput = !isProcessing && !isRecording && selectedModelReady;
+  const canRunInput =
+    !isProcessing && !isRecording && selectedModelReady && pipelineModelsReady;
   const hasOutput = speakerTranscript.trim().length > 0;
+  const canResetSession = isDiarizationSessionActive && !isRecording;
+  const processingStats = useMemo<ASRStats | null>(
+    () =>
+      latestRecord
+        ? {
+            processing_time_ms: latestRecord.processing_time_ms,
+            audio_duration_secs: latestRecord.duration_secs,
+            rtf: latestRecord.rtf,
+          }
+        : null,
+    [latestRecord],
+  );
+  const activeSpeakerCount =
+    latestRecord?.corrected_speaker_count ?? latestRecord?.speaker_count ?? null;
+  const renderErrorAlert = (className?: string) =>
+    error ? (
+      <motion.div
+        initial={{ opacity: 0, height: 0, y: 10 }}
+        animate={{ opacity: 1, height: "auto", y: 0 }}
+        exit={{ opacity: 0, height: 0, y: 10 }}
+        className={cn(
+          "p-3.5 rounded-lg border border-[var(--danger-border)] bg-[var(--danger-bg)] text-[var(--danger-text)] text-sm font-medium flex items-start gap-3",
+          className,
+        )}
+      >
+        <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+        {error}
+      </motion.div>
+    ) : null;
+
+  const workspaceShortcuts = useMemo(
+    () => [
+      {
+        key: "Enter",
+        metaKey: true,
+        enabled: selectedModelReady && pipelineModelsReady && !isProcessing,
+        action: () => {
+          if (isRecording) {
+            stopRecording();
+            return;
+          }
+          void startRecording();
+        },
+      },
+      {
+        key: "Escape",
+        enabled: isRecording,
+        action: stopRecording,
+      },
+      {
+        key: "Escape",
+        shiftKey: true,
+        enabled: isDiarizationSessionActive && !isRecording,
+        action: handleReset,
+      },
+    ],
+    [
+      handleReset,
+      isDiarizationSessionActive,
+      isProcessing,
+      isRecording,
+      pipelineModelsReady,
+      selectedModelReady,
+      startRecording,
+      stopRecording,
+    ],
+  );
+
+  useWorkspaceShortcuts(workspaceShortcuts);
 
   return (
-    <div className="grid gap-4 lg:gap-6 xl:grid-cols-[340px,minmax(0,1fr)] xl:h-[calc(100dvh-11.75rem)]">
-      <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-4 sm:p-5 space-y-4 xl:h-full xl:min-h-0 xl:overflow-y-auto">
-        <div className="flex items-center justify-between gap-3">
-          <div>
-            <div className="inline-flex items-center gap-2 text-xs font-semibold text-[var(--text-muted)] uppercase tracking-wider">
-              <FileAudio className="w-3.5 h-3.5" />
-              Capture
+    <div
+      className={cn(
+        "grid gap-5 lg:gap-6",
+        isDiarizationSessionActive
+          ? "xl:grid-cols-[340px,minmax(0,1fr)] xl:h-[calc(100dvh-11.75rem)]"
+          : "mx-auto w-full max-w-3xl",
+      )}
+    >
+      <div className="space-y-4">
+        <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-4 pt-5 sm:p-5 xl:pt-7 space-y-4">
+          <div className="space-y-2.5">
+            <div className="flex items-center justify-between gap-3">
+              <div className="inline-flex items-center gap-2 text-xs font-semibold text-[var(--text-muted)] uppercase tracking-wider">
+                <Settings2 className="w-3.5 h-3.5" />
+                Session
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                {onTogglePipelineLoadAll ? (
+                  <Button
+                    onClick={onTogglePipelineLoadAll}
+                    variant="outline"
+                    size="sm"
+                    className="h-8 gap-1.5 text-xs bg-[var(--bg-surface-1)] border-[var(--border-muted)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-surface-2)] shadow-sm"
+                    disabled={pipelineLoadAllBusy}
+                  >
+                    {pipelineLoadAllBusy ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        Loading...
+                      </>
+                    ) : pipelineAllLoaded ? (
+                      "Unload All"
+                    ) : (
+                      "Load All"
+                    )}
+                  </Button>
+                ) : null}
+                {onOpenModelManager ? (
+                  <Button
+                    onClick={onOpenModelManager}
+                    variant="outline"
+                    size="sm"
+                    className="h-8 gap-1.5 text-xs bg-[var(--bg-surface-1)] border-[var(--border-muted)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-surface-2)] shadow-sm"
+                  >
+                    <Settings2 className="w-4 h-4" />
+                    Models
+                  </Button>
+                ) : null}
+              </div>
             </div>
-            <h2 className="text-base font-semibold text-[var(--text-primary)] mt-1.5">
-              Audio Input
-            </h2>
+            <div>
+              <h2 className="text-sm font-semibold text-[var(--text-primary)] sm:text-base">
+                Diarization Settings
+              </h2>
+            </div>
           </div>
-          <div className="flex items-center gap-2">
-            {onTogglePipelineLoadAll && (
-              <Button
-                onClick={onTogglePipelineLoadAll}
-                variant="outline"
-                size="sm"
-                className="h-8 gap-1.5 text-xs bg-[var(--bg-surface-1)] border-[var(--border-muted)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-surface-2)] shadow-sm"
-                disabled={pipelineLoadAllBusy}
-              >
-                {pipelineLoadAllBusy ? (
-                  <>
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                    Loading...
-                  </>
-                ) : pipelineAllLoaded ? (
-                  "Unload All"
-                ) : (
-                  "Load All"
-                )}
-              </Button>
-            )}
-            {onOpenModelManager && (
-              <Button
-                onClick={onOpenModelManager}
-                variant="outline"
-                size="sm"
-                className="h-8 gap-1.5 text-xs bg-[var(--bg-surface-1)] border-[var(--border-muted)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-surface-2)] shadow-sm"
-              >
-                <Settings2 className="w-4 h-4" />
-                Models
-              </Button>
-            )}
-          </div>
-        </div>
 
-        <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 space-y-3">
-          <div className="grid grid-cols-2 gap-4">
-            <label className="text-xs font-semibold text-[var(--text-primary)] space-y-2 block">
-              <span className="text-[var(--text-muted)] uppercase tracking-wider">
-                Min Speakers
-              </span>
-              <input
-                type="number"
-                min={1}
-                max={4}
-                value={minSpeakers}
-                onChange={(event) =>
-                  setMinSpeakers(
-                    Math.max(1, Math.min(4, Number(event.target.value) || 1)),
-                  )
-                }
-                className="flex h-10 w-full rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-1 text-sm transition-colors placeholder:text-[var(--text-subtle)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--bg-surface-1)] disabled:cursor-not-allowed disabled:opacity-50"
-              />
-            </label>
-            <label className="text-xs font-semibold text-[var(--text-primary)] space-y-2 block">
-              <span className="text-[var(--text-muted)] uppercase tracking-wider">
-                Max Speakers
-              </span>
-              <input
-                type="number"
-                min={1}
-                max={4}
-                value={maxSpeakers}
-                onChange={(event) =>
-                  setMaxSpeakers(
-                    Math.max(1, Math.min(4, Number(event.target.value) || 4)),
-                  )
-                }
-                className="flex h-10 w-full rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-1 text-sm transition-colors placeholder:text-[var(--text-subtle)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--bg-surface-1)] disabled:cursor-not-allowed disabled:opacity-50"
-              />
-            </label>
-          </div>
-          <div className="grid grid-cols-2 gap-4">
-            <label className="text-xs font-semibold text-[var(--text-primary)] space-y-2 block">
-              <span className="text-[var(--text-muted)] uppercase tracking-wider">
-                Min Speech (ms)
-              </span>
-              <input
-                type="number"
-                min={40}
-                max={5000}
-                value={minSpeechMs}
-                onChange={(event) =>
-                  setMinSpeechMs(
-                    Math.max(
-                      40,
-                      Math.min(5000, Number(event.target.value) || 240),
-                    ),
-                  )
-                }
-                className="flex h-10 w-full rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-1 text-sm transition-colors placeholder:text-[var(--text-subtle)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--bg-surface-1)] disabled:cursor-not-allowed disabled:opacity-50"
-              />
-            </label>
-            <label className="text-xs font-semibold text-[var(--text-primary)] space-y-2 block">
-              <span className="text-[var(--text-muted)] uppercase tracking-wider">
-                Min Silence (ms)
-              </span>
-              <input
-                type="number"
-                min={40}
-                max={5000}
-                value={minSilenceMs}
-                onChange={(event) =>
-                  setMinSilenceMs(
-                    Math.max(
-                      40,
-                      Math.min(5000, Number(event.target.value) || 200),
-                    ),
-                  )
-                }
-                className="flex h-10 w-full rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-1 text-sm transition-colors placeholder:text-[var(--text-subtle)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--bg-surface-1)] disabled:cursor-not-allowed disabled:opacity-50"
-              />
-            </label>
-          </div>
-        </div>
-
-        <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
-          <div className="flex flex-col items-center">
-            <button
-              onClick={isRecording ? stopRecording : startRecording}
-              className={cn(
-                "w-24 h-24 rounded-full flex items-center justify-center transition-all duration-300 shadow-md",
-                isRecording
-                  ? "bg-red-500 hover:bg-red-600 scale-110 shadow-red-500/20 shadow-xl"
-                  : "bg-[var(--bg-surface-3)] hover:bg-[var(--border-muted)] border-2 border-[var(--border-strong)] hover:border-[var(--text-muted)]",
-                (!selectedModelReady || isProcessing) &&
-                  "opacity-50 cursor-not-allowed",
-              )}
-              disabled={!selectedModelReady || isProcessing}
-            >
-              {isRecording ? (
-                <Square className="w-10 h-10 text-white fill-current" />
-              ) : (
-                <Mic className="w-10 h-10 text-[var(--text-primary)]" />
-              )}
-            </button>
-            <p className="mt-4 text-sm font-medium text-[var(--text-secondary)]">
-              {isRecording
-                ? "Recording... click to stop"
-                : "Tap to record audio"}
-            </p>
-
-            <div className="w-full mt-6">
-              <div className="relative">
-                <div className="absolute inset-0 flex items-center">
-                  <div className="w-full border-t border-[var(--border-muted)]" />
+          <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5 sm:p-4 space-y-3.5">
+            <div className="space-y-3.5">
+              <div>
+                <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                  Speaker Range
                 </div>
-                <div className="relative flex justify-center text-xs uppercase">
-                  <span className="bg-[var(--bg-surface-0)] px-2 text-[var(--text-muted)]">
-                    Or
-                  </span>
+                <div className="grid grid-cols-2 gap-3">
+                  <label className="text-xs font-medium text-[var(--text-muted)] space-y-2 block">
+                    <span>Min speakers</span>
+                    <input
+                      aria-label="Min speakers"
+                      type="number"
+                      min={1}
+                      max={4}
+                      value={minSpeakers}
+                      onChange={(event) =>
+                        setMinSpeakers(
+                          Math.max(1, Math.min(4, Number(event.target.value) || 1)),
+                        )
+                      }
+                      className="flex h-10 w-full rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-1 text-sm text-[var(--text-primary)] transition-colors placeholder:text-[var(--text-subtle)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--bg-surface-1)] disabled:cursor-not-allowed disabled:opacity-50"
+                    />
+                  </label>
+                  <label className="text-xs font-medium text-[var(--text-muted)] space-y-2 block">
+                    <span>Max speakers</span>
+                    <input
+                      aria-label="Max speakers"
+                      type="number"
+                      min={1}
+                      max={4}
+                      value={maxSpeakers}
+                      onChange={(event) =>
+                        setMaxSpeakers(
+                          Math.max(1, Math.min(4, Number(event.target.value) || 4)),
+                        )
+                      }
+                      className="flex h-10 w-full rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-1 text-sm text-[var(--text-primary)] transition-colors placeholder:text-[var(--text-subtle)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--bg-surface-1)] disabled:cursor-not-allowed disabled:opacity-50"
+                    />
+                  </label>
                 </div>
               </div>
 
+              <div>
+                <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                  Timing Windows
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <label className="text-xs font-medium text-[var(--text-muted)] space-y-2 block">
+                    <span>Min speech (ms)</span>
+                    <input
+                      aria-label="Min speech (ms)"
+                      type="number"
+                      min={40}
+                      max={5000}
+                      value={minSpeechMs}
+                      onChange={(event) =>
+                        setMinSpeechMs(
+                          Math.max(
+                            40,
+                            Math.min(5000, Number(event.target.value) || 240),
+                          ),
+                        )
+                      }
+                      className="flex h-10 w-full rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-1 text-sm text-[var(--text-primary)] transition-colors placeholder:text-[var(--text-subtle)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--bg-surface-1)] disabled:cursor-not-allowed disabled:opacity-50"
+                    />
+                  </label>
+                  <label className="text-xs font-medium text-[var(--text-muted)] space-y-2 block">
+                    <span>Min silence (ms)</span>
+                    <input
+                      aria-label="Min silence (ms)"
+                      type="number"
+                      min={40}
+                      max={5000}
+                      value={minSilenceMs}
+                      onChange={(event) =>
+                        setMinSilenceMs(
+                          Math.max(
+                            40,
+                            Math.min(5000, Number(event.target.value) || 200),
+                          ),
+                        )
+                      }
+                      className="flex h-10 w-full rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-1 text-sm text-[var(--text-primary)] transition-colors placeholder:text-[var(--text-subtle)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--bg-surface-1)] disabled:cursor-not-allowed disabled:opacity-50"
+                    />
+                  </label>
+                </div>
+              </div>
+            </div>
+
+          </div>
+
+          <div className="grid gap-3 sm:grid-cols-2">
+            <button
+              onClick={() => {
+                if (isRecording) {
+                  stopRecording();
+                } else {
+                  void startRecording();
+                }
+              }}
+              className={cn(
+                "rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 sm:p-5 text-center transition-all duration-300",
+                "flex min-h-[176px] flex-col items-center justify-center gap-3 hover:border-[var(--border-strong)]",
+                isRecording
+                  ? "border-red-300 bg-red-500/5 shadow-[0_18px_40px_-24px_rgba(239,68,68,0.55)]"
+                  : "hover:bg-[var(--bg-surface-2)] shadow-sm",
+                (!selectedModelReady || !pipelineModelsReady || isProcessing) &&
+                  "opacity-50 cursor-not-allowed hover:border-[var(--border-muted)] hover:bg-[var(--bg-surface-1)]",
+              )}
+              disabled={!selectedModelReady || !pipelineModelsReady || isProcessing}
+            >
               <div
-                onClick={openFilePicker}
                 className={cn(
-                  "mt-4 flex flex-col items-center justify-center rounded-xl border-2 border-dashed p-6 transition-colors cursor-pointer",
-                  canRunInput
-                    ? "border-[var(--border-strong)] hover:border-primary/50 hover:bg-[var(--bg-surface-2)] bg-[var(--bg-surface-1)]"
-                    : "border-[var(--border-muted)] bg-[var(--bg-surface-1)] opacity-50 cursor-not-allowed",
+                  "relative flex h-20 w-20 items-center justify-center rounded-full border shadow-md",
+                  isRecording
+                    ? "border-red-400 bg-red-500 text-white shadow-red-500/20"
+                    : "border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-[var(--text-primary)]",
                 )}
               >
-                <Upload className="w-6 h-6 text-[var(--text-muted)] mb-2" />
-                <p className="text-sm font-medium text-[var(--text-primary)]">
-                  Upload audio file
+                {isRecording ? (
+                  <>
+                    <div
+                      className="absolute inset-0 rounded-full bg-red-500/20 animate-ping"
+                      style={{ animationDuration: "1.5s" }}
+                    />
+                    <div
+                      className="absolute inset-[-8px] rounded-full bg-red-500/10 animate-ping"
+                      style={{ animationDuration: "2s" }}
+                    />
+                    <Square className="relative z-10 h-8 w-8 fill-current" />
+                  </>
+                ) : (
+                  <Mic className="h-8 w-8" />
+                )}
+              </div>
+              <div className="space-y-1">
+                <p className="text-sm font-semibold text-[var(--text-primary)]">
+                  {isRecording ? "Recording" : "Record audio"}
                 </p>
-                <p className="text-xs text-[var(--text-muted)] mt-1">
+                <p className="text-xs text-[var(--text-muted)]">
+                  {isRecording ? "Tap to stop" : "Use your microphone"}
+                </p>
+              </div>
+            </button>
+
+            <div
+              onClick={openFilePicker}
+              className={cn(
+                "rounded-xl border-2 border-dashed p-4 sm:p-5 transition-all duration-200 cursor-pointer group",
+                "flex min-h-[176px] flex-col items-center justify-center gap-3 text-center",
+                canRunInput
+                  ? "border-[var(--border-strong)] bg-[var(--bg-surface-1)] hover:border-primary hover:bg-[var(--bg-surface-2)] hover:shadow-sm"
+                  : "border-[var(--border-muted)] bg-[var(--bg-surface-1)] opacity-50 cursor-not-allowed",
+              )}
+            >
+              <div className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-3 shadow-sm transition-transform duration-200 group-hover:scale-105">
+                <Upload className="h-5 w-5 text-muted-foreground group-hover:text-primary transition-colors" />
+              </div>
+              <div className="space-y-1">
+                <p className="text-sm font-semibold text-[var(--text-primary)] group-hover:text-primary transition-colors">
+                  Upload audio
+                </p>
+                <p className="text-xs text-[var(--text-muted)]">
                   WAV, MP3, M4A, AAC
                 </p>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="audio/*"
-                  onChange={handleFileUpload}
-                  className="hidden"
-                  disabled={!canRunInput}
-                />
               </div>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="audio/*"
+                onChange={handleFileUpload}
+                className="hidden"
+                disabled={!canRunInput}
+              />
             </div>
           </div>
+
+          <div className="flex items-center justify-end border-t border-[var(--border-muted)] pt-3">
+            {canResetSession ? (
+              <Button
+                onClick={handleReset}
+                variant="ghost"
+                size="sm"
+                className="h-8 gap-2 text-xs border border-transparent hover:border-[var(--border-muted)] bg-transparent hover:bg-[var(--bg-surface-1)]"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                Reset Session
+              </Button>
+            ) : null}
+          </div>
+
+          {!isDiarizationSessionActive ? (
+            <AnimatePresence>{renderErrorAlert()}</AnimatePresence>
+          ) : null}
         </div>
-
-        {audioUrl && (
-          <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
-            <div className="text-xs font-semibold text-[var(--text-muted)] uppercase tracking-wider mb-3">
-              Latest input
-            </div>
-            <p className="text-sm leading-relaxed text-[var(--text-secondary)]">
-              Audio is loaded into the review workspace. Use the transcript timeline
-              and playback controls there to validate who spoke when.
-            </p>
-          </div>
-        )}
-
-        {(hasOutput || audioUrl || error) && (
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={handleReset}
-            className="w-full h-9 gap-2 text-xs border border-transparent hover:border-[var(--border-muted)] bg-transparent hover:bg-[var(--bg-surface-1)] mt-2"
-          >
-            <RotateCcw className="w-3.5 h-3.5" />
-            Reset Session
-          </Button>
-        )}
       </div>
 
-      <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] flex flex-col min-h-[460px] lg:min-h-[560px] xl:min-h-0 xl:h-full overflow-hidden">
-        <div className="px-4 sm:px-5 py-4 border-b border-[var(--border-muted)] flex items-center justify-between gap-3 bg-[var(--bg-surface-1)]">
-          <div className="flex items-center gap-2">
+      {isDiarizationSessionActive ? (
+        <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] flex flex-col min-h-[460px] lg:min-h-[560px] xl:h-full xl:min-h-0 overflow-hidden">
+          <div className="px-4 sm:px-5 py-3 border-b border-[var(--border-muted)] flex items-center justify-between gap-3 bg-[var(--bg-surface-1)]">
             <h3 className="text-base font-semibold text-[var(--text-primary)]">
-              Diarized Transcript
+              Transcript
             </h3>
-          </div>
-          <div className="flex items-center gap-2">
-            <Button
-              onClick={handleCopy}
-              variant="outline"
-              size="icon"
-              className="h-9 w-9 bg-[var(--bg-surface-1)] border-[var(--border-muted)] text-[var(--text-secondary)] hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)]"
-              disabled={!hasOutput || isProcessing}
-              title="Copy transcript"
-            >
-              {copied ? (
-                <Check className="w-4 h-4 text-green-500" />
-              ) : (
-                <Copy className="w-4 h-4" />
-              )}
-            </Button>
-            <DiarizationExportDialog record={latestRecord}>
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              {isRecording ? <StatusBadge tone="success">Recording</StatusBadge> : null}
+              {!isRecording && activeSpeakerCount ? (
+                <StatusBadge>{activeSpeakerCount} speakers</StatusBadge>
+              ) : null}
               <Button
+                onClick={handleCopy}
                 variant="outline"
                 size="icon"
                 className="h-9 w-9 bg-[var(--bg-surface-1)] border-[var(--border-muted)] text-[var(--text-secondary)] hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)]"
-                disabled={!latestRecord || isProcessing}
-                title="Export transcript"
+                disabled={!hasOutput || isProcessing || isRecording}
+                title="Copy transcript"
               >
-                <Download className="w-4 h-4" />
-              </Button>
-            </DiarizationExportDialog>
-          </div>
-        </div>
-
-        <div className="flex-1 overflow-y-auto p-4 sm:p-6 bg-[var(--bg-surface-0)] scrollbar-thin">
-          {isProcessing ? (
-            <div className="h-full flex flex-col items-center justify-center text-sm font-medium text-[var(--text-muted)] gap-3">
-              <Loader2 className="w-5 h-5 animate-spin text-[var(--text-primary)]" />
-              Running diarization and transcript pipeline...
-            </div>
-          ) : hasOutput ? (
-            <Tabs value={workspaceTab} onValueChange={setWorkspaceTab} className="space-y-4">
-              <TabsList className="w-full justify-start bg-[var(--bg-surface-1)]">
-                <TabsTrigger value="transcript">Transcript</TabsTrigger>
-                <TabsTrigger value="speakers">Speakers</TabsTrigger>
-                <TabsTrigger value="quality">Quality</TabsTrigger>
-              </TabsList>
-
-              <TabsContent value="transcript" className="mt-0 space-y-4">
-                {latestRecord ? (
-                  <DiarizationReviewWorkspace
-                    record={latestRecord}
-                    audioUrl={audioUrl}
-                    emptyMessage="Run diarization to review speaker turns."
-                  />
+                {copied ? (
+                  <Check className="w-4 h-4 text-green-500" />
                 ) : (
-                  <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-5 sm:p-6 shadow-sm">
-                    <pre className="text-base text-[var(--text-secondary)] whitespace-pre-wrap break-words leading-relaxed font-sans selection:bg-[var(--accent-soft)]">
-                      {speakerTranscript}
-                    </pre>
-                  </div>
+                  <Copy className="w-4 h-4" />
                 )}
-              </TabsContent>
-
-              <TabsContent value="speakers" className="mt-0">
-                {latestRecord ? (
-                  <DiarizationSpeakerManager
-                    record={latestRecord}
-                    isSaving={speakerUpdatePending}
-                    error={speakerUpdateError}
-                    onSave={handleSpeakerCorrectionsSave}
-                  />
-                ) : null}
-              </TabsContent>
-
-              <TabsContent value="quality" className="mt-0">
-                <DiarizationQualityPanel
-                  record={latestRecord}
-                  isRerunning={rerunPending}
-                  error={rerunError}
-                  onRerun={handleRerunRecord}
-                />
-              </TabsContent>
-            </Tabs>
-          ) : (
-            <div className="h-full flex items-center justify-center text-center px-6">
-              <div className="max-w-sm">
-                <div className="w-16 h-16 rounded-full bg-[var(--bg-surface-2)] flex items-center justify-center mx-auto mb-4 border border-[var(--border-muted)]">
-                  <Users className="w-8 h-8 text-[var(--text-subtle)]" />
-                </div>
-                <p className="text-base font-semibold text-[var(--text-secondary)] mb-2">
-                  Ready to diarize
-                </p>
-                <p className="text-sm text-[var(--text-muted)] leading-relaxed">
-                  Record audio from your microphone or upload an audio file to
-                  start diarization. Your speaker-segmented transcript will
-                  appear here.
-                </p>
-              </div>
+              </Button>
+              <DiarizationExportDialog record={latestRecord}>
+                <Button
+                  variant="outline"
+                  size="icon"
+                  className="h-9 w-9 bg-[var(--bg-surface-1)] border-[var(--border-muted)] text-[var(--text-secondary)] hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)]"
+                  disabled={!latestRecord || !hasOutput || isProcessing || isRecording}
+                  title="Export transcript"
+                >
+                  <Download className="w-4 h-4" />
+                </Button>
+              </DiarizationExportDialog>
             </div>
-          )}
-        </div>
+          </div>
 
-        <AnimatePresence>
-          {error && (
-            <motion.div
-              initial={{ opacity: 0, height: 0, y: 10 }}
-              animate={{ opacity: 1, height: "auto", y: 0 }}
-              exit={{ opacity: 0, height: 0, y: 10 }}
-              className="m-4 p-3.5 rounded-lg border border-[var(--danger-border)] bg-[var(--danger-bg)] text-[var(--danger-text)] text-sm font-medium flex items-start gap-3"
-            >
-              <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
-              {error}
-            </motion.div>
-          )}
-        </AnimatePresence>
+          <div className="flex flex-1 min-h-0 flex-col bg-[var(--bg-surface-0)]">
+            <div className="flex-1 min-h-0 overflow-y-auto p-4 sm:p-6 scrollbar-thin">
+              {isProcessing ? (
+                <div className="h-full flex flex-col items-center justify-center text-sm font-medium text-[var(--text-muted)] gap-3">
+                  <Loader2 className="w-5 h-5 animate-spin text-[var(--text-primary)]" />
+                  Running diarization and transcript pipeline...
+                </div>
+              ) : latestRecord ? (
+                <Tabs
+                  value={workspaceTab}
+                  onValueChange={setWorkspaceTab}
+                  className="flex min-h-full flex-col gap-4"
+                >
+                  <TabsList className="w-full justify-start bg-[var(--bg-surface-1)]">
+                    <TabsTrigger value="transcript">Transcript</TabsTrigger>
+                    <TabsTrigger value="speakers">Speakers</TabsTrigger>
+                    <TabsTrigger value="quality">Quality</TabsTrigger>
+                  </TabsList>
+
+                  <TabsContent value="transcript" className="mt-0 flex-1">
+                    <DiarizationReviewWorkspace
+                      record={latestRecord}
+                      audioUrl={audioUrl}
+                      emptyTitle="Ready to diarize"
+                      emptyMessage="Record audio from your microphone or upload an audio file to start diarization. Your speaker-segmented transcript will appear here."
+                    />
+                  </TabsContent>
+
+                  <TabsContent value="speakers" className="mt-0">
+                    <DiarizationSpeakerManager
+                      record={latestRecord}
+                      isSaving={speakerUpdatePending}
+                      error={speakerUpdateError}
+                      onSave={handleSpeakerCorrectionsSave}
+                    />
+                  </TabsContent>
+
+                  <TabsContent value="quality" className="mt-0">
+                    <DiarizationQualityPanel
+                      record={latestRecord}
+                      isRerunning={rerunPending}
+                      error={rerunError}
+                      onRerun={handleRerunRecord}
+                    />
+                  </TabsContent>
+                </Tabs>
+              ) : (
+                <div className="flex min-h-full flex-col gap-4">
+                  {isRecording ? (
+                    <div className="rounded-xl border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-4 py-3 text-sm text-[var(--status-warning-text)] flex items-center gap-3">
+                      <MiniWaveform isActive={true} />
+                      <span>Recording audio...</span>
+                    </div>
+                  ) : null}
+
+                  <div className="flex-1 min-h-0">
+                    <DiarizationReviewWorkspace
+                      record={null}
+                      audioUrl={null}
+                      emptyTitle="Ready to diarize"
+                      emptyMessage="Record audio from your microphone or upload an audio file to start diarization. Your speaker-segmented transcript will appear here."
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {processingStats && !isProcessing && !isRecording ? (
+              <div
+                data-testid="diarization-stats-footer"
+                className="border-t border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-4 py-4 sm:px-6"
+              >
+                <GenerationStats
+                  stats={processingStats}
+                  type="asr"
+                  surface="plain"
+                  className="w-full justify-between gap-2 bg-transparent px-0 py-0 sm:justify-start sm:gap-3"
+                />
+              </div>
+            ) : null}
+          </div>
+
+          <AnimatePresence>{renderErrorAlert("m-4")}</AnimatePresence>
+        </div>
+      ) : null}
+
+      <div
+        className={cn(
+          "text-xs text-[var(--text-muted)]",
+          isDiarizationSessionActive ? "xl:col-start-2" : "mx-1",
+        )}
+      >
+        Shortcut: <span className="app-kbd">Ctrl/Cmd + Enter</span> start or stop capture, <span className="app-kbd">Esc</span> stop recording, <span className="app-kbd">Shift + Esc</span> reset.
       </div>
+
       <DiarizationHistoryPanel
         latestRecord={latestRecord}
         historyActionContainer={historyActionContainer}
