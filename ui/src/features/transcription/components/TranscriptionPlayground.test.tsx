@@ -39,7 +39,117 @@ describe("TranscriptionPlayground history", () => {
       new AbortController(),
     );
 
+    Object.defineProperty(URL, "createObjectURL", {
+      writable: true,
+      value: vi.fn(() => "blob:transcription-test"),
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      writable: true,
+      value: vi.fn(),
+    });
+
     HTMLElement.prototype.scrollIntoView = vi.fn();
+  });
+
+  it("hides the transcript workspace until a transcription session starts", async () => {
+    apiMocks.listTranscriptionRecords.mockResolvedValue([]);
+
+    render(
+      <TranscriptionPlayground
+        selectedModel="Qwen3-ASR-0.6B"
+        selectedModelReady={true}
+        modelOptions={[
+          {
+            value: "Qwen3-ASR-0.6B",
+            label: "Qwen3 ASR 0.6B",
+            statusLabel: "Ready",
+            isReady: true,
+          },
+        ]}
+        onSelectModel={vi.fn()}
+        onOpenModelManager={vi.fn()}
+        onModelRequired={vi.fn()}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(apiMocks.listTranscriptionRecords).toHaveBeenCalled(),
+    );
+
+    expect(
+      screen.queryByRole("heading", { name: "Transcript" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "Transcription Settings" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/record or upload audio to open the transcript workspace/i),
+    ).toBeInTheDocument();
+  });
+
+  it("shows the transcript workspace after an upload starts a session", async () => {
+    apiMocks.listTranscriptionRecords.mockResolvedValue([]);
+    apiMocks.createTranscriptionRecord.mockResolvedValue({
+      id: "transcription-upload",
+      created_at: 2,
+      model_id: "Qwen3-ASR-0.6B",
+      aligner_model_id: null,
+      language: "English",
+      duration_secs: 4.1,
+      processing_time_ms: 220,
+      rtf: 0.6,
+      audio_mime_type: "audio/wav",
+      audio_filename: "meeting.wav",
+      transcription: "Uploaded transcript text.",
+      segments: [],
+      words: [],
+    });
+
+    const { container } = render(
+      <TranscriptionPlayground
+        selectedModel="Qwen3-ASR-0.6B"
+        selectedModelReady={true}
+        modelOptions={[
+          {
+            value: "Qwen3-ASR-0.6B",
+            label: "Qwen3 ASR 0.6B",
+            statusLabel: "Ready",
+            isReady: true,
+          },
+        ]}
+        onSelectModel={vi.fn()}
+        onOpenModelManager={vi.fn()}
+        onModelRequired={vi.fn()}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(apiMocks.listTranscriptionRecords).toHaveBeenCalled(),
+    );
+
+    fireEvent.click(screen.getByLabelText(/Stream/i));
+
+    const fileInput = container.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement | null;
+    expect(fileInput).not.toBeNull();
+
+    fireEvent.change(fileInput!, {
+      target: {
+        files: [new File(["audio"], "meeting.wav", { type: "audio/wav" })],
+      },
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("heading", { name: "Transcript" }),
+      ).toBeInTheDocument(),
+    );
+    await waitFor(() =>
+      expect(apiMocks.createTranscriptionRecord).toHaveBeenCalled(),
+    );
+
+    expect(screen.getByText("Uploaded transcript text.")).toBeInTheDocument();
   });
 
   it("keeps the transcription history drawer open while confirming a delete", async () => {
@@ -206,11 +316,9 @@ describe("TranscriptionPlayground history", () => {
     fireEvent.click(await screen.findByText("Testing saved transcription history."));
 
     expect(await screen.findByText("Timed transcript")).toBeInTheDocument();
-    const copyButtons = screen.getAllByRole("button", { name: /Copy/i });
-    const exportButtons = screen.getAllByRole("button", { name: /Export/i });
-
-    expect(copyButtons[copyButtons.length - 1]).toBeInTheDocument();
-    expect(exportButtons[exportButtons.length - 1]).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "clip.wav" }),
+    ).toBeInTheDocument();
     expect(screen.getByTitle("Open older record")).toBeInTheDocument();
     expect(screen.queryByText("Performance")).not.toBeInTheDocument();
   });
