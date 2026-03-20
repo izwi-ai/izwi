@@ -52,6 +52,6 @@ describe("route model catalog", () => {
 
   it("treats Qwen3.5 models as thinking-capable chat models", () => {
     expect(isThinkingChatModel("Qwen3.5-4B")).toBe(true);
-    expect(isThinkingChatModel("Qwen3-ASR-0.6B")).toBe(false);
+    expect(isThinkingChatModel("Parakeet-TDT-0.6B-v3")).toBe(false);
   });
 });

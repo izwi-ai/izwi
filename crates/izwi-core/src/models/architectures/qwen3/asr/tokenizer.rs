@@ -1,4 +1,4 @@
-//! Tokenizer wrapper for Qwen3-ASR.
+//! Tokenizer wrapper for the retained Qwen speech/aligner stack.
 
 use std::collections::HashMap;
 use std::fs;

@@ -632,7 +632,7 @@ mod tests {
 
     fn sample_record() -> NewTranscriptionRecord {
         NewTranscriptionRecord {
-            model_id: Some("Qwen3-ASR-0.6B".to_string()),
+            model_id: Some("Parakeet-TDT-0.6B-v3".to_string()),
             aligner_model_id: Some("Qwen3-ForcedAligner-0.6B".to_string()),
             language: Some("English".to_string()),
             duration_secs: Some(6.0),

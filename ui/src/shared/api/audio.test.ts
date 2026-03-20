@@ -7,7 +7,7 @@ const updatedRecord = {
   id: "diar-1",
   created_at: 1,
   model_id: "diar_streaming_sortformer_4spk-v2.1",
-  asr_model_id: "Qwen3-ASR-0.6B",
+  asr_model_id: "Parakeet-TDT-0.6B-v3",
   aligner_model_id: "Qwen3-ForcedAligner-0.6B",
   llm_model_id: null,
   min_speakers: 1,
@@ -121,7 +121,7 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
         JSON.stringify({
           id: "txr-1",
           created_at: 1,
-          model_id: "Qwen3-ASR-0.6B",
+          model_id: "Parakeet-TDT-0.6B-v3",
           aligner_model_id: "Qwen3-ForcedAligner-0.6B",
           language: "English",
           duration_secs: 4,
@@ -147,7 +147,7 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
     await client.createTranscriptionRecord({
       audio_base64: "UklGRg==",
-      model_id: "Qwen3-ASR-0.6B",
+      model_id: "Parakeet-TDT-0.6B-v3",
       aligner_model_id: "Qwen3-ForcedAligner-0.6B",
       language: "English",
       include_timestamps: true,
@@ -159,7 +159,7 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
         method: "POST",
         body: JSON.stringify({
           audio_base64: "UklGRg==",
-          model: "Qwen3-ASR-0.6B",
+          model: "Parakeet-TDT-0.6B-v3",
           aligner_model: "Qwen3-ForcedAligner-0.6B",
           language: "English",
           include_timestamps: true,

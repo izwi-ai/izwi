@@ -442,18 +442,6 @@ impl ModelDownloader {
                     && path.join("kokoro-v1_0.pth").exists()
                     && path.join("voices").join("af_heart.pt").exists()
             }
-            ModelFamily::Qwen3Asr => {
-                let has_config = path.join("config.json").exists();
-                let has_vocab = path.join("vocab.json").exists();
-                let has_chat_template = path.join("chat_template.json").exists();
-                let has_model =
-                    if variant.is_quantized() || matches!(variant, ModelVariant::Qwen3Asr06B) {
-                        path.join("model.safetensors").exists()
-                    } else {
-                        path.join("model-00001-of-00002.safetensors").exists()
-                    };
-                has_config && has_vocab && has_chat_template && has_model
-            }
             ModelFamily::ParakeetAsr => {
                 if variant.is_parakeet_nemo() {
                     let nemo_file = match variant {
@@ -971,31 +959,6 @@ impl ModelDownloader {
                 "voices/zm_yunxia.pt".to_string(),
                 "voices/zm_yunyang.pt".to_string(),
             ],
-            ModelFamily::Qwen3Asr => {
-                let mut files = vec![
-                    "config.json".to_string(),
-                    "chat_template.json".to_string(),
-                    "generation_config.json".to_string(),
-                    "merges.txt".to_string(),
-                    "preprocessor_config.json".to_string(),
-                    "tokenizer_config.json".to_string(),
-                    "vocab.json".to_string(),
-                ];
-                // mlx-community quantized models use model.safetensors + model.safetensors.index.json.
-                if variant.is_quantized() {
-                    files.push("model.safetensors".to_string());
-                    files.push("model.safetensors.index.json".to_string());
-                } else if matches!(variant, ModelVariant::Qwen3Asr06B) {
-                    files.push("model.safetensors".to_string());
-                } else {
-                    files.extend([
-                        "model-00001-of-00002.safetensors".to_string(),
-                        "model-00002-of-00002.safetensors".to_string(),
-                        "model.safetensors.index.json".to_string(),
-                    ]);
-                }
-                files
-            }
             ModelFamily::ParakeetAsr => {
                 if variant.is_parakeet_nemo() {
                     let nemo_file = match variant {
@@ -1464,7 +1427,6 @@ impl ModelDownloader {
                     ModelVariant::Qwen3Tts12Hz17BBase
                     | ModelVariant::Qwen3Tts12Hz17BCustomVoice
                     | ModelVariant::Qwen3Tts12Hz17BVoiceDesign => 3_850_000_000,
-                    ModelVariant::Qwen3Asr06B => 1_800_000_000,
                     ModelVariant::WhisperLargeV3Turbo => 1_617_824_864,
                     ModelVariant::Qwen306B => 1_520_000_000,
                     ModelVariant::Qwen306B4Bit => 800_000_000,

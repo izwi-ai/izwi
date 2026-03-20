@@ -86,7 +86,7 @@ struct KokoroLoaderRegistration {
     loader: KokoroLoaderFn,
 }
 
-fn load_qwen_asr_model(
+fn load_qwen_forced_aligner_model(
     model_dir: &Path,
     _variant: ModelVariant,
     device: DeviceProfile,
@@ -213,9 +213,9 @@ const ASR_LOADER_REGISTRY: &[AsrLoaderRegistration] = &[
         loader: load_whisper_asr_model,
     },
     AsrLoaderRegistration {
-        name: "qwen_asr",
-        family: ModelFamily::Qwen3Asr,
-        loader: load_qwen_asr_model,
+        name: "qwen_forced_aligner",
+        family: ModelFamily::Qwen3ForcedAligner,
+        loader: load_qwen_forced_aligner_model,
     },
 ];
 
@@ -277,7 +277,7 @@ fn resolve_asr_loader_registration(
     variant: ModelVariant,
 ) -> Option<&'static AsrLoaderRegistration> {
     let family = match variant.family() {
-        ModelFamily::Qwen3Asr | ModelFamily::Qwen3ForcedAligner => ModelFamily::Qwen3Asr,
+        ModelFamily::Qwen3ForcedAligner => ModelFamily::Qwen3ForcedAligner,
         ModelFamily::ParakeetAsr => ModelFamily::ParakeetAsr,
         ModelFamily::WhisperAsr => ModelFamily::WhisperAsr,
         _ => return None,

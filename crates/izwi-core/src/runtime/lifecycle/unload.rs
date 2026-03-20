@@ -11,8 +11,7 @@ impl RuntimeService {
         let _ = self.core_engine.abort_requests_for_variant(variant).await;
 
         match variant.family() {
-            ModelFamily::Qwen3Asr
-            | ModelFamily::ParakeetAsr
+            ModelFamily::ParakeetAsr
             | ModelFamily::WhisperAsr
             | ModelFamily::Qwen3ForcedAligner => {
                 self.model_registry.unload_asr(variant).await;

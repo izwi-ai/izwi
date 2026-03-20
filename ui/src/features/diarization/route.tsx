@@ -68,7 +68,7 @@ function isDiarizationVariant(variant: string): boolean {
 }
 
 function isPipelineAsrVariant(variant: string): boolean {
-  return variant === "Qwen3-ASR-0.6B" || variant.startsWith("Qwen3-ASR-0.6B-");
+  return variant.startsWith("Parakeet-TDT-");
 }
 
 function isPipelineAlignerVariant(variant: string): boolean {
@@ -170,7 +170,7 @@ export function DiarizationPage({
   );
 
   const preferredDiarizationModelOrder = ["diar_streaming_sortformer_4spk-v2.1"];
-  const preferredAsrModelOrder = ["Qwen3-ASR-0.6B"];
+  const preferredAsrModelOrder = ["Parakeet-TDT-0.6B-v3", "Parakeet-TDT-0.6B-v2"];
   const preferredAlignerModelOrder = ["Qwen3-ForcedAligner-0.6B"];
   const preferredLlmModelOrder = ["Qwen3-1.7B-GGUF"];
 

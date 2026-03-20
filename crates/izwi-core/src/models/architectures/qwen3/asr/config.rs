@@ -1,4 +1,4 @@
-//! Configuration parsing for Qwen3-ASR.
+//! Configuration parsing for the retained Qwen speech/aligner stack.
 
 use serde::Deserialize;
 

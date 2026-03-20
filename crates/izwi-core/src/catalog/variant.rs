@@ -8,7 +8,6 @@ use super::ModelVariant;
 pub enum ModelFamily {
     Qwen3Tts,
     KokoroTts,
-    Qwen3Asr,
     ParakeetAsr,
     WhisperAsr,
     SortformerDiarization,
@@ -100,8 +99,6 @@ impl ModelVariant {
             | Qwen3Tts12Hz17BVoiceDesignBf16 => ModelFamily::Qwen3Tts,
             Kokoro82M => ModelFamily::KokoroTts,
             Qwen3TtsTokenizer12Hz => ModelFamily::Tokenizer,
-            Qwen3Asr06B | Qwen3Asr06B4Bit | Qwen3Asr06B8Bit | Qwen3Asr06BBf16 | Qwen3Asr17B
-            | Qwen3Asr17B4Bit | Qwen3Asr17B8Bit | Qwen3Asr17BBf16 => ModelFamily::Qwen3Asr,
             ParakeetTdt06BV2 | ParakeetTdt06BV3 => ModelFamily::ParakeetAsr,
             WhisperLargeV3Turbo => ModelFamily::WhisperAsr,
             DiarStreamingSortformer4SpkV21 => ModelFamily::SortformerDiarization,
@@ -119,7 +116,7 @@ impl ModelVariant {
     pub fn primary_task(&self) -> ModelTask {
         match self.family() {
             ModelFamily::Qwen3Tts | ModelFamily::KokoroTts => ModelTask::Tts,
-            ModelFamily::Qwen3Asr | ModelFamily::ParakeetAsr | ModelFamily::WhisperAsr => {
+            ModelFamily::ParakeetAsr | ModelFamily::WhisperAsr => {
                 ModelTask::Asr
             }
             ModelFamily::SortformerDiarization => ModelTask::Diarization,
@@ -202,15 +199,14 @@ pub fn resolve_asr_model_variant(input: Option<&str>) -> ModelVariant {
     use ModelVariant::*;
 
     let Some(raw) = input else {
-        return Qwen3Asr06B;
+        return ParakeetTdt06BV3;
     };
 
     match parse_model_variant(raw) {
-        Ok(Qwen3Asr06B4Bit | Qwen3Asr06B8Bit) => Qwen3Asr06B,
         Ok(variant) if variant.is_asr() || variant.is_voxtral() || variant.is_audio_chat() => {
             variant
         }
-        Ok(_) => Qwen3Asr06B,
+        Ok(_) => ParakeetTdt06BV3,
         Err(_) => {
             let normalized = normalize_identifier(raw);
             if normalized.contains("voxtral") {
@@ -221,15 +217,13 @@ pub fn resolve_asr_model_variant(input: Option<&str>) -> ModelVariant {
             {
                 WhisperLargeV3Turbo
             } else if normalized.contains("parakeet") {
-                if normalized.contains("v3") {
-                    ParakeetTdt06BV3
-                } else {
+                if normalized.contains("v2") {
                     ParakeetTdt06BV2
+                } else {
+                    ParakeetTdt06BV3
                 }
-            } else if normalized.contains("17") {
-                Qwen3Asr17B
             } else {
-                Qwen3Asr06B
+                ParakeetTdt06BV3
             }
         }
     }
@@ -286,24 +280,6 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
             return Some(Qwen3ForcedAligner06B4Bit);
         }
         return Some(Qwen3ForcedAligner06B);
-    }
-
-    if normalized.contains("qwen3") && normalized.contains("asr") {
-        let is_17b = normalized.contains("17b") || normalized.contains("17");
-        let q4 = normalized.contains("4bit") || normalized.contains("int4");
-        let q8 = normalized.contains("8bit") || normalized.contains("int8");
-        let bf16 = normalized.contains("bf16") || normalized.contains("bfloat16");
-
-        return Some(match (is_17b, q4, q8, bf16) {
-            (true, true, _, _) => Qwen3Asr17B4Bit,
-            (true, _, true, _) => Qwen3Asr17B8Bit,
-            (true, _, _, true) => Qwen3Asr17BBf16,
-            (true, _, _, _) => Qwen3Asr17B,
-            (false, true, _, _) => Qwen3Asr06B,
-            (false, _, true, _) => Qwen3Asr06B,
-            (false, _, _, true) => Qwen3Asr06BBf16,
-            (false, _, _, _) => Qwen3Asr06B,
-        });
     }
 
     if normalized.contains("qwen3") && normalized.contains("tts") {
@@ -548,8 +524,8 @@ mod tests {
 
     #[test]
     fn parse_by_repo_tail() {
-        let parsed = parse_model_variant("Qwen3-ASR-0.6B").unwrap();
-        assert_eq!(parsed, ModelVariant::Qwen3Asr06B);
+        let parsed = parse_model_variant("Parakeet-TDT-0.6B-v3").unwrap();
+        assert_eq!(parsed, ModelVariant::ParakeetTdt06BV3);
     }
 
     #[test]
@@ -560,7 +536,7 @@ mod tests {
 
     #[test]
     fn parse_tts_rejects_non_tts() {
-        assert!(parse_tts_model_variant("Qwen3-ASR-0.6B").is_err());
+        assert!(parse_tts_model_variant("Parakeet-TDT-0.6B-v3").is_err());
     }
 
     #[test]
@@ -571,17 +547,15 @@ mod tests {
     }
 
     #[test]
-    fn resolve_asr_fallback_defaults_to_06b() {
+    fn resolve_asr_fallback_defaults_to_parakeet_v3() {
         let resolved = resolve_asr_model_variant(Some("not-a-real-model"));
-        assert_eq!(resolved, ModelVariant::Qwen3Asr06B);
+        assert_eq!(resolved, ModelVariant::ParakeetTdt06BV3);
     }
 
     #[test]
-    fn resolve_asr_demotes_removed_qwen3_06b_quantized_variants() {
-        let q4 = resolve_asr_model_variant(Some("Qwen3-ASR-0.6B-4bit"));
-        let q8 = resolve_asr_model_variant(Some("Qwen3-ASR-0.6B-8bit"));
-        assert_eq!(q4, ModelVariant::Qwen3Asr06B);
-        assert_eq!(q8, ModelVariant::Qwen3Asr06B);
+    fn retired_qwen_asr_ids_fall_back_to_supported_default() {
+        let resolved = resolve_asr_model_variant(Some("Qwen3-ASR-1.7B"));
+        assert_eq!(resolved, ModelVariant::ParakeetTdt06BV3);
     }
 
     #[test]

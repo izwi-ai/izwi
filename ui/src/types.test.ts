@@ -11,7 +11,7 @@ describe("VIEW_CONFIGS.chat.modelFilter", () => {
   });
 
   it("continues to reject non-chat variants", () => {
-    expect(VIEW_CONFIGS.chat.modelFilter("Qwen3-ASR-0.6B")).toBe(false);
+    expect(VIEW_CONFIGS.chat.modelFilter("Parakeet-TDT-0.6B-v3")).toBe(false);
     expect(VIEW_CONFIGS.chat.modelFilter("Qwen3-TTS-12Hz-0.6B-Base")).toBe(
       false,
     );

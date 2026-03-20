@@ -8,7 +8,7 @@ const record = {
   id: "diar-review-1",
   created_at: 1,
   model_id: "diar_streaming_sortformer_4spk-v2.1",
-  asr_model_id: "Qwen3-ASR-0.6B",
+  asr_model_id: "Parakeet-TDT-0.6B-v3",
   aligner_model_id: "Qwen3-ForcedAligner-0.6B",
   llm_model_id: null,
   min_speakers: 1,

@@ -6,7 +6,7 @@ import { buildTranscriptionExport } from "@/utils/transcriptionExport";
 const record = {
   id: "transcription-export-1",
   created_at: Date.UTC(2026, 2, 10, 10, 0, 0),
-  model_id: "Qwen3-ASR-0.6B",
+  model_id: "Parakeet-TDT-0.6B-v3",
   aligner_model_id: "Qwen3-ForcedAligner-0.6B",
   language: "English",
   duration_secs: 2.5,
@@ -69,7 +69,7 @@ describe("buildTranscriptionExport", () => {
     });
 
     expect(txt.content).toContain("File: meeting.wav");
-    expect(txt.content).toContain("Model: Qwen3-ASR-0.6B");
+    expect(txt.content).toContain("Model: Parakeet-TDT-0.6B-v3");
     expect(txt.content).toContain(
       "Timestamps: Enabled (Qwen3-ForcedAligner-0.6B)",
     );

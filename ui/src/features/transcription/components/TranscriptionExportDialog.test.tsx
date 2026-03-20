@@ -7,7 +7,7 @@ import { TranscriptionExportDialog } from "@/features/transcription/components/T
 const record = {
   id: "transcription-export-dialog-1",
   created_at: 1,
-  model_id: "Qwen3-ASR-0.6B",
+  model_id: "Parakeet-TDT-0.6B-v3",
   aligner_model_id: "Qwen3-ForcedAligner-0.6B",
   language: "English",
   duration_secs: 2.5,

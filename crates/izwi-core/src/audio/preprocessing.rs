@@ -20,7 +20,7 @@ impl Default for MelConfig {
     fn default() -> Self {
         Self {
             sample_rate: 16_000,
-            n_fft: 400,      // Whisper/Qwen3-ASR uses 400 (25ms window at 16kHz)
+            n_fft: 400,      // Whisper and the retained Qwen forced-aligner stack use 25 ms windows
             hop_length: 160, // 10ms at 16kHz
             n_mels: 128,
             f_min: 0.0,
@@ -64,7 +64,7 @@ impl MelSpectrogram {
         let mel_spec = self.apply_mel_filterbank(&power_spec);
         let mut log_mel = self.log_mel(&mel_spec);
 
-        // NOTE: Qwen3-ASR may need all frames including the last one
+        // NOTE: The retained Qwen forced-aligner path may need all frames including the last one
         // Previously we did: if !log_mel.is_empty() { log_mel.pop(); }
 
         if self.config.normalize {

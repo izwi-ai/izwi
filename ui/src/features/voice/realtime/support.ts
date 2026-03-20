@@ -202,7 +202,6 @@ export function formatBytes(bytes: number): string {
 
 export function isAsrVariant(variant: string): boolean {
   return (
-    variant.includes("Qwen3-ASR") ||
     variant.includes("Whisper-Large-v3-Turbo") ||
     variant.includes("Parakeet-TDT") ||
     variant.includes("Voxtral")
@@ -217,10 +216,6 @@ export function formatModelVariantLabel(variant: string): string {
   const normalized = variant
     .replace(/-4bit\b/g, "-4-bit")
     .replace(/-8bit\b/g, "-8-bit");
-
-  if (normalized.startsWith("Qwen3-ASR-")) {
-    return normalized.replace("Qwen3-ASR-", "ASR ");
-  }
 
   if (normalized.startsWith("Parakeet-TDT-")) {
     return normalized.replace("Parakeet-TDT-", "Parakeet ");

@@ -81,30 +81,6 @@ pub enum ModelVariant {
     /// Kokoro-82M TTS model from hexgrad
     #[serde(rename = "Kokoro-82M")]
     Kokoro82M,
-    /// Qwen3-ASR 0.6B model
-    #[serde(rename = "Qwen3-ASR-0.6B")]
-    Qwen3Asr06B,
-    /// Qwen3-ASR 0.6B model (MLX 4-bit)
-    #[serde(rename = "Qwen3-ASR-0.6B-4bit")]
-    Qwen3Asr06B4Bit,
-    /// Qwen3-ASR 0.6B model (MLX 8-bit)
-    #[serde(rename = "Qwen3-ASR-0.6B-8bit")]
-    Qwen3Asr06B8Bit,
-    /// Qwen3-ASR 0.6B model (MLX bf16)
-    #[serde(rename = "Qwen3-ASR-0.6B-bf16")]
-    Qwen3Asr06BBf16,
-    /// Qwen3-ASR 1.7B model
-    #[serde(rename = "Qwen3-ASR-1.7B")]
-    Qwen3Asr17B,
-    /// Qwen3-ASR 1.7B model (MLX 4-bit)
-    #[serde(rename = "Qwen3-ASR-1.7B-4bit")]
-    Qwen3Asr17B4Bit,
-    /// Qwen3-ASR 1.7B model (MLX 8-bit)
-    #[serde(rename = "Qwen3-ASR-1.7B-8bit")]
-    Qwen3Asr17B8Bit,
-    /// Qwen3-ASR 1.7B model (MLX bf16)
-    #[serde(rename = "Qwen3-ASR-1.7B-bf16")]
-    Qwen3Asr17BBf16,
     /// Parakeet TDT 0.6B v2 ASR model (.nemo)
     #[serde(rename = "Parakeet-TDT-0.6B-v2", alias = "Parakeet-TDT-0.6B-v2-4bit")]
     ParakeetTdt06BV2,
@@ -245,14 +221,6 @@ impl ModelVariant {
             Self::Lfm2512BThinkingGguf => "LiquidAI/LFM2.5-1.2B-Thinking-GGUF",
             Self::Lfm25Audio15BGguf => "LiquidAI/LFM2.5-Audio-1.5B-GGUF",
             Self::Kokoro82M => "hexgrad/Kokoro-82M",
-            Self::Qwen3Asr06B => "Qwen/Qwen3-ASR-0.6B",
-            Self::Qwen3Asr06B4Bit => "mlx-community/Qwen3-ASR-0.6B-4bit",
-            Self::Qwen3Asr06B8Bit => "mlx-community/Qwen3-ASR-0.6B-8bit",
-            Self::Qwen3Asr06BBf16 => "mlx-community/Qwen3-ASR-0.6B-bf16",
-            Self::Qwen3Asr17B => "Qwen/Qwen3-ASR-1.7B",
-            Self::Qwen3Asr17B4Bit => "mlx-community/Qwen3-ASR-1.7B-4bit",
-            Self::Qwen3Asr17B8Bit => "mlx-community/Qwen3-ASR-1.7B-8bit",
-            Self::Qwen3Asr17BBf16 => "mlx-community/Qwen3-ASR-1.7B-bf16",
             Self::ParakeetTdt06BV2 => "nvidia/parakeet-tdt-0.6b-v2",
             Self::ParakeetTdt06BV3 => "nvidia/parakeet-tdt-0.6b-v3",
             Self::WhisperLargeV3Turbo => "openai/whisper-large-v3-turbo",
@@ -302,14 +270,6 @@ impl ModelVariant {
             Self::Lfm2512BThinkingGguf => "LFM2.5 1.2B Thinking GGUF",
             Self::Lfm25Audio15BGguf => "LFM2.5 Audio 1.5B GGUF",
             Self::Kokoro82M => "Kokoro 82M",
-            Self::Qwen3Asr06B => "Qwen3-ASR 0.6B",
-            Self::Qwen3Asr06B4Bit => "Qwen3-ASR 0.6B 4-bit",
-            Self::Qwen3Asr06B8Bit => "Qwen3-ASR 0.6B 8-bit",
-            Self::Qwen3Asr06BBf16 => "Qwen3-ASR 0.6B bf16",
-            Self::Qwen3Asr17B => "Qwen3-ASR 1.7B",
-            Self::Qwen3Asr17B4Bit => "Qwen3-ASR 1.7B 4-bit",
-            Self::Qwen3Asr17B8Bit => "Qwen3-ASR 1.7B 8-bit",
-            Self::Qwen3Asr17BBf16 => "Qwen3-ASR 1.7B bf16",
             Self::ParakeetTdt06BV2 => "Parakeet TDT 0.6B v2",
             Self::ParakeetTdt06BV3 => "Parakeet TDT 0.6B v3",
             Self::WhisperLargeV3Turbo => "Whisper Large v3 Turbo",
@@ -359,14 +319,6 @@ impl ModelVariant {
             Self::Lfm2512BThinkingGguf => "LFM2.5-1.2B-Thinking-GGUF",
             Self::Lfm25Audio15BGguf => "LFM2.5-Audio-1.5B-GGUF",
             Self::Kokoro82M => "Kokoro-82M",
-            Self::Qwen3Asr06B => "Qwen3-ASR-0.6B",
-            Self::Qwen3Asr06B4Bit => "Qwen3-ASR-0.6B-4bit",
-            Self::Qwen3Asr06B8Bit => "Qwen3-ASR-0.6B-8bit",
-            Self::Qwen3Asr06BBf16 => "Qwen3-ASR-0.6B-bf16",
-            Self::Qwen3Asr17B => "Qwen3-ASR-1.7B",
-            Self::Qwen3Asr17B4Bit => "Qwen3-ASR-1.7B-4bit",
-            Self::Qwen3Asr17B8Bit => "Qwen3-ASR-1.7B-8bit",
-            Self::Qwen3Asr17BBf16 => "Qwen3-ASR-1.7B-bf16",
             Self::ParakeetTdt06BV2 => "Parakeet-TDT-0.6B-v2",
             Self::ParakeetTdt06BV3 => "Parakeet-TDT-0.6B-v3",
             Self::WhisperLargeV3Turbo => "Whisper-Large-v3-Turbo",
@@ -416,14 +368,6 @@ impl ModelVariant {
             Self::Lfm2512BThinkingGguf => 730_895_360,  // ~0.68 GB (GGUF Q4_K_M, HF tree)
             Self::Lfm25Audio15BGguf => 1_220_000_000,   // ~1.14 GB (four-file GGUF bundle, est)
             Self::Kokoro82M => 363_323_757,             // ~346 MB (HF tree total, Apr 2025)
-            Self::Qwen3Asr06B => 1_880_619_678,         // ~1.75 GB
-            Self::Qwen3Asr06B4Bit => 712_781_279,       // ~0.66 GB
-            Self::Qwen3Asr06B8Bit => 1_010_773_761,     // ~0.94 GB
-            Self::Qwen3Asr06BBf16 => 1_569_438_434,     // ~1.46 GB
-            Self::Qwen3Asr17B => 4_703_114_308,         // ~4.38 GB
-            Self::Qwen3Asr17B4Bit => 1_607_633_106,     // ~1.50 GB
-            Self::Qwen3Asr17B8Bit => 2_467_859_030,     // ~2.30 GB
-            Self::Qwen3Asr17BBf16 => 4_080_710_353,     // ~3.80 GB
             Self::ParakeetTdt06BV2 => 4_926_457_088,    // ~4.59 GB
             Self::ParakeetTdt06BV3 => 10_036_761_167,   // ~9.35 GB
             Self::WhisperLargeV3Turbo => 1_617_824_864, // ~1.51 GB (HF x-linked-size)
@@ -472,14 +416,6 @@ impl ModelVariant {
             Self::Lfm2512BInstructGguf | Self::Lfm2512BThinkingGguf => 2.0,
             Self::Lfm25Audio15BGguf => 5.0,
             Self::Kokoro82M => 2.0,
-            Self::Qwen3Asr06B
-            | Self::Qwen3Asr06B4Bit
-            | Self::Qwen3Asr06B8Bit
-            | Self::Qwen3Asr06BBf16 => 2.5,
-            Self::Qwen3Asr17B
-            | Self::Qwen3Asr17B4Bit
-            | Self::Qwen3Asr17B8Bit
-            | Self::Qwen3Asr17BBf16 => 6.0,
             Self::ParakeetTdt06BV2 => 8.0,
             Self::ParakeetTdt06BV3 => 12.0,
             Self::WhisperLargeV3Turbo => 4.0,
@@ -515,13 +451,11 @@ impl ModelVariant {
         matches!(self.family(), crate::catalog::ModelFamily::KokoroTts)
     }
 
-    /// Whether this is a Qwen3-ASR model
+    /// Whether this is an ASR model
     pub fn is_asr(&self) -> bool {
         matches!(
             self.family(),
-            crate::catalog::ModelFamily::Qwen3Asr
-                | crate::catalog::ModelFamily::ParakeetAsr
-                | crate::catalog::ModelFamily::WhisperAsr
+            crate::catalog::ModelFamily::ParakeetAsr | crate::catalog::ModelFamily::WhisperAsr
         )
     }
 
@@ -709,12 +643,6 @@ impl ModelVariant {
                 | Self::Lfm2512BInstructGguf
                 | Self::Lfm2512BThinkingGguf
                 | Self::Lfm25Audio15BGguf
-                | Self::Qwen3Asr06B4Bit
-                | Self::Qwen3Asr06B8Bit
-                | Self::Qwen3Asr06BBf16
-                | Self::Qwen3Asr17B4Bit
-                | Self::Qwen3Asr17B8Bit
-                | Self::Qwen3Asr17BBf16
                 | Self::Qwen306B4Bit
                 | Self::Qwen317B4Bit
                 | Self::Qwen306BGguf
@@ -799,7 +727,6 @@ impl ModelVariant {
             | Self::Qwen354BGguf
             | Self::Qwen359BGguf
             | Self::Gemma31BIt
-            | Self::Qwen3Asr17B4Bit
             | Self::Qwen3Tts12Hz06BBase4Bit
             | Self::Qwen3Tts12Hz06BCustomVoice4Bit
             | Self::Qwen3Tts12Hz17BBase4Bit
@@ -844,14 +771,6 @@ impl ModelVariant {
             Self::Lfm2512BThinkingGguf,
             Self::Lfm25Audio15BGguf,
             Self::Kokoro82M,
-            Self::Qwen3Asr06B,
-            Self::Qwen3Asr06B4Bit,
-            Self::Qwen3Asr06B8Bit,
-            Self::Qwen3Asr06BBf16,
-            Self::Qwen3Asr17B,
-            Self::Qwen3Asr17B4Bit,
-            Self::Qwen3Asr17B8Bit,
-            Self::Qwen3Asr17BBf16,
             Self::ParakeetTdt06BV2,
             Self::ParakeetTdt06BV3,
             Self::WhisperLargeV3Turbo,
@@ -980,13 +899,13 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_asr_06b_quantized_variants_are_disabled() {
-        let q4 = ModelVariant::Qwen3Asr06B4Bit;
-        let q8 = ModelVariant::Qwen3Asr06B8Bit;
-        assert_eq!(q4.repo_id(), "mlx-community/Qwen3-ASR-0.6B-4bit");
-        assert_eq!(q8.repo_id(), "mlx-community/Qwen3-ASR-0.6B-8bit");
-        assert!(!q4.is_enabled());
-        assert!(!q8.is_enabled());
+    fn forced_aligner_4bit_variant_is_enabled() {
+        let variant = ModelVariant::Qwen3ForcedAligner06B4Bit;
+        assert_eq!(
+            variant.repo_id(),
+            "mlx-community/Qwen3-ForcedAligner-0.6B-4bit"
+        );
+        assert!(variant.is_enabled());
     }
 
     #[test]
@@ -1131,7 +1050,7 @@ mod tests {
 
     #[test]
     fn non_speech_variants_do_not_expose_speech_capabilities() {
-        assert_eq!(ModelVariant::Qwen3Asr06B.speech_capabilities(), None);
+        assert_eq!(ModelVariant::WhisperLargeV3Turbo.speech_capabilities(), None);
         assert_eq!(ModelVariant::Qwen38BGguf.speech_capabilities(), None);
     }
 }

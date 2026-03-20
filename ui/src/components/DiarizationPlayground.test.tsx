@@ -126,7 +126,7 @@ describe("DiarizationPlayground speaker corrections", () => {
         selectedModel="diar_streaming_sortformer_4spk-v2.1"
         selectedModelReady
         onModelRequired={vi.fn()}
-        pipelineAsrModelId="Qwen3-ASR-0.6B"
+        pipelineAsrModelId="Parakeet-TDT-0.6B-v3"
         pipelineAlignerModelId="Qwen3-ForcedAligner-0.6B"
         pipelineModelsReady
       />,
@@ -201,7 +201,7 @@ describe("DiarizationPlayground speaker corrections", () => {
       id: "diar-1",
       created_at: 1,
       model_id: "diar_streaming_sortformer_4spk-v2.1",
-      asr_model_id: "Qwen3-ASR-0.6B",
+      asr_model_id: "Parakeet-TDT-0.6B-v3",
       aligner_model_id: "Qwen3-ForcedAligner-0.6B",
       llm_model_id: "Qwen3-1.7B-GGUF",
       min_speakers: 1,
@@ -240,7 +240,7 @@ describe("DiarizationPlayground speaker corrections", () => {
       id: "diar-2",
       created_at: 2,
       model_id: "diar_streaming_sortformer_4spk-v2.1",
-      asr_model_id: "Qwen3-ASR-0.6B",
+      asr_model_id: "Parakeet-TDT-0.6B-v3",
       aligner_model_id: "Qwen3-ForcedAligner-0.6B",
       llm_model_id: "Qwen3-1.7B-GGUF",
       min_speakers: 2,
@@ -281,7 +281,7 @@ describe("DiarizationPlayground speaker corrections", () => {
         selectedModel="diar_streaming_sortformer_4spk-v2.1"
         selectedModelReady
         onModelRequired={vi.fn()}
-        pipelineAsrModelId="Qwen3-ASR-0.6B"
+        pipelineAsrModelId="Parakeet-TDT-0.6B-v3"
         pipelineAlignerModelId="Qwen3-ForcedAligner-0.6B"
         pipelineModelsReady
       />,
@@ -343,7 +343,7 @@ describe("DiarizationPlayground speaker corrections", () => {
       id: "diar-empty",
       created_at: 3,
       model_id: "diar_streaming_sortformer_4spk-v2.1",
-      asr_model_id: "Qwen3-ASR-0.6B",
+      asr_model_id: "Parakeet-TDT-0.6B-v3",
       aligner_model_id: "Qwen3-ForcedAligner-0.6B",
       llm_model_id: "Qwen3-1.7B-GGUF",
       min_speakers: 1,
@@ -375,7 +375,7 @@ describe("DiarizationPlayground speaker corrections", () => {
         selectedModel="diar_streaming_sortformer_4spk-v2.1"
         selectedModelReady
         onModelRequired={vi.fn()}
-        pipelineAsrModelId="Qwen3-ASR-0.6B"
+        pipelineAsrModelId="Parakeet-TDT-0.6B-v3"
         pipelineAlignerModelId="Qwen3-ForcedAligner-0.6B"
         pipelineModelsReady
       />,
@@ -415,7 +415,7 @@ describe("DiarizationPlayground speaker corrections", () => {
       id: "diar-live",
       created_at: 4,
       model_id: "diar_streaming_sortformer_4spk-v2.1",
-      asr_model_id: "Qwen3-ASR-0.6B",
+      asr_model_id: "Parakeet-TDT-0.6B-v3",
       aligner_model_id: "Qwen3-ForcedAligner-0.6B",
       llm_model_id: "Qwen3-1.7B-GGUF",
       min_speakers: 1,
@@ -546,7 +546,7 @@ describe("DiarizationPlayground speaker corrections", () => {
           selectedModel="diar_streaming_sortformer_4spk-v2.1"
           selectedModelReady
           onModelRequired={vi.fn()}
-          pipelineAsrModelId="Qwen3-ASR-0.6B"
+          pipelineAsrModelId="Parakeet-TDT-0.6B-v3"
           pipelineAlignerModelId="Qwen3-ForcedAligner-0.6B"
           pipelineModelsReady
         />,

@@ -33,9 +33,6 @@ export const TRANSCRIPTION_PREFERRED_MODELS = [
   "Parakeet-TDT-0.6B-v3",
   "Parakeet-TDT-0.6B-v2",
   "Whisper-Large-v3-Turbo",
-  "Qwen3-ASR-0.6B",
-  "Qwen3-ASR-1.7B-4bit",
-  "Qwen3-ASR-1.7B",
 ] as const;
 
 export const CHAT_PREFERRED_MODELS = [

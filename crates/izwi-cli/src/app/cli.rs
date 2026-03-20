@@ -239,7 +239,7 @@ pub enum Commands {
         file: PathBuf,
 
         /// Model to use
-        #[arg(short, long, default_value = "qwen3-asr-0.6b")]
+        #[arg(short, long, default_value = "parakeet-tdt-0.6b-v3")]
         model: String,
 
         /// Language hint (auto-detect if not specified)
@@ -306,7 +306,7 @@ pub enum Commands {
         transcribe: bool,
 
         /// ASR model for transcription (used with --transcribe)
-        #[arg(long, default_value = "qwen3-asr-0.6b")]
+        #[arg(long, default_value = "parakeet-tdt-0.6b-v3")]
         asr_model: String,
     },
 
@@ -495,7 +495,7 @@ pub enum BenchCommands {
     /// Benchmark ASR inference
     Asr {
         /// Model to benchmark
-        #[arg(short, long, default_value = "qwen3-asr-0.6b")]
+        #[arg(short, long, default_value = "parakeet-tdt-0.6b-v3")]
         model: String,
 
         /// Number of iterations

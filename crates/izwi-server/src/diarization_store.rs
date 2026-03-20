@@ -920,7 +920,7 @@ mod tests {
     fn sample_record() -> NewDiarizationRecord {
         NewDiarizationRecord {
             model_id: Some("diar_streaming_sortformer_4spk-v2.1".to_string()),
-            asr_model_id: Some("Qwen3-ASR-0.6B".to_string()),
+            asr_model_id: Some("Parakeet-TDT-0.6B-v3".to_string()),
             aligner_model_id: Some("Qwen3-ForcedAligner-0.6B".to_string()),
             llm_model_id: Some("Qwen3-1.7B-GGUF".to_string()),
             min_speakers: Some(1),

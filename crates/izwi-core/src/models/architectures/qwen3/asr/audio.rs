@@ -1,4 +1,4 @@
-//! Audio tower for Qwen3-ASR.
+//! Audio tower shared by the retained Qwen speech/aligner stack.
 
 use candle_core::{IndexOp, Module, Tensor, D};
 use candle_nn::ops;
@@ -12,7 +12,7 @@ use crate::models::shared::attention::flash::{
 use crate::models::shared::weights::mlx;
 
 /// Compute output length after feature extraction/downsampling.
-/// Matches upstream Qwen3-ASR `_get_feat_extract_output_lengths`.
+/// Matches upstream Qwen speech-family `_get_feat_extract_output_lengths`.
 pub fn get_cnn_output_lengths(input_lengths: &[usize]) -> Vec<usize> {
     input_lengths
         .iter()

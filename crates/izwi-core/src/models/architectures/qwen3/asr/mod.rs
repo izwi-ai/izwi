@@ -1,4 +1,4 @@
-//! Native Qwen3-ASR model loader and inference.
+//! Native Qwen speech-family loader and inference shared with Qwen3-ForcedAligner.
 
 mod audio;
 mod config;
@@ -100,7 +100,7 @@ impl Qwen3AsrModel {
         if let Some(inferred_lm_head_size) = inferred_lm_head_size {
             if inferred_lm_head_size != text_cfg.vocab_size {
                 debug!(
-                    "Overriding Qwen3-ASR lm_head output size from {} to {}",
+                    "Overriding Qwen speech-family lm_head output size from {} to {}",
                     text_cfg.vocab_size, inferred_lm_head_size
                 );
                 text_cfg.lm_head_size = Some(inferred_lm_head_size);
@@ -168,12 +168,12 @@ impl Qwen3AsrModel {
                 }
             };
             debug!(
-                "Qwen3-ASR quantized dtype selection: requested={:?}, selected={:?} on {:?}",
+                "Qwen speech-family quantized dtype selection: requested={:?}, selected={:?} on {:?}",
                 requested, selected, device.kind
             );
             selected
         } else if device.kind.is_metal() {
-            // Qwen3-ASR text decode on Metal can drift badly in fp16 on longer
+            // This Qwen speech-family text decode path can drift badly on Metal in fp16 on longer
             // utterances. Prefer f32 unless the user explicitly overrides it.
             DType::F32
         } else {
@@ -265,7 +265,7 @@ impl Qwen3AsrModel {
         let text_model = Qwen3Model::load(text_cfg, vb_text)?;
 
         info!(
-            "Loaded Qwen3-ASR model on {:?} (audio_dtype={:?}, text_dtype={:?})",
+            "Loaded Qwen speech-family model on {:?} (audio_dtype={:?}, text_dtype={:?})",
             device.kind, audio_dtype, text_dtype
         );
 
@@ -809,7 +809,7 @@ impl Qwen3AsrModel {
     }
 
     fn build_prompt(&self, audio_len: usize, language: Option<&str>) -> Result<PromptTokens> {
-        // Match upstream Qwen3-ASR prompt contract:
+        // Match the upstream Qwen speech-family prompt contract:
         // <|im_start|>system\n<|im_end|>\n
         // <|im_start|>user\n<|audio_start|><|audio_pad|>*N<|audio_end|><|im_end|>\n
         // <|im_start|>assistant\n

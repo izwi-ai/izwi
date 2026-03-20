@@ -56,11 +56,11 @@ describe("TranscriptionPlayground history", () => {
 
     render(
       <TranscriptionPlayground
-        selectedModel="Qwen3-ASR-0.6B"
+        selectedModel="Parakeet-TDT-0.6B-v3"
         selectedModelReady={true}
         modelOptions={[
           {
-            value: "Qwen3-ASR-0.6B",
+            value: "Parakeet-TDT-0.6B-v3",
             label: "Qwen3 ASR 0.6B",
             statusLabel: "Ready",
             isReady: true,
@@ -103,7 +103,7 @@ describe("TranscriptionPlayground history", () => {
     apiMocks.createTranscriptionRecord.mockResolvedValue({
       id: "transcription-upload",
       created_at: 2,
-      model_id: "Qwen3-ASR-0.6B",
+      model_id: "Parakeet-TDT-0.6B-v3",
       aligner_model_id: null,
       language: "English",
       duration_secs: 4.1,
@@ -118,11 +118,11 @@ describe("TranscriptionPlayground history", () => {
 
     const { container } = render(
       <TranscriptionPlayground
-        selectedModel="Qwen3-ASR-0.6B"
+        selectedModel="Parakeet-TDT-0.6B-v3"
         selectedModelReady={true}
         modelOptions={[
           {
-            value: "Qwen3-ASR-0.6B",
+            value: "Parakeet-TDT-0.6B-v3",
             label: "Qwen3 ASR 0.6B",
             statusLabel: "Ready",
             isReady: true,
@@ -185,7 +185,7 @@ describe("TranscriptionPlayground history", () => {
     apiMocks.createTranscriptionRecord.mockResolvedValue({
       id: "transcription-empty",
       created_at: 3,
-      model_id: "Qwen3-ASR-0.6B",
+      model_id: "Parakeet-TDT-0.6B-v3",
       aligner_model_id: null,
       language: "English",
       duration_secs: 2.4,
@@ -200,11 +200,11 @@ describe("TranscriptionPlayground history", () => {
 
     const { container } = render(
       <TranscriptionPlayground
-        selectedModel="Qwen3-ASR-0.6B"
+        selectedModel="Parakeet-TDT-0.6B-v3"
         selectedModelReady={true}
         modelOptions={[
           {
-            value: "Qwen3-ASR-0.6B",
+            value: "Parakeet-TDT-0.6B-v3",
             label: "Qwen3 ASR 0.6B",
             statusLabel: "Ready",
             isReady: true,
@@ -251,7 +251,7 @@ describe("TranscriptionPlayground history", () => {
       {
         id: "transcription-1",
         created_at: 1,
-        model_id: "Qwen3-ASR-0.6B",
+        model_id: "Parakeet-TDT-0.6B-v3",
         language: "English",
         duration_secs: 3.2,
         processing_time_ms: 160,
@@ -265,7 +265,7 @@ describe("TranscriptionPlayground history", () => {
     apiMocks.getTranscriptionRecord.mockResolvedValue({
       id: "transcription-1",
       created_at: 1,
-      model_id: "Qwen3-ASR-0.6B",
+      model_id: "Parakeet-TDT-0.6B-v3",
       aligner_model_id: null,
       language: "English",
       duration_secs: 3.2,
@@ -281,11 +281,11 @@ describe("TranscriptionPlayground history", () => {
 
     render(
       <TranscriptionPlayground
-        selectedModel="Qwen3-ASR-0.6B"
+        selectedModel="Parakeet-TDT-0.6B-v3"
         selectedModelReady={true}
         modelOptions={[
           {
-            value: "Qwen3-ASR-0.6B",
+            value: "Parakeet-TDT-0.6B-v3",
             label: "Qwen3 ASR 0.6B",
             statusLabel: "Ready",
             isReady: true,
@@ -332,7 +332,7 @@ describe("TranscriptionPlayground history", () => {
       {
         id: "transcription-1",
         created_at: 1,
-        model_id: "Qwen3-ASR-0.6B",
+        model_id: "Parakeet-TDT-0.6B-v3",
         language: "English",
         duration_secs: 3.2,
         processing_time_ms: 160,
@@ -346,7 +346,7 @@ describe("TranscriptionPlayground history", () => {
     apiMocks.getTranscriptionRecord.mockResolvedValue({
       id: "transcription-1",
       created_at: 1,
-      model_id: "Qwen3-ASR-0.6B",
+      model_id: "Parakeet-TDT-0.6B-v3",
       aligner_model_id: "Qwen3-ForcedAligner-0.6B",
       language: "English",
       duration_secs: 3.2,
@@ -374,11 +374,11 @@ describe("TranscriptionPlayground history", () => {
 
     render(
       <TranscriptionPlayground
-        selectedModel="Qwen3-ASR-0.6B"
+        selectedModel="Parakeet-TDT-0.6B-v3"
         selectedModelReady={true}
         modelOptions={[
           {
-            value: "Qwen3-ASR-0.6B",
+            value: "Parakeet-TDT-0.6B-v3",
             label: "Qwen3 ASR 0.6B",
             statusLabel: "Ready",
             isReady: true,
@@ -423,11 +423,11 @@ describe("TranscriptionPlayground history", () => {
 
     render(
       <TranscriptionPlayground
-        selectedModel="Qwen3-ASR-0.6B"
+        selectedModel="Parakeet-TDT-0.6B-v3"
         selectedModelReady={true}
         modelOptions={[
           {
-            value: "Qwen3-ASR-0.6B",
+            value: "Parakeet-TDT-0.6B-v3",
             label: "Qwen3 ASR 0.6B",
             statusLabel: "Ready",
             isReady: true,
@@ -457,11 +457,11 @@ describe("TranscriptionPlayground history", () => {
 
     render(
       <TranscriptionPlayground
-        selectedModel="Qwen3-ASR-0.6B"
+        selectedModel="Parakeet-TDT-0.6B-v3"
         selectedModelReady={true}
         modelOptions={[
           {
-            value: "Qwen3-ASR-0.6B",
+            value: "Parakeet-TDT-0.6B-v3",
             label: "Qwen3 ASR 0.6B",
             statusLabel: "Ready",
             isReady: true,

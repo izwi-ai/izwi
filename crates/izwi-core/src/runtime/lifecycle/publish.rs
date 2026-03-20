@@ -16,8 +16,7 @@ impl RuntimeService {
         } = instantiated;
 
         match family {
-            ModelFamily::Qwen3Asr
-            | ModelFamily::ParakeetAsr
+            ModelFamily::ParakeetAsr
             | ModelFamily::WhisperAsr
             | ModelFamily::Qwen3ForcedAligner
             | ModelFamily::SortformerDiarization
