@@ -3,6 +3,7 @@ import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TextToSpeechPage } from "./text-to-speech/route";
+import { TextToSpeechProjectsPage } from "./text-to-speech-projects/route";
 import { VoiceCloningPage } from "./voice-cloning/route";
 import { DiarizationPage } from "./diarization/route";
 import { TranscriptionPage } from "./transcription/route";
@@ -20,6 +21,8 @@ const apiMocks = vi.hoisted(() => ({
   getTranscriptionRecord: vi.fn(),
   deleteTranscriptionRecord: vi.fn(),
   transcriptionRecordAudioUrl: vi.fn(),
+  listTtsProjects: vi.fn(),
+  listSavedVoices: vi.fn(),
 }));
 
 vi.mock("@/api", () => ({
@@ -36,6 +39,8 @@ vi.mock("@/api", () => ({
     getTranscriptionRecord: apiMocks.getTranscriptionRecord,
     deleteTranscriptionRecord: apiMocks.deleteTranscriptionRecord,
     transcriptionRecordAudioUrl: apiMocks.transcriptionRecordAudioUrl,
+    listTtsProjects: apiMocks.listTtsProjects,
+    listSavedVoices: apiMocks.listSavedVoices,
   },
 }));
 vi.mock("../api", () => ({
@@ -52,6 +57,8 @@ vi.mock("../api", () => ({
     getTranscriptionRecord: apiMocks.getTranscriptionRecord,
     deleteTranscriptionRecord: apiMocks.deleteTranscriptionRecord,
     transcriptionRecordAudioUrl: apiMocks.transcriptionRecordAudioUrl,
+    listTtsProjects: apiMocks.listTtsProjects,
+    listSavedVoices: apiMocks.listSavedVoices,
   },
 }));
 
@@ -69,10 +76,14 @@ describe("Page header history buttons", () => {
     apiMocks.getTranscriptionRecord.mockReset();
     apiMocks.deleteTranscriptionRecord.mockReset();
     apiMocks.transcriptionRecordAudioUrl.mockReset();
+    apiMocks.listTtsProjects.mockReset();
+    apiMocks.listSavedVoices.mockReset();
 
     apiMocks.listSpeechHistoryRecords.mockResolvedValue([]);
     apiMocks.listDiarizationRecords.mockResolvedValue([]);
     apiMocks.listTranscriptionRecords.mockResolvedValue([]);
+    apiMocks.listTtsProjects.mockResolvedValue([]);
+    apiMocks.listSavedVoices.mockResolvedValue([]);
 
     HTMLElement.prototype.scrollIntoView = vi.fn();
   });
@@ -89,6 +100,7 @@ describe("Page header history buttons", () => {
     onDelete: vi.fn(),
     onSelect: vi.fn(),
     onError: vi.fn(),
+    onRefresh: vi.fn().mockResolvedValue(undefined),
   };
 
   it.each([
@@ -107,5 +119,24 @@ describe("Page header history buttons", () => {
     expect(within(slot).getByRole("button", { name: /History/i })).not.toHaveClass(
       "fixed",
     );
+  });
+
+  it("TextToSpeechProjectsPage renders project actions in the page header slot", async () => {
+    render(
+      <MemoryRouter>
+        <TextToSpeechProjectsPage {...baseProps} />
+      </MemoryRouter>,
+    );
+
+    const slot = screen.getByTestId("page-header-history-slot");
+
+    await waitFor(() =>
+      expect(
+        within(slot).getByRole("button", { name: /New project/i }),
+      ).toBeInTheDocument(),
+    );
+    expect(
+      within(slot).getByRole("button", { name: /Project Library/i }),
+    ).toBeInTheDocument();
   });
 });
