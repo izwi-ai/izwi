@@ -43,36 +43,25 @@ vi.mock("./VoiceClone", () => ({
 }));
 
 describe("VoiceCaptureWorkspace", () => {
-  it("shows guidance before a voice profile is available", () => {
-    render(<VoiceCaptureWorkspace onUseInTts={vi.fn()} />);
+  it("renders clone workflow guidance", () => {
+    render(<VoiceCaptureWorkspace />);
 
     expect(
       screen.getByText(
-        "Save a voice profile to enable one-click use in Text to Speech.",
+        "Upload or record a clean reference with transcript, then save a reusable voice profile.",
       ),
     ).toBeInTheDocument();
   });
 
-  it("requires rights confirmation before enabling TTS handoff", () => {
-    const handleUseInTts = vi.fn();
-    render(<VoiceCaptureWorkspace onUseInTts={handleUseInTts} />);
+  it("notifies when a saved voice is created", () => {
+    const handleVoiceSaved = vi.fn();
+    render(<VoiceCaptureWorkspace onVoiceSaved={handleVoiceSaved} />);
 
     fireEvent.click(screen.getByRole("button", { name: "Save Voice" }));
 
     expect(
-      screen.getByText("Confirm rights to unlock direct handoff to Text to Speech."),
+      screen.getByText("Voice profile saved successfully."),
     ).toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "Use in TTS" }),
-    ).not.toBeInTheDocument();
-
-    fireEvent.click(
-      screen.getByRole("checkbox", {
-        name: /I have permission to clone this voice/i,
-      }),
-    );
-    fireEvent.click(screen.getByRole("button", { name: "Use in TTS" }));
-
-    expect(handleUseInTts).toHaveBeenCalledWith("saved-voice");
+    expect(handleVoiceSaved).toHaveBeenCalledWith("saved-voice");
   });
 });

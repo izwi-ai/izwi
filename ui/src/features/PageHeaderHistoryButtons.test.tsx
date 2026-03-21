@@ -4,7 +4,6 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TextToSpeechPage } from "./text-to-speech/route";
 import { VoiceCloningPage } from "./voice-cloning/route";
-import { VoiceDesignPage } from "./voice-design/route";
 import { DiarizationPage } from "./diarization/route";
 import { TranscriptionPage } from "./transcription/route";
 
@@ -95,7 +94,6 @@ describe("Page header history buttons", () => {
   it.each([
     ["TextToSpeechPage", <TextToSpeechPage {...baseProps} />],
     ["VoiceCloningPage", <VoiceCloningPage {...baseProps} />],
-    ["VoiceDesignPage", <VoiceDesignPage {...baseProps} />],
     ["DiarizationPage", <DiarizationPage {...baseProps} />],
     ["TranscriptionPage", <TranscriptionPage {...baseProps} />],
   ])("%s renders the history button in the page header slot", async (_, ui) => {
