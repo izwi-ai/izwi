@@ -809,6 +809,7 @@ export function DiarizationHistoryPanel({
                           record={activeHistoryRecord}
                           audioUrl={selectedHistoryAudioUrl}
                           loading={selectedHistoryLoading}
+                          autoScrollActiveEntry={true}
                           emptyMessage={
                             normalizedActiveTranscript ||
                             "No transcript text available for this record."

@@ -68,6 +68,7 @@ describe("DiarizationReviewWorkspace", () => {
     vi.spyOn(window.HTMLMediaElement.prototype, "pause").mockImplementation(
       () => {},
     );
+    HTMLElement.prototype.scrollIntoView = vi.fn();
   });
 
   it("supports transcript seeking and active-row highlighting", () => {
@@ -114,5 +115,47 @@ describe("DiarizationReviewWorkspace", () => {
     fireEvent.timeUpdate(audio!);
 
     expect(secondRow).toHaveAttribute("data-active", "true");
+  });
+
+  it("auto-scrolls the active transcript entry into view during playback when enabled", () => {
+    const { container } = render(
+      <DiarizationReviewWorkspace
+        record={record}
+        audioUrl="/audio/meeting.wav"
+        autoScrollActiveEntry={true}
+      />,
+    );
+
+    const audio = container.querySelector("audio");
+    expect(audio).not.toBeNull();
+
+    Object.defineProperty(audio, "duration", {
+      configurable: true,
+      value: 6,
+    });
+    Object.defineProperty(audio, "currentTime", {
+      configurable: true,
+      writable: true,
+      value: 0,
+    });
+
+    fireEvent.loadedMetadata(audio!);
+    fireEvent.play(audio!);
+
+    const scrollSpy = vi.spyOn(HTMLElement.prototype, "scrollIntoView");
+    scrollSpy.mockClear();
+
+    audio!.currentTime = 4.2;
+    fireEvent.timeUpdate(audio!);
+
+    expect(screen.getByText("Response.").closest("button")).toHaveAttribute(
+      "data-active",
+      "true",
+    );
+    expect(scrollSpy).toHaveBeenCalledWith({
+      behavior: "smooth",
+      block: "center",
+      inline: "nearest",
+    });
   });
 });

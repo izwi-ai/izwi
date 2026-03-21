@@ -35,6 +35,7 @@ interface DiarizationReviewWorkspaceProps {
   loading?: boolean;
   emptyTitle?: string;
   emptyMessage?: string;
+  autoScrollActiveEntry?: boolean;
 }
 
 type SpeakerAccent = {
@@ -92,8 +93,11 @@ export function DiarizationReviewWorkspace({
   loading = false,
   emptyTitle = "Ready to diarize",
   emptyMessage = "No diarization transcript is available yet.",
+  autoScrollActiveEntry = false,
 }: DiarizationReviewWorkspaceProps) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const transcriptEntryRefs = useRef(new Map<number, HTMLButtonElement>());
+  const lastAutoScrolledEntryRef = useRef<number | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -149,7 +153,31 @@ export function DiarizationReviewWorkspace({
     setIsPlaying(false);
     setPlaybackRate(1);
     setAudioError(null);
+    lastAutoScrolledEntryRef.current = null;
   }, [audioUrl, record?.id]);
+
+  useEffect(() => {
+    if (!isPlaying) {
+      lastAutoScrolledEntryRef.current = null;
+    }
+  }, [isPlaying]);
+
+  useEffect(() => {
+    if (!autoScrollActiveEntry || !isPlaying || activeEntryIndex < 0) {
+      return;
+    }
+    if (lastAutoScrolledEntryRef.current === activeEntryIndex) {
+      return;
+    }
+
+    const activeEntry = transcriptEntryRefs.current.get(activeEntryIndex);
+    activeEntry?.scrollIntoView({
+      block: "center",
+      behavior: "smooth",
+      inline: "nearest",
+    });
+    lastAutoScrolledEntryRef.current = activeEntryIndex;
+  }, [activeEntryIndex, autoScrollActiveEntry, isPlaying]);
 
   async function togglePlayback(): Promise<void> {
     const audio = audioRef.current;
@@ -266,6 +294,13 @@ export function DiarizationReviewWorkspace({
                     key={`${entry.speaker}-${entry.start}-${entry.end}-${index}`}
                     type="button"
                     onClick={() => seek(entry.start)}
+                    ref={(element) => {
+                      if (element) {
+                        transcriptEntryRefs.current.set(index, element);
+                      } else {
+                        transcriptEntryRefs.current.delete(index);
+                      }
+                    }}
                     className="w-full rounded-lg border px-3.5 py-3 text-left transition-colors"
                     data-active={active ? "true" : "false"}
                     style={{
