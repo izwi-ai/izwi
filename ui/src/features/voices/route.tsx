@@ -15,7 +15,6 @@ import { api } from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import { VoicePicker, type VoicePickerItem } from "@/components/VoicePicker";
 import {
-  VOICE_ROUTE_BODY_COPY_CLASS,
   VOICE_ROUTE_META_COPY_CLASS,
   VOICE_ROUTE_PANEL_TITLE_CLASS,
 } from "@/components/voiceRouteTypography";
@@ -432,18 +431,6 @@ export function VoicesPage({
         : filteredBuiltInVoices.length;
   const activeResultsLabel =
     activeResultCount === 1 ? "1 result" : `${activeResultCount} results`;
-  const activePanelTitle =
-    activeTab === "all"
-      ? "Voice Library"
-      : activeTab === "saved"
-        ? "Your Saved Voices"
-        : "Built-in Voices";
-  const activePanelDescription =
-    activeTab === "all"
-      ? "Browse reusable saved voices and the active model's built-in speakers in one unified library."
-      : activeTab === "saved"
-        ? "Saved voices from voice cloning and voice design are ready for direct text-to-speech reuse."
-        : "Built-in voices depend on the active model. Generate a preview, then hand off to text-to-speech.";
   const showBuiltInMeta = activeTab === "built-in" || activeTab === "all";
   const showSavedVoiceError =
     savedVoicesError && (activeTab === "saved" || activeTab === "all");
@@ -463,35 +450,7 @@ export function VoicesPage({
         onValueChange={(value) => setActiveTab(value as VoiceLibraryTab)}
         className="w-full"
       >
-        <TabsList className="grid h-10 w-full max-w-[30rem] grid-cols-3 overflow-hidden rounded-[var(--radius-pill)] border-[var(--border-strong)] bg-[var(--bg-surface-2)] p-[2px] shadow-none">
-          <TabsTrigger
-            value="all"
-            className="h-full rounded-[var(--radius-pill)] px-3 text-[13px] font-semibold text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
-          >
-            All Voices
-          </TabsTrigger>
-          <TabsTrigger
-            value="saved"
-            className="h-full gap-2 rounded-[var(--radius-pill)] px-3 text-[13px] font-semibold text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
-          >
-            <span>My Voices</span>
-            <span className="rounded-full border border-current/20 px-2 py-0.5 text-[10px] font-semibold">
-              {totalSavedVoices}
-            </span>
-          </TabsTrigger>
-          <TabsTrigger
-            value="built-in"
-            className="h-full gap-2 rounded-[var(--radius-pill)] px-3 text-[13px] font-semibold text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
-          >
-            <span>Built-in Voices</span>
-            <span className="rounded-full border border-current/20 px-2 py-0.5 text-[10px] font-semibold">
-              {totalBuiltInVoices}
-            </span>
-          </TabsTrigger>
-        </TabsList>
-      </Tabs>
-
-      <div className="mt-5 grid gap-5 xl:grid-cols-[260px_minmax(0,1fr)]">
+        <div className="grid gap-5 xl:grid-cols-[260px_minmax(0,1fr)]">
         <aside>
           <WorkspacePanel className="p-5">
             <div className="flex items-start justify-between gap-3">
@@ -596,37 +555,57 @@ export function VoicesPage({
         </aside>
 
         <WorkspacePanel className="p-5 sm:p-6">
-          <div className="flex flex-col gap-4 border-b border-[var(--border-muted)] pb-4 sm:flex-row sm:items-start sm:justify-between">
-            <div className="min-w-0">
-              <h3 className={cn(VOICE_ROUTE_PANEL_TITLE_CLASS, "text-xl")}>
-                {activePanelTitle}
-              </h3>
-              <p className={cn(VOICE_ROUTE_BODY_COPY_CLASS, "mt-1 max-w-3xl")}>
-                {activePanelDescription}
-              </p>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2 text-xs">
-              <StatusBadge>{activeResultsLabel.toUpperCase()}</StatusBadge>
-              {savedVoiceFilter !== "all" &&
-              (activeTab === "saved" || activeTab === "all") ? (
-                <StatusBadge>
-                  {savedVoiceFilter === "voice_cloning" ? "CLONED" : "DESIGNED"}
-                </StatusBadge>
-              ) : null}
-              {showBuiltInMeta && resolvedSelectedModel ? (
-                <StatusBadge>{resolvedSelectedModel}</StatusBadge>
-              ) : null}
-              {showBuiltInMeta ? (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={openModelManager}
-                  className="h-8 bg-[var(--bg-surface-1)] text-xs"
+          <div className="flex flex-col gap-4 border-b border-[var(--border-muted)] pb-4">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <TabsList className="grid h-10 w-full max-w-[30rem] grid-cols-3 overflow-hidden rounded-[var(--radius-pill)] border-[var(--border-strong)] bg-[var(--bg-surface-2)] p-[2px] shadow-none">
+                <TabsTrigger
+                  value="all"
+                  className="h-full rounded-[var(--radius-pill)] px-3 text-[13px] font-semibold text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
                 >
-                  Model
-                </Button>
-              ) : null}
+                  All Voices
+                </TabsTrigger>
+                <TabsTrigger
+                  value="saved"
+                  className="h-full gap-2 rounded-[var(--radius-pill)] px-3 text-[13px] font-semibold text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
+                >
+                  <span>My Voices</span>
+                  <span className="rounded-full border border-current/20 px-2 py-0.5 text-[10px] font-semibold">
+                    {totalSavedVoices}
+                  </span>
+                </TabsTrigger>
+                <TabsTrigger
+                  value="built-in"
+                  className="h-full gap-2 rounded-[var(--radius-pill)] px-3 text-[13px] font-semibold text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
+                >
+                  <span>Built-in Voices</span>
+                  <span className="rounded-full border border-current/20 px-2 py-0.5 text-[10px] font-semibold">
+                    {totalBuiltInVoices}
+                  </span>
+                </TabsTrigger>
+              </TabsList>
+
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <StatusBadge>{activeResultsLabel.toUpperCase()}</StatusBadge>
+                {savedVoiceFilter !== "all" &&
+                (activeTab === "saved" || activeTab === "all") ? (
+                  <StatusBadge>
+                    {savedVoiceFilter === "voice_cloning" ? "CLONED" : "DESIGNED"}
+                  </StatusBadge>
+                ) : null}
+                {showBuiltInMeta && resolvedSelectedModel ? (
+                  <StatusBadge>{resolvedSelectedModel}</StatusBadge>
+                ) : null}
+                {showBuiltInMeta ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={openModelManager}
+                    className="h-8 bg-[var(--bg-surface-1)] text-xs"
+                  >
+                    Model
+                  </Button>
+                ) : null}
+              </div>
             </div>
           </div>
 
@@ -683,6 +662,7 @@ export function VoicesPage({
           />
         </WorkspacePanel>
       </div>
+      </Tabs>
     </div>
   );
 
