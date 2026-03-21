@@ -328,7 +328,7 @@ export function VoicesPage({
         <>
           <Button
             size="sm"
-            className="h-12 rounded-[var(--radius-pill)] px-5 text-sm"
+            className="h-9 rounded-[var(--radius-pill)] px-4 text-sm"
             onClick={(event) => {
               event.stopPropagation();
               handleUseSavedVoice(voice.id);
@@ -340,7 +340,7 @@ export function VoicesPage({
           <Button
             variant="outline"
             size="sm"
-            className="h-12 rounded-[var(--radius-pill)] border-[var(--border-strong)] bg-[var(--bg-surface-1)]/72 px-5 text-sm"
+            className="h-9 rounded-[var(--radius-pill)] border-[var(--border-strong)] bg-[var(--bg-surface-1)]/72 px-4 text-sm"
             onClick={(event) => {
               event.stopPropagation();
               void handleDeleteVoice(voice.id);
@@ -381,7 +381,7 @@ export function VoicesPage({
               event.stopPropagation();
               handleUseBuiltInVoice(voice.id);
             }}
-            className="h-12 rounded-[var(--radius-pill)] px-5 text-sm"
+            className="h-9 rounded-[var(--radius-pill)] px-4 text-sm"
           >
             <Mic2 className="h-4 w-4" />
             Use in TTS
@@ -394,7 +394,7 @@ export function VoicesPage({
               void handlePreviewBuiltInVoice(voice.id, voice.language);
             }}
             disabled={previewLoadingVoiceId === voice.id}
-            className="h-12 rounded-[var(--radius-pill)] border-[var(--border-strong)] bg-[var(--bg-surface-1)]/72 px-5 text-sm"
+            className="h-9 rounded-[var(--radius-pill)] border-[var(--border-strong)] bg-[var(--bg-surface-1)]/72 px-4 text-sm"
           >
             {previewLoadingVoiceId === voice.id ? (
               <Loader2 className="h-4 w-4 animate-spin" />
@@ -461,16 +461,16 @@ export function VoicesPage({
             onValueChange={(value) => setActiveTab(value as VoiceLibraryTab)}
             className="w-full"
           >
-            <TabsList className="grid w-full max-w-[30rem] grid-cols-3 border-[var(--border-strong)] bg-[var(--bg-surface-2)] p-1">
+            <TabsList className="grid h-10 w-full max-w-[30rem] grid-cols-3 overflow-hidden rounded-[var(--radius-pill)] border-[var(--border-strong)] bg-[var(--bg-surface-2)] p-[2px] shadow-none">
               <TabsTrigger
                 value="all"
-                className="justify-center gap-2 text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)]"
+                className="h-full rounded-[var(--radius-pill)] px-3 text-[13px] font-semibold text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
               >
                 All Voices
               </TabsTrigger>
               <TabsTrigger
                 value="saved"
-                className="justify-center gap-2 text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)]"
+                className="h-full rounded-[var(--radius-pill)] px-3 text-[13px] font-semibold text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
               >
                 <span>My Voices</span>
                 <span className="rounded-full border border-current/20 px-2 py-0.5 text-[10px] font-semibold">
@@ -479,7 +479,7 @@ export function VoicesPage({
               </TabsTrigger>
               <TabsTrigger
                 value="built-in"
-                className="justify-center gap-2 text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)]"
+                className="h-full rounded-[var(--radius-pill)] px-3 text-[13px] font-semibold text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
               >
                 <span>Built-in Voices</span>
                 <span className="rounded-full border border-current/20 px-2 py-0.5 text-[10px] font-semibold">
@@ -494,7 +494,7 @@ export function VoicesPage({
           <aside>
             <WorkspacePanel className="p-5">
               <div className="flex items-start justify-between gap-3">
-                <h3 className={cn(VOICE_ROUTE_PANEL_TITLE_CLASS, "text-[1.65rem]")}>
+                <h3 className={cn(VOICE_ROUTE_PANEL_TITLE_CLASS, "text-lg")}>
                   Library Statistics
                 </h3>
                 <Button
@@ -534,7 +534,7 @@ export function VoicesPage({
               </dl>
 
               <div className="mt-5 border-t border-[var(--border-muted)] pt-5">
-                <h4 className={cn(VOICE_ROUTE_PANEL_TITLE_CLASS, "text-[1.35rem]")}>
+                <h4 className={cn(VOICE_ROUTE_PANEL_TITLE_CLASS, "text-base")}>
                   Filter By
                 </h4>
                 <div role="radiogroup" className="mt-3 space-y-2">
@@ -570,7 +570,7 @@ export function VoicesPage({
               </div>
 
               <div className="mt-5 border-t border-[var(--border-muted)] pt-5">
-                <h4 className={cn(VOICE_ROUTE_PANEL_TITLE_CLASS, "text-[1.35rem]")}>
+                <h4 className={cn(VOICE_ROUTE_PANEL_TITLE_CLASS, "text-base")}>
                   Search
                 </h4>
                 <div className="relative mt-3">
@@ -586,7 +586,7 @@ export function VoicesPage({
 
               <Button
                 onClick={() => navigate("/voice-design")}
-                className="mt-5 h-11 w-full rounded-[var(--radius-pill)] text-sm"
+                className="mt-5 h-9 w-full rounded-[var(--radius-pill)] text-sm"
               >
                 <Plus className="h-4 w-4" />
                 Add New Voice
@@ -597,7 +597,7 @@ export function VoicesPage({
           <WorkspacePanel className="p-5 sm:p-6">
             <div className="flex flex-col gap-4 border-b border-[var(--border-muted)] pb-4 sm:flex-row sm:items-start sm:justify-between">
               <div className="min-w-0">
-                <h3 className={cn(VOICE_ROUTE_PANEL_TITLE_CLASS, "text-[2rem]")}>
+                <h3 className={cn(VOICE_ROUTE_PANEL_TITLE_CLASS, "text-xl")}>
                   {activePanelTitle}
                 </h3>
                 <p className={cn(VOICE_ROUTE_BODY_COPY_CLASS, "mt-1 max-w-3xl")}>
