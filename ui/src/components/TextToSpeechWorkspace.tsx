@@ -29,7 +29,6 @@ import type { VoicePickerItem } from "@/components/VoicePicker";
 import { VoiceSelect } from "@/components/VoiceSelect";
 import { RouteModelSelect } from "@/components/RouteModelSelect";
 import { GenerationStats } from "@/components/GenerationStats";
-import { TextToSpeechProjectsWorkspace } from "@/components/TextToSpeechProjectsWorkspace";
 import {
   VOICE_ROUTE_BODY_COPY_CLASS,
   VOICE_ROUTE_META_COPY_CLASS,
@@ -41,7 +40,6 @@ import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
 import { StatePanel } from "@/components/ui/state-panel";
 import { StatusBadge } from "@/components/ui/status-badge";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   WorkspacePanel,
   WorkspaceSectionLabel,
@@ -74,7 +72,6 @@ interface TextToSpeechWorkspaceProps {
 }
 
 type VoiceMode = "saved" | "built_in";
-type WorkspaceMode = "quick" | "projects";
 
 const MAX_BUFFERED_PCM_BYTES = 256 * 1024 * 1024;
 const ABORT_ERROR_NAME = "AbortError";
@@ -220,7 +217,6 @@ export function TextToSpeechWorkspace({
   initialSavedVoiceId,
   initialSpeaker,
 }: TextToSpeechWorkspaceProps) {
-  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("quick");
   const [text, setText] = useState("");
   const [voiceMode, setVoiceMode] = useState<VoiceMode>(
     initialSavedVoiceId ? "saved" : "built_in",
@@ -958,21 +954,20 @@ export function TextToSpeechWorkspace({
         key: "Enter",
         metaKey: true,
         allowInInputs: true,
-        enabled: workspaceMode === "quick" && !generating && canGenerate,
+        enabled: !generating && canGenerate,
         action: () => {
           void handleGenerate();
         },
       },
       {
         key: "Escape",
-        enabled:
-          workspaceMode === "quick" && (Boolean(audioUrl) || isStreaming || generating),
+        enabled: Boolean(audioUrl) || isStreaming || generating,
         action: handleStop,
       },
       {
         key: "Escape",
         shiftKey: true,
-        enabled: workspaceMode === "quick",
+        enabled: true,
         action: handleReset,
       },
     ],
@@ -984,7 +979,6 @@ export function TextToSpeechWorkspace({
       handleReset,
       handleStop,
       isStreaming,
-      workspaceMode,
     ],
   );
 
@@ -1002,167 +996,119 @@ export function TextToSpeechWorkspace({
     />
   );
 
-  const renderWorkflowTabs = () => (
-    <Tabs
-      value={workspaceMode}
-      onValueChange={(value) => setWorkspaceMode(value as WorkspaceMode)}
-      className="w-full max-w-sm"
-    >
-      <TabsList className="grid w-full grid-cols-2 border-[var(--border-strong)] bg-[var(--bg-surface-2)] p-1 shadow-sm">
-        <TabsTrigger
-          value="quick"
-          className="text-[var(--text-muted)] data-[state=active]:bg-[var(--accent-solid)] data-[state=active]:text-[var(--text-on-accent)] data-[state=active]:shadow-[0_8px_20px_-14px_rgba(17,17,17,0.55)]"
-        >
-          Quick
-        </TabsTrigger>
-        <TabsTrigger
-          value="projects"
-          className="text-[var(--text-muted)] data-[state=active]:bg-[var(--accent-solid)] data-[state=active]:text-[var(--text-on-accent)] data-[state=active]:shadow-[0_8px_20px_-14px_rgba(17,17,17,0.55)]"
-        >
-          Projects
-        </TabsTrigger>
-      </TabsList>
-    </Tabs>
-  );
-
-  if (workspaceMode === "projects") {
-    return (
-      <div className="grid items-start gap-5 pb-4 sm:pb-5">
-        <div className="flex flex-col">
-          <div>{renderWorkflowTabs()}</div>
-          <div className="mt-4">
-            <TextToSpeechProjectsWorkspace
-              selectedModel={selectedModel}
-              selectedModelInfo={selectedModelInfo}
-              availableModels={availableModels}
-              modelOptions={modelOptions}
-              headerActionContainer={historyActionContainer}
-              onSelectModel={onSelectModel}
-              onOpenModelManager={onOpenModelManager}
-              onModelRequired={onModelRequired}
-              onError={onError}
-            />
-          </div>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div className="grid items-start gap-5 pb-4 sm:pb-5">
       <div className="flex flex-col">
-        <div>{renderWorkflowTabs()}</div>
-        <div className="mt-4">
-          <WorkspacePanel className="mb-5 p-4">
-            <div className="grid gap-x-5 gap-y-4 xl:grid-cols-[minmax(0,360px)_minmax(0,360px)_minmax(0,1fr)_auto]">
-              <div className="min-w-0">
-                <WorkspaceSectionLabel>Active Model</WorkspaceSectionLabel>
-                <div className="mt-3 w-full max-w-[360px]">{renderModelSelector()}</div>
-                <StatusBadge
-                  tone={selectedModelReady ? "success" : "warning"}
-                  className="mt-3"
-                >
-                  {selectedOption?.statusLabel ||
-                    "Select and load a TTS model to continue"}
-                </StatusBadge>
-              </div>
-
-              <div className="min-w-0">
-                <WorkspaceSectionLabel>Voice</WorkspaceSectionLabel>
-                <div className="mt-3 w-full max-w-[360px]">
-                  {supportsVoiceSelection ? (
-                    <VoiceSelect
-                      voiceMode={voiceMode}
-                      onVoiceModeChange={setVoiceMode}
-                      savedVoiceItems={savedVoiceItems}
-                      builtInVoiceItems={builtInVoiceItems}
-                      selectedItem={selectedVoiceItem}
-                      savedVoicesLoading={savedVoicesLoading}
-                      savedVoicesError={savedVoicesError}
-                      savedEnabled={supportsReferenceVoices}
-                      builtInEnabled={supportsBuiltInVoices}
-                      disabled={!selectedModel}
-                      modelLabel={selectedModelInfo?.variant ?? selectedModel}
-                      compact
-                    />
-                  ) : (
-                    <div className="rounded-[var(--radius-md)] border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3.5 py-3">
-                      <div className="text-sm font-medium text-[var(--text-primary)]">
-                        {requiresVoiceDescriptionOnly
-                          ? "Voice direction prompt"
-                          : "No voice modes available"}
-                      </div>
-                      <p className="mt-1 text-xs leading-relaxed text-[var(--text-muted)]">
-                        {requiresVoiceDescriptionOnly
-                          ? "This model renders directly from the style prompt in Delivery Controls."
-                          : "Switch to a model with built-in, saved, or style-prompt voice support."}
-                      </p>
-                    </div>
-                  )}
-                </div>
-                <p className="mt-3 text-[11px] font-medium text-[var(--text-muted)]">
-                  {supportsVoiceSelection
-                    ? "Voice availability follows the selected model instead of switching models automatically."
-                    : requiresVoiceDescriptionOnly
-                      ? "This model family uses style prompts instead of voice pickers."
-                      : "Choose a compatible model to unlock voice selection controls."}
-                </p>
-              </div>
-
-              {onOpenModelManager ? (
-                <div className="xl:col-start-4 xl:row-start-1 xl:mt-[1.8rem] xl:justify-self-end">
-                  <Button
-                    variant="outline"
-                    onClick={onOpenModelManager}
-                    className="h-11 shrink-0 rounded-xl px-4"
-                  >
-                    <Settings2 className="h-4 w-4" />
-                    Models
-                  </Button>
-                </div>
-              ) : null}
+        <WorkspacePanel className="mb-5 p-4">
+          <div className="grid gap-x-5 gap-y-4 xl:grid-cols-[minmax(0,360px)_minmax(0,360px)_minmax(0,1fr)_auto]">
+            <div className="min-w-0">
+              <WorkspaceSectionLabel>Active Model</WorkspaceSectionLabel>
+              <div className="mt-3 w-full max-w-[360px]">{renderModelSelector()}</div>
+              <StatusBadge
+                tone={selectedModelReady ? "success" : "warning"}
+                className="mt-3"
+              >
+                {selectedOption?.statusLabel ||
+                  "Select and load a TTS model to continue"}
+              </StatusBadge>
             </div>
-          </WorkspacePanel>
 
-          <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_420px]">
-            <div className="space-y-6">
-              <WorkspacePanel className="p-5">
-                <label className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-2 block")}>
-                  Script
-                </label>
-                <textarea
-                  ref={textareaRef}
-                  value={text}
-                  onChange={(event) => setText(event.target.value)}
-                  rows={8}
-                  placeholder="Paste the text you want this voice to speak..."
-                  className="textarea min-h-[220px] w-full bg-[var(--bg-surface-1)] border-[var(--border-muted)] py-4 text-base leading-relaxed"
-                />
-              </WorkspacePanel>
-
-              <WorkspacePanel className="p-5">
-                <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-                  <div>
-                    <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-2")}>
-                      Delivery Controls
+            <div className="min-w-0">
+              <WorkspaceSectionLabel>Voice</WorkspaceSectionLabel>
+              <div className="mt-3 w-full max-w-[360px]">
+                {supportsVoiceSelection ? (
+                  <VoiceSelect
+                    voiceMode={voiceMode}
+                    onVoiceModeChange={setVoiceMode}
+                    savedVoiceItems={savedVoiceItems}
+                    builtInVoiceItems={builtInVoiceItems}
+                    selectedItem={selectedVoiceItem}
+                    savedVoicesLoading={savedVoicesLoading}
+                    savedVoicesError={savedVoicesError}
+                    savedEnabled={supportsReferenceVoices}
+                    builtInEnabled={supportsBuiltInVoices}
+                    disabled={!selectedModel}
+                    modelLabel={selectedModelInfo?.variant ?? selectedModel}
+                    compact
+                  />
+                ) : (
+                  <div className="rounded-[var(--radius-md)] border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3.5 py-3">
+                    <div className="text-sm font-medium text-[var(--text-primary)]">
+                      {requiresVoiceDescriptionOnly
+                        ? "Voice direction prompt"
+                        : "No voice modes available"}
                     </div>
-                    <div className={VOICE_ROUTE_BODY_COPY_CLASS}>
-                      {supportsSpeedControl
-                        ? "Speed is saved with the generation history. Streaming appears only when the selected model exposes it."
-                        : "This model uses a fixed speaking rate. Streaming appears only when the selected model exposes it."}
-                    </div>
+                    <p className="mt-1 text-xs leading-relaxed text-[var(--text-muted)]">
+                      {requiresVoiceDescriptionOnly
+                        ? "This model renders directly from the style prompt in Delivery Controls."
+                        : "Switch to a model with built-in, saved, or style-prompt voice support."}
+                    </p>
                   </div>
-                  {supportsVoiceDescription && !requiresVoiceDescriptionOnly ? (
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => setShowAdvanced((current) => !current)}
-                    >
-                      <Sparkles className="h-4 w-4" />
-                      {showAdvanced ? "Hide" : "Show"} advanced
-                    </Button>
-                  ) : null}
+                )}
+              </div>
+              <p className="mt-3 text-[11px] font-medium text-[var(--text-muted)]">
+                {supportsVoiceSelection
+                  ? "Voice availability follows the selected model instead of switching models automatically."
+                  : requiresVoiceDescriptionOnly
+                    ? "This model family uses style prompts instead of voice pickers."
+                    : "Choose a compatible model to unlock voice selection controls."}
+              </p>
+            </div>
+
+            {onOpenModelManager ? (
+              <div className="xl:col-start-4 xl:row-start-1 xl:mt-[1.8rem] xl:justify-self-end">
+                <Button
+                  variant="outline"
+                  onClick={onOpenModelManager}
+                  className="h-11 shrink-0 rounded-xl px-4"
+                >
+                  <Settings2 className="h-4 w-4" />
+                  Models
+                </Button>
+              </div>
+            ) : null}
+          </div>
+        </WorkspacePanel>
+
+        <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_420px]">
+          <div className="space-y-6">
+            <WorkspacePanel className="p-5">
+              <label className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-2 block")}>
+                Script
+              </label>
+              <textarea
+                ref={textareaRef}
+                value={text}
+                onChange={(event) => setText(event.target.value)}
+                rows={8}
+                placeholder="Paste the text you want this voice to speak..."
+                className="textarea min-h-[220px] w-full bg-[var(--bg-surface-1)] border-[var(--border-muted)] py-4 text-base leading-relaxed"
+              />
+            </WorkspacePanel>
+
+            <WorkspacePanel className="p-5">
+              <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                <div className="min-w-0">
+                  <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-2")}>
+                    Delivery Controls
+                  </div>
+                  <div className={VOICE_ROUTE_BODY_COPY_CLASS}>
+                    {supportsSpeedControl
+                      ? "Speed is saved with the generation history. Streaming appears only when the selected model exposes it."
+                      : "This model uses a fixed speaking rate. Streaming appears only when the selected model exposes it."}
+                  </div>
                 </div>
+                {supportsVoiceDescription && !requiresVoiceDescriptionOnly ? (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setShowAdvanced((current) => !current)}
+                  >
+                    <Sparkles className="h-4 w-4" />
+                    {showAdvanced ? "Hide" : "Show"} advanced
+                  </Button>
+                ) : null}
+              </div>
 
                 <div className="mt-4 grid gap-4 sm:grid-cols-[minmax(0,1fr)_320px]">
                   <div className="space-y-2">
@@ -1245,199 +1191,196 @@ export function TextToSpeechWorkspace({
                 </AnimatePresence>
               </WorkspacePanel>
 
-              <AnimatePresence>
-                {error ? (
-                  <motion.div
-                    initial={{ opacity: 0, height: 0 }}
-                    animate={{ opacity: 1, height: "auto" }}
-                    exit={{ opacity: 0, height: 0 }}
-                    className="overflow-hidden"
-                  >
-                    <StatePanel
-                      title="Generation error"
-                      description={error}
-                      icon={AlertCircle}
-                      tone="danger"
-                    />
-                  </motion.div>
-                ) : null}
-              </AnimatePresence>
-
-              <WorkspacePanel className="p-5">
-                <WorkspaceSectionLabel>Render</WorkspaceSectionLabel>
-                <div className="mt-4 flex flex-wrap items-center gap-3">
-                  <Button
-                    onClick={handleGenerate}
-                    disabled={generating || !canGenerate}
-                    className="min-w-[190px]"
-                  >
-                    {generating ? (
-                      <>
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                        Generating...
-                      </>
-                    ) : (
-                      <>
-                        <Mic2 className="h-4 w-4" />
-                        Generate audio
-                      </>
-                    )}
-                  </Button>
-
-                  {(audioUrl || isStreaming) ? (
-                    <Button variant="outline" onClick={handleStop}>
-                      <Square className="h-4 w-4" />
-                      Stop
-                    </Button>
-                  ) : null}
-
-                  {audioUrl ? (
-                    <>
-                      <Button
-                        variant="outline"
-                        onClick={handleDownload}
-                        disabled={isDownloading}
-                      >
-                        {isDownloading ? (
-                          <Loader2 className="h-4 w-4 animate-spin" />
-                        ) : (
-                          <Download className="h-4 w-4" />
-                        )}
-                        Download
-                      </Button>
-                      <Button variant="ghost" onClick={handleReset}>
-                        <RotateCcw className="h-4 w-4" />
-                        Reset
-                      </Button>
-                    </>
-                  ) : null}
-                </div>
-
-                {downloadState !== "idle" && downloadMessage ? (
-                  <div
-                    className={cn(
-                      "mt-4 flex items-center gap-2 rounded-lg border px-3 py-2.5 text-xs font-medium",
-                      downloadState === "downloading" &&
-                        "bg-[var(--status-warning-bg)] border-[var(--status-warning-border)] text-[var(--status-warning-text)]",
-                      downloadState === "success" &&
-                        "bg-[var(--status-positive-bg)] border-[var(--status-positive-border)] text-[var(--status-positive-text)]",
-                      downloadState === "error" &&
-                        "bg-[var(--danger-bg)] border-[var(--danger-border)] text-[var(--danger-text)]",
-                    )}
-                  >
-                    {downloadState === "downloading" ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : downloadState === "success" ? (
-                      <CheckCircle2 className="h-4 w-4" />
-                    ) : (
-                      <AlertCircle className="h-4 w-4" />
-                    )}
-                    {downloadMessage}
-                  </div>
-                ) : null}
-
-                <div className="text-xs text-[var(--text-muted)]">
-                  Shortcut: <span className="app-kbd">Ctrl/Cmd + Enter</span> generate, <span className="app-kbd">Esc</span> stop, <span className="app-kbd">Shift + Esc</span> reset.
-                </div>
-              </WorkspacePanel>
-            </div>
-
-            <div className="space-y-4">
-              <WorkspacePanel className="p-5">
-                <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-3")}>
-                  Voice Summary
-                </div>
-                <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-4">
-                  <div className={VOICE_ROUTE_PANEL_TITLE_CLASS}>
-                    {selectedVoiceItem?.name || "Select a voice"}
-                  </div>
-                  <div className={cn(VOICE_ROUTE_META_COPY_CLASS, "mt-1")}>
-                    {requiresVoiceDescriptionOnly
-                      ? "Voice direction"
-                      : voiceMode === "saved"
-                        ? "Saved voice"
-                        : "Built-in voice"}
-                  </div>
-                  <p className={cn(VOICE_ROUTE_BODY_COPY_CLASS, "mt-3")}>
-                    {compatibilityNotice}
-                  </p>
-                  <div className="mt-3 grid gap-2 sm:grid-cols-2 text-xs">
-                    <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-[var(--text-secondary)]">
-                      {selectedOption?.label || "No model selected"}
-                    </div>
-                    <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-[var(--text-secondary)]">
-                      {voiceAvailabilitySummary}
-                    </div>
-                  </div>
-                </div>
-              </WorkspacePanel>
-
-              <WorkspacePanel className="p-5">
-                <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-3")}>
-                  Output
-                </div>
-
-                {!audioUrl && !isStreaming ? (
+            <AnimatePresence>
+              {error ? (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: "auto" }}
+                  exit={{ opacity: 0, height: 0 }}
+                  className="overflow-hidden"
+                >
                   <StatePanel
-                    title="No rendered audio yet"
-                    description="Generate audio to review the rendered result here."
-                    tone="neutral"
-                    dashed
-                    align="center"
+                    title="Generation error"
+                    description={error}
+                    icon={AlertCircle}
+                    tone="danger"
                   />
-                ) : (
-                  <div className="space-y-4 rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-4">
-                    {audioUrl ? (
-                      <audio
-                        ref={audioRef}
-                        src={audioUrl}
-                        className="h-11 w-full"
-                        controls
-                      />
-                    ) : null}
-                    {isStreaming && !audioUrl ? (
-                      <div className="rounded-lg border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-3 py-2 text-xs font-medium text-[var(--status-warning-text)]">
-                        Streaming live audio...
-                      </div>
-                    ) : null}
-                    {generationStats ? (
-                      <GenerationStats stats={generationStats} type="tts" />
-                    ) : null}
-                  </div>
-                )}
-              </WorkspacePanel>
+                </motion.div>
+              ) : null}
+            </AnimatePresence>
 
-              <WorkspacePanel className="p-5">
-                <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-2")}>
-                  Quick Workflow
+            <WorkspacePanel className="p-5">
+              <WorkspaceSectionLabel>Render</WorkspaceSectionLabel>
+              <div className="mt-4 flex flex-wrap items-center gap-3">
+                <Button
+                  onClick={handleGenerate}
+                  disabled={generating || !canGenerate}
+                  className="min-w-[190px]"
+                >
+                  {generating ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Generating...
+                    </>
+                  ) : (
+                    <>
+                      <Mic2 className="h-4 w-4" />
+                      Generate audio
+                    </>
+                  )}
+                </Button>
+
+                {(audioUrl || isStreaming) ? (
+                  <Button variant="outline" onClick={handleStop}>
+                    <Square className="h-4 w-4" />
+                    Stop
+                  </Button>
+                ) : null}
+
+                {audioUrl ? (
+                  <>
+                    <Button
+                      variant="outline"
+                      onClick={handleDownload}
+                      disabled={isDownloading}
+                    >
+                      {isDownloading ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Download className="h-4 w-4" />
+                      )}
+                      Download
+                    </Button>
+                    <Button variant="ghost" onClick={handleReset}>
+                      <RotateCcw className="h-4 w-4" />
+                      Reset
+                    </Button>
+                  </>
+                ) : null}
+              </div>
+
+              {downloadState !== "idle" && downloadMessage ? (
+                <div
+                  className={cn(
+                    "mt-4 flex items-center gap-2 rounded-lg border px-3 py-2.5 text-xs font-medium",
+                    downloadState === "downloading" &&
+                      "bg-[var(--status-warning-bg)] border-[var(--status-warning-border)] text-[var(--status-warning-text)]",
+                    downloadState === "success" &&
+                      "bg-[var(--status-positive-bg)] border-[var(--status-positive-border)] text-[var(--status-positive-text)]",
+                    downloadState === "error" &&
+                      "bg-[var(--danger-bg)] border-[var(--danger-border)] text-[var(--danger-text)]",
+                  )}
+                >
+                  {downloadState === "downloading" ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : downloadState === "success" ? (
+                    <CheckCircle2 className="h-4 w-4" />
+                  ) : (
+                    <AlertCircle className="h-4 w-4" />
+                  )}
+                  {downloadMessage}
                 </div>
-                <div className="grid gap-2 text-xs">
-                  <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2 text-[var(--text-secondary)]">
-                    1. Choose a TTS model
+              ) : null}
+
+              <div className="text-xs text-[var(--text-muted)]">
+                Shortcut: <span className="app-kbd">Ctrl/Cmd + Enter</span> generate, <span className="app-kbd">Esc</span> stop, <span className="app-kbd">Shift + Esc</span> reset.
+              </div>
+            </WorkspacePanel>
+          </div>
+
+          <div className="space-y-4">
+            <WorkspacePanel className="p-5">
+              <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-3")}>
+                Voice Summary
+              </div>
+              <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-4">
+                <div className={VOICE_ROUTE_PANEL_TITLE_CLASS}>
+                  {selectedVoiceItem?.name || "Select a voice"}
+                </div>
+                <div className={cn(VOICE_ROUTE_META_COPY_CLASS, "mt-1")}>
+                  {requiresVoiceDescriptionOnly
+                    ? "Voice direction"
+                    : voiceMode === "saved"
+                      ? "Saved voice"
+                      : "Built-in voice"}
+                </div>
+                <p className={cn(VOICE_ROUTE_BODY_COPY_CLASS, "mt-3")}>
+                  {compatibilityNotice}
+                </p>
+                <div className="mt-3 grid gap-2 sm:grid-cols-2 text-xs">
+                  <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-[var(--text-secondary)]">
+                    {selectedOption?.label || "No model selected"}
                   </div>
-                  <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2 text-[var(--text-secondary)]">
-                    {requiresVoiceDescriptionOnly
-                      ? "2. Add voice direction"
-                      : "2. Pick a compatible voice"}
-                  </div>
-                  <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2 text-[var(--text-secondary)]">
-                    3. Generate and review the result
+                  <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-[var(--text-secondary)]">
+                    {voiceAvailabilitySummary}
                   </div>
                 </div>
-              </WorkspacePanel>
-            </div>
+              </div>
+            </WorkspacePanel>
+
+            <WorkspacePanel className="p-5">
+              <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-3")}>
+                Output
+              </div>
+
+              {!audioUrl && !isStreaming ? (
+                <StatePanel
+                  title="No rendered audio yet"
+                  description="Generate audio to review the rendered result here."
+                  tone="neutral"
+                  dashed
+                  align="center"
+                />
+              ) : (
+                <div className="space-y-4 rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-4">
+                  {audioUrl ? (
+                    <audio
+                      ref={audioRef}
+                      src={audioUrl}
+                      className="h-11 w-full"
+                      controls
+                    />
+                  ) : null}
+                  {isStreaming && !audioUrl ? (
+                    <div className="rounded-lg border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-3 py-2 text-xs font-medium text-[var(--status-warning-text)]">
+                      Streaming live audio...
+                    </div>
+                  ) : null}
+                  {generationStats ? (
+                    <GenerationStats stats={generationStats} type="tts" />
+                  ) : null}
+                </div>
+              )}
+            </WorkspacePanel>
+
+            <WorkspacePanel className="p-5">
+              <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-2")}>
+                Quick Workflow
+              </div>
+              <div className="grid gap-2 text-xs">
+                <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2 text-[var(--text-secondary)]">
+                  1. Choose a TTS model
+                </div>
+                <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2 text-[var(--text-secondary)]">
+                  {requiresVoiceDescriptionOnly
+                    ? "2. Add voice direction"
+                    : "2. Pick a compatible voice"}
+                </div>
+                <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2 text-[var(--text-secondary)]">
+                  3. Generate and review the result
+                </div>
+              </div>
+            </WorkspacePanel>
           </div>
         </div>
       </div>
-      {workspaceMode === "quick" ? (
-        <SpeechHistoryPanel
-          route="text-to-speech"
-          title="Text to Speech History"
-          emptyMessage="No saved text-to-speech generations yet."
-          latestRecord={latestRecord}
-          historyActionContainer={historyActionContainer}
-        />
-      ) : null}
+      <SpeechHistoryPanel
+        route="text-to-speech"
+        title="Text to Speech History"
+        emptyMessage="No saved text-to-speech generations yet."
+        latestRecord={latestRecord}
+        historyActionContainer={historyActionContainer}
+      />
     </div>
   );
 }
