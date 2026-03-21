@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { ArrowRight, ShieldCheck, Users } from "lucide-react";
 import clsx from "clsx";
 import { VoiceClone, type VoiceCloneReferenceState } from "./VoiceClone";
@@ -13,10 +13,14 @@ import { WorkspacePanel } from "@/components/ui/workspace";
 
 interface VoiceCaptureWorkspaceProps {
   onUseInTts?: (voiceId: string) => void;
+  onVoiceSaved?: (voiceId: string) => void;
+  layout?: "page" | "modal";
 }
 
 export function VoiceCaptureWorkspace({
   onUseInTts,
+  onVoiceSaved,
+  layout = "page",
 }: VoiceCaptureWorkspaceProps) {
   const [referenceState, setReferenceState] =
     useState<VoiceCloneReferenceState | null>(null);
@@ -30,6 +34,12 @@ export function VoiceCaptureWorkspace({
   const sampleDurationSecs = referenceState?.sampleDurationSecs ?? null;
   const referenceWarning = referenceState?.warnings?.[0] ?? null;
   const canUseInTts = Boolean(reusableVoiceId && consentConfirmed && onUseInTts);
+
+  useEffect(() => {
+    if (savedVoiceId) {
+      onVoiceSaved?.(savedVoiceId);
+    }
+  }, [onVoiceSaved, savedVoiceId]);
 
   const handleReferenceReady = useCallback(
     (_audioBase64: string, _transcript: string) => {
@@ -52,7 +62,12 @@ export function VoiceCaptureWorkspace({
   }, [sampleReady]);
 
   return (
-    <div className="grid items-start gap-6 pb-4 sm:pb-5">
+    <div
+      className={clsx(
+        "grid items-start gap-6",
+        layout === "page" ? "pb-4 sm:pb-5" : "pb-1",
+      )}
+    >
       <WorkspacePanel className="p-4 sm:p-5">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div>

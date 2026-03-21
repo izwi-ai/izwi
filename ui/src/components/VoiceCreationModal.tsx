@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { ArrowLeft, AudioLines, Sparkles } from "lucide-react";
+import { VoiceCaptureWorkspace } from "@/components/VoiceCaptureWorkspace";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -45,11 +46,13 @@ function stepDescription(step: CreationStep): string {
 export function VoiceCreationModal({ open, onOpenChange }: VoiceCreationModalProps) {
   const [step, setStep] = useState<CreationStep>("choice");
   const [hasDraftProgress, setHasDraftProgress] = useState(false);
+  const [savedCloneVoiceId, setSavedCloneVoiceId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open) {
       setStep("choice");
       setHasDraftProgress(false);
+      setSavedCloneVoiceId(null);
     }
   }, [open]);
 
@@ -68,6 +71,7 @@ export function VoiceCreationModal({ open, onOpenChange }: VoiceCreationModalPro
   const handleStepSelect = (nextStep: "clone" | "design") => {
     setStep(nextStep);
     setHasDraftProgress(true);
+    setSavedCloneVoiceId(null);
   };
 
   return (
@@ -145,9 +149,16 @@ export function VoiceCreationModal({ open, onOpenChange }: VoiceCreationModalPro
           ) : null}
 
           {step === "clone" ? (
-            <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-8 text-center text-sm text-[var(--text-muted)]">
-              Clone workflow is being moved into this modal in the next rollout
-              step.
+            <div className="space-y-3">
+              <VoiceCaptureWorkspace
+                layout="modal"
+                onVoiceSaved={setSavedCloneVoiceId}
+              />
+              {savedCloneVoiceId ? (
+                <div className="rounded-lg border border-[var(--status-positive-border)] bg-[var(--status-positive-bg)] px-3 py-2 text-xs font-medium text-[var(--status-positive-text)]">
+                  Saved voice profile is ready in your library.
+                </div>
+              ) : null}
             </div>
           ) : null}
 
