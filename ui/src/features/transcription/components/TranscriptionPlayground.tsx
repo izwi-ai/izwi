@@ -1719,7 +1719,10 @@ export function TranscriptionPlayground({
                 </div>
               </div>
 
-              <div className="flex-1 overflow-y-auto flex flex-col">
+              <div
+                data-testid="transcription-history-modal-body"
+                className="flex-1 overflow-y-auto flex flex-col"
+              >
                 {selectedHistoryLoading ? (
                   <div className="h-full min-h-[220px] flex items-center justify-center gap-2 text-sm text-[var(--text-muted)]">
                     <Loader2 className="w-4 h-4 animate-spin" />
@@ -1773,6 +1776,8 @@ export function TranscriptionPlayground({
                       record={activeHistoryRecord}
                       audioUrl={selectedHistoryAudioUrl}
                       loading={selectedHistoryLoading}
+                      autoScrollActiveEntry={true}
+                      stickyPlaybackFooter={true}
                       emptyTitle="No transcript available"
                       emptyMessage="No transcript text available for this record."
                     />

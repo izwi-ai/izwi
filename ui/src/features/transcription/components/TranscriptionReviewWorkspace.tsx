@@ -27,6 +27,8 @@ interface TranscriptionReviewWorkspaceProps {
   emptyTitle?: string;
   emptyMessage?: string;
   showPlayback?: boolean;
+  autoScrollActiveEntry?: boolean;
+  stickyPlaybackFooter?: boolean;
 }
 
 const PLAYBACK_SPEEDS = [0.75, 1, 1.25, 1.5, 2];
@@ -77,8 +79,12 @@ export function TranscriptionReviewWorkspace({
   emptyMessage =
     "Record audio from your microphone or upload an audio file to start transcription. The transcript will appear here.",
   showPlayback = true,
+  autoScrollActiveEntry = false,
+  stickyPlaybackFooter = false,
 }: TranscriptionReviewWorkspaceProps) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const transcriptEntryRefs = useRef(new Map<number, HTMLElement>());
+  const lastAutoScrolledEntryRef = useRef<number | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -123,7 +129,31 @@ export function TranscriptionReviewWorkspace({
     setIsPlaying(false);
     setPlaybackRate(1);
     setAudioError(null);
+    lastAutoScrolledEntryRef.current = null;
   }, [audioUrl, record?.id]);
+
+  useEffect(() => {
+    if (!isPlaying) {
+      lastAutoScrolledEntryRef.current = null;
+    }
+  }, [isPlaying]);
+
+  useEffect(() => {
+    if (!autoScrollActiveEntry || !isPlaying || activeEntryIndex < 0) {
+      return;
+    }
+    if (lastAutoScrolledEntryRef.current === activeEntryIndex) {
+      return;
+    }
+
+    const activeEntryElement = transcriptEntryRefs.current.get(activeEntryIndex);
+    activeEntryElement?.scrollIntoView({
+      block: "center",
+      behavior: "smooth",
+      inline: "nearest",
+    });
+    lastAutoScrolledEntryRef.current = activeEntryIndex;
+  }, [activeEntryIndex, autoScrollActiveEntry, isPlaying]);
 
   async function togglePlayback(): Promise<void> {
     const audio = audioRef.current;
@@ -207,8 +237,18 @@ export function TranscriptionReviewWorkspace({
     );
   }
 
+  const rootClassName = stickyPlaybackFooter
+    ? "relative flex min-h-0 flex-col"
+    : "flex h-full min-h-0 flex-col overflow-hidden rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)]";
+  const contentClassName = stickyPlaybackFooter
+    ? "grid gap-6 pb-20 xl:grid-cols-[minmax(0,1fr),248px]"
+    : "grid flex-1 min-h-0 gap-6 overflow-y-auto px-4 py-4 sm:px-5 sm:py-5 xl:grid-cols-[minmax(0,1fr),248px]";
+  const playbackClassName = stickyPlaybackFooter
+    ? "sticky bottom-0 -mx-4 -mb-4 mt-auto border-t border-[var(--border-muted)] bg-[var(--bg-surface-0)]/95 px-4 py-3 backdrop-blur sm:-mx-5 sm:-mb-5 sm:px-5 sm:py-3"
+    : "border-t border-[var(--border-muted)] bg-[var(--bg-surface-0)]/95 px-4 py-3 backdrop-blur sm:px-5";
+
   return (
-    <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)]">
+    <div className={rootClassName}>
       <audio
         ref={audioRef}
         src={audioUrl ?? undefined}
@@ -234,7 +274,7 @@ export function TranscriptionReviewWorkspace({
         className="hidden"
       />
 
-      <div className="grid flex-1 min-h-0 gap-6 overflow-y-auto px-4 py-4 sm:px-5 sm:py-5 xl:grid-cols-[minmax(0,1fr),248px]">
+      <div className={contentClassName}>
         <div className="space-y-4">
           <div>
             <h3 className="mb-3 text-[13px] font-semibold tracking-wide text-[var(--text-primary)]">
@@ -286,6 +326,13 @@ export function TranscriptionReviewWorkspace({
                   return (
                     <div
                       key={`entry-${index}`}
+                      ref={(element) => {
+                        if (element) {
+                          transcriptEntryRefs.current.set(index, element);
+                        } else {
+                          transcriptEntryRefs.current.delete(index);
+                        }
+                      }}
                       className={sharedClassName}
                       style={style}
                       data-active={active ? "true" : "false"}
@@ -300,6 +347,13 @@ export function TranscriptionReviewWorkspace({
                     key={`entry-${entry.start}-${entry.end}-${index}`}
                     type="button"
                     onClick={() => seek(entry.start)}
+                    ref={(element) => {
+                      if (element) {
+                        transcriptEntryRefs.current.set(index, element);
+                      } else {
+                        transcriptEntryRefs.current.delete(index);
+                      }
+                    }}
                     className={sharedClassName}
                     style={style}
                     data-active={active ? "true" : "false"}
@@ -369,7 +423,10 @@ export function TranscriptionReviewWorkspace({
       </div>
 
       {showPlayback ? (
-        <div className="border-t border-[var(--border-muted)] bg-[var(--bg-surface-0)]/95 px-4 py-3 backdrop-blur sm:px-5">
+        <div
+          data-testid="transcription-review-player"
+          className={playbackClassName}
+        >
           <div className="flex flex-col gap-2.5">
             <div className="flex items-center gap-3">
               <div className="flex items-center gap-2">
