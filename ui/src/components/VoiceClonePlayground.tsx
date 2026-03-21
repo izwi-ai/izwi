@@ -36,7 +36,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import {
-  WorkspaceFrame,
   WorkspaceHeader,
   WorkspacePanel,
 } from "@/components/ui/workspace";
@@ -298,62 +297,63 @@ export function VoiceClonePlayground({
   );
 
   return (
-    <div className="grid gap-6 items-start">
-      <WorkspaceFrame className="p-6">
-          <WorkspaceHeader
-            icon={Users}
-            title="Voice Cloning"
-            description="Prepare a reference, confirm quality, and audition a reusable cloned voice before sending it to TTS."
-            actions={
-              <Select value={language} onValueChange={setLanguage}>
-                <SelectTrigger className="w-full sm:w-56">
-                  <div className="flex min-w-0 items-center gap-2">
-                    <Globe className="h-4 w-4 text-[var(--text-muted)]" />
-                    <SelectValue placeholder="Language" />
-                  </div>
-                </SelectTrigger>
-                <SelectContent>
-                  {LANGUAGES.map((lang) => (
-                    <SelectItem key={lang.id} value={lang.id}>
-                      {lang.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            }
-          />
-
-          <WorkspacePanel className="mb-6 mt-5 p-4 sm:p-5">
-            <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
-              <div className="min-w-0 flex-1">
-                <div className={clsx(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-2.5")}>
-                  Active Model
+    <div className="grid items-start gap-6 pb-4 sm:pb-5">
+      <div className="flex flex-col">
+        <WorkspaceHeader
+          icon={Users}
+          title="Voice Cloning"
+          description="Prepare a reference, confirm quality, and audition a reusable cloned voice before sending it to TTS."
+          className="border-none pb-0"
+          actions={
+            <Select value={language} onValueChange={setLanguage}>
+              <SelectTrigger className="w-full sm:w-56">
+                <div className="flex min-w-0 items-center gap-2">
+                  <Globe className="h-4 w-4 text-[var(--text-muted)]" />
+                  <SelectValue placeholder="Language" />
                 </div>
-                {modelOptions.length > 0 && <div>{renderModelSelector()}</div>}
-                <StatusBadge
-                  tone={selectedModelReady ? "success" : "warning"}
-                  className="mt-2.5"
-                >
-                  {selectedModelReady
-                    ? "Ready for cloning"
-                    : "Select a downloaded model to begin"}
-                </StatusBadge>
+              </SelectTrigger>
+              <SelectContent>
+                {LANGUAGES.map((lang) => (
+                  <SelectItem key={lang.id} value={lang.id}>
+                    {lang.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          }
+        />
+
+        <WorkspacePanel className="mb-6 mt-5 p-4 sm:p-5">
+          <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-start">
+            <div className="min-w-0 flex-1">
+              <div className={clsx(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-2.5")}>
+                Active Model
               </div>
-              {onOpenModelManager && (
-                <div className="shrink-0 mt-2 sm:mt-0">
-                  <button
-                    onClick={handleOpenModels}
-                    className="btn btn-secondary text-xs h-9 px-4 rounded-md"
-                  >
-                    <Settings2 className="w-4 h-4" />
-                    Manage
-                  </button>
-                </div>
-              )}
+              {modelOptions.length > 0 && <div>{renderModelSelector()}</div>}
+              <StatusBadge
+                tone={selectedModelReady ? "success" : "warning"}
+                className="mt-2.5"
+              >
+                {selectedModelReady
+                  ? "Ready for cloning"
+                  : "Select a downloaded model to begin"}
+              </StatusBadge>
             </div>
-          </WorkspacePanel>
+            {onOpenModelManager && (
+              <div className="mt-2 shrink-0 sm:mt-0">
+                <button
+                  onClick={handleOpenModels}
+                  className="btn btn-secondary h-9 rounded-md px-4 text-xs"
+                >
+                  <Settings2 className="w-4 h-4" />
+                  Manage
+                </button>
+              </div>
+            )}
+          </div>
+        </WorkspacePanel>
 
-          <div className="space-y-6">
+        <div className="space-y-6">
             {/* Voice Reference Section */}
             <WorkspacePanel className="p-6">
               <div className="flex items-center gap-2 mb-5">
@@ -614,32 +614,32 @@ export function VoiceClonePlayground({
             <div className="text-xs text-[var(--text-muted)]">
               Shortcut: <span className="app-kbd">Ctrl/Cmd + Enter</span> create preview, <span className="app-kbd">Esc</span> stop playback, <span className="app-kbd">Shift + Esc</span> reset.
             </div>
-          </div>
+        </div>
 
-          {/* Audio player */}
-          <AnimatePresence>
-            {audioUrl && (
-              <motion.div
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: 10 }}
-                className="mt-6 space-y-4"
-              >
-                <div className="p-4 rounded-xl bg-[var(--bg-surface-2)] border border-[var(--border-strong)] shadow-sm">
-                  <audio
-                    ref={audioRef}
-                    src={audioUrl}
-                    className="w-full h-11"
-                    controls
-                  />
-                </div>
-                {generationStats && (
-                  <GenerationStats stats={generationStats} type="tts" />
-                )}
-              </motion.div>
-            )}
-          </AnimatePresence>
-      </WorkspaceFrame>
+        {/* Audio player */}
+        <AnimatePresence>
+          {audioUrl && (
+            <motion.div
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 10 }}
+              className="mt-6 space-y-4"
+            >
+              <div className="rounded-xl border border-[var(--border-strong)] bg-[var(--bg-surface-2)] p-4 shadow-sm">
+                <audio
+                  ref={audioRef}
+                  src={audioUrl}
+                  className="h-11 w-full"
+                  controls
+                />
+              </div>
+              {generationStats && (
+                <GenerationStats stats={generationStats} type="tts" />
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
 
       <SpeechHistoryPanel
         route="voice-cloning"

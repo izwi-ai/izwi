@@ -44,7 +44,6 @@ import { StatePanel } from "@/components/ui/state-panel";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
-  WorkspaceFrame,
   WorkspaceHeader,
   WorkspacePanel,
   WorkspaceSectionLabel,
@@ -952,12 +951,13 @@ export function TextToSpeechWorkspace({
 
   if (workspaceMode === "projects") {
     return (
-      <div className="grid gap-5 items-start">
-        <WorkspaceFrame className="flex flex-col">
+      <div className="grid items-start gap-5 pb-4 sm:pb-5">
+        <div className="flex flex-col">
           <WorkspaceHeader
             icon={Waves}
             title="TTS Projects"
             description="Import scripts, render segments, and export merged narration."
+            className="border-none pb-0"
             actions={renderWorkflowTabs()}
           />
 
@@ -974,18 +974,19 @@ export function TextToSpeechWorkspace({
               onError={onError}
             />
           </div>
-        </WorkspaceFrame>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="grid gap-5 items-start">
-      <WorkspaceFrame className="flex flex-col">
+    <div className="grid items-start gap-5 pb-4 sm:pb-5">
+      <div className="flex flex-col">
         <WorkspaceHeader
           icon={Mic2}
           title="Text to Speech"
           description="Choose a model, then a compatible voice, then render."
+          className="border-none pb-0"
           actions={renderWorkflowTabs()}
         />
 
@@ -1328,7 +1329,7 @@ export function TextToSpeechWorkspace({
             </div>
           </div>
         </div>
-      </WorkspaceFrame>
+      </div>
       {workspaceMode === "quick" ? (
         <SpeechHistoryPanel
           route="text-to-speech"

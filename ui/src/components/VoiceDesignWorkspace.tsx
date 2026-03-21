@@ -34,7 +34,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import {
-  WorkspaceFrame,
   WorkspaceHeader,
   WorkspacePanel,
 } from "@/components/ui/workspace";
@@ -353,64 +352,65 @@ export function VoiceDesignWorkspace({
   };
 
   return (
-    <div className="grid gap-4 items-start">
-      <WorkspaceFrame className="flex flex-col">
-          <WorkspaceHeader
-            icon={Wand2}
-            title="Voice Design"
-            description="Describe a voice, compare nearby candidates, and save the best option for TTS reuse."
-            actions={
-              <Select value={language} onValueChange={setLanguage}>
-                <SelectTrigger className="w-52 sm:w-56">
-                  <div className="flex min-w-0 items-center gap-2">
-                    <Globe className="h-3.5 w-3.5 text-[var(--text-muted)]" />
-                    <SelectValue placeholder="Language" />
-                  </div>
-                </SelectTrigger>
-                <SelectContent>
-                  {LANGUAGES.map((lang) => (
-                    <SelectItem key={lang.id} value={lang.id}>
-                      {lang.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            }
-          />
-
-          <WorkspacePanel className="mb-4 mt-5 p-4">
-            <div className="flex items-start justify-between gap-4">
-              <div className="min-w-0 flex-1">
-                <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>
-                  Active Model
+    <div className="grid items-start gap-4 pb-4 sm:pb-5">
+      <div className="flex flex-col">
+        <WorkspaceHeader
+          icon={Wand2}
+          title="Voice Design"
+          description="Describe a voice, compare nearby candidates, and save the best option for TTS reuse."
+          className="border-none pb-0"
+          actions={
+            <Select value={language} onValueChange={setLanguage}>
+              <SelectTrigger className="w-52 sm:w-56">
+                <div className="flex min-w-0 items-center gap-2">
+                  <Globe className="h-3.5 w-3.5 text-[var(--text-muted)]" />
+                  <SelectValue placeholder="Language" />
                 </div>
-                {modelOptions.length > 0 && (
-                  <div className="mt-2">{renderModelSelector()}</div>
-                )}
-                <StatusBadge
-                  tone={selectedModelReady ? "success" : "warning"}
-                  className="mt-2"
-                >
-                  {selectedModelReady
-                    ? "Loaded and ready"
-                    : "Open Models and load a VoiceDesign model"}
-                </StatusBadge>
+              </SelectTrigger>
+              <SelectContent>
+                {LANGUAGES.map((lang) => (
+                  <SelectItem key={lang.id} value={lang.id}>
+                    {lang.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          }
+        />
+
+        <WorkspacePanel className="mb-4 mt-5 p-4">
+          <div className="flex items-start justify-between gap-4">
+            <div className="min-w-0 flex-1">
+              <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>
+                Active Model
               </div>
-              {onOpenModelManager && (
-                <div className="shrink-0">
-                  <button
-                    onClick={handleOpenModels}
-                    className="btn btn-secondary text-xs"
-                  >
-                    <Settings2 className="w-4 h-4" />
-                    Models
-                  </button>
-                </div>
+              {modelOptions.length > 0 && (
+                <div className="mt-2">{renderModelSelector()}</div>
               )}
+              <StatusBadge
+                tone={selectedModelReady ? "success" : "warning"}
+                className="mt-2"
+              >
+                {selectedModelReady
+                  ? "Loaded and ready"
+                  : "Open Models and load a VoiceDesign model"}
+              </StatusBadge>
             </div>
-          </WorkspacePanel>
+            {onOpenModelManager && (
+              <div className="shrink-0">
+                <button
+                  onClick={handleOpenModels}
+                  className="btn btn-secondary text-xs"
+                >
+                  <Settings2 className="w-4 h-4" />
+                  Models
+                </button>
+              </div>
+            )}
+          </div>
+        </WorkspacePanel>
 
-          <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_420px]">
+        <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_420px]">
             <div className="space-y-6">
               <div>
                 <div className="flex items-center justify-between mb-2">
@@ -751,8 +751,8 @@ export function VoiceDesignWorkspace({
                 </div>
               ) : null}
             </div>
-          </div>
-      </WorkspaceFrame>
+        </div>
+      </div>
 
       <SpeechHistoryPanel
         route="voice-design"
