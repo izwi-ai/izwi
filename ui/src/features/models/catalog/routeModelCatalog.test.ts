@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   CHAT_PREFERRED_MODELS,
+  getChatRouteModelLabel,
   isThinkingChatModel,
   resolvePreferredRouteModel,
 } from "./routeModelCatalog";
@@ -53,5 +54,17 @@ describe("route model catalog", () => {
   it("treats Qwen3.5 models as thinking-capable chat models", () => {
     expect(isThinkingChatModel("Qwen3.5-4B")).toBe(true);
     expect(isThinkingChatModel("Parakeet-TDT-0.6B-v3")).toBe(false);
+  });
+
+  it("uses Qwen chat-route labels without injecting chat into the model name", () => {
+    expect(getChatRouteModelLabel("Qwen3-0.6B-GGUF")).toBe(
+      "Qwen3 0.6B GGUF (Q8_0)",
+    );
+    expect(getChatRouteModelLabel("Qwen3-8B-GGUF")).toBe(
+      "Qwen3 8B GGUF (Q4_K_M)",
+    );
+    expect(getChatRouteModelLabel("Qwen3.5-4B")).toBe(
+      "Qwen3.5 4B GGUF (Q4_K_M)",
+    );
   });
 });

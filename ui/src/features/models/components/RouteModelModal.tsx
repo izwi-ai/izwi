@@ -12,7 +12,10 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import type { ModelInfo } from "@/api";
-import { PROVIDER_ORDER } from "@/features/models/catalog/modelMetadata";
+import {
+  getModelProviderLabel,
+  PROVIDER_ORDER,
+} from "@/features/models/catalog/modelMetadata";
 import { withQwen3Prefix } from "@/utils/modelDisplay";
 
 interface RouteModelSection {
@@ -88,21 +91,7 @@ function getStatusDotClass(status: ModelInfo["status"]): string {
 }
 
 function getProviderLabel(variant: string): string {
-  if (variant.startsWith("Qwen3-") || variant.startsWith("Qwen3.5-")) {
-    return "Qwen";
-  }
-  if (variant.startsWith("Whisper-")) return "OpenAI";
-  if (variant.startsWith("LFM2")) return "Liquid AI";
-  if (variant.startsWith("Gemma-")) return "Google";
-  if (
-    variant.startsWith("Parakeet-") ||
-    variant.startsWith("diar_streaming_sortformer")
-  ) {
-    return "NVIDIA";
-  }
-  if (variant.startsWith("Voxtral-")) return "Mistral AI";
-  if (variant.startsWith("Kokoro-")) return "hexgrad";
-  return "Other";
+  return getModelProviderLabel(variant);
 }
 
 function compareProviders(left: string, right: string): number {

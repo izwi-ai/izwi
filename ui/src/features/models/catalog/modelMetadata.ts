@@ -9,6 +9,24 @@ export const PROVIDER_ORDER = [
   "Other",
 ] as const;
 
+export function getModelProviderLabel(variant: string): string {
+  if (variant.startsWith("Qwen3-") || variant.startsWith("Qwen3.5-")) {
+    return "Qwen";
+  }
+  if (variant.startsWith("Whisper-")) return "OpenAI";
+  if (variant.startsWith("LFM2")) return "Liquid AI";
+  if (variant.startsWith("Gemma-")) return "Google";
+  if (
+    variant.startsWith("Parakeet-") ||
+    variant.startsWith("diar_streaming_sortformer")
+  ) {
+    return "NVIDIA";
+  }
+  if (variant.startsWith("Voxtral-")) return "Mistral AI";
+  if (variant.startsWith("Kokoro-")) return "hexgrad";
+  return "Other";
+}
+
 export interface ModelDetail {
   shortName: string;
   fullName: string;
@@ -167,35 +185,35 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
   },
   // Text Chat
   "Qwen3-0.6B-GGUF": {
-    shortName: "Qwen3 Chat 0.6B GGUF",
+    shortName: "Qwen3 0.6B",
     fullName: "Qwen3 0.6B (GGUF Q8_0)",
-    description: "Compact text-to-text model in GGUF format",
+    description: "Compact Qwen3 text model in GGUF Q8_0 format",
     category: "chat",
-    capabilities: ["Text Chat", "GGUF", "Q8_0"],
+    capabilities: ["Text Generation", "GGUF", "Q8_0"],
     size: "1.0 GB",
   },
   "Qwen3-1.7B-GGUF": {
-    shortName: "Qwen3 Chat 1.7B GGUF",
+    shortName: "Qwen3 1.7B",
     fullName: "Qwen3 1.7B (GGUF Q8_0)",
-    description: "Higher-quality 1.7B chat model in GGUF format",
+    description: "Higher-quality Qwen3 text model in GGUF Q8_0 format",
     category: "chat",
-    capabilities: ["Text Chat", "GGUF", "Q8_0"],
+    capabilities: ["Text Generation", "GGUF", "Q8_0"],
     size: "2.2 GB",
   },
   "Qwen3-4B-GGUF": {
-    shortName: "Qwen3 Chat 4B GGUF",
+    shortName: "Qwen3 4B",
     fullName: "Qwen3 4B (GGUF Q4_K_M)",
-    description: "4B chat model in GGUF format (Q4_K_M only)",
+    description: "Qwen3 4B model in GGUF Q4_K_M format",
     category: "chat",
-    capabilities: ["Text Chat", "GGUF", "Q4_K_M"],
+    capabilities: ["Text Generation", "GGUF", "Q4_K_M"],
     size: "2.5 GB",
   },
   "Qwen3-8B-GGUF": {
-    shortName: "Qwen3 Chat 8B GGUF",
+    shortName: "Qwen3 8B",
     fullName: "Qwen3 8B (GGUF Q4_K_M)",
-    description: "8B chat model in GGUF format (Q4_K_M only)",
+    description: "Qwen3 8B model in GGUF Q4_K_M format",
     category: "chat",
-    capabilities: ["Text Chat", "GGUF", "Q4_K_M"],
+    capabilities: ["Text Generation", "GGUF", "Q4_K_M"],
     size: "5.2 GB",
   },
   "Qwen3.5-0.8B": {

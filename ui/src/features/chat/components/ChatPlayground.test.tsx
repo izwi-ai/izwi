@@ -47,11 +47,11 @@ describe("ChatPlayground", () => {
           selectedModel="Qwen3-0.6B-GGUF"
           selectedModelReady={true}
           supportsThinking={true}
-          modelLabel="Qwen3 Chat 0.6B GGUF"
+          modelLabel="Qwen3 0.6B GGUF (Q8_0)"
           modelOptions={[
             {
               value: "Qwen3-0.6B-GGUF",
-              label: "Qwen3 Chat 0.6B GGUF",
+              label: "Qwen3 0.6B GGUF (Q8_0)",
               statusLabel: "Ready",
               isReady: true,
             },
@@ -72,7 +72,7 @@ describe("ChatPlayground", () => {
     await waitFor(() => expect(apiMocks.listChatThreads).toHaveBeenCalled());
 
     fireEvent.click(
-      screen.getByRole("button", { name: "Qwen3 Chat 0.6B GGUF" }),
+      screen.getByRole("button", { name: "Qwen3 0.6B GGUF (Q8_0)" }),
     );
 
     expect(await screen.findByText("Gemma 3 1B")).toBeInTheDocument();
@@ -134,11 +134,11 @@ describe("ChatPlayground", () => {
           selectedModel="Qwen3-0.6B-GGUF"
           selectedModelReady={true}
           supportsThinking={true}
-          modelLabel="Qwen3 Chat 0.6B GGUF"
+          modelLabel="Qwen3 0.6B GGUF (Q8_0)"
           modelOptions={[
             {
               value: "Qwen3-0.6B-GGUF",
-              label: "Qwen3 Chat 0.6B GGUF",
+              label: "Qwen3 0.6B GGUF (Q8_0)",
               statusLabel: "Ready",
               isReady: true,
             },
@@ -157,7 +157,7 @@ describe("ChatPlayground", () => {
     expect(screen.getByText("Royal families in Europe")).toBeInTheDocument();
     expect(screen.queryByText("2 messages")).not.toBeInTheDocument();
     expect(
-      screen.queryByText("Using Qwen3 Chat 0.6B GGUF"),
+      screen.queryByText("Using Qwen3 0.6B GGUF (Q8_0)"),
     ).not.toBeInTheDocument();
 
     const sendButton = screen.getByRole("button", { name: "Send message" });
@@ -186,11 +186,11 @@ describe("ChatPlayground", () => {
           selectedModel="Qwen3-0.6B-GGUF"
           selectedModelReady={true}
           supportsThinking={true}
-          modelLabel="Qwen3 Chat 0.6B GGUF"
+          modelLabel="Qwen3 0.6B GGUF (Q8_0)"
           modelOptions={[
             {
               value: "Qwen3-0.6B-GGUF",
-              label: "Qwen3 Chat 0.6B GGUF",
+              label: "Qwen3 0.6B GGUF (Q8_0)",
               statusLabel: "Ready",
               isReady: true,
             },
@@ -272,11 +272,11 @@ describe("ChatPlayground", () => {
           selectedModel="Qwen3-0.6B-GGUF"
           selectedModelReady={true}
           supportsThinking={true}
-          modelLabel="Qwen3 Chat 0.6B GGUF"
+          modelLabel="Qwen3 0.6B GGUF (Q8_0)"
           modelOptions={[
             {
               value: "Qwen3-0.6B-GGUF",
-              label: "Qwen3 Chat 0.6B GGUF",
+              label: "Qwen3 0.6B GGUF (Q8_0)",
               statusLabel: "Ready",
               isReady: true,
             },

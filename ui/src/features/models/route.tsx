@@ -14,6 +14,7 @@ import clsx from "clsx";
 import type { ModelInfo } from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import {
+  getModelProviderLabel,
   MODEL_DETAILS,
   PROVIDER_ORDER,
 } from "@/features/models/catalog/modelMetadata";
@@ -116,21 +117,7 @@ function getStatusTextClass(status: ModelInfo["status"]): string {
 }
 
 function getProviderLabel(variant: string): string {
-  if (variant.startsWith("Qwen3-")) {
-    return "Qwen";
-  }
-  if (variant.startsWith("Whisper-")) return "OpenAI";
-  if (variant.startsWith("LFM2")) return "Liquid AI";
-  if (variant.startsWith("Gemma-")) return "Google";
-  if (
-    variant.startsWith("Parakeet-") ||
-    variant.startsWith("diar_streaming_sortformer")
-  ) {
-    return "NVIDIA";
-  }
-  if (variant.startsWith("Voxtral-")) return "Mistral AI";
-  if (variant.startsWith("Kokoro-")) return "hexgrad";
-  return "Other";
+  return getModelProviderLabel(variant);
 }
 
 function compareProviders(left: string, right: string): number {

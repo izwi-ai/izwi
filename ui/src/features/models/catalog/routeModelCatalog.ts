@@ -123,16 +123,16 @@ export function resolvePreferredRouteModel(options: {
 
 export function getChatRouteModelLabel(variant: string): string {
   if (variant === "Qwen3-0.6B-GGUF") {
-    return withQwen3Prefix("Chat 0.6B GGUF", variant);
+    return withQwen3Prefix("0.6B GGUF (Q8_0)", variant);
   }
   if (variant === "Qwen3-1.7B-GGUF") {
-    return withQwen3Prefix("Chat 1.7B GGUF", variant);
+    return withQwen3Prefix("1.7B GGUF (Q8_0)", variant);
   }
   if (variant === "Qwen3-4B-GGUF") {
-    return withQwen3Prefix("Chat 4B GGUF (Q4_K_M)", variant);
+    return withQwen3Prefix("4B GGUF (Q4_K_M)", variant);
   }
   if (variant === "Qwen3-8B-GGUF") {
-    return withQwen3Prefix("Chat 8B GGUF (Q4_K_M)", variant);
+    return withQwen3Prefix("8B GGUF (Q4_K_M)", variant);
   }
   if (variant === "Qwen3.5-0.8B") {
     return "Qwen3.5 0.8B GGUF (Q4_K_M)";
