@@ -51,17 +51,8 @@ interface VoicePreviewPlayerProps {
   onActivePreviewChange: (id: string | null) => void;
 }
 
-const WAVEFORM_BARS = [
-  0.18, 0.28, 0.52, 0.82, 0.6, 0.32, 0.25, 0.44, 0.72, 0.92, 0.66, 0.3, 0.22,
-  0.5, 0.84, 0.62, 0.34, 0.26, 0.48, 0.86, 0.68, 0.38, 0.24,
-] as const;
-
 const SEEKBAR_CLASS =
-  "relative z-10 h-7 w-full cursor-pointer appearance-none bg-transparent accent-[var(--text-primary)] focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-45 [&::-moz-range-progress]:bg-transparent [&::-moz-range-thumb]:h-3.5 [&::-moz-range-thumb]:w-3.5 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-none [&::-moz-range-thumb]:bg-[var(--text-primary)] [&::-moz-range-thumb]:shadow-md [&::-moz-range-track]:h-1.5 [&::-moz-range-track]:rounded-full [&::-moz-range-track]:bg-transparent [&::-webkit-slider-runnable-track]:h-1.5 [&::-webkit-slider-runnable-track]:rounded-full [&::-webkit-slider-runnable-track]:bg-transparent [&::-webkit-slider-thumb]:-mt-1 [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-none [&::-webkit-slider-thumb]:bg-[var(--text-primary)] [&::-webkit-slider-thumb]:shadow-md";
-
-function itemInitial(name: string): string {
-  return name.trim().charAt(0).toUpperCase() || "V";
-}
+  "relative z-10 h-5 w-full cursor-pointer appearance-none bg-transparent accent-[var(--text-primary)] focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-45 [&::-moz-range-progress]:bg-transparent [&::-moz-range-thumb]:h-3 [&::-moz-range-thumb]:w-3 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-none [&::-moz-range-thumb]:bg-[var(--text-primary)] [&::-moz-range-thumb]:shadow-sm [&::-moz-range-track]:h-1 [&::-moz-range-track]:rounded-full [&::-moz-range-track]:bg-transparent [&::-webkit-slider-runnable-track]:h-1 [&::-webkit-slider-runnable-track]:rounded-full [&::-webkit-slider-runnable-track]:bg-transparent [&::-webkit-slider-thumb]:-mt-1 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-none [&::-webkit-slider-thumb]:bg-[var(--text-primary)] [&::-webkit-slider-thumb]:shadow-sm";
 
 function formatClockTime(value: number): string {
   if (!Number.isFinite(value) || value < 0) {
@@ -73,32 +64,6 @@ function formatClockTime(value: number): string {
   const seconds = rounded % 60;
 
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
-}
-
-function VoiceGlyph({ name }: { name: string }) {
-  return (
-    <div
-      className="relative flex h-16 w-16 shrink-0 items-center justify-center rounded-full border border-[var(--border-muted)] shadow-[var(--shadow-soft)]"
-      style={{
-        backgroundImage:
-          "radial-gradient(circle at 28% 24%, var(--accent-soft), transparent 38%), linear-gradient(145deg, var(--bg-surface-2), var(--bg-surface-3))",
-      }}
-    >
-      <div className="absolute inset-[1px] rounded-full bg-[var(--accent-soft)]" />
-      <div className="relative flex items-end gap-0.5">
-        {[0.28, 0.52, 0.9, 1, 0.66, 0.38, 0.6, 0.44].map((height, index) => (
-          <span
-            key={`${name}-glyph-${index}`}
-            className="w-1 rounded-full bg-[var(--text-primary)]/80"
-            style={{ height: `${Math.max(height * 1.35, 0.35)}rem` }}
-          />
-        ))}
-      </div>
-      <div className="absolute -bottom-1 -right-1 flex h-6 w-6 items-center justify-center rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-[10px] font-semibold text-[var(--text-primary)] shadow-sm">
-        {itemInitial(name)}
-      </div>
-    </div>
-  );
 }
 
 function VoicePreviewPlayer({
@@ -117,7 +82,6 @@ function VoicePreviewPlayer({
   const isPlayable = hasPreview && !item.previewLoading;
   const progress = duration > 0 ? Math.min(currentTime / duration, 1) : 0;
   const hint = audioError ?? item.previewMessage ?? null;
-  const highlightedBarCount = Math.round(progress * WAVEFORM_BARS.length);
 
   useEffect(() => {
     const audio = audioRef.current;
@@ -231,7 +195,7 @@ function VoicePreviewPlayer({
 
   return (
     <div
-      className="rounded-[1.3rem] border border-[var(--border-muted)] px-3.5 py-3.5"
+      className="rounded-[0.9rem] border border-[var(--border-muted)] px-2 py-2"
       style={{
         backgroundImage:
           "radial-gradient(circle at top right, var(--accent-soft), transparent 42%), linear-gradient(180deg, var(--bg-surface-0), var(--bg-surface-1))",
@@ -248,13 +212,13 @@ function VoicePreviewPlayer({
         />
       ) : null}
 
-      <div className="flex items-center gap-4">
+      <div className="flex items-center gap-2">
         <button
           type="button"
           onClick={() => void togglePlayback()}
           disabled={!isPlayable}
           className={cn(
-            "flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] text-[var(--text-primary)] transition-colors",
+            "flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] text-[var(--text-primary)] transition-colors",
             isPlayable
               ? "hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-2)]"
               : "cursor-not-allowed text-[var(--text-muted)] opacity-80",
@@ -266,59 +230,24 @@ function VoicePreviewPlayer({
           }
         >
           {item.previewLoading ? (
-            <Loader2 className="h-5 w-5 animate-spin" />
+            <Loader2 className="h-3 w-3 animate-spin" />
           ) : isPlaying ? (
-            <Pause className="h-5 w-5 fill-current" />
+            <Pause className="h-3 w-3 fill-current" />
           ) : (
-            <Play className="ml-0.5 h-5 w-5 fill-current" />
+            <Play className="ml-0.5 h-3 w-3 fill-current" />
           )}
         </button>
 
-        <div className="min-w-0 flex-1">
-          <div className="flex h-12 items-center gap-1">
-            {WAVEFORM_BARS.map((barHeight, index) => {
-              const isHighlighted = index < highlightedBarCount;
-              const isAnimated = isPlaying && (index + 2) % 3 === 0;
-
-              return (
-                <span
-                  key={`${item.id}-wave-${index}`}
-                  className={cn(
-                    "w-1 rounded-full transition-[opacity,transform,background-color] duration-200",
-                    isPlayable ? "opacity-100" : "opacity-40",
-                    isHighlighted
-                      ? "bg-[var(--text-primary)]"
-                      : "bg-[var(--text-muted)]/45",
-                    isAnimated && "translate-y-[-1px]",
-                  )}
-                  style={{
-                    height: `${Math.max(barHeight * 2.15, 0.35)}rem`,
-                  }}
-                />
-              );
-            })}
-          </div>
-
-          {hint ? (
-            <p className="mt-1 text-xs leading-5 text-[var(--text-muted)]">{hint}</p>
-          ) : null}
-        </div>
-      </div>
-
-      <div className="mt-3.5 flex items-center gap-3">
-        <label
-          htmlFor={seekId}
-          className="sr-only"
-        >
+        <label htmlFor={seekId} className="sr-only">
           Seek preview for {item.name}
         </label>
-        <span className="min-w-[3rem] font-mono text-[12px] font-medium tabular-nums text-[var(--text-muted)]">
+        <span className="min-w-[2.3rem] font-mono text-[10px] font-medium tabular-nums text-[var(--text-muted)]">
           {formatClockTime(currentTime)}
         </span>
         <div className="group relative flex-1">
-          <div className="pointer-events-none absolute inset-x-0 top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-[var(--bg-surface-3)]" />
+          <div className="pointer-events-none absolute inset-x-0 top-1/2 h-1 -translate-y-1/2 rounded-full bg-[var(--bg-surface-3)]" />
           <div
-            className="pointer-events-none absolute left-0 top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-[var(--text-primary)]"
+            className="pointer-events-none absolute left-0 top-1/2 h-1 -translate-y-1/2 rounded-full bg-[var(--text-primary)]"
             style={{ width: `${Math.max(progress * 100, 0)}%` }}
           />
           <input
@@ -333,10 +262,16 @@ function VoicePreviewPlayer({
             className={SEEKBAR_CLASS}
           />
         </div>
-        <span className="min-w-[3rem] text-right font-mono text-[12px] font-medium tabular-nums text-[var(--text-muted)]">
+        <span className="min-w-[2.3rem] text-right font-mono text-[10px] font-medium tabular-nums text-[var(--text-muted)]">
           {duration > 0 ? formatClockTime(duration) : "00:00"}
         </span>
       </div>
+
+      {hint ? (
+        <p className="mt-1.5 text-[11px] leading-4 text-[var(--text-muted)]">
+          {hint}
+        </p>
+      ) : null}
     </div>
   );
 }
@@ -367,7 +302,7 @@ function VoiceCard({
     <Card
       key={item.id}
       className={cn(
-        "relative h-full overflow-hidden rounded-[1.55rem] border-[var(--border-muted)] p-0 transition-[border-color,transform,box-shadow] duration-200",
+        "relative h-full overflow-hidden rounded-[1rem] border-[var(--border-muted)] p-0 transition-[border-color,transform,box-shadow] duration-200",
         item.selected &&
           "border-[var(--border-strong)] shadow-[var(--shadow-soft)]",
         item.onSelect &&
@@ -383,48 +318,43 @@ function VoiceCard({
       onKeyDown={handleKeyDown}
       data-testid={`voice-card-${item.id}`}
     >
-      <div className="absolute inset-x-6 top-0 h-px bg-[var(--accent-strong)]" />
-      <div className="relative flex h-full flex-col gap-5 p-5 sm:p-6">
-        <div className="flex items-start gap-4">
-          <VoiceGlyph name={item.name} />
-          <div className="min-w-0 flex-1 pt-0.5">
-            <div className="flex flex-wrap items-center gap-2">
-              <StatusBadge>{item.categoryLabel}</StatusBadge>
-              {item.selected ? (
-                <StatusBadge tone="info">Selected</StatusBadge>
-              ) : null}
-            </div>
-
-            <h3 className="mt-3 text-[1.45rem] font-semibold leading-[1.1] tracking-tight text-[var(--text-primary)] sm:text-[1.6rem]">
-              {item.name}
-            </h3>
-
-            {titleMeta.length > 0 ? (
-              <div className="mt-3 flex flex-wrap gap-1.5">
-                {titleMeta.map((meta) => (
-                  <span
-                    key={`${item.id}-${meta}`}
-                    className={cn(
-                      VOICE_ROUTE_META_COPY_CLASS,
-                      "rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)]/70 px-2.5 py-1 text-[10px] font-semibold",
-                    )}
-                  >
-                    {meta}
-                  </span>
-                ))}
-              </div>
+      <div className="absolute inset-x-3.5 top-0 h-px bg-[var(--accent-strong)]" />
+      <div className="relative flex h-full flex-col gap-2.5 p-3 sm:p-3.5">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <StatusBadge>{item.categoryLabel}</StatusBadge>
+            {item.selected ? (
+              <StatusBadge tone="info">Selected</StatusBadge>
             ) : null}
           </div>
+          <h3 className="mt-1 line-clamp-1 text-lg font-semibold leading-tight tracking-tight text-[var(--text-primary)]">
+            {item.name}
+          </h3>
+          {titleMeta.length > 0 ? (
+            <div className="mt-1 flex flex-wrap gap-1.5">
+              {titleMeta.map((meta) => (
+                <span
+                  key={`${item.id}-${meta}`}
+                  className={cn(
+                    VOICE_ROUTE_META_COPY_CLASS,
+                    "rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)]/70 px-2 py-0.5 text-[10px] font-semibold",
+                  )}
+                >
+                  {meta}
+                </span>
+              ))}
+            </div>
+          ) : null}
         </div>
 
         <div>
-          <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-2")}>
+          <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-1")}>
             Voice Notes
           </div>
           <p
             className={cn(
               VOICE_ROUTE_BODY_COPY_CLASS,
-              "line-clamp-4 text-[15px] leading-7 text-[var(--text-secondary)]",
+              "line-clamp-2 text-sm leading-5 text-[var(--text-secondary)]",
               !item.description && "text-[var(--text-muted)]",
             )}
           >
@@ -433,7 +363,7 @@ function VoiceCard({
         </div>
 
         <div>
-          <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-3")}>
+          <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-1")}>
             Preview
           </div>
           <VoicePreviewPlayer
@@ -445,7 +375,7 @@ function VoiceCard({
 
         {item.actions ? (
           <div
-            className="mt-auto grid gap-3 [&>*]:w-full [&>*]:justify-center"
+            className="mt-auto grid gap-1.5 [&>*]:w-full [&>*]:justify-center"
             onClick={(event) => event.stopPropagation()}
           >
             {item.actions}
@@ -480,7 +410,7 @@ export function VoicePicker({
   return (
     <div
       className={cn(
-        "grid grid-cols-1 gap-4 lg:grid-cols-2 2xl:grid-cols-3",
+        "grid grid-cols-1 gap-2.5 lg:grid-cols-2 2xl:grid-cols-3",
         className,
       )}
     >

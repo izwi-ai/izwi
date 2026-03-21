@@ -51,7 +51,7 @@ describe("VoicePicker", () => {
     expect(screen.getByRole("button", { name: "Delete" })).toBeInTheDocument();
   });
 
-  it("updates the custom preview timeline from audio metadata", () => {
+  it("renders a simple preview player timeline without waveform bars", () => {
     const { container } = render(
       <VoicePicker
         items={[
@@ -67,6 +67,9 @@ describe("VoicePicker", () => {
         emptyDescription="Nothing to show"
       />,
     );
+
+    const waveformBars = container.querySelectorAll(".voice-wave-bar");
+    expect(waveformBars.length).toBe(0);
 
     const audio = container.querySelector("audio") as HTMLAudioElement | null;
     expect(audio).not.toBeNull();
