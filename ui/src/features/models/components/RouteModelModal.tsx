@@ -60,6 +60,7 @@ interface RouteModelModalProps {
   sections?: RouteModelSection[];
   canUseModel?: (variant: string) => boolean;
   getModelLabel?: (variant: string) => string;
+  selectionMode?: "route" | "manage";
 }
 
 function formatBytes(bytes: number): string {
@@ -186,6 +187,7 @@ export function RouteModelModal({
   sections,
   canUseModel,
   getModelLabel,
+  selectionMode = "route",
 }: RouteModelModalProps) {
   const [deleteTargetVariant, setDeleteTargetVariant] = useState<string | null>(
     null,
@@ -315,7 +317,10 @@ export function RouteModelModal({
                               </div>
 
                               {providerGroup.models.map((model) => {
+                                const selectionEnabled =
+                                  selectionMode === "route";
                                 const isSelected =
+                                  selectionEnabled &&
                                   selectedVariant === model.variant;
                                 const isIntent = intentVariant === model.variant;
                                 const progressValue =
@@ -324,9 +329,11 @@ export function RouteModelModal({
                                   progressValue?.percent ??
                                   model.download_progress ??
                                   0;
-                                const canSelect = canUseModel
-                                  ? canUseModel(model.variant)
-                                  : true;
+                                const canSelect =
+                                  selectionEnabled &&
+                                  (canUseModel
+                                    ? canUseModel(model.variant)
+                                    : true);
                                 const modelSizeLabel = getModelSizeLabel(
                                   model,
                                   progressValue,
@@ -338,6 +345,7 @@ export function RouteModelModal({
                                 return (
                                   <div
                                     key={model.variant}
+                                    data-testid={`route-model-row-${model.variant}`}
                                     className={clsx(
                                       "rounded-xl border px-3 py-2.5 transition-colors",
                                       isIntent
@@ -433,7 +441,8 @@ export function RouteModelModal({
                                           </button>
                                         )}
 
-                                        {model.status === "ready" &&
+                                        {selectionEnabled &&
+                                          model.status === "ready" &&
                                           canSelect &&
                                           (isSelected ? (
                                             <button

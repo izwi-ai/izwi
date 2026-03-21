@@ -277,7 +277,7 @@ export function DiarizationPage({
   ]);
 
   const openModelManager = () => {
-    setModalIntentModel(resolvedSelectedModel);
+    setModalIntentModel(null);
     setAutoCloseOnIntentReady(false);
     setIsModelModalOpen(true);
   };
@@ -404,10 +404,10 @@ export function DiarizationPage({
         description="Manage pipeline models for /v1/diarizations."
         models={pipelineModels}
         sections={pipelineModelGroups}
-        canUseModel={isDiarizationVariant}
         loading={loading}
-        selectedVariant={resolvedSelectedModel}
+        selectedVariant={null}
         intentVariant={modalIntentModel}
+        selectionMode="manage"
         downloadProgress={downloadProgress}
         onDownload={onDownload}
         onCancelDownload={onCancelDownload}
