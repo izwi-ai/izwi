@@ -1,20 +1,8 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { VoiceStudioPage } from "./route";
-
-const hookMocks = vi.hoisted(() => ({
-  useRouteModelSelection: vi.fn(),
-}));
-
-vi.mock("@/features/models/hooks/useRouteModelSelection", () => ({
-  useRouteModelSelection: hookMocks.useRouteModelSelection,
-}));
-
-vi.mock("@/features/models/components/RouteModelModal", () => ({
-  RouteModelModal: () => null,
-}));
 
 vi.mock("@/features/voices/route", () => ({
   VoicesPage: ({ onAddNewVoice }: { onAddNewVoice?: () => void }) => (
@@ -64,23 +52,7 @@ function renderVoiceStudio(initialEntry: string) {
 }
 
 describe("VoiceStudioPage", () => {
-  beforeEach(() => {
-    hookMocks.useRouteModelSelection.mockReset();
-    hookMocks.useRouteModelSelection.mockReturnValue({
-      routeModels: [],
-      resolvedSelectedModel: null,
-      selectedModelReady: false,
-      isModelModalOpen: false,
-      intentVariant: null,
-      closeModelModal: vi.fn(),
-      openModelManager: vi.fn(),
-      requestModel: vi.fn(),
-      handleModelSelect: vi.fn(),
-      modelOptions: [],
-    });
-  });
-
-  it("defaults to the library tab", () => {
+  it("shows the library content by default", () => {
     renderVoiceStudio("/voice-studio");
 
     expect(screen.getByTestId("studio-library")).toBeInTheDocument();
@@ -88,33 +60,26 @@ describe("VoiceStudioPage", () => {
     expect(screen.queryByTestId("studio-design")).not.toBeInTheDocument();
   });
 
-  it("renders clone tab content from query state", () => {
-    renderVoiceStudio("/voice-studio?tab=clone");
-
-    expect(screen.getByTestId("studio-clone-capture")).toBeInTheDocument();
-    expect(
-      screen.queryByTestId("page-header-history-slot"),
-    ).not.toBeInTheDocument();
-  });
-
-  it("renders design tab content from query state", () => {
+  it("ignores legacy tab query and keeps library-first layout", () => {
     renderVoiceStudio("/voice-studio?tab=design");
 
-    expect(screen.getByTestId("studio-design")).toBeInTheDocument();
-    expect(screen.getByTestId("page-header-history-slot")).toBeInTheDocument();
-  });
-
-  it("falls back to library for unknown tab query", () => {
-    renderVoiceStudio("/voice-studio?tab=unexpected");
-
     expect(screen.getByTestId("studio-library")).toBeInTheDocument();
+    expect(screen.queryByTestId("studio-design")).not.toBeInTheDocument();
   });
 
-  it("switches to design when add voice shortcut is used", () => {
+  it("opens creation modal from the page header action", () => {
+    renderVoiceStudio("/voice-studio");
+
+    fireEvent.click(screen.getByRole("button", { name: "New Voice" }));
+
+    expect(screen.getByRole("dialog", { name: "New Voice" })).toBeInTheDocument();
+  });
+
+  it("opens creation modal when library add shortcut is used", () => {
     renderVoiceStudio("/voice-studio");
 
     fireEvent.click(screen.getByRole("button", { name: "Add Voice Shortcut" }));
 
-    expect(screen.getByTestId("studio-design")).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "New Voice" })).toBeInTheDocument();
   });
 });
