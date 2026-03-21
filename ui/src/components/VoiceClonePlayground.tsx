@@ -35,10 +35,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import {
-  WorkspaceHeader,
-  WorkspacePanel,
-} from "@/components/ui/workspace";
+import { WorkspacePanel } from "@/components/ui/workspace";
 import { useWorkspaceShortcuts } from "@/hooks/useWorkspaceShortcuts";
 import { useDownloadIndicator } from "../utils/useDownloadIndicator";
 
@@ -299,31 +296,7 @@ export function VoiceClonePlayground({
   return (
     <div className="grid items-start gap-6 pb-4 sm:pb-5">
       <div className="flex flex-col">
-        <WorkspaceHeader
-          icon={Users}
-          title="Voice Cloning"
-          description="Prepare a reference, confirm quality, and audition a reusable cloned voice before sending it to TTS."
-          className="border-none pb-0"
-          actions={
-            <Select value={language} onValueChange={setLanguage}>
-              <SelectTrigger className="w-full sm:w-56">
-                <div className="flex min-w-0 items-center gap-2">
-                  <Globe className="h-4 w-4 text-[var(--text-muted)]" />
-                  <SelectValue placeholder="Language" />
-                </div>
-              </SelectTrigger>
-              <SelectContent>
-                {LANGUAGES.map((lang) => (
-                  <SelectItem key={lang.id} value={lang.id}>
-                    {lang.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          }
-        />
-
-        <WorkspacePanel className="mb-6 mt-5 p-4 sm:p-5">
+        <WorkspacePanel className="mb-6 p-4 sm:p-5">
           <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-start">
             <div className="min-w-0 flex-1">
               <div className={clsx(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-2.5")}>
@@ -356,16 +329,33 @@ export function VoiceClonePlayground({
         <div className="space-y-6">
             {/* Voice Reference Section */}
             <WorkspacePanel className="p-6">
-              <div className="flex items-center gap-2 mb-5">
-                <Users className="w-5 h-5 text-[var(--text-muted)]" />
-                <span className={VOICE_ROUTE_PANEL_TITLE_CLASS}>
-                  Voice Reference
-                </span>
-                {isVoiceReady && (
-                  <span className="text-[10px] font-medium px-2 py-0.5 rounded-md bg-green-500/10 text-green-500 border border-green-500/20 ml-2">
-                    Ready
+              <div className="mb-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex items-center gap-2">
+                  <Users className="w-5 h-5 text-[var(--text-muted)]" />
+                  <span className={VOICE_ROUTE_PANEL_TITLE_CLASS}>
+                    Voice Reference
                   </span>
-                )}
+                  {isVoiceReady && (
+                    <span className="ml-2 rounded-md border border-green-500/20 bg-green-500/10 px-2 py-0.5 text-[10px] font-medium text-green-500">
+                      Ready
+                    </span>
+                  )}
+                </div>
+                <Select value={language} onValueChange={setLanguage}>
+                  <SelectTrigger className="w-full sm:w-56">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <Globe className="h-4 w-4 text-[var(--text-muted)]" />
+                      <SelectValue placeholder="Language" />
+                    </div>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {LANGUAGES.map((lang) => (
+                      <SelectItem key={lang.id} value={lang.id}>
+                        {lang.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </div>
               <VoiceClone
                 onVoiceCloneReady={handleVoiceCloneReady}
