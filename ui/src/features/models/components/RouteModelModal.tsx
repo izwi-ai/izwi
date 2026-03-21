@@ -64,6 +64,7 @@ interface RouteModelModalProps {
   canUseModel?: (variant: string) => boolean;
   getModelLabel?: (variant: string) => string;
   selectionMode?: "route" | "manage";
+  zIndexClassName?: string;
 }
 
 function formatBytes(bytes: number): string {
@@ -177,6 +178,7 @@ export function RouteModelModal({
   canUseModel,
   getModelLabel,
   selectionMode = "route",
+  zIndexClassName = "z-50",
 }: RouteModelModalProps) {
   const [deleteTargetVariant, setDeleteTargetVariant] = useState<string | null>(
     null,
@@ -225,7 +227,10 @@ export function RouteModelModal({
     <AnimatePresence>
       {isOpen && (
         <motion.div
-          className="fixed inset-0 z-50 bg-black/70 p-4 backdrop-blur-sm sm:p-6"
+          className={clsx(
+            "fixed inset-0 bg-black/70 p-4 backdrop-blur-sm sm:p-6",
+            zIndexClassName,
+          )}
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}

@@ -145,6 +145,7 @@ export function VoiceStudioPage({
         onDelete={onDelete}
         onUseModel={onSelect}
         emptyMessage={designViewConfig.emptyStateDescription}
+        zIndexClassName="z-[70]"
       />
     </PageShell>
   );
