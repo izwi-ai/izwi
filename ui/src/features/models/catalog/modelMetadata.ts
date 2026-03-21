@@ -309,14 +309,6 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     capabilities: ["Forced Alignment", "Word timestamps", "4-bit"],
     size: "0.7 GB",
   },
-  "Parakeet-TDT-0.6B-v2": {
-    shortName: "Parakeet v2",
-    fullName: "Parakeet-TDT 0.6B v2",
-    description: "English FastConformer-TDT ASR model in .nemo format",
-    category: "asr",
-    capabilities: ["Transcription", "Word timestamps"],
-    size: "4.6 GB",
-  },
   "Parakeet-TDT-0.6B-v3": {
     shortName: "Parakeet v3",
     fullName: "Parakeet-TDT 0.6B v3",

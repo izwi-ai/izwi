@@ -312,13 +312,6 @@ const MODEL_DETAILS: Record<
     size: "0.7 GB",
     quantization: "4-bit",
   },
-  "Parakeet-TDT-0.6B-v2": {
-    shortName: "Parakeet v2",
-    fullName: "Parakeet-TDT 0.6B v2",
-    description: "English FastConformer-TDT ASR model distributed as .nemo",
-    features: ["English ASR", "Word timestamps", ".nemo checkpoint"],
-    size: "4.6 GB",
-  },
   "Parakeet-TDT-0.6B-v3": {
     shortName: "Parakeet v3",
     fullName: "Parakeet-TDT 0.6B v3",

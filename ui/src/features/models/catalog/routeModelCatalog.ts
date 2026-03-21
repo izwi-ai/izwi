@@ -31,7 +31,6 @@ export const VOICE_DESIGN_PREFERRED_MODELS = [
 
 export const TRANSCRIPTION_PREFERRED_MODELS = [
   "Parakeet-TDT-0.6B-v3",
-  "Parakeet-TDT-0.6B-v2",
   "Whisper-Large-v3-Turbo",
 ] as const;
 

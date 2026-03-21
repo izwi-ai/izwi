@@ -487,9 +487,9 @@ mod tests {
         let _guard = env_lock().lock().expect("env lock poisoned");
 
         let root = std::env::temp_dir().join(format!("izwi-parakeet-runtime-{}", Uuid::new_v4()));
-        let model_dir = root.join("Parakeet-TDT-0.6B-v2");
+        let model_dir = root.join("Parakeet-TDT-0.6B-v3");
         std::fs::create_dir_all(&model_dir).unwrap();
-        std::fs::write(model_dir.join("parakeet-tdt-0.6b-v2.nemo"), b"mock-nemo").unwrap();
+        std::fs::write(model_dir.join("parakeet-tdt-0.6b-v3.nemo"), b"mock-nemo").unwrap();
 
         let mut config = EngineConfig::default();
         config.models_dir = root.clone();
@@ -497,7 +497,7 @@ mod tests {
 
         let engine = RuntimeService::new(config).unwrap();
         let err = engine
-            .load_model(ModelVariant::ParakeetTdt06BV2)
+            .load_model(ModelVariant::ParakeetTdt06BV3)
             .await
             .expect_err("invalid .nemo archive should fail to load");
         let msg = err.to_string();

@@ -30,7 +30,6 @@ Izwi supports several model families optimized for different tasks:
 |-------|------|-------------|
 | `Qwen3-ASR-0.6B` | ~1.8 GB | Fast speech-to-text |
 | `Qwen3-ASR-1.7B` | ~4.4 GB | Higher accuracy transcription |
-| `Parakeet-TDT-0.6B-v2` | ~4.6 GB | NVIDIA Parakeet ASR |
 | `Parakeet-TDT-0.6B-v3` | ~9.4 GB | NVIDIA Parakeet ASR (latest) |
 
 ### Speaker Diarization

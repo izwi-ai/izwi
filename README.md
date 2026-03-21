@@ -142,6 +142,6 @@ Apache 2.0
 ## Acknowledgments
 
 - [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) by Alibaba
-- [Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) by NVIDIA
+- [Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) by NVIDIA
 - [Gemma](https://ai.google.dev/gemma) by Google
 - [HuggingFace Hub](https://huggingface.co/) for model hosting

@@ -99,7 +99,7 @@ impl ModelVariant {
             | Qwen3Tts12Hz17BVoiceDesignBf16 => ModelFamily::Qwen3Tts,
             Kokoro82M => ModelFamily::KokoroTts,
             Qwen3TtsTokenizer12Hz => ModelFamily::Tokenizer,
-            ParakeetTdt06BV2 | ParakeetTdt06BV3 => ModelFamily::ParakeetAsr,
+            ParakeetTdt06BV3 => ModelFamily::ParakeetAsr,
             WhisperLargeV3Turbo => ModelFamily::WhisperAsr,
             DiarStreamingSortformer4SpkV21 => ModelFamily::SortformerDiarization,
             Qwen306B | Qwen306B4Bit | Qwen306BGguf | Qwen317B | Qwen317B4Bit | Qwen317BGguf
@@ -217,11 +217,7 @@ pub fn resolve_asr_model_variant(input: Option<&str>) -> ModelVariant {
             {
                 WhisperLargeV3Turbo
             } else if normalized.contains("parakeet") {
-                if normalized.contains("v2") {
-                    ParakeetTdt06BV2
-                } else {
-                    ParakeetTdt06BV3
-                }
+                ParakeetTdt06BV3
             } else {
                 ParakeetTdt06BV3
             }
@@ -262,10 +258,7 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
     }
 
     if normalized.contains("parakeet") && normalized.contains("tdt") {
-        if normalized.contains("v3") {
-            return Some(ParakeetTdt06BV3);
-        }
-        return Some(ParakeetTdt06BV2);
+        return Some(ParakeetTdt06BV3);
     }
 
     if normalized.contains("whisper")
@@ -596,9 +589,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_asr_accepts_parakeet() {
-        let resolved = resolve_asr_model_variant(Some("nvidia/parakeet-tdt-0.6b-v2"));
-        assert_eq!(resolved, ModelVariant::ParakeetTdt06BV2);
+    fn resolve_asr_accepts_unversioned_parakeet_family_name() {
+        let resolved = resolve_asr_model_variant(Some("parakeet-tdt-0.6b"));
+        assert_eq!(resolved, ModelVariant::ParakeetTdt06BV3);
     }
 
     #[test]

@@ -170,7 +170,7 @@ export function DiarizationPage({
   );
 
   const preferredDiarizationModelOrder = ["diar_streaming_sortformer_4spk-v2.1"];
-  const preferredAsrModelOrder = ["Parakeet-TDT-0.6B-v3", "Parakeet-TDT-0.6B-v2"];
+  const preferredAsrModelOrder = ["Parakeet-TDT-0.6B-v3"];
   const preferredAlignerModelOrder = ["Qwen3-ForcedAligner-0.6B"];
   const preferredLlmModelOrder = ["Qwen3-1.7B-GGUF"];
 

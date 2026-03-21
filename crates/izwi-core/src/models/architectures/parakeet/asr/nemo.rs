@@ -22,7 +22,6 @@ pub fn ensure_parakeet_artifacts(
     variant: ModelVariant,
 ) -> Result<ParakeetArtifacts> {
     let nemo_filename = match variant {
-        ModelVariant::ParakeetTdt06BV2 => "parakeet-tdt-0.6b-v2.nemo",
         ModelVariant::ParakeetTdt06BV3 => "parakeet-tdt-0.6b-v3.nemo",
         _ => {
             return Err(Error::InvalidInput(format!(

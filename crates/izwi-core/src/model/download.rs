@@ -445,7 +445,6 @@ impl ModelDownloader {
             ModelFamily::ParakeetAsr => {
                 if variant.is_parakeet_nemo() {
                     let nemo_file = match variant {
-                        ModelVariant::ParakeetTdt06BV2 => "parakeet-tdt-0.6b-v2.nemo",
                         ModelVariant::ParakeetTdt06BV3 => "parakeet-tdt-0.6b-v3.nemo",
                         _ => unreachable!("checked by is_parakeet_nemo"),
                     };
@@ -962,7 +961,6 @@ impl ModelDownloader {
             ModelFamily::ParakeetAsr => {
                 if variant.is_parakeet_nemo() {
                     let nemo_file = match variant {
-                        ModelVariant::ParakeetTdt06BV2 => "parakeet-tdt-0.6b-v2.nemo",
                         ModelVariant::ParakeetTdt06BV3 => "parakeet-tdt-0.6b-v3.nemo",
                         _ => unreachable!("checked by is_parakeet_nemo"),
                     };
@@ -1453,7 +1451,6 @@ impl ModelDownloader {
             550_000
         } else if file.ends_with(".nemo") {
             match variant {
-                ModelVariant::ParakeetTdt06BV2 => 4_926_457_088,
                 ModelVariant::ParakeetTdt06BV3 => 10_036_761_167,
                 ModelVariant::DiarStreamingSortformer4SpkV21 => 510_000_000,
                 _ => 4_000_000_000,

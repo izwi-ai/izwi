@@ -81,9 +81,6 @@ pub enum ModelVariant {
     /// Kokoro-82M TTS model from hexgrad
     #[serde(rename = "Kokoro-82M")]
     Kokoro82M,
-    /// Parakeet TDT 0.6B v2 ASR model (.nemo)
-    #[serde(rename = "Parakeet-TDT-0.6B-v2", alias = "Parakeet-TDT-0.6B-v2-4bit")]
-    ParakeetTdt06BV2,
     /// Parakeet TDT 0.6B v3 ASR model (.nemo)
     #[serde(rename = "Parakeet-TDT-0.6B-v3", alias = "Parakeet-TDT-0.6B-v3-4bit")]
     ParakeetTdt06BV3,
@@ -221,7 +218,6 @@ impl ModelVariant {
             Self::Lfm2512BThinkingGguf => "LiquidAI/LFM2.5-1.2B-Thinking-GGUF",
             Self::Lfm25Audio15BGguf => "LiquidAI/LFM2.5-Audio-1.5B-GGUF",
             Self::Kokoro82M => "hexgrad/Kokoro-82M",
-            Self::ParakeetTdt06BV2 => "nvidia/parakeet-tdt-0.6b-v2",
             Self::ParakeetTdt06BV3 => "nvidia/parakeet-tdt-0.6b-v3",
             Self::WhisperLargeV3Turbo => "openai/whisper-large-v3-turbo",
             Self::DiarStreamingSortformer4SpkV21 => "nvidia/diar_streaming_sortformer_4spk-v2.1",
@@ -270,7 +266,6 @@ impl ModelVariant {
             Self::Lfm2512BThinkingGguf => "LFM2.5 1.2B Thinking GGUF",
             Self::Lfm25Audio15BGguf => "LFM2.5 Audio 1.5B GGUF",
             Self::Kokoro82M => "Kokoro 82M",
-            Self::ParakeetTdt06BV2 => "Parakeet TDT 0.6B v2",
             Self::ParakeetTdt06BV3 => "Parakeet TDT 0.6B v3",
             Self::WhisperLargeV3Turbo => "Whisper Large v3 Turbo",
             Self::DiarStreamingSortformer4SpkV21 => "Streaming Sortformer 4spk v2.1",
@@ -319,7 +314,6 @@ impl ModelVariant {
             Self::Lfm2512BThinkingGguf => "LFM2.5-1.2B-Thinking-GGUF",
             Self::Lfm25Audio15BGguf => "LFM2.5-Audio-1.5B-GGUF",
             Self::Kokoro82M => "Kokoro-82M",
-            Self::ParakeetTdt06BV2 => "Parakeet-TDT-0.6B-v2",
             Self::ParakeetTdt06BV3 => "Parakeet-TDT-0.6B-v3",
             Self::WhisperLargeV3Turbo => "Whisper-Large-v3-Turbo",
             Self::DiarStreamingSortformer4SpkV21 => "diar_streaming_sortformer_4spk-v2.1",
@@ -368,7 +362,6 @@ impl ModelVariant {
             Self::Lfm2512BThinkingGguf => 730_895_360,  // ~0.68 GB (GGUF Q4_K_M, HF tree)
             Self::Lfm25Audio15BGguf => 1_220_000_000,   // ~1.14 GB (four-file GGUF bundle, est)
             Self::Kokoro82M => 363_323_757,             // ~346 MB (HF tree total, Apr 2025)
-            Self::ParakeetTdt06BV2 => 4_926_457_088,    // ~4.59 GB
             Self::ParakeetTdt06BV3 => 10_036_761_167,   // ~9.35 GB
             Self::WhisperLargeV3Turbo => 1_617_824_864, // ~1.51 GB (HF x-linked-size)
             Self::DiarStreamingSortformer4SpkV21 => 510_000_000, // ~0.47 GB (est)
@@ -416,7 +409,6 @@ impl ModelVariant {
             Self::Lfm2512BInstructGguf | Self::Lfm2512BThinkingGguf => 2.0,
             Self::Lfm25Audio15BGguf => 5.0,
             Self::Kokoro82M => 2.0,
-            Self::ParakeetTdt06BV2 => 8.0,
             Self::ParakeetTdt06BV3 => 12.0,
             Self::WhisperLargeV3Turbo => 4.0,
             Self::DiarStreamingSortformer4SpkV21 => 3.0,
@@ -617,7 +609,7 @@ impl ModelVariant {
 
     /// Whether this is a legacy .nemo Parakeet variant.
     pub fn is_parakeet_nemo(&self) -> bool {
-        matches!(self, Self::ParakeetTdt06BV2 | Self::ParakeetTdt06BV3)
+        matches!(self, Self::ParakeetTdt06BV3)
     }
 
     /// Whether this is an MLX-exported Parakeet variant.
@@ -739,7 +731,7 @@ impl ModelVariant {
             | Self::Kokoro82M => true,
             Self::Gemma34BIt => false,
             Self::VoxtralMini4BRealtime2602 => false,
-            Self::ParakeetTdt06BV2 | Self::ParakeetTdt06BV3 => true,
+            Self::ParakeetTdt06BV3 => true,
             Self::WhisperLargeV3Turbo => true,
             Self::DiarStreamingSortformer4SpkV21 => true,
             Self::Qwen3ForcedAligner06B => true,
@@ -771,7 +763,6 @@ impl ModelVariant {
             Self::Lfm2512BThinkingGguf,
             Self::Lfm25Audio15BGguf,
             Self::Kokoro82M,
-            Self::ParakeetTdt06BV2,
             Self::ParakeetTdt06BV3,
             Self::WhisperLargeV3Turbo,
             Self::DiarStreamingSortformer4SpkV21,
