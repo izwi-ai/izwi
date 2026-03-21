@@ -39,6 +39,7 @@ describe("TranscriptionReviewWorkspace", () => {
     vi.spyOn(window.HTMLMediaElement.prototype, "pause").mockImplementation(
       () => {},
     );
+    HTMLElement.prototype.scrollIntoView = vi.fn();
   });
 
   it("supports transcript seeking and active-row highlighting", () => {
@@ -99,5 +100,61 @@ describe("TranscriptionReviewWorkspace", () => {
       screen.queryByRole("slider", { name: "Seek audio timeline" }),
     ).not.toBeInTheDocument();
     expect(screen.getByText("Follow up.")).toBeInTheDocument();
+  });
+
+  it("keeps the playback controls pinned in the sticky footer", () => {
+    render(
+      <TranscriptionReviewWorkspace
+        record={record}
+        audioUrl="/audio/meeting.wav"
+        stickyPlaybackFooter={true}
+      />,
+    );
+
+    expect(screen.getByTestId("transcription-review-player")).toHaveClass(
+      "sticky",
+    );
+  });
+
+  it("auto-scrolls the active transcript entry into view during playback when enabled", () => {
+    const { container } = render(
+      <TranscriptionReviewWorkspace
+        record={record}
+        audioUrl="/audio/meeting.wav"
+        autoScrollActiveEntry={true}
+      />,
+    );
+
+    const audio = container.querySelector("audio");
+    expect(audio).not.toBeNull();
+
+    Object.defineProperty(audio, "duration", {
+      configurable: true,
+      value: 6,
+    });
+    Object.defineProperty(audio, "currentTime", {
+      configurable: true,
+      writable: true,
+      value: 0,
+    });
+
+    fireEvent.loadedMetadata(audio!);
+    fireEvent.play(audio!);
+
+    const scrollSpy = vi.spyOn(HTMLElement.prototype, "scrollIntoView");
+    scrollSpy.mockClear();
+
+    audio!.currentTime = 3;
+    fireEvent.timeUpdate(audio!);
+
+    expect(screen.getByText("Follow up.").closest("button")).toHaveAttribute(
+      "data-active",
+      "true",
+    );
+    expect(scrollSpy).toHaveBeenCalledWith({
+      behavior: "smooth",
+      block: "center",
+      inline: "nearest",
+    });
   });
 });

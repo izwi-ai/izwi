@@ -413,6 +413,9 @@ describe("TranscriptionPlayground history", () => {
     expect(
       screen.getByRole("heading", { name: "clip.wav" }),
     ).toBeInTheDocument();
+    expect(
+      screen.getByTestId("transcription-history-modal-body"),
+    ).toHaveClass("overflow-y-auto");
     expect(screen.getByTitle("Open older record")).toBeInTheDocument();
     expect(screen.queryByText("Performance")).not.toBeInTheDocument();
   });
