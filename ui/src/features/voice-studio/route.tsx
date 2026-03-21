@@ -1,37 +1,21 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Library, Sparkles, Users } from "lucide-react";
 import type { ModelInfo } from "@/api";
+import { VoiceClonePlayground } from "@/components/VoiceClonePlayground";
+import { VoiceDesignWorkspace } from "@/components/VoiceDesignWorkspace";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { WorkspacePanel } from "@/components/ui/workspace";
 import { VoicesPage } from "@/features/voices/route";
+import {
+  VOICE_CLONING_PREFERRED_MODELS,
+  VOICE_DESIGN_PREFERRED_MODELS,
+  resolvePreferredRouteModel,
+} from "@/features/models/catalog/routeModelCatalog";
+import { RouteModelModal } from "@/features/models/components/RouteModelModal";
+import { useRouteModelSelection } from "@/features/models/hooks/useRouteModelSelection";
+import { VIEW_CONFIGS } from "@/types";
 
 type VoiceStudioTab = "library" | "clone" | "design";
-
-const TAB_LABELS: Record<VoiceStudioTab, string> = {
-  library: "Library",
-  clone: "Clone",
-  design: "Design",
-};
-
-function resolveTab(value: string | null): VoiceStudioTab {
-  if (value === "clone" || value === "design" || value === "library") {
-    return value;
-  }
-  return "library";
-}
-
-function tabIcon(tab: VoiceStudioTab) {
-  switch (tab) {
-    case "clone":
-      return Users;
-    case "design":
-      return Sparkles;
-    default:
-      return Library;
-  }
-}
 
 interface VoiceStudioPageProps {
   models: ModelInfo[];
@@ -56,6 +40,13 @@ interface VoiceStudioPageProps {
   onError: (message: string) => void;
 }
 
+function resolveTab(value: string | null): VoiceStudioTab {
+  if (value === "clone" || value === "design" || value === "library") {
+    return value;
+  }
+  return "library";
+}
+
 export function VoiceStudioPage({
   models,
   selectedModel,
@@ -72,25 +63,101 @@ export function VoiceStudioPage({
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
   const activeTab = resolveTab(searchParams.get("tab"));
+  const [cloneHistoryActionContainer, setCloneHistoryActionContainer] =
+    useState<HTMLDivElement | null>(null);
+  const [designHistoryActionContainer, setDesignHistoryActionContainer] =
+    useState<HTMLDivElement | null>(null);
 
-  const title = useMemo(() => TAB_LABELS[activeTab], [activeTab]);
-  const Icon = useMemo(() => tabIcon(activeTab), [activeTab]);
+  const cloneViewConfig = VIEW_CONFIGS["voice-clone"];
+  const {
+    routeModels: cloneRouteModels,
+    resolvedSelectedModel: cloneResolvedModel,
+    selectedModelReady: cloneModelReady,
+    isModelModalOpen: isCloneModelModalOpen,
+    intentVariant: cloneIntentVariant,
+    closeModelModal: closeCloneModelModal,
+    openModelManager: openCloneModelManager,
+    requestModel: requestCloneModel,
+    handleModelSelect: handleCloneModelSelect,
+    modelOptions: cloneModelOptions,
+  } = useRouteModelSelection({
+    models,
+    selectedModel,
+    onSelect,
+    modelFilter: cloneViewConfig.modelFilter,
+    resolveSelectedModel: (routeModels, currentModel) =>
+      resolvePreferredRouteModel({
+        models: routeModels,
+        selectedModel: currentModel,
+        preferredVariants: VOICE_CLONING_PREFERRED_MODELS,
+      }),
+  });
 
-  const handleTabChange = (nextValue: string) => {
-    const nextTab = resolveTab(nextValue);
+  const designViewConfig = VIEW_CONFIGS["voice-design"];
+  const {
+    routeModels: designRouteModels,
+    resolvedSelectedModel: designResolvedModel,
+    selectedModelReady: designModelReady,
+    isModelModalOpen: isDesignModelModalOpen,
+    intentVariant: designIntentVariant,
+    closeModelModal: closeDesignModelModal,
+    openModelManager: openDesignModelManager,
+    requestModel: requestDesignModel,
+    handleModelSelect: handleDesignModelSelect,
+    modelOptions: designModelOptions,
+  } = useRouteModelSelection({
+    models,
+    selectedModel,
+    onSelect,
+    modelFilter: designViewConfig.modelFilter,
+    resolveSelectedModel: (routeModels, currentModel) =>
+      resolvePreferredRouteModel({
+        models: routeModels,
+        selectedModel: currentModel,
+        preferredVariants: VOICE_DESIGN_PREFERRED_MODELS,
+      }),
+  });
+
+  const setStudioTab = (nextTab: VoiceStudioTab) => {
     const nextSearchParams = new URLSearchParams(searchParams);
     nextSearchParams.set("tab", nextTab);
     setSearchParams(nextSearchParams, { replace: true });
   };
 
+  const description = useMemo(() => {
+    if (activeTab === "clone") {
+      return "Clone custom voices from reference audio and save them for text-to-speech workflows.";
+    }
+    if (activeTab === "design") {
+      return "Create new voices from natural-language prompts, compare candidates, and save your best option.";
+    }
+    return "Manage saved and built-in voices, then move seamlessly into cloning and voice design workflows.";
+  }, [activeTab]);
+
+  const headerActions =
+    activeTab === "clone" ? (
+      <div
+        ref={setCloneHistoryActionContainer}
+        data-testid="page-header-history-slot"
+        className="flex min-h-9 items-center"
+      />
+    ) : activeTab === "design" ? (
+      <div
+        ref={setDesignHistoryActionContainer}
+        data-testid="page-header-history-slot"
+        className="flex min-h-9 items-center"
+      />
+    ) : undefined;
+
   return (
     <PageShell>
-      <PageHeader
-        title="Voice Studio"
-        description="Manage reusable voices and switch between cloning and design workflows in one place."
-      />
+      <PageHeader title="Voice Studio" description={description} actions={headerActions} />
 
-      <Tabs value={activeTab} onValueChange={handleTabChange} className="w-full">
+      <Tabs
+        value={activeTab}
+        onValueChange={(value) => setStudioTab(resolveTab(value))}
+        className="w-full"
+      >
         <TabsList className="grid h-10 w-full max-w-[22rem] grid-cols-3 overflow-hidden rounded-[var(--radius-pill)] border-[var(--border-strong)] bg-[var(--bg-surface-2)] p-[2px] shadow-none">
           <TabsTrigger
             value="library"
@@ -113,8 +180,8 @@ export function VoiceStudioPage({
         </TabsList>
       </Tabs>
 
-      {activeTab === "library" ? (
-        <div className="mt-5">
+      <div className="mt-5 pb-4 sm:pb-5">
+        {activeTab === "library" ? (
           <VoicesPage
             models={models}
             selectedModel={selectedModel}
@@ -128,31 +195,84 @@ export function VoiceStudioPage({
             onSelect={onSelect}
             onError={onError}
             embedded
-            onAddNewVoice={() => {
-              const nextSearchParams = new URLSearchParams(searchParams);
-              nextSearchParams.set("tab", "design");
-              navigate(`/voice-studio?${nextSearchParams.toString()}`);
-            }}
+            onAddNewVoice={() => setStudioTab("design")}
           />
-        </div>
-      ) : (
-        <WorkspacePanel className="mt-5 p-5 sm:p-6">
-          <div className="flex items-start gap-3">
-            <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-2)] p-2 text-[var(--text-secondary)]">
-              <Icon className="h-4 w-4" />
-            </div>
-            <div>
-              <h3 className="text-lg font-semibold text-[var(--text-primary)]">
-                {title} workspace
-              </h3>
-              <p className="mt-1 text-sm text-[var(--text-secondary)]">
-                This tab is now wired into Voice Studio and will gain full
-                integrated controls in the next commit.
-              </p>
-            </div>
-          </div>
-        </WorkspacePanel>
-      )}
+        ) : null}
+
+        {activeTab === "clone" ? (
+          <VoiceClonePlayground
+            selectedModel={cloneResolvedModel}
+            selectedModelReady={cloneModelReady}
+            modelOptions={cloneModelOptions}
+            onSelectModel={handleCloneModelSelect}
+            onOpenModelManager={openCloneModelManager}
+            onModelRequired={() => {
+              requestCloneModel();
+              onError("Select and load a Base model to clone voices.");
+            }}
+            onUseInTts={(voiceId) =>
+              navigate(`/text-to-speech?voiceId=${encodeURIComponent(voiceId)}`)
+            }
+            historyActionContainer={cloneHistoryActionContainer}
+          />
+        ) : null}
+
+        {activeTab === "design" ? (
+          <VoiceDesignWorkspace
+            selectedModel={designResolvedModel}
+            selectedModelReady={designModelReady}
+            modelOptions={designModelOptions}
+            onSelectModel={handleDesignModelSelect}
+            onOpenModelManager={openDesignModelManager}
+            onModelRequired={() => {
+              requestDesignModel();
+              onError("Select and load a VoiceDesign model to continue.");
+            }}
+            onUseInTts={(voiceId) =>
+              navigate(`/text-to-speech?voiceId=${encodeURIComponent(voiceId)}`)
+            }
+            historyActionContainer={designHistoryActionContainer}
+          />
+        ) : null}
+      </div>
+
+      <RouteModelModal
+        isOpen={isCloneModelModalOpen}
+        onClose={closeCloneModelModal}
+        title="Voice Cloning Models"
+        description="Manage Base models for this route."
+        models={cloneRouteModels}
+        loading={loading}
+        selectedVariant={cloneResolvedModel}
+        intentVariant={cloneIntentVariant}
+        downloadProgress={downloadProgress}
+        onDownload={onDownload}
+        onCancelDownload={onCancelDownload}
+        onLoad={onLoad}
+        onUnload={onUnload}
+        onDelete={onDelete}
+        onUseModel={onSelect}
+        emptyMessage={cloneViewConfig.emptyStateDescription}
+      />
+
+      <RouteModelModal
+        isOpen={isDesignModelModalOpen}
+        onClose={closeDesignModelModal}
+        title="Voice Design Models"
+        description="Manage VoiceDesign models for this route."
+        models={designRouteModels}
+        loading={loading}
+        selectedVariant={designResolvedModel}
+        intentVariant={designIntentVariant}
+        downloadProgress={downloadProgress}
+        onDownload={onDownload}
+        onCancelDownload={onCancelDownload}
+        onLoad={onLoad}
+        onUnload={onUnload}
+        onDelete={onDelete}
+        onUseModel={onSelect}
+        emptyMessage={designViewConfig.emptyStateDescription}
+      />
     </PageShell>
   );
 }
