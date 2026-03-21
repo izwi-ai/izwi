@@ -39,6 +39,7 @@ function VoiceCreationModalHarness() {
     <VoiceCreationModal
       open={open}
       onOpenChange={setOpen}
+      onUseSavedVoiceInTts={vi.fn()}
       designModel={null}
       designModelReady={false}
       designModelOptions={[]}
@@ -84,9 +85,8 @@ describe("VoiceCreationModal", () => {
     fireEvent.click(screen.getByRole("button", { name: /Clone Voice/i }));
     fireEvent.click(screen.getByRole("button", { name: "Save mock voice" }));
 
-    expect(
-      screen.getByText("Saved voice profile is ready in your library."),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Voice Saved" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Use in Text to Speech" })).toBeInTheDocument();
   });
 
   it("renders design workspace and shows a saved confirmation message", () => {
@@ -97,7 +97,42 @@ describe("VoiceCreationModal", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Save designed voice" }));
     expect(
-      screen.getByText("Designed voice is saved and available in your library."),
+      screen.getByText("Voice saved successfully"),
     ).toBeInTheDocument();
+  });
+
+  it("sends the saved voice to text to speech from success actions", () => {
+    const onUseSavedVoiceInTts = vi.fn();
+    function HarnessWithTtsCallback() {
+      const [open, setOpen] = useState(true);
+      return (
+        <VoiceCreationModal
+          open={open}
+          onOpenChange={setOpen}
+          onUseSavedVoiceInTts={onUseSavedVoiceInTts}
+          designModel={null}
+          designModelReady={false}
+          designModelOptions={[]}
+          onDesignModelRequired={vi.fn()}
+        />
+      );
+    }
+
+    render(<HarnessWithTtsCallback />);
+    fireEvent.click(screen.getByRole("button", { name: /Clone Voice/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Save mock voice" }));
+    fireEvent.click(screen.getByRole("button", { name: "Use in Text to Speech" }));
+
+    expect(onUseSavedVoiceInTts).toHaveBeenCalledWith("saved-voice-1");
+  });
+
+  it("allows starting another creation flow from success state", () => {
+    render(<VoiceCreationModalHarness />);
+    fireEvent.click(screen.getByRole("button", { name: /Clone Voice/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Save mock voice" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create Another" }));
+
+    expect(screen.getByRole("dialog", { name: "New Voice" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Design Voice/i })).toBeInTheDocument();
   });
 });

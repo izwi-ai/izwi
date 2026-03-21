@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Plus } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 import type { ModelInfo } from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import { Button } from "@/components/ui/button";
@@ -49,6 +50,7 @@ export function VoiceStudioPage({
   onSelect,
   onError,
 }: VoiceStudioPageProps) {
+  const navigate = useNavigate();
   const [isCreationModalOpen, setIsCreationModalOpen] = useState(false);
   const designViewConfig = VIEW_CONFIGS["voice-design"];
   const {
@@ -112,6 +114,9 @@ export function VoiceStudioPage({
       <VoiceCreationModal
         open={isCreationModalOpen}
         onOpenChange={setIsCreationModalOpen}
+        onUseSavedVoiceInTts={(voiceId) =>
+          navigate(`/text-to-speech?voiceId=${encodeURIComponent(voiceId)}`)
+        }
         designModel={designResolvedModel}
         designModelReady={designModelReady}
         designModelOptions={designModelOptions}

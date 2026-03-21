@@ -16,6 +16,7 @@ type CreationStep = "choice" | "clone" | "design" | "success";
 interface VoiceCreationModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  onUseSavedVoiceInTts?: (voiceId: string) => void;
   designModel: string | null;
   designModelReady: boolean;
   designModelOptions: Array<{
@@ -58,6 +59,7 @@ function stepDescription(step: CreationStep): string {
 export function VoiceCreationModal({
   open,
   onOpenChange,
+  onUseSavedVoiceInTts,
   designModel,
   designModelReady,
   designModelOptions,
@@ -67,17 +69,16 @@ export function VoiceCreationModal({
 }: VoiceCreationModalProps) {
   const [step, setStep] = useState<CreationStep>("choice");
   const [hasDraftProgress, setHasDraftProgress] = useState(false);
-  const [savedCloneVoiceId, setSavedCloneVoiceId] = useState<string | null>(null);
-  const [savedDesignVoiceId, setSavedDesignVoiceId] = useState<string | null>(
-    null,
-  );
+  const [savedVoiceResult, setSavedVoiceResult] = useState<{
+    voiceId: string;
+    source: "clone" | "design";
+  } | null>(null);
 
   useEffect(() => {
     if (!open) {
       setStep("choice");
       setHasDraftProgress(false);
-      setSavedCloneVoiceId(null);
-      setSavedDesignVoiceId(null);
+      setSavedVoiceResult(null);
     }
   }, [open]);
 
@@ -96,8 +97,13 @@ export function VoiceCreationModal({
   const handleStepSelect = (nextStep: "clone" | "design") => {
     setStep(nextStep);
     setHasDraftProgress(true);
-    setSavedCloneVoiceId(null);
-    setSavedDesignVoiceId(null);
+    setSavedVoiceResult(null);
+  };
+
+  const handleSavedVoice = (voiceId: string, source: "clone" | "design") => {
+    setSavedVoiceResult({ voiceId, source });
+    setHasDraftProgress(false);
+    setStep("success");
   };
 
   return (
@@ -121,7 +127,7 @@ export function VoiceCreationModal({
                   {stepDescription(step)}
                 </DialogDescription>
               </div>
-              {step !== "choice" ? (
+              {step !== "choice" && step !== "success" ? (
                 <Button
                   variant="ghost"
                   size="sm"
@@ -129,6 +135,7 @@ export function VoiceCreationModal({
                   onClick={() => {
                     setStep("choice");
                     setHasDraftProgress(false);
+                    setSavedVoiceResult(null);
                   }}
                 >
                   <ArrowLeft className="h-3.5 w-3.5" />
@@ -178,13 +185,8 @@ export function VoiceCreationModal({
             <div className="space-y-3">
               <VoiceCaptureWorkspace
                 layout="modal"
-                onVoiceSaved={setSavedCloneVoiceId}
+                onVoiceSaved={(voiceId) => handleSavedVoice(voiceId, "clone")}
               />
-              {savedCloneVoiceId ? (
-                <div className="rounded-lg border border-[var(--status-positive-border)] bg-[var(--status-positive-bg)] px-3 py-2 text-xs font-medium text-[var(--status-positive-text)]">
-                  Saved voice profile is ready in your library.
-                </div>
-              ) : null}
             </div>
           ) : null}
 
@@ -198,16 +200,56 @@ export function VoiceCreationModal({
                 onOpenModelManager={onOpenDesignModelManager}
                 onModelRequired={onDesignModelRequired}
                 embeddedInModal
-                onVoiceSaved={(voiceId) => {
-                  setSavedDesignVoiceId(voiceId);
-                  setHasDraftProgress(false);
-                }}
+                onVoiceSaved={(voiceId) => handleSavedVoice(voiceId, "design")}
               />
-              {savedDesignVoiceId ? (
-                <div className="rounded-lg border border-[var(--status-positive-border)] bg-[var(--status-positive-bg)] px-3 py-2 text-xs font-medium text-[var(--status-positive-text)]">
-                  Designed voice is saved and available in your library.
-                </div>
-              ) : null}
+            </div>
+          ) : null}
+
+          {step === "success" ? (
+            <div className="space-y-4">
+              <div className="rounded-xl border border-[var(--status-positive-border)] bg-[var(--status-positive-bg)] px-4 py-4">
+                <h3 className="text-sm font-semibold text-[var(--status-positive-text)]">
+                  Voice saved successfully
+                </h3>
+                <p className="mt-1 text-sm text-[var(--status-positive-text)]/90">
+                  {savedVoiceResult?.source === "design"
+                    ? "Your designed voice is ready in the library and available for Text to Speech."
+                    : "Your cloned voice is ready in the library and available for Text to Speech."}
+                </p>
+              </div>
+
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                <Button
+                  className="h-10 rounded-[var(--radius-pill)] px-4 text-sm"
+                  disabled={!savedVoiceResult || !onUseSavedVoiceInTts}
+                  onClick={() => {
+                    if (!savedVoiceResult || !onUseSavedVoiceInTts) {
+                      return;
+                    }
+                    onUseSavedVoiceInTts(savedVoiceResult.voiceId);
+                    onOpenChange(false);
+                  }}
+                >
+                  Use in Text to Speech
+                </Button>
+                <Button
+                  variant="outline"
+                  className="h-10 rounded-[var(--radius-pill)] border-[var(--border-strong)] px-4 text-sm"
+                  onClick={() => {
+                    setStep("choice");
+                    setSavedVoiceResult(null);
+                  }}
+                >
+                  Create Another
+                </Button>
+                <Button
+                  variant="ghost"
+                  className="h-10 rounded-[var(--radius-pill)] px-4 text-sm"
+                  onClick={() => onOpenChange(false)}
+                >
+                  Back to Library
+                </Button>
+              </div>
             </div>
           ) : null}
         </div>
