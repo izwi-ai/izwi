@@ -14,6 +14,7 @@ import {
   Menu,
   Sun,
   Moon,
+  FileAudio,
 } from "lucide-react";
 import {
   APP_ICON_URL,
@@ -90,6 +91,13 @@ const CREATION_NAV_ITEMS: NavItem[] = VOICE_STUDIO_ENABLED
         icon: Mic,
         path: "/text-to-speech",
       },
+      {
+        id: "tts-projects",
+        label: "Projects",
+        description: "Reusable long-form TTS scripts",
+        icon: FileAudio,
+        path: "/tts-projects",
+      },
     ]
   : [
       {
@@ -105,6 +113,13 @@ const CREATION_NAV_ITEMS: NavItem[] = VOICE_STUDIO_ENABLED
         description: "Output speech from text",
         icon: Mic,
         path: "/text-to-speech",
+      },
+      {
+        id: "tts-projects",
+        label: "Projects",
+        description: "Reusable long-form TTS scripts",
+        icon: FileAudio,
+        path: "/tts-projects",
       },
       {
         id: "voice-cloning",
