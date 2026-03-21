@@ -1,13 +1,12 @@
 import { useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import type { ModelInfo } from "@/api";
-import { VoiceClonePlayground } from "@/components/VoiceClonePlayground";
+import { VoiceCaptureWorkspace } from "@/components/VoiceCaptureWorkspace";
 import { VoiceDesignWorkspace } from "@/components/VoiceDesignWorkspace";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { VoicesPage } from "@/features/voices/route";
 import {
-  VOICE_CLONING_PREFERRED_MODELS,
   VOICE_DESIGN_PREFERRED_MODELS,
   resolvePreferredRouteModel,
 } from "@/features/models/catalog/routeModelCatalog";
@@ -63,35 +62,8 @@ export function VoiceStudioPage({
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
   const activeTab = resolveTab(searchParams.get("tab"));
-  const [cloneHistoryActionContainer, setCloneHistoryActionContainer] =
-    useState<HTMLDivElement | null>(null);
   const [designHistoryActionContainer, setDesignHistoryActionContainer] =
     useState<HTMLDivElement | null>(null);
-
-  const cloneViewConfig = VIEW_CONFIGS["voice-clone"];
-  const {
-    routeModels: cloneRouteModels,
-    resolvedSelectedModel: cloneResolvedModel,
-    selectedModelReady: cloneModelReady,
-    isModelModalOpen: isCloneModelModalOpen,
-    intentVariant: cloneIntentVariant,
-    closeModelModal: closeCloneModelModal,
-    openModelManager: openCloneModelManager,
-    requestModel: requestCloneModel,
-    handleModelSelect: handleCloneModelSelect,
-    modelOptions: cloneModelOptions,
-  } = useRouteModelSelection({
-    models,
-    selectedModel,
-    onSelect,
-    modelFilter: cloneViewConfig.modelFilter,
-    resolveSelectedModel: (routeModels, currentModel) =>
-      resolvePreferredRouteModel({
-        models: routeModels,
-        selectedModel: currentModel,
-        preferredVariants: VOICE_CLONING_PREFERRED_MODELS,
-      }),
-  });
 
   const designViewConfig = VIEW_CONFIGS["voice-design"];
   const {
@@ -126,7 +98,7 @@ export function VoiceStudioPage({
 
   const description = useMemo(() => {
     if (activeTab === "clone") {
-      return "Clone custom voices from reference audio and save them for text-to-speech workflows.";
+      return "Capture voice references with transcript and save reusable voice profiles for Text to Speech.";
     }
     if (activeTab === "design") {
       return "Create new voices from natural-language prompts, compare candidates, and save your best option.";
@@ -135,13 +107,7 @@ export function VoiceStudioPage({
   }, [activeTab]);
 
   const headerActions =
-    activeTab === "clone" ? (
-      <div
-        ref={setCloneHistoryActionContainer}
-        data-testid="page-header-history-slot"
-        className="flex min-h-9 items-center"
-      />
-    ) : activeTab === "design" ? (
+    activeTab === "design" ? (
       <div
         ref={setDesignHistoryActionContainer}
         data-testid="page-header-history-slot"
@@ -200,20 +166,10 @@ export function VoiceStudioPage({
         ) : null}
 
         {activeTab === "clone" ? (
-          <VoiceClonePlayground
-            selectedModel={cloneResolvedModel}
-            selectedModelReady={cloneModelReady}
-            modelOptions={cloneModelOptions}
-            onSelectModel={handleCloneModelSelect}
-            onOpenModelManager={openCloneModelManager}
-            onModelRequired={() => {
-              requestCloneModel();
-              onError("Select and load a Base model to clone voices.");
-            }}
+          <VoiceCaptureWorkspace
             onUseInTts={(voiceId) =>
               navigate(`/text-to-speech?voiceId=${encodeURIComponent(voiceId)}`)
             }
-            historyActionContainer={cloneHistoryActionContainer}
           />
         ) : null}
 
@@ -235,25 +191,6 @@ export function VoiceStudioPage({
           />
         ) : null}
       </div>
-
-      <RouteModelModal
-        isOpen={isCloneModelModalOpen}
-        onClose={closeCloneModelModal}
-        title="Voice Cloning Models"
-        description="Manage Base models for this route."
-        models={cloneRouteModels}
-        loading={loading}
-        selectedVariant={cloneResolvedModel}
-        intentVariant={cloneIntentVariant}
-        downloadProgress={downloadProgress}
-        onDownload={onDownload}
-        onCancelDownload={onCancelDownload}
-        onLoad={onLoad}
-        onUnload={onUnload}
-        onDelete={onDelete}
-        onUseModel={onSelect}
-        emptyMessage={cloneViewConfig.emptyStateDescription}
-      />
 
       <RouteModelModal
         isOpen={isDesignModelModalOpen}

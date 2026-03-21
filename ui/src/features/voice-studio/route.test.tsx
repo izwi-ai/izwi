@@ -27,8 +27,10 @@ vi.mock("@/features/voices/route", () => ({
   ),
 }));
 
-vi.mock("@/components/VoiceClonePlayground", () => ({
-  VoiceClonePlayground: () => <div data-testid="studio-clone">Clone workspace</div>,
+vi.mock("@/components/VoiceCaptureWorkspace", () => ({
+  VoiceCaptureWorkspace: () => (
+    <div data-testid="studio-clone-capture">Capture workspace</div>
+  ),
 }));
 
 vi.mock("@/components/VoiceDesignWorkspace", () => ({
@@ -82,15 +84,17 @@ describe("VoiceStudioPage", () => {
     renderVoiceStudio("/voice-studio");
 
     expect(screen.getByTestId("studio-library")).toBeInTheDocument();
-    expect(screen.queryByTestId("studio-clone")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("studio-clone-capture")).not.toBeInTheDocument();
     expect(screen.queryByTestId("studio-design")).not.toBeInTheDocument();
   });
 
   it("renders clone tab content from query state", () => {
     renderVoiceStudio("/voice-studio?tab=clone");
 
-    expect(screen.getByTestId("studio-clone")).toBeInTheDocument();
-    expect(screen.getByTestId("page-header-history-slot")).toBeInTheDocument();
+    expect(screen.getByTestId("studio-clone-capture")).toBeInTheDocument();
+    expect(
+      screen.queryByTestId("page-header-history-slot"),
+    ).not.toBeInTheDocument();
   });
 
   it("renders design tab content from query state", () => {

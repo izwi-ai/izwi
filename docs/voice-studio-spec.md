@@ -23,9 +23,9 @@ Unify voice creation and management workflows under a single `/voice-studio` rou
 - Search/filter by provenance (`Cloned`, `Designed`) and metadata.
 
 2. `Clone`
-- Clone a voice from reference audio + transcript.
-- Save cloned outputs to reusable saved voices.
-- Route to Text-to-Speech with selected saved voice.
+- Capture a voice reference from upload/recording + transcript.
+- Save voice profiles to reusable saved voices.
+- Hand off to Text-to-Speech for actual audio generation.
 
 3. `Design`
 - Generate voice candidates from natural-language description.
@@ -55,6 +55,7 @@ Unify voice creation and management workflows under a single `/voice-studio` rou
 - Reuse existing model-selection modal patterns per workflow.
 - Preserve route-level history affordances for clone/design workflows.
 - Keep all actions available with no feature loss versus legacy routes.
+- Keep clone tab focused on profile capture and save; do not duplicate TTS rendering controls there.
 
 ## Non-Goals
 
