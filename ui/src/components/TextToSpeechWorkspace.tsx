@@ -286,6 +286,11 @@ export function TextToSpeechWorkspace({
   const supportsVoiceDescription =
     capabilities?.supports_voice_description ?? false;
   const supportsStreaming = capabilities?.supports_streaming ?? false;
+  const supportsSpeedControl = capabilities?.supports_speed_control ?? false;
+  const supportsVoiceSelection =
+    supportsBuiltInVoices || supportsReferenceVoices;
+  const requiresVoiceDescriptionOnly =
+    supportsVoiceDescription && !supportsVoiceSelection;
 
   const availableSpeakers = useMemo(
     () =>
@@ -310,6 +315,12 @@ export function TextToSpeechWorkspace({
       setStreamingEnabled(false);
     }
   }, [streamingEnabled, supportsStreaming]);
+
+  useEffect(() => {
+    if (requiresVoiceDescriptionOnly) {
+      setShowAdvanced(true);
+    }
+  }, [requiresVoiceDescriptionOnly]);
 
   useEffect(() => {
     if (appliedInitialSavedVoiceRef.current || !initialSavedVoiceId) {
@@ -477,6 +488,17 @@ export function TextToSpeechWorkspace({
       return "Choose a model to see the voice options it supports on this route.";
     }
 
+    if (requiresVoiceDescriptionOnly) {
+      if (instructions.trim()) {
+        return `Generating from your voice direction prompt on ${selectedModelInfo.variant}.`;
+      }
+      return `${selectedModelInfo.variant} uses voice direction prompts on this route. Add a style prompt to generate audio.`;
+    }
+
+    if (!supportsVoiceSelection) {
+      return `${selectedModelInfo.variant} does not expose compatible voice selection controls on this route.`;
+    }
+
     if (voiceMode === "saved") {
       if (!supportsReferenceVoices) {
         return `${selectedModelInfo.variant} does not support reusable saved voices. Pick a renderer with saved-voice support.`;
@@ -501,12 +523,15 @@ export function TextToSpeechWorkspace({
     return `Using built-in voice "${speaker}" on ${selectedModelInfo.variant}.`;
   }, [
     availableSpeakers.length,
+    instructions,
+    requiresVoiceDescriptionOnly,
     savedVoicesLoading,
     selectedModelInfo?.variant,
     selectedSavedVoice,
     speaker,
     supportsBuiltInVoices,
     supportsReferenceVoices,
+    supportsVoiceSelection,
     voiceMode,
   ]);
 
@@ -515,8 +540,24 @@ export function TextToSpeechWorkspace({
       return "Choose a model";
     }
 
+    if (
+      supportsBuiltInVoices &&
+      supportsReferenceVoices &&
+      supportsVoiceDescription
+    ) {
+      return `${availableSpeakers.length} built-in voices + saved voices + style prompts`;
+    }
+
     if (supportsBuiltInVoices && supportsReferenceVoices) {
       return `${availableSpeakers.length} built-in voices plus saved voices`;
+    }
+
+    if (supportsBuiltInVoices && supportsVoiceDescription) {
+      return `${availableSpeakers.length} built-in voices + style prompts`;
+    }
+
+    if (supportsReferenceVoices && supportsVoiceDescription) {
+      return "Saved voices + style prompts";
     }
 
     if (supportsBuiltInVoices) {
@@ -529,12 +570,17 @@ export function TextToSpeechWorkspace({
       return "Saved voices only";
     }
 
+    if (supportsVoiceDescription) {
+      return "Voice-direction prompts only";
+    }
+
     return "No voices on this route";
   }, [
     availableSpeakers.length,
     selectedModelInfo?.variant,
     supportsBuiltInVoices,
     supportsReferenceVoices,
+    supportsVoiceDescription,
   ]);
 
   const savedVoiceItems: VoicePickerItem[] = savedVoices.map((voice) => ({
@@ -568,6 +614,9 @@ export function TextToSpeechWorkspace({
   }));
 
   const selectedVoiceItem = useMemo(() => {
+    if (requiresVoiceDescriptionOnly) {
+      return null;
+    }
     if (voiceMode === "saved") {
       return (
         savedVoiceItems.find((item) => item.id === selectedSavedVoiceId) ?? null
@@ -576,6 +625,7 @@ export function TextToSpeechWorkspace({
     return builtInVoiceItems.find((item) => item.id === speaker) ?? null;
   }, [
     builtInVoiceItems,
+    requiresVoiceDescriptionOnly,
     savedVoiceItems,
     selectedSavedVoiceId,
     speaker,
@@ -584,8 +634,11 @@ export function TextToSpeechWorkspace({
 
   const canGenerate =
     selectedModelReady &&
-    (voiceMode !== "saved" || Boolean(selectedSavedVoiceId)) &&
-    (voiceMode !== "built_in" || Boolean(speaker));
+    (supportsVoiceSelection || supportsVoiceDescription) &&
+    (!requiresVoiceDescriptionOnly || Boolean(instructions.trim())) &&
+    (requiresVoiceDescriptionOnly ||
+      ((voiceMode !== "saved" || Boolean(selectedSavedVoiceId)) &&
+        (voiceMode !== "built_in" || Boolean(speaker))));
 
   const handleGenerate = async () => {
     if (!selectedModel || !selectedModelReady) {
@@ -608,6 +661,18 @@ export function TextToSpeechWorkspace({
       return;
     }
 
+    if (!supportsVoiceSelection && !supportsVoiceDescription) {
+      reportError(
+        "The selected model does not expose a compatible voice mode on this route.",
+      );
+      return;
+    }
+
+    if (requiresVoiceDescriptionOnly && !instructions.trim()) {
+      reportError("Add a style prompt before generating with this model.");
+      return;
+    }
+
     const trimmedText = text.trim();
 
     try {
@@ -622,10 +687,15 @@ export function TextToSpeechWorkspace({
       const requestBase = {
         model_id: selectedModel,
         max_tokens: 0,
-        speed,
-        speaker: voiceMode === "built_in" ? speaker : undefined,
+        speed: supportsSpeedControl ? speed : undefined,
+        speaker:
+          !requiresVoiceDescriptionOnly && voiceMode === "built_in"
+            ? speaker
+            : undefined,
         saved_voice_id:
-          voiceMode === "saved" ? selectedSavedVoiceId : undefined,
+          !requiresVoiceDescriptionOnly && voiceMode === "saved"
+            ? selectedSavedVoiceId
+            : undefined,
         voice_description:
           supportsVoiceDescription && instructions.trim()
             ? instructions.trim()
@@ -846,9 +916,14 @@ export function TextToSpeechWorkspace({
         const downloadUrl = api.textToSpeechRecordAudioUrl(record.id, {
           download: true,
         });
+        const voiceTag = requiresVoiceDescriptionOnly
+          ? "voice-direction"
+          : voiceMode === "built_in"
+            ? speaker.toLowerCase()
+            : "saved-voice";
         const filename =
           record.audio_filename ||
-          `izwi-tts-${voiceMode === "built_in" ? speaker.toLowerCase() : "saved-voice"}-${Date.now()}.wav`;
+          `izwi-tts-${voiceTag}-${Date.now()}.wav`;
         await api.downloadAudioFile(downloadUrl, filename);
         completeDownload();
         return;
@@ -914,6 +989,9 @@ export function TextToSpeechWorkspace({
   );
 
   useWorkspaceShortcuts(workspaceShortcuts);
+
+  const showStylePromptControls =
+    supportsVoiceDescription && (requiresVoiceDescriptionOnly || showAdvanced);
 
   const renderModelSelector = () => (
     <RouteModelSelect
@@ -992,24 +1070,42 @@ export function TextToSpeechWorkspace({
               <div className="min-w-0">
                 <WorkspaceSectionLabel>Voice</WorkspaceSectionLabel>
                 <div className="mt-3 w-full max-w-[360px]">
-                  <VoiceSelect
-                    voiceMode={voiceMode}
-                    onVoiceModeChange={setVoiceMode}
-                    savedVoiceItems={savedVoiceItems}
-                    builtInVoiceItems={builtInVoiceItems}
-                    selectedItem={selectedVoiceItem}
-                    savedVoicesLoading={savedVoicesLoading}
-                    savedVoicesError={savedVoicesError}
-                    savedEnabled={supportsReferenceVoices}
-                    builtInEnabled={supportsBuiltInVoices}
-                    disabled={!selectedModel}
-                    modelLabel={selectedModelInfo?.variant ?? selectedModel}
-                    compact
-                  />
+                  {supportsVoiceSelection ? (
+                    <VoiceSelect
+                      voiceMode={voiceMode}
+                      onVoiceModeChange={setVoiceMode}
+                      savedVoiceItems={savedVoiceItems}
+                      builtInVoiceItems={builtInVoiceItems}
+                      selectedItem={selectedVoiceItem}
+                      savedVoicesLoading={savedVoicesLoading}
+                      savedVoicesError={savedVoicesError}
+                      savedEnabled={supportsReferenceVoices}
+                      builtInEnabled={supportsBuiltInVoices}
+                      disabled={!selectedModel}
+                      modelLabel={selectedModelInfo?.variant ?? selectedModel}
+                      compact
+                    />
+                  ) : (
+                    <div className="rounded-[var(--radius-md)] border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3.5 py-3">
+                      <div className="text-sm font-medium text-[var(--text-primary)]">
+                        {requiresVoiceDescriptionOnly
+                          ? "Voice direction prompt"
+                          : "No voice modes available"}
+                      </div>
+                      <p className="mt-1 text-xs leading-relaxed text-[var(--text-muted)]">
+                        {requiresVoiceDescriptionOnly
+                          ? "This model renders directly from the style prompt in Delivery Controls."
+                          : "Switch to a model with built-in, saved, or style-prompt voice support."}
+                      </p>
+                    </div>
+                  )}
                 </div>
                 <p className="mt-3 text-[11px] font-medium text-[var(--text-muted)]">
-                  Voice availability follows the selected model instead of
-                  switching models automatically.
+                  {supportsVoiceSelection
+                    ? "Voice availability follows the selected model instead of switching models automatically."
+                    : requiresVoiceDescriptionOnly
+                      ? "This model family uses style prompts instead of voice pickers."
+                      : "Choose a compatible model to unlock voice selection controls."}
                 </p>
               </div>
 
@@ -1051,18 +1147,21 @@ export function TextToSpeechWorkspace({
                       Delivery Controls
                     </div>
                     <div className={VOICE_ROUTE_BODY_COPY_CLASS}>
-                      Speed is saved with the generation history. Streaming
-                      appears only when the selected model exposes it.
+                      {supportsSpeedControl
+                        ? "Speed is saved with the generation history. Streaming appears only when the selected model exposes it."
+                        : "This model uses a fixed speaking rate. Streaming appears only when the selected model exposes it."}
                     </div>
                   </div>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => setShowAdvanced((current) => !current)}
-                  >
-                    <Sparkles className="h-4 w-4" />
-                    {showAdvanced ? "Hide" : "Show"} advanced
-                  </Button>
+                  {supportsVoiceDescription && !requiresVoiceDescriptionOnly ? (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setShowAdvanced((current) => !current)}
+                    >
+                      <Sparkles className="h-4 w-4" />
+                      {showAdvanced ? "Hide" : "Show"} advanced
+                    </Button>
+                  ) : null}
                 </div>
 
                 <div className="mt-4 grid gap-4 sm:grid-cols-[minmax(0,1fr)_320px]">
@@ -1081,6 +1180,7 @@ export function TextToSpeechWorkspace({
                       max={1.5}
                       step={0.05}
                       onValueChange={([value]) => setSpeed(value ?? 1)}
+                      disabled={!supportsSpeedControl}
                     />
                   </div>
 
@@ -1109,7 +1209,7 @@ export function TextToSpeechWorkspace({
                 </div>
 
                 <AnimatePresence>
-                  {showAdvanced ? (
+                  {showStylePromptControls ? (
                     <motion.div
                       initial={{ opacity: 0, height: 0 }}
                       animate={{ opacity: 1, height: "auto" }}
@@ -1118,18 +1218,27 @@ export function TextToSpeechWorkspace({
                     >
                       <div className="space-y-2 pt-4">
                         <label className={VOICE_ROUTE_SECTION_LABEL_CLASS}>
-                          Style prompt
+                          {requiresVoiceDescriptionOnly
+                            ? "Voice direction"
+                            : "Style prompt"}
                         </label>
                         <Input
                           value={instructions}
                           onChange={(event) => setInstructions(event.target.value)}
                           disabled={!supportsVoiceDescription}
                           placeholder={
-                            supportsVoiceDescription
-                              ? "Optional style guidance such as calm, energetic, or formal"
+                            requiresVoiceDescriptionOnly
+                              ? "Required voice direction, for example warm, confident, and conversational"
+                              : supportsVoiceDescription
+                                ? "Optional style guidance such as calm, energetic, or formal"
                               : "This renderer does not support style prompts"
                           }
                         />
+                        {requiresVoiceDescriptionOnly ? (
+                          <p className="text-xs text-[var(--text-muted)]">
+                            This model needs a voice direction prompt before it can render audio.
+                          </p>
+                        ) : null}
                       </div>
                     </motion.div>
                   ) : null}
@@ -1243,7 +1352,11 @@ export function TextToSpeechWorkspace({
                     {selectedVoiceItem?.name || "Select a voice"}
                   </div>
                   <div className={cn(VOICE_ROUTE_META_COPY_CLASS, "mt-1")}>
-                    {voiceMode === "saved" ? "Saved voice" : "Built-in voice"}
+                    {requiresVoiceDescriptionOnly
+                      ? "Voice direction"
+                      : voiceMode === "saved"
+                        ? "Saved voice"
+                        : "Built-in voice"}
                   </div>
                   <p className={cn(VOICE_ROUTE_BODY_COPY_CLASS, "mt-3")}>
                     {compatibilityNotice}
@@ -1303,7 +1416,9 @@ export function TextToSpeechWorkspace({
                     1. Choose a TTS model
                   </div>
                   <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2 text-[var(--text-secondary)]">
-                    2. Pick a compatible voice
+                    {requiresVoiceDescriptionOnly
+                      ? "2. Add voice direction"
+                      : "2. Pick a compatible voice"}
                   </div>
                   <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2 text-[var(--text-secondary)]">
                     3. Generate and review the result

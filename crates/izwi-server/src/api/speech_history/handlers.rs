@@ -318,13 +318,12 @@ async fn create_record(
     let mut req = normalize_create_request(req);
     let model_id = required_trimmed(req.model_id.as_deref(), "model_id")?;
     let input_text = required_trimmed(req.text.as_deref(), "text")?;
+    let variant = parse_tts_model_variant(model_id.as_str())
+        .map_err(|err| ApiError::bad_request(format!("Unsupported TTS model: {err}")))?;
 
     validate_reference_voice_selection(&req)?;
     req = resolve_saved_voice_selection(&state, req).await?;
-    validate_route_requirements(route_kind, &req)?;
-
-    let variant = parse_tts_model_variant(model_id.as_str())
-        .map_err(|err| ApiError::bad_request(format!("Unsupported TTS model: {err}")))?;
+    req = normalize_for_model_capabilities(route_kind, variant, req)?;
     state.runtime.load_model(variant).await?;
 
     if req.stream.unwrap_or(false) {
@@ -353,13 +352,12 @@ pub(crate) async fn synthesize_record(
     let mut req = normalize_create_request(req);
     let model_id = required_trimmed(req.model_id.as_deref(), "model_id")?;
     let input_text = required_trimmed(req.text.as_deref(), "text")?;
+    let variant = parse_tts_model_variant(model_id.as_str())
+        .map_err(|err| ApiError::bad_request(format!("Unsupported TTS model: {err}")))?;
 
     validate_reference_voice_selection(&req)?;
     req = resolve_saved_voice_selection(state, req).await?;
-    validate_route_requirements(route_kind, &req)?;
-
-    let variant = parse_tts_model_variant(model_id.as_str())
-        .map_err(|err| ApiError::bad_request(format!("Unsupported TTS model: {err}")))?;
+    req = normalize_for_model_capabilities(route_kind, variant, req)?;
     state.runtime.load_model(variant).await?;
 
     synthesize_record_internal(state, ctx, req, route_kind, variant, model_id, input_text).await
@@ -840,15 +838,6 @@ async fn resolve_saved_voice_selection(
 fn validate_reference_voice_selection(
     req: &CreateSpeechHistoryRecordRequest,
 ) -> Result<(), ApiError> {
-    let has_saved_voice = req
-        .saved_voice_id
-        .as_deref()
-        .map(has_non_empty_text)
-        .unwrap_or(false);
-    if !has_saved_voice {
-        return Ok(());
-    }
-
     let has_direct_reference_audio = req
         .reference_audio
         .as_deref()
@@ -859,6 +848,20 @@ fn validate_reference_voice_selection(
         .as_deref()
         .map(has_non_empty_text)
         .unwrap_or(false);
+    if has_direct_reference_audio != has_direct_reference_text {
+        return Err(ApiError::bad_request(
+            "Provide both `reference_audio` and `reference_text` together.",
+        ));
+    }
+
+    let has_saved_voice = req
+        .saved_voice_id
+        .as_deref()
+        .map(has_non_empty_text)
+        .unwrap_or(false);
+    if !has_saved_voice {
+        return Ok(());
+    }
     if has_direct_reference_audio || has_direct_reference_text {
         return Err(ApiError::bad_request(
             "Use either `saved_voice_id` or direct `reference_audio`/`reference_text`, not both.",
@@ -904,45 +907,125 @@ fn build_generation_request(
     }
 }
 
-fn validate_route_requirements(
+fn normalize_for_model_capabilities(
     route_kind: SpeechRouteKind,
-    req: &CreateSpeechHistoryRecordRequest,
-) -> Result<(), ApiError> {
+    variant: ModelVariant,
+    mut req: CreateSpeechHistoryRecordRequest,
+) -> Result<CreateSpeechHistoryRecordRequest, ApiError> {
+    let capabilities = variant.speech_capabilities().ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "{variant} does not expose speech generation capabilities."
+        ))
+    })?;
+
+    let has_speaker = req
+        .speaker
+        .as_deref()
+        .map(has_non_empty_text)
+        .unwrap_or(false);
+    let has_reference_audio = req
+        .reference_audio
+        .as_deref()
+        .map(has_non_empty_text)
+        .unwrap_or(false);
+    let has_reference_text = req
+        .reference_text
+        .as_deref()
+        .map(has_non_empty_text)
+        .unwrap_or(false);
+    let has_reference = has_reference_audio && has_reference_text;
+    let has_voice_description = req
+        .voice_description
+        .as_deref()
+        .map(has_non_empty_text)
+        .unwrap_or(false);
+
+    if req.speed.is_some() && !capabilities.supports_speed_control {
+        req.speed = None;
+    }
+
+    if req.stream.unwrap_or(false) && !capabilities.supports_streaming {
+        return Err(ApiError::bad_request(format!(
+            "{variant} does not support streaming synthesis. Disable `stream` or choose a model with streaming support.",
+        )));
+    }
+
+    if has_speaker && !capabilities.supports_builtin_voices {
+        return Err(ApiError::bad_request(format!(
+            "{variant} does not support built-in speaker selection.",
+        )));
+    }
+
+    if has_reference && !capabilities.supports_reference_voice {
+        return Err(ApiError::bad_request(format!(
+            "{variant} does not support reference or saved voices.",
+        )));
+    }
+
+    if has_voice_description && !capabilities.supports_voice_description {
+        return Err(ApiError::bad_request(format!(
+            "{variant} does not support voice direction prompts.",
+        )));
+    }
+
     match route_kind {
         SpeechRouteKind::VoiceDesign => {
-            let has_description = req
-                .voice_description
-                .as_deref()
-                .map(str::trim)
-                .map(|text| !text.is_empty())
-                .unwrap_or(false);
-            if !has_description {
+            if !capabilities.supports_voice_description {
+                return Err(ApiError::bad_request(
+                    "Voice design requests require a model with `voice_description` support.",
+                ));
+            }
+            if !has_voice_description {
                 return Err(ApiError::bad_request(
                     "Voice design requests require `voice_description`.",
                 ));
             }
         }
         SpeechRouteKind::VoiceCloning => {
-            let has_reference_audio = req
-                .reference_audio
-                .as_deref()
-                .map(has_non_empty_text)
-                .unwrap_or(false);
-            let has_reference_text = req
-                .reference_text
-                .as_deref()
-                .map(has_non_empty_text)
-                .unwrap_or(false);
+            if !capabilities.supports_reference_voice {
+                return Err(ApiError::bad_request(
+                    "Voice cloning requests require a model with reference-voice support.",
+                ));
+            }
             if !has_reference_audio || !has_reference_text {
                 return Err(ApiError::bad_request(
                     "Voice cloning requests require `saved_voice_id` or both `reference_audio` and `reference_text`.",
                 ));
             }
         }
-        SpeechRouteKind::TextToSpeech => {}
+        SpeechRouteKind::TextToSpeech => {
+            if !capabilities.supports_builtin_voices
+                && !capabilities.supports_reference_voice
+                && !capabilities.supports_voice_description
+            {
+                return Err(ApiError::bad_request(format!(
+                    "{variant} does not expose a supported text-to-speech voice mode.",
+                )));
+            }
+
+            if capabilities.supports_reference_voice
+                && !capabilities.supports_builtin_voices
+                && !capabilities.supports_voice_description
+                && !has_reference
+            {
+                return Err(ApiError::bad_request(format!(
+                    "{variant} requires `saved_voice_id` or direct reference audio/text on text-to-speech routes.",
+                )));
+            }
+
+            if capabilities.supports_voice_description
+                && !capabilities.supports_builtin_voices
+                && !capabilities.supports_reference_voice
+                && !has_voice_description
+            {
+                return Err(ApiError::bad_request(format!(
+                    "{variant} requires `voice_description` on text-to-speech routes.",
+                )));
+            }
+        }
     }
 
-    Ok(())
+    Ok(req)
 }
 
 fn required_trimmed(raw: Option<&str>, field_name: &str) -> Result<String, ApiError> {
@@ -1083,6 +1166,7 @@ mod tests {
         let err = validate_reference_voice_selection(&CreateSpeechHistoryRecordRequest {
             saved_voice_id: Some("voice-1".to_string()),
             reference_audio: Some("abc".to_string()),
+            reference_text: Some("hello".to_string()),
             ..base_request()
         })
         .expect_err("expected mixed reference inputs to fail");
@@ -1093,13 +1177,75 @@ mod tests {
     }
 
     #[test]
+    fn reference_audio_and_text_must_be_provided_together() {
+        let err = validate_reference_voice_selection(&CreateSpeechHistoryRecordRequest {
+            reference_audio: Some("abc".to_string()),
+            ..base_request()
+        })
+        .expect_err("expected incomplete reference inputs to fail");
+
+        assert!(err
+            .message
+            .contains("Provide both `reference_audio` and `reference_text` together."));
+    }
+
+    #[test]
     fn voice_cloning_requires_reference_source_after_resolution() {
-        let err = validate_route_requirements(SpeechRouteKind::VoiceCloning, &base_request())
-            .expect_err("expected missing reference source to fail");
+        let err = normalize_for_model_capabilities(
+            SpeechRouteKind::VoiceCloning,
+            ModelVariant::Qwen3Tts12Hz17BBase,
+            base_request(),
+        )
+        .expect_err("expected missing reference source to fail");
 
         assert!(err
             .message
             .contains("Voice cloning requests require `saved_voice_id` or both"));
+    }
+
+    #[test]
+    fn text_to_speech_base_models_require_reference_input() {
+        let err = normalize_for_model_capabilities(
+            SpeechRouteKind::TextToSpeech,
+            ModelVariant::Qwen3Tts12Hz17BBase,
+            base_request(),
+        )
+        .expect_err("expected base model to require reference input");
+
+        assert!(err
+            .message
+            .contains("requires `saved_voice_id` or direct reference audio/text"));
+    }
+
+    #[test]
+    fn text_to_speech_voice_design_only_models_require_prompt() {
+        let err = normalize_for_model_capabilities(
+            SpeechRouteKind::TextToSpeech,
+            ModelVariant::Qwen3Tts12Hz17BVoiceDesign,
+            base_request(),
+        )
+        .expect_err("expected voice-design model to require voice_description");
+
+        assert!(err
+            .message
+            .contains("requires `voice_description` on text-to-speech routes"));
+    }
+
+    #[test]
+    fn speed_is_ignored_for_models_without_speed_control() {
+        let normalized = normalize_for_model_capabilities(
+            SpeechRouteKind::TextToSpeech,
+            ModelVariant::Lfm25Audio15BGguf,
+            CreateSpeechHistoryRecordRequest {
+                model_id: Some("LFM2.5-Audio-1.5B-GGUF".to_string()),
+                speed: Some(1.2),
+                speaker: Some("US Female".to_string()),
+                ..base_request()
+            },
+        )
+        .expect("request should normalize");
+
+        assert_eq!(normalized.speed, None);
     }
 }
 

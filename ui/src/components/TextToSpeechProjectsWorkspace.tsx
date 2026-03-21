@@ -171,20 +171,42 @@ export function TextToSpeechProjectsWorkspace({
     currentProjectCapabilities?.supports_builtin_voices ?? false;
   const supportsSavedVoices =
     currentProjectCapabilities?.supports_reference_voice ?? false;
-
-  const builtInCompatibleModels = useMemo(
+  const supportsSpeedControl =
+    currentProjectCapabilities?.supports_speed_control ?? false;
+  const projectCompatibleModels = useMemo(
     () =>
       availableModels.filter(
-        (model) => model.speech_capabilities?.supports_builtin_voices,
+        (model) =>
+          model.speech_capabilities?.supports_builtin_voices ||
+          model.speech_capabilities?.supports_reference_voice,
       ),
     [availableModels],
   );
+  const projectCompatibleVariantSet = useMemo(
+    () => new Set(projectCompatibleModels.map((model) => model.variant)),
+    [projectCompatibleModels],
+  );
+  const projectModelOptions = useMemo(
+    () =>
+      modelOptions.filter((option) =>
+        projectCompatibleVariantSet.has(option.value),
+      ),
+    [modelOptions, projectCompatibleVariantSet],
+  );
+
+  const builtInCompatibleModels = useMemo(
+    () =>
+      projectCompatibleModels.filter(
+        (model) => model.speech_capabilities?.supports_builtin_voices,
+      ),
+    [projectCompatibleModels],
+  );
   const savedVoiceCompatibleModels = useMemo(
     () =>
-      availableModels.filter(
+      projectCompatibleModels.filter(
         (model) => model.speech_capabilities?.supports_reference_voice,
       ),
-    [availableModels],
+    [projectCompatibleModels],
   );
 
   const availableSpeakers = useMemo(
@@ -223,8 +245,10 @@ export function TextToSpeechProjectsWorkspace({
       projectVoiceMode !== selectedProject.voice_mode ||
       projectSpeaker !== (selectedProject.speaker ?? "") ||
       projectSavedVoiceId !== (selectedProject.saved_voice_id ?? "") ||
-      Number(projectSpeed.toFixed(2)) !==
-        Number((selectedProject.speed ?? 1).toFixed(2))
+      (supportsSpeedControl
+        ? Number(projectSpeed.toFixed(2)) !==
+          Number((selectedProject.speed ?? 1).toFixed(2))
+        : false)
     );
   }, [
     projectModelId,
@@ -234,6 +258,7 @@ export function TextToSpeechProjectsWorkspace({
     projectSpeed,
     projectVoiceMode,
     selectedProject,
+    supportsSpeedControl,
   ]);
 
   const loadProjects = useCallback(async () => {
@@ -344,6 +369,30 @@ export function TextToSpeechProjectsWorkspace({
   ]);
 
   useEffect(() => {
+    if (selectedProject || !projectModelId) {
+      return;
+    }
+    if (projectCompatibleVariantSet.has(projectModelId)) {
+      return;
+    }
+
+    const fallback = resolvePreferredRouteModel({
+      models: projectCompatibleModels,
+      selectedModel,
+      preferredVariants: TEXT_TO_SPEECH_PREFERRED_MODELS,
+    });
+    if (fallback && fallback !== projectModelId) {
+      setProjectModelId(fallback);
+    }
+  }, [
+    projectCompatibleModels,
+    projectCompatibleVariantSet,
+    projectModelId,
+    selectedModel,
+    selectedProject,
+  ]);
+
+  useEffect(() => {
     if (
       projectVoiceMode === "built_in" &&
       availableSpeakers.length > 0 &&
@@ -382,6 +431,10 @@ export function TextToSpeechProjectsWorkspace({
   const projectVoiceNotice = useMemo(() => {
     if (!projectModelId) {
       return "Choose a render model before assigning a project voice.";
+    }
+
+    if (!supportsBuiltInVoices && !supportsSavedVoices) {
+      return `${projectModelId} is not currently supported in Projects. Choose a model with built-in or saved-voice rendering.`;
     }
 
     if (projectVoiceMode === "saved") {
@@ -573,6 +626,9 @@ export function TextToSpeechProjectsWorkspace({
       setCreatingProject(true);
       setWorkspaceError(null);
       setWorkspaceStatus(null);
+      const defaultModelSupportsSpeed =
+        availableModels.find((model) => model.variant === defaults.modelId)
+          ?.speech_capabilities?.supports_speed_control ?? false;
 
       const project = await api.createTtsProject({
         name: newProjectName.trim() || undefined,
@@ -582,7 +638,7 @@ export function TextToSpeechProjectsWorkspace({
         voice_mode: defaults.voiceMode,
         speaker: defaults.speaker,
         saved_voice_id: defaults.savedVoiceId,
-        speed: 1,
+        speed: defaultModelSupportsSpeed ? 1 : undefined,
       });
 
       setSelectedProjectId(project.id);
@@ -677,7 +733,7 @@ export function TextToSpeechProjectsWorkspace({
         speaker: projectVoiceMode === "built_in" ? projectSpeaker : undefined,
         saved_voice_id:
           projectVoiceMode === "saved" ? projectSavedVoiceId : undefined,
-        speed: projectSpeed,
+        speed: supportsSpeedControl ? projectSpeed : undefined,
       });
       setSelectedProject(project);
       setWorkspaceStatus({
@@ -707,6 +763,7 @@ export function TextToSpeechProjectsWorkspace({
     projectSpeed,
     projectVoiceMode,
     selectedProject,
+    supportsSpeedControl,
   ]);
 
   const handleSaveSegment = async (segmentId: string) => {
@@ -1795,7 +1852,7 @@ export function TextToSpeechProjectsWorkspace({
                       </label>
                       <RouteModelSelect
                         value={projectModelId}
-                        options={modelOptions}
+                        options={projectModelOptions}
                         onSelect={(value) => {
                           setProjectModelId(value);
                           setWorkspaceStatus(null);
@@ -1836,7 +1893,9 @@ export function TextToSpeechProjectsWorkspace({
                           Speed
                         </span>
                         <span className="text-[var(--text-muted)]">
-                          {projectSpeed.toFixed(2)}x
+                          {supportsSpeedControl
+                            ? `${projectSpeed.toFixed(2)}x`
+                            : "Fixed by model"}
                         </span>
                       </div>
                       <Slider
@@ -1845,10 +1904,13 @@ export function TextToSpeechProjectsWorkspace({
                         max={1.5}
                         step={0.05}
                         onValueChange={([value]) => setProjectSpeed(value ?? 1)}
+                        disabled={!supportsSpeedControl}
                         className="mt-4"
                       />
                       <div className="mt-3 text-xs leading-relaxed text-[var(--text-muted)]">
-                        This speed applies to every rendered segment in the project.
+                        {supportsSpeedControl
+                          ? "This speed applies to every rendered segment in the project."
+                          : "This model does not expose adjustable speed for project renders."}
                       </div>
                     </div>
                   </div>

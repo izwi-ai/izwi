@@ -110,6 +110,7 @@ pub async fn create_tts_project(
 
     validate_project_voice_state(
         &state,
+        model_id.as_str(),
         voice_mode,
         req.speaker.as_deref(),
         req.saved_voice_id.as_deref(),
@@ -195,6 +196,11 @@ pub async fn update_tts_project(
 
     let req = normalize_update_request(req);
     let next_voice_mode = req.voice_mode.unwrap_or(existing.voice_mode);
+    let next_model_id = req
+        .model_id
+        .clone()
+        .or_else(|| existing.model_id.clone())
+        .ok_or_else(|| ApiError::bad_request("TTS project is missing a model selection."))?;
     let next_speaker = match req.speaker {
         Some(value) => Some(value),
         None => existing.speaker.clone(),
@@ -206,16 +212,12 @@ pub async fn update_tts_project(
 
     validate_project_voice_state(
         &state,
+        next_model_id.as_str(),
         next_voice_mode,
         next_speaker.as_deref(),
         next_saved_voice_id.as_deref(),
     )
     .await?;
-
-    if let Some(model_id) = req.model_id.as_deref() {
-        parse_tts_model_variant(model_id)
-            .map_err(|err| ApiError::bad_request(format!("Unsupported TTS model: {err}")))?;
-    }
 
     let project = state
         .tts_project_store
@@ -468,12 +470,26 @@ fn normalize_update_request(mut req: UpdateTtsProjectRequest) -> UpdateTtsProjec
 
 async fn validate_project_voice_state(
     state: &AppState,
+    model_id: &str,
     voice_mode: TtsProjectVoiceMode,
     speaker: Option<&str>,
     saved_voice_id: Option<&str>,
 ) -> Result<(), ApiError> {
+    let variant = parse_tts_model_variant(model_id)
+        .map_err(|err| ApiError::bad_request(format!("Unsupported TTS model: {err}")))?;
+    let capabilities = variant.speech_capabilities().ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "{variant} does not expose speech generation capabilities."
+        ))
+    })?;
+
     match voice_mode {
         TtsProjectVoiceMode::BuiltIn => {
+            if !capabilities.supports_builtin_voices {
+                return Err(ApiError::bad_request(format!(
+                    "{model_id} does not support built-in speaker rendering for TTS projects.",
+                )));
+            }
             if !has_non_empty_text(speaker) {
                 return Err(ApiError::bad_request(
                     "Built-in TTS projects require a speaker selection.",
@@ -481,6 +497,11 @@ async fn validate_project_voice_state(
             }
         }
         TtsProjectVoiceMode::Saved => {
+            if !capabilities.supports_reference_voice {
+                return Err(ApiError::bad_request(format!(
+                    "{model_id} does not support saved-voice rendering for TTS projects.",
+                )));
+            }
             let Some(voice_id) = saved_voice_id.filter(|value| has_non_empty_text(Some(value)))
             else {
                 return Err(ApiError::bad_request(

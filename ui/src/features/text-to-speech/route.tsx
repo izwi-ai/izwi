@@ -73,7 +73,8 @@ export function TextToSpeechPage({
         capabilities &&
           !variant.includes("Tokenizer") &&
           (capabilities.supports_builtin_voices ||
-            capabilities.supports_reference_voice),
+            capabilities.supports_reference_voice ||
+            capabilities.supports_voice_description),
       );
     },
     resolveSelectedModel: (routeModels, currentModel) =>
@@ -104,7 +105,7 @@ export function TextToSpeechPage({
     <PageShell>
       <PageHeader
         title="Text to Speech"
-        description="Generate natural speech from text with built-in voice libraries or reusable saved voices."
+        description="Generate natural speech from text with built-in voices, reusable saved voices, or voice-direction prompts."
         actions={
           <div
             ref={setHistoryActionContainer}
@@ -125,7 +126,7 @@ export function TextToSpeechPage({
         onModelRequired={() => {
           requestModel();
           onError(
-            "Select and load a built-in voice model or saved-voice renderer to generate speech.",
+            "Select and load a compatible TTS model (built-in voices, saved voices, or voice-direction prompts) to generate speech.",
           );
         }}
         onError={onError}
@@ -138,7 +139,7 @@ export function TextToSpeechPage({
         isOpen={isModelModalOpen}
         onClose={closeModelModal}
         title="Text-to-Speech Models"
-        description="Manage built-in voice models and saved-voice renderers for this route."
+        description="Manage built-in voice, saved-voice, and voice-direction TTS models for this route."
         models={routeModels}
         loading={loading}
         selectedVariant={resolvedSelectedModel}
@@ -150,7 +151,7 @@ export function TextToSpeechPage({
         onUnload={onUnload}
         onDelete={onDelete}
         onUseModel={onSelect}
-        emptyMessage="Load a built-in voice model or saved-voice renderer to generate speech."
+        emptyMessage="Load a compatible TTS model with built-in voices, saved voices, or voice-direction prompts to generate speech."
       />
     </PageShell>
   );
