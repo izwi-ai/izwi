@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
+  Check,
   Loader2,
-  Library,
   Mic2,
+  Plus,
   RefreshCw,
+  Search,
   Sparkles,
   Trash2,
 } from "lucide-react";
@@ -16,7 +18,6 @@ import {
   VOICE_ROUTE_BODY_COPY_CLASS,
   VOICE_ROUTE_META_COPY_CLASS,
   VOICE_ROUTE_PANEL_TITLE_CLASS,
-  VOICE_ROUTE_SECTION_LABEL_CLASS,
 } from "@/components/voiceRouteTypography";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -25,7 +26,6 @@ import { StatusBadge } from "@/components/ui/status-badge";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   WorkspaceFrame,
-  WorkspaceHeader,
   WorkspacePanel,
 } from "@/components/ui/workspace";
 import { getSpeakerProfilesForVariant, isLfm25AudioVariant } from "@/types";
@@ -61,6 +61,7 @@ interface VoicesPageProps {
 }
 
 type SavedVoiceFilter = "all" | "voice_cloning" | "voice_design";
+type VoiceLibraryTab = "all" | "saved" | "built-in";
 
 const BUILT_IN_PREVIEW_TEXT = {
   chinese: "你好，欢迎使用 Izwi 的内置语音预览。",
@@ -127,7 +128,7 @@ export function VoicesPage({
   onError,
 }: VoicesPageProps) {
   const navigate = useNavigate();
-  const [activeTab, setActiveTab] = useState<"saved" | "built-in">("saved");
+  const [activeTab, setActiveTab] = useState<VoiceLibraryTab>("saved");
   const [search, setSearch] = useState("");
   const [savedVoiceFilter, setSavedVoiceFilter] =
     useState<SavedVoiceFilter>("all");
@@ -327,6 +328,7 @@ export function VoicesPage({
         <>
           <Button
             size="sm"
+            className="h-12 rounded-[var(--radius-pill)] px-5 text-sm"
             onClick={(event) => {
               event.stopPropagation();
               handleUseSavedVoice(voice.id);
@@ -338,6 +340,7 @@ export function VoicesPage({
           <Button
             variant="outline"
             size="sm"
+            className="h-12 rounded-[var(--radius-pill)] border-[var(--border-strong)] bg-[var(--bg-surface-1)]/72 px-5 text-sm"
             onClick={(event) => {
               event.stopPropagation();
               void handleDeleteVoice(voice.id);
@@ -360,15 +363,29 @@ export function VoicesPage({
     (voice) => ({
       id: voice.id,
       name: voice.name,
-      categoryLabel: selectedModelInfo?.variant ?? "Built-in voice",
+      categoryLabel: "Built-in voice",
       description: voice.description,
-      meta: [voice.language],
+      meta: [voice.language, selectedModelInfo?.variant ?? "Model preview"],
       previewUrl: previewUrls[voice.id] ?? null,
+      previewLoading: previewLoadingVoiceId === voice.id,
       previewMessage: previewUrls[voice.id]
         ? null
-        : "Generate a preview sample to audition this built-in voice.",
+        : previewLoadingVoiceId === voice.id
+          ? "Generating a preview sample for this speaker."
+          : "Generate a preview sample to audition this built-in voice.",
       actions: (
         <>
+          <Button
+            size="sm"
+            onClick={(event) => {
+              event.stopPropagation();
+              handleUseBuiltInVoice(voice.id);
+            }}
+            className="h-12 rounded-[var(--radius-pill)] px-5 text-sm"
+          >
+            <Mic2 className="h-4 w-4" />
+            Use in TTS
+          </Button>
           <Button
             size="sm"
             variant="outline"
@@ -377,6 +394,7 @@ export function VoicesPage({
               void handlePreviewBuiltInVoice(voice.id, voice.language);
             }}
             disabled={previewLoadingVoiceId === voice.id}
+            className="h-12 rounded-[var(--radius-pill)] border-[var(--border-strong)] bg-[var(--bg-surface-1)]/72 px-5 text-sm"
           >
             {previewLoadingVoiceId === voice.id ? (
               <Loader2 className="h-4 w-4 animate-spin" />
@@ -384,16 +402,6 @@ export function VoicesPage({
               <Sparkles className="h-4 w-4" />
             )}
             Preview
-          </Button>
-          <Button
-            size="sm"
-            onClick={(event) => {
-              event.stopPropagation();
-              handleUseBuiltInVoice(voice.id);
-            }}
-          >
-            <Mic2 className="h-4 w-4" />
-            Use in TTS
           </Button>
         </>
       ),
@@ -407,236 +415,189 @@ export function VoicesPage({
   const designedVoiceCount = savedVoices.filter(
     (voice) => voice.source_route_kind === "voice_design",
   ).length;
+  const totalBuiltInVoices = builtInVoices.length;
+  const allVoiceItems = [...savedVoiceItems, ...builtInVoiceItems];
+  const activeItems =
+    activeTab === "all"
+      ? allVoiceItems
+      : activeTab === "saved"
+        ? savedVoiceItems
+        : builtInVoiceItems;
   const activeResultCount =
-    activeTab === "saved"
-      ? filteredSavedVoices.length
-      : filteredBuiltInVoices.length;
-  const activeSearchPlaceholder =
-    activeTab === "saved"
-      ? "Search saved voices by name or transcript"
-      : "Search built-in voices by name or language";
-  const activeItems = activeTab === "saved" ? savedVoiceItems : builtInVoiceItems;
+    activeTab === "all"
+      ? filteredSavedVoices.length + filteredBuiltInVoices.length
+      : activeTab === "saved"
+        ? filteredSavedVoices.length
+        : filteredBuiltInVoices.length;
   const activeResultsLabel =
     activeResultCount === 1 ? "1 result" : `${activeResultCount} results`;
   const activePanelTitle =
-    activeTab === "saved" ? "Reusable voice library" : "Built-in voice library";
+    activeTab === "all"
+      ? "Voice Library"
+      : activeTab === "saved"
+        ? "Your Saved Voices"
+        : "Built-in Voices";
   const activePanelDescription =
-    activeTab === "saved"
-      ? "Saved voices come from voice cloning and voice design and are ready to reuse in TTS."
-      : "Built-in voices belong to the active model. Generate a preview first, then jump into TTS with the selected speaker.";
+    activeTab === "all"
+      ? "Browse reusable saved voices and the active model's built-in speakers in one unified library."
+      : activeTab === "saved"
+        ? "Saved voices from voice cloning and voice design are ready for direct text-to-speech reuse."
+        : "Built-in voices depend on the active model. Generate a preview, then hand off to text-to-speech.";
+  const showBuiltInMeta = activeTab === "built-in" || activeTab === "all";
+  const showSavedVoiceError =
+    savedVoicesError && (activeTab === "saved" || activeTab === "all");
 
   return (
     <PageShell>
       <PageHeader
         title="Voices"
-        description="Manage saved cloned and designed voices, browse built-in voice libraries, and hand them off into text-to-speech."
+        description="Manage, browse, and use your saved, cloned, and designed voices for text-to-speech."
       />
 
       <WorkspaceFrame className="flex flex-col">
-        <WorkspaceHeader
-          icon={Library}
-          title="Voice browser"
-          description="Reusable saved voices stay ready for TTS. Built-in speakers come from the active model."
-          actions={
-            <Tabs
-              value={activeTab}
-              onValueChange={(value) => setActiveTab(value as "saved" | "built-in")}
-              className="w-full max-w-md"
-            >
-              <TabsList className="grid w-full grid-cols-2 border-[var(--border-strong)] bg-[var(--bg-surface-2)] p-1 shadow-sm">
-                <TabsTrigger
-                  value="saved"
-                  className="justify-between gap-2 text-[var(--text-muted)] hover:text-[var(--text-primary)] data-[state=active]:bg-[var(--accent-solid)] data-[state=active]:text-[var(--text-on-accent)] data-[state=active]:shadow-[0_8px_20px_-14px_rgba(17,17,17,0.55)]"
-                >
-                  <span className="inline-flex items-center gap-2">
-                    <Library className="h-4 w-4" />
-                    My Voices
-                  </span>
-                  <span className="rounded-full border border-current/15 px-2 py-0.5 text-[10px] font-semibold">
-                    {totalSavedVoices}
-                  </span>
-                </TabsTrigger>
-                <TabsTrigger
-                  value="built-in"
-                  className="justify-between gap-2 text-[var(--text-muted)] hover:text-[var(--text-primary)] data-[state=active]:bg-[var(--accent-solid)] data-[state=active]:text-[var(--text-on-accent)] data-[state=active]:shadow-[0_8px_20px_-14px_rgba(17,17,17,0.55)]"
-                >
-                  <span className="inline-flex items-center gap-2">
-                    <Sparkles className="h-4 w-4" />
-                    Built-in Voices
-                  </span>
-                  <span className="rounded-full border border-current/15 px-2 py-0.5 text-[10px] font-semibold">
-                    {builtInVoices.length}
-                  </span>
-                </TabsTrigger>
-              </TabsList>
-            </Tabs>
-          }
-        />
-
-        <div className="mt-5 grid gap-5 xl:grid-cols-[290px_minmax(0,1fr)]">
-          <aside className="space-y-4">
-            <WorkspacePanel className="p-5">
-              <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>Search</div>
-              <Input
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-                placeholder={activeSearchPlaceholder}
-                className="mt-3 bg-[var(--bg-surface-1)]"
-              />
-              <div
-                className={cn(
-                  VOICE_ROUTE_META_COPY_CLASS,
-                  "mt-3 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2",
-                )}
+        <div className="border-b border-[var(--border-muted)] pb-4">
+          <Tabs
+            value={activeTab}
+            onValueChange={(value) => setActiveTab(value as VoiceLibraryTab)}
+            className="w-full"
+          >
+            <TabsList className="grid w-full max-w-[30rem] grid-cols-3 border-[var(--border-strong)] bg-[var(--bg-surface-2)] p-1">
+              <TabsTrigger
+                value="all"
+                className="justify-center gap-2 text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)]"
               >
-                {activeResultsLabel} matching the current tab.
-              </div>
-            </WorkspacePanel>
+                All Voices
+              </TabsTrigger>
+              <TabsTrigger
+                value="saved"
+                className="justify-center gap-2 text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)]"
+              >
+                <span>My Voices</span>
+                <span className="rounded-full border border-current/20 px-2 py-0.5 text-[10px] font-semibold">
+                  {totalSavedVoices}
+                </span>
+              </TabsTrigger>
+              <TabsTrigger
+                value="built-in"
+                className="justify-center gap-2 text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)]"
+              >
+                <span>Built-in Voices</span>
+                <span className="rounded-full border border-current/20 px-2 py-0.5 text-[10px] font-semibold">
+                  {totalBuiltInVoices}
+                </span>
+              </TabsTrigger>
+            </TabsList>
+          </Tabs>
+        </div>
 
-            {activeTab === "saved" ? (
-              <WorkspacePanel className="p-5">
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>
-                      Saved Library
-                    </div>
-                    <h3 className={cn(VOICE_ROUTE_PANEL_TITLE_CLASS, "mt-1")}>
-                      Reusable saved voices
-                    </h3>
-                  </div>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => void loadSavedVoices()}
-                    disabled={savedVoicesLoading}
-                    className="bg-[var(--bg-surface-1)]"
-                  >
-                    {savedVoicesLoading ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <RefreshCw className="h-4 w-4" />
-                    )}
-                    Refresh
-                  </Button>
-                </div>
-
-                <div className="mt-4 grid gap-2 sm:grid-cols-3 xl:grid-cols-1">
-                  <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-3">
-                    <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>Total</div>
-                    <div className="mt-1 text-xl font-semibold text-[var(--text-primary)]">
-                      {totalSavedVoices}
-                    </div>
-                  </div>
-                  <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-3">
-                    <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>Cloned</div>
-                    <div className="mt-1 text-xl font-semibold text-[var(--text-primary)]">
-                      {clonedVoiceCount}
-                    </div>
-                  </div>
-                  <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-3">
-                    <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>Designed</div>
-                    <div className="mt-1 text-xl font-semibold text-[var(--text-primary)]">
-                      {designedVoiceCount}
-                    </div>
-                  </div>
-                </div>
-
-                <div className="mt-4 space-y-3">
-                  <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>Filters</div>
-                  <div className="flex flex-wrap gap-2">
-                    {(
-                      [
-                        ["all", "All voices"],
-                        ["voice_cloning", "Cloned"],
-                        ["voice_design", "Designed"],
-                      ] as const
-                    ).map(([value, label]) => (
-                      <Button
-                        key={value}
-                        type="button"
-                        size="sm"
-                        variant={savedVoiceFilter === value ? "default" : "outline"}
-                        onClick={() => setSavedVoiceFilter(value)}
-                      >
-                        {label}
-                      </Button>
-                    ))}
-                  </div>
-                </div>
-              </WorkspacePanel>
-            ) : (
-              <WorkspacePanel className="p-5">
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>
-                      Built-in Model
-                    </div>
-                    <h3 className={cn(VOICE_ROUTE_PANEL_TITLE_CLASS, "mt-1")}>
-                      {resolvedSelectedModel ?? "No model selected"}
-                    </h3>
-                    <div
-                      className={cn(
-                        "mt-2 text-xs",
-                        selectedModelReady
-                          ? "text-[var(--text-secondary)]"
-                          : "text-amber-500",
-                      )}
-                    >
-                      {selectedModelReady
-                        ? "Loaded and ready for voice previews"
-                        : "Choose and load a supported model before previewing"}
-                    </div>
-                  </div>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={openModelManager}
-                    className="bg-[var(--bg-surface-1)]"
-                  >
-                    Models
-                  </Button>
-                </div>
-
-                <div
-                  className={cn(
-                    VOICE_ROUTE_BODY_COPY_CLASS,
-                    "mt-4 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3.5 py-3",
-                  )}
+        <div className="mt-5 grid gap-5 xl:grid-cols-[260px_minmax(0,1fr)]">
+          <aside>
+            <WorkspacePanel className="p-5">
+              <div className="flex items-start justify-between gap-3">
+                <h3 className={cn(VOICE_ROUTE_PANEL_TITLE_CLASS, "text-[1.65rem]")}>
+                  Library Statistics
+                </h3>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => void loadSavedVoices()}
+                  disabled={savedVoicesLoading}
+                  className="h-8 px-2.5 text-xs"
                 >
-                  {selectedModelInfo?.speech_capabilities?.built_in_voice_count
-                    ? `${selectedModelInfo.speech_capabilities.built_in_voice_count} built-in speakers are available on the active model.`
-                    : "Built-in voices appear when a CustomVoice or Kokoro model is selected."}
-                </div>
+                  {savedVoicesLoading ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <RefreshCw className="h-4 w-4" />
+                  )}
+                </Button>
+              </div>
 
-                <div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-1">
-                  <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-3">
-                    <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>
-                      Visible voices
-                    </div>
-                    <div className="mt-1 text-xl font-semibold text-[var(--text-primary)]">
-                      {filteredBuiltInVoices.length}
-                    </div>
-                  </div>
-                  <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-3">
-                    <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>
-                      Route models
-                    </div>
-                    <div className="mt-1 text-xl font-semibold text-[var(--text-primary)]">
-                      {routeModels.length}
-                    </div>
-                  </div>
+              <dl className="mt-4 space-y-2 text-sm text-[var(--text-secondary)]">
+                <div className="flex items-center justify-between gap-3">
+                  <dt>Total Voices</dt>
+                  <dd className="font-semibold text-[var(--text-primary)]">
+                    {totalSavedVoices}
+                  </dd>
                 </div>
-              </WorkspacePanel>
-            )}
+                <div className="flex items-center justify-between gap-3">
+                  <dt>Cloned</dt>
+                  <dd className="font-semibold text-[var(--text-primary)]">
+                    {clonedVoiceCount}
+                  </dd>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <dt>Designed</dt>
+                  <dd className="font-semibold text-[var(--text-primary)]">
+                    {designedVoiceCount}
+                  </dd>
+                </div>
+              </dl>
+
+              <div className="mt-5 border-t border-[var(--border-muted)] pt-5">
+                <h4 className={cn(VOICE_ROUTE_PANEL_TITLE_CLASS, "text-[1.35rem]")}>
+                  Filter By
+                </h4>
+                <div role="radiogroup" className="mt-3 space-y-2">
+                  {(
+                    [
+                      ["all", "All"],
+                      ["voice_cloning", "Cloned"],
+                      ["voice_design", "Designed"],
+                    ] as const
+                  ).map(([value, label]) => (
+                    <button
+                      key={value}
+                      type="button"
+                      role="radio"
+                      aria-checked={savedVoiceFilter === value}
+                      onClick={() => setSavedVoiceFilter(value)}
+                      className="flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-[var(--text-secondary)] hover:bg-[var(--bg-surface-2)]"
+                    >
+                      <span
+                        className={cn(
+                          "flex h-5 w-5 items-center justify-center rounded-md border transition-colors",
+                          savedVoiceFilter === value
+                            ? "border-[var(--text-primary)] bg-[var(--text-primary)] text-[var(--text-on-accent)]"
+                            : "border-[var(--border-strong)] bg-transparent text-transparent",
+                        )}
+                      >
+                        <Check className="h-3 w-3" />
+                      </span>
+                      <span className="text-sm font-medium">{label}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="mt-5 border-t border-[var(--border-muted)] pt-5">
+                <h4 className={cn(VOICE_ROUTE_PANEL_TITLE_CLASS, "text-[1.35rem]")}>
+                  Search
+                </h4>
+                <div className="relative mt-3">
+                  <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[var(--text-muted)]" />
+                  <Input
+                    value={search}
+                    onChange={(event) => setSearch(event.target.value)}
+                    placeholder="Search voices by name or notes"
+                    className="pl-9"
+                  />
+                </div>
+              </div>
+
+              <Button
+                onClick={() => navigate("/voice-design")}
+                className="mt-5 h-11 w-full rounded-[var(--radius-pill)] text-sm"
+              >
+                <Plus className="h-4 w-4" />
+                Add New Voice
+              </Button>
+            </WorkspacePanel>
           </aside>
 
           <WorkspacePanel className="p-5 sm:p-6">
-            <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-              <div>
-                <div className={VOICE_ROUTE_SECTION_LABEL_CLASS}>
-                  {activeTab === "saved" ? "Saved voices" : "Built-in voices"}
-                </div>
-                <h3 className={cn(VOICE_ROUTE_PANEL_TITLE_CLASS, "mt-1")}>
+            <div className="flex flex-col gap-4 border-b border-[var(--border-muted)] pb-4 sm:flex-row sm:items-start sm:justify-between">
+              <div className="min-w-0">
+                <h3 className={cn(VOICE_ROUTE_PANEL_TITLE_CLASS, "text-[2rem]")}>
                   {activePanelTitle}
                 </h3>
                 <p className={cn(VOICE_ROUTE_BODY_COPY_CLASS, "mt-1 max-w-3xl")}>
@@ -644,20 +605,46 @@ export function VoicesPage({
                 </p>
               </div>
 
-              <div className="flex flex-wrap gap-2 text-xs">
-                <StatusBadge>{activeResultsLabel}</StatusBadge>
-                {activeTab === "saved" && savedVoiceFilter !== "all" ? (
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <StatusBadge>{activeResultsLabel.toUpperCase()}</StatusBadge>
+                {savedVoiceFilter !== "all" &&
+                (activeTab === "saved" || activeTab === "all") ? (
                   <StatusBadge>
-                    {savedVoiceFilter === "voice_cloning" ? "Cloned only" : "Designed only"}
+                    {savedVoiceFilter === "voice_cloning"
+                      ? "CLONED"
+                      : "DESIGNED"}
                   </StatusBadge>
                 ) : null}
-                {activeTab === "built-in" && resolvedSelectedModel ? (
+                {showBuiltInMeta && resolvedSelectedModel ? (
                   <StatusBadge>{resolvedSelectedModel}</StatusBadge>
+                ) : null}
+                {showBuiltInMeta ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={openModelManager}
+                    className="h-8 bg-[var(--bg-surface-1)] text-xs"
+                  >
+                    Model
+                  </Button>
                 ) : null}
               </div>
             </div>
 
-            {activeTab === "saved" && savedVoicesError ? (
+            {showBuiltInMeta ? (
+              <div
+                className={cn(
+                  VOICE_ROUTE_META_COPY_CLASS,
+                  "mt-3 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-3.5 py-2.5",
+                )}
+              >
+                {selectedModelReady
+                  ? `Built-in previews are using ${selectedModelInfo?.variant ?? "the selected model"}.`
+                  : "Select and load a supported voice model to generate built-in previews."}
+              </div>
+            ) : null}
+
+            {showSavedVoiceError ? (
               <div className="mt-4">
                 <StatePanel
                   title="Saved voices unavailable"
@@ -670,22 +657,30 @@ export function VoicesPage({
             <VoicePicker
               items={activeItems}
               emptyTitle={
-                activeTab === "saved"
+                activeTab === "all"
                   ? savedVoicesLoading
-                    ? "Loading saved voices"
-                    : "No saved voices yet"
-                  : "No built-in voices available"
+                    ? "Loading voices"
+                    : "No voices yet"
+                  : activeTab === "saved"
+                    ? savedVoicesLoading
+                      ? "Loading saved voices"
+                      : "No saved voices yet"
+                    : "No built-in voices available"
               }
               emptyDescription={
-                activeTab === "saved"
-                  ? savedVoicesLoading
-                    ? "Fetching your reusable cloned and designed voices."
-                    : "Save a result from voice cloning or voice design to build a reusable voice library."
-                  : routeModels.length === 0
-                    ? "Load a CustomVoice or Kokoro model to browse built-in voices."
-                    : "Try a different built-in voice model or search term."
+                activeTab === "all"
+                  ? routeModels.length === 0
+                    ? "Save a voice or load a supported built-in voice model to populate the library."
+                    : "Save a voice from voice cloning or voice design, or clear your search/filter to browse more voices."
+                  : activeTab === "saved"
+                    ? savedVoicesLoading
+                      ? "Fetching your reusable cloned and designed voices."
+                      : "Save a result from voice cloning or voice design to build a reusable voice library."
+                    : routeModels.length === 0
+                      ? "Load a CustomVoice or Kokoro model to browse built-in voices."
+                      : "Try a different built-in voice model or search term."
               }
-              className="mt-5 grid-cols-[repeat(auto-fill,minmax(300px,1fr))]"
+              className="mt-5"
             />
           </WorkspacePanel>
         </div>
