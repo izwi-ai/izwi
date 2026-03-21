@@ -15,6 +15,11 @@ const TextToSpeechPage = lazy(async () => {
   return { default: module.TextToSpeechPage };
 });
 
+const TextToSpeechProjectsPage = lazy(async () => {
+  const module = await import("@/features/text-to-speech-projects/route");
+  return { default: module.TextToSpeechProjectsPage };
+});
+
 const VoiceCloningPage = lazy(async () => {
   const module = await import("@/features/voice-cloning/route");
   return { default: module.VoiceCloningPage };
@@ -148,6 +153,14 @@ export function AppRoutes() {
         <Route
           path="/text-to-speech"
           element={withSuspense(<TextToSpeechPage {...pageProps} />)}
+        />
+        <Route
+          path="/tts-projects"
+          element={withSuspense(<TextToSpeechProjectsPage {...pageProps} />)}
+        />
+        <Route
+          path="/text-to-speech/projects"
+          element={<Navigate to="/tts-projects" replace />}
         />
         {VOICE_STUDIO_ENABLED ? (
           <>
