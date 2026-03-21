@@ -24,10 +24,7 @@ import { Input } from "@/components/ui/input";
 import { StatePanel } from "@/components/ui/state-panel";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import {
-  WorkspaceFrame,
-  WorkspacePanel,
-} from "@/components/ui/workspace";
+import { WorkspacePanel } from "@/components/ui/workspace";
 import { getSpeakerProfilesForVariant, isLfm25AudioVariant } from "@/types";
 import {
   TEXT_TO_SPEECH_PREFERRED_MODELS,
@@ -454,41 +451,39 @@ export function VoicesPage({
         description="Manage, browse, and use your saved, cloned, and designed voices for text-to-speech."
       />
 
-      <WorkspaceFrame className="flex flex-col">
-        <div className="border-b border-[var(--border-muted)] pb-4">
-          <Tabs
-            value={activeTab}
-            onValueChange={(value) => setActiveTab(value as VoiceLibraryTab)}
-            className="w-full"
-          >
-            <TabsList className="grid h-10 w-full max-w-[30rem] grid-cols-3 overflow-hidden rounded-[var(--radius-pill)] border-[var(--border-strong)] bg-[var(--bg-surface-2)] p-[2px] shadow-none">
-              <TabsTrigger
-                value="all"
-                className="h-full rounded-[var(--radius-pill)] px-3 text-[13px] font-semibold text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
-              >
-                All Voices
-              </TabsTrigger>
-              <TabsTrigger
-                value="saved"
-                className="h-full gap-2 rounded-[var(--radius-pill)] px-3 text-[13px] font-semibold text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
-              >
-                <span>My Voices</span>
-                <span className="rounded-full border border-current/20 px-2 py-0.5 text-[10px] font-semibold">
-                  {totalSavedVoices}
-                </span>
-              </TabsTrigger>
-              <TabsTrigger
-                value="built-in"
-                className="h-full gap-2 rounded-[var(--radius-pill)] px-3 text-[13px] font-semibold text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
-              >
-                <span>Built-in Voices</span>
-                <span className="rounded-full border border-current/20 px-2 py-0.5 text-[10px] font-semibold">
-                  {totalBuiltInVoices}
-                </span>
-              </TabsTrigger>
-            </TabsList>
-          </Tabs>
-        </div>
+      <div className="flex flex-col">
+        <Tabs
+          value={activeTab}
+          onValueChange={(value) => setActiveTab(value as VoiceLibraryTab)}
+          className="w-full"
+        >
+          <TabsList className="grid h-10 w-full max-w-[30rem] grid-cols-3 overflow-hidden rounded-[var(--radius-pill)] border-[var(--border-strong)] bg-[var(--bg-surface-2)] p-[2px] shadow-none">
+            <TabsTrigger
+              value="all"
+              className="h-full rounded-[var(--radius-pill)] px-3 text-[13px] font-semibold text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
+            >
+              All Voices
+            </TabsTrigger>
+            <TabsTrigger
+              value="saved"
+              className="h-full gap-2 rounded-[var(--radius-pill)] px-3 text-[13px] font-semibold text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
+            >
+              <span>My Voices</span>
+              <span className="rounded-full border border-current/20 px-2 py-0.5 text-[10px] font-semibold">
+                {totalSavedVoices}
+              </span>
+            </TabsTrigger>
+            <TabsTrigger
+              value="built-in"
+              className="h-full gap-2 rounded-[var(--radius-pill)] px-3 text-[13px] font-semibold text-[var(--text-muted)] data-[state=active]:bg-[var(--bg-surface-1)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
+            >
+              <span>Built-in Voices</span>
+              <span className="rounded-full border border-current/20 px-2 py-0.5 text-[10px] font-semibold">
+                {totalBuiltInVoices}
+              </span>
+            </TabsTrigger>
+          </TabsList>
+        </Tabs>
 
         <div className="mt-5 grid gap-5 xl:grid-cols-[260px_minmax(0,1fr)]">
           <aside>
@@ -684,7 +679,7 @@ export function VoicesPage({
             />
           </WorkspacePanel>
         </div>
-      </WorkspaceFrame>
+      </div>
 
       <RouteModelModal
         isOpen={isModelModalOpen}
