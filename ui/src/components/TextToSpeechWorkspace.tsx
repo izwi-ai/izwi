@@ -11,7 +11,6 @@ import {
   Settings2,
   Sparkles,
   Square,
-  Waves,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -44,7 +43,6 @@ import { StatePanel } from "@/components/ui/state-panel";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
-  WorkspaceHeader,
   WorkspacePanel,
   WorkspaceSectionLabel,
 } from "@/components/ui/workspace";
@@ -953,15 +951,8 @@ export function TextToSpeechWorkspace({
     return (
       <div className="grid items-start gap-5 pb-4 sm:pb-5">
         <div className="flex flex-col">
-          <WorkspaceHeader
-            icon={Waves}
-            title="TTS Projects"
-            description="Import scripts, render segments, and export merged narration."
-            className="border-none pb-0"
-            actions={renderWorkflowTabs()}
-          />
-
-          <div className="mt-5">
+          <div>{renderWorkflowTabs()}</div>
+          <div className="mt-4">
             <TextToSpeechProjectsWorkspace
               selectedModel={selectedModel}
               selectedModelInfo={selectedModelInfo}
@@ -982,15 +973,8 @@ export function TextToSpeechWorkspace({
   return (
     <div className="grid items-start gap-5 pb-4 sm:pb-5">
       <div className="flex flex-col">
-        <WorkspaceHeader
-          icon={Mic2}
-          title="Text to Speech"
-          description="Choose a model, then a compatible voice, then render."
-          className="border-none pb-0"
-          actions={renderWorkflowTabs()}
-        />
-
-        <div className="mt-5">
+        <div>{renderWorkflowTabs()}</div>
+        <div className="mt-4">
           <WorkspacePanel className="mb-5 p-4">
             <div className="grid gap-x-5 gap-y-4 xl:grid-cols-[minmax(0,360px)_minmax(0,360px)_minmax(0,1fr)_auto]">
               <div className="min-w-0">
