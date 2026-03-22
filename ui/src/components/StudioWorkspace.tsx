@@ -78,6 +78,18 @@ interface StudioWorkspaceProps {
   onError: (message: string) => void;
 }
 
+interface StudioRenderQueueItem {
+  id: string;
+  projectId: string;
+  segmentId: string;
+  segmentLabel: string;
+  status: "queued" | "running" | "failed";
+  errorMessage?: string;
+  jobId?: string;
+}
+
+const STUDIO_RENDER_QUEUE_STORAGE_KEY = "izwi.studio.render.queue.v1";
+
 const SAVED_VOICE_RENDERER_PREFERRED_MODELS = [
   ...VOICE_CLONING_PREFERRED_MODELS,
 ] as const;
@@ -166,6 +178,9 @@ export function StudioWorkspace({
     null,
   );
   const [renderingAll, setRenderingAll] = useState(false);
+  const [renderQueue, setRenderQueue] = useState<StudioRenderQueueItem[]>([]);
+  const [renderQueueReady, setRenderQueueReady] = useState(false);
+  const [processingRenderQueue, setProcessingRenderQueue] = useState(false);
   const [deletingProject, setDeletingProject] = useState(false);
   const [segmentDrafts, setSegmentDrafts] = useState<Record<string, string>>({});
   const [segmentSelections, setSegmentSelections] = useState<
@@ -555,6 +570,48 @@ export function StudioWorkspace({
       onSelectModel?.(projectModelId);
     }
   }, [onSelectModel, projectModelId, selectedModel]);
+
+  useEffect(() => {
+    if (
+      typeof window === "undefined" ||
+      typeof window.localStorage?.getItem !== "function"
+    ) {
+      setRenderQueueReady(true);
+      return;
+    }
+    try {
+      const raw = window.localStorage.getItem(STUDIO_RENDER_QUEUE_STORAGE_KEY);
+      if (!raw) {
+        setRenderQueue([]);
+      } else {
+        const parsed = JSON.parse(raw) as StudioRenderQueueItem[];
+        setRenderQueue(
+          parsed.map((item) => ({
+            ...item,
+            status: item.status === "running" ? "queued" : item.status,
+          })),
+        );
+      }
+    } catch {
+      setRenderQueue([]);
+    } finally {
+      setRenderQueueReady(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (
+      !renderQueueReady ||
+      typeof window === "undefined" ||
+      typeof window.localStorage?.setItem !== "function"
+    ) {
+      return;
+    }
+    window.localStorage.setItem(
+      STUDIO_RENDER_QUEUE_STORAGE_KEY,
+      JSON.stringify(renderQueue),
+    );
+  }, [renderQueue, renderQueueReady]);
 
   const builtInVoiceItems: VoicePickerItem[] = availableSpeakers.map((voice) => ({
     id: voice.id,
@@ -1120,6 +1177,160 @@ export function StudioWorkspace({
     }
   };
 
+  const queueSegmentsForRender = useCallback(
+    async (project: TtsProjectRecord, segmentIds: string[]) => {
+      const uniqueSegmentIds = Array.from(
+        new Set(segmentIds.filter((id) => id.trim().length > 0)),
+      );
+      if (uniqueSegmentIds.length === 0) {
+        return 0;
+      }
+
+      let jobId: string | undefined;
+      try {
+        const job = await api.createTtsProjectRenderJob(project.id, {
+          queued_segment_ids: uniqueSegmentIds,
+        });
+        jobId = job.id;
+      } catch {
+        jobId = undefined;
+      }
+
+      setRenderQueue((current) => {
+        const existingKeySet = new Set(
+          current
+            .filter((item) => item.status === "queued" || item.status === "running")
+            .map((item) => `${item.projectId}:${item.segmentId}`),
+        );
+        const additions = uniqueSegmentIds
+          .filter((segmentId) => !existingKeySet.has(`${project.id}:${segmentId}`))
+          .map((segmentId) => {
+            const segment = project.segments.find((entry) => entry.id === segmentId);
+            return {
+              id: `rq_${project.id}_${segmentId}_${Date.now()}`,
+              projectId: project.id,
+              segmentId,
+              segmentLabel: segment
+                ? `Segment ${segment.position + 1}`
+                : "Segment",
+              status: "queued" as const,
+              jobId,
+            };
+          });
+        return [...current, ...additions];
+      });
+
+      return uniqueSegmentIds.length;
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!renderQueueReady || processingRenderQueue) {
+      return;
+    }
+    const nextItem = renderQueue.find((item) => item.status === "queued");
+    if (!nextItem) {
+      return;
+    }
+
+    setProcessingRenderQueue(true);
+    setRenderingSegmentId(nextItem.segmentId);
+    setRenderQueue((current) =>
+      current.map((item) =>
+        item.id === nextItem.id
+          ? { ...item, status: "running", errorMessage: undefined }
+          : item,
+      ),
+    );
+
+    const process = async () => {
+      try {
+        const project = await api.renderTtsProjectSegment(
+          nextItem.projectId,
+          nextItem.segmentId,
+        );
+        if (selectedProjectId === nextItem.projectId) {
+          setSelectedProject(project);
+        }
+        await loadProjects();
+
+        setRenderQueue((current) =>
+          current.filter((item) => item.id !== nextItem.id),
+        );
+
+        if (nextItem.jobId) {
+          const hasPendingForJob = renderQueue.some(
+            (item) =>
+              item.jobId === nextItem.jobId &&
+              item.id !== nextItem.id &&
+              (item.status === "queued" || item.status === "running"),
+          );
+          if (!hasPendingForJob) {
+            await api.updateTtsProjectRenderJob(nextItem.projectId, nextItem.jobId, {
+              status: "completed",
+            });
+          }
+        }
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "Failed to render queued segment.";
+        setRenderQueue((current) =>
+          current.map((item) =>
+            item.id === nextItem.id
+              ? { ...item, status: "failed", errorMessage: message }
+              : item,
+          ),
+        );
+        if (nextItem.jobId) {
+          try {
+            await api.updateTtsProjectRenderJob(nextItem.projectId, nextItem.jobId, {
+              status: "failed",
+              error_message: message,
+            });
+          } catch {
+            // noop: queue failure state is already surfaced locally.
+          }
+        }
+      } finally {
+        setRenderingSegmentId(null);
+        setProcessingRenderQueue(false);
+      }
+    };
+
+    void process();
+  }, [
+    loadProjects,
+    processingRenderQueue,
+    renderQueue,
+    renderQueueReady,
+    selectedProjectId,
+  ]);
+
+  const retryRenderQueueItem = async (queueId: string) => {
+    setRenderQueue((current) =>
+      current.map((item) =>
+        item.id === queueId
+          ? { ...item, status: "queued", errorMessage: undefined }
+          : item,
+      ),
+    );
+  };
+
+  const cancelRenderQueueItem = async (queueId: string) => {
+    const item = renderQueue.find((entry) => entry.id === queueId);
+    setRenderQueue((current) => current.filter((entry) => entry.id !== queueId));
+    if (item?.jobId) {
+      try {
+        await api.updateTtsProjectRenderJob(item.projectId, item.jobId, {
+          status: "cancelled",
+        });
+      } catch {
+        // noop
+      }
+    }
+  };
+
   const handleMergeSegmentWithNext = async (segmentId: string) => {
     if (!selectedProject) {
       return;
@@ -1230,7 +1441,6 @@ export function StudioWorkspace({
       return;
     }
     try {
-      setRenderingSegmentId(segmentId);
       let currentProject = project;
       const currentSegment = currentProject.segments.find(
         (segment) => segment.id === segmentId,
@@ -1246,23 +1456,21 @@ export function StudioWorkspace({
         }
         currentProject = synced;
       }
-
-      const updated = await api.renderTtsProjectSegment(currentProject.id, segmentId);
-      setSelectedProject(updated);
+      const queuedCount = await queueSegmentsForRender(currentProject, [segmentId]);
       setWorkspaceStatus({
         tone: "success",
-        message: segmentDirty
-          ? "Saved the latest text and rendered the segment."
-          : "Segment rendered and attached to the project.",
+        message:
+          queuedCount > 0
+            ? segmentDirty
+              ? "Saved latest edits and queued the segment for rendering."
+              : "Segment queued for rendering."
+            : "Segment is already in the render queue.",
       });
-      await loadProjects();
     } catch (err) {
       const message =
         err instanceof Error ? err.message : "Failed to render the segment.";
       setWorkspaceError(message);
       onError(message);
-    } finally {
-      setRenderingSegmentId(null);
     }
   };
 
@@ -1306,19 +1514,17 @@ export function StudioWorkspace({
         }
       }
 
-      for (const segment of current.segments) {
-        if (!segmentIdsToRender.has(segment.id)) {
-          continue;
-        }
-
-        current = await api.renderTtsProjectSegment(current.id, segment.id);
-        setSelectedProject(current);
-      }
+      const queuedCount = await queueSegmentsForRender(
+        current,
+        Array.from(segmentIdsToRender),
+      );
       setWorkspaceStatus({
         tone: "success",
-        message: `Rendered ${segmentIdsToRender.size} segment${segmentIdsToRender.size === 1 ? "" : "s"} that needed updates.`,
+        message:
+          queuedCount > 0
+            ? `Queued ${queuedCount} segment${queuedCount === 1 ? "" : "s"} for background rendering.`
+            : "All pending segments are already queued.",
       });
-      await loadProjects();
     } catch (err) {
       const message =
         err instanceof Error ? err.message : "Failed while rendering the project.";
@@ -1416,6 +1622,20 @@ export function StudioWorkspace({
     pendingRenderSegmentCount > 0
       ? `Render ${pendingRenderSegmentCount} remaining`
       : "All blocks rendered";
+  const activeProjectQueueItems = renderQueue.filter(
+    (item) => selectedProject && item.projectId === selectedProject.id,
+  );
+  const queuedRenderCount = activeProjectQueueItems.filter(
+    (item) => item.status === "queued" || item.status === "running",
+  ).length;
+  const failedRenderCount = activeProjectQueueItems.filter(
+    (item) => item.status === "failed",
+  ).length;
+  const queuedSegmentIdSet = new Set(
+    activeProjectQueueItems
+      .filter((item) => item.status === "queued" || item.status === "running")
+      .map((item) => item.segmentId),
+  );
   const projectLibraryActions = (
     <div className="flex items-center gap-2">
       <Button
@@ -2130,6 +2350,7 @@ export function StudioWorkspace({
                     const segmentNeedsRender = segmentDirty || !segment.speech_record_id;
                     const isSaving = savingSegmentId === segment.id;
                     const isRendering = renderingSegmentId === segment.id;
+                    const segmentQueued = queuedSegmentIdSet.has(segment.id);
                     const splitIndex = segmentSelections[segment.id];
                     const canSplitSegment =
                       typeof splitIndex === "number" &&
@@ -2249,14 +2470,16 @@ export function StudioWorkspace({
                             <Button
                               size="sm"
                               onClick={() => void handleRenderSegment(segment.id)}
-                              disabled={isRendering}
+                              disabled={isRendering || segmentQueued}
                             >
                               {isRendering ? (
                                 <Loader2 className="h-4 w-4 animate-spin" />
                               ) : (
                                 <Play className="h-4 w-4" />
                               )}
-                              {segmentDirty
+                              {segmentQueued
+                                ? "Queued"
+                                : segmentDirty
                                 ? "Save & render"
                                 : segmentNeedsRender
                                   ? "Render block"
@@ -2514,6 +2737,72 @@ export function StudioWorkspace({
                       )}
                       Delete project
                     </Button>
+                  </div>
+                </section>
+
+                <section className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                        Render Queue
+                      </div>
+                      <div className="mt-1 text-sm font-semibold text-[var(--text-primary)]">
+                        {queuedRenderCount} queued · {failedRenderCount} failed
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="mt-3 space-y-2">
+                    {activeProjectQueueItems.length === 0 ? (
+                      <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
+                        No queued renders for this project.
+                      </div>
+                    ) : (
+                      activeProjectQueueItems.map((item) => (
+                        <div
+                          key={item.id}
+                          className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="text-sm text-[var(--text-primary)]">
+                              {item.segmentLabel}
+                            </div>
+                            <div className="text-xs uppercase tracking-wider text-[var(--text-muted)]">
+                              {item.status}
+                            </div>
+                          </div>
+                          {item.errorMessage ? (
+                            <div className="mt-1 text-xs text-[var(--danger-text)]">
+                              {item.errorMessage}
+                            </div>
+                          ) : null}
+                          <div className="mt-2 flex items-center gap-2">
+                            {item.status === "failed" ? (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                className="h-7 bg-[var(--bg-surface-0)] px-2 text-xs"
+                                onClick={() => void retryRenderQueueItem(item.id)}
+                              >
+                                Retry
+                              </Button>
+                            ) : null}
+                            {item.status !== "running" ? (
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 px-2 text-xs"
+                                onClick={() => void cancelRenderQueueItem(item.id)}
+                              >
+                                Cancel
+                              </Button>
+                            ) : null}
+                          </div>
+                        </div>
+                      ))
+                    )}
                   </div>
                 </section>
               </>
