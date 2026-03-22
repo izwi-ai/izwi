@@ -51,6 +51,8 @@ export type {
   TtsProjectRenderJobStatus,
   TtsProjectRenderJobUpdateRequest,
   TtsProjectSegmentRecord,
+  TtsProjectSegmentBulkDeleteRequest,
+  TtsProjectSegmentReorderRequest,
   TtsProjectSegmentSplitRequest,
   TtsProjectSegmentUpdateRequest,
   TtsProjectSnapshotCreateRequest,

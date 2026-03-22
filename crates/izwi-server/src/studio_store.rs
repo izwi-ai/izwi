@@ -760,6 +760,251 @@ impl TtsProjectStore {
         .await
     }
 
+    pub async fn merge_segment_with_next(
+        &self,
+        project_id: String,
+        segment_id: String,
+    ) -> anyhow::Result<Option<TtsProjectRecord>> {
+        self.run_blocking(move |db_path| {
+            let mut conn = storage_layout::open_sqlite_connection(&db_path)?;
+            let tx = conn.transaction()?;
+            let now = now_unix_millis_i64();
+
+            let current = tx
+                .query_row(
+                    r#"
+                    SELECT id, position, text
+                    FROM tts_project_segments
+                    WHERE project_id = ?1 AND id = ?2
+                    "#,
+                    params![project_id.as_str(), segment_id.as_str()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((current_id, current_position, current_text)) = current else {
+                tx.rollback()?;
+                return Ok(None);
+            };
+
+            let next = tx
+                .query_row(
+                    r#"
+                    SELECT id, position, text
+                    FROM tts_project_segments
+                    WHERE project_id = ?1 AND position = ?2
+                    "#,
+                    params![project_id.as_str(), current_position + 1],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((next_id, next_position, next_text)) = next else {
+                tx.rollback()?;
+                return Ok(None);
+            };
+
+            let merged_text = format!("{}\n\n{}", current_text.trim(), next_text.trim())
+                .trim()
+                .to_string();
+            tx.execute(
+                r#"
+                UPDATE tts_project_segments
+                SET
+                    text = ?3,
+                    speech_record_id = NULL,
+                    updated_at = ?4
+                WHERE project_id = ?1 AND id = ?2
+                "#,
+                params![project_id.as_str(), current_id.as_str(), merged_text, now],
+            )?;
+
+            tx.execute(
+                r#"
+                DELETE FROM tts_project_segments
+                WHERE project_id = ?1 AND id = ?2
+                "#,
+                params![project_id.as_str(), next_id.as_str()],
+            )?;
+
+            tx.execute(
+                r#"
+                UPDATE tts_project_segments
+                SET position = position - 1
+                WHERE project_id = ?1 AND position > ?2
+                "#,
+                params![project_id.as_str(), next_position],
+            )?;
+
+            sync_project_source_text(&tx, project_id.as_str())?;
+            touch_project(&tx, project_id.as_str(), now)?;
+            tx.commit()?;
+            fetch_project(&conn, &project_id)
+        })
+        .await
+    }
+
+    pub async fn reorder_segments(
+        &self,
+        project_id: String,
+        ordered_segment_ids: Vec<String>,
+    ) -> anyhow::Result<Option<TtsProjectRecord>> {
+        self.run_blocking(move |db_path| {
+            let mut conn = storage_layout::open_sqlite_connection(&db_path)?;
+            let tx = conn.transaction()?;
+
+            let existing_ids = {
+                let mut stmt = tx.prepare(
+                    r#"
+                    SELECT id
+                    FROM tts_project_segments
+                    WHERE project_id = ?1
+                    ORDER BY position ASC, id ASC
+                    "#,
+                )?;
+                let rows =
+                    stmt.query_map(params![project_id.as_str()], |row| row.get::<_, String>(0))?;
+                let mut ids = Vec::new();
+                for row in rows {
+                    ids.push(row?);
+                }
+                ids
+            };
+            if existing_ids.is_empty() {
+                tx.rollback()?;
+                return Ok(None);
+            }
+            if ordered_segment_ids.len() != existing_ids.len() {
+                anyhow::bail!("Reorder request must include every project segment exactly once.");
+            }
+
+            let existing_set = existing_ids.iter().collect::<std::collections::HashSet<_>>();
+            let requested_set = ordered_segment_ids
+                .iter()
+                .collect::<std::collections::HashSet<_>>();
+            if existing_set != requested_set {
+                anyhow::bail!("Reorder request contains unknown or missing segment ids.");
+            }
+
+            let now = now_unix_millis_i64();
+            for (position, segment_id) in ordered_segment_ids.iter().enumerate() {
+                tx.execute(
+                    r#"
+                    UPDATE tts_project_segments
+                    SET position = ?3, updated_at = ?4, speech_record_id = NULL
+                    WHERE project_id = ?1 AND id = ?2
+                    "#,
+                    params![
+                        project_id.as_str(),
+                        segment_id.as_str(),
+                        usize_to_i64(position),
+                        now
+                    ],
+                )?;
+            }
+
+            sync_project_source_text(&tx, project_id.as_str())?;
+            touch_project(&tx, project_id.as_str(), now)?;
+            tx.commit()?;
+            fetch_project(&conn, &project_id)
+        })
+        .await
+    }
+
+    pub async fn delete_segments(
+        &self,
+        project_id: String,
+        segment_ids: Vec<String>,
+    ) -> anyhow::Result<Option<TtsProjectRecord>> {
+        self.run_blocking(move |db_path| {
+            let mut conn = storage_layout::open_sqlite_connection(&db_path)?;
+            let tx = conn.transaction()?;
+            let existing = {
+                let mut stmt = tx.prepare(
+                    r#"
+                    SELECT id, position
+                    FROM tts_project_segments
+                    WHERE project_id = ?1
+                    ORDER BY position ASC, id ASC
+                    "#,
+                )?;
+                let rows = stmt.query_map(params![project_id.as_str()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?;
+                let mut records = Vec::new();
+                for row in rows {
+                    records.push(row?);
+                }
+                records
+            };
+            if existing.is_empty() {
+                tx.rollback()?;
+                return Ok(None);
+            }
+
+            let remove_set = segment_ids
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>();
+            if remove_set.is_empty() {
+                tx.rollback()?;
+                return fetch_project(&conn, &project_id);
+            }
+
+            let remaining_count = existing
+                .iter()
+                .filter(|(id, _)| !remove_set.contains(id))
+                .count();
+            if remaining_count == 0 {
+                anyhow::bail!("A project must keep at least one segment.");
+            }
+
+            for (segment_id, _) in &existing {
+                if remove_set.contains(segment_id) {
+                    tx.execute(
+                        r#"
+                        DELETE FROM tts_project_segments
+                        WHERE project_id = ?1 AND id = ?2
+                        "#,
+                        params![project_id.as_str(), segment_id.as_str()],
+                    )?;
+                }
+            }
+
+            let mut new_position = 0usize;
+            for (segment_id, _) in existing {
+                if remove_set.contains(segment_id.as_str()) {
+                    continue;
+                }
+                tx.execute(
+                    r#"
+                    UPDATE tts_project_segments
+                    SET position = ?3
+                    WHERE project_id = ?1 AND id = ?2
+                    "#,
+                    params![project_id.as_str(), segment_id.as_str(), usize_to_i64(new_position)],
+                )?;
+                new_position += 1;
+            }
+
+            let now = now_unix_millis_i64();
+            sync_project_source_text(&tx, project_id.as_str())?;
+            touch_project(&tx, project_id.as_str(), now)?;
+            tx.commit()?;
+            fetch_project(&conn, &project_id)
+        })
+        .await
+    }
+
     pub async fn attach_segment_record(
         &self,
         project_id: String,

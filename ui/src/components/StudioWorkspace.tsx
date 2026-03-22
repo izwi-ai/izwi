@@ -9,6 +9,8 @@ import {
 import { createPortal } from "react-dom";
 import {
   AlertCircle,
+  ChevronDown,
+  ChevronUp,
   CheckCircle2,
   Download,
   FileAudio,
@@ -20,6 +22,7 @@ import {
   Settings2,
   Trash2,
   Upload,
+  Link2,
   Waves,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -138,6 +141,8 @@ export function StudioWorkspace({
   const [newProjectName, setNewProjectName] = useState("");
   const [newProjectText, setNewProjectText] = useState("");
   const [newProjectFilename, setNewProjectFilename] = useState("");
+  const [newProjectSourceUrl, setNewProjectSourceUrl] = useState("");
+  const [importingFromUrl, setImportingFromUrl] = useState(false);
   const [isCreateProjectDialogOpen, setIsCreateProjectDialogOpen] =
     useState(false);
   const [isProjectLibraryOpen, setIsProjectLibraryOpen] = useState(false);
@@ -166,6 +171,7 @@ export function StudioWorkspace({
   const [segmentSelections, setSegmentSelections] = useState<
     Record<string, number | null>
   >({});
+  const [selectedSegmentIds, setSelectedSegmentIds] = useState<string[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const {
     downloadState,
@@ -462,6 +468,7 @@ export function StudioWorkspace({
       setProjectSpeed(1);
       setSegmentDrafts({});
       setSegmentSelections({});
+      setSelectedSegmentIds([]);
       return;
     }
 
@@ -478,6 +485,7 @@ export function StudioWorkspace({
       ),
     );
     setSegmentSelections({});
+    setSelectedSegmentIds([]);
   }, [projectMetaById, selectedModel, selectedProject]);
 
   useEffect(() => {
@@ -637,6 +645,39 @@ export function StudioWorkspace({
     savedVoiceItems,
   ]);
 
+  const normalizeImportedText = useCallback(
+    (filename: string, text: string): string => {
+      const lower = filename.toLowerCase();
+      if (lower.endsWith(".json")) {
+        try {
+          const parsed = JSON.parse(text) as unknown;
+          if (typeof parsed === "string") {
+            return parsed;
+          }
+          return JSON.stringify(parsed, null, 2);
+        } catch {
+          return text;
+        }
+      }
+      if (lower.endsWith(".html") || lower.endsWith(".htm")) {
+        if (typeof DOMParser !== "undefined") {
+          const parser = new DOMParser();
+          const doc = parser.parseFromString(text, "text/html");
+          return doc.body?.textContent?.trim() || text;
+        }
+      }
+      if (lower.endsWith(".rtf")) {
+        return text
+          .replace(/\\par[d]?/g, "\n")
+          .replace(/\\'[0-9a-fA-F]{2}/g, "")
+          .replace(/[{}\\]/g, "")
+          .trim();
+      }
+      return text;
+    },
+    [],
+  );
+
   const handleImportFile = async (
     event: ChangeEvent<HTMLInputElement>,
   ) => {
@@ -645,7 +686,7 @@ export function StudioWorkspace({
       return;
     }
     try {
-      const text = await file.text();
+      const text = normalizeImportedText(file.name, await file.text());
       setNewProjectText(text);
       setNewProjectFilename(file.name);
       if (!newProjectName.trim()) {
@@ -662,6 +703,49 @@ export function StudioWorkspace({
       onError(message);
     } finally {
       event.target.value = "";
+    }
+  };
+
+  const handleImportFromUrl = async () => {
+    const sourceUrl = newProjectSourceUrl.trim();
+    if (!sourceUrl) {
+      const message = "Enter a URL to import a script.";
+      setWorkspaceError(message);
+      onError(message);
+      return;
+    }
+    try {
+      setImportingFromUrl(true);
+      setWorkspaceError(null);
+      const response = await fetch(sourceUrl);
+      if (!response.ok) {
+        throw new Error(`Failed to load URL (${response.status}).`);
+      }
+      const html = await response.text();
+      const text = normalizeImportedText(`${sourceUrl}.html`, html);
+      if (!text.trim()) {
+        throw new Error("The URL did not return extractable text.");
+      }
+      setNewProjectText(text);
+      if (!newProjectName.trim()) {
+        try {
+          const url = new URL(sourceUrl);
+          setNewProjectName(url.hostname);
+        } catch {
+          setNewProjectName("Imported URL");
+        }
+      }
+      setWorkspaceStatus({
+        tone: "success",
+        message: `Imported script content from ${sourceUrl}.`,
+      });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Failed to import script from URL.";
+      setWorkspaceError(message);
+      onError(message);
+    } finally {
+      setImportingFromUrl(false);
     }
   };
 
@@ -780,6 +864,7 @@ export function StudioWorkspace({
       setNewProjectName("");
       setNewProjectText("");
       setNewProjectFilename("");
+      setNewProjectSourceUrl("");
       setIsCreateProjectDialogOpen(false);
       setIsProjectLibraryOpen(false);
       setWorkspaceStatus({
@@ -1035,6 +1120,107 @@ export function StudioWorkspace({
     }
   };
 
+  const handleMergeSegmentWithNext = async (segmentId: string) => {
+    if (!selectedProject) {
+      return;
+    }
+    try {
+      const project = await api.mergeTtsProjectSegmentWithNext(
+        selectedProject.id,
+        segmentId,
+      );
+      setSelectedProject(project);
+      setWorkspaceStatus({
+        tone: "success",
+        message: "Merged segment with the next block.",
+      });
+      await loadProjects();
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Failed to merge project segments.";
+      setWorkspaceError(message);
+      onError(message);
+    }
+  };
+
+  const handleMoveSegment = async (
+    segmentId: string,
+    direction: "up" | "down",
+  ) => {
+    if (!selectedProject) {
+      return;
+    }
+    const ids = selectedProject.segments.map((segment) => segment.id);
+    const index = ids.findIndex((id) => id === segmentId);
+    if (index < 0) {
+      return;
+    }
+    const targetIndex = direction === "up" ? index - 1 : index + 1;
+    if (targetIndex < 0 || targetIndex >= ids.length) {
+      return;
+    }
+    const reordered = [...ids];
+    const [moved] = reordered.splice(index, 1);
+    reordered.splice(targetIndex, 0, moved);
+    try {
+      const project = await api.reorderTtsProjectSegments(selectedProject.id, {
+        ordered_segment_ids: reordered,
+      });
+      setSelectedProject(project);
+      setWorkspaceStatus({
+        tone: "success",
+        message:
+          direction === "up"
+            ? "Moved segment up."
+            : "Moved segment down.",
+      });
+      await loadProjects();
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Failed to reorder project segments.";
+      setWorkspaceError(message);
+      onError(message);
+    }
+  };
+
+  const handleBulkDeleteSegments = async () => {
+    if (!selectedProject || selectedSegmentIds.length === 0) {
+      return;
+    }
+    if (selectedSegmentIds.length >= selectedProject.segments.length) {
+      const message = "A project must keep at least one segment.";
+      setWorkspaceError(message);
+      onError(message);
+      return;
+    }
+    try {
+      const project = await api.bulkDeleteTtsProjectSegments(selectedProject.id, {
+        segment_ids: selectedSegmentIds,
+      });
+      setSelectedProject(project);
+      setSelectedSegmentIds([]);
+      setWorkspaceStatus({
+        tone: "success",
+        message: `Deleted ${selectedSegmentIds.length} selected segment${selectedSegmentIds.length === 1 ? "" : "s"}.`,
+      });
+      await loadProjects();
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Failed to delete selected segments.";
+      setWorkspaceError(message);
+      onError(message);
+    }
+  };
+
+  const handleRenderSelectedSegments = async () => {
+    if (!selectedProject || selectedSegmentIds.length === 0) {
+      return;
+    }
+    for (const segmentId of selectedSegmentIds) {
+      await handleRenderSegment(segmentId);
+    }
+  };
+
   const handleRenderSegment = async (segmentId: string) => {
     if (!selectedProject) {
       return;
@@ -1217,6 +1403,7 @@ export function StudioWorkspace({
       const draft = segmentDrafts[segment.id] ?? segment.text;
       return draft !== segment.text || !segment.speech_record_id;
     }).length ?? 0;
+  const selectedSegmentCount = selectedSegmentIds.length;
   const readySegmentCount =
     selectedProjectSegmentCount > 0
       ? Math.max(0, selectedProjectSegmentCount - pendingRenderSegmentCount)
@@ -1420,7 +1607,7 @@ export function StudioWorkspace({
       <input
         ref={fileInputRef}
         type="file"
-        accept=".txt,.md,text/plain"
+        accept=".txt,.md,.json,.csv,.rtf,.html,.htm,text/plain,text/markdown,text/csv,text/html,application/json"
         className="hidden"
         onChange={handleImportFile}
       />
@@ -1466,6 +1653,35 @@ export function StudioWorkspace({
                 <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
                   Source script
                 </label>
+                <div className="flex flex-col gap-2 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3">
+                  <label className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                    Import from URL
+                  </label>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Input
+                      value={newProjectSourceUrl}
+                      onChange={(event) =>
+                        setNewProjectSourceUrl(event.target.value)
+                      }
+                      placeholder="https://example.com/article"
+                      className="flex-1 min-w-[200px] bg-[var(--bg-surface-0)]"
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => void handleImportFromUrl()}
+                      disabled={importingFromUrl}
+                      className="bg-[var(--bg-surface-0)]"
+                    >
+                      {importingFromUrl ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Upload className="h-4 w-4" />
+                      )}
+                      Import URL
+                    </Button>
+                  </div>
+                </div>
                 <Textarea
                   value={newProjectText}
                   onChange={(event) => setNewProjectText(event.target.value)}
@@ -1858,6 +2074,53 @@ export function StudioWorkspace({
                   <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[11px] text-[var(--text-muted)]">
                     {readySegmentCount} ready
                   </span>
+                  {selectedSegmentCount > 0 ? (
+                    <span className="rounded-full border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-2.5 py-1 text-[11px] text-[var(--status-warning-text)]">
+                      {selectedSegmentCount} selected
+                    </span>
+                  ) : null}
+                </div>
+
+                <div className="mt-4 flex flex-wrap items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() =>
+                      setSelectedSegmentIds(
+                        selectedSegmentCount === selectedProject.segments.length
+                          ? []
+                          : selectedProject.segments.map((segment) => segment.id),
+                      )
+                    }
+                    className="bg-[var(--bg-surface-1)]"
+                  >
+                    {selectedSegmentCount === selectedProject.segments.length
+                      ? "Clear selection"
+                      : "Select all"}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void handleRenderSelectedSegments()}
+                    disabled={selectedSegmentCount === 0}
+                    className="bg-[var(--bg-surface-1)]"
+                  >
+                    <Play className="h-4 w-4" />
+                    Render selected
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void handleBulkDeleteSegments()}
+                    disabled={selectedSegmentCount === 0}
+                    className="bg-[var(--bg-surface-1)]"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                    Delete selected
+                  </Button>
                 </div>
 
                 <div className="mt-5 space-y-4">
@@ -1872,6 +2135,10 @@ export function StudioWorkspace({
                       typeof splitIndex === "number" &&
                       splitIndex > 0 &&
                       splitIndex < draft.length;
+                    const isSelected = selectedSegmentIds.includes(segment.id);
+                    const isFirst = segment.position === 0;
+                    const isLast =
+                      segment.position === selectedProject.segments.length - 1;
 
                     return (
                       <div
@@ -1881,6 +2148,22 @@ export function StudioWorkspace({
                         <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
                           <div className="space-y-1.5">
                             <div className="flex flex-wrap items-center gap-2">
+                              <label className="inline-flex items-center gap-1.5 text-xs text-[var(--text-muted)]">
+                                <input
+                                  type="checkbox"
+                                  checked={isSelected}
+                                  onChange={(event) =>
+                                    setSelectedSegmentIds((current) => {
+                                      if (event.target.checked) {
+                                        return [...new Set([...current, segment.id])];
+                                      }
+                                      return current.filter((id) => id !== segment.id);
+                                    })
+                                  }
+                                  className="h-4 w-4 rounded border-[var(--border-muted)]"
+                                />
+                                Select
+                              </label>
                               <span className="text-xs font-semibold uppercase tracking-wider text-[var(--text-muted)]">
                                 Segment {segment.position + 1}
                               </span>
@@ -1923,6 +2206,36 @@ export function StudioWorkspace({
                                 <PencilLine className="h-4 w-4" />
                               )}
                               Save draft
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => void handleMoveSegment(segment.id, "up")}
+                              disabled={isFirst}
+                              className="bg-[var(--bg-surface-0)]"
+                            >
+                              <ChevronUp className="h-4 w-4" />
+                              Move up
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => void handleMoveSegment(segment.id, "down")}
+                              disabled={isLast}
+                              className="bg-[var(--bg-surface-0)]"
+                            >
+                              <ChevronDown className="h-4 w-4" />
+                              Move down
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => void handleMergeSegmentWithNext(segment.id)}
+                              disabled={isLast}
+                              className="bg-[var(--bg-surface-0)]"
+                            >
+                              <Link2 className="h-4 w-4" />
+                              Merge next
                             </Button>
                             <Button
                               variant="outline"

@@ -67,6 +67,18 @@ pub fn router() -> Router<AppState> {
             axum::routing::post(handlers::split_tts_project_segment),
         )
         .route(
+            "/tts-projects/:project_id/segments/:segment_id/merge-next",
+            axum::routing::post(handlers::merge_tts_project_segment_with_next),
+        )
+        .route(
+            "/tts-projects/:project_id/segments/reorder",
+            axum::routing::patch(handlers::reorder_tts_project_segments),
+        )
+        .route(
+            "/tts-projects/:project_id/segments/bulk-delete",
+            axum::routing::post(handlers::bulk_delete_tts_project_segments),
+        )
+        .route(
             "/tts-projects/:project_id/segments/:segment_id/render",
             axum::routing::post(handlers::render_tts_project_segment),
         )

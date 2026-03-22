@@ -300,6 +300,14 @@ export interface TtsProjectSegmentSplitRequest {
   after_text: string;
 }
 
+export interface TtsProjectSegmentReorderRequest {
+  ordered_segment_ids: string[];
+}
+
+export interface TtsProjectSegmentBulkDeleteRequest {
+  segment_ids: string[];
+}
+
 export interface TtsProjectFolderRecord {
   id: string;
   created_at: number;
@@ -848,6 +856,14 @@ export class AudioApiClient {
     return `${this.ttsProjectPath(projectId)}/segments/${encodeURIComponent(segmentId)}`;
   }
 
+  private ttsProjectSegmentsReorderPath(projectId: string): string {
+    return `${this.ttsProjectPath(projectId)}/segments/reorder`;
+  }
+
+  private ttsProjectSegmentsBulkDeletePath(projectId: string): string {
+    return `${this.ttsProjectPath(projectId)}/segments/bulk-delete`;
+  }
+
   private ttsProjectPronunciationsPath(projectId: string): string {
     return `${this.ttsProjectPath(projectId)}/pronunciations`;
   }
@@ -1320,6 +1336,42 @@ export class AudioApiClient {
         }),
       },
     );
+  }
+
+  async mergeTtsProjectSegmentWithNext(
+    projectId: string,
+    segmentId: string,
+  ): Promise<TtsProjectRecord> {
+    return this.http.request(
+      `${this.ttsProjectSegmentPath(projectId, segmentId)}/merge-next`,
+      {
+        method: "POST",
+      },
+    );
+  }
+
+  async reorderTtsProjectSegments(
+    projectId: string,
+    request: TtsProjectSegmentReorderRequest,
+  ): Promise<TtsProjectRecord> {
+    return this.http.request(this.ttsProjectSegmentsReorderPath(projectId), {
+      method: "PATCH",
+      body: JSON.stringify({
+        ordered_segment_ids: request.ordered_segment_ids,
+      }),
+    });
+  }
+
+  async bulkDeleteTtsProjectSegments(
+    projectId: string,
+    request: TtsProjectSegmentBulkDeleteRequest,
+  ): Promise<TtsProjectRecord> {
+    return this.http.request(this.ttsProjectSegmentsBulkDeletePath(projectId), {
+      method: "POST",
+      body: JSON.stringify({
+        segment_ids: request.segment_ids,
+      }),
+    });
   }
 
   async deleteTtsProjectSegment(

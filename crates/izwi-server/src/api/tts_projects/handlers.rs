@@ -87,6 +87,16 @@ pub struct SplitTtsProjectSegmentRequest {
     pub after_text: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ReorderTtsProjectSegmentsRequest {
+    pub ordered_segment_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BulkDeleteTtsProjectSegmentsRequest {
+    pub segment_ids: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct TtsProjectFolderListResponse {
     pub folders: Vec<TtsProjectFolderRecord>,
@@ -609,6 +619,58 @@ pub async fn split_tts_project_segment(
         .map_err(map_store_error)?
         .ok_or_else(|| ApiError::not_found("TTS project segment not found"))?;
 
+    Ok(Json(project))
+}
+
+pub async fn merge_tts_project_segment_with_next(
+    State(state): State<AppState>,
+    Path((project_id, segment_id)): Path<(String, String)>,
+) -> Result<Json<TtsProjectRecord>, ApiError> {
+    let project = state
+        .studio_store
+        .merge_segment_with_next(project_id, segment_id)
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("TTS project segment could not be merged"))?;
+
+    Ok(Json(project))
+}
+
+pub async fn reorder_tts_project_segments(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<ReorderTtsProjectSegmentsRequest>,
+) -> Result<Json<TtsProjectRecord>, ApiError> {
+    if req.ordered_segment_ids.is_empty() {
+        return Err(ApiError::bad_request(
+            "Reorder requests require at least one segment id.",
+        ));
+    }
+    let project = state
+        .studio_store
+        .reorder_segments(project_id, req.ordered_segment_ids)
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("TTS project not found"))?;
+    Ok(Json(project))
+}
+
+pub async fn bulk_delete_tts_project_segments(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<BulkDeleteTtsProjectSegmentsRequest>,
+) -> Result<Json<TtsProjectRecord>, ApiError> {
+    if req.segment_ids.is_empty() {
+        return Err(ApiError::bad_request(
+            "Bulk delete requests require at least one segment id.",
+        ));
+    }
+    let project = state
+        .studio_store
+        .delete_segments(project_id, req.segment_ids)
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("TTS project not found"))?;
     Ok(Json(project))
 }
 
