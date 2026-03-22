@@ -56,7 +56,6 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { RouteHistoryDrawer } from "@/components/RouteHistoryDrawer";
 import { Slider } from "@/components/ui/slider";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -194,7 +193,6 @@ export function StudioWorkspace({
   const [importingFromUrl, setImportingFromUrl] = useState(false);
   const [isCreateProjectDialogOpen, setIsCreateProjectDialogOpen] =
     useState(false);
-  const [isProjectLibraryOpen, setIsProjectLibraryOpen] = useState(false);
   const [creatingProject, setCreatingProject] = useState(false);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [workspaceStatus, setWorkspaceStatus] = useState<{
@@ -1017,7 +1015,6 @@ export function StudioWorkspace({
       setNewProjectFilename("");
       setNewProjectSourceUrl("");
       setIsCreateProjectDialogOpen(false);
-      setIsProjectLibraryOpen(false);
       setWorkspaceStatus({
         tone: "success",
         message: `Created project "${project.name}" with ${project.segments.length} segments.`,
@@ -1952,234 +1949,236 @@ export function StudioWorkspace({
       .filter((item) => item.status === "queued" || item.status === "running")
       .map((item) => item.segmentId),
   );
-  const projectLibraryActions = (
-    <div className="flex items-center gap-2">
-      <Button
-        size="sm"
-        onClick={openCreateProjectDialog}
-        className="h-9 gap-2 rounded-lg"
-      >
-        <FilePlus2 className="h-4 w-4" />
-        New project
-      </Button>
-      <RouteHistoryDrawer
-        title="Studio"
-        eyebrow="Project Library"
-        headerIcon={Library}
-        triggerLabel="Project Library"
-        triggerCount={projects.length}
-        countLabel={
-          projectsLoading
-            ? "Loading your reusable script projects."
-            : projects.length === 0
-              ? "No TTS projects yet."
-              : `${visibleProjects.length} of ${projects.length} project${projects.length === 1 ? "" : "s"} shown.`
-        }
-        open={isProjectLibraryOpen}
-        onOpenChange={setIsProjectLibraryOpen}
-      >
-        {({ close }) => (
-          <div className="app-sidebar-list">
-            {projectsLoading ? (
-              <div className="app-sidebar-loading">
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                Loading projects...
-              </div>
-            ) : projects.length === 0 ? (
-              <div className="app-sidebar-empty">
-                Create a project from the workspace to split a script into reusable
-                renderable segments.
-              </div>
-            ) : (
-              <div className="flex flex-col gap-2.5">
-                <div className="space-y-2 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3">
-                  <Input
-                    value={projectSearch}
-                    onChange={(event) => setProjectSearch(event.target.value)}
-                    placeholder="Search projects or tags"
-                    className="bg-[var(--bg-surface-0)]"
-                  />
-                  <div className="grid gap-2 sm:grid-cols-2">
-                    <Select
-                      value={projectStatusFilter}
-                      onValueChange={(value) =>
-                        setProjectStatusFilter(
-                          value as "all" | "in_progress" | "ready",
-                        )
-                      }
-                    >
-                      <SelectTrigger className="h-9 bg-[var(--bg-surface-0)] px-2 text-xs">
-                        <SelectValue placeholder="All statuses" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="all">All statuses</SelectItem>
-                        <SelectItem value="in_progress">In progress</SelectItem>
-                        <SelectItem value="ready">Ready to export</SelectItem>
-                      </SelectContent>
-                    </Select>
-                    <Select
-                      value={projectSort}
-                      onValueChange={(value) =>
-                        setProjectSort(
-                          value as "recent" | "name" | "progress",
-                        )
-                      }
-                    >
-                      <SelectTrigger className="h-9 bg-[var(--bg-surface-0)] px-2 text-xs">
-                        <SelectValue placeholder="Sort: Recent" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="recent">Sort: Recent</SelectItem>
-                        <SelectItem value="name">Sort: Name</SelectItem>
-                        <SelectItem value="progress">Sort: Progress</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <Select
-                    value={projectFolderFilter}
-                    onValueChange={setProjectFolderFilter}
-                  >
-                    <SelectTrigger className="h-9 w-full bg-[var(--bg-surface-0)] px-2 text-xs">
-                      <SelectValue placeholder="All folders" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="all">All folders</SelectItem>
-                      {projectFolders.map((folder) => (
-                        <SelectItem key={folder.id} value={folder.id}>
-                          {folder.name}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-                {visibleProjects.length === 0 ? (
-                  <div className="app-sidebar-empty">
-                    No projects match the current search or filters.
-                  </div>
-                ) : null}
-                {visibleProjects.map((project) => {
-                  const isActive = project.id === selectedProjectId;
-                  const completionLabel = `${project.rendered_segment_count}/${project.segment_count} segments rendered`;
-                  const meta = projectMetaById[project.id];
-                  const folderName = meta?.folder_id
-                    ? folderNameById[meta.folder_id]
-                    : null;
-                  const previewParts = [
-                    completionLabel,
-                    `${project.total_chars} chars`,
-                    project.model_id,
-                    folderName ? `Folder: ${folderName}` : null,
-                    ...(meta?.tags ?? []).slice(0, 2),
-                  ].filter((value): value is string => Boolean(value));
+  const projectHeaderActions = (
+    <Button
+      size="sm"
+      onClick={openCreateProjectDialog}
+      className="h-9 gap-2 rounded-lg"
+    >
+      <FilePlus2 className="h-4 w-4" />
+      New project
+    </Button>
+  );
 
-                  return (
-                    <div
-                      key={project.id}
-                      role="button"
-                      tabIndex={0}
-                      onClick={() => {
-                        setSelectedProjectId(project.id);
-                        close();
-                      }}
-                      onKeyDown={(event) => {
-                        if (event.currentTarget !== event.target) {
-                          return;
-                        }
-                        if (event.key === "Enter" || event.key === " ") {
+  const projectLibraryPanel = (
+    <Card className="rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-4 shadow-none sm:p-5">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+            Project Library
+          </div>
+          <div className="mt-1 text-base font-semibold text-[var(--text-primary)]">
+            {projects.length} project{projects.length === 1 ? "" : "s"}
+          </div>
+          <p className="mt-1 text-xs leading-relaxed text-[var(--text-muted)]">
+            Browse, filter, and jump into long-form narration projects without leaving the page.
+          </p>
+        </div>
+        <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-2 text-[var(--text-muted)]">
+          <Library className="h-4 w-4" />
+        </div>
+      </div>
+
+      <div className="mt-4 space-y-2 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3">
+        <Input
+          value={projectSearch}
+          onChange={(event) => setProjectSearch(event.target.value)}
+          placeholder="Search projects, models, or tags"
+          className="bg-[var(--bg-surface-0)]"
+        />
+        <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
+          <Select
+            value={projectStatusFilter}
+            onValueChange={(value) =>
+              setProjectStatusFilter(value as "all" | "in_progress" | "ready")
+            }
+          >
+            <SelectTrigger className="h-9 bg-[var(--bg-surface-0)] px-2 text-xs">
+              <SelectValue placeholder="All statuses" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All statuses</SelectItem>
+              <SelectItem value="in_progress">In progress</SelectItem>
+              <SelectItem value="ready">Ready to export</SelectItem>
+            </SelectContent>
+          </Select>
+          <Select
+            value={projectSort}
+            onValueChange={(value) =>
+              setProjectSort(value as "recent" | "name" | "progress")
+            }
+          >
+            <SelectTrigger className="h-9 bg-[var(--bg-surface-0)] px-2 text-xs">
+              <SelectValue placeholder="Sort: Recent" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="recent">Sort: Recent</SelectItem>
+              <SelectItem value="name">Sort: Name</SelectItem>
+              <SelectItem value="progress">Sort: Progress</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+        <Select value={projectFolderFilter} onValueChange={setProjectFolderFilter}>
+          <SelectTrigger className="h-9 w-full bg-[var(--bg-surface-0)] px-2 text-xs">
+            <SelectValue placeholder="All folders" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All folders</SelectItem>
+            {projectFolders.map((folder) => (
+              <SelectItem key={folder.id} value={folder.id}>
+                {folder.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+
+      <div className="mt-4 space-y-2.5">
+        {projectsLoading ? (
+          <div className="flex items-center gap-2 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            Loading projects...
+          </div>
+        ) : projects.length === 0 ? (
+          <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-3 text-xs text-[var(--text-muted)]">
+            No projects yet. Create a project to start segmenting and rendering.
+          </div>
+        ) : (
+          <div className="max-h-[34rem] space-y-2.5 overflow-y-auto pr-1">
+            {visibleProjects.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-3 text-xs text-[var(--text-muted)]">
+                No projects match the current search or filters.
+              </div>
+            ) : null}
+            {visibleProjects.map((project) => {
+              const isActive = project.id === selectedProjectId;
+              const meta = projectMetaById[project.id];
+              const folderName = meta?.folder_id ? folderNameById[meta.folder_id] : null;
+              const progressPercent =
+                project.segment_count > 0
+                  ? Math.round((project.rendered_segment_count / project.segment_count) * 100)
+                  : 0;
+              const completionLabel = `${project.rendered_segment_count}/${project.segment_count} rendered`;
+              const projectStatus =
+                progressPercent >= 100
+                  ? "Ready"
+                  : project.rendered_segment_count > 0
+                    ? "In progress"
+                    : "Not rendered";
+              return (
+                <div
+                  key={project.id}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => {
+                    setSelectedProjectId(project.id);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.currentTarget !== event.target) {
+                      return;
+                    }
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      setSelectedProjectId(project.id);
+                    }
+                  }}
+                  className={cn(
+                    "group rounded-xl border p-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+                    isActive
+                      ? "border-[var(--accent-soft-border)] bg-[var(--accent-soft-bg)]"
+                      : "border-[var(--border-muted)] bg-[var(--bg-surface-1)] hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-0)]",
+                  )}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="truncate text-sm font-semibold text-[var(--text-primary)]">
+                      {project.name}
+                    </span>
+                    <div className="inline-flex items-center gap-1.5 shrink-0">
+                      <span className="text-[11px] text-[var(--text-muted)]">
+                        {formatRelativeDate(project.updated_at)}
+                      </span>
+                      <button
+                        type="button"
+                        onPointerDown={(event) => {
+                          event.stopPropagation();
+                        }}
+                        onClick={(event) => {
                           event.preventDefault();
-                          setSelectedProjectId(project.id);
-                          close();
-                        }
-                      }}
+                          event.stopPropagation();
+                          openDeleteProjectConfirm(project.id, project.name);
+                        }}
+                        className="app-sidebar-delete-btn"
+                        title="Delete project"
+                        aria-label={`Delete project ${project.name}`}
+                        disabled={deletingProject}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[10px] font-medium uppercase tracking-[0.12em]">
+                    <span
                       className={cn(
-                        "group app-sidebar-row h-auto min-h-[110px] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-                        isActive
-                          ? "app-sidebar-row-active"
-                          : "app-sidebar-row-idle",
+                        "rounded-full border px-2 py-0.5",
+                        progressPercent >= 100
+                          ? "border-[var(--status-positive-border)] bg-[var(--status-positive-bg)] text-[var(--status-positive-text)]"
+                          : "border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] text-[var(--status-warning-text)]",
                       )}
                     >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="app-sidebar-row-label truncate font-medium text-[var(--text-primary)]">
-                          {project.name}
-                        </span>
-                        <div className="inline-flex items-center gap-1.5 shrink-0">
-                          <span className="app-sidebar-row-meta">
-                            {formatRelativeDate(project.updated_at)}
-                          </span>
-                          <button
-                            type="button"
-                            onPointerDown={(event) => {
-                              event.stopPropagation();
-                            }}
-                            onClick={(event) => {
-                              event.preventDefault();
-                              event.stopPropagation();
-                              openDeleteProjectConfirm(project.id, project.name);
-                            }}
-                            className="app-sidebar-delete-btn"
-                            title="Delete project"
-                            aria-label={`Delete project ${project.name}`}
-                            disabled={deletingProject}
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </button>
-                        </div>
-                      </div>
-                      <div className="mt-2 flex items-center gap-2">
-                        <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-[var(--bg-surface-3)]">
-                          <div
-                            className="h-full rounded-full bg-[var(--accent-solid)] transition-[width] duration-300"
-                            style={{
-                              width: `${
-                                project.segment_count > 0
-                                  ? Math.round(
-                                      (project.rendered_segment_count /
-                                        project.segment_count) *
-                                        100,
-                                    )
-                                  : 0
-                              }%`,
-                            }}
-                          />
-                        </div>
-                        <span className="app-sidebar-row-meta shrink-0">
-                          {project.segment_count > 0
-                            ? `${Math.round(
-                                (project.rendered_segment_count /
-                                  project.segment_count) *
-                                  100,
-                              )}%`
-                            : "0%"}
-                        </span>
-                      </div>
-                      <p
-                        className="app-sidebar-row-preview"
-                        style={{
-                          display: "-webkit-box",
-                          WebkitLineClamp: 3,
-                          WebkitBoxOrient: "vertical",
-                          overflow: "hidden",
-                        }}
-                      >
-                        {previewParts.join(" · ")}
-                      </p>
+                      {projectStatus}
+                    </span>
+                    {folderName ? (
+                      <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2 py-0.5 text-[var(--text-muted)]">
+                        {folderName}
+                      </span>
+                    ) : null}
+                  </div>
+
+                  <div className="mt-3 flex items-center gap-2">
+                    <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-[var(--bg-surface-3)]">
+                      <div
+                        className="h-full rounded-full bg-[var(--accent-solid)] transition-[width] duration-300"
+                        style={{ width: `${progressPercent}%` }}
+                      />
                     </div>
-                  );
-                })}
-              </div>
-            )}
+                    <span className="text-[11px] text-[var(--text-muted)]">
+                      {progressPercent}%
+                    </span>
+                  </div>
+
+                  <div className="mt-2 flex items-center justify-between text-xs text-[var(--text-muted)]">
+                    <span>{completionLabel}</span>
+                    <span>{project.total_chars} chars</span>
+                  </div>
+
+                  <p
+                    className="mt-2 text-xs text-[var(--text-secondary)]"
+                    style={{
+                      display: "-webkit-box",
+                      WebkitLineClamp: 2,
+                      WebkitBoxOrient: "vertical",
+                      overflow: "hidden",
+                    }}
+                  >
+                    {project.model_id || "No model selected"}
+                    {meta?.tags?.length ? ` · ${meta.tags.slice(0, 2).join(" · ")}` : ""}
+                  </p>
+                </div>
+              );
+            })}
           </div>
         )}
-      </RouteHistoryDrawer>
-    </div>
+      </div>
+    </Card>
   );
 
   return (
     <>
       {headerActionContainer === undefined
-        ? projectLibraryActions
+        ? projectHeaderActions
         : headerActionContainer
-          ? createPortal(projectLibraryActions, headerActionContainer)
+          ? createPortal(projectHeaderActions, headerActionContainer)
           : null}
 
       <input
@@ -2540,8 +2539,13 @@ export function StudioWorkspace({
           </div>
         ) : null}
 
+        <div className="grid gap-5 xl:grid-cols-[360px_minmax(0,1fr)]">
+          <aside className="xl:sticky xl:top-4 xl:self-start">
+            {projectLibraryPanel}
+          </aside>
+          <div className="min-w-0">
         {!selectedProject ? (
-          <section className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-8 sm:p-10">
+          <div className="bg-[var(--bg-surface-0)] p-8 sm:p-10">
             <div className="flex min-h-[620px] flex-col items-center justify-center gap-6 text-center">
               <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
                 <FileAudio className="h-6 w-6 text-[var(--text-muted)]" />
@@ -2560,16 +2564,6 @@ export function StudioWorkspace({
                   <FilePlus2 className="h-4 w-4" />
                   New project
                 </Button>
-                {projects.length > 0 ? (
-                  <Button
-                    variant="outline"
-                    onClick={() => setIsProjectLibraryOpen(true)}
-                    className="bg-[var(--bg-surface-1)]"
-                  >
-                    <Library className="h-4 w-4" />
-                    Open project library
-                  </Button>
-                ) : null}
               </div>
               <div className="grid w-full max-w-3xl gap-3 sm:grid-cols-3">
                 <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-4 text-left">
@@ -2598,7 +2592,7 @@ export function StudioWorkspace({
                 </div>
               </div>
             </div>
-          </section>
+          </div>
         ) : (
           <StudioWorkspaceScaffold
             library={
@@ -3507,6 +3501,8 @@ export function StudioWorkspace({
             }
           />
         )}
+          </div>
+        </div>
       </div>
     </>
   );
