@@ -50,6 +50,7 @@ import { Input } from "@/components/ui/input";
 import { RouteHistoryDrawer } from "@/components/RouteHistoryDrawer";
 import { Slider } from "@/components/ui/slider";
 import { Textarea } from "@/components/ui/textarea";
+import { StudioWorkspaceScaffold } from "@/features/studio/components/StudioWorkspaceScaffold";
 import { useDownloadIndicator } from "@/utils/useDownloadIndicator";
 import { getSpeakerProfilesForVariant } from "@/types";
 
@@ -1472,8 +1473,9 @@ export function StudioWorkspace({
             </div>
           </section>
         ) : (
-          <div className="space-y-5">
-            <section className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 sm:p-6">
+          <StudioWorkspaceScaffold
+            library={
+              <>
               <div className="flex flex-col gap-5 xl:flex-row xl:items-start xl:justify-between">
                 <div className="min-w-0 flex-1">
                   <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
@@ -1615,10 +1617,10 @@ export function StudioWorkspace({
                   {selectedProjectRenderedCount}/{selectedProjectSegmentCount} segments have attached audio in the project.
                 </div>
               </div>
-            </section>
-
-            <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
-              <section className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 sm:p-6">
+              </>
+            }
+            editor={
+              <>
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                   <div>
                     <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
@@ -1806,9 +1808,10 @@ export function StudioWorkspace({
                     );
                   })}
                 </div>
-              </section>
-
-              <div className="space-y-5">
+              </>
+            }
+            delivery={
+              <>
                 <section className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
                   <div className="flex items-center justify-between gap-3">
                     <div>
@@ -1973,9 +1976,9 @@ export function StudioWorkspace({
                     </Button>
                   </div>
                 </section>
-              </div>
-            </div>
-          </div>
+              </>
+            }
+          />
         )}
       </div>
     </>
