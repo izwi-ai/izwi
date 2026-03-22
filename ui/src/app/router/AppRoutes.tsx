@@ -165,20 +165,16 @@ export function AppRoutes() {
         {VOICE_STUDIO_ENABLED ? (
           <>
             <Route
-              path="/voice-studio"
+              path="/voices"
               element={withSuspense(<VoiceStudioPage {...pageProps} />)}
             />
             <Route
               path="/voice-cloning"
-              element={<Navigate to="/voice-studio?tab=clone" replace />}
+              element={<Navigate to="/voices?tab=clone" replace />}
             />
             <Route
               path="/voice-design"
-              element={<Navigate to="/voice-studio?tab=design" replace />}
-            />
-            <Route
-              path="/voices"
-              element={<Navigate to="/voice-studio?tab=library" replace />}
+              element={<Navigate to="/voices?tab=design" replace />}
             />
           </>
         ) : (
@@ -195,7 +191,6 @@ export function AppRoutes() {
               path="/voices"
               element={withSuspense(<VoicesPage {...pageProps} />)}
             />
-            <Route path="/voice-studio" element={<Navigate to="/voices" replace />} />
           </>
         )}
         <Route

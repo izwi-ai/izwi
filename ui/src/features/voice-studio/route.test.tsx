@@ -45,7 +45,7 @@ function renderVoiceStudio(initialEntry: string) {
   return render(
     <MemoryRouter initialEntries={[initialEntry]}>
       <Routes>
-        <Route path="/voice-studio" element={<VoiceStudioPage {...baseProps} />} />
+        <Route path="/voices" element={<VoiceStudioPage {...baseProps} />} />
       </Routes>
     </MemoryRouter>,
   );
@@ -69,19 +69,19 @@ describe("VoiceStudioPage", () => {
   });
 
   it("shows the library content by default", () => {
-    renderVoiceStudio("/voice-studio");
+    renderVoiceStudio("/voices");
 
     expect(screen.getByTestId("studio-library")).toBeInTheDocument();
   });
 
   it("ignores legacy tab query and keeps library-first layout", () => {
-    renderVoiceStudio("/voice-studio?tab=design");
+    renderVoiceStudio("/voices?tab=design");
 
     expect(screen.getByTestId("studio-library")).toBeInTheDocument();
   });
 
   it("opens creation modal from the page header action", () => {
-    renderVoiceStudio("/voice-studio");
+    renderVoiceStudio("/voices");
 
     fireEvent.click(screen.getByRole("button", { name: "New Voice" }));
 
@@ -91,7 +91,7 @@ describe("VoiceStudioPage", () => {
   });
 
   it("opens creation modal when library add shortcut is used", () => {
-    renderVoiceStudio("/voice-studio");
+    renderVoiceStudio("/voices");
 
     fireEvent.click(screen.getByRole("button", { name: "Add Voice Shortcut" }));
 

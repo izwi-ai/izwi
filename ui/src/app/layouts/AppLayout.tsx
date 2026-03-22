@@ -82,7 +82,7 @@ const CREATION_NAV_ITEMS: NavItem[] = VOICE_STUDIO_ENABLED
         label: "Voice Studio",
         description: "Create, clone, and manage voice assets",
         icon: Library,
-        path: "/voice-studio",
+        path: "/voices",
       },
       {
         id: "text-to-speech",
