@@ -31,8 +31,6 @@ import { RouteModelSelect } from "@/components/RouteModelSelect";
 import { GenerationStats } from "@/components/GenerationStats";
 import {
   VOICE_ROUTE_BODY_COPY_CLASS,
-  VOICE_ROUTE_META_COPY_CLASS,
-  VOICE_ROUTE_PANEL_TITLE_CLASS,
   VOICE_ROUTE_SECTION_LABEL_CLASS,
 } from "@/components/voiceRouteTypography";
 import { Button } from "@/components/ui/button";
@@ -1210,26 +1208,7 @@ export function TextToSpeechWorkspace({
             </AnimatePresence>
 
             <WorkspacePanel className="p-5">
-              <WorkspaceSectionLabel>Render</WorkspaceSectionLabel>
-              <div className="mt-4 flex flex-wrap items-center gap-3">
-                <Button
-                  onClick={handleGenerate}
-                  disabled={generating || !canGenerate}
-                  className="min-w-[190px]"
-                >
-                  {generating ? (
-                    <>
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                      Generating...
-                    </>
-                  ) : (
-                    <>
-                      <Mic2 className="h-4 w-4" />
-                      Generate audio
-                    </>
-                  )}
-                </Button>
-
+              <div className="flex flex-wrap items-center gap-3">
                 {(audioUrl || isStreaming) ? (
                   <Button variant="outline" onClick={handleStop}>
                     <Square className="h-4 w-4" />
@@ -1257,6 +1236,24 @@ export function TextToSpeechWorkspace({
                     </Button>
                   </>
                 ) : null}
+
+                <Button
+                  onClick={handleGenerate}
+                  disabled={generating || !canGenerate}
+                  className="ml-auto min-w-[190px]"
+                >
+                  {generating ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Generating...
+                    </>
+                  ) : (
+                    <>
+                      <Mic2 className="h-4 w-4" />
+                      Generate
+                    </>
+                  )}
+                </Button>
               </div>
 
               {downloadState !== "idle" && downloadMessage ? (
@@ -1282,7 +1279,7 @@ export function TextToSpeechWorkspace({
                 </div>
               ) : null}
 
-              <div className="text-xs text-[var(--text-muted)]">
+              <div className="mt-4 text-xs text-[var(--text-muted)]">
                 Shortcut: <span className="app-kbd">Ctrl/Cmd + Enter</span> generate, <span className="app-kbd">Esc</span> stop, <span className="app-kbd">Shift + Esc</span> reset.
               </div>
             </WorkspacePanel>
@@ -1291,30 +1288,72 @@ export function TextToSpeechWorkspace({
           <div className="space-y-4">
             <WorkspacePanel className="p-5">
               <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-3")}>
-                Voice Summary
+                Delivery Controls
               </div>
               <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-4">
-                <div className={VOICE_ROUTE_PANEL_TITLE_CLASS}>
-                  {selectedVoiceItem?.name || "Select a voice"}
-                </div>
-                <div className={cn(VOICE_ROUTE_META_COPY_CLASS, "mt-1")}>
-                  {requiresVoiceDescriptionOnly
-                    ? "Voice direction"
-                    : voiceMode === "saved"
-                      ? "Saved voice"
-                      : "Built-in voice"}
+                <div className="grid gap-2 text-xs">
+                  <div className="flex items-start justify-between gap-4 rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2.5">
+                    <span className="font-medium text-[var(--text-secondary)]">Model</span>
+                    <span className="max-w-[62%] text-right font-medium text-[var(--text-primary)]">
+                      {selectedOption?.label || "No model selected"}
+                    </span>
+                  </div>
+                  <div className="flex items-start justify-between gap-4 rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2.5">
+                    <span className="font-medium text-[var(--text-secondary)]">Voice mode</span>
+                    <span className="max-w-[62%] text-right font-medium text-[var(--text-primary)]">
+                      {requiresVoiceDescriptionOnly
+                        ? "Voice direction prompt"
+                        : voiceMode === "saved"
+                          ? "Saved voice"
+                          : "Built-in voice"}
+                    </span>
+                  </div>
+                  <div className="flex items-start justify-between gap-4 rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2.5">
+                    <span className="font-medium text-[var(--text-secondary)]">Selected voice</span>
+                    <span className="max-w-[62%] text-right font-medium text-[var(--text-primary)]">
+                      {requiresVoiceDescriptionOnly
+                        ? "Controlled by prompt"
+                        : selectedVoiceItem?.name || "No voice selected"}
+                    </span>
+                  </div>
+                  <div className="flex items-start justify-between gap-4 rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2.5">
+                    <span className="font-medium text-[var(--text-secondary)]">Speed</span>
+                    <span className="max-w-[62%] text-right font-medium text-[var(--text-primary)]">
+                      {supportsSpeedControl ? `${speed.toFixed(2)}x` : "Fixed by model"}
+                    </span>
+                  </div>
+                  <div className="flex items-start justify-between gap-4 rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2.5">
+                    <span className="font-medium text-[var(--text-secondary)]">Streaming</span>
+                    <span className="max-w-[62%] text-right font-medium text-[var(--text-primary)]">
+                      {supportsStreaming
+                        ? streamingEnabled
+                          ? "Enabled"
+                          : "Disabled"
+                        : "Not supported"}
+                    </span>
+                  </div>
+                  {supportsVoiceDescription ? (
+                    <div className="flex items-start justify-between gap-4 rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2.5">
+                      <span className="font-medium text-[var(--text-secondary)]">
+                        {requiresVoiceDescriptionOnly
+                          ? "Voice direction"
+                          : "Style prompt"}
+                      </span>
+                      <span className="max-w-[62%] text-right font-medium text-[var(--text-primary)]">
+                        {instructions.trim() ? "Configured" : "Not set"}
+                      </span>
+                    </div>
+                  ) : null}
+                  <div className="flex items-start justify-between gap-4 rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2.5">
+                    <span className="font-medium text-[var(--text-secondary)]">Voice support</span>
+                    <span className="max-w-[62%] text-right font-medium text-[var(--text-primary)]">
+                      {voiceAvailabilitySummary}
+                    </span>
+                  </div>
                 </div>
                 <p className={cn(VOICE_ROUTE_BODY_COPY_CLASS, "mt-3")}>
                   {compatibilityNotice}
                 </p>
-                <div className="mt-3 grid gap-2 sm:grid-cols-2 text-xs">
-                  <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-[var(--text-secondary)]">
-                    {selectedOption?.label || "No model selected"}
-                  </div>
-                  <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-[var(--text-secondary)]">
-                    {voiceAvailabilitySummary}
-                  </div>
-                </div>
               </div>
             </WorkspacePanel>
 
@@ -1353,24 +1392,6 @@ export function TextToSpeechWorkspace({
               )}
             </WorkspacePanel>
 
-            <WorkspacePanel className="p-5">
-              <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-2")}>
-                Quick Workflow
-              </div>
-              <div className="grid gap-2 text-xs">
-                <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2 text-[var(--text-secondary)]">
-                  1. Choose a TTS model
-                </div>
-                <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2 text-[var(--text-secondary)]">
-                  {requiresVoiceDescriptionOnly
-                    ? "2. Add voice direction"
-                    : "2. Pick a compatible voice"}
-                </div>
-                <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2 text-[var(--text-secondary)]">
-                  3. Generate and review the result
-                </div>
-              </div>
-            </WorkspacePanel>
           </div>
         </div>
       </div>
