@@ -25,8 +25,6 @@ import {
   Trash2,
   Upload,
   Link2,
-  History,
-  Waves,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -37,7 +35,6 @@ import {
   type TtsProjectMetaRecord,
   type TtsProjectPronunciationRecord,
   type TtsProjectRecord,
-  type TtsProjectSnapshotRecord,
   type TtsProjectSummary,
   type TtsProjectVoiceMode,
 } from "@/api";
@@ -68,9 +65,13 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Card } from "@/components/ui/card";
-import { StudioActionRail } from "@/features/studio/components/StudioActionRail";
+import {
+  Accordion,
+  AccordionContent,
+  AccordionItem,
+  AccordionTrigger,
+} from "@/components/ui/accordion";
 import { StudioWorkspaceScaffold } from "@/features/studio/components/StudioWorkspaceScaffold";
-import { StudioProjectUtilities } from "@/features/studio/components/StudioProjectUtilities";
 import { useDownloadIndicator } from "@/utils/useDownloadIndicator";
 import { getSpeakerProfilesForVariant } from "@/types";
 
@@ -179,15 +180,6 @@ export function StudioWorkspace({
   const [newPronunciationReplacement, setNewPronunciationReplacement] =
     useState("");
   const [savingPronunciation, setSavingPronunciation] = useState(false);
-  const [projectSnapshots, setProjectSnapshots] = useState<
-    TtsProjectSnapshotRecord[]
-  >([]);
-  const [projectSnapshotsLoading, setProjectSnapshotsLoading] = useState(false);
-  const [snapshotLabel, setSnapshotLabel] = useState("");
-  const [savingSnapshot, setSavingSnapshot] = useState(false);
-  const [restoringSnapshotId, setRestoringSnapshotId] = useState<string | null>(
-    null,
-  );
   const [selectedProject, setSelectedProject] = useState<TtsProjectRecord | null>(
     null,
   );
@@ -202,6 +194,7 @@ export function StudioWorkspace({
   const [importingFromUrl, setImportingFromUrl] = useState(false);
   const [isCreateProjectDialogOpen, setIsCreateProjectDialogOpen] =
     useState(false);
+  const [isExportDialogOpen, setIsExportDialogOpen] = useState(false);
   const [creatingProject, setCreatingProject] = useState(false);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [workspaceStatus, setWorkspaceStatus] = useState<{
@@ -221,7 +214,6 @@ export function StudioWorkspace({
   const [renderingSegmentId, setRenderingSegmentId] = useState<string | null>(
     null,
   );
-  const [renderingAll, setRenderingAll] = useState(false);
   const [renderQueue, setRenderQueue] = useState<StudioRenderQueueItem[]>([]);
   const [renderQueueReady, setRenderQueueReady] = useState(false);
   const [processingRenderQueue, setProcessingRenderQueue] = useState(false);
@@ -557,21 +549,6 @@ export function StudioWorkspace({
     }
   }, []);
 
-  const loadProjectSnapshots = useCallback(async (projectId: string | null) => {
-    if (!projectId) {
-      setProjectSnapshots([]);
-      return;
-    }
-    try {
-      setProjectSnapshotsLoading(true);
-      setProjectSnapshots(await api.listTtsProjectSnapshots(projectId));
-    } catch {
-      setProjectSnapshots([]);
-    } finally {
-      setProjectSnapshotsLoading(false);
-    }
-  }, []);
-
   useEffect(() => {
     void loadProjects();
     void loadSavedVoices();
@@ -593,10 +570,6 @@ export function StudioWorkspace({
   useEffect(() => {
     void loadProjectPronunciations(selectedProjectId);
   }, [loadProjectPronunciations, selectedProjectId]);
-
-  useEffect(() => {
-    void loadProjectSnapshots(selectedProjectId);
-  }, [loadProjectSnapshots, selectedProjectId]);
 
   useEffect(() => {
     if (!selectedProject) {
@@ -1557,57 +1530,6 @@ export function StudioWorkspace({
     }
   };
 
-  const handleCreateSnapshot = async () => {
-    if (!selectedProject) {
-      return;
-    }
-    try {
-      setSavingSnapshot(true);
-      const snapshot = await api.createTtsProjectSnapshot(selectedProject.id, {
-        label: snapshotLabel.trim() || undefined,
-      });
-      setProjectSnapshots((current) => [snapshot, ...current]);
-      setSnapshotLabel("");
-      setWorkspaceStatus({
-        tone: "success",
-        message: `Saved snapshot${snapshot.label ? ` "${snapshot.label}"` : ""}.`,
-      });
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Failed to save project snapshot.";
-      setWorkspaceError(message);
-      onError(message);
-    } finally {
-      setSavingSnapshot(false);
-    }
-  };
-
-  const handleRestoreSnapshot = async (snapshotId: string) => {
-    if (!selectedProject) {
-      return;
-    }
-    try {
-      setRestoringSnapshotId(snapshotId);
-      const restored = await api.restoreTtsProjectSnapshot(
-        selectedProject.id,
-        snapshotId,
-      );
-      setSelectedProject(restored);
-      await loadProjects();
-      setWorkspaceStatus({
-        tone: "success",
-        message: "Restored project snapshot.",
-      });
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Failed to restore snapshot.";
-      setWorkspaceError(message);
-      onError(message);
-    } finally {
-      setRestoringSnapshotId(null);
-    }
-  };
-
   const handleMergeSegmentWithNext = async (segmentId: string) => {
     if (!selectedProject) {
       return;
@@ -1751,70 +1673,9 @@ export function StudioWorkspace({
     }
   };
 
-  const handleRenderAll = async () => {
-    if (!selectedProject) {
-      return;
-    }
-    const project = await persistProjectSettings();
-    if (!project) {
-      return;
-    }
-    try {
-      setRenderingAll(true);
-      let current = project;
-
-      const segmentIdsToRender = new Set(
-        current.segments
-          .filter((segment) => {
-            const draft = segmentDrafts[segment.id] ?? segment.text;
-            return draft !== segment.text || !segment.speech_record_id;
-          })
-          .map((segment) => segment.id),
-      );
-
-      if (segmentIdsToRender.size === 0) {
-        setWorkspaceStatus({
-          tone: "success",
-          message: "All segments already have current rendered audio.",
-        });
-        return;
-      }
-
-      for (const segment of current.segments) {
-        const draft = segmentDrafts[segment.id] ?? segment.text;
-        if (draft !== segment.text) {
-          const synced = await persistSegmentDraft(current, segment.id);
-          if (!synced) {
-            return;
-          }
-          current = synced;
-        }
-      }
-
-      const queuedCount = await queueSegmentsForRender(
-        current,
-        Array.from(segmentIdsToRender),
-      );
-      setWorkspaceStatus({
-        tone: "success",
-        message:
-          queuedCount > 0
-            ? `Queued ${queuedCount} segment${queuedCount === 1 ? "" : "s"} for background rendering.`
-            : "All pending segments are already queued.",
-      });
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Failed while rendering the project.";
-      setWorkspaceError(message);
-      onError(message);
-    } finally {
-      setRenderingAll(false);
-    }
-  };
-
-  const handleExport = async () => {
+  const handleExport = async (): Promise<boolean> => {
     if (!selectedProject || isDownloading) {
-      return;
+      return false;
     }
     const segmentIds =
       exportScope === "selected" ? selectedSegmentIds : [];
@@ -1822,7 +1683,7 @@ export function StudioWorkspace({
       const message = "Select at least one segment to export a partial audio file.";
       setWorkspaceError(message);
       onError(message);
-      return;
+      return false;
     }
     beginDownload();
     try {
@@ -1859,8 +1720,17 @@ export function StudioWorkspace({
         );
       }
       completeDownload();
+      return true;
     } catch (err) {
       failDownload(err);
+      return false;
+    }
+  };
+
+  const handleExportFromDialog = async () => {
+    const didExport = await handleExport();
+    if (didExport) {
+      setIsExportDialogOpen(false);
     }
   };
 
@@ -1943,10 +1813,6 @@ export function StudioWorkspace({
           (selectedProjectRenderedCount / selectedProjectSegmentCount) * 100,
         )
       : 0;
-  const editedSegmentCount =
-    selectedProject?.segments.filter(
-      (segment) => (segmentDrafts[segment.id] ?? segment.text) !== segment.text,
-    ).length ?? 0;
   const pendingRenderSegmentCount =
     selectedProject?.segments.filter((segment) => {
       const draft = segmentDrafts[segment.id] ?? segment.text;
@@ -1957,18 +1823,6 @@ export function StudioWorkspace({
     selectedProjectSegmentCount > 0
       ? Math.max(0, selectedProjectSegmentCount - pendingRenderSegmentCount)
       : 0;
-  const exportReady =
-    selectedProjectSegmentCount > 0 &&
-    pendingRenderSegmentCount === 0 &&
-    selectedProjectRenderedCount === selectedProjectSegmentCount;
-  const changedSinceLastRender =
-    (selectedProject?.updated_at ?? 0) >
-      (selectedProjectMeta?.last_rendered_at ?? 0) ||
-    pendingRenderSegmentCount > 0;
-  const primaryRenderLabel =
-    pendingRenderSegmentCount > 0
-      ? `Render ${pendingRenderSegmentCount} remaining`
-      : "All blocks rendered";
   const activeProjectQueueItems = renderQueue.filter(
     (item) => selectedProject && item.projectId === selectedProject.id,
   );
@@ -1984,14 +1838,26 @@ export function StudioWorkspace({
       .map((item) => item.segmentId),
   );
   const projectHeaderActions = (
-    <Button
-      size="sm"
-      onClick={openCreateProjectDialog}
-      className="h-9 gap-2 rounded-lg"
-    >
-      <FilePlus2 className="h-4 w-4" />
-      New project
-    </Button>
+    <div className="flex items-center gap-2">
+      <Button
+        size="sm"
+        onClick={openCreateProjectDialog}
+        className="h-9 gap-2 rounded-lg"
+      >
+        <FilePlus2 className="h-4 w-4" />
+        New project
+      </Button>
+      <Button
+        size="sm"
+        variant="outline"
+        onClick={() => setIsExportDialogOpen(true)}
+        className="h-9 gap-2 rounded-lg bg-[var(--bg-surface-1)]"
+        disabled={!selectedProject}
+      >
+        <Download className="h-4 w-4" />
+        Export
+      </Button>
+    </div>
   );
 
   const projectLibraryFilters = (
@@ -2256,6 +2122,102 @@ export function StudioWorkspace({
       </Dialog>
 
       <Dialog
+        open={isExportDialogOpen}
+        onOpenChange={(open) => {
+          if (!isDownloading) {
+            setIsExportDialogOpen(open);
+          }
+        }}
+      >
+        <DialogContent className="max-w-md border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-5">
+          <DialogTitle>Export audio</DialogTitle>
+          <DialogDescription className="text-sm text-[var(--text-muted)]">
+            {selectedProject
+              ? `Choose export settings for "${selectedProject.name}".`
+              : "Open a project to export audio."}
+          </DialogDescription>
+
+          <div className="mt-4 grid gap-3">
+            <Select
+              value={exportFormat}
+              onValueChange={(value) =>
+                setExportFormat(value as "wav" | "raw_i16" | "raw_f32")
+              }
+            >
+              <SelectTrigger className="h-9 bg-[var(--bg-surface-1)] px-2 text-xs">
+                <SelectValue placeholder="Export format: WAV" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="wav">Export format: WAV</SelectItem>
+                <SelectItem value="raw_i16">Export format: PCM 16-bit</SelectItem>
+                <SelectItem value="raw_f32">Export format: Float 32-bit</SelectItem>
+              </SelectContent>
+            </Select>
+
+            <Select
+              value={exportScope}
+              onValueChange={(value) => setExportScope(value as "all" | "selected")}
+            >
+              <SelectTrigger className="h-9 bg-[var(--bg-surface-1)] px-2 text-xs">
+                <SelectValue placeholder="Scope: Full project" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">Scope: Full project</SelectItem>
+                <SelectItem value="selected">Scope: Selected segments</SelectItem>
+              </SelectContent>
+            </Select>
+
+            <label className="inline-flex items-center justify-between gap-2 text-xs text-[var(--text-secondary)]">
+              <span>Include script sidecar (.txt)</span>
+              <Switch
+                checked={exportIncludeScript}
+                onCheckedChange={setExportIncludeScript}
+                aria-label="Include script sidecar (.txt)"
+                className="h-5 w-9"
+              />
+            </label>
+
+            {exportScope === "selected" ? (
+              <div className="rounded-md bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
+                {selectedSegmentIds.length > 0
+                  ? `${selectedSegmentIds.length} selected segment${selectedSegmentIds.length === 1 ? "" : "s"} will be exported.`
+                  : "Select one or more segments to export a partial file."}
+              </div>
+            ) : null}
+          </div>
+
+          <div className="mt-5 flex items-center justify-end gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => setIsExportDialogOpen(false)}
+              disabled={isDownloading}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              onClick={() => void handleExportFromDialog()}
+              disabled={
+                !selectedProject ||
+                isDownloading ||
+                (exportScope === "selected" && selectedSegmentIds.length === 0)
+              }
+            >
+              {isDownloading ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Download className="h-4 w-4" />
+              )}
+              Export audio
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
         open={Boolean(deleteProjectTarget)}
         onOpenChange={(open) => {
           if (!open) {
@@ -2276,7 +2238,7 @@ export function StudioWorkspace({
                 </h3>
                 <DialogDescription className="mt-1 text-sm text-[var(--text-muted)]">
                   This permanently removes project segments, pronunciation rules,
-                  snapshots, and render queue history.
+                  and render queue history.
                 </DialogDescription>
                 <p className="mt-2 truncate text-xs text-[var(--text-subtle)]">
                   {deleteProjectTarget.name}
@@ -2685,49 +2647,73 @@ export function StudioWorkspace({
                     {selectedProjectRenderedCount}/{selectedProjectSegmentCount} segments complete
                   </div>
                 </div>
+
+                <section className="space-y-3">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                    Render Queue
+                  </div>
+                  <div className="text-sm font-semibold text-[var(--text-primary)]">
+                    {queuedRenderCount} queued · {failedRenderCount} failed
+                  </div>
+
+                  <div className="space-y-2 xl:max-h-[320px] xl:overflow-y-auto xl:pr-1">
+                    {activeProjectQueueItems.length === 0 ? (
+                      <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
+                        No queued renders for this project.
+                      </div>
+                    ) : (
+                      activeProjectQueueItems.map((item) => (
+                        <div
+                          key={item.id}
+                          className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="text-sm text-[var(--text-primary)]">
+                              {item.segmentLabel}
+                            </div>
+                            <div className="text-xs uppercase tracking-wider text-[var(--text-muted)]">
+                              {item.status}
+                            </div>
+                          </div>
+                          {item.errorMessage ? (
+                            <div className="mt-1 text-xs text-[var(--danger-text)]">
+                              {item.errorMessage}
+                            </div>
+                          ) : null}
+                          <div className="mt-2 flex items-center gap-2">
+                            {item.status === "failed" ? (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                className="h-7 bg-[var(--bg-surface-0)] px-2 text-xs"
+                                onClick={() => void retryRenderQueueItem(item.id)}
+                              >
+                                Retry
+                              </Button>
+                            ) : null}
+                            {item.status !== "running" ? (
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 px-2 text-xs"
+                                onClick={() => void cancelRenderQueueItem(item.id)}
+                              >
+                                Cancel
+                              </Button>
+                            ) : null}
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </section>
               </div>
             }
             editor={
               <>
-                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                  <div>
-                    <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                      Segments
-                    </div>
-                    <h3 className="mt-1 text-lg font-semibold text-[var(--text-primary)]">
-                      Review and render script blocks
-                    </h3>
-                    <p className="mt-1 max-w-2xl text-sm text-[var(--text-secondary)]">
-                      Edit the narration block, save a draft when needed, or render
-                      immediately to refresh the attached audio.
-                    </p>
-                  </div>
-                  {projectLoading ? (
-                    <div className="inline-flex items-center gap-2 rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-1 text-xs text-[var(--text-muted)]">
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      Refreshing
-                    </div>
-                  ) : null}
-                </div>
-
-                <div className="mt-4 flex flex-wrap gap-2">
-                  <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[11px] text-[var(--text-muted)]">
-                    {editedSegmentCount} edited
-                  </span>
-                  <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[11px] text-[var(--text-muted)]">
-                    {pendingRenderSegmentCount} awaiting render
-                  </span>
-                  <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[11px] text-[var(--text-muted)]">
-                    {readySegmentCount} ready
-                  </span>
-                  {selectedSegmentCount > 0 ? (
-                    <span className="rounded-full border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-2.5 py-1 text-[11px] text-[var(--status-warning-text)]">
-                      {selectedSegmentCount} selected
-                    </span>
-                  ) : null}
-                </div>
-
-                <div className="mt-4 flex flex-wrap items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
                   <Button
                     type="button"
                     variant="outline"
@@ -2979,492 +2965,276 @@ export function StudioWorkspace({
               </>
             }
             actionRail={
-              <StudioActionRail
-                workflowSummary={
-                  exportReady && !changedSinceLastRender
-                    ? "Everything is ready for merged export."
-                    : pendingRenderSegmentCount > 0
-                      ? `${pendingRenderSegmentCount} block${pendingRenderSegmentCount === 1 ? "" : "s"} still need rendering.`
-                      : "Project changes are newer than the last complete render."
-                }
-                primaryActions={
-                  <>
-                    <Button
-                      onClick={() => void handleRenderAll()}
-                      disabled={renderingAll || pendingRenderSegmentCount === 0}
-                      className="w-full justify-center"
-                    >
-                      {renderingAll ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : (
-                        <Waves className="h-4 w-4" />
-                      )}
-                      {primaryRenderLabel}
-                    </Button>
-                    <Button
-                      variant="outline"
-                      onClick={handleExport}
-                      disabled={isDownloading}
-                      className="w-full justify-center bg-[var(--bg-surface-1)]"
-                    >
-                      {isDownloading ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : (
-                        <Download className="h-4 w-4" />
-                      )}
-                      Export audio
-                    </Button>
-                  </>
-                }
-                exportSettings={
-                  <div className="grid gap-2">
-                    <Select
-                      value={exportFormat}
-                      onValueChange={(value) =>
-                        setExportFormat(
-                          value as "wav" | "raw_i16" | "raw_f32",
-                        )
-                      }
-                    >
-                      <SelectTrigger className="h-9 bg-[var(--bg-surface-1)] px-2 text-xs">
-                        <SelectValue placeholder="Export format: WAV" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="wav">Export format: WAV</SelectItem>
-                        <SelectItem value="raw_i16">
-                          Export format: PCM 16-bit
-                        </SelectItem>
-                        <SelectItem value="raw_f32">
-                          Export format: Float 32-bit
-                        </SelectItem>
-                      </SelectContent>
-                    </Select>
-                    <Select
-                      value={exportScope}
-                      onValueChange={(value) =>
-                        setExportScope(value as "all" | "selected")
-                      }
-                    >
-                      <SelectTrigger className="h-9 bg-[var(--bg-surface-1)] px-2 text-xs">
-                        <SelectValue placeholder="Scope: Full project" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="all">Scope: Full project</SelectItem>
-                        <SelectItem value="selected">
-                          Scope: Selected segments
-                        </SelectItem>
-                      </SelectContent>
-                    </Select>
-                    <label className="inline-flex items-center justify-between gap-2 text-xs text-[var(--text-secondary)]">
-                      <span>Include script sidecar (.txt)</span>
-                      <Switch
-                        checked={exportIncludeScript}
-                        onCheckedChange={setExportIncludeScript}
-                        aria-label="Include script sidecar (.txt)"
-                        className="h-5 w-9"
-                      />
-                    </label>
+              <div className="space-y-8">
+                <div className="space-y-1">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                    Configuration
                   </div>
-                }
-                queuePanel={
-                  <Card className="rounded-2xl border-0 bg-transparent p-0 shadow-none">
-                    <div className="flex items-start justify-between gap-3">
-                      <div>
-                        <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                          Render Queue
-                        </div>
-                        <div className="mt-1 text-sm font-semibold text-[var(--text-primary)]">
-                          {queuedRenderCount} queued · {failedRenderCount} failed
-                        </div>
-                      </div>
-                    </div>
+                  <p className="text-sm text-[var(--text-secondary)]">
+                    Configure and maintain this project.
+                  </p>
+                </div>
 
-                    <div className="mt-3 space-y-2 xl:max-h-[420px] xl:overflow-y-auto xl:pr-1">
-                      {activeProjectQueueItems.length === 0 ? (
-                        <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
-                          No queued renders for this project.
-                        </div>
-                      ) : (
-                        activeProjectQueueItems.map((item) => (
-                          <div
-                            key={item.id}
-                            className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2"
-                          >
-                            <div className="flex items-center justify-between gap-2">
-                              <div className="text-sm text-[var(--text-primary)]">
-                                {item.segmentLabel}
-                              </div>
-                              <div className="text-xs uppercase tracking-wider text-[var(--text-muted)]">
-                                {item.status}
-                              </div>
-                            </div>
-                            {item.errorMessage ? (
-                              <div className="mt-1 text-xs text-[var(--danger-text)]">
-                                {item.errorMessage}
-                              </div>
-                            ) : null}
-                            <div className="mt-2 flex items-center gap-2">
-                              {item.status === "failed" ? (
-                                <Button
-                                  type="button"
-                                  variant="outline"
-                                  size="sm"
-                                  className="h-7 bg-[var(--bg-surface-0)] px-2 text-xs"
-                                  onClick={() => void retryRenderQueueItem(item.id)}
-                                >
-                                  Retry
-                                </Button>
-                              ) : null}
-                              {item.status !== "running" ? (
-                                <Button
-                                  type="button"
-                                  variant="ghost"
-                                  size="sm"
-                                  className="h-7 px-2 text-xs"
-                                  onClick={() => void cancelRenderQueueItem(item.id)}
-                                >
-                                  Cancel
-                                </Button>
-                              ) : null}
-                            </div>
-                          </div>
-                        ))
-                      )}
-                    </div>
-                  </Card>
-                }
-              />
-            }
-            utilities={
-              <StudioProjectUtilities
-                profilePanel={
-                  <Card className="rounded-2xl border-0 bg-transparent p-0 shadow-none">
-                    <div className="flex items-center justify-between gap-3">
-                      <div>
-                        <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                <Accordion type="multiple" defaultValue={[]} className="space-y-3">
+                  <AccordionItem
+                    value="project-profile"
+                    className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3"
+                  >
+                    <AccordionTrigger className="py-3 text-left hover:no-underline">
+                      <div className="flex min-w-0 items-center gap-2">
+                        <span className="text-sm font-semibold text-[var(--text-primary)]">
                           Project Profile
-                        </div>
-                        <h3 className="mt-1 text-lg font-semibold text-[var(--text-primary)]">
-                          Shared render settings
-                        </h3>
+                        </span>
+                        {projectDirty || projectFolderDirty ? (
+                          <span className="rounded-full border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--status-warning-text)]">
+                            Unsaved
+                          </span>
+                        ) : null}
                       </div>
-                      {projectDirty || projectFolderDirty ? (
-                        <div className="rounded-full border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--status-warning-text)]">
-                          Unsaved
+                    </AccordionTrigger>
+                    <AccordionContent className="pb-3">
+                      <p className="text-sm leading-relaxed text-[var(--text-secondary)]">
+                        These defaults apply across the full project. Save them before
+                        you start a long render pass, or let render actions sync them automatically.
+                      </p>
+
+                      <div className="mt-4 space-y-4">
+                        <div className="space-y-2">
+                          <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
+                            Project name
+                          </label>
+                          <Input
+                            value={projectName}
+                            onChange={(event) => setProjectName(event.target.value)}
+                          />
                         </div>
-                      ) : (
-                        <div className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--text-muted)]">
-                          Synced
+
+                        <div className="space-y-2">
+                          <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
+                            Render model
+                          </label>
+                          <RouteModelSelect
+                            value={projectModelId}
+                            options={projectModelOptions}
+                            onSelect={(value) => {
+                              setProjectModelId(value);
+                              setWorkspaceStatus(null);
+                            }}
+                            className="w-full"
+                          />
                         </div>
-                      )}
-                    </div>
 
-                    <p className="mt-2 text-sm leading-relaxed text-[var(--text-secondary)]">
-                      These defaults apply across the full project. Save them before
-                      you start a long render pass, or let render actions sync them automatically.
-                    </p>
-
-                    <div className="mt-5 space-y-4">
-                      <div className="space-y-2">
-                        <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
-                          Project name
-                        </label>
-                        <Input
-                          value={projectName}
-                          onChange={(event) => setProjectName(event.target.value)}
-                        />
-                      </div>
-
-                      <div className="space-y-2">
-                        <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
-                          Render model
-                        </label>
-                        <RouteModelSelect
-                          value={projectModelId}
-                          options={projectModelOptions}
-                          onSelect={(value) => {
-                            setProjectModelId(value);
-                            setWorkspaceStatus(null);
-                          }}
-                          className="w-full"
-                        />
-                      </div>
-
-                      <div className="space-y-2">
-                        <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
-                          Folder
-                        </label>
-                        <Select
-                          value={projectFolderId || STUDIO_UNFILED_FOLDER_VALUE}
-                          onValueChange={(value) => {
-                            setProjectFolderId(
-                              value === STUDIO_UNFILED_FOLDER_VALUE ? "" : value,
-                            );
-                            setWorkspaceStatus(null);
-                          }}
-                        >
-                          <SelectTrigger className="w-full bg-[var(--bg-surface-1)]">
-                            <SelectValue placeholder="Unfiled" />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value={STUDIO_UNFILED_FOLDER_VALUE}>
-                              Unfiled
-                            </SelectItem>
-                            {projectFolders.map((folder) => (
-                              <SelectItem key={folder.id} value={folder.id}>
-                                {folder.name}
+                        <div className="space-y-2">
+                          <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
+                            Folder
+                          </label>
+                          <Select
+                            value={projectFolderId || STUDIO_UNFILED_FOLDER_VALUE}
+                            onValueChange={(value) => {
+                              setProjectFolderId(
+                                value === STUDIO_UNFILED_FOLDER_VALUE ? "" : value,
+                              );
+                              setWorkspaceStatus(null);
+                            }}
+                          >
+                            <SelectTrigger className="w-full bg-[var(--bg-surface-0)]">
+                              <SelectValue placeholder="Unfiled" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value={STUDIO_UNFILED_FOLDER_VALUE}>
+                                Unfiled
                               </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                      </div>
+                              {projectFolders.map((folder) => (
+                                <SelectItem key={folder.id} value={folder.id}>
+                                  {folder.name}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </div>
 
-                      <div className="space-y-2">
-                        <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
-                          Project voice
-                        </label>
-                        <VoiceSelect
-                          voiceMode={projectVoiceMode}
-                          onVoiceModeChange={(value) => {
-                            setProjectVoiceMode(value);
-                            setWorkspaceStatus(null);
-                          }}
-                          savedVoiceItems={savedVoiceItems}
-                          builtInVoiceItems={builtInVoiceItems}
-                          selectedItem={selectedVoiceItem}
-                          savedVoicesLoading={savedVoicesLoading}
-                          savedVoicesError={savedVoicesError}
-                          savedEnabled={supportsSavedVoices}
-                          builtInEnabled={supportsBuiltInVoices}
-                          disabled={!projectModelId}
-                          modelLabel={currentProjectModelInfo?.variant ?? projectModelId}
-                        />
-                      </div>
+                        <div className="space-y-2">
+                          <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
+                            Project voice
+                          </label>
+                          <VoiceSelect
+                            voiceMode={projectVoiceMode}
+                            onVoiceModeChange={(value) => {
+                              setProjectVoiceMode(value);
+                              setWorkspaceStatus(null);
+                            }}
+                            savedVoiceItems={savedVoiceItems}
+                            builtInVoiceItems={builtInVoiceItems}
+                            selectedItem={selectedVoiceItem}
+                            savedVoicesLoading={savedVoicesLoading}
+                            savedVoicesError={savedVoicesError}
+                            savedEnabled={supportsSavedVoices}
+                            builtInEnabled={supportsBuiltInVoices}
+                            disabled={!projectModelId}
+                            modelLabel={currentProjectModelInfo?.variant ?? projectModelId}
+                          />
+                        </div>
 
-                      <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-4 text-sm leading-relaxed text-[var(--text-secondary)]">
-                        {projectVoiceNotice}
-                      </div>
+                        <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-4 py-4 text-sm leading-relaxed text-[var(--text-secondary)]">
+                          {projectVoiceNotice}
+                        </div>
 
-                      <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
-                        <div className="flex items-center justify-between text-sm">
-                          <span className="font-medium text-[var(--text-primary)]">
-                            Speed
-                          </span>
-                          <span className="text-[var(--text-muted)]">
+                        <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-4">
+                          <div className="flex items-center justify-between text-sm">
+                            <span className="font-medium text-[var(--text-primary)]">
+                              Speed
+                            </span>
+                            <span className="text-[var(--text-muted)]">
+                              {supportsSpeedControl
+                                ? `${projectSpeed.toFixed(2)}x`
+                                : "Fixed by model"}
+                            </span>
+                          </div>
+                          <Slider
+                            value={[projectSpeed]}
+                            min={0.5}
+                            max={1.5}
+                            step={0.05}
+                            onValueChange={([value]) => setProjectSpeed(value ?? 1)}
+                            disabled={!supportsSpeedControl}
+                            className="mt-4"
+                          />
+                          <div className="mt-3 text-xs leading-relaxed text-[var(--text-muted)]">
                             {supportsSpeedControl
-                              ? `${projectSpeed.toFixed(2)}x`
-                              : "Fixed by model"}
-                          </span>
-                        </div>
-                        <Slider
-                          value={[projectSpeed]}
-                          min={0.5}
-                          max={1.5}
-                          step={0.05}
-                          onValueChange={([value]) => setProjectSpeed(value ?? 1)}
-                          disabled={!supportsSpeedControl}
-                          className="mt-4"
-                        />
-                        <div className="mt-3 text-xs leading-relaxed text-[var(--text-muted)]">
-                          {supportsSpeedControl
-                            ? "This speed applies to every rendered segment in the project."
-                            : "This model does not expose adjustable speed for project renders."}
+                              ? "This speed applies to every rendered segment in the project."
+                              : "This model does not expose adjustable speed for project renders."}
+                          </div>
                         </div>
                       </div>
-                    </div>
 
-                    <Button
-                      variant="outline"
-                      onClick={() => void persistProjectSettings()}
-                      disabled={(!projectDirty && !projectFolderDirty) || savingProject}
-                      className="mt-5 w-full justify-center bg-[var(--bg-surface-1)]"
-                    >
-                      {savingProject ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : (
-                        <Settings2 className="h-4 w-4" />
-                      )}
-                      Save profile
-                    </Button>
-
-                    <div className="mt-3 grid gap-2">
-                      {onOpenModelManager ? (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          className="w-full justify-center bg-[var(--bg-surface-1)]"
-                          onClick={onOpenModelManager}
-                        >
+                      <Button
+                        variant="outline"
+                        onClick={() => void persistProjectSettings()}
+                        disabled={(!projectDirty && !projectFolderDirty) || savingProject}
+                        className="mt-4 w-full justify-center bg-[var(--bg-surface-0)]"
+                      >
+                        {savingProject ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
                           <Settings2 className="h-4 w-4" />
-                          Open model manager
+                        )}
+                        Save profile
+                      </Button>
+
+                      <div className="mt-3 grid gap-2">
+                        {onOpenModelManager ? (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="w-full justify-center bg-[var(--bg-surface-0)]"
+                            onClick={onOpenModelManager}
+                          >
+                            <Settings2 className="h-4 w-4" />
+                            Open model manager
+                          </Button>
+                        ) : null}
+                        <Button
+                          variant="ghost"
+                          onClick={() => void handleDeleteProject()}
+                          disabled={deletingProject}
+                          className="w-full justify-center"
+                        >
+                          {deletingProject ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Trash2 className="h-4 w-4" />
+                          )}
+                          Delete project
                         </Button>
-                      ) : null}
-                      <Button
-                        variant="ghost"
-                        onClick={() => void handleDeleteProject()}
-                        disabled={deletingProject}
-                        className="w-full justify-center"
-                      >
-                        {deletingProject ? (
-                          <Loader2 className="h-4 w-4 animate-spin" />
-                        ) : (
-                          <Trash2 className="h-4 w-4" />
-                        )}
-                        Delete project
-                      </Button>
-                    </div>
-                  </Card>
-                }
-                pronunciationPanel={
-                  <Card className="rounded-2xl border-0 bg-transparent p-0 shadow-none">
-                    <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                      Pronunciation Rules
-                    </div>
-                    <div className="mt-2 text-sm leading-relaxed text-[var(--text-secondary)]">
-                      Replace words or phrases before rendering to keep pronunciation
-                      consistent across the project.
-                    </div>
+                      </div>
+                    </AccordionContent>
+                  </AccordionItem>
 
-                    <div className="mt-4 grid gap-2">
-                      <Input
-                        value={newPronunciationSource}
-                        onChange={(event) =>
-                          setNewPronunciationSource(event.target.value)
-                        }
-                        placeholder="Source text (e.g. SQL)"
-                      />
-                      <Input
-                        value={newPronunciationReplacement}
-                        onChange={(event) =>
-                          setNewPronunciationReplacement(event.target.value)
-                        }
-                        placeholder="Replacement text (e.g. sequel)"
-                      />
-                      <Button
-                        type="button"
-                        variant="outline"
-                        onClick={() => void handleCreatePronunciation()}
-                        disabled={savingPronunciation}
-                        className="justify-center bg-[var(--bg-surface-1)]"
-                      >
-                        {savingPronunciation ? (
-                          <Loader2 className="h-4 w-4 animate-spin" />
-                        ) : (
-                          <PencilLine className="h-4 w-4" />
-                        )}
-                        Add rule
-                      </Button>
-                    </div>
+                  <AccordionItem
+                    value="pronunciation-rules"
+                    className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3"
+                  >
+                    <AccordionTrigger className="py-3 text-left hover:no-underline">
+                      <span className="text-sm font-semibold text-[var(--text-primary)]">
+                        Pronunciation Rules
+                      </span>
+                    </AccordionTrigger>
+                    <AccordionContent className="pb-3">
+                      <p className="text-sm leading-relaxed text-[var(--text-secondary)]">
+                        Replace words or phrases before rendering to keep pronunciation
+                        consistent across the project.
+                      </p>
 
-                    <div className="mt-4 space-y-2">
-                      {projectPronunciationsLoading ? (
-                        <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
-                          Loading pronunciation rules...
-                        </div>
-                      ) : projectPronunciations.length === 0 ? (
-                        <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
-                          No pronunciation rules yet.
-                        </div>
-                      ) : (
-                        projectPronunciations.map((entry) => (
-                          <div
-                            key={entry.id}
-                            className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2"
-                          >
-                            <div className="text-xs text-[var(--text-muted)]">
-                              {entry.source_text}
-                            </div>
-                            <div className="text-sm text-[var(--text-primary)]">
-                              {entry.replacement_text}
-                            </div>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="sm"
-                              onClick={() => void handleDeletePronunciation(entry.id)}
-                              className="mt-1 h-7 px-2 text-xs"
-                            >
-                              Remove
-                            </Button>
+                      <div className="mt-4 grid gap-2">
+                        <Input
+                          value={newPronunciationSource}
+                          onChange={(event) =>
+                            setNewPronunciationSource(event.target.value)
+                          }
+                          placeholder="Source text (e.g. SQL)"
+                        />
+                        <Input
+                          value={newPronunciationReplacement}
+                          onChange={(event) =>
+                            setNewPronunciationReplacement(event.target.value)
+                          }
+                          placeholder="Replacement text (e.g. sequel)"
+                        />
+                        <Button
+                          type="button"
+                          variant="outline"
+                          onClick={() => void handleCreatePronunciation()}
+                          disabled={savingPronunciation}
+                          className="justify-center bg-[var(--bg-surface-0)]"
+                        >
+                          {savingPronunciation ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <PencilLine className="h-4 w-4" />
+                          )}
+                          Add rule
+                        </Button>
+                      </div>
+
+                      <div className="mt-4 space-y-2">
+                        {projectPronunciationsLoading ? (
+                          <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2 text-xs text-[var(--text-muted)]">
+                            Loading pronunciation rules...
                           </div>
-                        ))
-                      )}
-                    </div>
-                  </Card>
-                }
-                snapshotsPanel={
-                  <Card className="rounded-2xl border-0 bg-transparent p-0 shadow-none">
-                    <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                      Snapshots
-                    </div>
-                    <div className="mt-2 text-sm leading-relaxed text-[var(--text-secondary)]">
-                      Save restore points before major edits and roll back when needed.
-                    </div>
-
-                    <div className="mt-3 flex flex-wrap items-center gap-2">
-                      <Input
-                        value={snapshotLabel}
-                        onChange={(event) => setSnapshotLabel(event.target.value)}
-                        placeholder="Optional snapshot label"
-                        className="flex-1 min-w-[180px] bg-[var(--bg-surface-1)]"
-                      />
-                      <Button
-                        type="button"
-                        variant="outline"
-                        onClick={() => void handleCreateSnapshot()}
-                        disabled={savingSnapshot}
-                        className="bg-[var(--bg-surface-1)]"
-                      >
-                        {savingSnapshot ? (
-                          <Loader2 className="h-4 w-4 animate-spin" />
-                        ) : (
-                          <CheckCircle2 className="h-4 w-4" />
-                        )}
-                        Save snapshot
-                      </Button>
-                    </div>
-
-                    <div className="mt-4 space-y-2">
-                      {projectSnapshotsLoading ? (
-                        <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
-                          Loading snapshots...
-                        </div>
-                      ) : projectSnapshots.length === 0 ? (
-                        <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
-                          No snapshots yet.
-                        </div>
-                      ) : (
-                        projectSnapshots.map((snapshot) => (
-                          <div
-                            key={snapshot.id}
-                            className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2"
-                          >
-                            <div className="text-xs text-[var(--text-muted)]">
-                              {snapshot.label || "Unnamed snapshot"} ·{" "}
-                              {formatRelativeDate(snapshot.created_at)}
-                            </div>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="sm"
-                              onClick={() => void handleRestoreSnapshot(snapshot.id)}
-                              disabled={restoringSnapshotId === snapshot.id}
-                              className="mt-1 h-7 px-2 text-xs"
-                            >
-                              {restoringSnapshotId === snapshot.id ? (
-                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                              ) : (
-                                <History className="h-3.5 w-3.5" />
-                              )}
-                              Restore
-                            </Button>
+                        ) : projectPronunciations.length === 0 ? (
+                          <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2 text-xs text-[var(--text-muted)]">
+                            No pronunciation rules yet.
                           </div>
-                        ))
-                      )}
-                    </div>
-                  </Card>
-                }
-              />
+                        ) : (
+                          projectPronunciations.map((entry) => (
+                            <div
+                              key={entry.id}
+                              className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2"
+                            >
+                              <div className="text-xs text-[var(--text-muted)]">
+                                {entry.source_text}
+                              </div>
+                              <div className="text-sm text-[var(--text-primary)]">
+                                {entry.replacement_text}
+                              </div>
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => void handleDeletePronunciation(entry.id)}
+                                className="mt-1 h-7 px-2 text-xs"
+                              >
+                                Remove
+                              </Button>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </AccordionContent>
+                  </AccordionItem>
+                </Accordion>
+
+              </div>
             }
           />
         )}

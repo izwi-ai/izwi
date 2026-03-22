@@ -17,7 +17,7 @@ export function StudioWorkspaceScaffold({
   utilities,
 }: StudioWorkspaceScaffoldProps) {
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 pb-8">
       <section data-testid="studio-library-pane" className="space-y-2">
         {overview}
       </section>
