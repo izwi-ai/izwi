@@ -1771,36 +1771,44 @@ export function StudioWorkspace({
     }
   };
 
-  const handleDeleteProject = async () => {
-    if (!selectedProject || deletingProject) {
-      return;
-    }
-    if (typeof window !== "undefined") {
-      const confirmed = window.confirm(
-        `Delete the project "${selectedProject.name}"?`,
-      );
-      if (!confirmed) {
+  const deleteProjectById = useCallback(
+    async (projectId: string, projectName: string) => {
+      if (deletingProject) {
         return;
       }
+      if (typeof window !== "undefined") {
+        const confirmed = window.confirm(`Delete the project "${projectName}"?`);
+        if (!confirmed) {
+          return;
+        }
+      }
+      try {
+        setDeletingProject(true);
+        await api.deleteTtsProject(projectId);
+        setWorkspaceStatus({
+          tone: "success",
+          message: `Deleted project "${projectName}".`,
+        });
+        setSelectedProject((current) => (current?.id === projectId ? null : current));
+        setSelectedProjectId((current) => (current === projectId ? null : current));
+        await loadProjects();
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "Failed to delete the project.";
+        setWorkspaceError(message);
+        onError(message);
+      } finally {
+        setDeletingProject(false);
+      }
+    },
+    [deletingProject, loadProjects, onError],
+  );
+
+  const handleDeleteProject = async () => {
+    if (!selectedProject) {
+      return;
     }
-    try {
-      setDeletingProject(true);
-      await api.deleteTtsProject(selectedProject.id);
-      setWorkspaceStatus({
-        tone: "success",
-        message: `Deleted project "${selectedProject.name}".`,
-      });
-      setSelectedProject(null);
-      setSelectedProjectId(null);
-      await loadProjects();
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Failed to delete the project.";
-      setWorkspaceError(message);
-      onError(message);
-    } finally {
-      setDeletingProject(false);
-    }
+    await deleteProjectById(selectedProject.id, selectedProject.name);
   };
 
   const selectedProjectRenderedCount =
@@ -1981,12 +1989,23 @@ export function StudioWorkspace({
                   ].filter((value): value is string => Boolean(value));
 
                   return (
-                    <button
+                    <div
                       key={project.id}
-                      type="button"
+                      role="button"
+                      tabIndex={0}
                       onClick={() => {
                         setSelectedProjectId(project.id);
                         close();
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.currentTarget !== event.target) {
+                          return;
+                        }
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          setSelectedProjectId(project.id);
+                          close();
+                        }
                       }}
                       className={cn(
                         "group app-sidebar-row h-auto min-h-[110px] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
@@ -1999,9 +2018,28 @@ export function StudioWorkspace({
                         <span className="app-sidebar-row-label truncate font-medium text-[var(--text-primary)]">
                           {project.name}
                         </span>
-                        <span className="app-sidebar-row-meta shrink-0">
-                          {formatRelativeDate(project.updated_at)}
-                        </span>
+                        <div className="inline-flex items-center gap-1.5 shrink-0">
+                          <span className="app-sidebar-row-meta">
+                            {formatRelativeDate(project.updated_at)}
+                          </span>
+                          <button
+                            type="button"
+                            onPointerDown={(event) => {
+                              event.stopPropagation();
+                            }}
+                            onClick={(event) => {
+                              event.preventDefault();
+                              event.stopPropagation();
+                              void deleteProjectById(project.id, project.name);
+                            }}
+                            className="app-sidebar-delete-btn"
+                            title="Delete project"
+                            aria-label={`Delete project ${project.name}`}
+                            disabled={deletingProject}
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
                       </div>
                       <div className="mt-2 flex items-center gap-2">
                         <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-[var(--bg-surface-3)]">
@@ -2041,7 +2079,7 @@ export function StudioWorkspace({
                       >
                         {previewParts.join(" · ")}
                       </p>
-                    </button>
+                    </div>
                   );
                 })}
               </div>
