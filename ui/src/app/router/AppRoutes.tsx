@@ -158,6 +158,10 @@ export function AppRoutes() {
           path="/studio"
           element={withSuspense(<StudioPage {...pageProps} />)}
         />
+        <Route
+          path="/studio/:projectId"
+          element={withSuspense(<StudioPage {...pageProps} />)}
+        />
         <Route path="/tts-projects" element={<Navigate to="/studio" replace />} />
         <Route
           path="/text-to-speech/projects"

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { StudioWorkspace } from "@/components/StudioWorkspace";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import {
@@ -23,7 +23,10 @@ export function StudioPage({
   onSelect,
   onError,
 }: SharedPageProps) {
+  const navigate = useNavigate();
+  const { projectId } = useParams<{ projectId?: string }>();
   const [searchParams] = useSearchParams();
+  const modelQuery = searchParams.get("model");
   const [headerActionContainer, setHeaderActionContainer] =
     useState<HTMLDivElement | null>(null);
   const appliedQueryModelRef = useRef(false);
@@ -92,11 +95,16 @@ export function StudioPage({
       />
 
       <StudioWorkspace
+        activeProjectId={projectId ?? null}
         selectedModel={resolvedSelectedModel}
         selectedModelInfo={selectedModelInfo}
         availableModels={routeModels}
         modelOptions={modelOptions}
         headerActionContainer={headerActionContainer}
+        onNavigateProject={(nextProjectId) => {
+          const query = modelQuery ? `?model=${encodeURIComponent(modelQuery)}` : "";
+          navigate(nextProjectId ? `/studio/${nextProjectId}${query}` : `/studio${query}`);
+        }}
         onSelectModel={handleModelSelect}
         onOpenModelManager={openModelManager}
         onModelRequired={() => {
