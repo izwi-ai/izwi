@@ -68,6 +68,7 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Card } from "@/components/ui/card";
+import { StudioActionRail } from "@/features/studio/components/StudioActionRail";
 import { StudioWorkspaceScaffold } from "@/features/studio/components/StudioWorkspaceScaffold";
 import { StudioProjectUtilities } from "@/features/studio/components/StudioProjectUtilities";
 import { useDownloadIndicator } from "@/utils/useDownloadIndicator";
@@ -2640,32 +2641,24 @@ export function StudioWorkspace({
                   </div>
                 </div>
 
-                <div className="grid gap-2 sm:grid-cols-2 xl:w-[360px] xl:grid-cols-1">
-                  <Button
-                    onClick={() => void handleRenderAll()}
-                    disabled={renderingAll || pendingRenderSegmentCount === 0}
-                    className="w-full justify-center"
-                  >
-                    {renderingAll ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <Waves className="h-4 w-4" />
-                    )}
-                    {primaryRenderLabel}
-                  </Button>
-                  <Button
-                    variant="outline"
-                    onClick={handleExport}
-                    disabled={isDownloading}
-                    className="w-full justify-center bg-[var(--bg-surface-1)]"
-                  >
-                    {isDownloading ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <Download className="h-4 w-4" />
-                    )}
-                    Export audio
-                  </Button>
+                <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 xl:w-[320px]">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                    Session Status
+                  </div>
+                  <div className="mt-2 text-sm font-semibold text-[var(--text-primary)]">
+                    {pendingRenderSegmentCount > 0
+                      ? `${pendingRenderSegmentCount} block${pendingRenderSegmentCount === 1 ? "" : "s"} still need rendering.`
+                      : "All blocks are rendered and ready to export."}
+                  </div>
+                  <div className="mt-3 space-y-1 text-xs text-[var(--text-muted)]">
+                    <div>{selectedProjectRenderedCount} rendered blocks</div>
+                    <div>{queuedRenderCount} queued operations</div>
+                    {failedRenderCount > 0 ? (
+                      <div className="text-[var(--danger-text)]">
+                        {failedRenderCount} queue failure{failedRenderCount === 1 ? "" : "s"}
+                      </div>
+                    ) : null}
+                  </div>
                 </div>
               </div>
 
@@ -3050,24 +3043,45 @@ export function StudioWorkspace({
               </>
             }
             actionRail={
-              <>
-                <Card className="rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 shadow-none">
-                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                    Delivery
-                  </div>
-                  <div className="mt-2 text-sm font-semibold text-[var(--text-primary)]">
-                    {exportReady && !changedSinceLastRender
-                      ? "Everything is ready for merged export."
-                      : pendingRenderSegmentCount > 0
-                        ? `${pendingRenderSegmentCount} block${pendingRenderSegmentCount === 1 ? "" : "s"} still need rendering.`
-                        : "Project changes are newer than the last complete render."}
-                  </div>
-                  <div className="mt-2 text-sm leading-relaxed text-[var(--text-secondary)]">
-                    Use export once the project sounds right. If you changed text in a
-                    block, re-render that block before downloading the merged file.
-                  </div>
-
-                  <div className="mt-4 grid gap-2">
+              <StudioActionRail
+                workflowSummary={
+                  exportReady && !changedSinceLastRender
+                    ? "Everything is ready for merged export."
+                    : pendingRenderSegmentCount > 0
+                      ? `${pendingRenderSegmentCount} block${pendingRenderSegmentCount === 1 ? "" : "s"} still need rendering.`
+                      : "Project changes are newer than the last complete render."
+                }
+                primaryActions={
+                  <>
+                    <Button
+                      onClick={() => void handleRenderAll()}
+                      disabled={renderingAll || pendingRenderSegmentCount === 0}
+                      className="w-full justify-center"
+                    >
+                      {renderingAll ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Waves className="h-4 w-4" />
+                      )}
+                      {primaryRenderLabel}
+                    </Button>
+                    <Button
+                      variant="outline"
+                      onClick={handleExport}
+                      disabled={isDownloading}
+                      className="w-full justify-center bg-[var(--bg-surface-1)]"
+                    >
+                      {isDownloading ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Download className="h-4 w-4" />
+                      )}
+                      Export audio
+                    </Button>
+                  </>
+                }
+                exportSettings={
+                  <div className="grid gap-2">
                     <Select
                       value={exportFormat}
                       onValueChange={(value) =>
@@ -3115,101 +3129,75 @@ export function StudioWorkspace({
                       />
                     </label>
                   </div>
-
-                  <div className="mt-5 grid gap-2">
-                    {onOpenModelManager ? (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="w-full justify-center bg-[var(--bg-surface-1)]"
-                        onClick={onOpenModelManager}
-                      >
-                        <Settings2 className="h-4 w-4" />
-                        Open model manager
-                      </Button>
-                    ) : null}
-                    <Button
-                      variant="ghost"
-                      onClick={() => void handleDeleteProject()}
-                      disabled={deletingProject}
-                      className="w-full justify-center"
-                    >
-                      {deletingProject ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : (
-                        <Trash2 className="h-4 w-4" />
-                      )}
-                      Delete project
-                    </Button>
-                  </div>
-                </Card>
-
-                <Card className="rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 shadow-none">
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                        Render Queue
-                      </div>
-                      <div className="mt-1 text-sm font-semibold text-[var(--text-primary)]">
-                        {queuedRenderCount} queued · {failedRenderCount} failed
+                }
+                queuePanel={
+                  <Card className="rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 shadow-none">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                          Render Queue
+                        </div>
+                        <div className="mt-1 text-sm font-semibold text-[var(--text-primary)]">
+                          {queuedRenderCount} queued · {failedRenderCount} failed
+                        </div>
                       </div>
                     </div>
-                  </div>
 
-                  <div className="mt-3 space-y-2">
-                    {activeProjectQueueItems.length === 0 ? (
-                      <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
-                        No queued renders for this project.
-                      </div>
-                    ) : (
-                      activeProjectQueueItems.map((item) => (
-                        <div
-                          key={item.id}
-                          className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2"
-                        >
-                          <div className="flex items-center justify-between gap-2">
-                            <div className="text-sm text-[var(--text-primary)]">
-                              {item.segmentLabel}
-                            </div>
-                            <div className="text-xs uppercase tracking-wider text-[var(--text-muted)]">
-                              {item.status}
-                            </div>
-                          </div>
-                          {item.errorMessage ? (
-                            <div className="mt-1 text-xs text-[var(--danger-text)]">
-                              {item.errorMessage}
-                            </div>
-                          ) : null}
-                          <div className="mt-2 flex items-center gap-2">
-                            {item.status === "failed" ? (
-                              <Button
-                                type="button"
-                                variant="outline"
-                                size="sm"
-                                className="h-7 bg-[var(--bg-surface-0)] px-2 text-xs"
-                                onClick={() => void retryRenderQueueItem(item.id)}
-                              >
-                                Retry
-                              </Button>
-                            ) : null}
-                            {item.status !== "running" ? (
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                size="sm"
-                                className="h-7 px-2 text-xs"
-                                onClick={() => void cancelRenderQueueItem(item.id)}
-                              >
-                                Cancel
-                              </Button>
-                            ) : null}
-                          </div>
+                    <div className="mt-3 space-y-2">
+                      {activeProjectQueueItems.length === 0 ? (
+                        <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
+                          No queued renders for this project.
                         </div>
-                      ))
-                    )}
-                  </div>
-                </Card>
-              </>
+                      ) : (
+                        activeProjectQueueItems.map((item) => (
+                          <div
+                            key={item.id}
+                            className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2"
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <div className="text-sm text-[var(--text-primary)]">
+                                {item.segmentLabel}
+                              </div>
+                              <div className="text-xs uppercase tracking-wider text-[var(--text-muted)]">
+                                {item.status}
+                              </div>
+                            </div>
+                            {item.errorMessage ? (
+                              <div className="mt-1 text-xs text-[var(--danger-text)]">
+                                {item.errorMessage}
+                              </div>
+                            ) : null}
+                            <div className="mt-2 flex items-center gap-2">
+                              {item.status === "failed" ? (
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  className="h-7 bg-[var(--bg-surface-0)] px-2 text-xs"
+                                  onClick={() => void retryRenderQueueItem(item.id)}
+                                >
+                                  Retry
+                                </Button>
+                              ) : null}
+                              {item.status !== "running" ? (
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="sm"
+                                  className="h-7 px-2 text-xs"
+                                  onClick={() => void cancelRenderQueueItem(item.id)}
+                                >
+                                  Cancel
+                                </Button>
+                              ) : null}
+                            </div>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </Card>
+                }
+              />
             }
             utilities={
               <StudioProjectUtilities
@@ -3362,6 +3350,33 @@ export function StudioWorkspace({
                       )}
                       Save profile
                     </Button>
+
+                    <div className="mt-3 grid gap-2">
+                      {onOpenModelManager ? (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="w-full justify-center bg-[var(--bg-surface-1)]"
+                          onClick={onOpenModelManager}
+                        >
+                          <Settings2 className="h-4 w-4" />
+                          Open model manager
+                        </Button>
+                      ) : null}
+                      <Button
+                        variant="ghost"
+                        onClick={() => void handleDeleteProject()}
+                        disabled={deletingProject}
+                        className="w-full justify-center"
+                      >
+                        {deletingProject ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Trash2 className="h-4 w-4" />
+                        )}
+                        Delete project
+                      </Button>
+                    </div>
                   </Card>
                 }
                 pronunciationPanel={
