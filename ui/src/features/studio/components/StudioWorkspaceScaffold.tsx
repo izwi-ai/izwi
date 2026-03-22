@@ -1,8 +1,9 @@
 import type { ReactNode } from "react";
-import { Card } from "@/components/ui/card";
+import { cn } from "@/lib/utils";
 
 interface StudioWorkspaceScaffoldProps {
   overview: ReactNode;
+  statsRail?: ReactNode;
   editor: ReactNode;
   actionRail?: ReactNode;
   utilities?: ReactNode;
@@ -10,31 +11,51 @@ interface StudioWorkspaceScaffoldProps {
 
 export function StudioWorkspaceScaffold({
   overview,
+  statsRail,
   editor,
   actionRail,
   utilities,
 }: StudioWorkspaceScaffoldProps) {
   return (
-    <div className="space-y-5">
-      <Card
-        data-testid="studio-library-pane"
-        className="rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 shadow-none sm:p-6"
-      >
+    <div className="space-y-6">
+      <section data-testid="studio-library-pane" className="space-y-2">
         {overview}
-      </Card>
+      </section>
 
-      <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_340px] 2xl:grid-cols-[minmax(0,1fr)_360px]">
-        <Card
+      <div
+        className={cn(
+          "grid gap-6",
+          statsRail
+            ? "xl:grid-cols-[220px_minmax(0,1fr)_340px] 2xl:grid-cols-[240px_minmax(0,1fr)_360px]"
+            : "xl:grid-cols-[minmax(0,1fr)_340px] 2xl:grid-cols-[minmax(0,1fr)_360px]",
+        )}
+      >
+        {statsRail ? (
+          <aside
+            data-testid="studio-stats-pane"
+            className="order-2 xl:order-1 xl:sticky xl:top-4 xl:self-start"
+          >
+            {statsRail}
+          </aside>
+        ) : null}
+
+        <section
           data-testid="studio-editor-pane"
-          className="order-2 rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 shadow-none sm:p-6 xl:order-1"
+          className={cn(
+            "min-w-0",
+            statsRail ? "order-1 xl:order-2" : "order-1",
+          )}
         >
           {editor}
-        </Card>
+        </section>
 
         {actionRail ? (
           <aside
             data-testid="studio-delivery-pane"
-            className="order-1 space-y-5 xl:order-2 xl:sticky xl:top-4 xl:self-start"
+            className={cn(
+              "space-y-5 xl:sticky xl:top-4 xl:self-start",
+              statsRail ? "order-3 xl:order-3" : "order-2 xl:order-2",
+            )}
           >
             {actionRail}
           </aside>

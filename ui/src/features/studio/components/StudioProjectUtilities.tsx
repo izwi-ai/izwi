@@ -14,7 +14,7 @@ export function StudioProjectUtilities({
   snapshotsPanel,
 }: StudioProjectUtilitiesProps) {
   return (
-    <Card className="rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 shadow-none sm:p-6">
+    <Card className="rounded-2xl border-0 bg-transparent p-0 shadow-none">
       <div className="flex flex-col gap-1">
         <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
           Project Utilities
@@ -25,7 +25,7 @@ export function StudioProjectUtilities({
       </div>
 
       <Tabs defaultValue="profile" className="mt-4">
-        <TabsList className="h-auto w-full justify-start gap-1 rounded-xl border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-1">
+        <TabsList className="h-auto w-full justify-start gap-1 rounded-xl border-0 bg-[var(--bg-surface-1)] p-1">
           <TabsTrigger
             value="profile"
             className="h-7 min-w-[92px] rounded-lg px-2 text-xs font-semibold"

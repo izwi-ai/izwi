@@ -2594,63 +2594,41 @@ export function StudioWorkspace({
         ) : (
           <StudioWorkspaceScaffold
             overview={
-              <>
-              <div className="flex flex-col gap-5 xl:flex-row xl:items-start xl:justify-between">
-                <div className="min-w-0 flex-1">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+                <div className="min-w-0">
                   {onNavigateProject ? (
                     <Button
                       type="button"
                       variant="ghost"
                       size="sm"
                       onClick={() => onNavigateProject(null)}
-                      className="mb-3 h-8 px-2 text-xs text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+                      className="mb-2 h-8 px-2 text-xs text-[var(--text-muted)] hover:text-[var(--text-primary)]"
                     >
                       <ChevronLeft className="h-3.5 w-3.5" />
                       Back to Studio
                     </Button>
                   ) : null}
-                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                    Active Project
-                  </div>
-                  <h3 className="mt-2 text-2xl font-semibold tracking-tight text-[var(--text-primary)]">
+                  <h3 className="truncate text-2xl font-semibold tracking-tight text-[var(--text-primary)]">
                     {selectedProject.name}
                   </h3>
-                  <p className="mt-2 max-w-3xl text-sm leading-relaxed text-[var(--text-secondary)]">
-                    Keep the profile stable, review the split blocks, render only
-                    the ones that still need updates, then export a merged narration
-                    file when the project is ready.
-                  </p>
-
-                  <div className="mt-4 flex flex-wrap gap-2 text-xs">
-                    <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[var(--text-muted)]">
-                      Updated {formatRelativeDate(selectedProject.updated_at)}
-                    </span>
-                    <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[var(--text-muted)]">
-                      {selectedProject.source_filename || "Manual paste"}
-                    </span>
-                    {projectModelId ? (
-                      <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[var(--text-muted)]">
-                        {projectModelId}
-                      </span>
-                    ) : null}
-                    {selectedVoiceItem?.name ? (
-                      <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[var(--text-muted)]">
-                        {selectedVoiceItem.name}
-                      </span>
-                    ) : null}
-                  </div>
                 </div>
-
-                <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 xl:w-[320px]">
+                <div className="text-xs text-[var(--text-muted)]">
+                  Updated {formatRelativeDate(selectedProject.updated_at)}
+                </div>
+              </div>
+            }
+            statsRail={
+              <div className="space-y-6">
+                <div>
                   <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                    Session Status
+                    Status
                   </div>
                   <div className="mt-2 text-sm font-semibold text-[var(--text-primary)]">
                     {pendingRenderSegmentCount > 0
-                      ? `${pendingRenderSegmentCount} block${pendingRenderSegmentCount === 1 ? "" : "s"} still need rendering.`
-                      : "All blocks are rendered and ready to export."}
+                      ? `${pendingRenderSegmentCount} block${pendingRenderSegmentCount === 1 ? "" : "s"} need rendering.`
+                      : "All blocks are rendered and export-ready."}
                   </div>
-                  <div className="mt-3 space-y-1 text-xs text-[var(--text-muted)]">
+                  <div className="mt-2 space-y-1 text-xs text-[var(--text-muted)]">
                     <div>{selectedProjectRenderedCount} rendered blocks</div>
                     <div>{queuedRenderCount} queued operations</div>
                     {failedRenderCount > 0 ? (
@@ -2660,96 +2638,54 @@ export function StudioWorkspace({
                     ) : null}
                   </div>
                 </div>
-              </div>
 
-              <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-                <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-3">
-                  <div className="text-[11px] uppercase tracking-wider text-[var(--text-muted)]">
-                    Segments
+                <div>
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                    Project Stats
                   </div>
-                  <div className="mt-1 text-2xl font-semibold text-[var(--text-primary)]">
-                    {selectedProjectSegmentCount}
-                  </div>
-                </div>
-                <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-3">
-                  <div className="text-[11px] uppercase tracking-wider text-[var(--text-muted)]">
-                    Ready
-                  </div>
-                  <div className="mt-1 text-2xl font-semibold text-[var(--text-primary)]">
-                    {readySegmentCount}
-                  </div>
-                </div>
-                <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-3">
-                  <div className="text-[11px] uppercase tracking-wider text-[var(--text-muted)]">
-                    Needs Render
-                  </div>
-                  <div className="mt-1 text-2xl font-semibold text-[var(--text-primary)]">
-                    {pendingRenderSegmentCount}
-                  </div>
-                </div>
-                <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-3">
-                  <div className="text-[11px] uppercase tracking-wider text-[var(--text-muted)]">
-                    Script Size
-                  </div>
-                  <div className="mt-1 text-2xl font-semibold text-[var(--text-primary)]">
-                    {selectedProjectTotalChars}
-                  </div>
-                  <div className="text-xs text-[var(--text-muted)]">chars</div>
-                </div>
-              </div>
-
-              <div className="mt-5 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
-                <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-                  <div>
-                    <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                      Workflow Status
-                    </div>
-                    <div className="mt-2 text-sm font-medium text-[var(--text-primary)]">
-                      {exportReady && !changedSinceLastRender
-                        ? "Merged export is current and ready."
-                        : `${pendingRenderSegmentCount} segment${pendingRenderSegmentCount === 1 ? "" : "s"} still need rendering before the export is fully current.`}
-                    </div>
-                    <div className="mt-1 text-xs leading-relaxed text-[var(--text-muted)]">
-                      Render actions use the latest saved project profile, and block
-                      renders save edited text automatically before generating audio.
-                    </div>
-                  </div>
-                  <div className="flex flex-wrap gap-2 text-[11px]">
-                    {changedSinceLastRender ? (
-                      <span className="rounded-full border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-2.5 py-1 text-[var(--status-warning-text)]">
-                        Changed since last render
+                  <div className="mt-2 space-y-2 text-sm">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[var(--text-muted)]">Segments</span>
+                      <span className="font-semibold text-[var(--text-primary)]">
+                        {selectedProjectSegmentCount}
                       </span>
-                    ) : (
-                      <span className="rounded-full border border-[var(--status-positive-border)] bg-[var(--status-positive-bg)] px-2.5 py-1 text-[var(--status-positive-text)]">
-                        Synced with last render
+                    </div>
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[var(--text-muted)]">Ready</span>
+                      <span className="font-semibold text-[var(--text-primary)]">
+                        {readySegmentCount}
                       </span>
-                    )}
-                    <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2.5 py-1 text-[var(--text-muted)]">
-                      Prepare profile
-                    </span>
-                    <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2.5 py-1 text-[var(--text-muted)]">
-                      Review blocks
-                    </span>
-                    <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2.5 py-1 text-[var(--text-muted)]">
-                      Render remaining
-                    </span>
-                    <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2.5 py-1 text-[var(--text-muted)]">
-                      Export
-                    </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[var(--text-muted)]">Needs Render</span>
+                      <span className="font-semibold text-[var(--text-primary)]">
+                        {pendingRenderSegmentCount}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[var(--text-muted)]">Script Size</span>
+                      <span className="font-semibold text-[var(--text-primary)]">
+                        {selectedProjectTotalChars} chars
+                      </span>
+                    </div>
                   </div>
                 </div>
 
-                <div className="mt-4 h-2 overflow-hidden rounded-full bg-[var(--bg-surface-2)]">
-                  <div
-                    className="h-full rounded-full bg-[var(--accent-solid)] transition-[width] duration-300"
-                    style={{ width: `${selectedProjectCompletionPercent}%` }}
-                  />
-                </div>
-                <div className="mt-2 text-xs text-[var(--text-muted)]">
-                  {selectedProjectRenderedCount}/{selectedProjectSegmentCount} segments have attached audio in the project.
+                <div>
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                    Completion
+                  </div>
+                  <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-[var(--bg-surface-2)]">
+                    <div
+                      className="h-full rounded-full bg-[var(--accent-solid)] transition-[width] duration-300"
+                      style={{ width: `${selectedProjectCompletionPercent}%` }}
+                    />
+                  </div>
+                  <div className="mt-2 text-xs text-[var(--text-muted)]">
+                    {selectedProjectRenderedCount}/{selectedProjectSegmentCount} segments complete
+                  </div>
                 </div>
               </div>
-              </>
             }
             editor={
               <>
@@ -3131,7 +3067,7 @@ export function StudioWorkspace({
                   </div>
                 }
                 queuePanel={
-                  <Card className="rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 shadow-none">
+                  <Card className="rounded-2xl border-0 bg-transparent p-0 shadow-none">
                     <div className="flex items-start justify-between gap-3">
                       <div>
                         <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
@@ -3202,7 +3138,7 @@ export function StudioWorkspace({
             utilities={
               <StudioProjectUtilities
                 profilePanel={
-                  <Card className="rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 shadow-none">
+                  <Card className="rounded-2xl border-0 bg-transparent p-0 shadow-none">
                     <div className="flex items-center justify-between gap-3">
                       <div>
                         <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
@@ -3380,7 +3316,7 @@ export function StudioWorkspace({
                   </Card>
                 }
                 pronunciationPanel={
-                  <Card className="rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 shadow-none">
+                  <Card className="rounded-2xl border-0 bg-transparent p-0 shadow-none">
                     <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
                       Pronunciation Rules
                     </div>
@@ -3457,7 +3393,7 @@ export function StudioWorkspace({
                   </Card>
                 }
                 snapshotsPanel={
-                  <Card className="rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 shadow-none">
+                  <Card className="rounded-2xl border-0 bg-transparent p-0 shadow-none">
                     <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
                       Snapshots
                     </div>
