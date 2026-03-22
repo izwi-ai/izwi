@@ -3143,7 +3143,7 @@ export function StudioWorkspace({
                       </div>
                     </div>
 
-                    <div className="mt-3 space-y-2">
+                    <div className="mt-3 space-y-2 xl:max-h-[420px] xl:overflow-y-auto xl:pr-1">
                       {activeProjectQueueItems.length === 0 ? (
                         <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
                           No queued renders for this project.

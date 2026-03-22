@@ -23,10 +23,10 @@ export function StudioWorkspaceScaffold({
         {overview}
       </Card>
 
-      <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_320px] 2xl:grid-cols-[minmax(0,1fr)_340px]">
+      <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_340px] 2xl:grid-cols-[minmax(0,1fr)_360px]">
         <Card
           data-testid="studio-editor-pane"
-          className="rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 shadow-none sm:p-6"
+          className="order-2 rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 shadow-none sm:p-6 xl:order-1"
         >
           {editor}
         </Card>
@@ -34,7 +34,7 @@ export function StudioWorkspaceScaffold({
         {actionRail ? (
           <aside
             data-testid="studio-delivery-pane"
-            className="space-y-5 xl:sticky xl:top-4 xl:self-start"
+            className="order-1 space-y-5 xl:order-2 xl:sticky xl:top-4 xl:self-start"
           >
             {actionRail}
           </aside>

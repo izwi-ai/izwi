@@ -15,8 +15,8 @@ export function StudioActionRail({
   queuePanel,
 }: StudioActionRailProps) {
   return (
-    <div className="space-y-5">
-      <Card className="rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 shadow-none">
+    <div className="space-y-4 xl:space-y-5">
+      <Card className="rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-4 shadow-none sm:p-5">
         <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
           Render Flow
         </div>
@@ -30,7 +30,7 @@ export function StudioActionRail({
         <div className="mt-4 grid gap-2">{primaryActions}</div>
       </Card>
 
-      <Card className="rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 shadow-none">
+      <Card className="rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-4 shadow-none sm:p-5">
         <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
           Export Options
         </div>

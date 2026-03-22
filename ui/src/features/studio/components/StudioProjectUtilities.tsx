@@ -25,22 +25,22 @@ export function StudioProjectUtilities({
       </div>
 
       <Tabs defaultValue="profile" className="mt-4">
-        <TabsList className="h-9 w-full justify-start gap-1 overflow-x-auto rounded-xl border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-1">
+        <TabsList className="h-auto w-full justify-start gap-1 rounded-xl border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-1">
           <TabsTrigger
             value="profile"
-            className="h-7 rounded-lg px-2 text-xs font-semibold"
+            className="h-7 min-w-[92px] rounded-lg px-2 text-xs font-semibold"
           >
             Profile
           </TabsTrigger>
           <TabsTrigger
             value="pronunciation"
-            className="h-7 rounded-lg px-2 text-xs font-semibold"
+            className="h-7 min-w-[110px] rounded-lg px-2 text-xs font-semibold"
           >
             Pronunciations
           </TabsTrigger>
           <TabsTrigger
             value="snapshots"
-            className="h-7 rounded-lg px-2 text-xs font-semibold"
+            className="h-7 min-w-[96px] rounded-lg px-2 text-xs font-semibold"
           >
             Snapshots
           </TabsTrigger>
