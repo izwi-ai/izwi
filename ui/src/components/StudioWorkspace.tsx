@@ -69,6 +69,7 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { Card } from "@/components/ui/card";
 import { StudioWorkspaceScaffold } from "@/features/studio/components/StudioWorkspaceScaffold";
+import { StudioProjectUtilities } from "@/features/studio/components/StudioProjectUtilities";
 import { useDownloadIndicator } from "@/utils/useDownloadIndicator";
 import { getSpeakerProfilesForVariant } from "@/types";
 
@@ -3051,232 +3052,6 @@ export function StudioWorkspace({
             actionRail={
               <>
                 <Card className="rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 shadow-none">
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                        Project Profile
-                      </div>
-                      <h3 className="mt-1 text-lg font-semibold text-[var(--text-primary)]">
-                        Shared render settings
-                      </h3>
-                    </div>
-                    {projectDirty || projectFolderDirty ? (
-                      <div className="rounded-full border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--status-warning-text)]">
-                        Unsaved
-                      </div>
-                    ) : (
-                      <div className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--text-muted)]">
-                        Synced
-                      </div>
-                    )}
-                  </div>
-
-                  <p className="mt-2 text-sm leading-relaxed text-[var(--text-secondary)]">
-                    These defaults apply across the full project. Save them before
-                    you start a long render pass, or let render actions sync them automatically.
-                  </p>
-
-                  <div className="mt-5 space-y-4">
-                    <div className="space-y-2">
-                      <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
-                        Project name
-                      </label>
-                      <Input
-                        value={projectName}
-                        onChange={(event) => setProjectName(event.target.value)}
-                      />
-                    </div>
-
-                    <div className="space-y-2">
-                      <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
-                        Render model
-                      </label>
-                      <RouteModelSelect
-                        value={projectModelId}
-                        options={projectModelOptions}
-                        onSelect={(value) => {
-                          setProjectModelId(value);
-                          setWorkspaceStatus(null);
-                        }}
-                        className="w-full"
-                      />
-                    </div>
-
-                    <div className="space-y-2">
-                      <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
-                        Folder
-                      </label>
-                      <Select
-                        value={projectFolderId || STUDIO_UNFILED_FOLDER_VALUE}
-                        onValueChange={(value) => {
-                          setProjectFolderId(
-                            value === STUDIO_UNFILED_FOLDER_VALUE ? "" : value,
-                          );
-                          setWorkspaceStatus(null);
-                        }}
-                      >
-                        <SelectTrigger className="w-full bg-[var(--bg-surface-1)]">
-                          <SelectValue placeholder="Unfiled" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value={STUDIO_UNFILED_FOLDER_VALUE}>
-                            Unfiled
-                          </SelectItem>
-                          {projectFolders.map((folder) => (
-                            <SelectItem key={folder.id} value={folder.id}>
-                              {folder.name}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-
-                    <div className="space-y-2">
-                      <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
-                        Project voice
-                      </label>
-                      <VoiceSelect
-                        voiceMode={projectVoiceMode}
-                        onVoiceModeChange={(value) => {
-                          setProjectVoiceMode(value);
-                          setWorkspaceStatus(null);
-                        }}
-                        savedVoiceItems={savedVoiceItems}
-                        builtInVoiceItems={builtInVoiceItems}
-                        selectedItem={selectedVoiceItem}
-                        savedVoicesLoading={savedVoicesLoading}
-                        savedVoicesError={savedVoicesError}
-                        savedEnabled={supportsSavedVoices}
-                        builtInEnabled={supportsBuiltInVoices}
-                        disabled={!projectModelId}
-                        modelLabel={currentProjectModelInfo?.variant ?? projectModelId}
-                      />
-                    </div>
-
-                    <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-4 text-sm leading-relaxed text-[var(--text-secondary)]">
-                      {projectVoiceNotice}
-                    </div>
-
-                    <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
-                      <div className="flex items-center justify-between text-sm">
-                        <span className="font-medium text-[var(--text-primary)]">
-                          Speed
-                        </span>
-                        <span className="text-[var(--text-muted)]">
-                          {supportsSpeedControl
-                            ? `${projectSpeed.toFixed(2)}x`
-                            : "Fixed by model"}
-                        </span>
-                      </div>
-                      <Slider
-                        value={[projectSpeed]}
-                        min={0.5}
-                        max={1.5}
-                        step={0.05}
-                        onValueChange={([value]) => setProjectSpeed(value ?? 1)}
-                        disabled={!supportsSpeedControl}
-                        className="mt-4"
-                      />
-                      <div className="mt-3 text-xs leading-relaxed text-[var(--text-muted)]">
-                        {supportsSpeedControl
-                          ? "This speed applies to every rendered segment in the project."
-                          : "This model does not expose adjustable speed for project renders."}
-                      </div>
-                    </div>
-                  </div>
-
-                  <Button
-                    variant="outline"
-                    onClick={() => void persistProjectSettings()}
-                    disabled={(!projectDirty && !projectFolderDirty) || savingProject}
-                    className="mt-5 w-full justify-center bg-[var(--bg-surface-1)]"
-                  >
-                    {savingProject ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <Settings2 className="h-4 w-4" />
-                    )}
-                    Save profile
-                  </Button>
-                </Card>
-
-                <Card className="rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 shadow-none">
-                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                    Pronunciation Rules
-                  </div>
-                  <div className="mt-2 text-sm leading-relaxed text-[var(--text-secondary)]">
-                    Replace words or phrases before rendering to keep pronunciation
-                    consistent across the project.
-                  </div>
-
-                  <div className="mt-4 grid gap-2">
-                    <Input
-                      value={newPronunciationSource}
-                      onChange={(event) =>
-                        setNewPronunciationSource(event.target.value)
-                      }
-                      placeholder="Source text (e.g. SQL)"
-                    />
-                    <Input
-                      value={newPronunciationReplacement}
-                      onChange={(event) =>
-                        setNewPronunciationReplacement(event.target.value)
-                      }
-                      placeholder="Replacement text (e.g. sequel)"
-                    />
-                    <Button
-                      type="button"
-                      variant="outline"
-                      onClick={() => void handleCreatePronunciation()}
-                      disabled={savingPronunciation}
-                      className="justify-center bg-[var(--bg-surface-1)]"
-                    >
-                      {savingPronunciation ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : (
-                        <PencilLine className="h-4 w-4" />
-                      )}
-                      Add rule
-                    </Button>
-                  </div>
-
-                  <div className="mt-4 space-y-2">
-                    {projectPronunciationsLoading ? (
-                      <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
-                        Loading pronunciation rules...
-                      </div>
-                    ) : projectPronunciations.length === 0 ? (
-                      <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
-                        No pronunciation rules yet.
-                      </div>
-                    ) : (
-                      projectPronunciations.map((entry) => (
-                        <div
-                          key={entry.id}
-                          className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2"
-                        >
-                          <div className="text-xs text-[var(--text-muted)]">
-                            {entry.source_text}
-                          </div>
-                          <div className="text-sm text-[var(--text-primary)]">
-                            {entry.replacement_text}
-                          </div>
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => void handleDeletePronunciation(entry.id)}
-                            className="mt-1 h-7 px-2 text-xs"
-                          >
-                            Remove
-                          </Button>
-                        </div>
-                      ))
-                    )}
-                  </div>
-                </Card>
-
-                <Card className="rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 shadow-none">
                   <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
                     Delivery
                   </div>
@@ -3434,78 +3209,311 @@ export function StudioWorkspace({
                     )}
                   </div>
                 </Card>
+              </>
+            }
+            utilities={
+              <StudioProjectUtilities
+                profilePanel={
+                  <Card className="rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 shadow-none">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                          Project Profile
+                        </div>
+                        <h3 className="mt-1 text-lg font-semibold text-[var(--text-primary)]">
+                          Shared render settings
+                        </h3>
+                      </div>
+                      {projectDirty || projectFolderDirty ? (
+                        <div className="rounded-full border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--status-warning-text)]">
+                          Unsaved
+                        </div>
+                      ) : (
+                        <div className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--text-muted)]">
+                          Synced
+                        </div>
+                      )}
+                    </div>
 
-                <Card className="rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 shadow-none">
-                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                    Snapshots
-                  </div>
-                  <div className="mt-2 text-sm leading-relaxed text-[var(--text-secondary)]">
-                    Save restore points before major edits and roll back when needed.
-                  </div>
+                    <p className="mt-2 text-sm leading-relaxed text-[var(--text-secondary)]">
+                      These defaults apply across the full project. Save them before
+                      you start a long render pass, or let render actions sync them automatically.
+                    </p>
 
-                  <div className="mt-3 flex flex-wrap items-center gap-2">
-                    <Input
-                      value={snapshotLabel}
-                      onChange={(event) => setSnapshotLabel(event.target.value)}
-                      placeholder="Optional snapshot label"
-                      className="flex-1 min-w-[180px] bg-[var(--bg-surface-1)]"
-                    />
+                    <div className="mt-5 space-y-4">
+                      <div className="space-y-2">
+                        <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
+                          Project name
+                        </label>
+                        <Input
+                          value={projectName}
+                          onChange={(event) => setProjectName(event.target.value)}
+                        />
+                      </div>
+
+                      <div className="space-y-2">
+                        <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
+                          Render model
+                        </label>
+                        <RouteModelSelect
+                          value={projectModelId}
+                          options={projectModelOptions}
+                          onSelect={(value) => {
+                            setProjectModelId(value);
+                            setWorkspaceStatus(null);
+                          }}
+                          className="w-full"
+                        />
+                      </div>
+
+                      <div className="space-y-2">
+                        <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
+                          Folder
+                        </label>
+                        <Select
+                          value={projectFolderId || STUDIO_UNFILED_FOLDER_VALUE}
+                          onValueChange={(value) => {
+                            setProjectFolderId(
+                              value === STUDIO_UNFILED_FOLDER_VALUE ? "" : value,
+                            );
+                            setWorkspaceStatus(null);
+                          }}
+                        >
+                          <SelectTrigger className="w-full bg-[var(--bg-surface-1)]">
+                            <SelectValue placeholder="Unfiled" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value={STUDIO_UNFILED_FOLDER_VALUE}>
+                              Unfiled
+                            </SelectItem>
+                            {projectFolders.map((folder) => (
+                              <SelectItem key={folder.id} value={folder.id}>
+                                {folder.name}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+
+                      <div className="space-y-2">
+                        <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
+                          Project voice
+                        </label>
+                        <VoiceSelect
+                          voiceMode={projectVoiceMode}
+                          onVoiceModeChange={(value) => {
+                            setProjectVoiceMode(value);
+                            setWorkspaceStatus(null);
+                          }}
+                          savedVoiceItems={savedVoiceItems}
+                          builtInVoiceItems={builtInVoiceItems}
+                          selectedItem={selectedVoiceItem}
+                          savedVoicesLoading={savedVoicesLoading}
+                          savedVoicesError={savedVoicesError}
+                          savedEnabled={supportsSavedVoices}
+                          builtInEnabled={supportsBuiltInVoices}
+                          disabled={!projectModelId}
+                          modelLabel={currentProjectModelInfo?.variant ?? projectModelId}
+                        />
+                      </div>
+
+                      <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-4 text-sm leading-relaxed text-[var(--text-secondary)]">
+                        {projectVoiceNotice}
+                      </div>
+
+                      <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
+                        <div className="flex items-center justify-between text-sm">
+                          <span className="font-medium text-[var(--text-primary)]">
+                            Speed
+                          </span>
+                          <span className="text-[var(--text-muted)]">
+                            {supportsSpeedControl
+                              ? `${projectSpeed.toFixed(2)}x`
+                              : "Fixed by model"}
+                          </span>
+                        </div>
+                        <Slider
+                          value={[projectSpeed]}
+                          min={0.5}
+                          max={1.5}
+                          step={0.05}
+                          onValueChange={([value]) => setProjectSpeed(value ?? 1)}
+                          disabled={!supportsSpeedControl}
+                          className="mt-4"
+                        />
+                        <div className="mt-3 text-xs leading-relaxed text-[var(--text-muted)]">
+                          {supportsSpeedControl
+                            ? "This speed applies to every rendered segment in the project."
+                            : "This model does not expose adjustable speed for project renders."}
+                        </div>
+                      </div>
+                    </div>
+
                     <Button
-                      type="button"
                       variant="outline"
-                      onClick={() => void handleCreateSnapshot()}
-                      disabled={savingSnapshot}
-                      className="bg-[var(--bg-surface-1)]"
+                      onClick={() => void persistProjectSettings()}
+                      disabled={(!projectDirty && !projectFolderDirty) || savingProject}
+                      className="mt-5 w-full justify-center bg-[var(--bg-surface-1)]"
                     >
-                      {savingSnapshot ? (
+                      {savingProject ? (
                         <Loader2 className="h-4 w-4 animate-spin" />
                       ) : (
-                        <CheckCircle2 className="h-4 w-4" />
+                        <Settings2 className="h-4 w-4" />
                       )}
-                      Save snapshot
+                      Save profile
                     </Button>
-                  </div>
+                  </Card>
+                }
+                pronunciationPanel={
+                  <Card className="rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 shadow-none">
+                    <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                      Pronunciation Rules
+                    </div>
+                    <div className="mt-2 text-sm leading-relaxed text-[var(--text-secondary)]">
+                      Replace words or phrases before rendering to keep pronunciation
+                      consistent across the project.
+                    </div>
 
-                  <div className="mt-4 space-y-2">
-                    {projectSnapshotsLoading ? (
-                      <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
-                        Loading snapshots...
-                      </div>
-                    ) : projectSnapshots.length === 0 ? (
-                      <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
-                        No snapshots yet.
-                      </div>
-                    ) : (
-                      projectSnapshots.map((snapshot) => (
-                        <div
-                          key={snapshot.id}
-                          className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2"
-                        >
-                          <div className="text-xs text-[var(--text-muted)]">
-                            {snapshot.label || "Unnamed snapshot"} ·{" "}
-                            {formatRelativeDate(snapshot.created_at)}
-                          </div>
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => void handleRestoreSnapshot(snapshot.id)}
-                            disabled={restoringSnapshotId === snapshot.id}
-                            className="mt-1 h-7 px-2 text-xs"
-                          >
-                            {restoringSnapshotId === snapshot.id ? (
-                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                            ) : (
-                              <History className="h-3.5 w-3.5" />
-                            )}
-                            Restore
-                          </Button>
+                    <div className="mt-4 grid gap-2">
+                      <Input
+                        value={newPronunciationSource}
+                        onChange={(event) =>
+                          setNewPronunciationSource(event.target.value)
+                        }
+                        placeholder="Source text (e.g. SQL)"
+                      />
+                      <Input
+                        value={newPronunciationReplacement}
+                        onChange={(event) =>
+                          setNewPronunciationReplacement(event.target.value)
+                        }
+                        placeholder="Replacement text (e.g. sequel)"
+                      />
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={() => void handleCreatePronunciation()}
+                        disabled={savingPronunciation}
+                        className="justify-center bg-[var(--bg-surface-1)]"
+                      >
+                        {savingPronunciation ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <PencilLine className="h-4 w-4" />
+                        )}
+                        Add rule
+                      </Button>
+                    </div>
+
+                    <div className="mt-4 space-y-2">
+                      {projectPronunciationsLoading ? (
+                        <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
+                          Loading pronunciation rules...
                         </div>
-                      ))
-                    )}
-                  </div>
-                </Card>
-              </>
+                      ) : projectPronunciations.length === 0 ? (
+                        <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
+                          No pronunciation rules yet.
+                        </div>
+                      ) : (
+                        projectPronunciations.map((entry) => (
+                          <div
+                            key={entry.id}
+                            className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2"
+                          >
+                            <div className="text-xs text-[var(--text-muted)]">
+                              {entry.source_text}
+                            </div>
+                            <div className="text-sm text-[var(--text-primary)]">
+                              {entry.replacement_text}
+                            </div>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => void handleDeletePronunciation(entry.id)}
+                              className="mt-1 h-7 px-2 text-xs"
+                            >
+                              Remove
+                            </Button>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </Card>
+                }
+                snapshotsPanel={
+                  <Card className="rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5 shadow-none">
+                    <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                      Snapshots
+                    </div>
+                    <div className="mt-2 text-sm leading-relaxed text-[var(--text-secondary)]">
+                      Save restore points before major edits and roll back when needed.
+                    </div>
+
+                    <div className="mt-3 flex flex-wrap items-center gap-2">
+                      <Input
+                        value={snapshotLabel}
+                        onChange={(event) => setSnapshotLabel(event.target.value)}
+                        placeholder="Optional snapshot label"
+                        className="flex-1 min-w-[180px] bg-[var(--bg-surface-1)]"
+                      />
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={() => void handleCreateSnapshot()}
+                        disabled={savingSnapshot}
+                        className="bg-[var(--bg-surface-1)]"
+                      >
+                        {savingSnapshot ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <CheckCircle2 className="h-4 w-4" />
+                        )}
+                        Save snapshot
+                      </Button>
+                    </div>
+
+                    <div className="mt-4 space-y-2">
+                      {projectSnapshotsLoading ? (
+                        <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
+                          Loading snapshots...
+                        </div>
+                      ) : projectSnapshots.length === 0 ? (
+                        <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
+                          No snapshots yet.
+                        </div>
+                      ) : (
+                        projectSnapshots.map((snapshot) => (
+                          <div
+                            key={snapshot.id}
+                            className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2"
+                          >
+                            <div className="text-xs text-[var(--text-muted)]">
+                              {snapshot.label || "Unnamed snapshot"} ·{" "}
+                              {formatRelativeDate(snapshot.created_at)}
+                            </div>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => void handleRestoreSnapshot(snapshot.id)}
+                              disabled={restoringSnapshotId === snapshot.id}
+                              className="mt-1 h-7 px-2 text-xs"
+                            >
+                              {restoringSnapshotId === snapshot.id ? (
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              ) : (
+                                <History className="h-3.5 w-3.5" />
+                              )}
+                              Restore
+                            </Button>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </Card>
+                }
+              />
             }
           />
         )}
