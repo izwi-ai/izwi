@@ -10,6 +10,7 @@ import { createPortal } from "react-dom";
 import {
   AlertCircle,
   AlertTriangle,
+  ChevronLeft,
   ChevronDown,
   ChevronUp,
   CheckCircle2,
@@ -79,11 +80,13 @@ interface ModelOption {
 }
 
 interface StudioWorkspaceProps {
+  activeProjectId?: string | null;
   selectedModel: string | null;
   selectedModelInfo: ModelInfo | null;
   availableModels: ModelInfo[];
   modelOptions?: ModelOption[];
   headerActionContainer?: HTMLElement | null;
+  onNavigateProject?: (projectId: string | null) => void;
   onSelectModel?: (variant: string) => void;
   onOpenModelManager?: () => void;
   onModelRequired: () => void;
@@ -136,11 +139,13 @@ function downloadTextFile(filename: string, text: string): void {
 }
 
 export function StudioWorkspace({
+  activeProjectId,
   selectedModel,
   selectedModelInfo,
   availableModels,
   modelOptions = [],
   headerActionContainer,
+  onNavigateProject,
   onSelectModel,
   onOpenModelManager,
   onModelRequired,
@@ -160,7 +165,9 @@ export function StudioWorkspace({
     "recent",
   );
   const [projectFolderFilter, setProjectFolderFilter] = useState("all");
-  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  const [selectedProjectIdState, setSelectedProjectIdState] = useState<
+    string | null
+  >(null);
   const [projectPronunciations, setProjectPronunciations] = useState<
     TtsProjectPronunciationRecord[]
   >([]);
@@ -248,6 +255,22 @@ export function StudioWorkspace({
     completeDownload,
     failDownload,
   } = useDownloadIndicator();
+  const selectedProjectId =
+    activeProjectId !== undefined ? activeProjectId : selectedProjectIdState;
+  const setSelectedProjectId = useCallback(
+    (nextProjectId: string | null | ((current: string | null) => string | null)) => {
+      if (activeProjectId !== undefined) {
+        const resolvedNextId =
+          typeof nextProjectId === "function"
+            ? nextProjectId(activeProjectId)
+            : nextProjectId;
+        onNavigateProject?.(resolvedNextId);
+        return;
+      }
+      setSelectedProjectIdState(nextProjectId);
+    },
+    [activeProjectId, onNavigateProject],
+  );
 
   const currentProjectModelInfo = useMemo(
     () =>
@@ -420,6 +443,15 @@ export function StudioWorkspace({
     try {
       const records = await api.listTtsProjects();
       setProjects(records);
+      if (activeProjectId !== undefined) {
+        if (
+          activeProjectId &&
+          !records.some((project) => project.id === activeProjectId)
+        ) {
+          onNavigateProject?.(null);
+        }
+        return;
+      }
       setSelectedProjectId((current) => {
         if (current && records.some((project) => project.id === current)) {
           return current;
@@ -434,7 +466,7 @@ export function StudioWorkspace({
     } finally {
       setProjectsLoading(false);
     }
-  }, [onError]);
+  }, [activeProjectId, onError, onNavigateProject, setSelectedProjectId]);
 
   const loadSavedVoices = useCallback(async () => {
     setSavedVoicesLoading(true);
@@ -2599,6 +2631,18 @@ export function StudioWorkspace({
               <>
               <div className="flex flex-col gap-5 xl:flex-row xl:items-start xl:justify-between">
                 <div className="min-w-0 flex-1">
+                  {onNavigateProject ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => onNavigateProject(null)}
+                      className="mb-3 h-8 px-2 text-xs text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+                    >
+                      <ChevronLeft className="h-3.5 w-3.5" />
+                      Back to Studio
+                    </Button>
+                  ) : null}
                   <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
                     Active Project
                   </div>
