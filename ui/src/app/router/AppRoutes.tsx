@@ -155,12 +155,13 @@ export function AppRoutes() {
           element={withSuspense(<TextToSpeechPage {...pageProps} />)}
         />
         <Route
-          path="/tts-projects"
+          path="/studio"
           element={withSuspense(<TextToSpeechProjectsPage {...pageProps} />)}
         />
+        <Route path="/tts-projects" element={<Navigate to="/studio" replace />} />
         <Route
           path="/text-to-speech/projects"
-          element={<Navigate to="/tts-projects" replace />}
+          element={<Navigate to="/studio" replace />}
         />
         {VOICE_STUDIO_ENABLED ? (
           <>

@@ -80,7 +80,7 @@ export function TextToSpeechProjectsPage({
   return (
     <PageShell>
       <PageHeader
-        title="Projects"
+        title="Studio"
         description="Manage long-form text-to-speech scripts, render reusable segments, and export merged narration outputs."
         actions={
           <div
@@ -102,7 +102,7 @@ export function TextToSpeechProjectsPage({
         onModelRequired={() => {
           requestModel();
           onError(
-            "Select and load a compatible TTS model with built-in or saved-voice support to use Projects.",
+            "Select and load a compatible TTS model with built-in or saved-voice support to use Studio.",
           );
         }}
         onError={onError}

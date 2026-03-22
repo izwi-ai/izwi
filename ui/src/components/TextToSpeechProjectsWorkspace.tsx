@@ -1092,7 +1092,7 @@ export function TextToSpeechProjectsWorkspace({
         New project
       </Button>
       <RouteHistoryDrawer
-        title="TTS Projects"
+        title="Studio"
         eyebrow="Project Library"
         headerIcon={Library}
         triggerLabel="Project Library"

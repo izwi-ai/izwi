@@ -92,11 +92,11 @@ const CREATION_NAV_ITEMS: NavItem[] = VOICE_STUDIO_ENABLED
         path: "/text-to-speech",
       },
       {
-        id: "tts-projects",
-        label: "Projects",
+        id: "studio",
+        label: "Studio",
         description: "Reusable long-form TTS scripts",
         icon: FileAudio,
-        path: "/tts-projects",
+        path: "/studio",
       },
     ]
   : [
@@ -115,11 +115,11 @@ const CREATION_NAV_ITEMS: NavItem[] = VOICE_STUDIO_ENABLED
         path: "/text-to-speech",
       },
       {
-        id: "tts-projects",
-        label: "Projects",
+        id: "studio",
+        label: "Studio",
         description: "Reusable long-form TTS scripts",
         icon: FileAudio,
-        path: "/tts-projects",
+        path: "/studio",
       },
       {
         id: "voice-cloning",
