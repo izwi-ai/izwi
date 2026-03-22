@@ -412,5 +412,123 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     expect(client.ttsProjectAudioUrl("ttsp-1")).toBe(
       "http://localhost/v1/tts-projects/ttsp-1/audio",
     );
+    expect(
+      client.ttsProjectAudioUrl("ttsp-1", {
+        download: true,
+        format: "raw_i16",
+        segment_ids: ["a", "b"],
+      }),
+    ).toBe(
+      "http://localhost/v1/tts-projects/ttsp-1/audio?download=true&format=raw_i16&segment_ids=a%2Cb",
+    );
+  });
+
+  it("posts segment reorder operations to the canonical studio route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: "ttsp-1",
+          segments: [],
+        }),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+          },
+        },
+      ),
+    );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+    await client.reorderTtsProjectSegments("ttsp-1", {
+      ordered_segment_ids: ["ttss-2", "ttss-1"],
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost/v1/tts-projects/ttsp-1/segments/reorder",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({
+          ordered_segment_ids: ["ttss-2", "ttss-1"],
+        }),
+      }),
+    );
+  });
+
+  it("posts bulk segment deletion to the canonical studio route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: "ttsp-1",
+          segments: [],
+        }),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+          },
+        },
+      ),
+    );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+    await client.bulkDeleteTtsProjectSegments("ttsp-1", {
+      segment_ids: ["ttss-1", "ttss-2"],
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost/v1/tts-projects/ttsp-1/segments/bulk-delete",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          segment_ids: ["ttss-1", "ttss-2"],
+        }),
+      }),
+    );
+  });
+
+  it("posts render-job updates to the canonical studio route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: "ttsj-1",
+          project_id: "ttsp-1",
+          created_at: 1,
+          updated_at: 1,
+          status: "queued",
+          error_message: null,
+          queued_segment_ids: [],
+        }),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+          },
+        },
+      ),
+    );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+    await client.updateTtsProjectRenderJob("ttsp-1", "ttsj-1", {
+      status: "failed",
+      error_message: "boom",
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost/v1/tts-projects/ttsp-1/render-jobs/ttsj-1",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({
+          status: "failed",
+          error_message: "boom",
+        }),
+      }),
+    );
   });
 });
