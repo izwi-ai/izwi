@@ -6,7 +6,6 @@ import {
   Download,
   Loader2,
   Mic2,
-  Radio,
   RotateCcw,
   Settings2,
   Sparkles,
@@ -292,12 +291,6 @@ export function TextToSpeechWorkspace({
     [selectedModel, supportsBuiltInVoices],
   );
   const defaultSpeaker = availableSpeakers[0]?.id ?? "Vivian";
-  const selectedSavedVoice = useMemo(
-    () =>
-      savedVoices.find((voice) => voice.id === selectedSavedVoiceId) ?? null,
-    [savedVoices, selectedSavedVoiceId],
-  );
-
   useEffect(() => {
     if (!availableSpeakers.some((candidate) => candidate.id === speaker)) {
       setSpeaker(defaultSpeaker);
@@ -476,106 +469,6 @@ export function TextToSpeechWorkspace({
   useEffect(() => {
     void loadSavedVoices();
   }, [loadSavedVoices]);
-
-  const compatibilityNotice = useMemo(() => {
-    if (!selectedModelInfo?.variant) {
-      return "Choose a model to see the voice options it supports on this route.";
-    }
-
-    if (requiresVoiceDescriptionOnly) {
-      if (instructions.trim()) {
-        return `Generating from your voice direction prompt on ${selectedModelInfo.variant}.`;
-      }
-      return `${selectedModelInfo.variant} uses voice direction prompts on this route. Add a style prompt to generate audio.`;
-    }
-
-    if (!supportsVoiceSelection) {
-      return `${selectedModelInfo.variant} does not expose compatible voice selection controls on this route.`;
-    }
-
-    if (voiceMode === "saved") {
-      if (!supportsReferenceVoices) {
-        return `${selectedModelInfo.variant} does not support reusable saved voices. Pick a renderer with saved-voice support.`;
-      }
-      if (selectedSavedVoice) {
-        return `Rendering with reusable voice "${selectedSavedVoice.name}".`;
-      }
-      if (savedVoicesLoading) {
-        return "Loading your saved voices for this model.";
-      }
-      return "Choose a saved voice to reuse an existing cloned or designed profile.";
-    }
-
-    if (!supportsBuiltInVoices) {
-      return `${selectedModelInfo.variant} does not expose built-in speakers on this route.`;
-    }
-
-    if (availableSpeakers.length === 0) {
-      return `No built-in speakers are currently mapped for ${selectedModelInfo.variant}.`;
-    }
-
-    return `Using built-in voice "${speaker}" on ${selectedModelInfo.variant}.`;
-  }, [
-    availableSpeakers.length,
-    instructions,
-    requiresVoiceDescriptionOnly,
-    savedVoicesLoading,
-    selectedModelInfo?.variant,
-    selectedSavedVoice,
-    speaker,
-    supportsBuiltInVoices,
-    supportsReferenceVoices,
-    supportsVoiceSelection,
-    voiceMode,
-  ]);
-
-  const voiceAvailabilitySummary = useMemo(() => {
-    if (!selectedModelInfo?.variant) {
-      return "Choose a model";
-    }
-
-    if (
-      supportsBuiltInVoices &&
-      supportsReferenceVoices &&
-      supportsVoiceDescription
-    ) {
-      return `${availableSpeakers.length} built-in voices + saved voices + style prompts`;
-    }
-
-    if (supportsBuiltInVoices && supportsReferenceVoices) {
-      return `${availableSpeakers.length} built-in voices plus saved voices`;
-    }
-
-    if (supportsBuiltInVoices && supportsVoiceDescription) {
-      return `${availableSpeakers.length} built-in voices + style prompts`;
-    }
-
-    if (supportsReferenceVoices && supportsVoiceDescription) {
-      return "Saved voices + style prompts";
-    }
-
-    if (supportsBuiltInVoices) {
-      return availableSpeakers.length > 0
-        ? `${availableSpeakers.length} built-in voices`
-        : "Built-in voices unavailable";
-    }
-
-    if (supportsReferenceVoices) {
-      return "Saved voices only";
-    }
-
-    if (supportsVoiceDescription) {
-      return "Voice-direction prompts only";
-    }
-
-    return "No voices on this route";
-  }, [
-    availableSpeakers.length,
-    selectedModelInfo?.variant,
-    supportsBuiltInVoices,
-    supportsReferenceVoices,
-    supportsVoiceDescription,
-  ]);
 
   const savedVoiceItems: VoicePickerItem[] = savedVoices.map((voice) => ({
     id: voice.id,
@@ -1084,111 +977,6 @@ export function TextToSpeechWorkspace({
               />
             </WorkspacePanel>
 
-            <WorkspacePanel className="p-5">
-              <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-                <div className="min-w-0">
-                  <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-2")}>
-                    Delivery Controls
-                  </div>
-                  <div className={VOICE_ROUTE_BODY_COPY_CLASS}>
-                    {supportsSpeedControl
-                      ? "Speed is saved with the generation history. Streaming appears only when the selected model exposes it."
-                      : "This model uses a fixed speaking rate. Streaming appears only when the selected model exposes it."}
-                  </div>
-                </div>
-                {supportsVoiceDescription && !requiresVoiceDescriptionOnly ? (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => setShowAdvanced((current) => !current)}
-                  >
-                    <Sparkles className="h-4 w-4" />
-                    {showAdvanced ? "Hide" : "Show"} advanced
-                  </Button>
-                ) : null}
-              </div>
-
-                <div className="mt-4 grid gap-4 sm:grid-cols-[minmax(0,1fr)_320px]">
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between text-sm">
-                      <span className="font-medium text-[var(--text-primary)]">
-                        Speed
-                      </span>
-                      <span className="text-[var(--text-muted)]">
-                        {speed.toFixed(2)}x
-                      </span>
-                    </div>
-                    <Slider
-                      value={[speed]}
-                      min={0.5}
-                      max={1.5}
-                      step={0.05}
-                      onValueChange={([value]) => setSpeed(value ?? 1)}
-                      disabled={!supportsSpeedControl}
-                    />
-                  </div>
-
-                  <label className="flex items-center gap-3 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3.5 py-3 text-sm">
-                    <input
-                      type="checkbox"
-                      checked={streamingEnabled && supportsStreaming}
-                      onChange={(event) =>
-                        setStreamingEnabled(event.target.checked)
-                      }
-                      disabled={!supportsStreaming}
-                      className="h-4 w-4 rounded border-border"
-                    />
-                    <span className="min-w-0 flex-1">
-                      <span className="font-medium text-[var(--text-primary)]">
-                        Stream audio
-                      </span>
-                      <span className="block text-xs text-[var(--text-muted)]">
-                        {supportsStreaming
-                          ? "Play chunks as they arrive."
-                          : "Current model does not expose streaming on this route."}
-                      </span>
-                    </span>
-                    <Radio className="h-4 w-4 text-[var(--text-muted)]" />
-                  </label>
-                </div>
-
-                <AnimatePresence>
-                  {showStylePromptControls ? (
-                    <motion.div
-                      initial={{ opacity: 0, height: 0 }}
-                      animate={{ opacity: 1, height: "auto" }}
-                      exit={{ opacity: 0, height: 0 }}
-                      className="overflow-hidden"
-                    >
-                      <div className="space-y-2 pt-4">
-                        <label className={VOICE_ROUTE_SECTION_LABEL_CLASS}>
-                          {requiresVoiceDescriptionOnly
-                            ? "Voice direction"
-                            : "Style prompt"}
-                        </label>
-                        <Input
-                          value={instructions}
-                          onChange={(event) => setInstructions(event.target.value)}
-                          disabled={!supportsVoiceDescription}
-                          placeholder={
-                            requiresVoiceDescriptionOnly
-                              ? "Required voice direction, for example warm, confident, and conversational"
-                              : supportsVoiceDescription
-                                ? "Optional style guidance such as calm, energetic, or formal"
-                              : "This renderer does not support style prompts"
-                          }
-                        />
-                        {requiresVoiceDescriptionOnly ? (
-                          <p className="text-xs text-[var(--text-muted)]">
-                            This model needs a voice direction prompt before it can render audio.
-                          </p>
-                        ) : null}
-                      </div>
-                    </motion.div>
-                  ) : null}
-                </AnimatePresence>
-              </WorkspacePanel>
-
             <AnimatePresence>
               {error ? (
                 <motion.div
@@ -1208,39 +996,11 @@ export function TextToSpeechWorkspace({
             </AnimatePresence>
 
             <WorkspacePanel className="p-5">
-              <div className="flex flex-wrap items-center gap-3">
-                {(audioUrl || isStreaming) ? (
-                  <Button variant="outline" onClick={handleStop}>
-                    <Square className="h-4 w-4" />
-                    Stop
-                  </Button>
-                ) : null}
-
-                {audioUrl ? (
-                  <>
-                    <Button
-                      variant="outline"
-                      onClick={handleDownload}
-                      disabled={isDownloading}
-                    >
-                      {isDownloading ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : (
-                        <Download className="h-4 w-4" />
-                      )}
-                      Download
-                    </Button>
-                    <Button variant="ghost" onClick={handleReset}>
-                      <RotateCcw className="h-4 w-4" />
-                      Reset
-                    </Button>
-                  </>
-                ) : null}
-
+              <div className="space-y-3">
                 <Button
                   onClick={handleGenerate}
                   disabled={generating || !canGenerate}
-                  className="ml-auto min-w-[190px]"
+                  className="h-11 w-full rounded-2xl"
                 >
                   {generating ? (
                     <>
@@ -1254,6 +1014,53 @@ export function TextToSpeechWorkspace({
                     </>
                   )}
                 </Button>
+
+                {generating || audioUrl ? (
+                  <div className="flex flex-wrap items-center gap-2.5">
+                    {generating ? (
+                      <Button
+                        variant="outline"
+                        onClick={handleStop}
+                        className="h-10 rounded-2xl px-4"
+                      >
+                        <Square className="h-4 w-4" />
+                        Stop
+                      </Button>
+                    ) : null}
+
+                    {audioUrl ? (
+                      <>
+                        <Button
+                          variant="outline"
+                          onClick={handleDownload}
+                          disabled={isDownloading}
+                          className="h-10 rounded-2xl px-4"
+                        >
+                          {isDownloading ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Download className="h-4 w-4" />
+                          )}
+                          Download
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          onClick={handleReset}
+                          className="h-10 px-2 text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+                        >
+                          <RotateCcw className="h-4 w-4" />
+                          Reset
+                        </Button>
+                      </>
+                    ) : null}
+                  </div>
+                ) : null}
+
+                <div className="text-xs text-[var(--text-muted)]">
+                  Shortcut: <span className="app-kbd">Ctrl/Cmd + Enter</span>{" "}
+                  generate, <span className="app-kbd">Esc</span> stop,{" "}
+                  <span className="app-kbd">Shift + Esc</span> reset.
+                </div>
               </div>
 
               {downloadState !== "idle" && downloadMessage ? (
@@ -1279,82 +1086,113 @@ export function TextToSpeechWorkspace({
                 </div>
               ) : null}
 
-              <div className="mt-4 text-xs text-[var(--text-muted)]">
-                Shortcut: <span className="app-kbd">Ctrl/Cmd + Enter</span> generate, <span className="app-kbd">Esc</span> stop, <span className="app-kbd">Shift + Esc</span> reset.
-              </div>
             </WorkspacePanel>
           </div>
 
           <div className="space-y-4">
             <WorkspacePanel className="p-5">
-              <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-3")}>
-                Delivery Controls
+              <div className="flex flex-col gap-3">
+                <div className={cn(VOICE_ROUTE_SECTION_LABEL_CLASS, "mb-0")}>
+                  Delivery Controls
+                </div>
+                <div className={VOICE_ROUTE_BODY_COPY_CLASS}>
+                  {supportsSpeedControl
+                    ? "Speed is saved with the generation history. Streaming appears only when the selected model exposes it."
+                    : "This model uses a fixed speaking rate. Streaming appears only when the selected model exposes it."}
+                </div>
               </div>
-              <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-4">
-                <div className="grid gap-2 text-xs">
-                  <div className="flex items-start justify-between gap-4 rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2.5">
-                    <span className="font-medium text-[var(--text-secondary)]">Model</span>
-                    <span className="max-w-[62%] text-right font-medium text-[var(--text-primary)]">
-                      {selectedOption?.label || "No model selected"}
+
+              <div className="mt-5 space-y-4">
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between text-sm">
+                    <span className="font-medium text-[var(--text-primary)]">
+                      Speed
+                    </span>
+                    <span className="text-[var(--text-muted)]">
+                      {speed.toFixed(2)}x
                     </span>
                   </div>
-                  <div className="flex items-start justify-between gap-4 rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2.5">
-                    <span className="font-medium text-[var(--text-secondary)]">Voice mode</span>
-                    <span className="max-w-[62%] text-right font-medium text-[var(--text-primary)]">
-                      {requiresVoiceDescriptionOnly
-                        ? "Voice direction prompt"
-                        : voiceMode === "saved"
-                          ? "Saved voice"
-                          : "Built-in voice"}
+                  <Slider
+                    value={[speed]}
+                    min={0.5}
+                    max={1.5}
+                    step={0.05}
+                    onValueChange={([value]) => setSpeed(value ?? 1)}
+                    disabled={!supportsSpeedControl}
+                  />
+                </div>
+
+                <label className="grid grid-cols-[16px_minmax(0,1fr)] items-start gap-x-3 border-t border-[var(--border-muted)] pt-3">
+                  <input
+                    type="checkbox"
+                    checked={streamingEnabled && supportsStreaming}
+                    onChange={(event) =>
+                      setStreamingEnabled(event.target.checked)
+                    }
+                    disabled={!supportsStreaming}
+                    className="app-checkbox mt-0.5 h-4 w-4 shrink-0 self-start"
+                  />
+                  <span className="min-w-0">
+                    <span className="block font-medium leading-5 text-[var(--text-primary)]">
+                      Stream audio
                     </span>
-                  </div>
-                  <div className="flex items-start justify-between gap-4 rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2.5">
-                    <span className="font-medium text-[var(--text-secondary)]">Selected voice</span>
-                    <span className="max-w-[62%] text-right font-medium text-[var(--text-primary)]">
-                      {requiresVoiceDescriptionOnly
-                        ? "Controlled by prompt"
-                        : selectedVoiceItem?.name || "No voice selected"}
-                    </span>
-                  </div>
-                  <div className="flex items-start justify-between gap-4 rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2.5">
-                    <span className="font-medium text-[var(--text-secondary)]">Speed</span>
-                    <span className="max-w-[62%] text-right font-medium text-[var(--text-primary)]">
-                      {supportsSpeedControl ? `${speed.toFixed(2)}x` : "Fixed by model"}
-                    </span>
-                  </div>
-                  <div className="flex items-start justify-between gap-4 rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2.5">
-                    <span className="font-medium text-[var(--text-secondary)]">Streaming</span>
-                    <span className="max-w-[62%] text-right font-medium text-[var(--text-primary)]">
+                    <span className="mt-0.5 block text-xs leading-4 text-[var(--text-muted)]">
                       {supportsStreaming
-                        ? streamingEnabled
-                          ? "Enabled"
-                          : "Disabled"
-                        : "Not supported"}
+                        ? "Play chunks as they arrive."
+                        : "Current model does not expose streaming on this route."}
                     </span>
-                  </div>
-                  {supportsVoiceDescription ? (
-                    <div className="flex items-start justify-between gap-4 rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2.5">
-                      <span className="font-medium text-[var(--text-secondary)]">
+                  </span>
+                </label>
+              </div>
+
+              {supportsVoiceDescription && !requiresVoiceDescriptionOnly ? (
+                <div className="mt-4 flex justify-end">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setShowAdvanced((current) => !current)}
+                  >
+                    <Sparkles className="h-4 w-4" />
+                    {showAdvanced ? "Hide" : "Show"} advanced
+                  </Button>
+                </div>
+              ) : null}
+
+              <AnimatePresence>
+                {showStylePromptControls ? (
+                  <motion.div
+                    initial={{ opacity: 0, height: 0 }}
+                    animate={{ opacity: 1, height: "auto" }}
+                    exit={{ opacity: 0, height: 0 }}
+                    className="overflow-hidden"
+                  >
+                    <div className="space-y-2 pt-4">
+                      <label className={VOICE_ROUTE_SECTION_LABEL_CLASS}>
                         {requiresVoiceDescriptionOnly
                           ? "Voice direction"
                           : "Style prompt"}
-                      </span>
-                      <span className="max-w-[62%] text-right font-medium text-[var(--text-primary)]">
-                        {instructions.trim() ? "Configured" : "Not set"}
-                      </span>
+                      </label>
+                      <Input
+                        value={instructions}
+                        onChange={(event) => setInstructions(event.target.value)}
+                        disabled={!supportsVoiceDescription}
+                        placeholder={
+                          requiresVoiceDescriptionOnly
+                            ? "Required voice direction, for example warm, confident, and conversational"
+                            : supportsVoiceDescription
+                              ? "Optional style guidance such as calm, energetic, or formal"
+                              : "This renderer does not support style prompts"
+                        }
+                      />
+                      {requiresVoiceDescriptionOnly ? (
+                        <p className="text-xs text-[var(--text-muted)]">
+                          This model needs a voice direction prompt before it can render audio.
+                        </p>
+                      ) : null}
                     </div>
-                  ) : null}
-                  <div className="flex items-start justify-between gap-4 rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2.5">
-                    <span className="font-medium text-[var(--text-secondary)]">Voice support</span>
-                    <span className="max-w-[62%] text-right font-medium text-[var(--text-primary)]">
-                      {voiceAvailabilitySummary}
-                    </span>
-                  </div>
-                </div>
-                <p className={cn(VOICE_ROUTE_BODY_COPY_CLASS, "mt-3")}>
-                  {compatibilityNotice}
-                </p>
-              </div>
+                  </motion.div>
+                ) : null}
+              </AnimatePresence>
             </WorkspacePanel>
 
             <WorkspacePanel className="p-5">
