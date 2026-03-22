@@ -1992,7 +1992,7 @@ export function StudioWorkspace({
     </Button>
   );
 
-  const projectLibraryPanel = (
+  const projectLibraryFilters = (
     <Card className="rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-4 shadow-none sm:p-5">
       <div className="flex items-start justify-between gap-3">
         <div>
@@ -2002,15 +2002,11 @@ export function StudioWorkspace({
           <div className="mt-1 text-base font-semibold text-[var(--text-primary)]">
             {projects.length} project{projects.length === 1 ? "" : "s"}
           </div>
-          <p className="mt-1 text-xs leading-relaxed text-[var(--text-muted)]">
-            Browse, filter, and jump into long-form narration projects without leaving the page.
-          </p>
         </div>
         <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-2 text-[var(--text-muted)]">
           <Library className="h-4 w-4" />
         </div>
       </div>
-
       <div className="mt-4 space-y-2 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3">
         <Input
           value={projectSearch}
@@ -2018,7 +2014,7 @@ export function StudioWorkspace({
           placeholder="Search projects, models, or tags"
           className="bg-[var(--bg-surface-0)]"
         />
-        <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
+        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
           <Select
             value={projectStatusFilter}
             onValueChange={(value) =>
@@ -2049,158 +2045,20 @@ export function StudioWorkspace({
               <SelectItem value="progress">Sort: Progress</SelectItem>
             </SelectContent>
           </Select>
+          <Select value={projectFolderFilter} onValueChange={setProjectFolderFilter}>
+            <SelectTrigger className="h-9 w-full bg-[var(--bg-surface-0)] px-2 text-xs">
+              <SelectValue placeholder="All folders" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All folders</SelectItem>
+              {projectFolders.map((folder) => (
+                <SelectItem key={folder.id} value={folder.id}>
+                  {folder.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
-        <Select value={projectFolderFilter} onValueChange={setProjectFolderFilter}>
-          <SelectTrigger className="h-9 w-full bg-[var(--bg-surface-0)] px-2 text-xs">
-            <SelectValue placeholder="All folders" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All folders</SelectItem>
-            {projectFolders.map((folder) => (
-              <SelectItem key={folder.id} value={folder.id}>
-                {folder.name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
-
-      <div className="mt-4 space-y-2.5">
-        {projectsLoading ? (
-          <div className="flex items-center gap-2 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            Loading projects...
-          </div>
-        ) : projects.length === 0 ? (
-          <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-3 text-xs text-[var(--text-muted)]">
-            No projects yet. Create a project to start segmenting and rendering.
-          </div>
-        ) : (
-          <div className="max-h-[34rem] space-y-2.5 overflow-y-auto pr-1">
-            {visibleProjects.length === 0 ? (
-              <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-3 text-xs text-[var(--text-muted)]">
-                No projects match the current search or filters.
-              </div>
-            ) : null}
-            {visibleProjects.map((project) => {
-              const isActive = project.id === selectedProjectId;
-              const meta = projectMetaById[project.id];
-              const folderName = meta?.folder_id ? folderNameById[meta.folder_id] : null;
-              const progressPercent =
-                project.segment_count > 0
-                  ? Math.round((project.rendered_segment_count / project.segment_count) * 100)
-                  : 0;
-              const completionLabel = `${project.rendered_segment_count}/${project.segment_count} rendered`;
-              const projectStatus =
-                progressPercent >= 100
-                  ? "Ready"
-                  : project.rendered_segment_count > 0
-                    ? "In progress"
-                    : "Not rendered";
-              return (
-                <div
-                  key={project.id}
-                  role="button"
-                  tabIndex={0}
-                  onClick={() => {
-                    setSelectedProjectId(project.id);
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.currentTarget !== event.target) {
-                      return;
-                    }
-                    if (event.key === "Enter" || event.key === " ") {
-                      event.preventDefault();
-                      setSelectedProjectId(project.id);
-                    }
-                  }}
-                  className={cn(
-                    "group rounded-xl border p-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-                    isActive
-                      ? "border-[var(--accent-soft-border)] bg-[var(--accent-soft-bg)]"
-                      : "border-[var(--border-muted)] bg-[var(--bg-surface-1)] hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-0)]",
-                  )}
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="truncate text-sm font-semibold text-[var(--text-primary)]">
-                      {project.name}
-                    </span>
-                    <div className="inline-flex items-center gap-1.5 shrink-0">
-                      <span className="text-[11px] text-[var(--text-muted)]">
-                        {formatRelativeDate(project.updated_at)}
-                      </span>
-                      <button
-                        type="button"
-                        onPointerDown={(event) => {
-                          event.stopPropagation();
-                        }}
-                        onClick={(event) => {
-                          event.preventDefault();
-                          event.stopPropagation();
-                          openDeleteProjectConfirm(project.id, project.name);
-                        }}
-                        className="app-sidebar-delete-btn"
-                        title="Delete project"
-                        aria-label={`Delete project ${project.name}`}
-                        disabled={deletingProject}
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[10px] font-medium uppercase tracking-[0.12em]">
-                    <span
-                      className={cn(
-                        "rounded-full border px-2 py-0.5",
-                        progressPercent >= 100
-                          ? "border-[var(--status-positive-border)] bg-[var(--status-positive-bg)] text-[var(--status-positive-text)]"
-                          : "border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] text-[var(--status-warning-text)]",
-                      )}
-                    >
-                      {projectStatus}
-                    </span>
-                    {folderName ? (
-                      <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2 py-0.5 text-[var(--text-muted)]">
-                        {folderName}
-                      </span>
-                    ) : null}
-                  </div>
-
-                  <div className="mt-3 flex items-center gap-2">
-                    <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-[var(--bg-surface-3)]">
-                      <div
-                        className="h-full rounded-full bg-[var(--accent-solid)] transition-[width] duration-300"
-                        style={{ width: `${progressPercent}%` }}
-                      />
-                    </div>
-                    <span className="text-[11px] text-[var(--text-muted)]">
-                      {progressPercent}%
-                    </span>
-                  </div>
-
-                  <div className="mt-2 flex items-center justify-between text-xs text-[var(--text-muted)]">
-                    <span>{completionLabel}</span>
-                    <span>{project.total_chars} chars</span>
-                  </div>
-
-                  <p
-                    className="mt-2 text-xs text-[var(--text-secondary)]"
-                    style={{
-                      display: "-webkit-box",
-                      WebkitLineClamp: 2,
-                      WebkitBoxOrient: "vertical",
-                      overflow: "hidden",
-                    }}
-                  >
-                    {project.model_id || "No model selected"}
-                    {meta?.tags?.length ? ` · ${meta.tags.slice(0, 2).join(" · ")}` : ""}
-                  </p>
-                </div>
-              );
-            })}
-          </div>
-        )}
       </div>
     </Card>
   );
@@ -2571,60 +2429,166 @@ export function StudioWorkspace({
           </div>
         ) : null}
 
-        <div className="grid gap-5 xl:grid-cols-[360px_minmax(0,1fr)]">
-          <aside className="xl:sticky xl:top-4 xl:self-start">
-            {projectLibraryPanel}
-          </aside>
-          <div className="min-w-0">
-        {!selectedProject ? (
-          <div className="bg-[var(--bg-surface-0)] p-8 sm:p-10">
-            <div className="flex min-h-[620px] flex-col items-center justify-center gap-6 text-center">
-              <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
-                <FileAudio className="h-6 w-6 text-[var(--text-muted)]" />
+        {!activeProjectId ? (
+          <div className="space-y-5">
+            {projectLibraryFilters}
+
+            {projectsLoading ? (
+              <div className="flex items-center gap-2 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                Loading projects...
               </div>
-              <div className="space-y-2">
-                <p className="text-xl font-semibold text-[var(--text-primary)]">
-                  Select or create a TTS project
-                </p>
-                <p className="max-w-xl text-sm leading-relaxed text-[var(--text-secondary)]">
-                  Projects keep script segments, global render settings, per-segment
-                  progress, and merged export in one place.
-                </p>
+            ) : projects.length === 0 ? (
+              <div className="bg-[var(--bg-surface-0)] p-8 sm:p-10">
+                <div className="flex min-h-[420px] flex-col items-center justify-center gap-6 text-center">
+                  <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4">
+                    <FileAudio className="h-6 w-6 text-[var(--text-muted)]" />
+                  </div>
+                  <div className="space-y-2">
+                    <p className="text-xl font-semibold text-[var(--text-primary)]">
+                      Create your first Studio project
+                    </p>
+                    <p className="max-w-xl text-sm leading-relaxed text-[var(--text-secondary)]">
+                      Projects keep script segments, voice settings, render progress,
+                      and export workflow in one place.
+                    </p>
+                  </div>
+                  <Button onClick={openCreateProjectDialog}>
+                    <FilePlus2 className="h-4 w-4" />
+                    New project
+                  </Button>
+                </div>
               </div>
-              <div className="flex flex-wrap items-center justify-center gap-3">
-                <Button onClick={openCreateProjectDialog}>
-                  <FilePlus2 className="h-4 w-4" />
-                  New project
-                </Button>
+            ) : visibleProjects.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-4 text-sm text-[var(--text-muted)]">
+                No projects match the current search or filters.
               </div>
-              <div className="grid w-full max-w-3xl gap-3 sm:grid-cols-3">
-                <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-4 text-left">
-                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                    Create
-                  </div>
-                  <div className="mt-2 text-sm text-[var(--text-secondary)]">
-                    Import or paste a script and let Izwi split it into editable blocks.
-                  </div>
-                </div>
-                <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-4 text-left">
-                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                    Configure
-                  </div>
-                  <div className="mt-2 text-sm text-[var(--text-secondary)]">
-                    Assign a project model, voice, and speed before rendering.
-                  </div>
-                </div>
-                <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-4 py-4 text-left">
-                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                    Export
-                  </div>
-                  <div className="mt-2 text-sm text-[var(--text-secondary)]">
-                    Render individual segments or all at once, then export merged audio.
-                  </div>
-                </div>
+            ) : (
+              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+                {visibleProjects.map((project) => {
+                  const meta = projectMetaById[project.id];
+                  const folderName = meta?.folder_id ? folderNameById[meta.folder_id] : null;
+                  const progressPercent =
+                    project.segment_count > 0
+                      ? Math.round(
+                          (project.rendered_segment_count / project.segment_count) * 100,
+                        )
+                      : 0;
+                  const completionLabel = `${project.rendered_segment_count}/${project.segment_count} rendered`;
+                  const projectStatus =
+                    progressPercent >= 100
+                      ? "Ready"
+                      : project.rendered_segment_count > 0
+                        ? "In progress"
+                        : "Not rendered";
+                  return (
+                    <Card
+                      key={project.id}
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => {
+                        setSelectedProjectId(project.id);
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.currentTarget !== event.target) {
+                          return;
+                        }
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          setSelectedProjectId(project.id);
+                        }
+                      }}
+                      className="group rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-4 text-left shadow-none transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-1)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <h3 className="truncate text-base font-semibold text-[var(--text-primary)]">
+                          {project.name}
+                        </h3>
+                        <button
+                          type="button"
+                          onPointerDown={(event) => {
+                            event.stopPropagation();
+                          }}
+                          onClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            openDeleteProjectConfirm(project.id, project.name);
+                          }}
+                          className="app-sidebar-delete-btn"
+                          title="Delete project"
+                          aria-label={`Delete project ${project.name}`}
+                          disabled={deletingProject}
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+
+                      <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[10px] font-medium uppercase tracking-[0.12em]">
+                        <span
+                          className={cn(
+                            "rounded-full border px-2 py-0.5",
+                            progressPercent >= 100
+                              ? "border-[var(--status-positive-border)] bg-[var(--status-positive-bg)] text-[var(--status-positive-text)]"
+                              : "border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] text-[var(--status-warning-text)]",
+                          )}
+                        >
+                          {projectStatus}
+                        </span>
+                        {folderName ? (
+                          <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2 py-0.5 text-[var(--text-muted)]">
+                            {folderName}
+                          </span>
+                        ) : null}
+                      </div>
+
+                      <div className="mt-3 flex items-center gap-2">
+                        <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-[var(--bg-surface-3)]">
+                          <div
+                            className="h-full rounded-full bg-[var(--accent-solid)] transition-[width] duration-300"
+                            style={{ width: `${progressPercent}%` }}
+                          />
+                        </div>
+                        <span className="text-[11px] text-[var(--text-muted)]">
+                          {progressPercent}%
+                        </span>
+                      </div>
+
+                      <div className="mt-2 flex items-center justify-between text-xs text-[var(--text-muted)]">
+                        <span>{completionLabel}</span>
+                        <span>{project.total_chars} chars</span>
+                      </div>
+
+                      <p className="mt-2 line-clamp-2 text-xs text-[var(--text-secondary)]">
+                        {project.model_id || "No model selected"}
+                        {meta?.tags?.length ? ` · ${meta.tags.slice(0, 2).join(" · ")}` : ""}
+                      </p>
+                      <div className="mt-3 text-[11px] text-[var(--text-muted)]">
+                        Updated {formatRelativeDate(project.updated_at)}
+                      </div>
+                    </Card>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        ) : !selectedProject ? (
+          <Card className="rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-6 shadow-none">
+            <div className="flex flex-col items-start gap-3">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => onNavigateProject?.(null)}
+                className="h-8 px-2 text-xs text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+              >
+                <ChevronLeft className="h-3.5 w-3.5" />
+                Back to Studio
+              </Button>
+              <div className="text-sm text-[var(--text-muted)]">
+                {projectLoading ? "Loading project..." : "Project not found."}
               </div>
             </div>
-          </div>
+          </Card>
         ) : (
           <StudioWorkspaceScaffold
             library={
@@ -3545,8 +3509,6 @@ export function StudioWorkspace({
             }
           />
         )}
-          </div>
-        </div>
       </div>
     </>
   );
