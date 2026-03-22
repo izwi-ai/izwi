@@ -9,6 +9,10 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route(
+            "/tts-project-folders",
+            get(handlers::list_tts_project_folders).post(handlers::create_tts_project_folder),
+        )
+        .route(
             "/tts-projects",
             get(handlers::list_tts_projects).post(handlers::create_tts_project),
         )
@@ -21,6 +25,36 @@ pub fn router() -> Router<AppState> {
         .route(
             "/tts-projects/:project_id/audio",
             get(handlers::get_tts_project_audio),
+        )
+        .route(
+            "/tts-projects/:project_id/meta",
+            get(handlers::get_tts_project_meta).patch(handlers::upsert_tts_project_meta),
+        )
+        .route(
+            "/tts-projects/:project_id/pronunciations",
+            get(handlers::list_tts_project_pronunciations)
+                .post(handlers::create_tts_project_pronunciation),
+        )
+        .route(
+            "/tts-projects/:project_id/pronunciations/:pronunciation_id",
+            axum::routing::delete(handlers::delete_tts_project_pronunciation),
+        )
+        .route(
+            "/tts-projects/:project_id/snapshots",
+            get(handlers::list_tts_project_snapshots).post(handlers::create_tts_project_snapshot),
+        )
+        .route(
+            "/tts-projects/:project_id/snapshots/:snapshot_id/restore",
+            axum::routing::post(handlers::restore_tts_project_snapshot),
+        )
+        .route(
+            "/tts-projects/:project_id/render-jobs",
+            get(handlers::list_tts_project_render_jobs)
+                .post(handlers::create_tts_project_render_job),
+        )
+        .route(
+            "/tts-projects/:project_id/render-jobs/:job_id",
+            axum::routing::patch(handlers::update_tts_project_render_job),
         )
         .route(
             "/tts-projects/:project_id/segments/:segment_id",

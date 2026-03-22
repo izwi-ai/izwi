@@ -219,6 +219,13 @@ export interface SavedVoiceCreateRequest {
 }
 
 export type TtsProjectVoiceMode = "built_in" | "saved";
+export type TtsProjectExportFormat = "wav" | "mp3" | "flac";
+export type TtsProjectRenderJobStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled";
 
 export interface TtsProjectSummary {
   id: string;
@@ -291,6 +298,85 @@ export interface TtsProjectSegmentUpdateRequest {
 export interface TtsProjectSegmentSplitRequest {
   before_text: string;
   after_text: string;
+}
+
+export interface TtsProjectFolderRecord {
+  id: string;
+  created_at: number;
+  updated_at: number;
+  name: string;
+  parent_id: string | null;
+  sort_order: number;
+}
+
+export interface TtsProjectFolderCreateRequest {
+  name: string;
+  parent_id?: string;
+  sort_order?: number;
+}
+
+export interface TtsProjectMetaRecord {
+  project_id: string;
+  folder_id: string | null;
+  tags: string[];
+  default_export_format: TtsProjectExportFormat;
+  last_render_job_id: string | null;
+  last_rendered_at: number | null;
+}
+
+export interface TtsProjectMetaUpdateRequest {
+  folder_id?: string;
+  tags?: string[];
+  default_export_format?: TtsProjectExportFormat;
+  last_render_job_id?: string;
+  last_rendered_at?: number;
+}
+
+export interface TtsProjectPronunciationRecord {
+  id: string;
+  project_id: string;
+  source_text: string;
+  replacement_text: string;
+  locale: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface TtsProjectPronunciationCreateRequest {
+  source_text: string;
+  replacement_text: string;
+  locale?: string;
+}
+
+export interface TtsProjectSnapshotRecord {
+  id: string;
+  project_id: string;
+  created_at: number;
+  label: string | null;
+  project_name: string;
+}
+
+export interface TtsProjectSnapshotCreateRequest {
+  label?: string;
+}
+
+export interface TtsProjectRenderJobRecord {
+  id: string;
+  project_id: string;
+  created_at: number;
+  updated_at: number;
+  status: TtsProjectRenderJobStatus;
+  error_message: string | null;
+  queued_segment_ids: string[];
+}
+
+export interface TtsProjectRenderJobCreateRequest {
+  queued_segment_ids?: string[];
+}
+
+export interface TtsProjectRenderJobUpdateRequest {
+  status?: TtsProjectRenderJobStatus;
+  error_message?: string;
 }
 
 export interface STTRequest {
@@ -746,12 +832,50 @@ export class AudioApiClient {
     return "/tts-projects";
   }
 
+  private ttsProjectFoldersPath(): string {
+    return "/tts-project-folders";
+  }
+
   private ttsProjectPath(projectId: string): string {
     return `${this.ttsProjectsCollectionPath()}/${encodeURIComponent(projectId)}`;
   }
 
+  private ttsProjectMetaPath(projectId: string): string {
+    return `${this.ttsProjectPath(projectId)}/meta`;
+  }
+
   private ttsProjectSegmentPath(projectId: string, segmentId: string): string {
     return `${this.ttsProjectPath(projectId)}/segments/${encodeURIComponent(segmentId)}`;
+  }
+
+  private ttsProjectPronunciationsPath(projectId: string): string {
+    return `${this.ttsProjectPath(projectId)}/pronunciations`;
+  }
+
+  private ttsProjectPronunciationPath(
+    projectId: string,
+    pronunciationId: string,
+  ): string {
+    return `${this.ttsProjectPronunciationsPath(projectId)}/${encodeURIComponent(pronunciationId)}`;
+  }
+
+  private ttsProjectSnapshotsPath(projectId: string): string {
+    return `${this.ttsProjectPath(projectId)}/snapshots`;
+  }
+
+  private ttsProjectSnapshotRestorePath(
+    projectId: string,
+    snapshotId: string,
+  ): string {
+    return `${this.ttsProjectSnapshotsPath(projectId)}/${encodeURIComponent(snapshotId)}/restore`;
+  }
+
+  private ttsProjectRenderJobsPath(projectId: string): string {
+    return `${this.ttsProjectPath(projectId)}/render-jobs`;
+  }
+
+  private ttsProjectRenderJobPath(projectId: string, jobId: string): string {
+    return `${this.ttsProjectRenderJobsPath(projectId)}/${encodeURIComponent(jobId)}`;
   }
 
   private buildSpeechHistoryRecordCreateBody(
@@ -1237,6 +1361,149 @@ export class AudioApiClient {
   ): Promise<{ id: string; deleted: boolean }> {
     return this.http.request(this.ttsProjectPath(projectId), {
       method: "DELETE",
+    });
+  }
+
+  async listTtsProjectFolders(): Promise<TtsProjectFolderRecord[]> {
+    const payload = await this.http.request<{
+      folders: TtsProjectFolderRecord[];
+    }>(this.ttsProjectFoldersPath());
+    return payload.folders ?? [];
+  }
+
+  async createTtsProjectFolder(
+    request: TtsProjectFolderCreateRequest,
+  ): Promise<TtsProjectFolderRecord> {
+    return this.http.request(this.ttsProjectFoldersPath(), {
+      method: "POST",
+      body: JSON.stringify({
+        name: request.name,
+        parent_id: request.parent_id,
+        sort_order: request.sort_order,
+      }),
+    });
+  }
+
+  async getTtsProjectMeta(projectId: string): Promise<TtsProjectMetaRecord> {
+    return this.http.request(this.ttsProjectMetaPath(projectId));
+  }
+
+  async updateTtsProjectMeta(
+    projectId: string,
+    request: TtsProjectMetaUpdateRequest,
+  ): Promise<TtsProjectMetaRecord> {
+    return this.http.request(this.ttsProjectMetaPath(projectId), {
+      method: "PATCH",
+      body: JSON.stringify({
+        folder_id: request.folder_id,
+        tags: request.tags,
+        default_export_format: request.default_export_format,
+        last_render_job_id: request.last_render_job_id,
+        last_rendered_at: request.last_rendered_at,
+      }),
+    });
+  }
+
+  async listTtsProjectPronunciations(
+    projectId: string,
+  ): Promise<TtsProjectPronunciationRecord[]> {
+    const payload = await this.http.request<{
+      entries: TtsProjectPronunciationRecord[];
+    }>(this.ttsProjectPronunciationsPath(projectId));
+    return payload.entries ?? [];
+  }
+
+  async createTtsProjectPronunciation(
+    projectId: string,
+    request: TtsProjectPronunciationCreateRequest,
+  ): Promise<TtsProjectPronunciationRecord> {
+    return this.http.request(this.ttsProjectPronunciationsPath(projectId), {
+      method: "POST",
+      body: JSON.stringify({
+        source_text: request.source_text,
+        replacement_text: request.replacement_text,
+        locale: request.locale,
+      }),
+    });
+  }
+
+  async deleteTtsProjectPronunciation(
+    projectId: string,
+    pronunciationId: string,
+  ): Promise<{ id: string; deleted: boolean }> {
+    return this.http.request(
+      this.ttsProjectPronunciationPath(projectId, pronunciationId),
+      {
+        method: "DELETE",
+      },
+    );
+  }
+
+  async listTtsProjectSnapshots(
+    projectId: string,
+  ): Promise<TtsProjectSnapshotRecord[]> {
+    const payload = await this.http.request<{
+      snapshots: TtsProjectSnapshotRecord[];
+    }>(this.ttsProjectSnapshotsPath(projectId));
+    return payload.snapshots ?? [];
+  }
+
+  async createTtsProjectSnapshot(
+    projectId: string,
+    request?: TtsProjectSnapshotCreateRequest,
+  ): Promise<TtsProjectSnapshotRecord> {
+    return this.http.request(this.ttsProjectSnapshotsPath(projectId), {
+      method: "POST",
+      body: JSON.stringify({
+        label: request?.label,
+      }),
+    });
+  }
+
+  async restoreTtsProjectSnapshot(
+    projectId: string,
+    snapshotId: string,
+  ): Promise<TtsProjectRecord> {
+    return this.http.request(
+      this.ttsProjectSnapshotRestorePath(projectId, snapshotId),
+      {
+        method: "POST",
+      },
+    );
+  }
+
+  async listTtsProjectRenderJobs(
+    projectId: string,
+  ): Promise<TtsProjectRenderJobRecord[]> {
+    const payload = await this.http.request<{
+      jobs: TtsProjectRenderJobRecord[];
+    }>(this.ttsProjectRenderJobsPath(projectId));
+    return payload.jobs ?? [];
+  }
+
+  async createTtsProjectRenderJob(
+    projectId: string,
+    request?: TtsProjectRenderJobCreateRequest,
+  ): Promise<TtsProjectRenderJobRecord> {
+    return this.http.request(this.ttsProjectRenderJobsPath(projectId), {
+      method: "POST",
+      body: JSON.stringify({
+        queued_segment_ids: request?.queued_segment_ids ?? [],
+      }),
+    });
+  }
+
+  async updateTtsProjectRenderJob(
+    projectId: string,
+    jobId: string,
+    request: TtsProjectRenderJobUpdateRequest,
+  ): Promise<TtsProjectRenderJobRecord> {
+    return this.http.request(this.ttsProjectRenderJobPath(projectId, jobId), {
+      method: "PATCH",
+      body: JSON.stringify({
+        status: request.status,
+        error_message: request.error_message,
+      }),
     });
   }
 

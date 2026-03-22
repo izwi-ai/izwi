@@ -11,9 +11,14 @@ use crate::api::speech_history::{synthesize_record, CreateSpeechHistoryRecordReq
 use crate::error::ApiError;
 use crate::speech_history_store::{SpeechRouteKind, StoredSpeechAudio};
 use crate::state::AppState;
-use crate::tts_project_store::{
-    NewTtsProjectRecord, NewTtsProjectSegment, TtsProjectRecord, TtsProjectSegmentRecord,
+use crate::studio_store::{
+    NewTtsProjectFolderRecord, NewTtsProjectPronunciationRecord, NewTtsProjectRecord,
+    NewTtsProjectRenderJobRecord, NewTtsProjectSegment, NewTtsProjectSnapshotRecord,
+    TtsProjectExportFormat, TtsProjectFolderRecord, TtsProjectMetaRecord,
+    TtsProjectPronunciationRecord, TtsProjectRecord, TtsProjectRenderJobRecord,
+    TtsProjectRenderJobStatus, TtsProjectSegmentRecord, TtsProjectSnapshotRecord,
     TtsProjectSummary, TtsProjectVoiceMode, UpdateTtsProjectRecord,
+    UpdateTtsProjectRenderJobRecord, UpsertTtsProjectMetaRecord,
 };
 use izwi_core::audio::{AudioEncoder, AudioFormat};
 use izwi_core::parse_tts_model_variant;
@@ -82,15 +87,347 @@ pub struct SplitTtsProjectSegmentRequest {
     pub after_text: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct TtsProjectFolderListResponse {
+    pub folders: Vec<TtsProjectFolderRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateTtsProjectFolderRequest {
+    pub name: String,
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub sort_order: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TtsProjectPronunciationListResponse {
+    pub entries: Vec<TtsProjectPronunciationRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateTtsProjectPronunciationRequest {
+    pub source_text: String,
+    pub replacement_text: String,
+    #[serde(default)]
+    pub locale: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeleteTtsProjectPronunciationResponse {
+    pub id: String,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TtsProjectSnapshotListResponse {
+    pub snapshots: Vec<TtsProjectSnapshotRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateTtsProjectSnapshotRequest {
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct UpsertTtsProjectMetaRequest {
+    #[serde(default)]
+    pub folder_id: Option<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub default_export_format: Option<TtsProjectExportFormat>,
+    #[serde(default)]
+    pub last_render_job_id: Option<String>,
+    #[serde(default)]
+    pub last_rendered_at: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TtsProjectRenderJobListResponse {
+    pub jobs: Vec<TtsProjectRenderJobRecord>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct CreateTtsProjectRenderJobRequest {
+    #[serde(default)]
+    pub queued_segment_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct UpdateTtsProjectRenderJobRequest {
+    #[serde(default)]
+    pub status: Option<TtsProjectRenderJobStatus>,
+    #[serde(default)]
+    pub error_message: Option<String>,
+}
+
 pub async fn list_tts_projects(
     State(state): State<AppState>,
 ) -> Result<Json<TtsProjectListResponse>, ApiError> {
     let projects = state
-        .tts_project_store
+        .studio_store
         .list_projects(PROJECT_LIST_LIMIT)
         .await
         .map_err(map_store_error)?;
     Ok(Json(TtsProjectListResponse { projects }))
+}
+
+pub async fn list_tts_project_folders(
+    State(state): State<AppState>,
+) -> Result<Json<TtsProjectFolderListResponse>, ApiError> {
+    let folders = state
+        .studio_store
+        .list_folders()
+        .await
+        .map_err(map_store_error)?;
+    Ok(Json(TtsProjectFolderListResponse { folders }))
+}
+
+pub async fn create_tts_project_folder(
+    State(state): State<AppState>,
+    Json(req): Json<CreateTtsProjectFolderRequest>,
+) -> Result<Json<TtsProjectFolderRecord>, ApiError> {
+    let name = required_trimmed(Some(req.name.as_str()), "name")?;
+    let folder = state
+        .studio_store
+        .create_folder(NewTtsProjectFolderRecord {
+            name,
+            parent_id: normalize_optional_trimmed(req.parent_id),
+            sort_order: req.sort_order,
+        })
+        .await
+        .map_err(map_store_error)?;
+    Ok(Json(folder))
+}
+
+pub async fn get_tts_project_meta(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<TtsProjectMetaRecord>, ApiError> {
+    if let Some(meta) = state
+        .studio_store
+        .get_project_meta(project_id.clone())
+        .await
+        .map_err(map_store_error)?
+    {
+        return Ok(Json(meta));
+    }
+    let meta = state
+        .studio_store
+        .upsert_project_meta(project_id, UpsertTtsProjectMetaRecord::default())
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("TTS project not found"))?;
+    Ok(Json(meta))
+}
+
+pub async fn upsert_tts_project_meta(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<UpsertTtsProjectMetaRequest>,
+) -> Result<Json<TtsProjectMetaRecord>, ApiError> {
+    let folder_id_update = req.folder_id.map(|value| {
+        let trimmed = value.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    });
+    let tags = req.tags.map(|entries| {
+        entries
+            .into_iter()
+            .map(|entry| entry.trim().to_string())
+            .filter(|entry| !entry.is_empty())
+            .collect::<Vec<_>>()
+    });
+    let last_render_job_id_update = req.last_render_job_id.map(|value| {
+        let trimmed = value.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    });
+    let last_rendered_at_update = req.last_rendered_at.map(Some);
+
+    let meta = state
+        .studio_store
+        .upsert_project_meta(
+            project_id,
+            UpsertTtsProjectMetaRecord {
+                folder_id: folder_id_update,
+                tags,
+                default_export_format: req.default_export_format,
+                last_render_job_id: last_render_job_id_update,
+                last_rendered_at: last_rendered_at_update,
+            },
+        )
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("TTS project not found"))?;
+    Ok(Json(meta))
+}
+
+pub async fn list_tts_project_pronunciations(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<TtsProjectPronunciationListResponse>, ApiError> {
+    let entries = state
+        .studio_store
+        .list_project_pronunciations(project_id)
+        .await
+        .map_err(map_store_error)?;
+    Ok(Json(TtsProjectPronunciationListResponse { entries }))
+}
+
+pub async fn create_tts_project_pronunciation(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<CreateTtsProjectPronunciationRequest>,
+) -> Result<Json<TtsProjectPronunciationRecord>, ApiError> {
+    let source_text = required_trimmed(Some(req.source_text.as_str()), "source_text")?;
+    let replacement_text =
+        required_trimmed(Some(req.replacement_text.as_str()), "replacement_text")?;
+    let entry = state
+        .studio_store
+        .create_project_pronunciation(
+            project_id,
+            NewTtsProjectPronunciationRecord {
+                source_text,
+                replacement_text,
+                locale: normalize_optional_trimmed(req.locale),
+            },
+        )
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("TTS project not found"))?;
+    Ok(Json(entry))
+}
+
+pub async fn delete_tts_project_pronunciation(
+    State(state): State<AppState>,
+    Path((project_id, pronunciation_id)): Path<(String, String)>,
+) -> Result<Json<DeleteTtsProjectPronunciationResponse>, ApiError> {
+    let deleted = state
+        .studio_store
+        .delete_project_pronunciation(project_id, pronunciation_id.clone())
+        .await
+        .map_err(map_store_error)?;
+    if !deleted {
+        return Err(ApiError::not_found("TTS project pronunciation not found"));
+    }
+    Ok(Json(DeleteTtsProjectPronunciationResponse {
+        id: pronunciation_id,
+        deleted: true,
+    }))
+}
+
+pub async fn list_tts_project_snapshots(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<TtsProjectSnapshotListResponse>, ApiError> {
+    let snapshots = state
+        .studio_store
+        .list_project_snapshots(project_id)
+        .await
+        .map_err(map_store_error)?;
+    Ok(Json(TtsProjectSnapshotListResponse { snapshots }))
+}
+
+pub async fn create_tts_project_snapshot(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<CreateTtsProjectSnapshotRequest>,
+) -> Result<Json<TtsProjectSnapshotRecord>, ApiError> {
+    let snapshot = state
+        .studio_store
+        .create_project_snapshot(
+            project_id,
+            NewTtsProjectSnapshotRecord {
+                label: normalize_optional_trimmed(req.label),
+            },
+        )
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("TTS project not found"))?;
+    Ok(Json(snapshot))
+}
+
+pub async fn restore_tts_project_snapshot(
+    State(state): State<AppState>,
+    Path((project_id, snapshot_id)): Path<(String, String)>,
+) -> Result<Json<TtsProjectRecord>, ApiError> {
+    let project = state
+        .studio_store
+        .restore_project_snapshot(project_id, snapshot_id)
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("TTS project snapshot not found"))?;
+    Ok(Json(project))
+}
+
+pub async fn list_tts_project_render_jobs(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<TtsProjectRenderJobListResponse>, ApiError> {
+    let jobs = state
+        .studio_store
+        .list_project_render_jobs(project_id)
+        .await
+        .map_err(map_store_error)?;
+    Ok(Json(TtsProjectRenderJobListResponse { jobs }))
+}
+
+pub async fn create_tts_project_render_job(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<CreateTtsProjectRenderJobRequest>,
+) -> Result<Json<TtsProjectRenderJobRecord>, ApiError> {
+    let job = state
+        .studio_store
+        .create_project_render_job(
+            project_id,
+            NewTtsProjectRenderJobRecord {
+                queued_segment_ids: req.queued_segment_ids,
+            },
+        )
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("TTS project not found"))?;
+    Ok(Json(job))
+}
+
+pub async fn update_tts_project_render_job(
+    State(state): State<AppState>,
+    Path((project_id, job_id)): Path<(String, String)>,
+    Json(req): Json<UpdateTtsProjectRenderJobRequest>,
+) -> Result<Json<TtsProjectRenderJobRecord>, ApiError> {
+    let error_message_update = req.error_message.map(|value| {
+        let trimmed = value.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    });
+    let job = state
+        .studio_store
+        .update_project_render_job(
+            project_id,
+            job_id,
+            UpdateTtsProjectRenderJobRecord {
+                status: req.status,
+                error_message: error_message_update,
+            },
+        )
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("TTS project render job not found"))?;
+    Ok(Json(job))
 }
 
 pub async fn create_tts_project(
@@ -127,7 +464,7 @@ pub async fn create_tts_project(
     }
 
     let project = state
-        .tts_project_store
+        .studio_store
         .create_project(NewTtsProjectRecord {
             name: req
                 .name
@@ -156,7 +493,7 @@ pub async fn get_tts_project(
     Path(project_id): Path<String>,
 ) -> Result<Json<TtsProjectRecord>, ApiError> {
     let project = state
-        .tts_project_store
+        .studio_store
         .get_project(project_id)
         .await
         .map_err(map_store_error)?
@@ -169,7 +506,7 @@ pub async fn get_tts_project_segment(
     Path((project_id, segment_id)): Path<(String, String)>,
 ) -> Result<Json<TtsProjectSegmentRecord>, ApiError> {
     let project = state
-        .tts_project_store
+        .studio_store
         .get_project(project_id)
         .await
         .map_err(map_store_error)?
@@ -188,7 +525,7 @@ pub async fn update_tts_project(
     Json(req): Json<UpdateTtsProjectRequest>,
 ) -> Result<Json<TtsProjectRecord>, ApiError> {
     let existing = state
-        .tts_project_store
+        .studio_store
         .get_project(project_id.clone())
         .await
         .map_err(map_store_error)?
@@ -220,7 +557,7 @@ pub async fn update_tts_project(
     .await?;
 
     let project = state
-        .tts_project_store
+        .studio_store
         .update_project(
             project_id,
             UpdateTtsProjectRecord {
@@ -249,7 +586,7 @@ pub async fn update_tts_project_segment(
 ) -> Result<Json<TtsProjectRecord>, ApiError> {
     let text = required_trimmed(Some(req.text.as_str()), "text")?;
     let project = state
-        .tts_project_store
+        .studio_store
         .update_segment_text(project_id, segment_id, text)
         .await
         .map_err(map_store_error)?
@@ -266,7 +603,7 @@ pub async fn split_tts_project_segment(
     let after_text = required_trimmed(Some(req.after_text.as_str()), "after_text")?;
 
     let project = state
-        .tts_project_store
+        .studio_store
         .split_segment(project_id, segment_id, before_text, after_text)
         .await
         .map_err(map_store_error)?
@@ -280,7 +617,7 @@ pub async fn delete_tts_project_segment(
     Path((project_id, segment_id)): Path<(String, String)>,
 ) -> Result<Json<TtsProjectRecord>, ApiError> {
     let existing = state
-        .tts_project_store
+        .studio_store
         .get_project(project_id.clone())
         .await
         .map_err(map_store_error)?
@@ -293,7 +630,7 @@ pub async fn delete_tts_project_segment(
     }
 
     let project = state
-        .tts_project_store
+        .studio_store
         .delete_segment(project_id, segment_id)
         .await
         .map_err(map_store_error)?
@@ -308,7 +645,7 @@ pub async fn render_tts_project_segment(
     Path((project_id, segment_id)): Path<(String, String)>,
 ) -> Result<Json<TtsProjectRecord>, ApiError> {
     let project = state
-        .tts_project_store
+        .studio_store
         .get_project(project_id.clone())
         .await
         .map_err(map_store_error)?
@@ -344,7 +681,7 @@ pub async fn render_tts_project_segment(
 
     let record = synthesize_record(&state, &ctx, request, SpeechRouteKind::TextToSpeech).await?;
     let updated_project = state
-        .tts_project_store
+        .studio_store
         .attach_segment_record(project_id, segment_id, record.id)
         .await
         .map_err(map_store_error)?
@@ -359,7 +696,7 @@ pub async fn get_tts_project_audio(
     Query(query): Query<ProjectAudioQuery>,
 ) -> Result<Response, ApiError> {
     let project = state
-        .tts_project_store
+        .studio_store
         .get_project(project_id)
         .await
         .map_err(map_store_error)?
@@ -435,7 +772,7 @@ pub async fn delete_tts_project(
     Path(project_id): Path<String>,
 ) -> Result<Json<DeleteTtsProjectResponse>, ApiError> {
     let deleted = state
-        .tts_project_store
+        .studio_store
         .delete_project(project_id.clone())
         .await
         .map_err(map_store_error)?;
