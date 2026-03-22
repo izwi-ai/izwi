@@ -23,6 +23,7 @@ import {
   Trash2,
   Upload,
   Link2,
+  History,
   Waves,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -34,6 +35,7 @@ import {
   type TtsProjectMetaRecord,
   type TtsProjectPronunciationRecord,
   type TtsProjectRecord,
+  type TtsProjectSnapshotRecord,
   type TtsProjectSummary,
   type TtsProjectVoiceMode,
 } from "@/api";
@@ -158,6 +160,15 @@ export function StudioWorkspace({
   const [newPronunciationReplacement, setNewPronunciationReplacement] =
     useState("");
   const [savingPronunciation, setSavingPronunciation] = useState(false);
+  const [projectSnapshots, setProjectSnapshots] = useState<
+    TtsProjectSnapshotRecord[]
+  >([]);
+  const [projectSnapshotsLoading, setProjectSnapshotsLoading] = useState(false);
+  const [snapshotLabel, setSnapshotLabel] = useState("");
+  const [savingSnapshot, setSavingSnapshot] = useState(false);
+  const [restoringSnapshotId, setRestoringSnapshotId] = useState<string | null>(
+    null,
+  );
   const [selectedProject, setSelectedProject] = useState<TtsProjectRecord | null>(
     null,
   );
@@ -491,6 +502,21 @@ export function StudioWorkspace({
     }
   }, []);
 
+  const loadProjectSnapshots = useCallback(async (projectId: string | null) => {
+    if (!projectId) {
+      setProjectSnapshots([]);
+      return;
+    }
+    try {
+      setProjectSnapshotsLoading(true);
+      setProjectSnapshots(await api.listTtsProjectSnapshots(projectId));
+    } catch {
+      setProjectSnapshots([]);
+    } finally {
+      setProjectSnapshotsLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     void loadProjects();
     void loadSavedVoices();
@@ -512,6 +538,10 @@ export function StudioWorkspace({
   useEffect(() => {
     void loadProjectPronunciations(selectedProjectId);
   }, [loadProjectPronunciations, selectedProjectId]);
+
+  useEffect(() => {
+    void loadProjectSnapshots(selectedProjectId);
+  }, [loadProjectSnapshots, selectedProjectId]);
 
   useEffect(() => {
     if (!selectedProject) {
@@ -1424,6 +1454,57 @@ export function StudioWorkspace({
     }
   };
 
+  const handleCreateSnapshot = async () => {
+    if (!selectedProject) {
+      return;
+    }
+    try {
+      setSavingSnapshot(true);
+      const snapshot = await api.createTtsProjectSnapshot(selectedProject.id, {
+        label: snapshotLabel.trim() || undefined,
+      });
+      setProjectSnapshots((current) => [snapshot, ...current]);
+      setSnapshotLabel("");
+      setWorkspaceStatus({
+        tone: "success",
+        message: `Saved snapshot${snapshot.label ? ` "${snapshot.label}"` : ""}.`,
+      });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Failed to save project snapshot.";
+      setWorkspaceError(message);
+      onError(message);
+    } finally {
+      setSavingSnapshot(false);
+    }
+  };
+
+  const handleRestoreSnapshot = async (snapshotId: string) => {
+    if (!selectedProject) {
+      return;
+    }
+    try {
+      setRestoringSnapshotId(snapshotId);
+      const restored = await api.restoreTtsProjectSnapshot(
+        selectedProject.id,
+        snapshotId,
+      );
+      setSelectedProject(restored);
+      await loadProjects();
+      setWorkspaceStatus({
+        tone: "success",
+        message: "Restored project snapshot.",
+      });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Failed to restore snapshot.";
+      setWorkspaceError(message);
+      onError(message);
+    } finally {
+      setRestoringSnapshotId(null);
+    }
+  };
+
   const handleMergeSegmentWithNext = async (segmentId: string) => {
     if (!selectedProject) {
       return;
@@ -1747,6 +1828,10 @@ export function StudioWorkspace({
     selectedProjectSegmentCount > 0 &&
     pendingRenderSegmentCount === 0 &&
     selectedProjectRenderedCount === selectedProjectSegmentCount;
+  const changedSinceLastRender =
+    (selectedProject?.updated_at ?? 0) >
+      (selectedProjectMeta?.last_rendered_at ?? 0) ||
+    pendingRenderSegmentCount > 0;
   const primaryRenderLabel =
     pendingRenderSegmentCount > 0
       ? `Render ${pendingRenderSegmentCount} remaining`
@@ -2353,7 +2438,7 @@ export function StudioWorkspace({
                       Workflow Status
                     </div>
                     <div className="mt-2 text-sm font-medium text-[var(--text-primary)]">
-                      {exportReady
+                      {exportReady && !changedSinceLastRender
                         ? "Merged export is current and ready."
                         : `${pendingRenderSegmentCount} segment${pendingRenderSegmentCount === 1 ? "" : "s"} still need rendering before the export is fully current.`}
                     </div>
@@ -2363,6 +2448,15 @@ export function StudioWorkspace({
                     </div>
                   </div>
                   <div className="flex flex-wrap gap-2 text-[11px]">
+                    {changedSinceLastRender ? (
+                      <span className="rounded-full border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-2.5 py-1 text-[var(--status-warning-text)]">
+                        Changed since last render
+                      </span>
+                    ) : (
+                      <span className="rounded-full border border-[var(--status-positive-border)] bg-[var(--status-positive-bg)] px-2.5 py-1 text-[var(--status-positive-text)]">
+                        Synced with last render
+                      </span>
+                    )}
                     <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2.5 py-1 text-[var(--text-muted)]">
                       Prepare profile
                     </span>
@@ -2906,11 +3000,11 @@ export function StudioWorkspace({
                     Delivery
                   </div>
                   <div className="mt-2 text-sm font-semibold text-[var(--text-primary)]">
-                    {exportReady
+                    {exportReady && !changedSinceLastRender
                       ? "Everything is ready for merged export."
                       : pendingRenderSegmentCount > 0
                         ? `${pendingRenderSegmentCount} block${pendingRenderSegmentCount === 1 ? "" : "s"} still need rendering.`
-                        : "Render progress is in sync with the current project state."}
+                        : "Project changes are newer than the last complete render."}
                   </div>
                   <div className="mt-2 text-sm leading-relaxed text-[var(--text-secondary)]">
                     Use export once the project sounds right. If you changed text in a
@@ -3042,6 +3136,77 @@ export function StudioWorkspace({
                               </Button>
                             ) : null}
                           </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </section>
+
+                <section className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                    Snapshots
+                  </div>
+                  <div className="mt-2 text-sm leading-relaxed text-[var(--text-secondary)]">
+                    Save restore points before major edits and roll back when needed.
+                  </div>
+
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <Input
+                      value={snapshotLabel}
+                      onChange={(event) => setSnapshotLabel(event.target.value)}
+                      placeholder="Optional snapshot label"
+                      className="flex-1 min-w-[180px] bg-[var(--bg-surface-1)]"
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => void handleCreateSnapshot()}
+                      disabled={savingSnapshot}
+                      className="bg-[var(--bg-surface-1)]"
+                    >
+                      {savingSnapshot ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <CheckCircle2 className="h-4 w-4" />
+                      )}
+                      Save snapshot
+                    </Button>
+                  </div>
+
+                  <div className="mt-4 space-y-2">
+                    {projectSnapshotsLoading ? (
+                      <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
+                        Loading snapshots...
+                      </div>
+                    ) : projectSnapshots.length === 0 ? (
+                      <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
+                        No snapshots yet.
+                      </div>
+                    ) : (
+                      projectSnapshots.map((snapshot) => (
+                        <div
+                          key={snapshot.id}
+                          className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2"
+                        >
+                          <div className="text-xs text-[var(--text-muted)]">
+                            {snapshot.label || "Unnamed snapshot"} ·{" "}
+                            {formatRelativeDate(snapshot.created_at)}
+                          </div>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => void handleRestoreSnapshot(snapshot.id)}
+                            disabled={restoringSnapshotId === snapshot.id}
+                            className="mt-1 h-7 px-2 text-xs"
+                          >
+                            {restoringSnapshotId === snapshot.id ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <History className="h-3.5 w-3.5" />
+                            )}
+                            Restore
+                          </Button>
                         </div>
                       ))
                     )}
