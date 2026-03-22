@@ -27,6 +27,8 @@ import {
   api,
   type ModelInfo,
   type SavedVoiceSummary,
+  type TtsProjectFolderRecord,
+  type TtsProjectMetaRecord,
   type TtsProjectRecord,
   type TtsProjectSummary,
   type TtsProjectVoiceMode,
@@ -113,6 +115,18 @@ export function StudioWorkspace({
 }: StudioWorkspaceProps) {
   const [projects, setProjects] = useState<TtsProjectSummary[]>([]);
   const [projectsLoading, setProjectsLoading] = useState(false);
+  const [projectFolders, setProjectFolders] = useState<TtsProjectFolderRecord[]>([]);
+  const [projectMetaById, setProjectMetaById] = useState<
+    Record<string, TtsProjectMetaRecord>
+  >({});
+  const [projectSearch, setProjectSearch] = useState("");
+  const [projectStatusFilter, setProjectStatusFilter] = useState<
+    "all" | "in_progress" | "ready"
+  >("all");
+  const [projectSort, setProjectSort] = useState<"recent" | "name" | "progress">(
+    "recent",
+  );
+  const [projectFolderFilter, setProjectFolderFilter] = useState("all");
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [selectedProject, setSelectedProject] = useState<TtsProjectRecord | null>(
     null,
@@ -135,6 +149,7 @@ export function StudioWorkspace({
   } | null>(null);
   const [projectName, setProjectName] = useState("");
   const [projectModelId, setProjectModelId] = useState(selectedModel ?? "");
+  const [projectFolderId, setProjectFolderId] = useState("");
   const [projectVoiceMode, setProjectVoiceMode] =
     useState<TtsProjectVoiceMode>("built_in");
   const [projectSpeaker, setProjectSpeaker] = useState("Vivian");
@@ -236,6 +251,69 @@ export function StudioWorkspace({
     [projects, selectedProjectId],
   );
 
+  const selectedProjectMeta = selectedProjectId
+    ? projectMetaById[selectedProjectId] ?? null
+    : null;
+
+  const folderNameById = useMemo(
+    () =>
+      Object.fromEntries(projectFolders.map((folder) => [folder.id, folder.name] as const)),
+    [projectFolders],
+  );
+
+  const visibleProjects = useMemo(() => {
+    const search = projectSearch.trim().toLowerCase();
+    const filtered = projects.filter((project) => {
+      const meta = projectMetaById[project.id];
+      const folderId = meta?.folder_id ?? null;
+      const tags = meta?.tags ?? [];
+      const completionReady =
+        project.segment_count > 0 &&
+        project.rendered_segment_count === project.segment_count;
+      const statusMatch =
+        projectStatusFilter === "all" ||
+        (projectStatusFilter === "ready" && completionReady) ||
+        (projectStatusFilter === "in_progress" && !completionReady);
+      const folderMatch =
+        projectFolderFilter === "all" || folderId === projectFolderFilter;
+      const searchMatch =
+        !search ||
+        project.name.toLowerCase().includes(search) ||
+        project.model_id?.toLowerCase().includes(search) ||
+        tags.some((tag) => tag.toLowerCase().includes(search));
+      return statusMatch && folderMatch && searchMatch;
+    });
+
+    const sorted = [...filtered];
+    if (projectSort === "name") {
+      sorted.sort((left, right) => left.name.localeCompare(right.name));
+      return sorted;
+    }
+    if (projectSort === "progress") {
+      sorted.sort((left, right) => {
+        const leftRatio =
+          left.segment_count > 0
+            ? left.rendered_segment_count / left.segment_count
+            : 0;
+        const rightRatio =
+          right.segment_count > 0
+            ? right.rendered_segment_count / right.segment_count
+            : 0;
+        return rightRatio - leftRatio || right.updated_at - left.updated_at;
+      });
+      return sorted;
+    }
+    sorted.sort((left, right) => right.updated_at - left.updated_at);
+    return sorted;
+  }, [
+    projectFolderFilter,
+    projectMetaById,
+    projectSearch,
+    projectSort,
+    projectStatusFilter,
+    projects,
+  ]);
+
   const projectDirty = useMemo(() => {
     if (!selectedProject) {
       return false;
@@ -249,7 +327,7 @@ export function StudioWorkspace({
       (supportsSpeedControl
         ? Number(projectSpeed.toFixed(2)) !==
           Number((selectedProject.speed ?? 1).toFixed(2))
-        : false)
+      : false)
     );
   }, [
     projectModelId,
@@ -261,6 +339,8 @@ export function StudioWorkspace({
     selectedProject,
     supportsSpeedControl,
   ]);
+  const projectFolderDirty =
+    (selectedProjectMeta?.folder_id ?? "") !== projectFolderId;
 
   const loadProjects = useCallback(async () => {
     setProjectsLoading(true);
@@ -297,6 +377,45 @@ export function StudioWorkspace({
     }
   }, []);
 
+  const loadProjectFolders = useCallback(async () => {
+    try {
+      const folders = await api.listTtsProjectFolders();
+      setProjectFolders(folders);
+    } catch {
+      setProjectFolders([]);
+    }
+  }, []);
+
+  const loadProjectMeta = useCallback(async (records: TtsProjectSummary[]) => {
+    if (records.length === 0) {
+      setProjectMetaById({});
+      return;
+    }
+
+    const entries = await Promise.all(
+      records.map(async (project) => {
+        try {
+          const meta = await api.getTtsProjectMeta(project.id);
+          return [project.id, meta] as const;
+        } catch {
+          return [
+            project.id,
+            {
+              project_id: project.id,
+              folder_id: null,
+              tags: [],
+              default_export_format: "wav",
+              last_render_job_id: null,
+              last_rendered_at: null,
+            },
+          ] as const;
+        }
+      }),
+    );
+
+    setProjectMetaById(Object.fromEntries(entries));
+  }, []);
+
   const loadProject = useCallback(
     async (projectId: string) => {
       setProjectLoading(true);
@@ -317,7 +436,12 @@ export function StudioWorkspace({
   useEffect(() => {
     void loadProjects();
     void loadSavedVoices();
-  }, [loadProjects, loadSavedVoices]);
+    void loadProjectFolders();
+  }, [loadProjectFolders, loadProjects, loadSavedVoices]);
+
+  useEffect(() => {
+    void loadProjectMeta(projects);
+  }, [loadProjectMeta, projects]);
 
   useEffect(() => {
     if (!selectedProjectId) {
@@ -331,6 +455,7 @@ export function StudioWorkspace({
     if (!selectedProject) {
       setProjectName("");
       setProjectModelId(selectedModel ?? "");
+      setProjectFolderId("");
       setProjectVoiceMode("built_in");
       setProjectSpeaker("Vivian");
       setProjectSavedVoiceId("");
@@ -342,6 +467,7 @@ export function StudioWorkspace({
 
     setProjectName(selectedProject.name);
     setProjectModelId(selectedProject.model_id ?? selectedModel ?? "");
+    setProjectFolderId(projectMetaById[selectedProject.id]?.folder_id ?? "");
     setProjectVoiceMode(selectedProject.voice_mode);
     setProjectSpeaker(selectedProject.speaker ?? "Vivian");
     setProjectSavedVoiceId(selectedProject.saved_voice_id ?? "");
@@ -352,7 +478,14 @@ export function StudioWorkspace({
       ),
     );
     setSegmentSelections({});
-  }, [selectedModel, selectedProject]);
+  }, [projectMetaById, selectedModel, selectedProject]);
+
+  useEffect(() => {
+    if (!selectedProjectId) {
+      return;
+    }
+    setProjectFolderId(projectMetaById[selectedProjectId]?.folder_id ?? "");
+  }, [projectMetaById, selectedProjectId]);
 
   useEffect(() => {
     if (projectVoiceMode === "saved" && !supportsSavedVoices && supportsBuiltInVoices) {
@@ -721,21 +854,33 @@ export function StudioWorkspace({
       onError(message);
       return null;
     }
-    if (!projectDirty) {
+    if (!projectDirty && !projectFolderDirty) {
       return selectedProject;
     }
 
     try {
       setSavingProject(true);
-      const project = await api.updateTtsProject(selectedProject.id, {
-        name: projectName.trim(),
-        model_id: projectModelId,
-        voice_mode: projectVoiceMode,
-        speaker: projectVoiceMode === "built_in" ? projectSpeaker : undefined,
-        saved_voice_id:
-          projectVoiceMode === "saved" ? projectSavedVoiceId : undefined,
-        speed: supportsSpeedControl ? projectSpeed : undefined,
-      });
+      let project = selectedProject;
+      if (projectDirty) {
+        project = await api.updateTtsProject(selectedProject.id, {
+          name: projectName.trim(),
+          model_id: projectModelId,
+          voice_mode: projectVoiceMode,
+          speaker: projectVoiceMode === "built_in" ? projectSpeaker : undefined,
+          saved_voice_id:
+            projectVoiceMode === "saved" ? projectSavedVoiceId : undefined,
+          speed: supportsSpeedControl ? projectSpeed : undefined,
+        });
+      }
+      if (projectFolderDirty) {
+        const meta = await api.updateTtsProjectMeta(selectedProject.id, {
+          folder_id: projectFolderId || undefined,
+        });
+        setProjectMetaById((current) => ({
+          ...current,
+          [selectedProject.id]: meta,
+        }));
+      }
       setSelectedProject(project);
       setWorkspaceStatus({
         tone: "success",
@@ -757,6 +902,8 @@ export function StudioWorkspace({
     onError,
     onModelRequired,
     projectDirty,
+    projectFolderDirty,
+    projectFolderId,
     projectModelId,
     projectName,
     projectSavedVoiceId,
@@ -1103,7 +1250,7 @@ export function StudioWorkspace({
             ? "Loading your reusable script projects."
             : projects.length === 0
               ? "No TTS projects yet."
-              : `${projects.length} reusable script project${projects.length === 1 ? "" : "s"}.`
+              : `${visibleProjects.length} of ${projects.length} project${projects.length === 1 ? "" : "s"} shown.`
         }
         open={isProjectLibraryOpen}
         onOpenChange={setIsProjectLibraryOpen}
@@ -1122,13 +1269,72 @@ export function StudioWorkspace({
               </div>
             ) : (
               <div className="flex flex-col gap-2.5">
-                {projects.map((project) => {
+                <div className="space-y-2 rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3">
+                  <Input
+                    value={projectSearch}
+                    onChange={(event) => setProjectSearch(event.target.value)}
+                    placeholder="Search projects or tags"
+                    className="bg-[var(--bg-surface-0)]"
+                  />
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    <select
+                      value={projectStatusFilter}
+                      onChange={(event) =>
+                        setProjectStatusFilter(
+                          event.target.value as "all" | "in_progress" | "ready",
+                        )
+                      }
+                      className="h-9 rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2 text-xs text-[var(--text-primary)]"
+                    >
+                      <option value="all">All statuses</option>
+                      <option value="in_progress">In progress</option>
+                      <option value="ready">Ready to export</option>
+                    </select>
+                    <select
+                      value={projectSort}
+                      onChange={(event) =>
+                        setProjectSort(
+                          event.target.value as "recent" | "name" | "progress",
+                        )
+                      }
+                      className="h-9 rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2 text-xs text-[var(--text-primary)]"
+                    >
+                      <option value="recent">Sort: Recent</option>
+                      <option value="name">Sort: Name</option>
+                      <option value="progress">Sort: Progress</option>
+                    </select>
+                  </div>
+                  <select
+                    value={projectFolderFilter}
+                    onChange={(event) => setProjectFolderFilter(event.target.value)}
+                    className="h-9 w-full rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-2 text-xs text-[var(--text-primary)]"
+                  >
+                    <option value="all">All folders</option>
+                    {projectFolders.map((folder) => (
+                      <option key={folder.id} value={folder.id}>
+                        {folder.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                {visibleProjects.length === 0 ? (
+                  <div className="app-sidebar-empty">
+                    No projects match the current search or filters.
+                  </div>
+                ) : null}
+                {visibleProjects.map((project) => {
                   const isActive = project.id === selectedProjectId;
                   const completionLabel = `${project.rendered_segment_count}/${project.segment_count} segments rendered`;
+                  const meta = projectMetaById[project.id];
+                  const folderName = meta?.folder_id
+                    ? folderNameById[meta.folder_id]
+                    : null;
                   const previewParts = [
                     completionLabel,
                     `${project.total_chars} chars`,
                     project.model_id,
+                    folderName ? `Folder: ${folderName}` : null,
+                    ...(meta?.tags ?? []).slice(0, 2),
                   ].filter((value): value is string => Boolean(value));
 
                   return (
@@ -1822,7 +2028,7 @@ export function StudioWorkspace({
                         Shared render settings
                       </h3>
                     </div>
-                    {projectDirty ? (
+                    {projectDirty || projectFolderDirty ? (
                       <div className="rounded-full border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--status-warning-text)]">
                         Unsaved
                       </div>
@@ -1862,6 +2068,27 @@ export function StudioWorkspace({
                         }}
                         className="w-full"
                       />
+                    </div>
+
+                    <div className="space-y-2">
+                      <label className="text-xs font-semibold uppercase tracking-wider text-[var(--text-primary)]">
+                        Folder
+                      </label>
+                      <select
+                        value={projectFolderId}
+                        onChange={(event) => {
+                          setProjectFolderId(event.target.value);
+                          setWorkspaceStatus(null);
+                        }}
+                        className="h-10 w-full rounded-md border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 text-sm text-[var(--text-primary)]"
+                      >
+                        <option value="">Unfiled</option>
+                        {projectFolders.map((folder) => (
+                          <option key={folder.id} value={folder.id}>
+                            {folder.name}
+                          </option>
+                        ))}
+                      </select>
                     </div>
 
                     <div className="space-y-2">
@@ -1921,7 +2148,7 @@ export function StudioWorkspace({
                   <Button
                     variant="outline"
                     onClick={() => void persistProjectSettings()}
-                    disabled={!projectDirty || savingProject}
+                    disabled={(!projectDirty && !projectFolderDirty) || savingProject}
                     className="mt-5 w-full justify-center bg-[var(--bg-surface-1)]"
                   >
                     {savingProject ? (
