@@ -11,6 +11,7 @@ Izwi provides a comprehensive suite of audio AI capabilities. Each feature is ac
 | **Voice** | Real-time voice conversations with AI | [Voice Guide](./voice.md) |
 | **Chat** | Text-based AI conversations | [Chat Guide](./chat.md) |
 | **Text-to-Speech** | Generate natural speech from text | [TTS Guide](./text-to-speech.md) |
+| **Studio** | Manage long-form TTS projects and exports | [Studio Guide](./studio.md) |
 | **Transcription** | Convert audio to text | [Transcription Guide](./transcription.md) |
 | **Diarization** | Identify multiple speakers | [Diarization Guide](./diarization.md) |
 | **Voice Cloning** | Clone voices from audio samples | [Voice Cloning Guide](./voice-cloning.md) |
@@ -25,6 +26,7 @@ Izwi provides a comprehensive suite of audio AI capabilities. Each feature is ac
 | Voice | ✓ | ✓ | — | ✓ |
 | Chat | ✓ | ✓ | ✓ | ✓ |
 | Text-to-Speech | ✓ | ✓ | ✓ | ✓ |
+| Studio | ✓ | ✓ | — | ✓ |
 | Transcription | ✓ | ✓ | ✓ | ✓ |
 | Diarization | ✓ | ✓ | — | ✓ |
 | Voice Cloning | ✓ | ✓ | ✓ | ✓ |
@@ -61,6 +63,7 @@ Different features require different models:
 | Voice | TTS + ASR + Chat model |
 | Chat | Chat model (Qwen3 or Gemma) |
 | Text-to-Speech | TTS model |
+| Studio | TTS model |
 | Transcription | ASR model (Qwen3 or Parakeet) |
 | Diarization | Diarization model (Sortformer) |
 | Forced Alignment | Forced aligner model |
@@ -75,4 +78,5 @@ Choose a feature to learn more:
 
 - [Voice Mode](./voice.md) — Real-time conversations
 - [Text-to-Speech](./text-to-speech.md) — Generate speech
+- [Studio](./studio.md) — Build long-form TTS projects
 - [Transcription](./transcription.md) — Convert audio to text
