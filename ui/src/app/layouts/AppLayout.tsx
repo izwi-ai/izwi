@@ -78,9 +78,9 @@ const TOP_NAV_ITEMS: NavItem[] = [
 const CREATION_NAV_ITEMS: NavItem[] = VOICE_STUDIO_ENABLED
   ? [
       {
-        id: "voice-studio",
-        label: "Voice Studio",
-        description: "Create, clone, and manage voice assets",
+        id: "voices",
+        label: "Voices",
+        description: "Create, clone, design, and manage voice assets",
         icon: Library,
         path: "/voices",
       },
