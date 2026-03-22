@@ -724,9 +724,11 @@ pub async fn render_tts_project_segment(
         .model_id
         .clone()
         .ok_or_else(|| ApiError::bad_request("TTS project is missing a model selection."))?;
+    let rendered_text =
+        apply_project_pronunciations(&state, project.id.as_str(), segment.text.as_str()).await?;
     let request = CreateSpeechHistoryRecordRequest {
         model_id: Some(model_id),
-        text: Some(segment.text.clone()),
+        text: Some(rendered_text),
         speaker: project.speaker.clone(),
         language: None,
         voice_description: None,
@@ -1094,4 +1096,37 @@ fn map_saved_voice_store_error(err: anyhow::Error) -> ApiError {
 
 fn map_speech_store_error(err: anyhow::Error) -> ApiError {
     ApiError::internal(format!("Speech history storage error: {err}"))
+}
+
+async fn apply_project_pronunciations(
+    state: &AppState,
+    project_id: &str,
+    text: &str,
+) -> Result<String, ApiError> {
+    let entries = state
+        .studio_store
+        .list_project_pronunciations(project_id.to_string())
+        .await
+        .map_err(map_store_error)?;
+    if entries.is_empty() {
+        return Ok(text.to_string());
+    }
+
+    let mut ordered = entries;
+    ordered.sort_by(|left, right| {
+        right
+            .source_text
+            .len()
+            .cmp(&left.source_text.len())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    let mut output = text.to_string();
+    for entry in ordered {
+        if entry.source_text.is_empty() {
+            continue;
+        }
+        output = output.replace(entry.source_text.as_str(), entry.replacement_text.as_str());
+    }
+    Ok(output)
 }

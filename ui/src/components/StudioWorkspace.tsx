@@ -32,6 +32,7 @@ import {
   type SavedVoiceSummary,
   type TtsProjectFolderRecord,
   type TtsProjectMetaRecord,
+  type TtsProjectPronunciationRecord,
   type TtsProjectRecord,
   type TtsProjectSummary,
   type TtsProjectVoiceMode,
@@ -143,6 +144,15 @@ export function StudioWorkspace({
   );
   const [projectFolderFilter, setProjectFolderFilter] = useState("all");
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  const [projectPronunciations, setProjectPronunciations] = useState<
+    TtsProjectPronunciationRecord[]
+  >([]);
+  const [projectPronunciationsLoading, setProjectPronunciationsLoading] =
+    useState(false);
+  const [newPronunciationSource, setNewPronunciationSource] = useState("");
+  const [newPronunciationReplacement, setNewPronunciationReplacement] =
+    useState("");
+  const [savingPronunciation, setSavingPronunciation] = useState(false);
   const [selectedProject, setSelectedProject] = useState<TtsProjectRecord | null>(
     null,
   );
@@ -454,6 +464,23 @@ export function StudioWorkspace({
     [onError],
   );
 
+  const loadProjectPronunciations = useCallback(async (projectId: string | null) => {
+    if (!projectId) {
+      setProjectPronunciations([]);
+      return;
+    }
+    try {
+      setProjectPronunciationsLoading(true);
+      setProjectPronunciations(
+        await api.listTtsProjectPronunciations(projectId),
+      );
+    } catch {
+      setProjectPronunciations([]);
+    } finally {
+      setProjectPronunciationsLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     void loadProjects();
     void loadSavedVoices();
@@ -471,6 +498,10 @@ export function StudioWorkspace({
     }
     void loadProject(selectedProjectId);
   }, [loadProject, selectedProjectId]);
+
+  useEffect(() => {
+    void loadProjectPronunciations(selectedProjectId);
+  }, [loadProjectPronunciations, selectedProjectId]);
 
   useEffect(() => {
     if (!selectedProject) {
@@ -1328,6 +1359,58 @@ export function StudioWorkspace({
       } catch {
         // noop
       }
+    }
+  };
+
+  const handleCreatePronunciation = async () => {
+    if (!selectedProject) {
+      return;
+    }
+    const source = newPronunciationSource.trim();
+    const replacement = newPronunciationReplacement.trim();
+    if (!source || !replacement) {
+      const message = "Both source and replacement text are required.";
+      setWorkspaceError(message);
+      onError(message);
+      return;
+    }
+    try {
+      setSavingPronunciation(true);
+      const created = await api.createTtsProjectPronunciation(selectedProject.id, {
+        source_text: source,
+        replacement_text: replacement,
+      });
+      setProjectPronunciations((current) => [created, ...current]);
+      setNewPronunciationSource("");
+      setNewPronunciationReplacement("");
+      setWorkspaceStatus({
+        tone: "success",
+        message: `Added pronunciation rule for "${source}".`,
+      });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Failed to add pronunciation rule.";
+      setWorkspaceError(message);
+      onError(message);
+    } finally {
+      setSavingPronunciation(false);
+    }
+  };
+
+  const handleDeletePronunciation = async (entryId: string) => {
+    if (!selectedProject) {
+      return;
+    }
+    try {
+      await api.deleteTtsProjectPronunciation(selectedProject.id, entryId);
+      setProjectPronunciations((current) =>
+        current.filter((entry) => entry.id !== entryId),
+      );
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Failed to delete pronunciation rule.";
+      setWorkspaceError(message);
+      onError(message);
     }
   };
 
@@ -2694,6 +2777,82 @@ export function StudioWorkspace({
                     )}
                     Save profile
                   </Button>
+                </section>
+
+                <section className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                    Pronunciation Rules
+                  </div>
+                  <div className="mt-2 text-sm leading-relaxed text-[var(--text-secondary)]">
+                    Replace words or phrases before rendering to keep pronunciation
+                    consistent across the project.
+                  </div>
+
+                  <div className="mt-4 grid gap-2">
+                    <Input
+                      value={newPronunciationSource}
+                      onChange={(event) =>
+                        setNewPronunciationSource(event.target.value)
+                      }
+                      placeholder="Source text (e.g. SQL)"
+                    />
+                    <Input
+                      value={newPronunciationReplacement}
+                      onChange={(event) =>
+                        setNewPronunciationReplacement(event.target.value)
+                      }
+                      placeholder="Replacement text (e.g. sequel)"
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => void handleCreatePronunciation()}
+                      disabled={savingPronunciation}
+                      className="justify-center bg-[var(--bg-surface-1)]"
+                    >
+                      {savingPronunciation ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <PencilLine className="h-4 w-4" />
+                      )}
+                      Add rule
+                    </Button>
+                  </div>
+
+                  <div className="mt-4 space-y-2">
+                    {projectPronunciationsLoading ? (
+                      <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
+                        Loading pronunciation rules...
+                      </div>
+                    ) : projectPronunciations.length === 0 ? (
+                      <div className="rounded-xl border border-dashed border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2 text-xs text-[var(--text-muted)]">
+                        No pronunciation rules yet.
+                      </div>
+                    ) : (
+                      projectPronunciations.map((entry) => (
+                        <div
+                          key={entry.id}
+                          className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-2"
+                        >
+                          <div className="text-xs text-[var(--text-muted)]">
+                            {entry.source_text}
+                          </div>
+                          <div className="text-sm text-[var(--text-primary)]">
+                            {entry.replacement_text}
+                          </div>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => void handleDeletePronunciation(entry.id)}
+                            className="mt-1 h-7 px-2 text-xs"
+                          >
+                            Remove
+                          </Button>
+                        </div>
+                      ))
+                    )}
+                  </div>
                 </section>
 
                 <section className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-5">
