@@ -34,8 +34,8 @@ Analyzes audio to identify different speakers and when they spoke. Optionally in
 | `-n, --num-speakers <N>` | Expected number of speakers | Auto-detect |
 | `-f, --format <FORMAT>` | Output format: `text`, `json`, `verbose_json` | `text` |
 | `-o, --output <PATH>` | Output file (default: stdout) | — |
-| `--transcribe` | Include transcription with speaker labels | — |
-| `--asr-model <MODEL>` | ASR model for transcription | `parakeet-tdt-0.6b-v3` |
+| `--transcribe` | Compatibility flag (transcript output is included by default) | — |
+| `--asr-model <MODEL>` | ASR model used for transcript generation | `parakeet-tdt-0.6b-v3` |
 
 ---
 
@@ -53,10 +53,10 @@ izwi diarize meeting.wav
 izwi diarize meeting.wav --num-speakers 3
 ```
 
-### With transcription
+### Transcript output (default behavior)
 
 ```bash
-izwi diarize meeting.wav --transcribe
+izwi diarize meeting.wav --num-speakers 2
 ```
 
 ### JSON output
@@ -69,7 +69,6 @@ izwi diarize meeting.wav --format json --output diarization.json
 
 ```bash
 izwi diarize interview.wav \
-  --transcribe \
   --asr-model Qwen3-ASR-1.7B-GGUF \
   --format verbose_json \
   --output interview_transcript.json
@@ -95,7 +94,7 @@ izwi diarize interview.wav \
     {"speaker": "Speaker 1", "start": 0.0, "end": 5.2},
     {"speaker": "Speaker 2", "start": 5.5, "end": 12.1}
   ],
-  "num_speakers": 2
+  "speaker_count": 2
 }
 ```
 
@@ -117,7 +116,7 @@ izwi diarize interview.wav \
       "text": "Thanks for having me."
     }
   ],
-  "num_speakers": 2,
+  "speaker_count": 2,
   "duration": 120.5
 }
 ```

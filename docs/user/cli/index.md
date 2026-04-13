@@ -106,7 +106,7 @@ izwi transcribe audio.wav --format json
 
 ```bash
 izwi diarize meeting.wav
-izwi diarize meeting.wav --transcribe --num-speakers 3
+izwi diarize meeting.wav --num-speakers 3
 ```
 
 ### Forced alignment

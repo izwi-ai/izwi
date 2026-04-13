@@ -27,4 +27,9 @@ pub fn router() -> Router<AppState> {
             "/audio/diarizations",
             post(diarizations::diarizations).layer(DefaultBodyLimit::max(AUDIO_UPLOAD_LIMIT_BYTES)),
         )
+        // Legacy alias kept for older clients. Canonical route is /audio/diarizations.
+        .route(
+            "/audio/diarize",
+            post(diarizations::diarizations).layer(DefaultBodyLimit::max(AUDIO_UPLOAD_LIMIT_BYTES)),
+        )
 }
