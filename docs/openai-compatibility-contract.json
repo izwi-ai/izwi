@@ -1,0 +1,57 @@
+{
+  "version": "2026-04-13",
+  "scope": {
+    "supported_endpoints": [
+      "/v1/models",
+      "/v1/chat/completions",
+      "/v1/responses",
+      "/v1/responses/:response_id",
+      "/v1/responses/:response_id/cancel",
+      "/v1/responses/:response_id/input_items",
+      "/v1/audio/transcriptions",
+      "/v1/audio/speech"
+    ],
+    "out_of_scope_endpoints": [
+      "/v1/audio/translations",
+      "/v1/realtime/client_secrets",
+      "/v1/realtime/sessions",
+      "/v1/realtime/transcription_sessions"
+    ]
+  },
+  "streaming_contracts": {
+    "chat_completions": {
+      "required_sequence": [
+        "chat.completion.chunk(role)",
+        "chat.completion.chunk(delta)",
+        "chat.completion.chunk(terminal)",
+        "[DONE]"
+      ]
+    },
+    "responses": {
+      "required_sequence": [
+        "response.created",
+        "response.in_progress",
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.done",
+        "response.output_item.done",
+        "response.completed|response.failed",
+        "[DONE]"
+      ]
+    },
+    "audio_transcriptions": {
+      "required_events": [
+        "transcript.text.delta",
+        "transcript.text.done"
+      ]
+    },
+    "audio_speech": {
+      "required_events": [
+        "audio.chunk",
+        "audio.done|audio.failed"
+      ]
+    }
+  }
+}
