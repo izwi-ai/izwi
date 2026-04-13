@@ -211,6 +211,7 @@ async fn create_streaming_response(
     let created_at = now_unix_secs();
     let metadata = req.metadata.clone();
     let response_id_for_task = response_id.clone();
+    let message_id = new_uuid();
     let model_name = execution_request.variant.dir_name().to_string();
     let store_state = state.clone();
     let mut event_rx = spawn_chat_stream(state.clone(), execution_request);
@@ -231,15 +232,53 @@ async fn create_streaming_response(
             error: None,
             metadata: metadata.clone(),
         };
-        let created_event = ResponseStreamEnvelope {
+        let created_event = ResponseStreamEnvelope::<ResponseStreamCreatedPayload> {
             event_type: "response.created",
             payload: ResponseStreamCreatedPayload {
-                response: created_response,
+                response: created_response.clone(),
             },
         };
-        yield Ok::<_, Infallible>(format!(
-            "data: {}\n\n",
-            serde_json::to_string(&created_event).unwrap_or_default()
+        yield Ok::<_, Infallible>(sse_event(
+            "response.created",
+            &serde_json::to_string(&created_event).unwrap_or_default(),
+        ));
+        let in_progress_event = serde_json::json!({
+            "type": "response.in_progress",
+            "response": created_response,
+        });
+        yield Ok::<_, Infallible>(sse_event(
+            "response.in_progress",
+            &in_progress_event.to_string(),
+        ));
+        let output_item_added_event = serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": message_id.clone(),
+                "type": "message",
+                "status": "in_progress",
+                "role": "assistant",
+                "content": [],
+            }
+        });
+        yield Ok::<_, Infallible>(sse_event(
+            "response.output_item.added",
+            &output_item_added_event.to_string(),
+        ));
+        let content_part_added_event = serde_json::json!({
+            "type": "response.content_part.added",
+            "item_id": message_id.clone(),
+            "output_index": 0,
+            "content_index": 0,
+            "part": {
+                "type": "output_text",
+                "text": "",
+                "annotations": []
+            }
+        });
+        yield Ok::<_, Infallible>(sse_event(
+            "response.content_part.added",
+            &content_part_added_event.to_string(),
         ));
 
         let mut full_text = String::new();
@@ -269,7 +308,10 @@ async fn create_streaming_response(
                         created_at,
                         status: "completed".to_string(),
                         model: model_name.clone(),
-                        output: vec![assistant_output_item(output_text.clone())],
+                        output: vec![assistant_output_item_with_id(
+                            message_id.clone(),
+                            output_text.clone(),
+                        )],
                         usage: ResponseUsage {
                             input_tokens: generation.prompt_tokens,
                             output_tokens: generation.tokens_generated,
@@ -287,7 +329,7 @@ async fn create_streaming_response(
                             status: "completed".to_string(),
                             model: model_name.clone(),
                             input_items: input_items.clone(),
-                            output_text: Some(output_text),
+                            output_text: Some(output_text.clone()),
                             input_tokens: generation.prompt_tokens,
                             output_tokens: generation.tokens_generated,
                             error: None,
@@ -297,6 +339,52 @@ async fn create_streaming_response(
                     )
                     .await;
 
+                    let output_text_done_event = serde_json::json!({
+                        "type": "response.output_text.done",
+                        "item_id": message_id.clone(),
+                        "output_index": 0,
+                        "content_index": 0,
+                        "text": output_text,
+                    });
+                    yield Ok::<_, Infallible>(sse_event(
+                        "response.output_text.done",
+                        &output_text_done_event.to_string(),
+                    ));
+                    let content_part_done_event = serde_json::json!({
+                        "type": "response.content_part.done",
+                        "item_id": message_id.clone(),
+                        "output_index": 0,
+                        "content_index": 0,
+                        "part": {
+                            "type": "output_text",
+                            "text": completed.output[0].content[0].text,
+                            "annotations": []
+                        }
+                    });
+                    yield Ok::<_, Infallible>(sse_event(
+                        "response.content_part.done",
+                        &content_part_done_event.to_string(),
+                    ));
+                    let output_item_done_event = serde_json::json!({
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {
+                            "id": message_id,
+                            "type": "message",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [{
+                                "type": "output_text",
+                                "text": completed.output[0].content[0].text,
+                                "annotations": []
+                            }]
+                        }
+                    });
+                    yield Ok::<_, Infallible>(sse_event(
+                        "response.output_item.done",
+                        &output_item_done_event.to_string(),
+                    ));
+
                     let payload = serde_json::to_string(&ResponseStreamEnvelope {
                         event_type: "response.completed",
                         payload: ResponseStreamCompletedPayload {
@@ -304,27 +392,70 @@ async fn create_streaming_response(
                         },
                     })
                     .unwrap_or_default();
-                    yield Ok::<_, Infallible>(format!("data: {payload}\n\n"));
+                    yield Ok::<_, Infallible>(sse_event("response.completed", &payload));
                     break;
                 }
                 ChatStreamEvent::Failed(error) => {
-                    serde_json::json!({
+                    let failed = serde_json::json!({
                         "type": "response.failed",
-                        "response_id": response_id_for_task,
+                        "response_id": response_id_for_task.clone(),
                         "error": {"message": error}
                     })
-                    .to_string()
+                    .to_string();
+                    persist_response(
+                        &store_state,
+                        StoredResponseRecord {
+                            id: response_id_for_task.clone(),
+                            created_at,
+                            status: "failed".to_string(),
+                            model: model_name.clone(),
+                            input_items: input_items.clone(),
+                            output_text: None,
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            error: Some("Response generation failed".to_string()),
+                            metadata: metadata.clone(),
+                        },
+                        req.store,
+                    )
+                    .await;
+                    failed
                 }
                 ChatStreamEvent::ShuttingDown => {
-                    serde_json::json!({
+                    let failed = serde_json::json!({
                         "type": "response.failed",
-                        "response_id": response_id_for_task,
+                        "response_id": response_id_for_task.clone(),
                         "error": {"message": "Server is shutting down"}
                     })
-                    .to_string()
+                    .to_string();
+                    persist_response(
+                        &store_state,
+                        StoredResponseRecord {
+                            id: response_id_for_task.clone(),
+                            created_at,
+                            status: "failed".to_string(),
+                            model: model_name.clone(),
+                            input_items: input_items.clone(),
+                            output_text: None,
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            error: Some("Server is shutting down".to_string()),
+                            metadata: metadata.clone(),
+                        },
+                        req.store,
+                    )
+                    .await;
+                    failed
                 }
             };
-            yield Ok::<_, Infallible>(format!("data: {payload}\n\n"));
+            let event_type = match serde_json::from_str::<serde_json::Value>(&payload)
+                .ok()
+                .and_then(|value| value.get("type").and_then(|value| value.as_str()).map(str::to_string))
+            {
+                Some(value) => value,
+                None => "response.event".to_string(),
+            };
+            yield Ok::<_, Infallible>(sse_event(&event_type, &payload));
             if payload.contains("\"type\":\"response.failed\"") {
                 break;
             }
@@ -630,8 +761,12 @@ fn tool_parameter_text(value: &serde_json::Value) -> String {
 }
 
 fn assistant_output_item(text: String) -> ResponseOutputItem {
+    assistant_output_item_with_id(new_uuid(), text)
+}
+
+fn assistant_output_item_with_id(id: String, text: String) -> ResponseOutputItem {
     ResponseOutputItem {
-        id: new_uuid(),
+        id,
         item_type: "message",
         role: "assistant",
         content: vec![ResponseOutputContent {
@@ -679,6 +814,10 @@ fn now_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn sse_event(event_name: &str, payload: &str) -> String {
+    format!("event: {event_name}\ndata: {payload}\n\n")
 }
 
 #[cfg(test)]
@@ -876,5 +1015,25 @@ mod tests {
                 .expect_err("non-qwen35 multimodal should fail")
                 .contains("currently supported only for Qwen3.5")
         );
+    }
+
+    #[test]
+    fn sse_event_renders_named_event_and_data_lines() {
+        let payload = "{\"type\":\"response.created\"}";
+        let encoded = sse_event("response.created", payload);
+        assert!(encoded.starts_with("event: response.created\n"));
+        assert!(encoded.contains("\ndata: {\"type\":\"response.created\"}\n"));
+        assert!(encoded.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn assistant_output_item_with_id_preserves_message_id() {
+        let item = assistant_output_item_with_id("msg_custom".to_string(), "hello".to_string());
+        assert_eq!(item.id, "msg_custom");
+        assert_eq!(item.item_type, "message");
+        assert_eq!(item.role, "assistant");
+        assert_eq!(item.content.len(), 1);
+        assert_eq!(item.content[0].content_type, "output_text");
+        assert_eq!(item.content[0].text, "hello");
     }
 }
