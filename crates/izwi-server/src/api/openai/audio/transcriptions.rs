@@ -19,6 +19,7 @@ use tracing::info;
 use crate::api::request_context::RequestContext;
 use crate::error::ApiError;
 use crate::state::AppState;
+use super::resolve_audio_upload_limit_bytes;
 
 #[derive(Debug, Default)]
 struct TranscriptionRequest {
@@ -47,21 +48,6 @@ struct VerboseJsonTranscriptionResponse {
     rtf: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     izwi_asr_diagnostics: Option<serde_json::Value>,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct StreamEvent {
-    event: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    delta: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    language: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    audio_duration_secs: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
 }
 
 pub async fn transcriptions(
@@ -164,38 +150,10 @@ async fn transcriptions_stream(
         let _permit = match semaphore.acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => {
-                let err = StreamEvent {
-                    event: "error",
-                    text: None,
-                    delta: None,
-                    language: None,
-                    audio_duration_secs: None,
-                    error: Some("Server is shutting down".to_string()),
-                };
-                let _ = event_tx.send(serde_json::to_string(&err).unwrap_or_default());
-
-                let done = StreamEvent {
-                    event: "done",
-                    text: None,
-                    delta: None,
-                    language: None,
-                    audio_duration_secs: None,
-                    error: None,
-                };
-                let _ = event_tx.send(serde_json::to_string(&done).unwrap_or_default());
+                let _ = event_tx.send(transcript_error_event_payload("Server is shutting down"));
                 return;
             }
         };
-
-        let start = StreamEvent {
-            event: "start",
-            text: None,
-            delta: None,
-            language: None,
-            audio_duration_secs: None,
-            error: None,
-        };
-        let _ = event_tx.send(serde_json::to_string(&start).unwrap_or_default());
 
         let delta_tx = event_tx.clone();
         // Keep transcription streaming unbounded by wall-clock timeout so valid
@@ -207,53 +165,23 @@ async fn transcriptions_stream(
                 language.as_deref(),
                 Some(correlation_id.as_str()),
                 move |delta| {
-                    let event = StreamEvent {
-                        event: "delta",
-                        text: None,
-                        delta: Some(delta),
-                        language: None,
-                        audio_duration_secs: None,
-                        error: None,
-                    };
-                    let _ = delta_tx.send(serde_json::to_string(&event).unwrap_or_default());
+                    let _ = delta_tx.send(transcript_delta_event_payload(delta));
                 },
             )
             .await;
 
         match result {
             Ok(output) => {
-                let final_event = StreamEvent {
-                    event: "final",
-                    text: Some(output.text),
-                    delta: None,
-                    language: output.language,
-                    audio_duration_secs: Some(output.duration_secs),
-                    error: None,
-                };
-                let _ = event_tx.send(serde_json::to_string(&final_event).unwrap_or_default());
+                let _ = event_tx.send(transcript_done_event_payload(
+                    output.text,
+                    output.language,
+                    output.duration_secs,
+                ));
             }
             Err(err) => {
-                let error_event = StreamEvent {
-                    event: "error",
-                    text: None,
-                    delta: None,
-                    language: None,
-                    audio_duration_secs: None,
-                    error: Some(err.to_string()),
-                };
-                let _ = event_tx.send(serde_json::to_string(&error_event).unwrap_or_default());
+                let _ = event_tx.send(transcript_error_event_payload(&err.to_string()));
             }
         }
-
-        let done = StreamEvent {
-            event: "done",
-            text: None,
-            delta: None,
-            language: None,
-            audio_duration_secs: None,
-            error: None,
-        };
-        let _ = event_tx.send(serde_json::to_string(&done).unwrap_or_default());
     });
 
     let stream = async_stream::stream! {
@@ -447,11 +375,12 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
 fn multipart_field_error(field_name: &str, raw: &str) -> ApiError {
     let lowered = raw.to_ascii_lowercase();
     if lowered.contains("multipart/form-data") {
+        let limit_mb = resolve_audio_upload_limit_bytes() / (1024 * 1024);
         return ApiError::bad_request(format!(
             "Failed reading multipart '{}' field: {}. \
 This is commonly caused by oversized uploads or malformed multipart boundaries. \
-Ensure `Content-Type` includes a valid boundary (let your HTTP client set it automatically for FormData) and keep payload under 64 MiB.",
-            field_name, raw
+Ensure `Content-Type` includes a valid boundary (let your HTTP client set it automatically for FormData) and keep payload under {} MiB.",
+            field_name, raw, limit_mb
         ));
     }
 
@@ -459,6 +388,38 @@ Ensure `Content-Type` includes a valid boundary (let your HTTP client set it aut
         "Failed reading multipart '{}' field: {}",
         field_name, raw
     ))
+}
+
+fn transcript_delta_event_payload(delta: String) -> String {
+    serde_json::json!({
+        "type": "transcript.text.delta",
+        "delta": delta,
+    })
+    .to_string()
+}
+
+fn transcript_done_event_payload(
+    text: String,
+    language: Option<String>,
+    duration_secs: f32,
+) -> String {
+    serde_json::json!({
+        "type": "transcript.text.done",
+        "text": text,
+        "language": language,
+        "audio_duration_secs": duration_secs,
+    })
+    .to_string()
+}
+
+fn transcript_error_event_payload(message: &str) -> String {
+    serde_json::json!({
+        "type": "error",
+        "error": {
+            "message": message
+        }
+    })
+    .to_string()
 }
 
 fn format_srt(text: &str, duration_secs: f32) -> String {
@@ -504,5 +465,20 @@ mod tests {
         let vtt = format_vtt("hello", 1.23);
         assert!(srt.contains("-->"));
         assert!(vtt.starts_with("WEBVTT"));
+    }
+
+    #[test]
+    fn stream_delta_event_uses_openai_type_field() {
+        let payload = transcript_delta_event_payload("hello".to_string());
+        let json: serde_json::Value = serde_json::from_str(&payload).expect("json payload");
+        assert_eq!(json.get("type").and_then(|v| v.as_str()), Some("transcript.text.delta"));
+        assert_eq!(json.get("delta").and_then(|v| v.as_str()), Some("hello"));
+    }
+
+    #[test]
+    fn multipart_error_mentions_configured_limit() {
+        let expected_limit = resolve_audio_upload_limit_bytes() / (1024 * 1024);
+        let err = multipart_field_error("file", "multipart/form-data field parse failed");
+        assert!(err.message.contains(&format!("{expected_limit} MiB")));
     }
 }
