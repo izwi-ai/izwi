@@ -97,6 +97,7 @@ const audioMethodNames = [
   "getDiarizationRecord",
   "updateDiarizationRecord",
   "rerunDiarizationRecord",
+  "cancelDiarizationRecord",
   "regenerateDiarizationSummary",
   "createDiarizationRecord",
   "diarizationRecordAudioUrl",

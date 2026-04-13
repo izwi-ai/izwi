@@ -308,6 +308,28 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     );
   });
 
+  it("posts diarization cancels to the canonical cancel route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(updatedRecord), {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }),
+    );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+    const result = await client.cancelDiarizationRecord("diar-1");
+
+    expect(result).toEqual(updatedRecord);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost/v1/diarizations/diar-1/cancel",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
   it("posts diarization summary regenerations to the canonical summary route", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify(updatedRecord), {

@@ -1005,7 +1005,7 @@ impl DiarizationStore {
                     segments_json = ?27,
                     words_json = ?28,
                     utterances_json = ?29
-                WHERE id = ?1
+                WHERE id = ?1 AND processing_status IN ('pending', 'processing')
                 "#,
                 params![
                     record_id,
@@ -1702,6 +1702,38 @@ mod tests {
         }
     }
 
+    fn sample_complete_record() -> CompleteDiarizationRecord {
+        CompleteDiarizationRecord {
+            model_id: Some("diar_streaming_sortformer_4spk-v2.1".to_string()),
+            asr_model_id: Some("Parakeet-TDT-0.6B-v3".to_string()),
+            aligner_model_id: Some("Qwen3-ForcedAligner-0.6B".to_string()),
+            llm_model_id: Some("Qwen3.5-4B".to_string()),
+            min_speakers: Some(1),
+            max_speakers: Some(4),
+            min_speech_duration_ms: Some(240.0),
+            min_silence_duration_ms: Some(200.0),
+            enable_llm_refinement: true,
+            processing_time_ms: 480.0,
+            duration_secs: Some(12.0),
+            rtf: Some(0.4),
+            speaker_count: 2,
+            alignment_coverage: Some(0.95),
+            unattributed_words: 0,
+            llm_refined: true,
+            asr_text: "hello there".to_string(),
+            raw_transcript: "SPEAKER_00 [0.00s - 1.20s]: Hello there.".to_string(),
+            transcript: "SPEAKER_00 [0.00s - 1.20s]: Hello there.".to_string(),
+            summary_status: DiarizationSummaryStatus::Pending,
+            summary_model_id: Some("Qwen3.5-4B".to_string()),
+            summary_text: None,
+            summary_error: None,
+            summary_updated_at: None,
+            segments: sample_record().segments,
+            words: sample_record().words,
+            utterances: sample_record().utterances,
+        }
+    }
+
     #[tokio::test]
     async fn persists_speaker_name_overrides_and_corrected_summary() {
         let (store, root) = build_test_store();
@@ -1862,35 +1894,7 @@ mod tests {
         let completed = store
             .complete_record(
                 created.id.clone(),
-                CompleteDiarizationRecord {
-                    model_id: Some("diar_streaming_sortformer_4spk-v2.1".to_string()),
-                    asr_model_id: Some("Parakeet-TDT-0.6B-v3".to_string()),
-                    aligner_model_id: Some("Qwen3-ForcedAligner-0.6B".to_string()),
-                    llm_model_id: Some("Qwen3.5-4B".to_string()),
-                    min_speakers: Some(1),
-                    max_speakers: Some(4),
-                    min_speech_duration_ms: Some(240.0),
-                    min_silence_duration_ms: Some(200.0),
-                    enable_llm_refinement: true,
-                    processing_time_ms: 480.0,
-                    duration_secs: Some(12.0),
-                    rtf: Some(0.4),
-                    speaker_count: 2,
-                    alignment_coverage: Some(0.95),
-                    unattributed_words: 0,
-                    llm_refined: true,
-                    asr_text: "hello there".to_string(),
-                    raw_transcript: "SPEAKER_00 [0.00s - 1.20s]: Hello there.".to_string(),
-                    transcript: "SPEAKER_00 [0.00s - 1.20s]: Hello there.".to_string(),
-                    summary_status: DiarizationSummaryStatus::Pending,
-                    summary_model_id: Some("Qwen3.5-4B".to_string()),
-                    summary_text: None,
-                    summary_error: None,
-                    summary_updated_at: None,
-                    segments: sample_record().segments,
-                    words: sample_record().words,
-                    utterances: sample_record().utterances,
-                },
+                sample_complete_record(),
             )
             .await
             .expect("completion should succeed")
@@ -1903,6 +1907,66 @@ mod tests {
         assert!(completed.processing_error.is_none());
         assert_eq!(completed.speaker_count, 2);
         assert!(!completed.transcript.trim().is_empty());
+
+        std::fs::remove_dir_all(root).expect("test temp dir should be removable");
+    }
+
+    #[tokio::test]
+    async fn completion_does_not_overwrite_terminal_records() {
+        let (store, root) = build_test_store();
+        let mut pending = sample_record();
+        pending.processing_status = DiarizationProcessingStatus::Pending;
+        pending.processing_time_ms = 0.0;
+        pending.duration_secs = None;
+        pending.rtf = None;
+        pending.speaker_count = 0;
+        pending.alignment_coverage = None;
+        pending.unattributed_words = 0;
+        pending.llm_refined = false;
+        pending.asr_text = String::new();
+        pending.raw_transcript = String::new();
+        pending.transcript = String::new();
+        pending.summary_status = DiarizationSummaryStatus::NotRequested;
+        pending.summary_model_id = None;
+        pending.summary_text = None;
+        pending.summary_error = None;
+        pending.summary_updated_at = None;
+        pending.segments = Vec::new();
+        pending.words = Vec::new();
+        pending.utterances = Vec::new();
+
+        let created = store
+            .create_record(pending)
+            .await
+            .expect("pending record should be created");
+
+        let cancelled = store
+            .update_processing_status(
+                created.id.clone(),
+                DiarizationProcessingStatus::Failed,
+                Some("Cancelled by user.".to_string()),
+            )
+            .await
+            .expect("cancel status update should succeed")
+            .expect("record should exist");
+        assert_eq!(cancelled.processing_status, DiarizationProcessingStatus::Failed);
+
+        let completion = store
+            .complete_record(created.id.clone(), sample_complete_record())
+            .await
+            .expect("completion should execute");
+        assert!(
+            completion.is_none(),
+            "terminal records should not be overwritten by async completion"
+        );
+
+        let current = store
+            .get_record(created.id)
+            .await
+            .expect("record lookup should succeed")
+            .expect("record should exist");
+        assert_eq!(current.processing_status, DiarizationProcessingStatus::Failed);
+        assert_eq!(current.processing_error.as_deref(), Some("Cancelled by user."));
 
         std::fs::remove_dir_all(root).expect("test temp dir should be removable");
     }

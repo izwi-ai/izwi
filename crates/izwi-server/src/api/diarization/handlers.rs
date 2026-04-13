@@ -200,7 +200,7 @@ pub async fn rerun_record(
     Extension(ctx): Extension<RequestContext>,
     Path(record_id): Path<String>,
     Json(req): Json<RerunDiarizationRecordRequest>,
-) -> Result<Json<DiarizationRecord>, ApiError> {
+) -> Result<Response, ApiError> {
     let source_record = state
         .diarization_store
         .get_record(record_id.clone())
@@ -215,16 +215,49 @@ pub async fn rerun_record(
         .ok_or_else(|| ApiError::not_found("Diarization audio not found"))?;
 
     let rerun_request = build_rerun_create_request(&source_record, source_audio, req);
-    let record = execute_diarization_record(&state, rerun_request).await?;
-    maybe_spawn_summary_generation(
+    let placeholder = create_pending_record(&state, &rerun_request).await?;
+    spawn_diarization_processing_task(
         state.runtime.clone(),
         state.diarization_store.clone(),
         state.request_semaphore.clone(),
-        &record,
+        state.request_timeout_secs,
+        placeholder.id.clone(),
+        rerun_request,
         Some(ctx.correlation_id),
     );
 
-    Ok(Json(record))
+    Ok((StatusCode::ACCEPTED, Json(placeholder)).into_response())
+}
+
+pub async fn cancel_record(
+    State(state): State<AppState>,
+    Path(record_id): Path<String>,
+) -> Result<Json<DiarizationRecord>, ApiError> {
+    let existing = state
+        .diarization_store
+        .get_record(record_id.clone())
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("Diarization record not found"))?;
+
+    if existing.processing_status != DiarizationProcessingStatus::Pending
+        && existing.processing_status != DiarizationProcessingStatus::Processing
+    {
+        return Ok(Json(existing));
+    }
+
+    let cancelled = state
+        .diarization_store
+        .update_processing_status(
+            record_id,
+            DiarizationProcessingStatus::Failed,
+            Some("Cancelled by user.".to_string()),
+        )
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("Diarization record not found"))?;
+
+    Ok(Json(cancelled))
 }
 
 pub async fn create_record(
@@ -284,63 +317,6 @@ pub async fn regenerate_summary(
     );
 
     Ok(Json(record))
-}
-
-async fn execute_diarization_record(
-    state: &AppState,
-    parsed: ParsedDiarizationCreateRequest,
-) -> Result<DiarizationRecord, ApiError> {
-    validate_speaker_bounds(parsed.min_speakers, parsed.max_speakers)?;
-    let artifacts = generate_diarization_artifacts(
-        state.runtime.clone(),
-        state.request_semaphore.clone(),
-        state.request_timeout_secs,
-        &parsed,
-        None,
-    )
-    .await?;
-
-    state
-        .diarization_store
-        .create_record(NewDiarizationRecord {
-            model_id: parsed.model_id,
-            asr_model_id: parsed.asr_model_id,
-            aligner_model_id: parsed.aligner_model_id,
-            llm_model_id: parsed.llm_model_id,
-            processing_status: DiarizationProcessingStatus::Ready,
-            processing_error: None,
-            min_speakers: parsed.min_speakers,
-            max_speakers: parsed.max_speakers,
-            min_speech_duration_ms: parsed.min_speech_duration_ms,
-            min_silence_duration_ms: parsed.min_silence_duration_ms,
-            enable_llm_refinement: parsed.enable_llm_refinement.unwrap_or(false),
-            processing_time_ms: artifacts.processing_time_ms,
-            duration_secs: Some(artifacts.duration_secs),
-            rtf: artifacts.rtf,
-            speaker_count: artifacts.speaker_count,
-            alignment_coverage: artifacts.alignment_coverage,
-            unattributed_words: artifacts.unattributed_words,
-            llm_refined: artifacts.llm_refined,
-            asr_text: artifacts.asr_text,
-            raw_transcript: artifacts.raw_transcript,
-            transcript: artifacts.transcript,
-            summary_status: artifacts.summary_status,
-            summary_model_id: artifacts.summary_model_id,
-            summary_text: None,
-            summary_error: None,
-            summary_updated_at: None,
-            segments: artifacts.segments,
-            words: artifacts.words,
-            utterances: artifacts.utterances,
-            audio_mime_type: parsed
-                .audio_mime_type
-                .unwrap_or_else(|| "audio/wav".to_string()),
-            audio_filename: parsed.audio_filename,
-            speaker_name_overrides: BTreeMap::new(),
-            audio_bytes: parsed.audio_bytes,
-        })
-        .await
-        .map_err(map_store_error)
 }
 
 async fn create_pending_record(

@@ -12,6 +12,7 @@ const apiMocks = vi.hoisted(() => ({
   getDiarizationRecord: vi.fn(),
   updateDiarizationRecord: vi.fn(),
   rerunDiarizationRecord: vi.fn(),
+  cancelDiarizationRecord: vi.fn(),
   regenerateDiarizationSummary: vi.fn(),
   deleteDiarizationRecord: vi.fn(),
   createDiarizationRecord: vi.fn(),
@@ -25,6 +26,7 @@ vi.mock("@/api", () => ({
     getDiarizationRecord: apiMocks.getDiarizationRecord,
     updateDiarizationRecord: apiMocks.updateDiarizationRecord,
     rerunDiarizationRecord: apiMocks.rerunDiarizationRecord,
+    cancelDiarizationRecord: apiMocks.cancelDiarizationRecord,
     regenerateDiarizationSummary: apiMocks.regenerateDiarizationSummary,
     deleteDiarizationRecord: apiMocks.deleteDiarizationRecord,
     createDiarizationRecord: apiMocks.createDiarizationRecord,
@@ -202,6 +204,7 @@ describe("DiarizationPage routes", () => {
     apiMocks.getDiarizationRecord.mockReset();
     apiMocks.updateDiarizationRecord.mockReset();
     apiMocks.rerunDiarizationRecord.mockReset();
+    apiMocks.cancelDiarizationRecord.mockReset();
     apiMocks.regenerateDiarizationSummary.mockReset();
     apiMocks.deleteDiarizationRecord.mockReset();
     apiMocks.createDiarizationRecord.mockReset();
@@ -217,6 +220,11 @@ describe("DiarizationPage routes", () => {
       },
     }));
     apiMocks.getDiarizationRecord.mockResolvedValue(fullRecord);
+    apiMocks.cancelDiarizationRecord.mockResolvedValue({
+      ...fullRecord,
+      processing_status: "failed",
+      processing_error: "Cancelled by user.",
+    });
     apiMocks.createDiarizationRecord.mockResolvedValue(fullRecord);
     apiMocks.diarizationRecordAudioUrl.mockReturnValue("/audio/meeting.wav");
   });
@@ -668,6 +676,34 @@ describe("DiarizationPage routes", () => {
     expect(
       await screen.findByRole("heading", { name: "Diarization" }),
     ).toBeInTheDocument();
+  });
+
+  it("cancels a pending diarization record from the detail page", async () => {
+    apiMocks.listDiarizationRecords.mockResolvedValue([pendingSummaryRecord]);
+    apiMocks.getDiarizationRecord.mockResolvedValue({
+      ...fullRecord,
+      processing_status: "processing" as const,
+      processing_error: null,
+      transcript: "",
+      raw_transcript: "",
+      utterances: [],
+      words: [],
+      segments: [],
+      summary_status: "not_requested" as const,
+      summary_text: null,
+    });
+
+    renderRoute("/diarization/diar-1");
+
+    await waitFor(() =>
+      expect(apiMocks.getDiarizationRecord).toHaveBeenCalledWith("diar-1"),
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: /Cancel run/i }));
+
+    await waitFor(() =>
+      expect(apiMocks.cancelDiarizationRecord).toHaveBeenCalledWith("diar-1"),
+    );
   });
 
   it("deletes from the diarization history menu and refreshes the table", async () => {
