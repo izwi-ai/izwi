@@ -1,3 +1,62 @@
+# Voice Configuration Modal Redesign Plan
+
+## Goal
+
+Redesign the `/voice` "Voice Configuration" modal into a cleaner, more professional control surface that follows the OpenAI GPT-5.4 frontend guidance for app UI:
+
+- calm surface hierarchy
+- strong typography and spacing
+- minimal chrome
+- cards only when the card is the interaction
+- avoid dashboard-card mosaics and thick borders on every region
+
+Source:
+`https://developers.openai.com/blog/designing-delightful-frontends-with-gpt-5-4`
+
+## Constraints
+
+- Preserve the existing Izwi color system and overall product visual language.
+- Keep the current tab structure: `Setup`, `Models`, `Agent`, `Memory`.
+- Reduce boxed/card treatments wherever plain layout, rows, dividers, or list structure can carry the UI.
+- Keep the modal functional on desktop and mobile.
+- Use motion only where it improves hierarchy or modal presence.
+
+## Phases
+
+- [x] Phase 1: Redesign the modal shell and tab navigation
+  Scope:
+  Replace the current card-like modal shell and tab strip with a calmer two-zone layout: stronger header hierarchy, lighter framing, and tab navigation that feels like product navigation instead of pill-heavy controls.
+  Deliverable:
+  The modal opens with a cleaner structure, reduced chrome, improved spacing, and tab navigation that scales well across breakpoints.
+  Verification:
+  `npm run typecheck`
+  Commit:
+  `feat(ui): redesign voice config modal shell`
+
+- [ ] Phase 2: Redesign `Setup` and `Models` into cleaner operational layouts
+  Scope:
+  Rework `Setup` and `Models` so they rely on sections, lists, dividers, and row layouts instead of stacked cards. Simplify the setup overview, runtime mode controls, speaker selection area, and model lifecycle rows.
+  Deliverable:
+  The first two tabs feel denser, clearer, and more professional, with cards reserved only for actual interaction containers where needed.
+  Verification:
+  `npm run typecheck`
+  Commit:
+  `feat(ui): redesign voice setup and models tabs`
+
+- [ ] Phase 3: Redesign `Agent` and `Memory` tabs and finish modal polish
+  Scope:
+  Rework prompt editing and memory management to match the new modal system, including better hierarchy, lighter list treatments, and final responsive/polish adjustments across all tabs.
+  Deliverable:
+  All tabs share one consistent design language and the modal reads as a cohesive product settings surface rather than four unrelated panels.
+  Verification:
+  `npm run typecheck`
+  Commit:
+  `feat(ui): redesign voice agent and memory tabs`
+
+## Review
+
+- Phase 1 complete: replaced the heavy card-style modal shell with a calmer two-zone settings layout, upgraded the header hierarchy, and turned the tab strip into product-style section navigation with lighter chrome.
+
 # Diarization Alignment Plan
 
 ## Goal
