@@ -1976,101 +1976,132 @@ export function VoicePage({
   );
 
   const renderPromptSettings = () => (
-    <section className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 space-y-4">
-      <div className="flex items-start justify-between gap-3">
+    <section className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_240px]">
+      <div className="space-y-4">
         <div>
-          <h3 className="text-sm font-medium text-white">Voice Agent Prompt</h3>
-          <p className="text-xs text-[var(--text-muted)] mt-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+              Voice agent prompt
+            </h3>
+            <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-2.5 py-1 text-[10px] font-medium text-[var(--text-muted)]">
+              {promptStatusLabel}
+            </span>
+          </div>
+          <p className="mt-1 text-sm text-[var(--text-muted)]">
             Customize how the assistant responds in voice mode. Prompt updates
             apply the next time you start a voice session.
           </p>
         </div>
+
+        {isVoiceProfileLoading ? (
+          <p className="text-sm text-[var(--text-muted)]">
+            Loading saved prompt...
+          </p>
+        ) : (
+          <>
+            <Textarea
+              value={systemPromptDraft}
+              onChange={(event) => setSystemPromptDraft(event.target.value)}
+              placeholder={defaultSystemPrompt}
+              className="min-h-[260px] rounded-[24px] border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-4 py-4"
+            />
+            <div className="flex flex-col gap-3 border-t border-[var(--border-muted)] pt-4 sm:flex-row sm:items-center sm:justify-between">
+              <p className="text-[11px] leading-relaxed text-[var(--text-muted)]">
+                Saved prompt is used for websocket `session_start` and the legacy
+                agent-session fallback path.
+              </p>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 rounded-full px-3 text-xs"
+                  onClick={() => setSystemPromptDraft(defaultSystemPrompt)}
+                  disabled={
+                    isVoiceProfileSaving ||
+                    systemPromptDraft === defaultSystemPrompt
+                  }
+                >
+                  Restore default
+                </Button>
+                <Button
+                  size="sm"
+                  className="h-8 rounded-full px-3 text-xs"
+                  onClick={() => void handleSaveSystemPrompt()}
+                  disabled={isVoiceProfileSaving || !isSystemPromptDirty}
+                >
+                  {isVoiceProfileSaving ? "Saving..." : "Save prompt"}
+                </Button>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+
+      <div className="space-y-3 lg:border-l lg:border-[var(--border-muted)] lg:pl-6">
+        <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--text-subtle)]">
+          Behavior
+        </p>
+        <p className="text-sm leading-relaxed text-[var(--text-muted)]">
+          Keep this prompt short and operational. The strongest results usually
+          come from direct guidance, tone constraints, and any must-follow rules.
+        </p>
         {runtimeStatus !== "idle" && (
-          <span className="text-[11px] rounded-full border border-amber-500/30 bg-amber-500/10 px-2.5 py-1 text-amber-200">
+          <span className="inline-flex items-center rounded-full border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-2.5 py-1 text-[10px] font-medium text-[var(--status-warning-text)]">
             Restart required
           </span>
         )}
       </div>
-
-      {isVoiceProfileLoading ? (
-        <p className="text-xs text-[var(--text-muted)]">
-          Loading saved prompt...
-        </p>
-      ) : (
-        <>
-          <Textarea
-            value={systemPromptDraft}
-            onChange={(event) => setSystemPromptDraft(event.target.value)}
-            placeholder={defaultSystemPrompt}
-            className="min-h-[220px] bg-[var(--bg-surface-2)] border-[var(--border-muted)]"
-          />
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <p className="text-[11px] text-[var(--text-muted)]">
-              Saved prompt is used for websocket `session_start` and the legacy
-              agent-session fallback path.
-            </p>
-            <div className="flex flex-wrap items-center gap-2">
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => setSystemPromptDraft(defaultSystemPrompt)}
-                disabled={
-                  isVoiceProfileSaving ||
-                  systemPromptDraft === defaultSystemPrompt
-                }
-              >
-                Restore Default
-              </Button>
-              <Button
-                size="sm"
-                onClick={() => void handleSaveSystemPrompt()}
-                disabled={isVoiceProfileSaving || !isSystemPromptDirty}
-              >
-                {isVoiceProfileSaving ? "Saving..." : "Save Prompt"}
-              </Button>
-            </div>
-          </div>
-        </>
-      )}
     </section>
   );
 
   const renderMemorySettings = () => (
-    <section className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 space-y-4">
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <h3 className="text-sm font-medium text-white">
-            Observational Memory
-          </h3>
-          <p className="text-xs text-[var(--text-muted)] mt-1">
+    <section className="space-y-6">
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_240px]">
+        <div className="space-y-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+              Observational memory
+            </h3>
+            <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-2.5 py-1 text-[10px] font-medium text-[var(--text-muted)]">
+              {observationalMemoryEnabled ? "Enabled" : "Disabled"}
+            </span>
+          </div>
+          <p className="text-sm text-[var(--text-muted)]">
             Save stable user preferences and facts from modular voice turns so
             future responses can stay grounded.
           </p>
         </div>
-        <div className="flex items-center gap-3">
-          <span className="text-[11px] text-[var(--text-muted)]">
-            {observationalMemoryEnabled ? "Enabled" : "Disabled"}
-          </span>
-          <Switch
-            checked={observationalMemoryEnabled}
-            onCheckedChange={(checked) => {
-              void handleSetObservationalMemoryEnabled(checked);
-            }}
-            disabled={isVoiceObservationsMutating}
-            aria-label="Toggle observational memory"
-          />
+
+        <div className="space-y-3 lg:border-l lg:border-[var(--border-muted)] lg:pl-6">
+          <div className="flex items-center gap-3">
+            <Switch
+              checked={observationalMemoryEnabled}
+              onCheckedChange={(checked) => {
+                void handleSetObservationalMemoryEnabled(checked);
+              }}
+              disabled={isVoiceObservationsMutating}
+              aria-label="Toggle observational memory"
+            />
+            <span className="text-sm text-[var(--text-primary)]">
+              Capture new memories
+            </span>
+          </div>
+          <p className="text-[11px] leading-relaxed text-[var(--text-muted)]">
+            Memory is currently applied only to modular `/voice` conversations
+            and can be reviewed or deleted here.
+          </p>
         </div>
       </div>
 
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <p className="text-[11px] text-[var(--text-muted)]">
-          Memory is currently applied only to modular `/voice` conversations
-          and can be reviewed or deleted here.
+      <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[var(--border-muted)] pt-4">
+        <p className="text-sm text-[var(--text-muted)]">
+          Review recent observations, refresh this list, or clear the stored set.
         </p>
         <div className="flex items-center gap-2">
           <Button
             variant="ghost"
             size="sm"
+            className="h-8 rounded-full px-3 text-xs"
             onClick={() => void loadVoiceObservations()}
             disabled={isVoiceObservationsLoading}
           >
@@ -2079,58 +2110,58 @@ export function VoicePage({
           <Button
             variant="destructive"
             size="sm"
+            className="h-8 rounded-full px-3 text-xs"
             onClick={() => void handleClearObservations()}
             disabled={
               isVoiceObservationsMutating || voiceObservations.length === 0
             }
           >
-            Clear All
+            Clear all
           </Button>
         </div>
       </div>
 
-      <div className="space-y-2 max-h-[360px] overflow-y-auto pr-1">
+      <div className="max-h-[360px] overflow-y-auto rounded-[24px] border border-[var(--border-muted)] bg-[color-mix(in_srgb,var(--bg-surface-1)_70%,transparent)]">
         {isVoiceObservationsLoading ? (
-          <p className="text-xs text-[var(--text-muted)]">
+          <div className="px-4 py-4 text-sm text-[var(--text-muted)] sm:px-5">
             Loading voice memories...
-          </p>
+          </div>
         ) : voiceObservations.length === 0 ? (
-          <p className="text-xs text-[var(--text-muted)]">
+          <div className="px-4 py-4 text-sm text-[var(--text-muted)] sm:px-5">
             No voice memories stored yet.
-          </p>
+          </div>
         ) : (
-          voiceObservations.map((observation) => (
+          voiceObservations.map((observation, index) => (
             <div
               key={observation.id}
-              className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-3 py-2.5"
+              className={cn(
+                "flex flex-col gap-3 px-4 py-4 sm:flex-row sm:items-start sm:justify-between sm:px-5",
+                index > 0 && "border-t border-[var(--border-muted)]",
+              )}
             >
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-[10px] uppercase tracking-wide text-[var(--text-muted)]">
-                      {observation.category}
-                    </span>
-                    <span className="text-[10px] text-[var(--text-muted)]">
-                      confidence {observation.confidence.toFixed(2)}
-                    </span>
-                    <span className="text-[10px] text-[var(--text-muted)]">
-                      seen {observation.times_seen}x
-                    </span>
-                  </div>
-                  <p className="mt-1 text-sm text-[var(--text-primary)]">
-                    {observation.summary}
-                  </p>
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2 text-[10px] font-medium uppercase tracking-[0.16em] text-[var(--text-subtle)]">
+                  <span>{observation.category}</span>
+                  <span className="normal-case tracking-normal text-[var(--text-muted)]">
+                    confidence {observation.confidence.toFixed(2)}
+                  </span>
+                  <span className="normal-case tracking-normal text-[var(--text-muted)]">
+                    seen {observation.times_seen}x
+                  </span>
                 </div>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="shrink-0"
-                  onClick={() => void handleForgetObservation(observation.id)}
-                  disabled={isVoiceObservationsMutating}
-                >
-                  Forget
-                </Button>
+                <p className="mt-2 text-sm leading-relaxed text-[var(--text-primary)]">
+                  {observation.summary}
+                </p>
               </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-8 shrink-0 rounded-full px-3 text-xs"
+                onClick={() => void handleForgetObservation(observation.id)}
+                disabled={isVoiceObservationsMutating}
+              >
+                Forget
+              </Button>
             </div>
           ))
         )}
