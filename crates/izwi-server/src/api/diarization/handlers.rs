@@ -312,6 +312,7 @@ pub async fn regenerate_summary(
         state.runtime.clone(),
         state.diarization_store.clone(),
         state.request_semaphore.clone(),
+        state.request_timeout_secs,
         &record,
         Some(ctx.correlation_id),
     );
@@ -456,6 +457,7 @@ fn spawn_diarization_processing_task(
                             runtime.clone(),
                             diarization_store.clone(),
                             semaphore.clone(),
+                            request_timeout_secs,
                             &record,
                             correlation_id,
                         );
@@ -644,6 +646,7 @@ fn maybe_spawn_summary_generation(
     runtime: Arc<RuntimeService>,
     diarization_store: Arc<DiarizationStore>,
     semaphore: Arc<tokio::sync::Semaphore>,
+    summary_timeout_secs: u64,
     record: &DiarizationRecord,
     correlation_id: Option<String>,
 ) {
@@ -655,6 +658,7 @@ fn maybe_spawn_summary_generation(
         runtime,
         diarization_store,
         semaphore,
+        summary_timeout_secs,
         record.id.clone(),
         record.transcript.clone(),
         correlation_id,
@@ -665,22 +669,38 @@ fn spawn_summary_generation_task(
     runtime: Arc<RuntimeService>,
     diarization_store: Arc<DiarizationStore>,
     semaphore: Arc<tokio::sync::Semaphore>,
+    summary_timeout_secs: u64,
     record_id: String,
     transcript: String,
     correlation_id: Option<String>,
 ) {
     tokio::spawn(async move {
-        let _permit = match semaphore.acquire_owned().await {
+        let permit = match semaphore.acquire_owned().await {
             Ok(permit) => permit,
-            Err(_) => return,
+            Err(_) => {
+                persist_summary_update(
+                    &diarization_store,
+                    record_id.as_str(),
+                    summary_failure_update("Summary generation unavailable: request queue closed."),
+                )
+                .await;
+                return;
+            }
         };
 
         let summary_result = if transcript.trim().is_empty() {
             Err("Summary generation failed: transcript is empty".to_string())
         } else {
-            generate_diarization_summary(runtime, transcript.as_str(), correlation_id.as_deref())
-                .await
+            generate_diarization_summary_with_timeout(
+                runtime,
+                transcript.as_str(),
+                correlation_id.as_deref(),
+                summary_timeout_secs,
+            )
+            .await
         };
+
+        drop(permit);
 
         let summary_update = match summary_result {
             Ok(summary_text) => UpdateDiarizationSummary {
@@ -690,26 +710,25 @@ fn spawn_summary_generation_task(
                 error: None,
                 updated_at: None,
             },
-            Err(err) => UpdateDiarizationSummary {
-                status: DiarizationSummaryStatus::Failed,
-                model_id: Some(DEFAULT_DIARIZATION_SUMMARY_MODEL.to_string()),
-                text: None,
-                error: Some(truncate_summary_error(err.as_str())),
-                updated_at: None,
-            },
+            Err(err) => summary_failure_update(err.as_str()),
         };
 
-        if let Err(err) = diarization_store
-            .update_summary(record_id.clone(), summary_update)
-            .await
-        {
-            tracing::warn!(
-                "diarization summary persist failed: record_id={} error={}",
-                record_id,
-                err
-            );
-        }
+        persist_summary_update(&diarization_store, record_id.as_str(), summary_update).await;
     });
+}
+
+async fn generate_diarization_summary_with_timeout(
+    runtime: Arc<RuntimeService>,
+    transcript: &str,
+    correlation_id: Option<&str>,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    tokio::time::timeout(
+        Duration::from_secs(timeout_secs.max(1)),
+        generate_diarization_summary(runtime, transcript, correlation_id),
+    )
+    .await
+    .map_err(|_| summary_timeout_error(timeout_secs))?
 }
 
 async fn generate_diarization_summary(
@@ -750,6 +769,49 @@ async fn generate_diarization_summary(
 
     sanitize_summary_output(generation.text.as_str())
         .ok_or_else(|| "Summary generation returned empty text".to_string())
+}
+
+fn summary_failure_update(error: &str) -> UpdateDiarizationSummary {
+    UpdateDiarizationSummary {
+        status: DiarizationSummaryStatus::Failed,
+        model_id: Some(DEFAULT_DIARIZATION_SUMMARY_MODEL.to_string()),
+        text: None,
+        error: Some(truncate_summary_error(error)),
+        updated_at: None,
+    }
+}
+
+fn summary_timeout_error(timeout_secs: u64) -> String {
+    format!(
+        "Summary generation timed out after {} seconds.",
+        timeout_secs.max(1)
+    )
+}
+
+async fn persist_summary_update(
+    diarization_store: &DiarizationStore,
+    record_id: &str,
+    update: UpdateDiarizationSummary,
+) {
+    match diarization_store
+        .update_summary(record_id.to_string(), update)
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            tracing::warn!(
+                "diarization summary persist skipped: record_id={} not found",
+                record_id
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                "diarization summary persist failed: record_id={} error={}",
+                record_id,
+                err
+            );
+        }
+    }
 }
 
 fn sanitize_summary_output(raw: &str) -> Option<String> {
@@ -1179,6 +1241,31 @@ mod tests {
             sanitize_summary_output(raw).as_deref(),
             Some("Summary text.")
         );
+    }
+
+    #[test]
+    fn summary_timeout_error_enforces_minimum_one_second() {
+        assert_eq!(
+            summary_timeout_error(0),
+            "Summary generation timed out after 1 seconds."
+        );
+        assert_eq!(
+            summary_timeout_error(12),
+            "Summary generation timed out after 12 seconds."
+        );
+    }
+
+    #[test]
+    fn summary_failure_update_sets_failed_status_and_truncates_error() {
+        let update = summary_failure_update("x".repeat(500).as_str());
+        assert_eq!(update.status, DiarizationSummaryStatus::Failed);
+        assert_eq!(
+            update.model_id.as_deref(),
+            Some(DEFAULT_DIARIZATION_SUMMARY_MODEL)
+        );
+        assert!(update.text.is_none());
+        let error = update.error.expect("error should be populated");
+        assert_eq!(error.len(), 320);
     }
 }
 
