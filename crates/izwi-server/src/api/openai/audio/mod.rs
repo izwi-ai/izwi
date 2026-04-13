@@ -6,6 +6,7 @@ pub mod transcriptions;
 
 use axum::{extract::DefaultBodyLimit, routing::post, Router};
 
+use crate::api::openai::compat::{compatibility_profile, OpenAiCompatibilityProfile};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -34,11 +35,19 @@ pub fn router() -> Router<AppState> {
 
 pub fn resolve_audio_upload_limit_bytes() -> usize {
     const MIB: usize = 1024 * 1024;
-    const OPENAI_DEFAULT_MB: usize = 25;
+    let default_mb = default_audio_upload_limit_mb(compatibility_profile());
     std::env::var("IZWI_OPENAI_AUDIO_UPLOAD_LIMIT_MB")
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|mb| *mb > 0)
-        .unwrap_or(OPENAI_DEFAULT_MB)
+        .unwrap_or(default_mb)
         .saturating_mul(MIB)
+}
+
+fn default_audio_upload_limit_mb(profile: OpenAiCompatibilityProfile) -> usize {
+    if profile.is_relaxed() {
+        64
+    } else {
+        25
+    }
 }

@@ -11,6 +11,9 @@ use axum::{
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 
+use crate::api::openai::compat::{
+    compatibility_profile, strict_guardrail_message, OpenAiCompatibilityProfile,
+};
 use crate::api::request_context::RequestContext;
 use crate::app::chat::{
     generate_chat, parse_chat_model, spawn_chat_stream, ChatExecutionRequest, ChatStreamEvent,
@@ -110,7 +113,8 @@ struct OpenAiChatCompletionResponse {
     model: String,
     choices: Vec<OpenAiChoice>,
     usage: OpenAiUsage,
-    izwi_generation_time_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    izwi_generation_time_ms: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -551,36 +555,40 @@ fn stream_tool_call_deltas(tool_calls: &[OpenAiOutputToolCall]) -> Vec<OpenAiDel
         .collect()
 }
 
-fn validate_chat_request_compatibility(req: &ChatCompletionRequest) -> Result<(), ApiError> {
+fn validate_chat_request_compatibility(
+    req: &ChatCompletionRequest,
+    profile: OpenAiCompatibilityProfile,
+) -> Result<(), ApiError> {
     if req.n.unwrap_or(1) != 1 {
         return Err(ApiError::bad_request(
             "This server currently supports only `n=1` for chat completions",
         ));
     }
 
-    if req
-        .frequency_penalty
-        .is_some_and(|value| value.abs() > f32::EPSILON)
+    if profile.is_strict()
+        && req
+            .frequency_penalty
+            .is_some_and(|value| value.abs() > f32::EPSILON)
     {
-        return Err(ApiError::bad_request(
-            "`frequency_penalty` is not supported by this runtime",
-        ));
+        return Err(ApiError::bad_request(strict_guardrail_message(
+            "frequency_penalty",
+        )));
     }
 
-    if req.stop.is_some() {
-        return Err(ApiError::bad_request(
-            "`stop` sequences are not currently supported by this runtime",
-        ));
+    if profile.is_strict() && req.stop.is_some() {
+        return Err(ApiError::bad_request(strict_guardrail_message("stop")));
     }
 
-    if let Some(tool_choice) = &req.tool_choice {
-        if !tool_choice.is_null()
-            && tool_choice.as_str() != Some("auto")
-            && tool_choice.as_str() != Some("none")
-        {
-            return Err(ApiError::bad_request(
-                "Unsupported `tool_choice`. Supported values: \"auto\", \"none\", or null",
-            ));
+    if profile.is_strict() {
+        if let Some(tool_choice) = &req.tool_choice {
+            if !tool_choice.is_null()
+                && tool_choice.as_str() != Some("auto")
+                && tool_choice.as_str() != Some("none")
+            {
+                return Err(ApiError::bad_request(strict_guardrail_message(
+                    "tool_choice (supported values: \"auto\", \"none\", or null)",
+                )));
+            }
         }
     }
 
@@ -592,7 +600,8 @@ pub async fn completions(
     Extension(ctx): Extension<RequestContext>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
-    validate_chat_request_compatibility(&req)?;
+    let compat_profile = compatibility_profile();
+    validate_chat_request_compatibility(&req, compat_profile)?;
 
     let variant = parse_chat_model(&req.model)?;
     let (messages, media_inputs) = to_core_messages_with_media(
@@ -625,7 +634,7 @@ pub async fn completions(
     };
 
     if req.stream.unwrap_or(false) {
-        let stream_response = complete_stream(state, req, execution_request).await?;
+        let stream_response = complete_stream(state, req, execution_request, compat_profile).await?;
         return Ok(stream_response.into_response());
     }
 
@@ -657,7 +666,9 @@ pub async fn completions(
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
         },
-        izwi_generation_time_ms: generation.generation_time_ms,
+        izwi_generation_time_ms: compat_profile
+            .is_relaxed()
+            .then_some(generation.generation_time_ms),
     };
 
     Ok(Json(response).into_response())
@@ -667,6 +678,7 @@ async fn complete_stream(
     state: AppState,
     req: ChatCompletionRequest,
     execution_request: ChatExecutionRequest,
+    compat_profile: OpenAiCompatibilityProfile,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let include_usage = req
         .stream_options
@@ -754,7 +766,9 @@ async fn complete_stream(
                                 total_tokens: generation.prompt_tokens
                                     + generation.tokens_generated,
                             }),
-                            izwi_generation_time_ms: Some(generation.generation_time_ms),
+                            izwi_generation_time_ms: compat_profile
+                                .is_relaxed()
+                                .then_some(generation.generation_time_ms),
                         })
                         .unwrap_or_default(),
                         true,
@@ -1010,7 +1024,8 @@ mod tests {
             enable_thinking: None,
         };
 
-        let err = validate_chat_request_compatibility(&req).expect_err("should reject");
+        let err = validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Strict)
+            .expect_err("should reject");
         assert!(err.message.contains("frequency_penalty"));
     }
 
@@ -1039,8 +1054,38 @@ mod tests {
             enable_thinking: None,
         };
 
-        let err = validate_chat_request_compatibility(&req).expect_err("should reject");
+        let err = validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Strict)
+            .expect_err("should reject");
         assert!(err.message.contains("stop"));
+    }
+
+    #[test]
+    fn relaxed_profile_allows_stop_and_frequency_penalty_passthrough() {
+        let req = ChatCompletionRequest {
+            model: "Qwen3-8B-GGUF".to_string(),
+            messages: vec![OpenAiInboundMessage {
+                role: "user".to_string(),
+                content: Some(OpenAiInboundContent::Text("hello".to_string())),
+                tool_calls: None,
+            }],
+            max_tokens: None,
+            max_completion_tokens: None,
+            stream: None,
+            stream_options: None,
+            n: Some(1),
+            temperature: None,
+            top_p: None,
+            frequency_penalty: Some(1.0),
+            presence_penalty: None,
+            stop: Some(json!(["END"])),
+            user: None,
+            tools: None,
+            tool_choice: None,
+            enable_thinking: None,
+        };
+
+        validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Relaxed)
+            .expect("relaxed mode should allow passthrough");
     }
 
     #[test]

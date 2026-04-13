@@ -16,6 +16,7 @@ use tracing::info;
 
 use crate::api::request_context::RequestContext;
 use crate::api::saved_voices::resolve_saved_voice_reference;
+use crate::api::openai::compat::compatibility_profile;
 use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::audio::AudioFormat;
@@ -608,6 +609,9 @@ fn resolve_streaming_mode(req: &SpeechRequest) -> Result<bool, ApiError> {
 }
 
 fn allow_speech_format_fallback() -> bool {
+    if compatibility_profile().is_relaxed() {
+        return true;
+    }
     std::env::var("IZWI_OPENAI_SPEECH_FORMAT_FALLBACK")
         .ok()
         .map(|value| matches!(
