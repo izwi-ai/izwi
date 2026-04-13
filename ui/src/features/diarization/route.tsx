@@ -508,6 +508,20 @@ export function DiarizationPage({
     [latestRecord?.id, navigate, refreshHistory],
   );
 
+  const handleCancelProcessing = useCallback(
+    async (targetRecordId: string) => {
+      const cancelledRecord = await api.cancelDiarizationRecord(targetRecordId);
+      await Promise.all([
+        refreshHistory(),
+        recordId === targetRecordId ? refreshRecord() : Promise.resolve(),
+      ]);
+      if (latestRecord?.id === targetRecordId) {
+        setLatestRecord(cancelledRecord);
+      }
+    },
+    [latestRecord?.id, recordId, refreshHistory, refreshRecord],
+  );
+
   const handleRegenerateSummary = useCallback(
     async (targetRecordId: string) => {
       if (!summaryModelReady) {
@@ -565,6 +579,7 @@ export function DiarizationPage({
             onDelete={handleDeleteRecord}
             onSaveSpeakerCorrections={handleSaveSpeakerCorrections}
             onRerun={handleRerunRecord}
+            onCancelProcessing={handleCancelProcessing}
             onRegenerateSummary={handleRegenerateSummary}
           />
         </>

@@ -2016,6 +2016,15 @@ export class AudioApiClient {
     );
   }
 
+  async cancelDiarizationRecord(recordId: string): Promise<DiarizationRecord> {
+    return this.http.request(
+      `${this.diarizationRecordPath(recordId)}/cancel`,
+      {
+        method: "POST",
+      },
+    );
+  }
+
   async createDiarizationRecord(
     request: DiarizationRecordCreateRequest,
   ): Promise<DiarizationRecord> {

@@ -76,6 +76,7 @@ interface DiarizationRecordDetailProps {
     recordId: string,
     request: DiarizationRecordRerunRequest,
   ) => Promise<void> | void;
+  onCancelProcessing?: (recordId: string) => Promise<void> | void;
   onRegenerateSummary?: (recordId: string) => Promise<void> | void;
 }
 
@@ -89,6 +90,7 @@ export function DiarizationRecordDetail({
   onDelete,
   onSaveSpeakerCorrections,
   onRerun,
+  onCancelProcessing,
   onRegenerateSummary,
 }: DiarizationRecordDetailProps) {
   const [workspaceTab, setWorkspaceTab] = useState("transcript");
@@ -102,6 +104,8 @@ export function DiarizationRecordDetail({
   );
   const [rerunPending, setRerunPending] = useState(false);
   const [rerunError, setRerunError] = useState<string | null>(null);
+  const [cancelPending, setCancelPending] = useState(false);
+  const [cancelError, setCancelError] = useState<string | null>(null);
   const [summaryRefreshPending, setSummaryRefreshPending] = useState(false);
   const [summaryRefreshError, setSummaryRefreshError] = useState<string | null>(
     null,
@@ -154,6 +158,8 @@ export function DiarizationRecordDetail({
         return null;
     }
   }, [record?.summary_error, summaryStatus]);
+  const canCancelProcessing =
+    processingStatus === "pending" || processingStatus === "processing";
 
   useEffect(() => {
     setWorkspaceTab("transcript");
@@ -165,6 +171,8 @@ export function DiarizationRecordDetail({
     setSpeakerUpdateError(null);
     setRerunPending(false);
     setRerunError(null);
+    setCancelPending(false);
+    setCancelError(null);
     setSummaryRefreshPending(false);
     setSummaryRefreshError(null);
   }, [record?.id]);
@@ -238,6 +246,31 @@ export function DiarizationRecordDetail({
     }
   }
 
+  async function handleCancelProcessing(): Promise<void> {
+    if (
+      !record ||
+      !onCancelProcessing ||
+      cancelPending ||
+      !canCancelProcessing
+    ) {
+      return;
+    }
+
+    setCancelPending(true);
+    setCancelError(null);
+    try {
+      await onCancelProcessing(record.id);
+    } catch (err) {
+      setCancelError(
+        err instanceof Error
+          ? err.message
+          : "Failed to cancel diarization processing.",
+      );
+    } finally {
+      setCancelPending(false);
+    }
+  }
+
   async function handleRegenerateSummary(): Promise<void> {
     if (!record || !onRegenerateSummary || summaryRefreshPending) {
       return;
@@ -298,7 +331,9 @@ export function DiarizationRecordDetail({
             size="sm"
             className="h-9 gap-2"
             onClick={() => void handleRegenerateSummary()}
-            disabled={!record || summaryRefreshPending || !hasTranscript}
+            disabled={
+              !record || summaryRefreshPending || !hasTranscript || cancelPending
+            }
           >
             {summaryRefreshPending ? (
               <Loader2 className="h-4 w-4 animate-spin" />
@@ -347,6 +382,21 @@ export function DiarizationRecordDetail({
               Delete
             </Button>
           ) : null}
+          {onCancelProcessing && canCancelProcessing ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-9 gap-2 border-[var(--status-warning-border)] text-[var(--status-warning-text)] hover:bg-[var(--status-warning-bg)]"
+              onClick={() => void handleCancelProcessing()}
+              disabled={cancelPending}
+            >
+              {cancelPending ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : null}
+              {cancelPending ? "Cancelling" : "Cancel run"}
+            </Button>
+          ) : null}
         </div>
       </div>
 
@@ -359,6 +409,12 @@ export function DiarizationRecordDetail({
       {summaryRefreshError ? (
         <Card className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]">
           {summaryRefreshError}
+        </Card>
+      ) : null}
+
+      {cancelError ? (
+        <Card className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]">
+          {cancelError}
         </Card>
       ) : null}
 
