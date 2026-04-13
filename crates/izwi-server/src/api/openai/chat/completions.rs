@@ -162,6 +162,27 @@ struct OpenAiDelta {
     role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<OpenAiDeltaToolCall>>,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiDeltaToolCall {
+    index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    function: Option<OpenAiDeltaToolFunction>,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiDeltaToolFunction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arguments: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -514,16 +535,64 @@ fn build_assistant_response_parts(
     }
 }
 
-pub async fn completions(
-    State(state): State<AppState>,
-    Extension(ctx): Extension<RequestContext>,
-    Json(req): Json<ChatCompletionRequest>,
-) -> Result<Response, ApiError> {
+fn stream_tool_call_deltas(tool_calls: &[OpenAiOutputToolCall]) -> Vec<OpenAiDeltaToolCall> {
+    tool_calls
+        .iter()
+        .enumerate()
+        .map(|(idx, call)| OpenAiDeltaToolCall {
+            index: idx,
+            id: Some(call.id.clone()),
+            kind: Some(call.kind),
+            function: Some(OpenAiDeltaToolFunction {
+                name: Some(call.function.name.clone()),
+                arguments: Some(call.function.arguments.clone()),
+            }),
+        })
+        .collect()
+}
+
+fn validate_chat_request_compatibility(req: &ChatCompletionRequest) -> Result<(), ApiError> {
     if req.n.unwrap_or(1) != 1 {
         return Err(ApiError::bad_request(
             "This server currently supports only `n=1` for chat completions",
         ));
     }
+
+    if req
+        .frequency_penalty
+        .is_some_and(|value| value.abs() > f32::EPSILON)
+    {
+        return Err(ApiError::bad_request(
+            "`frequency_penalty` is not supported by this runtime",
+        ));
+    }
+
+    if req.stop.is_some() {
+        return Err(ApiError::bad_request(
+            "`stop` sequences are not currently supported by this runtime",
+        ));
+    }
+
+    if let Some(tool_choice) = &req.tool_choice {
+        if !tool_choice.is_null()
+            && tool_choice.as_str() != Some("auto")
+            && tool_choice.as_str() != Some("none")
+        {
+            return Err(ApiError::bad_request(
+                "Unsupported `tool_choice`. Supported values: \"auto\", \"none\", or null",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn completions(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<RequestContext>,
+    Json(req): Json<ChatCompletionRequest>,
+) -> Result<Response, ApiError> {
+    validate_chat_request_compatibility(&req)?;
 
     let variant = parse_chat_model(&req.model)?;
     let (messages, media_inputs) = to_core_messages_with_media(
@@ -624,6 +693,7 @@ async fn complete_stream(
                             delta: OpenAiDelta {
                                 role: Some("assistant"),
                                 content: None,
+                                tool_calls: None,
                             },
                             finish_reason: None,
                         }],
@@ -644,6 +714,7 @@ async fn complete_stream(
                             delta: OpenAiDelta {
                                 role: None,
                                 content: Some(delta),
+                                tool_calls: None,
                             },
                             finish_reason: None,
                         }],
@@ -656,6 +727,8 @@ async fn complete_stream(
                 ChatStreamEvent::Completed(generation) => {
                     let (_, tool_calls, finish_reason) =
                         build_assistant_response_parts(generation.text);
+                    let delta_tool_calls =
+                        tool_calls.as_ref().map(|calls| stream_tool_call_deltas(calls));
                     (
                         serde_json::to_string(&OpenAiChatChunk {
                             id: completion_id.clone(),
@@ -667,6 +740,7 @@ async fn complete_stream(
                                 delta: OpenAiDelta {
                                     role: None,
                                     content: None,
+                                    tool_calls: delta_tool_calls,
                                 },
                                 finish_reason: Some(if tool_calls.is_some() {
                                     "tool_calls"
@@ -908,6 +982,96 @@ mod tests {
             validate_media_inputs_for_variant(ModelVariant::Qwen38BGguf, &media_inputs)
                 .expect_err("non-qwen35 multimodal should fail")
                 .contains("currently supported only for Qwen3.5")
+        );
+    }
+
+    #[test]
+    fn validates_rejects_non_zero_frequency_penalty() {
+        let req = ChatCompletionRequest {
+            model: "Qwen3-8B-GGUF".to_string(),
+            messages: vec![OpenAiInboundMessage {
+                role: "user".to_string(),
+                content: Some(OpenAiInboundContent::Text("hello".to_string())),
+                tool_calls: None,
+            }],
+            max_tokens: None,
+            max_completion_tokens: None,
+            stream: None,
+            stream_options: None,
+            n: Some(1),
+            temperature: None,
+            top_p: None,
+            frequency_penalty: Some(0.5),
+            presence_penalty: None,
+            stop: None,
+            user: None,
+            tools: None,
+            tool_choice: None,
+            enable_thinking: None,
+        };
+
+        let err = validate_chat_request_compatibility(&req).expect_err("should reject");
+        assert!(err.message.contains("frequency_penalty"));
+    }
+
+    #[test]
+    fn validates_rejects_stop_sequences() {
+        let req = ChatCompletionRequest {
+            model: "Qwen3-8B-GGUF".to_string(),
+            messages: vec![OpenAiInboundMessage {
+                role: "user".to_string(),
+                content: Some(OpenAiInboundContent::Text("hello".to_string())),
+                tool_calls: None,
+            }],
+            max_tokens: None,
+            max_completion_tokens: None,
+            stream: None,
+            stream_options: None,
+            n: Some(1),
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: Some(json!(["END"])),
+            user: None,
+            tools: None,
+            tool_choice: None,
+            enable_thinking: None,
+        };
+
+        let err = validate_chat_request_compatibility(&req).expect_err("should reject");
+        assert!(err.message.contains("stop"));
+    }
+
+    #[test]
+    fn stream_tool_call_deltas_include_index_and_arguments() {
+        let tool_calls = vec![OpenAiOutputToolCall {
+            id: "call_123".to_string(),
+            kind: "function",
+            function: OpenAiOutputToolFunction {
+                name: "get_weather".to_string(),
+                arguments: "{\"city\":\"Harare\"}".to_string(),
+            },
+        }];
+
+        let deltas = stream_tool_call_deltas(&tool_calls);
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].index, 0);
+        assert_eq!(deltas[0].id.as_deref(), Some("call_123"));
+        assert_eq!(deltas[0].kind, Some("function"));
+        assert_eq!(
+            deltas[0]
+                .function
+                .as_ref()
+                .and_then(|function| function.name.as_deref()),
+            Some("get_weather")
+        );
+        assert!(
+            deltas[0]
+                .function
+                .as_ref()
+                .and_then(|function| function.arguments.as_deref())
+                .is_some_and(|args| args.contains("Harare"))
         );
     }
 }
