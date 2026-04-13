@@ -1735,6 +1735,37 @@ export function VoicePage({
     voiceMode === "unified"
       ? "LFM2.5 Audio handles transcription, reasoning, and response speech in one native GGUF stack."
       : "Parakeet, Qwen, and Kokoro stay separate so each stage is inspectable.";
+  const configTabs: Array<{
+    value: VoiceConfigTab;
+    label: string;
+    description: string;
+    status: string;
+  }> = [
+    {
+      value: "setup",
+      label: "Setup",
+      description: "Runtime mode, voice, playback, and speech detection.",
+      status: currentPipelineLabel,
+    },
+    {
+      value: "models",
+      label: "Models",
+      description: "Load and manage the voice stack used by this workspace.",
+      status: modelStatusLabel,
+    },
+    {
+      value: "agent",
+      label: "Agent",
+      description: "Tune assistant behavior and the saved system prompt.",
+      status: promptStatusLabel,
+    },
+    {
+      value: "memory",
+      label: "Memory",
+      description: "Review captured voice observations and memory state.",
+      status: memoryStatusLabel,
+    },
+  ];
 
   const renderSetupTab = () => (
     <div className="space-y-4">
@@ -2680,7 +2711,7 @@ export function VoicePage({
       <AnimatePresence>
         {isConfigOpen && (
           <motion.div
-            className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm p-4 sm:p-6"
+            className="fixed inset-0 z-50 bg-black/60 backdrop-blur-md p-4 sm:p-6"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
@@ -2691,76 +2722,110 @@ export function VoicePage({
               animate={{ y: 0, opacity: 1, scale: 1 }}
               exit={{ y: 16, opacity: 0, scale: 0.98 }}
               transition={{ duration: 0.2 }}
-              className="mx-auto max-w-5xl max-h-[90vh] overflow-hidden card"
+              className="mx-auto flex max-h-[90vh] max-w-6xl flex-col overflow-hidden rounded-[28px] border border-[var(--border-default)] bg-[color-mix(in_srgb,var(--bg-surface-1)_92%,black)] shadow-[var(--shadow-overlay)]"
               onClick={(event) => event.stopPropagation()}
             >
-              <div className="px-4 sm:px-5 py-4 border-b border-[var(--border-muted)] flex items-center justify-between gap-3">
-                <div>
-                  <h2 className="text-base font-semibold text-white">
-                    Voice Configuration
-                  </h2>
-                  <p className="text-xs text-[var(--text-muted)] mt-1">
-                    Configure realtime model stack and manage model lifecycle.
-                  </p>
+              <div className="border-b border-[var(--border-muted)] px-5 py-5 sm:px-6">
+                <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+                  <div className="min-w-0">
+                    <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-[var(--text-subtle)]">
+                      Realtime voice controls
+                    </p>
+                    <h2 className="mt-2 text-[1.75rem] font-semibold tracking-[-0.03em] text-[var(--text-primary)]">
+                      Voice configuration
+                    </h2>
+                    <p className="mt-2 max-w-2xl text-sm leading-relaxed text-[var(--text-muted)]">
+                      Keep the workspace ready to run with a clean model stack,
+                      grounded assistant behavior, and reusable voice settings.
+                    </p>
+                  </div>
+
+                  <div className="flex flex-col items-start gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-end lg:max-w-sm">
+                    <span
+                      className={cn(
+                        "inline-flex items-center rounded-full border px-3 py-1 text-[11px] font-medium",
+                        hasRunnableConfig
+                          ? "border-[var(--status-positive-border)] bg-[var(--status-positive-bg)] text-[var(--status-positive-text)]"
+                          : "border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] text-[var(--status-warning-text)]",
+                      )}
+                    >
+                      {hasRunnableConfig ? "Ready to start" : "Model action needed"}
+                    </span>
+                    <span className="inline-flex items-center rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-3 py-1 text-[11px] font-medium text-[var(--text-secondary)]">
+                      {currentPipelineLabel}
+                    </span>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-8 gap-2 rounded-full px-3"
+                      onClick={() => setIsConfigOpen(false)}
+                    >
+                      <X className="w-3.5 h-3.5" />
+                      Close
+                    </Button>
+                  </div>
                 </div>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="gap-2"
-                  onClick={() => setIsConfigOpen(false)}
-                >
-                  <X className="w-3.5 h-3.5" />
-                  Close
-                </Button>
               </div>
 
-              <div className="p-4 sm:p-5 overflow-y-auto max-h-[calc(90vh-88px)]">
+              <div className="overflow-y-auto max-h-[calc(90vh-128px)] px-5 py-5 sm:px-6">
                 <Tabs
                   value={configTab}
                   onValueChange={(value) =>
                     setConfigTab(value as VoiceConfigTab)
                   }
-                  className="space-y-4"
+                  className="grid gap-6 lg:grid-cols-[240px_minmax(0,1fr)] lg:gap-8"
                 >
-                  <TabsList className="grid w-full grid-cols-2 gap-1 border-[var(--border-strong)] bg-[var(--bg-surface-2)] p-1 shadow-sm sm:grid-cols-4">
-                    <TabsTrigger
-                      value="setup"
-                      className="text-[var(--text-muted)] data-[state=active]:bg-[var(--accent-solid)] data-[state=active]:text-[var(--text-on-accent)] data-[state=active]:shadow-[0_8px_20px_-14px_rgba(17,17,17,0.55)]"
-                    >
-                      Setup
-                    </TabsTrigger>
-                    <TabsTrigger
-                      value="models"
-                      className="text-[var(--text-muted)] data-[state=active]:bg-[var(--accent-solid)] data-[state=active]:text-[var(--text-on-accent)] data-[state=active]:shadow-[0_8px_20px_-14px_rgba(17,17,17,0.55)]"
-                    >
-                      Models
-                    </TabsTrigger>
-                    <TabsTrigger
-                      value="agent"
-                      className="text-[var(--text-muted)] data-[state=active]:bg-[var(--accent-solid)] data-[state=active]:text-[var(--text-on-accent)] data-[state=active]:shadow-[0_8px_20px_-14px_rgba(17,17,17,0.55)]"
-                    >
-                      Agent
-                    </TabsTrigger>
-                    <TabsTrigger
-                      value="memory"
-                      className="text-[var(--text-muted)] data-[state=active]:bg-[var(--accent-solid)] data-[state=active]:text-[var(--text-on-accent)] data-[state=active]:shadow-[0_8px_20px_-14px_rgba(17,17,17,0.55)]"
-                    >
-                      Memory
-                    </TabsTrigger>
-                  </TabsList>
+                  <div className="space-y-4 lg:sticky lg:top-0">
+                    <div className="space-y-1">
+                      <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--text-subtle)]">
+                        Sections
+                      </p>
+                      <p className="text-sm text-[var(--text-muted)]">
+                        Move through the voice workspace the same way you would
+                        review a product settings panel: setup first, then
+                        models, behavior, and memory.
+                      </p>
+                    </div>
 
-                  <TabsContent value="setup" className="mt-0">
-                    {renderSetupTab()}
-                  </TabsContent>
-                  <TabsContent value="models" className="mt-0">
-                    {renderModelSettings()}
-                  </TabsContent>
-                  <TabsContent value="agent" className="mt-0">
-                    {renderPromptSettings()}
-                  </TabsContent>
-                  <TabsContent value="memory" className="mt-0">
-                    {renderMemorySettings()}
-                  </TabsContent>
+                    <TabsList className="grid h-auto w-full grid-cols-1 gap-2 rounded-none border-0 bg-transparent p-0 shadow-none">
+                      {configTabs.map((tab) => (
+                        <TabsTrigger
+                          key={tab.value}
+                          value={tab.value}
+                          className="h-auto items-start justify-start rounded-[22px] border border-transparent bg-transparent px-4 py-3 text-left text-[var(--text-muted)] shadow-none transition-colors hover:border-[var(--border-muted)] hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)] data-[state=active]:border-[var(--border-strong)] data-[state=active]:bg-[var(--bg-surface-2)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
+                        >
+                          <div className="flex w-full items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="text-sm font-semibold">
+                                {tab.label}
+                              </div>
+                              <p className="mt-1 text-xs leading-relaxed text-[var(--text-muted)]">
+                                {tab.description}
+                              </p>
+                            </div>
+                            <span className="shrink-0 whitespace-nowrap rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[10px] font-medium text-[var(--text-muted)] data-[state=active]:border-[var(--border-strong)]">
+                              {tab.status}
+                            </span>
+                          </div>
+                        </TabsTrigger>
+                      ))}
+                    </TabsList>
+                  </div>
+
+                  <div className="min-w-0 lg:border-l lg:border-[var(--border-muted)] lg:pl-8">
+                    <TabsContent value="setup" className="mt-0">
+                      {renderSetupTab()}
+                    </TabsContent>
+                    <TabsContent value="models" className="mt-0">
+                      {renderModelSettings()}
+                    </TabsContent>
+                    <TabsContent value="agent" className="mt-0">
+                      {renderPromptSettings()}
+                    </TabsContent>
+                    <TabsContent value="memory" className="mt-0">
+                      {renderMemorySettings()}
+                    </TabsContent>
+                  </div>
                 </Tabs>
               </div>
             </motion.div>
