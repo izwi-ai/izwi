@@ -17,3 +17,6 @@ pub fn router() -> Router<AppState> {
         .merge(models::router())
         .merge(responses::router())
 }
+
+#[cfg(test)]
+mod compat_harness;
