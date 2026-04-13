@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  AlertTriangle,
   Loader2,
   Pause,
   Play,
@@ -59,7 +60,16 @@ type SpeakerAccent = {
   border: string;
 };
 
+type ConfidenceFlag = {
+  entryIndex: number;
+  start: number;
+  speaker: string;
+  averageConfidence: number | null;
+  reason: string;
+};
+
 const PLAYBACK_SPEEDS = [0.75, 1, 1.25, 1.5, 2];
+const LOW_CONFIDENCE_THRESHOLD = 0.72;
 
 function formatClockTime(totalSeconds: number): string {
   if (!Number.isFinite(totalSeconds) || totalSeconds < 0) {
@@ -102,6 +112,85 @@ function isEntryActive(
   );
 }
 
+function resolveEntryWords(
+  record: NonNullable<DiarizationReviewWorkspaceProps["record"]>,
+  entryIndex: number,
+  start: number,
+  end: number,
+) {
+  const utterance = record.utterances[entryIndex];
+  if (
+    utterance &&
+    Number.isInteger(utterance.word_start) &&
+    Number.isInteger(utterance.word_end)
+  ) {
+    const min = Math.max(0, utterance.word_start);
+    const max = Math.min(record.words.length - 1, utterance.word_end);
+    if (max >= min) {
+      return record.words.slice(min, max + 1);
+    }
+  }
+
+  return record.words.filter(
+    (word) =>
+      Number.isFinite(word.start) &&
+      Number.isFinite(word.end) &&
+      word.end > start &&
+      word.start < end,
+  );
+}
+
+function computeConfidenceFlags(
+  record: NonNullable<DiarizationReviewWorkspaceProps["record"]>,
+  entries: ReturnType<typeof transcriptEntriesFromRecord>,
+): ConfidenceFlag[] {
+  return entries.flatMap((entry, entryIndex) => {
+    const words = resolveEntryWords(record, entryIndex, entry.start, entry.end);
+    if (words.length === 0) {
+      return [];
+    }
+
+    const confidenceValues = words
+      .map((word) =>
+        typeof word.speaker_confidence === "number" &&
+        Number.isFinite(word.speaker_confidence)
+          ? word.speaker_confidence
+          : null,
+      )
+      .filter((value): value is number => value !== null);
+
+    const averageConfidence =
+      confidenceValues.length > 0
+        ? confidenceValues.reduce((sum, value) => sum + value, 0) /
+          confidenceValues.length
+        : null;
+    const overlapMismatches = words.filter(
+      (word) => word.overlaps_segment === false,
+    ).length;
+    const lowConfidence =
+      averageConfidence !== null && averageConfidence < LOW_CONFIDENCE_THRESHOLD;
+
+    if (!lowConfidence && overlapMismatches === 0) {
+      return [];
+    }
+
+    const reason =
+      overlapMismatches > 0
+        ? `${overlapMismatches} word${overlapMismatches === 1 ? "" : "s"} drifted from segment boundaries.`
+        : `Average speaker confidence ${Math.round((averageConfidence ?? 0) * 100)}%.`;
+
+    return [
+      {
+        entryIndex,
+        start: entry.start,
+        speaker: entry.speaker,
+        averageConfidence,
+        reason,
+      },
+    ];
+  });
+}
+
 export function DiarizationReviewWorkspace({
   record,
   audioUrl = null,
@@ -122,6 +211,7 @@ export function DiarizationReviewWorkspace({
   const [isPlaying, setIsPlaying] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1);
   const [audioError, setAudioError] = useState<string | null>(null);
+  const [focusedFlagIndex, setFocusedFlagIndex] = useState<number | null>(null);
 
   const transcriptEntries = useMemo(
     () => (record ? transcriptEntriesFromRecord(record) : []),
@@ -191,6 +281,36 @@ export function DiarizationReviewWorkspace({
     activeEntryIndex >= 0
       ? (transcriptEntries[activeEntryIndex]?.speaker ?? null)
       : null;
+  const confidenceFlags = useMemo(
+    () => (record ? computeConfidenceFlags(record, transcriptEntries) : []),
+    [record, transcriptEntries],
+  );
+  const confidenceFlagsByEntry = useMemo(
+    () =>
+      new Map(confidenceFlags.map((flag) => [flag.entryIndex, flag] as const)),
+    [confidenceFlags],
+  );
+  const activeFlagIndex = useMemo(
+    () =>
+      confidenceFlags.findIndex((flag) => flag.entryIndex === activeEntryIndex),
+    [activeEntryIndex, confidenceFlags],
+  );
+  const selectedFlagIndex = useMemo(() => {
+    if (confidenceFlags.length === 0) {
+      return null;
+    }
+    if (
+      focusedFlagIndex !== null &&
+      focusedFlagIndex >= 0 &&
+      focusedFlagIndex < confidenceFlags.length
+    ) {
+      return focusedFlagIndex;
+    }
+    if (activeFlagIndex >= 0) {
+      return activeFlagIndex;
+    }
+    return 0;
+  }, [activeFlagIndex, confidenceFlags, focusedFlagIndex]);
 
   useEffect(() => {
     const audio = audioRef.current;
@@ -204,6 +324,7 @@ export function DiarizationReviewWorkspace({
     setIsPlaying(false);
     setPlaybackRate(1);
     setAudioError(null);
+    setFocusedFlagIndex(null);
     lastAutoScrolledEntryRef.current = null;
   }, [audioUrl, record?.id]);
 
@@ -266,6 +387,27 @@ export function DiarizationReviewWorkspace({
       audio.playbackRate = nextRate;
     }
     setPlaybackRate(nextRate);
+  }
+
+  function jumpToConfidenceFlag(flagIndex: number): void {
+    if (confidenceFlags.length === 0) {
+      return;
+    }
+
+    const normalizedIndex =
+      ((flagIndex % confidenceFlags.length) + confidenceFlags.length) %
+      confidenceFlags.length;
+    const target = confidenceFlags[normalizedIndex];
+    setFocusedFlagIndex(normalizedIndex);
+    seek(target.start);
+  }
+
+  function stepConfidenceFlag(step: number): void {
+    if (confidenceFlags.length === 0) {
+      return;
+    }
+    const baseIndex = selectedFlagIndex ?? 0;
+    jumpToConfidenceFlag(baseIndex + step);
   }
 
   if (loading) {
@@ -384,9 +526,78 @@ export function DiarizationReviewWorkspace({
             <h3 className="mb-3 text-[13px] font-semibold tracking-wide text-[var(--text-primary)]">
               Transcript
             </h3>
+            {confidenceFlags.length > 0 ? (
+              <div
+                data-testid="diarization-confidence-nav"
+                className="mb-3 rounded-lg border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-3 py-2.5"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 text-[12px] font-semibold text-[var(--status-warning-text)]">
+                    <AlertTriangle className="h-4 w-4" />
+                    Uncertain turns
+                    <span className="rounded-full bg-[var(--bg-surface-0)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-primary)]">
+                      {confidenceFlags.length} flagged
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-7 border-[var(--status-warning-border)] text-[var(--status-warning-text)] hover:bg-[var(--status-warning-bg)]"
+                      onClick={() => stepConfidenceFlag(-1)}
+                      disabled={confidenceFlags.length === 0}
+                      aria-label="Previous flagged turn"
+                    >
+                      Prev flagged
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-7 border-[var(--status-warning-border)] text-[var(--status-warning-text)] hover:bg-[var(--status-warning-bg)]"
+                      onClick={() => stepConfidenceFlag(1)}
+                      disabled={confidenceFlags.length === 0}
+                      aria-label="Next flagged turn"
+                    >
+                      Next flagged
+                    </Button>
+                  </div>
+                </div>
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {confidenceFlags.map((flag, flagIndex) => {
+                    const selected = selectedFlagIndex === flagIndex;
+                    const confidenceLabel =
+                      flag.averageConfidence !== null
+                        ? `${Math.round(flag.averageConfidence * 100)}%`
+                        : "Review";
+                    return (
+                      <button
+                        key={`${flag.entryIndex}-${flag.start}`}
+                        type="button"
+                        className="rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors"
+                        style={{
+                          borderColor: "var(--status-warning-border)",
+                          backgroundColor: selected
+                            ? "var(--bg-surface-0)"
+                            : "transparent",
+                          color: "var(--status-warning-text)",
+                        }}
+                        aria-label={`Jump to flagged turn ${flagIndex + 1}`}
+                        onClick={() => jumpToConfidenceFlag(flagIndex)}
+                      >
+                        {formatClockTime(flag.start)} · {flag.speaker} ·{" "}
+                        {confidenceLabel}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : null}
             <div className="space-y-2.5">
               {transcriptEntries.map((entry, index) => {
                 const active = index === activeEntryIndex;
+                const confidenceFlag = confidenceFlagsByEntry.get(index) ?? null;
                 const speakerIndex = speakerSummaries.findIndex(
                   (s) => s.displaySpeaker === entry.speaker,
                 );
@@ -437,6 +648,16 @@ export function DiarizationReviewWorkspace({
                         </span>
                       ) : null}
                     </div>
+                    {confidenceFlag ? (
+                      <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                        <span className="rounded-full border border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.1em] text-[var(--status-warning-text)]">
+                          Review
+                        </span>
+                        <span className="text-[11px] text-[var(--status-warning-text)]">
+                          {confidenceFlag.reason}
+                        </span>
+                      </div>
+                    ) : null}
                     <p className="mt-1.5 text-[15px] leading-7 text-[var(--text-secondary)]">
                       {entry.text}
                     </p>

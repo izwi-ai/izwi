@@ -70,6 +70,60 @@ const record = {
   audio_filename: "meeting.wav",
 } satisfies DiarizationRecord;
 
+const lowConfidenceRecord = {
+  ...record,
+  words: [
+    {
+      word: "Hello",
+      speaker: "SPEAKER_00",
+      start: 0,
+      end: 0.4,
+      speaker_confidence: 0.95,
+      overlaps_segment: true,
+    },
+    {
+      word: "there",
+      speaker: "SPEAKER_00",
+      start: 0.4,
+      end: 0.9,
+      speaker_confidence: 0.9,
+      overlaps_segment: true,
+    },
+    {
+      word: "Follow",
+      speaker: "SPEAKER_00",
+      start: 1,
+      end: 2,
+      speaker_confidence: 0.45,
+      overlaps_segment: true,
+    },
+    {
+      word: "up",
+      speaker: "SPEAKER_00",
+      start: 2,
+      end: 2.9,
+      speaker_confidence: 0.48,
+      overlaps_segment: true,
+    },
+    {
+      word: "Response",
+      speaker: "SPEAKER_01",
+      start: 3,
+      end: 4.5,
+      speaker_confidence: 0.93,
+      overlaps_segment: false,
+    },
+    {
+      word: ".",
+      speaker: "SPEAKER_01",
+      start: 4.5,
+      end: 6,
+      speaker_confidence: 0.9,
+      overlaps_segment: true,
+    },
+  ],
+} satisfies DiarizationRecord;
+
 describe("DiarizationReviewWorkspace", () => {
   beforeEach(() => {
     vi.spyOn(window.HTMLMediaElement.prototype, "pause").mockImplementation(
@@ -200,5 +254,36 @@ describe("DiarizationReviewWorkspace", () => {
     expect(screen.getByTestId("diarization-review-player")).toHaveClass(
       "lg:left-[var(--app-shell-left)]",
     );
+  });
+
+  it("flags uncertain turns and supports quick-jump navigation", () => {
+    const { container } = render(
+      <DiarizationReviewWorkspace
+        record={lowConfidenceRecord}
+        audioUrl="/audio/meeting.wav"
+      />,
+    );
+
+    const audio = container.querySelector("audio");
+    expect(audio).not.toBeNull();
+    Object.defineProperty(audio, "currentTime", {
+      configurable: true,
+      writable: true,
+      value: 0,
+    });
+
+    expect(screen.getByTestId("diarization-confidence-nav")).toBeInTheDocument();
+    expect(screen.getByText("2 flagged")).toBeInTheDocument();
+    expect(
+      screen.getByText("Average speaker confidence 47%."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("1 word drifted from segment boundaries."),
+    ).toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Jump to flagged turn 1" }),
+    );
+    expect(audio!.currentTime).toBe(1);
   });
 });
