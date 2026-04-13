@@ -33,7 +33,7 @@ Source:
   Commit:
   `feat(ui): redesign voice config modal shell`
 
-- [ ] Phase 2: Redesign `Setup` and `Models` into cleaner operational layouts
+- [x] Phase 2: Redesign `Setup` and `Models` into cleaner operational layouts
   Scope:
   Rework `Setup` and `Models` so they rely on sections, lists, dividers, and row layouts instead of stacked cards. Simplify the setup overview, runtime mode controls, speaker selection area, and model lifecycle rows.
   Deliverable:
@@ -56,6 +56,7 @@ Source:
 ## Review
 
 - Phase 1 complete: replaced the heavy card-style modal shell with a calmer two-zone settings layout, upgraded the header hierarchy, and turned the tab strip into product-style section navigation with lighter chrome.
+- Phase 2 complete: rebuilt the `Setup` and `Models` tabs around sections and row lists, reduced stacked-card treatments, and kept model actions inside cleaner operational rows.
 
 # Diarization Alignment Plan
 

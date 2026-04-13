@@ -1768,161 +1768,206 @@ export function VoicePage({
   ];
 
   const renderSetupTab = () => (
-    <div className="space-y-4">
-      <section className="grid gap-3 md:grid-cols-3">
-        <button
-          type="button"
-          onClick={() => setConfigTab("models")}
-          className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 text-left transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-2)]"
-        >
-          <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--text-muted)]">
-            Models
-          </span>
-          <div className="mt-3 flex items-start justify-between gap-3">
-            <div>
-              <p className="text-sm font-medium text-[var(--text-primary)]">
-                {modelStatusLabel}
-              </p>
-              <p className="mt-1 text-xs leading-relaxed text-[var(--text-muted)]">
-                {modelSummaryText}
-              </p>
-            </div>
-            <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-2 py-1 text-[10px] text-[var(--text-muted)]">
-              {currentPipelineLabel}
-            </span>
-          </div>
-        </button>
-
-        <button
-          type="button"
-          onClick={() => setConfigTab("agent")}
-          className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 text-left transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-2)]"
-        >
-          <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--text-muted)]">
-            Agent
-          </span>
-          <div className="mt-3">
-            <p className="text-sm font-medium text-[var(--text-primary)]">
-              {promptStatusLabel}
-            </p>
-            <p className="mt-1 text-xs leading-relaxed text-[var(--text-muted)]">
-              {promptSummaryText}
-            </p>
-          </div>
-        </button>
-
-        <button
-          type="button"
-          onClick={() => setConfigTab("memory")}
-          className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-4 text-left transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-2)]"
-        >
-          <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--text-muted)]">
-            Memory
-          </span>
-          <div className="mt-3">
-            <p className="text-sm font-medium text-[var(--text-primary)]">
-              {memoryStatusLabel}
-            </p>
-            <p className="mt-1 text-xs leading-relaxed text-[var(--text-muted)]">
-              {memorySummaryText}
-            </p>
-          </div>
-        </button>
-      </section>
-
-      <section className="space-y-4">
-        <div className="flex items-center justify-between gap-2">
-          <h3 className="text-sm font-medium text-white">Runtime Profile</h3>
-          <span className="text-[11px] text-[var(--text-muted)]">
-            Choose how inference is orchestrated.
-          </span>
-        </div>
-        <div className="grid gap-3 sm:grid-cols-2">
-          <button
-            type="button"
-            onClick={() => setVoiceMode("modular")}
-            className={cn(
-              "rounded-lg border p-3 text-left transition-colors",
-              voiceMode === "modular"
-                ? "border-primary bg-primary/5 ring-1 ring-primary/20"
-                : "border-[var(--border-muted)] bg-[var(--bg-surface-1)] hover:border-[var(--border-strong)]",
-            )}
-          >
-            <div className="text-sm font-medium">Modular Voice Stack</div>
-            <p className="mt-1 text-xs text-[var(--text-muted)]">
-              Uses a fixed local stack: Parakeet ASR, Qwen3-1.7B-GGUF, and
-              Kokoro-82M.
-            </p>
-          </button>
-          <button
-            type="button"
-            onClick={() => setVoiceMode("unified")}
-            className={cn(
-              "rounded-lg border p-3 text-left transition-colors",
-              voiceMode === "unified"
-                ? "border-primary bg-primary/5 ring-1 ring-primary/20"
-                : "border-[var(--border-muted)] bg-[var(--bg-surface-1)] hover:border-[var(--border-strong)]",
-            )}
-          >
-            <div className="text-sm font-medium">Unified LFM2.5 Audio</div>
-            <p className="mt-1 text-xs text-[var(--text-muted)]">
-              Runs transcription, response planning, and synthesized speech in a
-              single native GGUF model.
-            </p>
-          </button>
-        </div>
-        <div className="text-[11px] text-[var(--text-muted)]">
-          Current mode: {currentPipelineLabel}
-        </div>
-      </section>
-
-      <section className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3 space-y-3">
-        <div className="flex items-start justify-between gap-3">
+    <div className="space-y-8">
+      <section className="space-y-3">
+        <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
           <div>
-            <h3 className="text-sm font-medium text-white">Assistant Voice</h3>
-            <p className="mt-1 text-xs text-[var(--text-muted)]">
+            <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+              Workspace overview
+            </h3>
+            <p className="mt-1 text-sm text-[var(--text-muted)]">
+              Keep the main controls lightweight here, then jump deeper into the
+              parts of the stack that need attention.
+            </p>
+          </div>
+          <span className="text-[11px] font-medium text-[var(--text-muted)]">
+            Current mode: {currentPipelineLabel}
+          </span>
+        </div>
+
+        <div className="overflow-hidden rounded-[24px] border border-[var(--border-muted)] bg-[color-mix(in_srgb,var(--bg-surface-1)_70%,transparent)]">
+          {[
+            {
+              tab: "models" as const,
+              label: "Models",
+              status: modelStatusLabel,
+              summary: modelSummaryText,
+            },
+            {
+              tab: "agent" as const,
+              label: "Agent",
+              status: promptStatusLabel,
+              summary: promptSummaryText,
+            },
+            {
+              tab: "memory" as const,
+              label: "Memory",
+              status: memoryStatusLabel,
+              summary: memorySummaryText,
+            },
+          ].map((item, index, items) => (
+            <button
+              key={item.tab}
+              type="button"
+              onClick={() => setConfigTab(item.tab)}
+              className={cn(
+                "flex w-full items-start justify-between gap-4 px-4 py-4 text-left transition-colors hover:bg-[var(--bg-surface-2)] sm:px-5",
+                index < items.length - 1 && "border-b border-[var(--border-muted)]",
+              )}
+            >
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-sm font-semibold text-[var(--text-primary)]">
+                    {item.label}
+                  </span>
+                  <span className="rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-2)] px-2.5 py-1 text-[10px] font-medium text-[var(--text-muted)]">
+                    {item.status}
+                  </span>
+                </div>
+                <p className="mt-2 text-sm leading-relaxed text-[var(--text-muted)]">
+                  {item.summary}
+                </p>
+              </div>
+              <span className="shrink-0 text-xs font-medium text-[var(--text-secondary)]">
+                Open
+              </span>
+            </button>
+          ))}
+        </div>
+      </section>
+
+      <section className="grid gap-6 border-t border-[var(--border-muted)] pt-6 lg:grid-cols-[minmax(0,1fr)_240px]">
+        <div className="space-y-4">
+          <div>
+            <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+              Runtime profile
+            </h3>
+            <p className="mt-1 text-sm text-[var(--text-muted)]">
+              Choose whether voice runs as one unified speech model or as a
+              fixed modular pipeline.
+            </p>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <button
+              type="button"
+              onClick={() => setVoiceMode("modular")}
+              className={cn(
+                "rounded-[22px] border px-4 py-4 text-left transition-colors",
+                voiceMode === "modular"
+                  ? "border-[var(--border-strong)] bg-[var(--bg-surface-2)]"
+                  : "border-[var(--border-muted)] bg-transparent hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-2)]",
+              )}
+            >
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-sm font-semibold text-[var(--text-primary)]">
+                  Modular voice stack
+                </span>
+                {voiceMode === "modular" && (
+                  <span className="rounded-full bg-[var(--accent-solid)] px-2.5 py-1 text-[10px] font-semibold text-[var(--text-on-accent)]">
+                    Active
+                  </span>
+                )}
+              </div>
+              <p className="mt-2 text-sm leading-relaxed text-[var(--text-muted)]">
+                Uses a fixed local stack: Parakeet ASR, Qwen3-1.7B-GGUF, and
+                Kokoro-82M.
+              </p>
+            </button>
+            <button
+              type="button"
+              onClick={() => setVoiceMode("unified")}
+              className={cn(
+                "rounded-[22px] border px-4 py-4 text-left transition-colors",
+                voiceMode === "unified"
+                  ? "border-[var(--border-strong)] bg-[var(--bg-surface-2)]"
+                  : "border-[var(--border-muted)] bg-transparent hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-2)]",
+              )}
+            >
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-sm font-semibold text-[var(--text-primary)]">
+                  Unified LFM2.5 Audio
+                </span>
+                {voiceMode === "unified" && (
+                  <span className="rounded-full bg-[var(--accent-solid)] px-2.5 py-1 text-[10px] font-semibold text-[var(--text-on-accent)]">
+                    Active
+                  </span>
+                )}
+              </div>
+              <p className="mt-2 text-sm leading-relaxed text-[var(--text-muted)]">
+                Runs transcription, response planning, and synthesized speech in
+                one native GGUF model.
+              </p>
+            </button>
+          </div>
+        </div>
+
+        <div className="space-y-2 lg:border-l lg:border-[var(--border-muted)] lg:pl-6">
+          <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--text-subtle)]">
+            Notes
+          </p>
+          <p className="text-sm leading-relaxed text-[var(--text-muted)]">
+            Unified mode minimizes handoffs. Modular mode keeps each stage
+            inspectable and easier to tune independently.
+          </p>
+        </div>
+      </section>
+
+      <section className="grid gap-6 border-t border-[var(--border-muted)] pt-6 lg:grid-cols-[minmax(0,1fr)_240px]">
+        <div className="space-y-4">
+          <div>
+            <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+              Assistant voice
+            </h3>
+            <p className="mt-1 text-sm text-[var(--text-muted)]">
               {voiceMode === "unified"
                 ? "LFM2.5 Audio uses its native built-in voice inventory."
                 : "Choose the built-in speaker exposed by the active realtime TTS model."}
             </p>
           </div>
-          <span className="text-[11px] text-[var(--text-muted)]">
+
+          <Select
+            value={selectedSpeaker}
+            onValueChange={setSelectedSpeaker}
+            disabled={assistantSpeakers.length === 0}
+          >
+            <SelectTrigger className="h-11 rounded-[18px] border-[var(--border-muted)] bg-[var(--bg-surface-2)]">
+              <SelectValue placeholder="Select assistant voice" />
+            </SelectTrigger>
+            <SelectContent>
+              {assistantSpeakers.map((speaker) => (
+                <SelectItem key={speaker.id} value={speaker.id}>
+                  {speaker.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div className="space-y-2 lg:border-l lg:border-[var(--border-muted)] lg:pl-6">
+          <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--text-subtle)]">
+            Active source
+          </p>
+          <p className="text-sm text-[var(--text-primary)]">
             {speakerModelVariant
               ? formatModelVariantLabel(speakerModelVariant)
               : "No voice model selected"}
-          </span>
-        </div>
-        <Select
-          value={selectedSpeaker}
-          onValueChange={setSelectedSpeaker}
-          disabled={assistantSpeakers.length === 0}
-        >
-          <SelectTrigger>
-            <SelectValue placeholder="Select assistant voice" />
-          </SelectTrigger>
-          <SelectContent>
-            {assistantSpeakers.map((speaker) => (
-              <SelectItem key={speaker.id} value={speaker.id}>
-                {speaker.name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <div className="flex flex-wrap items-center gap-2 text-[11px] text-[var(--text-muted)]">
-          {selectedSpeakerProfile ? (
-            <>
-              <span>{selectedSpeakerProfile.language}</span>
-              <span>{selectedSpeakerProfile.description}</span>
-            </>
-          ) : (
-            <span>No built-in voices are available for the selected realtime model.</span>
+          </p>
+          <div className="flex flex-wrap items-center gap-2 text-sm text-[var(--text-muted)]">
+            {selectedSpeakerProfile ? (
+              <>
+                <span>{selectedSpeakerProfile.language}</span>
+                <span>{selectedSpeakerProfile.description}</span>
+              </>
+            ) : (
+              <span>No built-in voices are available for the selected realtime model.</span>
+            )}
+          </div>
+          {runtimeStatus !== "idle" && (
+            <p className="text-[11px] text-[var(--text-muted)]">
+              Voice changes apply the next time you start listening.
+            </p>
           )}
         </div>
-        {runtimeStatus !== "idle" && (
-          <p className="text-[11px] text-[var(--text-muted)]">
-            Voice changes apply the next time you start listening.
-          </p>
-        )}
       </section>
 
       {renderAudioOutputSettings()}
@@ -2093,253 +2138,250 @@ export function VoicePage({
     </section>
   );
 
+  const renderModelActionControls = (model: ModelInfo | null) => {
+    if (!model) {
+      return null;
+    }
+
+    if (model.status === "downloading" && onCancelDownload) {
+      return (
+        <Button
+          onClick={() => onCancelDownload(model.variant)}
+          variant="destructive"
+          size="sm"
+          className="h-8 rounded-full px-3 text-xs"
+        >
+          <X className="w-3.5 h-3.5" />
+          Cancel
+        </Button>
+      );
+    }
+
+    if (model.status === "loading") {
+      return (
+        <Button
+          disabled
+          variant="outline"
+          size="sm"
+          className="h-8 rounded-full px-3 text-xs"
+        >
+          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+          Loading
+        </Button>
+      );
+    }
+
+    return (
+      <Button
+        onClick={() => onModelAction(model)}
+        variant={model.status === "ready" ? "outline" : "default"}
+        size="sm"
+        className="h-8 rounded-full px-3 text-xs"
+      >
+        {(model.status === "not_downloaded" || model.status === "error") && (
+          <Download className="w-3.5 h-3.5" />
+        )}
+        {model.status === "downloaded" && <Play className="w-3.5 h-3.5" />}
+        {model.status === "ready" && <Square className="w-3.5 h-3.5" />}
+        {model.status === "not_downloaded" || model.status === "error"
+          ? "Download"
+          : model.status === "downloaded"
+            ? "Load"
+            : "Unload"}
+      </Button>
+    );
+  };
+
+  const renderModelRow = ({
+    eyebrow,
+    label,
+    variant,
+    summary,
+    model,
+    emptyStatusLabel,
+  }: {
+    eyebrow: string;
+    label: string;
+    variant: string;
+    summary: string;
+    model: ModelInfo | null;
+    emptyStatusLabel?: string;
+  }) => {
+    const progressMeta = getModelProgress(model);
+
+    return (
+      <div className="px-4 py-4 sm:px-5">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <div className="min-w-0">
+            <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--text-subtle)]">
+              {eyebrow}
+            </p>
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <span className="text-sm font-semibold text-[var(--text-primary)]">
+                {label}
+              </span>
+              <span
+                className={clsx(
+                  "rounded-full border px-2.5 py-1 text-[10px] font-medium",
+                  model
+                    ? getStatusClass(model.status)
+                    : "border-[var(--border-muted)] bg-[var(--bg-surface-2)] text-[var(--text-muted)]",
+                )}
+              >
+                {model ? getStatusLabel(model.status) : emptyStatusLabel ?? "Unavailable"}
+              </span>
+            </div>
+            <p className="mt-1 text-sm text-[var(--text-muted)]">{variant}</p>
+            <p className="mt-2 text-sm leading-relaxed text-[var(--text-muted)]">
+              {summary}
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {renderModelActionControls(model)}
+          </div>
+        </div>
+
+        {model?.status === "downloading" && progressMeta && (
+          <div className="mt-4">
+            <div className="h-1.5 overflow-hidden rounded-full bg-[var(--bg-surface-3)]">
+              <div
+                className="h-full rounded-full bg-[var(--accent-solid)] transition-all duration-300"
+                style={{
+                  width: `${progressMeta.progress}%`,
+                }}
+              />
+            </div>
+            <div className="mt-1 text-[11px] text-[var(--text-muted)]">
+              Downloading {Math.round(progressMeta.progress)}%
+              {progressMeta.progressValue &&
+                progressMeta.progressValue.totalBytes > 0 && (
+                  <>
+                    {" "}
+                    (
+                    {formatBytes(progressMeta.progressValue.downloadedBytes)} /{" "}
+                    {formatBytes(progressMeta.progressValue.totalBytes)})
+                  </>
+                )}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
+
   const renderModelSettings = () => (
-    <section className="space-y-3">
-      <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3 space-y-3">
-        <div className="flex items-center justify-between gap-3">
+    <section className="space-y-8">
+      <div className="space-y-3">
+        <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
           <div>
-            <h3 className="text-sm font-medium text-white">Unified Model</h3>
-            <p className="text-[11px] text-[var(--text-muted)] mt-1">
+            <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+              Unified model
+            </h3>
+            <p className="mt-1 text-sm text-[var(--text-muted)]">
               Single-stack speech model for end-to-end voice replies.
             </p>
           </div>
-          <span className="text-[11px] text-[var(--text-muted)]">
+          <span className="text-[11px] font-medium text-[var(--text-muted)]">
             {voiceMode === "unified" ? "Selected mode" : "Available mode"}
           </span>
         </div>
+
         {selectedUnifiedInfo ? (
-          <div className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-2)] p-3 space-y-2">
-            <div className="flex items-start justify-between gap-2">
-              <div className="min-w-0">
-                <div className="text-sm font-medium text-white">
-                  {formatModelVariantLabel(selectedUnifiedInfo.variant)}
-                </div>
-                <div className="mt-0.5 text-xs text-[var(--text-muted)] truncate">
-                  {selectedUnifiedInfo.variant}
-                </div>
-              </div>
-              <span
-                className={clsx(
-                  "text-[10px] px-1.5 py-0.5 rounded border whitespace-nowrap",
-                  getStatusClass(selectedUnifiedInfo.status),
-                )}
-              >
-                {getStatusLabel(selectedUnifiedInfo.status)}
-              </span>
-            </div>
-            <p className="text-xs text-[var(--text-muted)]">
-              Native LFM2.5 Audio GGUF bundle with speech-to-speech generation.
-            </p>
-            <div className="flex flex-wrap items-center justify-end gap-2">
-              {selectedUnifiedInfo.status === "downloading" && onCancelDownload && (
-                <Button
-                  onClick={() => onCancelDownload(selectedUnifiedInfo.variant)}
-                  variant="destructive"
-                  size="sm"
-                  className="text-xs h-7 gap-2"
-                >
-                  <X className="w-3.5 h-3.5" />
-                  Cancel
-                </Button>
-              )}
-              {selectedUnifiedInfo.status === "loading" && (
-                <Button disabled variant="outline" size="sm" className="text-xs h-7 gap-2">
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  Loading
-                </Button>
-              )}
-              {selectedUnifiedInfo.status !== "loading" &&
-                selectedUnifiedInfo.status !== "downloading" && (
-                  <Button
-                    onClick={() => onModelAction(selectedUnifiedInfo)}
-                    variant={selectedUnifiedInfo.status === "ready" ? "outline" : "default"}
-                    size="sm"
-                    className="text-xs h-7 gap-2"
-                  >
-                    {selectedUnifiedInfo.status === "not_downloaded" ||
-                    selectedUnifiedInfo.status === "error" ? (
-                      <Download className="w-3.5 h-3.5" />
-                    ) : selectedUnifiedInfo.status === "downloaded" ? (
-                      <Play className="w-3.5 h-3.5" />
-                    ) : (
-                      <Square className="w-3.5 h-3.5" />
-                    )}
-                    {selectedUnifiedInfo.status === "not_downloaded" ||
-                    selectedUnifiedInfo.status === "error"
-                      ? "Download"
-                      : selectedUnifiedInfo.status === "downloaded"
-                        ? "Load"
-                        : "Unload"}
-                  </Button>
-                )}
-            </div>
+          <div className="overflow-hidden rounded-[24px] border border-[var(--border-muted)] bg-[color-mix(in_srgb,var(--bg-surface-1)_70%,transparent)]">
+            {renderModelRow({
+              eyebrow: "Unified path",
+              label: formatModelVariantLabel(selectedUnifiedInfo.variant),
+              variant: selectedUnifiedInfo.variant,
+              summary:
+                "Native LFM2.5 Audio GGUF bundle with speech-to-speech generation.",
+              model: selectedUnifiedInfo,
+            })}
           </div>
         ) : (
-          <p className="text-xs text-[var(--text-muted)]">
+          <p className="text-sm text-[var(--text-muted)]">
             No unified LFM2.5 Audio model is available in the current catalog.
           </p>
         )}
       </div>
-      <div className="flex items-center justify-between gap-3">
-        <div>
-          <h3 className="text-sm font-medium text-white">Modular Stack Models</h3>
-          <p className="text-[11px] text-[var(--text-muted)] mt-1">
-            Fixed stack: Parakeet-TDT-0.6B-v3, Qwen3-1.7B-GGUF, Kokoro-82M.
-          </p>
+
+      <div className="space-y-3 border-t border-[var(--border-muted)] pt-6">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+          <div>
+            <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+              Modular stack
+            </h3>
+            <p className="mt-1 text-sm text-[var(--text-muted)]">
+              Fixed stack: Parakeet-TDT-0.6B-v3, Qwen3-1.7B-GGUF, Kokoro-82M.
+            </p>
+          </div>
+          <Button
+            onClick={handleLoadAllModularStack}
+            size="sm"
+            className="h-8 rounded-full px-3 text-xs"
+            disabled={
+              !hasRequiredModularModels ||
+              !hasLoadableModularModels ||
+              isLoadAllRequested ||
+              isLoadAllBusy
+            }
+          >
+            {isLoadAllRequested ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Play className="w-3.5 h-3.5" />
+            )}
+            {isLoadAllRequested ? "Loading all..." : "Load all"}
+          </Button>
         </div>
-        <Button
-          onClick={handleLoadAllModularStack}
-          size="sm"
-          className="text-xs h-8 gap-2"
-          disabled={
-            !hasRequiredModularModels ||
-            !hasLoadableModularModels ||
-            isLoadAllRequested ||
-            isLoadAllBusy
-          }
-        >
-          {isLoadAllRequested ? (
-            <Loader2 className="w-3.5 h-3.5 animate-spin" />
-          ) : (
-            <Play className="w-3.5 h-3.5" />
-          )}
-          {isLoadAllRequested ? "Loading all..." : "Load all"}
-        </Button>
-      </div>
-      <div className="space-y-3">
-        {modularStackModels.map((item) => {
-          const model = item.model;
-          const progressMeta = getModelProgress(model);
-          return (
+
+        <div className="overflow-hidden rounded-[24px] border border-[var(--border-muted)] bg-[color-mix(in_srgb,var(--bg-surface-1)_70%,transparent)]">
+          {modularStackModels.map((item, index) => (
             <div
               key={item.key}
-              className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-2.5 space-y-2"
+              className={cn(index > 0 && "border-t border-[var(--border-muted)]")}
             >
-              <div className="flex items-start justify-between gap-2">
-                <div className="min-w-0">
-                  <div className="text-sm font-medium text-white">{item.role}</div>
-                  <div className="mt-0.5 text-xs text-[var(--text-muted)] truncate">
-                    {model ? formatModelVariantLabel(model.variant) : item.requiredVariant}
-                  </div>
-                </div>
-                <span
-                  className={clsx(
-                    "text-[10px] px-1.5 py-0.5 rounded border whitespace-nowrap",
-                    model
-                      ? getStatusClass(model.status)
-                      : "bg-[var(--bg-surface-2)] border-[var(--border-muted)] text-[var(--text-muted)]",
-                  )}
-                >
-                  {model ? getStatusLabel(model.status) : "Unavailable"}
-                </span>
-              </div>
-
-              <div className="flex flex-wrap items-center justify-end gap-2">
-                {model?.status === "downloading" && onCancelDownload && (
-                  <Button
-                    onClick={() => onCancelDownload(model.variant)}
-                    variant="destructive"
-                    size="sm"
-                    className="text-xs h-7 gap-2"
-                  >
-                    <X className="w-3.5 h-3.5" />
-                    Cancel
-                  </Button>
-                )}
-                {model?.status === "loading" && (
-                  <Button
-                    disabled
-                    variant="outline"
-                    size="sm"
-                    className="text-xs h-7 gap-2"
-                  >
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    Loading
-                  </Button>
-                )}
-                {model &&
-                  model.status !== "loading" &&
-                  model.status !== "downloading" && (
-                    <Button
-                      onClick={() => onModelAction(model)}
-                      variant={model.status === "ready" ? "outline" : "default"}
-                      size="sm"
-                      className="text-xs h-7 gap-2"
-                    >
-                      {(model.status === "not_downloaded" ||
-                        model.status === "error") && (
-                        <Download className="w-3.5 h-3.5" />
-                      )}
-                      {model.status === "downloaded" && (
-                        <Play className="w-3.5 h-3.5" />
-                      )}
-                      {model.status === "ready" && <Square className="w-3.5 h-3.5" />}
-                      {model.status === "not_downloaded" || model.status === "error"
-                        ? "Download"
-                        : model.status === "downloaded"
-                          ? "Load"
-                          : "Unload"}
-                    </Button>
-                  )}
-              </div>
-
-              {model?.status === "downloading" && progressMeta && (
-                <div>
-                  <div className="h-1.5 rounded bg-[var(--bg-surface-3)] overflow-hidden">
-                    <div
-                      className="h-full rounded bg-white transition-all duration-300"
-                      style={{
-                        width: `${progressMeta.progress}%`,
-                      }}
-                    />
-                  </div>
-                  <div className="mt-1 text-[11px] text-[var(--text-muted)]">
-                    Downloading {Math.round(progressMeta.progress)}%
-                    {progressMeta.progressValue &&
-                      progressMeta.progressValue.totalBytes > 0 && (
-                        <>
-                          {" "}
-                          (
-                          {formatBytes(progressMeta.progressValue.downloadedBytes)} /{" "}
-                          {formatBytes(progressMeta.progressValue.totalBytes)})
-                        </>
-                      )}
-                  </div>
-                </div>
-              )}
+              {renderModelRow({
+                eyebrow: `${item.role} stage`,
+                label: item.role,
+                variant: item.model
+                  ? formatModelVariantLabel(item.model.variant)
+                  : item.requiredVariant,
+                summary:
+                  item.role === "ASR"
+                    ? "Transcribes live microphone input into text before reasoning."
+                    : item.role === "Text"
+                      ? "Runs the conversational reasoning step before speech synthesis."
+                      : "Converts assistant replies into the built-in speaker voice.",
+                model: item.model,
+              })}
             </div>
-          );
-        })}
+          ))}
+        </div>
       </div>
     </section>
   );
 
   const renderAudioOutputSettings = () => (
-    <section className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3 space-y-4">
-      <div className="flex items-center justify-between gap-3">
+    <section className="grid gap-6 border-t border-[var(--border-muted)] pt-6 lg:grid-cols-[minmax(0,1fr)_240px]">
+      <div className="space-y-4">
         <div>
-          <h3 className="text-sm font-medium text-white">Audio Output</h3>
-          <p className="text-xs text-[var(--text-muted)] mt-1">
+          <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+            Audio output
+          </h3>
+          <p className="mt-1 text-sm text-[var(--text-muted)]">
             Control assistant playback without leaving voice mode.
           </p>
         </div>
-        <button
-          onClick={() => setIsOutputMuted((current) => !current)}
-          className="btn btn-secondary h-8 px-3 rounded-full text-[11px] gap-1.5"
-        >
-          {isOutputMuted ? (
-            <VolumeX className="w-3.5 h-3.5" />
-          ) : (
-            <Volume2 className="w-3.5 h-3.5" />
-          )}
-          {isOutputMuted ? "Muted" : "Unmuted"}
-        </button>
-      </div>
 
-      <div>
-        <label className="text-xs text-[var(--text-muted)]">
-          Playback Speed ({playbackSpeed.toFixed(2)}x)
-        </label>
+        <div className="space-y-2">
+          <label className="text-sm font-medium text-[var(--text-primary)]">
+            Playback speed ({playbackSpeed.toFixed(2)}x)
+          </label>
+          <p className="text-sm text-[var(--text-muted)]">
+            Slow the response down for clarity or keep it near realtime speed.
+          </p>
+        </div>
         <Slider
           aria-label="Playback speed"
           min={0.75}
@@ -2352,25 +2394,42 @@ export function VoicePage({
               setPlaybackSpeed(clampPlaybackSpeed(next));
             }
           }}
-          className="mt-2"
+          className="mt-3"
         />
       </div>
 
-      <div className="text-[11px] text-[var(--text-muted)]">
-        Shortcuts: `Space` start or stop, `Escape` stop, `M` mute.
+      <div className="space-y-3 lg:border-l lg:border-[var(--border-muted)] lg:pl-6">
+        <button
+          onClick={() => setIsOutputMuted((current) => !current)}
+          className="btn btn-secondary h-9 rounded-full px-4 text-xs"
+        >
+          {isOutputMuted ? (
+            <VolumeX className="w-3.5 h-3.5" />
+          ) : (
+            <Volume2 className="w-3.5 h-3.5" />
+          )}
+          {isOutputMuted ? "Muted" : "Audio on"}
+        </button>
+        <p className="text-[11px] leading-relaxed text-[var(--text-muted)]">
+          Shortcuts: `Space` start or stop, `Escape` stop, `M` mute.
+        </p>
       </div>
     </section>
   );
 
   const renderAdvancedSpeechSettings = () => (
-    <section className="rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3">
+    <section className="border-t border-[var(--border-muted)] pt-6">
       <details>
-        <summary className="cursor-pointer text-sm text-white">
+        <summary className="cursor-pointer text-sm font-semibold text-[var(--text-primary)]">
           Advanced Speech Detection
         </summary>
-        <div className="mt-3 grid md:grid-cols-3 gap-4">
+        <p className="mt-1 text-sm text-[var(--text-muted)]">
+          Tune how aggressively the microphone detects the start and end of
+          speech.
+        </p>
+        <div className="mt-4 grid gap-5 md:grid-cols-3">
           <div>
-            <label className="text-xs text-[var(--text-muted)]">
+            <label className="text-sm font-medium text-[var(--text-primary)]">
               VAD Sensitivity ({vadThreshold.toFixed(3)})
             </label>
             <Slider
@@ -2389,7 +2448,7 @@ export function VoicePage({
             />
           </div>
           <div>
-            <label className="text-xs text-[var(--text-muted)]">
+            <label className="text-sm font-medium text-[var(--text-primary)]">
               End Silence (ms): {silenceDurationMs}
             </label>
             <Slider
@@ -2408,7 +2467,7 @@ export function VoicePage({
             />
           </div>
           <div>
-            <label className="text-xs text-[var(--text-muted)]">
+            <label className="text-sm font-medium text-[var(--text-primary)]">
               Minimum Speech (ms): {minSpeechMs}
             </label>
             <Slider
