@@ -2667,7 +2667,7 @@ export function VoicePage({
                         <TabsTrigger
                           key={tab.value}
                           value={tab.value}
-                          className="h-auto w-full whitespace-normal items-start justify-start rounded-[22px] border border-transparent bg-transparent px-4 py-3 text-left text-[var(--text-muted)] shadow-none transition-colors hover:border-[var(--border-muted)] hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)] data-[state=active]:border-[var(--border-strong)] data-[state=active]:bg-[var(--bg-surface-2)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
+                          className="h-auto w-full whitespace-normal items-start justify-start rounded-[22px] border border-[color-mix(in_srgb,var(--border-muted)_72%,transparent)] bg-transparent px-4 py-3 text-left text-[var(--text-muted)] shadow-none transition-colors hover:border-[var(--border-muted)] hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)] data-[state=active]:border-[var(--border-strong)] data-[state=active]:bg-[var(--bg-surface-2)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
                         >
                           <div className="w-full min-w-0">
                             <div className="min-w-0">

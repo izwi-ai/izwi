@@ -35,3 +35,4 @@
 - In compact model inventory rows, do not repeat the raw variant string under an already clear formatted model label unless the user explicitly asks for technical identifiers.
 - In editor-style tabs, avoid dedicating a second column to generic writing guidance when the user asks for a cleaner modal; keep status badges inline with the primary editor header instead.
 - In compact setup modals, remove secondary tuning panels like playback controls when the user asks to strip the surface back; do not preserve them out of habit if they are not central to setup.
+- For simplified left-rail tabs, keep a faint inactive border so non-active items still read as clickable navigation rather than plain text.
