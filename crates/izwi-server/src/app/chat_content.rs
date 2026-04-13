@@ -148,8 +148,8 @@ fn resolve_text_part(value: &Value) -> Option<String> {
         }
         Value::Object(map) => map
             .get("text")
-            .or_else(|| map.get("input_text"))
             .and_then(|v| v.as_str())
+            .or_else(|| map.get("input_text").and_then(|v| v.as_str()))
             .map(str::to_string),
         _ => None,
     }
