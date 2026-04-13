@@ -29,3 +29,9 @@
 - For UI alignment corrections, prefer changing the row container semantics (`justify-between` + content order) instead of adding ad-hoc spacing utilities so "left label / right status" remains stable across breakpoints.
 - When extending shared primitives like `TabsTrigger`, audit inherited layout utilities such as `whitespace-nowrap`; multiline tab or rail content must explicitly opt back into wrapping and responsive stacking.
 - For left-rail tab navigation in dense settings modals, avoid inline status pills unless they are essential to navigation; they add clutter quickly and can destabilize vertical rhythm on narrow widths.
+- In dense settings modals, remove explanatory sidebars and overview sections when the user asks for a cleaner surface; keep only controls or context that directly supports the next action.
+- For operational model-management tabs, prefer one bulk action and a plain status list over repeating per-model action buttons and explanatory copy when the stack is fixed and predictable.
+- When simplifying grouped model-management UI, keep one action surface per model group if the user still expects that group to own loading/unloading; reduce duplication, but do not collapse away functional ownership.
+- In compact model inventory rows, do not repeat the raw variant string under an already clear formatted model label unless the user explicitly asks for technical identifiers.
+- In editor-style tabs, avoid dedicating a second column to generic writing guidance when the user asks for a cleaner modal; keep status badges inline with the primary editor header instead.
+- In compact setup modals, remove secondary tuning panels like playback controls when the user asks to strip the surface back; do not preserve them out of habit if they are not central to setup.
