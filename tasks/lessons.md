@@ -1,0 +1,31 @@
+# Lessons
+
+- When requirements include hardware support scope (for example Docker-only vs all distributions), treat scope as a hard contract and reconfirm before finalizing implementation plans.
+- For CUDA-related fixes, always align runtime behavior, packaging/release workflow, Docker builds, CLI reporting, and docs together to avoid "CUDA installed but not actually enabled" confusion.
+- When introducing lower-precision activation policies around Candle `QMatMul`, verify the actual weight expansion path first; some GGUF tensors materialize as dense `F32`, so projection helpers must normalize input dtypes before inference is considered fixed.
+- When lowering Gemma4 activations to `F16`, audit `RmsNorm` boundaries too; Candle's quantized norm weights dequantize to `F32`, and the norm kernel rejects mixed `F16`/`F32` inputs unless we promote the activation first.
+- When building attention masks with shape `[1, 1, q, k]` for reuse across heads, always apply them with the broadcast-aware tensor ops; plain `+` will fail against score tensors shaped `[batch, heads, q, k]`.
+- When using temporary debug harnesses to diagnose model regressions, keep them untracked and remove them before staging; never assume the user wants debugging files committed.
+- For chat decode bugs that emit role/control artifacts (for example empty text or `"user"`), do not resample from the same logits after rejecting a token. Consume the sampled token into model state first (llama.cpp-style sample/accept/process), then decide whether to surface it to users.
+- When a user reports "still broken" on streaming, always verify both non-stream and SSE `/messages` paths against a locally started patched server before claiming the fix is complete.
+- When startup appears frozen on model loading, verify crash vs hang first (PID stability + DiagnosticReports), then remove network-dependent metadata calls from the startup critical path.
+- To fix Gemma4 returning only `"user"`, keep generation stateful: sampled hidden control/role-prefix tokens must advance the KV/cache position even when they are suppressed from output.
+- For the Gemma4 `"user"` output bug, keep the fix scoped to `gemma4/chat.rs`: consume hidden control/role-prefix tokens by advancing decode state, do not resample the same logits, and avoid unrelated subsystem edits.
+- On Apple Metal, Gemma4 `F16` compute can yield all-NaN prefill logits; default Gemma4 compute dtype to `F32` on Metal unless explicitly overridden.
+- If Gemma4 emits repeated hidden prefix markers (`<turn|>`, `<|turn>`, channel markers) with no visible output, block hidden IDs during prefix resampling to force a visible token candidate before giving up.
+- For UI redesign follow-ups, treat user visual corrections as strict constraints: remove decorative container treatments when asked, preserve the existing color system, and enforce explicit text behavior requests (for example `whitespace-nowrap` on required single-line labels).
+- For onboarding completion screens, bias toward a simple single-column structure; avoid introducing extra panel splits when the user asks for a cleaner, lighter finish.
+- For copy-only completion lists, prefer plain text rows over boxed treatments unless grouping materially improves scan speed.
+- When rendering row metadata like model size, use an explicit trailing column (`grid-cols-[minmax(0,1fr)_auto]` + `whitespace-nowrap`) instead of wrap-enabled flex so right-aligned values never fall below long copy.
+- After adding cursor pagination to history/library tables, validate bottom breathing room on every affected route; if the final block is flush with the viewport, add explicit route shell bottom padding instead of relying on last-child margins.
+- If bottom spacing changes on route pages appear to have no effect, inspect shared wrapper structure first: child margins can collapse inside non-flex page containers, so fix layout semantics (`section`/`header` + flex column) before stacking route-specific spacing overrides.
+- When TTFT is the primary target, prioritize prefill-path compute reductions first; decode-loop and stream-chunk optimizations mostly affect TPS/end-to-end and are unlikely to move first-token latency.
+- For market-research follow-ups on Izwi, treat user requests for validation as potentially commercialization-oriented by default; explicitly analyze packaging, monetization, and the open-source-to-paid conversion path rather than stopping at market trends and competitors.
+- For Whisper streaming QA, always validate both the SSE final transcript and non-stream transcript on a long real file (not only `fox.wav`); chunked streaming can look fine on short clips while still producing overlap-duplication regressions.
+- For Whisper non-incremental streaming, avoid chunking audio that already fits the model context window unless explicitly overridden; overlap merge can degrade transcript quality and add avoidable latency.
+- For long-form ASR, avoid hard wall-clock timeout wrappers around active transcription generation; global request timeout values are not reliable proxies for valid transcription completion time.
+- When a model migration request says "only support X" for a specific route (for example diarization ASR), remove legacy model visibility from route model filters/preferences and also enforce the same constraint in runtime/store normalization so hidden fallbacks cannot persist.
+- When the user asks to match a newer modal readiness UX, replicate the exact interaction pattern (single full-width action + discrete status labels) and remove verbose progress/count copy rather than preserving previous explanatory text.
+- For UI alignment corrections, prefer changing the row container semantics (`justify-between` + content order) instead of adding ad-hoc spacing utilities so "left label / right status" remains stable across breakpoints.
+- When extending shared primitives like `TabsTrigger`, audit inherited layout utilities such as `whitespace-nowrap`; multiline tab or rail content must explicitly opt back into wrapping and responsive stacking.
+- For left-rail tab navigation in dense settings modals, avoid inline status pills unless they are essential to navigation; they add clutter quickly and can destabilize vertical rhythm on narrow widths.

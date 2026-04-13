@@ -1739,31 +1739,26 @@ export function VoicePage({
     value: VoiceConfigTab;
     label: string;
     description: string;
-    status: string;
   }> = [
     {
       value: "setup",
       label: "Setup",
       description: "Runtime mode, voice, playback, and speech detection.",
-      status: currentPipelineLabel,
     },
     {
       value: "models",
       label: "Models",
       description: "Load and manage the voice stack used by this workspace.",
-      status: modelStatusLabel,
     },
     {
       value: "agent",
       label: "Agent",
       description: "Tune assistant behavior and the saved system prompt.",
-      status: promptStatusLabel,
     },
     {
       value: "memory",
       label: "Memory",
       description: "Review captured voice observations and memory state.",
-      status: memoryStatusLabel,
     },
   ];
 
@@ -2863,7 +2858,7 @@ export function VoicePage({
                   onValueChange={(value) =>
                     setConfigTab(value as VoiceConfigTab)
                   }
-                  className="grid gap-6 lg:grid-cols-[240px_minmax(0,1fr)] lg:gap-8"
+                  className="grid gap-6 lg:grid-cols-[260px_minmax(0,1fr)] lg:gap-8"
                 >
                   <div className="space-y-4 lg:sticky lg:top-0">
                     <div className="space-y-1">
@@ -2882,9 +2877,9 @@ export function VoicePage({
                         <TabsTrigger
                           key={tab.value}
                           value={tab.value}
-                          className="h-auto items-start justify-start rounded-[22px] border border-transparent bg-transparent px-4 py-3 text-left text-[var(--text-muted)] shadow-none transition-colors hover:border-[var(--border-muted)] hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)] data-[state=active]:border-[var(--border-strong)] data-[state=active]:bg-[var(--bg-surface-2)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
+                          className="h-auto w-full whitespace-normal items-start justify-start rounded-[22px] border border-transparent bg-transparent px-4 py-3 text-left text-[var(--text-muted)] shadow-none transition-colors hover:border-[var(--border-muted)] hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)] data-[state=active]:border-[var(--border-strong)] data-[state=active]:bg-[var(--bg-surface-2)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:shadow-none"
                         >
-                          <div className="flex w-full items-start justify-between gap-3">
+                          <div className="w-full min-w-0">
                             <div className="min-w-0">
                               <div className="text-sm font-semibold">
                                 {tab.label}
@@ -2893,9 +2888,6 @@ export function VoicePage({
                                 {tab.description}
                               </p>
                             </div>
-                            <span className="shrink-0 whitespace-nowrap rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-1 text-[10px] font-medium text-[var(--text-muted)] data-[state=active]:border-[var(--border-strong)]">
-                              {tab.status}
-                            </span>
                           </div>
                         </TabsTrigger>
                       ))}
