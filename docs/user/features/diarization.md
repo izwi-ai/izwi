@@ -64,6 +64,12 @@ Example output:
 ### Endpoint
 
 ```
+POST /v1/audio/diarizations
+```
+
+Legacy alias still accepted for older clients:
+
+```
 POST /v1/audio/diarize
 ```
 
@@ -76,16 +82,22 @@ POST /v1/audio/diarize
 | `asr_model` | String | Optional ASR model override |
 | `aligner_model` | String | Optional forced aligner model override |
 | `llm_model` | String | Optional transcript refinement model |
-| `num_speakers` | Integer | Expected speakers (optional) |
+| `min_speakers` | Integer | Optional minimum expected speakers |
+| `max_speakers` | Integer | Optional maximum expected speakers |
+| `num_speakers` | Integer | Legacy shortcut; maps to both min/max when provided |
+| `response_format` | String | `json`, `verbose_json`, or `text` |
 
 ### Example (curl)
 
 ```bash
-curl -X POST http://localhost:8080/v1/audio/diarize \
+curl -X POST http://localhost:8080/v1/audio/diarizations \
   -F "file=@meeting.wav" \
   -F "model=diar_streaming_sortformer_4spk-v2.1" \
   -F "asr_model=Parakeet-TDT-0.6B-v3" \
-  -F "aligner_model=Qwen3-ForcedAligner-0.6B"
+  -F "aligner_model=Qwen3-ForcedAligner-0.6B" \
+  -F "min_speakers=2" \
+  -F "max_speakers=2" \
+  -F "response_format=verbose_json"
 ```
 
 ### Response
@@ -94,19 +106,18 @@ curl -X POST http://localhost:8080/v1/audio/diarize \
 {
   "segments": [
     {
-      "speaker": "Speaker 1",
+      "speaker": "SPEAKER_00",
       "start": 0.0,
-      "end": 5.2,
-      "text": "Welcome to the meeting."
+      "end": 5.2
     },
     {
-      "speaker": "Speaker 2",
+      "speaker": "SPEAKER_01",
       "start": 5.5,
-      "end": 12.1,
-      "text": "Thanks for having me."
+      "end": 12.1
     }
   ],
-  "num_speakers": 2,
+  "speaker_count": 2,
+  "transcript": "SPEAKER_00 [0.00s - 5.20s]: Welcome to the meeting.\nSPEAKER_01 [5.50s - 12.10s]: Thanks for having me.",
   "duration": 120.5
 }
 ```
@@ -121,9 +132,10 @@ If you know how many speakers are in the audio, specify it for better accuracy:
 
 ```bash
 # Via API
-curl -X POST http://localhost:8080/v1/audio/diarize \
+curl -X POST http://localhost:8080/v1/audio/diarizations \
   -F "file=@meeting.wav" \
-  -F "num_speakers=3"
+  -F "min_speakers=3" \
+  -F "max_speakers=3"
 ```
 
 ### Speaker Labels

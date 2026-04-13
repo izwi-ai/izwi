@@ -25,6 +25,7 @@ struct DiarizationRequest {
     aligner_model: Option<String>,
     llm_model: Option<String>,
     response_format: Option<String>,
+    num_speakers: Option<usize>,
     min_speakers: Option<usize>,
     max_speakers: Option<usize>,
     min_speech_duration_ms: Option<f32>,
@@ -103,10 +104,12 @@ pub async fn diarizations(
         .ok_or_else(|| ApiError::bad_request("Missing audio input (`file` or `audio_base64`)"))?;
 
     let _permit = state.acquire_permit().await;
+    let (min_speakers, max_speakers) =
+        resolve_speaker_bounds(req.min_speakers, req.max_speakers, req.num_speakers)?;
 
     let config = DiarizationConfig {
-        min_speakers: req.min_speakers,
-        max_speakers: req.max_speakers,
+        min_speakers,
+        max_speakers,
         min_speech_duration_ms: req.min_speech_duration_ms,
         min_silence_duration_ms: req.min_silence_duration_ms,
     };
@@ -261,6 +264,8 @@ struct JsonRequestBody {
     #[serde(default)]
     response_format: Option<String>,
     #[serde(default)]
+    num_speakers: Option<usize>,
+    #[serde(default)]
     min_speakers: Option<usize>,
     #[serde(default)]
     max_speakers: Option<usize>,
@@ -295,6 +300,7 @@ async fn parse_diarization_request(req: Request) -> Result<DiarizationRequest, A
             aligner_model: payload.aligner_model,
             llm_model: payload.llm_model,
             response_format: payload.response_format,
+            num_speakers: payload.num_speakers,
             min_speakers: payload.min_speakers,
             max_speakers: payload.max_speakers,
             min_speech_duration_ms: payload.min_speech_duration_ms,
@@ -401,6 +407,14 @@ async fn parse_diarization_request(req: Request) -> Result<DiarizationRequest, A
                     })?;
                     out.min_speakers = text.trim().parse::<usize>().ok();
                 }
+                "num_speakers" => {
+                    let text = field.text().await.map_err(|e| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart 'num_speakers' field: {e}"
+                        ))
+                    })?;
+                    out.num_speakers = text.trim().parse::<usize>().ok();
+                }
                 "max_speakers" => {
                     let text = field.text().await.map_err(|e| {
                         ApiError::bad_request(format!(
@@ -458,4 +472,45 @@ async fn parse_diarization_request(req: Request) -> Result<DiarizationRequest, A
         status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
         message: "Expected `Content-Type: application/json` or `multipart/form-data`".to_string(),
     })
+}
+
+fn resolve_speaker_bounds(
+    min_speakers: Option<usize>,
+    max_speakers: Option<usize>,
+    num_speakers: Option<usize>,
+) -> Result<(Option<usize>, Option<usize>), ApiError> {
+    let resolved_min = min_speakers.or(num_speakers);
+    let resolved_max = max_speakers.or(num_speakers);
+
+    if let (Some(min), Some(max)) = (resolved_min, resolved_max) {
+        if min > max {
+            return Err(ApiError::bad_request(
+                "`min_speakers` cannot be greater than `max_speakers`.",
+            ));
+        }
+    }
+
+    Ok((resolved_min, resolved_max))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_speaker_bounds;
+
+    #[test]
+    fn num_speakers_backfills_missing_bounds() {
+        let (min, max) = resolve_speaker_bounds(None, None, Some(3)).expect("bounds should resolve");
+        assert_eq!(min, Some(3));
+        assert_eq!(max, Some(3));
+    }
+
+    #[test]
+    fn rejects_invalid_speaker_bounds() {
+        let err = resolve_speaker_bounds(Some(4), Some(2), None)
+            .expect_err("min should not exceed max");
+        assert_eq!(
+            err.message,
+            "`min_speakers` cannot be greater than `max_speakers`."
+        );
+    }
 }

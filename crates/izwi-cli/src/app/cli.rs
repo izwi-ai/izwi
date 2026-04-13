@@ -301,11 +301,11 @@ pub enum Commands {
         #[arg(short, long, value_name = "PATH")]
         output: Option<PathBuf>,
 
-        /// Include transcription with speaker labels
+        /// Compatibility flag (transcript output is now included by default)
         #[arg(long)]
         transcribe: bool,
 
-        /// ASR model for transcription (used with --transcribe)
+        /// ASR model used for transcript generation
         #[arg(long, default_value = "parakeet-tdt-0.6b-v3")]
         asr_model: String,
     },

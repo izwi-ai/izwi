@@ -44,24 +44,27 @@ pub async fn execute(args: DiarizeArgs, server: &str) -> Result<()> {
         TranscriptFormat::VerboseJson => "verbose_json",
     };
 
+    if transcribe {
+        eprintln!(
+            "Note: --transcribe is now a compatibility flag; diarization responses already include transcript output."
+        );
+    }
+
     let mut request_body = serde_json::json!({
         "model": model,
         "audio_base64": audio_base64,
         "response_format": format_str,
-        "transcribe": transcribe,
+        "asr_model": asr_model,
     });
 
     if let Some(num) = num_speakers {
-        request_body["num_speakers"] = serde_json::Value::Number(num.into());
-    }
-
-    if transcribe {
-        request_body["asr_model"] = serde_json::Value::String(asr_model);
+        request_body["min_speakers"] = serde_json::Value::Number(num.into());
+        request_body["max_speakers"] = serde_json::Value::Number(num.into());
     }
 
     let client = http::client(Some(std::time::Duration::from_secs(600)))?;
     let response = client
-        .post(format!("{}/v1/audio/diarize", server))
+        .post(format!("{}/v1/audio/diarizations", server))
         .json(&request_body)
         .send()
         .await
