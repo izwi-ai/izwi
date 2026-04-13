@@ -59,6 +59,9 @@ pub struct SpeechRequest {
     /// If true, stream chunked audio from same endpoint.
     #[serde(default)]
     pub stream: Option<bool>,
+    /// OpenAI-style stream transport hint. `sse` enables server-sent events.
+    #[serde(default)]
+    pub stream_format: Option<String>,
     /// Optional voice design prompt.
     #[serde(default)]
     pub instructions: Option<String>,
@@ -130,7 +133,8 @@ pub async fn speech(
         .map_err(|err| ApiError::bad_request(format!("Unsupported TTS model: {}", err)))?;
     state.runtime.load_model(variant).await?;
 
-    if req.stream.unwrap_or(false) {
+    let streaming = resolve_streaming_mode(&req)?;
+    if streaming {
         return stream_speech(state, req, ctx.correlation_id).await;
     }
 
@@ -141,7 +145,10 @@ pub async fn speech(
         variant,
         &req,
     ));
-    let format = parse_response_format(req.response_format.as_deref().unwrap_or("wav"))?;
+    let (format, format_fallback) = parse_response_format(
+        req.response_format.as_deref().unwrap_or("wav"),
+        allow_speech_format_fallback(),
+    )?;
 
     let result = tokio::time::timeout(timeout, async {
         let gen_request = build_generation_request(&req, ctx.correlation_id, false);
@@ -162,7 +169,7 @@ pub async fn speech(
     let rtf = result.rtf();
     let tokens_generated = result.total_tokens;
 
-    Ok(Response::builder()
+    let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, content_type)
         .header("X-Generation-Time-Ms", format!("{:.1}", generation_time_ms))
         .header("X-Audio-Duration-Secs", format!("{:.2}", duration_secs))
@@ -170,10 +177,19 @@ pub async fn speech(
         .header("X-Tokens-Generated", tokens_generated.to_string())
         .header(
             "Access-Control-Expose-Headers",
-            "X-Generation-Time-Ms, X-Audio-Duration-Secs, X-RTF, X-Tokens-Generated",
+            "X-Generation-Time-Ms, X-Audio-Duration-Secs, X-RTF, X-Tokens-Generated, X-Requested-Response-Format, X-Response-Format-Fallback",
         )
-        .body(Body::from(audio_bytes))
-        .unwrap())
+        .header(
+            "X-Requested-Response-Format",
+            req.response_format
+                .as_deref()
+                .unwrap_or("wav")
+                .to_ascii_lowercase(),
+        );
+    if let Some(fallback) = format_fallback {
+        builder = builder.header("X-Response-Format-Fallback", fallback);
+    }
+    Ok(builder.body(Body::from(audio_bytes)).unwrap())
 }
 
 fn resolve_speech_timeout_secs(
@@ -231,6 +247,7 @@ fn normalize_speech_request(mut req: SpeechRequest) -> SpeechRequest {
     req.reference_audio = normalize_optional_trimmed(req.reference_audio);
     req.reference_text = normalize_optional_trimmed(req.reference_text);
     req.saved_voice_id = normalize_optional_trimmed(req.saved_voice_id);
+    req.stream_format = normalize_optional_trimmed(req.stream_format);
     req
 }
 
@@ -270,7 +287,10 @@ async fn stream_speech(
     req: SpeechRequest,
     correlation_id: String,
 ) -> Result<Response<Body>, ApiError> {
-    let format = parse_response_format(req.response_format.as_deref().unwrap_or("pcm"))?;
+    let (format, format_fallback) = parse_response_format(
+        req.response_format.as_deref().unwrap_or("pcm"),
+        allow_speech_format_fallback(),
+    )?;
     let gen_request = build_generation_request(&req, correlation_id, true);
     let stream_request_id = gen_request.id.clone();
     let stream_audio_format = stream_audio_format_label(format);
@@ -283,7 +303,7 @@ async fn stream_speech(
             Ok(permit) => permit,
             Err(_) => {
                 let error_event = SpeechStreamEvent {
-                    event: "error",
+                    event: "audio.failed",
                     request_id: Some(stream_request_id.clone()),
                     sequence: None,
                     audio_base64: None,
@@ -298,30 +318,13 @@ async fn stream_speech(
                     error: Some("Server is shutting down".to_string()),
                 };
                 let _ = send_stream_event(&event_tx, error_event).await;
-
-                let done_event = SpeechStreamEvent {
-                    event: "done",
-                    request_id: Some(stream_request_id),
-                    sequence: None,
-                    audio_base64: None,
-                    sample_count: None,
-                    is_final: None,
-                    sample_rate: None,
-                    audio_format: None,
-                    tokens_generated: None,
-                    generation_time_ms: None,
-                    audio_duration_secs: None,
-                    rtf: None,
-                    error: None,
-                };
-                let _ = send_stream_event(&event_tx, done_event).await;
                 return;
             }
         };
 
         let sample_rate = engine.sample_rate().await;
         let start_event = SpeechStreamEvent {
-            event: "start",
+            event: "audio.started",
             request_id: Some(stream_request_id.clone()),
             sequence: None,
             audio_base64: None,
@@ -333,7 +336,9 @@ async fn stream_speech(
             generation_time_ms: None,
             audio_duration_secs: None,
             rtf: None,
-            error: None,
+            error: format_fallback
+                .as_ref()
+                .map(|fallback| format!("Requested format fallback: {fallback}")),
         };
         if send_stream_event(&event_tx, start_event).await.is_err() {
             return;
@@ -362,7 +367,7 @@ async fn stream_speech(
                 Ok(bytes) => bytes,
                 Err(err) => {
                     let error_event = SpeechStreamEvent {
-                        event: "error",
+                        event: "audio.failed",
                         request_id: Some(stream_request_id.clone()),
                         sequence: None,
                         audio_base64: None,
@@ -383,7 +388,7 @@ async fn stream_speech(
             };
 
             let chunk_event = SpeechStreamEvent {
-                event: "chunk",
+                event: "audio.chunk",
                 request_id: Some(chunk.request_id.clone()),
                 sequence: Some(chunk.sequence),
                 audio_base64: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
@@ -443,7 +448,7 @@ async fn stream_speech(
                 };
 
                 let final_event = SpeechStreamEvent {
-                    event: "final",
+                    event: "audio.done",
                     request_id: Some(stream_request_id.clone()),
                     sequence: None,
                     audio_base64: None,
@@ -461,7 +466,7 @@ async fn stream_speech(
             }
             Ok(Err(err)) => {
                 let error_event = SpeechStreamEvent {
-                    event: "error",
+                    event: "audio.failed",
                     request_id: Some(stream_request_id.clone()),
                     sequence: None,
                     audio_base64: None,
@@ -479,7 +484,7 @@ async fn stream_speech(
             }
             Err(err) => {
                 let error_event = SpeechStreamEvent {
-                    event: "error",
+                    event: "audio.failed",
                     request_id: Some(stream_request_id.clone()),
                     sequence: None,
                     audio_base64: None,
@@ -497,22 +502,7 @@ async fn stream_speech(
             }
         }
 
-        let done_event = SpeechStreamEvent {
-            event: "done",
-            request_id: Some(stream_request_id),
-            sequence: None,
-            audio_base64: None,
-            sample_count: None,
-            is_final: None,
-            sample_rate: None,
-            audio_format: None,
-            tokens_generated: None,
-            generation_time_ms: None,
-            audio_duration_secs: None,
-            rtf: None,
-            error: None,
-        };
-        let _ = send_stream_event(&event_tx, done_event).await;
+        let _ = stream_request_id;
     });
 
     let stream = async_stream::stream! {
@@ -577,14 +567,21 @@ fn has_non_empty_text(raw: &str) -> bool {
     !raw.trim().is_empty()
 }
 
-fn parse_response_format(format: &str) -> Result<AudioFormat, ApiError> {
+fn parse_response_format(
+    format: &str,
+    allow_fallback: bool,
+) -> Result<(AudioFormat, Option<String>), ApiError> {
     match format.to_ascii_lowercase().as_str() {
-        "wav" => Ok(AudioFormat::Wav),
-        "pcm" | "pcm16" | "pcm_i16" | "raw_i16" => Ok(AudioFormat::RawI16),
-        "raw_f32" | "pcm_f32" => Ok(AudioFormat::RawF32),
-        // Accepted OpenAI names that are not yet supported by local encoder.
+        "wav" => Ok((AudioFormat::Wav, None)),
+        "pcm" | "pcm16" | "pcm_i16" | "raw_i16" => Ok((AudioFormat::RawI16, None)),
+        "raw_f32" | "pcm_f32" => Ok((AudioFormat::RawF32, None)),
+        // OpenAI-compatible names. This runtime can optionally fall back to WAV.
+        "mp3" | "opus" | "aac" | "flac" if allow_fallback => Ok((
+            AudioFormat::Wav,
+            Some(format!("{format}->wav")),
+        )),
         "mp3" | "opus" | "aac" | "flac" => Err(ApiError::bad_request(format!(
-            "Unsupported response_format: {}. This runtime currently supports wav and pcm",
+            "Unsupported response_format: {}. Set IZWI_OPENAI_SPEECH_FORMAT_FALLBACK=true to allow fallback to wav.",
             format
         ))),
         unsupported => Err(ApiError::bad_request(format!(
@@ -592,6 +589,32 @@ fn parse_response_format(format: &str) -> Result<AudioFormat, ApiError> {
             unsupported
         ))),
     }
+}
+
+fn resolve_streaming_mode(req: &SpeechRequest) -> Result<bool, ApiError> {
+    let stream_bool = req.stream.unwrap_or(false);
+    let stream_format = req
+        .stream_format
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase());
+    match stream_format.as_deref() {
+        None | Some("") => Ok(stream_bool),
+        Some("sse") => Ok(true),
+        Some(other) => Err(ApiError::bad_request(format!(
+            "Unsupported stream_format: {}. Supported value: sse",
+            other
+        ))),
+    }
+}
+
+fn allow_speech_format_fallback() -> bool {
+    std::env::var("IZWI_OPENAI_SPEECH_FORMAT_FALLBACK")
+        .ok()
+        .map(|value| matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ))
+        .unwrap_or(false)
 }
 
 fn stream_audio_format_label(format: AudioFormat) -> &'static str {
@@ -620,6 +643,7 @@ mod tests {
             max_output_tokens: None,
             top_k: None,
             stream: Some(false),
+            stream_format: None,
             instructions: None,
             reference_audio: None,
             reference_text: None,
@@ -645,6 +669,7 @@ mod tests {
             max_output_tokens: None,
             top_k: None,
             stream: Some(false),
+            stream_format: None,
             instructions: None,
             reference_audio: None,
             reference_text: None,
@@ -670,6 +695,7 @@ mod tests {
             max_output_tokens: None,
             top_k: None,
             stream: Some(false),
+            stream_format: None,
             instructions: None,
             reference_audio: None,
             reference_text: None,
@@ -678,5 +704,42 @@ mod tests {
 
         let timeout = resolve_speech_timeout_secs(300, ModelVariant::Kokoro82M, &req);
         assert_eq!(timeout, 300);
+    }
+
+    #[test]
+    fn parse_response_format_rejects_mp3_without_fallback() {
+        let err = parse_response_format("mp3", false).expect_err("fallback should be required");
+        assert!(err.message.contains("IZWI_OPENAI_SPEECH_FORMAT_FALLBACK"));
+    }
+
+    #[test]
+    fn parse_response_format_allows_mp3_with_fallback() {
+        let (format, fallback) =
+            parse_response_format("mp3", true).expect("fallback should be allowed");
+        assert_eq!(format, AudioFormat::Wav);
+        assert_eq!(fallback.as_deref(), Some("mp3->wav"));
+    }
+
+    #[test]
+    fn resolve_streaming_mode_honors_stream_format_sse() {
+        let req = SpeechRequest {
+            model: "Kokoro-82M".to_string(),
+            input: "hello".to_string(),
+            voice: None,
+            response_format: Some("wav".to_string()),
+            speed: None,
+            language: None,
+            temperature: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            top_k: None,
+            stream: Some(false),
+            stream_format: Some("sse".to_string()),
+            instructions: None,
+            reference_audio: None,
+            reference_text: None,
+            saved_voice_id: None,
+        };
+        assert!(resolve_streaming_mode(&req).expect("streaming mode"));
     }
 }
