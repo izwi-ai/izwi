@@ -2,6 +2,7 @@
 
 pub mod audio;
 pub mod chat;
+pub mod compat;
 pub mod models;
 pub mod responses;
 
