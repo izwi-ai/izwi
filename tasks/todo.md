@@ -43,7 +43,7 @@ Source:
   Commit:
   `feat(ui): redesign voice setup and models tabs`
 
-- [ ] Phase 3: Redesign `Agent` and `Memory` tabs and finish modal polish
+- [x] Phase 3: Redesign `Agent` and `Memory` tabs and finish modal polish
   Scope:
   Rework prompt editing and memory management to match the new modal system, including better hierarchy, lighter list treatments, and final responsive/polish adjustments across all tabs.
   Deliverable:
@@ -57,6 +57,8 @@ Source:
 
 - Phase 1 complete: replaced the heavy card-style modal shell with a calmer two-zone settings layout, upgraded the header hierarchy, and turned the tab strip into product-style section navigation with lighter chrome.
 - Phase 2 complete: rebuilt the `Setup` and `Models` tabs around sections and row lists, reduced stacked-card treatments, and kept model actions inside cleaner operational rows.
+- Phase 3 complete: aligned `Agent` and `Memory` with the new section system, simplified prompt and memory presentation, and finished responsive polish across all four tabs.
+- Verification: `npm run typecheck` and `npm run build`.
 
 # Diarization Alignment Plan
 
