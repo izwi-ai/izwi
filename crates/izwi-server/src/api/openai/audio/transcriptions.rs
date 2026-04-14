@@ -19,6 +19,7 @@ use tracing::info;
 use crate::api::request_context::RequestContext;
 use crate::error::ApiError;
 use crate::state::AppState;
+use izwi_core::parse_model_variant;
 use super::resolve_audio_upload_limit_bytes;
 
 #[derive(Debug, Default)]
@@ -56,6 +57,7 @@ pub async fn transcriptions(
     req: Request,
 ) -> Result<Response<Body>, ApiError> {
     let mut req = parse_transcription_request(req).await?;
+    validate_transcription_model(req.model.as_deref())?;
     let audio_base64 = req
         .audio_base64
         .take()
@@ -390,6 +392,29 @@ Ensure `Content-Type` includes a valid boundary (let your HTTP client set it aut
     ))
 }
 
+fn validate_transcription_model(model: Option<&str>) -> Result<(), ApiError> {
+    let Some(model_id) = model else {
+        return Ok(());
+    };
+    let trimmed = model_id.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    let variant = parse_model_variant(trimmed).map_err(|_| {
+        ApiError::bad_request(format!("Unsupported transcription model: {}", trimmed))
+    })?;
+
+    if variant.is_asr() || variant.is_voxtral() || variant.is_audio_chat() {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(format!(
+            "Unsupported transcription model: {}",
+            trimmed
+        )))
+    }
+}
+
 fn transcript_delta_event_payload(delta: String) -> String {
     serde_json::json!({
         "type": "transcript.text.delta",
@@ -480,5 +505,18 @@ mod tests {
         let expected_limit = resolve_audio_upload_limit_bytes() / (1024 * 1024);
         let err = multipart_field_error("file", "multipart/form-data field parse failed");
         assert!(err.message.contains(&format!("{expected_limit} MiB")));
+    }
+
+    #[test]
+    fn transcription_model_validation_accepts_known_asr_model() {
+        validate_transcription_model(Some("Parakeet-TDT-0.6B-v3"))
+            .expect("known ASR model should be accepted");
+    }
+
+    #[test]
+    fn transcription_model_validation_rejects_unknown_model() {
+        let err = validate_transcription_model(Some("definitely-not-a-real-model"))
+            .expect_err("unknown model should be rejected");
+        assert!(err.message.contains("Unsupported transcription model"));
     }
 }
