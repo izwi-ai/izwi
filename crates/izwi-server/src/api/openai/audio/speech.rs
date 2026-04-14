@@ -16,7 +16,6 @@ use tracing::info;
 
 use crate::api::request_context::RequestContext;
 use crate::api::saved_voices::resolve_saved_voice_reference;
-use crate::api::openai::compat::compatibility_profile;
 use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::audio::AudioFormat;
@@ -146,10 +145,8 @@ pub async fn speech(
         variant,
         &req,
     ));
-    let (format, format_fallback) = parse_response_format(
-        req.response_format.as_deref().unwrap_or("wav"),
-        allow_speech_format_fallback(),
-    )?;
+    let (format, format_fallback) =
+        parse_response_format(req.response_format.as_deref().unwrap_or("mp3"))?;
 
     let result = tokio::time::timeout(timeout, async {
         let gen_request = build_generation_request(&req, ctx.correlation_id, false);
@@ -184,7 +181,7 @@ pub async fn speech(
             "X-Requested-Response-Format",
             req.response_format
                 .as_deref()
-                .unwrap_or("wav")
+                .unwrap_or("mp3")
                 .to_ascii_lowercase(),
         );
     if let Some(fallback) = format_fallback {
@@ -288,10 +285,8 @@ async fn stream_speech(
     req: SpeechRequest,
     correlation_id: String,
 ) -> Result<Response<Body>, ApiError> {
-    let (format, format_fallback) = parse_response_format(
-        req.response_format.as_deref().unwrap_or("pcm"),
-        allow_speech_format_fallback(),
-    )?;
+    let (format, format_fallback) =
+        parse_response_format(req.response_format.as_deref().unwrap_or("mp3"))?;
     let gen_request = build_generation_request(&req, correlation_id, true);
     let stream_request_id = gen_request.id.clone();
     let stream_audio_format = stream_audio_format_label(format);
@@ -568,25 +563,17 @@ fn has_non_empty_text(raw: &str) -> bool {
     !raw.trim().is_empty()
 }
 
-fn parse_response_format(
-    format: &str,
-    allow_fallback: bool,
-) -> Result<(AudioFormat, Option<String>), ApiError> {
+fn parse_response_format(format: &str) -> Result<(AudioFormat, Option<String>), ApiError> {
     match format.to_ascii_lowercase().as_str() {
         "wav" => Ok((AudioFormat::Wav, None)),
         "pcm" | "pcm16" | "pcm_i16" | "raw_i16" => Ok((AudioFormat::RawI16, None)),
         "raw_f32" | "pcm_f32" => Ok((AudioFormat::RawF32, None)),
-        // OpenAI-compatible names. This runtime can optionally fall back to WAV.
-        "mp3" | "opus" | "aac" | "flac" if allow_fallback => Ok((
-            AudioFormat::Wav,
-            Some(format!("{format}->wav")),
-        )),
-        "mp3" | "opus" | "aac" | "flac" => Err(ApiError::bad_request(format!(
-            "Unsupported response_format: {}. Set IZWI_OPENAI_SPEECH_FORMAT_FALLBACK=true to allow fallback to wav.",
-            format
-        ))),
+        // OpenAI-compatible names. Runtime currently emits WAV as a transparent fallback.
+        "mp3" | "opus" | "aac" | "flac" => {
+            Ok((AudioFormat::Wav, Some(format!("{format}->wav"))))
+        }
         unsupported => Err(ApiError::bad_request(format!(
-            "Unsupported response_format: {}. Supported formats: wav, pcm",
+            "Unsupported response_format: {}. Supported formats: mp3, opus, aac, flac, wav, pcm",
             unsupported
         ))),
     }
@@ -606,19 +593,6 @@ fn resolve_streaming_mode(req: &SpeechRequest) -> Result<bool, ApiError> {
             other
         ))),
     }
-}
-
-fn allow_speech_format_fallback() -> bool {
-    if compatibility_profile().is_relaxed() {
-        return true;
-    }
-    std::env::var("IZWI_OPENAI_SPEECH_FORMAT_FALLBACK")
-        .ok()
-        .map(|value| matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        ))
-        .unwrap_or(false)
 }
 
 fn stream_audio_format_label(format: AudioFormat) -> &'static str {
@@ -711,15 +685,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_response_format_rejects_mp3_without_fallback() {
-        let err = parse_response_format("mp3", false).expect_err("fallback should be required");
-        assert!(err.message.contains("IZWI_OPENAI_SPEECH_FORMAT_FALLBACK"));
-    }
-
-    #[test]
-    fn parse_response_format_allows_mp3_with_fallback() {
-        let (format, fallback) =
-            parse_response_format("mp3", true).expect("fallback should be allowed");
+    fn parse_response_format_maps_mp3_to_wav_with_explicit_fallback() {
+        let (format, fallback) = parse_response_format("mp3").expect("format should parse");
         assert_eq!(format, AudioFormat::Wav);
         assert_eq!(fallback.as_deref(), Some("mp3->wav"));
     }
