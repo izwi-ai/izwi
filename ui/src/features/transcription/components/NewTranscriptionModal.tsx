@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Check, Loader2, Upload } from "lucide-react";
 
 import { api, type TranscriptionRecord } from "@/api";
@@ -31,8 +31,10 @@ interface NewTranscriptionModalProps {
   onSelectMode?: (mode: SpeechTextCreationMode) => void;
   selectedModel: string | null;
   selectedModelReady: boolean;
+  selectedModelStatus?: string | null;
   timestampAlignerModelId: string | null;
   timestampAlignerReady: boolean;
+  timestampAlignerModelStatus?: string | null;
   onOpenModelManager: () => void;
   onModelRequired: () => void;
   onTimestampAlignerRequired: () => void;
@@ -48,6 +50,11 @@ interface SubmitAudioOptions {
   filename?: string;
 }
 
+const ASR_MODEL_REQUIRED_ERROR =
+  "Select and load an ASR model before creating a transcription.";
+const ALIGNER_MODEL_REQUIRED_ERROR =
+  "Load the timestamp aligner model to include timestamps.";
+
 export function NewTranscriptionModal({
   isOpen,
   onClose,
@@ -57,8 +64,10 @@ export function NewTranscriptionModal({
   onSelectMode,
   selectedModel,
   selectedModelReady,
+  selectedModelStatus = null,
   timestampAlignerModelId,
   timestampAlignerReady,
+  timestampAlignerModelStatus = null,
   onOpenModelManager,
   onModelRequired,
   onTimestampAlignerRequired,
@@ -81,7 +90,7 @@ export function NewTranscriptionModal({
   const requireReadyModel = useCallback(() => {
     if (!selectedModel || !selectedModelReady) {
       onModelRequired();
-      setError("Select and load an ASR model before creating a transcription.");
+      setError(ASR_MODEL_REQUIRED_ERROR);
       return false;
     }
     return true;
@@ -101,7 +110,7 @@ export function NewTranscriptionModal({
       }
 
       onTimestampAlignerRequired();
-      setError("Load the timestamp aligner model to include timestamps.");
+      setError(ALIGNER_MODEL_REQUIRED_ERROR);
     },
     [
       onTimestampAlignerRequired,
@@ -125,7 +134,7 @@ export function NewTranscriptionModal({
       return true;
     }
     onTimestampAlignerRequired();
-    setError("Load the timestamp aligner model to include timestamps.");
+    setError(ALIGNER_MODEL_REQUIRED_ERROR);
     return false;
   }, [
     includeTimestamps,
@@ -268,17 +277,67 @@ export function NewTranscriptionModal({
   const alignerReadyForUse =
     !includeTimestamps || (!!timestampAlignerModelId && timestampAlignerReady);
   const transcriptionStackReady = selectedModelReady && alignerReadyForUse;
+  const isSelectedModelLoading =
+    selectedModelStatus === "loading" || selectedModelStatus === "downloading";
+  const isAlignerModelLoading =
+    includeTimestamps &&
+    (timestampAlignerModelStatus === "loading" ||
+      timestampAlignerModelStatus === "downloading");
+  const readinessStackLoading = isSelectedModelLoading || isAlignerModelLoading;
   const readinessStatusLabel = transcriptionStackReady
     ? "READY"
-    : "NEEDS ACTION";
+    : readinessStackLoading
+      ? "LOADING"
+      : "NOT LOADED";
   const readinessTone = transcriptionStackReady ? "success" : "warning";
   const readinessActionLabel = !selectedModelReady
     ? "Open ASR models"
     : includeTimestamps && !alignerReadyForUse
       ? "Open aligner models"
       : "Open models";
-  const readinessActionVariant = transcriptionStackReady ? "outline" : "default";
+  const readinessActionVariant = "default";
   const readinessActionHandler = onOpenModelManager;
+  const loadedModels = useMemo(() => {
+    const models: string[] = [];
+    if (selectedModelReady && selectedModel) {
+      models.push(selectedModel);
+    }
+    if (timestampAlignerReady && timestampAlignerModelId) {
+      const alreadyListed = models.includes(timestampAlignerModelId);
+      if (!alreadyListed) {
+        models.push(timestampAlignerModelId);
+      }
+    }
+    return models;
+  }, [
+    selectedModel,
+    selectedModelReady,
+    timestampAlignerModelId,
+    timestampAlignerReady,
+  ]);
+
+  useEffect(() => {
+    setError((current) => {
+      if (!current) {
+        return current;
+      }
+      if (current === ASR_MODEL_REQUIRED_ERROR && selectedModelReady) {
+        return null;
+      }
+      if (
+        current === ALIGNER_MODEL_REQUIRED_ERROR &&
+        (!includeTimestamps || (!!timestampAlignerModelId && timestampAlignerReady))
+      ) {
+        return null;
+      }
+      return current;
+    });
+  }, [
+    includeTimestamps,
+    selectedModelReady,
+    timestampAlignerModelId,
+    timestampAlignerReady,
+  ]);
 
   const modalBody = (
     <>
@@ -487,12 +546,28 @@ export function NewTranscriptionModal({
                 <div className="mt-2.5 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-3">
                   <div className="flex items-center justify-between gap-3">
                     <span className="text-xs text-[var(--text-muted)]">
-                      Transcription stack
+                      Transcription model
                     </span>
                     <StatusBadge tone={readinessTone}>
                       {readinessStatusLabel}
                     </StatusBadge>
                   </div>
+
+                  {loadedModels.length > 0 ? (
+                    <div className="mt-3 rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-2.5 py-2">
+                      <div className="space-y-1">
+                        {loadedModels.map((model) => (
+                          <div
+                            key={model}
+                            className="truncate text-xs text-[var(--text-primary)]"
+                            title={model}
+                          >
+                            {model}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
 
                   <Button
                     type="button"

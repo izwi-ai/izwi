@@ -175,6 +175,13 @@ export function TranscriptionPage({
         preferAnyPreferredBeforeReadyAny: true,
       }),
   });
+  const selectedTranscriptionModelStatus = useMemo(
+    () =>
+      transcriptionModels.find(
+        (model) => model.variant === resolvedSelectedModel,
+      )?.status ?? null,
+    [resolvedSelectedModel, transcriptionModels],
+  );
   const resolvedSummaryModel = useMemo(
     () =>
       resolvePreferredRouteModel({
@@ -526,6 +533,13 @@ export function TranscriptionPage({
       null,
     [transcriptionAlignerModels],
   );
+  const selectedAlignerModelStatus = useMemo(
+    () =>
+      transcriptionAlignerModels.find(
+        (model) => model.variant === resolvedAlignerModel,
+      )?.status ?? null,
+    [resolvedAlignerModel, transcriptionAlignerModels],
+  );
   const detailDescription = useMemo(() => {
     const visibleRecord =
       streamingRecord && streamingRecord.id === recordId ? streamingRecord : record;
@@ -678,11 +692,7 @@ export function TranscriptionPage({
             }}
           >
             <DialogContent
-              className={`overflow-hidden border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0 ${
-                newSpeechTextMode === "diarization"
-                  ? "max-w-[52rem]"
-                  : "max-w-[46rem]"
-              }`}
+              className="max-w-[52rem] overflow-hidden border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0"
               onEscapeKeyDown={(event) => {
                 if (isModelModalOpen) {
                   event.preventDefault();
@@ -716,8 +726,10 @@ export function TranscriptionPage({
                       onSelectMode={setNewSpeechTextMode}
                       selectedModel={resolvedSelectedModel}
                       selectedModelReady={selectedModelReady}
+                      selectedModelStatus={selectedTranscriptionModelStatus}
                       timestampAlignerModelId={resolvedAlignerModel}
                       timestampAlignerReady={timestampAlignerReady}
+                      timestampAlignerModelStatus={selectedAlignerModelStatus}
                       onOpenModelManager={() => {
                         openModelManager();
                       }}
