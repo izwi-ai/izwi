@@ -49,8 +49,18 @@ describe("SpeechTextPage", () => {
     expect(await screen.findByTestId("transcription-page")).toBeInTheDocument();
   });
 
-  it("switches to diarization mode when mode=diarization", async () => {
+  it("keeps unified transcription mode on /transcription when mode=diarization", async () => {
     renderRoute("/transcription?mode=diarization");
+    expect(await screen.findByTestId("transcription-page")).toBeInTheDocument();
+  });
+
+  it("keeps unified transcription mode on /transcription when job_kind=diarization", async () => {
+    renderRoute("/transcription?job_kind=diarization");
+    expect(await screen.findByTestId("transcription-page")).toBeInTheDocument();
+  });
+
+  it("uses diarization mode for detail routes when mode=diarization", async () => {
+    renderRoute("/transcription/diar-1?mode=diarization");
     expect(await screen.findByTestId("diarization-page")).toHaveTextContent(
       "diarization:/transcription",
     );
