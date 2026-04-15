@@ -450,6 +450,146 @@ export interface ASRTranscribeResponse {
   };
 }
 
+export type SpeechTextJobKind = "transcription" | "diarization";
+
+export type SpeechTextJobProcessingStatus =
+  | "pending"
+  | "processing"
+  | "ready"
+  | "failed";
+
+export type SpeechTextJobSummaryStatus =
+  | "not_requested"
+  | "pending"
+  | "ready"
+  | "failed";
+
+export interface SpeechTextJobSummaryBase {
+  id: string;
+  kind: SpeechTextJobKind;
+  created_at: number;
+  model_id: string | null;
+  processing_status: SpeechTextJobProcessingStatus;
+  processing_error?: string | null;
+  duration_secs: number | null;
+  processing_time_ms: number;
+  rtf: number | null;
+  audio_mime_type: string;
+  audio_filename: string | null;
+  summary_status?: SpeechTextJobSummaryStatus;
+  summary_preview?: string | null;
+  summary_chars?: number;
+}
+
+export interface SpeechTextTranscriptionSummary extends SpeechTextJobSummaryBase {
+  kind: "transcription";
+  language: string | null;
+  transcription_preview: string;
+  transcription_chars: number;
+}
+
+export interface SpeechTextDiarizationSummary extends SpeechTextJobSummaryBase {
+  kind: "diarization";
+  speaker_count: number;
+  corrected_speaker_count?: number;
+  speaker_name_override_count?: number;
+  transcript_preview: string;
+  transcript_chars: number;
+}
+
+export type SpeechTextJobSummary =
+  | SpeechTextTranscriptionSummary
+  | SpeechTextDiarizationSummary;
+
+export interface SpeechTextJobBase {
+  id: string;
+  kind: SpeechTextJobKind;
+  created_at: number;
+  model_id: string | null;
+  processing_status: SpeechTextJobProcessingStatus;
+  processing_error?: string | null;
+  duration_secs: number | null;
+  processing_time_ms: number;
+  rtf: number | null;
+  audio_mime_type: string;
+  audio_filename: string | null;
+  summary_status?: SpeechTextJobSummaryStatus;
+  summary_model_id?: string | null;
+  summary_text?: string | null;
+  summary_error?: string | null;
+  summary_updated_at?: number | null;
+}
+
+export interface SpeechTextTranscriptionJob extends SpeechTextJobBase {
+  kind: "transcription";
+  aligner_model_id: string | null;
+  language: string | null;
+  transcription: string;
+  segments: TranscriptionSegment[];
+  words: TranscriptionWord[];
+}
+
+export interface SpeechTextDiarizationJob extends SpeechTextJobBase {
+  kind: "diarization";
+  asr_model_id: string | null;
+  aligner_model_id: string | null;
+  llm_model_id: string | null;
+  min_speakers: number | null;
+  max_speakers: number | null;
+  min_speech_duration_ms: number | null;
+  min_silence_duration_ms: number | null;
+  enable_llm_refinement: boolean;
+  speaker_count: number;
+  corrected_speaker_count?: number;
+  alignment_coverage: number | null;
+  unattributed_words: number;
+  llm_refined: boolean;
+  asr_text: string;
+  raw_transcript: string;
+  transcript: string;
+  segments: DiarizationSegment[];
+  words: DiarizationWord[];
+  utterances: DiarizationUtterance[];
+  speaker_name_overrides?: Record<string, string>;
+}
+
+export type SpeechTextJob = SpeechTextTranscriptionJob | SpeechTextDiarizationJob;
+
+export interface SpeechTextJobCreateRequestBase {
+  kind: SpeechTextJobKind;
+  audio_base64?: string;
+  audio_file?: Blob;
+  audio_filename?: string;
+}
+
+export interface SpeechTextTranscriptionJobCreateRequest
+  extends SpeechTextJobCreateRequestBase {
+  kind: "transcription";
+  model_id?: string;
+  aligner_model_id?: string;
+  language?: string;
+  include_timestamps?: boolean;
+  stream?: boolean;
+}
+
+export interface SpeechTextDiarizationJobCreateRequest
+  extends SpeechTextJobCreateRequestBase {
+  kind: "diarization";
+  model_id?: string;
+  asr_model_id?: string;
+  aligner_model_id?: string;
+  llm_model_id?: string;
+  min_speakers?: number;
+  max_speakers?: number;
+  min_speech_duration_ms?: number;
+  min_silence_duration_ms?: number;
+  enable_llm_refinement?: boolean;
+}
+
+export type SpeechTextJobCreateRequest =
+  | SpeechTextTranscriptionJobCreateRequest
+  | SpeechTextDiarizationJobCreateRequest;
+
 export interface TranscriptionRecordSummary {
   id: string;
   created_at: number;
