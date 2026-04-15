@@ -410,7 +410,6 @@ fn spawn_diarization_processing_task(
         match generate_diarization_artifacts(
             runtime.clone(),
             semaphore.clone(),
-            request_timeout_secs,
             &parsed,
             correlation_id.as_deref(),
         )
@@ -490,34 +489,29 @@ fn spawn_diarization_processing_task(
 async fn generate_diarization_artifacts(
     runtime: Arc<RuntimeService>,
     semaphore: Arc<tokio::sync::Semaphore>,
-    request_timeout_secs: u64,
     parsed: &ParsedDiarizationCreateRequest,
     _correlation_id: Option<&str>,
 ) -> Result<GeneratedDiarizationArtifacts, ApiError> {
     let _permit = stateful_acquire(semaphore).await?;
     let started = Instant::now();
-    let timeout = Duration::from_secs(request_timeout_secs);
-
-    let output = tokio::time::timeout(timeout, async {
-        runtime
-            .diarize_with_transcript_bytes(
-                parsed.audio_bytes.as_slice(),
-                parsed.model_id.as_deref(),
-                parsed.asr_model_id.as_deref(),
-                parsed.aligner_model_id.as_deref(),
-                parsed.llm_model_id.as_deref(),
-                &DiarizationConfig {
-                    min_speakers: parsed.min_speakers,
-                    max_speakers: parsed.max_speakers,
-                    min_speech_duration_ms: parsed.min_speech_duration_ms.map(|v| v as f32),
-                    min_silence_duration_ms: parsed.min_silence_duration_ms.map(|v| v as f32),
-                },
-                parsed.enable_llm_refinement.unwrap_or(false),
-            )
-            .await
-    })
-    .await
-    .map_err(|_| ApiError::internal("Diarization request timed out"))??;
+    // Keep diarization processing unbounded by wall-clock timeout so valid
+    // long jobs can finish and persist successfully.
+    let output = runtime
+        .diarize_with_transcript_bytes(
+            parsed.audio_bytes.as_slice(),
+            parsed.model_id.as_deref(),
+            parsed.asr_model_id.as_deref(),
+            parsed.aligner_model_id.as_deref(),
+            parsed.llm_model_id.as_deref(),
+            &DiarizationConfig {
+                min_speakers: parsed.min_speakers,
+                max_speakers: parsed.max_speakers,
+                min_speech_duration_ms: parsed.min_speech_duration_ms.map(|v| v as f32),
+                min_silence_duration_ms: parsed.min_silence_duration_ms.map(|v| v as f32),
+            },
+            parsed.enable_llm_refinement.unwrap_or(false),
+        )
+        .await?;
 
     let processing_time_ms = started.elapsed().as_secs_f64() * 1000.0;
     let rtf = if output.duration_secs > 0.0 {
