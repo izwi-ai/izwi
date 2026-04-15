@@ -507,6 +507,21 @@ mod tests {
             "unified list should include diarization records"
         );
 
+        let unified_list_with_limit = send_request(
+            app.clone(),
+            build_request(Method::GET, "/v1/transcriptions/jobs?limit=25", None),
+        )
+        .await;
+        assert_eq!(unified_list_with_limit.status(), StatusCode::OK);
+        let list_with_limit_payload = read_json(unified_list_with_limit).await;
+        assert_eq!(
+            list_with_limit_payload
+                .get("pagination")
+                .and_then(|value| value.get("limit"))
+                .and_then(|value| value.as_u64()),
+            Some(25)
+        );
+
         let unified_transcription_record = send_request(
             app.clone(),
             build_request(
