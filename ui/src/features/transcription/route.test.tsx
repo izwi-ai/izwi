@@ -94,23 +94,30 @@ const baseProps: TranscriptionPageTestProps = {
   onError: vi.fn(),
 };
 
-function renderRoute(initialEntry: string) {
-  return render(
+function renderRouteElement(
+  initialEntry: string,
+  props: TranscriptionPageTestProps = baseProps,
+) {
+  return (
     <NotificationProvider>
       <MemoryRouter initialEntries={[initialEntry]}>
         <Routes>
           <Route
             path="/transcription"
-            element={<TranscriptionPage {...baseProps} />}
+            element={<TranscriptionPage {...props} />}
           />
           <Route
             path="/transcription/:recordId"
-            element={<TranscriptionPage {...baseProps} />}
+            element={<TranscriptionPage {...props} />}
           />
         </Routes>
       </MemoryRouter>
-    </NotificationProvider>,
+    </NotificationProvider>
   );
+}
+
+function renderRoute(initialEntry: string) {
+  return render(renderRouteElement(initialEntry));
 }
 
 function deferredPromise<T>() {
@@ -513,6 +520,9 @@ describe("TranscriptionPage detail route", () => {
     expect(screen.getByRole("radio", { name: "Diarization" })).not.toBeChecked();
     expect(screen.getByText("Bring in a recording")).toBeInTheDocument();
     expect(screen.getByText("Model readiness")).toBeInTheDocument();
+    expect(screen.getByText("Transcription model")).toBeInTheDocument();
+    expect(screen.getByText("Parakeet-TDT-0.6B-v3")).toBeInTheDocument();
+    expect(screen.getByText("Qwen3-ForcedAligner-0.6B")).toBeInTheDocument();
     expect(screen.getByText("Upload audio")).toBeInTheDocument();
     expect(screen.getByText("Stream results")).toBeInTheDocument();
   });
@@ -537,6 +547,159 @@ describe("TranscriptionPage detail route", () => {
     expect(screen.getByRole("radio", { name: "Diarization" })).toBeChecked();
     expect(screen.getByText("Choose how to start")).toBeInTheDocument();
     expect(screen.getByText("Model readiness")).toBeInTheDocument();
+  });
+
+  it("shows NOT LOADED readiness state in transcription mode when required models are not ready", async () => {
+    baseProps.selectedModel = null;
+    hookMocks.useRouteModelSelection.mockReturnValue({
+      routeModels: [],
+      resolvedSelectedModel: null,
+      selectedModelReady: false,
+      isModelModalOpen: false,
+      intentVariant: null,
+      closeModelModal: vi.fn(),
+      openModelManager: vi.fn(),
+      requestModel: vi.fn(),
+      handleModelSelect: vi.fn(),
+      modelOptions: [],
+    });
+
+    renderRoute("/transcription");
+
+    await waitFor(() =>
+      expect(apiMocks.listTranscriptionRecords).toHaveBeenCalled(),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /New transcript/i }));
+    expect(
+      await screen.findByRole("heading", { name: "New transcript" }),
+    ).toBeInTheDocument();
+
+    expect(screen.getByText("NOT LOADED")).toBeInTheDocument();
+    expect(screen.getByText("Qwen3-ForcedAligner-0.6B")).toBeInTheDocument();
+  });
+
+  it("clears ASR requirement errors after a transcription model becomes ready", async () => {
+    baseProps.selectedModel = null;
+    hookMocks.useRouteModelSelection.mockReturnValue({
+      routeModels: [],
+      resolvedSelectedModel: null,
+      selectedModelReady: false,
+      isModelModalOpen: false,
+      intentVariant: null,
+      closeModelModal: vi.fn(),
+      openModelManager: vi.fn(),
+      requestModel: vi.fn(),
+      handleModelSelect: vi.fn(),
+      modelOptions: [],
+    });
+
+    const view = renderRoute("/transcription");
+
+    await waitFor(() =>
+      expect(apiMocks.listTranscriptionRecords).toHaveBeenCalled(),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /New transcript/i }));
+    expect(
+      await screen.findByRole("heading", { name: "New transcript" }),
+    ).toBeInTheDocument();
+
+    const fileInput = document.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement | null;
+    expect(fileInput).not.toBeNull();
+
+    fireEvent.change(fileInput!, {
+      target: {
+        files: [new File(["audio"], "missing-model.wav", { type: "audio/wav" })],
+      },
+    });
+
+    expect(
+      await screen.findByText(
+        "Select and load an ASR model before creating a transcription.",
+      ),
+    ).toBeInTheDocument();
+
+    baseProps.selectedModel = "Parakeet-TDT-0.6B-v3";
+    hookMocks.useRouteModelSelection.mockReturnValue({
+      routeModels: baseProps.models,
+      resolvedSelectedModel: "Parakeet-TDT-0.6B-v3",
+      selectedModelReady: true,
+      isModelModalOpen: false,
+      intentVariant: null,
+      closeModelModal: vi.fn(),
+      openModelManager: vi.fn(),
+      requestModel: vi.fn(),
+      handleModelSelect: vi.fn(),
+      modelOptions: [],
+    });
+
+    view.rerender(renderRouteElement("/transcription"));
+
+    await waitFor(() =>
+      expect(
+        screen.queryByText(
+          "Select and load an ASR model before creating a transcription.",
+        ),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
+  it("shows LOADING readiness state in transcription mode when the selected model is loading", async () => {
+    baseProps.models = [
+      {
+        variant: "Parakeet-TDT-0.6B-v3",
+        status: "loading",
+        local_path: "/models/parakeet",
+        size_bytes: null,
+        download_progress: null,
+        error_message: null,
+      },
+      {
+        variant: "Qwen3-ForcedAligner-0.6B",
+        status: "ready",
+        local_path: "/models/aligner",
+        size_bytes: null,
+        download_progress: null,
+        error_message: null,
+      },
+      {
+        variant: "Qwen3.5-4B",
+        status: "ready",
+        local_path: "/models/qwen",
+        size_bytes: null,
+        download_progress: null,
+        error_message: null,
+      },
+    ];
+    baseProps.selectedModel = "Parakeet-TDT-0.6B-v3";
+    hookMocks.useRouteModelSelection.mockReturnValue({
+      routeModels: baseProps.models,
+      resolvedSelectedModel: "Parakeet-TDT-0.6B-v3",
+      selectedModelReady: false,
+      isModelModalOpen: false,
+      intentVariant: null,
+      closeModelModal: vi.fn(),
+      openModelManager: vi.fn(),
+      requestModel: vi.fn(),
+      handleModelSelect: vi.fn(),
+      modelOptions: [],
+    });
+
+    renderRoute("/transcription");
+
+    await waitFor(() =>
+      expect(apiMocks.listTranscriptionRecords).toHaveBeenCalled(),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /New transcript/i }));
+    expect(
+      await screen.findByRole("heading", { name: "New transcript" }),
+    ).toBeInTheDocument();
+
+    expect(screen.getByText("LOADING")).toBeInTheDocument();
   });
 
   it("opens model manager from the modal readiness button without raising an error toast", async () => {
