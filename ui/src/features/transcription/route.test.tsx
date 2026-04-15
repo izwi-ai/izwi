@@ -539,6 +539,41 @@ describe("TranscriptionPage detail route", () => {
     expect(screen.getByText("Model readiness")).toBeInTheDocument();
   });
 
+  it("opens model manager from the modal readiness button without raising an error toast", async () => {
+    const openModelManager = vi.fn();
+    const requestModel = vi.fn();
+    baseProps.selectedModel = null;
+    hookMocks.useRouteModelSelection.mockReturnValue({
+      routeModels: [],
+      resolvedSelectedModel: null,
+      selectedModelReady: false,
+      isModelModalOpen: false,
+      intentVariant: null,
+      closeModelModal: vi.fn(),
+      openModelManager,
+      requestModel,
+      handleModelSelect: vi.fn(),
+      modelOptions: [],
+    });
+
+    renderRoute("/transcription");
+
+    await waitFor(() =>
+      expect(apiMocks.listTranscriptionRecords).toHaveBeenCalled(),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /New transcript/i }));
+    expect(
+      await screen.findByRole("heading", { name: "New transcript" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open ASR models" }));
+
+    expect(openModelManager).toHaveBeenCalledTimes(1);
+    expect(requestModel).not.toHaveBeenCalled();
+    expect(baseProps.onError).not.toHaveBeenCalled();
+  });
+
   it("raises the model modal above the new transcript modal", async () => {
     hookMocks.useRouteModelSelection.mockReturnValue({
       routeModels: [],

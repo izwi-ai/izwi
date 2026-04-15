@@ -33,6 +33,7 @@ interface NewTranscriptionModalProps {
   selectedModelReady: boolean;
   timestampAlignerModelId: string | null;
   timestampAlignerReady: boolean;
+  onOpenModelManager: () => void;
   onModelRequired: () => void;
   onTimestampAlignerRequired: () => void;
   onCreated: (record: TranscriptionRecord) => Promise<void> | void;
@@ -58,6 +59,7 @@ export function NewTranscriptionModal({
   selectedModelReady,
   timestampAlignerModelId,
   timestampAlignerReady,
+  onOpenModelManager,
   onModelRequired,
   onTimestampAlignerRequired,
   onCreated,
@@ -276,11 +278,7 @@ export function NewTranscriptionModal({
       ? "Open aligner models"
       : "Open models";
   const readinessActionVariant = transcriptionStackReady ? "outline" : "default";
-  const readinessActionHandler = !selectedModelReady
-    ? onModelRequired
-    : includeTimestamps && !alignerReadyForUse
-      ? onTimestampAlignerRequired
-      : onModelRequired;
+  const readinessActionHandler = onOpenModelManager;
 
   const modalBody = (
     <>
