@@ -16,6 +16,10 @@ import {
   getModelProviderLabel,
   PROVIDER_ORDER,
 } from "@/features/models/catalog/modelMetadata";
+import type {
+  ModelDownloadProgressEntry,
+  ModelDownloadProgressMap,
+} from "@/features/models/downloadProgress";
 import { withQwen3Prefix } from "@/utils/modelDisplay";
 
 interface RouteModelSection {
@@ -43,16 +47,7 @@ interface RouteModelModalProps {
   loading: boolean;
   selectedVariant: string | null;
   intentVariant?: string | null;
-  downloadProgress: Record<
-    string,
-    {
-      percent: number;
-      currentFile: string;
-      status: string;
-      downloadedBytes: number;
-      totalBytes: number;
-    }
-  >;
+  downloadProgress: ModelDownloadProgressMap;
   onDownload: (variant: string) => void;
   onCancelDownload?: (variant: string) => void;
   onLoad: (variant: string) => void;
@@ -136,13 +131,7 @@ function defaultModelLabel(variant: string): string {
 
 function getModelSizeLabel(
   model: ModelInfo,
-  progress: {
-    percent: number;
-    currentFile: string;
-    status: string;
-    downloadedBytes: number;
-    totalBytes: number;
-  } | undefined,
+  progress: ModelDownloadProgressEntry | undefined,
 ): string {
   if (progress && progress.totalBytes > 0) {
     return formatBytes(progress.totalBytes);

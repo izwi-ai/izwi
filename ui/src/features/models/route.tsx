@@ -13,6 +13,7 @@ import {
 import clsx from "clsx";
 import type { ModelInfo } from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
+import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 import {
   getModelProviderLabel,
   MODEL_DETAILS,
@@ -23,10 +24,7 @@ import { withQwen3Prefix } from "@/utils/modelDisplay";
 interface MyModelsPageProps {
   models: ModelInfo[];
   loading: boolean;
-  downloadProgress: Record<
-    string,
-    { percent: number; currentFile: string; status: string }
-  >;
+  downloadProgress: ModelDownloadProgressMap;
   onDownload: (variant: string) => void;
   onCancelDownload?: (variant: string) => void;
   onLoad: (variant: string) => void;

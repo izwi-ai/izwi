@@ -1,7 +1,6 @@
 import { useCallback, useRef, useState } from "react";
 import {
   AlertTriangle,
-  Check,
   Loader2,
   Mic,
   Square,
@@ -17,246 +16,15 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { StatusBadge } from "@/components/ui/status-badge";
+import {
+  clampIntegerDraft,
+  formatDraftValue,
+  resolveDiarizationUploadFilename,
+  resolveSourceAudioFilename,
+  transcodeToWav,
+} from "@/features/diarization/audioUpload";
+import { SpeechTextModeSwitch } from "@/features/speech-text/components/SpeechTextModeSwitch";
 import type { SpeechTextCreationMode } from "@/features/speech-text/creationMode";
-
-function formatDraftValue(value: number | null | undefined): string {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    return "";
-  }
-  if (Number.isInteger(value)) {
-    return String(value);
-  }
-  return value.toFixed(2).replace(/\.?0+$/, "");
-}
-
-function parseOptionalInteger(value: string): number | undefined {
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return undefined;
-  }
-  const parsed = Number.parseInt(trimmed, 10);
-  return Number.isFinite(parsed) ? parsed : undefined;
-}
-
-function clampIntegerDraft(
-  value: string,
-  fallback: number,
-  min: number,
-  max: number,
-): number {
-  const parsed = parseOptionalInteger(value) ?? fallback;
-  return Math.max(min, Math.min(max, parsed));
-}
-
-function encodeWavPcm16(samples: Float32Array, sampleRate: number): Blob {
-  const bytesPerSample = 2;
-  const blockAlign = bytesPerSample;
-  const byteRate = sampleRate * blockAlign;
-  const dataSize = samples.length * bytesPerSample;
-  const buffer = new ArrayBuffer(44 + dataSize);
-  const view = new DataView(buffer);
-
-  const writeString = (offset: number, value: string) => {
-    for (let i = 0; i < value.length; i += 1) {
-      view.setUint8(offset + i, value.charCodeAt(i));
-    }
-  };
-
-  writeString(0, "RIFF");
-  view.setUint32(4, 36 + dataSize, true);
-  writeString(8, "WAVE");
-  writeString(12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, byteRate, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, 16, true);
-  writeString(36, "data");
-  view.setUint32(40, dataSize, true);
-
-  let offset = 44;
-  for (let i = 0; i < samples.length; i += 1) {
-    const clamped = Math.max(-1, Math.min(1, samples[i]));
-    const int16 = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
-    view.setInt16(offset, int16, true);
-    offset += 2;
-  }
-
-  return new Blob([buffer], { type: "audio/wav" });
-}
-
-function isWavMimeType(mimeType: string | null | undefined): boolean {
-  if (!mimeType) {
-    return false;
-  }
-  const normalized = mimeType.toLowerCase();
-  return (
-    normalized === "audio/wav" ||
-    normalized === "audio/x-wav" ||
-    normalized === "audio/wave" ||
-    normalized === "audio/vnd.wave"
-  );
-}
-
-function hasSpecificMimeType(mimeType: string | null | undefined): boolean {
-  if (!mimeType) {
-    return false;
-  }
-  const normalized = mimeType.trim().toLowerCase();
-  return normalized.length > 0 && normalized !== "application/octet-stream";
-}
-
-function extensionForAudioMimeType(
-  mimeType: string | null | undefined,
-): string | null {
-  if (!mimeType) {
-    return null;
-  }
-
-  const normalized = mimeType.trim().toLowerCase();
-  if (!normalized) {
-    return null;
-  }
-  if (isWavMimeType(normalized)) {
-    return "wav";
-  }
-  if (normalized.includes("webm")) {
-    return "webm";
-  }
-  if (normalized.includes("ogg")) {
-    return "ogg";
-  }
-  if (normalized.includes("flac")) {
-    return "flac";
-  }
-  if (normalized.includes("aac")) {
-    return "aac";
-  }
-  if (normalized.includes("mp4") || normalized.includes("m4a")) {
-    return "mp4";
-  }
-  if (normalized.includes("mpeg") || normalized.includes("mp3")) {
-    return "mp3";
-  }
-
-  return null;
-}
-
-function sourceAudioFilename(inputBlob: Blob): string | undefined {
-  if (!(inputBlob instanceof File)) {
-    return undefined;
-  }
-
-  const trimmed = inputBlob.name.trim();
-  return trimmed ? trimmed : undefined;
-}
-
-function fallbackAudioFilename(inputBlob: Blob): string {
-  const extension = extensionForAudioMimeType(inputBlob.type);
-  return extension ? `audio.${extension}` : "audio.bin";
-}
-
-function replaceAudioFilenameExtension(
-  filename: string,
-  nextExtension: string,
-): string {
-  const trimmed = filename.trim();
-  if (!trimmed) {
-    return `audio.${nextExtension}`;
-  }
-
-  const normalized = trimmed.split(/[/\\]/).pop() ?? trimmed;
-  const extensionIndex = normalized.lastIndexOf(".");
-  if (extensionIndex <= 0) {
-    return `${normalized}.${nextExtension}`;
-  }
-  return `${normalized.slice(0, extensionIndex)}.${nextExtension}`;
-}
-
-export function resolveDiarizationUploadFilename(options: {
-  sourceFileName?: string;
-  sourceBlob: Blob;
-  uploadedBlob: Blob;
-}): string {
-  const { sourceFileName, sourceBlob, uploadedBlob } = options;
-  const trimmedSourceFileName = sourceFileName?.trim();
-  if (!trimmedSourceFileName) {
-    return fallbackAudioFilename(uploadedBlob);
-  }
-
-  if (uploadedBlob === sourceBlob) {
-    return trimmedSourceFileName;
-  }
-
-  const uploadedExtension = extensionForAudioMimeType(uploadedBlob.type) ?? "wav";
-  return replaceAudioFilenameExtension(
-    trimmedSourceFileName,
-    uploadedExtension,
-  );
-}
-
-async function transcodeToWav(
-  inputBlob: Blob,
-  targetSampleRate = 16000,
-  sourceFileName?: string,
-): Promise<Blob> {
-  const filenameLooksWav = sourceFileName
-    ? sourceFileName.toLowerCase().endsWith(".wav")
-    : false;
-  if (
-    isWavMimeType(inputBlob.type) ||
-    (!hasSpecificMimeType(inputBlob.type) && filenameLooksWav)
-  ) {
-    return inputBlob;
-  }
-
-  const decodeContext = new AudioContext();
-  try {
-    const sourceBytes = await inputBlob.arrayBuffer();
-    const decoded = await decodeContext.decodeAudioData(sourceBytes.slice(0));
-
-    const monoBuffer = decodeContext.createBuffer(
-      1,
-      decoded.length,
-      decoded.sampleRate,
-    );
-    const mono = monoBuffer.getChannelData(0);
-
-    for (let i = 0; i < decoded.length; i += 1) {
-      let sum = 0;
-      for (let ch = 0; ch < decoded.numberOfChannels; ch += 1) {
-        sum += decoded.getChannelData(ch)[i] ?? 0;
-      }
-      mono[i] = sum / decoded.numberOfChannels;
-    }
-
-    const rendered = await (() => {
-      if (decoded.sampleRate === targetSampleRate) {
-        return Promise.resolve(monoBuffer);
-      }
-
-      const targetLength = Math.ceil(
-        (monoBuffer.length * targetSampleRate) / monoBuffer.sampleRate,
-      );
-      const offline = new OfflineAudioContext(
-        1,
-        targetLength,
-        targetSampleRate,
-      );
-      const source = offline.createBufferSource();
-      source.buffer = monoBuffer;
-      source.connect(offline.destination);
-      source.start(0);
-      return offline.startRendering();
-    })();
-
-    return encodeWavPcm16(rendered.getChannelData(0), targetSampleRate);
-  } finally {
-    decodeContext.close().catch(() => {});
-  }
-}
 
 interface NewDiarizationModalProps {
   isOpen: boolean;
@@ -381,7 +149,7 @@ export function NewDiarizationModal({
       setError(null);
 
       try {
-        const sourceFileName = sourceAudioFilename(audioBlob);
+        const sourceFileName = resolveSourceAudioFilename(audioBlob);
         const uploadedBlob = await transcodeToWav(
           audioBlob,
           16000,
@@ -544,50 +312,10 @@ export function NewDiarizationModal({
           Upload a recording or mic capture, then open the job page once the
           upload is accepted.
         </DialogDescription>
-        {onSelectMode ? (
-          <div className="mt-3 grid gap-2 sm:grid-cols-2">
-            <label className="flex items-start justify-between gap-3 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
-              <div className="min-w-0">
-                <div className="text-sm font-semibold text-[var(--text-primary)]">
-                  Transcription
-                </div>
-              </div>
-              <div className="relative mt-0.5 shrink-0">
-                <input
-                  id="speech-text-mode-transcription"
-                  name="speech-text-mode"
-                  type="radio"
-                  checked={selectedMode === "transcription"}
-                  onChange={() => onSelectMode("transcription")}
-                  className="peer sr-only"
-                />
-                <span className="flex h-5 w-5 items-center justify-center rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface-0)] text-white transition peer-checked:border-[var(--status-info-text)] peer-checked:bg-[var(--status-info-text)] peer-focus-visible:outline-none peer-focus-visible:ring-2 peer-focus-visible:ring-ring/45 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-background">
-                  <Check className="h-3.5 w-3.5 opacity-0 transition peer-checked:opacity-100" />
-                </span>
-              </div>
-            </label>
-            <label className="flex items-start justify-between gap-3 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
-              <div className="min-w-0">
-                <div className="text-sm font-semibold text-[var(--text-primary)]">
-                  Diarization
-                </div>
-              </div>
-              <div className="relative mt-0.5 shrink-0">
-                <input
-                  id="speech-text-mode-diarization"
-                  name="speech-text-mode"
-                  type="radio"
-                  checked={selectedMode === "diarization"}
-                  onChange={() => onSelectMode("diarization")}
-                  className="peer sr-only"
-                />
-                <span className="flex h-5 w-5 items-center justify-center rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface-0)] text-white transition peer-checked:border-[var(--status-info-text)] peer-checked:bg-[var(--status-info-text)] peer-focus-visible:outline-none peer-focus-visible:ring-2 peer-focus-visible:ring-ring/45 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-background">
-                  <Check className="h-3.5 w-3.5 opacity-0 transition peer-checked:opacity-100" />
-                </span>
-              </div>
-            </label>
-          </div>
-        ) : null}
+        <SpeechTextModeSwitch
+          selectedMode={selectedMode}
+          onSelectMode={onSelectMode}
+        />
       </div>
 
       <div className="grid lg:grid-cols-[minmax(0,1.1fr),minmax(19rem,0.9fr)]">

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { resolveDiarizationUploadFilename } from "./NewDiarizationModal";
+import { resolveDiarizationUploadFilename } from "@/features/diarization/audioUpload";
 
 describe("resolveDiarizationUploadFilename", () => {
   it("preserves the uploaded base filename when transcoding to wav", () => {

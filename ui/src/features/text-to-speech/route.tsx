@@ -9,6 +9,7 @@ import {
   TEXT_TO_SPEECH_PREFERRED_MODELS,
   resolvePreferredRouteModel,
 } from "@/features/models/catalog/routeModelCatalog";
+import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 import { RouteModelModal } from "@/features/models/components/RouteModelModal";
 import { useRouteModelSelection } from "@/features/models/hooks/useRouteModelSelection";
 import { TextToSpeechHistoryTable } from "@/features/text-to-speech/components/TextToSpeechHistoryTable";
@@ -25,16 +26,7 @@ interface TextToSpeechPageProps {
   models: ModelInfo[];
   selectedModel: string | null;
   loading: boolean;
-  downloadProgress: Record<
-    string,
-    {
-      percent: number;
-      currentFile: string;
-      status: string;
-      downloadedBytes: number;
-      totalBytes: number;
-    }
-  >;
+  downloadProgress: ModelDownloadProgressMap;
   onDownload: (variant: string) => void;
   onCancelDownload?: (variant: string) => void;
   onLoad: (variant: string) => void;

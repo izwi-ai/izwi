@@ -59,7 +59,7 @@ function speakerNameOverridesFromSource(
   );
 }
 
-export function resolveSpeakerName(
+function resolveSpeakerName(
   rawSpeaker: string,
   source: SpeakerNameOverrideSource | null | undefined,
 ): string {
@@ -140,14 +140,7 @@ function sanitizeTranscriptText(transcript: string, rawTranscript: string): stri
     .trim();
 }
 
-export function transcriptEntriesFromUtterances(
-  utterances: DiarizationUtterance[] | null | undefined,
-  source?: SpeakerNameOverrideSource | null,
-): TranscriptEntry[] {
-  return coerceUtteranceEntries(utterances, source);
-}
-
-export function transcriptEntriesFromResult(result: TranscriptSource): TranscriptEntry[] {
+function transcriptEntriesFromResult(result: TranscriptSource): TranscriptEntry[] {
   const entries = coerceUtteranceEntries(result.utterances, result);
   if (entries.length > 0) {
     return entries;
@@ -185,7 +178,7 @@ export function formattedTranscriptFromRecord(record: TranscriptRecordSource): s
   return sanitizeTranscriptText(record.transcript, record.raw_transcript);
 }
 
-export function formatTranscriptFromEntries(entries: TranscriptEntry[]): string {
+function formatTranscriptFromEntries(entries: TranscriptEntry[]): string {
   return entries
     .map(
       (entry) =>

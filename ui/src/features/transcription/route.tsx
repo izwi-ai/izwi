@@ -23,9 +23,20 @@ import {
   TRANSCRIPTION_PREFERRED_MODELS,
   resolvePreferredRouteModel,
 } from "@/features/models/catalog/routeModelCatalog";
+import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 import { RouteModelModal } from "@/features/models/components/RouteModelModal";
 import { useRouteModelSelection } from "@/features/models/hooks/useRouteModelSelection";
 import type { SpeechTextCreationMode } from "@/features/speech-text/creationMode";
+import {
+  collectManagedModels,
+  filterAndSortModels,
+  isDiarizationPipelineAlignerVariant,
+  isDiarizationPipelineAsrVariant,
+  isDiarizationPipelineLlmVariant,
+  isDiarizationVariant,
+  isTranscriptionAlignerVariant,
+  isTranscriptionSummaryVariant,
+} from "@/features/speech-text/modelFilters";
 import { useTranscriptionHistory } from "@/features/transcription/hooks/useTranscriptionHistory";
 import { useTranscriptionRecord } from "@/features/transcription/hooks/useTranscriptionRecord";
 import { normalizeProcessingStatus } from "@/features/transcription/playground/support";
@@ -34,45 +45,11 @@ import { Settings2 } from "lucide-react";
 
 const TRANSCRIPTION_PREFERRED_SUMMARY_MODELS = ["Qwen3.5-4B"] as const;
 
-function isTranscriptionAlignerVariant(variant: string): boolean {
-  return variant === "Qwen3-ForcedAligner-0.6B";
-}
-
-function isTranscriptionSummaryVariant(variant: string): boolean {
-  return variant === "Qwen3.5-4B";
-}
-
-function isDiarizationVariant(variant: string): boolean {
-  const normalized = variant.toLowerCase();
-  return normalized.includes("sortformer") || normalized.includes("diar");
-}
-
-function isDiarizationPipelineAsrVariant(variant: string): boolean {
-  return variant === "Whisper-Large-v3-Turbo";
-}
-
-function isDiarizationPipelineAlignerVariant(variant: string): boolean {
-  return variant === "Qwen3-ForcedAligner-0.6B";
-}
-
-function isDiarizationPipelineLlmVariant(variant: string): boolean {
-  return variant === "Qwen3.5-4B";
-}
-
 interface TranscriptionPageProps {
   models: ModelInfo[];
   selectedModel: string | null;
   loading: boolean;
-  downloadProgress: Record<
-    string,
-    {
-      percent: number;
-      currentFile: string;
-      status: string;
-      downloadedBytes: number;
-      totalBytes: number;
-    }
-  >;
+  downloadProgress: ModelDownloadProgressMap;
   onDownload: (variant: string) => void;
   onCancelDownload?: (variant: string) => void;
   onLoad: (variant: string) => void;
@@ -112,45 +89,27 @@ export function TranscriptionPage({
     useState<TranscriptionRecord | null>(null);
   const viewConfig = VIEW_CONFIGS.transcription;
   const transcriptionAlignerModels = useMemo(
-    () =>
-      models
-        .filter((model) => isTranscriptionAlignerVariant(model.variant))
-        .sort((a, b) => a.variant.localeCompare(b.variant)),
+    () => filterAndSortModels(models, isTranscriptionAlignerVariant),
     [models],
   );
   const transcriptionSummaryModels = useMemo(
-    () =>
-      models
-        .filter((model) => isTranscriptionSummaryVariant(model.variant))
-        .sort((a, b) => a.variant.localeCompare(b.variant)),
+    () => filterAndSortModels(models, isTranscriptionSummaryVariant),
     [models],
   );
   const diarizationModels = useMemo(
-    () =>
-      models
-        .filter((model) => isDiarizationVariant(model.variant))
-        .sort((a, b) => a.variant.localeCompare(b.variant)),
+    () => filterAndSortModels(models, isDiarizationVariant),
     [models],
   );
   const diarizationAsrPipelineModels = useMemo(
-    () =>
-      models
-        .filter((model) => isDiarizationPipelineAsrVariant(model.variant))
-        .sort((a, b) => a.variant.localeCompare(b.variant)),
+    () => filterAndSortModels(models, isDiarizationPipelineAsrVariant),
     [models],
   );
   const diarizationAlignerPipelineModels = useMemo(
-    () =>
-      models
-        .filter((model) => isDiarizationPipelineAlignerVariant(model.variant))
-        .sort((a, b) => a.variant.localeCompare(b.variant)),
+    () => filterAndSortModels(models, isDiarizationPipelineAlignerVariant),
     [models],
   );
   const diarizationLlmPipelineModels = useMemo(
-    () =>
-      models
-        .filter((model) => isDiarizationPipelineLlmVariant(model.variant))
-        .sort((a, b) => a.variant.localeCompare(b.variant)),
+    () => filterAndSortModels(models, isDiarizationPipelineLlmVariant),
     [models],
   );
   const {
@@ -284,25 +243,6 @@ export function TranscriptionPage({
     );
   const diarizationPipelineModelsReady =
     diarizationAsrModelReady && diarizationAlignerModelReady;
-  const diarizationManagedModelVariants = useMemo(
-    () =>
-      Array.from(
-        new Set(
-          [
-            resolvedDiarizationModel,
-            resolvedDiarizationAsrModel,
-            resolvedDiarizationAlignerModel,
-            resolvedDiarizationLlmModel,
-          ].filter((variant): variant is string => Boolean(variant)),
-        ),
-      ),
-    [
-      resolvedDiarizationAlignerModel,
-      resolvedDiarizationAsrModel,
-      resolvedDiarizationLlmModel,
-      resolvedDiarizationModel,
-    ],
-  );
   const diarizationPipelineModels = useMemo(
     () => [
       ...diarizationModels,
@@ -319,13 +259,22 @@ export function TranscriptionPage({
   );
   const diarizationManagedModels = useMemo(
     () =>
-      diarizationManagedModelVariants
-        .map((variant) =>
-          diarizationPipelineModels.find((model) => model.variant === variant) ??
-          null,
-        )
-        .filter((model): model is ModelInfo => model !== null),
-    [diarizationManagedModelVariants, diarizationPipelineModels],
+      collectManagedModels({
+        availableModels: diarizationPipelineModels,
+        managedVariants: [
+          resolvedDiarizationModel,
+          resolvedDiarizationAsrModel,
+          resolvedDiarizationAlignerModel,
+          resolvedDiarizationLlmModel,
+        ],
+      }),
+    [
+      diarizationPipelineModels,
+      resolvedDiarizationAlignerModel,
+      resolvedDiarizationAsrModel,
+      resolvedDiarizationLlmModel,
+      resolvedDiarizationModel,
+    ],
   );
   const readyDiarizationManagedModelCount = diarizationManagedModels.filter(
     (model) => model.status === "ready",

@@ -15,15 +15,15 @@ import {
   trackModelLoaded,
 } from "@/app/analytics/events";
 import { useNotifications } from "@/app/providers/NotificationProvider";
+import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 import { VIEW_CONFIGS } from "@/types";
-import type { DownloadProgressMap } from "@/app/router/types";
 
 interface ModelCatalogContextValue {
   models: ModelInfo[];
   selectedModel: string | null;
   loading: boolean;
   error: string | null;
-  downloadProgress: DownloadProgressMap;
+  downloadProgress: ModelDownloadProgressMap;
   readyModelsCount: number;
   selectModel: (variant: string | null) => void;
   reportError: (message: string) => void;
@@ -50,7 +50,7 @@ export function ModelCatalogProvider({
   const [selectedModel, setSelectedModelState] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [downloadProgress, setDownloadProgress] = useState<DownloadProgressMap>(
+  const [downloadProgress, setDownloadProgress] = useState<ModelDownloadProgressMap>(
     {},
   );
 

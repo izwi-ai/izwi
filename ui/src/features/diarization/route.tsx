@@ -18,7 +18,16 @@ import {
   DIARIZATION_PREFERRED_SUMMARY_MODELS,
   resolvePreferredRouteModel,
 } from "@/features/models/catalog/routeModelCatalog";
+import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 import { RouteModelModal } from "@/features/models/components/RouteModelModal";
+import {
+  collectManagedModels,
+  filterAndSortModels,
+  isDiarizationPipelineAlignerVariant,
+  isDiarizationPipelineAsrVariant,
+  isDiarizationPipelineLlmVariant,
+  isDiarizationVariant,
+} from "@/features/speech-text/modelFilters";
 import { useDiarizationHistory } from "@/features/diarization/hooks/useDiarizationHistory";
 import { useDiarizationRecord } from "@/features/diarization/hooks/useDiarizationRecord";
 import { summarizeDiarizationRecord } from "@/features/diarization/historySummary";
@@ -29,16 +38,7 @@ interface DiarizationPageProps {
   models: ModelInfo[];
   selectedModel: string | null;
   loading: boolean;
-  downloadProgress: Record<
-    string,
-    {
-      percent: number;
-      currentFile: string;
-      status: string;
-      downloadedBytes: number;
-      totalBytes: number;
-    }
-  >;
+  downloadProgress: ModelDownloadProgressMap;
   onDownload: (variant: string) => void;
   onCancelDownload?: (variant: string) => void;
   onLoad: (variant: string) => void;
@@ -54,23 +54,6 @@ interface DiarizationModelGroup {
   title: string;
   description: string;
   models: ModelInfo[];
-}
-
-function isDiarizationVariant(variant: string): boolean {
-  const normalized = variant.toLowerCase();
-  return normalized.includes("sortformer") || normalized.includes("diar");
-}
-
-function isPipelineAsrVariant(variant: string): boolean {
-  return variant === "Whisper-Large-v3-Turbo";
-}
-
-function isPipelineAlignerVariant(variant: string): boolean {
-  return variant === "Qwen3-ForcedAligner-0.6B";
-}
-
-function isPipelineLlmVariant(variant: string): boolean {
-  return variant === "Qwen3.5-4B";
 }
 
 export function DiarizationPage({
@@ -113,34 +96,22 @@ export function DiarizationPage({
   );
 
   const diarizationModels = useMemo(
-    () =>
-      models
-        .filter((model) => isDiarizationVariant(model.variant))
-        .sort((a, b) => a.variant.localeCompare(b.variant)),
+    () => filterAndSortModels(models, isDiarizationVariant),
     [models],
   );
 
   const asrPipelineModels = useMemo(
-    () =>
-      models
-        .filter((model) => isPipelineAsrVariant(model.variant))
-        .sort((a, b) => a.variant.localeCompare(b.variant)),
+    () => filterAndSortModels(models, isDiarizationPipelineAsrVariant),
     [models],
   );
 
   const alignerPipelineModels = useMemo(
-    () =>
-      models
-        .filter((model) => isPipelineAlignerVariant(model.variant))
-        .sort((a, b) => a.variant.localeCompare(b.variant)),
+    () => filterAndSortModels(models, isDiarizationPipelineAlignerVariant),
     [models],
   );
 
   const llmPipelineModels = useMemo(
-    () =>
-      models
-        .filter((model) => isPipelineLlmVariant(model.variant))
-        .sort((a, b) => a.variant.localeCompare(b.variant)),
+    () => filterAndSortModels(models, isDiarizationPipelineLlmVariant),
     [models],
   );
 
@@ -233,33 +204,24 @@ export function DiarizationPage({
     [llmPipelineModels],
   );
   const resolvedSummaryModel = resolvedLlmModel;
-  const managedModelVariants = useMemo(
+  const managedModels = useMemo(
     () =>
-      Array.from(
-        new Set(
-          [
-            resolvedSelectedModel,
-            resolvedAsrModel,
-            resolvedAlignerModel,
-            resolvedLlmModel,
-          ].filter((variant): variant is string => Boolean(variant)),
-        ),
-      ),
+      collectManagedModels({
+        availableModels: pipelineModels,
+        managedVariants: [
+          resolvedSelectedModel,
+          resolvedAsrModel,
+          resolvedAlignerModel,
+          resolvedLlmModel,
+        ],
+      }),
     [
+      pipelineModels,
       resolvedAlignerModel,
       resolvedAsrModel,
       resolvedLlmModel,
       resolvedSelectedModel,
     ],
-  );
-  const managedModels = useMemo(
-    () =>
-      managedModelVariants
-        .map((variant) =>
-          pipelineModels.find((model) => model.variant === variant) ?? null,
-        )
-        .filter((model): model is ModelInfo => model !== null),
-    [managedModelVariants, pipelineModels],
   );
 
   const asrModelReady =
