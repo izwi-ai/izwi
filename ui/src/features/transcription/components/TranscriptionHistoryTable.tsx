@@ -9,8 +9,14 @@ import {
   Trash2,
 } from "lucide-react";
 
-import { api, type TranscriptionRecordSummary } from "@/api";
+import {
+  api,
+  type DiarizationRecord,
+  type SpeechTextDiarizationSummary,
+  type SpeechTextJobSummary,
+} from "@/api";
 import { useNotifications } from "@/app/providers/NotificationProvider";
+import { DiarizationExportDialog } from "@/components/DiarizationExportDialog";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -31,10 +37,11 @@ import {
   formatCreatedAt,
 } from "@/features/transcription/playground/support";
 import { formatTranscriptionText } from "@/features/transcription/transcript";
+import { formattedTranscriptFromRecord } from "@/utils/diarizationTranscript";
 import type { ExportableTranscriptionRecord } from "@/utils/transcriptionExport";
 
 interface TranscriptionHistoryTableProps {
-  records: TranscriptionRecordSummary[];
+  records: SpeechTextJobSummary[];
   loading?: boolean;
   error?: string | null;
   loadMore?: {
@@ -42,13 +49,62 @@ interface TranscriptionHistoryTableProps {
     loading: boolean;
     onLoadMore: () => void;
   };
-  onOpenRecord: (recordId: string) => void;
-  onDeleteRecord?: (recordId: string) => Promise<void>;
+  onOpenRecord: (record: SpeechTextJobSummary) => void;
+  onDeleteRecord?: (record: SpeechTextJobSummary) => Promise<void>;
   onRefresh?: () => void;
 }
 
-function rowLabel(record: TranscriptionRecordSummary): string {
+type ExportableDiarizationRecord = Pick<
+  DiarizationRecord,
+  | "id"
+  | "created_at"
+  | "model_id"
+  | "speaker_count"
+  | "corrected_speaker_count"
+  | "duration_secs"
+  | "audio_filename"
+  | "speaker_name_overrides"
+  | "utterances"
+  | "transcript"
+  | "raw_transcript"
+>;
+
+function rowKind(record: SpeechTextJobSummary): "transcription" | "diarization" {
+  return record.kind === "diarization" ? "diarization" : "transcription";
+}
+
+function isDiarizationSummary(
+  record: SpeechTextJobSummary,
+): record is SpeechTextDiarizationSummary {
+  return record.kind === "diarization";
+}
+
+function rowKindLabel(record: SpeechTextJobSummary): string {
+  return rowKind(record) === "diarization" ? "Diarization" : "Transcription";
+}
+
+function rowPreview(record: SpeechTextJobSummary): string {
+  if (isDiarizationSummary(record)) {
+    return record.transcript_preview;
+  }
+  return record.transcription_preview;
+}
+
+function rowLabel(record: SpeechTextJobSummary): string {
   return record.audio_filename || record.model_id || record.id;
+}
+
+function rowSummaryLabel(record: SpeechTextJobSummary): string {
+  if (record.summary_preview) {
+    return `Summary: ${record.summary_preview}`;
+  }
+  if (record.summary_status === "pending") {
+    return "Summary: Generating";
+  }
+  if (record.summary_status === "failed") {
+    return "Summary: Failed";
+  }
+  return "Summary: Not requested";
 }
 
 export function TranscriptionHistoryTable({
@@ -62,38 +118,46 @@ export function TranscriptionHistoryTable({
 }: TranscriptionHistoryTableProps) {
   const { notify } = useNotifications();
   const [busyRecordId, setBusyRecordId] = useState<string | null>(null);
-  const [deleteTarget, setDeleteTarget] = useState<TranscriptionRecordSummary | null>(
+  const [deleteTarget, setDeleteTarget] = useState<SpeechTextJobSummary | null>(
     null,
   );
   const [deletePending, setDeletePending] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [exportDialogOpen, setExportDialogOpen] = useState(false);
-  const [exportRecord, setExportRecord] = useState<ExportableTranscriptionRecord | null>(
-    null,
-  );
+  const [exportTranscriptionRecord, setExportTranscriptionRecord] =
+    useState<ExportableTranscriptionRecord | null>(null);
+  const [exportDiarizationRecord, setExportDiarizationRecord] =
+    useState<ExportableDiarizationRecord | null>(null);
 
   const deleteTargetLabel = useMemo(
-    () => (deleteTarget ? rowLabel(deleteTarget) : "Transcription record"),
+    () => (deleteTarget ? rowLabel(deleteTarget) : "Speech-text job"),
     [deleteTarget],
   );
 
-  async function loadRecordForAction(recordId: string) {
-    return api.getTranscriptionRecord(recordId);
-  }
+  const deleteTargetKindLabel = useMemo(
+    () => (deleteTarget ? rowKindLabel(deleteTarget).toLowerCase() : "record"),
+    [deleteTarget],
+  );
 
-  async function handleCopy(record: TranscriptionRecordSummary): Promise<void> {
+  async function handleCopy(record: SpeechTextJobSummary): Promise<void> {
     if (busyRecordId || deletePending) {
       return;
     }
 
     setBusyRecordId(record.id);
+    const kind = rowKind(record);
     try {
-      const fullRecord = await loadRecordForAction(record.id);
-      const transcript = formatTranscriptionText(fullRecord);
+      const transcript =
+        kind === "diarization"
+          ? formattedTranscriptFromRecord(
+              await api.getDiarizationRecord(record.id),
+            )
+          : formatTranscriptionText(await api.getTranscriptionRecord(record.id));
+
       if (!transcript.trim()) {
         notify({
           title: "Nothing to copy",
-          description: "This transcription does not have transcript text yet.",
+          description: `This ${kind} does not have transcript text yet.`,
           tone: "warning",
         });
         return;
@@ -109,7 +173,9 @@ export function TranscriptionHistoryTable({
       notify({
         title: "Could not copy transcript",
         description:
-          err instanceof Error ? err.message : "Failed to load transcription.",
+          err instanceof Error
+            ? err.message
+            : `Failed to load ${kind} record.`,
         tone: "warning",
       });
     } finally {
@@ -117,21 +183,29 @@ export function TranscriptionHistoryTable({
     }
   }
 
-  async function handleExport(record: TranscriptionRecordSummary): Promise<void> {
+  async function handleExport(record: SpeechTextJobSummary): Promise<void> {
     if (busyRecordId || deletePending) {
       return;
     }
 
     setBusyRecordId(record.id);
+    const kind = rowKind(record);
     try {
-      const fullRecord = await loadRecordForAction(record.id);
-      setExportRecord(fullRecord);
+      if (kind === "diarization") {
+        setExportTranscriptionRecord(null);
+        setExportDiarizationRecord(await api.getDiarizationRecord(record.id));
+      } else {
+        setExportDiarizationRecord(null);
+        setExportTranscriptionRecord(await api.getTranscriptionRecord(record.id));
+      }
       setExportDialogOpen(true);
     } catch (err) {
       notify({
         title: "Could not open export",
         description:
-          err instanceof Error ? err.message : "Failed to load transcription.",
+          err instanceof Error
+            ? err.message
+            : `Failed to load ${kind} record.`,
         tone: "warning",
       });
     } finally {
@@ -147,16 +221,16 @@ export function TranscriptionHistoryTable({
     setDeletePending(true);
     setDeleteError(null);
     try {
-      await onDeleteRecord(deleteTarget.id);
+      await onDeleteRecord(deleteTarget);
       notify({
-        title: "Transcription deleted",
+        title: `${rowKindLabel(deleteTarget)} deleted`,
         description: deleteTargetLabel,
         tone: "success",
       });
       setDeleteTarget(null);
     } catch (err) {
       setDeleteError(
-        err instanceof Error ? err.message : "Failed to delete transcription.",
+        err instanceof Error ? err.message : `Failed to delete ${deleteTargetKindLabel}.`,
       );
     } finally {
       setDeletePending(false);
@@ -169,7 +243,7 @@ export function TranscriptionHistoryTable({
     return (
       <div className="mb-6 flex min-h-[20rem] items-center justify-center rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-sm text-[var(--text-muted)]">
         <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-        Loading transcriptions...
+        Loading speech-text history...
       </div>
     );
   }
@@ -196,10 +270,10 @@ export function TranscriptionHistoryTable({
     return (
       <div className="mb-6 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-10 text-center">
         <h3 className="text-lg font-semibold text-[var(--text-primary)]">
-          No transcription jobs yet
+          No speech-text jobs yet
         </h3>
         <p className="mt-2 text-sm text-[var(--text-muted)]">
-          Queued, processing, and completed jobs will appear here.
+          Queued, processing, and completed transcription and diarization jobs will appear here.
         </p>
       </div>
     );
@@ -213,6 +287,7 @@ export function TranscriptionHistoryTable({
             <thead className="bg-[var(--bg-surface-1)] text-left text-xs uppercase tracking-[0.14em] text-[var(--text-muted)]">
               <tr>
                 <th className="px-4 py-3 font-semibold sm:px-5">Created</th>
+                <th className="px-4 py-3 font-semibold">Type</th>
                 <th className="px-4 py-3 font-semibold">File</th>
                 <th className="px-4 py-3 font-semibold">Duration</th>
                 <th className="px-4 py-3 font-semibold">Preview</th>
@@ -223,18 +298,22 @@ export function TranscriptionHistoryTable({
             </thead>
             <tbody>
               {records.map((record) => {
+                const kind = rowKind(record);
                 const isBusy = activeBusyRecordId === record.id;
+                const speakerCount = isDiarizationSummary(record)
+                  ? (record.corrected_speaker_count ?? record.speaker_count)
+                  : null;
 
                 return (
                   <tr
                     key={record.id}
-                    aria-label={`Open transcription ${rowLabel(record)}`}
+                    aria-label={`Open ${kind} ${rowLabel(record)}`}
                     className="cursor-pointer border-t border-[var(--border-muted)] transition-colors hover:bg-[var(--bg-surface-1)]"
                     onClick={(event) => {
                       if ((event.target as HTMLElement).closest("[data-row-action]")) {
                         return;
                       }
-                      onOpenRecord(record.id);
+                      onOpenRecord(record);
                     }}
                     onKeyDown={(event) => {
                       if ((event.target as HTMLElement).closest("[data-row-action]")) {
@@ -242,13 +321,16 @@ export function TranscriptionHistoryTable({
                       }
                       if (event.key === "Enter" || event.key === " ") {
                         event.preventDefault();
-                        onOpenRecord(record.id);
+                        onOpenRecord(record);
                       }
                     }}
                     tabIndex={0}
                   >
                     <td className="px-4 py-3 align-top text-[var(--text-secondary)] sm:px-5">
                       {formatCreatedAt(record.created_at)}
+                    </td>
+                    <td className="px-4 py-3 align-top text-[var(--text-secondary)]">
+                      {rowKindLabel(record)}
                     </td>
                     <td className="px-4 py-3 align-top">
                       <div className="font-medium text-[var(--text-primary)]">
@@ -261,13 +343,16 @@ export function TranscriptionHistoryTable({
                     <td className="px-4 py-3 align-top text-[var(--text-secondary)]">
                       <div className="max-w-[34rem]">
                         <div className="line-clamp-2 text-[var(--text-primary)]">
-                          {record.transcription_preview}
+                          {rowPreview(record) || "No transcript preview yet."}
                         </div>
-                        {record.summary_preview ? (
+                        {speakerCount != null ? (
                           <div className="mt-1 line-clamp-1 text-xs text-[var(--text-muted)]">
-                            Summary: {record.summary_preview}
+                            Speakers: {speakerCount}
                           </div>
                         ) : null}
+                        <div className="mt-1 line-clamp-1 text-xs text-[var(--text-muted)]">
+                          {rowSummaryLabel(record)}
+                        </div>
                       </div>
                     </td>
                     <td className="px-3 py-2 align-top text-right sm:px-4">
@@ -295,7 +380,7 @@ export function TranscriptionHistoryTable({
                           className="w-48"
                           onClick={(event) => event.stopPropagation()}
                         >
-                          <DropdownMenuItem onSelect={() => onOpenRecord(record.id)}>
+                          <DropdownMenuItem onSelect={() => onOpenRecord(record)}>
                             <ExternalLink className="mr-2 h-4 w-4" />
                             Open record
                           </DropdownMenuItem>
@@ -352,12 +437,23 @@ export function TranscriptionHistoryTable({
       </div>
 
       <TranscriptionExportDialog
-        record={exportRecord}
-        open={exportDialogOpen}
+        record={exportTranscriptionRecord}
+        open={exportDialogOpen && Boolean(exportTranscriptionRecord)}
         onOpenChange={(open) => {
           setExportDialogOpen(open);
           if (!open) {
-            setExportRecord(null);
+            setExportTranscriptionRecord(null);
+          }
+        }}
+      />
+
+      <DiarizationExportDialog
+        record={exportDiarizationRecord}
+        open={exportDialogOpen && Boolean(exportDiarizationRecord)}
+        onOpenChange={(open) => {
+          setExportDialogOpen(open);
+          if (!open) {
+            setExportDiarizationRecord(null);
           }
         }}
       />
@@ -374,7 +470,7 @@ export function TranscriptionHistoryTable({
         }}
       >
         <DialogContent className="max-w-md border-[var(--border-strong)] bg-[var(--bg-surface-1)] p-5">
-          <DialogTitle className="sr-only">Delete transcription?</DialogTitle>
+          <DialogTitle className="sr-only">Delete record?</DialogTitle>
           {deleteTarget ? (
             <>
               <div className="flex items-start gap-3">
@@ -383,7 +479,7 @@ export function TranscriptionHistoryTable({
                 </div>
                 <div className="min-w-0 flex-1">
                   <h3 className="text-sm font-semibold text-[var(--text-primary)]">
-                    Delete transcription?
+                    Delete {deleteTargetKindLabel}?
                   </h3>
                   <DialogDescription className="mt-1 text-sm text-[var(--text-muted)]">
                     This permanently removes the saved audio and transcript from
@@ -429,7 +525,7 @@ export function TranscriptionHistoryTable({
                       Deleting
                     </>
                   ) : (
-                    "Delete transcription"
+                    `Delete ${deleteTargetKindLabel}`
                   )}
                 </Button>
               </div>

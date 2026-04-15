@@ -7,10 +7,12 @@ import { TranscriptionPage } from "./route";
 
 const apiMocks = vi.hoisted(() => ({
   listTranscriptionRecords: vi.fn(),
-  listTranscriptionRecordPage: vi.fn(),
+  listSpeechTextJobPage: vi.fn(),
   getTranscriptionRecord: vi.fn(),
+  getDiarizationRecord: vi.fn(),
   transcriptionRecordAudioUrl: vi.fn(),
   deleteTranscriptionRecord: vi.fn(),
+  deleteDiarizationRecord: vi.fn(),
   regenerateTranscriptionSummary: vi.fn(),
   createTranscriptionRecord: vi.fn(),
   createTranscriptionRecordStream: vi.fn(),
@@ -53,10 +55,12 @@ const componentMocks = vi.hoisted(() => ({
 vi.mock("@/api", () => ({
   api: {
     listTranscriptionRecords: apiMocks.listTranscriptionRecords,
-    listTranscriptionRecordPage: apiMocks.listTranscriptionRecordPage,
+    listSpeechTextJobPage: apiMocks.listSpeechTextJobPage,
     getTranscriptionRecord: apiMocks.getTranscriptionRecord,
+    getDiarizationRecord: apiMocks.getDiarizationRecord,
     transcriptionRecordAudioUrl: apiMocks.transcriptionRecordAudioUrl,
     deleteTranscriptionRecord: apiMocks.deleteTranscriptionRecord,
+    deleteDiarizationRecord: apiMocks.deleteDiarizationRecord,
     regenerateTranscriptionSummary: apiMocks.regenerateTranscriptionSummary,
     createTranscriptionRecord: apiMocks.createTranscriptionRecord,
     createTranscriptionRecordStream: apiMocks.createTranscriptionRecordStream,
@@ -118,9 +122,11 @@ describe("TranscriptionPage detail route", () => {
   beforeEach(() => {
     apiMocks.getTranscriptionRecord.mockReset();
     apiMocks.listTranscriptionRecords.mockReset();
-    apiMocks.listTranscriptionRecordPage.mockReset();
+    apiMocks.listSpeechTextJobPage.mockReset();
+    apiMocks.getDiarizationRecord.mockReset();
     apiMocks.transcriptionRecordAudioUrl.mockReset();
     apiMocks.deleteTranscriptionRecord.mockReset();
+    apiMocks.deleteDiarizationRecord.mockReset();
     apiMocks.regenerateTranscriptionSummary.mockReset();
     apiMocks.createTranscriptionRecord.mockReset();
     apiMocks.createTranscriptionRecordStream.mockReset();
@@ -130,7 +136,7 @@ describe("TranscriptionPage detail route", () => {
 
     apiMocks.transcriptionRecordAudioUrl.mockReturnValue("/audio/transcription.wav");
     apiMocks.listTranscriptionRecords.mockResolvedValue([]);
-    apiMocks.listTranscriptionRecordPage.mockImplementation(async () => ({
+    apiMocks.listSpeechTextJobPage.mockImplementation(async () => ({
       items: await apiMocks.listTranscriptionRecords(),
       pagination: {
         next_cursor: null,
@@ -139,6 +145,7 @@ describe("TranscriptionPage detail route", () => {
       },
     }));
     apiMocks.deleteTranscriptionRecord.mockResolvedValue(undefined);
+    apiMocks.deleteDiarizationRecord.mockResolvedValue(undefined);
     apiMocks.createTranscriptionRecord.mockResolvedValue({
       id: "txr-created-1",
       created_at: 1,
@@ -222,13 +229,13 @@ describe("TranscriptionPage detail route", () => {
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Models/i })).toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { name: "No transcription jobs yet" }),
+      screen.getByRole("heading", { name: "No speech-text jobs yet" }),
     ).toBeInTheDocument();
   });
 
   it("loads more transcription history rows", async () => {
-    apiMocks.listTranscriptionRecordPage.mockReset();
-    apiMocks.listTranscriptionRecordPage
+    apiMocks.listSpeechTextJobPage.mockReset();
+    apiMocks.listSpeechTextJobPage
       .mockResolvedValueOnce({
         items: [
           {
@@ -293,11 +300,11 @@ describe("TranscriptionPage detail route", () => {
     expect(await screen.findByText("page-two.wav")).toBeInTheDocument();
     expect(await screen.findByText("page-one.wav")).toBeInTheDocument();
 
-    expect(apiMocks.listTranscriptionRecordPage).toHaveBeenNthCalledWith(1, {
+    expect(apiMocks.listSpeechTextJobPage).toHaveBeenNthCalledWith(1, {
       limit: 25,
       cursor: null,
     });
-    expect(apiMocks.listTranscriptionRecordPage).toHaveBeenNthCalledWith(2, {
+    expect(apiMocks.listSpeechTextJobPage).toHaveBeenNthCalledWith(2, {
       limit: 25,
       cursor: "txr-cursor-2",
     });
@@ -360,7 +367,9 @@ describe("TranscriptionPage detail route", () => {
       );
 
       expect(screen.getByText("Still transcribing...")).toBeInTheDocument();
-      expect(screen.queryByText("Loading transcriptions...")).not.toBeInTheDocument();
+      expect(
+        screen.queryByText("Loading speech-text history..."),
+      ).not.toBeInTheDocument();
 
       backgroundRefresh.resolve([
         {
@@ -742,7 +751,7 @@ describe("TranscriptionPage detail route", () => {
 
     expect(await screen.findByText("clip.wav")).toBeInTheDocument();
     expect(
-      screen.queryByRole("heading", { name: "No transcription jobs yet" }),
+      screen.queryByRole("heading", { name: "No speech-text jobs yet" }),
     ).not.toBeInTheDocument();
   });
 
@@ -962,8 +971,49 @@ describe("TranscriptionPage detail route", () => {
       screen.queryByLabelText("Open transcription meeting.wav"),
     ).not.toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { name: "No transcription jobs yet" }),
+      screen.getByRole("heading", { name: "No speech-text jobs yet" }),
     ).toBeInTheDocument();
+  });
+
+  it("opens diarization rows through the merged transcription route mode", async () => {
+    apiMocks.listSpeechTextJobPage.mockResolvedValueOnce({
+      items: [
+        {
+          id: "diar-route-1",
+          kind: "diarization",
+          created_at: 1,
+          model_id: "nvidia-sortformer",
+          processing_status: "ready",
+          processing_error: null,
+          duration_secs: 4,
+          processing_time_ms: 120,
+          rtf: 0.5,
+          audio_mime_type: "audio/wav",
+          audio_filename: "diar.wav",
+          speaker_count: 2,
+          corrected_speaker_count: 2,
+          transcript_preview: "SPEAKER_00: Hello there.",
+          transcript_chars: 23,
+          summary_status: "not_requested",
+          summary_preview: null,
+          summary_chars: 0,
+        },
+      ],
+      pagination: {
+        next_cursor: null,
+        has_more: false,
+        limit: 25,
+      },
+    });
+
+    renderRoute("/transcription");
+
+    expect(await screen.findByText("diar.wav")).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("Open diarization diar.wav"));
+
+    await waitFor(() =>
+      expect(apiMocks.getTranscriptionRecord).toHaveBeenCalledWith("diar-route-1"),
+    );
   });
 
   it("keeps the current detail view visible while polling in the background", async () => {

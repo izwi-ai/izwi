@@ -19,7 +19,7 @@ const apiMocks = vi.hoisted(() => ({
   deleteDiarizationRecord: vi.fn(),
   diarizationRecordAudioUrl: vi.fn(),
   listTranscriptionRecords: vi.fn(),
-  listTranscriptionRecordPage: vi.fn(),
+  listSpeechTextJobPage: vi.fn(),
   getTranscriptionRecord: vi.fn(),
   deleteTranscriptionRecord: vi.fn(),
   transcriptionRecordAudioUrl: vi.fn(),
@@ -41,7 +41,7 @@ vi.mock("@/api", () => ({
     deleteDiarizationRecord: apiMocks.deleteDiarizationRecord,
     diarizationRecordAudioUrl: apiMocks.diarizationRecordAudioUrl,
     listTranscriptionRecords: apiMocks.listTranscriptionRecords,
-    listTranscriptionRecordPage: apiMocks.listTranscriptionRecordPage,
+    listSpeechTextJobPage: apiMocks.listSpeechTextJobPage,
     getTranscriptionRecord: apiMocks.getTranscriptionRecord,
     deleteTranscriptionRecord: apiMocks.deleteTranscriptionRecord,
     transcriptionRecordAudioUrl: apiMocks.transcriptionRecordAudioUrl,
@@ -63,7 +63,7 @@ vi.mock("../api", () => ({
     deleteDiarizationRecord: apiMocks.deleteDiarizationRecord,
     diarizationRecordAudioUrl: apiMocks.diarizationRecordAudioUrl,
     listTranscriptionRecords: apiMocks.listTranscriptionRecords,
-    listTranscriptionRecordPage: apiMocks.listTranscriptionRecordPage,
+    listSpeechTextJobPage: apiMocks.listSpeechTextJobPage,
     getTranscriptionRecord: apiMocks.getTranscriptionRecord,
     deleteTranscriptionRecord: apiMocks.deleteTranscriptionRecord,
     transcriptionRecordAudioUrl: apiMocks.transcriptionRecordAudioUrl,
@@ -86,7 +86,7 @@ describe("Page header history buttons", () => {
     apiMocks.deleteDiarizationRecord.mockReset();
     apiMocks.diarizationRecordAudioUrl.mockReset();
     apiMocks.listTranscriptionRecords.mockReset();
-    apiMocks.listTranscriptionRecordPage.mockReset();
+    apiMocks.listSpeechTextJobPage.mockReset();
     apiMocks.getTranscriptionRecord.mockReset();
     apiMocks.deleteTranscriptionRecord.mockReset();
     apiMocks.transcriptionRecordAudioUrl.mockReset();
@@ -113,7 +113,7 @@ describe("Page header history buttons", () => {
       },
     }));
     apiMocks.listTranscriptionRecords.mockResolvedValue([]);
-    apiMocks.listTranscriptionRecordPage.mockImplementation(async () => ({
+    apiMocks.listSpeechTextJobPage.mockImplementation(async () => ({
       items: await apiMocks.listTranscriptionRecords(),
       pagination: {
         next_cursor: null,
