@@ -2,6 +2,7 @@
 
 mod handlers;
 mod realtime;
+mod unified_read;
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -17,6 +18,9 @@ pub fn router() -> Router<AppState> {
     const CANONICAL_MEMBER: &str = "/transcriptions/:record_id";
     const CANONICAL_AUDIO: &str = "/transcriptions/:record_id/audio";
     const CANONICAL_SUMMARY_REGENERATE: &str = "/transcriptions/:record_id/summary/regenerate";
+    const CANONICAL_UNIFIED_COLLECTION: &str = "/transcriptions/jobs";
+    const CANONICAL_UNIFIED_MEMBER: &str = "/transcriptions/jobs/:record_id";
+    const CANONICAL_UNIFIED_AUDIO: &str = "/transcriptions/jobs/:record_id/audio";
 
     Router::new()
         .route(
@@ -26,6 +30,9 @@ pub fn router() -> Router<AppState> {
                 .layer(DefaultBodyLimit::max(AUDIO_UPLOAD_LIMIT_BYTES)),
         )
         .merge(realtime::router())
+        .route(CANONICAL_UNIFIED_COLLECTION, get(unified_read::list_jobs))
+        .route(CANONICAL_UNIFIED_MEMBER, get(unified_read::get_job))
+        .route(CANONICAL_UNIFIED_AUDIO, get(unified_read::get_job_audio))
         .route(
             CANONICAL_MEMBER,
             get(handlers::get_record).delete(handlers::delete_record),
