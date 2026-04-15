@@ -13,6 +13,10 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
+import {
+  formatDraftValue,
+  parseOptionalInteger,
+} from "@/features/diarization/audioUpload";
 import type { DiarizationRecord, DiarizationRecordRerunRequest } from "../api";
 
 interface DiarizationQualityPanelProps {
@@ -39,25 +43,6 @@ function formatCoverage(value: number | null | undefined): string {
     return "Unavailable";
   }
   return `${Math.round(value * 100)}%`;
-}
-
-function formatDraftValue(value: number | null | undefined): string {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    return "";
-  }
-  if (Number.isInteger(value)) {
-    return String(value);
-  }
-  return value.toFixed(2).replace(/\.?0+$/, "");
-}
-
-function parseOptionalInteger(value: string): number | undefined {
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return undefined;
-  }
-  const parsed = Number.parseInt(trimmed, 10);
-  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 function parseOptionalNumber(value: string): number | undefined {

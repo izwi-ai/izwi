@@ -30,7 +30,7 @@ export function isLfm25AudioVariant(variant: string): boolean {
   );
 }
 
-export function isQwenAsrVariant(variant: string): boolean {
+function isQwenAsrVariant(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   return (
     normalized === "qwen3-asr-0.6b-gguf" ||
@@ -135,7 +135,7 @@ export interface SpeakerProfile {
   description: string;
 }
 
-export const QWEN_SPEAKERS: SpeakerProfile[] = [
+const QWEN_SPEAKERS: SpeakerProfile[] = [
   {
     id: "Vivian",
     name: "Vivian",
@@ -192,7 +192,7 @@ export const QWEN_SPEAKERS: SpeakerProfile[] = [
   },
 ];
 
-export const LFM25_AUDIO_SPEAKERS: SpeakerProfile[] = [
+const LFM25_AUDIO_SPEAKERS: SpeakerProfile[] = [
   {
     id: "US Female",
     name: "US Female",
@@ -317,14 +317,12 @@ function kokoroGenderLabel(voiceId: string): string {
   return "Voice";
 }
 
-export const KOKORO_SPEAKERS: SpeakerProfile[] = KOKORO_VOICE_IDS.map((id) => ({
+const KOKORO_SPEAKERS: SpeakerProfile[] = KOKORO_VOICE_IDS.map((id) => ({
   id,
   name: kokoroDisplayName(id),
   language: kokoroLanguageForVoice(id),
   description: `${kokoroLanguageForVoice(id)} ${kokoroGenderLabel(id)} voice (Kokoro)`,
 }));
-
-export const SPEAKERS = QWEN_SPEAKERS;
 
 export const LANGUAGES = [
   { id: "Auto", name: "Auto Detect" },
@@ -339,19 +337,6 @@ export const LANGUAGES = [
   { id: "Spanish", name: "Spanish" },
   { id: "Italian", name: "Italian" },
 ];
-
-export const SAMPLE_TEXTS = {
-  english: [
-    "Hello! Welcome to Izwi, a text-to-speech engine powered by Qwen3-TTS.",
-    "The quick brown fox jumps over the lazy dog.",
-    "In a world where technology evolves rapidly, the ability to generate natural-sounding speech has become increasingly important.",
-  ],
-  chinese: [
-    "你好！欢迎使用Izwi，一个由Qwen3-TTS驱动的文本转语音引擎。",
-    "今天天气真好，我们一起去公园散步吧。",
-    "人工智能正在改变我们的生活方式。",
-  ],
-};
 
 export const VOICE_DESIGN_PRESETS = [
   {

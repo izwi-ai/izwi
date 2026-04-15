@@ -1,20 +1,11 @@
 import type { ModelInfo } from "@/api";
-
-export interface DownloadProgressEntry {
-  percent: number;
-  currentFile: string;
-  status: string;
-  downloadedBytes: number;
-  totalBytes: number;
-}
-
-export type DownloadProgressMap = Record<string, DownloadProgressEntry>;
+import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 
 export interface SharedPageProps {
   models: ModelInfo[];
   selectedModel: string | null;
   loading: boolean;
-  downloadProgress: DownloadProgressMap;
+  downloadProgress: ModelDownloadProgressMap;
   onDownload: (variant: string) => void;
   onCancelDownload?: (variant: string) => void;
   onLoad: (variant: string) => void;
@@ -28,7 +19,7 @@ export interface SharedPageProps {
 export interface VoiceRouteProps {
   models: ModelInfo[];
   loading: boolean;
-  downloadProgress: DownloadProgressMap;
+  downloadProgress: ModelDownloadProgressMap;
   onDownload: (variant: string) => void;
   onCancelDownload?: (variant: string) => void;
   onLoad: (variant: string) => void;
@@ -40,7 +31,7 @@ export interface VoiceRouteProps {
 export interface ModelsRouteProps {
   models: ModelInfo[];
   loading: boolean;
-  downloadProgress: DownloadProgressMap;
+  downloadProgress: ModelDownloadProgressMap;
   onDownload: (variant: string) => void;
   onCancelDownload?: (variant: string) => void;
   onLoad: (variant: string) => void;

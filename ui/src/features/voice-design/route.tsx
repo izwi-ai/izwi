@@ -1,6 +1,7 @@
 import type { ModelInfo } from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import { VIEW_CONFIGS } from "@/types";
+import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 import {
   VOICE_DESIGN_PREFERRED_MODELS,
   resolvePreferredRouteModel,
@@ -13,16 +14,7 @@ interface VoiceDesignPageProps {
   models: ModelInfo[];
   selectedModel: string | null;
   loading: boolean;
-  downloadProgress: Record<
-    string,
-    {
-      percent: number;
-      currentFile: string;
-      status: string;
-      downloadedBytes: number;
-      totalBytes: number;
-    }
-  >;
+  downloadProgress: ModelDownloadProgressMap;
   onDownload: (variant: string) => void;
   onCancelDownload?: (variant: string) => void;
   onLoad: (variant: string) => void;

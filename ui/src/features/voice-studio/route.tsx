@@ -5,6 +5,7 @@ import type { ModelInfo } from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import { Button } from "@/components/ui/button";
 import { VoiceCreationModal } from "@/components/VoiceCreationModal";
+import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 import {
   TEXT_TO_SPEECH_PREFERRED_MODELS,
   VOICE_DESIGN_PREFERRED_MODELS,
@@ -19,16 +20,7 @@ interface VoiceStudioPageProps {
   models: ModelInfo[];
   selectedModel: string | null;
   loading: boolean;
-  downloadProgress: Record<
-    string,
-    {
-      percent: number;
-      currentFile: string;
-      status: string;
-      downloadedBytes: number;
-      totalBytes: number;
-    }
-  >;
+  downloadProgress: ModelDownloadProgressMap;
   onDownload: (variant: string) => void;
   onCancelDownload?: (variant: string) => void;
   onLoad: (variant: string) => void;

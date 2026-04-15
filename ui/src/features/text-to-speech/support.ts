@@ -14,22 +14,6 @@ export function normalizeSpeechProcessingStatus(
   return "ready";
 }
 
-export function speechProcessingStatusLabel(
-  status: SpeechHistoryProcessingStatus,
-): string {
-  switch (status) {
-    case "pending":
-      return "Queued";
-    case "processing":
-      return "Processing";
-    case "failed":
-      return "Failed";
-    case "ready":
-    default:
-      return "Ready";
-  }
-}
-
 export function formatSpeechCreatedAt(timestampMs: number): string {
   if (!Number.isFinite(timestampMs)) {
     return "Unknown time";

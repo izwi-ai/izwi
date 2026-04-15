@@ -308,37 +308,6 @@ export function normalizeProcessingStatus(
   return "ready";
 }
 
-export function processingStatusLabel(
-  status: TranscriptionProcessingStatus,
-): string {
-  switch (status) {
-    case "pending":
-      return "Queued";
-    case "processing":
-      return "Processing";
-    case "failed":
-      return "Failed";
-    case "ready":
-    default:
-      return "Ready";
-  }
-}
-
-export function processingStatusTone(
-  status: TranscriptionProcessingStatus,
-): "neutral" | "warning" | "success" | "danger" {
-  switch (status) {
-    case "pending":
-    case "processing":
-      return "warning";
-    case "failed":
-      return "danger";
-    case "ready":
-    default:
-      return "success";
-  }
-}
-
 export function summaryStatusLabel(status: TranscriptionSummaryStatus): string {
   switch (status) {
     case "pending":
