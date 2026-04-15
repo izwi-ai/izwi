@@ -293,9 +293,9 @@ export function DiarizationRecordDetail({
 
   return (
     <SpeechTextRecordShell
-      title={record?.audio_filename || record?.model_id || "Diarization record"}
+      title={record?.audio_filename || record?.id || "Diarization record"}
       onBack={onBack}
-      backLabel="Back to diarization"
+      backLabel="Back to transcription"
       metadata={
         <>
           {record ? <span>{formatCreatedAt(record.created_at)}</span> : null}
@@ -307,7 +307,6 @@ export function DiarizationRecordDetail({
               {record.corrected_speaker_count ?? record.speaker_count} speakers
             </span>
           ) : null}
-          {record?.model_id ? <span>{record.model_id}</span> : null}
         </>
       }
       actions={
@@ -539,7 +538,7 @@ export function DiarizationRecordDetail({
                 history.
               </DialogDescription>
               <p className="mt-2 truncate text-xs text-[var(--text-subtle)]">
-                {record?.audio_filename || record?.model_id || record?.id}
+                {record?.audio_filename || record?.id}
               </p>
             </div>
           </div>

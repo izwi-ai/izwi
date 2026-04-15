@@ -634,6 +634,7 @@ export function TranscriptionPage({
 
           <Dialog
             open={isNewTranscriptionModalOpen}
+            modal={!isModelModalOpen}
             onOpenChange={(open) => {
               if (!open) {
                 handleCloseNewTranscriptionModal();
