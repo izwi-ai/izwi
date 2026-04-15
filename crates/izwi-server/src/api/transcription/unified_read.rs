@@ -29,8 +29,10 @@ enum JobKindFilter {
 
 #[derive(Debug, Deserialize)]
 pub struct UnifiedJobListQuery {
-    #[serde(flatten)]
-    pagination: CursorPaginationQuery,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    cursor: Option<String>,
     #[serde(default)]
     job_kind: Option<String>,
 }
@@ -57,14 +59,16 @@ pub async fn list_jobs(
     State(state): State<AppState>,
     Query(query): Query<UnifiedJobListQuery>,
 ) -> Result<Json<UnifiedJobListResponse>, ApiError> {
-    let limit = query.pagination.resolved_limit(HISTORY_LIST_LIMIT, 500);
+    let pagination = CursorPaginationQuery {
+        limit: query.limit,
+        cursor: query.cursor.clone(),
+    };
+    let limit = pagination.resolved_limit(HISTORY_LIST_LIMIT, 500);
     let kind = parse_job_kind_filter(query.job_kind.as_deref(), true)?;
 
     let response = match kind {
         JobKindFilter::Transcription => {
-            let cursor = query
-                .pagination
-                .decode_cursor::<TranscriptionRecordListCursor>()?;
+            let cursor = pagination.decode_cursor::<TranscriptionRecordListCursor>()?;
             let (records, next_cursor) = state
                 .transcription_store
                 .list_records_page(limit, cursor)
@@ -86,9 +90,7 @@ pub async fn list_jobs(
             }
         }
         JobKindFilter::Diarization => {
-            let cursor = query
-                .pagination
-                .decode_cursor::<DiarizationRecordListCursor>()?;
+            let cursor = pagination.decode_cursor::<DiarizationRecordListCursor>()?;
             let (records, next_cursor) = state
                 .diarization_store
                 .list_records_page(limit, cursor)
@@ -110,7 +112,7 @@ pub async fn list_jobs(
             }
         }
         JobKindFilter::All => {
-            if query.pagination.cursor.is_some() {
+            if pagination.cursor.is_some() {
                 return Err(ApiError::bad_request(
                     "Cursor pagination is not supported when `job_kind=all`.",
                 ));
