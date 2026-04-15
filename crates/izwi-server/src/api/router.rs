@@ -597,6 +597,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unified_transcription_job_mutation_routes_support_both_job_kinds() {
+        let (app, temp_dir) = test_api_app(
+            "unified_transcription_job_mutation_routes_support_both_job_kinds",
+            true,
+        );
+
+        let transcription_create = send_request(
+            app.clone(),
+            build_request(
+                Method::POST,
+                "/v1/transcriptions/jobs?job_kind=transcription",
+                Some("{\"audio_base64\":\"AQ==\"}"),
+            ),
+        )
+        .await;
+        assert_eq!(transcription_create.status(), StatusCode::ACCEPTED);
+        let transcription_id = read_json(transcription_create)
+            .await
+            .get("id")
+            .and_then(|value| value.as_str())
+            .expect("transcription id should exist")
+            .to_string();
+
+        let diarization_create = send_request(
+            app.clone(),
+            build_request(
+                Method::POST,
+                "/v1/transcriptions/jobs?job_kind=diarization",
+                Some("{\"audio_base64\":\"AQ==\"}"),
+            ),
+        )
+        .await;
+        assert_eq!(diarization_create.status(), StatusCode::ACCEPTED);
+        let diarization_id = read_json(diarization_create)
+            .await
+            .get("id")
+            .and_then(|value| value.as_str())
+            .expect("diarization id should exist")
+            .to_string();
+
+        let update_diarization = send_request(
+            app.clone(),
+            build_request(
+                Method::PATCH,
+                format!(
+                    "/v1/transcriptions/jobs/{}?job_kind=diarization",
+                    diarization_id
+                )
+                .as_str(),
+                Some("{\"speaker_name_overrides\":{}}"),
+            ),
+        )
+        .await;
+        assert_eq!(update_diarization.status(), StatusCode::OK);
+
+        let rerun_diarization = send_request(
+            app.clone(),
+            build_request(
+                Method::POST,
+                format!(
+                    "/v1/transcriptions/jobs/{}/reruns?job_kind=diarization",
+                    diarization_id
+                )
+                .as_str(),
+                Some("{}"),
+            ),
+        )
+        .await;
+        assert_eq!(rerun_diarization.status(), StatusCode::ACCEPTED);
+
+        let cancel_diarization = send_request(
+            app.clone(),
+            build_request(
+                Method::POST,
+                format!(
+                    "/v1/transcriptions/jobs/{}/cancel?job_kind=diarization",
+                    diarization_id
+                )
+                .as_str(),
+                Some("{}"),
+            ),
+        )
+        .await;
+        assert_eq!(cancel_diarization.status(), StatusCode::OK);
+
+        let regen_transcription_summary = send_request(
+            app.clone(),
+            build_request(
+                Method::POST,
+                format!(
+                    "/v1/transcriptions/jobs/{}/summary/regenerate?job_kind=transcription",
+                    transcription_id
+                )
+                .as_str(),
+                Some("{}"),
+            ),
+        )
+        .await;
+        assert_eq!(regen_transcription_summary.status(), StatusCode::OK);
+
+        let regen_diarization_summary = send_request(
+            app.clone(),
+            build_request(
+                Method::POST,
+                format!(
+                    "/v1/transcriptions/jobs/{}/summary/regenerate?job_kind=diarization",
+                    diarization_id
+                )
+                .as_str(),
+                Some("{}"),
+            ),
+        )
+        .await;
+        assert_eq!(regen_diarization_summary.status(), StatusCode::OK);
+
+        let delete_transcription = send_request(
+            app.clone(),
+            build_request(
+                Method::DELETE,
+                format!(
+                    "/v1/transcriptions/jobs/{}?job_kind=transcription",
+                    transcription_id
+                )
+                .as_str(),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(delete_transcription.status(), StatusCode::OK);
+
+        let delete_diarization = send_request(
+            app.clone(),
+            build_request(
+                Method::DELETE,
+                format!(
+                    "/v1/transcriptions/jobs/{}?job_kind=diarization",
+                    diarization_id
+                )
+                .as_str(),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(delete_diarization.status(), StatusCode::OK);
+
+        // Compatibility check: legacy mutation route still works.
+        let legacy_create = send_request(
+            app,
+            build_request(Method::POST, "/v1/diarizations", Some("{\"audio_base64\":\"AQ==\"}")),
+        )
+        .await;
+        assert_eq!(legacy_create.status(), StatusCode::ACCEPTED);
+
+        drop(temp_dir);
+    }
+
+    #[tokio::test]
     async fn canonical_history_mutation_routes_still_resolve() {
         let (app, temp_dir) = test_api_app("canonical_history_mutation_routes_still_resolve", true);
 
