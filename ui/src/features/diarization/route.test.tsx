@@ -375,7 +375,7 @@ describe("DiarizationPage routes", () => {
       await screen.findByRole("heading", { name: "New diarization" }),
     ).toBeInTheDocument();
     expect(screen.getByText("Choose how to start")).toBeInTheDocument();
-    expect(screen.getByText("Review run settings")).toBeInTheDocument();
+    expect(screen.getByText("Model readiness")).toBeInTheDocument();
 
     const fileInput = document.querySelector(
       'input[type="file"]',

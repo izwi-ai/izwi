@@ -9,6 +9,8 @@ import {
   DialogDescription,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Label } from "@/components/ui/label";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { LANGUAGE_OPTIONS } from "@/features/transcription/playground/support";
 import {
@@ -24,6 +26,7 @@ interface NewTranscriptionModalProps {
   isOpen: boolean;
   onClose: () => void;
   blockOutsideDismiss?: boolean;
+  renderInDialog?: boolean;
   selectedMode?: SpeechTextCreationMode;
   onSelectMode?: (mode: SpeechTextCreationMode) => void;
   selectedModel: string | null;
@@ -48,6 +51,7 @@ export function NewTranscriptionModal({
   isOpen,
   onClose,
   blockOutsideDismiss = false,
+  renderInDialog = true,
   selectedMode = "transcription",
   onSelectMode,
   selectedModel,
@@ -259,89 +263,92 @@ export function NewTranscriptionModal({
     [handleSelectedFile],
   );
 
-  const alignerNeeded = includeTimestamps;
   const alignerReadyForUse =
     !includeTimestamps || (!!timestampAlignerModelId && timestampAlignerReady);
-  const isTranscriptionMode = selectedMode === "transcription";
+  const transcriptionStackReady = selectedModelReady && alignerReadyForUse;
+  const readinessStatusLabel = transcriptionStackReady
+    ? "READY"
+    : "NEEDS ACTION";
+  const readinessTone = transcriptionStackReady ? "success" : "warning";
+  const readinessActionLabel = !selectedModelReady
+    ? "Open ASR models"
+    : includeTimestamps && !alignerReadyForUse
+      ? "Open aligner models"
+      : "Open models";
+  const readinessActionVariant = transcriptionStackReady ? "outline" : "default";
+  const readinessActionHandler = !selectedModelReady
+    ? onModelRequired
+    : includeTimestamps && !alignerReadyForUse
+      ? onTimestampAlignerRequired
+      : onModelRequired;
 
-  return (
-    <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent
-        className="max-w-[46rem] overflow-hidden border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0"
-        onEscapeKeyDown={(event) => {
-          if (blockOutsideDismiss) {
-            event.preventDefault();
-          }
-        }}
-        onPointerDownOutside={(event) => {
-          if (blockOutsideDismiss) {
-            event.preventDefault();
-          }
-        }}
-        onInteractOutside={(event) => {
-          if (blockOutsideDismiss) {
-            event.preventDefault();
-          }
-        }}
-      >
-        <div className="border-b border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-5 py-5 sm:px-6">
-          <DialogTitle className="text-xl font-semibold tracking-tight text-[var(--text-primary)]">
-            New transcript
-          </DialogTitle>
-          <DialogDescription className="mt-1 max-w-3xl text-[13px] leading-5 text-[var(--text-muted)]">
-            Upload a recording, choose whether results should stream live, and
-            open the job on its own page as soon as the file is accepted.
-          </DialogDescription>
-          {onSelectMode ? (
-            <fieldset className="mt-3">
-              <legend className="sr-only">Choose creation mode</legend>
-              <div className="inline-flex items-center gap-4">
-                <label className="inline-flex cursor-pointer items-center gap-2 text-sm text-[var(--text-primary)]">
-                  <input
-                    type="radio"
-                    name="speech-text-create-mode"
-                    checked={isTranscriptionMode}
-                    onChange={() => onSelectMode("transcription")}
-                    className="h-4 w-4 border-[var(--border-strong)] text-[var(--status-info-text)]"
-                  />
-                  Transcription
-                </label>
-                <label className="inline-flex cursor-pointer items-center gap-2 text-sm text-[var(--text-primary)]">
-                  <input
-                    type="radio"
-                    name="speech-text-create-mode"
-                    checked={!isTranscriptionMode}
-                    onChange={() => onSelectMode("diarization")}
-                    className="h-4 w-4 border-[var(--border-strong)] text-[var(--status-info-text)]"
-                  />
-                  Diarization
-                </label>
-              </div>
-            </fieldset>
-          ) : null}
-        </div>
-
-        <div className="grid lg:grid-cols-[minmax(0,1.08fr),minmax(18rem,0.84fr)]">
-          <div className="border-b border-[var(--border-muted)] px-5 py-5 sm:px-6 lg:border-b-0 lg:border-r">
-            <div className="mb-4 flex items-start justify-between gap-4">
-              <div>
-                <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[var(--text-muted)]">
-                  Audio source
-                </div>
-                <h3 className="mt-1.5 text-xl font-semibold tracking-tight text-[var(--text-primary)]">
-                  Bring in a recording
-                </h3>
-                <p className="mt-1.5 max-w-lg text-[13px] leading-5 text-[var(--text-muted)]">
-                  Choose a saved clip from your device and move straight into the dedicated transcript workspace.
-                </p>
-              </div>
-              {isSubmitting ? (
-                <div className="inline-flex items-center gap-2 rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)]">
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  Creating job
-                </div>
-              ) : null}
+  const modalBody = (
+    <>
+      <div className="border-b border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-5 py-5 sm:px-6">
+        <DialogTitle className="text-xl font-semibold tracking-tight text-[var(--text-primary)]">
+          New transcript
+        </DialogTitle>
+        <DialogDescription className="mt-1 max-w-3xl text-[13px] leading-5 text-[var(--text-muted)]">
+          Upload a recording, choose whether results should stream live, and
+          open the job on its own page as soon as the file is accepted.
+        </DialogDescription>
+        {onSelectMode ? (
+          <RadioGroup
+            value={selectedMode}
+            onValueChange={(value) =>
+              onSelectMode(value as SpeechTextCreationMode)
+            }
+            className="mt-3 flex gap-3"
+          >
+            <div className="inline-flex items-center gap-2 rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-1.5 text-sm">
+              <RadioGroupItem
+                id="speech-text-mode-transcription"
+                value="transcription"
+              />
+              <Label
+                htmlFor="speech-text-mode-transcription"
+                className="cursor-pointer text-[var(--text-primary)]"
+              >
+                Transcription
+              </Label>
             </div>
+            <div className="inline-flex items-center gap-2 rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-1.5 text-sm">
+              <RadioGroupItem
+                id="speech-text-mode-diarization"
+                value="diarization"
+              />
+              <Label
+                htmlFor="speech-text-mode-diarization"
+                className="cursor-pointer text-[var(--text-primary)]"
+              >
+                Diarization
+              </Label>
+            </div>
+          </RadioGroup>
+        ) : null}
+      </div>
+
+      <div className="grid lg:grid-cols-[minmax(0,1.08fr),minmax(18rem,0.84fr)]">
+        <div className="border-b border-[var(--border-muted)] px-5 py-5 sm:px-6 lg:border-b-0 lg:border-r">
+          <div className="mb-4 flex items-start justify-between gap-4">
+            <div>
+              <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[var(--text-muted)]">
+                Audio source
+              </div>
+              <h3 className="mt-1.5 text-xl font-semibold tracking-tight text-[var(--text-primary)]">
+                Bring in a recording
+              </h3>
+              <p className="mt-1.5 max-w-lg text-[13px] leading-5 text-[var(--text-muted)]">
+                Choose a saved clip from your device and move straight into the dedicated transcript workspace.
+              </p>
+            </div>
+            {isSubmitting ? (
+              <div className="inline-flex items-center gap-2 rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)]">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                Creating job
+              </div>
+            ) : null}
+          </div>
 
             <button
               type="button"
@@ -399,19 +406,8 @@ export function NewTranscriptionModal({
             </div>
           </div>
 
-          <div className="px-6 py-5 sm:px-6">
-            <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[var(--text-muted)]">
-              Configuration
-            </div>
-            <h3 className="mt-1.5 text-xl font-semibold tracking-tight text-[var(--text-primary)]">
-              Review job settings
-            </h3>
-            <p className="mt-1.5 max-w-sm text-[13px] leading-5 text-[var(--text-muted)]">
-              Keep setup brief: choose the language, decide whether timing or
-              streaming is needed, and confirm the model path is ready.
-            </p>
-
-            <div className="mt-4 space-y-2.5">
+        <div className="px-6 py-5 sm:px-6">
+          <div className="space-y-2.5">
               <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
                 <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--text-muted)]">
                   Language
@@ -490,77 +486,27 @@ export function NewTranscriptionModal({
                   Model readiness
                 </div>
 
-                <div className="mt-2.5 space-y-2.5">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <div className="text-sm font-medium text-[var(--text-primary)]">
-                        ASR model
-                      </div>
-                      <div className="mt-0.5 truncate text-[13px] leading-5 text-[var(--text-muted)]">
-                        {selectedModel || "No model selected"}
-                      </div>
-                    </div>
-                    <StatusBadge tone={selectedModelReady ? "success" : "warning"}>
-                      {selectedModelReady ? "Ready" : "Needs action"}
+                <div className="mt-2.5 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-xs text-[var(--text-muted)]">
+                      Transcription stack
+                    </span>
+                    <StatusBadge tone={readinessTone}>
+                      {readinessStatusLabel}
                     </StatusBadge>
                   </div>
 
-                  <div className="flex items-start justify-between gap-3 border-t border-[var(--border-muted)] pt-2.5">
-                    <div className="min-w-0">
-                      <div className="text-sm font-medium text-[var(--text-primary)]">
-                        Timestamp aligner
-                      </div>
-                      <div className="mt-0.5 truncate text-[13px] leading-5 text-[var(--text-muted)]">
-                        {timestampAlignerModelId || "Optional until timestamps are enabled"}
-                      </div>
-                    </div>
-                    <StatusBadge
-                      tone={
-                        alignerNeeded
-                          ? alignerReadyForUse
-                            ? "success"
-                            : "warning"
-                          : "neutral"
-                      }
-                    >
-                      {alignerNeeded
-                        ? alignerReadyForUse
-                          ? "Ready"
-                          : "Needs action"
-                        : "Optional"}
-                    </StatusBadge>
-                  </div>
+                  <Button
+                    type="button"
+                    variant={readinessActionVariant}
+                    size="sm"
+                    className="mt-3 h-9 w-full gap-2"
+                    onClick={readinessActionHandler}
+                    disabled={isSubmitting}
+                  >
+                    {readinessActionLabel}
+                  </Button>
                 </div>
-
-                {!selectedModelReady ? (
-                  <div className="mt-3.5">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      className="h-8"
-                      onClick={onModelRequired}
-                      disabled={isSubmitting}
-                    >
-                      Open ASR models
-                    </Button>
-                  </div>
-                ) : null}
-
-                {includeTimestamps && !alignerReadyForUse ? (
-                  <div className="mt-3.5">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      className="h-8"
-                      onClick={onTimestampAlignerRequired}
-                      disabled={isSubmitting}
-                    >
-                      Open aligner models
-                    </Button>
-                  </div>
-                ) : null}
               </div>
 
               {error ? (
@@ -573,18 +519,46 @@ export function NewTranscriptionModal({
               ) : null}
             </div>
 
-            <div className="mt-4 flex justify-end">
-              <Button
-                type="button"
-                variant="ghost"
-                onClick={onClose}
-                disabled={isSubmitting}
-              >
-                Cancel
-              </Button>
-            </div>
+          <div className="mt-4 flex justify-end">
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={onClose}
+              disabled={isSubmitting}
+            >
+              Cancel
+            </Button>
           </div>
         </div>
+      </div>
+    </>
+  );
+
+  if (!renderInDialog) {
+    return modalBody;
+  }
+
+  return (
+    <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
+      <DialogContent
+        className="max-w-[46rem] overflow-hidden border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0"
+        onEscapeKeyDown={(event) => {
+          if (blockOutsideDismiss) {
+            event.preventDefault();
+          }
+        }}
+        onPointerDownOutside={(event) => {
+          if (blockOutsideDismiss) {
+            event.preventDefault();
+          }
+        }}
+        onInteractOutside={(event) => {
+          if (blockOutsideDismiss) {
+            event.preventDefault();
+          }
+        }}
+      >
+        {modalBody}
       </DialogContent>
     </Dialog>
   );
