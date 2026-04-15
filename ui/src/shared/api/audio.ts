@@ -590,6 +590,12 @@ export type SpeechTextJobCreateRequest =
   | SpeechTextTranscriptionJobCreateRequest
   | SpeechTextDiarizationJobCreateRequest;
 
+export type SpeechTextJobQueryKind = SpeechTextJobKind | "all";
+
+export interface SpeechTextJobPageQuery extends CursorPaginationQuery {
+  job_kind?: SpeechTextJobQueryKind;
+}
+
 export interface TranscriptionRecordSummary {
   id: string;
   created_at: number;
@@ -1044,20 +1050,59 @@ export class AudioApiClient {
     return `${this.speechHistoryCollectionPath(route)}/${encodeURIComponent(recordId)}`;
   }
 
-  private transcriptionCollectionPath(): string {
-    return "/transcriptions";
+  private speechTextJobsCollectionPath(): string {
+    return "/transcriptions/jobs";
   }
 
-  private transcriptionRecordPath(recordId: string): string {
-    return `${this.transcriptionCollectionPath()}/${encodeURIComponent(recordId)}`;
+  private speechTextJobPath(recordId: string): string {
+    return `${this.speechTextJobsCollectionPath()}/${encodeURIComponent(recordId)}`;
   }
 
-  private diarizationCollectionPath(): string {
-    return "/diarizations";
+  private buildSpeechTextJobPath(
+    path: string,
+    jobKind?: SpeechTextJobQueryKind,
+  ): string {
+    if (!jobKind) {
+      return path;
+    }
+    const suffix = path.includes("?") ? "&" : "?";
+    return `${path}${suffix}job_kind=${encodeURIComponent(jobKind)}`;
   }
 
-  private diarizationRecordPath(recordId: string): string {
-    return `${this.diarizationCollectionPath()}/${encodeURIComponent(recordId)}`;
+  private normalizeSpeechTextJobRecord(
+    payload: unknown,
+    preferredKind?: SpeechTextJobKind,
+  ): SpeechTextJob {
+    const raw =
+      payload && typeof payload === "object"
+        ? (payload as Record<string, unknown>)
+        : {};
+    const candidateKind = raw.kind;
+    const explicitKind =
+      candidateKind === "transcription" || candidateKind === "diarization"
+        ? candidateKind
+        : null;
+    const inferredKind =
+      preferredKind ??
+      (typeof raw.transcription === "string" ? "transcription" : "diarization");
+    return {
+      ...raw,
+      kind: explicitKind ?? inferredKind,
+    } as SpeechTextJob;
+  }
+
+  private resolveSpeechTextPreferredKind(
+    jobKind?: SpeechTextJobQueryKind,
+  ): SpeechTextJobKind | undefined {
+    return jobKind === "transcription" || jobKind === "diarization"
+      ? jobKind
+      : undefined;
+  }
+
+  private stripSpeechTextJobKind<T>(record: SpeechTextJob): T {
+    const { kind: _kind, ...rest } = record as SpeechTextJob &
+      Record<string, unknown>;
+    return rest as T;
   }
 
   private studioProjectsCollectionPath(): string {
@@ -1890,17 +1935,26 @@ export class AudioApiClient {
     });
   }
 
-  async listTranscriptionRecords(): Promise<TranscriptionRecordSummary[]> {
-    const page = await this.listTranscriptionRecordPage();
+  async listSpeechTextJobs(
+    query?: SpeechTextJobPageQuery,
+  ): Promise<SpeechTextJobSummary[]> {
+    const page = await this.listSpeechTextJobPage(query);
     return page.items;
   }
 
-  async listTranscriptionRecordPage(
-    query?: CursorPaginationQuery,
-  ): Promise<CursorPageResult<TranscriptionRecordSummary>> {
-    const path = `${this.transcriptionCollectionPath()}${buildCursorQueryString(query)}`;
+  async listSpeechTextJobPage(
+    query?: SpeechTextJobPageQuery,
+  ): Promise<CursorPageResult<SpeechTextJobSummary>> {
+    const cursorQuery = buildCursorQueryString({
+      limit: query?.limit,
+      cursor: query?.cursor,
+    });
+    const path = this.buildSpeechTextJobPath(
+      `${this.speechTextJobsCollectionPath()}${cursorQuery}`,
+      query?.job_kind,
+    );
     const payload = await this.http.request<{
-      records: TranscriptionRecordSummary[];
+      records: SpeechTextJobSummary[];
       pagination?: {
         next_cursor?: string | null;
         has_more?: boolean;
@@ -1915,25 +1969,196 @@ export class AudioApiClient {
     };
   }
 
+  async getSpeechTextJob(
+    recordId: string,
+    options?: { job_kind?: SpeechTextJobQueryKind },
+  ): Promise<SpeechTextJob> {
+    const path = this.buildSpeechTextJobPath(
+      this.speechTextJobPath(recordId),
+      options?.job_kind,
+    );
+    const payload = await this.http.request(path);
+    const preferredKind = this.resolveSpeechTextPreferredKind(options?.job_kind);
+    return this.normalizeSpeechTextJobRecord(payload, preferredKind);
+  }
+
+  async createSpeechTextJob(
+    request: SpeechTextJobCreateRequest,
+  ): Promise<SpeechTextJob> {
+    if (request.kind === "transcription" && request.stream) {
+      throw new Error(
+        "Streaming transcription jobs must use createTranscriptionRecordStream.",
+      );
+    }
+
+    const path = this.buildSpeechTextJobPath(
+      this.speechTextJobsCollectionPath(),
+      request.kind,
+    );
+    const response = await fetch(this.http.url(path), {
+      ...this.buildSpeechTextJobCreateRequestInit(request),
+    });
+
+    if (!response.ok) {
+      throw await this.http.createError(response, "Speech text job failed");
+    }
+
+    const payload = await response.json();
+    return this.normalizeSpeechTextJobRecord(payload, request.kind);
+  }
+
+  async updateSpeechTextJob(
+    recordId: string,
+    request: DiarizationRecordUpdateRequest,
+    options?: { job_kind?: SpeechTextJobQueryKind },
+  ): Promise<SpeechTextJob> {
+    const path = this.buildSpeechTextJobPath(
+      this.speechTextJobPath(recordId),
+      options?.job_kind,
+    );
+    const body = JSON.stringify({
+      speaker_name_overrides: request.speaker_name_overrides,
+    });
+
+    const sendUpdate = (method: "PATCH" | "PUT") =>
+      fetch(this.http.url(path), {
+        method,
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body,
+      });
+
+    let response = await sendUpdate("PATCH");
+
+    // Some embedded-webview stacks still reject PATCH for local API calls.
+    if (response.status === 405) {
+      response = await sendUpdate("PUT");
+    }
+
+    if (!response.ok) {
+      throw await this.http.createError(
+        response,
+        "Failed to save speaker corrections",
+      );
+    }
+
+    const payload = await response.json();
+    const preferredKind = this.resolveSpeechTextPreferredKind(options?.job_kind);
+    return this.normalizeSpeechTextJobRecord(payload, preferredKind);
+  }
+
+  async rerunSpeechTextJob(
+    recordId: string,
+    request: DiarizationRecordRerunRequest,
+    options?: { job_kind?: SpeechTextJobQueryKind },
+  ): Promise<SpeechTextJob> {
+    const path = this.buildSpeechTextJobPath(
+      `${this.speechTextJobPath(recordId)}/reruns`,
+      options?.job_kind,
+    );
+    const payload = await this.http.request(path, {
+      method: "POST",
+      body: JSON.stringify({
+        min_speakers: request.min_speakers,
+        max_speakers: request.max_speakers,
+        min_speech_duration_ms: request.min_speech_duration_ms,
+        min_silence_duration_ms: request.min_silence_duration_ms,
+        enable_llm_refinement: request.enable_llm_refinement,
+      }),
+    });
+    const preferredKind = this.resolveSpeechTextPreferredKind(options?.job_kind);
+    return this.normalizeSpeechTextJobRecord(payload, preferredKind);
+  }
+
+  async cancelSpeechTextJob(
+    recordId: string,
+    options?: { job_kind?: SpeechTextJobQueryKind },
+  ): Promise<SpeechTextJob> {
+    const path = this.buildSpeechTextJobPath(
+      `${this.speechTextJobPath(recordId)}/cancel`,
+      options?.job_kind,
+    );
+    const payload = await this.http.request(path, {
+      method: "POST",
+    });
+    const preferredKind = this.resolveSpeechTextPreferredKind(options?.job_kind);
+    return this.normalizeSpeechTextJobRecord(payload, preferredKind);
+  }
+
+  speechTextJobAudioUrl(
+    recordId: string,
+    options?: { job_kind?: SpeechTextJobQueryKind },
+  ): string {
+    const path = this.buildSpeechTextJobPath(
+      `${this.speechTextJobPath(recordId)}/audio`,
+      options?.job_kind,
+    );
+    return this.http.url(path);
+  }
+
+  async regenerateSpeechTextJobSummary(
+    recordId: string,
+    options?: { job_kind?: SpeechTextJobQueryKind },
+  ): Promise<SpeechTextJob> {
+    const path = this.buildSpeechTextJobPath(
+      `${this.speechTextJobPath(recordId)}/summary/regenerate`,
+      options?.job_kind,
+    );
+    const payload = await this.http.request(path, {
+      method: "POST",
+    });
+    const preferredKind = this.resolveSpeechTextPreferredKind(options?.job_kind);
+    return this.normalizeSpeechTextJobRecord(payload, preferredKind);
+  }
+
+  async deleteSpeechTextJob(
+    recordId: string,
+    options?: { job_kind?: SpeechTextJobQueryKind },
+  ): Promise<{ id: string; deleted: boolean }> {
+    const path = this.buildSpeechTextJobPath(
+      this.speechTextJobPath(recordId),
+      options?.job_kind,
+    );
+    return this.http.request(path, {
+      method: "DELETE",
+    });
+  }
+
+  async listTranscriptionRecords(): Promise<TranscriptionRecordSummary[]> {
+    const page = await this.listTranscriptionRecordPage();
+    return page.items;
+  }
+
+  async listTranscriptionRecordPage(
+    query?: CursorPaginationQuery,
+  ): Promise<CursorPageResult<TranscriptionRecordSummary>> {
+    const page = await this.listSpeechTextJobPage({
+      ...query,
+      job_kind: "transcription",
+    });
+    return {
+      items: page.items as TranscriptionRecordSummary[],
+      pagination: page.pagination,
+    };
+  }
+
   async getTranscriptionRecord(recordId: string): Promise<TranscriptionRecord> {
-    return this.http.request(this.transcriptionRecordPath(recordId));
+    const record = await this.getSpeechTextJob(recordId, {
+      job_kind: "transcription",
+    });
+    return this.stripSpeechTextJobKind<TranscriptionRecord>(record);
   }
 
   async createTranscriptionRecord(
     request: TranscriptionRecordCreateRequest,
   ): Promise<TranscriptionRecord> {
-    const response = await fetch(
-      this.http.url(this.transcriptionCollectionPath()),
-      {
-        ...this.buildTranscriptionRecordRequestInit(request, false),
-      },
-    );
-
-    if (!response.ok) {
-      throw await this.http.createError(response, "Transcription failed");
-    }
-
-    return response.json();
+    const record = await this.createSpeechTextJob({
+      ...request,
+      kind: "transcription",
+      stream: false,
+    });
+    return this.stripSpeechTextJobKind<TranscriptionRecord>(record);
   }
 
   createTranscriptionRecordStream(
@@ -1944,13 +2169,14 @@ export class AudioApiClient {
 
     const startStream = async () => {
       try {
-        const response = await fetch(
-          this.http.url(this.transcriptionCollectionPath()),
-          {
-            ...this.buildTranscriptionRecordRequestInit(request, true),
-            signal: abortController.signal,
-          },
+        const path = this.buildSpeechTextJobPath(
+          this.speechTextJobsCollectionPath(),
+          "transcription",
         );
+        const response = await fetch(this.http.url(path), {
+          ...this.buildTranscriptionRecordRequestInit(request, true),
+          signal: abortController.signal,
+        });
 
         if (!response.ok) {
           callbacks.onError?.(
@@ -2012,25 +2238,25 @@ export class AudioApiClient {
   }
 
   transcriptionRecordAudioUrl(recordId: string): string {
-    return this.http.url(`${this.transcriptionRecordPath(recordId)}/audio`);
+    return this.speechTextJobAudioUrl(recordId, {
+      job_kind: "transcription",
+    });
   }
 
   async regenerateTranscriptionSummary(
     recordId: string,
   ): Promise<TranscriptionRecord> {
-    return this.http.request(
-      `${this.transcriptionRecordPath(recordId)}/summary/regenerate`,
-      {
-        method: "POST",
-      },
-    );
+    const record = await this.regenerateSpeechTextJobSummary(recordId, {
+      job_kind: "transcription",
+    });
+    return this.stripSpeechTextJobKind<TranscriptionRecord>(record);
   }
 
   async deleteTranscriptionRecord(
     recordId: string,
   ): Promise<{ id: string; deleted: boolean }> {
-    return this.http.request(this.transcriptionRecordPath(recordId), {
-      method: "DELETE",
+    return this.deleteSpeechTextJob(recordId, {
+      job_kind: "transcription",
     });
   }
 
@@ -2081,124 +2307,80 @@ export class AudioApiClient {
   async listDiarizationRecordPage(
     query?: CursorPaginationQuery,
   ): Promise<CursorPageResult<DiarizationRecordSummary>> {
-    const path = `${this.diarizationCollectionPath()}${buildCursorQueryString(query)}`;
-    const payload = await this.http.request<{
-      records: DiarizationRecordSummary[];
-      pagination?: {
-        next_cursor?: string | null;
-        has_more?: boolean;
-        limit?: number;
-      };
-    }>(path);
-    const items = payload.records ?? [];
-    const fallbackLimit = query?.limit ?? Math.max(items.length, 1);
+    const page = await this.listSpeechTextJobPage({
+      ...query,
+      job_kind: "diarization",
+    });
     return {
-      items,
-      pagination: normalizeCursorPaginationMeta(payload.pagination, fallbackLimit),
+      items: page.items as DiarizationRecordSummary[],
+      pagination: page.pagination,
     };
   }
 
   async getDiarizationRecord(recordId: string): Promise<DiarizationRecord> {
-    return this.http.request(this.diarizationRecordPath(recordId));
+    const record = await this.getSpeechTextJob(recordId, {
+      job_kind: "diarization",
+    });
+    return this.stripSpeechTextJobKind<DiarizationRecord>(record);
   }
 
   async updateDiarizationRecord(
     recordId: string,
     request: DiarizationRecordUpdateRequest,
   ): Promise<DiarizationRecord> {
-    const path = this.diarizationRecordPath(recordId);
-    const body = JSON.stringify({
-      speaker_name_overrides: request.speaker_name_overrides,
+    const record = await this.updateSpeechTextJob(recordId, request, {
+      job_kind: "diarization",
     });
-
-    const sendUpdate = (method: "PATCH" | "PUT") =>
-      fetch(this.http.url(path), {
-        method,
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body,
-      });
-
-    let response = await sendUpdate("PATCH");
-
-    // Some embedded-webview stacks still reject PATCH for local API calls.
-    if (response.status === 405) {
-      response = await sendUpdate("PUT");
-    }
-
-    if (!response.ok) {
-      throw await this.http.createError(
-        response,
-        "Failed to save speaker corrections",
-      );
-    }
-
-    return response.json();
+    return this.stripSpeechTextJobKind<DiarizationRecord>(record);
   }
 
   async rerunDiarizationRecord(
     recordId: string,
     request: DiarizationRecordRerunRequest,
   ): Promise<DiarizationRecord> {
-    return this.http.request(
-      `${this.diarizationRecordPath(recordId)}/reruns`,
-      {
-        method: "POST",
-        body: JSON.stringify({
-          min_speakers: request.min_speakers,
-          max_speakers: request.max_speakers,
-          min_speech_duration_ms: request.min_speech_duration_ms,
-          min_silence_duration_ms: request.min_silence_duration_ms,
-          enable_llm_refinement: request.enable_llm_refinement,
-        }),
-      },
-    );
+    const record = await this.rerunSpeechTextJob(recordId, request, {
+      job_kind: "diarization",
+    });
+    return this.stripSpeechTextJobKind<DiarizationRecord>(record);
   }
 
   async cancelDiarizationRecord(recordId: string): Promise<DiarizationRecord> {
-    return this.http.request(
-      `${this.diarizationRecordPath(recordId)}/cancel`,
-      {
-        method: "POST",
-      },
-    );
+    const record = await this.cancelSpeechTextJob(recordId, {
+      job_kind: "diarization",
+    });
+    return this.stripSpeechTextJobKind<DiarizationRecord>(record);
   }
 
   async createDiarizationRecord(
     request: DiarizationRecordCreateRequest,
   ): Promise<DiarizationRecord> {
-    const response = await fetch(this.http.url(this.diarizationCollectionPath()), {
-      ...this.buildDiarizationRecordRequestInit(request),
+    const record = await this.createSpeechTextJob({
+      ...request,
+      kind: "diarization",
     });
-
-    if (!response.ok) {
-      throw await this.http.createError(response, "Diarization failed");
-    }
-
-    return response.json();
+    return this.stripSpeechTextJobKind<DiarizationRecord>(record);
   }
 
   diarizationRecordAudioUrl(recordId: string): string {
-    return this.http.url(`${this.diarizationRecordPath(recordId)}/audio`);
+    return this.speechTextJobAudioUrl(recordId, {
+      job_kind: "diarization",
+    });
   }
 
   async regenerateDiarizationSummary(
     recordId: string,
   ): Promise<DiarizationRecord> {
-    return this.http.request(
-      `${this.diarizationRecordPath(recordId)}/summary/regenerate`,
-      {
-        method: "POST",
-      },
-    );
+    const record = await this.regenerateSpeechTextJobSummary(recordId, {
+      job_kind: "diarization",
+    });
+    return this.stripSpeechTextJobKind<DiarizationRecord>(record);
   }
 
   async deleteDiarizationRecord(
     recordId: string,
   ): Promise<{ id: string; deleted: boolean }> {
-    return this.http.request(this.diarizationRecordPath(recordId), {
-      method: "DELETE",
+    return this.deleteSpeechTextJob(recordId, {
+      job_kind: "diarization",
     });
   }
 
@@ -2416,6 +2598,15 @@ export class AudioApiClient {
 
     void startStream();
     return abortController;
+  }
+
+  private buildSpeechTextJobCreateRequestInit(
+    request: SpeechTextJobCreateRequest,
+  ): RequestInit {
+    if (request.kind === "transcription") {
+      return this.buildTranscriptionRecordRequestInit(request, Boolean(request.stream));
+    }
+    return this.buildDiarizationRecordRequestInit(request);
   }
 
   private buildAsrRequestInit(
