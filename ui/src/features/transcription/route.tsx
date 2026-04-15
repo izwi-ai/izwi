@@ -718,6 +718,9 @@ export function TranscriptionPage({
                       selectedModelReady={selectedModelReady}
                       timestampAlignerModelId={resolvedAlignerModel}
                       timestampAlignerReady={timestampAlignerReady}
+                      onOpenModelManager={() => {
+                        openModelManager();
+                      }}
                       onModelRequired={() => {
                         requestModel();
                         onError("Select and load an ASR model to start transcribing.");
