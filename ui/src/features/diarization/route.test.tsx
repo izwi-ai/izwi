@@ -413,7 +413,9 @@ describe("DiarizationPage routes", () => {
       }
     });
 
-    fireEvent.click(screen.getByRole("button", { name: /Back to diarization/i }));
+    fireEvent.click(
+      screen.getByRole("button", { name: /Back to transcription/i }),
+    );
 
     expect(
       await screen.findByText(
@@ -644,7 +646,7 @@ describe("DiarizationPage routes", () => {
     );
 
     fireEvent.click(
-      await screen.findByRole("button", { name: /Back to diarization/i }),
+      await screen.findByRole("button", { name: /Back to transcription/i }),
     );
 
     expect(
