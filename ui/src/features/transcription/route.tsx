@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { api, type ModelInfo, type TranscriptionRecord } from "@/api";
+import {
+  api,
+  type ModelInfo,
+  type SpeechTextJobSummary,
+  type TranscriptionRecord,
+} from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import { Button } from "@/components/ui/button";
 import { VIEW_CONFIGS } from "@/types";
@@ -254,8 +259,12 @@ export function TranscriptionPage({
   }, [navigate, recordDeletePending, recordId, refreshHistory]);
 
   const handleHistoryDelete = useCallback(
-    async (targetRecordId: string) => {
-      await api.deleteTranscriptionRecord(targetRecordId);
+    async (targetRecord: SpeechTextJobSummary) => {
+      if (targetRecord.kind === "diarization") {
+        await api.deleteDiarizationRecord(targetRecord.id);
+      } else {
+        await api.deleteTranscriptionRecord(targetRecord.id);
+      }
       await refreshHistory();
     },
     [refreshHistory],
@@ -449,8 +458,12 @@ export function TranscriptionPage({
             }}
             onRefresh={() => void refreshHistory()}
             onDeleteRecord={handleHistoryDelete}
-            onOpenRecord={(nextRecordId) => {
-              navigate(`/transcription/${nextRecordId}`);
+            onOpenRecord={(nextRecord) => {
+              if (nextRecord.kind === "diarization") {
+                navigate(`/transcription/${nextRecord.id}?mode=diarization`);
+                return;
+              }
+              navigate(`/transcription/${nextRecord.id}`);
             }}
           />
 
