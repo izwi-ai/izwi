@@ -37,10 +37,11 @@ izwi serve
 
 ## Using the Web UI
 
-1. Navigate to **Diarization** in the sidebar
-2. Upload an audio file with multiple speakers
-3. Click **Analyze**
-4. View the speaker-segmented transcript
+1. Navigate to **Transcription** in the sidebar
+2. Switch to **Diarization** mode
+3. Upload an audio file with multiple speakers
+4. Click **Analyze**
+5. View the speaker-segmented transcript
 
 ### Output
 

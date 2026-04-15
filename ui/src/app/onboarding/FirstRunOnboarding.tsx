@@ -56,7 +56,8 @@ const FEATURE_ITEMS = [
   {
     icon: FileText,
     title: "Transcription and diarization",
-    description: "High-quality speech-to-text with timestamps and speakers.",
+    description:
+      "One shared workspace for speech-to-text, timestamps, and speaker separation.",
   },
   {
     icon: Sparkles,

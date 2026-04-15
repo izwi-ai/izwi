@@ -27,6 +27,7 @@ describe("analytics event helpers", () => {
     expect(routeIdFromPathname("/text-to-speech/record_1")).toBe(
       "text_to_speech",
     );
+    expect(routeIdFromPathname("/diarization")).toBe("transcription");
     expect(routeIdFromPathname("/voice-cloning")).toBe("voices");
     expect(routeIdFromPathname("/my-models")).toBe("models");
     expect(routeIdFromPathname("/unknown")).toBeNull();

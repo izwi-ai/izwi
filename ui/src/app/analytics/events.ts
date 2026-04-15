@@ -4,7 +4,6 @@ export type RouteId =
   | "voice"
   | "chat"
   | "transcription"
-  | "diarization"
   | "text_to_speech"
   | "studio"
   | "voices"
@@ -21,7 +20,7 @@ export function routeIdFromPathname(pathname: string): RouteId | null {
     case "transcription":
       return "transcription";
     case "diarization":
-      return "diarization";
+      return "transcription";
     case "text-to-speech":
       return "text_to_speech";
     case "studio":
