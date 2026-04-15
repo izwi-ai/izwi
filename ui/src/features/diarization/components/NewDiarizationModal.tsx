@@ -16,6 +16,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { StatusBadge } from "@/components/ui/status-badge";
+import type { SpeechTextCreationMode } from "@/features/speech-text/creationMode";
 
 function formatDraftValue(value: number | null | undefined): string {
   if (typeof value !== "number" || !Number.isFinite(value)) {
@@ -259,6 +260,8 @@ async function transcodeToWav(
 interface NewDiarizationModalProps {
   isOpen: boolean;
   onClose: () => void;
+  selectedMode?: SpeechTextCreationMode;
+  onSelectMode?: (mode: SpeechTextCreationMode) => void;
   selectedModel: string | null;
   selectedModelReady: boolean;
   pipelineAsrModelId?: string | null;
@@ -280,6 +283,8 @@ interface NewDiarizationModalProps {
 export function NewDiarizationModal({
   isOpen,
   onClose,
+  selectedMode = "diarization",
+  onSelectMode,
   selectedModel,
   selectedModelReady,
   pipelineAsrModelId = null,
@@ -525,6 +530,7 @@ export function NewDiarizationModal({
   const canRunReadinessAction = readinessActionIsUnload
     ? canUnloadAnyManagedModels
     : canLoadAnyManagedModels;
+  const isDiarizationMode = selectedMode === "diarization";
 
   return (
     <Dialog
@@ -544,6 +550,33 @@ export function NewDiarizationModal({
             Upload a recording or capture from your microphone, then open the
             diarization run on its own page as soon as the upload is accepted.
           </DialogDescription>
+          {onSelectMode ? (
+            <fieldset className="mt-3">
+              <legend className="sr-only">Choose creation mode</legend>
+              <div className="inline-flex items-center gap-4">
+                <label className="inline-flex cursor-pointer items-center gap-2 text-sm text-[var(--text-primary)]">
+                  <input
+                    type="radio"
+                    name="speech-text-create-mode"
+                    checked={!isDiarizationMode}
+                    onChange={() => onSelectMode("transcription")}
+                    className="h-4 w-4 border-[var(--border-strong)] text-[var(--status-info-text)]"
+                  />
+                  Transcription
+                </label>
+                <label className="inline-flex cursor-pointer items-center gap-2 text-sm text-[var(--text-primary)]">
+                  <input
+                    type="radio"
+                    name="speech-text-create-mode"
+                    checked={isDiarizationMode}
+                    onChange={() => onSelectMode("diarization")}
+                    className="h-4 w-4 border-[var(--border-strong)] text-[var(--status-info-text)]"
+                  />
+                  Diarization
+                </label>
+              </div>
+            </fieldset>
+          ) : null}
         </div>
 
         <div className="grid lg:grid-cols-[minmax(0,1.1fr),minmax(19rem,0.9fr)]">

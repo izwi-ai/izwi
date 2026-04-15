@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import {
   api,
+  type DiarizationRecord,
   type ModelInfo,
   type SpeechTextJobSummary,
   type TranscriptionRecord,
@@ -10,14 +11,20 @@ import { PageHeader, PageShell } from "@/components/PageShell";
 import { Button } from "@/components/ui/button";
 import { VIEW_CONFIGS } from "@/types";
 import { NewTranscriptionModal } from "@/features/transcription/components/NewTranscriptionModal";
+import { NewDiarizationModal } from "@/features/diarization/components/NewDiarizationModal";
 import { TranscriptionHistoryTable } from "@/features/transcription/components/TranscriptionHistoryTable";
 import { TranscriptionRecordDetail } from "@/features/transcription/components/TranscriptionRecordDetail";
 import {
+  DIARIZATION_PREFERRED_ALIGNER_MODELS,
+  DIARIZATION_PREFERRED_ASR_MODELS,
+  DIARIZATION_PREFERRED_MODELS,
+  DIARIZATION_PREFERRED_SUMMARY_MODELS,
   TRANSCRIPTION_PREFERRED_MODELS,
   resolvePreferredRouteModel,
 } from "@/features/models/catalog/routeModelCatalog";
 import { RouteModelModal } from "@/features/models/components/RouteModelModal";
 import { useRouteModelSelection } from "@/features/models/hooks/useRouteModelSelection";
+import type { SpeechTextCreationMode } from "@/features/speech-text/creationMode";
 import { useTranscriptionHistory } from "@/features/transcription/hooks/useTranscriptionHistory";
 import { useTranscriptionRecord } from "@/features/transcription/hooks/useTranscriptionRecord";
 import { normalizeProcessingStatus } from "@/features/transcription/playground/support";
@@ -30,6 +37,23 @@ function isTranscriptionAlignerVariant(variant: string): boolean {
 }
 
 function isTranscriptionSummaryVariant(variant: string): boolean {
+  return variant === "Qwen3.5-4B";
+}
+
+function isDiarizationVariant(variant: string): boolean {
+  const normalized = variant.toLowerCase();
+  return normalized.includes("sortformer") || normalized.includes("diar");
+}
+
+function isDiarizationPipelineAsrVariant(variant: string): boolean {
+  return variant === "Whisper-Large-v3-Turbo";
+}
+
+function isDiarizationPipelineAlignerVariant(variant: string): boolean {
+  return variant === "Qwen3-ForcedAligner-0.6B";
+}
+
+function isDiarizationPipelineLlmVariant(variant: string): boolean {
   return variant === "Qwen3.5-4B";
 }
 
@@ -73,6 +97,8 @@ export function TranscriptionPage({
   const navigate = useNavigate();
   const [isNewTranscriptionModalOpen, setIsNewTranscriptionModalOpen] =
     useState(false);
+  const [newSpeechTextMode, setNewSpeechTextMode] =
+    useState<SpeechTextCreationMode>("transcription");
   const [recordActionError, setRecordActionError] = useState<string | null>(null);
   const [recordDeletePending, setRecordDeletePending] = useState(false);
   const [recordSummaryRefreshPending, setRecordSummaryRefreshPending] =
@@ -94,6 +120,34 @@ export function TranscriptionPage({
     () =>
       models
         .filter((model) => isTranscriptionSummaryVariant(model.variant))
+        .sort((a, b) => a.variant.localeCompare(b.variant)),
+    [models],
+  );
+  const diarizationModels = useMemo(
+    () =>
+      models
+        .filter((model) => isDiarizationVariant(model.variant))
+        .sort((a, b) => a.variant.localeCompare(b.variant)),
+    [models],
+  );
+  const diarizationAsrPipelineModels = useMemo(
+    () =>
+      models
+        .filter((model) => isDiarizationPipelineAsrVariant(model.variant))
+        .sort((a, b) => a.variant.localeCompare(b.variant)),
+    [models],
+  );
+  const diarizationAlignerPipelineModels = useMemo(
+    () =>
+      models
+        .filter((model) => isDiarizationPipelineAlignerVariant(model.variant))
+        .sort((a, b) => a.variant.localeCompare(b.variant)),
+    [models],
+  );
+  const diarizationLlmPipelineModels = useMemo(
+    () =>
+      models
+        .filter((model) => isDiarizationPipelineLlmVariant(model.variant))
         .sort((a, b) => a.variant.localeCompare(b.variant)),
     [models],
   );
@@ -160,6 +214,125 @@ export function TranscriptionPage({
         return `Download and load ${modelName} in Transcription Models to generate summaries.`;
     }
   }, [resolvedSummaryModel, summaryModelStatus]);
+  const resolvedDiarizationModel = useMemo(
+    () =>
+      resolvePreferredRouteModel({
+        models: diarizationModels,
+        selectedModel,
+        preferredVariants: DIARIZATION_PREFERRED_MODELS,
+        preferAnyPreferredBeforeReadyAny: true,
+      }),
+    [diarizationModels, selectedModel],
+  );
+  const diarizationModelReady =
+    resolvedDiarizationModel != null &&
+    diarizationModels.some(
+      (model) =>
+        model.variant === resolvedDiarizationModel && model.status === "ready",
+    );
+  const resolvedDiarizationAsrModel = useMemo(
+    () =>
+      resolvePreferredRouteModel({
+        models: diarizationAsrPipelineModels,
+        selectedModel: null,
+        preferredVariants: DIARIZATION_PREFERRED_ASR_MODELS,
+        preferAnyPreferredBeforeReadyAny: true,
+      }),
+    [diarizationAsrPipelineModels],
+  );
+  const resolvedDiarizationAlignerModel = useMemo(
+    () =>
+      resolvePreferredRouteModel({
+        models: diarizationAlignerPipelineModels,
+        selectedModel: null,
+        preferredVariants: DIARIZATION_PREFERRED_ALIGNER_MODELS,
+        preferAnyPreferredBeforeReadyAny: true,
+      }),
+    [diarizationAlignerPipelineModels],
+  );
+  const resolvedDiarizationLlmModel = useMemo(
+    () =>
+      resolvePreferredRouteModel({
+        models: diarizationLlmPipelineModels,
+        selectedModel: null,
+        preferredVariants: DIARIZATION_PREFERRED_SUMMARY_MODELS,
+        preferAnyPreferredBeforeReadyAny: true,
+      }),
+    [diarizationLlmPipelineModels],
+  );
+  const diarizationAsrModelReady =
+    resolvedDiarizationAsrModel != null &&
+    diarizationAsrPipelineModels.some(
+      (model) =>
+        model.variant === resolvedDiarizationAsrModel && model.status === "ready",
+    );
+  const diarizationAlignerModelReady =
+    resolvedDiarizationAlignerModel != null &&
+    diarizationAlignerPipelineModels.some(
+      (model) =>
+        model.variant === resolvedDiarizationAlignerModel &&
+        model.status === "ready",
+    );
+  const diarizationPipelineModelsReady =
+    diarizationAsrModelReady && diarizationAlignerModelReady;
+  const diarizationManagedModelVariants = useMemo(
+    () =>
+      Array.from(
+        new Set(
+          [
+            resolvedDiarizationModel,
+            resolvedDiarizationAsrModel,
+            resolvedDiarizationAlignerModel,
+            resolvedDiarizationLlmModel,
+          ].filter((variant): variant is string => Boolean(variant)),
+        ),
+      ),
+    [
+      resolvedDiarizationAlignerModel,
+      resolvedDiarizationAsrModel,
+      resolvedDiarizationLlmModel,
+      resolvedDiarizationModel,
+    ],
+  );
+  const diarizationPipelineModels = useMemo(
+    () => [
+      ...diarizationModels,
+      ...diarizationAsrPipelineModels,
+      ...diarizationAlignerPipelineModels,
+      ...diarizationLlmPipelineModels,
+    ],
+    [
+      diarizationAlignerPipelineModels,
+      diarizationAsrPipelineModels,
+      diarizationLlmPipelineModels,
+      diarizationModels,
+    ],
+  );
+  const diarizationManagedModels = useMemo(
+    () =>
+      diarizationManagedModelVariants
+        .map((variant) =>
+          diarizationPipelineModels.find((model) => model.variant === variant) ??
+          null,
+        )
+        .filter((model): model is ModelInfo => model !== null),
+    [diarizationManagedModelVariants, diarizationPipelineModels],
+  );
+  const readyDiarizationManagedModelCount = diarizationManagedModels.filter(
+    (model) => model.status === "ready",
+  ).length;
+  const canLoadAnyDiarizationManagedModels = diarizationManagedModels.some(
+    (model) =>
+      model.status === "downloaded" ||
+      model.status === "not_downloaded" ||
+      model.status === "error",
+  );
+  const canUnloadAnyDiarizationManagedModels = diarizationManagedModels.some(
+    (model) => model.status === "ready",
+  );
+  const isDiarizationManagedModelActionBusy = diarizationManagedModels.some(
+    (model) => model.status === "loading" || model.status === "downloading",
+  );
   const modelSections = useMemo(
     () => [
       {
@@ -230,11 +403,31 @@ export function TranscriptionPage({
     openModelManager();
   }, [openModelManager]);
   const handleOpenNewTranscriptionModal = useCallback(() => {
+    setNewSpeechTextMode("transcription");
     setIsNewTranscriptionModalOpen(true);
   }, []);
   const handleCloseNewTranscriptionModal = useCallback(() => {
     setIsNewTranscriptionModalOpen(false);
   }, []);
+  const handleLoadAllDiarizationManagedModels = useCallback(() => {
+    for (const model of diarizationManagedModels) {
+      if (model.status === "downloaded") {
+        onLoad(model.variant);
+      } else if (
+        model.status === "not_downloaded" ||
+        model.status === "error"
+      ) {
+        onDownload(model.variant);
+      }
+    }
+  }, [diarizationManagedModels, onDownload, onLoad]);
+  const handleUnloadAllDiarizationManagedModels = useCallback(() => {
+    for (const model of diarizationManagedModels) {
+      if (model.status === "ready") {
+        onUnload(model.variant);
+      }
+    }
+  }, [diarizationManagedModels, onUnload]);
 
   const handleDetailDelete = useCallback(async () => {
     if (!recordId || recordDeletePending) {
@@ -306,6 +499,13 @@ export function TranscriptionPage({
     summaryModelReady,
     summaryModelRequirementMessage,
   ]);
+  const handleCreatedDiarizationRecord = useCallback(
+    async (createdRecord: DiarizationRecord) => {
+      await refreshHistory().catch(() => undefined);
+      navigate(`/transcription/${createdRecord.id}?mode=diarization`);
+    },
+    [navigate, refreshHistory],
+  );
 
   const detailAudioUrl = useMemo(
     () => (recordId ? api.transcriptionRecordAudioUrl(recordId) : null),
@@ -467,55 +667,86 @@ export function TranscriptionPage({
             }}
           />
 
-          <NewTranscriptionModal
-            isOpen={isNewTranscriptionModalOpen}
-            onClose={handleCloseNewTranscriptionModal}
-            blockOutsideDismiss={isModelModalOpen}
-            selectedModel={resolvedSelectedModel}
-            selectedModelReady={selectedModelReady}
-            timestampAlignerModelId={resolvedAlignerModel}
-            timestampAlignerReady={timestampAlignerReady}
-            onModelRequired={() => {
-              requestModel();
-              onError("Select and load an ASR model to start transcribing.");
-            }}
-            onTimestampAlignerRequired={() => {
-              openModelManager();
-              onError("Load the timestamp aligner model to enable timestamps.");
-            }}
-            onCreated={async (createdRecord: TranscriptionRecord) => {
-              setStreamingRecord(createdRecord);
-              await refreshHistory().catch(() => undefined);
-              navigate(`/transcription/${createdRecord.id}`);
-            }}
-            onStreamingStart={() => {
-              setStreamingRecord((current) =>
-                current
-                  ? {
-                      ...current,
-                      processing_status: "processing",
-                    }
-                  : current,
-              );
-            }}
-            onStreamingDelta={(delta) => {
-              setStreamingRecord((current) =>
-                current
-                  ? {
-                      ...current,
-                      processing_status: "processing",
-                      transcription: `${current.transcription}${delta}`,
-                    }
-                  : current,
-              );
-            }}
-            onStreamingFinal={(finalRecord) => {
-              setStreamingRecord(finalRecord);
-            }}
-            onStreamingError={() => {
-              void refreshRecord();
-            }}
-          />
+          {newSpeechTextMode === "transcription" ? (
+            <NewTranscriptionModal
+              isOpen={isNewTranscriptionModalOpen}
+              onClose={handleCloseNewTranscriptionModal}
+              blockOutsideDismiss={isModelModalOpen}
+              selectedMode={newSpeechTextMode}
+              onSelectMode={setNewSpeechTextMode}
+              selectedModel={resolvedSelectedModel}
+              selectedModelReady={selectedModelReady}
+              timestampAlignerModelId={resolvedAlignerModel}
+              timestampAlignerReady={timestampAlignerReady}
+              onModelRequired={() => {
+                requestModel();
+                onError("Select and load an ASR model to start transcribing.");
+              }}
+              onTimestampAlignerRequired={() => {
+                openModelManager();
+                onError("Load the timestamp aligner model to enable timestamps.");
+              }}
+              onCreated={async (createdRecord: TranscriptionRecord) => {
+                setStreamingRecord(createdRecord);
+                await refreshHistory().catch(() => undefined);
+                navigate(`/transcription/${createdRecord.id}`);
+              }}
+              onStreamingStart={() => {
+                setStreamingRecord((current) =>
+                  current
+                    ? {
+                        ...current,
+                        processing_status: "processing",
+                      }
+                    : current,
+                );
+              }}
+              onStreamingDelta={(delta) => {
+                setStreamingRecord((current) =>
+                  current
+                    ? {
+                        ...current,
+                        processing_status: "processing",
+                        transcription: `${current.transcription}${delta}`,
+                      }
+                    : current,
+                );
+              }}
+              onStreamingFinal={(finalRecord) => {
+                setStreamingRecord(finalRecord);
+              }}
+              onStreamingError={() => {
+                void refreshRecord();
+              }}
+            />
+          ) : (
+            <NewDiarizationModal
+              isOpen={isNewTranscriptionModalOpen}
+              onClose={handleCloseNewTranscriptionModal}
+              selectedMode={newSpeechTextMode}
+              onSelectMode={setNewSpeechTextMode}
+              selectedModel={resolvedDiarizationModel}
+              selectedModelReady={diarizationModelReady}
+              pipelineAsrModelId={resolvedDiarizationAsrModel}
+              pipelineAlignerModelId={resolvedDiarizationAlignerModel}
+              pipelineLlmModelId={resolvedDiarizationLlmModel}
+              pipelineModelsReady={diarizationPipelineModelsReady}
+              onModelRequired={() => {
+                onError("Select and load a diarization model to start.");
+              }}
+              onPipelineModelsRequired={() => {
+                onError("Load ASR and forced aligner models before diarization.");
+              }}
+              managedModelCount={diarizationManagedModels.length}
+              readyManagedModelCount={readyDiarizationManagedModelCount}
+              canLoadAnyManagedModels={canLoadAnyDiarizationManagedModels}
+              canUnloadAnyManagedModels={canUnloadAnyDiarizationManagedModels}
+              isManagedModelActionBusy={isDiarizationManagedModelActionBusy}
+              onLoadAllManagedModels={handleLoadAllDiarizationManagedModels}
+              onUnloadAllManagedModels={handleUnloadAllDiarizationManagedModels}
+              onCreated={handleCreatedDiarizationRecord}
+            />
+          )}
         </>
       )}
 

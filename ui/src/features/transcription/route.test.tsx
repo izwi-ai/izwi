@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { ComponentProps } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -16,6 +17,7 @@ const apiMocks = vi.hoisted(() => ({
   regenerateTranscriptionSummary: vi.fn(),
   createTranscriptionRecord: vi.fn(),
   createTranscriptionRecordStream: vi.fn(),
+  createDiarizationRecord: vi.fn(),
 }));
 
 const hookMocks = vi.hoisted(() => ({
@@ -64,6 +66,7 @@ vi.mock("@/api", () => ({
     regenerateTranscriptionSummary: apiMocks.regenerateTranscriptionSummary,
     createTranscriptionRecord: apiMocks.createTranscriptionRecord,
     createTranscriptionRecordStream: apiMocks.createTranscriptionRecordStream,
+    createDiarizationRecord: apiMocks.createDiarizationRecord,
   },
 }));
 
@@ -75,7 +78,9 @@ vi.mock("@/features/models/components/RouteModelModal", () => ({
   RouteModelModal: componentMocks.routeModelModal,
 }));
 
-const baseProps = {
+type TranscriptionPageTestProps = ComponentProps<typeof TranscriptionPage>;
+
+const baseProps: TranscriptionPageTestProps = {
   models: [],
   selectedModel: null,
   loading: false,
@@ -130,9 +135,59 @@ describe("TranscriptionPage detail route", () => {
     apiMocks.regenerateTranscriptionSummary.mockReset();
     apiMocks.createTranscriptionRecord.mockReset();
     apiMocks.createTranscriptionRecordStream.mockReset();
+    apiMocks.createDiarizationRecord.mockReset();
     hookMocks.useRouteModelSelection.mockReset();
     componentMocks.routeModelModal.mockClear();
-    baseProps.onSelect.mockReset();
+    baseProps.models = [
+      {
+        variant: "Parakeet-TDT-0.6B-v3",
+        status: "ready",
+        local_path: "/models/parakeet",
+        size_bytes: null,
+        download_progress: null,
+        error_message: null,
+      },
+      {
+        variant: "diar_streaming_sortformer_4spk-v2.1",
+        status: "ready",
+        local_path: "/models/diar",
+        size_bytes: null,
+        download_progress: null,
+        error_message: null,
+      },
+      {
+        variant: "Whisper-Large-v3-Turbo",
+        status: "ready",
+        local_path: "/models/whisper",
+        size_bytes: null,
+        download_progress: null,
+        error_message: null,
+      },
+      {
+        variant: "Qwen3-ForcedAligner-0.6B",
+        status: "ready",
+        local_path: "/models/aligner",
+        size_bytes: null,
+        download_progress: null,
+        error_message: null,
+      },
+      {
+        variant: "Qwen3.5-4B",
+        status: "ready",
+        local_path: "/models/qwen",
+        size_bytes: null,
+        download_progress: null,
+        error_message: null,
+      },
+    ];
+    baseProps.selectedModel = "Parakeet-TDT-0.6B-v3";
+    baseProps.onDownload = vi.fn();
+    baseProps.onCancelDownload = vi.fn();
+    baseProps.onLoad = vi.fn();
+    baseProps.onUnload = vi.fn();
+    baseProps.onDelete = vi.fn();
+    baseProps.onSelect = vi.fn();
+    baseProps.onError = vi.fn();
 
     apiMocks.transcriptionRecordAudioUrl.mockReturnValue("/audio/transcription.wav");
     apiMocks.listTranscriptionRecords.mockResolvedValue([]);
@@ -195,6 +250,9 @@ describe("TranscriptionPage detail route", () => {
         return new AbortController();
       },
     );
+    apiMocks.createDiarizationRecord.mockResolvedValue({
+      id: "diar-created-1",
+    });
     hookMocks.useRouteModelSelection.mockReturnValue({
       routeModels: [],
       resolvedSelectedModel: "Parakeet-TDT-0.6B-v3",
@@ -451,10 +509,34 @@ describe("TranscriptionPage detail route", () => {
     expect(
       await screen.findByRole("heading", { name: "New transcript" }),
     ).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "Transcription" })).toBeChecked();
+    expect(screen.getByRole("radio", { name: "Diarization" })).not.toBeChecked();
     expect(screen.getByText("Bring in a recording")).toBeInTheDocument();
     expect(screen.getByText("Review job settings")).toBeInTheDocument();
     expect(screen.getByText("Upload audio")).toBeInTheDocument();
     expect(screen.getByText("Stream results")).toBeInTheDocument();
+  });
+
+  it("switches modal content when selecting diarization from the mode radios", async () => {
+    renderRoute("/transcription");
+
+    await waitFor(() =>
+      expect(apiMocks.listTranscriptionRecords).toHaveBeenCalled(),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /New transcript/i }));
+    expect(
+      await screen.findByRole("heading", { name: "New transcript" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("radio", { name: "Diarization" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "New diarization" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "Diarization" })).toBeChecked();
+    expect(screen.getByText("Choose how to start")).toBeInTheDocument();
+    expect(screen.getByText("Review run settings")).toBeInTheDocument();
   });
 
   it("raises the model modal above the new transcript modal", async () => {
@@ -586,6 +668,64 @@ describe("TranscriptionPage detail route", () => {
     expect(
       await screen.findByRole("heading", { name: "Transcription Record" }),
     ).toBeInTheDocument();
+  });
+
+  it("creates a diarization record when diarization mode is selected in the modal", async () => {
+    apiMocks.getTranscriptionRecord.mockResolvedValue({
+      id: "diar-created-1",
+      created_at: 1,
+      model_id: "Parakeet-TDT-0.6B-v3",
+      aligner_model_id: null,
+      language: "English",
+      processing_status: "processing",
+      processing_error: null,
+      duration_secs: null,
+      processing_time_ms: 0,
+      rtf: null,
+      audio_mime_type: "audio/wav",
+      audio_filename: "meeting.wav",
+      transcription: "",
+      segments: [],
+      words: [],
+      summary_status: "not_requested",
+      summary_model_id: null,
+      summary_text: null,
+      summary_error: null,
+      summary_updated_at: null,
+    });
+
+    renderRoute("/transcription");
+
+    await waitFor(() =>
+      expect(apiMocks.listTranscriptionRecords).toHaveBeenCalled(),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /New transcript/i }));
+    fireEvent.click(await screen.findByRole("radio", { name: "Diarization" }));
+
+    const fileInput = document.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement | null;
+    expect(fileInput).not.toBeNull();
+
+    fireEvent.change(fileInput!, {
+      target: {
+        files: [new File(["audio"], "meeting.wav", { type: "audio/wav" })],
+      },
+    });
+
+    await waitFor(() =>
+      expect(apiMocks.createDiarizationRecord).toHaveBeenCalledWith(
+        expect.objectContaining({
+          audio_filename: "meeting.wav",
+          model_id: "diar_streaming_sortformer_4spk-v2.1",
+          asr_model_id: "Whisper-Large-v3-Turbo",
+          aligner_model_id: "Qwen3-ForcedAligner-0.6B",
+          llm_model_id: "Qwen3.5-4B",
+        }),
+      ),
+    );
+    expect(apiMocks.createTranscriptionRecordStream).not.toHaveBeenCalled();
   });
 
   it("shows streamed transcript deltas on the detail page while processing", async () => {
