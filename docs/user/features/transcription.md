@@ -93,6 +93,8 @@ izwi transcribe audio.wav --language es
 4. Click **Transcribe**
 5. View, copy, or download the transcript
 
+> The Transcription workspace now also hosts diarization workflows. Use the mode switch in `/transcription` to open speaker-separated runs.
+
 ### Features
 
 - **Drag and drop** — Upload files easily

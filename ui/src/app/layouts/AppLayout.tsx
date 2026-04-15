@@ -68,16 +68,9 @@ const TOP_NAV_ITEMS: NavItem[] = [
   {
     id: "transcription",
     label: "Transcription",
-    description: "Input utility for audio workflows",
+    description: "Transcription and diarization workspace",
     icon: FileText,
     path: "/transcription",
-  },
-  {
-    id: "diarization",
-    label: "Diarization",
-    description: "Speaker segmentation with timestamps",
-    icon: Users,
-    path: "/diarization",
   },
 ];
 
