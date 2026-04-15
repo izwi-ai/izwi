@@ -46,6 +46,7 @@ interface DiarizationPageProps {
   onDelete: (variant: string) => void;
   onSelect: (variant: string) => void;
   onError: (message: string) => void;
+  routeBasePath?: string;
 }
 
 interface DiarizationModelGroup {
@@ -84,9 +85,24 @@ export function DiarizationPage({
   onDelete,
   onSelect,
   onError,
+  routeBasePath = "/diarization",
 }: DiarizationPageProps) {
   const { recordId } = useParams<{ recordId: string }>();
   const navigate = useNavigate();
+  const buildRoutePath = useCallback(
+    (targetRecordId?: string) => {
+      const basePath = targetRecordId
+        ? `${routeBasePath}/${targetRecordId}`
+        : routeBasePath;
+      if (routeBasePath !== "/transcription") {
+        return basePath;
+      }
+      const params = new URLSearchParams();
+      params.set("mode", "diarization");
+      return `${basePath}?${params.toString()}`;
+    },
+    [routeBasePath],
+  );
   const [isNewDiarizationModalOpen, setIsNewDiarizationModalOpen] =
     useState(false);
   const [isModelModalOpen, setIsModelModalOpen] = useState(false);
@@ -414,14 +430,14 @@ export function DiarizationPage({
 
   const handleOpenRecord = useCallback(
     (nextRecordId: string) => {
-      navigate(`/diarization/${nextRecordId}`);
+      navigate(buildRoutePath(nextRecordId));
     },
-    [navigate],
+    [buildRoutePath, navigate],
   );
 
   const handleCloseRecord = useCallback(() => {
-    navigate("/diarization");
-  }, [navigate]);
+    navigate(buildRoutePath());
+  }, [buildRoutePath, navigate]);
   const handleOpenNewDiarizationModal = useCallback(() => {
     setIsNewDiarizationModalOpen(true);
   }, []);
@@ -457,10 +473,10 @@ export function DiarizationPage({
   const handleCreatedRecord = useCallback(
     (createdRecord: DiarizationRecord) => {
       setLatestRecord(createdRecord);
-      navigate(`/diarization/${createdRecord.id}`);
+      navigate(buildRoutePath(createdRecord.id));
       void refreshHistory().catch(() => undefined);
     },
-    [navigate, refreshHistory],
+    [buildRoutePath, navigate, refreshHistory],
   );
 
   const handleDeleteRecord = useCallback(
@@ -468,13 +484,13 @@ export function DiarizationPage({
       await api.deleteDiarizationRecord(targetRecordId);
       await refreshHistory();
       if (recordId === targetRecordId) {
-        navigate("/diarization", { replace: true });
+        navigate(buildRoutePath(), { replace: true });
       }
       if (latestRecord?.id === targetRecordId) {
         setLatestRecord(null);
       }
     },
-    [latestRecord?.id, navigate, recordId, refreshHistory],
+    [buildRoutePath, latestRecord?.id, navigate, recordId, refreshHistory],
   );
 
   const handleSaveSpeakerCorrections = useCallback(
@@ -503,9 +519,9 @@ export function DiarizationPage({
       if (latestRecord?.id === targetRecordId) {
         setLatestRecord(rerunRecord);
       }
-      navigate(`/diarization/${rerunRecord.id}`);
+      navigate(buildRoutePath(rerunRecord.id));
     },
-    [latestRecord?.id, navigate, refreshHistory],
+    [buildRoutePath, latestRecord?.id, navigate, refreshHistory],
   );
 
   const handleCancelProcessing = useCallback(
