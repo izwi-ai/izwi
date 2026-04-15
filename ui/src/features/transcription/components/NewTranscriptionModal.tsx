@@ -18,11 +18,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import type { SpeechTextCreationMode } from "@/features/speech-text/creationMode";
 
 interface NewTranscriptionModalProps {
   isOpen: boolean;
   onClose: () => void;
   blockOutsideDismiss?: boolean;
+  selectedMode?: SpeechTextCreationMode;
+  onSelectMode?: (mode: SpeechTextCreationMode) => void;
   selectedModel: string | null;
   selectedModelReady: boolean;
   timestampAlignerModelId: string | null;
@@ -45,6 +48,8 @@ export function NewTranscriptionModal({
   isOpen,
   onClose,
   blockOutsideDismiss = false,
+  selectedMode = "transcription",
+  onSelectMode,
   selectedModel,
   selectedModelReady,
   timestampAlignerModelId,
@@ -257,6 +262,7 @@ export function NewTranscriptionModal({
   const alignerNeeded = includeTimestamps;
   const alignerReadyForUse =
     !includeTimestamps || (!!timestampAlignerModelId && timestampAlignerReady);
+  const isTranscriptionMode = selectedMode === "transcription";
 
   return (
     <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
@@ -286,6 +292,33 @@ export function NewTranscriptionModal({
             Upload a recording, choose whether results should stream live, and
             open the job on its own page as soon as the file is accepted.
           </DialogDescription>
+          {onSelectMode ? (
+            <fieldset className="mt-3">
+              <legend className="sr-only">Choose creation mode</legend>
+              <div className="inline-flex items-center gap-4">
+                <label className="inline-flex cursor-pointer items-center gap-2 text-sm text-[var(--text-primary)]">
+                  <input
+                    type="radio"
+                    name="speech-text-create-mode"
+                    checked={isTranscriptionMode}
+                    onChange={() => onSelectMode("transcription")}
+                    className="h-4 w-4 border-[var(--border-strong)] text-[var(--status-info-text)]"
+                  />
+                  Transcription
+                </label>
+                <label className="inline-flex cursor-pointer items-center gap-2 text-sm text-[var(--text-primary)]">
+                  <input
+                    type="radio"
+                    name="speech-text-create-mode"
+                    checked={!isTranscriptionMode}
+                    onChange={() => onSelectMode("diarization")}
+                    className="h-4 w-4 border-[var(--border-strong)] text-[var(--status-info-text)]"
+                  />
+                  Diarization
+                </label>
+              </div>
+            </fieldset>
+          ) : null}
         </div>
 
         <div className="grid lg:grid-cols-[minmax(0,1.08fr),minmax(18rem,0.84fr)]">

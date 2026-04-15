@@ -4,7 +4,6 @@ import {
   Route,
   Routes,
   useLocation,
-  useParams,
 } from "react-router-dom";
 import { routeIdFromPathname, trackRouteViewed } from "@/app/analytics/events";
 import { AppLayout } from "@/app/layouts/AppLayout";
@@ -82,14 +81,6 @@ function RouteLoadingFallback() {
 
 function withSuspense(children: ReactNode) {
   return <Suspense fallback={<RouteLoadingFallback />}>{children}</Suspense>;
-}
-
-export function LegacyDiarizationRedirect() {
-  const { recordId } = useParams<{ recordId?: string }>();
-  const targetPath = recordId
-    ? `/transcription/${encodeURIComponent(recordId)}`
-    : "/transcription";
-  return <Navigate to={`${targetPath}?mode=diarization`} replace />;
 }
 
 export function AppRoutes() {
@@ -233,14 +224,6 @@ export function AppRoutes() {
         <Route
           path="/transcription/:recordId"
           element={withSuspense(<SpeechTextPage {...pageProps} />)}
-        />
-        <Route
-          path="/diarization"
-          element={<LegacyDiarizationRedirect />}
-        />
-        <Route
-          path="/diarization/:recordId"
-          element={<LegacyDiarizationRedirect />}
         />
         <Route path="/chat" element={withSuspense(<ChatPage {...pageProps} />)} />
         <Route
