@@ -512,7 +512,7 @@ describe("TranscriptionPage detail route", () => {
     expect(screen.getByRole("radio", { name: "Transcription" })).toBeChecked();
     expect(screen.getByRole("radio", { name: "Diarization" })).not.toBeChecked();
     expect(screen.getByText("Bring in a recording")).toBeInTheDocument();
-    expect(screen.getByText("Review job settings")).toBeInTheDocument();
+    expect(screen.getByText("Model readiness")).toBeInTheDocument();
     expect(screen.getByText("Upload audio")).toBeInTheDocument();
     expect(screen.getByText("Stream results")).toBeInTheDocument();
   });
@@ -536,7 +536,7 @@ describe("TranscriptionPage detail route", () => {
     ).toBeInTheDocument();
     expect(screen.getByRole("radio", { name: "Diarization" })).toBeChecked();
     expect(screen.getByText("Choose how to start")).toBeInTheDocument();
-    expect(screen.getByText("Review run settings")).toBeInTheDocument();
+    expect(screen.getByText("Model readiness")).toBeInTheDocument();
   });
 
   it("raises the model modal above the new transcript modal", async () => {
@@ -703,7 +703,12 @@ describe("TranscriptionPage detail route", () => {
     fireEvent.click(screen.getByRole("button", { name: /New transcript/i }));
     fireEvent.click(await screen.findByRole("radio", { name: "Diarization" }));
 
-    const fileInput = document.querySelector(
+    await screen.findByRole("heading", { name: "New diarization" });
+    const uploadButtons = screen.getAllByRole("button", {
+      name: "Upload audio file",
+    });
+    const activeUploadButton = uploadButtons[uploadButtons.length - 1];
+    const fileInput = activeUploadButton?.querySelector(
       'input[type="file"]',
     ) as HTMLInputElement | null;
     expect(fileInput).not.toBeNull();

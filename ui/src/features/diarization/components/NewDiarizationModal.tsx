@@ -15,6 +15,8 @@ import {
   DialogDescription,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Label } from "@/components/ui/label";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { StatusBadge } from "@/components/ui/status-badge";
 import type { SpeechTextCreationMode } from "@/features/speech-text/creationMode";
 
@@ -260,6 +262,7 @@ async function transcodeToWav(
 interface NewDiarizationModalProps {
   isOpen: boolean;
   onClose: () => void;
+  renderInDialog?: boolean;
   selectedMode?: SpeechTextCreationMode;
   onSelectMode?: (mode: SpeechTextCreationMode) => void;
   selectedModel: string | null;
@@ -283,6 +286,7 @@ interface NewDiarizationModalProps {
 export function NewDiarizationModal({
   isOpen,
   onClose,
+  renderInDialog = true,
   selectedMode = "diarization",
   onSelectMode,
   selectedModel,
@@ -530,77 +534,75 @@ export function NewDiarizationModal({
   const canRunReadinessAction = readinessActionIsUnload
     ? canUnloadAnyManagedModels
     : canLoadAnyManagedModels;
-  const isDiarizationMode = selectedMode === "diarization";
 
-  return (
-    <Dialog
-      open={isOpen}
-      onOpenChange={(open) => {
-        if (!open && !isSubmitting && !isRecording) {
-          onClose();
-        }
-      }}
-    >
-      <DialogContent className="max-w-[52rem] overflow-hidden border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0">
-        <div className="border-b border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-5 py-5 sm:px-6">
-          <DialogTitle className="text-xl font-semibold tracking-tight text-[var(--text-primary)]">
-            New diarization
-          </DialogTitle>
-          <DialogDescription className="mt-1 max-w-3xl text-[13px] leading-5 text-[var(--text-muted)]">
-            Upload a recording or capture from your microphone, then open the
-            diarization run on its own page as soon as the upload is accepted.
-          </DialogDescription>
-          {onSelectMode ? (
-            <fieldset className="mt-3">
-              <legend className="sr-only">Choose creation mode</legend>
-              <div className="inline-flex items-center gap-4">
-                <label className="inline-flex cursor-pointer items-center gap-2 text-sm text-[var(--text-primary)]">
-                  <input
-                    type="radio"
-                    name="speech-text-create-mode"
-                    checked={!isDiarizationMode}
-                    onChange={() => onSelectMode("transcription")}
-                    className="h-4 w-4 border-[var(--border-strong)] text-[var(--status-info-text)]"
-                  />
-                  Transcription
-                </label>
-                <label className="inline-flex cursor-pointer items-center gap-2 text-sm text-[var(--text-primary)]">
-                  <input
-                    type="radio"
-                    name="speech-text-create-mode"
-                    checked={isDiarizationMode}
-                    onChange={() => onSelectMode("diarization")}
-                    className="h-4 w-4 border-[var(--border-strong)] text-[var(--status-info-text)]"
-                  />
-                  Diarization
-                </label>
-              </div>
-            </fieldset>
-          ) : null}
-        </div>
-
-        <div className="grid lg:grid-cols-[minmax(0,1.1fr),minmax(19rem,0.9fr)]">
-          <div className="border-b border-[var(--border-muted)] px-5 py-5 sm:px-6 lg:border-b-0 lg:border-r">
-            <div className="mb-4 flex items-start justify-between gap-4">
-              <div>
-                <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[var(--text-muted)]">
-                  Audio source
-                </div>
-                <h3 className="mt-1.5 text-xl font-semibold tracking-tight text-[var(--text-primary)]">
-                  Choose how to start
-                </h3>
-                <p className="mt-1.5 max-w-lg text-[13px] leading-5 text-[var(--text-muted)]">
-                  Bring in a saved clip or capture a fresh conversation, then
-                  move straight into the dedicated diarization record page.
-                </p>
-              </div>
-              {isSubmitting ? (
-                <div className="inline-flex items-center gap-2 rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)]">
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  Creating run
-                </div>
-              ) : null}
+  const modalBody = (
+    <>
+      <div className="border-b border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-5 py-5 sm:px-6">
+        <DialogTitle className="text-xl font-semibold tracking-tight text-[var(--text-primary)]">
+          New diarization
+        </DialogTitle>
+        <DialogDescription className="mt-1 max-w-3xl text-[13px] leading-5 text-[var(--text-muted)]">
+          Upload a recording or capture from your microphone, then open the
+          diarization run on its own page as soon as the upload is accepted.
+        </DialogDescription>
+        {onSelectMode ? (
+          <RadioGroup
+            value={selectedMode}
+            onValueChange={(value) =>
+              onSelectMode(value as SpeechTextCreationMode)
+            }
+            className="mt-3 flex gap-3"
+          >
+            <div className="inline-flex items-center gap-2 rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-1.5 text-sm">
+              <RadioGroupItem
+                id="speech-text-mode-transcription"
+                value="transcription"
+              />
+              <Label
+                htmlFor="speech-text-mode-transcription"
+                className="cursor-pointer text-[var(--text-primary)]"
+              >
+                Transcription
+              </Label>
             </div>
+            <div className="inline-flex items-center gap-2 rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-1.5 text-sm">
+              <RadioGroupItem
+                id="speech-text-mode-diarization"
+                value="diarization"
+              />
+              <Label
+                htmlFor="speech-text-mode-diarization"
+                className="cursor-pointer text-[var(--text-primary)]"
+              >
+                Diarization
+              </Label>
+            </div>
+          </RadioGroup>
+        ) : null}
+      </div>
+
+      <div className="grid lg:grid-cols-[minmax(0,1.1fr),minmax(19rem,0.9fr)]">
+        <div className="border-b border-[var(--border-muted)] px-5 py-5 sm:px-6 lg:border-b-0 lg:border-r">
+          <div className="mb-4 flex items-start justify-between gap-4">
+            <div>
+              <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[var(--text-muted)]">
+                Audio source
+              </div>
+              <h3 className="mt-1.5 text-xl font-semibold tracking-tight text-[var(--text-primary)]">
+                Choose how to start
+              </h3>
+              <p className="mt-1.5 max-w-lg text-[13px] leading-5 text-[var(--text-muted)]">
+                Bring in a saved clip or capture a fresh conversation, then
+                move straight into the dedicated diarization record page.
+              </p>
+            </div>
+            {isSubmitting ? (
+              <div className="inline-flex items-center gap-2 rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)]">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                Creating run
+              </div>
+            ) : null}
+          </div>
 
             <div className="grid gap-3 sm:grid-cols-2">
               <button
@@ -698,19 +700,8 @@ export function NewDiarizationModal({
             </div>
           </div>
 
-          <div className="px-6 py-5 sm:px-6">
-            <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[var(--text-muted)]">
-              Configuration
-            </div>
-            <h3 className="mt-1.5 text-xl font-semibold tracking-tight text-[var(--text-primary)]">
-              Review run settings
-            </h3>
-            <p className="mt-1.5 max-w-sm text-[13px] leading-5 text-[var(--text-muted)]">
-              Keep setup brief: set the expected speaker range, tune the timing
-              windows, and confirm the diarization pipeline is ready.
-            </p>
-
-            <div className="mt-4 space-y-2.5">
+        <div className="px-6 py-5 sm:px-6">
+          <div className="space-y-2.5">
               <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
                 <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--text-muted)]">
                   Speaker range
@@ -827,18 +818,36 @@ export function NewDiarizationModal({
               ) : null}
             </div>
 
-            <div className="mt-4 flex justify-end">
-              <Button
-                type="button"
-                variant="ghost"
-                onClick={onClose}
-                disabled={isSubmitting || isRecording}
-              >
-                Cancel
-              </Button>
-            </div>
+          <div className="mt-4 flex justify-end">
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={onClose}
+              disabled={isSubmitting || isRecording}
+            >
+              Cancel
+            </Button>
           </div>
         </div>
+      </div>
+    </>
+  );
+
+  if (!renderInDialog) {
+    return modalBody;
+  }
+
+  return (
+    <Dialog
+      open={isOpen}
+      onOpenChange={(open) => {
+        if (!open && !isSubmitting && !isRecording) {
+          onClose();
+        }
+      }}
+    >
+      <DialogContent className="max-w-[52rem] overflow-hidden border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0">
+        {modalBody}
       </DialogContent>
     </Dialog>
   );

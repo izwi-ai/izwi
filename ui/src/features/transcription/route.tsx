@@ -9,6 +9,7 @@ import {
 } from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { VIEW_CONFIGS } from "@/types";
 import { NewTranscriptionModal } from "@/features/transcription/components/NewTranscriptionModal";
 import { NewDiarizationModal } from "@/features/diarization/components/NewDiarizationModal";
@@ -28,6 +29,7 @@ import type { SpeechTextCreationMode } from "@/features/speech-text/creationMode
 import { useTranscriptionHistory } from "@/features/transcription/hooks/useTranscriptionHistory";
 import { useTranscriptionRecord } from "@/features/transcription/hooks/useTranscriptionRecord";
 import { normalizeProcessingStatus } from "@/features/transcription/playground/support";
+import { AnimatePresence, motion } from "framer-motion";
 import { Settings2 } from "lucide-react";
 
 const TRANSCRIPTION_PREFERRED_SUMMARY_MODELS = ["Qwen3.5-4B"] as const;
@@ -667,86 +669,129 @@ export function TranscriptionPage({
             }}
           />
 
-          {newSpeechTextMode === "transcription" ? (
-            <NewTranscriptionModal
-              isOpen={isNewTranscriptionModalOpen}
-              onClose={handleCloseNewTranscriptionModal}
-              blockOutsideDismiss={isModelModalOpen}
-              selectedMode={newSpeechTextMode}
-              onSelectMode={setNewSpeechTextMode}
-              selectedModel={resolvedSelectedModel}
-              selectedModelReady={selectedModelReady}
-              timestampAlignerModelId={resolvedAlignerModel}
-              timestampAlignerReady={timestampAlignerReady}
-              onModelRequired={() => {
-                requestModel();
-                onError("Select and load an ASR model to start transcribing.");
+          <Dialog
+            open={isNewTranscriptionModalOpen}
+            onOpenChange={(open) => {
+              if (!open) {
+                handleCloseNewTranscriptionModal();
+              }
+            }}
+          >
+            <DialogContent
+              className={`overflow-hidden border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0 ${
+                newSpeechTextMode === "diarization"
+                  ? "max-w-[52rem]"
+                  : "max-w-[46rem]"
+              }`}
+              onEscapeKeyDown={(event) => {
+                if (isModelModalOpen) {
+                  event.preventDefault();
+                }
               }}
-              onTimestampAlignerRequired={() => {
-                openModelManager();
-                onError("Load the timestamp aligner model to enable timestamps.");
+              onPointerDownOutside={(event) => {
+                if (isModelModalOpen) {
+                  event.preventDefault();
+                }
               }}
-              onCreated={async (createdRecord: TranscriptionRecord) => {
-                setStreamingRecord(createdRecord);
-                await refreshHistory().catch(() => undefined);
-                navigate(`/transcription/${createdRecord.id}`);
+              onInteractOutside={(event) => {
+                if (isModelModalOpen) {
+                  event.preventDefault();
+                }
               }}
-              onStreamingStart={() => {
-                setStreamingRecord((current) =>
-                  current
-                    ? {
-                        ...current,
-                        processing_status: "processing",
-                      }
-                    : current,
-                );
-              }}
-              onStreamingDelta={(delta) => {
-                setStreamingRecord((current) =>
-                  current
-                    ? {
-                        ...current,
-                        processing_status: "processing",
-                        transcription: `${current.transcription}${delta}`,
-                      }
-                    : current,
-                );
-              }}
-              onStreamingFinal={(finalRecord) => {
-                setStreamingRecord(finalRecord);
-              }}
-              onStreamingError={() => {
-                void refreshRecord();
-              }}
-            />
-          ) : (
-            <NewDiarizationModal
-              isOpen={isNewTranscriptionModalOpen}
-              onClose={handleCloseNewTranscriptionModal}
-              selectedMode={newSpeechTextMode}
-              onSelectMode={setNewSpeechTextMode}
-              selectedModel={resolvedDiarizationModel}
-              selectedModelReady={diarizationModelReady}
-              pipelineAsrModelId={resolvedDiarizationAsrModel}
-              pipelineAlignerModelId={resolvedDiarizationAlignerModel}
-              pipelineLlmModelId={resolvedDiarizationLlmModel}
-              pipelineModelsReady={diarizationPipelineModelsReady}
-              onModelRequired={() => {
-                onError("Select and load a diarization model to start.");
-              }}
-              onPipelineModelsRequired={() => {
-                onError("Load ASR and forced aligner models before diarization.");
-              }}
-              managedModelCount={diarizationManagedModels.length}
-              readyManagedModelCount={readyDiarizationManagedModelCount}
-              canLoadAnyManagedModels={canLoadAnyDiarizationManagedModels}
-              canUnloadAnyManagedModels={canUnloadAnyDiarizationManagedModels}
-              isManagedModelActionBusy={isDiarizationManagedModelActionBusy}
-              onLoadAllManagedModels={handleLoadAllDiarizationManagedModels}
-              onUnloadAllManagedModels={handleUnloadAllDiarizationManagedModels}
-              onCreated={handleCreatedDiarizationRecord}
-            />
-          )}
+            >
+              <AnimatePresence initial={false} mode="wait">
+                <motion.div
+                  key={newSpeechTextMode}
+                  initial={{ opacity: 0, y: 8 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -6 }}
+                  transition={{ duration: 0.18, ease: "easeOut" }}
+                >
+                  {newSpeechTextMode === "transcription" ? (
+                    <NewTranscriptionModal
+                      isOpen={isNewTranscriptionModalOpen}
+                      onClose={handleCloseNewTranscriptionModal}
+                      renderInDialog={false}
+                      selectedMode={newSpeechTextMode}
+                      onSelectMode={setNewSpeechTextMode}
+                      selectedModel={resolvedSelectedModel}
+                      selectedModelReady={selectedModelReady}
+                      timestampAlignerModelId={resolvedAlignerModel}
+                      timestampAlignerReady={timestampAlignerReady}
+                      onModelRequired={() => {
+                        requestModel();
+                        onError("Select and load an ASR model to start transcribing.");
+                      }}
+                      onTimestampAlignerRequired={() => {
+                        openModelManager();
+                        onError("Load the timestamp aligner model to enable timestamps.");
+                      }}
+                      onCreated={async (createdRecord: TranscriptionRecord) => {
+                        setStreamingRecord(createdRecord);
+                        await refreshHistory().catch(() => undefined);
+                        navigate(`/transcription/${createdRecord.id}`);
+                      }}
+                      onStreamingStart={() => {
+                        setStreamingRecord((current) =>
+                          current
+                            ? {
+                                ...current,
+                                processing_status: "processing",
+                              }
+                            : current,
+                        );
+                      }}
+                      onStreamingDelta={(delta) => {
+                        setStreamingRecord((current) =>
+                          current
+                            ? {
+                                ...current,
+                                processing_status: "processing",
+                                transcription: `${current.transcription}${delta}`,
+                              }
+                            : current,
+                        );
+                      }}
+                      onStreamingFinal={(finalRecord) => {
+                        setStreamingRecord(finalRecord);
+                      }}
+                      onStreamingError={() => {
+                        void refreshRecord();
+                      }}
+                    />
+                  ) : (
+                    <NewDiarizationModal
+                      isOpen={isNewTranscriptionModalOpen}
+                      onClose={handleCloseNewTranscriptionModal}
+                      renderInDialog={false}
+                      selectedMode={newSpeechTextMode}
+                      onSelectMode={setNewSpeechTextMode}
+                      selectedModel={resolvedDiarizationModel}
+                      selectedModelReady={diarizationModelReady}
+                      pipelineAsrModelId={resolvedDiarizationAsrModel}
+                      pipelineAlignerModelId={resolvedDiarizationAlignerModel}
+                      pipelineLlmModelId={resolvedDiarizationLlmModel}
+                      pipelineModelsReady={diarizationPipelineModelsReady}
+                      onModelRequired={() => {
+                        onError("Select and load a diarization model to start.");
+                      }}
+                      onPipelineModelsRequired={() => {
+                        onError("Load ASR and forced aligner models before diarization.");
+                      }}
+                      managedModelCount={diarizationManagedModels.length}
+                      readyManagedModelCount={readyDiarizationManagedModelCount}
+                      canLoadAnyManagedModels={canLoadAnyDiarizationManagedModels}
+                      canUnloadAnyManagedModels={canUnloadAnyDiarizationManagedModels}
+                      isManagedModelActionBusy={isDiarizationManagedModelActionBusy}
+                      onLoadAllManagedModels={handleLoadAllDiarizationManagedModels}
+                      onUnloadAllManagedModels={handleUnloadAllDiarizationManagedModels}
+                      onCreated={handleCreatedDiarizationRecord}
+                    />
+                  )}
+                </motion.div>
+              </AnimatePresence>
+            </DialogContent>
+          </Dialog>
         </>
       )}
 
