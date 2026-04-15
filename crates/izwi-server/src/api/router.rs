@@ -447,6 +447,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unified_transcription_job_read_routes_support_both_job_kinds() {
+        let (app, temp_dir) = test_api_app(
+            "unified_transcription_job_read_routes_support_both_job_kinds",
+            true,
+        );
+
+        let transcription_create = send_request(
+            app.clone(),
+            build_request(Method::POST, "/v1/transcriptions", Some("{\"audio_base64\":\"AQ==\"}")),
+        )
+        .await;
+        assert_eq!(transcription_create.status(), StatusCode::ACCEPTED);
+        let transcription_body = read_json(transcription_create).await;
+        let transcription_id = transcription_body
+            .get("id")
+            .and_then(|value| value.as_str())
+            .expect("transcription id should exist")
+            .to_string();
+
+        let diarization_create = send_request(
+            app.clone(),
+            build_request(Method::POST, "/v1/diarizations", Some("{\"audio_base64\":\"AQ==\"}")),
+        )
+        .await;
+        assert_eq!(diarization_create.status(), StatusCode::ACCEPTED);
+        let diarization_body = read_json(diarization_create).await;
+        let diarization_id = diarization_body
+            .get("id")
+            .and_then(|value| value.as_str())
+            .expect("diarization id should exist")
+            .to_string();
+
+        let unified_list = send_request(
+            app.clone(),
+            build_request(
+                Method::GET,
+                "/v1/transcriptions/jobs?job_kind=all",
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(unified_list.status(), StatusCode::OK);
+        let list_payload = read_json(unified_list).await;
+        let records = list_payload
+            .get("records")
+            .and_then(|value| value.as_array())
+            .expect("records array should exist");
+        let kinds = records
+            .iter()
+            .filter_map(|record| record.get("kind").and_then(|value| value.as_str()))
+            .collect::<Vec<_>>();
+        assert!(
+            kinds.contains(&"transcription"),
+            "unified list should include transcription records"
+        );
+        assert!(
+            kinds.contains(&"diarization"),
+            "unified list should include diarization records"
+        );
+
+        let unified_transcription_record = send_request(
+            app.clone(),
+            build_request(
+                Method::GET,
+                format!(
+                    "/v1/transcriptions/jobs/{}?job_kind=transcription",
+                    transcription_id
+                )
+                .as_str(),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(unified_transcription_record.status(), StatusCode::OK);
+        let transcription_payload = read_json(unified_transcription_record).await;
+        assert_eq!(
+            transcription_payload
+                .get("kind")
+                .and_then(|value| value.as_str()),
+            Some("transcription")
+        );
+
+        let unified_diarization_record = send_request(
+            app.clone(),
+            build_request(
+                Method::GET,
+                format!(
+                    "/v1/transcriptions/jobs/{}?job_kind=diarization",
+                    diarization_id
+                )
+                .as_str(),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(unified_diarization_record.status(), StatusCode::OK);
+        let diarization_payload = read_json(unified_diarization_record).await;
+        assert_eq!(
+            diarization_payload
+                .get("kind")
+                .and_then(|value| value.as_str()),
+            Some("diarization")
+        );
+
+        let transcription_audio = send_request(
+            app.clone(),
+            build_request(
+                Method::GET,
+                format!(
+                    "/v1/transcriptions/jobs/{}/audio?job_kind=transcription",
+                    transcription_id
+                )
+                .as_str(),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(transcription_audio.status(), StatusCode::OK);
+
+        let diarization_audio = send_request(
+            app.clone(),
+            build_request(
+                Method::GET,
+                format!(
+                    "/v1/transcriptions/jobs/{}/audio?job_kind=diarization",
+                    diarization_id
+                )
+                .as_str(),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(diarization_audio.status(), StatusCode::OK);
+
+        // Compatibility check: canonical diarization route remains available.
+        let legacy_diarization_get = send_request(
+            app,
+            build_request(
+                Method::GET,
+                format!("/v1/diarizations/{}", diarization_id).as_str(),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(legacy_diarization_get.status(), StatusCode::OK);
+
+        drop(temp_dir);
+    }
+
+    #[tokio::test]
     async fn canonical_history_mutation_routes_still_resolve() {
         let (app, temp_dir) = test_api_app("canonical_history_mutation_routes_still_resolve", true);
 
@@ -853,6 +1003,13 @@ mod tests {
             expected_status,
             "unexpected status for {path}"
         );
+    }
+
+    async fn read_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        serde_json::from_slice(bytes.as_ref()).expect("response should be valid json")
     }
 
     fn build_request(method: Method, path: &str, body: Option<&str>) -> Request<Body> {
