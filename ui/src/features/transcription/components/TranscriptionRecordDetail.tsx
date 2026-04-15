@@ -1,7 +1,6 @@
 import { useMemo, useState } from "react";
 import {
   AlertTriangle,
-  ArrowLeft,
   Check,
   Copy,
   Download,
@@ -21,6 +20,7 @@ import {
 } from "@/components/ui/dialog";
 import { TranscriptionExportDialog } from "@/features/transcription/components/TranscriptionExportDialog";
 import { TranscriptionReviewWorkspace } from "@/features/transcription/components/TranscriptionReviewWorkspace";
+import { SpeechTextRecordShell } from "@/features/speech-text/components/SpeechTextRecordShell";
 import {
   formatAudioDuration,
   formatCreatedAt,
@@ -105,35 +105,22 @@ export function TranscriptionRecordDetail({
   }
 
   return (
-    <div className="space-y-5">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0">
-          {onBack ? (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="mb-4 h-10 gap-2 rounded-full border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-4 text-sm font-medium text-[var(--text-secondary)] shadow-sm hover:bg-[var(--bg-surface-1)]"
-              onClick={onBack}
-            >
-              <ArrowLeft className="h-4 w-4" />
-              Back to transcriptions
-            </Button>
+    <SpeechTextRecordShell
+      title={record?.audio_filename || record?.model_id || "Transcription record"}
+      onBack={onBack}
+      backLabel="Back to transcriptions"
+      metadata={
+        <>
+          {record ? <span>{formatCreatedAt(record.created_at)}</span> : null}
+          {record?.duration_secs != null ? (
+            <span>{formatAudioDuration(record.duration_secs)}</span>
           ) : null}
-          <h2 className="truncate text-2xl font-semibold tracking-tight text-[var(--text-primary)]">
-            {record?.audio_filename || record?.model_id || "Transcription record"}
-          </h2>
-          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-[var(--text-muted)]">
-            {record ? <span>{formatCreatedAt(record.created_at)}</span> : null}
-            {record?.duration_secs != null ? (
-              <span>{formatAudioDuration(record.duration_secs)}</span>
-            ) : null}
-            {record?.language ? <span>{record.language}</span> : null}
-            {record?.model_id ? <span>{record.model_id}</span> : null}
-          </div>
-        </div>
-
-        <div className="flex flex-wrap items-center justify-end gap-2">
+          {record?.language ? <span>{record.language}</span> : null}
+          {record?.model_id ? <span>{record.model_id}</span> : null}
+        </>
+      }
+      actions={
+        <>
           {onRegenerateSummary ? (
             <Button
               type="button"
@@ -196,40 +183,43 @@ export function TranscriptionRecordDetail({
               Delete
             </Button>
           ) : null}
-        </div>
-      </div>
+        </>
+      }
+      alerts={
+        <>
+          {error ? (
+            <Card className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]">
+              {error}
+            </Card>
+          ) : null}
 
-      {error ? (
-        <Card className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]">
-          {error}
-        </Card>
-      ) : null}
+          {statusMessage ? (
+            <Card
+              className={
+                processingStatus === "failed"
+                  ? "border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]"
+                  : "border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] p-4 text-sm text-[var(--status-warning-text)]"
+              }
+            >
+              <div className="flex items-start gap-3">
+                {processingStatus === "failed" ? (
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                ) : (
+                  <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin" />
+                )}
+                <p>{statusMessage}</p>
+              </div>
+            </Card>
+          ) : null}
 
-      {statusMessage ? (
-        <Card
-          className={
-            processingStatus === "failed"
-              ? "border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]"
-              : "border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] p-4 text-sm text-[var(--status-warning-text)]"
-          }
-        >
-          <div className="flex items-start gap-3">
-            {processingStatus === "failed" ? (
-              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-            ) : (
-              <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin" />
-            )}
-            <p>{statusMessage}</p>
-          </div>
-        </Card>
-      ) : null}
-
-      {summaryRefreshError ? (
-        <Card className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]">
-          {summaryRefreshError}
-        </Card>
-      ) : null}
-
+          {summaryRefreshError ? (
+            <Card className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]">
+              {summaryRefreshError}
+            </Card>
+          ) : null}
+        </>
+      }
+    >
       <TranscriptionReviewWorkspace
         record={record}
         audioUrl={audioUrl}
@@ -309,6 +299,6 @@ export function TranscriptionRecordDetail({
           </div>
         </DialogContent>
       </Dialog>
-    </div>
+    </SpeechTextRecordShell>
   );
 }
