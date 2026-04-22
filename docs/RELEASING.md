@@ -51,6 +51,7 @@ git push origin v0.1.0-alpha-1
 6. Verify release:
    - Open GitHub Actions and confirm the `Release` workflow runs for tag `v0.1.0-alpha-1`.
    - Open the GitHub Releases page and confirm all assets are attached.
+   - Confirm the generated release body includes the runtime support note describing current CPU / Metal / CUDA artifact scope.
 
 ## What the release workflow builds
 
@@ -64,6 +65,20 @@ For each OS runner, the workflow builds:
    - Linux: `.deb`
    - Windows: `NSIS .exe`
    - macOS: `.dmg`
+
+## Current backend truth for release artifacts
+
+GitHub Releases currently publish:
+
+1. macOS assets as the Metal-capable path for Apple Silicon hosts.
+2. Linux and Windows assets as CPU-focused release artifacts.
+
+GitHub Releases do **not** currently publish CUDA-enabled binaries.
+
+For NVIDIA hosts, the supported CUDA paths are:
+
+1. Linux source builds using `cargo build --release --features cuda`
+2. The Docker CUDA image/profile
 
 The desktop bundle build runs the UI build automatically via Tauri `beforeBuildCommand`, so `ui/dist` is rebuilt from source on each release run.
 
