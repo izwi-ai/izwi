@@ -518,20 +518,19 @@ fn browser_target(host: &str, port: u16, no_ui: bool) -> String {
 fn detect_platform() -> String {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
-    let mut features = vec![];
+    let mut backends = vec!["CPU"];
 
-    if cfg!(target_os = "macos") {
-        features.push("Metal");
+    if cfg!(feature = "metal") {
+        backends.push("Metal");
+    }
+    if cfg!(feature = "cuda") {
+        backends.push("CUDA");
     }
 
-    if std::env::var("CUDA_VISIBLE_DEVICES").is_ok() {
-        features.push("CUDA");
-    }
-
-    let feature_str = if features.is_empty() {
+    let feature_str = if backends.is_empty() {
         String::new()
     } else {
-        format!(" [{}]", features.join(", "))
+        format!(" [{}]", backends.join(", "))
     };
 
     format!("{}-{}{}", os, arch, feature_str)

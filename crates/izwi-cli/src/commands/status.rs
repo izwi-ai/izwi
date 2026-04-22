@@ -4,6 +4,41 @@ use crate::style::Theme;
 use crate::utils;
 use comfy_table::{Cell, CellAlignment, Color, Table};
 use console::style;
+use serde::Deserialize;
+
+#[derive(Debug, Default, Deserialize)]
+struct StatusHealthResponse {
+    status: Option<String>,
+    version: Option<String>,
+    runtime: Option<RuntimeBackendStatus>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RuntimeBackendStatus {
+    requested_backend: Option<String>,
+    requested_backend_available: Option<bool>,
+    selected_backend: Option<String>,
+    selection_source: Option<String>,
+    selection_reason: Option<String>,
+    compiled_backends: Option<CompiledBackendsStatus>,
+    detected_device: Option<DetectedDeviceStatus>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CompiledBackendsStatus {
+    cpu: bool,
+    metal: bool,
+    cuda: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DetectedDeviceStatus {
+    kind: Option<String>,
+    supports_bf16: Option<bool>,
+    has_unified_memory: Option<bool>,
+    recommended_batch_size: Option<usize>,
+    available_memory_bytes: Option<usize>,
+}
 
 pub async fn execute(
     detailed: bool,
@@ -34,9 +69,12 @@ async fn show_status(server: &str, detailed: bool) -> Result<()> {
     // Health check
     let health_resp = client.get(format!("{}/v1/health", server)).send().await;
 
-    match health_resp {
+    let health_details = match health_resp {
         Ok(resp) => {
-            if resp.status().is_success() {
+            let status = resp.status();
+            let health_details = resp.json::<StatusHealthResponse>().await.ok();
+
+            if status.is_success() {
                 println!(
                     "{}  Server: {}",
                     style("●").green(),
@@ -47,9 +85,11 @@ async fn show_status(server: &str, detailed: bool) -> Result<()> {
                     "{}  Server: {} (Status: {})",
                     style("●").red(),
                     style("Unhealthy").red(),
-                    resp.status()
+                    status
                 );
             }
+
+            health_details
         }
         Err(e) => {
             println!(
@@ -60,7 +100,7 @@ async fn show_status(server: &str, detailed: bool) -> Result<()> {
             );
             return Ok(());
         }
-    }
+    };
 
     // Get models status
     let models_resp = client
@@ -128,13 +168,88 @@ async fn show_status(server: &str, detailed: bool) -> Result<()> {
     if detailed {
         println!("\n{}", style("Server Info:").bold());
         println!("  Endpoint: {}", server);
-        println!("  Version:  {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "  Version:  {}",
+            health_details
+                .as_ref()
+                .and_then(|health| health.version.as_deref())
+                .unwrap_or(env!("CARGO_PKG_VERSION"))
+        );
         println!(
             "  Platform: {}-{}",
             std::env::consts::OS,
             std::env::consts::ARCH
         );
+
+        if let Some(runtime) = health_details.and_then(|health| health.runtime) {
+            println!("\n{}", style("Runtime Backend:").bold());
+            if let Some(requested) = runtime.requested_backend.as_deref() {
+                let availability = runtime
+                    .requested_backend_available
+                    .map(|available| if available { "yes" } else { "no" })
+                    .unwrap_or("unknown");
+                println!("  Requested: {}", requested);
+                println!("  Available: {}", availability);
+            }
+            if let Some(selected) = runtime.selected_backend.as_deref() {
+                println!("  Selected:  {}", selected);
+            }
+            if let Some(source) = runtime.selection_source.as_deref() {
+                println!("  Source:    {}", source);
+            }
+            if let Some(compiled) = runtime.compiled_backends.as_ref() {
+                println!("  Compiled:  {}", format_compiled_backends(compiled));
+            }
+            if let Some(device) = runtime.detected_device.as_ref() {
+                if let Some(kind) = device.kind.as_deref() {
+                    println!("  Device:    {}", kind);
+                }
+                if let Some(supports_bf16) = device.supports_bf16 {
+                    println!(
+                        "  BF16:      {}",
+                        if supports_bf16 { "yes" } else { "no" }
+                    );
+                }
+                if let Some(has_unified_memory) = device.has_unified_memory {
+                    println!(
+                        "  Unified:   {}",
+                        if has_unified_memory { "yes" } else { "no" }
+                    );
+                }
+                if let Some(batch_size) = device.recommended_batch_size {
+                    println!("  Batch:     {}", batch_size);
+                }
+                if let Some(memory_bytes) = device.available_memory_bytes {
+                    println!(
+                        "  Memory:    {}",
+                        humansize::format_size(memory_bytes, humansize::BINARY)
+                    );
+                }
+            }
+            if let Some(reason) = runtime.selection_reason.as_deref() {
+                println!("  Reason:    {}", reason);
+            }
+        }
     }
 
     Ok(())
+}
+
+fn format_compiled_backends(backends: &CompiledBackendsStatus) -> String {
+    let mut labels = Vec::new();
+    if backends.cpu {
+        labels.push("cpu");
+    }
+    if backends.metal {
+        labels.push("metal");
+    }
+    if backends.cuda {
+        labels.push("cuda");
+    }
+
+    if labels.is_empty() {
+        "none".to_string()
+    } else {
+        labels.join(", ")
+    }
 }

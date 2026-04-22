@@ -2,6 +2,19 @@ use crate::style::Theme;
 use clap::crate_version;
 use console::style;
 
+fn compiled_backends() -> Vec<&'static str> {
+    let mut backends = vec!["CPU"];
+
+    if cfg!(feature = "metal") {
+        backends.push("Metal");
+    }
+    if cfg!(feature = "cuda") {
+        backends.push("CUDA");
+    }
+
+    backends
+}
+
 pub fn execute(full: bool, theme: &Theme) {
     theme.print_banner();
 
@@ -21,15 +34,16 @@ pub fn execute(full: bool, theme: &Theme) {
             rustc_version_runtime::version().patch
         );
 
+        println!("\n{}", style("Compiled Backends:").bold());
+        for backend in compiled_backends() {
+            println!("  ✓ {}", backend);
+        }
+
         println!("\n{}", style("Features:").bold());
-        if cfg!(target_os = "macos") {
-            println!("  ✓ Metal GPU acceleration");
-        }
-        if std::env::var("CUDA_VISIBLE_DEVICES").is_ok() {
-            println!("  ✓ CUDA support");
-        }
         if cfg!(feature = "playback") {
             println!("  ✓ Audio playback");
+        } else {
+            println!("  (none)");
         }
 
         println!("\n{}", style("License:").bold());
