@@ -37,6 +37,17 @@ Izwi is a privacy-focused audio AI platform that runs entirely on your machine. 
 
 The server exposes OpenAI-compatible API routes under `/v1`.
 
+## Runtime Support Matrix
+
+Backend support depends on both the host and the artifact you install.
+
+- macOS on Apple Silicon: Metal is the recommended and stable GPU path.
+- Linux source builds: CUDA is supported when you build with `--features cuda` on a compatible NVIDIA host.
+- GitHub Release artifacts: currently CPU-only on Linux and Windows unless an asset explicitly says otherwise.
+- Docker CUDA profile: intended for NVIDIA Linux hosts, but treat it as preview until the build path is fully aligned.
+
+See the full [Runtime Support Matrix](https://izwiai.com/docs/support-matrix).
+
 ---
 
 ## Quick Install

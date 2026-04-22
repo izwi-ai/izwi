@@ -30,6 +30,7 @@ Izwi is a powerful, privacy-focused audio AI platform that runs entirely on your
 |---------|-------------|
 | [Getting Started](./getting-started.md) | Install Izwi and run your first command |
 | [Installation](./installation/index.md) | Platform-specific installation guides |
+| [Runtime Support Matrix](./support-matrix.md) | Supported OS, hardware, artifact, and API surfaces |
 | [Features](./features/index.md) | Learn about each feature in detail |
 | [Models](./models/index.md) | Understand and manage AI models |
 | [CLI Reference](./cli/index.md) | Complete command-line reference |
@@ -46,9 +47,9 @@ Izwi is a powerful, privacy-focused audio AI platform that runs entirely on your
 | **Windows** | Windows 10 | Windows 11 |
 | **RAM** | 8 GB | 16 GB+ |
 | **Storage** | 10 GB free | 50 GB+ free |
-| **GPU** | — | Apple Silicon / NVIDIA CUDA |
+| **GPU** | — | Apple Silicon / NVIDIA GPU (see support matrix) |
 
-> **Note:** Izwi is optimized for Apple Silicon Macs with Metal acceleration. CUDA support is available for NVIDIA GPUs.
+> **Note:** Izwi is optimized for Apple Silicon Macs with Metal acceleration. NVIDIA CUDA support exists in the runtime, but artifact-level support varies by source build, Docker image, and release package. See the [Runtime Support Matrix](./support-matrix.md).
 
 ---
 
