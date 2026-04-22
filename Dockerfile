@@ -21,9 +21,9 @@ COPY ui/ ./
 RUN npm run build
 
 # -----------------------------------------------------------------------------
-# Stage 2: Build the Rust backend
+# Stage 2: Build the Rust backend (CPU)
 # -----------------------------------------------------------------------------
-FROM rust:1.88-bookworm AS rust-builder
+FROM rust:1.88-bookworm AS rust-builder-cpu
 
 WORKDIR /app
 
@@ -37,11 +37,40 @@ RUN apt-get update && apt-get install -y \
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 
-# Build release binary (server only for Docker)
-RUN cargo build --release --bin izwi-server
+# Build CPU release binary (server only for Docker)
+RUN cargo build --release --locked --bin izwi-server
 
 # -----------------------------------------------------------------------------
-# Stage 3: Production runtime (CPU)
+# Stage 3: Build the Rust backend (CUDA)
+# -----------------------------------------------------------------------------
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS rust-builder-cuda
+
+ENV PATH=/root/.cargo/bin:/usr/local/cuda/bin:${PATH}
+
+WORKDIR /app
+
+# Install build dependencies and Rust toolchain
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    ca-certificates \
+    curl \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    --profile minimal \
+    --default-toolchain 1.88.0
+
+# Copy Cargo files first for dependency caching
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+
+# Build CUDA release binary (server only for Docker)
+RUN cargo build --release --locked --bin izwi-server --features cuda
+
+# -----------------------------------------------------------------------------
+# Stage 4: Production runtime (CPU)
 # -----------------------------------------------------------------------------
 FROM debian:bookworm-slim AS production
 
@@ -63,7 +92,7 @@ RUN apt-get update && apt-get install -y \
     && useradd -m -u 1000 izwi
 
 # Copy Rust binary
-COPY --from=rust-builder /app/target/release/izwi-server /usr/local/bin/izwi-server
+COPY --from=rust-builder-cpu /app/target/release/izwi-server /usr/local/bin/izwi-server
 
 # Copy built UI
 COPY --from=ui-builder /app/ui/dist /app/ui/dist
@@ -96,7 +125,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
 CMD ["izwi-server"]
 
 # -----------------------------------------------------------------------------
-# Stage 4: Production runtime with CUDA support
+# Stage 5: Production runtime with CUDA support
 # -----------------------------------------------------------------------------
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS production-cuda
 
@@ -118,7 +147,7 @@ RUN apt-get update && apt-get install -y \
     && useradd -m -u 1000 izwi
 
 # Copy Rust binary
-COPY --from=rust-builder /app/target/release/izwi-server /usr/local/bin/izwi-server
+COPY --from=rust-builder-cuda /app/target/release/izwi-server /usr/local/bin/izwi-server
 
 # Copy built UI
 COPY --from=ui-builder /app/ui/dist /app/ui/dist
@@ -130,6 +159,8 @@ COPY config.docker.toml /app/config.toml
 ENV IZWI_CONFIG_PATH=/app/config.toml
 ENV IZWI_UI_DIR=/app/ui/dist
 ENV IZWI_MODELS_DIR=/app/models
+ENV IZWI_BACKEND=cuda
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
 # Create directories for models and data
 RUN mkdir -p /app/models /app/data && \
