@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Core crate
-izwi-core = { path = "../izwi-core" }
+izwi-core = { path = "../izwi-core", default-features = false }
 
 # CLI framework
 clap = { version = "4.5", features = [
@@ -77,6 +77,8 @@ colored_json = "5.0"
 
 [features]
 default = []
+cuda = ["izwi-core/cuda"]
+metal = ["izwi-core/metal"]
 playback = [] # rodio
 
 [dev-dependencies]
