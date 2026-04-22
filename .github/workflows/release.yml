@@ -21,11 +21,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            asset_suffix: linux-x86_64
+            asset_suffix: linux-x86_64-cpu
             bundle_kind: deb
             bundle_ext: deb
           - os: windows-latest
-            asset_suffix: windows-x86_64
+            asset_suffix: windows-x86_64-cpu
             bundle_kind: nsis
             bundle_ext: exe
           - os: macos-latest
@@ -343,6 +343,18 @@ jobs:
       - name: Show release files
         run: ls -lah dist
 
+      - name: Generate release support note
+        run: |
+          cat > release-support.md <<'EOF'
+          ## Runtime Support For This Release
+
+          - macOS release assets are the Metal-capable path for Apple Silicon hosts.
+          - Linux and Windows GitHub release assets are CPU-focused.
+          - CUDA / NVIDIA support is **not** included in GitHub release binaries today.
+          - For NVIDIA hosts, use a Linux source build with `--features cuda` or the Docker CUDA image/profile.
+          - See the runtime support matrix: https://izwiai.com/docs/support-matrix
+          EOF
+
       - name: Generate beta updater manifest
         if: startsWith(github.ref_name, 'v0.1.0-beta-')
         run: |
@@ -431,6 +443,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: Izwi ${{ github.ref_name }}
-          generate_release_notes: true
+          body_path: release-support.md
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: dist/*
