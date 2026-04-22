@@ -14,7 +14,7 @@ izwi status [OPTIONS]
 
 ## Description
 
-Displays the current state of the Izwi server, including health, loaded models, and resource usage.
+Displays the current state of the Izwi server, including health, loaded models, and runtime backend selection.
 
 ---
 
@@ -41,6 +41,15 @@ izwi status
 izwi status --detailed
 ```
 
+This reads the server health payload and reports:
+
+- the requested backend (`auto`, `metal`, `cuda`, or `cpu`)
+- whether that requested backend is currently available
+- the backend the server actually selected
+- whether the selection came from the request or a fallback path
+- which backends were compiled into the running binary
+- detected device capabilities such as BF16, unified memory, batch size, and memory when available
+
 ### Watch mode
 
 ```bash
@@ -57,8 +66,9 @@ The status command shows:
 
 - **Server health** — Running, stopped, or error
 - **Loaded models** — Currently loaded models
-- **Memory usage** — RAM and VRAM usage
-- **GPU status** — Metal/CUDA availability
+- **Runtime backend** — Requested backend, selected backend, and fallback reason
+- **Compiled backends** — CPU / Metal / CUDA support built into the server binary
+- **Device summary** — Capability details reported by the selected device
 - **Active requests** — Current request count
 
 ---

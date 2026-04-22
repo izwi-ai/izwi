@@ -40,7 +40,7 @@ Download the latest `Izwi-*.dmg` from [GitHub Releases](https://github.com/izwi-
 Open Terminal and run:
 
 ```bash
-izwi --version
+izwi version --full
 ```
 
 ---
@@ -80,11 +80,8 @@ If you only need the CLI tools without the desktop app:
 git clone https://github.com/izwi-ai/izwi.git
 cd izwi
 
-# Build with Metal support
-cargo build --release --features metal
-
-# Install CLI tools
-./scripts/install-cli.sh
+# Build and install with Metal support
+IZWI_BUILD_BACKEND=metal ./scripts/install-cli.sh
 ```
 
 This installs `izwi`, `izwi-server`, and `izwi-desktop` to `~/.local/bin`.

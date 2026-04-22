@@ -164,8 +164,12 @@ izwi serve --backend metal
 
 Linux/Windows (CUDA):
 ```bash
-# Rebuild with CUDA
-cargo build --release --features cuda
+# Linux source install
+IZWI_BUILD_BACKEND=cuda ./scripts/install-cli.sh
+
+# Windows package-scoped builds
+cargo build --release -p izwi-cli --features cuda
+cargo build --release -p izwi-server --features cuda
 ```
 
 **Use smaller models:**
@@ -264,9 +268,20 @@ nvidia-smi
 nvcc --version
 ```
 
-**Rebuild with CUDA:**
+**Rebuild with CUDA support:**
 ```bash
-cargo build --release --features cuda
+# Linux source install
+IZWI_BUILD_BACKEND=cuda ./scripts/install-cli.sh
+
+# Windows package-scoped builds
+cargo build --release -p izwi-cli --features cuda
+cargo build --release -p izwi-server --features cuda
+```
+
+**Verify compile-time and runtime backend state:**
+```bash
+izwi version --full
+izwi status --detailed
 ```
 
 ---

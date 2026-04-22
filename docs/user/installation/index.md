@@ -49,11 +49,10 @@ Download and run the installer from [GitHub Releases](https://github.com/izwi-ai
 After installation, verify everything is working:
 
 ```bash
-izwi --version
-izwi status
+izwi version --full
 ```
 
-You should see the Izwi version number and server status.
+You should see the compiled backend list for the installed CLI. After you start the server with `izwi serve`, use `izwi status --detailed` to verify runtime backend selection.
 
 If you specifically need NVIDIA CUDA support, see:
 
