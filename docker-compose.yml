@@ -67,9 +67,11 @@ services:
       - IZWI_CONFIG_PATH=/app/config.toml
       - IZWI_UI_DIR=/app/ui/dist
       - IZWI_MODELS_DIR=/app/models
+      - IZWI_BACKEND=cuda
       - HF_HOME=/app/models/huggingface
       - TRANSFORMERS_CACHE=/app/models/huggingface
       - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     deploy:
       resources:
         reservations:
