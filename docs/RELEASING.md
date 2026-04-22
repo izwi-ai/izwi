@@ -50,6 +50,7 @@ git push origin v0.1.0-alpha-1
 
 6. Verify release:
    - Open GitHub Actions and confirm the `Release` workflow runs for tag `v0.1.0-alpha-1`.
+   - Confirm the `Backend Truth` workflow is green on the branch or merge commit that produced the tag.
    - Open the GitHub Releases page and confirm all assets are attached.
    - Confirm the generated release body includes the runtime support note describing current CPU / Metal / CUDA artifact scope.
 
@@ -79,6 +80,12 @@ For NVIDIA hosts, the supported CUDA paths are:
 
 1. Linux source builds using `cargo build --release --features cuda`
 2. The Docker CUDA image/profile
+
+The `Backend Truth` workflow is the pre-release guardrail for this contract:
+
+1. CPU cargo checks run separately from CUDA cargo checks.
+2. CPU Docker builds run separately from CUDA Docker builds.
+3. A GPU-host runtime smoke test is still the next gap; until an NVIDIA runner exists, runtime verification remains a manual release check on a CUDA-capable Linux host.
 
 The desktop bundle build runs the UI build automatically via Tauri `beforeBuildCommand`, so `ui/dist` is rebuilt from source on each release run.
 
