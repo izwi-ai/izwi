@@ -181,6 +181,8 @@ pub enum ExecutionBackend {
 
 Selection logic: `ModelVariant` → `InferenceBackendHint` → device availability check → `ExecutionBackend`.
 
+CUDA is an active backend in the runtime, but product support is still uneven across packaging surfaces. Source builds and the CUDA Docker target are the intended NVIDIA paths; GitHub Release artifacts remain CPU-focused on Linux/Windows.
+
 ### 4.4 Model Families (`families/`)
 
 Per-family modules contain weight-loading helpers, tokeniser wrappers, and family-specific configuration parsing. They sit between the catalog (identity) and the architecture implementations (compute).
@@ -572,7 +574,8 @@ The following features are scaffolded or partially implemented but not yet activ
 | **Flash Attention** | Planned | Standard attention used; Flash Attention would reduce memory bandwidth |
 | **Prefix Caching** | Planned | Block sharing infrastructure exists; hash-based prefix lookup not implemented |
 | **Beam Search** | Planned | Sampling infrastructure supports it; beam expansion logic pending |
-| **CUDA / ROCm Backend** | Planned | `ExecutionBackend` enum has slots; only CPU and Metal are active |
+| **CUDA Backend Parity** | Partial | CUDA routing and execution exist, but packaging truth, CI coverage, and kernel parity are still behind CPU/Metal |
+| **ROCm Backend** | Planned | No active ROCm execution path is wired yet |
 
 ---
 

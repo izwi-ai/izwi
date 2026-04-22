@@ -1,6 +1,12 @@
 # Build from Source
 
-Build Izwi from source for development or to customize your installation.
+Build Izwi from source for development, backend-specific installs, or to customize your setup.
+
+See the [Runtime Support Matrix](../support-matrix.md) before choosing a build target. In particular:
+
+- GitHub Release artifacts and source builds do not expose the same backend set.
+- Metal is the primary accelerated source-build path on Apple Silicon.
+- CUDA should currently be treated as a Linux source-build / Docker path first.
 
 ---
 
@@ -61,22 +67,44 @@ If you plan to use `Kokoro-82M`, install `espeak-ng` using your platform guide b
 
 ## Build
 
-### Standard Build
+### Recommended: Use the Install Script
+
+The install script builds the CLI, server, and desktop binaries together and makes the backend choice explicit:
 
 ```bash
-cargo build --release
+./scripts/install-cli.sh
 ```
 
-### macOS with Metal Acceleration
+Backend-specific examples:
 
 ```bash
-cargo build --release --features metal
+# CPU-focused build
+IZWI_BUILD_BACKEND=cpu ./scripts/install-cli.sh
+
+# Apple Silicon / Metal build
+IZWI_BUILD_BACKEND=metal ./scripts/install-cli.sh
+
+# NVIDIA CUDA build
+IZWI_BUILD_BACKEND=cuda ./scripts/install-cli.sh
 ```
 
-### Linux/Windows with CUDA
+On Linux, the script defaults to `cpu`. On Apple Silicon macOS, it defaults to `metal`.
+
+### Manual Cargo Builds
+
+If you only want specific binaries, use package-scoped commands:
 
 ```bash
-cargo build --release --features cuda
+# CPU-focused CLI + server
+cargo build --release -p izwi-cli
+cargo build --release -p izwi-server
+
+# Metal-capable CLI (macOS)
+cargo build --release -p izwi-cli --features metal
+
+# CUDA-capable CLI + server
+cargo build --release -p izwi-cli --features cuda
+cargo build --release -p izwi-server --features cuda
 ```
 
 ---
@@ -115,6 +143,14 @@ This installs to `~/.local/bin`:
 - `izwi` — Main CLI
 - `izwi-server` — API server
 - `izwi-desktop` — Desktop application
+
+Verify the resulting backend support with:
+
+```bash
+izwi version --full
+```
+
+After you start the server with `izwi serve`, run `izwi status --detailed` to confirm which backend the runtime actually selected.
 
 ### Manual Installation
 

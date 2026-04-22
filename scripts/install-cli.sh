@@ -7,6 +7,7 @@ set -e
 REPO_URL="https://github.com/izwi-ai/izwi"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.izwi}"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
+BUILD_BACKEND="${IZWI_BUILD_BACKEND:-auto}"
 
 # Colors
 RED='\033[0;31m'
@@ -20,7 +21,7 @@ print_banner() {
     echo " ___ ____ ____ "
     echo "|_ _|_  /_  /  High-performance audio inference"
     echo " | | / / / /   Text-to-Speech & Speech-to-Text"
-    echo "|___/___/___|  Optimized for Apple Silicon & CUDA"
+    echo "|___/___/___|  Source install for CPU, Metal, or CUDA"
     echo -e "${NC}"
 }
 
@@ -39,6 +40,29 @@ detect_platform() {
     echo "${arch}-${os}"
 }
 
+resolve_build_backend() {
+    local requested=$(echo "$BUILD_BACKEND" | tr '[:upper:]' '[:lower:]')
+    local os=$(uname -s | tr '[:upper:]' '[:lower:]')
+    local arch=$(uname -m)
+
+    case "$requested" in
+        ""|auto)
+            if [[ "$os" == "darwin" && ( "$arch" == "arm64" || "$arch" == "aarch64" ) ]]; then
+                echo "metal"
+            else
+                echo "cpu"
+            fi
+            ;;
+        cpu|metal|cuda)
+            echo "$requested"
+            ;;
+        *)
+            echo "Unsupported IZWI_BUILD_BACKEND value: $BUILD_BACKEND" >&2
+            exit 1
+            ;;
+    esac
+}
+
 check_requirements() {
     echo -e "${BLUE}Checking requirements...${NC}"
     
@@ -54,12 +78,19 @@ check_requirements() {
         echo -e "${RED}npm is required to build desktop assets (ui/dist). Install Node.js 18+ and retry.${NC}"
         exit 1
     fi
+
+    if [[ "$SELECTED_BUILD_BACKEND" == "cuda" ]] && ! command -v nvcc &> /dev/null; then
+        echo -e "${RED}CUDA build requested, but nvcc was not found in PATH.${NC}"
+        echo -e "${YELLOW}Install the CUDA toolkit first or rerun with IZWI_BUILD_BACKEND=cpu.${NC}"
+        exit 1
+    fi
     
     echo -e "${GREEN}✓ Requirements satisfied${NC}"
 }
 
 install_from_source() {
     echo -e "${BLUE}Building Izwi from source...${NC}"
+    echo -e "${BLUE}Selected backend: ${SELECTED_BUILD_BACKEND}${NC}"
     
     # Clone if not already in repo
     if [ ! -f "Cargo.toml" ]; then
@@ -74,8 +105,22 @@ install_from_source() {
     fi
     npm --prefix ui run build
 
+    local cli_feature_args=()
+    local server_feature_args=()
+
+    case "$SELECTED_BUILD_BACKEND" in
+        metal)
+            cli_feature_args=(--features metal)
+            ;;
+        cuda)
+            cli_feature_args=(--features cuda)
+            server_feature_args=(--features cuda)
+            ;;
+    esac
+
     # Build release binaries (desktop build expects izwi + izwi-server artifacts to exist)
-    cargo build --release --bin izwi --bin izwi-server
+    cargo build --release --bin izwi "${cli_feature_args[@]}"
+    cargo build --release --bin izwi-server "${server_feature_args[@]}"
     cargo build --release --bin izwi-desktop
     
     # Create bin directory
@@ -140,16 +185,26 @@ print_usage() {
     echo "  izwi serve --mode desktop # Start server + desktop app"
     echo "  izwi pull qwen3-tts-0.6b-base  # Download a model"
     echo "  izwi tts 'Hello world'   # Generate speech"
+    echo "  izwi version --full      # Show compiled backend support"
+    echo "  izwi status --detailed   # Show selected runtime backend"
+    echo ""
+    echo "Install-time backend selection:"
+    echo "  IZWI_BUILD_BACKEND=cpu ./scripts/install-cli.sh"
+    echo "  IZWI_BUILD_BACKEND=metal ./scripts/install-cli.sh"
+    echo "  IZWI_BUILD_BACKEND=cuda ./scripts/install-cli.sh"
     echo ""
     echo "Documentation: https://github.com/izwi-ai/izwi"
 }
 
 main() {
     print_banner
+
+    SELECTED_BUILD_BACKEND="$(resolve_build_backend)"
     
     echo "Platform: $(detect_platform)"
     echo "Install directory: $INSTALL_DIR"
     echo "Binary directory: $BIN_DIR"
+    echo "Build backend: $SELECTED_BUILD_BACKEND"
     echo ""
     
     check_requirements

@@ -1,6 +1,8 @@
 # Linux Installation
 
-Izwi runs on most modern Linux distributions with optional CUDA support for NVIDIA GPUs.
+Izwi runs on most modern Linux distributions. GitHub Release packages are CPU-focused today; NVIDIA CUDA support is available through Linux source builds.
+
+See the [Runtime Support Matrix](../support-matrix.md) for the current artifact contract.
 
 ---
 
@@ -14,6 +16,8 @@ Izwi runs on most modern Linux distributions with optional CUDA support for NVID
 ---
 
 ## Install from .deb Package (Debian/Ubuntu)
+
+> The `.deb` package is a CPU-focused release artifact. If you need CUDA on an NVIDIA host, skip to [CUDA Support (NVIDIA GPUs)](#cuda-support-nvidia-gpus).
 
 ### Step 1: Download
 
@@ -36,8 +40,7 @@ sudo apt-get install -f
 ### Step 3: Verify
 
 ```bash
-izwi --version
-izwi status
+izwi version --full
 ```
 
 ---
@@ -104,10 +107,7 @@ rustup update stable
 git clone https://github.com/izwi-ai/izwi.git
 cd izwi
 
-# Build release binaries
-cargo build --release
-
-# Install CLI tools
+# Install CLI tools (defaults to CPU on Linux)
 ./scripts/install-cli.sh
 ```
 
@@ -130,16 +130,31 @@ sudo apt install -y cuda-toolkit-12-4
 ### Step 2: Build with CUDA
 
 ```bash
-cargo build --release --features cuda
+IZWI_BUILD_BACKEND=cuda ./scripts/install-cli.sh
 ```
 
 ### Step 3: Verify CUDA
 
+Start the server in one terminal:
+
 ```bash
+izwi serve --backend cuda
+```
+
+In a second terminal:
+
+```bash
+izwi version --full
 izwi status --detailed
 ```
 
-Look for "CUDA: available" in the output.
+Look for:
+
+- `CUDA` under **Compiled Backends** in `izwi version --full`
+- `Requested: cuda`
+- `Selected:  cuda`
+
+in `izwi status --detailed`.
 
 ---
 
@@ -244,7 +259,19 @@ sudo setcap 'cap_net_bind_service=+ep' $(which izwi-server)
 
 3. Rebuild with CUDA feature:
    ```bash
-   cargo build --release --features cuda
+   IZWI_BUILD_BACKEND=cuda ./scripts/install-cli.sh
+   ```
+
+4. Verify the binary and runtime separately:
+   ```bash
+   izwi version --full
+   ```
+
+   Then start the server and inspect the runtime backend:
+
+   ```bash
+   izwi serve --backend cuda
+   izwi status --detailed
    ```
 
 ### Audio playback not working

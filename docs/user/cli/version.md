@@ -14,7 +14,7 @@ izwi version [OPTIONS]
 
 ## Description
 
-Displays the Izwi version and optionally detailed build information.
+Displays the Izwi version and optionally detailed build information, including which backends were compiled into the CLI.
 
 ---
 
@@ -47,12 +47,21 @@ izwi version --full
 
 Output:
 ```
-izwi 0.1.0
-Build: release
-Target: aarch64-apple-darwin
-Rust: 1.83.0
-Features: metal
+Version: 0.1.0
+
+Build Info:
+  Target:    darwin-aarch64
+  Rust:      1.83.0
+
+Compiled Backends:
+  ✓ CPU
+  ✓ Metal
+
+Features:
+  (none)
 ```
+
+`Compiled Backends` reflects cargo features compiled into the binary. It does not mean the server is currently running on that backend; use [`izwi status --detailed`](./status.md) to verify runtime selection.
 
 ---
 
