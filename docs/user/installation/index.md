@@ -2,6 +2,12 @@
 
 Choose your platform for detailed installation instructions.
 
+Before choosing an install path, check the [Runtime Support Matrix](../support-matrix.md) for the current backend contract. In particular:
+
+- GitHub Release artifacts are not the same thing as CUDA source builds.
+- NVIDIA support should currently be treated as a Linux source-build-first capability.
+- The Docker CUDA profile is still considered preview until the image build path is fully aligned.
+
 ---
 
 ## Platforms
@@ -48,6 +54,12 @@ izwi status
 ```
 
 You should see the Izwi version number and server status.
+
+If you specifically need NVIDIA CUDA support, see:
+
+- [Runtime Support Matrix](../support-matrix.md)
+- [Linux Installation](./linux.md)
+- [Build from Source](./from-source.md)
 
 ### Optional: `espeak-ng` for Kokoro-82M
 
