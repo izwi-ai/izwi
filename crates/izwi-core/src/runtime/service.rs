@@ -342,6 +342,10 @@ impl Drop for PendingRequestGuard {
 }
 
 impl RuntimeService {
+    pub fn backend_context(&self) -> crate::backends::BackendContext {
+        self.backend_router.context().clone()
+    }
+
     fn ensure_requested_backend_available(
         backend_context: &crate::backends::BackendContext,
     ) -> Result<()> {
