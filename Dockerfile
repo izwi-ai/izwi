@@ -44,8 +44,10 @@ RUN cargo build --release --locked --bin izwi-server
 # Stage 3: Build the Rust backend (CUDA)
 # -----------------------------------------------------------------------------
 FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS rust-builder-cuda
+ARG CUDA_COMPUTE_CAP=80
 
 ENV PATH=/root/.cargo/bin:/usr/local/cuda/bin:${PATH}
+ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
 
 WORKDIR /app
 

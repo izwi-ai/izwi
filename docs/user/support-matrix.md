@@ -27,7 +27,7 @@ If another page says something different, this page should win.
 | **Source build** | Linux x86_64 with `--features cuda` and CUDA toolkit installed | `cuda` | Supported | This is the primary NVIDIA path today. Requires a compatible NVIDIA driver/toolkit environment. |
 | **Source build** | Windows with `--features cuda` and CUDA toolkit installed | `cuda` | Preview | Source-level CUDA hooks exist, but current release and verification coverage are Linux-first. |
 | **Docker `production` target** | Linux x86_64 | `cpu` | Stable | CPU-only container image. |
-| **Docker `production-cuda` target / `docker compose --profile cuda`** | Linux x86_64 + NVIDIA GPU | `cuda` | Preview | Intended for NVIDIA hosts, but not yet guaranteed by the current image build path. |
+| **Docker `production-cuda` target / `docker compose --profile cuda`** | Linux x86_64 + NVIDIA GPU | `cuda` | Preview | Intended for NVIDIA hosts. When building on a machine without `nvidia-smi`, set `CUDA_COMPUTE_CAP` for the target GPU architecture. |
 
 ---
 
@@ -37,7 +37,7 @@ If another page says something different, this page should win.
 |-------------------|--------|-------|
 | **Single-user macOS desktop evaluation** | Stable | Best-supported path for local evaluation. |
 | **Single-host Linux server on CPU** | Stable | Supported via source build and Docker CPU image. |
-| **Single-host Linux server on NVIDIA GPU** | Supported | Supported via Linux source builds today. Docker CUDA packaging is still being hardened. |
+| **Single-host Linux server on NVIDIA GPU** | Supported | Supported via Linux source builds today. Docker CUDA is available as a preview path and may require an explicit `CUDA_COMPUTE_CAP` when built on a non-GPU machine. |
 | **Windows desktop evaluation** | Stable | CPU-focused today. |
 | **Docker Compose on CPU** | Stable | Use the default `izwi` service. |
 | **Docker Compose on NVIDIA GPU** | Preview | Intended path is `izwi-cuda`, but see current CUDA packaging caveat above. |
@@ -67,7 +67,7 @@ The runtime exposes both compatibility APIs and first-party local workflow APIs 
 
 - GitHub Releases do **not** currently ship CUDA-enabled Linux or Windows binaries.
 - CUDA on NVIDIA should currently be treated as a **source-build-first** capability.
-- The Docker CUDA image/profile is intended for NVIDIA Linux hosts, but the image build path is still being aligned with that claim.
+- The Docker CUDA image/profile is intended for NVIDIA Linux hosts and may require `CUDA_COMPUTE_CAP` when built on a machine without `nvidia-smi`.
 - On macOS, the recommended GPU path is Metal, not CUDA.
 
 ---
