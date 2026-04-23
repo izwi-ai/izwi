@@ -21,11 +21,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            asset_suffix: linux-x86_64-cpu
+            asset_suffix: linux-x86_64
             bundle_kind: deb
             bundle_ext: deb
           - os: windows-latest
-            asset_suffix: windows-x86_64-cpu
+            asset_suffix: windows-x86_64
             bundle_kind: nsis
             bundle_ext: exe
           - os: macos-latest
