@@ -1,6 +1,5 @@
 # Rust
 /target/
-Cargo.lock
 
 # Models (large files)
 /models/
