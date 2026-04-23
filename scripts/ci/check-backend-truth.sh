@@ -21,6 +21,14 @@ require_command() {
     fi
 }
 
+resolve_cuda_compute_cap() {
+    if [[ -n "${CUDA_COMPUTE_CAP:-}" ]]; then
+        echo "${CUDA_COMPUTE_CAP}"
+    else
+        echo "80"
+    fi
+}
+
 run_cargo_cpu() {
     require_command cargo
 
@@ -31,6 +39,11 @@ run_cargo_cpu() {
 run_cargo_cuda() {
     require_command cargo
     require_command nvcc
+
+    local cuda_compute_cap
+    cuda_compute_cap="$(resolve_cuda_compute_cap)"
+    export CUDA_COMPUTE_CAP="${cuda_compute_cap}"
+    echo "Using CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}"
 
     cargo check --locked -p izwi-cli --features cuda
     cargo check --locked -p izwi-server --features cuda
@@ -46,8 +59,15 @@ run_docker_cpu() {
 run_docker_cuda() {
     require_command docker
 
+    local cuda_compute_cap
+    cuda_compute_cap="$(resolve_cuda_compute_cap)"
+
     docker compose --profile cuda config >/dev/null
-    docker build --target production-cuda -t izwi-ci:production-cuda .
+    docker build \
+        --build-arg CUDA_COMPUTE_CAP="${cuda_compute_cap}" \
+        --target production-cuda \
+        -t izwi-ci:production-cuda \
+        .
 }
 
 main() {

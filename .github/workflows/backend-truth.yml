@@ -70,6 +70,8 @@ jobs:
     name: Cargo Check (CUDA)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      CUDA_COMPUTE_CAP: "80"
     container:
       image: nvidia/cuda:12.4.1-devel-ubuntu22.04
 
@@ -116,12 +118,13 @@ jobs:
     name: Docker Build (CUDA)
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      DOCKER_BUILDKIT: "1"
+      CUDA_COMPUTE_CAP: "80"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Run CUDA Docker build checks
-        env:
-          DOCKER_BUILDKIT: "1"
         run: scripts/ci/check-backend-truth.sh docker-cuda

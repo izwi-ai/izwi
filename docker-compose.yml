@@ -52,6 +52,8 @@ services:
       context: .
       dockerfile: Dockerfile
       target: production-cuda
+      args:
+        CUDA_COMPUTE_CAP: ${CUDA_COMPUTE_CAP:-80}
     image: izwi:cuda
     pull_policy: never
     container_name: izwi-cuda

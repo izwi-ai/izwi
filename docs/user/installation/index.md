@@ -6,7 +6,7 @@ Before choosing an install path, check the [Runtime Support Matrix](../support-m
 
 - GitHub Release artifacts are not the same thing as CUDA source builds.
 - NVIDIA support should currently be treated as a Linux source-build-first capability.
-- The Docker CUDA profile is still considered preview until the image build path is fully aligned.
+- The Docker CUDA profile targets NVIDIA Linux hosts and may require `CUDA_COMPUTE_CAP` when built on a machine without `nvidia-smi`.
 
 ---
 

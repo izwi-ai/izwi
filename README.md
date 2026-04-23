@@ -44,7 +44,7 @@ Backend support depends on both the host and the artifact you install.
 - macOS on Apple Silicon: Metal is the recommended and stable GPU path.
 - Linux source builds: CUDA is supported when you build with `--features cuda` on a compatible NVIDIA host.
 - GitHub Release artifacts: currently CPU-only on Linux and Windows unless an asset explicitly says otherwise.
-- Docker CUDA profile: intended for NVIDIA Linux hosts, but treat it as preview until the build path is fully aligned.
+- Docker CUDA profile: intended for NVIDIA Linux hosts; when building on a machine without `nvidia-smi`, set `CUDA_COMPUTE_CAP` for the target GPU architecture.
 
 See the full [Runtime Support Matrix](https://izwiai.com/docs/support-matrix).
 
