@@ -1,5 +1,7 @@
 param(
     [switch]$AllowMissing,
+    [switch]$ExpectCudaDlls,
+    [switch]$SkipStartupProbe,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$Binaries
 )
@@ -9,10 +11,16 @@ $ErrorActionPreference = "Stop"
 
 function Show-Usage {
     @"
-Usage: scripts/release/audit-runtime-deps.ps1 [-AllowMissing] <binary>...
+Usage: scripts/release/audit-runtime-deps.ps1 [-AllowMissing] [-ExpectCudaDlls] [-SkipStartupProbe] <binary>...
 
 Audits Windows release binaries for CUDA DLL availability and verifies that
 each binary can at least enter its version/help path.
+
+Options:
+  -AllowMissing    Report missing CUDA DLLs without failing the audit.
+  -ExpectCudaDlls  Require CUDA runtime DLLs other than nvcuda.dll to be visible.
+  -SkipStartupProbe
+                   Do not execute --version/--help after DLL inspection.
 "@
 }
 
@@ -78,8 +86,46 @@ function Invoke-StartupProbe {
     return $false
 }
 
+function Find-Dumpbin {
+    $direct = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+    if ($direct) {
+        return $direct.Source
+    }
+
+    $vswherePath = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio/Installer/vswhere.exe"
+    if (-not (Test-Path $vswherePath)) {
+        return $null
+    }
+
+    $installPath = & $vswherePath `
+        -latest `
+        -products * `
+        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+        -property installationPath
+
+    if (-not $installPath) {
+        return $null
+    }
+
+    $toolsRoot = Join-Path $installPath "VC/Tools/MSVC"
+    if (-not (Test-Path $toolsRoot)) {
+        return $null
+    }
+
+    $candidate = Get-ChildItem -Path $toolsRoot -Recurse -Filter dumpbin.exe -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -match "\\bin\\Hostx64\\x64\\dumpbin\.exe$" } |
+        Sort-Object FullName -Descending |
+        Select-Object -First 1
+
+    if ($candidate) {
+        return $candidate.FullName
+    }
+
+    return $null
+}
+
 $failed = $false
-$dumpbin = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+$dumpbin = Find-Dumpbin
 
 foreach ($binary in $Binaries) {
     Write-Host "==> $binary"
@@ -95,7 +141,7 @@ foreach ($binary in $Binaries) {
 
     if ($dumpbin) {
         Write-Host "dumpbin /DEPENDENTS:"
-        $deps = & $dumpbin.Source /DEPENDENTS $resolved 2>&1
+        $deps = & $dumpbin /DEPENDENTS $resolved 2>&1
         $deps | ForEach-Object { Write-Host "  $_" }
     } else {
         Write-Host "dumpbin.exe not found; checking known CUDA DLLs on PATH and next to the binary."
@@ -108,14 +154,18 @@ foreach ($binary in $Binaries) {
             Write-Host "  $pattern -> $found"
         } else {
             Write-Host "  $pattern -> missing"
-            if (-not $AllowMissing -and $pattern -ne "nvcuda.dll") {
+            if ($ExpectCudaDlls -and -not $AllowMissing -and $pattern -ne "nvcuda.dll") {
                 $failed = $true
             }
         }
     }
 
-    if (-not (Invoke-StartupProbe -Binary $resolved)) {
-        $failed = $true
+    if ($SkipStartupProbe) {
+        Write-Host "Startup probe: skipped"
+    } else {
+        if (-not (Invoke-StartupProbe -Binary $resolved)) {
+            $failed = $true
+        }
     }
 
     Write-Host ""

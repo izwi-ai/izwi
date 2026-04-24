@@ -121,7 +121,7 @@ Use one shared backend packaging contract instead of copied core files:
   `curl -sS http://127.0.0.1:18081/v1/health`
   `git diff --check`
 
-- [ ] Phase 5: Update CI/release verification gates
+- [x] Phase 5: Update CI/release verification gates
   Scope:
   Add checks that fail release if:
   - Linux/Windows release binaries do not report expected compiled backend support.
@@ -129,6 +129,14 @@ Use one shared backend packaging contract instead of copied core files:
   - CUDA-host smoke tests cannot select CUDA.
   - updater artifacts and terminal bundles disagree on backend support.
   - docs/support matrix still says Linux/Windows release assets are CPU-only after the change.
+  Implementation:
+  Added Linux and Windows unified runtime verification scripts that enforce stable public binary names, require the private same-basename `runtime/cuda` layout, validate packaged CUDA runtime libraries, reject loader-visible CUDA dependencies on public binaries, and check release Tauri resource mappings. The release workflow now runs these verification gates for Linux and Windows before packaging terminal and desktop artifacts. The dependency audit scripts also support private-runtime audits that skip startup on CPU-only release runners while preserving public startup probes.
+  Verification:
+  `bash -n scripts/release/audit-runtime-deps.sh`
+  `bash -n scripts/release/verify-unified-runtime.sh`
+  `scripts/release/verify-unified-runtime.sh --skip-cuda-compiled-check --skip-cuda-library-check`
+  `git diff --check`
+  Windows PowerShell execution still needs a Windows runner because `pwsh` is not available on this host. CUDA device selection still needs a real NVIDIA host or self-hosted GPU runner; this phase gates the layout and CPU-safe startup path in hosted release CI.
 
 - [ ] Phase 6: Roll out behind explicit release notes
   Scope:
@@ -144,7 +152,8 @@ Use one shared backend packaging contract instead of copied core files:
 - Phase 2 chose the CPU-safe public entrypoint plus private CUDA runtime model, documented the library contract, and kept all backend variants tied to shared source builds rather than forked core files.
 - User correction captured: public binary names must remain `izwi` and `izwi-server`; no user-facing `izwi-cuda` or `izwi-server-cuda` commands.
 - Phase 3 normalized release build/package inputs around stable public names plus a private `runtime/cuda` layout. Windows PowerShell staging still needs execution on a Windows runner because `pwsh` is not available locally.
-- Phase 4 added runtime truth reporting and public-server CUDA delegation without changing public binary names. CUDA-host execution still needs CI/GPU validation in Phase 5.
+- Phase 4 added runtime truth reporting and public-server CUDA delegation without changing public binary names. CUDA-host execution still needs validation on a NVIDIA host.
+- Phase 5 added release verification gates for Linux and Windows unified runtime artifacts. Hosted CI can now fail on public name drift, missing private runtime layout, missing packaged CUDA runtime libraries, public CUDA loader dependencies, broken public startup probes, and Tauri runtime-resource drift. Real CUDA device selection remains the one verification item that needs a NVIDIA host or self-hosted GPU runner.
 
 # Voice Configuration Modal Redesign Plan
 
