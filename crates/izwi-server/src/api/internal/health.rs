@@ -1,6 +1,7 @@
 //! Health check endpoint
 
 use axum::{extract::State, Json};
+use izwi_core::backends::CudaRuntimeDiagnostics;
 use serde::Serialize;
 
 use crate::state::AppState;
@@ -21,6 +22,7 @@ pub struct RuntimeBackendResponse {
     pub selection_reason: String,
     pub compiled_backends: CompiledBackendsResponse,
     pub detected_device: DetectedDeviceResponse,
+    pub cuda_runtime: CudaRuntimeResponse,
 }
 
 #[derive(Serialize)]
@@ -39,11 +41,26 @@ pub struct DetectedDeviceResponse {
     pub available_memory_bytes: Option<usize>,
 }
 
+#[derive(Serialize)]
+pub struct CudaRuntimeResponse {
+    pub current_binary_cuda_compiled: bool,
+    pub private_runtime_active: bool,
+    pub private_runtime_packaged: bool,
+    pub private_runtime_path: Option<String>,
+    pub runtime_libraries_available: bool,
+    pub missing_runtime_libraries: Vec<String>,
+    pub driver_available: bool,
+    pub device_usable: Option<bool>,
+    pub search_paths: Vec<String>,
+    pub notes: Vec<String>,
+}
+
 pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse> {
     let context = state.runtime.backend_context();
     let capabilities = context.capabilities;
     let requested_backend_available = context.matches_preference();
     let device = context.device.clone();
+    let cuda_runtime = CudaRuntimeDiagnostics::detect(&current_server_binary_name());
 
     Json(HealthResponse {
         status: "ok",
@@ -66,6 +83,46 @@ pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse>
                 recommended_batch_size: device.capabilities.recommended_batch_size,
                 available_memory_bytes: device.capabilities.available_memory_bytes,
             },
+            cuda_runtime: CudaRuntimeResponse::from(cuda_runtime),
         },
     })
+}
+
+impl From<CudaRuntimeDiagnostics> for CudaRuntimeResponse {
+    fn from(value: CudaRuntimeDiagnostics) -> Self {
+        Self {
+            current_binary_cuda_compiled: value.current_binary_cuda_compiled,
+            private_runtime_active: value.private_runtime_active,
+            private_runtime_packaged: value.private_runtime_packaged,
+            private_runtime_path: value
+                .private_runtime_path
+                .map(|path| path.display().to_string()),
+            runtime_libraries_available: value.runtime_libraries_available,
+            missing_runtime_libraries: value.missing_runtime_libraries,
+            driver_available: value.driver_available,
+            device_usable: value.device_usable,
+            search_paths: value
+                .search_paths
+                .into_iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            notes: value.notes,
+        }
+    }
+}
+
+fn current_server_binary_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        })
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "izwi-server.exe".to_string()
+            } else {
+                "izwi-server".to_string()
+            }
+        })
 }

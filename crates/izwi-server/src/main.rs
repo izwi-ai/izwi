@@ -2,6 +2,8 @@
 
 use clap::{Parser, ValueEnum};
 use std::io::Cursor;
+use std::path::Path;
+use std::process::Command;
 use std::time::Duration;
 use tokio::signal;
 use tracing::{info, warn};
@@ -25,7 +27,10 @@ mod voice_memory;
 mod voice_observation_store;
 mod voice_store;
 
-use izwi_core::{parse_model_variant, RuntimeService, ServeRuntimeConfig, ServeRuntimeConfigOverrides};
+use izwi_core::backends::{self, BackendPreference, CudaRuntimeDiagnostics};
+use izwi_core::{
+    parse_model_variant, RuntimeService, ServeRuntimeConfig, ServeRuntimeConfigOverrides,
+};
 use state::AppState;
 
 #[derive(Debug, Parser)]
@@ -76,6 +81,7 @@ struct BindConfig {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = ServerArgs::parse();
+    maybe_delegate_to_private_cuda_runtime(&args)?;
 
     // Initialize logging
     tracing_subscriber::registry()
@@ -122,6 +128,116 @@ async fn main() -> anyhow::Result<()> {
     server.await?;
 
     Ok(())
+}
+
+fn maybe_delegate_to_private_cuda_runtime(args: &ServerArgs) -> anyhow::Result<()> {
+    if cfg!(feature = "cuda") || backends::private_cuda_runtime_active() {
+        return Ok(());
+    }
+
+    let serve_config = resolve_serve_runtime_config(args);
+    if !matches!(
+        serve_config.backend,
+        BackendPreference::Auto | BackendPreference::Cuda
+    ) {
+        return Ok(());
+    }
+
+    let binary_name = current_server_binary_name();
+    let diagnostics = CudaRuntimeDiagnostics::detect(&binary_name);
+    if diagnostics.can_start_private_runtime() {
+        let runtime_path = diagnostics
+            .private_runtime_path
+            .as_ref()
+            .expect("can_start_private_runtime requires a private runtime path");
+        return exec_private_cuda_runtime(runtime_path);
+    }
+
+    if serve_config.backend == BackendPreference::Cuda {
+        anyhow::bail!("{}", format_cuda_runtime_unavailable(&diagnostics));
+    }
+
+    Ok(())
+}
+
+fn exec_private_cuda_runtime(runtime_path: &Path) -> anyhow::Result<()> {
+    let mut command = Command::new(runtime_path);
+    command.args(std::env::args_os().skip(1));
+    command.env(backends::private_cuda_runtime_env_key(), "1");
+    backends::prepend_cuda_loader_paths(&mut command, runtime_path);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        let err = command.exec();
+        return Err(anyhow::anyhow!(
+            "failed to exec private CUDA runtime {}: {}",
+            runtime_path.display(),
+            err
+        ));
+    }
+
+    #[cfg(windows)]
+    {
+        let status = command.status().map_err(|err| {
+            anyhow::anyhow!(
+                "failed to start private CUDA runtime {}: {}",
+                runtime_path.display(),
+                err
+            )
+        })?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
+fn current_server_binary_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        })
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "izwi-server.exe".to_string()
+            } else {
+                "izwi-server".to_string()
+            }
+        })
+}
+
+fn format_cuda_runtime_unavailable(diagnostics: &CudaRuntimeDiagnostics) -> String {
+    let mut reasons = Vec::new();
+
+    if !diagnostics.private_runtime_packaged {
+        reasons.push("private CUDA runtime binary is not packaged".to_string());
+    }
+    if !diagnostics.runtime_libraries_available {
+        if diagnostics.missing_runtime_libraries.is_empty() {
+            reasons.push("CUDA runtime libraries are not available".to_string());
+        } else {
+            reasons.push(format!(
+                "missing CUDA runtime libraries: {}",
+                diagnostics.missing_runtime_libraries.join(", ")
+            ));
+        }
+    }
+    if !diagnostics.driver_available {
+        reasons.push("NVIDIA driver library is not available".to_string());
+    }
+
+    if reasons.is_empty() {
+        reasons.push("CUDA runtime could not be selected".to_string());
+    }
+
+    format!(
+        "CUDA backend was requested, but the packaged CUDA runtime is unavailable ({})",
+        reasons.join("; ")
+    )
 }
 
 fn resolve_serve_runtime_config(args: &ServerArgs) -> ServeRuntimeConfig {

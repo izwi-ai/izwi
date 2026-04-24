@@ -101,7 +101,7 @@ Use one shared backend packaging contract instead of copied core files:
   `cargo check -p izwi-desktop`
   `git diff --check`
 
-- [ ] Phase 4: Add runtime dependency diagnostics
+- [x] Phase 4: Add runtime dependency diagnostics
   Scope:
   Extend the existing backend truth reporting to distinguish:
   1. CUDA compiled into binary
@@ -111,6 +111,15 @@ Use one shared backend packaging contract instead of copied core files:
   5. selected backend
   Notes:
   This makes `auto` fallback understandable and prevents "CUDA compiled but CPU selected" confusion.
+  Implementation:
+  Added shared CUDA runtime diagnostics in `izwi-core`, exposed them through `/v1/health`, printed them in `izwi status --detailed`, and taught the public CPU-safe `izwi-server` entrypoint to delegate to the private same-name CUDA runtime only when packaged runtime libraries and the NVIDIA driver are visible. Explicit `--backend cuda` now fails before server startup with a clear diagnostic if the private runtime cannot be used.
+  Verification:
+  `cargo check -p izwi-core -p izwi-server -p izwi-cli`
+  `cargo test -p izwi-core cuda_runtime`
+  `cargo run -p izwi-server -- --backend cuda --port 0`
+  `./target/debug/izwi-server --backend cpu --port 18081`
+  `curl -sS http://127.0.0.1:18081/v1/health`
+  `git diff --check`
 
 - [ ] Phase 5: Update CI/release verification gates
   Scope:
@@ -135,6 +144,7 @@ Use one shared backend packaging contract instead of copied core files:
 - Phase 2 chose the CPU-safe public entrypoint plus private CUDA runtime model, documented the library contract, and kept all backend variants tied to shared source builds rather than forked core files.
 - User correction captured: public binary names must remain `izwi` and `izwi-server`; no user-facing `izwi-cuda` or `izwi-server-cuda` commands.
 - Phase 3 normalized release build/package inputs around stable public names plus a private `runtime/cuda` layout. Windows PowerShell staging still needs execution on a Windows runner because `pwsh` is not available locally.
+- Phase 4 added runtime truth reporting and public-server CUDA delegation without changing public binary names. CUDA-host execution still needs CI/GPU validation in Phase 5.
 
 # Voice Configuration Modal Redesign Plan
 

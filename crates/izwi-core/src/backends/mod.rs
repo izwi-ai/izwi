@@ -1,6 +1,7 @@
 //! Backend routing, device probing, and execution policy primitives.
 
 pub mod capabilities;
+pub mod cuda_runtime;
 pub mod device;
 pub mod model_io;
 pub mod policy;
@@ -8,6 +9,11 @@ pub mod router;
 pub mod types;
 
 pub use capabilities::BackendCapabilities;
+pub use cuda_runtime::{
+    prepend_cuda_loader_paths, private_cuda_runtime_active, private_cuda_runtime_binary_env_key,
+    private_cuda_runtime_candidates, private_cuda_runtime_env_key, resolve_private_cuda_runtime,
+    CudaRuntimeDiagnostics,
+};
 pub use device::{DeviceCapabilities, DeviceKind, DeviceProfile, DeviceSelector};
 pub use model_io::{
     auto_gguf_mmap_for_backend, backend_kind_for_device, gguf_mmap_enabled,

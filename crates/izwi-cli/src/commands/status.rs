@@ -22,6 +22,7 @@ struct RuntimeBackendStatus {
     selection_reason: Option<String>,
     compiled_backends: Option<CompiledBackendsStatus>,
     detected_device: Option<DetectedDeviceStatus>,
+    cuda_runtime: Option<CudaRuntimeStatus>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -38,6 +39,17 @@ struct DetectedDeviceStatus {
     has_unified_memory: Option<bool>,
     recommended_batch_size: Option<usize>,
     available_memory_bytes: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CudaRuntimeStatus {
+    current_binary_cuda_compiled: Option<bool>,
+    private_runtime_active: Option<bool>,
+    private_runtime_packaged: Option<bool>,
+    runtime_libraries_available: Option<bool>,
+    missing_runtime_libraries: Option<Vec<String>>,
+    driver_available: Option<bool>,
+    device_usable: Option<bool>,
 }
 
 pub async fn execute(
@@ -229,10 +241,57 @@ async fn show_status(server: &str, detailed: bool) -> Result<()> {
             if let Some(reason) = runtime.selection_reason.as_deref() {
                 println!("  Reason:    {}", reason);
             }
+            if let Some(cuda_runtime) = runtime.cuda_runtime.as_ref() {
+                println!("\n{}", style("CUDA Runtime:").bold());
+                print_cuda_runtime_status(cuda_runtime);
+            }
         }
     }
 
     Ok(())
+}
+
+fn print_cuda_runtime_status(runtime: &CudaRuntimeStatus) {
+    if let Some(compiled) = runtime.current_binary_cuda_compiled {
+        println!(
+            "  Current binary: {}",
+            if compiled {
+                "cuda-compiled"
+            } else {
+                "cpu-safe"
+            }
+        );
+    }
+    if let Some(active) = runtime.private_runtime_active {
+        println!("  Private active: {}", yes_no(active));
+    }
+    if let Some(packaged) = runtime.private_runtime_packaged {
+        println!("  Private packaged: {}", yes_no(packaged));
+    }
+    if let Some(available) = runtime.runtime_libraries_available {
+        println!("  Runtime libs: {}", yes_no(available));
+    }
+    if let Some(driver) = runtime.driver_available {
+        println!("  NVIDIA driver: {}", yes_no(driver));
+    }
+    if let Some(device) = runtime.device_usable {
+        println!("  CUDA device: {}", yes_no(device));
+    } else {
+        println!("  CUDA device: unknown");
+    }
+    if let Some(missing) = runtime.missing_runtime_libraries.as_ref() {
+        if !missing.is_empty() {
+            println!("  Missing libs: {}", missing.join(", "));
+        }
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 fn format_compiled_backends(backends: &CompiledBackendsStatus) -> String {
