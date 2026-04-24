@@ -148,6 +148,7 @@ izwi tts --help
 | `IZWI_MAX_CONCURRENT` | Maximum concurrent requests |
 | `IZWI_TIMEOUT` | Request timeout (seconds) |
 | `RUST_LOG` | Log level |
+| `IZWI_LOG_FORMAT` | Log output format (`text`, `json`) |
 | `NO_COLOR` | Disable colored output |
 
 ---

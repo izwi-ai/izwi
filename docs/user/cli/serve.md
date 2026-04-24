@@ -41,6 +41,7 @@ The resolved settings are passed through to the spawned `izwi-server` process, s
 | `--max-concurrent <N>` | Max concurrent requests | `100` |
 | `--timeout <SECONDS>` | Request timeout | `300` |
 | `--log-level <LEVEL>` | Log level | `warn` |
+| `--log-format <FORMAT>` | Log output format: `text` or `json` | `text` |
 | `--cors` | Enable wildcard CORS responses | Disabled |
 | `--no-ui` | Disable static web UI serving | UI enabled |
 
@@ -127,6 +128,7 @@ izwi serve --mode web --no-ui
 | `IZWI_NO_UI` | `--no-ui` |
 | `IZWI_UI_DIR` | Config-only UI build directory |
 | `RUST_LOG` | `--log-level` |
+| `IZWI_LOG_FORMAT` | `--log-format` |
 | `IZWI_SERVE_MODE` | `--mode` |
 
 Legacy aliases still resolve for one release cycle:
@@ -161,6 +163,20 @@ timeout = 300
 enabled = true
 dir = "ui/dist"
 ```
+
+---
+
+## Logging
+
+Text logs are the default. Use JSON logs when a collector needs machine-readable application events:
+
+```bash
+izwi serve --log-format json
+```
+
+`--log-format json` controls Izwi's application log lines. Docker's `json-file` logging driver only frames container stdout/stderr and is separate from the application log format.
+
+JSON logs include the normal tracing fields such as timestamp, level, target, and message. HTTP request events also include service, version, correlation ID, method, path, status, latency in milliseconds, and error fields when a request fails.
 
 ---
 

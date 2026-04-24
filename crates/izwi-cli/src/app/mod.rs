@@ -6,7 +6,7 @@ use crate::style::Theme;
 use izwi_core::{ServeRuntimeConfig, ServeRuntimeConfigOverrides};
 use std::path::PathBuf;
 
-use self::cli::{Backend, Cli, Commands, ServeMode};
+use self::cli::{Backend, Cli, Commands, LogFormat, ServeMode};
 
 pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
     let Cli {
@@ -30,6 +30,7 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
             max_concurrent,
             timeout,
             log_level,
+            log_format,
             dev,
             cors,
             no_ui,
@@ -46,6 +47,7 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
                 max_concurrent,
                 timeout,
                 log_level,
+                log_format,
                 dev,
                 cors,
                 no_ui,
@@ -203,6 +205,7 @@ fn build_serve_args(
     max_concurrent: Option<usize>,
     timeout: Option<u64>,
     log_level: String,
+    log_format: LogFormat,
     dev: bool,
     cors: bool,
     no_ui: bool,
@@ -226,6 +229,7 @@ fn build_serve_args(
         mode,
         runtime,
         log_level,
+        log_format,
         dev,
     })
 }
@@ -275,6 +279,7 @@ mod tests {
         std::env::remove_var(izwi_core::serve_runtime::ENV_UI_DIR);
         std::env::remove_var(izwi_core::serve_runtime::LEGACY_ENV_MAX_CONCURRENT[0]);
         std::env::remove_var(izwi_core::serve_runtime::LEGACY_ENV_TIMEOUT[0]);
+        std::env::remove_var("IZWI_LOG_FORMAT");
     }
 
     #[test]
@@ -313,6 +318,7 @@ mod tests {
             None,
             None,
             "info".to_string(),
+            LogFormat::Text,
             false,
             true,
             false,
@@ -349,6 +355,7 @@ mod tests {
             None,
             None,
             "warn".to_string(),
+            LogFormat::Text,
             false,
             false,
             false,

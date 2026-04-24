@@ -200,29 +200,35 @@ Verification:
 
 ### Phase 3: Structured JSON Logging Mode
 
+Status: complete.
+
 Goal:
 
 - Support machine-readable runtime logs while preserving current text default.
 
 Tasks:
 
-- [ ] Enable `tracing-subscriber` JSON formatter feature.
-- [ ] Add `LogFormat { text, json }` parsing.
-- [ ] Add direct server flag `--log-format`.
-- [ ] Add env var `IZWI_LOG_FORMAT`.
-- [ ] Add CLI `izwi serve --log-format` and pass it through to child server processes.
-- [ ] Centralize tracing initialization in a small helper so parsing/defaults are testable.
-- [ ] Define stable fields: timestamp, level, target, service, version, message, correlation_id, method, path, status, latency_ms, error.
-- [ ] Make request-id middleware and TraceLayer agree on generated request IDs.
-- [ ] Add response/failure events with status and latency.
-- [ ] Document Docker usage with application JSON logs, distinct from Docker `json-file`.
+- [x] Enable `tracing-subscriber` JSON formatter feature.
+- [x] Add `LogFormat { text, json }` parsing.
+- [x] Add direct server flag `--log-format`.
+- [x] Add env var `IZWI_LOG_FORMAT`.
+- [x] Add CLI `izwi serve --log-format` and pass it through to child server processes.
+- [x] Centralize tracing initialization in a small helper so parsing/defaults are testable.
+- [x] Define stable fields: timestamp, level, target, service, version, message, correlation_id, method, path, status, latency_ms, error.
+- [x] Make request-id middleware and TraceLayer agree on generated request IDs.
+- [x] Add response/failure events with status and latency.
+- [x] Document Docker usage with application JSON logs, distinct from Docker `json-file`.
 
 Verification:
 
-- [ ] Unit tests for log format parsing and defaults.
-- [ ] Router/middleware test proves generated `x-request-id` is returned.
-- [ ] Integration-style smoke captures one JSON log line and validates basic keys where feasible.
-- [ ] `cargo check --locked -p izwi-server -p izwi-cli`.
+- [x] Unit tests for log format parsing and defaults.
+- [x] Router/middleware test proves generated `x-request-id` is returned.
+- [x] Integration-style smoke captures one JSON log line and validates basic keys where feasible.
+- [x] `cargo check --locked -p izwi-server -p izwi-cli`.
+
+Notes:
+
+- JSON smoke emitted a structured startup line with timestamp, level, message, service, version, and `log_format=json`; the sandbox denied the subsequent localhost bind after logging.
 
 ### Phase 4: Preview Semantics Hardening For Responses And Agent Sessions
 

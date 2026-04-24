@@ -1,6 +1,6 @@
 use crate::error::{CliError, Result};
 use crate::style::Theme;
-use crate::ServeMode;
+use crate::{LogFormat, ServeMode};
 use console::style;
 use izwi_core::ServeRuntimeConfig;
 use std::path::PathBuf;
@@ -12,6 +12,7 @@ pub struct ServeArgs {
     pub mode: ServeMode,
     pub runtime: ServeRuntimeConfig,
     pub log_level: String,
+    pub log_format: LogFormat,
     pub dev: bool,
 }
 
@@ -38,6 +39,7 @@ pub async fn execute(args: ServeArgs) -> Result<()> {
     println!("  Timeout:        {}s", args.runtime.request_timeout_secs);
     println!("  Backend:        {}", args.runtime.backend.as_str());
     println!("  Log level:      {}", args.log_level);
+    println!("  Log format:     {}", args.log_format.as_str());
 
     set_server_env(&args);
 
@@ -157,6 +159,7 @@ fn serve_mode_label(mode: &ServeMode) -> &'static str {
 
 fn set_server_env(args: &ServeArgs) {
     std::env::set_var("RUST_LOG", &args.log_level);
+    std::env::set_var("IZWI_LOG_FORMAT", args.log_format.as_str());
     std::env::set_var("IZWI_HOST", &args.runtime.host);
     std::env::set_var("IZWI_PORT", args.runtime.port.to_string());
     std::env::set_var(
@@ -229,6 +232,7 @@ fn spawn_server(args: &ServeArgs) -> Result<Child> {
     };
 
     cmd.env("RUST_LOG", &args.log_level);
+    cmd.env("IZWI_LOG_FORMAT", args.log_format.as_str());
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::inherit());
 
@@ -549,6 +553,7 @@ mod tests {
 
     fn clear_serve_env() {
         std::env::remove_var("RUST_LOG");
+        std::env::remove_var("IZWI_LOG_FORMAT");
         std::env::remove_var("IZWI_HOST");
         std::env::remove_var("IZWI_PORT");
         std::env::remove_var("IZWI_MAX_BATCH_SIZE");
@@ -582,6 +587,7 @@ mod tests {
                 ui_dir: PathBuf::from("/tmp/ui"),
             },
             log_level: "info".to_string(),
+            log_format: LogFormat::Text,
             dev: false,
         }
     }
@@ -594,10 +600,23 @@ mod tests {
 
         assert_eq!(std::env::var("IZWI_CORS").as_deref(), Ok("1"));
         assert_eq!(std::env::var("IZWI_NO_UI").as_deref(), Ok("1"));
+        assert_eq!(std::env::var("IZWI_LOG_FORMAT").as_deref(), Ok("text"));
         assert_eq!(
             std::env::var("IZWI_MODELS_DIR").as_deref(),
             Ok("/tmp/models")
         );
+        clear_serve_env();
+    }
+
+    #[test]
+    fn set_server_env_passes_json_log_format() {
+        clear_serve_env();
+
+        let mut args = sample_args();
+        args.log_format = LogFormat::Json;
+        set_server_env(&args);
+
+        assert_eq!(std::env::var("IZWI_LOG_FORMAT").as_deref(), Ok("json"));
         clear_serve_env();
     }
 

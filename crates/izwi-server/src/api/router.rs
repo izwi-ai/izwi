@@ -2,16 +2,20 @@ use axum::{
     extract::Request,
     http::{HeaderValue, StatusCode},
     middleware,
+    response::Response,
     routing::get,
     Router,
 };
 use izwi_core::ServeRuntimeConfig;
+use std::time::Duration;
+use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
-use tracing::{info_span, warn};
+use tracing::{field, info, info_span, warn, Span};
 
 use crate::api::request_context::attach_request_context;
+use crate::logging::{SERVICE_NAME, SERVICE_VERSION};
 use crate::state::AppState;
 
 const DESKTOP_CORS_ORIGINS: &[&str] = &[
@@ -26,19 +30,55 @@ async fn api_not_found() -> StatusCode {
 
 /// Create the main API router.
 pub fn create_router(state: AppState, serve_config: &ServeRuntimeConfig) -> Router {
-    let trace_layer = TraceLayer::new_for_http().make_span_with(|request: &Request| {
-        let request_id = request
-            .headers()
-            .get("x-request-id")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("-");
-        info_span!(
-            "http_request",
-            method = %request.method(),
-            uri = %request.uri(),
-            correlation_id = %request_id
-        )
-    });
+    let trace_layer = TraceLayer::new_for_http()
+        .make_span_with(|request: &Request| {
+            let request_id = request
+                .headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-");
+            info_span!(
+                "http_request",
+                service = SERVICE_NAME,
+                version = SERVICE_VERSION,
+                method = %request.method(),
+                path = %request.uri().path(),
+                uri = %request.uri(),
+                correlation_id = %request_id,
+                status = field::Empty,
+                latency_ms = field::Empty,
+                error = field::Empty
+            )
+        })
+        .on_response(|response: &Response, latency: Duration, span: &Span| {
+            let status = response.status().as_u16();
+            let latency_ms = latency.as_millis() as u64;
+            span.record("status", status);
+            span.record("latency_ms", latency_ms);
+            info!(
+                parent: span,
+                service = SERVICE_NAME,
+                version = SERVICE_VERSION,
+                status,
+                latency_ms,
+                "HTTP request completed"
+            );
+        })
+        .on_failure(
+            |failure: ServerErrorsFailureClass, latency: Duration, span: &Span| {
+                let latency_ms = latency.as_millis() as u64;
+                span.record("latency_ms", latency_ms);
+                span.record("error", field::display(&failure));
+                warn!(
+                    parent: span,
+                    service = SERVICE_NAME,
+                    version = SERVICE_VERSION,
+                    error = %failure,
+                    latency_ms,
+                    "HTTP request failed"
+                );
+            },
+        );
 
     let v1_routes = Router::new()
         .merge(crate::api::internal::router())
