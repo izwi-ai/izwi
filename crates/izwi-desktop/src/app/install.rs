@@ -4,6 +4,13 @@ use tauri::Manager;
 
 use super::server::platform_binary_name;
 
+struct BundledCliTargets {
+    cli: PathBuf,
+    server: Option<PathBuf>,
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    runtime_dir: Option<PathBuf>,
+}
+
 pub fn ensure_cli_setup<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -31,7 +38,7 @@ pub fn ensure_cli_setup<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<
 
 fn resolve_bundled_cli_targets<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
-) -> Result<Option<(PathBuf, Option<PathBuf>)>> {
+) -> Result<Option<BundledCliTargets>> {
     let resource_dir = match app.path().resource_dir() {
         Ok(path) => path,
         Err(err) => {
@@ -56,7 +63,22 @@ fn resolve_bundled_cli_targets<R: tauri::Runtime>(
         None
     };
 
-    Ok(Some((cli_target, server_target)))
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let runtime_dir = {
+        let runtime_dir = resource_dir.join("bin").join("runtime");
+        if runtime_dir.exists() {
+            Some(runtime_dir)
+        } else {
+            None
+        }
+    };
+
+    Ok(Some(BundledCliTargets {
+        cli: cli_target,
+        server: server_target,
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        runtime_dir,
+    }))
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -97,11 +119,64 @@ fn install_binary_copy(src: &std::path::Path, dest: &std::path::Path) -> Result<
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn install_dir_copy(src: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    let existing = std::fs::symlink_metadata(dest).ok();
+    if let Some(metadata) = existing {
+        if metadata.file_type().is_dir() {
+            std::fs::remove_dir_all(dest)
+                .with_context(|| format!("failed removing existing {}", dest.display()))?;
+        } else {
+            std::fs::remove_file(dest)
+                .with_context(|| format!("failed removing existing {}", dest.display()))?;
+        }
+    }
+
+    copy_dir_recursive(src, dest)
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn copy_dir_recursive(src: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dest).with_context(|| format!("failed creating {}", dest.display()))?;
+
+    for entry in
+        std::fs::read_dir(src).with_context(|| format!("failed reading {}", src.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed reading entry in {}", src.display()))?;
+        let src_path = entry.path();
+        let dest_path = dest.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed reading metadata for {}", src_path.display()))?;
+
+        if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dest_path)?;
+        } else {
+            std::fs::copy(&src_path, &dest_path).with_context(|| {
+                format!(
+                    "failed copying {} -> {}",
+                    src_path.display(),
+                    dest_path.display()
+                )
+            })?;
+
+            let perms = std::fs::metadata(&src_path)
+                .with_context(|| format!("failed reading metadata for {}", src_path.display()))?
+                .permissions();
+            std::fs::set_permissions(&dest_path, perms).with_context(|| {
+                format!("failed setting permissions for {}", dest_path.display())
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn ensure_linux_cli_links<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<()> {
     use std::io::Write;
 
-    let Some((cli_target, server_target)) = resolve_bundled_cli_targets(app)? else {
+    let Some(targets) = resolve_bundled_cli_targets(app)? else {
         return Ok(());
     };
 
@@ -113,9 +188,12 @@ fn ensure_linux_cli_links<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Resul
     std::fs::create_dir_all(&bin_dir)
         .with_context(|| format!("failed creating {}", bin_dir.display()))?;
 
-    install_binary_copy(&cli_target, &bin_dir.join("izwi"))?;
-    if let Some(server_target) = server_target.as_ref() {
+    install_binary_copy(&targets.cli, &bin_dir.join("izwi"))?;
+    if let Some(server_target) = targets.server.as_ref() {
         install_binary_copy(server_target, &bin_dir.join("izwi-server"))?;
+    }
+    if let Some(runtime_dir) = targets.runtime_dir.as_ref() {
+        install_dir_copy(runtime_dir, &bin_dir.join("runtime"))?;
     }
 
     if !path_contains_dir(&bin_dir) {
@@ -145,7 +223,7 @@ fn ensure_linux_cli_links<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Resul
 
 #[cfg(target_os = "windows")]
 fn ensure_windows_cli_links<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<()> {
-    let Some((cli_target, server_target)) = resolve_bundled_cli_targets(app)? else {
+    let Some(targets) = resolve_bundled_cli_targets(app)? else {
         return Ok(());
     };
 
@@ -158,9 +236,12 @@ fn ensure_windows_cli_links<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Res
     std::fs::create_dir_all(&bin_dir)
         .with_context(|| format!("failed creating {}", bin_dir.display()))?;
 
-    install_binary_copy(&cli_target, &bin_dir.join("izwi.exe"))?;
-    if let Some(server_target) = server_target.as_ref() {
+    install_binary_copy(&targets.cli, &bin_dir.join("izwi.exe"))?;
+    if let Some(server_target) = targets.server.as_ref() {
         install_binary_copy(server_target, &bin_dir.join("izwi-server.exe"))?;
+    }
+    if let Some(runtime_dir) = targets.runtime_dir.as_ref() {
+        install_dir_copy(runtime_dir, &bin_dir.join("runtime"))?;
     }
 
     if !path_contains_dir(&bin_dir) {
@@ -212,7 +293,7 @@ fn is_running_from_macos_app_bundle() -> bool {
 fn ensure_macos_cli_links<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<()> {
     use std::process::Command;
 
-    let Some((cli_target, server_target)) = resolve_bundled_cli_targets(app)? else {
+    let Some(targets) = resolve_bundled_cli_targets(app)? else {
         return Ok(());
     };
 
@@ -227,7 +308,7 @@ fn ensure_macos_cli_links<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Resul
         );
         return Ok(());
     }
-    if server_target.is_some() && has_non_symlink_collision(&server_link)? {
+    if targets.server.is_some() && has_non_symlink_collision(&server_link)? {
         eprintln!(
             "warning: {} exists and is not a symlink; not overwriting",
             server_link.display()
@@ -242,12 +323,12 @@ fn ensure_macos_cli_links<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Resul
         eprintln!("warning: {}", err);
     }
 
-    if let Err(err) = ensure_symlink(&cli_target, &cli_link) {
+    if let Err(err) = ensure_symlink(&targets.cli, &cli_link) {
         needs_privileged_install = true;
         eprintln!("warning: {}", err);
     }
 
-    if let Some(server_target) = server_target.as_ref() {
+    if let Some(server_target) = targets.server.as_ref() {
         if let Err(err) = ensure_symlink(server_target, &server_link) {
             needs_privileged_install = true;
             eprintln!("warning: {}", err);
@@ -259,12 +340,12 @@ fn ensure_macos_cli_links<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Resul
             format!("mkdir -p '{}'", escape_single_quotes(&link_dir)),
             format!(
                 "ln -sf '{}' '{}'",
-                escape_single_quotes(&cli_target),
+                escape_single_quotes(&targets.cli),
                 escape_single_quotes(&cli_link)
             ),
         ];
 
-        if let Some(server_target) = server_target.as_ref() {
+        if let Some(server_target) = targets.server.as_ref() {
             shell_cmd.push(format!(
                 "ln -sf '{}' '{}'",
                 escape_single_quotes(server_target),
@@ -288,9 +369,9 @@ fn ensure_macos_cli_links<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Resul
                 eprintln!("warning: automatic privileged setup was not completed");
                 eprintln!(
                     "run manually: {}",
-                    manual_link_command(&cli_target, &cli_link)
+                    manual_link_command(&targets.cli, &cli_link)
                 );
-                if let Some(server_target) = server_target.as_ref() {
+                if let Some(server_target) = targets.server.as_ref() {
                     eprintln!(
                         "run manually: {}",
                         manual_link_command(server_target, &server_link)

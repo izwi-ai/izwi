@@ -86,12 +86,20 @@ Use one shared backend packaging contract instead of copied core files:
   Verification:
   Reviewed current NVIDIA CUDA EULA Attachment A and CUDA compatibility documentation.
 
-- [ ] Phase 3: Normalize release build inputs for all Linux and Windows surfaces
+- [x] Phase 3: Normalize release build inputs for all Linux and Windows surfaces
   Scope:
   Create one shared release build path that produces the binaries used by:
   Linux `.deb`, Linux AppImage/updater, Linux terminal tarball, Windows NSIS/updater, and Windows terminal zip.
   Notes:
   Check Tauri Linux/Windows resource config composition so AppImage/NSIS include the same `izwi` and `izwi-server` binaries as the terminal bundles. Avoid separate hand-copied packaging branches.
+  Implementation:
+  Added same-name private runtime staging scripts for Linux and Windows, release-only Tauri configs that bundle `target/release/runtime`, and release workflow steps that build CPU-safe public `izwi`/`izwi-server` plus CUDA runtime variants in a separate Cargo target dir. Linux tarballs, Windows zips, `.deb`, AppImage/updater, and NSIS/updater now draw from the same staged layout. Desktop CLI setup now copies the bundled `runtime/` directory with the installed CLI/server pair on Linux and Windows.
+  Verification:
+  `bash -n scripts/release/stage-unified-runtime.sh`
+  `jq empty crates/izwi-desktop/tauri.release.linux.conf.json crates/izwi-desktop/tauri.release.windows.conf.json`
+  `scripts/release/stage-unified-runtime.sh --cuda-target-dir target`
+  `cargo check -p izwi-desktop`
+  `git diff --check`
 
 - [ ] Phase 4: Add runtime dependency diagnostics
   Scope:
@@ -126,6 +134,7 @@ Use one shared backend packaging contract instead of copied core files:
 - Phase 1 added repeatable loader/startup audit tooling for release artifacts. Local verification covered the Bash script and existing macOS binary; Windows script validation is deferred to a Windows runner.
 - Phase 2 chose the CPU-safe public entrypoint plus private CUDA runtime model, documented the library contract, and kept all backend variants tied to shared source builds rather than forked core files.
 - User correction captured: public binary names must remain `izwi` and `izwi-server`; no user-facing `izwi-cuda` or `izwi-server-cuda` commands.
+- Phase 3 normalized release build/package inputs around stable public names plus a private `runtime/cuda` layout. Windows PowerShell staging still needs execution on a Windows runner because `pwsh` is not available locally.
 
 # Voice Configuration Modal Redesign Plan
 

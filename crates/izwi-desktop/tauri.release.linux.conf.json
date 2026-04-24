@@ -1,0 +1,18 @@
+{
+  "bundle": {
+    "resources": {
+      "../../target/release/izwi": "bin/izwi",
+      "../../target/release/izwi-server": "bin/izwi-server",
+      "../../target/release/runtime": "bin/runtime"
+    },
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/bin/izwi": "../../target/release/izwi",
+          "/usr/bin/izwi-server": "../../target/release/izwi-server",
+          "/usr/lib/izwi/runtime": "../../target/release/runtime"
+        }
+      }
+    }
+  }
+}
