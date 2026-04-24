@@ -62,6 +62,7 @@ For each OS runner, the workflow builds:
    - `izwi` (CLI)
    - `izwi-server`
    - `izwi-desktop` (desktop shell binary used by `izwi serve --mode desktop`)
+   - `runtime` on Linux and Windows
 2. Desktop installer bundle:
    - Linux: `.deb`
    - Windows: `NSIS .exe`
@@ -72,20 +73,27 @@ For each OS runner, the workflow builds:
 GitHub Releases currently publish:
 
 1. macOS assets as the Metal-capable path for Apple Silicon hosts.
-2. Linux and Windows assets as CPU-focused release artifacts.
+2. Linux and Windows assets as unified CPU/CUDA release artifacts with CPU-safe public entrypoints.
 
-GitHub Releases do **not** currently publish CUDA-enabled binaries.
+Linux and Windows public binary names must remain unchanged:
 
-For NVIDIA hosts, the supported CUDA paths are:
+1. `izwi` / `izwi-server` on Linux
+2. `izwi.exe` / `izwi-server.exe` on Windows
 
-1. Linux source builds using `cargo build --release --features cuda`
-2. The Docker CUDA image/profile
+CUDA-capable binaries are private package resources under `runtime/cuda`. They are built from the same crates with CUDA features enabled and are selected only after the public runtime verifies that the packaged CUDA runtime libraries and host NVIDIA driver are available.
 
-The `Backend Truth` workflow is the pre-release guardrail for this contract:
+CUDA release packaging is preview until a NVIDIA-host runtime smoke test is automated. The supported NVIDIA paths are:
+
+1. Linux and Windows release installers/terminal bundles with compatible NVIDIA drivers
+2. Source builds using `cargo build --release --features cuda`
+3. The Docker CUDA image/profile on Linux
+
+The `Backend Truth` and `Release` workflows are the pre-release guardrails for this contract:
 
 1. CPU cargo checks run separately from CUDA cargo checks.
 2. CPU Docker builds run separately from CUDA Docker builds.
-3. A GPU-host runtime smoke test is still the next gap; until an NVIDIA runner exists, runtime verification remains a manual release check on a CUDA-capable Linux host.
+3. Linux and Windows release jobs verify the unified runtime layout, public CPU-safe startup, private CUDA runtime layout, packaged CUDA runtime libraries, and Tauri resource mappings.
+4. A GPU-host runtime smoke test is still the next gap; until an NVIDIA runner exists, runtime verification remains a manual release check on CUDA-capable Linux and Windows hosts.
 
 The desktop bundle build runs the UI build automatically via Tauri `beforeBuildCommand`, so `ui/dist` is rebuilt from source on each release run.
 
@@ -93,6 +101,7 @@ Linux `.deb` installs:
 
 1. `/usr/bin/izwi`
 2. `/usr/bin/izwi-server`
+3. `/usr/lib/izwi/runtime`
 
 ## Signing and notarization
 

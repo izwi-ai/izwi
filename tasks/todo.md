@@ -138,9 +138,16 @@ Use one shared backend packaging contract instead of copied core files:
   `git diff --check`
   Windows PowerShell execution still needs a Windows runner because `pwsh` is not available on this host. CUDA device selection still needs a real NVIDIA host or self-hosted GPU runner; this phase gates the layout and CPU-safe startup path in hosted release CI.
 
-- [ ] Phase 6: Roll out behind explicit release notes
+- [x] Phase 6: Roll out behind explicit release notes
   Scope:
   Update `docs/RELEASING.md`, support matrix, Linux/Windows install docs, and release body text to describe the new contract. Make the first release a beta/preview CUDA packaging release unless Phase 1-5 smoke tests cover both CPU-only and NVIDIA hosts.
+  Implementation:
+  Updated the release body, release guide, support matrix, Linux install guide, Windows install guide, getting-started page, installation index, source-build guide, inference-engine docs, troubleshooting docs, and README to describe the unified Linux/Windows CPU+CUDA packaging contract. The docs now preserve the public `izwi`/`izwi-server` names, call out private same-basename CUDA runtime packaging, distinguish release installers from source builds, and label release CUDA packaging as preview until GPU-host smoke coverage is automated.
+  Verification:
+  `rg -n "CPU-focused|CPU-only|source-build-only|source-build-first|CUDA / NVIDIA support is|not included|do not ship CUDA|does not currently ship CUDA|assume CPU|dedicated CUDA release artifacts|treat the installed binary as CPU-only|current release workflow builds CPU|release artifacts remain CPU|release package is CPU" README.md docs .github/workflows/release.yml -S`
+  `rg -n "izwi-cuda|izwi-server-cuda|public.*cuda|CUDA-suffixed" README.md docs .github/workflows/release.yml -S`
+  `git diff --check`
+  Remaining grep hits are intentional references to CPU-only hosts, the Docker CPU image, the existing Docker Compose `izwi-cuda` service name, or the canonical rule forbidding public `*-cuda` binaries.
 
 ## Review
 
@@ -154,6 +161,7 @@ Use one shared backend packaging contract instead of copied core files:
 - Phase 3 normalized release build/package inputs around stable public names plus a private `runtime/cuda` layout. Windows PowerShell staging still needs execution on a Windows runner because `pwsh` is not available locally.
 - Phase 4 added runtime truth reporting and public-server CUDA delegation without changing public binary names. CUDA-host execution still needs validation on a NVIDIA host.
 - Phase 5 added release verification gates for Linux and Windows unified runtime artifacts. Hosted CI can now fail on public name drift, missing private runtime layout, missing packaged CUDA runtime libraries, public CUDA loader dependencies, broken public startup probes, and Tauri runtime-resource drift. Real CUDA device selection remains the one verification item that needs a NVIDIA host or self-hosted GPU runner.
+- Phase 6 updated user-facing docs and generated release-body text to describe Linux and Windows release installers as CPU-safe public entrypoints plus private packaged CUDA runtimes. The docs now avoid public CUDA-suffixed binary names and keep CUDA release packaging marked preview until NVIDIA-host smoke coverage is automated.
 
 # Voice Configuration Modal Redesign Plan
 

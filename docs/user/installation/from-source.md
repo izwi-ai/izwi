@@ -6,7 +6,7 @@ See the [Runtime Support Matrix](../support-matrix.md) before choosing a build t
 
 - GitHub Release artifacts and source builds do not expose the same backend set.
 - Metal is the primary accelerated source-build path on Apple Silicon.
-- CUDA should currently be treated as a Linux source-build / Docker path first.
+- CUDA source builds are useful for development, custom validation, and fallback debugging. Linux and Windows release artifacts also include a private packaged CUDA runtime for NVIDIA hosts.
 
 ---
 
