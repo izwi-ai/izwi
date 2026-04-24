@@ -99,6 +99,10 @@ compiled_section_has_cuda() {
     grep -Eiq '(^|[^[:alpha:]])CUDA([^[:alpha:]]|$)'
 }
 
+cuda_loader_env_prefix() {
+    printf '%s:%s/lib' "${runtime_dir}" "${runtime_dir}"
+}
+
 assert_cli_backend_contract() {
     local public_cli="${release_dir}/izwi"
     local private_cli="${runtime_dir}/izwi"
@@ -118,7 +122,10 @@ assert_cli_backend_contract() {
     fi
 
     local private_backends
-    private_backends="$(compiled_backend_lines "${private_cli}")"
+    private_backends="$(
+        LD_LIBRARY_PATH="$(cuda_loader_env_prefix)${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+            compiled_backend_lines "${private_cli}"
+    )"
     echo "Private CUDA CLI compiled backends:"
     printf '%s\n' "${private_backends}" | sed 's/^/  /'
 
@@ -251,10 +258,10 @@ echo "Auditing public CPU-safe binaries:"
 
 echo "Auditing private CUDA runtime binaries:"
 if [[ "$(uname -s)" == "Linux" ]]; then
-    LD_LIBRARY_PATH="${runtime_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
-        "${audit_script}" --allow-missing --skip-startup-probe "${runtime_dir}/izwi" "${runtime_dir}/izwi-server"
+    LD_LIBRARY_PATH="$(cuda_loader_env_prefix)${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+        "${audit_script}" --allow-missing-driver --skip-startup-probe "${runtime_dir}/izwi" "${runtime_dir}/izwi-server"
 else
-    "${audit_script}" --allow-missing --skip-startup-probe "${runtime_dir}/izwi" "${runtime_dir}/izwi-server"
+    "${audit_script}" --allow-missing-driver --skip-startup-probe "${runtime_dir}/izwi" "${runtime_dir}/izwi-server"
 fi
 
 echo "Unified runtime verification passed for ${release_dir}"

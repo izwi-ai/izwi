@@ -92,7 +92,13 @@ function Assert-CliBackendContract {
         return
     }
 
-    $privateBackends = Get-CompiledBackendLines -Binary $privateCli
+    $oldPath = $env:PATH
+    try {
+        $env:PATH = "$runtimeDir;$oldPath"
+        $privateBackends = Get-CompiledBackendLines -Binary $privateCli
+    } finally {
+        $env:PATH = $oldPath
+    }
     Write-Host "Private CUDA CLI compiled backends:"
     $privateBackends | ForEach-Object { Write-Host "  $_" }
     if (-not (Test-BackendSectionHasCuda -Lines $privateBackends)) {
@@ -241,7 +247,7 @@ Write-Host "Auditing private CUDA runtime binaries:"
 $oldPath = $env:PATH
 try {
     $env:PATH = "$runtimeDir;$oldPath"
-    & $auditScript -AllowMissing -ExpectCudaDlls -SkipStartupProbe `
+    & $auditScript -AllowMissingDriver -ExpectCudaDlls -SkipStartupProbe `
         (Join-Path $runtimeDir "izwi.exe") `
         (Join-Path $runtimeDir "izwi-server.exe")
     if ($LASTEXITCODE -ne 0) {

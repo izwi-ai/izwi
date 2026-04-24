@@ -218,6 +218,44 @@ Source:
   Commit:
   `feat(ui): redesign voice agent and memory tabs`
 
+# Unified CPU + CUDA Installer Hardening Plan
+
+## Goal
+
+Close the release and runtime gaps found during the CPU+CUDA installer review without changing public binary names or creating forked vendored copies of core files.
+
+## Phases
+
+- [x] Phase 1: Harden private CUDA runtime verification
+  Scope:
+  Run private Linux CUDA binary probes with the same loader path used at runtime, and make dependency audits fail on missing non-driver dependencies while still tolerating host NVIDIA driver absence in CI.
+  Verification:
+  `bash -n scripts/release/audit-runtime-deps.sh scripts/release/verify-unified-runtime.sh`
+  `scripts/release/verify-unified-runtime.sh --skip-cuda-compiled-check --skip-cuda-library-check`
+
+- [ ] Phase 2: Inspect final packaged artifacts
+  Scope:
+  Add post-package release checks for terminal archives and practical desktop bundle artifacts so CI validates the final shipped layout, not only `target/release`.
+  Verification:
+  Shell/PowerShell syntax checks and release workflow review.
+
+- [ ] Phase 3: Make explicit CUDA strict
+  Scope:
+  Ensure `--backend cuda` fails clearly when CUDA cannot actually be selected after private runtime delegation, instead of silently serving on CPU.
+  Verification:
+  `cargo check -p izwi-core -p izwi-server`
+  Targeted backend-selection tests where practical.
+
+- [ ] Phase 4: Remove path exposure from public health
+  Scope:
+  Keep `/v1/health` useful with booleans and missing library labels, but stop serializing private runtime and search paths by default.
+  Verification:
+  `cargo check -p izwi-server`
+
+## Review
+
+- Phase 1 complete: private Linux CUDA backend probes now run with the packaged runtime loader path, and private runtime audits now tolerate missing host NVIDIA driver libraries without allowing missing packaged CUDA runtime dependencies to pass silently. Windows audit logic was updated to the same contract, but still needs execution on a Windows runner because PowerShell is not available on this host.
+
 ## Review
 
 - Phase 1 complete: replaced the heavy card-style modal shell with a calmer two-zone settings layout, upgraded the header hierarchy, and turned the tab strip into product-style section navigation with lighter chrome.
