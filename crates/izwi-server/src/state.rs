@@ -306,12 +306,13 @@ fn trim_store_by<T>(
 #[cfg(test)]
 mod tests {
     use super::{
-        now_unix_secs, request_limits, trim_store_by, ServerLifecycle, StoredAgentSessionRecord,
-        StoredResponseInputItem, StoredResponseRecord,
+        now_unix_secs, request_limits, trim_store_by, AppState, ServerLifecycle,
+        StoredAgentSessionRecord, StoredResponseInputItem, StoredResponseRecord,
     };
     use izwi_agent::planner::PlanningMode;
-    use izwi_core::ServeRuntimeConfig;
+    use izwi_core::{backends::BackendPreference, RuntimeService, ServeRuntimeConfig};
     use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
 
     #[test]
     fn trim_store_by_evicts_oldest_response_record() {
@@ -427,5 +428,128 @@ mod tests {
         assert_eq!(draining.phase, "draining");
         assert!(draining.updated_at >= ready.updated_at);
         assert!(draining.updated_at >= now_unix_secs().saturating_sub(1));
+    }
+
+    #[tokio::test]
+    async fn app_state_response_store_limit_evicts_oldest_record() {
+        let _guard = env_lock();
+        let (state, _temp_dir) = test_app_state("response_store_limit", 1, 8);
+
+        state
+            .store_response_record(response_record("resp-old", 10))
+            .await;
+        state
+            .store_response_record(response_record("resp-new", 20))
+            .await;
+
+        let store = state.response_store.read().await;
+        assert!(store.contains_key("resp-new"));
+        assert!(!store.contains_key("resp-old"));
+    }
+
+    #[tokio::test]
+    async fn app_state_agent_session_store_limit_evicts_oldest_record() {
+        let _guard = env_lock();
+        let (state, _temp_dir) = test_app_state("agent_session_store_limit", 8, 1);
+
+        state
+            .store_agent_session_record(agent_session_record("sess-old", 5))
+            .await;
+        state
+            .store_agent_session_record(agent_session_record("sess-new", 15))
+            .await;
+
+        let store = state.agent_session_store.read().await;
+        assert!(store.contains_key("sess-new"));
+        assert!(!store.contains_key("sess-old"));
+    }
+
+    fn response_record(id: &str, created_at: u64) -> StoredResponseRecord {
+        StoredResponseRecord {
+            id: id.to_string(),
+            created_at,
+            status: "completed".to_string(),
+            model: "test".to_string(),
+            input_items: Vec::new(),
+            output_text: Some(id.to_string()),
+            input_tokens: 1,
+            output_tokens: 1,
+            error: None,
+            metadata: None,
+        }
+    }
+
+    fn agent_session_record(id: &str, updated_at: u64) -> StoredAgentSessionRecord {
+        StoredAgentSessionRecord {
+            id: id.to_string(),
+            agent_id: "agent".to_string(),
+            thread_id: format!("thread-{id}"),
+            model_id: "model".to_string(),
+            system_prompt: "prompt".to_string(),
+            planning_mode: PlanningMode::Auto,
+            created_at: updated_at,
+            updated_at,
+        }
+    }
+
+    fn test_app_state(
+        name: &str,
+        response_limit: usize,
+        agent_session_limit: usize,
+    ) -> (AppState, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().expect("temp dir should create");
+        let models_dir = temp_dir.path().join("models");
+        let media_dir = temp_dir.path().join("media");
+        std::fs::create_dir_all(&models_dir).expect("models dir should be created");
+
+        std::env::set_var(
+            "IZWI_DB_PATH",
+            temp_dir.path().join(format!("{name}.sqlite3")),
+        );
+        std::env::set_var("IZWI_MEDIA_DIR", &media_dir);
+        std::env::set_var(
+            "IZWI_MAX_RESPONSE_STORE_ENTRIES",
+            response_limit.to_string(),
+        );
+        std::env::set_var(
+            "IZWI_MAX_AGENT_SESSION_STORE_ENTRIES",
+            agent_session_limit.to_string(),
+        );
+
+        let serve_config = ServeRuntimeConfig {
+            backend: BackendPreference::Cpu,
+            models_dir,
+            ..ServeRuntimeConfig::default()
+        };
+        let runtime =
+            with_suppressed_panic_hook(|| RuntimeService::new(serve_config.engine_config()))
+                .expect("runtime should initialize");
+        let state = AppState::new(runtime, &serve_config).expect("state should initialize");
+        clear_store_env();
+
+        (state, temp_dir)
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("environment lock poisoned")
+    }
+
+    fn clear_store_env() {
+        std::env::remove_var("IZWI_DB_PATH");
+        std::env::remove_var("IZWI_MEDIA_DIR");
+        std::env::remove_var("IZWI_MAX_RESPONSE_STORE_ENTRIES");
+        std::env::remove_var("IZWI_MAX_AGENT_SESSION_STORE_ENTRIES");
+    }
+
+    fn with_suppressed_panic_hook<T>(f: impl FnOnce() -> T) -> T {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = f();
+        std::panic::set_hook(default_hook);
+        result
     }
 }

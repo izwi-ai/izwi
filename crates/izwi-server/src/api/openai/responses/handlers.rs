@@ -824,7 +824,9 @@ fn sse_event(event_name: &str, payload: &str) -> String {
 mod tests {
     use super::super::dto::{ResponseInputContentPart, ResponseInputItem};
     use super::*;
+    use izwi_core::{backends::BackendPreference, RuntimeService, ServeRuntimeConfig};
     use serde_json::json;
+    use std::sync::{Mutex, OnceLock};
 
     #[test]
     fn builds_messages_from_text_and_instructions() {
@@ -1035,5 +1037,82 @@ mod tests {
         assert_eq!(item.content.len(), 1);
         assert_eq!(item.content[0].content_type, "output_text");
         assert_eq!(item.content[0].text, "hello");
+    }
+
+    #[tokio::test]
+    async fn store_false_does_not_retain_response_record() {
+        let _guard = env_lock();
+        let (state, _temp_dir) = test_app_state("responses_store_false");
+
+        persist_response(&state, response_record("resp-skip"), Some(false)).await;
+        assert!(
+            state.response_store.read().await.is_empty(),
+            "store:false should skip in-memory retention"
+        );
+
+        persist_response(&state, response_record("resp-store"), None).await;
+        assert!(
+            state.response_store.read().await.contains_key("resp-store"),
+            "default store behavior should retain completed responses"
+        );
+    }
+
+    fn response_record(id: &str) -> StoredResponseRecord {
+        StoredResponseRecord {
+            id: id.to_string(),
+            created_at: now_unix_secs(),
+            status: "completed".to_string(),
+            model: "test".to_string(),
+            input_items: Vec::new(),
+            output_text: Some("ok".to_string()),
+            input_tokens: 1,
+            output_tokens: 1,
+            error: None,
+            metadata: None,
+        }
+    }
+
+    fn test_app_state(name: &str) -> (AppState, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().expect("temp dir should create");
+        let models_dir = temp_dir.path().join("models");
+        let media_dir = temp_dir.path().join("media");
+        std::fs::create_dir_all(&models_dir).expect("models dir should be created");
+
+        std::env::set_var(
+            "IZWI_DB_PATH",
+            temp_dir.path().join(format!("{name}.sqlite3")),
+        );
+        std::env::set_var("IZWI_MEDIA_DIR", &media_dir);
+
+        let serve_config = ServeRuntimeConfig {
+            backend: BackendPreference::Cpu,
+            models_dir,
+            ..ServeRuntimeConfig::default()
+        };
+        let runtime =
+            with_suppressed_panic_hook(|| RuntimeService::new(serve_config.engine_config()))
+                .expect("runtime should initialize");
+        let state = AppState::new(runtime, &serve_config).expect("state should initialize");
+
+        std::env::remove_var("IZWI_DB_PATH");
+        std::env::remove_var("IZWI_MEDIA_DIR");
+
+        (state, temp_dir)
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("environment lock poisoned")
+    }
+
+    fn with_suppressed_panic_hook<T>(f: impl FnOnce() -> T) -> T {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = f();
+        std::panic::set_hook(default_hook);
+        result
     }
 }

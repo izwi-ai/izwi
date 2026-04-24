@@ -232,25 +232,32 @@ Notes:
 
 ### Phase 4: Preview Semantics Hardening For Responses And Agent Sessions
 
+Status: complete.
+
 Goal:
 
 - Make the current non-durable decision intentional, tested, and legible.
 
 Tasks:
 
-- [ ] Add clear docs for `/v1/responses` retention: process-local, bounded memory, evicted by age, lost on restart.
-- [ ] Add clear docs for `/v1/agent/sessions`: session metadata process-local, chat thread/messages durable.
-- [ ] Add tests for `store:false` not retaining response records.
-- [ ] Add tests for bounded response eviction.
-- [ ] Add tests for bounded agent-session eviction.
-- [ ] Consider preview headers or response metadata for preview/process-local APIs if useful.
-- [ ] Align UI/client assumptions so durable history uses chat/voice stores, not response/agent-session ids.
+- [x] Add clear docs for `/v1/responses` retention: process-local, bounded memory, evicted by age, lost on restart.
+- [x] Add clear docs for `/v1/agent/sessions`: session metadata process-local, chat thread/messages durable.
+- [x] Add tests for `store:false` not retaining response records.
+- [x] Add tests for bounded response eviction.
+- [x] Add tests for bounded agent-session eviction.
+- [x] Consider preview headers or response metadata for preview/process-local APIs if useful.
+- [x] Align UI/client assumptions so durable history uses chat/voice stores, not response/agent-session ids.
 
 Verification:
 
-- [ ] Targeted server tests for response and agent session memory semantics.
-- [ ] Docs grep confirms preview/non-durable wording.
-- [ ] `cargo check --locked -p izwi-server`.
+- [x] Targeted server tests for response and agent session memory semantics.
+- [x] Docs grep confirms preview/non-durable wording.
+- [x] `cargo check --locked -p izwi-server`.
+
+Notes:
+
+- Preview headers were not added because the support matrix and dev docs now carry the explicit contract, and adding headers would broaden the API surface for preview routes.
+- UI audit found the chat title helper already uses `/v1/responses` with `store: false`; durable chat history uses the chat-thread APIs rather than response or agent-session ids.
 
 ### Phase 5: Optional Durable Promotion Path
 
