@@ -14,7 +14,7 @@ izwi status [OPTIONS]
 
 ## Description
 
-Displays the current state of the Izwi server, including health, loaded models, and runtime backend selection.
+Displays the current state of the Izwi server, including health, loaded models, and runtime backend selection. This command reads `/v1/health`, the rich runtime status payload.
 
 ---
 
@@ -49,6 +49,8 @@ This reads the server health payload and reports:
 - whether the selection came from the request or a fallback path
 - which backends were compiled into the running binary
 - detected device capabilities such as BF16, unified memory, batch size, and memory when available
+
+Deployment healthchecks should use `/readyz` for readiness and `/livez` for liveness. `izwi status` intentionally stays on `/v1/health` so it can report backend and model details.
 
 ### Watch mode
 

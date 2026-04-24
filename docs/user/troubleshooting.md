@@ -71,12 +71,18 @@ izwi serve
    izwi status
    ```
 
-2. Check the correct URL:
+2. Check the operational probes:
+   ```bash
+   curl -f http://localhost:8080/livez
+   curl -f http://localhost:8080/readyz
+   ```
+
+3. Check the correct URL:
    ```
    http://localhost:8080
    ```
 
-3. Check firewall settings
+4. Check firewall settings
 
 ### Server crashes on startup
 

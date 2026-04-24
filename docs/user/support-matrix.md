@@ -55,6 +55,7 @@ The runtime exposes both compatibility APIs and first-party local workflow APIs 
 | **`POST /v1/audio/transcriptions`** | Stable | Core OpenAI-compatible transcription surface. |
 | **`POST /v1/chat/completions`** | Stable | Core OpenAI-compatible chat surface. |
 | **`GET /v1/models`** | Stable | Live model catalog / availability surface. |
+| **Operational probes (`/livez`, `/readyz`, `/v1/live`, `/v1/ready`)** | Stable | Use `/livez` for cheap liveness and `/readyz` for readiness or deployment healthchecks. `/v1/health` remains the richer status payload. |
 | **Local CLI workflows (`izwi serve`, `izwi pull`, `izwi tts`, `izwi transcribe`)** | Stable | Primary user-facing local runtime workflows. |
 | **`POST /v1/responses` and response-object lifecycle routes** | Preview | Response objects are stored in bounded process memory for compatibility convenience. They can be evicted and are lost on server restart. |
 | **`/v1/admin/*` model-management APIs** | Preview | Operator-oriented local admin APIs; auth and long-term contract are not finalized. |

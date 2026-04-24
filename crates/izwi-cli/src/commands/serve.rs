@@ -98,8 +98,10 @@ pub async fn execute(args: ServeArgs) -> Result<()> {
             if !args.runtime.ui_enabled {
                 eprintln!(
                     "{}",
-                    style("Web mode requested with --no-ui; opening the health endpoint instead.")
-                        .yellow()
+                    style(
+                        "Web mode requested with --no-ui; opening the readiness endpoint instead.",
+                    )
+                    .yellow()
                 );
             }
 
@@ -398,11 +400,11 @@ async fn wait_for_server_ready(api_endpoint: &str, timeout: Duration) -> Result<
         .timeout(Duration::from_secs(2))
         .build()?;
 
-    let health_url = format!("{}/health", api_endpoint);
+    let ready_url = readiness_url(api_endpoint);
     let deadline = Instant::now() + timeout;
 
     loop {
-        if let Ok(resp) = client.get(&health_url).send().await {
+        if let Ok(resp) = client.get(&ready_url).send().await {
             if resp.status().is_success() {
                 return Ok(());
             }
@@ -412,12 +414,16 @@ async fn wait_for_server_ready(api_endpoint: &str, timeout: Duration) -> Result<
             return Err(CliError::Other(format!(
                 "Server did not become ready within {}s ({})",
                 timeout.as_secs(),
-                health_url
+                ready_url
             )));
         }
 
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+fn readiness_url(api_endpoint: &str) -> String {
+    format!("{}/ready", api_endpoint)
 }
 
 async fn supervise_desktop_mode(server: &mut Child, desktop: &mut Child) -> Result<()> {
@@ -509,7 +515,7 @@ fn server_connect_host(host: &str) -> String {
 
 fn browser_target(host: &str, port: u16, no_ui: bool) -> String {
     if no_ui {
-        format!("http://{}:{}/v1/health", host, port)
+        format!("http://{}:{}/v1/ready", host, port)
     } else {
         format!("http://{}:{}", host, port)
     }
@@ -596,14 +602,22 @@ mod tests {
     }
 
     #[test]
-    fn browser_target_uses_health_when_ui_is_disabled() {
+    fn browser_target_uses_readiness_when_ui_is_disabled() {
         assert_eq!(
             browser_target("127.0.0.1", 8080, true),
-            "http://127.0.0.1:8080/v1/health"
+            "http://127.0.0.1:8080/v1/ready"
         );
         assert_eq!(
             browser_target("127.0.0.1", 8080, false),
             "http://127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn startup_wait_uses_readiness_endpoint() {
+        assert_eq!(
+            readiness_url("http://127.0.0.1:8080/v1"),
+            "http://127.0.0.1:8080/v1/ready"
         );
     }
 }

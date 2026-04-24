@@ -73,7 +73,7 @@ Starts the server and opens the browser.
 izwi serve --mode web
 ```
 
-When `--no-ui` is set, web mode opens `http://<host>:<port>/v1/health` instead of the UI root.
+When `--no-ui` is set, web mode opens `http://<host>:<port>/v1/ready` instead of the UI root.
 
 ---
 
@@ -167,6 +167,8 @@ dir = "ui/dist"
 ## Graceful Shutdown
 
 Press `Ctrl+C` to gracefully shut down the server. Active requests finish before shutdown.
+
+During startup, `izwi serve` waits for the readiness endpoint before opening desktop or web clients. Use `/readyz` for deployment readiness checks and `/livez` for cheap liveness checks; `/v1/health` remains the richer status payload used by `izwi status`.
 
 ---
 
