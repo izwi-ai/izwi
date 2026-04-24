@@ -150,27 +150,29 @@ Out of scope:
 
 ### Phase 1: Probe Contract And Lifecycle State
 
+Status: complete.
+
 Goal:
 
 - Add real liveness/readiness semantics without breaking existing `/v1/health` clients.
 
 Tasks:
 
-- [ ] Keep `/v1/health` backward-compatible as the rich status summary.
-- [ ] Add root `/livez` and `/readyz`.
-- [ ] Consider `/v1/live` and `/v1/ready` aliases for API namespace consistency.
-- [ ] Add a small lifecycle state to server/AppState: startup time, phase, ready flag, degraded reasons, preload/warmup errors, shutdown/draining flag.
-- [ ] Mark server unready before graceful shutdown starts.
-- [ ] Define readiness reason codes, for example `runtime_initialized`, `stores_available`, `backend_available`, `preload_complete`, `worker_health`, `not_draining`.
-- [ ] Return compact JSON and `200` when ready, compact JSON and `503` when unready.
-- [ ] Keep liveness cheap and independent of model readiness.
+- [x] Keep `/v1/health` backward-compatible as the rich status summary.
+- [x] Add root `/livez` and `/readyz`.
+- [x] Consider `/v1/live` and `/v1/ready` aliases for API namespace consistency.
+- [x] Add a small lifecycle state to server/AppState: startup time, phase, ready flag, degraded reasons, preload/warmup errors, shutdown/draining flag.
+- [x] Mark server unready before graceful shutdown starts.
+- [x] Define readiness reason codes, for example `runtime_initialized`, `stores_available`, `backend_available`, `preload_complete`, `worker_health`, `not_draining`.
+- [x] Return compact JSON and `200` when ready, compact JSON and `503` when unready.
+- [x] Keep liveness cheap and independent of model readiness.
 
 Verification:
 
-- [ ] Router tests for `/livez` returning `200`.
-- [ ] Router tests for `/readyz` returning `200` when initialized.
-- [ ] Unit tests for unready/degraded reason rendering.
-- [ ] Shutdown/drain state test where practical.
+- [x] Router tests for `/livez` returning `200`.
+- [x] Router tests for `/readyz` returning `200` when initialized.
+- [x] Unit tests for unready/degraded reason rendering.
+- [x] Shutdown/drain state test where practical.
 
 ### Phase 2: Switch Dependents To The Right Probe
 

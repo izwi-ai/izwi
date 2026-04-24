@@ -1,7 +1,9 @@
 use axum::{
     extract::Request,
     http::{HeaderValue, StatusCode},
-    middleware, Router,
+    middleware,
+    routing::get,
+    Router,
 };
 use izwi_core::ServeRuntimeConfig;
 use tower_http::cors::{Any, CorsLayer};
@@ -57,6 +59,8 @@ pub fn create_router(state: AppState, serve_config: &ServeRuntimeConfig) -> Rout
         .fallback(api_not_found);
 
     let app = Router::new()
+        .route("/livez", get(crate::api::internal::probes::live_check))
+        .route("/readyz", get(crate::api::internal::probes::ready_check))
         .nest("/v1", v1_routes)
         // Compatibility mount for tooling that queries /internal/* directly.
         .nest("/internal", crate::api::internal::router())
@@ -455,7 +459,11 @@ mod tests {
 
         let transcription_create = send_request(
             app.clone(),
-            build_request(Method::POST, "/v1/transcriptions", Some("{\"audio_base64\":\"AQ==\"}")),
+            build_request(
+                Method::POST,
+                "/v1/transcriptions",
+                Some("{\"audio_base64\":\"AQ==\"}"),
+            ),
         )
         .await;
         assert_eq!(transcription_create.status(), StatusCode::ACCEPTED);
@@ -468,7 +476,11 @@ mod tests {
 
         let diarization_create = send_request(
             app.clone(),
-            build_request(Method::POST, "/v1/diarizations", Some("{\"audio_base64\":\"AQ==\"}")),
+            build_request(
+                Method::POST,
+                "/v1/diarizations",
+                Some("{\"audio_base64\":\"AQ==\"}"),
+            ),
         )
         .await;
         assert_eq!(diarization_create.status(), StatusCode::ACCEPTED);
@@ -481,11 +493,7 @@ mod tests {
 
         let unified_list = send_request(
             app.clone(),
-            build_request(
-                Method::GET,
-                "/v1/transcriptions/jobs?job_kind=all",
-                None,
-            ),
+            build_request(Method::GET, "/v1/transcriptions/jobs?job_kind=all", None),
         )
         .await;
         assert_eq!(unified_list.status(), StatusCode::OK);
@@ -760,7 +768,11 @@ mod tests {
         // Compatibility check: legacy mutation route still works.
         let legacy_create = send_request(
             app,
-            build_request(Method::POST, "/v1/diarizations", Some("{\"audio_base64\":\"AQ==\"}")),
+            build_request(
+                Method::POST,
+                "/v1/diarizations",
+                Some("{\"audio_base64\":\"AQ==\"}"),
+            ),
         )
         .await;
         assert_eq!(legacy_create.status(), StatusCode::ACCEPTED);
@@ -1146,6 +1158,42 @@ mod tests {
         drop(temp_dir);
     }
 
+    #[tokio::test]
+    async fn root_and_v1_probe_routes_are_available() {
+        let (app, temp_dir) = test_api_app("probe_routes_available", false);
+
+        assert_route_status(app.clone(), Method::GET, "/livez", None, StatusCode::OK).await;
+        assert_route_status(app.clone(), Method::GET, "/readyz", None, StatusCode::OK).await;
+        assert_route_status(app.clone(), Method::GET, "/v1/live", None, StatusCode::OK).await;
+        assert_route_status(app, Method::GET, "/v1/ready", None, StatusCode::OK).await;
+
+        drop(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn readyz_returns_unavailable_when_lifecycle_is_draining() {
+        let (state, temp_dir) = test_state("readyz_draining", false);
+        state.lifecycle.mark_ready();
+        state.lifecycle.mark_draining();
+        let serve_config = ServeRuntimeConfig {
+            backend: izwi_core::backends::BackendPreference::Cpu,
+            ui_enabled: false,
+            ..ServeRuntimeConfig::default()
+        };
+        let app = create_router(state, &serve_config);
+
+        assert_route_status(
+            app,
+            Method::GET,
+            "/readyz",
+            None,
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+        .await;
+
+        drop(temp_dir);
+    }
+
     async fn send_request(mut app: Router, request: Request<Body>) -> Response {
         app.as_service::<Body>()
             .call(request)
@@ -1202,6 +1250,17 @@ mod tests {
     }
 
     fn test_api_app(name: &str, ui_enabled: bool) -> (Router, TempDirGuard) {
+        let (state, temp_dir) = test_state(name, ui_enabled);
+        state.lifecycle.mark_ready();
+        let serve_config = ServeRuntimeConfig {
+            backend: izwi_core::backends::BackendPreference::Cpu,
+            ui_enabled,
+            ..ServeRuntimeConfig::default()
+        };
+        (create_router(state, &serve_config), temp_dir)
+    }
+
+    fn test_state(name: &str, ui_enabled: bool) -> (AppState, TempDirGuard) {
         let temp_dir = test_ui_dir(name);
         let ui_dir = temp_dir.join("ui");
         let models_dir = temp_dir.join("models");
@@ -1234,7 +1293,7 @@ mod tests {
         std::env::remove_var("IZWI_DB_PATH");
         std::env::remove_var("IZWI_MEDIA_DIR");
 
-        (create_router(state, &serve_config), TempDirGuard(temp_dir))
+        (state, TempDirGuard(temp_dir))
     }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {

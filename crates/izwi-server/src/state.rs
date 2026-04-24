@@ -14,6 +14,7 @@ use izwi_core::{RuntimeService, ServeRuntimeConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{RwLock, Semaphore};
 
 const DEFAULT_RESPONSE_STORE_LIMIT: usize = 512;
@@ -52,11 +53,100 @@ pub struct StoredAgentSessionRecord {
     pub updated_at: u64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct LifecycleSnapshot {
+    pub phase: String,
+    pub ready: bool,
+    pub draining: bool,
+    pub started_at: u64,
+    pub updated_at: u64,
+    pub startup_warnings: Vec<String>,
+}
+
+#[derive(Debug)]
+struct LifecycleInner {
+    phase: String,
+    ready: bool,
+    draining: bool,
+    started_at: u64,
+    updated_at: u64,
+    startup_warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ServerLifecycle {
+    inner: Arc<std::sync::RwLock<LifecycleInner>>,
+}
+
+impl ServerLifecycle {
+    fn new() -> Self {
+        let now = now_unix_secs();
+        Self {
+            inner: Arc::new(std::sync::RwLock::new(LifecycleInner {
+                phase: "initializing".to_string(),
+                ready: false,
+                draining: false,
+                started_at: now,
+                updated_at: now,
+                startup_warnings: Vec::new(),
+            })),
+        }
+    }
+
+    pub fn mark_ready(&self) {
+        self.update(|inner| {
+            inner.phase = "ready".to_string();
+            inner.ready = true;
+            inner.draining = false;
+        });
+    }
+
+    pub fn mark_draining(&self) {
+        self.update(|inner| {
+            inner.phase = "draining".to_string();
+            inner.ready = false;
+            inner.draining = true;
+        });
+    }
+
+    pub fn record_startup_warnings(&self, warnings: impl IntoIterator<Item = String>) {
+        self.update(|inner| {
+            inner.startup_warnings.extend(warnings);
+        });
+    }
+
+    pub fn snapshot(&self) -> LifecycleSnapshot {
+        let guard = self
+            .inner
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner());
+        LifecycleSnapshot {
+            phase: guard.phase.clone(),
+            ready: guard.ready,
+            draining: guard.draining,
+            started_at: guard.started_at,
+            updated_at: guard.updated_at,
+            startup_warnings: guard.startup_warnings.clone(),
+        }
+    }
+
+    fn update(&self, f: impl FnOnce(&mut LifecycleInner)) {
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        f(&mut guard);
+        guard.updated_at = now_unix_secs();
+    }
+}
+
 /// Shared application state with fine-grained locking and backpressure
 #[derive(Clone)]
 pub struct AppState {
     /// Runtime service reference - using Arc for cheap clones
     pub runtime: Arc<RuntimeService>,
+    /// Server lifecycle state used by readiness and liveness probes.
+    pub lifecycle: ServerLifecycle,
     /// Concurrency limiter to prevent resource exhaustion
     pub request_semaphore: Arc<Semaphore>,
     /// Request timeout configuration (seconds)
@@ -113,6 +203,7 @@ impl AppState {
 
         Ok(Self {
             runtime: Arc::new(runtime),
+            lifecycle: ServerLifecycle::new(),
             request_semaphore: Arc::new(Semaphore::new(max_concurrent_requests)),
             request_timeout_secs,
             response_store_limit,
@@ -169,6 +260,13 @@ impl AppState {
     }
 }
 
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn request_limits(serve_config: &ServeRuntimeConfig) -> (usize, u64) {
     (
         serve_config.max_concurrent_requests.max(1),
@@ -208,8 +306,8 @@ fn trim_store_by<T>(
 #[cfg(test)]
 mod tests {
     use super::{
-        request_limits, trim_store_by, StoredAgentSessionRecord, StoredResponseInputItem,
-        StoredResponseRecord,
+        now_unix_secs, request_limits, trim_store_by, ServerLifecycle, StoredAgentSessionRecord,
+        StoredResponseInputItem, StoredResponseRecord,
     };
     use izwi_agent::planner::PlanningMode;
     use izwi_core::ServeRuntimeConfig;
@@ -306,5 +404,28 @@ mod tests {
 
         assert_eq!(request_timeout_secs, 91);
         assert_eq!(max_concurrent_requests, 7);
+    }
+
+    #[test]
+    fn server_lifecycle_transitions_to_ready_and_draining() {
+        let lifecycle = ServerLifecycle::new();
+        let initial = lifecycle.snapshot();
+        assert!(!initial.ready);
+        assert_eq!(initial.phase, "initializing");
+
+        lifecycle.record_startup_warnings(vec!["preload failed".to_string()]);
+        lifecycle.mark_ready();
+        let ready = lifecycle.snapshot();
+        assert!(ready.ready);
+        assert_eq!(ready.phase, "ready");
+        assert_eq!(ready.startup_warnings, vec!["preload failed"]);
+
+        lifecycle.mark_draining();
+        let draining = lifecycle.snapshot();
+        assert!(!draining.ready);
+        assert!(draining.draining);
+        assert_eq!(draining.phase, "draining");
+        assert!(draining.updated_at >= ready.updated_at);
+        assert!(draining.updated_at >= now_unix_secs().saturating_sub(1));
     }
 }
