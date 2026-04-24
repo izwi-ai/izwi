@@ -4,20 +4,22 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: scripts/release/audit-runtime-deps.sh [--allow-missing] [--skip-startup-probe] <binary>...
+Usage: scripts/release/audit-runtime-deps.sh [--allow-missing] [--allow-missing-driver] [--skip-startup-probe] <binary>...
 
 Audits release binaries for loader-visible runtime dependencies and verifies
 that each binary can at least enter its version/help path. This is intended for
 CPU-only and CUDA-host smoke checks after building release artifacts.
 
 Options:
-  --allow-missing       Report missing shared libraries without failing the audit.
-  --skip-startup-probe  Do not execute --version/--help after loader inspection.
-  -h, --help            Show this help.
+  --allow-missing         Report missing shared libraries without failing the audit.
+  --allow-missing-driver  Allow missing NVIDIA host driver libraries, but fail other missing libraries.
+  --skip-startup-probe    Do not execute --version/--help after loader inspection.
+  -h, --help              Show this help.
 EOF
 }
 
 allow_missing=0
+allow_missing_driver=0
 skip_startup_probe=0
 binaries=()
 
@@ -25,6 +27,9 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --allow-missing)
             allow_missing=1
+            ;;
+        --allow-missing-driver)
+            allow_missing_driver=1
             ;;
         --skip-startup-probe)
             skip_startup_probe=1
@@ -59,6 +64,7 @@ if [[ ${#binaries[@]} -eq 0 ]]; then
 fi
 
 cuda_pattern='(libcuda|libcudart|libcublas|libcublasLt|libcurand|libnvrtc|libcudnn|nvcuda|cudart|cublas|curand|nvrtc|cudnn)'
+driver_missing_pattern='^[[:space:]]*(libcuda\.so|libnvidia-[^[:space:]]+\.so)'
 failed=0
 
 have_command() {
@@ -90,6 +96,7 @@ probe_startup() {
 audit_linux() {
     local binary="$1"
     local ldd_output
+    local missing_output
 
     if have_command readelf; then
         echo "ELF dynamic entries:"
@@ -108,10 +115,22 @@ audit_linux() {
     echo "CUDA-linked libraries detected by loader:"
     printf '%s\n' "$ldd_output" | grep -Ei "$cuda_pattern" | sed 's/^/  /' || echo "  (none)"
 
-    if printf '%s\n' "$ldd_output" | grep -q 'not found'; then
+    missing_output="$(printf '%s\n' "$ldd_output" | grep 'not found' || true)"
+    if [[ -n "${missing_output}" ]]; then
         echo "Missing shared libraries detected."
         if [[ "$allow_missing" -eq 0 ]]; then
-            return 1
+            if [[ "$allow_missing_driver" -eq 1 ]]; then
+                local unexpected_missing
+                unexpected_missing="$(printf '%s\n' "${missing_output}" | grep -Eiv "${driver_missing_pattern}" || true)"
+                if [[ -n "${unexpected_missing}" ]]; then
+                    echo "Missing non-driver shared libraries:"
+                    printf '%s\n' "${unexpected_missing}" | sed 's/^/  /'
+                    return 1
+                fi
+                echo "Only NVIDIA host driver libraries are missing; allowed for this audit."
+            else
+                return 1
+            fi
         fi
     fi
 }

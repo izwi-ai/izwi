@@ -1,5 +1,6 @@
 param(
     [switch]$AllowMissing,
+    [switch]$AllowMissingDriver,
     [switch]$ExpectCudaDlls,
     [switch]$SkipStartupProbe,
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -11,14 +12,15 @@ $ErrorActionPreference = "Stop"
 
 function Show-Usage {
     @"
-Usage: scripts/release/audit-runtime-deps.ps1 [-AllowMissing] [-ExpectCudaDlls] [-SkipStartupProbe] <binary>...
+Usage: scripts/release/audit-runtime-deps.ps1 [-AllowMissing] [-AllowMissingDriver] [-ExpectCudaDlls] [-SkipStartupProbe] <binary>...
 
 Audits Windows release binaries for CUDA DLL availability and verifies that
 each binary can at least enter its version/help path.
 
 Options:
-  -AllowMissing    Report missing CUDA DLLs without failing the audit.
-  -ExpectCudaDlls  Require CUDA runtime DLLs other than nvcuda.dll to be visible.
+  -AllowMissing       Report missing CUDA DLLs without failing the audit.
+  -AllowMissingDriver Allow missing nvcuda.dll, but fail other missing CUDA DLLs.
+  -ExpectCudaDlls     Require CUDA runtime DLLs other than nvcuda.dll to be visible.
   -SkipStartupProbe
                    Do not execute --version/--help after DLL inspection.
 "@
@@ -38,6 +40,8 @@ $cudaDllPatterns = @(
     "nvrtc64_*.dll",
     "cudnn64_*.dll"
 )
+
+$cudaDependencyPattern = "(?i)\b([A-Za-z0-9_.-]*(cuda|cublas|curand|nvrtc|cudnn)[A-Za-z0-9_.-]*\.dll)\b"
 
 function Resolve-DllCandidate {
     param([string]$Pattern, [string]$BinaryDir)
@@ -62,6 +66,40 @@ function Resolve-DllCandidate {
     }
 
     return $null
+}
+
+function Is-DriverDll {
+    param([string]$Name)
+
+    return $Name -ieq "nvcuda.dll"
+}
+
+function Get-CudaDependencyNames {
+    param([object[]]$DumpbinOutput)
+
+    $names = @()
+    foreach ($line in $DumpbinOutput) {
+        $text = [string]$line
+        if ($text -match $cudaDependencyPattern) {
+            $names += $Matches[1]
+        }
+    }
+
+    return $names | Sort-Object -Unique
+}
+
+function Test-MissingAllowed {
+    param([string]$Name)
+
+    if ($AllowMissing) {
+        return $true
+    }
+
+    if ($AllowMissingDriver -and (Is-DriverDll -Name $Name)) {
+        return $true
+    }
+
+    return $false
 }
 
 function Invoke-StartupProbe {
@@ -143,6 +181,15 @@ foreach ($binary in $Binaries) {
         Write-Host "dumpbin /DEPENDENTS:"
         $deps = & $dumpbin /DEPENDENTS $resolved 2>&1
         $deps | ForEach-Object { Write-Host "  $_" }
+
+        $cudaDeps = Get-CudaDependencyNames -DumpbinOutput $deps
+        foreach ($dep in $cudaDeps) {
+            $found = Resolve-DllCandidate -Pattern $dep -BinaryDir $binaryDir
+            if (-not $found -and -not (Test-MissingAllowed -Name $dep)) {
+                Write-Host "  missing imported CUDA DLL: $dep"
+                $failed = $true
+            }
+        }
     } else {
         Write-Host "dumpbin.exe not found; checking known CUDA DLLs on PATH and next to the binary."
     }
@@ -154,7 +201,7 @@ foreach ($binary in $Binaries) {
             Write-Host "  $pattern -> $found"
         } else {
             Write-Host "  $pattern -> missing"
-            if ($ExpectCudaDlls -and -not $AllowMissing -and $pattern -ne "nvcuda.dll") {
+            if ($ExpectCudaDlls -and -not (Test-MissingAllowed -Name $pattern)) {
                 $failed = $true
             }
         }
