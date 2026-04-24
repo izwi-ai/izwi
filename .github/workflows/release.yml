@@ -170,6 +170,12 @@ jobs:
               izwi izwi-server izwi-desktop
           fi
 
+      - name: Verify terminal archive contents (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          scripts/release/verify-packaged-artifacts.sh \
+            --terminal-archive "release-assets/izwi-cli-${{ github.ref_name }}-${{ matrix.asset_suffix }}.tar.gz"
+
       - name: Package terminal binaries (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -182,6 +188,13 @@ jobs:
             target/release/runtime `
             -DestinationPath "release-assets/izwi-cli-${{ github.ref_name }}-${{ matrix.asset_suffix }}.zip" `
             -Force
+
+      - name: Verify terminal archive contents (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          scripts/release/verify-packaged-artifacts.ps1 `
+            -TerminalZip "release-assets/izwi-cli-${{ github.ref_name }}-${{ matrix.asset_suffix }}.zip"
 
       - name: Include macOS uninstall helper
         if: runner.os == 'macOS'
@@ -201,6 +214,33 @@ jobs:
             --bundles deb,appimage \
             --config crates/izwi-desktop/tauri.release.linux.conf.json
 
+      - name: Verify desktop bundle contents (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          deb_path="$(
+            (
+              find target -type f -path "*/release/bundle/deb/*.deb" 2>/dev/null
+              find crates/izwi-desktop/target -type f -path "*/release/bundle/deb/*.deb" 2>/dev/null
+            ) | head -n 1
+          )"
+          appimage_path="$(
+            (
+              find target -type f -path "*/release/bundle/appimage/*.AppImage" 2>/dev/null
+              find crates/izwi-desktop/target -type f -path "*/release/bundle/appimage/*.AppImage" 2>/dev/null
+            ) | head -n 1
+          )"
+          if [ -z "$deb_path" ]; then
+            echo "Could not find .deb bundle to verify."
+            exit 1
+          fi
+          if [ -z "$appimage_path" ]; then
+            echo "Could not find AppImage bundle to verify."
+            exit 1
+          fi
+          scripts/release/verify-packaged-artifacts.sh \
+            --deb "$deb_path" \
+            --appimage "$appimage_path"
+
       - name: Build desktop bundle (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -208,6 +248,32 @@ jobs:
           CI: "true"
         run: |
           cargo tauri build --bundles ${{ matrix.bundle_kind }} --config crates/izwi-desktop/tauri.release.windows.conf.json
+
+      - name: Verify desktop bundle contents (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $preferredDirPattern = '[\\/]release[\\/]bundle[\\/]nsis[\\/]'
+          $fallbackDirPattern = '[\\/]release[\\/]bundle[\\/]nsis-updater[\\/]'
+
+          $bundle = Get-ChildItem -Path "target","crates/izwi-desktop/target" -Recurse -File |
+            Where-Object {
+              $_.Name -match '-setup\.exe$' -and
+              (
+                $_.FullName -match $preferredDirPattern -or
+                $_.FullName -match $fallbackDirPattern
+              )
+            } |
+            Sort-Object `
+              @{ Expression = { $_.FullName -match $preferredDirPattern }; Descending = $true }, `
+              @{ Expression = "LastWriteTime"; Descending = $true } |
+            Select-Object -First 1
+
+          if (-not $bundle) {
+            throw "Could not find Windows installer bundle to verify."
+          }
+
+          scripts/release/verify-packaged-artifacts.ps1 -InstallerPath $bundle.FullName
 
       - name: Build desktop bundle (unsigned macOS)
         if: runner.os == 'macOS' && env.APPLE_SIGNING_IDENTITY == ''
