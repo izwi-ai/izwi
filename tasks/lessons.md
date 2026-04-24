@@ -1,6 +1,7 @@
 # Lessons
 
 - When a user says Linux installers, cover every shipped Linux surface (`.deb`, AppImage/updater, terminal tarball, and future Linux bundle paths) unless they explicitly narrow to Ubuntu.
+- When a user says one installer or binary must support CPU and CUDA, preserve the public binary names unless they explicitly approve renamed CUDA commands; use private runtime layout or loader work, not public `*-cuda` names.
 - When requirements include hardware support scope (for example Docker-only vs all distributions), treat scope as a hard contract and reconfirm before finalizing implementation plans.
 - For CUDA-related fixes, always align runtime behavior, packaging/release workflow, Docker builds, CLI reporting, and docs together to avoid "CUDA installed but not actually enabled" confusion.
 - When introducing lower-precision activation policies around Candle `QMatMul`, verify the actual weight expansion path first; some GGUF tensors materialize as dense `F32`, so projection helpers must normalize input dtypes before inference is considered fixed.

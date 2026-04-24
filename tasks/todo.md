@@ -82,7 +82,7 @@ Use one shared backend packaging contract instead of copied core files:
   Deliverable:
   A written packaging contract for Linux and Windows that says exactly which CUDA libraries are bundled or required, where they live, how the loader finds them, and what happens on CPU-only machines.
   Implementation:
-  Added `docs/release/cuda-runtime-contract.md` choosing a single installer with CPU-safe defaults and CUDA sidecar binaries built from the same source. The contract lists expected CUDA libraries, driver boundaries, runtime selection behavior, and verification requirements.
+  Added `docs/release/cuda-runtime-contract.md` choosing a single installer with stable public `izwi` and `izwi-server` names. The contract allows private CUDA runtime variants with the same basename under package runtime directories, lists expected CUDA libraries, driver boundaries, runtime selection behavior, and verification requirements.
   Verification:
   Reviewed current NVIDIA CUDA EULA Attachment A and CUDA compatibility documentation.
 
@@ -124,7 +124,8 @@ Use one shared backend packaging contract instead of copied core files:
 - The requested user-facing goal is feasible only with a CUDA runtime delivery or lazy-loading strategy, not by simply flipping `--features cuda` in the release workflow.
 - The plan covers all Linux release surfaces, not only Ubuntu or `.deb`.
 - Phase 1 added repeatable loader/startup audit tooling for release artifacts. Local verification covered the Bash script and existing macOS binary; Windows script validation is deferred to a Windows runner.
-- Phase 2 chose the CPU-safe default plus CUDA sidecar model, documented the library contract, and kept all backend variants tied to shared source builds rather than forked core files.
+- Phase 2 chose the CPU-safe public entrypoint plus private CUDA runtime model, documented the library contract, and kept all backend variants tied to shared source builds rather than forked core files.
+- User correction captured: public binary names must remain `izwi` and `izwi-server`; no user-facing `izwi-cuda` or `izwi-server-cuda` commands.
 
 # Voice Configuration Modal Redesign Plan
 

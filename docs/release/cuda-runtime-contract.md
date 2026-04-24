@@ -4,12 +4,14 @@ This contract defines how Linux and Windows release installers should support bo
 
 ## Decision
 
-Use a **single installer with shared-source CPU and CUDA binary variants**:
+Use a **single installer with stable public binary names**:
 
-- Default binaries remain CPU-safe and must start on machines with no NVIDIA driver or CUDA toolkit.
-- CUDA-capable sidecar binaries are built from the same crates with `--features cuda`.
-- Launch and packaging logic may select a CUDA sidecar only after CUDA runtime dependencies are loadable.
-- If CUDA dependencies are missing or unusable, the default CPU binary path remains valid.
+- Users keep running `izwi` and `izwi-server` on Linux and Windows.
+- The public `izwi` and `izwi-server` entrypoints must remain CPU-safe and must start on machines with no NVIDIA driver or CUDA toolkit.
+- CUDA-capable runtime variants, if needed to avoid loader-startup failures, are private package resources built from the same crates with `--features cuda`.
+- Private runtime variants must keep the same basename as the public binary and live under a package-private runtime directory, not as user-facing `*-cuda` commands.
+- Launch and packaging logic may select the private CUDA runtime only after CUDA runtime dependencies are loadable.
+- If CUDA dependencies are missing or unusable, the public CPU-safe path remains valid.
 
 Do not replace the CPU-safe Linux/Windows release binaries with CUDA-linked binaries unless Phase 1 loader checks prove they can start without CUDA shared libraries. Current research indicates they cannot.
 
@@ -17,19 +19,20 @@ Do not replace the CPU-safe Linux/Windows release binaries with CUDA-linked bina
 
 Izwi can already select CPU or CUDA after process startup, but Candle's current CUDA feature path links CUDA shared libraries at loader time. A CUDA-linked `izwi` or `izwi-server` can therefore fail before `main()` on hosts without CUDA libraries, which prevents Izwi's runtime fallback from running.
 
-The sidecar model keeps the user-facing installer unified while avoiding that startup failure mode.
+The private-runtime model keeps the user-facing installer unified while avoiding that startup failure mode.
 
 ## Binary Layout
 
 The release package should contain:
 
-- `izwi` / `izwi.exe`: CPU-safe default CLI.
-- `izwi-server` / `izwi-server.exe`: CPU-safe default server.
-- `izwi-cuda` / `izwi-cuda.exe`: CUDA-capable CLI sidecar, when direct CUDA CLI support is needed.
-- `izwi-server-cuda` / `izwi-server-cuda.exe`: CUDA-capable server sidecar.
+- `izwi` / `izwi.exe`: public CPU-safe CLI entrypoint.
+- `izwi-server` / `izwi-server.exe`: public CPU-safe server entrypoint.
+- Private CUDA runtime binaries with the same basename in a package runtime directory:
+  - Linux: `lib/izwi/runtime/cuda/izwi` and `lib/izwi/runtime/cuda/izwi-server`
+  - Windows/App resources: `bin/runtime/cuda/izwi.exe` and `bin/runtime/cuda/izwi-server.exe`
 - A private CUDA runtime library directory, when redistribution is enabled:
-  - Linux: `lib/izwi/cuda/`
-  - Windows: colocated with CUDA sidecar `.exe` files or under `bin/cuda/`
+  - Linux: colocated with the private CUDA runtime binaries or under `lib/izwi/runtime/cuda/lib/`
+  - Windows: colocated with the private CUDA runtime `.exe` files
 
 All binaries are built from the same source tree. The only difference is Cargo feature selection and output name/location.
 
@@ -39,15 +42,15 @@ Default behavior:
 
 1. Start the CPU-safe default binary.
 2. If backend preference is `cpu`, stay on CPU.
-3. If backend preference is `auto`, a launcher may select CUDA only if:
-   - CUDA sidecar binary exists.
+3. If backend preference is `auto`, the public server entrypoint may delegate to the private CUDA runtime only if:
+   - Private CUDA runtime binary exists.
    - Required CUDA runtime libraries are loadable.
    - NVIDIA driver probing indicates a usable CUDA device.
-4. If backend preference is `cuda`, fail with a clear diagnostic when the CUDA sidecar or runtime dependencies are unavailable.
+4. If backend preference is `cuda`, fail with a clear diagnostic when the private CUDA runtime or runtime dependencies are unavailable.
 
 The runtime health surface should distinguish:
 
-- CUDA sidecar packaged.
+- Private CUDA runtime packaged.
 - CUDA runtime libraries loadable.
 - NVIDIA driver present.
 - CUDA device usable.
@@ -92,7 +95,7 @@ Each release candidate must prove:
 
 - CPU-only host with no CUDA libraries: default `izwi` and `izwi-server` start and report CPU fallback.
 - Host with CUDA libraries but no usable GPU: default binaries start and explain why CUDA was not selected.
-- NVIDIA GPU host: CUDA sidecar can start and `auto`/`cuda` select CUDA as expected.
+- NVIDIA GPU host: private CUDA runtime can start through the public `izwi-server` entrypoint, and `auto`/`cuda` select CUDA as expected.
 - Linux `.deb`, Linux AppImage/updater, Linux terminal tarball, Windows NSIS/updater, and Windows zip all expose the same CPU/CUDA packaging contract.
 
 ## Non-Forking Rule
