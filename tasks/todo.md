@@ -233,7 +233,7 @@ Close the release and runtime gaps found during the CPU+CUDA installer review wi
   `bash -n scripts/release/audit-runtime-deps.sh scripts/release/verify-unified-runtime.sh`
   `scripts/release/verify-unified-runtime.sh --skip-cuda-compiled-check --skip-cuda-library-check`
 
-- [ ] Phase 2: Inspect final packaged artifacts
+- [x] Phase 2: Inspect final packaged artifacts
   Scope:
   Add post-package release checks for terminal archives and practical desktop bundle artifacts so CI validates the final shipped layout, not only `target/release`.
   Verification:
@@ -255,6 +255,7 @@ Close the release and runtime gaps found during the CPU+CUDA installer review wi
 ## Review
 
 - Phase 1 complete: private Linux CUDA backend probes now run with the packaged runtime loader path, and private runtime audits now tolerate missing host NVIDIA driver libraries without allowing missing packaged CUDA runtime dependencies to pass silently. Windows audit logic was updated to the same contract, but still needs execution on a Windows runner because PowerShell is not available on this host.
+- Phase 2 complete: added post-package artifact verification for Linux terminal archives, `.deb` payloads, AppImage extraction, Windows terminal zips, and Windows NSIS installer extraction. Local verification covered Bash syntax, whitespace checks, and a synthetic terminal tarball; real `.deb`, AppImage, and NSIS extraction will run in release CI where those artifacts are produced.
 
 ## Review
 
