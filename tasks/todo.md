@@ -1,3 +1,126 @@
+# CPU + CUDA Unified Installer Feasibility Plan
+
+## Goal
+
+Investigate whether all Linux and Windows CPU installer surfaces can ship binaries that support both CPU and CUDA at runtime, using the existing device-selection pathway and without creating forked vendored copies of core files.
+
+## Research Checklist
+
+- [x] Map current runtime device/backend selection and where CPU/CUDA decisions are made.
+- [x] Map current Cargo feature flags, dependency features, and build-script behavior for CPU/CUDA.
+- [x] Map all Linux installer/release surfaces (`.deb`, AppImage/updater, terminal tarball, and any related bundle paths) and Windows installer/release build paths.
+- [x] Identify whether one binary can include CPU and CUDA backends while falling back cleanly on CPU-only hosts.
+- [x] Identify packaging/runtime constraints for Linux distributions and Windows CUDA dependencies.
+- [x] Produce a phased implementation and verification plan that keeps core source shared.
+
+## Constraints
+
+- Research, analysis, and planning only.
+- Do not implement code changes in this phase.
+- Do not create forked vendored spin-offs of core files.
+
+## Feasibility Summary
+
+Shipping the current Linux and Windows release binaries with `--features cuda` is not by itself a safe unified CPU+CUDA installer strategy.
+
+The Izwi runtime already has the higher-level selection path:
+
+- `auto` probes CUDA on non-macOS and falls back to CPU if CUDA is unavailable.
+- explicit `cpu` always selects CPU.
+- explicit `cuda` errors if CUDA was requested but unavailable.
+- `/v1/health`, `izwi status --detailed`, and `izwi version --full` expose requested, selected, and compiled backend state.
+
+The blocker is earlier than Izwi runtime selection: Candle's CUDA feature path currently pulls in `cudarc` dynamic CUDA linking and `candle-kernels` links `cudart`. That means a CUDA-enabled binary may fail at OS loader startup on a CPU-only machine without CUDA shared libraries, before `main()` and before Izwi can fall back to CPU.
+
+Therefore the viable paths are:
+
+1. **Unified installer with bundled private CUDA redistributable libraries** for Linux and Windows, plus clear driver/runtime compatibility checks.
+2. **Unified installer that installs/checks CUDA runtime prerequisites** before enabling CUDA, while remaining CPU-safe if prerequisites are absent.
+3. **Change the dependency/linking strategy to lazy dynamic loading** so CUDA libraries are opened only when CUDA is selected. This requires upstream-compatible dependency work, not vendored core forks.
+4. **Keep separate CPU and CUDA release artifacts** until one of the above is proven. This does not satisfy the requested installer behavior but is the safest interim contract.
+
+## Current Release Surfaces
+
+- Linux terminal tarball: packages `target/release/izwi`, `izwi-server`, and `izwi-desktop`.
+- Linux desktop bundle: builds `.deb` and AppImage from the Tauri build.
+- Linux updater: uses the AppImage artifact and signature in `latest-beta.json`.
+- Windows terminal zip: packages `izwi.exe`, `izwi-server.exe`, and `izwi-desktop.exe`.
+- Windows desktop installer/updater: builds and publishes NSIS setup `.exe` plus signature.
+
+The release workflow currently builds Linux and Windows CLI/server binaries without `--features cuda`, so every downstream Linux/Windows release surface inherits CPU-only backend support.
+
+## Non-Forking Design Direction
+
+Use one shared backend packaging contract instead of copied core files:
+
+- Keep `izwi-core`, `izwi-cli`, and `izwi-server` source shared.
+- Add release build profiles/feature sets only at workflow/script level.
+- Add small packaging helpers/manifests for CUDA runtime dependency discovery and validation.
+- Prefer upstream-supported Cargo feature/dependency adjustments or patching dependency versions over copying Candle/cudarc source into this repo.
+- Keep runtime reporting canonical: compiled backends, selected backend, requested backend availability, and dependency availability should all agree.
+
+## Phased Plan
+
+- [x] Phase 1: Prove loader behavior and dependency inventory
+  Scope:
+  Build Linux and Windows CUDA-feature binaries in CUDA-enabled builders. Inspect runtime dependencies with `ldd`/`readelf` on Linux and DLL inspection on Windows. Run the binaries on:
+  1. CPU-only host with no CUDA libraries
+  2. host with CUDA libraries but no usable GPU
+  3. NVIDIA GPU host
+  Expected decision:
+  Confirm whether raw CUDA-feature binaries are unsafe for universal CPU installers. Current research strongly predicts they are unsafe without bundled/installed CUDA runtime libraries.
+  Implementation:
+  Added `scripts/release/audit-runtime-deps.sh` and `scripts/release/audit-runtime-deps.ps1` so release builds can inspect loader dependencies and prove CPU-safe startup paths on Linux/macOS and Windows.
+  Verification:
+  `bash -n scripts/release/audit-runtime-deps.sh`
+  `scripts/release/audit-runtime-deps.sh target/release/izwi`
+  Windows PowerShell validation still needs a Windows runner because `pwsh` is not available on this host.
+
+- [ ] Phase 2: Choose the CUDA runtime delivery model
+  Scope:
+  Decide between private bundled CUDA redistributables, installer-managed prerequisites, or upstream-compatible lazy loading. Validate NVIDIA redistribution terms for the exact libraries required by Candle/cudarc/candle-kernels.
+  Deliverable:
+  A written packaging contract for Linux and Windows that says exactly which CUDA libraries are bundled or required, where they live, how the loader finds them, and what happens on CPU-only machines.
+
+- [ ] Phase 3: Normalize release build inputs for all Linux and Windows surfaces
+  Scope:
+  Create one shared release build path that produces the binaries used by:
+  Linux `.deb`, Linux AppImage/updater, Linux terminal tarball, Windows NSIS/updater, and Windows terminal zip.
+  Notes:
+  Check Tauri Linux/Windows resource config composition so AppImage/NSIS include the same `izwi` and `izwi-server` binaries as the terminal bundles. Avoid separate hand-copied packaging branches.
+
+- [ ] Phase 4: Add runtime dependency diagnostics
+  Scope:
+  Extend the existing backend truth reporting to distinguish:
+  1. CUDA compiled into binary
+  2. CUDA runtime libraries loadable
+  3. NVIDIA driver present/compatible
+  4. CUDA device usable
+  5. selected backend
+  Notes:
+  This makes `auto` fallback understandable and prevents "CUDA compiled but CPU selected" confusion.
+
+- [ ] Phase 5: Update CI/release verification gates
+  Scope:
+  Add checks that fail release if:
+  - Linux/Windows release binaries do not report expected compiled backend support.
+  - CPU-only smoke tests cannot start the installer-shipped binaries.
+  - CUDA-host smoke tests cannot select CUDA.
+  - updater artifacts and terminal bundles disagree on backend support.
+  - docs/support matrix still says Linux/Windows release assets are CPU-only after the change.
+
+- [ ] Phase 6: Roll out behind explicit release notes
+  Scope:
+  Update `docs/RELEASING.md`, support matrix, Linux/Windows install docs, and release body text to describe the new contract. Make the first release a beta/preview CUDA packaging release unless Phase 1-5 smoke tests cover both CPU-only and NVIDIA hosts.
+
+## Review
+
+- Current Izwi runtime/device selection is architecturally compatible with CPU/CUDA selection after process startup.
+- Current CUDA-feature binary delivery is likely not CPU-installer-safe because CUDA shared libraries are eagerly linked by Candle/cudarc/candle-kernels.
+- The requested user-facing goal is feasible only with a CUDA runtime delivery or lazy-loading strategy, not by simply flipping `--features cuda` in the release workflow.
+- The plan covers all Linux release surfaces, not only Ubuntu or `.deb`.
+- Phase 1 added repeatable loader/startup audit tooling for release artifacts. Local verification covered the Bash script and existing macOS binary; Windows script validation is deferred to a Windows runner.
+
 # Voice Configuration Modal Redesign Plan
 
 ## Goal
