@@ -15,7 +15,7 @@ use tracing::{debug, error, info_span};
 
 use crate::artifacts::{DownloadProgress, ModelManager};
 use crate::audio::{AudioCodec, AudioEncoder, StreamingConfig};
-use crate::backends::{BackendRouter, BackendSelectionSource, DeviceProfile};
+use crate::backends::{BackendPreference, BackendRouter, BackendSelectionSource, DeviceProfile};
 use crate::catalog::{ModelInfo, ModelVariant};
 use crate::config::EngineConfig;
 use crate::engine::{
@@ -353,11 +353,9 @@ impl RuntimeService {
             return Ok(());
         }
 
-        Err(Error::InferenceError(format!(
-            "Requested backend `{}` is not available on this runtime (detected `{}`)",
-            backend_context.preference.as_str(),
-            backend_context.backend_kind.as_str(),
-        )))
+        Err(Error::InferenceError(
+            requested_backend_unavailable_message(backend_context),
+        ))
     }
 
     /// Create a new inference engine.
@@ -778,4 +776,55 @@ fn positive_usize_env(key: &str) -> Option<usize> {
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
+}
+
+fn requested_backend_unavailable_message(
+    backend_context: &crate::backends::BackendContext,
+) -> String {
+    let requested = backend_context.preference.as_str();
+    let selected = backend_context.backend_kind.as_str();
+
+    if backend_context.preference == BackendPreference::Cuda {
+        let detail = if backend_context.capabilities.cuda_compiled {
+            "CUDA support is compiled in, but no usable CUDA device was selected"
+        } else {
+            "this runtime is not compiled with CUDA support"
+        };
+
+        return format!(
+            "CUDA backend was requested, but the selected backend is `{selected}`. {detail}. Use `izwi status --detailed` or `/v1/health` to inspect CUDA runtime diagnostics."
+        );
+    }
+
+    format!(
+        "Requested backend `{requested}` is not available on this runtime (selected `{selected}`)"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::{BackendCapabilities, BackendContext, BackendSelectionSource};
+
+    #[test]
+    fn explicit_cuda_mismatch_gets_cuda_specific_error() {
+        let context = BackendContext::new(
+            BackendPreference::Cuda,
+            BackendSelectionSource::Config,
+            BackendCapabilities {
+                cpu_compiled: true,
+                metal_compiled: false,
+                cuda_compiled: true,
+            },
+            DeviceProfile::cpu(),
+            "Requested cuda backend fell back to cpu",
+        );
+
+        let err = RuntimeService::ensure_requested_backend_available(&context).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("CUDA backend was requested"));
+        assert!(message.contains("selected backend is `cpu`"));
+        assert!(message.contains("no usable CUDA device"));
+    }
 }
