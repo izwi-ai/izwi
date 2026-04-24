@@ -261,6 +261,8 @@ Notes:
 
 ### Phase 5: Optional Durable Promotion Path
 
+Status: deferred.
+
 Goal:
 
 - Only if product decides durable Responses/agent sessions are needed, promote them deliberately.
@@ -282,6 +284,10 @@ Verification:
 - [ ] Streaming lifecycle persistence tests pass.
 - [ ] Agent session turn after restart works.
 - [ ] Docs and contract promote surfaces from preview only after tests prove durability.
+
+Deferral reason:
+
+- No product decision was made to promote `/v1/responses` lifecycle objects or `/v1/agent/sessions` metadata from preview process-local convenience APIs to durable product features. Phase 4 intentionally hardened the preview contract instead.
 
 ## Elegance Review
 
