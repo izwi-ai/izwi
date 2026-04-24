@@ -4,25 +4,30 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: scripts/release/audit-runtime-deps.sh [--allow-missing] <binary>...
+Usage: scripts/release/audit-runtime-deps.sh [--allow-missing] [--skip-startup-probe] <binary>...
 
 Audits release binaries for loader-visible runtime dependencies and verifies
 that each binary can at least enter its version/help path. This is intended for
 CPU-only and CUDA-host smoke checks after building release artifacts.
 
 Options:
-  --allow-missing   Report missing shared libraries without failing the audit.
-  -h, --help        Show this help.
+  --allow-missing       Report missing shared libraries without failing the audit.
+  --skip-startup-probe  Do not execute --version/--help after loader inspection.
+  -h, --help            Show this help.
 EOF
 }
 
 allow_missing=0
+skip_startup_probe=0
 binaries=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --allow-missing)
             allow_missing=1
+            ;;
+        --skip-startup-probe)
+            skip_startup_probe=1
             ;;
         -h|--help|help)
             usage
@@ -154,7 +159,11 @@ for binary in "${binaries[@]}"; do
             ;;
     esac
 
-    probe_startup "$binary" || failed=1
+    if [[ "${skip_startup_probe}" -eq 1 ]]; then
+        echo "Startup probe: skipped"
+    else
+        probe_startup "$binary" || failed=1
+    fi
     echo
 done
 

@@ -147,6 +147,15 @@ jobs:
           scripts/release/stage-unified-runtime.ps1 -CudaTargetDir target/cuda-release -CopyCudaLibs
           cargo build --release --bin izwi-desktop
 
+      - name: Verify unified runtime layout (Linux)
+        if: runner.os == 'Linux'
+        run: scripts/release/verify-unified-runtime.sh
+
+      - name: Verify unified runtime layout (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: scripts/release/verify-unified-runtime.ps1
+
       - name: Package terminal binaries (Linux/macOS)
         if: runner.os != 'Windows'
         run: |
