@@ -39,6 +39,7 @@ jobs:
       IZWI_UPDATER_PUBKEY: ${{ secrets.IZWI_UPDATER_PUBKEY }}
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      CUDA_COMPUTE_CAP: "80"
 
     steps:
       - name: Checkout
@@ -104,6 +105,14 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install CUDA toolkit for unified Linux/Windows runtime
+        if: runner.os == 'Linux' || runner.os == 'Windows'
+        uses: Jimver/cuda-toolkit@v0.2.29
+        with:
+          cuda: "12.4.1"
+          method: network
+          log-file-suffix: "${{ matrix.asset_suffix }}.txt"
+
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:
@@ -116,19 +125,41 @@ jobs:
       - name: Build UI dist (required by izwi-desktop compile-time Tauri config)
         run: npm --prefix ui run build
 
-      - name: Build CLI, server, and desktop binaries
+      - name: Build CLI, server, and desktop binaries (Linux/macOS)
+        if: runner.os != 'Windows'
         run: |
           # izwi-desktop bundles izwi/izwi-server as resources, so build those first.
-          cargo build --release --bin izwi --bin izwi-server
+          cargo build --release -p izwi-cli -p izwi-server
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            CARGO_TARGET_DIR=target/cuda-release cargo build --release -p izwi-cli -p izwi-server --features izwi-cli/cuda,izwi-server/cuda
+            scripts/release/stage-unified-runtime.sh --cuda-target-dir target/cuda-release --copy-cuda-libs
+          fi
+          cargo build --release --bin izwi-desktop
+
+      - name: Build CLI, server, and desktop binaries (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --release -p izwi-cli -p izwi-server
+          $env:CARGO_TARGET_DIR = "target/cuda-release"
+          cargo build --release -p izwi-cli -p izwi-server --features "izwi-cli/cuda,izwi-server/cuda"
+          Remove-Item Env:\CARGO_TARGET_DIR
+          scripts/release/stage-unified-runtime.ps1 -CudaTargetDir target/cuda-release -CopyCudaLibs
           cargo build --release --bin izwi-desktop
 
       - name: Package terminal binaries (Linux/macOS)
         if: runner.os != 'Windows'
         run: |
           mkdir -p release-assets
-          tar -czf "release-assets/izwi-cli-${{ github.ref_name }}-${{ matrix.asset_suffix }}.tar.gz" \
-            -C target/release \
-            izwi izwi-server izwi-desktop
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            tar -czf "release-assets/izwi-cli-${{ github.ref_name }}-${{ matrix.asset_suffix }}.tar.gz" \
+              -C target/release \
+              izwi izwi-server izwi-desktop runtime
+          else
+            tar -czf "release-assets/izwi-cli-${{ github.ref_name }}-${{ matrix.asset_suffix }}.tar.gz" \
+              -C target/release \
+              izwi izwi-server izwi-desktop
+          fi
 
       - name: Package terminal binaries (Windows)
         if: runner.os == 'Windows'
@@ -138,7 +169,8 @@ jobs:
           Compress-Archive -Path `
             target/release/izwi.exe, `
             target/release/izwi-server.exe, `
-            target/release/izwi-desktop.exe `
+            target/release/izwi-desktop.exe, `
+            target/release/runtime `
             -DestinationPath "release-assets/izwi-cli-${{ github.ref_name }}-${{ matrix.asset_suffix }}.zip" `
             -Force
 
@@ -157,7 +189,8 @@ jobs:
           CI: "true"
         run: |
           cargo tauri build \
-            --bundles deb,appimage
+            --bundles deb,appimage \
+            --config crates/izwi-desktop/tauri.release.linux.conf.json
 
       - name: Build desktop bundle (Windows)
         if: runner.os == 'Windows'
@@ -165,7 +198,7 @@ jobs:
         env:
           CI: "true"
         run: |
-          cargo tauri build --bundles ${{ matrix.bundle_kind }}
+          cargo tauri build --bundles ${{ matrix.bundle_kind }} --config crates/izwi-desktop/tauri.release.windows.conf.json
 
       - name: Build desktop bundle (unsigned macOS)
         if: runner.os == 'macOS' && env.APPLE_SIGNING_IDENTITY == ''
