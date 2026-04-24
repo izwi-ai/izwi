@@ -391,9 +391,9 @@ jobs:
           ## Runtime Support For This Release
 
           - macOS release assets are the Metal-capable path for Apple Silicon hosts.
-          - Linux and Windows GitHub release assets are CPU-focused.
-          - CUDA / NVIDIA support is **not** included in GitHub release binaries today.
-          - For NVIDIA hosts, use a Linux source build with `--features cuda` or the Docker CUDA image/profile.
+          - Linux and Windows GitHub release assets keep public `izwi` / `izwi-server` names CPU-safe, including their Windows `.exe` counterparts, and include a private packaged CUDA runtime.
+          - CUDA acceleration requires a compatible NVIDIA driver and GPU; CPU-only hosts continue to use the public CPU-safe path.
+          - CUDA release packaging is preview until GPU-host smoke coverage is automated.
           - See the runtime support matrix: https://izwiai.com/docs/support-matrix
           EOF
 

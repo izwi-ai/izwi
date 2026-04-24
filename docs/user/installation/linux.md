@@ -1,6 +1,6 @@
 # Linux Installation
 
-Izwi runs on most modern Linux distributions. GitHub Release packages are CPU-focused today; NVIDIA CUDA support is available through Linux source builds.
+Izwi runs on most modern Linux distributions. Linux GitHub Release assets keep the public `izwi` and `izwi-server` names, start safely on CPU-only hosts, and include a private packaged CUDA runtime for NVIDIA hosts.
 
 See the [Runtime Support Matrix](../support-matrix.md) for the current artifact contract.
 
@@ -15,9 +15,19 @@ See the [Runtime Support Matrix](../support-matrix.md) for the current artifact 
 
 ---
 
+## Install from GitHub Releases
+
+All Linux release surfaces use the same unified CPU/CUDA runtime contract:
+
+- `.deb` package for Debian/Ubuntu installs
+- AppImage desktop bundle and updater artifact
+- terminal tarball
+
+The public command names stay `izwi` and `izwi-server`. CUDA-capable runtime binaries are packaged privately under the release runtime directory.
+
 ## Install from .deb Package (Debian/Ubuntu)
 
-> The `.deb` package is a CPU-focused release artifact. If you need CUDA on an NVIDIA host, skip to [CUDA Support (NVIDIA GPUs)](#cuda-support-nvidia-gpus).
+> The `.deb` package uses the same unified CPU/CUDA runtime contract as the other Linux release assets. CUDA acceleration requires a compatible NVIDIA driver and GPU, but the public command names do not change.
 
 ### Step 1: Download
 
@@ -42,6 +52,8 @@ sudo apt-get install -f
 ```bash
 izwi version --full
 ```
+
+For terminal tarballs, unpack the release archive and keep the bundled `runtime/` directory next to `izwi` and `izwi-server`.
 
 ---
 
@@ -115,7 +127,25 @@ cd izwi
 
 ## CUDA Support (NVIDIA GPUs)
 
-For NVIDIA GPU acceleration:
+For NVIDIA GPU acceleration from a GitHub Release package, install a compatible NVIDIA driver and start Izwi with the CUDA backend:
+
+```bash
+nvidia-smi
+izwi serve --backend cuda
+izwi status --detailed
+```
+
+Look for:
+
+- `Requested: cuda`
+- `Selected:  cuda`
+- CUDA runtime diagnostics showing the packaged runtime and driver are available
+
+`izwi version --full` reports the public CPU-safe CLI binary. For release packages, use `izwi status --detailed` after the server starts to verify the active runtime.
+
+### Source Build CUDA Path
+
+Source builds still require a CUDA toolkit.
 
 ### Step 1: Install CUDA Toolkit
 
@@ -148,13 +178,7 @@ izwi version --full
 izwi status --detailed
 ```
 
-Look for:
-
-- `CUDA` under **Compiled Backends** in `izwi version --full`
-- `Requested: cuda`
-- `Selected:  cuda`
-
-in `izwi status --detailed`.
+For source builds, `izwi version --full` should include `CUDA` under **Compiled Backends**. Runtime selection still comes from `izwi status --detailed`.
 
 ---
 
@@ -251,24 +275,18 @@ sudo setcap 'cap_net_bind_service=+ep' $(which izwi-server)
    nvidia-smi
    ```
 
-2. Ensure CUDA toolkit is in your PATH:
+2. If you installed from source, ensure CUDA toolkit is in your PATH:
    ```bash
    export PATH=/usr/local/cuda/bin:$PATH
    export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
    ```
 
-3. Rebuild with CUDA feature:
+3. If you installed from source, rebuild with CUDA:
    ```bash
    IZWI_BUILD_BACKEND=cuda ./scripts/install-cli.sh
    ```
 
-4. Verify the binary and runtime separately:
-   ```bash
-   izwi version --full
-   ```
-
-   Then start the server and inspect the runtime backend:
-
+4. Verify the runtime:
    ```bash
    izwi serve --backend cuda
    izwi status --detailed

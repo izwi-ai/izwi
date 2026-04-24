@@ -1,6 +1,6 @@
 # Windows Installation
 
-Izwi runs on Windows 10 and later. GitHub Release installers are CPU-focused today; Windows CUDA usage is source-build-only and should currently be treated as preview.
+Izwi runs on Windows 10 and later. GitHub Release installers keep the public `izwi.exe` and `izwi-server.exe` names, start safely on CPU-only hosts, and include a private packaged CUDA runtime for NVIDIA hosts.
 
 See the [Runtime Support Matrix](../support-matrix.md) for the current artifact contract.
 
@@ -17,7 +17,7 @@ See the [Runtime Support Matrix](../support-matrix.md) for the current artifact 
 
 ## Install from Installer (Recommended)
 
-> The Windows installer does **not** currently ship CUDA-enabled binaries.
+> The Windows installer uses the unified CPU/CUDA runtime contract. CUDA acceleration requires a compatible NVIDIA driver and GPU, but the public command names do not change.
 
 ### Step 1: Download
 
@@ -71,17 +71,37 @@ winget install Agentem.Izwi
 
 ## CUDA Support (NVIDIA GPUs)
 
-For NVIDIA GPU acceleration on Windows:
+For NVIDIA GPU acceleration from the GitHub Release installer:
 
 ### Step 1: Install NVIDIA Drivers
 
 Download and install the latest drivers from [NVIDIA](https://www.nvidia.com/drivers).
 
-### Step 2: Install CUDA Toolkit
+### Step 2: Verify the Installed Runtime
 
-Download CUDA Toolkit from [NVIDIA CUDA Downloads](https://developer.nvidia.com/cuda-downloads).
+Start the server in one PowerShell window:
 
-### Step 3: Build from source (Preview)
+```powershell
+izwi serve --backend cuda
+```
+
+In a second PowerShell window:
+
+```powershell
+izwi status --detailed
+```
+
+Look for:
+
+- `Requested: cuda`
+- `Selected:  cuda`
+- CUDA runtime diagnostics showing the packaged runtime and driver are available
+
+`izwi version --full` reports the public CPU-safe CLI binary. For release installers, use `izwi status --detailed` after the server starts to verify the active runtime.
+
+### Optional: Build from source (Preview)
+
+Source builds still require CUDA Toolkit from [NVIDIA CUDA Downloads](https://developer.nvidia.com/cuda-downloads).
 
 ```powershell
 git clone https://github.com/izwi-ai/izwi.git
@@ -90,7 +110,7 @@ cargo build --release -p izwi-cli --features cuda
 cargo build --release -p izwi-server --features cuda
 ```
 
-### Step 4: Verify CUDA
+### Verify a Source Build
 
 Start the server in one PowerShell window:
 
@@ -110,8 +130,6 @@ Look for:
 - `CUDA` under **Compiled Backends**
 - `Requested: cuda`
 - `Selected:  cuda`
-
-If you installed from the GitHub `.exe` installer instead of building from source, treat the installed binary as CPU-only today.
 
 ---
 
@@ -219,21 +237,21 @@ izwi serve --port 8888
    nvidia-smi
    ```
 
-2. Verify the CUDA toolkit:
+2. If you installed from source, verify the CUDA toolkit:
    ```powershell
    nvcc --version
    ```
 
-3. Rebuild the CLI and server with CUDA:
+3. If you installed from source, rebuild the CLI and server with CUDA:
    ```powershell
    cargo build --release -p izwi-cli --features cuda
    cargo build --release -p izwi-server --features cuda
    ```
 
-4. Verify compile-time and runtime backend state:
+4. Verify runtime backend state:
    ```powershell
-   .\target\release\izwi.exe version --full
-   .\target\release\izwi.exe status --detailed
+   izwi serve --backend cuda
+   izwi status --detailed
    ```
 
 ### Firewall blocking connections

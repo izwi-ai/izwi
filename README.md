@@ -42,8 +42,8 @@ The server exposes OpenAI-compatible API routes under `/v1`.
 Backend support depends on both the host and the artifact you install.
 
 - macOS on Apple Silicon: Metal is the recommended and stable GPU path.
-- Linux source builds: CUDA is supported when you build with `--features cuda` on a compatible NVIDIA host.
-- GitHub Release artifacts: currently CPU-only on Linux and Windows unless an asset explicitly says otherwise.
+- Linux and Windows GitHub Release artifacts: public commands remain `izwi` / `izwi-server` and their Windows `.exe` counterparts, start safely on CPU-only hosts, and include a private packaged CUDA runtime for NVIDIA hosts.
+- Source builds: CUDA is supported when you build with `--features cuda` on a compatible NVIDIA host.
 - Docker CUDA profile: intended for NVIDIA Linux hosts; when building on a machine without `nvidia-smi`, set `CUDA_COMPUTE_CAP` for the target GPU architecture.
 
 See the full [Runtime Support Matrix](https://izwiai.com/docs/support-matrix).

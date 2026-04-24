@@ -6,7 +6,7 @@ Get Izwi running in under 5 minutes.
 
 ## Step 1: Install Izwi
 
-Before you pick an install path, check the [Runtime Support Matrix](./support-matrix.md) if backend support matters for your deployment. GitHub Release artifacts and CUDA source builds are not interchangeable today.
+Before you pick an install path, check the [Runtime Support Matrix](./support-matrix.md) if backend support matters for your deployment. Linux and Windows release installers now use a unified CPU/CUDA packaging contract; source builds are still useful for development and custom CUDA validation.
 
 ### macOS
 
@@ -26,13 +26,13 @@ Download the `.deb` package from [GitHub Releases](https://github.com/izwi-ai/iz
 sudo dpkg -i izwi_*.deb
 ```
 
-> The current Linux release package is a CPU-focused install path. For NVIDIA CUDA hosts, use the Linux source-build instructions until dedicated CUDA release artifacts are published.
+> The Linux release package keeps the public `izwi` command CPU-safe and includes a private CUDA runtime for NVIDIA hosts.
 
 ### Windows
 
 Download and run the `.exe` installer from [GitHub Releases](https://github.com/izwi-ai/izwi/releases).
 
-> The current Windows release package is CPU-focused. CUDA-capable Windows usage requires a source build and should currently be treated as preview.
+> The Windows release package keeps the public `izwi.exe` command CPU-safe and includes a private CUDA runtime for NVIDIA hosts.
 
 > See [Installation](./installation/index.md) for detailed platform-specific instructions.
 

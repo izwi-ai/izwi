@@ -263,12 +263,12 @@ izwi serve --backend metal
 nvidia-smi
 ```
 
-**Verify CUDA installation:**
+**For source builds, verify CUDA Toolkit installation:**
 ```bash
 nvcc --version
 ```
 
-**Rebuild with CUDA support:**
+**If you installed from source, rebuild with CUDA support:**
 ```bash
 # Linux source install
 IZWI_BUILD_BACKEND=cuda ./scripts/install-cli.sh
@@ -278,9 +278,9 @@ cargo build --release -p izwi-cli --features cuda
 cargo build --release -p izwi-server --features cuda
 ```
 
-**Verify compile-time and runtime backend state:**
+**Verify runtime backend state:**
 ```bash
-izwi version --full
+izwi serve --backend cuda
 izwi status --detailed
 ```
 
