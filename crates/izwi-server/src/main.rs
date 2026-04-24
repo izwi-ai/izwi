@@ -101,8 +101,17 @@ async fn main() -> anyhow::Result<()> {
     // Create runtime service
     let runtime = RuntimeService::new(config)?;
     let state = AppState::new(runtime, &serve_config)?;
-    preload_configured_models(&state).await;
-    warmup_preloaded_asr_models(&state).await;
+    let mut startup_warnings = preload_configured_models(&state).await;
+    startup_warnings.extend(warmup_preloaded_asr_models(&state).await);
+    if !startup_warnings.is_empty() {
+        state
+            .lifecycle
+            .record_startup_warnings(startup_warnings.clone());
+        for warning in startup_warnings {
+            warn!(warning = %warning, "Startup readiness warning");
+        }
+    }
+    state.lifecycle.mark_ready();
 
     info!("Runtime service initialized");
 
@@ -320,10 +329,11 @@ fn build_asr_warmup_wav(sample_rate: u32, duration_ms: u32) -> anyhow::Result<Ve
     Ok(wav_bytes)
 }
 
-async fn preload_configured_models(state: &AppState) {
+async fn preload_configured_models(state: &AppState) -> Vec<String> {
+    let mut warnings = Vec::new();
     let configured = configured_preload_models();
     if configured.is_empty() {
-        return;
+        return warnings;
     }
 
     info!(
@@ -338,39 +348,44 @@ async fn preload_configured_models(state: &AppState) {
                     info!(model = %variant, "Preloaded model");
                 }
                 Err(err) => {
+                    warnings.push(format!("failed to preload model {model_id}: {err}"));
                     warn!(model_id = %model_id, "Failed to preload model: {err}");
                 }
             },
             Err(err) => {
+                warnings.push(format!("unknown preload model {model_id}: {err}"));
                 warn!(model_id = %model_id, "Skipping unknown preload model id: {err}");
             }
         }
     }
+
+    warnings
 }
 
-async fn warmup_preloaded_asr_models(state: &AppState) {
+async fn warmup_preloaded_asr_models(state: &AppState) -> Vec<String> {
+    let mut warnings = Vec::new();
     if !warmup_preloaded_models_enabled() {
-        return;
+        return warnings;
     }
 
     let configured = configured_preload_models();
     if configured.is_empty() {
-        return;
+        return warnings;
     }
 
     let duration_ms = asr_warmup_duration_ms();
     let warmup_wav = match build_asr_warmup_wav(16_000, duration_ms) {
         Ok(bytes) => bytes,
         Err(err) => {
+            warnings.push(format!("failed to build ASR warmup WAV bytes: {err}"));
             warn!("Failed to build ASR warmup WAV bytes: {err}");
-            return;
+            return warnings;
         }
     };
 
     info!(
         count = configured.len(),
-        duration_ms,
-        "Running ASR warmup pass for preloaded models"
+        duration_ms, "Running ASR warmup pass for preloaded models"
     );
 
     for model_id in configured {
@@ -385,14 +400,20 @@ async fn warmup_preloaded_asr_models(state: &AppState) {
                     .await
                 {
                     Ok(_) => info!(model = %model_id, "ASR warmup completed"),
-                    Err(err) => warn!(model_id = %model_id, "ASR warmup failed: {err}"),
+                    Err(err) => {
+                        warnings.push(format!("ASR warmup failed for {model_id}: {err}"));
+                        warn!(model_id = %model_id, "ASR warmup failed: {err}");
+                    }
                 }
             }
             Err(err) => {
+                warnings.push(format!("unknown warmup model {model_id}: {err}"));
                 warn!(model_id = %model_id, "Skipping unknown warmup model id: {err}");
             }
         }
     }
+
+    warnings
 }
 
 /// Wait for shutdown signal and cleanup
@@ -422,6 +443,8 @@ async fn shutdown_signal(state: AppState) {
             info!("Received SIGTERM, shutting down...");
         },
     }
+
+    state.lifecycle.mark_draining();
 
     const CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
     match tokio::time::timeout(CLEANUP_TIMEOUT, state.runtime.unload_all_models()).await {
