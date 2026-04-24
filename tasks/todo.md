@@ -246,7 +246,7 @@ Close the release and runtime gaps found during the CPU+CUDA installer review wi
   `cargo check -p izwi-core -p izwi-server`
   Targeted backend-selection tests where practical.
 
-- [ ] Phase 4: Remove path exposure from public health
+- [x] Phase 4: Remove path exposure from public health
   Scope:
   Keep `/v1/health` useful with booleans and missing library labels, but stop serializing private runtime and search paths by default.
   Verification:
@@ -257,6 +257,7 @@ Close the release and runtime gaps found during the CPU+CUDA installer review wi
 - Phase 1 complete: private Linux CUDA backend probes now run with the packaged runtime loader path, and private runtime audits now tolerate missing host NVIDIA driver libraries without allowing missing packaged CUDA runtime dependencies to pass silently. Windows audit logic was updated to the same contract, but still needs execution on a Windows runner because PowerShell is not available on this host.
 - Phase 2 complete: added post-package artifact verification for Linux terminal archives, `.deb` payloads, AppImage extraction, Windows terminal zips, and Windows NSIS installer extraction. Local verification covered Bash syntax, whitespace checks, and a synthetic terminal tarball; real `.deb`, AppImage, and NSIS extraction will run in release CI where those artifacts are produced.
 - Phase 3 complete: explicit CUDA backend mismatches now produce a CUDA-specific diagnostic that names the selected fallback backend and points users to CUDA runtime diagnostics. `auto` selection remains unchanged.
+- Phase 4 complete: `/v1/health` keeps CUDA booleans, missing-library labels, device status, and notes, but no longer serializes private runtime paths or CUDA library search paths.
 
 ## Review
 
