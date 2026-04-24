@@ -11,6 +11,28 @@
       "/v1/audio/transcriptions",
       "/v1/audio/speech"
     ],
+    "preview_endpoints": {
+      "/v1/responses": {
+        "contract": "compatible request/response shape and streaming events",
+        "durability": "process_local",
+        "retention": "bounded in-memory store; records are lost on server restart"
+      },
+      "/v1/responses/:response_id": {
+        "contract": "lookup of process-local stored response records",
+        "durability": "process_local",
+        "retention": "not available after server restart or memory-store eviction"
+      },
+      "/v1/responses/:response_id/cancel": {
+        "contract": "preview lifecycle route for process-local response records",
+        "durability": "process_local",
+        "retention": "does not provide durable active-response cancellation semantics"
+      },
+      "/v1/responses/:response_id/input_items": {
+        "contract": "input-item lookup for process-local stored response records",
+        "durability": "process_local",
+        "retention": "not available after server restart or memory-store eviction"
+      }
+    },
     "out_of_scope_endpoints": [
       "/v1/audio/translations",
       "/v1/realtime/client_secrets",
