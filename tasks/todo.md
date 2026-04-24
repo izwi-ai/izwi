@@ -76,11 +76,15 @@ Use one shared backend packaging contract instead of copied core files:
   `scripts/release/audit-runtime-deps.sh target/release/izwi`
   Windows PowerShell validation still needs a Windows runner because `pwsh` is not available on this host.
 
-- [ ] Phase 2: Choose the CUDA runtime delivery model
+- [x] Phase 2: Choose the CUDA runtime delivery model
   Scope:
   Decide between private bundled CUDA redistributables, installer-managed prerequisites, or upstream-compatible lazy loading. Validate NVIDIA redistribution terms for the exact libraries required by Candle/cudarc/candle-kernels.
   Deliverable:
   A written packaging contract for Linux and Windows that says exactly which CUDA libraries are bundled or required, where they live, how the loader finds them, and what happens on CPU-only machines.
+  Implementation:
+  Added `docs/release/cuda-runtime-contract.md` choosing a single installer with CPU-safe defaults and CUDA sidecar binaries built from the same source. The contract lists expected CUDA libraries, driver boundaries, runtime selection behavior, and verification requirements.
+  Verification:
+  Reviewed current NVIDIA CUDA EULA Attachment A and CUDA compatibility documentation.
 
 - [ ] Phase 3: Normalize release build inputs for all Linux and Windows surfaces
   Scope:
@@ -120,6 +124,7 @@ Use one shared backend packaging contract instead of copied core files:
 - The requested user-facing goal is feasible only with a CUDA runtime delivery or lazy-loading strategy, not by simply flipping `--features cuda` in the release workflow.
 - The plan covers all Linux release surfaces, not only Ubuntu or `.deb`.
 - Phase 1 added repeatable loader/startup audit tooling for release artifacts. Local verification covered the Bash script and existing macOS binary; Windows script validation is deferred to a Windows runner.
+- Phase 2 chose the CPU-safe default plus CUDA sidecar model, documented the library contract, and kept all backend variants tied to shared source builds rather than forked core files.
 
 # Voice Configuration Modal Redesign Plan
 
