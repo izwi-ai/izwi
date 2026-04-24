@@ -557,6 +557,21 @@ store. Stored response objects are retained in bounded process memory and can be
 evicted or lost on server restart. Durable local history is provided by the
 SQLite-backed first-party chat and voice stores.
 
+Current preview retention rules:
+
+- `store: false` skips even process-local response retention.
+- Stored response records are capped by `IZWI_MAX_RESPONSE_STORE_ENTRIES` and default to 512 entries.
+- When the cap is exceeded, the oldest response records by `created_at` are evicted.
+- Streaming response records are stored only after terminal completion or failure, not as a durable in-progress lifecycle object.
+- `GET`, `DELETE`, `cancel`, and `input_items` operate only on currently retained process-local records.
+
+Agent session metadata has the same preview shape: `/v1/agent/sessions` stores
+session id, agent id, model id, planning mode, and the linked chat thread id in
+bounded process memory. The cap is `IZWI_MAX_AGENT_SESSION_STORE_ENTRIES`, also
+defaulting to 512 entries, and eviction uses `updated_at`. The linked chat
+thread and messages are SQLite-backed durable local history; the agent-session
+id and metadata are not durable across server restarts.
+
 ### 10.3 Admin Endpoints
 
 | Method | Path | Description |
