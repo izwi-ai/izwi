@@ -176,25 +176,27 @@ Verification:
 
 ### Phase 2: Switch Dependents To The Right Probe
 
+Status: complete.
+
 Goal:
 
 - Make internal tooling and deployment assets use liveness/readiness correctly.
 
 Tasks:
 
-- [ ] Switch Dockerfile healthchecks from `/v1/health` to `/readyz`.
-- [ ] Switch Docker Compose healthchecks to `/readyz`.
-- [ ] Switch `izwi serve` startup wait to readiness.
-- [ ] Keep `izwi status` on `/v1/health`, but optionally show readiness summary.
-- [ ] Switch bench HTTP-overhead throughput test from `/v1/health` to `/livez` if it is measuring server overhead rather than runtime readiness.
-- [ ] Update CLI docs, Docker docs, troubleshooting, and status docs.
+- [x] Switch Dockerfile healthchecks from `/v1/health` to `/readyz`.
+- [x] Switch Docker Compose healthchecks to `/readyz`.
+- [x] Switch `izwi serve` startup wait to readiness.
+- [x] Keep `izwi status` on `/v1/health`, but optionally show readiness summary.
+- [x] Switch bench HTTP-overhead throughput test from `/v1/health` to `/livez` if it is measuring server overhead rather than runtime readiness.
+- [x] Update CLI docs, Docker docs, troubleshooting, and status docs.
 
 Verification:
 
-- [ ] CLI serve wait test updated.
-- [ ] Docker healthcheck grep confirms `/readyz`.
-- [ ] Bench docs and command text mention `/livez` if changed.
-- [ ] `cargo check --locked -p izwi-server -p izwi-cli`.
+- [x] CLI serve wait test updated.
+- [x] Docker healthcheck grep confirms `/readyz`.
+- [x] Bench docs and command text mention `/livez` if changed.
+- [x] `cargo check --locked -p izwi-server -p izwi-cli`.
 
 ### Phase 3: Structured JSON Logging Mode
 

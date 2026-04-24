@@ -525,7 +525,7 @@ async fn bench_throughput(
         &format!("Throughput test: {}s, {} concurrent", duration, concurrent),
     );
 
-    println!("Running throughput benchmark against /v1/health...");
+    println!("Running throughput benchmark against /livez...");
     let client = http::client(Some(std::time::Duration::from_secs(5)))?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(duration);
 
@@ -537,7 +537,7 @@ async fn bench_throughput(
             let mut success = 0u64;
             let mut failed = 0u64;
             while std::time::Instant::now() < deadline {
-                match client.get(format!("{}/v1/health", server)).send().await {
+                match client.get(format!("{}/livez", server)).send().await {
                     Ok(resp) if resp.status().is_success() => success += 1,
                     _ => failed += 1,
                 }

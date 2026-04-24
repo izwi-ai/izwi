@@ -104,7 +104,7 @@ izwi bench asr --model Whisper-Large-v3-Turbo --file test.wav --language en --it
 
 ## izwi bench throughput
 
-Benchmark overall system throughput.
+Benchmark lightweight HTTP server overhead against `/livez`.
 
 ```bash
 izwi bench throughput [OPTIONS]
