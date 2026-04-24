@@ -56,10 +56,10 @@ The runtime exposes both compatibility APIs and first-party local workflow APIs 
 | **`POST /v1/chat/completions`** | Stable | Core OpenAI-compatible chat surface. |
 | **`GET /v1/models`** | Stable | Live model catalog / availability surface. |
 | **Local CLI workflows (`izwi serve`, `izwi pull`, `izwi tts`, `izwi transcribe`)** | Stable | Primary user-facing local runtime workflows. |
-| **`POST /v1/responses`** | Preview | Available today, but persistence/runtime contract is still being clarified. |
+| **`POST /v1/responses` and response-object lifecycle routes** | Preview | Response objects are stored in bounded process memory for compatibility convenience. They can be evicted and are lost on server restart. |
 | **`/v1/admin/*` model-management APIs** | Preview | Operator-oriented local admin APIs; auth and long-term contract are not finalized. |
 | **Persisted first-party workflow APIs (`/v1/transcriptions/jobs`, `/v1/diarizations`, `/v1/text-to-speech-generations`, `/v1/studio/*`, `/v1/voices*`)** | Preview | Powerful local product APIs, but the public compatibility/support contract is still evolving. |
-| **Local agent/session features** | Preview | Available for local use, but not yet positioned as a stable deployment contract. |
+| **Local agent/session features** | Preview | Agent session metadata is process-local today. Chat threads, voice sessions, voice turns, and voice observations are the durable SQLite-backed local stores. |
 
 ---
 

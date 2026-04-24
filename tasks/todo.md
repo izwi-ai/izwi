@@ -1,3 +1,292 @@
+# OSS Runtime P0 Backlog Analysis And Implementation Plan
+
+## Goal
+
+Analyze `/Users/lennex/Code/clients/izwi-knowledge/open-source-runtime-roadmap.md`, especially the Prioritized Backlog P0 items, against the current OSS codebase and produce a phased implementation plan only.
+
+## Constraints
+
+- Research, analysis, and planning only.
+- No runtime or product implementation in this phase.
+- Treat the roadmap as a snapshot, not guaranteed current truth.
+- Prefer current code/docs/CI evidence over stale roadmap claims.
+- Skip Docker and CUDA truth closure implementation planning per user direction.
+- Keep changes scoped to this planning artifact.
+
+## Research Checklist
+
+- [x] Review project lessons and current task notes.
+- [x] Read the roadmap and P0 backlog.
+- [x] Audit release/Docker CUDA backend truth.
+- [x] Audit support matrix and stable/preview API surface documentation.
+- [x] Audit readiness/liveness health contract.
+- [x] Audit structured JSON logging support.
+- [x] Audit `/v1/responses` and agent-session durability.
+- [x] Run lightweight verification of current server/CLI code.
+- [x] Produce phased implementation plan.
+
+## P0 Current-State Summary
+
+### 1. Fix release and Docker backend truth for CUDA/NVIDIA support
+
+Status: partially implemented, not fully closed.
+
+Already implemented:
+
+- Release workflow builds CPU-safe public Linux/Windows CLI/server binaries, then CUDA variants in a separate target directory and stages them under `runtime/cuda`.
+- Release verification scripts enforce stable public binary names and private CUDA runtime layout.
+- Dockerfile has separate CPU and CUDA build/runtime targets, and the CUDA target builds `izwi-server --features cuda`.
+- Backend Truth CI checks CPU cargo, CUDA cargo, CPU Docker build, and CUDA Docker build.
+- Runtime CUDA diagnostics exist in `izwi-core` and are exposed through `/v1/health` and `izwi status --detailed`.
+- README, release docs, and `docs/user/support-matrix.md` describe the unified CPU-safe public binary plus private CUDA runtime contract.
+
+Still missing or inconsistent:
+
+- Docker Compose CUDA instructions are likely wrong: `docker compose --profile cuda up -d` starts the default CPU service plus the profiled CUDA service, and both bind `8080:8080`.
+- CI builds Docker CUDA but does not run the image, query `/v1/health`, or assert CUDA selection.
+- No automated NVIDIA-host smoke test proves release/runtime CUDA selection or inference on a real GPU.
+- Runtime CUDA delegation docs say `auto` should delegate only when a usable CUDA device is indicated, but the current gate checks packaged runtime, runtime libraries, and driver availability, not `device_usable`.
+- Windows private runtime health can report active but not packaged after delegation because the delegation path does not set `IZWI_CUDA_RUNTIME_BINARY`, and Windows discovery lacks the Linux-style installed fallback.
+- Final packaged artifact checks are weaker than staging checks because they omit some CUDA library families required by staging verification.
+
+### 2. Publish runtime support matrix: OS, hardware, deployment targets, stable API surfaces
+
+Status: mostly implemented, needs consistency hardening.
+
+Already implemented:
+
+- `docs/user/support-matrix.md` now exists and covers backend matrix, deployment matrix, API surface maturity, CUDA caveats, and verification guidance.
+- README and installation/getting-started docs point to the support matrix.
+- The matrix correctly marks `/v1/responses`, `/v1/admin/*`, persisted first-party workflow APIs, and local agent/session features as preview.
+
+Still missing or inconsistent:
+
+- `docs/openai-compatibility-contract.json` lists `/v1/responses/:id`, cancel, and input-items as supported without saying those lifecycle routes are process-local preview behavior.
+- Dev docs list `POST /v1/responses` but do not clearly document retrieval/cancel/input-items maturity.
+- Docker Compose CUDA support text should be revised after the Compose service/profile contract is fixed.
+- The support matrix should link to operational probe/logging contracts once those P0 items land.
+
+### 3. Add real readiness and liveness endpoints
+
+Status: missing.
+
+What exists:
+
+- `/v1/health` and `/internal/health` return status/version/backend/device/CUDA diagnostics.
+- `/v1/metrics`, `/internal/metrics`, and Prometheus metrics expose runtime telemetry.
+- CLI status, CLI serve readiness wait, bench throughput, Dockerfile healthchecks, and Docker Compose healthchecks depend on `/v1/health`.
+
+What is missing:
+
+- No `/livez`, `/readyz`, or equivalent.
+- `/health` always returns `200` with `status: "ok"` and is a summary, not readiness or liveness.
+- No `503` readiness path.
+- No lifecycle state for starting, ready, degraded, draining, or shutdown.
+- No readiness checks for store health, selected backend availability, preload failures, required model residency, semaphore saturation, worker panic/restart thresholds, or shutdown drain state.
+- Since the server only listens after preload/warmup, probes cannot observe alive-but-not-ready startup work.
+
+### 4. Add structured JSON logging as a supported runtime mode
+
+Status: missing.
+
+What exists:
+
+- Server uses `tracing_subscriber::fmt::layer()` with `RUST_LOG`/`EnvFilter`.
+- HTTP `TraceLayer` spans include method, URI, and an inbound `x-request-id` when present.
+- Request middleware generates/returns `x-request-id`.
+- CLI exposes `--log-level` and passes `RUST_LOG` to the server.
+
+What is missing:
+
+- No `--log-format json`, `IZWI_LOG_FORMAT`, or config key.
+- Workspace `tracing-subscriber` does not enable the JSON formatter feature.
+- No stable JSON log schema for service/version/level/target/request id/method/path/status/latency/error.
+- The trace span does not use the generated request id from request middleware when the caller does not provide one.
+- No tests or docs for JSON log mode.
+- Docker `json-file` logging is container framing, not application JSON logs.
+
+### 5. Decide whether `/v1/responses` and agent sessions are durable product features or preview-only local conveniences
+
+Status: decision should be preview-only now.
+
+Current behavior:
+
+- `/v1/responses` records live in an in-memory `HashMap` with a default 512-entry limit.
+- `store: false` skips even in-memory storage.
+- Streaming responses are stored only when completed or failed, not at `response.created`, so in-progress lookup/cancel is not a real durable lifecycle.
+- `/v1/agent/sessions` session metadata also lives in an in-memory `HashMap`.
+- Agent session creation does create a durable chat thread, but the agent session id and metadata are lost after restart.
+- Voice profiles, voice sessions, voice turns, observations, and chat threads/messages are SQLite-backed; those are the durable local product surfaces today.
+
+Decision:
+
+- Keep `/v1/responses` and `/v1/agent/sessions` as preview, process-local, bounded-memory convenience APIs for now.
+- Do not promote them to durable product features until SQLite storage, lifecycle semantics, restart tests, and docs are implemented together.
+
+## Phased Implementation Plan
+
+### Phase 0: Contract Cleanup And No-Code Truth Fixes
+
+Status: complete.
+
+Goal:
+
+- Close the easy trust gaps before changing runtime behavior.
+
+Tasks:
+
+- [x] Update `docs/openai-compatibility-contract.json` or its surrounding docs to mark Responses lifecycle routes as preview/process-local where applicable.
+- [x] Update dev docs to list all Responses lifecycle routes and describe their current non-durable behavior.
+- [x] Keep `/v1/responses` and `/v1/agent/sessions` explicitly preview in the support matrix.
+- [x] Add a short note in this planning artifact that Docker/CUDA truth closure is intentionally deferred/out of scope.
+
+Verification:
+
+- [x] Docs grep confirms no stale claim that `/v1/responses` object lifecycle or agent sessions are durable.
+
+Out of scope:
+
+- Docker and CUDA truth closure remains analyzed above for context, but is intentionally skipped in this implementation plan.
+
+### Phase 1: Probe Contract And Lifecycle State
+
+Goal:
+
+- Add real liveness/readiness semantics without breaking existing `/v1/health` clients.
+
+Tasks:
+
+- [ ] Keep `/v1/health` backward-compatible as the rich status summary.
+- [ ] Add root `/livez` and `/readyz`.
+- [ ] Consider `/v1/live` and `/v1/ready` aliases for API namespace consistency.
+- [ ] Add a small lifecycle state to server/AppState: startup time, phase, ready flag, degraded reasons, preload/warmup errors, shutdown/draining flag.
+- [ ] Mark server unready before graceful shutdown starts.
+- [ ] Define readiness reason codes, for example `runtime_initialized`, `stores_available`, `backend_available`, `preload_complete`, `worker_health`, `not_draining`.
+- [ ] Return compact JSON and `200` when ready, compact JSON and `503` when unready.
+- [ ] Keep liveness cheap and independent of model readiness.
+
+Verification:
+
+- [ ] Router tests for `/livez` returning `200`.
+- [ ] Router tests for `/readyz` returning `200` when initialized.
+- [ ] Unit tests for unready/degraded reason rendering.
+- [ ] Shutdown/drain state test where practical.
+
+### Phase 2: Switch Dependents To The Right Probe
+
+Goal:
+
+- Make internal tooling and deployment assets use liveness/readiness correctly.
+
+Tasks:
+
+- [ ] Switch Dockerfile healthchecks from `/v1/health` to `/readyz`.
+- [ ] Switch Docker Compose healthchecks to `/readyz`.
+- [ ] Switch `izwi serve` startup wait to readiness.
+- [ ] Keep `izwi status` on `/v1/health`, but optionally show readiness summary.
+- [ ] Switch bench HTTP-overhead throughput test from `/v1/health` to `/livez` if it is measuring server overhead rather than runtime readiness.
+- [ ] Update CLI docs, Docker docs, troubleshooting, and status docs.
+
+Verification:
+
+- [ ] CLI serve wait test updated.
+- [ ] Docker healthcheck grep confirms `/readyz`.
+- [ ] Bench docs and command text mention `/livez` if changed.
+- [ ] `cargo check --locked -p izwi-server -p izwi-cli`.
+
+### Phase 3: Structured JSON Logging Mode
+
+Goal:
+
+- Support machine-readable runtime logs while preserving current text default.
+
+Tasks:
+
+- [ ] Enable `tracing-subscriber` JSON formatter feature.
+- [ ] Add `LogFormat { text, json }` parsing.
+- [ ] Add direct server flag `--log-format`.
+- [ ] Add env var `IZWI_LOG_FORMAT`.
+- [ ] Add CLI `izwi serve --log-format` and pass it through to child server processes.
+- [ ] Centralize tracing initialization in a small helper so parsing/defaults are testable.
+- [ ] Define stable fields: timestamp, level, target, service, version, message, correlation_id, method, path, status, latency_ms, error.
+- [ ] Make request-id middleware and TraceLayer agree on generated request IDs.
+- [ ] Add response/failure events with status and latency.
+- [ ] Document Docker usage with application JSON logs, distinct from Docker `json-file`.
+
+Verification:
+
+- [ ] Unit tests for log format parsing and defaults.
+- [ ] Router/middleware test proves generated `x-request-id` is returned.
+- [ ] Integration-style smoke captures one JSON log line and validates basic keys where feasible.
+- [ ] `cargo check --locked -p izwi-server -p izwi-cli`.
+
+### Phase 4: Preview Semantics Hardening For Responses And Agent Sessions
+
+Goal:
+
+- Make the current non-durable decision intentional, tested, and legible.
+
+Tasks:
+
+- [ ] Add clear docs for `/v1/responses` retention: process-local, bounded memory, evicted by age, lost on restart.
+- [ ] Add clear docs for `/v1/agent/sessions`: session metadata process-local, chat thread/messages durable.
+- [ ] Add tests for `store:false` not retaining response records.
+- [ ] Add tests for bounded response eviction.
+- [ ] Add tests for bounded agent-session eviction.
+- [ ] Consider preview headers or response metadata for preview/process-local APIs if useful.
+- [ ] Align UI/client assumptions so durable history uses chat/voice stores, not response/agent-session ids.
+
+Verification:
+
+- [ ] Targeted server tests for response and agent session memory semantics.
+- [ ] Docs grep confirms preview/non-durable wording.
+- [ ] `cargo check --locked -p izwi-server`.
+
+### Phase 5: Optional Durable Promotion Path
+
+Goal:
+
+- Only if product decides durable Responses/agent sessions are needed, promote them deliberately.
+
+Tasks:
+
+- [ ] Add SQLite store/tables for response objects and response input items.
+- [ ] Persist streaming lifecycle from created/in-progress through completed/failed.
+- [ ] Implement meaningful active-response cancellation, or document cancel as best-effort if runtime cancellation is unavailable.
+- [ ] Add SQLite store/tables for agent session metadata.
+- [ ] Reconstruct agent sessions after restart using stored session metadata plus durable chat thread/messages.
+- [ ] Add migrations and storage versioning tests.
+- [ ] Add restart integration tests for Responses and agent sessions.
+- [ ] Update compatibility contract, support matrix, dev docs, and UI copy only after behavior is durable.
+
+Verification:
+
+- [ ] Restart durability tests pass.
+- [ ] Streaming lifecycle persistence tests pass.
+- [ ] Agent session turn after restart works.
+- [ ] Docs and contract promote surfaces from preview only after tests prove durability.
+
+## Elegance Review
+
+The elegant path is to avoid turning `/v1/health` into a catch-all contract. Keep it as the existing rich status endpoint, add small Unix/Kubernetes-style probes for orchestration, and keep durability decisions separate from OpenAI compatibility routing. That minimizes breakage while giving enterprise packaging the precise hooks it needs.
+
+For Responses and agent sessions, the lowest-risk decision is preview-only now. There are already durable SQLite-backed product surfaces for chat and voice. Promoting the compatibility lifecycle to durable storage is valuable only if it is done with full lifecycle semantics, not a partial table bolted onto the current in-memory map.
+
+## Verification Completed In This Planning Phase
+
+- [x] `cargo check --locked -p izwi-server -p izwi-cli`
+
+Result:
+
+- Server and CLI compile successfully in the current codebase.
+
+## Review
+
+- The roadmap is stale on at least two P0 points: a support matrix exists, and CUDA release packaging has already been significantly implemented.
+- Docker and CUDA truth closure was analyzed but intentionally skipped from the implementation plan per user direction.
+- The remaining P0 implementation work in scope is contract hardening around real probes, JSON logging, and explicit preview semantics.
+- No runtime implementation was performed in this phase.
+
 # CPU + CUDA Unified Installer Feasibility Plan
 
 ## Goal

@@ -545,9 +545,17 @@ These routes back the desktop UI's saved history and reusable assets. Canonical 
 | `POST` | `/v1/audio/translations` | Speech translation |
 | `POST` | `/v1/chat/completions` | Chat / LLM completions |
 | `GET` | `/v1/models` | List available models |
-| `POST` | `/v1/responses` | Structured response generation |
+| `POST` | `/v1/responses` | Structured response generation; preview process-local response-object storage |
+| `GET, DELETE` | `/v1/responses/:response_id` | Fetch or delete a process-local stored response object |
+| `POST` | `/v1/responses/:response_id/cancel` | Preview lifecycle route for process-local response records |
+| `GET` | `/v1/responses/:response_id/input_items` | Fetch input items for a process-local stored response object |
 
 Sub-routers: `audio`, `chat`, `models`, `responses` (defined in `api/openai/mod.rs`).
+
+Responses object storage is a compatibility convenience, not a durable product
+store. Stored response objects are retained in bounded process memory and can be
+evicted or lost on server restart. Durable local history is provided by the
+SQLite-backed first-party chat and voice stores.
 
 ### 10.3 Admin Endpoints
 
