@@ -46,12 +46,10 @@ pub struct CudaRuntimeResponse {
     pub current_binary_cuda_compiled: bool,
     pub private_runtime_active: bool,
     pub private_runtime_packaged: bool,
-    pub private_runtime_path: Option<String>,
     pub runtime_libraries_available: bool,
     pub missing_runtime_libraries: Vec<String>,
     pub driver_available: bool,
     pub device_usable: Option<bool>,
-    pub search_paths: Vec<String>,
     pub notes: Vec<String>,
 }
 
@@ -94,18 +92,10 @@ impl From<CudaRuntimeDiagnostics> for CudaRuntimeResponse {
             current_binary_cuda_compiled: value.current_binary_cuda_compiled,
             private_runtime_active: value.private_runtime_active,
             private_runtime_packaged: value.private_runtime_packaged,
-            private_runtime_path: value
-                .private_runtime_path
-                .map(|path| path.display().to_string()),
             runtime_libraries_available: value.runtime_libraries_available,
             missing_runtime_libraries: value.missing_runtime_libraries,
             driver_available: value.driver_available,
             device_usable: value.device_usable,
-            search_paths: value
-                .search_paths
-                .into_iter()
-                .map(|path| path.display().to_string())
-                .collect(),
             notes: value.notes,
         }
     }
@@ -125,4 +115,34 @@ fn current_server_binary_name() -> String {
                 "izwi-server".to_string()
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cuda_runtime_health_response_does_not_expose_local_paths() {
+        let response = CudaRuntimeResponse {
+            current_binary_cuda_compiled: false,
+            private_runtime_active: false,
+            private_runtime_packaged: true,
+            runtime_libraries_available: true,
+            missing_runtime_libraries: Vec::new(),
+            driver_available: false,
+            device_usable: None,
+            notes: vec!["private CUDA runtime binary is packaged".to_string()],
+        };
+
+        let value = serde_json::to_value(response).expect("serialize CUDA runtime health response");
+
+        assert!(value.get("private_runtime_path").is_none());
+        assert!(value.get("search_paths").is_none());
+        assert_eq!(
+            value
+                .get("private_runtime_packaged")
+                .and_then(|entry| entry.as_bool()),
+            Some(true)
+        );
+    }
 }
