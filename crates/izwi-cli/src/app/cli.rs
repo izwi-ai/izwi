@@ -123,6 +123,10 @@ pub enum Commands {
         #[arg(long, default_value = "warn", env = "RUST_LOG")]
         log_level: String,
 
+        /// Log output format
+        #[arg(long, value_enum, default_value = "text", env = "IZWI_LOG_FORMAT")]
+        log_format: LogFormat,
+
         /// Enable development mode with hot reload
         #[arg(long, hide = true)]
         dev: bool,
@@ -613,6 +617,21 @@ pub enum ServeMode {
     Desktop,
     /// Start API server and open the web UI in a browser tab
     Web,
+}
+
+#[derive(Clone, ValueEnum)]
+pub enum LogFormat {
+    Text,
+    Json,
+}
+
+impl LogFormat {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+        }
+    }
 }
 
 #[derive(Clone, ValueEnum)]

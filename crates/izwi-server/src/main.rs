@@ -7,7 +7,6 @@ use std::process::Command;
 use std::time::Duration;
 use tokio::signal;
 use tracing::{info, warn};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod api;
 mod app;
@@ -15,6 +14,7 @@ mod chat_store;
 mod diarization_store;
 mod error;
 mod ids;
+mod logging;
 mod onboarding_store;
 mod saved_voice_store;
 mod speech_history_store;
@@ -31,6 +31,7 @@ use izwi_core::backends::{self, BackendPreference, CudaRuntimeDiagnostics};
 use izwi_core::{
     parse_model_variant, RuntimeService, ServeRuntimeConfig, ServeRuntimeConfigOverrides,
 };
+use logging::{LogFormat, SERVICE_NAME, SERVICE_VERSION};
 use state::AppState;
 
 #[derive(Debug, Parser)]
@@ -51,6 +52,10 @@ struct ServerArgs {
     /// Backend preference (`auto`, `cpu`, `metal`, `cuda`)
     #[arg(long, value_enum, env = "IZWI_BACKEND")]
     backend: Option<BackendArg>,
+
+    /// Log output format (`text`, `json`)
+    #[arg(long, value_enum, env = "IZWI_LOG_FORMAT", default_value = "text")]
+    log_format: LogFormat,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -83,16 +88,14 @@ async fn main() -> anyhow::Result<()> {
     let args = ServerArgs::parse();
     maybe_delegate_to_private_cuda_runtime(&args)?;
 
-    // Initialize logging
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "izwi_server=warn,izwi_core=warn,tower_http=warn".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    logging::init_tracing(args.log_format);
 
-    info!("Starting Izwi TTS Server");
+    info!(
+        service = SERVICE_NAME,
+        version = SERVICE_VERSION,
+        log_format = args.log_format.as_str(),
+        "Starting Izwi TTS Server"
+    );
 
     let serve_config = resolve_serve_runtime_config(&args);
     let config = serve_config.engine_config();
@@ -485,6 +488,7 @@ mod tests {
         std::env::remove_var("IZWI_HOST");
         std::env::remove_var("IZWI_PORT");
         std::env::remove_var("IZWI_BACKEND");
+        std::env::remove_var("IZWI_LOG_FORMAT");
         std::env::remove_var("IZWI_MAX_BATCH_SIZE");
         std::env::remove_var("IZWI_NUM_THREADS");
         std::env::remove_var("IZWI_MAX_CONCURRENT");
@@ -575,6 +579,40 @@ mod tests {
         assert!(
             result.is_err(),
             "invalid backend should fail argument parsing"
+        );
+    }
+
+    #[test]
+    fn log_format_defaults_to_text() {
+        let _guard = env_lock();
+        clear_bind_env();
+
+        let args = parse(&["izwi-server"]);
+
+        assert_eq!(args.log_format, LogFormat::Text);
+        clear_bind_env();
+    }
+
+    #[test]
+    fn log_format_accepts_cli_and_environment() {
+        let _guard = env_lock();
+        clear_bind_env();
+        std::env::set_var("IZWI_LOG_FORMAT", "json");
+
+        let env_args = parse(&["izwi-server"]);
+        let cli_args = parse(&["izwi-server", "--log-format", "text"]);
+
+        assert_eq!(env_args.log_format, LogFormat::Json);
+        assert_eq!(cli_args.log_format, LogFormat::Text);
+        clear_bind_env();
+    }
+
+    #[test]
+    fn invalid_log_format_value_is_rejected() {
+        let result = ServerArgs::try_parse_from(["izwi-server", "--log-format", "ndjson"]);
+        assert!(
+            result.is_err(),
+            "invalid log format should fail argument parsing"
         );
     }
 

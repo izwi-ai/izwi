@@ -14,7 +14,7 @@ mod style;
 mod utils;
 
 pub use app::cli::{
-    AudioFormat, Backend, BenchCommands, Cli, Commands, ConfigCommands, ModelCommands,
+    AudioFormat, Backend, BenchCommands, Cli, Commands, ConfigCommands, LogFormat, ModelCommands,
     OutputFormat, ServeMode, Shell, TranscriptFormat,
 };
 use error::Result;
