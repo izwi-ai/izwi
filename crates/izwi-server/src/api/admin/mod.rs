@@ -10,27 +10,27 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/admin/models", get(models::list_models))
         .route(
-            "/admin/models/:variant/download",
+            "/admin/models/{variant}/download",
             axum::routing::post(models::download_model),
         )
         .route(
-            "/admin/models/:variant/download/progress",
+            "/admin/models/{variant}/download/progress",
             get(models::download_progress_stream),
         )
         .route(
-            "/admin/models/:variant/download/cancel",
+            "/admin/models/{variant}/download/cancel",
             axum::routing::post(models::cancel_download),
         )
         .route(
-            "/admin/models/:variant/load",
+            "/admin/models/{variant}/load",
             axum::routing::post(models::load_model),
         )
         .route(
-            "/admin/models/:variant/unload",
+            "/admin/models/{variant}/unload",
             axum::routing::post(models::unload_model),
         )
         .route(
-            "/admin/models/:variant",
+            "/admin/models/{variant}",
             get(models::get_model_info).delete(models::delete_model),
         )
 }

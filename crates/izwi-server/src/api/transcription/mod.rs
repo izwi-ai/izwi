@@ -16,16 +16,16 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     const AUDIO_UPLOAD_LIMIT_BYTES: usize = 64 * 1024 * 1024;
     const CANONICAL_COLLECTION: &str = "/transcriptions";
-    const CANONICAL_MEMBER: &str = "/transcriptions/:record_id";
-    const CANONICAL_AUDIO: &str = "/transcriptions/:record_id/audio";
-    const CANONICAL_SUMMARY_REGENERATE: &str = "/transcriptions/:record_id/summary/regenerate";
+    const CANONICAL_MEMBER: &str = "/transcriptions/{record_id}";
+    const CANONICAL_AUDIO: &str = "/transcriptions/{record_id}/audio";
+    const CANONICAL_SUMMARY_REGENERATE: &str = "/transcriptions/{record_id}/summary/regenerate";
     const CANONICAL_UNIFIED_COLLECTION: &str = "/transcriptions/jobs";
-    const CANONICAL_UNIFIED_MEMBER: &str = "/transcriptions/jobs/:record_id";
-    const CANONICAL_UNIFIED_AUDIO: &str = "/transcriptions/jobs/:record_id/audio";
-    const CANONICAL_UNIFIED_RERUNS: &str = "/transcriptions/jobs/:record_id/reruns";
-    const CANONICAL_UNIFIED_CANCEL: &str = "/transcriptions/jobs/:record_id/cancel";
+    const CANONICAL_UNIFIED_MEMBER: &str = "/transcriptions/jobs/{record_id}";
+    const CANONICAL_UNIFIED_AUDIO: &str = "/transcriptions/jobs/{record_id}/audio";
+    const CANONICAL_UNIFIED_RERUNS: &str = "/transcriptions/jobs/{record_id}/reruns";
+    const CANONICAL_UNIFIED_CANCEL: &str = "/transcriptions/jobs/{record_id}/cancel";
     const CANONICAL_UNIFIED_SUMMARY_REGENERATE: &str =
-        "/transcriptions/jobs/:record_id/summary/regenerate";
+        "/transcriptions/jobs/{record_id}/summary/regenerate";
 
     Router::new()
         .route(

@@ -13,11 +13,11 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     const AUDIO_UPLOAD_LIMIT_BYTES: usize = 64 * 1024 * 1024;
     const CANONICAL_COLLECTION: &str = "/diarizations";
-    const CANONICAL_MEMBER: &str = "/diarizations/:record_id";
-    const CANONICAL_AUDIO: &str = "/diarizations/:record_id/audio";
-    const CANONICAL_RERUNS: &str = "/diarizations/:record_id/reruns";
-    const CANONICAL_CANCEL: &str = "/diarizations/:record_id/cancel";
-    const CANONICAL_SUMMARY_REGENERATE: &str = "/diarizations/:record_id/summary/regenerate";
+    const CANONICAL_MEMBER: &str = "/diarizations/{record_id}";
+    const CANONICAL_AUDIO: &str = "/diarizations/{record_id}/audio";
+    const CANONICAL_RERUNS: &str = "/diarizations/{record_id}/reruns";
+    const CANONICAL_CANCEL: &str = "/diarizations/{record_id}/cancel";
+    const CANONICAL_SUMMARY_REGENERATE: &str = "/diarizations/{record_id}/summary/regenerate";
 
     Router::new()
         .route(

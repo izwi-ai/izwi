@@ -15,12 +15,12 @@ pub fn router() -> Router<AppState> {
             get(handlers::list_voice_observations).delete(handlers::clear_voice_observations),
         )
         .route(
-            "/voice/observations/:observation_id",
+            "/voice/observations/{observation_id}",
             axum::routing::delete(handlers::delete_voice_observation),
         )
         .route("/voice/sessions", get(handlers::list_voice_sessions))
         .route(
-            "/voice/sessions/:session_id",
+            "/voice/sessions/{session_id}",
             get(handlers::get_voice_session),
         )
 }
