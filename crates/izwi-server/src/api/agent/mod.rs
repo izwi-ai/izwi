@@ -12,9 +12,9 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/agent/sessions", post(handlers::create_session))
-        .route("/agent/sessions/:session_id", get(handlers::get_session))
+        .route("/agent/sessions/{session_id}", get(handlers::get_session))
         .route(
-            "/agent/sessions/:session_id/turns",
+            "/agent/sessions/{session_id}/turns",
             post(handlers::create_turn),
         )
 }

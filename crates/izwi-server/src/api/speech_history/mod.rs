@@ -12,14 +12,14 @@ pub(crate) use handlers::{synthesize_record, CreateSpeechHistoryRecordRequest};
 pub fn router() -> Router<AppState> {
     const AUDIO_UPLOAD_LIMIT_BYTES: usize = 64 * 1024 * 1024;
     const CANONICAL_TTS_COLLECTION: &str = "/text-to-speech-generations";
-    const CANONICAL_TTS_MEMBER: &str = "/text-to-speech-generations/:record_id";
-    const CANONICAL_TTS_AUDIO: &str = "/text-to-speech-generations/:record_id/audio";
+    const CANONICAL_TTS_MEMBER: &str = "/text-to-speech-generations/{record_id}";
+    const CANONICAL_TTS_AUDIO: &str = "/text-to-speech-generations/{record_id}/audio";
     const CANONICAL_VOICE_DESIGN_COLLECTION: &str = "/voice-design-generations";
-    const CANONICAL_VOICE_DESIGN_MEMBER: &str = "/voice-design-generations/:record_id";
-    const CANONICAL_VOICE_DESIGN_AUDIO: &str = "/voice-design-generations/:record_id/audio";
+    const CANONICAL_VOICE_DESIGN_MEMBER: &str = "/voice-design-generations/{record_id}";
+    const CANONICAL_VOICE_DESIGN_AUDIO: &str = "/voice-design-generations/{record_id}/audio";
     const CANONICAL_VOICE_CLONE_COLLECTION: &str = "/voice-clone-generations";
-    const CANONICAL_VOICE_CLONE_MEMBER: &str = "/voice-clone-generations/:record_id";
-    const CANONICAL_VOICE_CLONE_AUDIO: &str = "/voice-clone-generations/:record_id/audio";
+    const CANONICAL_VOICE_CLONE_MEMBER: &str = "/voice-clone-generations/{record_id}";
+    const CANONICAL_VOICE_CLONE_AUDIO: &str = "/voice-clone-generations/{record_id}/audio";
 
     Router::new()
         .route(

@@ -7,5 +7,5 @@ use axum::{routing::get, Router};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/media/*path", get(handlers::get_media))
+    Router::new().route("/media/{*path}", get(handlers::get_media))
 }

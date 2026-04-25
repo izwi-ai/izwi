@@ -26,11 +26,11 @@ pub fn router() -> Router<AppState> {
                 .layer(DefaultBodyLimit::max(AUDIO_UPLOAD_LIMIT_BYTES)),
         )
         .route(
-            "/voices/:voice_id",
+            "/voices/{voice_id}",
             get(handlers::get_saved_voice).delete(handlers::delete_saved_voice),
         )
         .route(
-            "/voices/:voice_id/audio",
+            "/voices/{voice_id}/audio",
             get(handlers::get_saved_voice_audio),
         )
 }

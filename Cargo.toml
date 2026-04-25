@@ -24,10 +24,10 @@ futures = "0.3"
 async-stream = "0.3"
 
 # Web framework
-axum = { version = "0.7", features = ["ws", "multipart"] }
-axum-extra = { version = "0.9", features = ["typed-header"] }
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "fs", "trace"] }
+axum = { version = "0.8.9", features = ["ws", "multipart"] }
+axum-extra = { version = "0.12.6", features = ["typed-header"] }
+tower = "0.5.3"
+tower-http = { version = "0.6.8", features = ["cors", "fs", "trace"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
