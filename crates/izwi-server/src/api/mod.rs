@@ -8,6 +8,7 @@ pub mod internal;
 pub mod media;
 pub mod onboarding;
 pub mod openai;
+pub mod openapi;
 pub mod pagination;
 pub mod preferences;
 pub mod request_context;
