@@ -169,6 +169,7 @@ fn build_cors_layer(serve_config: &ServeRuntimeConfig) -> Option<CorsLayer> {
 mod tests {
     use super::*;
     use crate::state::AppState;
+    use crate::test_support::env_lock;
     use axum::{
         body::Body,
         http::{header, Method, Request, StatusCode},
@@ -177,7 +178,6 @@ mod tests {
     };
     use izwi_core::RuntimeService;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tower::Service;
 
@@ -1513,14 +1513,6 @@ mod tests {
         std::env::remove_var("IZWI_MEDIA_DIR");
 
         (state, TempDirGuard(temp_dir))
-    }
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("environment lock poisoned")
     }
 
     fn with_suppressed_panic_hook<T>(f: impl FnOnce() -> T) -> T {

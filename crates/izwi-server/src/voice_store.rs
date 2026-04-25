@@ -857,15 +857,7 @@ fn now_unix_millis_i64() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock")
-    }
+    use crate::test_support::env_lock;
 
     #[tokio::test]
     async fn initializes_default_profile_and_persists_sessions() {

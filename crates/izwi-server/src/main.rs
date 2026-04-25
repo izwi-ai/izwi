@@ -21,6 +21,8 @@ mod speech_history_store;
 mod state;
 mod storage_layout;
 mod studio_project_store;
+#[cfg(test)]
+mod test_support;
 mod transcription_store;
 mod voice_defaults;
 mod voice_memory;
@@ -474,15 +476,7 @@ async fn shutdown_signal(state: AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("environment lock poisoned")
-    }
+    use crate::test_support::env_lock;
 
     fn clear_bind_env() {
         std::env::remove_var("IZWI_HOST");

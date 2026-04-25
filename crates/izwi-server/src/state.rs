@@ -309,10 +309,10 @@ mod tests {
         now_unix_secs, request_limits, trim_store_by, AppState, ServerLifecycle,
         StoredAgentSessionRecord, StoredResponseInputItem, StoredResponseRecord,
     };
+    use crate::test_support::env_lock;
     use izwi_agent::planner::PlanningMode;
     use izwi_core::{backends::BackendPreference, RuntimeService, ServeRuntimeConfig};
     use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
 
     #[test]
     fn trim_store_by_evicts_oldest_response_record() {
@@ -528,14 +528,6 @@ mod tests {
         clear_store_env();
 
         (state, temp_dir)
-    }
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("environment lock poisoned")
     }
 
     fn clear_store_env() {
