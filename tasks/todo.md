@@ -1,3 +1,297 @@
+# Axum 0.8 Upgrade And Scalar API Docs Implementation Plan
+
+## Goal
+
+Upgrade Izwi's Rust HTTP stack to the latest Axum family and then add Rust-served Scalar API documentation backed by an OpenAPI document.
+
+## Constraints
+
+- Planning only in this pass; no runtime implementation yet.
+- Each future implementation phase must be a separate, standalone commit.
+- Each phase must leave the repo buildable and behaviorally verified before committing.
+- If a phase exposes migration breakage beyond the phase scope, stop and re-plan before continuing.
+- Keep the docs integration Rust-native.
+- Prefer the existing central router shape over a routing refactor.
+
+## Upstream Research Snapshot
+
+- Latest Axum is `0.8.9` with MSRV `1.80`.
+- Matching current ecosystem versions are `axum-extra 0.12.6`, `tower 0.5.3`, and `tower-http 0.6.8`.
+- Axum `0.8` changes route parameter syntax from `/:id` and `/*path` to `/{id}` and `/{*path}`; old syntax panics.
+- Axum `0.8` requires `Sync` handlers/services added to routers.
+- Axum `0.8` WebSocket message payloads use byte/string wrapper types rather than plain `Vec<u8>` / `String`.
+- `scalar_api_reference 0.2.2` is the current official Scalar Rust crate, MIT licensed, and its optional Axum feature depends on Axum `^0.8.8`.
+- `utoipa 5.4.0` is the current code-first OpenAPI generation crate; it supports OpenAPI 3.1 and can be used framework-agnostically.
+- `utoipa-scalar 0.3.0` is available, but using official `scalar_api_reference` keeps the visualizer tied directly to Scalar's crate.
+
+## Local Impact Summary
+
+- Workspace HTTP dependencies currently live in `Cargo.toml` as Axum `0.7`, axum-extra `0.9`, tower `0.4`, and tower-http `0.5`.
+- `izwi-server` is the primary affected crate; routes are composed centrally in `crates/izwi-server/src/api/router.rs`.
+- Many route strings still use Axum 0.7 syntax and must migrate in the same commit as the dependency bump.
+- WebSocket paths in `app/voice_realtime.rs` and `app/transcription_realtime.rs` already mostly use compatible conversions, but must be compile-verified.
+- No OpenAPI generation crate is currently wired in.
+- `axum-extra` appears unused in server code today, but keeping it upgraded is acceptable because Scalar/Axum ecosystem crates expect the 0.12 line.
+
+## Phase 1 Commit: Baseline Route And Runtime Coverage
+
+Commit name:
+
+- `test(server): harden router coverage before axum upgrade`
+
+Scope:
+
+- Add or tighten router tests under current Axum 0.7 for representative dynamic routes:
+  - catch-all media route,
+  - single path params,
+  - tuple path params,
+  - OpenAI Responses lifecycle routes,
+  - Studio nested routes,
+  - WebSocket upgrade route status where practical.
+- Add a lightweight inventory test or helper that enumerates key route paths so migration regressions are visible.
+- Do not change dependencies yet.
+
+Verification before commit:
+
+- `cargo test -p izwi-server api::router`
+- `cargo check --locked -p izwi-server`
+
+Commit boundary:
+
+- Stage only the tests/helpers for this phase.
+- Commit after tests pass.
+
+## Phase 2 Commit: Axum Family Upgrade
+
+Commit name:
+
+- `chore(server): upgrade axum stack to 0.8`
+
+Scope:
+
+- Update workspace dependencies:
+  - `axum = { version = "0.8.9", features = ["ws", "multipart"] }`
+  - `axum-extra = { version = "0.12.6", features = ["typed-header"] }`
+  - `tower = "0.5.3"`
+  - `tower-http = { version = "0.6.8", features = ["cors", "fs", "trace"] }`
+- Update `Cargo.lock`.
+- Migrate all Axum route strings:
+  - `/:param` -> `/{param}`
+  - `/*path` -> `/{*path}`
+- Update route tests/contract fixtures that intentionally describe OpenAI-style paths only where they are Axum router patterns rather than public docs.
+- Fix compile issues from tower 0.5 and WebSocket payload wrapper changes.
+- Avoid semantic route changes beyond the syntax migration.
+
+Verification before commit:
+
+- `cargo check --locked -p izwi-server`
+- `cargo test -p izwi-server api::router`
+- `cargo test -p izwi-server api::request_context`
+- `scripts/ci/check-backend-truth.sh cargo-cpu`
+
+Commit boundary:
+
+- Stage dependency manifests, lockfile, route syntax changes, and migration fixes only.
+- Commit after all checks pass.
+
+## Phase 3 Commit: OpenAPI Foundation
+
+Commit name:
+
+- `feat(server): expose openapi document scaffold`
+
+Scope:
+
+- Add `utoipa = { version = "5.4.0", features = ["axum_extras", "preserve_path_order"] }` or the minimal feature set proven by implementation.
+- Add a server OpenAPI module, likely `crates/izwi-server/src/api/openapi.rs`.
+- Define API metadata:
+  - title: `Izwi API`
+  - version from `CARGO_PKG_VERSION`
+  - local server URL such as `/`
+  - tags for OpenAI-compatible, runtime, admin, and first-party workflow surfaces.
+- Add reusable schemas for:
+  - shared error envelope,
+  - liveness/readiness responses,
+  - model list/model object,
+  - pagination cursor shapes if needed.
+- Serve `GET /openapi.json` from Rust before the UI fallback.
+- Keep endpoint coverage intentionally small but valid in this phase.
+
+Verification before commit:
+
+- `cargo check --locked -p izwi-server`
+- Router test for `GET /openapi.json` returning valid JSON with `openapi`, `info`, and `paths`.
+- OpenAPI validation using a Rust test or dev dependency if lightweight enough.
+
+Commit boundary:
+
+- Commit only the OpenAPI scaffold, minimal schemas, route mount, and tests.
+
+## Phase 4 Commit: Stable And Preview API Coverage
+
+Commit name:
+
+- `docs(api): describe public api surface in openapi`
+
+Scope:
+
+- Add OpenAPI coverage for stable OpenAI-compatible endpoints:
+  - `GET /v1/models`
+  - `GET /v1/models/{model}`
+  - `POST /v1/chat/completions`
+  - `POST /v1/audio/speech`
+  - `POST /v1/audio/transcriptions`
+- Add explicit preview coverage for:
+  - `POST /v1/responses`
+  - `GET /v1/responses/{response_id}`
+  - `DELETE /v1/responses/{response_id}`
+  - `POST /v1/responses/{response_id}/cancel`
+  - `GET /v1/responses/{response_id}/input_items`
+- Model multipart uploads, binary audio responses, and SSE streams manually where `utoipa` cannot infer enough from handlers.
+- Keep admin and first-party persisted workflow APIs either tagged as preview or deferred behind a clear TODO, rather than half-documenting them as stable.
+- Reuse existing DTOs where practical; expose or duplicate docs-only schema types only when handler-local/private response types make derive noise worse than a small docs module.
+
+Verification before commit:
+
+- `cargo check --locked -p izwi-server`
+- OpenAPI route test asserts the expected stable and preview paths exist.
+- Contract test cross-checks stable/preview endpoint lists against `docs/openai-compatibility-contract.json` where applicable.
+
+Commit boundary:
+
+- Commit OpenAPI schema/path annotations and tests only.
+
+## Phase 5 Commit: Scalar UI Route
+
+Commit name:
+
+- `feat(server): serve scalar api docs`
+
+Scope:
+
+- Add `scalar_api_reference = { version = "0.2.2", features = ["axum"] }`.
+- Add Scalar docs routes in Rust:
+  - `GET /docs` or `GET /scalar` for the API reference UI.
+  - Static Scalar asset route, either via the crate's Axum helper or explicit asset handler.
+- Configure Scalar to load the local `/openapi.json`.
+- Disable Scalar Agent by default unless product explicitly opts in later.
+- Mount docs routes before the Tauri/UI static fallback.
+- Keep docs served by the same `izwi-server` binary; no separate Node or static build step.
+
+Verification before commit:
+
+- `cargo check --locked -p izwi-server`
+- Router tests:
+  - docs route returns HTML,
+  - HTML references the local OpenAPI document,
+  - Scalar JS asset route returns JavaScript content type,
+  - `/openapi.json` still returns JSON.
+- Local smoke with a running server if feasible:
+  - open `/docs`,
+  - confirm Scalar loads the OpenAPI document.
+
+Commit boundary:
+
+- Commit Scalar dependency, docs route/module, and tests.
+
+## Phase 6 Commit: User-Facing Docs And Release Notes
+
+Commit name:
+
+- `docs(user): document local scalar api reference`
+
+Scope:
+
+- Update README and user docs to mention local API docs route.
+- Update support matrix to point API users to `/docs` and `/openapi.json`.
+- Document that preview endpoints are labeled preview in the API reference.
+- Add troubleshooting note for docs route conflicts with disabled UI/static fallback if needed.
+
+Verification before commit:
+
+- `rg "/docs|/openapi.json|Scalar" README.md docs`
+- `cargo check --locked -p izwi-server`
+
+Commit boundary:
+
+- Commit documentation-only changes.
+
+## Phase 7 Commit: Final Verification Sweep
+
+Commit name:
+
+- `test(server): verify axum scalar docs integration`
+
+Scope:
+
+- Add any missing regression tests discovered during manual smoke.
+- Run broader server/CLI checks and fix only integration fallout from earlier phases.
+- Keep fixes small; if broader behavior breaks, stop and re-plan instead of hiding it in this phase.
+
+Verification before commit:
+
+- `cargo check --locked -p izwi-server -p izwi-cli`
+- `cargo test -p izwi-server`
+- `scripts/ci/check-backend-truth.sh cargo-cpu`
+- If CUDA toolchain is available: `scripts/ci/check-backend-truth.sh cargo-cuda`
+
+Commit boundary:
+
+- Commit only verification fallout and regression tests.
+
+## Elegance Review
+
+The clean path is to separate the transport upgrade from documentation features. Axum 0.8 changes routing semantics enough that bundling it with OpenAPI/Scalar would make review noisy. First prove the HTTP stack upgrade with existing behavior intact, then add `/openapi.json`, then add Scalar as a thin visualizer over that document. This keeps each commit useful on its own and makes rollback possible at the exact layer that caused trouble.
+
+# Scalar API Docs Feasibility Analysis
+
+## Goal
+
+Analyze whether Izwi can add API documentation with Scalar, keeping the docs integration in Rust, and produce a recommendation only. No runtime implementation in this phase.
+
+## Constraints
+
+- Analysis and planning only.
+- Do not implement routes, OpenAPI generation, or UI assets yet.
+- Prefer a Rust-native integration if practical.
+- Verify Scalar's current Rust support against upstream sources.
+- Keep planned changes minimal and aligned with the existing API server.
+
+## Checklist
+
+- [x] Review project lessons and existing task notes.
+- [x] Inspect Rust API framework, router composition, and server startup.
+- [x] Audit existing API contracts/docs and DTO patterns.
+- [x] Verify Scalar Rust integration options and licensing/source status.
+- [x] Identify feasible implementation paths and tradeoffs.
+- [x] Produce recommendation and verification plan.
+
+## Review
+
+Scalar is feasible for Izwi, and it can be kept in Rust.
+
+Recommended path:
+
+- Serve Scalar from Rust under a docs route such as `/docs` or `/scalar`.
+- Serve an OpenAPI JSON document from Rust under `/openapi.json`.
+- Use Scalar's framework-agnostic Rust API rather than its latest Axum feature until Izwi upgrades from Axum 0.7 to Axum 0.8.
+- Generate or assemble the OpenAPI document in Rust, likely with `utoipa` for code-first schema/path metadata plus small manual sections for multipart uploads, binary audio responses, SSE streams, and WebSocket endpoints.
+
+Key findings:
+
+- Izwi uses Axum 0.7 from the workspace and composes all API routes through `crates/izwi-server/src/api/router.rs`.
+- `scalar_api_reference` latest is 0.2.2 and is MIT licensed, but its optional Axum integration depends on Axum 0.8.
+- `scalar_api_reference` 0.1.0 matches Axum 0.7 if we want the built-in Axum helper, but pinning an older docs UI integration is less attractive than using the current crate's framework-agnostic HTML/asset helpers.
+- No OpenAPI generation crates are currently wired in.
+- Existing DTOs mostly use serde derives, but some response/request shapes are private, manual, multipart, binary, or streaming; OpenAPI coverage will need deliberate schema work rather than a drop-in route merge.
+
+Verification plan for a future implementation:
+
+- `cargo check --locked -p izwi-server`.
+- Router tests for `/openapi.json`, Scalar HTML route, and local `scalar.js` asset route.
+- JSON schema validation for the OpenAPI document.
+- Smoke test that the Scalar page loads the local OpenAPI document without CDN dependency if offline docs are desired.
+
 # OSS Runtime P0 Backlog Analysis And Implementation Plan
 
 ## Goal
