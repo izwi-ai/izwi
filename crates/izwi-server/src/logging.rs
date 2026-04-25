@@ -30,7 +30,13 @@ pub fn init_tracing(log_format: LogFormat) {
             .init(),
         LogFormat::Json => tracing_subscriber::registry()
             .with(filter)
-            .with(tracing_subscriber::fmt::layer().json().flatten_event(true))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .flatten_event(true)
+                    .with_current_span(true)
+                    .with_span_list(true),
+            )
             .init(),
     }
 }
