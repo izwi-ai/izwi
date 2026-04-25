@@ -289,6 +289,18 @@ Deferral reason:
 
 - No product decision was made to promote `/v1/responses` lifecycle objects or `/v1/agent/sessions` metadata from preview process-local convenience APIs to durable product features. Phase 4 intentionally hardened the preview contract instead.
 
+## Review Follow-Up Fixes
+
+Status: complete.
+
+- [x] Make startup preload/warmup warnings fail readiness through a `preload_complete` check.
+- [x] Include current span and span list data in JSON logs so HTTP request events carry method, path, and correlation id fields.
+
+Verification:
+
+- [x] `cargo test -p izwi-server probes`
+- [x] `cargo check --locked -p izwi-server`
+
 ## Elegance Review
 
 The elegant path is to avoid turning `/v1/health` into a catch-all contract. Keep it as the existing rich status endpoint, add small Unix/Kubernetes-style probes for orchestration, and keep durability decisions separate from OpenAI compatibility routing. That minimizes breakage while giving enterprise packaging the precise hooks it needs.
