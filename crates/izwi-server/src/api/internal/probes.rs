@@ -61,6 +61,8 @@ async fn readiness_response(state: &AppState) -> ReadyResponse {
     let lifecycle = state.lifecycle.snapshot();
     let backend_context = state.runtime.backend_context();
     let telemetry = state.runtime.telemetry_snapshot().await;
+    let startup_warnings = lifecycle.startup_warnings.clone();
+    let preload_complete = startup_warnings.is_empty();
 
     let mut checks = vec![
         ProbeCheck {
@@ -74,6 +76,11 @@ async fn readiness_response(state: &AppState) -> ReadyResponse {
             message: lifecycle
                 .draining
                 .then(|| "server is draining for shutdown".to_string()),
+        },
+        ProbeCheck {
+            name: "preload_complete",
+            ok: preload_complete,
+            message: (!preload_complete).then(|| startup_warnings.join("; ")),
         },
         ProbeCheck {
             name: "backend_available",
@@ -121,7 +128,7 @@ async fn readiness_response(state: &AppState) -> ReadyResponse {
         draining: lifecycle.draining,
         uptime_secs: now_saturating_sub(lifecycle.started_at),
         checks,
-        startup_warnings: lifecycle.startup_warnings,
+        startup_warnings,
     }
 }
 
@@ -166,6 +173,28 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.name == "not_draining" && !check.ok));
+    }
+
+    #[tokio::test]
+    async fn readiness_reports_unready_when_startup_warnings_exist() {
+        let (_guard, state) = test_state("readiness_startup_warnings");
+        state
+            .lifecycle
+            .record_startup_warnings(vec!["failed to preload model test".to_string()]);
+        state.lifecycle.mark_ready();
+
+        let response = readiness_response(&state).await;
+
+        assert!(!response.ready);
+        assert_eq!(response.status, "unready");
+        assert_eq!(
+            response.startup_warnings,
+            vec!["failed to preload model test"]
+        );
+        assert!(response
+            .checks
+            .iter()
+            .any(|check| check.name == "preload_complete" && !check.ok));
     }
 
     fn test_state(name: &str) -> (TempDirGuard, AppState) {
