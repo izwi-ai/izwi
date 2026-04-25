@@ -4,6 +4,7 @@ pub mod admin;
 pub mod agent;
 pub mod chat;
 pub mod diarization;
+pub mod docs;
 pub mod internal;
 pub mod media;
 pub mod onboarding;
