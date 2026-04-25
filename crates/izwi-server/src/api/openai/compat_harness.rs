@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -15,6 +14,7 @@ use tower::Service;
 
 use crate::api::router::create_router;
 use crate::state::AppState;
+use crate::test_support::env_lock;
 
 const CONTRACT_JSON: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -107,13 +107,6 @@ impl Drop for TempDirGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
-}
-
-fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("environment lock should not be poisoned")
 }
 
 fn test_api_app(name: &str) -> (Router, TempDirGuard) {

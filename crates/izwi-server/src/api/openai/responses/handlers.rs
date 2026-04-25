@@ -824,9 +824,9 @@ fn sse_event(event_name: &str, payload: &str) -> String {
 mod tests {
     use super::super::dto::{ResponseInputContentPart, ResponseInputItem};
     use super::*;
+    use crate::test_support::env_lock;
     use izwi_core::{backends::BackendPreference, RuntimeService, ServeRuntimeConfig};
     use serde_json::json;
-    use std::sync::{Mutex, OnceLock};
 
     #[test]
     fn builds_messages_from_text_and_instructions() {
@@ -1098,14 +1098,6 @@ mod tests {
         std::env::remove_var("IZWI_MEDIA_DIR");
 
         (state, temp_dir)
-    }
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("environment lock poisoned")
     }
 
     fn with_suppressed_panic_hook<T>(f: impl FnOnce() -> T) -> T {

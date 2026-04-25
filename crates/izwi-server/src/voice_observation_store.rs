@@ -412,16 +412,8 @@ fn now_unix_millis_i64() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env_lock;
     use crate::voice_store::VoiceStore;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock")
-    }
 
     #[tokio::test]
     async fn upserts_and_clears_observations() {

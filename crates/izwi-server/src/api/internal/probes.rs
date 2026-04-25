@@ -144,8 +144,8 @@ fn now_saturating_sub(started_at: u64) -> u64 {
 mod tests {
     use super::*;
     use crate::state::AppState;
+    use crate::test_support::env_lock;
     use izwi_core::{backends::BackendPreference, RuntimeService, ServeRuntimeConfig};
-    use std::sync::{Mutex, OnceLock};
 
     #[tokio::test]
     async fn readiness_reports_ready_after_lifecycle_mark_ready() {
@@ -233,14 +233,6 @@ mod tests {
             },
             state,
         )
-    }
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("environment lock poisoned")
     }
 
     struct TempDirGuard {

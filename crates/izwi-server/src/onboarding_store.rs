@@ -206,16 +206,12 @@ fn onboarding_state_has_column(conn: &rusqlite::Connection, target: &str) -> any
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env_lock;
     use std::future::Future;
-    use std::sync::OnceLock;
     use tempfile::TempDir;
-    use tokio::sync::Mutex;
-
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     async fn with_env_lock<T>(action: impl Future<Output = T>) -> T {
-        let lock = ENV_LOCK.get_or_init(|| Mutex::new(()));
-        let _guard = lock.lock().await;
+        let _guard = env_lock();
         action.await
     }
 
