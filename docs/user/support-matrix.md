@@ -48,6 +48,9 @@ If another page says something different, this page should win.
 ## API Surface Maturity
 
 The runtime exposes both compatibility APIs and first-party local workflow APIs under `/v1`.
+When the server is running, open `/docs` for the local Scalar API reference or
+`/openapi.json` for the raw OpenAPI document. Preview endpoints are tagged as
+preview in the API reference.
 
 | Surface | Status | Notes |
 |---------|--------|-------|
@@ -56,6 +59,7 @@ The runtime exposes both compatibility APIs and first-party local workflow APIs 
 | **`POST /v1/chat/completions`** | Stable | Core OpenAI-compatible chat surface. |
 | **`GET /v1/models`** | Stable | Live model catalog / availability surface. |
 | **Operational probes (`/livez`, `/readyz`, `/v1/live`, `/v1/ready`)** | Stable | Use `/livez` for cheap liveness and `/readyz` for readiness or deployment healthchecks. `/v1/health` remains the richer status payload. |
+| **Local API reference (`/docs`, `/openapi.json`)** | Stable | Served by the same `izwi-server` process. Endpoint-level preview status is shown in the API reference. |
 | **Local CLI workflows (`izwi serve`, `izwi pull`, `izwi tts`, `izwi transcribe`)** | Stable | Primary user-facing local runtime workflows. |
 | **`POST /v1/responses` and response-object lifecycle routes** | Preview | Response objects are stored in bounded process memory for compatibility convenience. `store:false` skips retention; retained records can be evicted and are lost on server restart. |
 | **`/v1/admin/*` model-management APIs** | Preview | Operator-oriented local admin APIs; auth and long-term contract are not finalized. |

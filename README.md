@@ -35,7 +35,10 @@ Izwi is a privacy-focused audio AI platform that runs entirely on your machine. 
 - **Forced Alignment** — Word-level audio-text alignment
 - **Chat** — Text-based AI conversations
 
-The server exposes OpenAI-compatible API routes under `/v1`.
+The server exposes OpenAI-compatible API routes under `/v1`. When the server is
+running, the local Scalar API reference is available at
+`http://localhost:8080/docs`, and the raw OpenAPI document is available at
+`http://localhost:8080/openapi.json`.
 
 ## Runtime Support Matrix
 
@@ -84,6 +87,9 @@ izwi serve
 ```
 
 Open `http://localhost:8080` in your browser.
+
+API users can also open `http://localhost:8080/docs` for the local Scalar API
+reference.
 
 ### 2. Download a model
 
@@ -173,6 +179,7 @@ Run `izwi list` to see all available models.
 | **Features** | [izwiai.com/docs/features](https://izwiai.com/docs/features) |
 | **CLI Reference** | [izwiai.com/docs/cli](https://izwiai.com/docs/cli) |
 | **Models** | [izwiai.com/docs/models](https://izwiai.com/docs/models) |
+| **Local API Reference** | `http://localhost:8080/docs` when `izwi serve` is running |
 | **Troubleshooting** | [izwiai.com/docs/troubleshooting](https://izwiai.com/docs/troubleshooting) |
 
 ---
