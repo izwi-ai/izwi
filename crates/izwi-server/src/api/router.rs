@@ -1211,6 +1211,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dynamic_routes_cover_axum_upgrade_surface() {
+        let (app, temp_dir) = test_api_app("dynamic_routes_cover_axum_upgrade_surface", false);
+
+        let cases = [
+            (
+                Method::GET,
+                "/v1/media/nested/example.png",
+                None,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                Method::GET,
+                "/v1/agent/sessions/missing-session",
+                None,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::POST,
+                "/v1/agent/sessions/missing-session/turns",
+                Some(r#"{"input":"hello"}"#),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::GET,
+                "/v1/responses/missing-response",
+                None,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::DELETE,
+                "/v1/responses/missing-response",
+                None,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::POST,
+                "/v1/responses/missing-response/cancel",
+                Some("{}"),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::GET,
+                "/v1/responses/missing-response/input_items",
+                None,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::DELETE,
+                "/v1/studio/projects/missing-project/pronunciations/missing-pronunciation",
+                None,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::POST,
+                "/v1/studio/projects/missing-project/snapshots/missing-snapshot/restore",
+                Some("{}"),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::PATCH,
+                "/v1/studio/projects/missing-project/render-jobs/missing-job",
+                Some("{}"),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::POST,
+                "/v1/studio/projects/missing-project/segments/missing-segment/split",
+                Some(r#"{"before_text":"before","after_text":"after"}"#),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::POST,
+                "/v1/studio/projects/missing-project/segments/missing-segment/merge-next",
+                Some("{}"),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::POST,
+                "/v1/studio/projects/missing-project/segments/missing-segment/render",
+                Some("{}"),
+                StatusCode::NOT_FOUND,
+            ),
+        ];
+
+        for (method, path, body, expected_status) in cases {
+            assert_route_status(app.clone(), method, path, body, expected_status).await;
+        }
+
+        assert_route_status(
+            app.clone(),
+            Method::GET,
+            "/v1/voice/realtime/ws",
+            None,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_route_status(
+            app,
+            Method::GET,
+            "/v1/transcription/realtime/ws",
+            None,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+
+        drop(temp_dir);
+    }
+
+    #[tokio::test]
     async fn readyz_returns_unavailable_when_lifecycle_is_draining() {
         let (state, temp_dir) = test_state("readyz_draining", false);
         state.lifecycle.mark_ready();
