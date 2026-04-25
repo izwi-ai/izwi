@@ -16,6 +16,13 @@ izwi serve [OPTIONS]
 
 Launches the local HTTP API server that powers Izwi.
 
+The server also serves a local API reference:
+
+- Scalar API reference: `http://<host>:<port>/docs`
+- OpenAPI JSON: `http://<host>:<port>/openapi.json`
+
+Preview endpoints are labeled in the API reference.
+
 Resolution order for serve/runtime settings is:
 
 1. CLI flags
