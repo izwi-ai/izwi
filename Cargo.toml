@@ -28,6 +28,7 @@ axum = { version = "0.8.9", features = ["ws", "multipart"] }
 axum-extra = { version = "0.12.6", features = ["typed-header"] }
 tower = "0.5.3"
 tower-http = { version = "0.6.8", features = ["cors", "fs", "trace"] }
+utoipa = { version = "5.4.0", features = ["preserve_path_order"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

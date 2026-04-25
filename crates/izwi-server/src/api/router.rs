@@ -101,6 +101,7 @@ pub fn create_router(state: AppState, serve_config: &ServeRuntimeConfig) -> Rout
     let app = Router::new()
         .route("/livez", get(crate::api::internal::probes::live_check))
         .route("/readyz", get(crate::api::internal::probes::ready_check))
+        .route("/openapi.json", get(crate::api::openapi::openapi_json))
         .nest("/v1", v1_routes)
         // Compatibility mount for tooling that queries /internal/* directly.
         .nest("/internal", crate::api::internal::router())
@@ -1206,6 +1207,28 @@ mod tests {
         assert_route_status(app.clone(), Method::GET, "/readyz", None, StatusCode::OK).await;
         assert_route_status(app.clone(), Method::GET, "/v1/live", None, StatusCode::OK).await;
         assert_route_status(app, Method::GET, "/v1/ready", None, StatusCode::OK).await;
+
+        drop(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn openapi_json_route_returns_valid_scaffold() {
+        let (app, temp_dir) = test_api_app("openapi_json_route_returns_valid_scaffold", false);
+
+        let response = send_request(app, build_request(Method::GET, "/openapi.json", None)).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("application/json"))
+        );
+
+        let json = read_json(response).await;
+        assert!(json["openapi"].as_str().is_some());
+        assert_eq!(json["info"]["title"], "Izwi API");
+        assert_eq!(json["info"]["version"], env!("CARGO_PKG_VERSION"));
+        assert!(json["paths"].get("/livez").is_some());
+        assert!(json["paths"].get("/readyz").is_some());
 
         drop(temp_dir);
     }
