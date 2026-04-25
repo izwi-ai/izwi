@@ -24,6 +24,7 @@ axum-extra = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 utoipa = { workspace = true }
+scalar_api_reference = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -102,6 +102,7 @@ pub fn create_router(state: AppState, serve_config: &ServeRuntimeConfig) -> Rout
         .route("/livez", get(crate::api::internal::probes::live_check))
         .route("/readyz", get(crate::api::internal::probes::ready_check))
         .route("/openapi.json", get(crate::api::openapi::openapi_json))
+        .merge(crate::api::docs::router())
         .nest("/v1", v1_routes)
         // Compatibility mount for tooling that queries /internal/* directly.
         .nest("/internal", crate::api::internal::router())
@@ -1229,6 +1230,52 @@ mod tests {
         assert_eq!(json["info"]["version"], env!("CARGO_PKG_VERSION"));
         assert!(json["paths"].get("/livez").is_some());
         assert!(json["paths"].get("/readyz").is_some());
+
+        drop(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn scalar_docs_route_returns_html_before_ui_fallback() {
+        let (app, temp_dir) = test_api_app("scalar_docs_route_returns_html", true);
+
+        let response = send_request(app, build_request(Method::GET, "/docs", None)).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/html")));
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let html = String::from_utf8(body.to_vec()).expect("html should be utf-8");
+        assert!(html.contains("/openapi.json"));
+        assert!(html.contains("/docs/scalar.js"));
+        assert!(html.contains("\"disabled\":true"));
+        assert!(!html.contains("<html>ui</html>"));
+
+        drop(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn scalar_js_asset_route_returns_javascript() {
+        let (app, temp_dir) = test_api_app("scalar_js_asset_route_returns_javascript", false);
+
+        let response =
+            send_request(app, build_request(Method::GET, "/docs/scalar.js", None)).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("application/javascript"))
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        assert!(!body.is_empty());
 
         drop(temp_dir);
     }
