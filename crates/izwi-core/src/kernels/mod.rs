@@ -8,8 +8,11 @@
 //! - Fallback to Candle operations for other backends
 
 pub mod buffer_pool;
+pub mod cuda;
 pub mod cuda_support;
 pub mod metal;
+
+use candle_core::Device;
 
 use crate::error::Error;
 
@@ -23,6 +26,11 @@ pub fn fused_kernels_available() -> bool {
     {
         false // TODO: CUDA support
     }
+}
+
+/// Whether fused kernels are available for a specific device.
+pub fn fused_kernels_available_for_device(device: &Device) -> bool {
+    (device.is_metal() && fused_kernels_available()) || cuda::cuda_kernels_available(device)
 }
 
 /// Whether to use fused kernels (can be disabled via environment).
