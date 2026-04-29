@@ -13,8 +13,7 @@ use crate::error::Result;
 use crate::models::shared::telemetry::{
     record_fused_attention_attempt, record_fused_attention_fallback,
     record_fused_attention_masked_attempt, record_fused_attention_masked_fallback,
-    record_fused_attention_masked_success, record_fused_attention_success,
-    AttentionFallbackReason,
+    record_fused_attention_masked_success, record_fused_attention_success, AttentionFallbackReason,
 };
 
 /// Runtime opt-in for fused attention paths.
@@ -40,6 +39,17 @@ pub fn should_enable_flash_attention_v2(device: &candle_core::Device) -> bool {
     flash_attention_requested() && device.is_cuda() && flash_attention_compiled()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CudaAttentionBackend {
+    FlashAttention2,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum CudaAttentionDecision {
+    Try(CudaAttentionBackend),
+    Skip(AttentionFallbackReason),
+}
+
 /// Try a fused self-attention kernel and return `None` when unsupported.
 ///
 /// Input/output layout: `[batch, heads, seq, head_dim]`.
@@ -59,12 +69,12 @@ pub fn try_fused_self_attention(
     }
     let mut fallback_reason = AttentionFallbackReason::UnsupportedBackend;
 
-    #[cfg(feature = "flash-attn")]
-    {
-        if should_enable_flash_attention_v2(q.device()) {
-            if mask.is_none() {
-                if dtype_supported_for_flash(q.dtype()) {
-                    if q.dtype() == k.dtype() && k.dtype() == v.dtype() {
+    if q.device().is_cuda() {
+        match select_cuda_attention_backend(q, k, v, mask)? {
+            CudaAttentionDecision::Try(CudaAttentionBackend::FlashAttention2) => {
+                fallback_reason = {
+                    #[cfg(feature = "flash-attn")]
+                    {
                         let q = q.transpose(1, 2)?.contiguous()?;
                         let k = k.transpose(1, 2)?.contiguous()?;
                         let v = v.transpose(1, 2)?.contiguous()?;
@@ -80,32 +90,18 @@ pub fn try_fused_self_attention(
                                 }
                                 return Ok(Some(out.transpose(1, 2)?));
                             }
-                            Ok(Err(_)) | Err(_) => {
-                                fallback_reason = AttentionFallbackReason::FlashRuntimeError;
-                            }
+                            Ok(Err(_)) | Err(_) => AttentionFallbackReason::FlashRuntimeError,
                         }
-                    } else {
-                        fallback_reason = AttentionFallbackReason::FlashDTypeMismatch;
                     }
-                } else {
-                    fallback_reason = AttentionFallbackReason::FlashDTypeUnsupported;
-                }
-            } else {
-                fallback_reason = AttentionFallbackReason::FlashMaskUnsupported;
+                    #[cfg(not(feature = "flash-attn"))]
+                    {
+                        AttentionFallbackReason::FlashNotCompiled
+                    }
+                };
             }
-        } else if q.device().is_cuda() {
-            fallback_reason = AttentionFallbackReason::FlashNotRequested;
-        }
-    }
-
-    #[cfg(not(feature = "flash-attn"))]
-    {
-        if q.device().is_cuda() {
-            fallback_reason = if flash_attention_requested() {
-                AttentionFallbackReason::FlashNotCompiled
-            } else {
-                AttentionFallbackReason::FlashNotRequested
-            };
+            CudaAttentionDecision::Skip(reason) => {
+                fallback_reason = reason;
+            }
         }
     }
 
@@ -145,6 +141,48 @@ pub fn try_fused_self_attention(
         record_fused_attention_masked_fallback();
     }
     Ok(None)
+}
+
+pub fn select_cuda_attention_backend(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+) -> Result<CudaAttentionDecision> {
+    Ok(select_cuda_flash_policy(
+        flash_attention_requested(),
+        flash_attention_compiled(),
+        mask.is_some(),
+        q.dtype(),
+        k.dtype(),
+        v.dtype(),
+    ))
+}
+
+fn select_cuda_flash_policy(
+    flash_requested: bool,
+    flash_compiled: bool,
+    masked: bool,
+    q_dtype: DType,
+    k_dtype: DType,
+    v_dtype: DType,
+) -> CudaAttentionDecision {
+    if !flash_requested {
+        return CudaAttentionDecision::Skip(AttentionFallbackReason::FlashNotRequested);
+    }
+    if !flash_compiled {
+        return CudaAttentionDecision::Skip(AttentionFallbackReason::FlashNotCompiled);
+    }
+    if masked {
+        return CudaAttentionDecision::Skip(AttentionFallbackReason::FlashMaskUnsupported);
+    }
+    if !dtype_supported_for_flash_policy(q_dtype) {
+        return CudaAttentionDecision::Skip(AttentionFallbackReason::FlashDTypeUnsupported);
+    }
+    if q_dtype != k_dtype || k_dtype != v_dtype {
+        return CudaAttentionDecision::Skip(AttentionFallbackReason::FlashDTypeMismatch);
+    }
+    CudaAttentionDecision::Try(CudaAttentionBackend::FlashAttention2)
 }
 
 /// Conservative preflight for Metal SDPA.
@@ -350,13 +388,81 @@ fn dtype_supported_for_flash(dtype: candle_core::DType) -> bool {
     matches!(dtype, candle_core::DType::F16 | candle_core::DType::BF16)
 }
 
+fn dtype_supported_for_flash_policy(dtype: candle_core::DType) -> bool {
+    matches!(dtype, candle_core::DType::F16 | candle_core::DType::BF16)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        metal_sdpa_mask_shape_supported, metal_sdpa_shape_supported, should_use_metal_sdpa_f16_cast,
+        metal_sdpa_mask_shape_supported, metal_sdpa_shape_supported, select_cuda_flash_policy,
+        should_use_metal_sdpa_f16_cast, CudaAttentionBackend, CudaAttentionDecision,
     };
     use candle_core::DType;
     use candle_core::{Device, Tensor};
+
+    use crate::models::shared::telemetry::AttentionFallbackReason;
+
+    fn assert_skips(decision: CudaAttentionDecision, expected: AttentionFallbackReason) {
+        match decision {
+            CudaAttentionDecision::Skip(reason) => {
+                assert_eq!(
+                    std::mem::discriminant(&reason),
+                    std::mem::discriminant(&expected)
+                );
+            }
+            CudaAttentionDecision::Try(backend) => {
+                panic!("expected skip {expected:?}, got try {backend:?}");
+            }
+        }
+    }
+
+    fn assert_tries(decision: CudaAttentionDecision, expected: CudaAttentionBackend) {
+        match decision {
+            CudaAttentionDecision::Try(backend) => {
+                assert_eq!(backend, expected);
+            }
+            CudaAttentionDecision::Skip(reason) => {
+                panic!("expected try {expected:?}, got skip {reason:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn cuda_flash_policy_records_skip_reasons() {
+        assert_skips(
+            select_cuda_flash_policy(false, true, false, DType::F16, DType::F16, DType::F16),
+            AttentionFallbackReason::FlashNotRequested,
+        );
+        assert_skips(
+            select_cuda_flash_policy(true, false, false, DType::F16, DType::F16, DType::F16),
+            AttentionFallbackReason::FlashNotCompiled,
+        );
+        assert_skips(
+            select_cuda_flash_policy(true, true, true, DType::F16, DType::F16, DType::F16),
+            AttentionFallbackReason::FlashMaskUnsupported,
+        );
+        assert_skips(
+            select_cuda_flash_policy(true, true, false, DType::F32, DType::F32, DType::F32),
+            AttentionFallbackReason::FlashDTypeUnsupported,
+        );
+        assert_skips(
+            select_cuda_flash_policy(true, true, false, DType::F16, DType::BF16, DType::F16),
+            AttentionFallbackReason::FlashDTypeMismatch,
+        );
+    }
+
+    #[test]
+    fn cuda_flash_policy_accepts_supported_unmasked_half_attention() {
+        assert_tries(
+            select_cuda_flash_policy(true, true, false, DType::F16, DType::F16, DType::F16),
+            CudaAttentionBackend::FlashAttention2,
+        );
+        assert_tries(
+            select_cuda_flash_policy(true, true, false, DType::BF16, DType::BF16, DType::BF16),
+            CudaAttentionBackend::FlashAttention2,
+        );
+    }
 
     #[test]
     fn metal_sdpa_shape_gate_accepts_supported_shapes() {
