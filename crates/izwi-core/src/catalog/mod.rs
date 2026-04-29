@@ -5,9 +5,11 @@
 //! under `crate::artifacts`, while legacy `crate::model` paths remain
 //! available for backward compatibility.
 
+mod cuda_support;
 mod metadata;
 mod variant;
 
+pub use cuda_support::{CudaSupportInfo, CudaSupportLevel};
 pub use metadata::{ModelInfo, ModelStatus, ModelVariant, SpeechModelCapabilities};
 pub use variant::{
     parse_chat_model_variant, parse_model_variant, parse_tts_model_variant,
