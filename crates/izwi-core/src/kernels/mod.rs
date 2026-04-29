@@ -13,7 +13,7 @@ pub mod cuda;
 pub mod metal;
 
 use crate::error::Error;
-use candle_core::Device;
+use candle_core::{Device, Tensor};
 
 /// Whether any fused kernel backend is available in this build.
 pub fn fused_kernels_available() -> bool {
@@ -49,6 +49,169 @@ pub fn use_fused_kernels() -> bool {
         })
         .unwrap_or(true)
         && fused_kernels_available()
+}
+
+/// Whether fused kernels are enabled and available for a specific device.
+pub fn use_fused_kernels_for_device(device: &Device) -> bool {
+    std::env::var("IZWI_FUSED_KERNELS")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(true)
+        && fused_kernels_available_for_device(device)
+}
+
+/// Whether backend-specific block fusion is enabled for a specific device.
+pub fn use_block_fusion_for_device(device: &Device) -> bool {
+    if !use_fused_kernels_for_device(device) {
+        return false;
+    }
+
+    if device.is_cuda() {
+        return cuda::use_block_fusion();
+    }
+
+    if device.is_metal() {
+        return metal::use_block_fusion();
+    }
+
+    false
+}
+
+pub fn try_fused_silu_mul(gate: &Tensor, up: &Tensor) -> Option<Tensor> {
+    if !use_fused_kernels_for_device(gate.device()) {
+        return None;
+    }
+
+    if gate.device().is_cuda() {
+        return cuda::try_fused_silu_mul(gate, up);
+    }
+
+    if gate.device().is_metal() {
+        return metal::try_fused_silu_mul(gate, up);
+    }
+
+    None
+}
+
+pub fn try_fused_l2_norm(input: &Tensor, eps: f64) -> Option<Tensor> {
+    if !use_fused_kernels_for_device(input.device()) {
+        return None;
+    }
+
+    if input.device().is_cuda() {
+        return cuda::try_fused_l2_norm(input, eps);
+    }
+
+    if input.device().is_metal() {
+        return metal::try_fused_l2_norm(input, eps);
+    }
+
+    None
+}
+
+pub fn try_fused_rms_norm(input: &Tensor, weight: &Tensor, eps: f64) -> Option<Tensor> {
+    if !use_fused_kernels_for_device(input.device()) {
+        return None;
+    }
+
+    if input.device().is_cuda() {
+        return cuda::try_fused_rms_norm(input, weight, eps);
+    }
+
+    if input.device().is_metal() {
+        return metal::try_fused_rms_norm(input, weight, eps);
+    }
+
+    None
+}
+
+pub fn try_fused_gated_rms_norm(
+    hidden: &Tensor,
+    gate: &Tensor,
+    weight: &Tensor,
+    eps: f64,
+) -> Option<Tensor> {
+    if !use_fused_kernels_for_device(hidden.device()) {
+        return None;
+    }
+
+    if hidden.device().is_cuda() {
+        return cuda::try_fused_gated_rms_norm(hidden, gate, weight, eps);
+    }
+
+    if hidden.device().is_metal() {
+        return metal::try_fused_gated_rms_norm(hidden, gate, weight, eps);
+    }
+
+    None
+}
+
+pub fn try_fused_gated_delta_recurrent(
+    query: &Tensor,
+    key: &Tensor,
+    value: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: &Tensor,
+) -> Option<(Tensor, Tensor)> {
+    if !use_fused_kernels_for_device(query.device()) {
+        return None;
+    }
+
+    if query.device().is_cuda() {
+        return cuda::try_fused_gated_delta_recurrent(query, key, value, g, beta, state);
+    }
+
+    if query.device().is_metal() {
+        return metal::try_fused_gated_delta_recurrent(query, key, value, g, beta, state);
+    }
+
+    None
+}
+
+pub fn try_tiled_deltanet_recurrence(
+    queries: &Tensor,
+    keys: &Tensor,
+    values: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    initial_state: &Tensor,
+    tile_size: usize,
+) -> Option<(Tensor, Tensor)> {
+    if !use_fused_kernels_for_device(queries.device()) {
+        return None;
+    }
+
+    if queries.device().is_cuda() {
+        return cuda::try_tiled_deltanet_recurrence(
+            queries,
+            keys,
+            values,
+            g,
+            beta,
+            initial_state,
+            tile_size,
+        );
+    }
+
+    if queries.device().is_metal() {
+        return metal::try_tiled_deltanet_recurrence(
+            queries,
+            keys,
+            values,
+            g,
+            beta,
+            initial_state,
+            tile_size,
+        );
+    }
+
+    None
 }
 
 /// Result type for fused kernel operations.
@@ -95,6 +258,8 @@ mod tests {
     #[test]
     fn cpu_never_reports_fused_kernel_availability() {
         assert!(!fused_kernels_available_for_device(&Device::Cpu));
+        assert!(!use_fused_kernels_for_device(&Device::Cpu));
+        assert!(!use_block_fusion_for_device(&Device::Cpu));
     }
 
     #[test]

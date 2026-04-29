@@ -11,9 +11,9 @@ use crate::error::{Error, Result};
 use crate::kernels::buffer_pool::{
     global_buffer_pool_for_device, maybe_init_global_buffer_pool, SharedBufferPool,
 };
-use crate::kernels::metal::{
+use crate::kernels::{
     try_fused_gated_delta_recurrent, try_fused_gated_rms_norm, try_fused_l2_norm,
-    try_tiled_deltanet_recurrence, use_block_fusion,
+    try_fused_silu_mul, try_tiled_deltanet_recurrence, use_block_fusion_for_device,
 };
 use crate::models::architectures::qwen3::core::repeat_kv;
 use crate::models::shared::attention::flash::try_fused_self_attention;
@@ -506,9 +506,7 @@ impl Qwen35Mlp {
         let gate_proj_out = self.gate.forward(hidden_states)?;
         let up_proj_out = self.up.forward(hidden_states)?;
 
-        let hidden = if let Some(fused) =
-            crate::kernels::metal::try_fused_silu_mul(&gate_proj_out, &up_proj_out)
-        {
+        let hidden = if let Some(fused) = try_fused_silu_mul(&gate_proj_out, &up_proj_out) {
             fused
         } else {
             let gate = ops::silu(&gate_proj_out)?;
@@ -1722,12 +1720,12 @@ fn qwen35_tiled_recurrence_tile_size(seq_len: usize, override_size: Option<usize
 
 fn qwen35_block_fusion_decode_enabled(device: &Device) -> bool {
     device.is_metal()
-        && use_block_fusion()
+        && use_block_fusion_for_device(device)
         && qwen35_env_bool("IZWI_QWEN35_BLOCK_FUSION_DECODE", true)
 }
 
 fn qwen35_block_fusion_prefill_policy(device: &Device) -> (bool, usize) {
-    if !device.is_metal() || !use_block_fusion() {
+    if !device.is_metal() || !use_block_fusion_for_device(device) {
         return (false, 8);
     }
     let enabled = qwen35_env_bool("IZWI_QWEN35_BLOCK_FUSION_PREFILL", true);

@@ -9,7 +9,7 @@ use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::kernels::metal::try_fused_silu_mul;
+use crate::kernels::try_fused_silu_mul;
 use crate::models::shared::attention::batched::{
     batched_scaled_dot_product_attention, BatchedAttentionConfig, BatchedAttentionInput,
 };
