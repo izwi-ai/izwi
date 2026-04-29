@@ -61,6 +61,51 @@ pub fn default_kv_quantization() -> KvCacheQuantization {
         .unwrap_or(KvCacheQuantization::None)
 }
 
+/// Resolve KV quantization for the target append device.
+///
+/// CUDA Q4_0 currently uses host-vector pack/unpack. Keep that fallback explicit
+/// until a Rust-owned CUDA kernel exists for this format.
+pub fn resolve_kv_cache_quantization(
+    device: &candle_core::Device,
+    requested: KvCacheQuantization,
+) -> Result<KvCacheQuantization> {
+    kv_cache_quantization_policy(
+        device.is_cuda(),
+        requested,
+        env_bool("IZWI_CUDA_KV_Q4_0_HOST_FALLBACK", false),
+    )
+}
+
+fn kv_cache_quantization_policy(
+    is_cuda: bool,
+    requested: KvCacheQuantization,
+    cuda_q4_0_host_fallback_enabled: bool,
+) -> Result<KvCacheQuantization> {
+    if is_cuda
+        && requested == KvCacheQuantization::Q4_0
+        && !cuda_q4_0_host_fallback_enabled
+    {
+        return Err(Error::InvalidInput(
+            "CUDA Q4_0 KV cache quantization requires a CUDA kernel or explicit \
+             IZWI_CUDA_KV_Q4_0_HOST_FALLBACK=1 host fallback"
+                .to_string(),
+        ));
+    }
+    Ok(requested)
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
+}
+
 /// Single KV page storage (dense or quantized).
 #[derive(Debug, Clone)]
 pub enum KvPage {
@@ -336,6 +381,7 @@ pub fn append_to_pages(
     append: &Tensor,
     quantization: KvCacheQuantization,
 ) -> Result<()> {
+    let quantization = resolve_kv_cache_quantization(append.device(), quantization)?;
     if page_size == 0 {
         return Err(Error::InvalidInput(
             "KV page size must be greater than zero".to_string(),
@@ -414,16 +460,34 @@ fn parse_env_positive_usize(name: &str) -> Option<usize> {
 
 fn paged_decode_page_group_size(device: &candle_core::Device, page_count: usize) -> usize {
     let override_pages = parse_env_positive_usize("IZWI_PAGED_DECODE_GROUP_PAGES");
-    paged_decode_page_group_size_policy(device.is_metal(), page_count, override_pages)
+    paged_decode_page_group_size_policy(
+        device.is_metal(),
+        device.is_cuda(),
+        page_count,
+        override_pages,
+    )
 }
 
 fn paged_decode_page_group_size_policy(
     is_metal: bool,
+    is_cuda: bool,
     page_count: usize,
     override_pages: Option<usize>,
 ) -> usize {
     if let Some(override_pages) = override_pages {
         return override_pages.max(1);
+    }
+    if is_cuda {
+        if page_count >= 64 {
+            return 16;
+        }
+        if page_count >= 24 {
+            return 8;
+        }
+        if page_count >= 8 {
+            return 4;
+        }
+        return 1;
     }
     if !is_metal || page_count < 8 {
         return 1;
@@ -564,6 +628,16 @@ pub fn paged_decode_attention(
         )));
     }
     record_decode_attention_path(DecodeAttentionPath::Paged);
+    if q.device().is_cuda() {
+        if let Some(out) = crate::kernels::cuda::try_cuda_paged_decode_attention(
+            q,
+            head_dim,
+            num_heads,
+            num_kv_heads,
+        )? {
+            return Ok(out);
+        }
+    }
     let page_group_size = paged_decode_page_group_size(q.device(), k_pages.len());
     paged_decode_attention_with_group_size(
         q,
@@ -841,19 +915,46 @@ mod tests {
 
     #[test]
     fn test_paged_decode_page_group_policy_scales_on_metal() {
-        assert_eq!(paged_decode_page_group_size_policy(true, 1, None), 1);
-        assert_eq!(paged_decode_page_group_size_policy(true, 7, None), 1);
-        assert_eq!(paged_decode_page_group_size_policy(true, 8, None), 2);
-        assert_eq!(paged_decode_page_group_size_policy(true, 23, None), 2);
-        assert_eq!(paged_decode_page_group_size_policy(true, 24, None), 4);
-        assert_eq!(paged_decode_page_group_size_policy(true, 63, None), 4);
-        assert_eq!(paged_decode_page_group_size_policy(true, 64, None), 8);
+        assert_eq!(paged_decode_page_group_size_policy(true, false, 1, None), 1);
+        assert_eq!(paged_decode_page_group_size_policy(true, false, 7, None), 1);
+        assert_eq!(paged_decode_page_group_size_policy(true, false, 8, None), 2);
+        assert_eq!(paged_decode_page_group_size_policy(true, false, 23, None), 2);
+        assert_eq!(paged_decode_page_group_size_policy(true, false, 24, None), 4);
+        assert_eq!(paged_decode_page_group_size_policy(true, false, 63, None), 4);
+        assert_eq!(paged_decode_page_group_size_policy(true, false, 64, None), 8);
+    }
+
+    #[test]
+    fn test_paged_decode_page_group_policy_scales_on_cuda() {
+        assert_eq!(paged_decode_page_group_size_policy(false, true, 1, None), 1);
+        assert_eq!(paged_decode_page_group_size_policy(false, true, 7, None), 1);
+        assert_eq!(paged_decode_page_group_size_policy(false, true, 8, None), 4);
+        assert_eq!(paged_decode_page_group_size_policy(false, true, 23, None), 4);
+        assert_eq!(paged_decode_page_group_size_policy(false, true, 24, None), 8);
+        assert_eq!(paged_decode_page_group_size_policy(false, true, 63, None), 8);
+        assert_eq!(paged_decode_page_group_size_policy(false, true, 64, None), 16);
     }
 
     #[test]
     fn test_paged_decode_page_group_policy_respects_overrides() {
-        assert_eq!(paged_decode_page_group_size_policy(false, 128, None), 1);
-        assert_eq!(paged_decode_page_group_size_policy(true, 128, Some(3)), 3);
+        assert_eq!(paged_decode_page_group_size_policy(false, false, 128, None), 1);
+        assert_eq!(paged_decode_page_group_size_policy(true, false, 128, Some(3)), 3);
+        assert_eq!(paged_decode_page_group_size_policy(false, true, 128, Some(5)), 5);
+    }
+
+    #[test]
+    fn test_kv_quantization_policy_blocks_implicit_cuda_q4_host_fallback() {
+        assert!(kv_cache_quantization_policy(false, KvCacheQuantization::Q4_0, false).is_ok());
+        assert!(kv_cache_quantization_policy(true, KvCacheQuantization::None, false).is_ok());
+        assert!(kv_cache_quantization_policy(true, KvCacheQuantization::Int8, false).is_ok());
+        assert!(kv_cache_quantization_policy(true, KvCacheQuantization::Q4_0, false).is_err());
+    }
+
+    #[test]
+    fn test_kv_quantization_policy_allows_explicit_cuda_q4_host_fallback() {
+        let selected =
+            kv_cache_quantization_policy(true, KvCacheQuantization::Q4_0, true).unwrap();
+        assert_eq!(selected, KvCacheQuantization::Q4_0);
     }
 
     #[test]
