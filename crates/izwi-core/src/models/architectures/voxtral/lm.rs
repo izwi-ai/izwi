@@ -265,11 +265,8 @@ impl VoxtralAttention {
         q = self.apply_rope(q, start_pos, position_ids)?;
         k = self.apply_rope(k, start_pos, position_ids)?;
 
-        let k = repeat_kv(&k, self.num_heads, self.num_kv_heads)?;
-        let v = repeat_kv(&v, self.num_heads, self.num_kv_heads)?;
-
         let (k, v) = if let Some(cache) = cache {
-            cache.append(layer_idx, k, v)?;
+            cache.append(layer_idx, k.clone(), v.clone())?;
 
             if seq_len == 1 && start_pos > 0 {
                 if let Some((k_pages, v_pages)) = cache.pages(layer_idx) {
@@ -290,6 +287,8 @@ impl VoxtralAttention {
         } else {
             (k, v)
         };
+        let k = repeat_kv(&k, self.num_heads, self.num_kv_heads)?;
+        let v = repeat_kv(&v, self.num_heads, self.num_kv_heads)?;
 
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;

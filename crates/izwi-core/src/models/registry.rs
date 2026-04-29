@@ -39,7 +39,7 @@ use crate::runtime::{DiarizationConfig, DiarizationResult};
 type AsrLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeAsrModel>;
 type AudioChatLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeAudioChatModel>;
 type ChatLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeChatModel>;
-type DiarizationLoaderFn = fn(&Path, ModelVariant) -> Result<NativeDiarizationModel>;
+type DiarizationLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeDiarizationModel>;
 type VoxtralLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VoxtralRealtimeModel>;
 type QwenTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile, usize, &str) -> Result<Qwen3TtsModel>;
 type KokoroLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<KokoroTtsModel>;
@@ -149,9 +149,10 @@ fn load_gemma_chat_model(
 fn load_sortformer_diarization_model(
     model_dir: &Path,
     variant: ModelVariant,
+    device: DeviceProfile,
 ) -> Result<NativeDiarizationModel> {
     Ok(NativeDiarizationModel::Sortformer(
-        SortformerDiarizerModel::load(model_dir, variant)?,
+        SortformerDiarizerModel::load(model_dir, variant, device)?,
     ))
 }
 
@@ -1032,10 +1033,11 @@ impl ModelRegistry {
         let model = cell
             .get_or_try_init({
                 let model_dir = model_dir.to_path_buf();
+                let device = self.device.clone();
                 let loader = registration.loader;
                 move || async move {
                     tokio::task::spawn_blocking(move || {
-                        let model = loader(&model_dir, variant)?;
+                        let model = loader(&model_dir, variant, device)?;
                         Ok::<NativeDiarizationModel, Error>(model)
                     })
                     .await
