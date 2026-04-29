@@ -14,7 +14,10 @@ pub use cuda_runtime::{
     private_cuda_runtime_candidates, private_cuda_runtime_env_key, resolve_private_cuda_runtime,
     CudaRuntimeDiagnostics,
 };
-pub use device::{DeviceCapabilities, DeviceKind, DeviceProfile, DeviceSelector};
+pub use device::{
+    DTypeSelection, DTypeSelectionError, DTypeSelectionPolicy, DTypeSelectionRequest,
+    DeviceCapabilities, DeviceKind, DeviceProfile, DeviceSelector,
+};
 pub use model_io::{
     auto_gguf_mmap_for_backend, backend_kind_for_device, gguf_mmap_enabled,
     gguf_mmap_mode_from_env, open_gguf_reader, open_gguf_reader_with_mode, resolve_gguf_mmap_mode,
