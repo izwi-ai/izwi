@@ -9,6 +9,9 @@ use candle_transformers::quantized_nn::RmsNorm;
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 
 use crate::error::{Error, Result};
+use crate::models::shared::attention::flash::{
+    flash_attention_requested, try_fused_self_attention_with_options, CudaFlashAttentionOptions,
+};
 use crate::models::shared::telemetry::record_rope_kernel;
 use crate::models::shared::weights::gguf::GgufLoader;
 
@@ -32,6 +35,7 @@ struct AttentionLayer {
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
+    sliding_window: Option<usize>,
     cos: Tensor,
     sin: Tensor,
     neg_inf: Tensor,
@@ -180,6 +184,26 @@ impl AttentionLayer {
             (key_states, value_states)
         };
         self.kv_cache = Some((all_keys.clone(), all_values.clone()));
+
+        if query_states.device().is_cuda() && flash_attention_requested() {
+            let cuda_options =
+                lfm25_cuda_flash_attention_options(mask.is_some(), self.sliding_window);
+            if let Some(attn_output) = try_fused_self_attention_with_options(
+                &query_states,
+                &all_keys,
+                &all_values,
+                None,
+                self.head_dim,
+                true,
+                cuda_options,
+            )? {
+                let attn_output =
+                    attn_output
+                        .transpose(1, 2)?
+                        .reshape((batch_size, seq_len, hidden_size))?;
+                return self.wo.forward(&attn_output).map_err(Error::from);
+            }
+        }
 
         let (key_states, value_states) = if self.n_head != self.n_kv_head {
             let repeats = self.n_head / self.n_kv_head;
@@ -507,6 +531,7 @@ impl QuantizedLfm2Backbone {
                     n_head: cfg.attention_head_count,
                     n_kv_head,
                     head_dim: cfg.embedding_length / cfg.attention_head_count,
+                    sliding_window: cfg.attention_sliding_window,
                     cos: cos.clone(),
                     sin: sin.clone(),
                     neg_inf: neg_inf.clone(),
@@ -665,6 +690,16 @@ fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: &Tensor) -> Result<Ten
         .map_err(Error::from)
 }
 
+fn lfm25_cuda_flash_attention_options(
+    masked_prefill: bool,
+    sliding_window: Option<usize>,
+) -> CudaFlashAttentionOptions<'static> {
+    CudaFlashAttentionOptions {
+        window_size_left: if masked_prefill { sliding_window } else { None },
+        ..CudaFlashAttentionOptions::default()
+    }
+}
+
 fn precompute_freqs(
     head_dim: usize,
     freq_base: f32,
@@ -739,4 +774,24 @@ fn load_optional_bias_any(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lfm25_cuda_flash_attention_options;
+
+    #[test]
+    fn lfm25_cuda_flash_options_use_window_only_for_masked_prefill() {
+        let options = lfm25_cuda_flash_attention_options(true, Some(512));
+        assert_eq!(options.window_size_left, Some(512));
+        assert_eq!(options.window_size_right, None);
+        assert!(options.alibi_slopes.is_none());
+        assert!(options.softcap.is_none());
+
+        let decode_options = lfm25_cuda_flash_attention_options(false, Some(512));
+        assert_eq!(decode_options.window_size_left, None);
+
+        let full_causal_options = lfm25_cuda_flash_attention_options(true, None);
+        assert_eq!(full_causal_options.window_size_left, None);
+    }
 }
