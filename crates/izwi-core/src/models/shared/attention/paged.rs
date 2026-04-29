@@ -73,8 +73,9 @@ pub enum KvPage {
     /// Q4_0 quantized page: 4-bit weights with per-32-element block scales.
     /// Values are packed 2x4-bit per byte, with a block scale (f16/f32) every 32 values.
     Q4_0 {
-        values: Tensor,      // U8 packed 4-bit values
-        scales: Tensor,      // F32 scale per block
+        values: Tensor, // U8 packed 4-bit values
+        scales: Tensor, // F32 scale per block
+        shape: (usize, usize, usize, usize),
         seq_len: usize,      // Original sequence length
         num_elements: usize, // Total flat elements represented by the page
         target_dtype: DType,
@@ -94,7 +95,16 @@ impl KvPage {
                 })
             }
             KvCacheQuantization::Q4_0 => {
+                if !q4_0_quantization_allowed_on_device(
+                    tensor.device().is_cuda(),
+                    cuda_q4_0_host_fallback_enabled(),
+                ) {
+                    return Err(Error::InvalidInput(
+                        "CUDA Q4_0 KV cache uses a host fallback path; set IZWI_CUDA_KV_Q4_HOST_FALLBACK=1 to opt in".to_string(),
+                    ));
+                }
                 let seq_len = tensor.dim(1)?;
+                let shape = tensor.dims4()?;
                 let num_elements = tensor.elem_count();
                 let (values, scales, target_dtype) = quantize_tensor_q4_0(&tensor)?;
                 let num_blocks = scales.elem_count();
@@ -107,6 +117,7 @@ impl KvPage {
                 Ok(Self::Q4_0 {
                     values,
                     scales,
+                    shape,
                     seq_len,
                     num_elements,
                     target_dtype,
@@ -134,10 +145,13 @@ impl KvPage {
             Self::Q4_0 {
                 values,
                 scales,
+                shape,
                 seq_len: _,
                 num_elements,
                 target_dtype,
-            } => dequantize_tensor_q4_0(values, scales, *num_elements, *target_dtype),
+            } => dequantize_tensor_q4_0(values, scales, *num_elements, *target_dtype)?
+                .reshape(*shape)
+                .map_err(Error::from),
         }
     }
 }
@@ -414,11 +428,17 @@ fn parse_env_positive_usize(name: &str) -> Option<usize> {
 
 fn paged_decode_page_group_size(device: &candle_core::Device, page_count: usize) -> usize {
     let override_pages = parse_env_positive_usize("IZWI_PAGED_DECODE_GROUP_PAGES");
-    paged_decode_page_group_size_policy(device.is_metal(), page_count, override_pages)
+    paged_decode_page_group_size_policy(
+        device.is_metal(),
+        device.is_cuda(),
+        page_count,
+        override_pages,
+    )
 }
 
 fn paged_decode_page_group_size_policy(
     is_metal: bool,
+    is_cuda: bool,
     page_count: usize,
     override_pages: Option<usize>,
 ) -> usize {
@@ -426,6 +446,12 @@ fn paged_decode_page_group_size_policy(
         return override_pages.max(1);
     }
     if !is_metal || page_count < 8 {
+        if is_cuda && page_count >= 64 {
+            return 4;
+        }
+        if is_cuda && page_count >= 24 {
+            return 2;
+        }
         return 1;
     }
     if page_count >= 64 {
@@ -435,6 +461,26 @@ fn paged_decode_page_group_size_policy(
         return 4;
     }
     2
+}
+
+fn cuda_q4_0_host_fallback_enabled() -> bool {
+    env_bool("IZWI_CUDA_KV_Q4_HOST_FALLBACK", false)
+}
+
+fn q4_0_quantization_allowed_on_device(is_cuda: bool, cuda_host_fallback_enabled: bool) -> bool {
+    !is_cuda || cuda_host_fallback_enabled
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
 }
 
 fn paged_decode_attention_with_group_size(
@@ -634,12 +680,15 @@ mod tests {
     #[test]
     fn test_q4_0_quantized_materialize_close_to_dense() {
         let device = Device::Cpu;
-        let full = Tensor::randn(0.0f32, 1.0f32, (1, 17, 4, 8), &device).unwrap();
+        let values = (0..17 * 4 * 8)
+            .map(|idx| ((idx % 97) as f32 / 48.0) - 1.0)
+            .collect::<Vec<_>>();
+        let full = Tensor::from_vec(values, (1, 17, 4, 8), &device).unwrap();
         let mut pages = Vec::new();
         append_to_pages(5, &mut pages, &full, KvCacheQuantization::Q4_0).unwrap();
         let materialized = materialize_pages(&pages).unwrap();
         let diff = max_abs_diff(&materialized, &full);
-        assert!(diff < 0.20, "max abs diff was {}", diff);
+        assert!(diff < 0.16, "max abs diff was {}", diff);
 
         assert_eq!(pages.len(), 4, "unexpected page count");
         assert_eq!(pages[0].seq_len().unwrap(), 5);
@@ -841,19 +890,68 @@ mod tests {
 
     #[test]
     fn test_paged_decode_page_group_policy_scales_on_metal() {
-        assert_eq!(paged_decode_page_group_size_policy(true, 1, None), 1);
-        assert_eq!(paged_decode_page_group_size_policy(true, 7, None), 1);
-        assert_eq!(paged_decode_page_group_size_policy(true, 8, None), 2);
-        assert_eq!(paged_decode_page_group_size_policy(true, 23, None), 2);
-        assert_eq!(paged_decode_page_group_size_policy(true, 24, None), 4);
-        assert_eq!(paged_decode_page_group_size_policy(true, 63, None), 4);
-        assert_eq!(paged_decode_page_group_size_policy(true, 64, None), 8);
+        assert_eq!(paged_decode_page_group_size_policy(true, false, 1, None), 1);
+        assert_eq!(paged_decode_page_group_size_policy(true, false, 7, None), 1);
+        assert_eq!(paged_decode_page_group_size_policy(true, false, 8, None), 2);
+        assert_eq!(
+            paged_decode_page_group_size_policy(true, false, 23, None),
+            2
+        );
+        assert_eq!(
+            paged_decode_page_group_size_policy(true, false, 24, None),
+            4
+        );
+        assert_eq!(
+            paged_decode_page_group_size_policy(true, false, 63, None),
+            4
+        );
+        assert_eq!(
+            paged_decode_page_group_size_policy(true, false, 64, None),
+            8
+        );
+    }
+
+    #[test]
+    fn test_paged_decode_page_group_policy_scales_on_cuda() {
+        assert_eq!(
+            paged_decode_page_group_size_policy(false, true, 23, None),
+            1
+        );
+        assert_eq!(
+            paged_decode_page_group_size_policy(false, true, 24, None),
+            2
+        );
+        assert_eq!(
+            paged_decode_page_group_size_policy(false, true, 63, None),
+            2
+        );
+        assert_eq!(
+            paged_decode_page_group_size_policy(false, true, 64, None),
+            4
+        );
     }
 
     #[test]
     fn test_paged_decode_page_group_policy_respects_overrides() {
-        assert_eq!(paged_decode_page_group_size_policy(false, 128, None), 1);
-        assert_eq!(paged_decode_page_group_size_policy(true, 128, Some(3)), 3);
+        assert_eq!(
+            paged_decode_page_group_size_policy(false, false, 128, None),
+            1
+        );
+        assert_eq!(
+            paged_decode_page_group_size_policy(true, false, 128, Some(3)),
+            3
+        );
+        assert_eq!(
+            paged_decode_page_group_size_policy(false, true, 128, Some(3)),
+            3
+        );
+    }
+
+    #[test]
+    fn test_cuda_q4_0_requires_explicit_host_fallback() {
+        assert!(q4_0_quantization_allowed_on_device(false, false));
+        assert!(!q4_0_quantization_allowed_on_device(true, false));
+        assert!(q4_0_quantization_allowed_on_device(true, true));
     }
 
     #[test]
