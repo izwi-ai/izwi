@@ -25,6 +25,7 @@ use tracing::info;
 
 use crate::audio::{MelConfig, MelSpectrogram};
 use crate::backends::DeviceProfile;
+use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::tokenizer::Tokenizer;
 
@@ -191,13 +192,18 @@ impl WhisperTurboAsrModel {
         let generation = read_generation_config(model_dir)?;
         let tokenizer = Tokenizer::from_path(model_dir)?;
 
-        let model_dtype = std::env::var("IZWI_WHISPER_DTYPE")
+        let dtype_override = std::env::var("IZWI_WHISPER_DTYPE")
             .ok()
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(|value| device.select_dtype(Some(value)))
-            .unwrap_or_else(|| device.select_dtype(None));
+            .map(str::to_string);
+        let model_dtype = match dtype_override.as_deref() {
+            Some(raw) => {
+                device.select_model_dtype_checked(ModelFamily::WhisperAsr, Some(raw), "Whisper")?
+            }
+            None => device.select_model_dtype(ModelFamily::WhisperAsr, None),
+        };
 
         let index_path = model_dir.join("model.safetensors.index.json");
         let vb = if index_path.exists() {

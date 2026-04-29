@@ -24,6 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
 
 use crate::backends::DeviceProfile;
+use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::models::shared::attention::paged::{default_kv_page_size, KvCacheQuantization};
 
@@ -218,7 +219,9 @@ impl Qwen3TtsModel {
             .ok()
             .or_else(|| std::env::var("IZWI_QWEN_DTYPE").ok());
         let dtype = match dtype_override.as_deref().map(str::trim) {
-            Some(raw) if !raw.is_empty() => device.select_dtype(Some(raw)),
+            Some(raw) if !raw.is_empty() => {
+                device.select_model_dtype_checked(ModelFamily::Qwen3Tts, Some(raw), "Qwen3 TTS")?
+            }
             _ if is_custom_voice_model || is_voice_clone_model => {
                 // Voice-clone and CustomVoice generation are sensitive to precision and can
                 // become unstable under fp16. Keep default inference in fp32 unless overridden.
@@ -228,7 +231,7 @@ impl Qwen3TtsModel {
                 // Reduce model residency on Apple Silicon while preserving speed.
                 DType::F16
             }
-            _ => device.select_dtype(None),
+            _ => device.select_model_dtype(ModelFamily::Qwen3Tts, None),
         };
 
         // Load tokenizer

@@ -8,6 +8,7 @@ use tracing::info;
 
 use crate::audio::{MelConfig, MelSpectrogram};
 use crate::backends::DeviceProfile;
+use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::core::Qwen3Cache;
 use crate::models::architectures::voxtral::lm::VoxtralLM;
@@ -70,7 +71,7 @@ impl VoxtralRealtimeModel {
         };
         let tokenizer = VoxtralTokenizer::new(config.text_config().vocab_size, audio_config);
 
-        let dtype = device.select_dtype(None);
+        let dtype = device.select_model_dtype(ModelFamily::Voxtral, None);
 
         // Load weights - clone device to a local binding for lifetime
         let device_clone = device.clone();
