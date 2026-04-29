@@ -1,4 +1,7 @@
-use crate::catalog::{InferenceBackendHint, ModelVariant};
+use crate::catalog::{
+    CudaQuantizationInfo, CudaQuantizationSupportLevel, CudaSupportInfo, CudaSupportLevel,
+    InferenceBackendHint, ModelVariant,
+};
 
 use super::capabilities::BackendCapabilities;
 use super::device::{DeviceProfile, DeviceSelector};
@@ -8,6 +11,9 @@ use super::types::{BackendContext, BackendPreference, BackendSelectionSource, Ex
 pub struct BackendPlan {
     pub backend: ExecutionBackend,
     pub reason: String,
+    pub cuda_support: CudaSupportInfo,
+    pub cuda_quantization: CudaQuantizationInfo,
+    pub diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -133,18 +139,80 @@ impl BackendRouter {
             ExecutionBackend::CandleNative => "native CPU backend",
             ExecutionBackend::CandleCuda => "CUDA backend",
         };
+        let cuda_support = variant.cuda_support();
+        let cuda_quantization = variant.cuda_quantization();
+        let diagnostics =
+            self.cuda_diagnostics_for_selection(variant, cuda_support, cuda_quantization);
 
         match variant.backend_hint() {
             InferenceBackendHint::CandleNative => BackendPlan {
                 backend: self.context.execution_backend,
-                reason: format!(
-                    "{} targets the native Candle execution path ({})",
-                    variant.dir_name(),
-                    default_desc
+                reason: append_diagnostics(
+                    format!(
+                        "{} targets the native Candle execution path ({})",
+                        variant.dir_name(),
+                        default_desc
+                    ),
+                    &diagnostics,
                 ),
+                cuda_support,
+                cuda_quantization,
+                diagnostics,
             },
         }
     }
+
+    fn cuda_diagnostics_for_selection(
+        &self,
+        variant: ModelVariant,
+        cuda_support: CudaSupportInfo,
+        cuda_quantization: CudaQuantizationInfo,
+    ) -> Vec<String> {
+        if self.context.execution_backend != ExecutionBackend::CandleCuda {
+            return Vec::new();
+        }
+
+        let mut diagnostics = Vec::new();
+        match cuda_support.level {
+            CudaSupportLevel::CpuOnly | CudaSupportLevel::Disabled | CudaSupportLevel::Unknown => {
+                diagnostics.push(format!(
+                    "CUDA support for {} is {}: {}",
+                    variant.dir_name(),
+                    cuda_support.level.as_str(),
+                    cuda_support.reason
+                ));
+            }
+            CudaSupportLevel::CandleCudaGeneric => diagnostics.push(format!(
+                "CUDA support for {} is generic Candle CUDA and needs smoke validation: {}",
+                variant.dir_name(),
+                cuda_support.reason
+            )),
+            CudaSupportLevel::NativeCuda => {}
+        }
+
+        if matches!(
+            cuda_quantization.level,
+            CudaQuantizationSupportLevel::DenseDequantizedFallback
+                | CudaQuantizationSupportLevel::Unknown
+        ) {
+            diagnostics.push(format!(
+                "CUDA quantization for {} is {}: {}",
+                variant.dir_name(),
+                cuda_quantization.level.as_str(),
+                cuda_quantization.reason
+            ));
+        }
+
+        diagnostics
+    }
+}
+
+fn append_diagnostics(mut reason: String, diagnostics: &[String]) -> String {
+    if !diagnostics.is_empty() {
+        reason.push_str("; ");
+        reason.push_str(&diagnostics.join("; "));
+    }
+    reason
 }
 
 #[cfg(test)]
@@ -183,6 +251,7 @@ mod tests {
         let router = BackendRouter::from_preference(BackendPreference::Cpu);
         let plan = router.select(ModelVariant::Qwen3Tts12Hz06BBase);
         assert_eq!(plan.backend, ExecutionBackend::CandleNative);
+        assert!(plan.diagnostics.is_empty());
     }
 
     #[test]
@@ -220,5 +289,40 @@ mod tests {
             BackendRouter::resolve_context(BackendPreference::Cpu, BackendSelectionSource::Config);
         assert!(context.matches_preference());
         assert_eq!(context.backend_kind, crate::backends::BackendKind::Cpu);
+    }
+
+    #[test]
+    fn cuda_selection_reports_cpu_only_models() {
+        let context = BackendContext::new(
+            BackendPreference::Cuda,
+            BackendSelectionSource::Config,
+            BackendCapabilities {
+                cpu_compiled: true,
+                metal_compiled: false,
+                cuda_compiled: true,
+            },
+            DeviceProfile {
+                device: candle_core::Device::Cpu,
+                kind: crate::backends::DeviceKind::Cuda,
+                capabilities: crate::backends::DeviceCapabilities {
+                    supports_bf16: true,
+                    supports_f16: true,
+                    ..Default::default()
+                },
+                memory_pool: None,
+            },
+            "Selected cuda backend",
+        );
+        let router = BackendRouter::from_context(context);
+        let plan = router.select(ModelVariant::DiarStreamingSortformer4SpkV21);
+
+        assert_eq!(plan.backend, ExecutionBackend::CandleCuda);
+        assert_eq!(plan.cuda_support.level, CudaSupportLevel::CpuOnly);
+        assert!(
+            plan.reason.contains("cpu_only"),
+            "reason should carry CUDA support diagnostics: {}",
+            plan.reason
+        );
+        assert!(!plan.diagnostics.is_empty());
     }
 }

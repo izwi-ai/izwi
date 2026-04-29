@@ -1,7 +1,10 @@
 //! Health check endpoint
 
 use axum::{extract::State, Json};
-use izwi_core::backends::CudaRuntimeDiagnostics;
+use izwi_core::backends::{CudaRuntimeDiagnostics, DTypeSelectionRequest};
+use izwi_core::runtime_models::shared::attention::flash::{
+    flash_attention_compiled, flash_attention_requested,
+};
 use serde::Serialize;
 
 use crate::state::AppState;
@@ -22,6 +25,8 @@ pub struct RuntimeBackendResponse {
     pub selection_reason: String,
     pub compiled_backends: CompiledBackendsResponse,
     pub detected_device: DetectedDeviceResponse,
+    pub dtype_policy: DTypePolicyResponse,
+    pub fused_attention: FusedAttentionResponse,
     pub cuda_runtime: CudaRuntimeResponse,
 }
 
@@ -36,9 +41,25 @@ pub struct CompiledBackendsResponse {
 pub struct DetectedDeviceResponse {
     pub kind: String,
     pub supports_bf16: bool,
+    pub supports_f16: bool,
+    pub supports_int8_tensor_cores: bool,
     pub has_unified_memory: bool,
     pub recommended_batch_size: usize,
     pub available_memory_bytes: Option<usize>,
+    pub cuda_compute_capability: Option<String>,
+    pub cuda_device_name: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct DTypePolicyResponse {
+    pub selected_dtype: String,
+    pub reason: String,
+}
+
+#[derive(Serialize)]
+pub struct FusedAttentionResponse {
+    pub cuda_flash_attention_compiled: bool,
+    pub requested: bool,
 }
 
 #[derive(Serialize)]
@@ -58,6 +79,7 @@ pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse>
     let capabilities = context.capabilities;
     let requested_backend_available = context.matches_preference();
     let device = context.device.clone();
+    let dtype_selection = device.resolve_dtype(DTypeSelectionRequest::new(None));
     let cuda_runtime = CudaRuntimeDiagnostics::detect(&current_server_binary_name());
 
     Json(HealthResponse {
@@ -77,9 +99,24 @@ pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse>
             detected_device: DetectedDeviceResponse {
                 kind: context.backend_kind.as_str().to_string(),
                 supports_bf16: device.capabilities.supports_bf16,
+                supports_f16: device.capabilities.supports_f16,
+                supports_int8_tensor_cores: device.capabilities.supports_int8_tensor_cores,
                 has_unified_memory: device.capabilities.has_unified_memory,
                 recommended_batch_size: device.capabilities.recommended_batch_size,
                 available_memory_bytes: device.capabilities.available_memory_bytes,
+                cuda_compute_capability: device
+                    .capabilities
+                    .cuda_compute_capability
+                    .map(|(major, minor)| format!("{major}.{minor}")),
+                cuda_device_name: device.capabilities.cuda_device_name.clone(),
+            },
+            dtype_policy: DTypePolicyResponse {
+                selected_dtype: format!("{:?}", dtype_selection.dtype).to_ascii_lowercase(),
+                reason: dtype_selection.reason.into_owned(),
+            },
+            fused_attention: FusedAttentionResponse {
+                cuda_flash_attention_compiled: flash_attention_compiled(),
+                requested: flash_attention_requested(),
             },
             cuda_runtime: CudaRuntimeResponse::from(cuda_runtime),
         },

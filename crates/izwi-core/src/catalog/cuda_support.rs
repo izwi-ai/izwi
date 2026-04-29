@@ -29,7 +29,7 @@ impl CudaSupportLevel {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CudaSupportInfo {
     pub level: CudaSupportLevel,
     pub reason: &'static str,
@@ -38,6 +38,60 @@ pub struct CudaSupportInfo {
 impl CudaSupportInfo {
     pub const fn new(level: CudaSupportLevel, reason: &'static str) -> Self {
         Self { level, reason }
+    }
+}
+
+impl Default for CudaSupportInfo {
+    fn default() -> Self {
+        Self::new(
+            CudaSupportLevel::Unknown,
+            "CUDA support was not recorded in serialized model metadata",
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CudaQuantizationSupportLevel {
+    Dense,
+    CandleQuantizedGeneric,
+    DenseDequantizedFallback,
+    CpuOnly,
+    Disabled,
+    Unknown,
+}
+
+impl CudaQuantizationSupportLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dense => "dense",
+            Self::CandleQuantizedGeneric => "candle_quantized_generic",
+            Self::DenseDequantizedFallback => "dense_dequantized_fallback",
+            Self::CpuOnly => "cpu_only",
+            Self::Disabled => "disabled",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CudaQuantizationInfo {
+    pub level: CudaQuantizationSupportLevel,
+    pub reason: &'static str,
+}
+
+impl CudaQuantizationInfo {
+    pub const fn new(level: CudaQuantizationSupportLevel, reason: &'static str) -> Self {
+        Self { level, reason }
+    }
+}
+
+impl Default for CudaQuantizationInfo {
+    fn default() -> Self {
+        Self::new(
+            CudaQuantizationSupportLevel::Unknown,
+            "CUDA quantization support was not recorded in serialized model metadata",
+        )
     }
 }
 
@@ -79,6 +133,49 @@ impl ModelVariant {
 
     pub fn cuda_support_level(&self) -> CudaSupportLevel {
         self.cuda_support().level
+    }
+
+    pub fn cuda_quantization(&self) -> CudaQuantizationInfo {
+        if !self.is_enabled() {
+            return CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::Disabled,
+                "variant is disabled in the application catalog",
+            );
+        }
+
+        match self.family() {
+            ModelFamily::Tokenizer => CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::CpuOnly,
+                "tokenizer-only artifact does not run quantized CUDA inference",
+            ),
+            ModelFamily::SortformerDiarization => CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::CpuOnly,
+                "Sortformer is currently a CPU-only CUDA support entry",
+            ),
+            _ if self.is_qwen_chat_gguf()
+                || self.is_qwen35_chat_gguf()
+                || self.is_lfm2_chat_gguf() =>
+            {
+                CudaQuantizationInfo::new(
+                    CudaQuantizationSupportLevel::CandleQuantizedGeneric,
+                    "GGUF text model uses Candle quantized weights on the selected device",
+                )
+            }
+            _ if self.is_qwen_asr_gguf() || self.is_lfm25_audio_gguf() => {
+                CudaQuantizationInfo::new(
+                    CudaQuantizationSupportLevel::DenseDequantizedFallback,
+                    "GGUF speech/audio bundle is loaded through dense VarBuilder paths",
+                )
+            }
+            _ if self.is_quantized() => CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::DenseDequantizedFallback,
+                "quantized safetensors are dequantized into dense tensors before CUDA execution",
+            ),
+            _ => CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::Dense,
+                "dense checkpoint uses the selected CUDA dtype policy",
+            ),
+        }
     }
 }
 
@@ -137,5 +234,34 @@ mod tests {
                 "{variant} should have an explicit CUDA support level"
             );
         }
+    }
+
+    #[test]
+    fn cuda_quantization_inventory_covers_every_variant() {
+        for variant in ModelVariant::all() {
+            let info = variant.cuda_quantization();
+            assert!(
+                !info.reason.trim().is_empty(),
+                "{variant} must include a CUDA quantization reason"
+            );
+        }
+    }
+
+    #[test]
+    fn cuda_quantization_marks_dequantized_and_candle_paths() {
+        assert_eq!(
+            ModelVariant::Qwen34BGguf.cuda_quantization().level,
+            CudaQuantizationSupportLevel::CandleQuantizedGeneric
+        );
+        assert_eq!(
+            ModelVariant::Qwen3Asr06BGguf.cuda_quantization().level,
+            CudaQuantizationSupportLevel::DenseDequantizedFallback
+        );
+        assert_eq!(
+            ModelVariant::Qwen3Tts12Hz06BBase4Bit
+                .cuda_quantization()
+                .level,
+            CudaQuantizationSupportLevel::DenseDequantizedFallback
+        );
     }
 }

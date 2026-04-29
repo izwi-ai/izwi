@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::backends::BackendPlan;
 use crate::error::{Error, Result};
@@ -27,6 +27,9 @@ impl RuntimeService {
             "Selected backend {:?} for {} ({})",
             backend_plan.backend, variant, backend_plan.reason
         );
+        for diagnostic in &backend_plan.diagnostics {
+            warn!("CUDA backend diagnostic for {}: {}", variant, diagnostic);
+        }
 
         Ok(ResolvedModelLoad {
             variant,
