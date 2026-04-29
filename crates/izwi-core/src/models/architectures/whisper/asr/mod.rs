@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use candle_core::{DType, IndexOp, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::whisper::{self, model::Whisper, Config as WhisperConfig};
+use candle_transformers::models::whisper::{self, Config as WhisperConfig};
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use rand::Rng;
@@ -28,6 +28,8 @@ use crate::backends::DeviceProfile;
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::tokenizer::Tokenizer;
+
+use super::model::Whisper;
 
 const SAMPLE_RATE: u32 = whisper::SAMPLE_RATE as u32;
 const DEFAULT_MAX_NEW_TOKENS: usize = 448;
