@@ -69,6 +69,37 @@ pub const fn cuda_flash_attention_head_dim_supported(head_dim: usize) -> bool {
         && head_dim % CUDA_FLASH_ATTENTION_HEAD_DIM_MULTIPLE == 0
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CudaFlashAttentionOptions<'a> {
+    pub window_size_left: Option<usize>,
+    pub window_size_right: Option<usize>,
+    pub alibi_slopes: Option<&'a Tensor>,
+    pub softcap: Option<f32>,
+}
+
+impl Default for CudaFlashAttentionOptions<'_> {
+    fn default() -> Self {
+        Self {
+            window_size_left: None,
+            window_size_right: None,
+            alibi_slopes: None,
+            softcap: None,
+        }
+    }
+}
+
+fn cuda_flash_attention_window(
+    causal: bool,
+    options: CudaFlashAttentionOptions<'_>,
+) -> (Option<usize>, Option<usize>) {
+    (
+        options.window_size_left,
+        options
+            .window_size_right
+            .or_else(|| if causal { Some(0) } else { None }),
+    )
+}
+
 /// Runtime check used by models that wire Candle's `use_flash_attn` flag.
 pub fn should_enable_flash_attention_v2(device: &candle_core::Device) -> bool {
     flash_attention_requested() && device.is_cuda() && flash_attention_compiled()
@@ -122,12 +153,39 @@ pub fn try_fused_self_attention(
     head_dim: usize,
     causal: bool,
 ) -> Result<Option<Tensor>> {
+    try_fused_self_attention_with_options(
+        q,
+        k,
+        v,
+        mask,
+        head_dim,
+        causal,
+        CudaFlashAttentionOptions::default(),
+    )
+}
+
+/// Try a fused self-attention kernel with CUDA-specific Candle FlashAttention options.
+///
+/// Input/output layout: `[batch, heads, seq, head_dim]`. Extended options are only
+/// consulted by the CUDA FlashAttention path; Metal SDPA and unfused fallbacks keep
+/// the same behavior as `try_fused_self_attention`.
+pub fn try_fused_self_attention_with_options(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    head_dim: usize,
+    causal: bool,
+    cuda_options: CudaFlashAttentionOptions<'_>,
+) -> Result<Option<Tensor>> {
     let scale = 1.0f32 / (head_dim as f32).sqrt();
     let masked = mask.is_some();
     record_fused_attention_attempt();
     if masked {
         record_fused_attention_masked_attempt();
     }
+    #[cfg(not(feature = "flash-attn"))]
+    let _ = cuda_options;
     let mut fallback_reason = AttentionFallbackReason::UnsupportedBackend;
 
     if q.device().is_cuda() {
@@ -150,7 +208,7 @@ pub fn try_fused_self_attention(
                     let v = v.transpose(1, 2)?.contiguous()?;
                     let flash_result =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            candle_flash_attn::flash_attn(&q, &k, &v, scale, causal)
+                            run_cuda_flash_attention(&q, &k, &v, scale, causal, cuda_options)
                         }));
                     match flash_result {
                         Ok(Ok(out)) => {
@@ -209,6 +267,56 @@ pub fn try_fused_self_attention(
         record_fused_attention_masked_fallback();
     }
     Ok(None)
+}
+
+#[cfg(feature = "flash-attn")]
+fn run_cuda_flash_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    causal: bool,
+    options: CudaFlashAttentionOptions<'_>,
+) -> candle_core::Result<Tensor> {
+    let (window_size_left, window_size_right) = cuda_flash_attention_window(causal, options);
+    let default_window = (None, if causal { Some(0) } else { None });
+    let custom_window = (window_size_left, window_size_right) != default_window;
+
+    match (options.alibi_slopes, options.softcap) {
+        (_, Some(softcap)) => candle_flash_attn::flash_attn_alibi_windowed_softcap(
+            q,
+            k,
+            v,
+            options.alibi_slopes,
+            scale,
+            window_size_left,
+            window_size_right,
+            softcap,
+        ),
+        (Some(alibi_slopes), None) if custom_window => {
+            candle_flash_attn::flash_attn_alibi_windowed(
+                q,
+                k,
+                v,
+                alibi_slopes,
+                scale,
+                window_size_left,
+                window_size_right,
+            )
+        }
+        (Some(alibi_slopes), None) => {
+            candle_flash_attn::flash_attn_alibi(q, k, v, alibi_slopes, scale, causal)
+        }
+        (None, None) if custom_window => candle_flash_attn::flash_attn_windowed(
+            q,
+            k,
+            v,
+            scale,
+            window_size_left,
+            window_size_right,
+        ),
+        (None, None) => candle_flash_attn::flash_attn(q, k, v, scale, causal),
+    }
 }
 
 /// Conservative preflight for Metal SDPA.
@@ -417,10 +525,10 @@ fn dtype_supported_for_flash(dtype: DType) -> bool {
 mod tests {
     use super::{
         cuda_flash_attention_capabilities, cuda_flash_attention_head_dim_supported,
-        metal_sdpa_mask_shape_supported, metal_sdpa_shape_supported,
+        cuda_flash_attention_window, metal_sdpa_mask_shape_supported, metal_sdpa_shape_supported,
         should_try_cuda_flash_attention, should_use_metal_sdpa_f16_cast,
-        CudaFlashAttentionDecision, CUDA_FLASH_ATTENTION_HEAD_DIM_MULTIPLE,
-        CUDA_FLASH_ATTENTION_MAX_HEAD_DIM,
+        CudaFlashAttentionDecision, CudaFlashAttentionOptions,
+        CUDA_FLASH_ATTENTION_HEAD_DIM_MULTIPLE, CUDA_FLASH_ATTENTION_MAX_HEAD_DIM,
     };
     use crate::models::shared::telemetry::AttentionFallbackReason;
     use candle_core::DType;
@@ -577,6 +685,39 @@ mod tests {
                 DType::F16
             ),
             CudaFlashAttentionDecision::Skip(AttentionFallbackReason::UnsupportedBackend)
+        );
+    }
+
+    #[test]
+    fn cuda_flash_attention_options_resolve_causal_window() {
+        assert_eq!(
+            cuda_flash_attention_window(true, CudaFlashAttentionOptions::default()),
+            (None, Some(0))
+        );
+        assert_eq!(
+            cuda_flash_attention_window(false, CudaFlashAttentionOptions::default()),
+            (None, None)
+        );
+        assert_eq!(
+            cuda_flash_attention_window(
+                true,
+                CudaFlashAttentionOptions {
+                    window_size_left: Some(512),
+                    ..CudaFlashAttentionOptions::default()
+                }
+            ),
+            (Some(512), Some(0))
+        );
+        assert_eq!(
+            cuda_flash_attention_window(
+                true,
+                CudaFlashAttentionOptions {
+                    window_size_left: Some(128),
+                    window_size_right: Some(16),
+                    ..CudaFlashAttentionOptions::default()
+                }
+            ),
+            (Some(128), Some(16))
         );
     }
 
