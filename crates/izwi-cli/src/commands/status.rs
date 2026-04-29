@@ -22,6 +22,8 @@ struct RuntimeBackendStatus {
     selection_reason: Option<String>,
     compiled_backends: Option<CompiledBackendsStatus>,
     detected_device: Option<DetectedDeviceStatus>,
+    dtype_policy: Option<DTypePolicyStatus>,
+    fused_attention: Option<FusedAttentionStatus>,
     cuda_runtime: Option<CudaRuntimeStatus>,
 }
 
@@ -36,9 +38,25 @@ struct CompiledBackendsStatus {
 struct DetectedDeviceStatus {
     kind: Option<String>,
     supports_bf16: Option<bool>,
+    supports_f16: Option<bool>,
+    supports_int8_tensor_cores: Option<bool>,
     has_unified_memory: Option<bool>,
     recommended_batch_size: Option<usize>,
     available_memory_bytes: Option<usize>,
+    cuda_compute_capability: Option<String>,
+    cuda_device_name: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DTypePolicyStatus {
+    selected_dtype: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FusedAttentionStatus {
+    cuda_flash_attention_compiled: Option<bool>,
+    requested: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -128,7 +146,11 @@ async fn show_status(server: &str, detailed: bool) -> Result<()> {
                 println!("\n{}", style("Models:").bold());
 
                 let mut table = Table::new();
-                table.set_header(vec!["Model", "Status", "Size"]);
+                if detailed {
+                    table.set_header(vec!["Model", "Status", "Size", "CUDA", "Quant"]);
+                } else {
+                    table.set_header(vec!["Model", "Status", "Size"]);
+                }
 
                 for model in models {
                     let id = model
@@ -165,11 +187,16 @@ async fn show_status(server: &str, detailed: bool) -> Result<()> {
                         _ => Cell::new(&status).fg(Color::DarkGrey),
                     };
 
-                    table.add_row(vec![
+                    let mut row = vec![
                         Cell::new(id).fg(Color::Cyan),
                         status_cell,
                         Cell::new(size).set_alignment(CellAlignment::Right),
-                    ]);
+                    ];
+                    if detailed {
+                        row.push(Cell::new(model_cuda_level(model)).fg(Color::DarkGrey));
+                        row.push(Cell::new(model_cuda_quant_level(model)).fg(Color::DarkGrey));
+                    }
+                    table.add_row(row);
                 }
 
                 println!("{}", table);
@@ -216,11 +243,20 @@ async fn show_status(server: &str, detailed: bool) -> Result<()> {
                 if let Some(kind) = device.kind.as_deref() {
                     println!("  Device:    {}", kind);
                 }
+                if let Some(name) = device.cuda_device_name.as_deref() {
+                    println!("  CUDA name: {}", name);
+                }
+                if let Some(capability) = device.cuda_compute_capability.as_deref() {
+                    println!("  CUDA cc:   {}", capability);
+                }
                 if let Some(supports_bf16) = device.supports_bf16 {
-                    println!(
-                        "  BF16:      {}",
-                        if supports_bf16 { "yes" } else { "no" }
-                    );
+                    println!("  BF16:      {}", if supports_bf16 { "yes" } else { "no" });
+                }
+                if let Some(supports_f16) = device.supports_f16 {
+                    println!("  F16:       {}", if supports_f16 { "yes" } else { "no" });
+                }
+                if let Some(supports_int8) = device.supports_int8_tensor_cores {
+                    println!("  INT8 TC:   {}", if supports_int8 { "yes" } else { "no" });
                 }
                 if let Some(has_unified_memory) = device.has_unified_memory {
                     println!(
@@ -240,6 +276,24 @@ async fn show_status(server: &str, detailed: bool) -> Result<()> {
             }
             if let Some(reason) = runtime.selection_reason.as_deref() {
                 println!("  Reason:    {}", reason);
+            }
+            if let Some(dtype) = runtime.dtype_policy.as_ref() {
+                if let Some(selected) = dtype.selected_dtype.as_deref() {
+                    println!("  DType:     {}", selected);
+                }
+                if let Some(reason) = dtype.reason.as_deref() {
+                    println!("  DType why: {}", reason);
+                }
+            }
+            if let Some(fused) = runtime.fused_attention.as_ref() {
+                println!(
+                    "  FlashAttn: compiled={} requested={}",
+                    fused
+                        .cuda_flash_attention_compiled
+                        .map(yes_no)
+                        .unwrap_or("unknown"),
+                    fused.requested.map(yes_no).unwrap_or("unknown")
+                );
             }
             if let Some(cuda_runtime) = runtime.cuda_runtime.as_ref() {
                 println!("\n{}", style("CUDA Runtime:").bold());
@@ -284,6 +338,22 @@ fn print_cuda_runtime_status(runtime: &CudaRuntimeStatus) {
             println!("  Missing libs: {}", missing.join(", "));
         }
     }
+}
+
+fn model_cuda_level(model: &serde_json::Value) -> &str {
+    model
+        .get("cuda_support")
+        .and_then(|value| value.get("level"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+}
+
+fn model_cuda_quant_level(model: &serde_json::Value) -> &str {
+    model
+        .get("cuda_quantization")
+        .and_then(|value| value.get("level"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
 }
 
 fn yes_no(value: bool) -> &'static str {

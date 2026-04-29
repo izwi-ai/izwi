@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use super::{CudaQuantizationInfo, CudaSupportInfo};
+
 /// Available TTS model variants
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ModelVariant {
@@ -875,6 +877,10 @@ pub struct ModelInfo {
     pub download_progress: Option<f32>,
     pub error_message: Option<String>,
     pub speech_capabilities: Option<SpeechModelCapabilities>,
+    #[serde(skip_deserializing)]
+    pub cuda_support: CudaSupportInfo,
+    #[serde(skip_deserializing)]
+    pub cuda_quantization: CudaQuantizationInfo,
 }
 
 impl ModelInfo {
@@ -888,6 +894,8 @@ impl ModelInfo {
             download_progress: None,
             error_message: None,
             speech_capabilities: variant.speech_capabilities(),
+            cuda_support: variant.cuda_support(),
+            cuda_quantization: variant.cuda_quantization(),
         }
     }
 

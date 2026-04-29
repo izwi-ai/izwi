@@ -67,7 +67,8 @@ pub use serve_runtime::{ServeRuntimeConfig, ServeRuntimeConfigOverrides};
 pub use artifacts::{DownloadProgress, ModelDownloader, ModelManager, ModelWeights};
 pub use catalog::{
     parse_chat_model_variant, parse_model_variant, parse_tts_model_variant,
-    resolve_asr_model_variant, resolve_diarization_model_variant, ModelInfo, ModelStatus,
+    resolve_asr_model_variant, resolve_diarization_model_variant, CudaQuantizationInfo,
+    CudaQuantizationSupportLevel, CudaSupportInfo, CudaSupportLevel, ModelInfo, ModelStatus,
     ModelVariant, SpeechModelCapabilities,
 };
 pub use runtime_models::shared::chat::{
