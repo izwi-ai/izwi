@@ -269,6 +269,78 @@ pub fn try_fused_self_attention_with_options(
     Ok(None)
 }
 
+/// Try CUDA FlashAttention varlen for packed independent attention spans.
+///
+/// Input/output layout: `[1, heads, total_seq, head_dim]`. The cumulative
+/// sequence lengths are CUDA-side FlashAttention metadata and this helper is a
+/// no-op on non-CUDA devices.
+pub fn try_fused_varlen_self_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    cu_seqlens: &[u32],
+    max_seqlen: usize,
+    head_dim: usize,
+    causal: bool,
+) -> Result<Option<Tensor>> {
+    if !q.device().is_cuda() {
+        return Ok(None);
+    }
+
+    record_fused_attention_attempt();
+    let mut fallback_reason = AttentionFallbackReason::UnsupportedBackend;
+    if cu_seqlens.len() < 2 || max_seqlen == 0 {
+        record_fused_attention_fallback(fallback_reason);
+        return Ok(None);
+    }
+
+    let cuda_decision = should_try_cuda_flash_attention(
+        flash_attention_requested(),
+        flash_attention_compiled(),
+        false,
+        head_dim,
+        q.dtype(),
+        k.dtype(),
+        v.dtype(),
+    );
+
+    match cuda_decision {
+        CudaFlashAttentionDecision::Try => {
+            #[cfg(feature = "flash-attn")]
+            {
+                let device = q.device();
+                let scale = 1.0f32 / (head_dim as f32).sqrt();
+                let flash_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let q = q.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+                    let k = k.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+                    let v = v.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+                    let seqlens = Tensor::new(cu_seqlens, device)?;
+                    candle_flash_attn::flash_attn_varlen(
+                        &q, &k, &v, &seqlens, &seqlens, max_seqlen, max_seqlen, scale, causal,
+                    )
+                }));
+                match flash_result {
+                    Ok(Ok(out)) => {
+                        record_fused_attention_success();
+                        return Ok(Some(out.transpose(0, 1)?.unsqueeze(0)?));
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        fallback_reason = AttentionFallbackReason::FlashRuntimeError;
+                    }
+                }
+            }
+            #[cfg(not(feature = "flash-attn"))]
+            let _ = causal;
+        }
+        CudaFlashAttentionDecision::Skip(reason) => {
+            fallback_reason = reason;
+        }
+    }
+
+    record_fused_attention_fallback(fallback_reason);
+    Ok(None)
+}
+
 #[cfg(feature = "flash-attn")]
 fn run_cuda_flash_attention(
     q: &Tensor,

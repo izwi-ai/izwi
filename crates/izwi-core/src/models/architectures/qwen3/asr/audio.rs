@@ -6,7 +6,9 @@ use candle_nn::{layer_norm, Conv2d, Conv2dConfig, LayerNorm, Linear, VarBuilder}
 
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::asr::config::AudioConfig;
-use crate::models::shared::attention::flash::try_fused_self_attention;
+use crate::models::shared::attention::flash::{
+    try_fused_self_attention, try_fused_varlen_self_attention,
+};
 use crate::models::shared::telemetry::{
     record_chunk_attention_fused_span, record_chunk_attention_mask_fallback,
     record_chunk_attention_sequence, record_chunk_attention_unfused_span,
@@ -123,6 +125,28 @@ fn chunk_spans_from_cu_seqlens(seq_len: usize, cu_seqlens: &[i64]) -> Option<Vec
     Some(spans)
 }
 
+fn chunk_cu_seqlens_u32(seq_len: usize, spans: &[(usize, usize)]) -> Option<Vec<u32>> {
+    if spans.is_empty() {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(spans.len() + 1);
+    let mut expected_start = 0usize;
+    out.push(0);
+    for &(start, end) in spans {
+        if start != expected_start || end <= start || end > seq_len {
+            return None;
+        }
+        out.push(u32::try_from(end).ok()?);
+        expected_start = end;
+    }
+
+    if expected_start != seq_len {
+        return None;
+    }
+    Some(out)
+}
+
 fn attention_unfused_with_mask(
     q: &Tensor,
     k: &Tensor,
@@ -220,6 +244,35 @@ impl AudioAttention {
         // a full block mask and unlocks mask-free fused kernels for each span.
         if let Some(spans) = chunk_spans_from_cu_seqlens(seq_len, cu_seqlens) {
             record_chunk_attention_sequence(spans.len(), seq_len);
+            if spans.len() > 1 && q.device().is_cuda() {
+                let max_span = spans
+                    .iter()
+                    .map(|(start, end)| end - start)
+                    .max()
+                    .unwrap_or(0);
+                if let Some(cu_seqlens_u32) = chunk_cu_seqlens_u32(seq_len, &spans) {
+                    if let Some(fused) = try_fused_varlen_self_attention(
+                        &q,
+                        &k,
+                        &v,
+                        &cu_seqlens_u32,
+                        max_span,
+                        self.head_dim,
+                        false,
+                    )? {
+                        for _ in &spans {
+                            record_chunk_attention_fused_span();
+                        }
+                        let out = fused.transpose(1, 2)?.reshape((
+                            1,
+                            seq_len,
+                            self.num_heads * self.head_dim,
+                        ))?;
+                        return self.out_proj.forward(&out).map_err(Error::from);
+                    }
+                }
+            }
+
             if spans.len() == 1 {
                 let (start, end) = spans[0];
                 let span = end - start;
@@ -599,8 +652,8 @@ fn gelu(x: &Tensor) -> Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::{
-        attention_no_mask, attention_unfused_with_mask, chunk_spans_from_cu_seqlens,
-        create_chunked_attention_mask,
+        attention_no_mask, attention_unfused_with_mask, chunk_cu_seqlens_u32,
+        chunk_spans_from_cu_seqlens, create_chunked_attention_mask,
     };
     use candle_core::{DType, Device, Tensor};
 
@@ -615,6 +668,16 @@ mod tests {
         assert!(chunk_spans_from_cu_seqlens(8, &[1, 8]).is_none());
         assert!(chunk_spans_from_cu_seqlens(8, &[0, 4, 3, 8]).is_none());
         assert!(chunk_spans_from_cu_seqlens(8, &[0, 4, 7]).is_none());
+    }
+
+    #[test]
+    fn chunk_cu_seqlens_u32_requires_contiguous_spans() {
+        let spans = vec![(0, 3), (3, 7), (7, 11)];
+        assert_eq!(chunk_cu_seqlens_u32(11, &spans), Some(vec![0, 3, 7, 11]));
+
+        assert!(chunk_cu_seqlens_u32(11, &[(0, 3), (4, 11)]).is_none());
+        assert!(chunk_cu_seqlens_u32(11, &[(0, 3), (3, 12)]).is_none());
+        assert!(chunk_cu_seqlens_u32(11, &[]).is_none());
     }
 
     #[test]
