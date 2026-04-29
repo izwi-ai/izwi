@@ -47,7 +47,7 @@ pub enum DecodeAttentionPath {
     Paged,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttentionFallbackReason {
     FlashNotRequested,
     FlashNotCompiled,
@@ -110,10 +110,8 @@ static FUSED_ATTN_FALLBACK_FLASH_DTYPE_MISMATCH_TOTAL: AtomicU64 = AtomicU64::ne
 static FUSED_ATTN_FALLBACK_FLASH_RUNTIME_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FUSED_ATTN_FALLBACK_METAL_SDPA_RUNTIME_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FUSED_ATTN_FALLBACK_METAL_SDPA_MASK_POLICY_DISABLED_TOTAL: AtomicU64 = AtomicU64::new(0);
-static FUSED_ATTN_FALLBACK_METAL_SDPA_MASK_SHAPE_UNSUPPORTED_TOTAL: AtomicU64 =
-    AtomicU64::new(0);
-static FUSED_ATTN_FALLBACK_METAL_SDPA_MASK_DTYPE_UNSUPPORTED_TOTAL: AtomicU64 =
-    AtomicU64::new(0);
+static FUSED_ATTN_FALLBACK_METAL_SDPA_MASK_SHAPE_UNSUPPORTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FUSED_ATTN_FALLBACK_METAL_SDPA_MASK_DTYPE_UNSUPPORTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FUSED_ATTN_FALLBACK_UNSUPPORTED_BACKEND_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 pub fn record_prefill_token_mode_step() {
