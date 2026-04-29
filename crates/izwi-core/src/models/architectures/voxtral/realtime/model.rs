@@ -15,6 +15,7 @@ use crate::models::architectures::voxtral::lm::VoxtralLM;
 use crate::models::shared::attention::flash::{
     flash_attention_requested, try_fused_self_attention,
 };
+use crate::models::shared::config::checkpoint_dtype_from_config_json;
 
 use super::audio::{AudioLanguageAdapter, TimeEmbedding};
 use super::config::VoxtralConfig;
@@ -46,6 +47,7 @@ impl VoxtralRealtimeModel {
             .map_err(|e| Error::ModelLoadError(format!("Failed to read config: {}", e)))?;
         let config: VoxtralConfig = serde_json::from_str(&config_str)
             .map_err(|e| Error::ModelLoadError(format!("Failed to parse config: {}", e)))?;
+        let checkpoint_dtype = checkpoint_dtype_from_config_json(&config_str);
 
         // Setup audio processing
         let audio_cfg = config.audio_config();
@@ -71,7 +73,7 @@ impl VoxtralRealtimeModel {
         };
         let tokenizer = VoxtralTokenizer::new(config.text_config().vocab_size, audio_config);
 
-        let dtype = device.select_model_dtype(ModelFamily::Voxtral, None);
+        let dtype = select_voxtral_dtype(&device, checkpoint_dtype);
 
         // Load weights - clone device to a local binding for lifetime
         let device_clone = device.clone();
@@ -799,6 +801,10 @@ fn load_weights<'a>(
     }
 }
 
+fn select_voxtral_dtype(device: &DeviceProfile, checkpoint_dtype: Option<DType>) -> DType {
+    device.select_model_dtype_with_checkpoint(ModelFamily::Voxtral, checkpoint_dtype)
+}
+
 /// GELU activation function
 fn gelu(x: &Tensor) -> Result<Tensor> {
     let coeff = 0.044715f32;
@@ -817,4 +823,27 @@ fn gelu(x: &Tensor) -> Result<Tensor> {
     let out = out.broadcast_mul(&half)?;
     out.to_dtype(dtype)
         .map_err(|e| Error::InferenceError(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_voxtral_dtype;
+    use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile};
+    use candle_core::{DType, Device};
+
+    #[test]
+    fn voxtral_dense_cuda_uses_checkpoint_dtype() {
+        let profile = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Cuda,
+            capabilities: DeviceCapabilities {
+                supports_bf16: true,
+                supports_f16: true,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+
+        assert_eq!(select_voxtral_dtype(&profile, Some(DType::F16)), DType::F16);
+    }
 }

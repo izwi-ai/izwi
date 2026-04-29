@@ -18,6 +18,7 @@ use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::shared::attention::flash::should_enable_flash_attention_v2;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
+use crate::models::shared::config::checkpoint_dtype_from_config_json;
 use crate::tokenizer::Tokenizer;
 
 #[derive(Debug, Clone)]
@@ -300,6 +301,15 @@ fn infer_embed_vocab_size_from_safetensors(
     Ok(Some(vocab_size))
 }
 
+fn select_gemma3_dense_dtype(device: &DeviceProfile, checkpoint_dtype: Option<DType>) -> DType {
+    if device.kind.is_metal() {
+        // Prefer F16 for Gemma on Metal to keep memory use in check on larger checkpoints.
+        DType::F16
+    } else {
+        device.select_model_dtype_with_checkpoint(ModelFamily::Gemma3Chat, checkpoint_dtype)
+    }
+}
+
 pub struct Gemma3ChatModel {
     variant: ModelVariant,
     device: DeviceProfile,
@@ -315,12 +325,8 @@ impl Gemma3ChatModel {
         let config_str = fs::read_to_string(config_path)?;
         let mut use_language_model_prefix = should_use_language_model_prefix(&config_str);
         let mut inferred_vocab_size: Option<usize> = None;
-        let dtype = if device.kind.is_metal() {
-            // Prefer F16 for Gemma on Metal to keep memory use in check on larger checkpoints.
-            DType::F16
-        } else {
-            device.select_model_dtype(ModelFamily::Gemma3Chat, None)
-        };
+        let checkpoint_dtype = checkpoint_dtype_from_config_json(&config_str);
+        let dtype = select_gemma3_dense_dtype(&device, checkpoint_dtype);
 
         let index_path = model_dir.join("model.safetensors.index.json");
         let vb_base = if index_path.exists() {
@@ -730,7 +736,9 @@ fn text_delta(previous: &str, current: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_unused_placeholders;
+    use super::{select_gemma3_dense_dtype, strip_unused_placeholders};
+    use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile};
+    use candle_core::{DType, Device};
 
     #[test]
     fn strip_unused_placeholders_removes_marker_tokens() {
@@ -744,5 +752,24 @@ mod tests {
         let input = "a <unused> b <unusedx12> c";
         let output = strip_unused_placeholders(input);
         assert_eq!(output, input);
+    }
+
+    #[test]
+    fn gemma3_dense_cuda_uses_checkpoint_dtype() {
+        let profile = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Cuda,
+            capabilities: DeviceCapabilities {
+                supports_bf16: true,
+                supports_f16: true,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+
+        assert_eq!(
+            select_gemma3_dense_dtype(&profile, Some(DType::F32)),
+            DType::F32
+        );
     }
 }

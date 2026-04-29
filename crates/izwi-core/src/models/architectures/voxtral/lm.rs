@@ -442,3 +442,136 @@ impl VoxtralMlp {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::shared::attention::paged::KvCacheQuantization;
+    use candle_core::D;
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        let a = a
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let b = b
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        a.iter()
+            .zip(b.iter())
+            .fold(0.0f32, |max, (left, right)| max.max((left - right).abs()))
+    }
+
+    #[test]
+    fn voxtral_gqa_cache_keeps_kv_heads_unexpanded_for_paged_decode() {
+        let device = Device::Cpu;
+        let batch_size = 1usize;
+        let num_heads = 8usize;
+        let num_kv_heads = 2usize;
+        let head_dim = 8usize;
+        let prefill_len = 3usize;
+
+        let mut cache =
+            Qwen3Cache::with_page_size_and_quantization(1, 2, KvCacheQuantization::None);
+        let k_prefill = Tensor::randn(
+            0.0f32,
+            1.0f32,
+            (batch_size, prefill_len, num_kv_heads, head_dim),
+            &device,
+        )
+        .unwrap();
+        let v_prefill = Tensor::randn(
+            0.0f32,
+            1.0f32,
+            (batch_size, prefill_len, num_kv_heads, head_dim),
+            &device,
+        )
+        .unwrap();
+        cache
+            .append(0, k_prefill.clone(), v_prefill.clone())
+            .unwrap();
+
+        let k_decode = Tensor::randn(
+            0.0f32,
+            1.0f32,
+            (batch_size, 1, num_kv_heads, head_dim),
+            &device,
+        )
+        .unwrap();
+        let v_decode = Tensor::randn(
+            0.0f32,
+            1.0f32,
+            (batch_size, 1, num_kv_heads, head_dim),
+            &device,
+        )
+        .unwrap();
+        cache.append(0, k_decode.clone(), v_decode.clone()).unwrap();
+
+        let (k_materialized, v_materialized) = cache.materialize(0).unwrap();
+        assert_eq!(
+            k_materialized.dims4().unwrap(),
+            (batch_size, prefill_len + 1, num_kv_heads, head_dim)
+        );
+        assert_eq!(
+            v_materialized.dims4().unwrap(),
+            (batch_size, prefill_len + 1, num_kv_heads, head_dim)
+        );
+
+        let q = Tensor::randn(
+            0.0f32,
+            1.0f32,
+            (batch_size, 1, num_heads, head_dim),
+            &device,
+        )
+        .unwrap();
+        let (k_pages, v_pages) = cache.pages(0).unwrap();
+        let paged = paged_decode_attention(&q, k_pages, v_pages, num_heads, num_kv_heads, head_dim)
+            .unwrap();
+
+        let total_len = prefill_len + 1;
+        let k_full = Tensor::cat(&[&k_prefill, &k_decode], 1).unwrap();
+        let v_full = Tensor::cat(&[&v_prefill, &v_decode], 1).unwrap();
+        let q_ref = q
+            .transpose(1, 2)
+            .unwrap()
+            .reshape((batch_size * num_heads, 1, head_dim))
+            .unwrap();
+        let k_ref = repeat_kv(&k_full, num_heads, num_kv_heads)
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .reshape((batch_size * num_heads, total_len, head_dim))
+            .unwrap();
+        let v_ref = repeat_kv(&v_full, num_heads, num_kv_heads)
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .reshape((batch_size * num_heads, total_len, head_dim))
+            .unwrap();
+        let scale = (head_dim as f64).sqrt();
+        let mut scores = q_ref.matmul(&k_ref.transpose(1, 2).unwrap()).unwrap();
+        let scale_t = Tensor::from_vec(vec![scale as f32], (1,), &device)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+        scores = scores.broadcast_div(&scale_t).unwrap();
+        let weights = ops::softmax(&scores, D::Minus1).unwrap();
+        let dense = weights
+            .matmul(&v_ref)
+            .unwrap()
+            .reshape((batch_size, num_heads, 1, head_dim))
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap();
+
+        let diff = max_abs_diff(&paged, &dense);
+        assert!(diff < 1e-4, "max abs diff was {}", diff);
+    }
+}
