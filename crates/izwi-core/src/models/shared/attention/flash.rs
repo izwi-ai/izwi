@@ -13,8 +13,7 @@ use crate::error::Result;
 use crate::models::shared::telemetry::{
     record_fused_attention_attempt, record_fused_attention_fallback,
     record_fused_attention_masked_attempt, record_fused_attention_masked_fallback,
-    record_fused_attention_masked_success, record_fused_attention_success,
-    AttentionFallbackReason,
+    record_fused_attention_masked_success, record_fused_attention_success, AttentionFallbackReason,
 };
 
 /// Runtime opt-in for fused attention paths.
@@ -40,6 +39,39 @@ pub fn should_enable_flash_attention_v2(device: &candle_core::Device) -> bool {
     flash_attention_requested() && device.is_cuda() && flash_attention_compiled()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CudaFlashAttentionDecision {
+    Try,
+    Skip(AttentionFallbackReason),
+}
+
+fn should_try_cuda_flash_attention(
+    requested: bool,
+    compiled: bool,
+    masked: bool,
+    q_dtype: DType,
+    k_dtype: DType,
+    v_dtype: DType,
+) -> CudaFlashAttentionDecision {
+    if !requested {
+        return CudaFlashAttentionDecision::Skip(AttentionFallbackReason::FlashNotRequested);
+    }
+    if !compiled {
+        return CudaFlashAttentionDecision::Skip(AttentionFallbackReason::FlashNotCompiled);
+    }
+    if masked {
+        return CudaFlashAttentionDecision::Skip(AttentionFallbackReason::FlashMaskUnsupported);
+    }
+    if !dtype_supported_for_flash(q_dtype) {
+        return CudaFlashAttentionDecision::Skip(AttentionFallbackReason::FlashDTypeUnsupported);
+    }
+    if q_dtype != k_dtype || k_dtype != v_dtype {
+        return CudaFlashAttentionDecision::Skip(AttentionFallbackReason::FlashDTypeMismatch);
+    }
+
+    CudaFlashAttentionDecision::Try
+}
+
 /// Try a fused self-attention kernel and return `None` when unsupported.
 ///
 /// Input/output layout: `[batch, heads, seq, head_dim]`.
@@ -59,53 +91,44 @@ pub fn try_fused_self_attention(
     }
     let mut fallback_reason = AttentionFallbackReason::UnsupportedBackend;
 
-    #[cfg(feature = "flash-attn")]
-    {
-        if should_enable_flash_attention_v2(q.device()) {
-            if mask.is_none() {
-                if dtype_supported_for_flash(q.dtype()) {
-                    if q.dtype() == k.dtype() && k.dtype() == v.dtype() {
-                        let q = q.transpose(1, 2)?.contiguous()?;
-                        let k = k.transpose(1, 2)?.contiguous()?;
-                        let v = v.transpose(1, 2)?.contiguous()?;
-                        let flash_result =
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                candle_flash_attn::flash_attn(&q, &k, &v, scale, causal)
-                            }));
-                        match flash_result {
-                            Ok(Ok(out)) => {
-                                record_fused_attention_success();
-                                if masked {
-                                    record_fused_attention_masked_success();
-                                }
-                                return Ok(Some(out.transpose(1, 2)?));
-                            }
-                            Ok(Err(_)) | Err(_) => {
-                                fallback_reason = AttentionFallbackReason::FlashRuntimeError;
-                            }
-                        }
-                    } else {
-                        fallback_reason = AttentionFallbackReason::FlashDTypeMismatch;
-                    }
-                } else {
-                    fallback_reason = AttentionFallbackReason::FlashDTypeUnsupported;
-                }
-            } else {
-                fallback_reason = AttentionFallbackReason::FlashMaskUnsupported;
-            }
-        } else if q.device().is_cuda() {
-            fallback_reason = AttentionFallbackReason::FlashNotRequested;
-        }
-    }
+    if q.device().is_cuda() {
+        let cuda_decision = should_try_cuda_flash_attention(
+            flash_attention_requested(),
+            flash_attention_compiled(),
+            masked,
+            q.dtype(),
+            k.dtype(),
+            v.dtype(),
+        );
 
-    #[cfg(not(feature = "flash-attn"))]
-    {
-        if q.device().is_cuda() {
-            fallback_reason = if flash_attention_requested() {
-                AttentionFallbackReason::FlashNotCompiled
-            } else {
-                AttentionFallbackReason::FlashNotRequested
-            };
+        match cuda_decision {
+            CudaFlashAttentionDecision::Try => {
+                #[cfg(feature = "flash-attn")]
+                {
+                    let q = q.transpose(1, 2)?.contiguous()?;
+                    let k = k.transpose(1, 2)?.contiguous()?;
+                    let v = v.transpose(1, 2)?.contiguous()?;
+                    let flash_result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            candle_flash_attn::flash_attn(&q, &k, &v, scale, causal)
+                        }));
+                    match flash_result {
+                        Ok(Ok(out)) => {
+                            record_fused_attention_success();
+                            if masked {
+                                record_fused_attention_masked_success();
+                            }
+                            return Ok(Some(out.transpose(1, 2)?));
+                        }
+                        Ok(Err(_)) | Err(_) => {
+                            fallback_reason = AttentionFallbackReason::FlashRuntimeError;
+                        }
+                    }
+                }
+            }
+            CudaFlashAttentionDecision::Skip(reason) => {
+                fallback_reason = reason;
+            }
         }
     }
 
@@ -113,7 +136,8 @@ pub fn try_fused_self_attention(
         match should_try_metal_sdpa(q, k, v, mask)? {
             MetalSdpaDecision::Try => {
                 let q_seq = q.dim(2)?;
-                let use_f16_cast = mask.is_none() && should_use_metal_sdpa_f16_cast(q.dtype(), q_seq);
+                let use_f16_cast =
+                    mask.is_none() && should_use_metal_sdpa_f16_cast(q.dtype(), q_seq);
                 let sdpa_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     if use_f16_cast {
                         run_metal_sdpa_with_f16_inputs(q, k, v, mask, causal, scale)
@@ -344,17 +368,19 @@ fn env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-#[cfg(feature = "flash-attn")]
 #[inline]
-fn dtype_supported_for_flash(dtype: candle_core::DType) -> bool {
-    matches!(dtype, candle_core::DType::F16 | candle_core::DType::BF16)
+fn dtype_supported_for_flash(dtype: DType) -> bool {
+    matches!(dtype, DType::F16 | DType::BF16)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        metal_sdpa_mask_shape_supported, metal_sdpa_shape_supported, should_use_metal_sdpa_f16_cast,
+        metal_sdpa_mask_shape_supported, metal_sdpa_shape_supported,
+        should_try_cuda_flash_attention, should_use_metal_sdpa_f16_cast,
+        CudaFlashAttentionDecision,
     };
+    use crate::models::shared::telemetry::AttentionFallbackReason;
     use candle_core::DType;
     use candle_core::{Device, Tensor};
 
@@ -388,30 +414,50 @@ mod tests {
     }
 
     #[test]
+    fn cuda_flash_attention_policy_has_explicit_fallback_reasons() {
+        assert_eq!(
+            should_try_cuda_flash_attention(false, true, false, DType::F16, DType::F16, DType::F16),
+            CudaFlashAttentionDecision::Skip(AttentionFallbackReason::FlashNotRequested)
+        );
+        assert_eq!(
+            should_try_cuda_flash_attention(true, false, false, DType::F16, DType::F16, DType::F16),
+            CudaFlashAttentionDecision::Skip(AttentionFallbackReason::FlashNotCompiled)
+        );
+        assert_eq!(
+            should_try_cuda_flash_attention(true, true, true, DType::F16, DType::F16, DType::F16),
+            CudaFlashAttentionDecision::Skip(AttentionFallbackReason::FlashMaskUnsupported)
+        );
+        assert_eq!(
+            should_try_cuda_flash_attention(true, true, false, DType::F32, DType::F32, DType::F32),
+            CudaFlashAttentionDecision::Skip(AttentionFallbackReason::FlashDTypeUnsupported)
+        );
+        assert_eq!(
+            should_try_cuda_flash_attention(true, true, false, DType::F16, DType::BF16, DType::F16),
+            CudaFlashAttentionDecision::Skip(AttentionFallbackReason::FlashDTypeMismatch)
+        );
+        assert_eq!(
+            should_try_cuda_flash_attention(true, true, false, DType::F16, DType::F16, DType::F16),
+            CudaFlashAttentionDecision::Try
+        );
+    }
+
+    #[test]
     fn metal_sdpa_mask_shape_gate_accepts_supported_broadcast_masks() {
         let device = Device::Cpu;
         let mask = Tensor::zeros((1, 1, 32, 32), DType::F32, &device).expect("mask");
-        assert!(
-            metal_sdpa_mask_shape_supported(&mask, 1, 8, 32, 32).expect("shape check")
-        );
+        assert!(metal_sdpa_mask_shape_supported(&mask, 1, 8, 32, 32).expect("shape check"));
 
         let per_head = Tensor::zeros((1, 8, 32, 64), DType::F32, &device).expect("mask");
-        assert!(
-            metal_sdpa_mask_shape_supported(&per_head, 1, 8, 32, 64).expect("shape check")
-        );
+        assert!(metal_sdpa_mask_shape_supported(&per_head, 1, 8, 32, 64).expect("shape check"));
     }
 
     #[test]
     fn metal_sdpa_mask_shape_gate_rejects_invalid_masks() {
         let device = Device::Cpu;
         let bad_rank = Tensor::zeros((32, 32), DType::F32, &device).expect("mask");
-        assert!(
-            !metal_sdpa_mask_shape_supported(&bad_rank, 1, 8, 32, 32).expect("shape check")
-        );
+        assert!(!metal_sdpa_mask_shape_supported(&bad_rank, 1, 8, 32, 32).expect("shape check"));
 
         let bad_dims = Tensor::zeros((2, 8, 32, 32), DType::F32, &device).expect("mask");
-        assert!(
-            !metal_sdpa_mask_shape_supported(&bad_dims, 1, 8, 32, 32).expect("shape check")
-        );
+        assert!(!metal_sdpa_mask_shape_supported(&bad_dims, 1, 8, 32, 32).expect("shape check"));
     }
 }
