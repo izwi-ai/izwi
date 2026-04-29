@@ -37,8 +37,28 @@ pub enum CudaKernelDecision {
     Skip(CudaKernelFallbackReason),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CudaKernelBuildMode {
+    NotCompiled,
+    RuntimeDefault,
+    ConfiguredArch(&'static str),
+}
+
 pub fn cuda_kernels_compiled() -> bool {
     cfg!(feature = "cuda")
+}
+
+pub fn configured_cuda_kernel_arch() -> Option<&'static str> {
+    option_env!("IZWI_CUDA_KERNEL_ARCH")
+}
+
+pub fn cuda_kernel_build_mode() -> CudaKernelBuildMode {
+    if !cuda_kernels_compiled() {
+        return CudaKernelBuildMode::NotCompiled;
+    }
+    configured_cuda_kernel_arch()
+        .map(CudaKernelBuildMode::ConfiguredArch)
+        .unwrap_or(CudaKernelBuildMode::RuntimeDefault)
 }
 
 pub fn cuda_kernels_available(device: &Device) -> bool {
@@ -126,7 +146,8 @@ fn record_cuda_scaffold_attempt(device: &Device) -> Result<Option<Tensor>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cuda_kernel_preflight, cuda_kernels_available, cuda_kernels_compiled, try_cuda_attention,
+        configured_cuda_kernel_arch, cuda_kernel_build_mode, cuda_kernel_preflight,
+        cuda_kernels_available, cuda_kernels_compiled, try_cuda_attention, CudaKernelBuildMode,
         CudaKernelDecision, CudaKernelKind,
     };
     use crate::models::shared::telemetry;
@@ -144,6 +165,21 @@ mod tests {
     #[test]
     fn cuda_kernel_compiled_reflects_feature_flag() {
         assert_eq!(cuda_kernels_compiled(), cfg!(feature = "cuda"));
+    }
+
+    #[test]
+    fn cuda_kernel_build_mode_reflects_compile_state() {
+        match cuda_kernel_build_mode() {
+            CudaKernelBuildMode::NotCompiled => assert!(!cuda_kernels_compiled()),
+            CudaKernelBuildMode::RuntimeDefault => {
+                assert!(cuda_kernels_compiled());
+                assert!(configured_cuda_kernel_arch().is_none());
+            }
+            CudaKernelBuildMode::ConfiguredArch(arch) => {
+                assert!(cuda_kernels_compiled());
+                assert_eq!(configured_cuda_kernel_arch(), Some(arch));
+            }
+        }
     }
 
     #[test]

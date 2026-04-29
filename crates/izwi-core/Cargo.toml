@@ -4,6 +4,7 @@ description = "Core TTS inference engine for Qwen3-TTS models on Apple Silicon"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+build = "build.rs"
 
 [dependencies]
 izwi-asr-toolkit = { path = "../izwi-asr-toolkit" }
