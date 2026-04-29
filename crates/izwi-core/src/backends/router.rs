@@ -1,6 +1,5 @@
 use crate::catalog::{
-    CudaQuantizationInfo, CudaQuantizationSupportLevel, CudaSupportInfo, CudaSupportLevel,
-    InferenceBackendHint, ModelVariant,
+    CudaQuantizationInfo, CudaSupportInfo, CudaSupportLevel, InferenceBackendHint, ModelVariant,
 };
 
 use super::capabilities::BackendCapabilities;
@@ -190,13 +189,16 @@ impl BackendRouter {
             CudaSupportLevel::NativeCuda => {}
         }
 
-        if matches!(
-            cuda_quantization.level,
-            CudaQuantizationSupportLevel::DenseDequantizedFallback
-                | CudaQuantizationSupportLevel::Unknown
-        ) {
+        if !cuda_quantization.is_allowed_for_cuda() {
             diagnostics.push(format!(
-                "CUDA quantization for {} is {}: {}",
+                "CUDA quantization for {} is not allowed by policy ({}): {}",
+                variant.dir_name(),
+                cuda_quantization.level.as_str(),
+                cuda_quantization.reason
+            ));
+        } else if cuda_quantization.uses_dense_dequantized_fallback() {
+            diagnostics.push(format!(
+                "CUDA quantization for {} uses an explicit dense dequantized fallback ({}): {}",
                 variant.dir_name(),
                 cuda_quantization.level.as_str(),
                 cuda_quantization.reason
@@ -218,7 +220,7 @@ fn append_diagnostics(mut reason: String, diagnostics: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::ModelVariant;
+    use crate::catalog::{CudaQuantizationSupportLevel, ModelVariant};
     use crate::env_test_lock;
 
     #[test]
@@ -314,7 +316,7 @@ mod tests {
             "Selected cuda backend",
         );
         let router = BackendRouter::from_context(context);
-        let plan = router.select(ModelVariant::DiarStreamingSortformer4SpkV21);
+        let plan = router.select(ModelVariant::Qwen3TtsTokenizer12Hz);
 
         assert_eq!(plan.backend, ExecutionBackend::CandleCuda);
         assert_eq!(plan.cuda_support.level, CudaSupportLevel::CpuOnly);
@@ -324,5 +326,41 @@ mod tests {
             plan.reason
         );
         assert!(!plan.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn cuda_selection_reports_dense_dequantized_quantization_fallbacks() {
+        let context = BackendContext::new(
+            BackendPreference::Cuda,
+            BackendSelectionSource::Config,
+            BackendCapabilities {
+                cpu_compiled: true,
+                metal_compiled: false,
+                cuda_compiled: true,
+            },
+            DeviceProfile {
+                device: candle_core::Device::Cpu,
+                kind: crate::backends::DeviceKind::Cuda,
+                capabilities: crate::backends::DeviceCapabilities {
+                    supports_bf16: true,
+                    supports_f16: true,
+                    ..Default::default()
+                },
+                memory_pool: None,
+            },
+            "Selected cuda backend",
+        );
+        let router = BackendRouter::from_context(context);
+        let plan = router.select(ModelVariant::Qwen3Tts12Hz06BBase4Bit);
+
+        assert_eq!(
+            plan.cuda_quantization.level,
+            CudaQuantizationSupportLevel::DenseDequantizedFallback
+        );
+        assert!(
+            plan.reason.contains("dense dequantized fallback"),
+            "reason should carry CUDA quantization diagnostics: {}",
+            plan.reason
+        );
     }
 }
