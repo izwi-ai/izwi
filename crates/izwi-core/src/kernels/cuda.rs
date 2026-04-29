@@ -105,6 +105,24 @@ pub fn try_cuda_rotary(
     record_cuda_scaffold_attempt(x.device())
 }
 
+pub fn try_cuda_rotary_pair(
+    q: &Tensor,
+    k: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    kind: CudaKernelKind,
+) -> Result<Option<(Tensor, Tensor)>> {
+    if !q.device().is_cuda() {
+        return Ok(None);
+    }
+    let q_out = try_cuda_rotary(q, cos, sin, kind)?;
+    let k_out = try_cuda_rotary(k, cos, sin, kind)?;
+    Ok(match (q_out, k_out) {
+        (Some(q_out), Some(k_out)) => Some((q_out, k_out)),
+        _ => None,
+    })
+}
+
 pub fn try_cuda_norm(
     x: &Tensor,
     _weight: &Tensor,

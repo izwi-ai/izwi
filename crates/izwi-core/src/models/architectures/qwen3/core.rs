@@ -9,6 +9,7 @@ use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::kernels::cuda::{try_cuda_binary_activation, try_cuda_rotary_pair, CudaKernelKind};
 use crate::kernels::metal::try_fused_silu_mul;
 use crate::models::shared::attention::batched::{
     batched_scaled_dot_product_attention, BatchedAttentionConfig, BatchedAttentionInput,
@@ -272,9 +273,21 @@ impl Qwen3Attention {
             )?
         };
 
+        let cos = cos_half.unsqueeze(0)?.contiguous()?;
+        let sin = sin_half.unsqueeze(0)?.contiguous()?;
+        if q.device().is_cuda() {
+            let kind = if self.use_mrope {
+                CudaKernelKind::MRope
+            } else {
+                CudaKernelKind::Rope
+            };
+            if let Some((q_out, k_out)) = try_cuda_rotary_pair(&q, &k, &cos, &sin, kind)? {
+                record_rope_kernel();
+                record_rope_kernel();
+                return Ok((q_out, k_out));
+            }
+        }
         if self.should_try_rope_kernel(q.dtype()) {
-            let cos = cos_half.unsqueeze(0)?.contiguous()?;
-            let sin = sin_half.unsqueeze(0)?.contiguous()?;
             if let Some((q_out, k_out)) = try_apply_rope_pair_thd(&q, &k, &cos, &sin)? {
                 record_rope_kernel();
                 record_rope_kernel();
@@ -463,7 +476,16 @@ impl Qwen3Mlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        let hidden = if let Some(fused) = try_fused_silu_mul(&gate, &up) {
+        let hidden = if gate.device().is_cuda() {
+            if let Some(fused) = try_cuda_binary_activation(&gate, &up, CudaKernelKind::SiluMul)? {
+                fused
+            } else if let Some(fused) = try_fused_silu_mul(&gate, &up) {
+                fused
+            } else {
+                let act = ops::silu(&gate)?;
+                act.broadcast_mul(&up)?
+            }
+        } else if let Some(fused) = try_fused_silu_mul(&gate, &up) {
             fused
         } else {
             let act = ops::silu(&gate)?;

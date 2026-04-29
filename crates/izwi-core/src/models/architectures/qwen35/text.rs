@@ -11,6 +11,7 @@ use crate::error::{Error, Result};
 use crate::kernels::buffer_pool::{
     global_buffer_pool_for_device, maybe_init_global_buffer_pool, SharedBufferPool,
 };
+use crate::kernels::cuda::{try_cuda_binary_activation, try_cuda_rotary_pair, CudaKernelKind};
 use crate::kernels::metal::{
     try_fused_gated_delta_recurrent, try_fused_gated_rms_norm, try_fused_l2_norm,
     try_tiled_deltanet_recurrence, use_block_fusion,
@@ -506,7 +507,20 @@ impl Qwen35Mlp {
         let gate_proj_out = self.gate.forward(hidden_states)?;
         let up_proj_out = self.up.forward(hidden_states)?;
 
-        let hidden = if let Some(fused) =
+        let hidden = if gate_proj_out.device().is_cuda() {
+            if let Some(fused) =
+                try_cuda_binary_activation(&gate_proj_out, &up_proj_out, CudaKernelKind::SiluMul)?
+            {
+                fused
+            } else if let Some(fused) =
+                crate::kernels::metal::try_fused_silu_mul(&gate_proj_out, &up_proj_out)
+            {
+                fused
+            } else {
+                let gate = ops::silu(&gate_proj_out)?;
+                (&gate * &up_proj_out)?
+            }
+        } else if let Some(fused) =
             crate::kernels::metal::try_fused_silu_mul(&gate_proj_out, &up_proj_out)
         {
             fused
@@ -914,6 +928,24 @@ impl Qwen35FullAttention {
 
         let query_rot = query_states.narrow(3, 0, self.rope_dim)?.contiguous()?;
         let key_rot = key_states.narrow(3, 0, self.rope_dim)?.contiguous()?;
+        if query_rot.device().is_cuda() {
+            if let Some((query_rot, key_rot)) =
+                try_cuda_rotary_pair(&query_rot, &key_rot, &cos, &sin, CudaKernelKind::MRope)?
+            {
+                record_rope_kernel();
+                if self.rope_dim == self.head_dim {
+                    return Ok((query_rot, key_rot));
+                }
+                let query_pass =
+                    query_states.narrow(3, self.rope_dim, self.head_dim - self.rope_dim)?;
+                let key_pass =
+                    key_states.narrow(3, self.rope_dim, self.head_dim - self.rope_dim)?;
+                return Ok((
+                    Tensor::cat(&[&query_rot, &query_pass], 3)?,
+                    Tensor::cat(&[&key_rot, &key_pass], 3)?,
+                ));
+            }
+        }
         let (query_rot, key_rot) = if self.should_try_rope_kernel(query_states.dtype()) {
             match try_apply_rope_thd(&query_rot, &key_rot, &cos, &sin)? {
                 Some((query_rot, key_rot)) => {
@@ -981,6 +1013,26 @@ impl Qwen35FullAttention {
 
         let query_rot = query_states.narrow(3, 0, self.rope_dim)?.contiguous()?;
         let key_rot = key_states.narrow(3, 0, self.rope_dim)?.contiguous()?;
+        if query_rot.device().is_cuda() {
+            if let Some((query_rot, key_rot)) =
+                try_cuda_rotary_pair(&query_rot, &key_rot, &cos, &sin, CudaKernelKind::MRope)?
+            {
+                for _ in 0..seq_len {
+                    record_rope_kernel();
+                }
+                if self.rope_dim == self.head_dim {
+                    return Ok((query_rot, key_rot));
+                }
+                let query_pass =
+                    query_states.narrow(3, self.rope_dim, self.head_dim - self.rope_dim)?;
+                let key_pass =
+                    key_states.narrow(3, self.rope_dim, self.head_dim - self.rope_dim)?;
+                return Ok((
+                    Tensor::cat(&[&query_rot, &query_pass], 3)?,
+                    Tensor::cat(&[&key_rot, &key_pass], 3)?,
+                ));
+            }
+        }
         let (query_rot, key_rot) = if self.should_try_rope_kernel(query_states.dtype()) {
             match try_apply_rope_thd(&query_rot, &key_rot, &cos, &sin)? {
                 Some((query_rot, key_rot)) => {
