@@ -5,23 +5,36 @@
 //!
 //! Currently supports:
 //! - Metal (Apple Silicon) kernels for Qwen3.5 DeltaNet layers
-//! - Fallback to Candle operations for other backends
+//! - CUDA kernel dispatch scaffold with Candle fallbacks
+//! - Fallback to Candle operations for unsupported backends and kernels
 
 pub mod buffer_pool;
+pub mod cuda;
 pub mod metal;
 
 use crate::error::Error;
+use candle_core::Device;
 
-/// Whether fused kernels are available for the current device.
+/// Whether any fused kernel backend is available in this build.
 pub fn fused_kernels_available() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        true // Metal kernels available on macOS
+    metal_fused_kernels_available() || cuda::fused_kernels_available()
+}
+
+/// Whether fused kernels are available for a specific device backend.
+pub fn fused_kernels_available_for_device(device: &Device) -> bool {
+    if device.is_metal() {
+        return metal_fused_kernels_available();
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        false // TODO: CUDA support
+
+    if device.is_cuda() {
+        return cuda::fused_kernels_available();
     }
+
+    false
+}
+
+fn metal_fused_kernels_available() -> bool {
+    cfg!(target_os = "macos")
 }
 
 /// Whether to use fused kernels (can be disabled via environment).
@@ -72,5 +85,23 @@ impl std::error::Error for FusedKernelError {}
 impl From<FusedKernelError> for Error {
     fn from(e: FusedKernelError) -> Self {
         Error::InferenceError(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_never_reports_fused_kernel_availability() {
+        assert!(!fused_kernels_available_for_device(&Device::Cpu));
+    }
+
+    #[test]
+    fn global_fused_kernel_availability_tracks_known_backends() {
+        assert_eq!(
+            fused_kernels_available(),
+            cfg!(target_os = "macos") || cuda::fused_kernels_available()
+        );
     }
 }
