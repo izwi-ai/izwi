@@ -84,6 +84,22 @@ impl CudaQuantizationInfo {
     pub const fn new(level: CudaQuantizationSupportLevel, reason: &'static str) -> Self {
         Self { level, reason }
     }
+
+    pub fn is_allowed_for_cuda(self) -> bool {
+        !matches!(
+            self.level,
+            CudaQuantizationSupportLevel::CpuOnly
+                | CudaQuantizationSupportLevel::Disabled
+                | CudaQuantizationSupportLevel::Unknown
+        )
+    }
+
+    pub fn uses_dense_dequantized_fallback(self) -> bool {
+        matches!(
+            self.level,
+            CudaQuantizationSupportLevel::DenseDequantizedFallback
+        )
+    }
 }
 
 impl Default for CudaQuantizationInfo {
@@ -259,5 +275,19 @@ mod tests {
                 .level,
             CudaQuantizationSupportLevel::DenseDequantizedFallback
         );
+    }
+
+    #[test]
+    fn cuda_quantization_policy_distinguishes_allowed_and_fallback_modes() {
+        let dense = ModelVariant::WhisperLargeV3Turbo.cuda_quantization();
+        assert!(dense.is_allowed_for_cuda());
+        assert!(!dense.uses_dense_dequantized_fallback());
+
+        let dequant = ModelVariant::Qwen3Tts12Hz06BBase4Bit.cuda_quantization();
+        assert!(dequant.is_allowed_for_cuda());
+        assert!(dequant.uses_dense_dequantized_fallback());
+
+        let tokenizer = ModelVariant::Qwen3TtsTokenizer12Hz.cuda_quantization();
+        assert!(!tokenizer.is_allowed_for_cuda());
     }
 }
