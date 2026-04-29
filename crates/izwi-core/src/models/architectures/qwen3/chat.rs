@@ -20,6 +20,7 @@ use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::core::{Qwen3Cache, Qwen3Config, Qwen3Model};
 use crate::models::shared::chat::{ChatMessage, ChatRole};
+use crate::models::shared::config::checkpoint_dtype_from_config_json;
 use crate::tokenizer::Tokenizer;
 
 #[derive(Debug, Clone)]
@@ -157,23 +158,13 @@ impl Qwen3ChatModel {
         let config_path = model_dir.join("config.json");
         let config_str = fs::read_to_string(config_path)?;
         let config = parse_qwen3_config(&config_str)?;
+        let checkpoint_dtype = checkpoint_dtype_from_config_json(&config_str);
 
         let tokenizer = ChatTokenizer::load(model_dir, Some(config.vocab_size))?;
         let dtype_override = std::env::var("IZWI_CHAT_DTYPE")
             .ok()
             .or_else(|| std::env::var("IZWI_QWEN_DTYPE").ok());
-        let dtype = match dtype_override.as_deref().map(str::trim) {
-            Some(raw) if !raw.is_empty() => device.select_model_dtype_checked(
-                ModelFamily::Qwen3Chat,
-                Some(raw),
-                "Qwen3 chat",
-            )?,
-            _ if device.kind.is_metal() => {
-                // Keep chat memory/latency practical on Apple Silicon.
-                DType::F16
-            }
-            _ => device.select_model_dtype(ModelFamily::Qwen3Chat, None),
-        };
+        let dtype = select_qwen3_dense_dtype(&device, dtype_override.as_deref(), checkpoint_dtype)?;
 
         let index_path = model_dir.join("model.safetensors.index.json");
         let vb = if index_path.exists() {
@@ -561,6 +552,25 @@ fn parse_qwen3_config(config_str: &str) -> Result<Qwen3Config> {
     }
 }
 
+fn select_qwen3_dense_dtype(
+    device: &DeviceProfile,
+    dtype_override: Option<&str>,
+    checkpoint_dtype: Option<DType>,
+) -> Result<DType> {
+    match dtype_override.map(str::trim) {
+        Some(raw) if !raw.is_empty() => {
+            device.select_model_dtype_checked(ModelFamily::Qwen3Chat, Some(raw), "Qwen3 chat")
+        }
+        _ if device.kind.is_metal() => {
+            // Keep chat memory/latency practical on Apple Silicon.
+            Ok(DType::F16)
+        }
+        _ => {
+            Ok(device.select_model_dtype_with_checkpoint(ModelFamily::Qwen3Chat, checkpoint_dtype))
+        }
+    }
+}
+
 fn argmax(logits: &Tensor) -> Result<u32> {
     let logits = match logits.rank() {
         1 => logits.clone(),
@@ -604,7 +614,9 @@ fn text_delta(previous: &str, current: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_think_blocks;
+    use super::{select_qwen3_dense_dtype, strip_think_blocks};
+    use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile};
+    use candle_core::{DType, Device};
 
     #[test]
     fn strip_think_blocks_handles_explicit_tags() {
@@ -616,5 +628,22 @@ mod tests {
     fn strip_think_blocks_handles_implicit_open_pattern() {
         let stripped = strip_think_blocks("reasoning only</think>\nFinal answer");
         assert_eq!(stripped, "Final answer");
+    }
+
+    #[test]
+    fn qwen3_dense_cuda_uses_checkpoint_dtype() {
+        let profile = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Cuda,
+            capabilities: DeviceCapabilities {
+                supports_bf16: true,
+                supports_f16: true,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+
+        let dtype = select_qwen3_dense_dtype(&profile, None, Some(DType::F16)).unwrap();
+        assert_eq!(dtype, DType::F16);
     }
 }

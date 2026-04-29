@@ -243,6 +243,25 @@ impl DeviceProfile {
         selection.dtype
     }
 
+    pub fn select_model_dtype_with_checkpoint(
+        &self,
+        model_family: ModelFamily,
+        checkpoint_dtype: Option<DType>,
+    ) -> DType {
+        let mut request = DTypeSelectionRequest::new(None).with_model_family(model_family);
+        if let Some(dtype) = checkpoint_dtype {
+            request = request.with_checkpoint_dtype(dtype);
+        }
+        let selection = self.resolve_dtype(request);
+
+        debug!(
+            "Selected dtype {:?} for {:?} on {:?} (checkpoint: {:?}, reason: {})",
+            selection.dtype, model_family, self.kind, checkpoint_dtype, selection.reason
+        );
+
+        selection.dtype
+    }
+
     pub fn try_select_model_dtype(
         &self,
         model_family: ModelFamily,
@@ -284,7 +303,7 @@ impl DeviceProfile {
         if let Some(raw) = request.requested {
             let raw = raw.trim();
             if !raw.is_empty() {
-                if let Some(dtype) = parse_dtype_override(raw) {
+                if let Some(dtype) = parse_dtype_name(raw) {
                     return self.resolve_requested_dtype(raw, dtype);
                 }
 
@@ -638,11 +657,15 @@ struct CudaProbe {
     device_name: Option<String>,
 }
 
-fn parse_dtype_override(raw: &str) -> Option<DType> {
-    match raw.trim().to_ascii_lowercase().as_str() {
+pub fn parse_dtype_name(raw: &str) -> Option<DType> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    let normalized = normalized
+        .strip_prefix("torch.")
+        .unwrap_or(normalized.as_str());
+    match normalized {
         "bfloat16" | "bf16" => Some(DType::BF16),
-        "float16" | "f16" | "half" => Some(DType::F16),
-        "float32" | "f32" | "fp32" => Some(DType::F32),
+        "float16" | "f16" | "fp16" | "half" => Some(DType::F16),
+        "float32" | "float" | "f32" | "fp32" => Some(DType::F32),
         _ => None,
     }
 }
@@ -843,6 +866,44 @@ mod tests {
             cuda_profile.select_model_dtype(ModelFamily::Voxtral, None),
             DType::BF16
         );
+    }
+
+    #[test]
+    fn parse_dtype_name_handles_config_aliases() {
+        assert_eq!(parse_dtype_name("torch.bfloat16"), Some(DType::BF16));
+        assert_eq!(parse_dtype_name("torch.float16"), Some(DType::F16));
+        assert_eq!(parse_dtype_name("fp16"), Some(DType::F16));
+        assert_eq!(parse_dtype_name("float"), Some(DType::F32));
+        assert_eq!(parse_dtype_name("float8"), None);
+    }
+
+    #[test]
+    fn cuda_dense_checkpoint_dtype_beats_generic_bf16_default() {
+        let cuda_profile = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Cuda,
+            capabilities: DeviceCapabilities {
+                supports_bf16: true,
+                supports_f16: true,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+
+        for family in [
+            ModelFamily::Qwen3Chat,
+            ModelFamily::Gemma3Chat,
+            ModelFamily::Voxtral,
+        ] {
+            assert_eq!(
+                cuda_profile.select_model_dtype_with_checkpoint(family, Some(DType::F16)),
+                DType::F16
+            );
+            assert_eq!(
+                cuda_profile.select_model_dtype_with_checkpoint(family, Some(DType::F32)),
+                DType::F32
+            );
+        }
     }
 
     #[test]

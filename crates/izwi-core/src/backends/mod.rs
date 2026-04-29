@@ -15,8 +15,8 @@ pub use cuda_runtime::{
     CudaRuntimeDiagnostics,
 };
 pub use device::{
-    DTypeSelection, DTypeSelectionError, DTypeSelectionPolicy, DTypeSelectionRequest,
-    DeviceCapabilities, DeviceKind, DeviceProfile, DeviceSelector,
+    parse_dtype_name, DTypeSelection, DTypeSelectionError, DTypeSelectionPolicy,
+    DTypeSelectionRequest, DeviceCapabilities, DeviceKind, DeviceProfile, DeviceSelector,
 };
 pub use model_io::{
     auto_gguf_mmap_for_backend, backend_kind_for_device, gguf_mmap_enabled,
