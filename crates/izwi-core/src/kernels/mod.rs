@@ -8,6 +8,7 @@
 //! - Fallback to Candle operations for other backends
 
 pub mod buffer_pool;
+pub mod cuda_support;
 pub mod metal;
 
 use crate::error::Error;
