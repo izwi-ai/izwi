@@ -5,14 +5,14 @@
 //! - Memory pool integration for reduced allocation overhead
 //! - Unified memory awareness for Apple Silicon
 
-use candle_core::{DType, Device};
+use candle_core::{DType, Device, DeviceLocation};
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use super::types::{BackendKind, BackendPreference};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::models::shared::memory::metal::{metal_pool_for_device, MetalMemoryPool};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +59,8 @@ pub struct DeviceCapabilities {
     pub recommended_batch_size: usize,
     /// Available memory in bytes (if detectable)
     pub available_memory_bytes: Option<usize>,
+    /// CUDA-specific capabilities, populated only for CUDA devices.
+    pub cuda: Option<CudaDeviceCapabilities>,
 }
 
 impl Default for DeviceCapabilities {
@@ -69,6 +71,50 @@ impl Default for DeviceCapabilities {
             has_unified_memory: false,
             recommended_batch_size: 1,
             available_memory_bytes: None,
+            cuda: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CudaDeviceCapabilities {
+    pub device_name: Option<String>,
+    pub compute_capability: Option<(u32, u32)>,
+    pub total_memory_bytes: Option<usize>,
+    pub supports_bf16: bool,
+    pub supports_fp16: bool,
+    pub supports_int8_tensor_cores: bool,
+}
+
+impl CudaDeviceCapabilities {
+    pub fn unknown() -> Self {
+        Self {
+            device_name: None,
+            compute_capability: None,
+            total_memory_bytes: None,
+            supports_bf16: false,
+            supports_fp16: false,
+            supports_int8_tensor_cores: false,
+        }
+    }
+
+    pub fn from_compute_capability(
+        device_name: Option<String>,
+        compute_capability: Option<(u32, u32)>,
+        total_memory_bytes: Option<usize>,
+    ) -> Self {
+        let supports_bf16 = compute_capability.is_some_and(cuda_supports_bf16);
+        let supports_fp16 = compute_capability.is_some_and(cuda_supports_fp16);
+        let supports_int8_tensor_cores =
+            compute_capability.is_some_and(cuda_supports_int8_tensor_cores);
+
+        Self {
+            device_name,
+            compute_capability,
+            total_memory_bytes,
+            supports_bf16,
+            supports_fp16,
+            supports_int8_tensor_cores,
         }
     }
 }
@@ -110,13 +156,7 @@ impl DeviceProfile {
                     debug!("Metal device: using F32 instead of BF16 for better performance");
                     DType::F32
                 }
-                DeviceKind::Cuda => {
-                    if self.capabilities.supports_bf16 {
-                        DType::BF16
-                    } else {
-                        DType::F32
-                    }
-                }
+                DeviceKind::Cuda => select_cuda_dtype(self.capabilities.cuda.as_ref(), requested),
             },
             "float16" | "f16" => match self.kind {
                 DeviceKind::Cpu => DType::F32,
@@ -125,7 +165,7 @@ impl DeviceProfile {
                     debug!("Metal device: using F32 instead of F16 for better performance");
                     DType::F32
                 }
-                _ => DType::F16,
+                DeviceKind::Cuda => select_cuda_dtype(self.capabilities.cuda.as_ref(), requested),
             },
             "float32" | "f32" => DType::F32,
             // Default selection based on device optimization
@@ -136,13 +176,7 @@ impl DeviceProfile {
                     // due to unified memory architecture and lack of Tensor Cores
                     DType::F32
                 }
-                DeviceKind::Cuda => {
-                    if self.capabilities.supports_bf16 {
-                        DType::BF16
-                    } else {
-                        DType::F32
-                    }
-                }
+                DeviceKind::Cuda => select_cuda_dtype(self.capabilities.cuda.as_ref(), requested),
             },
         };
 
@@ -152,6 +186,14 @@ impl DeviceProfile {
         );
 
         dtype
+    }
+
+    /// Select dtype while rejecting unsupported explicit CUDA overrides.
+    pub fn try_select_dtype(&self, requested: Option<&str>) -> Result<DType> {
+        if self.kind == DeviceKind::Cuda {
+            validate_cuda_dtype_request(self.capabilities.cuda.as_ref(), requested)?;
+        }
+        Ok(self.select_dtype(requested))
     }
 
     /// Get the optimal dtype for this device without any specific request
@@ -226,6 +268,7 @@ impl DeviceSelector {
                     has_unified_memory: true,     // Apple Silicon has unified memory
                     recommended_batch_size: 4,    // Conservative for unified memory
                     available_memory_bytes: None, // Could be detected via system APIs
+                    cuda: None,
                 },
                 memory_pool,
             })
@@ -239,18 +282,22 @@ impl DeviceSelector {
             .ok()?
             .ok()?;
         if device.is_cuda() {
-            // Detect CUDA capabilities
-            let supports_bf16 = Self::detect_cuda_bf16_support();
+            let gpu_id = match device.location() {
+                DeviceLocation::Cuda { gpu_id } => gpu_id,
+                _ => 0,
+            };
+            let cuda = Self::detect_cuda_capabilities(gpu_id);
 
             Some(DeviceProfile {
                 device,
                 kind: DeviceKind::Cuda,
                 capabilities: DeviceCapabilities {
                     prefers_f32: false,
-                    supports_bf16,
+                    supports_bf16: cuda.supports_bf16,
                     has_unified_memory: false,
                     recommended_batch_size: 8, // CUDA can handle larger batches
-                    available_memory_bytes: Self::detect_cuda_memory(),
+                    available_memory_bytes: cuda.total_memory_bytes,
+                    cuda: Some(cuda),
                 },
                 memory_pool: None, // CUDA uses its own memory management
             })
@@ -259,15 +306,8 @@ impl DeviceSelector {
         }
     }
 
-    fn detect_cuda_bf16_support() -> bool {
-        // BF16 support requires Compute Capability 8.0+ (Ampere)
-        // This is a simplified check - in production, query the device properties
-        true // Assume modern CUDA supports BF16
-    }
-
-    fn detect_cuda_memory() -> Option<usize> {
-        // Could use CUDA APIs to detect available memory
-        None
+    fn detect_cuda_capabilities(gpu_id: usize) -> CudaDeviceCapabilities {
+        query_cuda_capabilities(gpu_id).unwrap_or_else(CudaDeviceCapabilities::unknown)
     }
 
     pub fn detect() -> Result<DeviceProfile> {
@@ -323,6 +363,96 @@ impl DeviceSelector {
             .map(Self::detect_for_preference)
             .unwrap_or_else(Self::detect)
     }
+}
+
+fn cuda_supports_bf16((major, _minor): (u32, u32)) -> bool {
+    major >= 8
+}
+
+fn cuda_supports_fp16((major, minor): (u32, u32)) -> bool {
+    major > 5 || (major == 5 && minor >= 3)
+}
+
+fn cuda_supports_int8_tensor_cores((major, _minor): (u32, u32)) -> bool {
+    major >= 7
+}
+
+fn select_cuda_dtype(cuda: Option<&CudaDeviceCapabilities>, requested: Option<&str>) -> DType {
+    let capabilities = cuda
+        .cloned()
+        .unwrap_or_else(CudaDeviceCapabilities::unknown);
+    match requested.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "float32" | "f32" => DType::F32,
+        "float16" | "f16" if capabilities.supports_fp16 => DType::F16,
+        "float16" | "f16" => DType::F32,
+        "bfloat16" | "bf16" if capabilities.supports_bf16 => DType::BF16,
+        "bfloat16" | "bf16" if capabilities.supports_fp16 => DType::F16,
+        "bfloat16" | "bf16" => DType::F32,
+        _ if capabilities.supports_bf16 => DType::BF16,
+        _ if capabilities.supports_fp16 => DType::F16,
+        _ => DType::F32,
+    }
+}
+
+fn validate_cuda_dtype_request(
+    cuda: Option<&CudaDeviceCapabilities>,
+    requested: Option<&str>,
+) -> Result<()> {
+    let Some(raw) = requested.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(());
+    };
+    let capabilities = cuda
+        .cloned()
+        .unwrap_or_else(CudaDeviceCapabilities::unknown);
+    match raw.to_ascii_lowercase().as_str() {
+        "float32" | "f32" => Ok(()),
+        "float16" | "f16" if capabilities.supports_fp16 => Ok(()),
+        "float16" | "f16" => Err(Error::InvalidInput(
+            "CUDA device does not report FP16 support".to_string(),
+        )),
+        "bfloat16" | "bf16" if capabilities.supports_bf16 => Ok(()),
+        "bfloat16" | "bf16" => Err(Error::InvalidInput(
+            "CUDA device does not report BF16 support".to_string(),
+        )),
+        other => Err(Error::InvalidInput(format!(
+            "Unsupported CUDA dtype override: {other}"
+        ))),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn query_cuda_capabilities(gpu_id: usize) -> Option<CudaDeviceCapabilities> {
+    use candle_core::cuda_backend::cudarc::driver::{result, sys};
+
+    result::init().ok()?;
+    let device = result::device::get(gpu_id as i32).ok()?;
+    let device_name = result::device::get_name(device).ok();
+    let major = unsafe {
+        result::device::get_attribute(
+            device,
+            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+        )
+        .ok()
+    }?;
+    let minor = unsafe {
+        result::device::get_attribute(
+            device,
+            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+        )
+        .ok()
+    }?;
+    let total_memory_bytes = unsafe { result::device::total_mem(device).ok() };
+
+    Some(CudaDeviceCapabilities::from_compute_capability(
+        device_name,
+        Some((major as u32, minor as u32)),
+        total_memory_bytes,
+    ))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn query_cuda_capabilities(_gpu_id: usize) -> Option<CudaDeviceCapabilities> {
+    None
 }
 
 #[cfg(test)]
@@ -398,6 +528,11 @@ mod tests {
             kind: DeviceKind::Cuda,
             capabilities: DeviceCapabilities {
                 supports_bf16: true,
+                cuda: Some(CudaDeviceCapabilities::from_compute_capability(
+                    Some("test ampere".to_string()),
+                    Some((8, 0)),
+                    Some(16 * 1024 * 1024 * 1024),
+                )),
                 ..Default::default()
             },
             memory_pool: None,
@@ -410,6 +545,67 @@ mod tests {
         assert_eq!(cuda_profile.select_dtype(Some("f32")), DType::F32);
         assert_eq!(cuda_profile.select_dtype(Some("f16")), DType::F16);
         assert_eq!(cuda_profile.select_dtype(Some("bf16")), DType::BF16);
+    }
+
+    #[test]
+    fn test_cuda_dtype_selection_without_bf16_uses_f16() {
+        let cuda_profile = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Cuda,
+            capabilities: DeviceCapabilities {
+                supports_bf16: false,
+                cuda: Some(CudaDeviceCapabilities::from_compute_capability(
+                    Some("test turing".to_string()),
+                    Some((7, 5)),
+                    None,
+                )),
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+
+        assert_eq!(cuda_profile.select_dtype(None), DType::F16);
+        assert_eq!(cuda_profile.select_dtype(Some("bf16")), DType::F16);
+        assert!(cuda_profile.try_select_dtype(Some("bf16")).is_err());
+        assert_eq!(
+            cuda_profile.try_select_dtype(Some("f16")).unwrap(),
+            DType::F16
+        );
+    }
+
+    #[test]
+    fn test_cuda_dtype_selection_without_half_support_uses_f32() {
+        let cuda_profile = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Cuda,
+            capabilities: DeviceCapabilities {
+                supports_bf16: false,
+                cuda: Some(CudaDeviceCapabilities::from_compute_capability(
+                    Some("test old cuda".to_string()),
+                    Some((5, 2)),
+                    None,
+                )),
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+
+        assert_eq!(cuda_profile.select_dtype(None), DType::F32);
+        assert_eq!(cuda_profile.select_dtype(Some("f16")), DType::F32);
+        assert!(cuda_profile.try_select_dtype(Some("f16")).is_err());
+    }
+
+    #[test]
+    fn test_cuda_capability_flags_follow_compute_capability() {
+        let volta = CudaDeviceCapabilities::from_compute_capability(None, Some((7, 0)), Some(1024));
+        assert!(!volta.supports_bf16);
+        assert!(volta.supports_fp16);
+        assert!(volta.supports_int8_tensor_cores);
+        assert_eq!(volta.total_memory_bytes, Some(1024));
+
+        let ampere = CudaDeviceCapabilities::from_compute_capability(None, Some((8, 0)), None);
+        assert!(ampere.supports_bf16);
+        assert!(ampere.supports_fp16);
     }
 
     #[test]
