@@ -15,6 +15,7 @@ use tracing::info;
 
 use crate::backends::DeviceProfile;
 use crate::backends::{open_gguf_reader, BackendKind};
+use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::core::{Qwen3Cache, Qwen3Config, Qwen3Model};
@@ -162,12 +163,16 @@ impl Qwen3ChatModel {
             .ok()
             .or_else(|| std::env::var("IZWI_QWEN_DTYPE").ok());
         let dtype = match dtype_override.as_deref().map(str::trim) {
-            Some(raw) if !raw.is_empty() => device.select_dtype(Some(raw)),
+            Some(raw) if !raw.is_empty() => device.select_model_dtype_checked(
+                ModelFamily::Qwen3Chat,
+                Some(raw),
+                "Qwen3 chat",
+            )?,
             _ if device.kind.is_metal() => {
                 // Keep chat memory/latency practical on Apple Silicon.
                 DType::F16
             }
-            _ => device.select_dtype(None),
+            _ => device.select_model_dtype(ModelFamily::Qwen3Chat, None),
         };
 
         let index_path = model_dir.join("model.safetensors.index.json");

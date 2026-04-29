@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 
 use super::types::{BackendKind, BackendPreference};
 use crate::catalog::ModelFamily;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::models::shared::memory::metal::{metal_pool_for_device, MetalMemoryPool};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +120,26 @@ impl<'a> DTypeSelectionRequest<'a> {
             policy: DTypeSelectionPolicy::Default,
         }
     }
+
+    pub fn with_model_family(mut self, model_family: ModelFamily) -> Self {
+        self.model_family = Some(model_family);
+        self
+    }
+
+    pub fn with_checkpoint_dtype(mut self, checkpoint_dtype: DType) -> Self {
+        self.checkpoint_dtype = Some(checkpoint_dtype);
+        self
+    }
+
+    pub fn with_quantized(mut self, quantized: bool) -> Self {
+        self.quantized = quantized;
+        self
+    }
+
+    pub fn with_policy(mut self, policy: DTypeSelectionPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,6 +222,56 @@ impl DeviceProfile {
             .map(|selection| selection.dtype)
     }
 
+    pub fn select_model_dtype(&self, model_family: ModelFamily, requested: Option<&str>) -> DType {
+        let request = DTypeSelectionRequest::new(requested).with_model_family(model_family);
+        let selection = match self.try_resolve_dtype(request) {
+            Ok(selection) => selection,
+            Err(err) => {
+                warn!(
+                    "Falling back from unsupported dtype override for {:?} on {:?}: {}",
+                    model_family, self.kind, err
+                );
+                self.resolve_dtype(DTypeSelectionRequest::new(None).with_model_family(model_family))
+            }
+        };
+
+        debug!(
+            "Selected dtype {:?} for {:?} on {:?} (requested: {:?}, reason: {})",
+            selection.dtype, model_family, self.kind, requested, selection.reason
+        );
+
+        selection.dtype
+    }
+
+    pub fn try_select_model_dtype(
+        &self,
+        model_family: ModelFamily,
+        requested: Option<&str>,
+    ) -> std::result::Result<DType, DTypeSelectionError> {
+        self.try_resolve_dtype(
+            DTypeSelectionRequest::new(requested).with_model_family(model_family),
+        )
+        .map(|selection| selection.dtype)
+    }
+
+    pub fn select_model_dtype_checked(
+        &self,
+        model_family: ModelFamily,
+        requested: Option<&str>,
+        context: &str,
+    ) -> Result<DType> {
+        let requested = requested.map(str::trim).filter(|raw| !raw.is_empty());
+        if self.kind.is_cuda() && requested.is_some() {
+            return self
+                .try_select_model_dtype(model_family, requested)
+                .map_err(|err| {
+                    Error::InvalidInput(format!("Invalid CUDA {context} dtype override: {err}"))
+                });
+        }
+
+        Ok(self.select_model_dtype(model_family, requested))
+    }
+
     pub fn resolve_dtype(&self, request: DTypeSelectionRequest<'_>) -> DTypeSelection {
         self.try_resolve_dtype(request)
             .unwrap_or_else(|_| self.default_dtype_selection(request))
@@ -212,8 +282,16 @@ impl DeviceProfile {
         request: DTypeSelectionRequest<'_>,
     ) -> std::result::Result<DTypeSelection, DTypeSelectionError> {
         if let Some(raw) = request.requested {
-            if let Some(dtype) = parse_dtype_override(raw) {
-                return self.resolve_requested_dtype(raw, dtype);
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                if let Some(dtype) = parse_dtype_override(raw) {
+                    return self.resolve_requested_dtype(raw, dtype);
+                }
+
+                return Err(DTypeSelectionError {
+                    requested: raw.to_string(),
+                    reason: "expected one of f32, f16, or bf16".into(),
+                });
             }
         }
 
@@ -300,6 +378,17 @@ impl DeviceProfile {
             _ => {}
         }
 
+        if let Some(selection) = self.cuda_model_family_dtype_selection(request) {
+            return selection;
+        }
+
+        if request.checkpoint_dtype == Some(DType::F32) {
+            return DTypeSelection {
+                dtype: DType::F32,
+                reason: "checkpoint dtype is F32".into(),
+            };
+        }
+
         if request.checkpoint_dtype == Some(DType::BF16) && self.capabilities.supports_bf16 {
             return DTypeSelection {
                 dtype: DType::BF16,
@@ -331,6 +420,34 @@ impl DeviceProfile {
                     "CUDA default falls back to F32 because no half precision support was reported"
                         .into(),
             }
+        }
+    }
+
+    fn cuda_model_family_dtype_selection(
+        &self,
+        request: DTypeSelectionRequest<'_>,
+    ) -> Option<DTypeSelection> {
+        match request.model_family? {
+            ModelFamily::WhisperAsr => {
+                if self.capabilities.supports_f16 {
+                    Some(DTypeSelection {
+                        dtype: DType::F16,
+                        reason: "Whisper CUDA policy defaults to F16".into(),
+                    })
+                } else {
+                    Some(DTypeSelection {
+                        dtype: DType::F32,
+                        reason: "Whisper CUDA policy falls back to F32 without F16 support".into(),
+                    })
+                }
+            }
+            ModelFamily::KokoroTts
+            | ModelFamily::ParakeetAsr
+            | ModelFamily::SortformerDiarization => Some(DTypeSelection {
+                dtype: DType::F32,
+                reason: "model family policy keeps CUDA default in F32".into(),
+            }),
+            _ => None,
         }
     }
 
@@ -682,6 +799,135 @@ mod tests {
                 .unwrap_err()
                 .requested,
             "bf16"
+        );
+    }
+
+    #[test]
+    fn cuda_model_family_defaults_are_specific() {
+        let cuda_profile = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Cuda,
+            capabilities: DeviceCapabilities {
+                supports_bf16: true,
+                supports_f16: true,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+
+        assert_eq!(
+            cuda_profile.select_model_dtype(ModelFamily::WhisperAsr, None),
+            DType::F16
+        );
+        assert_eq!(
+            cuda_profile.select_model_dtype(ModelFamily::KokoroTts, None),
+            DType::F32
+        );
+        assert_eq!(
+            cuda_profile.select_model_dtype(ModelFamily::ParakeetAsr, None),
+            DType::F32
+        );
+        assert_eq!(
+            cuda_profile.select_model_dtype(ModelFamily::SortformerDiarization, None),
+            DType::F32
+        );
+        assert_eq!(
+            cuda_profile.select_model_dtype(ModelFamily::Qwen3Chat, None),
+            DType::BF16
+        );
+        assert_eq!(
+            cuda_profile.select_model_dtype(ModelFamily::Gemma3Chat, None),
+            DType::BF16
+        );
+        assert_eq!(
+            cuda_profile.select_model_dtype(ModelFamily::Voxtral, None),
+            DType::BF16
+        );
+    }
+
+    #[test]
+    fn cuda_quantized_checkpoint_dtype_respects_capabilities() {
+        let cuda_profile = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Cuda,
+            capabilities: DeviceCapabilities {
+                supports_bf16: false,
+                supports_f16: true,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+
+        let selection = cuda_profile.resolve_dtype(
+            DTypeSelectionRequest::new(None)
+                .with_model_family(ModelFamily::Qwen3Asr)
+                .with_checkpoint_dtype(DType::BF16)
+                .with_quantized(true),
+        );
+        assert_eq!(selection.dtype, DType::F16);
+
+        let selection = cuda_profile.resolve_dtype(
+            DTypeSelectionRequest::new(None)
+                .with_model_family(ModelFamily::Qwen3Asr)
+                .with_checkpoint_dtype(DType::F32)
+                .with_quantized(true),
+        );
+        assert_eq!(selection.dtype, DType::F32);
+    }
+
+    #[test]
+    fn cuda_checked_model_dtype_rejects_bad_overrides() {
+        let cuda_profile = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Cuda,
+            capabilities: DeviceCapabilities {
+                supports_bf16: false,
+                supports_f16: true,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+
+        let err = cuda_profile
+            .select_model_dtype_checked(ModelFamily::Qwen3Chat, Some("bf16"), "Qwen3 chat")
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid CUDA Qwen3 chat"));
+
+        let err = cuda_profile
+            .select_model_dtype_checked(ModelFamily::Qwen3Chat, Some("float8"), "Qwen3 chat")
+            .unwrap_err();
+        assert!(err.to_string().contains("expected one of"));
+    }
+
+    #[test]
+    fn non_cuda_checked_model_dtype_keeps_legacy_fallbacks() {
+        let cpu_profile = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Cpu,
+            capabilities: DeviceCapabilities::default(),
+            memory_pool: None,
+        };
+        let metal_profile = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Metal,
+            capabilities: DeviceCapabilities {
+                prefers_f32: true,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+
+        assert_eq!(
+            cpu_profile
+                .select_model_dtype_checked(ModelFamily::Qwen3Chat, Some("float8"), "Qwen3 chat")
+                .unwrap(),
+            DType::F32
+        );
+        assert_eq!(
+            metal_profile
+                .select_model_dtype_checked(ModelFamily::Qwen3Chat, Some("bf16"), "Qwen3 chat")
+                .unwrap(),
+            DType::F32
         );
     }
 

@@ -13,6 +13,7 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::backends::DeviceProfile;
+use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::shared::attention::flash::should_enable_flash_attention_v2;
@@ -318,7 +319,7 @@ impl Gemma3ChatModel {
             // Prefer F16 for Gemma on Metal to keep memory use in check on larger checkpoints.
             DType::F16
         } else {
-            device.select_dtype(None)
+            device.select_model_dtype(ModelFamily::Gemma3Chat, None)
         };
 
         let index_path = model_dir.join("model.safetensors.index.json");

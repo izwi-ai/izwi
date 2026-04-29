@@ -14,7 +14,8 @@ use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use crate::audio::{MelConfig, MelSpectrogram};
-use crate::backends::{backend_kind_for_device, DeviceKind, DeviceProfile};
+use crate::backends::{backend_kind_for_device, DTypeSelectionRequest, DeviceKind, DeviceProfile};
+use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::kernels::buffer_pool::maybe_init_global_buffer_pool;
 use crate::model::ModelVariant;
@@ -159,6 +160,11 @@ impl Qwen3AsrModel {
             .map(|name| name.to_ascii_lowercase().contains("forced_aligner"))
             .unwrap_or(false)
             || config.thinker_config.classify_num.is_some();
+        let model_family = if is_forced_aligner {
+            ModelFamily::Qwen3ForcedAligner
+        } else {
+            ModelFamily::Qwen3Asr
+        };
 
         let mut text_cfg = config.thinker_config.text_config.clone();
         let inferred_lm_head_size = if let Some(gguf_path) = gguf_path.as_ref() {
@@ -228,11 +234,11 @@ impl Qwen3AsrModel {
             .filter(|raw| !raw.is_empty())
             .map(str::to_string);
         let text_dtype = if let Some(raw) = text_dtype_override.as_deref() {
-            device.select_dtype(Some(raw))
+            device.select_model_dtype_checked(model_family, Some(raw), "Qwen ASR text")?
         } else if is_quantized {
             let requested =
                 parse_asr_dtype(config.thinker_config.dtype.as_deref()).unwrap_or(DType::BF16);
-            let selected = select_quantized_text_dtype(&device, requested);
+            let selected = select_quantized_text_dtype(&device, model_family, requested);
             debug!(
                 "Qwen speech-family quantized dtype selection: requested={:?}, selected={:?} on {:?}",
                 requested, selected, device.kind
@@ -243,13 +249,17 @@ impl Qwen3AsrModel {
             // utterances. Prefer f32 unless the user explicitly overrides it.
             DType::F32
         } else {
-            device.select_dtype(None)
+            device.select_model_dtype(model_family, None)
         };
         let audio_dtype_override = std::env::var("IZWI_QWEN_ASR_AUDIO_DTYPE").ok();
         let audio_dtype = if is_gguf {
             match audio_dtype_override.as_deref().map(str::trim) {
                 Some(raw) if !raw.is_empty() => {
-                    let requested = device.select_dtype(Some(raw));
+                    let requested = device.select_model_dtype_checked(
+                        model_family,
+                        Some(raw),
+                        "Qwen ASR audio",
+                    )?;
                     if requested != text_dtype {
                         warn!(
                             "Qwen ASR GGUF requested audio dtype {:?} differs from text dtype {:?}; loading a second GGUF VarBuilder",
@@ -262,7 +272,9 @@ impl Qwen3AsrModel {
             }
         } else {
             match audio_dtype_override.as_deref().map(str::trim) {
-                Some(raw) if !raw.is_empty() => device.select_dtype(Some(raw)),
+                Some(raw) if !raw.is_empty() => {
+                    device.select_model_dtype_checked(model_family, Some(raw), "Qwen ASR audio")?
+                }
                 _ => DType::F32,
             }
         };
@@ -1393,16 +1405,23 @@ fn resolve_safetensors_shards(model_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(vec![weights_path])
 }
 
-fn select_quantized_text_dtype(device: &DeviceProfile, requested: DType) -> DType {
+fn select_quantized_text_dtype(
+    device: &DeviceProfile,
+    model_family: ModelFamily,
+    requested: DType,
+) -> DType {
     match device.kind {
         DeviceKind::Metal => DType::F16,
         DeviceKind::Cpu => DType::F32,
         DeviceKind::Cuda => {
-            if requested == DType::BF16 && !device.capabilities.supports_bf16 {
-                DType::F16
-            } else {
-                requested
-            }
+            device
+                .resolve_dtype(
+                    DTypeSelectionRequest::new(None)
+                        .with_model_family(model_family)
+                        .with_checkpoint_dtype(requested)
+                        .with_quantized(true),
+                )
+                .dtype
         }
     }
 }
