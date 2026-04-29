@@ -1,6 +1,8 @@
 use crate::catalog::{
     CudaQuantizationInfo, CudaSupportInfo, CudaSupportLevel, InferenceBackendHint, ModelVariant,
 };
+use crate::kernels::cuda;
+use crate::models::shared::attention::flash::cuda_flash_attention_capabilities;
 
 use super::capabilities::BackendCapabilities;
 use super::device::{DeviceProfile, DeviceSelector};
@@ -172,6 +174,29 @@ impl BackendRouter {
         }
 
         let mut diagnostics = Vec::new();
+        let kernel_status = cuda::status();
+        diagnostics.push(format!(
+            "CUDA Candle kernel dispatch is {}: {}",
+            if kernel_status.available {
+                "available"
+            } else {
+                "unavailable"
+            },
+            kernel_status.reason
+        ));
+
+        let flash = cuda_flash_attention_capabilities();
+        diagnostics.push(format!(
+            "CUDA FlashAttention compiled={}, max_head_dim={}, alignment={}, windowed={}, alibi={}, softcap={}, varlen={}",
+            flash.compiled,
+            flash.max_head_dim,
+            flash.head_dim_multiple,
+            flash.supports_windowed,
+            flash.supports_alibi,
+            flash.supports_softcap,
+            flash.supports_varlen
+        ));
+
         match cuda_support.level {
             CudaSupportLevel::CpuOnly | CudaSupportLevel::Disabled | CudaSupportLevel::Unknown => {
                 diagnostics.push(format!(
@@ -326,6 +351,20 @@ mod tests {
             plan.reason
         );
         assert!(!plan.diagnostics.is_empty());
+        assert!(
+            plan.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("CUDA Candle kernel dispatch")),
+            "CUDA diagnostics should include Candle kernel dispatch status: {:?}",
+            plan.diagnostics
+        );
+        assert!(
+            plan.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("CUDA FlashAttention")),
+            "CUDA diagnostics should include FlashAttention capability status: {:?}",
+            plan.diagnostics
+        );
     }
 
     #[test]

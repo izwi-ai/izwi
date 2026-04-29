@@ -127,7 +127,7 @@ impl ModelVariant {
             ),
             ModelFamily::SortformerDiarization => CudaSupportInfo::new(
                 CudaSupportLevel::CandleCudaGeneric,
-                "Sortformer keeps preprocessing/postprocessing on CPU but loads inference tensors on CUDA when selected",
+                "Sortformer uses Candle CUDA tensor kernels for inference when selected; preprocessing/postprocessing remain host-side orchestration",
             ),
             ModelFamily::Qwen3Tts
             | ModelFamily::KokoroTts
@@ -142,7 +142,7 @@ impl ModelVariant {
             | ModelFamily::Qwen3ForcedAligner
             | ModelFamily::Voxtral => CudaSupportInfo::new(
                 CudaSupportLevel::CandleCudaGeneric,
-                "model can be loaded on a CUDA Candle device but still needs CUDA-specific validation",
+                "model uses Candle CUDA tensor kernels, with CUDA-only Candle FlashAttention fast paths when shape and dtype support them",
             ),
         }
     }
@@ -244,6 +244,28 @@ mod tests {
                 variant.cuda_support_level(),
                 CudaSupportLevel::Unknown,
                 "{variant} should have an explicit CUDA support level"
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_inference_families_report_candle_cuda_kernel_coverage() {
+        for variant in ModelVariant::all()
+            .iter()
+            .copied()
+            .filter(ModelVariant::is_enabled)
+            .filter(|variant| variant.family() != ModelFamily::Tokenizer)
+        {
+            let info = variant.cuda_support();
+            assert_eq!(
+                info.level,
+                CudaSupportLevel::CandleCudaGeneric,
+                "{variant} should use the Candle CUDA support class"
+            );
+            assert!(
+                info.reason.contains("Candle CUDA"),
+                "{variant} CUDA reason should name Candle CUDA coverage: {}",
+                info.reason
             );
         }
     }
