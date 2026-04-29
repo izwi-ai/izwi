@@ -12,6 +12,7 @@ use candle_nn::{
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
 
+use crate::backends::{DeviceKind, DeviceProfile};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::shared::weights::mlx;
@@ -170,7 +171,11 @@ pub struct SortformerDiarizerModel {
 }
 
 impl SortformerDiarizerModel {
-    pub fn load(model_dir: &Path, variant: ModelVariant) -> Result<Self> {
+    pub fn load(
+        model_dir: &Path,
+        variant: ModelVariant,
+        device_profile: DeviceProfile,
+    ) -> Result<Self> {
         if !variant.is_diarization() {
             return Err(Error::InvalidInput(format!(
                 "Variant {} is not a Sortformer diarization model",
@@ -220,7 +225,7 @@ impl SortformerDiarizerModel {
             )));
         }
 
-        let device = Device::Cpu;
+        let device = sortformer_model_device(&device_profile);
         let vb =
             VarBuilder::from_pth(&artifacts.checkpoint_path, DType::F32, &device).map_err(|e| {
                 Error::ModelLoadError(format!(
@@ -252,6 +257,7 @@ impl SortformerDiarizerModel {
             streaming_mode,
             config.encoder.clone(),
             modules_cfg.clone(),
+            device.clone(),
         )?;
 
         Ok(Self {
@@ -512,6 +518,18 @@ impl SortformerDiarizerModel {
     }
 }
 
+fn sortformer_model_device(device_profile: &DeviceProfile) -> Device {
+    if sortformer_uses_selected_model_device(device_profile.kind) {
+        device_profile.device.clone()
+    } else {
+        Device::Cpu
+    }
+}
+
+fn sortformer_uses_selected_model_device(kind: DeviceKind) -> bool {
+    kind.is_cuda()
+}
+
 #[derive(Debug, Clone)]
 struct RawSegment {
     speaker_idx: usize,
@@ -540,6 +558,7 @@ struct PostProcessingParams {
 }
 
 struct SortformerInferenceModel {
+    device: Device,
     preprocessor: SortformerPreprocessor,
     encoder: SortformerConformerEncoder,
     encoder_proj: Linear,
@@ -556,6 +575,7 @@ impl SortformerInferenceModel {
         streaming_mode: bool,
         encoder_cfg: Option<SortformerEncoderConfig>,
         modules_cfg: SortformerModulesConfig,
+        device: Device,
     ) -> Result<Self> {
         let preprocessor = SortformerPreprocessor::load(vb, preprocessor_cfg)?;
         let encoder = SortformerConformerEncoder::load(
@@ -583,6 +603,7 @@ impl SortformerInferenceModel {
         };
 
         Ok(Self {
+            device,
             preprocessor,
             encoder,
             encoder_proj,
@@ -620,7 +641,9 @@ impl SortformerInferenceModel {
         if feature_frames == 0 {
             return Ok((Vec::new(), self.encoder.frame_stride_samples()));
         }
-        let features = features.narrow(2, 0, feature_frames)?;
+        let features = features
+            .narrow(2, 0, feature_frames)?
+            .to_device(&self.device)?;
 
         let out = if let Some(streaming_cfg) = self.streaming {
             self.infer_speaker_probabilities_streaming(&features, feature_frames, streaming_cfg)?
@@ -2634,6 +2657,7 @@ fn normalize_all_features(mel: &mut [f32], n_mels: usize, frames: usize, valid_f
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::DeviceKind;
     use crate::runtime::audio_io::decode_audio_bytes;
     use std::path::PathBuf;
 
@@ -2655,6 +2679,13 @@ mod tests {
             weak_boost_rate: 1.5,
             min_pos_scores_rate: 0.5,
         }
+    }
+
+    #[test]
+    fn sortformer_only_uses_selected_model_device_for_cuda() {
+        assert!(!sortformer_uses_selected_model_device(DeviceKind::Cpu));
+        assert!(!sortformer_uses_selected_model_device(DeviceKind::Metal));
+        assert!(sortformer_uses_selected_model_device(DeviceKind::Cuda));
     }
 
     #[test]
@@ -3028,9 +3059,12 @@ mod tests {
         let audio_bytes = std::fs::read(&audio_path).expect("sample audio should exist");
         let (samples, sample_rate) = decode_audio_bytes(&audio_bytes).expect("audio should decode");
 
-        let model =
-            SortformerDiarizerModel::load(&model_dir, ModelVariant::DiarStreamingSortformer4SpkV21)
-                .expect("sortformer checkpoint should load");
+        let model = SortformerDiarizerModel::load(
+            &model_dir,
+            ModelVariant::DiarStreamingSortformer4SpkV21,
+            DeviceProfile::cpu(),
+        )
+        .expect("sortformer checkpoint should load");
         let diarization = model
             .diarize(&samples, sample_rate, &DiarizationConfig::default())
             .expect("sortformer diarization should run");

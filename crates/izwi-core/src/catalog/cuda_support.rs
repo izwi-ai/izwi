@@ -110,8 +110,8 @@ impl ModelVariant {
                 "tokenizer-only artifact does not run an inference backend",
             ),
             ModelFamily::SortformerDiarization => CudaSupportInfo::new(
-                CudaSupportLevel::CpuOnly,
-                "Sortformer currently hardcodes CPU tensors in its loader",
+                CudaSupportLevel::CandleCudaGeneric,
+                "Sortformer keeps preprocessing/postprocessing on CPU but loads inference tensors on CUDA when selected",
             ),
             ModelFamily::Qwen3Tts
             | ModelFamily::KokoroTts
@@ -149,8 +149,8 @@ impl ModelVariant {
                 "tokenizer-only artifact does not run quantized CUDA inference",
             ),
             ModelFamily::SortformerDiarization => CudaQuantizationInfo::new(
-                CudaQuantizationSupportLevel::CpuOnly,
-                "Sortformer is currently a CPU-only CUDA support entry",
+                CudaQuantizationSupportLevel::Dense,
+                "Sortformer checkpoint is dense F32 when loaded on CUDA",
             ),
             _ if self.is_qwen_chat_gguf()
                 || self.is_qwen35_chat_gguf()
@@ -211,10 +211,6 @@ mod tests {
 
     #[test]
     fn known_cpu_only_families_are_explicit() {
-        assert_eq!(
-            ModelVariant::DiarStreamingSortformer4SpkV21.cuda_support_level(),
-            CudaSupportLevel::CpuOnly
-        );
         assert_eq!(
             ModelVariant::Qwen3TtsTokenizer12Hz.cuda_support_level(),
             CudaSupportLevel::CpuOnly
