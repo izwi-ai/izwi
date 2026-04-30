@@ -15,7 +15,9 @@ use std::time::Instant;
 
 use candle_core::{DType, IndexOp, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::whisper::{self, Config as WhisperConfig};
+use candle_transformers::models::whisper::{
+    self, model::Whisper as CandleWhisper, Config as WhisperConfig,
+};
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use rand::Rng;
@@ -29,7 +31,7 @@ use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::tokenizer::Tokenizer;
 
-use super::model::Whisper;
+use super::model::Whisper as CudaWhisper;
 
 const SAMPLE_RATE: u32 = whisper::SAMPLE_RATE as u32;
 const DEFAULT_MAX_NEW_TOKENS: usize = 448;
@@ -169,10 +171,78 @@ struct WhisperLanguageResolution {
     strategy: &'static str,
 }
 
+enum WhisperModel {
+    Upstream(CandleWhisper),
+    Cuda(CudaWhisper),
+}
+
+impl WhisperModel {
+    fn load(vb: &VarBuilder, config: WhisperConfig, use_cuda_dtype_shim: bool) -> Result<Self> {
+        if use_cuda_dtype_shim {
+            CudaWhisper::load(vb, config)
+                .map(Self::Cuda)
+                .map_err(Error::from)
+        } else {
+            CandleWhisper::load(vb, config)
+                .map(Self::Upstream)
+                .map_err(Error::from)
+        }
+    }
+
+    fn reset_kv_cache(&mut self) {
+        match self {
+            Self::Upstream(model) => model.reset_kv_cache(),
+            Self::Cuda(model) => model.reset_kv_cache(),
+        }
+    }
+
+    fn encoder_forward(&mut self, x: &Tensor, flush_kv_cache: bool) -> Result<Tensor> {
+        match self {
+            Self::Upstream(model) => model
+                .encoder
+                .forward(x, flush_kv_cache)
+                .map_err(Error::from),
+            Self::Cuda(model) => model
+                .encoder
+                .forward(x, flush_kv_cache)
+                .map_err(Error::from),
+        }
+    }
+
+    fn decoder_forward(
+        &mut self,
+        x: &Tensor,
+        audio_features: &Tensor,
+        flush_kv_cache: bool,
+    ) -> Result<Tensor> {
+        match self {
+            Self::Upstream(model) => model
+                .decoder
+                .forward(x, audio_features, flush_kv_cache)
+                .map_err(Error::from),
+            Self::Cuda(model) => model
+                .decoder
+                .forward(x, audio_features, flush_kv_cache)
+                .map_err(Error::from),
+        }
+    }
+
+    fn decoder_final_linear(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Upstream(model) => model.decoder.final_linear(x).map_err(Error::from),
+            Self::Cuda(model) => model.decoder.final_linear(x).map_err(Error::from),
+        }
+    }
+}
+
+fn use_cuda_whisper_dtype_shim(device: &candle_core::Device) -> bool {
+    device.is_cuda()
+}
+
 pub struct WhisperTurboAsrModel {
     device: DeviceProfile,
     model_dtype: DType,
-    whisper: Mutex<Whisper>,
+    whisper: Mutex<WhisperModel>,
     config: WhisperConfig,
     generation: WhisperGenerationConfig,
     tokenizer: Tokenizer,
@@ -240,7 +310,8 @@ impl WhisperTurboAsrModel {
             }
         };
 
-        let whisper = Whisper::load(&vb, config.clone())?;
+        let use_cuda_dtype_shim = use_cuda_whisper_dtype_shim(&device.device);
+        let whisper = WhisperModel::load(&vb, config.clone(), use_cuda_dtype_shim)?;
         let special = resolve_special_tokens(&tokenizer, &generation)?;
         let (language_token_ids, token_id_to_language_code) =
             build_language_token_maps(&tokenizer, &generation);
@@ -261,8 +332,8 @@ impl WhisperTurboAsrModel {
         })?;
 
         info!(
-            "Loaded Whisper Large v3 Turbo ASR on {:?} (dtype={:?})",
-            device.kind, model_dtype
+            "Loaded Whisper Large v3 Turbo ASR on {:?} (dtype={:?}, cuda_dtype_shim={})",
+            device.kind, model_dtype, use_cuda_dtype_shim
         );
 
         Ok(Self {
@@ -341,7 +412,7 @@ impl WhisperTurboAsrModel {
 
         whisper.reset_kv_cache();
         let encoder_started = Instant::now();
-        let audio_features = whisper.encoder.forward(&mel, true)?;
+        let audio_features = whisper.encoder_forward(&mel, true)?;
         let encoder_forward_ms = encoder_started.elapsed().as_secs_f64() * 1000.0;
 
         let language_resolution =
@@ -516,7 +587,7 @@ impl WhisperTurboAsrModel {
             .map_err(|_| Error::InferenceError("Whisper model mutex poisoned".to_string()))?;
 
         whisper.reset_kv_cache();
-        let audio_features = whisper.encoder.forward(&mel, true)?;
+        let audio_features = whisper.encoder_forward(&mel, true)?;
 
         let language_resolution =
             self.resolve_request_language(&mut whisper, &audio_features, language)?;
@@ -691,7 +762,7 @@ impl WhisperTurboAsrModel {
 
     fn detect_language_token(
         &self,
-        whisper: &mut Whisper,
+        whisper: &mut WhisperModel,
         audio_features: &Tensor,
     ) -> Result<Option<(u32, String)>> {
         if self.language_token_ids.is_empty() {
@@ -699,8 +770,8 @@ impl WhisperTurboAsrModel {
         }
 
         let tokens = Tensor::new(&[[self.special.sot]], &self.device.device)?;
-        let ys = whisper.decoder.forward(&tokens, audio_features, true)?;
-        let logits = whisper.decoder.final_linear(&ys.i(..1)?)?.i(0)?.i(0)?;
+        let ys = whisper.decoder_forward(&tokens, audio_features, true)?;
+        let logits = whisper.decoder_final_linear(&ys.i(..1)?)?.i(0)?.i(0)?;
         let logits_vec = logits.to_vec1::<f32>()?;
 
         let mut best_token: Option<u32> = None;
@@ -765,7 +836,7 @@ impl WhisperTurboAsrModel {
 
     fn resolve_request_language(
         &self,
-        whisper: &mut Whisper,
+        whisper: &mut WhisperModel,
         audio_features: &Tensor,
         language: Option<&str>,
     ) -> Result<WhisperLanguageResolution> {
@@ -965,7 +1036,7 @@ fn trimmed_audio_bounds(
 impl WhisperTurboAsrModel {
     fn decode_attempt(
         &self,
-        whisper: &mut Whisper,
+        whisper: &mut WhisperModel,
         audio_features: &Tensor,
         prompt_prefix: &[u32],
         max_steps: usize,
@@ -983,13 +1054,10 @@ impl WhisperTurboAsrModel {
 
         for step_idx in 0..max_steps {
             let tokens_t = Tensor::new(prompt.as_slice(), &self.device.device)?.unsqueeze(0)?;
-            let ys = whisper
-                .decoder
-                .forward(&tokens_t, audio_features, step_idx == 0)?;
+            let ys = whisper.decoder_forward(&tokens_t, audio_features, step_idx == 0)?;
             let (_, seq_len, _) = ys.dims3()?;
             let logits = whisper
-                .decoder
-                .final_linear(&ys.i((..1, seq_len - 1..))?)?
+                .decoder_final_linear(&ys.i((..1, seq_len - 1..))?)?
                 .i(0)?
                 .i(0)?;
 
@@ -1079,7 +1147,7 @@ impl WhisperTurboAsrModel {
 
     fn decode_attempt_streaming(
         &self,
-        whisper: &mut Whisper,
+        whisper: &mut WhisperModel,
         audio_features: &Tensor,
         prompt_prefix: &[u32],
         max_steps: usize,
@@ -1100,13 +1168,10 @@ impl WhisperTurboAsrModel {
 
         for step_idx in 0..max_steps {
             let tokens_t = Tensor::new(prompt.as_slice(), &self.device.device)?.unsqueeze(0)?;
-            let ys = whisper
-                .decoder
-                .forward(&tokens_t, audio_features, step_idx == 0)?;
+            let ys = whisper.decoder_forward(&tokens_t, audio_features, step_idx == 0)?;
             let (_, seq_len, _) = ys.dims3()?;
             let logits = whisper
-                .decoder
-                .final_linear(&ys.i((..1, seq_len - 1..))?)?
+                .decoder_final_linear(&ys.i((..1, seq_len - 1..))?)?
                 .i(0)?
                 .i(0)?;
 
@@ -1679,7 +1744,13 @@ mod tests {
         adaptive_decode_budget, capped_decode_temperatures, decode_step_budget,
         find_suffix_token_repetition, has_low_word_diversity, logits_to_log_probs,
         logits_to_log_probs_in_place, text_delta, trimmed_audio_bounds,
+        use_cuda_whisper_dtype_shim,
     };
+
+    #[test]
+    fn whisper_dtype_shim_is_cuda_only() {
+        assert!(!use_cuda_whisper_dtype_shim(&candle_core::Device::Cpu));
+    }
 
     #[test]
     fn decode_step_budget_clamps_generation_to_remaining_context() {
