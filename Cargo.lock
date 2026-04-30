@@ -3436,6 +3436,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "izwi-hooks"
+version = "0.1.0-beta-13"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "izwi-server"
 version = "0.1.0-beta-13"
 dependencies = [
