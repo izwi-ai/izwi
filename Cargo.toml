@@ -4,6 +4,7 @@ members = [
     "crates/izwi-asr-toolkit",
     "crates/izwi-agent",
     "crates/izwi-core",
+    "crates/izwi-hooks",
     "crates/izwi-server",
     "crates/izwi-cli",
     "crates/izwi-desktop",
@@ -22,6 +23,7 @@ tokio = { version = "1.43", features = ["full"] }
 tokio-stream = "0.1"
 futures = "0.3"
 async-stream = "0.3"
+async-trait = "0.1"
 
 # Web framework
 axum = { version = "0.8.9", features = ["ws", "multipart"] }
