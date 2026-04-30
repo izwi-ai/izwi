@@ -11,6 +11,7 @@ use crate::voice_observation_store::VoiceObservationStore;
 use crate::voice_store::VoiceStore;
 use izwi_agent::planner::PlanningMode;
 use izwi_core::{RuntimeService, ServeRuntimeConfig};
+use izwi_hooks::EnterpriseHooks;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -145,6 +146,8 @@ impl ServerLifecycle {
 pub struct AppState {
     /// Runtime service reference - using Arc for cheap clones
     pub runtime: Arc<RuntimeService>,
+    /// Enterprise integration hooks. Community builds use no-op hooks.
+    pub enterprise_hooks: EnterpriseHooks,
     /// Server lifecycle state used by readiness and liveness probes.
     pub lifecycle: ServerLifecycle,
     /// Concurrency limiter to prevent resource exhaustion
@@ -180,7 +183,16 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[allow(dead_code)]
     pub fn new(runtime: RuntimeService, serve_config: &ServeRuntimeConfig) -> anyhow::Result<Self> {
+        Self::with_enterprise_hooks(runtime, serve_config, EnterpriseHooks::noop())
+    }
+
+    pub fn with_enterprise_hooks(
+        runtime: RuntimeService,
+        serve_config: &ServeRuntimeConfig,
+        enterprise_hooks: EnterpriseHooks,
+    ) -> anyhow::Result<Self> {
         let (max_concurrent_requests, request_timeout_secs) = request_limits(serve_config);
         let response_store_limit = store_limit_from_env(
             "IZWI_MAX_RESPONSE_STORE_ENTRIES",
@@ -203,6 +215,7 @@ impl AppState {
 
         Ok(Self {
             runtime: Arc::new(runtime),
+            enterprise_hooks,
             lifecycle: ServerLifecycle::new(),
             request_semaphore: Arc::new(Semaphore::new(max_concurrent_requests)),
             request_timeout_secs,
