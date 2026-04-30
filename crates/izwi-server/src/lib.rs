@@ -91,7 +91,7 @@ pub async fn run_from_cli(enterprise_hooks: EnterpriseHooks) -> anyhow::Result<(
     run_with_args(args, enterprise_hooks).await
 }
 
-async fn run_with_args(args: ServerArgs, _enterprise_hooks: EnterpriseHooks) -> anyhow::Result<()> {
+async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> anyhow::Result<()> {
     maybe_delegate_to_private_cuda_runtime(&args)?;
 
     logging::init_tracing(args.log_format);
@@ -109,7 +109,7 @@ async fn run_with_args(args: ServerArgs, _enterprise_hooks: EnterpriseHooks) -> 
 
     // Create runtime service
     let runtime = RuntimeService::new(config)?;
-    let state = AppState::new(runtime, &serve_config)?;
+    let state = AppState::with_enterprise_hooks(runtime, &serve_config, enterprise_hooks)?;
     let mut startup_warnings = preload_configured_models(&state).await;
     startup_warnings.extend(warmup_preloaded_asr_models(&state).await);
     if !startup_warnings.is_empty() {

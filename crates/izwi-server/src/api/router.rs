@@ -14,7 +14,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing::{field, info, info_span, warn, Span};
 
-use crate::api::request_context::attach_request_context;
+use crate::api::request_context::attach_enterprise_request_context;
 use crate::logging::{SERVICE_NAME, SERVICE_VERSION};
 use crate::state::AppState;
 
@@ -30,6 +30,7 @@ async fn api_not_found() -> StatusCode {
 
 /// Create the main API router.
 pub fn create_router(state: AppState, serve_config: &ServeRuntimeConfig) -> Router {
+    let middleware_state = state.clone();
     let trace_layer = TraceLayer::new_for_http()
         .make_span_with(|request: &Request| {
             let request_id = request
@@ -110,7 +111,10 @@ pub fn create_router(state: AppState, serve_config: &ServeRuntimeConfig) -> Rout
 
     apply_runtime_contract(app, serve_config)
         .layer(trace_layer)
-        .layer(middleware::from_fn(attach_request_context))
+        .layer(middleware::from_fn_with_state(
+            middleware_state,
+            attach_enterprise_request_context,
+        ))
 }
 
 fn apply_runtime_contract(mut app: Router, serve_config: &ServeRuntimeConfig) -> Router {
@@ -170,6 +174,7 @@ mod tests {
     use super::*;
     use crate::state::AppState;
     use crate::test_support::env_lock;
+    use async_trait::async_trait;
     use axum::{
         body::Body,
         http::{header, Method, Request, StatusCode},
@@ -177,7 +182,11 @@ mod tests {
         routing::get,
     };
     use izwi_core::RuntimeService;
+    use izwi_hooks::{
+        AuthorizationDecision, AuthorizationRequest, EnterpriseHooks, HookResult, PolicyEngine,
+    };
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tower::Service;
 
@@ -1413,6 +1422,25 @@ mod tests {
         drop(temp_dir);
     }
 
+    #[tokio::test]
+    async fn enterprise_policy_can_deny_requests_at_http_boundary() {
+        let mut hooks = EnterpriseHooks::noop();
+        hooks.policy = Arc::new(DenyAllPolicy);
+
+        let (state, temp_dir) = test_state_with_hooks("enterprise_policy_denied", false, hooks);
+        state.lifecycle.mark_ready();
+        let serve_config = ServeRuntimeConfig {
+            backend: izwi_core::backends::BackendPreference::Cpu,
+            ui_enabled: false,
+            ..ServeRuntimeConfig::default()
+        };
+        let app = create_router(state, &serve_config);
+
+        assert_route_status(app, Method::GET, "/livez", None, StatusCode::FORBIDDEN).await;
+
+        drop(temp_dir);
+    }
+
     async fn send_request(mut app: Router, request: Request<Body>) -> Response {
         app.as_service::<Body>()
             .call(request)
@@ -1480,6 +1508,14 @@ mod tests {
     }
 
     fn test_state(name: &str, ui_enabled: bool) -> (AppState, TempDirGuard) {
+        test_state_with_hooks(name, ui_enabled, EnterpriseHooks::noop())
+    }
+
+    fn test_state_with_hooks(
+        name: &str,
+        ui_enabled: bool,
+        enterprise_hooks: EnterpriseHooks,
+    ) -> (AppState, TempDirGuard) {
         let temp_dir = test_ui_dir(name);
         let ui_dir = temp_dir.join("ui");
         let models_dir = temp_dir.join("models");
@@ -1507,7 +1543,8 @@ mod tests {
         let runtime =
             with_suppressed_panic_hook(|| RuntimeService::new(serve_config.engine_config()))
                 .expect("runtime should initialize");
-        let state = AppState::new(runtime, &serve_config).expect("app state should initialize");
+        let state = AppState::with_enterprise_hooks(runtime, &serve_config, enterprise_hooks)
+            .expect("app state should initialize");
 
         std::env::remove_var("IZWI_DB_PATH");
         std::env::remove_var("IZWI_MEDIA_DIR");
@@ -1528,6 +1565,18 @@ mod tests {
     impl Drop for TempDirGuard {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct DenyAllPolicy;
+
+    #[async_trait]
+    impl PolicyEngine for DenyAllPolicy {
+        async fn authorize(
+            &self,
+            _request: &AuthorizationRequest,
+        ) -> HookResult<AuthorizationDecision> {
+            Ok(AuthorizationDecision::deny("blocked by test policy"))
         }
     }
 }
