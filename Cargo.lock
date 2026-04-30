@@ -3464,6 +3464,7 @@ dependencies = [
  "hound",
  "izwi-agent",
  "izwi-core",
+ "izwi-hooks",
  "rusqlite",
  "scalar_api_reference",
  "serde",
