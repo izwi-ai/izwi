@@ -20,7 +20,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # CUDA 12.4.1 is available in NVIDIA's Ubuntu 22.04 apt repo; ubuntu-latest
+          # currently resolves to 24.04, where the 12.4 apt meta-package is absent.
+          - os: ubuntu-22.04
             asset_suffix: linux-x86_64
             bundle_kind: deb
             bundle_ext: deb
