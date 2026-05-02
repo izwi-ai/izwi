@@ -181,7 +181,7 @@ pub enum ExecutionBackend {
 
 Selection logic: `ModelVariant` → `InferenceBackendHint` → device availability check → `ExecutionBackend`.
 
-CUDA is an active backend in the runtime. Linux and Windows release artifacts keep CPU-safe public entrypoints and package private CUDA runtime binaries for NVIDIA hosts; source builds and the CUDA Docker target remain important development and validation paths.
+CUDA is an active backend in the runtime. Linux and Windows native release artifacts are CPU-only; source builds and the Docker `production-cuda` target remain the CUDA development, validation, and shipping paths.
 
 ### 4.4 Model Families (`families/`)
 

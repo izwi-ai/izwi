@@ -52,7 +52,7 @@ git push origin v0.1.0-alpha-1
    - Open GitHub Actions and confirm the `Release` workflow runs for tag `v0.1.0-alpha-1`.
    - Confirm the `Backend Truth` workflow is green on the branch or merge commit that produced the tag.
    - Open the GitHub Releases page and confirm all assets are attached.
-   - Confirm the generated release body includes the runtime support note describing current CPU / Metal / CUDA artifact scope.
+   - Confirm the release body includes the runtime support note describing the CPU-only native artifacts and Docker/source CUDA paths.
 
 ## What the release workflow builds
 
@@ -62,7 +62,6 @@ For each OS runner, the workflow builds:
    - `izwi` (CLI)
    - `izwi-server`
    - `izwi-desktop` (desktop shell binary used by `izwi serve --mode desktop`)
-   - `runtime` on Linux and Windows
 2. Desktop installer bundle:
    - Linux: `.deb`
    - Windows: `NSIS .exe`
@@ -73,27 +72,25 @@ For each OS runner, the workflow builds:
 GitHub Releases currently publish:
 
 1. macOS assets as the Metal-capable path for Apple Silicon hosts.
-2. Linux and Windows assets as unified CPU/CUDA release artifacts with CPU-safe public entrypoints.
+2. Linux and Windows assets as CPU-only native artifacts with CPU-safe public entrypoints.
 
 Linux and Windows public binary names must remain unchanged:
 
 1. `izwi` / `izwi-server` on Linux
 2. `izwi.exe` / `izwi-server.exe` on Windows
 
-CUDA-capable binaries are private package resources under `runtime/cuda`. They are built from the same crates with CUDA features enabled and are selected only after the public runtime verifies that the packaged CUDA runtime libraries and host NVIDIA driver are available.
+Linux and Windows native release artifacts must not contain `runtime/cuda`, CUDA shared libraries, or CUDA DLLs. The supported NVIDIA paths are:
 
-CUDA release packaging is preview until a NVIDIA-host runtime smoke test is automated. The supported NVIDIA paths are:
-
-1. Linux and Windows release installers/terminal bundles with compatible NVIDIA drivers
+1. The Docker CUDA image/profile on NVIDIA Linux hosts
 2. Source builds using `cargo build --release --features cuda`
-3. The Docker CUDA image/profile on Linux
 
 The `Backend Truth` and `Release` workflows are the pre-release guardrails for this contract:
 
 1. CPU cargo checks run separately from CUDA cargo checks.
 2. CPU Docker builds run separately from CUDA Docker builds.
-3. Linux and Windows release jobs verify the unified runtime layout, public CPU-safe startup, private CUDA runtime layout, packaged CUDA runtime libraries, and Tauri resource mappings.
-4. A GPU-host runtime smoke test is still the next gap; until an NVIDIA runner exists, runtime verification remains a manual release check on CUDA-capable Linux and Windows hosts.
+3. Linux and Windows release jobs verify native artifacts are CPU-only, reject CUDA runtime payloads, and enforce a conservative per-file size cap.
+4. Docker build jobs smoke-run the final CPU and CUDA images with `/usr/local/bin/izwi-server --help`.
+5. A GPU-host runtime smoke test is still the next gap; until an NVIDIA runner exists, end-to-end CUDA execution remains a manual release check on an NVIDIA Linux host.
 
 The desktop bundle build runs the UI build automatically via Tauri `beforeBuildCommand`, so `ui/dist` is rebuilt from source on each release run.
 
@@ -101,7 +98,6 @@ Linux `.deb` installs:
 
 1. `/usr/bin/izwi`
 2. `/usr/bin/izwi-server`
-3. `/usr/lib/izwi/runtime`
 
 ## Signing and notarization
 

@@ -358,6 +358,17 @@ jobs:
       - name: Verify downloaded native release artifacts
         run: scripts/release/verify-native-artifacts.sh --artifact-dir dist
 
+      - name: Generate release support note
+        run: |
+          cat > release-support.md <<'EOF'
+          ## Runtime Support
+
+          - macOS native artifacts are Metal-capable on Apple Silicon.
+          - Linux and Windows native artifacts are CPU-only and intentionally do not bundle CUDA runtime libraries.
+          - NVIDIA CUDA is supported through the Docker `production-cuda` target / `docker compose --profile cuda` and through source builds with `--features cuda`.
+          - Native artifacts are checked for CUDA runtime payloads and per-file size before release publication.
+          EOF
+
       - name: Generate beta updater manifest
         if: startsWith(github.ref_name, 'v0.1.0-beta-')
         run: |
@@ -446,6 +457,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: Izwi ${{ github.ref_name }}
+          body_path: release-support.md
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: dist/*

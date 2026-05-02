@@ -1,6 +1,6 @@
 # Linux Installation
 
-Izwi runs on most modern Linux distributions. Linux GitHub Release assets keep the public `izwi` and `izwi-server` names, start safely on CPU-only hosts, and include a private packaged CUDA runtime for NVIDIA hosts.
+Izwi runs on most modern Linux distributions. Linux GitHub Release assets keep the public `izwi` and `izwi-server` names and are intentionally CPU-only.
 
 See the [Runtime Support Matrix](../support-matrix.md) for the current artifact contract.
 
@@ -17,17 +17,17 @@ See the [Runtime Support Matrix](../support-matrix.md) for the current artifact 
 
 ## Install from GitHub Releases
 
-All Linux release surfaces use the same unified CPU/CUDA runtime contract:
+Linux release surfaces are CPU-only native artifacts:
 
 - `.deb` package for Debian/Ubuntu installs
 - AppImage desktop bundle and updater artifact
 - terminal tarball
 
-The public command names stay `izwi` and `izwi-server`. CUDA-capable runtime binaries are packaged privately under the release runtime directory.
+The public command names stay `izwi` and `izwi-server`. CUDA runtime libraries and CUDA-linked binaries are not bundled in native Linux release artifacts.
 
 ## Install from .deb Package (Debian/Ubuntu)
 
-> The `.deb` package uses the same unified CPU/CUDA runtime contract as the other Linux release assets. CUDA acceleration requires a compatible NVIDIA driver and GPU, but the public command names do not change.
+> The `.deb` package is CPU-only. Use Docker CUDA or a source build when you need NVIDIA acceleration.
 
 ### Step 1: Download
 
@@ -53,7 +53,7 @@ sudo apt-get install -f
 izwi version --full
 ```
 
-For terminal tarballs, unpack the release archive and keep the bundled `runtime/` directory next to `izwi` and `izwi-server`.
+For terminal tarballs, unpack the release archive and keep the bundled binaries together.
 
 ---
 
@@ -127,21 +127,16 @@ cd izwi
 
 ## CUDA Support (NVIDIA GPUs)
 
-For NVIDIA GPU acceleration from a GitHub Release package, install a compatible NVIDIA driver and start Izwi with the CUDA backend:
+Native Linux GitHub Release artifacts are CPU-only. For CUDA-capable binaries on NVIDIA Linux hosts, use the Docker CUDA profile:
 
 ```bash
 nvidia-smi
-izwi serve --backend cuda
-izwi status --detailed
+git clone https://github.com/izwi-ai/izwi.git
+cd izwi
+CUDA_COMPUTE_CAP=80 docker compose --profile cuda up
 ```
 
-Look for:
-
-- `Requested: cuda`
-- `Selected:  cuda`
-- CUDA runtime diagnostics showing the packaged runtime and driver are available
-
-`izwi version --full` reports the public CPU-safe CLI binary. For release packages, use `izwi status --detailed` after the server starts to verify the active runtime.
+Adjust `CUDA_COMPUTE_CAP` for the target GPU architecture if you build on a machine without `nvidia-smi`.
 
 ### Source Build CUDA Path
 

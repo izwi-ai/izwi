@@ -5,9 +5,9 @@ Choose your platform for detailed installation instructions.
 Before choosing an install path, check the [Runtime Support Matrix](../support-matrix.md) for the current backend contract. In particular:
 
 - GitHub Release artifacts are not the same thing as CUDA source builds.
-- Linux and Windows GitHub Release artifacts keep public commands CPU-safe and include a private packaged CUDA runtime for NVIDIA hosts.
+- Linux and Windows GitHub Release artifacts are CPU-only and do not bundle CUDA runtime libraries.
 - CUDA acceleration requires a compatible NVIDIA driver and GPU; source builds still require the CUDA toolkit.
-- The Docker CUDA profile targets NVIDIA Linux hosts and may require `CUDA_COMPUTE_CAP` when built on a machine without `nvidia-smi`.
+- The Docker CUDA profile is the CUDA distribution path for NVIDIA Linux hosts and may require `CUDA_COMPUTE_CAP` when built on a machine without `nvidia-smi`.
 
 ---
 
@@ -59,7 +59,6 @@ If you specifically need NVIDIA CUDA support, see:
 
 - [Runtime Support Matrix](../support-matrix.md)
 - [Linux Installation](./linux.md)
-- [Windows Installation](./windows.md)
 - [Build from Source](./from-source.md)
 
 ### Optional: `espeak-ng` for Kokoro-82M

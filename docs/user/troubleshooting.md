@@ -168,7 +168,12 @@ macOS (Metal):
 izwi serve --backend metal
 ```
 
-Linux/Windows (CUDA):
+Linux (Docker CUDA):
+```bash
+CUDA_COMPUTE_CAP=80 docker compose --profile cuda up
+```
+
+Linux/Windows source build (CUDA):
 ```bash
 # Linux source install
 IZWI_BUILD_BACKEND=cuda ./scripts/install-cli.sh
@@ -269,7 +274,7 @@ izwi serve --backend metal
 nvidia-smi
 ```
 
-**For source builds, verify CUDA Toolkit installation:**
+**For Docker CUDA on Linux, verify the NVIDIA driver and container runtime. For source builds, verify CUDA Toolkit installation:**
 ```bash
 nvcc --version
 ```
