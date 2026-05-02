@@ -26,7 +26,7 @@ use crate::style;
     about = "High-performance audio inference engine",
     long_about = "Izwi is a world-class audio inference engine for text-to-speech (TTS) and automatic speech recognition (ASR). Optimized for Apple Silicon and CUDA devices.",
     version = env!("CARGO_PKG_VERSION"),
-    author = "Agentem <info@agentem.com>",
+    author = "Izwi <hi@izwiai.com>",
     help_template = style::HELP_TEMPLATE,
     arg_required_else_help = true,
     propagate_version = true,
