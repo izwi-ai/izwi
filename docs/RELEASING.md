@@ -89,7 +89,7 @@ The `Backend Truth` and `Release` workflows are the pre-release guardrails for t
 1. CPU cargo checks run separately from CUDA cargo checks.
 2. CPU Docker builds run separately from CUDA Docker builds.
 3. Linux and Windows release jobs verify native artifacts are CPU-only, reject CUDA runtime payloads, and enforce a conservative per-file size cap.
-4. Docker build jobs smoke-run the final CPU and CUDA images with `/usr/local/bin/izwi-server --help`.
+4. Docker build jobs smoke-run the final CPU image and audit the CUDA image's dynamic dependencies, allowing `libcuda.so.1` to come from the NVIDIA container runtime on GPU hosts.
 5. A GPU-host runtime smoke test is still the next gap; until an NVIDIA runner exists, end-to-end CUDA execution remains a manual release check on an NVIDIA Linux host.
 
 The desktop bundle build runs the UI build automatically via Tauri `beforeBuildCommand`, so `ui/dist` is rebuilt from source on each release run.

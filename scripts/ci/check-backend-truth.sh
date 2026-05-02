@@ -10,7 +10,7 @@ Commands:
   cargo-cpu     Run CPU-focused cargo checks for the CLI and server
   cargo-cuda    Run CUDA-focused cargo checks for the CLI and server
   docker-cpu    Validate the default Docker Compose config, build, and smoke the CPU image
-  docker-cuda   Validate the CUDA Docker Compose profile, build, and smoke the CUDA image
+  docker-cuda   Validate the CUDA Docker Compose profile, build, and audit the CUDA image
 EOF
 }
 
@@ -37,6 +37,40 @@ smoke_docker_server() {
         --entrypoint /usr/local/bin/izwi-server \
         "${image}" \
         --help >/dev/null
+}
+
+audit_cuda_docker_server() {
+    local image="$1"
+
+    echo "Auditing CUDA dependencies in ${image}"
+    docker run --rm \
+        --entrypoint /bin/sh \
+        "${image}" \
+        -c '
+            set -eu
+
+            test -x /usr/local/bin/izwi-server
+
+            ldd_output="$(ldd /usr/local/bin/izwi-server || true)"
+            printf "%s\n" "${ldd_output}"
+
+            if ! printf "%s\n" "${ldd_output}" | grep -Eq "lib(cuda|cudart|cublas|curand|nvrtc).*\.so"; then
+                echo "Expected izwi-server to link against CUDA shared libraries." >&2
+                exit 1
+            fi
+
+            missing="$(printf "%s\n" "${ldd_output}" | awk "/not found/ { print \$1 }")"
+            unexpected_missing="$(printf "%s\n" "${missing}" | grep -Ev "^(libcuda\.so\.1)?$" || true)"
+            if [ -n "${unexpected_missing}" ]; then
+                echo "Unexpected missing shared libraries:" >&2
+                printf "%s\n" "${unexpected_missing}" >&2
+                exit 1
+            fi
+
+            if printf "%s\n" "${missing}" | grep -qx "libcuda.so.1"; then
+                echo "Host driver library libcuda.so.1 is intentionally supplied by the NVIDIA container runtime."
+            fi
+        '
 }
 
 run_cargo_cpu() {
@@ -79,7 +113,7 @@ run_docker_cuda() {
         --target production-cuda \
         -t izwi-ci:production-cuda \
         .
-    smoke_docker_server izwi-ci:production-cuda
+    audit_cuda_docker_server izwi-ci:production-cuda
 }
 
 main() {
