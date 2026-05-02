@@ -321,6 +321,15 @@ jobs:
 
           Copy-Item $bundle.FullName -Destination release-assets
 
+      - name: Verify native release artifacts (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: scripts/release/verify-native-artifacts.sh --artifact-dir release-assets
+
+      - name: Verify native release artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: scripts/release/verify-native-artifacts.ps1 -ArtifactDir release-assets
+
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -333,6 +342,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
       - name: Download built artifacts
         uses: actions/download-artifact@v4
         with:
@@ -342,6 +354,9 @@ jobs:
 
       - name: Show release files
         run: ls -lah dist
+
+      - name: Verify downloaded native release artifacts
+        run: scripts/release/verify-native-artifacts.sh --artifact-dir dist
 
       - name: Generate beta updater manifest
         if: startsWith(github.ref_name, 'v0.1.0-beta-')
