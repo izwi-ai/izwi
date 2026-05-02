@@ -26,7 +26,9 @@ jobs:
             asset_suffix: linux-x86_64
             bundle_kind: deb
             bundle_ext: deb
-          - os: windows-latest
+          # Keep CUDA 12.4.1 on the Visual Studio 2022-era Windows runner instead
+          # of following windows-latest to newer MSVC toolchain changes.
+          - os: windows-2022
             asset_suffix: windows-x86_64
             bundle_kind: nsis
             bundle_ext: exe
@@ -142,6 +144,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          . scripts/release/enter-msvc-dev-env.ps1
           cargo build --release -p izwi-cli -p izwi-server
           $env:CARGO_TARGET_DIR = "target/cuda-release"
           cargo build --release -p izwi-cli -p izwi-server --features "izwi-cli/cuda,izwi-server/cuda"
