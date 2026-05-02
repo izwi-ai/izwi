@@ -1,6 +1,8 @@
 param(
+    [string]$ArtifactDir,
     [string]$TerminalZip,
-    [string]$InstallerPath
+    [string]$InstallerPath,
+    [Int64]$MaxBytes = 1073741824
 )
 
 Set-StrictMode -Version Latest
@@ -8,32 +10,34 @@ $ErrorActionPreference = "Stop"
 
 function Show-Usage {
     @"
-Usage: scripts/release/verify-packaged-artifacts.ps1 [-TerminalZip <path>] [-InstallerPath <path>]
+Usage: scripts/release/verify-native-artifacts.ps1 [-ArtifactDir <dir>] [-TerminalZip <path>] [-InstallerPath <path>] [-MaxBytes <bytes>]
 
-Verifies final Windows release artifacts contain the unified CPU+CUDA runtime
-layout after packaging, not only in target/release.
+Verifies native Windows release artifacts are CPU-only and stay within a safe
+size limit before upload/publish.
 "@
 }
 
-if (-not $TerminalZip -and -not $InstallerPath) {
+if (-not $ArtifactDir -and -not $TerminalZip -and -not $InstallerPath) {
     Show-Usage
     exit 1
 }
 
-$requiredRuntimePatterns = @(
-    "runtime/cuda/izwi\.exe$",
-    "runtime/cuda/izwi-server\.exe$",
-    "runtime/cuda/cudart64_.*\.dll$",
-    "runtime/cuda/cublas64_.*\.dll$",
-    "runtime/cuda/curand64_.*\.dll$",
-    "runtime/cuda/nvrtc64_.*\.dll$"
-)
+$forbiddenPattern = "runtime/cuda|libcuda\.so|libcudart\.so|libcublas(Lt)?\.so|libcurand\.so|libnvrtc(-builtins)?\.so|nvcuda\.dll|cudart64_|cublas(Lt)?64_|curand64_|nvrtc(-builtins)?64_"
 
 function Assert-File {
     param([string]$Path)
 
     if (-not (Test-Path $Path -PathType Leaf)) {
         throw "Missing artifact: $Path"
+    }
+}
+
+function Assert-SizeOk {
+    param([string]$Path)
+
+    $item = Get-Item -LiteralPath $Path
+    if ($item.Length -gt $MaxBytes) {
+        throw "$Path is $($item.Length) bytes; max allowed is $MaxBytes"
     }
 }
 
@@ -58,11 +62,17 @@ function Assert-ContainsPattern {
     }
 }
 
-function Assert-UnifiedRuntimeEntries {
-    param([string[]]$Entries)
+function Assert-NoForbiddenEntries {
+    param(
+        [string[]]$Entries,
+        [string]$Label
+    )
 
-    foreach ($pattern in $requiredRuntimePatterns) {
-        Assert-ContainsPattern -Entries $Entries -Pattern $pattern -Label $pattern
+    $matches = $Entries | Where-Object { $_ -match $forbiddenPattern }
+    if ($matches) {
+        Write-Host "Forbidden CUDA/native-runtime entries in ${Label}:"
+        $matches | ForEach-Object { Write-Host "  $_" }
+        throw "$Label contains CUDA runtime payload"
     }
 }
 
@@ -70,6 +80,7 @@ function Verify-TerminalZip {
     param([string]$Path)
 
     Assert-File -Path $Path
+    Assert-SizeOk -Path $Path
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $Path).Path)
     try {
@@ -78,10 +89,10 @@ function Verify-TerminalZip {
         $zip.Dispose()
     }
 
+    Assert-NoForbiddenEntries -Entries $entries -Label $Path
     Assert-ContainsPattern -Entries $entries -Pattern '(^|/)izwi\.exe$' -Label "public CLI"
     Assert-ContainsPattern -Entries $entries -Pattern '(^|/)izwi-server\.exe$' -Label "public server"
     Assert-ContainsPattern -Entries $entries -Pattern '(^|/)izwi-desktop\.exe$' -Label "desktop binary"
-    Assert-UnifiedRuntimeEntries -Entries $entries
 
     Write-Host "Verified terminal zip: $Path"
 }
@@ -121,6 +132,7 @@ function Verify-Installer {
     param([string]$Path)
 
     Assert-File -Path $Path
+    Assert-SizeOk -Path $Path
     $sevenZip = Find-7Zip
     if (-not $sevenZip) {
         throw "7z.exe is required to inspect Windows installer payloads."
@@ -139,15 +151,41 @@ function Verify-Installer {
         $entries = Get-ChildItem -Path $root -Recurse -File |
             ForEach-Object { Normalize-Entry -Entry $_.FullName.Substring($root.Length) }
 
+        Assert-NoForbiddenEntries -Entries $entries -Label $Path
         Assert-ContainsPattern -Entries $entries -Pattern '(^|/)bin/izwi\.exe$' -Label "installer public CLI resource"
         Assert-ContainsPattern -Entries $entries -Pattern '(^|/)bin/izwi-server\.exe$' -Label "installer public server resource"
-        Assert-UnifiedRuntimeEntries -Entries $entries
 
         Write-Host "Verified Windows installer payload: $Path"
     } finally {
         if (Test-Path $root) {
             Remove-Item -Recurse -Force $root
         }
+    }
+}
+
+function Verify-ArtifactFile {
+    param([string]$Path)
+
+    Assert-File -Path $Path
+    Assert-SizeOk -Path $Path
+    $name = Split-Path -Leaf $Path
+
+    if ($name -like "*.zip") {
+        Verify-TerminalZip -Path $Path
+    } elseif ($name -match "-setup\.exe$") {
+        Verify-Installer -Path $Path
+    } else {
+        Write-Host "Verified size-only artifact: $Path"
+    }
+}
+
+if ($ArtifactDir) {
+    if (-not (Test-Path $ArtifactDir -PathType Container)) {
+        throw "Missing artifact directory: $ArtifactDir"
+    }
+
+    Get-ChildItem -Path $ArtifactDir -File | ForEach-Object {
+        Verify-ArtifactFile -Path $_.FullName
     }
 }
 
