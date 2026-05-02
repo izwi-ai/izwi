@@ -1,103 +1,94 @@
-# CPU + CUDA Release Runtime Contract
+# Native CPU + Docker CUDA Release Contract
 
-This contract defines how Linux and Windows release installers should support both CPU and CUDA without forking or vendoring Izwi core source files.
+This contract defines the supported split between public native release
+artifacts and CUDA-capable Docker/source builds.
 
 ## Decision
 
-Use a **single installer with stable public binary names**:
+Public native artifacts stay CPU-safe:
 
-- Users keep running `izwi` and `izwi-server` on Linux and Windows.
-- The public `izwi` and `izwi-server` entrypoints must remain CPU-safe and must start on machines with no NVIDIA driver or CUDA toolkit.
-- CUDA-capable runtime variants, if needed to avoid loader-startup failures, are private package resources built from the same crates with `--features cuda`.
-- Private runtime variants must keep the same basename as the public binary and live under a package-private runtime directory, not as user-facing `*-cuda` commands.
-- Launch and packaging logic may select the private CUDA runtime only after CUDA runtime dependencies are loadable.
-- If CUDA dependencies are missing or unusable, the public CPU-safe path remains valid.
+- Linux and Windows GitHub Release installers and terminal bundles are CPU-only.
+- Native Linux and Windows artifacts must not bundle CUDA runtime libraries, CUDA DLLs, or private CUDA-linked binaries.
+- Public binary names remain `izwi` / `izwi-server` on Linux and `izwi.exe` / `izwi-server.exe` on Windows.
+- macOS release artifacts remain the native accelerated path through Metal on Apple Silicon.
+- CUDA-capable binaries are built in CI only for the Docker `production-cuda` target, whose final stage is based on `nvidia/cuda:12.4.1-runtime-ubuntu22.04`.
+- Source builds may still enable CUDA with `--features cuda` on compatible NVIDIA hosts.
 
-Do not replace the CPU-safe Linux/Windows release binaries with CUDA-linked binaries unless Phase 1 loader checks prove they can start without CUDA shared libraries. Current research indicates they cannot.
+Do not reintroduce native CUDA runtime bundling unless the release strategy is explicitly reopened and artifact-size, redistribution, and loader-startup risks are resolved first.
 
-## Why Not One CUDA-Linked Default Binary?
+## Why Not Native CUDA Bundles?
 
-Izwi can already select CPU or CUDA after process startup, but Candle's current CUDA feature path links CUDA shared libraries at loader time. A CUDA-linked `izwi` or `izwi-server` can therefore fail before `main()` on hosts without CUDA libraries, which prevents Izwi's runtime fallback from running.
+Izwi can choose CPU or CUDA after process startup, but Candle's CUDA feature path links CUDA shared libraries at loader time. A CUDA-linked native `izwi` or `izwi-server` can fail before `main()` on hosts without CUDA libraries, which prevents the runtime CPU fallback from running.
 
-The private-runtime model keeps the user-facing installer unified while avoiding that startup failure mode.
+Bundling CUDA runtime libraries inside native installers also balloons artifact size. The beta 14 native CUDA attempt pushed Linux/Windows assets hundreds of MB larger and caused the `.deb` release asset to exceed GitHub's 2 GiB upload limit.
 
-## Binary Layout
+Docker solves both problems for the CUDA distribution path:
 
-The release package should contain:
+- CUDA libraries come from the NVIDIA runtime image.
+- Host driver integration is handled by the NVIDIA container runtime.
+- Native release assets return to CPU-only beta 13 scale.
 
-- `izwi` / `izwi.exe`: public CPU-safe CLI entrypoint.
-- `izwi-server` / `izwi-server.exe`: public CPU-safe server entrypoint.
-- Private CUDA runtime binaries with the same basename in a package runtime directory:
-  - Linux: `lib/izwi/runtime/cuda/izwi` and `lib/izwi/runtime/cuda/izwi-server`
-  - Windows/App resources: `bin/runtime/cuda/izwi.exe` and `bin/runtime/cuda/izwi-server.exe`
-- A private CUDA runtime library directory, when redistribution is enabled:
-  - Linux: colocated with the private CUDA runtime binaries or under `lib/izwi/runtime/cuda/lib/`
-  - Windows: colocated with the private CUDA runtime `.exe` files
+## Artifact Layout
 
-All binaries are built from the same source tree. The only difference is Cargo feature selection and output name/location.
+Native GitHub Release artifacts:
+
+- `izwi` / `izwi.exe`: public CPU-only CLI entrypoint.
+- `izwi-server` / `izwi-server.exe`: public CPU-only server entrypoint.
+- `izwi-desktop` / `izwi-desktop.exe`: public CPU-only desktop shell binary on Linux/Windows.
+- Linux `.deb`, Linux AppImage/updater, Linux terminal tarball, Windows NSIS/updater, and Windows terminal zip must not include `runtime/cuda`, CUDA shared libraries, or CUDA DLLs.
+
+Docker CUDA artifact:
+
+- The `rust-builder-cuda` stage builds `izwi-server` with `--features cuda`.
+- The `production-cuda` stage copies only that CUDA-capable server binary into the NVIDIA CUDA runtime image.
+- The image sets `IZWI_BACKEND=cuda`, `NVIDIA_VISIBLE_DEVICES=all`, and `NVIDIA_DRIVER_CAPABILITIES=compute,utility`.
 
 ## Runtime Selection
 
-Default behavior:
+Native releases:
 
-1. Start the CPU-safe default binary.
-2. If backend preference is `cpu`, stay on CPU.
-3. If backend preference is `auto`, the public server entrypoint may delegate to the private CUDA runtime only if:
-   - Private CUDA runtime binary exists.
-   - Required CUDA runtime libraries are loadable.
-   - NVIDIA driver probing indicates a usable CUDA device.
-4. If backend preference is `cuda`, fail with a clear diagnostic when the private CUDA runtime or runtime dependencies are unavailable.
+1. Start the CPU-only public binary.
+2. `auto` and `cpu` run on CPU unless a platform-native accelerator such as macOS Metal is available.
+3. A CUDA request on a CPU-only native artifact should fail clearly instead of looking for packaged CUDA binaries.
 
-The runtime health surface should distinguish:
+Docker CUDA:
 
-- Private CUDA runtime packaged.
-- CUDA runtime libraries loadable.
-- NVIDIA driver present.
-- CUDA device usable.
-- selected backend.
+1. Build the `production-cuda` target with `CUDA_COMPUTE_CAP` set for the target GPU architecture when automatic detection is unavailable.
+2. Run the CUDA image on an NVIDIA Linux host through Docker Compose profile `cuda` or an equivalent `docker run --gpus` deployment.
+3. Health/status surfaces should report CUDA availability and selection from inside the container.
 
-## CUDA Library Policy
+Source CUDA:
 
-The required library set must be derived from loader audit output, not guessed. For the current Candle CUDA path, expect these families:
+1. Install a compatible NVIDIA driver and CUDA toolkit.
+2. Build with `cargo build --release --features cuda` or `IZWI_BUILD_BACKEND=cuda ./scripts/install-cli.sh`.
+3. Run with `--backend cuda` or `IZWI_BACKEND=cuda`.
 
-Linux:
+## Guardrails
 
-- `libcuda.so.1` or compatible driver library from the host NVIDIA driver.
-- `libcudart.so*`
-- `libcublas.so*`
-- `libcublasLt.so*`
-- `libcurand.so*`
-- `libnvrtc.so*`
-- `libnvrtc-builtins.so*`
+Release workflow guardrails:
 
-Windows:
+- Native release jobs build without CUDA features.
+- Native terminal bundles contain only the public binaries.
+- Native artifact verification rejects `runtime/cuda`, CUDA shared libraries, and CUDA DLLs.
+- Native artifact verification enforces a conservative per-file size cap before upload and again before GitHub release publication.
 
-- `nvcuda.dll` from the host NVIDIA driver.
-- `cudart64_*.dll`
-- `cublas64_*.dll`
-- `cublasLt64_*.dll`
-- `curand64_*.dll`
-- `nvrtc64_*.dll`
-- `nvrtc-builtins64_*.dll`
+Docker workflow guardrails:
 
-The NVIDIA CUDA EULA lists CUDA Toolkit redistributable files in Attachment A. As of the January 26, 2026 EULA, `cudart`, `cublas`, `cublasLt`, `curand`, `nvrtc`, and `nvrtc-builtins` are listed as redistributable families. Driver components such as `nvcuda.dll` / `libcuda.so.1` should be treated as host driver dependencies unless legal review approves any other approach.
-
-References:
-
-- NVIDIA CUDA EULA: `https://docs.nvidia.com/cuda/eula/index.html`
-- CUDA compatibility documentation: `https://docs.nvidia.com/deploy/cuda-compatibility/`
-
-This file is an engineering packaging contract, not legal advice. Verify redistribution terms before publishing CUDA runtime libraries.
+- CPU and CUDA Docker builds run as separate `Backend Truth` jobs.
+- The CUDA Docker job builds `production-cuda`, not a native release package.
+- Final Docker images are smoke-run with `/usr/local/bin/izwi-server --help` so loader-time runtime dependencies are checked before the job passes.
 
 ## Verification Requirements
 
 Each release candidate must prove:
 
-- CPU-only host with no CUDA libraries: default `izwi` and `izwi-server` start and report CPU fallback.
-- Host with CUDA libraries but no usable GPU: default binaries start and explain why CUDA was not selected.
-- NVIDIA GPU host: private CUDA runtime can start through the public `izwi-server` entrypoint, and `auto`/`cuda` select CUDA as expected.
-- Linux `.deb`, Linux AppImage/updater, Linux terminal tarball, Windows NSIS/updater, and Windows zip all expose the same CPU/CUDA packaging contract.
+- Linux and Windows native artifacts install/start on CPU-only hosts.
+- Linux and Windows native artifacts do not contain CUDA runtime payloads.
+- Native artifact sizes stay comfortably below GitHub's release asset limit.
+- The Docker CPU image builds and starts the server binary.
+- The Docker CUDA image builds from the NVIDIA CUDA runtime image and starts the CUDA-linked server binary.
+- CUDA source builds still compile in the CUDA CI container.
 
 ## Non-Forking Rule
 
-Do not copy or fork Izwi core runtime files to create backend-specific source variants. Backend variants must be produced through Cargo features, build profiles, packaging layout, and small launch/runtime diagnostics only.
+Do not copy or fork Izwi core runtime files to create backend-specific source variants. Backend variants must be produced through Cargo features, build profiles, Docker stages, packaging layout, and small launch/runtime diagnostics only.

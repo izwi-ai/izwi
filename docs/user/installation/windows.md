@@ -1,6 +1,6 @@
 # Windows Installation
 
-Izwi runs on Windows 10 and later. GitHub Release installers keep the public `izwi.exe` and `izwi-server.exe` names, start safely on CPU-only hosts, and include a private packaged CUDA runtime for NVIDIA hosts.
+Izwi runs on Windows 10 and later. GitHub Release installers keep the public `izwi.exe` and `izwi-server.exe` names and are intentionally CPU-only.
 
 See the [Runtime Support Matrix](../support-matrix.md) for the current artifact contract.
 
@@ -17,7 +17,7 @@ See the [Runtime Support Matrix](../support-matrix.md) for the current artifact 
 
 ## Install from Installer (Recommended)
 
-> The Windows installer uses the unified CPU/CUDA runtime contract. CUDA acceleration requires a compatible NVIDIA driver and GPU, but the public command names do not change.
+> The Windows installer is CPU-only. Use a source build when you need CUDA on Windows.
 
 ### Step 1: Download
 
@@ -71,35 +71,13 @@ winget install Agentem.Izwi
 
 ## CUDA Support (NVIDIA GPUs)
 
-For NVIDIA GPU acceleration from the GitHub Release installer:
+Native Windows GitHub Release installers are CPU-only and do not bundle CUDA runtime DLLs. CUDA on Windows is currently a source-build preview path.
 
 ### Step 1: Install NVIDIA Drivers
 
 Download and install the latest drivers from [NVIDIA](https://www.nvidia.com/drivers).
 
-### Step 2: Verify the Installed Runtime
-
-Start the server in one PowerShell window:
-
-```powershell
-izwi serve --backend cuda
-```
-
-In a second PowerShell window:
-
-```powershell
-izwi status --detailed
-```
-
-Look for:
-
-- `Requested: cuda`
-- `Selected:  cuda`
-- CUDA runtime diagnostics showing the packaged runtime and driver are available
-
-`izwi version --full` reports the public CPU-safe CLI binary. For release installers, use `izwi status --detailed` after the server starts to verify the active runtime.
-
-### Optional: Build from source (Preview)
+### Step 2: Build from source (Preview)
 
 Source builds still require CUDA Toolkit from [NVIDIA CUDA Downloads](https://developer.nvidia.com/cuda-downloads).
 

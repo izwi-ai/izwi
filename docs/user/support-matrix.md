@@ -18,16 +18,16 @@ If another page says something different, this page should win.
 | Surface | OS / Hardware | Backend status | Support level | Notes |
 |---------|----------------|----------------|---------------|-------|
 | **Desktop app from GitHub Releases** | macOS on Apple Silicon | `metal` | Stable | Desktop and terminal binaries bundled in the macOS release can use Metal acceleration. |
-| **Desktop app from GitHub Releases** | Linux x86_64 | `cpu`, `cuda` preview | Stable CPU / Preview CUDA | Public `izwi` and `izwi-server` names stay CPU-safe; the installer includes a private CUDA runtime for NVIDIA hosts. |
-| **Desktop app from GitHub Releases** | Windows x86_64 | `cpu`, `cuda` preview | Stable CPU / Preview CUDA | Public `izwi.exe` and `izwi-server.exe` names stay CPU-safe; the installer includes a private CUDA runtime for NVIDIA hosts. |
-| **Terminal bundle from GitHub Releases** | Linux x86_64 | `cpu`, `cuda` preview | Stable CPU / Preview CUDA | Linux terminal tarballs use the same private CUDA runtime layout as desktop bundles. |
+| **Desktop app from GitHub Releases** | Linux x86_64 | `cpu` | Stable | Native Linux installers are CPU-only and do not bundle CUDA runtime libraries. |
+| **Desktop app from GitHub Releases** | Windows x86_64 | `cpu` | Stable | Native Windows installers are CPU-only and do not bundle CUDA runtime DLLs. |
+| **Terminal bundle from GitHub Releases** | Linux x86_64 | `cpu` | Stable | Linux terminal tarballs contain the public CPU-only CLI, server, and desktop shell binaries. |
 | **Terminal bundle from GitHub Releases** | macOS Apple Silicon | `metal` | Stable | Metal is compiled into the macOS build path. |
-| **Terminal bundle from GitHub Releases** | Windows x86_64 | `cpu`, `cuda` preview | Stable CPU / Preview CUDA | Windows terminal zips use the same private CUDA runtime layout as desktop bundles. |
+| **Terminal bundle from GitHub Releases** | Windows x86_64 | `cpu` | Stable | Windows terminal zips contain the public CPU-only CLI, server, and desktop shell binaries. |
 | **Source build** | macOS Apple Silicon with `--features metal` | `metal` | Stable | Recommended GPU path on macOS. |
-| **Source build** | Linux x86_64 with `--features cuda` and CUDA toolkit installed | `cuda` | Supported | Useful for development, custom builds, or validating ahead of release packaging. Requires a compatible NVIDIA driver/toolkit environment. |
-| **Source build** | Windows with `--features cuda` and CUDA toolkit installed | `cuda` | Preview | Useful for development and fallback validation while Windows CUDA release packaging remains preview. |
+| **Source build** | Linux x86_64 with `--features cuda` and CUDA toolkit installed | `cuda` | Supported | Useful for development, custom builds, and debugging outside Docker. Requires a compatible NVIDIA driver/toolkit environment. |
+| **Source build** | Windows with `--features cuda` and CUDA toolkit installed | `cuda` | Preview | Useful for development and custom validation. Native Windows release artifacts remain CPU-only. |
 | **Docker `production` target** | Linux x86_64 | `cpu` | Stable | CPU-only container image. |
-| **Docker `production-cuda` target / `docker compose --profile cuda`** | Linux x86_64 + NVIDIA GPU | `cuda` | Preview | Intended for NVIDIA hosts. When building on a machine without `nvidia-smi`, set `CUDA_COMPUTE_CAP` for the target GPU architecture. |
+| **Docker `production-cuda` target / `docker compose --profile cuda`** | Linux x86_64 + NVIDIA GPU | `cuda` | Preview | Shipped CUDA binary path. The final image is based on `nvidia/cuda:12.4.1-runtime-ubuntu22.04`. When building on a machine without `nvidia-smi`, set `CUDA_COMPUTE_CAP` for the target GPU architecture. |
 
 ---
 
@@ -37,8 +37,8 @@ If another page says something different, this page should win.
 |-------------------|--------|-------|
 | **Single-user macOS desktop evaluation** | Stable | Best-supported path for local evaluation. |
 | **Single-host Linux server on CPU** | Stable | Supported via GitHub Release packages, source builds, and the Docker CPU image. |
-| **Single-host Linux server on NVIDIA GPU** | Supported / Preview by artifact | Source builds are supported. Release installers and terminal bundles include CUDA packaging as preview until GPU-host release smoke coverage is automated. Docker CUDA remains preview. |
-| **Windows desktop evaluation** | Stable CPU / Preview CUDA | The installer remains CPU-safe and can use the packaged CUDA runtime on NVIDIA hosts when driver/device checks pass. |
+| **Single-host Linux server on NVIDIA GPU** | Supported / Preview by artifact | Use the Docker CUDA image/profile, or build from source with `--features cuda`. Native Linux release artifacts are CPU-only. |
+| **Windows desktop evaluation** | Stable CPU | Native Windows release artifacts are CPU-only. CUDA on Windows is source-build preview only. |
 | **Docker Compose on CPU** | Stable | Use the default `izwi` service. |
 | **Docker Compose on NVIDIA GPU** | Preview | Use `docker compose --profile cuda up`; the profile runs the `izwi-cuda` service and may require `CUDA_COMPUTE_CAP` when built on a non-GPU machine. |
 | **Kubernetes / Helm / multi-node production orchestration** | Not yet supported | Not published in OSS today. |
@@ -71,11 +71,10 @@ preview in the API reference.
 ## CUDA Caveats
 
 - Linux and Windows GitHub Releases keep public binary names unchanged: `izwi` and `izwi-server` on Linux, `izwi.exe` and `izwi-server.exe` on Windows.
-- The public release entrypoints are CPU-safe. CUDA-capable runtime binaries are private package resources under `runtime/cuda`.
+- Linux and Windows GitHub Release artifacts are CPU-only and must not contain CUDA runtime libraries or private CUDA binaries.
 - Release installers do not replace the host NVIDIA driver. CUDA acceleration requires a compatible NVIDIA driver and CUDA-capable GPU.
-- CUDA release packaging is still preview until a real NVIDIA-host smoke test is automated in CI. Hosted release CI verifies layout, packaged runtime libraries, and CPU-safe startup.
 - Source builds still require the CUDA toolkit and remain useful for development or fallback validation.
-- The Docker CUDA image/profile is intended for NVIDIA Linux hosts and may require `CUDA_COMPUTE_CAP` when built on a machine without `nvidia-smi`.
+- The Docker CUDA image/profile is the CUDA distribution path for NVIDIA Linux hosts and may require `CUDA_COMPUTE_CAP` when built on a machine without `nvidia-smi`.
 - On macOS, the recommended GPU path is Metal, not CUDA.
 
 ---
@@ -85,8 +84,8 @@ preview in the API reference.
 Use the following expectations when validating a host:
 
 - **macOS Apple Silicon:** build or install a Metal-capable binary and run with `--backend metal` or `IZWI_BACKEND=metal`.
-- **Linux/Windows GitHub Release on CPU-only hosts:** run `izwi serve --backend cpu`, then `izwi status --detailed`.
-- **Linux/Windows GitHub Release on NVIDIA hosts:** install a compatible NVIDIA driver, run `izwi serve --backend cuda`, then confirm `Selected:  cuda` and the CUDA runtime diagnostics in `izwi status --detailed`.
+- **Linux/Windows GitHub Release:** run `izwi serve --backend cpu`, then `izwi status --detailed`.
+- **Docker CUDA on NVIDIA Linux hosts:** run `docker compose --profile cuda up`, then confirm the container selects CUDA through `/v1/health` or `izwi status --detailed` from a matching client environment.
 - **Linux/Windows source build for CUDA:** build with `cargo build --release --features cuda`, then run with `--backend cuda` or `IZWI_BACKEND=cuda`.
 
 ---
