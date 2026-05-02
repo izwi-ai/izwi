@@ -76,7 +76,8 @@ Docker workflow guardrails:
 
 - CPU and CUDA Docker builds run as separate `Backend Truth` jobs.
 - The CUDA Docker job builds `production-cuda`, not a native release package.
-- Final Docker images are smoke-run with `/usr/local/bin/izwi-server --help` so loader-time runtime dependencies are checked before the job passes.
+- The CPU Docker image is smoke-run with `/usr/local/bin/izwi-server --help`.
+- The CUDA Docker image is audited with `ldd`; CUDA runtime libraries must resolve from the image, while `libcuda.so.1` is allowed to remain unresolved because it is supplied by the NVIDIA container runtime on GPU hosts.
 
 ## Verification Requirements
 
@@ -86,7 +87,7 @@ Each release candidate must prove:
 - Linux and Windows native artifacts do not contain CUDA runtime payloads.
 - Native artifact sizes stay comfortably below GitHub's release asset limit.
 - The Docker CPU image builds and starts the server binary.
-- The Docker CUDA image builds from the NVIDIA CUDA runtime image and starts the CUDA-linked server binary.
+- The Docker CUDA image builds from the NVIDIA CUDA runtime image and exposes a CUDA-linked server binary whose non-driver CUDA libraries resolve inside the image.
 - CUDA source builds still compile in the CUDA CI container.
 
 ## Non-Forking Rule
