@@ -1,6 +1,7 @@
 # =============================================================================
 # Izwi Audio - Multi-stage Dockerfile (Rust-native runtime)
-# Supports both CPU and CUDA environments
+# Public native releases are CPU-only. CUDA is compiled and shipped through the
+# Docker production-cuda target, which uses the NVIDIA CUDA runtime image.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -127,7 +128,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
 CMD ["izwi-server"]
 
 # -----------------------------------------------------------------------------
-# Stage 5: Production runtime with CUDA support
+# Stage 5: Production runtime with CUDA support (Docker-only CUDA artifact)
 # -----------------------------------------------------------------------------
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS production-cuda
 
@@ -162,6 +163,7 @@ ENV IZWI_CONFIG_PATH=/app/config.toml
 ENV IZWI_UI_DIR=/app/ui/dist
 ENV IZWI_MODELS_DIR=/app/models
 ENV IZWI_BACKEND=cuda
+ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
 # Create directories for models and data
