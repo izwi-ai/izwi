@@ -9,8 +9,8 @@ Usage: scripts/ci/check-backend-truth.sh <command>
 Commands:
   cargo-cpu     Run CPU-focused cargo checks for the CLI and server
   cargo-cuda    Run CUDA-focused cargo checks for the CLI and server
-  docker-cpu    Validate the default Docker Compose config and build the CPU image
-  docker-cuda   Validate the CUDA Docker Compose profile and build the CUDA image
+  docker-cpu    Validate the default Docker Compose config, build, and smoke the CPU image
+  docker-cuda   Validate the CUDA Docker Compose profile, build, and smoke the CUDA image
 EOF
 }
 
@@ -27,6 +27,16 @@ resolve_cuda_compute_cap() {
     else
         echo "80"
     fi
+}
+
+smoke_docker_server() {
+    local image="$1"
+
+    echo "Smoke-checking ${image}"
+    docker run --rm \
+        --entrypoint /usr/local/bin/izwi-server \
+        "${image}" \
+        --help >/dev/null
 }
 
 run_cargo_cpu() {
@@ -54,6 +64,7 @@ run_docker_cpu() {
 
     docker compose config >/dev/null
     docker build --target production -t izwi-ci:production .
+    smoke_docker_server izwi-ci:production
 }
 
 run_docker_cuda() {
@@ -68,6 +79,7 @@ run_docker_cuda() {
         --target production-cuda \
         -t izwi-ci:production-cuda \
         .
+    smoke_docker_server izwi-ci:production-cuda
 }
 
 main() {
