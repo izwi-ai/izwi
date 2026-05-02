@@ -20,15 +20,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # CUDA 12.4.1 is available in NVIDIA's Ubuntu 22.04 apt repo; ubuntu-latest
-          # currently resolves to 24.04, where the 12.4 apt meta-package is absent.
-          - os: ubuntu-22.04
+          - os: ubuntu-latest
             asset_suffix: linux-x86_64
             bundle_kind: deb
             bundle_ext: deb
-          # Keep CUDA 12.4.1 on the Visual Studio 2022-era Windows runner instead
-          # of following windows-latest to newer MSVC toolchain changes.
-          - os: windows-2022
+          - os: windows-latest
             asset_suffix: windows-x86_64
             bundle_kind: nsis
             bundle_ext: exe
@@ -43,7 +39,6 @@ jobs:
       IZWI_UPDATER_PUBKEY: ${{ secrets.IZWI_UPDATER_PUBKEY }}
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-      CUDA_COMPUTE_CAP: "80"
 
     steps:
       - name: Checkout
@@ -109,14 +104,6 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install CUDA toolkit for unified Linux/Windows runtime
-        if: runner.os == 'Linux' || runner.os == 'Windows'
-        uses: Jimver/cuda-toolkit@v0.2.29
-        with:
-          cuda: "12.4.1"
-          method: network
-          log-file-suffix: "${{ matrix.asset_suffix }}.txt"
-
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:
@@ -129,57 +116,19 @@ jobs:
       - name: Build UI dist (required by izwi-desktop compile-time Tauri config)
         run: npm --prefix ui run build
 
-      - name: Build CLI, server, and desktop binaries (Linux/macOS)
-        if: runner.os != 'Windows'
+      - name: Build CLI, server, and desktop binaries
         run: |
           # izwi-desktop bundles izwi/izwi-server as resources, so build those first.
-          cargo build --release -p izwi-cli -p izwi-server
-          if [ "${{ runner.os }}" = "Linux" ]; then
-            CARGO_TARGET_DIR=target/cuda-release cargo build --release -p izwi-cli -p izwi-server --features izwi-cli/cuda,izwi-server/cuda
-            scripts/release/stage-unified-runtime.sh --cuda-target-dir target/cuda-release --copy-cuda-libs
-          fi
+          cargo build --release --bin izwi --bin izwi-server
           cargo build --release --bin izwi-desktop
-
-      - name: Build CLI, server, and desktop binaries (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          . scripts/release/enter-msvc-dev-env.ps1
-          cargo build --release -p izwi-cli -p izwi-server
-          $env:CARGO_TARGET_DIR = "target/cuda-release"
-          cargo build --release -p izwi-cli -p izwi-server --features "izwi-cli/cuda,izwi-server/cuda"
-          Remove-Item Env:\CARGO_TARGET_DIR
-          scripts/release/stage-unified-runtime.ps1 -CudaTargetDir target/cuda-release -CopyCudaLibs
-          cargo build --release --bin izwi-desktop
-
-      - name: Verify unified runtime layout (Linux)
-        if: runner.os == 'Linux'
-        run: scripts/release/verify-unified-runtime.sh
-
-      - name: Verify unified runtime layout (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: scripts/release/verify-unified-runtime.ps1
 
       - name: Package terminal binaries (Linux/macOS)
         if: runner.os != 'Windows'
         run: |
           mkdir -p release-assets
-          if [ "${{ runner.os }}" = "Linux" ]; then
-            tar -czf "release-assets/izwi-cli-${{ github.ref_name }}-${{ matrix.asset_suffix }}.tar.gz" \
-              -C target/release \
-              izwi izwi-server izwi-desktop runtime
-          else
-            tar -czf "release-assets/izwi-cli-${{ github.ref_name }}-${{ matrix.asset_suffix }}.tar.gz" \
-              -C target/release \
-              izwi izwi-server izwi-desktop
-          fi
-
-      - name: Verify terminal archive contents (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          scripts/release/verify-packaged-artifacts.sh \
-            --terminal-archive "release-assets/izwi-cli-${{ github.ref_name }}-${{ matrix.asset_suffix }}.tar.gz"
+          tar -czf "release-assets/izwi-cli-${{ github.ref_name }}-${{ matrix.asset_suffix }}.tar.gz" \
+            -C target/release \
+            izwi izwi-server izwi-desktop
 
       - name: Package terminal binaries (Windows)
         if: runner.os == 'Windows'
@@ -189,17 +138,9 @@ jobs:
           Compress-Archive -Path `
             target/release/izwi.exe, `
             target/release/izwi-server.exe, `
-            target/release/izwi-desktop.exe, `
-            target/release/runtime `
+            target/release/izwi-desktop.exe `
             -DestinationPath "release-assets/izwi-cli-${{ github.ref_name }}-${{ matrix.asset_suffix }}.zip" `
             -Force
-
-      - name: Verify terminal archive contents (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          scripts/release/verify-packaged-artifacts.ps1 `
-            -TerminalZip "release-assets/izwi-cli-${{ github.ref_name }}-${{ matrix.asset_suffix }}.zip"
 
       - name: Include macOS uninstall helper
         if: runner.os == 'macOS'
@@ -216,35 +157,7 @@ jobs:
           CI: "true"
         run: |
           cargo tauri build \
-            --bundles deb,appimage \
-            --config crates/izwi-desktop/tauri.release.linux.conf.json
-
-      - name: Verify desktop bundle contents (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          deb_path="$(
-            (
-              find target -type f -path "*/release/bundle/deb/*.deb" 2>/dev/null
-              find crates/izwi-desktop/target -type f -path "*/release/bundle/deb/*.deb" 2>/dev/null
-            ) | head -n 1
-          )"
-          appimage_path="$(
-            (
-              find target -type f -path "*/release/bundle/appimage/*.AppImage" 2>/dev/null
-              find crates/izwi-desktop/target -type f -path "*/release/bundle/appimage/*.AppImage" 2>/dev/null
-            ) | head -n 1
-          )"
-          if [ -z "$deb_path" ]; then
-            echo "Could not find .deb bundle to verify."
-            exit 1
-          fi
-          if [ -z "$appimage_path" ]; then
-            echo "Could not find AppImage bundle to verify."
-            exit 1
-          fi
-          scripts/release/verify-packaged-artifacts.sh \
-            --deb "$deb_path" \
-            --appimage "$appimage_path"
+            --bundles deb,appimage
 
       - name: Build desktop bundle (Windows)
         if: runner.os == 'Windows'
@@ -252,33 +165,7 @@ jobs:
         env:
           CI: "true"
         run: |
-          cargo tauri build --bundles ${{ matrix.bundle_kind }} --config crates/izwi-desktop/tauri.release.windows.conf.json
-
-      - name: Verify desktop bundle contents (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $preferredDirPattern = '[\\/]release[\\/]bundle[\\/]nsis[\\/]'
-          $fallbackDirPattern = '[\\/]release[\\/]bundle[\\/]nsis-updater[\\/]'
-
-          $bundle = Get-ChildItem -Path "target","crates/izwi-desktop/target" -Recurse -File |
-            Where-Object {
-              $_.Name -match '-setup\.exe$' -and
-              (
-                $_.FullName -match $preferredDirPattern -or
-                $_.FullName -match $fallbackDirPattern
-              )
-            } |
-            Sort-Object `
-              @{ Expression = { $_.FullName -match $preferredDirPattern }; Descending = $true }, `
-              @{ Expression = "LastWriteTime"; Descending = $true } |
-            Select-Object -First 1
-
-          if (-not $bundle) {
-            throw "Could not find Windows installer bundle to verify."
-          }
-
-          scripts/release/verify-packaged-artifacts.ps1 -InstallerPath $bundle.FullName
+          cargo tauri build --bundles ${{ matrix.bundle_kind }}
 
       - name: Build desktop bundle (unsigned macOS)
         if: runner.os == 'macOS' && env.APPLE_SIGNING_IDENTITY == ''
@@ -456,18 +343,6 @@ jobs:
       - name: Show release files
         run: ls -lah dist
 
-      - name: Generate release support note
-        run: |
-          cat > release-support.md <<'EOF'
-          ## Runtime Support For This Release
-
-          - macOS release assets are the Metal-capable path for Apple Silicon hosts.
-          - Linux and Windows GitHub release assets keep public `izwi` / `izwi-server` names CPU-safe, including their Windows `.exe` counterparts, and include a private packaged CUDA runtime.
-          - CUDA acceleration requires a compatible NVIDIA driver and GPU; CPU-only hosts continue to use the public CPU-safe path.
-          - CUDA release packaging is preview until GPU-host smoke coverage is automated.
-          - See the runtime support matrix: https://izwiai.com/docs/support-matrix
-          EOF
-
       - name: Generate beta updater manifest
         if: startsWith(github.ref_name, 'v0.1.0-beta-')
         run: |
@@ -556,6 +431,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: Izwi ${{ github.ref_name }}
-          body_path: release-support.md
+          generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: dist/*
