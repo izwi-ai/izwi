@@ -20,7 +20,9 @@ each binary can at least enter its version/help path.
 Options:
   -AllowMissing       Report missing CUDA DLLs without failing the audit.
   -AllowMissingDriver Allow missing nvcuda.dll, but fail other missing CUDA DLLs.
-  -ExpectCudaDlls     Require CUDA runtime DLLs other than nvcuda.dll to be visible.
+  -ExpectCudaDlls     Require packaged CUDA runtime DLLs to be visible.
+                   Host driver DLLs and optional CUDA DLL families are reported
+                   but only fail when imported by a binary.
   -SkipStartupProbe
                    Do not execute --version/--help after DLL inspection.
 "@
@@ -31,15 +33,19 @@ if (-not $Binaries -or $Binaries.Count -eq 0) {
     exit 1
 }
 
-$cudaDllPatterns = @(
-    "nvcuda.dll",
+$requiredPackagedCudaDllPatterns = @(
     "cudart64_*.dll",
     "cublas64_*.dll",
     "cublasLt64_*.dll",
     "curand64_*.dll",
     "nvrtc64_*.dll",
-    "cudnn64_*.dll"
+    "nvrtc-builtins64_*.dll"
 )
+
+$hostDriverCudaDllPatterns = @("nvcuda.dll")
+$optionalCudaDllPatterns = @("cudnn64_*.dll")
+
+$cudaDllPatterns = $hostDriverCudaDllPatterns + $requiredPackagedCudaDllPatterns + $optionalCudaDllPatterns
 
 $cudaDependencyPattern = "(?i)\b([A-Za-z0-9_.-]*(cuda|cublas|curand|nvrtc|cudnn)[A-Za-z0-9_.-]*\.dll)\b"
 
@@ -201,7 +207,7 @@ foreach ($binary in $Binaries) {
             Write-Host "  $pattern -> $found"
         } else {
             Write-Host "  $pattern -> missing"
-            if ($ExpectCudaDlls -and -not (Test-MissingAllowed -Name $pattern)) {
+            if ($ExpectCudaDlls -and ($requiredPackagedCudaDllPatterns -contains $pattern)) {
                 $failed = $true
             }
         }
