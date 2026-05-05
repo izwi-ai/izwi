@@ -1,8 +1,10 @@
 use crate::{db::migrator::Migrator, storage_layout};
 use anyhow::Context;
-use sea_orm::{sqlx::sqlite::SqliteJournalMode, ConnectOptions, Database, DatabaseConnection};
-use std::path::Path;
+use sea_orm::{ConnectOptions, Database, DatabaseConnection, sqlx::sqlite::SqliteJournalMode};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::OnceCell;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(3);
 const SQLITE_MAX_CONNECTIONS: u32 = 5;
@@ -46,6 +48,42 @@ pub async fn connect_path(db_path: &Path) -> anyhow::Result<DatabaseConnection> 
             db_path.display()
         )
     })
+}
+
+#[derive(Clone)]
+pub struct StoreDatabase {
+    db_path: PathBuf,
+    connection: Arc<OnceCell<DatabaseConnection>>,
+}
+
+impl StoreDatabase {
+    pub fn from_default_path() -> anyhow::Result<Self> {
+        let db_path = storage_layout::resolve_db_path();
+        let media_root = storage_layout::resolve_media_root();
+        storage_layout::ensure_storage_dirs(&db_path, &media_root)
+            .context("Failed to prepare storage layout for SeaORM store")?;
+        Ok(Self::new(db_path))
+    }
+
+    pub fn new(db_path: PathBuf) -> Self {
+        Self {
+            db_path,
+            connection: Arc::new(OnceCell::new()),
+        }
+    }
+
+    pub async fn connection(&self) -> anyhow::Result<&DatabaseConnection> {
+        let db_path = self.db_path.clone();
+        self.connection
+            .get_or_try_init(|| async move {
+                let db = connect_path(&db_path).await?;
+                Migrator::up(&db)
+                    .await
+                    .context("Failed to run SQLite migrations for SeaORM store")?;
+                Ok(db)
+            })
+            .await
+    }
 }
 
 fn sqlite_url(db_path: &Path) -> String {
