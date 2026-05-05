@@ -12,6 +12,8 @@ path = "src/main.rs"
 [features]
 default = []
 cuda = ["izwi-core/cuda"]
+db-mysql = ["sea-orm/sqlx-mysql"]
+db-postgres = ["sea-orm/sqlx-postgres"]
 
 [dependencies]
 tokio = { workspace = true }

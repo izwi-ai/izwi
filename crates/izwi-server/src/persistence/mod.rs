@@ -1,5 +1,5 @@
 use crate::{db, db::migrator::Migrator, storage_layout};
-use anyhow::Context;
+use anyhow::{bail, Context};
 use izwi_hooks::{
     DatabaseBackend, DatabaseConnectionDecision, DatabaseMigrationMode, DatabaseProviderDecision,
     DatabaseProviderRequest, EnterpriseHooks, HookError, HookMetadata, HookResult,
@@ -7,7 +7,7 @@ use izwi_hooks::{
     MediaStorageProvider, MediaStorageProviderDecision, MediaStorageProviderRequest,
     MediaWriteRequest, StoredMediaBytes, StoredMediaObject,
 };
-use sea_orm::DatabaseConnection;
+use sea_orm::{DatabaseConnection, DatabaseConnectionType, DbBackend};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -168,6 +168,10 @@ async fn local_database_context() -> anyhow::Result<DatabaseContext> {
 async fn provider_database_context(
     decision: DatabaseConnectionDecision,
 ) -> anyhow::Result<DatabaseContext> {
+    let actual_backend = actual_database_backend(&decision.connection)?;
+    validate_declared_backend(&decision.backend, &actual_backend)?;
+    validate_migration_mode_for_backend(&actual_backend, &decision.migration_mode)?;
+
     if matches!(decision.migration_mode, DatabaseMigrationMode::IzwiManaged) {
         Migrator::up(&decision.connection)
             .await
@@ -180,6 +184,51 @@ async fn provider_database_context(
         decision.migration_mode,
         decision.metadata,
     ))
+}
+
+fn actual_database_backend(connection: &DatabaseConnection) -> anyhow::Result<DatabaseBackend> {
+    if matches!(&connection.inner, DatabaseConnectionType::Disconnected) {
+        bail!("Enterprise database hook returned a disconnected SeaORM connection");
+    }
+
+    Ok(hook_backend_from_seaorm(connection.get_database_backend()))
+}
+
+fn hook_backend_from_seaorm(backend: DbBackend) -> DatabaseBackend {
+    match backend {
+        DbBackend::Sqlite => DatabaseBackend::Sqlite,
+        DbBackend::Postgres => DatabaseBackend::Postgres,
+        DbBackend::MySql => DatabaseBackend::Mysql,
+        _ => DatabaseBackend::Other(format!("{backend:?}")),
+    }
+}
+
+fn validate_declared_backend(
+    declared: &DatabaseBackend,
+    actual: &DatabaseBackend,
+) -> anyhow::Result<()> {
+    if matches!(declared, DatabaseBackend::Other(_)) || declared == actual {
+        return Ok(());
+    }
+
+    bail!(
+        "Enterprise database hook declared backend {declared:?}, but the SeaORM connection reports {actual:?}"
+    );
+}
+
+fn validate_migration_mode_for_backend(
+    backend: &DatabaseBackend,
+    migration_mode: &DatabaseMigrationMode,
+) -> anyhow::Result<()> {
+    if matches!(migration_mode, DatabaseMigrationMode::IzwiManaged)
+        && !matches!(backend, DatabaseBackend::Sqlite)
+    {
+        bail!(
+            "Izwi-managed migrations currently require the local SQLite backend; enterprise database providers must use provider-managed or disabled migrations for {backend:?}"
+        );
+    }
+
+    Ok(())
 }
 
 async fn resolve_media_storage(
@@ -339,6 +388,7 @@ fn filename_from_key(key: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::test_support::env_lock;
+    use izwi_hooks::{DatabaseProvider, DatabaseProviderDecision};
     use sea_orm::DbBackend;
 
     #[tokio::test]
@@ -404,5 +454,85 @@ mod tests {
             })
             .await
             .expect("delete media");
+    }
+
+    #[tokio::test]
+    async fn enterprise_database_backend_mismatch_is_rejected() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let connection = db::sqlite::connect_path(&temp_dir.path().join("enterprise.sqlite3"))
+            .await
+            .expect("sqlite connection");
+        let mut hooks = EnterpriseHooks::noop();
+        hooks.database = Arc::new(StaticDatabaseProvider {
+            decision: DatabaseProviderDecision::UseConnection(DatabaseConnectionDecision {
+                connection,
+                backend: DatabaseBackend::Postgres,
+                migration_mode: DatabaseMigrationMode::ProviderManaged,
+                metadata: HookMetadata::new(),
+            }),
+        });
+
+        let error = match PersistenceContext::resolve(&hooks).await {
+            Ok(_) => panic!("backend mismatch should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("declared backend Postgres, but the SeaORM connection reports Sqlite"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn izwi_managed_migrations_are_restricted_to_sqlite() {
+        assert!(validate_migration_mode_for_backend(
+            &DatabaseBackend::Sqlite,
+            &DatabaseMigrationMode::IzwiManaged,
+        )
+        .is_ok());
+
+        let error = validate_migration_mode_for_backend(
+            &DatabaseBackend::Postgres,
+            &DatabaseMigrationMode::IzwiManaged,
+        )
+        .expect_err("managed migrations should reject non-sqlite backends");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Izwi-managed migrations currently require the local SQLite backend"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn provider_managed_modes_accept_non_sqlite_backends() {
+        assert!(validate_migration_mode_for_backend(
+            &DatabaseBackend::Postgres,
+            &DatabaseMigrationMode::ProviderManaged,
+        )
+        .is_ok());
+        assert!(validate_migration_mode_for_backend(
+            &DatabaseBackend::Mysql,
+            &DatabaseMigrationMode::Disabled,
+        )
+        .is_ok());
+    }
+
+    #[derive(Clone)]
+    struct StaticDatabaseProvider {
+        decision: DatabaseProviderDecision,
+    }
+
+    #[async_trait::async_trait]
+    impl DatabaseProvider for StaticDatabaseProvider {
+        async fn resolve_database(
+            &self,
+            _request: &DatabaseProviderRequest,
+        ) -> HookResult<DatabaseProviderDecision> {
+            Ok(self.decision.clone())
+        }
     }
 }
