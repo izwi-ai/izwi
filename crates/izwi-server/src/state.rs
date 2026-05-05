@@ -7,7 +7,6 @@ use crate::onboarding_store::OnboardingStore;
 use crate::persistence::PersistenceContext;
 use crate::saved_voice_store::SavedVoiceStore;
 use crate::speech_history_store::SpeechHistoryStore;
-use crate::storage_layout;
 use crate::studio_project_store::StudioProjectStore;
 use crate::transcription_store::TranscriptionStore;
 use crate::voice_observation_store::VoiceObservationStore;
@@ -257,25 +256,25 @@ impl AppState {
             DEFAULT_AGENT_SESSION_STORE_LIMIT,
         );
         let store_database = StoreDatabase::from_connection(persistence.database.connection());
-        let media_root = storage_layout::resolve_media_root();
+        let media_storage = persistence.media_storage();
 
         let chat_store = Arc::new(ChatStore::initialize_with_database(store_database.clone()));
-        let transcription_store = Arc::new(TranscriptionStore::initialize_with_database(
+        let transcription_store = Arc::new(TranscriptionStore::initialize_with_storage(
             store_database.clone(),
-            media_root.clone(),
-        )?);
-        let diarization_store = Arc::new(DiarizationStore::initialize_with_database(
+            media_storage.clone(),
+        ));
+        let diarization_store = Arc::new(DiarizationStore::initialize_with_storage(
             store_database.clone(),
-            media_root.clone(),
-        )?);
-        let speech_history_store = Arc::new(SpeechHistoryStore::initialize_with_database(
+            media_storage.clone(),
+        ));
+        let speech_history_store = Arc::new(SpeechHistoryStore::initialize_with_storage(
             store_database.clone(),
-            media_root.clone(),
-        )?);
-        let saved_voice_store = Arc::new(SavedVoiceStore::initialize_with_database(
+            media_storage.clone(),
+        ));
+        let saved_voice_store = Arc::new(SavedVoiceStore::initialize_with_storage(
             store_database.clone(),
-            media_root,
-        )?);
+            media_storage,
+        ));
         let studio_store = Arc::new(StudioProjectStore::initialize_with_database(
             store_database.clone(),
         ));

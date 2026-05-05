@@ -1,6 +1,6 @@
 use crate::{db::migrator::Migrator, storage_layout};
 use anyhow::Context;
-use sea_orm::{ConnectOptions, Database, DatabaseConnection, sqlx::sqlite::SqliteJournalMode};
+use sea_orm::{sqlx::sqlite::SqliteJournalMode, ConnectOptions, Database, DatabaseConnection};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,6 +10,7 @@ use tokio::sync::OnceCell;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(3);
 const SQLITE_MAX_CONNECTIONS: u32 = 5;
 
+#[cfg(test)]
 pub async fn initialize_default() -> anyhow::Result<DatabaseConnection> {
     let db = connect_default().await?;
     Migrator::up(&db)

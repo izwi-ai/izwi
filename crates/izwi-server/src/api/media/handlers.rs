@@ -1,21 +1,32 @@
 use axum::{
     body::Body,
-    extract::Path,
+    extract::{Path, State},
     http::{header, StatusCode},
     response::Response,
 };
 
 use crate::error::ApiError;
+use crate::persistence::read_media_object;
+use crate::state::AppState;
 use crate::storage_layout;
 
-pub async fn get_media(Path(path): Path<String>) -> Result<Response, ApiError> {
+pub async fn get_media(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+) -> Result<Response, ApiError> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return Err(ApiError::bad_request("Media path cannot be empty"));
     }
 
-    let media_root = storage_layout::resolve_media_root();
-    let bytes = storage_layout::read_media_file(&media_root, trimmed).map_err(map_media_error)?;
+    let bytes = if let Some(persistence) = state.persistence.as_ref() {
+        read_media_object(&persistence.media_storage(), trimmed)
+            .await
+            .map_err(map_media_error)?
+    } else {
+        let media_root = storage_layout::resolve_media_root();
+        storage_layout::read_media_file(&media_root, trimmed).map_err(map_media_error)?
+    };
     let content_type = content_type_from_path(trimmed);
 
     Response::builder()
