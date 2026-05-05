@@ -11,6 +11,7 @@ use tracing::{info, warn};
 mod api;
 mod app;
 mod chat_store;
+mod db;
 mod diarization_store;
 mod error;
 mod ids;
@@ -109,6 +110,7 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
 
     // Create runtime service
     let runtime = RuntimeService::new(config)?;
+    db::initialize_default().await?;
     let state = AppState::with_enterprise_hooks(runtime, &serve_config, enterprise_hooks)?;
     let mut startup_warnings = preload_configured_models(&state).await;
     startup_warnings.extend(warmup_preloaded_asr_models(&state).await);

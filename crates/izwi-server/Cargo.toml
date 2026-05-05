@@ -45,7 +45,15 @@ izwi-agent = { path = "../izwi-agent" }
 
 config = { workspace = true }
 dirs = { workspace = true }
-rusqlite = { version = "0.38.0", features = ["bundled"] }
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
+sea-orm = { version = "=2.0.0-rc.38", default-features = false, features = [
+    "macros",
+    "runtime-tokio",
+    "sqlx-sqlite",
+    "sqlite-use-returning-for-3_35",
+    "with-json",
+    "with-uuid",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 izwi-core = { path = "../izwi-core", default-features = false, features = ["metal", "accelerate"] }
