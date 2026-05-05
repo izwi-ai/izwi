@@ -30,6 +30,10 @@ impl OnboardingStore {
         })
     }
 
+    pub fn initialize_with_database(db: StoreDatabase) -> Self {
+        Self { db }
+    }
+
     pub async fn get_state(&self) -> anyhow::Result<OnboardingState> {
         let db = self.db.connection().await?;
         read_state(db).await

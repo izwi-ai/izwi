@@ -45,6 +45,10 @@ impl VoiceObservationStore {
         })
     }
 
+    pub fn initialize_with_database(db: StoreDatabase) -> Self {
+        Self { db }
+    }
+
     pub async fn list_active(
         &self,
         profile_id: String,

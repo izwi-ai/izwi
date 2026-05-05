@@ -96,6 +96,10 @@ impl VoiceStore {
         })
     }
 
+    pub fn initialize_with_database(db: StoreDatabase) -> Self {
+        Self { db }
+    }
+
     pub async fn get_default_profile(&self) -> anyhow::Result<VoiceProfile> {
         self.get_profile(DEFAULT_VOICE_PROFILE_ID.to_string())
             .await?

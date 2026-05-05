@@ -111,6 +111,16 @@ impl SavedVoiceStore {
         })
     }
 
+    pub fn initialize_with_database(
+        db: StoreDatabase,
+        media_root: PathBuf,
+    ) -> anyhow::Result<Self> {
+        storage_layout::ensure_media_dirs(&media_root)
+            .context("Failed to prepare saved voice media storage layout")?;
+
+        Ok(Self { db, media_root })
+    }
+
     pub async fn list_voices_page(
         &self,
         limit: usize,

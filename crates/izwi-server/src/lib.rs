@@ -38,6 +38,7 @@ use izwi_core::{
 };
 use izwi_hooks::EnterpriseHooks;
 use logging::{LogFormat, SERVICE_NAME, SERVICE_VERSION};
+use persistence::PersistenceContext;
 use state::AppState;
 
 #[derive(Debug, Parser)]
@@ -112,8 +113,13 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
 
     // Create runtime service
     let runtime = RuntimeService::new(config)?;
-    db::initialize_default().await?;
-    let state = AppState::with_enterprise_hooks(runtime, &serve_config, enterprise_hooks)?;
+    let persistence = PersistenceContext::resolve(&enterprise_hooks).await?;
+    let state = AppState::with_enterprise_hooks_and_persistence(
+        runtime,
+        &serve_config,
+        enterprise_hooks,
+        persistence,
+    )?;
     let mut startup_warnings = preload_configured_models(&state).await;
     startup_warnings.extend(warmup_preloaded_asr_models(&state).await);
     if !startup_warnings.is_empty() {

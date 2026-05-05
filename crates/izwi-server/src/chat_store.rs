@@ -52,6 +52,10 @@ impl ChatStore {
         })
     }
 
+    pub fn initialize_with_database(db: StoreDatabase) -> Self {
+        Self { db }
+    }
+
     pub async fn list_threads(&self) -> anyhow::Result<Vec<ChatThreadSummary>> {
         let db = self.db.connection().await?;
         let rows = db

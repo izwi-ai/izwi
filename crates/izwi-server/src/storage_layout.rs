@@ -49,6 +49,10 @@ pub fn ensure_storage_dirs(db_path: &Path, media_root: &Path) -> anyhow::Result<
         })?;
     }
 
+    ensure_media_dirs(media_root)
+}
+
+pub fn ensure_media_dirs(media_root: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(media_root).with_context(|| {
         format!(
             "Failed to create media root directory: {}",
