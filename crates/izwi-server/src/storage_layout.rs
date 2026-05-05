@@ -1,9 +1,7 @@
 //! Shared storage layout and filesystem helpers for server persistence.
 
 use anyhow::{anyhow, Context};
-use rusqlite::Connection;
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
 
 const APP_NAME_DIR: &str = "izwi";
 const DEFAULT_DB_FILENAME: &str = "izwi.sqlite3";
@@ -69,18 +67,6 @@ pub fn ensure_storage_dirs(db_path: &Path, media_root: &Path) -> anyhow::Result<
     }
 
     Ok(())
-}
-
-pub fn open_sqlite_connection(path: &Path) -> anyhow::Result<Connection> {
-    let conn = Connection::open(path)
-        .with_context(|| format!("Unable to open SQLite database at {}", path.display()))?;
-    conn.busy_timeout(Duration::from_secs(3))
-        .context("Failed to configure SQLite busy timeout")?;
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .context("Failed to enable SQLite WAL journal mode")?;
-    conn.pragma_update(None, "foreign_keys", "ON")
-        .context("Failed to enable SQLite foreign key constraints")?;
-    Ok(conn)
 }
 
 pub fn persist_audio_file(
