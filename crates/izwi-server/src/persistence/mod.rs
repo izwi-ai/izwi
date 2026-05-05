@@ -1,0 +1,344 @@
+use crate::{db, db::migrator::Migrator, storage_layout};
+use anyhow::Context;
+use izwi_hooks::{
+    DatabaseBackend, DatabaseConnectionDecision, DatabaseMigrationMode, DatabaseProviderDecision,
+    DatabaseProviderRequest, EnterpriseHooks, HookError, HookMetadata, HookResult,
+    MediaDeleteRequest, MediaNamespace, MediaObjectKey, MediaObjectMetadata, MediaReadRequest,
+    MediaStorageProvider, MediaStorageProviderDecision, MediaStorageProviderRequest,
+    MediaWriteRequest, StoredMediaBytes, StoredMediaObject,
+};
+use sea_orm::DatabaseConnection;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+#[derive(Clone)]
+pub struct PersistenceContext {
+    pub database: DatabaseContext,
+    pub media_storage: Arc<dyn MediaStorageProvider>,
+}
+
+impl PersistenceContext {
+    pub async fn resolve(enterprise_hooks: &EnterpriseHooks) -> anyhow::Result<Self> {
+        let database = resolve_database(enterprise_hooks).await?;
+        let media_storage = resolve_media_storage(enterprise_hooks).await?;
+
+        Ok(Self {
+            database,
+            media_storage,
+        })
+    }
+
+    pub async fn local_default() -> anyhow::Result<Self> {
+        let hooks = EnterpriseHooks::noop();
+        Self::resolve(&hooks).await
+    }
+}
+
+#[derive(Clone)]
+pub struct DatabaseContext {
+    connection: DatabaseConnection,
+    backend: DatabaseBackend,
+    migration_mode: DatabaseMigrationMode,
+    metadata: HookMetadata,
+}
+
+impl DatabaseContext {
+    pub fn new(
+        connection: DatabaseConnection,
+        backend: DatabaseBackend,
+        migration_mode: DatabaseMigrationMode,
+        metadata: HookMetadata,
+    ) -> Self {
+        Self {
+            connection,
+            backend,
+            migration_mode,
+            metadata,
+        }
+    }
+
+    pub fn connection(&self) -> DatabaseConnection {
+        self.connection.clone()
+    }
+
+    pub fn backend(&self) -> &DatabaseBackend {
+        &self.backend
+    }
+
+    pub fn migration_mode(&self) -> &DatabaseMigrationMode {
+        &self.migration_mode
+    }
+
+    pub fn metadata(&self) -> &HookMetadata {
+        &self.metadata
+    }
+}
+
+async fn resolve_database(enterprise_hooks: &EnterpriseHooks) -> anyhow::Result<DatabaseContext> {
+    match enterprise_hooks
+        .database
+        .resolve_database(&DatabaseProviderRequest::server_runtime())
+        .await
+        .map_err(|err| anyhow::anyhow!("Enterprise database hook failed: {err}"))?
+    {
+        DatabaseProviderDecision::UseDefault => local_database_context().await,
+        DatabaseProviderDecision::UseConnection(decision) => provider_database_context(decision).await,
+    }
+}
+
+async fn local_database_context() -> anyhow::Result<DatabaseContext> {
+    let connection = db::sqlite::connect_default().await?;
+    Migrator::up(&connection)
+        .await
+        .context("Failed to run local SQLite migrations")?;
+
+    Ok(DatabaseContext::new(
+        connection,
+        DatabaseBackend::Sqlite,
+        DatabaseMigrationMode::IzwiManaged,
+        HookMetadata::new(),
+    ))
+}
+
+async fn provider_database_context(
+    decision: DatabaseConnectionDecision,
+) -> anyhow::Result<DatabaseContext> {
+    if matches!(decision.migration_mode, DatabaseMigrationMode::IzwiManaged) {
+        Migrator::up(&decision.connection)
+            .await
+            .context("Failed to run Izwi-managed migrations on enterprise database")?;
+    }
+
+    Ok(DatabaseContext::new(
+        decision.connection,
+        decision.backend,
+        decision.migration_mode,
+        decision.metadata,
+    ))
+}
+
+async fn resolve_media_storage(
+    enterprise_hooks: &EnterpriseHooks,
+) -> anyhow::Result<Arc<dyn MediaStorageProvider>> {
+    match enterprise_hooks
+        .media_storage
+        .resolve_media_storage(&MediaStorageProviderRequest::server_media())
+        .await
+        .map_err(|err| anyhow::anyhow!("Enterprise media storage hook failed: {err}"))?
+    {
+        MediaStorageProviderDecision::UseDefault => Ok(Arc::new(LocalMediaStorageProvider::new(
+            storage_layout::resolve_media_root(),
+        ))),
+        MediaStorageProviderDecision::UseProvider(provider) => Ok(provider),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalMediaStorageProvider {
+    media_root: PathBuf,
+}
+
+impl LocalMediaStorageProvider {
+    pub fn new(media_root: PathBuf) -> Self {
+        Self { media_root }
+    }
+
+    pub fn media_root(&self) -> &PathBuf {
+        &self.media_root
+    }
+}
+
+#[async_trait::async_trait]
+impl MediaStorageProvider for LocalMediaStorageProvider {
+    async fn put(
+        &self,
+        request: MediaWriteRequest,
+        bytes: Vec<u8>,
+    ) -> HookResult<StoredMediaObject> {
+        let content_length = bytes.len() as u64;
+        let (group, namespace) = local_namespace(&request.namespace, &request.metadata);
+        let key = storage_layout::persist_audio_file(
+            &self.media_root,
+            group,
+            &namespace,
+            &request.record_id,
+            request.preferred_filename.as_deref(),
+            &request.content_type,
+            &bytes,
+        )
+        .map_err(|err| HookError::Failed(err.to_string()))?;
+
+        Ok(StoredMediaObject {
+            key: MediaObjectKey::new(key),
+            metadata: MediaObjectMetadata {
+                content_type: request.content_type,
+                filename: request.preferred_filename,
+                content_length: Some(content_length),
+                sha256: None,
+                tenant_id: None,
+                attributes: request.metadata,
+            },
+        })
+    }
+
+    async fn get(&self, request: MediaReadRequest) -> HookResult<StoredMediaBytes> {
+        let bytes = storage_layout::read_media_file(&self.media_root, &request.key.key)
+            .map_err(|err| HookError::Failed(err.to_string()))?;
+
+        Ok(StoredMediaBytes {
+            metadata: MediaObjectMetadata {
+                content_type: content_type_from_key(&request.key.key).to_string(),
+                filename: filename_from_key(&request.key.key),
+                content_length: Some(bytes.len() as u64),
+                sha256: None,
+                tenant_id: None,
+                attributes: request.metadata,
+            },
+            bytes,
+        })
+    }
+
+    async fn delete(&self, request: MediaDeleteRequest) -> HookResult<()> {
+        storage_layout::delete_media_file(&self.media_root, Some(&request.key.key))
+            .map_err(|err| HookError::Failed(err.to_string()))
+    }
+}
+
+fn local_namespace(
+    namespace: &MediaNamespace,
+    metadata: &HookMetadata,
+) -> (storage_layout::MediaGroup, String) {
+    match namespace {
+        MediaNamespace::TranscriptionUpload => (
+            storage_layout::MediaGroup::Uploads,
+            "transcription".to_string(),
+        ),
+        MediaNamespace::DiarizationUpload => (
+            storage_layout::MediaGroup::Uploads,
+            "diarization".to_string(),
+        ),
+        MediaNamespace::GeneratedSpeech => {
+            let route_kind = metadata.get("route_kind").map(String::as_str).unwrap_or("speech");
+            (
+                storage_layout::MediaGroup::Generated,
+                format!("speech/{route_kind}"),
+            )
+        }
+        MediaNamespace::SavedVoice => (storage_layout::MediaGroup::Generated, "voices".to_string()),
+        MediaNamespace::ChatMedia => (storage_layout::MediaGroup::Uploads, "chat".to_string()),
+        MediaNamespace::Export => (storage_layout::MediaGroup::Generated, "exports".to_string()),
+        MediaNamespace::Other(namespace) => (
+            storage_layout::MediaGroup::Generated,
+            sanitize_namespace(namespace),
+        ),
+    }
+}
+
+fn sanitize_namespace(namespace: &str) -> String {
+    namespace
+        .split('/')
+        .filter(|segment| {
+            !segment.is_empty()
+                && segment
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn content_type_from_key(key: &str) -> &'static str {
+    match std::path::Path::new(key)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("wav") => "audio/wav",
+        Some("mp3") => "audio/mpeg",
+        Some("ogg") => "audio/ogg",
+        Some("flac") => "audio/flac",
+        Some("webm") => "audio/webm",
+        Some("m4a") => "audio/mp4",
+        Some("aac") => "audio/aac",
+        _ => "application/octet-stream",
+    }
+}
+
+fn filename_from_key(key: &str) -> Option<String> {
+    std::path::Path::new(key)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::env_lock;
+    use sea_orm::DbBackend;
+
+    #[tokio::test]
+    async fn noop_hooks_resolve_local_persistence() {
+        let _guard = env_lock();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("izwi.sqlite3");
+        let media_dir = temp_dir.path().join("media");
+        std::env::set_var("IZWI_DB_PATH", &db_path);
+        std::env::set_var("IZWI_MEDIA_DIR", &media_dir);
+
+        let context = PersistenceContext::local_default()
+            .await
+            .expect("local persistence resolves");
+
+        assert_eq!(
+            context.database.connection().get_database_backend(),
+            DbBackend::Sqlite
+        );
+        assert!(db_path.exists());
+        assert!(media_dir.exists());
+
+        std::env::remove_var("IZWI_DB_PATH");
+        std::env::remove_var("IZWI_MEDIA_DIR");
+    }
+
+    #[tokio::test]
+    async fn local_media_provider_round_trips_bytes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let provider = LocalMediaStorageProvider::new(temp_dir.path().to_path_buf());
+        let mut metadata = HookMetadata::new();
+        metadata.insert("route_kind".to_string(), "tts".to_string());
+
+        let stored = provider
+            .put(
+                MediaWriteRequest {
+                    namespace: MediaNamespace::GeneratedSpeech,
+                    record_id: "record-1".to_string(),
+                    preferred_filename: Some("speech.wav".to_string()),
+                    content_type: "audio/wav".to_string(),
+                    metadata,
+                },
+                b"audio".to_vec(),
+            )
+            .await
+            .expect("write media");
+
+        assert_eq!(stored.key.key, "generated/speech/tts/record-1.wav");
+
+        let bytes = provider
+            .get(MediaReadRequest {
+                key: stored.key.clone(),
+                metadata: HookMetadata::new(),
+            })
+            .await
+            .expect("read media");
+        assert_eq!(bytes.bytes, b"audio");
+
+        provider
+            .delete(MediaDeleteRequest {
+                key: stored.key,
+                metadata: HookMetadata::new(),
+            })
+            .await
+            .expect("delete media");
+    }
+}

@@ -18,6 +18,7 @@ mod error;
 mod ids;
 mod logging;
 mod onboarding_store;
+mod persistence;
 mod saved_voice_store;
 mod speech_history_store;
 mod state;
