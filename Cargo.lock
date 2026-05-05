@@ -3683,6 +3683,7 @@ name = "izwi-hooks"
 version = "0.1.0-beta-15"
 dependencies = [
  "async-trait",
+ "sea-orm",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
