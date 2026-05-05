@@ -28,9 +28,14 @@ impl PersistenceContext {
         })
     }
 
+    #[cfg(test)]
     pub async fn local_default() -> anyhow::Result<Self> {
         let hooks = EnterpriseHooks::noop();
         Self::resolve(&hooks).await
+    }
+
+    pub fn media_storage(&self) -> Arc<dyn MediaStorageProvider> {
+        self.media_storage.clone()
     }
 }
 
@@ -74,6 +79,64 @@ impl DatabaseContext {
     }
 }
 
+pub async fn persist_audio_object(
+    provider: &Arc<dyn MediaStorageProvider>,
+    namespace: MediaNamespace,
+    record_id: impl Into<String>,
+    preferred_filename: Option<&str>,
+    mime_type: &str,
+    bytes: &[u8],
+    metadata: HookMetadata,
+) -> anyhow::Result<String> {
+    let stored = provider
+        .put(
+            MediaWriteRequest {
+                namespace,
+                record_id: record_id.into(),
+                preferred_filename: preferred_filename.map(str::to_string),
+                content_type: mime_type.to_string(),
+                metadata,
+            },
+            bytes.to_vec(),
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("Media storage write failed: {err}"))?;
+
+    Ok(stored.key.key)
+}
+
+pub async fn read_media_object(
+    provider: &Arc<dyn MediaStorageProvider>,
+    key: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let stored = provider
+        .get(MediaReadRequest {
+            key: MediaObjectKey::new(key),
+            metadata: HookMetadata::new(),
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("Media storage read failed: {err}"))?;
+
+    Ok(stored.bytes)
+}
+
+pub async fn delete_media_object(
+    provider: &Arc<dyn MediaStorageProvider>,
+    key: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(key) = key.filter(|key| !key.trim().is_empty()) else {
+        return Ok(());
+    };
+
+    provider
+        .delete(MediaDeleteRequest {
+            key: MediaObjectKey::new(key),
+            metadata: HookMetadata::new(),
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("Media storage delete failed: {err}"))
+}
+
 async fn resolve_database(enterprise_hooks: &EnterpriseHooks) -> anyhow::Result<DatabaseContext> {
     match enterprise_hooks
         .database
@@ -82,7 +145,9 @@ async fn resolve_database(enterprise_hooks: &EnterpriseHooks) -> anyhow::Result<
         .map_err(|err| anyhow::anyhow!("Enterprise database hook failed: {err}"))?
     {
         DatabaseProviderDecision::UseDefault => local_database_context().await,
-        DatabaseProviderDecision::UseConnection(decision) => provider_database_context(decision).await,
+        DatabaseProviderDecision::UseConnection(decision) => {
+            provider_database_context(decision).await
+        }
     }
 }
 
@@ -141,10 +206,6 @@ pub struct LocalMediaStorageProvider {
 impl LocalMediaStorageProvider {
     pub fn new(media_root: PathBuf) -> Self {
         Self { media_root }
-    }
-
-    pub fn media_root(&self) -> &PathBuf {
-        &self.media_root
     }
 }
 
@@ -218,7 +279,10 @@ fn local_namespace(
             "diarization".to_string(),
         ),
         MediaNamespace::GeneratedSpeech => {
-            let route_kind = metadata.get("route_kind").map(String::as_str).unwrap_or("speech");
+            let route_kind = metadata
+                .get("route_kind")
+                .map(String::as_str)
+                .unwrap_or("speech");
             (
                 storage_layout::MediaGroup::Generated,
                 format!("speech/{route_kind}"),

@@ -1,19 +1,24 @@
 //! Persistent transcription history storage backed by SQLite.
 
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
+use izwi_hooks::{HookMetadata, MediaNamespace, MediaStorageProvider};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryResult, Set, Statement,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     db::StoreDatabase,
     entity::transcription_records,
     ids::new_uuid,
-    storage_layout::{self, MediaGroup},
+    persistence::{
+        delete_media_object, persist_audio_object, read_media_object, LocalMediaStorageProvider,
+    },
+    storage_layout,
 };
 
 const DEFAULT_LIST_LIMIT: usize = 200;
@@ -196,7 +201,7 @@ pub struct CompleteTranscriptionRecord {
 #[derive(Clone)]
 pub struct TranscriptionStore {
     db: StoreDatabase,
-    media_root: PathBuf,
+    media_storage: Arc<dyn MediaStorageProvider>,
 }
 
 impl TranscriptionStore {
@@ -213,18 +218,15 @@ impl TranscriptionStore {
 
         Ok(Self {
             db: StoreDatabase::new(db_path),
-            media_root,
+            media_storage: Arc::new(LocalMediaStorageProvider::new(media_root)),
         })
     }
 
-    pub fn initialize_with_database(
+    pub fn initialize_with_storage(
         db: StoreDatabase,
-        media_root: PathBuf,
-    ) -> anyhow::Result<Self> {
-        storage_layout::ensure_media_dirs(&media_root)
-            .context("Failed to prepare transcription media storage layout")?;
-
-        Ok(Self { db, media_root })
+        media_storage: Arc<dyn MediaStorageProvider>,
+    ) -> Self {
+        Self { db, media_storage }
     }
 
     pub async fn list_records_page(
@@ -308,8 +310,9 @@ impl TranscriptionStore {
         let audio_storage_path: String = row.try_get_by_index(0)?;
         let audio_mime_type: String = row.try_get_by_index(1)?;
         let audio_filename: Option<String> = row.try_get_by_index(2)?;
-        let audio_bytes =
-            storage_layout::read_media_file(&self.media_root, audio_storage_path.as_str())?;
+        let audio_bytes = read_media_object(&self.media_storage, audio_storage_path.as_str())
+            .await
+            .context("Failed to read transcription media")?;
         Ok(Some(StoredTranscriptionAudio {
             audio_bytes,
             audio_mime_type,
@@ -363,15 +366,16 @@ impl TranscriptionStore {
             return Err(anyhow!("Audio payload cannot be empty"));
         }
 
-        let audio_storage_path = storage_layout::persist_audio_file(
-            &self.media_root,
-            MediaGroup::Uploads,
-            "transcription",
+        let audio_storage_path = persist_audio_object(
+            &self.media_storage,
+            MediaNamespace::TranscriptionUpload,
             &record_id,
             audio_filename.as_deref(),
             audio_mime_type.as_str(),
             &record.audio_bytes,
-        )?;
+            HookMetadata::new(),
+        )
+        .await?;
 
         let segments_json =
             serde_json::to_string(&segments).context("Failed serializing segments")?;
@@ -404,7 +408,7 @@ impl TranscriptionStore {
             .exec(db)
             .await
         {
-            let _ = storage_layout::delete_media_file(&self.media_root, Some(&audio_storage_path));
+            let _ = delete_media_object(&self.media_storage, Some(&audio_storage_path)).await;
             return Err(err).context("Failed to insert transcription record");
         }
 
@@ -616,7 +620,7 @@ impl TranscriptionStore {
             .await
             .context("Failed to delete transcription record")?;
         if result.rows_affected > 0 {
-            storage_layout::delete_media_file(&self.media_root, audio_storage_path.as_deref())?;
+            delete_media_object(&self.media_storage, audio_storage_path.as_deref()).await?;
         }
         Ok(result.rows_affected > 0)
     }
@@ -972,7 +976,11 @@ fn now_unix_millis_i64() -> i64 {
 }
 
 fn i64_to_u64(value: i64) -> u64 {
-    if value.is_negative() { 0 } else { value as u64 }
+    if value.is_negative() {
+        0
+    } else {
+        value as u64
+    }
 }
 
 #[allow(dead_code)]

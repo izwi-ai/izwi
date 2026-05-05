@@ -1,19 +1,23 @@
 //! Persistent speech generation history storage backed by SQLite.
 
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
+use izwi_hooks::{HookMetadata, MediaNamespace, MediaStorageProvider};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryResult, Set, Statement,
 };
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     db::StoreDatabase,
     entity::speech_history_records,
     ids::new_uuid,
-    storage_layout::{self, MediaGroup},
+    persistence::{
+        delete_media_object, persist_audio_object, read_media_object, LocalMediaStorageProvider,
+    },
+    storage_layout,
 };
 
 const DEFAULT_LIST_LIMIT: usize = 200;
@@ -183,7 +187,7 @@ pub struct CompleteSpeechHistoryRecord {
 #[derive(Clone)]
 pub struct SpeechHistoryStore {
     db: StoreDatabase,
-    media_root: PathBuf,
+    media_storage: Arc<dyn MediaStorageProvider>,
 }
 
 impl SpeechHistoryStore {
@@ -196,18 +200,15 @@ impl SpeechHistoryStore {
 
         Ok(Self {
             db: StoreDatabase::new(db_path),
-            media_root,
+            media_storage: Arc::new(LocalMediaStorageProvider::new(media_root)),
         })
     }
 
-    pub fn initialize_with_database(
+    pub fn initialize_with_storage(
         db: StoreDatabase,
-        media_root: PathBuf,
-    ) -> anyhow::Result<Self> {
-        storage_layout::ensure_media_dirs(&media_root)
-            .context("Failed to prepare speech history media storage layout")?;
-
-        Ok(Self { db, media_root })
+        media_storage: Arc<dyn MediaStorageProvider>,
+    ) -> Self {
+        Self { db, media_storage }
     }
 
     pub async fn list_records_page(
@@ -306,8 +307,9 @@ impl SpeechHistoryStore {
             return Ok(None);
         };
 
-        let audio_bytes =
-            storage_layout::read_media_file(&self.media_root, audio_storage_path.as_str())?;
+        let audio_bytes = read_media_object(&self.media_storage, audio_storage_path.as_str())
+            .await
+            .context("Failed to read speech history media")?;
 
         Ok(Some(StoredSpeechAudio {
             audio_bytes,
@@ -362,16 +364,23 @@ impl SpeechHistoryStore {
         }
 
         let audio_storage_path = if has_audio_payload {
-            let namespace = format!("speech/{}", route_kind.as_db_value());
-            Some(storage_layout::persist_audio_file(
-                &self.media_root,
-                MediaGroup::Generated,
-                namespace.as_str(),
-                &record_id,
-                audio_filename.as_deref(),
-                audio_mime_type.as_str(),
-                &record.audio_bytes,
-            )?)
+            let mut metadata = HookMetadata::new();
+            metadata.insert(
+                "route_kind".to_string(),
+                route_kind.as_db_value().to_string(),
+            );
+            Some(
+                persist_audio_object(
+                    &self.media_storage,
+                    MediaNamespace::GeneratedSpeech,
+                    &record_id,
+                    audio_filename.as_deref(),
+                    audio_mime_type.as_str(),
+                    &record.audio_bytes,
+                    metadata,
+                )
+                .await?,
+            )
         } else {
             None
         };
@@ -403,7 +412,7 @@ impl SpeechHistoryStore {
             .await
         {
             if let Some(path) = audio_storage_path.as_deref() {
-                let _ = storage_layout::delete_media_file(&self.media_root, Some(path));
+                let _ = delete_media_object(&self.media_storage, Some(path)).await;
             }
             return Err(err).context("Failed to insert speech history record");
         }
@@ -481,16 +490,21 @@ impl SpeechHistoryStore {
             ));
         }
 
-        let namespace = format!("speech/{}", route_kind.as_db_value());
-        let next_audio_storage_path = storage_layout::persist_audio_file(
-            &self.media_root,
-            MediaGroup::Generated,
-            namespace.as_str(),
+        let mut metadata = HookMetadata::new();
+        metadata.insert(
+            "route_kind".to_string(),
+            route_kind.as_db_value().to_string(),
+        );
+        let next_audio_storage_path = persist_audio_object(
+            &self.media_storage,
+            MediaNamespace::GeneratedSpeech,
             &record_id,
             audio_filename.as_deref(),
             audio_mime_type.as_str(),
             &record.audio_bytes,
-        )?;
+            metadata,
+        )
+        .await?;
 
         let previous_audio_storage_path = fetch_audio_storage_path(db, route_kind, &record_id)
             .await?
@@ -566,16 +580,14 @@ impl SpeechHistoryStore {
             .context("Failed to complete speech history record")?;
 
         if result.rows_affected == 0 {
-            let _ = storage_layout::delete_media_file(
-                &self.media_root,
-                Some(next_audio_storage_path.as_str()),
-            );
+            let _ =
+                delete_media_object(&self.media_storage, Some(next_audio_storage_path.as_str()))
+                    .await;
             return Ok(None);
         }
 
         if let Some(previous_path) = sanitize_media_path(previous_audio_storage_path.as_deref()) {
-            let _ =
-                storage_layout::delete_media_file(&self.media_root, Some(previous_path.as_str()));
+            let _ = delete_media_object(&self.media_storage, Some(previous_path.as_str())).await;
         }
 
         fetch_record_without_audio(db, route_kind, &record_id).await
@@ -599,7 +611,7 @@ impl SpeechHistoryStore {
 
         if result.rows_affected > 0 {
             let normalized_audio_path = sanitize_media_path(audio_storage_path.as_deref());
-            storage_layout::delete_media_file(&self.media_root, normalized_audio_path.as_deref())?;
+            delete_media_object(&self.media_storage, normalized_audio_path.as_deref()).await?;
         }
 
         Ok(result.rows_affected > 0)
@@ -853,7 +865,11 @@ fn now_unix_millis_i64() -> i64 {
 }
 
 fn i64_to_u64(value: i64) -> u64 {
-    if value.is_negative() { 0 } else { value as u64 }
+    if value.is_negative() {
+        0
+    } else {
+        value as u64
+    }
 }
 
 fn i64_to_usize(value: i64) -> Option<usize> {
@@ -957,19 +973,15 @@ mod tests {
         );
         assert_eq!(failed.processing_error.as_deref(), Some("boom"));
 
-        assert!(
-            store
-                .delete_record(SpeechRouteKind::TextToSpeech, created.id.clone())
-                .await
-                .expect("record should delete")
-        );
-        assert!(
-            store
-                .get_record(SpeechRouteKind::TextToSpeech, created.id)
-                .await
-                .expect("record lookup should succeed")
-                .is_none()
-        );
+        assert!(store
+            .delete_record(SpeechRouteKind::TextToSpeech, created.id.clone())
+            .await
+            .expect("record should delete"));
+        assert!(store
+            .get_record(SpeechRouteKind::TextToSpeech, created.id)
+            .await
+            .expect("record lookup should succeed")
+            .is_none());
 
         clear_env();
     }
@@ -988,13 +1000,11 @@ mod tests {
             })
             .await
             .expect("pending record should create");
-        assert!(
-            store
-                .get_audio(SpeechRouteKind::TextToSpeech, pending.id.clone())
-                .await
-                .expect("audio lookup should succeed")
-                .is_none()
-        );
+        assert!(store
+            .get_audio(SpeechRouteKind::TextToSpeech, pending.id.clone())
+            .await
+            .expect("audio lookup should succeed")
+            .is_none());
 
         let completed = store
             .complete_record(

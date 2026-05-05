@@ -1,16 +1,20 @@
 //! Persistent saved voice storage backed by SQLite.
 
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
+use izwi_hooks::{HookMetadata, MediaNamespace, MediaStorageProvider};
 use sea_orm::{ConnectionTrait, DbBackend, EntityTrait, QueryResult, Set, Statement};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     db::StoreDatabase,
     entity::saved_voices,
     ids::new_uuid,
-    storage_layout::{self, MediaGroup},
+    persistence::{
+        delete_media_object, persist_audio_object, read_media_object, LocalMediaStorageProvider,
+    },
+    storage_layout,
 };
 
 const DEFAULT_LIST_LIMIT: usize = 500;
@@ -94,7 +98,7 @@ pub struct NewSavedVoice {
 #[derive(Clone)]
 pub struct SavedVoiceStore {
     db: StoreDatabase,
-    media_root: PathBuf,
+    media_storage: Arc<dyn MediaStorageProvider>,
 }
 
 impl SavedVoiceStore {
@@ -107,18 +111,15 @@ impl SavedVoiceStore {
 
         Ok(Self {
             db: StoreDatabase::new(db_path),
-            media_root,
+            media_storage: Arc::new(LocalMediaStorageProvider::new(media_root)),
         })
     }
 
-    pub fn initialize_with_database(
+    pub fn initialize_with_storage(
         db: StoreDatabase,
-        media_root: PathBuf,
-    ) -> anyhow::Result<Self> {
-        storage_layout::ensure_media_dirs(&media_root)
-            .context("Failed to prepare saved voice media storage layout")?;
-
-        Ok(Self { db, media_root })
+        media_storage: Arc<dyn MediaStorageProvider>,
+    ) -> Self {
+        Self { db, media_storage }
     }
 
     pub async fn list_voices_page(
@@ -207,8 +208,9 @@ impl SavedVoiceStore {
         let audio_storage_path: String = row.try_get_by_index(0)?;
         let audio_mime_type: String = row.try_get_by_index(1)?;
         let audio_filename: Option<String> = row.try_get_by_index(2)?;
-        let audio_bytes =
-            storage_layout::read_media_file(&self.media_root, audio_storage_path.as_str())?;
+        let audio_bytes = read_media_object(&self.media_storage, audio_storage_path.as_str())
+            .await
+            .context("Failed to read saved voice media")?;
 
         Ok(Some(StoredSavedVoiceAudio {
             audio_bytes,
@@ -235,15 +237,16 @@ impl SavedVoiceStore {
             return Err(anyhow!("Audio payload cannot be empty"));
         }
 
-        let audio_storage_path = storage_layout::persist_audio_file(
-            &self.media_root,
-            MediaGroup::Generated,
-            "voices",
+        let audio_storage_path = persist_audio_object(
+            &self.media_storage,
+            MediaNamespace::SavedVoice,
             &voice_id,
             audio_filename.as_deref(),
             audio_mime_type.as_str(),
             &voice.audio_bytes,
-        )?;
+            HookMetadata::new(),
+        )
+        .await?;
 
         if let Err(err) = saved_voices::Entity::insert(saved_voices::ActiveModel {
             id: Set(voice_id.clone()),
@@ -260,7 +263,7 @@ impl SavedVoiceStore {
         .exec(db)
         .await
         {
-            let _ = storage_layout::delete_media_file(&self.media_root, Some(&audio_storage_path));
+            let _ = delete_media_object(&self.media_storage, Some(&audio_storage_path)).await;
             return Err(err).context("Failed to insert saved voice");
         }
 
@@ -289,7 +292,7 @@ impl SavedVoiceStore {
             .context("Failed to delete saved voice")?;
 
         if result.rows_affected > 0 {
-            storage_layout::delete_media_file(&self.media_root, audio_storage_path.as_deref())?;
+            delete_media_object(&self.media_storage, audio_storage_path.as_deref()).await?;
         }
 
         Ok(result.rows_affected > 0)
@@ -464,7 +467,11 @@ fn now_unix_millis_i64() -> i64 {
 }
 
 fn i64_to_u64(value: i64) -> u64 {
-    if value.is_negative() { 0 } else { value as u64 }
+    if value.is_negative() {
+        0
+    } else {
+        value as u64
+    }
 }
 
 #[allow(dead_code)]
@@ -531,19 +538,15 @@ mod tests {
         assert_eq!(voices.len(), 1);
         assert_eq!(voices[0].name, "Demo Voice");
 
-        assert!(
-            store
-                .delete_voice(created.id.clone())
-                .await
-                .expect("voice should delete")
-        );
-        assert!(
-            store
-                .get_voice(created.id)
-                .await
-                .expect("voice lookup should succeed")
-                .is_none()
-        );
+        assert!(store
+            .delete_voice(created.id.clone())
+            .await
+            .expect("voice should delete"));
+        assert!(store
+            .get_voice(created.id)
+            .await
+            .expect("voice lookup should succeed")
+            .is_none());
 
         clear_env();
     }

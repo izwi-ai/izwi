@@ -1,6 +1,7 @@
 //! Persistent diarization history storage backed by SQLite.
 
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
+use izwi_hooks::{HookMetadata, MediaNamespace, MediaStorageProvider};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryResult, Set, Statement,
@@ -8,13 +9,17 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     db::StoreDatabase,
     entity::diarization_records,
     ids::new_uuid,
-    storage_layout::{self, MediaGroup},
+    persistence::{
+        delete_media_object, persist_audio_object, read_media_object, LocalMediaStorageProvider,
+    },
+    storage_layout,
 };
 
 const DEFAULT_LIST_LIMIT: usize = 200;
@@ -253,7 +258,7 @@ pub struct CompleteDiarizationRecord {
 #[derive(Clone)]
 pub struct DiarizationStore {
     db: StoreDatabase,
-    media_root: PathBuf,
+    media_storage: Arc<dyn MediaStorageProvider>,
 }
 
 impl DiarizationStore {
@@ -270,18 +275,15 @@ impl DiarizationStore {
 
         Ok(Self {
             db: StoreDatabase::new(db_path),
-            media_root,
+            media_storage: Arc::new(LocalMediaStorageProvider::new(media_root)),
         })
     }
 
-    pub fn initialize_with_database(
+    pub fn initialize_with_storage(
         db: StoreDatabase,
-        media_root: PathBuf,
-    ) -> anyhow::Result<Self> {
-        storage_layout::ensure_media_dirs(&media_root)
-            .context("Failed to prepare diarization media storage layout")?;
-
-        Ok(Self { db, media_root })
+        media_storage: Arc<dyn MediaStorageProvider>,
+    ) -> Self {
+        Self { db, media_storage }
     }
 
     pub async fn list_records_page(
@@ -369,8 +371,9 @@ impl DiarizationStore {
         let audio_storage_path: String = row.try_get_by_index(0)?;
         let audio_mime_type: String = row.try_get_by_index(1)?;
         let audio_filename: Option<String> = row.try_get_by_index(2)?;
-        let audio_bytes =
-            storage_layout::read_media_file(&self.media_root, audio_storage_path.as_str())?;
+        let audio_bytes = read_media_object(&self.media_storage, audio_storage_path.as_str())
+            .await
+            .context("Failed to read diarization media")?;
 
         Ok(Some(StoredDiarizationAudio {
             audio_bytes,
@@ -452,15 +455,16 @@ impl DiarizationStore {
             return Err(anyhow!("Audio payload cannot be empty"));
         }
 
-        let audio_storage_path = storage_layout::persist_audio_file(
-            &self.media_root,
-            MediaGroup::Uploads,
-            "diarization",
+        let audio_storage_path = persist_audio_object(
+            &self.media_storage,
+            MediaNamespace::DiarizationUpload,
             &record_id,
             audio_filename.as_deref(),
             audio_mime_type.as_str(),
             &record.audio_bytes,
-        )?;
+            HookMetadata::new(),
+        )
+        .await?;
 
         let segments_json =
             serde_json::to_string(&record.segments).context("Failed serializing segments")?;
@@ -515,10 +519,8 @@ impl DiarizationStore {
         .exec(db)
         .await
         {
-            let _ = storage_layout::delete_media_file(
-                &self.media_root,
-                Some(audio_storage_path.as_str()),
-            );
+            let _ =
+                delete_media_object(&self.media_storage, Some(audio_storage_path.as_str())).await;
             return Err(err).context("Failed to insert diarization record");
         }
 
@@ -537,7 +539,7 @@ impl DiarizationStore {
             .context("Failed to delete diarization record")?;
 
         if result.rows_affected > 0 {
-            storage_layout::delete_media_file(&self.media_root, audio_storage_path.as_deref())?;
+            delete_media_object(&self.media_storage, audio_storage_path.as_deref()).await?;
         }
 
         Ok(result.rows_affected > 0)
@@ -1357,7 +1359,11 @@ fn now_unix_millis_i64() -> i64 {
 }
 
 fn i64_to_u64(value: i64) -> u64 {
-    if value.is_negative() { 0 } else { value as u64 }
+    if value.is_negative() {
+        0
+    } else {
+        value as u64
+    }
 }
 
 fn i64_to_usize(value: i64) -> Option<usize> {
@@ -1608,10 +1614,9 @@ mod tests {
             .await
             .expect_err("unknown speaker should fail");
 
-        assert!(
-            err.to_string()
-                .contains("Unknown diarization speaker label")
-        );
+        assert!(err
+            .to_string()
+            .contains("Unknown diarization speaker label"));
         std::fs::remove_dir_all(root).expect("test temp dir should be removable");
     }
 

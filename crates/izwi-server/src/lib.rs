@@ -114,6 +114,12 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
     // Create runtime service
     let runtime = RuntimeService::new(config)?;
     let persistence = PersistenceContext::resolve(&enterprise_hooks).await?;
+    info!(
+        database_backend = ?persistence.database.backend(),
+        database_migration_mode = ?persistence.database.migration_mode(),
+        database_metadata_keys = persistence.database.metadata().len(),
+        "Persistence database resolved"
+    );
     let state = AppState::with_enterprise_hooks_and_persistence(
         runtime,
         &serve_config,
