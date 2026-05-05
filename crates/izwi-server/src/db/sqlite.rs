@@ -1,6 +1,7 @@
 use crate::{db::migrator::Migrator, storage_layout};
 use anyhow::Context;
 use sea_orm::{ConnectOptions, Database, DatabaseConnection, sqlx::sqlite::SqliteJournalMode};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,7 +53,7 @@ pub async fn connect_path(db_path: &Path) -> anyhow::Result<DatabaseConnection> 
 
 #[derive(Clone)]
 pub struct StoreDatabase {
-    db_path: PathBuf,
+    db_path: Option<PathBuf>,
     connection: Arc<OnceCell<DatabaseConnection>>,
 }
 
@@ -67,22 +68,48 @@ impl StoreDatabase {
 
     pub fn new(db_path: PathBuf) -> Self {
         Self {
-            db_path,
+            db_path: Some(db_path),
             connection: Arc::new(OnceCell::new()),
         }
     }
 
+    pub fn from_connection(connection: DatabaseConnection) -> Self {
+        let cell = OnceCell::new();
+        cell.set(connection)
+            .map_err(|_| ())
+            .expect("new OnceCell should accept initial database connection");
+        Self {
+            db_path: None,
+            connection: Arc::new(cell),
+        }
+    }
+
     pub async fn connection(&self) -> anyhow::Result<&DatabaseConnection> {
-        let db_path = self.db_path.clone();
+        if let Some(db_path) = self.db_path.clone() {
+            return self
+                .connection
+                .get_or_try_init(|| async move {
+                    let db = connect_path(&db_path).await?;
+                    Migrator::up(&db)
+                        .await
+                        .context("Failed to run SQLite migrations for SeaORM store")?;
+                    Ok(db)
+                })
+                .await;
+        }
+
         self.connection
-            .get_or_try_init(|| async move {
-                let db = connect_path(&db_path).await?;
-                Migrator::up(&db)
-                    .await
-                    .context("Failed to run SQLite migrations for SeaORM store")?;
-                Ok(db)
-            })
-            .await
+            .get()
+            .context("Store database was constructed without a connection")
+    }
+}
+
+impl fmt::Debug for StoreDatabase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StoreDatabase")
+            .field("db_path", &self.db_path)
+            .field("has_connection", &self.connection.get().is_some())
+            .finish()
     }
 }
 

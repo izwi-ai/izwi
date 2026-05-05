@@ -1,10 +1,13 @@
 //! Application state management with high-concurrency optimizations
 
 use crate::chat_store::ChatStore;
+use crate::db::StoreDatabase;
 use crate::diarization_store::DiarizationStore;
 use crate::onboarding_store::OnboardingStore;
+use crate::persistence::PersistenceContext;
 use crate::saved_voice_store::SavedVoiceStore;
 use crate::speech_history_store::SpeechHistoryStore;
+use crate::storage_layout;
 use crate::studio_project_store::StudioProjectStore;
 use crate::transcription_store::TranscriptionStore;
 use crate::voice_observation_store::VoiceObservationStore;
@@ -148,6 +151,8 @@ pub struct AppState {
     pub runtime: Arc<RuntimeService>,
     /// Enterprise integration hooks. Community builds use no-op hooks.
     pub enterprise_hooks: EnterpriseHooks,
+    /// Startup-resolved persistence providers. Older unit helpers may omit this.
+    pub persistence: Option<PersistenceContext>,
     /// Server lifecycle state used by readiness and liveness probes.
     pub lifecycle: ServerLifecycle,
     /// Concurrency limiter to prevent resource exhaustion
@@ -216,6 +221,74 @@ impl AppState {
         Ok(Self {
             runtime: Arc::new(runtime),
             enterprise_hooks,
+            persistence: None,
+            lifecycle: ServerLifecycle::new(),
+            request_semaphore: Arc::new(Semaphore::new(max_concurrent_requests)),
+            request_timeout_secs,
+            response_store_limit,
+            agent_session_store_limit,
+            response_store: Arc::new(RwLock::new(HashMap::new())),
+            agent_session_store: Arc::new(RwLock::new(HashMap::new())),
+            chat_store,
+            transcription_store,
+            diarization_store,
+            speech_history_store,
+            saved_voice_store,
+            onboarding_store,
+            studio_store,
+            voice_store,
+            voice_observation_store,
+        })
+    }
+
+    pub fn with_enterprise_hooks_and_persistence(
+        runtime: RuntimeService,
+        serve_config: &ServeRuntimeConfig,
+        enterprise_hooks: EnterpriseHooks,
+        persistence: PersistenceContext,
+    ) -> anyhow::Result<Self> {
+        let (max_concurrent_requests, request_timeout_secs) = request_limits(serve_config);
+        let response_store_limit = store_limit_from_env(
+            "IZWI_MAX_RESPONSE_STORE_ENTRIES",
+            DEFAULT_RESPONSE_STORE_LIMIT,
+        );
+        let agent_session_store_limit = store_limit_from_env(
+            "IZWI_MAX_AGENT_SESSION_STORE_ENTRIES",
+            DEFAULT_AGENT_SESSION_STORE_LIMIT,
+        );
+        let store_database = StoreDatabase::from_connection(persistence.database.connection());
+        let media_root = storage_layout::resolve_media_root();
+
+        let chat_store = Arc::new(ChatStore::initialize_with_database(store_database.clone()));
+        let transcription_store = Arc::new(TranscriptionStore::initialize_with_database(
+            store_database.clone(),
+            media_root.clone(),
+        )?);
+        let diarization_store = Arc::new(DiarizationStore::initialize_with_database(
+            store_database.clone(),
+            media_root.clone(),
+        )?);
+        let speech_history_store = Arc::new(SpeechHistoryStore::initialize_with_database(
+            store_database.clone(),
+            media_root.clone(),
+        )?);
+        let saved_voice_store = Arc::new(SavedVoiceStore::initialize_with_database(
+            store_database.clone(),
+            media_root,
+        )?);
+        let studio_store = Arc::new(StudioProjectStore::initialize_with_database(
+            store_database.clone(),
+        ));
+        let voice_store = Arc::new(VoiceStore::initialize_with_database(store_database.clone()));
+        let voice_observation_store = Arc::new(VoiceObservationStore::initialize_with_database(
+            store_database.clone(),
+        ));
+        let onboarding_store = Arc::new(OnboardingStore::initialize_with_database(store_database));
+
+        Ok(Self {
+            runtime: Arc::new(runtime),
+            enterprise_hooks,
+            persistence: Some(persistence),
             lifecycle: ServerLifecycle::new(),
             request_semaphore: Arc::new(Semaphore::new(max_concurrent_requests)),
             request_timeout_secs,
