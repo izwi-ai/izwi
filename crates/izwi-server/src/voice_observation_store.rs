@@ -1,10 +1,14 @@
-use anyhow::{anyhow, Context};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use anyhow::{Context, anyhow};
+use sea_orm::sea_query::Expr;
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryResult, Statement,
+    TransactionTrait,
+};
 use serde::Serialize;
-use std::path::PathBuf;
-use tokio::task;
 
-use crate::{ids::new_uuid, storage_layout};
+use crate::db::StoreDatabase;
+use crate::entity::voice_observations;
+use crate::ids::new_uuid;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VoiceObservation {
@@ -31,52 +35,14 @@ pub struct CandidateObservation {
 
 #[derive(Clone)]
 pub struct VoiceObservationStore {
-    db_path: PathBuf,
+    db: StoreDatabase,
 }
 
 impl VoiceObservationStore {
     pub fn initialize() -> anyhow::Result<Self> {
-        let db_path = storage_layout::resolve_db_path();
-        let media_root = storage_layout::resolve_media_root();
-
-        storage_layout::ensure_storage_dirs(&db_path, &media_root)
-            .context("Failed to prepare voice observation storage layout")?;
-
-        let conn = storage_layout::open_sqlite_connection(&db_path).with_context(|| {
-            format!(
-                "Failed to open voice observation database: {}",
-                db_path.display()
-            )
-        })?;
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS voice_observations (
-                id TEXT PRIMARY KEY,
-                profile_id TEXT NOT NULL,
-                category TEXT NOT NULL,
-                summary TEXT NOT NULL,
-                canonical_summary TEXT NOT NULL,
-                confidence REAL NOT NULL,
-                source_turn_id TEXT NULL,
-                source_user_text TEXT NULL,
-                source_assistant_text TEXT NULL,
-                times_seen INTEGER NOT NULL DEFAULT 1,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                forgotten_at INTEGER NULL,
-                FOREIGN KEY(profile_id) REFERENCES voice_profiles(id) ON DELETE CASCADE
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_voice_observations_profile_updated_at
-                ON voice_observations(profile_id, updated_at DESC, created_at DESC);
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_voice_observations_profile_canonical_active
-                ON voice_observations(profile_id, canonical_summary)
-                WHERE forgotten_at IS NULL;
-            "#,
-        )
-        .context("Failed to initialize voice observation database schema")?;
-
-        Ok(Self { db_path })
+        Ok(Self {
+            db: StoreDatabase::from_default_path()?,
+        })
     }
 
     pub async fn list_active(
@@ -84,38 +50,17 @@ impl VoiceObservationStore {
         profile_id: String,
         limit: usize,
     ) -> anyhow::Result<Vec<VoiceObservation>> {
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let mut stmt = conn.prepare(
-                r#"
-                SELECT
-                    id,
-                    profile_id,
-                    category,
-                    summary,
-                    confidence,
-                    source_turn_id,
-                    source_user_text,
-                    source_assistant_text,
-                    times_seen,
-                    created_at,
-                    updated_at,
-                    forgotten_at
-                FROM voice_observations
-                WHERE profile_id = ?1
-                  AND forgotten_at IS NULL
-                ORDER BY confidence DESC, updated_at DESC, created_at DESC
-                LIMIT ?2
-                "#,
-            )?;
-            let rows = stmt.query_map(params![profile_id, limit.max(1) as i64], map_observation)?;
-            let mut observations = Vec::new();
-            for row in rows {
-                observations.push(row?);
-            }
-            Ok(observations)
-        })
-        .await
+        let db = self.db.connection().await?;
+        let limit = i64::try_from(limit.max(1)).context("Voice observation limit exceeds i64")?;
+        let rows = db
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                OBSERVATIONS_ACTIVE_SQL,
+                vec![profile_id.into(), limit.into()],
+            ))
+            .await
+            .context("Failed to list voice observations")?;
+        rows.iter().map(map_observation).collect()
     }
 
     pub async fn upsert_candidates(
@@ -126,142 +71,144 @@ impl VoiceObservationStore {
         source_assistant_text: Option<String>,
         candidates: Vec<CandidateObservation>,
     ) -> anyhow::Result<Vec<VoiceObservation>> {
-        self.run_blocking(move |db_path| {
-            let mut conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let tx = conn.transaction()?;
-            let mut persisted = Vec::new();
-            let now = now_unix_millis_i64();
+        let db = self.db.connection().await?;
+        let tx = db
+            .begin()
+            .await
+            .context("Failed to start voice observation transaction")?;
+        let mut persisted = Vec::new();
+        let now = now_unix_millis_i64();
 
-            for candidate in candidates {
-                let Some(summary) = sanitize_summary(candidate.summary.as_str()) else {
-                    continue;
-                };
-                let category = sanitize_category(candidate.category.as_str());
-                let confidence = clamp_confidence(candidate.confidence);
-                let canonical_summary =
-                    build_canonical_summary(category.as_str(), summary.as_str());
+        for candidate in candidates {
+            let Some(summary) = sanitize_summary(candidate.summary.as_str()) else {
+                continue;
+            };
+            let category = sanitize_category(candidate.category.as_str());
+            let confidence = clamp_confidence(candidate.confidence);
+            let canonical_summary = build_canonical_summary(category.as_str(), summary.as_str());
 
-                let existing_id = tx
-                    .query_row(
-                        r#"
-                        SELECT id
-                        FROM voice_observations
-                        WHERE profile_id = ?1
-                          AND canonical_summary = ?2
-                          AND forgotten_at IS NULL
-                        LIMIT 1
-                        "#,
-                        params![profile_id, canonical_summary],
-                        |row| row.get::<_, String>(0),
+            let existing_id = tx
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    r#"
+                    SELECT id
+                    FROM voice_observations
+                    WHERE profile_id = ?1
+                      AND canonical_summary = ?2
+                      AND forgotten_at IS NULL
+                    LIMIT 1
+                    "#,
+                    vec![profile_id.clone().into(), canonical_summary.clone().into()],
+                ))
+                .await
+                .context("Failed to find existing voice observation")?
+                .map(|row| row.try_get_by_index::<String>(0))
+                .transpose()?;
+
+            let observation = if let Some(existing_id) = existing_id {
+                tx.execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    r#"
+                    UPDATE voice_observations
+                    SET confidence = MAX(confidence, ?1),
+                        source_turn_id = ?2,
+                        source_user_text = ?3,
+                        source_assistant_text = ?4,
+                        times_seen = times_seen + 1,
+                        updated_at = ?5
+                    WHERE id = ?6
+                    "#,
+                    vec![
+                        f64::from(confidence).into(),
+                        sanitize_optional_text(source_turn_id.as_deref(), 160).into(),
+                        sanitize_optional_text(source_user_text.as_deref(), 16000).into(),
+                        sanitize_optional_text(source_assistant_text.as_deref(), 16000).into(),
+                        now.into(),
+                        existing_id.clone().into(),
+                    ],
+                ))
+                .await
+                .context("Failed to update voice observation")?;
+                fetch_observation(&tx, &existing_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("Updated observation not found"))?
+            } else {
+                let observation_id = new_uuid();
+                tx.execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    r#"
+                    INSERT INTO voice_observations (
+                        id,
+                        profile_id,
+                        category,
+                        summary,
+                        canonical_summary,
+                        confidence,
+                        source_turn_id,
+                        source_user_text,
+                        source_assistant_text,
+                        times_seen,
+                        created_at,
+                        updated_at,
+                        forgotten_at
                     )
-                    .optional()?;
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?10, NULL)
+                    "#,
+                    vec![
+                        observation_id.clone().into(),
+                        profile_id.clone().into(),
+                        category.into(),
+                        summary.into(),
+                        canonical_summary.into(),
+                        f64::from(confidence).into(),
+                        sanitize_optional_text(source_turn_id.as_deref(), 160).into(),
+                        sanitize_optional_text(source_user_text.as_deref(), 16000).into(),
+                        sanitize_optional_text(source_assistant_text.as_deref(), 16000).into(),
+                        now.into(),
+                    ],
+                ))
+                .await
+                .context("Failed to insert voice observation")?;
+                fetch_observation(&tx, &observation_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("Inserted observation not found"))?
+            };
 
-                let observation = if let Some(existing_id) = existing_id {
-                    tx.execute(
-                        r#"
-                        UPDATE voice_observations
-                        SET confidence = MAX(confidence, ?1),
-                            source_turn_id = ?2,
-                            source_user_text = ?3,
-                            source_assistant_text = ?4,
-                            times_seen = times_seen + 1,
-                            updated_at = ?5
-                        WHERE id = ?6
-                        "#,
-                        params![
-                            confidence,
-                            sanitize_optional_text(source_turn_id.as_deref(), 160),
-                            sanitize_optional_text(source_user_text.as_deref(), 16000),
-                            sanitize_optional_text(source_assistant_text.as_deref(), 16000),
-                            now,
-                            existing_id,
-                        ],
-                    )?;
-                    fetch_observation(&tx, &existing_id)?
-                        .ok_or_else(|| anyhow!("Updated observation not found"))?
-                } else {
-                    let observation_id = new_uuid();
-                    tx.execute(
-                        r#"
-                        INSERT INTO voice_observations (
-                            id,
-                            profile_id,
-                            category,
-                            summary,
-                            canonical_summary,
-                            confidence,
-                            source_turn_id,
-                            source_user_text,
-                            source_assistant_text,
-                            times_seen,
-                            created_at,
-                            updated_at,
-                            forgotten_at
-                        )
-                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?10, NULL)
-                        "#,
-                        params![
-                            observation_id,
-                            profile_id,
-                            category,
-                            summary,
-                            canonical_summary,
-                            confidence,
-                            sanitize_optional_text(source_turn_id.as_deref(), 160),
-                            sanitize_optional_text(source_user_text.as_deref(), 16000),
-                            sanitize_optional_text(source_assistant_text.as_deref(), 16000),
-                            now,
-                        ],
-                    )?;
-                    fetch_observation(&tx, &observation_id)?
-                        .ok_or_else(|| anyhow!("Inserted observation not found"))?
-                };
+            persisted.push(observation);
+        }
 
-                persisted.push(observation);
-            }
-
-            tx.commit()?;
-            Ok(persisted)
-        })
-        .await
+        tx.commit()
+            .await
+            .context("Failed to commit voice observation transaction")?;
+        Ok(persisted)
     }
 
     pub async fn forget_observation(&self, observation_id: String) -> anyhow::Result<bool> {
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let now = now_unix_millis_i64();
-            let updated = conn.execute(
-                r#"
-                UPDATE voice_observations
-                SET forgotten_at = ?1,
-                    updated_at = ?1
-                WHERE id = ?2
-                  AND forgotten_at IS NULL
-                "#,
-                params![now, observation_id],
-            )?;
-            Ok(updated > 0)
-        })
-        .await
+        let db = self.db.connection().await?;
+        let now = now_unix_millis_i64();
+        let result = voice_observations::Entity::update_many()
+            .col_expr(voice_observations::Column::ForgottenAt, Expr::value(now))
+            .col_expr(voice_observations::Column::UpdatedAt, Expr::value(now))
+            .filter(voice_observations::Column::Id.eq(observation_id))
+            .filter(voice_observations::Column::ForgottenAt.is_null())
+            .exec(db)
+            .await
+            .context("Failed to forget voice observation")?;
+        Ok(result.rows_affected > 0)
     }
 
     pub async fn clear_profile(&self, profile_id: String) -> anyhow::Result<usize> {
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let now = now_unix_millis_i64();
-            let updated = conn.execute(
-                r#"
-                UPDATE voice_observations
-                SET forgotten_at = ?1,
-                    updated_at = ?1
-                WHERE profile_id = ?2
-                  AND forgotten_at IS NULL
-                "#,
-                params![now, profile_id],
-            )?;
-            Ok(updated)
-        })
-        .await
+        let db = self.db.connection().await?;
+        let now = now_unix_millis_i64();
+        let result = voice_observations::Entity::update_many()
+            .col_expr(voice_observations::Column::ForgottenAt, Expr::value(now))
+            .col_expr(voice_observations::Column::UpdatedAt, Expr::value(now))
+            .filter(voice_observations::Column::ProfileId.eq(profile_id))
+            .filter(voice_observations::Column::ForgottenAt.is_null())
+            .exec(db)
+            .await
+            .context("Failed to clear voice observations")?;
+        usize::try_from(result.rows_affected).context("Voice observation update count overflow")
     }
 
     pub async fn build_context(
@@ -286,65 +233,81 @@ impl VoiceObservationStore {
         }
         Ok(Some(lines.join("\n")))
     }
-
-    async fn run_blocking<F, T>(&self, task_fn: F) -> anyhow::Result<T>
-    where
-        F: FnOnce(PathBuf) -> anyhow::Result<T> + Send + 'static,
-        T: Send + 'static,
-    {
-        let db_path = self.db_path.clone();
-        task::spawn_blocking(move || task_fn(db_path))
-            .await
-            .map_err(|err| anyhow!("Voice observation storage worker failed: {err}"))?
-    }
 }
 
-fn fetch_observation(
-    conn: &Connection,
+const OBSERVATIONS_ACTIVE_SQL: &str = r#"
+    SELECT
+        id,
+        profile_id,
+        category,
+        summary,
+        confidence,
+        source_turn_id,
+        source_user_text,
+        source_assistant_text,
+        times_seen,
+        created_at,
+        updated_at,
+        forgotten_at
+    FROM voice_observations
+    WHERE profile_id = ?1
+      AND forgotten_at IS NULL
+    ORDER BY confidence DESC, updated_at DESC, created_at DESC
+    LIMIT ?2
+"#;
+
+const OBSERVATION_BY_ID_SQL: &str = r#"
+    SELECT
+        id,
+        profile_id,
+        category,
+        summary,
+        confidence,
+        source_turn_id,
+        source_user_text,
+        source_assistant_text,
+        times_seen,
+        created_at,
+        updated_at,
+        forgotten_at
+    FROM voice_observations
+    WHERE id = ?1
+"#;
+
+async fn fetch_observation<C>(
+    conn: &C,
     observation_id: &str,
-) -> anyhow::Result<Option<VoiceObservation>> {
-    let observation = conn
-        .query_row(
-            r#"
-            SELECT
-                id,
-                profile_id,
-                category,
-                summary,
-                confidence,
-                source_turn_id,
-                source_user_text,
-                source_assistant_text,
-                times_seen,
-                created_at,
-                updated_at,
-                forgotten_at
-            FROM voice_observations
-            WHERE id = ?1
-            "#,
-            params![observation_id],
-            map_observation,
-        )
-        .optional()?;
-    Ok(observation)
+) -> anyhow::Result<Option<VoiceObservation>>
+where
+    C: ConnectionTrait,
+{
+    let row = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            OBSERVATION_BY_ID_SQL,
+            vec![observation_id.into()],
+        ))
+        .await
+        .context("Failed to load voice observation")?;
+    row.as_ref().map(map_observation).transpose()
 }
 
-fn map_observation(row: &Row<'_>) -> rusqlite::Result<VoiceObservation> {
-    let times_seen: i64 = row.get(8)?;
+fn map_observation(row: &QueryResult) -> anyhow::Result<VoiceObservation> {
+    let times_seen: i64 = row.try_get_by_index(8)?;
     Ok(VoiceObservation {
-        id: row.get(0)?,
-        profile_id: row.get(1)?,
-        category: row.get(2)?,
-        summary: row.get(3)?,
-        confidence: row.get::<_, f64>(4)? as f32,
-        source_turn_id: row.get(5)?,
-        source_user_text: row.get(6)?,
-        source_assistant_text: row.get(7)?,
+        id: row.try_get_by_index(0)?,
+        profile_id: row.try_get_by_index(1)?,
+        category: row.try_get_by_index(2)?,
+        summary: row.try_get_by_index(3)?,
+        confidence: row.try_get_by_index::<f64>(4)? as f32,
+        source_turn_id: row.try_get_by_index(5)?,
+        source_user_text: row.try_get_by_index(6)?,
+        source_assistant_text: row.try_get_by_index(7)?,
         times_seen: times_seen.max(0) as usize,
-        created_at: row.get::<_, i64>(9)?.max(0) as u64,
-        updated_at: row.get::<_, i64>(10)?.max(0) as u64,
+        created_at: row.try_get_by_index::<i64>(9)?.max(0) as u64,
+        updated_at: row.try_get_by_index::<i64>(10)?.max(0) as u64,
         forgotten_at: row
-            .get::<_, Option<i64>>(11)?
+            .try_get_by_index::<Option<i64>>(11)?
             .map(|value| value.max(0) as u64),
     })
 }
