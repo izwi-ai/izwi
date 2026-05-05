@@ -1,14 +1,15 @@
-use anyhow::{anyhow, Context};
-use rusqlite::{params, Connection, OptionalExtension, Row};
-use serde::Serialize;
-use std::path::PathBuf;
-use tokio::task;
-
-use crate::ids::new_uuid;
-use crate::storage_layout;
-use crate::voice_defaults::{
-    DEFAULT_VOICE_AGENT_SYSTEM_PROMPT, DEFAULT_VOICE_PROFILE_ID, DEFAULT_VOICE_PROFILE_NAME,
+use anyhow::{Context, anyhow};
+use sea_orm::sea_query::Expr;
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, QueryFilter,
+    QueryResult, Set, Statement,
 };
+use serde::Serialize;
+
+use crate::db::StoreDatabase;
+use crate::entity::{voice_profiles, voice_sessions, voice_turns};
+use crate::ids::new_uuid;
+use crate::voice_defaults::{DEFAULT_VOICE_AGENT_SYSTEM_PROMPT, DEFAULT_VOICE_PROFILE_ID};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VoiceProfile {
@@ -85,77 +86,14 @@ pub struct CreateVoiceTurnRequest {
 
 #[derive(Clone)]
 pub struct VoiceStore {
-    db_path: PathBuf,
+    db: StoreDatabase,
 }
 
 impl VoiceStore {
     pub fn initialize() -> anyhow::Result<Self> {
-        let db_path = storage_layout::resolve_db_path();
-        let media_root = storage_layout::resolve_media_root();
-
-        storage_layout::ensure_storage_dirs(&db_path, &media_root)
-            .context("Failed to prepare voice storage layout")?;
-
-        let conn = storage_layout::open_sqlite_connection(&db_path)
-            .with_context(|| format!("Failed to open voice database: {}", db_path.display()))?;
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS voice_profiles (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                system_prompt TEXT NOT NULL,
-                observational_memory_enabled INTEGER NOT NULL DEFAULT 1,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS voice_sessions (
-                id TEXT PRIMARY KEY,
-                profile_id TEXT NOT NULL,
-                mode TEXT NOT NULL CHECK(mode IN ('modular', 'unified')),
-                system_prompt TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                ended_at INTEGER NULL,
-                FOREIGN KEY(profile_id) REFERENCES voice_profiles(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS voice_turns (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                utterance_id TEXT NOT NULL,
-                utterance_seq INTEGER NOT NULL,
-                mode TEXT NOT NULL CHECK(mode IN ('modular', 'unified')),
-                status TEXT NOT NULL CHECK(status IN ('processing', 'ok', 'error', 'timeout', 'interrupted', 'no_input')),
-                status_reason TEXT NULL,
-                vad_end_reason TEXT NULL,
-                user_text TEXT NULL,
-                assistant_text TEXT NULL,
-                assistant_raw_text TEXT NULL,
-                language TEXT NULL,
-                audio_duration_secs REAL NULL,
-                asr_model_id TEXT NULL,
-                text_model_id TEXT NULL,
-                tts_model_id TEXT NULL,
-                s2s_model_id TEXT NULL,
-                speaker TEXT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES voice_sessions(id) ON DELETE CASCADE
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_voice_sessions_updated_at
-                ON voice_sessions(updated_at DESC, created_at DESC);
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_voice_turns_session_utterance
-                ON voice_turns(session_id, utterance_seq);
-            CREATE INDEX IF NOT EXISTS idx_voice_turns_session_created_at
-                ON voice_turns(session_id, created_at ASC, id ASC);
-            "#,
-        )
-        .context("Failed to initialize voice database schema")?;
-        ensure_default_profile(&conn)?;
-
-        Ok(Self { db_path })
+        Ok(Self {
+            db: StoreDatabase::from_default_path()?,
+        })
     }
 
     pub async fn get_default_profile(&self) -> anyhow::Result<VoiceProfile> {
@@ -165,29 +103,8 @@ impl VoiceStore {
     }
 
     pub async fn get_profile(&self, profile_id: String) -> anyhow::Result<Option<VoiceProfile>> {
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            ensure_default_profile(&conn)?;
-            let profile = conn
-                .query_row(
-                    r#"
-                SELECT
-                    id,
-                    name,
-                    system_prompt,
-                    observational_memory_enabled,
-                    created_at,
-                    updated_at
-                FROM voice_profiles
-                WHERE id = ?1
-                "#,
-                    params![profile_id],
-                    map_voice_profile,
-                )
-                .optional()?;
-            Ok(profile)
-        })
-        .await
+        let db = self.db.connection().await?;
+        fetch_voice_profile(db, &profile_id).await
     }
 
     pub async fn update_default_profile(
@@ -196,287 +113,188 @@ impl VoiceStore {
         system_prompt: Option<String>,
         observational_memory_enabled: Option<bool>,
     ) -> anyhow::Result<VoiceProfile> {
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            ensure_default_profile(&conn)?;
+        let db = self.db.connection().await?;
+        let current = fetch_voice_profile(db, DEFAULT_VOICE_PROFILE_ID)
+            .await?
+            .context("Default voice profile not found")?;
+        let next_name = sanitize_profile_name(name.as_deref()).unwrap_or(current.name);
+        let next_prompt =
+            sanitize_prompt(system_prompt.as_deref()).unwrap_or(current.system_prompt);
+        let next_memory_enabled =
+            observational_memory_enabled.unwrap_or(current.observational_memory_enabled);
+        let now = now_unix_millis_i64();
 
-            let current = conn
-                .query_row(
-                    r#"
-                    SELECT
-                        id,
-                        name,
-                        system_prompt,
-                        observational_memory_enabled,
-                        created_at,
-                        updated_at
-                    FROM voice_profiles
-                    WHERE id = ?1
-                    "#,
-                    params![DEFAULT_VOICE_PROFILE_ID],
-                    map_voice_profile,
-                )
-                .context("Default voice profile not found")?;
-
-            let next_name = sanitize_profile_name(name.as_deref()).unwrap_or(current.name);
-            let next_prompt =
-                sanitize_prompt(system_prompt.as_deref()).unwrap_or(current.system_prompt);
-            let next_memory_enabled =
-                observational_memory_enabled.unwrap_or(current.observational_memory_enabled);
-            let now = now_unix_millis_i64();
-
-            conn.execute(
-                r#"
-                UPDATE voice_profiles
-                SET name = ?1,
-                    system_prompt = ?2,
-                    observational_memory_enabled = ?3,
-                    updated_at = ?4
-                WHERE id = ?5
-                "#,
-                params![
-                    next_name,
-                    next_prompt,
-                    bool_to_i64(next_memory_enabled),
-                    now,
-                    DEFAULT_VOICE_PROFILE_ID
-                ],
-            )?;
-
-            conn.query_row(
-                r#"
-                SELECT
-                    id,
-                    name,
-                    system_prompt,
-                    observational_memory_enabled,
-                    created_at,
-                    updated_at
-                FROM voice_profiles
-                WHERE id = ?1
-                "#,
-                params![DEFAULT_VOICE_PROFILE_ID],
-                map_voice_profile,
+        voice_profiles::Entity::update_many()
+            .col_expr(voice_profiles::Column::Name, Expr::value(next_name))
+            .col_expr(
+                voice_profiles::Column::SystemPrompt,
+                Expr::value(next_prompt),
             )
+            .col_expr(
+                voice_profiles::Column::ObservationalMemoryEnabled,
+                Expr::value(bool_to_i64(next_memory_enabled)),
+            )
+            .col_expr(voice_profiles::Column::UpdatedAt, Expr::value(now))
+            .filter(voice_profiles::Column::Id.eq(DEFAULT_VOICE_PROFILE_ID))
+            .exec(db)
+            .await
+            .context("Failed to update default voice profile")?;
+
+        fetch_voice_profile(db, DEFAULT_VOICE_PROFILE_ID)
+            .await?
             .context("Updated voice profile not found")
-        })
-        .await
     }
 
     pub async fn create_session(
         &self,
         request: CreateVoiceSessionRequest,
     ) -> anyhow::Result<VoiceSessionSummary> {
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let now = now_unix_millis_i64();
-            let session_id = new_uuid();
+        let db = self.db.connection().await?;
+        let now = now_unix_millis_i64();
+        let session_id = new_uuid();
+        let mode = sanitize_mode(request.mode.as_str())?;
+        let system_prompt = sanitize_prompt(Some(request.system_prompt.as_str()))
+            .unwrap_or_else(|| DEFAULT_VOICE_AGENT_SYSTEM_PROMPT.to_string());
 
-            conn.execute(
-                r#"
-                INSERT INTO voice_sessions (
-                    id,
-                    profile_id,
-                    mode,
-                    system_prompt,
-                    created_at,
-                    updated_at,
-                    ended_at
-                )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
-                "#,
-                params![
-                    session_id,
-                    request.profile_id,
-                    sanitize_mode(request.mode.as_str())?,
-                    sanitize_prompt(Some(request.system_prompt.as_str()))
-                        .unwrap_or_else(|| DEFAULT_VOICE_AGENT_SYSTEM_PROMPT.to_string()),
-                    now,
-                    now,
-                ],
-            )?;
-
-            fetch_session_summary(&conn, &session_id)?
-                .ok_or_else(|| anyhow!("Created voice session not found"))
+        voice_sessions::Entity::insert(voice_sessions::ActiveModel {
+            id: Set(session_id.clone()),
+            profile_id: Set(request.profile_id),
+            mode: Set(mode),
+            system_prompt: Set(system_prompt),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ended_at: Set(None),
         })
+        .exec(db)
         .await
+        .context("Failed to create voice session")?;
+
+        fetch_session_summary(db, &session_id)
+            .await?
+            .ok_or_else(|| anyhow!("Created voice session not found"))
     }
 
     pub async fn end_session(&self, session_id: String) -> anyhow::Result<()> {
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let now = now_unix_millis_i64();
-            conn.execute(
-                r#"
-                UPDATE voice_sessions
-                SET updated_at = ?1,
-                    ended_at = COALESCE(ended_at, ?1)
-                WHERE id = ?2
-                "#,
-                params![now, session_id],
-            )?;
-            Ok(())
-        })
+        let db = self.db.connection().await?;
+        let now = now_unix_millis_i64();
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"
+            UPDATE voice_sessions
+            SET updated_at = ?1,
+                ended_at = COALESCE(ended_at, ?1)
+            WHERE id = ?2
+            "#,
+            vec![now.into(), session_id.into()],
+        ))
         .await
+        .context("Failed to end voice session")?;
+        Ok(())
     }
 
     pub async fn list_sessions(&self, limit: usize) -> anyhow::Result<Vec<VoiceSessionSummary>> {
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let mut stmt = conn.prepare(
+        let db = self.db.connection().await?;
+        let limit = i64::try_from(limit.max(1)).context("Voice session limit exceeds i64")?;
+        let rows = db
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
                 r#"
-                SELECT
-                    s.id,
-                    s.profile_id,
-                    s.mode,
-                    s.system_prompt,
-                    s.created_at,
-                    s.updated_at,
-                    s.ended_at,
-                    (
-                        SELECT COUNT(1)
-                        FROM voice_turns t
-                        WHERE t.session_id = s.id
-                    ) AS turn_count,
-                    (
-                        SELECT t.user_text
-                        FROM voice_turns t
-                        WHERE t.session_id = s.id
-                        ORDER BY t.created_at DESC, t.id DESC
-                        LIMIT 1
-                    ) AS last_user_text,
-                    (
-                        SELECT t.assistant_text
-                        FROM voice_turns t
-                        WHERE t.session_id = s.id
-                        ORDER BY t.created_at DESC, t.id DESC
-                        LIMIT 1
-                    ) AS last_assistant_text
-                FROM voice_sessions s
-                ORDER BY s.updated_at DESC, s.created_at DESC
-                LIMIT ?1
+            SELECT
+                s.id,
+                s.profile_id,
+                s.mode,
+                s.system_prompt,
+                s.created_at,
+                s.updated_at,
+                s.ended_at,
+                (
+                    SELECT COUNT(1)
+                    FROM voice_turns t
+                    WHERE t.session_id = s.id
+                ) AS turn_count,
+                (
+                    SELECT t.user_text
+                    FROM voice_turns t
+                    WHERE t.session_id = s.id
+                    ORDER BY t.created_at DESC, t.id DESC
+                    LIMIT 1
+                ) AS last_user_text,
+                (
+                    SELECT t.assistant_text
+                    FROM voice_turns t
+                    WHERE t.session_id = s.id
+                    ORDER BY t.created_at DESC, t.id DESC
+                    LIMIT 1
+                ) AS last_assistant_text
+            FROM voice_sessions s
+            ORDER BY s.updated_at DESC, s.created_at DESC
+            LIMIT ?1
                 "#,
-            )?;
-
-            let rows = stmt.query_map(params![limit.max(1) as i64], map_session_summary)?;
-            let mut sessions = Vec::new();
-            for row in rows {
-                sessions.push(row?);
-            }
-            Ok(sessions)
-        })
-        .await
+                vec![limit.into()],
+            ))
+            .await
+            .context("Failed to list voice sessions")?;
+        rows.iter().map(map_session_summary).collect()
     }
 
     pub async fn get_session(
         &self,
         session_id: String,
     ) -> anyhow::Result<Option<VoiceSessionDetail>> {
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let Some(session) = fetch_session_summary(&conn, &session_id)? else {
-                return Ok(None);
-            };
-
-            let mut stmt = conn.prepare(
-                r#"
-                SELECT
-                    id,
-                    session_id,
-                    utterance_id,
-                    utterance_seq,
-                    mode,
-                    status,
-                    status_reason,
-                    vad_end_reason,
-                    user_text,
-                    assistant_text,
-                    assistant_raw_text,
-                    language,
-                    audio_duration_secs,
-                    asr_model_id,
-                    text_model_id,
-                    tts_model_id,
-                    s2s_model_id,
-                    speaker,
-                    created_at,
-                    updated_at
-                FROM voice_turns
-                WHERE session_id = ?1
-                ORDER BY created_at ASC, id ASC
-                "#,
-            )?;
-            let rows = stmt.query_map(params![session_id], map_turn_record)?;
-            let mut turns = Vec::new();
-            for row in rows {
-                turns.push(row?);
-            }
-
-            Ok(Some(VoiceSessionDetail { session, turns }))
-        })
-        .await
+        let db = self.db.connection().await?;
+        let Some(session) = fetch_session_summary(db, &session_id).await? else {
+            return Ok(None);
+        };
+        let turns = list_session_turns(db, &session_id).await?;
+        Ok(Some(VoiceSessionDetail { session, turns }))
     }
 
     pub async fn create_turn(
         &self,
         request: CreateVoiceTurnRequest,
     ) -> anyhow::Result<VoiceTurnRecord> {
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let now = now_unix_millis_i64();
-            let turn_id = new_uuid();
-            let mode = sanitize_mode(request.mode.as_str())?;
+        let db = self.db.connection().await?;
+        let now = now_unix_millis_i64();
+        let turn_id = new_uuid();
+        let mode = sanitize_mode(request.mode.as_str())?;
+        let session_id = request.session_id;
 
-            conn.execute(
-                r#"
-                INSERT INTO voice_turns (
-                    id,
-                    session_id,
-                    utterance_id,
-                    utterance_seq,
-                    mode,
-                    status,
-                    status_reason,
-                    vad_end_reason,
-                    user_text,
-                    assistant_text,
-                    assistant_raw_text,
-                    language,
-                    audio_duration_secs,
-                    asr_model_id,
-                    text_model_id,
-                    tts_model_id,
-                    s2s_model_id,
-                    speaker,
-                    created_at,
-                    updated_at
-                )
-                VALUES (
-                    ?1, ?2, ?3, ?4, ?5, 'processing', NULL, ?6, NULL, NULL, NULL, NULL, NULL,
-                    ?7, ?8, ?9, ?10, ?11, ?12, ?12
-                )
-                "#,
-                params![
-                    turn_id,
-                    request.session_id,
-                    sanitize_required_text(request.utterance_id.as_str(), 160)?,
-                    u64_to_i64(request.utterance_seq)?,
-                    mode,
-                    sanitize_optional_text(request.vad_end_reason.as_deref(), 48),
-                    sanitize_optional_text(request.asr_model_id.as_deref(), 160),
-                    sanitize_optional_text(request.text_model_id.as_deref(), 160),
-                    sanitize_optional_text(request.tts_model_id.as_deref(), 160),
-                    sanitize_optional_text(request.s2s_model_id.as_deref(), 160),
-                    sanitize_optional_text(request.speaker.as_deref(), 160),
-                    now,
-                ],
-            )?;
-
-            touch_session_updated_at(&conn, request.session_id.as_str(), now)?;
-            fetch_turn_record(&conn, &turn_id)?
-                .ok_or_else(|| anyhow!("Created voice turn not found"))
+        voice_turns::Entity::insert(voice_turns::ActiveModel {
+            id: Set(turn_id.clone()),
+            session_id: Set(session_id.clone()),
+            utterance_id: Set(sanitize_required_text(request.utterance_id.as_str(), 160)?),
+            utterance_seq: Set(u64_to_i64(request.utterance_seq)?),
+            mode: Set(mode),
+            status: Set("processing".to_string()),
+            status_reason: Set(None),
+            vad_end_reason: Set(sanitize_optional_text(
+                request.vad_end_reason.as_deref(),
+                48,
+            )),
+            user_text: Set(None),
+            assistant_text: Set(None),
+            assistant_raw_text: Set(None),
+            language: Set(None),
+            audio_duration_secs: Set(None),
+            asr_model_id: Set(sanitize_optional_text(request.asr_model_id.as_deref(), 160)),
+            text_model_id: Set(sanitize_optional_text(
+                request.text_model_id.as_deref(),
+                160,
+            )),
+            tts_model_id: Set(sanitize_optional_text(request.tts_model_id.as_deref(), 160)),
+            s2s_model_id: Set(sanitize_optional_text(request.s2s_model_id.as_deref(), 160)),
+            speaker: Set(sanitize_optional_text(request.speaker.as_deref(), 160)),
+            created_at: Set(now),
+            updated_at: Set(now),
         })
+        .exec(db)
         .await
+        .context("Failed to create voice turn")?;
+
+        touch_session_updated_at(db, session_id.as_str(), now).await?;
+        fetch_turn_record(db, &turn_id)
+            .await?
+            .ok_or_else(|| anyhow!("Created voice turn not found"))
     }
 
     pub async fn update_turn_transcript(
@@ -486,32 +304,32 @@ impl VoiceStore {
         language: Option<String>,
         audio_duration_secs: Option<f32>,
     ) -> anyhow::Result<()> {
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let now = now_unix_millis_i64();
-            let session_id = fetch_turn_session_id(&conn, &turn_id)?
-                .ok_or_else(|| anyhow!("Voice turn not found"))?;
-            conn.execute(
-                r#"
-                UPDATE voice_turns
-                SET user_text = ?1,
-                    language = ?2,
-                    audio_duration_secs = ?3,
-                    updated_at = ?4
-                WHERE id = ?5
-                "#,
-                params![
-                    sanitize_optional_text(Some(user_text.as_str()), 16000),
-                    sanitize_optional_text(language.as_deref(), 64),
-                    audio_duration_secs.map(f64::from),
-                    now,
-                    turn_id,
-                ],
-            )?;
-            touch_session_updated_at(&conn, session_id.as_str(), now)?;
-            Ok(())
-        })
+        let db = self.db.connection().await?;
+        let now = now_unix_millis_i64();
+        let session_id = fetch_turn_session_id(db, &turn_id)
+            .await?
+            .ok_or_else(|| anyhow!("Voice turn not found"))?;
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"
+            UPDATE voice_turns
+            SET user_text = ?1,
+                language = ?2,
+                audio_duration_secs = ?3,
+                updated_at = ?4
+            WHERE id = ?5
+            "#,
+            vec![
+                sanitize_optional_text(Some(user_text.as_str()), 16000).into(),
+                sanitize_optional_text(language.as_deref(), 64).into(),
+                audio_duration_secs.map(f64::from).into(),
+                now.into(),
+                turn_id.into(),
+            ],
+        ))
         .await
+        .context("Failed to update voice turn transcript")?;
+        touch_session_updated_at(db, session_id.as_str(), now).await
     }
 
     pub async fn update_turn_assistant(
@@ -520,30 +338,30 @@ impl VoiceStore {
         assistant_text: Option<String>,
         assistant_raw_text: Option<String>,
     ) -> anyhow::Result<()> {
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let now = now_unix_millis_i64();
-            let session_id = fetch_turn_session_id(&conn, &turn_id)?
-                .ok_or_else(|| anyhow!("Voice turn not found"))?;
-            conn.execute(
-                r#"
-                UPDATE voice_turns
-                SET assistant_text = ?1,
-                    assistant_raw_text = ?2,
-                    updated_at = ?3
-                WHERE id = ?4
-                "#,
-                params![
-                    sanitize_optional_text(assistant_text.as_deref(), 16000),
-                    sanitize_optional_text(assistant_raw_text.as_deref(), 16000),
-                    now,
-                    turn_id,
-                ],
-            )?;
-            touch_session_updated_at(&conn, session_id.as_str(), now)?;
-            Ok(())
-        })
+        let db = self.db.connection().await?;
+        let now = now_unix_millis_i64();
+        let session_id = fetch_turn_session_id(db, &turn_id)
+            .await?
+            .ok_or_else(|| anyhow!("Voice turn not found"))?;
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"
+            UPDATE voice_turns
+            SET assistant_text = ?1,
+                assistant_raw_text = ?2,
+                updated_at = ?3
+            WHERE id = ?4
+            "#,
+            vec![
+                sanitize_optional_text(assistant_text.as_deref(), 16000).into(),
+                sanitize_optional_text(assistant_raw_text.as_deref(), 16000).into(),
+                now.into(),
+                turn_id.into(),
+            ],
+        ))
         .await
+        .context("Failed to update voice turn assistant text")?;
+        touch_session_updated_at(db, session_id.as_str(), now).await
     }
 
     pub async fn complete_turn(
@@ -553,88 +371,46 @@ impl VoiceStore {
         status_reason: Option<String>,
     ) -> anyhow::Result<()> {
         let status = sanitize_turn_status(status)?;
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let now = now_unix_millis_i64();
-            let session_id = fetch_turn_session_id(&conn, &turn_id)?
-                .ok_or_else(|| anyhow!("Voice turn not found"))?;
-            conn.execute(
-                r#"
-                UPDATE voice_turns
-                SET status = ?1,
-                    status_reason = ?2,
-                    updated_at = ?3
-                WHERE id = ?4
-                "#,
-                params![
-                    status,
-                    sanitize_optional_text(status_reason.as_deref(), 160),
-                    now,
-                    turn_id,
-                ],
-            )?;
-            touch_session_updated_at(&conn, session_id.as_str(), now)?;
-            Ok(())
-        })
-        .await
-    }
-
-    async fn run_blocking<F, T>(&self, task_fn: F) -> anyhow::Result<T>
-    where
-        F: FnOnce(PathBuf) -> anyhow::Result<T> + Send + 'static,
-        T: Send + 'static,
-    {
-        let db_path = self.db_path.clone();
-        task::spawn_blocking(move || task_fn(db_path))
-            .await
-            .map_err(|err| anyhow!("Voice storage worker failed: {err}"))?
-    }
-}
-
-fn ensure_default_profile(conn: &Connection) -> anyhow::Result<()> {
-    let exists = conn
-        .query_row(
-            "SELECT 1 FROM voice_profiles WHERE id = ?1 LIMIT 1",
-            params![DEFAULT_VOICE_PROFILE_ID],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-    if exists {
-        return Ok(());
-    }
-
-    let now = now_unix_millis_i64();
-    conn.execute(
-        r#"
-        INSERT INTO voice_profiles (
-            id,
-            name,
-            system_prompt,
-            observational_memory_enabled,
-            created_at,
-            updated_at
-        )
-        VALUES (?1, ?2, ?3, 1, ?4, ?4)
-        "#,
-        params![
-            DEFAULT_VOICE_PROFILE_ID,
-            DEFAULT_VOICE_PROFILE_NAME,
-            DEFAULT_VOICE_AGENT_SYSTEM_PROMPT,
-            now,
-        ],
-    )?;
-
-    Ok(())
-}
-
-fn fetch_session_summary(
-    conn: &Connection,
-    session_id: &str,
-) -> anyhow::Result<Option<VoiceSessionSummary>> {
-    let session = conn
-        .query_row(
+        let db = self.db.connection().await?;
+        let now = now_unix_millis_i64();
+        let session_id = fetch_turn_session_id(db, &turn_id)
+            .await?
+            .ok_or_else(|| anyhow!("Voice turn not found"))?;
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
             r#"
+            UPDATE voice_turns
+            SET status = ?1,
+                status_reason = ?2,
+                updated_at = ?3
+            WHERE id = ?4
+            "#,
+            vec![
+                status.into(),
+                sanitize_optional_text(status_reason.as_deref(), 160).into(),
+                now.into(),
+                turn_id.into(),
+            ],
+        ))
+        .await
+        .context("Failed to complete voice turn")?;
+        touch_session_updated_at(db, session_id.as_str(), now).await
+    }
+}
+
+const VOICE_PROFILE_BY_ID_SQL: &str = r#"
+    SELECT
+        id,
+        name,
+        system_prompt,
+        observational_memory_enabled,
+        created_at,
+        updated_at
+    FROM voice_profiles
+    WHERE id = ?1
+"#;
+
+const SESSION_SUMMARY_BY_ID_SQL: &str = r#"
             SELECT
                 s.id,
                 s.profile_id,
@@ -664,18 +440,9 @@ fn fetch_session_summary(
                 ) AS last_assistant_text
             FROM voice_sessions s
             WHERE s.id = ?1
-            "#,
-            params![session_id],
-            map_session_summary,
-        )
-        .optional()?;
-    Ok(session)
-}
+"#;
 
-fn fetch_turn_record(conn: &Connection, turn_id: &str) -> anyhow::Result<Option<VoiceTurnRecord>> {
-    let turn = conn
-        .query_row(
-            r#"
+const TURN_RECORD_BY_ID_SQL: &str = r#"
             SELECT
                 id,
                 session_id,
@@ -699,86 +466,179 @@ fn fetch_turn_record(conn: &Connection, turn_id: &str) -> anyhow::Result<Option<
                 updated_at
             FROM voice_turns
             WHERE id = ?1
-            "#,
-            params![turn_id],
-            map_turn_record,
-        )
-        .optional()?;
-    Ok(turn)
+"#;
+
+const SESSION_TURNS_SQL: &str = r#"
+            SELECT
+                id,
+                session_id,
+                utterance_id,
+                utterance_seq,
+                mode,
+                status,
+                status_reason,
+                vad_end_reason,
+                user_text,
+                assistant_text,
+                assistant_raw_text,
+                language,
+                audio_duration_secs,
+                asr_model_id,
+                text_model_id,
+                tts_model_id,
+                s2s_model_id,
+                speaker,
+                created_at,
+                updated_at
+            FROM voice_turns
+            WHERE session_id = ?1
+            ORDER BY created_at ASC, id ASC
+"#;
+
+async fn fetch_voice_profile(
+    db: &DatabaseConnection,
+    profile_id: &str,
+) -> anyhow::Result<Option<VoiceProfile>> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            VOICE_PROFILE_BY_ID_SQL,
+            vec![profile_id.into()],
+        ))
+        .await
+        .context("Failed to load voice profile")?;
+    row.as_ref().map(map_voice_profile).transpose()
 }
 
-fn fetch_turn_session_id(conn: &Connection, turn_id: &str) -> anyhow::Result<Option<String>> {
-    Ok(conn
-        .query_row(
+async fn fetch_session_summary(
+    db: &DatabaseConnection,
+    session_id: &str,
+) -> anyhow::Result<Option<VoiceSessionSummary>> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            SESSION_SUMMARY_BY_ID_SQL,
+            vec![session_id.into()],
+        ))
+        .await
+        .context("Failed to load voice session summary")?;
+    row.as_ref().map(map_session_summary).transpose()
+}
+
+async fn list_session_turns(
+    db: &DatabaseConnection,
+    session_id: &str,
+) -> anyhow::Result<Vec<VoiceTurnRecord>> {
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            SESSION_TURNS_SQL,
+            vec![session_id.into()],
+        ))
+        .await
+        .context("Failed to list voice turns")?;
+    rows.iter().map(map_turn_record).collect()
+}
+
+async fn fetch_turn_record(
+    db: &DatabaseConnection,
+    turn_id: &str,
+) -> anyhow::Result<Option<VoiceTurnRecord>> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            TURN_RECORD_BY_ID_SQL,
+            vec![turn_id.into()],
+        ))
+        .await
+        .context("Failed to load voice turn")?;
+    row.as_ref().map(map_turn_record).transpose()
+}
+
+async fn fetch_turn_session_id(
+    db: &DatabaseConnection,
+    turn_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
             "SELECT session_id FROM voice_turns WHERE id = ?1",
-            params![turn_id],
-            |row| row.get(0),
-        )
-        .optional()?)
+            vec![turn_id.into()],
+        ))
+        .await
+        .context("Failed to load voice turn session id")?;
+    row.map(|row| row.try_get_by_index(0))
+        .transpose()
+        .map_err(Into::into)
 }
 
-fn touch_session_updated_at(
-    conn: &Connection,
+async fn touch_session_updated_at(
+    db: &DatabaseConnection,
     session_id: &str,
     updated_at: i64,
 ) -> anyhow::Result<()> {
-    conn.execute(
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
         "UPDATE voice_sessions SET updated_at = ?1 WHERE id = ?2",
-        params![updated_at, session_id],
-    )?;
+        vec![updated_at.into(), session_id.into()],
+    ))
+    .await
+    .context("Failed to touch voice session")?;
     Ok(())
 }
 
-fn map_voice_profile(row: &Row<'_>) -> rusqlite::Result<VoiceProfile> {
+fn map_voice_profile(row: &QueryResult) -> anyhow::Result<VoiceProfile> {
     Ok(VoiceProfile {
-        id: row.get(0)?,
-        name: row.get(1)?,
-        system_prompt: row.get(2)?,
-        observational_memory_enabled: i64_to_bool(row.get(3)?),
-        created_at: i64_to_u64(row.get(4)?),
-        updated_at: i64_to_u64(row.get(5)?),
+        id: row.try_get_by_index(0)?,
+        name: row.try_get_by_index(1)?,
+        system_prompt: row.try_get_by_index(2)?,
+        observational_memory_enabled: i64_to_bool(row.try_get_by_index(3)?),
+        created_at: i64_to_u64(row.try_get_by_index(4)?),
+        updated_at: i64_to_u64(row.try_get_by_index(5)?),
     })
 }
 
-fn map_session_summary(row: &Row<'_>) -> rusqlite::Result<VoiceSessionSummary> {
-    let turn_count_raw: i64 = row.get(7)?;
+fn map_session_summary(row: &QueryResult) -> anyhow::Result<VoiceSessionSummary> {
+    let turn_count_raw: i64 = row.try_get_by_index(7)?;
     Ok(VoiceSessionSummary {
-        id: row.get(0)?,
-        profile_id: row.get(1)?,
-        mode: row.get(2)?,
-        system_prompt: row.get(3)?,
-        created_at: i64_to_u64(row.get(4)?),
-        updated_at: i64_to_u64(row.get(5)?),
-        ended_at: row.get::<_, Option<i64>>(6)?.map(i64_to_u64),
+        id: row.try_get_by_index(0)?,
+        profile_id: row.try_get_by_index(1)?,
+        mode: row.try_get_by_index(2)?,
+        system_prompt: row.try_get_by_index(3)?,
+        created_at: i64_to_u64(row.try_get_by_index(4)?),
+        updated_at: i64_to_u64(row.try_get_by_index(5)?),
+        ended_at: row.try_get_by_index::<Option<i64>>(6)?.map(i64_to_u64),
         turn_count: i64_to_usize(turn_count_raw),
-        last_user_text: row.get(8)?,
-        last_assistant_text: row.get(9)?,
+        last_user_text: row.try_get_by_index(8)?,
+        last_assistant_text: row.try_get_by_index(9)?,
     })
 }
 
-fn map_turn_record(row: &Row<'_>) -> rusqlite::Result<VoiceTurnRecord> {
-    let utterance_seq: i64 = row.get(3)?;
+fn map_turn_record(row: &QueryResult) -> anyhow::Result<VoiceTurnRecord> {
+    let utterance_seq: i64 = row.try_get_by_index(3)?;
     Ok(VoiceTurnRecord {
-        id: row.get(0)?,
-        session_id: row.get(1)?,
-        utterance_id: row.get(2)?,
+        id: row.try_get_by_index(0)?,
+        session_id: row.try_get_by_index(1)?,
+        utterance_id: row.try_get_by_index(2)?,
         utterance_seq: i64_to_u64(utterance_seq),
-        mode: row.get(4)?,
-        status: row.get(5)?,
-        status_reason: row.get(6)?,
-        vad_end_reason: row.get(7)?,
-        user_text: row.get(8)?,
-        assistant_text: row.get(9)?,
-        assistant_raw_text: row.get(10)?,
-        language: row.get(11)?,
-        audio_duration_secs: row.get::<_, Option<f64>>(12)?.map(|value| value as f32),
-        asr_model_id: row.get(13)?,
-        text_model_id: row.get(14)?,
-        tts_model_id: row.get(15)?,
-        s2s_model_id: row.get(16)?,
-        speaker: row.get(17)?,
-        created_at: i64_to_u64(row.get(18)?),
-        updated_at: i64_to_u64(row.get(19)?),
+        mode: row.try_get_by_index(4)?,
+        status: row.try_get_by_index(5)?,
+        status_reason: row.try_get_by_index(6)?,
+        vad_end_reason: row.try_get_by_index(7)?,
+        user_text: row.try_get_by_index(8)?,
+        assistant_text: row.try_get_by_index(9)?,
+        assistant_raw_text: row.try_get_by_index(10)?,
+        language: row.try_get_by_index(11)?,
+        audio_duration_secs: row
+            .try_get_by_index::<Option<f64>>(12)?
+            .map(|value| value as f32),
+        asr_model_id: row.try_get_by_index(13)?,
+        text_model_id: row.try_get_by_index(14)?,
+        tts_model_id: row.try_get_by_index(15)?,
+        s2s_model_id: row.try_get_by_index(16)?,
+        speaker: row.try_get_by_index(17)?,
+        created_at: i64_to_u64(row.try_get_by_index(18)?),
+        updated_at: i64_to_u64(row.try_get_by_index(19)?),
     })
 }
 
@@ -822,11 +682,7 @@ fn sanitize_optional_text(raw: Option<&str>, max_len: usize) -> Option<String> {
 }
 
 fn bool_to_i64(value: bool) -> i64 {
-    if value {
-        1
-    } else {
-        0
-    }
+    if value { 1 } else { 0 }
 }
 
 fn i64_to_bool(value: i64) -> bool {
