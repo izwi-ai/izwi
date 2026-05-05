@@ -1,13 +1,14 @@
 //! Persistent saved voice storage backed by SQLite.
 
-use anyhow::{anyhow, Context};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use anyhow::{Context, anyhow};
+use sea_orm::{ConnectionTrait, DbBackend, EntityTrait, QueryResult, Set, Statement};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::task;
 
 use crate::{
+    db::StoreDatabase,
+    entity::saved_voices,
     ids::new_uuid,
     storage_layout::{self, MediaGroup},
 };
@@ -92,7 +93,7 @@ pub struct NewSavedVoice {
 
 #[derive(Clone)]
 pub struct SavedVoiceStore {
-    db_path: PathBuf,
+    db: StoreDatabase,
     media_root: PathBuf,
 }
 
@@ -104,36 +105,8 @@ impl SavedVoiceStore {
         storage_layout::ensure_storage_dirs(&db_path, &media_root)
             .context("Failed to prepare saved voice storage layout")?;
 
-        let conn = storage_layout::open_sqlite_connection(&db_path).with_context(|| {
-            format!("Failed to open saved voice database: {}", db_path.display())
-        })?;
-
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS saved_voices (
-                id TEXT PRIMARY KEY,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                name TEXT NOT NULL COLLATE NOCASE,
-                reference_text TEXT NOT NULL,
-                audio_mime_type TEXT NOT NULL,
-                audio_filename TEXT NULL,
-                audio_storage_path TEXT NOT NULL,
-                source_route_kind TEXT NULL,
-                source_record_id TEXT NULL
-            );
-
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_voices_name_nocase
-                ON saved_voices(name COLLATE NOCASE);
-
-            CREATE INDEX IF NOT EXISTS idx_saved_voices_updated_at
-                ON saved_voices(updated_at DESC, created_at DESC);
-            "#,
-        )
-        .context("Failed to initialize saved voice database schema")?;
-
         Ok(Self {
-            db_path,
+            db: StoreDatabase::new(db_path),
             media_root,
         })
     }
@@ -143,316 +116,278 @@ impl SavedVoiceStore {
         limit: usize,
         cursor: Option<SavedVoiceListCursor>,
     ) -> anyhow::Result<(Vec<SavedVoiceSummary>, Option<SavedVoiceListCursor>)> {
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let list_limit = i64::try_from(limit.clamp(1, 2000).max(1)).unwrap_or(500);
-            let page_size = usize::try_from(list_limit).unwrap_or(500);
-            let fetch_limit = list_limit.saturating_add(1);
+        let db = self.db.connection().await?;
+        let list_limit = i64::try_from(limit.clamp(1, 2000).max(1)).unwrap_or(500);
+        let page_size = usize::try_from(list_limit).unwrap_or(500);
+        let fetch_limit = list_limit.saturating_add(1);
 
-            let mut records = Vec::new();
-            if let Some(cursor) = cursor {
-                let cursor_updated_at = i64::try_from(cursor.updated_at).unwrap_or(i64::MAX);
-                let cursor_created_at = i64::try_from(cursor.created_at).unwrap_or(i64::MAX);
-                let mut stmt = conn.prepare(
-                    r#"
-                    SELECT
-                        id,
-                        created_at,
-                        updated_at,
-                        name,
-                        reference_text,
-                        audio_mime_type,
-                        audio_filename,
-                        source_route_kind,
-                        source_record_id
-                    FROM saved_voices
-                    WHERE
-                        updated_at < ?1
-                        OR (
-                            updated_at = ?1
-                            AND (
-                                created_at < ?2
-                                OR (created_at = ?2 AND id < ?3)
-                            )
-                        )
-                    ORDER BY updated_at DESC, created_at DESC, id DESC
-                    LIMIT ?4
-                    "#,
-                )?;
+        let rows = if let Some(cursor) = cursor {
+            let cursor_updated_at = i64::try_from(cursor.updated_at).unwrap_or(i64::MAX);
+            let cursor_created_at = i64::try_from(cursor.created_at).unwrap_or(i64::MAX);
+            db.query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                SAVED_VOICE_PAGE_AFTER_CURSOR_SQL,
+                vec![
+                    cursor_updated_at.into(),
+                    cursor_created_at.into(),
+                    cursor.id.into(),
+                    fetch_limit.into(),
+                ],
+            ))
+            .await
+        } else {
+            db.query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                SAVED_VOICE_PAGE_SQL,
+                vec![fetch_limit.into()],
+            ))
+            .await
+        }
+        .context("Failed to list saved voices")?;
 
-                let rows = stmt.query_map(
-                    params![cursor_updated_at, cursor_created_at, cursor.id, fetch_limit],
-                    map_saved_voice_summary,
-                )?;
-                for row in rows {
-                    records.push(row?);
-                }
-            } else {
-                let mut stmt = conn.prepare(
-                    r#"
-                    SELECT
-                        id,
-                        created_at,
-                        updated_at,
-                        name,
-                        reference_text,
-                        audio_mime_type,
-                        audio_filename,
-                        source_route_kind,
-                        source_record_id
-                    FROM saved_voices
-                    ORDER BY updated_at DESC, created_at DESC, id DESC
-                    LIMIT ?1
-                    "#,
-                )?;
+        let mut records = rows
+            .iter()
+            .map(map_saved_voice_summary)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let has_more = records.len() > page_size;
+        if has_more {
+            records.truncate(page_size);
+        }
 
-                let rows = stmt.query_map(params![fetch_limit], map_saved_voice_summary)?;
-                for row in rows {
-                    records.push(row?);
-                }
-            }
+        let next_cursor = if has_more {
+            records.last().map(|record| SavedVoiceListCursor {
+                updated_at: record.updated_at,
+                created_at: record.created_at,
+                id: record.id.clone(),
+            })
+        } else {
+            None
+        };
 
-            let has_more = records.len() > page_size;
-            if has_more {
-                records.truncate(page_size);
-            }
-
-            let next_cursor = if has_more {
-                records.last().map(|record| SavedVoiceListCursor {
-                    updated_at: record.updated_at,
-                    created_at: record.created_at,
-                    id: record.id.clone(),
-                })
-            } else {
-                None
-            };
-
-            Ok((records, next_cursor))
-        })
-        .await
+        Ok((records, next_cursor))
     }
 
     pub async fn get_voice(&self, voice_id: String) -> anyhow::Result<Option<SavedVoice>> {
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            fetch_voice_without_audio(&conn, &voice_id)
-        })
-        .await
+        let db = self.db.connection().await?;
+        fetch_voice_without_audio(db, &voice_id).await
     }
 
     pub async fn get_audio(
         &self,
         voice_id: String,
     ) -> anyhow::Result<Option<StoredSavedVoiceAudio>> {
-        let media_root = self.media_root.clone();
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let audio = conn
-                .query_row(
-                    r#"
-                    SELECT audio_storage_path, audio_mime_type, audio_filename
-                    FROM saved_voices
-                    WHERE id = ?1
-                    "#,
-                    params![voice_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, Option<String>>(2)?,
-                        ))
-                    },
-                )
-                .optional()?;
+        let db = self.db.connection().await?;
+        let audio = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                r#"
+                SELECT audio_storage_path, audio_mime_type, audio_filename
+                FROM saved_voices
+                WHERE id = ?1
+                "#,
+                vec![voice_id.into()],
+            ))
+            .await
+            .context("Failed to load saved voice audio metadata")?;
 
-            let Some((audio_storage_path, audio_mime_type, audio_filename)) = audio else {
-                return Ok(None);
-            };
+        let Some(row) = audio else {
+            return Ok(None);
+        };
 
-            let audio_bytes =
-                storage_layout::read_media_file(&media_root, audio_storage_path.as_str())?;
+        let audio_storage_path: String = row.try_get_by_index(0)?;
+        let audio_mime_type: String = row.try_get_by_index(1)?;
+        let audio_filename: Option<String> = row.try_get_by_index(2)?;
+        let audio_bytes =
+            storage_layout::read_media_file(&self.media_root, audio_storage_path.as_str())?;
 
-            Ok(Some(StoredSavedVoiceAudio {
-                audio_bytes,
-                audio_mime_type,
-                audio_filename,
-            }))
-        })
-        .await
+        Ok(Some(StoredSavedVoiceAudio {
+            audio_bytes,
+            audio_mime_type,
+            audio_filename,
+        }))
     }
 
     pub async fn create_voice(&self, voice: NewSavedVoice) -> anyhow::Result<SavedVoice> {
-        let media_root = self.media_root.clone();
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
+        let db = self.db.connection().await?;
+        let now = now_unix_millis_i64();
+        let voice_id = new_uuid();
+        let name = sanitize_required_text(voice.name.as_str(), 120, "name")?;
+        let reference_text =
+            sanitize_required_text(voice.reference_text.as_str(), 4_000, "reference_text")?;
+        let audio_mime_type = sanitize_audio_mime_type(voice.audio_mime_type.as_str());
+        let audio_filename = sanitize_optional_text(voice.audio_filename.as_deref(), 260);
+        let source_route_kind = voice
+            .source_route_kind
+            .map(|kind| kind.as_db_value().to_string());
+        let source_record_id = sanitize_optional_text(voice.source_record_id.as_deref(), 200);
 
-            let now = now_unix_millis_i64();
-            let voice_id = new_uuid();
+        if voice.audio_bytes.is_empty() {
+            return Err(anyhow!("Audio payload cannot be empty"));
+        }
 
-            let name = sanitize_required_text(voice.name.as_str(), 120, "name")?;
-            let reference_text =
-                sanitize_required_text(voice.reference_text.as_str(), 4_000, "reference_text")?;
-            let audio_mime_type = sanitize_audio_mime_type(voice.audio_mime_type.as_str());
-            let audio_filename = sanitize_optional_text(voice.audio_filename.as_deref(), 260);
-            let source_route_kind = voice
-                .source_route_kind
-                .map(SavedVoiceSourceRouteKind::as_db_value);
-            let source_record_id = sanitize_optional_text(voice.source_record_id.as_deref(), 200);
+        let audio_storage_path = storage_layout::persist_audio_file(
+            &self.media_root,
+            MediaGroup::Generated,
+            "voices",
+            &voice_id,
+            audio_filename.as_deref(),
+            audio_mime_type.as_str(),
+            &voice.audio_bytes,
+        )?;
 
-            if voice.audio_bytes.is_empty() {
-                return Err(anyhow!("Audio payload cannot be empty"));
-            }
-
-            let audio_storage_path = storage_layout::persist_audio_file(
-                &media_root,
-                MediaGroup::Generated,
-                "voices",
-                &voice_id,
-                audio_filename.as_deref(),
-                audio_mime_type.as_str(),
-                &voice.audio_bytes,
-            )?;
-
-            if let Err(err) = conn.execute(
-                r#"
-                INSERT INTO saved_voices (
-                    id,
-                    created_at,
-                    updated_at,
-                    name,
-                    reference_text,
-                    audio_mime_type,
-                    audio_filename,
-                    audio_storage_path,
-                    source_route_kind,
-                    source_record_id
-                )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                "#,
-                params![
-                    &voice_id,
-                    now,
-                    now,
-                    name,
-                    reference_text,
-                    audio_mime_type,
-                    audio_filename,
-                    audio_storage_path,
-                    source_route_kind,
-                    source_record_id,
-                ],
-            ) {
-                let _ = storage_layout::delete_media_file(
-                    &media_root,
-                    Some(audio_storage_path.as_str()),
-                );
-                return Err(err).context("Failed to insert saved voice");
-            }
-
-            fetch_voice_without_audio(&conn, &voice_id)?
-                .ok_or_else(|| anyhow!("Failed to fetch created saved voice"))
+        if let Err(err) = saved_voices::Entity::insert(saved_voices::ActiveModel {
+            id: Set(voice_id.clone()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            name: Set(name),
+            reference_text: Set(reference_text),
+            audio_mime_type: Set(audio_mime_type),
+            audio_filename: Set(audio_filename),
+            audio_storage_path: Set(audio_storage_path.clone()),
+            source_route_kind: Set(source_route_kind),
+            source_record_id: Set(source_record_id),
         })
+        .exec(db)
         .await
+        {
+            let _ = storage_layout::delete_media_file(&self.media_root, Some(&audio_storage_path));
+            return Err(err).context("Failed to insert saved voice");
+        }
+
+        fetch_voice_without_audio(db, &voice_id)
+            .await?
+            .ok_or_else(|| anyhow!("Failed to fetch created saved voice"))
     }
 
     pub async fn delete_voice(&self, voice_id: String) -> anyhow::Result<bool> {
-        let media_root = self.media_root.clone();
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let audio_storage_path = conn
-                .query_row(
-                    "SELECT audio_storage_path FROM saved_voices WHERE id = ?1",
-                    params![&voice_id],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .optional()?
-                .flatten();
-
-            let changed =
-                conn.execute("DELETE FROM saved_voices WHERE id = ?1", params![voice_id])?;
-
-            if changed > 0 {
-                storage_layout::delete_media_file(&media_root, audio_storage_path.as_deref())?;
-            }
-
-            Ok(changed > 0)
-        })
-        .await
-    }
-
-    async fn run_blocking<F, T>(&self, task_fn: F) -> anyhow::Result<T>
-    where
-        F: FnOnce(PathBuf) -> anyhow::Result<T> + Send + 'static,
-        T: Send + 'static,
-    {
-        let db_path = self.db_path.clone();
-        task::spawn_blocking(move || task_fn(db_path))
+        let db = self.db.connection().await?;
+        let audio_storage_path = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT audio_storage_path FROM saved_voices WHERE id = ?1",
+                vec![voice_id.clone().into()],
+            ))
             .await
-            .map_err(|err| anyhow!("Saved voice storage worker failed: {err}"))?
+            .context("Failed to load saved voice media path")?
+            .map(|row| row.try_get_by_index::<Option<String>>(0))
+            .transpose()?
+            .flatten();
+
+        let result = saved_voices::Entity::delete_by_id(voice_id)
+            .exec(db)
+            .await
+            .context("Failed to delete saved voice")?;
+
+        if result.rows_affected > 0 {
+            storage_layout::delete_media_file(&self.media_root, audio_storage_path.as_deref())?;
+        }
+
+        Ok(result.rows_affected > 0)
     }
 }
 
-fn fetch_voice_without_audio(
-    conn: &Connection,
+const SAVED_VOICE_COLUMNS: &str = r#"
+    id,
+    created_at,
+    updated_at,
+    name,
+    reference_text,
+    audio_mime_type,
+    audio_filename,
+    source_route_kind,
+    source_record_id
+"#;
+
+const SAVED_VOICE_PAGE_SQL: &str = r#"
+    SELECT
+        id,
+        created_at,
+        updated_at,
+        name,
+        reference_text,
+        audio_mime_type,
+        audio_filename,
+        source_route_kind,
+        source_record_id
+    FROM saved_voices
+    ORDER BY updated_at DESC, created_at DESC, id DESC
+    LIMIT ?1
+"#;
+
+const SAVED_VOICE_PAGE_AFTER_CURSOR_SQL: &str = r#"
+    SELECT
+        id,
+        created_at,
+        updated_at,
+        name,
+        reference_text,
+        audio_mime_type,
+        audio_filename,
+        source_route_kind,
+        source_record_id
+    FROM saved_voices
+    WHERE
+        updated_at < ?1
+        OR (
+            updated_at = ?1
+            AND (
+                created_at < ?2
+                OR (created_at = ?2 AND id < ?3)
+            )
+        )
+    ORDER BY updated_at DESC, created_at DESC, id DESC
+    LIMIT ?4
+"#;
+
+async fn fetch_voice_without_audio(
+    db: &sea_orm::DatabaseConnection,
     voice_id: &str,
 ) -> anyhow::Result<Option<SavedVoice>> {
-    let voice = conn
-        .query_row(
-            r#"
-            SELECT
-                id,
-                created_at,
-                updated_at,
-                name,
-                reference_text,
-                audio_mime_type,
-                audio_filename,
-                source_route_kind,
-                source_record_id
-            FROM saved_voices
-            WHERE id = ?1
-            "#,
-            params![voice_id],
-            map_saved_voice,
-        )
-        .optional()?;
-    Ok(voice)
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            format!("SELECT {SAVED_VOICE_COLUMNS} FROM saved_voices WHERE id = ?1"),
+            vec![voice_id.into()],
+        ))
+        .await
+        .context("Failed to load saved voice")?;
+    row.as_ref().map(map_saved_voice).transpose()
 }
 
-fn map_saved_voice(row: &Row<'_>) -> rusqlite::Result<SavedVoice> {
-    let source_route_raw: Option<String> = row.get(7)?;
+fn map_saved_voice(row: &QueryResult) -> anyhow::Result<SavedVoice> {
+    let source_route_raw: Option<String> = row.try_get_by_index(7)?;
     Ok(SavedVoice {
-        id: row.get(0)?,
-        created_at: i64_to_u64(row.get(1)?),
-        updated_at: i64_to_u64(row.get(2)?),
-        name: row.get(3)?,
-        reference_text: row.get(4)?,
-        audio_mime_type: row.get(5)?,
-        audio_filename: row.get(6)?,
+        id: row.try_get_by_index(0)?,
+        created_at: i64_to_u64(row.try_get_by_index(1)?),
+        updated_at: i64_to_u64(row.try_get_by_index(2)?),
+        name: row.try_get_by_index(3)?,
+        reference_text: row.try_get_by_index(4)?,
+        audio_mime_type: row.try_get_by_index(5)?,
+        audio_filename: row.try_get_by_index(6)?,
         source_route_kind: source_route_raw
             .as_deref()
             .and_then(SavedVoiceSourceRouteKind::from_db_value),
-        source_record_id: row.get(8)?,
+        source_record_id: row.try_get_by_index(8)?,
     })
 }
 
-fn map_saved_voice_summary(row: &Row<'_>) -> rusqlite::Result<SavedVoiceSummary> {
-    let reference_text: String = row.get(4)?;
-    let source_route_raw: Option<String> = row.get(7)?;
+fn map_saved_voice_summary(row: &QueryResult) -> anyhow::Result<SavedVoiceSummary> {
+    let reference_text: String = row.try_get_by_index(4)?;
+    let source_route_raw: Option<String> = row.try_get_by_index(7)?;
 
     Ok(SavedVoiceSummary {
-        id: row.get(0)?,
-        created_at: i64_to_u64(row.get(1)?),
-        updated_at: i64_to_u64(row.get(2)?),
-        name: row.get(3)?,
+        id: row.try_get_by_index(0)?,
+        created_at: i64_to_u64(row.try_get_by_index(1)?),
+        updated_at: i64_to_u64(row.try_get_by_index(2)?),
+        name: row.try_get_by_index(3)?,
         reference_text_preview: reference_text_preview(reference_text.as_str()),
         reference_text_chars: reference_text.chars().count(),
-        audio_mime_type: row.get(5)?,
-        audio_filename: row.get(6)?,
+        audio_mime_type: row.try_get_by_index(5)?,
+        audio_filename: row.try_get_by_index(6)?,
         source_route_kind: source_route_raw
             .as_deref()
             .and_then(SavedVoiceSourceRouteKind::from_db_value),
-        source_record_id: row.get(8)?,
+        source_record_id: row.try_get_by_index(8)?,
     })
 }
 
@@ -519,14 +454,87 @@ fn now_unix_millis_i64() -> i64 {
 }
 
 fn i64_to_u64(value: i64) -> u64 {
-    if value.is_negative() {
-        0
-    } else {
-        value as u64
-    }
+    if value.is_negative() { 0 } else { value as u64 }
 }
 
 #[allow(dead_code)]
 pub const fn default_list_limit() -> usize {
     DEFAULT_LIST_LIMIT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::env_lock;
+
+    fn setup_store() -> (tempfile::TempDir, SavedVoiceStore) {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("saved-voices.sqlite3");
+        let media_dir = temp_dir.path().join("media");
+        std::env::set_var("IZWI_DB_PATH", &db_path);
+        std::env::set_var("IZWI_MEDIA_DIR", &media_dir);
+        let store = SavedVoiceStore::initialize().expect("store");
+        (temp_dir, store)
+    }
+
+    fn clear_env() {
+        std::env::remove_var("IZWI_DB_PATH");
+        std::env::remove_var("IZWI_MEDIA_DIR");
+    }
+
+    #[tokio::test]
+    async fn creates_lists_reads_audio_and_deletes_voice() {
+        let _guard = env_lock();
+        let (_temp, store) = setup_store();
+
+        let created = store
+            .create_voice(NewSavedVoice {
+                name: "  Demo Voice ".to_string(),
+                reference_text: " A calm reference sample ".to_string(),
+                audio_mime_type: "audio/wav".to_string(),
+                audio_filename: Some("demo.wav".to_string()),
+                audio_bytes: vec![1, 2, 3, 4],
+                source_route_kind: Some(SavedVoiceSourceRouteKind::VoiceCloning),
+                source_record_id: Some("speech-1".to_string()),
+            })
+            .await
+            .expect("voice should create");
+
+        assert_eq!(created.name, "Demo Voice");
+        assert_eq!(
+            created.source_route_kind,
+            Some(SavedVoiceSourceRouteKind::VoiceCloning)
+        );
+
+        let audio = store
+            .get_audio(created.id.clone())
+            .await
+            .expect("audio should load")
+            .expect("audio should exist");
+        assert_eq!(audio.audio_bytes, vec![1, 2, 3, 4]);
+
+        let (voices, cursor) = store
+            .list_voices_page(10, None)
+            .await
+            .expect("voices should list");
+        assert!(cursor.is_none());
+        assert_eq!(voices.len(), 1);
+        assert_eq!(voices[0].name, "Demo Voice");
+
+        assert!(
+            store
+                .delete_voice(created.id.clone())
+                .await
+                .expect("voice should delete")
+        );
+        assert!(
+            store
+                .get_voice(created.id)
+                .await
+                .expect("voice lookup should succeed")
+                .is_none()
+        );
+
+        clear_env();
+    }
 }
