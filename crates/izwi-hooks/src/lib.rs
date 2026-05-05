@@ -5,6 +5,7 @@
 //! [`EnterpriseHooks`] bundle into the reusable server entry point.
 
 use async_trait::async_trait;
+use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -383,6 +384,139 @@ impl DesktopPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatabaseProviderRequest {
+    pub purpose: String,
+    pub metadata: HookMetadata,
+}
+
+impl DatabaseProviderRequest {
+    pub fn server_runtime() -> Self {
+        Self {
+            purpose: "server_runtime".to_string(),
+            metadata: HookMetadata::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DatabaseBackend {
+    Sqlite,
+    Postgres,
+    Mysql,
+    Other(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DatabaseMigrationMode {
+    IzwiManaged,
+    ProviderManaged,
+    Disabled,
+}
+
+#[derive(Clone)]
+pub struct DatabaseConnectionDecision {
+    pub connection: DatabaseConnection,
+    pub backend: DatabaseBackend,
+    pub migration_mode: DatabaseMigrationMode,
+    pub metadata: HookMetadata,
+}
+
+#[derive(Clone)]
+pub enum DatabaseProviderDecision {
+    UseDefault,
+    UseConnection(DatabaseConnectionDecision),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaStorageProviderRequest {
+    pub purpose: String,
+    pub metadata: HookMetadata,
+}
+
+impl MediaStorageProviderRequest {
+    pub fn server_media() -> Self {
+        Self {
+            purpose: "server_media".to_string(),
+            metadata: HookMetadata::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaNamespace {
+    TranscriptionUpload,
+    DiarizationUpload,
+    GeneratedSpeech,
+    SavedVoice,
+    ChatMedia,
+    Export,
+    Other(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaObjectKey {
+    pub key: String,
+}
+
+impl MediaObjectKey {
+    pub fn new(key: impl Into<String>) -> Self {
+        Self { key: key.into() }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaObjectMetadata {
+    pub content_type: String,
+    pub filename: Option<String>,
+    pub content_length: Option<u64>,
+    pub sha256: Option<String>,
+    pub tenant_id: Option<String>,
+    pub attributes: HookMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaWriteRequest {
+    pub namespace: MediaNamespace,
+    pub record_id: String,
+    pub preferred_filename: Option<String>,
+    pub content_type: String,
+    pub metadata: HookMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredMediaObject {
+    pub key: MediaObjectKey,
+    pub metadata: MediaObjectMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaReadRequest {
+    pub key: MediaObjectKey,
+    pub metadata: HookMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredMediaBytes {
+    pub bytes: Vec<u8>,
+    pub metadata: MediaObjectMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaDeleteRequest {
+    pub key: MediaObjectKey,
+    pub metadata: HookMetadata,
+}
+
+#[derive(Clone)]
+pub enum MediaStorageProviderDecision {
+    UseDefault,
+    UseProvider(Arc<dyn MediaStorageProvider>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Edition {
     Community,
@@ -446,6 +580,35 @@ pub trait DesktopPolicyProvider: Send + Sync {
     async fn desktop_policy(&self, request: &DesktopPolicyRequest) -> HookResult<DesktopPolicy>;
 }
 
+#[async_trait]
+pub trait DatabaseProvider: Send + Sync {
+    async fn resolve_database(
+        &self,
+        request: &DatabaseProviderRequest,
+    ) -> HookResult<DatabaseProviderDecision>;
+}
+
+#[async_trait]
+pub trait MediaStorageResolver: Send + Sync {
+    async fn resolve_media_storage(
+        &self,
+        request: &MediaStorageProviderRequest,
+    ) -> HookResult<MediaStorageProviderDecision>;
+}
+
+#[async_trait]
+pub trait MediaStorageProvider: Send + Sync {
+    async fn put(
+        &self,
+        request: MediaWriteRequest,
+        bytes: Vec<u8>,
+    ) -> HookResult<StoredMediaObject>;
+
+    async fn get(&self, request: MediaReadRequest) -> HookResult<StoredMediaBytes>;
+
+    async fn delete(&self, request: MediaDeleteRequest) -> HookResult<()>;
+}
+
 pub trait EditionCapabilities: Send + Sync {
     fn edition(&self) -> Edition;
     fn capability_enabled(&self, capability: &str) -> bool;
@@ -464,6 +627,8 @@ pub struct EnterpriseHooks {
     pub admin_workflows: Arc<dyn AdminWorkflowHooks>,
     pub agent_tools: Arc<dyn AgentToolPolicy>,
     pub desktop_policy: Arc<dyn DesktopPolicyProvider>,
+    pub database: Arc<dyn DatabaseProvider>,
+    pub media_storage: Arc<dyn MediaStorageResolver>,
     pub edition: Arc<dyn EditionCapabilities>,
 }
 
@@ -481,6 +646,8 @@ impl EnterpriseHooks {
             admin_workflows: Arc::new(NoopAdminWorkflowHooks),
             agent_tools: Arc::new(NoopAgentToolPolicy),
             desktop_policy: Arc::new(NoopDesktopPolicyProvider),
+            database: Arc::new(NoopDatabaseProvider),
+            media_storage: Arc::new(NoopMediaStorageResolver),
             edition: Arc::new(NoopEditionCapabilities),
         }
     }
@@ -617,6 +784,32 @@ impl DesktopPolicyProvider for NoopDesktopPolicyProvider {
 }
 
 #[derive(Debug, Default)]
+pub struct NoopDatabaseProvider;
+
+#[async_trait]
+impl DatabaseProvider for NoopDatabaseProvider {
+    async fn resolve_database(
+        &self,
+        _request: &DatabaseProviderRequest,
+    ) -> HookResult<DatabaseProviderDecision> {
+        Ok(DatabaseProviderDecision::UseDefault)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct NoopMediaStorageResolver;
+
+#[async_trait]
+impl MediaStorageResolver for NoopMediaStorageResolver {
+    async fn resolve_media_storage(
+        &self,
+        _request: &MediaStorageProviderRequest,
+    ) -> HookResult<MediaStorageProviderDecision> {
+        Ok(MediaStorageProviderDecision::UseDefault)
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct NoopEditionCapabilities;
 
 impl EditionCapabilities for NoopEditionCapabilities {
@@ -682,5 +875,33 @@ mod tests {
 
         assert_eq!(hooks.edition.edition(), Edition::Community);
         assert!(!hooks.edition.capability_enabled("enterprise.sso"));
+        assert!(!hooks
+            .edition
+            .capability_enabled("enterprise.persistence.database"));
+        assert!(!hooks
+            .edition
+            .capability_enabled("enterprise.persistence.storage"));
+    }
+
+    #[tokio::test]
+    async fn noop_persistence_hooks_use_local_defaults() {
+        let hooks = EnterpriseHooks::noop();
+
+        let database = hooks
+            .database
+            .resolve_database(&DatabaseProviderRequest::server_runtime())
+            .await
+            .expect("noop database hook should succeed");
+        assert!(matches!(database, DatabaseProviderDecision::UseDefault));
+
+        let media_storage = hooks
+            .media_storage
+            .resolve_media_storage(&MediaStorageProviderRequest::server_media())
+            .await
+            .expect("noop media storage hook should succeed");
+        assert!(matches!(
+            media_storage,
+            MediaStorageProviderDecision::UseDefault
+        ));
     }
 }
