@@ -3,4 +3,4 @@
 pub mod migrator;
 pub mod sqlite;
 
-pub use sqlite::initialize_default;
+pub use sqlite::{StoreDatabase, initialize_default};

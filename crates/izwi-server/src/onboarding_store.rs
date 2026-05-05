@@ -1,13 +1,13 @@
 //! Persistent first-run onboarding state backed by SQLite.
 
 use anyhow::Context;
-use rusqlite::{params, OptionalExtension};
+use sea_orm::sea_query::OnConflict;
+use sea_orm::{DatabaseConnection, EntityTrait, Set};
 use serde::Serialize;
-use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::task;
 
-use crate::storage_layout;
+use crate::db::StoreDatabase;
+use crate::entity::onboarding_state;
 
 const ONBOARDING_STATE_ID: &str = "default";
 
@@ -20,129 +20,95 @@ pub struct OnboardingState {
 
 #[derive(Clone)]
 pub struct OnboardingStore {
-    db_path: PathBuf,
+    db: StoreDatabase,
 }
 
 impl OnboardingStore {
     pub fn initialize() -> anyhow::Result<Self> {
-        let db_path = storage_layout::resolve_db_path();
-        let media_root = storage_layout::resolve_media_root();
-
-        storage_layout::ensure_storage_dirs(&db_path, &media_root)
-            .context("Failed to prepare onboarding storage layout")?;
-
-        let conn = storage_layout::open_sqlite_connection(&db_path).with_context(|| {
-            format!("Failed to open onboarding database: {}", db_path.display())
-        })?;
-
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS onboarding_state (
-                id TEXT PRIMARY KEY,
-                completed_at INTEGER NULL,
-                analytics_opt_in INTEGER NOT NULL DEFAULT 0
-            );
-            "#,
-        )
-        .context("Failed to initialize onboarding database schema")?;
-        ensure_onboarding_state_analytics_opt_in_column(&conn)?;
-
-        Ok(Self { db_path })
+        Ok(Self {
+            db: StoreDatabase::from_default_path()?,
+        })
     }
 
     pub async fn get_state(&self) -> anyhow::Result<OnboardingState> {
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            read_state_from_conn(&conn)
-        })
-        .await
+        let db = self.db.connection().await?;
+        read_state(db).await
     }
 
     pub async fn mark_completed(&self) -> anyhow::Result<OnboardingState> {
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let completed_at = current_timestamp();
+        let db = self.db.connection().await?;
+        let completed_at = current_timestamp();
+        let state = onboarding_state::ActiveModel {
+            id: Set(ONBOARDING_STATE_ID.to_string()),
+            completed_at: Set(Some(completed_at as i64)),
+            ..Default::default()
+        };
 
-            conn.execute(
-                r#"
-                INSERT INTO onboarding_state (id, completed_at)
-                VALUES (?1, ?2)
-                ON CONFLICT(id) DO UPDATE SET completed_at = excluded.completed_at
-                "#,
-                params![ONBOARDING_STATE_ID, completed_at as i64],
-            )?;
+        onboarding_state::Entity::insert(state)
+            .on_conflict(
+                OnConflict::column(onboarding_state::Column::Id)
+                    .update_column(onboarding_state::Column::CompletedAt)
+                    .to_owned(),
+            )
+            .exec(db)
+            .await
+            .context("Failed to mark onboarding completed")?;
 
-            read_state_from_conn(&conn)
-        })
-        .await
+        read_state(db).await
     }
 
     pub async fn set_analytics_opt_in(
         &self,
         analytics_opt_in: bool,
     ) -> anyhow::Result<OnboardingState> {
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let analytics_opt_in_int = bool_to_i64(analytics_opt_in);
+        let db = self.db.connection().await?;
+        let state = onboarding_state::ActiveModel {
+            id: Set(ONBOARDING_STATE_ID.to_string()),
+            analytics_opt_in: Set(bool_to_i64(analytics_opt_in)),
+            ..Default::default()
+        };
 
-            conn.execute(
-                r#"
-                INSERT INTO onboarding_state (id, completed_at, analytics_opt_in)
-                VALUES (?1, NULL, ?2)
-                ON CONFLICT(id) DO UPDATE SET analytics_opt_in = excluded.analytics_opt_in
-                "#,
-                params![ONBOARDING_STATE_ID, analytics_opt_in_int],
-            )?;
-
-            read_state_from_conn(&conn)
-        })
-        .await
-    }
-
-    async fn run_blocking<F, T>(&self, task_fn: F) -> anyhow::Result<T>
-    where
-        F: FnOnce(PathBuf) -> anyhow::Result<T> + Send + 'static,
-        T: Send + 'static,
-    {
-        let db_path = self.db_path.clone();
-        task::spawn_blocking(move || task_fn(db_path))
+        onboarding_state::Entity::insert(state)
+            .on_conflict(
+                OnConflict::column(onboarding_state::Column::Id)
+                    .update_column(onboarding_state::Column::AnalyticsOptIn)
+                    .to_owned(),
+            )
+            .exec(db)
             .await
-            .context("Onboarding store task failed")?
+            .context("Failed to update onboarding analytics preference")?;
+
+        read_state(db).await
     }
 }
 
-fn read_state_from_conn(conn: &rusqlite::Connection) -> anyhow::Result<OnboardingState> {
-    let row = conn
-        .query_row(
-            r#"
-            SELECT completed_at, analytics_opt_in
-            FROM onboarding_state
-            WHERE id = ?1
-            "#,
-            params![ONBOARDING_STATE_ID],
-            |row| {
-                let completed_at: Option<i64> = row.get(0)?;
-                let analytics_opt_in: i64 = row.get(1)?;
-                Ok((completed_at, analytics_opt_in))
-            },
-        )
-        .optional()?;
+async fn read_state(db: &DatabaseConnection) -> anyhow::Result<OnboardingState> {
+    let model = onboarding_state::Entity::find_by_id(ONBOARDING_STATE_ID.to_string())
+        .one(db)
+        .await
+        .context("Failed to load onboarding state")?;
+    Ok(model_to_state(model))
+}
 
-    let (completed_at_raw, analytics_opt_in_raw) = row.unwrap_or((None, 0));
-    let completed_at = completed_at_raw.and_then(i64_to_u64);
-    Ok(OnboardingState {
+fn model_to_state(model: Option<onboarding_state::Model>) -> OnboardingState {
+    let Some(model) = model else {
+        return OnboardingState {
+            completed: false,
+            completed_at: None,
+            analytics_opt_in: false,
+        };
+    };
+
+    let completed_at = model.completed_at.and_then(i64_to_u64);
+    OnboardingState {
         completed: completed_at.is_some(),
         completed_at,
-        analytics_opt_in: i64_to_bool(analytics_opt_in_raw),
-    })
+        analytics_opt_in: i64_to_bool(model.analytics_opt_in),
+    }
 }
 
 fn i64_to_u64(value: i64) -> Option<u64> {
-    if value > 0 {
-        Some(value as u64)
-    } else {
-        None
-    }
+    if value > 0 { Some(value as u64) } else { None }
 }
 
 fn current_timestamp() -> u64 {
@@ -153,54 +119,11 @@ fn current_timestamp() -> u64 {
 }
 
 fn bool_to_i64(value: bool) -> i64 {
-    if value {
-        1
-    } else {
-        0
-    }
+    if value { 1 } else { 0 }
 }
 
 fn i64_to_bool(value: i64) -> bool {
     value > 0
-}
-
-fn ensure_onboarding_state_analytics_opt_in_column(
-    conn: &rusqlite::Connection,
-) -> anyhow::Result<()> {
-    if onboarding_state_has_column(conn, "analytics_opt_in")? {
-        return Ok(());
-    }
-
-    conn.execute(
-        "ALTER TABLE onboarding_state ADD COLUMN analytics_opt_in INTEGER NOT NULL DEFAULT 0",
-        [],
-    )
-    .context("Failed adding onboarding_state.analytics_opt_in column")?;
-
-    Ok(())
-}
-
-fn onboarding_state_has_column(conn: &rusqlite::Connection, target: &str) -> anyhow::Result<bool> {
-    let mut stmt = conn
-        .prepare("PRAGMA table_info(onboarding_state)")
-        .context("Failed to inspect onboarding_state schema")?;
-    let mut rows = stmt
-        .query([])
-        .context("Failed to query onboarding_state schema info")?;
-
-    while let Some(row) = rows
-        .next()
-        .context("Failed reading onboarding_state schema row")?
-    {
-        let name: String = row
-            .get(1)
-            .context("Failed reading onboarding_state column name")?;
-        if name == target {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
 }
 
 #[cfg(test)]
