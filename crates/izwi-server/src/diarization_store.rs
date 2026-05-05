@@ -1,14 +1,18 @@
 //! Persistent diarization history storage backed by SQLite.
 
-use anyhow::{anyhow, Context};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use anyhow::{Context, anyhow};
+use sea_orm::sea_query::Expr;
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryResult, Set, Statement,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::task;
 
 use crate::{
+    db::StoreDatabase,
+    entity::diarization_records,
     ids::new_uuid,
     storage_layout::{self, MediaGroup},
 };
@@ -248,7 +252,7 @@ pub struct CompleteDiarizationRecord {
 
 #[derive(Clone)]
 pub struct DiarizationStore {
-    db_path: PathBuf,
+    db: StoreDatabase,
     media_root: PathBuf,
 }
 
@@ -264,66 +268,8 @@ impl DiarizationStore {
         storage_layout::ensure_storage_dirs(&db_path, &media_root)
             .context("Failed to prepare diarization storage layout")?;
 
-        let conn = storage_layout::open_sqlite_connection(&db_path).with_context(|| {
-            format!("Failed to open diarization database: {}", db_path.display())
-        })?;
-
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS diarization_records (
-                id TEXT PRIMARY KEY,
-                created_at INTEGER NOT NULL,
-                model_id TEXT NULL,
-                asr_model_id TEXT NULL,
-                aligner_model_id TEXT NULL,
-                llm_model_id TEXT NULL,
-                processing_status TEXT NOT NULL DEFAULT 'ready',
-                processing_error TEXT NULL,
-                min_speakers INTEGER NULL,
-                max_speakers INTEGER NULL,
-                min_speech_duration_ms REAL NULL,
-                min_silence_duration_ms REAL NULL,
-                enable_llm_refinement INTEGER NOT NULL,
-                processing_time_ms REAL NOT NULL,
-                duration_secs REAL NULL,
-                rtf REAL NULL,
-                speaker_count INTEGER NOT NULL,
-                alignment_coverage REAL NULL,
-                unattributed_words INTEGER NOT NULL,
-                llm_refined INTEGER NOT NULL,
-                asr_text TEXT NOT NULL,
-                raw_transcript TEXT NOT NULL,
-                transcript TEXT NOT NULL,
-                summary_status TEXT NOT NULL DEFAULT 'not_requested',
-                summary_model_id TEXT NULL,
-                summary_text TEXT NULL,
-                summary_error TEXT NULL,
-                summary_updated_at INTEGER NULL,
-                segments_json TEXT NOT NULL,
-                words_json TEXT NOT NULL,
-                utterances_json TEXT NOT NULL,
-                speaker_name_overrides_json TEXT NOT NULL DEFAULT '{}',
-                audio_mime_type TEXT NOT NULL,
-                audio_filename TEXT NULL,
-                audio_storage_path TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_diarization_records_created_at
-                ON diarization_records(created_at DESC);
-            "#,
-        )
-        .context("Failed to initialize diarization database schema")?;
-        ensure_diarization_records_speaker_name_overrides_column(&conn)?;
-        ensure_diarization_records_processing_status_column(&conn)?;
-        ensure_diarization_records_processing_error_column(&conn)?;
-        ensure_diarization_records_summary_status_column(&conn)?;
-        ensure_diarization_records_summary_model_id_column(&conn)?;
-        ensure_diarization_records_summary_text_column(&conn)?;
-        ensure_diarization_records_summary_error_column(&conn)?;
-        ensure_diarization_records_summary_updated_at_column(&conn)?;
-
         Ok(Self {
-            db_path,
+            db: StoreDatabase::new(db_path),
             media_root,
         })
     }
@@ -336,455 +282,255 @@ impl DiarizationStore {
         Vec<DiarizationRecordSummary>,
         Option<DiarizationRecordListCursor>,
     )> {
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let list_limit = i64::try_from(limit.clamp(1, 500).max(1)).unwrap_or(200);
-            let mut records = Vec::new();
-            let fetch_limit = list_limit.saturating_add(1);
+        let db = self.db.connection().await?;
+        let list_limit = i64::try_from(limit.clamp(1, 500).max(1)).unwrap_or(200);
+        let fetch_limit = list_limit.saturating_add(1);
 
-            if let Some(cursor) = cursor {
-                let cursor_created_at = i64::try_from(cursor.created_at).unwrap_or(i64::MAX);
-                let mut stmt = conn.prepare(
-                    r#"
-                    SELECT
-                        id,
-                        created_at,
-                        model_id,
-                        processing_status,
-                        processing_error,
-                        speaker_count,
-                        utterances_json,
-                        speaker_name_overrides_json,
-                        duration_secs,
-                        processing_time_ms,
-                        rtf,
-                        audio_mime_type,
-                        audio_filename,
-                        transcript,
-                        summary_status,
-                        summary_text
-                    FROM diarization_records
-                    WHERE created_at < ?1 OR (created_at = ?1 AND id < ?2)
-                    ORDER BY created_at DESC, id DESC
-                    LIMIT ?3
-                    "#,
-                )?;
+        let rows = if let Some(cursor) = cursor {
+            let cursor_created_at = i64::try_from(cursor.created_at).unwrap_or(i64::MAX);
+            db.query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                DIARIZATION_PAGE_AFTER_CURSOR_SQL,
+                vec![
+                    cursor_created_at.into(),
+                    cursor.id.into(),
+                    fetch_limit.into(),
+                ],
+            ))
+            .await
+        } else {
+            db.query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                DIARIZATION_PAGE_SQL,
+                vec![fetch_limit.into()],
+            ))
+            .await
+        }
+        .context("Failed to list diarization records")?;
 
-                let rows =
-                    stmt.query_map(params![cursor_created_at, cursor.id, fetch_limit], |row| {
-                        let speaker_count = row
-                            .get::<_, Option<i64>>(5)?
-                            .and_then(i64_to_usize)
-                            .unwrap_or(0);
-                        let utterances: Vec<DiarizationUtteranceRecord> =
-                            parse_json_vec(row.get(6)?);
-                        let speaker_name_overrides = parse_json_map(row.get(7)?);
-                        let transcript: String = row.get(13)?;
-                        let summary_status =
-                            parse_summary_status(row.get::<_, Option<String>>(14)?);
-                        let summary_text: Option<String> = row.get(15)?;
-                        Ok(DiarizationRecordSummary {
-                            id: row.get(0)?,
-                            created_at: i64_to_u64(row.get(1)?),
-                            model_id: row.get(2)?,
-                            processing_status: parse_processing_status(row.get(3)?),
-                            processing_error: row.get(4)?,
-                            speaker_count,
-                            corrected_speaker_count: corrected_speaker_count_from_parts(
-                                speaker_count,
-                                &[],
-                                &[],
-                                &utterances,
-                                &speaker_name_overrides,
-                            ),
-                            speaker_name_override_count: speaker_name_overrides.len(),
-                            duration_secs: row.get(8)?,
-                            processing_time_ms: row.get(9)?,
-                            rtf: row.get(10)?,
-                            audio_mime_type: row.get(11)?,
-                            audio_filename: row.get(12)?,
-                            transcript_preview: transcript_preview_with_utterances(
-                                &utterances,
-                                &speaker_name_overrides,
-                                transcript.as_str(),
-                            ),
-                            transcript_chars: transcript.chars().count(),
-                            summary_status,
-                            summary_preview: summary_preview(summary_text.as_deref()),
-                            summary_chars: summary_text
-                                .as_ref()
-                                .map(|text| text.chars().count())
-                                .unwrap_or(0),
-                        })
-                    })?;
+        let mut records = rows
+            .iter()
+            .map(map_diarization_summary)
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
-                for row in rows {
-                    records.push(row?);
-                }
-            } else {
-                let mut stmt = conn.prepare(
-                    r#"
-                    SELECT
-                        id,
-                        created_at,
-                        model_id,
-                        processing_status,
-                        processing_error,
-                        speaker_count,
-                        utterances_json,
-                        speaker_name_overrides_json,
-                        duration_secs,
-                        processing_time_ms,
-                        rtf,
-                        audio_mime_type,
-                        audio_filename,
-                        transcript,
-                        summary_status,
-                        summary_text
-                    FROM diarization_records
-                    ORDER BY created_at DESC, id DESC
-                    LIMIT ?1
-                    "#,
-                )?;
+        let page_limit = usize::try_from(list_limit).unwrap_or(200);
+        let has_more = records.len() > page_limit;
+        if has_more {
+            records.truncate(page_limit);
+        }
+        let next_cursor = if has_more {
+            records.last().map(|record| DiarizationRecordListCursor {
+                created_at: record.created_at,
+                id: record.id.clone(),
+            })
+        } else {
+            None
+        };
 
-                let rows = stmt.query_map(params![fetch_limit], |row| {
-                    let speaker_count = row
-                        .get::<_, Option<i64>>(5)?
-                        .and_then(i64_to_usize)
-                        .unwrap_or(0);
-                    let utterances: Vec<DiarizationUtteranceRecord> = parse_json_vec(row.get(6)?);
-                    let speaker_name_overrides = parse_json_map(row.get(7)?);
-                    let transcript: String = row.get(13)?;
-                    let summary_status = parse_summary_status(row.get::<_, Option<String>>(14)?);
-                    let summary_text: Option<String> = row.get(15)?;
-                    Ok(DiarizationRecordSummary {
-                        id: row.get(0)?,
-                        created_at: i64_to_u64(row.get(1)?),
-                        model_id: row.get(2)?,
-                        processing_status: parse_processing_status(row.get(3)?),
-                        processing_error: row.get(4)?,
-                        speaker_count,
-                        corrected_speaker_count: corrected_speaker_count_from_parts(
-                            speaker_count,
-                            &[],
-                            &[],
-                            &utterances,
-                            &speaker_name_overrides,
-                        ),
-                        speaker_name_override_count: speaker_name_overrides.len(),
-                        duration_secs: row.get(8)?,
-                        processing_time_ms: row.get(9)?,
-                        rtf: row.get(10)?,
-                        audio_mime_type: row.get(11)?,
-                        audio_filename: row.get(12)?,
-                        transcript_preview: transcript_preview_with_utterances(
-                            &utterances,
-                            &speaker_name_overrides,
-                            transcript.as_str(),
-                        ),
-                        transcript_chars: transcript.chars().count(),
-                        summary_status,
-                        summary_preview: summary_preview(summary_text.as_deref()),
-                        summary_chars: summary_text
-                            .as_ref()
-                            .map(|text| text.chars().count())
-                            .unwrap_or(0),
-                    })
-                })?;
-
-                for row in rows {
-                    records.push(row?);
-                }
-            }
-
-            let page_limit = usize::try_from(list_limit).unwrap_or(200);
-            let has_more = records.len() > page_limit;
-            if has_more {
-                records.truncate(page_limit);
-            }
-            let next_cursor = if has_more {
-                records.last().map(|record| DiarizationRecordListCursor {
-                    created_at: record.created_at,
-                    id: record.id.clone(),
-                })
-            } else {
-                None
-            };
-
-            Ok((records, next_cursor))
-        })
-        .await
+        Ok((records, next_cursor))
     }
 
     pub async fn get_record(&self, record_id: String) -> anyhow::Result<Option<DiarizationRecord>> {
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let record = fetch_record_without_audio(&conn, &record_id)?;
-            Ok(record)
-        })
-        .await
+        let db = self.db.connection().await?;
+        fetch_record_without_audio(db, &record_id).await
     }
 
     pub async fn get_audio(
         &self,
         record_id: String,
     ) -> anyhow::Result<Option<StoredDiarizationAudio>> {
-        let media_root = self.media_root.clone();
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let audio = conn
-                .query_row(
-                    r#"
-                    SELECT audio_storage_path, audio_mime_type, audio_filename
-                    FROM diarization_records
-                    WHERE id = ?1
-                    "#,
-                    params![record_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, Option<String>>(2)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            let Some((audio_storage_path, audio_mime_type, audio_filename)) = audio else {
-                return Ok(None);
-            };
+        let db = self.db.connection().await?;
+        let audio = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                r#"
+                SELECT audio_storage_path, audio_mime_type, audio_filename
+                FROM diarization_records
+                WHERE id = ?1
+                "#,
+                vec![record_id.into()],
+            ))
+            .await
+            .context("Failed to load diarization audio metadata")?;
+        let Some(row) = audio else {
+            return Ok(None);
+        };
 
-            let audio_bytes =
-                storage_layout::read_media_file(&media_root, audio_storage_path.as_str())?;
+        let audio_storage_path: String = row.try_get_by_index(0)?;
+        let audio_mime_type: String = row.try_get_by_index(1)?;
+        let audio_filename: Option<String> = row.try_get_by_index(2)?;
+        let audio_bytes =
+            storage_layout::read_media_file(&self.media_root, audio_storage_path.as_str())?;
 
-            Ok(Some(StoredDiarizationAudio {
-                audio_bytes,
-                audio_mime_type,
-                audio_filename,
-            }))
-        })
-        .await
+        Ok(Some(StoredDiarizationAudio {
+            audio_bytes,
+            audio_mime_type,
+            audio_filename,
+        }))
     }
 
     pub async fn create_record(
         &self,
         record: NewDiarizationRecord,
     ) -> anyhow::Result<DiarizationRecord> {
-        let media_root = self.media_root.clone();
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let now = now_unix_millis_i64();
-            let record_id = new_uuid();
+        let db = self.db.connection().await?;
+        let now = now_unix_millis_i64();
+        let record_id = new_uuid();
 
-            let model_id = sanitize_optional_text(record.model_id.as_deref(), 160);
-            let asr_model_id = sanitize_optional_text(record.asr_model_id.as_deref(), 160);
-            let aligner_model_id = sanitize_optional_text(record.aligner_model_id.as_deref(), 160);
-            let llm_model_id = sanitize_optional_text(record.llm_model_id.as_deref(), 160);
-            let processing_error =
-                sanitize_optional_text(record.processing_error.as_deref(), 1_000);
-            let processing_status =
-                normalize_processing_status(record.processing_status, processing_error.as_deref());
-            let min_speakers = record
-                .min_speakers
-                .and_then(|value| i64::try_from(value).ok());
-            let max_speakers = record
-                .max_speakers
-                .and_then(|value| i64::try_from(value).ok());
-            let min_speech_duration_ms = record
-                .min_speech_duration_ms
-                .filter(|value| value.is_finite() && *value >= 0.0);
-            let min_silence_duration_ms = record
-                .min_silence_duration_ms
-                .filter(|value| value.is_finite() && *value >= 0.0);
-            let processing_time_ms = if record.processing_time_ms.is_finite() {
-                record.processing_time_ms.max(0.0)
+        let model_id = sanitize_optional_text(record.model_id.as_deref(), 160);
+        let asr_model_id = sanitize_optional_text(record.asr_model_id.as_deref(), 160);
+        let aligner_model_id = sanitize_optional_text(record.aligner_model_id.as_deref(), 160);
+        let llm_model_id = sanitize_optional_text(record.llm_model_id.as_deref(), 160);
+        let processing_error = sanitize_optional_text(record.processing_error.as_deref(), 1_000);
+        let processing_status =
+            normalize_processing_status(record.processing_status, processing_error.as_deref());
+        let min_speakers = record
+            .min_speakers
+            .and_then(|value| i64::try_from(value).ok());
+        let max_speakers = record
+            .max_speakers
+            .and_then(|value| i64::try_from(value).ok());
+        let min_speech_duration_ms = record
+            .min_speech_duration_ms
+            .filter(|value| value.is_finite() && *value >= 0.0);
+        let min_silence_duration_ms = record
+            .min_silence_duration_ms
+            .filter(|value| value.is_finite() && *value >= 0.0);
+        let processing_time_ms = if record.processing_time_ms.is_finite() {
+            record.processing_time_ms.max(0.0)
+        } else {
+            0.0
+        };
+        let duration_secs = record
+            .duration_secs
+            .filter(|value| value.is_finite() && *value >= 0.0);
+        let rtf = record
+            .rtf
+            .filter(|value| value.is_finite() && *value >= 0.0);
+        let speaker_count = i64::try_from(record.speaker_count).unwrap_or(0);
+        let alignment_coverage = record
+            .alignment_coverage
+            .filter(|value| value.is_finite() && *value >= 0.0);
+        let unattributed_words = i64::try_from(record.unattributed_words).unwrap_or(0);
+        let asr_text = sanitize_required_text(record.asr_text.as_str(), 40_000);
+        let raw_transcript = sanitize_required_text(record.raw_transcript.as_str(), 100_000);
+        let transcript = sanitize_required_text(record.transcript.as_str(), 100_000);
+        let summary_model_id = sanitize_optional_text(record.summary_model_id.as_deref(), 160);
+        let summary_text = sanitize_optional_text(record.summary_text.as_deref(), 20_000);
+        let summary_error = sanitize_optional_text(record.summary_error.as_deref(), 1_000);
+        let summary_status = normalize_summary_status(
+            record.summary_status,
+            summary_text.as_deref(),
+            summary_error.as_deref(),
+        );
+        let summary_updated_at = normalize_optional_timestamp_i64(record.summary_updated_at)
+            .or_else(|| {
+                if summary_status == DiarizationSummaryStatus::NotRequested {
+                    None
+                } else {
+                    Some(now)
+                }
+            });
+        let speaker_name_overrides = sanitize_speaker_name_overrides(
+            &record.speaker_name_overrides,
+            &raw_speaker_labels_from_parts(&record.segments, &record.words, &record.utterances),
+        )?;
+        let audio_mime_type = sanitize_audio_mime_type(record.audio_mime_type.as_str());
+        let audio_filename = sanitize_optional_text(record.audio_filename.as_deref(), 260);
+
+        if record.audio_bytes.is_empty() {
+            return Err(anyhow!("Audio payload cannot be empty"));
+        }
+
+        let audio_storage_path = storage_layout::persist_audio_file(
+            &self.media_root,
+            MediaGroup::Uploads,
+            "diarization",
+            &record_id,
+            audio_filename.as_deref(),
+            audio_mime_type.as_str(),
+            &record.audio_bytes,
+        )?;
+
+        let segments_json =
+            serde_json::to_string(&record.segments).context("Failed serializing segments")?;
+        let words_json =
+            serde_json::to_string(&record.words).context("Failed serializing words")?;
+        let utterances_json =
+            serde_json::to_string(&record.utterances).context("Failed serializing utterances")?;
+        let speaker_name_overrides_json = serde_json::to_string(&speaker_name_overrides)
+            .context("Failed serializing speaker name overrides")?;
+
+        if let Err(err) = diarization_records::Entity::insert(diarization_records::ActiveModel {
+            id: Set(record_id.clone()),
+            created_at: Set(now),
+            model_id: Set(model_id),
+            asr_model_id: Set(asr_model_id),
+            aligner_model_id: Set(aligner_model_id),
+            llm_model_id: Set(llm_model_id),
+            processing_status: Set(processing_status.as_db_value().to_string()),
+            processing_error: Set(processing_error),
+            min_speakers: Set(min_speakers),
+            max_speakers: Set(max_speakers),
+            min_speech_duration_ms: Set(min_speech_duration_ms),
+            min_silence_duration_ms: Set(min_silence_duration_ms),
+            enable_llm_refinement: Set(if record.enable_llm_refinement {
+                1_i64
             } else {
-                0.0
-            };
-            let duration_secs = record
-                .duration_secs
-                .filter(|value| value.is_finite() && *value >= 0.0);
-            let rtf = record
-                .rtf
-                .filter(|value| value.is_finite() && *value >= 0.0);
-            let speaker_count = i64::try_from(record.speaker_count).unwrap_or(0);
-            let alignment_coverage = record
-                .alignment_coverage
-                .filter(|value| value.is_finite() && *value >= 0.0);
-            let unattributed_words = i64::try_from(record.unattributed_words).unwrap_or(0);
-            let asr_text = sanitize_required_text(record.asr_text.as_str(), 40_000);
-            let raw_transcript = sanitize_required_text(record.raw_transcript.as_str(), 100_000);
-            let transcript = sanitize_required_text(record.transcript.as_str(), 100_000);
-            let summary_model_id = sanitize_optional_text(record.summary_model_id.as_deref(), 160);
-            let summary_text = sanitize_optional_text(record.summary_text.as_deref(), 20_000);
-            let summary_error = sanitize_optional_text(record.summary_error.as_deref(), 1_000);
-            let summary_status = normalize_summary_status(
-                record.summary_status,
-                summary_text.as_deref(),
-                summary_error.as_deref(),
-            );
-            let summary_updated_at = normalize_optional_timestamp_i64(record.summary_updated_at)
-                .or_else(|| {
-                    if summary_status == DiarizationSummaryStatus::NotRequested {
-                        None
-                    } else {
-                        Some(now)
-                    }
-                });
-            let speaker_name_overrides = sanitize_speaker_name_overrides(
-                &record.speaker_name_overrides,
-                &raw_speaker_labels_from_parts(&record.segments, &record.words, &record.utterances),
-            )?;
-            let audio_mime_type = sanitize_audio_mime_type(record.audio_mime_type.as_str());
-            let audio_filename = sanitize_optional_text(record.audio_filename.as_deref(), 260);
-
-            if record.audio_bytes.is_empty() {
-                return Err(anyhow!("Audio payload cannot be empty"));
-            }
-
-            let audio_storage_path = storage_layout::persist_audio_file(
-                &media_root,
-                MediaGroup::Uploads,
-                "diarization",
-                &record_id,
-                audio_filename.as_deref(),
-                audio_mime_type.as_str(),
-                &record.audio_bytes,
-            )?;
-
-            let segments_json =
-                serde_json::to_string(&record.segments).context("Failed serializing segments")?;
-            let words_json =
-                serde_json::to_string(&record.words).context("Failed serializing words")?;
-            let utterances_json = serde_json::to_string(&record.utterances)
-                .context("Failed serializing utterances")?;
-            let speaker_name_overrides_json = serde_json::to_string(&speaker_name_overrides)
-                .context("Failed serializing speaker name overrides")?;
-
-            if let Err(err) = conn.execute(
-                r#"
-                INSERT INTO diarization_records (
-                    id,
-                    created_at,
-                    model_id,
-                    asr_model_id,
-                    aligner_model_id,
-                    llm_model_id,
-                    processing_status,
-                    processing_error,
-                    min_speakers,
-                    max_speakers,
-                    min_speech_duration_ms,
-                    min_silence_duration_ms,
-                    enable_llm_refinement,
-                    processing_time_ms,
-                    duration_secs,
-                    rtf,
-                    speaker_count,
-                    alignment_coverage,
-                    unattributed_words,
-                    llm_refined,
-                    asr_text,
-                    raw_transcript,
-                    transcript,
-                    summary_status,
-                    summary_model_id,
-                    summary_text,
-                    summary_error,
-                    summary_updated_at,
-                    segments_json,
-                    words_json,
-                    utterances_json,
-                    speaker_name_overrides_json,
-                    audio_mime_type,
-                    audio_filename,
-                    audio_storage_path
-                )
-                VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                    ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-                    ?30, ?31, ?32, ?33, ?34, ?35
-                )
-                "#,
-                params![
-                    &record_id,
-                    now,
-                    model_id,
-                    asr_model_id,
-                    aligner_model_id,
-                    llm_model_id,
-                    processing_status.as_db_value(),
-                    processing_error,
-                    min_speakers,
-                    max_speakers,
-                    min_speech_duration_ms,
-                    min_silence_duration_ms,
-                    if record.enable_llm_refinement {
-                        1_i64
-                    } else {
-                        0_i64
-                    },
-                    processing_time_ms,
-                    duration_secs,
-                    rtf,
-                    speaker_count,
-                    alignment_coverage,
-                    unattributed_words,
-                    if record.llm_refined { 1_i64 } else { 0_i64 },
-                    asr_text,
-                    raw_transcript,
-                    transcript,
-                    summary_status.as_db_value(),
-                    summary_model_id,
-                    summary_text,
-                    summary_error,
-                    summary_updated_at,
-                    segments_json,
-                    words_json,
-                    utterances_json,
-                    speaker_name_overrides_json,
-                    audio_mime_type,
-                    audio_filename,
-                    audio_storage_path
-                ],
-            ) {
-                let _ = storage_layout::delete_media_file(
-                    &media_root,
-                    Some(audio_storage_path.as_str()),
-                );
-                return Err(err).context("Failed to insert diarization record");
-            }
-
-            let created = fetch_record_without_audio(&conn, &record_id)?
-                .ok_or_else(|| anyhow!("Failed to fetch created diarization record"))?;
-            Ok(created)
+                0_i64
+            }),
+            processing_time_ms: Set(processing_time_ms),
+            duration_secs: Set(duration_secs),
+            rtf: Set(rtf),
+            speaker_count: Set(speaker_count),
+            alignment_coverage: Set(alignment_coverage),
+            unattributed_words: Set(unattributed_words),
+            llm_refined: Set(if record.llm_refined { 1_i64 } else { 0_i64 }),
+            asr_text: Set(asr_text),
+            raw_transcript: Set(raw_transcript),
+            transcript: Set(transcript),
+            summary_status: Set(summary_status.as_db_value().to_string()),
+            summary_model_id: Set(summary_model_id),
+            summary_text: Set(summary_text),
+            summary_error: Set(summary_error),
+            summary_updated_at: Set(summary_updated_at),
+            segments_json: Set(segments_json),
+            words_json: Set(words_json),
+            utterances_json: Set(utterances_json),
+            speaker_name_overrides_json: Set(speaker_name_overrides_json),
+            audio_mime_type: Set(audio_mime_type),
+            audio_filename: Set(audio_filename),
+            audio_storage_path: Set(audio_storage_path.clone()),
         })
+        .exec(db)
         .await
+        {
+            let _ = storage_layout::delete_media_file(
+                &self.media_root,
+                Some(audio_storage_path.as_str()),
+            );
+            return Err(err).context("Failed to insert diarization record");
+        }
+
+        fetch_record_without_audio(db, &record_id)
+            .await?
+            .ok_or_else(|| anyhow!("Failed to fetch created diarization record"))
     }
 
     pub async fn delete_record(&self, record_id: String) -> anyhow::Result<bool> {
-        let media_root = self.media_root.clone();
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let audio_storage_path = conn
-                .query_row(
-                    "SELECT audio_storage_path FROM diarization_records WHERE id = ?1",
-                    params![&record_id],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .optional()?
-                .flatten();
-            let changed = conn.execute(
-                "DELETE FROM diarization_records WHERE id = ?1",
-                params![record_id],
-            )?;
+        let db = self.db.connection().await?;
+        let audio_storage_path = fetch_audio_storage_path(db, &record_id).await?.flatten();
+        let result = diarization_records::Entity::delete_many()
+            .filter(diarization_records::Column::Id.eq(record_id))
+            .exec(db)
+            .await
+            .context("Failed to delete diarization record")?;
 
-            if changed > 0 {
-                storage_layout::delete_media_file(&media_root, audio_storage_path.as_deref())?;
-            }
+        if result.rows_affected > 0 {
+            storage_layout::delete_media_file(&self.media_root, audio_storage_path.as_deref())?;
+        }
 
-            Ok(changed > 0)
-        })
-        .await
+        Ok(result.rows_affected > 0)
     }
 
     pub async fn update_speaker_name_overrides(
@@ -792,37 +538,34 @@ impl DiarizationStore {
         record_id: String,
         speaker_name_overrides: BTreeMap<String, String>,
     ) -> anyhow::Result<Option<DiarizationRecord>> {
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let existing = fetch_record_without_audio(&conn, &record_id)?;
-            let Some(existing) = existing else {
-                return Ok(None);
-            };
+        let db = self.db.connection().await?;
+        let existing = fetch_record_without_audio(db, &record_id).await?;
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
 
-            let sanitized_overrides = sanitize_speaker_name_overrides(
-                &speaker_name_overrides,
-                &raw_speaker_labels_from_parts(
-                    &existing.segments,
-                    &existing.words,
-                    &existing.utterances,
-                ),
-            )?;
-            let speaker_name_overrides_json = serde_json::to_string(&sanitized_overrides)
-                .context("Failed serializing speaker name overrides")?;
+        let sanitized_overrides = sanitize_speaker_name_overrides(
+            &speaker_name_overrides,
+            &raw_speaker_labels_from_parts(
+                &existing.segments,
+                &existing.words,
+                &existing.utterances,
+            ),
+        )?;
+        let speaker_name_overrides_json = serde_json::to_string(&sanitized_overrides)
+            .context("Failed serializing speaker name overrides")?;
 
-            conn.execute(
-                r#"
-                UPDATE diarization_records
-                SET speaker_name_overrides_json = ?2
-                WHERE id = ?1
-                "#,
-                params![record_id, speaker_name_overrides_json],
+        diarization_records::Entity::update_many()
+            .col_expr(
+                diarization_records::Column::SpeakerNameOverridesJson,
+                Expr::value(speaker_name_overrides_json),
             )
+            .filter(diarization_records::Column::Id.eq(record_id))
+            .exec(db)
+            .await
             .context("Failed updating speaker name overrides")?;
 
-            fetch_record_without_audio(&conn, &existing.id)
-        })
-        .await
+        fetch_record_without_audio(db, &existing.id).await
     }
 
     pub async fn update_summary(
@@ -830,55 +573,57 @@ impl DiarizationStore {
         record_id: String,
         update: UpdateDiarizationSummary,
     ) -> anyhow::Result<Option<DiarizationRecord>> {
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let now = now_unix_millis_i64();
+        let db = self.db.connection().await?;
+        let now = now_unix_millis_i64();
 
-            let summary_model_id = sanitize_optional_text(update.model_id.as_deref(), 160);
-            let summary_text = sanitize_optional_text(update.text.as_deref(), 20_000);
-            let summary_error = sanitize_optional_text(update.error.as_deref(), 1_000);
-            let summary_status = normalize_summary_status(
-                update.status,
-                summary_text.as_deref(),
-                summary_error.as_deref(),
-            );
-            let summary_updated_at =
-                normalize_optional_timestamp_i64(update.updated_at).or_else(|| {
-                    if summary_status == DiarizationSummaryStatus::NotRequested {
-                        None
-                    } else {
-                        Some(now)
-                    }
-                });
+        let summary_model_id = sanitize_optional_text(update.model_id.as_deref(), 160);
+        let summary_text = sanitize_optional_text(update.text.as_deref(), 20_000);
+        let summary_error = sanitize_optional_text(update.error.as_deref(), 1_000);
+        let summary_status = normalize_summary_status(
+            update.status,
+            summary_text.as_deref(),
+            summary_error.as_deref(),
+        );
+        let summary_updated_at =
+            normalize_optional_timestamp_i64(update.updated_at).or_else(|| {
+                if summary_status == DiarizationSummaryStatus::NotRequested {
+                    None
+                } else {
+                    Some(now)
+                }
+            });
 
-            let changed = conn.execute(
-                r#"
-                UPDATE diarization_records
-                SET
-                    summary_status = ?2,
-                    summary_model_id = ?3,
-                    summary_text = ?4,
-                    summary_error = ?5,
-                    summary_updated_at = ?6
-                WHERE id = ?1
-                "#,
-                params![
-                    record_id,
-                    summary_status.as_db_value(),
-                    summary_model_id,
-                    summary_text,
-                    summary_error,
-                    summary_updated_at,
-                ],
-            )?;
+        let result = diarization_records::Entity::update_many()
+            .col_expr(
+                diarization_records::Column::SummaryStatus,
+                Expr::value(summary_status.as_db_value()),
+            )
+            .col_expr(
+                diarization_records::Column::SummaryModelId,
+                Expr::value(summary_model_id),
+            )
+            .col_expr(
+                diarization_records::Column::SummaryText,
+                Expr::value(summary_text),
+            )
+            .col_expr(
+                diarization_records::Column::SummaryError,
+                Expr::value(summary_error),
+            )
+            .col_expr(
+                diarization_records::Column::SummaryUpdatedAt,
+                Expr::value(summary_updated_at),
+            )
+            .filter(diarization_records::Column::Id.eq(record_id.clone()))
+            .exec(db)
+            .await
+            .context("Failed updating diarization summary")?;
 
-            if changed == 0 {
-                return Ok(None);
-            }
+        if result.rows_affected == 0 {
+            return Ok(None);
+        }
 
-            fetch_record_without_audio(&conn, &record_id)
-        })
-        .await
+        fetch_record_without_audio(db, &record_id).await
     }
 
     pub async fn update_processing_status(
@@ -887,30 +632,29 @@ impl DiarizationStore {
         status: DiarizationProcessingStatus,
         error: Option<String>,
     ) -> anyhow::Result<Option<DiarizationRecord>> {
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
-            let processing_error = sanitize_optional_text(error.as_deref(), 1_000);
-            let processing_status =
-                normalize_processing_status(status, processing_error.as_deref());
+        let db = self.db.connection().await?;
+        let processing_error = sanitize_optional_text(error.as_deref(), 1_000);
+        let processing_status = normalize_processing_status(status, processing_error.as_deref());
 
-            let changed = conn.execute(
-                r#"
-                UPDATE diarization_records
-                SET
-                    processing_status = ?2,
-                    processing_error = ?3
-                WHERE id = ?1
-                "#,
-                params![record_id, processing_status.as_db_value(), processing_error,],
-            )?;
+        let result = diarization_records::Entity::update_many()
+            .col_expr(
+                diarization_records::Column::ProcessingStatus,
+                Expr::value(processing_status.as_db_value()),
+            )
+            .col_expr(
+                diarization_records::Column::ProcessingError,
+                Expr::value(processing_error),
+            )
+            .filter(diarization_records::Column::Id.eq(record_id.clone()))
+            .exec(db)
+            .await
+            .context("Failed updating diarization processing status")?;
 
-            if changed == 0 {
-                return Ok(None);
-            }
+        if result.rows_affected == 0 {
+            return Ok(None);
+        }
 
-            fetch_record_without_audio(&conn, &record_id)
-        })
-        .await
+        fetch_record_without_audio(db, &record_id).await
     }
 
     pub async fn complete_record(
@@ -918,220 +662,369 @@ impl DiarizationStore {
         record_id: String,
         record: CompleteDiarizationRecord,
     ) -> anyhow::Result<Option<DiarizationRecord>> {
-        self.run_blocking(move |db_path| {
-            let conn = storage_layout::open_sqlite_connection(&db_path)?;
+        let db = self.db.connection().await?;
 
-            let model_id = sanitize_optional_text(record.model_id.as_deref(), 160);
-            let asr_model_id = sanitize_optional_text(record.asr_model_id.as_deref(), 160);
-            let aligner_model_id = sanitize_optional_text(record.aligner_model_id.as_deref(), 160);
-            let llm_model_id = sanitize_optional_text(record.llm_model_id.as_deref(), 160);
-            let min_speakers = record
-                .min_speakers
-                .and_then(|value| i64::try_from(value).ok());
-            let max_speakers = record
-                .max_speakers
-                .and_then(|value| i64::try_from(value).ok());
-            let min_speech_duration_ms = record
-                .min_speech_duration_ms
-                .filter(|value| value.is_finite() && *value >= 0.0);
-            let min_silence_duration_ms = record
-                .min_silence_duration_ms
-                .filter(|value| value.is_finite() && *value >= 0.0);
-            let processing_time_ms = if record.processing_time_ms.is_finite() {
-                record.processing_time_ms.max(0.0)
-            } else {
-                0.0
-            };
-            let duration_secs = record
-                .duration_secs
-                .filter(|value| value.is_finite() && *value >= 0.0);
-            let rtf = record
-                .rtf
-                .filter(|value| value.is_finite() && *value >= 0.0);
-            let speaker_count = i64::try_from(record.speaker_count).unwrap_or(0);
-            let alignment_coverage = record
-                .alignment_coverage
-                .filter(|value| value.is_finite() && *value >= 0.0);
-            let unattributed_words = i64::try_from(record.unattributed_words).unwrap_or(0);
-            let asr_text = sanitize_required_text(record.asr_text.as_str(), 40_000);
-            let raw_transcript = sanitize_required_text(record.raw_transcript.as_str(), 100_000);
-            let transcript = sanitize_required_text(record.transcript.as_str(), 100_000);
-            let segments_json =
-                serde_json::to_string(&record.segments).context("Failed serializing segments")?;
-            let words_json =
-                serde_json::to_string(&record.words).context("Failed serializing words")?;
-            let utterances_json = serde_json::to_string(&record.utterances)
-                .context("Failed serializing utterances")?;
-            let summary_model_id = sanitize_optional_text(record.summary_model_id.as_deref(), 160);
-            let summary_text = sanitize_optional_text(record.summary_text.as_deref(), 20_000);
-            let summary_error = sanitize_optional_text(record.summary_error.as_deref(), 1_000);
-            let summary_status = normalize_summary_status(
-                record.summary_status,
-                summary_text.as_deref(),
-                summary_error.as_deref(),
-            );
-            let summary_updated_at = normalize_optional_timestamp_i64(record.summary_updated_at);
+        let model_id = sanitize_optional_text(record.model_id.as_deref(), 160);
+        let asr_model_id = sanitize_optional_text(record.asr_model_id.as_deref(), 160);
+        let aligner_model_id = sanitize_optional_text(record.aligner_model_id.as_deref(), 160);
+        let llm_model_id = sanitize_optional_text(record.llm_model_id.as_deref(), 160);
+        let min_speakers = record
+            .min_speakers
+            .and_then(|value| i64::try_from(value).ok());
+        let max_speakers = record
+            .max_speakers
+            .and_then(|value| i64::try_from(value).ok());
+        let min_speech_duration_ms = record
+            .min_speech_duration_ms
+            .filter(|value| value.is_finite() && *value >= 0.0);
+        let min_silence_duration_ms = record
+            .min_silence_duration_ms
+            .filter(|value| value.is_finite() && *value >= 0.0);
+        let processing_time_ms = if record.processing_time_ms.is_finite() {
+            record.processing_time_ms.max(0.0)
+        } else {
+            0.0
+        };
+        let duration_secs = record
+            .duration_secs
+            .filter(|value| value.is_finite() && *value >= 0.0);
+        let rtf = record
+            .rtf
+            .filter(|value| value.is_finite() && *value >= 0.0);
+        let speaker_count = i64::try_from(record.speaker_count).unwrap_or(0);
+        let alignment_coverage = record
+            .alignment_coverage
+            .filter(|value| value.is_finite() && *value >= 0.0);
+        let unattributed_words = i64::try_from(record.unattributed_words).unwrap_or(0);
+        let asr_text = sanitize_required_text(record.asr_text.as_str(), 40_000);
+        let raw_transcript = sanitize_required_text(record.raw_transcript.as_str(), 100_000);
+        let transcript = sanitize_required_text(record.transcript.as_str(), 100_000);
+        let segments_json =
+            serde_json::to_string(&record.segments).context("Failed serializing segments")?;
+        let words_json =
+            serde_json::to_string(&record.words).context("Failed serializing words")?;
+        let utterances_json =
+            serde_json::to_string(&record.utterances).context("Failed serializing utterances")?;
+        let summary_model_id = sanitize_optional_text(record.summary_model_id.as_deref(), 160);
+        let summary_text = sanitize_optional_text(record.summary_text.as_deref(), 20_000);
+        let summary_error = sanitize_optional_text(record.summary_error.as_deref(), 1_000);
+        let summary_status = normalize_summary_status(
+            record.summary_status,
+            summary_text.as_deref(),
+            summary_error.as_deref(),
+        );
+        let summary_updated_at = normalize_optional_timestamp_i64(record.summary_updated_at);
 
-            let changed = conn.execute(
-                r#"
-                UPDATE diarization_records
-                SET
-                    model_id = ?2,
-                    asr_model_id = ?3,
-                    aligner_model_id = ?4,
-                    llm_model_id = ?5,
-                    processing_status = ?6,
-                    processing_error = NULL,
-                    min_speakers = ?7,
-                    max_speakers = ?8,
-                    min_speech_duration_ms = ?9,
-                    min_silence_duration_ms = ?10,
-                    enable_llm_refinement = ?11,
-                    processing_time_ms = ?12,
-                    duration_secs = ?13,
-                    rtf = ?14,
-                    speaker_count = ?15,
-                    alignment_coverage = ?16,
-                    unattributed_words = ?17,
-                    llm_refined = ?18,
-                    asr_text = ?19,
-                    raw_transcript = ?20,
-                    transcript = ?21,
-                    summary_status = ?22,
-                    summary_model_id = ?23,
-                    summary_text = ?24,
-                    summary_error = ?25,
-                    summary_updated_at = ?26,
-                    segments_json = ?27,
-                    words_json = ?28,
-                    utterances_json = ?29
-                WHERE id = ?1 AND processing_status IN ('pending', 'processing')
-                "#,
-                params![
-                    record_id,
-                    model_id,
-                    asr_model_id,
-                    aligner_model_id,
-                    llm_model_id,
-                    DiarizationProcessingStatus::Ready.as_db_value(),
-                    min_speakers,
-                    max_speakers,
-                    min_speech_duration_ms,
-                    min_silence_duration_ms,
-                    if record.enable_llm_refinement {
-                        1_i64
-                    } else {
-                        0_i64
-                    },
-                    processing_time_ms,
-                    duration_secs,
-                    rtf,
-                    speaker_count,
-                    alignment_coverage,
-                    unattributed_words,
-                    if record.llm_refined { 1_i64 } else { 0_i64 },
-                    asr_text,
-                    raw_transcript,
-                    transcript,
-                    summary_status.as_db_value(),
-                    summary_model_id,
-                    summary_text,
-                    summary_error,
-                    summary_updated_at,
-                    segments_json,
-                    words_json,
-                    utterances_json,
-                ],
-            )?;
-
-            if changed == 0 {
-                return Ok(None);
-            }
-
-            fetch_record_without_audio(&conn, &record_id)
-        })
-        .await
-    }
-
-    async fn run_blocking<F, T>(&self, task_fn: F) -> anyhow::Result<T>
-    where
-        F: FnOnce(PathBuf) -> anyhow::Result<T> + Send + 'static,
-        T: Send + 'static,
-    {
-        let db_path = self.db_path.clone();
-        task::spawn_blocking(move || task_fn(db_path))
+        let result = diarization_records::Entity::update_many()
+            .col_expr(diarization_records::Column::ModelId, Expr::value(model_id))
+            .col_expr(
+                diarization_records::Column::AsrModelId,
+                Expr::value(asr_model_id),
+            )
+            .col_expr(
+                diarization_records::Column::AlignerModelId,
+                Expr::value(aligner_model_id),
+            )
+            .col_expr(
+                diarization_records::Column::LlmModelId,
+                Expr::value(llm_model_id),
+            )
+            .col_expr(
+                diarization_records::Column::ProcessingStatus,
+                Expr::value(DiarizationProcessingStatus::Ready.as_db_value()),
+            )
+            .col_expr(
+                diarization_records::Column::ProcessingError,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                diarization_records::Column::MinSpeakers,
+                Expr::value(min_speakers),
+            )
+            .col_expr(
+                diarization_records::Column::MaxSpeakers,
+                Expr::value(max_speakers),
+            )
+            .col_expr(
+                diarization_records::Column::MinSpeechDurationMs,
+                Expr::value(min_speech_duration_ms),
+            )
+            .col_expr(
+                diarization_records::Column::MinSilenceDurationMs,
+                Expr::value(min_silence_duration_ms),
+            )
+            .col_expr(
+                diarization_records::Column::EnableLlmRefinement,
+                Expr::value(if record.enable_llm_refinement {
+                    1_i64
+                } else {
+                    0_i64
+                }),
+            )
+            .col_expr(
+                diarization_records::Column::ProcessingTimeMs,
+                Expr::value(processing_time_ms),
+            )
+            .col_expr(
+                diarization_records::Column::DurationSecs,
+                Expr::value(duration_secs),
+            )
+            .col_expr(diarization_records::Column::Rtf, Expr::value(rtf))
+            .col_expr(
+                diarization_records::Column::SpeakerCount,
+                Expr::value(speaker_count),
+            )
+            .col_expr(
+                diarization_records::Column::AlignmentCoverage,
+                Expr::value(alignment_coverage),
+            )
+            .col_expr(
+                diarization_records::Column::UnattributedWords,
+                Expr::value(unattributed_words),
+            )
+            .col_expr(
+                diarization_records::Column::LlmRefined,
+                Expr::value(if record.llm_refined { 1_i64 } else { 0_i64 }),
+            )
+            .col_expr(diarization_records::Column::AsrText, Expr::value(asr_text))
+            .col_expr(
+                diarization_records::Column::RawTranscript,
+                Expr::value(raw_transcript),
+            )
+            .col_expr(
+                diarization_records::Column::Transcript,
+                Expr::value(transcript),
+            )
+            .col_expr(
+                diarization_records::Column::SummaryStatus,
+                Expr::value(summary_status.as_db_value()),
+            )
+            .col_expr(
+                diarization_records::Column::SummaryModelId,
+                Expr::value(summary_model_id),
+            )
+            .col_expr(
+                diarization_records::Column::SummaryText,
+                Expr::value(summary_text),
+            )
+            .col_expr(
+                diarization_records::Column::SummaryError,
+                Expr::value(summary_error),
+            )
+            .col_expr(
+                diarization_records::Column::SummaryUpdatedAt,
+                Expr::value(summary_updated_at),
+            )
+            .col_expr(
+                diarization_records::Column::SegmentsJson,
+                Expr::value(segments_json),
+            )
+            .col_expr(
+                diarization_records::Column::WordsJson,
+                Expr::value(words_json),
+            )
+            .col_expr(
+                diarization_records::Column::UtterancesJson,
+                Expr::value(utterances_json),
+            )
+            .filter(diarization_records::Column::Id.eq(record_id.clone()))
+            .filter(
+                diarization_records::Column::ProcessingStatus
+                    .is_in(["pending".to_string(), "processing".to_string()]),
+            )
+            .exec(db)
             .await
-            .map_err(|err| anyhow!("Diarization storage worker failed: {err}"))?
+            .context("Failed to complete diarization record")?;
+
+        if result.rows_affected == 0 {
+            return Ok(None);
+        }
+
+        fetch_record_without_audio(db, &record_id).await
     }
 }
 
-fn fetch_record_without_audio(
-    conn: &Connection,
+const DIARIZATION_PAGE_SQL: &str = r#"
+    SELECT
+        id,
+        created_at,
+        model_id,
+        processing_status,
+        processing_error,
+        speaker_count,
+        utterances_json,
+        speaker_name_overrides_json,
+        duration_secs,
+        processing_time_ms,
+        rtf,
+        audio_mime_type,
+        audio_filename,
+        transcript,
+        summary_status,
+        summary_text
+    FROM diarization_records
+    ORDER BY created_at DESC, id DESC
+    LIMIT ?1
+"#;
+
+const DIARIZATION_PAGE_AFTER_CURSOR_SQL: &str = r#"
+    SELECT
+        id,
+        created_at,
+        model_id,
+        processing_status,
+        processing_error,
+        speaker_count,
+        utterances_json,
+        speaker_name_overrides_json,
+        duration_secs,
+        processing_time_ms,
+        rtf,
+        audio_mime_type,
+        audio_filename,
+        transcript,
+        summary_status,
+        summary_text
+    FROM diarization_records
+    WHERE created_at < ?1 OR (created_at = ?1 AND id < ?2)
+    ORDER BY created_at DESC, id DESC
+    LIMIT ?3
+"#;
+
+const DIARIZATION_RECORD_COLUMNS: &str = r#"
+    id,
+    created_at,
+    model_id,
+    asr_model_id,
+    aligner_model_id,
+    llm_model_id,
+    processing_status,
+    processing_error,
+    min_speakers,
+    max_speakers,
+    min_speech_duration_ms,
+    min_silence_duration_ms,
+    enable_llm_refinement,
+    processing_time_ms,
+    duration_secs,
+    rtf,
+    speaker_count,
+    alignment_coverage,
+    unattributed_words,
+    llm_refined,
+    asr_text,
+    raw_transcript,
+    transcript,
+    summary_status,
+    summary_model_id,
+    summary_text,
+    summary_error,
+    summary_updated_at,
+    segments_json,
+    words_json,
+    utterances_json,
+    speaker_name_overrides_json,
+    audio_mime_type,
+    audio_filename
+"#;
+
+async fn fetch_record_without_audio(
+    db: &sea_orm::DatabaseConnection,
     record_id: &str,
 ) -> anyhow::Result<Option<DiarizationRecord>> {
-    let record = conn
-        .query_row(
-            r#"
-            SELECT
-                id,
-                created_at,
-                model_id,
-                asr_model_id,
-                aligner_model_id,
-                llm_model_id,
-                processing_status,
-                processing_error,
-                min_speakers,
-                max_speakers,
-                min_speech_duration_ms,
-                min_silence_duration_ms,
-                enable_llm_refinement,
-                processing_time_ms,
-                duration_secs,
-                rtf,
-                speaker_count,
-                alignment_coverage,
-                unattributed_words,
-                llm_refined,
-                asr_text,
-                raw_transcript,
-                transcript,
-                summary_status,
-                summary_model_id,
-                summary_text,
-                summary_error,
-                summary_updated_at,
-                segments_json,
-                words_json,
-                utterances_json,
-                speaker_name_overrides_json,
-                audio_mime_type,
-                audio_filename
-            FROM diarization_records
-            WHERE id = ?1
-            "#,
-            params![record_id],
-            map_diarization_record,
-        )
-        .optional()?;
-    Ok(record)
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            format!("SELECT {DIARIZATION_RECORD_COLUMNS} FROM diarization_records WHERE id = ?1"),
+            vec![record_id.into()],
+        ))
+        .await
+        .context("Failed to load diarization record")?;
+    row.as_ref().map(map_diarization_record).transpose()
 }
 
-fn map_diarization_record(row: &Row<'_>) -> rusqlite::Result<DiarizationRecord> {
-    let min_speakers = row.get::<_, Option<i64>>(8)?.and_then(i64_to_usize);
-    let max_speakers = row.get::<_, Option<i64>>(9)?.and_then(i64_to_usize);
+async fn fetch_audio_storage_path(
+    db: &sea_orm::DatabaseConnection,
+    record_id: &str,
+) -> anyhow::Result<Option<Option<String>>> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT audio_storage_path FROM diarization_records WHERE id = ?1",
+            vec![record_id.into()],
+        ))
+        .await
+        .context("Failed to load diarization media path")?;
+    row.map(|row| row.try_get_by_index::<Option<String>>(0))
+        .transpose()
+        .map_err(Into::into)
+}
+
+fn map_diarization_summary(row: &QueryResult) -> anyhow::Result<DiarizationRecordSummary> {
     let speaker_count = row
-        .get::<_, Option<i64>>(16)?
+        .try_get_by_index::<Option<i64>>(5)?
+        .and_then(i64_to_usize)
+        .unwrap_or(0);
+    let utterances: Vec<DiarizationUtteranceRecord> = parse_json_vec(row.try_get_by_index(6)?);
+    let speaker_name_overrides = parse_json_map(row.try_get_by_index(7)?);
+    let transcript: String = row.try_get_by_index(13)?;
+    let summary_status = parse_summary_status(row.try_get_by_index(14)?);
+    let summary_text: Option<String> = row.try_get_by_index(15)?;
+
+    Ok(DiarizationRecordSummary {
+        id: row.try_get_by_index(0)?,
+        created_at: i64_to_u64(row.try_get_by_index(1)?),
+        model_id: row.try_get_by_index(2)?,
+        processing_status: parse_processing_status(row.try_get_by_index(3)?),
+        processing_error: row.try_get_by_index(4)?,
+        speaker_count,
+        corrected_speaker_count: corrected_speaker_count_from_parts(
+            speaker_count,
+            &[],
+            &[],
+            &utterances,
+            &speaker_name_overrides,
+        ),
+        speaker_name_override_count: speaker_name_overrides.len(),
+        duration_secs: row.try_get_by_index(8)?,
+        processing_time_ms: row.try_get_by_index(9)?,
+        rtf: row.try_get_by_index(10)?,
+        audio_mime_type: row.try_get_by_index(11)?,
+        audio_filename: row.try_get_by_index(12)?,
+        transcript_preview: transcript_preview_with_utterances(
+            &utterances,
+            &speaker_name_overrides,
+            transcript.as_str(),
+        ),
+        transcript_chars: transcript.chars().count(),
+        summary_status,
+        summary_preview: summary_preview(summary_text.as_deref()),
+        summary_chars: summary_text
+            .as_ref()
+            .map(|text| text.chars().count())
+            .unwrap_or(0),
+    })
+}
+
+fn map_diarization_record(row: &QueryResult) -> anyhow::Result<DiarizationRecord> {
+    let min_speakers = row
+        .try_get_by_index::<Option<i64>>(8)?
+        .and_then(i64_to_usize);
+    let max_speakers = row
+        .try_get_by_index::<Option<i64>>(9)?
+        .and_then(i64_to_usize);
+    let speaker_count = row
+        .try_get_by_index::<Option<i64>>(16)?
         .and_then(i64_to_usize)
         .unwrap_or(0);
     let unattributed_words = row
-        .get::<_, Option<i64>>(18)?
+        .try_get_by_index::<Option<i64>>(18)?
         .and_then(i64_to_usize)
         .unwrap_or(0);
-    let segments_raw: String = row.get(28)?;
-    let words_raw: String = row.get(29)?;
-    let utterances_raw: String = row.get(30)?;
-    let speaker_name_overrides = parse_json_map(row.get(31)?);
+    let segments_raw: String = row.try_get_by_index(28)?;
+    let words_raw: String = row.try_get_by_index(29)?;
+    let utterances_raw: String = row.try_get_by_index(30)?;
+    let speaker_name_overrides = parse_json_map(row.try_get_by_index(31)?);
     let segments: Vec<DiarizationSegmentRecord> = parse_json_vec(Some(segments_raw));
     let words: Vec<DiarizationWordRecord> = parse_json_vec(Some(words_raw));
     let utterances: Vec<DiarizationUtteranceRecord> = parse_json_vec(Some(utterances_raw));
@@ -1144,41 +1037,41 @@ fn map_diarization_record(row: &Row<'_>) -> rusqlite::Result<DiarizationRecord> 
     );
 
     Ok(DiarizationRecord {
-        id: row.get(0)?,
-        created_at: i64_to_u64(row.get(1)?),
-        model_id: row.get(2)?,
-        asr_model_id: row.get(3)?,
-        aligner_model_id: row.get(4)?,
-        llm_model_id: row.get(5)?,
-        processing_status: parse_processing_status(row.get(6)?),
-        processing_error: row.get(7)?,
+        id: row.try_get_by_index(0)?,
+        created_at: i64_to_u64(row.try_get_by_index(1)?),
+        model_id: row.try_get_by_index(2)?,
+        asr_model_id: row.try_get_by_index(3)?,
+        aligner_model_id: row.try_get_by_index(4)?,
+        llm_model_id: row.try_get_by_index(5)?,
+        processing_status: parse_processing_status(row.try_get_by_index(6)?),
+        processing_error: row.try_get_by_index(7)?,
         min_speakers,
         max_speakers,
-        min_speech_duration_ms: row.get(10)?,
-        min_silence_duration_ms: row.get(11)?,
-        enable_llm_refinement: row.get::<_, i64>(12)? > 0,
-        processing_time_ms: row.get(13)?,
-        duration_secs: row.get(14)?,
-        rtf: row.get(15)?,
+        min_speech_duration_ms: row.try_get_by_index(10)?,
+        min_silence_duration_ms: row.try_get_by_index(11)?,
+        enable_llm_refinement: row.try_get_by_index::<i64>(12)? > 0,
+        processing_time_ms: row.try_get_by_index(13)?,
+        duration_secs: row.try_get_by_index(14)?,
+        rtf: row.try_get_by_index(15)?,
         speaker_count,
         corrected_speaker_count,
-        alignment_coverage: row.get(17)?,
+        alignment_coverage: row.try_get_by_index(17)?,
         unattributed_words,
-        llm_refined: row.get::<_, i64>(19)? > 0,
-        asr_text: row.get(20)?,
-        raw_transcript: row.get(21)?,
-        transcript: row.get(22)?,
-        summary_status: parse_summary_status(row.get(23)?),
-        summary_model_id: row.get(24)?,
-        summary_text: row.get(25)?,
-        summary_error: row.get(26)?,
-        summary_updated_at: row.get::<_, Option<i64>>(27)?.map(i64_to_u64),
+        llm_refined: row.try_get_by_index::<i64>(19)? > 0,
+        asr_text: row.try_get_by_index(20)?,
+        raw_transcript: row.try_get_by_index(21)?,
+        transcript: row.try_get_by_index(22)?,
+        summary_status: parse_summary_status(row.try_get_by_index(23)?),
+        summary_model_id: row.try_get_by_index(24)?,
+        summary_text: row.try_get_by_index(25)?,
+        summary_error: row.try_get_by_index(26)?,
+        summary_updated_at: row.try_get_by_index::<Option<i64>>(27)?.map(i64_to_u64),
         segments,
         words,
         utterances,
         speaker_name_overrides,
-        audio_mime_type: row.get(32)?,
-        audio_filename: row.get(33)?,
+        audio_mime_type: row.try_get_by_index(32)?,
+        audio_filename: row.try_get_by_index(33)?,
     })
 }
 
@@ -1343,135 +1236,6 @@ fn normalize_optional_timestamp_i64(value: Option<u64>) -> Option<i64> {
     value.and_then(|raw| i64::try_from(raw).ok())
 }
 
-fn ensure_diarization_records_speaker_name_overrides_column(
-    conn: &Connection,
-) -> anyhow::Result<()> {
-    if diarization_records_has_column(conn, "speaker_name_overrides_json")? {
-        return Ok(());
-    }
-
-    conn.execute(
-        "ALTER TABLE diarization_records ADD COLUMN speaker_name_overrides_json TEXT NOT NULL DEFAULT '{}'",
-        [],
-    )
-    .context("Failed adding diarization_records.speaker_name_overrides_json column")?;
-    Ok(())
-}
-
-fn ensure_diarization_records_processing_status_column(conn: &Connection) -> anyhow::Result<()> {
-    if diarization_records_has_column(conn, "processing_status")? {
-        return Ok(());
-    }
-
-    conn.execute(
-        "ALTER TABLE diarization_records ADD COLUMN processing_status TEXT NOT NULL DEFAULT 'ready'",
-        [],
-    )
-    .context("Failed adding diarization_records.processing_status column")?;
-    Ok(())
-}
-
-fn ensure_diarization_records_processing_error_column(conn: &Connection) -> anyhow::Result<()> {
-    if diarization_records_has_column(conn, "processing_error")? {
-        return Ok(());
-    }
-
-    conn.execute(
-        "ALTER TABLE diarization_records ADD COLUMN processing_error TEXT NULL",
-        [],
-    )
-    .context("Failed adding diarization_records.processing_error column")?;
-    Ok(())
-}
-
-fn ensure_diarization_records_summary_status_column(conn: &Connection) -> anyhow::Result<()> {
-    if diarization_records_has_column(conn, "summary_status")? {
-        return Ok(());
-    }
-
-    conn.execute(
-        "ALTER TABLE diarization_records ADD COLUMN summary_status TEXT NOT NULL DEFAULT 'not_requested'",
-        [],
-    )
-    .context("Failed adding diarization_records.summary_status column")?;
-    Ok(())
-}
-
-fn ensure_diarization_records_summary_model_id_column(conn: &Connection) -> anyhow::Result<()> {
-    if diarization_records_has_column(conn, "summary_model_id")? {
-        return Ok(());
-    }
-
-    conn.execute(
-        "ALTER TABLE diarization_records ADD COLUMN summary_model_id TEXT NULL",
-        [],
-    )
-    .context("Failed adding diarization_records.summary_model_id column")?;
-    Ok(())
-}
-
-fn ensure_diarization_records_summary_text_column(conn: &Connection) -> anyhow::Result<()> {
-    if diarization_records_has_column(conn, "summary_text")? {
-        return Ok(());
-    }
-
-    conn.execute(
-        "ALTER TABLE diarization_records ADD COLUMN summary_text TEXT NULL",
-        [],
-    )
-    .context("Failed adding diarization_records.summary_text column")?;
-    Ok(())
-}
-
-fn ensure_diarization_records_summary_error_column(conn: &Connection) -> anyhow::Result<()> {
-    if diarization_records_has_column(conn, "summary_error")? {
-        return Ok(());
-    }
-
-    conn.execute(
-        "ALTER TABLE diarization_records ADD COLUMN summary_error TEXT NULL",
-        [],
-    )
-    .context("Failed adding diarization_records.summary_error column")?;
-    Ok(())
-}
-
-fn ensure_diarization_records_summary_updated_at_column(conn: &Connection) -> anyhow::Result<()> {
-    if diarization_records_has_column(conn, "summary_updated_at")? {
-        return Ok(());
-    }
-
-    conn.execute(
-        "ALTER TABLE diarization_records ADD COLUMN summary_updated_at INTEGER NULL",
-        [],
-    )
-    .context("Failed adding diarization_records.summary_updated_at column")?;
-    Ok(())
-}
-
-fn diarization_records_has_column(conn: &Connection, target: &str) -> anyhow::Result<bool> {
-    let mut stmt = conn
-        .prepare("PRAGMA table_info(diarization_records)")
-        .context("Failed to inspect diarization_records schema")?;
-    let mut rows = stmt
-        .query([])
-        .context("Failed to query diarization_records schema info")?;
-
-    while let Some(row) = rows
-        .next()
-        .context("Failed reading diarization_records schema row")?
-    {
-        let name: String = row
-            .get(1)
-            .context("Failed reading diarization_records column name")?;
-        if name == target {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
-}
-
 fn resolve_speaker_label(
     raw_label: &str,
     speaker_name_overrides: &BTreeMap<String, String>,
@@ -1583,11 +1347,7 @@ fn now_unix_millis_i64() -> i64 {
 }
 
 fn i64_to_u64(value: i64) -> u64 {
-    if value.is_negative() {
-        0
-    } else {
-        value as u64
-    }
+    if value.is_negative() { 0 } else { value as u64 }
 }
 
 fn i64_to_usize(value: i64) -> Option<usize> {
@@ -1838,9 +1598,10 @@ mod tests {
             .await
             .expect_err("unknown speaker should fail");
 
-        assert!(err
-            .to_string()
-            .contains("Unknown diarization speaker label"));
+        assert!(
+            err.to_string()
+                .contains("Unknown diarization speaker label")
+        );
         std::fs::remove_dir_all(root).expect("test temp dir should be removable");
     }
 
@@ -1892,10 +1653,7 @@ mod tests {
         );
 
         let completed = store
-            .complete_record(
-                created.id.clone(),
-                sample_complete_record(),
-            )
+            .complete_record(created.id.clone(), sample_complete_record())
             .await
             .expect("completion should succeed")
             .expect("record should exist");
@@ -1949,7 +1707,10 @@ mod tests {
             .await
             .expect("cancel status update should succeed")
             .expect("record should exist");
-        assert_eq!(cancelled.processing_status, DiarizationProcessingStatus::Failed);
+        assert_eq!(
+            cancelled.processing_status,
+            DiarizationProcessingStatus::Failed
+        );
 
         let completion = store
             .complete_record(created.id.clone(), sample_complete_record())
@@ -1965,8 +1726,14 @@ mod tests {
             .await
             .expect("record lookup should succeed")
             .expect("record should exist");
-        assert_eq!(current.processing_status, DiarizationProcessingStatus::Failed);
-        assert_eq!(current.processing_error.as_deref(), Some("Cancelled by user."));
+        assert_eq!(
+            current.processing_status,
+            DiarizationProcessingStatus::Failed
+        );
+        assert_eq!(
+            current.processing_error.as_deref(),
+            Some("Cancelled by user.")
+        );
 
         std::fs::remove_dir_all(root).expect("test temp dir should be removable");
     }
