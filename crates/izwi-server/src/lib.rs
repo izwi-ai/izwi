@@ -13,6 +13,7 @@ mod app;
 mod chat_store;
 mod db;
 mod diarization_store;
+mod entity;
 mod error;
 mod ids;
 mod logging;
