@@ -208,12 +208,12 @@ impl SavedVoiceStore {
         let audio_storage_path: String = row.try_get_by_index(0)?;
         let audio_mime_type: String = row.try_get_by_index(1)?;
         let audio_filename: Option<String> = row.try_get_by_index(2)?;
-        let audio_bytes = read_media_object(&self.media_storage, audio_storage_path.as_str())
+        let audio = read_media_object(&self.media_storage, audio_storage_path.as_str())
             .await
             .context("Failed to read saved voice media")?;
 
         Ok(Some(StoredSavedVoiceAudio {
-            audio_bytes,
+            audio_bytes: audio.bytes,
             audio_mime_type,
             audio_filename,
         }))

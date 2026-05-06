@@ -251,6 +251,7 @@ async fn record_request_outcome(
 fn auth_failure_status(err: &HookError) -> StatusCode {
     match err {
         HookError::Denied(_) => StatusCode::UNAUTHORIZED,
+        HookError::NotFound(_) => StatusCode::INTERNAL_SERVER_ERROR,
         HookError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -258,6 +259,7 @@ fn auth_failure_status(err: &HookError) -> StatusCode {
 fn policy_failure_status(err: &HookError) -> StatusCode {
     match err {
         HookError::Denied(_) => StatusCode::FORBIDDEN,
+        HookError::NotFound(_) => StatusCode::INTERNAL_SERVER_ERROR,
         HookError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }

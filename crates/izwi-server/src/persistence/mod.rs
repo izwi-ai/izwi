@@ -108,16 +108,18 @@ pub async fn persist_audio_object(
 pub async fn read_media_object(
     provider: &Arc<dyn MediaStorageProvider>,
     key: &str,
-) -> anyhow::Result<Vec<u8>> {
-    let stored = provider
+) -> Result<StoredMediaBytes, MediaStorageError> {
+    let key = key.to_string();
+    provider
         .get(MediaReadRequest {
-            key: MediaObjectKey::new(key),
+            key: MediaObjectKey::new(key.clone()),
             metadata: HookMetadata::new(),
         })
         .await
-        .map_err(|err| anyhow::anyhow!("Media storage read failed: {err}"))?;
-
-    Ok(stored.bytes)
+        .map_err(|err| match err {
+            HookError::NotFound(message) => MediaStorageError::NotFound { key, message },
+            err => MediaStorageError::ReadFailed(err),
+        })
 }
 
 pub async fn delete_media_object(
@@ -128,13 +130,30 @@ pub async fn delete_media_object(
         return Ok(());
     };
 
-    provider
+    match provider
         .delete(MediaDeleteRequest {
             key: MediaObjectKey::new(key),
             metadata: HookMetadata::new(),
         })
         .await
-        .map_err(|err| anyhow::anyhow!("Media storage delete failed: {err}"))
+    {
+        Ok(()) | Err(HookError::NotFound(_)) => Ok(()),
+        Err(err) => Err(anyhow::anyhow!("Media storage delete failed: {err}")),
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MediaStorageError {
+    #[error("media storage object not found: {key}: {message}")]
+    NotFound { key: String, message: String },
+    #[error("media storage read failed: {0}")]
+    ReadFailed(#[source] HookError),
+}
+
+impl MediaStorageError {
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::NotFound { .. })
+    }
 }
 
 async fn resolve_database(enterprise_hooks: &EnterpriseHooks) -> anyhow::Result<DatabaseContext> {
@@ -170,6 +189,7 @@ async fn provider_database_context(
 ) -> anyhow::Result<DatabaseContext> {
     let actual_backend = actual_database_backend(&decision.connection)?;
     validate_declared_backend(&decision.backend, &actual_backend)?;
+    validate_supported_database_backend(&actual_backend)?;
     validate_migration_mode_for_backend(&actual_backend, &decision.migration_mode)?;
 
     if matches!(decision.migration_mode, DatabaseMigrationMode::IzwiManaged) {
@@ -213,6 +233,16 @@ fn validate_declared_backend(
 
     bail!(
         "Enterprise database hook declared backend {declared:?}, but the SeaORM connection reports {actual:?}"
+    );
+}
+
+fn validate_supported_database_backend(backend: &DatabaseBackend) -> anyhow::Result<()> {
+    if matches!(backend, DatabaseBackend::Sqlite) {
+        return Ok(());
+    }
+
+    bail!(
+        "Enterprise database backend {backend:?} is not enabled yet: runtime stores and migrations currently require SQLite-compatible SQL"
     );
 }
 
@@ -292,17 +322,24 @@ impl MediaStorageProvider for LocalMediaStorageProvider {
     }
 
     async fn get(&self, request: MediaReadRequest) -> HookResult<StoredMediaBytes> {
-        let bytes = storage_layout::read_media_file(&self.media_root, &request.key.key)
-            .map_err(|err| HookError::Failed(err.to_string()))?;
+        let key = request.key.key;
+        let metadata = request.metadata;
+        let bytes = storage_layout::read_media_file(&self.media_root, &key).map_err(|err| {
+            if is_not_found_error(&err) {
+                HookError::NotFound(key.clone())
+            } else {
+                HookError::Failed(err.to_string())
+            }
+        })?;
 
         Ok(StoredMediaBytes {
             metadata: MediaObjectMetadata {
-                content_type: content_type_from_key(&request.key.key).to_string(),
-                filename: filename_from_key(&request.key.key),
+                content_type: content_type_from_key(&key).to_string(),
+                filename: filename_from_key(&key),
                 content_length: Some(bytes.len() as u64),
                 sha256: None,
                 tenant_id: None,
-                attributes: request.metadata,
+                attributes: metadata,
             },
             bytes,
         })
@@ -384,6 +421,14 @@ fn filename_from_key(key: &str) -> Option<String> {
         .map(|name| name.to_string_lossy().to_string())
 }
 
+fn is_not_found_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,7 +467,7 @@ mod tests {
         let mut metadata = HookMetadata::new();
         metadata.insert("route_kind".to_string(), "tts".to_string());
 
-        let stored = provider
+        let object = provider
             .put(
                 MediaWriteRequest {
                     namespace: MediaNamespace::GeneratedSpeech,
@@ -436,20 +481,21 @@ mod tests {
             .await
             .expect("write media");
 
-        assert_eq!(stored.key.key, "generated/speech/tts/record-1.wav");
+        assert_eq!(object.key.key, "generated/speech/tts/record-1.wav");
 
-        let bytes = provider
+        let stored = provider
             .get(MediaReadRequest {
-                key: stored.key.clone(),
+                key: object.key.clone(),
                 metadata: HookMetadata::new(),
             })
             .await
             .expect("read media");
-        assert_eq!(bytes.bytes, b"audio");
+        assert_eq!(stored.bytes, b"audio");
+        assert_eq!(stored.metadata.content_type, "audio/wav");
 
         provider
             .delete(MediaDeleteRequest {
-                key: stored.key,
+                key: object.key,
                 metadata: HookMetadata::new(),
             })
             .await
@@ -508,17 +554,32 @@ mod tests {
     }
 
     #[test]
-    fn provider_managed_modes_accept_non_sqlite_backends() {
-        assert!(validate_migration_mode_for_backend(
-            &DatabaseBackend::Postgres,
-            &DatabaseMigrationMode::ProviderManaged,
-        )
-        .is_ok());
-        assert!(validate_migration_mode_for_backend(
-            &DatabaseBackend::Mysql,
-            &DatabaseMigrationMode::Disabled,
-        )
-        .is_ok());
+    fn non_sqlite_backends_are_rejected_until_store_sql_is_portable() {
+        let error = validate_supported_database_backend(&DatabaseBackend::Postgres)
+            .expect_err("postgres should be rejected until store SQL is portable");
+
+        assert!(
+            error
+                .to_string()
+                .contains("runtime stores and migrations currently require SQLite-compatible SQL"),
+            "{error}"
+        );
+
+        assert!(validate_supported_database_backend(&DatabaseBackend::Sqlite).is_ok());
+    }
+
+    #[tokio::test]
+    async fn local_media_provider_reports_missing_objects_as_not_found() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let provider = Arc::new(LocalMediaStorageProvider::new(
+            temp_dir.path().to_path_buf(),
+        )) as Arc<dyn MediaStorageProvider>;
+
+        let error = read_media_object(&provider, "generated/missing/object.wav")
+            .await
+            .expect_err("missing object should fail");
+
+        assert!(error.is_not_found(), "{error}");
     }
 
     #[derive(Clone)]
