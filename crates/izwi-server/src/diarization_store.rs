@@ -3,9 +3,7 @@
 use anyhow::{anyhow, Context};
 use izwi_hooks::{HookMetadata, MediaNamespace, MediaStorageProvider};
 use sea_orm::sea_query::Expr;
-use sea_orm::{
-    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryResult, Set, Statement,
-};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryResult, Set};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -13,7 +11,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    db::StoreDatabase,
+    db::{raw, StoreDatabase},
     entity::diarization_records,
     ids::new_uuid,
     persistence::{
@@ -300,22 +298,22 @@ impl DiarizationStore {
 
         let rows = if let Some(cursor) = cursor {
             let cursor_created_at = i64::try_from(cursor.created_at).unwrap_or(i64::MAX);
-            db.query_all_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+            db.query_all_raw(raw::statement(
+                db,
                 DIARIZATION_PAGE_AFTER_CURSOR_SQL,
                 vec![
                     cursor_created_at.into(),
                     cursor.id.into(),
                     fetch_limit.into(),
                 ],
-            ))
+            )?)
             .await
         } else {
-            db.query_all_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+            db.query_all_raw(raw::statement(
+                db,
                 DIARIZATION_PAGE_SQL,
                 vec![fetch_limit.into()],
-            ))
+            )?)
             .await
         }
         .context("Failed to list diarization records")?;
@@ -353,15 +351,15 @@ impl DiarizationStore {
     ) -> anyhow::Result<Option<StoredDiarizationAudio>> {
         let db = self.db.connection().await?;
         let audio = db
-            .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+            .query_one_raw(raw::statement(
+                db,
                 r#"
                 SELECT audio_storage_path, audio_mime_type, audio_filename
                 FROM diarization_records
                 WHERE id = ?1
                 "#,
                 vec![record_id.into()],
-            ))
+            )?)
             .await
             .context("Failed to load diarization audio metadata")?;
         let Some(row) = audio else {
@@ -945,11 +943,11 @@ async fn fetch_record_without_audio(
     record_id: &str,
 ) -> anyhow::Result<Option<DiarizationRecord>> {
     let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+        .query_one_raw(raw::statement(
+            db,
             format!("SELECT {DIARIZATION_RECORD_COLUMNS} FROM diarization_records WHERE id = ?1"),
             vec![record_id.into()],
-        ))
+        )?)
         .await
         .context("Failed to load diarization record")?;
     row.as_ref().map(map_diarization_record).transpose()
@@ -960,11 +958,11 @@ async fn fetch_audio_storage_path(
     record_id: &str,
 ) -> anyhow::Result<Option<Option<String>>> {
     let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+        .query_one_raw(raw::statement(
+            db,
             "SELECT audio_storage_path FROM diarization_records WHERE id = ?1",
             vec![record_id.into()],
-        ))
+        )?)
         .await
         .context("Failed to load diarization media path")?;
     row.map(|row| row.try_get_by_index::<Option<String>>(0))

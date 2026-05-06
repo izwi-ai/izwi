@@ -1,12 +1,11 @@
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryResult, Statement,
-    TransactionTrait,
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryResult, TransactionTrait,
 };
 use serde::Serialize;
 
-use crate::db::StoreDatabase;
+use crate::db::{raw, StoreDatabase};
 use crate::entity::voice_observations;
 use crate::ids::new_uuid;
 
@@ -57,11 +56,11 @@ impl VoiceObservationStore {
         let db = self.db.connection().await?;
         let limit = i64::try_from(limit.max(1)).context("Voice observation limit exceeds i64")?;
         let rows = db
-            .query_all_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+            .query_all_raw(raw::statement(
+                db,
                 OBSERVATIONS_ACTIVE_SQL,
                 vec![profile_id.into(), limit.into()],
-            ))
+            )?)
             .await
             .context("Failed to list voice observations")?;
         rows.iter().map(map_observation).collect()
@@ -92,8 +91,8 @@ impl VoiceObservationStore {
             let canonical_summary = build_canonical_summary(category.as_str(), summary.as_str());
 
             let existing_id = tx
-                .query_one_raw(Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
+                .query_one_raw(raw::statement(
+                    &tx,
                     r#"
                     SELECT id
                     FROM voice_observations
@@ -103,25 +102,28 @@ impl VoiceObservationStore {
                     LIMIT 1
                     "#,
                     vec![profile_id.clone().into(), canonical_summary.clone().into()],
-                ))
+                )?)
                 .await
                 .context("Failed to find existing voice observation")?
                 .map(|row| row.try_get_by_index::<String>(0))
                 .transpose()?;
 
             let observation = if let Some(existing_id) = existing_id {
-                tx.execute_raw(Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
-                    r#"
+                let confidence_expr = raw::greatest(tx.get_database_backend(), "confidence", "?1")?;
+                tx.execute_raw(raw::statement(
+                    &tx,
+                    format!(
+                        r#"
                     UPDATE voice_observations
-                    SET confidence = MAX(confidence, ?1),
+                    SET confidence = {confidence_expr},
                         source_turn_id = ?2,
                         source_user_text = ?3,
                         source_assistant_text = ?4,
                         times_seen = times_seen + 1,
                         updated_at = ?5
                     WHERE id = ?6
-                    "#,
+                    "#
+                    ),
                     vec![
                         f64::from(confidence).into(),
                         sanitize_optional_text(source_turn_id.as_deref(), 160).into(),
@@ -130,7 +132,7 @@ impl VoiceObservationStore {
                         now.into(),
                         existing_id.clone().into(),
                     ],
-                ))
+                )?)
                 .await
                 .context("Failed to update voice observation")?;
                 fetch_observation(&tx, &existing_id)
@@ -138,8 +140,8 @@ impl VoiceObservationStore {
                     .ok_or_else(|| anyhow!("Updated observation not found"))?
             } else {
                 let observation_id = new_uuid();
-                tx.execute_raw(Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
+                tx.execute_raw(raw::statement(
+                    &tx,
                     r#"
                     INSERT INTO voice_observations (
                         id,
@@ -170,7 +172,7 @@ impl VoiceObservationStore {
                         sanitize_optional_text(source_assistant_text.as_deref(), 16000).into(),
                         now.into(),
                     ],
-                ))
+                )?)
                 .await
                 .context("Failed to insert voice observation")?;
                 fetch_observation(&tx, &observation_id)
@@ -286,11 +288,11 @@ where
     C: ConnectionTrait,
 {
     let row = conn
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+        .query_one_raw(raw::statement(
+            conn,
             OBSERVATION_BY_ID_SQL,
             vec![observation_id.into()],
-        ))
+        )?)
         .await
         .context("Failed to load voice observation")?;
     row.as_ref().map(map_observation).transpose()

@@ -1,16 +1,14 @@
 //! Persistent text-to-speech project storage backed by SQLite.
 
-use anyhow::{Context, anyhow};
-use sea_orm::{
-    ConnectionTrait, DatabaseConnection, DbBackend, QueryResult, Statement, TransactionTrait, Value,
-};
+use anyhow::{anyhow, Context};
+use sea_orm::{ConnectionTrait, DatabaseConnection, QueryResult, TransactionTrait, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    db::StoreDatabase,
+    db::{raw, StoreDatabase},
     ids::new_uuid,
     storage_layout::{self},
 };
@@ -1566,36 +1564,56 @@ impl StudioProjectStore {
         let next_last_rendered_at_i64 =
             next_last_rendered_at.and_then(|value| i64::try_from(value).ok());
 
-        execute(
-            &tx,
-            r#"
-            INSERT INTO studio_project_meta (
-                project_id,
-                folder_id,
-                tags_json,
-                default_export_format,
-                last_render_job_id,
-                last_rendered_at
+        if current.is_some() {
+            execute(
+                &tx,
+                r#"
+                UPDATE studio_project_meta
+                SET
+                    folder_id = ?2,
+                    tags_json = ?3,
+                    default_export_format = ?4,
+                    last_render_job_id = ?5,
+                    last_rendered_at = ?6
+                WHERE project_id = ?1
+                "#,
+                vec![
+                    project_id.clone().into(),
+                    next_folder_id.into(),
+                    encode_json_string_vec(next_tags.as_slice()).into(),
+                    next_export.as_db_value().into(),
+                    next_last_render_job_id.into(),
+                    next_last_rendered_at_i64.into(),
+                ],
+                "Failed to update Studio project metadata",
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-            ON CONFLICT(project_id) DO UPDATE SET
-                folder_id = excluded.folder_id,
-                tags_json = excluded.tags_json,
-                default_export_format = excluded.default_export_format,
-                last_render_job_id = excluded.last_render_job_id,
-                last_rendered_at = excluded.last_rendered_at
-            "#,
-            vec![
-                project_id.clone().into(),
-                next_folder_id.into(),
-                encode_json_string_vec(next_tags.as_slice()).into(),
-                next_export.as_db_value().into(),
-                next_last_render_job_id.into(),
-                next_last_rendered_at_i64.into(),
-            ],
-            "Failed to upsert Studio project metadata",
-        )
-        .await?;
+            .await?;
+        } else {
+            execute(
+                &tx,
+                r#"
+                INSERT INTO studio_project_meta (
+                    project_id,
+                    folder_id,
+                    tags_json,
+                    default_export_format,
+                    last_render_job_id,
+                    last_rendered_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+                vec![
+                    project_id.clone().into(),
+                    next_folder_id.into(),
+                    encode_json_string_vec(next_tags.as_slice()).into(),
+                    next_export.as_db_value().into(),
+                    next_last_render_job_id.into(),
+                    next_last_rendered_at_i64.into(),
+                ],
+                "Failed to insert Studio project metadata",
+            )
+            .await?;
+        }
 
         tx.commit()
             .await
@@ -1684,7 +1702,7 @@ impl StudioProjectStore {
         let db = self.db.connection().await?;
         let rows = query_all(
             db,
-            STUDIO_PROJECT_SNAPSHOTS_SQL,
+            studio_project_snapshots_sql(db)?,
             vec![project_id.into()],
             "Failed to list Studio project snapshots",
         )
@@ -2090,30 +2108,42 @@ const STUDIO_PROJECT_META_SQL: &str = r#"
     WHERE project_id = ?1
 "#;
 
-const STUDIO_PROJECT_SNAPSHOTS_SQL: &str = r#"
-    SELECT
-        s.id,
-        s.project_id,
-        s.created_at,
-        s.label,
-        COALESCE(json_extract(s.project_json, '$.name'), p.name) AS project_name
-    FROM studio_project_snapshots s
-    LEFT JOIN studio_projects p ON p.id = s.project_id
-    WHERE s.project_id = ?1
-    ORDER BY s.created_at DESC, s.id DESC
-"#;
+fn studio_project_snapshots_sql<C>(db: &C) -> anyhow::Result<String>
+where
+    C: ConnectionTrait,
+{
+    studio_project_snapshot_summary_sql(
+        db,
+        "WHERE s.project_id = ?1\n    ORDER BY s.created_at DESC, s.id DESC",
+    )
+}
 
-const STUDIO_PROJECT_SNAPSHOT_BY_ID_SQL: &str = r#"
+fn studio_project_snapshot_by_id_sql<C>(db: &C) -> anyhow::Result<String>
+where
+    C: ConnectionTrait,
+{
+    studio_project_snapshot_summary_sql(db, "WHERE s.id = ?1")
+}
+
+fn studio_project_snapshot_summary_sql<C>(db: &C, predicate: &str) -> anyhow::Result<String>
+where
+    C: ConnectionTrait,
+{
+    let project_name = raw::json_extract_text(db.get_database_backend(), "s.project_json", "name")?;
+    Ok(format!(
+        r#"
     SELECT
         s.id,
         s.project_id,
         s.created_at,
         s.label,
-        COALESCE(json_extract(s.project_json, '$.name'), p.name) AS project_name
+        COALESCE({project_name}, p.name) AS project_name
     FROM studio_project_snapshots s
     LEFT JOIN studio_projects p ON p.id = s.project_id
-    WHERE s.id = ?1
-"#;
+    {predicate}
+"#
+    ))
+}
 
 const STUDIO_PROJECT_RENDER_JOBS_SQL: &str = r#"
     SELECT
@@ -2241,7 +2271,7 @@ async fn fetch_snapshot(
 ) -> anyhow::Result<Option<StudioProjectSnapshotRecord>> {
     query_one(
         db,
-        STUDIO_PROJECT_SNAPSHOT_BY_ID_SQL,
+        studio_project_snapshot_by_id_sql(db)?,
         vec![snapshot_id.into()],
         "Failed to load Studio project snapshot",
     )
@@ -2340,61 +2370,82 @@ async fn upsert_last_render_job<C>(
 where
     C: ConnectionTrait,
 {
-    if let Some(last_rendered_at) = last_rendered_at {
-        execute(
-            db,
-            r#"
-            INSERT INTO studio_project_meta (
-                project_id,
-                folder_id,
-                tags_json,
-                default_export_format,
-                last_render_job_id,
-                last_rendered_at
+    let exists = query_one(
+        db,
+        "SELECT 1 FROM studio_project_meta WHERE project_id = ?1",
+        vec![project_id.into()],
+        "Failed to check Studio project render metadata",
+    )
+    .await?
+    .is_some();
+
+    match (exists, last_rendered_at) {
+        (true, Some(last_rendered_at)) => {
+            execute(
+                db,
+                r#"
+                UPDATE studio_project_meta
+                SET
+                    last_render_job_id = ?2,
+                    last_rendered_at = ?3
+                WHERE project_id = ?1
+                "#,
+                vec![project_id.into(), job_id.into(), last_rendered_at.into()],
+                "Failed to update Studio project completed render metadata",
             )
-            VALUES (
-                ?1,
-                (SELECT folder_id FROM studio_project_meta WHERE project_id = ?1),
-                COALESCE((SELECT tags_json FROM studio_project_meta WHERE project_id = ?1), '[]'),
-                COALESCE((SELECT default_export_format FROM studio_project_meta WHERE project_id = ?1), 'wav'),
-                ?2,
-                ?3
+            .await?;
+        }
+        (true, None) => {
+            execute(
+                db,
+                r#"
+                UPDATE studio_project_meta
+                SET last_render_job_id = ?2
+                WHERE project_id = ?1
+                "#,
+                vec![project_id.into(), job_id.into()],
+                "Failed to update Studio project render metadata",
             )
-            ON CONFLICT(project_id) DO UPDATE SET
-                last_render_job_id = excluded.last_render_job_id,
-                last_rendered_at = excluded.last_rendered_at
-            "#,
-            vec![project_id.into(), job_id.into(), last_rendered_at.into()],
-            "Failed to update Studio project completed render metadata",
-        )
-        .await?;
-    } else {
-        execute(
-            db,
-            r#"
-            INSERT INTO studio_project_meta (
-                project_id,
-                folder_id,
-                tags_json,
-                default_export_format,
-                last_render_job_id,
-                last_rendered_at
+            .await?;
+        }
+        (false, Some(last_rendered_at)) => {
+            execute(
+                db,
+                r#"
+                INSERT INTO studio_project_meta (
+                    project_id,
+                    folder_id,
+                    tags_json,
+                    default_export_format,
+                    last_render_job_id,
+                    last_rendered_at
+                )
+                VALUES (?1, NULL, '[]', 'wav', ?2, ?3)
+                "#,
+                vec![project_id.into(), job_id.into(), last_rendered_at.into()],
+                "Failed to insert Studio project completed render metadata",
             )
-            VALUES (
-                ?1,
-                (SELECT folder_id FROM studio_project_meta WHERE project_id = ?1),
-                COALESCE((SELECT tags_json FROM studio_project_meta WHERE project_id = ?1), '[]'),
-                COALESCE((SELECT default_export_format FROM studio_project_meta WHERE project_id = ?1), 'wav'),
-                ?2,
-                (SELECT last_rendered_at FROM studio_project_meta WHERE project_id = ?1)
+            .await?;
+        }
+        (false, None) => {
+            execute(
+                db,
+                r#"
+                INSERT INTO studio_project_meta (
+                    project_id,
+                    folder_id,
+                    tags_json,
+                    default_export_format,
+                    last_render_job_id,
+                    last_rendered_at
+                )
+                VALUES (?1, NULL, '[]', 'wav', ?2, NULL)
+                "#,
+                vec![project_id.into(), job_id.into()],
+                "Failed to insert Studio project render metadata",
             )
-            ON CONFLICT(project_id) DO UPDATE SET
-                last_render_job_id = excluded.last_render_job_id
-            "#,
-            vec![project_id.into(), job_id.into()],
-            "Failed to update Studio project render metadata",
-        )
-        .await?;
+            .await?;
+        }
     }
     Ok(())
 }
@@ -2408,14 +2459,8 @@ async fn execute<C>(
 where
     C: ConnectionTrait,
 {
-    let result = db
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            sql,
-            values,
-        ))
-        .await
-        .context(context)?;
+    let statement = raw::statement(db, sql, values).context(context)?;
+    let result = db.execute_raw(statement).await.context(context)?;
     Ok(result.rows_affected())
 }
 
@@ -2428,13 +2473,8 @@ async fn query_one<C>(
 where
     C: ConnectionTrait,
 {
-    db.query_one_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        sql,
-        values,
-    ))
-    .await
-    .context(context)
+    let statement = raw::statement(db, sql, values).context(context)?;
+    db.query_one_raw(statement).await.context(context)
 }
 
 async fn query_all<C>(
@@ -2446,13 +2486,8 @@ async fn query_all<C>(
 where
     C: ConnectionTrait,
 {
-    db.query_all_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        sql,
-        values,
-    ))
-    .await
-    .context(context)
+    let statement = raw::statement(db, sql, values).context(context)?;
+    db.query_all_raw(statement).await.context(context)
 }
 
 fn map_project_summary_row(row: &QueryResult) -> anyhow::Result<StudioProjectSummary> {
