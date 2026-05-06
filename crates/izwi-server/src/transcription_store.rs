@@ -3,16 +3,14 @@
 use anyhow::{anyhow, Context};
 use izwi_hooks::{HookMetadata, MediaNamespace, MediaStorageProvider};
 use sea_orm::sea_query::Expr;
-use sea_orm::{
-    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryResult, Set, Statement,
-};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryResult, Set};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    db::StoreDatabase,
+    db::{raw, StoreDatabase},
     entity::transcription_records,
     ids::new_uuid,
     persistence::{
@@ -242,22 +240,22 @@ impl TranscriptionStore {
         let fetch_limit = list_limit.saturating_add(1);
         let rows = if let Some(cursor) = cursor {
             let cursor_created_at = i64::try_from(cursor.created_at).unwrap_or(i64::MAX);
-            db.query_all_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+            db.query_all_raw(raw::statement(
+                db,
                 TRANSCRIPTION_PAGE_AFTER_CURSOR_SQL,
                 vec![
                     cursor_created_at.into(),
                     cursor.id.into(),
                     fetch_limit.into(),
                 ],
-            ))
+            )?)
             .await
         } else {
-            db.query_all_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+            db.query_all_raw(raw::statement(
+                db,
                 TRANSCRIPTION_PAGE_SQL,
                 vec![fetch_limit.into()],
-            ))
+            )?)
             .await
         }
         .context("Failed to list transcription records")?;
@@ -297,11 +295,11 @@ impl TranscriptionStore {
     ) -> anyhow::Result<Option<StoredTranscriptionAudio>> {
         let db = self.db.connection().await?;
         let row = db
-            .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+            .query_one_raw(raw::statement(
+                db,
                 "SELECT audio_storage_path, audio_mime_type, audio_filename FROM transcription_records WHERE id = ?1",
                 vec![record_id.into()],
-            ))
+            )?)
             .await
             .context("Failed to load transcription audio metadata")?;
         let Some(row) = row else {
@@ -605,11 +603,11 @@ impl TranscriptionStore {
     pub async fn delete_record(&self, record_id: String) -> anyhow::Result<bool> {
         let db = self.db.connection().await?;
         let audio_storage_path = db
-            .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+            .query_one_raw(raw::statement(
+                db,
                 "SELECT audio_storage_path FROM transcription_records WHERE id = ?1",
                 vec![record_id.clone().into()],
-            ))
+            )?)
             .await
             .context("Failed to load transcription media path")?
             .map(|row| row.try_get_by_index::<Option<String>>(0))
@@ -697,13 +695,13 @@ async fn fetch_record_without_audio(
     record_id: &str,
 ) -> anyhow::Result<Option<TranscriptionRecord>> {
     let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+        .query_one_raw(raw::statement(
+            db,
             format!(
                 "SELECT {TRANSCRIPTION_RECORD_COLUMNS} FROM transcription_records WHERE id = ?1"
             ),
             vec![record_id.into()],
-        ))
+        )?)
         .await
         .context("Failed to load transcription record")?;
     row.as_ref().map(map_transcription_record).transpose()

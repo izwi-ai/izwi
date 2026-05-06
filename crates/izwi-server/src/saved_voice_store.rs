@@ -2,13 +2,13 @@
 
 use anyhow::{anyhow, Context};
 use izwi_hooks::{HookMetadata, MediaNamespace, MediaStorageProvider};
-use sea_orm::{ConnectionTrait, DbBackend, EntityTrait, QueryResult, Set, Statement};
+use sea_orm::{ConnectionTrait, EntityTrait, QueryResult, Set};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    db::StoreDatabase,
+    db::{raw, StoreDatabase},
     entity::saved_voices,
     ids::new_uuid,
     persistence::{
@@ -135,8 +135,8 @@ impl SavedVoiceStore {
         let rows = if let Some(cursor) = cursor {
             let cursor_updated_at = i64::try_from(cursor.updated_at).unwrap_or(i64::MAX);
             let cursor_created_at = i64::try_from(cursor.created_at).unwrap_or(i64::MAX);
-            db.query_all_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+            db.query_all_raw(raw::statement(
+                db,
                 SAVED_VOICE_PAGE_AFTER_CURSOR_SQL,
                 vec![
                     cursor_updated_at.into(),
@@ -144,14 +144,14 @@ impl SavedVoiceStore {
                     cursor.id.into(),
                     fetch_limit.into(),
                 ],
-            ))
+            )?)
             .await
         } else {
-            db.query_all_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+            db.query_all_raw(raw::statement(
+                db,
                 SAVED_VOICE_PAGE_SQL,
                 vec![fetch_limit.into()],
-            ))
+            )?)
             .await
         }
         .context("Failed to list saved voices")?;
@@ -189,15 +189,15 @@ impl SavedVoiceStore {
     ) -> anyhow::Result<Option<StoredSavedVoiceAudio>> {
         let db = self.db.connection().await?;
         let audio = db
-            .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+            .query_one_raw(raw::statement(
+                db,
                 r#"
                 SELECT audio_storage_path, audio_mime_type, audio_filename
                 FROM saved_voices
                 WHERE id = ?1
                 "#,
                 vec![voice_id.into()],
-            ))
+            )?)
             .await
             .context("Failed to load saved voice audio metadata")?;
 
@@ -275,11 +275,11 @@ impl SavedVoiceStore {
     pub async fn delete_voice(&self, voice_id: String) -> anyhow::Result<bool> {
         let db = self.db.connection().await?;
         let audio_storage_path = db
-            .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+            .query_one_raw(raw::statement(
+                db,
                 "SELECT audio_storage_path FROM saved_voices WHERE id = ?1",
                 vec![voice_id.clone().into()],
-            ))
+            )?)
             .await
             .context("Failed to load saved voice media path")?
             .map(|row| row.try_get_by_index::<Option<String>>(0))
@@ -357,11 +357,11 @@ async fn fetch_voice_without_audio(
     voice_id: &str,
 ) -> anyhow::Result<Option<SavedVoice>> {
     let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+        .query_one_raw(raw::statement(
+            db,
             format!("SELECT {SAVED_VOICE_COLUMNS} FROM saved_voices WHERE id = ?1"),
             vec![voice_id.into()],
-        ))
+        )?)
         .await
         .context("Failed to load saved voice")?;
     row.as_ref().map(map_saved_voice).transpose()

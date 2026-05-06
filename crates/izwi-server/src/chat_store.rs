@@ -1,16 +1,16 @@
 //! Persistent chat thread storage backed by SQLite.
 
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, QueryFilter,
-    QueryResult, Set, Statement, TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryResult, Set,
+    TransactionTrait,
 };
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::db::StoreDatabase;
+use crate::db::{raw, StoreDatabase};
 use crate::entity::{chat_messages, chat_threads};
 use crate::ids::new_uuid;
 
@@ -59,10 +59,7 @@ impl ChatStore {
     pub async fn list_threads(&self) -> anyhow::Result<Vec<ChatThreadSummary>> {
         let db = self.db.connection().await?;
         let rows = db
-            .query_all_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                THREAD_SUMMARY_LIST_SQL.to_string(),
-            ))
+            .query_all_raw(raw::statement_without_values(db, THREAD_SUMMARY_LIST_SQL))
             .await
             .context("Failed to list chat threads")?;
         rows.iter().map(map_thread_summary).collect()
@@ -117,11 +114,11 @@ impl ChatStore {
     pub async fn list_messages(&self, thread_id: String) -> anyhow::Result<Vec<ChatThreadMessage>> {
         let db = self.db.connection().await?;
         let rows = db
-            .query_all_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+            .query_all_raw(raw::statement(
+                db,
                 CHAT_MESSAGES_LIST_SQL,
                 vec![thread_id.into()],
-            ))
+            )?)
             .await
             .context("Failed to list chat messages")?;
         rows.iter().map(map_thread_message).collect()
@@ -294,11 +291,11 @@ async fn fetch_thread_summary(
     thread_id: &str,
 ) -> anyhow::Result<Option<ChatThreadSummary>> {
     let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+        .query_one_raw(raw::statement(
+            db,
             THREAD_SUMMARY_BY_ID_SQL,
             vec![thread_id.into()],
-        ))
+        )?)
         .await
         .context("Failed to load chat thread summary")?;
     row.as_ref().map(map_thread_summary).transpose()
@@ -379,7 +376,11 @@ fn opt_usize_to_i64(value: Option<usize>) -> anyhow::Result<Option<i64>> {
 }
 
 fn i64_to_u64(value: i64) -> u64 {
-    if value.is_negative() { 0 } else { value as u64 }
+    if value.is_negative() {
+        0
+    } else {
+        value as u64
+    }
 }
 
 fn i64_to_usize(value: i64) -> usize {
@@ -424,13 +425,11 @@ mod tests {
     async fn persists_threads_messages_and_content_parts() {
         with_env_lock(async {
             let (_temp, store) = setup_store();
-            assert!(
-                store
-                    .list_threads()
-                    .await
-                    .expect("threads should list")
-                    .is_empty()
-            );
+            assert!(store
+                .list_threads()
+                .await
+                .expect("threads should list")
+                .is_empty());
 
             let thread = store
                 .create_thread(
@@ -497,19 +496,15 @@ mod tests {
                 .expect("thread should exist");
             assert_eq!(updated.title, "Renamed");
 
-            assert!(
-                store
-                    .delete_thread(thread.id.clone())
-                    .await
-                    .expect("thread should delete")
-            );
-            assert!(
-                store
-                    .list_messages(thread.id)
-                    .await
-                    .expect("messages should list")
-                    .is_empty()
-            );
+            assert!(store
+                .delete_thread(thread.id.clone())
+                .await
+                .expect("thread should delete"));
+            assert!(store
+                .list_messages(thread.id)
+                .await
+                .expect("messages should list")
+                .is_empty());
             clear_env();
         })
         .await;

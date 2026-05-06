@@ -1,12 +1,11 @@
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, QueryFilter,
-    QueryResult, Set, Statement,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryResult, Set,
 };
 use serde::Serialize;
 
-use crate::db::StoreDatabase;
+use crate::db::{raw, StoreDatabase};
 use crate::entity::{voice_profiles, voice_sessions, voice_turns};
 use crate::ids::new_uuid;
 use crate::voice_defaults::{DEFAULT_VOICE_AGENT_SYSTEM_PROMPT, DEFAULT_VOICE_PROFILE_ID};
@@ -181,8 +180,8 @@ impl VoiceStore {
     pub async fn end_session(&self, session_id: String) -> anyhow::Result<()> {
         let db = self.db.connection().await?;
         let now = now_unix_millis_i64();
-        db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+        db.execute_raw(raw::statement(
+            db,
             r#"
             UPDATE voice_sessions
             SET updated_at = ?1,
@@ -190,7 +189,7 @@ impl VoiceStore {
             WHERE id = ?2
             "#,
             vec![now.into(), session_id.into()],
-        ))
+        )?)
         .await
         .context("Failed to end voice session")?;
         Ok(())
@@ -200,8 +199,8 @@ impl VoiceStore {
         let db = self.db.connection().await?;
         let limit = i64::try_from(limit.max(1)).context("Voice session limit exceeds i64")?;
         let rows = db
-            .query_all_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+            .query_all_raw(raw::statement(
+                db,
                 r#"
             SELECT
                 s.id,
@@ -235,7 +234,7 @@ impl VoiceStore {
             LIMIT ?1
                 "#,
                 vec![limit.into()],
-            ))
+            )?)
             .await
             .context("Failed to list voice sessions")?;
         rows.iter().map(map_session_summary).collect()
@@ -313,8 +312,8 @@ impl VoiceStore {
         let session_id = fetch_turn_session_id(db, &turn_id)
             .await?
             .ok_or_else(|| anyhow!("Voice turn not found"))?;
-        db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+        db.execute_raw(raw::statement(
+            db,
             r#"
             UPDATE voice_turns
             SET user_text = ?1,
@@ -330,7 +329,7 @@ impl VoiceStore {
                 now.into(),
                 turn_id.into(),
             ],
-        ))
+        )?)
         .await
         .context("Failed to update voice turn transcript")?;
         touch_session_updated_at(db, session_id.as_str(), now).await
@@ -347,8 +346,8 @@ impl VoiceStore {
         let session_id = fetch_turn_session_id(db, &turn_id)
             .await?
             .ok_or_else(|| anyhow!("Voice turn not found"))?;
-        db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+        db.execute_raw(raw::statement(
+            db,
             r#"
             UPDATE voice_turns
             SET assistant_text = ?1,
@@ -362,7 +361,7 @@ impl VoiceStore {
                 now.into(),
                 turn_id.into(),
             ],
-        ))
+        )?)
         .await
         .context("Failed to update voice turn assistant text")?;
         touch_session_updated_at(db, session_id.as_str(), now).await
@@ -380,8 +379,8 @@ impl VoiceStore {
         let session_id = fetch_turn_session_id(db, &turn_id)
             .await?
             .ok_or_else(|| anyhow!("Voice turn not found"))?;
-        db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+        db.execute_raw(raw::statement(
+            db,
             r#"
             UPDATE voice_turns
             SET status = ?1,
@@ -395,7 +394,7 @@ impl VoiceStore {
                 now.into(),
                 turn_id.into(),
             ],
-        ))
+        )?)
         .await
         .context("Failed to complete voice turn")?;
         touch_session_updated_at(db, session_id.as_str(), now).await
@@ -504,11 +503,11 @@ async fn fetch_voice_profile(
     profile_id: &str,
 ) -> anyhow::Result<Option<VoiceProfile>> {
     let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+        .query_one_raw(raw::statement(
+            db,
             VOICE_PROFILE_BY_ID_SQL,
             vec![profile_id.into()],
-        ))
+        )?)
         .await
         .context("Failed to load voice profile")?;
     row.as_ref().map(map_voice_profile).transpose()
@@ -519,11 +518,11 @@ async fn fetch_session_summary(
     session_id: &str,
 ) -> anyhow::Result<Option<VoiceSessionSummary>> {
     let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+        .query_one_raw(raw::statement(
+            db,
             SESSION_SUMMARY_BY_ID_SQL,
             vec![session_id.into()],
-        ))
+        )?)
         .await
         .context("Failed to load voice session summary")?;
     row.as_ref().map(map_session_summary).transpose()
@@ -534,11 +533,11 @@ async fn list_session_turns(
     session_id: &str,
 ) -> anyhow::Result<Vec<VoiceTurnRecord>> {
     let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+        .query_all_raw(raw::statement(
+            db,
             SESSION_TURNS_SQL,
             vec![session_id.into()],
-        ))
+        )?)
         .await
         .context("Failed to list voice turns")?;
     rows.iter().map(map_turn_record).collect()
@@ -549,11 +548,11 @@ async fn fetch_turn_record(
     turn_id: &str,
 ) -> anyhow::Result<Option<VoiceTurnRecord>> {
     let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+        .query_one_raw(raw::statement(
+            db,
             TURN_RECORD_BY_ID_SQL,
             vec![turn_id.into()],
-        ))
+        )?)
         .await
         .context("Failed to load voice turn")?;
     row.as_ref().map(map_turn_record).transpose()
@@ -564,11 +563,11 @@ async fn fetch_turn_session_id(
     turn_id: &str,
 ) -> anyhow::Result<Option<String>> {
     let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+        .query_one_raw(raw::statement(
+            db,
             "SELECT session_id FROM voice_turns WHERE id = ?1",
             vec![turn_id.into()],
-        ))
+        )?)
         .await
         .context("Failed to load voice turn session id")?;
     row.map(|row| row.try_get_by_index(0))
@@ -581,11 +580,11 @@ async fn touch_session_updated_at(
     session_id: &str,
     updated_at: i64,
 ) -> anyhow::Result<()> {
-    db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
+    db.execute_raw(raw::statement(
+        db,
         "UPDATE voice_sessions SET updated_at = ?1 WHERE id = ?2",
         vec![updated_at.into(), session_id.into()],
-    ))
+    )?)
     .await
     .context("Failed to touch voice session")?;
     Ok(())
@@ -686,7 +685,11 @@ fn sanitize_optional_text(raw: Option<&str>, max_len: usize) -> Option<String> {
 }
 
 fn bool_to_i64(value: bool) -> i64 {
-    if value { 1 } else { 0 }
+    if value {
+        1
+    } else {
+        0
+    }
 }
 
 fn i64_to_bool(value: i64) -> bool {

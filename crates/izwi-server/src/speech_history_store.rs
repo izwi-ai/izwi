@@ -3,15 +3,13 @@
 use anyhow::{anyhow, Context};
 use izwi_hooks::{HookMetadata, MediaNamespace, MediaStorageProvider};
 use sea_orm::sea_query::Expr;
-use sea_orm::{
-    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryResult, Set, Statement,
-};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryResult, Set};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    db::StoreDatabase,
+    db::{raw, StoreDatabase},
     entity::speech_history_records,
     ids::new_uuid,
     persistence::{
@@ -226,8 +224,8 @@ impl SpeechHistoryStore {
 
         let rows = if let Some(cursor) = cursor {
             let cursor_created_at = i64::try_from(cursor.created_at).unwrap_or(i64::MAX);
-            db.query_all_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+            db.query_all_raw(raw::statement(
+                db,
                 SPEECH_HISTORY_PAGE_AFTER_CURSOR_SQL,
                 vec![
                     route_kind.as_db_value().into(),
@@ -235,14 +233,14 @@ impl SpeechHistoryStore {
                     cursor.id.into(),
                     fetch_limit.into(),
                 ],
-            ))
+            )?)
             .await
         } else {
-            db.query_all_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+            db.query_all_raw(raw::statement(
+                db,
                 SPEECH_HISTORY_PAGE_SQL,
                 vec![route_kind.as_db_value().into(), fetch_limit.into()],
-            ))
+            )?)
             .await
         }
         .context("Failed to list speech history records")?;
@@ -285,15 +283,15 @@ impl SpeechHistoryStore {
     ) -> anyhow::Result<Option<StoredSpeechAudio>> {
         let db = self.db.connection().await?;
         let audio = db
-            .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+            .query_one_raw(raw::statement(
+                db,
                 r#"
                 SELECT audio_storage_path, audio_mime_type, audio_filename
                 FROM speech_history_records
                 WHERE route_kind = ?1 AND id = ?2
                 "#,
                 vec![route_kind.as_db_value().into(), record_id.into()],
-            ))
+            )?)
             .await
             .context("Failed to load speech history audio metadata")?;
         let Some(row) = audio else {
@@ -697,13 +695,13 @@ async fn fetch_record_without_audio(
     record_id: &str,
 ) -> anyhow::Result<Option<SpeechHistoryRecord>> {
     let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+        .query_one_raw(raw::statement(
+            db,
             format!(
                 "SELECT {SPEECH_HISTORY_RECORD_COLUMNS} FROM speech_history_records WHERE route_kind = ?1 AND id = ?2"
             ),
             vec![route_kind.as_db_value().into(), record_id.into()],
-        ))
+        )?)
         .await
         .context("Failed to load speech history record")?;
     row.as_ref().map(map_speech_history_record).transpose()
@@ -715,11 +713,11 @@ async fn fetch_audio_storage_path(
     record_id: &str,
 ) -> anyhow::Result<Option<Option<String>>> {
     let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+        .query_one_raw(raw::statement(
+            db,
             "SELECT audio_storage_path FROM speech_history_records WHERE route_kind = ?1 AND id = ?2",
             vec![route_kind.as_db_value().into(), record_id.into()],
-        ))
+        )?)
         .await
         .context("Failed to load speech history media path")?;
     row.map(|row| row.try_get_by_index::<Option<String>>(0))

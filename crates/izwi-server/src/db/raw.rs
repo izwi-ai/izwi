@@ -1,11 +1,7 @@
 use anyhow::{bail, Context};
 use sea_orm::{ConnectionTrait, DbBackend, Statement, Value};
 
-pub fn statement<C>(
-    db: &C,
-    sql: impl Into<String>,
-    values: Vec<Value>,
-) -> anyhow::Result<Statement>
+pub fn statement<C>(db: &C, sql: impl Into<String>, values: Vec<Value>) -> anyhow::Result<Statement>
 where
     C: ConnectionTrait,
 {
@@ -28,12 +24,24 @@ where
     Statement::from_string(db.get_database_backend(), sql)
 }
 
-pub fn json_extract_text(backend: DbBackend, expression: &str, key: &str) -> anyhow::Result<String> {
+pub fn json_extract_text(
+    backend: DbBackend,
+    expression: &str,
+    key: &str,
+) -> anyhow::Result<String> {
     validate_json_key(key)?;
     Ok(match backend {
         DbBackend::Sqlite => format!("json_extract({expression}, '$.{key}')"),
         DbBackend::Postgres => format!("(({expression})::jsonb ->> '{key}')"),
         DbBackend::MySql => format!("JSON_UNQUOTE(JSON_EXTRACT({expression}, '$.{key}'))"),
+        _ => bail!("Unsupported SeaORM database backend: {backend:?}"),
+    })
+}
+
+pub fn greatest(backend: DbBackend, left: &str, right: &str) -> anyhow::Result<String> {
+    Ok(match backend {
+        DbBackend::Sqlite => format!("MAX({left}, {right})"),
+        DbBackend::Postgres | DbBackend::MySql => format!("GREATEST({left}, {right})"),
         _ => bail!("Unsupported SeaORM database backend: {backend:?}"),
     })
 }
@@ -192,12 +200,9 @@ mod tests {
     #[test]
     fn postgres_rewrites_indexed_placeholders_without_duplication() {
         let values = vec!["first".into(), 2_i64.into()];
-        let statement = statement_for_backend(
-            DbBackend::Postgres,
-            "SELECT ?1, ?2, ?1, '?'",
-            values,
-        )
-        .expect("statement should build");
+        let statement =
+            statement_for_backend(DbBackend::Postgres, "SELECT ?1, ?2, ?1, '?'", values)
+                .expect("statement should build");
 
         assert_eq!(statement.sql, "SELECT $1, $2, $1, '?'");
         assert_eq!(statement.values.expect("values").0.len(), 2);
@@ -206,9 +211,8 @@ mod tests {
     #[test]
     fn mysql_rewrites_indexed_placeholders_and_duplicates_reused_values() {
         let values = vec!["first".into(), 2_i64.into()];
-        let statement =
-            statement_for_backend(DbBackend::MySql, "SELECT ?1, ?2, ?1, '?2'", values)
-                .expect("statement should build");
+        let statement = statement_for_backend(DbBackend::MySql, "SELECT ?1, ?2, ?1, '?2'", values)
+            .expect("statement should build");
 
         assert_eq!(statement.sql, "SELECT ?, ?, ?, '?2'");
         assert_eq!(statement.values.expect("values").0.len(), 3);
@@ -247,6 +251,22 @@ mod tests {
         assert_eq!(
             json_extract_text(DbBackend::MySql, "project_json", "name").expect("mysql"),
             "JSON_UNQUOTE(JSON_EXTRACT(project_json, '$.name'))"
+        );
+    }
+
+    #[test]
+    fn greatest_fragments_are_backend_specific() {
+        assert_eq!(
+            greatest(DbBackend::Sqlite, "confidence", "?1").expect("sqlite"),
+            "MAX(confidence, ?1)"
+        );
+        assert_eq!(
+            greatest(DbBackend::Postgres, "confidence", "?1").expect("postgres"),
+            "GREATEST(confidence, ?1)"
+        );
+        assert_eq!(
+            greatest(DbBackend::MySql, "confidence", "?1").expect("mysql"),
+            "GREATEST(confidence, ?1)"
         );
     }
 }
