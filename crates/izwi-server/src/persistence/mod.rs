@@ -1,5 +1,9 @@
-use crate::{db, db::migrator::Migrator, storage_layout};
-use anyhow::{bail, Context};
+use crate::{
+    db,
+    db::{migrator::Migrator, schema_contract::validate_provider_managed_schema},
+    storage_layout,
+};
+use anyhow::{Context, bail};
 use izwi_hooks::{
     DatabaseBackend, DatabaseConnectionDecision, DatabaseMigrationMode, DatabaseProviderDecision,
     DatabaseProviderRequest, EnterpriseHooks, HookError, HookMetadata, HookResult,
@@ -196,11 +200,13 @@ async fn provider_database_context(
         Migrator::up(&decision.connection)
             .await
             .context("Failed to run Izwi-managed migrations on enterprise database")?;
+    } else {
+        validate_provider_managed_schema(&decision.connection).await?;
     }
 
     Ok(DatabaseContext::new(
         decision.connection,
-        decision.backend,
+        actual_backend,
         decision.migration_mode,
         decision.metadata,
     ))
@@ -237,13 +243,12 @@ fn validate_declared_backend(
 }
 
 fn validate_supported_database_backend(backend: &DatabaseBackend) -> anyhow::Result<()> {
-    if matches!(backend, DatabaseBackend::Sqlite) {
-        return Ok(());
+    match backend {
+        DatabaseBackend::Sqlite | DatabaseBackend::Postgres | DatabaseBackend::Mysql => Ok(()),
+        DatabaseBackend::Other(name) => {
+            bail!("Enterprise database backend {name:?} is not supported by this runtime")
+        }
     }
-
-    bail!(
-        "Enterprise database backend {backend:?} is not enabled yet: runtime stores and migrations currently require SQLite-compatible SQL"
-    );
 }
 
 fn validate_migration_mode_for_backend(
@@ -533,11 +538,13 @@ mod tests {
 
     #[test]
     fn izwi_managed_migrations_are_restricted_to_sqlite() {
-        assert!(validate_migration_mode_for_backend(
-            &DatabaseBackend::Sqlite,
-            &DatabaseMigrationMode::IzwiManaged,
-        )
-        .is_ok());
+        assert!(
+            validate_migration_mode_for_backend(
+                &DatabaseBackend::Sqlite,
+                &DatabaseMigrationMode::IzwiManaged,
+            )
+            .is_ok()
+        );
 
         let error = validate_migration_mode_for_backend(
             &DatabaseBackend::Postgres,
@@ -551,21 +558,99 @@ mod tests {
                 .contains("Izwi-managed migrations currently require the local SQLite backend"),
             "{error}"
         );
+
+        assert!(
+            validate_migration_mode_for_backend(
+                &DatabaseBackend::Postgres,
+                &DatabaseMigrationMode::ProviderManaged,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_migration_mode_for_backend(
+                &DatabaseBackend::Mysql,
+                &DatabaseMigrationMode::Disabled,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
-    fn non_sqlite_backends_are_rejected_until_store_sql_is_portable() {
-        let error = validate_supported_database_backend(&DatabaseBackend::Postgres)
-            .expect_err("postgres should be rejected until store SQL is portable");
+    fn supported_database_backends_accept_portable_store_sql() {
+        assert!(validate_supported_database_backend(&DatabaseBackend::Sqlite).is_ok());
+        assert!(validate_supported_database_backend(&DatabaseBackend::Postgres).is_ok());
+        assert!(validate_supported_database_backend(&DatabaseBackend::Mysql).is_ok());
+
+        let error =
+            validate_supported_database_backend(&DatabaseBackend::Other("unsupported".to_string()))
+                .expect_err("unknown backend should be rejected");
 
         assert!(
             error
                 .to_string()
-                .contains("runtime stores and migrations currently require SQLite-compatible SQL"),
+                .contains("is not supported by this runtime"),
             "{error}"
         );
+    }
 
-        assert!(validate_supported_database_backend(&DatabaseBackend::Sqlite).is_ok());
+    #[tokio::test]
+    async fn provider_managed_database_requires_schema_contract() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let connection = db::sqlite::connect_path(&temp_dir.path().join("enterprise.sqlite3"))
+            .await
+            .expect("sqlite connection");
+        let mut hooks = EnterpriseHooks::noop();
+        hooks.database = Arc::new(StaticDatabaseProvider {
+            decision: DatabaseProviderDecision::UseConnection(DatabaseConnectionDecision {
+                connection,
+                backend: DatabaseBackend::Sqlite,
+                migration_mode: DatabaseMigrationMode::ProviderManaged,
+                metadata: HookMetadata::new(),
+            }),
+        });
+
+        let error = match PersistenceContext::resolve(&hooks).await {
+            Ok(_) => panic!("empty provider-managed schema should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("Enterprise database schema is incomplete"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("chat_threads"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn provider_managed_database_accepts_valid_schema_contract() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let connection = db::sqlite::connect_path(&temp_dir.path().join("enterprise.sqlite3"))
+            .await
+            .expect("sqlite connection");
+        Migrator::up(&connection)
+            .await
+            .expect("provider-managed test schema");
+
+        let mut hooks = EnterpriseHooks::noop();
+        hooks.database = Arc::new(StaticDatabaseProvider {
+            decision: DatabaseProviderDecision::UseConnection(DatabaseConnectionDecision {
+                connection,
+                backend: DatabaseBackend::Sqlite,
+                migration_mode: DatabaseMigrationMode::ProviderManaged,
+                metadata: HookMetadata::new(),
+            }),
+        });
+
+        let context = PersistenceContext::resolve(&hooks)
+            .await
+            .expect("provider-managed schema should validate");
+        assert_eq!(context.database.backend(), &DatabaseBackend::Sqlite);
+        assert_eq!(
+            context.database.migration_mode(),
+            &DatabaseMigrationMode::ProviderManaged
+        );
     }
 
     #[tokio::test]
