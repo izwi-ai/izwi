@@ -31,6 +31,7 @@ Izwi is a powerful, privacy-focused audio AI platform that runs entirely on your
 | [Getting Started](./getting-started.md) | Install Izwi and run your first command |
 | [Installation](./installation/index.md) | Platform-specific installation guides |
 | [Runtime Support Matrix](./support-matrix.md) | Supported OS, hardware, artifact, and API surfaces |
+| [API Reference](./api.md) | Stable, preview, first-party, operator, and realtime HTTP/WebSocket APIs |
 | [Features](./features/index.md) | Learn about each feature in detail |
 | [Models](./models/index.md) | Understand and manage AI models |
 | [CLI Reference](./cli/index.md) | Complete command-line reference |

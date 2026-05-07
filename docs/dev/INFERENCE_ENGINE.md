@@ -502,10 +502,13 @@ These routes back the desktop UI's saved history and reusable assets. Canonical 
 | `GET, POST` | `/v1/transcriptions` | Legacy alias family for transcription-only list/create |
 | `GET, DELETE` | `/v1/transcriptions/:id` | Legacy alias family for transcription-only fetch/delete |
 | `GET` | `/v1/transcriptions/:id/audio` | Legacy alias family for transcription audio fetch |
+| `POST` | `/v1/transcriptions/:id/summary/regenerate` | Legacy transcription summary regeneration |
 | `GET, POST` | `/v1/diarizations` | List or create saved diarization records |
 | `GET, PATCH, PUT, DELETE` | `/v1/diarizations/:id` | Fetch, update, or delete a saved diarization record |
 | `GET` | `/v1/diarizations/:id/audio` | Fetch stored diarization source audio |
 | `POST` | `/v1/diarizations/:id/reruns` | Re-run diarization from a saved record's source audio |
+| `POST` | `/v1/diarizations/:id/cancel` | Cancel an in-flight diarization rerun |
+| `POST` | `/v1/diarizations/:id/summary/regenerate` | Regenerate a diarization summary |
 | `GET, POST` | `/v1/text-to-speech-generations` | List or create saved TTS generations |
 | `GET, DELETE` | `/v1/text-to-speech-generations/:id` | Fetch or delete a saved TTS generation |
 | `GET` | `/v1/text-to-speech-generations/:id/audio` | Fetch generated TTS audio |
@@ -528,6 +531,7 @@ These routes back the desktop UI's saved history and reusable assets. Canonical 
 | `POST` | `/v1/studio/projects/:project_id/snapshots/:snapshot_id/restore` | Restore a Studio project from a snapshot |
 | `GET, POST` | `/v1/studio/projects/:project_id/render-jobs` | List or create Studio project render jobs |
 | `PATCH` | `/v1/studio/projects/:project_id/render-jobs/:job_id` | Update Studio project render job status |
+| `POST` | `/v1/studio/projects/:project_id/segments` | Create a Studio project segment |
 | `GET, PATCH, DELETE` | `/v1/studio/projects/:project_id/segments/:segment_id` | Fetch, update, or delete a Studio project segment |
 | `POST` | `/v1/studio/projects/:project_id/segments/:segment_id/split` | Split a Studio project segment |
 | `POST` | `/v1/studio/projects/:project_id/segments/:segment_id/merge-next` | Merge a Studio project segment with the next segment |
@@ -535,16 +539,36 @@ These routes back the desktop UI's saved history and reusable assets. Canonical 
 | `POST` | `/v1/studio/projects/:project_id/segments/bulk-delete` | Bulk delete Studio project segments |
 | `POST` | `/v1/studio/projects/:project_id/segments/:segment_id/render` | Render a Studio project segment |
 | `GET, POST` | `/v1/studio/folders` | List or create Studio project folders |
+| `GET, POST` | `/v1/chat/threads` | List or create durable local chat threads |
+| `GET, PATCH, DELETE` | `/v1/chat/threads/:thread_id` | Fetch, update, or delete a chat thread |
+| `GET, POST` | `/v1/chat/threads/:thread_id/messages` | List messages or send a thread message |
+| `POST` | `/v1/agent/sessions` | Create preview process-local agent session metadata and a linked chat thread |
+| `GET` | `/v1/agent/sessions/:session_id` | Fetch retained agent session metadata |
+| `POST` | `/v1/agent/sessions/:session_id/turns` | Run one agent turn |
+| `GET, PATCH` | `/v1/voice/profile` | Fetch or update voice profile settings |
+| `GET, DELETE` | `/v1/voice/observations` | List or clear voice memory observations |
+| `DELETE` | `/v1/voice/observations/:observation_id` | Delete one voice memory observation |
+| `GET` | `/v1/voice/sessions` | List persisted voice sessions |
+| `GET` | `/v1/voice/sessions/:session_id` | Fetch one persisted voice session |
+| `GET` | `/v1/media/{*path}` | Serve persisted local media by relative path |
+| `GET` | `/v1/onboarding` | Fetch first-run onboarding state |
+| `POST` | `/v1/onboarding/complete` | Mark first-run onboarding complete |
+| `GET` | `/v1/preferences` | Fetch user preferences |
+| `PUT` | `/v1/preferences/analytics` | Update analytics opt-in preference |
+| `GET` | `/v1/transcription/realtime/ws` | Preview realtime transcription WebSocket |
+| `GET` | `/v1/voice/realtime/ws` | Preview realtime voice WebSocket |
 
-### 10.2 OpenAI-Compatible Endpoints
+### 10.2 OpenAI-Compatible And OpenAI-Style Endpoints
 
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/v1/audio/speech` | Text-to-speech synthesis |
 | `POST` | `/v1/audio/transcriptions` | Speech-to-text (Whisper) |
-| `POST` | `/v1/audio/translations` | Speech translation |
+| `POST` | `/v1/audio/diarizations` | Izwi-specific diarization API |
+| `POST` | `/v1/audio/diarize` | Legacy alias for `/v1/audio/diarizations` |
 | `POST` | `/v1/chat/completions` | Chat / LLM completions |
 | `GET` | `/v1/models` | List available models |
+| `GET` | `/v1/models/:model` | Fetch one available model |
 | `POST` | `/v1/responses` | Structured response generation; preview process-local response-object storage |
 | `GET, DELETE` | `/v1/responses/:response_id` | Fetch or delete a process-local stored response object |
 | `POST` | `/v1/responses/:response_id/cancel` | Preview lifecycle route for process-local response records |
@@ -578,10 +602,27 @@ id and metadata are not durable across server restarts.
 |---|---|---|
 | `GET` | `/v1/admin/models` | List all known model variants |
 | `POST` | `/v1/admin/models/:variant/download` | Download model weights |
+| `GET` | `/v1/admin/models/:variant/download/progress` | Stream model download progress events |
+| `POST` | `/v1/admin/models/:variant/download/cancel` | Cancel an active model download |
 | `POST` | `/v1/admin/models/:variant/load` | Load model into engine |
 | `POST` | `/v1/admin/models/:variant/unload` | Unload model from engine |
 | `GET` | `/v1/admin/models/:variant` | Get model info |
 | `DELETE` | `/v1/admin/models/:variant` | Delete model weights |
+
+### 10.4 Internal And Operator Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/livez` | Root liveness probe |
+| `GET` | `/readyz` | Root readiness probe |
+| `GET` | `/openapi.json` | Generated OpenAPI document for the stable compatibility contract and probes |
+| `GET` | `/docs` | Local Scalar OpenAPI reference |
+| `GET` | `/v1/live` | Versioned liveness probe |
+| `GET` | `/v1/ready` | Versioned readiness probe |
+| `GET` | `/v1/health` | Rich runtime/backend status payload |
+| `GET` | `/v1/metrics` | JSON runtime telemetry snapshot |
+| `GET` | `/v1/metrics/prometheus` | Prometheus runtime telemetry |
+| `GET` | `/internal/*` | Compatibility aliases for the internal health/metrics routes |
 
 ---
 

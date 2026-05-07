@@ -86,6 +86,9 @@ POST /v1/audio/diarize
 | `min_speakers` | Integer | Optional minimum expected speakers |
 | `max_speakers` | Integer | Optional maximum expected speakers |
 | `num_speakers` | Integer | Legacy shortcut; maps to both min/max when provided |
+| `min_speech_duration_ms` | Number | Optional VAD speech-duration tuning |
+| `min_silence_duration_ms` | Number | Optional VAD silence-duration tuning |
+| `enable_llm_refinement` | Boolean/String | Enable optional transcript refinement |
 | `response_format` | String | `json`, `verbose_json`, or `text` |
 
 ### Example (curl)
@@ -103,6 +106,8 @@ curl -X POST http://localhost:8080/v1/audio/diarizations \
 
 ### Response
 
+The default `json` response contains speaker segments and a formatted transcript:
+
 ```json
 {
   "segments": [
@@ -117,11 +122,16 @@ curl -X POST http://localhost:8080/v1/audio/diarizations \
       "end": 12.1
     }
   ],
-  "speaker_count": 2,
-  "transcript": "SPEAKER_00 [0.00s - 5.20s]: Welcome to the meeting.\nSPEAKER_01 [5.50s - 12.10s]: Thanks for having me.",
-  "duration": 120.5
+  "transcript": "SPEAKER_00 [0.00s - 5.20s]: Welcome to the meeting.\nSPEAKER_01 [5.50s - 12.10s]: Thanks for having me."
 }
 ```
+
+Use `response_format=verbose_json` for words, utterances, speaker count,
+duration, alignment coverage, LLM refinement status, and processing metrics.
+Streaming diarization is not currently supported on this route.
+
+See the [API Reference](../api.md#audio-diarizations) for JSON input,
+legacy alias behavior, and exact response shapes.
 
 ---
 

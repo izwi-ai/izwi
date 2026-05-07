@@ -119,7 +119,8 @@ POST /v1/audio/transcriptions
 | `file` | File | Audio file to transcribe |
 | `model` | String | Model name |
 | `language` | String | Language code (optional) |
-| `response_format` | String | `text`, `json`, or `verbose_json` |
+| `response_format` | String | `text`, `json`, `verbose_json`, `srt`, or `vtt` |
+| `stream` | Boolean/String | Enable SSE transcript events (`true`, `1`, `yes`, or `on`) |
 
 ### Example (curl)
 
@@ -134,9 +135,7 @@ curl -X POST http://localhost:8080/v1/audio/transcriptions \
 
 ```json
 {
-  "text": "Hello, this is a transcription test.",
-  "language": "en",
-  "duration": 3.5
+  "text": "Hello, this is a transcription test."
 }
 ```
 
@@ -147,13 +146,17 @@ curl -X POST http://localhost:8080/v1/audio/transcriptions \
   "text": "Hello, this is a transcription test.",
   "language": "en",
   "duration": 3.5,
-  "words": [
-    {"word": "Hello", "start": 0.0, "end": 0.5},
-    {"word": "this", "start": 0.6, "end": 0.8},
-    ...
-  ]
+  "processing_time_ms": 812.4,
+  "rtf": 0.23,
+  "izwi_asr_diagnostics": null
 }
 ```
+
+Streaming responses emit SSE payloads with `type` values such as
+`transcript.text.delta`, `transcript.text.done`, and `error`.
+
+See the [API Reference](../api.md#audio-transcriptions) for JSON input,
+streaming events, upload limits, and exact response shapes.
 
 ---
 
@@ -207,17 +210,18 @@ Hello, this is a transcription test.
 
 ### Verbose JSON
 
-Includes word-level timestamps and metadata:
+Includes language, duration, processing-time, realtime-factor, and optional
+runtime diagnostics. Word-level timestamps are not currently returned by this
+endpoint.
 
 ```json
 {
   "text": "Hello, this is a transcription test.",
   "language": "en",
   "duration": 3.5,
-  "words": [
-    {"word": "Hello", "start": 0.0, "end": 0.5},
-    {"word": "this", "start": 0.6, "end": 0.8}
-  ]
+  "processing_time_ms": 812.4,
+  "rtf": 0.23,
+  "izwi_asr_diagnostics": null
 }
 ```
 

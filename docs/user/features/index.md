@@ -81,3 +81,4 @@ Choose a feature to learn more:
 - [Text-to-Speech](./text-to-speech.md) — Generate speech
 - [Studio](./studio.md) — Build long-form TTS projects
 - [Transcription](./transcription.md) — Convert audio to text
+- [API Reference](../api.md) — Integrate with HTTP, SSE, and WebSocket APIs

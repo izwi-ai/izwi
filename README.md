@@ -38,7 +38,9 @@ Izwi is a privacy-focused audio AI platform that runs entirely on your machine. 
 The server exposes OpenAI-compatible API routes under `/v1`. When the server is
 running, the local Scalar API reference is available at
 `http://localhost:8080/docs`, and the raw OpenAPI document is available at
-`http://localhost:8080/openapi.json`.
+`http://localhost:8080/openapi.json`. Scalar includes navigation entries for
+preview first-party, operator, and realtime route families; detailed guidance is
+documented in the [API Reference](https://izwiai.com/docs/api).
 
 ## Runtime Support Matrix
 
@@ -178,8 +180,9 @@ Run `izwi list` to see all available models.
 | **Installation** | [izwiai.com/docs/installation](https://izwiai.com/docs/installation) |
 | **Features** | [izwiai.com/docs/features](https://izwiai.com/docs/features) |
 | **CLI Reference** | [izwiai.com/docs/cli](https://izwiai.com/docs/cli) |
+| **API Reference** | [izwiai.com/docs/api](https://izwiai.com/docs/api) |
 | **Models** | [izwiai.com/docs/models](https://izwiai.com/docs/models) |
-| **Local API Reference** | `http://localhost:8080/docs` when `izwi serve` is running |
+| **Local OpenAPI Reference** | `http://localhost:8080/docs` when `izwi serve` is running |
 | **Troubleshooting** | [izwiai.com/docs/troubleshooting](https://izwiai.com/docs/troubleshooting) |
 
 ---
