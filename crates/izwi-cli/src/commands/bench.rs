@@ -16,7 +16,7 @@ enum RuntimeTelemetryContext {
     AsrWhisper,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct RuntimeTelemetrySnapshot {
     requests_queued: u64,
     requests_completed: u64,
@@ -96,6 +96,12 @@ struct AsrBenchResponse {
     izwi_asr_diagnostics: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone)]
+struct AsrBenchSample {
+    total_ms: f64,
+    response: AsrBenchResponse,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct WhisperStageTimings {
     audio_decode: Option<f64>,
@@ -164,17 +170,21 @@ pub async fn execute(command: BenchCommands, server: &str, theme: &Theme) -> Res
             iterations,
             file,
             language,
+            concurrent,
             warmup,
-        } => bench_asr(
-            server,
-            &model,
-            iterations,
-            file,
-            language.as_deref(),
-            warmup,
-            theme,
-        )
-        .await,
+        } => {
+            bench_asr(
+                server,
+                &model,
+                iterations,
+                file,
+                language.as_deref(),
+                concurrent,
+                warmup,
+                theme,
+            )
+            .await
+        }
         BenchCommands::Throughput {
             duration,
             concurrent,
@@ -401,12 +411,18 @@ async fn bench_asr(
     iterations: u32,
     file: Option<std::path::PathBuf>,
     language: Option<&str>,
+    concurrent: u32,
     warmup: bool,
     theme: &Theme,
 ) -> Result<()> {
     if iterations == 0 {
         return Err(CliError::InvalidInput(
             "Iterations must be greater than 0".to_string(),
+        ));
+    }
+    if concurrent == 0 {
+        return Err(CliError::InvalidInput(
+            "Concurrent requests must be greater than 0".to_string(),
         ));
     }
 
@@ -444,14 +460,48 @@ async fn bench_asr(
             .progress_chars("#>-"),
     );
 
-    let mut times = Vec::new();
+    let progress = Arc::new(pb);
+    let audio_base64 = Arc::new(audio_base64);
+    let language = language.map(|value| Arc::new(value.to_string()));
+    let wall_start = Instant::now();
+    let samples: Vec<AsrBenchSample> = stream::iter(0..iterations)
+        .map(|_| {
+            let progress = Arc::clone(&progress);
+            let audio_base64 = Arc::clone(&audio_base64);
+            let language = language.clone();
+            let model = model.to_string();
+            let server = server.to_string();
+            async move {
+                let start = Instant::now();
+                let result = run_asr_request(
+                    &server,
+                    &model,
+                    audio_base64.as_str(),
+                    language.as_deref().map(|value| value.as_str()),
+                )
+                .await
+                .map(|response| AsrBenchSample {
+                    total_ms: start.elapsed().as_secs_f64() * 1000.0,
+                    response,
+                });
+                progress.inc(1);
+                result
+            }
+        })
+        .buffer_unordered(concurrent as usize)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    let wall_elapsed = wall_start.elapsed();
+
+    progress.finish_with_message("Benchmark complete");
+
+    let times: Vec<f64> = samples.iter().map(|sample| sample.total_ms).collect();
     let mut stage_samples = Vec::new();
     let mut saw_whisper_diagnostics = false;
-
-    for _ in 0..iterations {
-        let start = std::time::Instant::now();
-        let response = run_asr_request(server, model, &audio_base64, language).await?;
-        if let Some(diagnostics) = response.izwi_asr_diagnostics.as_ref() {
+    for sample in &samples {
+        if let Some(diagnostics) = sample.response.izwi_asr_diagnostics.as_ref() {
             if diagnostics
                 .get("model_family")
                 .and_then(|value| value.as_str())
@@ -459,16 +509,11 @@ async fn bench_asr(
             {
                 saw_whisper_diagnostics = true;
             }
-            if let Some(sample) = whisper_stage_timings_from_diagnostics(diagnostics) {
-                stage_samples.push(sample);
+            if let Some(stage_sample) = whisper_stage_timings_from_diagnostics(diagnostics) {
+                stage_samples.push(stage_sample);
             }
         }
-        let elapsed = start.elapsed().as_millis() as f64;
-        times.push(elapsed);
-        pb.inc(1);
     }
-
-    pb.finish_with_message("Benchmark complete");
 
     let avg = times.iter().sum::<f64>() / times.len() as f64;
     let min = times.iter().copied().fold(f64::INFINITY, f64::min);
@@ -478,13 +523,17 @@ async fn bench_asr(
     let p99 = percentile(&times, 0.99);
     println!("\n{}", console::style("Results:").bold().underlined());
     println!("  Iterations: {}", iterations);
+    println!("  Concurrent: {}", concurrent);
     println!("  Average:    {:.2} ms", avg);
     println!("  Min:        {:.2} ms", min);
     println!("  Max:        {:.2} ms", max);
     println!("  P50:        {:.2} ms", p50);
     println!("  P95:        {:.2} ms", p95);
     println!("  P99:        {:.2} ms", p99);
-    println!("  Throughput: {:.2} req/s", 1000.0 / avg);
+    println!(
+        "  Throughput: {:.2} req/s",
+        iterations as f64 / wall_elapsed.as_secs_f64()
+    );
     print_whisper_stage_timing_summary(&stage_samples);
 
     let model_lower = model.to_ascii_lowercase();
@@ -790,24 +839,34 @@ fn percentile(data: &[f64], p: f64) -> f64 {
 }
 
 async fn fetch_runtime_metrics(server: &str) -> Option<RuntimeTelemetrySnapshot> {
-    let client = http::client(Some(std::time::Duration::from_secs(3))).ok()?;
+    let client = http::client(Some(std::time::Duration::from_secs(15))).ok()?;
     let base = server.trim_end_matches('/');
-    for path in ["/internal/metrics", "/v1/metrics"] {
-        let response = match client.get(format!("{base}{path}")).send().await {
-            Ok(response) => response,
-            Err(_) => continue,
-        };
-        if !response.status().is_success() {
-            continue;
+
+    for attempt in 0..3 {
+        for path in ["/internal/metrics", "/v1/metrics"] {
+            let response = match client.get(format!("{base}{path}")).send().await {
+                Ok(response) => response,
+                Err(_) => continue,
+            };
+            if !response.status().is_success() {
+                continue;
+            }
+            if let Ok(metrics) = response.json::<RuntimeTelemetrySnapshot>().await {
+                return Some(metrics);
+            }
         }
-        if let Ok(metrics) = response.json::<RuntimeTelemetrySnapshot>().await {
-            return Some(metrics);
+
+        if attempt < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(250 * (attempt + 1))).await;
         }
     }
+
     None
 }
 
-fn whisper_stage_timings_from_diagnostics(diagnostics: &serde_json::Value) -> Option<WhisperStageTimings> {
+fn whisper_stage_timings_from_diagnostics(
+    diagnostics: &serde_json::Value,
+) -> Option<WhisperStageTimings> {
     let timings = diagnostics.get("timings_ms")?.as_object()?;
     Some(WhisperStageTimings {
         audio_decode: timings.get("audio_decode").and_then(|value| value.as_f64()),
@@ -898,12 +957,14 @@ fn print_runtime_delta(
     after: Option<RuntimeTelemetrySnapshot>,
     context: RuntimeTelemetryContext,
 ) {
-    let (Some(before), Some(after)) = (before, after) else {
+    let Some(after) = after else {
         println!(
             "\nRuntime telemetry delta: unavailable (/internal/metrics or /v1/metrics not reachable)"
         );
         return;
     };
+    let delta_available = before.is_some();
+    let before = before.unwrap_or_default();
 
     let completed_delta = after
         .requests_completed
@@ -920,12 +981,19 @@ fn print_runtime_delta(
             .underlined()
     );
     println!("  Note: rolling latency quantiles are runtime-wide, not run-local.");
-    println!("  Queued:             {}", queued_delta);
-    println!("  Completed:          {}", completed_delta);
-    println!("  Failed:             {}", failed_delta);
-    println!("  Active (current):   {}", after.requests_active);
-    println!("  Worker restarts:    {}", restart_delta);
-    println!("  Worker panics:      {}", panic_delta);
+    if !delta_available {
+        println!("  Note: pre-run snapshot was unavailable; counters below are post-run totals.");
+    }
+    let counter_suffix = if delta_available { "" } else { " (total)" };
+    println!("  Queued{}:             {}", counter_suffix, queued_delta);
+    println!(
+        "  Completed{}:          {}",
+        counter_suffix, completed_delta
+    );
+    println!("  Failed{}:             {}", counter_suffix, failed_delta);
+    println!("  Active (current):     {}", after.requests_active);
+    println!("  Worker restarts{}:    {}", counter_suffix, restart_delta);
+    println!("  Worker panics{}:      {}", counter_suffix, panic_delta);
     println!(
         "  Queue wait rolling(avg/p50/p95): {:.2} / {:.2} / {:.2} ms",
         after.queue_wait_ms_avg, after.queue_wait_ms_p50, after.queue_wait_ms_p95
@@ -1010,13 +1078,19 @@ fn print_runtime_delta(
         .saturating_sub(kernel_before.fused_attention_masked_fallback_total);
     let fused_mask_policy_disabled_delta = kernel_after
         .fused_attention_fallback_metal_sdpa_mask_policy_disabled_total
-        .saturating_sub(kernel_before.fused_attention_fallback_metal_sdpa_mask_policy_disabled_total);
+        .saturating_sub(
+            kernel_before.fused_attention_fallback_metal_sdpa_mask_policy_disabled_total,
+        );
     let fused_mask_shape_unsupported_delta = kernel_after
         .fused_attention_fallback_metal_sdpa_mask_shape_unsupported_total
-        .saturating_sub(kernel_before.fused_attention_fallback_metal_sdpa_mask_shape_unsupported_total);
+        .saturating_sub(
+            kernel_before.fused_attention_fallback_metal_sdpa_mask_shape_unsupported_total,
+        );
     let fused_mask_dtype_unsupported_delta = kernel_after
         .fused_attention_fallback_metal_sdpa_mask_dtype_unsupported_total
-        .saturating_sub(kernel_before.fused_attention_fallback_metal_sdpa_mask_dtype_unsupported_total);
+        .saturating_sub(
+            kernel_before.fused_attention_fallback_metal_sdpa_mask_dtype_unsupported_total,
+        );
     let decode_total = dense_decode_delta + paged_decode_delta;
     println!(
         "  Prefill path counts (token-mode/sequence-spans/sequence-tokens): {} / {} / {}",
