@@ -148,6 +148,7 @@ izwi bench asr --model parakeet-tdt-0.6b-v3 --file data/test.wav --iterations 3 
 izwi bench throughput --duration 10 --concurrent 2
 izwi --output-format json bench chat --iterations 5
 izwi --output-format json bench run benchmarks/local.toml
+izwi bench compare current.json baseline.json --tolerance-percent 5
 ```
 
 ### Config

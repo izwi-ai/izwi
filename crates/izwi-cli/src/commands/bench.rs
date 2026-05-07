@@ -290,6 +290,33 @@ struct BenchmarkSuiteCaseReport {
     report: BenchmarkReport,
 }
 
+#[derive(Debug, Serialize)]
+struct BenchmarkCompareReport {
+    schema_version: u32,
+    current: String,
+    baseline: String,
+    tolerance_percent: f64,
+    regressions: usize,
+    checks: Vec<BenchmarkComparison>,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchmarkComparison {
+    case: String,
+    metric: String,
+    baseline: f64,
+    current: f64,
+    change_percent: f64,
+    lower_is_better: bool,
+    status: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct ReportEntry {
+    name: String,
+    summary: serde_json::Value,
+}
+
 pub async fn execute(
     command: BenchCommands,
     server: &str,
@@ -362,6 +389,187 @@ pub async fn execute(
             .await
             .and_then(|report| emit_report(&options, &report)),
         BenchCommands::Run { manifest } => bench_manifest(server, &manifest, &options, theme).await,
+        BenchCommands::Compare {
+            current,
+            baseline,
+            tolerance_percent,
+        } => bench_compare(&current, &baseline, tolerance_percent, &options).await,
+    }
+}
+
+async fn bench_compare(
+    current_path: &Path,
+    baseline_path: &Path,
+    tolerance_percent: f64,
+    options: &BenchOptions,
+) -> Result<()> {
+    if !tolerance_percent.is_finite() || tolerance_percent < 0.0 {
+        return Err(CliError::InvalidInput(
+            "Comparison tolerance must be a non-negative percentage".to_string(),
+        ));
+    }
+
+    let current_value = read_json_report(current_path).await?;
+    let baseline_value = read_json_report(baseline_path).await?;
+    let current_reports = report_entries(&current_value)?;
+    let baseline_reports = report_entries(&baseline_value)?;
+    if current_reports.len() != baseline_reports.len() {
+        return Err(CliError::InvalidInput(format!(
+            "Report shape mismatch: current has {} case(s), baseline has {} case(s)",
+            current_reports.len(),
+            baseline_reports.len()
+        )));
+    }
+
+    let mut checks = Vec::new();
+    for (current, baseline) in current_reports.iter().zip(baseline_reports.iter()) {
+        let case = if current.name == baseline.name {
+            current.name.clone()
+        } else {
+            format!("{} vs {}", current.name, baseline.name)
+        };
+        collect_metric_comparisons(
+            &case,
+            &current.summary,
+            &baseline.summary,
+            tolerance_percent,
+            &mut checks,
+        );
+    }
+
+    if checks.is_empty() {
+        return Err(CliError::InvalidInput(
+            "No comparable benchmark summary metrics found".to_string(),
+        ));
+    }
+
+    let regressions = checks
+        .iter()
+        .filter(|check| check.status == "regression")
+        .count();
+    let report = BenchmarkCompareReport {
+        schema_version: 1,
+        current: current_path.display().to_string(),
+        baseline: baseline_path.display().to_string(),
+        tolerance_percent,
+        regressions,
+        checks,
+    };
+
+    emit_compare_report(options, &report)?;
+    if regressions > 0 {
+        return Err(CliError::Other(format!(
+            "Benchmark comparison failed: {regressions} regression(s) exceeded {tolerance_percent:.2}% tolerance"
+        )));
+    }
+
+    Ok(())
+}
+
+async fn read_json_report(path: &Path) -> Result<serde_json::Value> {
+    let text = tokio::fs::read_to_string(path)
+        .await
+        .map_err(CliError::Io)?;
+    serde_json::from_str(&text)
+        .map_err(|e| CliError::InvalidInput(format!("Invalid benchmark JSON report: {e}")))
+}
+
+fn report_entries(value: &serde_json::Value) -> Result<Vec<ReportEntry>> {
+    if let Some(reports) = value.get("reports").and_then(|value| value.as_array()) {
+        return reports
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let report = entry.get("report").ok_or_else(|| {
+                    CliError::InvalidInput("Suite report entry missing `report`".to_string())
+                })?;
+                let summary = report.get("summary").cloned().ok_or_else(|| {
+                    CliError::InvalidInput("Benchmark report missing `summary`".to_string())
+                })?;
+                let name = entry
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| report.get("command").and_then(|value| value.as_str()))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("case-{}", index + 1));
+                Ok(ReportEntry { name, summary })
+            })
+            .collect();
+    }
+
+    let summary = value
+        .get("summary")
+        .cloned()
+        .ok_or_else(|| CliError::InvalidInput("Benchmark report missing `summary`".to_string()))?;
+    let name = value
+        .get("command")
+        .and_then(|value| value.as_str())
+        .unwrap_or("benchmark")
+        .to_string();
+    Ok(vec![ReportEntry { name, summary }])
+}
+
+fn collect_metric_comparisons(
+    case: &str,
+    current: &serde_json::Value,
+    baseline: &serde_json::Value,
+    tolerance_percent: f64,
+    checks: &mut Vec<BenchmarkComparison>,
+) {
+    for (metric, path, lower_is_better) in [
+        ("latency_ms.p95", &["latency_ms", "p95"][..], true),
+        ("ttft_ms.p95", &["ttft_ms", "p95"][..], true),
+        ("end_to_end_ms.p95", &["end_to_end_ms", "p95"][..], true),
+        ("rtf.avg", &["rtf", "avg"][..], true),
+        ("throughput_rps", &["throughput_rps"][..], false),
+        ("completion_tps.p50", &["completion_tps", "p50"][..], false),
+        (
+            "tokens_per_second.p50",
+            &["tokens_per_second", "p50"][..],
+            false,
+        ),
+    ] {
+        let Some(current_value) = summary_metric(current, path) else {
+            continue;
+        };
+        let Some(baseline_value) = summary_metric(baseline, path) else {
+            continue;
+        };
+        let change_percent = percent_change(current_value, baseline_value);
+        let regression = if lower_is_better {
+            current_value > baseline_value * (1.0 + tolerance_percent / 100.0)
+        } else {
+            current_value < baseline_value * (1.0 - tolerance_percent / 100.0)
+        };
+        checks.push(BenchmarkComparison {
+            case: case.to_string(),
+            metric: metric.to_string(),
+            baseline: baseline_value,
+            current: current_value,
+            change_percent,
+            lower_is_better,
+            status: if regression { "regression" } else { "ok" },
+        });
+    }
+}
+
+fn summary_metric(summary: &serde_json::Value, path: &[&str]) -> Option<f64> {
+    let mut value = summary;
+    for key in path {
+        value = value.get(*key)?;
+    }
+    value.as_f64().filter(|value| value.is_finite())
+}
+
+fn percent_change(current: f64, baseline: f64) -> f64 {
+    if baseline == 0.0 {
+        if current == 0.0 {
+            0.0
+        } else {
+            f64::INFINITY
+        }
+    } else {
+        (current - baseline) * 100.0 / baseline
     }
 }
 
@@ -1607,6 +1815,37 @@ fn emit_suite_report(options: &BenchOptions, report: &BenchmarkSuiteReport) -> R
         })?;
         println!("{payload}");
     }
+    Ok(())
+}
+
+fn emit_compare_report(options: &BenchOptions, report: &BenchmarkCompareReport) -> Result<()> {
+    if matches!(options.output_format, OutputFormat::Json) {
+        let payload = serde_json::to_string_pretty(&report).map_err(|e| {
+            CliError::Other(format!("Failed to serialize benchmark comparison: {e}"))
+        })?;
+        println!("{payload}");
+        return Ok(());
+    }
+
+    println!(
+        "\n{}",
+        console::style("Benchmark Comparison:").bold().underlined()
+    );
+    println!("  Current:   {}", report.current);
+    println!("  Baseline:  {}", report.baseline);
+    println!("  Tolerance: {:.2}%", report.tolerance_percent);
+    for check in &report.checks {
+        let marker = if check.status == "regression" {
+            console::style("REGRESSION").red().to_string()
+        } else {
+            console::style("ok").green().to_string()
+        };
+        println!(
+            "  [{}] {} {}: current={:.4}, baseline={:.4}, change={:.2}%",
+            marker, check.case, check.metric, check.current, check.baseline, check.change_percent
+        );
+    }
+    println!("  Regressions: {}", report.regressions);
     Ok(())
 }
 

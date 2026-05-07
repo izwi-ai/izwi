@@ -21,6 +21,7 @@ izwi bench <COMMAND>
 | `asr` | Benchmark ASR inference |
 | `throughput` | Benchmark system throughput |
 | `run` | Run a benchmark manifest |
+| `compare` | Compare JSON reports and fail on regressions |
 
 ---
 
@@ -161,6 +162,18 @@ concurrent = 2
 ```
 
 Supported `command` values are `chat`, `tts`, `asr`, and `throughput`. Relative ASR file paths resolve from the manifest directory.
+
+---
+
+## izwi bench compare
+
+Compare a current JSON report against a baseline JSON report. The command exits with a non-zero status when any comparable metric regresses beyond the tolerance.
+
+```bash
+izwi bench compare current.json baseline.json --tolerance-percent 5
+```
+
+Supported inputs are single reports from `--output-format json` and suite reports from `izwi bench run`. Lower-is-better checks include p95 latency, p95 TTFT, p95 end-to-end latency, and average RTF. Higher-is-better checks include request throughput, chat completion TPS, and TTS tokens/sec when present.
 
 ---
 

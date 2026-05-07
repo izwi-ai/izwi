@@ -544,6 +544,19 @@ pub enum BenchCommands {
         #[arg(value_name = "PATH")]
         manifest: PathBuf,
     },
+
+    /// Compare benchmark JSON reports and fail on regressions
+    Compare {
+        /// Current benchmark report JSON
+        current: PathBuf,
+
+        /// Baseline benchmark report JSON
+        baseline: PathBuf,
+
+        /// Allowed regression tolerance as a percentage
+        #[arg(long, default_value = "5.0")]
+        tolerance_percent: f64,
+    },
 }
 
 #[derive(Subcommand)]
