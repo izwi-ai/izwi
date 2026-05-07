@@ -85,7 +85,12 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
     add_tag(
         doc,
         "Speech to Text",
-        "Preview persisted transcription and diarization workflows",
+        "Preview persisted transcription workflows",
+    );
+    add_tag(
+        doc,
+        "Diarization",
+        "Preview speaker diarization and speaker-labeling workflows",
     );
     add_tag(
         doc,
@@ -385,14 +390,14 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
     add_collection(
         paths,
         "/v1/diarizations",
-        "Speech to Text",
+        "Diarization",
         "Persisted diarization records",
         "List or create saved diarization records.",
     );
     add_get_patch_put_delete_member(
         paths,
         "/v1/diarizations/{record_id}",
-        "Speech to Text",
+        "Diarization",
         "Persisted diarization record",
         "Fetch, update, or delete a saved diarization record.",
         &[("record_id", "Diarization record identifier")],
@@ -401,7 +406,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         paths,
         "/v1/diarizations/{record_id}/audio",
         "get",
-        "Speech to Text",
+        "Diarization",
         "Fetch diarization audio",
         "Fetch stored diarization source audio.",
         &[("record_id", "Diarization record identifier")],
@@ -411,7 +416,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         paths,
         "/v1/diarizations/{record_id}/reruns",
         "post",
-        "Speech to Text",
+        "Diarization",
         "Rerun diarization record",
         "Re-run diarization from a saved record.",
         &[("record_id", "Diarization record identifier")],
@@ -421,7 +426,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         paths,
         "/v1/diarizations/{record_id}/cancel",
         "post",
-        "Speech to Text",
+        "Diarization",
         "Cancel diarization record",
         "Cancel an in-flight diarization record.",
         &[("record_id", "Diarization record identifier")],
@@ -431,7 +436,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         paths,
         "/v1/diarizations/{record_id}/summary/regenerate",
         "post",
-        "Speech to Text",
+        "Diarization",
         "Regenerate diarization summary",
         "Regenerate a diarization summary.",
         &[("record_id", "Diarization record identifier")],
@@ -1757,6 +1762,7 @@ mod tests {
             "OpenAI Compatible",
             "Admin",
             "Speech to Text",
+            "Diarization",
             "Text to Speech",
             "Studio",
             "Chat",
@@ -1796,6 +1802,7 @@ mod tests {
                 "post",
                 "Speech to Text",
             ),
+            ("/v1/diarizations/{record_id}/reruns", "post", "Diarization"),
             (
                 "/v1/text-to-speech-generations/{record_id}/audio",
                 "get",
