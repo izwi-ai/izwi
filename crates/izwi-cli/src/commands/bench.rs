@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use futures::{stream, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -441,8 +442,8 @@ async fn bench_compare(
 
     let current_value = read_json_report(current_path).await?;
     let baseline_value = read_json_report(baseline_path).await?;
-    let current_reports = report_entries(&current_value)?;
-    let baseline_reports = report_entries(&baseline_value)?;
+    let current_reports = report_entry_map(report_entries(&current_value)?, "Current")?;
+    let baseline_reports = report_entry_map(report_entries(&baseline_value)?, "Baseline")?;
     if current_reports.len() != baseline_reports.len() {
         return Err(CliError::InvalidInput(format!(
             "Report shape mismatch: current has {} case(s), baseline has {} case(s)",
@@ -450,16 +451,25 @@ async fn bench_compare(
             baseline_reports.len()
         )));
     }
+    let current_names: BTreeSet<_> = current_reports.keys().cloned().collect();
+    let baseline_names: BTreeSet<_> = baseline_reports.keys().cloned().collect();
+    if current_names != baseline_names {
+        let only_current: Vec<_> = current_names.difference(&baseline_names).cloned().collect();
+        let only_baseline: Vec<_> = baseline_names.difference(&current_names).cloned().collect();
+        return Err(CliError::InvalidInput(format!(
+            "Report case mismatch: only in current: {}; only in baseline: {}",
+            format_case_list(&only_current),
+            format_case_list(&only_baseline)
+        )));
+    }
 
     let mut checks = Vec::new();
-    for (current, baseline) in current_reports.iter().zip(baseline_reports.iter()) {
-        let case = if current.name == baseline.name {
-            current.name.clone()
-        } else {
-            format!("{} vs {}", current.name, baseline.name)
-        };
+    for (case, current) in &current_reports {
+        let baseline = baseline_reports
+            .get(case)
+            .expect("case set equality should guarantee baseline entry");
         collect_metric_comparisons(
-            &case,
+            case,
             &current.summary,
             &baseline.summary,
             tolerance_percent,
@@ -494,6 +504,30 @@ async fn bench_compare(
     }
 
     Ok(())
+}
+
+fn report_entry_map(
+    entries: Vec<ReportEntry>,
+    label: &str,
+) -> Result<BTreeMap<String, ReportEntry>> {
+    let mut map = BTreeMap::new();
+    for entry in entries {
+        let name = entry.name.clone();
+        if map.insert(name.clone(), entry).is_some() {
+            return Err(CliError::InvalidInput(format!(
+                "{label} report has duplicate benchmark case name `{name}`"
+            )));
+        }
+    }
+    Ok(map)
+}
+
+fn format_case_list(cases: &[String]) -> String {
+    if cases.is_empty() {
+        "none".to_string()
+    } else {
+        cases.join(", ")
+    }
 }
 
 async fn read_json_report(path: &Path) -> Result<serde_json::Value> {
@@ -2282,6 +2316,7 @@ fn print_runtime_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn chat_stream_event_records_first_delta_and_terminal_usage() {
@@ -2320,5 +2355,103 @@ mod tests {
         assert_eq!(sample.completion_tokens, 7);
         assert_eq!(sample.generation_time_ms, Some(123.0));
         assert!(sample.ttft_ms >= 0.0);
+    }
+
+    #[tokio::test]
+    async fn compare_matches_suite_cases_by_name_not_order() {
+        let dir = tempdir().expect("temp dir should be created");
+        let baseline = dir.path().join("baseline.json");
+        let current = dir.path().join("current.json");
+
+        let baseline_report = serde_json::json!({
+            "reports": [
+                {
+                    "name": "fast-case",
+                    "report": {
+                        "summary": {
+                            "latency_ms": { "p95": 100.0 }
+                        }
+                    }
+                },
+                {
+                    "name": "slow-case",
+                    "report": {
+                        "summary": {
+                            "latency_ms": { "p95": 1000.0 }
+                        }
+                    }
+                }
+            ]
+        });
+        let current_report = serde_json::json!({
+            "reports": [
+                {
+                    "name": "slow-case",
+                    "report": {
+                        "summary": {
+                            "latency_ms": { "p95": 1000.0 }
+                        }
+                    }
+                },
+                {
+                    "name": "fast-case",
+                    "report": {
+                        "summary": {
+                            "latency_ms": { "p95": 100.0 }
+                        }
+                    }
+                }
+            ]
+        });
+        std::fs::write(
+            &baseline,
+            serde_json::to_vec(&baseline_report).expect("baseline should serialize"),
+        )
+        .expect("baseline should be written");
+        std::fs::write(
+            &current,
+            serde_json::to_vec(&current_report).expect("current should serialize"),
+        )
+        .expect("current should be written");
+
+        bench_compare(
+            &current,
+            &baseline,
+            5.0,
+            &BenchOptions {
+                output_format: OutputFormat::Json,
+                quiet: true,
+            },
+        )
+        .await
+        .expect("reordered same-name suite cases should compare successfully");
+    }
+
+    #[test]
+    fn duplicate_suite_case_names_are_rejected() {
+        let report = serde_json::json!({
+            "reports": [
+                {
+                    "name": "duplicate",
+                    "report": {
+                        "summary": {
+                            "latency_ms": { "p95": 100.0 }
+                        }
+                    }
+                },
+                {
+                    "name": "duplicate",
+                    "report": {
+                        "summary": {
+                            "latency_ms": { "p95": 101.0 }
+                        }
+                    }
+                }
+            ]
+        });
+
+        let entries = report_entries(&report).expect("suite entries should parse");
+        let err = report_entry_map(entries, "Current").expect_err("duplicates should fail");
+        assert!(format!("{err}").contains("duplicate benchmark case name `duplicate`"));
     }
 }
