@@ -122,7 +122,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/live",
         "get",
         "Runtime",
-        "Versioned liveness probe",
+        "Check liveness",
         "Server process is alive.",
         ok_response(),
     );
@@ -131,7 +131,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/ready",
         "get",
         "Runtime",
-        "Versioned readiness probe",
+        "Check readiness",
         "Server readiness probe under the versioned namespace.",
         response_with_statuses(&[("200", "Ready"), ("503", "Alive but not ready")]),
     );
@@ -140,7 +140,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/health",
         "get",
         "Runtime",
-        "Runtime health details",
+        "Get health details",
         "Rich backend, device, dtype, CUDA, and fused-attention status used by izwi status.",
         ok_response(),
     );
@@ -149,7 +149,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/metrics",
         "get",
         "Runtime",
-        "Runtime telemetry snapshot",
+        "Get metrics",
         "JSON runtime telemetry snapshot.",
         ok_response(),
     );
@@ -158,7 +158,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/metrics/prometheus",
         "get",
         "Runtime",
-        "Prometheus metrics",
+        "Get Prometheus metrics",
         "Runtime telemetry in Prometheus text format.",
         ok_response(),
     );
@@ -167,7 +167,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/internal/health",
         "get",
         "Runtime",
-        "Internal health alias",
+        "Get internal health details",
         "Compatibility alias for rich runtime health.",
         ok_response(),
     );
@@ -176,7 +176,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/internal/live",
         "get",
         "Runtime",
-        "Internal liveness alias",
+        "Check internal liveness",
         "Compatibility alias for liveness.",
         ok_response(),
     );
@@ -185,7 +185,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/internal/ready",
         "get",
         "Runtime",
-        "Internal readiness alias",
+        "Check internal readiness",
         "Compatibility alias for readiness.",
         response_with_statuses(&[("200", "Ready"), ("503", "Alive but not ready")]),
     );
@@ -194,7 +194,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/internal/metrics",
         "get",
         "Runtime",
-        "Internal metrics alias",
+        "Get internal metrics",
         "Compatibility alias for JSON runtime telemetry.",
         ok_response(),
     );
@@ -203,7 +203,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/internal/metrics/prometheus",
         "get",
         "Runtime",
-        "Internal Prometheus metrics alias",
+        "Get internal Prometheus metrics",
         "Compatibility alias for Prometheus runtime telemetry.",
         ok_response(),
     );
@@ -240,7 +240,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         paths,
         "/v1/admin/models/{variant}",
         "Admin",
-        "Model variant",
+        "model variant",
         "Fetch or delete local model variant state.",
         &[("variant", "Model variant identifier")],
     );
@@ -299,14 +299,15 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         paths,
         "/v1/transcriptions/jobs",
         "Speech to Text",
-        "Speech-text jobs",
+        "speech-to-text jobs",
+        "speech-to-text job",
         "List or create canonical saved transcription and diarization jobs.",
     );
     add_get_patch_put_delete_member(
         paths,
         "/v1/transcriptions/jobs/{record_id}",
         "Speech to Text",
-        "Speech-text job",
+        "speech-to-text job",
         "Fetch, update, or delete a canonical saved speech-text job.",
         &[("record_id", "Speech-text job identifier")],
     );
@@ -315,7 +316,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/transcriptions/jobs/{record_id}/audio",
         "get",
         "Speech to Text",
-        "Fetch speech-text job audio",
+        "Download speech-to-text job audio",
         "Fetch stored source audio for a speech-text job.",
         &[("record_id", "Speech-text job identifier")],
         binary_response(),
@@ -325,7 +326,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/transcriptions/jobs/{record_id}/reruns",
         "post",
         "Speech to Text",
-        "Rerun diarization job",
+        "Rerun speech-to-text job",
         "Re-run diarization from stored source audio.",
         &[("record_id", "Speech-text job identifier")],
         preview_response(),
@@ -335,7 +336,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/transcriptions/jobs/{record_id}/cancel",
         "post",
         "Speech to Text",
-        "Cancel diarization job",
+        "Cancel speech-to-text job",
         "Cancel an in-flight diarization job.",
         &[("record_id", "Speech-text job identifier")],
         preview_response(),
@@ -345,7 +346,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/transcriptions/jobs/{record_id}/summary/regenerate",
         "post",
         "Speech to Text",
-        "Regenerate speech-text summary",
+        "Regenerate speech-to-text summary",
         "Regenerate a transcription or diarization summary.",
         &[("record_id", "Speech-text job identifier")],
         preview_response(),
@@ -355,14 +356,15 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         paths,
         "/v1/transcriptions",
         "Speech to Text",
-        "Legacy transcription records",
+        "transcription records",
+        "transcription record",
         "Legacy transcription-only list/create route family.",
     );
     add_get_delete_member(
         paths,
         "/v1/transcriptions/{record_id}",
         "Speech to Text",
-        "Legacy transcription record",
+        "transcription record",
         "Fetch or delete a transcription-only record.",
         &[("record_id", "Transcription record identifier")],
     );
@@ -371,7 +373,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/transcriptions/{record_id}/audio",
         "get",
         "Speech to Text",
-        "Fetch transcription audio",
+        "Download transcription audio",
         "Fetch stored transcription source audio.",
         &[("record_id", "Transcription record identifier")],
         binary_response(),
@@ -391,14 +393,15 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         paths,
         "/v1/diarizations",
         "Diarization",
-        "Persisted diarization records",
+        "diarization records",
+        "diarization record",
         "List or create saved diarization records.",
     );
     add_get_patch_put_delete_member(
         paths,
         "/v1/diarizations/{record_id}",
         "Diarization",
-        "Persisted diarization record",
+        "diarization record",
         "Fetch, update, or delete a saved diarization record.",
         &[("record_id", "Diarization record identifier")],
     );
@@ -407,7 +410,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/diarizations/{record_id}/audio",
         "get",
         "Diarization",
-        "Fetch diarization audio",
+        "Download diarization audio",
         "Fetch stored diarization source audio.",
         &[("record_id", "Diarization record identifier")],
         binary_response(),
@@ -446,30 +449,31 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
     add_speech_generation_family(
         paths,
         "/v1/text-to-speech-generations",
-        "Text-to-speech generations",
+        "text-to-speech generations",
     );
     add_speech_generation_family(
         paths,
         "/v1/voice-design-generations",
-        "Voice design generations",
+        "voice design generations",
     );
     add_speech_generation_family(
         paths,
         "/v1/voice-clone-generations",
-        "Voice clone generations",
+        "voice clone generations",
     );
     add_collection(
         paths,
         "/v1/voices",
         "Text to Speech",
-        "Saved voices",
+        "saved voices",
+        "saved voice",
         "List or create reusable saved voice references.",
     );
     add_get_delete_member(
         paths,
         "/v1/voices/{voice_id}",
         "Text to Speech",
-        "Saved voice",
+        "saved voice",
         "Fetch or delete saved voice metadata.",
         &[("voice_id", "Saved voice identifier")],
     );
@@ -478,7 +482,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/voices/{voice_id}/audio",
         "get",
         "Text to Speech",
-        "Fetch saved voice audio",
+        "Download saved voice audio",
         "Fetch saved voice reference audio.",
         &[("voice_id", "Saved voice identifier")],
         binary_response(),
@@ -489,6 +493,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/studio/folders",
         "Studio",
         "Studio folders",
+        "Studio folder",
         "List or create Studio project folders.",
     );
     add_collection(
@@ -496,6 +501,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/studio/projects",
         "Studio",
         "Studio projects",
+        "Studio project",
         "List or create Studio projects.",
     );
     add_get_patch_delete_member(
@@ -511,7 +517,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/studio/projects/{project_id}/audio",
         "get",
         "Studio",
-        "Fetch Studio project audio",
+        "Download Studio project audio",
         "Fetch combined or selected Studio project audio.",
         &[("project_id", "Studio project identifier")],
         binary_response(),
@@ -521,7 +527,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/studio/projects/{project_id}/meta",
         "get",
         "Studio",
-        "Fetch Studio project metadata",
+        "Get Studio project metadata",
         "Fetch Studio project metadata.",
         &[("project_id", "Studio project identifier")],
         preview_response(),
@@ -541,6 +547,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/studio/projects/{project_id}/pronunciations",
         "Studio",
         "Studio pronunciations",
+        "Studio pronunciation",
         "List or create pronunciation overrides.",
         &[("project_id", "Studio project identifier")],
     );
@@ -562,6 +569,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/studio/projects/{project_id}/snapshots",
         "Studio",
         "Studio snapshots",
+        "Studio snapshot",
         "List or create project snapshots.",
         &[("project_id", "Studio project identifier")],
     );
@@ -583,6 +591,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/studio/projects/{project_id}/render-jobs",
         "Studio",
         "Studio render jobs",
+        "Studio render job",
         "List or create render jobs.",
         &[("project_id", "Studio project identifier")],
     );
@@ -661,7 +670,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/studio/projects/{project_id}/segments/bulk-delete",
         "post",
         "Studio",
-        "Bulk delete Studio segments",
+        "Delete Studio segments in bulk",
         "Bulk delete Studio project segments.",
         &[("project_id", "Studio project identifier")],
         preview_response(),
@@ -684,14 +693,15 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         paths,
         "/v1/chat/threads",
         "Chat",
-        "Chat threads",
+        "chat threads",
+        "chat thread",
         "List or create durable local chat threads.",
     );
     add_get_patch_delete_member(
         paths,
         "/v1/chat/threads/{thread_id}",
         "Chat",
-        "Chat thread",
+        "chat thread",
         "Fetch, update, or delete a chat thread.",
         &[("thread_id", "Chat thread identifier")],
     );
@@ -699,7 +709,8 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         paths,
         "/v1/chat/threads/{thread_id}/messages",
         "Chat",
-        "Chat thread messages",
+        "chat messages",
+        "chat message",
         "List messages or send a new user message.",
         &[("thread_id", "Chat thread identifier")],
     );
@@ -717,7 +728,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/agent/sessions/{session_id}",
         "get",
         "Chat",
-        "Fetch agent session",
+        "Get agent session",
         "Fetch retained process-local agent session metadata.",
         &[("session_id", "Agent session identifier")],
         preview_response(),
@@ -738,7 +749,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/voice/profile",
         "get",
         "Voice",
-        "Fetch voice profile",
+        "Get voice profile",
         "Fetch voice profile settings.",
         preview_response(),
     );
@@ -793,7 +804,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/voice/sessions/{session_id}",
         "get",
         "Voice",
-        "Fetch voice session",
+        "Get voice session",
         "Fetch one persisted voice session.",
         &[("session_id", "Voice session identifier")],
         preview_response(),
@@ -804,7 +815,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/media/{path}",
         "get",
         "Media",
-        "Fetch local media",
+        "Download media",
         "Fetch persisted local media by relative path.",
         &[("path", "Relative media path")],
         binary_response(),
@@ -814,7 +825,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/onboarding",
         "get",
         "Preferences",
-        "Fetch onboarding state",
+        "Get onboarding state",
         "Fetch first-run onboarding state.",
         preview_response(),
     );
@@ -832,7 +843,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/preferences",
         "get",
         "Preferences",
-        "Fetch preferences",
+        "Get preferences",
         "Fetch user preferences.",
         preview_response(),
     );
@@ -851,7 +862,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/transcription/realtime/ws",
         "get",
         "Realtime",
-        "Transcription realtime WebSocket",
+        "Open transcription realtime WebSocket",
         "Upgrade to the preview transcription realtime WebSocket protocol.",
         websocket_response(),
     );
@@ -860,18 +871,24 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/voice/realtime/ws",
         "get",
         "Realtime",
-        "Voice realtime WebSocket",
+        "Open voice realtime WebSocket",
         "Upgrade to the preview voice realtime WebSocket protocol.",
         websocket_response(),
     );
 }
 
-fn add_speech_generation_family(paths: &mut Map<String, Value>, family_path: &str, label: &str) {
+fn add_speech_generation_family(
+    paths: &mut Map<String, Value>,
+    family_path: &str,
+    plural_label: &str,
+) {
+    let singular_label = plural_label.strip_suffix('s').unwrap_or(plural_label);
     add_collection(
         paths,
         family_path,
         "Text to Speech",
-        label,
+        plural_label,
+        singular_label,
         "List or create persisted speech generation records.",
     );
     let member = format!("{family_path}/{{record_id}}");
@@ -880,7 +897,7 @@ fn add_speech_generation_family(paths: &mut Map<String, Value>, family_path: &st
         paths,
         &member,
         "Text to Speech",
-        &format!("{label} record"),
+        singular_label,
         "Fetch or delete a persisted speech generation record.",
         &[("record_id", "Speech generation record identifier")],
     );
@@ -889,7 +906,7 @@ fn add_speech_generation_family(paths: &mut Map<String, Value>, family_path: &st
         &audio,
         "get",
         "Text to Speech",
-        &format!("Fetch {label} audio"),
+        &format!("Download {singular_label} audio"),
         "Fetch generated speech audio.",
         &[("record_id", "Speech generation record identifier")],
         binary_response(),
@@ -900,7 +917,8 @@ fn add_collection(
     paths: &mut Map<String, Value>,
     path: &str,
     tag: &str,
-    summary: &str,
+    plural_label: &str,
+    singular_label: &str,
     description: &str,
 ) {
     add_operation(
@@ -908,7 +926,7 @@ fn add_collection(
         path,
         "get",
         tag,
-        summary,
+        &format!("List {plural_label}"),
         description,
         preview_response(),
     );
@@ -917,7 +935,7 @@ fn add_collection(
         path,
         "post",
         tag,
-        summary,
+        &format!("Create {singular_label}"),
         description,
         preview_response(),
     );
@@ -927,7 +945,8 @@ fn add_collection_with_params(
     paths: &mut Map<String, Value>,
     path: &str,
     tag: &str,
-    summary: &str,
+    plural_label: &str,
+    singular_label: &str,
     description: &str,
     params: &[(&str, &str)],
 ) {
@@ -936,7 +955,7 @@ fn add_collection_with_params(
         path,
         "get",
         tag,
-        summary,
+        &format!("List {plural_label}"),
         description,
         params,
         preview_response(),
@@ -946,7 +965,7 @@ fn add_collection_with_params(
         path,
         "post",
         tag,
-        summary,
+        &format!("Create {singular_label}"),
         description,
         params,
         preview_response(),
@@ -957,7 +976,7 @@ fn add_get_delete_member(
     paths: &mut Map<String, Value>,
     path: &str,
     tag: &str,
-    summary: &str,
+    label: &str,
     description: &str,
     params: &[(&str, &str)],
 ) {
@@ -966,7 +985,7 @@ fn add_get_delete_member(
         path,
         "get",
         tag,
-        summary,
+        &format!("Get {label}"),
         description,
         params,
         preview_response(),
@@ -976,7 +995,7 @@ fn add_get_delete_member(
         path,
         "delete",
         tag,
-        summary,
+        &format!("Delete {label}"),
         description,
         params,
         preview_response(),
@@ -987,7 +1006,7 @@ fn add_get_patch_delete_member(
     paths: &mut Map<String, Value>,
     path: &str,
     tag: &str,
-    summary: &str,
+    label: &str,
     description: &str,
     params: &[(&str, &str)],
 ) {
@@ -996,7 +1015,7 @@ fn add_get_patch_delete_member(
         path,
         "get",
         tag,
-        summary,
+        &format!("Get {label}"),
         description,
         params,
         preview_response(),
@@ -1006,7 +1025,7 @@ fn add_get_patch_delete_member(
         path,
         "patch",
         tag,
-        summary,
+        &format!("Update {label}"),
         description,
         params,
         preview_response(),
@@ -1016,7 +1035,7 @@ fn add_get_patch_delete_member(
         path,
         "delete",
         tag,
-        summary,
+        &format!("Delete {label}"),
         description,
         params,
         preview_response(),
@@ -1027,7 +1046,7 @@ fn add_get_patch_put_delete_member(
     paths: &mut Map<String, Value>,
     path: &str,
     tag: &str,
-    summary: &str,
+    label: &str,
     description: &str,
     params: &[(&str, &str)],
 ) {
@@ -1036,7 +1055,7 @@ fn add_get_patch_put_delete_member(
         path,
         "get",
         tag,
-        summary,
+        &format!("Get {label}"),
         description,
         params,
         preview_response(),
@@ -1046,7 +1065,7 @@ fn add_get_patch_put_delete_member(
         path,
         "patch",
         tag,
-        summary,
+        &format!("Update {label}"),
         description,
         params,
         preview_response(),
@@ -1056,7 +1075,7 @@ fn add_get_patch_put_delete_member(
         path,
         "put",
         tag,
-        summary,
+        &format!("Replace {label}"),
         description,
         params,
         preview_response(),
@@ -1066,7 +1085,7 @@ fn add_get_patch_put_delete_member(
         path,
         "delete",
         tag,
-        summary,
+        &format!("Delete {label}"),
         description,
         params,
         preview_response(),
@@ -1204,6 +1223,7 @@ fn response_with_statuses(statuses: &[(&str, &str)]) -> Value {
     get,
     path = "/livez",
     tag = "Runtime",
+    summary = "Check liveness",
     responses(
         (status = 200, description = "Server process is alive", body = LiveResponse)
     )
@@ -1215,6 +1235,7 @@ fn livez() {}
     get,
     path = "/readyz",
     tag = "Runtime",
+    summary = "Check readiness",
     responses(
         (status = 200, description = "Server is ready to serve requests", body = ReadyResponse),
         (status = 503, description = "Server is alive but not ready", body = ReadyResponse)
@@ -1227,6 +1248,7 @@ fn readyz() {}
     get,
     path = "/v1/models",
     tag = "OpenAI Compatible",
+    summary = "List models",
     responses(
         (status = 200, description = "List locally available OpenAI-compatible models", body = OpenAiModelsResponse),
         (status = 500, description = "Server error", body = ApiErrorEnvelope)
@@ -1239,6 +1261,7 @@ fn list_models() {}
     get,
     path = "/v1/models/{model}",
     tag = "OpenAI Compatible",
+    summary = "Get model",
     params(
         ("model" = String, Path, description = "Model identifier")
     ),
@@ -1255,6 +1278,7 @@ fn get_model() {}
     post,
     path = "/v1/chat/completions",
     tag = "OpenAI Compatible",
+    summary = "Create chat completion",
     request_body = ChatCompletionRequest,
     responses(
         (status = 200, description = "Chat completion JSON when stream is false; server-sent events when stream is true", body = ChatCompletionResponse),
@@ -1269,6 +1293,7 @@ fn create_chat_completion() {}
     post,
     path = "/v1/audio/speech",
     tag = "OpenAI Compatible",
+    summary = "Create speech",
     request_body = SpeechRequest,
     responses(
         (status = 200, description = "Generated audio bytes, or server-sent audio events when stream_format is sse"),
@@ -1283,6 +1308,7 @@ fn create_speech() {}
     post,
     path = "/v1/audio/transcriptions",
     tag = "OpenAI Compatible",
+    summary = "Create transcription",
     request_body(content = TranscriptionMultipartRequest, content_type = "multipart/form-data"),
     responses(
         (status = 200, description = "Transcription result as JSON, verbose JSON, text, SRT, VTT, or server-sent events", body = TranscriptionResponse),
@@ -1297,6 +1323,7 @@ fn create_transcription() {}
     post,
     path = "/v1/responses",
     tag = "OpenAI Compatible",
+    summary = "Create response",
     request_body = ResponsesCreateRequest,
     responses(
         (status = 200, description = "Preview process-local response object, or server-sent events when stream is true", body = ResponseObject),
@@ -1311,6 +1338,7 @@ fn create_response() {}
     get,
     path = "/v1/responses/{response_id}",
     tag = "OpenAI Compatible",
+    summary = "Get response",
     params(
         ("response_id" = String, Path, description = "Process-local response identifier")
     ),
@@ -1326,6 +1354,7 @@ fn get_response() {}
     delete,
     path = "/v1/responses/{response_id}",
     tag = "OpenAI Compatible",
+    summary = "Delete response",
     params(
         ("response_id" = String, Path, description = "Process-local response identifier")
     ),
@@ -1341,6 +1370,7 @@ fn delete_response() {}
     post,
     path = "/v1/responses/{response_id}/cancel",
     tag = "OpenAI Compatible",
+    summary = "Cancel response",
     params(
         ("response_id" = String, Path, description = "Process-local response identifier")
     ),
@@ -1356,6 +1386,7 @@ fn cancel_response() {}
     get,
     path = "/v1/responses/{response_id}/input_items",
     tag = "OpenAI Compatible",
+    summary = "List response input items",
     params(
         ("response_id" = String, Path, description = "Process-local response identifier")
     ),
@@ -1841,6 +1872,120 @@ mod tests {
             for tag in operation["tags"].as_array().into_iter().flatten() {
                 let tag = tag.as_str().expect("operation tags should be strings");
                 assert!(!tag.contains('-'), "{tag} should not contain hyphens");
+            }
+        }
+    }
+
+    #[test]
+    fn openapi_uses_action_first_sidebar_summaries() {
+        let openapi = document();
+        let paths = openapi["paths"].as_object().expect("paths should exist");
+
+        let expected = [
+            ("/v1/audio/speech", "post", "Create speech"),
+            ("/v1/responses/{response_id}", "get", "Get response"),
+            ("/v1/transcriptions/jobs", "get", "List speech-to-text jobs"),
+            (
+                "/v1/transcriptions/jobs",
+                "post",
+                "Create speech-to-text job",
+            ),
+            ("/v1/diarizations", "get", "List diarization records"),
+            ("/v1/diarizations", "post", "Create diarization record"),
+            (
+                "/v1/diarizations/{record_id}",
+                "put",
+                "Replace diarization record",
+            ),
+            (
+                "/v1/text-to-speech-generations",
+                "get",
+                "List text-to-speech generations",
+            ),
+            (
+                "/v1/text-to-speech-generations/{record_id}",
+                "delete",
+                "Delete text-to-speech generation",
+            ),
+            ("/v1/voices/{voice_id}", "get", "Get saved voice"),
+            (
+                "/v1/studio/projects/{project_id}/audio",
+                "get",
+                "Download Studio project audio",
+            ),
+            (
+                "/v1/chat/threads/{thread_id}/messages",
+                "post",
+                "Create chat message",
+            ),
+            (
+                "/v1/voice/realtime/ws",
+                "get",
+                "Open voice realtime WebSocket",
+            ),
+        ];
+
+        for (path, method, summary) in expected {
+            let actual = paths
+                .get(path)
+                .and_then(|operations| operations.get(method))
+                .and_then(|operation| operation["summary"].as_str())
+                .unwrap_or_else(|| panic!("{method} {path} should have a summary"));
+            assert_eq!(actual, summary, "{method} {path} summary should match");
+        }
+
+        let allowed_prefixes: HashSet<&str> = [
+            "Cancel",
+            "Check",
+            "Clear",
+            "Complete",
+            "Create",
+            "Delete",
+            "Download",
+            "Get",
+            "List",
+            "Load",
+            "Merge",
+            "Open",
+            "Regenerate",
+            "Render",
+            "Reorder",
+            "Replace",
+            "Restore",
+            "Rerun",
+            "Split",
+            "Start",
+            "Stream",
+            "Unload",
+            "Update",
+        ]
+        .into_iter()
+        .collect();
+
+        for (path, operations) in paths {
+            for (method, operation) in operations
+                .as_object()
+                .expect("path operations should be an object")
+            {
+                let summary = operation["summary"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{method} {path} should have a summary"));
+                assert!(
+                    !summary.starts_with('/'),
+                    "{method} {path} should not use a raw path as the sidebar label"
+                );
+                assert!(
+                    !summary.contains('{'),
+                    "{method} {path} should not expose path parameters in the sidebar label"
+                );
+                let first_word = summary
+                    .split_whitespace()
+                    .next()
+                    .expect("summary should not be empty");
+                assert!(
+                    allowed_prefixes.contains(first_word),
+                    "{method} {path} summary should start with an approved action verb: {summary}"
+                );
             }
         }
     }
