@@ -543,6 +543,10 @@ pub enum BenchCommands {
         /// Benchmark manifest path (TOML)
         #[arg(value_name = "PATH")]
         manifest: PathBuf,
+
+        /// Directory to write report, manifest, metadata, and observability artifacts
+        #[arg(long, value_name = "DIR")]
+        artifact_dir: Option<PathBuf>,
     },
 
     /// Compare benchmark JSON reports and fail on regressions

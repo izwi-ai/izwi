@@ -135,6 +135,7 @@ Run a TOML benchmark manifest with one or more benchmark cases.
 
 ```bash
 izwi bench run benchmarks/local.toml
+izwi bench run benchmarks/local.toml --artifact-dir benchmarks/results/run-001
 ```
 
 ### Manifest Format
@@ -162,6 +163,13 @@ concurrent = 2
 ```
 
 Supported `command` values are `chat`, `tts`, `asr`, and `throughput`. Relative ASR file paths resolve from the manifest directory.
+
+When `--artifact-dir` is provided, the CLI writes:
+
+- `report.json` — suite report with all case summaries and samples
+- `manifest.toml` — copied manifest text
+- `metadata.json` — CLI version, git SHA when available, platform, server, and run timestamps
+- `observability.json` — before/after `/v1/health`, metrics JSON, and Prometheus telemetry snapshots
 
 ---
 

@@ -291,6 +291,33 @@ struct BenchmarkSuiteCaseReport {
 }
 
 #[derive(Debug, Serialize)]
+struct BenchmarkArtifactMetadata {
+    schema_version: u32,
+    cli_version: &'static str,
+    server: String,
+    manifest: String,
+    git_sha: Option<String>,
+    os: &'static str,
+    arch: &'static str,
+    started_at: DateTime<Utc>,
+    ended_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchmarkObservabilityBundle {
+    before: ObservabilitySnapshot,
+    after: ObservabilitySnapshot,
+}
+
+#[derive(Debug, Serialize)]
+struct ObservabilitySnapshot {
+    captured_at: DateTime<Utc>,
+    health: Option<serde_json::Value>,
+    metrics: Option<serde_json::Value>,
+    prometheus: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct BenchmarkCompareReport {
     schema_version: u32,
     current: String,
@@ -388,7 +415,10 @@ pub async fn execute(
         } => bench_throughput(server, duration, concurrent, &options, theme)
             .await
             .and_then(|report| emit_report(&options, &report)),
-        BenchCommands::Run { manifest } => bench_manifest(server, &manifest, &options, theme).await,
+        BenchCommands::Run {
+            manifest,
+            artifact_dir,
+        } => bench_manifest(server, &manifest, artifact_dir.as_deref(), &options, theme).await,
         BenchCommands::Compare {
             current,
             baseline,
@@ -576,6 +606,7 @@ fn percent_change(current: f64, baseline: f64) -> f64 {
 async fn bench_manifest(
     server: &str,
     manifest_path: &Path,
+    artifact_dir: Option<&Path>,
     options: &BenchOptions,
     theme: &Theme,
 ) -> Result<()> {
@@ -592,6 +623,7 @@ async fn bench_manifest(
 
     let suite_server = manifest.server.as_deref().unwrap_or(server).to_string();
     let started_at = Utc::now();
+    let observability_before = capture_observability(&suite_server).await;
     let manifest_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
     let mut reports = Vec::new();
 
@@ -698,14 +730,39 @@ async fn bench_manifest(
         });
     }
 
+    let ended_at = Utc::now();
+    let observability_after = capture_observability(&suite_server).await;
     let suite = BenchmarkSuiteReport {
         schema_version: 1,
         manifest: manifest_path.display().to_string(),
-        server: suite_server,
+        server: suite_server.clone(),
         started_at,
-        ended_at: Utc::now(),
+        ended_at,
         reports,
     };
+    if let Some(artifact_dir) = artifact_dir {
+        write_artifact_bundle(
+            artifact_dir,
+            &suite,
+            &manifest_text,
+            BenchmarkArtifactMetadata {
+                schema_version: 1,
+                cli_version: env!("CARGO_PKG_VERSION"),
+                server: suite_server,
+                manifest: manifest_path.display().to_string(),
+                git_sha: current_git_sha(),
+                os: std::env::consts::OS,
+                arch: std::env::consts::ARCH,
+                started_at,
+                ended_at,
+            },
+            BenchmarkObservabilityBundle {
+                before: observability_before,
+                after: observability_after,
+            },
+        )
+        .await?;
+    }
     emit_suite_report(options, &suite)?;
 
     if options.human_output() {
@@ -714,9 +771,80 @@ async fn bench_manifest(
             console::style("Manifest").bold(),
             suite.reports.len()
         );
+        if let Some(artifact_dir) = artifact_dir {
+            println!("  Artifacts: {}", artifact_dir.display());
+        }
     }
 
     Ok(())
+}
+
+async fn capture_observability(server: &str) -> ObservabilitySnapshot {
+    let metrics = match fetch_json(server, "/internal/metrics").await {
+        Some(value) => Some(value),
+        None => fetch_json(server, "/v1/metrics").await,
+    };
+    let prometheus = match fetch_text(server, "/internal/metrics/prometheus").await {
+        Some(value) => Some(value),
+        None => fetch_text(server, "/v1/metrics/prometheus").await,
+    };
+    ObservabilitySnapshot {
+        captured_at: Utc::now(),
+        health: fetch_json(server, "/v1/health").await,
+        metrics,
+        prometheus,
+    }
+}
+
+async fn fetch_json(server: &str, path: &str) -> Option<serde_json::Value> {
+    let text = fetch_text(server, path).await?;
+    serde_json::from_str(&text).ok()
+}
+
+async fn fetch_text(server: &str, path: &str) -> Option<String> {
+    let client = http::client(Some(std::time::Duration::from_secs(10))).ok()?;
+    let base = server.trim_end_matches('/');
+    let response = client.get(format!("{base}{path}")).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response.text().await.ok()
+}
+
+async fn write_artifact_bundle(
+    artifact_dir: &Path,
+    suite: &BenchmarkSuiteReport,
+    manifest_text: &str,
+    metadata: BenchmarkArtifactMetadata,
+    observability: BenchmarkObservabilityBundle,
+) -> Result<()> {
+    tokio::fs::create_dir_all(artifact_dir)
+        .await
+        .map_err(CliError::Io)?;
+    write_json_artifact(artifact_dir.join("report.json"), suite).await?;
+    write_json_artifact(artifact_dir.join("metadata.json"), &metadata).await?;
+    write_json_artifact(artifact_dir.join("observability.json"), &observability).await?;
+    tokio::fs::write(artifact_dir.join("manifest.toml"), manifest_text)
+        .await
+        .map_err(CliError::Io)?;
+    Ok(())
+}
+
+async fn write_json_artifact<T: Serialize>(path: std::path::PathBuf, value: &T) -> Result<()> {
+    let payload = serde_json::to_vec_pretty(value)
+        .map_err(|e| CliError::Other(format!("Failed to serialize artifact: {e}")))?;
+    tokio::fs::write(path, payload).await.map_err(CliError::Io)
+}
+
+fn current_git_sha() -> Option<String> {
+    std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 async fn bench_chat(
