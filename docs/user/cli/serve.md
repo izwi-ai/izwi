@@ -21,7 +21,10 @@ The server also serves a local API reference:
 - Scalar API reference: `http://<host>:<port>/docs`
 - OpenAPI JSON: `http://<host>:<port>/openapi.json`
 
-Preview endpoints are labeled in the API reference.
+The local Scalar/OpenAPI reference covers the stable OpenAI-compatible contract,
+the `/v1/responses` preview contract, readiness probes, and sidebar entries for
+preview first-party, operator, and realtime route families. Detailed route
+behavior is documented in the [API Reference](../api.md).
 
 Resolution order for serve/runtime settings is:
 

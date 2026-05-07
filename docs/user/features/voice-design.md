@@ -139,6 +139,11 @@ curl -X POST http://localhost:8080/v1/audio/speech \
   --output designed.wav
 ```
 
+Voice design generation history is also available through
+`/v1/voice-design-generations`. See the
+[API Reference](../api.md#speech-generation-history) for the persisted route
+family and `/v1/audio/speech` streaming details.
+
 ---
 
 ## Available Models

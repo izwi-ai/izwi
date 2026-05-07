@@ -34,7 +34,7 @@ Transcribes audio files to text using automatic speech recognition (ASR). Suppor
 | `-l, --language <LANG>` | Language hint (e.g., `en`, `es`) | Auto-detect |
 | `-f, --format <FORMAT>` | Output format: `text`, `json`, `verbose_json` | `text` |
 | `-o, --output <PATH>` | Output file (default: stdout) | — |
-| `--word-timestamps` | Include word-level timestamps | — |
+| `--word-timestamps` | Future-compatible flag; current server warns and ignores it | — |
 
 ---
 
@@ -104,12 +104,15 @@ Hello, this is a transcription test.
   "text": "Hello, this is a transcription test.",
   "language": "en",
   "duration": 3.5,
-  "words": [
-    {"word": "Hello", "start": 0.0, "end": 0.5},
-    {"word": "this", "start": 0.6, "end": 0.8}
-  ]
+  "processing_time_ms": 812.4,
+  "rtf": 0.23,
+  "izwi_asr_diagnostics": null
 }
 ```
+
+`--word-timestamps` is accepted by the CLI for future compatibility, but the
+current server warns that word-level timestamps are not yet supported and ignores
+the option.
 
 ---
 

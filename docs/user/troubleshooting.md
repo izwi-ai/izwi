@@ -355,6 +355,9 @@ Check the endpoint URL:
 - Transcription: `POST /v1/audio/transcriptions`
 - Chat: `POST /v1/chat/completions`
 
+For the full route list, including preview first-party APIs, admin routes, and
+realtime WebSockets, see the [API Reference](./api.md).
+
 ### 500 Internal Server Error
 
 Check server logs:

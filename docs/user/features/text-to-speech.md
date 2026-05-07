@@ -144,6 +144,11 @@ POST /v1/audio/speech
 
 Binary audio data with appropriate `Content-Type` header.
 
+Set `stream` to `true` or `stream_format` to `sse` to receive server-sent
+audio events instead of one binary response. See the
+[API Reference](../api.md#audio-speech) for streaming event shapes,
+voice-cloning fields, saved voices, and model-specific controls.
+
 ### Example (curl)
 
 ```bash
@@ -177,10 +182,11 @@ For prompt-based voice design, use **VoiceDesign** variants.
 | Format | Extension | Notes |
 |--------|-----------|-------|
 | WAV | `.wav` | Uncompressed, highest quality |
-| MP3 | `.mp3` | Compressed, widely compatible |
-| OGG | `.ogg` | Open format, good compression |
-| FLAC | `.flac` | Lossless compression |
-| AAC | `.aac` | High efficiency compression |
+| PCM | `.pcm` | Raw PCM for low-level playback pipelines |
+| MP3 | `.mp3` | Accepted for OpenAI compatibility; currently falls back to WAV bytes |
+| OPUS | `.opus` | Accepted for OpenAI compatibility; currently falls back to WAV bytes |
+| FLAC | `.flac` | Accepted for OpenAI compatibility; currently falls back to WAV bytes |
+| AAC | `.aac` | Accepted for OpenAI compatibility; currently falls back to WAV bytes |
 
 ---
 

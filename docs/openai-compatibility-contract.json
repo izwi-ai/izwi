@@ -3,6 +3,7 @@
   "scope": {
     "supported_endpoints": [
       "/v1/models",
+      "/v1/models/{model}",
       "/v1/chat/completions",
       "/v1/responses",
       "/v1/responses/:response_id",

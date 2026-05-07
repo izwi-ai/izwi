@@ -2,6 +2,7 @@
 
 use axum::Json;
 use serde::Serialize;
+use serde_json::{json, Map, Value};
 use utoipa::{OpenApi, ToSchema};
 
 #[derive(OpenApi)]
@@ -59,28 +60,1153 @@ use utoipa::{OpenApi, ToSchema};
         VerboseTranscriptionResponse,
     )),
     tags(
-        (name = "runtime", description = "Runtime health, readiness, and operational probes"),
-        (name = "openai-compatible", description = "OpenAI-compatible API surface"),
-        (name = "openai-preview", description = "Preview OpenAI-compatible API surface"),
-        (name = "admin", description = "Local administrative API surface"),
-        (name = "workflows", description = "First-party persisted workflow API surface")
+        (name = "Runtime", description = "Runtime health, readiness, and operational probes"),
+        (name = "OpenAI Compatible", description = "OpenAI-compatible API surface, including preview compatibility routes and Izwi OpenAI-style extensions"),
+        (name = "Admin", description = "Local administrative API surface")
     )
 )]
 pub struct IzwiOpenApi;
 
-pub async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
+pub async fn openapi_json() -> Json<Value> {
     Json(document())
 }
 
-pub fn document() -> utoipa::openapi::OpenApi {
-    IzwiOpenApi::openapi()
+pub fn document() -> Value {
+    let mut doc = serde_json::to_value(IzwiOpenApi::openapi())
+        .expect("generated OpenAPI document should serialize");
+    add_scalar_navigation_paths(&mut doc);
+    doc
+}
+
+fn add_scalar_navigation_paths(doc: &mut Value) {
+    // Utoipa owns rich schemas for the stable contract. These lightweight path
+    // items keep Scalar navigation in sync with preview routes documented in
+    // docs/user/api.md while those contracts continue to mature.
+    add_tag(
+        doc,
+        "Speech Text Workflows",
+        "Preview persisted transcription and diarization workflows",
+    );
+    add_tag(
+        doc,
+        "Speech Generation Workflows",
+        "Preview persisted speech generation and saved voice workflows",
+    );
+    add_tag(
+        doc,
+        "Studio Workflows",
+        "Preview Studio project workflow APIs",
+    );
+    add_tag(
+        doc,
+        "Chat Agent Workflows",
+        "Preview chat thread and agent session APIs",
+    );
+    add_tag(
+        doc,
+        "Voice Workflows",
+        "Preview voice profile, memory, and session APIs",
+    );
+    add_tag(doc, "Media", "Preview local media serving APIs");
+    add_tag(
+        doc,
+        "Preferences",
+        "Preview onboarding and user preference APIs",
+    );
+    add_tag(doc, "Realtime", "Preview WebSocket realtime APIs");
+
+    let paths = doc
+        .get_mut("paths")
+        .and_then(Value::as_object_mut)
+        .expect("OpenAPI document should contain a paths object");
+
+    add_operation(
+        paths,
+        "/v1/live",
+        "get",
+        "Runtime",
+        "Versioned liveness probe",
+        "Server process is alive.",
+        ok_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/ready",
+        "get",
+        "Runtime",
+        "Versioned readiness probe",
+        "Server readiness probe under the versioned namespace.",
+        response_with_statuses(&[("200", "Ready"), ("503", "Alive but not ready")]),
+    );
+    add_operation(
+        paths,
+        "/v1/health",
+        "get",
+        "Runtime",
+        "Runtime health details",
+        "Rich backend, device, dtype, CUDA, and fused-attention status used by izwi status.",
+        ok_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/metrics",
+        "get",
+        "Runtime",
+        "Runtime telemetry snapshot",
+        "JSON runtime telemetry snapshot.",
+        ok_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/metrics/prometheus",
+        "get",
+        "Runtime",
+        "Prometheus metrics",
+        "Runtime telemetry in Prometheus text format.",
+        ok_response(),
+    );
+    add_operation(
+        paths,
+        "/internal/health",
+        "get",
+        "Runtime",
+        "Internal health alias",
+        "Compatibility alias for rich runtime health.",
+        ok_response(),
+    );
+    add_operation(
+        paths,
+        "/internal/live",
+        "get",
+        "Runtime",
+        "Internal liveness alias",
+        "Compatibility alias for liveness.",
+        ok_response(),
+    );
+    add_operation(
+        paths,
+        "/internal/ready",
+        "get",
+        "Runtime",
+        "Internal readiness alias",
+        "Compatibility alias for readiness.",
+        response_with_statuses(&[("200", "Ready"), ("503", "Alive but not ready")]),
+    );
+    add_operation(
+        paths,
+        "/internal/metrics",
+        "get",
+        "Runtime",
+        "Internal metrics alias",
+        "Compatibility alias for JSON runtime telemetry.",
+        ok_response(),
+    );
+    add_operation(
+        paths,
+        "/internal/metrics/prometheus",
+        "get",
+        "Runtime",
+        "Internal Prometheus metrics alias",
+        "Compatibility alias for Prometheus runtime telemetry.",
+        ok_response(),
+    );
+
+    add_operation(
+        paths,
+        "/v1/audio/diarizations",
+        "post",
+        "OpenAI Compatible",
+        "Create diarization",
+        "Izwi-specific diarization endpoint accepting JSON or multipart audio input.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/audio/diarize",
+        "post",
+        "OpenAI Compatible",
+        "Create diarization legacy alias",
+        "Legacy alias for /v1/audio/diarizations.",
+        preview_response(),
+    );
+
+    add_operation(
+        paths,
+        "/v1/admin/models",
+        "get",
+        "Admin",
+        "List model variants",
+        "List all known enabled model variants and local status.",
+        preview_response(),
+    );
+    add_get_delete_member(
+        paths,
+        "/v1/admin/models/{variant}",
+        "Admin",
+        "Model variant",
+        "Fetch or delete local model variant state.",
+        &[("variant", "Model variant identifier")],
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/admin/models/{variant}/download",
+        "post",
+        "Admin",
+        "Start model download",
+        "Start a model download in the background.",
+        &[("variant", "Model variant identifier")],
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/admin/models/{variant}/download/progress",
+        "get",
+        "Admin",
+        "Stream download progress",
+        "Server-sent model download progress events.",
+        &[("variant", "Model variant identifier")],
+        event_stream_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/admin/models/{variant}/download/cancel",
+        "post",
+        "Admin",
+        "Cancel model download",
+        "Cancel an active model download.",
+        &[("variant", "Model variant identifier")],
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/admin/models/{variant}/load",
+        "post",
+        "Admin",
+        "Load model",
+        "Load model weights into runtime memory.",
+        &[("variant", "Model variant identifier")],
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/admin/models/{variant}/unload",
+        "post",
+        "Admin",
+        "Unload model",
+        "Unload model weights from runtime memory.",
+        &[("variant", "Model variant identifier")],
+        preview_response(),
+    );
+
+    add_collection(
+        paths,
+        "/v1/transcriptions/jobs",
+        "Speech Text Workflows",
+        "Speech-text jobs",
+        "List or create canonical saved transcription and diarization jobs.",
+    );
+    add_get_patch_put_delete_member(
+        paths,
+        "/v1/transcriptions/jobs/{record_id}",
+        "Speech Text Workflows",
+        "Speech-text job",
+        "Fetch, update, or delete a canonical saved speech-text job.",
+        &[("record_id", "Speech-text job identifier")],
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/transcriptions/jobs/{record_id}/audio",
+        "get",
+        "Speech Text Workflows",
+        "Fetch speech-text job audio",
+        "Fetch stored source audio for a speech-text job.",
+        &[("record_id", "Speech-text job identifier")],
+        binary_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/transcriptions/jobs/{record_id}/reruns",
+        "post",
+        "Speech Text Workflows",
+        "Rerun diarization job",
+        "Re-run diarization from stored source audio.",
+        &[("record_id", "Speech-text job identifier")],
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/transcriptions/jobs/{record_id}/cancel",
+        "post",
+        "Speech Text Workflows",
+        "Cancel diarization job",
+        "Cancel an in-flight diarization job.",
+        &[("record_id", "Speech-text job identifier")],
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/transcriptions/jobs/{record_id}/summary/regenerate",
+        "post",
+        "Speech Text Workflows",
+        "Regenerate speech-text summary",
+        "Regenerate a transcription or diarization summary.",
+        &[("record_id", "Speech-text job identifier")],
+        preview_response(),
+    );
+
+    add_collection(
+        paths,
+        "/v1/transcriptions",
+        "Speech Text Workflows",
+        "Legacy transcription records",
+        "Legacy transcription-only list/create route family.",
+    );
+    add_get_delete_member(
+        paths,
+        "/v1/transcriptions/{record_id}",
+        "Speech Text Workflows",
+        "Legacy transcription record",
+        "Fetch or delete a transcription-only record.",
+        &[("record_id", "Transcription record identifier")],
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/transcriptions/{record_id}/audio",
+        "get",
+        "Speech Text Workflows",
+        "Fetch transcription audio",
+        "Fetch stored transcription source audio.",
+        &[("record_id", "Transcription record identifier")],
+        binary_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/transcriptions/{record_id}/summary/regenerate",
+        "post",
+        "Speech Text Workflows",
+        "Regenerate transcription summary",
+        "Regenerate a transcription summary.",
+        &[("record_id", "Transcription record identifier")],
+        preview_response(),
+    );
+
+    add_collection(
+        paths,
+        "/v1/diarizations",
+        "Speech Text Workflows",
+        "Persisted diarization records",
+        "List or create saved diarization records.",
+    );
+    add_get_patch_put_delete_member(
+        paths,
+        "/v1/diarizations/{record_id}",
+        "Speech Text Workflows",
+        "Persisted diarization record",
+        "Fetch, update, or delete a saved diarization record.",
+        &[("record_id", "Diarization record identifier")],
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/diarizations/{record_id}/audio",
+        "get",
+        "Speech Text Workflows",
+        "Fetch diarization audio",
+        "Fetch stored diarization source audio.",
+        &[("record_id", "Diarization record identifier")],
+        binary_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/diarizations/{record_id}/reruns",
+        "post",
+        "Speech Text Workflows",
+        "Rerun diarization record",
+        "Re-run diarization from a saved record.",
+        &[("record_id", "Diarization record identifier")],
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/diarizations/{record_id}/cancel",
+        "post",
+        "Speech Text Workflows",
+        "Cancel diarization record",
+        "Cancel an in-flight diarization record.",
+        &[("record_id", "Diarization record identifier")],
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/diarizations/{record_id}/summary/regenerate",
+        "post",
+        "Speech Text Workflows",
+        "Regenerate diarization summary",
+        "Regenerate a diarization summary.",
+        &[("record_id", "Diarization record identifier")],
+        preview_response(),
+    );
+
+    add_speech_generation_family(
+        paths,
+        "/v1/text-to-speech-generations",
+        "Text-to-speech generations",
+    );
+    add_speech_generation_family(
+        paths,
+        "/v1/voice-design-generations",
+        "Voice design generations",
+    );
+    add_speech_generation_family(
+        paths,
+        "/v1/voice-clone-generations",
+        "Voice clone generations",
+    );
+    add_collection(
+        paths,
+        "/v1/voices",
+        "Speech Generation Workflows",
+        "Saved voices",
+        "List or create reusable saved voice references.",
+    );
+    add_get_delete_member(
+        paths,
+        "/v1/voices/{voice_id}",
+        "Speech Generation Workflows",
+        "Saved voice",
+        "Fetch or delete saved voice metadata.",
+        &[("voice_id", "Saved voice identifier")],
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/voices/{voice_id}/audio",
+        "get",
+        "Speech Generation Workflows",
+        "Fetch saved voice audio",
+        "Fetch saved voice reference audio.",
+        &[("voice_id", "Saved voice identifier")],
+        binary_response(),
+    );
+
+    add_collection(
+        paths,
+        "/v1/studio/folders",
+        "Studio Workflows",
+        "Studio folders",
+        "List or create Studio project folders.",
+    );
+    add_collection(
+        paths,
+        "/v1/studio/projects",
+        "Studio Workflows",
+        "Studio projects",
+        "List or create Studio projects.",
+    );
+    add_get_patch_delete_member(
+        paths,
+        "/v1/studio/projects/{project_id}",
+        "Studio Workflows",
+        "Studio project",
+        "Fetch, update, or delete a Studio project.",
+        &[("project_id", "Studio project identifier")],
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/studio/projects/{project_id}/audio",
+        "get",
+        "Studio Workflows",
+        "Fetch Studio project audio",
+        "Fetch combined or selected Studio project audio.",
+        &[("project_id", "Studio project identifier")],
+        binary_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/studio/projects/{project_id}/meta",
+        "get",
+        "Studio Workflows",
+        "Fetch Studio project metadata",
+        "Fetch Studio project metadata.",
+        &[("project_id", "Studio project identifier")],
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/studio/projects/{project_id}/meta",
+        "patch",
+        "Studio Workflows",
+        "Update Studio project metadata",
+        "Create or update Studio project metadata.",
+        &[("project_id", "Studio project identifier")],
+        preview_response(),
+    );
+    add_collection_with_params(
+        paths,
+        "/v1/studio/projects/{project_id}/pronunciations",
+        "Studio Workflows",
+        "Studio pronunciations",
+        "List or create pronunciation overrides.",
+        &[("project_id", "Studio project identifier")],
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/studio/projects/{project_id}/pronunciations/{pronunciation_id}",
+        "delete",
+        "Studio Workflows",
+        "Delete Studio pronunciation",
+        "Delete a pronunciation override.",
+        &[
+            ("project_id", "Studio project identifier"),
+            ("pronunciation_id", "Pronunciation identifier"),
+        ],
+        preview_response(),
+    );
+    add_collection_with_params(
+        paths,
+        "/v1/studio/projects/{project_id}/snapshots",
+        "Studio Workflows",
+        "Studio snapshots",
+        "List or create project snapshots.",
+        &[("project_id", "Studio project identifier")],
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/studio/projects/{project_id}/snapshots/{snapshot_id}/restore",
+        "post",
+        "Studio Workflows",
+        "Restore Studio snapshot",
+        "Restore a project from a snapshot.",
+        &[
+            ("project_id", "Studio project identifier"),
+            ("snapshot_id", "Snapshot identifier"),
+        ],
+        preview_response(),
+    );
+    add_collection_with_params(
+        paths,
+        "/v1/studio/projects/{project_id}/render-jobs",
+        "Studio Workflows",
+        "Studio render jobs",
+        "List or create render jobs.",
+        &[("project_id", "Studio project identifier")],
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/studio/projects/{project_id}/render-jobs/{job_id}",
+        "patch",
+        "Studio Workflows",
+        "Update Studio render job",
+        "Update render job state.",
+        &[
+            ("project_id", "Studio project identifier"),
+            ("job_id", "Render job identifier"),
+        ],
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/studio/projects/{project_id}/segments",
+        "post",
+        "Studio Workflows",
+        "Create Studio segment",
+        "Create a Studio project segment.",
+        &[("project_id", "Studio project identifier")],
+        preview_response(),
+    );
+    add_get_patch_delete_member(
+        paths,
+        "/v1/studio/projects/{project_id}/segments/{segment_id}",
+        "Studio Workflows",
+        "Studio segment",
+        "Fetch, update, or delete a Studio project segment.",
+        &[
+            ("project_id", "Studio project identifier"),
+            ("segment_id", "Segment identifier"),
+        ],
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/studio/projects/{project_id}/segments/{segment_id}/split",
+        "post",
+        "Studio Workflows",
+        "Split Studio segment",
+        "Split a Studio project segment.",
+        &[
+            ("project_id", "Studio project identifier"),
+            ("segment_id", "Segment identifier"),
+        ],
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/studio/projects/{project_id}/segments/{segment_id}/merge-next",
+        "post",
+        "Studio Workflows",
+        "Merge Studio segment",
+        "Merge a Studio project segment with the next segment.",
+        &[
+            ("project_id", "Studio project identifier"),
+            ("segment_id", "Segment identifier"),
+        ],
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/studio/projects/{project_id}/segments/reorder",
+        "patch",
+        "Studio Workflows",
+        "Reorder Studio segments",
+        "Reorder Studio project segments.",
+        &[("project_id", "Studio project identifier")],
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/studio/projects/{project_id}/segments/bulk-delete",
+        "post",
+        "Studio Workflows",
+        "Bulk delete Studio segments",
+        "Bulk delete Studio project segments.",
+        &[("project_id", "Studio project identifier")],
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/studio/projects/{project_id}/segments/{segment_id}/render",
+        "post",
+        "Studio Workflows",
+        "Render Studio segment",
+        "Render a Studio project segment.",
+        &[
+            ("project_id", "Studio project identifier"),
+            ("segment_id", "Segment identifier"),
+        ],
+        preview_response(),
+    );
+
+    add_collection(
+        paths,
+        "/v1/chat/threads",
+        "Chat Agent Workflows",
+        "Chat threads",
+        "List or create durable local chat threads.",
+    );
+    add_get_patch_delete_member(
+        paths,
+        "/v1/chat/threads/{thread_id}",
+        "Chat Agent Workflows",
+        "Chat thread",
+        "Fetch, update, or delete a chat thread.",
+        &[("thread_id", "Chat thread identifier")],
+    );
+    add_collection_with_params(
+        paths,
+        "/v1/chat/threads/{thread_id}/messages",
+        "Chat Agent Workflows",
+        "Chat thread messages",
+        "List messages or send a new user message.",
+        &[("thread_id", "Chat thread identifier")],
+    );
+    add_operation(
+        paths,
+        "/v1/agent/sessions",
+        "post",
+        "Chat Agent Workflows",
+        "Create agent session",
+        "Create preview process-local agent session metadata and a linked chat thread.",
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/agent/sessions/{session_id}",
+        "get",
+        "Chat Agent Workflows",
+        "Fetch agent session",
+        "Fetch retained process-local agent session metadata.",
+        &[("session_id", "Agent session identifier")],
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/agent/sessions/{session_id}/turns",
+        "post",
+        "Chat Agent Workflows",
+        "Create agent turn",
+        "Run one agent turn.",
+        &[("session_id", "Agent session identifier")],
+        preview_response(),
+    );
+
+    add_operation(
+        paths,
+        "/v1/voice/profile",
+        "get",
+        "Voice Workflows",
+        "Fetch voice profile",
+        "Fetch voice profile settings.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/voice/profile",
+        "patch",
+        "Voice Workflows",
+        "Update voice profile",
+        "Update voice profile settings.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/voice/observations",
+        "get",
+        "Voice Workflows",
+        "List voice observations",
+        "List voice memory observations.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/voice/observations",
+        "delete",
+        "Voice Workflows",
+        "Clear voice observations",
+        "Clear voice memory observations.",
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/voice/observations/{observation_id}",
+        "delete",
+        "Voice Workflows",
+        "Delete voice observation",
+        "Delete one voice memory observation.",
+        &[("observation_id", "Voice observation identifier")],
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/voice/sessions",
+        "get",
+        "Voice Workflows",
+        "List voice sessions",
+        "List persisted voice sessions.",
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/voice/sessions/{session_id}",
+        "get",
+        "Voice Workflows",
+        "Fetch voice session",
+        "Fetch one persisted voice session.",
+        &[("session_id", "Voice session identifier")],
+        preview_response(),
+    );
+
+    add_operation_with_params(
+        paths,
+        "/v1/media/{path}",
+        "get",
+        "Media",
+        "Fetch local media",
+        "Fetch persisted local media by relative path.",
+        &[("path", "Relative media path")],
+        binary_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/onboarding",
+        "get",
+        "Preferences",
+        "Fetch onboarding state",
+        "Fetch first-run onboarding state.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/onboarding/complete",
+        "post",
+        "Preferences",
+        "Complete onboarding",
+        "Mark first-run onboarding complete.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/preferences",
+        "get",
+        "Preferences",
+        "Fetch preferences",
+        "Fetch user preferences.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/preferences/analytics",
+        "put",
+        "Preferences",
+        "Update analytics preference",
+        "Update analytics opt-in preference.",
+        preview_response(),
+    );
+
+    add_operation(
+        paths,
+        "/v1/transcription/realtime/ws",
+        "get",
+        "Realtime",
+        "Transcription realtime WebSocket",
+        "Upgrade to the preview transcription realtime WebSocket protocol.",
+        websocket_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/voice/realtime/ws",
+        "get",
+        "Realtime",
+        "Voice realtime WebSocket",
+        "Upgrade to the preview voice realtime WebSocket protocol.",
+        websocket_response(),
+    );
+}
+
+fn add_speech_generation_family(paths: &mut Map<String, Value>, family_path: &str, label: &str) {
+    add_collection(
+        paths,
+        family_path,
+        "Speech Generation Workflows",
+        label,
+        "List or create persisted speech generation records.",
+    );
+    let member = format!("{family_path}/{{record_id}}");
+    let audio = format!("{family_path}/{{record_id}}/audio");
+    add_get_delete_member(
+        paths,
+        &member,
+        "Speech Generation Workflows",
+        &format!("{label} record"),
+        "Fetch or delete a persisted speech generation record.",
+        &[("record_id", "Speech generation record identifier")],
+    );
+    add_operation_with_params(
+        paths,
+        &audio,
+        "get",
+        "Speech Generation Workflows",
+        &format!("Fetch {label} audio"),
+        "Fetch generated speech audio.",
+        &[("record_id", "Speech generation record identifier")],
+        binary_response(),
+    );
+}
+
+fn add_collection(
+    paths: &mut Map<String, Value>,
+    path: &str,
+    tag: &str,
+    summary: &str,
+    description: &str,
+) {
+    add_operation(
+        paths,
+        path,
+        "get",
+        tag,
+        summary,
+        description,
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        path,
+        "post",
+        tag,
+        summary,
+        description,
+        preview_response(),
+    );
+}
+
+fn add_collection_with_params(
+    paths: &mut Map<String, Value>,
+    path: &str,
+    tag: &str,
+    summary: &str,
+    description: &str,
+    params: &[(&str, &str)],
+) {
+    add_operation_with_params(
+        paths,
+        path,
+        "get",
+        tag,
+        summary,
+        description,
+        params,
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        path,
+        "post",
+        tag,
+        summary,
+        description,
+        params,
+        preview_response(),
+    );
+}
+
+fn add_get_delete_member(
+    paths: &mut Map<String, Value>,
+    path: &str,
+    tag: &str,
+    summary: &str,
+    description: &str,
+    params: &[(&str, &str)],
+) {
+    add_operation_with_params(
+        paths,
+        path,
+        "get",
+        tag,
+        summary,
+        description,
+        params,
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        path,
+        "delete",
+        tag,
+        summary,
+        description,
+        params,
+        preview_response(),
+    );
+}
+
+fn add_get_patch_delete_member(
+    paths: &mut Map<String, Value>,
+    path: &str,
+    tag: &str,
+    summary: &str,
+    description: &str,
+    params: &[(&str, &str)],
+) {
+    add_operation_with_params(
+        paths,
+        path,
+        "get",
+        tag,
+        summary,
+        description,
+        params,
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        path,
+        "patch",
+        tag,
+        summary,
+        description,
+        params,
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        path,
+        "delete",
+        tag,
+        summary,
+        description,
+        params,
+        preview_response(),
+    );
+}
+
+fn add_get_patch_put_delete_member(
+    paths: &mut Map<String, Value>,
+    path: &str,
+    tag: &str,
+    summary: &str,
+    description: &str,
+    params: &[(&str, &str)],
+) {
+    add_operation_with_params(
+        paths,
+        path,
+        "get",
+        tag,
+        summary,
+        description,
+        params,
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        path,
+        "patch",
+        tag,
+        summary,
+        description,
+        params,
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        path,
+        "put",
+        tag,
+        summary,
+        description,
+        params,
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        path,
+        "delete",
+        tag,
+        summary,
+        description,
+        params,
+        preview_response(),
+    );
+}
+
+fn add_operation(
+    paths: &mut Map<String, Value>,
+    path: &str,
+    method: &str,
+    tag: &str,
+    summary: &str,
+    description: &str,
+    responses: Value,
+) {
+    add_operation_with_params(
+        paths,
+        path,
+        method,
+        tag,
+        summary,
+        description,
+        &[],
+        responses,
+    );
+}
+
+fn add_operation_with_params(
+    paths: &mut Map<String, Value>,
+    path: &str,
+    method: &str,
+    tag: &str,
+    summary: &str,
+    description: &str,
+    params: &[(&str, &str)],
+    responses: Value,
+) {
+    let path_item = paths.entry(path.to_string()).or_insert_with(|| json!({}));
+    let path_obj = path_item
+        .as_object_mut()
+        .expect("OpenAPI path item should be an object");
+    let mut operation = json!({
+        "tags": [tag],
+        "summary": summary,
+        "description": description,
+        "responses": responses,
+    });
+    if !params.is_empty() {
+        operation["parameters"] = Value::Array(
+            params
+                .iter()
+                .map(|(name, description)| {
+                    json!({
+                        "name": name,
+                        "in": "path",
+                        "required": true,
+                        "description": description,
+                        "schema": { "type": "string" }
+                    })
+                })
+                .collect(),
+        );
+    }
+    path_obj.insert(method.to_string(), operation);
+}
+
+fn add_tag(doc: &mut Value, name: &str, description: &str) {
+    let tags = doc
+        .get_mut("tags")
+        .and_then(Value::as_array_mut)
+        .expect("OpenAPI document should contain tags array");
+    if tags
+        .iter()
+        .any(|tag| tag.get("name").and_then(Value::as_str) == Some(name))
+    {
+        return;
+    }
+    tags.push(json!({
+        "name": name,
+        "description": description,
+    }));
+}
+
+fn ok_response() -> Value {
+    response_with_statuses(&[("200", "OK")])
+}
+
+fn preview_response() -> Value {
+    response_with_statuses(&[
+        ("200", "OK"),
+        ("400", "Invalid request"),
+        ("404", "Not found"),
+        ("500", "Server error"),
+    ])
+}
+
+fn binary_response() -> Value {
+    response_with_statuses(&[
+        ("200", "Binary media response"),
+        ("404", "Not found"),
+        ("500", "Server error"),
+    ])
+}
+
+fn event_stream_response() -> Value {
+    response_with_statuses(&[
+        ("200", "Server-sent event stream"),
+        ("404", "Not found"),
+        ("500", "Server error"),
+    ])
+}
+
+fn websocket_response() -> Value {
+    response_with_statuses(&[
+        ("101", "WebSocket upgrade"),
+        ("400", "Invalid WebSocket request"),
+    ])
+}
+
+fn response_with_statuses(statuses: &[(&str, &str)]) -> Value {
+    let mut responses = Map::new();
+    for (status, description) in statuses {
+        responses.insert(
+            (*status).to_string(),
+            json!({
+                "description": description,
+            }),
+        );
+    }
+    Value::Object(responses)
 }
 
 #[allow(dead_code)]
 #[utoipa::path(
     get,
     path = "/livez",
-    tag = "runtime",
+    tag = "Runtime",
     responses(
         (status = 200, description = "Server process is alive", body = LiveResponse)
     )
@@ -91,7 +1217,7 @@ fn livez() {}
 #[utoipa::path(
     get,
     path = "/readyz",
-    tag = "runtime",
+    tag = "Runtime",
     responses(
         (status = 200, description = "Server is ready to serve requests", body = ReadyResponse),
         (status = 503, description = "Server is alive but not ready", body = ReadyResponse)
@@ -103,7 +1229,7 @@ fn readyz() {}
 #[utoipa::path(
     get,
     path = "/v1/models",
-    tag = "openai-compatible",
+    tag = "OpenAI Compatible",
     responses(
         (status = 200, description = "List locally available OpenAI-compatible models", body = OpenAiModelsResponse),
         (status = 500, description = "Server error", body = ApiErrorEnvelope)
@@ -115,7 +1241,7 @@ fn list_models() {}
 #[utoipa::path(
     get,
     path = "/v1/models/{model}",
-    tag = "openai-compatible",
+    tag = "OpenAI Compatible",
     params(
         ("model" = String, Path, description = "Model identifier")
     ),
@@ -131,7 +1257,7 @@ fn get_model() {}
 #[utoipa::path(
     post,
     path = "/v1/chat/completions",
-    tag = "openai-compatible",
+    tag = "OpenAI Compatible",
     request_body = ChatCompletionRequest,
     responses(
         (status = 200, description = "Chat completion JSON when stream is false; server-sent events when stream is true", body = ChatCompletionResponse),
@@ -145,7 +1271,7 @@ fn create_chat_completion() {}
 #[utoipa::path(
     post,
     path = "/v1/audio/speech",
-    tag = "openai-compatible",
+    tag = "OpenAI Compatible",
     request_body = SpeechRequest,
     responses(
         (status = 200, description = "Generated audio bytes, or server-sent audio events when stream_format is sse"),
@@ -159,7 +1285,7 @@ fn create_speech() {}
 #[utoipa::path(
     post,
     path = "/v1/audio/transcriptions",
-    tag = "openai-compatible",
+    tag = "OpenAI Compatible",
     request_body(content = TranscriptionMultipartRequest, content_type = "multipart/form-data"),
     responses(
         (status = 200, description = "Transcription result as JSON, verbose JSON, text, SRT, VTT, or server-sent events", body = TranscriptionResponse),
@@ -173,7 +1299,7 @@ fn create_transcription() {}
 #[utoipa::path(
     post,
     path = "/v1/responses",
-    tag = "openai-preview",
+    tag = "OpenAI Compatible",
     request_body = ResponsesCreateRequest,
     responses(
         (status = 200, description = "Preview process-local response object, or server-sent events when stream is true", body = ResponseObject),
@@ -187,7 +1313,7 @@ fn create_response() {}
 #[utoipa::path(
     get,
     path = "/v1/responses/{response_id}",
-    tag = "openai-preview",
+    tag = "OpenAI Compatible",
     params(
         ("response_id" = String, Path, description = "Process-local response identifier")
     ),
@@ -202,7 +1328,7 @@ fn get_response() {}
 #[utoipa::path(
     delete,
     path = "/v1/responses/{response_id}",
-    tag = "openai-preview",
+    tag = "OpenAI Compatible",
     params(
         ("response_id" = String, Path, description = "Process-local response identifier")
     ),
@@ -217,7 +1343,7 @@ fn delete_response() {}
 #[utoipa::path(
     post,
     path = "/v1/responses/{response_id}/cancel",
-    tag = "openai-preview",
+    tag = "OpenAI Compatible",
     params(
         ("response_id" = String, Path, description = "Process-local response identifier")
     ),
@@ -232,7 +1358,7 @@ fn cancel_response() {}
 #[utoipa::path(
     get,
     path = "/v1/responses/{response_id}/input_items",
-    tag = "openai-preview",
+    tag = "OpenAI Compatible",
     params(
         ("response_id" = String, Path, description = "Process-local response identifier")
     ),
@@ -549,9 +1675,10 @@ mod tests {
 
     #[test]
     fn openapi_documents_compatibility_contract_endpoints() {
-        let contract: serde_json::Value =
-            serde_json::from_str(include_str!("../../../../docs/openai-compatibility-contract.json"))
-                .expect("contract should parse");
+        let contract: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../docs/openai-compatibility-contract.json"
+        ))
+        .expect("contract should parse");
         let supported = contract["scope"]["supported_endpoints"]
             .as_array()
             .expect("supported endpoints should be an array");
@@ -609,7 +1736,7 @@ mod tests {
 
         for path in preview_paths {
             let operations = paths.get(path).expect("preview path should exist");
-            let has_preview_tag = operations
+            let has_compatible_tag = operations
                 .as_object()
                 .expect("operations should be an object")
                 .values()
@@ -618,9 +1745,108 @@ mod tests {
                         .as_array()
                         .into_iter()
                         .flatten()
-                        .any(|tag| tag.as_str() == Some("openai-preview"))
+                        .any(|tag| tag.as_str() == Some("OpenAI Compatible"))
                 });
-            assert!(has_preview_tag, "{path} should be tagged preview");
+            assert!(
+                has_compatible_tag,
+                "{path} should be tagged OpenAI Compatible"
+            );
+        }
+    }
+
+    #[test]
+    fn openapi_wires_preview_route_groups_for_scalar_sidebar() {
+        let openapi = document();
+        let tags = openapi["tags"].as_array().expect("tags should exist");
+        let tag_names: HashSet<&str> = tags.iter().filter_map(|tag| tag["name"].as_str()).collect();
+
+        for tag in [
+            "Runtime",
+            "OpenAI Compatible",
+            "Admin",
+            "Speech Text Workflows",
+            "Speech Generation Workflows",
+            "Studio Workflows",
+            "Chat Agent Workflows",
+            "Voice Workflows",
+            "Media",
+            "Preferences",
+            "Realtime",
+        ] {
+            assert!(tag_names.contains(tag), "{tag} tag should exist");
+        }
+        for legacy_tag in [
+            "openai-compatible",
+            "openai-preview",
+            "openai-style-preview",
+            "speech-text-workflows",
+            "speech-generation-workflows",
+            "studio-workflows",
+            "chat-agent-workflows",
+            "voice-workflows",
+        ] {
+            assert!(
+                !tag_names.contains(legacy_tag),
+                "{legacy_tag} tag should not remain"
+            );
+        }
+
+        let paths = openapi["paths"].as_object().expect("paths should exist");
+        let expected = [
+            ("/v1/audio/diarizations", "post", "OpenAI Compatible"),
+            (
+                "/v1/admin/models/{variant}/download/progress",
+                "get",
+                "Admin",
+            ),
+            (
+                "/v1/transcriptions/jobs/{record_id}/reruns",
+                "post",
+                "Speech Text Workflows",
+            ),
+            (
+                "/v1/text-to-speech-generations/{record_id}/audio",
+                "get",
+                "Speech Generation Workflows",
+            ),
+            (
+                "/v1/studio/projects/{project_id}/segments",
+                "post",
+                "Studio Workflows",
+            ),
+            (
+                "/v1/chat/threads/{thread_id}/messages",
+                "get",
+                "Chat Agent Workflows",
+            ),
+            ("/v1/voice/profile", "patch", "Voice Workflows"),
+            ("/v1/media/{path}", "get", "Media"),
+            ("/v1/preferences/analytics", "put", "Preferences"),
+            ("/v1/voice/realtime/ws", "get", "Realtime"),
+        ];
+
+        for (path, method, tag) in expected {
+            let operation = paths
+                .get(path)
+                .and_then(|operations| operations.get(method))
+                .unwrap_or_else(|| panic!("{method} {path} should be documented"));
+            let has_tag = operation["tags"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|actual| actual.as_str() == Some(tag));
+            assert!(has_tag, "{method} {path} should be tagged {tag}");
+        }
+
+        for operation in paths.values().flat_map(|path| {
+            path.as_object()
+                .into_iter()
+                .flat_map(|operations| operations.values())
+        }) {
+            for tag in operation["tags"].as_array().into_iter().flatten() {
+                let tag = tag.as_str().expect("operation tags should be strings");
+                assert!(!tag.contains('-'), "{tag} should not contain hyphens");
+            }
         }
     }
 }

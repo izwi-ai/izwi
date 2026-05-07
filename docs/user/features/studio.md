@@ -20,3 +20,9 @@ Studio is Izwi's long-form text-to-speech workspace for single-device, solo prod
 4. Queue renders for changed or pending segments.
 5. Verify queue completion and restore from snapshots if needed.
 6. Export audio (and optional script sidecar).
+
+## Using the API
+
+Studio's preview API is documented in the [API Reference](../api.md#studio).
+It covers projects, folders, metadata, pronunciations, snapshots, render jobs,
+segment editing, and project audio export query parameters.

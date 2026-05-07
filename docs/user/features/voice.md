@@ -92,6 +92,14 @@ Use the **Voice Agent Prompt** section in settings to customize the assistant's 
 
 Use **Observational Memory** in settings to review, enable, disable, or delete the stable user memories captured from modular voice conversations. You can forget individual memories or clear them all at any time.
 
+### API Routes
+
+Voice mode uses preview APIs for the voice profile, observations, saved
+sessions, and low-latency WebSocket transport. See the
+[API Reference](../api.md#voice-profile-memory-and-sessions) for persisted
+voice state and [Voice Realtime](../api.md#voice-realtime) for the WebSocket
+protocol.
+
 ### Audio Settings
 
 - **Auto-detect silence** — Automatically stop recording when you stop speaking

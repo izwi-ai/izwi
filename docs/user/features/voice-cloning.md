@@ -77,6 +77,7 @@ POST /v1/audio/speech
 | `input` | String | Text to synthesize |
 | `reference_audio` | String | Base64-encoded reference audio |
 | `reference_text` | String | Transcript of reference audio |
+| `saved_voice_id` | String | Optional saved voice reference to reuse instead of resending audio |
 
 ### Example (curl)
 
@@ -91,6 +92,10 @@ curl -X POST http://localhost:8080/v1/audio/speech \
   }' \
   --output cloned.wav
 ```
+
+Saved voices can also be managed through `/v1/voices` and reused from
+`/v1/audio/speech`. See the [API Reference](../api.md#saved-voices) for the
+saved voice routes and exact fields.
 
 ---
 
