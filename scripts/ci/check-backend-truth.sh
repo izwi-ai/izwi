@@ -38,23 +38,29 @@ smoke_docker_server() {
         "${image}" \
         --help >/dev/null
 
-    assert_docker_espeak "${image}"
+    assert_docker_runtime_commands "${image}"
 }
 
-assert_docker_espeak() {
+assert_docker_runtime_commands() {
     local image="$1"
 
-    echo "Checking Kokoro phonemizer dependency in ${image}"
+    echo "Checking runtime command dependencies in ${image}"
     docker run --rm \
         --entrypoint /bin/sh \
         "${image}" \
-        -c 'command -v espeak-ng >/dev/null'
+        -c '
+            set -eu
+
+            for cmd in espeak-ng tar unzip zip which; do
+                command -v "${cmd}" >/dev/null
+            done
+        '
 }
 
 audit_cuda_docker_server() {
     local image="$1"
 
-    assert_docker_espeak "${image}"
+    assert_docker_runtime_commands "${image}"
 
     echo "Auditing CUDA dependencies in ${image}"
     docker run --rm \
