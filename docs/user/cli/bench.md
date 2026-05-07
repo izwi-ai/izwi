@@ -66,6 +66,7 @@ izwi bench tts [OPTIONS]
 | `-m, --model <MODEL>` | Model to benchmark | `qwen3-tts-0.6b-base` |
 | `-i, --iterations <N>` | Number of iterations | `10` |
 | `-t, --text <TEXT>` | Text to synthesize | Default test text |
+| `-c, --concurrent <N>` | Concurrent requests | `1` |
 | `--warmup` | Enable warmup iteration | — |
 
 ### Example
@@ -92,6 +93,7 @@ izwi bench asr [OPTIONS]
 | `-i, --iterations <N>` | Number of iterations | `10` |
 | `-f, --file <PATH>` | Audio file to use | Built-in test audio |
 | `-l, --language <LANG>` | Optional ASR language hint (e.g., `en`) | Auto-detect |
+| `-c, --concurrent <N>` | Concurrent requests | `1` |
 | `--warmup` | Enable warmup iteration | — |
 
 ### Example
@@ -132,9 +134,10 @@ Benchmarks report:
 - **TTFT** — Time to first streamed token for chat benchmarks
 - **Latency** — Average, min, max, p50, p95, p99
 - **Throughput** — Requests per second
-- **Tokens/second** — For TTS benchmarks
-- **Real-time factor** — Audio duration vs processing time
+- **Tokens/second** — For chat completion output and TTS server token generation when available
+- **Real-time factor** — Audio duration vs processing time for TTS/ASR when available
 - **Runtime telemetry snapshot** — Counter deltas for the run plus rolling runtime latency quantiles (explicitly labeled as rolling in CLI output)
+- **Structured reports** — Use global `--output-format json` to emit a machine-readable report with run config, summary metrics, per-request samples, and runtime telemetry snapshots.
 
 ---
 

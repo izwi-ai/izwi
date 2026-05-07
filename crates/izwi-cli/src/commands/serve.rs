@@ -594,6 +594,7 @@ mod tests {
 
     #[test]
     fn set_server_env_sets_ui_and_cors_flags() {
+        let _guard = crate::test_support::env_lock();
         clear_serve_env();
 
         set_server_env(&sample_args());
@@ -610,6 +611,7 @@ mod tests {
 
     #[test]
     fn set_server_env_passes_json_log_format() {
+        let _guard = crate::test_support::env_lock();
         clear_serve_env();
 
         let mut args = sample_args();

@@ -143,9 +143,10 @@ izwi chat --model qwen3-0.6b-4bit --system "You are concise."
 
 ```bash
 izwi bench chat --model Qwen3.5-4B --iterations 5 --max-tokens 128 --warmup
-izwi bench tts --model qwen3-tts-0.6b-base --iterations 5
-izwi bench asr --model qwen3-asr-0.6b --file data/test.wav --iterations 3
+izwi bench tts --model qwen3-tts-0.6b-base --iterations 5 --concurrent 2
+izwi bench asr --model parakeet-tdt-0.6b-v3 --file data/test.wav --iterations 3 --concurrent 2
 izwi bench throughput --duration 10 --concurrent 2
+izwi --output-format json bench chat --iterations 5
 ```
 
 ### Config

@@ -253,16 +253,7 @@ fn resolve_serve_runtime_config(
 mod tests {
     use super::*;
     use izwi_core::backends::BackendPreference;
-    use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("environment lock poisoned")
-    }
 
     fn clear_serve_env() {
         std::env::remove_var(izwi_core::serve_runtime::ENV_HOST);
@@ -284,7 +275,7 @@ mod tests {
 
     #[test]
     fn build_serve_args_resolves_cli_env_then_config() {
-        let _guard = env_lock();
+        let _guard = crate::test_support::env_lock();
         clear_serve_env();
 
         let dir = tempdir().expect("temp dir should be created");
@@ -337,7 +328,7 @@ mod tests {
 
     #[test]
     fn build_serve_args_honors_legacy_runtime_env_aliases() {
-        let _guard = env_lock();
+        let _guard = crate::test_support::env_lock();
         clear_serve_env();
 
         std::env::set_var(izwi_core::serve_runtime::LEGACY_ENV_MAX_CONCURRENT[0], "45");

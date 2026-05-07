@@ -491,6 +491,10 @@ pub enum BenchCommands {
         )]
         text: String,
 
+        /// Maximum concurrent requests
+        #[arg(short, long, default_value = "1")]
+        concurrent: u32,
+
         /// Enable warmup iteration
         #[arg(long)]
         warmup: bool,

@@ -91,8 +91,23 @@ struct ChatBenchSample {
     generation_time_ms: Option<f64>,
 }
 
+#[derive(Debug, Clone)]
+struct TtsBenchSample {
+    total_ms: f64,
+    generation_time_ms: Option<f64>,
+    audio_duration_secs: Option<f64>,
+    rtf: Option<f64>,
+    tokens_generated: Option<u64>,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 struct AsrBenchResponse {
+    #[serde(default)]
+    duration: Option<f64>,
+    #[serde(default)]
+    processing_time_ms: Option<f64>,
+    #[serde(default)]
+    rtf: Option<f64>,
     #[serde(default)]
     izwi_asr_diagnostics: Option<serde_json::Value>,
 }
@@ -187,7 +202,11 @@ struct BenchmarkSummary {
     ttft_ms: Option<Stats>,
     end_to_end_ms: Option<Stats>,
     completion_tps: Option<Stats>,
+    tokens_per_second: Option<Stats>,
     server_generation_ms: Option<Stats>,
+    server_processing_ms: Option<Stats>,
+    audio_duration_secs: Option<Stats>,
+    rtf: Option<Stats>,
     prompt_tokens_avg: Option<f64>,
     completion_tokens_avg: Option<f64>,
     throughput_rps: Option<f64>,
@@ -214,9 +233,14 @@ struct BenchmarkSample {
     ttft_ms: Option<f64>,
     end_to_end_ms: Option<f64>,
     completion_tps: Option<f64>,
+    tokens_per_second: Option<f64>,
     prompt_tokens: Option<usize>,
     completion_tokens: Option<usize>,
     server_generation_ms: Option<f64>,
+    server_processing_ms: Option<f64>,
+    audio_duration_secs: Option<f64>,
+    rtf: Option<f64>,
+    tokens_generated: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -265,8 +289,14 @@ pub async fn execute(
             model,
             iterations,
             text,
+            concurrent,
             warmup,
-        } => bench_tts(server, &model, iterations, &text, warmup, &options, theme).await,
+        } => {
+            bench_tts(
+                server, &model, iterations, &text, concurrent, warmup, &options, theme,
+            )
+            .await
+        }
         BenchCommands::Asr {
             model,
             iterations,
@@ -474,7 +504,11 @@ async fn bench_chat(
                 ttft_ms: stats(&ttft_ms),
                 end_to_end_ms: stats(&total_ms),
                 completion_tps: stats(&completion_tps),
+                tokens_per_second: None,
                 server_generation_ms: stats(&server_generation_ms),
+                server_processing_ms: None,
+                audio_duration_secs: None,
+                rtf: None,
                 prompt_tokens_avg: Some(prompt_tokens_avg),
                 completion_tokens_avg: Some(completion_tokens_avg),
                 throughput_rps: Some(iterations as f64 / run_start.elapsed().as_secs_f64()),
@@ -495,9 +529,14 @@ async fn bench_chat(
                     } else {
                         0.0
                     }),
+                    tokens_per_second: None,
                     prompt_tokens: Some(sample.prompt_tokens),
                     completion_tokens: Some(sample.completion_tokens),
                     server_generation_ms: sample.generation_time_ms,
+                    server_processing_ms: None,
+                    audio_duration_secs: None,
+                    rtf: None,
+                    tokens_generated: None,
                 })
                 .collect(),
             telemetry: RuntimeTelemetryReport {
@@ -516,6 +555,7 @@ async fn bench_tts(
     model: &str,
     iterations: u32,
     text: &str,
+    concurrent: u32,
     warmup: bool,
     options: &BenchOptions,
     theme: &Theme,
@@ -523,6 +563,11 @@ async fn bench_tts(
     if iterations == 0 {
         return Err(CliError::InvalidInput(
             "Iterations must be greater than 0".to_string(),
+        ));
+    }
+    if concurrent == 0 {
+        return Err(CliError::InvalidInput(
+            "Concurrent requests must be greater than 0".to_string(),
         ));
     }
 
@@ -550,19 +595,57 @@ async fn bench_tts(
             .progress_chars("#>-"),
     );
 
-    let mut times = Vec::new();
+    let progress = Arc::new(pb);
+    let text = Arc::new(text.to_string());
+    let wall_start = Instant::now();
+    let samples: Vec<TtsBenchSample> = stream::iter(0..iterations)
+        .map(|_| {
+            let progress = Arc::clone(&progress);
+            let text = Arc::clone(&text);
+            let model = model.to_string();
+            let server = server.to_string();
+            async move {
+                let start = Instant::now();
+                let result =
+                    run_tts_request(&server, &model, text.as_str())
+                        .await
+                        .map(|mut sample| {
+                            sample.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+                            sample
+                        });
+                progress.inc(1);
+                result
+            }
+        })
+        .buffer_unordered(concurrent as usize)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    let wall_elapsed = wall_start.elapsed();
 
-    for _ in 0..iterations {
-        let start = std::time::Instant::now();
-        let _ = run_tts_request(server, model, text).await?;
-        let elapsed = start.elapsed().as_millis() as f64;
-        times.push(elapsed);
-        pb.inc(1);
-    }
-
-    pb.finish_with_message("Benchmark complete");
+    progress.finish_with_message("Benchmark complete");
 
     // Calculate statistics
+    let times: Vec<f64> = samples.iter().map(|sample| sample.total_ms).collect();
+    let generation_ms: Vec<f64> = samples
+        .iter()
+        .filter_map(|sample| sample.generation_time_ms)
+        .collect();
+    let audio_duration_secs: Vec<f64> = samples
+        .iter()
+        .filter_map(|sample| sample.audio_duration_secs)
+        .collect();
+    let rtf: Vec<f64> = samples.iter().filter_map(|sample| sample.rtf).collect();
+    let tokens_per_second: Vec<f64> = samples
+        .iter()
+        .filter_map(
+            |sample| match (sample.tokens_generated, sample.generation_time_ms) {
+                (Some(tokens), Some(ms)) if ms > 0.0 => Some(tokens as f64 * 1000.0 / ms),
+                _ => None,
+            },
+        )
+        .collect();
     let avg = times.iter().sum::<f64>() / times.len() as f64;
     let min = times.iter().cloned().fold(f64::INFINITY, f64::min);
     let max = times.iter().cloned().fold(0.0, f64::max);
@@ -573,13 +656,49 @@ async fn bench_tts(
     if options.human_output() {
         println!("\n{}", console::style("Results:").bold().underlined());
         println!("  Iterations: {}", iterations);
+        println!("  Concurrent: {}", concurrent);
         println!("  Average:    {:.2} ms", avg);
         println!("  Min:        {:.2} ms", min);
         println!("  Max:        {:.2} ms", max);
         println!("  P50:        {:.2} ms", p50);
         println!("  P95:        {:.2} ms", p95);
         println!("  P99:        {:.2} ms", p99);
-        println!("  Throughput: {:.2} req/s", 1000.0 / avg);
+        println!(
+            "  Throughput: {:.2} req/s",
+            iterations as f64 / wall_elapsed.as_secs_f64()
+        );
+        if !generation_ms.is_empty() {
+            println!(
+                "  Server generation (avg/p50/p95): {:.2} / {:.2} / {:.2} ms",
+                generation_ms.iter().sum::<f64>() / generation_ms.len() as f64,
+                percentile(&generation_ms, 0.5),
+                percentile(&generation_ms, 0.95)
+            );
+        }
+        if !audio_duration_secs.is_empty() {
+            println!(
+                "  Audio duration (avg/p50/p95):    {:.2} / {:.2} / {:.2} s",
+                audio_duration_secs.iter().sum::<f64>() / audio_duration_secs.len() as f64,
+                percentile(&audio_duration_secs, 0.5),
+                percentile(&audio_duration_secs, 0.95)
+            );
+        }
+        if !rtf.is_empty() {
+            println!(
+                "  RTF (avg/p50/p95):               {:.3} / {:.3} / {:.3}",
+                rtf.iter().sum::<f64>() / rtf.len() as f64,
+                percentile(&rtf, 0.5),
+                percentile(&rtf, 0.95)
+            );
+        }
+        if !tokens_per_second.is_empty() {
+            println!(
+                "  Tokens/sec (avg/p50/p95):        {:.2} / {:.2} / {:.2}",
+                tokens_per_second.iter().sum::<f64>() / tokens_per_second.len() as f64,
+                percentile(&tokens_per_second, 0.5),
+                percentile(&tokens_per_second, 0.95)
+            );
+        }
     }
     let metrics_after = fetch_runtime_metrics(server).await;
     if options.human_output() {
@@ -602,12 +721,12 @@ async fn bench_tts(
             config: BenchmarkRunConfig {
                 model: Some(model.to_string()),
                 iterations: Some(iterations),
-                concurrent: Some(1),
+                concurrent: Some(concurrent),
                 warmup,
                 prompt: None,
                 system: None,
                 max_tokens: None,
-                text: Some(text.to_string()),
+                text: Some(text.as_ref().clone()),
                 file: None,
                 language: None,
                 duration_secs: None,
@@ -617,26 +736,38 @@ async fn bench_tts(
                 ttft_ms: None,
                 end_to_end_ms: stats(&times),
                 completion_tps: None,
-                server_generation_ms: None,
+                tokens_per_second: stats(&tokens_per_second),
+                server_generation_ms: stats(&generation_ms),
+                server_processing_ms: None,
+                audio_duration_secs: stats(&audio_duration_secs),
+                rtf: stats(&rtf),
                 prompt_tokens_avg: None,
                 completion_tokens_avg: None,
-                throughput_rps: Some(1000.0 / avg),
+                throughput_rps: Some(iterations as f64 / wall_elapsed.as_secs_f64()),
                 successful: Some(iterations as u64),
                 failed: Some(0),
                 total: Some(iterations as u64),
             },
-            samples: times
+            samples: samples
                 .iter()
                 .enumerate()
-                .map(|(index, time)| BenchmarkSample {
+                .map(|(index, sample)| BenchmarkSample {
                     index: index + 1,
-                    latency_ms: Some(*time),
+                    latency_ms: Some(sample.total_ms),
                     ttft_ms: None,
-                    end_to_end_ms: Some(*time),
+                    end_to_end_ms: Some(sample.total_ms),
                     completion_tps: None,
+                    tokens_per_second: match (sample.tokens_generated, sample.generation_time_ms) {
+                        (Some(tokens), Some(ms)) if ms > 0.0 => Some(tokens as f64 * 1000.0 / ms),
+                        _ => None,
+                    },
                     prompt_tokens: None,
                     completion_tokens: None,
-                    server_generation_ms: None,
+                    server_generation_ms: sample.generation_time_ms,
+                    server_processing_ms: None,
+                    audio_duration_secs: sample.audio_duration_secs,
+                    rtf: sample.rtf,
+                    tokens_generated: sample.tokens_generated,
                 })
                 .collect(),
             telemetry: RuntimeTelemetryReport {
@@ -752,6 +883,18 @@ async fn bench_asr(
     progress.finish_with_message("Benchmark complete");
 
     let times: Vec<f64> = samples.iter().map(|sample| sample.total_ms).collect();
+    let audio_duration_secs: Vec<f64> = samples
+        .iter()
+        .filter_map(|sample| sample.response.duration)
+        .collect();
+    let processing_ms: Vec<f64> = samples
+        .iter()
+        .filter_map(|sample| sample.response.processing_time_ms)
+        .collect();
+    let rtf: Vec<f64> = samples
+        .iter()
+        .filter_map(|sample| sample.response.rtf)
+        .collect();
     let mut stage_samples = Vec::new();
     let mut saw_whisper_diagnostics = false;
     for sample in &samples {
@@ -789,6 +932,22 @@ async fn bench_asr(
             "  Throughput: {:.2} req/s",
             iterations as f64 / wall_elapsed.as_secs_f64()
         );
+        if !audio_duration_secs.is_empty() {
+            println!(
+                "  Audio duration (avg/p50/p95): {:.2} / {:.2} / {:.2} s",
+                audio_duration_secs.iter().sum::<f64>() / audio_duration_secs.len() as f64,
+                percentile(&audio_duration_secs, 0.5),
+                percentile(&audio_duration_secs, 0.95)
+            );
+        }
+        if !rtf.is_empty() {
+            println!(
+                "  RTF (avg/p50/p95):            {:.3} / {:.3} / {:.3}",
+                rtf.iter().sum::<f64>() / rtf.len() as f64,
+                percentile(&rtf, 0.5),
+                percentile(&rtf, 0.95)
+            );
+        }
         print_whisper_stage_timing_summary(&stage_samples);
     }
 
@@ -834,7 +993,11 @@ async fn bench_asr(
                 ttft_ms: None,
                 end_to_end_ms: stats(&times),
                 completion_tps: None,
+                tokens_per_second: None,
                 server_generation_ms: None,
+                server_processing_ms: stats(&processing_ms),
+                audio_duration_secs: stats(&audio_duration_secs),
+                rtf: stats(&rtf),
                 prompt_tokens_avg: None,
                 completion_tokens_avg: None,
                 throughput_rps: Some(iterations as f64 / wall_elapsed.as_secs_f64()),
@@ -851,9 +1014,14 @@ async fn bench_asr(
                     ttft_ms: None,
                     end_to_end_ms: Some(sample.total_ms),
                     completion_tps: None,
+                    tokens_per_second: None,
                     prompt_tokens: None,
                     completion_tokens: None,
                     server_generation_ms: None,
+                    server_processing_ms: sample.response.processing_time_ms,
+                    audio_duration_secs: sample.response.duration,
+                    rtf: sample.response.rtf,
+                    tokens_generated: None,
                 })
                 .collect(),
             telemetry: RuntimeTelemetryReport {
@@ -965,7 +1133,11 @@ async fn bench_throughput(
                 ttft_ms: None,
                 end_to_end_ms: None,
                 completion_tps: None,
+                tokens_per_second: None,
                 server_generation_ms: None,
+                server_processing_ms: None,
+                audio_duration_secs: None,
+                rtf: None,
                 prompt_tokens_avg: None,
                 completion_tokens_avg: None,
                 throughput_rps: Some(rps),
@@ -985,7 +1157,23 @@ async fn bench_throughput(
     Ok(())
 }
 
-async fn run_tts_request(server: &str, model: &str, text: &str) -> Result<()> {
+fn header_f64(response: &reqwest::Response, name: &'static str) -> Option<f64> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<f64>().ok())
+}
+
+fn header_u64(response: &reqwest::Response, name: &'static str) -> Option<u64> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+async fn run_tts_request(server: &str, model: &str, text: &str) -> Result<TtsBenchSample> {
     let client = http::client(Some(std::time::Duration::from_secs(300)))?;
     let request_body = serde_json::json!({
         "model": model,
@@ -1010,7 +1198,13 @@ async fn run_tts_request(server: &str, model: &str, text: &str) -> Result<()> {
         });
     }
 
-    Ok(())
+    Ok(TtsBenchSample {
+        total_ms: 0.0,
+        generation_time_ms: header_f64(&response, "x-generation-time-ms"),
+        audio_duration_secs: header_f64(&response, "x-audio-duration-secs"),
+        rtf: header_f64(&response, "x-rtf"),
+        tokens_generated: header_u64(&response, "x-tokens-generated"),
+    })
 }
 
 async fn run_asr_request(
@@ -1342,7 +1536,7 @@ fn print_whisper_stage_timing_summary(samples: &[WhisperStageTimings]) {
 
     println!(
         "\n{}",
-        console::style("Whisper Stage Timings (run-local):")
+        console::style("ASR Stage Timings (run-local):")
             .bold()
             .underlined()
     );

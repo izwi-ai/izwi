@@ -13,6 +13,19 @@ mod http;
 mod style;
 mod utils;
 
+#[cfg(test)]
+mod test_support {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("environment lock poisoned")
+    }
+}
+
 pub use app::cli::{
     AudioFormat, Backend, BenchCommands, Cli, Commands, ConfigCommands, LogFormat, ModelCommands,
     OutputFormat, ServeMode, Shell, TranscriptFormat,
