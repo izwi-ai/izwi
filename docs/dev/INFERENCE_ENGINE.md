@@ -499,10 +499,6 @@ These routes back the desktop UI's saved history and reusable assets. Canonical 
 | `POST` | `/v1/transcriptions/jobs/:id/reruns` | Canonical diarization rerun trigger for saved jobs |
 | `POST` | `/v1/transcriptions/jobs/:id/cancel` | Canonical diarization cancel trigger for in-flight jobs |
 | `POST` | `/v1/transcriptions/jobs/:id/summary/regenerate` | Canonical summary regeneration for both job kinds |
-| `GET, POST` | `/v1/transcriptions` | Legacy alias family for transcription-only list/create |
-| `GET, DELETE` | `/v1/transcriptions/:id` | Legacy alias family for transcription-only fetch/delete |
-| `GET` | `/v1/transcriptions/:id/audio` | Legacy alias family for transcription audio fetch |
-| `POST` | `/v1/transcriptions/:id/summary/regenerate` | Legacy transcription summary regeneration |
 | `GET, POST` | `/v1/diarizations` | List or create saved diarization records |
 | `GET, PATCH, PUT, DELETE` | `/v1/diarizations/:id` | Fetch, update, or delete a saved diarization record |
 | `GET` | `/v1/diarizations/:id/audio` | Fetch stored diarization source audio |
@@ -565,7 +561,6 @@ These routes back the desktop UI's saved history and reusable assets. Canonical 
 | `POST` | `/v1/audio/speech` | Text-to-speech synthesis |
 | `POST` | `/v1/audio/transcriptions` | Speech-to-text (Whisper) |
 | `POST` | `/v1/audio/diarizations` | Izwi-specific diarization API |
-| `POST` | `/v1/audio/diarize` | Legacy alias for `/v1/audio/diarizations` |
 | `POST` | `/v1/chat/completions` | Chat / LLM completions |
 | `GET` | `/v1/models` | List available models |
 | `GET` | `/v1/models/:model` | Fetch one available model |

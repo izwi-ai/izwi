@@ -24,7 +24,7 @@ When `izwi serve` is running:
 | `/v1/audio/transcriptions` | Stable | OpenAI-compatible transcription endpoint with local streaming support. |
 | `/livez`, `/readyz`, `/v1/live`, `/v1/ready`, `/v1/health` | Stable | Operational health and readiness endpoints. |
 | `/v1/responses*` | Preview | OpenAI-compatible Responses API shape with process-local response retention. |
-| `/v1/audio/diarizations`, `/v1/audio/diarize` | Preview | Izwi diarization API; OpenAI-style transport, not an upstream OpenAI endpoint. |
+| `/v1/audio/diarizations` | Preview | Izwi diarization API; OpenAI-style transport, not an upstream OpenAI endpoint. |
 | First-party workflow routes | Preview | Persisted local product APIs used by the web UI and desktop app. |
 | `/v1/admin/*` | Preview | Local model-management APIs. Bind carefully on shared hosts. |
 | WebSocket realtime routes | Preview | Browser-facing low-latency protocols that may evolve. |
@@ -351,12 +351,6 @@ curl -X POST http://localhost:8080/v1/audio/transcriptions \
 
 `POST /v1/audio/diarizations`
 
-Legacy alias:
-
-```text
-POST /v1/audio/diarize
-```
-
 This route is Izwi-specific preview API. It accepts JSON or multipart input in the same style as transcription.
 
 Request fields:
@@ -470,15 +464,6 @@ Canonical saved transcription and diarization job routes:
 | `POST` | `/v1/transcriptions/jobs/{record_id}/summary/regenerate` | Regenerate transcription or diarization summary. |
 
 The `job_kind` query parameter is important for shared IDs and for clients that want a specific record family.
-
-Legacy transcription-only routes:
-
-| Method | Path |
-|--------|------|
-| `GET`, `POST` | `/v1/transcriptions` |
-| `GET`, `DELETE` | `/v1/transcriptions/{record_id}` |
-| `GET` | `/v1/transcriptions/{record_id}/audio` |
-| `POST` | `/v1/transcriptions/{record_id}/summary/regenerate` |
 
 ### Diarization Records
 

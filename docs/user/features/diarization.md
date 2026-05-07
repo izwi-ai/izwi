@@ -68,12 +68,6 @@ Example output:
 POST /v1/audio/diarizations
 ```
 
-Legacy alias still accepted for older clients:
-
-```
-POST /v1/audio/diarize
-```
-
 ### Request (multipart/form-data)
 
 | Field | Type | Description |
@@ -130,8 +124,7 @@ Use `response_format=verbose_json` for words, utterances, speaker count,
 duration, alignment coverage, LLM refinement status, and processing metrics.
 Streaming diarization is not currently supported on this route.
 
-See the [API Reference](../api.md#audio-diarizations) for JSON input,
-legacy alias behavior, and exact response shapes.
+See the [API Reference](../api.md#audio-diarizations) for JSON input and exact response shapes.
 
 ---
 
