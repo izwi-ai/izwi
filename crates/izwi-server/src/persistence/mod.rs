@@ -403,21 +403,7 @@ fn sanitize_namespace(namespace: &str) -> String {
 }
 
 fn content_type_from_key(key: &str) -> &'static str {
-    match std::path::Path::new(key)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("wav") => "audio/wav",
-        Some("mp3") => "audio/mpeg",
-        Some("ogg") => "audio/ogg",
-        Some("flac") => "audio/flac",
-        Some("webm") => "audio/webm",
-        Some("m4a") => "audio/mp4",
-        Some("aac") => "audio/aac",
-        _ => "application/octet-stream",
-    }
+    storage_layout::content_type_from_media_path(key)
 }
 
 fn filename_from_key(key: &str) -> Option<String> {
@@ -505,6 +491,36 @@ mod tests {
             })
             .await
             .expect("delete media");
+    }
+
+    #[tokio::test]
+    async fn local_media_provider_preserves_image_and_video_content_types() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let provider = LocalMediaStorageProvider::new(temp_dir.path().to_path_buf());
+        let image_path = temp_dir.path().join("images/example.png");
+        let video_path = temp_dir.path().join("videos/example.mp4");
+        std::fs::create_dir_all(image_path.parent().expect("image parent")).expect("image dir");
+        std::fs::create_dir_all(video_path.parent().expect("video parent")).expect("video dir");
+        std::fs::write(&image_path, b"image").expect("image file");
+        std::fs::write(&video_path, b"video").expect("video file");
+
+        let image = provider
+            .get(MediaReadRequest {
+                key: MediaObjectKey::new("images/example.png"),
+                metadata: HookMetadata::new(),
+            })
+            .await
+            .expect("read image");
+        let video = provider
+            .get(MediaReadRequest {
+                key: MediaObjectKey::new("videos/example.mp4"),
+                metadata: HookMetadata::new(),
+            })
+            .await
+            .expect("read video");
+
+        assert_eq!(image.metadata.content_type, "image/png");
+        assert_eq!(video.metadata.content_type, "video/mp4");
     }
 
     #[tokio::test]

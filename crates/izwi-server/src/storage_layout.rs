@@ -1,6 +1,6 @@
 //! Shared storage layout and filesystem helpers for server persistence.
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use std::path::{Component, Path, PathBuf};
 
 const APP_NAME_DIR: &str = "izwi";
@@ -142,6 +142,39 @@ pub fn read_media_file(media_root: &Path, relative_path: &str) -> anyhow::Result
     let absolute_path = resolve_media_path(media_root, relative_path)?;
     std::fs::read(&absolute_path)
         .with_context(|| format!("Failed to read media file: {}", absolute_path.display()))
+}
+
+pub fn content_type_from_media_path(path: &str) -> &'static str {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
+
+    match extension.as_deref() {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("bmp") => "image/bmp",
+        Some("svg") => "image/svg+xml",
+        Some("avif") => "image/avif",
+        Some("heic") => "image/heic",
+        Some("heif") => "image/heif",
+        Some("mp4") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("mov") => "video/quicktime",
+        Some("avi") => "video/x-msvideo",
+        Some("mkv") => "video/x-matroska",
+        Some("mpeg") | Some("mpg") => "video/mpeg",
+        Some("3gp") => "video/3gpp",
+        Some("wav") => "audio/wav",
+        Some("mp3") => "audio/mpeg",
+        Some("ogg") => "audio/ogg",
+        Some("flac") => "audio/flac",
+        Some("m4a") => "audio/mp4",
+        Some("aac") => "audio/aac",
+        _ => "application/octet-stream",
+    }
 }
 
 pub fn delete_media_file(media_root: &Path, relative_path: Option<&str>) -> anyhow::Result<()> {

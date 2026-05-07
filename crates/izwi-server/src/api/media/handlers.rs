@@ -1,12 +1,12 @@
 use axum::{
     body::Body,
     extract::{Path, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::Response,
 };
 
 use crate::error::ApiError;
-use crate::persistence::{read_media_object, MediaStorageError};
+use crate::persistence::{MediaStorageError, read_media_object};
 use crate::state::AppState;
 use crate::storage_layout;
 
@@ -83,30 +83,7 @@ fn normalize_content_type(content_type: &str) -> Option<String> {
 }
 
 fn content_type_from_path(path: &str) -> &'static str {
-    let extension = std::path::Path::new(path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase());
-
-    match extension.as_deref() {
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("png") => "image/png",
-        Some("webp") => "image/webp",
-        Some("gif") => "image/gif",
-        Some("bmp") => "image/bmp",
-        Some("svg") => "image/svg+xml",
-        Some("avif") => "image/avif",
-        Some("heic") => "image/heic",
-        Some("heif") => "image/heif",
-        Some("mp4") => "video/mp4",
-        Some("webm") => "video/webm",
-        Some("mov") => "video/quicktime",
-        Some("avi") => "video/x-msvideo",
-        Some("mkv") => "video/x-matroska",
-        Some("mpeg") | Some("mpg") => "video/mpeg",
-        Some("3gp") => "video/3gpp",
-        _ => "application/octet-stream",
-    }
+    storage_layout::content_type_from_media_path(path)
 }
 
 #[cfg(test)]
