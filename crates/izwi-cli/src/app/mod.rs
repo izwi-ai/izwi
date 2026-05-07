@@ -174,7 +174,7 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
             .await?;
         }
         Commands::Bench { command } => {
-            commands::bench::execute(command, &server, &theme).await?;
+            commands::bench::execute(command, &server, output_format, quiet, &theme).await?;
         }
         Commands::Status { detailed, watch } => {
             commands::status::execute(detailed, watch, &server, &theme).await?;

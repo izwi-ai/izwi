@@ -1,12 +1,13 @@
 use crate::error::{CliError, Result};
 use crate::http;
 use crate::style::Theme;
-use crate::BenchCommands;
+use crate::{BenchCommands, OutputFormat};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use chrono::{DateTime, Utc};
 use futures::{stream, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -16,7 +17,7 @@ enum RuntimeTelemetryContext {
     AsrWhisper,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct RuntimeTelemetrySnapshot {
     requests_queued: u64,
     requests_completed: u64,
@@ -43,7 +44,7 @@ struct RuntimeTelemetrySnapshot {
     kernel_path: KernelPathTelemetrySnapshot,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct KernelPathTelemetrySnapshot {
     prefill_token_mode_steps_total: u64,
     prefill_sequence_spans_total: u64,
@@ -135,7 +136,107 @@ struct ChatStreamUsage {
     completion_tokens: usize,
 }
 
-pub async fn execute(command: BenchCommands, server: &str, theme: &Theme) -> Result<()> {
+#[derive(Clone)]
+struct BenchOptions {
+    output_format: OutputFormat,
+    quiet: bool,
+}
+
+impl BenchOptions {
+    fn human_output(&self) -> bool {
+        !matches!(self.output_format, OutputFormat::Json)
+    }
+
+    fn interactive(&self) -> bool {
+        self.human_output() && !self.quiet
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct BenchmarkReport {
+    schema_version: u32,
+    command: &'static str,
+    server: String,
+    started_at: DateTime<Utc>,
+    ended_at: DateTime<Utc>,
+    duration_ms: f64,
+    config: BenchmarkRunConfig,
+    summary: BenchmarkSummary,
+    samples: Vec<BenchmarkSample>,
+    telemetry: RuntimeTelemetryReport,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchmarkRunConfig {
+    model: Option<String>,
+    iterations: Option<u32>,
+    concurrent: Option<u32>,
+    warmup: bool,
+    prompt: Option<String>,
+    system: Option<String>,
+    max_tokens: Option<usize>,
+    text: Option<String>,
+    file: Option<String>,
+    language: Option<String>,
+    duration_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchmarkSummary {
+    latency_ms: Option<Stats>,
+    ttft_ms: Option<Stats>,
+    end_to_end_ms: Option<Stats>,
+    completion_tps: Option<Stats>,
+    server_generation_ms: Option<Stats>,
+    prompt_tokens_avg: Option<f64>,
+    completion_tokens_avg: Option<f64>,
+    throughput_rps: Option<f64>,
+    successful: Option<u64>,
+    failed: Option<u64>,
+    total: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct Stats {
+    count: usize,
+    avg: f64,
+    min: f64,
+    max: f64,
+    p50: f64,
+    p95: f64,
+    p99: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchmarkSample {
+    index: usize,
+    latency_ms: Option<f64>,
+    ttft_ms: Option<f64>,
+    end_to_end_ms: Option<f64>,
+    completion_tps: Option<f64>,
+    prompt_tokens: Option<usize>,
+    completion_tokens: Option<usize>,
+    server_generation_ms: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeTelemetryReport {
+    delta_available: bool,
+    before: Option<RuntimeTelemetrySnapshot>,
+    after: Option<RuntimeTelemetrySnapshot>,
+}
+
+pub async fn execute(
+    command: BenchCommands,
+    server: &str,
+    output_format: OutputFormat,
+    quiet: bool,
+    theme: &Theme,
+) -> Result<()> {
+    let options = BenchOptions {
+        output_format,
+        quiet,
+    };
     match command {
         BenchCommands::Chat {
             model,
@@ -155,6 +256,7 @@ pub async fn execute(command: BenchCommands, server: &str, theme: &Theme) -> Res
                 max_tokens,
                 concurrent,
                 warmup,
+                &options,
                 theme,
             )
             .await
@@ -164,7 +266,7 @@ pub async fn execute(command: BenchCommands, server: &str, theme: &Theme) -> Res
             iterations,
             text,
             warmup,
-        } => bench_tts(server, &model, iterations, &text, warmup, theme).await,
+        } => bench_tts(server, &model, iterations, &text, warmup, &options, theme).await,
         BenchCommands::Asr {
             model,
             iterations,
@@ -181,6 +283,7 @@ pub async fn execute(command: BenchCommands, server: &str, theme: &Theme) -> Res
                 language.as_deref(),
                 concurrent,
                 warmup,
+                &options,
                 theme,
             )
             .await
@@ -188,7 +291,7 @@ pub async fn execute(command: BenchCommands, server: &str, theme: &Theme) -> Res
         BenchCommands::Throughput {
             duration,
             concurrent,
-        } => bench_throughput(server, duration, concurrent, theme).await,
+        } => bench_throughput(server, duration, concurrent, &options, theme).await,
     }
 }
 
@@ -201,6 +304,7 @@ async fn bench_chat(
     max_tokens: usize,
     concurrent: u32,
     warmup: bool,
+    options: &BenchOptions,
     theme: &Theme,
 ) -> Result<()> {
     if iterations == 0 {
@@ -219,15 +323,21 @@ async fn bench_chat(
         ));
     }
 
-    theme.step(1, 3, &format!("Benchmarking chat with '{}'", model));
+    if options.interactive() {
+        theme.step(1, 3, &format!("Benchmarking chat with '{}'", model));
+    }
+    let started_at = Utc::now();
+    let run_start = Instant::now();
     let metrics_before = fetch_runtime_metrics(server).await;
 
     if warmup {
-        theme.info("Running warmup iteration...");
+        if options.interactive() {
+            theme.info("Running warmup iteration...");
+        }
         let _ = run_chat_request(server, model, prompt, system, max_tokens).await?;
     }
 
-    let pb = ProgressBar::new(iterations as u64);
+    let pb = progress_bar(options.interactive(), iterations as u64);
     pb.set_style(
         ProgressStyle::default_bar()
             .template(
@@ -295,42 +405,108 @@ async fn bench_chat(
         .sum::<f64>()
         / samples.len() as f64;
 
-    println!("\n{}", console::style("Results:").bold().underlined());
-    println!("  Iterations: {}", iterations);
-    println!("  Concurrent: {}", concurrent);
-    println!("  Prompt tokens (avg):      {:.2}", prompt_tokens_avg);
-    println!("  Completion tokens (avg):  {:.2}", completion_tokens_avg);
-    println!(
-        "  TTFT (avg/p50/p95):       {:.2} / {:.2} / {:.2} ms",
-        ttft_ms.iter().sum::<f64>() / ttft_ms.len() as f64,
-        percentile(&ttft_ms, 0.5),
-        percentile(&ttft_ms, 0.95)
-    );
-    println!(
-        "  End-to-end (avg/p50/p95): {:.2} / {:.2} / {:.2} ms",
-        total_ms.iter().sum::<f64>() / total_ms.len() as f64,
-        percentile(&total_ms, 0.5),
-        percentile(&total_ms, 0.95)
-    );
-    println!(
-        "  Completion TPS (avg/p50/p95): {:.2} / {:.2} / {:.2} tok/s",
-        completion_tps.iter().sum::<f64>() / completion_tps.len() as f64,
-        percentile(&completion_tps, 0.5),
-        percentile(&completion_tps, 0.95)
-    );
-    if !server_generation_ms.is_empty() {
+    if options.human_output() {
+        println!("\n{}", console::style("Results:").bold().underlined());
+        println!("  Iterations: {}", iterations);
+        println!("  Concurrent: {}", concurrent);
+        println!("  Prompt tokens (avg):      {:.2}", prompt_tokens_avg);
+        println!("  Completion tokens (avg):  {:.2}", completion_tokens_avg);
         println!(
-            "  Server generation (avg/p50/p95): {:.2} / {:.2} / {:.2} ms",
-            server_generation_ms.iter().sum::<f64>() / server_generation_ms.len() as f64,
-            percentile(&server_generation_ms, 0.5),
-            percentile(&server_generation_ms, 0.95)
+            "  TTFT (avg/p50/p95):       {:.2} / {:.2} / {:.2} ms",
+            ttft_ms.iter().sum::<f64>() / ttft_ms.len() as f64,
+            percentile(&ttft_ms, 0.5),
+            percentile(&ttft_ms, 0.95)
+        );
+        println!(
+            "  End-to-end (avg/p50/p95): {:.2} / {:.2} / {:.2} ms",
+            total_ms.iter().sum::<f64>() / total_ms.len() as f64,
+            percentile(&total_ms, 0.5),
+            percentile(&total_ms, 0.95)
+        );
+        println!(
+            "  Completion TPS (avg/p50/p95): {:.2} / {:.2} / {:.2} tok/s",
+            completion_tps.iter().sum::<f64>() / completion_tps.len() as f64,
+            percentile(&completion_tps, 0.5),
+            percentile(&completion_tps, 0.95)
+        );
+        if !server_generation_ms.is_empty() {
+            println!(
+                "  Server generation (avg/p50/p95): {:.2} / {:.2} / {:.2} ms",
+                server_generation_ms.iter().sum::<f64>() / server_generation_ms.len() as f64,
+                percentile(&server_generation_ms, 0.5),
+                percentile(&server_generation_ms, 0.95)
+            );
+        }
+    }
+    let metrics_after = fetch_runtime_metrics(server).await;
+    if options.human_output() {
+        print_runtime_delta(
+            metrics_before.clone(),
+            metrics_after.clone(),
+            RuntimeTelemetryContext::Default,
         );
     }
-    print_runtime_delta(
-        metrics_before,
-        fetch_runtime_metrics(server).await,
-        RuntimeTelemetryContext::Default,
-    );
+    let ended_at = Utc::now();
+    emit_report(
+        options,
+        BenchmarkReport {
+            schema_version: 1,
+            command: "chat",
+            server: server.to_string(),
+            started_at,
+            ended_at,
+            duration_ms: run_start.elapsed().as_secs_f64() * 1000.0,
+            config: BenchmarkRunConfig {
+                model: Some(model.to_string()),
+                iterations: Some(iterations),
+                concurrent: Some(concurrent),
+                warmup,
+                prompt: Some(prompt.to_string()),
+                system: system.as_deref().map(|value| value.to_string()),
+                max_tokens: Some(max_tokens),
+                text: None,
+                file: None,
+                language: None,
+                duration_secs: None,
+            },
+            summary: BenchmarkSummary {
+                latency_ms: None,
+                ttft_ms: stats(&ttft_ms),
+                end_to_end_ms: stats(&total_ms),
+                completion_tps: stats(&completion_tps),
+                server_generation_ms: stats(&server_generation_ms),
+                prompt_tokens_avg: Some(prompt_tokens_avg),
+                completion_tokens_avg: Some(completion_tokens_avg),
+                throughput_rps: Some(iterations as f64 / run_start.elapsed().as_secs_f64()),
+                successful: Some(iterations as u64),
+                failed: Some(0),
+                total: Some(iterations as u64),
+            },
+            samples: samples
+                .iter()
+                .enumerate()
+                .map(|(index, sample)| BenchmarkSample {
+                    index: index + 1,
+                    latency_ms: Some(sample.total_ms),
+                    ttft_ms: Some(sample.ttft_ms),
+                    end_to_end_ms: Some(sample.total_ms),
+                    completion_tps: Some(if sample.total_ms > 0.0 {
+                        sample.completion_tokens as f64 * 1000.0 / sample.total_ms
+                    } else {
+                        0.0
+                    }),
+                    prompt_tokens: Some(sample.prompt_tokens),
+                    completion_tokens: Some(sample.completion_tokens),
+                    server_generation_ms: sample.generation_time_ms,
+                })
+                .collect(),
+            telemetry: RuntimeTelemetryReport {
+                delta_available: metrics_before.is_some() && metrics_after.is_some(),
+                before: metrics_before,
+                after: metrics_after,
+            },
+        },
+    )?;
 
     Ok(())
 }
@@ -341,6 +517,7 @@ async fn bench_tts(
     iterations: u32,
     text: &str,
     warmup: bool,
+    options: &BenchOptions,
     theme: &Theme,
 ) -> Result<()> {
     if iterations == 0 {
@@ -349,15 +526,21 @@ async fn bench_tts(
         ));
     }
 
-    theme.step(1, 3, &format!("Benchmarking TTS with '{}'", model));
+    if options.interactive() {
+        theme.step(1, 3, &format!("Benchmarking TTS with '{}'", model));
+    }
+    let started_at = Utc::now();
+    let run_start = Instant::now();
     let metrics_before = fetch_runtime_metrics(server).await;
 
     if warmup {
-        theme.info("Running warmup iteration...");
+        if options.interactive() {
+            theme.info("Running warmup iteration...");
+        }
         let _ = run_tts_request(server, model, text).await?;
     }
 
-    let pb = ProgressBar::new(iterations as u64);
+    let pb = progress_bar(options.interactive(), iterations as u64);
     pb.set_style(
         ProgressStyle::default_bar()
             .template(
@@ -387,20 +570,82 @@ async fn bench_tts(
     let p95 = percentile(&times, 0.95);
     let p99 = percentile(&times, 0.99);
 
-    println!("\n{}", console::style("Results:").bold().underlined());
-    println!("  Iterations: {}", iterations);
-    println!("  Average:    {:.2} ms", avg);
-    println!("  Min:        {:.2} ms", min);
-    println!("  Max:        {:.2} ms", max);
-    println!("  P50:        {:.2} ms", p50);
-    println!("  P95:        {:.2} ms", p95);
-    println!("  P99:        {:.2} ms", p99);
-    println!("  Throughput: {:.2} req/s", 1000.0 / avg);
-    print_runtime_delta(
-        metrics_before,
-        fetch_runtime_metrics(server).await,
-        RuntimeTelemetryContext::Default,
-    );
+    if options.human_output() {
+        println!("\n{}", console::style("Results:").bold().underlined());
+        println!("  Iterations: {}", iterations);
+        println!("  Average:    {:.2} ms", avg);
+        println!("  Min:        {:.2} ms", min);
+        println!("  Max:        {:.2} ms", max);
+        println!("  P50:        {:.2} ms", p50);
+        println!("  P95:        {:.2} ms", p95);
+        println!("  P99:        {:.2} ms", p99);
+        println!("  Throughput: {:.2} req/s", 1000.0 / avg);
+    }
+    let metrics_after = fetch_runtime_metrics(server).await;
+    if options.human_output() {
+        print_runtime_delta(
+            metrics_before.clone(),
+            metrics_after.clone(),
+            RuntimeTelemetryContext::Default,
+        );
+    }
+    let ended_at = Utc::now();
+    emit_report(
+        options,
+        BenchmarkReport {
+            schema_version: 1,
+            command: "tts",
+            server: server.to_string(),
+            started_at,
+            ended_at,
+            duration_ms: run_start.elapsed().as_secs_f64() * 1000.0,
+            config: BenchmarkRunConfig {
+                model: Some(model.to_string()),
+                iterations: Some(iterations),
+                concurrent: Some(1),
+                warmup,
+                prompt: None,
+                system: None,
+                max_tokens: None,
+                text: Some(text.to_string()),
+                file: None,
+                language: None,
+                duration_secs: None,
+            },
+            summary: BenchmarkSummary {
+                latency_ms: stats(&times),
+                ttft_ms: None,
+                end_to_end_ms: stats(&times),
+                completion_tps: None,
+                server_generation_ms: None,
+                prompt_tokens_avg: None,
+                completion_tokens_avg: None,
+                throughput_rps: Some(1000.0 / avg),
+                successful: Some(iterations as u64),
+                failed: Some(0),
+                total: Some(iterations as u64),
+            },
+            samples: times
+                .iter()
+                .enumerate()
+                .map(|(index, time)| BenchmarkSample {
+                    index: index + 1,
+                    latency_ms: Some(*time),
+                    ttft_ms: None,
+                    end_to_end_ms: Some(*time),
+                    completion_tps: None,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    server_generation_ms: None,
+                })
+                .collect(),
+            telemetry: RuntimeTelemetryReport {
+                delta_available: metrics_before.is_some() && metrics_after.is_some(),
+                before: metrics_before,
+                after: metrics_after,
+            },
+        },
+    )?;
 
     Ok(())
 }
@@ -413,6 +658,7 @@ async fn bench_asr(
     language: Option<&str>,
     concurrent: u32,
     warmup: bool,
+    options: &BenchOptions,
     theme: &Theme,
 ) -> Result<()> {
     if iterations == 0 {
@@ -426,7 +672,11 @@ async fn bench_asr(
         ));
     }
 
-    theme.step(1, 3, &format!("Benchmarking ASR with '{}'", model));
+    if options.interactive() {
+        theme.step(1, 3, &format!("Benchmarking ASR with '{}'", model));
+    }
+    let started_at = Utc::now();
+    let run_start = Instant::now();
     let metrics_before = fetch_runtime_metrics(server).await;
 
     // Use sample audio if no file provided
@@ -442,15 +692,19 @@ async fn bench_asr(
     let audio_data = tokio::fs::read(&audio_file).await.map_err(CliError::Io)?;
     let audio_base64 = STANDARD.encode(&audio_data);
     if let Some(language) = language {
-        theme.info(&format!("Using language hint: {}", language));
+        if options.interactive() {
+            theme.info(&format!("Using language hint: {}", language));
+        }
     }
 
     if warmup {
-        theme.info("Running warmup iteration...");
+        if options.interactive() {
+            theme.info("Running warmup iteration...");
+        }
         let _ = run_asr_request(server, model, &audio_base64, language).await?;
     }
 
-    let pb = ProgressBar::new(iterations as u64);
+    let pb = progress_bar(options.interactive(), iterations as u64);
     pb.set_style(
         ProgressStyle::default_bar()
             .template(
@@ -521,20 +775,22 @@ async fn bench_asr(
     let p50 = percentile(&times, 0.5);
     let p95 = percentile(&times, 0.95);
     let p99 = percentile(&times, 0.99);
-    println!("\n{}", console::style("Results:").bold().underlined());
-    println!("  Iterations: {}", iterations);
-    println!("  Concurrent: {}", concurrent);
-    println!("  Average:    {:.2} ms", avg);
-    println!("  Min:        {:.2} ms", min);
-    println!("  Max:        {:.2} ms", max);
-    println!("  P50:        {:.2} ms", p50);
-    println!("  P95:        {:.2} ms", p95);
-    println!("  P99:        {:.2} ms", p99);
-    println!(
-        "  Throughput: {:.2} req/s",
-        iterations as f64 / wall_elapsed.as_secs_f64()
-    );
-    print_whisper_stage_timing_summary(&stage_samples);
+    if options.human_output() {
+        println!("\n{}", console::style("Results:").bold().underlined());
+        println!("  Iterations: {}", iterations);
+        println!("  Concurrent: {}", concurrent);
+        println!("  Average:    {:.2} ms", avg);
+        println!("  Min:        {:.2} ms", min);
+        println!("  Max:        {:.2} ms", max);
+        println!("  P50:        {:.2} ms", p50);
+        println!("  P95:        {:.2} ms", p95);
+        println!("  P99:        {:.2} ms", p99);
+        println!(
+            "  Throughput: {:.2} req/s",
+            iterations as f64 / wall_elapsed.as_secs_f64()
+        );
+        print_whisper_stage_timing_summary(&stage_samples);
+    }
 
     let model_lower = model.to_ascii_lowercase();
     let telemetry_context = if saw_whisper_diagnostics || model_lower.contains("whisper") {
@@ -542,11 +798,71 @@ async fn bench_asr(
     } else {
         RuntimeTelemetryContext::Default
     };
-    print_runtime_delta(
-        metrics_before,
-        fetch_runtime_metrics(server).await,
-        telemetry_context,
-    );
+    let metrics_after = fetch_runtime_metrics(server).await;
+    if options.human_output() {
+        print_runtime_delta(
+            metrics_before.clone(),
+            metrics_after.clone(),
+            telemetry_context,
+        );
+    }
+    let ended_at = Utc::now();
+    emit_report(
+        options,
+        BenchmarkReport {
+            schema_version: 1,
+            command: "asr",
+            server: server.to_string(),
+            started_at,
+            ended_at,
+            duration_ms: run_start.elapsed().as_secs_f64() * 1000.0,
+            config: BenchmarkRunConfig {
+                model: Some(model.to_string()),
+                iterations: Some(iterations),
+                concurrent: Some(concurrent),
+                warmup,
+                prompt: None,
+                system: None,
+                max_tokens: None,
+                text: None,
+                file: Some(audio_file.display().to_string()),
+                language: language.as_deref().map(|value| value.to_string()),
+                duration_secs: None,
+            },
+            summary: BenchmarkSummary {
+                latency_ms: stats(&times),
+                ttft_ms: None,
+                end_to_end_ms: stats(&times),
+                completion_tps: None,
+                server_generation_ms: None,
+                prompt_tokens_avg: None,
+                completion_tokens_avg: None,
+                throughput_rps: Some(iterations as f64 / wall_elapsed.as_secs_f64()),
+                successful: Some(iterations as u64),
+                failed: Some(0),
+                total: Some(iterations as u64),
+            },
+            samples: samples
+                .iter()
+                .enumerate()
+                .map(|(index, sample)| BenchmarkSample {
+                    index: index + 1,
+                    latency_ms: Some(sample.total_ms),
+                    ttft_ms: None,
+                    end_to_end_ms: Some(sample.total_ms),
+                    completion_tps: None,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    server_generation_ms: None,
+                })
+                .collect(),
+            telemetry: RuntimeTelemetryReport {
+                delta_available: metrics_before.is_some() && metrics_after.is_some(),
+                before: metrics_before,
+                after: metrics_after,
+            },
+        },
+    )?;
 
     Ok(())
 }
@@ -555,6 +871,7 @@ async fn bench_throughput(
     server: &str,
     duration: u64,
     concurrent: u32,
+    options: &BenchOptions,
     theme: &Theme,
 ) -> Result<()> {
     if duration == 0 {
@@ -568,13 +885,19 @@ async fn bench_throughput(
         ));
     }
 
-    theme.step(
-        1,
-        1,
-        &format!("Throughput test: {}s, {} concurrent", duration, concurrent),
-    );
+    if options.interactive() {
+        theme.step(
+            1,
+            1,
+            &format!("Throughput test: {}s, {} concurrent", duration, concurrent),
+        );
+    }
+    let started_at = Utc::now();
+    let run_start = Instant::now();
 
-    println!("Running throughput benchmark against /livez...");
+    if options.human_output() {
+        println!("Running throughput benchmark against /livez...");
+    }
     let client = http::client(Some(std::time::Duration::from_secs(5)))?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(duration);
 
@@ -607,11 +930,57 @@ async fn bench_throughput(
 
     let total = success + failed;
     let rps = total as f64 / duration as f64;
-    println!("\n{}", console::style("Results:").bold().underlined());
-    println!("  Successful: {:.0}", success);
-    println!("  Failed:     {:.0}", failed);
-    println!("  Total:      {:.0}", total);
-    println!("  Throughput: {:.2} req/s", rps);
+    if options.human_output() {
+        println!("\n{}", console::style("Results:").bold().underlined());
+        println!("  Successful: {:.0}", success);
+        println!("  Failed:     {:.0}", failed);
+        println!("  Total:      {:.0}", total);
+        println!("  Throughput: {:.2} req/s", rps);
+    }
+    let ended_at = Utc::now();
+    emit_report(
+        options,
+        BenchmarkReport {
+            schema_version: 1,
+            command: "throughput",
+            server: server.to_string(),
+            started_at,
+            ended_at,
+            duration_ms: run_start.elapsed().as_secs_f64() * 1000.0,
+            config: BenchmarkRunConfig {
+                model: None,
+                iterations: None,
+                concurrent: Some(concurrent),
+                warmup: false,
+                prompt: None,
+                system: None,
+                max_tokens: None,
+                text: None,
+                file: None,
+                language: None,
+                duration_secs: Some(duration),
+            },
+            summary: BenchmarkSummary {
+                latency_ms: None,
+                ttft_ms: None,
+                end_to_end_ms: None,
+                completion_tps: None,
+                server_generation_ms: None,
+                prompt_tokens_avg: None,
+                completion_tokens_avg: None,
+                throughput_rps: Some(rps),
+                successful: Some(success),
+                failed: Some(failed),
+                total: Some(total),
+            },
+            samples: Vec::new(),
+            telemetry: RuntimeTelemetryReport {
+                delta_available: false,
+                before: None,
+                after: None,
+            },
+        },
+    )?;
 
     Ok(())
 }
@@ -836,6 +1205,39 @@ fn percentile(data: &[f64], p: f64) -> f64 {
     sorted.sort_by(|a, b| a.total_cmp(b));
     let index = (p * (sorted.len() - 1) as f64) as usize;
     sorted[index]
+}
+
+fn stats(data: &[f64]) -> Option<Stats> {
+    if data.is_empty() {
+        return None;
+    }
+
+    Some(Stats {
+        count: data.len(),
+        avg: data.iter().sum::<f64>() / data.len() as f64,
+        min: data.iter().copied().fold(f64::INFINITY, f64::min),
+        max: data.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        p50: percentile(data, 0.5),
+        p95: percentile(data, 0.95),
+        p99: percentile(data, 0.99),
+    })
+}
+
+fn progress_bar(visible: bool, len: u64) -> ProgressBar {
+    if visible {
+        ProgressBar::new(len)
+    } else {
+        ProgressBar::hidden()
+    }
+}
+
+fn emit_report(options: &BenchOptions, report: BenchmarkReport) -> Result<()> {
+    if matches!(options.output_format, OutputFormat::Json) {
+        let payload = serde_json::to_string_pretty(&report)
+            .map_err(|e| CliError::Other(format!("Failed to serialize benchmark report: {e}")))?;
+        println!("{payload}");
+    }
+    Ok(())
 }
 
 async fn fetch_runtime_metrics(server: &str) -> Option<RuntimeTelemetrySnapshot> {
