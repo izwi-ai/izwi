@@ -219,16 +219,6 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
     );
     add_operation(
         paths,
-        "/v1/audio/diarize",
-        "post",
-        "OpenAI Compatible",
-        "Create diarization legacy alias",
-        "Legacy alias for /v1/audio/diarizations.",
-        preview_response(),
-    );
-
-    add_operation(
-        paths,
         "/v1/admin/models",
         "get",
         "Admin",
@@ -349,43 +339,6 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "Regenerate speech-to-text summary",
         "Regenerate a transcription or diarization summary.",
         &[("record_id", "Speech-text job identifier")],
-        preview_response(),
-    );
-
-    add_collection(
-        paths,
-        "/v1/transcriptions",
-        "Speech to Text",
-        "transcription records",
-        "transcription record",
-        "Legacy transcription-only list/create route family.",
-    );
-    add_get_delete_member(
-        paths,
-        "/v1/transcriptions/{record_id}",
-        "Speech to Text",
-        "transcription record",
-        "Fetch or delete a transcription-only record.",
-        &[("record_id", "Transcription record identifier")],
-    );
-    add_operation_with_params(
-        paths,
-        "/v1/transcriptions/{record_id}/audio",
-        "get",
-        "Speech to Text",
-        "Download transcription audio",
-        "Fetch stored transcription source audio.",
-        &[("record_id", "Transcription record identifier")],
-        binary_response(),
-    );
-    add_operation_with_params(
-        paths,
-        "/v1/transcriptions/{record_id}/summary/regenerate",
-        "post",
-        "Speech to Text",
-        "Regenerate transcription summary",
-        "Regenerate a transcription summary.",
-        &[("record_id", "Transcription record identifier")],
         preview_response(),
     );
 
@@ -1987,6 +1940,25 @@ mod tests {
                     "{method} {path} summary should start with an approved action verb: {summary}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn openapi_omits_legacy_sidebar_routes() {
+        let openapi = document();
+        let paths = openapi["paths"].as_object().expect("paths should exist");
+
+        for legacy_path in [
+            "/v1/audio/diarize",
+            "/v1/transcriptions",
+            "/v1/transcriptions/{record_id}",
+            "/v1/transcriptions/{record_id}/audio",
+            "/v1/transcriptions/{record_id}/summary/regenerate",
+        ] {
+            assert!(
+                !paths.contains_key(legacy_path),
+                "{legacy_path} should not be documented in OpenAPI"
+            );
         }
     }
 }
