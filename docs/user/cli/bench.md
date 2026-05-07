@@ -164,6 +164,24 @@ concurrent = 2
 
 Supported `command` values are `chat`, `tts`, `asr`, and `throughput`. Relative ASR file paths resolve from the manifest directory.
 
+Each benchmark can include a `[benchmarks.matrix]` table to generate a cartesian matrix from array values. Scalar values on the benchmark are used as defaults, and matrix values override them per generated case.
+
+```toml
+[[benchmarks]]
+name = "chat-short"
+command = "chat"
+prompt = "Summarize why batching helps transformer prefill."
+iterations = 10
+warmup = true
+
+[benchmarks.matrix]
+model = ["Qwen3.5-4B", "Qwen3.5-8B"]
+concurrent = [1, 2, 4]
+max_tokens = [64, 128]
+```
+
+The example expands to 12 named cases such as `chat-short[model=Qwen3.5-4B,concurrent=1,max_tokens=64]`. Duplicate expanded case names are rejected so JSON reports can be compared safely by case identity.
+
 When `--artifact-dir` is provided, the CLI writes:
 
 - `report.json` — suite report with all case summaries and samples

@@ -151,6 +151,8 @@ izwi --output-format json bench run benchmarks/local.toml --artifact-dir benchma
 izwi bench compare current.json baseline.json --tolerance-percent 5
 ```
 
+Benchmark manifests support `[benchmarks.matrix]` tables for cartesian runs across fields like `model`, `concurrent`, `max_tokens`, `file`, and `duration_secs`.
+
 ### Config
 
 ```bash

@@ -258,7 +258,7 @@ struct BenchmarkManifest {
     benchmarks: Vec<BenchmarkManifestCase>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct BenchmarkManifestCase {
     name: Option<String>,
     command: String,
@@ -273,6 +273,43 @@ struct BenchmarkManifestCase {
     file: Option<String>,
     language: Option<String>,
     duration_secs: Option<u64>,
+    matrix: Option<BenchmarkManifestMatrix>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct BenchmarkManifestMatrix {
+    model: Option<Vec<String>>,
+    iterations: Option<Vec<u32>>,
+    concurrent: Option<Vec<u32>>,
+    warmup: Option<Vec<bool>>,
+    prompt: Option<Vec<String>>,
+    system: Option<Vec<String>>,
+    max_tokens: Option<Vec<usize>>,
+    text: Option<Vec<String>>,
+    file: Option<Vec<String>>,
+    language: Option<Vec<String>>,
+    duration_secs: Option<Vec<u64>>,
+}
+
+#[derive(Debug, Clone)]
+struct MatrixDimension {
+    key: &'static str,
+    values: Vec<MatrixValue>,
+}
+
+#[derive(Debug, Clone)]
+enum MatrixValue {
+    Model(String),
+    Iterations(u32),
+    Concurrent(u32),
+    Warmup(bool),
+    Prompt(String),
+    System(String),
+    MaxTokens(usize),
+    Text(String),
+    File(String),
+    Language(String),
+    DurationSecs(u64),
 }
 
 #[derive(Debug, Serialize)]
@@ -530,6 +567,198 @@ fn format_case_list(cases: &[String]) -> String {
     }
 }
 
+impl MatrixValue {
+    fn apply(&self, case: &mut BenchmarkManifestCase) {
+        match self {
+            MatrixValue::Model(value) => case.model = Some(value.clone()),
+            MatrixValue::Iterations(value) => case.iterations = Some(*value),
+            MatrixValue::Concurrent(value) => case.concurrent = Some(*value),
+            MatrixValue::Warmup(value) => case.warmup = Some(*value),
+            MatrixValue::Prompt(value) => case.prompt = Some(value.clone()),
+            MatrixValue::System(value) => case.system = Some(value.clone()),
+            MatrixValue::MaxTokens(value) => case.max_tokens = Some(*value),
+            MatrixValue::Text(value) => case.text = Some(value.clone()),
+            MatrixValue::File(value) => case.file = Some(value.clone()),
+            MatrixValue::Language(value) => case.language = Some(value.clone()),
+            MatrixValue::DurationSecs(value) => case.duration_secs = Some(*value),
+        }
+    }
+
+    fn label_value(&self) -> String {
+        match self {
+            MatrixValue::Model(value)
+            | MatrixValue::Prompt(value)
+            | MatrixValue::System(value)
+            | MatrixValue::Text(value)
+            | MatrixValue::File(value)
+            | MatrixValue::Language(value) => matrix_label_string(value),
+            MatrixValue::Iterations(value) => value.to_string(),
+            MatrixValue::Concurrent(value) => value.to_string(),
+            MatrixValue::MaxTokens(value) => value.to_string(),
+            MatrixValue::DurationSecs(value) => value.to_string(),
+            MatrixValue::Warmup(value) => value.to_string(),
+        }
+    }
+}
+
+impl BenchmarkManifestMatrix {
+    fn dimensions(&self) -> Result<Vec<MatrixDimension>> {
+        let mut dimensions = Vec::new();
+        add_matrix_dimension(&mut dimensions, "model", &self.model, MatrixValue::Model)?;
+        add_matrix_dimension(
+            &mut dimensions,
+            "iterations",
+            &self.iterations,
+            MatrixValue::Iterations,
+        )?;
+        add_matrix_dimension(
+            &mut dimensions,
+            "concurrent",
+            &self.concurrent,
+            MatrixValue::Concurrent,
+        )?;
+        add_matrix_dimension(&mut dimensions, "warmup", &self.warmup, MatrixValue::Warmup)?;
+        add_matrix_dimension(&mut dimensions, "prompt", &self.prompt, MatrixValue::Prompt)?;
+        add_matrix_dimension(&mut dimensions, "system", &self.system, MatrixValue::System)?;
+        add_matrix_dimension(
+            &mut dimensions,
+            "max_tokens",
+            &self.max_tokens,
+            MatrixValue::MaxTokens,
+        )?;
+        add_matrix_dimension(&mut dimensions, "text", &self.text, MatrixValue::Text)?;
+        add_matrix_dimension(&mut dimensions, "file", &self.file, MatrixValue::File)?;
+        add_matrix_dimension(
+            &mut dimensions,
+            "language",
+            &self.language,
+            MatrixValue::Language,
+        )?;
+        add_matrix_dimension(
+            &mut dimensions,
+            "duration_secs",
+            &self.duration_secs,
+            MatrixValue::DurationSecs,
+        )?;
+        if dimensions.is_empty() {
+            return Err(CliError::InvalidInput(
+                "Benchmark matrix must include at least one non-empty field".to_string(),
+            ));
+        }
+        Ok(dimensions)
+    }
+}
+
+fn add_matrix_dimension<T, F>(
+    dimensions: &mut Vec<MatrixDimension>,
+    key: &'static str,
+    values: &Option<Vec<T>>,
+    map: F,
+) -> Result<()>
+where
+    T: Clone,
+    F: Fn(T) -> MatrixValue,
+{
+    let Some(values) = values else {
+        return Ok(());
+    };
+    if values.is_empty() {
+        return Err(CliError::InvalidInput(format!(
+            "Benchmark matrix field `{key}` must contain at least one value"
+        )));
+    }
+    dimensions.push(MatrixDimension {
+        key,
+        values: values.iter().cloned().map(map).collect(),
+    });
+    Ok(())
+}
+
+fn matrix_label_string(value: &str) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= 32 {
+        normalized
+    } else {
+        format!(
+            "{}~{:016x}",
+            normalized.chars().take(32).collect::<String>(),
+            stable_label_hash(&normalized)
+        )
+    }
+}
+
+fn stable_label_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn expand_manifest_cases(manifest: &BenchmarkManifest) -> Result<Vec<BenchmarkManifestCase>> {
+    let mut expanded = Vec::new();
+    for case in &manifest.benchmarks {
+        expanded.extend(expand_manifest_case(case)?);
+    }
+    reject_duplicate_manifest_case_names(&expanded)?;
+    Ok(expanded)
+}
+
+fn expand_manifest_case(case: &BenchmarkManifestCase) -> Result<Vec<BenchmarkManifestCase>> {
+    let Some(matrix) = case.matrix.as_ref() else {
+        return Ok(vec![case.clone()]);
+    };
+    let dimensions = matrix.dimensions()?;
+    let mut expanded = vec![(case.clone(), Vec::<String>::new())];
+
+    for dimension in dimensions {
+        let mut next = Vec::new();
+        for (base, labels) in expanded {
+            for value in &dimension.values {
+                let mut case = base.clone();
+                value.apply(&mut case);
+                let mut labels = labels.clone();
+                labels.push(format!("{}={}", dimension.key, value.label_value()));
+                next.push((case, labels));
+            }
+        }
+        expanded = next;
+    }
+
+    Ok(expanded
+        .into_iter()
+        .map(|(mut case, labels)| {
+            case.matrix = None;
+            case.name = Some(match case.name.as_deref() {
+                Some(name) => format!("{name}[{}]", labels.join(",")),
+                None => format!(
+                    "{}[{}]",
+                    case.command.to_ascii_lowercase(),
+                    labels.join(",")
+                ),
+            });
+            case
+        })
+        .collect())
+}
+
+fn reject_duplicate_manifest_case_names(cases: &[BenchmarkManifestCase]) -> Result<()> {
+    let mut names = BTreeSet::new();
+    for (index, case) in cases.iter().enumerate() {
+        let name = case
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("case-{}", index + 1));
+        if !names.insert(name.clone()) {
+            return Err(CliError::InvalidInput(format!(
+                "Benchmark manifest expands to duplicate case name `{name}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn read_json_report(path: &Path) -> Result<serde_json::Value> {
     let text = tokio::fs::read_to_string(path)
         .await
@@ -654,6 +883,7 @@ async fn bench_manifest(
             "Benchmark manifest must include at least one [[benchmarks]] entry".to_string(),
         ));
     }
+    let benchmark_cases = expand_manifest_cases(&manifest)?;
 
     let suite_server = manifest.server.as_deref().unwrap_or(server).to_string();
     let started_at = Utc::now();
@@ -664,18 +894,18 @@ async fn bench_manifest(
     if options.interactive() {
         theme.step(
             1,
-            manifest.benchmarks.len(),
+            benchmark_cases.len(),
             &format!("Running benchmark manifest {}", manifest_path.display()),
         );
     }
 
-    for (index, case) in manifest.benchmarks.iter().enumerate() {
+    for (index, case) in benchmark_cases.iter().enumerate() {
         if options.interactive() {
             let label = case.name.as_deref().unwrap_or(case.command.as_str());
             theme.info(&format!(
                 "Case {}/{}: {}",
                 index + 1,
-                manifest.benchmarks.len(),
+                benchmark_cases.len(),
                 label
             ));
         }
@@ -2453,5 +2683,60 @@ mod tests {
         let entries = report_entries(&report).expect("suite entries should parse");
         let err = report_entry_map(entries, "Current").expect_err("duplicates should fail");
         assert!(format!("{err}").contains("duplicate benchmark case name `duplicate`"));
+    }
+
+    #[test]
+    fn manifest_matrix_expands_cartesian_cases() {
+        let manifest: BenchmarkManifest = toml::from_str(
+            r#"
+[[benchmarks]]
+name = "chat-short"
+command = "chat"
+prompt = "hello"
+iterations = 1
+
+[benchmarks.matrix]
+model = ["m1", "m2"]
+concurrent = [1, 2]
+"#,
+        )
+        .expect("manifest should parse");
+
+        let cases = expand_manifest_cases(&manifest).expect("matrix should expand");
+        let names: Vec<_> = cases
+            .iter()
+            .map(|case| case.name.as_deref().expect("expanded cases are named"))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "chat-short[model=m1,concurrent=1]",
+                "chat-short[model=m1,concurrent=2]",
+                "chat-short[model=m2,concurrent=1]",
+                "chat-short[model=m2,concurrent=2]",
+            ]
+        );
+        assert_eq!(cases[0].model.as_deref(), Some("m1"));
+        assert_eq!(cases[0].concurrent, Some(1));
+        assert_eq!(cases[3].model.as_deref(), Some("m2"));
+        assert_eq!(cases[3].concurrent, Some(2));
+    }
+
+    #[test]
+    fn manifest_matrix_rejects_duplicate_expanded_names() {
+        let manifest: BenchmarkManifest = toml::from_str(
+            r#"
+[[benchmarks]]
+name = "chat-short"
+command = "chat"
+
+[benchmarks.matrix]
+concurrent = [1, 1]
+"#,
+        )
+        .expect("manifest should parse");
+
+        let err = expand_manifest_cases(&manifest).expect_err("duplicate matrix names should fail");
+        assert!(format!("{err}").contains("duplicate case name `chat-short[concurrent=1]`"));
     }
 }
