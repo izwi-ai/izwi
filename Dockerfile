@@ -88,9 +88,13 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     libssl3 \
     ca-certificates \
+    debianutils \
     ffmpeg \
     libsndfile1 \
     espeak-ng \
+    tar \
+    unzip \
+    zip \
     curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m -u 1000 izwi
@@ -144,9 +148,13 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     libssl3 \
     ca-certificates \
+    debianutils \
     ffmpeg \
     libsndfile1 \
     espeak-ng \
+    tar \
+    unzip \
+    zip \
     curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m -u 1000 izwi
