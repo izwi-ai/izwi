@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeTelemetryContext {
@@ -1831,14 +1831,13 @@ async fn bench_throughput(
             &format!("Throughput test: {}s, {} concurrent", duration, concurrent),
         );
     }
-    let started_at = Utc::now();
-    let run_start = Instant::now();
-
     if options.human_output() {
         println!("Running throughput benchmark against /livez...");
     }
-    let client = http::client(Some(std::time::Duration::from_secs(5)))?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(duration);
+    let client = http::client(Some(Duration::from_secs(5)))?;
+    let started_at = Utc::now();
+    let run_start = Instant::now();
+    let deadline = run_start + Duration::from_secs(duration);
 
     let mut workers = Vec::new();
     for _ in 0..concurrent {
@@ -1868,7 +1867,8 @@ async fn bench_throughput(
     }
 
     let total = success + failed;
-    let rps = total as f64 / duration as f64;
+    let measured_elapsed = run_start.elapsed();
+    let rps = throughput_rps(total, measured_elapsed);
     if options.human_output() {
         println!("\n{}", console::style("Results:").bold().underlined());
         println!("  Successful: {:.0}", success);
@@ -1883,7 +1883,7 @@ async fn bench_throughput(
         server: server.to_string(),
         started_at,
         ended_at,
-        duration_ms: run_start.elapsed().as_secs_f64() * 1000.0,
+        duration_ms: measured_elapsed.as_secs_f64() * 1000.0,
         config: BenchmarkRunConfig {
             model: None,
             iterations: None,
@@ -2181,6 +2181,15 @@ fn stats(data: &[f64]) -> Option<Stats> {
         p95: percentile(data, 0.95),
         p99: percentile(data, 0.99),
     })
+}
+
+fn throughput_rps(total: u64, elapsed: Duration) -> f64 {
+    let elapsed_secs = elapsed.as_secs_f64();
+    if elapsed_secs > 0.0 {
+        total as f64 / elapsed_secs
+    } else {
+        0.0
+    }
 }
 
 fn progress_bar(visible: bool, len: u64) -> ProgressBar {
@@ -2738,5 +2747,11 @@ concurrent = [1, 1]
 
         let err = expand_manifest_cases(&manifest).expect_err("duplicate matrix names should fail");
         assert!(format!("{err}").contains("duplicate case name `chat-short[concurrent=1]`"));
+    }
+
+    #[test]
+    fn throughput_rps_uses_measured_elapsed() {
+        assert_eq!(throughput_rps(10, Duration::from_millis(2500)), 4.0);
+        assert_eq!(throughput_rps(10, Duration::ZERO), 0.0);
     }
 }
