@@ -20,6 +20,7 @@ izwi bench <COMMAND>
 | `tts` | Benchmark TTS inference |
 | `asr` | Benchmark ASR inference |
 | `throughput` | Benchmark system throughput |
+| `run` | Run a benchmark manifest |
 
 ---
 
@@ -124,6 +125,42 @@ izwi bench throughput [OPTIONS]
 ```bash
 izwi bench throughput --duration 60 --concurrent 4
 ```
+
+---
+
+## izwi bench run
+
+Run a TOML benchmark manifest with one or more benchmark cases.
+
+```bash
+izwi bench run benchmarks/local.toml
+```
+
+### Manifest Format
+
+```toml
+server = "http://localhost:8080"
+
+[[benchmarks]]
+name = "chat-short-c1"
+command = "chat"
+model = "Qwen3.5-4B"
+iterations = 10
+concurrent = 1
+warmup = true
+prompt = "Summarize why batching helps transformer prefill."
+max_tokens = 128
+
+[[benchmarks]]
+name = "asr-short-c2"
+command = "asr"
+model = "parakeet-tdt-0.6b-v3"
+file = "data/test.wav"
+iterations = 4
+concurrent = 2
+```
+
+Supported `command` values are `chat`, `tts`, `asr`, and `throughput`. Relative ASR file paths resolve from the manifest directory.
 
 ---
 

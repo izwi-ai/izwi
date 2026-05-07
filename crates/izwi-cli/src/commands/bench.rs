@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use futures::{stream, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -250,6 +251,45 @@ struct RuntimeTelemetryReport {
     after: Option<RuntimeTelemetrySnapshot>,
 }
 
+#[derive(Debug, Deserialize)]
+struct BenchmarkManifest {
+    server: Option<String>,
+    benchmarks: Vec<BenchmarkManifestCase>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BenchmarkManifestCase {
+    name: Option<String>,
+    command: String,
+    model: Option<String>,
+    iterations: Option<u32>,
+    concurrent: Option<u32>,
+    warmup: Option<bool>,
+    prompt: Option<String>,
+    system: Option<String>,
+    max_tokens: Option<usize>,
+    text: Option<String>,
+    file: Option<String>,
+    language: Option<String>,
+    duration_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchmarkSuiteReport {
+    schema_version: u32,
+    manifest: String,
+    server: String,
+    started_at: DateTime<Utc>,
+    ended_at: DateTime<Utc>,
+    reports: Vec<BenchmarkSuiteCaseReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchmarkSuiteCaseReport {
+    name: Option<String>,
+    report: BenchmarkReport,
+}
+
 pub async fn execute(
     command: BenchCommands,
     server: &str,
@@ -270,33 +310,31 @@ pub async fn execute(
             max_tokens,
             concurrent,
             warmup,
-        } => {
-            bench_chat(
-                server,
-                &model,
-                iterations,
-                &prompt,
-                system.as_deref(),
-                max_tokens,
-                concurrent,
-                warmup,
-                &options,
-                theme,
-            )
-            .await
-        }
+        } => bench_chat(
+            server,
+            &model,
+            iterations,
+            &prompt,
+            system.as_deref(),
+            max_tokens,
+            concurrent,
+            warmup,
+            &options,
+            theme,
+        )
+        .await
+        .and_then(|report| emit_report(&options, &report)),
         BenchCommands::Tts {
             model,
             iterations,
             text,
             concurrent,
             warmup,
-        } => {
-            bench_tts(
-                server, &model, iterations, &text, concurrent, warmup, &options, theme,
-            )
-            .await
-        }
+        } => bench_tts(
+            server, &model, iterations, &text, concurrent, warmup, &options, theme,
+        )
+        .await
+        .and_then(|report| emit_report(&options, &report)),
         BenchCommands::Asr {
             model,
             iterations,
@@ -304,25 +342,173 @@ pub async fn execute(
             language,
             concurrent,
             warmup,
-        } => {
-            bench_asr(
-                server,
-                &model,
-                iterations,
-                file,
-                language.as_deref(),
-                concurrent,
-                warmup,
-                &options,
-                theme,
-            )
-            .await
-        }
+        } => bench_asr(
+            server,
+            &model,
+            iterations,
+            file,
+            language.as_deref(),
+            concurrent,
+            warmup,
+            &options,
+            theme,
+        )
+        .await
+        .and_then(|report| emit_report(&options, &report)),
         BenchCommands::Throughput {
             duration,
             concurrent,
-        } => bench_throughput(server, duration, concurrent, &options, theme).await,
+        } => bench_throughput(server, duration, concurrent, &options, theme)
+            .await
+            .and_then(|report| emit_report(&options, &report)),
+        BenchCommands::Run { manifest } => bench_manifest(server, &manifest, &options, theme).await,
     }
+}
+
+async fn bench_manifest(
+    server: &str,
+    manifest_path: &Path,
+    options: &BenchOptions,
+    theme: &Theme,
+) -> Result<()> {
+    let manifest_text = tokio::fs::read_to_string(manifest_path)
+        .await
+        .map_err(CliError::Io)?;
+    let manifest: BenchmarkManifest = toml::from_str(&manifest_text)
+        .map_err(|e| CliError::InvalidInput(format!("Invalid benchmark manifest: {e}")))?;
+    if manifest.benchmarks.is_empty() {
+        return Err(CliError::InvalidInput(
+            "Benchmark manifest must include at least one [[benchmarks]] entry".to_string(),
+        ));
+    }
+
+    let suite_server = manifest.server.as_deref().unwrap_or(server).to_string();
+    let started_at = Utc::now();
+    let manifest_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut reports = Vec::new();
+
+    if options.interactive() {
+        theme.step(
+            1,
+            manifest.benchmarks.len(),
+            &format!("Running benchmark manifest {}", manifest_path.display()),
+        );
+    }
+
+    for (index, case) in manifest.benchmarks.iter().enumerate() {
+        if options.interactive() {
+            let label = case.name.as_deref().unwrap_or(case.command.as_str());
+            theme.info(&format!(
+                "Case {}/{}: {}",
+                index + 1,
+                manifest.benchmarks.len(),
+                label
+            ));
+        }
+
+        let report = match case.command.to_ascii_lowercase().as_str() {
+            "chat" => {
+                let prompt = case.prompt.as_deref().unwrap_or(
+                    "Summarize the main trade-offs between chunked prefill and continuous batching in two concise paragraphs.",
+                );
+                let model = case.model.as_deref().unwrap_or("Qwen3.5-4B");
+                bench_chat(
+                    &suite_server,
+                    model,
+                    case.iterations.unwrap_or(10),
+                    prompt,
+                    case.system.as_deref(),
+                    case.max_tokens.unwrap_or(128),
+                    case.concurrent.unwrap_or(1),
+                    case.warmup.unwrap_or(false),
+                    options,
+                    theme,
+                )
+                .await?
+            }
+            "tts" => {
+                let text = case
+                    .text
+                    .as_deref()
+                    .unwrap_or("Hello, this is a benchmark test for text to speech synthesis.");
+                let model = case.model.as_deref().unwrap_or("qwen3-tts-0.6b-base");
+                bench_tts(
+                    &suite_server,
+                    model,
+                    case.iterations.unwrap_or(10),
+                    text,
+                    case.concurrent.unwrap_or(1),
+                    case.warmup.unwrap_or(false),
+                    options,
+                    theme,
+                )
+                .await?
+            }
+            "asr" => {
+                let file = case.file.as_ref().map(|file| {
+                    let path = Path::new(file);
+                    if path.is_absolute() {
+                        path.to_path_buf()
+                    } else {
+                        manifest_dir.join(path)
+                    }
+                });
+                let model = case.model.as_deref().unwrap_or("parakeet-tdt-0.6b-v3");
+                bench_asr(
+                    &suite_server,
+                    model,
+                    case.iterations.unwrap_or(10),
+                    file,
+                    case.language.as_deref(),
+                    case.concurrent.unwrap_or(1),
+                    case.warmup.unwrap_or(false),
+                    options,
+                    theme,
+                )
+                .await?
+            }
+            "throughput" => {
+                bench_throughput(
+                    &suite_server,
+                    case.duration_secs.unwrap_or(30),
+                    case.concurrent.unwrap_or(1),
+                    options,
+                    theme,
+                )
+                .await?
+            }
+            other => {
+                return Err(CliError::InvalidInput(format!(
+                    "Unsupported benchmark manifest command: {other}"
+                )));
+            }
+        };
+
+        reports.push(BenchmarkSuiteCaseReport {
+            name: case.name.clone(),
+            report,
+        });
+    }
+
+    let suite = BenchmarkSuiteReport {
+        schema_version: 1,
+        manifest: manifest_path.display().to_string(),
+        server: suite_server,
+        started_at,
+        ended_at: Utc::now(),
+        reports,
+    };
+    emit_suite_report(options, &suite)?;
+
+    if options.human_output() {
+        println!(
+            "\n{} completed {} benchmark case(s)",
+            console::style("Manifest").bold(),
+            suite.reports.len()
+        );
+    }
+
+    Ok(())
 }
 
 async fn bench_chat(
@@ -336,7 +522,7 @@ async fn bench_chat(
     warmup: bool,
     options: &BenchOptions,
     theme: &Theme,
-) -> Result<()> {
+) -> Result<BenchmarkReport> {
     if iterations == 0 {
         return Err(CliError::InvalidInput(
             "Iterations must be greater than 0".to_string(),
@@ -477,77 +663,72 @@ async fn bench_chat(
         );
     }
     let ended_at = Utc::now();
-    emit_report(
-        options,
-        BenchmarkReport {
-            schema_version: 1,
-            command: "chat",
-            server: server.to_string(),
-            started_at,
-            ended_at,
-            duration_ms: run_start.elapsed().as_secs_f64() * 1000.0,
-            config: BenchmarkRunConfig {
-                model: Some(model.to_string()),
-                iterations: Some(iterations),
-                concurrent: Some(concurrent),
-                warmup,
-                prompt: Some(prompt.to_string()),
-                system: system.as_deref().map(|value| value.to_string()),
-                max_tokens: Some(max_tokens),
-                text: None,
-                file: None,
-                language: None,
-                duration_secs: None,
-            },
-            summary: BenchmarkSummary {
-                latency_ms: None,
-                ttft_ms: stats(&ttft_ms),
-                end_to_end_ms: stats(&total_ms),
-                completion_tps: stats(&completion_tps),
+    Ok(BenchmarkReport {
+        schema_version: 1,
+        command: "chat",
+        server: server.to_string(),
+        started_at,
+        ended_at,
+        duration_ms: run_start.elapsed().as_secs_f64() * 1000.0,
+        config: BenchmarkRunConfig {
+            model: Some(model.to_string()),
+            iterations: Some(iterations),
+            concurrent: Some(concurrent),
+            warmup,
+            prompt: Some(prompt.to_string()),
+            system: system.as_deref().map(|value| value.to_string()),
+            max_tokens: Some(max_tokens),
+            text: None,
+            file: None,
+            language: None,
+            duration_secs: None,
+        },
+        summary: BenchmarkSummary {
+            latency_ms: None,
+            ttft_ms: stats(&ttft_ms),
+            end_to_end_ms: stats(&total_ms),
+            completion_tps: stats(&completion_tps),
+            tokens_per_second: None,
+            server_generation_ms: stats(&server_generation_ms),
+            server_processing_ms: None,
+            audio_duration_secs: None,
+            rtf: None,
+            prompt_tokens_avg: Some(prompt_tokens_avg),
+            completion_tokens_avg: Some(completion_tokens_avg),
+            throughput_rps: Some(iterations as f64 / run_start.elapsed().as_secs_f64()),
+            successful: Some(iterations as u64),
+            failed: Some(0),
+            total: Some(iterations as u64),
+        },
+        samples: samples
+            .iter()
+            .enumerate()
+            .map(|(index, sample)| BenchmarkSample {
+                index: index + 1,
+                latency_ms: Some(sample.total_ms),
+                ttft_ms: Some(sample.ttft_ms),
+                end_to_end_ms: Some(sample.total_ms),
+                completion_tps: Some(if sample.total_ms > 0.0 {
+                    sample.completion_tokens as f64 * 1000.0 / sample.total_ms
+                } else {
+                    0.0
+                }),
                 tokens_per_second: None,
-                server_generation_ms: stats(&server_generation_ms),
+                prompt_tokens: Some(sample.prompt_tokens),
+                completion_tokens: Some(sample.completion_tokens),
+                server_generation_ms: sample.generation_time_ms,
                 server_processing_ms: None,
                 audio_duration_secs: None,
                 rtf: None,
-                prompt_tokens_avg: Some(prompt_tokens_avg),
-                completion_tokens_avg: Some(completion_tokens_avg),
-                throughput_rps: Some(iterations as f64 / run_start.elapsed().as_secs_f64()),
-                successful: Some(iterations as u64),
-                failed: Some(0),
-                total: Some(iterations as u64),
-            },
-            samples: samples
-                .iter()
-                .enumerate()
-                .map(|(index, sample)| BenchmarkSample {
-                    index: index + 1,
-                    latency_ms: Some(sample.total_ms),
-                    ttft_ms: Some(sample.ttft_ms),
-                    end_to_end_ms: Some(sample.total_ms),
-                    completion_tps: Some(if sample.total_ms > 0.0 {
-                        sample.completion_tokens as f64 * 1000.0 / sample.total_ms
-                    } else {
-                        0.0
-                    }),
-                    tokens_per_second: None,
-                    prompt_tokens: Some(sample.prompt_tokens),
-                    completion_tokens: Some(sample.completion_tokens),
-                    server_generation_ms: sample.generation_time_ms,
-                    server_processing_ms: None,
-                    audio_duration_secs: None,
-                    rtf: None,
-                    tokens_generated: None,
-                })
-                .collect(),
-            telemetry: RuntimeTelemetryReport {
-                delta_available: metrics_before.is_some() && metrics_after.is_some(),
-                before: metrics_before,
-                after: metrics_after,
-            },
+                tokens_generated: None,
+            })
+            .collect(),
+        telemetry: RuntimeTelemetryReport {
+            delta_available: metrics_before.is_some() && metrics_after.is_some(),
+            before: metrics_before,
+            after: metrics_after,
         },
-    )?;
-
-    Ok(())
+    })
 }
 
 async fn bench_tts(
@@ -559,7 +740,7 @@ async fn bench_tts(
     warmup: bool,
     options: &BenchOptions,
     theme: &Theme,
-) -> Result<()> {
+) -> Result<BenchmarkReport> {
     if iterations == 0 {
         return Err(CliError::InvalidInput(
             "Iterations must be greater than 0".to_string(),
@@ -709,76 +890,71 @@ async fn bench_tts(
         );
     }
     let ended_at = Utc::now();
-    emit_report(
-        options,
-        BenchmarkReport {
-            schema_version: 1,
-            command: "tts",
-            server: server.to_string(),
-            started_at,
-            ended_at,
-            duration_ms: run_start.elapsed().as_secs_f64() * 1000.0,
-            config: BenchmarkRunConfig {
-                model: Some(model.to_string()),
-                iterations: Some(iterations),
-                concurrent: Some(concurrent),
-                warmup,
-                prompt: None,
-                system: None,
-                max_tokens: None,
-                text: Some(text.as_ref().clone()),
-                file: None,
-                language: None,
-                duration_secs: None,
-            },
-            summary: BenchmarkSummary {
-                latency_ms: stats(&times),
-                ttft_ms: None,
-                end_to_end_ms: stats(&times),
-                completion_tps: None,
-                tokens_per_second: stats(&tokens_per_second),
-                server_generation_ms: stats(&generation_ms),
-                server_processing_ms: None,
-                audio_duration_secs: stats(&audio_duration_secs),
-                rtf: stats(&rtf),
-                prompt_tokens_avg: None,
-                completion_tokens_avg: None,
-                throughput_rps: Some(iterations as f64 / wall_elapsed.as_secs_f64()),
-                successful: Some(iterations as u64),
-                failed: Some(0),
-                total: Some(iterations as u64),
-            },
-            samples: samples
-                .iter()
-                .enumerate()
-                .map(|(index, sample)| BenchmarkSample {
-                    index: index + 1,
-                    latency_ms: Some(sample.total_ms),
-                    ttft_ms: None,
-                    end_to_end_ms: Some(sample.total_ms),
-                    completion_tps: None,
-                    tokens_per_second: match (sample.tokens_generated, sample.generation_time_ms) {
-                        (Some(tokens), Some(ms)) if ms > 0.0 => Some(tokens as f64 * 1000.0 / ms),
-                        _ => None,
-                    },
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                    server_generation_ms: sample.generation_time_ms,
-                    server_processing_ms: None,
-                    audio_duration_secs: sample.audio_duration_secs,
-                    rtf: sample.rtf,
-                    tokens_generated: sample.tokens_generated,
-                })
-                .collect(),
-            telemetry: RuntimeTelemetryReport {
-                delta_available: metrics_before.is_some() && metrics_after.is_some(),
-                before: metrics_before,
-                after: metrics_after,
-            },
+    Ok(BenchmarkReport {
+        schema_version: 1,
+        command: "tts",
+        server: server.to_string(),
+        started_at,
+        ended_at,
+        duration_ms: run_start.elapsed().as_secs_f64() * 1000.0,
+        config: BenchmarkRunConfig {
+            model: Some(model.to_string()),
+            iterations: Some(iterations),
+            concurrent: Some(concurrent),
+            warmup,
+            prompt: None,
+            system: None,
+            max_tokens: None,
+            text: Some(text.as_ref().clone()),
+            file: None,
+            language: None,
+            duration_secs: None,
         },
-    )?;
-
-    Ok(())
+        summary: BenchmarkSummary {
+            latency_ms: stats(&times),
+            ttft_ms: None,
+            end_to_end_ms: stats(&times),
+            completion_tps: None,
+            tokens_per_second: stats(&tokens_per_second),
+            server_generation_ms: stats(&generation_ms),
+            server_processing_ms: None,
+            audio_duration_secs: stats(&audio_duration_secs),
+            rtf: stats(&rtf),
+            prompt_tokens_avg: None,
+            completion_tokens_avg: None,
+            throughput_rps: Some(iterations as f64 / wall_elapsed.as_secs_f64()),
+            successful: Some(iterations as u64),
+            failed: Some(0),
+            total: Some(iterations as u64),
+        },
+        samples: samples
+            .iter()
+            .enumerate()
+            .map(|(index, sample)| BenchmarkSample {
+                index: index + 1,
+                latency_ms: Some(sample.total_ms),
+                ttft_ms: None,
+                end_to_end_ms: Some(sample.total_ms),
+                completion_tps: None,
+                tokens_per_second: match (sample.tokens_generated, sample.generation_time_ms) {
+                    (Some(tokens), Some(ms)) if ms > 0.0 => Some(tokens as f64 * 1000.0 / ms),
+                    _ => None,
+                },
+                prompt_tokens: None,
+                completion_tokens: None,
+                server_generation_ms: sample.generation_time_ms,
+                server_processing_ms: None,
+                audio_duration_secs: sample.audio_duration_secs,
+                rtf: sample.rtf,
+                tokens_generated: sample.tokens_generated,
+            })
+            .collect(),
+        telemetry: RuntimeTelemetryReport {
+            delta_available: metrics_before.is_some() && metrics_after.is_some(),
+            before: metrics_before,
+            after: metrics_after,
+        },
+    })
 }
 
 async fn bench_asr(
@@ -791,7 +967,7 @@ async fn bench_asr(
     warmup: bool,
     options: &BenchOptions,
     theme: &Theme,
-) -> Result<()> {
+) -> Result<BenchmarkReport> {
     if iterations == 0 {
         return Err(CliError::InvalidInput(
             "Iterations must be greater than 0".to_string(),
@@ -966,73 +1142,68 @@ async fn bench_asr(
         );
     }
     let ended_at = Utc::now();
-    emit_report(
-        options,
-        BenchmarkReport {
-            schema_version: 1,
-            command: "asr",
-            server: server.to_string(),
-            started_at,
-            ended_at,
-            duration_ms: run_start.elapsed().as_secs_f64() * 1000.0,
-            config: BenchmarkRunConfig {
-                model: Some(model.to_string()),
-                iterations: Some(iterations),
-                concurrent: Some(concurrent),
-                warmup,
-                prompt: None,
-                system: None,
-                max_tokens: None,
-                text: None,
-                file: Some(audio_file.display().to_string()),
-                language: language.as_deref().map(|value| value.to_string()),
-                duration_secs: None,
-            },
-            summary: BenchmarkSummary {
-                latency_ms: stats(&times),
+    Ok(BenchmarkReport {
+        schema_version: 1,
+        command: "asr",
+        server: server.to_string(),
+        started_at,
+        ended_at,
+        duration_ms: run_start.elapsed().as_secs_f64() * 1000.0,
+        config: BenchmarkRunConfig {
+            model: Some(model.to_string()),
+            iterations: Some(iterations),
+            concurrent: Some(concurrent),
+            warmup,
+            prompt: None,
+            system: None,
+            max_tokens: None,
+            text: None,
+            file: Some(audio_file.display().to_string()),
+            language: language.as_deref().map(|value| value.to_string()),
+            duration_secs: None,
+        },
+        summary: BenchmarkSummary {
+            latency_ms: stats(&times),
+            ttft_ms: None,
+            end_to_end_ms: stats(&times),
+            completion_tps: None,
+            tokens_per_second: None,
+            server_generation_ms: None,
+            server_processing_ms: stats(&processing_ms),
+            audio_duration_secs: stats(&audio_duration_secs),
+            rtf: stats(&rtf),
+            prompt_tokens_avg: None,
+            completion_tokens_avg: None,
+            throughput_rps: Some(iterations as f64 / wall_elapsed.as_secs_f64()),
+            successful: Some(iterations as u64),
+            failed: Some(0),
+            total: Some(iterations as u64),
+        },
+        samples: samples
+            .iter()
+            .enumerate()
+            .map(|(index, sample)| BenchmarkSample {
+                index: index + 1,
+                latency_ms: Some(sample.total_ms),
                 ttft_ms: None,
-                end_to_end_ms: stats(&times),
+                end_to_end_ms: Some(sample.total_ms),
                 completion_tps: None,
                 tokens_per_second: None,
+                prompt_tokens: None,
+                completion_tokens: None,
                 server_generation_ms: None,
-                server_processing_ms: stats(&processing_ms),
-                audio_duration_secs: stats(&audio_duration_secs),
-                rtf: stats(&rtf),
-                prompt_tokens_avg: None,
-                completion_tokens_avg: None,
-                throughput_rps: Some(iterations as f64 / wall_elapsed.as_secs_f64()),
-                successful: Some(iterations as u64),
-                failed: Some(0),
-                total: Some(iterations as u64),
-            },
-            samples: samples
-                .iter()
-                .enumerate()
-                .map(|(index, sample)| BenchmarkSample {
-                    index: index + 1,
-                    latency_ms: Some(sample.total_ms),
-                    ttft_ms: None,
-                    end_to_end_ms: Some(sample.total_ms),
-                    completion_tps: None,
-                    tokens_per_second: None,
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                    server_generation_ms: None,
-                    server_processing_ms: sample.response.processing_time_ms,
-                    audio_duration_secs: sample.response.duration,
-                    rtf: sample.response.rtf,
-                    tokens_generated: None,
-                })
-                .collect(),
-            telemetry: RuntimeTelemetryReport {
-                delta_available: metrics_before.is_some() && metrics_after.is_some(),
-                before: metrics_before,
-                after: metrics_after,
-            },
+                server_processing_ms: sample.response.processing_time_ms,
+                audio_duration_secs: sample.response.duration,
+                rtf: sample.response.rtf,
+                tokens_generated: None,
+            })
+            .collect(),
+        telemetry: RuntimeTelemetryReport {
+            delta_available: metrics_before.is_some() && metrics_after.is_some(),
+            before: metrics_before,
+            after: metrics_after,
         },
-    )?;
-
-    Ok(())
+    })
 }
 
 async fn bench_throughput(
@@ -1041,7 +1212,7 @@ async fn bench_throughput(
     concurrent: u32,
     options: &BenchOptions,
     theme: &Theme,
-) -> Result<()> {
+) -> Result<BenchmarkReport> {
     if duration == 0 {
         return Err(CliError::InvalidInput(
             "Duration must be greater than 0 seconds".to_string(),
@@ -1106,55 +1277,50 @@ async fn bench_throughput(
         println!("  Throughput: {:.2} req/s", rps);
     }
     let ended_at = Utc::now();
-    emit_report(
-        options,
-        BenchmarkReport {
-            schema_version: 1,
-            command: "throughput",
-            server: server.to_string(),
-            started_at,
-            ended_at,
-            duration_ms: run_start.elapsed().as_secs_f64() * 1000.0,
-            config: BenchmarkRunConfig {
-                model: None,
-                iterations: None,
-                concurrent: Some(concurrent),
-                warmup: false,
-                prompt: None,
-                system: None,
-                max_tokens: None,
-                text: None,
-                file: None,
-                language: None,
-                duration_secs: Some(duration),
-            },
-            summary: BenchmarkSummary {
-                latency_ms: None,
-                ttft_ms: None,
-                end_to_end_ms: None,
-                completion_tps: None,
-                tokens_per_second: None,
-                server_generation_ms: None,
-                server_processing_ms: None,
-                audio_duration_secs: None,
-                rtf: None,
-                prompt_tokens_avg: None,
-                completion_tokens_avg: None,
-                throughput_rps: Some(rps),
-                successful: Some(success),
-                failed: Some(failed),
-                total: Some(total),
-            },
-            samples: Vec::new(),
-            telemetry: RuntimeTelemetryReport {
-                delta_available: false,
-                before: None,
-                after: None,
-            },
+    Ok(BenchmarkReport {
+        schema_version: 1,
+        command: "throughput",
+        server: server.to_string(),
+        started_at,
+        ended_at,
+        duration_ms: run_start.elapsed().as_secs_f64() * 1000.0,
+        config: BenchmarkRunConfig {
+            model: None,
+            iterations: None,
+            concurrent: Some(concurrent),
+            warmup: false,
+            prompt: None,
+            system: None,
+            max_tokens: None,
+            text: None,
+            file: None,
+            language: None,
+            duration_secs: Some(duration),
         },
-    )?;
-
-    Ok(())
+        summary: BenchmarkSummary {
+            latency_ms: None,
+            ttft_ms: None,
+            end_to_end_ms: None,
+            completion_tps: None,
+            tokens_per_second: None,
+            server_generation_ms: None,
+            server_processing_ms: None,
+            audio_duration_secs: None,
+            rtf: None,
+            prompt_tokens_avg: None,
+            completion_tokens_avg: None,
+            throughput_rps: Some(rps),
+            successful: Some(success),
+            failed: Some(failed),
+            total: Some(total),
+        },
+        samples: Vec::new(),
+        telemetry: RuntimeTelemetryReport {
+            delta_available: false,
+            before: None,
+            after: None,
+        },
+    })
 }
 
 fn header_f64(response: &reqwest::Response, name: &'static str) -> Option<f64> {
@@ -1425,10 +1591,20 @@ fn progress_bar(visible: bool, len: u64) -> ProgressBar {
     }
 }
 
-fn emit_report(options: &BenchOptions, report: BenchmarkReport) -> Result<()> {
+fn emit_report(options: &BenchOptions, report: &BenchmarkReport) -> Result<()> {
     if matches!(options.output_format, OutputFormat::Json) {
         let payload = serde_json::to_string_pretty(&report)
             .map_err(|e| CliError::Other(format!("Failed to serialize benchmark report: {e}")))?;
+        println!("{payload}");
+    }
+    Ok(())
+}
+
+fn emit_suite_report(options: &BenchOptions, report: &BenchmarkSuiteReport) -> Result<()> {
+    if matches!(options.output_format, OutputFormat::Json) {
+        let payload = serde_json::to_string_pretty(&report).map_err(|e| {
+            CliError::Other(format!("Failed to serialize benchmark suite report: {e}"))
+        })?;
         println!("{payload}");
     }
     Ok(())

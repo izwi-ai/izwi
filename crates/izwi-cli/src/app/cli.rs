@@ -537,6 +537,13 @@ pub enum BenchCommands {
         #[arg(short, long, default_value = "1")]
         concurrent: u32,
     },
+
+    /// Run a benchmark manifest
+    Run {
+        /// Benchmark manifest path (TOML)
+        #[arg(value_name = "PATH")]
+        manifest: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]

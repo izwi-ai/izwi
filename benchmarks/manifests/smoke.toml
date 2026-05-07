@@ -1,0 +1,23 @@
+# Smoke benchmark matrix for local validation.
+#
+# Override the server at runtime with `izwi --server <URL> bench run ...`,
+# or set `server` here for a fixed target.
+
+[[benchmarks]]
+name = "chat-short-c1"
+command = "chat"
+model = "Qwen3.5-4B"
+iterations = 1
+concurrent = 1
+warmup = false
+prompt = "Summarize why batching helps transformer prefill in one sentence."
+max_tokens = 64
+
+[[benchmarks]]
+name = "asr-short-c1"
+command = "asr"
+model = "parakeet-tdt-0.6b-v3"
+file = "../../data/test.wav"
+iterations = 1
+concurrent = 1
+warmup = false

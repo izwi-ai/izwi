@@ -147,6 +147,7 @@ izwi bench tts --model qwen3-tts-0.6b-base --iterations 5 --concurrent 2
 izwi bench asr --model parakeet-tdt-0.6b-v3 --file data/test.wav --iterations 3 --concurrent 2
 izwi bench throughput --duration 10 --concurrent 2
 izwi --output-format json bench chat --iterations 5
+izwi --output-format json bench run benchmarks/local.toml
 ```
 
 ### Config
