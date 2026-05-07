@@ -37,10 +37,24 @@ smoke_docker_server() {
         --entrypoint /usr/local/bin/izwi-server \
         "${image}" \
         --help >/dev/null
+
+    assert_docker_espeak "${image}"
+}
+
+assert_docker_espeak() {
+    local image="$1"
+
+    echo "Checking Kokoro phonemizer dependency in ${image}"
+    docker run --rm \
+        --entrypoint /bin/sh \
+        "${image}" \
+        -c 'command -v espeak-ng >/dev/null'
 }
 
 audit_cuda_docker_server() {
     local image="$1"
+
+    assert_docker_espeak "${image}"
 
     echo "Auditing CUDA dependencies in ${image}"
     docker run --rm \

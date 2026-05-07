@@ -90,6 +90,7 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     ffmpeg \
     libsndfile1 \
+    espeak-ng \
     curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m -u 1000 izwi
@@ -145,6 +146,7 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     ffmpeg \
     libsndfile1 \
+    espeak-ng \
     curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m -u 1000 izwi

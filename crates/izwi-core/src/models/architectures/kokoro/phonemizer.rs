@@ -25,7 +25,7 @@ impl EspeakPhonemizer {
                 return Ok(Self::new(path));
             }
         }
-        Err(Error::ModelLoadError(
+        Err(Error::MissingDependency(
             "espeak-ng not found; install it to enable Kokoro phonemization".to_string(),
         ))
     }

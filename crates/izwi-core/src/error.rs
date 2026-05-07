@@ -31,6 +31,9 @@ pub enum Error {
     #[error("Configuration error: {0}")]
     ConfigError(String),
 
+    #[error("Missing runtime dependency: {0}")]
+    MissingDependency(String),
+
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 
