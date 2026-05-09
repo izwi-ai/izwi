@@ -12,6 +12,7 @@ pub use crate::catalog::{ModelInfo, ModelStatus, ModelVariant};
 pub use download::{DownloadProgress, ModelDownloader};
 pub use manager::ModelManager;
 pub use residency::{
-    ModelArtifactState, ModelLifecycleSnapshot, ModelResidency, ModelResidencyState,
+    ModelArtifactState, ModelLifecycleSnapshot, ModelResidency, ModelResidencyLease,
+    ModelResidencyState,
 };
 pub use weights::ModelWeights;

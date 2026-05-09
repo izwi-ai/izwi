@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -68,9 +69,76 @@ impl ModelLifecycleSnapshot {
 #[derive(Debug, Default)]
 pub struct ModelResidency {
     states: RwLock<HashMap<ModelVariant, ModelResidencyState>>,
+    lease_counts: Arc<Mutex<HashMap<ModelVariant, usize>>>,
+}
+
+#[derive(Debug)]
+pub struct ModelResidencyLease {
+    variant: ModelVariant,
+    lease_counts: Arc<Mutex<HashMap<ModelVariant, usize>>>,
+    active: bool,
+}
+
+impl ModelResidencyLease {
+    fn new(variant: ModelVariant, lease_counts: Arc<Mutex<HashMap<ModelVariant, usize>>>) -> Self {
+        {
+            let mut counts = lease_counts
+                .lock()
+                .expect("model residency lease counts lock poisoned");
+            *counts.entry(variant).or_insert(0) += 1;
+        }
+
+        Self {
+            variant,
+            lease_counts,
+            active: true,
+        }
+    }
+
+    pub fn variant(&self) -> ModelVariant {
+        self.variant
+    }
+}
+
+impl Drop for ModelResidencyLease {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+
+        let mut counts = self
+            .lease_counts
+            .lock()
+            .expect("model residency lease counts lock poisoned");
+        let Some(count) = counts.get_mut(&self.variant) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            counts.remove(&self.variant);
+        }
+    }
 }
 
 impl ModelResidency {
+    pub fn acquire_lease(&self, variant: ModelVariant) -> ModelResidencyLease {
+        ModelResidencyLease::new(variant, self.lease_counts.clone())
+    }
+
+    pub fn active_leases(&self, variant: ModelVariant) -> usize {
+        self.lease_counts
+            .lock()
+            .expect("model residency lease counts lock poisoned")
+            .get(&variant)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn has_active_leases(&self, variant: ModelVariant) -> bool {
+        self.active_leases(variant) > 0
+    }
+
     pub async fn state(&self, variant: ModelVariant) -> ModelResidencyState {
         self.states
             .read()
@@ -123,5 +191,26 @@ mod tests {
 
         assert_eq!(snapshot.artifact_state, ModelArtifactState::Available);
         assert_eq!(snapshot.residency_state, ModelResidencyState::Ready);
+    }
+
+    #[test]
+    fn residency_leases_count_active_model_use_until_drop() {
+        let residency = ModelResidency::default();
+        assert_eq!(residency.active_leases(ModelVariant::Kokoro82M), 0);
+
+        let first = residency.acquire_lease(ModelVariant::Kokoro82M);
+        assert_eq!(first.variant(), ModelVariant::Kokoro82M);
+        assert_eq!(residency.active_leases(ModelVariant::Kokoro82M), 1);
+        assert!(residency.has_active_leases(ModelVariant::Kokoro82M));
+
+        {
+            let _second = residency.acquire_lease(ModelVariant::Kokoro82M);
+            assert_eq!(residency.active_leases(ModelVariant::Kokoro82M), 2);
+        }
+
+        assert_eq!(residency.active_leases(ModelVariant::Kokoro82M), 1);
+        drop(first);
+        assert_eq!(residency.active_leases(ModelVariant::Kokoro82M), 0);
+        assert!(!residency.has_active_leases(ModelVariant::Kokoro82M));
     }
 }
