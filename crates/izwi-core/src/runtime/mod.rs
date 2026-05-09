@@ -12,6 +12,7 @@ mod chat;
 mod diarization;
 mod kokoro;
 mod lifecycle;
+mod pipeline;
 mod request;
 mod service;
 mod speech_to_speech;
