@@ -282,6 +282,40 @@ impl Default for ConnectionState {
     }
 }
 
+impl ConnectionState {
+    fn clear_finished_turn(&mut self) {
+        if self
+            .active_turn
+            .as_ref()
+            .map(|turn| turn.task.is_finished())
+            .unwrap_or(false)
+        {
+            self.active_turn = None;
+        }
+    }
+
+    fn has_running_turn(&self) -> bool {
+        self.active_turn
+            .as_ref()
+            .map(|turn| !turn.task.is_finished())
+            .unwrap_or(false)
+    }
+
+    fn close_voice_session_if_idle(&mut self) -> Option<String> {
+        self.clear_finished_turn();
+        if self.has_running_turn() {
+            return None;
+        }
+        self.voice_session.close();
+        self.voice_session_id.take()
+    }
+
+    fn close_voice_session_now(&mut self) -> Option<String> {
+        self.voice_session.close();
+        self.voice_session_id.take()
+    }
+}
+
 #[derive(Debug)]
 struct SpeechStartEvent {
     utterance_id: String,
@@ -691,7 +725,7 @@ pub async fn handle_socket(socket: WebSocket, state: AppState, correlation_id: S
     }
 
     interrupt_active_turn(&out_tx, &mut conn.active_turn, "socket_closed");
-    if let Some(session_id) = conn.voice_session_id.take() {
+    if let Some(session_id) = conn.close_voice_session_now() {
         if let Err(err) = state.voice_store.end_session(session_id).await {
             warn!("failed to end voice session on socket close: {err}");
         }
@@ -914,14 +948,13 @@ async fn handle_text_message(
                 }
             }
             send_json(out_tx, json!({ "type": "input_stream_stopped" }));
-            if let Some(session_id) = conn.voice_session_id.take() {
+            if let Some(session_id) = conn.close_voice_session_if_idle() {
                 state
                     .voice_store
                     .end_session(session_id)
                     .await
                     .map_err(|err| format!("Voice storage error: {err}"))?;
             }
-            conn.voice_session.close();
         }
         ClientEvent::Interrupt { reason } => {
             let reason = reason.unwrap_or_else(|| "client_interrupt".to_string());
