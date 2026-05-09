@@ -59,7 +59,7 @@ pub use runtime::{
 };
 pub use runtime::{
     AudioChunk, GenerationConfig, InferenceOptions, RuntimeService, RuntimeTelemetrySnapshot,
-    SpeechToSpeechGeneration,
+    SpeechToSpeechGeneration, VoiceSession, VoiceSessionPhase,
 };
 pub use serve_runtime::{ServeRuntimeConfig, ServeRuntimeConfigOverrides};
 
