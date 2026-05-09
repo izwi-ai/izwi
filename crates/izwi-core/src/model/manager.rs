@@ -1,6 +1,8 @@
 //! Model lifecycle management
 
-use super::residency::{ModelLifecycleSnapshot, ModelResidency, ModelResidencyState};
+use super::residency::{
+    ModelLifecycleSnapshot, ModelResidency, ModelResidencyLease, ModelResidencyState,
+};
 use futures::stream::{self, StreamExt};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -190,6 +192,18 @@ impl ModelManager {
             .into_iter()
             .map(ModelLifecycleSnapshot::from_model_info)
             .collect()
+    }
+
+    /// Acquire a lease for active work using a resident model.
+    ///
+    /// Phase 4 records active use without changing unload/eviction policy yet.
+    pub fn acquire_residency_lease(&self, variant: ModelVariant) -> ModelResidencyLease {
+        self.residency.acquire_lease(variant)
+    }
+
+    /// Number of active leases for a resident model.
+    pub fn active_residency_leases(&self, variant: ModelVariant) -> usize {
+        self.residency.active_leases(variant)
     }
 
     /// Download a model from HuggingFace

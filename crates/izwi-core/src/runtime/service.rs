@@ -23,6 +23,7 @@ use crate::engine::{
     WorkerConfig,
 };
 use crate::error::{Error, Result};
+use crate::model::ModelResidencyLease;
 use crate::models::shared::telemetry::{
     prometheus as kernel_path_prometheus, snapshot as kernel_path_telemetry_snapshot,
 };
@@ -523,6 +524,21 @@ impl RuntimeService {
     /// Snapshot of inference broker rollout state.
     pub(crate) fn inference_broker_snapshot(&self) -> InferenceBrokerSnapshot {
         self.inference_broker.snapshot()
+    }
+
+    /// Acquire a model residency lease for active runtime work.
+    ///
+    /// Phase 4 keeps this as observable scaffolding; unload/eviction enforcement
+    /// is introduced only after direct model paths are fully wrapped.
+    pub(crate) fn acquire_model_residency_lease(
+        &self,
+        variant: ModelVariant,
+    ) -> ModelResidencyLease {
+        self.model_manager.acquire_residency_lease(variant)
+    }
+
+    pub(crate) fn active_model_residency_leases(&self, variant: ModelVariant) -> usize {
+        self.model_manager.active_residency_leases(variant)
     }
 
     /// Download a model.
