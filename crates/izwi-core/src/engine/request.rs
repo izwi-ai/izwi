@@ -27,6 +27,21 @@ pub enum RequestStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EngineStreamPolicy {
+    FailOnFull,
+    BlockWithDeadline,
+    DropOldest,
+    Coalesce,
+    Sample,
+}
+
+impl Default for EngineStreamPolicy {
+    fn default() -> Self {
+        Self::FailOnFull
+    }
+}
+
 /// A request to the engine core.
 #[derive(Debug, Clone)]
 pub struct EngineCoreRequest {
@@ -68,6 +83,8 @@ pub struct EngineCoreRequest {
     pub prompt_tokens: Vec<TokenId>,
     /// Enable streaming output
     pub streaming: bool,
+    /// Backpressure behavior for streaming output.
+    pub stream_policy: EngineStreamPolicy,
     /// Channel for streaming output (internal use)
     #[allow(dead_code)]
     pub(crate) streaming_tx: Option<mpsc::Sender<StreamingOutput>>,
@@ -96,6 +113,7 @@ impl EngineCoreRequest {
             arrival_time: Instant::now(),
             prompt_tokens: Vec::new(),
             streaming: false,
+            stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
         }
     }
@@ -122,6 +140,7 @@ impl EngineCoreRequest {
             arrival_time: Instant::now(),
             prompt_tokens: Vec::new(),
             streaming: false,
+            stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
         }
     }
@@ -148,6 +167,7 @@ impl EngineCoreRequest {
             arrival_time: Instant::now(),
             prompt_tokens: Vec::new(),
             streaming: false,
+            stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
         }
     }
@@ -174,6 +194,7 @@ impl EngineCoreRequest {
             arrival_time: Instant::now(),
             prompt_tokens: Vec::new(),
             streaming: false,
+            stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
         }
     }
@@ -200,6 +221,7 @@ impl EngineCoreRequest {
             arrival_time: Instant::now(),
             prompt_tokens: Vec::new(),
             streaming: false,
+            stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
         }
     }
@@ -226,6 +248,7 @@ impl EngineCoreRequest {
             arrival_time: Instant::now(),
             prompt_tokens: Vec::new(),
             streaming: false,
+            stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
         }
     }
@@ -251,6 +274,12 @@ impl EngineCoreRequest {
     /// Enable streaming.
     pub fn with_streaming(mut self, streaming: bool) -> Self {
         self.streaming = streaming;
+        self
+    }
+
+    /// Set streaming backpressure policy.
+    pub fn with_stream_policy(mut self, stream_policy: EngineStreamPolicy) -> Self {
+        self.stream_policy = stream_policy;
         self
     }
 

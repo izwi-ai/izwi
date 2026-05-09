@@ -21,6 +21,7 @@ impl NativeExecutor {
         let family = variant.family();
         let language = request.language.as_deref();
         let stream_tx = Self::stream_sender(request);
+        let stream_policy = request.stream_policy;
 
         if let Some(tx) = stream_tx.as_ref() {
             if !matches!(family, ModelFamily::Voxtral) {
@@ -64,6 +65,7 @@ impl NativeExecutor {
                                 Self::transcribe_with_chunk_plan(
                                     &request.id,
                                     Some(tx),
+                                    stream_policy,
                                     &mut sequence,
                                     &samples,
                                     sample_rate,
@@ -140,16 +142,18 @@ impl NativeExecutor {
                         final_text = step.text.clone();
 
                         if !step.delta.is_empty() {
-                            Self::stream_text_per_character(
+                            Self::stream_text_per_character_with_policy(
                                 tx,
+                                stream_policy,
                                 &request.id,
                                 &mut active_state.stream_sequence,
                                 &step.delta,
                             )?;
                         }
                         if step.finished {
-                            Self::stream_final_marker(
+                            Self::stream_final_marker_with_policy(
                                 tx,
+                                stream_policy,
                                 &request.id,
                                 &mut active_state.stream_sequence,
                             )?;
@@ -222,10 +226,11 @@ impl NativeExecutor {
                 let (chunk_cfg, chunk_plan) =
                     Self::asr_chunk_plan(&samples, sample_rate, None, false);
                 if chunk_plan.len() > 1 {
-                    let text = Self::transcribe_with_chunk_plan(
-                        &request.id,
-                        stream_tx.as_ref(),
-                        &mut sequence,
+                        let text = Self::transcribe_with_chunk_plan(
+                            &request.id,
+                            stream_tx.as_ref(),
+                            stream_policy,
+                            &mut sequence,
                         &samples,
                         sample_rate,
                         &chunk_plan,
@@ -240,8 +245,9 @@ impl NativeExecutor {
                         let mut stream_err: Option<Error> = None;
                         let mut emit = |delta: &str| {
                             if stream_err.is_none() {
-                                if let Err(err) = Self::stream_text_per_character(
+                                if let Err(err) = Self::stream_text_per_character_with_policy(
                                     tx,
+                                    stream_policy,
                                     &request.id,
                                     &mut sequence,
                                     delta,
@@ -259,7 +265,12 @@ impl NativeExecutor {
                         if let Some(err) = stream_err {
                             return Err(err);
                         }
-                        Self::stream_final_marker(tx, &request.id, &mut sequence)?;
+                        Self::stream_final_marker_with_policy(
+                            tx,
+                            stream_policy,
+                            &request.id,
+                            &mut sequence,
+                        )?;
                         return Ok((text, None));
                     }
                 }
@@ -282,6 +293,7 @@ impl NativeExecutor {
                 let text = Self::transcribe_with_chunk_plan(
                     &request.id,
                     stream_tx.as_ref(),
+                    stream_policy,
                     &mut sequence,
                     &samples,
                     sample_rate,
@@ -297,8 +309,9 @@ impl NativeExecutor {
                     let mut stream_err: Option<Error> = None;
                     let mut emit = |delta: &str| {
                         if stream_err.is_none() {
-                            if let Err(err) = Self::stream_text_per_character(
+                            if let Err(err) = Self::stream_text_per_character_with_policy(
                                 tx,
+                                stream_policy,
                                 &request.id,
                                 &mut sequence,
                                 delta,
@@ -316,7 +329,12 @@ impl NativeExecutor {
                     if let Some(err) = stream_err {
                         return Err(err);
                     }
-                    Self::stream_final_marker(tx, &request.id, &mut sequence)?;
+                    Self::stream_final_marker_with_policy(
+                        tx,
+                        stream_policy,
+                        &request.id,
+                        &mut sequence,
+                    )?;
                     return Ok((text, None));
                 }
             }

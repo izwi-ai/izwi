@@ -96,6 +96,7 @@ impl NativeExecutor {
         let messages = Self::chat_messages(request)?;
         let max_new_tokens = request.params.max_tokens.max(1);
         let stream_tx = Self::stream_sender(request);
+        let stream_policy = request.stream_policy;
         let generation_config = Self::chat_generation_config(request);
 
         let model = self.with_registry(|registry| {
@@ -123,7 +124,13 @@ impl NativeExecutor {
                         if stream_err.is_none() {
                             if let Some(chunk) = stream_batch.push(delta) {
                                 if let Err(err) =
-                                    Self::stream_text(tx, &request.id, &mut sequence, chunk)
+                                    Self::stream_text_with_policy(
+                                        tx,
+                                        stream_policy,
+                                        &request.id,
+                                        &mut sequence,
+                                        chunk,
+                                    )
                                 {
                                     stream_err = Some(err);
                                 }
@@ -143,7 +150,13 @@ impl NativeExecutor {
                     if stream_err.is_none() {
                         if let Some(chunk) = stream_batch.finish() {
                             if let Err(err) =
-                                Self::stream_text(tx, &request.id, &mut sequence, chunk)
+                                Self::stream_text_with_policy(
+                                    tx,
+                                    stream_policy,
+                                    &request.id,
+                                    &mut sequence,
+                                    chunk,
+                                )
                             {
                                 stream_err = Some(err);
                             }
@@ -154,7 +167,12 @@ impl NativeExecutor {
                     return Err(err);
                 }
                 if let Some(tx) = stream_tx.as_ref() {
-                    Self::stream_final_marker(tx, &request.id, &mut sequence)?;
+                    Self::stream_final_marker_with_policy(
+                        tx,
+                        stream_policy,
+                        &request.id,
+                        &mut sequence,
+                    )?;
                 }
 
                 let total_ms = generation_started.elapsed().as_secs_f64() * 1000.0;
@@ -248,15 +266,21 @@ impl NativeExecutor {
 
             if let Some(tx) = stream_tx.as_ref() {
                 if !step.delta.is_empty() {
-                    Self::stream_text(
+                    Self::stream_text_with_policy(
                         tx,
+                        stream_policy,
                         &request.id,
                         &mut active_state.stream_sequence,
                         step.delta.clone(),
                     )?;
                 }
                 if step.finished {
-                    Self::stream_final_marker(tx, &request.id, &mut active_state.stream_sequence)?;
+                    Self::stream_final_marker_with_policy(
+                        tx,
+                        stream_policy,
+                        &request.id,
+                        &mut active_state.stream_sequence,
+                    )?;
                 }
             }
 

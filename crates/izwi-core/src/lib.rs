@@ -69,9 +69,10 @@ pub use runtime::{
     GenerationRequest, GenerationResult,
 };
 pub use runtime::{
-    AudioChunk, GenerationConfig, InferenceBrokerRuntimeTelemetrySnapshot, InferenceOptions,
-    RuntimeService, RuntimeTelemetrySnapshot, SpeechToSpeechGeneration,
-    VoiceRuntimeTelemetrySnapshot, VoiceSession, VoiceSessionPhase,
+    AudioChunk, EngineRuntimeTelemetrySnapshot, GenerationConfig,
+    InferenceBrokerRuntimeTelemetrySnapshot, InferenceOptions, RuntimeService,
+    RuntimeTelemetrySnapshot, SpeechToSpeechGeneration, VoiceRuntimeTelemetrySnapshot,
+    VoiceSession, VoiceSessionPhase,
 };
 pub use serve_runtime::{ServeRuntimeConfig, ServeRuntimeConfigOverrides};
 

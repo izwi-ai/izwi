@@ -4,7 +4,7 @@
 //! shape. They keep task-specific validation and model identity close to the
 //! capability that needs them while preserving the existing engine contract.
 
-use crate::engine::{EngineCoreRequest, GenerationParams as CoreGenerationParams};
+use crate::engine::{EngineCoreRequest, EngineStreamPolicy, GenerationParams as CoreGenerationParams};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::shared::chat::{ChatMessage, ChatRequestConfig};
@@ -40,6 +40,18 @@ pub(crate) enum RuntimeStreamPolicy {
 impl Default for RuntimeStreamPolicy {
     fn default() -> Self {
         Self::FailOnFull
+    }
+}
+
+impl From<RuntimeStreamPolicy> for EngineStreamPolicy {
+    fn from(policy: RuntimeStreamPolicy) -> Self {
+        match policy {
+            RuntimeStreamPolicy::FailOnFull => Self::FailOnFull,
+            RuntimeStreamPolicy::BlockWithDeadline => Self::BlockWithDeadline,
+            RuntimeStreamPolicy::DropOldest => Self::DropOldest,
+            RuntimeStreamPolicy::Coalesce => Self::Coalesce,
+            RuntimeStreamPolicy::Sample => Self::Sample,
+        }
     }
 }
 
@@ -151,6 +163,7 @@ impl TtsRuntimeRequest {
         request.id = self.envelope.request_id;
         request.model_variant = Some(self.envelope.model_variant);
         request.correlation_id = self.envelope.correlation_id;
+        request.stream_policy = self.envelope.stream_policy.into();
         request.language = self.language;
         request.reference_audio = self.reference_audio;
         request.reference_text = self.reference_text;
@@ -209,6 +222,7 @@ impl AsrRuntimeRequest {
         request.id = self.envelope.request_id;
         request.model_variant = Some(self.envelope.model_variant);
         request.correlation_id = self.envelope.correlation_id;
+        request.stream_policy = self.envelope.stream_policy.into();
         request.language = self.language;
         request
     }
@@ -254,6 +268,7 @@ impl ChatRuntimeRequest {
         request.id = self.envelope.request_id;
         request.model_variant = Some(self.envelope.model_variant);
         request.correlation_id = self.envelope.correlation_id;
+        request.stream_policy = self.envelope.stream_policy.into();
         request.params = self.params;
         request.chat_config = self.chat_config;
         request.prompt_tokens = self.prompt_tokens;
@@ -324,6 +339,7 @@ impl AudioChatRuntimeRequest {
         request.id = self.envelope.request_id;
         request.model_variant = Some(self.envelope.model_variant);
         request.correlation_id = self.envelope.correlation_id;
+        request.stream_policy = self.envelope.stream_policy.into();
         request.chat_messages = (!self.messages.is_empty()).then_some(self.messages);
         request.system_prompt = self
             .system_prompt

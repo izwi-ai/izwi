@@ -3,17 +3,11 @@ use tokio::sync::mpsc;
 use crate::error::{Error, Result};
 
 use super::super::output::StreamingOutput;
-use super::super::request::EngineCoreRequest;
+use super::super::request::{EngineCoreRequest, EngineStreamPolicy};
+use super::super::metrics::record_engine_stream_backpressure;
 use super::NativeExecutor;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum StreamBackpressurePolicy {
-    FailOnFull,
-    BlockWithDeadline,
-    DropOldest,
-    Coalesce,
-    Sample,
-}
+pub(super) type StreamBackpressurePolicy = EngineStreamPolicy;
 
 pub(super) struct StreamSink<'a> {
     tx: &'a mpsc::Sender<StreamingOutput>,
@@ -44,13 +38,21 @@ impl<'a> StreamSink<'a> {
             StreamBackpressurePolicy::FailOnFull => {
                 self.tx.try_send(output).map_err(stream_send_error)
             }
-            StreamBackpressurePolicy::BlockWithDeadline
-            | StreamBackpressurePolicy::DropOldest
+            StreamBackpressurePolicy::BlockWithDeadline => {
+                self.tx.try_send(output).map_err(stream_send_error)
+            }
+            StreamBackpressurePolicy::DropOldest
             | StreamBackpressurePolicy::Coalesce
-            | StreamBackpressurePolicy::Sample => Err(Error::InferenceError(format!(
-                "Streaming backpressure policy {:?} is not enabled for engine execution",
-                self.policy
-            ))),
+            | StreamBackpressurePolicy::Sample => match self.tx.try_send(output) {
+                Ok(()) => Ok(()),
+                Err(mpsc::error::TrySendError::Closed(output)) => {
+                    Err(stream_send_error(mpsc::error::TrySendError::Closed(output)))
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    record_engine_stream_backpressure();
+                    Ok(())
+                }
+            },
         }
     }
 }
@@ -72,7 +74,23 @@ impl NativeExecutor {
         sequence: &mut usize,
         text: String,
     ) -> Result<()> {
-        StreamSink::fail_on_full(tx).send(StreamingOutput {
+        Self::stream_text_with_policy(
+            tx,
+            StreamBackpressurePolicy::FailOnFull,
+            request_id,
+            sequence,
+            text,
+        )
+    }
+
+    pub(super) fn stream_text_with_policy(
+        tx: &mpsc::Sender<StreamingOutput>,
+        policy: StreamBackpressurePolicy,
+        request_id: &str,
+        sequence: &mut usize,
+        text: String,
+    ) -> Result<()> {
+        StreamSink::with_policy(tx, policy).send(StreamingOutput {
             request_id: request_id.to_string(),
             sequence: *sequence,
             samples: Vec::new(),
@@ -91,12 +109,28 @@ impl NativeExecutor {
         sequence: &mut usize,
         text: &str,
     ) -> Result<()> {
+        Self::stream_text_per_character_with_policy(
+            tx,
+            StreamBackpressurePolicy::FailOnFull,
+            request_id,
+            sequence,
+            text,
+        )
+    }
+
+    pub(super) fn stream_text_per_character_with_policy(
+        tx: &mpsc::Sender<StreamingOutput>,
+        policy: StreamBackpressurePolicy,
+        request_id: &str,
+        sequence: &mut usize,
+        text: &str,
+    ) -> Result<()> {
         if text.is_empty() {
             return Ok(());
         }
 
         for ch in text.chars() {
-            Self::stream_text(tx, request_id, sequence, ch.to_string())?;
+            Self::stream_text_with_policy(tx, policy, request_id, sequence, ch.to_string())?;
         }
         Ok(())
     }
@@ -109,7 +143,27 @@ impl NativeExecutor {
         sample_rate: u32,
         is_final: bool,
     ) -> Result<()> {
-        StreamSink::fail_on_full(tx).send(StreamingOutput {
+        Self::stream_audio_with_policy(
+            tx,
+            StreamBackpressurePolicy::FailOnFull,
+            request_id,
+            sequence,
+            samples,
+            sample_rate,
+            is_final,
+        )
+    }
+
+    pub(super) fn stream_audio_with_policy(
+        tx: &mpsc::Sender<StreamingOutput>,
+        policy: StreamBackpressurePolicy,
+        request_id: &str,
+        sequence: &mut usize,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        is_final: bool,
+    ) -> Result<()> {
+        StreamSink::with_policy(tx, policy).send(StreamingOutput {
             request_id: request_id.to_string(),
             sequence: *sequence,
             samples,
@@ -127,7 +181,21 @@ impl NativeExecutor {
         request_id: &str,
         sequence: &mut usize,
     ) -> Result<()> {
-        Self::stream_audio(tx, request_id, sequence, Vec::new(), 0, true)
+        Self::stream_final_marker_with_policy(
+            tx,
+            StreamBackpressurePolicy::FailOnFull,
+            request_id,
+            sequence,
+        )
+    }
+
+    pub(super) fn stream_final_marker_with_policy(
+        tx: &mpsc::Sender<StreamingOutput>,
+        policy: StreamBackpressurePolicy,
+        request_id: &str,
+        sequence: &mut usize,
+    ) -> Result<()> {
+        Self::stream_audio_with_policy(tx, policy, request_id, sequence, Vec::new(), 0, true)
     }
 }
 
@@ -136,9 +204,12 @@ fn stream_send_error(err: mpsc::error::TrySendError<StreamingOutput>) -> Error {
         mpsc::error::TrySendError::Closed(_) => {
             Error::InferenceError("Streaming output channel closed".to_string())
         }
-        mpsc::error::TrySendError::Full(_) => Error::InferenceError(
-            "Streaming output backpressure exceeded queue capacity".to_string(),
-        ),
+        mpsc::error::TrySendError::Full(_) => {
+            record_engine_stream_backpressure();
+            Error::InferenceError(
+                "Streaming output backpressure exceeded queue capacity".to_string(),
+            )
+        }
     }
 }
 
@@ -213,25 +284,30 @@ mod tests {
     }
 
     #[test]
-    fn stream_sink_reserved_policies_fail_closed_until_rollout() {
+    fn stream_sink_lossy_policies_drop_when_queue_is_full() {
         let (tx, _rx) = mpsc::channel(1);
         let sink = StreamSink::with_policy(&tx, StreamBackpressurePolicy::Coalesce);
 
-        let err = sink
-            .send(StreamingOutput {
-                request_id: "req-1".to_string(),
-                sequence: 0,
-                samples: vec![0.0],
-                sample_rate: 24_000,
-                is_final: false,
-                text: None,
-                stats: None,
-            })
-            .expect_err("reserved policy should not silently change stream behavior");
+        sink.send(StreamingOutput {
+            request_id: "req-1".to_string(),
+            sequence: 0,
+            samples: vec![0.0],
+            sample_rate: 24_000,
+            is_final: false,
+            text: None,
+            stats: None,
+        })
+        .expect("first chunk should fit");
 
-        let Error::InferenceError(message) = err else {
-            panic!("expected inference error for reserved policy");
-        };
-        assert!(message.contains("not enabled"));
+        sink.send(StreamingOutput {
+            request_id: "req-1".to_string(),
+            sequence: 1,
+            samples: vec![0.0],
+            sample_rate: 24_000,
+            is_final: false,
+            text: None,
+            stats: None,
+        })
+        .expect("lossy policy should drop full-queue chunk");
     }
 }
