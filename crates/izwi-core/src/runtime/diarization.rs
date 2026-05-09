@@ -57,6 +57,7 @@ impl RuntimeService {
     ) -> Result<DiarizationResult> {
         let variant = resolve_diarization_model_variant(model_id);
         self.load_model(variant).await?;
+        let _lease = self.acquire_model_residency_lease(variant);
 
         let model = self
             .model_registry
@@ -164,8 +165,15 @@ impl RuntimeService {
             crate::runtime::asr::resolve_forced_aligner_variant(
                 runtime_request.aligner_model_id.as_deref(),
             )?;
-        let aligner_model = match self.load_model(aligner_variant).await {
-            Ok(()) => match self.model_registry.get_asr(aligner_variant).await {
+        let aligner_lease = match self.load_model(aligner_variant).await {
+            Ok(()) => Some(self.acquire_model_residency_lease(aligner_variant)),
+            Err(err) => {
+                warn!("Forced aligner load failed, using heuristic timings: {err}");
+                None
+            }
+        };
+        let aligner_model = if aligner_lease.is_some() {
+            match self.model_registry.get_asr(aligner_variant).await {
                 Some(model) => Some(model),
                 None => {
                     warn!(
@@ -174,11 +182,9 @@ impl RuntimeService {
                     );
                     None
                 }
-            },
-            Err(err) => {
-                warn!("Forced aligner load failed, using heuristic timings: {err}");
-                None
             }
+        } else {
+            None
         };
 
         let aligner_limit = aligner_model
@@ -192,6 +198,7 @@ impl RuntimeService {
 
         let (asr_text, chunk_texts, detected_language) = if use_single_pass_asr {
             self.load_model(asr_variant).await?;
+            let _asr_lease = self.acquire_model_residency_lease(asr_variant);
             let asr_model = self
                 .model_registry
                 .get_asr(asr_variant)
@@ -211,6 +218,7 @@ impl RuntimeService {
             (transcription.text, Vec::new(), transcription.language)
         } else {
             self.load_model(asr_variant).await?;
+            let _asr_lease = self.acquire_model_residency_lease(asr_variant);
             let asr_model = self
                 .model_registry
                 .get_asr(asr_variant)

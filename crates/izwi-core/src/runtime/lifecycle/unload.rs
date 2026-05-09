@@ -1,5 +1,5 @@
 use crate::catalog::ModelFamily;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::model::ModelStatus;
 use crate::model::ModelVariant;
 use crate::models::shared::memory::metal::MetalPoolManager;
@@ -8,6 +8,13 @@ use crate::runtime::service::RuntimeService;
 impl RuntimeService {
     /// Unload a model from memory.
     pub async fn unload_model(&self, variant: ModelVariant) -> Result<()> {
+        let active_leases = self.active_model_residency_leases(variant);
+        if active_leases > 0 {
+            return Err(Error::InferenceError(format!(
+                "Cannot unload model {variant}: {active_leases} active inference lease(s) are still held"
+            )));
+        }
+
         let _ = self.core_engine.abort_requests_for_variant(variant).await;
 
         match variant.family() {

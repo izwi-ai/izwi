@@ -63,7 +63,13 @@ impl RuntimeService {
             return Ok(());
         }
 
-        let active_variants = self.core_engine.active_model_variants().await;
+        let mut active_variants = self.core_engine.active_model_variants().await;
+        active_variants.extend(
+            loaded_variants
+                .iter()
+                .copied()
+                .filter(|variant| self.active_model_residency_leases(*variant) > 0),
+        );
         let last_used = self.model_last_used.lock().await.clone();
         let Some(victim) = select_lru_eviction_candidate(
             &loaded_variants,

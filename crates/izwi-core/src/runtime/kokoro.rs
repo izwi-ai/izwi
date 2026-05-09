@@ -42,6 +42,7 @@ impl RuntimeService {
     ) -> Result<GenerationResult> {
         let variant = self.resolve_kokoro_variant_for_request(&request).await;
         self.load_model(variant).await?;
+        let _lease = self.acquire_model_residency_lease(variant);
         let model = self
             .model_registry
             .get_kokoro(variant)
@@ -75,6 +76,7 @@ impl RuntimeService {
         let request_id = request.id.clone();
         let variant = self.resolve_kokoro_variant_for_request(&request).await;
         self.load_model(variant).await?;
+        let _lease = self.acquire_model_residency_lease(variant);
         let model = self
             .model_registry
             .get_kokoro(variant)
