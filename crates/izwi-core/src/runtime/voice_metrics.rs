@@ -1,6 +1,8 @@
 //! Stable metric names for production voice runtime observability.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::Serialize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct VoiceMetricDescriptor {
     pub name: &'static str,
     pub description: &'static str,
@@ -20,6 +22,8 @@ pub const VOICE_ASR_FINAL_MS: &str = "voice.asr.final_ms";
 pub const VOICE_LLM_FIRST_TOKEN_MS: &str = "voice.llm.first_token_ms";
 pub const VOICE_TTS_FIRST_AUDIO_MS: &str = "voice.tts.first_audio_ms";
 pub const VOICE_BARGE_IN_LATENCY_MS: &str = "voice.barge_in.latency_ms";
+pub const VOICE_BARGE_IN_TOTAL: &str = "voice.barge_in.events_total";
+pub const VOICE_SESSION_INTERRUPTED_TOTAL: &str = "voice.session.interruptions_total";
 pub const VOICE_STREAM_BACKPRESSURE_TOTAL: &str = "voice.stream.backpressure_total";
 pub const VOICE_MODEL_READY_TOTAL: &str = "voice.model.ready_total";
 
@@ -77,6 +81,14 @@ pub const VOICE_METRIC_CATALOG: &[VoiceMetricDescriptor] = &[
         description: "Latency from user speech during playback to active turn cancellation.",
     },
     VoiceMetricDescriptor {
+        name: VOICE_BARGE_IN_TOTAL,
+        description: "Voice barge-in interruptions.",
+    },
+    VoiceMetricDescriptor {
+        name: VOICE_SESSION_INTERRUPTED_TOTAL,
+        description: "Voice turns interrupted before completion.",
+    },
+    VoiceMetricDescriptor {
         name: VOICE_STREAM_BACKPRESSURE_TOTAL,
         description: "Runtime stream backpressure events.",
     },
@@ -88,6 +100,45 @@ pub const VOICE_METRIC_CATALOG: &[VoiceMetricDescriptor] = &[
 
 pub fn voice_metric_catalog() -> &'static [VoiceMetricDescriptor] {
     VOICE_METRIC_CATALOG
+}
+
+pub fn prometheus_voice_metric_name(name: &str) -> String {
+    format!("izwi_{}", name.replace('.', "_"))
+}
+
+pub fn prometheus_voice_metric_type(name: &str) -> &'static str {
+    if name.ends_with("_total") {
+        "counter"
+    } else {
+        "gauge"
+    }
+}
+
+pub fn voice_metric_prometheus_contract() -> String {
+    let mut payload = String::new();
+    payload.push_str(
+        "# HELP izwi_voice_metric_contract_info Voice metric catalog entry exposed by the runtime.\n\
+# TYPE izwi_voice_metric_contract_info gauge\n",
+    );
+    for metric in voice_metric_catalog() {
+        let prometheus_name = prometheus_voice_metric_name(metric.name);
+        let metric_type = prometheus_voice_metric_type(metric.name);
+        payload.push_str(&format!(
+            "izwi_voice_metric_contract_info{{name=\"{}\",prometheus_name=\"{}\",metric_type=\"{}\",description=\"{}\"}} 1\n",
+            prometheus_label_value(metric.name),
+            prometheus_label_value(&prometheus_name),
+            metric_type,
+            prometheus_label_value(&metric.description.replace('\n', " "))
+        ));
+    }
+    payload
+}
+
+fn prometheus_label_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 #[cfg(test)]
@@ -131,5 +182,15 @@ mod tests {
         ] {
             assert!(names.contains(required), "missing {required}");
         }
+    }
+
+    #[test]
+    fn voice_metric_prometheus_contract_exports_sanitized_metric_names() {
+        let payload = voice_metric_prometheus_contract();
+
+        assert!(payload.contains("# HELP izwi_voice_metric_contract_info"));
+        assert!(payload.contains("prometheus_name=\"izwi_voice_session_started_total\""));
+        assert!(payload.contains("metric_type=\"counter\""));
+        assert!(payload.contains("name=\"voice.tts.first_audio_ms\""));
     }
 }

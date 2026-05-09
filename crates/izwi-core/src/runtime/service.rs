@@ -27,6 +27,11 @@ use crate::models::shared::telemetry::{
     prometheus as kernel_path_prometheus, snapshot as kernel_path_telemetry_snapshot,
 };
 use crate::runtime::adapters::RuntimeAdapterRegistry;
+use crate::runtime::voice_metrics::{
+    prometheus_voice_metric_name, voice_metric_catalog, voice_metric_prometheus_contract,
+    VoiceMetricDescriptor, VOICE_BARGE_IN_TOTAL, VOICE_SESSION_CLOSED_TOTAL,
+    VOICE_SESSION_INTERRUPTED_TOTAL, VOICE_SESSION_STARTED_TOTAL,
+};
 use crate::runtime_models::ModelRegistry;
 use crate::tokenizer::Tokenizer;
 use crate::KernelPathTelemetrySnapshot;
@@ -39,6 +44,14 @@ fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
         return msg.clone();
     }
     "unknown panic payload".to_string()
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VoiceRuntimeTelemetrySnapshot {
+    pub sessions_started: u64,
+    pub sessions_closed: u64,
+    pub interruptions: u64,
+    pub barge_ins: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,6 +79,8 @@ pub struct RuntimeTelemetrySnapshot {
     pub end_to_end_ms_p50: f64,
     pub end_to_end_ms_p95: f64,
     pub kernel_path: KernelPathTelemetrySnapshot,
+    pub voice: VoiceRuntimeTelemetrySnapshot,
+    pub voice_metrics: &'static [VoiceMetricDescriptor],
 }
 
 #[derive(Debug)]
@@ -78,6 +93,10 @@ struct RuntimeTelemetryCollector {
     requests_active: AtomicU64,
     worker_restarts: AtomicU64,
     worker_panics: AtomicU64,
+    voice_sessions_started: AtomicU64,
+    voice_sessions_closed: AtomicU64,
+    voice_interruptions: AtomicU64,
+    voice_barge_ins: AtomicU64,
     queue_wait_ms_samples: Mutex<VecDeque<f64>>,
     prefill_ms_samples: Mutex<VecDeque<f64>>,
     decode_ms_samples: Mutex<VecDeque<f64>>,
@@ -96,6 +115,10 @@ impl RuntimeTelemetryCollector {
             requests_active: AtomicU64::new(0),
             worker_restarts: AtomicU64::new(0),
             worker_panics: AtomicU64::new(0),
+            voice_sessions_started: AtomicU64::new(0),
+            voice_sessions_closed: AtomicU64::new(0),
+            voice_interruptions: AtomicU64::new(0),
+            voice_barge_ins: AtomicU64::new(0),
             queue_wait_ms_samples: Mutex::new(VecDeque::with_capacity(max_samples.max(64))),
             prefill_ms_samples: Mutex::new(VecDeque::with_capacity(max_samples.max(64))),
             decode_ms_samples: Mutex::new(VecDeque::with_capacity(max_samples.max(64))),
@@ -172,6 +195,22 @@ impl RuntimeTelemetryCollector {
         self.worker_panics.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_voice_session_started(&self) {
+        self.voice_sessions_started.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_voice_session_closed(&self) {
+        self.voice_sessions_closed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_voice_interruption(&self) {
+        self.voice_interruptions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_voice_barge_in(&self) {
+        self.voice_barge_ins.fetch_add(1, Ordering::Relaxed);
+    }
+
     async fn snapshot(&self) -> RuntimeTelemetrySnapshot {
         let queue = self.queue_wait_ms_samples.lock().await.clone();
         let prefill = self.prefill_ms_samples.lock().await.clone();
@@ -203,6 +242,13 @@ impl RuntimeTelemetryCollector {
             end_to_end_ms_p50: percentile(&end_to_end, 0.50),
             end_to_end_ms_p95: percentile(&end_to_end, 0.95),
             kernel_path: kernel_path_telemetry_snapshot(),
+            voice: VoiceRuntimeTelemetrySnapshot {
+                sessions_started: self.voice_sessions_started.load(Ordering::Relaxed),
+                sessions_closed: self.voice_sessions_closed.load(Ordering::Relaxed),
+                interruptions: self.voice_interruptions.load(Ordering::Relaxed),
+                barge_ins: self.voice_barge_ins.load(Ordering::Relaxed),
+            },
+            voice_metrics: voice_metric_catalog(),
         }
     }
 
@@ -243,6 +289,31 @@ impl RuntimeTelemetryCollector {
             snapshot.end_to_end_ms_p95,
         );
         payload.push_str(&kernel_path_prometheus());
+        push_voice_counter(
+            &mut payload,
+            VOICE_SESSION_STARTED_TOTAL,
+            "Voice sessions started.",
+            snapshot.voice.sessions_started,
+        );
+        push_voice_counter(
+            &mut payload,
+            VOICE_SESSION_CLOSED_TOTAL,
+            "Voice sessions closed.",
+            snapshot.voice.sessions_closed,
+        );
+        push_voice_counter(
+            &mut payload,
+            VOICE_SESSION_INTERRUPTED_TOTAL,
+            "Voice turns interrupted before completion.",
+            snapshot.voice.interruptions,
+        );
+        push_voice_counter(
+            &mut payload,
+            VOICE_BARGE_IN_TOTAL,
+            "Voice barge-in interruptions.",
+            snapshot.voice.barge_ins,
+        );
+        payload.push_str(&voice_metric_prometheus_contract());
         payload
     }
 
@@ -253,6 +324,13 @@ impl RuntimeTelemetryCollector {
         }
         guard.push_back(value.max(0.0));
     }
+}
+
+fn push_voice_counter(payload: &mut String, name: &str, help: &str, value: u64) {
+    let prometheus_name = prometheus_voice_metric_name(name);
+    payload.push_str(&format!(
+        "# HELP {prometheus_name} {help}\n# TYPE {prometheus_name} counter\n{prometheus_name} {value}\n"
+    ));
 }
 
 fn mean(values: &VecDeque<f64>) -> f64 {
@@ -769,6 +847,22 @@ impl RuntimeService {
     pub async fn telemetry_prometheus(&self) -> String {
         self.telemetry.prometheus().await
     }
+
+    pub fn record_voice_session_started(&self) {
+        self.telemetry.record_voice_session_started();
+    }
+
+    pub fn record_voice_session_closed(&self) {
+        self.telemetry.record_voice_session_closed();
+    }
+
+    pub fn record_voice_interruption(&self) {
+        self.telemetry.record_voice_interruption();
+    }
+
+    pub fn record_voice_barge_in(&self) {
+        self.telemetry.record_voice_barge_in();
+    }
 }
 
 fn configure_runtime_threading(num_threads: usize) {
@@ -842,5 +936,32 @@ mod tests {
         assert!(message.contains("CUDA backend was requested"));
         assert!(message.contains("selected backend is `cpu`"));
         assert!(message.contains("no usable CUDA device"));
+    }
+
+    #[tokio::test]
+    async fn voice_telemetry_snapshot_and_prometheus_include_recorded_counters() {
+        let telemetry = RuntimeTelemetryCollector::new(64);
+
+        telemetry.record_voice_session_started();
+        telemetry.record_voice_session_closed();
+        telemetry.record_voice_interruption();
+        telemetry.record_voice_barge_in();
+
+        let snapshot = telemetry.snapshot().await;
+        assert_eq!(snapshot.voice.sessions_started, 1);
+        assert_eq!(snapshot.voice.sessions_closed, 1);
+        assert_eq!(snapshot.voice.interruptions, 1);
+        assert_eq!(snapshot.voice.barge_ins, 1);
+        assert!(snapshot
+            .voice_metrics
+            .iter()
+            .any(|metric| metric.name == VOICE_SESSION_STARTED_TOTAL));
+
+        let payload = telemetry.prometheus().await;
+        assert!(payload.contains("izwi_voice_session_started_total 1"));
+        assert!(payload.contains("izwi_voice_session_closed_total 1"));
+        assert!(payload.contains("izwi_voice_session_interruptions_total 1"));
+        assert!(payload.contains("izwi_voice_barge_in_events_total 1"));
+        assert!(payload.contains("izwi_voice_metric_contract_info"));
     }
 }
