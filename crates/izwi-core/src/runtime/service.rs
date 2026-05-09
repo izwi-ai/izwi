@@ -27,6 +27,7 @@ use crate::models::shared::telemetry::{
     prometheus as kernel_path_prometheus, snapshot as kernel_path_telemetry_snapshot,
 };
 use crate::runtime::adapters::RuntimeAdapterRegistry;
+use crate::runtime::broker::{InferenceBroker, InferenceBrokerSnapshot};
 use crate::runtime::voice_metrics::{
     prometheus_voice_metric_name, voice_metric_catalog, voice_metric_prometheus_contract,
     VoiceMetricDescriptor, VOICE_BARGE_IN_TOTAL, VOICE_SESSION_CLOSED_TOTAL,
@@ -354,6 +355,7 @@ fn percentile(values: &VecDeque<f64>, q: f64) -> f64 {
 pub struct RuntimeService {
     pub(crate) config: EngineConfig,
     pub(crate) backend_router: BackendRouter,
+    pub(crate) inference_broker: InferenceBroker,
     pub(crate) adapter_registry: RuntimeAdapterRegistry,
     pub(crate) model_manager: Arc<ModelManager>,
     pub(crate) model_registry: Arc<ModelRegistry>,
@@ -475,6 +477,7 @@ impl RuntimeService {
         Ok(Self {
             config,
             backend_router: BackendRouter::from_context(backend_context),
+            inference_broker: InferenceBroker::from_env(),
             adapter_registry: RuntimeAdapterRegistry::built_in(),
             model_manager,
             model_registry,
@@ -515,6 +518,11 @@ impl RuntimeService {
     /// Get explicit artifact and residency states for all known models.
     pub async fn model_lifecycle_snapshots(&self) -> Vec<ModelLifecycleSnapshot> {
         self.model_manager.lifecycle_snapshots().await
+    }
+
+    /// Snapshot of inference broker rollout state.
+    pub(crate) fn inference_broker_snapshot(&self) -> InferenceBrokerSnapshot {
+        self.inference_broker.snapshot()
     }
 
     /// Download a model.

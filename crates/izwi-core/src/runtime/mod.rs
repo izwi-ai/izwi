@@ -7,6 +7,7 @@
 mod adapters;
 mod asr;
 pub(crate) mod audio_io;
+mod broker;
 mod chat;
 mod diarization;
 mod kokoro;
