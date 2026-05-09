@@ -6,6 +6,33 @@ use super::super::output::StreamingOutput;
 use super::super::request::EngineCoreRequest;
 use super::NativeExecutor;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StreamBackpressurePolicy {
+    FailOnFull,
+}
+
+pub(super) struct StreamSink<'a> {
+    tx: &'a mpsc::Sender<StreamingOutput>,
+    policy: StreamBackpressurePolicy,
+}
+
+impl<'a> StreamSink<'a> {
+    fn fail_on_full(tx: &'a mpsc::Sender<StreamingOutput>) -> Self {
+        Self {
+            tx,
+            policy: StreamBackpressurePolicy::FailOnFull,
+        }
+    }
+
+    fn send(&self, output: StreamingOutput) -> Result<()> {
+        match self.policy {
+            StreamBackpressurePolicy::FailOnFull => {
+                self.tx.try_send(output).map_err(stream_send_error)
+            }
+        }
+    }
+}
+
 impl NativeExecutor {
     pub(super) fn stream_sender(
         request: &EngineCoreRequest,
@@ -23,7 +50,7 @@ impl NativeExecutor {
         sequence: &mut usize,
         text: String,
     ) -> Result<()> {
-        tx.try_send(StreamingOutput {
+        StreamSink::fail_on_full(tx).send(StreamingOutput {
             request_id: request_id.to_string(),
             sequence: *sequence,
             samples: Vec::new(),
@@ -31,8 +58,7 @@ impl NativeExecutor {
             is_final: false,
             text: Some(text),
             stats: None,
-        })
-        .map_err(stream_send_error)?;
+        })?;
         *sequence += 1;
         Ok(())
     }
@@ -61,7 +87,7 @@ impl NativeExecutor {
         sample_rate: u32,
         is_final: bool,
     ) -> Result<()> {
-        tx.try_send(StreamingOutput {
+        StreamSink::fail_on_full(tx).send(StreamingOutput {
             request_id: request_id.to_string(),
             sequence: *sequence,
             samples,
@@ -69,8 +95,7 @@ impl NativeExecutor {
             is_final,
             text: None,
             stats: None,
-        })
-        .map_err(stream_send_error)?;
+        })?;
         *sequence += 1;
         Ok(())
     }
@@ -100,6 +125,10 @@ mod tests {
     use tokio::sync::mpsc;
 
     use crate::engine::executor::NativeExecutor;
+    use crate::engine::output::StreamingOutput;
+    use crate::error::Error;
+
+    use super::StreamSink;
 
     #[test]
     fn stream_text_per_character_emits_one_delta_per_character() {
@@ -124,5 +153,39 @@ mod tests {
         assert_eq!(third.text.as_deref(), Some("é"));
 
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn stream_sink_fail_on_full_preserves_current_backpressure_behavior() {
+        let (tx, _rx) = mpsc::channel(1);
+        let sink = StreamSink::fail_on_full(&tx);
+
+        sink.send(StreamingOutput {
+            request_id: "req-1".to_string(),
+            sequence: 0,
+            samples: vec![0.0],
+            sample_rate: 24_000,
+            is_final: false,
+            text: None,
+            stats: None,
+        })
+        .expect("first chunk should fit");
+
+        let err = sink
+            .send(StreamingOutput {
+                request_id: "req-1".to_string(),
+                sequence: 1,
+                samples: vec![0.0],
+                sample_rate: 24_000,
+                is_final: false,
+                text: None,
+                stats: None,
+            })
+            .expect_err("full queue should fail with default policy");
+
+        let Error::InferenceError(message) = err else {
+            panic!("expected inference error for stream backpressure");
+        };
+        assert!(message.contains("backpressure"));
     }
 }
