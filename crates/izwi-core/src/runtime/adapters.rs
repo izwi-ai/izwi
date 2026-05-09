@@ -36,11 +36,23 @@ pub(crate) enum StreamingMode {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutionTargetKind {
+    TokenEngine,
+    BatchRunner,
+    RealtimeRunner,
+    PipelineRunner,
+    DirectModel,
+    Artifact,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AdapterMetadata {
     pub(crate) id: &'static str,
     pub(crate) capability: CapabilityKind,
     pub(crate) model_variant: ModelVariant,
     pub(crate) streaming_mode: StreamingMode,
+    pub(crate) execution_target: ExecutionTargetKind,
 }
 
 pub(crate) trait ModelCapabilityAdapter {
@@ -107,6 +119,22 @@ impl RuntimeAdapterRegistry {
     }
 }
 
+fn tts_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
+    if model_variant.is_kokoro() || model_variant.is_lfm25_audio_gguf() {
+        ExecutionTargetKind::DirectModel
+    } else {
+        ExecutionTargetKind::TokenEngine
+    }
+}
+
+fn asr_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
+    if model_variant.is_audio_chat() {
+        ExecutionTargetKind::DirectModel
+    } else {
+        ExecutionTargetKind::BatchRunner
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TtsCapabilityAdapter;
 
@@ -122,6 +150,7 @@ impl ModelCapabilityAdapter for TtsCapabilityAdapter {
             } else {
                 StreamingMode::None
             },
+            execution_target: tts_execution_target(model_variant),
         })
     }
 }
@@ -137,6 +166,7 @@ impl ModelCapabilityAdapter for StreamingTtsCapabilityAdapter {
             capability: CapabilityKind::StreamingTts,
             model_variant,
             streaming_mode: StreamingMode::Chunked,
+            execution_target: tts_execution_target(model_variant),
         })
     }
 }
@@ -151,6 +181,7 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
             capability: CapabilityKind::Asr,
             model_variant,
             streaming_mode: StreamingMode::None,
+            execution_target: asr_execution_target(model_variant),
         })
     }
 }
@@ -165,6 +196,7 @@ impl ModelCapabilityAdapter for RealtimeAsrCapabilityAdapter {
             capability: CapabilityKind::RealtimeAsr,
             model_variant,
             streaming_mode: StreamingMode::Realtime,
+            execution_target: ExecutionTargetKind::RealtimeRunner,
         })
     }
 }
@@ -179,6 +211,7 @@ impl ModelCapabilityAdapter for ChatCapabilityAdapter {
             capability: CapabilityKind::Chat,
             model_variant,
             streaming_mode: StreamingMode::Chunked,
+            execution_target: ExecutionTargetKind::TokenEngine,
         })
     }
 }
@@ -193,6 +226,7 @@ impl ModelCapabilityAdapter for AudioChatCapabilityAdapter {
             capability: CapabilityKind::AudioChat,
             model_variant,
             streaming_mode: StreamingMode::Chunked,
+            execution_target: ExecutionTargetKind::TokenEngine,
         })
     }
 }
@@ -207,6 +241,7 @@ impl ModelCapabilityAdapter for SpeechToSpeechCapabilityAdapter {
             capability: CapabilityKind::SpeechToSpeech,
             model_variant,
             streaming_mode: StreamingMode::Chunked,
+            execution_target: ExecutionTargetKind::TokenEngine,
         })
     }
 }
@@ -221,6 +256,7 @@ impl ModelCapabilityAdapter for DiarizationCapabilityAdapter {
             capability: CapabilityKind::Diarization,
             model_variant,
             streaming_mode: StreamingMode::None,
+            execution_target: ExecutionTargetKind::PipelineRunner,
         })
     }
 }
@@ -235,6 +271,7 @@ impl ModelCapabilityAdapter for ForcedAlignmentCapabilityAdapter {
             capability: CapabilityKind::ForcedAlignment,
             model_variant,
             streaming_mode: StreamingMode::None,
+            execution_target: ExecutionTargetKind::BatchRunner,
         })
     }
 }
@@ -249,6 +286,7 @@ impl ModelCapabilityAdapter for TokenizerCapabilityAdapter {
             capability: CapabilityKind::Tokenizer,
             model_variant,
             streaming_mode: StreamingMode::None,
+            execution_target: ExecutionTargetKind::Artifact,
         })
     }
 }
@@ -316,11 +354,13 @@ mod tests {
             .expect("qwen tts adapter");
         assert_eq!(qwen.id, "builtin.tts");
         assert_eq!(qwen.streaming_mode, StreamingMode::Chunked);
+        assert_eq!(qwen.execution_target, ExecutionTargetKind::TokenEngine);
 
         let lfm = registry
             .require(CapabilityKind::Tts, ModelVariant::Lfm25Audio15BGguf)
             .expect("lfm audio tts adapter");
         assert_eq!(lfm.streaming_mode, StreamingMode::None);
+        assert_eq!(lfm.execution_target, ExecutionTargetKind::DirectModel);
     }
 
     #[test]
@@ -344,15 +384,15 @@ mod tests {
             registry
                 .require(CapabilityKind::Asr, ModelVariant::WhisperLargeV3Turbo)
                 .expect("whisper asr adapter")
-                .id,
-            "builtin.asr"
+                .execution_target,
+            ExecutionTargetKind::BatchRunner
         );
         assert_eq!(
             registry
                 .require(CapabilityKind::Chat, ModelVariant::Qwen38BGguf)
                 .expect("qwen chat adapter")
-                .id,
-            "builtin.chat"
+                .execution_target,
+            ExecutionTargetKind::TokenEngine
         );
         assert_eq!(
             registry
@@ -361,8 +401,8 @@ mod tests {
                     ModelVariant::Lfm25Audio15BGguf
                 )
                 .expect("lfm audio speech-to-speech adapter")
-                .id,
-            "builtin.speech_to_speech"
+                .execution_target,
+            ExecutionTargetKind::TokenEngine
         );
         assert_eq!(
             registry
@@ -371,8 +411,8 @@ mod tests {
                     ModelVariant::DiarStreamingSortformer4SpkV21
                 )
                 .expect("sortformer diarization adapter")
-                .id,
-            "builtin.diarization"
+                .execution_target,
+            ExecutionTargetKind::PipelineRunner
         );
         assert_eq!(
             registry
@@ -381,8 +421,28 @@ mod tests {
                     ModelVariant::Qwen3ForcedAligner06B
                 )
                 .expect("forced alignment adapter")
-                .id,
-            "builtin.forced_alignment"
+                .execution_target,
+            ExecutionTargetKind::BatchRunner
+        );
+    }
+
+    #[test]
+    fn built_in_registry_marks_audio_chat_as_direct_asr_but_token_s2s() {
+        let registry = RuntimeAdapterRegistry::built_in();
+
+        assert_eq!(
+            registry
+                .require(CapabilityKind::Asr, ModelVariant::Lfm25Audio15BGguf)
+                .expect("lfm audio asr adapter")
+                .execution_target,
+            ExecutionTargetKind::DirectModel
+        );
+        assert_eq!(
+            registry
+                .require(CapabilityKind::AudioChat, ModelVariant::Lfm25Audio15BGguf)
+                .expect("lfm audio-chat adapter")
+                .execution_target,
+            ExecutionTargetKind::TokenEngine
         );
     }
 
