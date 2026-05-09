@@ -57,6 +57,13 @@ pub struct VoiceRuntimeTelemetrySnapshot {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct InferenceBrokerRuntimeTelemetrySnapshot {
+    pub shadow_requests: u64,
+    pub execution_requests: u64,
+    pub validation_failures: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct RuntimeTelemetrySnapshot {
     pub uptime_secs: f64,
     pub requests_queued: u64,
@@ -82,6 +89,7 @@ pub struct RuntimeTelemetrySnapshot {
     pub end_to_end_ms_p95: f64,
     pub kernel_path: KernelPathTelemetrySnapshot,
     pub voice: VoiceRuntimeTelemetrySnapshot,
+    pub broker: InferenceBrokerRuntimeTelemetrySnapshot,
     pub voice_metrics: &'static [VoiceMetricDescriptor],
 }
 
@@ -99,6 +107,9 @@ struct RuntimeTelemetryCollector {
     voice_sessions_closed: AtomicU64,
     voice_interruptions: AtomicU64,
     voice_barge_ins: AtomicU64,
+    broker_shadow_requests: AtomicU64,
+    broker_execution_requests: AtomicU64,
+    broker_validation_failures: AtomicU64,
     queue_wait_ms_samples: Mutex<VecDeque<f64>>,
     prefill_ms_samples: Mutex<VecDeque<f64>>,
     decode_ms_samples: Mutex<VecDeque<f64>>,
@@ -121,6 +132,9 @@ impl RuntimeTelemetryCollector {
             voice_sessions_closed: AtomicU64::new(0),
             voice_interruptions: AtomicU64::new(0),
             voice_barge_ins: AtomicU64::new(0),
+            broker_shadow_requests: AtomicU64::new(0),
+            broker_execution_requests: AtomicU64::new(0),
+            broker_validation_failures: AtomicU64::new(0),
             queue_wait_ms_samples: Mutex::new(VecDeque::with_capacity(max_samples.max(64))),
             prefill_ms_samples: Mutex::new(VecDeque::with_capacity(max_samples.max(64))),
             decode_ms_samples: Mutex::new(VecDeque::with_capacity(max_samples.max(64))),
@@ -213,6 +227,19 @@ impl RuntimeTelemetryCollector {
         self.voice_barge_ins.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_broker_shadow_request(&self) {
+        self.broker_shadow_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_broker_execution_request(&self) {
+        self.broker_execution_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_broker_validation_failure(&self) {
+        self.broker_validation_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     async fn snapshot(&self) -> RuntimeTelemetrySnapshot {
         let queue = self.queue_wait_ms_samples.lock().await.clone();
         let prefill = self.prefill_ms_samples.lock().await.clone();
@@ -249,6 +276,11 @@ impl RuntimeTelemetryCollector {
                 sessions_closed: self.voice_sessions_closed.load(Ordering::Relaxed),
                 interruptions: self.voice_interruptions.load(Ordering::Relaxed),
                 barge_ins: self.voice_barge_ins.load(Ordering::Relaxed),
+            },
+            broker: InferenceBrokerRuntimeTelemetrySnapshot {
+                shadow_requests: self.broker_shadow_requests.load(Ordering::Relaxed),
+                execution_requests: self.broker_execution_requests.load(Ordering::Relaxed),
+                validation_failures: self.broker_validation_failures.load(Ordering::Relaxed),
             },
             voice_metrics: voice_metric_catalog(),
         }
@@ -315,6 +347,14 @@ impl RuntimeTelemetryCollector {
             "Voice barge-in interruptions.",
             snapshot.voice.barge_ins,
         );
+        payload.push_str(&format!(
+            "# TYPE izwi_inference_broker_shadow_requests_total counter\nizwi_inference_broker_shadow_requests_total {}\n\
+# TYPE izwi_inference_broker_execution_requests_total counter\nizwi_inference_broker_execution_requests_total {}\n\
+# TYPE izwi_inference_broker_validation_failures_total counter\nizwi_inference_broker_validation_failures_total {}\n",
+            snapshot.broker.shadow_requests,
+            snapshot.broker.execution_requests,
+            snapshot.broker.validation_failures
+        ));
         payload.push_str(&voice_metric_prometheus_contract());
         payload
     }
@@ -541,6 +581,36 @@ impl RuntimeService {
         self.model_manager.active_residency_leases(variant)
     }
 
+    fn observe_broker_request(&self, request: &EngineCoreRequest) -> Result<()> {
+        let Some(observation) = self
+            .inference_broker
+            .observe_engine_request(request, &self.adapter_registry)
+        else {
+            return Ok(());
+        };
+
+        if observation.shadow_enabled {
+            self.telemetry.record_broker_shadow_request();
+        }
+        if observation.execution_enabled {
+            self.telemetry.record_broker_execution_request();
+        }
+
+        if let Some(message) = observation.validation_error {
+            self.telemetry.record_broker_validation_failure();
+            if observation.execution_enabled {
+                return Err(Error::InvalidInput(message));
+            }
+            debug!(
+                capability = ?observation.capability,
+                model_variant = ?observation.model_variant,
+                "Inference broker shadow validation failed: {message}"
+            );
+        }
+
+        Ok(())
+    }
+
     /// Download a model.
     pub async fn download_model(&self, variant: ModelVariant) -> Result<()> {
         self.model_manager.download_model(variant).await?;
@@ -738,6 +808,7 @@ impl RuntimeService {
     }
 
     pub(crate) async fn run_request(&self, request: EngineCoreRequest) -> Result<EngineOutput> {
+        self.observe_broker_request(&request)?;
         self.ensure_step_driver_started().await;
 
         let span = info_span!(
@@ -778,6 +849,7 @@ impl RuntimeService {
         F: FnMut(StreamingOutput) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
+        self.observe_broker_request(&request)?;
         self.ensure_step_driver_started().await;
 
         request.streaming = true;
@@ -987,5 +1059,24 @@ mod tests {
         assert!(payload.contains("izwi_voice_session_interruptions_total 1"));
         assert!(payload.contains("izwi_voice_barge_in_events_total 1"));
         assert!(payload.contains("izwi_voice_metric_contract_info"));
+    }
+
+    #[tokio::test]
+    async fn broker_telemetry_snapshot_and_prometheus_include_recorded_counters() {
+        let telemetry = RuntimeTelemetryCollector::new(64);
+
+        telemetry.record_broker_shadow_request();
+        telemetry.record_broker_execution_request();
+        telemetry.record_broker_validation_failure();
+
+        let snapshot = telemetry.snapshot().await;
+        assert_eq!(snapshot.broker.shadow_requests, 1);
+        assert_eq!(snapshot.broker.execution_requests, 1);
+        assert_eq!(snapshot.broker.validation_failures, 1);
+
+        let payload = telemetry.prometheus().await;
+        assert!(payload.contains("izwi_inference_broker_shadow_requests_total 1"));
+        assert!(payload.contains("izwi_inference_broker_execution_requests_total 1"));
+        assert!(payload.contains("izwi_inference_broker_validation_failures_total 1"));
     }
 }

@@ -21,7 +21,10 @@ mod types;
 mod voice_metrics;
 mod voice_session;
 
-pub use service::{RuntimeService, RuntimeTelemetrySnapshot, VoiceRuntimeTelemetrySnapshot};
+pub use service::{
+    InferenceBrokerRuntimeTelemetrySnapshot, RuntimeService, RuntimeTelemetrySnapshot,
+    VoiceRuntimeTelemetrySnapshot,
+};
 pub use types::{
     AsrTranscription, AudioChunk, ChatGeneration, ChunkStats, DiarizationConfig, DiarizationResult,
     DiarizationSegment, DiarizationTranscriptResult, DiarizationUtterance, DiarizationWord,
