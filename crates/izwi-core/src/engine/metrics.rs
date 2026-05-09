@@ -14,6 +14,84 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
+/// Stable metric names for scheduler and KV-cache observability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct EngineMetricDescriptor {
+    pub name: &'static str,
+    pub description: &'static str,
+}
+
+pub const ENGINE_SCHEDULER_QUEUE_DEPTH: &str = "engine.scheduler.queue_depth";
+pub const ENGINE_SCHEDULER_RUNNING_REQUESTS: &str = "engine.scheduler.running_requests";
+pub const ENGINE_SCHEDULER_PREEMPTIONS_TOTAL: &str = "engine.scheduler.preemptions_total";
+pub const ENGINE_SCHEDULER_STEP_TOKENS_TOTAL: &str = "engine.scheduler.step_tokens_total";
+pub const ENGINE_KV_CACHE_HITS_TOTAL: &str = "engine.kv_cache.hits_total";
+pub const ENGINE_KV_CACHE_MISSES_TOTAL: &str = "engine.kv_cache.misses_total";
+pub const ENGINE_KV_CACHE_EVICTIONS_TOTAL: &str = "engine.kv_cache.evictions_total";
+pub const ENGINE_KV_CACHE_ALLOCATED_BLOCKS: &str = "engine.kv_cache.allocated_blocks";
+pub const ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL: &str =
+    "engine.kv_cache.prefix_reuse_blocks_total";
+pub const ENGINE_STREAM_BACKPRESSURE_TOTAL: &str = "engine.stream.backpressure_total";
+
+pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
+    EngineMetricDescriptor {
+        name: ENGINE_SCHEDULER_QUEUE_DEPTH,
+        description: "Requests waiting in the scheduler queue.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_SCHEDULER_RUNNING_REQUESTS,
+        description: "Requests currently running in the scheduler.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_SCHEDULER_PREEMPTIONS_TOTAL,
+        description: "Scheduler preemptions caused by priority or KV pressure.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_SCHEDULER_STEP_TOKENS_TOTAL,
+        description: "Tokens admitted into scheduler execution steps.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_KV_CACHE_HITS_TOTAL,
+        description: "KV-cache or prefix-cache hits.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_KV_CACHE_MISSES_TOTAL,
+        description: "KV-cache or prefix-cache misses.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_KV_CACHE_EVICTIONS_TOTAL,
+        description: "KV-cache evictions labeled by reason when emitted.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
+        description: "Currently allocated KV-cache blocks.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL,
+        description: "Prompt blocks reused from prefix cache.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_STREAM_BACKPRESSURE_TOTAL,
+        description: "Engine stream backpressure events.",
+    },
+];
+
+pub fn engine_metric_catalog() -> &'static [EngineMetricDescriptor] {
+    ENGINE_METRIC_CATALOG
+}
+
+pub fn prometheus_engine_metric_name(name: &str) -> String {
+    format!("izwi_{}", name.replace('.', "_"))
+}
+
+pub fn prometheus_engine_metric_type(name: &str) -> &'static str {
+    if name.ends_with("_total") {
+        "counter"
+    } else {
+        "gauge"
+    }
+}
+
 /// Global metrics collector for the engine.
 #[derive(Debug)]
 pub struct MetricsCollector {
@@ -359,5 +437,36 @@ mod tests {
 
         assert!((compute_percentile(&samples, 0.50) - 50.0).abs() < 2.0);
         assert!((compute_percentile(&samples, 0.90) - 90.0).abs() < 2.0);
+    }
+
+    #[test]
+    fn engine_metric_catalog_exposes_scheduler_and_cache_contract() {
+        let names = engine_metric_catalog()
+            .iter()
+            .map(|descriptor| descriptor.name)
+            .collect::<std::collections::HashSet<_>>();
+
+        assert!(names.contains(ENGINE_SCHEDULER_QUEUE_DEPTH));
+        assert!(names.contains(ENGINE_SCHEDULER_PREEMPTIONS_TOTAL));
+        assert!(names.contains(ENGINE_KV_CACHE_HITS_TOTAL));
+        assert!(names.contains(ENGINE_KV_CACHE_EVICTIONS_TOTAL));
+        assert!(names.contains(ENGINE_STREAM_BACKPRESSURE_TOTAL));
+        assert_eq!(names.len(), ENGINE_METRIC_CATALOG.len());
+    }
+
+    #[test]
+    fn engine_metric_prometheus_helpers_preserve_counter_suffix() {
+        assert_eq!(
+            prometheus_engine_metric_name(ENGINE_KV_CACHE_HITS_TOTAL),
+            "izwi_engine_kv_cache_hits_total"
+        );
+        assert_eq!(
+            prometheus_engine_metric_type(ENGINE_KV_CACHE_HITS_TOTAL),
+            "counter"
+        );
+        assert_eq!(
+            prometheus_engine_metric_type(ENGINE_KV_CACHE_ALLOCATED_BLOCKS),
+            "gauge"
+        );
     }
 }
