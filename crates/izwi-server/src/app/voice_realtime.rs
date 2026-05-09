@@ -518,6 +518,7 @@ async fn finalize_stream_vad_utterance(
     end_reason: UtteranceEndReason,
 ) -> Result<(), String> {
     if interrupt_active_turn(out_tx, &mut conn.active_turn, "preempted_by_new_turn") {
+        state.runtime.record_voice_interruption();
         conn.voice_session.interrupt("preempted_by_new_turn");
     }
 
@@ -723,10 +724,14 @@ pub async fn handle_socket(socket: WebSocket, state: AppState, correlation_id: S
         }
     }
 
-    interrupt_active_turn(&out_tx, &mut conn.active_turn, "socket_closed");
+    if interrupt_active_turn(&out_tx, &mut conn.active_turn, "socket_closed") {
+        state.runtime.record_voice_interruption();
+    }
     if let Some(session_id) = conn.close_voice_session_now() {
         if let Err(err) = state.voice_store.end_session(session_id).await {
             warn!("failed to end voice session on socket close: {err}");
+        } else {
+            state.runtime.record_voice_session_closed();
         }
     }
     drop(out_tx);
@@ -883,6 +888,7 @@ async fn handle_text_message(
                     .map_err(|err| format!("Voice storage error: {err}"))?;
                 conn.voice_session.start(session.id.clone());
                 conn.voice_session_id = Some(session.id);
+                state.runtime.record_voice_session_started();
             }
 
             conn.streaming_input = Some(StreamingInputState::new(StreamingInputConfig {
@@ -953,11 +959,13 @@ async fn handle_text_message(
                     .end_session(session_id)
                     .await
                     .map_err(|err| format!("Voice storage error: {err}"))?;
+                state.runtime.record_voice_session_closed();
             }
         }
         ClientEvent::Interrupt { reason } => {
             let reason = reason.unwrap_or_else(|| "client_interrupt".to_string());
             if interrupt_active_turn(out_tx, &mut conn.active_turn, &reason) {
+                state.runtime.record_voice_interruption();
                 conn.voice_session.interrupt(reason);
             }
         }
@@ -1004,6 +1012,8 @@ async fn handle_binary_message(
 
             if let Some(evt) = frame_result.speech_start {
                 if interrupt_active_turn(out_tx, &mut conn.active_turn, "barge_in") {
+                    state.runtime.record_voice_interruption();
+                    state.runtime.record_voice_barge_in();
                     conn.voice_session.interrupt("barge_in");
                 }
                 send_json(
