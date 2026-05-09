@@ -16,6 +16,7 @@ mod service;
 mod speech_to_speech;
 mod tts;
 mod types;
+mod voice_session;
 
 pub use service::{RuntimeService, RuntimeTelemetrySnapshot};
 pub use types::{
@@ -24,3 +25,4 @@ pub use types::{
     GenerationConfig, GenerationRequest, GenerationResult, InferenceOptions,
     SpeechToSpeechGeneration,
 };
+pub use voice_session::{VoiceSession, VoiceSessionPhase};

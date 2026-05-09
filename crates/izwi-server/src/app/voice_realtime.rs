@@ -24,7 +24,7 @@ use izwi_agent::{
 use izwi_core::{
     audio::{AudioEncoder, AudioFormat},
     parse_chat_model_variant, parse_model_variant, parse_tts_model_variant, ChatMessage, ChatRole,
-    GenerationConfig, GenerationParams, GenerationRequest,
+    GenerationConfig, GenerationParams, GenerationRequest, VoiceSession,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -262,6 +262,7 @@ struct ConnectionState {
     agent_session_system_prompt: Option<String>,
     streaming_input: Option<StreamingInputState>,
     active_turn: Option<ActiveTurn>,
+    voice_session: VoiceSession,
     started: bool,
 }
 
@@ -275,6 +276,7 @@ impl Default for ConnectionState {
             agent_session_system_prompt: None,
             streaming_input: None,
             active_turn: None,
+            voice_session: VoiceSession::default(),
             started: false,
         }
     }
@@ -481,7 +483,10 @@ async fn finalize_stream_vad_utterance(
     wav_bytes: Vec<u8>,
     end_reason: UtteranceEndReason,
 ) -> Result<(), String> {
-    interrupt_active_turn(out_tx, &mut conn.active_turn, "preempted_by_new_turn");
+    if conn.active_turn.is_some() {
+        interrupt_active_turn(out_tx, &mut conn.active_turn, "preempted_by_new_turn");
+        conn.voice_session.interrupt("preempted_by_new_turn");
+    }
 
     let voice_session_id = conn
         .voice_session_id
@@ -520,6 +525,7 @@ async fn finalize_stream_vad_utterance(
         VoiceTurnConfig::Unified(_) => None,
     };
 
+    let turn_record_id = turn_record.id.clone();
     let task = spawn_turn_task(
         state.clone(),
         correlation_id.to_string(),
@@ -530,16 +536,17 @@ async fn finalize_stream_vad_utterance(
         voice_session_id,
         voice_profile_id,
         conn.system_prompt.clone(),
-        turn_record.id.clone(),
+        turn_record_id.clone(),
     );
 
     conn.active_turn = Some(ActiveTurn {
         utterance_id: commit.utterance_id,
         utterance_seq: commit.utterance_seq,
-        turn_record_id: turn_record.id,
+        turn_record_id: turn_record_id.clone(),
         state: state.clone(),
         task,
     });
+    conn.voice_session.begin_processing(turn_record_id);
 
     Ok(())
 }
@@ -841,6 +848,7 @@ async fn handle_text_message(
                     })
                     .await
                     .map_err(|err| format!("Voice storage error: {err}"))?;
+                conn.voice_session.start(session.id.clone());
                 conn.voice_session_id = Some(session.id);
             }
 
@@ -865,6 +873,7 @@ async fn handle_text_message(
                 input_sample_rate_hint: input_sample_rate
                     .filter(|sr| *sr >= 8_000 && *sr <= 192_000),
             }));
+            conn.voice_session.begin_listening();
 
             send_json(
                 out_tx,
@@ -912,10 +921,12 @@ async fn handle_text_message(
                     .await
                     .map_err(|err| format!("Voice storage error: {err}"))?;
             }
+            conn.voice_session.close();
         }
         ClientEvent::Interrupt { reason } => {
             let reason = reason.unwrap_or_else(|| "client_interrupt".to_string());
             interrupt_active_turn(out_tx, &mut conn.active_turn, &reason);
+            conn.voice_session.interrupt(reason);
         }
         ClientEvent::Ping { timestamp_ms } => {
             send_json(
@@ -961,6 +972,7 @@ async fn handle_binary_message(
             if let Some(evt) = frame_result.speech_start {
                 if conn.active_turn.is_some() {
                     interrupt_active_turn(out_tx, &mut conn.active_turn, "barge_in");
+                    conn.voice_session.interrupt("barge_in");
                 }
                 send_json(
                     out_tx,
