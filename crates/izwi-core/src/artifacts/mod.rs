@@ -5,6 +5,6 @@
 //! compatibility shims.
 
 pub use crate::model::{
-    DownloadProgress, ModelDownloader, ModelManager, ModelResidency, ModelResidencyState,
-    ModelWeights,
+    DownloadProgress, ModelArtifactState, ModelDownloader, ModelLifecycleSnapshot, ModelManager,
+    ModelResidency, ModelResidencyState, ModelWeights,
 };
