@@ -1428,6 +1428,7 @@ async fn stream_tts_to_socket(
 
     let gen_request = GenerationRequest {
         id: uuid::Uuid::new_v4().to_string(),
+        model_variant: Some(tts_variant),
         correlation_id: Some(correlation_id.to_string()),
         text: text.to_string(),
         config: gen_config,

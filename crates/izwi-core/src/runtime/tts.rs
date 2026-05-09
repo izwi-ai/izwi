@@ -7,6 +7,7 @@ use tracing::info;
 
 use crate::engine::{EngineCoreRequest, GenerationParams as CoreGenParams};
 use crate::error::{Error, Result};
+use crate::model::ModelVariant;
 use crate::models::architectures::lfm25_audio::lfm25_audio_tts_system_prompt;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 use crate::runtime::service::RuntimeService;
@@ -28,13 +29,21 @@ fn lfm25_audio_prompt_messages(text: &str, speaker: Option<&str>) -> Vec<ChatMes
 }
 
 impl RuntimeService {
+    async fn resolve_tts_variant_for_request(
+        &self,
+        request: &GenerationRequest,
+    ) -> Result<ModelVariant> {
+        request
+            .model_variant
+            .or(*self.loaded_tts_variant.read().await)
+            .ok_or_else(|| Error::InferenceError("No TTS model loaded".to_string()))
+    }
+
     async fn lfm25_audio_tts_generate(
         &self,
         request: GenerationRequest,
+        variant: ModelVariant,
     ) -> Result<GenerationResult> {
-        let variant = (*self.loaded_tts_variant.read().await)
-            .filter(|variant| matches!(variant.family(), crate::catalog::ModelFamily::Lfm25Audio))
-            .ok_or_else(|| Error::InferenceError("No LFM2.5 Audio TTS model loaded".to_string()))?;
         self.load_model(variant).await?;
 
         let text = request.text.trim();
@@ -76,9 +85,10 @@ impl RuntimeService {
     async fn lfm25_audio_tts_generate_streaming(
         &self,
         request: GenerationRequest,
+        variant: ModelVariant,
         chunk_tx: mpsc::Sender<AudioChunk>,
     ) -> Result<()> {
-        let result = self.lfm25_audio_tts_generate(request).await?;
+        let result = self.lfm25_audio_tts_generate(request, variant).await?;
         let mut chunk = AudioChunk::final_chunk(result.request_id.clone(), 0, result.samples);
         chunk.is_final = true;
         chunk_tx
@@ -92,24 +102,27 @@ impl RuntimeService {
 impl RuntimeService {
     /// Generate audio from text using the unified core engine.
     pub async fn generate(&self, request: GenerationRequest) -> Result<GenerationResult> {
-        let loaded_variant = *self.loaded_tts_variant.read().await;
-        if loaded_variant
-            .map(|variant| matches!(variant.family(), crate::catalog::ModelFamily::KokoroTts))
-            .unwrap_or(false)
-        {
+        let resolved_variant = self.resolve_tts_variant_for_request(&request).await?;
+        if matches!(
+            resolved_variant.family(),
+            crate::catalog::ModelFamily::KokoroTts
+        ) {
             return self.kokoro_tts_generate(request).await;
         }
-        if loaded_variant
-            .map(|variant| matches!(variant.family(), crate::catalog::ModelFamily::Lfm25Audio))
-            .unwrap_or(false)
-        {
-            return self.lfm25_audio_tts_generate(request).await;
+        if matches!(
+            resolved_variant.family(),
+            crate::catalog::ModelFamily::Lfm25Audio
+        ) {
+            return self
+                .lfm25_audio_tts_generate(request, resolved_variant)
+                .await;
         }
+        self.load_model(resolved_variant).await?;
 
         let mut core_request = EngineCoreRequest::tts(request.text.clone());
         core_request.id = request.id.clone();
         core_request.correlation_id = request.correlation_id.clone();
-        core_request.model_variant = loaded_variant;
+        core_request.model_variant = Some(resolved_variant);
         core_request.language = request.language.clone();
         core_request.reference_audio = request.reference_audio.clone();
         core_request.reference_text = request.reference_text.clone();
@@ -146,26 +159,27 @@ impl RuntimeService {
         request: GenerationRequest,
         chunk_tx: mpsc::Sender<AudioChunk>,
     ) -> Result<()> {
-        let loaded_variant = *self.loaded_tts_variant.read().await;
-        if loaded_variant
-            .map(|variant| matches!(variant.family(), crate::catalog::ModelFamily::KokoroTts))
-            .unwrap_or(false)
-        {
+        let resolved_variant = self.resolve_tts_variant_for_request(&request).await?;
+        if matches!(
+            resolved_variant.family(),
+            crate::catalog::ModelFamily::KokoroTts
+        ) {
             return self.kokoro_tts_generate_streaming(request, chunk_tx).await;
         }
-        if loaded_variant
-            .map(|variant| matches!(variant.family(), crate::catalog::ModelFamily::Lfm25Audio))
-            .unwrap_or(false)
-        {
+        if matches!(
+            resolved_variant.family(),
+            crate::catalog::ModelFamily::Lfm25Audio
+        ) {
             return self
-                .lfm25_audio_tts_generate_streaming(request, chunk_tx)
+                .lfm25_audio_tts_generate_streaming(request, resolved_variant, chunk_tx)
                 .await;
         }
+        self.load_model(resolved_variant).await?;
 
         let mut core_request = EngineCoreRequest::tts(request.text.clone());
         core_request.id = request.id.clone();
         core_request.correlation_id = request.correlation_id.clone();
-        core_request.model_variant = loaded_variant;
+        core_request.model_variant = Some(resolved_variant);
         core_request.language = request.language.clone();
         core_request.reference_audio = request.reference_audio.clone();
         core_request.reference_text = request.reference_text.clone();

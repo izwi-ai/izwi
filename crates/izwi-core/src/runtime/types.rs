@@ -1,5 +1,6 @@
 //! Runtime request/response types.
 
+use crate::catalog::ModelVariant;
 use crate::engine::GenerationParams;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -135,6 +136,13 @@ pub struct GenerationRequest {
     #[serde(default = "generate_request_id")]
     pub id: String,
 
+    /// Resolved TTS model variant for this request.
+    ///
+    /// Public API layers should set this after resolving request defaults so
+    /// concurrent TTS calls do not depend on process-global active model state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_variant: Option<ModelVariant>,
+
     /// Optional request correlation ID.
     #[serde(default)]
     pub correlation_id: Option<String>,
@@ -171,6 +179,7 @@ impl GenerationRequest {
     pub fn new(text: impl Into<String>) -> Self {
         Self {
             id: generate_request_id(),
+            model_variant: None,
             correlation_id: None,
             text: text.into(),
             config: GenerationConfig::default(),
@@ -183,6 +192,11 @@ impl GenerationRequest {
 
     pub fn with_config(mut self, config: GenerationConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    pub fn with_model_variant(mut self, model_variant: ModelVariant) -> Self {
+        self.model_variant = Some(model_variant);
         self
     }
 
@@ -275,5 +289,29 @@ impl GenerationResult {
         } else {
             0.0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generation_request_keeps_explicit_model_variant() {
+        let request = GenerationRequest::new("hello").with_model_variant(ModelVariant::Kokoro82M);
+
+        assert_eq!(request.model_variant, Some(ModelVariant::Kokoro82M));
+
+        let serialized = serde_json::to_value(&request).expect("serialize generation request");
+        assert_eq!(serialized["model_variant"], "Kokoro-82M");
+    }
+
+    #[test]
+    fn generation_request_defaults_to_no_model_variant() {
+        let request: GenerationRequest =
+            serde_json::from_value(serde_json::json!({ "text": "hello" }))
+                .expect("deserialize generation request");
+
+        assert_eq!(request.model_variant, None);
     }
 }

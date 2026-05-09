@@ -188,8 +188,9 @@ pub fn expand_generation_requests_for_long_form(
 pub async fn generate_long_form_tts(
     runtime: &Arc<RuntimeService>,
     variant: ModelVariant,
-    request: GenerationRequest,
+    mut request: GenerationRequest,
 ) -> Result<GenerationResult, izwi_core::Error> {
+    request.model_variant.get_or_insert(variant);
     let planned_requests = expand_generation_requests_for_long_form(&request, variant);
     if planned_requests.len() == 1 {
         return runtime
