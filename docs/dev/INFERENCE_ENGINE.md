@@ -4,6 +4,11 @@
 
 ---
 
+For the current Voice AI Runtime boundary contract and migration invariants, see
+[Voice AI Runtime Architecture](./VOICE_AI_RUNTIME_ARCHITECTURE.md).
+
+---
+
 ## Table of Contents
 
 1. [Overview & Design Goals](#1-overview--design-goals)
