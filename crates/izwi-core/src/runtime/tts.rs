@@ -10,6 +10,7 @@ use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::lfm25_audio::lfm25_audio_tts_system_prompt;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
+use crate::runtime::adapters::CapabilityKind;
 use crate::runtime::request::TtsRuntimeRequest;
 use crate::runtime::service::RuntimeService;
 use crate::runtime::types::{AudioChunk, GenerationConfig, GenerationRequest, GenerationResult};
@@ -38,6 +39,11 @@ impl RuntimeService {
             .model_variant
             .or(*self.loaded_tts_variant.read().await)
             .ok_or_else(|| Error::InferenceError("No TTS model loaded".to_string()))
+            .and_then(|variant| {
+                self.adapter_registry
+                    .require(CapabilityKind::Tts, variant)
+                    .map(|_| variant)
+            })
     }
 
     async fn lfm25_audio_tts_generate(

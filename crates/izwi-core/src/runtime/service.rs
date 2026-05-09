@@ -26,6 +26,7 @@ use crate::error::{Error, Result};
 use crate::models::shared::telemetry::{
     prometheus as kernel_path_prometheus, snapshot as kernel_path_telemetry_snapshot,
 };
+use crate::runtime::adapters::RuntimeAdapterRegistry;
 use crate::runtime_models::ModelRegistry;
 use crate::tokenizer::Tokenizer;
 use crate::KernelPathTelemetrySnapshot;
@@ -275,6 +276,7 @@ fn percentile(values: &VecDeque<f64>, q: f64) -> f64 {
 pub struct RuntimeService {
     pub(crate) config: EngineConfig,
     pub(crate) backend_router: BackendRouter,
+    pub(crate) adapter_registry: RuntimeAdapterRegistry,
     pub(crate) model_manager: Arc<ModelManager>,
     pub(crate) model_registry: Arc<ModelRegistry>,
     pub(crate) tokenizer: RwLock<Option<Tokenizer>>,
@@ -395,6 +397,7 @@ impl RuntimeService {
         Ok(Self {
             config,
             backend_router: BackendRouter::from_context(backend_context),
+            adapter_registry: RuntimeAdapterRegistry::built_in(),
             model_manager,
             model_registry,
             tokenizer: RwLock::new(None),
