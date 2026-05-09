@@ -9,6 +9,10 @@ use super::NativeExecutor;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StreamBackpressurePolicy {
     FailOnFull,
+    BlockWithDeadline,
+    DropOldest,
+    Coalesce,
+    Sample,
 }
 
 pub(super) struct StreamSink<'a> {
@@ -18,10 +22,21 @@ pub(super) struct StreamSink<'a> {
 
 impl<'a> StreamSink<'a> {
     fn fail_on_full(tx: &'a mpsc::Sender<StreamingOutput>) -> Self {
+        Self::with_policy(tx, StreamBackpressurePolicy::FailOnFull)
+    }
+
+    fn with_policy(
+        tx: &'a mpsc::Sender<StreamingOutput>,
+        policy: StreamBackpressurePolicy,
+    ) -> Self {
         Self {
             tx,
-            policy: StreamBackpressurePolicy::FailOnFull,
+            policy,
         }
+    }
+
+    fn policy(&self) -> StreamBackpressurePolicy {
+        self.policy
     }
 
     fn send(&self, output: StreamingOutput) -> Result<()> {
@@ -29,6 +44,13 @@ impl<'a> StreamSink<'a> {
             StreamBackpressurePolicy::FailOnFull => {
                 self.tx.try_send(output).map_err(stream_send_error)
             }
+            StreamBackpressurePolicy::BlockWithDeadline
+            | StreamBackpressurePolicy::DropOldest
+            | StreamBackpressurePolicy::Coalesce
+            | StreamBackpressurePolicy::Sample => Err(Error::InferenceError(format!(
+                "Streaming backpressure policy {:?} is not enabled for engine execution",
+                self.policy
+            ))),
         }
     }
 }
@@ -128,7 +150,7 @@ mod tests {
     use crate::engine::output::StreamingOutput;
     use crate::error::Error;
 
-    use super::StreamSink;
+    use super::{StreamBackpressurePolicy, StreamSink};
 
     #[test]
     fn stream_text_per_character_emits_one_delta_per_character() {
@@ -159,6 +181,7 @@ mod tests {
     fn stream_sink_fail_on_full_preserves_current_backpressure_behavior() {
         let (tx, _rx) = mpsc::channel(1);
         let sink = StreamSink::fail_on_full(&tx);
+        assert_eq!(sink.policy(), StreamBackpressurePolicy::FailOnFull);
 
         sink.send(StreamingOutput {
             request_id: "req-1".to_string(),
@@ -187,5 +210,28 @@ mod tests {
             panic!("expected inference error for stream backpressure");
         };
         assert!(message.contains("backpressure"));
+    }
+
+    #[test]
+    fn stream_sink_reserved_policies_fail_closed_until_rollout() {
+        let (tx, _rx) = mpsc::channel(1);
+        let sink = StreamSink::with_policy(&tx, StreamBackpressurePolicy::Coalesce);
+
+        let err = sink
+            .send(StreamingOutput {
+                request_id: "req-1".to_string(),
+                sequence: 0,
+                samples: vec![0.0],
+                sample_rate: 24_000,
+                is_final: false,
+                text: None,
+                stats: None,
+            })
+            .expect_err("reserved policy should not silently change stream behavior");
+
+        let Error::InferenceError(message) = err else {
+            panic!("expected inference error for reserved policy");
+        };
+        assert!(message.contains("not enabled"));
     }
 }
