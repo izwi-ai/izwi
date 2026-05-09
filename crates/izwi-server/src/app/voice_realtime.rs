@@ -1087,6 +1087,7 @@ fn spawn_turn_task(
             );
             match &commit.turn_config {
                 VoiceTurnConfig::Modular(config) => {
+                    state.runtime.record_modular_voice_pipeline_turn();
                     send_json(
                         &out_tx,
                         json!({
@@ -1270,6 +1271,7 @@ fn spawn_turn_task(
                     Ok(())
                 }
                 VoiceTurnConfig::Unified(config) => {
+                    state.runtime.record_unified_voice_pipeline_turn();
                     send_json(
                         &out_tx,
                         json!({
