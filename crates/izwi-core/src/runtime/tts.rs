@@ -5,11 +5,12 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::info;
 
-use crate::engine::{EngineCoreRequest, GenerationParams as CoreGenParams};
+use crate::engine::GenerationParams as CoreGenParams;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::lfm25_audio::lfm25_audio_tts_system_prompt;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
+use crate::runtime::request::TtsRuntimeRequest;
 use crate::runtime::service::RuntimeService;
 use crate::runtime::types::{AudioChunk, GenerationConfig, GenerationRequest, GenerationResult};
 
@@ -119,15 +120,9 @@ impl RuntimeService {
         }
         self.load_model(resolved_variant).await?;
 
-        let mut core_request = EngineCoreRequest::tts(request.text.clone());
-        core_request.id = request.id.clone();
-        core_request.correlation_id = request.correlation_id.clone();
-        core_request.model_variant = Some(resolved_variant);
-        core_request.language = request.language.clone();
-        core_request.reference_audio = request.reference_audio.clone();
-        core_request.reference_text = request.reference_text.clone();
-        core_request.voice_description = request.voice_description.clone();
-        core_request.params = core_params_from_generation(&request.config);
+        let core_params = core_params_from_generation(&request.config);
+        let core_request = TtsRuntimeRequest::from_generation(request, resolved_variant)?
+            .into_engine_request(core_params);
 
         let output = self.run_request(core_request).await?;
         let samples = output.audio.samples;
@@ -176,15 +171,9 @@ impl RuntimeService {
         }
         self.load_model(resolved_variant).await?;
 
-        let mut core_request = EngineCoreRequest::tts(request.text.clone());
-        core_request.id = request.id.clone();
-        core_request.correlation_id = request.correlation_id.clone();
-        core_request.model_variant = Some(resolved_variant);
-        core_request.language = request.language.clone();
-        core_request.reference_audio = request.reference_audio.clone();
-        core_request.reference_text = request.reference_text.clone();
-        core_request.voice_description = request.voice_description.clone();
-        core_request.params = core_params_from_generation(&request.config);
+        let core_params = core_params_from_generation(&request.config);
+        let core_request = TtsRuntimeRequest::from_generation(request, resolved_variant)?
+            .into_engine_request(core_params);
 
         self.run_streaming_request(core_request, |stream_chunk| {
             let tx = chunk_tx.clone();
