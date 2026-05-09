@@ -7,6 +7,7 @@ use crate::error::{Error, Result};
 use crate::models::registry::NativeAsrModel;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 use crate::runtime::audio_io::{base64_decode, decode_audio_bytes};
+use crate::runtime::request::DiarizationRuntimeRequest;
 use crate::runtime::service::RuntimeService;
 use crate::runtime::types::{
     DiarizationConfig, DiarizationResult, DiarizationSegment, DiarizationTranscriptResult,
@@ -83,9 +84,21 @@ impl RuntimeService {
         model_id: Option<&str>,
         config: &DiarizationConfig,
     ) -> Result<DiarizationResult> {
+        let runtime_request =
+            DiarizationRuntimeRequest::from_bytes(
+                resolve_diarization_model_variant(model_id),
+                audio_bytes.to_vec(),
+                config.clone(),
+            )?
+            .with_pipeline_models(model_id.map(ToOwned::to_owned), None, None, None);
         let audio = decode_pipeline_audio_bytes(audio_bytes)?;
-        self.diarize_samples(&audio.samples, audio.sample_rate, model_id, config)
-            .await
+        self.diarize_samples(
+            &audio.samples,
+            audio.sample_rate,
+            runtime_request.diarization_model_id.as_deref(),
+            &runtime_request.config,
+        )
+        .await
     }
 
     /// Run diarization and produce speaker-attributed transcript artifacts.
@@ -122,20 +135,35 @@ impl RuntimeService {
         config: &DiarizationConfig,
         enable_llm_refinement: bool,
     ) -> Result<DiarizationTranscriptResult> {
+        let runtime_request =
+            DiarizationRuntimeRequest::from_bytes(
+                resolve_diarization_model_variant(diarization_model_id),
+                audio_bytes.to_vec(),
+                config.clone(),
+            )?
+            .with_pipeline_models(
+                diarization_model_id.map(ToOwned::to_owned),
+                asr_model_id.map(ToOwned::to_owned),
+                aligner_model_id.map(ToOwned::to_owned),
+                llm_model_id.map(ToOwned::to_owned),
+            )
+            .with_llm_refinement(enable_llm_refinement);
         let audio = decode_pipeline_audio_bytes(audio_bytes)?;
         let diarization = self
             .diarize_samples(
                 &audio.samples,
                 audio.sample_rate,
-                diarization_model_id,
-                config,
+                runtime_request.diarization_model_id.as_deref(),
+                &runtime_request.config,
             )
             .await?;
 
-        let asr_variant = resolve_asr_model_variant(asr_model_id);
+        let asr_variant = resolve_asr_model_variant(runtime_request.asr_model_id.as_deref());
 
         let aligner_variant =
-            crate::runtime::asr::resolve_forced_aligner_variant(aligner_model_id)?;
+            crate::runtime::asr::resolve_forced_aligner_variant(
+                runtime_request.aligner_model_id.as_deref(),
+            )?;
         let aligner_model = match self.load_model(aligner_variant).await {
             Ok(()) => match self.model_registry.get_asr(aligner_variant).await {
                 Some(model) => Some(model),
@@ -203,7 +231,7 @@ impl RuntimeService {
                     audio_bytes,
                     &asr_text,
                     detected_language.as_deref(),
-                    aligner_model_id,
+                    runtime_request.aligner_model_id.as_deref(),
                 )
                 .await
             {
@@ -276,8 +304,8 @@ impl RuntimeService {
         let raw_transcript_trimmed = raw_transcript.trim();
         let mut transcript = raw_transcript.clone();
         let mut llm_refined = false;
-        if enable_llm_refinement && !raw_transcript_trimmed.is_empty() {
-            let llm_variant = resolve_chat_variant(llm_model_id)?;
+        if runtime_request.enable_llm_refinement && !raw_transcript_trimmed.is_empty() {
+            let llm_variant = resolve_chat_variant(runtime_request.llm_model_id.as_deref())?;
             match self
                 .polish_diarized_transcript(llm_variant, &raw_transcript)
                 .await

@@ -5,6 +5,7 @@ use crate::engine::GenerationParams;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRequestConfig};
+use crate::runtime::request::ChatRuntimeRequest;
 use crate::runtime::service::RuntimeService;
 use crate::runtime::types::ChatGeneration;
 
@@ -44,14 +45,16 @@ impl RuntimeService {
             .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?
             .prompt_token_ids_with_config(&messages, &prompt_config)?;
 
-        let mut request = EngineCoreRequest::chat(messages);
-        request.model_variant = Some(variant);
         params.max_tokens = params.max_tokens.max(1);
-        request.params = params;
-        request.chat_config = chat_config;
-        request.correlation_id = correlation_id.map(|s| s.to_string());
-        request.prompt_tokens = prompt_tokens;
-        Ok(request)
+        Ok(ChatRuntimeRequest::from_messages(
+            variant,
+            messages,
+            params,
+            chat_config,
+            prompt_tokens,
+            correlation_id.map(ToOwned::to_owned),
+        )?
+        .into_engine_request())
     }
 
     async fn build_chat_request_with_params(

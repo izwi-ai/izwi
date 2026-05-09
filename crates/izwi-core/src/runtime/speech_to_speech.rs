@@ -5,6 +5,7 @@ use crate::engine::{EngineCoreRequest, GenerationParams, StreamingOutput};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::shared::chat::ChatMessage;
+use crate::runtime::request::AudioChatRuntimeRequest;
 use crate::runtime::service::RuntimeService;
 use crate::runtime::types::SpeechToSpeechGeneration;
 
@@ -42,24 +43,28 @@ impl RuntimeService {
     ) -> Result<EngineCoreRequest> {
         self.load_model(variant).await?;
 
-        let mut request = match audio_input {
-            SpeechAudioInput::Base64(audio_base64) => {
-                EngineCoreRequest::speech_to_speech(audio_base64.to_string())
-            }
-            SpeechAudioInput::Bytes(audio_bytes) => {
-                EngineCoreRequest::speech_to_speech_bytes(audio_bytes.to_vec())
-            }
-        };
-        request.model_variant = Some(variant);
-        request.chat_messages = (!messages.is_empty()).then_some(messages);
-        request.system_prompt = system_prompt
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
-        request.correlation_id = correlation_id.map(|value| value.to_string());
         params.max_tokens = params.max_tokens.max(1);
-        request.params = params;
-        Ok(request)
+        let runtime_request = match audio_input {
+            SpeechAudioInput::Base64(audio_base64) => {
+                AudioChatRuntimeRequest::speech_to_speech_base64(
+                    variant,
+                    audio_base64,
+                    messages,
+                    params,
+                    system_prompt.map(ToOwned::to_owned),
+                    correlation_id.map(ToOwned::to_owned),
+                )?
+            }
+            SpeechAudioInput::Bytes(audio_bytes) => AudioChatRuntimeRequest::speech_to_speech_bytes(
+                variant,
+                audio_bytes.to_vec(),
+                messages,
+                params,
+                system_prompt.map(ToOwned::to_owned),
+                correlation_id.map(ToOwned::to_owned),
+            )?,
+        };
+        Ok(runtime_request.into_engine_request())
     }
 
     pub async fn speech_to_speech_generate_bytes_with_variant(

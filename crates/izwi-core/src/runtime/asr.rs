@@ -5,6 +5,7 @@ use crate::engine::EngineCoreRequest;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::runtime::audio_io::{base64_decode, decode_audio_bytes};
+use crate::runtime::request::{AlignmentRuntimeRequest, AsrRuntimeRequest};
 use crate::runtime::service::RuntimeService;
 use crate::runtime::types::AsrTranscription;
 
@@ -90,14 +91,21 @@ impl RuntimeService {
     ) -> Result<EngineCoreRequest> {
         self.load_model(variant).await?;
 
-        let mut request = match audio_input {
-            AsrAudioInput::Base64(audio_base64) => EngineCoreRequest::asr(audio_base64.to_string()),
-            AsrAudioInput::Bytes(audio_bytes) => EngineCoreRequest::asr_bytes(audio_bytes.to_vec()),
+        let runtime_request = match audio_input {
+            AsrAudioInput::Base64(audio_base64) => AsrRuntimeRequest::from_base64(
+                audio_base64,
+                variant,
+                language.map(ToOwned::to_owned),
+                correlation_id.map(ToOwned::to_owned),
+            )?,
+            AsrAudioInput::Bytes(audio_bytes) => AsrRuntimeRequest::from_bytes(
+                audio_bytes.to_vec(),
+                variant,
+                language.map(ToOwned::to_owned),
+                correlation_id.map(ToOwned::to_owned),
+            )?,
         };
-        request.model_variant = Some(variant);
-        request.language = language.map(|s| s.to_string());
-        request.correlation_id = correlation_id.map(|s| s.to_string());
-        Ok(request)
+        Ok(runtime_request.into_engine_request())
     }
 
     pub(crate) async fn asr_transcribe_with_variant(
@@ -455,6 +463,12 @@ impl RuntimeService {
         model_id: Option<&str>,
     ) -> Result<Vec<(String, u32, u32)>> {
         let variant = resolve_forced_aligner_variant(model_id)?;
+        let _runtime_request = AlignmentRuntimeRequest::from_bytes(
+            variant,
+            audio_bytes.to_vec(),
+            reference_text,
+            language.map(ToOwned::to_owned),
+        )?;
         self.load_model(variant).await?;
 
         let model = self
