@@ -196,7 +196,6 @@ impl ModelManager {
 
     /// Acquire a lease for active work using a resident model.
     ///
-    /// Phase 4 records active use without changing unload/eviction policy yet.
     pub fn acquire_residency_lease(&self, variant: ModelVariant) -> ModelResidencyLease {
         self.residency.acquire_lease(variant)
     }
@@ -340,6 +339,12 @@ impl ModelManager {
 
     /// Unload a model from memory
     pub async fn unload_model(&self, variant: ModelVariant) -> Result<()> {
+        if self.residency.has_active_leases(variant) {
+            return Err(Error::InferenceError(format!(
+                "Cannot unload model {variant}: active inference leases are still held"
+            )));
+        }
+
         let mut models = self.models.write().await;
         if let Some(state) = models.get_mut(&variant) {
             state.weights = None;
@@ -564,6 +569,33 @@ mod tests {
         assert_eq!(info.status, ModelStatus::Downloaded);
         assert_eq!(info.local_path, Some(model_dir));
         assert!(info.size_bytes.is_some_and(|bytes| bytes >= 5));
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unload_rejects_model_with_active_residency_lease() {
+        let temp_dir = std::env::temp_dir().join(format!("izwi-manager-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let config = EngineConfig {
+            models_dir: temp_dir.clone(),
+            ..EngineConfig::default()
+        };
+        let manager = ModelManager::new(config).unwrap();
+        let lease = manager.acquire_residency_lease(ModelVariant::Kokoro82M);
+
+        let err = manager
+            .unload_model(ModelVariant::Kokoro82M)
+            .await
+            .expect_err("active lease should block unload");
+        assert!(err.to_string().contains("active inference lease"));
+
+        drop(lease);
+        manager
+            .unload_model(ModelVariant::Kokoro82M)
+            .await
+            .expect("unload should succeed after lease drops");
 
         std::fs::remove_dir_all(&temp_dir).unwrap();
     }

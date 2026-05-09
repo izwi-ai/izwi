@@ -26,6 +26,7 @@ impl RuntimeService {
         F: FnMut(String),
     {
         self.load_model(variant).await?;
+        let _lease = self.acquire_model_residency_lease(variant);
         let model = self
             .model_registry
             .get_audio_chat(variant)
@@ -470,6 +471,7 @@ impl RuntimeService {
             language.map(ToOwned::to_owned),
         )?;
         self.load_model(variant).await?;
+        let _lease = self.acquire_model_residency_lease(variant);
 
         let model = self
             .model_registry

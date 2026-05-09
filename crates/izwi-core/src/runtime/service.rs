@@ -650,6 +650,7 @@ impl RuntimeService {
     pub async fn available_speakers(&self) -> Result<Vec<String>> {
         let variant = (*self.loaded_tts_variant.read().await)
             .ok_or_else(|| Error::InferenceError("No TTS model loaded".to_string()))?;
+        let _lease = self.acquire_model_residency_lease(variant);
 
         match variant.family() {
             crate::catalog::ModelFamily::Qwen3Tts => {
@@ -809,6 +810,9 @@ impl RuntimeService {
 
     pub(crate) async fn run_request(&self, request: EngineCoreRequest) -> Result<EngineOutput> {
         self.observe_broker_request(&request)?;
+        let _residency_lease = request
+            .model_variant
+            .map(|variant| self.acquire_model_residency_lease(variant));
         self.ensure_step_driver_started().await;
 
         let span = info_span!(
@@ -850,6 +854,9 @@ impl RuntimeService {
         Fut: Future<Output = Result<()>>,
     {
         self.observe_broker_request(&request)?;
+        let _residency_lease = request
+            .model_variant
+            .map(|variant| self.acquire_model_residency_lease(variant));
         self.ensure_step_driver_started().await;
 
         request.streaming = true;

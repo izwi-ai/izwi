@@ -52,6 +52,7 @@ impl RuntimeService {
         variant: ModelVariant,
     ) -> Result<GenerationResult> {
         self.load_model(variant).await?;
+        let _lease = self.acquire_model_residency_lease(variant);
 
         let text = request.text.trim();
         if text.is_empty() {
