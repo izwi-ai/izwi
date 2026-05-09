@@ -1,0 +1,33 @@
+# Voice-turn benchmark contract surface.
+#
+# This manifest exercises the three current voice-turn components with existing
+# bench commands. A future duplex voice benchmark should preserve these case
+# names while replacing the component commands with a single voice-turn runner.
+
+[[benchmarks]]
+name = "voice-turn-asr-input-c1"
+command = "asr"
+model = "parakeet-tdt-0.6b-v3"
+file = "../../data/test.wav"
+iterations = 1
+concurrent = 1
+warmup = false
+
+[[benchmarks]]
+name = "voice-turn-llm-response-c1"
+command = "chat"
+model = "Qwen3.5-4B"
+iterations = 1
+concurrent = 1
+warmup = false
+prompt = "Reply as a concise voice assistant confirming the user's request."
+max_tokens = 64
+
+[[benchmarks]]
+name = "voice-turn-tts-output-c1"
+command = "tts"
+model = "Kokoro-82M"
+iterations = 1
+concurrent = 1
+warmup = false
+text = "I can help with that."
