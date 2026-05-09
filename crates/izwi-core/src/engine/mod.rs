@@ -42,7 +42,16 @@ pub use executor::{ExecutorOutput, ModelExecutor, WorkerConfig};
 pub use kv_cache::{
     BlockAllocator, CacheResidency, KVCacheConfig as KVConfig, KVCacheManager, PinnedBlockHandle,
 };
-pub use metrics::{BenchmarkResult, MetricsCollector, MetricsSnapshot};
+pub use metrics::{
+    engine_metric_catalog, prometheus_engine_metric_name, prometheus_engine_metric_type,
+    BenchmarkResult, EngineMetricDescriptor, MetricsCollector, MetricsSnapshot,
+    ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_EVICTIONS_TOTAL,
+    ENGINE_KV_CACHE_HITS_TOTAL, ENGINE_KV_CACHE_MISSES_TOTAL,
+    ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL, ENGINE_METRIC_CATALOG,
+    ENGINE_SCHEDULER_PREEMPTIONS_TOTAL, ENGINE_SCHEDULER_QUEUE_DEPTH,
+    ENGINE_SCHEDULER_RUNNING_REQUESTS, ENGINE_SCHEDULER_STEP_TOKENS_TOTAL,
+    ENGINE_STREAM_BACKPRESSURE_TOTAL,
+};
 pub use output::{OutputProcessor, StreamingOutput};
 pub use request::{EngineCoreRequest, RequestProcessor, RequestStatus};
 pub use scheduler::{ScheduleResult, Scheduler, SchedulerConfig, SchedulingPolicy};
