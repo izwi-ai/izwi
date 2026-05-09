@@ -10,7 +10,7 @@ use crate::catalog::ModelVariant;
 use crate::error::{Error, Result};
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum CapabilityKind {
     Asr,
     RealtimeAsr,
@@ -56,7 +56,28 @@ impl RuntimeAdapterRegistry {
     pub(crate) fn built_in() -> Self {
         let mut registry = Self::default();
         registry.register_adapter(TtsCapabilityAdapter);
+        registry.register_adapter(StreamingTtsCapabilityAdapter);
+        registry.register_adapter(AsrCapabilityAdapter);
+        registry.register_adapter(RealtimeAsrCapabilityAdapter);
+        registry.register_adapter(ChatCapabilityAdapter);
+        registry.register_adapter(AudioChatCapabilityAdapter);
+        registry.register_adapter(SpeechToSpeechCapabilityAdapter);
+        registry.register_adapter(DiarizationCapabilityAdapter);
+        registry.register_adapter(ForcedAlignmentCapabilityAdapter);
+        registry.register_adapter(TokenizerCapabilityAdapter);
         registry
+    }
+
+    pub(crate) fn capabilities_for(&self, model_variant: ModelVariant) -> Vec<AdapterMetadata> {
+        let mut capabilities = self
+            .adapters
+            .iter()
+            .filter_map(|((_, variant), metadata)| {
+                (*variant == model_variant).then_some(*metadata)
+            })
+            .collect::<Vec<_>>();
+        capabilities.sort_by_key(|metadata| metadata.capability);
+        capabilities
     }
 
     pub(crate) fn require(
@@ -105,9 +126,186 @@ impl ModelCapabilityAdapter for TtsCapabilityAdapter {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct StreamingTtsCapabilityAdapter;
+
+impl ModelCapabilityAdapter for StreamingTtsCapabilityAdapter {
+    fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
+        let capabilities = model_variant.speech_capabilities()?;
+        capabilities.supports_streaming.then_some(AdapterMetadata {
+            id: "builtin.streaming_tts",
+            capability: CapabilityKind::StreamingTts,
+            model_variant,
+            streaming_mode: StreamingMode::Chunked,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AsrCapabilityAdapter;
+
+impl ModelCapabilityAdapter for AsrCapabilityAdapter {
+    fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
+        (model_variant.is_asr() || model_variant.is_audio_chat()).then_some(AdapterMetadata {
+            id: "builtin.asr",
+            capability: CapabilityKind::Asr,
+            model_variant,
+            streaming_mode: StreamingMode::None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RealtimeAsrCapabilityAdapter;
+
+impl ModelCapabilityAdapter for RealtimeAsrCapabilityAdapter {
+    fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
+        model_variant.is_voxtral().then_some(AdapterMetadata {
+            id: "builtin.realtime_asr",
+            capability: CapabilityKind::RealtimeAsr,
+            model_variant,
+            streaming_mode: StreamingMode::Realtime,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChatCapabilityAdapter;
+
+impl ModelCapabilityAdapter for ChatCapabilityAdapter {
+    fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
+        model_variant.is_chat().then_some(AdapterMetadata {
+            id: "builtin.chat",
+            capability: CapabilityKind::Chat,
+            model_variant,
+            streaming_mode: StreamingMode::Chunked,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AudioChatCapabilityAdapter;
+
+impl ModelCapabilityAdapter for AudioChatCapabilityAdapter {
+    fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
+        model_variant.is_audio_chat().then_some(AdapterMetadata {
+            id: "builtin.audio_chat",
+            capability: CapabilityKind::AudioChat,
+            model_variant,
+            streaming_mode: StreamingMode::Chunked,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SpeechToSpeechCapabilityAdapter;
+
+impl ModelCapabilityAdapter for SpeechToSpeechCapabilityAdapter {
+    fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
+        model_variant.is_audio_chat().then_some(AdapterMetadata {
+            id: "builtin.speech_to_speech",
+            capability: CapabilityKind::SpeechToSpeech,
+            model_variant,
+            streaming_mode: StreamingMode::Chunked,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DiarizationCapabilityAdapter;
+
+impl ModelCapabilityAdapter for DiarizationCapabilityAdapter {
+    fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
+        model_variant.is_diarization().then_some(AdapterMetadata {
+            id: "builtin.diarization",
+            capability: CapabilityKind::Diarization,
+            model_variant,
+            streaming_mode: StreamingMode::None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ForcedAlignmentCapabilityAdapter;
+
+impl ModelCapabilityAdapter for ForcedAlignmentCapabilityAdapter {
+    fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
+        model_variant.is_forced_aligner().then_some(AdapterMetadata {
+            id: "builtin.forced_alignment",
+            capability: CapabilityKind::ForcedAlignment,
+            model_variant,
+            streaming_mode: StreamingMode::None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TokenizerCapabilityAdapter;
+
+impl ModelCapabilityAdapter for TokenizerCapabilityAdapter {
+    fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
+        model_variant.is_tokenizer().then_some(AdapterMetadata {
+            id: "builtin.tokenizer",
+            capability: CapabilityKind::Tokenizer,
+            model_variant,
+            streaming_mode: StreamingMode::None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    fn expected_capabilities(model_variant: ModelVariant) -> BTreeSet<CapabilityKind> {
+        let mut expected = BTreeSet::new();
+
+        if model_variant.speech_capabilities().is_some() {
+            expected.insert(CapabilityKind::Tts);
+        }
+        if model_variant
+            .speech_capabilities()
+            .is_some_and(|capabilities| capabilities.supports_streaming)
+        {
+            expected.insert(CapabilityKind::StreamingTts);
+        }
+        if model_variant.is_asr() || model_variant.is_audio_chat() {
+            expected.insert(CapabilityKind::Asr);
+        }
+        if model_variant.is_voxtral() {
+            expected.insert(CapabilityKind::RealtimeAsr);
+        }
+        if model_variant.is_chat() {
+            expected.insert(CapabilityKind::Chat);
+        }
+        if model_variant.is_audio_chat() {
+            expected.insert(CapabilityKind::AudioChat);
+            expected.insert(CapabilityKind::SpeechToSpeech);
+        }
+        if model_variant.is_diarization() {
+            expected.insert(CapabilityKind::Diarization);
+        }
+        if model_variant.is_forced_aligner() {
+            expected.insert(CapabilityKind::ForcedAlignment);
+        }
+        if model_variant.is_tokenizer() {
+            expected.insert(CapabilityKind::Tokenizer);
+        }
+
+        expected
+    }
+
+    fn registry_capabilities(
+        registry: &RuntimeAdapterRegistry,
+        model_variant: ModelVariant,
+    ) -> BTreeSet<CapabilityKind> {
+        registry
+            .capabilities_for(model_variant)
+            .into_iter()
+            .map(|metadata| metadata.capability)
+            .collect()
+    }
 
     #[test]
     fn built_in_registry_resolves_tts_models() {
@@ -123,6 +321,69 @@ mod tests {
             .require(CapabilityKind::Tts, ModelVariant::Lfm25Audio15BGguf)
             .expect("lfm audio tts adapter");
         assert_eq!(lfm.streaming_mode, StreamingMode::None);
+    }
+
+    #[test]
+    fn built_in_registry_covers_every_model_variant_capability() {
+        let registry = RuntimeAdapterRegistry::built_in();
+
+        for variant in ModelVariant::all().iter().copied() {
+            assert_eq!(
+                registry_capabilities(&registry, variant),
+                expected_capabilities(variant),
+                "capability registry mismatch for {variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn built_in_registry_resolves_non_tts_capabilities() {
+        let registry = RuntimeAdapterRegistry::built_in();
+
+        assert_eq!(
+            registry
+                .require(CapabilityKind::Asr, ModelVariant::WhisperLargeV3Turbo)
+                .expect("whisper asr adapter")
+                .id,
+            "builtin.asr"
+        );
+        assert_eq!(
+            registry
+                .require(CapabilityKind::Chat, ModelVariant::Qwen38BGguf)
+                .expect("qwen chat adapter")
+                .id,
+            "builtin.chat"
+        );
+        assert_eq!(
+            registry
+                .require(
+                    CapabilityKind::SpeechToSpeech,
+                    ModelVariant::Lfm25Audio15BGguf
+                )
+                .expect("lfm audio speech-to-speech adapter")
+                .id,
+            "builtin.speech_to_speech"
+        );
+        assert_eq!(
+            registry
+                .require(
+                    CapabilityKind::Diarization,
+                    ModelVariant::DiarStreamingSortformer4SpkV21
+                )
+                .expect("sortformer diarization adapter")
+                .id,
+            "builtin.diarization"
+        );
+        assert_eq!(
+            registry
+                .require(
+                    CapabilityKind::ForcedAlignment,
+                    ModelVariant::Qwen3ForcedAligner06B
+                )
+                .expect("forced alignment adapter")
+                .id,
+            "builtin.forced_alignment"
+        );
     }
 
     #[test]
