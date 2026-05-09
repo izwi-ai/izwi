@@ -19,8 +19,13 @@ use crate::backends::{BackendPreference, BackendRouter, BackendSelectionSource, 
 use crate::catalog::{ModelInfo, ModelVariant};
 use crate::config::EngineConfig;
 use crate::engine::{
-    Engine as CoreEngine, EngineCoreConfig, EngineCoreRequest, EngineOutput, StreamingOutput,
-    WorkerConfig,
+    engine_metric_catalog, engine_stream_backpressure_total, prometheus_engine_metric_name,
+    prometheus_engine_metric_type, Engine as CoreEngine, EngineCoreConfig, EngineCoreRequest,
+    EngineMetricDescriptor, EngineOutput, StreamingOutput, WorkerConfig,
+    ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_EVICTIONS_TOTAL,
+    ENGINE_KV_CACHE_HITS_TOTAL, ENGINE_KV_CACHE_MISSES_TOTAL,
+    ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL, ENGINE_SCHEDULER_QUEUE_DEPTH,
+    ENGINE_SCHEDULER_RUNNING_REQUESTS, ENGINE_STREAM_BACKPRESSURE_TOTAL,
 };
 use crate::error::{Error, Result};
 use crate::model::ModelResidencyLease;
@@ -63,6 +68,18 @@ pub struct InferenceBrokerRuntimeTelemetrySnapshot {
     pub validation_failures: u64,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct EngineRuntimeTelemetrySnapshot {
+    pub scheduler_queue_depth: u64,
+    pub scheduler_running_requests: u64,
+    pub kv_cache_hits_total: u64,
+    pub kv_cache_misses_total: u64,
+    pub kv_cache_evictions_total: u64,
+    pub kv_cache_allocated_blocks: u64,
+    pub kv_cache_prefix_reuse_blocks_total: u64,
+    pub stream_backpressure_total: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeTelemetrySnapshot {
     pub uptime_secs: f64,
@@ -88,8 +105,10 @@ pub struct RuntimeTelemetrySnapshot {
     pub end_to_end_ms_p50: f64,
     pub end_to_end_ms_p95: f64,
     pub kernel_path: KernelPathTelemetrySnapshot,
+    pub engine: EngineRuntimeTelemetrySnapshot,
     pub voice: VoiceRuntimeTelemetrySnapshot,
     pub broker: InferenceBrokerRuntimeTelemetrySnapshot,
+    pub engine_metrics: &'static [EngineMetricDescriptor],
     pub voice_metrics: &'static [VoiceMetricDescriptor],
 }
 
@@ -271,6 +290,7 @@ impl RuntimeTelemetryCollector {
             end_to_end_ms_p50: percentile(&end_to_end, 0.50),
             end_to_end_ms_p95: percentile(&end_to_end, 0.95),
             kernel_path: kernel_path_telemetry_snapshot(),
+            engine: EngineRuntimeTelemetrySnapshot::default(),
             voice: VoiceRuntimeTelemetrySnapshot {
                 sessions_started: self.voice_sessions_started.load(Ordering::Relaxed),
                 sessions_closed: self.voice_sessions_closed.load(Ordering::Relaxed),
@@ -282,6 +302,7 @@ impl RuntimeTelemetryCollector {
                 execution_requests: self.broker_execution_requests.load(Ordering::Relaxed),
                 validation_failures: self.broker_validation_failures.load(Ordering::Relaxed),
             },
+            engine_metrics: engine_metric_catalog(),
             voice_metrics: voice_metric_catalog(),
         }
     }
@@ -372,6 +393,14 @@ fn push_voice_counter(payload: &mut String, name: &str, help: &str, value: u64) 
     let prometheus_name = prometheus_voice_metric_name(name);
     payload.push_str(&format!(
         "# HELP {prometheus_name} {help}\n# TYPE {prometheus_name} counter\n{prometheus_name} {value}\n"
+    ));
+}
+
+fn push_engine_metric(payload: &mut String, name: &str, value: u64) {
+    let prometheus_name = prometheus_engine_metric_name(name);
+    let metric_type = prometheus_engine_metric_type(name);
+    payload.push_str(&format!(
+        "# TYPE {prometheus_name} {metric_type}\n{prometheus_name} {value}\n"
     ));
 }
 
@@ -943,12 +972,83 @@ impl RuntimeService {
 
     /// Snapshot of runtime/engine telemetry (queue/prefill/decode/worker health).
     pub async fn telemetry_snapshot(&self) -> RuntimeTelemetrySnapshot {
-        self.telemetry.snapshot().await
+        let mut snapshot = self.telemetry.snapshot().await;
+        snapshot.engine = self.engine_telemetry_snapshot().await;
+        snapshot
     }
 
     /// Prometheus exposition format telemetry payload.
     pub async fn telemetry_prometheus(&self) -> String {
-        self.telemetry.prometheus().await
+        let mut payload = self.telemetry.prometheus().await;
+        self.push_engine_prometheus_metrics(&mut payload).await;
+        payload
+    }
+
+    async fn engine_telemetry_snapshot(&self) -> EngineRuntimeTelemetrySnapshot {
+        let queue_depth = self.core_engine.pending_requests().await as u64;
+        let running_requests = self.core_engine.running_requests().await as u64;
+        let kv_cache = self.core_engine.kv_cache_stats().await;
+        let stream_backpressure_total = engine_stream_backpressure_total();
+        let kv_cache_hits_total = kv_cache.telemetry.shared_prefix_hits;
+        let kv_cache_misses_total = kv_cache
+            .telemetry
+            .total_allocations
+            .saturating_sub(kv_cache_hits_total);
+
+        EngineRuntimeTelemetrySnapshot {
+            scheduler_queue_depth: queue_depth,
+            scheduler_running_requests: running_requests,
+            kv_cache_hits_total,
+            kv_cache_misses_total,
+            kv_cache_evictions_total: kv_cache.telemetry.total_frees,
+            kv_cache_allocated_blocks: kv_cache.allocated_blocks as u64,
+            kv_cache_prefix_reuse_blocks_total: kv_cache_hits_total,
+            stream_backpressure_total,
+        }
+    }
+
+    async fn push_engine_prometheus_metrics(&self, payload: &mut String) {
+        let snapshot = self.engine_telemetry_snapshot().await;
+        push_engine_metric(
+            payload,
+            ENGINE_SCHEDULER_QUEUE_DEPTH,
+            snapshot.scheduler_queue_depth,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_SCHEDULER_RUNNING_REQUESTS,
+            snapshot.scheduler_running_requests,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_KV_CACHE_HITS_TOTAL,
+            snapshot.kv_cache_hits_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_KV_CACHE_MISSES_TOTAL,
+            snapshot.kv_cache_misses_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_KV_CACHE_EVICTIONS_TOTAL,
+            snapshot.kv_cache_evictions_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
+            snapshot.kv_cache_allocated_blocks,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL,
+            snapshot.kv_cache_prefix_reuse_blocks_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_STREAM_BACKPRESSURE_TOTAL,
+            snapshot.stream_backpressure_total,
+        );
     }
 
     pub fn record_voice_session_started(&self) {
@@ -1085,5 +1185,17 @@ mod tests {
         assert!(payload.contains("izwi_inference_broker_shadow_requests_total 1"));
         assert!(payload.contains("izwi_inference_broker_execution_requests_total 1"));
         assert!(payload.contains("izwi_inference_broker_validation_failures_total 1"));
+    }
+
+    #[tokio::test]
+    async fn runtime_prometheus_includes_engine_metric_values() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+
+        let payload = runtime.telemetry_prometheus().await;
+
+        assert!(payload.contains("izwi_engine_scheduler_queue_depth"));
+        assert!(payload.contains("izwi_engine_scheduler_running_requests"));
+        assert!(payload.contains("izwi_engine_kv_cache_allocated_blocks"));
+        assert!(payload.contains("izwi_engine_stream_backpressure_total"));
     }
 }

@@ -7,6 +7,7 @@ use crate::error::{Error, Result};
 use crate::runtime::audio_io::{base64_decode, decode_audio_bytes};
 
 use super::super::output::StreamingOutput;
+use super::super::request::EngineStreamPolicy;
 use super::NativeExecutor;
 
 const DEFAULT_STREAM_SHORT_TARGET_CHUNK_SECS: f32 = 2.4;
@@ -196,6 +197,7 @@ impl NativeExecutor {
     pub(super) fn transcribe_with_chunk_plan<F>(
         request_id: &str,
         stream_tx: Option<&mpsc::Sender<StreamingOutput>>,
+        stream_policy: EngineStreamPolicy,
         sequence: &mut usize,
         samples: &[f32],
         sample_rate: u32,
@@ -241,15 +243,22 @@ impl NativeExecutor {
 
             if !delta.is_empty() {
                 if let Some(tx) = stream_tx {
-                    Self::stream_text_per_character(tx, request_id, sequence, &delta)?;
+                    Self::stream_text_per_character_with_policy(
+                        tx,
+                        stream_policy,
+                        request_id,
+                        sequence,
+                        &delta,
+                    )?;
                 }
             }
         }
 
         if !deferred_boundary_delta.is_empty() {
             if let Some(tx) = stream_tx {
-                Self::stream_text_per_character(
+                Self::stream_text_per_character_with_policy(
                     tx,
+                    stream_policy,
                     request_id,
                     sequence,
                     &deferred_boundary_delta,
@@ -258,7 +267,7 @@ impl NativeExecutor {
         }
 
         if let Some(tx) = stream_tx {
-            Self::stream_final_marker(tx, request_id, sequence)?;
+            Self::stream_final_marker_with_policy(tx, stream_policy, request_id, sequence)?;
         }
 
         Ok(assembler.finish())
@@ -321,6 +330,8 @@ fn is_boundary_noise_delta(delta: &str) -> bool {
 mod tests {
     use izwi_asr_toolkit::AudioChunk;
     use tokio::sync::mpsc;
+
+    use crate::engine::EngineStreamPolicy;
 
     use super::NativeExecutor;
 
@@ -464,6 +475,7 @@ mod tests {
         let merged = NativeExecutor::transcribe_with_chunk_plan(
             "req-1",
             Some(&tx),
+            EngineStreamPolicy::FailOnFull,
             &mut sequence,
             &samples,
             sr,

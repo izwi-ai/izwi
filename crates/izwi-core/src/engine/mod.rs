@@ -40,11 +40,13 @@ pub use config::EngineCoreConfig;
 pub use core::EngineCore;
 pub use executor::{ExecutorOutput, ModelExecutor, WorkerConfig};
 pub use kv_cache::{
-    BlockAllocator, CacheResidency, KVCacheConfig as KVConfig, KVCacheManager, PinnedBlockHandle,
+    BlockAllocator, CacheResidency, KVCacheConfig as KVConfig, KVCacheManager, KVCacheStats,
+    PinnedBlockHandle,
 };
 pub use metrics::{
-    engine_metric_catalog, prometheus_engine_metric_name, prometheus_engine_metric_type,
-    BenchmarkResult, EngineMetricDescriptor, MetricsCollector, MetricsSnapshot,
+    engine_metric_catalog, engine_stream_backpressure_total, prometheus_engine_metric_name,
+    prometheus_engine_metric_type, BenchmarkResult, EngineMetricDescriptor, MetricsCollector,
+    MetricsSnapshot,
     ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_EVICTIONS_TOTAL,
     ENGINE_KV_CACHE_HITS_TOTAL, ENGINE_KV_CACHE_MISSES_TOTAL,
     ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL, ENGINE_METRIC_CATALOG,
@@ -53,7 +55,7 @@ pub use metrics::{
     ENGINE_STREAM_BACKPRESSURE_TOTAL,
 };
 pub use output::{OutputProcessor, StreamingOutput};
-pub use request::{EngineCoreRequest, RequestProcessor, RequestStatus};
+pub use request::{EngineCoreRequest, EngineStreamPolicy, RequestProcessor, RequestStatus};
 pub use scheduler::{ScheduleResult, Scheduler, SchedulerConfig, SchedulingPolicy};
 pub use types::{
     AudioOutput, EngineMetrics, EngineOutput, GenerationParams, RequestId, SequenceId, TaskType,
@@ -327,6 +329,12 @@ impl Engine {
     pub async fn running_requests(&self) -> usize {
         let core = self.core.read().await;
         core.running_request_count()
+    }
+
+    /// Get KV cache statistics.
+    pub async fn kv_cache_stats(&self) -> KVCacheStats {
+        let core = self.core.read().await;
+        core.kv_cache_stats()
     }
 
     /// Check if scheduler currently has runnable or queued work.

@@ -70,6 +70,7 @@ impl NativeExecutor {
         scheduled: &ScheduledRequest,
     ) -> Result<ExecutorOutput> {
         let stream_tx = Self::stream_sender(request);
+        let stream_policy = request.stream_policy;
         let variant = request.model_variant;
         let params = Self::to_tts_params(request);
         let language = request.language.as_deref();
@@ -180,8 +181,9 @@ impl NativeExecutor {
                         .audio_samples_accum
                         .extend_from_slice(&step.samples);
                     if let Some(tx) = stream_tx.as_ref() {
-                        Self::stream_audio(
+                        Self::stream_audio_with_policy(
                             tx,
+                            stream_policy,
                             &request.id,
                             &mut active_state.stream_sequence,
                             step.samples.clone(),
@@ -193,8 +195,9 @@ impl NativeExecutor {
 
                 if step.finished {
                     if let Some(tx) = stream_tx.as_ref() {
-                        Self::stream_final_marker(
+                        Self::stream_final_marker_with_policy(
                             tx,
+                            stream_policy,
                             &request.id,
                             &mut active_state.stream_sequence,
                         )?;

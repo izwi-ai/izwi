@@ -76,8 +76,18 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
     },
 ];
 
+static ENGINE_STREAM_BACKPRESSURE_EVENTS: AtomicU64 = AtomicU64::new(0);
+
 pub fn engine_metric_catalog() -> &'static [EngineMetricDescriptor] {
     ENGINE_METRIC_CATALOG
+}
+
+pub(crate) fn record_engine_stream_backpressure() {
+    ENGINE_STREAM_BACKPRESSURE_EVENTS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn engine_stream_backpressure_total() -> u64 {
+    ENGINE_STREAM_BACKPRESSURE_EVENTS.load(Ordering::Relaxed)
 }
 
 pub fn prometheus_engine_metric_name(name: &str) -> String {
@@ -468,5 +478,12 @@ mod tests {
             prometheus_engine_metric_type(ENGINE_KV_CACHE_ALLOCATED_BLOCKS),
             "gauge"
         );
+    }
+
+    #[test]
+    fn engine_stream_backpressure_counter_is_observable() {
+        let before = engine_stream_backpressure_total();
+        record_engine_stream_backpressure();
+        assert_eq!(engine_stream_backpressure_total(), before + 1);
     }
 }

@@ -43,6 +43,7 @@ impl NativeExecutor {
     ) -> Result<ExecutorOutput> {
         let variant = Self::resolve_variant(request)?;
         let stream_tx = Self::stream_sender(request);
+        let stream_policy = request.stream_policy;
         let generation_config = Self::audio_chat_generation_config(request);
         let stream_config = Lfm25AudioStreamConfig::default();
         let history_messages = Self::audio_chat_messages(request);
@@ -74,7 +75,13 @@ impl NativeExecutor {
                         return;
                     }
                     let mut sequence = stream_sequence.get();
-                    match Self::stream_text(tx, &request.id, &mut sequence, delta.to_string()) {
+                    match Self::stream_text_with_policy(
+                        tx,
+                        stream_policy,
+                        &request.id,
+                        &mut sequence,
+                        delta.to_string(),
+                    ) {
                         Ok(()) => stream_sequence.set(sequence),
                         Err(err) => {
                             *stream_err.borrow_mut() = Some(err);
@@ -86,8 +93,9 @@ impl NativeExecutor {
                         return;
                     }
                     let mut sequence = stream_sequence.get();
-                    match Self::stream_audio(
+                    match Self::stream_audio_with_policy(
                         tx,
+                        stream_policy,
                         &request.id,
                         &mut sequence,
                         delta.to_vec(),
@@ -115,7 +123,12 @@ impl NativeExecutor {
                     return Err(err);
                 }
                 let mut sequence = stream_sequence.get();
-                Self::stream_final_marker(tx, &request.id, &mut sequence)?;
+                Self::stream_final_marker_with_policy(
+                    tx,
+                    stream_policy,
+                    &request.id,
+                    &mut sequence,
+                )?;
                 Ok(output)
             } else {
                 let mut no_text = |_delta: &str| {};
