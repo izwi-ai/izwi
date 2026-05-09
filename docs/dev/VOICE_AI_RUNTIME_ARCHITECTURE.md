@@ -250,3 +250,6 @@ tests alongside behavior changes.
 7. Move realtime voice orchestration behind a reusable session boundary.
 8. Add production voice observability and benchmark contracts.
 9. Add optional gateway/worker-mode documentation after local seams are clean.
+
+The optional gateway/worker-mode shape is documented in
+[Voice Gateway And Worker Mode](./VOICE_GATEWAY_WORKER_MODE.md).
