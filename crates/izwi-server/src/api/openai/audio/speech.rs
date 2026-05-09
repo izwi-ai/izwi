@@ -135,7 +135,7 @@ pub async fn speech(
 
     let streaming = resolve_streaming_mode(&req)?;
     if streaming {
-        return stream_speech(state, req, ctx.correlation_id).await;
+        return stream_speech(state, req, ctx.correlation_id, variant).await;
     }
 
     let _permit = state.acquire_permit().await;
@@ -149,7 +149,7 @@ pub async fn speech(
         parse_response_format(req.response_format.as_deref().unwrap_or("mp3"))?;
 
     let result = tokio::time::timeout(timeout, async {
-        let gen_request = build_generation_request(&req, ctx.correlation_id, false);
+        let gen_request = build_generation_request(&req, ctx.correlation_id, false, variant);
         state.runtime.generate(gen_request).await
     })
     .await
@@ -284,10 +284,11 @@ async fn stream_speech(
     state: AppState,
     req: SpeechRequest,
     correlation_id: String,
+    variant: ModelVariant,
 ) -> Result<Response<Body>, ApiError> {
     let (format, format_fallback) =
         parse_response_format(req.response_format.as_deref().unwrap_or("mp3"))?;
-    let gen_request = build_generation_request(&req, correlation_id, true);
+    let gen_request = build_generation_request(&req, correlation_id, true, variant);
     let stream_request_id = gen_request.id.clone();
     let stream_audio_format = stream_audio_format_label(format);
     let (event_tx, mut event_rx) = mpsc::channel::<String>(stream_event_queue_capacity());
@@ -519,6 +520,7 @@ fn build_generation_request(
     req: &SpeechRequest,
     correlation_id: String,
     streaming: bool,
+    variant: ModelVariant,
 ) -> GenerationRequest {
     let mut gen_config = GenerationConfig {
         streaming,
@@ -540,6 +542,7 @@ fn build_generation_request(
 
     GenerationRequest {
         id: uuid::Uuid::new_v4().to_string(),
+        model_variant: Some(variant),
         correlation_id: Some(correlation_id),
         text: req.input.clone(),
         config: gen_config,

@@ -19,7 +19,15 @@ impl RuntimeService {
         ModelVariant::Kokoro82M
     }
 
-    async fn resolve_active_kokoro_variant(&self) -> ModelVariant {
+    async fn resolve_kokoro_variant_for_request(
+        &self,
+        request: &GenerationRequest,
+    ) -> ModelVariant {
+        if let Some(variant) = request.model_variant {
+            if matches!(variant.family(), crate::catalog::ModelFamily::KokoroTts) {
+                return variant;
+            }
+        }
         if let Some(variant) = *self.loaded_tts_variant.read().await {
             if matches!(variant.family(), crate::catalog::ModelFamily::KokoroTts) {
                 return variant;
@@ -32,7 +40,7 @@ impl RuntimeService {
         &self,
         request: GenerationRequest,
     ) -> Result<GenerationResult> {
-        let variant = self.resolve_active_kokoro_variant().await;
+        let variant = self.resolve_kokoro_variant_for_request(&request).await;
         self.load_model(variant).await?;
         let model = self
             .model_registry
@@ -65,7 +73,7 @@ impl RuntimeService {
         chunk_tx: mpsc::Sender<AudioChunk>,
     ) -> Result<()> {
         let request_id = request.id.clone();
-        let variant = self.resolve_active_kokoro_variant().await;
+        let variant = self.resolve_kokoro_variant_for_request(&request).await;
         self.load_model(variant).await?;
         let model = self
             .model_registry

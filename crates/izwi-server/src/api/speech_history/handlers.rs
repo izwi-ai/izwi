@@ -512,6 +512,7 @@ async fn synthesize_record_internal(
         ctx.correlation_id.clone(),
         input_text.clone(),
         false,
+        variant,
     );
     let planned_request_count =
         expand_generation_requests_for_long_form(&generation_request, variant).len();
@@ -604,8 +605,13 @@ async fn stream_record_creation(
     input_text: String,
     placeholder: SpeechHistoryRecord,
 ) -> Result<Response, ApiError> {
-    let generation_request =
-        build_generation_request(req.clone(), ctx.correlation_id, input_text.clone(), true);
+    let generation_request = build_generation_request(
+        req.clone(),
+        ctx.correlation_id,
+        input_text.clone(),
+        true,
+        variant,
+    );
     let planned_requests = expand_generation_requests_for_long_form(&generation_request, variant);
     let stream_request_id = generation_request.id.clone();
     let placeholder_record_id = placeholder.id.clone();
@@ -1029,6 +1035,7 @@ fn build_generation_request(
     correlation_id: String,
     text: String,
     streaming: bool,
+    variant: ModelVariant,
 ) -> GenerationRequest {
     let mut generation_config = GenerationConfig {
         streaming,
@@ -1050,6 +1057,7 @@ fn build_generation_request(
 
     GenerationRequest {
         id: uuid::Uuid::new_v4().to_string(),
+        model_variant: Some(variant),
         correlation_id: Some(correlation_id),
         text,
         config: generation_config,
