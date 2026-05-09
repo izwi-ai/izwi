@@ -10,6 +10,7 @@ mod chat;
 mod diarization;
 mod kokoro;
 mod lifecycle;
+mod request;
 mod service;
 mod speech_to_speech;
 mod tts;
