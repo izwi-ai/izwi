@@ -4,6 +4,7 @@
 //! in vLLM/TGI/llama.cpp style systems), while legacy `inference` paths are
 //! maintained as compatibility shims.
 
+mod adapters;
 mod asr;
 pub(crate) mod audio_io;
 mod chat;
