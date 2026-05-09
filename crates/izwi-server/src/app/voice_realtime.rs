@@ -517,8 +517,7 @@ async fn finalize_stream_vad_utterance(
     wav_bytes: Vec<u8>,
     end_reason: UtteranceEndReason,
 ) -> Result<(), String> {
-    if conn.active_turn.is_some() {
-        interrupt_active_turn(out_tx, &mut conn.active_turn, "preempted_by_new_turn");
+    if interrupt_active_turn(out_tx, &mut conn.active_turn, "preempted_by_new_turn") {
         conn.voice_session.interrupt("preempted_by_new_turn");
     }
 
@@ -958,8 +957,9 @@ async fn handle_text_message(
         }
         ClientEvent::Interrupt { reason } => {
             let reason = reason.unwrap_or_else(|| "client_interrupt".to_string());
-            interrupt_active_turn(out_tx, &mut conn.active_turn, &reason);
-            conn.voice_session.interrupt(reason);
+            if interrupt_active_turn(out_tx, &mut conn.active_turn, &reason) {
+                conn.voice_session.interrupt(reason);
+            }
         }
         ClientEvent::Ping { timestamp_ms } => {
             send_json(
@@ -1003,8 +1003,7 @@ async fn handle_binary_message(
             let frame_result = streaming.handle_pcm16_frame(frame_seq, sample_rate, &payload)?;
 
             if let Some(evt) = frame_result.speech_start {
-                if conn.active_turn.is_some() {
-                    interrupt_active_turn(out_tx, &mut conn.active_turn, "barge_in");
+                if interrupt_active_turn(out_tx, &mut conn.active_turn, "barge_in") {
                     conn.voice_session.interrupt("barge_in");
                 }
                 send_json(
@@ -1680,10 +1679,10 @@ fn interrupt_active_turn(
     out_tx: &mpsc::UnboundedSender<Message>,
     active_turn: &mut Option<ActiveTurn>,
     reason: &str,
-) {
+) -> bool {
     if let Some(turn) = active_turn.take() {
         if turn.task.is_finished() {
-            return;
+            return false;
         }
         turn.task.abort();
         let state = turn.state.clone();
@@ -1705,7 +1704,9 @@ fn interrupt_active_turn(
                 "reason": reason,
             }),
         );
+        return true;
     }
+    false
 }
 
 async fn ensure_agent_session(
