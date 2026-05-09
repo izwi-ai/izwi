@@ -1,6 +1,6 @@
 //! Model lifecycle management
 
-use super::residency::{ModelResidency, ModelResidencyState};
+use super::residency::{ModelLifecycleSnapshot, ModelResidency, ModelResidencyState};
 use futures::stream::{self, StreamExt};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -171,6 +171,25 @@ impl ModelManager {
         self.refresh_model_states().await;
         let models = self.models.read().await;
         models.get(&variant).map(|s| s.info.clone())
+    }
+
+    /// Get explicit artifact and residency state for a specific model.
+    pub async fn lifecycle_snapshot(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<ModelLifecycleSnapshot> {
+        self.get_model_info(variant)
+            .await
+            .map(ModelLifecycleSnapshot::from_model_info)
+    }
+
+    /// Get explicit artifact and residency states for all known models.
+    pub async fn lifecycle_snapshots(&self) -> Vec<ModelLifecycleSnapshot> {
+        self.list_models()
+            .await
+            .into_iter()
+            .map(ModelLifecycleSnapshot::from_model_info)
+            .collect()
     }
 
     /// Download a model from HuggingFace

@@ -13,7 +13,7 @@ use tokio::sync::{broadcast, oneshot, Mutex, Notify, RwLock};
 use tokio::task::yield_now;
 use tracing::{debug, error, info_span};
 
-use crate::artifacts::{DownloadProgress, ModelManager};
+use crate::artifacts::{DownloadProgress, ModelLifecycleSnapshot, ModelManager};
 use crate::audio::{AudioCodec, AudioEncoder, StreamingConfig};
 use crate::backends::{BackendPreference, BackendRouter, BackendSelectionSource, DeviceProfile};
 use crate::catalog::{ModelInfo, ModelVariant};
@@ -424,6 +424,19 @@ impl RuntimeService {
     /// List available models.
     pub async fn list_models(&self) -> Vec<ModelInfo> {
         self.model_manager.list_models().await
+    }
+
+    /// Get explicit artifact and residency state for a specific model.
+    pub async fn model_lifecycle_snapshot(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<ModelLifecycleSnapshot> {
+        self.model_manager.lifecycle_snapshot(variant).await
+    }
+
+    /// Get explicit artifact and residency states for all known models.
+    pub async fn model_lifecycle_snapshots(&self) -> Vec<ModelLifecycleSnapshot> {
+        self.model_manager.lifecycle_snapshots().await
     }
 
     /// Download a model.
