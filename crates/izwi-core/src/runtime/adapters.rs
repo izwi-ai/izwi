@@ -18,9 +18,12 @@ pub(crate) enum CapabilityKind {
     StreamingTts,
     Chat,
     AudioChat,
+    SpeechToSpeech,
     Diarization,
+    ForcedAlignment,
     Vad,
     Endpointing,
+    Tokenizer,
 }
 
 #[allow(dead_code)]
