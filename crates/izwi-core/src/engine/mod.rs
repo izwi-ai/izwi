@@ -56,7 +56,7 @@ pub use output::{OutputProcessor, StreamingOutput};
 pub use request::{EngineCoreRequest, RequestProcessor, RequestStatus};
 pub use scheduler::{ScheduleResult, Scheduler, SchedulerConfig, SchedulingPolicy};
 pub use types::{
-    AudioOutput, EngineMetrics, EngineOutput, GenerationParams, RequestId, SequenceId,
+    AudioOutput, EngineMetrics, EngineOutput, GenerationParams, RequestId, SequenceId, TaskType,
 };
 
 use crate::error::Result;
@@ -65,8 +65,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Notify, RwLock};
 use tracing::{debug, info, warn};
-
-use self::types::TaskType;
 
 /// Main inference engine - the primary interface for audio generation.
 ///

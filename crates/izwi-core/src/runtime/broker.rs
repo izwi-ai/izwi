@@ -6,6 +6,9 @@
 
 use serde::Serialize;
 
+use crate::engine::{EngineCoreRequest, TaskType};
+use crate::runtime::adapters::{CapabilityKind, RuntimeAdapterRegistry};
+
 const BROKER_MODE_ENV: &str = "IZWI_INFERENCE_BROKER";
 const DEPLOYMENT_MODE_ENV: &str = "IZWI_INFERENCE_DEPLOYMENT_MODE";
 
@@ -70,6 +73,15 @@ pub(crate) struct InferenceBrokerSnapshot {
     pub(crate) local_runtime_default: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InferenceBrokerObservation {
+    pub(crate) capability: CapabilityKind,
+    pub(crate) model_variant: Option<crate::model::ModelVariant>,
+    pub(crate) shadow_enabled: bool,
+    pub(crate) execution_enabled: bool,
+    pub(crate) validation_error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct InferenceBroker {
     mode: InferenceBrokerMode,
@@ -130,11 +142,52 @@ impl InferenceBroker {
             local_runtime_default: self.local_runtime_default(),
         }
     }
+
+    pub(crate) fn observe_engine_request(
+        &self,
+        request: &EngineCoreRequest,
+        adapters: &RuntimeAdapterRegistry,
+    ) -> Option<InferenceBrokerObservation> {
+        if !self.shadow_enabled() && !self.execution_enabled() {
+            return None;
+        }
+
+        let capability = capability_for_task(request.task_type);
+        let validation_error = match request.model_variant {
+            Some(model_variant) => adapters
+                .require(capability, model_variant)
+                .err()
+                .map(|err| err.to_string()),
+            None => Some(format!(
+                "Inference broker could not validate {capability:?}: request missing model variant"
+            )),
+        };
+
+        Some(InferenceBrokerObservation {
+            capability,
+            model_variant: request.model_variant,
+            shadow_enabled: self.shadow_enabled(),
+            execution_enabled: self.execution_enabled(),
+            validation_error,
+        })
+    }
+}
+
+fn capability_for_task(task_type: TaskType) -> CapabilityKind {
+    match task_type {
+        TaskType::TTS => CapabilityKind::Tts,
+        TaskType::ASR => CapabilityKind::Asr,
+        TaskType::Chat => CapabilityKind::Chat,
+        TaskType::SpeechToSpeech => CapabilityKind::SpeechToSpeech,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::EngineCoreRequest;
+    use crate::model::ModelVariant;
+    use crate::runtime::adapters::RuntimeAdapterRegistry;
 
     #[test]
     fn broker_mode_defaults_unknown_values_to_off() {
@@ -205,5 +258,35 @@ mod tests {
         assert_eq!(gateway.deployment_mode, InferenceDeploymentMode::Gateway);
         assert!(!gateway.local_runtime_default);
         assert!(gateway.shadow_enabled);
+    }
+
+    #[test]
+    fn broker_shadow_observes_and_validates_engine_requests() {
+        let broker = InferenceBroker::with_mode(InferenceBrokerMode::Shadow);
+        let adapters = RuntimeAdapterRegistry::built_in();
+        let request = EngineCoreRequest::chat(vec![]).with_model_variant(ModelVariant::Qwen38BGguf);
+
+        let observation = broker
+            .observe_engine_request(&request, &adapters)
+            .expect("shadow mode should observe request");
+
+        assert_eq!(observation.capability, CapabilityKind::Chat);
+        assert!(observation.shadow_enabled);
+        assert!(!observation.execution_enabled);
+        assert!(observation.validation_error.is_none());
+    }
+
+    #[test]
+    fn broker_on_reports_adapter_validation_errors() {
+        let broker = InferenceBroker::with_mode(InferenceBrokerMode::On);
+        let adapters = RuntimeAdapterRegistry::built_in();
+        let request = EngineCoreRequest::chat(vec![]).with_model_variant(ModelVariant::Kokoro82M);
+
+        let observation = broker
+            .observe_engine_request(&request, &adapters)
+            .expect("on mode should observe request");
+
+        assert!(observation.execution_enabled);
+        assert!(observation.validation_error.is_some());
     }
 }
