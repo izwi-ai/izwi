@@ -149,6 +149,7 @@ impl RuntimeService {
                 llm_model_id.map(ToOwned::to_owned),
             )
             .with_llm_refinement(enable_llm_refinement);
+        self.record_diarization_transcript_pipeline(runtime_request.enable_llm_refinement);
         let audio = decode_pipeline_audio_bytes(audio_bytes)?;
         let diarization = self
             .diarize_samples(

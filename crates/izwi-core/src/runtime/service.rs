@@ -34,6 +34,7 @@ use crate::models::shared::telemetry::{
 };
 use crate::runtime::adapters::RuntimeAdapterRegistry;
 use crate::runtime::broker::{InferenceBroker, InferenceBrokerSnapshot};
+use crate::runtime::pipeline::{PipelineGraph, PipelineKind};
 use crate::runtime::voice_metrics::{
     prometheus_voice_metric_name, voice_metric_catalog, voice_metric_prometheus_contract,
     VoiceMetricDescriptor, VOICE_BARGE_IN_TOTAL, VOICE_SESSION_CLOSED_TOTAL,
@@ -80,6 +81,14 @@ pub struct EngineRuntimeTelemetrySnapshot {
     pub stream_backpressure_total: u64,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PipelineRuntimeTelemetrySnapshot {
+    pub modular_voice_turns: u64,
+    pub unified_voice_turns: u64,
+    pub diarization_transcripts: u64,
+    pub stages_recorded: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeTelemetrySnapshot {
     pub uptime_secs: f64,
@@ -108,6 +117,7 @@ pub struct RuntimeTelemetrySnapshot {
     pub engine: EngineRuntimeTelemetrySnapshot,
     pub voice: VoiceRuntimeTelemetrySnapshot,
     pub broker: InferenceBrokerRuntimeTelemetrySnapshot,
+    pub pipelines: PipelineRuntimeTelemetrySnapshot,
     pub engine_metrics: &'static [EngineMetricDescriptor],
     pub voice_metrics: &'static [VoiceMetricDescriptor],
 }
@@ -129,6 +139,10 @@ struct RuntimeTelemetryCollector {
     broker_shadow_requests: AtomicU64,
     broker_execution_requests: AtomicU64,
     broker_validation_failures: AtomicU64,
+    pipeline_modular_voice_turns: AtomicU64,
+    pipeline_unified_voice_turns: AtomicU64,
+    pipeline_diarization_transcripts: AtomicU64,
+    pipeline_stages_recorded: AtomicU64,
     queue_wait_ms_samples: Mutex<VecDeque<f64>>,
     prefill_ms_samples: Mutex<VecDeque<f64>>,
     decode_ms_samples: Mutex<VecDeque<f64>>,
@@ -154,6 +168,10 @@ impl RuntimeTelemetryCollector {
             broker_shadow_requests: AtomicU64::new(0),
             broker_execution_requests: AtomicU64::new(0),
             broker_validation_failures: AtomicU64::new(0),
+            pipeline_modular_voice_turns: AtomicU64::new(0),
+            pipeline_unified_voice_turns: AtomicU64::new(0),
+            pipeline_diarization_transcripts: AtomicU64::new(0),
+            pipeline_stages_recorded: AtomicU64::new(0),
             queue_wait_ms_samples: Mutex::new(VecDeque::with_capacity(max_samples.max(64))),
             prefill_ms_samples: Mutex::new(VecDeque::with_capacity(max_samples.max(64))),
             decode_ms_samples: Mutex::new(VecDeque::with_capacity(max_samples.max(64))),
@@ -259,6 +277,25 @@ impl RuntimeTelemetryCollector {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_pipeline_graph(&self, graph: &PipelineGraph) {
+        match graph.kind {
+            PipelineKind::ModularVoiceTurn => {
+                self.pipeline_modular_voice_turns
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            PipelineKind::UnifiedVoiceTurn => {
+                self.pipeline_unified_voice_turns
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            PipelineKind::DiarizationTranscript => {
+                self.pipeline_diarization_transcripts
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.pipeline_stages_recorded
+            .fetch_add(graph.stages().len() as u64, Ordering::Relaxed);
+    }
+
     async fn snapshot(&self) -> RuntimeTelemetrySnapshot {
         let queue = self.queue_wait_ms_samples.lock().await.clone();
         let prefill = self.prefill_ms_samples.lock().await.clone();
@@ -301,6 +338,14 @@ impl RuntimeTelemetryCollector {
                 shadow_requests: self.broker_shadow_requests.load(Ordering::Relaxed),
                 execution_requests: self.broker_execution_requests.load(Ordering::Relaxed),
                 validation_failures: self.broker_validation_failures.load(Ordering::Relaxed),
+            },
+            pipelines: PipelineRuntimeTelemetrySnapshot {
+                modular_voice_turns: self.pipeline_modular_voice_turns.load(Ordering::Relaxed),
+                unified_voice_turns: self.pipeline_unified_voice_turns.load(Ordering::Relaxed),
+                diarization_transcripts: self
+                    .pipeline_diarization_transcripts
+                    .load(Ordering::Relaxed),
+                stages_recorded: self.pipeline_stages_recorded.load(Ordering::Relaxed),
             },
             engine_metrics: engine_metric_catalog(),
             voice_metrics: voice_metric_catalog(),
@@ -375,6 +420,16 @@ impl RuntimeTelemetryCollector {
             snapshot.broker.shadow_requests,
             snapshot.broker.execution_requests,
             snapshot.broker.validation_failures
+        ));
+        payload.push_str(&format!(
+            "# TYPE izwi_inference_pipeline_modular_voice_turns_total counter\nizwi_inference_pipeline_modular_voice_turns_total {}\n\
+# TYPE izwi_inference_pipeline_unified_voice_turns_total counter\nizwi_inference_pipeline_unified_voice_turns_total {}\n\
+# TYPE izwi_inference_pipeline_diarization_transcripts_total counter\nizwi_inference_pipeline_diarization_transcripts_total {}\n\
+# TYPE izwi_inference_pipeline_stages_recorded_total counter\nizwi_inference_pipeline_stages_recorded_total {}\n",
+            snapshot.pipelines.modular_voice_turns,
+            snapshot.pipelines.unified_voice_turns,
+            snapshot.pipelines.diarization_transcripts,
+            snapshot.pipelines.stages_recorded
         ));
         payload.push_str(&voice_metric_prometheus_contract());
         payload
@@ -1066,6 +1121,21 @@ impl RuntimeService {
     pub fn record_voice_barge_in(&self) {
         self.telemetry.record_voice_barge_in();
     }
+
+    pub fn record_modular_voice_pipeline_turn(&self) {
+        let graph = PipelineGraph::modular_voice_turn();
+        self.telemetry.record_pipeline_graph(&graph);
+    }
+
+    pub fn record_unified_voice_pipeline_turn(&self) {
+        let graph = PipelineGraph::unified_voice_turn();
+        self.telemetry.record_pipeline_graph(&graph);
+    }
+
+    pub(crate) fn record_diarization_transcript_pipeline(&self, enable_llm_refinement: bool) {
+        let graph = PipelineGraph::diarization_transcript(enable_llm_refinement);
+        self.telemetry.record_pipeline_graph(&graph);
+    }
 }
 
 fn configure_runtime_threading(num_threads: usize) {
@@ -1185,6 +1255,27 @@ mod tests {
         assert!(payload.contains("izwi_inference_broker_shadow_requests_total 1"));
         assert!(payload.contains("izwi_inference_broker_execution_requests_total 1"));
         assert!(payload.contains("izwi_inference_broker_validation_failures_total 1"));
+    }
+
+    #[tokio::test]
+    async fn pipeline_telemetry_snapshot_and_prometheus_include_recorded_counters() {
+        let telemetry = RuntimeTelemetryCollector::new(64);
+
+        telemetry.record_pipeline_graph(&PipelineGraph::modular_voice_turn());
+        telemetry.record_pipeline_graph(&PipelineGraph::unified_voice_turn());
+        telemetry.record_pipeline_graph(&PipelineGraph::diarization_transcript(true));
+
+        let snapshot = telemetry.snapshot().await;
+        assert_eq!(snapshot.pipelines.modular_voice_turns, 1);
+        assert_eq!(snapshot.pipelines.unified_voice_turns, 1);
+        assert_eq!(snapshot.pipelines.diarization_transcripts, 1);
+        assert_eq!(snapshot.pipelines.stages_recorded, 14);
+
+        let payload = telemetry.prometheus().await;
+        assert!(payload.contains("izwi_inference_pipeline_modular_voice_turns_total 1"));
+        assert!(payload.contains("izwi_inference_pipeline_unified_voice_turns_total 1"));
+        assert!(payload.contains("izwi_inference_pipeline_diarization_transcripts_total 1"));
+        assert!(payload.contains("izwi_inference_pipeline_stages_recorded_total 14"));
     }
 
     #[tokio::test]
