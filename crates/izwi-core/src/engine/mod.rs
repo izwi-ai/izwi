@@ -55,7 +55,10 @@ pub use metrics::{
     ENGINE_STREAM_BACKPRESSURE_TOTAL,
 };
 pub use output::{OutputProcessor, StreamingOutput};
-pub use request::{EngineCoreRequest, EngineStreamPolicy, RequestProcessor, RequestStatus};
+pub use request::{
+    AsrEngineInput, AudioChatEngineInput, ChatEngineInput, EngineAudioInput, EngineCoreRequest,
+    EngineStreamPolicy, EngineTask, RequestProcessor, RequestStatus, TtsEngineInput,
+};
 pub use scheduler::{ScheduleResult, Scheduler, SchedulerConfig, SchedulingPolicy};
 pub use types::{
     AudioOutput, EngineMetrics, EngineOutput, GenerationParams, RequestId, SequenceId, TaskType,

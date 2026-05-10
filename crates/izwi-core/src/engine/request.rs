@@ -42,11 +42,66 @@ impl Default for EngineStreamPolicy {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum EngineAudioInput {
+    Base64(String),
+    Bytes(Vec<u8>),
+}
+
+#[derive(Debug, Clone)]
+pub struct TtsEngineInput {
+    pub text: String,
+    pub reference_audio: Option<String>,
+    pub reference_text: Option<String>,
+    pub voice_description: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AsrEngineInput {
+    pub audio: EngineAudioInput,
+    pub language: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatEngineInput {
+    pub messages: Vec<ChatMessage>,
+    pub chat_config: ChatRequestConfig,
+    pub prompt_tokens: Vec<TokenId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AudioChatEngineInput {
+    pub audio: EngineAudioInput,
+    pub messages: Vec<ChatMessage>,
+    pub system_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum EngineTask {
+    Tts(TtsEngineInput),
+    Asr(AsrEngineInput),
+    Chat(ChatEngineInput),
+    SpeechToSpeech(AudioChatEngineInput),
+}
+
+impl EngineTask {
+    pub fn task_type(&self) -> TaskType {
+        match self {
+            Self::Tts(_) => TaskType::TTS,
+            Self::Asr(_) => TaskType::ASR,
+            Self::Chat(_) => TaskType::Chat,
+            Self::SpeechToSpeech(_) => TaskType::SpeechToSpeech,
+        }
+    }
+}
+
 /// A request to the engine core.
 #[derive(Debug, Clone)]
 pub struct EngineCoreRequest {
     /// Unique request ID
     pub id: RequestId,
+    /// Typed task payload used by new engine internals.
+    pub task: EngineTask,
     /// Task type (TTS, ASR, AudioChat)
     pub task_type: TaskType,
     /// Specific model variant to route to.
@@ -91,13 +146,83 @@ pub struct EngineCoreRequest {
 }
 
 impl EngineCoreRequest {
+    fn task_from_fields(
+        task_type: TaskType,
+        text: Option<String>,
+        chat_messages: Option<Vec<ChatMessage>>,
+        chat_config: ChatRequestConfig,
+        language: Option<String>,
+        audio_input: Option<String>,
+        audio_bytes: Option<Vec<u8>>,
+        reference_audio: Option<String>,
+        reference_text: Option<String>,
+        voice_description: Option<String>,
+        system_prompt: Option<String>,
+        prompt_tokens: Vec<TokenId>,
+    ) -> EngineTask {
+        let audio = || {
+            audio_bytes
+                .clone()
+                .map(EngineAudioInput::Bytes)
+                .or_else(|| audio_input.clone().map(EngineAudioInput::Base64))
+                .unwrap_or_else(|| EngineAudioInput::Bytes(Vec::new()))
+        };
+
+        match task_type {
+            TaskType::TTS => EngineTask::Tts(TtsEngineInput {
+                text: text.unwrap_or_default(),
+                reference_audio,
+                reference_text,
+                voice_description,
+            }),
+            TaskType::ASR => EngineTask::Asr(AsrEngineInput {
+                audio: audio(),
+                language,
+            }),
+            TaskType::Chat => EngineTask::Chat(ChatEngineInput {
+                messages: chat_messages.unwrap_or_default(),
+                chat_config,
+                prompt_tokens,
+            }),
+            TaskType::SpeechToSpeech => EngineTask::SpeechToSpeech(AudioChatEngineInput {
+                audio: audio(),
+                messages: chat_messages.unwrap_or_default(),
+                system_prompt,
+            }),
+        }
+    }
+
+    fn sync_task_from_fields(&mut self) {
+        self.task = Self::task_from_fields(
+            self.task_type,
+            self.text.clone(),
+            self.chat_messages.clone(),
+            self.chat_config.clone(),
+            self.language.clone(),
+            self.audio_input.clone(),
+            self.audio_bytes.clone(),
+            self.reference_audio.clone(),
+            self.reference_text.clone(),
+            self.voice_description.clone(),
+            self.system_prompt.clone(),
+            self.prompt_tokens.clone(),
+        );
+    }
+
     /// Create a new TTS request.
     pub fn tts(text: impl Into<String>) -> Self {
+        let text = text.into();
         Self {
             id: Uuid::new_v4().to_string(),
+            task: EngineTask::Tts(TtsEngineInput {
+                text: text.clone(),
+                reference_audio: None,
+                reference_text: None,
+                voice_description: None,
+            }),
             task_type: TaskType::TTS,
             model_variant: None,
-            text: Some(text.into()),
+            text: Some(text),
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
             language: None,
@@ -120,8 +245,13 @@ impl EngineCoreRequest {
 
     /// Create a new ASR request.
     pub fn asr(audio_base64: impl Into<String>) -> Self {
+        let audio_base64 = audio_base64.into();
         Self {
             id: Uuid::new_v4().to_string(),
+            task: EngineTask::Asr(AsrEngineInput {
+                audio: EngineAudioInput::Base64(audio_base64.clone()),
+                language: None,
+            }),
             task_type: TaskType::ASR,
             model_variant: None,
             text: None,
@@ -129,7 +259,7 @@ impl EngineCoreRequest {
             chat_config: ChatRequestConfig::default(),
             language: None,
             correlation_id: None,
-            audio_input: Some(audio_base64.into()),
+            audio_input: Some(audio_base64),
             audio_bytes: None,
             reference_audio: None,
             reference_text: None,
@@ -147,8 +277,13 @@ impl EngineCoreRequest {
 
     /// Create a new ASR request from already-decoded audio bytes.
     pub fn asr_bytes(audio_bytes: impl Into<Vec<u8>>) -> Self {
+        let audio_bytes = audio_bytes.into();
         Self {
             id: Uuid::new_v4().to_string(),
+            task: EngineTask::Asr(AsrEngineInput {
+                audio: EngineAudioInput::Bytes(audio_bytes.clone()),
+                language: None,
+            }),
             task_type: TaskType::ASR,
             model_variant: None,
             text: None,
@@ -157,7 +292,7 @@ impl EngineCoreRequest {
             language: None,
             correlation_id: None,
             audio_input: None,
-            audio_bytes: Some(audio_bytes.into()),
+            audio_bytes: Some(audio_bytes),
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -176,6 +311,11 @@ impl EngineCoreRequest {
     pub fn chat(messages: Vec<ChatMessage>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
+            task: EngineTask::Chat(ChatEngineInput {
+                messages: messages.clone(),
+                chat_config: ChatRequestConfig::default(),
+                prompt_tokens: Vec::new(),
+            }),
             task_type: TaskType::Chat,
             model_variant: None,
             text: None,
@@ -201,8 +341,14 @@ impl EngineCoreRequest {
 
     /// Create a new speech-to-speech request.
     pub fn speech_to_speech(audio_base64: impl Into<String>) -> Self {
+        let audio_base64 = audio_base64.into();
         Self {
             id: Uuid::new_v4().to_string(),
+            task: EngineTask::SpeechToSpeech(AudioChatEngineInput {
+                audio: EngineAudioInput::Base64(audio_base64.clone()),
+                messages: Vec::new(),
+                system_prompt: None,
+            }),
             task_type: TaskType::SpeechToSpeech,
             model_variant: None,
             text: None,
@@ -210,7 +356,7 @@ impl EngineCoreRequest {
             chat_config: ChatRequestConfig::default(),
             language: None,
             correlation_id: None,
-            audio_input: Some(audio_base64.into()),
+            audio_input: Some(audio_base64),
             audio_bytes: None,
             reference_audio: None,
             reference_text: None,
@@ -228,8 +374,14 @@ impl EngineCoreRequest {
 
     /// Create a new speech-to-speech request from already-decoded audio bytes.
     pub fn speech_to_speech_bytes(audio_bytes: impl Into<Vec<u8>>) -> Self {
+        let audio_bytes = audio_bytes.into();
         Self {
             id: Uuid::new_v4().to_string(),
+            task: EngineTask::SpeechToSpeech(AudioChatEngineInput {
+                audio: EngineAudioInput::Bytes(audio_bytes.clone()),
+                messages: Vec::new(),
+                system_prompt: None,
+            }),
             task_type: TaskType::SpeechToSpeech,
             model_variant: None,
             text: None,
@@ -238,7 +390,7 @@ impl EngineCoreRequest {
             language: None,
             correlation_id: None,
             audio_input: None,
-            audio_bytes: Some(audio_bytes.into()),
+            audio_bytes: Some(audio_bytes),
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -293,18 +445,21 @@ impl EngineCoreRequest {
     pub fn with_reference(mut self, audio: impl Into<String>, text: impl Into<String>) -> Self {
         self.reference_audio = Some(audio.into());
         self.reference_text = Some(text.into());
+        self.sync_task_from_fields();
         self
     }
 
     /// Set voice description.
     pub fn with_voice_description(mut self, description: impl Into<String>) -> Self {
         self.voice_description = Some(description.into());
+        self.sync_task_from_fields();
         self
     }
 
     /// Set language hint.
     pub fn with_language(mut self, language: impl Into<String>) -> Self {
         self.language = Some(language.into());
+        self.sync_task_from_fields();
         self
     }
 
@@ -317,12 +472,14 @@ impl EngineCoreRequest {
     /// Set speech-to-speech system prompt.
     pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.system_prompt = Some(prompt.into());
+        self.sync_task_from_fields();
         self
     }
 
     /// Set chat-specific prompt/runtime configuration.
     pub fn with_chat_config(mut self, chat_config: ChatRequestConfig) -> Self {
         self.chat_config = chat_config;
+        self.sync_task_from_fields();
         self
     }
 
@@ -412,6 +569,7 @@ impl RequestProcessor {
             }
         }
 
+        request.sync_task_from_fields();
         Ok(request)
     }
 
@@ -599,6 +757,7 @@ impl RequestBuilder {
     pub fn audio_input(mut self, audio: impl Into<String>) -> Self {
         self.request.audio_input = Some(audio.into());
         self.request.audio_bytes = None;
+        self.request.sync_task_from_fields();
         self
     }
 
@@ -606,35 +765,41 @@ impl RequestBuilder {
     pub fn audio_bytes(mut self, audio: impl Into<Vec<u8>>) -> Self {
         self.request.audio_bytes = Some(audio.into());
         self.request.audio_input = None;
+        self.request.sync_task_from_fields();
         self
     }
 
     /// Set text input (for chat).
     pub fn text_input(mut self, text: impl Into<String>) -> Self {
         self.request.text = Some(text.into());
+        self.request.sync_task_from_fields();
         self
     }
 
     /// Set chat messages.
     pub fn chat_messages(mut self, messages: Vec<ChatMessage>) -> Self {
         self.request.chat_messages = Some(messages);
+        self.request.sync_task_from_fields();
         self
     }
 
     /// Set language hint.
     pub fn language(mut self, language: impl Into<String>) -> Self {
         self.request.language = Some(language.into());
+        self.request.sync_task_from_fields();
         self
     }
 
     /// Set speech-to-speech system prompt.
     pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.request.system_prompt = Some(prompt.into());
+        self.request.sync_task_from_fields();
         self
     }
 
     /// Build the request.
-    pub fn build(self) -> EngineCoreRequest {
+    pub fn build(mut self) -> EngineCoreRequest {
+        self.request.sync_task_from_fields();
         self.request
     }
 }
@@ -650,6 +815,10 @@ mod tests {
         let request = EngineCoreRequest::tts("Hello, world!");
         assert_eq!(request.task_type, TaskType::TTS);
         assert_eq!(request.text.as_deref(), Some("Hello, world!"));
+        match &request.task {
+            EngineTask::Tts(input) => assert_eq!(input.text, "Hello, world!"),
+            other => panic!("unexpected task payload: {other:?}"),
+        }
     }
 
     #[test]
@@ -746,6 +915,10 @@ mod tests {
 
         let processed = processor.process(request).expect("request should process");
         assert_eq!(processed.prompt_tokens, vec![41, 42, 43]);
+        match processed.task {
+            EngineTask::Chat(input) => assert_eq!(input.prompt_tokens, vec![41, 42, 43]),
+            other => panic!("unexpected task payload: {other:?}"),
+        }
     }
 
     #[test]
@@ -756,6 +929,13 @@ mod tests {
         let request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]);
         let processed = processor.process(request);
         assert!(processed.is_ok());
+        match processed.expect("processed").task {
+            EngineTask::Asr(input) => match input.audio {
+                EngineAudioInput::Bytes(bytes) => assert_eq!(bytes, vec![1, 2, 3]),
+                other => panic!("unexpected audio input: {other:?}"),
+            },
+            other => panic!("unexpected task payload: {other:?}"),
+        }
     }
 
     #[test]
