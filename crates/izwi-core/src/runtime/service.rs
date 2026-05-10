@@ -27,7 +27,7 @@ use crate::error::{Error, Result};
 use crate::model::ModelResidencyLease;
 use crate::runtime::adapters::RuntimeAdapterRegistry;
 use crate::runtime::broker::{InferenceBroker, InferenceBrokerSnapshot};
-use crate::runtime::pipeline::PipelineGraph;
+use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
 use crate::runtime::telemetry::{
     push_engine_metric, EngineRuntimeTelemetrySnapshot, RuntimeTelemetryCollector,
     RuntimeTelemetrySnapshot,
@@ -693,17 +693,20 @@ impl RuntimeService {
 
     pub fn record_modular_voice_pipeline_turn(&self) {
         let graph = PipelineGraph::modular_voice_turn();
-        self.telemetry.record_pipeline_graph(&graph);
+        let summary = PipelineExecutor.execute_contract(&graph);
+        self.telemetry.record_pipeline_execution(&summary);
     }
 
     pub fn record_unified_voice_pipeline_turn(&self) {
         let graph = PipelineGraph::unified_voice_turn();
-        self.telemetry.record_pipeline_graph(&graph);
+        let summary = PipelineExecutor.execute_contract(&graph);
+        self.telemetry.record_pipeline_execution(&summary);
     }
 
     pub(crate) fn record_diarization_transcript_pipeline(&self, enable_llm_refinement: bool) {
         let graph = PipelineGraph::diarization_transcript(enable_llm_refinement);
-        self.telemetry.record_pipeline_graph(&graph);
+        let summary = PipelineExecutor.execute_contract(&graph);
+        self.telemetry.record_pipeline_execution(&summary);
     }
 }
 

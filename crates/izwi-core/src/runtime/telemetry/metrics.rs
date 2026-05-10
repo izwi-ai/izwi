@@ -14,7 +14,7 @@ use crate::engine::{
 use crate::models::shared::telemetry::{
     prometheus as kernel_path_prometheus, snapshot as kernel_path_telemetry_snapshot,
 };
-use crate::runtime::pipeline::{PipelineGraph, PipelineKind};
+use crate::runtime::pipeline::{PipelineExecutionSummary, PipelineExecutor, PipelineGraph, PipelineKind};
 use crate::runtime::voice_metrics::{
     prometheus_voice_metric_name, voice_metric_catalog, voice_metric_prometheus_contract,
     VoiceMetricDescriptor, VOICE_BARGE_IN_TOTAL, VOICE_SESSION_CLOSED_TOTAL,
@@ -246,7 +246,12 @@ impl RuntimeTelemetryCollector {
     }
 
     pub(crate) fn record_pipeline_graph(&self, graph: &PipelineGraph) {
-        match graph.kind {
+        let summary = PipelineExecutor.execute_contract(graph);
+        self.record_pipeline_execution(&summary);
+    }
+
+    pub(crate) fn record_pipeline_execution(&self, summary: &PipelineExecutionSummary) {
+        match summary.kind() {
             PipelineKind::ModularVoiceTurn => {
                 self.pipeline_modular_voice_turns
                     .fetch_add(1, Ordering::Relaxed);
@@ -261,7 +266,7 @@ impl RuntimeTelemetryCollector {
             }
         }
         self.pipeline_stages_recorded
-            .fetch_add(graph.stages().len() as u64, Ordering::Relaxed);
+            .fetch_add(summary.stages().len() as u64, Ordering::Relaxed);
     }
 
     pub(crate) async fn snapshot(&self) -> RuntimeTelemetrySnapshot {
