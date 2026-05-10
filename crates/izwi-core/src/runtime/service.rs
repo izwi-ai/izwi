@@ -506,13 +506,13 @@ impl RuntimeService {
         F: FnMut(StreamingOutput) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
+        request.streaming = true;
         self.observe_broker_request(&request)?;
         let _residency_lease = request
             .model_variant
             .map(|variant| self.acquire_model_residency_lease(variant));
         self.ensure_step_driver_started().await;
 
-        request.streaming = true;
         let span = info_span!(
             "runtime_request",
             request_id = %request.id,
@@ -760,6 +760,7 @@ fn requested_backend_unavailable_message(
 mod tests {
     use super::*;
     use crate::backends::{BackendCapabilities, BackendContext, BackendSelectionSource};
+    use crate::runtime::broker::{InferenceBroker, InferenceBrokerMode};
 
     #[test]
     fn explicit_cuda_mismatch_gets_cuda_specific_error() {
@@ -793,5 +794,20 @@ mod tests {
         assert!(payload.contains("izwi_engine_scheduler_running_requests"));
         assert!(payload.contains("izwi_engine_kv_cache_allocated_blocks"));
         assert!(payload.contains("izwi_engine_stream_backpressure_total"));
+    }
+
+    #[tokio::test]
+    async fn streaming_requests_are_validated_as_streaming_by_broker() {
+        let mut runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        runtime.inference_broker = InferenceBroker::with_mode(InferenceBrokerMode::On);
+        let request = EngineCoreRequest::asr("audio")
+            .with_model_variant(ModelVariant::WhisperLargeV3Turbo);
+
+        let err = runtime
+            .run_streaming_request(request, |_| std::future::ready(Ok(())))
+            .await
+            .expect_err("batch-only ASR should be rejected before streaming execution");
+
+        assert!(err.to_string().contains("not streaming execution"));
     }
 }
