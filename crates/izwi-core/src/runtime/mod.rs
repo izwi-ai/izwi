@@ -9,6 +9,7 @@ mod asr;
 pub(crate) mod audio_io;
 mod broker;
 mod chat;
+mod conformance;
 mod diarization;
 mod kokoro;
 mod lifecycle;
@@ -25,6 +26,10 @@ pub use service::{
     EngineRuntimeTelemetrySnapshot, InferenceBrokerRuntimeTelemetrySnapshot,
     PipelineRuntimeTelemetrySnapshot, RuntimeService, RuntimeTelemetrySnapshot,
     VoiceRuntimeTelemetrySnapshot,
+};
+pub use conformance::{
+    capability_conformance_cases, required_conformance_capabilities,
+    CapabilityConformanceCase, ConformanceCapability, ConformanceExecutionClass,
 };
 pub use types::{
     AsrTranscription, AudioChunk, ChatGeneration, ChunkStats, DiarizationConfig, DiarizationResult,
