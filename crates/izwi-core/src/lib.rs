@@ -35,6 +35,7 @@ pub mod error;
 pub mod kernels;
 pub mod model;
 mod models;
+pub mod residency;
 pub mod runtime;
 pub mod runtime_models;
 pub mod serve_runtime;
@@ -94,7 +95,7 @@ pub use runtime_models::shared::chat::{
 
 // Canonical native registry/device exports.
 pub use backends::{DeviceProfile, DeviceSelector};
-pub use runtime_models::ModelRegistry;
+pub use runtime_models::{LoadedModelRegistry, ModelRegistry};
 
 #[cfg(test)]
 pub(crate) fn env_test_lock() -> &'static std::sync::Mutex<()> {
