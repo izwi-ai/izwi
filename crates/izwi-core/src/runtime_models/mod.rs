@@ -3,4 +3,8 @@
 //! Public callers should prefer this namespace over the internal `models`
 //! implementation module.
 
-pub use crate::models::{architectures, registry, shared, LoadedModelRegistry, ModelRegistry};
+pub use crate::models::{
+    architectures, families, model_family_registrations, registration_for_variant,
+    registrations_for_capability, registry, shared, FamilyRegistration, LoadedModelRegistry,
+    ModelRegistry, MODEL_FAMILY_REGISTRATIONS,
+};
