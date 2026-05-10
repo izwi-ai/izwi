@@ -56,6 +56,58 @@ pub(crate) struct PipelineGraph {
     stages: Vec<PipelineStage>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PipelineStageStatus {
+    Recorded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PipelineStageExecution {
+    pub(crate) kind: PipelineStageKind,
+    pub(crate) name: &'static str,
+    pub(crate) required: bool,
+    pub(crate) status: PipelineStageStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PipelineExecutionSummary {
+    kind: PipelineKind,
+    stages: Vec<PipelineStageExecution>,
+}
+
+impl PipelineExecutionSummary {
+    pub(crate) fn kind(&self) -> PipelineKind {
+        self.kind
+    }
+
+    pub(crate) fn stages(&self) -> &[PipelineStageExecution] {
+        &self.stages
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PipelineExecutor;
+
+impl PipelineExecutor {
+    pub(crate) fn execute_contract(&self, graph: &PipelineGraph) -> PipelineExecutionSummary {
+        let stages = graph
+            .stages()
+            .iter()
+            .map(|stage| PipelineStageExecution {
+                kind: stage.kind,
+                name: stage.name,
+                required: stage.required,
+                status: PipelineStageStatus::Recorded,
+            })
+            .collect();
+
+        PipelineExecutionSummary {
+            kind: graph.kind,
+            stages,
+        }
+    }
+}
+
 impl PipelineGraph {
     pub(crate) fn modular_voice_turn() -> Self {
         Self {
@@ -175,5 +227,31 @@ mod tests {
                 .expect("llm refinement stage")
                 .required
         );
+    }
+
+    #[test]
+    fn pipeline_executor_records_stage_contracts_in_order() {
+        let graph = PipelineGraph::modular_voice_turn();
+        let summary = PipelineExecutor.execute_contract(&graph);
+
+        assert_eq!(summary.kind(), PipelineKind::ModularVoiceTurn);
+        assert_eq!(
+            summary
+                .stages()
+                .iter()
+                .map(|stage| stage.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                PipelineStageKind::Vad,
+                PipelineStageKind::Endpointing,
+                PipelineStageKind::Asr,
+                PipelineStageKind::Chat,
+                PipelineStageKind::Tts,
+            ]
+        );
+        assert!(summary
+            .stages()
+            .iter()
+            .all(|stage| stage.status == PipelineStageStatus::Recorded));
     }
 }
