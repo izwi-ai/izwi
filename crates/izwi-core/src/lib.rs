@@ -53,15 +53,16 @@ pub use config::EngineConfig;
 pub use error::{Error, Result};
 pub use models::shared::telemetry::KernelPathTelemetrySnapshot;
 pub use runtime::{
-    prometheus_voice_metric_name, prometheus_voice_metric_type, voice_metric_catalog,
-    voice_metric_prometheus_contract, VoiceMetricDescriptor, VOICE_ASR_FINAL_MS,
-    VOICE_ASR_FIRST_PARTIAL_MS, VOICE_AUDIO_EGRESS_UNDERRUNS_TOTAL,
-    VOICE_AUDIO_INGRESS_DROPPED_FRAMES_TOTAL, VOICE_AUDIO_INGRESS_JITTER_MS,
-    VOICE_BARGE_IN_LATENCY_MS, VOICE_BARGE_IN_TOTAL, VOICE_ENDPOINTING_LATENCY_MS,
-    VOICE_LLM_FIRST_TOKEN_MS, VOICE_METRIC_CATALOG, VOICE_MODEL_READY_TOTAL,
-    VOICE_SESSION_CLOSED_TOTAL, VOICE_SESSION_DURATION_MS, VOICE_SESSION_INTERRUPTED_TOTAL,
-    VOICE_SESSION_STARTED_TOTAL, VOICE_STREAM_BACKPRESSURE_TOTAL, VOICE_TTS_FIRST_AUDIO_MS,
-    VOICE_VAD_SPEECH_START_MS,
+    capability_conformance_cases, prometheus_voice_metric_name, prometheus_voice_metric_type,
+    required_conformance_capabilities, voice_metric_catalog, voice_metric_prometheus_contract,
+    CapabilityConformanceCase, ConformanceCapability, ConformanceExecutionClass,
+    VoiceMetricDescriptor, VOICE_ASR_FINAL_MS, VOICE_ASR_FIRST_PARTIAL_MS,
+    VOICE_AUDIO_EGRESS_UNDERRUNS_TOTAL, VOICE_AUDIO_INGRESS_DROPPED_FRAMES_TOTAL,
+    VOICE_AUDIO_INGRESS_JITTER_MS, VOICE_BARGE_IN_LATENCY_MS, VOICE_BARGE_IN_TOTAL,
+    VOICE_ENDPOINTING_LATENCY_MS, VOICE_LLM_FIRST_TOKEN_MS, VOICE_METRIC_CATALOG,
+    VOICE_MODEL_READY_TOTAL, VOICE_SESSION_CLOSED_TOTAL, VOICE_SESSION_DURATION_MS,
+    VOICE_SESSION_INTERRUPTED_TOTAL, VOICE_SESSION_STARTED_TOTAL, VOICE_STREAM_BACKPRESSURE_TOTAL,
+    VOICE_TTS_FIRST_AUDIO_MS, VOICE_VAD_SPEECH_START_MS,
 };
 pub use runtime::{
     AsrTranscription, ChatGeneration, ChunkStats, DiarizationConfig, DiarizationResult,
