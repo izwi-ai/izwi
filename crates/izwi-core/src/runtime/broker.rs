@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use crate::engine::{EngineCoreRequest, TaskType};
 use crate::runtime::adapters::{CapabilityKind, RuntimeAdapterRegistry};
+use crate::runtime::capabilities::{CapabilityExecutionRegistry, CapabilityExecutionRequest};
 
 const BROKER_MODE_ENV: &str = "IZWI_INFERENCE_BROKER";
 const DEPLOYMENT_MODE_ENV: &str = "IZWI_INFERENCE_DEPLOYMENT_MODE";
@@ -153,9 +154,13 @@ impl InferenceBroker {
         }
 
         let capability = capability_for_task(request.task_type);
+        let execution_registry = CapabilityExecutionRegistry::new(adapters);
         let validation_error = match request.model_variant {
-            Some(model_variant) => adapters
-                .require(capability, model_variant)
+            Some(model_variant) => execution_registry
+                .plan(
+                    CapabilityExecutionRequest::new(capability, model_variant)
+                        .with_streaming_required(request.streaming),
+                )
                 .err()
                 .map(|err| err.to_string()),
             None => Some(format!(
