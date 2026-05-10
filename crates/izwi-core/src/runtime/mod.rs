@@ -18,19 +18,21 @@ mod pipeline;
 mod request;
 mod service;
 mod speech_to_speech;
+mod telemetry;
 mod tts;
 mod types;
 mod voice_metrics;
 mod voice_session;
 
-pub use service::{
-    EngineRuntimeTelemetrySnapshot, InferenceBrokerRuntimeTelemetrySnapshot,
-    PipelineRuntimeTelemetrySnapshot, RuntimeService, RuntimeTelemetrySnapshot,
-    VoiceRuntimeTelemetrySnapshot,
-};
 pub use conformance::{
     capability_conformance_cases, required_conformance_capabilities,
     CapabilityConformanceCase, ConformanceCapability, ConformanceExecutionClass,
+};
+pub use service::RuntimeService;
+pub use telemetry::{
+    EngineRuntimeTelemetrySnapshot, InferenceBrokerRuntimeTelemetrySnapshot,
+    PipelineRuntimeTelemetrySnapshot, RuntimeTelemetrySnapshot,
+    VoiceRuntimeTelemetrySnapshot,
 };
 pub use types::{
     AsrTranscription, AudioChunk, ChatGeneration, ChunkStats, DiarizationConfig, DiarizationResult,
