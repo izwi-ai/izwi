@@ -6,6 +6,7 @@ use crate::catalog::{
 use crate::error::{Error, Result};
 use crate::models::registry::NativeAsrModel;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
+use crate::runtime::adapters::CapabilityKind;
 use crate::runtime::audio_io::{base64_decode, decode_audio_bytes};
 use crate::runtime::request::DiarizationRuntimeRequest;
 use crate::runtime::service::RuntimeService;
@@ -56,6 +57,7 @@ impl RuntimeService {
         config: &DiarizationConfig,
     ) -> Result<DiarizationResult> {
         let variant = resolve_diarization_model_variant(model_id);
+        self.observe_broker_capability_request(CapabilityKind::Diarization, Some(variant), false)?;
         self.load_model(variant).await?;
         let _lease = self.acquire_model_residency_lease(variant);
 

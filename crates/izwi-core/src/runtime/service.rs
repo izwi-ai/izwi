@@ -17,16 +17,18 @@ use crate::catalog::{ModelInfo, ModelVariant};
 use crate::config::EngineConfig;
 use crate::engine::{
     engine_stream_backpressure_total, Engine as CoreEngine, EngineCoreConfig, EngineCoreRequest,
-    EngineOutput, StreamingOutput, WorkerConfig,
-    ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_EVICTIONS_TOTAL,
-    ENGINE_KV_CACHE_HITS_TOTAL, ENGINE_KV_CACHE_MISSES_TOTAL,
+    EngineOutput, StreamingOutput, WorkerConfig, ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
+    ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_HITS_TOTAL, ENGINE_KV_CACHE_MISSES_TOTAL,
     ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL, ENGINE_SCHEDULER_QUEUE_DEPTH,
     ENGINE_SCHEDULER_RUNNING_REQUESTS, ENGINE_STREAM_BACKPRESSURE_TOTAL,
 };
 use crate::error::{Error, Result};
 use crate::model::ModelResidencyLease;
+use crate::runtime::adapters::CapabilityKind;
 use crate::runtime::adapters::RuntimeAdapterRegistry;
-use crate::runtime::broker::{InferenceBroker, InferenceBrokerSnapshot};
+use crate::runtime::broker::{
+    InferenceBroker, InferenceBrokerObservation, InferenceBrokerSnapshot,
+};
 use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
 use crate::runtime::telemetry::{
     push_engine_metric, EngineRuntimeTelemetrySnapshot, RuntimeTelemetryCollector,
@@ -242,6 +244,28 @@ impl RuntimeService {
             return Ok(());
         };
 
+        self.record_broker_observation(observation)
+    }
+
+    pub(crate) fn observe_broker_capability_request(
+        &self,
+        capability: CapabilityKind,
+        model_variant: Option<ModelVariant>,
+        streaming_required: bool,
+    ) -> Result<()> {
+        let Some(observation) = self.inference_broker.observe_capability_request(
+            capability,
+            model_variant,
+            streaming_required,
+            &self.adapter_registry,
+        ) else {
+            return Ok(());
+        };
+
+        self.record_broker_observation(observation)
+    }
+
+    fn record_broker_observation(&self, observation: InferenceBrokerObservation) -> Result<()> {
         if observation.shadow_enabled {
             self.telemetry.record_broker_shadow_request();
         }
@@ -800,8 +824,8 @@ mod tests {
     async fn streaming_requests_are_validated_as_streaming_by_broker() {
         let mut runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         runtime.inference_broker = InferenceBroker::with_mode(InferenceBrokerMode::On);
-        let request = EngineCoreRequest::asr("audio")
-            .with_model_variant(ModelVariant::WhisperLargeV3Turbo);
+        let request =
+            EngineCoreRequest::asr("audio").with_model_variant(ModelVariant::WhisperLargeV3Turbo);
 
         let err = runtime
             .run_streaming_request(request, |_| std::future::ready(Ok(())))
@@ -809,5 +833,24 @@ mod tests {
             .expect_err("batch-only ASR should be rejected before streaming execution");
 
         assert!(err.to_string().contains("not streaming execution"));
+    }
+
+    #[tokio::test]
+    async fn direct_capability_observation_records_broker_telemetry() {
+        let mut runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        runtime.inference_broker = InferenceBroker::with_mode(InferenceBrokerMode::Shadow);
+
+        runtime
+            .observe_broker_capability_request(
+                CapabilityKind::Tts,
+                Some(ModelVariant::Kokoro82M),
+                true,
+            )
+            .expect("direct capability observation should validate");
+
+        let snapshot = runtime.telemetry_snapshot().await;
+        assert_eq!(snapshot.broker.shadow_requests, 1);
+        assert_eq!(snapshot.broker.execution_requests, 0);
+        assert_eq!(snapshot.broker.validation_failures, 0);
     }
 }

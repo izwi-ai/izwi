@@ -8,6 +8,7 @@ use tracing::info;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::kokoro::{KokoroSynthesisResult, KokoroTtsModel};
+use crate::runtime::adapters::CapabilityKind;
 use crate::runtime::service::RuntimeService;
 use crate::runtime::types::{AudioChunk, GenerationRequest, GenerationResult};
 
@@ -41,6 +42,7 @@ impl RuntimeService {
         request: GenerationRequest,
     ) -> Result<GenerationResult> {
         let variant = self.resolve_kokoro_variant_for_request(&request).await;
+        self.observe_broker_capability_request(CapabilityKind::Tts, Some(variant), false)?;
         self.load_model(variant).await?;
         let _lease = self.acquire_model_residency_lease(variant);
         let model = self
@@ -75,6 +77,7 @@ impl RuntimeService {
     ) -> Result<()> {
         let request_id = request.id.clone();
         let variant = self.resolve_kokoro_variant_for_request(&request).await;
+        self.observe_broker_capability_request(CapabilityKind::Tts, Some(variant), true)?;
         self.load_model(variant).await?;
         let _lease = self.acquire_model_residency_lease(variant);
         let model = self

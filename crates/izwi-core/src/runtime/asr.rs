@@ -4,6 +4,7 @@ use crate::catalog::{parse_model_variant, resolve_asr_model_variant};
 use crate::engine::EngineCoreRequest;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
+use crate::runtime::adapters::CapabilityKind;
 use crate::runtime::audio_io::{base64_decode, decode_audio_bytes};
 use crate::runtime::request::{AlignmentRuntimeRequest, AsrRuntimeRequest};
 use crate::runtime::service::RuntimeService;
@@ -117,6 +118,7 @@ impl RuntimeService {
         correlation_id: Option<&str>,
     ) -> Result<AsrTranscription> {
         if variant.is_audio_chat() {
+            self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
             return self
                 .asr_transcribe_audio_chat_base64(variant, audio_base64, |_delta| {})
                 .await;
@@ -153,6 +155,7 @@ impl RuntimeService {
         F: FnMut(String) + Send + 'static,
     {
         if variant.is_audio_chat() {
+            self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), true)?;
             return self
                 .asr_transcribe_audio_chat_base64(variant, audio_base64, on_delta)
                 .await;
@@ -196,6 +199,7 @@ impl RuntimeService {
         correlation_id: Option<&str>,
     ) -> Result<AsrTranscription> {
         if variant.is_audio_chat() {
+            self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
             return self
                 .asr_transcribe_audio_chat_bytes(variant, audio_bytes, |_delta| {})
                 .await;
@@ -232,6 +236,7 @@ impl RuntimeService {
         F: FnMut(String) + Send + 'static,
     {
         if variant.is_audio_chat() {
+            self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), true)?;
             return self
                 .asr_transcribe_audio_chat_bytes(variant, audio_bytes, on_delta)
                 .await;
@@ -469,6 +474,11 @@ impl RuntimeService {
             audio_bytes.to_vec(),
             reference_text,
             language.map(ToOwned::to_owned),
+        )?;
+        self.observe_broker_capability_request(
+            CapabilityKind::ForcedAlignment,
+            Some(variant),
+            false,
         )?;
         self.load_model(variant).await?;
         let _lease = self.acquire_model_residency_lease(variant);
