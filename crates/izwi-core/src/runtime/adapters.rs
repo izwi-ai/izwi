@@ -84,9 +84,7 @@ impl RuntimeAdapterRegistry {
         let mut capabilities = self
             .adapters
             .iter()
-            .filter_map(|((_, variant), metadata)| {
-                (*variant == model_variant).then_some(*metadata)
-            })
+            .filter_map(|((_, variant), metadata)| (*variant == model_variant).then_some(*metadata))
             .collect::<Vec<_>>();
         capabilities.sort_by_key(|metadata| metadata.capability);
         capabilities
@@ -145,7 +143,9 @@ impl ModelCapabilityAdapter for TtsCapabilityAdapter {
             id: "builtin.tts",
             capability: CapabilityKind::Tts,
             model_variant,
-            streaming_mode: if capabilities.supports_streaming {
+            streaming_mode: if capabilities.supports_streaming
+                || model_variant.is_lfm25_audio_gguf()
+            {
                 StreamingMode::Chunked
             } else {
                 StreamingMode::None
@@ -180,7 +180,11 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
             id: "builtin.asr",
             capability: CapabilityKind::Asr,
             model_variant,
-            streaming_mode: StreamingMode::None,
+            streaming_mode: if model_variant.is_audio_chat() {
+                StreamingMode::Chunked
+            } else {
+                StreamingMode::None
+            },
             execution_target: asr_execution_target(model_variant),
         })
     }
@@ -266,13 +270,15 @@ struct ForcedAlignmentCapabilityAdapter;
 
 impl ModelCapabilityAdapter for ForcedAlignmentCapabilityAdapter {
     fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
-        model_variant.is_forced_aligner().then_some(AdapterMetadata {
-            id: "builtin.forced_alignment",
-            capability: CapabilityKind::ForcedAlignment,
-            model_variant,
-            streaming_mode: StreamingMode::None,
-            execution_target: ExecutionTargetKind::BatchRunner,
-        })
+        model_variant
+            .is_forced_aligner()
+            .then_some(AdapterMetadata {
+                id: "builtin.forced_alignment",
+                capability: CapabilityKind::ForcedAlignment,
+                model_variant,
+                streaming_mode: StreamingMode::None,
+                execution_target: ExecutionTargetKind::BatchRunner,
+            })
     }
 }
 
@@ -359,7 +365,7 @@ mod tests {
         let lfm = registry
             .require(CapabilityKind::Tts, ModelVariant::Lfm25Audio15BGguf)
             .expect("lfm audio tts adapter");
-        assert_eq!(lfm.streaming_mode, StreamingMode::None);
+        assert_eq!(lfm.streaming_mode, StreamingMode::Chunked);
         assert_eq!(lfm.execution_target, ExecutionTargetKind::DirectModel);
     }
 
@@ -436,6 +442,13 @@ mod tests {
                 .expect("lfm audio asr adapter")
                 .execution_target,
             ExecutionTargetKind::DirectModel
+        );
+        assert_eq!(
+            registry
+                .require(CapabilityKind::Asr, ModelVariant::Lfm25Audio15BGguf)
+                .expect("lfm audio asr adapter")
+                .streaming_mode,
+            StreamingMode::Chunked
         );
         assert_eq!(
             registry

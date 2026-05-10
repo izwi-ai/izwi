@@ -127,7 +127,10 @@ impl InferenceBroker {
     }
 
     pub(crate) fn shadow_enabled(&self) -> bool {
-        matches!(self.mode, InferenceBrokerMode::Shadow | InferenceBrokerMode::On)
+        matches!(
+            self.mode,
+            InferenceBrokerMode::Shadow | InferenceBrokerMode::On
+        )
     }
 
     pub(crate) fn execution_enabled(&self) -> bool {
@@ -149,17 +152,31 @@ impl InferenceBroker {
         request: &EngineCoreRequest,
         adapters: &RuntimeAdapterRegistry,
     ) -> Option<InferenceBrokerObservation> {
+        self.observe_capability_request(
+            capability_for_task(request.task_type),
+            request.model_variant,
+            request.streaming,
+            adapters,
+        )
+    }
+
+    pub(crate) fn observe_capability_request(
+        &self,
+        capability: CapabilityKind,
+        model_variant: Option<crate::model::ModelVariant>,
+        streaming_required: bool,
+        adapters: &RuntimeAdapterRegistry,
+    ) -> Option<InferenceBrokerObservation> {
         if !self.shadow_enabled() && !self.execution_enabled() {
             return None;
         }
 
-        let capability = capability_for_task(request.task_type);
         let execution_registry = CapabilityExecutionRegistry::new(adapters);
-        let validation_error = match request.model_variant {
+        let validation_error = match model_variant {
             Some(model_variant) => execution_registry
                 .plan(
                     CapabilityExecutionRequest::new(capability, model_variant)
-                        .with_streaming_required(request.streaming),
+                        .with_streaming_required(streaming_required),
                 )
                 .err()
                 .map(|err| err.to_string()),
@@ -170,7 +187,7 @@ impl InferenceBroker {
 
         Some(InferenceBrokerObservation {
             capability,
-            model_variant: request.model_variant,
+            model_variant,
             shadow_enabled: self.shadow_enabled(),
             execution_enabled: self.execution_enabled(),
             validation_error,
@@ -205,13 +222,22 @@ mod tests {
 
     #[test]
     fn broker_mode_accepts_shadow_alias() {
-        assert_eq!(InferenceBrokerMode::parse("shadow"), InferenceBrokerMode::Shadow);
-        assert_eq!(InferenceBrokerMode::parse("audit"), InferenceBrokerMode::Shadow);
+        assert_eq!(
+            InferenceBrokerMode::parse("shadow"),
+            InferenceBrokerMode::Shadow
+        );
+        assert_eq!(
+            InferenceBrokerMode::parse("audit"),
+            InferenceBrokerMode::Shadow
+        );
     }
 
     #[test]
     fn deployment_mode_defaults_to_local_for_unknown_values() {
-        assert_eq!(InferenceDeploymentMode::parse(""), InferenceDeploymentMode::Local);
+        assert_eq!(
+            InferenceDeploymentMode::parse(""),
+            InferenceDeploymentMode::Local
+        );
         assert_eq!(
             InferenceDeploymentMode::parse("something-else"),
             InferenceDeploymentMode::Local
@@ -293,5 +319,26 @@ mod tests {
 
         assert!(observation.execution_enabled);
         assert!(observation.validation_error.is_some());
+    }
+
+    #[test]
+    fn broker_observes_direct_capability_requests() {
+        let broker = InferenceBroker::with_mode(InferenceBrokerMode::Shadow);
+        let adapters = RuntimeAdapterRegistry::built_in();
+
+        let observation = broker
+            .observe_capability_request(
+                CapabilityKind::Tts,
+                Some(ModelVariant::Kokoro82M),
+                true,
+                &adapters,
+            )
+            .expect("shadow broker should observe direct TTS request");
+
+        assert_eq!(observation.capability, CapabilityKind::Tts);
+        assert_eq!(observation.model_variant, Some(ModelVariant::Kokoro82M));
+        assert!(observation.shadow_enabled);
+        assert!(!observation.execution_enabled);
+        assert!(observation.validation_error.is_none());
     }
 }

@@ -50,7 +50,13 @@ impl RuntimeService {
         &self,
         request: GenerationRequest,
         variant: ModelVariant,
+        streaming_required: bool,
     ) -> Result<GenerationResult> {
+        self.observe_broker_capability_request(
+            CapabilityKind::Tts,
+            Some(variant),
+            streaming_required,
+        )?;
         self.load_model(variant).await?;
         let _lease = self.acquire_model_residency_lease(variant);
 
@@ -96,7 +102,9 @@ impl RuntimeService {
         variant: ModelVariant,
         chunk_tx: mpsc::Sender<AudioChunk>,
     ) -> Result<()> {
-        let result = self.lfm25_audio_tts_generate(request, variant).await?;
+        let result = self
+            .lfm25_audio_tts_generate(request, variant, true)
+            .await?;
         let mut chunk = AudioChunk::final_chunk(result.request_id.clone(), 0, result.samples);
         chunk.is_final = true;
         chunk_tx
@@ -122,7 +130,7 @@ impl RuntimeService {
             crate::catalog::ModelFamily::Lfm25Audio
         ) {
             return self
-                .lfm25_audio_tts_generate(request, resolved_variant)
+                .lfm25_audio_tts_generate(request, resolved_variant, false)
                 .await;
         }
         self.load_model(resolved_variant).await?;
