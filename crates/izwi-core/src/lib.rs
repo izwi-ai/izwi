@@ -96,7 +96,10 @@ pub use runtime_models::shared::chat::{
 
 // Canonical native registry/device exports.
 pub use backends::{DeviceProfile, DeviceSelector};
-pub use runtime_models::{LoadedModelRegistry, ModelRegistry};
+pub use runtime_models::{
+    model_family_registrations, registration_for_variant, registrations_for_capability,
+    FamilyRegistration, LoadedModelRegistry, ModelRegistry, MODEL_FAMILY_REGISTRATIONS,
+};
 
 #[cfg(test)]
 pub(crate) fn env_test_lock() -> &'static std::sync::Mutex<()> {
