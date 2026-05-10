@@ -857,6 +857,13 @@ pub struct ModelRegistry {
     kokoro_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<KokoroTtsModel>>>>>>,
 }
 
+/// Explicit name for the in-memory registry of loaded native model handles.
+///
+/// `ModelRegistry` remains the compatibility name used throughout the current
+/// runtime. New architecture work should prefer `LoadedModelRegistry` when the
+/// distinction from catalog and artifact registries matters.
+pub type LoadedModelRegistry = ModelRegistry;
+
 impl ModelRegistry {
     pub fn new(models_dir: PathBuf, device: DeviceProfile) -> Self {
         Self {

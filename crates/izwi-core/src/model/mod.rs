@@ -5,13 +5,12 @@
 
 pub mod download;
 mod manager;
-mod residency;
 pub mod weights;
 
 pub use crate::catalog::{ModelInfo, ModelStatus, ModelVariant};
 pub use download::{DownloadProgress, ModelDownloader};
 pub use manager::ModelManager;
-pub use residency::{
+pub use crate::residency::{
     ModelArtifactState, ModelLifecycleSnapshot, ModelResidency, ModelResidencyLease,
     ModelResidencyState,
 };

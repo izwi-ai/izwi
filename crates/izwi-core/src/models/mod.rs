@@ -9,4 +9,4 @@ pub mod architectures;
 pub mod registry;
 pub mod shared;
 
-pub use registry::ModelRegistry;
+pub use registry::{LoadedModelRegistry, ModelRegistry};

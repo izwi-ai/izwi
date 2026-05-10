@@ -1,6 +1,6 @@
 //! Model lifecycle management
 
-use super::residency::{
+use crate::residency::{
     ModelLifecycleSnapshot, ModelResidency, ModelResidencyLease, ModelResidencyState,
 };
 use futures::stream::{self, StreamExt};
