@@ -31,8 +31,13 @@ pub use conformance::{
 pub use service::RuntimeService;
 pub use telemetry::{
     EngineRuntimeTelemetrySnapshot, InferenceBrokerRuntimeTelemetrySnapshot,
-    PipelineRuntimeTelemetrySnapshot, RuntimeTelemetrySnapshot,
-    VoiceRuntimeTelemetrySnapshot,
+    PipelineRuntimeTelemetrySnapshot, ReplayRedaction, RuntimeReplayRecord,
+    RuntimeTelemetrySnapshot, RuntimeTraceContract, RuntimeTracePhase,
+    VoiceRuntimeTelemetrySnapshot, RUNTIME_REPLAY_REDACTION, RUNTIME_TRACE_CONTRACTS,
+    TRACE_CAPABILITY, TRACE_CORRELATION_ID, TRACE_ERROR_KIND, TRACE_EXECUTION_TARGET,
+    TRACE_MODEL_VARIANT, TRACE_PIPELINE_KIND, TRACE_PIPELINE_STAGE, TRACE_REQUEST_ID,
+    TRACE_STREAMING_MODE, runtime_trace_contracts, sanitized_replay_record,
+    trace_contract_for_phase,
 };
 pub use types::{
     AsrTranscription, AudioChunk, ChatGeneration, ChunkStats, DiarizationConfig, DiarizationResult,
