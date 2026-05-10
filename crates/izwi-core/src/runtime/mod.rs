@@ -8,6 +8,7 @@ mod adapters;
 mod asr;
 pub(crate) mod audio_io;
 mod broker;
+mod capabilities;
 mod chat;
 mod conformance;
 mod diarization;
