@@ -1,5 +1,6 @@
 //! OpenAI-compatible audio resources.
 
+pub mod align;
 pub mod speech;
 pub mod transcriptions;
 
@@ -20,6 +21,10 @@ pub fn router() -> Router<AppState> {
             "/audio/transcriptions",
             post(transcriptions::transcriptions)
                 .layer(DefaultBodyLimit::max(audio_upload_limit_bytes)),
+        )
+        .route(
+            "/audio/align",
+            post(align::align).layer(DefaultBodyLimit::max(audio_upload_limit_bytes)),
         )
 }
 

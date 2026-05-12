@@ -346,6 +346,59 @@ curl -X POST http://localhost:8080/v1/audio/transcriptions \
   -F "response_format=verbose_json"
 ```
 
+### Audio Alignment
+
+`POST /v1/audio/align`
+
+Forced alignment accepts JSON or multipart input and aligns reference text to audio at word level.
+
+JSON request:
+
+```json
+{
+  "audio_base64": "<base64-audio>",
+  "text": "Hello world, this is a test.",
+  "model": "Qwen3-ForcedAligner-0.6B",
+  "language": "English",
+  "response_format": "json"
+}
+```
+
+Multipart fields:
+
+| Field | Notes |
+|-------|-------|
+| `file` or `audio` | Uploaded audio file. |
+| `audio_base64` | Base64 audio alternative. |
+| `text` or `reference_text` | Required reference text to align. |
+| `model` | Optional forced-aligner model variant. Defaults to `Qwen3-ForcedAligner-0.6B`. |
+| `language` | Optional language hint. |
+| `response_format` | `json`, `verbose_json`, or `text`. Default `json`. |
+
+`json` response:
+
+```json
+{
+  "alignments": [
+    { "word": "Hello", "start": 0.0, "end": 0.45 },
+    { "word": "world", "start": 0.5, "end": 0.95 }
+  ],
+  "duration": 0.95
+}
+```
+
+`verbose_json` adds `model`, `language`, `word_count`, and `processing_time_ms`.
+
+Example multipart request:
+
+```bash
+curl -X POST http://localhost:8080/v1/audio/align \
+  -F "file=@speech.wav" \
+  -F "text=Hello world" \
+  -F "model=Qwen3-ForcedAligner-0.6B" \
+  -F "response_format=verbose_json"
+```
+
 ### Responses
 
 `POST /v1/responses`

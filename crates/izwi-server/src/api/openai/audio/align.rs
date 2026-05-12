@@ -1,0 +1,333 @@
+//! Forced alignment audio endpoint.
+
+use axum::{
+    Json, RequestExt,
+    body::Body,
+    extract::{Multipart, Request, State},
+    http::{StatusCode, header},
+    response::Response,
+};
+use base64::Engine;
+use serde::Serialize;
+use std::time::Instant;
+use utoipa::ToSchema;
+
+use super::resolve_audio_upload_limit_bytes;
+use crate::error::ApiError;
+use crate::state::AppState;
+
+#[derive(Debug, Default)]
+struct AlignmentRequest {
+    audio_base64: Option<String>,
+    text: Option<String>,
+    model: Option<String>,
+    language: Option<String>,
+    response_format: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, ToSchema)]
+pub struct AlignmentJsonRequest {
+    pub audio_base64: String,
+    pub text: String,
+    pub model: Option<String>,
+    pub language: Option<String>,
+    pub response_format: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AlignmentMultipartRequest {
+    #[schema(value_type = String, format = Binary)]
+    pub file: Option<String>,
+    pub audio_base64: Option<String>,
+    pub text: String,
+    pub model: Option<String>,
+    pub language: Option<String>,
+    pub response_format: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AlignmentWord {
+    pub word: String,
+    pub start: f32,
+    pub end: f32,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AlignmentResponse {
+    pub alignments: Vec<AlignmentWord>,
+    pub duration: f32,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct VerboseAlignmentResponse {
+    pub alignments: Vec<AlignmentWord>,
+    pub duration: f32,
+    pub model: Option<String>,
+    pub language: Option<String>,
+    pub word_count: usize,
+    pub processing_time_ms: f64,
+}
+
+pub async fn align(
+    State(state): State<AppState>,
+    req: Request,
+) -> Result<Response<Body>, ApiError> {
+    let mut req = parse_alignment_request(req).await?;
+    let audio_base64 = req
+        .audio_base64
+        .take()
+        .ok_or_else(|| ApiError::bad_request("Missing audio input (`file` or `audio_base64`)"))?;
+    let text = req
+        .text
+        .take()
+        .ok_or_else(|| ApiError::bad_request("Missing reference text (`text`)"))?;
+    validate_alignment_text(text.as_str())?;
+
+    let response_format = req
+        .response_format
+        .as_deref()
+        .unwrap_or("json")
+        .to_ascii_lowercase();
+    if !matches!(response_format.as_str(), "json" | "verbose_json" | "text") {
+        return Err(ApiError::bad_request(format!(
+            "Unsupported response_format: {}. Supported: json, verbose_json, text",
+            response_format
+        )));
+    }
+
+    let _permit = state.acquire_permit().await;
+    let started = Instant::now();
+    let raw_alignments = state
+        .runtime
+        .force_align_with_model_and_language(
+            audio_base64.as_str(),
+            text.as_str(),
+            req.language.as_deref(),
+            req.model.as_deref(),
+        )
+        .await?;
+    let processing_time_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+    let alignments = alignment_words(raw_alignments);
+    let duration = alignment_duration(&alignments);
+
+    match response_format.as_str() {
+        "json" => json_response(&AlignmentResponse {
+            alignments,
+            duration,
+        }),
+        "verbose_json" => json_response(&VerboseAlignmentResponse {
+            word_count: alignments.len(),
+            alignments,
+            duration,
+            model: req.model,
+            language: req.language,
+            processing_time_ms,
+        }),
+        "text" => Ok(Response::builder()
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(Body::from(format_alignment_text(&alignments)))
+            .unwrap()),
+        _ => unreachable!("response format validated above"),
+    }
+}
+
+fn json_response<T: Serialize>(body: &T) -> Result<Response<Body>, ApiError> {
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_string(body).unwrap()))
+        .unwrap())
+}
+
+async fn parse_alignment_request(req: Request) -> Result<AlignmentRequest, ApiError> {
+    let content_type = req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if content_type.starts_with("application/json") {
+        let Json(payload) = req
+            .extract::<Json<AlignmentJsonRequest>, _>()
+            .await
+            .map_err(|e| ApiError::bad_request(format!("Invalid JSON payload: {e}")))?;
+
+        return Ok(AlignmentRequest {
+            audio_base64: Some(payload.audio_base64),
+            text: Some(payload.text),
+            model: payload.model,
+            language: payload.language,
+            response_format: payload.response_format,
+        });
+    }
+
+    if content_type.starts_with("multipart/form-data") {
+        let mut multipart = req
+            .extract::<Multipart, _>()
+            .await
+            .map_err(|e| ApiError::bad_request(format!("Invalid multipart payload: {e}")))?;
+        let mut out = AlignmentRequest::default();
+
+        while let Some(field) = multipart
+            .next_field()
+            .await
+            .map_err(|e| ApiError::bad_request(format!("Failed reading multipart field: {e}")))?
+        {
+            let name = field.name().unwrap_or_default().to_string();
+            match name.as_str() {
+                "file" | "audio" => {
+                    let bytes = field
+                        .bytes()
+                        .await
+                        .map_err(|e| multipart_field_error(&name, &e.to_string()))?;
+                    if !bytes.is_empty() {
+                        out.audio_base64 =
+                            Some(base64::engine::general_purpose::STANDARD.encode(&bytes));
+                    }
+                }
+                "audio_base64" => {
+                    let text = read_multipart_text(field, "audio_base64").await?;
+                    if !text.trim().is_empty() {
+                        out.audio_base64 = Some(text);
+                    }
+                }
+                "text" | "reference_text" => {
+                    let text = read_multipart_text(field, &name).await?;
+                    if !text.trim().is_empty() {
+                        out.text = Some(text.trim().to_string());
+                    }
+                }
+                "model" => {
+                    let text = read_multipart_text(field, "model").await?;
+                    if !text.trim().is_empty() {
+                        out.model = Some(text.trim().to_string());
+                    }
+                }
+                "language" => {
+                    let text = read_multipart_text(field, "language").await?;
+                    if !text.trim().is_empty() {
+                        out.language = Some(text.trim().to_string());
+                    }
+                }
+                "response_format" => {
+                    let text = read_multipart_text(field, "response_format").await?;
+                    if !text.trim().is_empty() {
+                        out.response_format = Some(text.trim().to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        return Ok(out);
+    }
+
+    Err(ApiError {
+        status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        message: "Expected `Content-Type: application/json` or `multipart/form-data`".to_string(),
+    })
+}
+
+async fn read_multipart_text(
+    field: axum::extract::multipart::Field<'_>,
+    name: &str,
+) -> Result<String, ApiError> {
+    field
+        .text()
+        .await
+        .map_err(|e| ApiError::bad_request(format!("Failed reading multipart '{name}' field: {e}")))
+}
+
+fn multipart_field_error(field_name: &str, raw: &str) -> ApiError {
+    let lowered = raw.to_ascii_lowercase();
+    if lowered.contains("multipart/form-data") {
+        let limit_mb = resolve_audio_upload_limit_bytes() / (1024 * 1024);
+        return ApiError::bad_request(format!(
+            "Failed reading multipart '{}' field: {}. \
+This is commonly caused by oversized uploads or malformed multipart boundaries. \
+Ensure `Content-Type` includes a valid boundary (let your HTTP client set it automatically for FormData) and keep payload under {} MiB.",
+            field_name, raw, limit_mb
+        ));
+    }
+
+    ApiError::bad_request(format!(
+        "Failed reading multipart '{}' field: {}",
+        field_name, raw
+    ))
+}
+
+fn validate_alignment_text(text: &str) -> Result<(), ApiError> {
+    if text.trim().is_empty() {
+        Err(ApiError::bad_request("Reference text cannot be empty"))
+    } else {
+        Ok(())
+    }
+}
+
+fn alignment_words(raw: Vec<(String, u32, u32)>) -> Vec<AlignmentWord> {
+    raw.into_iter()
+        .map(|(word, start_ms, end_ms)| AlignmentWord {
+            word,
+            start: millis_to_secs(start_ms),
+            end: millis_to_secs(end_ms),
+        })
+        .collect()
+}
+
+fn millis_to_secs(ms: u32) -> f32 {
+    (ms as f32) / 1000.0
+}
+
+fn alignment_duration(words: &[AlignmentWord]) -> f32 {
+    words.iter().map(|word| word.end).fold(0.0, f32::max)
+}
+
+fn format_alignment_text(words: &[AlignmentWord]) -> String {
+    let mut out = String::new();
+    for word in words {
+        out.push_str(&format!(
+            "{:<24} {:.2} - {:.2}\n",
+            word.word, word.start, word.end
+        ));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alignment_words_convert_millis_to_seconds() {
+        let words = alignment_words(vec![("hello".to_string(), 120, 980)]);
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].word, "hello");
+        assert!((words[0].start - 0.12).abs() < f32::EPSILON);
+        assert!((words[0].end - 0.98).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn formats_text_alignment_for_cli() {
+        let text = format_alignment_text(&[AlignmentWord {
+            word: "hello".to_string(),
+            start: 0.0,
+            end: 0.45,
+        }]);
+        assert!(text.contains("hello"));
+        assert!(text.contains("0.00 - 0.45"));
+    }
+
+    #[test]
+    fn rejects_blank_reference_text() {
+        let err = validate_alignment_text("  ").expect_err("blank text should be rejected");
+        assert!(err.message.contains("Reference text cannot be empty"));
+    }
+
+    #[test]
+    fn multipart_error_mentions_configured_limit() {
+        let expected_limit = resolve_audio_upload_limit_bytes() / (1024 * 1024);
+        let err = multipart_field_error("file", "multipart/form-data field parse failed");
+        assert!(err.message.contains(&format!("{expected_limit} MiB")));
+    }
+}

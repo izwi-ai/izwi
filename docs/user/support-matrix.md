@@ -59,6 +59,7 @@ and realtime route families. Detailed preview behavior is documented in the
 |---------|--------|-------|
 | **`POST /v1/audio/speech`** | Stable | Core OpenAI-compatible TTS surface. |
 | **`POST /v1/audio/transcriptions`** | Stable | Core OpenAI-compatible transcription surface. |
+| **`POST /v1/audio/align`** | Stable | Izwi extension for word-level forced alignment of reference text to audio. |
 | **`POST /v1/chat/completions`** | Stable | Core OpenAI-compatible chat surface. |
 | **`GET /v1/models`** | Stable | Live model catalog / availability surface. |
 | **Operational probes (`/livez`, `/readyz`, `/v1/live`, `/v1/ready`)** | Stable | Use `/livez` for cheap liveness and `/readyz` for readiness or deployment healthchecks. `/v1/health` remains the richer status payload. |

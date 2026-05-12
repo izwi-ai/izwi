@@ -1387,6 +1387,12 @@ mod tests {
                 StatusCode::NOT_FOUND,
             ),
             (
+                Method::POST,
+                "/v1/audio/align",
+                Some("{}"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
                 Method::GET,
                 "/v1/responses/missing-response/input_items",
                 None,
