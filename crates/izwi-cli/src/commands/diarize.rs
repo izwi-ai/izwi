@@ -1,8 +1,8 @@
-use crate::TranscriptFormat;
 use crate::error::{CliError, Result};
 use crate::http;
-use base64::Engine;
+use crate::TranscriptFormat;
 use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -50,7 +50,7 @@ struct DiarizationUtterance {
     word_end: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct DiarizationJobRecord {
     id: String,
     processing_status: String,
@@ -145,10 +145,7 @@ pub async fn execute(args: DiarizeArgs, server: &str) -> Result<()> {
 
     let client = http::client(Some(std::time::Duration::from_secs(600)))?;
     let response = client
-        .post(format!(
-            "{}/v1/speech-to-text/jobs?job_kind=diarization",
-            server
-        ))
+        .post(create_diarization_job_url(server))
         .json(&request_body)
         .send()
         .await
@@ -186,7 +183,24 @@ pub async fn execute(args: DiarizeArgs, server: &str) -> Result<()> {
 async fn wait_for_diarization_job(
     client: &reqwest::Client,
     server: &str,
+    record: DiarizationJobRecord,
+) -> Result<DiarizationJobRecord> {
+    wait_for_diarization_job_with_polling(
+        client,
+        server,
+        record,
+        Duration::from_secs(DIARIZATION_POLL_TIMEOUT_SECS),
+        Duration::from_millis(DIARIZATION_POLL_INTERVAL_MS),
+    )
+    .await
+}
+
+async fn wait_for_diarization_job_with_polling(
+    client: &reqwest::Client,
+    server: &str,
     mut record: DiarizationJobRecord,
+    timeout: Duration,
+    poll_interval: Duration,
 ) -> Result<DiarizationJobRecord> {
     let started = Instant::now();
     loop {
@@ -208,19 +222,16 @@ async fn wait_for_diarization_job(
             }
         }
 
-        if started.elapsed() >= Duration::from_secs(DIARIZATION_POLL_TIMEOUT_SECS) {
+        if started.elapsed() >= timeout {
             return Err(CliError::Other(format!(
                 "Timed out waiting for diarization job {}",
                 record.id
             )));
         }
 
-        tokio::time::sleep(Duration::from_millis(DIARIZATION_POLL_INTERVAL_MS)).await;
+        tokio::time::sleep(poll_interval).await;
         let response = client
-            .get(format!(
-                "{}/v1/speech-to-text/jobs/{}?job_kind=diarization",
-                server, record.id
-            ))
+            .get(diarization_job_url(server, &record.id))
             .send()
             .await
             .map_err(|e| CliError::ConnectionError(e.to_string()))?;
@@ -239,6 +250,21 @@ async fn wait_for_diarization_job(
             .await
             .map_err(|e| CliError::Other(e.to_string()))?;
     }
+}
+
+fn create_diarization_job_url(server: &str) -> String {
+    format!(
+        "{}/v1/speech-to-text/jobs?job_kind=diarization",
+        server.trim_end_matches('/')
+    )
+}
+
+fn diarization_job_url(server: &str, record_id: &str) -> String {
+    format!(
+        "{}/v1/speech-to-text/jobs/{}?job_kind=diarization",
+        server.trim_end_matches('/'),
+        record_id
+    )
 }
 
 fn format_diarization_output(
@@ -285,4 +311,270 @@ fn format_diarization_text(record: &DiarizationJobRecord) -> String {
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[derive(Debug)]
+    struct CapturedRequest {
+        request_line: String,
+        body: String,
+    }
+
+    #[tokio::test]
+    async fn execute_posts_to_canonical_job_route_and_polls_until_ready() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let audio_path = temp_dir.path().join("sample.wav");
+        let output_path = temp_dir.path().join("diarization.json");
+        tokio::fs::write(&audio_path, b"fake wav")
+            .await
+            .expect("write audio");
+
+        let (server, server_task) = spawn_flow_server(vec![
+            http_json_response("202 Accepted", &sample_record("job-1", "pending")),
+            http_json_response("200 OK", &ready_record("job-1")),
+        ])
+        .await;
+
+        execute(
+            DiarizeArgs {
+                file: audio_path,
+                model: "nvidia/sortformer".to_string(),
+                num_speakers: Some(2),
+                format: TranscriptFormat::Json,
+                output: Some(output_path.clone()),
+                transcribe: false,
+                asr_model: "distil-whisper".to_string(),
+            },
+            &format!("{server}/"),
+        )
+        .await
+        .expect("diarization command should complete");
+
+        let requests = server_task.await.expect("server task");
+        assert_eq!(
+            requests[0].request_line,
+            "POST /v1/speech-to-text/jobs?job_kind=diarization HTTP/1.1"
+        );
+        let request_json: Value =
+            serde_json::from_str(&requests[0].body).expect("valid request json");
+        assert_eq!(request_json["model"], "nvidia/sortformer");
+        assert_eq!(request_json["asr_model"], "distil-whisper");
+        assert_eq!(request_json["min_speakers"], 2);
+        assert_eq!(request_json["max_speakers"], 2);
+        assert_eq!(
+            request_json["audio_base64"],
+            Value::String(STANDARD.encode(b"fake wav"))
+        );
+        assert_eq!(
+            requests[1].request_line,
+            "GET /v1/speech-to-text/jobs/job-1?job_kind=diarization HTTP/1.1"
+        );
+
+        let output = tokio::fs::read_to_string(output_path)
+            .await
+            .expect("read output");
+        let output_json: Value = serde_json::from_str(&output).expect("valid output json");
+        assert_eq!(output_json["transcript"], "Speaker one text");
+        assert_eq!(output_json["segments"][0]["speaker"], "SPEAKER_00");
+    }
+
+    #[tokio::test]
+    async fn wait_for_diarization_job_maps_failed_records_to_api_error() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client");
+        let err = wait_for_diarization_job(
+            &client,
+            "http://127.0.0.1:1",
+            failed_record("job-2", "model failed"),
+        )
+        .await
+        .expect_err("failed records should return api error");
+
+        match err {
+            CliError::ApiError { status, message } => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "model failed");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_diarization_job_times_out_pending_records() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client");
+        let err = wait_for_diarization_job_with_polling(
+            &client,
+            "http://127.0.0.1:1",
+            sample_record("job-timeout", "pending"),
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .await
+        .expect_err("pending records should time out");
+
+        assert!(
+            matches!(err, CliError::Other(message) if message == "Timed out waiting for diarization job job-timeout")
+        );
+    }
+
+    #[test]
+    fn diarization_job_urls_trim_trailing_server_slash() {
+        assert_eq!(
+            create_diarization_job_url("http://localhost:8080/"),
+            "http://localhost:8080/v1/speech-to-text/jobs?job_kind=diarization"
+        );
+        assert_eq!(
+            diarization_job_url("http://localhost:8080/", "abc"),
+            "http://localhost:8080/v1/speech-to-text/jobs/abc?job_kind=diarization"
+        );
+    }
+
+    async fn spawn_flow_server(
+        responses: Vec<String>,
+    ) -> (String, tokio::task::JoinHandle<Vec<CapturedRequest>>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("server addr");
+        let handle = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.expect("accept request");
+                requests.push(read_request(&mut stream).await);
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+            requests
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    async fn read_request(stream: &mut TcpStream) -> CapturedRequest {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+
+        let header_end = loop {
+            let read = stream.read(&mut buffer).await.expect("read request");
+            assert!(read > 0, "connection closed before headers");
+            bytes.extend_from_slice(&buffer[..read]);
+            if let Some(index) = find_header_end(&bytes) {
+                break index;
+            }
+        };
+
+        let headers = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("content-length: ")
+                    .or_else(|| line.strip_prefix("Content-Length: "))
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        let body_start = header_end + 4;
+        let total_len = body_start + content_length;
+        while bytes.len() < total_len {
+            let read = stream.read(&mut buffer).await.expect("read body");
+            assert!(read > 0, "connection closed before body");
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+
+        CapturedRequest {
+            request_line: headers.lines().next().unwrap_or_default().to_string(),
+            body: String::from_utf8_lossy(&bytes[body_start..total_len]).to_string(),
+        }
+    }
+
+    fn find_header_end(bytes: &[u8]) -> Option<usize> {
+        bytes.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    fn http_json_response(status: &str, record: &DiarizationJobRecord) -> String {
+        let body = serde_json::to_string(record).expect("serialize record");
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn sample_record(id: &str, status: &str) -> DiarizationJobRecord {
+        DiarizationJobRecord {
+            id: id.to_string(),
+            processing_status: status.to_string(),
+            processing_error: None,
+            segments: Vec::new(),
+            words: Vec::new(),
+            utterances: Vec::new(),
+            asr_text: String::new(),
+            raw_transcript: String::new(),
+            transcript: String::new(),
+            llm_refined: false,
+            alignment_coverage: None,
+            unattributed_words: 0,
+            speaker_count: 0,
+            duration_secs: None,
+            processing_time_ms: 0.0,
+            rtf: None,
+        }
+    }
+
+    fn ready_record(id: &str) -> DiarizationJobRecord {
+        DiarizationJobRecord {
+            processing_status: "ready".to_string(),
+            segments: vec![DiarizationSegment {
+                speaker: "SPEAKER_00".to_string(),
+                start: 0.0,
+                end: 1.25,
+                confidence: Some(0.95),
+            }],
+            words: vec![DiarizationWord {
+                word: "Speaker".to_string(),
+                speaker: "SPEAKER_00".to_string(),
+                start: 0.0,
+                end: 0.4,
+                speaker_confidence: Some(0.93),
+                overlaps_segment: true,
+            }],
+            utterances: vec![DiarizationUtterance {
+                speaker: "SPEAKER_00".to_string(),
+                start: 0.0,
+                end: 1.25,
+                text: "Speaker one text".to_string(),
+                word_start: 0,
+                word_end: 3,
+            }],
+            transcript: "Speaker one text".to_string(),
+            asr_text: "Speaker one text".to_string(),
+            raw_transcript: "speaker one text".to_string(),
+            llm_refined: true,
+            alignment_coverage: Some(1.0),
+            unattributed_words: 0,
+            speaker_count: 1,
+            duration_secs: Some(1.25),
+            processing_time_ms: 12.5,
+            rtf: Some(0.1),
+            ..sample_record(id, "ready")
+        }
+    }
+
+    fn failed_record(id: &str, message: &str) -> DiarizationJobRecord {
+        DiarizationJobRecord {
+            processing_status: "failed".to_string(),
+            processing_error: Some(message.to_string()),
+            ..sample_record(id, "failed")
+        }
+    }
 }
