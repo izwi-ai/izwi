@@ -498,12 +498,12 @@ These routes back the desktop UI's saved history and reusable assets. Canonical 
 
 | Method | Path | Description |
 |---|---|---|
-| `GET, POST` | `/v1/transcriptions/jobs` | Canonical list/create for saved transcription + diarization jobs |
-| `GET, PATCH, PUT, DELETE` | `/v1/transcriptions/jobs/:id` | Canonical fetch/update/delete for saved transcription + diarization jobs |
-| `GET` | `/v1/transcriptions/jobs/:id/audio` | Canonical stored source-audio fetch for speech-text jobs |
-| `POST` | `/v1/transcriptions/jobs/:id/reruns` | Canonical diarization rerun trigger for saved jobs |
-| `POST` | `/v1/transcriptions/jobs/:id/cancel` | Canonical diarization cancel trigger for in-flight jobs |
-| `POST` | `/v1/transcriptions/jobs/:id/summary/regenerate` | Canonical summary regeneration for both job kinds |
+| `GET, POST` | `/v1/speech-to-text/jobs` | Canonical list/create for saved transcription + diarization jobs |
+| `GET, PATCH, PUT, DELETE` | `/v1/speech-to-text/jobs/:id` | Canonical fetch/update/delete for saved transcription + diarization jobs |
+| `GET` | `/v1/speech-to-text/jobs/:id/audio` | Canonical stored source-audio fetch for speech-text jobs |
+| `POST` | `/v1/speech-to-text/jobs/:id/reruns` | Canonical diarization rerun trigger for saved jobs |
+| `POST` | `/v1/speech-to-text/jobs/:id/cancel` | Canonical diarization cancel trigger for in-flight jobs |
+| `POST` | `/v1/speech-to-text/jobs/:id/summary/regenerate` | Canonical summary regeneration for both job kinds |
 | `GET, POST` | `/v1/diarizations` | List or create saved diarization records |
 | `GET, PATCH, PUT, DELETE` | `/v1/diarizations/:id` | Fetch, update, or delete a saved diarization record |
 | `GET` | `/v1/diarizations/:id/audio` | Fetch stored diarization source audio |

@@ -86,12 +86,12 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
-      "http://localhost/v1/transcriptions/jobs/diar-1?job_kind=diarization",
+      "http://localhost/v1/speech-to-text/jobs/diar-1?job_kind=diarization",
       expect.objectContaining({ method: "PATCH" }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
-      "http://localhost/v1/transcriptions/jobs/diar-1?job_kind=diarization",
+      "http://localhost/v1/speech-to-text/jobs/diar-1?job_kind=diarization",
       expect.objectContaining({ method: "PUT" }),
     );
   });
@@ -113,7 +113,7 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
 
     expect(result).toEqual([]);
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://localhost/v1/transcriptions/jobs?job_kind=transcription",
+      "http://localhost/v1/speech-to-text/jobs?job_kind=transcription",
       expect.objectContaining({
         headers: expect.objectContaining({
           "Content-Type": "application/json",
@@ -164,7 +164,7 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://localhost/v1/transcriptions/jobs?job_kind=transcription",
+      "http://localhost/v1/speech-to-text/jobs?job_kind=transcription",
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({
@@ -214,7 +214,7 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     await client.regenerateTranscriptionSummary("txr-1");
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://localhost/v1/transcriptions/jobs/txr-1/summary/regenerate?job_kind=transcription",
+      "http://localhost/v1/speech-to-text/jobs/txr-1/summary/regenerate?job_kind=transcription",
       expect.objectContaining({
         method: "POST",
       }),
@@ -303,7 +303,7 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
 
     expect(result).toEqual(updatedRecord);
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://localhost/v1/transcriptions/jobs/diar-1/reruns?job_kind=diarization",
+      "http://localhost/v1/speech-to-text/jobs/diar-1/reruns?job_kind=diarization",
       expect.objectContaining({ method: "POST" }),
     );
   });
@@ -325,7 +325,7 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
 
     expect(result).toEqual(updatedRecord);
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://localhost/v1/transcriptions/jobs/diar-1/cancel?job_kind=diarization",
+      "http://localhost/v1/speech-to-text/jobs/diar-1/cancel?job_kind=diarization",
       expect.objectContaining({ method: "POST" }),
     );
   });
@@ -347,7 +347,7 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
 
     expect(result).toEqual(updatedRecord);
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://localhost/v1/transcriptions/jobs/diar-1/summary/regenerate?job_kind=diarization",
+      "http://localhost/v1/speech-to-text/jobs/diar-1/summary/regenerate?job_kind=diarization",
       expect.objectContaining({ method: "POST" }),
     );
   });
@@ -373,7 +373,7 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
 
     expect(page.items).toEqual([]);
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://localhost/v1/transcriptions/jobs?limit=10&cursor=cursor-1&job_kind=diarization",
+      "http://localhost/v1/speech-to-text/jobs?limit=10&cursor=cursor-1&job_kind=diarization",
       expect.objectContaining({
         headers: expect.objectContaining({
           "Content-Type": "application/json",
@@ -407,7 +407,7 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://localhost/v1/transcriptions/jobs?job_kind=diarization",
+      "http://localhost/v1/speech-to-text/jobs?job_kind=diarization",
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({
@@ -430,7 +430,7 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
 
     expect(client.speechTextJobAudioUrl("diar-1", { job_kind: "diarization" })).toBe(
-      "http://localhost/v1/transcriptions/jobs/diar-1/audio?job_kind=diarization",
+      "http://localhost/v1/speech-to-text/jobs/diar-1/audio?job_kind=diarization",
     );
   });
 
