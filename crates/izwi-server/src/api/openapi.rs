@@ -1464,7 +1464,13 @@ fn create_transcription() {}
     path = "/v1/audio/align",
     tag = "OpenAI Compatible",
     summary = "Create forced alignment",
-    request_body = AlignmentJsonRequest,
+    request_body(
+        description = "Forced alignment input. Send application/json with audio_base64, or multipart/form-data with an audio file and text.",
+        content(
+            (AlignmentJsonRequest = "application/json"),
+            (AlignmentMultipartRequest = "multipart/form-data")
+        )
+    ),
     responses(
         (status = 200, description = "Word-level alignment as JSON, verbose JSON, or text", body = AlignmentResponse),
         (status = 400, description = "Invalid request", body = ApiErrorEnvelope),
@@ -1960,6 +1966,23 @@ mod tests {
                 "{path} should be tagged OpenAI Compatible"
             );
         }
+    }
+
+    #[test]
+    fn openapi_documents_alignment_json_and_multipart_request_bodies() {
+        let openapi = document();
+        let content = openapi["paths"]["/v1/audio/align"]["post"]["requestBody"]["content"]
+            .as_object()
+            .expect("alignment request body content should exist");
+
+        assert_eq!(
+            content["application/json"]["schema"]["$ref"].as_str(),
+            Some("#/components/schemas/AlignmentJsonRequest")
+        );
+        assert_eq!(
+            content["multipart/form-data"]["schema"]["$ref"].as_str(),
+            Some("#/components/schemas/AlignmentMultipartRequest")
+        );
     }
 
     #[test]
