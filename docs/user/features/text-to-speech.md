@@ -9,7 +9,7 @@ Generate natural, human-like speech from text using state-of-the-art TTS models.
 Izwi's text-to-speech converts written text into spoken audio. Features include:
 
 - **Natural voices** — High-quality, expressive speech
-- **Multiple formats** — WAV, MP3, OGG, FLAC, AAC
+- **Local audio output** — WAV for files and raw PCM for low-level API clients
 - **Speed control** — Adjust playback speed
 - **Streaming** — Real-time audio generation
 - **Local processing** — No cloud, complete privacy
@@ -72,11 +72,10 @@ izwi tts "Your text here" --output output.wav
 
 ### Examples
 
-**Different formats:**
+**WAV output:**
 
 ```bash
-izwi tts "Hello world" --format mp3 --output hello.mp3
-izwi tts "Hello world" --format ogg --output hello.ogg
+izwi tts "Hello world" --format wav --output hello.wav
 ```
 
 **Adjust speed:**
@@ -183,10 +182,7 @@ For prompt-based voice design, use **VoiceDesign** variants.
 |--------|-----------|-------|
 | WAV | `.wav` | Uncompressed, highest quality |
 | PCM | `.pcm` | Raw PCM for low-level playback pipelines |
-| MP3 | `.mp3` | Accepted for OpenAI compatibility; currently falls back to WAV bytes |
-| OPUS | `.opus` | Accepted for OpenAI compatibility; currently falls back to WAV bytes |
-| FLAC | `.flac` | Accepted for OpenAI compatibility; currently falls back to WAV bytes |
-| AAC | `.aac` | Accepted for OpenAI compatibility; currently falls back to WAV bytes |
+| MP3, OPUS, OGG, FLAC, AAC | Matching extension | Recognized request names. The OSS server does not bundle compressed encoders yet, so API clients must set `allow_format_fallback: true` if they intentionally want WAV bytes returned for these names. |
 
 ---
 

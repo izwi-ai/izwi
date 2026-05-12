@@ -1716,6 +1716,7 @@ pub struct SpeechRequest {
     pub input: String,
     pub voice: Option<String>,
     pub response_format: Option<String>,
+    pub allow_format_fallback: Option<bool>,
     pub speed: Option<f32>,
     pub language: Option<String>,
     pub temperature: Option<f32>,
