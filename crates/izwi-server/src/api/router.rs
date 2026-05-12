@@ -1215,6 +1215,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_models_expose_voice_app_capabilities() {
+        let (app, temp_dir) = test_api_app("admin_models_expose_voice_app_capabilities", false);
+
+        let response =
+            send_request(app, build_request(Method::GET, "/v1/admin/models", None)).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        let models = body["models"]
+            .as_array()
+            .expect("models should be an array");
+        let find_model = |variant: &str| {
+            models
+                .iter()
+                .find(|model| model["variant"].as_str() == Some(variant))
+                .unwrap_or_else(|| panic!("{variant} should be listed"))
+        };
+
+        let tts_model = find_model("Kokoro-82M");
+        assert_eq!(
+            tts_model["route_capabilities"]["openai_audio_speech"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            tts_model["route_capabilities"]["voice_realtime_modular_tts"].as_bool(),
+            Some(true)
+        );
+        assert!(
+            tts_model["modalities"]
+                .as_array()
+                .expect("modalities should be an array")
+                .iter()
+                .any(|modality| modality.as_str() == Some("audio_output"))
+        );
+
+        let aligner_model = find_model("Qwen3-ForcedAligner-0.6B");
+        assert_eq!(
+            aligner_model["route_capabilities"]["forced_alignment"].as_bool(),
+            Some(true)
+        );
+        assert!(
+            aligner_model["modalities"]
+                .as_array()
+                .expect("modalities should be an array")
+                .iter()
+                .any(|modality| modality.as_str() == Some("timestamps"))
+        );
+
+        let diarization_model = find_model("diar_streaming_sortformer_4spk-v2.1");
+        assert_eq!(
+            diarization_model["route_capabilities"]["diarization_records"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            diarization_model["route_capabilities"]["speech_to_text_jobs"].as_bool(),
+            Some(true)
+        );
+
+        drop(temp_dir);
+    }
+
+    #[tokio::test]
     async fn openapi_json_route_returns_valid_scaffold() {
         let (app, temp_dir) = test_api_app("openapi_json_route_returns_valid_scaffold", false);
 

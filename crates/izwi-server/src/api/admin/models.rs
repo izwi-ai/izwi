@@ -1,9 +1,9 @@
 //! Model management API endpoints
 
 use axum::{
+    Json,
     extract::{Path, State},
     response::Sse,
-    Json,
 };
 use futures::stream::Stream;
 use serde::Serialize;
@@ -11,20 +11,224 @@ use std::convert::Infallible;
 use std::pin::Pin;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{info, warn};
+use utoipa::ToSchema;
 
 use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::model::download::DownloadState;
-use izwi_core::{parse_model_variant, ModelInfo, ModelVariant};
+use izwi_core::{
+    ModelInfo, ModelStatus, ModelVariant, SpeechModelCapabilities, parse_model_variant,
+};
 
 /// Response for model list
-#[derive(Serialize)]
-pub struct ModelsResponse {
-    pub models: Vec<ModelInfo>,
+#[derive(Serialize, ToSchema)]
+pub struct AdminModelsResponse {
+    pub models: Vec<AdminModelInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AdminModelInfo {
+    pub variant: String,
+    pub enabled: bool,
+    pub status: String,
+    pub local_path: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub download_progress: Option<f32>,
+    pub error_message: Option<String>,
+    pub modalities: Vec<String>,
+    pub route_capabilities: AdminModelRouteCapabilities,
+    pub speech_capabilities: Option<AdminSpeechModelCapabilities>,
+    pub cuda_support: serde_json::Value,
+    pub cuda_quantization: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AdminSpeechModelCapabilities {
+    pub supports_builtin_voices: bool,
+    pub built_in_voice_count: Option<usize>,
+    pub supports_reference_voice: bool,
+    pub supports_voice_description: bool,
+    pub supports_streaming: bool,
+    pub supports_speed_control: bool,
+    pub supports_auto_long_form: bool,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AdminModelRouteCapabilities {
+    pub openai_chat_completions: bool,
+    pub openai_responses: bool,
+    pub openai_audio_speech: bool,
+    pub openai_audio_transcriptions: bool,
+    pub speech_to_text_jobs: bool,
+    pub speech_to_text_realtime: bool,
+    pub diarization_records: bool,
+    pub text_to_speech_records: bool,
+    pub voice_design_records: bool,
+    pub voice_clone_records: bool,
+    pub saved_voice_reuse: bool,
+    pub studio_projects: bool,
+    pub voice_realtime_text_model: bool,
+    pub voice_realtime_modular_asr: bool,
+    pub voice_realtime_modular_tts: bool,
+    pub voice_realtime_unified: bool,
+    pub forced_alignment: bool,
+    pub tokenizer: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct AdminModelActionResponse {
+    pub status: &'static str,
+    pub message: String,
+}
+
+#[derive(Serialize, Clone, ToSchema)]
+pub struct AdminModelDownloadProgressEvent {
+    pub variant: String,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub current_file: String,
+    pub current_file_downloaded: u64,
+    pub current_file_total: u64,
+    pub files_completed: usize,
+    pub files_total: usize,
+    pub percent: f32,
+    pub status: String,
+}
+
+impl From<ModelInfo> for AdminModelInfo {
+    fn from(info: ModelInfo) -> Self {
+        let variant = info.variant;
+        Self {
+            variant: variant.dir_name().to_string(),
+            enabled: info.enabled,
+            status: model_status_as_str(info.status).to_string(),
+            local_path: info
+                .local_path
+                .map(|path| path.to_string_lossy().into_owned()),
+            size_bytes: info.size_bytes,
+            download_progress: info.download_progress,
+            error_message: info.error_message,
+            modalities: model_modalities(variant),
+            route_capabilities: AdminModelRouteCapabilities::from_variant(variant),
+            speech_capabilities: info
+                .speech_capabilities
+                .map(AdminSpeechModelCapabilities::from),
+            cuda_support: serde_json::to_value(info.cuda_support)
+                .unwrap_or(serde_json::Value::Null),
+            cuda_quantization: serde_json::to_value(info.cuda_quantization)
+                .unwrap_or(serde_json::Value::Null),
+        }
+    }
+}
+
+impl From<SpeechModelCapabilities> for AdminSpeechModelCapabilities {
+    fn from(capabilities: SpeechModelCapabilities) -> Self {
+        Self {
+            supports_builtin_voices: capabilities.supports_builtin_voices,
+            built_in_voice_count: capabilities.built_in_voice_count,
+            supports_reference_voice: capabilities.supports_reference_voice,
+            supports_voice_description: capabilities.supports_voice_description,
+            supports_streaming: capabilities.supports_streaming,
+            supports_speed_control: capabilities.supports_speed_control,
+            supports_auto_long_form: capabilities.supports_auto_long_form,
+        }
+    }
+}
+
+impl AdminModelRouteCapabilities {
+    fn from_variant(variant: ModelVariant) -> Self {
+        let speech_capabilities = variant.speech_capabilities();
+        let supports_tts = speech_capabilities.is_some();
+        let supports_reference_voice = speech_capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.supports_reference_voice);
+        let supports_voice_description = speech_capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.supports_voice_description);
+
+        Self {
+            openai_chat_completions: variant.is_chat(),
+            openai_responses: variant.is_chat(),
+            openai_audio_speech: supports_tts,
+            openai_audio_transcriptions: variant.is_asr()
+                || variant.is_voxtral()
+                || variant.is_audio_chat(),
+            speech_to_text_jobs: variant.is_asr() || variant.is_diarization(),
+            speech_to_text_realtime: variant.is_asr()
+                || variant.is_voxtral()
+                || variant.is_audio_chat(),
+            diarization_records: variant.is_diarization(),
+            text_to_speech_records: supports_tts,
+            voice_design_records: supports_voice_description,
+            voice_clone_records: supports_reference_voice,
+            saved_voice_reuse: supports_reference_voice,
+            studio_projects: supports_tts,
+            voice_realtime_text_model: variant.is_chat(),
+            voice_realtime_modular_asr: variant.is_asr() || variant.is_voxtral(),
+            voice_realtime_modular_tts: supports_tts,
+            voice_realtime_unified: variant.is_audio_chat(),
+            forced_alignment: variant.is_forced_aligner(),
+            tokenizer: variant.is_tokenizer(),
+        }
+    }
+}
+
+fn model_status_as_str(status: ModelStatus) -> &'static str {
+    match status {
+        ModelStatus::NotDownloaded => "not_downloaded",
+        ModelStatus::Downloading => "downloading",
+        ModelStatus::Downloaded => "downloaded",
+        ModelStatus::Loading => "loading",
+        ModelStatus::Ready => "ready",
+        ModelStatus::Error => "error",
+    }
+}
+
+fn model_modalities(variant: ModelVariant) -> Vec<String> {
+    let mut modalities = Vec::new();
+    let mut push = |modality: &'static str| {
+        if !modalities.iter().any(|existing| existing == modality) {
+            modalities.push(modality.to_string());
+        }
+    };
+
+    if variant.is_chat() {
+        push("text_input");
+        push("text_output");
+    }
+    if variant.speech_capabilities().is_some() {
+        push("text_input");
+        push("audio_output");
+    }
+    if variant.is_asr() || variant.is_voxtral() || variant.is_audio_chat() {
+        push("audio_input");
+        push("text_output");
+    }
+    if variant.is_audio_chat() {
+        push("text_input");
+        push("audio_output");
+    }
+    if variant.is_diarization() {
+        push("audio_input");
+        push("speaker_labels");
+        push("timestamps");
+    }
+    if variant.is_forced_aligner() {
+        push("audio_input");
+        push("text_input");
+        push("timestamps");
+    }
+    if variant.is_tokenizer() {
+        push("audio_tokens");
+    }
+
+    modalities
 }
 
 /// List all available models
-pub async fn list_models(State(state): State<AppState>) -> Result<Json<ModelsResponse>, ApiError> {
+pub async fn list_models(
+    State(state): State<AppState>,
+) -> Result<Json<AdminModelsResponse>, ApiError> {
     let mut models: Vec<ModelInfo> = state
         .runtime
         .list_models()
@@ -33,14 +237,16 @@ pub async fn list_models(State(state): State<AppState>) -> Result<Json<ModelsRes
         .filter(|model| model.enabled)
         .collect();
     models.sort_by_key(model_sort_key);
-    Ok(Json(ModelsResponse { models }))
+    Ok(Json(AdminModelsResponse {
+        models: models.into_iter().map(AdminModelInfo::from).collect(),
+    }))
 }
 
 /// Get info for a specific model
 pub async fn get_model_info(
     State(state): State<AppState>,
     Path(variant): Path<String>,
-) -> Result<Json<ModelInfo>, ApiError> {
+) -> Result<Json<AdminModelInfo>, ApiError> {
     let variant = parse_variant(&variant)?;
     if !variant.is_enabled() {
         return Err(ApiError::not_found("Model not found"));
@@ -53,30 +259,14 @@ pub async fn get_model_info(
         .await
         .ok_or_else(|| ApiError::not_found("Model not found"))?;
 
-    Ok(Json(info))
+    Ok(Json(AdminModelInfo::from(info)))
 }
 
 /// SSE progress event
-#[derive(Serialize, Clone)]
-struct ProgressEvent {
-    variant: String,
-    downloaded_bytes: u64,
-    total_bytes: u64,
-    current_file: String,
-    current_file_downloaded: u64,
-    current_file_total: u64,
-    files_completed: usize,
-    files_total: usize,
-    percent: f32,
-    status: String, // "downloading", "completed", "error"
-}
+type ProgressEvent = AdminModelDownloadProgressEvent;
 
 /// Download progress response
-#[derive(Serialize)]
-pub struct DownloadResponse {
-    pub status: &'static str,
-    pub message: String,
-}
+pub type DownloadResponse = AdminModelActionResponse;
 
 /// Download a model from HuggingFace (non-blocking)
 pub async fn download_model(
