@@ -135,11 +135,16 @@ pub async fn speech(
 
     let variant = parse_tts_model_variant(&req.model)
         .map_err(|err| ApiError::bad_request(format!("Unsupported TTS model: {}", err)))?;
+    let streaming = resolve_streaming_mode(&req)?;
+    let resolved_format = parse_response_format(
+        req.response_format.as_deref().unwrap_or("wav"),
+        req.allow_format_fallback.unwrap_or(false),
+    )?;
+
     state.runtime.load_model(variant).await?;
 
-    let streaming = resolve_streaming_mode(&req)?;
     if streaming {
-        return stream_speech(state, req, ctx.correlation_id, variant).await;
+        return stream_speech(state, req, ctx.correlation_id, variant, resolved_format).await;
     }
 
     let _permit = state.acquire_permit().await;
@@ -149,10 +154,6 @@ pub async fn speech(
         variant,
         &req,
     ));
-    let resolved_format = parse_response_format(
-        req.response_format.as_deref().unwrap_or("wav"),
-        req.allow_format_fallback.unwrap_or(false),
-    )?;
     let format = resolved_format.format;
     let actual_format = resolved_format.label;
     let format_fallback = resolved_format.fallback;
@@ -302,11 +303,8 @@ async fn stream_speech(
     req: SpeechRequest,
     correlation_id: String,
     variant: ModelVariant,
+    resolved_format: ResolvedSpeechFormat,
 ) -> Result<Response<Body>, ApiError> {
-    let resolved_format = parse_response_format(
-        req.response_format.as_deref().unwrap_or("wav"),
-        req.allow_format_fallback.unwrap_or(false),
-    )?;
     let format = resolved_format.format;
     let format_fallback = resolved_format.fallback;
     let gen_request = build_generation_request(&req, correlation_id, true, variant);
