@@ -800,7 +800,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
 
     add_operation(
         paths,
-        "/v1/transcription/realtime/ws",
+        "/v1/speech-to-text/realtime/ws",
         "get",
         "Realtime",
         "Open transcription realtime WebSocket",
@@ -1810,6 +1810,7 @@ mod tests {
             "/v1/voice-design-generations",
             "/v1/voice-clone-generations",
             "/v1/transcriptions/jobs",
+            "/v1/transcription/realtime/ws",
         ] {
             assert!(
                 !paths.contains_key(removed_path),

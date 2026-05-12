@@ -13,7 +13,7 @@ describe("transcription playground support", () => {
   it("builds the realtime websocket endpoint from an api base url", () => {
     expect(
       buildTranscriptionRealtimeWebSocketUrl("https://api.example.com/v1"),
-    ).toBe("wss://api.example.com/v1/transcription/realtime/ws");
+    ).toBe("wss://api.example.com/v1/speech-to-text/realtime/ws");
   });
 
   it("encodes realtime pcm16 frames with the expected header", () => {

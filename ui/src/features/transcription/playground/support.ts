@@ -93,7 +93,7 @@ export function buildTranscriptionRealtimeWebSocketUrl(
 ): string {
   const base = new URL(apiBaseUrl, window.location.origin);
   base.protocol = base.protocol === "https:" ? "wss:" : "ws:";
-  base.pathname = `${base.pathname.replace(/\/$/, "")}/transcription/realtime/ws`;
+  base.pathname = `${base.pathname.replace(/\/$/, "")}/speech-to-text/realtime/ws`;
   base.search = "";
   base.hash = "";
   return base.toString();
