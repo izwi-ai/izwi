@@ -46,6 +46,7 @@ Converts text to speech using a TTS model. The OSS server emits WAV audio for th
 | `-r, --speed <SPEED>` | Speech speed (0.5-2.0) | `1.0` |
 | `-t, --temperature <TEMP>` | Sampling temperature | `0.7` |
 | `--stream` | Stream output in real-time | — |
+| `--allow-format-fallback` | Allow WAV output when a requested compressed format is unavailable | — |
 | `-p, --play` | Play audio after generation | — |
 
 ---
@@ -121,7 +122,7 @@ izwi tts "Long text for streaming" --stream --play
 | Format | Extension | Notes |
 |--------|-----------|-------|
 | `wav` | `.wav` | Native OSS output format. |
-| `mp3`, `ogg`, `flac`, `aac` | Matching extension | Recognized by the CLI enum, but the OSS server does not bundle compressed encoders yet. Use the API `allow_format_fallback` field when you intentionally want WAV bytes for a compressed request. |
+| `mp3`, `ogg`, `flac`, `aac` | Matching extension when supported | Recognized by the CLI enum, but the OSS server does not bundle compressed encoders yet. Add `--allow-format-fallback` when you intentionally want the CLI to accept WAV bytes for a compressed request; default filenames then use the actual returned extension. |
 
 ---
 

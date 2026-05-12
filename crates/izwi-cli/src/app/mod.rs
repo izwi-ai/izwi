@@ -75,6 +75,7 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
             speed,
             temperature,
             stream,
+            allow_format_fallback,
             play,
         } => {
             commands::tts::execute(
@@ -87,6 +88,7 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
                     speed,
                     temperature,
                     stream,
+                    allow_format_fallback,
                     play,
                 },
                 &server,

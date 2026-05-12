@@ -229,6 +229,10 @@ pub enum Commands {
         #[arg(long)]
         stream: bool,
 
+        /// Allow the server to return WAV audio when the requested compressed format is unavailable
+        #[arg(long)]
+        allow_format_fallback: bool,
+
         /// Play audio immediately after generation
         #[arg(short, long)]
         play: bool,
