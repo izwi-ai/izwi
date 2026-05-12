@@ -67,7 +67,7 @@ and realtime route families. Detailed preview behavior is documented in the
 | **Local CLI workflows (`izwi serve`, `izwi pull`, `izwi tts`, `izwi transcribe`)** | Stable | Primary user-facing local runtime workflows. |
 | **`POST /v1/responses` and response-object lifecycle routes** | Preview | Response objects are stored in bounded process memory for compatibility convenience. `store:false` skips retention; retained records can be evicted and are lost on server restart. |
 | **`/v1/admin/*` model-management APIs** | Preview | Operator-oriented local admin APIs; auth and long-term contract are not finalized. |
-| **Persisted first-party workflow APIs (`/v1/transcriptions/jobs`, `/v1/diarizations`, `/v1/text-to-speech-generations`, `/v1/studio/*`, `/v1/voices*`)** | Preview | Powerful local product APIs, but the public compatibility/support contract is still evolving. |
+| **Persisted first-party workflow APIs (`/v1/transcriptions/jobs`, `/v1/diarizations`, `/v1/text-to-speech`, `/v1/studio/*`, `/v1/voices*`)** | Preview | Powerful local product APIs, but the public compatibility/support contract is still evolving. |
 | **Local agent/session features** | Preview | Agent session metadata is process-local and bounded today. Linked chat threads, voice sessions, voice turns, and voice observations are the durable SQLite-backed local stores. |
 
 ---

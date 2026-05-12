@@ -478,15 +478,15 @@ Persisted diarization routes:
 | `POST` | `/v1/diarizations/{record_id}/cancel` | Cancel in-flight diarization. |
 | `POST` | `/v1/diarizations/{record_id}/summary/regenerate` | Regenerate the LLM summary. |
 
-### Speech Generation History
+### Speech History
 
 All three speech history families share list/create, member, audio, pagination, and deletion behavior. Create routes can generate audio and persist the resulting record.
 
 | Route family | Purpose |
 |--------------|---------|
-| `/v1/text-to-speech-generations` | Plain TTS history. |
-| `/v1/voice-design-generations` | Voice-design prompt generations. |
-| `/v1/voice-clone-generations` | Reference-audio voice clone generations. |
+| `/v1/text-to-speech` | Plain TTS history. |
+| `/v1/voice-designs` | Voice-design prompt records. |
+| `/v1/voice-clones` | Reference-audio voice clone records. |
 
 Routes:
 

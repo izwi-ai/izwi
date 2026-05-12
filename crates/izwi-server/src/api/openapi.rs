@@ -2,7 +2,7 @@
 
 use axum::Json;
 use serde::Serialize;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use utoipa::{OpenApi, ToSchema};
 
 #[derive(OpenApi)]
@@ -399,21 +399,9 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         preview_response(),
     );
 
-    add_speech_generation_family(
-        paths,
-        "/v1/text-to-speech-generations",
-        "text-to-speech generations",
-    );
-    add_speech_generation_family(
-        paths,
-        "/v1/voice-design-generations",
-        "voice design generations",
-    );
-    add_speech_generation_family(
-        paths,
-        "/v1/voice-clone-generations",
-        "voice clone generations",
-    );
+    add_speech_history_family(paths, "/v1/text-to-speech", "text-to-speech records");
+    add_speech_history_family(paths, "/v1/voice-designs", "voice design records");
+    add_speech_history_family(paths, "/v1/voice-clones", "voice clone records");
     add_collection(
         paths,
         "/v1/voices",
@@ -830,7 +818,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
     );
 }
 
-fn add_speech_generation_family(
+fn add_speech_history_family(
     paths: &mut Map<String, Value>,
     family_path: &str,
     plural_label: &str,
@@ -842,7 +830,7 @@ fn add_speech_generation_family(
         "Text to Speech",
         plural_label,
         singular_label,
-        "List or create persisted speech generation records.",
+        "List or create persisted speech records.",
     );
     let member = format!("{family_path}/{{record_id}}");
     let audio = format!("{family_path}/{{record_id}}/audio");
@@ -851,8 +839,8 @@ fn add_speech_generation_family(
         &member,
         "Text to Speech",
         singular_label,
-        "Fetch or delete a persisted speech generation record.",
-        &[("record_id", "Speech generation record identifier")],
+        "Fetch or delete a persisted speech record.",
+        &[("record_id", "Speech record identifier")],
     );
     add_operation_with_params(
         paths,
@@ -861,7 +849,7 @@ fn add_speech_generation_family(
         "Text to Speech",
         &format!("Download {singular_label} audio"),
         "Fetch generated speech audio.",
-        &[("record_id", "Speech generation record identifier")],
+        &[("record_id", "Speech record identifier")],
         binary_response(),
     );
 }
@@ -1788,7 +1776,7 @@ mod tests {
             ),
             ("/v1/diarizations/{record_id}/reruns", "post", "Diarization"),
             (
-                "/v1/text-to-speech-generations/{record_id}/audio",
+                "/v1/text-to-speech/{record_id}/audio",
                 "get",
                 "Text to Speech",
             ),
@@ -1815,6 +1803,17 @@ mod tests {
                 .flatten()
                 .any(|actual| actual.as_str() == Some(tag));
             assert!(has_tag, "{method} {path} should be tagged {tag}");
+        }
+
+        for removed_path in [
+            "/v1/text-to-speech-generations",
+            "/v1/voice-design-generations",
+            "/v1/voice-clone-generations",
+        ] {
+            assert!(
+                !paths.contains_key(removed_path),
+                "{removed_path} should not be documented"
+            );
         }
 
         for operation in paths.values().flat_map(|path| {
@@ -1850,15 +1849,11 @@ mod tests {
                 "put",
                 "Replace diarization record",
             ),
+            ("/v1/text-to-speech", "get", "List text-to-speech records"),
             (
-                "/v1/text-to-speech-generations",
-                "get",
-                "List text-to-speech generations",
-            ),
-            (
-                "/v1/text-to-speech-generations/{record_id}",
+                "/v1/text-to-speech/{record_id}",
                 "delete",
-                "Delete text-to-speech generation",
+                "Delete text-to-speech record",
             ),
             ("/v1/voices/{voice_id}", "get", "Get saved voice"),
             (

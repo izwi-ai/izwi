@@ -263,7 +263,7 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://localhost/v1/text-to-speech-generations",
+      "http://localhost/v1/text-to-speech",
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({
@@ -438,7 +438,7 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
 
     expect(client.voiceCloningRecordAudioUrl("clone-1")).toBe(
-      "http://localhost/v1/voice-clone-generations/clone-1/audio",
+      "http://localhost/v1/voice-clones/clone-1/audio",
     );
   });
 

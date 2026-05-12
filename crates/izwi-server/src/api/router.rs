@@ -1,10 +1,10 @@
 use axum::{
+    Router,
     extract::Request,
     http::{HeaderValue, StatusCode},
     middleware,
     response::Response,
     routing::get,
-    Router,
 };
 use izwi_core::ServeRuntimeConfig;
 use std::time::Duration;
@@ -12,7 +12,7 @@ use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
-use tracing::{field, info, info_span, warn, Span};
+use tracing::{Span, field, info, info_span, warn};
 
 use crate::api::request_context::attach_enterprise_request_context;
 use crate::logging::{SERVICE_NAME, SERVICE_VERSION};
@@ -177,7 +177,7 @@ mod tests {
     use async_trait::async_trait;
     use axum::{
         body::Body,
-        http::{header, Method, Request, StatusCode},
+        http::{Method, Request, StatusCode, header},
         response::Response,
         routing::get,
     };
@@ -239,10 +239,12 @@ mod tests {
         )
         .await;
 
-        assert!(response
-            .headers()
-            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-            .is_none());
+        assert!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -450,53 +452,68 @@ mod tests {
         assert_route_status(
             app.clone(),
             Method::GET,
+            "/v1/text-to-speech",
+            None,
+            StatusCode::OK,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::GET,
+            "/v1/text-to-speech/missing/audio",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+
+        assert_route_status(
+            app.clone(),
+            Method::GET,
+            "/v1/voice-designs",
+            None,
+            StatusCode::OK,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::GET,
+            "/v1/voice-designs/missing",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+
+        assert_route_status(
+            app.clone(),
+            Method::GET,
+            "/v1/voice-clones",
+            None,
+            StatusCode::OK,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::GET,
+            "/v1/voice-clones/missing/audio",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+
+        for removed_path in [
             "/v1/text-to-speech-generations",
-            None,
-            StatusCode::OK,
-        )
-        .await;
-        assert_route_status(
-            app.clone(),
-            Method::GET,
-            "/v1/text-to-speech-generations/missing/audio",
-            None,
-            StatusCode::NOT_FOUND,
-        )
-        .await;
-
-        assert_route_status(
-            app.clone(),
-            Method::GET,
             "/v1/voice-design-generations",
-            None,
-            StatusCode::OK,
-        )
-        .await;
-        assert_route_status(
-            app.clone(),
-            Method::GET,
-            "/v1/voice-design-generations/missing",
-            None,
-            StatusCode::NOT_FOUND,
-        )
-        .await;
-
-        assert_route_status(
-            app.clone(),
-            Method::GET,
             "/v1/voice-clone-generations",
-            None,
-            StatusCode::OK,
-        )
-        .await;
-        assert_route_status(
-            app,
-            Method::GET,
-            "/v1/voice-clone-generations/missing/audio",
-            None,
-            StatusCode::NOT_FOUND,
-        )
-        .await;
+        ] {
+            assert_route_status(
+                app.clone(),
+                Method::GET,
+                removed_path,
+                None,
+                StatusCode::NOT_FOUND,
+            )
+            .await;
+        }
 
         drop(temp_dir);
     }
@@ -896,53 +913,68 @@ mod tests {
         assert_route_status(
             app.clone(),
             Method::POST,
+            "/v1/text-to-speech",
+            Some("{}"),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::DELETE,
+            "/v1/text-to-speech/missing",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+
+        assert_route_status(
+            app.clone(),
+            Method::POST,
+            "/v1/voice-designs",
+            Some("{}"),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::DELETE,
+            "/v1/voice-designs/missing",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+
+        assert_route_status(
+            app.clone(),
+            Method::POST,
+            "/v1/voice-clones",
+            Some("{}"),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_route_status(
+            app.clone(),
+            Method::DELETE,
+            "/v1/voice-clones/missing",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+
+        for removed_path in [
             "/v1/text-to-speech-generations",
-            Some("{}"),
-            StatusCode::BAD_REQUEST,
-        )
-        .await;
-        assert_route_status(
-            app.clone(),
-            Method::DELETE,
-            "/v1/text-to-speech-generations/missing",
-            None,
-            StatusCode::NOT_FOUND,
-        )
-        .await;
-
-        assert_route_status(
-            app.clone(),
-            Method::POST,
             "/v1/voice-design-generations",
-            Some("{}"),
-            StatusCode::BAD_REQUEST,
-        )
-        .await;
-        assert_route_status(
-            app.clone(),
-            Method::DELETE,
-            "/v1/voice-design-generations/missing",
-            None,
-            StatusCode::NOT_FOUND,
-        )
-        .await;
-
-        assert_route_status(
-            app.clone(),
-            Method::POST,
             "/v1/voice-clone-generations",
-            Some("{}"),
-            StatusCode::BAD_REQUEST,
-        )
-        .await;
-        assert_route_status(
-            app,
-            Method::DELETE,
-            "/v1/voice-clone-generations/missing",
-            None,
-            StatusCode::NOT_FOUND,
-        )
-        .await;
+        ] {
+            assert_route_status(
+                app.clone(),
+                Method::POST,
+                removed_path,
+                Some("{}"),
+                StatusCode::NOT_FOUND,
+            )
+            .await;
+        }
 
         drop(temp_dir);
     }
@@ -1093,39 +1125,6 @@ mod tests {
         assert_route_status(
             app.clone(),
             Method::GET,
-            "/v1/text-to-speech/records",
-            None,
-            StatusCode::NOT_FOUND,
-        )
-        .await;
-        assert_route_status(
-            app.clone(),
-            Method::POST,
-            "/v1/text-to-speech/records",
-            Some("{}"),
-            StatusCode::NOT_FOUND,
-        )
-        .await;
-        assert_route_status(
-            app.clone(),
-            Method::GET,
-            "/v1/text-to-speech/records/missing/audio",
-            None,
-            StatusCode::NOT_FOUND,
-        )
-        .await;
-        assert_route_status(
-            app.clone(),
-            Method::DELETE,
-            "/v1/text-to-speech/records/missing",
-            None,
-            StatusCode::NOT_FOUND,
-        )
-        .await;
-
-        assert_route_status(
-            app.clone(),
-            Method::GET,
             "/v1/voice-design/records",
             None,
             StatusCode::NOT_FOUND,
@@ -1250,11 +1249,13 @@ mod tests {
         let response = send_request(app, build_request(Method::GET, "/docs", None)).await;
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with("text/html")));
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/html"))
+        );
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -1272,8 +1273,7 @@ mod tests {
     async fn scalar_js_asset_route_returns_javascript() {
         let (app, temp_dir) = test_api_app("scalar_js_asset_route_returns_javascript", false);
 
-        let response =
-            send_request(app, build_request(Method::GET, "/docs/scalar.js", None)).await;
+        let response = send_request(app, build_request(Method::GET, "/docs/scalar.js", None)).await;
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
