@@ -43,6 +43,28 @@ const updatedRecord = {
   audio_filename: "meeting.wav",
 } satisfies DiarizationRecord;
 
+function sseResponse(events: Array<Record<string, unknown> | string>): Response {
+  const encoder = new TextEncoder();
+  return new Response(
+    new ReadableStream({
+      start(controller) {
+        for (const event of events) {
+          const payload =
+            typeof event === "string" ? event : JSON.stringify(event);
+          controller.enqueue(encoder.encode(`data: ${payload}\n\n`));
+        }
+        controller.close();
+      },
+    }),
+    {
+      status: 200,
+      headers: {
+        "Content-Type": "text/event-stream",
+      },
+    },
+  );
+}
+
 describe("AudioApiClient.updateDiarizationRecord", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -94,6 +116,99 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
       "http://localhost/v1/speech-to-text/jobs/diar-1?job_kind=diarization",
       expect.objectContaining({ method: "PUT" }),
     );
+  });
+
+  it("parses direct TTS stream audio event names", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      sseResponse([
+        {
+          event: "audio.started",
+          request_id: "req-1",
+          sample_rate: 24000,
+          audio_format: "pcm_i16",
+        },
+        {
+          event: "audio.chunk",
+          request_id: "req-1",
+          sequence: 1,
+          audio_base64: "AAAA",
+          sample_count: 2,
+          is_final: false,
+        },
+        {
+          event: "audio.done",
+          request_id: "req-1",
+          tokens_generated: 12,
+          generation_time_ms: 100,
+          audio_duration_secs: 1,
+          rtf: 0.1,
+        },
+      ]),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+    const onStart = vi.fn();
+    const onChunk = vi.fn();
+    const onFinal = vi.fn();
+    await new Promise<void>((resolve) => {
+      client.generateTTSStream(
+        { model_id: "Kokoro-82M", text: "Hello" },
+        { onStart, onChunk, onFinal, onDone: resolve },
+      );
+    });
+
+    expect(onStart).toHaveBeenCalledWith({
+      requestId: "req-1",
+      sampleRate: 24000,
+      audioFormat: "pcm_i16",
+    });
+    expect(onChunk).toHaveBeenCalledWith({
+      requestId: "req-1",
+      sequence: 1,
+      audioBase64: "AAAA",
+      sampleCount: 2,
+      isFinal: false,
+    });
+    expect(onFinal).toHaveBeenCalledWith({
+      generation_time_ms: 100,
+      audio_duration_secs: 1,
+      rtf: 0.1,
+      tokens_generated: 12,
+    });
+  });
+
+  it("parses direct ASR stream transcript type names", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      sseResponse([
+        { type: "transcript.text.delta", delta: "Hel" },
+        { type: "transcript.text.delta", delta: "lo" },
+        {
+          type: "transcript.text.done",
+          text: "Hello",
+          language: "English",
+          audio_duration_secs: 1.2,
+        },
+      ]),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+    const onDelta = vi.fn();
+    const onPartial = vi.fn();
+    const onFinal = vi.fn();
+    await new Promise<void>((resolve) => {
+      client.asrTranscribeStream(
+        { audio_base64: "AAAA", model_id: "Parakeet-TDT-0.6B-v3" },
+        { onDelta, onPartial, onFinal, onDone: resolve },
+      );
+    });
+
+    expect(onDelta).toHaveBeenNthCalledWith(1, "Hel");
+    expect(onDelta).toHaveBeenNthCalledWith(2, "lo");
+    expect(onPartial).toHaveBeenNthCalledWith(1, "Hel");
+    expect(onPartial).toHaveBeenNthCalledWith(2, "Hello");
+    expect(onFinal).toHaveBeenCalledWith("Hello", "English", 1.2);
   });
 
   it("lists transcriptions through the canonical collection route", async () => {

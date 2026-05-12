@@ -39,13 +39,13 @@ export interface TTSGenerateResult {
 
 export type TTSStreamEvent =
   | {
-      event: "start";
+      event: "start" | "audio.started";
       request_id: string;
       sample_rate: number;
       audio_format: "wav" | "pcm_i16" | "pcm_f32";
     }
   | {
-      event: "chunk";
+      event: "chunk" | "audio.chunk";
       request_id: string;
       sequence: number;
       audio_base64: string;
@@ -53,14 +53,14 @@ export type TTSStreamEvent =
       is_final: boolean;
     }
   | {
-      event: "final";
+      event: "final" | "audio.done";
       request_id: string;
       tokens_generated: number;
       generation_time_ms: number;
       audio_duration_secs: number;
       rtf: number;
     }
-  | { event: "error"; request_id?: string; error: string }
+  | { event: "error" | "audio.failed"; request_id?: string; error: string }
   | { event: "done"; request_id?: string };
 
 export interface TTSStreamCallbacks {
@@ -825,7 +825,15 @@ export type ASRStreamEvent =
       audio_duration_secs: number | null;
     }
   | { event: "error"; error: string }
-  | { event: "done" };
+  | { event: "done" }
+  | { type: "transcript.text.delta"; delta: string }
+  | {
+      type: "transcript.text.done";
+      text: string;
+      language: string | null;
+      audio_duration_secs: number | null;
+    }
+  | { type: "error"; error: string | { message?: string } };
 
 export interface ASRStreamCallbacks {
   onStart?: (audioDuration: number | null) => void;
@@ -848,6 +856,37 @@ export interface ASRStatusResponse {
 }
 
 type AsrResponseFormat = "json" | "verbose_json";
+
+function normalizeAsrStreamEventName(
+  event: ASRStreamEvent,
+): "start" | "delta" | "partial" | "final" | "error" | "done" | null {
+  if ("event" in event) {
+    return event.event;
+  }
+  switch (event.type) {
+    case "transcript.text.delta":
+      return "delta";
+    case "transcript.text.done":
+      return "final";
+    case "error":
+      return "error";
+    default:
+      return null;
+  }
+}
+
+function streamErrorMessage(
+  error: string | { message?: string } | undefined,
+  fallback: string,
+): string {
+  if (typeof error === "string") {
+    return error;
+  }
+  if (error?.message) {
+    return error.message;
+  }
+  return fallback;
+}
 
 export class AudioApiClient {
   constructor(private readonly http: ApiHttpClient) {}
@@ -947,6 +986,7 @@ export class AudioApiClient {
             const event = JSON.parse(data) as TTSStreamEvent;
             switch (event.event) {
               case "start":
+              case "audio.started":
                 callbacks.onStart?.({
                   requestId: event.request_id,
                   sampleRate: event.sample_rate,
@@ -954,6 +994,7 @@ export class AudioApiClient {
                 });
                 break;
               case "chunk":
+              case "audio.chunk":
                 callbacks.onChunk?.({
                   requestId: event.request_id,
                   sequence: event.sequence,
@@ -963,6 +1004,7 @@ export class AudioApiClient {
                 });
                 break;
               case "final":
+              case "audio.done":
                 callbacks.onFinal?.({
                   generation_time_ms: event.generation_time_ms,
                   audio_duration_secs: event.audio_duration_secs,
@@ -971,7 +1013,10 @@ export class AudioApiClient {
                 });
                 break;
               case "error":
-                callbacks.onError?.(event.error);
+              case "audio.failed":
+                callbacks.onError?.(
+                  streamErrorMessage(event.error, "TTS stream error"),
+                );
                 break;
               case "done":
                 return true;
@@ -2385,37 +2430,62 @@ export class AudioApiClient {
 
           try {
             const event = JSON.parse(data) as ASRStreamEvent;
-            switch (event.event) {
+            switch (normalizeAsrStreamEventName(event)) {
               case "start":
-                callbacks.onStart?.(event.audio_duration_secs);
+                callbacks.onStart?.(
+                  "audio_duration_secs" in event
+                    ? event.audio_duration_secs
+                    : null,
+                );
                 break;
               case "delta":
-                assembledText += event.delta;
-                callbacks.onDelta?.(event.delta);
+                {
+                  const deltaEvent = event as { delta: string };
+                  assembledText += deltaEvent.delta;
+                  callbacks.onDelta?.(deltaEvent.delta);
+                }
                 callbacks.onPartial?.(assembledText);
                 break;
               case "partial":
-                if (event.text.startsWith(assembledText)) {
-                  const delta = event.text.slice(assembledText.length);
-                  if (delta) {
-                    callbacks.onDelta?.(delta);
-                  }
-                } else if (event.text !== assembledText) {
-                  callbacks.onDelta?.(event.text);
+                if ("type" in event) {
+                  break;
                 }
-                assembledText = event.text;
-                callbacks.onPartial?.(event.text);
+                {
+                  const partialEvent = event as { text: string };
+                  if (partialEvent.text.startsWith(assembledText)) {
+                    const delta = partialEvent.text.slice(assembledText.length);
+                    if (delta) {
+                      callbacks.onDelta?.(delta);
+                    }
+                  } else if (partialEvent.text !== assembledText) {
+                    callbacks.onDelta?.(partialEvent.text);
+                  }
+                  assembledText = partialEvent.text;
+                  callbacks.onPartial?.(partialEvent.text);
+                }
                 break;
               case "final":
-                assembledText = event.text;
-                callbacks.onFinal?.(
-                  event.text,
-                  event.language,
-                  event.audio_duration_secs,
-                );
+                {
+                  const finalEvent = event as {
+                    text: string;
+                    language: string | null;
+                    audio_duration_secs: number | null;
+                  };
+                  assembledText = finalEvent.text;
+                  callbacks.onFinal?.(
+                    finalEvent.text,
+                    finalEvent.language,
+                    finalEvent.audio_duration_secs,
+                  );
+                }
                 break;
               case "error":
-                callbacks.onError?.(event.error);
+                callbacks.onError?.(
+                  streamErrorMessage(
+                    (event as { error?: string | { message?: string } }).error,
+                    "Transcription stream error",
+                  ),
+                );
                 break;
               case "done":
                 return true;
