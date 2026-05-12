@@ -421,6 +421,10 @@ runtime routes were removed.
 | `/v1/text-to-speech-generations` | `/v1/text-to-speech` |
 | `/v1/voice-design-generations` | `/v1/voice-designs` |
 | `/v1/voice-clone-generations` | `/v1/voice-clones` |
+| `/v1/transcriptions` | `/v1/speech-to-text/jobs?job_kind=transcription` |
+| `/v1/transcriptions/{record_id}` | `/v1/speech-to-text/jobs/{record_id}?job_kind=transcription` |
+| `/v1/transcriptions/{record_id}/audio` | `/v1/speech-to-text/jobs/{record_id}/audio?job_kind=transcription` |
+| `/v1/transcriptions/{record_id}/summary/regenerate` | `/v1/speech-to-text/jobs/{record_id}/summary/regenerate?job_kind=transcription` |
 | `/v1/transcriptions/jobs` | `/v1/speech-to-text/jobs` |
 | `/v1/transcription/realtime/ws` | `/v1/speech-to-text/realtime/ws` |
 | `/v1/audio/diarize` | `/v1/speech-to-text/jobs?job_kind=diarization` |
@@ -428,9 +432,11 @@ runtime routes were removed.
 
 The speech history and speech-to-text renames keep response payloads, record IDs,
 pagination, audio download behavior, and SSE event names unchanged. The removed
-direct audio diarization routes now use the persisted speech-to-text job flow:
-create a job, poll the returned record until `processing_status` is `ready`, and
-then read the diarization fields from that job record.
+direct saved transcription routes now use `job_kind=transcription` on the
+persisted speech-to-text job flow. The removed direct audio diarization routes
+use the same job flow with `job_kind=diarization`: create a job, poll the
+returned record until `processing_status` is `ready`, and then read the
+diarization fields from that job record.
 
 ### Speech-Text Jobs
 
