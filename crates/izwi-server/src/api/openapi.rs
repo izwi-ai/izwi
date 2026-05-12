@@ -9,6 +9,10 @@ use crate::api::admin::models::{
     AdminModelActionResponse, AdminModelDownloadProgressEvent, AdminModelInfo,
     AdminModelRouteCapabilities, AdminModelsResponse, AdminSpeechModelCapabilities,
 };
+use crate::api::openai::audio::align::{
+    AlignmentJsonRequest, AlignmentMultipartRequest, AlignmentResponse, AlignmentWord,
+    VerboseAlignmentResponse,
+};
 
 #[derive(OpenApi)]
 #[openapi(
@@ -28,6 +32,7 @@ use crate::api::admin::models::{
         create_chat_completion,
         create_speech,
         create_transcription,
+        create_alignment,
         create_response,
         get_response,
         delete_response,
@@ -43,6 +48,10 @@ use crate::api::admin::models::{
         AdminModelRouteCapabilities,
         AdminModelsResponse,
         AdminSpeechModelCapabilities,
+        AlignmentJsonRequest,
+        AlignmentMultipartRequest,
+        AlignmentResponse,
+        AlignmentWord,
         ChatCompletionChoice,
         ChatCompletionChunk,
         ChatCompletionDelta,
@@ -68,6 +77,7 @@ use crate::api::admin::models::{
         TranscriptionMultipartRequest,
         TranscriptionResponse,
         Usage,
+        VerboseAlignmentResponse,
         VerboseTranscriptionResponse,
     )),
     tags(
@@ -1359,6 +1369,22 @@ fn create_transcription() {}
 #[allow(dead_code)]
 #[utoipa::path(
     post,
+    path = "/v1/audio/align",
+    tag = "OpenAI Compatible",
+    summary = "Create forced alignment",
+    request_body = AlignmentJsonRequest,
+    responses(
+        (status = 200, description = "Word-level alignment as JSON, verbose JSON, or text", body = AlignmentResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorEnvelope),
+        (status = 415, description = "Unsupported media type", body = ApiErrorEnvelope),
+        (status = 500, description = "Server error", body = ApiErrorEnvelope)
+    )
+)]
+fn create_alignment() {}
+
+#[allow(dead_code)]
+#[utoipa::path(
+    post,
     path = "/v1/responses",
     tag = "OpenAI Compatible",
     summary = "Create response",
@@ -1774,6 +1800,7 @@ mod tests {
             ("/v1/chat/completions", "post"),
             ("/v1/audio/speech", "post"),
             ("/v1/audio/transcriptions", "post"),
+            ("/v1/audio/align", "post"),
             ("/v1/responses", "post"),
             ("/v1/responses/{response_id}", "get"),
             ("/v1/responses/{response_id}", "delete"),
