@@ -111,11 +111,44 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "Preview onboarding and user preference APIs",
     );
     add_tag(doc, "Realtime", "Preview WebSocket realtime APIs");
+    add_tag(
+        doc,
+        "Reference",
+        "Local API reference and OpenAPI document routes",
+    );
 
     let paths = doc
         .get_mut("paths")
         .and_then(Value::as_object_mut)
         .expect("OpenAPI document should contain a paths object");
+
+    add_operation(
+        paths,
+        "/docs",
+        "get",
+        "Reference",
+        "Get API reference",
+        "Open the local Scalar API reference UI.",
+        ok_response(),
+    );
+    add_operation(
+        paths,
+        "/docs/scalar.js",
+        "get",
+        "Reference",
+        "Get Scalar JavaScript",
+        "Fetch the bundled Scalar API reference JavaScript asset.",
+        ok_response(),
+    );
+    add_operation(
+        paths,
+        "/openapi.json",
+        "get",
+        "Reference",
+        "Get OpenAPI document",
+        "Fetch the generated OpenAPI document for the local server.",
+        ok_response(),
+    );
 
     add_operation(
         paths,
@@ -748,8 +781,8 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "get",
         "Media",
         "Download media",
-        "Fetch persisted local media by relative path.",
-        &[("path", "Relative media path")],
+        "Fetch persisted local media by catch-all relative path. The path may contain slashes.",
+        &[("path", "Catch-all relative media path, including nested segments")],
         binary_response(),
     );
     add_operation(
@@ -1733,6 +1766,7 @@ mod tests {
             "Media",
             "Preferences",
             "Realtime",
+            "Reference",
         ] {
             assert!(tag_names.contains(tag), "{tag} tag should exist");
         }
@@ -1780,6 +1814,9 @@ mod tests {
             ("/v1/media/{path}", "get", "Media"),
             ("/v1/preferences/analytics", "put", "Preferences"),
             ("/v1/voice/realtime/ws", "get", "Realtime"),
+            ("/openapi.json", "get", "Reference"),
+            ("/docs", "get", "Reference"),
+            ("/docs/scalar.js", "get", "Reference"),
         ];
 
         for (path, method, tag) in expected {

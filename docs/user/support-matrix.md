@@ -66,9 +66,10 @@ and realtime route families. Detailed preview behavior is documented in the
 | **Markdown API reference (`/docs/api` on the website, `docs/user/api.md` in the repo)** | Stable | Provides detailed behavior for the broader preview first-party, operator, and realtime route surface. |
 | **Local CLI workflows (`izwi serve`, `izwi pull`, `izwi tts`, `izwi transcribe`)** | Stable | Primary user-facing local runtime workflows. |
 | **`POST /v1/responses` and response-object lifecycle routes** | Preview | Response objects are stored in bounded process memory for compatibility convenience. `store:false` skips retention; retained records can be evicted and are lost on server restart. |
-| **`/v1/admin/*` model-management APIs** | Preview | Operator-oriented local admin APIs; auth and long-term contract are not finalized. |
-| **Persisted first-party workflow APIs (`/v1/speech-to-text/jobs`, `/v1/diarizations`, `/v1/text-to-speech`, `/v1/studio/*`, `/v1/voices*`)** | Preview | Powerful local product APIs, but the public compatibility/support contract is still evolving. |
-| **Local agent/session features** | Preview | Agent session metadata is process-local and bounded today. Linked chat threads, voice sessions, voice turns, and voice observations are the durable SQLite-backed local stores. |
+| **`/v1/admin/models*` model-management APIs** | Preview | Operator-oriented local model lifecycle and capability APIs; auth and long-term contract are not finalized. |
+| **Persisted speech and voice workflow APIs (`/v1/speech-to-text/jobs*`, `/v1/diarizations*`, `/v1/text-to-speech*`, `/v1/voice-designs*`, `/v1/voice-clones*`, `/v1/voices*`, `/v1/studio/*`)** | Preview | Powerful local product APIs, but the public compatibility/support contract is still evolving. Both speech-to-text diarization jobs and direct diarization records are supported first-party surfaces. |
+| **Local chat, agent, and voice state APIs (`/v1/chat/threads*`, `/v1/agent/sessions*`, `/v1/voice/profile`, `/v1/voice/observations`, `/v1/voice/sessions*`)** | Preview | Agent session metadata is process-local and bounded today. Linked chat threads, voice sessions, voice turns, and voice observations are the durable SQLite-backed local stores. |
+| **Realtime WebSocket APIs (`/v1/speech-to-text/realtime/ws`, `/v1/voice/realtime/ws`)** | Preview | Low-latency browser-facing protocols for streaming transcription and voice AI conversations. |
 
 ---
 

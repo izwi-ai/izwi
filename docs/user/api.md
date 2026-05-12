@@ -438,6 +438,12 @@ use the same job flow with `job_kind=diarization`: create a job, poll the
 returned record until `processing_status` is `ready`, and then read the
 diarization fields from that job record.
 
+Direct `/v1/diarizations*` routes remain supported first-party APIs. Use
+`/v1/speech-to-text/jobs?job_kind=diarization` when an app wants a unified
+speech-text list across transcription and diarization. Use `/v1/diarizations*`
+when an app wants diarization-specific resource names and does not need to mix
+transcription records into the same collection.
+
 ### Speech-Text Jobs
 
 Canonical saved transcription and diarization job routes:
@@ -628,10 +634,13 @@ Observational memory is applied to modular voice conversations. Updates are stor
 `GET /v1/media/{path}`
 
 Serves persisted media objects used by chat attachments and local workflows.
+The server route is a catch-all, so `{path}` can contain nested segments such as
+`images/example.png` or `chat/thread-1/attachment.wav`.
 
 Rules:
 
 - The path is relative to the media root.
+- Nested paths are allowed.
 - Absolute paths and `..` traversal are rejected.
 - Unknown media returns `404`.
 - Treat media URLs as local API resources, not stable public object-store URLs.
