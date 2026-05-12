@@ -1,12 +1,11 @@
 //! OpenAI-compatible audio resources.
 
-pub mod diarizations;
 pub mod speech;
 pub mod transcriptions;
 
-use axum::{extract::DefaultBodyLimit, routing::post, Router};
+use axum::{Router, extract::DefaultBodyLimit, routing::post};
 
-use crate::api::openai::compat::{compatibility_profile, OpenAiCompatibilityProfile};
+use crate::api::openai::compat::{OpenAiCompatibilityProfile, compatibility_profile};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -22,15 +21,6 @@ pub fn router() -> Router<AppState> {
             post(transcriptions::transcriptions)
                 .layer(DefaultBodyLimit::max(audio_upload_limit_bytes)),
         )
-        .route(
-            "/audio/diarizations",
-            post(diarizations::diarizations).layer(DefaultBodyLimit::max(audio_upload_limit_bytes)),
-        )
-        // Legacy alias kept for older clients. Canonical route is /audio/diarizations.
-        .route(
-            "/audio/diarize",
-            post(diarizations::diarizations).layer(DefaultBodyLimit::max(audio_upload_limit_bytes)),
-        )
 }
 
 pub fn resolve_audio_upload_limit_bytes() -> usize {
@@ -45,9 +35,5 @@ pub fn resolve_audio_upload_limit_bytes() -> usize {
 }
 
 fn default_audio_upload_limit_mb(profile: OpenAiCompatibilityProfile) -> usize {
-    if profile.is_relaxed() {
-        64
-    } else {
-        25
-    }
+    if profile.is_relaxed() { 64 } else { 25 }
 }

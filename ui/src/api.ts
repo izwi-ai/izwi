@@ -24,8 +24,6 @@ export type {
   DiarizationRecordSummary,
   DiarizationSummaryStatus,
   DiarizationRecordUpdateRequest,
-  DiarizationRequest,
-  DiarizationResponse,
   DiarizationSegment,
   DiarizationUtterance,
   DiarizationWord,

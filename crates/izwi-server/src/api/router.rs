@@ -386,31 +386,6 @@ mod tests {
         assert_route_status(
             app.clone(),
             Method::GET,
-            "/v1/transcriptions",
-            None,
-            StatusCode::OK,
-        )
-        .await;
-        assert_route_status(
-            app.clone(),
-            Method::GET,
-            "/v1/transcriptions/missing",
-            None,
-            StatusCode::NOT_FOUND,
-        )
-        .await;
-        assert_route_status(
-            app.clone(),
-            Method::GET,
-            "/v1/transcriptions/missing/audio",
-            None,
-            StatusCode::NOT_FOUND,
-        )
-        .await;
-
-        assert_route_status(
-            app.clone(),
-            Method::GET,
             "/v1/diarizations",
             None,
             StatusCode::OK,
@@ -529,7 +504,7 @@ mod tests {
             app.clone(),
             build_request(
                 Method::POST,
-                "/v1/transcriptions",
+                "/v1/speech-to-text/jobs?job_kind=transcription",
                 Some("{\"audio_base64\":\"AQ==\"}"),
             ),
         )
@@ -686,8 +661,7 @@ mod tests {
             .await;
         }
 
-        // Compatibility check: canonical diarization route remains available.
-        let legacy_diarization_get = send_request(
+        let canonical_diarization_get = send_request(
             app,
             build_request(
                 Method::GET,
@@ -696,7 +670,7 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(legacy_diarization_get.status(), StatusCode::OK);
+        assert_eq!(canonical_diarization_get.status(), StatusCode::OK);
 
         drop(temp_dir);
     }
@@ -862,8 +836,7 @@ mod tests {
             .await;
         }
 
-        // Compatibility check: legacy mutation route still works.
-        let legacy_create = send_request(
+        let canonical_diarization_create = send_request(
             app,
             build_request(
                 Method::POST,
@@ -872,7 +845,7 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(legacy_create.status(), StatusCode::ACCEPTED);
+        assert_eq!(canonical_diarization_create.status(), StatusCode::ACCEPTED);
 
         drop(temp_dir);
     }
@@ -880,31 +853,6 @@ mod tests {
     #[tokio::test]
     async fn canonical_history_mutation_routes_still_resolve() {
         let (app, temp_dir) = test_api_app("canonical_history_mutation_routes_still_resolve", true);
-
-        assert_route_status(
-            app.clone(),
-            Method::POST,
-            "/v1/transcriptions",
-            Some("{}"),
-            StatusCode::BAD_REQUEST,
-        )
-        .await;
-        assert_route_status(
-            app.clone(),
-            Method::DELETE,
-            "/v1/transcriptions/missing",
-            None,
-            StatusCode::NOT_FOUND,
-        )
-        .await;
-        assert_route_status(
-            app.clone(),
-            Method::POST,
-            "/v1/transcriptions/missing/summary/regenerate",
-            Some("{}"),
-            StatusCode::NOT_FOUND,
-        )
-        .await;
 
         assert_route_status(
             app.clone(),
@@ -1052,6 +1000,23 @@ mod tests {
     #[tokio::test]
     async fn legacy_history_routes_return_not_found() {
         let (app, temp_dir) = test_api_app("legacy_history_routes_return_not_found", true);
+
+        for (method, path, body) in [
+            (Method::POST, "/v1/audio/diarize", Some("{}")),
+            (Method::POST, "/v1/audio/diarizations", Some("{}")),
+            (Method::GET, "/v1/transcriptions", None),
+            (Method::POST, "/v1/transcriptions", Some("{}")),
+            (Method::GET, "/v1/transcriptions/missing", None),
+            (Method::DELETE, "/v1/transcriptions/missing", None),
+            (Method::GET, "/v1/transcriptions/missing/audio", None),
+            (
+                Method::POST,
+                "/v1/transcriptions/missing/summary/regenerate",
+                Some("{}"),
+            ),
+        ] {
+            assert_route_status(app.clone(), method, path, body, StatusCode::NOT_FOUND).await;
+        }
 
         assert_route_status(
             app.clone(),

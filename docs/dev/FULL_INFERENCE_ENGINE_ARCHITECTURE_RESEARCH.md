@@ -614,7 +614,7 @@ green after every phase:
 | ASR | `/v1/audio/transcriptions` JSON and multipart, text/SRT/VTT/JSON formats, first-party transcription jobs, realtime transcription websocket, CLI `transcribe`, UI speech-text route. |
 | Chat | `/v1/chat/completions` streaming and non-streaming, `/v1/responses`, tool/media normalization, first-party chat threads, CLI `chat`, UI chat playground. |
 | Voice | Realtime modular voice, unified audio-chat voice, barge-in, interruption, turn persistence, transcript/audio event ordering, voice metrics. |
-| Diarization | `/v1/audio/diarizations`, first-party diarization jobs, ASR attribution, forced alignment, optional LLM refinement, export formats, UI diarization route. |
+| Diarization | First-party speech-to-text jobs with `job_kind=diarization`, ASR attribution, forced alignment, optional LLM refinement, export formats, UI diarization route. |
 | Model ops | List, download, cancel download, load, unload, delete, lifecycle snapshots, UI/CLI/admin compatibility. |
 | Metrics | Existing `/v1/metrics`, `/v1/metrics/prometheus`, `/internal/*` aliases, runtime counters, voice counters, benchmark snapshots. |
 

@@ -1,6 +1,5 @@
 import type {
   DiarizationRecord,
-  DiarizationResponse,
   DiarizationSegment,
   DiarizationUtterance,
   DiarizationWord,
@@ -34,7 +33,7 @@ type SpeakerNameOverrideSource = {
 };
 
 type TranscriptSource = Pick<
-  DiarizationResponse,
+  DiarizationRecord,
   "utterances" | "transcript" | "raw_transcript"
 > &
   SpeakerNameOverrideSource;

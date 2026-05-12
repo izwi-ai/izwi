@@ -65,7 +65,7 @@ Example output:
 ### Endpoint
 
 ```
-POST /v1/audio/diarizations
+POST /v1/speech-to-text/jobs?job_kind=diarization
 ```
 
 ### Request (multipart/form-data)
@@ -79,52 +79,41 @@ POST /v1/audio/diarizations
 | `llm_model` | String | Optional transcript refinement model |
 | `min_speakers` | Integer | Optional minimum expected speakers |
 | `max_speakers` | Integer | Optional maximum expected speakers |
-| `num_speakers` | Integer | Legacy shortcut; maps to both min/max when provided |
 | `min_speech_duration_ms` | Number | Optional VAD speech-duration tuning |
 | `min_silence_duration_ms` | Number | Optional VAD silence-duration tuning |
 | `enable_llm_refinement` | Boolean/String | Enable optional transcript refinement |
-| `response_format` | String | `json`, `verbose_json`, or `text` |
 
 ### Example (curl)
 
 ```bash
-curl -X POST http://localhost:8080/v1/audio/diarizations \
+curl -X POST "http://localhost:8080/v1/speech-to-text/jobs?job_kind=diarization" \
   -F "file=@meeting.wav" \
   -F "model=diar_streaming_sortformer_4spk-v2.1" \
   -F "asr_model=Parakeet-TDT-0.6B-v3" \
   -F "aligner_model=Qwen3-ForcedAligner-0.6B" \
   -F "min_speakers=2" \
-  -F "max_speakers=2" \
-  -F "response_format=verbose_json"
+  -F "max_speakers=2"
 ```
 
 ### Response
 
-The default `json` response contains speaker segments and a formatted transcript:
+The create response is a persisted diarization job. Poll the returned `id` with
+`GET /v1/speech-to-text/jobs/{record_id}?job_kind=diarization` until
+`processing_status` is `ready`.
 
 ```json
 {
-  "segments": [
-    {
-      "speaker": "SPEAKER_00",
-      "start": 0.0,
-      "end": 5.2
-    },
-    {
-      "speaker": "SPEAKER_01",
-      "start": 5.5,
-      "end": 12.1
-    }
-  ],
-  "transcript": "SPEAKER_00 [0.00s - 5.20s]: Welcome to the meeting.\nSPEAKER_01 [5.50s - 12.10s]: Thanks for having me."
+  "id": "diarization_...",
+  "kind": "diarization",
+  "processing_status": "pending"
 }
 ```
 
-Use `response_format=verbose_json` for words, utterances, speaker count,
-duration, alignment coverage, LLM refinement status, and processing metrics.
-Streaming diarization is not currently supported on this route.
+Ready job records include `segments`, `words`, `utterances`, `speaker_count`,
+`duration_secs`, `alignment_coverage`, LLM refinement status, processing metrics,
+and the formatted `transcript`.
 
-See the [API Reference](../api.md#audio-diarizations) for JSON input and exact response shapes.
+See the [API Reference](../api.md#speech-text-jobs) for JSON input and exact response shapes.
 
 ---
 
@@ -136,7 +125,7 @@ If you know how many speakers are in the audio, specify it for better accuracy:
 
 ```bash
 # Via API
-curl -X POST http://localhost:8080/v1/audio/diarizations \
+curl -X POST "http://localhost:8080/v1/speech-to-text/jobs?job_kind=diarization" \
   -F "file=@meeting.wav" \
   -F "min_speakers=3" \
   -F "max_speakers=3"
