@@ -287,7 +287,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
 
     add_collection(
         paths,
-        "/v1/transcriptions/jobs",
+        "/v1/speech-to-text/jobs",
         "Speech to Text",
         "speech-to-text jobs",
         "speech-to-text job",
@@ -295,7 +295,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
     );
     add_get_patch_put_delete_member(
         paths,
-        "/v1/transcriptions/jobs/{record_id}",
+        "/v1/speech-to-text/jobs/{record_id}",
         "Speech to Text",
         "speech-to-text job",
         "Fetch, update, or delete a canonical saved speech-text job.",
@@ -303,7 +303,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
     );
     add_operation_with_params(
         paths,
-        "/v1/transcriptions/jobs/{record_id}/audio",
+        "/v1/speech-to-text/jobs/{record_id}/audio",
         "get",
         "Speech to Text",
         "Download speech-to-text job audio",
@@ -313,7 +313,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
     );
     add_operation_with_params(
         paths,
-        "/v1/transcriptions/jobs/{record_id}/reruns",
+        "/v1/speech-to-text/jobs/{record_id}/reruns",
         "post",
         "Speech to Text",
         "Rerun speech-to-text job",
@@ -323,7 +323,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
     );
     add_operation_with_params(
         paths,
-        "/v1/transcriptions/jobs/{record_id}/cancel",
+        "/v1/speech-to-text/jobs/{record_id}/cancel",
         "post",
         "Speech to Text",
         "Cancel speech-to-text job",
@@ -333,7 +333,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
     );
     add_operation_with_params(
         paths,
-        "/v1/transcriptions/jobs/{record_id}/summary/regenerate",
+        "/v1/speech-to-text/jobs/{record_id}/summary/regenerate",
         "post",
         "Speech to Text",
         "Regenerate speech-to-text summary",
@@ -1770,7 +1770,7 @@ mod tests {
                 "Admin",
             ),
             (
-                "/v1/transcriptions/jobs/{record_id}/reruns",
+                "/v1/speech-to-text/jobs/{record_id}/reruns",
                 "post",
                 "Speech to Text",
             ),
@@ -1809,6 +1809,7 @@ mod tests {
             "/v1/text-to-speech-generations",
             "/v1/voice-design-generations",
             "/v1/voice-clone-generations",
+            "/v1/transcriptions/jobs",
         ] {
             assert!(
                 !paths.contains_key(removed_path),
@@ -1836,9 +1837,9 @@ mod tests {
         let expected = [
             ("/v1/audio/speech", "post", "Create speech"),
             ("/v1/responses/{response_id}", "get", "Get response"),
-            ("/v1/transcriptions/jobs", "get", "List speech-to-text jobs"),
+            ("/v1/speech-to-text/jobs", "get", "List speech-to-text jobs"),
             (
-                "/v1/transcriptions/jobs",
+                "/v1/speech-to-text/jobs",
                 "post",
                 "Create speech-to-text job",
             ),

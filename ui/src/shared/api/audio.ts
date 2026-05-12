@@ -1051,7 +1051,7 @@ export class AudioApiClient {
   }
 
   private speechTextJobsCollectionPath(): string {
-    return "/transcriptions/jobs";
+    return "/speech-to-text/jobs";
   }
 
   private speechTextJobPath(recordId: string): string {

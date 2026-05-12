@@ -453,15 +453,15 @@ Canonical saved transcription and diarization job routes:
 
 | Method | Path | Notes |
 |--------|------|-------|
-| `GET` | `/v1/transcriptions/jobs` | List jobs. Supports `limit`, `cursor`, and `job_kind=transcription|diarization|all`. |
-| `POST` | `/v1/transcriptions/jobs` | Create transcription or diarization job. Multipart uploads allowed. |
-| `GET` | `/v1/transcriptions/jobs/{record_id}` | Fetch one job. `job_kind` can disambiguate. |
-| `PATCH`, `PUT` | `/v1/transcriptions/jobs/{record_id}` | Update editable metadata such as title, transcript fields, speaker labels, or summary state depending on job kind. |
-| `DELETE` | `/v1/transcriptions/jobs/{record_id}` | Delete job and associated stored media. |
-| `GET` | `/v1/transcriptions/jobs/{record_id}/audio` | Fetch stored source audio. |
-| `POST` | `/v1/transcriptions/jobs/{record_id}/reruns` | Re-run diarization from stored source audio. |
-| `POST` | `/v1/transcriptions/jobs/{record_id}/cancel` | Cancel an in-flight diarization job. |
-| `POST` | `/v1/transcriptions/jobs/{record_id}/summary/regenerate` | Regenerate transcription or diarization summary. |
+| `GET` | `/v1/speech-to-text/jobs` | List jobs. Supports `limit`, `cursor`, and `job_kind=transcription|diarization|all`. |
+| `POST` | `/v1/speech-to-text/jobs` | Create transcription or diarization job. Multipart uploads allowed. |
+| `GET` | `/v1/speech-to-text/jobs/{record_id}` | Fetch one job. `job_kind` can disambiguate. |
+| `PATCH`, `PUT` | `/v1/speech-to-text/jobs/{record_id}` | Update editable metadata such as title, transcript fields, speaker labels, or summary state depending on job kind. |
+| `DELETE` | `/v1/speech-to-text/jobs/{record_id}` | Delete job and associated stored media. |
+| `GET` | `/v1/speech-to-text/jobs/{record_id}/audio` | Fetch stored source audio. |
+| `POST` | `/v1/speech-to-text/jobs/{record_id}/reruns` | Re-run diarization from stored source audio. |
+| `POST` | `/v1/speech-to-text/jobs/{record_id}/cancel` | Cancel an in-flight diarization job. |
+| `POST` | `/v1/speech-to-text/jobs/{record_id}/summary/regenerate` | Regenerate transcription or diarization summary. |
 
 The `job_kind` query parameter is important for shared IDs and for clients that want a specific record family.
 

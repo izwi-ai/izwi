@@ -19,13 +19,13 @@ pub fn router() -> Router<AppState> {
     const CANONICAL_MEMBER: &str = "/transcriptions/{record_id}";
     const CANONICAL_AUDIO: &str = "/transcriptions/{record_id}/audio";
     const CANONICAL_SUMMARY_REGENERATE: &str = "/transcriptions/{record_id}/summary/regenerate";
-    const CANONICAL_UNIFIED_COLLECTION: &str = "/transcriptions/jobs";
-    const CANONICAL_UNIFIED_MEMBER: &str = "/transcriptions/jobs/{record_id}";
-    const CANONICAL_UNIFIED_AUDIO: &str = "/transcriptions/jobs/{record_id}/audio";
-    const CANONICAL_UNIFIED_RERUNS: &str = "/transcriptions/jobs/{record_id}/reruns";
-    const CANONICAL_UNIFIED_CANCEL: &str = "/transcriptions/jobs/{record_id}/cancel";
+    const CANONICAL_UNIFIED_COLLECTION: &str = "/speech-to-text/jobs";
+    const CANONICAL_UNIFIED_MEMBER: &str = "/speech-to-text/jobs/{record_id}";
+    const CANONICAL_UNIFIED_AUDIO: &str = "/speech-to-text/jobs/{record_id}/audio";
+    const CANONICAL_UNIFIED_RERUNS: &str = "/speech-to-text/jobs/{record_id}/reruns";
+    const CANONICAL_UNIFIED_CANCEL: &str = "/speech-to-text/jobs/{record_id}/cancel";
     const CANONICAL_UNIFIED_SUMMARY_REGENERATE: &str =
-        "/transcriptions/jobs/{record_id}/summary/regenerate";
+        "/speech-to-text/jobs/{record_id}/summary/regenerate";
 
     Router::new()
         .route(

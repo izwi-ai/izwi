@@ -561,7 +561,7 @@ mod tests {
 
         let unified_list = send_request(
             app.clone(),
-            build_request(Method::GET, "/v1/transcriptions/jobs?job_kind=all", None),
+            build_request(Method::GET, "/v1/speech-to-text/jobs?job_kind=all", None),
         )
         .await;
         assert_eq!(unified_list.status(), StatusCode::OK);
@@ -585,7 +585,7 @@ mod tests {
 
         let unified_list_with_limit = send_request(
             app.clone(),
-            build_request(Method::GET, "/v1/transcriptions/jobs?limit=25", None),
+            build_request(Method::GET, "/v1/speech-to-text/jobs?limit=25", None),
         )
         .await;
         assert_eq!(unified_list_with_limit.status(), StatusCode::OK);
@@ -603,7 +603,7 @@ mod tests {
             build_request(
                 Method::GET,
                 format!(
-                    "/v1/transcriptions/jobs/{}?job_kind=transcription",
+                    "/v1/speech-to-text/jobs/{}?job_kind=transcription",
                     transcription_id
                 )
                 .as_str(),
@@ -625,7 +625,7 @@ mod tests {
             build_request(
                 Method::GET,
                 format!(
-                    "/v1/transcriptions/jobs/{}?job_kind=diarization",
+                    "/v1/speech-to-text/jobs/{}?job_kind=diarization",
                     diarization_id
                 )
                 .as_str(),
@@ -647,7 +647,7 @@ mod tests {
             build_request(
                 Method::GET,
                 format!(
-                    "/v1/transcriptions/jobs/{}/audio?job_kind=transcription",
+                    "/v1/speech-to-text/jobs/{}/audio?job_kind=transcription",
                     transcription_id
                 )
                 .as_str(),
@@ -662,7 +662,7 @@ mod tests {
             build_request(
                 Method::GET,
                 format!(
-                    "/v1/transcriptions/jobs/{}/audio?job_kind=diarization",
+                    "/v1/speech-to-text/jobs/{}/audio?job_kind=diarization",
                     diarization_id
                 )
                 .as_str(),
@@ -671,6 +671,20 @@ mod tests {
         )
         .await;
         assert_eq!(diarization_audio.status(), StatusCode::OK);
+
+        for removed_path in [
+            "/v1/transcriptions/jobs?job_kind=all",
+            "/v1/transcriptions/jobs/missing/audio?job_kind=transcription",
+        ] {
+            assert_route_status(
+                app.clone(),
+                Method::GET,
+                removed_path,
+                None,
+                StatusCode::NOT_FOUND,
+            )
+            .await;
+        }
 
         // Compatibility check: canonical diarization route remains available.
         let legacy_diarization_get = send_request(
@@ -698,7 +712,7 @@ mod tests {
             app.clone(),
             build_request(
                 Method::POST,
-                "/v1/transcriptions/jobs?job_kind=transcription",
+                "/v1/speech-to-text/jobs?job_kind=transcription",
                 Some("{\"audio_base64\":\"AQ==\"}"),
             ),
         )
@@ -715,7 +729,7 @@ mod tests {
             app.clone(),
             build_request(
                 Method::POST,
-                "/v1/transcriptions/jobs?job_kind=diarization",
+                "/v1/speech-to-text/jobs?job_kind=diarization",
                 Some("{\"audio_base64\":\"AQ==\"}"),
             ),
         )
@@ -733,7 +747,7 @@ mod tests {
             build_request(
                 Method::PATCH,
                 format!(
-                    "/v1/transcriptions/jobs/{}?job_kind=diarization",
+                    "/v1/speech-to-text/jobs/{}?job_kind=diarization",
                     diarization_id
                 )
                 .as_str(),
@@ -748,7 +762,7 @@ mod tests {
             build_request(
                 Method::POST,
                 format!(
-                    "/v1/transcriptions/jobs/{}/reruns?job_kind=diarization",
+                    "/v1/speech-to-text/jobs/{}/reruns?job_kind=diarization",
                     diarization_id
                 )
                 .as_str(),
@@ -763,7 +777,7 @@ mod tests {
             build_request(
                 Method::POST,
                 format!(
-                    "/v1/transcriptions/jobs/{}/cancel?job_kind=diarization",
+                    "/v1/speech-to-text/jobs/{}/cancel?job_kind=diarization",
                     diarization_id
                 )
                 .as_str(),
@@ -778,7 +792,7 @@ mod tests {
             build_request(
                 Method::POST,
                 format!(
-                    "/v1/transcriptions/jobs/{}/summary/regenerate?job_kind=transcription",
+                    "/v1/speech-to-text/jobs/{}/summary/regenerate?job_kind=transcription",
                     transcription_id
                 )
                 .as_str(),
@@ -793,7 +807,7 @@ mod tests {
             build_request(
                 Method::POST,
                 format!(
-                    "/v1/transcriptions/jobs/{}/summary/regenerate?job_kind=diarization",
+                    "/v1/speech-to-text/jobs/{}/summary/regenerate?job_kind=diarization",
                     diarization_id
                 )
                 .as_str(),
@@ -808,7 +822,7 @@ mod tests {
             build_request(
                 Method::DELETE,
                 format!(
-                    "/v1/transcriptions/jobs/{}?job_kind=transcription",
+                    "/v1/speech-to-text/jobs/{}?job_kind=transcription",
                     transcription_id
                 )
                 .as_str(),
@@ -823,7 +837,7 @@ mod tests {
             build_request(
                 Method::DELETE,
                 format!(
-                    "/v1/transcriptions/jobs/{}?job_kind=diarization",
+                    "/v1/speech-to-text/jobs/{}?job_kind=diarization",
                     diarization_id
                 )
                 .as_str(),
@@ -832,6 +846,21 @@ mod tests {
         )
         .await;
         assert_eq!(delete_diarization.status(), StatusCode::OK);
+
+        for removed_path in [
+            "/v1/transcriptions/jobs/missing/reruns?job_kind=diarization",
+            "/v1/transcriptions/jobs/missing/cancel?job_kind=diarization",
+            "/v1/transcriptions/jobs/missing/summary/regenerate?job_kind=transcription",
+        ] {
+            assert_route_status(
+                app.clone(),
+                Method::POST,
+                removed_path,
+                Some("{}"),
+                StatusCode::NOT_FOUND,
+            )
+            .await;
+        }
 
         // Compatibility check: legacy mutation route still works.
         let legacy_create = send_request(
