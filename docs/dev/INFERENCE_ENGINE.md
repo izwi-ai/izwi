@@ -510,15 +510,15 @@ These routes back the desktop UI's saved history and reusable assets. Canonical 
 | `POST` | `/v1/diarizations/:id/reruns` | Re-run diarization from a saved record's source audio |
 | `POST` | `/v1/diarizations/:id/cancel` | Cancel an in-flight diarization rerun |
 | `POST` | `/v1/diarizations/:id/summary/regenerate` | Regenerate a diarization summary |
-| `GET, POST` | `/v1/text-to-speech-generations` | List or create saved TTS generations |
-| `GET, DELETE` | `/v1/text-to-speech-generations/:id` | Fetch or delete a saved TTS generation |
-| `GET` | `/v1/text-to-speech-generations/:id/audio` | Fetch generated TTS audio |
-| `GET, POST` | `/v1/voice-design-generations` | List or create saved voice design generations |
-| `GET, DELETE` | `/v1/voice-design-generations/:id` | Fetch or delete a saved voice design generation |
-| `GET` | `/v1/voice-design-generations/:id/audio` | Fetch generated voice design audio |
-| `GET, POST` | `/v1/voice-clone-generations` | List or create saved voice clone generations |
-| `GET, DELETE` | `/v1/voice-clone-generations/:id` | Fetch or delete a saved voice clone generation |
-| `GET` | `/v1/voice-clone-generations/:id/audio` | Fetch generated voice clone audio |
+| `GET, POST` | `/v1/text-to-speech` | List or create saved TTS records |
+| `GET, DELETE` | `/v1/text-to-speech/:id` | Fetch or delete a saved TTS record |
+| `GET` | `/v1/text-to-speech/:id/audio` | Fetch generated TTS audio |
+| `GET, POST` | `/v1/voice-designs` | List or create saved voice design records |
+| `GET, DELETE` | `/v1/voice-designs/:id` | Fetch or delete a saved voice design record |
+| `GET` | `/v1/voice-designs/:id/audio` | Fetch generated voice design audio |
+| `GET, POST` | `/v1/voice-clones` | List or create saved voice clone records |
+| `GET, DELETE` | `/v1/voice-clones/:id` | Fetch or delete a saved voice clone record |
+| `GET` | `/v1/voice-clones/:id/audio` | Fetch generated voice clone audio |
 | `GET, POST` | `/v1/voices` | List or create reusable saved voices |
 | `GET, DELETE` | `/v1/voices/:voice_id` | Fetch or delete a saved voice |
 | `GET` | `/v1/voices/:voice_id/audio` | Fetch saved voice reference audio |

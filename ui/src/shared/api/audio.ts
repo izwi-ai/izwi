@@ -1035,11 +1035,11 @@ export class AudioApiClient {
   private speechHistoryCollectionPath(route: SpeechHistoryRoute): string {
     switch (route) {
       case "text-to-speech":
-        return "/text-to-speech-generations";
+        return "/text-to-speech";
       case "voice-design":
-        return "/voice-design-generations";
+        return "/voice-designs";
       case "voice-cloning":
-        return "/voice-clone-generations";
+        return "/voice-clones";
     }
   }
 
