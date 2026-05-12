@@ -703,7 +703,7 @@ Media lifecycle routes:
 
 | Method | Path | Notes |
 |--------|------|-------|
-| `GET` | `/v1/media?limit=100` | List local media objects in the OSS media root. |
+| `GET` | `/v1/media?limit=100` | List media objects when the server is using local media storage; provider-backed storage can return `501` if listing is unavailable. |
 | `POST` | `/v1/media` | Upload a base64 media object. |
 | `GET` | `/v1/media/{path}` | Download a persisted media object. |
 | `DELETE` | `/v1/media/{path}` | Delete a persisted media object. |
