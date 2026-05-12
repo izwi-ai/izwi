@@ -14,7 +14,7 @@ izwi tts <TEXT> [OPTIONS]
 
 ## Description
 
-Converts text to speech using a TTS model. Supports multiple output formats, voice selection, and real-time streaming.
+Converts text to speech using a TTS model. The OSS server emits WAV audio for the CLI path, with voice selection and real-time streaming.
 
 ### Kokoro-82M Prerequisite (`espeak-ng`)
 
@@ -42,7 +42,7 @@ Converts text to speech using a TTS model. Supports multiple output formats, voi
 | `-m, --model <MODEL>` | TTS model to use | `qwen3-tts-0.6b-base` |
 | `-s, --speaker <VOICE>` | Voice/speaker (name or audio path) | `default` |
 | `-o, --output <PATH>` | Output file path | stdout |
-| `-f, --format <FORMAT>` | Audio format: `wav`, `mp3`, `ogg`, `flac`, `aac` | `wav` |
+| `-f, --format <FORMAT>` | Audio format requested from the server. OSS native output is `wav`; compressed choices require server-side encoder support. | `wav` |
 | `-r, --speed <SPEED>` | Speech speed (0.5-2.0) | `1.0` |
 | `-t, --temperature <TEMP>` | Sampling temperature | `0.7` |
 | `--stream` | Stream output in real-time | — |
@@ -73,10 +73,10 @@ izwi tts "Hello my name is Bella" \
 izwi tts "Hello, world!" --play
 ```
 
-### Different format
+### WAV output
 
 ```bash
-izwi tts "Hello, world!" --format mp3 --output hello.mp3
+izwi tts "Hello, world!" --format wav --output hello.wav
 ```
 
 ### Adjust speed
@@ -120,11 +120,8 @@ izwi tts "Long text for streaming" --stream --play
 
 | Format | Extension | Notes |
 |--------|-----------|-------|
-| `wav` | `.wav` | Uncompressed, highest quality |
-| `mp3` | `.mp3` | Compressed, widely compatible |
-| `ogg` | `.ogg` | Open format, good compression |
-| `flac` | `.flac` | Lossless compression |
-| `aac` | `.aac` | High efficiency compression |
+| `wav` | `.wav` | Native OSS output format. |
+| `mp3`, `ogg`, `flac`, `aac` | Matching extension | Recognized by the CLI enum, but the OSS server does not bundle compressed encoders yet. Use the API `allow_format_fallback` field when you intentionally want WAV bytes for a compressed request. |
 
 ---
 

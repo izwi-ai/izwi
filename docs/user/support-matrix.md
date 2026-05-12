@@ -57,7 +57,7 @@ and realtime route families. Detailed preview behavior is documented in the
 
 | Surface | Status | Notes |
 |---------|--------|-------|
-| **`POST /v1/audio/speech`** | Stable | Core OpenAI-compatible TTS surface. |
+| **`POST /v1/audio/speech`** | Stable | Core OpenAI-compatible TTS surface. Native OSS output formats are WAV and raw PCM; recognized compressed names require explicit WAV fallback opt-in until bundled encoders are added. |
 | **`POST /v1/audio/transcriptions`** | Stable | Core OpenAI-compatible transcription surface. |
 | **`POST /v1/audio/align`** | Stable | Izwi extension for word-level forced alignment of reference text to audio. |
 | **`POST /v1/chat/completions`** | Stable | Core OpenAI-compatible chat surface. |

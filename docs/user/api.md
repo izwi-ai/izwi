@@ -244,7 +244,8 @@ Request fields:
 | `model` | Required TTS model variant. |
 | `input` | Required text to synthesize. |
 | `voice` | Built-in voice/speaker name where the model supports presets. |
-| `response_format` | `wav`, `pcm`, `pcm16`, `pcm_i16`, `raw_i16`, `raw_f32`, `pcm_f32`, `mp3`, `opus`, `aac`, `flac`. OpenAI compressed names currently fall back to WAV bytes. |
+| `response_format` | Native OSS formats: `wav` (default), `pcm`, `pcm16`, `pcm_i16`, `raw_i16`, `raw_f32`, `pcm_f32`. Recognized compressed names `mp3`, `opus`, `ogg`, `aac`, and `flac` require explicit fallback opt-in because compressed encoders are not bundled. |
+| `allow_format_fallback` | Optional boolean. When `true`, recognized compressed `response_format` values return WAV bytes with `X-Actual-Response-Format: wav`, `X-Response-Format-Fallback`, and `Warning` headers. When omitted or `false`, compressed formats return `400`. |
 | `speed` | Optional model-dependent speed control. |
 | `language` | Optional language hint such as `English`, `Chinese`, or `Auto`. |
 | `temperature`, `top_k` | Optional sampling controls. |
@@ -258,14 +259,14 @@ Request fields:
 Non-stream response:
 
 - Body is binary audio.
-- Content type follows the generated/fallback format.
-- `mp3`, `opus`, `aac`, and `flac` request names are accepted for OpenAI compatibility but currently return WAV bytes with a transparent fallback.
+- Content type follows the actual generated format.
+- `X-Requested-Response-Format` and `X-Actual-Response-Format` are exposed. Explicit fallbacks also include `X-Response-Format-Fallback` and an HTTP `Warning` header.
 
 SSE events:
 
 | Event | Fields |
 |-------|--------|
-| `audio.started` | `request_id`, `sample_rate`, `audio_format`, optional fallback note in `error`. |
+| `audio.started` | `request_id`, `sample_rate`, `audio_format`, optional explicit fallback note in `error`. |
 | `audio.chunk` | `request_id`, `sequence`, `audio_base64`, `sample_count`, `is_final`. |
 | `audio.done` | `request_id`, `tokens_generated`, `generation_time_ms`, `audio_duration_secs`, `rtf`. |
 | `audio.failed` | `request_id`, `error`. |
@@ -598,7 +599,7 @@ Audio export query parameters:
 | Parameter | Notes |
 |-----------|-------|
 | `download=true` | Prefer attachment-style download headers. |
-| `format=wav|mp3|flac|raw_i16` | Requested export format. |
+| `format=wav|raw_i16|raw_f32` | Requested export format. |
 | `segment_ids=a,b,c` | Export selected segments in order. |
 
 Pronunciations and snapshots:
