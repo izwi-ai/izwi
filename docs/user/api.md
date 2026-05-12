@@ -447,6 +447,22 @@ response.completed or response.failed
 
 These routes are preview APIs used by the web UI and desktop app. They are local, SQLite-backed stores unless otherwise noted.
 
+### Route Rename Migration
+
+The following preview route names were replaced by canonical names. The old
+runtime routes were removed.
+
+| Removed route family | Current route family |
+|----------------------|----------------------|
+| `/v1/text-to-speech-generations` | `/v1/text-to-speech` |
+| `/v1/voice-design-generations` | `/v1/voice-designs` |
+| `/v1/voice-clone-generations` | `/v1/voice-clones` |
+| `/v1/transcriptions/jobs` | `/v1/speech-to-text/jobs` |
+| `/v1/transcription/realtime/ws` | `/v1/speech-to-text/realtime/ws` |
+
+Response payloads, record IDs, pagination, audio download behavior, and SSE
+event names are unchanged.
+
 ### Speech-Text Jobs
 
 Canonical saved transcription and diarization job routes:

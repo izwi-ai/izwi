@@ -61,7 +61,7 @@ use utoipa::{OpenApi, ToSchema};
     )),
     tags(
         (name = "Runtime", description = "Runtime health, readiness, and operational probes"),
-        (name = "OpenAI Compatible", description = "OpenAI-compatible API surface, including preview compatibility routes and Izwi OpenAI-style extensions"),
+        (name = "OpenAI Compatible", description = "OpenAI-compatible API surface, including preview compatibility routes"),
         (name = "Admin", description = "Local administrative API surface")
     )
 )]
@@ -212,7 +212,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         paths,
         "/v1/audio/diarizations",
         "post",
-        "OpenAI Compatible",
+        "Diarization",
         "Create diarization",
         "Izwi-specific diarization endpoint accepting JSON or multipart audio input.",
         preview_response(),
@@ -1763,7 +1763,7 @@ mod tests {
 
         let paths = openapi["paths"].as_object().expect("paths should exist");
         let expected = [
-            ("/v1/audio/diarizations", "post", "OpenAI Compatible"),
+            ("/v1/audio/diarizations", "post", "Diarization"),
             (
                 "/v1/admin/models/{variant}/download/progress",
                 "get",
