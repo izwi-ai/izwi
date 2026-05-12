@@ -76,6 +76,8 @@ use crate::api::openai::audio::align::{
         TranscriptionJsonRequest,
         TranscriptionMultipartRequest,
         TranscriptionResponse,
+        TranscriptionTimestampSegment,
+        TranscriptionTimestampWord,
         Usage,
         VerboseAlignmentResponse,
         VerboseTranscriptionResponse,
@@ -1663,6 +1665,7 @@ pub struct TranscriptionMultipartRequest {
     pub file: Option<String>,
     pub audio_base64: Option<String>,
     pub model: Option<String>,
+    pub aligner_model: Option<String>,
     pub language: Option<String>,
     pub response_format: Option<String>,
     pub stream: Option<bool>,
@@ -1676,9 +1679,11 @@ pub struct TranscriptionMultipartRequest {
 pub struct TranscriptionJsonRequest {
     pub audio_base64: String,
     pub model: Option<String>,
+    pub aligner_model: Option<String>,
     pub language: Option<String>,
     pub response_format: Option<String>,
     pub stream: Option<bool>,
+    pub timestamp_granularities: Option<Vec<String>>,
 }
 
 #[allow(dead_code)]
@@ -1693,9 +1698,28 @@ pub struct VerboseTranscriptionResponse {
     pub text: String,
     pub language: Option<String>,
     pub duration: f32,
+    pub words: Option<Vec<TranscriptionTimestampWord>>,
+    pub segments: Option<Vec<TranscriptionTimestampSegment>>,
     pub processing_time_ms: f64,
     pub rtf: Option<f64>,
     pub izwi_asr_diagnostics: Option<serde_json::Value>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TranscriptionTimestampWord {
+    pub word: String,
+    pub start: f32,
+    pub end: f32,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TranscriptionTimestampSegment {
+    pub id: usize,
+    pub start: f32,
+    pub end: f32,
+    pub text: String,
 }
 
 #[allow(dead_code)]

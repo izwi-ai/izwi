@@ -1,14 +1,14 @@
 //! OpenAI-compatible transcription endpoints.
 
 use axum::{
+    Json, RequestExt,
     body::Body,
     extract::{Extension, Multipart, Request, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{
-        sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
     },
-    Json, RequestExt,
 };
 use base64::Engine;
 use std::convert::Infallible;
@@ -16,23 +16,24 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::info;
 
+use super::resolve_audio_upload_limit_bytes;
 use crate::api::request_context::RequestContext;
 use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::parse_model_variant;
-use super::resolve_audio_upload_limit_bytes;
 
 #[derive(Debug, Default)]
 struct TranscriptionRequest {
     audio_base64: Option<String>,
     model: Option<String>,
+    aligner_model: Option<String>,
     language: Option<String>,
     response_format: Option<String>,
     stream: bool,
     // Accepted for compatibility; currently not used by runtime.
     _prompt: Option<String>,
     _temperature: Option<f32>,
-    _timestamp_granularities: Option<Vec<String>>,
+    timestamp_granularities: Option<Vec<String>>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -45,10 +46,59 @@ struct VerboseJsonTranscriptionResponse {
     text: String,
     language: Option<String>,
     duration: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    words: Option<Vec<TranscriptionTimestampWord>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    segments: Option<Vec<TranscriptionTimestampSegment>>,
     processing_time_ms: f64,
     rtf: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     izwi_asr_diagnostics: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct TranscriptionTimestampWord {
+    word: String,
+    start: f32,
+    end: f32,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct TranscriptionTimestampSegment {
+    id: usize,
+    start: f32,
+    end: f32,
+    text: String,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct TimestampGranularityRequest {
+    words: bool,
+    segments: bool,
+}
+
+impl TimestampGranularityRequest {
+    fn parse(values: Option<&[String]>) -> Result<Self, ApiError> {
+        let mut request = Self::default();
+        for value in values.unwrap_or_default() {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "" => {}
+                "word" | "words" => request.words = true,
+                "segment" | "segments" => request.segments = true,
+                other => {
+                    return Err(ApiError::bad_request(format!(
+                        "Unsupported timestamp granularity: {}. Supported: word, segment",
+                        other
+                    )));
+                }
+            }
+        }
+        Ok(request)
+    }
+
+    fn any(self) -> bool {
+        self.words || self.segments
+    }
 }
 
 pub async fn transcriptions(
@@ -69,8 +119,20 @@ pub async fn transcriptions(
         return transcriptions_stream(state, req, audio_base64, ctx.correlation_id).await;
     }
 
-    let _permit = state.acquire_permit().await;
+    let response_format = req
+        .response_format
+        .as_deref()
+        .unwrap_or("json")
+        .to_ascii_lowercase();
+    let timestamp_request =
+        TimestampGranularityRequest::parse(req.timestamp_granularities.as_deref())?;
+    if timestamp_request.any() && response_format != "verbose_json" {
+        return Err(ApiError::bad_request(
+            "`timestamp_granularities` requires `response_format: \"verbose_json\"`",
+        ));
+    }
 
+    let _permit = state.acquire_permit().await;
     let started = Instant::now();
     let output = state
         .runtime
@@ -81,13 +143,32 @@ pub async fn transcriptions(
             Some(&ctx.correlation_id),
         )
         .await?;
-    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
 
-    let response_format = req
-        .response_format
-        .as_deref()
-        .unwrap_or("json")
-        .to_ascii_lowercase();
+    let mut words = None;
+    let mut segments = None;
+    if timestamp_request.any() && !output.text.trim().is_empty() {
+        let alignments = state
+            .runtime
+            .force_align_with_model_and_language(
+                &audio_base64,
+                output.text.as_str(),
+                output.language.as_deref().or(req.language.as_deref()),
+                req.aligner_model.as_deref(),
+            )
+            .await?;
+        let timestamp_words = alignments_to_timestamp_words(alignments);
+        if timestamp_request.words {
+            words = Some(timestamp_words.clone());
+        }
+        if timestamp_request.segments {
+            segments = Some(build_timestamp_segments(
+                output.text.as_str(),
+                &timestamp_words,
+            ));
+        }
+    }
+
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
 
     let rtf = if output.duration_secs > 0.0 {
         Some((elapsed_ms / 1000.0) / output.duration_secs as f64)
@@ -109,6 +190,8 @@ pub async fn transcriptions(
                     text: output.text,
                     language: output.language,
                     duration: output.duration_secs,
+                    words,
+                    segments,
                     processing_time_ms: elapsed_ms,
                     rtf,
                     izwi_asr_diagnostics: output.asr_diagnostics,
@@ -215,6 +298,9 @@ struct JsonRequestBody {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
+    #[serde(alias = "aligner_model_id")]
+    aligner_model: Option<String>,
+    #[serde(default)]
     language: Option<String>,
     #[serde(default)]
     response_format: Option<String>,
@@ -245,12 +331,13 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
         return Ok(TranscriptionRequest {
             audio_base64: Some(payload.audio_base64),
             model: payload.model,
+            aligner_model: payload.aligner_model,
             language: payload.language,
             response_format: payload.response_format,
             stream: payload.stream.unwrap_or(false),
             _prompt: payload.prompt,
             _temperature: payload.temperature,
-            _timestamp_granularities: payload.timestamp_granularities,
+            timestamp_granularities: payload.timestamp_granularities,
         });
     }
 
@@ -300,6 +387,17 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
                         out.model = Some(text.trim().to_string());
                     }
                 }
+                "aligner_model" | "aligner_model_id" => {
+                    let text = field.text().await.map_err(|e| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart '{}' field: {e}",
+                            name
+                        ))
+                    })?;
+                    if !text.trim().is_empty() {
+                        out.aligner_model = Some(text.trim().to_string());
+                    }
+                }
                 "language" => {
                     let text = field.text().await.map_err(|e| {
                         ApiError::bad_request(format!(
@@ -345,7 +443,7 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
                         ))
                     })?;
                     if !text.trim().is_empty() {
-                        out._timestamp_granularities
+                        out.timestamp_granularities
                             .get_or_insert_with(Vec::new)
                             .push(text.trim().to_string());
                     }
@@ -413,6 +511,39 @@ fn validate_transcription_model(model: Option<&str>) -> Result<(), ApiError> {
             trimmed
         )))
     }
+}
+
+fn alignments_to_timestamp_words(
+    alignments: Vec<(String, u32, u32)>,
+) -> Vec<TranscriptionTimestampWord> {
+    alignments
+        .into_iter()
+        .map(|(word, start_ms, end_ms)| TranscriptionTimestampWord {
+            word,
+            start: millis_to_secs(start_ms),
+            end: millis_to_secs(end_ms),
+        })
+        .collect()
+}
+
+fn build_timestamp_segments(
+    text: &str,
+    words: &[TranscriptionTimestampWord],
+) -> Vec<TranscriptionTimestampSegment> {
+    let Some(first_word) = words.first() else {
+        return Vec::new();
+    };
+    let end = words.last().map(|word| word.end).unwrap_or(first_word.end);
+    vec![TranscriptionTimestampSegment {
+        id: 0,
+        start: first_word.start,
+        end,
+        text: text.trim().to_string(),
+    }]
+}
+
+fn millis_to_secs(ms: u32) -> f32 {
+    (ms as f32) / 1000.0
 }
 
 fn transcript_delta_event_payload(delta: String) -> String {
@@ -496,7 +627,10 @@ mod tests {
     fn stream_delta_event_uses_openai_type_field() {
         let payload = transcript_delta_event_payload("hello".to_string());
         let json: serde_json::Value = serde_json::from_str(&payload).expect("json payload");
-        assert_eq!(json.get("type").and_then(|v| v.as_str()), Some("transcript.text.delta"));
+        assert_eq!(
+            json.get("type").and_then(|v| v.as_str()),
+            Some("transcript.text.delta")
+        );
         assert_eq!(json.get("delta").and_then(|v| v.as_str()), Some("hello"));
     }
 
@@ -518,5 +652,53 @@ mod tests {
         let err = validate_transcription_model(Some("definitely-not-a-real-model"))
             .expect_err("unknown model should be rejected");
         assert!(err.message.contains("Unsupported transcription model"));
+    }
+
+    #[test]
+    fn parses_timestamp_granularities() {
+        let requested = vec!["word".to_string(), "segments".to_string()];
+        let parsed =
+            TimestampGranularityRequest::parse(Some(&requested)).expect("supported granularities");
+        assert!(parsed.words);
+        assert!(parsed.segments);
+    }
+
+    #[test]
+    fn rejects_unknown_timestamp_granularity() {
+        let requested = vec!["phoneme".to_string()];
+        let err = TimestampGranularityRequest::parse(Some(&requested))
+            .expect_err("unknown granularity should be rejected");
+        assert!(err.message.contains("Unsupported timestamp granularity"));
+    }
+
+    #[test]
+    fn converts_alignment_millis_into_verbose_timestamp_words() {
+        let words = alignments_to_timestamp_words(vec![("hello".to_string(), 250, 900)]);
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].word, "hello");
+        assert!((words[0].start - 0.25).abs() < f32::EPSILON);
+        assert!((words[0].end - 0.9).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn builds_single_verbose_timestamp_segment() {
+        let words = vec![
+            TranscriptionTimestampWord {
+                word: "hello".to_string(),
+                start: 0.1,
+                end: 0.4,
+            },
+            TranscriptionTimestampWord {
+                word: "world".to_string(),
+                start: 0.5,
+                end: 0.9,
+            },
+        ];
+        let segments = build_timestamp_segments(" hello world ", &words);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].id, 0);
+        assert_eq!(segments[0].text, "hello world");
+        assert!((segments[0].start - 0.1).abs() < f32::EPSILON);
+        assert!((segments[0].end - 0.9).abs() < f32::EPSILON);
     }
 }
