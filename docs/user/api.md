@@ -306,7 +306,9 @@ Multipart fields:
 | `language` | Optional language hint. |
 | `response_format` | `json`, `verbose_json`, `text`, `srt`, or `vtt`. Default `json`. |
 | `stream` | `true`, `1`, `yes`, or `on` enables SSE. |
-| `prompt`, `temperature`, `timestamp_granularities[]` | Accepted for compatibility; currently not used by the runtime path. |
+| `timestamp_granularities[]` | Optional `word`, `segment`, or both. Requires `response_format=verbose_json` and uses the forced aligner for timestamps. |
+| `aligner_model` | Optional forced-aligner model for timestamp generation. Defaults to `Qwen3-ForcedAligner-0.6B`. |
+| `prompt`, `temperature` | Accepted for compatibility; currently not used by the runtime path. |
 
 `json` response:
 
@@ -323,6 +325,12 @@ Multipart fields:
   "text": "Hello, this is a transcription test.",
   "language": "en",
   "duration": 3.5,
+  "words": [
+    { "word": "Hello", "start": 0.0, "end": 0.45 }
+  ],
+  "segments": [
+    { "id": 0, "start": 0.0, "end": 3.5, "text": "Hello, this is a transcription test." }
+  ],
   "processing_time_ms": 812.4,
   "rtf": 0.23,
   "izwi_asr_diagnostics": null
