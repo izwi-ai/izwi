@@ -19,6 +19,7 @@ use std::sync::Arc;
 pub struct PersistenceContext {
     pub database: DatabaseContext,
     pub media_storage: Arc<dyn MediaStorageProvider>,
+    local_media_root: Option<PathBuf>,
 }
 
 impl PersistenceContext {
@@ -28,7 +29,8 @@ impl PersistenceContext {
 
         Ok(Self {
             database,
-            media_storage,
+            media_storage: media_storage.provider,
+            local_media_root: media_storage.local_media_root,
         })
     }
 
@@ -40,6 +42,10 @@ impl PersistenceContext {
 
     pub fn media_storage(&self) -> Arc<dyn MediaStorageProvider> {
         self.media_storage.clone()
+    }
+
+    pub fn local_media_root(&self) -> Option<&PathBuf> {
+        self.local_media_root.as_ref()
     }
 }
 
@@ -266,19 +272,31 @@ fn validate_migration_mode_for_backend(
     Ok(())
 }
 
+struct ResolvedMediaStorage {
+    provider: Arc<dyn MediaStorageProvider>,
+    local_media_root: Option<PathBuf>,
+}
+
 async fn resolve_media_storage(
     enterprise_hooks: &EnterpriseHooks,
-) -> anyhow::Result<Arc<dyn MediaStorageProvider>> {
+) -> anyhow::Result<ResolvedMediaStorage> {
     match enterprise_hooks
         .media_storage
         .resolve_media_storage(&MediaStorageProviderRequest::server_media())
         .await
         .map_err(|err| anyhow::anyhow!("Enterprise media storage hook failed: {err}"))?
     {
-        MediaStorageProviderDecision::UseDefault => Ok(Arc::new(LocalMediaStorageProvider::new(
-            storage_layout::resolve_media_root(),
-        ))),
-        MediaStorageProviderDecision::UseProvider(provider) => Ok(provider),
+        MediaStorageProviderDecision::UseDefault => {
+            let media_root = storage_layout::resolve_media_root();
+            Ok(ResolvedMediaStorage {
+                provider: Arc::new(LocalMediaStorageProvider::new(media_root.clone())),
+                local_media_root: Some(media_root),
+            })
+        }
+        MediaStorageProviderDecision::UseProvider(provider) => Ok(ResolvedMediaStorage {
+            provider,
+            local_media_root: None,
+        }),
     }
 }
 
@@ -424,7 +442,7 @@ fn is_not_found_error(err: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
     use crate::test_support::env_lock;
-    use izwi_hooks::{DatabaseProvider, DatabaseProviderDecision};
+    use izwi_hooks::{DatabaseProvider, DatabaseProviderDecision, MediaStorageResolver};
     use sea_orm::DbBackend;
 
     #[tokio::test]
@@ -446,9 +464,28 @@ mod tests {
         );
         assert!(db_path.exists());
         assert!(media_dir.exists());
+        assert_eq!(context.local_media_root(), Some(&media_dir));
 
         std::env::remove_var("IZWI_DB_PATH");
         std::env::remove_var("IZWI_MEDIA_DIR");
+    }
+
+    #[tokio::test]
+    async fn provider_media_storage_is_not_marked_as_local_listable_storage() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let provider = Arc::new(LocalMediaStorageProvider::new(
+            temp_dir.path().to_path_buf(),
+        )) as Arc<dyn MediaStorageProvider>;
+        let mut hooks = EnterpriseHooks::noop();
+        hooks.media_storage = Arc::new(StaticMediaStorageResolver {
+            decision: MediaStorageProviderDecision::UseProvider(provider),
+        });
+
+        let resolved = resolve_media_storage(&hooks)
+            .await
+            .expect("media storage resolves");
+
+        assert!(resolved.local_media_root.is_none());
     }
 
     #[tokio::test]
@@ -694,6 +731,21 @@ mod tests {
             &self,
             _request: &DatabaseProviderRequest,
         ) -> HookResult<DatabaseProviderDecision> {
+            Ok(self.decision.clone())
+        }
+    }
+
+    #[derive(Clone)]
+    struct StaticMediaStorageResolver {
+        decision: MediaStorageProviderDecision,
+    }
+
+    #[async_trait::async_trait]
+    impl MediaStorageResolver for StaticMediaStorageResolver {
+        async fn resolve_media_storage(
+            &self,
+            _request: &MediaStorageProviderRequest,
+        ) -> HookResult<MediaStorageProviderDecision> {
             Ok(self.decision.clone())
         }
     }

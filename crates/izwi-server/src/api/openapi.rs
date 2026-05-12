@@ -884,8 +884,8 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "get",
         "Media",
         "List media",
-        "List local media objects served by the OSS media route.",
-        preview_response(),
+        "List media objects when the server is using local media storage. Provider-backed storage may return 501 if listing is unavailable.",
+        media_list_response(),
     );
     add_operation(
         paths,
@@ -1280,6 +1280,16 @@ fn preview_response() -> Value {
         ("200", "OK"),
         ("400", "Invalid request"),
         ("404", "Not found"),
+        ("500", "Server error"),
+    ])
+}
+
+fn media_list_response() -> Value {
+    response_with_statuses(&[
+        ("200", "OK"),
+        ("400", "Invalid request"),
+        ("404", "Not found"),
+        ("501", "Media listing unavailable for configured provider"),
         ("500", "Server error"),
     ])
 }

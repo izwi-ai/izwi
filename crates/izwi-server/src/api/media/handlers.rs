@@ -8,7 +8,10 @@ use axum::{
 use base64::Engine;
 use izwi_hooks::{HookMetadata, MediaNamespace};
 use serde::{Deserialize, Serialize};
-use std::{path::Path as FsPath, time::UNIX_EPOCH};
+use std::{
+    path::{Path as FsPath, PathBuf},
+    time::UNIX_EPOCH,
+};
 
 use crate::error::ApiError;
 use crate::persistence::{
@@ -65,12 +68,28 @@ pub struct DeleteMediaResponse {
 }
 
 pub async fn list_media(
+    State(state): State<AppState>,
     Query(query): Query<ListMediaQuery>,
 ) -> Result<Json<ListMediaResponse>, ApiError> {
-    let media_root = storage_layout::resolve_media_root();
+    let media_root = listable_media_root(&state)?;
     let media = list_local_media_files(&media_root, query.limit.unwrap_or(100).clamp(1, 500))
         .map_err(|err| ApiError::internal(format!("Failed listing media files: {err}")))?;
     Ok(Json(ListMediaResponse { media }))
+}
+
+fn listable_media_root(state: &AppState) -> Result<PathBuf, ApiError> {
+    match state.persistence.as_ref() {
+        Some(persistence) => persistence
+            .local_media_root()
+            .cloned()
+            .ok_or_else(|| ApiError {
+                status: StatusCode::NOT_IMPLEMENTED,
+                message:
+                    "GET /v1/media listing is only available for local media storage providers"
+                        .to_string(),
+            }),
+        None => Ok(storage_layout::resolve_media_root()),
+    }
 }
 
 pub async fn create_media(
