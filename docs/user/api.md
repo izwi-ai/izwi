@@ -745,7 +745,7 @@ Realtime routes are preview browser protocols. They use JSON text messages for c
 
 ### Transcription Realtime
 
-`GET /v1/transcription/realtime/ws`
+`GET /v1/speech-to-text/realtime/ws`
 
 Server starts with:
 

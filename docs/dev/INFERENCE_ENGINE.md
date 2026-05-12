@@ -556,7 +556,7 @@ These routes back the desktop UI's saved history and reusable assets. Canonical 
 | `POST` | `/v1/onboarding/complete` | Mark first-run onboarding complete |
 | `GET` | `/v1/preferences` | Fetch user preferences |
 | `PUT` | `/v1/preferences/analytics` | Update analytics opt-in preference |
-| `GET` | `/v1/transcription/realtime/ws` | Preview realtime transcription WebSocket |
+| `GET` | `/v1/speech-to-text/realtime/ws` | Preview realtime transcription WebSocket |
 | `GET` | `/v1/voice/realtime/ws` | Preview realtime voice WebSocket |
 
 ### 10.2 OpenAI-Compatible And OpenAI-Style Endpoints

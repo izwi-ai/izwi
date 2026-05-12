@@ -1416,11 +1416,19 @@ mod tests {
         )
         .await;
         assert_route_status(
+            app.clone(),
+            Method::GET,
+            "/v1/speech-to-text/realtime/ws",
+            None,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_route_status(
             app,
             Method::GET,
             "/v1/transcription/realtime/ws",
             None,
-            StatusCode::BAD_REQUEST,
+            StatusCode::NOT_FOUND,
         )
         .await;
 

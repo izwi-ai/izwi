@@ -10,7 +10,7 @@ use crate::app::transcription_realtime;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/transcription/realtime/ws", get(ws_upgrade))
+    Router::new().route("/speech-to-text/realtime/ws", get(ws_upgrade))
 }
 
 async fn ws_upgrade(
