@@ -1277,6 +1277,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn voice_session_rest_lifecycle_routes_work() {
+        let (app, temp_dir) = test_api_app("voice_session_rest_lifecycle_routes_work", false);
+
+        let create = send_request(
+            app.clone(),
+            build_request(Method::POST, "/v1/voice/sessions", Some("{}")),
+        )
+        .await;
+        assert_eq!(create.status(), StatusCode::OK);
+        let created = read_json(create).await;
+        let session_id = created["session"]["id"]
+            .as_str()
+            .expect("created session id")
+            .to_string();
+        assert_eq!(created["turns"].as_array().expect("turns").len(), 0);
+
+        let turns = send_request(
+            app.clone(),
+            build_request(
+                Method::GET,
+                &format!("/v1/voice/sessions/{session_id}/turns"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(turns.status(), StatusCode::OK);
+        assert_eq!(
+            read_json(turns).await.as_array().expect("turn list").len(),
+            0
+        );
+
+        let patch = send_request(
+            app.clone(),
+            build_request(
+                Method::PATCH,
+                &format!("/v1/voice/sessions/{session_id}"),
+                Some(r#"{"system_prompt":"Keep the exchange concise."}"#),
+            ),
+        )
+        .await;
+        assert_eq!(patch.status(), StatusCode::OK);
+        let patched = read_json(patch).await;
+        assert_eq!(
+            patched["session"]["system_prompt"].as_str(),
+            Some("Keep the exchange concise.")
+        );
+
+        let end = send_request(
+            app.clone(),
+            build_request(
+                Method::POST,
+                &format!("/v1/voice/sessions/{session_id}/end"),
+                Some("{}"),
+            ),
+        )
+        .await;
+        assert_eq!(end.status(), StatusCode::OK);
+        assert!(read_json(end).await["session"]["ended_at"].is_number());
+
+        let export = send_request(
+            app.clone(),
+            build_request(
+                Method::GET,
+                &format!("/v1/voice/sessions/{session_id}/export?format=text"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(export.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(export.into_body(), usize::MAX)
+            .await
+            .expect("export body");
+        assert!(
+            std::str::from_utf8(&body)
+                .expect("text export")
+                .contains(&session_id)
+        );
+
+        let delete = send_request(
+            app.clone(),
+            build_request(
+                Method::DELETE,
+                &format!("/v1/voice/sessions/{session_id}"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(delete.status(), StatusCode::OK);
+
+        assert_route_status(
+            app,
+            Method::GET,
+            &format!("/v1/voice/sessions/{session_id}"),
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+
+        drop(temp_dir);
+    }
+
+    #[tokio::test]
     async fn openapi_json_route_returns_valid_scaffold() {
         let (app, temp_dir) = test_api_app("openapi_json_route_returns_valid_scaffold", false);
 
@@ -1354,7 +1456,49 @@ mod tests {
                 Method::GET,
                 "/v1/media/nested/example.png",
                 None,
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::POST,
+                "/v1/media",
+                Some("{}"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Method::DELETE,
+                "/v1/media/nested/example.png",
+                None,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::GET,
+                "/v1/voice/sessions/missing-session/turns",
+                None,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::PATCH,
+                "/v1/voice/sessions/missing-session",
+                Some(r#"{"system_prompt":"updated"}"#),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::POST,
+                "/v1/voice/sessions/missing-session/end",
+                Some("{}"),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::GET,
+                "/v1/voice/sessions/missing-session/export",
+                None,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::DELETE,
+                "/v1/voice/sessions/missing-session",
+                None,
+                StatusCode::NOT_FOUND,
             ),
             (
                 Method::GET,

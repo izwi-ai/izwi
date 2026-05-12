@@ -808,6 +808,15 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "List persisted voice sessions.",
         preview_response(),
     );
+    add_operation(
+        paths,
+        "/v1/voice/sessions",
+        "post",
+        "Voice",
+        "Create voice session",
+        "Create a persisted voice session shell for external applications.",
+        preview_response(),
+    );
     add_operation_with_params(
         paths,
         "/v1/voice/sessions/{session_id}",
@@ -818,7 +827,75 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         &[("session_id", "Voice session identifier")],
         preview_response(),
     );
+    add_operation_with_params(
+        paths,
+        "/v1/voice/sessions/{session_id}",
+        "patch",
+        "Voice",
+        "Update voice session",
+        "Update voice session metadata such as the prompt or ended state.",
+        &[("session_id", "Voice session identifier")],
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/voice/sessions/{session_id}",
+        "delete",
+        "Voice",
+        "Delete voice session",
+        "Delete a persisted voice session and its turns.",
+        &[("session_id", "Voice session identifier")],
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/voice/sessions/{session_id}/turns",
+        "get",
+        "Voice",
+        "List voice session turns",
+        "List turns for one persisted voice session.",
+        &[("session_id", "Voice session identifier")],
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/voice/sessions/{session_id}/end",
+        "post",
+        "Voice",
+        "Update voice session end state",
+        "Mark a persisted voice session ended.",
+        &[("session_id", "Voice session identifier")],
+        preview_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/voice/sessions/{session_id}/export",
+        "get",
+        "Voice",
+        "Download voice session export",
+        "Export a persisted voice session as JSON or text transcript.",
+        &[("session_id", "Voice session identifier")],
+        preview_response(),
+    );
 
+    add_operation(
+        paths,
+        "/v1/media",
+        "get",
+        "Media",
+        "List media",
+        "List local media objects served by the OSS media route.",
+        preview_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/media",
+        "post",
+        "Media",
+        "Create media",
+        "Upload a base64 media object for local app workflows.",
+        preview_response(),
+    );
     add_operation_with_params(
         paths,
         "/v1/media/{path}",
@@ -831,6 +908,19 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
             "Catch-all relative media path, including nested segments",
         )],
         binary_response(),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/media/{path}",
+        "delete",
+        "Media",
+        "Delete media",
+        "Delete a persisted local media object by catch-all relative path.",
+        &[(
+            "path",
+            "Catch-all relative media path, including nested segments",
+        )],
+        preview_response(),
     );
     add_operation(
         paths,
@@ -1935,7 +2025,10 @@ mod tests {
             ),
             ("/v1/chat/threads/{thread_id}/messages", "get", "Chat"),
             ("/v1/voice/profile", "patch", "Voice"),
+            ("/v1/voice/sessions", "post", "Voice"),
+            ("/v1/voice/sessions/{session_id}/turns", "get", "Voice"),
             ("/v1/media/{path}", "get", "Media"),
+            ("/v1/media", "post", "Media"),
             ("/v1/preferences/analytics", "put", "Preferences"),
             ("/v1/voice/realtime/ws", "get", "Realtime"),
             ("/openapi.json", "get", "Reference"),

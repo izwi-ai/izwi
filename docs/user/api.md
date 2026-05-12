@@ -686,17 +686,45 @@ Voice-mode persisted state:
 | `GET`, `DELETE` | `/v1/voice/observations` | List or clear remembered observations. `limit` controls list size. |
 | `DELETE` | `/v1/voice/observations/{observation_id}` | Forget one observation. |
 | `GET` | `/v1/voice/sessions` | List voice sessions. |
+| `POST` | `/v1/voice/sessions` | Create a persisted session shell. Defaults to the default profile, `modular` mode, and the profile system prompt. |
 | `GET` | `/v1/voice/sessions/{session_id}` | Fetch a session with turns. |
+| `PATCH` | `/v1/voice/sessions/{session_id}` | Update `system_prompt` and/or set `ended: true`. |
+| `DELETE` | `/v1/voice/sessions/{session_id}` | Delete a session and its stored turns. |
+| `GET` | `/v1/voice/sessions/{session_id}/turns` | List only the stored turns for a session. |
+| `POST` | `/v1/voice/sessions/{session_id}/end` | Mark a session ended. |
+| `GET` | `/v1/voice/sessions/{session_id}/export?format=json\|text` | Export session metadata, turn metadata, and a transcript view. |
 
 Observational memory is applied to modular voice conversations. Updates are stored locally and can be cleared by the user.
 
 ### Media
 
-`GET /v1/media/{path}`
+Media lifecycle routes:
+
+| Method | Path | Notes |
+|--------|------|-------|
+| `GET` | `/v1/media?limit=100` | List local media objects in the OSS media root. |
+| `POST` | `/v1/media` | Upload a base64 media object. |
+| `GET` | `/v1/media/{path}` | Download a persisted media object. |
+| `DELETE` | `/v1/media/{path}` | Delete a persisted media object. |
 
 Serves persisted media objects used by chat attachments and local workflows.
 The server route is a catch-all, so `{path}` can contain nested segments such as
 `images/example.png` or `chat/thread-1/attachment.wav`.
+
+Upload request:
+
+```json
+{
+  "data_base64": "UklGRiQAAABXQVZF...",
+  "content_type": "audio/wav",
+  "filename": "utterance.wav",
+  "namespace": "voice/session-1"
+}
+```
+
+`audio_base64` is accepted as an alias for `data_base64`, and data URLs such as
+`data:audio/wav;base64,...` are accepted. Upload responses include `path`,
+`url`, `content_type`, `filename`, and `size_bytes`.
 
 Rules:
 
