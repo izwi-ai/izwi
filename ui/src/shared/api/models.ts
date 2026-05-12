@@ -10,8 +10,30 @@ export interface SpeechModelCapabilities {
   supports_auto_long_form: boolean;
 }
 
+export interface ModelRouteCapabilities {
+  openai_chat_completions: boolean;
+  openai_responses: boolean;
+  openai_audio_speech: boolean;
+  openai_audio_transcriptions: boolean;
+  speech_to_text_jobs: boolean;
+  speech_to_text_realtime: boolean;
+  diarization_records: boolean;
+  text_to_speech_records: boolean;
+  voice_design_records: boolean;
+  voice_clone_records: boolean;
+  saved_voice_reuse: boolean;
+  studio_projects: boolean;
+  voice_realtime_text_model: boolean;
+  voice_realtime_modular_asr: boolean;
+  voice_realtime_modular_tts: boolean;
+  voice_realtime_unified: boolean;
+  forced_alignment: boolean;
+  tokenizer: boolean;
+}
+
 export interface ModelInfo {
   variant: string;
+  enabled?: boolean;
   status:
     | "not_downloaded"
     | "downloading"
@@ -23,6 +45,8 @@ export interface ModelInfo {
   size_bytes: number | null;
   download_progress: number | null;
   error_message: string | null;
+  modalities?: string[];
+  route_capabilities?: ModelRouteCapabilities;
   speech_capabilities?: SpeechModelCapabilities | null;
 }
 

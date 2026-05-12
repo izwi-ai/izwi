@@ -5,6 +5,11 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use utoipa::{OpenApi, ToSchema};
 
+use crate::api::admin::models::{
+    AdminModelActionResponse, AdminModelDownloadProgressEvent, AdminModelInfo,
+    AdminModelRouteCapabilities, AdminModelsResponse, AdminSpeechModelCapabilities,
+};
+
 #[derive(OpenApi)]
 #[openapi(
     info(
@@ -32,6 +37,12 @@ use utoipa::{OpenApi, ToSchema};
     components(schemas(
         ApiErrorBody,
         ApiErrorEnvelope,
+        AdminModelActionResponse,
+        AdminModelDownloadProgressEvent,
+        AdminModelInfo,
+        AdminModelRouteCapabilities,
+        AdminModelsResponse,
+        AdminSpeechModelCapabilities,
         ChatCompletionChoice,
         ChatCompletionChunk,
         ChatCompletionDelta,
@@ -247,16 +258,34 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "get",
         "Admin",
         "List model variants",
-        "List all known enabled model variants and local status.",
-        preview_response(),
+        "List all known enabled model variants, local status, modalities, and route capabilities.",
+        json_schema_response(
+            "AdminModelsResponse",
+            "Model variants with local lifecycle state and voice-app capabilities",
+        ),
     );
-    add_get_delete_member(
+    add_operation_with_params(
         paths,
         "/v1/admin/models/{variant}",
+        "get",
         "Admin",
-        "model variant",
-        "Fetch or delete local model variant state.",
+        "Get model variant",
+        "Fetch one model variant's local lifecycle state and voice-app capabilities.",
         &[("variant", "Model variant identifier")],
+        json_schema_response(
+            "AdminModelInfo",
+            "Model lifecycle state and voice-app capabilities",
+        ),
+    );
+    add_operation_with_params(
+        paths,
+        "/v1/admin/models/{variant}",
+        "delete",
+        "Admin",
+        "Delete model variant",
+        "Unload and delete local model files for a variant.",
+        &[("variant", "Model variant identifier")],
+        json_schema_response("AdminModelActionResponse", "Model delete result"),
     );
     add_operation_with_params(
         paths,
@@ -266,7 +295,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "Start model download",
         "Start a model download in the background.",
         &[("variant", "Model variant identifier")],
-        preview_response(),
+        json_schema_response("AdminModelActionResponse", "Model download start result"),
     );
     add_operation_with_params(
         paths,
@@ -276,7 +305,10 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "Stream download progress",
         "Server-sent model download progress events.",
         &[("variant", "Model variant identifier")],
-        event_stream_response(),
+        event_stream_schema_response(
+            "AdminModelDownloadProgressEvent",
+            "Server-sent model download progress events",
+        ),
     );
     add_operation_with_params(
         paths,
@@ -286,7 +318,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "Cancel model download",
         "Cancel an active model download.",
         &[("variant", "Model variant identifier")],
-        preview_response(),
+        json_schema_response("AdminModelActionResponse", "Model download cancel result"),
     );
     add_operation_with_params(
         paths,
@@ -296,7 +328,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "Load model",
         "Load model weights into runtime memory.",
         &[("variant", "Model variant identifier")],
-        preview_response(),
+        json_schema_response("AdminModelActionResponse", "Model load result"),
     );
     add_operation_with_params(
         paths,
@@ -306,7 +338,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "Unload model",
         "Unload model weights from runtime memory.",
         &[("variant", "Model variant identifier")],
-        preview_response(),
+        json_schema_response("AdminModelActionResponse", "Model unload result"),
     );
 
     add_collection(
@@ -782,7 +814,10 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "Media",
         "Download media",
         "Fetch persisted local media by catch-all relative path. The path may contain slashes.",
-        &[("path", "Catch-all relative media path, including nested segments")],
+        &[(
+            "path",
+            "Catch-all relative media path, including nested segments",
+        )],
         binary_response(),
     );
     add_operation(
@@ -1155,12 +1190,50 @@ fn binary_response() -> Value {
     ])
 }
 
-fn event_stream_response() -> Value {
-    response_with_statuses(&[
-        ("200", "Server-sent event stream"),
+fn json_schema_response(schema: &str, description: &str) -> Value {
+    let mut responses = response_with_statuses(&[
+        ("400", "Invalid request"),
         ("404", "Not found"),
         ("500", "Server error"),
-    ])
+    ]);
+    responses
+        .as_object_mut()
+        .expect("OpenAPI responses should be an object")
+        .insert(
+            "200".to_string(),
+            json!({
+                "description": description,
+                "content": {
+                    "application/json": {
+                        "schema": schema_ref(schema)
+                    }
+                }
+            }),
+        );
+    responses
+}
+
+fn event_stream_schema_response(schema: &str, description: &str) -> Value {
+    let mut responses = response_with_statuses(&[("404", "Not found"), ("500", "Server error")]);
+    responses
+        .as_object_mut()
+        .expect("OpenAPI responses should be an object")
+        .insert(
+            "200".to_string(),
+            json!({
+                "description": description,
+                "content": {
+                    "text/event-stream": {
+                        "schema": schema_ref(schema)
+                    }
+                }
+            }),
+        );
+    responses
+}
+
+fn schema_ref(schema: &str) -> Value {
+    json!({ "$ref": format!("#/components/schemas/{schema}") })
 }
 
 fn websocket_response() -> Value {
@@ -1857,6 +1930,39 @@ mod tests {
                 assert!(!tag.contains('-'), "{tag} should not contain hyphens");
             }
         }
+    }
+
+    #[test]
+    fn openapi_types_admin_model_discovery_contract() {
+        let openapi = document();
+        let schemas = openapi["components"]["schemas"]
+            .as_object()
+            .expect("schemas should exist");
+
+        for schema in [
+            "AdminModelsResponse",
+            "AdminModelInfo",
+            "AdminModelRouteCapabilities",
+            "AdminSpeechModelCapabilities",
+            "AdminModelActionResponse",
+            "AdminModelDownloadProgressEvent",
+        ] {
+            assert!(schemas.contains_key(schema), "{schema} schema should exist");
+        }
+
+        let paths = openapi["paths"].as_object().expect("paths should exist");
+        assert_eq!(
+            paths["/v1/admin/models"]["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["$ref"]
+                .as_str(),
+            Some("#/components/schemas/AdminModelsResponse")
+        );
+        assert_eq!(
+            paths["/v1/admin/models/{variant}/download/progress"]["get"]["responses"]["200"]
+                ["content"]["text/event-stream"]["schema"]["$ref"]
+                .as_str(),
+            Some("#/components/schemas/AdminModelDownloadProgressEvent")
+        );
     }
 
     #[test]

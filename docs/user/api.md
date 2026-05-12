@@ -682,12 +682,12 @@ Small first-party UI state APIs:
 
 ### Admin Model Management
 
-Preview local admin routes:
+Preview local admin routes. Use these routes as the OSS model lifecycle and discovery surface for voice apps: each model record includes local status, broad modalities, speech-generation capabilities when present, and route-level capability booleans.
 
 | Method | Path | Notes |
 |--------|------|-------|
-| `GET` | `/v1/admin/models` | List known enabled variants and local status. |
-| `GET` | `/v1/admin/models/{variant}` | Fetch one model status. |
+| `GET` | `/v1/admin/models` | List known enabled variants, local status, modalities, and route capabilities. |
+| `GET` | `/v1/admin/models/{variant}` | Fetch one model status and capability contract. |
 | `POST` | `/v1/admin/models/{variant}/download` | Start background download. |
 | `GET` | `/v1/admin/models/{variant}/download/progress` | SSE download progress. |
 | `POST` | `/v1/admin/models/{variant}/download/cancel` | Cancel active download. |
@@ -717,6 +717,37 @@ Speech model capabilities, when present:
   "supports_streaming": true,
   "supports_speed_control": true,
   "supports_auto_long_form": true
+}
+```
+
+Model records also expose route capability flags so clients can discover which models can drive OpenAI-compatible speech, persisted speech-to-text jobs, diarization records, Studio projects, realtime voice sessions, saved voices, forced alignment, and tokenizer workflows:
+
+```json
+{
+  "variant": "Kokoro-82M",
+  "enabled": true,
+  "status": "ready",
+  "modalities": ["text_input", "audio_output"],
+  "route_capabilities": {
+    "openai_chat_completions": false,
+    "openai_responses": false,
+    "openai_audio_speech": true,
+    "openai_audio_transcriptions": false,
+    "speech_to_text_jobs": false,
+    "speech_to_text_realtime": false,
+    "diarization_records": false,
+    "text_to_speech_records": true,
+    "voice_design_records": false,
+    "voice_clone_records": false,
+    "saved_voice_reuse": false,
+    "studio_projects": true,
+    "voice_realtime_text_model": false,
+    "voice_realtime_modular_asr": false,
+    "voice_realtime_modular_tts": true,
+    "voice_realtime_unified": false,
+    "forced_alignment": false,
+    "tokenizer": false
+  }
 }
 ```
 
