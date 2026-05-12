@@ -3,34 +3,30 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    body::Body,
-    extract::{Extension, Multipart, Path, Query, Request, State},
-    http::{header, HeaderValue, StatusCode},
-    response::{
-        sse::{Event, KeepAlive, Sse},
-        IntoResponse, Response,
-    },
     Json, RequestExt,
+    extract::{Extension, Multipart, Path, Request, State},
+    http::{HeaderValue, StatusCode, header},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::api::pagination::{encode_cursor, CursorPagination, CursorPaginationQuery};
 use crate::api::request_context::RequestContext;
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::transcription_store::{
-    CompleteTranscriptionRecord, NewTranscriptionRecord, StoredTranscriptionAudio,
-    TranscriptionProcessingStatus, TranscriptionRecord, TranscriptionRecordListCursor,
-    TranscriptionRecordSummary, TranscriptionSegmentRecord, TranscriptionStore,
+    CompleteTranscriptionRecord, NewTranscriptionRecord, TranscriptionProcessingStatus,
+    TranscriptionRecord, TranscriptionSegmentRecord, TranscriptionStore,
     TranscriptionSummaryStatus, TranscriptionWordRecord, UpdateTranscriptionSummary,
 };
 use izwi_core::{
-    parse_chat_model_variant, ChatMessage, ChatRole, GenerationParams, RuntimeService,
+    ChatMessage, ChatRole, GenerationParams, RuntimeService, parse_chat_model_variant,
 };
 
-const HISTORY_LIST_LIMIT: usize = 200;
 const DEFAULT_TRANSCRIPTION_ALIGNER_MODEL: &str = "Qwen3-ForcedAligner-0.6B";
 const DEFAULT_TRANSCRIPTION_SUMMARY_MODEL: &str = "Qwen3.5-4B";
 const DEFAULT_TRANSCRIPTION_SUMMARY_MAX_TOKENS: usize = 384;
@@ -39,12 +35,6 @@ const MAX_SEGMENT_WORDS: usize = 18;
 const MAX_SEGMENT_DURATION_SECS: f32 = 9.0;
 const MIN_SENTENCE_BREAK_WORDS: usize = 5;
 const SEGMENT_GAP_BREAK_SECS: f32 = 0.85;
-
-#[derive(Debug, Serialize)]
-pub struct TranscriptionRecordListResponse {
-    pub records: Vec<TranscriptionRecordSummary>,
-    pub pagination: CursorPagination,
-}
 
 #[derive(Debug, Serialize)]
 pub struct DeleteTranscriptionRecordResponse {
@@ -125,57 +115,6 @@ struct GeneratedTranscriptionArtifacts {
     aligner_model_id: Option<String>,
     segments: Vec<TranscriptionSegmentRecord>,
     words: Vec<TranscriptionWordRecord>,
-}
-
-pub async fn list_records(
-    State(state): State<AppState>,
-    Query(query): Query<CursorPaginationQuery>,
-) -> Result<Json<TranscriptionRecordListResponse>, ApiError> {
-    let limit = query.resolved_limit(HISTORY_LIST_LIMIT, 500);
-    let cursor = query.decode_cursor::<TranscriptionRecordListCursor>()?;
-    let (records, next_cursor) = state
-        .transcription_store
-        .list_records_page(limit, cursor)
-        .await
-        .map_err(map_store_error)?;
-
-    let has_more = next_cursor.is_some();
-    Ok(Json(TranscriptionRecordListResponse {
-        records,
-        pagination: CursorPagination {
-            next_cursor: next_cursor.map(|value| encode_cursor(&value)),
-            has_more,
-            limit,
-        },
-    }))
-}
-
-pub async fn get_record(
-    State(state): State<AppState>,
-    Path(record_id): Path<String>,
-) -> Result<Json<TranscriptionRecord>, ApiError> {
-    let record = state
-        .transcription_store
-        .get_record(record_id)
-        .await
-        .map_err(map_store_error)?
-        .ok_or_else(|| ApiError::not_found("Transcription record not found"))?;
-
-    Ok(Json(record))
-}
-
-pub async fn get_record_audio(
-    State(state): State<AppState>,
-    Path(record_id): Path<String>,
-) -> Result<Response, ApiError> {
-    let audio = state
-        .transcription_store
-        .get_audio(record_id)
-        .await
-        .map_err(map_store_error)?
-        .ok_or_else(|| ApiError::not_found("Transcription audio not found"))?;
-
-    Ok(audio_response(audio))
 }
 
 pub async fn delete_record(
@@ -1022,38 +961,6 @@ fn truncate_summary_error(raw: &str) -> String {
     raw.chars().take(MAX_ERROR_CHARS).collect::<String>()
 }
 
-fn audio_response(audio: StoredTranscriptionAudio) -> Response {
-    let mut response = Response::builder()
-        .status(StatusCode::OK)
-        .body(Body::from(audio.audio_bytes));
-
-    if let Ok(content_type) = HeaderValue::from_str(audio.audio_mime_type.as_str()) {
-        response = response.map(|mut body| {
-            let headers = body.headers_mut();
-            headers.insert(header::CONTENT_TYPE, content_type);
-            body
-        });
-    }
-
-    if let Some(filename) = audio.audio_filename {
-        let disposition = format!("inline; filename=\"{}\"", filename.replace('"', ""));
-        if let Ok(value) = HeaderValue::from_str(disposition.as_str()) {
-            response = response.map(|mut body| {
-                let headers = body.headers_mut();
-                headers.insert(header::CONTENT_DISPOSITION, value);
-                body
-            });
-        }
-    }
-
-    response.unwrap_or_else(|_| {
-        Response::builder()
-            .status(StatusCode::OK)
-            .body(Body::empty())
-            .unwrap_or_else(|_| Response::new(Body::empty()))
-    })
-}
-
 fn map_store_error(err: anyhow::Error) -> ApiError {
     ApiError::internal(format!("Transcription storage error: {err}"))
 }
@@ -1061,8 +968,8 @@ fn map_store_error(err: anyhow::Error) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::{
-        alignments_to_word_records, build_segment_records, initial_summary_state, parse_bool,
-        sanitize_summary_output, TranscriptionSummaryStatus, TranscriptionWordRecord,
+        TranscriptionSummaryStatus, TranscriptionWordRecord, alignments_to_word_records,
+        build_segment_records, initial_summary_state, parse_bool, sanitize_summary_output,
     };
 
     #[test]

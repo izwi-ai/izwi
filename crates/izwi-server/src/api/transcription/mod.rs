@@ -1,4 +1,4 @@
-//! First-party persisted transcription resource routes for the desktop UI.
+//! First-party persisted speech-to-text job routes for the desktop UI.
 
 mod handlers;
 mod realtime;
@@ -6,19 +6,15 @@ mod unified_read;
 mod unified_write;
 
 use axum::{
+    Router,
     extract::DefaultBodyLimit,
     routing::{get, post},
-    Router,
 };
 
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
     const AUDIO_UPLOAD_LIMIT_BYTES: usize = 64 * 1024 * 1024;
-    const CANONICAL_COLLECTION: &str = "/transcriptions";
-    const CANONICAL_MEMBER: &str = "/transcriptions/{record_id}";
-    const CANONICAL_AUDIO: &str = "/transcriptions/{record_id}/audio";
-    const CANONICAL_SUMMARY_REGENERATE: &str = "/transcriptions/{record_id}/summary/regenerate";
     const CANONICAL_UNIFIED_COLLECTION: &str = "/speech-to-text/jobs";
     const CANONICAL_UNIFIED_MEMBER: &str = "/speech-to-text/jobs/{record_id}";
     const CANONICAL_UNIFIED_AUDIO: &str = "/speech-to-text/jobs/{record_id}/audio";
@@ -28,12 +24,6 @@ pub fn router() -> Router<AppState> {
         "/speech-to-text/jobs/{record_id}/summary/regenerate";
 
     Router::new()
-        .route(
-            CANONICAL_COLLECTION,
-            get(handlers::list_records)
-                .post(handlers::create_record)
-                .layer(DefaultBodyLimit::max(AUDIO_UPLOAD_LIMIT_BYTES)),
-        )
         .merge(realtime::router())
         .route(
             CANONICAL_UNIFIED_COLLECTION,
@@ -54,14 +44,5 @@ pub fn router() -> Router<AppState> {
         .route(
             CANONICAL_UNIFIED_SUMMARY_REGENERATE,
             post(unified_write::regenerate_job_summary),
-        )
-        .route(
-            CANONICAL_MEMBER,
-            get(handlers::get_record).delete(handlers::delete_record),
-        )
-        .route(CANONICAL_AUDIO, get(handlers::get_record_audio))
-        .route(
-            CANONICAL_SUMMARY_REGENERATE,
-            post(handlers::regenerate_summary),
         )
 }

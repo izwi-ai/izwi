@@ -24,7 +24,6 @@ When `izwi serve` is running:
 | `/v1/audio/transcriptions` | Stable | OpenAI-compatible transcription endpoint with local streaming support. |
 | `/livez`, `/readyz`, `/v1/live`, `/v1/ready`, `/v1/health` | Stable | Operational health and readiness endpoints. |
 | `/v1/responses*` | Preview | OpenAI-compatible Responses API shape with process-local response retention. |
-| `/v1/audio/diarizations` | Preview | Izwi diarization API; OpenAI-style transport, not an upstream OpenAI endpoint. |
 | First-party workflow routes | Preview | Persisted local product APIs used by the web UI and desktop app. |
 | `/v1/admin/*` | Preview | Local model-management APIs. Bind carefully on shared hosts. |
 | WebSocket realtime routes | Preview | Browser-facing low-latency protocols that may evolve. |
@@ -347,41 +346,6 @@ curl -X POST http://localhost:8080/v1/audio/transcriptions \
   -F "response_format=verbose_json"
 ```
 
-### Audio Diarizations
-
-`POST /v1/audio/diarizations`
-
-This route is Izwi-specific preview API. It accepts JSON or multipart input in the same style as transcription.
-
-Request fields:
-
-| Field | Notes |
-|-------|-------|
-| `audio_base64`, `file`, `audio` | Audio input. |
-| `model` or `diarization_model` | Diarization model variant. |
-| `asr_model` | Optional ASR override. |
-| `aligner_model` | Optional forced aligner override. |
-| `llm_model` | Optional transcript refinement model. |
-| `response_format` | `json`, `verbose_json`, or `text`. |
-| `num_speakers` | Legacy shortcut that sets min and max to the same value. |
-| `min_speakers`, `max_speakers` | Speaker bounds. |
-| `min_speech_duration_ms`, `min_silence_duration_ms` | VAD tuning. |
-| `enable_llm_refinement` | Enables LLM transcript refinement. |
-| `stream` | Accepted, but `true` returns `400`; streaming diarization is not supported. |
-
-`json` response:
-
-```json
-{
-  "segments": [
-    { "speaker": "SPEAKER_00", "start": 0.0, "end": 5.2, "confidence": 0.91 }
-  ],
-  "transcript": "SPEAKER_00 [0.00s - 5.20s]: Welcome."
-}
-```
-
-`verbose_json` adds `words`, `utterances`, `asr_text`, `raw_transcript`, `llm_refined`, `alignment_coverage`, `unattributed_words`, `speaker_count`, `duration`, `processing_time_ms`, and `rtf`.
-
 ### Responses
 
 `POST /v1/responses`
@@ -459,9 +423,14 @@ runtime routes were removed.
 | `/v1/voice-clone-generations` | `/v1/voice-clones` |
 | `/v1/transcriptions/jobs` | `/v1/speech-to-text/jobs` |
 | `/v1/transcription/realtime/ws` | `/v1/speech-to-text/realtime/ws` |
+| `/v1/audio/diarize` | `/v1/speech-to-text/jobs?job_kind=diarization` |
+| `/v1/audio/diarizations` | `/v1/speech-to-text/jobs?job_kind=diarization` |
 
-Response payloads, record IDs, pagination, audio download behavior, and SSE
-event names are unchanged.
+The speech history and speech-to-text renames keep response payloads, record IDs,
+pagination, audio download behavior, and SSE event names unchanged. The removed
+direct audio diarization routes now use the persisted speech-to-text job flow:
+create a job, poll the returned record until `processing_status` is `ready`, and
+then read the diarization fields from that job record.
 
 ### Speech-Text Jobs
 

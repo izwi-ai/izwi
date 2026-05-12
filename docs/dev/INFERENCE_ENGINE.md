@@ -565,7 +565,6 @@ These routes back the desktop UI's saved history and reusable assets. Canonical 
 |---|---|---|
 | `POST` | `/v1/audio/speech` | Text-to-speech synthesis |
 | `POST` | `/v1/audio/transcriptions` | Speech-to-text (Whisper) |
-| `POST` | `/v1/audio/diarizations` | Izwi-specific diarization API |
 | `POST` | `/v1/chat/completions` | Chat / LLM completions |
 | `GET` | `/v1/models` | List available models |
 | `GET` | `/v1/models/:model` | Fetch one available model |

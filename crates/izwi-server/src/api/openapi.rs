@@ -210,15 +210,6 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
 
     add_operation(
         paths,
-        "/v1/audio/diarizations",
-        "post",
-        "Diarization",
-        "Create diarization",
-        "Izwi-specific diarization endpoint accepting JSON or multipart audio input.",
-        preview_response(),
-    );
-    add_operation(
-        paths,
         "/v1/admin/models",
         "get",
         "Admin",
@@ -1763,7 +1754,6 @@ mod tests {
 
         let paths = openapi["paths"].as_object().expect("paths should exist");
         let expected = [
-            ("/v1/audio/diarizations", "post", "Diarization"),
             (
                 "/v1/admin/models/{variant}/download/progress",
                 "get",
@@ -1811,6 +1801,8 @@ mod tests {
             "/v1/voice-clone-generations",
             "/v1/transcriptions/jobs",
             "/v1/transcription/realtime/ws",
+            "/v1/audio/diarize",
+            "/v1/audio/diarizations",
         ] {
             assert!(
                 !paths.contains_key(removed_path),
@@ -1947,6 +1939,7 @@ mod tests {
 
         for legacy_path in [
             "/v1/audio/diarize",
+            "/v1/audio/diarizations",
             "/v1/transcriptions",
             "/v1/transcriptions/{record_id}",
             "/v1/transcriptions/{record_id}/audio",

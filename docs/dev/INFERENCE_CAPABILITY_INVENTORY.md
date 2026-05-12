@@ -96,7 +96,7 @@ behavior change is approved separately.
 | First-party ASR | Transcription jobs, background execution, summaries, export paths, realtime transcription websocket. |
 | Chat/Responses | `/v1/chat/completions`, `/v1/responses`, streaming and non-streaming responses, media/tool normalization. |
 | Realtime voice | Modular voice, unified audio-chat voice, barge-in, interruption, transcript events, audio events, turn persistence. |
-| Diarization | `/v1/audio/diarizations`, first-party jobs, ASR attribution, forced alignment, optional LLM refinement, exports. |
+| Diarization | First-party speech-to-text jobs with `job_kind=diarization`, ASR attribution, forced alignment, optional LLM refinement, exports. |
 | Model ops | Model list, download, cancel download, load, unload, delete, lifecycle snapshots. |
 | Metrics | `/v1/metrics`, `/v1/metrics/prometheus`, `/internal/*` aliases, existing runtime and voice counters. |
 | CLI/UI | `tts`, `transcribe`, `diarize`, `chat`, bench commands, and existing UI routes for TTS, speech-text, diarization, chat, voice, and models. |
