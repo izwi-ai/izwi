@@ -1,4 +1,7 @@
-use axum::{routing::get, Router};
+use axum::{
+    Router,
+    routing::{get, post},
+};
 
 use crate::state::AppState;
 
@@ -18,9 +21,26 @@ pub fn router() -> Router<AppState> {
             "/voice/observations/{observation_id}",
             axum::routing::delete(handlers::delete_voice_observation),
         )
-        .route("/voice/sessions", get(handlers::list_voice_sessions))
+        .route(
+            "/voice/sessions",
+            get(handlers::list_voice_sessions).post(handlers::create_voice_session),
+        )
+        .route(
+            "/voice/sessions/{session_id}/turns",
+            get(handlers::list_voice_session_turns),
+        )
+        .route(
+            "/voice/sessions/{session_id}/end",
+            post(handlers::end_voice_session),
+        )
+        .route(
+            "/voice/sessions/{session_id}/export",
+            get(handlers::export_voice_session),
+        )
         .route(
             "/voice/sessions/{session_id}",
-            get(handlers::get_voice_session),
+            get(handlers::get_voice_session)
+                .patch(handlers::update_voice_session)
+                .delete(handlers::delete_voice_session),
         )
 }

@@ -1,11 +1,11 @@
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryResult, Set,
 };
 use serde::Serialize;
 
-use crate::db::{raw, StoreDatabase};
+use crate::db::{StoreDatabase, raw};
 use crate::entity::{voice_profiles, voice_sessions, voice_turns};
 use crate::ids::new_uuid;
 use crate::voice_defaults::{DEFAULT_VOICE_AGENT_SYSTEM_PROMPT, DEFAULT_VOICE_PROFILE_ID};
@@ -177,22 +177,65 @@ impl VoiceStore {
             .ok_or_else(|| anyhow!("Created voice session not found"))
     }
 
-    pub async fn end_session(&self, session_id: String) -> anyhow::Result<()> {
+    pub async fn end_session(&self, session_id: String) -> anyhow::Result<bool> {
         let db = self.db.connection().await?;
         let now = now_unix_millis_i64();
-        db.execute_raw(raw::statement(
-            db,
-            r#"
-            UPDATE voice_sessions
-            SET updated_at = ?1,
-                ended_at = COALESCE(ended_at, ?1)
-            WHERE id = ?2
-            "#,
-            vec![now.into(), session_id.into()],
-        )?)
-        .await
-        .context("Failed to end voice session")?;
-        Ok(())
+        let result = db
+            .execute_raw(raw::statement(
+                db,
+                r#"
+                UPDATE voice_sessions
+                SET updated_at = ?1,
+                    ended_at = COALESCE(ended_at, ?1)
+                WHERE id = ?2
+                "#,
+                vec![now.into(), session_id.into()],
+            )?)
+            .await
+            .context("Failed to end voice session")?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn update_session_system_prompt(
+        &self,
+        session_id: String,
+        system_prompt: String,
+    ) -> anyhow::Result<bool> {
+        let db = self.db.connection().await?;
+        let now = now_unix_millis_i64();
+        let system_prompt = sanitize_prompt(Some(system_prompt.as_str()))
+            .ok_or_else(|| anyhow!("Missing required session system prompt"))?;
+        let result = voice_sessions::Entity::update_many()
+            .col_expr(
+                voice_sessions::Column::SystemPrompt,
+                Expr::value(system_prompt),
+            )
+            .col_expr(voice_sessions::Column::UpdatedAt, Expr::value(now))
+            .filter(voice_sessions::Column::Id.eq(session_id))
+            .exec(db)
+            .await
+            .context("Failed to update voice session")?;
+        Ok(result.rows_affected > 0)
+    }
+
+    pub async fn delete_session(&self, session_id: String) -> anyhow::Result<bool> {
+        let db = self.db.connection().await?;
+        let result = voice_sessions::Entity::delete_by_id(session_id)
+            .exec(db)
+            .await
+            .context("Failed to delete voice session")?;
+        Ok(result.rows_affected > 0)
+    }
+
+    pub async fn list_turns(
+        &self,
+        session_id: String,
+    ) -> anyhow::Result<Option<Vec<VoiceTurnRecord>>> {
+        let db = self.db.connection().await?;
+        if fetch_session_summary(db, &session_id).await?.is_none() {
+            return Ok(None);
+        }
+        list_session_turns(db, &session_id).await.map(Some)
     }
 
     pub async fn list_sessions(&self, limit: usize) -> anyhow::Result<Vec<VoiceSessionSummary>> {
@@ -685,11 +728,7 @@ fn sanitize_optional_text(raw: Option<&str>, max_len: usize) -> Option<String> {
 }
 
 fn bool_to_i64(value: bool) -> i64 {
-    if value {
-        1
-    } else {
-        0
-    }
+    if value { 1 } else { 0 }
 }
 
 fn i64_to_bool(value: i64) -> bool {
@@ -796,6 +835,35 @@ mod tests {
         assert_eq!(fetched.turns[0].user_text.as_deref(), Some("Hello there"));
         assert_eq!(fetched.turns[0].assistant_text.as_deref(), Some("Hi!"));
         assert!(fetched.session.ended_at.is_some());
+
+        let turns = store
+            .list_turns(session.id.clone())
+            .await
+            .expect("list turns")
+            .expect("session turns");
+        assert_eq!(turns.len(), 1);
+
+        let updated = store
+            .update_session_system_prompt(
+                session.id.clone(),
+                "Updated voice session prompt.".to_string(),
+            )
+            .await
+            .expect("update session prompt");
+        assert!(updated);
+
+        let deleted = store
+            .delete_session(session.id.clone())
+            .await
+            .expect("delete session");
+        assert!(deleted);
+        assert!(
+            store
+                .get_session(session.id)
+                .await
+                .expect("get deleted session")
+                .is_none()
+        );
 
         std::env::remove_var("IZWI_DB_PATH");
         std::env::remove_var("IZWI_MEDIA_DIR");
