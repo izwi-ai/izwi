@@ -16,17 +16,17 @@ use std::time::Instant;
 use candle_core::{DType, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::whisper::{
-    self, Config as WhisperConfig, model::Whisper as CandleWhisper,
+    self, model::Whisper as CandleWhisper, Config as WhisperConfig,
 };
-use flate2::Compression;
 use flate2::write::ZlibEncoder;
+use flate2::Compression;
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::json;
 use tracing::info;
 
 use crate::audio::{MelConfig, MelSpectrogram};
-use crate::backends::DeviceProfile;
+use crate::backends::{DeviceKind, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::tokenizer::Tokenizer;
@@ -269,6 +269,27 @@ fn use_cuda_whisper_dtype_shim(device: &candle_core::Device) -> bool {
     device.is_cuda()
 }
 
+fn whisper_device_diagnostics(
+    device_kind: DeviceKind,
+    model_dtype: DType,
+    cuda_dtype_shim: bool,
+) -> serde_json::Value {
+    json!({
+        "kind": format!("{device_kind:?}"),
+        "model_dtype": format!("{model_dtype:?}"),
+        "cuda_dtype_shim": cuda_dtype_shim,
+        "whisper_impl": whisper_impl_name(cuda_dtype_shim),
+    })
+}
+
+fn whisper_impl_name(cuda_dtype_shim: bool) -> &'static str {
+    if cuda_dtype_shim {
+        "cuda_dtype_shim"
+    } else {
+        "upstream_candle"
+    }
+}
+
 pub struct WhisperTurboAsrModel {
     device: DeviceProfile,
     model_dtype: DType,
@@ -283,6 +304,7 @@ pub struct WhisperTurboAsrModel {
     language_token_ids: Vec<u32>,
     token_id_to_language_code: HashMap<u32, String>,
     runtime_tuning: WhisperRuntimeTuning,
+    cuda_dtype_shim: bool,
     cached_detected_language: Mutex<Option<(u32, String)>>,
 }
 
@@ -386,6 +408,7 @@ impl WhisperTurboAsrModel {
             language_token_ids,
             token_id_to_language_code,
             runtime_tuning,
+            cuda_dtype_shim: use_cuda_dtype_shim,
             cached_detected_language: Mutex::new(None),
         })
     }
@@ -606,6 +629,11 @@ impl WhisperTurboAsrModel {
         };
         let diagnostics = json!({
             "model_family": "whisper_asr",
+            "device": whisper_device_diagnostics(
+                self.device.kind,
+                self.model_dtype,
+                self.cuda_dtype_shim,
+            ),
             "fallback_attempts": attempted_temperatures.len(),
             "attempted_temperatures": attempted_temperatures,
             "fallback_policy": {
@@ -2088,16 +2116,57 @@ fn decode_step_budget(
 #[cfg(test)]
 mod tests {
     use super::{
-        WhisperDecodeAttempt, WhisperSpecialTokens, adaptive_decode_budget,
-        apply_whisper_decode_constraints, build_whisper_prompt_prefix, capped_decode_temperatures,
-        decode_retry_reasons, decode_step_budget, find_suffix_token_repetition,
-        has_low_word_diversity, logits_to_log_probs, logits_to_log_probs_in_place, text_delta,
-        token_contains_numeral_or_symbol, trimmed_audio_bounds, use_cuda_whisper_dtype_shim,
+        adaptive_decode_budget, apply_whisper_decode_constraints, build_whisper_prompt_prefix,
+        capped_decode_temperatures, decode_retry_reasons, decode_step_budget,
+        find_suffix_token_repetition, has_low_word_diversity, logits_to_log_probs,
+        logits_to_log_probs_in_place, text_delta, token_contains_numeral_or_symbol,
+        trimmed_audio_bounds, use_cuda_whisper_dtype_shim, whisper_device_diagnostics,
+        whisper_impl_name, WhisperDecodeAttempt, WhisperSpecialTokens,
     };
 
     #[test]
     fn whisper_dtype_shim_is_cuda_only() {
         assert!(!use_cuda_whisper_dtype_shim(&candle_core::Device::Cpu));
+    }
+
+    #[test]
+    fn whisper_device_diagnostics_keep_cpu_and_metal_on_upstream_f32() {
+        for kind in [
+            crate::backends::DeviceKind::Cpu,
+            crate::backends::DeviceKind::Metal,
+        ] {
+            let diagnostics = whisper_device_diagnostics(kind, candle_core::DType::F32, false);
+            let expected_kind = format!("{kind:?}");
+
+            assert_eq!(
+                diagnostics.get("kind").and_then(|value| value.as_str()),
+                Some(expected_kind.as_str())
+            );
+            assert_eq!(
+                diagnostics
+                    .get("model_dtype")
+                    .and_then(|value| value.as_str()),
+                Some("F32")
+            );
+            assert_eq!(
+                diagnostics
+                    .get("cuda_dtype_shim")
+                    .and_then(|value| value.as_bool()),
+                Some(false)
+            );
+            assert_eq!(
+                diagnostics
+                    .get("whisper_impl")
+                    .and_then(|value| value.as_str()),
+                Some("upstream_candle")
+            );
+        }
+    }
+
+    #[test]
+    fn whisper_impl_name_marks_cuda_dtype_shim_explicitly() {
+        assert_eq!(whisper_impl_name(false), "upstream_candle");
+        assert_eq!(whisper_impl_name(true), "cuda_dtype_shim");
     }
 
     #[test]
