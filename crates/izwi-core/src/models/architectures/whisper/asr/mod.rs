@@ -111,6 +111,29 @@ struct WhisperDecodeAttempt {
     generated_token_count: usize,
     sampled_token_count: usize,
     decode_steps: usize,
+    profile: WhisperDecodeProfile,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct WhisperDecodeProfile {
+    enabled: bool,
+    synchronized: bool,
+    token_tensor_ms: f64,
+    decoder_forward_ms: f64,
+    final_linear_ms: f64,
+    logits_to_host_ms: f64,
+    sampling_ms: f64,
+    step_total_ms: f64,
+}
+
+impl WhisperDecodeProfile {
+    fn new(sync_enabled: bool) -> Self {
+        Self {
+            enabled: sync_enabled,
+            synchronized: sync_enabled,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +157,7 @@ struct WhisperRuntimeTuning {
     suppress_blank: bool,
     suppress_numerals: bool,
     initial_prompt_max_tokens: usize,
+    profile_sync_timings: bool,
 }
 
 impl WhisperRuntimeTuning {
@@ -172,6 +196,7 @@ impl WhisperRuntimeTuning {
             suppress_numerals: env_bool("IZWI_WHISPER_SUPPRESS_NUMERALS").unwrap_or(false),
             initial_prompt_max_tokens: env_usize("IZWI_WHISPER_INITIAL_PROMPT_MAX_TOKENS")
                 .unwrap_or(DEFAULT_INITIAL_PROMPT_MAX_TOKENS),
+            profile_sync_timings: env_bool("IZWI_WHISPER_PROFILE_SYNC").unwrap_or(false),
         }
     }
 }
@@ -263,6 +288,10 @@ impl WhisperModel {
             Self::Cuda(model) => model.decoder.final_linear(x).map_err(Error::from),
         }
     }
+}
+
+fn elapsed_ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
 }
 
 fn use_cuda_whisper_dtype_shim(device: &candle_core::Device) -> bool {
@@ -503,9 +532,11 @@ impl WhisperTurboAsrModel {
             .map_err(|_| Error::InferenceError("Whisper model mutex poisoned".to_string()))?;
 
         whisper.reset_kv_cache();
+        self.synchronize_profile_device()?;
         let encoder_started = Instant::now();
         let audio_features = whisper.encoder_forward(&mel, true)?;
-        let encoder_forward_ms = encoder_started.elapsed().as_secs_f64() * 1000.0;
+        self.synchronize_profile_device()?;
+        let encoder_forward_ms = elapsed_ms(encoder_started);
 
         let language_resolution =
             self.resolve_request_language(&mut whisper, &audio_features, language)?;
@@ -617,6 +648,7 @@ impl WhisperTurboAsrModel {
             generated_token_count: 0,
             sampled_token_count: 0,
             decode_steps: 0,
+            profile: WhisperDecodeProfile::new(self.runtime_tuning.profile_sync_timings),
         });
 
         let text = final_attempt.text.trim().to_string();
@@ -694,6 +726,15 @@ impl WhisperTurboAsrModel {
                 "generated_token_count": final_attempt.generated_token_count,
                 "sampled_token_count": final_attempt.sampled_token_count,
                 "generated_tokens_per_second": generated_tokens_per_second,
+                "profile": whisper_decode_profile_diagnostics(&final_attempt.profile),
+            },
+            "profiling": {
+                "sync_enabled": self.runtime_tuning.profile_sync_timings,
+                "timing_mode": if self.runtime_tuning.profile_sync_timings {
+                    "device_synchronized"
+                } else {
+                    "wall_clock"
+                },
             },
             "timings_ms": {
                 "mel_prepare": mel_prepare_ms,
@@ -859,6 +900,13 @@ impl WhisperTurboAsrModel {
             return Ok(mel.to_dtype(self.model_dtype)?);
         }
         Ok(mel)
+    }
+
+    fn synchronize_profile_device(&self) -> Result<()> {
+        if self.runtime_tuning.profile_sync_timings {
+            self.device.device.synchronize()?;
+        }
+        Ok(())
     }
 
     fn resolve_language_token(&self, language: &str) -> Result<Option<(u32, String)>> {
@@ -1033,9 +1081,11 @@ impl WhisperTurboAsrModel {
             }
         }
 
+        self.synchronize_profile_device()?;
         let detect_started = Instant::now();
         let resolved = self.detect_language_token(whisper, audio_features)?;
-        let detect_ms = detect_started.elapsed().as_secs_f64() * 1000.0;
+        self.synchronize_profile_device()?;
+        let detect_ms = elapsed_ms(detect_started);
         if let Some((token, code)) = resolved.as_ref() {
             self.update_cached_language(*token, code.clone());
         }
@@ -1277,19 +1327,66 @@ impl WhisperTurboAsrModel {
         let mut ended_with_eot = false;
         let mut repetition_loop = false;
         let mut decode_steps = 0usize;
+        let profile_enabled = self.runtime_tuning.profile_sync_timings;
+        let mut profile = WhisperDecodeProfile::new(profile_enabled);
 
         for step_idx in 0..max_steps {
             decode_steps = decode_steps.saturating_add(1);
-            let tokens_t = Tensor::new(prompt.as_slice(), &self.device.device)?.unsqueeze(0)?;
-            let ys = whisper.decoder_forward(&tokens_t, audio_features, step_idx == 0)?;
+            self.synchronize_profile_device()?;
+            let step_started = if profile_enabled {
+                Some(Instant::now())
+            } else {
+                None
+            };
+            let tokens_t = if profile_enabled {
+                let started = Instant::now();
+                let tokens = Tensor::new(prompt.as_slice(), &self.device.device)?.unsqueeze(0)?;
+                self.synchronize_profile_device()?;
+                profile.token_tensor_ms += elapsed_ms(started);
+                tokens
+            } else {
+                Tensor::new(prompt.as_slice(), &self.device.device)?.unsqueeze(0)?
+            };
+            let ys = if profile_enabled {
+                let started = Instant::now();
+                let ys = whisper.decoder_forward(&tokens_t, audio_features, step_idx == 0)?;
+                self.synchronize_profile_device()?;
+                profile.decoder_forward_ms += elapsed_ms(started);
+                ys
+            } else {
+                whisper.decoder_forward(&tokens_t, audio_features, step_idx == 0)?
+            };
             let (_, seq_len, _) = ys.dims3()?;
-            let logits = whisper
-                .decoder_final_linear(&ys.i((..1, seq_len - 1..))?)?
-                .i(0)?
-                .i(0)?;
+            let logits = if profile_enabled {
+                let started = Instant::now();
+                let logits = whisper
+                    .decoder_final_linear(&ys.i((..1, seq_len - 1..))?)?
+                    .i(0)?
+                    .i(0)?;
+                self.synchronize_profile_device()?;
+                profile.final_linear_ms += elapsed_ms(started);
+                logits
+            } else {
+                whisper
+                    .decoder_final_linear(&ys.i((..1, seq_len - 1..))?)?
+                    .i(0)?
+                    .i(0)?
+            };
 
-            let mut logits_vec = logits.to_vec1::<f32>()?;
+            let mut logits_vec = if profile_enabled {
+                let started = Instant::now();
+                let logits_vec = logits.to_vec1::<f32>()?;
+                profile.logits_to_host_ms += elapsed_ms(started);
+                logits_vec
+            } else {
+                logits.to_vec1::<f32>()?
+            };
             self.apply_decode_constraints(&mut logits_vec, step_idx == 0);
+            let sampling_started = if profile_enabled {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let (next, next_logprob, step_no_speech_prob) = if deterministic {
                 let inv_temperature = 1.0f32 / temperature.max(1e-6);
                 if let Some(logsumexp) = scaled_logsumexp(&logits_vec, inv_temperature) {
@@ -1326,12 +1423,18 @@ impl WhisperTurboAsrModel {
                 );
                 (next, next_logprob, no_speech_prob)
             };
+            if let Some(started) = sampling_started {
+                profile.sampling_ms += elapsed_ms(started);
+            }
 
             if step_idx == 0 {
                 no_speech_prob = step_no_speech_prob;
             }
             sum_logprobs += next_logprob as f64;
             sampled_token_count = sampled_token_count.saturating_add(1);
+            if let Some(started) = step_started {
+                profile.step_total_ms += elapsed_ms(started);
+            }
 
             if next == self.special.eot {
                 ended_with_eot = true;
@@ -1372,6 +1475,7 @@ impl WhisperTurboAsrModel {
             generated_token_count: generated_tokens.len(),
             sampled_token_count,
             decode_steps,
+            profile,
         })
     }
 
@@ -1396,6 +1500,7 @@ impl WhisperTurboAsrModel {
         let mut streamed_text = String::new();
         let mut log_probs_buf = Vec::<f32>::new();
         let mut decode_steps = 0usize;
+        let profile = WhisperDecodeProfile::new(false);
 
         for step_idx in 0..max_steps {
             decode_steps = decode_steps.saturating_add(1);
@@ -1500,6 +1605,7 @@ impl WhisperTurboAsrModel {
             generated_token_count: generated_tokens.len(),
             sampled_token_count,
             decode_steps,
+            profile,
         })
     }
 
@@ -2009,6 +2115,26 @@ fn whisper_attempt_diagnostics(
         "sampled_token_count": attempt.sampled_token_count,
         "retry_reasons": retry_reasons,
         "no_speech": no_speech_skip,
+        "profile": whisper_decode_profile_diagnostics(&attempt.profile),
+    })
+}
+
+fn whisper_decode_profile_diagnostics(profile: &WhisperDecodeProfile) -> serde_json::Value {
+    let measured_ms = profile.token_tensor_ms
+        + profile.decoder_forward_ms
+        + profile.final_linear_ms
+        + profile.logits_to_host_ms
+        + profile.sampling_ms;
+    json!({
+        "enabled": profile.enabled,
+        "synchronized": profile.synchronized,
+        "token_tensor_ms": profile.token_tensor_ms,
+        "decoder_forward_ms": profile.decoder_forward_ms,
+        "final_linear_ms": profile.final_linear_ms,
+        "logits_to_host_ms": profile.logits_to_host_ms,
+        "sampling_ms": profile.sampling_ms,
+        "step_total_ms": profile.step_total_ms,
+        "unattributed_ms": (profile.step_total_ms - measured_ms).max(0.0),
     })
 }
 
@@ -2120,8 +2246,9 @@ mod tests {
         capped_decode_temperatures, decode_retry_reasons, decode_step_budget,
         find_suffix_token_repetition, has_low_word_diversity, logits_to_log_probs,
         logits_to_log_probs_in_place, text_delta, token_contains_numeral_or_symbol,
-        trimmed_audio_bounds, use_cuda_whisper_dtype_shim, whisper_device_diagnostics,
-        whisper_impl_name, WhisperDecodeAttempt, WhisperSpecialTokens,
+        trimmed_audio_bounds, use_cuda_whisper_dtype_shim, whisper_decode_profile_diagnostics,
+        whisper_device_diagnostics, whisper_impl_name, WhisperDecodeAttempt, WhisperDecodeProfile,
+        WhisperSpecialTokens,
     };
 
     #[test]
@@ -2167,6 +2294,39 @@ mod tests {
     fn whisper_impl_name_marks_cuda_dtype_shim_explicitly() {
         assert_eq!(whisper_impl_name(false), "upstream_candle");
         assert_eq!(whisper_impl_name(true), "cuda_dtype_shim");
+    }
+
+    #[test]
+    fn whisper_decode_profile_reports_synchronized_stage_timings() {
+        let profile = WhisperDecodeProfile {
+            enabled: true,
+            synchronized: true,
+            token_tensor_ms: 1.0,
+            decoder_forward_ms: 2.0,
+            final_linear_ms: 3.0,
+            logits_to_host_ms: 4.0,
+            sampling_ms: 5.0,
+            step_total_ms: 20.0,
+        };
+
+        let diagnostics = whisper_decode_profile_diagnostics(&profile);
+
+        assert_eq!(
+            diagnostics.get("enabled").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            diagnostics
+                .get("synchronized")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            diagnostics
+                .get("unattributed_ms")
+                .and_then(|value| value.as_f64()),
+            Some(5.0)
+        );
     }
 
     #[test]
@@ -2417,6 +2577,7 @@ mod tests {
             generated_token_count: 8,
             sampled_token_count: 9,
             decode_steps: 9,
+            profile: WhisperDecodeProfile::default(),
         };
 
         let reasons = decode_retry_reasons(&attempt, -1.0, Some(2.4));
