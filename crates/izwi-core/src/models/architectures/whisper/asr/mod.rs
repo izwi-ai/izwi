@@ -21,7 +21,7 @@ use flate2::Compression;
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::json;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::audio::{MelConfig, MelSpectrogram};
 use crate::backends::{DeviceKind, DeviceProfile};
@@ -122,6 +122,9 @@ struct WhisperDecodeProfile {
     logits_to_host_ms: f64,
     sampling_ms: f64,
     step_total_ms: f64,
+    device_greedy_steps: usize,
+    device_greedy_fallbacks: usize,
+    host_logits_steps: usize,
 }
 
 impl WhisperDecodeProfile {
@@ -156,6 +159,7 @@ struct WhisperRuntimeTuning {
     suppress_numerals: bool,
     initial_prompt_max_tokens: usize,
     profile_sync_timings: bool,
+    device_greedy_decode: bool,
 }
 
 impl WhisperRuntimeTuning {
@@ -195,6 +199,7 @@ impl WhisperRuntimeTuning {
             initial_prompt_max_tokens: env_usize("IZWI_WHISPER_INITIAL_PROMPT_MAX_TOKENS")
                 .unwrap_or(DEFAULT_INITIAL_PROMPT_MAX_TOKENS),
             profile_sync_timings: env_bool("IZWI_WHISPER_PROFILE_SYNC").unwrap_or(false),
+            device_greedy_decode: env_bool("IZWI_WHISPER_DEVICE_GREEDY").unwrap_or(true),
         }
     }
 }
@@ -321,6 +326,8 @@ pub struct WhisperTurboAsrModel {
     mel: MelSpectrogram,
     suppress_tokens: Vec<u32>,
     numeral_symbol_tokens: Vec<u32>,
+    decode_mask: Tensor,
+    decode_begin_mask: Tensor,
     language_token_ids: Vec<u32>,
     token_id_to_language_code: HashMap<u32, String>,
     runtime_tuning: WhisperRuntimeTuning,
@@ -398,6 +405,17 @@ impl WhisperTurboAsrModel {
         } else {
             Vec::new()
         };
+        let (decode_mask, decode_begin_mask) = build_whisper_decode_mask_tensors(
+            config.vocab_size,
+            &suppress_tokens,
+            &generation.begin_suppress_tokens,
+            &language_token_ids,
+            &special,
+            runtime_tuning.suppress_blank,
+            &numeral_symbol_tokens,
+            model_dtype,
+            &device.device,
+        )?;
 
         let mel = MelSpectrogram::new(MelConfig {
             sample_rate: whisper::SAMPLE_RATE,
@@ -425,6 +443,8 @@ impl WhisperTurboAsrModel {
             mel,
             suppress_tokens,
             numeral_symbol_tokens,
+            decode_mask,
+            decode_begin_mask,
             language_token_ids,
             token_id_to_language_code,
             runtime_tuning,
@@ -702,6 +722,9 @@ impl WhisperTurboAsrModel {
                 "blank_token_id": self.special.blank,
                 "suppress_numerals": self.runtime_tuning.suppress_numerals,
                 "numeral_symbol_token_count": self.numeral_symbol_tokens.len(),
+                "device_greedy_decode": self.runtime_tuning.device_greedy_decode,
+                "device_greedy_active": self.runtime_tuning.device_greedy_decode
+                    && !self.device.device.is_cpu(),
             },
             "selected_temperature": selected_temperature,
             "language_hint_used": language_hint_used,
@@ -898,6 +921,108 @@ impl WhisperTurboAsrModel {
             self.device.device.synchronize()?;
         }
         Ok(())
+    }
+
+    fn mask_for_logits(&self, mask: &Tensor, logits: &Tensor) -> Result<Tensor> {
+        if mask.dtype() == logits.dtype() {
+            Ok(mask.clone())
+        } else {
+            mask.to_dtype(logits.dtype()).map_err(Error::from)
+        }
+    }
+
+    fn masked_decode_logits(&self, logits: &Tensor, at_begin: bool) -> Result<Tensor> {
+        let base_mask = self.mask_for_logits(&self.decode_mask, logits)?;
+        let mut masked = logits.broadcast_add(&base_mask)?;
+        if at_begin {
+            let begin_mask = self.mask_for_logits(&self.decode_begin_mask, logits)?;
+            masked = masked.broadcast_add(&begin_mask)?;
+        }
+        Ok(masked)
+    }
+
+    fn greedy_decode_step_on_device(
+        &self,
+        logits: &Tensor,
+        at_begin: bool,
+        inv_temperature: f32,
+    ) -> Result<(u32, f32, Option<f32>)> {
+        let masked = self.masked_decode_logits(logits, at_begin)?;
+        greedy_decode_step_from_masked_logits(
+            &masked,
+            &self.special,
+            self.config.vocab_size,
+            inv_temperature,
+        )
+    }
+
+    fn select_next_token<R: Rng + ?Sized>(
+        &self,
+        logits: &Tensor,
+        at_begin: bool,
+        deterministic: bool,
+        temperature: f32,
+        rng: &mut R,
+        log_probs_buf: &mut Vec<f32>,
+        profile: &mut WhisperDecodeProfile,
+    ) -> Result<(u32, f32, Option<f32>)> {
+        let inv_temperature = 1.0f32 / temperature.max(1e-6);
+        if deterministic && self.runtime_tuning.device_greedy_decode && !self.device.device.is_cpu()
+        {
+            match self.greedy_decode_step_on_device(logits, at_begin, inv_temperature) {
+                Ok(step) => {
+                    profile.device_greedy_steps = profile.device_greedy_steps.saturating_add(1);
+                    return Ok(step);
+                }
+                Err(err) => {
+                    profile.device_greedy_fallbacks =
+                        profile.device_greedy_fallbacks.saturating_add(1);
+                    debug!("Whisper device greedy decode fell back to host logits: {err}");
+                }
+            }
+        }
+
+        let mut logits_vec = if profile.enabled {
+            let started = Instant::now();
+            let logits_vec = logits.to_vec1::<f32>()?;
+            profile.logits_to_host_ms += elapsed_ms(started);
+            logits_vec
+        } else {
+            logits.to_vec1::<f32>()?
+        };
+        profile.host_logits_steps = profile.host_logits_steps.saturating_add(1);
+        self.apply_decode_constraints(&mut logits_vec, at_begin);
+        if deterministic {
+            if let Some(logsumexp) = scaled_logsumexp(&logits_vec, inv_temperature) {
+                let (next, best_logit) = best_finite_logit(&logits_vec, self.special.eot);
+                let next_scaled_logit = best_logit * inv_temperature;
+                let next_logprob = if next_scaled_logit.is_finite() {
+                    next_scaled_logit - logsumexp
+                } else {
+                    f32::NEG_INFINITY
+                };
+                let no_speech_prob = self.special.no_speech.and_then(|token_id| {
+                    probability_for_token_from_logits(
+                        &logits_vec,
+                        token_id,
+                        logsumexp,
+                        inv_temperature,
+                    )
+                });
+                Ok((next, next_logprob, no_speech_prob))
+            } else {
+                Ok((self.special.eot, f32::NEG_INFINITY, None))
+            }
+        } else {
+            logits_to_log_probs_in_place(&logits_vec, temperature, log_probs_buf);
+            let no_speech_prob = self
+                .special
+                .no_speech
+                .and_then(|token_id| probability_for_token(log_probs_buf, token_id));
+            let (next, next_logprob) =
+                sample_token_from_log_probs(log_probs_buf, temperature, self.special.eot, rng);
+            Ok((next, next_logprob, no_speech_prob))
+        }
     }
 
     fn resolve_language_token(&self, language: &str) -> Result<Option<(u32, String)>> {
@@ -1320,6 +1445,7 @@ impl WhisperTurboAsrModel {
         let mut decode_steps = 0usize;
         let profile_enabled = self.runtime_tuning.profile_sync_timings;
         let mut profile = WhisperDecodeProfile::new(profile_enabled);
+        let mut log_probs_buf = Vec::<f32>::new();
 
         for step_idx in 0..max_steps {
             decode_steps = decode_steps.saturating_add(1);
@@ -1383,56 +1509,20 @@ impl WhisperTurboAsrModel {
                     .i(0)?
             };
 
-            let mut logits_vec = if profile_enabled {
-                let started = Instant::now();
-                let logits_vec = logits.to_vec1::<f32>()?;
-                profile.logits_to_host_ms += elapsed_ms(started);
-                logits_vec
-            } else {
-                logits.to_vec1::<f32>()?
-            };
-            self.apply_decode_constraints(&mut logits_vec, step_idx == 0);
             let sampling_started = if profile_enabled {
                 Some(Instant::now())
             } else {
                 None
             };
-            let (next, next_logprob, step_no_speech_prob) = if deterministic {
-                let inv_temperature = 1.0f32 / temperature.max(1e-6);
-                if let Some(logsumexp) = scaled_logsumexp(&logits_vec, inv_temperature) {
-                    let (next, best_logit) = best_finite_logit(&logits_vec, self.special.eot);
-                    let next_scaled_logit = best_logit * inv_temperature;
-                    let next_logprob = if next_scaled_logit.is_finite() {
-                        next_scaled_logit - logsumexp
-                    } else {
-                        f32::NEG_INFINITY
-                    };
-                    let no_speech_prob = self.special.no_speech.and_then(|token_id| {
-                        probability_for_token_from_logits(
-                            &logits_vec,
-                            token_id,
-                            logsumexp,
-                            inv_temperature,
-                        )
-                    });
-                    (next, next_logprob, no_speech_prob)
-                } else {
-                    (self.special.eot, f32::NEG_INFINITY, None)
-                }
-            } else {
-                let log_probs_buf = logits_to_log_probs(&logits_vec, temperature);
-                let no_speech_prob = self
-                    .special
-                    .no_speech
-                    .and_then(|token_id| probability_for_token(&log_probs_buf, token_id));
-                let (next, next_logprob) = sample_token_from_log_probs(
-                    &log_probs_buf,
-                    temperature,
-                    self.special.eot,
-                    &mut rng,
-                );
-                (next, next_logprob, no_speech_prob)
-            };
+            let (next, next_logprob, step_no_speech_prob) = self.select_next_token(
+                &logits,
+                step_idx == 0,
+                deterministic,
+                temperature,
+                &mut rng,
+                &mut log_probs_buf,
+                &mut profile,
+            )?;
             if let Some(started) = sampling_started {
                 profile.sampling_ms += elapsed_ms(started);
             }
@@ -1510,7 +1600,7 @@ impl WhisperTurboAsrModel {
         let mut streamed_text = String::new();
         let mut log_probs_buf = Vec::<f32>::new();
         let mut decode_steps = 0usize;
-        let profile = WhisperDecodeProfile::new(false);
+        let mut profile = WhisperDecodeProfile::new(false);
 
         for step_idx in 0..max_steps {
             decode_steps = decode_steps.saturating_add(1);
@@ -1536,44 +1626,15 @@ impl WhisperTurboAsrModel {
                 .i(0)?
                 .i(0)?;
 
-            let mut logits_vec = logits.to_vec1::<f32>()?;
-            self.apply_decode_constraints(&mut logits_vec, step_idx == 0);
-            let (next, next_logprob, step_no_speech_prob) = if deterministic {
-                let inv_temperature = 1.0f32 / temperature.max(1e-6);
-                if let Some(logsumexp) = scaled_logsumexp(&logits_vec, inv_temperature) {
-                    let (next, best_logit) = best_finite_logit(&logits_vec, self.special.eot);
-                    let next_scaled_logit = best_logit * inv_temperature;
-                    let next_logprob = if next_scaled_logit.is_finite() {
-                        next_scaled_logit - logsumexp
-                    } else {
-                        f32::NEG_INFINITY
-                    };
-                    let no_speech_prob = self.special.no_speech.and_then(|token_id| {
-                        probability_for_token_from_logits(
-                            &logits_vec,
-                            token_id,
-                            logsumexp,
-                            inv_temperature,
-                        )
-                    });
-                    (next, next_logprob, no_speech_prob)
-                } else {
-                    (self.special.eot, f32::NEG_INFINITY, None)
-                }
-            } else {
-                logits_to_log_probs_in_place(&logits_vec, temperature, &mut log_probs_buf);
-                let no_speech_prob = self
-                    .special
-                    .no_speech
-                    .and_then(|token_id| probability_for_token(&log_probs_buf, token_id));
-                let (next, next_logprob) = sample_token_from_log_probs(
-                    &log_probs_buf,
-                    temperature,
-                    self.special.eot,
-                    &mut rng,
-                );
-                (next, next_logprob, no_speech_prob)
-            };
+            let (next, next_logprob, step_no_speech_prob) = self.select_next_token(
+                &logits,
+                step_idx == 0,
+                deterministic,
+                temperature,
+                &mut rng,
+                &mut log_probs_buf,
+                &mut profile,
+            )?;
 
             if step_idx == 0 {
                 no_speech_prob = step_no_speech_prob;
@@ -1829,6 +1890,113 @@ fn env_nonempty_string(key: &str) -> Option<String> {
     })
 }
 
+fn greedy_decode_step_from_masked_logits(
+    masked: &Tensor,
+    special: &WhisperSpecialTokens,
+    vocab_size: usize,
+    inv_temperature: f32,
+) -> Result<(u32, f32, Option<f32>)> {
+    let masked_f32 = if masked.dtype() == DType::F32 {
+        masked.clone()
+    } else {
+        masked.to_dtype(DType::F32)?
+    };
+    let scaled = if (inv_temperature - 1.0).abs() <= f32::EPSILON {
+        masked_f32.clone()
+    } else {
+        (&masked_f32 * inv_temperature as f64)?
+    };
+    let max_scaled = scaled.max(0)?;
+    let max_scaled_value = max_scaled.to_scalar::<f32>()?;
+    if !max_scaled_value.is_finite() {
+        return Ok((special.eot, f32::NEG_INFINITY, None));
+    }
+
+    let next = masked.argmax(0)?.to_scalar::<u32>()?;
+    let logsumexp = scaled
+        .broadcast_sub(&max_scaled)?
+        .exp()?
+        .sum_all()?
+        .log()?
+        .broadcast_add(&max_scaled)?
+        .to_scalar::<f32>()?;
+    let next_scaled_logit = scaled.i(next as usize)?.to_scalar::<f32>()?;
+    let next_logprob = if next_scaled_logit.is_finite() && logsumexp.is_finite() {
+        next_scaled_logit - logsumexp
+    } else {
+        f32::NEG_INFINITY
+    };
+    let no_speech_prob = special
+        .no_speech
+        .filter(|token_id| (*token_id as usize) < vocab_size)
+        .and_then(|token_id| {
+            let scaled_logit = scaled.i(token_id as usize).ok()?.to_scalar::<f32>().ok()?;
+            if scaled_logit.is_finite() && logsumexp.is_finite() {
+                Some((scaled_logit - logsumexp).exp())
+            } else {
+                None
+            }
+        });
+    Ok((next, next_logprob, no_speech_prob))
+}
+
+fn build_whisper_decode_mask_tensors(
+    vocab_size: usize,
+    suppress_tokens: &[u32],
+    begin_suppress_tokens: &[u32],
+    language_token_ids: &[u32],
+    special: &WhisperSpecialTokens,
+    suppress_blank: bool,
+    numeral_symbol_tokens: &[u32],
+    dtype: DType,
+    device: &candle_core::Device,
+) -> Result<(Tensor, Tensor)> {
+    let mut base = vec![0f32; vocab_size];
+    for token_id in suppress_tokens {
+        mask_token_value(&mut base, *token_id);
+    }
+    mask_token_value(&mut base, special.sot);
+    mask_token_value(&mut base, special.transcribe);
+    for token_id in language_token_ids {
+        mask_token_value(&mut base, *token_id);
+    }
+    for token_id in numeral_symbol_tokens {
+        mask_token_value(&mut base, *token_id);
+    }
+    if let Some(no_timestamps_token_id) = special.no_timestamps {
+        mask_token_value(&mut base, no_timestamps_token_id);
+        let timestamp_begin = no_timestamps_token_id.saturating_add(1) as usize;
+        if timestamp_begin < base.len() {
+            base[timestamp_begin..].fill(f32::NEG_INFINITY);
+        }
+    }
+
+    let mut begin = vec![0f32; vocab_size];
+    for token_id in begin_suppress_tokens {
+        mask_token_value(&mut begin, *token_id);
+    }
+    if suppress_blank {
+        mask_token_value(&mut begin, special.eot);
+        if let Some(blank_token_id) = special.blank {
+            mask_token_value(&mut begin, blank_token_id);
+        }
+    }
+
+    let base = Tensor::from_vec(base, (vocab_size,), device)?;
+    let begin = Tensor::from_vec(begin, (vocab_size,), device)?;
+    let base = if dtype == DType::F32 {
+        base
+    } else {
+        base.to_dtype(dtype)?
+    };
+    let begin = if dtype == DType::F32 {
+        begin
+    } else {
+        begin.to_dtype(dtype)?
+    };
+    Ok((base, begin))
+}
+
 fn apply_whisper_decode_constraints(
     logits: &mut [f32],
     at_begin: bool,
@@ -1877,6 +2045,13 @@ fn mask_token(logits: &mut [f32], token_id: u32) {
     let idx = token_id as usize;
     if idx < logits.len() {
         logits[idx] = f32::NEG_INFINITY;
+    }
+}
+
+fn mask_token_value(mask: &mut [f32], token_id: u32) {
+    let idx = token_id as usize;
+    if idx < mask.len() {
+        mask[idx] = f32::NEG_INFINITY;
     }
 }
 
@@ -2159,6 +2334,9 @@ fn whisper_decode_profile_diagnostics(profile: &WhisperDecodeProfile) -> serde_j
         "sampling_ms": profile.sampling_ms,
         "step_total_ms": profile.step_total_ms,
         "unattributed_ms": (profile.step_total_ms - measured_ms).max(0.0),
+        "device_greedy_steps": profile.device_greedy_steps,
+        "device_greedy_fallbacks": profile.device_greedy_fallbacks,
+        "host_logits_steps": profile.host_logits_steps,
     })
 }
 
@@ -2266,11 +2444,13 @@ fn decode_step_budget(
 #[cfg(test)]
 mod tests {
     use super::{
-        adaptive_decode_budget, apply_whisper_decode_constraints, build_whisper_prompt_prefix,
-        capped_decode_temperatures, decode_retry_reasons, decode_step_budget,
-        find_suffix_token_repetition, has_low_word_diversity, logits_to_log_probs,
-        logits_to_log_probs_in_place, text_delta, token_contains_numeral_or_symbol,
-        trimmed_audio_bounds, use_cuda_whisper_dtype_shim, whisper_decode_profile_diagnostics,
+        adaptive_decode_budget, apply_whisper_decode_constraints, best_finite_logit,
+        build_whisper_decode_mask_tensors, build_whisper_prompt_prefix, capped_decode_temperatures,
+        decode_retry_reasons, decode_step_budget, find_suffix_token_repetition,
+        greedy_decode_step_from_masked_logits, has_low_word_diversity, logits_to_log_probs,
+        logits_to_log_probs_in_place, probability_for_token_from_logits, scaled_logsumexp,
+        text_delta, token_contains_numeral_or_symbol, trimmed_audio_bounds,
+        use_cuda_whisper_dtype_shim, whisper_decode_profile_diagnostics,
         whisper_device_diagnostics, whisper_impl_name, WhisperDecodeAttempt, WhisperDecodeProfile,
         WhisperSpecialTokens,
     };
@@ -2331,6 +2511,9 @@ mod tests {
             logits_to_host_ms: 4.0,
             sampling_ms: 5.0,
             step_total_ms: 20.0,
+            device_greedy_steps: 2,
+            device_greedy_fallbacks: 1,
+            host_logits_steps: 3,
         };
 
         let diagnostics = whisper_decode_profile_diagnostics(&profile);
@@ -2350,6 +2533,108 @@ mod tests {
                 .get("unattributed_ms")
                 .and_then(|value| value.as_f64()),
             Some(5.0)
+        );
+        assert_eq!(
+            diagnostics
+                .get("device_greedy_steps")
+                .and_then(|value| value.as_u64()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn device_decode_masks_match_host_constraints() {
+        let special = WhisperSpecialTokens {
+            sot: 0,
+            sot_prev: None,
+            transcribe: 6,
+            eot: 1,
+            blank: Some(5),
+            no_timestamps: Some(8),
+            no_speech: Some(4),
+        };
+        let suppress_tokens = vec![2];
+        let begin_suppress_tokens = vec![3];
+        let language_token_ids = vec![4];
+        let numeral_symbol_tokens = vec![7];
+        let (base_mask, begin_mask) = build_whisper_decode_mask_tensors(
+            12,
+            &suppress_tokens,
+            &begin_suppress_tokens,
+            &language_token_ids,
+            &special,
+            true,
+            &numeral_symbol_tokens,
+            candle_core::DType::F32,
+            &candle_core::Device::Cpu,
+        )
+        .expect("decode masks");
+        let logits: Vec<f32> = (0..12).map(|value| value as f32).collect();
+        let logits_t = candle_core::Tensor::from_vec(
+            logits.clone(),
+            (logits.len(),),
+            &candle_core::Device::Cpu,
+        )
+        .expect("logits");
+
+        let mut host = logits.clone();
+        apply_whisper_decode_constraints(
+            &mut host,
+            true,
+            &suppress_tokens,
+            &begin_suppress_tokens,
+            &language_token_ids,
+            &special,
+            true,
+            &numeral_symbol_tokens,
+        );
+        let device = logits_t
+            .broadcast_add(&base_mask)
+            .expect("base mask")
+            .broadcast_add(&begin_mask)
+            .expect("begin mask")
+            .to_vec1::<f32>()
+            .expect("masked logits");
+
+        assert_eq!(device, host);
+    }
+
+    #[test]
+    fn device_greedy_decode_matches_host_greedy_selection() {
+        let special = WhisperSpecialTokens {
+            sot: 0,
+            sot_prev: None,
+            transcribe: 6,
+            eot: 1,
+            blank: Some(5),
+            no_timestamps: Some(8),
+            no_speech: Some(4),
+        };
+        let mut logits = vec![0.0, -1.0, 3.0, 8.0, 2.0, 4.0, 1.0, 7.0, 0.0, 5.0, 6.0, 9.0];
+        apply_whisper_decode_constraints(&mut logits, false, &[], &[], &[], &special, true, &[]);
+        let inv_temperature = 1.0;
+        let logsumexp = scaled_logsumexp(&logits, inv_temperature).expect("logsumexp");
+        let (host_next, host_best_logit) = best_finite_logit(&logits, special.eot);
+        let host_logprob = host_best_logit * inv_temperature - logsumexp;
+        let host_no_speech = probability_for_token_from_logits(
+            &logits,
+            special.no_speech.unwrap(),
+            logsumexp,
+            inv_temperature,
+        );
+        let logits_t = candle_core::Tensor::from_vec(logits, (12,), &candle_core::Device::Cpu)
+            .expect("masked logits");
+
+        let (device_next, device_logprob, device_no_speech) =
+            greedy_decode_step_from_masked_logits(&logits_t, &special, 12, inv_temperature)
+                .expect("device greedy");
+
+        assert_eq!(device_next, host_next);
+        assert!((device_logprob - host_logprob).abs() < 1e-5);
+        assert!(
+            (device_no_speech.expect("device no speech") - host_no_speech.expect("host no speech"))
+                .abs()
+                < 1e-5
         );
     }
 
