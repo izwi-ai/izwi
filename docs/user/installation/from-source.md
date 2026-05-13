@@ -107,6 +107,11 @@ cargo build --release -p izwi-cli --features cuda
 cargo build --release -p izwi-server --features cuda
 ```
 
+For Whisper CUDA experiments, source builds can add Candle-backed CUDA features
+such as `flash-attn` or `cudnn`, for example
+`cargo build --release -p izwi-server --features cuda,flash-attn`. Only enable
+`cudnn` when the matching cuDNN development and runtime libraries are installed.
+
 ---
 
 ## Install UI Dependencies

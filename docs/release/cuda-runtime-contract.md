@@ -39,9 +39,13 @@ Native GitHub Release artifacts:
 
 Docker CUDA artifact:
 
-- The `rust-builder-cuda` stage builds `izwi-server` with `--features cuda`.
+- The `rust-builder-cuda` stage builds `izwi-server` with
+  `--features "${IZWI_CUDA_FEATURES}"`; the default remains `cuda`.
 - The `production-cuda` stage copies only that CUDA-capable server binary into the NVIDIA CUDA runtime image.
 - The image sets `IZWI_BACKEND=cuda`, `NVIDIA_VISIBLE_DEVICES=all`, and `NVIDIA_DRIVER_CAPABILITIES=compute,utility`.
+- Optional Candle CUDA features such as `flash-attn` and `cudnn` are source/build
+  knobs. Do not enable `cudnn` for a runtime image unless the matching cuDNN
+  runtime libraries are present in the final image.
 
 ## Runtime Selection
 
@@ -61,6 +65,9 @@ Source CUDA:
 
 1. Install a compatible NVIDIA driver and CUDA toolkit.
 2. Build with `cargo build --release --features cuda` or `IZWI_BUILD_BACKEND=cuda ./scripts/install-cli.sh`.
+   For Whisper CUDA experiments, use package features such as
+   `--features cuda,flash-attn` or `--features cuda,cudnn` on a host with the
+   matching CUDA/cuDNN toolchain.
 3. Run with `--backend cuda` or `IZWI_BACKEND=cuda`.
 
 ## Guardrails
@@ -78,6 +85,8 @@ Docker workflow guardrails:
 - The CUDA Docker job builds `production-cuda`, not a native release package.
 - The CPU Docker image is smoke-run with `/usr/local/bin/izwi-server --help`.
 - The CUDA Docker image is audited with `ldd`; CUDA runtime libraries must resolve from the image, while `libcuda.so.1` is allowed to remain unresolved because it is supplied by the NVIDIA container runtime on GPU hosts.
+- CUDA feature experiments can set `IZWI_CUDA_FEATURES`, for example
+  `IZWI_CUDA_FEATURES=cuda,flash-attn scripts/ci/check-backend-truth.sh cargo-cuda`.
 
 ## Verification Requirements
 
