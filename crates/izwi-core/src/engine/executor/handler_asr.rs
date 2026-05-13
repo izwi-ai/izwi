@@ -53,13 +53,14 @@ impl NativeExecutor {
                         let (samples, sample_rate) = decode_request_audio_with_rate(request)?;
                         let samples_len = samples.len();
 
-                        let (chunk_cfg, chunk_plan) = Self::asr_chunk_plan(
+                        let chunk_plan = Self::asr_chunk_plan(
                             &samples,
                             sample_rate,
                             model.max_audio_seconds_hint(),
                             false,
+                            matches!(family, ModelFamily::WhisperAsr),
                         );
-                        if chunk_plan.len() > 1 {
+                        if chunk_plan.requires_chunk_path() {
                             let mut sequence = 0usize;
                             let text = Self::run_blocking(|| {
                                 Self::transcribe_with_chunk_plan(
@@ -69,11 +70,12 @@ impl NativeExecutor {
                                     &mut sequence,
                                     &samples,
                                     sample_rate,
-                                    &chunk_plan,
-                                    &chunk_cfg,
+                                    &chunk_plan.chunks,
+                                    &chunk_plan.config,
                                     |chunk_audio, sr| model.transcribe(chunk_audio, sr, language),
                                 )
                             })?;
+                            let diagnostics = Some(chunk_plan.diagnostics());
 
                             return Ok(ExecutorOutput {
                                 request_id: request.id.clone(),
@@ -92,7 +94,7 @@ impl NativeExecutor {
                                 tokens_generated: (samples_len / 256).max(1),
                                 finished: true,
                                 phase_timing_override: None,
-                                asr_diagnostics: None,
+                                asr_diagnostics: diagnostics,
                                 error: None,
                             });
                         }
@@ -223,21 +225,20 @@ impl NativeExecutor {
                     })
                 })?;
 
-                let (chunk_cfg, chunk_plan) =
-                    Self::asr_chunk_plan(&samples, sample_rate, None, false);
-                if chunk_plan.len() > 1 {
-                        let text = Self::transcribe_with_chunk_plan(
-                            &request.id,
-                            stream_tx.as_ref(),
-                            stream_policy,
-                            &mut sequence,
+                let chunk_plan = Self::asr_chunk_plan(&samples, sample_rate, None, false, false);
+                if chunk_plan.requires_chunk_path() {
+                    let text = Self::transcribe_with_chunk_plan(
+                        &request.id,
+                        stream_tx.as_ref(),
+                        stream_policy,
+                        &mut sequence,
                         &samples,
                         sample_rate,
-                        &chunk_plan,
-                        &chunk_cfg,
+                        &chunk_plan.chunks,
+                        &chunk_plan.config,
                         |chunk_audio, sr| model.transcribe(chunk_audio, sr, language),
                     )?;
-                    return Ok((text, None));
+                    return Ok((text, Some(chunk_plan.diagnostics())));
                 }
 
                 if request.streaming {
@@ -283,13 +284,14 @@ impl NativeExecutor {
                 })
             })?;
 
-            let (chunk_cfg, chunk_plan) = Self::asr_chunk_plan(
+            let chunk_plan = Self::asr_chunk_plan(
                 &samples,
                 sample_rate,
                 model.max_audio_seconds_hint(),
                 request.streaming && !model.supports_incremental_decode(),
+                matches!(family, ModelFamily::WhisperAsr),
             );
-            if chunk_plan.len() > 1 {
+            if chunk_plan.requires_chunk_path() {
                 let text = Self::transcribe_with_chunk_plan(
                     &request.id,
                     stream_tx.as_ref(),
@@ -297,11 +299,11 @@ impl NativeExecutor {
                     &mut sequence,
                     &samples,
                     sample_rate,
-                    &chunk_plan,
-                    &chunk_cfg,
+                    &chunk_plan.chunks,
+                    &chunk_plan.config,
                     |chunk_audio, sr| model.transcribe(chunk_audio, sr, language),
                 )?;
-                return Ok((text, None));
+                return Ok((text, Some(chunk_plan.diagnostics())));
             }
 
             if request.streaming {

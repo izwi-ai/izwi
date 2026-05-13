@@ -1,4 +1,8 @@
-use izwi_asr_toolkit::{plan_audio_chunks, AsrLongFormConfig, AudioChunk, TranscriptAssembler};
+use izwi_asr_toolkit::{
+    plan_audio_chunks, plan_speech_audio_chunks, AsrLongFormConfig, AsrSpeechChunkConfig,
+    AudioChunk, SpeechChunkPlan, TranscriptAssembler,
+};
+use serde_json::json;
 use tokio::sync::mpsc;
 use tracing::debug;
 
@@ -24,12 +28,115 @@ const STREAM_SHORT_AUDIO_SECS_THRESHOLD: f32 = 12.0;
 const STREAM_SINGLE_CHUNK_SECS_THRESHOLD: f32 = 4.5;
 const MAX_STREAMING_LOW_LATENCY_CHUNKS: usize = 24;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AsrChunkPlannerKind {
+    Duration,
+    Speech,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PlannedAsrChunks {
+    pub(crate) config: AsrLongFormConfig,
+    pub(crate) chunks: Vec<AudioChunk>,
+    pub(crate) planner: AsrChunkPlannerKind,
+    pub(crate) speech_plan: Option<SpeechChunkPlan>,
+    pub(crate) input_samples: usize,
+    pub(crate) sample_rate: u32,
+}
+
+impl PlannedAsrChunks {
+    pub(crate) fn requires_chunk_path(&self) -> bool {
+        if self
+            .speech_plan
+            .as_ref()
+            .map(|plan| plan.no_speech)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if self.chunks.len() > 1 {
+            return true;
+        }
+        if self.planner != AsrChunkPlannerKind::Speech {
+            return false;
+        }
+        let Some(chunk) = self.chunks.first() else {
+            return false;
+        };
+        chunk.start_sample > 0 || chunk.end_sample < self.input_samples
+    }
+
+    pub(crate) fn diagnostics(&self) -> serde_json::Value {
+        let audio_secs = if self.sample_rate > 0 {
+            self.input_samples as f32 / self.sample_rate as f32
+        } else {
+            0.0
+        };
+        let planner = match self.planner {
+            AsrChunkPlannerKind::Duration => "duration",
+            AsrChunkPlannerKind::Speech => "speech",
+        };
+        let chunks = self
+            .chunks
+            .iter()
+            .map(|chunk| {
+                json!({
+                    "start_sample": chunk.start_sample,
+                    "end_sample": chunk.end_sample,
+                })
+            })
+            .collect::<Vec<_>>();
+        let speech = self.speech_plan.as_ref().map(|plan| {
+            let speech_regions = plan
+                .speech_regions
+                .iter()
+                .map(|region| {
+                    json!({
+                        "start_sample": region.start_sample,
+                        "end_sample": region.end_sample,
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "no_speech": plan.no_speech,
+                "speech_region_count": plan.speech_regions.len(),
+                "speech_samples": plan.speech_samples,
+                "included_samples": plan.included_samples,
+                "skipped_samples": plan.skipped_samples,
+                "speech_regions": speech_regions,
+            })
+        });
+        json!({
+            "chunking": {
+                "planner": planner,
+                "chunk_count": self.chunks.len(),
+                "input_samples": self.input_samples,
+                "sample_rate": self.sample_rate,
+                "audio_seconds": audio_secs,
+                "chunks": chunks,
+                "speech": speech,
+            }
+        })
+    }
+}
+
 impl NativeExecutor {
     pub(super) fn env_f32(key: &str) -> Option<f32> {
         std::env::var(key)
             .ok()
             .and_then(|raw| raw.trim().parse::<f32>().ok())
             .filter(|v| v.is_finite() && *v > 0.0)
+    }
+
+    pub(super) fn env_bool(key: &str) -> Option<bool> {
+        std::env::var(key).ok().and_then(|raw| {
+            let normalized = raw.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => None,
+            }
+        })
     }
 
     pub(super) fn asr_long_form_config() -> AsrLongFormConfig {
@@ -135,7 +242,26 @@ impl NativeExecutor {
         sample_rate: u32,
         model_max_chunk_secs: Option<f32>,
         streaming_low_latency: bool,
-    ) -> (AsrLongFormConfig, Vec<AudioChunk>) {
+        allow_speech_planner: bool,
+    ) -> PlannedAsrChunks {
+        Self::asr_chunk_plan_with_options(
+            samples,
+            sample_rate,
+            model_max_chunk_secs,
+            streaming_low_latency,
+            allow_speech_planner,
+            Self::env_bool("IZWI_ASR_VAD_CHUNKING").unwrap_or(false),
+        )
+    }
+
+    fn asr_chunk_plan_with_options(
+        samples: &[f32],
+        sample_rate: u32,
+        model_max_chunk_secs: Option<f32>,
+        streaming_low_latency: bool,
+        allow_speech_planner: bool,
+        vad_chunking_enabled: bool,
+    ) -> PlannedAsrChunks {
         let audio_secs = if sample_rate > 0 {
             samples.len() as f32 / sample_rate as f32
         } else {
@@ -149,6 +275,7 @@ impl NativeExecutor {
             && model_fit_limit_secs
                 .map(|limit| audio_secs <= limit)
                 .unwrap_or(false)
+            && !(allow_speech_planner && vad_chunking_enabled)
         {
             let mut single_chunk_cfg = Self::asr_long_form_config();
             let single_chunk_secs = audio_secs.max(single_chunk_cfg.min_chunk_secs.max(0.5));
@@ -165,7 +292,14 @@ impl NativeExecutor {
                 &single_chunk_cfg,
                 model_fit_limit_secs.map(|v| v.max(single_chunk_cfg.min_chunk_secs.max(1.0))),
             );
-            return (single_chunk_cfg, chunks);
+            return PlannedAsrChunks {
+                config: single_chunk_cfg,
+                chunks,
+                planner: AsrChunkPlannerKind::Duration,
+                speech_plan: None,
+                input_samples: samples.len(),
+                sample_rate,
+            };
         }
 
         let cfg = if streaming_low_latency {
@@ -176,6 +310,21 @@ impl NativeExecutor {
         let tuned_limit = model_max_chunk_secs
             .filter(|v| v.is_finite() && *v > 0.0)
             .map(|v| (v * 0.95).max(cfg.min_chunk_secs.max(1.0)));
+
+        if allow_speech_planner && vad_chunking_enabled {
+            let speech_cfg = AsrSpeechChunkConfig::default();
+            let speech_plan =
+                plan_speech_audio_chunks(samples, sample_rate, &cfg, &speech_cfg, tuned_limit);
+            return PlannedAsrChunks {
+                chunks: speech_plan.chunks.clone(),
+                config: cfg,
+                planner: AsrChunkPlannerKind::Speech,
+                speech_plan: Some(speech_plan),
+                input_samples: samples.len(),
+                sample_rate,
+            };
+        }
+
         let mut chunks = plan_audio_chunks(samples, sample_rate, &cfg, tuned_limit);
 
         if streaming_low_latency && chunks.len() > MAX_STREAMING_LOW_LATENCY_CHUNKS {
@@ -188,10 +337,24 @@ impl NativeExecutor {
                 .filter(|v| v.is_finite() && *v > 0.0)
                 .map(|v| (v * 0.95).max(fallback_cfg.min_chunk_secs.max(1.0)));
             chunks = plan_audio_chunks(samples, sample_rate, &fallback_cfg, fallback_limit);
-            return (fallback_cfg, chunks);
+            return PlannedAsrChunks {
+                config: fallback_cfg,
+                chunks,
+                planner: AsrChunkPlannerKind::Duration,
+                speech_plan: None,
+                input_samples: samples.len(),
+                sample_rate,
+            };
         }
 
-        (cfg, chunks)
+        PlannedAsrChunks {
+            config: cfg,
+            chunks,
+            planner: AsrChunkPlannerKind::Duration,
+            speech_plan: None,
+            input_samples: samples.len(),
+            sample_rate,
+        }
     }
 
     pub(super) fn transcribe_with_chunk_plan<F>(
@@ -209,9 +372,10 @@ impl NativeExecutor {
         F: FnMut(&[f32], u32) -> Result<String>,
     {
         if chunk_plan.is_empty() {
-            return Err(Error::InvalidInput(
-                "ASR chunk planner produced no chunks".to_string(),
-            ));
+            if let Some(tx) = stream_tx {
+                Self::stream_final_marker_with_policy(tx, stream_policy, request_id, sequence)?;
+            }
+            return Ok(String::new());
         }
 
         debug!(
@@ -333,7 +497,7 @@ mod tests {
 
     use crate::engine::EngineStreamPolicy;
 
-    use super::NativeExecutor;
+    use super::{AsrChunkPlannerKind, NativeExecutor};
 
     #[test]
     fn next_audio_delta_emits_only_new_tail_samples() {
@@ -384,12 +548,12 @@ mod tests {
     fn streaming_low_latency_chunk_plan_keeps_very_short_audio_single_chunk() {
         let sr = 16_000u32;
         let samples = vec![0.0f32; (sr as usize) * 4];
-        let (_cfg, chunks) = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true);
+        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true, false);
         assert_eq!(
-            chunks.len(),
+            plan.chunks.len(),
             1,
             "expected a single chunk, got {}",
-            chunks.len()
+            plan.chunks.len()
         );
     }
 
@@ -397,11 +561,11 @@ mod tests {
     fn streaming_low_latency_chunk_plan_splits_medium_audio() {
         let sr = 16_000u32;
         let samples = vec![0.0f32; (sr as usize) * 8];
-        let (_cfg, chunks) = NativeExecutor::asr_chunk_plan(&samples, sr, None, true);
+        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, None, true, false);
         assert!(
-            chunks.len() > 1,
+            plan.chunks.len() > 1,
             "expected multiple chunks, got {}",
-            chunks.len()
+            plan.chunks.len()
         );
     }
 
@@ -409,12 +573,12 @@ mod tests {
     fn streaming_chunk_plan_keeps_model_fit_audio_single_chunk() {
         let sr = 16_000u32;
         let samples = vec![0.0f32; (sr as usize) * 20];
-        let (_cfg, chunks) = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true);
+        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true, false);
         assert_eq!(
-            chunks.len(),
+            plan.chunks.len(),
             1,
             "expected a single chunk for model-fit audio, got {}",
-            chunks.len()
+            plan.chunks.len()
         );
     }
 
@@ -422,11 +586,11 @@ mod tests {
     fn streaming_chunk_plan_splits_audio_when_model_hint_is_exceeded() {
         let sr = 16_000u32;
         let samples = vec![0.0f32; (sr as usize) * 40];
-        let (_cfg, chunks) = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true);
+        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true, false);
         assert!(
-            chunks.len() > 1,
+            plan.chunks.len() > 1,
             "expected chunking beyond model hint, got {}",
-            chunks.len()
+            plan.chunks.len()
         );
     }
 
@@ -434,20 +598,79 @@ mod tests {
     fn standard_chunk_plan_keeps_short_audio_single_chunk() {
         let sr = 16_000u32;
         let samples = vec![0.0f32; (sr as usize) * 4];
-        let (_cfg, chunks) = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), false);
-        assert_eq!(chunks.len(), 1);
+        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), false, false);
+        assert_eq!(plan.chunks.len(), 1);
     }
 
     #[test]
     fn streaming_chunk_plan_relaxes_when_chunk_count_is_too_high() {
         let sr = 16_000u32;
         let samples = vec![0.0f32; (sr as usize) * 180];
-        let (_cfg, chunks) = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true);
+        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true, false);
         assert!(
-            chunks.len() <= 24,
+            plan.chunks.len() <= 24,
             "expected guarded chunk count, got {}",
-            chunks.len()
+            plan.chunks.len()
         );
+    }
+
+    #[test]
+    fn vad_chunk_plan_is_disabled_by_default_path() {
+        let sr = 16_000u32;
+        let samples = vec![0.0f32; (sr as usize) * 4];
+        let plan = NativeExecutor::asr_chunk_plan_with_options(
+            &samples,
+            sr,
+            Some(30.0),
+            false,
+            true,
+            false,
+        );
+        assert_eq!(plan.planner, AsrChunkPlannerKind::Duration);
+        assert_eq!(plan.chunks.len(), 1);
+    }
+
+    #[test]
+    fn vad_chunk_plan_can_return_no_speech() {
+        let sr = 16_000u32;
+        let samples = vec![0.0f32; (sr as usize) * 4];
+        let plan = NativeExecutor::asr_chunk_plan_with_options(
+            &samples,
+            sr,
+            Some(30.0),
+            false,
+            true,
+            true,
+        );
+        assert_eq!(plan.planner, AsrChunkPlannerKind::Speech);
+        assert!(plan.requires_chunk_path());
+        assert!(plan.chunks.is_empty());
+        assert!(plan.speech_plan.as_ref().expect("speech plan").no_speech);
+    }
+
+    #[test]
+    fn empty_chunk_plan_streams_final_marker() {
+        let sr = 16_000u32;
+        let samples = Vec::<f32>::new();
+        let chunk_plan = Vec::<AudioChunk>::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut sequence = 0usize;
+        let merged = NativeExecutor::transcribe_with_chunk_plan(
+            "req-empty",
+            Some(&tx),
+            EngineStreamPolicy::FailOnFull,
+            &mut sequence,
+            &samples,
+            sr,
+            &chunk_plan,
+            &NativeExecutor::asr_long_form_config(),
+            |_chunk_audio, _sr| Ok("unreachable".to_string()),
+        )
+        .expect("empty no-speech plan should complete");
+
+        assert!(merged.is_empty());
+        let event = rx.try_recv().expect("final marker");
+        assert!(event.is_final);
     }
 
     #[test]
