@@ -8,6 +8,8 @@ use candle_nn::{
 use candle_transformers::models::whisper::Config;
 use candle_transformers::models::with_tracing::{linear, linear_no_bias, Linear};
 
+use crate::models::shared::attention::flash::try_fused_self_attention;
+
 fn conv1d(
     in_channels: usize,
     out_channels: usize,
@@ -137,10 +139,23 @@ impl MultiHeadAttention {
     ) -> Result<Tensor> {
         let (_, q_len, n_state) = q.dims3()?;
         let kv_len = k.dim(1)?;
-        let scale = ((n_state / self.n_head) as f64).powf(-0.25);
-        let q = (self.reshape_head(q)? * scale)?;
-        let k = (self.reshape_head(k)?.transpose(2, 3)? * scale)?;
+        let head_dim = n_state / self.n_head;
+        let scale = (head_dim as f64).powf(-0.25);
+        let q = self.reshape_head(q)?;
+        let k = self.reshape_head(k)?;
         let v = self.reshape_head(v)?.contiguous()?;
+
+        if mask.is_none() && q.device().is_cuda() {
+            match try_fused_self_attention(&q, &k, &v, None, head_dim, false) {
+                Ok(Some(wv)) => {
+                    return wv.transpose(1, 2)?.flatten_from(2);
+                }
+                Ok(None) | Err(_) => {}
+            }
+        }
+
+        let q = (q * scale)?;
+        let k = (k.transpose(2, 3)? * scale)?;
         let mut qk = {
             let _enter = self.matmul_span.enter();
             q.matmul(&k)?
