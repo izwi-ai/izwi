@@ -46,6 +46,18 @@ pub(crate) struct PlannedAsrChunks {
     pub(crate) planning_ms: f64,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct AsrChunkTranscription {
+    pub(super) text: String,
+    pub(super) diagnostics: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ChunkedAsrTranscription {
+    pub(super) text: String,
+    pub(super) chunk_diagnostics: Vec<serde_json::Value>,
+}
+
 impl PlannedAsrChunks {
     pub(crate) fn requires_chunk_path(&self) -> bool {
         if self
@@ -133,6 +145,23 @@ impl PlannedAsrChunks {
                 "speech": speech,
             }
         })
+    }
+
+    pub(crate) fn diagnostics_with_chunk_transcriptions(
+        &self,
+        chunk_transcriptions: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut diagnostics = self.diagnostics();
+        if let Some(chunking) = diagnostics
+            .get_mut("chunking")
+            .and_then(|value| value.as_object_mut())
+        {
+            chunking.insert(
+                "chunk_transcriptions".to_string(),
+                serde_json::Value::Array(chunk_transcriptions),
+            );
+        }
+        diagnostics
     }
 }
 
@@ -400,11 +429,47 @@ impl NativeExecutor {
     where
         F: FnMut(&[f32], u32) -> Result<String>,
     {
+        Self::transcribe_with_chunk_plan_with_details(
+            request_id,
+            stream_tx,
+            stream_policy,
+            sequence,
+            samples,
+            sample_rate,
+            chunk_plan,
+            chunk_cfg,
+            |chunk_audio, sr| {
+                transcribe_chunk(chunk_audio, sr).map(|text| AsrChunkTranscription {
+                    text,
+                    diagnostics: None,
+                })
+            },
+        )
+        .map(|result| result.text)
+    }
+
+    pub(super) fn transcribe_with_chunk_plan_with_details<F>(
+        request_id: &str,
+        stream_tx: Option<&mpsc::Sender<StreamingOutput>>,
+        stream_policy: EngineStreamPolicy,
+        sequence: &mut usize,
+        samples: &[f32],
+        sample_rate: u32,
+        chunk_plan: &[AudioChunk],
+        chunk_cfg: &AsrLongFormConfig,
+        mut transcribe_chunk: F,
+    ) -> Result<ChunkedAsrTranscription>
+    where
+        F: FnMut(&[f32], u32) -> Result<AsrChunkTranscription>,
+    {
         if chunk_plan.is_empty() {
             if let Some(tx) = stream_tx {
                 Self::stream_final_marker_with_policy(tx, stream_policy, request_id, sequence)?;
             }
-            return Ok(String::new());
+            return Ok(ChunkedAsrTranscription {
+                text: String::new(),
+                chunk_diagnostics: Vec::new(),
+            });
         }
 
         debug!(
@@ -416,13 +481,35 @@ impl NativeExecutor {
 
         let mut assembler = TranscriptAssembler::new(chunk_cfg.clone());
         let mut deferred_boundary_delta = String::new();
+        let mut chunk_diagnostics = Vec::new();
         for (idx, chunk) in chunk_plan.iter().enumerate() {
             if chunk.end_sample <= chunk.start_sample || chunk.end_sample > samples.len() {
+                chunk_diagnostics.push(Self::chunk_transcription_diagnostics(
+                    idx,
+                    chunk,
+                    sample_rate,
+                    0.0,
+                    "",
+                    Some(json!({
+                        "skipped": true,
+                        "skip_reason": "invalid_bounds",
+                    })),
+                ));
                 continue;
             }
             let chunk_audio = &samples[chunk.start_sample..chunk.end_sample];
-            let chunk_text = transcribe_chunk(chunk_audio, sample_rate)?;
-            let mut delta = assembler.push_chunk_text(&chunk_text);
+            let chunk_started = Instant::now();
+            let chunk_result = transcribe_chunk(chunk_audio, sample_rate)?;
+            let transcribe_ms = chunk_started.elapsed().as_secs_f64() * 1000.0;
+            chunk_diagnostics.push(Self::chunk_transcription_diagnostics(
+                idx,
+                chunk,
+                sample_rate,
+                transcribe_ms,
+                &chunk_result.text,
+                chunk_result.diagnostics,
+            ));
+            let mut delta = assembler.push_chunk_text(&chunk_result.text);
             if !deferred_boundary_delta.is_empty() {
                 deferred_boundary_delta.push_str(&delta);
                 delta = std::mem::take(&mut deferred_boundary_delta);
@@ -463,7 +550,39 @@ impl NativeExecutor {
             Self::stream_final_marker_with_policy(tx, stream_policy, request_id, sequence)?;
         }
 
-        Ok(assembler.finish())
+        Ok(ChunkedAsrTranscription {
+            text: assembler.finish(),
+            chunk_diagnostics,
+        })
+    }
+
+    fn chunk_transcription_diagnostics(
+        index: usize,
+        chunk: &AudioChunk,
+        sample_rate: u32,
+        transcribe_ms: f64,
+        text: &str,
+        model_diagnostics: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let start_seconds = samples_to_seconds(chunk.start_sample, sample_rate);
+        let end_seconds = samples_to_seconds(chunk.end_sample, sample_rate);
+        let mut payload = json!({
+            "index": index,
+            "start_sample": chunk.start_sample,
+            "end_sample": chunk.end_sample,
+            "start_seconds": start_seconds,
+            "end_seconds": end_seconds,
+            "duration_seconds": (end_seconds - start_seconds).max(0.0),
+            "transcribe_ms": transcribe_ms,
+            "text_chars": text.chars().count(),
+            "text_empty": text.trim().is_empty(),
+        });
+        if let Some(model_diagnostics) = model_diagnostics {
+            if let Some(payload) = payload.as_object_mut() {
+                payload.insert("model_diagnostics".to_string(), model_diagnostics);
+            }
+        }
+        payload
     }
 
     pub(super) fn next_audio_delta(all_samples: &[f32], emitted_samples: &mut usize) -> Vec<f32> {
@@ -526,7 +645,7 @@ mod tests {
 
     use crate::engine::EngineStreamPolicy;
 
-    use super::{AsrChunkPlannerKind, NativeExecutor};
+    use super::{AsrChunkPlannerKind, AsrChunkTranscription, NativeExecutor};
 
     #[test]
     fn next_audio_delta_emits_only_new_tail_samples() {
@@ -735,6 +854,103 @@ mod tests {
         assert!(merged.is_empty());
         let event = rx.try_recv().expect("final marker");
         assert!(event.is_final);
+    }
+
+    #[test]
+    fn chunk_plan_details_collects_per_chunk_diagnostics() {
+        let sr = 10u32;
+        let samples = vec![0.0f32; sr as usize * 2];
+        let chunk_plan = vec![
+            AudioChunk {
+                start_sample: 0,
+                end_sample: sr as usize,
+            },
+            AudioChunk {
+                start_sample: sr as usize,
+                end_sample: sr as usize * 2,
+            },
+        ];
+
+        let mut chunk_idx = 0usize;
+        let mut sequence = 0usize;
+        let merged = NativeExecutor::transcribe_with_chunk_plan_with_details(
+            "req-details",
+            None,
+            EngineStreamPolicy::FailOnFull,
+            &mut sequence,
+            &samples,
+            sr,
+            &chunk_plan,
+            &NativeExecutor::asr_long_form_config(),
+            |_chunk_audio, _sr| {
+                let idx = chunk_idx;
+                chunk_idx = chunk_idx.saturating_add(1);
+                Ok(AsrChunkTranscription {
+                    text: format!("chunk-{idx}"),
+                    diagnostics: Some(serde_json::json!({ "decoder_chunk": idx })),
+                })
+            },
+        )
+        .expect("chunk plan should complete");
+
+        assert!(merged.text.contains("chunk-0"));
+        assert!(merged.text.contains("chunk-1"));
+        assert_eq!(merged.chunk_diagnostics.len(), 2);
+        assert_eq!(
+            merged.chunk_diagnostics[0]
+                .get("index")
+                .and_then(|value| value.as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            merged.chunk_diagnostics[0]
+                .get("start_seconds")
+                .and_then(|value| value.as_f64()),
+            Some(0.0)
+        );
+        assert_eq!(
+            merged.chunk_diagnostics[0]
+                .get("end_seconds")
+                .and_then(|value| value.as_f64()),
+            Some(1.0)
+        );
+        assert_eq!(
+            merged.chunk_diagnostics[0]
+                .get("model_diagnostics")
+                .and_then(|value| value.get("decoder_chunk"))
+                .and_then(|value| value.as_u64()),
+            Some(0)
+        );
+        assert!(
+            merged.chunk_diagnostics[0]
+                .get("transcribe_ms")
+                .and_then(|value| value.as_f64())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn chunk_plan_diagnostics_can_embed_transcription_details() {
+        let sr = 10u32;
+        let samples = vec![0.0f32; sr as usize * 2];
+        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(1.0), false, false);
+
+        let diagnostics = plan.diagnostics_with_chunk_transcriptions(vec![
+            serde_json::json!({ "index": 0, "text_chars": 5 }),
+        ]);
+        let chunk_transcriptions = diagnostics
+            .get("chunking")
+            .and_then(|value| value.get("chunk_transcriptions"))
+            .and_then(|value| value.as_array())
+            .expect("chunk transcription diagnostics");
+
+        assert_eq!(chunk_transcriptions.len(), 1);
+        assert_eq!(
+            chunk_transcriptions[0]
+                .get("text_chars")
+                .and_then(|value| value.as_u64()),
+            Some(5)
+        );
     }
 
     #[test]
