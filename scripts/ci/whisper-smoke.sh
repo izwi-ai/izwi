@@ -109,9 +109,80 @@ def collect_whisper_diagnostics(diagnostics):
     return found
 
 
-def validate_cpu_metal_whisper_diagnostics(case_name, diagnostics, backend):
+def require_non_negative_number(case_name, label, value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise SystemExit(f"{case_name}: expected non-negative numeric {label}, got {value!r}")
+
+
+def validate_whisper_timings(case_name, idx, node):
+    timings = node.get("timings_ms")
+    if not isinstance(timings, dict):
+        raise SystemExit(f"{case_name}: Whisper diagnostics {idx} missing timings_ms object")
+    for key in ("model_total", "decode", "encoder_forward", "mel_prepare"):
+        require_non_negative_number(
+            case_name,
+            f"Whisper diagnostics {idx} timings_ms.{key}",
+            timings.get(key),
+        )
+
+
+def validate_whisper_logit_filters(case_name, idx, node, backend):
+    filters = node.get("logit_filters")
+    if not isinstance(filters, dict):
+        raise SystemExit(f"{case_name}: Whisper diagnostics {idx} missing logit_filters object")
+    device_greedy_decode = filters.get("device_greedy_decode")
+    device_greedy_active = filters.get("device_greedy_active")
+    if not isinstance(device_greedy_decode, bool):
+        raise SystemExit(
+            f"{case_name}: expected boolean logit_filters.device_greedy_decode, got {device_greedy_decode!r}"
+        )
+    if not isinstance(device_greedy_active, bool):
+        raise SystemExit(
+            f"{case_name}: expected boolean logit_filters.device_greedy_active, got {device_greedy_active!r}"
+        )
+    expected_active = backend == "metal" and device_greedy_decode
+    if device_greedy_active is not expected_active:
+        raise SystemExit(
+            f"{case_name}: expected device_greedy_active={expected_active} for {backend}, got {device_greedy_active}"
+        )
+
+
+def validate_long_chunking(case_name, diagnostics):
+    if case_name != "long_verbose":
+        return
+    if not isinstance(diagnostics, dict):
+        raise SystemExit(f"{case_name}: missing diagnostics object")
+    chunking = diagnostics.get("chunking")
+    if not isinstance(chunking, dict):
+        raise SystemExit(f"{case_name}: expected long-form chunking diagnostics")
+    chunk_count = chunking.get("chunk_count")
+    if not isinstance(chunk_count, int) or chunk_count <= 1:
+        raise SystemExit(f"{case_name}: expected chunk_count > 1, got {chunk_count!r}")
+    chunk_transcriptions = chunking.get("chunk_transcriptions")
+    if not isinstance(chunk_transcriptions, list):
+        raise SystemExit(f"{case_name}: missing chunk_transcriptions list")
+    if len(chunk_transcriptions) != chunk_count:
+        raise SystemExit(
+            f"{case_name}: expected {chunk_count} chunk_transcriptions, got {len(chunk_transcriptions)}"
+        )
+    for idx, chunk in enumerate(chunk_transcriptions):
+        if not isinstance(chunk, dict):
+            raise SystemExit(f"{case_name}: chunk_transcriptions[{idx}] is not an object")
+        model_diagnostics = chunk.get("model_diagnostics")
+        if not isinstance(model_diagnostics, dict):
+            raise SystemExit(f"{case_name}: chunk_transcriptions[{idx}] missing model_diagnostics")
+        if model_diagnostics.get("model_family") != "whisper_asr":
+            raise SystemExit(
+                f"{case_name}: chunk_transcriptions[{idx}] is not Whisper diagnostics"
+            )
+
+
+def validate_cpu_metal_whisper_diagnostics(case_name, diagnostics, backend, response_text):
+    validate_long_chunking(case_name, diagnostics)
     nodes = collect_whisper_diagnostics(diagnostics)
-    if not nodes and "silence" not in case_name:
+    if not nodes and "silence" in case_name and not response_text.strip():
+        return
+    if not nodes:
         raise SystemExit(f"{case_name}: no Whisper diagnostics found to validate")
 
     expected_kind = {"cpu": "Cpu", "metal": "Metal"}[backend]
@@ -133,6 +204,8 @@ def validate_cpu_metal_whisper_diagnostics(case_name, diagnostics, backend):
             raise SystemExit(
                 f"{case_name}: expected local_whisper Whisper impl, got {device.get('whisper_impl')}"
             )
+        validate_whisper_timings(case_name, idx, node)
+        validate_whisper_logit_filters(case_name, idx, node, backend)
 
 
 Path(output_path).write_bytes(body)
@@ -151,6 +224,7 @@ elif response_format == "verbose_json":
         case_name,
         parsed.get("izwi_asr_diagnostics"),
         backend,
+        str(parsed.get("text") or ""),
     )
 else:
     if not text.strip():

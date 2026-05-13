@@ -5,7 +5,7 @@ use std::time::Instant;
 use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
-use super::audio::{AsrChunkTranscription, decode_request_audio_with_rate};
+use super::audio::{decode_request_audio_with_rate, AsrChunkTranscription};
 use super::state::ActiveAsrDecode;
 use super::{ExecutorOutput, NativeExecutor};
 
@@ -87,12 +87,10 @@ impl NativeExecutor {
                                     },
                                 )
                             })?;
-                            let diagnostics = Some(
-                                chunk_plan
-                                    .diagnostics_with_chunk_transcriptions(
-                                        chunked.chunk_diagnostics,
-                                    ),
-                            );
+                            let diagnostics =
+                                Some(chunk_plan.diagnostics_with_chunk_transcriptions(
+                                    chunked.chunk_diagnostics,
+                                ));
 
                             return Ok(ExecutorOutput {
                                 request_id: request.id.clone(),
@@ -254,12 +252,12 @@ impl NativeExecutor {
                         &chunk_plan.chunks,
                         &chunk_plan.config,
                         |chunk_audio, sr| {
-                            model
-                                .transcribe(chunk_audio, sr, language)
-                                .map(|text| AsrChunkTranscription {
+                            model.transcribe(chunk_audio, sr, language).map(|text| {
+                                AsrChunkTranscription {
                                     text,
                                     diagnostics: None,
-                                })
+                                }
+                            })
                         },
                     )?;
                     return Ok((
@@ -347,9 +345,7 @@ impl NativeExecutor {
                 return Ok((
                     chunked.text,
                     Some(
-                        chunk_plan.diagnostics_with_chunk_transcriptions(
-                            chunked.chunk_diagnostics,
-                        ),
+                        chunk_plan.diagnostics_with_chunk_transcriptions(chunked.chunk_diagnostics),
                     ),
                 ));
             }
@@ -446,5 +442,44 @@ impl NativeExecutor {
         }
 
         Some(payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NativeExecutor;
+
+    #[test]
+    fn audio_decode_timing_preserves_whisper_model_diagnostics() {
+        let diagnostics = serde_json::json!({
+            "model_family": "whisper_asr",
+            "timings_ms": {
+                "model_total": 12.5
+            }
+        });
+
+        let updated = NativeExecutor::with_audio_decode_timing(Some(diagnostics), 3.25)
+            .expect("diagnostics payload");
+
+        assert_eq!(updated["model_family"], "whisper_asr");
+        assert_eq!(updated["timings_ms"]["model_total"], 12.5);
+        assert_eq!(updated["timings_ms"]["audio_decode"], 3.25);
+    }
+
+    #[test]
+    fn audio_decode_timing_creates_diagnostics_when_missing() {
+        let updated =
+            NativeExecutor::with_audio_decode_timing(None, 4.0).expect("diagnostics payload");
+
+        assert_eq!(updated["timings_ms"]["audio_decode"], 4.0);
+    }
+
+    #[test]
+    fn audio_decode_timing_wraps_non_object_diagnostics() {
+        let updated = NativeExecutor::with_audio_decode_timing(Some(serde_json::json!("old")), 5.0)
+            .expect("diagnostics payload");
+
+        assert_eq!(updated["model_diagnostics"], "old");
+        assert_eq!(updated["timings_ms"]["audio_decode"], 5.0);
     }
 }
