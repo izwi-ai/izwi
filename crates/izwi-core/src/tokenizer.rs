@@ -6,17 +6,17 @@ use std::path::Path;
 use uuid::Uuid;
 
 use serde::Deserialize;
-use tokenizers::decoders::byte_fallback::ByteFallback;
-use tokenizers::decoders::sequence::Sequence as DecoderSequence;
-use tokenizers::decoders::DecoderWrapper;
-use tokenizers::models::bpe::BPE;
-use tokenizers::pre_tokenizers::byte_level::ByteLevel;
-use tokenizers::pre_tokenizers::sequence::Sequence as PreTokenizerSequence;
-use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
-use tokenizers::pre_tokenizers::PreTokenizerWrapper;
 use tokenizers::AddedToken;
 use tokenizers::SplitDelimiterBehavior;
 use tokenizers::Tokenizer as HfTokenizer;
+use tokenizers::decoders::DecoderWrapper;
+use tokenizers::decoders::byte_fallback::ByteFallback;
+use tokenizers::decoders::sequence::Sequence as DecoderSequence;
+use tokenizers::models::bpe::BPE;
+use tokenizers::pre_tokenizers::PreTokenizerWrapper;
+use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+use tokenizers::pre_tokenizers::sequence::Sequence as PreTokenizerSequence;
+use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
 use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
@@ -35,8 +35,7 @@ pub struct Tokenizer {
     special_tokens: SpecialTokens,
 }
 
-const QWEN2_PRETOKENIZER_REGEX: &str =
-    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+const QWEN2_PRETOKENIZER_REGEX: &str = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
 impl Tokenizer {
     pub fn from_path(model_dir: &Path) -> Result<Self> {
@@ -305,6 +304,10 @@ impl Tokenizer {
 
     pub fn vocab_size(&self) -> usize {
         self.inner.get_vocab_size(true)
+    }
+
+    pub fn vocab(&self) -> HashMap<String, u32> {
+        self.inner.get_vocab(true)
     }
 
     pub fn token_to_id(&self, token: &str) -> Option<u32> {

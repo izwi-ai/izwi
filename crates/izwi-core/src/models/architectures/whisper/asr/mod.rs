@@ -16,10 +16,10 @@ use std::time::Instant;
 use candle_core::{DType, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::whisper::{
-    self, model::Whisper as CandleWhisper, Config as WhisperConfig,
+    self, Config as WhisperConfig, model::Whisper as CandleWhisper,
 };
-use flate2::write::ZlibEncoder;
 use flate2::Compression;
+use flate2::write::ZlibEncoder;
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::json;
@@ -86,6 +86,7 @@ struct WhisperSpecialTokens {
     sot: u32,
     transcribe: u32,
     eot: u32,
+    blank: Option<u32>,
     no_timestamps: Option<u32>,
     no_speech: Option<u32>,
 }
@@ -125,6 +126,8 @@ struct WhisperRuntimeTuning {
     silence_trim_min_leading_ms: usize,
     silence_trim_min_trailing_ms: usize,
     silence_trim_min_clip_secs: f32,
+    suppress_blank: bool,
+    suppress_numerals: bool,
 }
 
 impl WhisperRuntimeTuning {
@@ -159,6 +162,8 @@ impl WhisperRuntimeTuning {
                 .unwrap_or(DEFAULT_SILENCE_TRIM_MIN_TRAILING_MS),
             silence_trim_min_clip_secs: env_f32("IZWI_WHISPER_SILENCE_TRIM_MIN_CLIP_SECS")
                 .unwrap_or(DEFAULT_SILENCE_TRIM_MIN_CLIP_SECS),
+            suppress_blank: env_bool("IZWI_WHISPER_SUPPRESS_BLANK").unwrap_or(true),
+            suppress_numerals: env_bool("IZWI_WHISPER_SUPPRESS_NUMERALS").unwrap_or(false),
         }
     }
 }
@@ -249,6 +254,7 @@ pub struct WhisperTurboAsrModel {
     special: WhisperSpecialTokens,
     mel: MelSpectrogram,
     suppress_tokens: Vec<u32>,
+    numeral_symbol_tokens: Vec<u32>,
     language_token_ids: Vec<u32>,
     token_id_to_language_code: HashMap<u32, String>,
     runtime_tuning: WhisperRuntimeTuning,
@@ -320,6 +326,11 @@ impl WhisperTurboAsrModel {
         suppress_tokens.sort_unstable();
         suppress_tokens.dedup();
         let runtime_tuning = WhisperRuntimeTuning::from_env();
+        let numeral_symbol_tokens = if runtime_tuning.suppress_numerals {
+            build_numeral_symbol_tokens(&tokenizer, &special)
+        } else {
+            Vec::new()
+        };
 
         let mel = MelSpectrogram::new(MelConfig {
             sample_rate: whisper::SAMPLE_RATE,
@@ -346,6 +357,7 @@ impl WhisperTurboAsrModel {
             special,
             mel,
             suppress_tokens,
+            numeral_symbol_tokens,
             language_token_ids,
             token_id_to_language_code,
             runtime_tuning,
@@ -542,6 +554,12 @@ impl WhisperTurboAsrModel {
                 "strategy": language_resolution.strategy,
                 "default_language": self.runtime_tuning.default_language,
                 "reuse_detected_language": self.runtime_tuning.reuse_detected_language,
+            },
+            "logit_filters": {
+                "suppress_blank": self.runtime_tuning.suppress_blank,
+                "blank_token_id": self.special.blank,
+                "suppress_numerals": self.runtime_tuning.suppress_numerals,
+                "numeral_symbol_token_count": self.numeral_symbol_tokens.len(),
             },
             "selected_temperature": selected_temperature,
             "language_hint_used": language_hint_used,
@@ -1269,29 +1287,16 @@ impl WhisperTurboAsrModel {
     }
 
     fn apply_decode_constraints(&self, logits: &mut [f32], at_begin: bool) {
-        for token_id in &self.suppress_tokens {
-            mask_token(logits, *token_id);
-        }
-        if at_begin {
-            for token_id in &self.generation.begin_suppress_tokens {
-                mask_token(logits, *token_id);
-            }
-        }
-
-        mask_token(logits, self.special.sot);
-        mask_token(logits, self.special.transcribe);
-        for token_id in &self.language_token_ids {
-            mask_token(logits, *token_id);
-        }
-
-        if let Some(no_timestamps_token_id) = self.special.no_timestamps {
-            // whisper.cpp / transformers text-only decode behavior.
-            mask_token(logits, no_timestamps_token_id);
-            let timestamp_begin = no_timestamps_token_id.saturating_add(1) as usize;
-            if timestamp_begin < logits.len() {
-                logits[timestamp_begin..].fill(f32::NEG_INFINITY);
-            }
-        }
+        apply_whisper_decode_constraints(
+            logits,
+            at_begin,
+            &self.suppress_tokens,
+            &self.generation.begin_suppress_tokens,
+            &self.language_token_ids,
+            &self.special,
+            self.runtime_tuning.suppress_blank,
+            &self.numeral_symbol_tokens,
+        );
     }
 }
 
@@ -1321,6 +1326,11 @@ fn resolve_special_tokens(
         .token_to_id(whisper::EOT_TOKEN)
         .or(generation.eos_token_id)
         .ok_or_else(|| Error::TokenizationError("Missing <|endoftext|> token".to_string()))?;
+    let blank = tokenizer
+        .encode(" ")
+        .ok()
+        .and_then(|ids| (ids.len() == 1).then_some(ids[0]))
+        .or_else(|| tokenizer.token_to_id(" "));
     let no_timestamps = generation
         .no_timestamps_token_id
         .or_else(|| tokenizer.token_to_id(whisper::NO_TIMESTAMPS_TOKEN));
@@ -1332,8 +1342,64 @@ fn resolve_special_tokens(
         sot,
         transcribe,
         eot,
+        blank,
         no_timestamps,
         no_speech,
+    })
+}
+
+fn build_numeral_symbol_tokens(tokenizer: &Tokenizer, special: &WhisperSpecialTokens) -> Vec<u32> {
+    let special_ids: HashSet<u32> = [
+        Some(special.sot),
+        Some(special.transcribe),
+        Some(special.eot),
+        special.blank,
+        special.no_timestamps,
+        special.no_speech,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    let mut tokens: Vec<u32> = tokenizer
+        .vocab()
+        .into_iter()
+        .filter_map(|(token, token_id)| {
+            if special_ids.contains(&token_id) || is_whisper_control_token(&token) {
+                return None;
+            }
+            token_contains_numeral_or_symbol(&token).then_some(token_id)
+        })
+        .collect();
+    tokens.sort_unstable();
+    tokens.dedup();
+    tokens
+}
+
+fn is_whisper_control_token(token: &str) -> bool {
+    token.starts_with("<|") && token.ends_with("|>")
+}
+
+fn token_contains_numeral_or_symbol(token: &str) -> bool {
+    token.chars().any(|ch| {
+        ch.is_numeric()
+            || matches!(
+                ch,
+                '$' | '%'
+                    | '+'
+                    | '='
+                    | '#'
+                    | '@'
+                    | '*'
+                    | '/'
+                    | '\\'
+                    | '<'
+                    | '>'
+                    | '^'
+                    | '_'
+                    | '~'
+                    | '&'
+            )
     })
 }
 
@@ -1411,6 +1477,50 @@ fn env_nonempty_string(key: &str) -> Option<String> {
             Some(trimmed.to_string())
         }
     })
+}
+
+fn apply_whisper_decode_constraints(
+    logits: &mut [f32],
+    at_begin: bool,
+    suppress_tokens: &[u32],
+    begin_suppress_tokens: &[u32],
+    language_token_ids: &[u32],
+    special: &WhisperSpecialTokens,
+    suppress_blank: bool,
+    numeral_symbol_tokens: &[u32],
+) {
+    for token_id in suppress_tokens {
+        mask_token(logits, *token_id);
+    }
+    if at_begin {
+        for token_id in begin_suppress_tokens {
+            mask_token(logits, *token_id);
+        }
+        if suppress_blank {
+            mask_token(logits, special.eot);
+            if let Some(blank_token_id) = special.blank {
+                mask_token(logits, blank_token_id);
+            }
+        }
+    }
+
+    mask_token(logits, special.sot);
+    mask_token(logits, special.transcribe);
+    for token_id in language_token_ids {
+        mask_token(logits, *token_id);
+    }
+    for token_id in numeral_symbol_tokens {
+        mask_token(logits, *token_id);
+    }
+
+    if let Some(no_timestamps_token_id) = special.no_timestamps {
+        // whisper.cpp / transformers text-only decode behavior.
+        mask_token(logits, no_timestamps_token_id);
+        let timestamp_begin = no_timestamps_token_id.saturating_add(1) as usize;
+        if timestamp_begin < logits.len() {
+            logits[timestamp_begin..].fill(f32::NEG_INFINITY);
+        }
+    }
 }
 
 fn mask_token(logits: &mut [f32], token_id: u32) {
@@ -1741,10 +1851,10 @@ fn decode_step_budget(
 #[cfg(test)]
 mod tests {
     use super::{
-        adaptive_decode_budget, capped_decode_temperatures, decode_step_budget,
-        find_suffix_token_repetition, has_low_word_diversity, logits_to_log_probs,
-        logits_to_log_probs_in_place, text_delta, trimmed_audio_bounds,
-        use_cuda_whisper_dtype_shim,
+        WhisperSpecialTokens, adaptive_decode_budget, apply_whisper_decode_constraints,
+        capped_decode_temperatures, decode_step_budget, find_suffix_token_repetition,
+        has_low_word_diversity, logits_to_log_probs, logits_to_log_probs_in_place, text_delta,
+        token_contains_numeral_or_symbol, trimmed_audio_bounds, use_cuda_whisper_dtype_shim,
     };
 
     #[test]
@@ -1793,6 +1903,70 @@ mod tests {
                 assert!(!left.is_finite() && !right.is_finite());
             }
         }
+    }
+
+    #[test]
+    fn decode_constraints_suppress_blank_only_at_begin() {
+        let special = WhisperSpecialTokens {
+            sot: 1,
+            transcribe: 2,
+            eot: 3,
+            blank: Some(4),
+            no_timestamps: Some(7),
+            no_speech: None,
+        };
+        let mut begin_logits = vec![0.0f32; 10];
+        apply_whisper_decode_constraints(
+            &mut begin_logits,
+            true,
+            &[],
+            &[],
+            &[],
+            &special,
+            true,
+            &[],
+        );
+        assert_eq!(begin_logits[3], f32::NEG_INFINITY);
+        assert_eq!(begin_logits[4], f32::NEG_INFINITY);
+
+        let mut next_logits = vec![0.0f32; 10];
+        apply_whisper_decode_constraints(
+            &mut next_logits,
+            false,
+            &[],
+            &[],
+            &[],
+            &special,
+            true,
+            &[],
+        );
+        assert!(next_logits[3].is_finite());
+        assert!(next_logits[4].is_finite());
+    }
+
+    #[test]
+    fn decode_constraints_mask_numeral_symbol_tokens() {
+        let special = WhisperSpecialTokens {
+            sot: 1,
+            transcribe: 2,
+            eot: 3,
+            blank: Some(4),
+            no_timestamps: Some(7),
+            no_speech: None,
+        };
+        let mut logits = vec![0.0f32; 10];
+        apply_whisper_decode_constraints(&mut logits, false, &[], &[], &[], &special, false, &[5]);
+        assert_eq!(logits[5], f32::NEG_INFINITY);
+        assert_eq!(logits[7], f32::NEG_INFINITY);
+        assert_eq!(logits[8], f32::NEG_INFINITY);
+        assert_eq!(logits[9], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn numeral_symbol_filter_detects_digits_and_symbols() {
+        assert!(token_contains_numeral_or_symbol("12"));
+        assert!(token_contains_numeral_or_symbol("$"));
+        assert!(!token_contains_numeral_or_symbol("word"));
     }
 
     #[test]
