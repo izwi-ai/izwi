@@ -29,6 +29,10 @@ resolve_cuda_compute_cap() {
     fi
 }
 
+resolve_cuda_features() {
+    echo "${IZWI_CUDA_FEATURES:-cuda}"
+}
+
 smoke_docker_server() {
     local image="$1"
 
@@ -106,11 +110,15 @@ run_cargo_cuda() {
 
     local cuda_compute_cap
     cuda_compute_cap="$(resolve_cuda_compute_cap)"
+    local cuda_features
+    cuda_features="$(resolve_cuda_features)"
+
     export CUDA_COMPUTE_CAP="${cuda_compute_cap}"
     echo "Using CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}"
+    echo "Using IZWI_CUDA_FEATURES=${cuda_features}"
 
-    cargo check --locked -p izwi-cli --features cuda
-    cargo check --locked -p izwi-server --features cuda
+    cargo check --locked -p izwi-cli --features "${cuda_features}"
+    cargo check --locked -p izwi-server --features "${cuda_features}"
 }
 
 run_docker_cpu() {
@@ -126,10 +134,13 @@ run_docker_cuda() {
 
     local cuda_compute_cap
     cuda_compute_cap="$(resolve_cuda_compute_cap)"
+    local cuda_features
+    cuda_features="$(resolve_cuda_features)"
 
     docker compose --profile cuda config >/dev/null
     docker build \
         --build-arg CUDA_COMPUTE_CAP="${cuda_compute_cap}" \
+        --build-arg IZWI_CUDA_FEATURES="${cuda_features}" \
         --target production-cuda \
         -t izwi-ci:production-cuda \
         .

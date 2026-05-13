@@ -183,6 +183,10 @@ cargo build --release -p izwi-cli --features cuda
 cargo build --release -p izwi-server --features cuda
 ```
 
+For Whisper CUDA performance experiments, add Candle-backed feature flags only
+on hosts with the matching NVIDIA libraries, for example
+`--features cuda,flash-attn` or `--features cuda,cudnn`.
+
 **Use smaller models:**
 - `Qwen3-TTS-12Hz-0.6B-Base` instead of `Qwen3-TTS-12Hz-1.7B-Base`
 - Quantized variants (`-4bit`)

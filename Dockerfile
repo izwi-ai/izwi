@@ -46,9 +46,11 @@ RUN cargo build --release --locked --bin izwi-server
 # -----------------------------------------------------------------------------
 FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS rust-builder-cuda
 ARG CUDA_COMPUTE_CAP=80
+ARG IZWI_CUDA_FEATURES=cuda
 
 ENV PATH=/root/.cargo/bin:/usr/local/cuda/bin:${PATH}
 ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
+ENV IZWI_CUDA_FEATURES=${IZWI_CUDA_FEATURES}
 
 WORKDIR /app
 
@@ -70,7 +72,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 
 # Build CUDA release binary (server only for Docker)
-RUN cargo build --release --locked --bin izwi-server --features cuda
+RUN cargo build --release --locked --bin izwi-server --features "${IZWI_CUDA_FEATURES}"
 
 # -----------------------------------------------------------------------------
 # Stage 4: Production runtime (CPU)

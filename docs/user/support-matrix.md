@@ -93,7 +93,7 @@ Use the following expectations when validating a host:
 - **macOS Apple Silicon:** build or install a Metal-capable binary and run with `--backend metal` or `IZWI_BACKEND=metal`.
 - **Linux/Windows GitHub Release:** run `izwi serve --backend cpu`, then `izwi status --detailed`.
 - **Docker CUDA on NVIDIA Linux hosts:** run `docker compose --profile cuda up`, then confirm the container selects CUDA through `/v1/health` or `izwi status --detailed` from a matching client environment.
-- **Linux/Windows source build for CUDA:** build with `cargo build --release --features cuda`, then run with `--backend cuda` or `IZWI_BACKEND=cuda`.
+- **Linux/Windows source build for CUDA:** build with `cargo build --release --features cuda`, then run with `--backend cuda` or `IZWI_BACKEND=cuda`. Whisper CUDA experiments can additionally enable Candle-backed features such as `flash-attn` or `cudnn` when the matching NVIDIA libraries are installed.
 
 ---
 

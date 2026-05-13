@@ -113,8 +113,9 @@ install_from_source() {
             cli_feature_args=(--features metal)
             ;;
         cuda)
-            cli_feature_args=(--features cuda)
-            server_feature_args=(--features cuda)
+            local cuda_features="${IZWI_CUDA_FEATURES:-cuda}"
+            cli_feature_args=(--features "$cuda_features")
+            server_feature_args=(--features "$cuda_features")
             ;;
     esac
 

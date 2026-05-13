@@ -61,6 +61,13 @@ memmap2 = { workspace = true }
 [features]
 default = []
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+cudnn = [
+    "cuda",
+    "candle-core/cudnn",
+    "candle-nn/cudnn",
+    "candle-transformers/cudnn",
+    "candle-flash-attn?/cudnn",
+]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 flash-attn = ["cuda", "dep:candle-flash-attn", "candle-transformers/flash-attn"]
 accelerate = [
