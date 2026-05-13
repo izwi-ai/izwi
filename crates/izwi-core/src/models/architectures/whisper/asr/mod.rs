@@ -329,6 +329,7 @@ pub struct WhisperTurboAsrModel {
     decode_mask: Tensor,
     decode_begin_mask: Tensor,
     language_token_ids: Vec<u32>,
+    language_token_range: Option<(usize, usize)>,
     token_id_to_language_code: HashMap<u32, String>,
     runtime_tuning: WhisperRuntimeTuning,
     cuda_dtype_shim: bool,
@@ -395,6 +396,7 @@ impl WhisperTurboAsrModel {
         let special = resolve_special_tokens(&tokenizer, &generation)?;
         let (language_token_ids, token_id_to_language_code) =
             build_language_token_maps(&tokenizer, &generation);
+        let language_token_range = contiguous_token_range(&language_token_ids);
 
         let mut suppress_tokens = generation.suppress_tokens.clone();
         suppress_tokens.sort_unstable();
@@ -446,6 +448,7 @@ impl WhisperTurboAsrModel {
             decode_mask,
             decode_begin_mask,
             language_token_ids,
+            language_token_range,
             token_id_to_language_code,
             runtime_tuning,
             cuda_dtype_shim: use_cuda_dtype_shim,
@@ -1082,6 +1085,9 @@ impl WhisperTurboAsrModel {
         let tokens = Tensor::new(&[[self.special.sot]], &self.device.device)?;
         let ys = whisper.decoder_forward(&tokens, audio_features, true)?;
         let logits = whisper.decoder_final_linear(&ys.i(..1)?)?.i(0)?.i(0)?;
+        if let Some(language) = self.detect_language_token_on_cuda(&logits)? {
+            return Ok(Some(language));
+        }
         let logits_vec = logits.to_vec1::<f32>()?;
 
         let mut best_token: Option<u32> = None;
@@ -1101,6 +1107,31 @@ impl WhisperTurboAsrModel {
         let Some(token_id) = best_token else {
             return Ok(None);
         };
+        let Some(code) = self.token_id_to_language_code.get(&token_id).cloned() else {
+            return Ok(None);
+        };
+
+        Ok(Some((token_id, code)))
+    }
+
+    fn detect_language_token_on_cuda(&self, logits: &Tensor) -> Result<Option<(u32, String)>> {
+        if !logits.device().is_cuda() {
+            return Ok(None);
+        }
+
+        let Some((start, len)) = self.language_token_range else {
+            return Ok(None);
+        };
+        let Some(end) = start.checked_add(len) else {
+            return Ok(None);
+        };
+        if end > logits.dim(0)? {
+            return Ok(None);
+        }
+
+        let language_logits = logits.narrow(0, start, len)?;
+        let offset = language_logits.argmax(0)?.to_scalar::<u32>()? as usize;
+        let token_id = start.saturating_add(offset) as u32;
         let Some(code) = self.token_id_to_language_code.get(&token_id).cloned() else {
             return Ok(None);
         };
@@ -1846,6 +1877,16 @@ fn build_language_token_maps(
     (lang_ids, token_to_lang)
 }
 
+fn contiguous_token_range(token_ids: &[u32]) -> Option<(usize, usize)> {
+    let first = *token_ids.first()? as usize;
+    for (offset, token_id) in token_ids.iter().enumerate() {
+        if *token_id as usize != first + offset {
+            return None;
+        }
+    }
+    Some((first, token_ids.len()))
+}
+
 fn has_whisper_language_token(
     generation_lang_to_id: &HashMap<String, u32>,
     code: &str,
@@ -2446,13 +2487,13 @@ mod tests {
     use super::{
         adaptive_decode_budget, apply_whisper_decode_constraints, best_finite_logit,
         build_whisper_decode_mask_tensors, build_whisper_prompt_prefix, capped_decode_temperatures,
-        decode_retry_reasons, decode_step_budget, find_suffix_token_repetition,
-        greedy_decode_step_from_masked_logits, has_low_word_diversity, logits_to_log_probs,
-        logits_to_log_probs_in_place, probability_for_token_from_logits, scaled_logsumexp,
-        text_delta, token_contains_numeral_or_symbol, trimmed_audio_bounds,
-        use_cuda_whisper_dtype_shim, whisper_decode_profile_diagnostics,
-        whisper_device_diagnostics, whisper_impl_name, WhisperDecodeAttempt, WhisperDecodeProfile,
-        WhisperSpecialTokens,
+        contiguous_token_range, decode_retry_reasons, decode_step_budget,
+        find_suffix_token_repetition, greedy_decode_step_from_masked_logits,
+        has_low_word_diversity, logits_to_log_probs, logits_to_log_probs_in_place,
+        probability_for_token_from_logits, scaled_logsumexp, text_delta,
+        token_contains_numeral_or_symbol, trimmed_audio_bounds, use_cuda_whisper_dtype_shim,
+        whisper_decode_profile_diagnostics, whisper_device_diagnostics, whisper_impl_name,
+        WhisperDecodeAttempt, WhisperDecodeProfile, WhisperSpecialTokens,
     };
 
     #[test]
@@ -2636,6 +2677,13 @@ mod tests {
                 .abs()
                 < 1e-5
         );
+    }
+
+    #[test]
+    fn contiguous_token_range_detects_dense_language_ids() {
+        assert_eq!(contiguous_token_range(&[10, 11, 12]), Some((10, 3)));
+        assert_eq!(contiguous_token_range(&[10, 12]), None);
+        assert_eq!(contiguous_token_range(&[]), None);
     }
 
     #[test]
