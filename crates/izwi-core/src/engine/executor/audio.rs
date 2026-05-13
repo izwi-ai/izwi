@@ -1,8 +1,9 @@
 use izwi_asr_toolkit::{
-    plan_audio_chunks, plan_speech_audio_chunks, AsrLongFormConfig, AsrSpeechChunkConfig,
-    AudioChunk, SpeechChunkPlan, TranscriptAssembler,
+    AsrLongFormConfig, AsrSpeechChunkConfig, AudioChunk, SpeechChunkPlan, TranscriptAssembler,
+    plan_audio_chunks, plan_speech_audio_chunks,
 };
 use serde_json::json;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::debug;
 
@@ -42,6 +43,7 @@ pub(crate) struct PlannedAsrChunks {
     pub(crate) speech_plan: Option<SpeechChunkPlan>,
     pub(crate) input_samples: usize,
     pub(crate) sample_rate: u32,
+    pub(crate) planning_ms: f64,
 }
 
 impl PlannedAsrChunks {
@@ -80,9 +82,14 @@ impl PlannedAsrChunks {
             .chunks
             .iter()
             .map(|chunk| {
+                let start_secs = samples_to_seconds(chunk.start_sample, self.sample_rate);
+                let end_secs = samples_to_seconds(chunk.end_sample, self.sample_rate);
                 json!({
                     "start_sample": chunk.start_sample,
                     "end_sample": chunk.end_sample,
+                    "start_seconds": start_secs,
+                    "end_seconds": end_secs,
+                    "duration_seconds": (end_secs - start_secs).max(0.0),
                 })
             })
             .collect::<Vec<_>>();
@@ -91,9 +98,14 @@ impl PlannedAsrChunks {
                 .speech_regions
                 .iter()
                 .map(|region| {
+                    let start_secs = samples_to_seconds(region.start_sample, self.sample_rate);
+                    let end_secs = samples_to_seconds(region.end_sample, self.sample_rate);
                     json!({
                         "start_sample": region.start_sample,
                         "end_sample": region.end_sample,
+                        "start_seconds": start_secs,
+                        "end_seconds": end_secs,
+                        "duration_seconds": (end_secs - start_secs).max(0.0),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -101,8 +113,11 @@ impl PlannedAsrChunks {
                 "no_speech": plan.no_speech,
                 "speech_region_count": plan.speech_regions.len(),
                 "speech_samples": plan.speech_samples,
+                "speech_seconds": samples_to_seconds(plan.speech_samples, self.sample_rate),
                 "included_samples": plan.included_samples,
+                "included_seconds": samples_to_seconds(plan.included_samples, self.sample_rate),
                 "skipped_samples": plan.skipped_samples,
+                "skipped_seconds": samples_to_seconds(plan.skipped_samples, self.sample_rate),
                 "speech_regions": speech_regions,
             })
         });
@@ -113,10 +128,19 @@ impl PlannedAsrChunks {
                 "input_samples": self.input_samples,
                 "sample_rate": self.sample_rate,
                 "audio_seconds": audio_secs,
+                "planning_ms": self.planning_ms,
                 "chunks": chunks,
                 "speech": speech,
             }
         })
+    }
+}
+
+fn samples_to_seconds(samples: usize, sample_rate: u32) -> f32 {
+    if sample_rate > 0 {
+        samples as f32 / sample_rate as f32
+    } else {
+        0.0
     }
 }
 
@@ -262,6 +286,7 @@ impl NativeExecutor {
         allow_speech_planner: bool,
         vad_chunking_enabled: bool,
     ) -> PlannedAsrChunks {
+        let planning_started = Instant::now();
         let audio_secs = if sample_rate > 0 {
             samples.len() as f32 / sample_rate as f32
         } else {
@@ -299,6 +324,7 @@ impl NativeExecutor {
                 speech_plan: None,
                 input_samples: samples.len(),
                 sample_rate,
+                planning_ms: planning_started.elapsed().as_secs_f64() * 1000.0,
             };
         }
 
@@ -322,6 +348,7 @@ impl NativeExecutor {
                 speech_plan: Some(speech_plan),
                 input_samples: samples.len(),
                 sample_rate,
+                planning_ms: planning_started.elapsed().as_secs_f64() * 1000.0,
             };
         }
 
@@ -344,6 +371,7 @@ impl NativeExecutor {
                 speech_plan: None,
                 input_samples: samples.len(),
                 sample_rate,
+                planning_ms: planning_started.elapsed().as_secs_f64() * 1000.0,
             };
         }
 
@@ -354,6 +382,7 @@ impl NativeExecutor {
             speech_plan: None,
             input_samples: samples.len(),
             sample_rate,
+            planning_ms: planning_started.elapsed().as_secs_f64() * 1000.0,
         }
     }
 
@@ -646,6 +675,41 @@ mod tests {
         assert!(plan.requires_chunk_path());
         assert!(plan.chunks.is_empty());
         assert!(plan.speech_plan.as_ref().expect("speech plan").no_speech);
+    }
+
+    #[test]
+    fn chunk_plan_diagnostics_include_timing_and_seconds() {
+        let sr = 16_000u32;
+        let samples = vec![0.0f32; (sr as usize) * 4];
+        let plan = NativeExecutor::asr_chunk_plan_with_options(
+            &samples,
+            sr,
+            Some(30.0),
+            false,
+            true,
+            true,
+        );
+
+        let diagnostics = plan.diagnostics();
+        let chunking = diagnostics
+            .get("chunking")
+            .and_then(|value| value.as_object())
+            .expect("chunking diagnostics");
+
+        assert!(
+            chunking
+                .get("planning_ms")
+                .and_then(|v| v.as_f64())
+                .is_some()
+        );
+        let speech = chunking
+            .get("speech")
+            .and_then(|value| value.as_object())
+            .expect("speech diagnostics");
+        assert_eq!(
+            speech.get("skipped_seconds").and_then(|v| v.as_f64()),
+            Some(4.0)
+        );
     }
 
     #[test]

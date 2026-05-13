@@ -108,6 +108,9 @@ struct WhisperDecodeAttempt {
     ended_with_eot: bool,
     repetition_loop: bool,
     compression_ratio: Option<f32>,
+    generated_token_count: usize,
+    sampled_token_count: usize,
+    decode_steps: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -518,6 +521,8 @@ impl WhisperTurboAsrModel {
 
         let decode_started = Instant::now();
         let mut attempted_temperatures = Vec::with_capacity(temperatures.len());
+        let mut attempt_diagnostics = Vec::with_capacity(temperatures.len());
+        let mut fallback_reasons = Vec::<&'static str>::new();
         let mut best_attempt: Option<WhisperDecodeAttempt> = None;
         let mut selected_temperature = temperatures.first().copied().unwrap_or(0.0);
         let mut best_temperature = selected_temperature;
@@ -530,8 +535,19 @@ impl WhisperTurboAsrModel {
                 max_steps,
                 temperature,
             )?;
+            let no_speech_skip =
+                should_skip_as_no_speech(&attempt, logprob_threshold, no_speech_threshold);
+            let retry_reasons =
+                decode_retry_reasons(&attempt, logprob_threshold, compression_ratio_threshold);
+            attempt_diagnostics.push(whisper_attempt_diagnostics(
+                temperature,
+                &attempt,
+                &retry_reasons,
+                no_speech_skip,
+            ));
 
-            if should_skip_as_no_speech(&attempt, logprob_threshold, no_speech_threshold) {
+            if no_speech_skip {
+                record_unique_reason(&mut fallback_reasons, "no_speech");
                 best_attempt = Some(WhisperDecodeAttempt {
                     text: String::new(),
                     ..attempt
@@ -541,8 +557,7 @@ impl WhisperTurboAsrModel {
             }
 
             let is_last_temperature = idx + 1 == temperatures.len();
-            let should_retry = !is_last_temperature
-                && should_retry_decode(&attempt, logprob_threshold, compression_ratio_threshold);
+            let should_retry = !is_last_temperature && !retry_reasons.is_empty();
             if !should_retry {
                 if best_attempt
                     .as_ref()
@@ -556,6 +571,7 @@ impl WhisperTurboAsrModel {
                 break;
             }
 
+            record_unique_reasons(&mut fallback_reasons, &retry_reasons);
             if best_attempt
                 .as_ref()
                 .map(|best| is_better_attempt(&attempt, best))
@@ -565,7 +581,8 @@ impl WhisperTurboAsrModel {
                 best_temperature = temperature;
             }
         }
-        let decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
+        let decode_secs = decode_started.elapsed().as_secs_f64();
+        let decode_ms = decode_secs * 1000.0;
 
         let final_attempt = best_attempt.unwrap_or_else(|| WhisperDecodeAttempt {
             text: String::new(),
@@ -574,11 +591,19 @@ impl WhisperTurboAsrModel {
             ended_with_eot: false,
             repetition_loop: false,
             compression_ratio: None,
+            generated_token_count: 0,
+            sampled_token_count: 0,
+            decode_steps: 0,
         });
 
         let text = final_attempt.text.trim().to_string();
         let language = resolved_language.map(|(_token_id, code)| code);
         let model_total_ms = request_started.elapsed().as_secs_f64() * 1000.0;
+        let generated_tokens_per_second = if decode_secs > 0.0 {
+            Some(final_attempt.generated_token_count as f64 / decode_secs)
+        } else {
+            None
+        };
         let diagnostics = json!({
             "model_family": "whisper_asr",
             "fallback_attempts": attempted_temperatures.len(),
@@ -629,12 +654,18 @@ impl WhisperTurboAsrModel {
             },
             "selected_temperature": selected_temperature,
             "language_hint_used": language_hint_used,
+            "fallback_reasons": fallback_reasons,
+            "decode_attempts": attempt_diagnostics,
             "decode": {
                 "ended_with_eot": final_attempt.ended_with_eot,
                 "repetition_loop": final_attempt.repetition_loop,
                 "avg_logprob": final_attempt.avg_logprob,
                 "no_speech_prob": final_attempt.no_speech_prob,
                 "compression_ratio": final_attempt.compression_ratio,
+                "decode_steps": final_attempt.decode_steps,
+                "generated_token_count": final_attempt.generated_token_count,
+                "sampled_token_count": final_attempt.sampled_token_count,
+                "generated_tokens_per_second": generated_tokens_per_second,
             },
             "timings_ms": {
                 "mel_prepare": mel_prepare_ms,
@@ -1217,8 +1248,10 @@ impl WhisperTurboAsrModel {
         let mut no_speech_prob: Option<f32> = None;
         let mut ended_with_eot = false;
         let mut repetition_loop = false;
+        let mut decode_steps = 0usize;
 
         for step_idx in 0..max_steps {
+            decode_steps = decode_steps.saturating_add(1);
             let tokens_t = Tensor::new(prompt.as_slice(), &self.device.device)?.unsqueeze(0)?;
             let ys = whisper.decoder_forward(&tokens_t, audio_features, step_idx == 0)?;
             let (_, seq_len, _) = ys.dims3()?;
@@ -1308,6 +1341,9 @@ impl WhisperTurboAsrModel {
             ended_with_eot,
             repetition_loop,
             compression_ratio,
+            generated_token_count: generated_tokens.len(),
+            sampled_token_count,
+            decode_steps,
         })
     }
 
@@ -1331,8 +1367,10 @@ impl WhisperTurboAsrModel {
         let mut repetition_loop = false;
         let mut streamed_text = String::new();
         let mut log_probs_buf = Vec::<f32>::new();
+        let mut decode_steps = 0usize;
 
         for step_idx in 0..max_steps {
+            decode_steps = decode_steps.saturating_add(1);
             let tokens_t = Tensor::new(prompt.as_slice(), &self.device.device)?.unsqueeze(0)?;
             let ys = whisper.decoder_forward(&tokens_t, audio_features, step_idx == 0)?;
             let (_, seq_len, _) = ys.dims3()?;
@@ -1431,6 +1469,9 @@ impl WhisperTurboAsrModel {
             ended_with_eot,
             repetition_loop,
             compression_ratio,
+            generated_token_count: generated_tokens.len(),
+            sampled_token_count,
+            decode_steps,
         })
     }
 
@@ -1873,6 +1914,33 @@ fn should_skip_as_no_speech(
             .unwrap_or(false)
 }
 
+fn decode_retry_reasons(
+    attempt: &WhisperDecodeAttempt,
+    logprob_threshold: f32,
+    compression_ratio_threshold: Option<f32>,
+) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    if attempt.repetition_loop {
+        reasons.push("repetition_loop");
+    }
+    if !attempt.ended_with_eot {
+        reasons.push("missing_eot");
+    }
+    if attempt.avg_logprob < logprob_threshold {
+        reasons.push("low_logprob");
+    }
+    if let (Some(ratio), Some(threshold)) = (attempt.compression_ratio, compression_ratio_threshold)
+    {
+        if ratio > threshold {
+            reasons.push("compression_ratio");
+        }
+    }
+    if has_low_word_diversity(&attempt.text) {
+        reasons.push("low_word_diversity");
+    }
+    reasons
+}
+
 fn should_retry_decode(
     attempt: &WhisperDecodeAttempt,
     logprob_threshold: f32,
@@ -1880,22 +1948,40 @@ fn should_retry_decode(
 ) -> bool {
     // Fallback criteria aligned with upstream Whisper implementations:
     // repetition/unfinished decode, low avg logprob, and optional compression ratio.
-    if attempt.repetition_loop || !attempt.ended_with_eot {
-        return true;
+    !decode_retry_reasons(attempt, logprob_threshold, compression_ratio_threshold).is_empty()
+}
+
+fn record_unique_reason(reasons: &mut Vec<&'static str>, reason: &'static str) {
+    if !reasons.contains(&reason) {
+        reasons.push(reason);
     }
-    if attempt.avg_logprob < logprob_threshold {
-        return true;
+}
+
+fn record_unique_reasons(reasons: &mut Vec<&'static str>, new_reasons: &[&'static str]) {
+    for reason in new_reasons {
+        record_unique_reason(reasons, reason);
     }
-    if let (Some(ratio), Some(threshold)) = (attempt.compression_ratio, compression_ratio_threshold)
-    {
-        if ratio > threshold {
-            return true;
-        }
-    }
-    if has_low_word_diversity(&attempt.text) {
-        return true;
-    }
-    false
+}
+
+fn whisper_attempt_diagnostics(
+    temperature: f32,
+    attempt: &WhisperDecodeAttempt,
+    retry_reasons: &[&'static str],
+    no_speech_skip: bool,
+) -> serde_json::Value {
+    json!({
+        "temperature": temperature,
+        "avg_logprob": attempt.avg_logprob,
+        "no_speech_prob": attempt.no_speech_prob,
+        "ended_with_eot": attempt.ended_with_eot,
+        "repetition_loop": attempt.repetition_loop,
+        "compression_ratio": attempt.compression_ratio,
+        "decode_steps": attempt.decode_steps,
+        "generated_token_count": attempt.generated_token_count,
+        "sampled_token_count": attempt.sampled_token_count,
+        "retry_reasons": retry_reasons,
+        "no_speech": no_speech_skip,
+    })
 }
 
 fn has_low_word_diversity(text: &str) -> bool {
@@ -2002,11 +2088,11 @@ fn decode_step_budget(
 #[cfg(test)]
 mod tests {
     use super::{
-        WhisperSpecialTokens, adaptive_decode_budget, apply_whisper_decode_constraints,
-        build_whisper_prompt_prefix, capped_decode_temperatures, decode_step_budget,
-        find_suffix_token_repetition, has_low_word_diversity, logits_to_log_probs,
-        logits_to_log_probs_in_place, text_delta, token_contains_numeral_or_symbol,
-        trimmed_audio_bounds, use_cuda_whisper_dtype_shim,
+        WhisperDecodeAttempt, WhisperSpecialTokens, adaptive_decode_budget,
+        apply_whisper_decode_constraints, build_whisper_prompt_prefix, capped_decode_temperatures,
+        decode_retry_reasons, decode_step_budget, find_suffix_token_repetition,
+        has_low_word_diversity, logits_to_log_probs, logits_to_log_probs_in_place, text_delta,
+        token_contains_numeral_or_symbol, trimmed_audio_bounds, use_cuda_whisper_dtype_shim,
     };
 
     #[test]
@@ -2248,6 +2334,29 @@ mod tests {
         assert!(!has_low_word_diversity(
             "The quick brown fox jumps over the lazy dog"
         ));
+    }
+
+    #[test]
+    fn decode_retry_reasons_are_structured() {
+        let attempt = WhisperDecodeAttempt {
+            text: "same same same same same same same same".to_string(),
+            avg_logprob: -2.0,
+            no_speech_prob: Some(0.1),
+            ended_with_eot: false,
+            repetition_loop: true,
+            compression_ratio: Some(3.0),
+            generated_token_count: 8,
+            sampled_token_count: 9,
+            decode_steps: 9,
+        };
+
+        let reasons = decode_retry_reasons(&attempt, -1.0, Some(2.4));
+
+        assert!(reasons.contains(&"repetition_loop"));
+        assert!(reasons.contains(&"missing_eot"));
+        assert!(reasons.contains(&"low_logprob"));
+        assert!(reasons.contains(&"compression_ratio"));
+        assert!(reasons.contains(&"low_word_diversity"));
     }
 }
 
