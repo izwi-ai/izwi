@@ -4,7 +4,9 @@
 //! shape. They keep task-specific validation and model identity close to the
 //! capability that needs them while preserving the existing engine contract.
 
-use crate::engine::{EngineCoreRequest, EngineStreamPolicy, GenerationParams as CoreGenerationParams};
+use crate::engine::{
+    EngineCoreRequest, EngineStreamPolicy, GenerationParams as CoreGenerationParams,
+};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::shared::chat::{ChatMessage, ChatRequestConfig};
@@ -179,6 +181,7 @@ pub(crate) struct AsrRuntimeRequest {
     envelope: RequestEnvelope,
     audio: RuntimeAudioInput,
     language: Option<String>,
+    prompt: Option<String>,
 }
 
 impl AsrRuntimeRequest {
@@ -195,6 +198,7 @@ impl AsrRuntimeRequest {
                 .with_correlation_id(correlation_id),
             audio,
             language,
+            prompt: None,
         })
     }
 
@@ -211,7 +215,20 @@ impl AsrRuntimeRequest {
                 .with_correlation_id(correlation_id),
             audio,
             language,
+            prompt: None,
         })
+    }
+
+    pub(crate) fn with_prompt(mut self, prompt: Option<String>) -> Self {
+        self.prompt = prompt.and_then(|prompt| {
+            let trimmed = prompt.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+        self
     }
 
     pub(crate) fn into_engine_request(self) -> EngineCoreRequest {
@@ -223,7 +240,12 @@ impl AsrRuntimeRequest {
         request.model_variant = Some(self.envelope.model_variant);
         request.correlation_id = self.envelope.correlation_id;
         request.stream_policy = self.envelope.stream_policy.into();
-        request.language = self.language;
+        if let Some(language) = self.language {
+            request = request.with_language(language);
+        }
+        if let Some(prompt) = self.prompt {
+            request = request.with_asr_prompt(prompt);
+        }
         request
     }
 }
@@ -481,7 +503,7 @@ impl VadRuntimeRequest {
 mod tests {
     use super::*;
     use crate::catalog::ModelVariant;
-    use crate::engine::GenerationParams;
+    use crate::engine::{EngineTask, GenerationParams};
     use crate::models::shared::chat::{ChatMessage, ChatRole};
     use crate::runtime::types::GenerationRequest;
 
@@ -559,6 +581,31 @@ mod tests {
         assert_eq!(core_request.audio_bytes.as_deref(), Some(&[1, 2, 3][..]));
         assert_eq!(core_request.language.as_deref(), Some("en"));
         assert_eq!(core_request.correlation_id.as_deref(), Some("corr-asr"));
+    }
+
+    #[test]
+    fn asr_runtime_request_carries_initial_prompt() {
+        let runtime_request = AsrRuntimeRequest::from_bytes(
+            vec![1, 2, 3],
+            ModelVariant::WhisperLargeV3Turbo,
+            None,
+            None,
+        )
+        .expect("valid ASR request")
+        .with_prompt(Some("  spell Izwi correctly  ".to_string()));
+
+        let core_request = runtime_request.into_engine_request();
+
+        assert_eq!(
+            core_request.asr_prompt.as_deref(),
+            Some("spell Izwi correctly")
+        );
+        match core_request.task {
+            EngineTask::Asr(input) => {
+                assert_eq!(input.prompt.as_deref(), Some("spell Izwi correctly"));
+            }
+            other => panic!("unexpected task payload: {other:?}"),
+        }
     }
 
     #[test]

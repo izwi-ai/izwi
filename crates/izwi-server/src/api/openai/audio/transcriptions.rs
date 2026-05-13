@@ -30,8 +30,7 @@ struct TranscriptionRequest {
     language: Option<String>,
     response_format: Option<String>,
     stream: bool,
-    // Accepted for compatibility; currently not used by runtime.
-    _prompt: Option<String>,
+    prompt: Option<String>,
     _temperature: Option<f32>,
     timestamp_granularities: Option<Vec<String>>,
 }
@@ -141,10 +140,11 @@ pub async fn transcriptions(
     let started = Instant::now();
     let output = state
         .runtime
-        .asr_transcribe_with_correlation(
+        .asr_transcribe_with_prompt_and_correlation(
             &audio_base64,
             req.model.as_deref(),
             req.language.as_deref(),
+            req.prompt.as_deref(),
             Some(&ctx.correlation_id),
         )
         .await?;
@@ -262,6 +262,7 @@ async fn transcriptions_stream(
 ) -> Result<Response<Body>, ApiError> {
     let model = req.model;
     let language = req.language;
+    let prompt = req.prompt;
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<String>();
     let engine = state.runtime.clone();
@@ -280,10 +281,11 @@ async fn transcriptions_stream(
         // Keep transcription streaming unbounded by wall-clock timeout so valid
         // long jobs are not cut off mid-flight.
         let result = engine
-            .asr_transcribe_streaming_with_correlation(
+            .asr_transcribe_streaming_with_prompt_and_correlation(
                 &audio_base64,
                 model.as_deref(),
                 language.as_deref(),
+                prompt.as_deref(),
                 Some(correlation_id.as_str()),
                 move |delta| {
                     let _ = delta_tx.send(transcript_delta_event_payload(delta));
@@ -371,7 +373,7 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
             language: payload.language,
             response_format: payload.response_format,
             stream: payload.stream.unwrap_or(false),
-            _prompt: payload.prompt,
+            prompt: payload.prompt,
             _temperature: payload.temperature,
             timestamp_granularities: payload.timestamp_granularities,
         });
@@ -461,7 +463,7 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
                         ))
                     })?;
                     if !text.trim().is_empty() {
-                        out._prompt = Some(text.trim().to_string());
+                        out.prompt = Some(text.trim().to_string());
                     }
                 }
                 "temperature" => {
