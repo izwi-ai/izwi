@@ -74,6 +74,7 @@ const TIMESTAMP_SEGMENT_MAX_DURATION_SECS: f32 = 8.0;
 const TIMESTAMP_SEGMENT_MAX_CHARS: usize = 84;
 const TIMESTAMP_SEGMENT_LONG_PAUSE_SECS: f32 = 0.8;
 const TIMESTAMP_SEGMENT_MIN_PUNCTUATION_SECS: f32 = 1.0;
+const TIMESTAMP_SEGMENT_BOUNDARY_EPS: f32 = 0.001;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct TimestampGranularityRequest {
@@ -152,6 +153,7 @@ pub async fn transcriptions(
     let mut words = None;
     let mut segments = None;
     let mut subtitle_segments = None;
+    let chunk_boundaries = extract_chunk_segment_boundaries(output.asr_diagnostics.as_ref());
     if timestamp_request.any() && !output.text.trim().is_empty() {
         let alignments = state
             .runtime
@@ -167,7 +169,10 @@ pub async fn transcriptions(
             words = Some(timestamp_words.clone());
         }
         if timestamp_request.segments {
-            segments = Some(build_timestamp_segments(&timestamp_words));
+            segments = Some(build_timestamp_segments(
+                &timestamp_words,
+                &chunk_boundaries,
+            ));
         }
     } else if matches!(response_format.as_str(), "srt" | "vtt") && !output.text.trim().is_empty() {
         match state
@@ -182,7 +187,7 @@ pub async fn transcriptions(
         {
             Ok(alignments) => {
                 let timestamp_words = alignments_to_timestamp_words(alignments);
-                let built_segments = build_timestamp_segments(&timestamp_words);
+                let built_segments = build_timestamp_segments(&timestamp_words, &chunk_boundaries);
                 if !built_segments.is_empty() {
                     subtitle_segments = Some(built_segments);
                 }
@@ -566,6 +571,7 @@ fn alignments_to_timestamp_words(
 
 fn build_timestamp_segments(
     words: &[TranscriptionTimestampWord],
+    chunk_boundaries: &[f32],
 ) -> Vec<TranscriptionTimestampSegment> {
     let mut segments = Vec::new();
     let mut current_words = Vec::<String>::new();
@@ -591,7 +597,18 @@ fn build_timestamp_segments(
             .sum::<usize>();
         let duration = end - segment_start;
         let is_last = next.is_none();
+        let crosses_chunk_boundary = next
+            .map(|next_word| {
+                timestamp_segment_crosses_chunk_boundary(
+                    segment_start,
+                    end,
+                    next_word.start,
+                    chunk_boundaries,
+                )
+            })
+            .unwrap_or(false);
         let should_close = is_last
+            || crosses_chunk_boundary
             || pause_after >= TIMESTAMP_SEGMENT_LONG_PAUSE_SECS
             || current_text_len >= TIMESTAMP_SEGMENT_MAX_CHARS
             || duration >= TIMESTAMP_SEGMENT_MAX_DURATION_SECS
@@ -605,6 +622,58 @@ fn build_timestamp_segments(
     }
 
     segments
+}
+
+fn timestamp_segment_crosses_chunk_boundary(
+    segment_start: f32,
+    word_end: f32,
+    next_word_start: f32,
+    chunk_boundaries: &[f32],
+) -> bool {
+    chunk_boundaries.iter().any(|boundary| {
+        boundary.is_finite()
+            && *boundary > segment_start + TIMESTAMP_SEGMENT_BOUNDARY_EPS
+            && (*boundary <= word_end + TIMESTAMP_SEGMENT_BOUNDARY_EPS
+                || *boundary <= next_word_start + TIMESTAMP_SEGMENT_BOUNDARY_EPS)
+    })
+}
+
+fn extract_chunk_segment_boundaries(diagnostics: Option<&serde_json::Value>) -> Vec<f32> {
+    let Some(diagnostics) = diagnostics else {
+        return Vec::new();
+    };
+    let Some(chunking) = diagnostics
+        .get("chunking")
+        .or_else(|| diagnostics.get("model_diagnostics")?.get("chunking"))
+    else {
+        return Vec::new();
+    };
+    let Some(chunks) = chunking.get("chunks").and_then(|chunks| chunks.as_array()) else {
+        return Vec::new();
+    };
+    let sample_rate = chunking
+        .get("sample_rate")
+        .and_then(|value| value.as_f64())
+        .filter(|sample_rate| sample_rate.is_finite() && *sample_rate > 0.0);
+    let mut starts = chunks
+        .iter()
+        .filter_map(|chunk| {
+            chunk
+                .get("start_seconds")
+                .and_then(|value| value.as_f64())
+                .or_else(|| {
+                    let sample_rate = sample_rate?;
+                    let start_sample = chunk.get("start_sample")?.as_u64()?;
+                    Some(start_sample as f64 / sample_rate)
+                })
+        })
+        .filter(|start| start.is_finite() && *start > 0.0)
+        .map(|start| start as f32)
+        .collect::<Vec<_>>();
+
+    starts.sort_by(|left, right| left.total_cmp(right));
+    starts.dedup_by(|left, right| (*left - *right).abs() <= TIMESTAMP_SEGMENT_BOUNDARY_EPS);
+    starts
 }
 
 fn push_timestamp_segment(
@@ -831,7 +900,7 @@ mod tests {
                 end: 2.4,
             },
         ];
-        let segments = build_timestamp_segments(&words);
+        let segments = build_timestamp_segments(&words, &[]);
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].id, 0);
         assert_eq!(segments[0].text, "hello world");
@@ -855,10 +924,66 @@ mod tests {
                 end: 1.6,
             },
         ];
-        let segments = build_timestamp_segments(&words);
+        let segments = build_timestamp_segments(&words, &[]);
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].text, "Hello.");
         assert_eq!(segments[1].text, "World");
+    }
+
+    #[test]
+    fn groups_verbose_timestamp_segments_by_chunk_boundary() {
+        let words = vec![
+            TranscriptionTimestampWord {
+                word: "hello".to_string(),
+                start: 0.1,
+                end: 0.4,
+            },
+            TranscriptionTimestampWord {
+                word: "world".to_string(),
+                start: 0.5,
+                end: 0.8,
+            },
+            TranscriptionTimestampWord {
+                word: "again".to_string(),
+                start: 1.05,
+                end: 1.4,
+            },
+        ];
+
+        let diagnostics = serde_json::json!({
+            "chunking": {
+                "sample_rate": 16000,
+                "chunks": [
+                    { "start_seconds": 0.0, "end_seconds": 1.0 },
+                    { "start_seconds": 1.0, "end_seconds": 2.0 }
+                ]
+            }
+        });
+        let chunk_boundaries = extract_chunk_segment_boundaries(Some(&diagnostics));
+        let segments = build_timestamp_segments(&words, &chunk_boundaries);
+
+        assert_eq!(chunk_boundaries, vec![1.0]);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].text, "hello world");
+        assert_eq!(segments[1].text, "again");
+    }
+
+    #[test]
+    fn extracts_chunk_boundaries_from_sample_offsets() {
+        let diagnostics = serde_json::json!({
+            "chunking": {
+                "sample_rate": 16000,
+                "chunks": [
+                    { "start_sample": 0, "end_sample": 16000 },
+                    { "start_sample": 16000, "end_sample": 32000 },
+                    { "start_sample": 32000, "end_sample": 48000 }
+                ]
+            }
+        });
+
+        let chunk_boundaries = extract_chunk_segment_boundaries(Some(&diagnostics));
+
+        assert_eq!(chunk_boundaries, vec![1.0, 2.0]);
     }
 
     #[test]
