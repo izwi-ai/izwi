@@ -36,6 +36,15 @@ fn to_add_dtype(tensor: Tensor, dtype: DType) -> Result<Tensor> {
     }
 }
 
+fn can_skip_attention_mask_for_cuda_flash(
+    masked: bool,
+    query_pos: usize,
+    q_len: usize,
+    kv_len: usize,
+) -> bool {
+    !masked || (q_len == 1 && kv_len == query_pos + 1)
+}
+
 #[derive(Debug, Clone)]
 struct MultiHeadAttention {
     query: Linear,
@@ -145,7 +154,9 @@ impl MultiHeadAttention {
         let k = self.reshape_head(k)?;
         let v = self.reshape_head(v)?.contiguous()?;
 
-        if mask.is_none() && q.device().is_cuda() {
+        if can_skip_attention_mask_for_cuda_flash(mask.is_some(), query_pos, q_len, kv_len)
+            && q.device().is_cuda()
+        {
             match try_fused_self_attention(&q, &k, &v, None, head_dim, false) {
                 Ok(Some(wv)) => {
                     return wv.transpose(1, 2)?.flatten_from(2);
@@ -505,7 +516,10 @@ impl Whisper {
 
 #[cfg(test)]
 mod tests {
-    use super::{attention_mask_window, causal_attention_mask, sinusoids};
+    use super::{
+        attention_mask_window, can_skip_attention_mask_for_cuda_flash, causal_attention_mask,
+        sinusoids,
+    };
     use candle_core::{DType, Device, Tensor};
 
     #[test]
@@ -542,5 +556,13 @@ mod tests {
         assert_eq!(rows[0][1], 0.0);
         assert_eq!(rows[0][2], 0.0);
         assert!(rows[0][3].is_infinite() && rows[0][3].is_sign_negative());
+    }
+
+    #[test]
+    fn incremental_single_token_mask_can_be_skipped_for_flash_attention() {
+        assert!(can_skip_attention_mask_for_cuda_flash(false, 0, 8, 8));
+        assert!(can_skip_attention_mask_for_cuda_flash(true, 4, 1, 5));
+        assert!(!can_skip_attention_mask_for_cuda_flash(true, 0, 4, 4));
+        assert!(!can_skip_attention_mask_for_cuda_flash(true, 4, 1, 6));
     }
 }
