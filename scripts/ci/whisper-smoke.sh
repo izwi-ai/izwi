@@ -129,9 +129,9 @@ def validate_cpu_metal_whisper_diagnostics(case_name, diagnostics, backend):
             )
         if device.get("cuda_dtype_shim") is not False:
             raise SystemExit(f"{case_name}: CPU/Metal run reported CUDA dtype shim")
-        if device.get("whisper_impl") != "upstream_candle":
+        if device.get("whisper_impl") != "local_whisper":
             raise SystemExit(
-                f"{case_name}: expected upstream_candle Whisper impl, got {device.get('whisper_impl')}"
+                f"{case_name}: expected local_whisper Whisper impl, got {device.get('whisper_impl')}"
             )
 
 

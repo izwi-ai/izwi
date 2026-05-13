@@ -15,9 +15,7 @@ use std::time::Instant;
 
 use candle_core::{DType, IndexOp, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::whisper::{
-    self, model::Whisper as CandleWhisper, Config as WhisperConfig,
-};
+use candle_transformers::models::whisper::{self, Config as WhisperConfig};
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use rand::Rng;
@@ -31,7 +29,7 @@ use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::tokenizer::Tokenizer;
 
-use super::model::Whisper as CudaWhisper;
+use super::model::Whisper as LocalWhisper;
 
 const SAMPLE_RATE: u32 = whisper::SAMPLE_RATE as u32;
 const DEFAULT_MAX_NEW_TOKENS: usize = 448;
@@ -227,37 +225,25 @@ struct WhisperLanguageResolution {
 }
 
 enum WhisperModel {
-    Upstream(CandleWhisper),
-    Cuda(CudaWhisper),
+    Local(LocalWhisper),
 }
 
 impl WhisperModel {
-    fn load(vb: &VarBuilder, config: WhisperConfig, use_cuda_dtype_shim: bool) -> Result<Self> {
-        if use_cuda_dtype_shim {
-            CudaWhisper::load(vb, config)
-                .map(Self::Cuda)
-                .map_err(Error::from)
-        } else {
-            CandleWhisper::load(vb, config)
-                .map(Self::Upstream)
-                .map_err(Error::from)
-        }
+    fn load(vb: &VarBuilder, config: WhisperConfig) -> Result<Self> {
+        LocalWhisper::load(vb, config)
+            .map(Self::Local)
+            .map_err(Error::from)
     }
 
     fn reset_kv_cache(&mut self) {
         match self {
-            Self::Upstream(model) => model.reset_kv_cache(),
-            Self::Cuda(model) => model.reset_kv_cache(),
+            Self::Local(model) => model.reset_kv_cache(),
         }
     }
 
     fn encoder_forward(&mut self, x: &Tensor, flush_kv_cache: bool) -> Result<Tensor> {
         match self {
-            Self::Upstream(model) => model
-                .encoder
-                .forward(x, flush_kv_cache)
-                .map_err(Error::from),
-            Self::Cuda(model) => model
+            Self::Local(model) => model
                 .encoder
                 .forward(x, flush_kv_cache)
                 .map_err(Error::from),
@@ -270,22 +256,27 @@ impl WhisperModel {
         audio_features: &Tensor,
         flush_kv_cache: bool,
     ) -> Result<Tensor> {
+        self.decoder_forward_at(x, audio_features, 0, flush_kv_cache)
+    }
+
+    fn decoder_forward_at(
+        &mut self,
+        x: &Tensor,
+        audio_features: &Tensor,
+        position_offset: usize,
+        flush_kv_cache: bool,
+    ) -> Result<Tensor> {
         match self {
-            Self::Upstream(model) => model
+            Self::Local(model) => model
                 .decoder
-                .forward(x, audio_features, flush_kv_cache)
-                .map_err(Error::from),
-            Self::Cuda(model) => model
-                .decoder
-                .forward(x, audio_features, flush_kv_cache)
+                .forward_at(x, audio_features, position_offset, flush_kv_cache)
                 .map_err(Error::from),
         }
     }
 
     fn decoder_final_linear(&self, x: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Upstream(model) => model.decoder.final_linear(x).map_err(Error::from),
-            Self::Cuda(model) => model.decoder.final_linear(x).map_err(Error::from),
+            Self::Local(model) => model.decoder.final_linear(x).map_err(Error::from),
         }
     }
 }
@@ -313,9 +304,9 @@ fn whisper_device_diagnostics(
 
 fn whisper_impl_name(cuda_dtype_shim: bool) -> &'static str {
     if cuda_dtype_shim {
-        "cuda_dtype_shim"
+        "local_whisper_cuda_dtype_shim"
     } else {
-        "upstream_candle"
+        "local_whisper"
     }
 }
 
@@ -393,7 +384,7 @@ impl WhisperTurboAsrModel {
         };
 
         let use_cuda_dtype_shim = use_cuda_whisper_dtype_shim(&device.device);
-        let whisper = WhisperModel::load(&vb, config.clone(), use_cuda_dtype_shim)?;
+        let whisper = WhisperModel::load(&vb, config.clone())?;
         let special = resolve_special_tokens(&tokenizer, &generation)?;
         let (language_token_ids, token_id_to_language_code) =
             build_language_token_maps(&tokenizer, &generation);
@@ -1332,6 +1323,15 @@ impl WhisperTurboAsrModel {
 
         for step_idx in 0..max_steps {
             decode_steps = decode_steps.saturating_add(1);
+            let mut single_token = [0u32; 1];
+            let (input_tokens, position_offset, flush_cache) = if step_idx == 0 {
+                (prompt.as_slice(), 0, true)
+            } else {
+                single_token[0] = *prompt.last().ok_or_else(|| {
+                    Error::InferenceError("Whisper decode prompt is empty".to_string())
+                })?;
+                (&single_token[..], prompt.len().saturating_sub(1), false)
+            };
             self.synchronize_profile_device()?;
             let step_started = if profile_enabled {
                 Some(Instant::now())
@@ -1340,21 +1340,31 @@ impl WhisperTurboAsrModel {
             };
             let tokens_t = if profile_enabled {
                 let started = Instant::now();
-                let tokens = Tensor::new(prompt.as_slice(), &self.device.device)?.unsqueeze(0)?;
+                let tokens = Tensor::new(input_tokens, &self.device.device)?.unsqueeze(0)?;
                 self.synchronize_profile_device()?;
                 profile.token_tensor_ms += elapsed_ms(started);
                 tokens
             } else {
-                Tensor::new(prompt.as_slice(), &self.device.device)?.unsqueeze(0)?
+                Tensor::new(input_tokens, &self.device.device)?.unsqueeze(0)?
             };
             let ys = if profile_enabled {
                 let started = Instant::now();
-                let ys = whisper.decoder_forward(&tokens_t, audio_features, step_idx == 0)?;
+                let ys = whisper.decoder_forward_at(
+                    &tokens_t,
+                    audio_features,
+                    position_offset,
+                    flush_cache,
+                )?;
                 self.synchronize_profile_device()?;
                 profile.decoder_forward_ms += elapsed_ms(started);
                 ys
             } else {
-                whisper.decoder_forward(&tokens_t, audio_features, step_idx == 0)?
+                whisper.decoder_forward_at(
+                    &tokens_t,
+                    audio_features,
+                    position_offset,
+                    flush_cache,
+                )?
             };
             let (_, seq_len, _) = ys.dims3()?;
             let logits = if profile_enabled {
@@ -1504,8 +1514,22 @@ impl WhisperTurboAsrModel {
 
         for step_idx in 0..max_steps {
             decode_steps = decode_steps.saturating_add(1);
-            let tokens_t = Tensor::new(prompt.as_slice(), &self.device.device)?.unsqueeze(0)?;
-            let ys = whisper.decoder_forward(&tokens_t, audio_features, step_idx == 0)?;
+            let mut single_token = [0u32; 1];
+            let (input_tokens, position_offset, flush_cache) = if step_idx == 0 {
+                (prompt.as_slice(), 0, true)
+            } else {
+                single_token[0] = *prompt.last().ok_or_else(|| {
+                    Error::InferenceError("Whisper decode prompt is empty".to_string())
+                })?;
+                (&single_token[..], prompt.len().saturating_sub(1), false)
+            };
+            let tokens_t = Tensor::new(input_tokens, &self.device.device)?.unsqueeze(0)?;
+            let ys = whisper.decoder_forward_at(
+                &tokens_t,
+                audio_features,
+                position_offset,
+                flush_cache,
+            )?;
             let (_, seq_len, _) = ys.dims3()?;
             let logits = whisper
                 .decoder_final_linear(&ys.i((..1, seq_len - 1..))?)?
@@ -2257,7 +2281,7 @@ mod tests {
     }
 
     #[test]
-    fn whisper_device_diagnostics_keep_cpu_and_metal_on_upstream_f32() {
+    fn whisper_device_diagnostics_keep_cpu_and_metal_on_local_f32() {
         for kind in [
             crate::backends::DeviceKind::Cpu,
             crate::backends::DeviceKind::Metal,
@@ -2285,15 +2309,15 @@ mod tests {
                 diagnostics
                     .get("whisper_impl")
                     .and_then(|value| value.as_str()),
-                Some("upstream_candle")
+                Some("local_whisper")
             );
         }
     }
 
     #[test]
     fn whisper_impl_name_marks_cuda_dtype_shim_explicitly() {
-        assert_eq!(whisper_impl_name(false), "upstream_candle");
-        assert_eq!(whisper_impl_name(true), "cuda_dtype_shim");
+        assert_eq!(whisper_impl_name(false), "local_whisper");
+        assert_eq!(whisper_impl_name(true), "local_whisper_cuda_dtype_shim");
     }
 
     #[test]
