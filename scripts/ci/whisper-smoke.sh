@@ -51,7 +51,7 @@ request_transcription() {
   local output_path="$5"
   local stream="$6"
 
-  python3 - "$SERVER" "$MODEL" "$case_name" "$audio_path" "$response_format" "$language" "$output_path" "$stream" <<'PY'
+  python3 - "$SERVER" "$MODEL" "$case_name" "$audio_path" "$response_format" "$language" "$output_path" "$stream" "$BACKEND" <<'PY'
 import base64
 import json
 import os
@@ -60,7 +60,7 @@ import sys
 import urllib.error
 import urllib.request
 
-server, model, case_name, audio_path, response_format, language, output_path, stream = sys.argv[1:]
+server, model, case_name, audio_path, response_format, language, output_path, stream, backend = sys.argv[1:]
 timeout = int(os.environ.get("IZWI_WHISPER_SMOKE_TIMEOUT_SECS", "900"))
 payload = {
     "model": model,
@@ -88,6 +88,53 @@ except urllib.error.HTTPError as exc:
     sys.stderr.write(body.decode("utf-8", errors="replace") + "\n")
     raise
 
+
+def collect_whisper_diagnostics(diagnostics):
+    found = []
+    if not isinstance(diagnostics, dict):
+        return found
+    if diagnostics.get("model_family") == "whisper_asr":
+        found.append(diagnostics)
+    chunking = diagnostics.get("chunking")
+    if isinstance(chunking, dict):
+        for chunk in chunking.get("chunk_transcriptions", []):
+            if not isinstance(chunk, dict):
+                continue
+            model_diagnostics = chunk.get("model_diagnostics")
+            if (
+                isinstance(model_diagnostics, dict)
+                and model_diagnostics.get("model_family") == "whisper_asr"
+            ):
+                found.append(model_diagnostics)
+    return found
+
+
+def validate_cpu_metal_whisper_diagnostics(case_name, diagnostics, backend):
+    nodes = collect_whisper_diagnostics(diagnostics)
+    if not nodes and "silence" not in case_name:
+        raise SystemExit(f"{case_name}: no Whisper diagnostics found to validate")
+
+    expected_kind = {"cpu": "Cpu", "metal": "Metal"}[backend]
+    for idx, node in enumerate(nodes):
+        device = node.get("device")
+        if not isinstance(device, dict):
+            raise SystemExit(f"{case_name}: Whisper diagnostics {idx} missing device object")
+        if device.get("kind") != expected_kind:
+            raise SystemExit(
+                f"{case_name}: expected Whisper device kind {expected_kind}, got {device.get('kind')}"
+            )
+        if device.get("model_dtype") != "F32":
+            raise SystemExit(
+                f"{case_name}: expected Whisper model dtype F32, got {device.get('model_dtype')}"
+            )
+        if device.get("cuda_dtype_shim") is not False:
+            raise SystemExit(f"{case_name}: CPU/Metal run reported CUDA dtype shim")
+        if device.get("whisper_impl") != "upstream_candle":
+            raise SystemExit(
+                f"{case_name}: expected upstream_candle Whisper impl, got {device.get('whisper_impl')}"
+            )
+
+
 Path(output_path).write_bytes(body)
 text = body.decode("utf-8", errors="replace")
 
@@ -100,6 +147,11 @@ elif response_format == "verbose_json":
         raise SystemExit(f"{case_name}: verbose_json response is missing text")
     if "izwi_asr_diagnostics" not in parsed:
         raise SystemExit(f"{case_name}: verbose_json response is missing izwi_asr_diagnostics")
+    validate_cpu_metal_whisper_diagnostics(
+        case_name,
+        parsed.get("izwi_asr_diagnostics"),
+        backend,
+    )
 else:
     if not text.strip():
         raise SystemExit(f"{case_name}: {response_format} response was empty")
