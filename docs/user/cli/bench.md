@@ -104,6 +104,51 @@ izwi bench asr [OPTIONS]
 izwi bench asr --model Whisper-Large-v3-Turbo --file test.wav --language en --iterations 20 --warmup
 ```
 
+### Whisper ASR Performance Protocol
+
+For CPU and Metal regressions, start a warmed server for the backend under
+test, then run the smoke guardrail before recording a benchmark:
+
+```bash
+IZWI_BACKEND=metal \
+IZWI_PRELOAD_MODELS=Whisper-Large-v3-Turbo \
+IZWI_WARMUP_PRELOADED_MODELS=1 \
+izwi serve --backend metal
+```
+
+```bash
+IZWI_WHISPER_SMOKE_BACKEND=metal \
+IZWI_WHISPER_SMOKE_SHORT_AUDIO=fixtures/short.wav \
+IZWI_WHISPER_SMOKE_LONG_AUDIO=fixtures/long.wav \
+IZWI_WHISPER_SMOKE_SILENCE_AUDIO=fixtures/silence.wav \
+IZWI_WHISPER_SMOKE_NON_EN_AUDIO=fixtures/non-en.wav \
+scripts/ci/whisper-smoke.sh
+```
+
+The smoke output must show Whisper diagnostics with
+`device.model_dtype = "F32"`, `device.cuda_dtype_shim = false`, and
+`device.whisper_impl = "local_whisper"` for CPU and Metal. CUDA runs keep the
+CUDA-specific Whisper dtype policy.
+
+Use JSON output for comparable benchmark artifacts:
+
+```bash
+izwi --output-format json bench asr \
+  --model Whisper-Large-v3-Turbo \
+  --file fixtures/short.wav \
+  --language en \
+  --iterations 10 \
+  --warmup > whisper-current.json
+```
+
+```bash
+izwi bench compare whisper-current.json whisper-baseline.json --tolerance-percent 10
+```
+
+Set `IZWI_WHISPER_PROFILE_SYNC=1` when investigating backend timing
+attribution. Set `IZWI_WHISPER_DEVICE_GREEDY=0` only when isolating the scalar
+device-greedy decode path from the incremental decoder cache.
+
 ---
 
 ## izwi bench throughput

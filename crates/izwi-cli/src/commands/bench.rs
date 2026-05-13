@@ -1675,16 +1675,10 @@ async fn bench_asr(
     let mut saw_whisper_diagnostics = false;
     for sample in &samples {
         if let Some(diagnostics) = sample.response.izwi_asr_diagnostics.as_ref() {
-            if diagnostics
-                .get("model_family")
-                .and_then(|value| value.as_str())
-                == Some("whisper_asr")
-            {
+            if diagnostics_contains_whisper_model(diagnostics) {
                 saw_whisper_diagnostics = true;
             }
-            if let Some(stage_sample) = whisper_stage_timings_from_diagnostics(diagnostics) {
-                stage_samples.push(stage_sample);
-            }
+            stage_samples.extend(collect_whisper_stage_timings_from_diagnostics(diagnostics));
         }
     }
 
@@ -2294,6 +2288,64 @@ fn whisper_stage_timings_from_diagnostics(
     })
 }
 
+fn diagnostics_contains_whisper_model(diagnostics: &serde_json::Value) -> bool {
+    if diagnostics
+        .get("model_family")
+        .and_then(|value| value.as_str())
+        == Some("whisper_asr")
+    {
+        return true;
+    }
+
+    diagnostics
+        .get("chunking")
+        .and_then(|value| value.get("chunk_transcriptions"))
+        .and_then(|value| value.as_array())
+        .map(|chunks| {
+            chunks.iter().any(|chunk| {
+                chunk
+                    .get("model_diagnostics")
+                    .and_then(|value| value.get("model_family"))
+                    .and_then(|value| value.as_str())
+                    == Some("whisper_asr")
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn collect_whisper_stage_timings_from_diagnostics(
+    diagnostics: &serde_json::Value,
+) -> Vec<WhisperStageTimings> {
+    let mut samples = Vec::new();
+    if let Some(stage_sample) = whisper_stage_timings_from_diagnostics(diagnostics) {
+        samples.push(stage_sample);
+    }
+
+    if let Some(chunks) = diagnostics
+        .get("chunking")
+        .and_then(|value| value.get("chunk_transcriptions"))
+        .and_then(|value| value.as_array())
+    {
+        for chunk in chunks {
+            let Some(model_diagnostics) = chunk.get("model_diagnostics") else {
+                continue;
+            };
+            if model_diagnostics
+                .get("model_family")
+                .and_then(|value| value.as_str())
+                != Some("whisper_asr")
+            {
+                continue;
+            }
+            if let Some(stage_sample) = whisper_stage_timings_from_diagnostics(model_diagnostics) {
+                samples.push(stage_sample);
+            }
+        }
+    }
+
+    samples
+}
+
 fn summarize_stage(stage: &str, values: &[f64]) {
     if values.is_empty() {
         return;
@@ -2594,6 +2646,32 @@ mod tests {
         assert_eq!(sample.completion_tokens, 7);
         assert_eq!(sample.generation_time_ms, Some(123.0));
         assert!(sample.ttft_ms >= 0.0);
+    }
+
+    #[test]
+    fn whisper_stage_timing_collection_includes_chunk_model_diagnostics() {
+        let diagnostics = serde_json::json!({
+            "chunking": {
+                "chunk_transcriptions": [
+                    {
+                        "model_diagnostics": {
+                            "model_family": "whisper_asr",
+                            "timings_ms": {
+                                "decode": 10.0,
+                                "model_total": 20.0
+                            }
+                        }
+                    }
+                ]
+            }
+        });
+
+        assert!(diagnostics_contains_whisper_model(&diagnostics));
+        let samples = collect_whisper_stage_timings_from_diagnostics(&diagnostics);
+
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].decode, Some(10.0));
+        assert_eq!(samples[0].model_total, Some(20.0));
     }
 
     #[tokio::test]

@@ -993,6 +993,46 @@ mod tests {
     }
 
     #[test]
+    fn cpu_and_metal_whisper_model_dtype_stays_f32() {
+        let cpu_profile = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Cpu,
+            capabilities: DeviceCapabilities::default(),
+            memory_pool: None,
+        };
+        let metal_profile = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Metal,
+            capabilities: DeviceCapabilities {
+                prefers_f32: true,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+
+        assert_eq!(
+            cpu_profile.select_model_dtype(ModelFamily::WhisperAsr, None),
+            DType::F32
+        );
+        assert_eq!(
+            cpu_profile
+                .select_model_dtype_checked(ModelFamily::WhisperAsr, Some("f16"), "Whisper")
+                .unwrap(),
+            DType::F32
+        );
+        assert_eq!(
+            metal_profile.select_model_dtype(ModelFamily::WhisperAsr, None),
+            DType::F32
+        );
+        assert_eq!(
+            metal_profile
+                .select_model_dtype_checked(ModelFamily::WhisperAsr, Some("bf16"), "Whisper")
+                .unwrap(),
+            DType::F32
+        );
+    }
+
+    #[test]
     fn cuda_compute_capability_gates_bf16() {
         assert!(!cuda_compute_capability_supports_bf16((7, 5)));
         assert!(cuda_compute_capability_supports_bf16((8, 0)));
