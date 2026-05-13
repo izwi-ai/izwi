@@ -149,6 +149,37 @@ Set `IZWI_WHISPER_PROFILE_SYNC=1` when investigating backend timing
 attribution. Set `IZWI_WHISPER_DEVICE_GREEDY=0` only when isolating the scalar
 device-greedy decode path from the incremental decoder cache.
 
+For CUDA second-wave kernel benchmarks, build and compare Candle feature
+combinations before changing CUDA defaults:
+
+```bash
+IZWI_CUDA_FEATURES=cuda scripts/ci/check-backend-truth.sh cargo-cuda
+IZWI_CUDA_FEATURES=cuda,flash-attn scripts/ci/check-backend-truth.sh cargo-cuda
+IZWI_CUDA_FEATURES=cuda,cudnn scripts/ci/check-backend-truth.sh cargo-cuda
+IZWI_CUDA_FEATURES=cuda,cudnn,flash-attn scripts/ci/check-backend-truth.sh cargo-cuda
+```
+
+Run FlashAttention experiments with both the build feature and runtime opt-in:
+
+```bash
+IZWI_BACKEND=cuda \
+IZWI_USE_FLASH_ATTENTION=1 \
+IZWI_WHISPER_PROFILE_SYNC=1 \
+izwi --output-format json bench asr \
+  --model Whisper-Large-v3-Turbo \
+  --file fixtures/short.wav \
+  --language en \
+  --iterations 10 \
+  --warmup > whisper-cuda-flash.json
+```
+
+The CUDA FlashAttention path is Candle-backed and opportunistic: Whisper uses it
+only for CUDA tensors when the build, dtype, head dimension, shape, and runtime
+flag allow it. The benchmark telemetry should show fused-attention
+attempt/success/fallback counters, and the transcript/WER must be compared
+against the non-FlashAttention CUDA baseline. Only enable `cudnn` in builds
+whose runtime image or host provides matching cuDNN libraries.
+
 ---
 
 ## izwi bench throughput
