@@ -47,6 +47,7 @@ const DEFAULT_SILENCE_TRIM_MARGIN_MS: usize = 120;
 const DEFAULT_SILENCE_TRIM_MIN_LEADING_MS: usize = 500;
 const DEFAULT_SILENCE_TRIM_MIN_TRAILING_MS: usize = 160;
 const DEFAULT_SILENCE_TRIM_MIN_CLIP_SECS: f32 = 0.8;
+const DEFAULT_INITIAL_PROMPT_MAX_TOKENS: usize = 224;
 const DEFAULT_LOGPROB_THRESHOLD: f32 = -1.0;
 const DEFAULT_NO_SPEECH_THRESHOLD: f32 = 0.6;
 const REPETITION_GUARD_MIN_SPAN_TOKENS: usize = 8;
@@ -84,6 +85,7 @@ struct WhisperGenerationConfig {
 #[derive(Debug, Clone, Copy)]
 struct WhisperSpecialTokens {
     sot: u32,
+    sot_prev: Option<u32>,
     transcribe: u32,
     eot: u32,
     blank: Option<u32>,
@@ -128,6 +130,7 @@ struct WhisperRuntimeTuning {
     silence_trim_min_clip_secs: f32,
     suppress_blank: bool,
     suppress_numerals: bool,
+    initial_prompt_max_tokens: usize,
 }
 
 impl WhisperRuntimeTuning {
@@ -164,8 +167,27 @@ impl WhisperRuntimeTuning {
                 .unwrap_or(DEFAULT_SILENCE_TRIM_MIN_CLIP_SECS),
             suppress_blank: env_bool("IZWI_WHISPER_SUPPRESS_BLANK").unwrap_or(true),
             suppress_numerals: env_bool("IZWI_WHISPER_SUPPRESS_NUMERALS").unwrap_or(false),
+            initial_prompt_max_tokens: env_usize("IZWI_WHISPER_INITIAL_PROMPT_MAX_TOKENS")
+                .unwrap_or(DEFAULT_INITIAL_PROMPT_MAX_TOKENS),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct WhisperPromptDiagnostics {
+    initial_prompt_requested: bool,
+    initial_prompt_token_count: usize,
+    initial_prompt_tokens_used: usize,
+    initial_prompt_tokens_truncated: usize,
+    initial_prompt_max_tokens: usize,
+    previous_context_token_id: Option<u32>,
+    rolling_context_enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+struct WhisperPromptPrefix {
+    ids: Vec<u32>,
+    diagnostics: WhisperPromptDiagnostics,
 }
 
 #[derive(Debug, Clone)]
@@ -371,9 +393,19 @@ impl WhisperTurboAsrModel {
         sample_rate: u32,
         language: Option<&str>,
     ) -> Result<String> {
+        self.transcribe_with_prompt(audio, sample_rate, language, None)
+    }
+
+    pub fn transcribe_with_prompt(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        initial_prompt: Option<&str>,
+    ) -> Result<String> {
         let mut no_op = |_delta: &str| {};
         Ok(self
-            .transcribe_impl(audio, sample_rate, language, &mut no_op)?
+            .transcribe_impl(audio, sample_rate, language, initial_prompt, &mut no_op)?
             .text)
     }
 
@@ -383,8 +415,18 @@ impl WhisperTurboAsrModel {
         sample_rate: u32,
         language: Option<&str>,
     ) -> Result<AsrTranscriptionOutput> {
+        self.transcribe_with_details_and_prompt(audio, sample_rate, language, None)
+    }
+
+    pub fn transcribe_with_details_and_prompt(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        initial_prompt: Option<&str>,
+    ) -> Result<AsrTranscriptionOutput> {
         let mut no_op = |_delta: &str| {};
-        self.transcribe_impl(audio, sample_rate, language, &mut no_op)
+        self.transcribe_impl(audio, sample_rate, language, initial_prompt, &mut no_op)
     }
 
     pub fn transcribe_with_callback(
@@ -394,7 +436,18 @@ impl WhisperTurboAsrModel {
         language: Option<&str>,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<String> {
-        self.transcribe_streaming(audio, sample_rate, language, on_delta)
+        self.transcribe_with_callback_and_prompt(audio, sample_rate, language, None, on_delta)
+    }
+
+    pub fn transcribe_with_callback_and_prompt(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        initial_prompt: Option<&str>,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        self.transcribe_streaming(audio, sample_rate, language, initial_prompt, on_delta)
     }
 
     pub fn max_audio_seconds_hint(&self) -> Option<f32> {
@@ -406,6 +459,7 @@ impl WhisperTurboAsrModel {
         audio: &[f32],
         sample_rate: u32,
         language: Option<&str>,
+        initial_prompt: Option<&str>,
         _on_delta: &mut dyn FnMut(&str),
     ) -> Result<AsrTranscriptionOutput> {
         if audio.is_empty() {
@@ -433,15 +487,18 @@ impl WhisperTurboAsrModel {
         let language_hint_used = language_resolution.hint_used;
         let language_detect_ms = language_resolution.detect_ms;
 
-        let mut prompt = Vec::with_capacity(4);
-        prompt.push(self.special.sot);
-        if let Some((language_token, _language_code)) = resolved_language.as_ref() {
-            prompt.push(*language_token);
-        }
-        prompt.push(self.special.transcribe);
-        if let Some(no_timestamps) = self.special.no_timestamps {
-            prompt.push(no_timestamps);
-        }
+        let initial_prompt_tokens = self.encode_initial_prompt_tokens(initial_prompt)?;
+        let prompt_prefix = build_whisper_prompt_prefix(
+            &self.special,
+            resolved_language
+                .as_ref()
+                .map(|(language_token, _language_code)| *language_token),
+            &initial_prompt_tokens,
+            self.config.max_target_positions,
+            self.runtime_tuning.initial_prompt_max_tokens,
+        )?;
+        let prompt = prompt_prefix.ids;
+        let prompt_diagnostics = prompt_prefix.diagnostics;
 
         let max_steps = decode_step_budget(
             prompt.len(),
@@ -555,6 +612,15 @@ impl WhisperTurboAsrModel {
                 "default_language": self.runtime_tuning.default_language,
                 "reuse_detected_language": self.runtime_tuning.reuse_detected_language,
             },
+            "prompt": {
+                "initial_prompt_requested": prompt_diagnostics.initial_prompt_requested,
+                "initial_prompt_token_count": prompt_diagnostics.initial_prompt_token_count,
+                "initial_prompt_tokens_used": prompt_diagnostics.initial_prompt_tokens_used,
+                "initial_prompt_tokens_truncated": prompt_diagnostics.initial_prompt_tokens_truncated,
+                "initial_prompt_max_tokens": prompt_diagnostics.initial_prompt_max_tokens,
+                "previous_context_token_id": prompt_diagnostics.previous_context_token_id,
+                "rolling_context_enabled": prompt_diagnostics.rolling_context_enabled,
+            },
             "logit_filters": {
                 "suppress_blank": self.runtime_tuning.suppress_blank,
                 "blank_token_id": self.special.blank,
@@ -591,6 +657,7 @@ impl WhisperTurboAsrModel {
         audio: &[f32],
         sample_rate: u32,
         language: Option<&str>,
+        initial_prompt: Option<&str>,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<String> {
         if audio.is_empty() {
@@ -611,15 +678,17 @@ impl WhisperTurboAsrModel {
             self.resolve_request_language(&mut whisper, &audio_features, language)?;
         let resolved_language = language_resolution.resolved;
 
-        let mut prompt = Vec::with_capacity(4);
-        prompt.push(self.special.sot);
-        if let Some((language_token, _language_code)) = resolved_language.as_ref() {
-            prompt.push(*language_token);
-        }
-        prompt.push(self.special.transcribe);
-        if let Some(no_timestamps) = self.special.no_timestamps {
-            prompt.push(no_timestamps);
-        }
+        let initial_prompt_tokens = self.encode_initial_prompt_tokens(initial_prompt)?;
+        let prompt = build_whisper_prompt_prefix(
+            &self.special,
+            resolved_language
+                .as_ref()
+                .map(|(language_token, _language_code)| *language_token),
+            &initial_prompt_tokens,
+            self.config.max_target_positions,
+            self.runtime_tuning.initial_prompt_max_tokens,
+        )?
+        .ids;
 
         let max_steps = decode_step_budget(
             prompt.len(),
@@ -820,6 +889,16 @@ impl WhisperTurboAsrModel {
         self.tokenizer.decode(token_ids)
     }
 
+    fn encode_initial_prompt_tokens(&self, initial_prompt: Option<&str>) -> Result<Vec<u32>> {
+        let Some(prompt) = initial_prompt
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty())
+        else {
+            return Ok(Vec::new());
+        };
+        self.tokenizer.encode(prompt)
+    }
+
     fn decode_temperatures(&self) -> Vec<f32> {
         // Mirrors whisper.cpp/transformers temperature fallback ladder.
         let start = self.generation.temperature.unwrap_or(0.0).clamp(0.0, 1.0);
@@ -993,6 +1072,75 @@ fn adaptive_decode_budget(
         .max(min_new_tokens)
         .max(1);
     proposed.min(configured_cap.max(1))
+}
+
+fn build_whisper_prompt_prefix(
+    special: &WhisperSpecialTokens,
+    language_token: Option<u32>,
+    initial_prompt_tokens: &[u32],
+    max_target_positions: usize,
+    initial_prompt_max_tokens: usize,
+) -> Result<WhisperPromptPrefix> {
+    let mut controls = Vec::with_capacity(4);
+    controls.push(special.sot);
+    if let Some(language_token) = language_token {
+        controls.push(language_token);
+    }
+    controls.push(special.transcribe);
+    if let Some(no_timestamps) = special.no_timestamps {
+        controls.push(no_timestamps);
+    }
+
+    if controls.len() >= max_target_positions {
+        return Err(Error::InvalidInput(format!(
+            "Whisper prompt controls length {} exceeds decoder context {}",
+            controls.len(),
+            max_target_positions
+        )));
+    }
+
+    let initial_prompt_requested = !initial_prompt_tokens.is_empty();
+    let base_context_budget = max_target_positions
+        .saturating_sub(controls.len())
+        .saturating_sub(1);
+    let can_use_previous_context =
+        initial_prompt_requested && special.sot_prev.is_some() && base_context_budget > 1;
+    let previous_context_tokens = usize::from(can_use_previous_context);
+    let available_for_context = base_context_budget.saturating_sub(previous_context_tokens);
+    let prompt_budget = available_for_context.min(initial_prompt_max_tokens);
+    let initial_prompt_tokens_used = initial_prompt_tokens.len().min(prompt_budget);
+    let initial_prompt_tokens_truncated = initial_prompt_tokens
+        .len()
+        .saturating_sub(initial_prompt_tokens_used);
+    let previous_context_token_id = if initial_prompt_tokens_used > 0 && can_use_previous_context {
+        special.sot_prev
+    } else {
+        None
+    };
+
+    let mut ids =
+        Vec::with_capacity(previous_context_tokens + initial_prompt_tokens_used + controls.len());
+    if let Some(token_id) = previous_context_token_id {
+        ids.push(token_id);
+    }
+    if initial_prompt_tokens_used > 0 {
+        let start = initial_prompt_tokens.len() - initial_prompt_tokens_used;
+        ids.extend_from_slice(&initial_prompt_tokens[start..]);
+    }
+    ids.extend(controls);
+
+    Ok(WhisperPromptPrefix {
+        ids,
+        diagnostics: WhisperPromptDiagnostics {
+            initial_prompt_requested,
+            initial_prompt_token_count: initial_prompt_tokens.len(),
+            initial_prompt_tokens_used,
+            initial_prompt_tokens_truncated,
+            initial_prompt_max_tokens,
+            previous_context_token_id,
+            rolling_context_enabled: false,
+        },
+    })
 }
 
 fn trimmed_audio_bounds(
@@ -1318,6 +1466,7 @@ fn resolve_special_tokens(
     let sot = tokenizer.token_to_id(whisper::SOT_TOKEN).ok_or_else(|| {
         Error::TokenizationError("Missing <|startoftranscript|> token".to_string())
     })?;
+    let sot_prev = tokenizer.token_to_id("<|startofprev|>");
     let transcribe = tokenizer
         .token_to_id(whisper::TRANSCRIBE_TOKEN)
         .or_else(|| generation.task_to_id.get("transcribe").copied())
@@ -1340,6 +1489,7 @@ fn resolve_special_tokens(
 
     Ok(WhisperSpecialTokens {
         sot,
+        sot_prev,
         transcribe,
         eot,
         blank,
@@ -1351,6 +1501,7 @@ fn resolve_special_tokens(
 fn build_numeral_symbol_tokens(tokenizer: &Tokenizer, special: &WhisperSpecialTokens) -> Vec<u32> {
     let special_ids: HashSet<u32> = [
         Some(special.sot),
+        special.sot_prev,
         Some(special.transcribe),
         Some(special.eot),
         special.blank,
@@ -1852,9 +2003,10 @@ fn decode_step_budget(
 mod tests {
     use super::{
         WhisperSpecialTokens, adaptive_decode_budget, apply_whisper_decode_constraints,
-        capped_decode_temperatures, decode_step_budget, find_suffix_token_repetition,
-        has_low_word_diversity, logits_to_log_probs, logits_to_log_probs_in_place, text_delta,
-        token_contains_numeral_or_symbol, trimmed_audio_bounds, use_cuda_whisper_dtype_shim,
+        build_whisper_prompt_prefix, capped_decode_temperatures, decode_step_budget,
+        find_suffix_token_repetition, has_low_word_diversity, logits_to_log_probs,
+        logits_to_log_probs_in_place, text_delta, token_contains_numeral_or_symbol,
+        trimmed_audio_bounds, use_cuda_whisper_dtype_shim,
     };
 
     #[test]
@@ -1909,6 +2061,7 @@ mod tests {
     fn decode_constraints_suppress_blank_only_at_begin() {
         let special = WhisperSpecialTokens {
             sot: 1,
+            sot_prev: None,
             transcribe: 2,
             eot: 3,
             blank: Some(4),
@@ -1948,6 +2101,7 @@ mod tests {
     fn decode_constraints_mask_numeral_symbol_tokens() {
         let special = WhisperSpecialTokens {
             sot: 1,
+            sot_prev: None,
             transcribe: 2,
             eot: 3,
             blank: Some(4),
@@ -2004,6 +2158,48 @@ mod tests {
 
         let capped = adaptive_decode_budget(30.0, 120, 12.0, 32, 8);
         assert_eq!(capped, 120);
+    }
+
+    #[test]
+    fn whisper_prompt_prefix_keeps_default_controls_unchanged() {
+        let special = WhisperSpecialTokens {
+            sot: 1,
+            sot_prev: Some(9),
+            transcribe: 2,
+            eot: 3,
+            blank: Some(4),
+            no_timestamps: Some(7),
+            no_speech: None,
+        };
+
+        let prefix = build_whisper_prompt_prefix(&special, Some(5), &[], 12, 4).expect("prefix");
+
+        assert_eq!(prefix.ids, vec![1, 5, 2, 7]);
+        assert!(!prefix.diagnostics.initial_prompt_requested);
+        assert_eq!(prefix.diagnostics.initial_prompt_tokens_used, 0);
+    }
+
+    #[test]
+    fn whisper_prompt_prefix_truncates_initial_prompt_tail() {
+        let special = WhisperSpecialTokens {
+            sot: 1,
+            sot_prev: Some(9),
+            transcribe: 2,
+            eot: 3,
+            blank: Some(4),
+            no_timestamps: Some(7),
+            no_speech: None,
+        };
+
+        let prefix = build_whisper_prompt_prefix(&special, Some(5), &[10, 11, 12, 13, 14], 12, 3)
+            .expect("prefix");
+
+        assert_eq!(prefix.ids, vec![9, 12, 13, 14, 1, 5, 2, 7]);
+        assert!(prefix.diagnostics.initial_prompt_requested);
+        assert_eq!(prefix.diagnostics.initial_prompt_token_count, 5);
+        assert_eq!(prefix.diagnostics.initial_prompt_tokens_used, 3);
+        assert_eq!(prefix.diagnostics.initial_prompt_tokens_truncated, 2);
+        assert_eq!(prefix.diagnostics.previous_context_token_id, Some(9));
     }
 
     #[test]

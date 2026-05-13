@@ -409,8 +409,18 @@ impl NativeAsrModel {
         sample_rate: u32,
         language: Option<&str>,
     ) -> Result<String> {
+        self.transcribe_with_prompt(audio, sample_rate, language, None)
+    }
+
+    pub fn transcribe_with_prompt(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<String> {
         let mut no_op = |_delta: &str| {};
-        self.transcribe_with_callback(audio, sample_rate, language, &mut no_op)
+        self.transcribe_with_callback_and_prompt(audio, sample_rate, language, prompt, &mut no_op)
     }
 
     pub fn transcribe_with_callback(
@@ -420,6 +430,17 @@ impl NativeAsrModel {
         language: Option<&str>,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<String> {
+        self.transcribe_with_callback_and_prompt(audio, sample_rate, language, None, on_delta)
+    }
+
+    pub fn transcribe_with_callback_and_prompt(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<String> {
         match self {
             Self::Qwen3(model) => {
                 model.transcribe_with_callback(audio, sample_rate, language, on_delta)
@@ -427,9 +448,13 @@ impl NativeAsrModel {
             Self::Parakeet(model) => {
                 model.transcribe_with_callback(audio, sample_rate, language, on_delta)
             }
-            Self::WhisperTurbo(model) => {
-                model.transcribe_with_callback(audio, sample_rate, language, on_delta)
-            }
+            Self::WhisperTurbo(model) => model.transcribe_with_callback_and_prompt(
+                audio,
+                sample_rate,
+                language,
+                prompt,
+                on_delta,
+            ),
         }
     }
 
@@ -438,6 +463,16 @@ impl NativeAsrModel {
         audio: &[f32],
         sample_rate: u32,
         language: Option<&str>,
+    ) -> Result<NativeAsrTranscription> {
+        self.transcribe_with_details_and_prompt(audio, sample_rate, language, None)
+    }
+
+    pub fn transcribe_with_details_and_prompt(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
     ) -> Result<NativeAsrTranscription> {
         match self {
             Self::Qwen3(model) => {
@@ -459,7 +494,12 @@ impl NativeAsrModel {
                     text,
                     language,
                     diagnostics,
-                } = model.transcribe_with_details(audio, sample_rate, language)?;
+                } = model.transcribe_with_details_and_prompt(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                )?;
                 Ok(NativeAsrTranscription {
                     text,
                     language,

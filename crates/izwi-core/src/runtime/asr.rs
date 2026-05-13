@@ -89,6 +89,7 @@ impl RuntimeService {
         variant: ModelVariant,
         audio_input: AsrAudioInput<'_>,
         language: Option<&str>,
+        prompt: Option<&str>,
         correlation_id: Option<&str>,
     ) -> Result<EngineCoreRequest> {
         self.load_model(variant).await?;
@@ -106,7 +107,8 @@ impl RuntimeService {
                 language.map(ToOwned::to_owned),
                 correlation_id.map(ToOwned::to_owned),
             )?,
-        };
+        }
+        .with_prompt(prompt.map(ToOwned::to_owned));
         Ok(runtime_request.into_engine_request())
     }
 
@@ -115,6 +117,24 @@ impl RuntimeService {
         variant: ModelVariant,
         audio_base64: &str,
         language: Option<&str>,
+        correlation_id: Option<&str>,
+    ) -> Result<AsrTranscription> {
+        self.asr_transcribe_with_variant_and_prompt(
+            variant,
+            audio_base64,
+            language,
+            None,
+            correlation_id,
+        )
+        .await
+    }
+
+    pub(crate) async fn asr_transcribe_with_variant_and_prompt(
+        &self,
+        variant: ModelVariant,
+        audio_base64: &str,
+        language: Option<&str>,
+        prompt: Option<&str>,
         correlation_id: Option<&str>,
     ) -> Result<AsrTranscription> {
         if variant.is_audio_chat() {
@@ -129,6 +149,7 @@ impl RuntimeService {
                 variant,
                 AsrAudioInput::Base64(audio_base64),
                 language,
+                prompt,
                 correlation_id,
             )
             .await?;
@@ -149,6 +170,29 @@ impl RuntimeService {
         audio_base64: &str,
         language: Option<&str>,
         correlation_id: Option<&str>,
+        on_delta: F,
+    ) -> Result<AsrTranscription>
+    where
+        F: FnMut(String) + Send + 'static,
+    {
+        self.asr_transcribe_with_variant_streaming_and_prompt(
+            variant,
+            audio_base64,
+            language,
+            None,
+            correlation_id,
+            on_delta,
+        )
+        .await
+    }
+
+    pub(crate) async fn asr_transcribe_with_variant_streaming_and_prompt<F>(
+        &self,
+        variant: ModelVariant,
+        audio_base64: &str,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        correlation_id: Option<&str>,
         mut on_delta: F,
     ) -> Result<AsrTranscription>
     where
@@ -166,6 +210,7 @@ impl RuntimeService {
                 variant,
                 AsrAudioInput::Base64(audio_base64),
                 language,
+                prompt,
                 correlation_id,
             )
             .await?;
@@ -198,6 +243,24 @@ impl RuntimeService {
         language: Option<&str>,
         correlation_id: Option<&str>,
     ) -> Result<AsrTranscription> {
+        self.asr_transcribe_bytes_with_variant_and_prompt(
+            variant,
+            audio_bytes,
+            language,
+            None,
+            correlation_id,
+        )
+        .await
+    }
+
+    pub(crate) async fn asr_transcribe_bytes_with_variant_and_prompt(
+        &self,
+        variant: ModelVariant,
+        audio_bytes: &[u8],
+        language: Option<&str>,
+        prompt: Option<&str>,
+        correlation_id: Option<&str>,
+    ) -> Result<AsrTranscription> {
         if variant.is_audio_chat() {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
             return self
@@ -210,6 +273,7 @@ impl RuntimeService {
                 variant,
                 AsrAudioInput::Bytes(audio_bytes),
                 language,
+                prompt,
                 correlation_id,
             )
             .await?;
@@ -230,6 +294,29 @@ impl RuntimeService {
         audio_bytes: &[u8],
         language: Option<&str>,
         correlation_id: Option<&str>,
+        on_delta: F,
+    ) -> Result<AsrTranscription>
+    where
+        F: FnMut(String) + Send + 'static,
+    {
+        self.asr_transcribe_bytes_with_variant_streaming_and_prompt(
+            variant,
+            audio_bytes,
+            language,
+            None,
+            correlation_id,
+            on_delta,
+        )
+        .await
+    }
+
+    pub(crate) async fn asr_transcribe_bytes_with_variant_streaming_and_prompt<F>(
+        &self,
+        variant: ModelVariant,
+        audio_bytes: &[u8],
+        language: Option<&str>,
+        prompt: Option<&str>,
+        correlation_id: Option<&str>,
         mut on_delta: F,
     ) -> Result<AsrTranscription>
     where
@@ -247,6 +334,7 @@ impl RuntimeService {
                 variant,
                 AsrAudioInput::Bytes(audio_bytes),
                 language,
+                prompt,
                 correlation_id,
             )
             .await?;
@@ -321,9 +409,34 @@ impl RuntimeService {
         language: Option<&str>,
         correlation_id: Option<&str>,
     ) -> Result<AsrTranscription> {
+        self.asr_transcribe_with_prompt_and_correlation(
+            audio_base64,
+            model_id,
+            language,
+            None,
+            correlation_id,
+        )
+        .await
+    }
+
+    /// Transcribe audio with optional ASR initial prompt/context metadata.
+    pub async fn asr_transcribe_with_prompt_and_correlation(
+        &self,
+        audio_base64: &str,
+        model_id: Option<&str>,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        correlation_id: Option<&str>,
+    ) -> Result<AsrTranscription> {
         let variant = resolve_asr_model_variant(model_id);
-        self.asr_transcribe_with_variant(variant, audio_base64, language, correlation_id)
-            .await
+        self.asr_transcribe_with_variant_and_prompt(
+            variant,
+            audio_base64,
+            language,
+            prompt,
+            correlation_id,
+        )
+        .await
     }
 
     pub async fn asr_transcribe_bytes(
@@ -332,9 +445,26 @@ impl RuntimeService {
         model_id: Option<&str>,
         language: Option<&str>,
     ) -> Result<AsrTranscription> {
-        let variant = resolve_asr_model_variant(model_id);
-        self.asr_transcribe_bytes_with_variant(variant, audio_bytes, language, None)
+        self.asr_transcribe_bytes_with_prompt(audio_bytes, model_id, language, None)
             .await
+    }
+
+    pub async fn asr_transcribe_bytes_with_prompt(
+        &self,
+        audio_bytes: &[u8],
+        model_id: Option<&str>,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<AsrTranscription> {
+        let variant = resolve_asr_model_variant(model_id);
+        self.asr_transcribe_bytes_with_variant_and_prompt(
+            variant,
+            audio_bytes,
+            language,
+            prompt,
+            None,
+        )
+        .await
     }
 
     /// Transcribe audio and emit deltas.
@@ -390,11 +520,36 @@ impl RuntimeService {
     where
         F: FnMut(String) + Send + 'static,
     {
+        self.asr_transcribe_streaming_with_prompt_and_correlation(
+            audio_base64,
+            model_id,
+            language,
+            None,
+            correlation_id,
+            on_delta,
+        )
+        .await
+    }
+
+    /// Transcribe audio with optional ASR initial prompt/context metadata and deltas.
+    pub async fn asr_transcribe_streaming_with_prompt_and_correlation<F>(
+        &self,
+        audio_base64: &str,
+        model_id: Option<&str>,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        correlation_id: Option<&str>,
+        on_delta: F,
+    ) -> Result<AsrTranscription>
+    where
+        F: FnMut(String) + Send + 'static,
+    {
         let variant = resolve_asr_model_variant(model_id);
-        self.asr_transcribe_with_variant_streaming(
+        self.asr_transcribe_with_variant_streaming_and_prompt(
             variant,
             audio_base64,
             language,
+            prompt,
             correlation_id,
             on_delta,
         )
@@ -412,11 +567,35 @@ impl RuntimeService {
     where
         F: FnMut(String) + Send + 'static,
     {
+        self.asr_transcribe_streaming_bytes_with_prompt_and_correlation(
+            audio_bytes,
+            model_id,
+            language,
+            None,
+            correlation_id,
+            on_delta,
+        )
+        .await
+    }
+
+    pub async fn asr_transcribe_streaming_bytes_with_prompt_and_correlation<F>(
+        &self,
+        audio_bytes: &[u8],
+        model_id: Option<&str>,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        correlation_id: Option<&str>,
+        on_delta: F,
+    ) -> Result<AsrTranscription>
+    where
+        F: FnMut(String) + Send + 'static,
+    {
         let variant = resolve_asr_model_variant(model_id);
-        self.asr_transcribe_bytes_with_variant_streaming(
+        self.asr_transcribe_bytes_with_variant_streaming_and_prompt(
             variant,
             audio_bytes,
             language,
+            prompt,
             correlation_id,
             on_delta,
         )

@@ -20,6 +20,7 @@ impl NativeExecutor {
         let variant = Self::resolve_variant(request)?;
         let family = variant.family();
         let language = request.language.as_deref();
+        let asr_prompt = request.asr_prompt.as_deref();
         let stream_tx = Self::stream_sender(request);
         let stream_policy = request.stream_policy;
 
@@ -72,7 +73,14 @@ impl NativeExecutor {
                                     sample_rate,
                                     &chunk_plan.chunks,
                                     &chunk_plan.config,
-                                    |chunk_audio, sr| model.transcribe(chunk_audio, sr, language),
+                                    |chunk_audio, sr| {
+                                        model.transcribe_with_prompt(
+                                            chunk_audio,
+                                            sr,
+                                            language,
+                                            asr_prompt,
+                                        )
+                                    },
                                 )
                             })?;
                             let diagnostics = Some(chunk_plan.diagnostics());
@@ -301,7 +309,9 @@ impl NativeExecutor {
                     sample_rate,
                     &chunk_plan.chunks,
                     &chunk_plan.config,
-                    |chunk_audio, sr| model.transcribe(chunk_audio, sr, language),
+                    |chunk_audio, sr| {
+                        model.transcribe_with_prompt(chunk_audio, sr, language, asr_prompt)
+                    },
                 )?;
                 return Ok((text, Some(chunk_plan.diagnostics())));
             }
@@ -322,10 +332,11 @@ impl NativeExecutor {
                             }
                         }
                     };
-                    let text = model.transcribe_with_callback(
+                    let text = model.transcribe_with_callback_and_prompt(
                         &samples,
                         sample_rate,
                         language,
+                        asr_prompt,
                         &mut emit,
                     )?;
                     if let Some(err) = stream_err {
@@ -340,7 +351,12 @@ impl NativeExecutor {
                     return Ok((text, None));
                 }
             }
-            let details = model.transcribe_with_details(&samples, sample_rate, language)?;
+            let details = model.transcribe_with_details_and_prompt(
+                &samples,
+                sample_rate,
+                language,
+                asr_prompt,
+            )?;
             Ok((details.text, details.diagnostics))
         })?;
         let asr_diagnostics = Self::with_audio_decode_timing(asr_diagnostics, audio_decode_ms);

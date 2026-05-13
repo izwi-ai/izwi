@@ -60,6 +60,7 @@ pub struct TtsEngineInput {
 pub struct AsrEngineInput {
     pub audio: EngineAudioInput,
     pub language: Option<String>,
+    pub prompt: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +121,8 @@ pub struct EngineCoreRequest {
     pub audio_input: Option<String>,
     /// Input audio bytes for first-party routes that already parsed uploads.
     pub audio_bytes: Option<Vec<u8>>,
+    /// Optional ASR initial prompt/context hint.
+    pub asr_prompt: Option<String>,
     /// Reference audio for voice cloning (base64 encoded)
     pub reference_audio: Option<String>,
     /// Reference text for voice cloning
@@ -154,6 +157,7 @@ impl EngineCoreRequest {
         language: Option<String>,
         audio_input: Option<String>,
         audio_bytes: Option<Vec<u8>>,
+        asr_prompt: Option<String>,
         reference_audio: Option<String>,
         reference_text: Option<String>,
         voice_description: Option<String>,
@@ -178,6 +182,7 @@ impl EngineCoreRequest {
             TaskType::ASR => EngineTask::Asr(AsrEngineInput {
                 audio: audio(),
                 language,
+                prompt: asr_prompt,
             }),
             TaskType::Chat => EngineTask::Chat(ChatEngineInput {
                 messages: chat_messages.unwrap_or_default(),
@@ -201,6 +206,7 @@ impl EngineCoreRequest {
             self.language.clone(),
             self.audio_input.clone(),
             self.audio_bytes.clone(),
+            self.asr_prompt.clone(),
             self.reference_audio.clone(),
             self.reference_text.clone(),
             self.voice_description.clone(),
@@ -229,6 +235,7 @@ impl EngineCoreRequest {
             correlation_id: None,
             audio_input: None,
             audio_bytes: None,
+            asr_prompt: None,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -251,6 +258,7 @@ impl EngineCoreRequest {
             task: EngineTask::Asr(AsrEngineInput {
                 audio: EngineAudioInput::Base64(audio_base64.clone()),
                 language: None,
+                prompt: None,
             }),
             task_type: TaskType::ASR,
             model_variant: None,
@@ -261,6 +269,7 @@ impl EngineCoreRequest {
             correlation_id: None,
             audio_input: Some(audio_base64),
             audio_bytes: None,
+            asr_prompt: None,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -283,6 +292,7 @@ impl EngineCoreRequest {
             task: EngineTask::Asr(AsrEngineInput {
                 audio: EngineAudioInput::Bytes(audio_bytes.clone()),
                 language: None,
+                prompt: None,
             }),
             task_type: TaskType::ASR,
             model_variant: None,
@@ -293,6 +303,7 @@ impl EngineCoreRequest {
             correlation_id: None,
             audio_input: None,
             audio_bytes: Some(audio_bytes),
+            asr_prompt: None,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -325,6 +336,7 @@ impl EngineCoreRequest {
             correlation_id: None,
             audio_input: None,
             audio_bytes: None,
+            asr_prompt: None,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -358,6 +370,7 @@ impl EngineCoreRequest {
             correlation_id: None,
             audio_input: Some(audio_base64),
             audio_bytes: None,
+            asr_prompt: None,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -391,6 +404,7 @@ impl EngineCoreRequest {
             correlation_id: None,
             audio_input: None,
             audio_bytes: Some(audio_bytes),
+            asr_prompt: None,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -463,6 +477,15 @@ impl EngineCoreRequest {
         self
     }
 
+    /// Set ASR initial prompt/context hint.
+    pub fn with_asr_prompt(mut self, prompt: impl Into<String>) -> Self {
+        let prompt = prompt.into();
+        let trimmed = prompt.trim();
+        self.asr_prompt = (!trimmed.is_empty()).then_some(trimmed.to_string());
+        self.sync_task_from_fields();
+        self
+    }
+
     /// Set request correlation ID.
     pub fn with_correlation_id(mut self, correlation_id: impl Into<String>) -> Self {
         self.correlation_id = Some(correlation_id.into());
@@ -487,6 +510,8 @@ impl EngineCoreRequest {
     pub fn num_prompt_tokens(&self) -> usize {
         if !self.prompt_tokens.is_empty() {
             self.prompt_tokens.len()
+        } else if let Some(prompt) = &self.asr_prompt {
+            (prompt.len() / 4).max(1)
         } else {
             // Estimate from text length (rough approximation)
             self.text.as_ref().map(|t| t.len() / 4).unwrap_or(0).max(1)
@@ -561,6 +586,9 @@ impl RequestProcessor {
             // Tokenize text input (simplified - actual tokenization would be more complex)
             if let Some(text) = &request.text {
                 let estimated_tokens = (text.len() / 4).max(1);
+                request.prompt_tokens = (0..estimated_tokens as u32).collect();
+            } else if let Some(prompt) = &request.asr_prompt {
+                let estimated_tokens = (prompt.len() / 4).max(1);
                 request.prompt_tokens = (0..estimated_tokens as u32).collect();
             } else if let Some(messages) = &request.chat_messages {
                 let estimated_tokens =
@@ -790,6 +818,15 @@ impl RequestBuilder {
         self
     }
 
+    /// Set ASR initial prompt/context hint.
+    pub fn asr_prompt(mut self, prompt: impl Into<String>) -> Self {
+        let prompt = prompt.into();
+        let trimmed = prompt.trim();
+        self.request.asr_prompt = (!trimmed.is_empty()).then_some(trimmed.to_string());
+        self.request.sync_task_from_fields();
+        self
+    }
+
     /// Set speech-to-speech system prompt.
     pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.request.system_prompt = Some(prompt.into());
@@ -934,6 +971,28 @@ mod tests {
                 EngineAudioInput::Bytes(bytes) => assert_eq!(bytes, vec![1, 2, 3]),
                 other => panic!("unexpected audio input: {other:?}"),
             },
+            other => panic!("unexpected task payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_request_processor_carries_asr_prompt() {
+        let config = EngineCoreConfig::default();
+        let processor = RequestProcessor::new(config);
+
+        let request =
+            EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_asr_prompt("spell Izwi correctly");
+        let processed = processor.process(request).expect("request should process");
+
+        assert_eq!(
+            processed.asr_prompt.as_deref(),
+            Some("spell Izwi correctly")
+        );
+        assert!(processed.num_prompt_tokens() >= 1);
+        match processed.task {
+            EngineTask::Asr(input) => {
+                assert_eq!(input.prompt.as_deref(), Some("spell Izwi correctly"));
+            }
             other => panic!("unexpected task payload: {other:?}"),
         }
     }
