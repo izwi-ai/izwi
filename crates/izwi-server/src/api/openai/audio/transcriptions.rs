@@ -14,7 +14,7 @@ use base64::Engine;
 use std::convert::Infallible;
 use std::time::Instant;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{debug, info};
 
 use super::resolve_audio_upload_limit_bytes;
 use crate::api::request_context::RequestContext;
@@ -70,6 +70,11 @@ struct TranscriptionTimestampSegment {
     end: f32,
     text: String,
 }
+
+const TIMESTAMP_SEGMENT_MAX_DURATION_SECS: f32 = 8.0;
+const TIMESTAMP_SEGMENT_MAX_CHARS: usize = 84;
+const TIMESTAMP_SEGMENT_LONG_PAUSE_SECS: f32 = 0.8;
+const TIMESTAMP_SEGMENT_MIN_PUNCTUATION_SECS: f32 = 1.0;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct TimestampGranularityRequest {
@@ -146,6 +151,7 @@ pub async fn transcriptions(
 
     let mut words = None;
     let mut segments = None;
+    let mut subtitle_segments = None;
     if timestamp_request.any() && !output.text.trim().is_empty() {
         let alignments = state
             .runtime
@@ -161,10 +167,32 @@ pub async fn transcriptions(
             words = Some(timestamp_words.clone());
         }
         if timestamp_request.segments {
-            segments = Some(build_timestamp_segments(
+            segments = Some(build_timestamp_segments(&timestamp_words));
+        }
+    } else if matches!(response_format.as_str(), "srt" | "vtt") && !output.text.trim().is_empty() {
+        match state
+            .runtime
+            .force_align_with_model_and_language(
+                &audio_base64,
                 output.text.as_str(),
-                &timestamp_words,
-            ));
+                output.language.as_deref().or(req.language.as_deref()),
+                req.aligner_model.as_deref(),
+            )
+            .await
+        {
+            Ok(alignments) => {
+                let timestamp_words = alignments_to_timestamp_words(alignments);
+                let built_segments = build_timestamp_segments(&timestamp_words);
+                if !built_segments.is_empty() {
+                    subtitle_segments = Some(built_segments);
+                }
+            }
+            Err(err) => {
+                debug!(
+                    "Falling back to coarse transcription subtitle timestamps: {}",
+                    err
+                );
+            }
         }
     }
 
@@ -205,11 +233,19 @@ pub async fn transcriptions(
             .unwrap()),
         "srt" => Ok(Response::builder()
             .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-            .body(Body::from(format_srt(&output.text, output.duration_secs)))
+            .body(Body::from(format_srt(
+                &output.text,
+                output.duration_secs,
+                subtitle_segments.as_deref(),
+            )))
             .unwrap()),
         "vtt" => Ok(Response::builder()
             .header(header::CONTENT_TYPE, "text/vtt; charset=utf-8")
-            .body(Body::from(format_vtt(&output.text, output.duration_secs)))
+            .body(Body::from(format_vtt(
+                &output.text,
+                output.duration_secs,
+                subtitle_segments.as_deref(),
+            )))
             .unwrap()),
         other => Err(ApiError::bad_request(format!(
             "Unsupported response_format: {}. Supported: json, verbose_json, text, srt, vtt",
@@ -527,19 +563,72 @@ fn alignments_to_timestamp_words(
 }
 
 fn build_timestamp_segments(
-    text: &str,
     words: &[TranscriptionTimestampWord],
 ) -> Vec<TranscriptionTimestampSegment> {
-    let Some(first_word) = words.first() else {
-        return Vec::new();
-    };
-    let end = words.last().map(|word| word.end).unwrap_or(first_word.end);
-    vec![TranscriptionTimestampSegment {
-        id: 0,
-        start: first_word.start,
-        end,
-        text: text.trim().to_string(),
-    }]
+    let mut segments = Vec::new();
+    let mut current_words = Vec::<String>::new();
+    let mut current_start: Option<f32> = None;
+
+    for (idx, word) in words.iter().enumerate() {
+        let trimmed = word.word.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let start = word.start.max(0.0);
+        let end = word.end.max(start);
+        let segment_start = *current_start.get_or_insert(start);
+        current_words.push(trimmed.to_string());
+
+        let next = words.get(idx + 1);
+        let pause_after = next
+            .map(|next_word| (next_word.start - end).max(0.0))
+            .unwrap_or(0.0);
+        let current_text_len = current_words
+            .iter()
+            .map(|part| part.len() + 1)
+            .sum::<usize>();
+        let duration = end - segment_start;
+        let is_last = next.is_none();
+        let should_close = is_last
+            || pause_after >= TIMESTAMP_SEGMENT_LONG_PAUSE_SECS
+            || current_text_len >= TIMESTAMP_SEGMENT_MAX_CHARS
+            || duration >= TIMESTAMP_SEGMENT_MAX_DURATION_SECS
+            || (duration >= TIMESTAMP_SEGMENT_MIN_PUNCTUATION_SECS && ends_sentence_like(trimmed));
+
+        if should_close {
+            push_timestamp_segment(&mut segments, segment_start, end, &current_words);
+            current_words.clear();
+            current_start = None;
+        }
+    }
+
+    segments
+}
+
+fn push_timestamp_segment(
+    segments: &mut Vec<TranscriptionTimestampSegment>,
+    start: f32,
+    end: f32,
+    words: &[String],
+) {
+    let text = words.join(" ").trim().to_string();
+    if text.is_empty() {
+        return;
+    }
+    segments.push(TranscriptionTimestampSegment {
+        id: segments.len(),
+        start,
+        end: end.max(start + 0.01),
+        text,
+    });
+}
+
+fn ends_sentence_like(text: &str) -> bool {
+    text.chars()
+        .rev()
+        .find(|ch| !matches!(ch, '"' | '\'' | ')' | ']' | '}' | '”' | '’'))
+        .map(|ch| matches!(ch, '.' | '!' | '?' | '。' | '！' | '？'))
+        .unwrap_or(false)
 }
 
 fn millis_to_secs(ms: u32) -> f32 {
@@ -578,7 +667,28 @@ fn transcript_error_event_payload(message: &str) -> String {
     .to_string()
 }
 
-fn format_srt(text: &str, duration_secs: f32) -> String {
+fn format_srt(
+    text: &str,
+    duration_secs: f32,
+    segments: Option<&[TranscriptionTimestampSegment]>,
+) -> String {
+    if let Some(segments) = segments.filter(|segments| !segments.is_empty()) {
+        return segments
+            .iter()
+            .enumerate()
+            .map(|(idx, segment)| {
+                format!(
+                    "{}\n{} --> {}\n{}\n",
+                    idx + 1,
+                    secs_to_srt(segment.start),
+                    secs_to_srt(segment.end),
+                    segment.text.trim()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
     format!(
         "1\n{} --> {}\n{}\n",
         secs_to_srt(0.0),
@@ -587,7 +697,27 @@ fn format_srt(text: &str, duration_secs: f32) -> String {
     )
 }
 
-fn format_vtt(text: &str, duration_secs: f32) -> String {
+fn format_vtt(
+    text: &str,
+    duration_secs: f32,
+    segments: Option<&[TranscriptionTimestampSegment]>,
+) -> String {
+    if let Some(segments) = segments.filter(|segments| !segments.is_empty()) {
+        let cues = segments
+            .iter()
+            .map(|segment| {
+                format!(
+                    "{} --> {}\n{}\n",
+                    secs_to_vtt(segment.start),
+                    secs_to_vtt(segment.end),
+                    segment.text.trim()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return format!("WEBVTT\n\n{cues}");
+    }
+
     format!(
         "WEBVTT\n\n{} --> {}\n{}\n",
         secs_to_vtt(0.0),
@@ -617,8 +747,8 @@ mod tests {
 
     #[test]
     fn renders_srt_and_vtt() {
-        let srt = format_srt("hello", 1.23);
-        let vtt = format_vtt("hello", 1.23);
+        let srt = format_srt("hello", 1.23, None);
+        let vtt = format_vtt("hello", 1.23, None);
         assert!(srt.contains("-->"));
         assert!(vtt.starts_with("WEBVTT"));
     }
@@ -681,7 +811,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_single_verbose_timestamp_segment() {
+    fn groups_verbose_timestamp_segments_by_pause() {
         let words = vec![
             TranscriptionTimestampWord {
                 word: "hello".to_string(),
@@ -693,12 +823,65 @@ mod tests {
                 start: 0.5,
                 end: 0.9,
             },
+            TranscriptionTimestampWord {
+                word: "again".to_string(),
+                start: 2.0,
+                end: 2.4,
+            },
         ];
-        let segments = build_timestamp_segments(" hello world ", &words);
-        assert_eq!(segments.len(), 1);
+        let segments = build_timestamp_segments(&words);
+        assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].id, 0);
         assert_eq!(segments[0].text, "hello world");
         assert!((segments[0].start - 0.1).abs() < f32::EPSILON);
         assert!((segments[0].end - 0.9).abs() < f32::EPSILON);
+        assert_eq!(segments[1].id, 1);
+        assert_eq!(segments[1].text, "again");
+    }
+
+    #[test]
+    fn groups_verbose_timestamp_segments_by_punctuation() {
+        let words = vec![
+            TranscriptionTimestampWord {
+                word: "Hello.".to_string(),
+                start: 0.0,
+                end: 1.1,
+            },
+            TranscriptionTimestampWord {
+                word: "World".to_string(),
+                start: 1.2,
+                end: 1.6,
+            },
+        ];
+        let segments = build_timestamp_segments(&words);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].text, "Hello.");
+        assert_eq!(segments[1].text, "World");
+    }
+
+    #[test]
+    fn renders_multi_cue_srt_and_vtt_from_segments() {
+        let segments = vec![
+            TranscriptionTimestampSegment {
+                id: 0,
+                start: 0.1,
+                end: 0.9,
+                text: "hello world".to_string(),
+            },
+            TranscriptionTimestampSegment {
+                id: 1,
+                start: 2.0,
+                end: 2.4,
+                text: "again".to_string(),
+            },
+        ];
+
+        let srt = format_srt("fallback", 3.0, Some(&segments));
+        let vtt = format_vtt("fallback", 3.0, Some(&segments));
+
+        assert!(srt.contains("1\n00:00:00,100 --> 00:00:00,900"));
+        assert!(srt.contains("2\n00:00:02,000 --> 00:00:02,400"));
+        assert!(vtt.starts_with("WEBVTT"));
+        assert!(vtt.contains("00:00:02.000 --> 00:00:02.400"));
     }
 }
