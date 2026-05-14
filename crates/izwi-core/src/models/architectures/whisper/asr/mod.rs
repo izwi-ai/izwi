@@ -987,11 +987,11 @@ impl WhisperTurboAsrModel {
 
         let mut logits_vec = if profile.enabled {
             let started = Instant::now();
-            let logits_vec = logits.to_vec1::<f32>()?;
+            let logits_vec = tensor_to_f32_vec1(logits)?;
             profile.logits_to_host_ms += elapsed_ms(started);
             logits_vec
         } else {
-            logits.to_vec1::<f32>()?
+            tensor_to_f32_vec1(logits)?
         };
         profile.host_logits_steps = profile.host_logits_steps.saturating_add(1);
         self.apply_decode_constraints(&mut logits_vec, at_begin);
@@ -1088,7 +1088,7 @@ impl WhisperTurboAsrModel {
         if let Some(language) = self.detect_language_token_on_cuda(&logits)? {
             return Ok(Some(language));
         }
-        let logits_vec = logits.to_vec1::<f32>()?;
+        let logits_vec = tensor_to_f32_vec1(&logits)?;
 
         let mut best_token: Option<u32> = None;
         let mut best_score = f32::NEG_INFINITY;
@@ -1931,6 +1931,15 @@ fn env_nonempty_string(key: &str) -> Option<String> {
     })
 }
 
+fn tensor_to_f32_vec1(tensor: &Tensor) -> Result<Vec<f32>> {
+    let tensor = if tensor.dtype() == DType::F32 {
+        tensor.clone()
+    } else {
+        tensor.to_dtype(DType::F32)?
+    };
+    tensor.to_vec1::<f32>().map_err(Error::from)
+}
+
 fn greedy_decode_step_from_masked_logits(
     masked: &Tensor,
     special: &WhisperSpecialTokens,
@@ -2490,7 +2499,7 @@ mod tests {
         contiguous_token_range, decode_retry_reasons, decode_step_budget,
         find_suffix_token_repetition, greedy_decode_step_from_masked_logits,
         has_low_word_diversity, logits_to_log_probs, logits_to_log_probs_in_place,
-        probability_for_token_from_logits, scaled_logsumexp, text_delta,
+        probability_for_token_from_logits, scaled_logsumexp, tensor_to_f32_vec1, text_delta,
         token_contains_numeral_or_symbol, trimmed_audio_bounds, use_cuda_whisper_dtype_shim,
         whisper_decode_profile_diagnostics, whisper_device_diagnostics, whisper_impl_name,
         WhisperDecodeAttempt, WhisperDecodeProfile, WhisperSpecialTokens,
@@ -2684,6 +2693,21 @@ mod tests {
         assert_eq!(contiguous_token_range(&[10, 11, 12]), Some((10, 3)));
         assert_eq!(contiguous_token_range(&[10, 12]), None);
         assert_eq!(contiguous_token_range(&[]), None);
+    }
+
+    #[test]
+    fn tensor_to_f32_vec1_accepts_f16_logits() {
+        let logits =
+            candle_core::Tensor::from_vec(vec![1.0f32, -2.0, 3.5], (3,), &candle_core::Device::Cpu)
+                .expect("logits")
+                .to_dtype(candle_core::DType::F16)
+                .expect("f16 logits");
+
+        let values = tensor_to_f32_vec1(&logits).expect("f32 host copy");
+        assert_eq!(values.len(), 3);
+        assert!((values[0] - 1.0).abs() < 1e-3);
+        assert!((values[1] + 2.0).abs() < 1e-3);
+        assert!((values[2] - 3.5).abs() < 1e-3);
     }
 
     #[test]
