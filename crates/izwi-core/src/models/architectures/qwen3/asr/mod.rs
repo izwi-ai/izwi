@@ -5,12 +5,14 @@ mod config;
 mod tokenizer;
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use std::{fs, io::Read};
 
 use candle_core::quantized::gguf_file::Value as GgufValue;
 use candle_core::{DType, IndexOp, Tensor, D};
 use candle_nn::VarBuilder;
 use serde::Deserialize;
+use serde_json::json;
 use tracing::{debug, info, warn};
 
 use crate::audio::{MelConfig, MelSpectrogram};
@@ -69,6 +71,7 @@ pub struct AsrDecodeState {
     decoded_visible_tokens: usize,
     tokens_since_resync: usize,
     assembled: String,
+    diagnostics: Qwen3AsrDiagnostics,
     stop_tokens: Vec<u32>,
     max_new_tokens: usize,
     finished: bool,
@@ -86,6 +89,78 @@ pub struct AsrDecodeStep {
 pub struct AsrTranscriptionOutput {
     pub text: String,
     pub language: Option<String>,
+    pub diagnostics: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Qwen3AsrTimingDiagnostics {
+    resample_ms: f64,
+    mel_ms: f64,
+    audio_encode_ms: f64,
+    prefill_ms: f64,
+    decode_ms: f64,
+    total_ms: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Qwen3AsrDiagnostics {
+    input_sample_rate: u32,
+    input_samples: usize,
+    resampled_sample_rate: u32,
+    resampled_samples: usize,
+    mel_frames: usize,
+    mel_frames_before_truncate: usize,
+    mel_frames_truncated: bool,
+    audio_tokens: usize,
+    prompt_tokens: usize,
+    system_prompt_requested: bool,
+    system_prompt_token_count: usize,
+    forced_language: Option<String>,
+    forced_language_token_count: usize,
+    asr_text_token_available: bool,
+    asr_text_token_appended: bool,
+    max_new_tokens: usize,
+    generated_tokens: usize,
+    timings: Qwen3AsrTimingDiagnostics,
+}
+
+impl Qwen3AsrDiagnostics {
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "model_family": "qwen3_asr",
+            "audio": {
+                "input_sample_rate": self.input_sample_rate,
+                "input_samples": self.input_samples,
+                "resampled_sample_rate": self.resampled_sample_rate,
+                "resampled_samples": self.resampled_samples,
+                "mel_frames": self.mel_frames,
+                "mel_frames_before_truncate": self.mel_frames_before_truncate,
+                "mel_frames_truncated": self.mel_frames_truncated,
+                "audio_tokens": self.audio_tokens,
+            },
+            "prompt": {
+                "prompt_tokens": self.prompt_tokens,
+                "system_prompt_requested": self.system_prompt_requested,
+                "system_prompt_token_count": self.system_prompt_token_count,
+                "forced_language": self.forced_language,
+                "forced_language_token_count": self.forced_language_token_count,
+                "asr_text_token_available": self.asr_text_token_available,
+                "asr_text_token_appended": self.asr_text_token_appended,
+            },
+            "decode": {
+                "max_new_tokens": self.max_new_tokens,
+                "generated_tokens": self.generated_tokens,
+            },
+            "timings_ms": {
+                "resample": self.timings.resample_ms,
+                "mel": self.timings.mel_ms,
+                "audio_encode": self.timings.audio_encode_ms,
+                "prefill": self.timings.prefill_ms,
+                "decode": self.timings.decode_ms,
+                "model_total": self.timings.total_ms,
+            }
+        })
+    }
 }
 
 const DEFAULT_TRANSCRIBE_MAX_NEW_TOKENS: usize = 512;
@@ -344,8 +419,20 @@ impl Qwen3AsrModel {
         sample_rate: u32,
         language: Option<&str>,
     ) -> Result<String> {
+        self.transcribe_with_prompt(audio, sample_rate, language, None)
+    }
+
+    pub fn transcribe_with_prompt(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        system_prompt: Option<&str>,
+    ) -> Result<String> {
         let mut no_op = |_delta: &str| {};
-        self.transcribe_with_callback(audio, sample_rate, language, &mut no_op)
+        Ok(self
+            .transcribe_impl(audio, sample_rate, language, system_prompt, &mut no_op)?
+            .text)
     }
 
     pub fn transcribe_with_details(
@@ -354,12 +441,18 @@ impl Qwen3AsrModel {
         sample_rate: u32,
         language: Option<&str>,
     ) -> Result<AsrTranscriptionOutput> {
-        let raw = self.transcribe(audio, sample_rate, language)?;
-        let (detected_language, text) = parse_asr_output(&raw, language);
-        Ok(AsrTranscriptionOutput {
-            text,
-            language: detected_language,
-        })
+        self.transcribe_with_details_and_prompt(audio, sample_rate, language, None)
+    }
+
+    pub fn transcribe_with_details_and_prompt(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        system_prompt: Option<&str>,
+    ) -> Result<AsrTranscriptionOutput> {
+        let mut no_op = |_delta: &str| {};
+        self.transcribe_impl(audio, sample_rate, language, system_prompt, &mut no_op)
     }
 
     /// Upper-bound hint for chunk sizing in long-form ASR orchestration.
@@ -382,18 +475,44 @@ impl Qwen3AsrModel {
         language: Option<&str>,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<String> {
+        self.transcribe_with_callback_and_prompt(audio, sample_rate, language, None, on_delta)
+    }
+
+    pub fn transcribe_with_callback_and_prompt(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        system_prompt: Option<&str>,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        Ok(self
+            .transcribe_impl(audio, sample_rate, language, system_prompt, on_delta)?
+            .text)
+    }
+
+    fn transcribe_impl(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        system_prompt: Option<&str>,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<AsrTranscriptionOutput> {
         if self.is_forced_aligner {
             return Err(Error::InvalidInput(
                 "Qwen3-ForcedAligner models do not support transcription. Use forced alignment instead."
                     .to_string(),
             ));
         }
-        let mut state = self.start_decode(
+        let mut state = self.start_decode_with_prompt(
             audio,
             sample_rate,
             language,
+            system_prompt,
             DEFAULT_TRANSCRIBE_MAX_NEW_TOKENS,
         )?;
+        let decode_started = Instant::now();
         loop {
             let step = self.decode_step(&mut state)?;
             if !step.delta.is_empty() {
@@ -403,7 +522,15 @@ impl Qwen3AsrModel {
                 }
             }
             if step.finished {
-                return Ok(step.text);
+                state.diagnostics.timings.decode_ms = elapsed_ms(decode_started);
+                state.diagnostics.timings.total_ms += state.diagnostics.timings.decode_ms;
+                state.diagnostics.generated_tokens = step.tokens_generated;
+                let (detected_language, text) = parse_asr_output(&step.text, language);
+                return Ok(AsrTranscriptionOutput {
+                    text,
+                    language: detected_language,
+                    diagnostics: Some(state.diagnostics.to_json()),
+                });
             }
         }
     }
@@ -415,21 +542,39 @@ impl Qwen3AsrModel {
         language: Option<&str>,
         max_new_tokens: usize,
     ) -> Result<AsrDecodeState> {
+        self.start_decode_with_prompt(audio, sample_rate, language, None, max_new_tokens)
+    }
+
+    pub fn start_decode_with_prompt(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        system_prompt: Option<&str>,
+        max_new_tokens: usize,
+    ) -> Result<AsrDecodeState> {
         if self.is_forced_aligner {
             return Err(Error::InvalidInput(
                 "Qwen3-ForcedAligner models do not support transcription decode state.".to_string(),
             ));
         }
+        let input_samples = audio.len();
+        let total_started = Instant::now();
+        let resample_started = Instant::now();
         let audio = if sample_rate != 16_000 {
             resample(audio, sample_rate, 16_000)?
         } else {
             audio.to_vec()
         };
+        let resample_ms = elapsed_ms(resample_started);
 
+        let mel_started = Instant::now();
         let mut mel_spec = self.mel.compute(&audio)?;
+        let mel_frames_before_truncate = mel_spec.len();
         if self.preprocessor.nb_max_frames > 0 && mel_spec.len() > self.preprocessor.nb_max_frames {
             mel_spec.truncate(self.preprocessor.nb_max_frames);
         }
+        let mel_ms = elapsed_ms(mel_started);
 
         let n_mels = self.mel.config().n_mels;
         if mel_spec.is_empty() {
@@ -449,13 +594,15 @@ impl Qwen3AsrModel {
             .to_dtype(self.audio_dtype)?;
 
         let feature_lens = vec![frames];
+        let audio_started = Instant::now();
         let mut audio_embeds = self.audio_tower.forward(&mel, Some(&feature_lens))?;
         if audio_embeds.dtype() != self.text_dtype {
             audio_embeds = audio_embeds.to_dtype(self.text_dtype)?;
         }
+        let audio_encode_ms = elapsed_ms(audio_started);
         let audio_len = audio_embeds.dim(1)?;
 
-        let prompt = self.build_prompt(audio_len, language)?;
+        let prompt = self.build_prompt(audio_len, language, system_prompt)?;
         let input_ids = Tensor::from_vec(
             prompt.ids.clone(),
             (1, prompt.ids.len()),
@@ -463,6 +610,7 @@ impl Qwen3AsrModel {
         )?;
 
         let mut cache = self.build_decode_cache(prompt.ids.len());
+        let prefill_started = Instant::now();
         let embeds = self.forward_with_audio(
             &input_ids,
             &audio_embeds,
@@ -470,7 +618,36 @@ impl Qwen3AsrModel {
             prompt.audio_pad_len,
             &mut cache,
         )?;
+        let prefill_ms = elapsed_ms(prefill_started);
         let pos = embeds.dim(1)?;
+        let max_new_tokens = max_new_tokens.max(1);
+        let diagnostics = Qwen3AsrDiagnostics {
+            input_sample_rate: sample_rate,
+            input_samples,
+            resampled_sample_rate: 16_000,
+            resampled_samples: audio.len(),
+            mel_frames: frames,
+            mel_frames_before_truncate,
+            mel_frames_truncated: mel_frames_before_truncate > frames,
+            audio_tokens: audio_len,
+            prompt_tokens: prompt.ids.len(),
+            system_prompt_requested: prompt.system_prompt_requested,
+            system_prompt_token_count: prompt.system_prompt_token_count,
+            forced_language: prompt.forced_language,
+            forced_language_token_count: prompt.forced_language_token_count,
+            asr_text_token_available: prompt.asr_text_token_available,
+            asr_text_token_appended: prompt.asr_text_token_appended,
+            max_new_tokens,
+            generated_tokens: 0,
+            timings: Qwen3AsrTimingDiagnostics {
+                resample_ms,
+                mel_ms,
+                audio_encode_ms,
+                prefill_ms,
+                decode_ms: 0.0,
+                total_ms: elapsed_ms(total_started),
+            },
+        };
 
         Ok(AsrDecodeState {
             cache,
@@ -482,8 +659,9 @@ impl Qwen3AsrModel {
             decoded_visible_tokens: 0,
             tokens_since_resync: 0,
             assembled: String::new(),
+            diagnostics,
             stop_tokens: collect_stop_token_ids(&self.specials),
-            max_new_tokens: max_new_tokens.max(1),
+            max_new_tokens,
             finished: false,
         })
     }
@@ -889,41 +1067,19 @@ impl Qwen3AsrModel {
             .forward_with_embeds(&embeds, 0, Some(cache), position_ids.as_ref())
     }
 
-    fn build_prompt(&self, audio_len: usize, language: Option<&str>) -> Result<PromptTokens> {
-        // Match the upstream Qwen speech-family prompt contract:
-        // <|im_start|>system\n<|im_end|>\n
-        // <|im_start|>user\n<|audio_start|><|audio_pad|>*N<|audio_end|><|im_end|>\n
-        // <|im_start|>assistant\n
-        // If language is explicitly forced, append: "language {Lang}<asr_text>".
-        let forced_language = forced_language_name(language);
-        let mut ids = Vec::new();
-        ids.push(self.specials.im_start);
-        ids.extend(self.tokenizer.encode_text("system\n")?);
-        ids.push(self.specials.im_end);
-        ids.extend(self.tokenizer.encode_text("\n")?);
-
-        ids.push(self.specials.im_start);
-        ids.extend(self.tokenizer.encode_text("user\n")?);
-        ids.push(self.specials.audio_start);
-
-        let audio_pad_start = ids.len();
-        ids.extend(std::iter::repeat_n(self.specials.audio_token, audio_len));
-
-        ids.push(self.specials.audio_end);
-        ids.push(self.specials.im_end);
-        ids.extend(self.tokenizer.encode_text("\n")?);
-        ids.push(self.specials.im_start);
-        ids.extend(self.tokenizer.encode_text("assistant\n")?);
-        if let Some(lang) = forced_language {
-            ids.extend(self.tokenizer.encode_text("language ")?);
-            ids.extend(self.tokenizer.encode_text(&lang)?);
-        }
-
-        Ok(PromptTokens {
-            ids,
-            audio_pad_start,
-            audio_pad_len: audio_len,
-        })
+    fn build_prompt(
+        &self,
+        audio_len: usize,
+        language: Option<&str>,
+        system_prompt: Option<&str>,
+    ) -> Result<PromptTokens> {
+        build_qwen_asr_prompt_tokens(
+            &self.specials,
+            audio_len,
+            language,
+            system_prompt,
+            |text| self.tokenizer.encode_text(text),
+        )
     }
 
     fn build_alignment_prompt(
@@ -960,6 +1116,12 @@ impl Qwen3AsrModel {
             ids,
             audio_pad_start,
             audio_pad_len: audio_len,
+            system_prompt_requested: false,
+            system_prompt_token_count: 0,
+            forced_language: None,
+            forced_language_token_count: 0,
+            asr_text_token_available: self.specials.asr_text.is_some(),
+            asr_text_token_appended: false,
         })
     }
 
@@ -1741,6 +1903,12 @@ struct PromptTokens {
     ids: Vec<u32>,
     audio_pad_start: usize,
     audio_pad_len: usize,
+    system_prompt_requested: bool,
+    system_prompt_token_count: usize,
+    forced_language: Option<String>,
+    forced_language_token_count: usize,
+    asr_text_token_available: bool,
+    asr_text_token_appended: bool,
 }
 
 struct ForcedAlignerPrompt {
@@ -1748,6 +1916,90 @@ struct ForcedAlignerPrompt {
     audio_pad_start: usize,
     audio_pad_len: usize,
     timestamp_token_id: u32,
+}
+
+fn elapsed_ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
+}
+
+fn build_qwen_asr_prompt_tokens(
+    specials: &SpecialTokenIds,
+    audio_len: usize,
+    language: Option<&str>,
+    system_prompt: Option<&str>,
+    mut encode_text: impl FnMut(&str) -> Result<Vec<u32>>,
+) -> Result<PromptTokens> {
+    // Match the upstream Qwen speech-family prompt contract:
+    // <|im_start|>system\n
+    // [optional system prompt text]
+    // <|im_end|>\n
+    // <|im_start|>user\n<|audio_start|><|audio_pad|>*N<|audio_end|><|im_end|>\n
+    // <|im_start|>assistant\n
+    // If language is explicitly forced, append: "language {Lang}<asr_text>".
+    let system_prompt = non_empty_trimmed(system_prompt);
+    let forced_language = forced_language_name(language);
+    let mut ids = Vec::new();
+
+    ids.push(specials.im_start);
+    ids.extend(encode_text("system\n")?);
+    let system_prompt_token_count = if let Some(prompt) = system_prompt {
+        let prompt_tokens = encode_text(prompt)?;
+        let count = prompt_tokens.len();
+        ids.extend(prompt_tokens);
+        count
+    } else {
+        0
+    };
+    ids.push(specials.im_end);
+    ids.extend(encode_text("\n")?);
+
+    ids.push(specials.im_start);
+    ids.extend(encode_text("user\n")?);
+    ids.push(specials.audio_start);
+
+    let audio_pad_start = ids.len();
+    ids.extend(std::iter::repeat_n(specials.audio_token, audio_len));
+
+    ids.push(specials.audio_end);
+    ids.push(specials.im_end);
+    ids.extend(encode_text("\n")?);
+    ids.push(specials.im_start);
+    ids.extend(encode_text("assistant\n")?);
+
+    let mut forced_language_token_count = 0usize;
+    let mut asr_text_token_appended = false;
+    if let Some(lang) = forced_language.as_deref() {
+        let language_prefix = encode_text("language ")?;
+        forced_language_token_count += language_prefix.len();
+        ids.extend(language_prefix);
+
+        let language_tokens = encode_text(lang)?;
+        forced_language_token_count += language_tokens.len();
+        ids.extend(language_tokens);
+
+        if let Some(asr_text) = specials.asr_text {
+            ids.push(asr_text);
+            forced_language_token_count += 1;
+            asr_text_token_appended = true;
+        }
+    }
+
+    Ok(PromptTokens {
+        ids,
+        audio_pad_start,
+        audio_pad_len: audio_len,
+        system_prompt_requested: system_prompt.is_some(),
+        system_prompt_token_count,
+        forced_language,
+        forced_language_token_count,
+        asr_text_token_available: specials.asr_text.is_some(),
+        asr_text_token_appended,
+    })
+}
+
+fn non_empty_trimmed(value: Option<&str>) -> Option<&str> {
+    let trimmed = value?.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
 fn parse_asr_dtype(dtype: Option<&str>) -> Option<DType> {
@@ -2084,6 +2336,130 @@ mod tests {
         };
         let stop_ids = collect_stop_token_ids(&specials);
         assert_eq!(stop_ids, vec![2, 6]);
+    }
+
+    fn test_specials(asr_text: Option<u32>) -> SpecialTokenIds {
+        SpecialTokenIds {
+            im_start: 1,
+            im_end: 2,
+            audio_start: 3,
+            audio_end: 4,
+            audio_token: 5,
+            timestamp: Some(12),
+            asr_text,
+            fim_prefix: Some(8),
+            fim_middle: Some(9),
+            fim_suffix: Some(10),
+            fim_pad: Some(11),
+            eos: 6,
+            eos_alt: Some(13),
+            pad: 0,
+        }
+    }
+
+    fn encode_prompt_piece_for_test(text: &str) -> Result<Vec<u32>> {
+        match text {
+            "system\n" => Ok(vec![20]),
+            "\n" => Ok(vec![21]),
+            "user\n" => Ok(vec![22]),
+            "assistant\n" => Ok(vec![23]),
+            "language " => Ok(vec![24]),
+            "English" => Ok(vec![25]),
+            "spell Izwi correctly" => Ok(vec![26, 27, 28]),
+            other => Err(Error::TokenizationError(format!(
+                "unexpected test prompt piece: {other}"
+            ))),
+        }
+    }
+
+    #[test]
+    fn qwen_asr_prompt_inserts_system_prompt_and_asr_text_marker() {
+        let prompt = build_qwen_asr_prompt_tokens(
+            &test_specials(Some(7)),
+            2,
+            Some("english"),
+            Some("  spell Izwi correctly  "),
+            encode_prompt_piece_for_test,
+        )
+        .expect("prompt");
+
+        assert_eq!(
+            prompt.ids,
+            vec![
+                1, 20, 26, 27, 28, 2, 21, 1, 22, 3, 5, 5, 4, 2, 21, 1, 23, 24, 25, 7
+            ]
+        );
+        assert_eq!(prompt.audio_pad_start, 10);
+        assert_eq!(prompt.audio_pad_len, 2);
+        assert!(prompt.system_prompt_requested);
+        assert_eq!(prompt.system_prompt_token_count, 3);
+        assert_eq!(prompt.forced_language.as_deref(), Some("English"));
+        assert_eq!(prompt.forced_language_token_count, 3);
+        assert!(prompt.asr_text_token_available);
+        assert!(prompt.asr_text_token_appended);
+    }
+
+    #[test]
+    fn qwen_asr_prompt_preserves_markerless_forced_language_fallback() {
+        let prompt = build_qwen_asr_prompt_tokens(
+            &test_specials(None),
+            1,
+            Some("english"),
+            Some("   "),
+            encode_prompt_piece_for_test,
+        )
+        .expect("prompt");
+
+        assert_eq!(
+            prompt.ids,
+            vec![1, 20, 2, 21, 1, 22, 3, 5, 4, 2, 21, 1, 23, 24, 25]
+        );
+        assert_eq!(prompt.audio_pad_start, 7);
+        assert!(!prompt.system_prompt_requested);
+        assert_eq!(prompt.system_prompt_token_count, 0);
+        assert_eq!(prompt.forced_language.as_deref(), Some("English"));
+        assert_eq!(prompt.forced_language_token_count, 2);
+        assert!(!prompt.asr_text_token_available);
+        assert!(!prompt.asr_text_token_appended);
+    }
+
+    #[test]
+    fn qwen_asr_diagnostics_json_shape_is_stable() {
+        let diagnostics = Qwen3AsrDiagnostics {
+            input_sample_rate: 44_100,
+            input_samples: 44_100,
+            resampled_sample_rate: 16_000,
+            resampled_samples: 16_000,
+            mel_frames: 100,
+            mel_frames_before_truncate: 120,
+            mel_frames_truncated: true,
+            audio_tokens: 50,
+            prompt_tokens: 64,
+            system_prompt_requested: true,
+            system_prompt_token_count: 4,
+            forced_language: Some("English".to_string()),
+            forced_language_token_count: 3,
+            asr_text_token_available: true,
+            asr_text_token_appended: true,
+            max_new_tokens: 128,
+            generated_tokens: 12,
+            timings: Qwen3AsrTimingDiagnostics {
+                resample_ms: 1.0,
+                mel_ms: 2.0,
+                audio_encode_ms: 3.0,
+                prefill_ms: 4.0,
+                decode_ms: 5.0,
+                total_ms: 15.0,
+            },
+        }
+        .to_json();
+
+        assert_eq!(diagnostics["model_family"], "qwen3_asr");
+        assert_eq!(diagnostics["audio"]["mel_frames"], 100);
+        assert_eq!(diagnostics["prompt"]["system_prompt_requested"], true);
+        assert_eq!(diagnostics["prompt"]["asr_text_token_appended"], true);
+        assert_eq!(diagnostics["decode"]["generated_tokens"], 12);
+        assert_eq!(diagnostics["timings_ms"]["model_total"], 15.0);
     }
 
     #[test]

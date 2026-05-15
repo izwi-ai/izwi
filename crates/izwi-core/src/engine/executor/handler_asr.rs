@@ -118,10 +118,11 @@ impl NativeExecutor {
                         // produce runaway gibberish and extreme latency.
                         let max_new_tokens = request.params.max_tokens.clamp(1, MAX_ASR_NEW_TOKENS);
                         let decode_state = Self::run_blocking(|| {
-                            model.start_decode_state(
+                            model.start_decode_state_with_prompt(
                                 &samples,
                                 sample_rate,
                                 language,
+                                asr_prompt,
                                 max_new_tokens,
                             )
                         })?;

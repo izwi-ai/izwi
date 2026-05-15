@@ -442,9 +442,13 @@ impl NativeAsrModel {
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<String> {
         match self {
-            Self::Qwen3(model) => {
-                model.transcribe_with_callback(audio, sample_rate, language, on_delta)
-            }
+            Self::Qwen3(model) => model.transcribe_with_callback_and_prompt(
+                audio,
+                sample_rate,
+                language,
+                prompt,
+                on_delta,
+            ),
             Self::Parakeet(model) => {
                 model.transcribe_with_callback(audio, sample_rate, language, on_delta)
             }
@@ -476,12 +480,15 @@ impl NativeAsrModel {
     ) -> Result<NativeAsrTranscription> {
         match self {
             Self::Qwen3(model) => {
-                let Qwen3AsrTranscriptionOutput { text, language } =
-                    model.transcribe_with_details(audio, sample_rate, language)?;
+                let Qwen3AsrTranscriptionOutput {
+                    text,
+                    language,
+                    diagnostics,
+                } = model.transcribe_with_details_and_prompt(audio, sample_rate, language, prompt)?;
                 Ok(NativeAsrTranscription {
                     text,
                     language,
-                    diagnostics: None,
+                    diagnostics,
                 })
             }
             Self::Parakeet(model) => Ok(NativeAsrTranscription {
@@ -546,11 +553,23 @@ impl NativeAsrModel {
         language: Option<&str>,
         max_new_tokens: usize,
     ) -> Result<NativeAsrDecodeState> {
+        self.start_decode_state_with_prompt(audio, sample_rate, language, None, max_new_tokens)
+    }
+
+    pub fn start_decode_state_with_prompt(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_new_tokens: usize,
+    ) -> Result<NativeAsrDecodeState> {
         match self {
-            Self::Qwen3(model) => Ok(NativeAsrDecodeState::Qwen3(model.start_decode(
+            Self::Qwen3(model) => Ok(NativeAsrDecodeState::Qwen3(model.start_decode_with_prompt(
                 audio,
                 sample_rate,
                 language,
+                prompt,
                 max_new_tokens,
             )?)),
             Self::Parakeet(_) => Err(Error::InvalidInput(
