@@ -1566,6 +1566,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stores_uploaded_source_audio_metadata_and_bytes() {
+        let (store, root) = build_test_store();
+        let mut record = sample_record();
+        record.audio_mime_type = "audio/mpeg".to_string();
+        record.audio_filename = Some("board-review.mp3".to_string());
+        record.audio_bytes = vec![0x49, 0x44, 0x33, 0x04];
+
+        let created = store
+            .create_record(record)
+            .await
+            .expect("record should be created");
+
+        assert_eq!(created.audio_mime_type, "audio/mpeg");
+        assert_eq!(created.audio_filename.as_deref(), Some("board-review.mp3"));
+
+        let audio = store
+            .get_audio(created.id.clone())
+            .await
+            .expect("audio should load")
+            .expect("audio should exist");
+
+        assert_eq!(audio.audio_mime_type, "audio/mpeg");
+        assert_eq!(audio.audio_filename.as_deref(), Some("board-review.mp3"));
+        assert_eq!(audio.audio_bytes, vec![0x49, 0x44, 0x33, 0x04]);
+
+        std::fs::remove_dir_all(root).expect("test temp dir should be removable");
+    }
+
+    #[tokio::test]
     async fn updates_summary_fields() {
         let (store, root) = build_test_store();
         let created = store

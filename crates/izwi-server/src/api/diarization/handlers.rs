@@ -27,7 +27,7 @@ use izwi_core::{
 };
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
-use crate::api::speech_text_upload::multipart_upload_error;
+use crate::api::speech_text_upload::{multipart_upload_error, resolve_source_audio_mime_type};
 
 const HISTORY_LIST_LIMIT: usize = 200;
 const DEFAULT_DIARIZATION_SUMMARY_MODEL: &str = "Qwen3.5-4B";
@@ -362,10 +362,10 @@ async fn create_pending_record(
             words: Vec::new(),
             utterances: Vec::new(),
             speaker_name_overrides: BTreeMap::new(),
-            audio_mime_type: parsed
-                .audio_mime_type
-                .clone()
-                .unwrap_or_else(|| "audio/wav".to_string()),
+            audio_mime_type: resolve_source_audio_mime_type(
+                parsed.audio_mime_type.as_deref(),
+                parsed.audio_filename.as_deref(),
+            ),
             audio_filename: parsed.audio_filename.clone(),
             audio_bytes: parsed.audio_bytes.clone(),
         })
@@ -885,11 +885,19 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
         if audio_bytes.is_empty() {
             return Err(ApiError::bad_request("Audio payload cannot be empty."));
         }
+        let audio_filename = sanitize_optional(payload.audio_filename);
+        let audio_mime_type = sanitize_optional(payload.audio_mime_type).or_else(|| {
+            if audio_filename.is_none() {
+                Some("audio/wav".to_string())
+            } else {
+                None
+            }
+        });
 
         return Ok(ParsedDiarizationCreateRequest {
             audio_bytes,
-            audio_mime_type: sanitize_optional(payload.audio_mime_type),
-            audio_filename: sanitize_optional(payload.audio_filename),
+            audio_mime_type,
+            audio_filename,
             model_id: sanitize_optional(payload.model_id),
             asr_model_id: sanitize_optional(payload.asr_model_id),
             aligner_model_id: sanitize_optional(payload.aligner_model_id),

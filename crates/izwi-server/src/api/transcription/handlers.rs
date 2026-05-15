@@ -28,7 +28,7 @@ use izwi_core::{
 };
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
-use crate::api::speech_text_upload::multipart_upload_error;
+use crate::api::speech_text_upload::{multipart_upload_error, resolve_source_audio_mime_type};
 
 const DEFAULT_TRANSCRIPTION_ALIGNER_MODEL: &str = "Qwen3-ForcedAligner-0.6B";
 const DEFAULT_TRANSCRIPTION_SUMMARY_MODEL: &str = "Qwen3.5-4B";
@@ -258,10 +258,10 @@ async fn create_pending_record(
             duration_secs: None,
             processing_time_ms: 0.0,
             rtf: None,
-            audio_mime_type: parsed
-                .audio_mime_type
-                .clone()
-                .unwrap_or_else(|| "audio/wav".to_string()),
+            audio_mime_type: resolve_source_audio_mime_type(
+                parsed.audio_mime_type.as_deref(),
+                parsed.audio_filename.as_deref(),
+            ),
             audio_filename: parsed.audio_filename.clone(),
             audio_bytes: parsed.audio_bytes.clone(),
             transcription: String::new(),
