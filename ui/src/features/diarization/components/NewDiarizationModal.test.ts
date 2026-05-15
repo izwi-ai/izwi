@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { resolveDiarizationUploadFilename } from "@/features/diarization/audioUpload";
+import {
+  prepareDiarizationUploadBlob,
+  resolveDiarizationUploadFilename,
+} from "@/features/diarization/audioUpload";
 
 describe("resolveDiarizationUploadFilename", () => {
   it("preserves the uploaded base filename when transcoding to wav", () => {
@@ -30,5 +33,17 @@ describe("resolveDiarizationUploadFilename", () => {
         uploadedBlob: sourceBlob,
       }),
     ).toBe("board-review.wav");
+  });
+});
+
+describe("prepareDiarizationUploadBlob", () => {
+  it("preserves uploaded files instead of expanding compressed audio to wav", async () => {
+    const sourceFile = new File(["compressed audio"], "aliko-dangote.mp3", {
+      type: "audio/mpeg",
+    });
+
+    await expect(prepareDiarizationUploadBlob(sourceFile)).resolves.toBe(
+      sourceFile,
+    );
   });
 });
