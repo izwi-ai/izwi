@@ -414,7 +414,11 @@ impl Qwen3AsrModel {
 
     fn build_decode_cache(&self, prompt_tokens: usize) -> Qwen3Cache {
         let page_size = qwen3_asr_kv_page_size(&self.device.device, prompt_tokens);
-        Qwen3Cache::with_page_size(self.text_model.num_layers(), page_size)
+        Qwen3Cache::with_page_size_and_dense_decode(
+            self.text_model.num_layers(),
+            page_size,
+            &self.device.device,
+        )
     }
 
     pub fn transcribe(
