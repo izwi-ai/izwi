@@ -556,10 +556,10 @@ impl Qwen3Attention {
         } else {
             (k, v)
         };
-        let k = repeat_kv(&k, self.num_heads, self.num_kv_heads)?;
-        let v = repeat_kv(&v, self.num_heads, self.num_kv_heads)?;
 
         if use_batched {
+            let k = repeat_kv(&k, self.num_heads, self.num_kv_heads)?;
+            let v = repeat_kv(&v, self.num_heads, self.num_kv_heads)?;
             let q = q.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
             let k = k.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
             let v = v.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
@@ -587,6 +587,25 @@ impl Qwen3Attention {
         }
 
         let q = q.transpose(1, 2)?; // [b, h, s, d]
+        let k_kv = k.transpose(1, 2)?; // [b, kv_h, t, d]
+        let v_kv = v.transpose(1, 2)?;
+
+        let total_len = k_kv.dim(2)?;
+        if start_pos == 0 && total_len == seq_len {
+            if let Some(fused_out) =
+                try_fused_self_attention(&q, &k_kv, &v_kv, None, self.head_dim, true)?
+            {
+                let out = fused_out.transpose(1, 2)?.reshape((
+                    bsz,
+                    seq_len,
+                    self.num_heads * self.head_dim,
+                ))?;
+                return self.o_proj.forward(&out).map_err(Error::from);
+            }
+        }
+
+        let k = repeat_kv(&k, self.num_heads, self.num_kv_heads)?;
+        let v = repeat_kv(&v, self.num_heads, self.num_kv_heads)?;
         let k = k.transpose(1, 2)?; // [b, h, t, d]
         let v = v.transpose(1, 2)?;
 
@@ -595,18 +614,6 @@ impl Qwen3Attention {
             let scale = 1.0f32 / (self.head_dim as f32).sqrt();
             if let Ok(sdpa_out) = ops::sdpa(&q, &k, &v, None, false, scale, 1.0) {
                 let out = sdpa_out.transpose(1, 2)?.reshape((
-                    bsz,
-                    seq_len,
-                    self.num_heads * self.head_dim,
-                ))?;
-                return self.o_proj.forward(&out).map_err(Error::from);
-            }
-        }
-        if start_pos == 0 && total_len == seq_len {
-            if let Some(fused_out) =
-                try_fused_self_attention(&q, &k, &v, None, self.head_dim, true)?
-            {
-                let out = fused_out.transpose(1, 2)?.reshape((
                     bsz,
                     seq_len,
                     self.num_heads * self.head_dim,
@@ -1279,5 +1286,62 @@ mod tests {
         let (k_dense, v_dense) = cache.materialize(0).expect("materialized");
         assert_eq!(k_dense.dims4().expect("k dims"), (1, 3, 1, 4));
         assert_eq!(v_dense.dims4().expect("v dims"), (1, 3, 1, 4));
+    }
+
+    #[test]
+    fn dense_decode_attention_matches_manual_gqa() {
+        let device = Device::Cpu;
+        let q = Tensor::from_vec(
+            vec![0.2f32, -0.1, 0.3, 0.4, -0.5, 0.6, 0.7, -0.2],
+            (1, 1, 2, 4),
+            &device,
+        )
+        .expect("q");
+        let k = Tensor::from_vec(
+            vec![0.1f32, 0.2, -0.1, 0.3, -0.2, 0.5, 0.4, 0.1],
+            (1, 2, 1, 4),
+            &device,
+        )
+        .expect("k");
+        let v = Tensor::from_vec(
+            vec![0.7f32, -0.3, 0.2, 0.5, 0.1, 0.4, -0.6, 0.8],
+            (1, 2, 1, 4),
+            &device,
+        )
+        .expect("v");
+        let k_heads = k.transpose(1, 2).expect("k heads").contiguous().expect("k contig");
+        let v_heads = v.transpose(1, 2).expect("v heads").contiguous().expect("v contig");
+
+        let dense = dense_decode_attention(&q, &k_heads, &v_heads, 2, 1, 4).expect("dense");
+        let q_heads = q.transpose(1, 2).expect("q heads");
+        let k_repeated = repeat_kv(&k, 2, 1).expect("repeat k");
+        let v_repeated = repeat_kv(&v, 2, 1).expect("repeat v");
+        let k_repeated = k_repeated.transpose(1, 2).expect("k repeated heads");
+        let v_repeated = v_repeated.transpose(1, 2).expect("v repeated heads");
+        let mut att = q_heads
+            .matmul(&k_repeated.transpose(2, 3).expect("k t"))
+            .expect("scores");
+        att = (att / 2.0f64).expect("scale");
+        let expected = ops::softmax(&att, D::Minus1)
+            .expect("softmax")
+            .matmul(&v_repeated)
+            .expect("expected")
+            .transpose(1, 2)
+            .expect("expected transpose");
+
+        let dense_vals = dense
+            .flatten_all()
+            .expect("dense flat")
+            .to_vec1::<f32>()
+            .expect("dense vals");
+        let expected_vals = expected
+            .flatten_all()
+            .expect("expected flat")
+            .to_vec1::<f32>()
+            .expect("expected vals");
+        assert_eq!(dense_vals.len(), expected_vals.len());
+        for (lhs, rhs) in dense_vals.iter().zip(expected_vals.iter()) {
+            assert!((lhs - rhs).abs() < 1e-5, "{lhs} != {rhs}");
+        }
     }
 }
