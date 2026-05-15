@@ -2,6 +2,11 @@ use axum::{extract::multipart::MultipartError, http::StatusCode};
 
 use crate::error::ApiError;
 
+/// First-party transcription and diarization upload limit while multipart file
+/// fields are still buffered in memory before being written to media storage.
+///
+/// Do not raise this limit until the ingestion path streams file fields
+/// directly to temp/media storage and processing consumes the stored object.
 pub(crate) const FIRST_PARTY_AUDIO_UPLOAD_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 pub(crate) fn resolve_source_audio_mime_type(
@@ -87,7 +92,12 @@ Ensure `Content-Type` includes a valid boundary (let your HTTP client set it aut
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_source_audio_mime_type;
+    use super::{resolve_source_audio_mime_type, FIRST_PARTY_AUDIO_UPLOAD_LIMIT_BYTES};
+
+    #[test]
+    fn first_party_upload_limit_stays_bounded_while_ingestion_is_buffered() {
+        assert_eq!(FIRST_PARTY_AUDIO_UPLOAD_LIMIT_BYTES, 64 * 1024 * 1024);
+    }
 
     #[test]
     fn keeps_specific_source_audio_mime_type() {
