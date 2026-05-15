@@ -2347,6 +2347,11 @@ fn collect_asr_stage_timings_from_diagnostics(
     if let Some(stage_sample) = asr_stage_timings_from_diagnostics(diagnostics) {
         samples.push(stage_sample);
     }
+    if let Some(model_diagnostics) = diagnostics.get("model_diagnostics") {
+        if let Some(stage_sample) = asr_stage_timings_from_diagnostics(model_diagnostics) {
+            samples.push(stage_sample);
+        }
+    }
 
     if let Some(chunks) = diagnostics
         .get("chunking")
@@ -2791,6 +2796,41 @@ mod tests {
         assert_eq!(samples[0].audio_tokens, Some(355));
         assert_eq!(samples[0].generated_tokens, Some(93));
         assert_eq!(samples[0].max_new_tokens, Some(512));
+    }
+
+    #[test]
+    fn asr_stage_timing_collection_includes_nested_model_diagnostics() {
+        let diagnostics = serde_json::json!({
+            "timings_ms": {
+                "audio_decode": 23.0
+            },
+            "model_diagnostics": {
+                "model_family": "qwen3_asr",
+                "audio": {
+                    "audio_tokens": 355
+                },
+                "prompt": {
+                    "prompt_tokens": 482
+                },
+                "decode": {
+                    "generated_tokens": 93
+                },
+                "timings_ms": {
+                    "audio_encode": 820.0,
+                    "prefill": 1080.0,
+                    "decode": 21230.0,
+                    "model_total": 22360.0
+                }
+            }
+        });
+
+        let samples = collect_asr_stage_timings_from_diagnostics(&diagnostics);
+
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].audio_decode, Some(23.0));
+        assert_eq!(samples[1].audio_encode, Some(820.0));
+        assert_eq!(samples[1].prefill, Some(1080.0));
+        assert_eq!(samples[1].generated_tokens, Some(93));
     }
 
     #[tokio::test]
