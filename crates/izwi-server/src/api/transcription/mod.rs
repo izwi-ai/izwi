@@ -6,15 +6,16 @@ mod unified_read;
 mod unified_write;
 
 use axum::{
-    Router,
     extract::DefaultBodyLimit,
     routing::{get, post},
+    Router,
 };
 
 use crate::state::AppState;
 
+pub(crate) use crate::api::speech_text_upload::FIRST_PARTY_AUDIO_UPLOAD_LIMIT_BYTES as AUDIO_UPLOAD_LIMIT_BYTES;
+
 pub fn router() -> Router<AppState> {
-    const AUDIO_UPLOAD_LIMIT_BYTES: usize = 64 * 1024 * 1024;
     const CANONICAL_UNIFIED_COLLECTION: &str = "/speech-to-text/jobs";
     const CANONICAL_UNIFIED_MEMBER: &str = "/speech-to-text/jobs/{record_id}";
     const CANONICAL_UNIFIED_AUDIO: &str = "/speech-to-text/jobs/{record_id}/audio";

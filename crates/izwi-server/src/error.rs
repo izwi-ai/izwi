@@ -52,6 +52,7 @@ impl IntoResponse for ApiError {
                 "type": match self.status {
                     StatusCode::BAD_REQUEST => "invalid_request_error",
                     StatusCode::NOT_FOUND => "not_found_error",
+                    StatusCode::PAYLOAD_TOO_LARGE => "invalid_request_error",
                     StatusCode::SERVICE_UNAVAILABLE => "service_unavailable_error",
                     _ => "server_error",
                 },
@@ -105,6 +106,25 @@ mod tests {
         assert_eq!(
             body["error"]["code"],
             StatusCode::SERVICE_UNAVAILABLE.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn payload_too_large_uses_invalid_request_error_type() {
+        let response = ApiError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: "too large".to_string(),
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            body["error"]["code"],
+            StatusCode::PAYLOAD_TOO_LARGE.as_str()
         );
     }
 }

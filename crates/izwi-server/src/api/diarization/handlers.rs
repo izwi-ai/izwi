@@ -26,6 +26,9 @@ use izwi_core::{
     RuntimeService,
 };
 
+use super::AUDIO_UPLOAD_LIMIT_BYTES;
+use crate::api::speech_text_upload::multipart_upload_error;
+
 const HISTORY_LIST_LIMIT: usize = 200;
 const DEFAULT_DIARIZATION_SUMMARY_MODEL: &str = "Qwen3.5-4B";
 const DEFAULT_DIARIZATION_SUMMARY_MAX_TOKENS: usize = 384;
@@ -909,19 +912,17 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
         let mut out = ParsedDiarizationCreateRequest::default();
 
         while let Some(field) = multipart.next_field().await.map_err(|err| {
-            ApiError::bad_request(format!("Failed reading multipart field: {err}"))
+            multipart_upload_error("Diarization", "field", AUDIO_UPLOAD_LIMIT_BYTES, err)
         })? {
             let name = field.name().unwrap_or_default().to_string();
             match name.as_str() {
                 "file" | "audio" => {
                     let mime_type = field.content_type().map(ToString::to_string);
                     let file_name = field.file_name().map(ToString::to_string);
-                    let bytes = field.bytes().await.map_err(|err| {
-                        ApiError::bad_request(format!(
-                            "Failed reading multipart '{}' field: {}",
-                            name, err
-                        ))
-                    })?;
+                    let bytes = field
+                        .bytes()
+                        .await
+                        .map_err(|err| multipart_field_error(&name, err))?;
                     if !bytes.is_empty() {
                         out.audio_bytes = bytes.to_vec();
                         out.audio_mime_type = sanitize_optional(mime_type);
@@ -1076,6 +1077,28 @@ fn parse_truthy(raw: &str) -> bool {
     )
 }
 
+fn multipart_field_error(
+    field_name: &str,
+    err: axum::extract::multipart::MultipartError,
+) -> ApiError {
+    multipart_upload_error("Diarization", field_name, AUDIO_UPLOAD_LIMIT_BYTES, err)
+}
+
+#[cfg(test)]
+fn multipart_field_api_error(
+    field_name: &str,
+    status: StatusCode,
+    raw: impl AsRef<str>,
+) -> ApiError {
+    crate::api::speech_text_upload::multipart_upload_api_error(
+        "Diarization",
+        field_name,
+        AUDIO_UPLOAD_LIMIT_BYTES,
+        status,
+        raw,
+    )
+}
+
 fn sanitize_optional<T>(raw: Option<T>) -> Option<String>
 where
     T: Into<String>,
@@ -1215,6 +1238,17 @@ mod tests {
             err.message,
             "`min_speakers` cannot be greater than `max_speakers`."
         );
+    }
+
+    #[test]
+    fn multipart_error_mentions_diarization_upload_limit() {
+        let err = multipart_field_api_error(
+            "file",
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Request payload is too large",
+        );
+        assert_eq!(err.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(err.message.contains("64 MiB"));
     }
 
     #[test]

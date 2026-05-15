@@ -1,14 +1,14 @@
 //! OpenAI-compatible transcription endpoints.
 
 use axum::{
-    Json, RequestExt,
     body::Body,
     extract::{Extension, Multipart, Request, State},
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     response::{
-        IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
     },
+    Json, RequestExt,
 };
 use base64::Engine;
 use std::convert::Infallible;
@@ -18,6 +18,7 @@ use tracing::{debug, info};
 
 use super::resolve_audio_upload_limit_bytes;
 use crate::api::request_context::RequestContext;
+use crate::api::speech_text_upload::multipart_upload_api_error;
 use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::parse_model_variant;
@@ -395,7 +396,7 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
         while let Some(field) = multipart
             .next_field()
             .await
-            .map_err(|e| ApiError::bad_request(format!("Failed reading multipart field: {e}")))?
+            .map_err(|e| multipart_field_error("field", e))?
         {
             let name = field.name().unwrap_or_default().to_string();
             match name.as_str() {
@@ -403,7 +404,7 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
                     let bytes = field
                         .bytes()
                         .await
-                        .map_err(|e| multipart_field_error(&name, &e.to_string()))?;
+                        .map_err(|e| multipart_field_error(&name, e))?;
                     if !bytes.is_empty() {
                         out.audio_base64 =
                             Some(base64::engine::general_purpose::STANDARD.encode(&bytes));
@@ -515,22 +516,25 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
     })
 }
 
-fn multipart_field_error(field_name: &str, raw: &str) -> ApiError {
-    let lowered = raw.to_ascii_lowercase();
-    if lowered.contains("multipart/form-data") {
-        let limit_mb = resolve_audio_upload_limit_bytes() / (1024 * 1024);
-        return ApiError::bad_request(format!(
-            "Failed reading multipart '{}' field: {}. \
-This is commonly caused by oversized uploads or malformed multipart boundaries. \
-Ensure `Content-Type` includes a valid boundary (let your HTTP client set it automatically for FormData) and keep payload under {} MiB.",
-            field_name, raw, limit_mb
-        ));
-    }
+fn multipart_field_error(
+    field_name: &str,
+    err: axum::extract::multipart::MultipartError,
+) -> ApiError {
+    multipart_field_api_error(field_name, err.status(), err.body_text())
+}
 
-    ApiError::bad_request(format!(
-        "Failed reading multipart '{}' field: {}",
-        field_name, raw
-    ))
+fn multipart_field_api_error(
+    field_name: &str,
+    status: StatusCode,
+    raw: impl AsRef<str>,
+) -> ApiError {
+    multipart_upload_api_error(
+        "OpenAI-compatible audio",
+        field_name,
+        resolve_audio_upload_limit_bytes(),
+        status,
+        raw,
+    )
 }
 
 fn validate_transcription_model(model: Option<&str>) -> Result<(), ApiError> {
@@ -838,8 +842,23 @@ mod tests {
     #[test]
     fn multipart_error_mentions_configured_limit() {
         let expected_limit = resolve_audio_upload_limit_bytes() / (1024 * 1024);
-        let err = multipart_field_error("file", "multipart/form-data field parse failed");
+        let err = multipart_field_api_error(
+            "file",
+            StatusCode::BAD_REQUEST,
+            "multipart/form-data field parse failed",
+        );
         assert!(err.message.contains(&format!("{expected_limit} MiB")));
+    }
+
+    #[test]
+    fn multipart_error_preserves_payload_too_large_status() {
+        let err = multipart_field_api_error(
+            "file",
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body too large",
+        );
+        assert_eq!(err.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(err.message.contains("original compressed file"));
     }
 
     #[test]

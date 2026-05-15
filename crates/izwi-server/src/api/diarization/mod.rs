@@ -10,8 +10,9 @@ use axum::{
 
 use crate::state::AppState;
 
+pub(crate) use crate::api::speech_text_upload::FIRST_PARTY_AUDIO_UPLOAD_LIMIT_BYTES as AUDIO_UPLOAD_LIMIT_BYTES;
+
 pub fn router() -> Router<AppState> {
-    const AUDIO_UPLOAD_LIMIT_BYTES: usize = 64 * 1024 * 1024;
     const CANONICAL_COLLECTION: &str = "/diarizations";
     const CANONICAL_MEMBER: &str = "/diarizations/{record_id}";
     const CANONICAL_AUDIO: &str = "/diarizations/{record_id}/audio";
