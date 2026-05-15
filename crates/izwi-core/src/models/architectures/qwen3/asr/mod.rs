@@ -26,7 +26,7 @@ use crate::models::architectures::qwen3::core::{
 };
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::memory::metal::metal_pool_for_device;
-use crate::models::shared::weights::gguf::{var_builder_from_gguf, GgufLoader};
+use crate::models::shared::weights::gguf::{var_builder_from_gguf_filtered, GgufLoader};
 
 use audio::AudioTower;
 use config::Qwen3AsrConfig;
@@ -363,33 +363,48 @@ impl Qwen3AsrModel {
         let _ = maybe_init_global_buffer_pool(&device.device);
         let _ = metal_pool_for_device(&device.device);
 
-        let (vb_text, vb_audio) = if let Some(gguf_path) = gguf_path.as_ref() {
-            let vb_text = var_builder_from_gguf(gguf_path, text_dtype, &device.device)?;
-            if audio_dtype == text_dtype {
-                (vb_text.clone(), vb_text)
-            } else {
-                let vb_audio = var_builder_from_gguf(gguf_path, audio_dtype, &device.device)?;
-                (vb_text, vb_audio)
-            }
-        } else {
-            load_safetensors_var_builders(model_dir, &device, text_dtype, audio_dtype)?
-        };
-
-        let has_thinker_prefix = vb_text.contains_tensor("thinker.audio_tower.conv2d1.weight");
-        let vb_text = if has_thinker_prefix {
-            vb_text.pp("thinker")
-        } else {
-            vb_text
-        };
-        let vb_audio = if has_thinker_prefix {
-            vb_audio.pp("thinker")
-        } else {
-            vb_audio
-        };
-
         let audio_cfg = config.thinker_config.audio_config.clone();
-        let audio_tower = AudioTower::load(audio_cfg, vb_audio.pp("audio_tower"))?;
-        let text_model = Qwen3Model::load(text_cfg, vb_text)?;
+        let (audio_tower, text_model) = if let Some(gguf_path) = gguf_path.as_ref() {
+            let loader = gguf_loader.as_ref().ok_or_else(|| {
+                Error::ModelLoadError("Qwen ASR GGUF loader missing for GGUF path".to_string())
+            })?;
+            let tensor_prefix = qwen3_asr_gguf_tensor_prefix(loader);
+            let vb_audio =
+                var_builder_from_gguf_filtered(gguf_path, audio_dtype, &device.device, |name| {
+                    qwen3_asr_gguf_audio_tensor_matches(name, tensor_prefix)
+                })?;
+            let vb_audio = if tensor_prefix.is_empty() {
+                vb_audio
+            } else {
+                vb_audio.pp(tensor_prefix)
+            };
+            let audio_tower = AudioTower::load(audio_cfg, vb_audio.pp("audio_tower"))?;
+            let text_model = Qwen3Model::load_gguf_text(
+                text_cfg,
+                loader,
+                &device.device,
+                text_dtype,
+                tensor_prefix,
+            )?;
+            (audio_tower, text_model)
+        } else {
+            let (vb_text, vb_audio) =
+                load_safetensors_var_builders(model_dir, &device, text_dtype, audio_dtype)?;
+            let has_thinker_prefix = vb_text.contains_tensor("thinker.audio_tower.conv2d1.weight");
+            let vb_text = if has_thinker_prefix {
+                vb_text.pp("thinker")
+            } else {
+                vb_text
+            };
+            let vb_audio = if has_thinker_prefix {
+                vb_audio.pp("thinker")
+            } else {
+                vb_audio
+            };
+            let audio_tower = AudioTower::load(audio_cfg, vb_audio.pp("audio_tower"))?;
+            let text_model = Qwen3Model::load(text_cfg, vb_text)?;
+            (audio_tower, text_model)
+        };
 
         info!(
             "Loaded Qwen speech-family model on {:?} (audio_dtype={:?}, text_dtype={:?})",
@@ -1086,13 +1101,9 @@ impl Qwen3AsrModel {
         language: Option<&str>,
         system_prompt: Option<&str>,
     ) -> Result<PromptTokens> {
-        build_qwen_asr_prompt_tokens(
-            &self.specials,
-            audio_len,
-            language,
-            system_prompt,
-            |text| self.tokenizer.encode_text(text),
-        )
+        build_qwen_asr_prompt_tokens(&self.specials, audio_len, language, system_prompt, |text| {
+            self.tokenizer.encode_text(text)
+        })
     }
 
     fn build_alignment_prompt(
@@ -1489,6 +1500,24 @@ fn parse_qwen3_asr_config_from_gguf(loader: &GgufLoader) -> Result<Qwen3AsrConfi
         timestamp_token_id: None,
         timestamp_segment_time: None,
     })
+}
+
+fn qwen3_asr_gguf_tensor_prefix(loader: &GgufLoader) -> &str {
+    if loader.has_tensor("thinker.model.embed_tokens.weight")
+        || loader.has_tensor("thinker.audio_tower.conv2d1.weight")
+    {
+        "thinker"
+    } else {
+        ""
+    }
+}
+
+fn qwen3_asr_gguf_audio_tensor_matches(name: &str, prefix: &str) -> bool {
+    if prefix.is_empty() {
+        name.starts_with("audio_tower.")
+    } else {
+        name.starts_with(&format!("{prefix}.audio_tower."))
+    }
 }
 
 fn preprocessor_config_from_gguf(loader: &GgufLoader) -> Result<PreprocessorConfig> {
@@ -2489,9 +2518,7 @@ mod tests {
 
         assert_eq!(
             prompt.ids,
-            vec![
-                1, 20, 26, 27, 28, 2, 21, 1, 22, 3, 5, 5, 4, 2, 21, 1, 23, 24, 25, 7
-            ]
+            vec![1, 20, 26, 27, 28, 2, 21, 1, 22, 3, 5, 5, 4, 2, 21, 1, 23, 24, 25, 7]
         );
         assert_eq!(prompt.audio_pad_start, 10);
         assert_eq!(prompt.audio_pad_len, 2);
@@ -2774,6 +2801,26 @@ mod tests {
             qwen_asr_gguf_filename(ModelVariant::WhisperLargeV3Turbo),
             None
         );
+    }
+
+    #[test]
+    fn qwen_asr_gguf_audio_tensor_filter_matches_prefix_style() {
+        assert!(qwen3_asr_gguf_audio_tensor_matches(
+            "thinker.audio_tower.conv2d1.weight",
+            "thinker"
+        ));
+        assert!(!qwen3_asr_gguf_audio_tensor_matches(
+            "thinker.model.layers.0.self_attn.q_proj.weight",
+            "thinker"
+        ));
+        assert!(qwen3_asr_gguf_audio_tensor_matches(
+            "audio_tower.conv2d1.weight",
+            ""
+        ));
+        assert!(!qwen3_asr_gguf_audio_tensor_matches(
+            "model.layers.0.self_attn.q_proj.weight",
+            ""
+        ));
     }
 
     #[test]

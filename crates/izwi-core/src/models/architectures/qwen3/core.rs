@@ -3,10 +3,12 @@
 //! Adapted from the Qwen3 architecture to allow embedding overrides
 //! (used for audio-conditioned ASR).
 
+use candle_core::quantized::QMatMul;
 use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{ops, rotary_emb, Embedding, Linear, RmsNorm, VarBuilder};
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::kernels::try_fused_silu_mul;
@@ -21,6 +23,7 @@ use crate::models::shared::attention::paged::{
 use crate::models::shared::telemetry::{
     record_decode_attention_path, record_rope_kernel, record_rope_manual, DecodeAttentionPath,
 };
+use crate::models::shared::weights::gguf::GgufLoader;
 use crate::models::shared::weights::mlx;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -298,7 +301,7 @@ fn qwen3_dense_decode_max_tokens(
         .saturating_mul(qwen3_dense_decode_max_pages())
 }
 
-    fn qwen3_use_dense_decode_attention_feature(device: &Device) -> bool {
+fn qwen3_use_dense_decode_attention_feature(device: &Device) -> bool {
     if !device.is_metal() {
         return false;
     }
@@ -324,11 +327,58 @@ fn parse_env_bool(raw: &str) -> Option<bool> {
     }
 }
 
+enum Qwen3Projection {
+    Dense(Linear),
+    Quantized(QMatMul),
+}
+
+impl Qwen3Projection {
+    fn dense(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
+        mlx::load_linear_no_bias(in_dim, out_dim, vb)
+            .map(Self::Dense)
+            .map_err(Error::from)
+    }
+
+    fn quantized(loader: &GgufLoader, device: &Device, name: &str) -> Result<Self> {
+        let weights = Arc::new(loader.load_qtensor(name, device)?);
+        QMatMul::from_arc(weights)
+            .map(Self::Quantized)
+            .map_err(Error::from)
+    }
+
+    fn tied_dense(weight: Tensor) -> Self {
+        Self::Dense(Linear::new(weight, None))
+    }
+}
+
+impl Module for Qwen3Projection {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        match self {
+            Self::Dense(linear) => linear.forward(x),
+            Self::Quantized(qmatmul) => qmatmul.forward(x),
+        }
+    }
+}
+
+fn load_optional_rms_norm_from_gguf(
+    loader: &GgufLoader,
+    device: &Device,
+    dtype: DType,
+    name: &str,
+    eps: f64,
+) -> Result<Option<RmsNorm>> {
+    if !loader.has_tensor(name) {
+        return Ok(None);
+    }
+    let weight = loader.load_tensor(name, dtype, device)?;
+    Ok(Some(RmsNorm::new(weight, eps)))
+}
+
 struct Qwen3Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: Qwen3Projection,
+    k_proj: Qwen3Projection,
+    v_proj: Qwen3Projection,
+    o_proj: Qwen3Projection,
     q_norm: Option<RmsNorm>,
     k_norm: Option<RmsNorm>,
     num_heads: usize,
@@ -343,22 +393,22 @@ struct Qwen3Attention {
 impl Qwen3Attention {
     fn load(cfg: &Qwen3Config, vb: VarBuilder) -> Result<Self> {
         let head_dim = cfg.head_dim();
-        let q_proj = mlx::load_linear_no_bias(
+        let q_proj = Qwen3Projection::dense(
             cfg.hidden_size,
             cfg.num_attention_heads * head_dim,
             vb.pp("q_proj"),
         )?;
-        let k_proj = mlx::load_linear_no_bias(
+        let k_proj = Qwen3Projection::dense(
             cfg.hidden_size,
             cfg.num_key_value_heads * head_dim,
             vb.pp("k_proj"),
         )?;
-        let v_proj = mlx::load_linear_no_bias(
+        let v_proj = Qwen3Projection::dense(
             cfg.hidden_size,
             cfg.num_key_value_heads * head_dim,
             vb.pp("v_proj"),
         )?;
-        let o_proj = mlx::load_linear_no_bias(
+        let o_proj = Qwen3Projection::dense(
             cfg.num_attention_heads * head_dim,
             cfg.hidden_size,
             vb.pp("o_proj"),
@@ -390,6 +440,64 @@ impl Qwen3Attention {
             mrope_section,
             rope_inv_freqs: build_rope_inv_freqs(head_dim, cfg.rope_theta),
             rope_kernel_enabled: qwen3_rope_kernel_enabled(vb.device()),
+        })
+    }
+
+    fn load_gguf(
+        loader: &GgufLoader,
+        cfg: &Qwen3Config,
+        device: &Device,
+        dtype: DType,
+        prefix: &str,
+    ) -> Result<Self> {
+        let head_dim = cfg.head_dim();
+        let q_proj =
+            Qwen3Projection::quantized(loader, device, &format!("{prefix}.q_proj.weight"))?;
+        let k_proj =
+            Qwen3Projection::quantized(loader, device, &format!("{prefix}.k_proj.weight"))?;
+        let v_proj =
+            Qwen3Projection::quantized(loader, device, &format!("{prefix}.v_proj.weight"))?;
+        let o_proj =
+            Qwen3Projection::quantized(loader, device, &format!("{prefix}.o_proj.weight"))?;
+
+        let q_norm = load_optional_rms_norm_from_gguf(
+            loader,
+            device,
+            dtype,
+            &format!("{prefix}.q_norm.weight"),
+            cfg.rms_norm_eps,
+        )?;
+        let k_norm = load_optional_rms_norm_from_gguf(
+            loader,
+            device,
+            dtype,
+            &format!("{prefix}.k_norm.weight"),
+            cfg.rms_norm_eps,
+        )?;
+        let (use_mrope, mrope_section) = cfg
+            .rope_scaling
+            .as_ref()
+            .map(|scaling| {
+                let use_mrope = scaling.mrope_interleaved.unwrap_or(false)
+                    || scaling.interleaved.unwrap_or(false);
+                (use_mrope, scaling.mrope_section.clone())
+            })
+            .unwrap_or((false, None));
+
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
+            num_heads: cfg.num_attention_heads,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim,
+            use_mrope,
+            mrope_section,
+            rope_inv_freqs: build_rope_inv_freqs(head_dim, cfg.rope_theta),
+            rope_kernel_enabled: qwen3_rope_kernel_enabled(device),
         })
     }
 
@@ -650,19 +758,33 @@ impl Qwen3Attention {
 }
 
 struct Qwen3Mlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    gate_proj: Qwen3Projection,
+    up_proj: Qwen3Projection,
+    down_proj: Qwen3Projection,
 }
 
 impl Qwen3Mlp {
     fn load(cfg: &Qwen3Config, vb: VarBuilder) -> Result<Self> {
         let gate_proj =
-            mlx::load_linear_no_bias(cfg.hidden_size, cfg.intermediate_size, vb.pp("gate_proj"))?;
+            Qwen3Projection::dense(cfg.hidden_size, cfg.intermediate_size, vb.pp("gate_proj"))?;
         let up_proj =
-            mlx::load_linear_no_bias(cfg.hidden_size, cfg.intermediate_size, vb.pp("up_proj"))?;
+            Qwen3Projection::dense(cfg.hidden_size, cfg.intermediate_size, vb.pp("up_proj"))?;
         let down_proj =
-            mlx::load_linear_no_bias(cfg.intermediate_size, cfg.hidden_size, vb.pp("down_proj"))?;
+            Qwen3Projection::dense(cfg.intermediate_size, cfg.hidden_size, vb.pp("down_proj"))?;
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+        })
+    }
+
+    fn load_gguf(loader: &GgufLoader, device: &Device, prefix: &str) -> Result<Self> {
+        let gate_proj =
+            Qwen3Projection::quantized(loader, device, &format!("{prefix}.gate_proj.weight"))?;
+        let up_proj =
+            Qwen3Projection::quantized(loader, device, &format!("{prefix}.up_proj.weight"))?;
+        let down_proj =
+            Qwen3Projection::quantized(loader, device, &format!("{prefix}.down_proj.weight"))?;
         Ok(Self {
             gate_proj,
             up_proj,
@@ -710,6 +832,36 @@ impl Qwen3Layer {
         })
     }
 
+    fn load_gguf(
+        loader: &GgufLoader,
+        cfg: &Qwen3Config,
+        device: &Device,
+        dtype: DType,
+        prefix: &str,
+    ) -> Result<Self> {
+        let input_layernorm = RmsNorm::new(
+            loader.load_tensor(&format!("{prefix}.input_layernorm.weight"), dtype, device)?,
+            cfg.rms_norm_eps,
+        );
+        let self_attn =
+            Qwen3Attention::load_gguf(loader, cfg, device, dtype, &format!("{prefix}.self_attn"))?;
+        let post_attention_layernorm = RmsNorm::new(
+            loader.load_tensor(
+                &format!("{prefix}.post_attention_layernorm.weight"),
+                dtype,
+                device,
+            )?,
+            cfg.rms_norm_eps,
+        );
+        let mlp = Qwen3Mlp::load_gguf(loader, device, &format!("{prefix}.mlp"))?;
+        Ok(Self {
+            input_layernorm,
+            self_attn,
+            post_attention_layernorm,
+            mlp,
+        })
+    }
+
     fn forward(
         &self,
         x: &Tensor,
@@ -735,7 +887,7 @@ pub struct Qwen3Model {
     embed_tokens: Embedding,
     layers: Vec<Qwen3Layer>,
     norm: RmsNorm,
-    lm_head: Linear,
+    lm_head: Qwen3Projection,
     device: Device,
     cfg: Qwen3Config,
     use_mrope: bool,
@@ -747,7 +899,7 @@ impl Qwen3Model {
         let embed_tokens =
             mlx::load_embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
         let lm_head = if vb.contains_tensor("lm_head.weight") {
-            mlx::load_linear_no_bias(cfg.hidden_size, lm_head_size, vb.pp("lm_head"))?
+            Qwen3Projection::dense(cfg.hidden_size, lm_head_size, vb.pp("lm_head"))?
         } else {
             // Some MLX checkpoints omit lm_head and tie it to token embeddings.
             if lm_head_size != cfg.vocab_size {
@@ -756,7 +908,7 @@ impl Qwen3Model {
                     cfg.vocab_size
                 )));
             }
-            Linear::new(embed_tokens.embeddings().clone(), None)
+            Qwen3Projection::tied_dense(embed_tokens.embeddings().clone())
         };
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for idx in 0..cfg.num_hidden_layers {
@@ -778,6 +930,68 @@ impl Qwen3Model {
             norm,
             lm_head,
             device: vb.device().clone(),
+            cfg,
+            use_mrope,
+        })
+    }
+
+    pub fn load_gguf_text(
+        cfg: Qwen3Config,
+        loader: &GgufLoader,
+        device: &Device,
+        dtype: DType,
+        prefix: &str,
+    ) -> Result<Self> {
+        let lm_head_size = cfg.lm_head_size.unwrap_or(cfg.vocab_size);
+        let model_prefix = qwen3_join_prefix(prefix, "model");
+        let embed_tokens = Embedding::new(
+            loader.load_tensor(
+                &qwen3_join_prefix(&model_prefix, "embed_tokens.weight"),
+                dtype,
+                device,
+            )?,
+            cfg.hidden_size,
+        );
+        let lm_head_name = qwen3_join_prefix(prefix, "lm_head.weight");
+        let lm_head = if loader.has_tensor(&lm_head_name) {
+            Qwen3Projection::quantized(loader, device, &lm_head_name)?
+        } else {
+            if lm_head_size != cfg.vocab_size {
+                return Err(Error::InvalidInput(format!(
+                    "lm_head_size ({lm_head_size}) differs from vocab_size ({}) but lm_head.weight is missing",
+                    cfg.vocab_size
+                )));
+            }
+            Qwen3Projection::tied_dense(embed_tokens.embeddings().clone())
+        };
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        for idx in 0..cfg.num_hidden_layers {
+            let layer_prefix = qwen3_join_prefix(&model_prefix, &format!("layers.{idx}"));
+            let layer = Qwen3Layer::load_gguf(loader, &cfg, device, dtype, &layer_prefix)?;
+            layers.push(layer);
+        }
+        let norm = RmsNorm::new(
+            loader.load_tensor(
+                &qwen3_join_prefix(&model_prefix, "norm.weight"),
+                dtype,
+                device,
+            )?,
+            cfg.rms_norm_eps,
+        );
+        let use_mrope = cfg
+            .rope_scaling
+            .as_ref()
+            .map(|scaling| {
+                scaling.mrope_interleaved.unwrap_or(false) || scaling.interleaved.unwrap_or(false)
+            })
+            .unwrap_or(false);
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            device: device.clone(),
             cfg,
             use_mrope,
         })
@@ -824,6 +1038,14 @@ impl Qwen3Model {
 
     pub fn uses_mrope(&self) -> bool {
         self.use_mrope
+    }
+}
+
+fn qwen3_join_prefix(prefix: &str, suffix: &str) -> String {
+    if prefix.is_empty() {
+        suffix.to_string()
+    } else {
+        format!("{prefix}.{suffix}")
     }
 }
 
@@ -1273,8 +1495,8 @@ mod tests {
         assert!(cache.dense_heads(0).is_some());
         assert!(cache.pages(0).is_none());
 
-        let next_k = Tensor::from_vec(vec![8.0f32, 9.0, 10.0, 11.0], (1, 1, 1, 4), &device)
-            .expect("next k");
+        let next_k =
+            Tensor::from_vec(vec![8.0f32, 9.0, 10.0, 11.0], (1, 1, 1, 4), &device).expect("next k");
         let next_v = Tensor::from_vec(vec![28.0f32, 29.0, 30.0, 31.0], (1, 1, 1, 4), &device)
             .expect("next v");
         cache.append(0, next_k, next_v).expect("append next");
@@ -1309,8 +1531,16 @@ mod tests {
             &device,
         )
         .expect("v");
-        let k_heads = k.transpose(1, 2).expect("k heads").contiguous().expect("k contig");
-        let v_heads = v.transpose(1, 2).expect("v heads").contiguous().expect("v contig");
+        let k_heads = k
+            .transpose(1, 2)
+            .expect("k heads")
+            .contiguous()
+            .expect("k contig");
+        let v_heads = v
+            .transpose(1, 2)
+            .expect("v heads")
+            .contiguous()
+            .expect("v contig");
 
         let dense = dense_decode_attention(&q, &k_heads, &v_heads, 2, 1, 4).expect("dense");
         let q_heads = q.transpose(1, 2).expect("q heads");

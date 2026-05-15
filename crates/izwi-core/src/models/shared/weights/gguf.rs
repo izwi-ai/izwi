@@ -307,11 +307,38 @@ pub fn var_builder_from_gguf(
     device: &Device,
 ) -> Result<VarBuilder<'static>> {
     let loader = GgufLoader::from_path_with_backend(path, backend_kind_for_device(device))?;
+    var_builder_from_gguf_loader_filtered(&loader, dtype, device, |_| true)
+}
 
+pub fn var_builder_from_gguf_filtered<F>(
+    path: &Path,
+    dtype: DType,
+    device: &Device,
+    include: F,
+) -> Result<VarBuilder<'static>>
+where
+    F: Fn(&str) -> bool,
+{
+    let loader = GgufLoader::from_path_with_backend(path, backend_kind_for_device(device))?;
+    var_builder_from_gguf_loader_filtered(&loader, dtype, device, include)
+}
+
+fn var_builder_from_gguf_loader_filtered<F>(
+    loader: &GgufLoader,
+    dtype: DType,
+    device: &Device,
+    include: F,
+) -> Result<VarBuilder<'static>>
+where
+    F: Fn(&str) -> bool,
+{
     // Load all tensors into a HashMap
     let mut tensors: HashMap<String, Tensor> = HashMap::new();
 
     for name in loader.tensor_names() {
+        if !include(&name) {
+            continue;
+        }
         match loader.load_tensor(&name, dtype, device) {
             Ok(tensor) => {
                 tensors.insert(name, tensor);
