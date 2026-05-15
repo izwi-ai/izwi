@@ -121,13 +121,21 @@ struct AsrBenchSample {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct WhisperStageTimings {
+struct AsrStageTimings {
     audio_decode: Option<f64>,
     mel_prepare: Option<f64>,
     encoder_forward: Option<f64>,
     language_detect: Option<f64>,
+    resample: Option<f64>,
+    mel: Option<f64>,
+    audio_encode: Option<f64>,
+    prefill: Option<f64>,
     decode: Option<f64>,
     model_total: Option<f64>,
+    prompt_tokens: Option<u64>,
+    audio_tokens: Option<u64>,
+    generated_tokens: Option<u64>,
+    max_new_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1678,7 +1686,7 @@ async fn bench_asr(
             if diagnostics_contains_whisper_model(diagnostics) {
                 saw_whisper_diagnostics = true;
             }
-            stage_samples.extend(collect_whisper_stage_timings_from_diagnostics(diagnostics));
+            stage_samples.extend(collect_asr_stage_timings_from_diagnostics(diagnostics));
         }
     }
 
@@ -1718,7 +1726,7 @@ async fn bench_asr(
                 percentile(&rtf, 0.95)
             );
         }
-        print_whisper_stage_timing_summary(&stage_samples);
+        print_asr_stage_timing_summary(&stage_samples);
     }
 
     let model_lower = model.to_ascii_lowercase();
@@ -2270,11 +2278,14 @@ async fn fetch_runtime_metrics(server: &str) -> Option<RuntimeTelemetrySnapshot>
     None
 }
 
-fn whisper_stage_timings_from_diagnostics(
+fn asr_stage_timings_from_diagnostics(
     diagnostics: &serde_json::Value,
-) -> Option<WhisperStageTimings> {
+) -> Option<AsrStageTimings> {
     let timings = diagnostics.get("timings_ms")?.as_object()?;
-    Some(WhisperStageTimings {
+    let prompt = diagnostics.get("prompt");
+    let audio = diagnostics.get("audio");
+    let decode = diagnostics.get("decode");
+    Some(AsrStageTimings {
         audio_decode: timings.get("audio_decode").and_then(|value| value.as_f64()),
         mel_prepare: timings.get("mel_prepare").and_then(|value| value.as_f64()),
         encoder_forward: timings
@@ -2283,8 +2294,24 @@ fn whisper_stage_timings_from_diagnostics(
         language_detect: timings
             .get("language_detect")
             .and_then(|value| value.as_f64()),
+        resample: timings.get("resample").and_then(|value| value.as_f64()),
+        mel: timings.get("mel").and_then(|value| value.as_f64()),
+        audio_encode: timings.get("audio_encode").and_then(|value| value.as_f64()),
+        prefill: timings.get("prefill").and_then(|value| value.as_f64()),
         decode: timings.get("decode").and_then(|value| value.as_f64()),
         model_total: timings.get("model_total").and_then(|value| value.as_f64()),
+        prompt_tokens: prompt
+            .and_then(|value| value.get("prompt_tokens"))
+            .and_then(|value| value.as_u64()),
+        audio_tokens: audio
+            .and_then(|value| value.get("audio_tokens"))
+            .and_then(|value| value.as_u64()),
+        generated_tokens: decode
+            .and_then(|value| value.get("generated_tokens"))
+            .and_then(|value| value.as_u64()),
+        max_new_tokens: decode
+            .and_then(|value| value.get("max_new_tokens"))
+            .and_then(|value| value.as_u64()),
     })
 }
 
@@ -2313,11 +2340,11 @@ fn diagnostics_contains_whisper_model(diagnostics: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
-fn collect_whisper_stage_timings_from_diagnostics(
+fn collect_asr_stage_timings_from_diagnostics(
     diagnostics: &serde_json::Value,
-) -> Vec<WhisperStageTimings> {
+) -> Vec<AsrStageTimings> {
     let mut samples = Vec::new();
-    if let Some(stage_sample) = whisper_stage_timings_from_diagnostics(diagnostics) {
+    if let Some(stage_sample) = asr_stage_timings_from_diagnostics(diagnostics) {
         samples.push(stage_sample);
     }
 
@@ -2330,14 +2357,7 @@ fn collect_whisper_stage_timings_from_diagnostics(
             let Some(model_diagnostics) = chunk.get("model_diagnostics") else {
                 continue;
             };
-            if model_diagnostics
-                .get("model_family")
-                .and_then(|value| value.as_str())
-                != Some("whisper_asr")
-            {
-                continue;
-            }
-            if let Some(stage_sample) = whisper_stage_timings_from_diagnostics(model_diagnostics) {
+            if let Some(stage_sample) = asr_stage_timings_from_diagnostics(model_diagnostics) {
                 samples.push(stage_sample);
             }
         }
@@ -2359,7 +2379,21 @@ fn summarize_stage(stage: &str, values: &[f64]) {
     );
 }
 
-fn print_whisper_stage_timing_summary(samples: &[WhisperStageTimings]) {
+fn summarize_count(stage: &str, values: &[u64]) {
+    if values.is_empty() {
+        return;
+    }
+    let values_f64 = values.iter().map(|value| *value as f64).collect::<Vec<_>>();
+    let avg = values_f64.iter().sum::<f64>() / values_f64.len() as f64;
+    let p50 = percentile(&values_f64, 0.5);
+    let p95 = percentile(&values_f64, 0.95);
+    println!(
+        "  {:<14} avg/p50/p95: {:.1} / {:.1} / {:.1}",
+        stage, avg, p50, p95
+    );
+}
+
+fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     if samples.is_empty() {
         return;
     }
@@ -2368,8 +2402,16 @@ fn print_whisper_stage_timing_summary(samples: &[WhisperStageTimings]) {
     let mut mel_prepare = Vec::new();
     let mut encoder_forward = Vec::new();
     let mut language_detect = Vec::new();
+    let mut resample = Vec::new();
+    let mut mel = Vec::new();
+    let mut audio_encode = Vec::new();
+    let mut prefill = Vec::new();
     let mut decode = Vec::new();
     let mut model_total = Vec::new();
+    let mut prompt_tokens = Vec::new();
+    let mut audio_tokens = Vec::new();
+    let mut generated_tokens = Vec::new();
+    let mut max_new_tokens = Vec::new();
 
     for sample in samples {
         if let Some(value) = sample.audio_decode {
@@ -2384,11 +2426,35 @@ fn print_whisper_stage_timing_summary(samples: &[WhisperStageTimings]) {
         if let Some(value) = sample.language_detect {
             language_detect.push(value);
         }
+        if let Some(value) = sample.resample {
+            resample.push(value);
+        }
+        if let Some(value) = sample.mel {
+            mel.push(value);
+        }
+        if let Some(value) = sample.audio_encode {
+            audio_encode.push(value);
+        }
+        if let Some(value) = sample.prefill {
+            prefill.push(value);
+        }
         if let Some(value) = sample.decode {
             decode.push(value);
         }
         if let Some(value) = sample.model_total {
             model_total.push(value);
+        }
+        if let Some(value) = sample.prompt_tokens {
+            prompt_tokens.push(value);
+        }
+        if let Some(value) = sample.audio_tokens {
+            audio_tokens.push(value);
+        }
+        if let Some(value) = sample.generated_tokens {
+            generated_tokens.push(value);
+        }
+        if let Some(value) = sample.max_new_tokens {
+            max_new_tokens.push(value);
         }
     }
 
@@ -2396,8 +2462,16 @@ fn print_whisper_stage_timing_summary(samples: &[WhisperStageTimings]) {
         && mel_prepare.is_empty()
         && encoder_forward.is_empty()
         && language_detect.is_empty()
+        && resample.is_empty()
+        && mel.is_empty()
+        && audio_encode.is_empty()
+        && prefill.is_empty()
         && decode.is_empty()
         && model_total.is_empty()
+        && prompt_tokens.is_empty()
+        && audio_tokens.is_empty()
+        && generated_tokens.is_empty()
+        && max_new_tokens.is_empty()
     {
         return;
     }
@@ -2412,8 +2486,16 @@ fn print_whisper_stage_timing_summary(samples: &[WhisperStageTimings]) {
     summarize_stage("mel_prepare", &mel_prepare);
     summarize_stage("encoder_fwd", &encoder_forward);
     summarize_stage("lang_detect", &language_detect);
+    summarize_stage("resample", &resample);
+    summarize_stage("mel", &mel);
+    summarize_stage("audio_encode", &audio_encode);
+    summarize_stage("prefill", &prefill);
     summarize_stage("decode", &decode);
     summarize_stage("model_total", &model_total);
+    summarize_count("prompt_tokens", &prompt_tokens);
+    summarize_count("audio_tokens", &audio_tokens);
+    summarize_count("gen_tokens", &generated_tokens);
+    summarize_count("max_new_tokens", &max_new_tokens);
 }
 
 fn print_runtime_delta(
@@ -2667,11 +2749,48 @@ mod tests {
         });
 
         assert!(diagnostics_contains_whisper_model(&diagnostics));
-        let samples = collect_whisper_stage_timings_from_diagnostics(&diagnostics);
+        let samples = collect_asr_stage_timings_from_diagnostics(&diagnostics);
 
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].decode, Some(10.0));
         assert_eq!(samples[0].model_total, Some(20.0));
+    }
+
+    #[test]
+    fn asr_stage_timing_collection_includes_qwen_diagnostics() {
+        let diagnostics = serde_json::json!({
+            "model_family": "qwen3_asr",
+            "audio": {
+                "audio_tokens": 355
+            },
+            "prompt": {
+                "prompt_tokens": 482
+            },
+            "decode": {
+                "generated_tokens": 93,
+                "max_new_tokens": 512
+            },
+            "timings_ms": {
+                "resample": 0.0,
+                "mel": 12.5,
+                "audio_encode": 820.0,
+                "prefill": 1080.0,
+                "decode": 21230.0,
+                "model_total": 22360.0
+            }
+        });
+
+        let samples = collect_asr_stage_timings_from_diagnostics(&diagnostics);
+
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].mel, Some(12.5));
+        assert_eq!(samples[0].audio_encode, Some(820.0));
+        assert_eq!(samples[0].prefill, Some(1080.0));
+        assert_eq!(samples[0].decode, Some(21230.0));
+        assert_eq!(samples[0].prompt_tokens, Some(482));
+        assert_eq!(samples[0].audio_tokens, Some(355));
+        assert_eq!(samples[0].generated_tokens, Some(93));
+        assert_eq!(samples[0].max_new_tokens, Some(512));
     }
 
     #[tokio::test]
