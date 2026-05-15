@@ -45,8 +45,13 @@ import {
   summaryStatusLabel,
   summaryStatusTone,
   summarizeRecord,
-  transcodeToWav,
 } from "@/features/transcription/playground/support";
+import {
+  prepareSpeechTextUploadBlob,
+  resolveSourceAudioFilename,
+  resolveSpeechTextUploadFilename,
+  transcodeToWav,
+} from "@/shared/audioUpload";
 import {
   api,
   type TranscriptionRecord,
@@ -618,16 +623,19 @@ export function TranscriptionPlayground({
       }
 
       try {
-        const shouldTranscode =
-          options.transcode ?? !(audioBlob instanceof File);
-        const uploadBlob = shouldTranscode
-          ? await transcodeToWav(audioBlob, 16000)
-          : audioBlob;
-        const uploadFilename =
-          options.filename?.trim() ||
-          (audioBlob instanceof File && audioBlob.name
-            ? audioBlob.name
-            : "audio.wav");
+        const sourceFileName =
+          options.filename?.trim() || resolveSourceAudioFilename(audioBlob);
+        const uploadBlob =
+          options.transcode === true
+            ? await transcodeToWav(audioBlob, 16000, sourceFileName).catch(
+                () => audioBlob,
+              )
+            : await prepareSpeechTextUploadBlob(audioBlob, 16000);
+        const uploadFilename = resolveSpeechTextUploadFilename({
+          sourceFileName,
+          sourceBlob: audioBlob,
+          uploadedBlob: uploadBlob,
+        });
 
         const url = URL.createObjectURL(uploadBlob);
         setAudioUrl((previousUrl) => {
@@ -991,7 +999,6 @@ export function TranscriptionPlayground({
     setIsTranscriptSessionActive(true);
     await processAudio(file, {
       filename: file.name,
-      transcode: false,
     });
     event.target.value = "";
   };

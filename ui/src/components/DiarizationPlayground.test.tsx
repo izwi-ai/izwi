@@ -613,7 +613,7 @@ describe("DiarizationPlayground speaker corrections", () => {
     expect(screen.getByTestId("diarization-stats-footer")).toBeInTheDocument();
   });
 
-  it("transcodes recorded webm microphone audio before creating a diarization record", async () => {
+  it("preserves recorded webm microphone audio when creating a diarization record", async () => {
     apiMocks.createDiarizationRecord.mockResolvedValue({
       id: "diar-live",
       created_at: 4,
@@ -765,9 +765,9 @@ describe("DiarizationPlayground speaker corrections", () => {
       );
 
       const request = apiMocks.createDiarizationRecord.mock.calls[0]?.[0];
-      expect(request.audio_filename).toBe("audio.wav");
+      expect(request.audio_filename).toBe("audio.webm");
       expect(request.audio_file).toBeInstanceOf(Blob);
-      expect(request.audio_file.type).toBe("audio/wav");
+      expect(request.audio_file.type).toBe("audio/webm;codecs=opus");
       expect(stopTrack).toHaveBeenCalled();
     } finally {
       Object.defineProperty(navigator, "mediaDevices", {
