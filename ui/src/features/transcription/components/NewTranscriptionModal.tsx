@@ -12,6 +12,11 @@ import {
 import { StatusBadge } from "@/components/ui/status-badge";
 import { LANGUAGE_OPTIONS } from "@/features/transcription/playground/support";
 import {
+  prepareSpeechTextUploadBlob,
+  resolveSourceAudioFilename,
+  resolveSpeechTextUploadFilename,
+} from "@/shared/audioUpload";
+import {
   Select,
   SelectContent,
   SelectItem,
@@ -153,13 +158,16 @@ export function NewTranscriptionModal({
       setError(null);
 
       try {
-        const uploadFilename =
-          options.filename?.trim() ||
-          (audioBlob instanceof File && audioBlob.name
-            ? audioBlob.name
-            : "audio.wav");
+        const sourceFileName =
+          options.filename?.trim() || resolveSourceAudioFilename(audioBlob);
+        const uploadedBlob = await prepareSpeechTextUploadBlob(audioBlob, 16000);
+        const uploadFilename = resolveSpeechTextUploadFilename({
+          sourceFileName,
+          sourceBlob: audioBlob,
+          uploadedBlob,
+        });
         const request = {
-          audio_file: audioBlob,
+          audio_file: uploadedBlob,
           audio_filename: uploadFilename,
           model_id: selectedModel || undefined,
           aligner_model_id: includeTimestamps

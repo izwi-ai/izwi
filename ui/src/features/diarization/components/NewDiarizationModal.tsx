@@ -19,10 +19,12 @@ import { StatusBadge } from "@/components/ui/status-badge";
 import {
   clampIntegerDraft,
   formatDraftValue,
-  resolveDiarizationUploadFilename,
-  resolveSourceAudioFilename,
-  transcodeToWav,
 } from "@/features/diarization/audioUpload";
+import {
+  prepareSpeechTextUploadBlob,
+  resolveSourceAudioFilename,
+  resolveSpeechTextUploadFilename,
+} from "@/shared/audioUpload";
 import { SpeechTextModeSwitch } from "@/features/speech-text/components/SpeechTextModeSwitch";
 import type { SpeechTextCreationMode } from "@/features/speech-text/creationMode";
 
@@ -150,12 +152,11 @@ export function NewDiarizationModal({
 
       try {
         const sourceFileName = resolveSourceAudioFilename(audioBlob);
-        const uploadedBlob = await transcodeToWav(
+        const uploadedBlob = await prepareSpeechTextUploadBlob(
           audioBlob,
           16000,
-          sourceFileName,
-        ).catch(() => audioBlob);
-        const uploadFilename = resolveDiarizationUploadFilename({
+        );
+        const uploadFilename = resolveSpeechTextUploadFilename({
           sourceFileName,
           sourceBlob: audioBlob,
           uploadedBlob,

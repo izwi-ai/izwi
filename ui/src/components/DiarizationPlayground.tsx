@@ -28,10 +28,12 @@ import {
 import {
   clampIntegerDraft,
   formatDraftValue,
-  resolveDiarizationUploadFilename,
-  resolveSourceAudioFilename,
-  transcodeToWav,
 } from "@/features/diarization/audioUpload";
+import {
+  prepareSpeechTextUploadBlob,
+  resolveSourceAudioFilename,
+  resolveSpeechTextUploadFilename,
+} from "@/shared/audioUpload";
 import { formattedTranscriptFromResult } from "../utils/diarizationTranscript";
 import {
   diarizationSummaryStatusLabel,
@@ -244,20 +246,19 @@ export function DiarizationPlayground({
 
       try {
         const sourceFileName = resolveSourceAudioFilename(audioBlob);
-        const wavBlob = await transcodeToWav(
+        const uploadedBlob = await prepareSpeechTextUploadBlob(
           audioBlob,
           16000,
-          sourceFileName,
-        ).catch(() => audioBlob);
+        );
 
-        const uploadFilename = resolveDiarizationUploadFilename({
+        const uploadFilename = resolveSpeechTextUploadFilename({
           sourceFileName,
           sourceBlob: audioBlob,
-          uploadedBlob: wavBlob,
+          uploadedBlob,
         });
 
         const record = await api.createDiarizationRecord({
-          audio_file: wavBlob,
+          audio_file: uploadedBlob,
           audio_filename: uploadFilename,
           model_id: selectedModel || undefined,
           asr_model_id: pipelineAsrModelId || undefined,
