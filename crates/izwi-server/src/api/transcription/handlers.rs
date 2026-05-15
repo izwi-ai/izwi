@@ -3,13 +3,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    Json, RequestExt,
     extract::{Extension, Multipart, Path, Request, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{header, HeaderValue, StatusCode},
     response::{
-        IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
     },
+    Json, RequestExt,
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -24,8 +24,11 @@ use crate::transcription_store::{
     TranscriptionSummaryStatus, TranscriptionWordRecord, UpdateTranscriptionSummary,
 };
 use izwi_core::{
-    ChatMessage, ChatRole, GenerationParams, RuntimeService, parse_chat_model_variant,
+    parse_chat_model_variant, ChatMessage, ChatRole, GenerationParams, RuntimeService,
 };
+
+use super::AUDIO_UPLOAD_LIMIT_BYTES;
+use crate::api::speech_text_upload::multipart_upload_error;
 
 const DEFAULT_TRANSCRIPTION_ALIGNER_MODEL: &str = "Qwen3-ForcedAligner-0.6B";
 const DEFAULT_TRANSCRIPTION_SUMMARY_MODEL: &str = "Qwen3.5-4B";
@@ -553,18 +556,21 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
 
         let mut out = ParsedTranscriptionCreateRequest::default();
 
-        while let Some(field) = multipart
-            .next_field()
-            .await
-            .map_err(|e| ApiError::bad_request(format!("Failed reading multipart field: {e}")))?
-        {
+        while let Some(field) = multipart.next_field().await.map_err(|err| {
+            multipart_upload_error("Transcription", "field", AUDIO_UPLOAD_LIMIT_BYTES, err)
+        })? {
             let name = field.name().unwrap_or_default().to_string();
             match name.as_str() {
                 "file" | "audio" => {
                     let filename = field.file_name().map(|value| value.to_string());
                     let mime_type = field.content_type().map(|value| value.to_string());
-                    let bytes = field.bytes().await.map_err(|e| {
-                        ApiError::bad_request(format!("Failed reading '{name}' bytes: {e}"))
+                    let bytes = field.bytes().await.map_err(|err| {
+                        multipart_upload_error(
+                            "Transcription",
+                            &name,
+                            AUDIO_UPLOAD_LIMIT_BYTES,
+                            err,
+                        )
                     })?;
                     if !bytes.is_empty() {
                         out.audio_bytes = bytes.to_vec();
@@ -667,6 +673,21 @@ fn parse_bool(raw: &str) -> bool {
 fn sanitize_optional(raw: Option<String>) -> Option<String> {
     raw.map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+fn multipart_field_api_error(
+    field_name: &str,
+    status: StatusCode,
+    raw: impl AsRef<str>,
+) -> ApiError {
+    crate::api::speech_text_upload::multipart_upload_api_error(
+        "Transcription",
+        field_name,
+        AUDIO_UPLOAD_LIMIT_BYTES,
+        status,
+        raw,
+    )
 }
 
 fn alignments_to_word_records(alignments: &[(String, u32, u32)]) -> Vec<TranscriptionWordRecord> {
@@ -967,9 +988,12 @@ fn map_store_error(err: anyhow::Error) -> ApiError {
 
 #[cfg(test)]
 mod tests {
+    use axum::http::StatusCode;
+
     use super::{
-        TranscriptionSummaryStatus, TranscriptionWordRecord, alignments_to_word_records,
-        build_segment_records, initial_summary_state, parse_bool, sanitize_summary_output,
+        alignments_to_word_records, build_segment_records, initial_summary_state,
+        multipart_field_api_error, parse_bool, sanitize_summary_output, TranscriptionSummaryStatus,
+        TranscriptionWordRecord,
     };
 
     #[test]
@@ -1025,6 +1049,18 @@ mod tests {
         assert!(parse_bool("YES"));
         assert!(parse_bool("1"));
         assert!(!parse_bool("false"));
+    }
+
+    #[test]
+    fn multipart_error_mentions_transcription_upload_limit() {
+        let err = multipart_field_api_error(
+            "file",
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body too large",
+        );
+        assert_eq!(err.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(err.message.contains("64 MiB"));
+        assert!(err.message.contains("original compressed file"));
     }
 
     #[test]

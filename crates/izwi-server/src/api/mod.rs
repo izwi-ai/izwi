@@ -16,6 +16,7 @@ pub mod request_context;
 mod router;
 pub mod saved_voices;
 pub mod speech_history;
+pub(crate) mod speech_text_upload;
 pub mod studio;
 pub mod transcription;
 pub(crate) mod tts_long_form;
