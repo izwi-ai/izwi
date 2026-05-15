@@ -109,7 +109,9 @@ struct Qwen3AsrDiagnostics {
     resampled_sample_rate: u32,
     resampled_samples: usize,
     mel_frames: usize,
+    mel_frames_before_drop: usize,
     mel_frames_before_truncate: usize,
+    mel_last_frame_dropped: bool,
     mel_frames_truncated: bool,
     audio_tokens: usize,
     prompt_tokens: usize,
@@ -134,7 +136,9 @@ impl Qwen3AsrDiagnostics {
                 "resampled_sample_rate": self.resampled_sample_rate,
                 "resampled_samples": self.resampled_samples,
                 "mel_frames": self.mel_frames,
+                "mel_frames_before_drop": self.mel_frames_before_drop,
                 "mel_frames_before_truncate": self.mel_frames_before_truncate,
+                "mel_last_frame_dropped": self.mel_last_frame_dropped,
                 "mel_frames_truncated": self.mel_frames_truncated,
                 "audio_tokens": self.audio_tokens,
             },
@@ -570,6 +574,9 @@ impl Qwen3AsrModel {
 
         let mel_started = Instant::now();
         let mut mel_spec = self.mel.compute(&audio)?;
+        let mel_frames_before_drop = mel_spec.len();
+        let mel_last_frame_dropped =
+            apply_qwen_mel_frame_policy(&mut mel_spec, qwen_asr_drop_last_mel_frame());
         let mel_frames_before_truncate = mel_spec.len();
         if self.preprocessor.nb_max_frames > 0 && mel_spec.len() > self.preprocessor.nb_max_frames {
             mel_spec.truncate(self.preprocessor.nb_max_frames);
@@ -627,7 +634,9 @@ impl Qwen3AsrModel {
             resampled_sample_rate: 16_000,
             resampled_samples: audio.len(),
             mel_frames: frames,
+            mel_frames_before_drop,
             mel_frames_before_truncate,
+            mel_last_frame_dropped,
             mel_frames_truncated: mel_frames_before_truncate > frames,
             audio_tokens: audio_len,
             prompt_tokens: prompt.ids.len(),
@@ -2238,23 +2247,114 @@ fn is_special_generation_token(specials: &SpecialTokenIds, id: u32) -> bool {
     false
 }
 
+fn qwen_asr_drop_last_mel_frame() -> bool {
+    env_bool("IZWI_QWEN_ASR_DROP_LAST_MEL_FRAME").unwrap_or(false)
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    std::env::var(name).ok().and_then(|raw| {
+        let normalized = raw.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    })
+}
+
+fn apply_qwen_mel_frame_policy(mel_spec: &mut Vec<Vec<f32>>, drop_last: bool) -> bool {
+    if drop_last && !mel_spec.is_empty() {
+        mel_spec.pop();
+        return true;
+    }
+    false
+}
+
 fn resample(audio: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>> {
     if src_rate == dst_rate {
         return Ok(audio.to_vec());
     }
+    if src_rate == 0 || dst_rate == 0 {
+        return Err(Error::InvalidInput(format!(
+            "Invalid sample rate for resampling: {src_rate} -> {dst_rate}"
+        )));
+    }
+    if audio.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    let ratio = dst_rate as f32 / src_rate as f32;
-    let out_len = ((audio.len() as f32) * ratio).ceil() as usize;
+    // Antirez/qwen-asr uses a bounded windowed-sinc resampler with a Kaiser
+    // window for anti-aliasing when downsampling. Keep this Qwen-local so the
+    // broader audio stack remains unchanged.
+    const SINC_HALF: isize = 16;
+    const KAISER_BETA: f64 = 6.0;
+
+    let ratio = dst_rate as f64 / src_rate as f64;
+    let cutoff = ratio.min(1.0);
+    let out_len = ((audio.len() as u64)
+        .saturating_mul(dst_rate as u64)
+        .checked_div(src_rate as u64)
+        .unwrap_or(0) as usize)
+        .max(1);
+    let inv_i0_beta = 1.0 / bessel_i0(KAISER_BETA);
     let mut out = Vec::with_capacity(out_len);
     for i in 0..out_len {
-        let src_pos = i as f32 / ratio;
-        let idx = src_pos.floor() as usize;
-        let frac = src_pos - idx as f32;
-        let s0 = *audio.get(idx).unwrap_or(&0.0);
-        let s1 = *audio.get(idx + 1).unwrap_or(&s0);
-        out.push(s0 + frac * (s1 - s0));
+        let src_pos = i as f64 / ratio;
+        let center = src_pos.floor() as isize;
+        let mut acc = 0.0f64;
+        let mut weight_sum = 0.0f64;
+
+        for j in (center - SINC_HALF + 1)..=(center + SINC_HALF) {
+            let d = j as f64 - src_pos;
+            let coeff = sinc(d * cutoff)
+                * kaiser_window(d, SINC_HALF as f64, KAISER_BETA, inv_i0_beta)
+                * cutoff;
+            if let Some(sample) = (j >= 0)
+                .then_some(j as usize)
+                .and_then(|idx| audio.get(idx))
+            {
+                acc += *sample as f64 * coeff;
+                weight_sum += coeff;
+            }
+        }
+
+        out.push(if weight_sum.abs() > 1e-9 {
+            (acc / weight_sum) as f32
+        } else {
+            0.0
+        });
     }
     Ok(out)
+}
+
+fn sinc(x: f64) -> f64 {
+    if x.abs() < 1e-9 {
+        1.0
+    } else {
+        let pix = std::f64::consts::PI * x;
+        pix.sin() / pix
+    }
+}
+
+fn kaiser_window(distance: f64, half_width: f64, beta: f64, inv_i0_beta: f64) -> f64 {
+    let normalized = distance / half_width;
+    if normalized <= -1.0 || normalized >= 1.0 {
+        return 0.0;
+    }
+    let inner = (1.0 - normalized * normalized).max(0.0).sqrt();
+    bessel_i0(beta * inner) * inv_i0_beta
+}
+
+fn bessel_i0(x: f64) -> f64 {
+    let mut sum = 1.0;
+    let mut term = 1.0;
+    let xx = x * x;
+    for k in 1..=20 {
+        let k = k as f64;
+        term *= xx / (4.0 * k * k);
+        sum += term;
+    }
+    sum
 }
 
 fn argmax(logits: &Tensor) -> Result<u32> {
@@ -2431,7 +2531,9 @@ mod tests {
             resampled_sample_rate: 16_000,
             resampled_samples: 16_000,
             mel_frames: 100,
+            mel_frames_before_drop: 121,
             mel_frames_before_truncate: 120,
+            mel_last_frame_dropped: true,
             mel_frames_truncated: true,
             audio_tokens: 50,
             prompt_tokens: 64,
@@ -2456,6 +2558,8 @@ mod tests {
 
         assert_eq!(diagnostics["model_family"], "qwen3_asr");
         assert_eq!(diagnostics["audio"]["mel_frames"], 100);
+        assert_eq!(diagnostics["audio"]["mel_frames_before_drop"], 121);
+        assert_eq!(diagnostics["audio"]["mel_last_frame_dropped"], true);
         assert_eq!(diagnostics["prompt"]["system_prompt_requested"], true);
         assert_eq!(diagnostics["prompt"]["asr_text_token_appended"], true);
         assert_eq!(diagnostics["decode"]["generated_tokens"], 12);
@@ -2526,6 +2630,59 @@ mod tests {
         assert_eq!(parse_asr_dtype(Some("fp16")), Some(DType::F16));
         assert_eq!(parse_asr_dtype(Some("float32")), Some(DType::F32));
         assert_eq!(parse_asr_dtype(Some("unknown")), None);
+    }
+
+    #[test]
+    fn qwen_mel_frame_policy_is_opt_in() {
+        let mut mel = vec![vec![1.0], vec![2.0], vec![3.0]];
+        assert!(!apply_qwen_mel_frame_policy(&mut mel, false));
+        assert_eq!(mel.len(), 3);
+
+        assert!(apply_qwen_mel_frame_policy(&mut mel, true));
+        assert_eq!(mel, vec![vec![1.0], vec![2.0]]);
+
+        let mut empty: Vec<Vec<f32>> = Vec::new();
+        assert!(!apply_qwen_mel_frame_policy(&mut empty, true));
+    }
+
+    #[test]
+    fn resample_preserves_identity_when_rates_match() {
+        let input = vec![0.0f32, 0.25, -0.5, 1.0];
+        let output = resample(&input, 16_000, 16_000).expect("resample");
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn resample_uses_expected_duration_for_up_and_down_sampling() {
+        let input = (0..100).map(|idx| idx as f32 / 100.0).collect::<Vec<_>>();
+        let down = resample(&input, 100, 50).expect("downsample");
+        let up = resample(&input, 50, 100).expect("upsample");
+
+        assert_eq!(down.len(), 50);
+        assert_eq!(up.len(), 200);
+        assert!(down.iter().all(|value| value.is_finite()));
+        assert!(up.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn resample_rejects_zero_sample_rates() {
+        let input = vec![0.0f32, 1.0];
+        let err = resample(&input, 0, 16_000).expect_err("zero source rate");
+        assert!(format!("{err}").contains("Invalid sample rate"));
+
+        let err = resample(&input, 16_000, 0).expect_err("zero destination rate");
+        assert!(format!("{err}").contains("Invalid sample rate"));
+    }
+
+    #[test]
+    fn resample_keeps_constant_signal_stable() {
+        let input = vec![0.75f32; 128];
+        let output = resample(&input, 48_000, 16_000).expect("resample");
+
+        assert_eq!(output.len(), 42);
+        for value in output {
+            assert!((value - 0.75).abs() < 1e-3, "unexpected value: {value}");
+        }
     }
 
     #[test]
