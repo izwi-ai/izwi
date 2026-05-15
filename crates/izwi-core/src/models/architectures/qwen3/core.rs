@@ -316,7 +316,7 @@ fn qwen3_dense_decode_max_pages() -> usize {
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(12)
+        .unwrap_or(128)
 }
 
 fn parse_env_bool(raw: &str) -> Option<bool> {
