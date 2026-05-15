@@ -25,8 +25,17 @@ import {
   resolveSourceAudioFilename,
   resolveSpeechTextUploadFilename,
 } from "@/shared/audioUpload";
+import type { UploadProgressInfo } from "@/shared/api/audio";
+import { isAbortError } from "@/shared/api/http";
 import { SpeechTextModeSwitch } from "@/features/speech-text/components/SpeechTextModeSwitch";
+import { SpeechTextUploadProgress } from "@/features/speech-text/components/SpeechTextUploadProgress";
 import type { SpeechTextCreationMode } from "@/features/speech-text/creationMode";
+import {
+  clampUploadPercent,
+  createSpeechTextUploadState,
+  createUploadAbortError,
+  type SpeechTextUploadState,
+} from "@/features/speech-text/uploadProgress";
 
 interface NewDiarizationModalProps {
   isOpen: boolean;
@@ -50,6 +59,10 @@ interface NewDiarizationModalProps {
   onLoadAllManagedModels: () => void;
   onUnloadAllManagedModels: () => void;
   onCreated: (record: DiarizationRecord) => Promise<void> | void;
+}
+
+interface SubmitAudioOptions {
+  filename?: string;
 }
 
 export function NewDiarizationModal({
@@ -78,6 +91,7 @@ export function NewDiarizationModal({
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
+  const uploadAbortRef = useRef<AbortController | null>(null);
 
   const [minSpeakers, setMinSpeakers] = useState("1");
   const [maxSpeakers, setMaxSpeakers] = useState("4");
@@ -87,6 +101,42 @@ export function NewDiarizationModal({
   const [isRecording, setIsRecording] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [uploadState, setUploadState] =
+    useState<SpeechTextUploadState | null>(null);
+
+  const updateUploadProgress = useCallback((progress: UploadProgressInfo) => {
+    setUploadState((current) => {
+      if (!current || current.phase === "accepted" || current.phase === "opening") {
+        return current;
+      }
+
+      return {
+        ...current,
+        phase: "uploading",
+        loadedBytes: progress.loadedBytes,
+        totalBytes: progress.totalBytes ?? current.totalBytes,
+        percent:
+          progress.percent === null
+            ? null
+            : clampUploadPercent(progress.percent),
+      };
+    });
+  }, []);
+
+  const handleCancelUpload = useCallback(() => {
+    uploadAbortRef.current?.abort();
+    uploadAbortRef.current = null;
+    setUploadState((current) =>
+      current
+        ? {
+            ...current,
+            phase: "cancelled",
+            errorMessage: undefined,
+          }
+        : current,
+    );
+    setIsSubmitting(false);
+  }, []);
 
   const requireReadyModel = useCallback(() => {
     if (!selectedModel || !selectedModelReady) {
@@ -139,7 +189,7 @@ export function NewDiarizationModal({
   }, [maxSpeakers, minSilenceMs, minSpeakers, minSpeechMs]);
 
   const submitAudio = useCallback(
-    async (audioBlob: Blob) => {
+    async (audioBlob: Blob, options: SubmitAudioOptions = {}) => {
       if (!requireReadyModel() || !requireReadyPipelineModels()) {
         return;
       }
@@ -149,39 +199,105 @@ export function NewDiarizationModal({
       setIsSubmitting(true);
       setIsDraggingFile(false);
       setError(null);
+      uploadAbortRef.current = null;
 
       try {
-        const sourceFileName = resolveSourceAudioFilename(audioBlob);
+        const uploadController = new AbortController();
+        uploadAbortRef.current = uploadController;
+        const fallbackSourceFileName = resolveSpeechTextUploadFilename({
+          sourceBlob: audioBlob,
+          uploadedBlob: audioBlob,
+        });
+        const sourceFileName =
+          options.filename?.trim() ||
+          resolveSourceAudioFilename(audioBlob) ||
+          fallbackSourceFileName;
+        setUploadState(
+          createSpeechTextUploadState(audioBlob, sourceFileName, "preparing"),
+        );
         const uploadedBlob = await prepareSpeechTextUploadBlob(
           audioBlob,
           16000,
         );
+        if (uploadController.signal.aborted) {
+          throw createUploadAbortError();
+        }
         const uploadFilename = resolveSpeechTextUploadFilename({
           sourceFileName,
           sourceBlob: audioBlob,
           uploadedBlob,
         });
+        setUploadState(
+          createSpeechTextUploadState(uploadedBlob, uploadFilename, "uploading"),
+        );
 
-        const record = await api.createDiarizationRecord({
-          audio_file: uploadedBlob,
-          audio_filename: uploadFilename,
-          model_id: selectedModel || undefined,
-          asr_model_id: pipelineAsrModelId || undefined,
-          aligner_model_id: pipelineAlignerModelId || undefined,
-          llm_model_id: pipelineLlmModelId || undefined,
-          min_speakers: captureSettings.minSpeakers,
-          max_speakers: captureSettings.maxSpeakers,
-          min_speech_duration_ms: captureSettings.minSpeechMs,
-          min_silence_duration_ms: captureSettings.minSilenceMs,
-        });
+        const record = await api.createDiarizationRecord(
+          {
+            audio_file: uploadedBlob,
+            audio_filename: uploadFilename,
+            model_id: selectedModel || undefined,
+            asr_model_id: pipelineAsrModelId || undefined,
+            aligner_model_id: pipelineAlignerModelId || undefined,
+            llm_model_id: pipelineLlmModelId || undefined,
+            min_speakers: captureSettings.minSpeakers,
+            max_speakers: captureSettings.maxSpeakers,
+            min_speech_duration_ms: captureSettings.minSpeechMs,
+            min_silence_duration_ms: captureSettings.minSilenceMs,
+          },
+          {
+            signal: uploadController.signal,
+            onUploadProgress: updateUploadProgress,
+          },
+        );
+
+        setUploadState((current) =>
+          current
+            ? {
+                ...current,
+                phase: "accepted",
+                loadedBytes: current.totalBytes ?? current.loadedBytes,
+                percent: 100,
+              }
+            : current,
+        );
+        setUploadState((current) =>
+          current
+            ? {
+                ...current,
+                phase: "opening",
+              }
+            : current,
+        );
 
         onClose();
         await Promise.resolve(onCreated(record));
       } catch (err) {
-        setError(
-          err instanceof Error ? err.message : "Failed to create diarization.",
-        );
+        if (isAbortError(err)) {
+          setUploadState((current) =>
+            current
+              ? {
+                  ...current,
+                  phase: "cancelled",
+                  errorMessage: undefined,
+                }
+              : current,
+          );
+        } else {
+          const message =
+            err instanceof Error ? err.message : "Failed to create diarization.";
+          setError(message);
+          setUploadState((current) =>
+            current
+              ? {
+                  ...current,
+                  phase: "failed",
+                  errorMessage: message,
+                }
+              : current,
+          );
+        }
       } finally {
+        uploadAbortRef.current = null;
         setIsSubmitting(false);
       }
     },
@@ -195,6 +311,7 @@ export function NewDiarizationModal({
       requireReadyModel,
       requireReadyPipelineModels,
       selectedModel,
+      updateUploadProgress,
     ],
   );
 
@@ -203,7 +320,9 @@ export function NewDiarizationModal({
       if (!file) {
         return;
       }
-      await submitAudio(file);
+      await submitAudio(file, {
+        filename: file.name,
+      });
     },
     [submitAudio],
   );
@@ -302,6 +421,14 @@ export function NewDiarizationModal({
   const canRunReadinessAction = readinessActionIsUnload
     ? canUnloadAnyManagedModels
     : canLoadAnyManagedModels;
+  const submissionStatusLabel =
+    uploadState?.phase === "preparing"
+      ? "Preparing"
+      : uploadState?.phase === "uploading"
+        ? "Uploading"
+        : uploadState?.phase === "accepted" || uploadState?.phase === "opening"
+          ? "Opening run"
+          : "Creating run";
 
   const modalBody = (
     <>
@@ -337,7 +464,7 @@ export function NewDiarizationModal({
             {isSubmitting ? (
               <div className="inline-flex items-center gap-2 rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)]">
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                Creating run
+                {submissionStatusLabel}
               </div>
             ) : null}
           </div>
@@ -432,6 +559,20 @@ export function NewDiarizationModal({
                 </div>
               </button>
             </div>
+
+            {uploadState ? (
+              <div className="mt-3">
+                <SpeechTextUploadProgress
+                  {...uploadState}
+                  canCancel={
+                    isSubmitting &&
+                    (uploadState.phase === "preparing" ||
+                      uploadState.phase === "uploading")
+                  }
+                  onCancel={handleCancelUpload}
+                />
+              </div>
+            ) : null}
 
             <div className="mt-3 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3.5 py-3 text-[13px] leading-5 text-[var(--text-muted)]">
               The run opens on its own page as soon as the upload is accepted.

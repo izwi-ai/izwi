@@ -689,6 +689,19 @@ export interface TranscriptionRecordStreamCallbacks {
   onFinal?: (record: TranscriptionRecord) => void;
   onError?: (error: string) => void;
   onDone?: () => void;
+  onUploadProgress?: (progress: UploadProgressInfo) => void;
+}
+
+export interface UploadProgressInfo {
+  loadedBytes: number;
+  totalBytes: number | null;
+  percent: number | null;
+  lengthComputable: boolean;
+}
+
+export interface SpeechTextJobUploadOptions {
+  onUploadProgress?: (progress: UploadProgressInfo) => void;
+  signal?: AbortSignal;
 }
 
 export interface DiarizationSegment {
@@ -888,8 +901,269 @@ function streamErrorMessage(
   return fallback;
 }
 
+function createAbortError(message = "Request aborted"): Error {
+  if (typeof DOMException !== "undefined") {
+    return new DOMException(message, "AbortError");
+  }
+
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
+}
+
+function parseXhrErrorMessage(
+  responseText: string | null | undefined,
+  fallback: string,
+): string {
+  if (!responseText) {
+    return fallback;
+  }
+
+  try {
+    const payload = JSON.parse(responseText) as {
+      error?: { message?: string };
+      message?: string;
+    };
+    return payload.error?.message || payload.message || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizeUploadProgress(event: ProgressEvent): UploadProgressInfo {
+  const lengthComputable = event.lengthComputable && event.total > 0;
+  return {
+    loadedBytes: event.loaded,
+    totalBytes: lengthComputable ? event.total : null,
+    percent: lengthComputable
+      ? Math.min(100, Math.max(0, (event.loaded / event.total) * 100))
+      : null,
+    lengthComputable,
+  };
+}
+
 export class AudioApiClient {
   constructor(private readonly http: ApiHttpClient) {}
+
+  private applyXhrHeaders(
+    xhr: XMLHttpRequest,
+    headers: HeadersInit | undefined,
+  ) {
+    if (!headers) {
+      return;
+    }
+
+    new Headers(headers).forEach((value, key) => {
+      xhr.setRequestHeader(key, value);
+    });
+  }
+
+  private async requestJsonWithUploadProgress<T>(
+    url: string,
+    init: RequestInit,
+    options: SpeechTextJobUploadOptions,
+    fallbackMessage: string,
+  ): Promise<T> {
+    if (typeof XMLHttpRequest === "undefined") {
+      const response = await fetch(url, {
+        ...init,
+        signal: options.signal,
+      });
+
+      if (!response.ok) {
+        throw await this.http.createError(response, fallbackMessage);
+      }
+
+      return response.json();
+    }
+
+    return new Promise<T>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      let settled = false;
+      const handleSignalAbort = () => {
+        xhr.abort();
+      };
+      const settle = (callback: () => void) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        options.signal?.removeEventListener("abort", handleSignalAbort);
+        callback();
+      };
+
+      if (options.signal?.aborted) {
+        reject(createAbortError());
+        return;
+      }
+
+      xhr.open(init.method || "GET", url, true);
+      this.applyXhrHeaders(xhr, init.headers);
+      xhr.responseType = "text";
+
+      xhr.upload.onprogress = (event) => {
+        options.onUploadProgress?.(normalizeUploadProgress(event));
+      };
+
+      xhr.onload = () => {
+        settle(() => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            try {
+              resolve(JSON.parse(xhr.responseText) as T);
+            } catch {
+              reject(new Error(fallbackMessage));
+            }
+            return;
+          }
+
+          reject(
+            new Error(parseXhrErrorMessage(xhr.responseText, fallbackMessage)),
+          );
+        });
+      };
+
+      xhr.onerror = () => {
+        settle(() => reject(new Error(fallbackMessage)));
+      };
+
+      xhr.onabort = () => {
+        settle(() => reject(createAbortError()));
+      };
+
+      options.signal?.addEventListener("abort", handleSignalAbort, {
+        once: true,
+      });
+
+      xhr.send((init.body ?? null) as XMLHttpRequestBodyInit | null);
+    });
+  }
+
+  private dispatchTranscriptionRecordStreamData(
+    data: string,
+    callbacks: TranscriptionRecordStreamCallbacks,
+  ): boolean {
+    try {
+      const event = JSON.parse(data) as TranscriptionRecordStreamEvent;
+      switch (event.event) {
+        case "created":
+          callbacks.onCreated?.(event.record);
+          break;
+        case "start":
+          callbacks.onStart?.();
+          break;
+        case "delta":
+          callbacks.onDelta?.(event.delta);
+          break;
+        case "final":
+          callbacks.onFinal?.(event.record);
+          break;
+        case "error":
+          callbacks.onError?.(event.error);
+          break;
+        case "done":
+          return true;
+      }
+    } catch {
+      // Skip malformed SSE payloads.
+    }
+
+    return false;
+  }
+
+  private createTranscriptionRecordStreamWithUploadProgress(
+    request: TranscriptionRecordCreateRequest,
+    callbacks: TranscriptionRecordStreamCallbacks,
+  ): AbortController {
+    const abortController = new AbortController();
+    const path = this.buildSpeechTextJobPath(
+      this.speechTextJobsCollectionPath(),
+      "transcription",
+    );
+    const init = this.buildTranscriptionRecordRequestInit(request, true);
+
+    const xhr = new XMLHttpRequest();
+    let responseOffset = 0;
+    let responseBuffer = "";
+    let completed = false;
+    const handleAbort = () => {
+      xhr.abort();
+    };
+
+    const finish = () => {
+      if (completed) {
+        return;
+      }
+      completed = true;
+      abortController.signal.removeEventListener("abort", handleAbort);
+      callbacks.onDone?.();
+    };
+
+    const processLine = (line: string) => {
+      if (!line.startsWith("data:")) {
+        return;
+      }
+
+      const data = line.slice(5).trim();
+      if (!data) {
+        return;
+      }
+
+      if (this.dispatchTranscriptionRecordStreamData(data, callbacks)) {
+        finish();
+      }
+    };
+
+    const consumeResponse = () => {
+      if (completed || (xhr.status !== 0 && (xhr.status < 200 || xhr.status >= 300))) {
+        return;
+      }
+
+      const chunk = xhr.responseText.slice(responseOffset);
+      responseOffset = xhr.responseText.length;
+      responseBuffer += chunk;
+      const lines = responseBuffer.split("\n");
+      responseBuffer = lines.pop() || "";
+      lines.forEach((line) => processLine(line.trimEnd()));
+    };
+
+    xhr.open(init.method || "GET", this.http.url(path), true);
+    this.applyXhrHeaders(xhr, init.headers);
+    xhr.responseType = "text";
+
+    xhr.upload.onprogress = (event) => {
+      callbacks.onUploadProgress?.(normalizeUploadProgress(event));
+    };
+
+    xhr.onprogress = consumeResponse;
+    xhr.onload = () => {
+      if (xhr.status < 200 || xhr.status >= 300) {
+        callbacks.onError?.(
+          parseXhrErrorMessage(xhr.responseText, "Streaming transcription failed"),
+        );
+        finish();
+        return;
+      }
+
+      consumeResponse();
+      if (responseBuffer.trim().startsWith("data:")) {
+        processLine(responseBuffer.trimEnd());
+        responseBuffer = "";
+      }
+      finish();
+    };
+    xhr.onerror = () => {
+      callbacks.onError?.("Streaming transcription failed");
+      finish();
+    };
+    xhr.onabort = finish;
+
+    abortController.signal.addEventListener("abort", handleAbort, {
+      once: true,
+    });
+    xhr.send((init.body ?? null) as XMLHttpRequestBodyInit | null);
+
+    return abortController;
+  }
 
   async generateTTS(request: TTSRequest): Promise<Blob> {
     const result = await this.generateTTSWithStats(request);
@@ -1995,6 +2269,7 @@ export class AudioApiClient {
 
   async createSpeechTextJob(
     request: SpeechTextJobCreateRequest,
+    options: SpeechTextJobUploadOptions = {},
   ): Promise<SpeechTextJob> {
     if (request.kind === "transcription" && request.stream) {
       throw new Error(
@@ -2006,9 +2281,19 @@ export class AudioApiClient {
       this.speechTextJobsCollectionPath(),
       request.kind,
     );
-    const response = await fetch(this.http.url(path), {
-      ...this.buildSpeechTextJobCreateRequestInit(request),
-    });
+    const init = this.buildSpeechTextJobCreateRequestInit(request);
+
+    if (options.onUploadProgress || options.signal) {
+      const payload = await this.requestJsonWithUploadProgress<unknown>(
+        this.http.url(path),
+        init,
+        options,
+        "Speech text job failed",
+      );
+      return this.normalizeSpeechTextJobRecord(payload, request.kind);
+    }
+
+    const response = await fetch(this.http.url(path), init);
 
     if (!response.ok) {
       throw await this.http.createError(response, "Speech text job failed");
@@ -2163,12 +2448,16 @@ export class AudioApiClient {
 
   async createTranscriptionRecord(
     request: TranscriptionRecordCreateRequest,
+    options: SpeechTextJobUploadOptions = {},
   ): Promise<TranscriptionRecord> {
-    const record = await this.createSpeechTextJob({
-      ...request,
-      kind: "transcription",
-      stream: false,
-    });
+    const record = await this.createSpeechTextJob(
+      {
+        ...request,
+        kind: "transcription",
+        stream: false,
+      },
+      options,
+    );
     return this.stripSpeechTextJobKind<TranscriptionRecord>(record);
   }
 
@@ -2176,6 +2465,13 @@ export class AudioApiClient {
     request: TranscriptionRecordCreateRequest,
     callbacks: TranscriptionRecordStreamCallbacks,
   ): AbortController {
+    if (callbacks.onUploadProgress) {
+      return this.createTranscriptionRecordStreamWithUploadProgress(
+        request,
+        callbacks,
+      );
+    }
+
     const abortController = new AbortController();
 
     const startStream = async () => {
@@ -2203,32 +2499,7 @@ export class AudioApiClient {
         }
 
         await consumeDataStream(response, (data) => {
-          try {
-            const event = JSON.parse(data) as TranscriptionRecordStreamEvent;
-            switch (event.event) {
-              case "created":
-                callbacks.onCreated?.(event.record);
-                break;
-              case "start":
-                callbacks.onStart?.();
-                break;
-              case "delta":
-                callbacks.onDelta?.(event.delta);
-                break;
-              case "final":
-                callbacks.onFinal?.(event.record);
-                break;
-              case "error":
-                callbacks.onError?.(event.error);
-                break;
-              case "done":
-                return true;
-            }
-          } catch {
-            // Skip malformed SSE payloads.
-          }
-
-          return false;
+          return this.dispatchTranscriptionRecordStreamData(data, callbacks);
         });
 
         callbacks.onDone?.();
@@ -2364,11 +2635,15 @@ export class AudioApiClient {
 
   async createDiarizationRecord(
     request: DiarizationRecordCreateRequest,
+    options: SpeechTextJobUploadOptions = {},
   ): Promise<DiarizationRecord> {
-    const record = await this.createSpeechTextJob({
-      ...request,
-      kind: "diarization",
-    });
+    const record = await this.createSpeechTextJob(
+      {
+        ...request,
+        kind: "diarization",
+      },
+      options,
+    );
     return this.stripSpeechTextJobKind<DiarizationRecord>(record);
   }
 

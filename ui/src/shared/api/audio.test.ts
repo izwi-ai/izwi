@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { AudioApiClient, type DiarizationRecord } from "@/shared/api/audio";
+import {
+  AudioApiClient,
+  type DiarizationRecord,
+  type TranscriptionRecord,
+} from "@/shared/api/audio";
 import { ApiHttpClient } from "@/shared/api/http";
 
 const updatedRecord = {
@@ -43,6 +47,29 @@ const updatedRecord = {
   audio_filename: "meeting.wav",
 } satisfies DiarizationRecord;
 
+const createdTranscriptionRecord = {
+  id: "txr-xhr-1",
+  created_at: 1,
+  model_id: "Parakeet-TDT-0.6B-v3",
+  aligner_model_id: null,
+  language: "English",
+  processing_status: "pending" as const,
+  processing_error: null,
+  duration_secs: null,
+  processing_time_ms: 0,
+  rtf: null,
+  audio_mime_type: "audio/wav",
+  audio_filename: "clip.wav",
+  transcription: "",
+  segments: [],
+  words: [],
+  summary_status: "not_requested" as const,
+  summary_model_id: null,
+  summary_text: null,
+  summary_error: null,
+  summary_updated_at: null,
+} satisfies TranscriptionRecord;
+
 function sseResponse(events: Array<Record<string, unknown> | string>): Response {
   const encoder = new TextEncoder();
   return new Response(
@@ -63,6 +90,75 @@ function sseResponse(events: Array<Record<string, unknown> | string>): Response 
       },
     },
   );
+}
+
+type XhrProgressHandler = ((event: ProgressEvent) => void) | null;
+
+class MockXMLHttpRequest {
+  static instances: MockXMLHttpRequest[] = [];
+
+  upload: { onprogress: XhrProgressHandler } = { onprogress: null };
+  onload: XhrProgressHandler = null;
+  onerror: XhrProgressHandler = null;
+  onabort: XhrProgressHandler = null;
+  onprogress: XhrProgressHandler = null;
+  method = "";
+  url = "";
+  headers = new Map<string, string>();
+  body: XMLHttpRequestBodyInit | null = null;
+  status = 0;
+  responseText = "";
+  responseType: XMLHttpRequestResponseType = "";
+
+  constructor() {
+    MockXMLHttpRequest.instances.push(this);
+  }
+
+  open(method: string, url: string) {
+    this.method = method;
+    this.url = url;
+  }
+
+  setRequestHeader(name: string, value: string) {
+    this.headers.set(name.toLowerCase(), value);
+  }
+
+  send(body: XMLHttpRequestBodyInit | null = null) {
+    this.body = body;
+  }
+
+  abort() {
+    this.onabort?.({} as ProgressEvent);
+  }
+
+  emitUploadProgress(
+    loaded: number,
+    total: number,
+    lengthComputable = true,
+  ) {
+    this.upload.onprogress?.({
+      lengthComputable,
+      loaded,
+      total,
+    } as ProgressEvent);
+  }
+
+  appendResponse(chunk: string, status = 202) {
+    this.status = status;
+    this.responseText += chunk;
+    this.onprogress?.({} as ProgressEvent);
+  }
+
+  complete(status = 202) {
+    this.status = status;
+    this.onload?.({} as ProgressEvent);
+  }
+
+  respond(status: number, responseText: string) {
+    this.status = status;
+    this.responseText = responseText;
+    this.onload?.({} as ProgressEvent);
+  }
 }
 
 describe("AudioApiClient.updateDiarizationRecord", () => {
@@ -539,6 +635,172 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
         }),
       }),
     );
+  });
+
+  it("uses XHR for progress-enabled diarization file uploads", async () => {
+    MockXMLHttpRequest.instances = [];
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+    const onUploadProgress = vi.fn();
+    const file = new File(["0123456789"], "meeting.mp3", {
+      type: "audio/mpeg",
+    });
+
+    const promise = client.createDiarizationRecord(
+      {
+        audio_file: file,
+        audio_filename: file.name,
+        model_id: "diar_streaming_sortformer_4spk-v2.1",
+        asr_model_id: "Whisper-Large-v3-Turbo",
+        aligner_model_id: "Qwen3-ForcedAligner-0.6B",
+        min_speakers: 1,
+        max_speakers: 4,
+      },
+      { onUploadProgress },
+    );
+
+    const xhr = MockXMLHttpRequest.instances[0]!;
+    expect(xhr.method).toBe("POST");
+    expect(xhr.url).toBe(
+      "http://localhost/v1/speech-to-text/jobs?job_kind=diarization",
+    );
+    expect(xhr.headers.has("content-type")).toBe(false);
+    expect(xhr.body).toBeInstanceOf(FormData);
+
+    const form = xhr.body as FormData;
+    const uploadedFile = form.get("file") as File;
+    expect(uploadedFile.name).toBe("meeting.mp3");
+    expect(uploadedFile.type).toBe("audio/mpeg");
+    await expect(uploadedFile.text()).resolves.toBe("0123456789");
+    expect(form.get("model")).toBe("diar_streaming_sortformer_4spk-v2.1");
+    expect(form.get("asr_model")).toBe("Whisper-Large-v3-Turbo");
+    expect(form.get("aligner_model")).toBe("Qwen3-ForcedAligner-0.6B");
+    expect(form.get("enable_llm_refinement")).toBe("true");
+
+    xhr.emitUploadProgress(5, 10);
+    xhr.respond(
+      202,
+      JSON.stringify({
+        ...updatedRecord,
+        kind: "diarization",
+      }),
+    );
+
+    await expect(promise).resolves.toEqual(updatedRecord);
+    expect(onUploadProgress).toHaveBeenCalledWith({
+      loadedBytes: 5,
+      totalBytes: 10,
+      percent: 50,
+      lengthComputable: true,
+    });
+  });
+
+  it("preserves JSON error messages from progress-enabled uploads", async () => {
+    MockXMLHttpRequest.instances = [];
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+    const promise = client.createDiarizationRecord(
+      {
+        audio_file: new File(["audio"], "large.mp3", {
+          type: "audio/mpeg",
+        }),
+        audio_filename: "large.mp3",
+      },
+      { onUploadProgress: vi.fn() },
+    );
+
+    MockXMLHttpRequest.instances[0]!.respond(
+      413,
+      JSON.stringify({
+        error: {
+          message: "Uploaded audio is too large for this server.",
+        },
+      }),
+    );
+
+    await expect(promise).rejects.toThrow(
+      "Uploaded audio is too large for this server.",
+    );
+  });
+
+  it("aborts progress-enabled upload requests", async () => {
+    MockXMLHttpRequest.instances = [];
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+    const abortController = new AbortController();
+    const promise = client.createDiarizationRecord(
+      {
+        audio_file: new File(["audio"], "meeting.wav", {
+          type: "audio/wav",
+        }),
+        audio_filename: "meeting.wav",
+      },
+      {
+        signal: abortController.signal,
+        onUploadProgress: vi.fn(),
+      },
+    );
+
+    abortController.abort();
+
+    await expect(promise).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("streams transcription creation over XHR when upload progress is requested", async () => {
+    MockXMLHttpRequest.instances = [];
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+    const onUploadProgress = vi.fn();
+    const onCreated = vi.fn();
+    const onDelta = vi.fn();
+    const onDone = vi.fn();
+
+    client.createTranscriptionRecordStream(
+      {
+        audio_file: new File(["audio"], "stream.wav", {
+          type: "audio/wav",
+        }),
+        audio_filename: "stream.wav",
+        model_id: "Parakeet-TDT-0.6B-v3",
+      },
+      {
+        onUploadProgress,
+        onCreated,
+        onDelta,
+        onDone,
+      },
+    );
+
+    const xhr = MockXMLHttpRequest.instances[0]!;
+    expect(xhr.url).toBe(
+      "http://localhost/v1/speech-to-text/jobs?job_kind=transcription",
+    );
+    xhr.emitUploadProgress(4, 8);
+    xhr.appendResponse(
+      `data: ${JSON.stringify({
+        event: "created",
+        record: createdTranscriptionRecord,
+      })}\n\n`,
+    );
+    xhr.appendResponse(
+      `data: ${JSON.stringify({ event: "delta", delta: "Hello" })}\n\n`,
+    );
+    xhr.appendResponse(`data: ${JSON.stringify({ event: "done" })}\n\n`);
+    xhr.complete();
+
+    expect(onUploadProgress).toHaveBeenCalledWith({
+      loadedBytes: 4,
+      totalBytes: 8,
+      percent: 50,
+      lengthComputable: true,
+    });
+    expect(onCreated).toHaveBeenCalledWith(createdTranscriptionRecord);
+    expect(onDelta).toHaveBeenCalledWith("Hello");
+    expect(onDone).toHaveBeenCalledTimes(1);
   });
 
   it("builds unified speech text audio urls with kind filters", () => {

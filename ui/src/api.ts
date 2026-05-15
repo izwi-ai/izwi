@@ -89,6 +89,8 @@ export type {
   TranscriptionRecordStreamCallbacks,
   TranscriptionRecordSummary,
   TranscriptionWord,
+  UploadProgressInfo,
+  SpeechTextJobUploadOptions,
 } from "@/shared/api/audio";
 
 export type {

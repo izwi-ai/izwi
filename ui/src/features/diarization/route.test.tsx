@@ -395,6 +395,10 @@ describe("DiarizationPage routes", () => {
       expect.objectContaining({
         audio_filename: "meeting.wav",
       }),
+      expect.objectContaining({
+        onUploadProgress: expect.any(Function),
+        signal: expect.any(AbortSignal),
+      }),
     );
     await waitFor(() =>
       expect(apiMocks.getDiarizationRecord).toHaveBeenCalledWith("diar-1"),
@@ -421,6 +425,75 @@ describe("DiarizationPage routes", () => {
       await screen.findByText(
         "Board sync covered runway, launch timing, and next hiring steps.",
       ),
+    ).toBeInTheDocument();
+  });
+
+  it("shows selected diarization file details and upload progress before navigation", async () => {
+    let resolveCreate:
+      | ((record: typeof fullRecord) => void)
+      | null = null;
+    apiMocks.createDiarizationRecord.mockImplementationOnce(
+      (_request, options) => {
+        options.onUploadProgress?.({
+          loadedBytes: 6,
+          totalBytes: 12,
+          percent: 50,
+          lengthComputable: true,
+        });
+        return new Promise<typeof fullRecord>((resolve) => {
+          resolveCreate = resolve;
+        });
+      },
+    );
+    apiMocks.getDiarizationRecord.mockResolvedValue(fullRecord);
+
+    renderRoute("/diarization");
+
+    await waitFor(() =>
+      expect(apiMocks.listDiarizationRecords).toHaveBeenCalledTimes(1),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
+    expect(
+      await screen.findByRole("heading", { name: "New diarization" }),
+    ).toBeInTheDocument();
+
+    const fileInput = document.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement | null;
+    expect(fileInput).not.toBeNull();
+
+    fireEvent.change(fileInput!, {
+      target: {
+        files: [
+          new File(["012345678901"], "meeting.mp3", {
+            type: "audio/mpeg",
+          }),
+        ],
+      },
+    });
+
+    expect(await screen.findByText("meeting.mp3")).toBeInTheDocument();
+    expect(screen.getByText("MP3")).toBeInTheDocument();
+    expect(screen.getByText("12 B")).toBeInTheDocument();
+    expect(screen.getByText("Uploading audio")).toBeInTheDocument();
+    expect(screen.getByText("50%")).toBeInTheDocument();
+    expect(apiMocks.createDiarizationRecord).toHaveBeenCalledWith(
+      expect.objectContaining({
+        audio_filename: "meeting.mp3",
+      }),
+      expect.objectContaining({
+        onUploadProgress: expect.any(Function),
+        signal: expect.any(AbortSignal),
+      }),
+    );
+
+    await act(async () => {
+      resolveCreate?.(fullRecord);
+    });
+
+    expect(
+      await screen.findByRole("heading", { name: "Diarization Record" }),
     ).toBeInTheDocument();
   });
 

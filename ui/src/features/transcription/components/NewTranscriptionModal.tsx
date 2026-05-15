@@ -16,6 +16,8 @@ import {
   resolveSourceAudioFilename,
   resolveSpeechTextUploadFilename,
 } from "@/shared/audioUpload";
+import type { UploadProgressInfo } from "@/shared/api/audio";
+import { isAbortError } from "@/shared/api/http";
 import {
   Select,
   SelectContent,
@@ -25,6 +27,13 @@ import {
 } from "@/components/ui/select";
 import type { SpeechTextCreationMode } from "@/features/speech-text/creationMode";
 import { SpeechTextModeSwitch } from "@/features/speech-text/components/SpeechTextModeSwitch";
+import { SpeechTextUploadProgress } from "@/features/speech-text/components/SpeechTextUploadProgress";
+import {
+  clampUploadPercent,
+  createSpeechTextUploadState,
+  createUploadAbortError,
+  type SpeechTextUploadState,
+} from "@/features/speech-text/uploadProgress";
 
 interface NewTranscriptionModalProps {
   isOpen: boolean;
@@ -83,6 +92,7 @@ export function NewTranscriptionModal({
   onStreamingDone,
 }: NewTranscriptionModalProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const uploadAbortRef = useRef<AbortController | null>(null);
 
   const [selectedLanguage, setSelectedLanguage] = useState("English");
   const [includeTimestamps, setIncludeTimestamps] = useState(false);
@@ -90,6 +100,42 @@ export function NewTranscriptionModal({
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [uploadState, setUploadState] =
+    useState<SpeechTextUploadState | null>(null);
+
+  const updateUploadProgress = useCallback((progress: UploadProgressInfo) => {
+    setUploadState((current) => {
+      if (!current || current.phase === "accepted" || current.phase === "opening") {
+        return current;
+      }
+
+      return {
+        ...current,
+        phase: "uploading",
+        loadedBytes: progress.loadedBytes,
+        totalBytes: progress.totalBytes ?? current.totalBytes,
+        percent:
+          progress.percent === null
+            ? null
+            : clampUploadPercent(progress.percent),
+      };
+    });
+  }, []);
+
+  const handleCancelUpload = useCallback(() => {
+    uploadAbortRef.current?.abort();
+    uploadAbortRef.current = null;
+    setUploadState((current) =>
+      current
+        ? {
+            ...current,
+            phase: "cancelled",
+            errorMessage: undefined,
+          }
+        : current,
+    );
+    setIsSubmitting(false);
+  }, []);
 
   const requireReadyModel = useCallback(() => {
     if (!selectedModel || !selectedModelReady) {
@@ -156,16 +202,30 @@ export function NewTranscriptionModal({
       setIsSubmitting(true);
       setIsDraggingFile(false);
       setError(null);
+      uploadAbortRef.current = null;
 
       try {
+        const uploadController = new AbortController();
+        uploadAbortRef.current = uploadController;
         const sourceFileName =
-          options.filename?.trim() || resolveSourceAudioFilename(audioBlob);
+          options.filename?.trim() ||
+          resolveSourceAudioFilename(audioBlob) ||
+          "audio";
+        setUploadState(
+          createSpeechTextUploadState(audioBlob, sourceFileName, "preparing"),
+        );
         const uploadedBlob = await prepareSpeechTextUploadBlob(audioBlob, 16000);
+        if (uploadController.signal.aborted) {
+          throw createUploadAbortError();
+        }
         const uploadFilename = resolveSpeechTextUploadFilename({
           sourceFileName,
           sourceBlob: audioBlob,
           uploadedBlob,
         });
+        setUploadState(
+          createSpeechTextUploadState(uploadedBlob, uploadFilename, "uploading"),
+        );
         const request = {
           audio_file: uploadedBlob,
           audio_filename: uploadFilename,
@@ -179,8 +239,17 @@ export function NewTranscriptionModal({
         const record = streamingEnabled
           ? await new Promise<TranscriptionRecord>((resolve, reject) => {
               let settled = false;
+              let streamController: AbortController | null = null;
+              const rejectIfAborted = () => {
+                if (settled) {
+                  return;
+                }
+                settled = true;
+                reject(createUploadAbortError());
+              };
 
-              api.createTranscriptionRecordStream(request, {
+              streamController = api.createTranscriptionRecordStream(request, {
+                onUploadProgress: updateUploadProgress,
                 onStart: () => {
                   onStreamingStart?.();
                 },
@@ -210,6 +279,11 @@ export function NewTranscriptionModal({
                   if (settled) {
                     return;
                   }
+                  if (uploadAbortRef.current?.signal.aborted) {
+                    settled = true;
+                    reject(createUploadAbortError());
+                    return;
+                  }
                   settled = true;
                   reject(
                     new Error(
@@ -218,15 +292,66 @@ export function NewTranscriptionModal({
                   );
                 },
               });
+              uploadAbortRef.current = streamController;
+              streamController.signal.addEventListener("abort", rejectIfAborted, {
+                once: true,
+              });
             })
-          : await api.createTranscriptionRecord(request);
+          : await (() => {
+              return api.createTranscriptionRecord(request, {
+                signal: uploadController.signal,
+                onUploadProgress: updateUploadProgress,
+              });
+            })();
+        setUploadState((current) =>
+          current
+            ? {
+                ...current,
+                phase: "accepted",
+                loadedBytes: current.totalBytes ?? current.loadedBytes,
+                percent: 100,
+              }
+            : current,
+        );
+        setUploadState((current) =>
+          current
+            ? {
+                ...current,
+                phase: "opening",
+              }
+            : current,
+        );
         await onCreated(record);
         onClose();
       } catch (err) {
-        setError(
-          err instanceof Error ? err.message : "Failed to create transcription.",
-        );
+        if (isAbortError(err)) {
+          setUploadState((current) =>
+            current
+              ? {
+                  ...current,
+                  phase: "cancelled",
+                  errorMessage: undefined,
+                }
+              : current,
+          );
+        } else {
+          const message =
+            err instanceof Error
+              ? err.message
+              : "Failed to create transcription.";
+          setError(message);
+          setUploadState((current) =>
+            current
+              ? {
+                  ...current,
+                  phase: "failed",
+                  errorMessage: message,
+                }
+              : current,
+          );
+        }
       } finally {
+        uploadAbortRef.current = null;
         setIsSubmitting(false);
       }
     },
@@ -245,6 +370,7 @@ export function NewTranscriptionModal({
       selectedModel,
       streamingEnabled,
       timestampAlignerModelId,
+      updateUploadProgress,
     ],
   );
 
@@ -346,6 +472,15 @@ export function NewTranscriptionModal({
     timestampAlignerReady,
   ]);
 
+  const submissionStatusLabel =
+    uploadState?.phase === "preparing"
+      ? "Preparing"
+      : uploadState?.phase === "uploading"
+        ? "Uploading"
+        : uploadState?.phase === "accepted" || uploadState?.phase === "opening"
+          ? "Opening job"
+          : "Creating job";
+
   const modalBody = (
     <>
       <div className="border-b border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-5 py-5 sm:px-6">
@@ -379,7 +514,7 @@ export function NewTranscriptionModal({
             {isSubmitting ? (
               <div className="inline-flex items-center gap-2 rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)]">
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                Creating job
+                {submissionStatusLabel}
               </div>
             ) : null}
           </div>
@@ -432,6 +567,20 @@ export function NewTranscriptionModal({
                 onChange={(event) => void handleFileUpload(event)}
               />
             </button>
+
+            {uploadState ? (
+              <div className="mt-3">
+                <SpeechTextUploadProgress
+                  {...uploadState}
+                  canCancel={
+                    isSubmitting &&
+                    (uploadState.phase === "preparing" ||
+                      uploadState.phase === "uploading")
+                  }
+                  onCancel={handleCancelUpload}
+                />
+              </div>
+            ) : null}
 
             <div className="mt-3">
               <div className="flex rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] px-3.5 py-3 text-[13px] leading-5 text-[var(--text-muted)]">
@@ -589,21 +738,28 @@ export function NewTranscriptionModal({
   }
 
   return (
-    <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
+    <Dialog
+      open={isOpen}
+      onOpenChange={(open) => {
+        if (!open && !isSubmitting) {
+          onClose();
+        }
+      }}
+    >
       <DialogContent
         className="max-w-[46rem] overflow-hidden border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0"
         onEscapeKeyDown={(event) => {
-          if (blockOutsideDismiss) {
+          if (blockOutsideDismiss || isSubmitting) {
             event.preventDefault();
           }
         }}
         onPointerDownOutside={(event) => {
-          if (blockOutsideDismiss) {
+          if (blockOutsideDismiss || isSubmitting) {
             event.preventDefault();
           }
         }}
         onInteractOutside={(event) => {
-          if (blockOutsideDismiss) {
+          if (blockOutsideDismiss || isSubmitting) {
             event.preventDefault();
           }
         }}
