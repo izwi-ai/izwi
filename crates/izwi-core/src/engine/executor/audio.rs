@@ -1,6 +1,6 @@
 use izwi_asr_toolkit::{
-    AsrLongFormConfig, AsrSpeechChunkConfig, AudioChunk, SpeechChunkPlan, TranscriptAssembler,
-    plan_audio_chunks, plan_speech_audio_chunks,
+    plan_audio_chunks, plan_speech_audio_chunks, AsrLongFormConfig, AsrSpeechChunkConfig,
+    AudioChunk, SpeechChunkPlan, TranscriptAssembler,
 };
 use serde_json::json;
 use std::time::Instant;
@@ -56,6 +56,11 @@ pub(super) struct AsrChunkTranscription {
 pub(super) struct ChunkedAsrTranscription {
     pub(super) text: String,
     pub(super) chunk_diagnostics: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct AsrChunkStreamOptions {
+    pub(super) stable_text_holdback_chars: usize,
 }
 
 impl PlannedAsrChunks {
@@ -190,6 +195,26 @@ impl NativeExecutor {
                 _ => None,
             }
         })
+    }
+
+    pub(super) fn env_usize(key: &str) -> Option<usize> {
+        std::env::var(key)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+    }
+
+    pub(super) fn qwen_asr_chunk_stream_options() -> AsrChunkStreamOptions {
+        let rollback_tokens = Self::env_usize("IZWI_QWEN_ASR_STREAM_ROLLBACK_TOKENS")
+            .unwrap_or(5)
+            .min(32);
+        let chars_per_token = Self::env_usize("IZWI_QWEN_ASR_STREAM_CHARS_PER_TOKEN")
+            .unwrap_or(4)
+            .clamp(1, 12);
+        let stable_text_holdback_chars = Self::env_usize("IZWI_QWEN_ASR_STREAM_HOLDBACK_CHARS")
+            .unwrap_or_else(|| rollback_tokens.saturating_mul(chars_per_token));
+        AsrChunkStreamOptions {
+            stable_text_holdback_chars,
+        }
     }
 
     pub(super) fn asr_long_form_config() -> AsrLongFormConfig {
@@ -460,6 +485,35 @@ impl NativeExecutor {
         sample_rate: u32,
         chunk_plan: &[AudioChunk],
         chunk_cfg: &AsrLongFormConfig,
+        transcribe_chunk: F,
+    ) -> Result<ChunkedAsrTranscription>
+    where
+        F: FnMut(&[f32], u32) -> Result<AsrChunkTranscription>,
+    {
+        Self::transcribe_with_chunk_plan_with_details_and_options(
+            request_id,
+            stream_tx,
+            stream_policy,
+            sequence,
+            samples,
+            sample_rate,
+            chunk_plan,
+            chunk_cfg,
+            AsrChunkStreamOptions::default(),
+            transcribe_chunk,
+        )
+    }
+
+    pub(super) fn transcribe_with_chunk_plan_with_details_and_options<F>(
+        request_id: &str,
+        stream_tx: Option<&mpsc::Sender<StreamingOutput>>,
+        stream_policy: EngineStreamPolicy,
+        sequence: &mut usize,
+        samples: &[f32],
+        sample_rate: u32,
+        chunk_plan: &[AudioChunk],
+        chunk_cfg: &AsrLongFormConfig,
+        stream_options: AsrChunkStreamOptions,
         mut transcribe_chunk: F,
     ) -> Result<ChunkedAsrTranscription>
     where
@@ -484,6 +538,9 @@ impl NativeExecutor {
 
         let mut assembler = TranscriptAssembler::new(chunk_cfg.clone());
         let mut deferred_boundary_delta = String::new();
+        let mut emitted_stream_chars = 0usize;
+        let stable_text_streaming =
+            stream_tx.is_some() && stream_options.stable_text_holdback_chars > 0;
         let mut chunk_diagnostics = Vec::new();
         for (idx, chunk) in chunk_plan.iter().enumerate() {
             if chunk.end_sample <= chunk.start_sample || chunk.end_sample > samples.len() {
@@ -503,22 +560,45 @@ impl NativeExecutor {
             let chunk_audio = &samples[chunk.start_sample..chunk.end_sample];
             let chunk_started = Instant::now();
             let chunk_result = transcribe_chunk(chunk_audio, sample_rate)?;
+            let chunk_text = chunk_result.text.clone();
             let transcribe_ms = chunk_started.elapsed().as_secs_f64() * 1000.0;
             chunk_diagnostics.push(Self::chunk_transcription_diagnostics(
                 idx,
                 chunk,
                 sample_rate,
                 transcribe_ms,
-                &chunk_result.text,
+                &chunk_text,
                 chunk_result.diagnostics,
             ));
-            let mut delta = assembler.push_chunk_text(&chunk_result.text);
+            let mut delta = assembler.push_chunk_text(&chunk_text);
+            let is_last_chunk = idx + 1 == chunk_plan.len();
+
+            if stable_text_streaming {
+                if let Some(tx) = stream_tx {
+                    let stable_delta = Self::next_text_delta_stable(
+                        assembler.text(),
+                        &mut emitted_stream_chars,
+                        stream_options.stable_text_holdback_chars,
+                        is_last_chunk,
+                    );
+                    if !stable_delta.is_empty() {
+                        Self::stream_text_with_policy(
+                            tx,
+                            stream_policy,
+                            request_id,
+                            sequence,
+                            stable_delta,
+                        )?;
+                    }
+                }
+                continue;
+            }
+
             if !deferred_boundary_delta.is_empty() {
                 deferred_boundary_delta.push_str(&delta);
                 delta = std::mem::take(&mut deferred_boundary_delta);
             }
 
-            let is_last_chunk = idx + 1 == chunk_plan.len();
             if !is_last_chunk && is_boundary_noise_delta(&delta) {
                 deferred_boundary_delta.push_str(&delta);
                 continue;
@@ -527,6 +607,26 @@ impl NativeExecutor {
             if !delta.is_empty() {
                 if let Some(tx) = stream_tx {
                     Self::stream_text_with_policy(tx, stream_policy, request_id, sequence, delta)?;
+                }
+            }
+        }
+
+        if stable_text_streaming {
+            if let Some(tx) = stream_tx {
+                let final_delta = Self::next_text_delta_stable(
+                    assembler.text(),
+                    &mut emitted_stream_chars,
+                    0,
+                    true,
+                );
+                if !final_delta.is_empty() {
+                    Self::stream_text_with_policy(
+                        tx,
+                        stream_policy,
+                        request_id,
+                        sequence,
+                        final_delta,
+                    )?;
                 }
             }
         }
@@ -605,6 +705,39 @@ impl NativeExecutor {
         *emitted_samples = stable_end;
         delta
     }
+
+    pub(super) fn next_text_delta_stable(
+        all_text: &str,
+        emitted_chars: &mut usize,
+        holdback_chars: usize,
+        is_final: bool,
+    ) -> String {
+        let total_chars = all_text.chars().count();
+        let stable_end = if is_final {
+            total_chars
+        } else {
+            total_chars.saturating_sub(holdback_chars)
+        };
+        let start = (*emitted_chars).min(stable_end);
+        if start >= stable_end {
+            return String::new();
+        }
+
+        let start_byte = char_to_byte_index(all_text, start);
+        let end_byte = char_to_byte_index(all_text, stable_end);
+        *emitted_chars = stable_end;
+        all_text[start_byte..end_byte].to_string()
+    }
+}
+
+fn char_to_byte_index(text: &str, char_idx: usize) -> usize {
+    if char_idx == 0 {
+        return 0;
+    }
+    text.char_indices()
+        .nth(char_idx)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len())
 }
 
 pub(super) fn decode_audio_base64_with_rate(audio_b64: &str) -> Result<(Vec<f32>, u32)> {
@@ -687,6 +820,38 @@ mod tests {
         let delta = NativeExecutor::next_audio_delta_stable(&all, &mut emitted, 8, false);
         assert!(delta.is_empty());
         assert_eq!(emitted, 0);
+    }
+
+    #[test]
+    fn next_text_delta_stable_holds_back_unstable_tail() {
+        let mut emitted = 0usize;
+
+        let first = NativeExecutor::next_text_delta_stable("hello world", &mut emitted, 5, false);
+        assert_eq!(first, "hello ");
+        assert_eq!(emitted, 6);
+
+        let second =
+            NativeExecutor::next_text_delta_stable("hello world again", &mut emitted, 5, false);
+        assert_eq!(second, "world ");
+        assert_eq!(emitted, 12);
+
+        let final_delta =
+            NativeExecutor::next_text_delta_stable("hello world again", &mut emitted, 5, true);
+        assert_eq!(final_delta, "again");
+        assert_eq!(emitted, 17);
+    }
+
+    #[test]
+    fn next_text_delta_stable_respects_utf8_boundaries() {
+        let mut emitted = 0usize;
+        let first = NativeExecutor::next_text_delta_stable("héllo 世界", &mut emitted, 2, false);
+        assert_eq!(first, "héllo ");
+        assert_eq!(emitted, 6);
+
+        let final_delta =
+            NativeExecutor::next_text_delta_stable("héllo 世界", &mut emitted, 2, true);
+        assert_eq!(final_delta, "世界");
+        assert_eq!(emitted, 8);
     }
 
     #[test]
@@ -831,12 +996,10 @@ mod tests {
             .and_then(|value| value.as_object())
             .expect("chunking diagnostics");
 
-        assert!(
-            chunking
-                .get("planning_ms")
-                .and_then(|v| v.as_f64())
-                .is_some()
-        );
+        assert!(chunking
+            .get("planning_ms")
+            .and_then(|v| v.as_f64())
+            .is_some());
         let speech = chunking
             .get("speech")
             .and_then(|value| value.as_object())
@@ -937,12 +1100,10 @@ mod tests {
                 .and_then(|value| value.as_u64()),
             Some(0)
         );
-        assert!(
-            merged.chunk_diagnostics[0]
-                .get("transcribe_ms")
-                .and_then(|value| value.as_f64())
-                .is_some()
-        );
+        assert!(merged.chunk_diagnostics[0]
+            .get("transcribe_ms")
+            .and_then(|value| value.as_f64())
+            .is_some());
     }
 
     #[test]

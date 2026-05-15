@@ -63,8 +63,13 @@ impl NativeExecutor {
                         );
                         if chunk_plan.requires_chunk_path() {
                             let mut sequence = 0usize;
+                            let chunk_stream_options = if matches!(family, ModelFamily::Qwen3Asr) {
+                                Self::qwen_asr_chunk_stream_options()
+                            } else {
+                                Default::default()
+                            };
                             let chunked = Self::run_blocking(|| {
-                                Self::transcribe_with_chunk_plan_with_details(
+                                Self::transcribe_with_chunk_plan_with_details_and_options(
                                     &request.id,
                                     Some(tx),
                                     stream_policy,
@@ -73,6 +78,7 @@ impl NativeExecutor {
                                     sample_rate,
                                     &chunk_plan.chunks,
                                     &chunk_plan.config,
+                                    chunk_stream_options,
                                     |chunk_audio, sr| {
                                         let details = model.transcribe_with_details_and_prompt(
                                             chunk_audio,
