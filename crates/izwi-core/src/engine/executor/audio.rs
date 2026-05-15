@@ -146,6 +146,18 @@ impl PlannedAsrChunks {
                 "sample_rate": self.sample_rate,
                 "audio_seconds": audio_secs,
                 "planning_ms": self.planning_ms,
+                "config": {
+                    "target_chunk_seconds": self.config.target_chunk_secs,
+                    "hard_max_chunk_seconds": self.config.hard_max_chunk_secs,
+                    "overlap_seconds": self.config.overlap_secs,
+                    "silence_search_seconds": self.config.silence_search_secs,
+                    "min_chunk_seconds": self.config.min_chunk_secs,
+                    "analysis_frame_ms": self.config.analysis_frame_ms,
+                    "min_word_overlap": self.config.min_word_overlap,
+                    "max_word_overlap": self.config.max_word_overlap,
+                    "min_context_replay_words": self.config.min_context_replay_words,
+                    "max_context_replay_words": self.config.max_context_replay_words,
+                },
                 "chunks": chunks,
                 "speech": speech,
             }
@@ -1000,6 +1012,16 @@ mod tests {
             .get("planning_ms")
             .and_then(|v| v.as_f64())
             .is_some());
+        let config = chunking
+            .get("config")
+            .and_then(|value| value.as_object())
+            .expect("chunk config diagnostics");
+        assert_eq!(
+            config
+                .get("min_context_replay_words")
+                .and_then(|value| value.as_u64()),
+            Some(8)
+        );
         let speech = chunking
             .get("speech")
             .and_then(|value| value.as_object())

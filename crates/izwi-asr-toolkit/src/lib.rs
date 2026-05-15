@@ -25,6 +25,11 @@ pub struct AsrLongFormConfig {
     pub min_word_overlap: usize,
     /// Maximum overlap tokens to compare while deduping.
     pub max_word_overlap: usize,
+    /// Minimum replayed context words required before trimming a long repeated
+    /// prefix from a later chunk.
+    pub min_context_replay_words: usize,
+    /// Maximum replayed context words to compare when trimming a later chunk.
+    pub max_context_replay_words: usize,
     /// Maximum consecutive repeat count per character in chunk cleanup.
     pub max_repeated_chars: usize,
 }
@@ -42,6 +47,8 @@ impl Default for AsrLongFormConfig {
             silence_energy_scale: 2.5,
             min_word_overlap: 3,
             max_word_overlap: 24,
+            min_context_replay_words: 8,
+            max_context_replay_words: 120,
             max_repeated_chars: 8,
         }
     }
@@ -622,6 +629,16 @@ impl TranscriptAssembler {
                 dedupe_overlap_char_boundary(&self.merged, &cleaned, 14, 120).unwrap_or(0);
         }
 
+        if delta_start == 0 {
+            delta_start = dedupe_overlap_word_boundary(
+                &self.merged,
+                &cleaned,
+                self.config.min_context_replay_words,
+                self.config.max_context_replay_words,
+            )
+            .unwrap_or(0);
+        }
+
         if delta_start >= cleaned.len() {
             return String::new();
         }
@@ -1092,6 +1109,44 @@ mod tests {
         assert_eq!(
             assembler.text(),
             "hello world this is a test of chunk stitching"
+        );
+    }
+
+    #[test]
+    fn assembler_trims_long_replayed_context_prefix() {
+        let mut cfg = AsrLongFormConfig::default();
+        cfg.max_word_overlap = 3;
+        cfg.min_context_replay_words = 6;
+        cfg.max_context_replay_words = 32;
+        let mut assembler = TranscriptAssembler::new(cfg);
+
+        let first = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu";
+        let replayed = "eta theta iota kappa lambda mu new words arrive";
+        let d1 = assembler.push_chunk_text(first);
+        let d2 = assembler.push_chunk_text(replayed);
+
+        assert_eq!(d1, first);
+        assert_eq!(d2, " new words arrive");
+        assert_eq!(
+            assembler.text(),
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu new words arrive"
+        );
+    }
+
+    #[test]
+    fn assembler_does_not_trim_short_repeated_phrase_as_context_replay() {
+        let mut cfg = AsrLongFormConfig::default();
+        cfg.max_word_overlap = 2;
+        cfg.min_context_replay_words = 6;
+        let mut assembler = TranscriptAssembler::new(cfg);
+
+        assembler.push_chunk_text("call and response happens here");
+        let delta = assembler.push_chunk_text("happens here happens again");
+
+        assert_eq!(delta, " happens here happens again");
+        assert_eq!(
+            assembler.text(),
+            "call and response happens here happens here happens again"
         );
     }
 
