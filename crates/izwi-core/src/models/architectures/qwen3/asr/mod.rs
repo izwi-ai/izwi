@@ -452,9 +452,8 @@ impl Qwen3AsrModel {
         language: Option<&str>,
         system_prompt: Option<&str>,
     ) -> Result<String> {
-        let mut no_op = |_delta: &str| {};
         Ok(self
-            .transcribe_impl(audio, sample_rate, language, system_prompt, &mut no_op)?
+            .transcribe_impl(audio, sample_rate, language, system_prompt, None)?
             .text)
     }
 
@@ -474,8 +473,7 @@ impl Qwen3AsrModel {
         language: Option<&str>,
         system_prompt: Option<&str>,
     ) -> Result<AsrTranscriptionOutput> {
-        let mut no_op = |_delta: &str| {};
-        self.transcribe_impl(audio, sample_rate, language, system_prompt, &mut no_op)
+        self.transcribe_impl(audio, sample_rate, language, system_prompt, None)
     }
 
     /// Upper-bound hint for chunk sizing in long-form ASR orchestration.
@@ -510,7 +508,7 @@ impl Qwen3AsrModel {
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<String> {
         Ok(self
-            .transcribe_impl(audio, sample_rate, language, system_prompt, on_delta)?
+            .transcribe_impl(audio, sample_rate, language, system_prompt, Some(on_delta))?
             .text)
     }
 
@@ -520,7 +518,7 @@ impl Qwen3AsrModel {
         sample_rate: u32,
         language: Option<&str>,
         system_prompt: Option<&str>,
-        on_delta: &mut dyn FnMut(&str),
+        mut on_delta: Option<&mut dyn FnMut(&str)>,
     ) -> Result<AsrTranscriptionOutput> {
         if self.is_forced_aligner {
             return Err(Error::InvalidInput(
@@ -537,11 +535,17 @@ impl Qwen3AsrModel {
         )?;
         let decode_started = Instant::now();
         loop {
-            let step = self.decode_step(&mut state)?;
+            let step = if on_delta.is_some() {
+                self.decode_step(&mut state)?
+            } else {
+                self.decode_step_without_delta(&mut state)?
+            };
             if !step.delta.is_empty() {
-                for ch in step.delta.chars() {
-                    let mut buf = [0u8; 4];
-                    on_delta(ch.encode_utf8(&mut buf));
+                if let Some(on_delta) = on_delta.as_deref_mut() {
+                    for ch in step.delta.chars() {
+                        let mut buf = [0u8; 4];
+                        on_delta(ch.encode_utf8(&mut buf));
+                    }
                 }
             }
             if step.finished {
@@ -735,6 +739,18 @@ impl Qwen3AsrModel {
     }
 
     pub fn decode_step(&self, state: &mut AsrDecodeState) -> Result<AsrDecodeStep> {
+        self.decode_step_inner(state, true)
+    }
+
+    fn decode_step_without_delta(&self, state: &mut AsrDecodeState) -> Result<AsrDecodeStep> {
+        self.decode_step_inner(state, false)
+    }
+
+    fn decode_step_inner(
+        &self,
+        state: &mut AsrDecodeState,
+        emit_delta: bool,
+    ) -> Result<AsrDecodeStep> {
         if state.finished || state.generated_ids.len() >= state.max_new_tokens {
             state.finished = true;
             self.refresh_full_decoded_text(state)?;
@@ -763,7 +779,11 @@ impl Qwen3AsrModel {
         if !is_special_generation_token(&self.specials, next) {
             state.visible_generated_ids.push(next);
         }
-        let delta = self.decode_incremental_delta(state)?;
+        let delta = if emit_delta {
+            self.decode_incremental_delta(state)?
+        } else {
+            String::new()
+        };
 
         let next_tensor = Tensor::from_vec(vec![next], (1, 1), &self.device.device)?;
         state.embeds = self
@@ -780,8 +800,10 @@ impl Qwen3AsrModel {
             delta,
             text: if state.finished {
                 self.finalized_text(state)
-            } else {
+            } else if emit_delta {
                 state.assembled.trim().to_string()
+            } else {
+                String::new()
             },
             tokens_generated: state.generated_ids.len(),
             finished: state.finished,
