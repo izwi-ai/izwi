@@ -311,11 +311,14 @@ impl NativeExecutor {
         samples: &[f32],
         sample_rate: u32,
         model_max_chunk_secs: Option<f32>,
-        streaming_low_latency: bool,
+        mut streaming_low_latency: bool,
         allow_speech_planner: bool,
         vad_chunking_enabled: bool,
     ) -> PlannedAsrChunks {
         let planning_started = Instant::now();
+        if allow_speech_planner {
+            streaming_low_latency = false;
+        }
         let audio_secs = if sample_rate > 0 {
             samples.len() as f32 / sample_rate as f32
         } else {
@@ -740,6 +743,25 @@ mod tests {
             "expected chunking beyond model hint, got {}",
             plan.chunks.len()
         );
+    }
+
+    #[test]
+    fn whisper_streaming_chunk_plan_keeps_standard_long_form_chunks() {
+        let sr = 16_000u32;
+        let samples = vec![0.0f32; (sr as usize) * 40];
+        let streaming = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true, true);
+        let standard = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), false, true);
+
+        assert_eq!(
+            streaming.config.target_chunk_secs,
+            standard.config.target_chunk_secs
+        );
+        assert_eq!(
+            streaming.config.hard_max_chunk_secs,
+            standard.config.hard_max_chunk_secs
+        );
+        assert_eq!(streaming.config.overlap_secs, standard.config.overlap_secs);
+        assert_eq!(streaming.chunks, standard.chunks);
     }
 
     #[test]

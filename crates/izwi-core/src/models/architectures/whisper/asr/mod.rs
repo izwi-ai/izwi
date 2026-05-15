@@ -899,11 +899,8 @@ impl WhisperTurboAsrModel {
 
         // Whisper encoder downsamples by 2 before positional embeddings.
         let max_input_frames = self.config.max_source_positions.saturating_mul(2).max(1);
-        if mel_spec.len() > max_input_frames {
-            mel_spec.truncate(max_input_frames);
-        }
-
         let n_mels = self.config.num_mel_bins;
+        pad_or_trim_mel_frames(&mut mel_spec, n_mels, max_input_frames);
         let frames = mel_spec.len();
         let mut flat = vec![0f32; frames * n_mels];
         for (frame_idx, frame) in mel_spec.iter().enumerate() {
@@ -1453,6 +1450,14 @@ fn trimmed_audio_bounds(
         return (0, audio.len());
     }
     (start, end)
+}
+
+fn pad_or_trim_mel_frames(mel_spec: &mut Vec<Vec<f32>>, n_mels: usize, target_frames: usize) {
+    if mel_spec.len() > target_frames {
+        mel_spec.truncate(target_frames);
+    } else if mel_spec.len() < target_frames {
+        mel_spec.resize_with(target_frames, || vec![0.0; n_mels]);
+    }
 }
 
 impl WhisperTurboAsrModel {
@@ -2499,10 +2504,11 @@ mod tests {
         contiguous_token_range, decode_retry_reasons, decode_step_budget,
         find_suffix_token_repetition, greedy_decode_step_from_masked_logits,
         has_low_word_diversity, logits_to_log_probs, logits_to_log_probs_in_place,
-        probability_for_token_from_logits, scaled_logsumexp, tensor_to_f32_vec1, text_delta,
-        token_contains_numeral_or_symbol, trimmed_audio_bounds, use_cuda_whisper_dtype_shim,
-        whisper_decode_profile_diagnostics, whisper_device_diagnostics, whisper_impl_name,
-        WhisperDecodeAttempt, WhisperDecodeProfile, WhisperSpecialTokens,
+        pad_or_trim_mel_frames, probability_for_token_from_logits, scaled_logsumexp,
+        tensor_to_f32_vec1, text_delta, token_contains_numeral_or_symbol, trimmed_audio_bounds,
+        use_cuda_whisper_dtype_shim, whisper_decode_profile_diagnostics,
+        whisper_device_diagnostics, whisper_impl_name, WhisperDecodeAttempt, WhisperDecodeProfile,
+        WhisperSpecialTokens,
     };
 
     #[test]
@@ -2548,6 +2554,20 @@ mod tests {
     fn whisper_impl_name_marks_cuda_dtype_shim_explicitly() {
         assert_eq!(whisper_impl_name(false), "local_whisper");
         assert_eq!(whisper_impl_name(true), "local_whisper_cuda_dtype_shim");
+    }
+
+    #[test]
+    fn whisper_mel_frames_pad_or_trim_to_model_window() {
+        let mut short = vec![vec![1.0, 2.0]];
+        pad_or_trim_mel_frames(&mut short, 2, 3);
+        assert_eq!(short.len(), 3);
+        assert_eq!(short[0], vec![1.0, 2.0]);
+        assert_eq!(short[1], vec![0.0, 0.0]);
+        assert_eq!(short[2], vec![0.0, 0.0]);
+
+        let mut long = vec![vec![1.0], vec![2.0], vec![3.0]];
+        pad_or_trim_mel_frames(&mut long, 1, 2);
+        assert_eq!(long, vec![vec![1.0], vec![2.0]]);
     }
 
     #[test]
