@@ -159,12 +159,12 @@ impl NativeExecutor {
                         final_text = step.text.clone();
 
                         if !step.delta.is_empty() {
-                            Self::stream_text_per_character_with_policy(
+                            Self::stream_text_with_policy(
                                 tx,
                                 stream_policy,
                                 &request.id,
                                 &mut active_state.stream_sequence,
-                                &step.delta,
+                                step.delta,
                             )?;
                         }
                         if step.finished {
@@ -274,12 +274,12 @@ impl NativeExecutor {
                         let mut stream_err: Option<Error> = None;
                         let mut emit = |delta: &str| {
                             if stream_err.is_none() {
-                                if let Err(err) = Self::stream_text_per_character_with_policy(
+                                if let Err(err) = Self::stream_text_with_policy(
                                     tx,
                                     stream_policy,
                                     &request.id,
                                     &mut sequence,
-                                    delta,
+                                    delta.to_string(),
                                 ) {
                                     stream_err = Some(err);
                                 }
@@ -355,12 +355,12 @@ impl NativeExecutor {
                     let mut stream_err: Option<Error> = None;
                     let mut emit = |delta: &str| {
                         if stream_err.is_none() {
-                            if let Err(err) = Self::stream_text_per_character_with_policy(
+                            if let Err(err) = Self::stream_text_with_policy(
                                 tx,
                                 stream_policy,
                                 &request.id,
                                 &mut sequence,
-                                delta,
+                                delta.to_string(),
                             ) {
                                 stream_err = Some(err);
                             }

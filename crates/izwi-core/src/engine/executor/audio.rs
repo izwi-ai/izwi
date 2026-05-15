@@ -526,25 +526,19 @@ impl NativeExecutor {
 
             if !delta.is_empty() {
                 if let Some(tx) = stream_tx {
-                    Self::stream_text_per_character_with_policy(
-                        tx,
-                        stream_policy,
-                        request_id,
-                        sequence,
-                        &delta,
-                    )?;
+                    Self::stream_text_with_policy(tx, stream_policy, request_id, sequence, delta)?;
                 }
             }
         }
 
         if !deferred_boundary_delta.is_empty() {
             if let Some(tx) = stream_tx {
-                Self::stream_text_per_character_with_policy(
+                Self::stream_text_with_policy(
                     tx,
                     stream_policy,
                     request_id,
                     sequence,
-                    &deferred_boundary_delta,
+                    deferred_boundary_delta,
                 )?;
             }
         }
@@ -1035,5 +1029,42 @@ mod tests {
         assert!(saw_final, "expected final marker");
         assert!(streamed.contains("hello"));
         assert!(streamed.contains("world"));
+    }
+
+    #[test]
+    fn chunk_streaming_batches_large_text_delta_to_avoid_queue_pressure() {
+        let sr = 16_000u32;
+        let samples = vec![0.0f32; sr as usize];
+        let chunk_plan = vec![AudioChunk {
+            start_sample: 0,
+            end_sample: samples.len(),
+        }];
+        let long_delta = "word ".repeat(1024);
+        let (tx, mut rx) = mpsc::channel(2);
+        let mut sequence = 0usize;
+
+        let merged = NativeExecutor::transcribe_with_chunk_plan(
+            "req-large-delta",
+            Some(&tx),
+            EngineStreamPolicy::FailOnFull,
+            &mut sequence,
+            &samples,
+            sr,
+            &chunk_plan,
+            &NativeExecutor::asr_long_form_config(),
+            |_chunk_audio, _sr| Ok(long_delta.clone()),
+        )
+        .expect("large chunk delta should fit as one streaming event");
+
+        assert_eq!(merged, long_delta.trim());
+        assert_eq!(sequence, 2);
+
+        let text_event = rx.try_recv().expect("text delta event");
+        assert_eq!(text_event.sequence, 0);
+        assert_eq!(text_event.text.as_deref(), Some(long_delta.trim()));
+
+        let final_event = rx.try_recv().expect("final marker");
+        assert_eq!(final_event.sequence, 1);
+        assert!(final_event.is_final);
     }
 }
