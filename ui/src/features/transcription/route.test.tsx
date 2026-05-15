@@ -868,6 +868,103 @@ describe("TranscriptionPage detail route", () => {
     ).toBeInTheDocument();
   });
 
+  it("shows selected transcription file details and upload progress before navigation", async () => {
+    const createdRecord = {
+      id: "txr-progress-1",
+      created_at: 1,
+      model_id: "Parakeet-TDT-0.6B-v3",
+      aligner_model_id: null,
+      language: "English",
+      processing_status: "processing" as const,
+      processing_error: null,
+      duration_secs: null,
+      processing_time_ms: 0,
+      rtf: null,
+      audio_mime_type: "audio/mpeg",
+      audio_filename: "Aliko Dangote.mp3",
+      transcription: "",
+      segments: [],
+      words: [],
+      summary_status: "not_requested" as const,
+      summary_model_id: null,
+      summary_text: null,
+      summary_error: null,
+      summary_updated_at: null,
+    };
+    let streamCallbacks:
+      | {
+          onCreated?: (record: typeof createdRecord) => void;
+          onUploadProgress?: (progress: {
+            loadedBytes: number;
+            totalBytes: number | null;
+            percent: number | null;
+            lengthComputable: boolean;
+          }) => void;
+        }
+      | undefined;
+
+    apiMocks.createTranscriptionRecordStream.mockImplementationOnce(
+      (_request, callbacks) => {
+        streamCallbacks = callbacks;
+        callbacks.onUploadProgress?.({
+          loadedBytes: 5,
+          totalBytes: 10,
+          percent: 50,
+          lengthComputable: true,
+        });
+        return new AbortController();
+      },
+    );
+    apiMocks.getTranscriptionRecord.mockResolvedValue(createdRecord);
+
+    renderRoute("/transcription");
+
+    await waitFor(() =>
+      expect(apiMocks.listTranscriptionRecords).toHaveBeenCalled(),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /New transcript/i }));
+
+    const fileInput = document.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement | null;
+    expect(fileInput).not.toBeNull();
+
+    fireEvent.change(fileInput!, {
+      target: {
+        files: [
+          new File(["0123456789"], "Aliko Dangote.mp3", {
+            type: "audio/mpeg",
+          }),
+        ],
+      },
+    });
+
+    expect(await screen.findByText("Aliko Dangote.mp3")).toBeInTheDocument();
+    expect(screen.getByText("MP3")).toBeInTheDocument();
+    expect(screen.getByText("10 B")).toBeInTheDocument();
+    expect(screen.getByText("Uploading audio")).toBeInTheDocument();
+    expect(screen.getByText("50%")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(apiMocks.createTranscriptionRecordStream).toHaveBeenCalledWith(
+        expect.objectContaining({
+          audio_filename: "Aliko Dangote.mp3",
+        }),
+        expect.objectContaining({
+          onUploadProgress: expect.any(Function),
+        }),
+      ),
+    );
+
+    await act(async () => {
+      streamCallbacks?.onCreated?.(createdRecord);
+    });
+
+    expect(
+      await screen.findByRole("heading", { name: "Transcription Record" }),
+    ).toBeInTheDocument();
+  });
+
   it("creates a diarization record when diarization mode is selected in the modal", async () => {
     apiMocks.getTranscriptionRecord.mockResolvedValue({
       id: "diar-created-1",
@@ -925,6 +1022,10 @@ describe("TranscriptionPage detail route", () => {
           asr_model_id: "Whisper-Large-v3-Turbo",
           aligner_model_id: "Qwen3-ForcedAligner-0.6B",
           llm_model_id: "Qwen3.5-4B",
+        }),
+        expect.objectContaining({
+          onUploadProgress: expect.any(Function),
+          signal: expect.any(AbortSignal),
         }),
       ),
     );
