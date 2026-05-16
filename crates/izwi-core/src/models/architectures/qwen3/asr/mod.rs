@@ -335,10 +335,9 @@ impl Qwen3AsrModel {
         };
         let mel = MelSpectrogram::new(mel_cfg)?;
 
-        // Quantized checkpoints are trained/evaluated in bf16 and can degrade
-        // badly when forced through fp32 dequant paths. Audio conditioning is
-        // especially sensitive to precision, so keep the audio tower in F32
-        // by default and select the text dtype with backend-aware rules.
+        // Quantized text checkpoints are trained/evaluated in bf16 and can
+        // degrade when forced through fp32 dequant paths. CUDA audio kernels are
+        // stricter around f32 boundaries, so select audio/text dtypes separately.
         let is_gguf = gguf_loader.is_some();
         let checkpoint_format = if is_gguf { "gguf" } else { "safetensors" };
         let is_quantized =
@@ -388,14 +387,14 @@ impl Qwen3AsrModel {
                     }
                     requested
                 }
-                _ => text_dtype,
+                _ => qwen3_asr_default_audio_dtype(device.kind, true, text_dtype),
             }
         } else {
             match audio_dtype_override.as_deref().map(str::trim) {
                 Some(raw) if !raw.is_empty() => {
                     device.select_model_dtype_checked(model_family, Some(raw), "Qwen ASR audio")?
                 }
-                _ => DType::F32,
+                _ => qwen3_asr_default_audio_dtype(device.kind, false, text_dtype),
             }
         };
 
@@ -1752,6 +1751,20 @@ fn select_quantized_text_dtype(
     }
 }
 
+fn qwen3_asr_default_audio_dtype(
+    device_kind: DeviceKind,
+    is_gguf: bool,
+    text_dtype: DType,
+) -> DType {
+    if is_gguf && device_kind.is_cuda() {
+        return DType::F32;
+    }
+    if is_gguf {
+        return text_dtype;
+    }
+    DType::F32
+}
+
 fn infer_lm_head_size_from_gguf(
     gguf_path: &Path,
     tensor_name: Option<&str>,
@@ -2833,6 +2846,34 @@ mod tests {
         assert_eq!(parse_asr_dtype(Some("fp16")), Some(DType::F16));
         assert_eq!(parse_asr_dtype(Some("float32")), Some(DType::F32));
         assert_eq!(parse_asr_dtype(Some("unknown")), None);
+    }
+
+    #[test]
+    fn qwen_asr_cuda_gguf_audio_defaults_to_f32() {
+        assert_eq!(
+            qwen3_asr_default_audio_dtype(DeviceKind::Cuda, true, DType::BF16),
+            DType::F32
+        );
+        assert_eq!(
+            qwen3_asr_default_audio_dtype(DeviceKind::Cuda, true, DType::F16),
+            DType::F32
+        );
+        assert_eq!(
+            qwen3_asr_default_audio_dtype(DeviceKind::Cuda, false, DType::BF16),
+            DType::F32
+        );
+    }
+
+    #[test]
+    fn qwen_asr_non_cuda_gguf_audio_policy_is_unchanged() {
+        assert_eq!(
+            qwen3_asr_default_audio_dtype(DeviceKind::Metal, true, DType::F16),
+            DType::F16
+        );
+        assert_eq!(
+            qwen3_asr_default_audio_dtype(DeviceKind::Cpu, true, DType::F32),
+            DType::F32
+        );
     }
 
     #[test]
