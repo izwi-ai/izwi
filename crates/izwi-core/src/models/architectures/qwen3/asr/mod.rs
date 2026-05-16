@@ -379,13 +379,28 @@ impl Qwen3AsrModel {
                 vb_audio.pp(tensor_prefix)
             };
             let audio_tower = AudioTower::load(audio_cfg, vb_audio.pp("audio_tower"))?;
-            let text_model = Qwen3Model::load_gguf_text(
-                text_cfg,
-                loader,
-                &device.device,
-                text_dtype,
-                tensor_prefix,
-            )?;
+            let text_model = if qwen3_asr_use_gguf_qmatmul_text(&device.device) {
+                Qwen3Model::load_gguf_text(
+                    text_cfg,
+                    loader,
+                    &device.device,
+                    text_dtype,
+                    tensor_prefix,
+                )?
+            } else {
+                let vb_text = var_builder_from_gguf_filtered(
+                    gguf_path,
+                    text_dtype,
+                    &device.device,
+                    |name| qwen3_asr_gguf_text_tensor_matches(name, tensor_prefix),
+                )?;
+                let vb_text = if tensor_prefix.is_empty() {
+                    vb_text
+                } else {
+                    vb_text.pp(tensor_prefix)
+                };
+                Qwen3Model::load(text_cfg, vb_text)?
+            };
             (audio_tower, text_model)
         } else {
             let (vb_text, vb_audio) =
@@ -1540,6 +1555,19 @@ fn qwen3_asr_gguf_audio_tensor_matches(name: &str, prefix: &str) -> bool {
     } else {
         name.starts_with(&format!("{prefix}.audio_tower."))
     }
+}
+
+fn qwen3_asr_gguf_text_tensor_matches(name: &str, prefix: &str) -> bool {
+    if prefix.is_empty() {
+        name.starts_with("model.") || name == "lm_head.weight"
+    } else {
+        name.starts_with(&format!("{prefix}.model.")) || name == format!("{prefix}.lm_head.weight")
+    }
+}
+
+fn qwen3_asr_use_gguf_qmatmul_text(device: &candle_core::Device) -> bool {
+    let default_enabled = !device.is_metal();
+    env_bool("IZWI_QWEN3_ASR_GGUF_QMATMUL_TEXT").unwrap_or(default_enabled)
 }
 
 fn preprocessor_config_from_gguf(loader: &GgufLoader) -> Result<PreprocessorConfig> {
@@ -2841,6 +2869,31 @@ mod tests {
         ));
         assert!(!qwen3_asr_gguf_audio_tensor_matches(
             "model.layers.0.self_attn.q_proj.weight",
+            ""
+        ));
+    }
+
+    #[test]
+    fn qwen_asr_gguf_text_tensor_filter_matches_prefix_style() {
+        assert!(qwen3_asr_gguf_text_tensor_matches(
+            "thinker.model.layers.0.self_attn.q_proj.weight",
+            "thinker"
+        ));
+        assert!(qwen3_asr_gguf_text_tensor_matches(
+            "thinker.lm_head.weight",
+            "thinker"
+        ));
+        assert!(!qwen3_asr_gguf_text_tensor_matches(
+            "thinker.audio_tower.conv2d1.weight",
+            "thinker"
+        ));
+        assert!(qwen3_asr_gguf_text_tensor_matches(
+            "model.layers.0.self_attn.q_proj.weight",
+            ""
+        ));
+        assert!(qwen3_asr_gguf_text_tensor_matches("lm_head.weight", ""));
+        assert!(!qwen3_asr_gguf_text_tensor_matches(
+            "audio_tower.conv2d1.weight",
             ""
         ));
     }
