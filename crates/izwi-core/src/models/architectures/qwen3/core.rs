@@ -1086,7 +1086,8 @@ fn dense_decode_attention(
     }
 
     let q_heads = q.transpose(1, 2)?.contiguous()?;
-    if let Some(out) = try_fused_self_attention(&q_heads, k_heads, v_heads, None, head_dim, true)? {
+    if let Some(out) = try_fused_self_attention(&q_heads, k_heads, v_heads, None, head_dim, false)?
+    {
         return out.transpose(1, 2).map_err(Error::from);
     }
 
@@ -1592,6 +1593,78 @@ mod tests {
         assert_eq!(dense_vals.len(), expected_vals.len());
         for (lhs, rhs) in dense_vals.iter().zip(expected_vals.iter()) {
             assert!((lhs - rhs).abs() < 1e-5, "{lhs} != {rhs}");
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn dense_decode_attention_matches_manual_gqa_on_metal_decode_window() {
+        let device = match std::panic::catch_unwind(|| Device::new_metal(0)) {
+            Ok(Ok(device)) => device,
+            _ => return,
+        };
+        let num_heads = 2usize;
+        let num_kv_heads = 1usize;
+        let head_dim = 64usize;
+        let kv_len = 4usize;
+        let q_values = (0..(num_heads * head_dim))
+            .map(|idx| ((idx % 17) as f32 - 8.0) * 0.025)
+            .collect::<Vec<_>>();
+        let k_values = (0..(kv_len * num_kv_heads * head_dim))
+            .map(|idx| ((idx % 23) as f32 - 11.0) * 0.02)
+            .collect::<Vec<_>>();
+        let v_values = (0..(kv_len * num_kv_heads * head_dim))
+            .map(|idx| ((idx % 19) as f32 - 9.0) * 0.03)
+            .collect::<Vec<_>>();
+
+        let q = Tensor::from_vec(q_values, (1, 1, num_heads, head_dim), &device).expect("q");
+        let k =
+            Tensor::from_vec(k_values, (1, kv_len, num_kv_heads, head_dim), &device).expect("k");
+        let v =
+            Tensor::from_vec(v_values, (1, kv_len, num_kv_heads, head_dim), &device).expect("v");
+        let k_heads = k
+            .transpose(1, 2)
+            .expect("k heads")
+            .contiguous()
+            .expect("k contig");
+        let v_heads = v
+            .transpose(1, 2)
+            .expect("v heads")
+            .contiguous()
+            .expect("v contig");
+
+        let dense =
+            dense_decode_attention(&q, &k_heads, &v_heads, num_heads, num_kv_heads, head_dim)
+                .expect("dense");
+        let q_heads = q.transpose(1, 2).expect("q heads");
+        let k_repeated = repeat_kv(&k, num_heads, num_kv_heads).expect("repeat k");
+        let v_repeated = repeat_kv(&v, num_heads, num_kv_heads).expect("repeat v");
+        let k_repeated = k_repeated.transpose(1, 2).expect("k repeated heads");
+        let v_repeated = v_repeated.transpose(1, 2).expect("v repeated heads");
+        let mut att = q_heads
+            .matmul(&k_repeated.transpose(2, 3).expect("k t"))
+            .expect("scores");
+        att = (att / (head_dim as f64).sqrt()).expect("scale");
+        let expected = ops::softmax(&att, D::Minus1)
+            .expect("softmax")
+            .matmul(&v_repeated)
+            .expect("expected")
+            .transpose(1, 2)
+            .expect("expected transpose");
+
+        let dense_vals = dense
+            .flatten_all()
+            .expect("dense flat")
+            .to_vec1::<f32>()
+            .expect("dense vals");
+        let expected_vals = expected
+            .flatten_all()
+            .expect("expected flat")
+            .to_vec1::<f32>()
+            .expect("expected vals");
+        assert_eq!(dense_vals.len(), expected_vals.len());
+        for (lhs, rhs) in dense_vals.iter().zip(expected_vals.iter()) {
+            assert!((lhs - rhs).abs() < 5e-3, "{lhs} != {rhs}");
         }
     }
 }
