@@ -200,6 +200,7 @@ IZWI_QWEN_ASR_SMOKE_SHORT_AUDIO=data/fox.wav \
 IZWI_QWEN_ASR_SMOKE_LONG_AUDIO=data/diarization-2.mp3 \
 IZWI_QWEN_ASR_SMOKE_SHORT_EXPECT="quick brown fox" \
 IZWI_QWEN_ASR_SMOKE_LONG_EXPECTED_PREFIX="So human" \
+IZWI_QWEN_ASR_SMOKE_REQUIRE_CHUNK_ATTENTION=1 \
 scripts/ci/qwen-asr-smoke.sh
 ```
 
@@ -248,6 +249,9 @@ fused/unfused/fallback counts, and dense vs paged decode share. FlashAttention
 experiments require both the `flash-attn` build feature and
 `IZWI_USE_FLASH_ATTENTION=1`; unsupported CUDA shapes must fall back through the
 existing Candle path with telemetry rather than failing the request.
+When validating audio chunk varlen FlashAttention specifically, also set
+`IZWI_QWEN_ASR_SMOKE_REQUIRE_FUSED_CHUNKS=1` so the smoke script fails if the
+runtime chunk-attention counters do not show fused spans.
 
 ---
 
