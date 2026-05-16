@@ -322,13 +322,21 @@ fn qwen3_dense_decode_max_tokens(
 }
 
 fn qwen3_use_dense_decode_attention_feature(device: &Device) -> bool {
-    if !device.is_metal() {
+    let override_enabled = std::env::var("IZWI_QWEN3_DENSE_DECODE_ATTENTION")
+        .ok()
+        .and_then(|raw| parse_env_bool(&raw));
+    qwen3_use_dense_decode_attention_policy(device.is_metal(), device.is_cuda(), override_enabled)
+}
+
+fn qwen3_use_dense_decode_attention_policy(
+    is_metal: bool,
+    is_cuda: bool,
+    override_enabled: Option<bool>,
+) -> bool {
+    if !is_metal && !is_cuda {
         return false;
     }
-    std::env::var("IZWI_QWEN3_DENSE_DECODE_ATTENTION")
-        .ok()
-        .and_then(|raw| parse_env_bool(&raw))
-        .unwrap_or(true)
+    override_enabled.unwrap_or(true)
 }
 
 fn qwen3_dense_decode_max_pages() -> usize {
@@ -1529,6 +1537,29 @@ mod tests {
         let (k_dense, v_dense) = cache.materialize(0).expect("materialized");
         assert_eq!(k_dense.dims4().expect("k dims"), (1, 3, 1, 4));
         assert_eq!(v_dense.dims4().expect("v dims"), (1, 3, 1, 4));
+    }
+
+    #[test]
+    fn qwen3_dense_decode_policy_enables_only_metal_and_cuda() {
+        assert!(!qwen3_use_dense_decode_attention_policy(false, false, None));
+        assert!(qwen3_use_dense_decode_attention_policy(true, false, None));
+        assert!(qwen3_use_dense_decode_attention_policy(false, true, None));
+        assert!(qwen3_use_dense_decode_attention_policy(true, true, None));
+        assert!(!qwen3_use_dense_decode_attention_policy(
+            true,
+            false,
+            Some(false)
+        ));
+        assert!(!qwen3_use_dense_decode_attention_policy(
+            false,
+            true,
+            Some(false)
+        ));
+        assert!(!qwen3_use_dense_decode_attention_policy(
+            false,
+            false,
+            Some(true)
+        ));
     }
 
     #[test]
