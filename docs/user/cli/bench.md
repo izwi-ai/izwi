@@ -180,6 +180,75 @@ attempt/success/fallback counters, and the transcript/WER must be compared
 against the non-FlashAttention CUDA baseline. Only enable `cudnn` in builds
 whose runtime image or host provides matching cuDNN libraries.
 
+### Qwen-ASR CUDA Performance Protocol
+
+Qwen-ASR CUDA kernel work follows the same guardrail rule as Whisper: prove
+transcript quality and kernel telemetry before changing defaults. Start a server
+with the backend and model under test, then run the Qwen smoke script before
+recording benchmark artifacts:
+
+```bash
+IZWI_BACKEND=cuda \
+IZWI_PRELOAD_MODELS=Qwen3-ASR-0.6B-GGUF \
+IZWI_WARMUP_PRELOADED_MODELS=1 \
+izwi serve --backend cuda
+```
+
+```bash
+IZWI_QWEN_ASR_SMOKE_BACKEND=cuda \
+IZWI_QWEN_ASR_SMOKE_SHORT_AUDIO=data/fox.wav \
+IZWI_QWEN_ASR_SMOKE_LONG_AUDIO=data/diarization-2.mp3 \
+IZWI_QWEN_ASR_SMOKE_SHORT_EXPECT="quick brown fox" \
+IZWI_QWEN_ASR_SMOKE_LONG_EXPECTED_PREFIX="So human" \
+scripts/ci/qwen-asr-smoke.sh
+```
+
+Run the same smoke script for CPU and Metal when changing shared Qwen code.
+Those backends are protected behavior for CUDA second-wave work.
+
+Build and compare the CUDA feature matrix before changing CUDA defaults:
+
+```bash
+IZWI_CUDA_FEATURES=cuda scripts/ci/check-backend-truth.sh cargo-cuda
+IZWI_CUDA_FEATURES=cuda,flash-attn scripts/ci/check-backend-truth.sh cargo-cuda
+IZWI_CUDA_FEATURES=cuda,cudnn scripts/ci/check-backend-truth.sh cargo-cuda
+IZWI_CUDA_FEATURES=cuda,cudnn,flash-attn scripts/ci/check-backend-truth.sh cargo-cuda
+```
+
+Benchmark each candidate with JSON output. At minimum, compare the CUDA
+baseline, dense decode, QMatMul, and FlashAttention runtime gates:
+
+```bash
+IZWI_BACKEND=cuda \
+IZWI_QWEN3_DENSE_DECODE_ATTENTION=1 \
+IZWI_QWEN3_ASR_GGUF_QMATMUL_TEXT=1 \
+izwi --output-format json bench asr \
+  --model Qwen3-ASR-0.6B-GGUF \
+  --file data/diarization.wav \
+  --iterations 10 \
+  --warmup > qwen-asr-cuda-current.json
+```
+
+```bash
+IZWI_BACKEND=cuda \
+IZWI_USE_FLASH_ATTENTION=1 \
+IZWI_QWEN3_DENSE_DECODE_ATTENTION=1 \
+IZWI_QWEN3_ASR_GGUF_QMATMUL_TEXT=1 \
+izwi --output-format json bench asr \
+  --model Qwen3-ASR-0.6B-GGUF \
+  --file data/diarization-2.mp3 \
+  --iterations 5 \
+  --warmup > qwen-asr-cuda-flash-long.json
+```
+
+Required review fields are the normalized transcript or WER, `RTF`,
+`timings_ms.prefill`, `timings_ms.decode`, generated tokens, prompt/audio
+tokens, fused attention attempt/success/fallback counts, chunk attention
+fused/unfused/fallback counts, and dense vs paged decode share. FlashAttention
+experiments require both the `flash-attn` build feature and
+`IZWI_USE_FLASH_ATTENTION=1`; unsupported CUDA shapes must fall back through the
+existing Candle path with telemetry rather than failing the request.
+
 ---
 
 ## izwi bench throughput
