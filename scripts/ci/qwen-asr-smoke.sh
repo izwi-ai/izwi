@@ -18,6 +18,10 @@ Optional environment:
   IZWI_QWEN_ASR_SMOKE_SHORT_EXPECT Expected substring in the short transcript
   IZWI_QWEN_ASR_SMOKE_LONG_EXPECTED_PREFIX
                                       Expected prefix for the long transcript
+  IZWI_QWEN_ASR_SMOKE_REQUIRE_CHUNK_ATTENTION
+                                      If truthy, require runtime chunk-attention telemetry
+  IZWI_QWEN_ASR_SMOKE_REQUIRE_FUSED_CHUNKS
+                                      If truthy, require fused chunk-attention spans
 
 Start the server separately with the backend being verified, for example:
   IZWI_BACKEND=cuda izwi serve --backend cuda
@@ -159,6 +163,61 @@ else:
 PY
 }
 
+validate_runtime_telemetry() {
+  python3 - "$SERVER" <<'PY'
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+server = sys.argv[1].rstrip("/")
+timeout = int(os.environ.get("IZWI_QWEN_ASR_SMOKE_TIMEOUT_SECS", "900"))
+
+
+def truthy(name):
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+require_chunk_attention = truthy("IZWI_QWEN_ASR_SMOKE_REQUIRE_CHUNK_ATTENTION")
+require_fused_chunks = truthy("IZWI_QWEN_ASR_SMOKE_REQUIRE_FUSED_CHUNKS")
+if not require_chunk_attention and not require_fused_chunks:
+    sys.exit(0)
+
+last_error = None
+metrics = None
+for path in ("/internal/metrics", "/v1/metrics"):
+    try:
+        with urllib.request.urlopen(f"{server}{path}", timeout=timeout) as response:
+            metrics = json.loads(response.read().decode("utf-8"))
+            break
+    except (OSError, urllib.error.HTTPError, json.JSONDecodeError) as exc:
+        last_error = exc
+
+if not isinstance(metrics, dict):
+    raise SystemExit(f"runtime metrics unavailable: {last_error}")
+
+kernel_path = metrics.get("kernel_path")
+if not isinstance(kernel_path, dict):
+    raise SystemExit("runtime metrics missing kernel_path object")
+
+
+def require_positive_counter(name):
+    value = kernel_path.get(name)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise SystemExit(f"expected positive kernel_path.{name}, got {value!r}")
+
+
+if require_chunk_attention:
+    require_positive_counter("chunk_attention_sequence_calls_total")
+    require_positive_counter("chunk_attention_spans_total")
+    require_positive_counter("chunk_attention_tokens_total")
+
+if require_fused_chunks:
+    require_positive_counter("chunk_attention_fused_spans_total")
+PY
+}
+
 require_var IZWI_QWEN_ASR_SMOKE_BACKEND
 require_var IZWI_QWEN_ASR_SMOKE_SHORT_AUDIO
 require_var IZWI_QWEN_ASR_SMOKE_LONG_AUDIO
@@ -217,6 +276,7 @@ run_case() {
 run_case short_verbose "$IZWI_QWEN_ASR_SMOKE_SHORT_AUDIO" verbose_json false
 run_case long_verbose "$IZWI_QWEN_ASR_SMOKE_LONG_AUDIO" verbose_json false
 run_case long_stream "$IZWI_QWEN_ASR_SMOKE_LONG_AUDIO" json true
+validate_runtime_telemetry
 
 echo
 echo "Qwen-ASR smoke verification completed for ${BACKEND}."
