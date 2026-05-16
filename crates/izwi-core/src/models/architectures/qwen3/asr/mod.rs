@@ -442,12 +442,13 @@ impl Qwen3AsrModel {
         })
     }
 
-    fn build_decode_cache(&self, prompt_tokens: usize) -> Qwen3Cache {
+    fn build_decode_cache(&self, prompt_tokens: usize, max_new_tokens: usize) -> Qwen3Cache {
         let page_size = qwen3_asr_kv_page_size(&self.device.device, prompt_tokens);
-        Qwen3Cache::with_page_size_and_dense_decode(
+        Qwen3Cache::with_page_size_and_dense_decode_tokens(
             self.text_model.num_layers(),
             page_size,
             &self.device.device,
+            prompt_tokens.saturating_add(max_new_tokens.max(1)),
         )
     }
 
@@ -654,7 +655,8 @@ impl Qwen3AsrModel {
             &self.device.device,
         )?;
 
-        let mut cache = self.build_decode_cache(prompt.ids.len());
+        let max_new_tokens = max_new_tokens.max(1);
+        let mut cache = self.build_decode_cache(prompt.ids.len(), max_new_tokens);
         let prefill_started = Instant::now();
         let embeds = self.forward_with_audio(
             &input_ids,
@@ -665,7 +667,6 @@ impl Qwen3AsrModel {
         )?;
         let prefill_ms = elapsed_ms(prefill_started);
         let pos = embeds.dim(1)?;
-        let max_new_tokens = max_new_tokens.max(1);
         let diagnostics = Qwen3AsrDiagnostics {
             input_sample_rate: sample_rate,
             input_samples,
@@ -881,7 +882,8 @@ impl Qwen3AsrModel {
             &self.device.device,
         )?;
 
-        let mut cache = self.build_decode_cache(prompt.ids.len());
+        let max_tokens = 2048usize;
+        let mut cache = self.build_decode_cache(prompt.ids.len(), max_tokens);
         let mut embeds = self.forward_with_audio(
             &input_ids,
             &audio_embeds,
@@ -894,7 +896,6 @@ impl Qwen3AsrModel {
 
         let mut generated: Vec<u32> = Vec::new();
 
-        let max_tokens = 2048usize;
         for _ in 0..max_tokens {
             let logits = embeds.i((0, embeds.dim(1)? - 1))?;
             let next = argmax(&logits)?;
@@ -981,7 +982,7 @@ impl Qwen3AsrModel {
             &self.device.device,
         )?;
 
-        let mut cache = self.build_decode_cache(prompt.ids.len());
+        let mut cache = self.build_decode_cache(prompt.ids.len(), 1);
         let logits = self.forward_with_audio(
             &input_ids,
             &audio_embeds,
