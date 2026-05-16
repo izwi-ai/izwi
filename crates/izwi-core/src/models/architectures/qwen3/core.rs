@@ -110,6 +110,26 @@ impl Qwen3Cache {
         )
     }
 
+    pub fn with_page_size_and_dense_decode_tokens(
+        num_layers: usize,
+        page_size: usize,
+        device: &Device,
+        dense_decode_max_tokens: usize,
+    ) -> Self {
+        let quantization = default_kv_quantization();
+        let dense_decode_max_tokens = if qwen3_use_dense_decode_attention_feature(device) {
+            dense_decode_max_tokens
+        } else {
+            0
+        };
+        Self::with_page_size_quantization_and_dense_decode_tokens(
+            num_layers,
+            page_size,
+            quantization,
+            dense_decode_max_tokens,
+        )
+    }
+
     pub fn with_page_size_and_quantization(
         num_layers: usize,
         page_size: usize,
