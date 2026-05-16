@@ -1065,12 +1065,10 @@ impl Qwen3AsrModel {
         )?;
 
         let segment_time_ms = self.timestamp_segment_time_ms.unwrap_or(20).max(1);
-        let mut timestamp_ms = Vec::with_capacity(timestamp_positions.len());
-        for &position in &timestamp_positions {
-            let token_logits = logits.i((0, position))?;
-            let cls_idx = argmax(&token_logits)?;
-            timestamp_ms.push(cls_idx.saturating_mul(segment_time_ms));
-        }
+        let timestamp_ms = batched_timestamp_argmax(&logits, &timestamp_positions)?
+            .into_iter()
+            .map(|cls_idx| cls_idx.saturating_mul(segment_time_ms))
+            .collect::<Vec<_>>();
 
         let mut fixed = fix_timestamp_sequence(&timestamp_ms);
         let required = words.len().saturating_mul(2);
@@ -2565,6 +2563,33 @@ fn collect_stop_token_ids(specials: &SpecialTokenIds) -> Vec<u32> {
     stop_ids
 }
 
+fn batched_timestamp_argmax(logits: &Tensor, positions: &[usize]) -> Result<Vec<u32>> {
+    if positions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let dims = logits.dims();
+    if dims.len() != 3 || dims[0] != 1 {
+        return Err(Error::InferenceError(format!(
+            "Forced aligner timestamp argmax expects logits shape [1, seq, classes], got {dims:?}"
+        )));
+    }
+    let seq_len = dims[1];
+    let mut position_ids = Vec::with_capacity(positions.len());
+    for &position in positions {
+        if position >= seq_len {
+            return Err(Error::InferenceError(format!(
+                "Forced aligner timestamp position {position} is out of range for sequence length {seq_len}"
+            )));
+        }
+        position_ids.push(position as i64);
+    }
+
+    let positions = Tensor::from_vec(position_ids, (positions.len(),), logits.device())?;
+    let token_logits = logits.i(0)?.index_select(&positions, 0)?;
+    let indices = token_logits.argmax(D::Minus1)?.to_dtype(DType::U32)?;
+    indices.to_vec1::<u32>().map_err(Error::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3009,6 +3034,36 @@ mod tests {
         let logits = Tensor::from_vec(vec![0.1f32; 8], (2, 4), &device).expect("logits");
         let err = argmax(&logits).expect_err("argmax should reject batched rank2");
         assert!(format!("{err}").contains("Unexpected batched logits for argmax"));
+    }
+
+    #[test]
+    fn batched_timestamp_argmax_selects_requested_positions() {
+        let device = candle_core::Device::Cpu;
+        let logits = Tensor::from_vec(
+            vec![
+                0.1f32, 0.2, 0.9, 0.0, //
+                0.8, 0.1, 0.0, 0.2, //
+                0.3, 1.4, 0.2, 0.0, //
+                0.0, 0.2, 0.1, 2.0,
+            ],
+            (1, 4, 4),
+            &device,
+        )
+        .expect("logits");
+
+        let indices = batched_timestamp_argmax(&logits, &[2, 0, 3]).expect("argmax");
+
+        assert_eq!(indices, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn batched_timestamp_argmax_rejects_out_of_range_position() {
+        let device = candle_core::Device::Cpu;
+        let logits = Tensor::from_vec(vec![0.1f32; 8], (1, 2, 4), &device).expect("logits");
+        let err = batched_timestamp_argmax(&logits, &[2])
+            .expect_err("timestamp position should be out of range");
+
+        assert!(format!("{err}").contains("out of range"));
     }
 
     #[test]
