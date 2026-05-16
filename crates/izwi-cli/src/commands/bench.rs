@@ -77,11 +77,27 @@ struct KernelPathTelemetrySnapshot {
     #[serde(default)]
     fused_attention_masked_fallback_total: u64,
     #[serde(default)]
+    fused_attention_fallback_flash_not_requested_total: u64,
+    #[serde(default)]
+    fused_attention_fallback_flash_not_compiled_total: u64,
+    #[serde(default)]
+    fused_attention_fallback_flash_mask_unsupported_total: u64,
+    #[serde(default)]
+    fused_attention_fallback_flash_dtype_unsupported_total: u64,
+    #[serde(default)]
+    fused_attention_fallback_flash_dtype_mismatch_total: u64,
+    #[serde(default)]
+    fused_attention_fallback_flash_runtime_error_total: u64,
+    #[serde(default)]
+    fused_attention_fallback_metal_sdpa_runtime_error_total: u64,
+    #[serde(default)]
     fused_attention_fallback_metal_sdpa_mask_policy_disabled_total: u64,
     #[serde(default)]
     fused_attention_fallback_metal_sdpa_mask_shape_unsupported_total: u64,
     #[serde(default)]
     fused_attention_fallback_metal_sdpa_mask_dtype_unsupported_total: u64,
+    #[serde(default)]
+    fused_attention_fallback_unsupported_backend_total: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -2627,6 +2643,27 @@ fn print_runtime_delta(
     let fused_masked_fallback_delta = kernel_after
         .fused_attention_masked_fallback_total
         .saturating_sub(kernel_before.fused_attention_masked_fallback_total);
+    let fused_flash_not_requested_delta = kernel_after
+        .fused_attention_fallback_flash_not_requested_total
+        .saturating_sub(kernel_before.fused_attention_fallback_flash_not_requested_total);
+    let fused_flash_not_compiled_delta = kernel_after
+        .fused_attention_fallback_flash_not_compiled_total
+        .saturating_sub(kernel_before.fused_attention_fallback_flash_not_compiled_total);
+    let fused_flash_mask_unsupported_delta = kernel_after
+        .fused_attention_fallback_flash_mask_unsupported_total
+        .saturating_sub(kernel_before.fused_attention_fallback_flash_mask_unsupported_total);
+    let fused_flash_dtype_unsupported_delta = kernel_after
+        .fused_attention_fallback_flash_dtype_unsupported_total
+        .saturating_sub(kernel_before.fused_attention_fallback_flash_dtype_unsupported_total);
+    let fused_flash_dtype_mismatch_delta = kernel_after
+        .fused_attention_fallback_flash_dtype_mismatch_total
+        .saturating_sub(kernel_before.fused_attention_fallback_flash_dtype_mismatch_total);
+    let fused_flash_runtime_error_delta = kernel_after
+        .fused_attention_fallback_flash_runtime_error_total
+        .saturating_sub(kernel_before.fused_attention_fallback_flash_runtime_error_total);
+    let fused_metal_runtime_error_delta = kernel_after
+        .fused_attention_fallback_metal_sdpa_runtime_error_total
+        .saturating_sub(kernel_before.fused_attention_fallback_metal_sdpa_runtime_error_total);
     let fused_mask_policy_disabled_delta = kernel_after
         .fused_attention_fallback_metal_sdpa_mask_policy_disabled_total
         .saturating_sub(
@@ -2642,6 +2679,9 @@ fn print_runtime_delta(
         .saturating_sub(
             kernel_before.fused_attention_fallback_metal_sdpa_mask_dtype_unsupported_total,
         );
+    let fused_unsupported_backend_delta = kernel_after
+        .fused_attention_fallback_unsupported_backend_total
+        .saturating_sub(kernel_before.fused_attention_fallback_unsupported_backend_total);
     let decode_total = dense_decode_delta + paged_decode_delta;
     println!(
         "  Prefill path counts (token-mode/sequence-spans/sequence-tokens): {} / {} / {}",
@@ -2679,10 +2719,23 @@ fn print_runtime_delta(
         fused_masked_attempts_delta, fused_masked_success_delta, fused_masked_fallback_delta
     );
     println!(
+        "  CUDA FlashAttention fallback reasons (not-requested/not-compiled/mask/dtype/mismatch/runtime): {} / {} / {} / {} / {} / {}",
+        fused_flash_not_requested_delta,
+        fused_flash_not_compiled_delta,
+        fused_flash_mask_unsupported_delta,
+        fused_flash_dtype_unsupported_delta,
+        fused_flash_dtype_mismatch_delta,
+        fused_flash_runtime_error_delta
+    );
+    println!(
         "  Masked fused fallback reasons (policy/shape/dtype): {} / {} / {}",
         fused_mask_policy_disabled_delta,
         fused_mask_shape_unsupported_delta,
         fused_mask_dtype_unsupported_delta
+    );
+    println!(
+        "  Fused backend fallback reasons (metal-runtime/unsupported): {} / {}",
+        fused_metal_runtime_error_delta, fused_unsupported_backend_delta
     );
     if matches!(context, RuntimeTelemetryContext::AsrWhisper) {
         println!(
@@ -2831,6 +2884,48 @@ mod tests {
         assert_eq!(samples[1].audio_encode, Some(820.0));
         assert_eq!(samples[1].prefill, Some(1080.0));
         assert_eq!(samples[1].generated_tokens, Some(93));
+    }
+
+    #[test]
+    fn kernel_path_telemetry_deserializes_flash_fallback_reasons() {
+        let kernel_path: KernelPathTelemetrySnapshot = serde_json::from_value(serde_json::json!({
+            "prefill_token_mode_steps_total": 0,
+            "prefill_sequence_spans_total": 0,
+            "prefill_sequence_tokens_total": 0,
+            "decode_attention_dense_total": 0,
+            "decode_attention_paged_total": 0,
+            "rope_kernel_total": 0,
+            "rope_manual_total": 0,
+            "fused_attention_attempts_total": 12,
+            "fused_attention_success_total": 7,
+            "fused_attention_fallback_total": 5,
+            "fused_attention_fallback_flash_not_requested_total": 1,
+            "fused_attention_fallback_flash_not_compiled_total": 2,
+            "fused_attention_fallback_flash_dtype_mismatch_total": 3,
+            "fused_attention_fallback_unsupported_backend_total": 4
+        }))
+        .expect("kernel path telemetry should deserialize");
+
+        assert_eq!(
+            kernel_path.fused_attention_fallback_flash_not_requested_total,
+            1
+        );
+        assert_eq!(
+            kernel_path.fused_attention_fallback_flash_not_compiled_total,
+            2
+        );
+        assert_eq!(
+            kernel_path.fused_attention_fallback_flash_dtype_mismatch_total,
+            3
+        );
+        assert_eq!(
+            kernel_path.fused_attention_fallback_unsupported_backend_total,
+            4
+        );
+        assert_eq!(
+            kernel_path.fused_attention_fallback_flash_runtime_error_total,
+            0
+        );
     }
 
     #[tokio::test]
