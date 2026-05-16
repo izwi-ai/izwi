@@ -245,7 +245,9 @@ izwi --output-format json bench asr \
 Required review fields are the normalized transcript or WER, `RTF`,
 `timings_ms.prefill`, `timings_ms.decode`, generated tokens, prompt/audio
 tokens, fused attention attempt/success/fallback counts, chunk attention
-fused/unfused/fallback counts, and dense vs paged decode share. FlashAttention
+fused/unfused/fallback counts, dense vs paged decode share, and Qwen
+`execution` diagnostics for device, dtypes, dense decode, FlashAttention, and
+text projection backend. FlashAttention
 experiments require both the `flash-attn` build feature and
 `IZWI_USE_FLASH_ATTENTION=1`; unsupported CUDA shapes must fall back through the
 existing Candle path with telemetry rather than failing the request.
