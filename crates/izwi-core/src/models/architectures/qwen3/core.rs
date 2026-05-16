@@ -419,11 +419,30 @@ impl Qwen3Projection {
     }
 }
 
+fn qwen3_cuda_qmatmul_input_dtype(device_is_cuda: bool, activation_dtype: DType) -> Option<DType> {
+    (device_is_cuda && activation_dtype != DType::F32).then_some(DType::F32)
+}
+
 impl Module for Qwen3Projection {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         match self {
             Self::Dense(linear) => linear.forward(x),
-            Self::Quantized(qmatmul) => qmatmul.forward(x),
+            Self::Quantized(qmatmul) => {
+                let activation_dtype = x.dtype();
+                let x = if let Some(dtype) =
+                    qwen3_cuda_qmatmul_input_dtype(x.device().is_cuda(), activation_dtype)
+                {
+                    x.to_dtype(dtype)?
+                } else {
+                    x.clone()
+                };
+                let out = qmatmul.forward(&x)?;
+                if out.dtype() != activation_dtype {
+                    out.to_dtype(activation_dtype)
+                } else {
+                    Ok(out)
+                }
+            }
         }
     }
 }
@@ -1629,6 +1648,20 @@ mod tests {
             false,
             Some(true)
         ));
+    }
+
+    #[test]
+    fn qwen3_cuda_qmatmul_uses_f32_input_for_lower_precision_activations() {
+        assert_eq!(
+            qwen3_cuda_qmatmul_input_dtype(true, DType::BF16),
+            Some(DType::F32)
+        );
+        assert_eq!(
+            qwen3_cuda_qmatmul_input_dtype(true, DType::F16),
+            Some(DType::F32)
+        );
+        assert_eq!(qwen3_cuda_qmatmul_input_dtype(true, DType::F32), None);
+        assert_eq!(qwen3_cuda_qmatmul_input_dtype(false, DType::BF16), None);
     }
 
     #[test]
