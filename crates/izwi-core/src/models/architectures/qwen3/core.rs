@@ -94,6 +94,14 @@ impl Qwen3Cache {
         Self::with_page_size_and_quantization(num_layers, page_size, default_kv_quantization())
     }
 
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+
+    pub fn dense_decode_max_tokens(&self) -> usize {
+        self.dense_decode_max_tokens
+    }
+
     pub fn with_page_size_and_dense_decode(
         num_layers: usize,
         page_size: usize,
@@ -360,6 +368,25 @@ enum Qwen3Projection {
     Quantized(QMatMul),
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Qwen3ProjectionDiagnostics {
+    pub dense_projection_count: usize,
+    pub quantized_projection_count: usize,
+}
+
+impl Qwen3ProjectionDiagnostics {
+    fn add(self, other: Self) -> Self {
+        Self {
+            dense_projection_count: self
+                .dense_projection_count
+                .saturating_add(other.dense_projection_count),
+            quantized_projection_count: self
+                .quantized_projection_count
+                .saturating_add(other.quantized_projection_count),
+        }
+    }
+}
+
 impl Qwen3Projection {
     fn dense(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
         mlx::load_linear_no_bias(in_dim, out_dim, vb)
@@ -376,6 +403,19 @@ impl Qwen3Projection {
 
     fn tied_dense(weight: Tensor) -> Self {
         Self::Dense(Linear::new(weight, None))
+    }
+
+    fn diagnostics(&self) -> Qwen3ProjectionDiagnostics {
+        match self {
+            Self::Dense(_) => Qwen3ProjectionDiagnostics {
+                dense_projection_count: 1,
+                quantized_projection_count: 0,
+            },
+            Self::Quantized(_) => Qwen3ProjectionDiagnostics {
+                dense_projection_count: 0,
+                quantized_projection_count: 1,
+            },
+        }
     }
 }
 
@@ -527,6 +567,14 @@ impl Qwen3Attention {
             rope_inv_freqs: build_rope_inv_freqs(head_dim, cfg.rope_theta),
             rope_kernel_enabled: qwen3_rope_kernel_enabled(device),
         })
+    }
+
+    fn projection_diagnostics(&self) -> Qwen3ProjectionDiagnostics {
+        self.q_proj
+            .diagnostics()
+            .add(self.k_proj.diagnostics())
+            .add(self.v_proj.diagnostics())
+            .add(self.o_proj.diagnostics())
     }
 
     fn apply_qk_norm(
@@ -820,6 +868,13 @@ impl Qwen3Mlp {
         })
     }
 
+    fn projection_diagnostics(&self) -> Qwen3ProjectionDiagnostics {
+        self.gate_proj
+            .diagnostics()
+            .add(self.up_proj.diagnostics())
+            .add(self.down_proj.diagnostics())
+    }
+
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
@@ -888,6 +943,12 @@ impl Qwen3Layer {
             post_attention_layernorm,
             mlp,
         })
+    }
+
+    fn projection_diagnostics(&self) -> Qwen3ProjectionDiagnostics {
+        self.self_attn
+            .projection_diagnostics()
+            .add(self.mlp.projection_diagnostics())
     }
 
     fn forward(
@@ -1031,6 +1092,14 @@ impl Qwen3Model {
 
     pub fn num_layers(&self) -> usize {
         self.layers.len()
+    }
+
+    pub fn projection_diagnostics(&self) -> Qwen3ProjectionDiagnostics {
+        self.layers
+            .iter()
+            .fold(self.lm_head.diagnostics(), |acc, layer| {
+                acc.add(layer.projection_diagnostics())
+            })
     }
 
     pub fn forward(

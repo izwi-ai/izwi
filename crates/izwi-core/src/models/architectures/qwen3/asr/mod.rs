@@ -24,6 +24,9 @@ use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::core::{
     Qwen3Cache, Qwen3Config, Qwen3Model, RopeScalingConfig,
 };
+use crate::models::shared::attention::flash::{
+    flash_attention_compiled, flash_attention_requested,
+};
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::memory::metal::metal_pool_for_device;
 use crate::models::shared::weights::gguf::{var_builder_from_gguf_filtered, GgufLoader};
@@ -50,6 +53,8 @@ pub struct Qwen3AsrModel {
     device: DeviceProfile,
     audio_dtype: DType,
     text_dtype: DType,
+    checkpoint_format: &'static str,
+    gguf_qmatmul_text_enabled: bool,
     is_forced_aligner: bool,
     timestamp_token_id: Option<u32>,
     timestamp_segment_time_ms: Option<u32>,
@@ -103,6 +108,24 @@ struct Qwen3AsrTimingDiagnostics {
 }
 
 #[derive(Debug, Clone, Default)]
+struct Qwen3AsrExecutionDiagnostics {
+    device_kind: String,
+    audio_dtype: String,
+    text_dtype: String,
+    checkpoint_format: String,
+    flash_attention_requested: bool,
+    flash_attention_compiled: bool,
+    kv_page_size: usize,
+    dense_decode_enabled: bool,
+    dense_decode_max_tokens: usize,
+    gguf_qmatmul_text_enabled: bool,
+    text_projection_backend: String,
+    text_projection_quantized: bool,
+    qmatmul_projection_count: usize,
+    dense_projection_count: usize,
+}
+
+#[derive(Debug, Clone, Default)]
 struct Qwen3AsrDiagnostics {
     input_sample_rate: u32,
     input_samples: usize,
@@ -123,6 +146,7 @@ struct Qwen3AsrDiagnostics {
     asr_text_token_appended: bool,
     max_new_tokens: usize,
     generated_tokens: usize,
+    execution: Qwen3AsrExecutionDiagnostics,
     timings: Qwen3AsrTimingDiagnostics,
 }
 
@@ -154,6 +178,22 @@ impl Qwen3AsrDiagnostics {
             "decode": {
                 "max_new_tokens": self.max_new_tokens,
                 "generated_tokens": self.generated_tokens,
+            },
+            "execution": {
+                "device_kind": &self.execution.device_kind,
+                "audio_dtype": &self.execution.audio_dtype,
+                "text_dtype": &self.execution.text_dtype,
+                "checkpoint_format": &self.execution.checkpoint_format,
+                "flash_attention_requested": self.execution.flash_attention_requested,
+                "flash_attention_compiled": self.execution.flash_attention_compiled,
+                "kv_page_size": self.execution.kv_page_size,
+                "dense_decode_enabled": self.execution.dense_decode_enabled,
+                "dense_decode_max_tokens": self.execution.dense_decode_max_tokens,
+                "gguf_qmatmul_text_enabled": self.execution.gguf_qmatmul_text_enabled,
+                "text_projection_backend": &self.execution.text_projection_backend,
+                "text_projection_quantized": self.execution.text_projection_quantized,
+                "qmatmul_projection_count": self.execution.qmatmul_projection_count,
+                "dense_projection_count": self.execution.dense_projection_count,
             },
             "timings_ms": {
                 "resample": self.timings.resample_ms,
@@ -300,6 +340,7 @@ impl Qwen3AsrModel {
         // especially sensitive to precision, so keep the audio tower in F32
         // by default and select the text dtype with backend-aware rules.
         let is_gguf = gguf_loader.is_some();
+        let checkpoint_format = if is_gguf { "gguf" } else { "safetensors" };
         let is_quantized =
             is_gguf || config.quantization.is_some() || config.quantization_config.is_some();
         if !is_gguf && is_quantized {
@@ -364,6 +405,7 @@ impl Qwen3AsrModel {
         let _ = metal_pool_for_device(&device.device);
 
         let audio_cfg = config.thinker_config.audio_config.clone();
+        let gguf_qmatmul_text_enabled = is_gguf && qwen3_asr_use_gguf_qmatmul_text(&device.device);
         let (audio_tower, text_model) = if let Some(gguf_path) = gguf_path.as_ref() {
             let loader = gguf_loader.as_ref().ok_or_else(|| {
                 Error::ModelLoadError("Qwen ASR GGUF loader missing for GGUF path".to_string())
@@ -379,7 +421,7 @@ impl Qwen3AsrModel {
                 vb_audio.pp(tensor_prefix)
             };
             let audio_tower = AudioTower::load(audio_cfg, vb_audio.pp("audio_tower"))?;
-            let text_model = if qwen3_asr_use_gguf_qmatmul_text(&device.device) {
+            let text_model = if gguf_qmatmul_text_enabled {
                 Qwen3Model::load_gguf_text(
                     text_cfg,
                     loader,
@@ -430,6 +472,8 @@ impl Qwen3AsrModel {
             device,
             audio_dtype,
             text_dtype,
+            checkpoint_format,
+            gguf_qmatmul_text_enabled,
             is_forced_aligner,
             timestamp_token_id,
             timestamp_segment_time_ms,
@@ -450,6 +494,33 @@ impl Qwen3AsrModel {
             &self.device.device,
             prompt_tokens.saturating_add(max_new_tokens.max(1)),
         )
+    }
+
+    fn execution_diagnostics(&self, cache: &Qwen3Cache) -> Qwen3AsrExecutionDiagnostics {
+        let projection_diagnostics = self.text_model.projection_diagnostics();
+        let text_projection_quantized = projection_diagnostics.quantized_projection_count > 0;
+        let text_projection_backend = if text_projection_quantized {
+            "qmatmul"
+        } else {
+            "dense_linear"
+        };
+
+        Qwen3AsrExecutionDiagnostics {
+            device_kind: format!("{:?}", self.device.kind),
+            audio_dtype: format!("{:?}", self.audio_dtype),
+            text_dtype: format!("{:?}", self.text_dtype),
+            checkpoint_format: self.checkpoint_format.to_string(),
+            flash_attention_requested: flash_attention_requested(),
+            flash_attention_compiled: flash_attention_compiled(),
+            kv_page_size: cache.page_size(),
+            dense_decode_enabled: cache.dense_decode_max_tokens() > 0,
+            dense_decode_max_tokens: cache.dense_decode_max_tokens(),
+            gguf_qmatmul_text_enabled: self.gguf_qmatmul_text_enabled,
+            text_projection_backend: text_projection_backend.to_string(),
+            text_projection_quantized,
+            qmatmul_projection_count: projection_diagnostics.quantized_projection_count,
+            dense_projection_count: projection_diagnostics.dense_projection_count,
+        }
     }
 
     pub fn transcribe(
@@ -657,6 +728,7 @@ impl Qwen3AsrModel {
 
         let max_new_tokens = max_new_tokens.max(1);
         let mut cache = self.build_decode_cache(prompt.ids.len(), max_new_tokens);
+        let execution = self.execution_diagnostics(&cache);
         let prefill_started = Instant::now();
         let embeds = self.forward_with_audio(
             &input_ids,
@@ -687,6 +759,7 @@ impl Qwen3AsrModel {
             asr_text_token_appended: prompt.asr_text_token_appended,
             max_new_tokens,
             generated_tokens: 0,
+            execution,
             timings: Qwen3AsrTimingDiagnostics {
                 resample_ms,
                 mel_ms,
@@ -2627,6 +2700,22 @@ mod tests {
             asr_text_token_appended: true,
             max_new_tokens: 128,
             generated_tokens: 12,
+            execution: Qwen3AsrExecutionDiagnostics {
+                device_kind: "Cuda".to_string(),
+                audio_dtype: "F16".to_string(),
+                text_dtype: "F16".to_string(),
+                checkpoint_format: "gguf".to_string(),
+                flash_attention_requested: true,
+                flash_attention_compiled: true,
+                kv_page_size: 256,
+                dense_decode_enabled: true,
+                dense_decode_max_tokens: 1024,
+                gguf_qmatmul_text_enabled: true,
+                text_projection_backend: "qmatmul".to_string(),
+                text_projection_quantized: true,
+                qmatmul_projection_count: 197,
+                dense_projection_count: 0,
+            },
             timings: Qwen3AsrTimingDiagnostics {
                 resample_ms: 1.0,
                 mel_ms: 2.0,
@@ -2645,6 +2734,13 @@ mod tests {
         assert_eq!(diagnostics["prompt"]["system_prompt_requested"], true);
         assert_eq!(diagnostics["prompt"]["asr_text_token_appended"], true);
         assert_eq!(diagnostics["decode"]["generated_tokens"], 12);
+        assert_eq!(diagnostics["execution"]["device_kind"], "Cuda");
+        assert_eq!(diagnostics["execution"]["checkpoint_format"], "gguf");
+        assert_eq!(
+            diagnostics["execution"]["text_projection_backend"],
+            "qmatmul"
+        );
+        assert_eq!(diagnostics["execution"]["qmatmul_projection_count"], 197);
         assert_eq!(diagnostics["timings_ms"]["model_total"], 15.0);
     }
 

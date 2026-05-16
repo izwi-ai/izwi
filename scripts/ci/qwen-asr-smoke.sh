@@ -102,7 +102,7 @@ def validate_qwen_diagnostics(diagnostics):
         raise SystemExit(
             f"{case_name}: expected qwen3_asr diagnostics, got {diagnostics.get('model_family')!r}"
         )
-    for section in ("audio", "prompt", "decode", "timings_ms"):
+    for section in ("audio", "prompt", "decode", "execution", "timings_ms"):
         if not isinstance(diagnostics.get(section), dict):
             raise SystemExit(f"{case_name}: diagnostics missing {section} object")
     timings = diagnostics["timings_ms"]
@@ -122,6 +122,33 @@ def validate_qwen_diagnostics(diagnostics):
                 )
     if diagnostics["decode"]["generated_tokens"] == 0 and case_name != "short_verbose":
         raise SystemExit(f"{case_name}: generated_tokens was zero")
+    execution = diagnostics["execution"]
+    expected_device_kind = {
+        "cpu": "Cpu",
+        "metal": "Metal",
+        "cuda": "Cuda",
+    }.get(backend)
+    if expected_device_kind and execution.get("device_kind") != expected_device_kind:
+        raise SystemExit(
+            f"{case_name}: expected execution.device_kind={expected_device_kind}, got {execution.get('device_kind')!r}"
+        )
+    for key in ("audio_dtype", "text_dtype", "checkpoint_format", "text_projection_backend"):
+        value = execution.get(key)
+        if not isinstance(value, str) or not value:
+            raise SystemExit(f"{case_name}: expected non-empty execution.{key}, got {value!r}")
+    for key in (
+        "flash_attention_requested",
+        "flash_attention_compiled",
+        "dense_decode_enabled",
+        "gguf_qmatmul_text_enabled",
+        "text_projection_quantized",
+    ):
+        if not isinstance(execution.get(key), bool):
+            raise SystemExit(f"{case_name}: expected boolean execution.{key}")
+    for key in ("kv_page_size", "dense_decode_max_tokens", "qmatmul_projection_count", "dense_projection_count"):
+        value = execution.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise SystemExit(f"{case_name}: expected non-negative integer execution.{key}, got {value!r}")
 
 
 def validate_text(response_text):
