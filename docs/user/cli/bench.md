@@ -255,6 +255,13 @@ When validating audio chunk varlen FlashAttention specifically, also set
 `IZWI_QWEN_ASR_SMOKE_REQUIRE_FUSED_CHUNKS=1` so the smoke script fails if the
 runtime chunk-attention counters do not show fused spans.
 
+Paged attention or elementwise custom CUDA kernels are a later escalation, not
+the default second-wave path. Only start that work when the JSON artifacts show
+that dense decode, Candle FlashAttention, audio varlen attention, and QMatMul are
+all active or inapplicable, and the remaining bottleneck is still paged decode
+or elementwise launch overhead. Until then, keep Qwen-ASR CUDA work routed
+through Candle kernels and existing exact fallbacks.
+
 ---
 
 ## izwi bench throughput
