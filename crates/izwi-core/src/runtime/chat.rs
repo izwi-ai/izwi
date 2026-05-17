@@ -12,11 +12,54 @@ use crate::runtime::service::RuntimeService;
 use crate::runtime::types::ChatGeneration;
 
 const DEFAULT_QWEN35_CUDA_SAFE_PREFILL_TOKENS: usize = 8192;
+const DEFAULT_QWEN35_CUDA_PREFILL_CHUNK_TOKENS: usize = 4096;
 const QWEN35_CUDA_SAFE_PREFILL_ENV: &str = "IZWI_QWEN35_CUDA_SAFE_PREFILL_TOKENS";
+const QWEN35_CUDA_PREFILL_CHUNK_ENV: &str = "IZWI_QWEN35_CUDA_PREFILL_CHUNK_TOKENS";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen35CudaContextBudget {
+    pub total_context_tokens: usize,
+    pub prefill_chunk_tokens: usize,
+    pub runtime_max_sequence_length: usize,
+    pub model_context_length: Option<usize>,
+}
 
 impl RuntimeService {
+    pub fn qwen35_cuda_prefill_chunk_tokens(&self) -> usize {
+        qwen35_cuda_prefill_chunk_tokens()
+    }
+
     pub fn qwen35_cuda_safe_prefill_tokens(&self) -> usize {
         qwen35_cuda_safe_prefill_tokens()
+    }
+
+    pub fn qwen35_cuda_context_budget(
+        &self,
+        model_context_length: Option<usize>,
+    ) -> Qwen35CudaContextBudget {
+        qwen35_cuda_context_budget(self.config.max_sequence_length, model_context_length)
+    }
+
+    pub async fn qwen35_cuda_context_budget_for_variant(
+        &self,
+        variant: ModelVariant,
+    ) -> Result<Option<Qwen35CudaContextBudget>> {
+        if self.backend_context().backend_kind != BackendKind::Cuda
+            || variant.family() != ModelFamily::Qwen35Chat
+        {
+            return Ok(None);
+        }
+
+        self.load_model(variant).await?;
+        let _lease = self.acquire_model_residency_lease(variant);
+        let chat_model = self
+            .model_registry
+            .get_chat(variant)
+            .await
+            .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?;
+        Ok(Some(self.qwen35_cuda_context_budget(
+            chat_model.qwen35_context_length_hint(),
+        )))
     }
 
     fn prompt_token_config(
@@ -137,6 +180,7 @@ impl RuntimeService {
             model_context_length = model_context_length.unwrap_or_default(),
             limit_tokens = limit,
             safe_prefill_tokens = qwen35_cuda_safe_prefill_tokens(),
+            prefill_chunk_tokens = qwen35_cuda_prefill_chunk_tokens(),
             "Validated Qwen3.5 CUDA chat prompt budget"
         );
         Ok(())
@@ -398,6 +442,20 @@ fn qwen35_cuda_safe_prefill_tokens() -> usize {
         .unwrap_or(DEFAULT_QWEN35_CUDA_SAFE_PREFILL_TOKENS)
 }
 
+fn qwen35_cuda_prefill_chunk_tokens() -> usize {
+    std::env::var(QWEN35_CUDA_PREFILL_CHUNK_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .or_else(|| {
+            std::env::var(QWEN35_CUDA_SAFE_PREFILL_ENV)
+                .ok()
+                .and_then(|raw| raw.trim().parse::<usize>().ok())
+                .filter(|value| *value > 0)
+        })
+        .unwrap_or(DEFAULT_QWEN35_CUDA_PREFILL_CHUNK_TOKENS)
+}
+
 fn qwen35_cuda_context_budget_limit(
     runtime_max_sequence_length: usize,
     model_context_length: Option<usize>,
@@ -407,6 +465,23 @@ fn qwen35_cuda_context_budget_limit(
         .filter(|limit| *limit > 0)
         .map(|model_limit| runtime_limit.min(model_limit))
         .unwrap_or(runtime_limit)
+}
+
+fn qwen35_cuda_context_budget(
+    runtime_max_sequence_length: usize,
+    model_context_length: Option<usize>,
+) -> Qwen35CudaContextBudget {
+    let total_context_tokens =
+        qwen35_cuda_context_budget_limit(runtime_max_sequence_length, model_context_length);
+    let prefill_chunk_tokens = qwen35_cuda_prefill_chunk_tokens()
+        .max(1)
+        .min(total_context_tokens.max(1));
+    Qwen35CudaContextBudget {
+        total_context_tokens,
+        prefill_chunk_tokens,
+        runtime_max_sequence_length: runtime_max_sequence_length.max(1),
+        model_context_length,
+    }
 }
 
 fn validate_qwen35_cuda_context_budget(
@@ -435,8 +510,9 @@ fn validate_qwen35_cuda_context_budget(
 #[cfg(test)]
 mod tests {
     use super::{
-        qwen35_cuda_context_budget_limit, qwen35_cuda_safe_prefill_tokens,
-        validate_qwen35_cuda_context_budget, QWEN35_CUDA_SAFE_PREFILL_ENV,
+        QWEN35_CUDA_PREFILL_CHUNK_ENV, QWEN35_CUDA_SAFE_PREFILL_ENV, qwen35_cuda_context_budget,
+        qwen35_cuda_context_budget_limit, qwen35_cuda_prefill_chunk_tokens,
+        qwen35_cuda_safe_prefill_tokens, validate_qwen35_cuda_context_budget,
     };
     use crate::error::Error;
 
@@ -469,9 +545,58 @@ mod tests {
     }
 
     #[test]
+    fn qwen35_cuda_context_budget_separates_total_context_from_prefill_chunk() {
+        let _guard = crate::env_test_lock().lock().expect("env lock");
+        std::env::set_var(QWEN35_CUDA_PREFILL_CHUNK_ENV, "2048");
+
+        let budget = qwen35_cuda_context_budget(65_536, Some(262_144));
+
+        assert_eq!(budget.total_context_tokens, 65_536);
+        assert_eq!(budget.prefill_chunk_tokens, 2048);
+        assert_eq!(budget.runtime_max_sequence_length, 65_536);
+        assert_eq!(budget.model_context_length, Some(262_144));
+
+        std::env::remove_var(QWEN35_CUDA_PREFILL_CHUNK_ENV);
+    }
+
+    #[test]
+    fn qwen35_cuda_prefill_chunk_tokens_are_clamped_to_total_context_budget() {
+        let _guard = crate::env_test_lock().lock().expect("env lock");
+        std::env::set_var(QWEN35_CUDA_PREFILL_CHUNK_ENV, "8192");
+
+        let budget = qwen35_cuda_context_budget(4096, Some(262_144));
+
+        assert_eq!(budget.total_context_tokens, 4096);
+        assert_eq!(budget.prefill_chunk_tokens, 4096);
+
+        std::env::remove_var(QWEN35_CUDA_PREFILL_CHUNK_ENV);
+    }
+
+    #[test]
+    fn qwen35_cuda_prefill_chunk_tokens_use_new_env_before_legacy_safe_env() {
+        let _guard = crate::env_test_lock().lock().expect("env lock");
+        std::env::remove_var(QWEN35_CUDA_PREFILL_CHUNK_ENV);
+        std::env::remove_var(QWEN35_CUDA_SAFE_PREFILL_ENV);
+        assert_eq!(qwen35_cuda_prefill_chunk_tokens(), 4096);
+
+        std::env::set_var(QWEN35_CUDA_SAFE_PREFILL_ENV, "8192");
+        assert_eq!(qwen35_cuda_prefill_chunk_tokens(), 8192);
+
+        std::env::set_var(QWEN35_CUDA_PREFILL_CHUNK_ENV, "2048");
+        assert_eq!(qwen35_cuda_prefill_chunk_tokens(), 2048);
+
+        std::env::set_var(QWEN35_CUDA_PREFILL_CHUNK_ENV, "0");
+        assert_eq!(qwen35_cuda_prefill_chunk_tokens(), 8192);
+
+        std::env::remove_var(QWEN35_CUDA_PREFILL_CHUNK_ENV);
+        std::env::remove_var(QWEN35_CUDA_SAFE_PREFILL_ENV);
+    }
+
+    #[test]
     fn qwen35_cuda_safe_prefill_tokens_uses_positive_env_override() {
         let _guard = crate::env_test_lock().lock().expect("env lock");
 
+        std::env::remove_var(QWEN35_CUDA_PREFILL_CHUNK_ENV);
         std::env::remove_var(QWEN35_CUDA_SAFE_PREFILL_ENV);
         assert_eq!(qwen35_cuda_safe_prefill_tokens(), 8192);
 
