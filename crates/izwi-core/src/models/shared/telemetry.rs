@@ -63,7 +63,7 @@ pub enum AttentionFallbackReason {
 }
 
 impl AttentionFallbackReason {
-    fn as_label(self) -> &'static str {
+    pub const fn as_label(self) -> &'static str {
         match self {
             Self::FlashNotRequested => "flash_not_requested",
             Self::FlashNotCompiled => "flash_not_compiled",

@@ -111,6 +111,19 @@ enum CudaFlashAttentionDecision {
     Skip(AttentionFallbackReason),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CudaFlashAttentionProbe {
+    pub requested: bool,
+    pub compiled: bool,
+    pub masked: bool,
+    pub head_dim: usize,
+    pub q_dtype: DType,
+    pub k_dtype: DType,
+    pub v_dtype: DType,
+    pub eligible: bool,
+    pub fallback_reason: Option<AttentionFallbackReason>,
+}
+
 fn should_try_cuda_flash_attention(
     requested: bool,
     compiled: bool,
@@ -140,6 +153,44 @@ fn should_try_cuda_flash_attention(
     }
 
     CudaFlashAttentionDecision::Try
+}
+
+pub fn cuda_flash_attention_probe(
+    masked: bool,
+    head_dim: usize,
+    q_dtype: DType,
+    k_dtype: DType,
+    v_dtype: DType,
+) -> CudaFlashAttentionProbe {
+    let requested = flash_attention_requested();
+    let compiled = flash_attention_compiled();
+    let decision = should_try_cuda_flash_attention(
+        requested, compiled, masked, head_dim, q_dtype, k_dtype, v_dtype,
+    );
+    match decision {
+        CudaFlashAttentionDecision::Try => CudaFlashAttentionProbe {
+            requested,
+            compiled,
+            masked,
+            head_dim,
+            q_dtype,
+            k_dtype,
+            v_dtype,
+            eligible: true,
+            fallback_reason: None,
+        },
+        CudaFlashAttentionDecision::Skip(reason) => CudaFlashAttentionProbe {
+            requested,
+            compiled,
+            masked,
+            head_dim,
+            q_dtype,
+            k_dtype,
+            v_dtype,
+            eligible: false,
+            fallback_reason: Some(reason),
+        },
+    }
 }
 
 /// Try a fused self-attention kernel and return `None` when unsupported.
@@ -597,9 +648,9 @@ fn dtype_supported_for_flash(dtype: DType) -> bool {
 mod tests {
     use super::{
         cuda_flash_attention_capabilities, cuda_flash_attention_head_dim_supported,
-        cuda_flash_attention_window, metal_sdpa_mask_shape_supported, metal_sdpa_shape_supported,
-        should_try_cuda_flash_attention, should_use_metal_sdpa_f16_cast,
-        CudaFlashAttentionDecision, CudaFlashAttentionOptions,
+        cuda_flash_attention_probe, cuda_flash_attention_window, metal_sdpa_mask_shape_supported,
+        metal_sdpa_shape_supported, should_try_cuda_flash_attention,
+        should_use_metal_sdpa_f16_cast, CudaFlashAttentionDecision, CudaFlashAttentionOptions,
         CUDA_FLASH_ATTENTION_HEAD_DIM_MULTIPLE, CUDA_FLASH_ATTENTION_MAX_HEAD_DIM,
     };
     use crate::models::shared::telemetry::AttentionFallbackReason;
@@ -757,6 +808,24 @@ mod tests {
                 DType::F16
             ),
             CudaFlashAttentionDecision::Skip(AttentionFallbackReason::UnsupportedBackend)
+        );
+    }
+
+    #[test]
+    fn cuda_flash_attention_probe_exposes_fallback_reason() {
+        let _guard = crate::env_test_lock().lock().expect("env lock");
+        std::env::remove_var("IZWI_USE_FLASH_ATTENTION");
+
+        let probe = cuda_flash_attention_probe(false, 128, DType::BF16, DType::BF16, DType::BF16);
+        assert!(!probe.requested);
+        assert!(!probe.eligible);
+        assert_eq!(
+            probe.fallback_reason,
+            Some(AttentionFallbackReason::FlashNotRequested)
+        );
+        assert_eq!(
+            probe.fallback_reason.map(AttentionFallbackReason::as_label),
+            Some("flash_not_requested")
         );
     }
 

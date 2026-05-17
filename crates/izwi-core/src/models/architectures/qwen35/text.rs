@@ -17,8 +17,8 @@ use crate::kernels::{
 };
 use crate::models::architectures::qwen3::core::repeat_kv;
 use crate::models::shared::attention::flash::{
-    cuda_flash_attention_capabilities, flash_attention_compiled, flash_attention_requested,
-    try_fused_self_attention,
+    cuda_flash_attention_capabilities, cuda_flash_attention_probe, flash_attention_compiled,
+    flash_attention_requested, try_fused_self_attention,
 };
 use crate::models::shared::attention::paged::{
     append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
@@ -234,11 +234,13 @@ impl Qwen35TextModel {
         let mut rope_kernel_enabled_layers = 0usize;
         let mut kv_page_size = None;
         let mut kv_quantization = None;
+        let mut full_attention_head_dim = None;
 
         for layer in &self.layers {
             match &layer.mixer {
                 Qwen35Mixer::Full(attn) => {
                     full_attention_layers = full_attention_layers.saturating_add(1);
+                    full_attention_head_dim.get_or_insert(attn.head_dim);
                     if attn.dense_decode_attention_enabled {
                         dense_decode_enabled_layers = dense_decode_enabled_layers.saturating_add(1);
                     }
@@ -255,6 +257,27 @@ impl Qwen35TextModel {
         }
 
         let flash = cuda_flash_attention_capabilities();
+        let activation_dtype = self.token_embeddings.embeddings().dtype();
+        let flash_probe = full_attention_head_dim.map(|head_dim| {
+            cuda_flash_attention_probe(
+                false,
+                head_dim,
+                activation_dtype,
+                activation_dtype,
+                activation_dtype,
+            )
+        });
+        let flash_probe = flash_probe.map(|probe| {
+            serde_json::json!({
+                "eligible": probe.eligible,
+                "fallback_reason": probe.fallback_reason.map(|reason| reason.as_label()),
+                "masked": probe.masked,
+                "head_dim": probe.head_dim,
+                "q_dtype": format!("{:?}", probe.q_dtype),
+                "k_dtype": format!("{:?}", probe.k_dtype),
+                "v_dtype": format!("{:?}", probe.v_dtype),
+            })
+        });
         serde_json::json!({
             "device": {
                 "debug": format!("{:?}", self.device),
@@ -262,7 +285,7 @@ impl Qwen35TextModel {
                 "is_metal": self.device.is_metal(),
             },
             "dtypes": {
-                "token_embeddings": format!("{:?}", self.token_embeddings.embeddings().dtype()),
+                "token_embeddings": format!("{:?}", activation_dtype),
             },
             "layers": {
                 "total": self.layers.len(),
@@ -290,6 +313,7 @@ impl Qwen35TextModel {
                 "supports_alibi": flash.supports_alibi,
                 "supports_softcap": flash.supports_softcap,
                 "supports_varlen": flash.supports_varlen,
+                "qwen35_unmasked_probe": flash_probe,
             }
         })
     }
