@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use candle_core::quantized::gguf_file::Value as GgufValue;
-use candle_core::{DType, IndexOp, Tensor, D};
+use candle_core::{D, DType, IndexOp, Tensor};
 use serde::Deserialize;
 use tracing::info;
 
@@ -52,6 +52,38 @@ pub struct ChatDecodeState {
     next_text_position: usize,
     config: ChatGenerationConfig,
     rng: SimpleRng,
+}
+
+pub struct ChatPrefillState {
+    prepared_prompt: PreparedPrompt,
+    text_state: Qwen35TextRuntimeState,
+    next_prompt_offset: usize,
+    vision_embedding_index: usize,
+    logits: Option<Tensor>,
+    max_new_tokens: usize,
+    config: ChatGenerationConfig,
+}
+
+impl ChatPrefillState {
+    pub fn prompt_tokens_total(&self) -> usize {
+        self.prepared_prompt.prompt_ids.len()
+    }
+
+    pub fn prompt_tokens_processed(&self) -> usize {
+        self.next_prompt_offset
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.next_prompt_offset >= self.prepared_prompt.prompt_ids.len()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatPrefillStep {
+    pub tokens_processed: usize,
+    pub prompt_tokens_processed: usize,
+    pub prompt_tokens_total: usize,
+    pub finished: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -456,6 +488,10 @@ impl Qwen35ChatModel {
         true
     }
 
+    pub fn supports_continuation_prefill(&self) -> bool {
+        true
+    }
+
     pub fn device_kind(&self) -> BackendKind {
         self.device_kind
     }
@@ -487,26 +523,110 @@ impl Qwen35ChatModel {
 
         let mut text_state = self.text_model.new_state();
         let logits = self.prefill_prompt(&prepared_prompt, &mut text_state)?;
-        let track_history =
-            config.repetition_penalty > 1.0 || config.presence_penalty.abs() > f32::EPSILON;
-
-        Ok(ChatDecodeState {
+        Ok(self.decode_state_from_prefill(
+            &prepared_prompt,
             text_state,
             logits,
-            history_ids: if track_history {
-                Vec::with_capacity(max_new_tokens.max(1))
-            } else {
-                Vec::new()
-            },
-            tokens_generated: 0,
-            track_history,
-            assembled: String::new(),
+            max_new_tokens,
+            config,
+        ))
+    }
+
+    pub fn start_prefill_state_with_config(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+    ) -> Result<ChatPrefillState> {
+        let prepared_prompt = self.prepare_prompt(messages, config)?;
+        if prepared_prompt.prompt_ids.is_empty() {
+            return Err(Error::InvalidInput(
+                "Chat request must include at least one tokenizable message".to_string(),
+            ));
+        }
+
+        Ok(ChatPrefillState {
+            prepared_prompt,
+            text_state: self.text_model.new_state(),
+            next_prompt_offset: 0,
+            vision_embedding_index: 0,
+            logits: None,
             max_new_tokens: max_new_tokens.max(1),
-            finished: false,
-            next_text_position: prepared_prompt.next_text_position,
             config: config.clone(),
-            rng: SimpleRng::new(config.seed),
         })
+    }
+
+    pub fn prefill_next_chunk(
+        &self,
+        state: &mut ChatPrefillState,
+        max_tokens: usize,
+    ) -> Result<ChatPrefillStep> {
+        if state.is_complete() {
+            self.validate_prefill_completion(
+                &state.prepared_prompt,
+                state.vision_embedding_index,
+                &state.logits,
+            )?;
+            return Ok(ChatPrefillStep {
+                tokens_processed: 0,
+                prompt_tokens_processed: state.prompt_tokens_processed(),
+                prompt_tokens_total: state.prompt_tokens_total(),
+                finished: true,
+            });
+        }
+
+        let tokens_processed = self.prefill_prompt_chunk(
+            &state.prepared_prompt,
+            &mut state.text_state,
+            &mut state.next_prompt_offset,
+            &mut state.vision_embedding_index,
+            &mut state.logits,
+            max_tokens,
+        )?;
+        let finished = state.is_complete();
+        if finished {
+            self.validate_prefill_completion(
+                &state.prepared_prompt,
+                state.vision_embedding_index,
+                &state.logits,
+            )?;
+        }
+
+        Ok(ChatPrefillStep {
+            tokens_processed,
+            prompt_tokens_processed: state.prompt_tokens_processed(),
+            prompt_tokens_total: state.prompt_tokens_total(),
+            finished,
+        })
+    }
+
+    pub fn finish_prefill_state(&self, state: ChatPrefillState) -> Result<ChatDecodeState> {
+        let ChatPrefillState {
+            prepared_prompt,
+            text_state,
+            next_prompt_offset,
+            vision_embedding_index,
+            logits,
+            max_new_tokens,
+            config,
+        } = state;
+        if next_prompt_offset < prepared_prompt.prompt_ids.len() {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3.5 prompt prefill is incomplete: processed {next_prompt_offset} of {} tokens",
+                prepared_prompt.prompt_ids.len()
+            )));
+        }
+        self.validate_prefill_completion(&prepared_prompt, vision_embedding_index, &logits)?;
+        let logits = logits.ok_or_else(|| {
+            Error::InferenceError("Qwen3.5 prompt prefill did not produce logits".to_string())
+        })?;
+        Ok(self.decode_state_from_prefill(
+            &prepared_prompt,
+            text_state,
+            logits,
+            max_new_tokens,
+            &config,
+        ))
     }
 
     pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
@@ -585,18 +705,52 @@ impl Qwen35ChatModel {
     ) -> Result<Tensor> {
         let mut logits: Option<Tensor> = None;
         let mut vision_embedding_index = 0usize;
-        let mut idx = 0usize;
-        while idx < prepared_prompt.prompt_ids.len() {
+        let mut next_prompt_offset = 0usize;
+        while next_prompt_offset < prepared_prompt.prompt_ids.len() {
+            self.prefill_prompt_chunk(
+                prepared_prompt,
+                text_state,
+                &mut next_prompt_offset,
+                &mut vision_embedding_index,
+                &mut logits,
+                usize::MAX,
+            )?;
+        }
+
+        self.validate_prefill_completion(prepared_prompt, vision_embedding_index, &logits)?;
+        logits.ok_or_else(|| {
+            Error::InferenceError("Qwen3.5 prompt prefill did not produce logits".to_string())
+        })
+    }
+
+    fn prefill_prompt_chunk(
+        &self,
+        prepared_prompt: &PreparedPrompt,
+        text_state: &mut Qwen35TextRuntimeState,
+        next_prompt_offset: &mut usize,
+        vision_embedding_index: &mut usize,
+        logits: &mut Option<Tensor>,
+        max_tokens: usize,
+    ) -> Result<usize> {
+        let prompt_len = prepared_prompt.prompt_ids.len();
+        if *next_prompt_offset >= prompt_len {
+            return Ok(0);
+        }
+
+        let start = *next_prompt_offset;
+        let chunk_end = prompt_len.min(start.saturating_add(max_tokens.max(1)));
+        while *next_prompt_offset < chunk_end {
+            let idx = *next_prompt_offset;
             let token_id = prepared_prompt.prompt_ids[idx];
             let position_ids = prepared_prompt.prompt_positions[idx];
-            let is_last = idx + 1 == prepared_prompt.prompt_ids.len();
+            let is_last = idx + 1 == prompt_len;
             if token_id == self.tokenizer.specials.image_pad {
                 let vision_inputs = prepared_prompt.vision_inputs.as_ref().ok_or_else(|| {
                     Error::InvalidInput(
                         "Qwen3.5 image placeholders require paired media inputs".to_string(),
                     )
                 })?;
-                if vision_embedding_index >= vision_inputs.embeddings.dim(0)? {
+                if *vision_embedding_index >= vision_inputs.embeddings.dim(0)? {
                     return Err(Error::InferenceError(
                         "Qwen3.5 prompt consumed more image placeholders than vision embeddings"
                             .to_string(),
@@ -604,12 +758,12 @@ impl Qwen35ChatModel {
                 }
                 let embedding = vision_inputs
                     .embeddings
-                    .narrow(0, vision_embedding_index, 1)?
+                    .narrow(0, *vision_embedding_index, 1)?
                     .reshape((1, 1, self.text_model.hidden_size()))?;
-                vision_embedding_index += 1;
+                *vision_embedding_index += 1;
                 record_prefill_token_mode_step();
                 if is_last {
-                    logits = Some(self.text_model.forward_input_embedding_at(
+                    *logits = Some(self.text_model.forward_input_embedding_at(
                         &embedding,
                         position_ids,
                         text_state,
@@ -627,7 +781,7 @@ impl Qwen35ChatModel {
                 ));
             } else {
                 let mut run_end = idx + 1;
-                while run_end < prepared_prompt.prompt_ids.len() {
+                while run_end < chunk_end {
                     let candidate = prepared_prompt.prompt_ids[run_end];
                     if candidate == self.tokenizer.specials.image_pad
                         || candidate == self.tokenizer.specials.video_pad
@@ -637,22 +791,31 @@ impl Qwen35ChatModel {
                     run_end += 1;
                 }
 
-                let compute_logits = run_end == prepared_prompt.prompt_ids.len();
+                let compute_logits = run_end == prompt_len;
                 if let Some(run_logits) = self.text_model.prefill_token_ids(
                     &prepared_prompt.prompt_ids[idx..run_end],
                     &prepared_prompt.prompt_positions[idx..run_end],
                     text_state,
                     compute_logits,
                 )? {
-                    logits = Some(run_logits);
+                    *logits = Some(run_logits);
                 }
-                idx = run_end;
+                *next_prompt_offset = run_end;
                 continue;
             }
 
-            idx += 1;
+            *next_prompt_offset += 1;
         }
 
+        Ok((*next_prompt_offset).saturating_sub(start))
+    }
+
+    fn validate_prefill_completion(
+        &self,
+        prepared_prompt: &PreparedPrompt,
+        vision_embedding_index: usize,
+        logits: &Option<Tensor>,
+    ) -> Result<()> {
         if let Some(vision_inputs) = prepared_prompt.vision_inputs.as_ref() {
             if vision_embedding_index != vision_inputs.embeddings.dim(0)? {
                 return Err(Error::InferenceError(format!(
@@ -662,9 +825,43 @@ impl Qwen35ChatModel {
             }
         }
 
-        logits.ok_or_else(|| {
-            Error::InferenceError("Qwen3.5 prompt prefill did not produce logits".to_string())
-        })
+        if logits.is_none() {
+            return Err(Error::InferenceError(
+                "Qwen3.5 prompt prefill did not produce logits".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn decode_state_from_prefill(
+        &self,
+        prepared_prompt: &PreparedPrompt,
+        text_state: Qwen35TextRuntimeState,
+        logits: Tensor,
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+    ) -> ChatDecodeState {
+        let track_history =
+            config.repetition_penalty > 1.0 || config.presence_penalty.abs() > f32::EPSILON;
+
+        ChatDecodeState {
+            text_state,
+            logits,
+            history_ids: if track_history {
+                Vec::with_capacity(max_new_tokens.max(1))
+            } else {
+                Vec::new()
+            },
+            tokens_generated: 0,
+            track_history,
+            assembled: String::new(),
+            max_new_tokens: max_new_tokens.max(1),
+            finished: false,
+            next_text_position: prepared_prompt.next_text_position,
+            config: config.clone(),
+            rng: SimpleRng::new(config.seed),
+        }
     }
 
     fn prepare_prompt(
@@ -1360,7 +1557,7 @@ fn logits_to_vec(logits: &Tensor) -> Result<Vec<f32>> {
         rank => {
             return Err(Error::InferenceError(format!(
                 "Unexpected Qwen3.5 logits rank for sampling: {rank}"
-            )))
+            )));
         }
     };
 
@@ -1408,7 +1605,7 @@ fn argmax(logits: &Tensor) -> Result<u32> {
         rank => {
             return Err(Error::InferenceError(format!(
                 "Unexpected Qwen3.5 logits rank for argmax: {rank}"
-            )))
+            )));
         }
     };
 
@@ -1445,7 +1642,7 @@ fn argmax_clamped(logits: &Tensor, vocab_size: usize) -> Result<u32> {
         rank => {
             return Err(Error::InferenceError(format!(
                 "Unexpected Qwen3.5 logits rank for argmax: {rank}"
-            )))
+            )));
         }
     };
 
@@ -1691,10 +1888,12 @@ mod tests {
             model.text_checkpoint().architecture.as_deref(),
             Some("qwen35")
         );
-        assert!(model
-            .projector_checkpoint()
-            .path
-            .ends_with("mmproj-F16.gguf"));
+        assert!(
+            model
+                .projector_checkpoint()
+                .path
+                .ends_with("mmproj-F16.gguf")
+        );
     }
 
     #[test]
@@ -1730,6 +1929,77 @@ mod tests {
             .expect("qwen3.5 text generation should run");
 
         assert!(output.tokens_generated <= 4);
+    }
+
+    #[test]
+    fn chunked_prefill_matches_one_shot_decode_if_available() {
+        let model_dir = local_model_dir("Qwen3.5-0.8B");
+        if !model_dir.exists() {
+            return;
+        }
+
+        let model = Qwen35ChatModel::load(
+            &model_dir,
+            ModelVariant::Qwen3508BGguf,
+            DeviceProfile::cpu(),
+        )
+        .expect("qwen3.5 assets should load");
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "Reply with exactly one short word.".to_string(),
+        }];
+        let config = ChatGenerationConfig {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            stop_token_ids: Vec::new(),
+            seed: 7,
+            request: ChatRequestConfig::default(),
+        };
+        let prompt_tokens = model
+            .prompt_token_ids_with_config(&messages, &config)
+            .expect("prompt tokens");
+        let mut one_shot = model
+            .start_decode_state_with_config(&messages, 4, &config)
+            .expect("one-shot prefill");
+        let mut chunked_prefill = model
+            .start_prefill_state_with_config(&messages, 4, &config)
+            .expect("chunked prefill state");
+
+        assert_eq!(chunked_prefill.prompt_tokens_total(), prompt_tokens.len());
+        assert_eq!(chunked_prefill.prompt_tokens_processed(), 0);
+        assert!(!chunked_prefill.is_complete());
+
+        let mut processed = 0usize;
+        while !chunked_prefill.is_complete() {
+            let step = model
+                .prefill_next_chunk(&mut chunked_prefill, 3)
+                .expect("prefill chunk");
+            assert!(step.tokens_processed > 0);
+            processed += step.tokens_processed;
+            assert_eq!(step.prompt_tokens_processed, processed);
+            assert_eq!(step.prompt_tokens_total, prompt_tokens.len());
+            if !step.finished {
+                assert!(chunked_prefill.logits.is_none());
+            }
+        }
+
+        assert_eq!(processed, prompt_tokens.len());
+        let mut chunked = model
+            .finish_prefill_state(chunked_prefill)
+            .expect("finish chunked prefill");
+
+        let one_shot_step = model.decode_step(&mut one_shot).expect("one-shot decode");
+        let chunked_step = model.decode_step(&mut chunked).expect("chunked decode");
+        assert_eq!(chunked.next_text_position, one_shot.next_text_position);
+        assert_eq!(chunked_step.delta, one_shot_step.delta);
+        assert_eq!(
+            chunked_step.tokens_generated,
+            one_shot_step.tokens_generated
+        );
+        assert_eq!(chunked_step.finished, one_shot_step.finished);
     }
 
     fn generate_local_qwen35_variant_text_smoke_if_available(
