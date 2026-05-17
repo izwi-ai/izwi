@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use izwi_core::backends::BackendKind;
 use izwi_core::catalog::ModelFamily;
-use izwi_core::{ChatMessage, ChatRole, GenerationParams, ModelVariant, RuntimeService};
+use izwi_core::{
+    ChatMessage, ChatRole, GenerationParams, ModelVariant, Qwen35CudaContextBudget, RuntimeService,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SummaryKind {
@@ -86,16 +88,16 @@ pub(crate) fn should_use_cuda_hierarchical_summary(
         && variant.family() == ModelFamily::Qwen35Chat
 }
 
-pub(crate) fn summary_prompt_fits_cuda_prefill_budget(
+pub(crate) fn summary_prompt_fits_cuda_context_budget(
     prompt_tokens: usize,
     max_output_tokens: usize,
-    safe_prefill_tokens: usize,
+    total_context_tokens: usize,
 ) -> bool {
-    prompt_tokens.saturating_add(max_output_tokens.max(1)) <= safe_prefill_tokens.max(1)
+    prompt_tokens.saturating_add(max_output_tokens.max(1)) <= total_context_tokens.max(1)
 }
 
-pub(crate) fn summary_chunk_char_budget(safe_prefill_tokens: usize) -> usize {
-    safe_prefill_tokens.saturating_mul(3).clamp(1_024, 24_000)
+pub(crate) fn summary_chunk_char_budget(total_context_tokens: usize) -> usize {
+    total_context_tokens.saturating_mul(3).clamp(1_024, 24_000)
 }
 
 pub(crate) fn single_pass_summary_messages(
@@ -216,24 +218,25 @@ pub(crate) async fn generate_summary_with_cuda_planner(
     correlation_id: Option<&str>,
     sanitize: fn(&str) -> Option<String>,
 ) -> Result<PlannedSummary, String> {
-    let safe_prefill_tokens = runtime.qwen35_cuda_safe_prefill_tokens();
+    let cuda_budget = summary_cuda_context_budget(&runtime, variant).await?;
     let single_pass_messages = single_pass_summary_messages(kind, system_prompt, input);
     let single_prompt_tokens =
         count_summary_prompt_tokens(&runtime, variant, &single_pass_messages, &params).await?;
 
-    if summary_prompt_fits_cuda_prefill_budget(
+    if summary_prompt_fits_cuda_context_budget(
         single_prompt_tokens,
         params.max_tokens,
-        safe_prefill_tokens,
+        cuda_budget.total_context_tokens,
     ) {
         tracing::info!(
             target: "izwi.summary",
             summary_kind = kind.as_str(),
             summary_strategy = SummaryStrategy::SinglePass.as_str(),
             prompt_tokens = single_prompt_tokens,
-            safe_prefill_tokens,
+            total_context_tokens = cuda_budget.total_context_tokens,
+            prefill_chunk_tokens = cuda_budget.prefill_chunk_tokens,
             correlation_id = correlation_id.unwrap_or_default(),
-            "CUDA summary prompt fits single-pass prefill budget"
+            "CUDA summary prompt fits total context budget"
         );
         let text = generate_summary_text(
             &runtime,
@@ -259,7 +262,7 @@ pub(crate) async fn generate_summary_with_cuda_planner(
         system_prompt,
         input,
         &params,
-        safe_prefill_tokens,
+        cuda_budget.total_context_tokens,
     )
     .await?;
     tracing::info!(
@@ -267,10 +270,11 @@ pub(crate) async fn generate_summary_with_cuda_planner(
         summary_kind = kind.as_str(),
         summary_strategy = SummaryStrategy::Hierarchical.as_str(),
         prompt_tokens = single_prompt_tokens,
-        safe_prefill_tokens,
+        total_context_tokens = cuda_budget.total_context_tokens,
+        prefill_chunk_tokens = cuda_budget.prefill_chunk_tokens,
         chunk_count = chunks.len(),
         correlation_id = correlation_id.unwrap_or_default(),
-        "CUDA summary prompt exceeds single-pass budget; using hierarchical summary"
+        "CUDA summary prompt exceeds total context budget; using hierarchical summary"
     );
 
     let mut chunk_summaries = Vec::with_capacity(chunks.len());
@@ -291,16 +295,17 @@ pub(crate) async fn generate_summary_with_cuda_planner(
     let synthesis_messages = synthesis_summary_messages(kind, system_prompt, &chunk_summaries);
     let synthesis_prompt_tokens =
         count_summary_prompt_tokens(&runtime, variant, &synthesis_messages, &params).await?;
-    if !summary_prompt_fits_cuda_prefill_budget(
+    if !summary_prompt_fits_cuda_context_budget(
         synthesis_prompt_tokens,
         params.max_tokens,
-        safe_prefill_tokens,
+        cuda_budget.total_context_tokens,
     ) {
         return Err(format!(
-            "Summary generation failed: final synthesis prompt exceeds CUDA safe prefill budget: prompt_tokens={}, max_tokens={}, safe_prefill_tokens={}, chunk_count={}",
+            "Summary generation failed: final synthesis prompt exceeds CUDA total context budget: prompt_tokens={}, max_tokens={}, total_context_tokens={}, prefill_chunk_tokens={}, chunk_count={}",
             synthesis_prompt_tokens,
             params.max_tokens.max(1),
-            safe_prefill_tokens,
+            cuda_budget.total_context_tokens,
+            cuda_budget.prefill_chunk_tokens,
             chunk_summaries.len()
         ));
     }
@@ -329,9 +334,9 @@ async fn plan_summary_chunks(
     system_prompt: &str,
     input: &str,
     params: &GenerationParams,
-    safe_prefill_tokens: usize,
+    total_context_tokens: usize,
 ) -> Result<Vec<String>, String> {
-    let mut char_budget = summary_chunk_char_budget(safe_prefill_tokens);
+    let mut char_budget = summary_chunk_char_budget(total_context_tokens);
     for _ in 0..8 {
         let chunks = split_summary_input_by_line_budget(input, char_budget);
         if chunks.is_empty() {
@@ -344,10 +349,10 @@ async fn plan_summary_chunks(
                 chunk_summary_messages(kind, system_prompt, chunk, idx + 1, chunks.len());
             let prompt_tokens =
                 count_summary_prompt_tokens(runtime, variant, &messages, params).await?;
-            if !summary_prompt_fits_cuda_prefill_budget(
+            if !summary_prompt_fits_cuda_context_budget(
                 prompt_tokens,
                 params.max_tokens,
-                safe_prefill_tokens,
+                total_context_tokens,
             ) {
                 all_fit = false;
                 break;
@@ -363,10 +368,25 @@ async fn plan_summary_chunks(
     }
 
     Err(format!(
-        "Summary generation failed: unable to split {} under CUDA safe prefill budget {}",
+        "Summary generation failed: unable to split {} under CUDA total context budget {}",
         kind.input_label(),
-        safe_prefill_tokens
+        total_context_tokens
     ))
+}
+
+async fn summary_cuda_context_budget(
+    runtime: &RuntimeService,
+    variant: ModelVariant,
+) -> Result<Qwen35CudaContextBudget, String> {
+    runtime
+        .qwen35_cuda_context_budget_for_variant(variant)
+        .await
+        .map_err(|err| format!("Summary generation failed: CUDA context budget lookup failed: {err}"))?
+        .ok_or_else(|| {
+            format!(
+                "Summary generation failed: CUDA context planner is only available for Qwen3.5 chat models, got {variant}"
+            )
+        })
 }
 
 async fn count_summary_prompt_tokens(
@@ -433,14 +453,15 @@ fn title_case_label(label: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        chunk_summary_messages, single_pass_summary_messages, split_summary_input_by_line_budget,
-        summary_chunk_char_budget, summary_prompt_fits_cuda_prefill_budget, SummaryKind,
+        SummaryKind, chunk_summary_messages, single_pass_summary_messages,
+        split_summary_input_by_line_budget, summary_chunk_char_budget,
+        summary_prompt_fits_cuda_context_budget,
     };
 
     #[test]
     fn summary_prompt_budget_reserves_output_tokens() {
-        assert!(summary_prompt_fits_cuda_prefill_budget(7000, 1000, 8192));
-        assert!(!summary_prompt_fits_cuda_prefill_budget(8000, 384, 8192));
+        assert!(summary_prompt_fits_cuda_context_budget(7000, 1000, 8192));
+        assert!(!summary_prompt_fits_cuda_context_budget(8000, 384, 8192));
     }
 
     #[test]
@@ -466,9 +487,11 @@ mod tests {
     fn summary_messages_keep_existing_single_pass_instruction() {
         let messages = single_pass_summary_messages(SummaryKind::Diarization, "system", "hello");
         assert_eq!(messages[0].content, "system");
-        assert!(messages[1]
-            .content
-            .starts_with("Summarize the following diarized transcript."));
+        assert!(
+            messages[1]
+                .content
+                .starts_with("Summarize the following diarized transcript.")
+        );
         assert!(messages[1].content.contains("Transcript:\nhello"));
     }
 

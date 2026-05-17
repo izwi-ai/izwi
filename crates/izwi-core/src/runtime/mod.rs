@@ -24,6 +24,7 @@ mod types;
 mod voice_metrics;
 mod voice_session;
 
+pub use chat::Qwen35CudaContextBudget;
 pub use conformance::{
     capability_conformance_cases, required_conformance_capabilities,
     CapabilityConformanceCase, ConformanceCapability, ConformanceExecutionClass,

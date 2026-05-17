@@ -68,6 +68,19 @@ fn configure_qwen35_cuda_prefill_scheduler(
         .min(core_config.max_tokens_per_step);
 }
 
+fn configure_qwen35_cuda_context_window(
+    config: &mut EngineConfig,
+    selected_backend_kind: BackendKind,
+) {
+    if selected_backend_kind != BackendKind::Cuda {
+        return;
+    }
+
+    config.max_sequence_length = config
+        .max_sequence_length
+        .max(super::chat::qwen35_cuda_total_context_tokens().max(1));
+}
+
 /// Main inference engine runtime.
 pub struct RuntimeService {
     pub(crate) config: EngineConfig,
@@ -158,15 +171,16 @@ impl RuntimeService {
     }
 
     /// Create a new inference engine.
-    pub fn new(config: EngineConfig) -> Result<Self> {
+    pub fn new(mut config: EngineConfig) -> Result<Self> {
         configure_runtime_threading(config.num_threads.max(1));
-        let model_manager = Arc::new(ModelManager::new(config.clone())?);
-
         let backend_context =
             BackendRouter::resolve_context(config.backend, BackendSelectionSource::Config);
         let device = backend_context.device.clone();
         Self::ensure_requested_backend_available(&backend_context)?;
         let selected_backend_kind = backend_context.backend_kind;
+        configure_qwen35_cuda_context_window(&mut config, selected_backend_kind);
+
+        let model_manager = Arc::new(ModelManager::new(config.clone())?);
 
         let model_registry = Arc::new(ModelRegistry::new(
             config.models_dir.clone(),
@@ -859,6 +873,22 @@ mod tests {
         assert!(cuda_config.enable_chunked_prefill);
 
         std::env::remove_var("IZWI_QWEN35_CUDA_PREFILL_CHUNK_TOKENS");
+    }
+
+    #[test]
+    fn qwen35_cuda_context_window_tuning_is_cuda_only() {
+        let _guard = crate::env_test_lock().lock().expect("env lock");
+        std::env::set_var("IZWI_QWEN35_CUDA_CONTEXT_TOKENS", "65536");
+
+        let mut cpu_config = EngineConfig::default();
+        configure_qwen35_cuda_context_window(&mut cpu_config, BackendKind::Cpu);
+        assert_eq!(cpu_config.max_sequence_length, 4096);
+
+        let mut cuda_config = EngineConfig::default();
+        configure_qwen35_cuda_context_window(&mut cuda_config, BackendKind::Cuda);
+        assert_eq!(cuda_config.max_sequence_length, 65_536);
+
+        std::env::remove_var("IZWI_QWEN35_CUDA_CONTEXT_TOKENS");
     }
 
     #[tokio::test]

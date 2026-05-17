@@ -69,7 +69,7 @@ pub use runtime::{
 pub use runtime::{
     AsrTranscription, ChatGeneration, ChunkStats, DiarizationConfig, DiarizationResult,
     DiarizationSegment, DiarizationTranscriptResult, DiarizationUtterance, DiarizationWord,
-    GenerationRequest, GenerationResult,
+    GenerationRequest, GenerationResult, Qwen35CudaContextBudget,
 };
 pub use runtime::{
     AudioChunk, EngineRuntimeTelemetrySnapshot, GenerationConfig,

@@ -13,8 +13,10 @@ use crate::runtime::types::ChatGeneration;
 
 const DEFAULT_QWEN35_CUDA_SAFE_PREFILL_TOKENS: usize = 8192;
 const DEFAULT_QWEN35_CUDA_PREFILL_CHUNK_TOKENS: usize = 4096;
+const DEFAULT_QWEN35_CUDA_CONTEXT_TOKENS: usize = 262_144;
 const QWEN35_CUDA_SAFE_PREFILL_ENV: &str = "IZWI_QWEN35_CUDA_SAFE_PREFILL_TOKENS";
 const QWEN35_CUDA_PREFILL_CHUNK_ENV: &str = "IZWI_QWEN35_CUDA_PREFILL_CHUNK_TOKENS";
+const QWEN35_CUDA_CONTEXT_ENV: &str = "IZWI_QWEN35_CUDA_CONTEXT_TOKENS";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Qwen35CudaContextBudget {
@@ -456,6 +458,14 @@ pub(super) fn qwen35_cuda_prefill_chunk_tokens() -> usize {
         .unwrap_or(DEFAULT_QWEN35_CUDA_PREFILL_CHUNK_TOKENS)
 }
 
+pub(super) fn qwen35_cuda_total_context_tokens() -> usize {
+    std::env::var(QWEN35_CUDA_CONTEXT_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_QWEN35_CUDA_CONTEXT_TOKENS)
+}
+
 fn qwen35_cuda_context_budget_limit(
     runtime_max_sequence_length: usize,
     model_context_length: Option<usize>,
@@ -510,9 +520,10 @@ fn validate_qwen35_cuda_context_budget(
 #[cfg(test)]
 mod tests {
     use super::{
-        QWEN35_CUDA_PREFILL_CHUNK_ENV, QWEN35_CUDA_SAFE_PREFILL_ENV, qwen35_cuda_context_budget,
-        qwen35_cuda_context_budget_limit, qwen35_cuda_prefill_chunk_tokens,
-        qwen35_cuda_safe_prefill_tokens, validate_qwen35_cuda_context_budget,
+        QWEN35_CUDA_CONTEXT_ENV, QWEN35_CUDA_PREFILL_CHUNK_ENV, QWEN35_CUDA_SAFE_PREFILL_ENV,
+        qwen35_cuda_context_budget, qwen35_cuda_context_budget_limit,
+        qwen35_cuda_prefill_chunk_tokens, qwen35_cuda_safe_prefill_tokens,
+        qwen35_cuda_total_context_tokens, validate_qwen35_cuda_context_budget,
     };
     use crate::error::Error;
 
@@ -542,6 +553,20 @@ mod tests {
         let limit = validate_qwen35_cuda_context_budget(4000, 96, 4096, Some(262_144))
             .expect("prompt fits");
         assert_eq!(limit, 4096);
+    }
+
+    #[test]
+    fn qwen35_cuda_total_context_tokens_default_to_model_window() {
+        let _guard = crate::env_test_lock().lock().expect("env lock");
+        std::env::remove_var(QWEN35_CUDA_CONTEXT_ENV);
+        assert_eq!(qwen35_cuda_total_context_tokens(), 262_144);
+
+        std::env::set_var(QWEN35_CUDA_CONTEXT_ENV, "65536");
+        assert_eq!(qwen35_cuda_total_context_tokens(), 65_536);
+
+        std::env::set_var(QWEN35_CUDA_CONTEXT_ENV, "0");
+        assert_eq!(qwen35_cuda_total_context_tokens(), 262_144);
+        std::env::remove_var(QWEN35_CUDA_CONTEXT_ENV);
     }
 
     #[test]
