@@ -1,10 +1,17 @@
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::tts::TtsDecodeState as QwenTtsDecodeState;
-use crate::models::registry::{NativeAsrDecodeState, NativeChatDecodeState};
+use crate::models::registry::{
+    NativeAsrDecodeState, NativeChatDecodeState, NativeChatPrefillState,
+};
+
+pub(super) enum ActiveChatState {
+    Prefilling(NativeChatPrefillState),
+    Decoding(NativeChatDecodeState),
+}
 
 pub(super) struct ActiveChatDecode {
     pub(super) variant: ModelVariant,
-    pub(super) state: NativeChatDecodeState,
+    pub(super) state: ActiveChatState,
     pub(super) prompt_accounted: bool,
     pub(super) last_tokens_generated: usize,
     pub(super) stream_sequence: usize,

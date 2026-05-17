@@ -2,25 +2,27 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::FutureExt;
-use tokio::sync::{broadcast, oneshot, Mutex, Notify, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock, broadcast, oneshot};
 use tokio::task::yield_now;
 use tracing::{debug, error, info_span};
 
 use crate::artifacts::{DownloadProgress, ModelLifecycleSnapshot, ModelManager};
 use crate::audio::{AudioCodec, AudioEncoder, StreamingConfig};
-use crate::backends::{BackendPreference, BackendRouter, BackendSelectionSource, DeviceProfile};
+use crate::backends::{
+    BackendKind, BackendPreference, BackendRouter, BackendSelectionSource, DeviceProfile,
+};
 use crate::catalog::{ModelInfo, ModelVariant};
 use crate::config::EngineConfig;
 use crate::engine::{
-    engine_stream_backpressure_total, Engine as CoreEngine, EngineCoreConfig, EngineCoreRequest,
-    EngineOutput, StreamingOutput, WorkerConfig, ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
-    ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_HITS_TOTAL, ENGINE_KV_CACHE_MISSES_TOTAL,
-    ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL, ENGINE_SCHEDULER_QUEUE_DEPTH,
-    ENGINE_SCHEDULER_RUNNING_REQUESTS, ENGINE_STREAM_BACKPRESSURE_TOTAL,
+    ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_HITS_TOTAL,
+    ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL,
+    ENGINE_SCHEDULER_QUEUE_DEPTH, ENGINE_SCHEDULER_RUNNING_REQUESTS,
+    ENGINE_STREAM_BACKPRESSURE_TOTAL, Engine as CoreEngine, EngineCoreConfig, EngineCoreRequest,
+    EngineOutput, StreamingOutput, WorkerConfig, engine_stream_backpressure_total,
 };
 use crate::error::{Error, Result};
 use crate::model::ModelResidencyLease;
@@ -31,8 +33,8 @@ use crate::runtime::broker::{
 };
 use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
 use crate::runtime::telemetry::{
-    push_engine_metric, EngineRuntimeTelemetrySnapshot, RuntimeTelemetryCollector,
-    RuntimeTelemetrySnapshot,
+    EngineRuntimeTelemetrySnapshot, RuntimeTelemetryCollector, RuntimeTelemetrySnapshot,
+    push_engine_metric,
 };
 use crate::runtime_models::ModelRegistry;
 use crate::tokenizer::Tokenizer;
@@ -45,6 +47,25 @@ fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
         return msg.clone();
     }
     "unknown panic payload".to_string()
+}
+
+fn configure_qwen35_cuda_prefill_scheduler(
+    core_config: &mut EngineCoreConfig,
+    selected_backend_kind: BackendKind,
+) {
+    if selected_backend_kind != BackendKind::Cuda {
+        return;
+    }
+
+    let prefill_chunk_tokens = super::chat::qwen35_cuda_prefill_chunk_tokens().max(1);
+    core_config.enable_chunked_prefill = true;
+    core_config.max_tokens_per_step = core_config.max_tokens_per_step.max(prefill_chunk_tokens);
+    core_config.chunked_prefill_threshold = core_config
+        .chunked_prefill_threshold
+        .max(prefill_chunk_tokens);
+    core_config.min_tokens_per_step = core_config
+        .min_tokens_per_step
+        .min(core_config.max_tokens_per_step);
 }
 
 /// Main inference engine runtime.
@@ -160,6 +181,7 @@ impl RuntimeService {
         core_config.num_threads = config.num_threads.max(1);
         core_config.block_size = config.kv_page_size.max(1);
         core_config.kv_cache_dtype = config.kv_cache_dtype.clone();
+        configure_qwen35_cuda_prefill_scheduler(&mut core_config, selected_backend_kind);
 
         let mut worker_config = WorkerConfig::from(&core_config);
         worker_config.models_dir = config.models_dir.clone();
@@ -818,6 +840,25 @@ mod tests {
         assert!(payload.contains("izwi_engine_scheduler_running_requests"));
         assert!(payload.contains("izwi_engine_kv_cache_allocated_blocks"));
         assert!(payload.contains("izwi_engine_stream_backpressure_total"));
+    }
+
+    #[test]
+    fn qwen35_cuda_prefill_scheduler_tuning_is_cuda_only() {
+        let _guard = crate::env_test_lock().lock().expect("env lock");
+        std::env::set_var("IZWI_QWEN35_CUDA_PREFILL_CHUNK_TOKENS", "2048");
+
+        let mut cpu_config = EngineCoreConfig::default();
+        configure_qwen35_cuda_prefill_scheduler(&mut cpu_config, BackendKind::Cpu);
+        assert_eq!(cpu_config.max_tokens_per_step, 384);
+        assert_eq!(cpu_config.chunked_prefill_threshold, 192);
+
+        let mut cuda_config = EngineCoreConfig::default();
+        configure_qwen35_cuda_prefill_scheduler(&mut cuda_config, BackendKind::Cuda);
+        assert_eq!(cuda_config.max_tokens_per_step, 2048);
+        assert_eq!(cuda_config.chunked_prefill_threshold, 2048);
+        assert!(cuda_config.enable_chunked_prefill);
+
+        std::env::remove_var("IZWI_QWEN35_CUDA_PREFILL_CHUNK_TOKENS");
     }
 
     #[tokio::test]

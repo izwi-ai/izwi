@@ -26,7 +26,8 @@ use crate::models::architectures::qwen3::chat::{
 };
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::models::architectures::qwen35::chat::{
-    ChatDecodeState as Qwen35ChatDecodeState, Qwen35ChatModel,
+    ChatDecodeState as Qwen35ChatDecodeState, ChatPrefillState as Qwen35ChatPrefillState,
+    Qwen35ChatModel,
 };
 use crate::models::architectures::sortformer::diarization::SortformerDiarizerModel;
 use crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel;
@@ -484,7 +485,12 @@ impl NativeAsrModel {
                     text,
                     language,
                     diagnostics,
-                } = model.transcribe_with_details_and_prompt(audio, sample_rate, language, prompt)?;
+                } = model.transcribe_with_details_and_prompt(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                )?;
                 Ok(NativeAsrTranscription {
                     text,
                     language,
@@ -565,13 +571,15 @@ impl NativeAsrModel {
         max_new_tokens: usize,
     ) -> Result<NativeAsrDecodeState> {
         match self {
-            Self::Qwen3(model) => Ok(NativeAsrDecodeState::Qwen3(model.start_decode_with_prompt(
-                audio,
-                sample_rate,
-                language,
-                prompt,
-                max_new_tokens,
-            )?)),
+            Self::Qwen3(model) => Ok(NativeAsrDecodeState::Qwen3(
+                model.start_decode_with_prompt(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                    max_new_tokens,
+                )?,
+            )),
             Self::Parakeet(_) => Err(Error::InvalidInput(
                 "Incremental decode state is not available for this ASR model".to_string(),
             )),
@@ -720,11 +728,23 @@ pub enum NativeChatDecodeState {
     Qwen35(Qwen35ChatDecodeState),
 }
 
+pub enum NativeChatPrefillState {
+    Qwen35(Qwen35ChatPrefillState),
+}
+
 #[derive(Debug, Clone)]
 pub struct NativeChatDecodeStep {
     pub delta: String,
     pub text: String,
     pub tokens_generated: usize,
+    pub finished: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeChatPrefillStep {
+    pub tokens_processed: usize,
+    pub prompt_tokens_processed: usize,
+    pub prompt_tokens_total: usize,
     pub finished: bool,
 }
 
@@ -844,10 +864,68 @@ impl NativeChatModel {
         }
     }
 
+    pub fn supports_continuation_prefill(&self) -> bool {
+        match self {
+            Self::Qwen35(model) => model.supports_continuation_prefill(),
+            _ => false,
+        }
+    }
+
     pub fn qwen35_context_length_hint(&self) -> Option<usize> {
         match self {
             Self::Qwen35(model) => Some(model.text_config().context_length),
             _ => None,
+        }
+    }
+
+    pub fn start_prefill_state_with_config(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+    ) -> Result<NativeChatPrefillState> {
+        match self {
+            Self::Qwen35(model) => Ok(NativeChatPrefillState::Qwen35(
+                model.start_prefill_state_with_config(messages, max_new_tokens, config)?,
+            )),
+            _ => Err(Error::InvalidInput(
+                "Continuation prefill state is not available for this chat model".to_string(),
+            )),
+        }
+    }
+
+    pub fn prefill_next_chunk(
+        &self,
+        state: &mut NativeChatPrefillState,
+        max_tokens: usize,
+    ) -> Result<NativeChatPrefillStep> {
+        match (self, state) {
+            (Self::Qwen35(model), NativeChatPrefillState::Qwen35(state)) => {
+                let step = model.prefill_next_chunk(state, max_tokens)?;
+                Ok(NativeChatPrefillStep {
+                    tokens_processed: step.tokens_processed,
+                    prompt_tokens_processed: step.prompt_tokens_processed,
+                    prompt_tokens_total: step.prompt_tokens_total,
+                    finished: step.finished,
+                })
+            }
+            _ => Err(Error::InvalidInput(
+                "Chat prefill state does not match loaded chat model".to_string(),
+            )),
+        }
+    }
+
+    pub fn finish_prefill_state(
+        &self,
+        state: NativeChatPrefillState,
+    ) -> Result<NativeChatDecodeState> {
+        match (self, state) {
+            (Self::Qwen35(model), NativeChatPrefillState::Qwen35(state)) => Ok(
+                NativeChatDecodeState::Qwen35(model.finish_prefill_state(state)?),
+            ),
+            _ => Err(Error::InvalidInput(
+                "Chat prefill state does not match loaded chat model".to_string(),
+            )),
         }
     }
 

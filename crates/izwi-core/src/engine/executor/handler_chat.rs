@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 use crate::models::shared::chat::ChatGenerationConfig;
 use crate::models::shared::chat::ChatMessage;
@@ -7,7 +8,7 @@ use crate::models::shared::chat::ChatMessage;
 use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
-use super::state::ActiveChatDecode;
+use super::state::{ActiveChatDecode, ActiveChatState};
 use super::{ExecutorOutput, ExecutorPhaseTiming, NativeExecutor};
 
 const FALLBACK_CHAT_STREAM_BATCH_PIECES: usize = 4;
@@ -87,6 +88,19 @@ impl NativeExecutor {
             .ok_or_else(|| Error::InvalidInput("Chat request missing messages".to_string()))
     }
 
+    fn should_use_qwen35_cuda_continuation_prefill(
+        backend: BackendKind,
+        model_supports_continuation_prefill: bool,
+        scheduled: &ScheduledRequest,
+        prompt_tokens: usize,
+        has_active_prefill: bool,
+    ) -> bool {
+        backend == BackendKind::Cuda
+            && model_supports_continuation_prefill
+            && scheduled.is_prefill
+            && (has_active_prefill || scheduled.num_tokens < prompt_tokens.max(1))
+    }
+
     pub(super) fn chat_request(
         &self,
         request: &EngineCoreRequest,
@@ -123,15 +137,13 @@ impl NativeExecutor {
                     if let Some(tx) = stream_tx.as_ref() {
                         if stream_err.is_none() {
                             if let Some(chunk) = stream_batch.push(delta) {
-                                if let Err(err) =
-                                    Self::stream_text_with_policy(
-                                        tx,
-                                        stream_policy,
-                                        &request.id,
-                                        &mut sequence,
-                                        chunk,
-                                    )
-                                {
+                                if let Err(err) = Self::stream_text_with_policy(
+                                    tx,
+                                    stream_policy,
+                                    &request.id,
+                                    &mut sequence,
+                                    chunk,
+                                ) {
                                     stream_err = Some(err);
                                 }
                             }
@@ -149,15 +161,13 @@ impl NativeExecutor {
                 if let Some(tx) = stream_tx.as_ref() {
                     if stream_err.is_none() {
                         if let Some(chunk) = stream_batch.finish() {
-                            if let Err(err) =
-                                Self::stream_text_with_policy(
-                                    tx,
-                                    stream_policy,
-                                    &request.id,
-                                    &mut sequence,
-                                    chunk,
-                                )
-                            {
+                            if let Err(err) = Self::stream_text_with_policy(
+                                tx,
+                                stream_policy,
+                                &request.id,
+                                &mut sequence,
+                                chunk,
+                            ) {
                                 stream_err = Some(err);
                             }
                         }
@@ -228,20 +238,91 @@ impl NativeExecutor {
             active_state = None;
         }
 
+        let has_active_prefill = active_state
+            .as_ref()
+            .map(|state| matches!(&state.state, ActiveChatState::Prefilling(_)))
+            .unwrap_or(false);
+        let use_continuation_prefill = Self::should_use_qwen35_cuda_continuation_prefill(
+            self.config.backend,
+            model.supports_continuation_prefill(),
+            scheduled,
+            request.num_prompt_tokens(),
+            has_active_prefill,
+        );
+
         let mut active_state = if let Some(state) = active_state {
             state
+        } else if use_continuation_prefill {
+            let prefill_state = Self::run_blocking(|| {
+                model.start_prefill_state_with_config(messages, max_new_tokens, &generation_config)
+            })?;
+            ActiveChatDecode {
+                variant,
+                state: ActiveChatState::Prefilling(prefill_state),
+                prompt_accounted: true,
+                last_tokens_generated: 0,
+                stream_sequence: 0,
+            }
         } else {
             let decode_state = Self::run_blocking(|| {
                 model.start_decode_state_with_config(messages, max_new_tokens, &generation_config)
             })?;
             ActiveChatDecode {
                 variant,
-                state: decode_state,
+                state: ActiveChatState::Decoding(decode_state),
                 prompt_accounted: false,
                 last_tokens_generated: 0,
                 stream_sequence: 0,
             }
         };
+
+        if use_continuation_prefill {
+            let mut prefill_state = match active_state.state {
+                ActiveChatState::Prefilling(state) => state,
+                ActiveChatState::Decoding(_) => {
+                    return Err(Error::InferenceError(
+                        "Qwen3.5 CUDA continuation prefill received decode state during prefill"
+                            .to_string(),
+                    ));
+                }
+            };
+            let step = Self::run_blocking(|| {
+                model.prefill_next_chunk(&mut prefill_state, scheduled.num_tokens.max(1))
+            })?;
+            active_state.prompt_accounted = true;
+            active_state.state = if step.finished {
+                ActiveChatState::Decoding(Self::run_blocking(|| {
+                    model.finish_prefill_state(prefill_state)
+                })?)
+            } else {
+                ActiveChatState::Prefilling(prefill_state)
+            };
+
+            let mut guard = self.chat_decode_states.lock().map_err(|_| {
+                Error::InferenceError("Chat decode state mutex poisoned".to_string())
+            })?;
+            guard.insert(request.id.clone(), active_state);
+
+            return Ok(ExecutorOutput {
+                request_id: request.id.clone(),
+                audio: Some(AudioOutput::empty(24_000)),
+                text: Some(String::new()),
+                input_transcription: None,
+                tokens_processed: step.tokens_processed,
+                tokens_generated: 0,
+                finished: false,
+                phase_timing_override: None,
+                asr_diagnostics: None,
+                error: None,
+            });
+        }
+
+        if matches!(&active_state.state, ActiveChatState::Prefilling(_)) {
+            return Err(Error::InferenceError(
+                "Qwen3.5 CUDA continuation prefill was still incomplete during decode scheduling"
+                    .to_string(),
+            ));
+        }
 
         let decode_iterations = if scheduled.is_prefill {
             1
@@ -254,7 +335,16 @@ impl NativeExecutor {
         let mut finished = false;
 
         for _ in 0..decode_iterations {
-            let step = Self::run_blocking(|| model.decode_step(&mut active_state.state))?;
+            let step = match &mut active_state.state {
+                ActiveChatState::Decoding(state) => {
+                    Self::run_blocking(|| model.decode_step(state))?
+                }
+                ActiveChatState::Prefilling(_) => {
+                    return Err(Error::InferenceError(
+                        "Chat decode state is still prefilling".to_string(),
+                    ));
+                }
+            };
             decode_steps_ran = decode_steps_ran.saturating_add(1);
 
             let step_tokens_generated = step
@@ -326,7 +416,19 @@ impl NativeExecutor {
 mod tests {
     use super::*;
     use crate::engine::GenerationParams;
+    use crate::engine::scheduler::ScheduledRequest;
     use crate::models::shared::chat::{ChatMessage, ChatRole};
+
+    fn scheduled_chat_prefill(num_tokens: usize) -> ScheduledRequest {
+        ScheduledRequest {
+            request_id: "req-chat".to_string(),
+            sequence_id: 1,
+            num_tokens,
+            is_prefill: true,
+            block_ids: Vec::new(),
+            num_computed_tokens: 0,
+        }
+    }
 
     #[test]
     fn chat_generation_config_preserves_request_sampling_controls() {
@@ -357,6 +459,68 @@ mod tests {
             NativeExecutor::chat_request_seed("req-sampling")
         );
         assert_eq!(config.request, request.chat_config);
+    }
+
+    #[test]
+    fn qwen35_cuda_continuation_prefill_decision_is_cuda_only_and_chunked() {
+        let scheduled = scheduled_chat_prefill(512);
+
+        assert!(
+            !NativeExecutor::should_use_qwen35_cuda_continuation_prefill(
+                BackendKind::Cpu,
+                true,
+                &scheduled,
+                4096,
+                false,
+            )
+        );
+        assert!(
+            !NativeExecutor::should_use_qwen35_cuda_continuation_prefill(
+                BackendKind::Metal,
+                true,
+                &scheduled,
+                4096,
+                false,
+            )
+        );
+        assert!(
+            !NativeExecutor::should_use_qwen35_cuda_continuation_prefill(
+                BackendKind::Cuda,
+                false,
+                &scheduled,
+                4096,
+                false,
+            )
+        );
+        assert!(NativeExecutor::should_use_qwen35_cuda_continuation_prefill(
+            BackendKind::Cuda,
+            true,
+            &scheduled,
+            4096,
+            false,
+        ));
+    }
+
+    #[test]
+    fn qwen35_cuda_continuation_prefill_keeps_active_prefill_state() {
+        let scheduled = scheduled_chat_prefill(4096);
+
+        assert!(
+            !NativeExecutor::should_use_qwen35_cuda_continuation_prefill(
+                BackendKind::Cuda,
+                true,
+                &scheduled,
+                4096,
+                false,
+            )
+        );
+        assert!(NativeExecutor::should_use_qwen35_cuda_continuation_prefill(
+            BackendKind::Cuda,
+            true,
+            &scheduled,
+            4096,
+            true,
+        ));
     }
 
     #[test]

@@ -442,7 +442,7 @@ fn qwen35_cuda_safe_prefill_tokens() -> usize {
         .unwrap_or(DEFAULT_QWEN35_CUDA_SAFE_PREFILL_TOKENS)
 }
 
-fn qwen35_cuda_prefill_chunk_tokens() -> usize {
+pub(super) fn qwen35_cuda_prefill_chunk_tokens() -> usize {
     std::env::var(QWEN35_CUDA_PREFILL_CHUNK_ENV)
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
