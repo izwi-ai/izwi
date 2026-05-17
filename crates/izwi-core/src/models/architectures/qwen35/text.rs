@@ -16,7 +16,10 @@ use crate::kernels::{
     try_fused_silu_mul, try_tiled_deltanet_recurrence, use_block_fusion_for_device,
 };
 use crate::models::architectures::qwen3::core::repeat_kv;
-use crate::models::shared::attention::flash::try_fused_self_attention;
+use crate::models::shared::attention::flash::{
+    cuda_flash_attention_capabilities, flash_attention_compiled, flash_attention_requested,
+    try_fused_self_attention,
+};
 use crate::models::shared::attention::paged::{
     append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
     paged_decode_attention, KvCacheQuantization, KvPage,
@@ -217,6 +220,73 @@ impl Qwen35TextModel {
             block_fusion_decode_enabled,
             block_fusion_prefill_enabled,
             block_fusion_prefill_min_tokens,
+        })
+    }
+
+    pub fn diagnostics(&self) -> serde_json::Value {
+        let mut full_attention_layers = 0usize;
+        let mut linear_attention_layers = 0usize;
+        let mut dense_decode_enabled_layers = 0usize;
+        let mut rope_kernel_enabled_layers = 0usize;
+        let mut kv_page_size = None;
+        let mut kv_quantization = None;
+
+        for layer in &self.layers {
+            match &layer.mixer {
+                Qwen35Mixer::Full(attn) => {
+                    full_attention_layers = full_attention_layers.saturating_add(1);
+                    if attn.dense_decode_attention_enabled {
+                        dense_decode_enabled_layers = dense_decode_enabled_layers.saturating_add(1);
+                    }
+                    if attn.rope_kernel_enabled {
+                        rope_kernel_enabled_layers = rope_kernel_enabled_layers.saturating_add(1);
+                    }
+                    kv_page_size.get_or_insert(attn.kv_page_size);
+                    kv_quantization.get_or_insert(format!("{:?}", attn.kv_quantization));
+                }
+                Qwen35Mixer::Linear(_) => {
+                    linear_attention_layers = linear_attention_layers.saturating_add(1);
+                }
+            }
+        }
+
+        let flash = cuda_flash_attention_capabilities();
+        serde_json::json!({
+            "device": {
+                "debug": format!("{:?}", self.device),
+                "is_cuda": self.device.is_cuda(),
+                "is_metal": self.device.is_metal(),
+            },
+            "dtypes": {
+                "token_embeddings": format!("{:?}", self.token_embeddings.embeddings().dtype()),
+            },
+            "layers": {
+                "total": self.layers.len(),
+                "full_attention": full_attention_layers,
+                "linear_attention": linear_attention_layers,
+                "linear_triplet_starts": self.linear_triplet_starts.iter().filter(|enabled| **enabled).count(),
+            },
+            "prefill": {
+                "block_fusion_decode_enabled": self.block_fusion_decode_enabled,
+                "block_fusion_prefill_enabled": self.block_fusion_prefill_enabled,
+                "block_fusion_prefill_min_tokens": self.block_fusion_prefill_min_tokens,
+            },
+            "attention": {
+                "dense_decode_enabled_layers": dense_decode_enabled_layers,
+                "rope_kernel_enabled_layers": rope_kernel_enabled_layers,
+                "kv_page_size": kv_page_size,
+                "kv_quantization": kv_quantization,
+            },
+            "cuda_flash_attention": {
+                "requested": flash_attention_requested(),
+                "compiled": flash_attention_compiled(),
+                "max_head_dim": flash.max_head_dim,
+                "head_dim_multiple": flash.head_dim_multiple,
+                "supports_windowed": flash.supports_windowed,
+                "supports_alibi": flash.supports_alibi,
+                "supports_softcap": flash.supports_softcap,
+                "supports_varlen": flash.supports_varlen,
+            }
         })
     }
 

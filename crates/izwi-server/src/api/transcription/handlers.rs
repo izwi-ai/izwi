@@ -900,6 +900,8 @@ async fn generate_transcription_summary(
     params.temperature = 0.2;
     params.top_p = 0.9;
 
+    log_transcription_summary_start(&runtime, transcription, params.max_tokens, correlation_id);
+
     let generation = runtime
         .chat_generate_with_generation_params_and_correlation(
             variant,
@@ -920,10 +922,85 @@ async fn generate_transcription_summary(
             correlation_id,
         )
         .await
-        .map_err(|err| format!("Summary generation failed: {err}"))?;
+        .map_err(|err| {
+            log_transcription_summary_failure(
+                &runtime,
+                transcription,
+                correlation_id,
+                err.to_string(),
+            );
+            format!("Summary generation failed: {err}")
+        })?;
+
+    log_transcription_summary_success(&runtime, transcription, correlation_id, &generation);
 
     sanitize_summary_output(generation.text.as_str())
         .ok_or_else(|| "Summary generation returned empty text".to_string())
+}
+
+fn log_transcription_summary_start(
+    runtime: &RuntimeService,
+    transcription: &str,
+    max_tokens: usize,
+    correlation_id: Option<&str>,
+) {
+    let backend = runtime.backend_context();
+    tracing::info!(
+        target: "izwi.summary",
+        summary_kind = "transcription",
+        summary_model = DEFAULT_TRANSCRIPTION_SUMMARY_MODEL,
+        selected_backend = backend.backend_kind.as_str(),
+        requested_backend = backend.preference.as_str(),
+        transcription_chars = transcription.chars().count(),
+        transcription_bytes = transcription.len(),
+        max_tokens,
+        correlation_id = correlation_id.unwrap_or_default(),
+        "Starting transcription summary generation"
+    );
+}
+
+fn log_transcription_summary_success(
+    runtime: &RuntimeService,
+    transcription: &str,
+    correlation_id: Option<&str>,
+    generation: &izwi_core::ChatGeneration,
+) {
+    let backend = runtime.backend_context();
+    tracing::info!(
+        target: "izwi.summary",
+        summary_kind = "transcription",
+        summary_model = DEFAULT_TRANSCRIPTION_SUMMARY_MODEL,
+        selected_backend = backend.backend_kind.as_str(),
+        requested_backend = backend.preference.as_str(),
+        transcription_chars = transcription.chars().count(),
+        transcription_bytes = transcription.len(),
+        prompt_tokens = generation.prompt_tokens,
+        tokens_generated = generation.tokens_generated,
+        generation_time_ms = generation.generation_time_ms,
+        correlation_id = correlation_id.unwrap_or_default(),
+        "Finished transcription summary generation"
+    );
+}
+
+fn log_transcription_summary_failure(
+    runtime: &RuntimeService,
+    transcription: &str,
+    correlation_id: Option<&str>,
+    error: String,
+) {
+    let backend = runtime.backend_context();
+    tracing::warn!(
+        target: "izwi.summary",
+        summary_kind = "transcription",
+        summary_model = DEFAULT_TRANSCRIPTION_SUMMARY_MODEL,
+        selected_backend = backend.backend_kind.as_str(),
+        requested_backend = backend.preference.as_str(),
+        transcription_chars = transcription.chars().count(),
+        transcription_bytes = transcription.len(),
+        correlation_id = correlation_id.unwrap_or_default(),
+        error,
+        "Transcription summary generation failed"
+    );
 }
 
 fn sanitize_summary_output(raw: &str) -> Option<String> {

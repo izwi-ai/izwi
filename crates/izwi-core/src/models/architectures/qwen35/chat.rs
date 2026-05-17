@@ -345,6 +345,13 @@ impl Qwen35ChatModel {
             text_loader.tensor_count(),
             projector_loader.tensor_count()
         );
+        info!(
+            target: "izwi.qwen35",
+            variant = %variant.display_name(),
+            backend = backend.as_str(),
+            diagnostics = %text_model.diagnostics(),
+            "Loaded Qwen3.5 text diagnostics"
+        );
 
         Ok(Self {
             device_kind: backend,
