@@ -230,6 +230,7 @@ impl Qwen35TextModel {
     pub fn diagnostics(&self) -> serde_json::Value {
         let mut full_attention_layers = 0usize;
         let mut linear_attention_layers = 0usize;
+        let mut tiled_recurrence_enabled_layers = 0usize;
         let mut dense_decode_enabled_layers = 0usize;
         let mut rope_kernel_enabled_layers = 0usize;
         let mut kv_page_size = None;
@@ -250,8 +251,12 @@ impl Qwen35TextModel {
                     kv_page_size.get_or_insert(attn.kv_page_size);
                     kv_quantization.get_or_insert(format!("{:?}", attn.kv_quantization));
                 }
-                Qwen35Mixer::Linear(_) => {
+                Qwen35Mixer::Linear(mixer) => {
                     linear_attention_layers = linear_attention_layers.saturating_add(1);
+                    if mixer.tiled_recurrence_enabled {
+                        tiled_recurrence_enabled_layers =
+                            tiled_recurrence_enabled_layers.saturating_add(1);
+                    }
                 }
             }
         }
@@ -292,6 +297,10 @@ impl Qwen35TextModel {
                 "full_attention": full_attention_layers,
                 "linear_attention": linear_attention_layers,
                 "linear_triplet_starts": self.linear_triplet_starts.iter().filter(|enabled| **enabled).count(),
+            },
+            "linear_attention": {
+                "tiled_recurrence_enabled_layers": tiled_recurrence_enabled_layers,
+                "cuda_recurrence_dtype": if self.device.is_cuda() { Some("F32") } else { None },
             },
             "prefill": {
                 "block_fusion_decode_enabled": self.block_fusion_decode_enabled,
@@ -1293,6 +1302,8 @@ impl Qwen35LinearAttention {
 
         let beta = beta.reshape((1, self.num_v_heads))?;
         let g = g.reshape((1, self.num_v_heads))?;
+        let (query, key, value, g, beta, current_state) =
+            qwen35_prepare_cuda_recurrence_tensors(query, key, value, g, beta, current_state)?;
         let (output, next_state) =
             recurrent_gated_delta(&query, &key, &value, &g, &beta, current_state)?;
         *recurrent_state = Some(next_state);
@@ -1381,6 +1392,8 @@ impl Qwen35LinearAttention {
 
         let beta = beta.reshape((1, seq_len, self.num_v_heads))?;
         let g = g.reshape((1, seq_len, self.num_v_heads))?;
+        let (query, key, value, g, beta, current_state) =
+            qwen35_prepare_cuda_recurrence_tensors(query, key, value, g, beta, current_state)?;
         let tile_size =
             qwen35_tiled_recurrence_tile_size(seq_len, self.tiled_recurrence_tile_size_override);
         let (output, next_state) = if self.tiled_recurrence_enabled {
@@ -1497,6 +1510,55 @@ impl Qwen35GatedRmsNorm {
         let normalized = candle_nn::ops::rms_norm(hidden_states, &self.weight, self.eps as f32)?;
         (&normalized * &ops::silu(gate)?).map_err(Error::from)
     }
+}
+
+fn qwen35_cuda_linear_attention_recurrence_dtype(
+    device_is_cuda: bool,
+    tensor_dtype: DType,
+) -> Option<DType> {
+    (device_is_cuda && tensor_dtype != DType::F32).then_some(DType::F32)
+}
+
+fn qwen35_cuda_recurrence_tensor(tensor: &Tensor) -> candle_core::Result<Tensor> {
+    if let Some(dtype) =
+        qwen35_cuda_linear_attention_recurrence_dtype(tensor.device().is_cuda(), tensor.dtype())
+    {
+        tensor.to_dtype(dtype)
+    } else {
+        Ok(tensor.clone())
+    }
+}
+
+fn qwen35_cuda_recurrence_state(state: Tensor) -> candle_core::Result<Tensor> {
+    if let Some(dtype) =
+        qwen35_cuda_linear_attention_recurrence_dtype(state.device().is_cuda(), state.dtype())
+    {
+        state.to_dtype(dtype)
+    } else {
+        Ok(state)
+    }
+}
+
+fn qwen35_prepare_cuda_recurrence_tensors(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    g: Tensor,
+    beta: Tensor,
+    state: Tensor,
+) -> candle_core::Result<(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)> {
+    if !query.device().is_cuda() {
+        return Ok((query, key, value, g, beta, state));
+    }
+
+    Ok((
+        qwen35_cuda_recurrence_tensor(&query)?,
+        qwen35_cuda_recurrence_tensor(&key)?,
+        qwen35_cuda_recurrence_tensor(&value)?,
+        qwen35_cuda_recurrence_tensor(&g)?,
+        qwen35_cuda_recurrence_tensor(&beta)?,
+        qwen35_cuda_recurrence_state(state)?,
+    ))
 }
 
 impl Qwen35Projection {
@@ -2060,7 +2122,8 @@ fn recurrent_gated_delta(
 #[cfg(test)]
 mod tests {
     use super::{
-        append_dense_kv_cache_h, apply_rotary_emb, build_mrope, qwen35_cuda_qmatmul_input_dtype,
+        append_dense_kv_cache_h, apply_rotary_emb, build_mrope,
+        qwen35_cuda_linear_attention_recurrence_dtype, qwen35_cuda_qmatmul_input_dtype,
         qwen35_dense_decode_max_pages, qwen35_page_count_for_tokens, repeat_head_states,
         repeat_head_states_seq,
     };
@@ -2080,6 +2143,26 @@ mod tests {
         assert_eq!(qwen35_cuda_qmatmul_input_dtype(true, DType::F32), None);
         assert_eq!(qwen35_cuda_qmatmul_input_dtype(false, DType::BF16), None);
         assert_eq!(qwen35_cuda_qmatmul_input_dtype(false, DType::F16), None);
+    }
+
+    #[test]
+    fn qwen35_cuda_linear_attention_recurrence_uses_f32_for_lower_precision_tensors() {
+        assert_eq!(
+            qwen35_cuda_linear_attention_recurrence_dtype(true, DType::F16),
+            Some(DType::F32)
+        );
+        assert_eq!(
+            qwen35_cuda_linear_attention_recurrence_dtype(true, DType::BF16),
+            Some(DType::F32)
+        );
+        assert_eq!(
+            qwen35_cuda_linear_attention_recurrence_dtype(true, DType::F32),
+            None
+        );
+        assert_eq!(
+            qwen35_cuda_linear_attention_recurrence_dtype(false, DType::BF16),
+            None
+        );
     }
 
     #[test]
