@@ -1,9 +1,9 @@
 use axum::{
+    Json, RequestExt,
     body::Body,
     extract::{Extension, Multipart, Path, Query, Request, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    Json, RequestExt,
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -11,11 +11,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::api::pagination::{encode_cursor, CursorPagination, CursorPaginationQuery};
+use crate::api::pagination::{CursorPagination, CursorPaginationQuery, encode_cursor};
 use crate::api::request_context::RequestContext;
 use crate::api::summary::{
-    generate_summary_with_cuda_planner, should_use_cuda_hierarchical_summary,
-    single_pass_summary_messages, PlannedSummary, SummaryKind,
+    PlannedSummary, SummaryKind, generate_summary_with_cuda_planner,
+    should_use_cuda_hierarchical_summary, single_pass_summary_messages, summary_error_kind,
 };
 use crate::diarization_store::{
     CompleteDiarizationRecord, DiarizationProcessingStatus, DiarizationRecord,
@@ -25,7 +25,7 @@ use crate::diarization_store::{
 };
 use crate::error::ApiError;
 use crate::state::AppState;
-use izwi_core::{parse_chat_model_variant, DiarizationConfig, GenerationParams, RuntimeService};
+use izwi_core::{DiarizationConfig, GenerationParams, RuntimeService, parse_chat_model_variant};
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
 use crate::api::speech_text_upload::{multipart_upload_error, resolve_source_audio_mime_type};
@@ -721,12 +721,20 @@ async fn generate_diarization_summary_with_timeout(
     correlation_id: Option<&str>,
     timeout_secs: u64,
 ) -> Result<String, String> {
-    tokio::time::timeout(
-        Duration::from_secs(timeout_secs.max(1)),
-        generate_diarization_summary(runtime, transcript, correlation_id),
+    let effective_timeout_secs = effective_summary_timeout_secs(timeout_secs, transcript);
+    match tokio::time::timeout(
+        Duration::from_secs(effective_timeout_secs),
+        generate_diarization_summary(runtime.clone(), transcript, correlation_id),
     )
     .await
-    .map_err(|_| summary_timeout_error(timeout_secs))?
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let error = summary_timeout_error(effective_timeout_secs, transcript);
+            log_diarization_summary_failure(&runtime, transcript, correlation_id, error.clone());
+            Err(error)
+        }
+    }
 }
 
 async fn generate_diarization_summary(
@@ -871,6 +879,7 @@ fn log_diarization_summary_failure(
         transcript_chars = transcript.chars().count(),
         transcript_bytes = transcript.len(),
         correlation_id = correlation_id.unwrap_or_default(),
+        error_kind = summary_error_kind(error.as_str()),
         error,
         "Diarization summary generation failed"
     );
@@ -886,10 +895,20 @@ fn summary_failure_update(error: &str) -> UpdateDiarizationSummary {
     }
 }
 
-fn summary_timeout_error(timeout_secs: u64) -> String {
+fn effective_summary_timeout_secs(timeout_secs: u64, transcript: &str) -> u64 {
+    let scaled = (transcript.chars().count() as u64)
+        .saturating_add(999)
+        .saturating_div(1_000)
+        .max(1);
+    timeout_secs.max(1).max(scaled)
+}
+
+fn summary_timeout_error(timeout_secs: u64, transcript: &str) -> String {
     format!(
-        "Summary generation timed out after {} seconds.",
-        timeout_secs.max(1)
+        "Summary generation timed out after {} seconds (transcript_chars={}, transcript_bytes={}).",
+        timeout_secs.max(1),
+        transcript.chars().count(),
+        transcript.len()
     )
 }
 
@@ -1390,12 +1409,25 @@ mod tests {
     #[test]
     fn summary_timeout_error_enforces_minimum_one_second() {
         assert_eq!(
-            summary_timeout_error(0),
-            "Summary generation timed out after 1 seconds."
+            summary_timeout_error(0, "abc"),
+            "Summary generation timed out after 1 seconds (transcript_chars=3, transcript_bytes=3)."
         );
         assert_eq!(
-            summary_timeout_error(12),
-            "Summary generation timed out after 12 seconds."
+            summary_timeout_error(12, "hello"),
+            "Summary generation timed out after 12 seconds (transcript_chars=5, transcript_bytes=5)."
+        );
+    }
+
+    #[test]
+    fn effective_summary_timeout_scales_with_transcript_size() {
+        assert_eq!(effective_summary_timeout_secs(0, "abc"), 1);
+        assert_eq!(
+            effective_summary_timeout_secs(2, "x".repeat(5_001).as_str()),
+            6
+        );
+        assert_eq!(
+            effective_summary_timeout_secs(30, "x".repeat(5_001).as_str()),
+            30
         );
     }
 

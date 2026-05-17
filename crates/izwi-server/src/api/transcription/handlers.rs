@@ -3,13 +3,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::{Extension, Multipart, Path, Request, State},
-    http::{header, HeaderValue, StatusCode},
-    response::{
-        sse::{Event, KeepAlive, Sse},
-        IntoResponse, Response,
-    },
     Json, RequestExt,
+    extract::{Extension, Multipart, Path, Request, State},
+    http::{HeaderValue, StatusCode, header},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -17,8 +17,8 @@ use tokio::sync::mpsc;
 
 use crate::api::request_context::RequestContext;
 use crate::api::summary::{
-    generate_summary_with_cuda_planner, should_use_cuda_hierarchical_summary,
-    single_pass_summary_messages, PlannedSummary, SummaryKind,
+    PlannedSummary, SummaryKind, generate_summary_with_cuda_planner,
+    should_use_cuda_hierarchical_summary, single_pass_summary_messages, summary_error_kind,
 };
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -27,7 +27,7 @@ use crate::transcription_store::{
     TranscriptionRecord, TranscriptionSegmentRecord, TranscriptionStore,
     TranscriptionSummaryStatus, TranscriptionWordRecord, UpdateTranscriptionSummary,
 };
-use izwi_core::{parse_chat_model_variant, GenerationParams, RuntimeService};
+use izwi_core::{GenerationParams, RuntimeService, parse_chat_model_variant};
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
 use crate::api::speech_text_upload::{multipart_upload_error, resolve_source_audio_mime_type};
@@ -1040,6 +1040,7 @@ fn log_transcription_summary_failure(
         transcription_chars = transcription.chars().count(),
         transcription_bytes = transcription.len(),
         correlation_id = correlation_id.unwrap_or_default(),
+        error_kind = summary_error_kind(error.as_str()),
         error,
         "Transcription summary generation failed"
     );
@@ -1110,9 +1111,9 @@ mod tests {
     use axum::http::StatusCode;
 
     use super::{
-        alignments_to_word_records, build_segment_records, initial_summary_state,
-        multipart_field_api_error, parse_bool, sanitize_summary_output, TranscriptionSummaryStatus,
-        TranscriptionWordRecord,
+        TranscriptionSummaryStatus, TranscriptionWordRecord, alignments_to_word_records,
+        build_segment_records, initial_summary_state, multipart_field_api_error, parse_bool,
+        sanitize_summary_output,
     };
 
     #[test]

@@ -100,6 +100,25 @@ pub(crate) fn summary_chunk_char_budget(total_context_tokens: usize) -> usize {
     total_context_tokens.saturating_mul(3).clamp(1_024, 24_000)
 }
 
+pub(crate) fn summary_error_kind(error: &str) -> &'static str {
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("cuda_error_illegal_address")
+        || normalized.contains("illegal memory access")
+    {
+        return "cuda_illegal_address";
+    }
+    if normalized.contains("timed out") {
+        return "timeout";
+    }
+    if normalized.contains("context budget") || normalized.contains("prompt budget") {
+        return "context_budget";
+    }
+    if normalized.contains("tokenization") {
+        return "tokenization";
+    }
+    "summary_generation"
+}
+
 pub(crate) fn single_pass_summary_messages(
     kind: SummaryKind,
     system_prompt: &str,
@@ -454,7 +473,7 @@ fn title_case_label(label: &str) -> &'static str {
 mod tests {
     use super::{
         SummaryKind, chunk_summary_messages, single_pass_summary_messages,
-        split_summary_input_by_line_budget, summary_chunk_char_budget,
+        split_summary_input_by_line_budget, summary_chunk_char_budget, summary_error_kind,
         summary_prompt_fits_cuda_context_budget,
     };
 
@@ -469,6 +488,22 @@ mod tests {
         assert_eq!(summary_chunk_char_budget(1), 1024);
         assert_eq!(summary_chunk_char_budget(4096), 12_288);
         assert_eq!(summary_chunk_char_budget(262_144), 24_000);
+    }
+
+    #[test]
+    fn summary_error_kind_classifies_cuda_and_budget_failures() {
+        assert_eq!(
+            summary_error_kind("DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, illegal memory access)"),
+            "cuda_illegal_address"
+        );
+        assert_eq!(
+            summary_error_kind("Summary generation timed out after 12 seconds"),
+            "timeout"
+        );
+        assert_eq!(
+            summary_error_kind("final synthesis prompt exceeds CUDA total context budget"),
+            "context_budget"
+        );
     }
 
     #[test]
