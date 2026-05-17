@@ -38,7 +38,7 @@ pub struct Qwen35TextModel {
     layers: Vec<Qwen35Layer>,
     linear_triplet_starts: Vec<bool>,
     output_norm: RmsNorm,
-    output: QMatMul,
+    output: Qwen35Projection,
     block_fusion_decode_enabled: bool,
     block_fusion_prefill_enabled: bool,
     block_fusion_prefill_min_tokens: usize,
@@ -80,16 +80,16 @@ enum Qwen35Mixer {
 }
 
 struct Qwen35Mlp {
-    gate: QMatMul,
-    up: QMatMul,
-    down: QMatMul,
+    gate: Qwen35Projection,
+    up: Qwen35Projection,
+    down: Qwen35Projection,
 }
 
 struct Qwen35FullAttention {
-    q_proj: QMatMul,
-    k_proj: QMatMul,
-    v_proj: QMatMul,
-    o_proj: QMatMul,
+    q_proj: Qwen35Projection,
+    k_proj: Qwen35Projection,
+    v_proj: Qwen35Projection,
+    o_proj: Qwen35Projection,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     num_heads: usize,
@@ -109,16 +109,16 @@ struct Qwen35FullAttention {
 }
 
 struct Qwen35LinearAttention {
-    qkv_proj: QMatMul,
-    gate_proj: QMatMul,
-    beta_proj: QMatMul,
-    alpha_proj: QMatMul,
+    qkv_proj: Qwen35Projection,
+    gate_proj: Qwen35Projection,
+    beta_proj: Qwen35Projection,
+    alpha_proj: Qwen35Projection,
     dt_bias: Tensor,
     a: Tensor,
     conv_kernel: Tensor,
     conv_kernel_slices: Vec<Tensor>,
     norm: Qwen35GatedRmsNorm,
-    out_proj: QMatMul,
+    out_proj: Qwen35Projection,
     num_k_heads: usize,
     num_v_heads: usize,
     head_k_dim: usize,
@@ -132,6 +132,10 @@ struct Qwen35LinearAttention {
 struct Qwen35GatedRmsNorm {
     weight: Tensor,
     eps: f64,
+}
+
+struct Qwen35Projection {
+    inner: QMatMul,
 }
 
 impl Qwen35TextModel {
@@ -1471,13 +1475,44 @@ impl Qwen35GatedRmsNorm {
     }
 }
 
+impl Qwen35Projection {
+    fn new(inner: QMatMul) -> Self {
+        Self { inner }
+    }
+}
+
+fn qwen35_cuda_qmatmul_input_dtype(device_is_cuda: bool, activation_dtype: DType) -> Option<DType> {
+    (device_is_cuda && activation_dtype != DType::F32).then_some(DType::F32)
+}
+
+impl Module for Qwen35Projection {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let activation_dtype = x.dtype();
+        let input = if let Some(dtype) =
+            qwen35_cuda_qmatmul_input_dtype(x.device().is_cuda(), activation_dtype)
+        {
+            x.to_dtype(dtype)?
+        } else {
+            x.clone()
+        };
+        let output = self.inner.forward(&input)?;
+        if output.dtype() != activation_dtype {
+            output.to_dtype(activation_dtype)
+        } else {
+            Ok(output)
+        }
+    }
+}
+
 fn is_full_attention_layer(layer_idx: usize, full_attention_interval: usize) -> bool {
     full_attention_interval > 0 && (layer_idx + 1).is_multiple_of(full_attention_interval)
 }
 
-fn load_qmatmul(loader: &GgufLoader, device: &Device, name: &str) -> Result<QMatMul> {
+fn load_qmatmul(loader: &GgufLoader, device: &Device, name: &str) -> Result<Qwen35Projection> {
     let weights = Arc::new(loader.load_qtensor(name, device)?);
-    QMatMul::from_weights(weights).map_err(Error::from)
+    QMatMul::from_weights(weights)
+        .map(Qwen35Projection::new)
+        .map_err(Error::from)
 }
 
 fn load_rms_norm(
@@ -2001,11 +2036,27 @@ fn recurrent_gated_delta(
 #[cfg(test)]
 mod tests {
     use super::{
-        append_dense_kv_cache_h, apply_rotary_emb, build_mrope, qwen35_dense_decode_max_pages,
-        qwen35_page_count_for_tokens, repeat_head_states, repeat_head_states_seq,
+        append_dense_kv_cache_h, apply_rotary_emb, build_mrope, qwen35_cuda_qmatmul_input_dtype,
+        qwen35_dense_decode_max_pages, qwen35_page_count_for_tokens, repeat_head_states,
+        repeat_head_states_seq,
     };
     use candle_core::{DType, Device, Tensor};
     use candle_nn::rotary_emb;
+
+    #[test]
+    fn qwen35_cuda_qmatmul_uses_f32_input_for_lower_precision_activations() {
+        assert_eq!(
+            qwen35_cuda_qmatmul_input_dtype(true, DType::F16),
+            Some(DType::F32)
+        );
+        assert_eq!(
+            qwen35_cuda_qmatmul_input_dtype(true, DType::BF16),
+            Some(DType::F32)
+        );
+        assert_eq!(qwen35_cuda_qmatmul_input_dtype(true, DType::F32), None);
+        assert_eq!(qwen35_cuda_qmatmul_input_dtype(false, DType::BF16), None);
+        assert_eq!(qwen35_cuda_qmatmul_input_dtype(false, DType::F16), None);
+    }
 
     #[test]
     fn repeat_head_states_uses_tiled_order() {
