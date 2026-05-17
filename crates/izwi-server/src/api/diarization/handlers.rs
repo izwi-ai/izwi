@@ -13,6 +13,10 @@ use std::time::{Duration, Instant};
 
 use crate::api::pagination::{encode_cursor, CursorPagination, CursorPaginationQuery};
 use crate::api::request_context::RequestContext;
+use crate::api::summary::{
+    generate_summary_with_cuda_planner, should_use_cuda_hierarchical_summary,
+    single_pass_summary_messages, PlannedSummary, SummaryKind,
+};
 use crate::diarization_store::{
     CompleteDiarizationRecord, DiarizationProcessingStatus, DiarizationRecord,
     DiarizationRecordListCursor, DiarizationRecordSummary, DiarizationSegmentRecord,
@@ -21,10 +25,7 @@ use crate::diarization_store::{
 };
 use crate::error::ApiError;
 use crate::state::AppState;
-use izwi_core::{
-    parse_chat_model_variant, ChatMessage, ChatRole, DiarizationConfig, GenerationParams,
-    RuntimeService,
-};
+use izwi_core::{parse_chat_model_variant, DiarizationConfig, GenerationParams, RuntimeService};
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
 use crate::api::speech_text_upload::{multipart_upload_error, resolve_source_audio_mime_type};
@@ -744,22 +745,34 @@ async fn generate_diarization_summary(
 
     log_diarization_summary_start(&runtime, transcript, params.max_tokens, correlation_id);
 
+    if should_use_cuda_hierarchical_summary(&runtime, variant) {
+        let planned = generate_summary_with_cuda_planner(
+            runtime.clone(),
+            variant,
+            SummaryKind::Diarization,
+            DIARIZATION_SUMMARY_SYSTEM_PROMPT,
+            transcript,
+            params.clone(),
+            correlation_id,
+            sanitize_summary_output,
+        )
+        .await
+        .map_err(|err| {
+            log_diarization_summary_failure(&runtime, transcript, correlation_id, err.clone());
+            err
+        })?;
+        log_diarization_summary_planned_success(&runtime, transcript, correlation_id, &planned);
+        return Ok(planned.text);
+    }
+
     let generation = runtime
         .chat_generate_with_generation_params_and_correlation(
             variant,
-            vec![
-                ChatMessage {
-                    role: ChatRole::System,
-                    content: DIARIZATION_SUMMARY_SYSTEM_PROMPT.to_string(),
-                },
-                ChatMessage {
-                    role: ChatRole::User,
-                    content: format!(
-                        "Summarize the following diarized transcript.\n\nTranscript:\n{}",
-                        transcript
-                    ),
-                },
-            ],
+            single_pass_summary_messages(
+                SummaryKind::Diarization,
+                DIARIZATION_SUMMARY_SYSTEM_PROMPT,
+                transcript,
+            ),
             params,
             correlation_id,
         )
@@ -814,6 +827,29 @@ fn log_diarization_summary_success(
         prompt_tokens = generation.prompt_tokens,
         tokens_generated = generation.tokens_generated,
         generation_time_ms = generation.generation_time_ms,
+        correlation_id = correlation_id.unwrap_or_default(),
+        "Finished diarization summary generation"
+    );
+}
+
+fn log_diarization_summary_planned_success(
+    runtime: &RuntimeService,
+    transcript: &str,
+    correlation_id: Option<&str>,
+    planned: &PlannedSummary,
+) {
+    let backend = runtime.backend_context();
+    tracing::info!(
+        target: "izwi.summary",
+        summary_kind = "diarization",
+        summary_model = DEFAULT_DIARIZATION_SUMMARY_MODEL,
+        selected_backend = backend.backend_kind.as_str(),
+        requested_backend = backend.preference.as_str(),
+        transcript_chars = transcript.chars().count(),
+        transcript_bytes = transcript.len(),
+        prompt_tokens = planned.prompt_tokens,
+        summary_strategy = planned.strategy.as_str(),
+        chunk_count = planned.chunk_count,
         correlation_id = correlation_id.unwrap_or_default(),
         "Finished diarization summary generation"
     );

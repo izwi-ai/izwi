@@ -73,6 +73,42 @@ impl RuntimeService {
         .into_engine_request())
     }
 
+    pub async fn chat_prompt_token_count_with_generation_params_and_chat_config(
+        &self,
+        variant: ModelVariant,
+        messages: &[ChatMessage],
+        params: &GenerationParams,
+        chat_config: &ChatRequestConfig,
+    ) -> Result<usize> {
+        self.load_model(variant).await?;
+        let _lease = self.acquire_model_residency_lease(variant);
+
+        let prompt_config = Self::prompt_token_config(params, chat_config);
+        let chat_model = self
+            .model_registry
+            .get_chat(variant)
+            .await
+            .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?;
+        chat_model
+            .prompt_token_ids_with_config(messages, &prompt_config)
+            .map(|tokens| tokens.len())
+    }
+
+    pub async fn chat_prompt_token_count_with_generation_params(
+        &self,
+        variant: ModelVariant,
+        messages: &[ChatMessage],
+        params: &GenerationParams,
+    ) -> Result<usize> {
+        self.chat_prompt_token_count_with_generation_params_and_chat_config(
+            variant,
+            messages,
+            params,
+            &ChatRequestConfig::default(),
+        )
+        .await
+    }
+
     fn validate_qwen35_cuda_context_budget(
         &self,
         variant: ModelVariant,

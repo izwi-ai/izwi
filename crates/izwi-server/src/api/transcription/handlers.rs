@@ -16,6 +16,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::api::request_context::RequestContext;
+use crate::api::summary::{
+    generate_summary_with_cuda_planner, should_use_cuda_hierarchical_summary,
+    single_pass_summary_messages, PlannedSummary, SummaryKind,
+};
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::transcription_store::{
@@ -23,9 +27,7 @@ use crate::transcription_store::{
     TranscriptionRecord, TranscriptionSegmentRecord, TranscriptionStore,
     TranscriptionSummaryStatus, TranscriptionWordRecord, UpdateTranscriptionSummary,
 };
-use izwi_core::{
-    parse_chat_model_variant, ChatMessage, ChatRole, GenerationParams, RuntimeService,
-};
+use izwi_core::{parse_chat_model_variant, GenerationParams, RuntimeService};
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
 use crate::api::speech_text_upload::{multipart_upload_error, resolve_source_audio_mime_type};
@@ -902,22 +904,39 @@ async fn generate_transcription_summary(
 
     log_transcription_summary_start(&runtime, transcription, params.max_tokens, correlation_id);
 
+    if should_use_cuda_hierarchical_summary(&runtime, variant) {
+        let planned = generate_summary_with_cuda_planner(
+            runtime.clone(),
+            variant,
+            SummaryKind::Transcription,
+            TRANSCRIPTION_SUMMARY_SYSTEM_PROMPT,
+            transcription,
+            params.clone(),
+            correlation_id,
+            sanitize_summary_output,
+        )
+        .await
+        .map_err(|err| {
+            log_transcription_summary_failure(&runtime, transcription, correlation_id, err.clone());
+            err
+        })?;
+        log_transcription_summary_planned_success(
+            &runtime,
+            transcription,
+            correlation_id,
+            &planned,
+        );
+        return Ok(planned.text);
+    }
+
     let generation = runtime
         .chat_generate_with_generation_params_and_correlation(
             variant,
-            vec![
-                ChatMessage {
-                    role: ChatRole::System,
-                    content: TRANSCRIPTION_SUMMARY_SYSTEM_PROMPT.to_string(),
-                },
-                ChatMessage {
-                    role: ChatRole::User,
-                    content: format!(
-                        "Summarize the following transcript.\n\nTranscript:\n{}",
-                        transcription
-                    ),
-                },
-            ],
+            single_pass_summary_messages(
+                SummaryKind::Transcription,
+                TRANSCRIPTION_SUMMARY_SYSTEM_PROMPT,
+                transcription,
+            ),
             params,
             correlation_id,
         )
@@ -977,6 +996,29 @@ fn log_transcription_summary_success(
         prompt_tokens = generation.prompt_tokens,
         tokens_generated = generation.tokens_generated,
         generation_time_ms = generation.generation_time_ms,
+        correlation_id = correlation_id.unwrap_or_default(),
+        "Finished transcription summary generation"
+    );
+}
+
+fn log_transcription_summary_planned_success(
+    runtime: &RuntimeService,
+    transcription: &str,
+    correlation_id: Option<&str>,
+    planned: &PlannedSummary,
+) {
+    let backend = runtime.backend_context();
+    tracing::info!(
+        target: "izwi.summary",
+        summary_kind = "transcription",
+        summary_model = DEFAULT_TRANSCRIPTION_SUMMARY_MODEL,
+        selected_backend = backend.backend_kind.as_str(),
+        requested_backend = backend.preference.as_str(),
+        transcription_chars = transcription.chars().count(),
+        transcription_bytes = transcription.len(),
+        prompt_tokens = planned.prompt_tokens,
+        summary_strategy = planned.strategy.as_str(),
+        chunk_count = planned.chunk_count,
         correlation_id = correlation_id.unwrap_or_default(),
         "Finished transcription summary generation"
     );
