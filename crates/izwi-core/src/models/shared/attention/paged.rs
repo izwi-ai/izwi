@@ -463,11 +463,14 @@ fn paged_decode_page_group_size_policy(
     2
 }
 
-fn cuda_q4_0_host_fallback_enabled() -> bool {
+pub(crate) fn cuda_q4_0_host_fallback_enabled() -> bool {
     env_bool("IZWI_CUDA_KV_Q4_HOST_FALLBACK", false)
 }
 
-fn q4_0_quantization_allowed_on_device(is_cuda: bool, cuda_host_fallback_enabled: bool) -> bool {
+pub(crate) fn q4_0_quantization_allowed_on_device(
+    is_cuda: bool,
+    cuda_host_fallback_enabled: bool,
+) -> bool {
     !is_cuda || cuda_host_fallback_enabled
 }
 

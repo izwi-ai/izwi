@@ -21,8 +21,9 @@ use crate::models::shared::attention::flash::{
     flash_attention_requested, try_fused_self_attention,
 };
 use crate::models::shared::attention::paged::{
-    append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
-    paged_decode_attention, KvCacheQuantization, KvPage,
+    append_to_pages, cuda_q4_0_host_fallback_enabled, default_kv_page_size,
+    default_kv_quantization, materialize_pages, paged_decode_attention,
+    q4_0_quantization_allowed_on_device, KvCacheQuantization, KvPage,
 };
 use crate::models::shared::telemetry::{
     record_decode_attention_path, record_prefill_sequence_span, record_prefill_token_mode_step,
@@ -263,6 +264,7 @@ impl Qwen35TextModel {
 
         let flash = cuda_flash_attention_capabilities();
         let activation_dtype = self.token_embeddings.embeddings().dtype();
+        let cuda_q4_host_fallback = cuda_q4_0_host_fallback_enabled();
         let flash_probe = full_attention_head_dim.map(|head_dim| {
             cuda_flash_attention_probe(
                 false,
@@ -312,6 +314,15 @@ impl Qwen35TextModel {
                 "rope_kernel_enabled_layers": rope_kernel_enabled_layers,
                 "kv_page_size": kv_page_size,
                 "kv_quantization": kv_quantization,
+            },
+            "cuda_hardening": {
+                "rope_kernel_cuda_enabled": false,
+                "dense_decode_cuda_enabled": false,
+                "q4_0_kv_host_fallback_enabled": cuda_q4_host_fallback,
+                "q4_0_kv_allowed_on_selected_device": q4_0_quantization_allowed_on_device(
+                    self.device.is_cuda(),
+                    cuda_q4_host_fallback
+                ),
             },
             "cuda_flash_attention": {
                 "requested": flash_attention_requested(),
@@ -1881,7 +1892,10 @@ fn qwen35_tiled_recurrence_enabled() -> bool {
 }
 
 fn qwen35_rope_kernel_enabled(device: &Device) -> bool {
-    device.is_metal() && qwen35_env_bool("IZWI_QWEN35_ROPE_KERNEL", true)
+    qwen35_metal_only_fast_path_policy(
+        device.is_metal(),
+        qwen35_env_bool("IZWI_QWEN35_ROPE_KERNEL", true),
+    )
 }
 
 fn qwen35_tiled_recurrence_tile_size_override() -> Option<usize> {
@@ -1945,7 +1959,14 @@ fn qwen35_dense_decode_policy(device: &Device) -> (bool, usize) {
 }
 
 fn qwen35_use_dense_decode_attention_feature(device: &Device) -> bool {
-    device.is_metal() && qwen35_env_bool("IZWI_QWEN35_DENSE_DECODE_ATTENTION", true)
+    qwen35_metal_only_fast_path_policy(
+        device.is_metal(),
+        qwen35_env_bool("IZWI_QWEN35_DENSE_DECODE_ATTENTION", true),
+    )
+}
+
+fn qwen35_metal_only_fast_path_policy(is_metal: bool, env_enabled: bool) -> bool {
+    is_metal && env_enabled
 }
 
 fn append_dense_kv_cache_h(cache: &mut Option<Tensor>, append: &Tensor) -> Result<()> {
@@ -2124,8 +2145,8 @@ mod tests {
     use super::{
         append_dense_kv_cache_h, apply_rotary_emb, build_mrope,
         qwen35_cuda_linear_attention_recurrence_dtype, qwen35_cuda_qmatmul_input_dtype,
-        qwen35_dense_decode_max_pages, qwen35_page_count_for_tokens, repeat_head_states,
-        repeat_head_states_seq,
+        qwen35_dense_decode_max_pages, qwen35_metal_only_fast_path_policy,
+        qwen35_page_count_for_tokens, repeat_head_states, repeat_head_states_seq,
     };
     use candle_core::{DType, Device, Tensor};
     use candle_nn::rotary_emb;
@@ -2163,6 +2184,14 @@ mod tests {
             qwen35_cuda_linear_attention_recurrence_dtype(false, DType::BF16),
             None
         );
+    }
+
+    #[test]
+    fn qwen35_metal_only_fast_paths_do_not_enable_for_cuda_policy() {
+        assert!(qwen35_metal_only_fast_path_policy(true, true));
+        assert!(!qwen35_metal_only_fast_path_policy(true, false));
+        assert!(!qwen35_metal_only_fast_path_policy(false, true));
+        assert!(!qwen35_metal_only_fast_path_policy(false, false));
     }
 
     #[test]
