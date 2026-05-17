@@ -1,5 +1,7 @@
 //! Chat runtime methods routed through the unified core engine.
 
+use crate::backends::BackendKind;
+use crate::catalog::ModelFamily;
 use crate::engine::EngineCoreRequest;
 use crate::engine::GenerationParams;
 use crate::error::{Error, Result};
@@ -9,7 +11,14 @@ use crate::runtime::request::ChatRuntimeRequest;
 use crate::runtime::service::RuntimeService;
 use crate::runtime::types::ChatGeneration;
 
+const DEFAULT_QWEN35_CUDA_SAFE_PREFILL_TOKENS: usize = 8192;
+const QWEN35_CUDA_SAFE_PREFILL_ENV: &str = "IZWI_QWEN35_CUDA_SAFE_PREFILL_TOKENS";
+
 impl RuntimeService {
+    pub fn qwen35_cuda_safe_prefill_tokens(&self) -> usize {
+        qwen35_cuda_safe_prefill_tokens()
+    }
+
     fn prompt_token_config(
         params: &GenerationParams,
         chat_config: &ChatRequestConfig,
@@ -39,14 +48,20 @@ impl RuntimeService {
 
         let prompt_config = Self::prompt_token_config(&params, &chat_config);
 
-        let prompt_tokens = self
+        let chat_model = self
             .model_registry
             .get_chat(variant)
             .await
-            .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?
-            .prompt_token_ids_with_config(&messages, &prompt_config)?;
+            .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?;
+        let prompt_tokens = chat_model.prompt_token_ids_with_config(&messages, &prompt_config)?;
 
         params.max_tokens = params.max_tokens.max(1);
+        self.validate_qwen35_cuda_context_budget(
+            variant,
+            prompt_tokens.len(),
+            params.max_tokens,
+            chat_model.qwen35_context_length_hint(),
+        )?;
         Ok(ChatRuntimeRequest::from_messages(
             variant,
             messages,
@@ -56,6 +71,39 @@ impl RuntimeService {
             correlation_id.map(ToOwned::to_owned),
         )?
         .into_engine_request())
+    }
+
+    fn validate_qwen35_cuda_context_budget(
+        &self,
+        variant: ModelVariant,
+        prompt_tokens: usize,
+        max_new_tokens: usize,
+        model_context_length: Option<usize>,
+    ) -> Result<()> {
+        if self.backend_context().backend_kind != BackendKind::Cuda
+            || variant.family() != ModelFamily::Qwen35Chat
+        {
+            return Ok(());
+        }
+
+        let limit = validate_qwen35_cuda_context_budget(
+            prompt_tokens,
+            max_new_tokens,
+            self.config.max_sequence_length,
+            model_context_length,
+        )?;
+        tracing::debug!(
+            target: "izwi.qwen35",
+            variant = %variant.display_name(),
+            prompt_tokens,
+            max_new_tokens = max_new_tokens.max(1),
+            runtime_max_sequence_length = self.config.max_sequence_length.max(1),
+            model_context_length = model_context_length.unwrap_or_default(),
+            limit_tokens = limit,
+            safe_prefill_tokens = qwen35_cuda_safe_prefill_tokens(),
+            "Validated Qwen3.5 CUDA chat prompt budget"
+        );
+        Ok(())
     }
 
     async fn build_chat_request_with_params(
@@ -303,5 +351,103 @@ impl RuntimeService {
             tokens_generated: output.num_tokens,
             generation_time_ms: output.generation_time.as_secs_f64() * 1000.0,
         })
+    }
+}
+
+fn qwen35_cuda_safe_prefill_tokens() -> usize {
+    std::env::var(QWEN35_CUDA_SAFE_PREFILL_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_QWEN35_CUDA_SAFE_PREFILL_TOKENS)
+}
+
+fn qwen35_cuda_context_budget_limit(
+    runtime_max_sequence_length: usize,
+    model_context_length: Option<usize>,
+) -> usize {
+    let runtime_limit = runtime_max_sequence_length.max(1);
+    model_context_length
+        .filter(|limit| *limit > 0)
+        .map(|model_limit| runtime_limit.min(model_limit))
+        .unwrap_or(runtime_limit)
+}
+
+fn validate_qwen35_cuda_context_budget(
+    prompt_tokens: usize,
+    max_new_tokens: usize,
+    runtime_max_sequence_length: usize,
+    model_context_length: Option<usize>,
+) -> Result<usize> {
+    let max_new_tokens = max_new_tokens.max(1);
+    let requested_tokens = prompt_tokens.saturating_add(max_new_tokens);
+    let limit = qwen35_cuda_context_budget_limit(runtime_max_sequence_length, model_context_length);
+    if requested_tokens <= limit {
+        return Ok(limit);
+    }
+
+    Err(Error::InvalidInput(format!(
+        "Qwen3.5 CUDA prompt budget exceeded: prompt_tokens={prompt_tokens}, \
+         max_new_tokens={max_new_tokens}, requested_tokens={requested_tokens}, \
+         limit_tokens={limit}, runtime_max_sequence_length={}, model_context_length={}. \
+         Reduce the prompt/max tokens or use hierarchical chunking for long summaries.",
+        runtime_max_sequence_length.max(1),
+        model_context_length.unwrap_or_default()
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        qwen35_cuda_context_budget_limit, qwen35_cuda_safe_prefill_tokens,
+        validate_qwen35_cuda_context_budget, QWEN35_CUDA_SAFE_PREFILL_ENV,
+    };
+    use crate::error::Error;
+
+    #[test]
+    fn qwen35_cuda_context_budget_uses_runtime_and_model_minimum() {
+        assert_eq!(qwen35_cuda_context_budget_limit(4096, Some(262_144)), 4096);
+        assert_eq!(qwen35_cuda_context_budget_limit(262_144, Some(4096)), 4096);
+        assert_eq!(qwen35_cuda_context_budget_limit(8192, None), 8192);
+        assert_eq!(qwen35_cuda_context_budget_limit(0, Some(0)), 1);
+    }
+
+    #[test]
+    fn qwen35_cuda_context_budget_rejects_oversized_prompt_before_prefill() {
+        let err = validate_qwen35_cuda_context_budget(4090, 16, 4096, Some(262_144))
+            .expect_err("prompt should exceed runtime limit");
+        assert!(matches!(
+            err,
+            Error::InvalidInput(message)
+                if message.contains("Qwen3.5 CUDA prompt budget exceeded")
+                    && message.contains("requested_tokens=4106")
+                    && message.contains("limit_tokens=4096")
+        ));
+    }
+
+    #[test]
+    fn qwen35_cuda_context_budget_accepts_prompt_within_limit() {
+        let limit = validate_qwen35_cuda_context_budget(4000, 96, 4096, Some(262_144))
+            .expect("prompt fits");
+        assert_eq!(limit, 4096);
+    }
+
+    #[test]
+    fn qwen35_cuda_safe_prefill_tokens_uses_positive_env_override() {
+        let _guard = crate::env_test_lock().lock().expect("env lock");
+
+        std::env::remove_var(QWEN35_CUDA_SAFE_PREFILL_ENV);
+        assert_eq!(qwen35_cuda_safe_prefill_tokens(), 8192);
+
+        std::env::set_var(QWEN35_CUDA_SAFE_PREFILL_ENV, "16384");
+        assert_eq!(qwen35_cuda_safe_prefill_tokens(), 16_384);
+
+        std::env::set_var(QWEN35_CUDA_SAFE_PREFILL_ENV, "0");
+        assert_eq!(qwen35_cuda_safe_prefill_tokens(), 8192);
+
+        std::env::set_var(QWEN35_CUDA_SAFE_PREFILL_ENV, "not-a-number");
+        assert_eq!(qwen35_cuda_safe_prefill_tokens(), 8192);
+
+        std::env::remove_var(QWEN35_CUDA_SAFE_PREFILL_ENV);
     }
 }

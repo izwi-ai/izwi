@@ -844,6 +844,13 @@ impl NativeChatModel {
         }
     }
 
+    pub fn qwen35_context_length_hint(&self) -> Option<usize> {
+        match self {
+            Self::Qwen35(model) => Some(model.text_config().context_length),
+            _ => None,
+        }
+    }
+
     pub fn start_decode_state(
         &self,
         messages: &[ChatMessage],
