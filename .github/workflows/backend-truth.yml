@@ -73,7 +73,7 @@ jobs:
     env:
       CUDA_COMPUTE_CAP: "80"
     container:
-      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+      image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
     steps:
       - name: Checkout

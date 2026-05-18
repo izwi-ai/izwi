@@ -40,12 +40,14 @@ Native GitHub Release artifacts:
 Docker CUDA artifact:
 
 - The `rust-builder-cuda` stage builds `izwi-server` with
-  `--features "${IZWI_CUDA_FEATURES}"`; the default remains `cuda`.
-- The `production-cuda` stage copies only that CUDA-capable server binary into the NVIDIA CUDA runtime image.
+  `--features "${IZWI_CUDA_FEATURES}"`; the Docker default is
+  `cuda,cudnn,flash-attn`.
+- The `production-cuda` stage copies only that CUDA-capable server binary into
+  the NVIDIA CUDA cuDNN runtime image.
 - The image sets `IZWI_BACKEND=cuda`, `NVIDIA_VISIBLE_DEVICES=all`, and `NVIDIA_DRIVER_CAPABILITIES=compute,utility`.
-- Optional Candle CUDA features such as `flash-attn` and `cudnn` are source/build
-  knobs. Do not enable `cudnn` for a runtime image unless the matching cuDNN
-  runtime libraries are present in the final image.
+- Optional Candle CUDA features remain source/build knobs through
+  `IZWI_CUDA_FEATURES`; Docker CUDA defaults include cuDNN because the builder
+  and runtime stages use matching NVIDIA cuDNN images.
 
 ## Runtime Selection
 
