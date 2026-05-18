@@ -29,6 +29,7 @@ use crate::error::{Error, Result};
 use crate::models::shared::attention::paged::{default_kv_page_size, KvCacheQuantization};
 
 const NEWLINE_TOKEN_ID: u32 = 198;
+const ENV_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM: &str = "IZWI_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM";
 
 /// Runtime generation settings for semantic token sampling.
 #[derive(Debug, Clone)]
@@ -1725,7 +1726,7 @@ impl Qwen3TtsModel {
             }
         }
 
-        if self.device.kind.is_cuda() && !force {
+        if self.device.kind.is_cuda() && !force && qwen_tts_cuda_chunked_codec_stream_enabled() {
             let (samples, emitted_frames, emitted_samples) = self.decode_cuda_stream_chunk(
                 &state.all_code_groups,
                 state.emitted_frames,
@@ -1793,7 +1794,7 @@ impl Qwen3TtsModel {
             }
         }
 
-        if self.device.kind.is_cuda() && !force {
+        if self.device.kind.is_cuda() && !force && qwen_tts_cuda_chunked_codec_stream_enabled() {
             let (new_samples, emitted_frames, emitted_samples) = self.decode_cuda_stream_chunk(
                 codec_groups,
                 state.emitted_frames,
@@ -2101,6 +2102,21 @@ fn raw_codec_token(
             token
         }
     }
+}
+
+fn qwen_tts_cuda_chunked_codec_stream_enabled() -> bool {
+    qwen_tts_cuda_chunked_codec_stream_enabled_from(
+        std::env::var(ENV_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn qwen_tts_cuda_chunked_codec_stream_enabled_from(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
 }
 
 /// Argmax sampling for greedy decoding
@@ -2654,5 +2670,16 @@ mod tests {
             19
         );
         assert_eq!(raw_codec_token(19, 3, 151_936, 2048), 19);
+    }
+
+    #[test]
+    fn cuda_chunked_codec_streaming_is_explicit_opt_in() {
+        assert!(!qwen_tts_cuda_chunked_codec_stream_enabled_from(None));
+        for raw in ["", "0", "false", "off", "no"] {
+            assert!(!qwen_tts_cuda_chunked_codec_stream_enabled_from(Some(raw)));
+        }
+        for raw in ["1", "true", "YES", " on "] {
+            assert!(qwen_tts_cuda_chunked_codec_stream_enabled_from(Some(raw)));
+        }
     }
 }
