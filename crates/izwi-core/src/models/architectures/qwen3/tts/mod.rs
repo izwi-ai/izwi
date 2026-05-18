@@ -2105,7 +2105,7 @@ fn raw_codec_token(
     }
 }
 
-fn qwen_tts_cuda_chunked_codec_stream_enabled() -> bool {
+pub(crate) fn qwen_tts_cuda_chunked_codec_stream_enabled() -> bool {
     qwen_tts_cuda_chunked_codec_stream_enabled_from(
         std::env::var(ENV_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM)
             .ok()

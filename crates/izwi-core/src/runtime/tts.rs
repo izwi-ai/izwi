@@ -5,17 +5,29 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::info;
 
+use crate::catalog::ModelFamily;
 use crate::engine::GenerationParams as CoreGenParams;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::lfm25_audio::lfm25_audio_tts_system_prompt;
+use crate::models::architectures::qwen3::tts::qwen_tts_cuda_chunked_codec_stream_enabled;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 use crate::runtime::adapters::CapabilityKind;
 use crate::runtime::request::TtsRuntimeRequest;
 use crate::runtime::service::RuntimeService;
-use crate::runtime::types::{AudioChunk, GenerationConfig, GenerationRequest, GenerationResult};
+use crate::runtime::types::{
+    AudioChunk, ChunkStats, GenerationConfig, GenerationRequest, GenerationResult,
+};
 
 const LFM25_AUDIO_DEFAULT_MAX_NEW_TOKENS: usize = 1024;
+
+fn qwen_tts_cuda_streaming_uses_final_only(
+    is_cuda: bool,
+    variant: ModelVariant,
+    chunked_codec_stream_enabled: bool,
+) -> bool {
+    is_cuda && matches!(variant.family(), ModelFamily::Qwen3Tts) && !chunked_codec_stream_enabled
+}
 
 fn lfm25_audio_prompt_messages(text: &str, speaker: Option<&str>) -> Vec<ChatMessage> {
     vec![
@@ -113,22 +125,44 @@ impl RuntimeService {
             .map_err(|_| Error::InferenceError("Streaming output channel closed".to_string()))?;
         Ok(())
     }
+
+    async fn qwen_tts_cuda_final_only_streaming(
+        &self,
+        mut request: GenerationRequest,
+        chunk_tx: mpsc::Sender<AudioChunk>,
+    ) -> Result<()> {
+        request.config.streaming = false;
+        let result = self.generate(request).await?;
+        let generation_time_ms = result.total_time_ms;
+        let tokens_generated = result.total_tokens;
+        let rtf = result.rtf();
+        let mut chunk = AudioChunk::final_chunk(result.request_id.clone(), 0, result.samples);
+        chunk.stats = Some(ChunkStats {
+            generation_time_ms,
+            tokens_generated,
+            rtf,
+        });
+        chunk_tx
+            .send(chunk)
+            .await
+            .map_err(|_| Error::InferenceError("Streaming output channel closed".to_string()))?;
+
+        info!(
+            "Qwen3-TTS CUDA streaming emitted final-only audio in {:.1}ms (RTF {:.3}); enable IZWI_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM=1 for progressive CUDA codec streaming",
+            generation_time_ms, rtf
+        );
+        Ok(())
+    }
 }
 
 impl RuntimeService {
     /// Generate audio from text using the unified core engine.
     pub async fn generate(&self, request: GenerationRequest) -> Result<GenerationResult> {
         let resolved_variant = self.resolve_tts_variant_for_request(&request).await?;
-        if matches!(
-            resolved_variant.family(),
-            crate::catalog::ModelFamily::KokoroTts
-        ) {
+        if matches!(resolved_variant.family(), ModelFamily::KokoroTts) {
             return self.kokoro_tts_generate(request).await;
         }
-        if matches!(
-            resolved_variant.family(),
-            crate::catalog::ModelFamily::Lfm25Audio
-        ) {
+        if matches!(resolved_variant.family(), ModelFamily::Lfm25Audio) {
             return self
                 .lfm25_audio_tts_generate(request, resolved_variant, false)
                 .await;
@@ -170,18 +204,21 @@ impl RuntimeService {
         chunk_tx: mpsc::Sender<AudioChunk>,
     ) -> Result<()> {
         let resolved_variant = self.resolve_tts_variant_for_request(&request).await?;
-        if matches!(
-            resolved_variant.family(),
-            crate::catalog::ModelFamily::KokoroTts
-        ) {
+        if matches!(resolved_variant.family(), ModelFamily::KokoroTts) {
             return self.kokoro_tts_generate_streaming(request, chunk_tx).await;
         }
-        if matches!(
-            resolved_variant.family(),
-            crate::catalog::ModelFamily::Lfm25Audio
-        ) {
+        if matches!(resolved_variant.family(), ModelFamily::Lfm25Audio) {
             return self
                 .lfm25_audio_tts_generate_streaming(request, resolved_variant, chunk_tx)
+                .await;
+        }
+        if qwen_tts_cuda_streaming_uses_final_only(
+            self.device.kind.is_cuda(),
+            resolved_variant,
+            qwen_tts_cuda_chunked_codec_stream_enabled(),
+        ) {
+            return self
+                .qwen_tts_cuda_final_only_streaming(request, chunk_tx)
                 .await;
         }
         self.load_model(resolved_variant).await?;
@@ -222,4 +259,41 @@ fn core_params_from_generation(config: &GenerationConfig) -> CoreGenParams {
         params.voice = params.speaker.clone();
     }
     params
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qwen_tts_cuda_streaming_defaults_to_final_only_without_chunked_codec() {
+        assert!(qwen_tts_cuda_streaming_uses_final_only(
+            true,
+            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+            false,
+        ));
+    }
+
+    #[test]
+    fn qwen_tts_cuda_streaming_respects_chunked_codec_opt_in() {
+        assert!(!qwen_tts_cuda_streaming_uses_final_only(
+            true,
+            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+            true,
+        ));
+    }
+
+    #[test]
+    fn qwen_tts_final_only_streaming_policy_does_not_affect_non_cuda_or_non_qwen() {
+        assert!(!qwen_tts_cuda_streaming_uses_final_only(
+            false,
+            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+            false,
+        ));
+        assert!(!qwen_tts_cuda_streaming_uses_final_only(
+            true,
+            ModelVariant::Kokoro82M,
+            false,
+        ));
+    }
 }
