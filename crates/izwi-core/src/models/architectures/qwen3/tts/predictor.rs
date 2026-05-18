@@ -454,15 +454,12 @@ impl Attention {
             x.dtype(),
         )?;
 
-        let cos = Tensor::cat(&[cos.clone(), cos], 1)?;
-        let sin = Tensor::cat(&[sin.clone(), sin], 1)?;
         let cos = cos.unsqueeze(0)?.unsqueeze(2)?;
         let sin = sin.unsqueeze(0)?.unsqueeze(2)?;
 
         let x1 = x.narrow(3, 0, half_dim)?;
         let x2 = x.narrow(3, half_dim, half_dim)?;
-        let minus_one = Tensor::from_vec(vec![-1.0f32], (1,), x.device())?.to_dtype(x.dtype())?;
-        let neg_x2 = x2.broadcast_mul(&minus_one)?;
+        let neg_x2 = x2.neg()?;
         let rotated = Tensor::cat(&[neg_x2, x1], 3)?;
 
         let out = x.broadcast_mul(&cos)?;

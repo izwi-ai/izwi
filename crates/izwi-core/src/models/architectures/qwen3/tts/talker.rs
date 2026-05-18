@@ -10,7 +10,7 @@ use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::tts::config::TalkerConfig;
 use crate::models::architectures::qwen3::tts::rope::{
-    build_rope_inv_freq, build_rope_window, RopeCache,
+    build_rope_inv_freq, build_rope_window, duplicate_rope_window, RopeCache,
 };
 use crate::models::shared::attention::batched::{
     batched_scaled_dot_product_attention, BatchedAttentionConfig, BatchedAttentionInput,
@@ -230,15 +230,17 @@ impl Attention {
         };
 
         // Qwen RoPE uses rotate_half(x) over [first_half, second_half].
-        let cos = Tensor::cat(&[cos.clone(), cos], 1)?;
-        let sin = Tensor::cat(&[sin.clone(), sin], 1)?;
+        let (cos, sin) = if cos.dim(1)? == half_dim {
+            duplicate_rope_window(cos, sin)?
+        } else {
+            (cos, sin)
+        };
         let cos = cos.unsqueeze(0)?.unsqueeze(2)?;
         let sin = sin.unsqueeze(0)?.unsqueeze(2)?;
 
         let x1 = x.narrow(3, 0, half_dim)?;
         let x2 = x.narrow(3, half_dim, half_dim)?;
-        let minus_one = Tensor::from_vec(vec![-1.0f32], (1,), x.device())?.to_dtype(x.dtype())?;
-        let neg_x2 = x2.broadcast_mul(&minus_one)?;
+        let neg_x2 = x2.neg()?;
         let rotated = Tensor::cat(&[neg_x2, x1], 3)?;
 
         let out = x.broadcast_mul(&cos)?;
