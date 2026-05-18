@@ -20,7 +20,7 @@ use candle_nn::VarBuilder;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
 
 use crate::backends::DeviceProfile;
@@ -1003,8 +1003,10 @@ impl Qwen3TtsModel {
             });
         }
 
+        let step_start = Instant::now();
         let min_tokens_before_eos = 8usize;
         let allow_eos = state.all_code_groups[0].len() >= min_tokens_before_eos;
+        let semantic_start = Instant::now();
         let semantic_token = sample_semantic(
             &state.last_logits.i((0, 0))?,
             state.semantic_vocab_size,
@@ -1014,6 +1016,7 @@ impl Qwen3TtsModel {
             &state.semantic_history,
             &mut state.rng,
         )?;
+        let semantic_ms = semantic_start.elapsed().as_secs_f64() * 1000.0;
 
         if allow_eos && semantic_token == self.specials.codec_eos_token_id {
             state.finished = true;
@@ -1033,6 +1036,7 @@ impl Qwen3TtsModel {
 
         state.all_code_groups[0].push(state.text_vocab_size + semantic_token);
 
+        let predictor_start = Instant::now();
         let semantic_embed = self.talker.get_codec_embedding(semantic_token)?;
         let acoustic_codes = self.code_predictor.generate_acoustic_codes(
             &state.last_hidden,
@@ -1042,6 +1046,7 @@ impl Qwen3TtsModel {
         let acoustic_embed_sum = self
             .code_predictor
             .get_acoustic_embeddings_sum(&acoustic_codes)?;
+        let predictor_ms = predictor_start.elapsed().as_secs_f64() * 1000.0;
         for (acoustic_idx, &group_token) in acoustic_codes.iter().enumerate() {
             let group_idx = acoustic_idx + 1;
             if group_idx < state.all_code_groups.len() {
@@ -1063,21 +1068,38 @@ impl Qwen3TtsModel {
         let step_input = semantic_embed
             .broadcast_add(&acoustic_embed_sum)?
             .broadcast_add(&text_addition)?;
+        let talker_start = Instant::now();
         let (new_hidden, new_logits) = self.talker.generate_step_with_embed(
             &step_input,
             &mut state.talker_cache,
             state.offset,
         )?;
+        let talker_ms = talker_start.elapsed().as_secs_f64() * 1000.0;
         state.last_hidden = new_hidden;
         state.last_logits = new_logits;
         state.frame_idx = state.frame_idx.saturating_add(1);
         state.offset = state.offset.saturating_add(1);
 
+        let audio_start = Instant::now();
         let mut samples = self.collect_incremental_audio(state, false)?;
+        let audio_ms = audio_start.elapsed().as_secs_f64() * 1000.0;
         if state.frame_idx >= state.max_frames {
             state.finished = true;
             let final_samples = self.collect_incremental_audio(state, true)?;
             samples.extend(final_samples);
+        }
+
+        if self.device.kind.is_cuda() {
+            debug!(
+                frame_idx = state.frame_idx,
+                semantic_ms,
+                predictor_ms,
+                talker_ms,
+                audio_ms,
+                total_ms = step_start.elapsed().as_secs_f64() * 1000.0,
+                emitted_samples = samples.len(),
+                "Qwen3-TTS CUDA decode step timings"
+            );
         }
 
         Ok(TtsDecodeStep {
@@ -1553,9 +1575,19 @@ impl Qwen3TtsModel {
 
         let prefill_len = prefill_embeds.dim(1)?;
         let trailing_text_len = trailing_text_hidden.dim(1)?;
+        let prefill_start = Instant::now();
         let (last_hidden, last_logits) =
             self.talker
                 .prefill_with_embeds(&prefill_embeds, &mut talker_cache, None)?;
+        if self.device.kind.is_cuda() {
+            debug!(
+                prefill_len,
+                trailing_text_len,
+                dtype = ?self.dtype,
+                prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0,
+                "Qwen3-TTS CUDA prefill timings"
+            );
+        }
 
         Ok(TtsDecodeState {
             talker_cache,
