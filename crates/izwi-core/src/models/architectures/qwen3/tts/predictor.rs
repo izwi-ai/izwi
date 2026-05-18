@@ -4,7 +4,7 @@
 //! has produced the first (semantic) codebook. It uses a smaller transformer
 //! for efficient multi-token prediction.
 
-use candle_core::{D, DType, Device, IndexOp, Tensor};
+use candle_core::{DType, Device, IndexOp, Tensor, D};
 use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::error::{Error, Result};
@@ -690,15 +690,13 @@ fn causal_mask(
 }
 
 fn argmax_token(logits: &Tensor) -> Result<u32> {
-    let logits = logits.to_dtype(DType::F32)?;
-    let values = logits.to_vec1::<f32>()?;
-    let mut max_idx = 0usize;
-    let mut max_val = f32::NEG_INFINITY;
-    for (idx, &val) in values.iter().enumerate() {
-        if val > max_val {
-            max_val = val;
-            max_idx = idx;
-        }
-    }
-    Ok(max_idx as u32)
+    let idx = logits.argmax(D::Minus1)?;
+    let idx = if idx.rank() == 0 {
+        idx
+    } else {
+        idx.squeeze(0)?
+    };
+    idx.to_dtype(DType::U32)?
+        .to_scalar::<u32>()
+        .map_err(Error::from)
 }
