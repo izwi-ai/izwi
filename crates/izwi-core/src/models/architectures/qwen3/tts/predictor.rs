@@ -268,9 +268,11 @@ impl CodePredictor {
 
         let mut offset = seq_len;
         for group_idx in 1..num_acoustic {
-            let prev_tensor = Tensor::new(&[prev_code], &self.device)?;
-            let mut step_hidden = self.codec_embeddings[group_idx - 1].forward(&prev_tensor)?;
-            step_hidden = step_hidden.unsqueeze(0)?;
+            let mut step_hidden = self.codec_embeddings[group_idx - 1]
+                .embeddings()
+                .i(prev_code as usize)?
+                .unsqueeze(0)?
+                .unsqueeze(0)?;
             if let Some(proj) = &self.small_to_mtp_projection {
                 step_hidden = proj.forward(&step_hidden)?;
             }
@@ -300,20 +302,17 @@ impl CodePredictor {
             )));
         }
 
-        let codes = Tensor::from_vec(
-            acoustic_codes.to_vec(),
-            (acoustic_codes.len(),),
-            &self.device,
-        )?;
-        let first_code = codes.narrow(0, 0, 1)?;
         let mut sum = self.codec_embeddings[0]
-            .forward(&first_code)?
+            .embeddings()
+            .i(acoustic_codes[0] as usize)?
+            .unsqueeze(0)?
             .unsqueeze(0)?;
 
-        for group_idx in 1..acoustic_codes.len() {
-            let code_tensor = codes.narrow(0, group_idx, 1)?;
+        for (group_idx, code) in acoustic_codes.iter().enumerate().skip(1) {
             let embed = self.codec_embeddings[group_idx]
-                .forward(&code_tensor)?
+                .embeddings()
+                .i(*code as usize)?
+                .unsqueeze(0)?
                 .unsqueeze(0)?;
             sum = sum.broadcast_add(&embed)?;
         }

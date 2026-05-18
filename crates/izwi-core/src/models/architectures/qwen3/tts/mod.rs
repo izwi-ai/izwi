@@ -2251,17 +2251,7 @@ fn sample_semantic(
     };
     let vocab_len = logits.dim(0)?;
     let semantic_len = (semantic_vocab_size as usize).min(vocab_len);
-    let mut values: Vec<(u32, f32)> = if semantic_len > 0 {
-        logits
-            .narrow(0, 0, semantic_len)?
-            .to_vec1::<f32>()?
-            .into_iter()
-            .enumerate()
-            .map(|(idx, value)| (idx as u32, value))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let mut values = collect_semantic_sampling_values(&logits, semantic_len, params, history)?;
 
     let eos_idx = eos_token_id as usize;
     if allow_eos && eos_idx < vocab_len && eos_idx >= semantic_len {
@@ -2362,6 +2352,49 @@ fn sample_semantic(
         .map(|(idx, _)| *idx)
         .or_else(|| Some(if allow_eos { eos_token_id } else { 0 }))
         .ok_or_else(|| Error::InferenceError("Failed to sample semantic token".to_string()))
+}
+
+fn collect_semantic_sampling_values(
+    logits: &Tensor,
+    semantic_len: usize,
+    params: &TtsGenerationParams,
+    history: &[u32],
+) -> Result<Vec<(u32, f32)>> {
+    if semantic_len == 0 {
+        return Ok(Vec::new());
+    }
+
+    let semantic_logits = logits.narrow(0, 0, semantic_len)?;
+    if params.top_k > 0 && params.top_k < semantic_len {
+        let penalty_extra = if params.repetition_penalty > 1.0 && !history.is_empty() {
+            history
+                .iter()
+                .copied()
+                .filter(|token_id| (*token_id as usize) < semantic_len)
+                .collect::<HashSet<_>>()
+                .len()
+        } else {
+            0
+        };
+        let prefetch = params
+            .top_k
+            .saturating_add(penalty_extra)
+            .min(semantic_len);
+        let (sorted_values, sorted_indices) = semantic_logits.sort_last_dim(false)?;
+        let values = sorted_values.narrow(0, 0, prefetch)?.to_vec1::<f32>()?;
+        let indices = sorted_indices
+            .narrow(0, 0, prefetch)?
+            .to_dtype(DType::U32)?
+            .to_vec1::<u32>()?;
+        return Ok(indices.into_iter().zip(values).collect());
+    }
+
+    Ok(semantic_logits
+        .to_vec1::<f32>()?
+        .into_iter()
+        .enumerate()
+        .map(|(idx, value)| (idx as u32, value))
+        .collect())
 }
 
 struct SimpleRng {
@@ -2659,6 +2692,27 @@ mod tests {
         assert_eq!(
             sample_semantic(&logits, 3, 6, true, &params, &[], &mut rng).unwrap(),
             6
+        );
+    }
+
+    #[test]
+    fn top_k_semantic_sampling_keeps_penalty_replacement_candidates() {
+        let logits = Tensor::new(vec![10.0f32, 9.0, 0.0, -5.0], &candle_core::Device::Cpu)
+            .unwrap();
+        let params = TtsGenerationParams {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 1,
+            repetition_penalty: 2.0,
+            ..Default::default()
+        };
+        let mut rng = SimpleRng {
+            state: 0x1234_5678_9abc_def0,
+        };
+
+        assert_eq!(
+            sample_semantic(&logits, 4, 99, false, &params, &[0], &mut rng).unwrap(),
+            1
         );
     }
 
