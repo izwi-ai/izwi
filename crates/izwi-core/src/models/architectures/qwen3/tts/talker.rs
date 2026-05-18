@@ -114,7 +114,7 @@ struct Attention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    rope_theta: f64,
+    rope_inv_freq: Vec<f32>,
     use_mrope: bool,
     mrope_section: Vec<usize>,
 }
@@ -161,7 +161,7 @@ impl Attention {
             num_heads: cfg.num_attention_heads,
             num_kv_heads: cfg.num_key_value_heads,
             head_dim,
-            rope_theta: cfg.rope_theta,
+            rope_inv_freq: build_rope_inv_freq(head_dim, cfg.rope_theta),
             use_mrope,
             mrope_section,
         })
@@ -211,19 +211,17 @@ impl Attention {
             };
             build_mrope_cache(
                 seq_len,
-                self.head_dim,
-                self.rope_theta,
                 x.device(),
                 x.dtype(),
                 &position_ids,
                 &self.mrope_section,
+                &self.rope_inv_freq,
             )?
         } else {
             build_rope_cache(
                 seq_len,
-                self.head_dim,
                 start_pos,
-                self.rope_theta,
+                &self.rope_inv_freq,
                 x.device(),
                 x.dtype(),
             )?
@@ -742,22 +740,25 @@ impl TalkerModel {
     }
 }
 
-/// Build standard RoPE cache
-fn build_rope_cache(
-    seq_len: usize,
-    head_dim: usize,
-    start_pos: usize,
-    rope_theta: f64,
-    device: &Device,
-    dtype: DType,
-) -> Result<(Tensor, Tensor)> {
+fn build_rope_inv_freq(head_dim: usize, rope_theta: f64) -> Vec<f32> {
     let half_dim = head_dim / 2;
     let mut inv_freq = Vec::with_capacity(half_dim);
     for i in 0..half_dim {
         let power = (2.0 * i as f64) / head_dim as f64;
         inv_freq.push((1.0 / rope_theta.powf(power)) as f32);
     }
+    inv_freq
+}
 
+/// Build standard RoPE cache
+fn build_rope_cache(
+    seq_len: usize,
+    start_pos: usize,
+    inv_freq: &[f32],
+    device: &Device,
+    dtype: DType,
+) -> Result<(Tensor, Tensor)> {
+    let half_dim = inv_freq.len();
     let mut angles = Vec::with_capacity(seq_len * half_dim);
     for pos in start_pos..start_pos + seq_len {
         for &inv in inv_freq.iter() {
@@ -774,28 +775,21 @@ fn build_rope_cache(
 /// Build MRoPE cache for multi-modal position encoding
 fn build_mrope_cache(
     seq_len: usize,
-    head_dim: usize,
-    rope_theta: f64,
     device: &Device,
     dtype: DType,
     position_ids: &Tensor,
     mrope_section: &[usize],
+    inv_freq: &[f32],
 ) -> Result<(Tensor, Tensor)> {
-    let half_dim = head_dim / 2;
+    let half_dim = inv_freq.len();
 
     if mrope_section.len() < 3 {
-        return build_rope_cache(seq_len, head_dim, 0, rope_theta, device, dtype);
+        return build_rope_cache(seq_len, 0, inv_freq, device, dtype);
     }
 
     let positions = position_ids.to_vec2::<i64>()?;
     if positions.len() != 3 || positions.iter().any(|axis| axis.len() < seq_len) {
-        return build_rope_cache(seq_len, head_dim, 0, rope_theta, device, dtype);
-    }
-
-    let mut inv_freq = Vec::with_capacity(half_dim);
-    for i in 0..half_dim {
-        let power = (2.0 * i as f64) / head_dim as f64;
-        inv_freq.push((1.0 / rope_theta.powf(power)) as f32);
+        return build_rope_cache(seq_len, 0, inv_freq, device, dtype);
     }
 
     // Match Qwen3 interleaved MRoPE layout.
