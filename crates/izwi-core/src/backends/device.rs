@@ -859,6 +859,10 @@ mod tests {
             DType::BF16
         );
         assert_eq!(
+            cuda_profile.select_model_dtype(ModelFamily::Qwen3Tts, None),
+            DType::BF16
+        );
+        assert_eq!(
             cuda_profile.select_model_dtype(ModelFamily::Gemma3Chat, None),
             DType::BF16
         );
