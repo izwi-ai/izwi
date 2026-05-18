@@ -33,7 +33,7 @@ impl RopeCache {
 
         if inner.dtype != Some(dtype) || inner.len < required_len {
             let cache_len = required_len.max(1).next_power_of_two();
-            let (cos, sin) = build_rope_prefix(cache_len, inv_freq, device, dtype)?;
+            let (cos, sin) = build_rope_prefix_full(cache_len, inv_freq, device, dtype)?;
             inner.dtype = Some(dtype);
             inner.len = cache_len;
             inner.cos = Some(cos);
@@ -85,13 +85,30 @@ pub(super) fn build_rope_window(
     Ok((cos, sin))
 }
 
-fn build_rope_prefix(
+pub(super) fn build_rope_window_full(
+    seq_len: usize,
+    start_pos: usize,
+    inv_freq: &[f32],
+    device: &Device,
+    dtype: DType,
+) -> Result<(Tensor, Tensor)> {
+    let (cos, sin) = build_rope_window(seq_len, start_pos, inv_freq, device, dtype)?;
+    duplicate_rope_window(cos, sin)
+}
+
+fn build_rope_prefix_full(
     len: usize,
     inv_freq: &[f32],
     device: &Device,
     dtype: DType,
 ) -> Result<(Tensor, Tensor)> {
-    build_rope_window(len, 0, inv_freq, device, dtype)
+    build_rope_window_full(len, 0, inv_freq, device, dtype)
+}
+
+pub(super) fn duplicate_rope_window(cos: Tensor, sin: Tensor) -> Result<(Tensor, Tensor)> {
+    let cos = Tensor::cat(&[cos.clone(), cos], 1)?;
+    let sin = Tensor::cat(&[sin.clone(), sin], 1)?;
+    Ok((cos, sin))
 }
 
 #[cfg(test)]
@@ -108,8 +125,9 @@ mod tests {
             .get_window(2, 3, &inv_freq, &device, DType::F32)
             .unwrap();
         let (direct_cos, direct_sin) =
-            build_rope_window(2, 3, &inv_freq, &device, DType::F32).unwrap();
+            build_rope_window_full(2, 3, &inv_freq, &device, DType::F32).unwrap();
 
+        assert_eq!(cached_cos.dim(1).unwrap(), 4);
         assert_eq!(
             cached_cos.to_vec2::<f32>().unwrap(),
             direct_cos.to_vec2::<f32>().unwrap()
