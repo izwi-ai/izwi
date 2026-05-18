@@ -1469,14 +1469,7 @@ impl RVQFirstQuantizer {
     }
 
     fn decode(&self, codes: &Tensor) -> Result<Tensor> {
-        let flat = codes.flatten_all()?;
-        let codebook_size = self.codebook.codebook_size as i64;
-        let mut flat_codes: Vec<i64> = flat.to_vec1()?;
-        for code in &mut flat_codes {
-            *code = code.rem_euclid(codebook_size);
-        }
-        let mapped = Tensor::from_vec(flat_codes, flat.dims(), codes.device())?;
-        let embeddings = self.codebook.lookup(&mapped)?;
+        let embeddings = self.codebook.lookup(codes)?;
         let embeddings =
             embeddings.reshape((codes.dim(0)?, codes.dim(1)?, self.codebook.codebook_dim))?;
         let embeddings = embeddings.transpose(1, 2)?;
@@ -1534,14 +1527,20 @@ impl RVQRestQuantizer {
             codebook.embeddings.dtype(),
             device,
         )?;
+        let mut normalized_codes = Vec::with_capacity(self.codebooks.len() * seq_len);
         for (idx, codebook) in self.codebooks.iter().enumerate() {
             let group_tokens = codec_tokens.get(idx + 1);
-            let mut values = Vec::with_capacity(seq_len);
-            for t in 0..seq_len {
-                let token = group_tokens.and_then(|g| g.get(t)).copied().unwrap_or(0);
-                values.push((token as i64).rem_euclid(codebook.codebook_size as i64));
-            }
-            let codes = Tensor::from_vec(values, (1, seq_len), device)?;
+            normalized_codes.extend(normalized_codec_indices(
+                group_tokens.map(Vec::as_slice),
+                seq_len,
+                codebook.codebook_size,
+            ));
+        }
+        let normalized_codes =
+            Tensor::from_vec(normalized_codes, (self.codebooks.len(), seq_len), device)?;
+
+        for (idx, codebook) in self.codebooks.iter().enumerate() {
+            let codes = normalized_codes.i(idx)?.unsqueeze(0)?;
             let embed = codebook.lookup(&codes)?;
             rest_embed = rest_embed.broadcast_add(&embed)?;
         }
@@ -1760,7 +1759,11 @@ impl SpeechTokenizerDecoder {
         }
 
         let seq_len = codec_tokens[0].len();
-        let first_codes: Vec<i64> = codec_tokens[0].iter().map(|&x| x as i64).collect();
+        let first_codes = normalized_codec_indices(
+            Some(codec_tokens[0].as_slice()),
+            seq_len,
+            self.rvq_first.codebook.codebook_size,
+        );
         let first_tensor = Tensor::from_vec(first_codes, (1, seq_len), &self.device)?;
 
         // RVQ decode (first + residual codebooks) and project to hidden features.
@@ -1875,6 +1878,26 @@ fn ceil_div(n: usize, d: usize) -> usize {
     n.div_ceil(d)
 }
 
+fn normalized_codec_index(token: u32, codebook_size: usize) -> i64 {
+    if codebook_size == 0 {
+        return 0;
+    }
+    (token as i64).rem_euclid(codebook_size as i64)
+}
+
+fn normalized_codec_indices(
+    tokens: Option<&[u32]>,
+    seq_len: usize,
+    codebook_size: usize,
+) -> Vec<i64> {
+    let mut values = Vec::with_capacity(seq_len);
+    for t in 0..seq_len {
+        let token = tokens.and_then(|tokens| tokens.get(t)).copied().unwrap_or(0);
+        values.push(normalized_codec_index(token, codebook_size));
+    }
+    values
+}
+
 fn resample_audio_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>> {
     if src_rate == dst_rate {
         return Ok(audio.to_vec());
@@ -1894,4 +1917,22 @@ fn resample_audio_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Result<
         out.push((s0 as f64 * (1.0 - frac) + s1 as f64 * frac) as f32);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalized_codec_indices_wrap_and_pad_tokens() {
+        assert_eq!(normalized_codec_index(0, 8), 0);
+        assert_eq!(normalized_codec_index(9, 8), 1);
+        assert_eq!(normalized_codec_index(17, 8), 1);
+
+        assert_eq!(
+            normalized_codec_indices(Some(&[0, 9]), 4, 8),
+            vec![0, 1, 0, 0]
+        );
+        assert_eq!(normalized_codec_indices(None, 3, 8), vec![0, 0, 0]);
+    }
 }
