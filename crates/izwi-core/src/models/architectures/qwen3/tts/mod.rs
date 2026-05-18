@@ -5,6 +5,7 @@
 
 mod config;
 mod predictor;
+mod rope;
 mod speech_tokenizer;
 mod talker;
 mod tokenizer;
