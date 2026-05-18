@@ -167,8 +167,12 @@ impl TtsGenerationParams {
 pub struct Qwen3TtsModel {
     /// Device configuration
     device: DeviceProfile,
-    /// Data type for inference
+    /// Primary transformer data type for inference.
     dtype: DType,
+    /// Data type used by the acoustic code predictor.
+    code_predictor_dtype: DType,
+    /// Data type used by the speech tokenizer decoder.
+    speech_tokenizer_dtype: DType,
     /// Tokenizer for text and codec tokens
     tokenizer: TtsTokenizer,
     /// Special token IDs
@@ -185,6 +189,62 @@ pub struct Qwen3TtsModel {
     kv_page_size: usize,
     /// KV cache quantization mode.
     kv_quantization: KvCacheQuantization,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Qwen3TtsDTypePlan {
+    talker: DType,
+    code_predictor: DType,
+    speech_tokenizer: DType,
+}
+
+fn select_qwen3_tts_dtypes(
+    device: &DeviceProfile,
+    dtype_override: Option<&str>,
+    is_custom_voice_model: bool,
+    is_voice_clone_model: bool,
+) -> Result<Qwen3TtsDTypePlan> {
+    if let Some(raw) = dtype_override.map(str::trim).filter(|raw| !raw.is_empty()) {
+        let dtype =
+            device.select_model_dtype_checked(ModelFamily::Qwen3Tts, Some(raw), "Qwen3 TTS")?;
+        return Ok(Qwen3TtsDTypePlan {
+            talker: dtype,
+            code_predictor: dtype,
+            speech_tokenizer: dtype,
+        });
+    }
+
+    let legacy_dtype = if is_custom_voice_model || is_voice_clone_model {
+        // Voice-clone and CustomVoice generation were historically kept in
+        // F32 by default. Preserve that outside CUDA, and keep the decoder at
+        // F32 for CUDA unless the user explicitly overrides the dtype.
+        DType::F32
+    } else if device.kind.is_metal() {
+        // Reduce model residency on Apple Silicon while preserving speed.
+        DType::F16
+    } else {
+        device.select_model_dtype(ModelFamily::Qwen3Tts, None)
+    };
+
+    if device.kind.is_cuda() {
+        let transformer_dtype = device.select_model_dtype(ModelFamily::Qwen3Tts, None);
+        let speech_tokenizer_dtype = if is_custom_voice_model || is_voice_clone_model {
+            DType::F32
+        } else {
+            legacy_dtype
+        };
+        Ok(Qwen3TtsDTypePlan {
+            talker: transformer_dtype,
+            code_predictor: transformer_dtype,
+            speech_tokenizer: speech_tokenizer_dtype,
+        })
+    } else {
+        Ok(Qwen3TtsDTypePlan {
+            talker: legacy_dtype,
+            code_predictor: legacy_dtype,
+            speech_tokenizer: legacy_dtype,
+        })
+    }
 }
 
 impl Qwen3TtsModel {
@@ -218,21 +278,12 @@ impl Qwen3TtsModel {
         let dtype_override = std::env::var("IZWI_QWEN_TTS_DTYPE")
             .ok()
             .or_else(|| std::env::var("IZWI_QWEN_DTYPE").ok());
-        let dtype = match dtype_override.as_deref().map(str::trim) {
-            Some(raw) if !raw.is_empty() => {
-                device.select_model_dtype_checked(ModelFamily::Qwen3Tts, Some(raw), "Qwen3 TTS")?
-            }
-            _ if is_custom_voice_model || is_voice_clone_model => {
-                // Voice-clone and CustomVoice generation are sensitive to precision and can
-                // become unstable under fp16. Keep default inference in fp32 unless overridden.
-                DType::F32
-            }
-            _ if device.kind.is_metal() => {
-                // Reduce model residency on Apple Silicon while preserving speed.
-                DType::F16
-            }
-            _ => device.select_model_dtype(ModelFamily::Qwen3Tts, None),
-        };
+        let dtype_plan = select_qwen3_tts_dtypes(
+            &device,
+            dtype_override.as_deref(),
+            is_custom_voice_model,
+            is_voice_clone_model,
+        )?;
 
         // Load tokenizer
         let specials = TtsSpecialTokens::from_configs(&config, &config.talker_config);
@@ -240,12 +291,28 @@ impl Qwen3TtsModel {
 
         // Load model weights
         let weights_path = model_dir.join("model.safetensors");
-        let vb =
-            unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device.device)? };
+        let talker_vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(
+                std::slice::from_ref(&weights_path),
+                dtype_plan.talker,
+                &device.device,
+            )?
+        };
+        let code_predictor_vb = if dtype_plan.code_predictor == dtype_plan.talker {
+            talker_vb.clone()
+        } else {
+            unsafe {
+                VarBuilder::from_mmaped_safetensors(
+                    std::slice::from_ref(&weights_path),
+                    dtype_plan.code_predictor,
+                    &device.device,
+                )?
+            }
+        };
 
         // Load talker model
         info!("Loading talker model...");
-        let talker = TalkerModel::load(config.talker_config.clone(), vb.pp("talker"))?;
+        let talker = TalkerModel::load(config.talker_config.clone(), talker_vb.pp("talker"))?;
 
         // Load code predictor
         info!("Loading code predictor...");
@@ -260,25 +327,30 @@ impl Qwen3TtsModel {
         }
         let code_predictor = CodePredictor::load(
             code_predictor_config,
-            vb.pp("talker.code_predictor"),
+            code_predictor_vb.pp("talker.code_predictor"),
             num_code_groups,
         )?;
 
         // Load speech tokenizer decoder
         info!("Loading speech tokenizer decoder...");
         let speech_tokenizer_path = model_dir.join("speech_tokenizer");
-        let speech_tokenizer =
-            SpeechTokenizerDecoder::load(&speech_tokenizer_path, device.device.clone(), dtype)?;
+        let speech_tokenizer = SpeechTokenizerDecoder::load(
+            &speech_tokenizer_path,
+            device.device.clone(),
+            dtype_plan.speech_tokenizer,
+        )?;
 
         info!(
-            "Qwen3-TTS model loaded successfully on {:?} with dtype {:?}",
-            device.kind, dtype
+            "Qwen3-TTS model loaded successfully on {:?} (talker {:?}, predictor {:?}, speech tokenizer {:?})",
+            device.kind, dtype_plan.talker, dtype_plan.code_predictor, dtype_plan.speech_tokenizer
         );
         let kv_quantization = KvCacheQuantization::from_dtype_hint(kv_cache_dtype);
 
         Ok(Self {
             device,
-            dtype,
+            dtype: dtype_plan.talker,
+            code_predictor_dtype: dtype_plan.code_predictor,
+            speech_tokenizer_dtype: dtype_plan.speech_tokenizer,
             tokenizer,
             specials,
             talker,
@@ -1583,7 +1655,9 @@ impl Qwen3TtsModel {
             debug!(
                 prefill_len,
                 trailing_text_len,
-                dtype = ?self.dtype,
+                talker_dtype = ?self.dtype,
+                predictor_dtype = ?self.code_predictor_dtype,
+                speech_tokenizer_dtype = ?self.speech_tokenizer_dtype,
                 prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0,
                 "Qwen3-TTS CUDA prefill timings"
             );
@@ -2231,8 +2305,27 @@ pub fn load_model(model_path: &Path, device: DeviceProfile) -> Result<Qwen3TtsMo
 
 #[cfg(test)]
 mod tests {
+    use crate::backends::{DeviceCapabilities, DeviceKind};
+
     use super::config::{CodePredictorConfig, TalkerConfig};
     use super::*;
+
+    fn dtype_test_profile(
+        kind: DeviceKind,
+        supports_bf16: bool,
+        supports_f16: bool,
+    ) -> DeviceProfile {
+        DeviceProfile {
+            device: candle_core::Device::Cpu,
+            kind,
+            capabilities: DeviceCapabilities {
+                supports_bf16,
+                supports_f16,
+                ..Default::default()
+            },
+            memory_pool: None,
+        }
+    }
 
     #[test]
     fn test_special_tokens_creation() {
@@ -2302,5 +2395,65 @@ mod tests {
         let specials = TtsSpecialTokens::from_configs(&main_config, &main_config.talker_config);
         assert_eq!(specials.codec_bos_id, 2149);
         assert_eq!(specials.codec_eos_token_id, 2150);
+    }
+
+    #[test]
+    fn cuda_base_tts_uses_half_transformers_without_changing_decoder_default() {
+        let profile = dtype_test_profile(DeviceKind::Cuda, true, true);
+        let plan = select_qwen3_tts_dtypes(&profile, None, false, true).unwrap();
+
+        assert_eq!(plan.talker, DType::BF16);
+        assert_eq!(plan.code_predictor, DType::BF16);
+        assert_eq!(plan.speech_tokenizer, DType::F32);
+    }
+
+    #[test]
+    fn cuda_custom_tts_falls_back_to_f16_transformers_without_bf16() {
+        let profile = dtype_test_profile(DeviceKind::Cuda, false, true);
+        let plan = select_qwen3_tts_dtypes(&profile, None, true, false).unwrap();
+
+        assert_eq!(plan.talker, DType::F16);
+        assert_eq!(plan.code_predictor, DType::F16);
+        assert_eq!(plan.speech_tokenizer, DType::F32);
+    }
+
+    #[test]
+    fn cpu_and_metal_qwen_tts_dtype_policy_stays_legacy() {
+        let cpu = dtype_test_profile(DeviceKind::Cpu, false, false);
+        let cpu_plan = select_qwen3_tts_dtypes(&cpu, None, true, false).unwrap();
+        assert_eq!(
+            cpu_plan,
+            Qwen3TtsDTypePlan {
+                talker: DType::F32,
+                code_predictor: DType::F32,
+                speech_tokenizer: DType::F32,
+            }
+        );
+
+        let metal = dtype_test_profile(DeviceKind::Metal, false, false);
+        let metal_custom = select_qwen3_tts_dtypes(&metal, None, true, false).unwrap();
+        assert_eq!(metal_custom.talker, DType::F32);
+        assert_eq!(metal_custom.code_predictor, DType::F32);
+        assert_eq!(metal_custom.speech_tokenizer, DType::F32);
+
+        let metal_voice_design = select_qwen3_tts_dtypes(&metal, None, false, false).unwrap();
+        assert_eq!(metal_voice_design.talker, DType::F16);
+        assert_eq!(metal_voice_design.code_predictor, DType::F16);
+        assert_eq!(metal_voice_design.speech_tokenizer, DType::F16);
+    }
+
+    #[test]
+    fn explicit_qwen_tts_dtype_override_applies_to_all_components() {
+        let profile = dtype_test_profile(DeviceKind::Cuda, true, true);
+        let plan = select_qwen3_tts_dtypes(&profile, Some("f32"), true, false).unwrap();
+
+        assert_eq!(
+            plan,
+            Qwen3TtsDTypePlan {
+                talker: DType::F32,
+                code_predictor: DType::F32,
+                speech_tokenizer: DType::F32,
+            }
+        );
     }
 }
