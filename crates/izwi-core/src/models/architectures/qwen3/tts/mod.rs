@@ -1724,6 +1724,21 @@ impl Qwen3TtsModel {
                 return Ok(Vec::new());
             }
         }
+
+        if self.device.kind.is_cuda() && !force {
+            let (samples, emitted_frames, emitted_samples) = self.decode_cuda_stream_chunk(
+                &state.all_code_groups,
+                state.emitted_frames,
+                state.emitted_samples,
+                target_frames,
+                state.stream_config,
+                &mut state.decode_raw_token_scratch,
+            )?;
+            state.emitted_frames = emitted_frames;
+            state.emitted_samples = emitted_samples;
+            return Ok(samples);
+        }
+
         self.fill_raw_codec_scratch(
             &state.all_code_groups,
             target_frames,
@@ -1776,6 +1791,23 @@ impl Qwen3TtsModel {
             if group.len() < target_frames {
                 return Ok(());
             }
+        }
+
+        if self.device.kind.is_cuda() && !force {
+            let (new_samples, emitted_frames, emitted_samples) = self.decode_cuda_stream_chunk(
+                codec_groups,
+                state.emitted_frames,
+                state.emitted_samples,
+                target_frames,
+                state.config,
+                &mut state.decode_raw_token_scratch,
+            )?;
+            state.emitted_frames = emitted_frames;
+            state.emitted_samples = emitted_samples;
+            if !new_samples.is_empty() {
+                (state.on_chunk)(new_samples)?;
+            }
+            return Ok(());
         }
 
         self.fill_raw_codec_scratch(
@@ -1936,17 +1968,60 @@ impl Qwen3TtsModel {
         self.decode_raw_codec_tokens(&raw_codec_tokens)
     }
 
+    fn decode_cuda_stream_chunk(
+        &self,
+        codec_tokens: &[Vec<u32>],
+        emitted_frames: usize,
+        emitted_samples: usize,
+        target_frames: usize,
+        stream_config: TtsStreamingConfig,
+        scratch: &mut Vec<Vec<u32>>,
+    ) -> Result<(Vec<f32>, usize, usize)> {
+        let context_frames = emitted_frames.min(
+            stream_config
+                .decode_lookahead_frames
+                .max(stream_config.decode_interval_frames)
+                .max(4),
+        );
+        let start_frame = emitted_frames.saturating_sub(context_frames);
+        let chunk_frames = target_frames.saturating_sub(start_frame);
+        if chunk_frames == 0 {
+            return Ok((Vec::new(), emitted_frames, emitted_samples));
+        }
+
+        self.fill_raw_codec_scratch_range(codec_tokens, start_frame, target_frames, scratch)?;
+        let decoded = self.decode_raw_codec_tokens(scratch)?;
+        let skip_samples = decoded
+            .len()
+            .saturating_mul(emitted_frames.saturating_sub(start_frame))
+            / chunk_frames;
+        let new_samples = decoded.get(skip_samples..).unwrap_or(&[]).to_vec();
+        let emitted_samples = emitted_samples.saturating_add(new_samples.len());
+        Ok((new_samples, target_frames, emitted_samples))
+    }
+
     fn fill_raw_codec_scratch(
         &self,
         codec_tokens: &[Vec<u32>],
         target_frames: usize,
         scratch: &mut Vec<Vec<u32>>,
     ) -> Result<()> {
-        if codec_tokens.is_empty() || target_frames == 0 {
+        self.fill_raw_codec_scratch_range(codec_tokens, 0, target_frames, scratch)
+    }
+
+    fn fill_raw_codec_scratch_range(
+        &self,
+        codec_tokens: &[Vec<u32>],
+        start_frame: usize,
+        end_frame: usize,
+        scratch: &mut Vec<Vec<u32>>,
+    ) -> Result<()> {
+        if codec_tokens.is_empty() || end_frame <= start_frame {
             scratch.clear();
             return Ok(());
         }
 
+        let target_frames = end_frame - start_frame;
         let text_vocab_size = self.tokenizer.text_vocab_size() as u32;
         let codec_vocab_size = self.tokenizer.codec_vocab_size() as u32;
 
@@ -1955,7 +2030,7 @@ impl Qwen3TtsModel {
         }
 
         for (group_idx, group_tokens) in codec_tokens.iter().enumerate() {
-            if group_tokens.len() < target_frames {
+            if group_tokens.len() < end_frame {
                 return Err(Error::InvalidInput(
                     "Insufficient codec frames for requested decode slice".to_string(),
                 ));
@@ -1964,22 +2039,13 @@ impl Qwen3TtsModel {
             raw_tokens.clear();
             raw_tokens.reserve(target_frames);
 
-            for &token in group_tokens.iter().take(target_frames) {
-                let codec_token = if group_idx == 0 {
-                    if token >= text_vocab_size {
-                        token - text_vocab_size
-                    } else {
-                        token
-                    }
-                } else {
-                    let offset = text_vocab_size + (group_idx as u32 * codec_vocab_size);
-                    if token >= offset {
-                        token - offset
-                    } else {
-                        token
-                    }
-                };
-                raw_tokens.push(codec_token);
+            for &token in group_tokens.iter().take(end_frame).skip(start_frame) {
+                raw_tokens.push(raw_codec_token(
+                    token,
+                    group_idx,
+                    text_vocab_size,
+                    codec_vocab_size,
+                ));
             }
         }
         Ok(())
@@ -2012,6 +2078,28 @@ impl Qwen3TtsModel {
     /// Get the device
     pub fn device(&self) -> &DeviceProfile {
         &self.device
+    }
+}
+
+fn raw_codec_token(
+    token: u32,
+    group_idx: usize,
+    text_vocab_size: u32,
+    codec_vocab_size: u32,
+) -> u32 {
+    if group_idx == 0 {
+        if token >= text_vocab_size {
+            token - text_vocab_size
+        } else {
+            token
+        }
+    } else {
+        let offset = text_vocab_size + (group_idx as u32 * codec_vocab_size);
+        if token >= offset {
+            token - offset
+        } else {
+            token
+        }
     }
 }
 
@@ -2555,5 +2643,16 @@ mod tests {
             sample_semantic(&logits, 3, 6, true, &params, &[], &mut rng).unwrap(),
             6
         );
+    }
+
+    #[test]
+    fn raw_codec_token_mapping_preserves_unoffset_tokens() {
+        assert_eq!(raw_codec_token(151_936 + 7, 0, 151_936, 2048), 7);
+        assert_eq!(raw_codec_token(7, 0, 151_936, 2048), 7);
+        assert_eq!(
+            raw_codec_token(151_936 + (3 * 2048) + 19, 3, 151_936, 2048),
+            19
+        );
+        assert_eq!(raw_codec_token(19, 3, 151_936, 2048), 19);
     }
 }
