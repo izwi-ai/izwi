@@ -9,6 +9,9 @@ use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::tts::config::TalkerConfig;
+use crate::models::architectures::qwen3::tts::rope::{
+    build_rope_inv_freq, build_rope_window, RopeCache,
+};
 use crate::models::shared::attention::batched::{
     batched_scaled_dot_product_attention, BatchedAttentionConfig, BatchedAttentionInput,
 };
@@ -115,6 +118,7 @@ struct Attention {
     num_kv_heads: usize,
     head_dim: usize,
     rope_inv_freq: Vec<f32>,
+    rope_cache: RopeCache,
     use_mrope: bool,
     mrope_section: Vec<usize>,
 }
@@ -162,6 +166,7 @@ impl Attention {
             num_kv_heads: cfg.num_key_value_heads,
             head_dim,
             rope_inv_freq: build_rope_inv_freq(head_dim, cfg.rope_theta),
+            rope_cache: RopeCache::default(),
             use_mrope,
             mrope_section,
         })
@@ -196,29 +201,26 @@ impl Attention {
         let half_dim = self.head_dim / 2;
 
         let (cos, sin) = if self.use_mrope {
-            let position_ids = if let Some(position_ids) = position_ids {
-                position_ids.clone()
+            if let Some(position_ids) = position_ids {
+                build_mrope_cache(
+                    seq_len,
+                    x.device(),
+                    x.dtype(),
+                    position_ids,
+                    &self.mrope_section,
+                    &self.rope_inv_freq,
+                )?
             } else {
-                // Default: create standard position IDs replicated for 3 dims
-                let mut data = Vec::with_capacity(3 * seq_len);
-                let base = start_pos as i64;
-                for _ in 0..3 {
-                    for idx in 0..seq_len {
-                        data.push(base + idx as i64);
-                    }
-                }
-                Tensor::from_vec(data, (3, seq_len), x.device())?
-            };
-            build_mrope_cache(
-                seq_len,
-                x.device(),
-                x.dtype(),
-                &position_ids,
-                &self.mrope_section,
-                &self.rope_inv_freq,
-            )?
+                self.rope_cache.get_window(
+                    seq_len,
+                    start_pos,
+                    &self.rope_inv_freq,
+                    x.device(),
+                    x.dtype(),
+                )?
+            }
         } else {
-            build_rope_cache(
+            self.rope_cache.get_window(
                 seq_len,
                 start_pos,
                 &self.rope_inv_freq,
@@ -740,38 +742,6 @@ impl TalkerModel {
     }
 }
 
-fn build_rope_inv_freq(head_dim: usize, rope_theta: f64) -> Vec<f32> {
-    let half_dim = head_dim / 2;
-    let mut inv_freq = Vec::with_capacity(half_dim);
-    for i in 0..half_dim {
-        let power = (2.0 * i as f64) / head_dim as f64;
-        inv_freq.push((1.0 / rope_theta.powf(power)) as f32);
-    }
-    inv_freq
-}
-
-/// Build standard RoPE cache
-fn build_rope_cache(
-    seq_len: usize,
-    start_pos: usize,
-    inv_freq: &[f32],
-    device: &Device,
-    dtype: DType,
-) -> Result<(Tensor, Tensor)> {
-    let half_dim = inv_freq.len();
-    let mut angles = Vec::with_capacity(seq_len * half_dim);
-    for pos in start_pos..start_pos + seq_len {
-        for &inv in inv_freq.iter() {
-            angles.push(pos as f32 * inv);
-        }
-    }
-
-    let angles = Tensor::from_vec(angles, (seq_len, half_dim), device)?;
-    let cos = angles.cos()?.to_dtype(dtype)?;
-    let sin = angles.sin()?.to_dtype(dtype)?;
-    Ok((cos, sin))
-}
-
 /// Build MRoPE cache for multi-modal position encoding
 fn build_mrope_cache(
     seq_len: usize,
@@ -784,12 +754,12 @@ fn build_mrope_cache(
     let half_dim = inv_freq.len();
 
     if mrope_section.len() < 3 {
-        return build_rope_cache(seq_len, 0, inv_freq, device, dtype);
+        return build_rope_window(seq_len, 0, inv_freq, device, dtype);
     }
 
     let positions = position_ids.to_vec2::<i64>()?;
     if positions.len() != 3 || positions.iter().any(|axis| axis.len() < seq_len) {
-        return build_rope_cache(seq_len, 0, inv_freq, device, dtype);
+        return build_rope_window(seq_len, 0, inv_freq, device, dtype);
     }
 
     // Match Qwen3 interleaved MRoPE layout.

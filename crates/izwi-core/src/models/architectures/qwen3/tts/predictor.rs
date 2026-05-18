@@ -9,6 +9,7 @@ use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::tts::config::CodePredictorConfig;
+use crate::models::architectures::qwen3::tts::rope::{build_rope_inv_freq, RopeCache};
 use crate::models::shared::attention::batched::{
     batched_scaled_dot_product_attention, BatchedAttentionConfig, BatchedAttentionInput,
 };
@@ -382,6 +383,7 @@ struct Attention {
     num_kv_heads: usize,
     head_dim: usize,
     rope_inv_freq: Vec<f32>,
+    rope_cache: RopeCache,
 }
 
 impl Attention {
@@ -422,6 +424,7 @@ impl Attention {
             num_kv_heads: cfg.num_key_value_heads,
             head_dim,
             rope_inv_freq: build_rope_inv_freq(head_dim, cfg.rope_theta),
+            rope_cache: RopeCache::default(),
         })
     }
 
@@ -444,7 +447,7 @@ impl Attention {
         let seq_len = x.dim(1)?;
         let half_dim = self.head_dim / 2;
 
-        let (cos, sin) = build_rope_cache(
+        let (cos, sin) = self.rope_cache.get_window(
             seq_len,
             start_pos,
             &self.rope_inv_freq,
@@ -640,38 +643,6 @@ impl Mlp {
         let hidden = act.broadcast_mul(&up)?;
         self.down_proj.forward(&hidden).map_err(Error::from)
     }
-}
-
-fn build_rope_inv_freq(head_dim: usize, rope_theta: f64) -> Vec<f32> {
-    let half_dim = head_dim / 2;
-    let mut inv_freq = Vec::with_capacity(half_dim);
-    for i in 0..half_dim {
-        let power = (2.0 * i as f64) / head_dim as f64;
-        inv_freq.push((1.0 / rope_theta.powf(power)) as f32);
-    }
-    inv_freq
-}
-
-/// Build RoPE cache
-fn build_rope_cache(
-    seq_len: usize,
-    start_pos: usize,
-    inv_freq: &[f32],
-    device: &Device,
-    dtype: DType,
-) -> Result<(Tensor, Tensor)> {
-    let half_dim = inv_freq.len();
-    let mut angles = Vec::with_capacity(seq_len * half_dim);
-    for pos in start_pos..start_pos + seq_len {
-        for &inv in inv_freq.iter() {
-            angles.push(pos as f32 * inv);
-        }
-    }
-
-    let angles = Tensor::from_vec(angles, (seq_len, half_dim), device)?;
-    let cos = angles.cos()?.to_dtype(dtype)?;
-    let sin = angles.sin()?.to_dtype(dtype)?;
-    Ok((cos, sin))
 }
 
 /// Create causal attention mask
