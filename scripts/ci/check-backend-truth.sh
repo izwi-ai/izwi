@@ -30,7 +30,7 @@ resolve_cuda_compute_cap() {
 }
 
 resolve_cuda_features() {
-    echo "${IZWI_CUDA_FEATURES:-cuda}"
+    echo "${IZWI_CUDA_FEATURES:-cuda,cudnn,flash-attn}"
 }
 
 smoke_docker_server() {
@@ -61,8 +61,18 @@ assert_docker_runtime_commands() {
         '
 }
 
+cuda_features_include() {
+    local features="$1"
+    local feature="$2"
+    case ",${features}," in
+        *",${feature},"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 audit_cuda_docker_server() {
     local image="$1"
+    local cuda_features="$2"
 
     assert_docker_runtime_commands "${image}"
 
@@ -82,6 +92,28 @@ audit_cuda_docker_server() {
                 echo "Expected izwi-server to link against CUDA shared libraries." >&2
                 exit 1
             fi
+        '
+
+    if cuda_features_include "${cuda_features}" "cudnn"; then
+        docker run --rm \
+            --entrypoint /bin/sh \
+            "${image}" \
+            -c '
+                set -eu
+                ldd_output="$(ldd /usr/local/bin/izwi-server || true)"
+                if ! printf "%s\n" "${ldd_output}" | grep -Eq "libcudnn.*\.so"; then
+                    echo "Expected izwi-server to link against cuDNN shared libraries." >&2
+                    exit 1
+                fi
+            '
+    fi
+
+    docker run --rm \
+        --entrypoint /bin/sh \
+        "${image}" \
+        -c '
+            set -eu
+            ldd_output="$(ldd /usr/local/bin/izwi-server || true)"
 
             missing="$(printf "%s\n" "${ldd_output}" | awk "/not found/ { print \$1 }")"
             unexpected_missing="$(printf "%s\n" "${missing}" | grep -Ev "^(libcuda\.so\.1)?$" || true)"
@@ -144,7 +176,7 @@ run_docker_cuda() {
         --target production-cuda \
         -t izwi-ci:production-cuda \
         .
-    audit_cuda_docker_server izwi-ci:production-cuda
+    audit_cuda_docker_server izwi-ci:production-cuda "${cuda_features}"
 }
 
 main() {

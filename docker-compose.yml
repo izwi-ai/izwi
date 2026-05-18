@@ -54,6 +54,7 @@ services:
       target: production-cuda
       args:
         CUDA_COMPUTE_CAP: ${CUDA_COMPUTE_CAP:-80}
+        IZWI_CUDA_FEATURES: ${IZWI_CUDA_FEATURES:-cuda,cudnn,flash-attn}
     image: izwi:cuda
     pull_policy: never
     container_name: izwi-cuda

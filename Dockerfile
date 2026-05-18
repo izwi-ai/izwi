@@ -44,9 +44,9 @@ RUN cargo build --release --locked --bin izwi-server
 # -----------------------------------------------------------------------------
 # Stage 3: Build the Rust backend (CUDA)
 # -----------------------------------------------------------------------------
-FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS rust-builder-cuda
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04 AS rust-builder-cuda
 ARG CUDA_COMPUTE_CAP=80
-ARG IZWI_CUDA_FEATURES=cuda
+ARG IZWI_CUDA_FEATURES=cuda,cudnn,flash-attn
 
 ENV PATH=/root/.cargo/bin:/usr/local/cuda/bin:${PATH}
 ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
@@ -137,7 +137,7 @@ CMD ["izwi-server"]
 # -----------------------------------------------------------------------------
 # Stage 5: Production runtime with CUDA support (Docker-only CUDA artifact)
 # -----------------------------------------------------------------------------
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS production-cuda
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 AS production-cuda
 
 LABEL org.opencontainers.image.title="Izwi Audio (CUDA)"
 LABEL org.opencontainers.image.description="Rust-native audio inference engine with CUDA support"
