@@ -27,9 +27,10 @@ impl RopeCache {
         dtype: DType,
     ) -> Result<(Tensor, Tensor)> {
         let required_len = start_pos.saturating_add(seq_len);
-        let mut inner = self.inner.lock().map_err(|_| {
-            Error::InferenceError("Qwen3-TTS RoPE cache lock poisoned".to_string())
-        })?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| Error::InferenceError("Qwen3-TTS RoPE cache lock poisoned".to_string()))?;
 
         if inner.dtype != Some(dtype) || inner.len < required_len {
             let cache_len = required_len.max(1).next_power_of_two();
@@ -111,6 +112,18 @@ pub(super) fn duplicate_rope_window(cos: Tensor, sin: Tensor) -> Result<(Tensor,
     Ok((cos, sin))
 }
 
+pub(super) fn qwen_rotate_half(x: &Tensor, half_dim: usize) -> Result<Tensor> {
+    let x1 = x.narrow(3, 0, half_dim)?;
+    let x2 = x.narrow(3, half_dim, half_dim)?;
+    let neg_x2 = if x.device().is_cuda() {
+        x2.neg()?
+    } else {
+        let minus_one = Tensor::from_vec(vec![-1.0f32], (1,), x.device())?.to_dtype(x.dtype())?;
+        x2.broadcast_mul(&minus_one)?
+    };
+    Tensor::cat(&[neg_x2, x1], 3).map_err(Error::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,6 +148,18 @@ mod tests {
         assert_eq!(
             cached_sin.to_vec2::<f32>().unwrap(),
             direct_sin.to_vec2::<f32>().unwrap()
+        );
+    }
+
+    #[test]
+    fn qwen_rotate_half_matches_reference_layout() {
+        let device = Device::Cpu;
+        let x = Tensor::new(&[[[[1.0f32, 2.0, 3.0, 4.0]]]], &device).unwrap();
+        let rotated = qwen_rotate_half(&x, 2).unwrap();
+
+        assert_eq!(
+            rotated.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![-3.0, -4.0, 1.0, 2.0]
         );
     }
 }
