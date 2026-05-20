@@ -268,10 +268,8 @@ impl CodePredictor {
 
         let mut offset = seq_len;
         for group_idx in 1..num_acoustic {
-            let mut step_hidden = self.codec_embeddings[group_idx - 1]
-                .embeddings()
-                .i(prev_code as usize)?
-                .unsqueeze(0)?
+            let mut step_hidden = self
+                .codec_embedding_row(group_idx - 1, prev_code)?
                 .unsqueeze(0)?;
             if let Some(proj) = &self.small_to_mtp_projection {
                 step_hidden = proj.forward(&step_hidden)?;
@@ -302,22 +300,31 @@ impl CodePredictor {
             )));
         }
 
-        let mut sum = self.codec_embeddings[0]
-            .embeddings()
-            .i(acoustic_codes[0] as usize)?
-            .unsqueeze(0)?
+        let mut sum = self
+            .codec_embedding_row(0, acoustic_codes[0])?
             .unsqueeze(0)?;
 
         for (group_idx, code) in acoustic_codes.iter().enumerate().skip(1) {
-            let embed = self.codec_embeddings[group_idx]
-                .embeddings()
-                .i(*code as usize)?
-                .unsqueeze(0)?
-                .unsqueeze(0)?;
+            let embed = self.codec_embedding_row(group_idx, *code)?.unsqueeze(0)?;
             sum = sum.broadcast_add(&embed)?;
         }
 
         Ok(sum)
+    }
+
+    fn codec_embedding_row(&self, group_idx: usize, code: u32) -> Result<Tensor> {
+        if self.device.is_cuda() {
+            self.codec_embeddings[group_idx]
+                .embeddings()
+                .i(code as usize)?
+                .unsqueeze(0)
+                .map_err(Error::from)
+        } else {
+            let code_tensor = Tensor::from_vec(vec![code], (1,), &self.device)?;
+            self.codec_embeddings[group_idx]
+                .forward(&code_tensor)
+                .map_err(Error::from)
+        }
     }
 }
 
@@ -664,6 +671,10 @@ fn causal_mask(
 }
 
 fn argmax_token(logits: &Tensor) -> Result<u32> {
+    if !logits.device().is_cuda() {
+        return argmax_token_reference(logits);
+    }
+
     let idx = logits.argmax(D::Minus1)?;
     let idx = if idx.rank() == 0 {
         idx
@@ -673,4 +684,55 @@ fn argmax_token(logits: &Tensor) -> Result<u32> {
     idx.to_dtype(DType::U32)?
         .to_scalar::<u32>()
         .map_err(Error::from)
+}
+
+fn argmax_token_reference(logits: &Tensor) -> Result<u32> {
+    let logits = logits.to_dtype(DType::F32)?;
+    let logits = match logits.rank() {
+        1 => logits,
+        2 => {
+            let (rows, _cols) = logits.dims2()?;
+            if rows != 1 {
+                return Err(Error::InferenceError(format!(
+                    "Unexpected Qwen3-TTS predictor logits shape: {:?}",
+                    logits.shape().dims()
+                )));
+            }
+            logits.i(0)?
+        }
+        rank => {
+            return Err(Error::InferenceError(format!(
+                "Unexpected Qwen3-TTS predictor logits rank: {rank}"
+            )))
+        }
+    };
+    let values = logits.to_vec1::<f32>()?;
+    let mut max_idx = 0usize;
+    let mut max_val = f32::NEG_INFINITY;
+    for (idx, &val) in values.iter().enumerate() {
+        if val > max_val {
+            max_val = val;
+            max_idx = idx;
+        }
+    }
+    Ok(max_idx as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_cuda_predictor_argmax_uses_reference_ordering() {
+        let logits = Tensor::new(vec![0.0f32, 4.0, 4.0, 3.0], &Device::Cpu).unwrap();
+
+        assert_eq!(argmax_token(&logits).unwrap(), 1);
+    }
+
+    #[test]
+    fn predictor_argmax_reference_accepts_single_row_logits() {
+        let logits = Tensor::new(&[[0.0f32, 1.0, 7.0, 3.0]], &Device::Cpu).unwrap();
+
+        assert_eq!(argmax_token(&logits).unwrap(), 2);
+    }
 }

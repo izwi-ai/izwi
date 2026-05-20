@@ -648,6 +648,7 @@ impl Qwen3TtsModel {
                         &state.params,
                         &state.semantic_history,
                         &mut state.rng,
+                        self.device.kind.is_cuda(),
                     )?;
                     if allow_eos && semantic_token == self.specials.codec_eos_token_id {
                         state.finished = true;
@@ -1089,6 +1090,7 @@ impl Qwen3TtsModel {
             &state.params,
             &state.semantic_history,
             &mut state.rng,
+            self.device.kind.is_cuda(),
         )?;
         let semantic_ms = semantic_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -1294,6 +1296,7 @@ impl Qwen3TtsModel {
                 params,
                 &semantic_history,
                 &mut rng,
+                self.device.kind.is_cuda(),
             )?;
 
             // Check for end of sequence
@@ -2216,6 +2219,56 @@ fn argmax_semantic(
     }
 }
 
+fn argmax_semantic_reference(
+    logits: &Tensor,
+    semantic_vocab_size: u32,
+    eos_token_id: u32,
+    allow_eos: bool,
+) -> Result<u32> {
+    let logits = logits.to_dtype(DType::F32)?;
+    let logits = match logits.rank() {
+        1 => logits,
+        2 => {
+            let (rows, _cols) = logits.dims2()?;
+            if rows != 1 {
+                return Err(Error::InferenceError(format!(
+                    "Unexpected Qwen3-TTS semantic logits shape: {:?}",
+                    logits.shape().dims()
+                )));
+            }
+            logits.i(0)?
+        }
+        rank => {
+            return Err(Error::InferenceError(format!(
+                "Unexpected Qwen3-TTS semantic logits rank: {rank}"
+            )))
+        }
+    };
+    let values = logits.to_vec1::<f32>()?;
+    let mut max_idx: Option<usize> = None;
+    let mut max_val = f32::NEG_INFINITY;
+
+    for (idx, &val) in values.iter().enumerate() {
+        let token_id = idx as u32;
+        let allowed = token_id < semantic_vocab_size || (allow_eos && token_id == eos_token_id);
+        if !allowed {
+            continue;
+        }
+        if val > max_val {
+            max_val = val;
+            max_idx = Some(idx);
+        }
+    }
+
+    if let Some(idx) = max_idx {
+        Ok(idx as u32)
+    } else if allow_eos {
+        Ok(eos_token_id)
+    } else {
+        Ok(0)
+    }
+}
+
 fn sample_semantic(
     logits: &Tensor,
     semantic_vocab_size: u32,
@@ -2224,7 +2277,20 @@ fn sample_semantic(
     params: &TtsGenerationParams,
     history: &[u32],
     rng: &mut SimpleRng,
+    prefer_device_sampling: bool,
 ) -> Result<u32> {
+    if !prefer_device_sampling {
+        return sample_semantic_reference(
+            logits,
+            semantic_vocab_size,
+            eos_token_id,
+            allow_eos,
+            params,
+            history,
+            rng,
+        );
+    }
+
     // Greedy fallback stays on device until the selected scalar is copied back.
     if params.temperature <= 1e-5 {
         return argmax_semantic(logits, semantic_vocab_size, eos_token_id, allow_eos);
@@ -2354,6 +2420,154 @@ fn sample_semantic(
         .ok_or_else(|| Error::InferenceError("Failed to sample semantic token".to_string()))
 }
 
+fn sample_semantic_reference(
+    logits: &Tensor,
+    semantic_vocab_size: u32,
+    eos_token_id: u32,
+    allow_eos: bool,
+    params: &TtsGenerationParams,
+    history: &[u32],
+    rng: &mut SimpleRng,
+) -> Result<u32> {
+    let logits = logits.to_dtype(DType::F32)?;
+    let logits = match logits.rank() {
+        1 => logits,
+        2 => {
+            let (rows, _cols) = logits.dims2()?;
+            if rows != 1 {
+                return Err(Error::InferenceError(format!(
+                    "Unexpected Qwen3-TTS semantic logits shape: {:?}",
+                    logits.shape().dims()
+                )));
+            }
+            logits.i(0)?
+        }
+        rank => {
+            return Err(Error::InferenceError(format!(
+                "Unexpected Qwen3-TTS semantic logits rank: {rank}"
+            )))
+        }
+    };
+    let mut values = logits.to_vec1::<f32>()?;
+
+    // Token suppression: keep semantic range and optional EOS only.
+    for (idx, v) in values.iter_mut().enumerate() {
+        let token_id = idx as u32;
+        let allowed = token_id < semantic_vocab_size || (allow_eos && token_id == eos_token_id);
+        if !allowed {
+            *v = f32::NEG_INFINITY;
+        }
+    }
+
+    // Repetition penalty over recent semantic history.
+    if params.repetition_penalty > 1.0 && !history.is_empty() {
+        let mut seen = vec![false; values.len()];
+        for &token in history {
+            let idx = token as usize;
+            if idx < seen.len() {
+                seen[idx] = true;
+            }
+        }
+        for (idx, seen_flag) in seen.iter().enumerate() {
+            if !*seen_flag {
+                continue;
+            }
+            let v = &mut values[idx];
+            if !v.is_finite() {
+                continue;
+            }
+            if *v > 0.0 {
+                *v /= params.repetition_penalty;
+            } else {
+                *v *= params.repetition_penalty;
+            }
+        }
+    }
+
+    // Greedy fallback when sampling is effectively disabled.
+    if params.temperature <= 1e-5 {
+        return argmax_semantic_reference(&logits, semantic_vocab_size, eos_token_id, allow_eos);
+    }
+
+    let temperature = params.temperature.max(1e-5);
+    for v in values.iter_mut() {
+        if v.is_finite() {
+            *v /= temperature;
+        }
+    }
+
+    let mut candidates: Vec<usize> = values
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &v)| if v.is_finite() { Some(idx) } else { None })
+        .collect();
+    if candidates.is_empty() {
+        return Ok(if allow_eos { eos_token_id } else { 0 });
+    }
+
+    // Top-k filtering.
+    if params.top_k > 0 && params.top_k < candidates.len() {
+        candidates.sort_by(|&a, &b| values[b].partial_cmp(&values[a]).unwrap_or(Ordering::Equal));
+        candidates.truncate(params.top_k);
+    }
+
+    let max_logit = candidates
+        .iter()
+        .map(|&idx| values[idx])
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut probs: Vec<(usize, f32)> = candidates
+        .iter()
+        .map(|&idx| (idx, (values[idx] - max_logit).exp()))
+        .collect();
+
+    let mut sum: f32 = probs.iter().map(|(_, p)| *p).sum();
+    if !sum.is_finite() || sum <= 0.0 {
+        return argmax_semantic_reference(&logits, semantic_vocab_size, eos_token_id, allow_eos);
+    }
+    for (_, p) in probs.iter_mut() {
+        *p /= sum;
+    }
+
+    // Top-p filtering over normalized probabilities.
+    if params.top_p < 1.0 {
+        probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        let cutoff = params.top_p.max(1e-6);
+        let mut cumsum = 0.0f32;
+        let mut keep = 0usize;
+        for (_, p) in probs.iter() {
+            cumsum += *p;
+            keep += 1;
+            if cumsum >= cutoff {
+                break;
+            }
+        }
+        probs.truncate(keep.max(1));
+        sum = probs.iter().map(|(_, p)| *p).sum();
+        if sum > 0.0 {
+            for (_, p) in probs.iter_mut() {
+                *p /= sum;
+            }
+        }
+    }
+
+    let r = rng.next_f32();
+    let mut acc = 0.0f32;
+    for (idx, p) in probs.iter() {
+        acc += *p;
+        if r <= acc {
+            return Ok(*idx as u32);
+        }
+    }
+
+    // Numerical fallback: pick max probability candidate.
+    probs
+        .iter()
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
+        .map(|(idx, _)| *idx as u32)
+        .or_else(|| Some(if allow_eos { eos_token_id } else { 0 }))
+        .ok_or_else(|| Error::InferenceError("Failed to sample semantic token".to_string()))
+}
+
 fn collect_semantic_sampling_values(
     logits: &Tensor,
     semantic_len: usize,
@@ -2376,10 +2590,7 @@ fn collect_semantic_sampling_values(
         } else {
             0
         };
-        let prefetch = params
-            .top_k
-            .saturating_add(penalty_extra)
-            .min(semantic_len);
+        let prefetch = params.top_k.saturating_add(penalty_extra).min(semantic_len);
         let (sorted_values, sorted_indices) = semantic_logits.sort_last_dim(false)?;
         let values = sorted_values.narrow(0, 0, prefetch)?.to_vec1::<f32>()?;
         let indices = sorted_indices
@@ -2690,15 +2901,77 @@ mod tests {
         };
 
         assert_eq!(
-            sample_semantic(&logits, 3, 6, true, &params, &[], &mut rng).unwrap(),
+            sample_semantic(&logits, 3, 6, true, &params, &[], &mut rng, true).unwrap(),
             6
         );
     }
 
     #[test]
+    fn reference_semantic_sampling_suppresses_invalid_tokens() {
+        let logits = Tensor::new(
+            vec![0.0f32, 2.0, 4.0, 1.0, 100.0, 3.0, 5.0],
+            &candle_core::Device::Cpu,
+        )
+        .unwrap();
+        let params = TtsGenerationParams {
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let mut rng = SimpleRng {
+            state: 0x1234_5678_9abc_def0,
+        };
+
+        assert_eq!(
+            sample_semantic(&logits, 3, 6, false, &params, &[], &mut rng, false).unwrap(),
+            2
+        );
+        assert_eq!(
+            sample_semantic(&logits, 3, 6, true, &params, &[], &mut rng, false).unwrap(),
+            6
+        );
+    }
+
+    #[test]
+    fn semantic_sampling_reference_and_device_paths_match_simple_top_k() {
+        let logits = Tensor::new(
+            vec![10.0f32, 9.0, 8.0, 0.0, -5.0],
+            &candle_core::Device::Cpu,
+        )
+        .unwrap();
+        let params = TtsGenerationParams {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 2,
+            repetition_penalty: 1.1,
+            ..Default::default()
+        };
+        let mut reference_rng = SimpleRng {
+            state: 0x1234_5678_9abc_def0,
+        };
+        let mut device_rng = SimpleRng {
+            state: 0x1234_5678_9abc_def0,
+        };
+
+        let reference = sample_semantic(
+            &logits,
+            5,
+            99,
+            false,
+            &params,
+            &[0],
+            &mut reference_rng,
+            false,
+        )
+        .unwrap();
+        let device =
+            sample_semantic(&logits, 5, 99, false, &params, &[0], &mut device_rng, true).unwrap();
+
+        assert_eq!(reference, device);
+    }
+
+    #[test]
     fn top_k_semantic_sampling_keeps_penalty_replacement_candidates() {
-        let logits = Tensor::new(vec![10.0f32, 9.0, 0.0, -5.0], &candle_core::Device::Cpu)
-            .unwrap();
+        let logits = Tensor::new(vec![10.0f32, 9.0, 0.0, -5.0], &candle_core::Device::Cpu).unwrap();
         let params = TtsGenerationParams {
             temperature: 1.0,
             top_p: 1.0,
@@ -2711,7 +2984,7 @@ mod tests {
         };
 
         assert_eq!(
-            sample_semantic(&logits, 4, 99, false, &params, &[0], &mut rng).unwrap(),
+            sample_semantic(&logits, 4, 99, false, &params, &[0], &mut rng, true).unwrap(),
             1
         );
     }
