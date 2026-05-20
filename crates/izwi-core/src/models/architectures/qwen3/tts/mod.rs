@@ -31,6 +31,7 @@ use crate::models::shared::attention::paged::{default_kv_page_size, KvCacheQuant
 
 const NEWLINE_TOKEN_ID: u32 = 198;
 const ENV_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM: &str = "IZWI_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM";
+const MIN_QWEN_TTS_TOKENS_BEFORE_EOS: usize = 8;
 
 /// Runtime generation settings for semantic token sampling.
 #[derive(Debug, Clone)]
@@ -247,6 +248,14 @@ fn select_qwen3_tts_dtypes(
             speech_tokenizer: legacy_dtype,
         })
     }
+}
+
+fn qwen_tts_uses_cuda_sampling(device: &DeviceProfile) -> bool {
+    device.kind.is_cuda()
+}
+
+fn qwen_tts_allows_eos(frames_generated: usize) -> bool {
+    frames_generated >= MIN_QWEN_TTS_TOKENS_BEFORE_EOS
 }
 
 impl Qwen3TtsModel {
@@ -626,7 +635,6 @@ impl Qwen3TtsModel {
 
             let mut offset = group[0].prefill_len;
             let max_frames = states.iter().map(|s| s.max_frames).max().unwrap_or(0);
-            let min_tokens_before_eos = 8usize;
 
             for frame_idx in 0..max_frames {
                 let mut step_inputs = Vec::with_capacity(batch_size);
@@ -639,7 +647,7 @@ impl Qwen3TtsModel {
                     }
 
                     any_active = true;
-                    let allow_eos = state.all_code_groups[0].len() >= min_tokens_before_eos;
+                    let allow_eos = qwen_tts_allows_eos(state.all_code_groups[0].len());
                     let semantic_token = sample_semantic(
                         &state.last_logits.i((0, 0))?,
                         semantic_vocab_size,
@@ -648,10 +656,15 @@ impl Qwen3TtsModel {
                         &state.params,
                         &state.semantic_history,
                         &mut state.rng,
-                        self.device.kind.is_cuda(),
+                        qwen_tts_uses_cuda_sampling(&self.device),
                     )?;
                     if allow_eos && semantic_token == self.specials.codec_eos_token_id {
                         state.finished = true;
+                        debug!(
+                            frames_generated = state.all_code_groups[0].len(),
+                            device = ?self.device.kind,
+                            "Qwen3-TTS batch generation reached semantic EOS"
+                        );
                         step_inputs.push(state.tts_pad_embed.clone());
                         continue;
                     }
@@ -1079,8 +1092,7 @@ impl Qwen3TtsModel {
         }
 
         let step_start = Instant::now();
-        let min_tokens_before_eos = 8usize;
-        let allow_eos = state.all_code_groups[0].len() >= min_tokens_before_eos;
+        let allow_eos = qwen_tts_allows_eos(state.all_code_groups[0].len());
         let semantic_start = Instant::now();
         let semantic_token = sample_semantic(
             &state.last_logits.i((0, 0))?,
@@ -1090,12 +1102,17 @@ impl Qwen3TtsModel {
             &state.params,
             &state.semantic_history,
             &mut state.rng,
-            self.device.kind.is_cuda(),
+            qwen_tts_uses_cuda_sampling(&self.device),
         )?;
         let semantic_ms = semantic_start.elapsed().as_secs_f64() * 1000.0;
 
         if allow_eos && semantic_token == self.specials.codec_eos_token_id {
             state.finished = true;
+            debug!(
+                frames_generated = state.all_code_groups.first().map(|g| g.len()).unwrap_or(0),
+                device = ?self.device.kind,
+                "Qwen3-TTS decode reached semantic EOS"
+            );
             let final_samples = self.collect_incremental_audio(state, true)?;
             return Ok(TtsDecodeStep {
                 samples: final_samples,
@@ -1278,7 +1295,6 @@ impl Qwen3TtsModel {
         } else {
             max_length.max(1).min(context_budget)
         };
-        let min_tokens_before_eos = 8usize;
         let mut rng = SimpleRng::new();
         let mut semantic_history: Vec<u32> = Vec::new();
 
@@ -1287,7 +1303,7 @@ impl Qwen3TtsModel {
             let last_logits = logits.i((0, logits.dim(1)? - 1))?;
 
             // Sample first codebook token (semantic) from valid semantic ids plus EOS.
-            let allow_eos = all_code_groups[0].len() >= min_tokens_before_eos;
+            let allow_eos = qwen_tts_allows_eos(all_code_groups[0].len());
             let first_codebook_token = sample_semantic(
                 &last_logits,
                 semantic_vocab_size,
@@ -1296,11 +1312,16 @@ impl Qwen3TtsModel {
                 params,
                 &semantic_history,
                 &mut rng,
-                self.device.kind.is_cuda(),
+                qwen_tts_uses_cuda_sampling(&self.device),
             )?;
 
             // Check for end of sequence
             if allow_eos && first_codebook_token == self.specials.codec_eos_token_id {
+                debug!(
+                    frames_generated = all_code_groups[0].len(),
+                    device = ?self.device.kind,
+                    "Qwen3-TTS generation reached semantic EOS"
+                );
                 break;
             }
             semantic_history.push(first_codebook_token);
@@ -2871,6 +2892,26 @@ mod tests {
                 speech_tokenizer: DType::F32,
             }
         );
+    }
+
+    #[test]
+    fn qwen_tts_optimized_sampling_is_cuda_only() {
+        let cpu = dtype_test_profile(DeviceKind::Cpu, false, false);
+        let metal = dtype_test_profile(DeviceKind::Metal, false, false);
+        let cuda = dtype_test_profile(DeviceKind::Cuda, true, true);
+
+        assert!(!qwen_tts_uses_cuda_sampling(&cpu));
+        assert!(!qwen_tts_uses_cuda_sampling(&metal));
+        assert!(qwen_tts_uses_cuda_sampling(&cuda));
+    }
+
+    #[test]
+    fn qwen_tts_eos_gate_matches_reference_minimum() {
+        assert!(!qwen_tts_allows_eos(
+            MIN_QWEN_TTS_TOKENS_BEFORE_EOS.saturating_sub(1)
+        ));
+        assert!(qwen_tts_allows_eos(MIN_QWEN_TTS_TOKENS_BEFORE_EOS));
+        assert!(qwen_tts_allows_eos(MIN_QWEN_TTS_TOKENS_BEFORE_EOS + 1));
     }
 
     #[test]
