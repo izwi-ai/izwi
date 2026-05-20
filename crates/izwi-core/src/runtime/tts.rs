@@ -21,12 +21,12 @@ use crate::runtime::types::{
 
 const LFM25_AUDIO_DEFAULT_MAX_NEW_TOKENS: usize = 1024;
 
-fn qwen_tts_cuda_streaming_uses_final_only(
+fn qwen_tts_streaming_uses_final_only(
     is_cuda: bool,
     variant: ModelVariant,
     chunked_codec_stream_enabled: bool,
 ) -> bool {
-    is_cuda && matches!(variant.family(), ModelFamily::Qwen3Tts) && !chunked_codec_stream_enabled
+    matches!(variant.family(), ModelFamily::Qwen3Tts) && !(is_cuda && chunked_codec_stream_enabled)
 }
 
 fn lfm25_audio_prompt_messages(text: &str, speaker: Option<&str>) -> Vec<ChatMessage> {
@@ -126,7 +126,7 @@ impl RuntimeService {
         Ok(())
     }
 
-    async fn qwen_tts_cuda_final_only_streaming(
+    async fn qwen_tts_final_only_streaming(
         &self,
         mut request: GenerationRequest,
         chunk_tx: mpsc::Sender<AudioChunk>,
@@ -148,7 +148,7 @@ impl RuntimeService {
             .map_err(|_| Error::InferenceError("Streaming output channel closed".to_string()))?;
 
         info!(
-            "Qwen3-TTS CUDA streaming emitted final-only audio in {:.1}ms (RTF {:.3}); enable IZWI_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM=1 for progressive CUDA codec streaming",
+            "Qwen3-TTS streaming emitted final-only audio in {:.1}ms (RTF {:.3}); enable IZWI_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM=1 for experimental progressive CUDA codec streaming",
             generation_time_ms, rtf
         );
         Ok(())
@@ -212,14 +212,12 @@ impl RuntimeService {
                 .lfm25_audio_tts_generate_streaming(request, resolved_variant, chunk_tx)
                 .await;
         }
-        if qwen_tts_cuda_streaming_uses_final_only(
+        if qwen_tts_streaming_uses_final_only(
             self.device.kind.is_cuda(),
             resolved_variant,
             qwen_tts_cuda_chunked_codec_stream_enabled(),
         ) {
-            return self
-                .qwen_tts_cuda_final_only_streaming(request, chunk_tx)
-                .await;
+            return self.qwen_tts_final_only_streaming(request, chunk_tx).await;
         }
         self.load_model(resolved_variant).await?;
 
@@ -267,7 +265,7 @@ mod tests {
 
     #[test]
     fn qwen_tts_cuda_streaming_defaults_to_final_only_without_chunked_codec() {
-        assert!(qwen_tts_cuda_streaming_uses_final_only(
+        assert!(qwen_tts_streaming_uses_final_only(
             true,
             ModelVariant::Qwen3Tts12Hz06BCustomVoice,
             false,
@@ -276,7 +274,7 @@ mod tests {
 
     #[test]
     fn qwen_tts_cuda_streaming_respects_chunked_codec_opt_in() {
-        assert!(!qwen_tts_cuda_streaming_uses_final_only(
+        assert!(!qwen_tts_streaming_uses_final_only(
             true,
             ModelVariant::Qwen3Tts12Hz06BCustomVoice,
             true,
@@ -284,13 +282,17 @@ mod tests {
     }
 
     #[test]
-    fn qwen_tts_final_only_streaming_policy_does_not_affect_non_cuda_or_non_qwen() {
-        assert!(!qwen_tts_cuda_streaming_uses_final_only(
+    fn qwen_tts_non_cuda_streaming_defaults_to_final_only() {
+        assert!(qwen_tts_streaming_uses_final_only(
             false,
             ModelVariant::Qwen3Tts12Hz06BCustomVoice,
             false,
         ));
-        assert!(!qwen_tts_cuda_streaming_uses_final_only(
+    }
+
+    #[test]
+    fn qwen_tts_final_only_streaming_policy_does_not_affect_non_qwen() {
+        assert!(!qwen_tts_streaming_uses_final_only(
             true,
             ModelVariant::Kokoro82M,
             false,
