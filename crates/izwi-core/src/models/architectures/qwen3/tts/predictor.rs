@@ -9,7 +9,9 @@ use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::tts::config::CodePredictorConfig;
-use crate::models::architectures::qwen3::tts::rope::{build_rope_inv_freq, RopeCache};
+use crate::models::architectures::qwen3::tts::rope::{
+    build_rope_inv_freq, build_rope_window_full, qwen_rotate_half, RopeCache,
+};
 use crate::models::shared::attention::batched::{
     batched_scaled_dot_product_attention, BatchedAttentionConfig, BatchedAttentionInput,
 };
@@ -453,21 +455,28 @@ impl Attention {
         let seq_len = x.dim(1)?;
         let half_dim = self.head_dim / 2;
 
-        let (cos, sin) = self.rope_cache.get_window(
-            seq_len,
-            start_pos,
-            &self.rope_inv_freq,
-            x.device(),
-            x.dtype(),
-        )?;
+        let (cos, sin) = if x.device().is_cuda() {
+            self.rope_cache.get_window(
+                seq_len,
+                start_pos,
+                &self.rope_inv_freq,
+                x.device(),
+                x.dtype(),
+            )?
+        } else {
+            build_rope_window_full(
+                seq_len,
+                start_pos,
+                &self.rope_inv_freq,
+                x.device(),
+                x.dtype(),
+            )?
+        };
 
         let cos = cos.unsqueeze(0)?.unsqueeze(2)?;
         let sin = sin.unsqueeze(0)?.unsqueeze(2)?;
 
-        let x1 = x.narrow(3, 0, half_dim)?;
-        let x2 = x.narrow(3, half_dim, half_dim)?;
-        let neg_x2 = x2.neg()?;
-        let rotated = Tensor::cat(&[neg_x2, x1], 3)?;
+        let rotated = qwen_rotate_half(&x, half_dim)?;
 
         let out = x.broadcast_mul(&cos)?;
         out.broadcast_add(&rotated.broadcast_mul(&sin)?)

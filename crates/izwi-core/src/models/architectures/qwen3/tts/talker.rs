@@ -10,7 +10,7 @@ use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::tts::config::TalkerConfig;
 use crate::models::architectures::qwen3::tts::rope::{
-    build_rope_inv_freq, build_rope_window, duplicate_rope_window, RopeCache,
+    build_rope_inv_freq, build_rope_window, duplicate_rope_window, qwen_rotate_half, RopeCache,
 };
 use crate::models::shared::attention::batched::{
     batched_scaled_dot_product_attention, BatchedAttentionConfig, BatchedAttentionInput,
@@ -211,6 +211,28 @@ impl Attention {
                     &self.rope_inv_freq,
                 )?
             } else {
+                if x.device().is_cuda() {
+                    self.rope_cache.get_window(
+                        seq_len,
+                        start_pos,
+                        &self.rope_inv_freq,
+                        x.device(),
+                        x.dtype(),
+                    )?
+                } else {
+                    let position_ids = repeated_mrope_position_ids(seq_len, start_pos, x.device())?;
+                    build_mrope_cache(
+                        seq_len,
+                        x.device(),
+                        x.dtype(),
+                        &position_ids,
+                        &self.mrope_section,
+                        &self.rope_inv_freq,
+                    )?
+                }
+            }
+        } else {
+            if x.device().is_cuda() {
                 self.rope_cache.get_window(
                     seq_len,
                     start_pos,
@@ -218,15 +240,15 @@ impl Attention {
                     x.device(),
                     x.dtype(),
                 )?
+            } else {
+                build_rope_window(
+                    seq_len,
+                    start_pos,
+                    &self.rope_inv_freq,
+                    x.device(),
+                    x.dtype(),
+                )?
             }
-        } else {
-            self.rope_cache.get_window(
-                seq_len,
-                start_pos,
-                &self.rope_inv_freq,
-                x.device(),
-                x.dtype(),
-            )?
         };
 
         // Qwen RoPE uses rotate_half(x) over [first_half, second_half].
@@ -238,10 +260,7 @@ impl Attention {
         let cos = cos.unsqueeze(0)?.unsqueeze(2)?;
         let sin = sin.unsqueeze(0)?.unsqueeze(2)?;
 
-        let x1 = x.narrow(3, 0, half_dim)?;
-        let x2 = x.narrow(3, half_dim, half_dim)?;
-        let neg_x2 = x2.neg()?;
-        let rotated = Tensor::cat(&[neg_x2, x1], 3)?;
+        let rotated = qwen_rotate_half(&x, half_dim)?;
 
         let out = x.broadcast_mul(&cos)?;
         out.broadcast_add(&rotated.broadcast_mul(&sin)?)
@@ -793,6 +812,21 @@ fn build_mrope_cache(
     Ok((cos, sin))
 }
 
+fn repeated_mrope_position_ids(
+    seq_len: usize,
+    start_pos: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let mut data = Vec::with_capacity(3 * seq_len);
+    let base = start_pos as i64;
+    for _ in 0..3 {
+        for idx in 0..seq_len {
+            data.push(base + idx as i64);
+        }
+    }
+    Tensor::from_vec(data, (3, seq_len), device).map_err(Error::from)
+}
+
 /// Create causal attention mask
 fn causal_mask(
     seq_len: usize,
@@ -813,4 +847,39 @@ fn causal_mask(
     Tensor::from_vec(data, (1, seq_len, total_len), device)?
         .to_dtype(dtype)
         .map_err(Error::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_mrope_positions_match_standard_rope_when_axes_equal() {
+        let device = Device::Cpu;
+        let seq_len = 3;
+        let start_pos = 2;
+        let inv_freq = build_rope_inv_freq(6, 10_000.0);
+        let position_ids = repeated_mrope_position_ids(seq_len, start_pos, &device).unwrap();
+
+        let (mrope_cos, mrope_sin) = build_mrope_cache(
+            seq_len,
+            &device,
+            DType::F32,
+            &position_ids,
+            &[1, 1, 1],
+            &inv_freq,
+        )
+        .unwrap();
+        let (standard_cos, standard_sin) =
+            build_rope_window(seq_len, start_pos, &inv_freq, &device, DType::F32).unwrap();
+
+        assert_eq!(
+            mrope_cos.to_vec2::<f32>().unwrap(),
+            standard_cos.to_vec2::<f32>().unwrap()
+        );
+        assert_eq!(
+            mrope_sin.to_vec2::<f32>().unwrap(),
+            standard_sin.to_vec2::<f32>().unwrap()
+        );
+    }
 }
