@@ -303,7 +303,7 @@ Multipart fields:
 |-------|-------|
 | `file` or `audio` | Uploaded audio file. |
 | `audio_base64` | Base64 audio alternative. |
-| `model` | Optional ASR, Voxtral, or audio-chat model variant. |
+| `model` | Optional ASR, Voxtral offline transcription, or audio-chat model variant. Voxtral realtime is planned separately. |
 | `language` | Optional language hint. |
 | `response_format` | `json`, `verbose_json`, `text`, `srt`, or `vtt`. Default `json`. |
 | `stream` | `true`, `1`, `yes`, or `on` enables SSE. |

@@ -1273,6 +1273,46 @@ mod tests {
             Some(true)
         );
 
+        let voxtral_model = find_model("Voxtral-Mini-4B-Realtime-2602");
+        assert_eq!(
+            voxtral_model["route_capabilities"]["openai_audio_transcriptions"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            voxtral_model["route_capabilities"]["speech_to_text_jobs"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            voxtral_model["route_capabilities"]["speech_to_text_realtime"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            voxtral_model["route_capabilities"]["voice_realtime_modular_asr"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            voxtral_model["route_capabilities"]["voice_realtime_unified"].as_bool(),
+            Some(false)
+        );
+        let voxtral_modalities = voxtral_model["modalities"]
+            .as_array()
+            .expect("Voxtral modalities should be an array");
+        assert!(
+            voxtral_modalities
+                .iter()
+                .any(|modality| modality.as_str() == Some("audio_input"))
+        );
+        assert!(
+            voxtral_modalities
+                .iter()
+                .any(|modality| modality.as_str() == Some("text_output"))
+        );
+        assert!(
+            !voxtral_modalities
+                .iter()
+                .any(|modality| modality.as_str() == Some("audio_output"))
+        );
+
         drop(temp_dir);
     }
 

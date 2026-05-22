@@ -81,7 +81,7 @@ phases can verify registry coverage without changing public behavior.
 | `Gemma34BIt` | Gemma3Chat | Chat | `chat` | No |
 | `Qwen3ForcedAligner06B` | Qwen3ForcedAligner | ForcedAlign | `forced_alignment` | Yes |
 | `Qwen3ForcedAligner06B4Bit` | Qwen3ForcedAligner | ForcedAlign | `forced_alignment` | Yes |
-| `VoxtralMini4BRealtime2602` | Voxtral | Asr | `asr` | No |
+| `VoxtralMini4BRealtime2602` | Voxtral | Asr | `asr` | Yes |
 
 ## Public Compatibility Surfaces
 

@@ -767,7 +767,7 @@ impl ModelVariant {
             | Self::Lfm25Audio15BGguf
             | Self::Kokoro82M => true,
             Self::Gemma34BIt => false,
-            Self::VoxtralMini4BRealtime2602 => false,
+            Self::VoxtralMini4BRealtime2602 => true,
             Self::ParakeetTdt06BV3 => true,
             Self::WhisperLargeV3Turbo => true,
             Self::DiarStreamingSortformer4SpkV21 => true,
@@ -1011,11 +1011,11 @@ mod tests {
     }
 
     #[test]
-    fn voxtral_initial_contract_is_asr_only_until_realtime_lands() {
+    fn voxtral_enabled_contract_is_asr_only_until_realtime_lands() {
         let variant = ModelVariant::VoxtralMini4BRealtime2602;
         assert!(variant.is_voxtral());
         assert_eq!(variant.primary_task(), ModelTask::Asr);
-        assert!(!variant.is_enabled());
+        assert!(variant.is_enabled());
         assert!(!variant.is_asr());
         assert!(!variant.is_audio_chat());
         assert_eq!(variant.speech_capabilities(), None);
