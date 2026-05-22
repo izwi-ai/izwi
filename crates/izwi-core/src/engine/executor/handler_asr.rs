@@ -5,7 +5,7 @@ use std::time::Instant;
 use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
-use super::audio::{decode_request_audio_with_rate, AsrChunkTranscription};
+use super::audio::{AsrChunkTranscription, decode_request_audio_with_rate};
 use super::state::ActiveAsrDecode;
 use super::{ExecutorOutput, NativeExecutor};
 
@@ -259,12 +259,12 @@ impl NativeExecutor {
                         &chunk_plan.chunks,
                         &chunk_plan.config,
                         |chunk_audio, sr| {
-                            model.transcribe(chunk_audio, sr, language).map(|text| {
-                                AsrChunkTranscription {
-                                    text,
-                                    diagnostics: None,
-                                }
-                            })
+                            model
+                                .transcribe_with_details(chunk_audio, sr, language)
+                                .map(|details| AsrChunkTranscription {
+                                    text: details.text,
+                                    diagnostics: details.diagnostics,
+                                })
                         },
                     )?;
                     return Ok((
@@ -310,7 +310,8 @@ impl NativeExecutor {
                         return Ok((text, None));
                     }
                 }
-                return Ok((model.transcribe(&samples, sample_rate, language)?, None));
+                let details = model.transcribe_with_details(&samples, sample_rate, language)?;
+                return Ok((details.text, details.diagnostics));
             }
 
             let model = self.with_registry(|registry| {
