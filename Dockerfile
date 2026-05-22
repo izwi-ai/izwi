@@ -59,6 +59,7 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     ca-certificates \
     curl \
+    git \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
