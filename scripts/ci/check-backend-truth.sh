@@ -70,6 +70,20 @@ cuda_features_include() {
     esac
 }
 
+assert_cuda_docker_builder_dependencies() {
+    local dockerfile="${1:-Dockerfile}"
+
+    if ! awk '
+        /^FROM .* AS rust-builder-cuda$/ { in_cuda_builder = 1; next }
+        /^FROM / && in_cuda_builder { in_cuda_builder = 0 }
+        in_cuda_builder && /^[[:space:]]*git([[:space:]]*\\)?[[:space:]]*$/ { found_git = 1 }
+        END { exit found_git ? 0 : 1 }
+    ' "${dockerfile}"; then
+        echo "Docker CUDA builder must install git for Candle flash-attn CUTLASS checkout." >&2
+        exit 1
+    fi
+}
+
 audit_cuda_docker_server() {
     local image="$1"
     local cuda_features="$2"
@@ -170,6 +184,9 @@ run_docker_cuda() {
     cuda_features="$(resolve_cuda_features)"
 
     docker compose --profile cuda config >/dev/null
+    if cuda_features_include "${cuda_features}" "flash-attn"; then
+        assert_cuda_docker_builder_dependencies Dockerfile
+    fi
     docker build \
         --build-arg CUDA_COMPUTE_CAP="${cuda_compute_cap}" \
         --build-arg IZWI_CUDA_FEATURES="${cuda_features}" \
