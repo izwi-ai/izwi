@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/backend-truth.yml"
+      - ".github/workflows/cuda-flash-attn.yml"
       - ".github/workflows/release.yml"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -19,6 +20,7 @@ on:
       - master
     paths:
       - ".github/workflows/backend-truth.yml"
+      - ".github/workflows/cuda-flash-attn.yml"
       - ".github/workflows/release.yml"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -72,6 +74,7 @@ jobs:
     timeout-minutes: 30
     env:
       CUDA_COMPUTE_CAP: "80"
+      IZWI_CUDA_FEATURES: "cuda,cudnn"
     container:
       image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
@@ -121,6 +124,7 @@ jobs:
     env:
       DOCKER_BUILDKIT: "1"
       CUDA_COMPUTE_CAP: "80"
+      IZWI_CUDA_FEATURES: "cuda,cudnn"
 
     steps:
       - name: Checkout
