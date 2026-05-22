@@ -360,17 +360,22 @@ impl RuntimeService {
         })
     }
 
-    /// Transcribe audio with Voxtral Realtime.
+    /// Transcribe audio with Voxtral through the offline transcription path.
     pub async fn voxtral_transcribe(
         &self,
         audio_base64: &str,
         language: Option<&str>,
     ) -> Result<AsrTranscription> {
-        self.voxtral_transcribe_streaming(audio_base64, language, |_delta| {})
-            .await
+        self.asr_transcribe_with_variant(
+            ModelVariant::VoxtralMini4BRealtime2602,
+            audio_base64,
+            language,
+            None,
+        )
+        .await
     }
 
-    /// Transcribe audio with Voxtral Realtime and emit incremental deltas.
+    /// Transcribe audio with Voxtral and emit incremental deltas from offline decode.
     pub async fn voxtral_transcribe_streaming<F>(
         &self,
         audio_base64: &str,
