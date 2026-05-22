@@ -5,15 +5,14 @@
 //! root-level layer structure compared to standard Qwen3.
 
 use candle_core::{DType, Device, Tensor};
-use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
+use candle_nn::{Embedding, Linear, Module, RmsNorm, VarBuilder, ops};
 
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::core::{
-    build_mrope_cache, build_rope_cache, causal_mask, repeat_kv, Qwen3Cache, Qwen3Config,
+    Qwen3Cache, Qwen3Config, build_mrope_cache, build_rope_cache, causal_mask,
+    dense_decode_attention, repeat_kv,
 };
-use crate::models::shared::attention::flash::{
-    flash_attention_requested, try_fused_self_attention,
-};
+use crate::models::shared::attention::flash::try_fused_self_attention;
 use crate::models::shared::attention::paged::paged_decode_attention;
 
 pub struct VoxtralLM {
@@ -269,6 +268,19 @@ impl VoxtralAttention {
             cache.append(layer_idx, k.clone(), v.clone())?;
 
             if seq_len == 1 && start_pos > 0 {
+                if let Some((k_heads, v_heads)) = cache.dense_heads(layer_idx) {
+                    let out = dense_decode_attention(
+                        &q,
+                        k_heads,
+                        v_heads,
+                        self.num_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                    )?;
+                    let out = out.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
+                    return self.o_proj.forward(&out).map_err(Error::from);
+                }
+
                 if let Some((k_pages, v_pages)) = cache.pages(layer_idx) {
                     let out = paged_decode_attention(
                         &q,
@@ -287,18 +299,20 @@ impl VoxtralAttention {
         } else {
             (k, v)
         };
-        let k = repeat_kv(&k, self.num_heads, self.num_kv_heads)?;
-        let v = repeat_kv(&v, self.num_heads, self.num_kv_heads)?;
+        let q_heads = q.transpose(1, 2)?;
+        let k_kv_heads = k.transpose(1, 2)?;
+        let v_kv_heads = v.transpose(1, 2)?;
 
-        let q = q.transpose(1, 2)?;
-        let k = k.transpose(1, 2)?;
-        let v = v.transpose(1, 2)?;
-
-        let total_len = k.dim(2)?;
-        if flash_attention_requested() && start_pos == 0 && total_len == seq_len {
-            if let Some(fused_out) =
-                try_fused_self_attention(&q, &k, &v, None, self.head_dim, true)?
-            {
+        let total_len = k_kv_heads.dim(2)?;
+        if start_pos == 0 && total_len == seq_len {
+            if let Some(fused_out) = try_fused_self_attention(
+                &q_heads,
+                &k_kv_heads,
+                &v_kv_heads,
+                None,
+                self.head_dim,
+                true,
+            )? {
                 let out = fused_out.transpose(1, 2)?.reshape((
                     bsz,
                     seq_len,
@@ -309,6 +323,14 @@ impl VoxtralAttention {
             }
         }
 
+        let k = repeat_kv(&k, self.num_heads, self.num_kv_heads)?;
+        let v = repeat_kv(&v, self.num_heads, self.num_kv_heads)?;
+
+        let q = q_heads;
+        let k = k.transpose(1, 2)?;
+        let v = v.transpose(1, 2)?;
+
+        let total_len = k.dim(2)?;
         let q = q.reshape((bsz * self.num_heads, seq_len, self.head_dim))?;
         let k = k.reshape((bsz * self.num_heads, total_len, self.head_dim))?;
         let v = v.reshape((bsz * self.num_heads, total_len, self.head_dim))?;
