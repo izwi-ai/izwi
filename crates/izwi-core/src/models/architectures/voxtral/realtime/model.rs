@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use candle_core::{DType, IndexOp, Tensor};
+use candle_core::{D, DType, IndexOp, Tensor};
 use candle_nn::{Module, VarBuilder};
 use tracing::info;
 
@@ -741,20 +741,18 @@ impl WhisperAttention {
             .reshape((bsz, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        if flash_attention_requested() {
-            if let Some(fused_out) =
-                try_fused_self_attention(&q, &k, &v, None, self.head_dim, is_causal)?
-            {
-                let attn_output = fused_out.transpose(1, 2)?.reshape((
-                    bsz,
-                    seq_len,
-                    self.num_heads * self.head_dim,
-                ))?;
-                return self
-                    .out_proj
-                    .forward(&attn_output)
-                    .map_err(|e| Error::InferenceError(e.to_string()));
-            }
+        if let Some(fused_out) =
+            try_fused_self_attention(&q, &k, &v, None, self.head_dim, is_causal)?
+        {
+            let attn_output = fused_out.transpose(1, 2)?.reshape((
+                bsz,
+                seq_len,
+                self.num_heads * self.head_dim,
+            ))?;
+            return self
+                .out_proj
+                .forward(&attn_output)
+                .map_err(|e| Error::InferenceError(e.to_string()));
         }
 
         // Scaled dot-product attention
@@ -810,16 +808,32 @@ fn create_causal_mask(
 }
 
 fn argmax(logits: &Tensor) -> Result<u32> {
-    let logits = logits.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-    let mut max_idx = 0;
-    let mut max_val = logits[0];
-    for (i, &v) in logits.iter().enumerate() {
-        if v > max_val {
-            max_val = v;
-            max_idx = i;
+    let logits = match logits.rank() {
+        1 => logits.clone(),
+        2 => {
+            let (batch, _vocab) = logits.dims2()?;
+            if batch != 1 {
+                return Err(Error::InferenceError(format!(
+                    "Unexpected batched Voxtral logits for argmax: expected batch=1, got {batch}"
+                )));
+            }
+            logits.i(0)?
         }
-    }
-    Ok(max_idx as u32)
+        rank => {
+            return Err(Error::InferenceError(format!(
+                "Unexpected Voxtral logits rank for argmax: {rank}"
+            )));
+        }
+    };
+    let idx = logits.argmax(D::Minus1)?;
+    let idx = if idx.rank() == 0 {
+        idx
+    } else {
+        idx.squeeze(0)?
+    };
+    idx.to_dtype(DType::U32)?
+        .to_scalar::<u32>()
+        .map_err(Error::from)
 }
 
 fn text_delta(previous: &str, current: &str) -> String {
@@ -999,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn voxtral_argmax_casts_half_logits_for_host_read() {
+    fn voxtral_argmax_selects_from_half_logits_on_device() {
         let device = Device::Cpu;
         let logits = Tensor::from_vec(vec![0.1f32, 0.7, -0.2], (3,), &device)
             .unwrap()
@@ -1007,5 +1021,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(argmax(&logits).unwrap(), 1);
+    }
+
+    #[test]
+    fn voxtral_argmax_rejects_batched_rank2_logits() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![0.1f32; 8], (2, 4), &device).unwrap();
+        let err = argmax(&logits).expect_err("rank2 batch > 1 should be rejected");
+
+        assert!(format!("{err}").contains("Unexpected batched Voxtral logits"));
     }
 }
