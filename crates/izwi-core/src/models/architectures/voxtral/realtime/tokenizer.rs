@@ -23,6 +23,8 @@ const STREAMING_PAD_TOKEN_CANDIDATES: &[&str] = &["[STREAMING_PAD]"];
 const STREAMING_WORD_TOKEN_CANDIDATES: &[&str] = &["[STREAMING_WORD]"];
 const TEXT_TO_AUDIO_TOKEN_CANDIDATES: &[&str] = &["[NEXT_AUDIO_TEXT]"];
 const AUDIO_TO_TEXT_TOKEN_CANDIDATES: &[&str] = &["[REPEAT_AUDIO_TEXT]"];
+const DEFAULT_STREAMING_LEFT_PAD_TOKENS: usize = 32;
+pub(crate) const OFFLINE_STREAMING_BUFFER_TOKENS: usize = 10;
 
 /// Special token IDs for Voxtral.
 #[derive(Debug, Clone)]
@@ -88,6 +90,7 @@ pub struct AudioConfig {
     pub hop_length: usize,
     pub num_mel_bins: usize,
     pub n_delay_tokens: usize,
+    pub streaming_left_pad_tokens: usize,
 }
 
 impl Default for AudioConfig {
@@ -99,6 +102,7 @@ impl Default for AudioConfig {
             hop_length: 160,
             num_mel_bins: 128,
             n_delay_tokens: 0,
+            streaming_left_pad_tokens: DEFAULT_STREAMING_LEFT_PAD_TOKENS,
         }
     }
 }
@@ -108,6 +112,18 @@ impl AudioConfig {
     pub fn num_audio_tokens(&self, audio_length: usize) -> usize {
         let samples_per_frame = self.sampling_rate / self.frame_rate as usize;
         (audio_length + samples_per_frame - 1) / samples_per_frame
+    }
+
+    pub fn raw_audio_length_per_tok(&self) -> usize {
+        (self.sampling_rate as f32 / self.frame_rate).max(1.0) as usize
+    }
+
+    pub fn streaming_prompt_pad_tokens(&self) -> usize {
+        self.streaming_left_pad_tokens + self.n_delay_tokens
+    }
+
+    pub fn offline_right_pad_tokens(&self) -> usize {
+        self.n_delay_tokens + 1 + OFFLINE_STREAMING_BUFFER_TOKENS
     }
 }
 
@@ -121,6 +137,9 @@ pub struct VoxtralTokenizer {
 impl VoxtralTokenizer {
     pub fn load(model_dir: &Path, audio_config: AudioConfig) -> Result<Self> {
         let tekken_path = model_dir.join("tekken.json");
+        let tekken_str = std::fs::read_to_string(&tekken_path)
+            .map_err(|err| tokenization_error(format!("read {}", tekken_path.display()), err))?;
+        let audio_config = merge_tekken_audio_metadata(audio_config, &tekken_str)?;
         let inner = Tekkenizer::from_file(&tekken_path)
             .map_err(|err| tokenization_error(format!("load {}", tekken_path.display()), err))?;
         Self::from_tekkenizer(inner, audio_config)
@@ -149,18 +168,21 @@ impl VoxtralTokenizer {
         self.inner.vocab_size()
     }
 
-    /// Build the legacy audio prompt used by the current offline path.
-    ///
-    /// The frame-synchronous realtime decoder uses a different prefix schedule;
-    /// this helper remains only for the existing offline prefill path.
-    pub fn build_transcription_prompt(&self, audio_len_tokens: usize) -> Vec<u32> {
-        let mut tokens = Vec::with_capacity(audio_len_tokens + 2);
-        tokens.push(self.specials.begin_audio);
-        tokens.extend(std::iter::repeat_n(self.specials.audio, audio_len_tokens));
-        if let Some(end_audio) = self.specials.end_audio {
-            tokens.push(end_audio);
-        }
-        tokens
+    /// Build the Mistral streaming transcription prefix:
+    /// BOS followed by left-padding and delay STREAMING_PAD tokens.
+    pub fn build_transcription_prompt(&self) -> Result<Vec<u32>> {
+        let streaming_pad = self.specials.streaming_pad.ok_or_else(|| {
+            Error::TokenizationError(
+                "Voxtral streaming transcription requires [STREAMING_PAD]".to_string(),
+            )
+        })?;
+        let mut tokens = Vec::with_capacity(self.audio_config.streaming_prompt_pad_tokens() + 1);
+        tokens.push(self.specials.bos);
+        tokens.extend(std::iter::repeat_n(
+            streaming_pad,
+            self.audio_config.streaming_prompt_pad_tokens(),
+        ));
+        Ok(tokens)
     }
 
     /// Decode generated tokens to text.
@@ -174,9 +196,34 @@ impl VoxtralTokenizer {
             .collect::<Vec<_>>();
         self.inner
             .decode(&text_tokens, SpecialTokenPolicy::Ignore)
-            .map(|text| text.trim().to_string())
             .map_err(|err| tokenization_error("decode Tekken tokens", err))
     }
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct TekkenAudioMetadata {
+    #[serde(default)]
+    audio: Option<TekkenAudioConfig>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct TekkenAudioConfig {
+    streaming_n_left_pad_tokens: Option<usize>,
+}
+
+fn merge_tekken_audio_metadata(
+    mut audio_config: AudioConfig,
+    tekken_json: &str,
+) -> Result<AudioConfig> {
+    let metadata: TekkenAudioMetadata = serde_json::from_str(tekken_json)
+        .map_err(|err| tokenization_error("parse Tekken audio metadata", err))?;
+    if let Some(left_pad) = metadata
+        .audio
+        .and_then(|audio| audio.streaming_n_left_pad_tokens)
+    {
+        audio_config.streaming_left_pad_tokens = left_pad;
+    }
+    Ok(audio_config)
 }
 
 fn required_control_token(tokenizer: &Tekkenizer, name: &str, candidates: &[&str]) -> Result<u32> {
@@ -204,8 +251,8 @@ fn tokenization_error(context: impl Display, err: impl Display) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine;
     use tekken::config::{TokenInfo, TokenizerVersion};
     use tekken::special_tokens::SpecialTokenInfo;
 
@@ -272,6 +319,54 @@ mod tests {
         assert_eq!(tokenizer.specials().streaming_pad, Some(263));
         assert_eq!(tokenizer.specials().streaming_word, Some(264));
         assert_eq!(tokenizer.specials().end_audio, None);
+    }
+
+    #[test]
+    fn reads_streaming_left_pad_tokens_from_tekken_audio_metadata() {
+        let config = merge_tekken_audio_metadata(
+            AudioConfig::default(),
+            r#"{
+                "audio": {
+                    "streaming_n_left_pad_tokens": 12
+                }
+            }"#,
+        )
+        .expect("audio metadata");
+
+        assert_eq!(config.streaming_left_pad_tokens, 12);
+        assert_eq!(
+            config.streaming_prompt_pad_tokens(),
+            12 + config.n_delay_tokens
+        );
+    }
+
+    #[test]
+    fn transcription_prompt_uses_streaming_pad_schedule() {
+        let tokenizer = VoxtralTokenizer::from_tekkenizer(
+            test_tekkenizer(),
+            AudioConfig {
+                n_delay_tokens: 3,
+                streaming_left_pad_tokens: 2,
+                ..AudioConfig::default()
+            },
+        )
+        .expect("Voxtral tokenizer");
+
+        let prompt = tokenizer
+            .build_transcription_prompt()
+            .expect("transcription prompt");
+
+        assert_eq!(
+            prompt,
+            vec![
+                tokenizer.specials().bos,
+                tokenizer.specials().streaming_pad.unwrap(),
+                tokenizer.specials().streaming_pad.unwrap(),
+                tokenizer.specials().streaming_pad.unwrap(),
+                tokenizer.specials().streaming_pad.unwrap(),
+                tokenizer.specials().streaming_pad.unwrap(),
+            ]
+        );
     }
 
     #[test]
