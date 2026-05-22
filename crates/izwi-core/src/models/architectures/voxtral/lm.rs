@@ -47,6 +47,7 @@ struct VoxtralLayer {
     input_layernorm: RmsNorm,
     self_attn: VoxtralAttention,
     post_attention_layernorm: RmsNorm,
+    ada_rms_norm: Option<VoxtralAdaRmsNorm>,
     mlp: VoxtralMlp,
 }
 
@@ -63,12 +64,18 @@ struct VoxtralAttention {
     use_mrope: bool,
     mrope_section: Option<Vec<usize>>,
     rope_theta: f64,
+    sliding_window: Option<usize>,
 }
 
 struct VoxtralMlp {
     gate_proj: Linear,
     up_proj: Linear,
     down_proj: Linear,
+}
+
+struct VoxtralAdaRmsNorm {
+    down: Linear,
+    up: Linear,
 }
 
 impl VoxtralLM {
@@ -123,7 +130,7 @@ impl VoxtralLM {
         cache: Option<&mut Qwen3Cache>,
     ) -> Result<Tensor> {
         let embeds = self.embeddings(input_ids)?;
-        self.forward_with_embeds(&embeds, start_pos, cache, None)
+        self.forward_with_embeds(&embeds, start_pos, cache, None, None)
     }
 
     pub fn forward_with_embeds(
@@ -132,11 +139,12 @@ impl VoxtralLM {
         start_pos: usize,
         mut cache: Option<&mut Qwen3Cache>,
         position_ids: Option<&Tensor>,
+        t_cond: Option<&Tensor>,
     ) -> Result<Tensor> {
         let mut x = embeds.clone();
         for (idx, layer) in self.layers.iter().enumerate() {
             let cache_ref = cache.as_deref_mut();
-            x = layer.forward(&x, start_pos, position_ids, cache_ref, idx)?;
+            x = layer.forward(&x, start_pos, position_ids, cache_ref, idx, t_cond)?;
         }
         let x = self.norm.forward(&x)?;
         let logits = self.lm_head.forward(&x)?;
@@ -181,11 +189,13 @@ impl VoxtralLayer {
         let self_attn = VoxtralAttention::load(cfg, vb.pp("attention"))?;
         let post_attention_layernorm =
             candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("ffn_norm"))?;
+        let ada_rms_norm = VoxtralAdaRmsNorm::load(cfg, vb.clone())?;
         let mlp = VoxtralMlp::load(cfg, vb.pp("feed_forward"))?;
         Ok(Self {
             input_layernorm,
             self_attn,
             post_attention_layernorm,
+            ada_rms_norm,
             mlp,
         })
     }
@@ -197,6 +207,7 @@ impl VoxtralLayer {
         position_ids: Option<&Tensor>,
         cache: Option<&mut Qwen3Cache>,
         layer_idx: usize,
+        t_cond: Option<&Tensor>,
     ) -> Result<Tensor> {
         let normed = self.input_layernorm.forward(x)?;
         let attn_out =
@@ -204,7 +215,21 @@ impl VoxtralLayer {
                 .forward(&normed, start_pos, position_ids, cache, layer_idx)?;
         let x = x.broadcast_add(&attn_out)?;
 
-        let normed = self.post_attention_layernorm.forward(&x)?;
+        let mut normed = self.post_attention_layernorm.forward(&x)?;
+        if let Some(ada_rms_norm) = &self.ada_rms_norm {
+            let t_cond = t_cond.ok_or_else(|| {
+                Error::InferenceError(
+                    "Voxtral LM requires delay conditioning for Ada RMSNorm".to_string(),
+                )
+            })?;
+            let mut scale = ada_rms_norm.forward(t_cond)?;
+            if scale.dtype() != normed.dtype() {
+                scale = scale.to_dtype(normed.dtype())?;
+            }
+            let one = Tensor::ones(scale.shape(), scale.dtype(), scale.device())?;
+            let scale = scale.broadcast_add(&one)?;
+            normed = normed.broadcast_mul(&scale)?;
+        }
         let mlp_out = self.mlp.forward(&normed)?;
         let x = x.broadcast_add(&mlp_out)?;
         Ok(x)
@@ -260,6 +285,7 @@ impl VoxtralAttention {
             use_mrope,
             mrope_section,
             rope_theta: cfg.rope_theta,
+            sliding_window: cfg.sliding_window(),
         })
     }
 
@@ -296,7 +322,7 @@ impl VoxtralAttention {
         let (k, v) = if let Some(cache) = cache {
             cache.append(layer_idx, k.clone(), v.clone())?;
 
-            if seq_len == 1 && start_pos > 0 {
+            if seq_len == 1 && start_pos > 0 && self.sliding_window.is_none() {
                 if let Some((k_heads, v_heads)) = cache.dense_heads(layer_idx) {
                     let out = dense_decode_attention(
                         &q,
@@ -333,7 +359,7 @@ impl VoxtralAttention {
         let v_kv_heads = v.transpose(1, 2)?;
 
         let total_len = k_kv_heads.dim(2)?;
-        if start_pos == 0 && total_len == seq_len {
+        if start_pos == 0 && total_len == seq_len && self.sliding_window.is_none() {
             if let Some(fused_out) = try_fused_self_attention(
                 &q_heads,
                 &k_kv_heads,
@@ -370,8 +396,15 @@ impl VoxtralAttention {
             Tensor::from_vec(vec![scale as f32], (1,), att.device())?.to_dtype(att.dtype())?;
         att = att.broadcast_div(&scale_t)?;
 
-        if seq_len > 1 || start_pos == 0 {
-            let mask = causal_mask(seq_len, total_len, start_pos, att.device(), att.dtype())?;
+        if seq_len > 1 || start_pos == 0 || self.sliding_window.is_some() {
+            let mask = voxtral_attention_mask(
+                seq_len,
+                total_len,
+                start_pos,
+                self.sliding_window,
+                att.device(),
+                att.dtype(),
+            )?;
             att = att.broadcast_add(&mask)?;
         }
 
@@ -469,6 +502,73 @@ impl VoxtralAttention {
     }
 }
 
+impl VoxtralAdaRmsNorm {
+    fn load(cfg: &Qwen3Config, vb: VarBuilder) -> Result<Option<Self>> {
+        if !cfg.ada_rms_norm_t_cond {
+            return Ok(None);
+        }
+        let cond_dim = cfg.ada_rms_norm_t_cond_dim;
+        if cond_dim == 0 {
+            return Err(Error::ModelLoadError(
+                "Voxtral ada_rms_norm_t_cond is enabled but ada_rms_norm_t_cond_dim is missing"
+                    .to_string(),
+            ));
+        }
+
+        for (down_path, up_path) in [
+            ("ada_rms_norm_t_cond.0", "ada_rms_norm_t_cond.2"),
+            ("ada_rms_norm.linear1", "ada_rms_norm.linear2"),
+        ] {
+            if vb.contains_tensor(&format!("{down_path}.weight"))
+                && vb.contains_tensor(&format!("{up_path}.weight"))
+            {
+                let down = candle_nn::linear_no_bias(cfg.hidden_size, cond_dim, vb.pp(down_path))?;
+                let up = candle_nn::linear_no_bias(cond_dim, cfg.hidden_size, vb.pp(up_path))?;
+                return Ok(Some(Self { down, up }));
+            }
+        }
+
+        Err(Error::ModelLoadError(
+            "Voxtral checkpoint is missing ada_rms_norm_t_cond weights; tried \
+             ada_rms_norm_t_cond.0/2 and ada_rms_norm.linear1/linear2"
+                .to_string(),
+        ))
+    }
+
+    fn forward(&self, t_cond: &Tensor) -> Result<Tensor> {
+        let hidden = self.down.forward(t_cond)?.gelu()?;
+        self.up.forward(&hidden).map_err(Error::from)
+    }
+}
+
+fn voxtral_attention_mask(
+    seq_len: usize,
+    total_len: usize,
+    start_pos: usize,
+    sliding_window: Option<usize>,
+    device: &Device,
+    dtype: candle_core::DType,
+) -> Result<Tensor> {
+    if sliding_window.is_none() {
+        return causal_mask(seq_len, total_len, start_pos, device, dtype);
+    }
+
+    let sliding_window = sliding_window.unwrap();
+    let mut data = vec![0f32; seq_len * total_len];
+    for i in 0..seq_len {
+        let query_pos = start_pos + i;
+        let earliest = query_pos.saturating_add(1).saturating_sub(sliding_window);
+        for j in 0..total_len {
+            if j > query_pos || j < earliest {
+                data[i * total_len + j] = -1e4;
+            }
+        }
+    }
+    Tensor::from_vec(data, (1, seq_len, total_len), device)?
+        .to_dtype(dtype)
+        .map_err(Error::from)
+}
+
 impl VoxtralMlp {
     fn load(cfg: &Qwen3Config, vb: VarBuilder) -> Result<Self> {
         let gate_proj =
@@ -514,6 +614,10 @@ mod tests {
             vocab_size: 3,
             lm_head_size: None,
             rope_scaling: None,
+            sliding_window: None,
+            use_sliding_window: false,
+            ada_rms_norm_t_cond: false,
+            ada_rms_norm_t_cond_dim: 0,
         }
     }
 
@@ -580,6 +684,88 @@ mod tests {
 
         assert!(format!("{embed_err}").contains("missing token embedding weights"));
         assert!(format!("{head_err}").contains("missing LM head weights"));
+    }
+
+    #[test]
+    fn voxtral_lm_loads_ada_rms_norm_t_cond_aliases() {
+        let device = Device::Cpu;
+        let mut cfg = tiny_cfg();
+        cfg.ada_rms_norm_t_cond = true;
+        cfg.ada_rms_norm_t_cond_dim = 2;
+
+        let down = Tensor::from_vec(
+            (0..8).map(|v| (v as f32) / 10.0).collect::<Vec<_>>(),
+            (2, 4),
+            &device,
+        )
+        .unwrap();
+        let up = Tensor::from_vec(
+            (0..8).map(|v| (v as f32) / 20.0).collect::<Vec<_>>(),
+            (4, 2),
+            &device,
+        )
+        .unwrap();
+        let vb = VarBuilder::from_tensors(
+            HashMap::from([
+                ("layers.0.ada_rms_norm_t_cond.0.weight".to_string(), down),
+                ("layers.0.ada_rms_norm_t_cond.2.weight".to_string(), up),
+            ]),
+            DType::F32,
+            &device,
+        );
+
+        let ada = VoxtralAdaRmsNorm::load(&cfg, vb.pp("layers.0"))
+            .unwrap()
+            .unwrap();
+        let t_cond = Tensor::ones((1, 4), DType::F32, &device).unwrap();
+        let out = ada.forward(&t_cond).unwrap();
+
+        assert_eq!(out.dims(), &[1, 4]);
+    }
+
+    #[test]
+    fn voxtral_lm_requires_configured_ada_rms_norm_weights() {
+        let device = Device::Cpu;
+        let mut cfg = tiny_cfg();
+        cfg.ada_rms_norm_t_cond = true;
+        cfg.ada_rms_norm_t_cond_dim = 2;
+        let vb = VarBuilder::from_tensors(HashMap::new(), DType::F32, &device);
+
+        let err = VoxtralAdaRmsNorm::load(&cfg, vb.pp("layers.0"))
+            .err()
+            .unwrap();
+
+        assert!(format!("{err}").contains("missing ada_rms_norm_t_cond weights"));
+    }
+
+    #[test]
+    fn voxtral_sliding_attention_mask_limits_left_context() {
+        let device = Device::Cpu;
+        let mask = voxtral_attention_mask(5, 5, 0, Some(3), &device, DType::F32)
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+
+        assert_eq!(
+            mask,
+            vec![
+                vec![0.0, -1e4, -1e4, -1e4, -1e4],
+                vec![0.0, 0.0, -1e4, -1e4, -1e4],
+                vec![0.0, 0.0, 0.0, -1e4, -1e4],
+                vec![-1e4, 0.0, 0.0, 0.0, -1e4],
+                vec![-1e4, -1e4, 0.0, 0.0, 0.0],
+            ]
+        );
+
+        let decode_mask = voxtral_attention_mask(1, 5, 4, Some(3), &device, DType::F32)
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        assert_eq!(decode_mask, vec![vec![-1e4, -1e4, 0.0, 0.0, 0.0]]);
     }
 
     #[test]
