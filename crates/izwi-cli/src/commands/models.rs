@@ -16,11 +16,57 @@ struct AdminModelsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AdminModelInfo {
     variant: String,
+    #[serde(default)]
+    enabled: Option<bool>,
     status: String,
     local_path: Option<PathBuf>,
     size_bytes: Option<u64>,
     download_progress: Option<f32>,
     error_message: Option<String>,
+    #[serde(default)]
+    modalities: Vec<String>,
+    #[serde(default)]
+    route_capabilities: AdminModelRouteCapabilities,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AdminModelRouteCapabilities {
+    #[serde(default)]
+    openai_chat_completions: bool,
+    #[serde(default)]
+    openai_responses: bool,
+    #[serde(default)]
+    openai_audio_speech: bool,
+    #[serde(default)]
+    openai_audio_transcriptions: bool,
+    #[serde(default)]
+    speech_to_text_jobs: bool,
+    #[serde(default)]
+    speech_to_text_realtime: bool,
+    #[serde(default)]
+    diarization_records: bool,
+    #[serde(default)]
+    text_to_speech_records: bool,
+    #[serde(default)]
+    voice_design_records: bool,
+    #[serde(default)]
+    voice_clone_records: bool,
+    #[serde(default)]
+    saved_voice_reuse: bool,
+    #[serde(default)]
+    studio_projects: bool,
+    #[serde(default)]
+    voice_realtime_text_model: bool,
+    #[serde(default)]
+    voice_realtime_modular_asr: bool,
+    #[serde(default)]
+    voice_realtime_modular_tts: bool,
+    #[serde(default)]
+    voice_realtime_unified: bool,
+    #[serde(default)]
+    forced_alignment: bool,
+    #[serde(default)]
+    tokenizer: bool,
 }
 
 pub async fn execute(
@@ -164,6 +210,65 @@ fn status_color(status: &str) -> String {
     }
 }
 
+fn route_capability_labels(capabilities: &AdminModelRouteCapabilities) -> Vec<&'static str> {
+    let mut labels = Vec::new();
+    if capabilities.openai_chat_completions {
+        labels.push("chat completions");
+    }
+    if capabilities.openai_responses {
+        labels.push("responses");
+    }
+    if capabilities.openai_audio_speech {
+        labels.push("audio speech");
+    }
+    if capabilities.openai_audio_transcriptions {
+        labels.push("audio transcriptions");
+    }
+    if capabilities.speech_to_text_jobs {
+        labels.push("speech-to-text jobs");
+    }
+    if capabilities.speech_to_text_realtime {
+        labels.push("speech-to-text realtime");
+    }
+    if capabilities.diarization_records {
+        labels.push("diarization records");
+    }
+    if capabilities.text_to_speech_records {
+        labels.push("text-to-speech records");
+    }
+    if capabilities.voice_design_records {
+        labels.push("voice design");
+    }
+    if capabilities.voice_clone_records {
+        labels.push("voice clone");
+    }
+    if capabilities.saved_voice_reuse {
+        labels.push("saved voice reuse");
+    }
+    if capabilities.studio_projects {
+        labels.push("studio projects");
+    }
+    if capabilities.voice_realtime_text_model {
+        labels.push("voice realtime text model");
+    }
+    if capabilities.voice_realtime_modular_asr {
+        labels.push("voice realtime ASR");
+    }
+    if capabilities.voice_realtime_modular_tts {
+        labels.push("voice realtime TTS");
+    }
+    if capabilities.voice_realtime_unified {
+        labels.push("voice realtime unified");
+    }
+    if capabilities.forced_alignment {
+        labels.push("forced alignment");
+    }
+    if capabilities.tokenizer {
+        labels.push("tokenizer");
+    }
+    labels
+}
+
 async fn show_model_info(
     server: &str,
     model: &str,
@@ -221,6 +326,17 @@ async fn show_model_info(
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "-".to_string())
         );
+        if !info.modalities.is_empty() {
+            println!(
+                "{}: {}",
+                style("Modalities").bold(),
+                info.modalities.join(", ")
+            );
+        }
+        let route_labels = route_capability_labels(&info.route_capabilities);
+        if !route_labels.is_empty() {
+            println!("{}: {}", style("Routes").bold(), route_labels.join(", "));
+        }
         if let Some(err) = info.error_message {
             println!("{}: {}", style("Error").bold(), style(err).red());
         }
@@ -385,5 +501,55 @@ fn reconcile_local_state(model: &mut AdminModelInfo) {
         if model.download_progress.is_none() {
             model.download_progress = Some(100.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_capability_labels_show_voxtral_offline_transcription_only() {
+        let capabilities = AdminModelRouteCapabilities {
+            openai_audio_transcriptions: true,
+            speech_to_text_jobs: true,
+            speech_to_text_realtime: false,
+            voice_realtime_modular_asr: false,
+            voice_realtime_unified: false,
+            ..Default::default()
+        };
+
+        let labels = route_capability_labels(&capabilities);
+
+        assert_eq!(labels, vec!["audio transcriptions", "speech-to-text jobs"]);
+    }
+
+    #[test]
+    fn admin_model_info_accepts_route_capabilities_from_server() {
+        let raw = serde_json::json!({
+            "variant": "Voxtral-Mini-4B-Realtime-2602",
+            "enabled": true,
+            "status": "downloaded",
+            "local_path": null,
+            "size_bytes": null,
+            "download_progress": null,
+            "error_message": null,
+            "modalities": ["audio_input", "text_output"],
+            "route_capabilities": {
+                "openai_audio_transcriptions": true,
+                "speech_to_text_jobs": true,
+                "speech_to_text_realtime": false,
+                "voice_realtime_unified": false
+            }
+        });
+
+        let info: AdminModelInfo = serde_json::from_value(raw).unwrap();
+
+        assert_eq!(info.variant, "Voxtral-Mini-4B-Realtime-2602");
+        assert_eq!(info.enabled, Some(true));
+        assert_eq!(info.modalities, vec!["audio_input", "text_output"]);
+        assert!(info.route_capabilities.openai_audio_transcriptions);
+        assert!(info.route_capabilities.speech_to_text_jobs);
+        assert!(!info.route_capabilities.speech_to_text_realtime);
     }
 }

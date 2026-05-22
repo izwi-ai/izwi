@@ -1,14 +1,14 @@
 //! OpenAI-compatible transcription endpoints.
 
 use axum::{
+    Json, RequestExt,
     body::Body,
     extract::{Extension, Multipart, Request, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{
-        sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
     },
-    Json, RequestExt,
 };
 use base64::Engine;
 use std::convert::Infallible;
@@ -865,6 +865,23 @@ mod tests {
     fn transcription_model_validation_accepts_known_asr_model() {
         validate_transcription_model(Some("Parakeet-TDT-0.6B-v3"))
             .expect("known ASR model should be accepted");
+    }
+
+    #[test]
+    fn transcription_model_validation_accepts_voxtral() {
+        validate_transcription_model(Some("mistralai/Voxtral-Mini-4B-Realtime-2602"))
+            .expect("Voxtral should be accepted for offline transcription");
+    }
+
+    #[test]
+    fn transcription_model_validation_rejects_tts_or_chat_model() {
+        let tts = validate_transcription_model(Some("Kokoro-82M"))
+            .expect_err("TTS model should be rejected for transcription");
+        assert!(tts.message.contains("Unsupported transcription model"));
+
+        let chat = validate_transcription_model(Some("Qwen3-8B-GGUF"))
+            .expect_err("chat model should be rejected for transcription");
+        assert!(chat.message.contains("Unsupported transcription model"));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use crate::utils;
 use console::style;
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
+use izwi_core::parse_model_variant;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -123,11 +124,63 @@ pub async fn execute(
         style(format!("izwi models load {}", model)).cyan()
     );
     println!(
-        "  - Generate speech: {}",
-        style(format!("izwi tts 'Hello' -m {}", model)).cyan()
+        "  - {}: {}",
+        post_download_usage_label(&model),
+        style(post_download_usage_command(&model)).cyan()
     );
 
     Ok(())
+}
+
+fn post_download_usage_label(model: &str) -> &'static str {
+    match parse_model_variant(model).ok() {
+        Some(variant) if variant.is_asr() || variant.is_voxtral() => "Transcribe audio",
+        Some(variant) if variant.is_diarization() => "Diarize audio",
+        Some(variant) if variant.is_chat() => "Start chat",
+        Some(variant) if variant.is_tokenizer() => "Inspect tokenizer",
+        _ => "Generate speech",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn post_download_hint_for_voxtral_uses_transcribe() {
+        let model = "Voxtral-Mini-4B-Realtime-2602";
+
+        assert_eq!(post_download_usage_label(model), "Transcribe audio");
+        assert_eq!(
+            post_download_usage_command(model),
+            "izwi transcribe audio.wav --model Voxtral-Mini-4B-Realtime-2602"
+        );
+    }
+
+    #[test]
+    fn post_download_hint_for_tts_still_uses_tts() {
+        let model = "Kokoro-82M";
+
+        assert_eq!(post_download_usage_label(model), "Generate speech");
+        assert_eq!(
+            post_download_usage_command(model),
+            "izwi tts 'Hello' -m Kokoro-82M"
+        );
+    }
+}
+
+fn post_download_usage_command(model: &str) -> String {
+    match parse_model_variant(model).ok() {
+        Some(variant) if variant.is_asr() || variant.is_voxtral() => {
+            format!("izwi transcribe audio.wav --model {}", model)
+        }
+        Some(variant) if variant.is_diarization() => {
+            format!("izwi diarize audio.wav --model {}", model)
+        }
+        Some(variant) if variant.is_chat() => format!("izwi chat --model {}", model),
+        Some(variant) if variant.is_tokenizer() => format!("izwi models info {} --json", model),
+        _ => format!("izwi tts 'Hello' -m {}", model),
+    }
 }
 
 async fn wait_for_download_completion(server: &str, model: &str) -> Result<()> {
