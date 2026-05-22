@@ -33,6 +33,9 @@ pub struct VoxtralRealtimeModel {
     language_model: VoxtralLM,
     time_embedding: TimeEmbedding,
     mel: MelSpectrogram,
+    num_delay_tokens: usize,
+    block_pool_size: usize,
+    audio_length_per_tok: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +43,21 @@ pub struct VoxtralTranscriptionOutput {
     pub text: String,
     pub language: Option<String>,
     pub diagnostics: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct VoxtralRuntimeSidecarConfig {
+    default_num_delay_tokens: Option<usize>,
+    downsample_factor: Option<usize>,
+    audio_length_per_tok: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct VoxtralRuntimeConfig {
+    default_num_delay_tokens: Option<usize>,
+    downsample_factor: Option<usize>,
+    audio_length_per_tok: Option<usize>,
+    checkpoint_dtype: Option<DType>,
 }
 
 impl VoxtralRealtimeModel {
@@ -55,7 +73,21 @@ impl VoxtralRealtimeModel {
             .map_err(|e| Error::ModelLoadError(format!("Failed to read config: {}", e)))?;
         let config: VoxtralConfig = serde_json::from_str(&config_str)
             .map_err(|e| Error::ModelLoadError(format!("Failed to parse config: {}", e)))?;
-        let checkpoint_dtype = checkpoint_dtype_from_config_json(&config_str);
+        let runtime_config = load_voxtral_runtime_config(model_dir)?;
+        let checkpoint_dtype =
+            checkpoint_dtype_from_config_json(&config_str).or(runtime_config.checkpoint_dtype);
+        let num_delay_tokens = runtime_config
+            .default_num_delay_tokens
+            .unwrap_or_else(|| config.num_delay_tokens())
+            .max(1);
+        let block_pool_size = runtime_config
+            .downsample_factor
+            .unwrap_or_else(|| config.block_pool_size())
+            .max(1);
+        let audio_length_per_tok = runtime_config
+            .audio_length_per_tok
+            .unwrap_or(block_pool_size.saturating_mul(2))
+            .max(1);
 
         // Setup audio processing
         let audio_cfg = config.audio_config();
@@ -77,7 +109,7 @@ impl VoxtralRealtimeModel {
             window_size: audio_cfg.window_size,
             hop_length: audio_cfg.hop_length,
             num_mel_bins: audio_cfg.num_mel_bins,
-            n_delay_tokens: config.num_delay_tokens(),
+            n_delay_tokens: num_delay_tokens,
         };
         let tokenizer = VoxtralTokenizer::load(model_dir, audio_config)?;
 
@@ -92,7 +124,7 @@ impl VoxtralRealtimeModel {
         let whisper_prefix = "mm_streams_embeddings.embedding_module.whisper_encoder";
         let whisper_encoder = WhisperEncoder::load_voxtral(&audio_cfg, vb.pp(whisper_prefix))?;
 
-        let hidden_size = audio_cfg.d_model * config.downsample_factor();
+        let hidden_size = audio_cfg.d_model * block_pool_size;
         let audio_adapter = AudioLanguageAdapter::load(
             hidden_size,
             config.text_config().hidden_size,
@@ -120,6 +152,9 @@ impl VoxtralRealtimeModel {
             language_model,
             time_embedding,
             mel,
+            num_delay_tokens,
+            block_pool_size,
+            audio_length_per_tok,
         })
     }
 
@@ -215,7 +250,7 @@ impl VoxtralRealtimeModel {
 
         // Apply time conditioning
         let time_tensor = Tensor::from_vec(
-            vec![self.config.num_delay_tokens() as f32],
+            vec![self.num_delay_tokens as f32],
             (1,),
             &self.device.device,
         )?
@@ -336,6 +371,11 @@ impl VoxtralRealtimeModel {
                 "cache": cache.unwrap_or_else(|| self.cache_diagnostics(
                     &self.build_decode_cache(decode_frames)
                 ))
+            },
+            "config": {
+                "num_delay_tokens": self.num_delay_tokens,
+                "block_pool_size": self.block_pool_size,
+                "audio_length_per_tok": self.audio_length_per_tok
             }
         })
     }
@@ -343,7 +383,7 @@ impl VoxtralRealtimeModel {
     /// Pool audio embeddings by block_size
     fn pool_audio_embeddings(&self, audio_embeds: &Tensor) -> Result<Tensor> {
         let (bsz, seq_len, hidden) = audio_embeds.dims3()?;
-        let pool_size = self.config.block_pool_size();
+        let pool_size = self.block_pool_size;
 
         // Ensure seq_len is divisible by pool_size
         let new_len = seq_len / pool_size;
@@ -927,6 +967,30 @@ fn load_weights<'a>(
     }
 }
 
+fn load_voxtral_runtime_config(model_dir: &Path) -> Result<VoxtralRuntimeConfig> {
+    let sidecar_path = model_dir.join("config.json");
+    if !sidecar_path.exists() {
+        return Ok(VoxtralRuntimeConfig::default());
+    }
+
+    let sidecar_str = std::fs::read_to_string(&sidecar_path).map_err(|e| {
+        Error::ModelLoadError(format!("Failed to read Voxtral config.json sidecar: {}", e))
+    })?;
+    let sidecar: VoxtralRuntimeSidecarConfig = serde_json::from_str(&sidecar_str).map_err(|e| {
+        Error::ModelLoadError(format!(
+            "Failed to parse Voxtral config.json sidecar: {}",
+            e
+        ))
+    })?;
+
+    Ok(VoxtralRuntimeConfig {
+        default_num_delay_tokens: sidecar.default_num_delay_tokens,
+        downsample_factor: sidecar.downsample_factor,
+        audio_length_per_tok: sidecar.audio_length_per_tok,
+        checkpoint_dtype: checkpoint_dtype_from_config_json(&sidecar_str),
+    })
+}
+
 fn select_voxtral_dtype(device: &DeviceProfile, checkpoint_dtype: Option<DType>) -> DType {
     device.select_model_dtype_with_checkpoint(ModelFamily::Voxtral, checkpoint_dtype)
 }
@@ -975,11 +1039,13 @@ fn gelu(x: &Tensor) -> Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::{
-        argmax, build_voxtral_decode_cache, select_voxtral_dtype, voxtral_dense_decode_max_tokens,
+        argmax, build_voxtral_decode_cache, load_voxtral_runtime_config, select_voxtral_dtype,
+        voxtral_dense_decode_max_tokens,
     };
     use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile};
     use crate::models::shared::attention::paged::DEFAULT_KV_PAGE_SIZE;
     use candle_core::{DType, Device, Tensor};
+    use uuid::Uuid;
 
     #[test]
     fn voxtral_dense_cuda_uses_checkpoint_dtype() {
@@ -1010,6 +1076,32 @@ mod tests {
         let cuda_cache = build_voxtral_decode_cache(2, DeviceKind::Cuda, 128);
         assert_eq!(cuda_cache.page_size(), DEFAULT_KV_PAGE_SIZE);
         assert_eq!(cuda_cache.dense_decode_max_tokens(), 128);
+    }
+
+    #[test]
+    fn voxtral_runtime_config_reads_hf_sidecar_values() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("izwi-voxtral-config-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(
+            temp_dir.join("config.json"),
+            r#"{
+                "default_num_delay_tokens": 6,
+                "downsample_factor": 4,
+                "audio_length_per_tok": 8,
+                "dtype": "bfloat16"
+            }"#,
+        )
+        .unwrap();
+
+        let config = load_voxtral_runtime_config(&temp_dir).unwrap();
+
+        assert_eq!(config.default_num_delay_tokens, Some(6));
+        assert_eq!(config.downsample_factor, Some(4));
+        assert_eq!(config.audio_length_per_tok, Some(8));
+        assert_eq!(config.checkpoint_dtype, Some(DType::BF16));
+
+        std::fs::remove_dir_all(temp_dir).ok();
     }
 
     #[test]

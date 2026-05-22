@@ -101,9 +101,7 @@ impl VoxtralConfig {
 
     /// Get number of delay tokens
     pub fn num_delay_tokens(&self) -> usize {
-        // Calculate from frame rate and typical delay
-        // Voxtral uses ~400ms delay, at 12.5 frames/sec = 5 tokens
-        5
+        6
     }
 
     /// Get block pool size
