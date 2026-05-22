@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use candle_core::{D, DType, IndexOp, Tensor};
+use candle_core::{DType, IndexOp, Tensor, D};
 use candle_nn::{Module, VarBuilder};
 use tracing::info;
 
@@ -15,7 +15,7 @@ use crate::models::architectures::voxtral::lm::VoxtralLM;
 use crate::models::shared::attention::flash::{
     flash_attention_compiled, flash_attention_requested, try_fused_self_attention,
 };
-use crate::models::shared::attention::paged::{DEFAULT_KV_PAGE_SIZE, KvCacheQuantization};
+use crate::models::shared::attention::paged::{KvCacheQuantization, DEFAULT_KV_PAGE_SIZE};
 use crate::models::shared::config::checkpoint_dtype_from_config_json;
 
 use super::audio::{AudioLanguageAdapter, TimeEmbedding};
@@ -34,6 +34,9 @@ pub struct VoxtralRealtimeModel {
     time_embedding: TimeEmbedding,
     mel: MelSpectrogram,
     num_delay_tokens: usize,
+    streaming_left_pad_tokens: usize,
+    streaming_right_pad_tokens: usize,
+    raw_audio_length_per_tok: usize,
     block_pool_size: usize,
     audio_length_per_tok: usize,
 }
@@ -110,8 +113,12 @@ impl VoxtralRealtimeModel {
             hop_length: audio_cfg.hop_length,
             num_mel_bins: audio_cfg.num_mel_bins,
             n_delay_tokens: num_delay_tokens,
+            ..AudioConfig::default()
         };
         let tokenizer = VoxtralTokenizer::load(model_dir, audio_config)?;
+        let streaming_left_pad_tokens = tokenizer.audio_config().streaming_left_pad_tokens;
+        let streaming_right_pad_tokens = tokenizer.audio_config().offline_right_pad_tokens();
+        let raw_audio_length_per_tok = tokenizer.audio_config().raw_audio_length_per_tok();
 
         let dtype = select_voxtral_dtype(&device, checkpoint_dtype);
 
@@ -153,6 +160,9 @@ impl VoxtralRealtimeModel {
             time_embedding,
             mel,
             num_delay_tokens,
+            streaming_left_pad_tokens,
+            streaming_right_pad_tokens,
+            raw_audio_length_per_tok,
             block_pool_size,
             audio_length_per_tok,
         })
@@ -206,8 +216,10 @@ impl VoxtralRealtimeModel {
             audio.to_vec()
         };
 
+        let padded_audio = self.pad_offline_streaming_audio(&audio);
+
         // Compute mel spectrogram
-        let mel_spec = self.mel.compute(&audio)?;
+        let mel_spec = self.mel.compute(&padded_audio)?;
         let n_mels = self.mel.config().n_mels;
         let frames = mel_spec.len();
 
@@ -239,8 +251,10 @@ impl VoxtralRealtimeModel {
                 diagnostics: Some(self.execution_diagnostics(
                     input_samples,
                     audio.len(),
+                    padded_audio.len(),
                     frames,
                     audio_frames,
+                    0,
                     0,
                     0,
                     None,
@@ -258,17 +272,24 @@ impl VoxtralRealtimeModel {
         let t_cond = self.time_embedding.forward(&time_tensor)?.unsqueeze(1)?;
 
         // Generate
+        let prompt_tokens = self.tokenizer.build_transcription_prompt()?;
+        let prompt_len = prompt_tokens.len();
         let max_frames = audio_frames.min(1024);
         let mut cache = self.build_decode_cache(max_frames);
         let cache_diagnostics = self.cache_diagnostics(&cache);
         let mut generated = Vec::new();
         let mut assembled = String::new();
         let specials = self.tokenizer.specials().clone();
-        let mut prev_token = specials.bos;
+        let mut prev_token: Option<u32> = None;
 
         for frame_idx in 0..max_frames {
-            let prev_tensor = Tensor::from_vec(vec![prev_token], (1, 1), &self.device.device)?;
-            let text_embed = self.language_model.embeddings(&prev_tensor)?;
+            let input_token = prompt_tokens
+                .get(frame_idx)
+                .copied()
+                .or(prev_token)
+                .unwrap_or(specials.eos);
+            let input_tensor = Tensor::from_vec(vec![input_token], (1, 1), &self.device.device)?;
+            let text_embed = self.language_model.embeddings(&input_tensor)?;
             let mut audio_step = audio_embeds.narrow(1, frame_idx, 1)?;
             if audio_step.dtype() != text_embed.dtype() {
                 audio_step = audio_step.to_dtype(text_embed.dtype())?;
@@ -290,6 +311,11 @@ impl VoxtralRealtimeModel {
             let next_logits = logits.i((0, logits.dim(1)? - 1))?;
             let next = argmax(&next_logits)?;
 
+            let should_emit = frame_idx + 1 >= prompt_len;
+            if !should_emit {
+                continue;
+            }
+
             if next == specials.eos || Some(next) == specials.end_audio {
                 break;
             }
@@ -304,7 +330,7 @@ impl VoxtralRealtimeModel {
                 }
             }
             assembled = decoded;
-            prev_token = next;
+            prev_token = Some(next);
         }
 
         Ok(VoxtralTranscriptionOutput {
@@ -313,13 +339,29 @@ impl VoxtralRealtimeModel {
             diagnostics: Some(self.execution_diagnostics(
                 input_samples,
                 audio.len(),
+                padded_audio.len(),
                 frames,
                 audio_frames,
                 max_frames,
+                prompt_len,
                 generated.len(),
                 Some(cache_diagnostics),
             )),
         })
+    }
+
+    fn pad_offline_streaming_audio(&self, audio: &[f32]) -> Vec<f32> {
+        let (left_pad, right_pad) = offline_streaming_padding_samples(
+            audio.len(),
+            self.raw_audio_length_per_tok,
+            self.streaming_left_pad_tokens,
+            self.streaming_right_pad_tokens,
+        );
+        let mut padded = Vec::with_capacity(left_pad + audio.len() + right_pad);
+        padded.extend(std::iter::repeat_n(0.0, left_pad));
+        padded.extend_from_slice(audio);
+        padded.extend(std::iter::repeat_n(0.0, right_pad));
+        padded
     }
 
     fn build_decode_cache(&self, max_decode_tokens: usize) -> Qwen3Cache {
@@ -343,9 +385,11 @@ impl VoxtralRealtimeModel {
         &self,
         input_samples: usize,
         resampled_samples: usize,
+        padded_samples: usize,
         mel_frames: usize,
         audio_frames: usize,
         decode_frames: usize,
+        prompt_tokens: usize,
         generated_tokens: usize,
         cache: Option<serde_json::Value>,
     ) -> serde_json::Value {
@@ -355,12 +399,14 @@ impl VoxtralRealtimeModel {
                 "input_samples": input_samples,
                 "resampled_sample_rate": 16000,
                 "resampled_samples": resampled_samples,
+                "padded_samples": padded_samples,
                 "mel_frames": mel_frames,
                 "audio_frames": audio_frames
             },
             "decode": {
                 "frame_synchronous": true,
                 "decode_frames": decode_frames,
+                "prompt_tokens": prompt_tokens,
                 "generated_tokens": generated_tokens
             },
             "execution": {
@@ -374,6 +420,9 @@ impl VoxtralRealtimeModel {
             },
             "config": {
                 "num_delay_tokens": self.num_delay_tokens,
+                "streaming_left_pad_tokens": self.streaming_left_pad_tokens,
+                "streaming_right_pad_tokens": self.streaming_right_pad_tokens,
+                "raw_audio_length_per_tok": self.raw_audio_length_per_tok,
                 "block_pool_size": self.block_pool_size,
                 "audio_length_per_tok": self.audio_length_per_tok
             }
@@ -910,6 +959,19 @@ fn resample_audio(audio: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f32
     Ok(resampled)
 }
 
+fn offline_streaming_padding_samples(
+    sample_len: usize,
+    raw_audio_length_per_tok: usize,
+    left_pad_tokens: usize,
+    right_pad_tokens: usize,
+) -> (usize, usize) {
+    let token_samples = raw_audio_length_per_tok.max(1);
+    let left_pad = token_samples.saturating_mul(left_pad_tokens);
+    let alignment_pad = (token_samples - (sample_len % token_samples)) % token_samples;
+    let right_pad = alignment_pad.saturating_add(token_samples.saturating_mul(right_pad_tokens));
+    (left_pad, right_pad)
+}
+
 fn load_weights<'a>(
     model_dir: &'a Path,
     dtype: DType,
@@ -1039,7 +1101,8 @@ fn gelu(x: &Tensor) -> Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::{
-        argmax, build_voxtral_decode_cache, load_voxtral_runtime_config, select_voxtral_dtype,
+        argmax, build_voxtral_decode_cache, load_voxtral_runtime_config,
+        offline_streaming_padding_samples, select_voxtral_dtype, text_delta,
         voxtral_dense_decode_max_tokens,
     };
     use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile};
@@ -1102,6 +1165,20 @@ mod tests {
         assert_eq!(config.checkpoint_dtype, Some(DType::BF16));
 
         std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn offline_streaming_padding_matches_mistral_token_padding_policy() {
+        let (left, right) = offline_streaming_padding_samples(16_001, 1_280, 32, 17);
+
+        assert_eq!(left, 32 * 1_280);
+        assert_eq!(right, 639 + 17 * 1_280);
+        assert_eq!((left + 16_001 + right) % 1_280, 0);
+    }
+
+    #[test]
+    fn text_delta_preserves_word_boundary_space() {
+        assert_eq!(text_delta("hello", "hello world"), " world");
     }
 
     #[test]
