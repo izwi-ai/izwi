@@ -71,7 +71,7 @@ impl VoxtralRealtimeModel {
             num_mel_bins: audio_cfg.num_mel_bins,
             n_delay_tokens: config.num_delay_tokens(),
         };
-        let tokenizer = VoxtralTokenizer::new(config.text_config().vocab_size, audio_config);
+        let tokenizer = VoxtralTokenizer::load(model_dir, audio_config)?;
 
         let dtype = select_voxtral_dtype(&device, checkpoint_dtype);
 
@@ -205,7 +205,7 @@ impl VoxtralRealtimeModel {
             let next_logits = logits.i((0, logits.dim(1)? - 1))?;
             let next = argmax(&next_logits)?;
 
-            if next == specials.eos || next == specials.end_audio {
+            if next == specials.eos || Some(next) == specials.end_audio {
                 break;
             }
 
