@@ -162,20 +162,10 @@ impl VoxtralRealtimeModel {
         // Project to language model dimension
         let audio_embeds = self.audio_adapter.forward(&audio_embeds)?;
 
-        // Build prompt
-        let audio_tokens = audio_embeds.dim(1)?;
-        let prompt_ids = self.tokenizer.build_transcription_prompt(audio_tokens);
-        let input_ids = Tensor::from_vec(
-            prompt_ids.clone(),
-            (1, prompt_ids.len()),
-            &self.device.device,
-        )?;
-
-        // Get text embeddings
-        let text_embeds = self.language_model.embeddings(&input_ids)?;
-
-        // Sum audio and text embeddings
-        let combined_embeds = audio_embeds.broadcast_add(&text_embeds)?;
+        let audio_frames = audio_embeds.dim(1)?;
+        if audio_frames == 0 {
+            return Ok(String::new());
+        }
 
         // Apply time conditioning
         let time_tensor = Tensor::from_vec(
@@ -184,24 +174,37 @@ impl VoxtralRealtimeModel {
             &self.device.device,
         )?
         .to_dtype(self.dtype)?;
-        let t_cond = self.time_embedding.forward(&time_tensor)?;
+        let t_cond = self.time_embedding.forward(&time_tensor)?.unsqueeze(1)?;
 
         // Generate
         let mut cache = Qwen3Cache::new(self.language_model.num_layers());
         let mut generated = Vec::new();
         let mut assembled = String::new();
-        let max_tokens = 1024usize;
+        let specials = self.tokenizer.specials().clone();
+        let mut prev_token = specials.bos;
+        let max_frames = audio_frames.min(1024);
 
-        // Forward with audio - use forward_with_embeds for custom embeddings
-        let combined_embeds = combined_embeds.broadcast_add(&t_cond.unsqueeze(0)?)?;
-        let mut logits =
-            self.language_model
-                .forward_with_embeds(&combined_embeds, 0, Some(&mut cache), None)?;
+        for frame_idx in 0..max_frames {
+            let prev_tensor = Tensor::from_vec(vec![prev_token], (1, 1), &self.device.device)?;
+            let text_embed = self.language_model.embeddings(&prev_tensor)?;
+            let mut audio_step = audio_embeds.narrow(1, frame_idx, 1)?;
+            if audio_step.dtype() != text_embed.dtype() {
+                audio_step = audio_step.to_dtype(text_embed.dtype())?;
+            }
+            let mut step_embeds = audio_step.broadcast_add(&text_embed)?;
+            let t_cond = if t_cond.dtype() == step_embeds.dtype() {
+                t_cond.clone()
+            } else {
+                t_cond.to_dtype(step_embeds.dtype())?
+            };
+            step_embeds = step_embeds.broadcast_add(&t_cond)?;
 
-        let specials = self.tokenizer.specials();
-        let mut pos = combined_embeds.dim(1)?;
-
-        for _ in 0..max_tokens {
+            let logits = self.language_model.forward_with_embeds(
+                &step_embeds,
+                frame_idx,
+                Some(&mut cache),
+                None,
+            )?;
             let next_logits = logits.i((0, logits.dim(1)? - 1))?;
             let next = argmax(&next_logits)?;
 
@@ -217,12 +220,7 @@ impl VoxtralRealtimeModel {
                 on_delta(ch.encode_utf8(&mut buf));
             }
             assembled = decoded;
-
-            let next_tensor = Tensor::from_vec(vec![next], (1, 1), &self.device.device)?;
-            logits = self
-                .language_model
-                .forward(&next_tensor, pos, Some(&mut cache))?;
-            pos += 1;
+            prev_token = next;
         }
 
         Ok(assembled.trim().to_string())
