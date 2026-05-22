@@ -204,8 +204,7 @@ export function formatBytes(bytes: number): string {
 export function isAsrVariant(variant: string): boolean {
   return (
     variant.includes("Whisper-Large-v3-Turbo") ||
-    variant.includes("Parakeet-TDT") ||
-    variant.includes("Voxtral")
+    variant.includes("Parakeet-TDT")
   );
 }
 

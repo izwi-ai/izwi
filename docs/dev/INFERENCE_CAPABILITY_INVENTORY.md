@@ -23,7 +23,7 @@ capability adapters, broker metrics, conformance fixtures, and documentation.
 | `asr` | Audio input to transcript output. | Parakeet, Whisper, Qwen3 ASR, audio-chat transcription path. |
 | `realtime_asr` | Session-oriented ASR with partial/final updates. | Realtime transcription websocket, Voxtral realtime when enabled. |
 | `chat` | Text/multimodal prompt to generated text output. | Qwen3, Qwen3.5, Gemma, LFM2.5 chat. |
-| `audio_chat` | Audio/text prompt to audio-language model output. | LFM2.5 Audio, Voxtral. |
+| `audio_chat` | Audio/text prompt to audio-language model output. | LFM2.5 Audio. |
 | `speech_to_speech` | Audio input to generated audio/text response. | LFM2.5 Audio unified voice path. |
 | `diarization` | Audio input to speaker-attributed segments. | Sortformer. |
 | `forced_alignment` | Transcript/audio input to word timestamps. | Qwen3 ForcedAligner. |
@@ -81,7 +81,7 @@ phases can verify registry coverage without changing public behavior.
 | `Gemma34BIt` | Gemma3Chat | Chat | `chat` | No |
 | `Qwen3ForcedAligner06B` | Qwen3ForcedAligner | ForcedAlign | `forced_alignment` | Yes |
 | `Qwen3ForcedAligner06B4Bit` | Qwen3ForcedAligner | ForcedAlign | `forced_alignment` | Yes |
-| `VoxtralMini4BRealtime2602` | Voxtral | AudioChat | `audio_chat`, `asr`, `realtime_asr` | No |
+| `VoxtralMini4BRealtime2602` | Voxtral | Asr | `asr` | No |
 
 ## Public Compatibility Surfaces
 

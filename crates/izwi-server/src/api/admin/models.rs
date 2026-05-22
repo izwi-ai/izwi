@@ -1,9 +1,9 @@
 //! Model management API endpoints
 
 use axum::{
-    Json,
     extract::{Path, State},
     response::Sse,
+    Json,
 };
 use futures::stream::Stream;
 use serde::Serialize;
@@ -17,7 +17,7 @@ use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::model::download::DownloadState;
 use izwi_core::{
-    ModelInfo, ModelStatus, ModelVariant, SpeechModelCapabilities, parse_model_variant,
+    parse_model_variant, ModelInfo, ModelStatus, ModelVariant, SpeechModelCapabilities,
 };
 
 /// Response for model list
@@ -153,10 +153,10 @@ impl AdminModelRouteCapabilities {
             openai_audio_transcriptions: variant.is_asr()
                 || variant.is_voxtral()
                 || variant.is_audio_chat(),
-            speech_to_text_jobs: variant.is_asr() || variant.is_diarization(),
-            speech_to_text_realtime: variant.is_asr()
+            speech_to_text_jobs: variant.is_asr()
                 || variant.is_voxtral()
-                || variant.is_audio_chat(),
+                || variant.is_diarization(),
+            speech_to_text_realtime: variant.is_asr() || variant.is_audio_chat(),
             diarization_records: variant.is_diarization(),
             text_to_speech_records: supports_tts,
             voice_design_records: supports_voice_description,
@@ -164,7 +164,7 @@ impl AdminModelRouteCapabilities {
             saved_voice_reuse: supports_reference_voice,
             studio_projects: supports_tts,
             voice_realtime_text_model: variant.is_chat(),
-            voice_realtime_modular_asr: variant.is_asr() || variant.is_voxtral(),
+            voice_realtime_modular_asr: variant.is_asr(),
             voice_realtime_modular_tts: supports_tts,
             voice_realtime_unified: variant.is_audio_chat(),
             forced_alignment: variant.is_forced_aligner(),

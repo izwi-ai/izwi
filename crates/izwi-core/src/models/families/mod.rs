@@ -103,18 +103,8 @@ const LFM25_AUDIO_FIXTURES: &[&str] = &[
 const FORCED_ALIGNMENT_CAPABILITIES: &[ConformanceCapability] =
     &[ConformanceCapability::ForcedAlignment];
 const FORCED_ALIGNMENT_FIXTURES: &[&str] = &["forced_alignment.words"];
-const VOXTRAL_CAPABILITIES: &[ConformanceCapability] = &[
-    ConformanceCapability::Asr,
-    ConformanceCapability::RealtimeAsr,
-    ConformanceCapability::AudioChat,
-    ConformanceCapability::SpeechToSpeech,
-];
-const VOXTRAL_FIXTURES: &[&str] = &[
-    "asr.short_wav.transcript",
-    "realtime_asr.partial_final",
-    "audio_chat.audio_prompt.response",
-    "speech_to_speech.audio_stream",
-];
+const VOXTRAL_CAPABILITIES: &[ConformanceCapability] = &[ConformanceCapability::Asr];
+const VOXTRAL_FIXTURES: &[&str] = &["asr.short_wav.transcript"];
 const TOKENIZER_CAPABILITIES: &[ConformanceCapability] = &[ConformanceCapability::Tokenizer];
 const TOKENIZER_FIXTURES: &[&str] = &["tokenizer.model_artifact.round_trip"];
 
@@ -255,11 +245,8 @@ mod tests {
         {
             expected.insert(ConformanceCapability::StreamingTts);
         }
-        if variant.is_asr() || variant.is_audio_chat() {
+        if variant.is_asr() || variant.is_voxtral() || variant.is_audio_chat() {
             expected.insert(ConformanceCapability::Asr);
-        }
-        if variant.is_voxtral() {
-            expected.insert(ConformanceCapability::RealtimeAsr);
         }
         if variant.is_chat() {
             expected.insert(ConformanceCapability::Chat);
