@@ -1,0 +1,64 @@
+name: CUDA FlashAttention
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 2 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cuda-flash-attn-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CUDA_COMPUTE_CAP: "80"
+  IZWI_CUDA_FEATURES: "cuda,cudnn,flash-attn"
+
+jobs:
+  cargo-cuda-flash-attn:
+    name: Cargo Check (CUDA FlashAttention)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container:
+      image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install container build dependencies
+        run: |
+          apt-get update
+          apt-get install -y \
+            build-essential \
+            ca-certificates \
+            curl \
+            git \
+            pkg-config \
+            libssl-dev
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+            --profile minimal \
+            --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Run CUDA FlashAttention cargo checks
+        run: scripts/ci/check-backend-truth.sh cargo-cuda
+
+  docker-cuda-flash-attn:
+    name: Docker Build (CUDA FlashAttention)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      DOCKER_BUILDKIT: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Run CUDA FlashAttention Docker build checks
+        run: scripts/ci/check-backend-truth.sh docker-cuda

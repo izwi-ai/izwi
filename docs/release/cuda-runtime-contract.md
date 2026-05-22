@@ -83,8 +83,12 @@ Release workflow guardrails:
 
 Docker workflow guardrails:
 
-- CPU and CUDA Docker builds run as separate `Backend Truth` jobs.
-- The CUDA Docker job builds `production-cuda`, not a native release package.
+- CPU and fast CUDA Docker builds run as separate required `Backend Truth` jobs.
+- Required Backend Truth CUDA jobs use `IZWI_CUDA_FEATURES=cuda,cudnn` so PRs do
+  not spend the required-check budget compiling Candle FlashAttention/CUTLASS.
+- The `CUDA FlashAttention` workflow validates
+  `IZWI_CUDA_FEATURES=cuda,cudnn,flash-attn` on a longer manual/nightly path.
+- The CUDA Docker jobs build `production-cuda`, not a native release package.
 - The CPU Docker image is smoke-run with `/usr/local/bin/izwi-server --help`.
 - The CUDA Docker image is audited with `ldd`; CUDA runtime libraries must resolve from the image, while `libcuda.so.1` is allowed to remain unresolved because it is supplied by the NVIDIA container runtime on GPU hosts.
 - CUDA feature experiments can set `IZWI_CUDA_FEATURES`, for example

@@ -30,7 +30,7 @@ resolve_cuda_compute_cap() {
 }
 
 resolve_cuda_features() {
-    echo "${IZWI_CUDA_FEATURES:-cuda,cudnn,flash-attn}"
+    echo "${IZWI_CUDA_FEATURES:-cuda,cudnn}"
 }
 
 smoke_docker_server() {
