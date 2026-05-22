@@ -3,6 +3,7 @@ import {
   buildVoiceRealtimeWebSocketUrl,
   encodeVoiceRealtimeClientPcm16Frame,
   formatModelVariantLabel,
+  isAsrVariant,
   isUnifiedAudioChatVariant,
   makeTranscriptEntryId,
   mergeSampleChunks,
@@ -33,6 +34,12 @@ describe("voice realtime support", () => {
   it("detects the unified lfm25 audio variant", () => {
     expect(isUnifiedAudioChatVariant("LFM2.5-Audio-1.5B-GGUF")).toBe(true);
     expect(isUnifiedAudioChatVariant("Qwen3-1.7B-GGUF")).toBe(false);
+  });
+
+  it("keeps Voxtral out of modular voice ASR until native realtime support lands", () => {
+    expect(isAsrVariant("Parakeet-TDT-0.6B-v3")).toBe(true);
+    expect(isAsrVariant("Whisper-Large-v3-Turbo")).toBe(true);
+    expect(isAsrVariant("Voxtral-Mini-4B-Realtime-2602")).toBe(false);
   });
 
   it("creates uuid transcript entry ids", () => {

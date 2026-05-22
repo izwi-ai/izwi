@@ -509,10 +509,7 @@ impl ModelVariant {
 
     /// Whether this is an audio-chat model.
     pub fn is_audio_chat(&self) -> bool {
-        matches!(
-            self.family(),
-            crate::catalog::ModelFamily::Voxtral | crate::catalog::ModelFamily::Lfm25Audio
-        )
+        matches!(self.family(), crate::catalog::ModelFamily::Lfm25Audio)
     }
 
     pub fn is_tts(&self) -> bool {
@@ -908,6 +905,8 @@ impl ModelInfo {
 
 #[cfg(test)]
 mod tests {
+    use crate::catalog::ModelTask;
+
     use super::{ModelVariant, SpeechModelCapabilities};
 
     #[test]
@@ -1009,6 +1008,17 @@ mod tests {
             variant.dir_name()
         );
         assert!(variant.is_gguf(), "{} should be gguf", variant.dir_name());
+    }
+
+    #[test]
+    fn voxtral_initial_contract_is_asr_only_until_realtime_lands() {
+        let variant = ModelVariant::VoxtralMini4BRealtime2602;
+        assert!(variant.is_voxtral());
+        assert_eq!(variant.primary_task(), ModelTask::Asr);
+        assert!(!variant.is_enabled());
+        assert!(!variant.is_asr());
+        assert!(!variant.is_audio_chat());
+        assert_eq!(variant.speech_capabilities(), None);
     }
 
     #[test]

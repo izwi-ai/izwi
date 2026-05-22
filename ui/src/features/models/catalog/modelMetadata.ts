@@ -366,9 +366,9 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
   "Voxtral-Mini-4B-Realtime-2602": {
     shortName: "Voxtral 4B",
     fullName: "Voxtral Mini 4B Realtime",
-    description: "Realtime streaming ASR from Mistral AI",
+    description: "Mistral AI speech transcription model with realtime support planned",
     category: "asr",
-    capabilities: ["Transcription", "Realtime"],
+    capabilities: ["Transcription"],
     size: "8.0 GB",
   },
 };

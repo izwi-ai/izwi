@@ -127,7 +127,8 @@ impl ModelVariant {
             | ModelFamily::Lfm2Chat
             | ModelFamily::Gemma3Chat => ModelTask::Chat,
             ModelFamily::Qwen3ForcedAligner => ModelTask::ForcedAlign,
-            ModelFamily::Voxtral | ModelFamily::Lfm25Audio => ModelTask::AudioChat,
+            ModelFamily::Voxtral => ModelTask::Asr,
+            ModelFamily::Lfm25Audio => ModelTask::AudioChat,
             ModelFamily::Tokenizer => ModelTask::Tokenizer,
         }
     }

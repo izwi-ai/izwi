@@ -837,6 +837,13 @@ async fn handle_text_message(
                         );
                     };
 
+                    let asr_variant = parse_model_variant(asr_model_id.as_str())
+                        .map_err(|err| format!("Unsupported ASR model: {err}"))?;
+                    if !asr_variant.is_asr() {
+                        return Err(format!(
+                            "Model `{asr_model_id}` is not a supported modular ASR model."
+                        ));
+                    }
                     let _ = resolve_chat_model_id(Some(text_model_id.as_str()))?;
                     parse_tts_model_variant(tts_model_id.as_str())
                         .map_err(|err| format!("Unsupported TTS model: {err}"))?;
