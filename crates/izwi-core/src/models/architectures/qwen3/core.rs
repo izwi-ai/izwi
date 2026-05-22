@@ -4,8 +4,8 @@
 //! (used for audio-conditioned ASR).
 
 use candle_core::quantized::QMatMul;
-use candle_core::{D, DType, Device, Module, Tensor};
-use candle_nn::{Embedding, Linear, RmsNorm, VarBuilder, ops, rotary_emb};
+use candle_core::{DType, Device, Module, Tensor, D};
+use candle_nn::{ops, rotary_emb, Embedding, Linear, RmsNorm, VarBuilder};
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -13,15 +13,15 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::kernels::try_fused_silu_mul;
 use crate::models::shared::attention::batched::{
-    BatchedAttentionConfig, BatchedAttentionInput, batched_scaled_dot_product_attention,
+    batched_scaled_dot_product_attention, BatchedAttentionConfig, BatchedAttentionInput,
 };
 use crate::models::shared::attention::flash::try_fused_self_attention;
 use crate::models::shared::attention::paged::{
-    KvCacheQuantization, KvPage, append_to_pages, default_kv_page_size, default_kv_quantization,
-    materialize_pages, paged_decode_attention,
+    append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
+    paged_decode_attention, KvCacheQuantization, KvPage,
 };
 use crate::models::shared::telemetry::{
-    DecodeAttentionPath, record_decode_attention_path, record_rope_kernel, record_rope_manual,
+    record_decode_attention_path, record_rope_kernel, record_rope_manual, DecodeAttentionPath,
 };
 use crate::models::shared::weights::gguf::GgufLoader;
 use crate::models::shared::weights::mlx;
@@ -56,6 +56,14 @@ pub struct Qwen3Config {
     pub lm_head_size: Option<usize>,
     #[serde(default)]
     pub rope_scaling: Option<RopeScalingConfig>,
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+    #[serde(default)]
+    pub use_sliding_window: bool,
+    #[serde(default)]
+    pub ada_rms_norm_t_cond: bool,
+    #[serde(default)]
+    pub ada_rms_norm_t_cond_dim: usize,
 }
 
 impl Qwen3Config {
@@ -66,6 +74,13 @@ impl Qwen3Config {
 
     pub fn kv_groups(&self) -> usize {
         self.num_attention_heads / self.num_key_value_heads
+    }
+
+    pub fn sliding_window(&self) -> Option<usize> {
+        self.use_sliding_window
+            .then_some(self.sliding_window)
+            .flatten()
+            .filter(|window| *window > 0)
     }
 }
 

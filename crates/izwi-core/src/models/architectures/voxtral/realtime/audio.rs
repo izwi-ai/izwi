@@ -2,7 +2,7 @@
 //!
 //! Sinusoidal embedding for encoding time/delay tokens.
 
-use candle_core::{D, DType, Result, Tensor};
+use candle_core::{DType, Result, Tensor, D};
 use candle_nn::Module;
 
 /// Sinusoidal Time Embedding for encoding delay tokens
@@ -17,7 +17,7 @@ impl TimeEmbedding {
         let half_dim = dim / 2;
         let log_theta = theta.ln();
         let inv_freq: Vec<f32> = (0..half_dim)
-            .map(|i| (-log_theta * i as f32 / (half_dim as f32 - 1.0)).exp())
+            .map(|i| (-log_theta * i as f32 / half_dim as f32).exp())
             .collect();
         let inv_freq = Tensor::from_vec(inv_freq, (half_dim,), device)?;
 
@@ -106,5 +106,24 @@ mod tests {
 
         assert_eq!(out.dtype(), DType::F16);
         assert_eq!(out.dims(), &[1, 8]);
+    }
+
+    #[test]
+    fn time_embedding_uses_vllm_frequency_schedule() {
+        let device = Device::Cpu;
+        let embedding = TimeEmbedding::new(8, 10000.0, &device).unwrap();
+        let t = Tensor::from_vec(vec![1.0f32], (1,), &device).unwrap();
+
+        let out = embedding.forward(&t).unwrap().to_vec2::<f32>().unwrap();
+        let row = &out[0];
+
+        assert!((row[0] - 1.0f32.cos()).abs() < 1e-6);
+        assert!((row[1] - 0.1f32.cos()).abs() < 1e-6);
+        assert!((row[2] - 0.01f32.cos()).abs() < 1e-6);
+        assert!((row[3] - 0.001f32.cos()).abs() < 1e-6);
+        assert!((row[4] - 1.0f32.sin()).abs() < 1e-6);
+        assert!((row[5] - 0.1f32.sin()).abs() < 1e-6);
+        assert!((row[6] - 0.01f32.sin()).abs() < 1e-6);
+        assert!((row[7] - 0.001f32.sin()).abs() < 1e-6);
     }
 }

@@ -56,6 +56,8 @@ impl VoxtralConfig {
             tie_word_embeddings: self.tied_embeddings,
             sliding_window: self.sliding_window,
             use_sliding_window: self.sliding_window > 0,
+            ada_rms_norm_t_cond: self.ada_rms_norm_t_cond,
+            ada_rms_norm_t_cond_dim: self.ada_rms_norm_t_cond_dim,
         }
     }
 
@@ -187,6 +189,10 @@ pub struct MistralConfig {
     pub sliding_window: usize,
     #[serde(default)]
     pub use_sliding_window: bool,
+    #[serde(default)]
+    pub ada_rms_norm_t_cond: bool,
+    #[serde(default)]
+    pub ada_rms_norm_t_cond_dim: usize,
 }
 
 /// Whisper-based audio encoder configuration
@@ -235,6 +241,10 @@ impl From<MistralConfig> for Qwen3Config {
             vocab_size: cfg.vocab_size,
             lm_head_size: None,
             rope_scaling: None,
+            sliding_window: cfg.use_sliding_window.then_some(cfg.sliding_window),
+            use_sliding_window: cfg.use_sliding_window,
+            ada_rms_norm_t_cond: cfg.ada_rms_norm_t_cond,
+            ada_rms_norm_t_cond_dim: cfg.ada_rms_norm_t_cond_dim,
         }
     }
 }

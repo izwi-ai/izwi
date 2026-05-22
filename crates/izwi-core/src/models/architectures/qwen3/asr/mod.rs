@@ -1572,6 +1572,10 @@ fn parse_qwen3_asr_config_from_gguf(loader: &GgufLoader) -> Result<Qwen3AsrConfi
             interleaved: Some(true),
             mrope_section: Some(mrope_section),
         }),
+        sliding_window: None,
+        use_sliding_window: false,
+        ada_rms_norm_t_cond: false,
+        ada_rms_norm_t_cond_dim: 0,
     };
 
     let audio_config = config::AudioConfig {

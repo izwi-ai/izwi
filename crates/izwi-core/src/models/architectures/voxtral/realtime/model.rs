@@ -269,7 +269,7 @@ impl VoxtralRealtimeModel {
             &self.device.device,
         )?
         .to_dtype(self.dtype)?;
-        let t_cond = self.time_embedding.forward(&time_tensor)?.unsqueeze(1)?;
+        let t_cond = self.time_embedding.forward(&time_tensor)?;
 
         // Generate
         let prompt_tokens = self.tokenizer.build_transcription_prompt()?;
@@ -294,19 +294,19 @@ impl VoxtralRealtimeModel {
             if audio_step.dtype() != text_embed.dtype() {
                 audio_step = audio_step.to_dtype(text_embed.dtype())?;
             }
-            let mut step_embeds = audio_step.broadcast_add(&text_embed)?;
+            let step_embeds = audio_step.broadcast_add(&text_embed)?;
             let t_cond = if t_cond.dtype() == step_embeds.dtype() {
                 t_cond.clone()
             } else {
                 t_cond.to_dtype(step_embeds.dtype())?
             };
-            step_embeds = step_embeds.broadcast_add(&t_cond)?;
 
             let logits = self.language_model.forward_with_embeds(
                 &step_embeds,
                 frame_idx,
                 Some(&mut cache),
                 None,
+                Some(&t_cond),
             )?;
             let next_logits = logits.i((0, logits.dim(1)? - 1))?;
             let next = argmax(&next_logits)?;
