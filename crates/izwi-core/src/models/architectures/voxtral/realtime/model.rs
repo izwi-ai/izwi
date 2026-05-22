@@ -7,14 +7,15 @@ use candle_nn::{Module, VarBuilder};
 use tracing::info;
 
 use crate::audio::{MelConfig, MelSpectrogram};
-use crate::backends::DeviceProfile;
+use crate::backends::{DeviceKind, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::core::Qwen3Cache;
 use crate::models::architectures::voxtral::lm::VoxtralLM;
 use crate::models::shared::attention::flash::{
-    flash_attention_requested, try_fused_self_attention,
+    flash_attention_compiled, flash_attention_requested, try_fused_self_attention,
 };
+use crate::models::shared::attention::paged::{DEFAULT_KV_PAGE_SIZE, KvCacheQuantization};
 use crate::models::shared::config::checkpoint_dtype_from_config_json;
 
 use super::audio::{AudioLanguageAdapter, TimeEmbedding};
@@ -32,6 +33,13 @@ pub struct VoxtralRealtimeModel {
     language_model: VoxtralLM,
     time_embedding: TimeEmbedding,
     mel: MelSpectrogram,
+}
+
+#[derive(Debug, Clone)]
+pub struct VoxtralTranscriptionOutput {
+    pub text: String,
+    pub language: Option<String>,
+    pub diagnostics: Option<serde_json::Value>,
 }
 
 impl VoxtralRealtimeModel {
@@ -97,7 +105,10 @@ impl VoxtralRealtimeModel {
         let time_embedding =
             TimeEmbedding::new(config.text_config().hidden_size, 10000.0, &device.device)?;
 
-        info!("Loaded Voxtral Realtime model on {:?}", device.kind);
+        info!(
+            "Loaded Voxtral Realtime model on {:?} with dtype {:?}",
+            device.kind, dtype
+        );
 
         Ok(Self {
             device,
@@ -119,8 +130,18 @@ impl VoxtralRealtimeModel {
         sample_rate: u32,
         _language: Option<&str>,
     ) -> Result<String> {
-        let mut no_op = |_delta: &str| {};
-        self.transcribe_with_callback(audio, sample_rate, _language, &mut no_op)
+        Ok(self
+            .transcribe_with_details(audio, sample_rate, _language)?
+            .text)
+    }
+
+    pub fn transcribe_with_details(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+    ) -> Result<VoxtralTranscriptionOutput> {
+        self.transcribe_impl(audio, sample_rate, language, None)
     }
 
     pub fn transcribe_with_callback(
@@ -130,6 +151,19 @@ impl VoxtralRealtimeModel {
         _language: Option<&str>,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<String> {
+        Ok(self
+            .transcribe_impl(audio, sample_rate, _language, Some(on_delta))?
+            .text)
+    }
+
+    fn transcribe_impl(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        mut on_delta: Option<&mut dyn FnMut(&str)>,
+    ) -> Result<VoxtralTranscriptionOutput> {
+        let input_samples = audio.len();
         // Resample to 16kHz if needed
         let audio = if sample_rate != 16_000 {
             resample_audio(audio, sample_rate, 16_000)?
@@ -164,7 +198,19 @@ impl VoxtralRealtimeModel {
 
         let audio_frames = audio_embeds.dim(1)?;
         if audio_frames == 0 {
-            return Ok(String::new());
+            return Ok(VoxtralTranscriptionOutput {
+                text: String::new(),
+                language: language.map(str::to_string),
+                diagnostics: Some(self.execution_diagnostics(
+                    input_samples,
+                    audio.len(),
+                    frames,
+                    audio_frames,
+                    0,
+                    0,
+                    None,
+                )),
+            });
         }
 
         // Apply time conditioning
@@ -177,12 +223,13 @@ impl VoxtralRealtimeModel {
         let t_cond = self.time_embedding.forward(&time_tensor)?.unsqueeze(1)?;
 
         // Generate
-        let mut cache = Qwen3Cache::new(self.language_model.num_layers());
+        let max_frames = audio_frames.min(1024);
+        let mut cache = self.build_decode_cache(max_frames);
+        let cache_diagnostics = self.cache_diagnostics(&cache);
         let mut generated = Vec::new();
         let mut assembled = String::new();
         let specials = self.tokenizer.specials().clone();
         let mut prev_token = specials.bos;
-        let max_frames = audio_frames.min(1024);
 
         for frame_idx in 0..max_frames {
             let prev_tensor = Tensor::from_vec(vec![prev_token], (1, 1), &self.device.device)?;
@@ -215,15 +262,82 @@ impl VoxtralRealtimeModel {
             generated.push(next);
             let decoded = self.tokenizer.decode_text(&generated)?;
             let delta = text_delta(&assembled, &decoded);
-            for ch in delta.chars() {
-                let mut buf = [0u8; 4];
-                on_delta(ch.encode_utf8(&mut buf));
+            if let Some(on_delta) = on_delta.as_deref_mut() {
+                for ch in delta.chars() {
+                    let mut buf = [0u8; 4];
+                    on_delta(ch.encode_utf8(&mut buf));
+                }
             }
             assembled = decoded;
             prev_token = next;
         }
 
-        Ok(assembled.trim().to_string())
+        Ok(VoxtralTranscriptionOutput {
+            text: assembled.trim().to_string(),
+            language: language.map(str::to_string),
+            diagnostics: Some(self.execution_diagnostics(
+                input_samples,
+                audio.len(),
+                frames,
+                audio_frames,
+                max_frames,
+                generated.len(),
+                Some(cache_diagnostics),
+            )),
+        })
+    }
+
+    fn build_decode_cache(&self, max_decode_tokens: usize) -> Qwen3Cache {
+        build_voxtral_decode_cache(
+            self.language_model.num_layers(),
+            self.device.kind,
+            max_decode_tokens,
+        )
+    }
+
+    fn cache_diagnostics(&self, cache: &Qwen3Cache) -> serde_json::Value {
+        serde_json::json!({
+            "page_size": cache.page_size(),
+            "dense_decode_enabled": cache.dense_decode_max_tokens() > 0,
+            "dense_decode_max_tokens": cache.dense_decode_max_tokens(),
+            "kv_quantization": "none"
+        })
+    }
+
+    fn execution_diagnostics(
+        &self,
+        input_samples: usize,
+        resampled_samples: usize,
+        mel_frames: usize,
+        audio_frames: usize,
+        decode_frames: usize,
+        generated_tokens: usize,
+        cache: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "model_family": "voxtral",
+            "audio": {
+                "input_samples": input_samples,
+                "resampled_sample_rate": 16000,
+                "resampled_samples": resampled_samples,
+                "mel_frames": mel_frames,
+                "audio_frames": audio_frames
+            },
+            "decode": {
+                "frame_synchronous": true,
+                "decode_frames": decode_frames,
+                "generated_tokens": generated_tokens
+            },
+            "execution": {
+                "device_kind": format!("{:?}", self.device.kind),
+                "dtype": format!("{:?}", self.dtype),
+                "flash_attention_requested": flash_attention_requested(),
+                "flash_attention_compiled": flash_attention_compiled(),
+                "cache": cache.unwrap_or_else(|| self.cache_diagnostics(
+                    &self.build_decode_cache(decode_frames)
+                ))
+            }
+        })
     }
 
     /// Pool audio embeddings by block_size
@@ -696,7 +810,7 @@ fn create_causal_mask(
 }
 
 fn argmax(logits: &Tensor) -> Result<u32> {
-    let logits = logits.to_vec1::<f32>()?;
+    let logits = logits.to_dtype(DType::F32)?.to_vec1::<f32>()?;
     let mut max_idx = 0;
     let mut max_val = logits[0];
     for (i, &v) in logits.iter().enumerate() {
@@ -803,6 +917,27 @@ fn select_voxtral_dtype(device: &DeviceProfile, checkpoint_dtype: Option<DType>)
     device.select_model_dtype_with_checkpoint(ModelFamily::Voxtral, checkpoint_dtype)
 }
 
+fn build_voxtral_decode_cache(
+    num_layers: usize,
+    device_kind: DeviceKind,
+    max_decode_tokens: usize,
+) -> Qwen3Cache {
+    Qwen3Cache::with_page_size_quantization_and_dense_decode_tokens(
+        num_layers,
+        DEFAULT_KV_PAGE_SIZE,
+        KvCacheQuantization::None,
+        voxtral_dense_decode_max_tokens(device_kind, max_decode_tokens),
+    )
+}
+
+fn voxtral_dense_decode_max_tokens(device_kind: DeviceKind, max_decode_tokens: usize) -> usize {
+    if device_kind.is_metal() || device_kind.is_cuda() {
+        max_decode_tokens.max(1)
+    } else {
+        0
+    }
+}
+
 /// GELU activation function
 fn gelu(x: &Tensor) -> Result<Tensor> {
     let coeff = 0.044715f32;
@@ -825,9 +960,12 @@ fn gelu(x: &Tensor) -> Result<Tensor> {
 
 #[cfg(test)]
 mod tests {
-    use super::select_voxtral_dtype;
+    use super::{
+        argmax, build_voxtral_decode_cache, select_voxtral_dtype, voxtral_dense_decode_max_tokens,
+    };
     use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile};
-    use candle_core::{DType, Device};
+    use crate::models::shared::attention::paged::DEFAULT_KV_PAGE_SIZE;
+    use candle_core::{DType, Device, Tensor};
 
     #[test]
     fn voxtral_dense_cuda_uses_checkpoint_dtype() {
@@ -843,5 +981,31 @@ mod tests {
         };
 
         assert_eq!(select_voxtral_dtype(&profile, Some(DType::F16)), DType::F16);
+    }
+
+    #[test]
+    fn voxtral_decode_cache_policy_is_explicit_per_backend() {
+        assert_eq!(voxtral_dense_decode_max_tokens(DeviceKind::Cpu, 128), 0);
+        assert_eq!(voxtral_dense_decode_max_tokens(DeviceKind::Metal, 128), 128);
+        assert_eq!(voxtral_dense_decode_max_tokens(DeviceKind::Cuda, 128), 128);
+
+        let cpu_cache = build_voxtral_decode_cache(2, DeviceKind::Cpu, 128);
+        assert_eq!(cpu_cache.page_size(), DEFAULT_KV_PAGE_SIZE);
+        assert_eq!(cpu_cache.dense_decode_max_tokens(), 0);
+
+        let cuda_cache = build_voxtral_decode_cache(2, DeviceKind::Cuda, 128);
+        assert_eq!(cuda_cache.page_size(), DEFAULT_KV_PAGE_SIZE);
+        assert_eq!(cuda_cache.dense_decode_max_tokens(), 128);
+    }
+
+    #[test]
+    fn voxtral_argmax_casts_half_logits_for_host_read() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![0.1f32, 0.7, -0.2], (3,), &device)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+
+        assert_eq!(argmax(&logits).unwrap(), 1);
     }
 }

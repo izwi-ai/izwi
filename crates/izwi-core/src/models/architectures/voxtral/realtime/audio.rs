@@ -2,7 +2,7 @@
 //!
 //! Sinusoidal embedding for encoding time/delay tokens.
 
-use candle_core::{Result, Tensor, D};
+use candle_core::{D, DType, Result, Tensor};
 use candle_nn::Module;
 
 /// Sinusoidal Time Embedding for encoding delay tokens
@@ -31,8 +31,9 @@ impl TimeEmbedding {
     /// Forward pass
     /// t: (B,) -> (B, dim) or (B, T) -> (B, T, dim)
     pub fn forward(&self, t: &Tensor) -> Result<Tensor> {
+        let dtype = t.dtype();
         // Add dimension: (B,) -> (B, 1) or (B, T) -> (B, T, 1)
-        let t = t.unsqueeze(D::Minus1)?;
+        let t = t.to_dtype(DType::F32)?.unsqueeze(D::Minus1)?;
 
         // Broadcast: (B, 1) x (dim/2,) -> (B, dim/2)
         let emb = t.broadcast_mul(&self.inv_freq)?;
@@ -42,7 +43,7 @@ impl TimeEmbedding {
         let sin_emb = emb.sin()?;
         let emb = Tensor::cat(&[&cos_emb, &sin_emb], D::Minus1)?;
 
-        Ok(emb)
+        emb.to_dtype(dtype)
     }
 }
 
@@ -85,4 +86,25 @@ fn gelu(x: &Tensor) -> Result<Tensor> {
     let out = x_f32.broadcast_mul(&one.broadcast_add(&tanh)?)?;
     let out = out.broadcast_mul(&half)?;
     out.to_dtype(dtype)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+
+    #[test]
+    fn time_embedding_preserves_selected_dtype() {
+        let device = Device::Cpu;
+        let embedding = TimeEmbedding::new(8, 10000.0, &device).unwrap();
+        let t = Tensor::from_vec(vec![4.0f32], (1,), &device)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+
+        let out = embedding.forward(&t).unwrap();
+
+        assert_eq!(out.dtype(), DType::F16);
+        assert_eq!(out.dims(), &[1, 8]);
+    }
 }
