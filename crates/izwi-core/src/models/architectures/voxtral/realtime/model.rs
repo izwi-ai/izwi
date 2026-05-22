@@ -617,11 +617,18 @@ impl WhisperEncoder {
 
     /// Forward only conv layers (for realtime processing)
     pub fn forward_conv(&self, mel_features: &[Tensor]) -> Result<Tensor> {
+        if mel_features.is_empty() {
+            return Err(Error::InvalidInput(
+                "Voxtral realtime forward_conv requires at least one mel feature tensor"
+                    .to_string(),
+            ));
+        }
+
         let mut outputs = Vec::with_capacity(mel_features.len());
 
         for mel in mel_features {
             // mel: [n_mels, seq_len] -> [1, n_mels, seq_len]
-            let x = mel.unsqueeze(0)?.transpose(1, 2)?;
+            let x = prepare_realtime_conv_input(mel)?;
             let x = self.conv1.forward(&x)?;
             let x = gelu(&x)?;
             let x = self.conv2.forward(&x)?;
@@ -635,6 +642,11 @@ impl WhisperEncoder {
         let outputs_refs: Vec<&Tensor> = outputs.iter().collect();
         Tensor::cat(&outputs_refs, 1).map_err(|e| Error::InferenceError(e.to_string()))
     }
+}
+
+fn prepare_realtime_conv_input(mel: &Tensor) -> Result<Tensor> {
+    mel.dims2().map_err(Error::from)?;
+    mel.unsqueeze(0).map_err(Error::from)
 }
 
 /// Whisper encoder layer
@@ -938,6 +950,14 @@ fn text_delta(previous: &str, current: &str) -> String {
 }
 
 fn resample_audio(audio: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f32>> {
+    if from_rate == 0 || to_rate == 0 {
+        return Err(Error::InvalidInput(format!(
+            "Invalid audio sample rate for resampling: {from_rate} -> {to_rate}"
+        )));
+    }
+    if audio.is_empty() {
+        return Ok(Vec::new());
+    }
     if from_rate == to_rate {
         return Ok(audio.to_vec());
     }
@@ -1102,8 +1122,8 @@ fn gelu(x: &Tensor) -> Result<Tensor> {
 mod tests {
     use super::{
         argmax, build_voxtral_decode_cache, load_voxtral_runtime_config,
-        offline_streaming_padding_samples, select_voxtral_dtype, text_delta,
-        voxtral_dense_decode_max_tokens,
+        offline_streaming_padding_samples, prepare_realtime_conv_input, resample_audio,
+        select_voxtral_dtype, text_delta, voxtral_dense_decode_max_tokens,
     };
     use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile};
     use crate::models::shared::attention::paged::DEFAULT_KV_PAGE_SIZE;
@@ -1179,6 +1199,32 @@ mod tests {
     #[test]
     fn text_delta_preserves_word_boundary_space() {
         assert_eq!(text_delta("hello", "hello world"), " world");
+    }
+
+    #[test]
+    fn realtime_conv_input_keeps_mels_as_channels() {
+        let device = Device::Cpu;
+        let mel = Tensor::zeros((80, 7), DType::F32, &device).unwrap();
+
+        let conv_input = prepare_realtime_conv_input(&mel).unwrap();
+
+        assert_eq!(conv_input.dims(), &[1, 80, 7]);
+    }
+
+    #[test]
+    fn voxtral_resample_audio_handles_empty_input() {
+        assert_eq!(
+            resample_audio(&[], 48_000, 16_000).unwrap(),
+            Vec::<f32>::new()
+        );
+    }
+
+    #[test]
+    fn voxtral_resample_audio_rejects_zero_sample_rates() {
+        let err = resample_audio(&[0.0], 0, 16_000)
+            .expect_err("zero input sample rate should be rejected");
+
+        assert!(format!("{err}").contains("Invalid audio sample rate"));
     }
 
     #[test]
