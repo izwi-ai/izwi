@@ -13,7 +13,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -526,6 +526,7 @@ impl ModelDownloader {
             }
             ModelFamily::Voxtral => {
                 path.join("params.json").exists()
+                    && path.join("config.json").exists()
                     && path.join("tekken.json").exists()
                     && path.join("consolidated.safetensors").exists()
             }
@@ -1005,9 +1006,11 @@ impl ModelDownloader {
                 "added_tokens.json".to_string(),
                 "model.safetensors".to_string(),
             ],
-            ModelFamily::Qwen3Asr => vec![qwen_asr_gguf_filename(variant)
-                .expect("checked by qwen3-asr family")
-                .to_string()],
+            ModelFamily::Qwen3Asr => vec![
+                qwen_asr_gguf_filename(variant)
+                    .expect("checked by qwen3-asr family")
+                    .to_string(),
+            ],
             ModelFamily::SortformerDiarization => vec![
                 "diar_streaming_sortformer_4spk-v2.1.nemo".to_string(),
                 "README.md".to_string(),
@@ -1097,6 +1100,7 @@ impl ModelDownloader {
             }
             ModelFamily::Voxtral => vec![
                 "params.json".to_string(),
+                "config.json".to_string(),
                 "tekken.json".to_string(),
                 "consolidated.safetensors".to_string(),
             ],
@@ -1702,6 +1706,7 @@ mod tests {
             files,
             vec![
                 "params.json".to_string(),
+                "config.json".to_string(),
                 "tekken.json".to_string(),
                 "consolidated.safetensors".to_string(),
             ]
@@ -1716,6 +1721,7 @@ mod tests {
         let model_dir = downloader.model_path(variant);
         std::fs::create_dir_all(&model_dir).expect("model dir");
         std::fs::write(model_dir.join("params.json"), "{}").expect("params");
+        std::fs::write(model_dir.join("config.json"), "{}").expect("config");
         std::fs::write(model_dir.join("tekken.json"), "{}").expect("tekken");
         assert!(!downloader.is_downloaded(variant));
         std::fs::write(model_dir.join("consolidated.safetensors"), [0u8]).expect("weights");

@@ -7,7 +7,7 @@ use futures::stream::{self, StreamExt};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 use tracing::info;
 
 use crate::artifacts::ModelWeights;
@@ -582,6 +582,7 @@ mod tests {
         let model_dir = temp_dir.join(variant.dir_name());
         std::fs::create_dir_all(&model_dir).unwrap();
         std::fs::write(model_dir.join("params.json"), "{}").unwrap();
+        std::fs::write(model_dir.join("config.json"), "{}").unwrap();
         std::fs::write(model_dir.join("tekken.json"), "{}").unwrap();
         std::fs::write(model_dir.join("consolidated.safetensors"), [0u8]).unwrap();
 
