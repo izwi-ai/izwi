@@ -34,8 +34,38 @@ vi.mock("@/api", () => ({
   },
 }));
 
+const componentMocks = vi.hoisted(() => ({
+  routeModelModal: vi.fn(
+    ({
+      isOpen,
+      title,
+      zIndexClassName,
+      models = [],
+      sections = [],
+    }: {
+      isOpen: boolean;
+      title: string;
+      zIndexClassName?: string;
+      models?: ModelInfo[];
+      sections?: Array<{ title?: string; models: ModelInfo[] }>;
+    }) =>
+      isOpen ? (
+        <div
+          data-testid="route-model-modal"
+          data-z-index={zIndexClassName ?? ""}
+          data-models={models.map((model) => model.variant).join(",")}
+          data-sections={sections
+            .map((section) => section.title ?? "")
+            .join(",")}
+        >
+          {title}
+        </div>
+      ) : null,
+  ),
+}));
+
 vi.mock("@/features/models/components/RouteModelModal", () => ({
-  RouteModelModal: () => null,
+  RouteModelModal: componentMocks.routeModelModal,
 }));
 
 const baseModels: ModelInfo[] = [
@@ -209,6 +239,7 @@ describe("DiarizationPage routes", () => {
     apiMocks.deleteDiarizationRecord.mockReset();
     apiMocks.createDiarizationRecord.mockReset();
     apiMocks.diarizationRecordAudioUrl.mockReset();
+    componentMocks.routeModelModal.mockClear();
 
     apiMocks.listDiarizationRecords.mockResolvedValue([]);
     apiMocks.listDiarizationRecordPage.mockImplementation(async () => ({
@@ -597,6 +628,85 @@ describe("DiarizationPage routes", () => {
     expect(props.onLoad).toHaveBeenCalledWith("Qwen3.5-4B");
     expect(props.onDownload).toHaveBeenCalledWith("Whisper-Large-v3-Turbo");
     expect(props.onUnload).not.toHaveBeenCalled();
+  });
+
+  it("opens configured diarization models from the new modal readiness panel", async () => {
+    const props = createRouteProps({
+      models: [
+        {
+          variant: "diar_streaming_sortformer_4spk-v2.1",
+          status: "downloaded" as const,
+          local_path: "/models/diar",
+          size_bytes: null,
+          download_progress: null,
+          error_message: null,
+        },
+        {
+          variant: "Whisper-Large-v3-Turbo",
+          status: "not_downloaded" as const,
+          local_path: "/models/asr",
+          size_bytes: null,
+          download_progress: null,
+          error_message: null,
+        },
+        {
+          variant: "Qwen3-ForcedAligner-0.6B",
+          status: "ready" as const,
+          local_path: "/models/aligner",
+          size_bytes: null,
+          download_progress: null,
+          error_message: null,
+        },
+        {
+          variant: "Qwen3.5-4B",
+          status: "downloaded" as const,
+          local_path: "/models/llm",
+          size_bytes: null,
+          download_progress: null,
+          error_message: null,
+        },
+      ],
+      selectedModel: "diar_streaming_sortformer_4spk-v2.1",
+    });
+
+    renderRoute("/diarization", props);
+
+    await waitFor(() =>
+      expect(apiMocks.listDiarizationRecords).toHaveBeenCalledTimes(1),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
+
+    const loadButton = await screen.findByRole("button", {
+      name: "Load Models",
+    });
+    const openModelsButton = screen.getByRole("button", {
+      name: "Open Models",
+    });
+    expect(
+      loadButton.compareDocumentPosition(openModelsButton) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    fireEvent.click(openModelsButton);
+
+    const modelModal = await screen.findByTestId("route-model-modal");
+    expect(modelModal).toHaveTextContent("Diarization Models");
+    expect(modelModal).toHaveAttribute("data-z-index", "z-[70]");
+    expect(modelModal.getAttribute("data-models")).toContain(
+      "diar_streaming_sortformer_4spk-v2.1",
+    );
+    expect(modelModal.getAttribute("data-models")).toContain(
+      "Whisper-Large-v3-Turbo",
+    );
+    expect(modelModal.getAttribute("data-models")).toContain(
+      "Qwen3-ForcedAligner-0.6B",
+    );
+    expect(modelModal.getAttribute("data-models")).toContain("Qwen3.5-4B");
+    expect(modelModal.getAttribute("data-sections")).toBe(
+      "Diarization,ASR,Forced Aligner,Refiner + Summary",
+    );
+    expect(props.onError).not.toHaveBeenCalled();
   });
 
   it("shows unload only after the full diarization stack is ready", async () => {

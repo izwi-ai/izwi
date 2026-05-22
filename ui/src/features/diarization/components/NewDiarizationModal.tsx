@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   Loader2,
   Mic,
+  Settings2,
   Square,
   Upload,
 } from "lucide-react";
@@ -56,6 +57,7 @@ interface NewDiarizationModalProps {
   canLoadAnyManagedModels?: boolean;
   canUnloadAnyManagedModels?: boolean;
   isManagedModelActionBusy?: boolean;
+  onOpenModelManager: () => void;
   onLoadAllManagedModels: () => void;
   onUnloadAllManagedModels: () => void;
   onCreated: (record: DiarizationRecord) => Promise<void> | void;
@@ -84,6 +86,7 @@ export function NewDiarizationModal({
   canLoadAnyManagedModels = false,
   canUnloadAnyManagedModels = false,
   isManagedModelActionBusy = false,
+  onOpenModelManager,
   onLoadAllManagedModels,
   onUnloadAllManagedModels,
   onCreated,
@@ -683,6 +686,18 @@ export function NewDiarizationModal({
                       <Loader2 className="h-4 w-4 animate-spin" />
                     ) : null}
                     {readinessActionLabel}
+                  </Button>
+
+                  <Button
+                    type="button"
+                    variant="default"
+                    size="sm"
+                    className="mt-2 h-9 w-full gap-2"
+                    onClick={onOpenModelManager}
+                    disabled={isSubmitting || isRecording}
+                  >
+                    <Settings2 className="h-4 w-4" />
+                    Open Models
                   </Button>
                 </div>
               </div>

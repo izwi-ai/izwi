@@ -630,6 +630,7 @@ export function DiarizationPage({
             canLoadAnyManagedModels={canLoadAnyManagedModels}
             canUnloadAnyManagedModels={canUnloadAnyManagedModels}
             isManagedModelActionBusy={isManagedModelActionBusy}
+            onOpenModelManager={openModelManager}
             onLoadAllManagedModels={handleLoadAllManagedModels}
             onUnloadAllManagedModels={handleUnloadAllManagedModels}
             onCreated={handleCreatedRecord}
@@ -656,6 +657,7 @@ export function DiarizationPage({
         onDelete={onDelete}
         onUseModel={onSelect}
         emptyMessage="No diarization pipeline models available for this route."
+        zIndexClassName={isNewDiarizationModalOpen ? "z-[70]" : "z-50"}
       />
     </PageShell>
   );
