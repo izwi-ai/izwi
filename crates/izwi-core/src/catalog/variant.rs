@@ -640,6 +640,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_voxtral_repo_alias() {
+        let parsed = parse_model_variant("mistralai/Voxtral-Mini-4B-Realtime-2602").unwrap();
+        assert_eq!(parsed, ModelVariant::VoxtralMini4BRealtime2602);
+        assert_eq!(parsed.family(), ModelFamily::Voxtral);
+    }
+
+    #[test]
+    fn resolve_asr_accepts_voxtral_display_name() {
+        let resolved = resolve_asr_model_variant(Some("Voxtral-Mini-4B-Realtime-2602"));
+        assert_eq!(resolved, ModelVariant::VoxtralMini4BRealtime2602);
+    }
+
+    #[test]
+    fn resolve_asr_accepts_voxtral_family_alias() {
+        let resolved = resolve_asr_model_variant(Some("voxtral-mini"));
+        assert_eq!(resolved, ModelVariant::VoxtralMini4BRealtime2602);
+    }
+
+    #[test]
     fn resolve_asr_accepts_whisper_turbo() {
         let resolved = resolve_asr_model_variant(Some("whisper-large-v3-turbo"));
         assert_eq!(resolved, ModelVariant::WhisperLargeV3Turbo);

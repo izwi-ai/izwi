@@ -334,7 +334,18 @@ Multipart fields:
   ],
   "processing_time_ms": 812.4,
   "rtf": 0.23,
-  "izwi_asr_diagnostics": null
+  "izwi_asr_diagnostics": {
+    "model_family": "voxtral",
+    "execution": {
+      "device_kind": "Metal",
+      "dtype": "F32",
+      "cache": {
+        "page_size": 64,
+        "dense_decode_enabled": true,
+        "kv_quantization": "none"
+      }
+    }
+  }
 }
 ```
 
