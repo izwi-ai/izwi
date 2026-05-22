@@ -4,16 +4,34 @@
 //! which uses different tensor naming conventions (wq/wk/wv/wo, w1/w2/w3) and
 //! root-level layer structure compared to standard Qwen3.
 
-use candle_core::{DType, Device, Tensor};
-use candle_nn::{Embedding, Linear, Module, RmsNorm, VarBuilder, ops};
+use candle_core::{Device, Tensor};
+use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::core::{
-    Qwen3Cache, Qwen3Config, build_mrope_cache, build_rope_cache, causal_mask,
-    dense_decode_attention, repeat_kv,
+    build_mrope_cache, build_rope_cache, causal_mask, dense_decode_attention, repeat_kv,
+    Qwen3Cache, Qwen3Config,
 };
 use crate::models::shared::attention::flash::try_fused_self_attention;
 use crate::models::shared::attention::paged::paged_decode_attention;
+
+const EMBEDDING_WEIGHT_CANDIDATES: &[&str] = &[
+    "embed_tokens.weight",
+    "tok_embeddings.weight",
+    "model.embed_tokens.weight",
+    "language_model.embed_tokens.weight",
+    "language_model.model.embed_tokens.weight",
+    "mm_streams_embeddings.embedding_module.tok_embeddings.weight",
+];
+
+const LM_HEAD_WEIGHT_CANDIDATES: &[&str] = &[
+    "lm_head.weight",
+    "output.weight",
+    "model.lm_head.weight",
+    "model.output.weight",
+    "language_model.lm_head.weight",
+    "language_model.output.weight",
+];
 
 pub struct VoxtralLM {
     embed_tokens: Embedding,
@@ -55,18 +73,7 @@ struct VoxtralMlp {
 
 impl VoxtralLM {
     pub fn load(cfg: Qwen3Config, vb: VarBuilder) -> Result<Self> {
-        // For Voxtral, embeddings are provided by the audio projection + text projection
-        // We create placeholder embeddings that will be overridden by custom embeddings
-        let embed_tokens =
-            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))
-                .unwrap_or_else(|_| {
-                    candle_nn::embedding(
-                        cfg.vocab_size,
-                        cfg.hidden_size,
-                        VarBuilder::zeros(DType::F32, vb.device()),
-                    )
-                    .unwrap()
-                });
+        let embed_tokens = load_embedding_from_candidates(&vb, &cfg)?;
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for idx in 0..cfg.num_hidden_layers {
@@ -76,15 +83,7 @@ impl VoxtralLM {
 
         let norm = candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))?;
 
-        let lm_head = candle_nn::linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))
-            .unwrap_or_else(|_| {
-                candle_nn::linear_no_bias(
-                    cfg.hidden_size,
-                    cfg.vocab_size,
-                    VarBuilder::zeros(DType::F32, vb.device()),
-                )
-                .unwrap()
-            });
+        let lm_head = load_lm_head_from_candidates(&vb, &cfg)?;
 
         let use_mrope = cfg
             .rope_scaling
@@ -143,6 +142,36 @@ impl VoxtralLM {
         let logits = self.lm_head.forward(&x)?;
         Ok(logits)
     }
+}
+
+fn load_embedding_from_candidates(vb: &VarBuilder, cfg: &Qwen3Config) -> Result<Embedding> {
+    let root = vb.root();
+    for candidate in EMBEDDING_WEIGHT_CANDIDATES {
+        if root.contains_tensor(candidate) {
+            let embeddings = root.get((cfg.vocab_size, cfg.hidden_size), candidate)?;
+            return Ok(Embedding::new(embeddings, cfg.hidden_size));
+        }
+    }
+
+    Err(Error::ModelLoadError(format!(
+        "Voxtral checkpoint is missing token embedding weights; tried {}",
+        EMBEDDING_WEIGHT_CANDIDATES.join(", ")
+    )))
+}
+
+fn load_lm_head_from_candidates(vb: &VarBuilder, cfg: &Qwen3Config) -> Result<Linear> {
+    let root = vb.root();
+    for candidate in LM_HEAD_WEIGHT_CANDIDATES {
+        if root.contains_tensor(candidate) {
+            let weight = root.get((cfg.vocab_size, cfg.hidden_size), candidate)?;
+            return Ok(Linear::new(weight, None));
+        }
+    }
+
+    Err(Error::ModelLoadError(format!(
+        "Voxtral checkpoint is missing LM head weights; tried {}",
+        LM_HEAD_WEIGHT_CANDIDATES.join(", ")
+    )))
 }
 
 impl VoxtralLayer {
@@ -469,7 +498,24 @@ impl VoxtralMlp {
 mod tests {
     use super::*;
     use crate::models::shared::attention::paged::KvCacheQuantization;
-    use candle_core::D;
+    use candle_core::{DType, D};
+    use std::collections::HashMap;
+
+    fn tiny_cfg() -> Qwen3Config {
+        Qwen3Config {
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_attention_heads: 2,
+            num_hidden_layers: 0,
+            num_key_value_heads: 1,
+            head_dim: Some(2),
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            vocab_size: 3,
+            lm_head_size: None,
+            rope_scaling: None,
+        }
+    }
 
     fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
         let a = a
@@ -489,6 +535,51 @@ mod tests {
         a.iter()
             .zip(b.iter())
             .fold(0.0f32, |max, (left, right)| max.max((left - right).abs()))
+    }
+
+    #[test]
+    fn voxtral_lm_loads_mistral_embedding_and_output_aliases() {
+        let device = Device::Cpu;
+        let cfg = tiny_cfg();
+        let embed_weight = Tensor::from_vec(
+            (0..12).map(|v| v as f32).collect::<Vec<_>>(),
+            (3, 4),
+            &device,
+        )
+        .unwrap();
+        let output_weight = Tensor::from_vec(
+            (0..12).map(|v| (v as f32) / 10.0).collect::<Vec<_>>(),
+            (3, 4),
+            &device,
+        )
+        .unwrap();
+        let vb = VarBuilder::from_tensors(
+            HashMap::from([
+                ("tok_embeddings.weight".to_string(), embed_weight.clone()),
+                ("output.weight".to_string(), output_weight.clone()),
+            ]),
+            DType::F32,
+            &device,
+        );
+
+        let embeddings = load_embedding_from_candidates(&vb, &cfg).unwrap();
+        let head = load_lm_head_from_candidates(&vb, &cfg).unwrap();
+
+        assert_eq!(embeddings.embeddings().dims(), &[3, 4]);
+        assert_eq!(head.weight().dims(), &[3, 4]);
+    }
+
+    #[test]
+    fn voxtral_lm_missing_embedding_or_head_is_loader_error() {
+        let device = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vb = VarBuilder::from_tensors(HashMap::new(), DType::F32, &device);
+
+        let embed_err = load_embedding_from_candidates(&vb, &cfg).unwrap_err();
+        let head_err = load_lm_head_from_candidates(&vb, &cfg).unwrap_err();
+
+        assert!(format!("{embed_err}").contains("missing token embedding weights"));
+        assert!(format!("{head_err}").contains("missing LM head weights"));
     }
 
     #[test]
