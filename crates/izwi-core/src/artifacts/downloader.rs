@@ -1693,4 +1693,33 @@ mod tests {
         assert!(downloader.is_downloaded(variant));
         std::fs::remove_dir_all(temp_dir).ok();
     }
+
+    #[test]
+    fn voxtral_model_files_include_required_mistral_assets() {
+        let (downloader, temp_dir) = test_downloader();
+        let files = downloader.get_model_files(ModelVariant::VoxtralMini4BRealtime2602);
+        assert_eq!(
+            files,
+            vec![
+                "params.json".to_string(),
+                "tekken.json".to_string(),
+                "consolidated.safetensors".to_string(),
+            ]
+        );
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn voxtral_is_downloaded_only_when_required_mistral_assets_exist() {
+        let (downloader, temp_dir) = test_downloader();
+        let variant = ModelVariant::VoxtralMini4BRealtime2602;
+        let model_dir = downloader.model_path(variant);
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+        std::fs::write(model_dir.join("params.json"), "{}").expect("params");
+        std::fs::write(model_dir.join("tekken.json"), "{}").expect("tekken");
+        assert!(!downloader.is_downloaded(variant));
+        std::fs::write(model_dir.join("consolidated.safetensors"), [0u8]).expect("weights");
+        assert!(downloader.is_downloaded(variant));
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
 }

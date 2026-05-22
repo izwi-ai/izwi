@@ -34,6 +34,7 @@ Those endpoints only show variants that are enabled for download/use.
 | `Qwen3-ASR-0.6B-GGUF` | Smaller Qwen3 ASR |
 | `Qwen3-ASR-1.7B-GGUF` | Higher-accuracy Qwen3 ASR |
 | `LFM2.5-Audio-1.5B-GGUF` | Unified audio model (ASR + speech generation) |
+| `Voxtral-Mini-4B-Realtime-2602` | Mistral Voxtral offline transcription; realtime support planned |
 
 ### Diarization and Alignment
 
@@ -58,7 +59,6 @@ These variants exist in the catalog but are not currently enabled for standard l
 - Legacy Qwen3 chat IDs: `Qwen3-0.6B`, `Qwen3-0.6B-4bit`, `Qwen3-1.7B`, `Qwen3-1.7B-4bit`
 - `Qwen3-14B-GGUF`
 - `Gemma-3-4b-it`
-- `Voxtral-Mini-4B-Realtime-2602`
 
 ---
 
