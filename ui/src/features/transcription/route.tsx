@@ -44,6 +44,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { Settings2 } from "lucide-react";
 
 const TRANSCRIPTION_PREFERRED_SUMMARY_MODELS = ["Qwen3.5-4B"] as const;
+type ModelModalContext = "transcription" | "diarization";
 
 interface TranscriptionPageProps {
   models: ModelInfo[];
@@ -87,6 +88,8 @@ export function TranscriptionPage({
   >(null);
   const [streamingRecord, setStreamingRecord] =
     useState<TranscriptionRecord | null>(null);
+  const [modelModalContext, setModelModalContext] =
+    useState<ModelModalContext>("transcription");
   const viewConfig = VIEW_CONFIGS.transcription;
   const transcriptionAlignerModels = useMemo(
     () => filterAndSortModels(models, isTranscriptionAlignerVariant),
@@ -291,7 +294,7 @@ export function TranscriptionPage({
   const isDiarizationManagedModelActionBusy = diarizationManagedModels.some(
     (model) => model.status === "loading" || model.status === "downloading",
   );
-  const modelSections = useMemo(
+  const transcriptionModelSections = useMemo(
     () => [
       {
         key: "asr",
@@ -315,6 +318,41 @@ export function TranscriptionPage({
       },
     ],
     [transcriptionAlignerModels, transcriptionModels, transcriptionSummaryModels],
+  );
+  const diarizationModelSections = useMemo(
+    () => [
+      {
+        key: "diarization",
+        title: "Diarization",
+        description: "Speaker segmentation model used by this route.",
+        models: diarizationModels,
+      },
+      {
+        key: "asr",
+        title: "ASR",
+        description: "Transcript generation model in the diarization pipeline.",
+        models: diarizationAsrPipelineModels,
+      },
+      {
+        key: "aligner",
+        title: "Forced Aligner",
+        description: "Word timing alignment model for speaker attribution.",
+        models: diarizationAlignerPipelineModels,
+      },
+      {
+        key: "llm",
+        title: "Refiner + Summary",
+        description:
+          "LLM used for transcript refinement and diarization summaries.",
+        models: diarizationLlmPipelineModels,
+      },
+    ],
+    [
+      diarizationAlignerPipelineModels,
+      diarizationAsrPipelineModels,
+      diarizationLlmPipelineModels,
+      diarizationModels,
+    ],
   );
   const {
     records,
@@ -357,9 +395,17 @@ export function TranscriptionPage({
     }
   }, [record, streamingRecord]);
 
-  const handleOpenModels = useCallback(() => {
+  const openTranscriptionModelManager = useCallback(() => {
+    setModelModalContext("transcription");
     openModelManager();
   }, [openModelManager]);
+  const openDiarizationModelManager = useCallback(() => {
+    setModelModalContext("diarization");
+    openModelManager();
+  }, [openModelManager]);
+  const handleOpenModels = useCallback(() => {
+    openTranscriptionModelManager();
+  }, [openTranscriptionModelManager]);
   const handleOpenNewTranscriptionModal = useCallback(() => {
     setNewSpeechTextMode("transcription");
     setIsNewTranscriptionModalOpen(true);
@@ -426,7 +472,7 @@ export function TranscriptionPage({
       return;
     }
     if (!summaryModelReady) {
-      openModelManager();
+      openTranscriptionModelManager();
       setRecordSummaryRefreshError(summaryModelRequirementMessage);
       onError(summaryModelRequirementMessage);
       return;
@@ -450,7 +496,7 @@ export function TranscriptionPage({
     }
   }, [
     onError,
-    openModelManager,
+    openTranscriptionModelManager,
     recordId,
     recordSummaryRefreshPending,
     refreshRecord,
@@ -468,6 +514,15 @@ export function TranscriptionPage({
   const detailAudioUrl = useMemo(
     () => (recordId ? api.transcriptionRecordAudioUrl(recordId) : null),
     [recordId],
+  );
+  const isDiarizationModelModal = modelModalContext === "diarization";
+  const transcriptionModalModels = useMemo(
+    () => [
+      ...transcriptionModels,
+      ...transcriptionAlignerModels,
+      ...transcriptionSummaryModels,
+    ],
+    [transcriptionAlignerModels, transcriptionModels, transcriptionSummaryModels],
   );
   const timestampAlignerReady = useMemo(
     () =>
@@ -680,15 +735,14 @@ export function TranscriptionPage({
                       timestampAlignerModelId={resolvedAlignerModel}
                       timestampAlignerReady={timestampAlignerReady}
                       timestampAlignerModelStatus={selectedAlignerModelStatus}
-                      onOpenModelManager={() => {
-                        openModelManager();
-                      }}
+                      onOpenModelManager={openTranscriptionModelManager}
                       onModelRequired={() => {
+                        setModelModalContext("transcription");
                         requestModel();
                         onError("Select and load an ASR model to start transcribing.");
                       }}
                       onTimestampAlignerRequired={() => {
-                        openModelManager();
+                        openTranscriptionModelManager();
                         onError("Load the timestamp aligner model to enable timestamps.");
                       }}
                       onCreated={async (createdRecord: TranscriptionRecord) => {
@@ -748,6 +802,7 @@ export function TranscriptionPage({
                       canLoadAnyManagedModels={canLoadAnyDiarizationManagedModels}
                       canUnloadAnyManagedModels={canUnloadAnyDiarizationManagedModels}
                       isManagedModelActionBusy={isDiarizationManagedModelActionBusy}
+                      onOpenModelManager={openDiarizationModelManager}
                       onLoadAllManagedModels={handleLoadAllDiarizationManagedModels}
                       onUnloadAllManagedModels={handleUnloadAllDiarizationManagedModels}
                       onCreated={handleCreatedDiarizationRecord}
@@ -763,16 +818,20 @@ export function TranscriptionPage({
       <RouteModelModal
         isOpen={isModelModalOpen}
         onClose={closeModelModal}
-        title="Transcription Models"
-        description="Manage ASR models, the optional timestamp aligner, and the summary model for this route."
-        models={[
-          ...transcriptionModels,
-          ...transcriptionAlignerModels,
-          ...transcriptionSummaryModels,
-        ]}
+        title={
+          isDiarizationModelModal ? "Diarization Models" : "Transcription Models"
+        }
+        description={
+          isDiarizationModelModal
+            ? "Manage diarization pipeline models for /v1/diarizations."
+            : "Manage ASR models, the optional timestamp aligner, and the summary model for this route."
+        }
+        models={
+          isDiarizationModelModal ? diarizationPipelineModels : transcriptionModalModels
+        }
         loading={loading}
-        selectedVariant={resolvedSelectedModel}
-        intentVariant={intentVariant}
+        selectedVariant={isDiarizationModelModal ? null : resolvedSelectedModel}
+        intentVariant={isDiarizationModelModal ? null : intentVariant}
         downloadProgress={downloadProgress}
         onDownload={onDownload}
         onCancelDownload={onCancelDownload}
@@ -780,11 +839,23 @@ export function TranscriptionPage({
         onUnload={onUnload}
         onDelete={onDelete}
         onUseModel={onSelect}
-        emptyMessage="No transcription models available for this route."
-        sections={modelSections}
-        canUseModel={(variant) =>
-          transcriptionModels.some((model) => model.variant === variant)
+        emptyMessage={
+          isDiarizationModelModal
+            ? "No diarization pipeline models available for this route."
+            : "No transcription models available for this route."
         }
+        sections={
+          isDiarizationModelModal
+            ? diarizationModelSections
+            : transcriptionModelSections
+        }
+        canUseModel={
+          isDiarizationModelModal
+            ? undefined
+            : (variant) =>
+                transcriptionModels.some((model) => model.variant === variant)
+        }
+        selectionMode={isDiarizationModelModal ? "manage" : "route"}
         zIndexClassName={
           isNewTranscriptionModalOpen ? "z-[70]" : "z-50"
         }
