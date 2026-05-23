@@ -30,6 +30,7 @@ use crate::models::architectures::qwen35::chat::{
 };
 use crate::models::architectures::sortformer::diarization::SortformerDiarizerModel;
 use crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel;
+use crate::models::architectures::voxtral::tts::VoxtralTtsModel;
 use crate::models::architectures::whisper::asr::{
     AsrTranscriptionOutput as WhisperAsrTranscriptionOutput, WhisperTurboAsrModel,
 };
@@ -41,6 +42,7 @@ type AudioChatLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<Native
 type ChatLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeChatModel>;
 type DiarizationLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeDiarizationModel>;
 type VoxtralLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VoxtralRealtimeModel>;
+type VoxtralTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VoxtralTtsModel>;
 type QwenTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile, usize, &str) -> Result<Qwen3TtsModel>;
 type KokoroLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<KokoroTtsModel>;
 
@@ -72,6 +74,12 @@ struct VoxtralLoaderRegistration {
     name: &'static str,
     family: ModelFamily,
     loader: VoxtralLoaderFn,
+}
+
+struct VoxtralTtsLoaderRegistration {
+    name: &'static str,
+    family: ModelFamily,
+    loader: VoxtralTtsLoaderFn,
 }
 
 struct QwenTtsLoaderRegistration {
@@ -194,6 +202,14 @@ fn load_voxtral_model(
     VoxtralRealtimeModel::load(model_dir, device)
 }
 
+fn load_voxtral_tts_model(
+    model_dir: &Path,
+    _variant: ModelVariant,
+    device: DeviceProfile,
+) -> Result<VoxtralTtsModel> {
+    VoxtralTtsModel::load(model_dir, device)
+}
+
 fn load_qwen_tts_model(
     model_dir: &Path,
     _variant: ModelVariant,
@@ -277,6 +293,13 @@ const VOXTRAL_LOADER_REGISTRY: &[VoxtralLoaderRegistration] = &[VoxtralLoaderReg
     loader: load_voxtral_model,
 }];
 
+const VOXTRAL_TTS_LOADER_REGISTRY: &[VoxtralTtsLoaderRegistration] =
+    &[VoxtralTtsLoaderRegistration {
+        name: "voxtral_tts",
+        family: ModelFamily::VoxtralTts,
+        loader: load_voxtral_tts_model,
+    }];
+
 const QWEN_TTS_LOADER_REGISTRY: &[QwenTtsLoaderRegistration] = &[QwenTtsLoaderRegistration {
     name: "qwen3_tts",
     family: ModelFamily::Qwen3Tts,
@@ -337,6 +360,15 @@ fn resolve_voxtral_loader_registration(
 ) -> Option<&'static VoxtralLoaderRegistration> {
     let family = variant.family();
     VOXTRAL_LOADER_REGISTRY
+        .iter()
+        .find(|registration| registration.family == family)
+}
+
+fn resolve_voxtral_tts_loader_registration(
+    variant: ModelVariant,
+) -> Option<&'static VoxtralTtsLoaderRegistration> {
+    let family = variant.family();
+    VOXTRAL_TTS_LOADER_REGISTRY
         .iter()
         .find(|registration| registration.family == family)
 }
@@ -912,6 +944,7 @@ pub struct ModelRegistry {
         Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<NativeDiarizationModel>>>>>>,
     chat_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<NativeChatModel>>>>>>,
     voxtral_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<VoxtralRealtimeModel>>>>>>,
+    voxtral_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<VoxtralTtsModel>>>>>>,
     qwen_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<Qwen3TtsModel>>>>>>,
     kokoro_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<KokoroTtsModel>>>>>>,
 }
@@ -933,6 +966,7 @@ impl ModelRegistry {
             diarization_models: Arc::new(RwLock::new(HashMap::new())),
             chat_models: Arc::new(RwLock::new(HashMap::new())),
             voxtral_models: Arc::new(RwLock::new(HashMap::new())),
+            voxtral_tts_models: Arc::new(RwLock::new(HashMap::new())),
             qwen_tts_models: Arc::new(RwLock::new(HashMap::new())),
             kokoro_models: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -1205,6 +1239,45 @@ impl ModelRegistry {
         Ok(model.clone())
     }
 
+    pub async fn load_voxtral_tts(
+        &self,
+        variant: ModelVariant,
+        model_dir: &Path,
+    ) -> Result<Arc<VoxtralTtsModel>> {
+        let registration = resolve_voxtral_tts_loader_registration(variant).ok_or_else(|| {
+            Error::InvalidInput(format!("Unsupported Voxtral TTS model variant: {variant}"))
+        })?;
+
+        let cell = {
+            let mut guard = self.voxtral_tts_models.write().await;
+            guard
+                .entry(variant)
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+
+        info!(
+            "Loading Voxtral TTS model {variant} ({}) from {model_dir:?}",
+            registration.name
+        );
+
+        let model = cell
+            .get_or_try_init({
+                let model_dir = model_dir.to_path_buf();
+                let device = self.device.clone();
+                let loader = registration.loader;
+                move || async move {
+                    tokio::task::spawn_blocking(move || loader(&model_dir, variant, device))
+                        .await
+                        .map_err(|e| Error::ModelLoadError(e.to_string()))?
+                        .map(Arc::new)
+                }
+            })
+            .await?;
+
+        Ok(model.clone())
+    }
+
     pub async fn load_kokoro(
         &self,
         variant: ModelVariant,
@@ -1300,6 +1373,16 @@ impl ModelRegistry {
         guard.get(&variant).and_then(|cell| cell.get().cloned())
     }
 
+    pub async fn get_voxtral_tts(&self, variant: ModelVariant) -> Option<Arc<VoxtralTtsModel>> {
+        let guard = self.voxtral_tts_models.read().await;
+        guard.get(&variant).and_then(|cell| cell.get().cloned())
+    }
+
+    pub fn try_get_voxtral_tts(&self, variant: ModelVariant) -> Option<Arc<VoxtralTtsModel>> {
+        let guard = self.voxtral_tts_models.try_read().ok()?;
+        guard.get(&variant).and_then(|cell| cell.get().cloned())
+    }
+
     pub async fn get_qwen_tts(&self, variant: ModelVariant) -> Option<Arc<Qwen3TtsModel>> {
         let guard = self.qwen_tts_models.read().await;
         guard.get(&variant).and_then(|cell| cell.get().cloned())
@@ -1342,6 +1425,11 @@ impl ModelRegistry {
 
     pub async fn unload_voxtral(&self, variant: ModelVariant) {
         let mut guard = self.voxtral_models.write().await;
+        guard.remove(&variant);
+    }
+
+    pub async fn unload_voxtral_tts(&self, variant: ModelVariant) {
+        let mut guard = self.voxtral_tts_models.write().await;
         guard.remove(&variant);
     }
 

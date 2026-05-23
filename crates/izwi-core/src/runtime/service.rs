@@ -346,6 +346,14 @@ impl RuntimeService {
                     .ok_or_else(|| Error::InferenceError("No TTS model loaded".to_string()))?;
                 model.available_speakers()
             }
+            crate::catalog::ModelFamily::VoxtralTts => {
+                let model = self
+                    .model_registry
+                    .get_voxtral_tts(variant)
+                    .await
+                    .ok_or_else(|| Error::InferenceError("No TTS model loaded".to_string()))?;
+                Ok(model.available_speakers())
+            }
             crate::catalog::ModelFamily::Lfm25Audio => Ok(
                 crate::models::architectures::lfm25_audio::LFM25_AUDIO_BUILT_IN_SPEAKERS
                     .iter()

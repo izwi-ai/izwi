@@ -49,6 +49,7 @@ impl RuntimeService {
                 self.clear_active_tts_variant(variant).await;
             }
             ModelFamily::VoxtralTts => {
+                self.model_registry.unload_voxtral_tts(variant).await;
                 self.clear_active_tts_variant(variant).await;
             }
             ModelFamily::Tokenizer => {
