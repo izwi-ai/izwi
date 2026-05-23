@@ -585,6 +585,39 @@ mod tests {
         assert!(frames_to_codebooks(vec![vec![1], vec![1, 2]]).is_err());
     }
 
+    #[test]
+    #[ignore = "requires IZWI_VOXTRAL_TTS_SMOKE_MODEL_DIR pointing at a full Voxtral TTS checkpoint"]
+    fn voxtral_tts_local_generate_smoke_if_env_set() {
+        let model_dir = std::env::var("IZWI_VOXTRAL_TTS_SMOKE_MODEL_DIR")
+            .map(PathBuf::from)
+            .expect("set IZWI_VOXTRAL_TTS_SMOKE_MODEL_DIR to run the local Voxtral TTS smoke");
+        let max_frames = std::env::var("IZWI_VOXTRAL_TTS_SMOKE_MAX_FRAMES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(4)
+            .max(1);
+        let model = VoxtralTtsModel::load(&model_dir, DeviceProfile::cpu()).unwrap();
+        let output = model
+            .generate_with_voice(
+                "Testing Voxtral TTS.",
+                "casual_male",
+                VoxtralTtsGenerationParams {
+                    max_frames,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(output.sample_rate, 24_000);
+        assert!(output.frames_generated > 0);
+        assert_eq!(
+            output.samples.len(),
+            output.frames_generated * model.codec_config.downsample_factor().unwrap()
+        );
+        assert!(output.samples.iter().all(|sample| sample.is_finite()));
+        assert!(output.samples.iter().any(|sample| sample.abs() > 1e-6));
+    }
+
     fn tiny_audio_embedding_config() -> VoxtralTtsConfig {
         let mut value: serde_json::Value = serde_json::from_str(fixture_json()).unwrap();
         let audio = &mut value["multimodal"]["audio_model_args"];
