@@ -15,6 +15,8 @@ use crate::models::architectures::qwen3::core::{
 use crate::models::shared::attention::flash::try_fused_self_attention;
 use crate::models::shared::attention::paged::paged_decode_attention;
 
+use super::layers::linear_forward_last_dim;
+
 const EMBEDDING_WEIGHT_CANDIDATES: &[&str] = &[
     "embed_tokens.weight",
     "tok_embeddings.weight",
@@ -164,7 +166,7 @@ impl VoxtralLM {
     }
 
     pub fn logits_from_hidden(&self, hidden: &Tensor) -> Result<Tensor> {
-        self.lm_head.forward(hidden).map_err(Error::from)
+        linear_forward_last_dim(&self.lm_head, hidden)
     }
 }
 
@@ -234,9 +236,14 @@ impl VoxtralLayer {
         t_cond: Option<&Tensor>,
     ) -> Result<Tensor> {
         let normed = self.input_layernorm.forward(x)?;
-        let attn_out =
-            self.self_attn
-                .forward(&normed, start_pos, position_ids, cache, layer_idx)?;
+        let attn_out = self
+            .self_attn
+            .forward(&normed, start_pos, position_ids, cache, layer_idx)
+            .map_err(|err| {
+                Error::InferenceError(format!(
+                    "Voxtral LM layer {layer_idx} attention failed: {err}"
+                ))
+            })?;
         let x = x.broadcast_add(&attn_out)?;
 
         let mut normed = self.post_attention_layernorm.forward(&x)?;
@@ -254,7 +261,11 @@ impl VoxtralLayer {
             let scale = scale.broadcast_add(&one)?;
             normed = normed.broadcast_mul(&scale)?;
         }
-        let mlp_out = self.mlp.forward(&normed)?;
+        let mlp_out = self.mlp.forward(&normed).map_err(|err| {
+            Error::InferenceError(format!(
+                "Voxtral LM layer {layer_idx} feed-forward failed: {err}"
+            ))
+        })?;
         let x = x.broadcast_add(&mlp_out)?;
         Ok(x)
     }
@@ -324,18 +335,24 @@ impl VoxtralAttention {
         let bsz = x.dim(0)?;
         let seq_len = x.dim(1)?;
 
-        let mut q =
-            self.q_proj
-                .forward(x)?
-                .reshape((bsz, seq_len, self.num_heads, self.head_dim))?;
-        let mut k =
-            self.k_proj
-                .forward(x)?
-                .reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
-        let v =
-            self.v_proj
-                .forward(x)?
-                .reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
+        let mut q = linear_forward_last_dim(&self.q_proj, x)?.reshape((
+            bsz,
+            seq_len,
+            self.num_heads,
+            self.head_dim,
+        ))?;
+        let mut k = linear_forward_last_dim(&self.k_proj, x)?.reshape((
+            bsz,
+            seq_len,
+            self.num_kv_heads,
+            self.head_dim,
+        ))?;
+        let v = linear_forward_last_dim(&self.v_proj, x)?.reshape((
+            bsz,
+            seq_len,
+            self.num_kv_heads,
+            self.head_dim,
+        ))?;
 
         q = self.apply_qk_norm(q, &self.q_norm, self.num_heads, seq_len)?;
         k = self.apply_qk_norm(k, &self.k_norm, self.num_kv_heads, seq_len)?;
@@ -357,7 +374,7 @@ impl VoxtralAttention {
                         self.head_dim,
                     )?;
                     let out = out.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
-                    return self.o_proj.forward(&out).map_err(Error::from);
+                    return linear_forward_last_dim(&self.o_proj, &out);
                 }
 
                 if let Some((k_pages, v_pages)) = cache.pages(layer_idx) {
@@ -370,7 +387,7 @@ impl VoxtralAttention {
                         self.head_dim,
                     )?;
                     let out = out.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
-                    return self.o_proj.forward(&out).map_err(Error::from);
+                    return linear_forward_last_dim(&self.o_proj, &out);
                 }
             }
 
@@ -397,7 +414,7 @@ impl VoxtralAttention {
                     seq_len,
                     self.num_heads * self.head_dim,
                 ))?;
-                let out = self.o_proj.forward(&out)?;
+                let out = linear_forward_last_dim(&self.o_proj, &out)?;
                 return Ok(out);
             }
         }
@@ -439,7 +456,7 @@ impl VoxtralAttention {
             .transpose(1, 2)?
             .reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
 
-        let out = self.o_proj.forward(&out)?;
+        let out = linear_forward_last_dim(&self.o_proj, &out)?;
         Ok(out)
     }
 
@@ -615,11 +632,11 @@ impl VoxtralMlp {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = self.gate_proj.forward(x)?;
-        let up = self.up_proj.forward(x)?;
+        let gate = linear_forward_last_dim(&self.gate_proj, x)?;
+        let up = linear_forward_last_dim(&self.up_proj, x)?;
         let act = ops::silu(&gate)?;
         let hidden = act.broadcast_mul(&up)?;
-        let out = self.down_proj.forward(&hidden)?;
+        let out = linear_forward_last_dim(&self.down_proj, &hidden)?;
         Ok(out)
     }
 }
