@@ -168,11 +168,14 @@ curl -X POST http://localhost:8080/v1/audio/speech \
 | `Qwen3-TTS-12Hz-1.7B-Base` | ~4.2 GB | Better | Medium |
 | `Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit` | ~1.6 GB | Good | Fast |
 | `Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit` | ~2.2 GB | Better | Medium |
+| `Voxtral-4B-TTS-2603` | ~8.1 GB | Better | Medium |
 
 For reference-audio cloning, use **Base** variants.  
 For built-in voice presets, use **CustomVoice** variants.  
 For prompt-based voice design, use **VoiceDesign** variants.
 `Kokoro-82M` requires `espeak-ng` to be installed separately.
+`Voxtral-4B-TTS-2603` supports 20 preset voices and emits 24 kHz audio. Its
+model and bundled voice assets inherit a CC BY-NC 4.0 license.
 
 ---
 

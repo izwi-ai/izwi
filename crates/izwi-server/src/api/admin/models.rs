@@ -30,6 +30,7 @@ pub struct AdminModelsResponse {
 pub struct AdminModelInfo {
     pub variant: String,
     pub enabled: bool,
+    pub license: Option<String>,
     pub status: String,
     pub local_path: Option<String>,
     pub size_bytes: Option<u64>,
@@ -101,6 +102,7 @@ impl From<ModelInfo> for AdminModelInfo {
         Self {
             variant: variant.dir_name().to_string(),
             enabled: info.enabled,
+            license: variant.license_label().map(str::to_string),
             status: model_status_as_str(info.status).to_string(),
             local_path: info
                 .local_path

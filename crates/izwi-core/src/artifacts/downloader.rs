@@ -13,7 +13,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{broadcast, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -73,6 +73,29 @@ fn lfm25_audio_gguf_filenames(variant: ModelVariant) -> Option<[&'static str; 4]
         _ => None,
     }
 }
+
+const VOXTRAL_TTS_VOICE_EMBEDDINGS: &[&str] = &[
+    "voice_embedding/ar_male.pt",
+    "voice_embedding/casual_female.pt",
+    "voice_embedding/casual_male.pt",
+    "voice_embedding/cheerful_female.pt",
+    "voice_embedding/de_female.pt",
+    "voice_embedding/de_male.pt",
+    "voice_embedding/es_female.pt",
+    "voice_embedding/es_male.pt",
+    "voice_embedding/fr_female.pt",
+    "voice_embedding/fr_male.pt",
+    "voice_embedding/hi_female.pt",
+    "voice_embedding/hi_male.pt",
+    "voice_embedding/it_female.pt",
+    "voice_embedding/it_male.pt",
+    "voice_embedding/neutral_female.pt",
+    "voice_embedding/neutral_male.pt",
+    "voice_embedding/nl_female.pt",
+    "voice_embedding/nl_male.pt",
+    "voice_embedding/pt_female.pt",
+    "voice_embedding/pt_male.pt",
+];
 
 #[derive(Debug, Deserialize)]
 struct HfRepoTreeEntry {
@@ -529,6 +552,14 @@ impl ModelDownloader {
                     && path.join("config.json").exists()
                     && path.join("tekken.json").exists()
                     && path.join("consolidated.safetensors").exists()
+            }
+            ModelFamily::VoxtralTts => {
+                path.join("params.json").exists()
+                    && path.join("tekken.json").exists()
+                    && path.join("consolidated.safetensors").exists()
+                    && VOXTRAL_TTS_VOICE_EMBEDDINGS
+                        .iter()
+                        .all(|file| path.join(file).exists())
             }
             ModelFamily::Tokenizer => {
                 path.join("tokenizer.json").exists() || path.join("vocab.json").exists()
@@ -1006,11 +1037,9 @@ impl ModelDownloader {
                 "added_tokens.json".to_string(),
                 "model.safetensors".to_string(),
             ],
-            ModelFamily::Qwen3Asr => vec![
-                qwen_asr_gguf_filename(variant)
-                    .expect("checked by qwen3-asr family")
-                    .to_string(),
-            ],
+            ModelFamily::Qwen3Asr => vec![qwen_asr_gguf_filename(variant)
+                .expect("checked by qwen3-asr family")
+                .to_string()],
             ModelFamily::SortformerDiarization => vec![
                 "diar_streaming_sortformer_4spk-v2.1.nemo".to_string(),
                 "README.md".to_string(),
@@ -1104,6 +1133,19 @@ impl ModelDownloader {
                 "tekken.json".to_string(),
                 "consolidated.safetensors".to_string(),
             ],
+            ModelFamily::VoxtralTts => {
+                let mut files = vec![
+                    "params.json".to_string(),
+                    "tekken.json".to_string(),
+                    "consolidated.safetensors".to_string(),
+                ];
+                files.extend(
+                    VOXTRAL_TTS_VOICE_EMBEDDINGS
+                        .iter()
+                        .map(|file| (*file).to_string()),
+                );
+                files
+            }
             ModelFamily::Tokenizer => vec![
                 "config.json".to_string(),
                 "generation_config.json".to_string(),
@@ -1438,6 +1480,12 @@ impl ModelDownloader {
             } else {
                 1_000_000_000
             }
+        } else if file == "consolidated.safetensors" {
+            match variant {
+                ModelVariant::VoxtralMini4BRealtime2602 => 8_900_000_000,
+                ModelVariant::Voxtral4BTts2603 => 8_650_000_000,
+                _ => 8_000_000_000,
+            }
         } else if file.contains("model.safetensors") && !file.contains("index") {
             if file.contains("00001") || file.contains("00002") {
                 2_000_000_000
@@ -1472,7 +1520,9 @@ impl ModelDownloader {
             }
         } else if file.ends_with(".pth") && file.contains("kokoro-v1_0") {
             327_212_226
-        } else if file.starts_with("voices/") && file.ends_with(".pt") {
+        } else if (file.starts_with("voices/") || file.starts_with("voice_embedding/"))
+            && file.ends_with(".pt")
+        {
             550_000
         } else if file.ends_with(".nemo") {
             match variant {
@@ -1726,6 +1776,56 @@ mod tests {
         assert!(!downloader.is_downloaded(variant));
         std::fs::write(model_dir.join("consolidated.safetensors"), [0u8]).expect("weights");
         assert!(downloader.is_downloaded(variant));
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn voxtral_tts_model_files_include_voice_embeddings_without_config_json() {
+        let (downloader, temp_dir) = test_downloader();
+        let files = downloader.get_model_files(ModelVariant::Voxtral4BTts2603);
+
+        assert!(files.contains(&"params.json".to_string()));
+        assert!(files.contains(&"tekken.json".to_string()));
+        assert!(files.contains(&"consolidated.safetensors".to_string()));
+        assert!(!files.contains(&"config.json".to_string()));
+        assert_eq!(
+            files
+                .iter()
+                .filter(|file| file.starts_with("voice_embedding/") && file.ends_with(".pt"))
+                .count(),
+            ModelVariant::VOXTRAL_TTS_BUILT_IN_VOICE_COUNT
+        );
+        assert!(files.contains(&"voice_embedding/casual_male.pt".to_string()));
+        assert!(files.contains(&"voice_embedding/hi_female.pt".to_string()));
+
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn voxtral_tts_is_downloaded_only_when_all_voice_embeddings_exist() {
+        let (downloader, temp_dir) = test_downloader();
+        let variant = ModelVariant::Voxtral4BTts2603;
+        let model_dir = downloader.model_path(variant);
+        std::fs::create_dir_all(model_dir.join("voice_embedding")).expect("model dir");
+        std::fs::write(model_dir.join("params.json"), "{}").expect("params");
+        std::fs::write(model_dir.join("tekken.json"), "{}").expect("tekken");
+        std::fs::write(model_dir.join("consolidated.safetensors"), [0u8]).expect("weights");
+
+        for file in VOXTRAL_TTS_VOICE_EMBEDDINGS
+            .iter()
+            .take(VOXTRAL_TTS_VOICE_EMBEDDINGS.len() - 1)
+        {
+            std::fs::write(model_dir.join(file), [0u8]).expect("voice embedding");
+        }
+        assert!(!downloader.is_downloaded(variant));
+
+        std::fs::write(
+            model_dir.join(VOXTRAL_TTS_VOICE_EMBEDDINGS.last().unwrap()),
+            [0u8],
+        )
+        .expect("last voice embedding");
+        assert!(downloader.is_downloaded(variant));
+
         std::fs::remove_dir_all(temp_dir).ok();
     }
 }

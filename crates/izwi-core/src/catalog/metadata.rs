@@ -186,6 +186,14 @@ pub enum ModelVariant {
     /// Voxtral Mini 4B Realtime model from Mistral AI
     #[serde(rename = "Voxtral-Mini-4B-Realtime-2602")]
     VoxtralMini4BRealtime2602,
+    /// Voxtral 4B TTS model from Mistral AI
+    #[serde(
+        rename = "Voxtral-4B-TTS-2603",
+        alias = "mistralai/Voxtral-4B-TTS-2603",
+        alias = "voxtral-4b-tts-2603",
+        alias = "Voxtral 4B TTS 2603"
+    )]
+    Voxtral4BTts2603,
 }
 
 impl ModelVariant {
@@ -197,6 +205,9 @@ impl ModelVariant {
     pub const QWEN_CUSTOMVOICE_BUILT_IN_VOICE_COUNT: usize = 9;
     pub const KOKORO_BUILT_IN_VOICE_COUNT: usize = 54;
     pub const LFM25_AUDIO_BUILT_IN_VOICE_COUNT: usize = 4;
+    pub const VOXTRAL_TTS_BUILT_IN_VOICE_COUNT: usize = 20;
+    pub const VOXTRAL_TTS_MAX_OUTPUT_FRAMES: usize = 1500;
+    pub const VOXTRAL_TTS_FRAME_RATE_HZ: f32 = 12.5;
 
     /// Get HuggingFace repository ID
     pub fn repo_id(&self) -> &'static str {
@@ -258,6 +269,7 @@ impl ModelVariant {
             Self::Qwen3ForcedAligner06B => "Qwen/Qwen3-ForcedAligner-0.6B",
             Self::Qwen3ForcedAligner06B4Bit => "mlx-community/Qwen3-ForcedAligner-0.6B-4bit",
             Self::VoxtralMini4BRealtime2602 => "mistralai/Voxtral-Mini-4B-Realtime-2602",
+            Self::Voxtral4BTts2603 => "mistralai/Voxtral-4B-TTS-2603",
         }
     }
 
@@ -308,6 +320,7 @@ impl ModelVariant {
             Self::Qwen3ForcedAligner06B => "Qwen3-ForcedAligner 0.6B",
             Self::Qwen3ForcedAligner06B4Bit => "Qwen3-ForcedAligner 0.6B 4-bit",
             Self::VoxtralMini4BRealtime2602 => "Voxtral Mini 4B Realtime",
+            Self::Voxtral4BTts2603 => "Voxtral 4B TTS",
         }
     }
 
@@ -358,6 +371,7 @@ impl ModelVariant {
             Self::Qwen3ForcedAligner06B => "Qwen3-ForcedAligner-0.6B",
             Self::Qwen3ForcedAligner06B4Bit => "Qwen3-ForcedAligner-0.6B-4bit",
             Self::VoxtralMini4BRealtime2602 => "Voxtral-Mini-4B-Realtime-2602",
+            Self::Voxtral4BTts2603 => "Voxtral-4B-TTS-2603",
         }
     }
 
@@ -408,6 +422,7 @@ impl ModelVariant {
             Self::Qwen3ForcedAligner06B => 1_840_072_459, // ~1.71 GB
             Self::Qwen3ForcedAligner06B4Bit => 703_200_000, // ~0.65 GB
             Self::VoxtralMini4BRealtime2602 => 8_000_000_000, // ~7.45 GB (est)
+            Self::Voxtral4BTts2603 => 8_650_000_000, // ~8.04 GB plus voice assets
         }
     }
 
@@ -457,6 +472,7 @@ impl ModelVariant {
             Self::Qwen3ForcedAligner06B => 2.5,
             Self::Qwen3ForcedAligner06B4Bit => 1.5,
             Self::VoxtralMini4BRealtime2602 => 16.0,
+            Self::Voxtral4BTts2603 => 16.0,
         }
     }
 
@@ -515,8 +531,19 @@ impl ModelVariant {
     pub fn is_tts(&self) -> bool {
         matches!(
             self.family(),
-            crate::catalog::ModelFamily::Qwen3Tts | crate::catalog::ModelFamily::KokoroTts
+            crate::catalog::ModelFamily::Qwen3Tts
+                | crate::catalog::ModelFamily::KokoroTts
+                | crate::catalog::ModelFamily::VoxtralTts
         )
+    }
+
+    /// Model-weight license label, when the model has a license that should be
+    /// surfaced independently from the Izwi application license.
+    pub fn license_label(&self) -> Option<&'static str> {
+        match self {
+            Self::Voxtral4BTts2603 => Some("CC BY-NC 4.0"),
+            _ => None,
+        }
     }
 
     pub fn speech_capabilities(&self) -> Option<SpeechModelCapabilities> {
@@ -588,6 +615,15 @@ impl ModelVariant {
                 supports_speed_control: false,
                 supports_auto_long_form: false,
             },
+            Self::Voxtral4BTts2603 => SpeechModelCapabilities {
+                supports_builtin_voices: true,
+                built_in_voice_count: Some(Self::VOXTRAL_TTS_BUILT_IN_VOICE_COUNT),
+                supports_reference_voice: false,
+                supports_voice_description: false,
+                supports_streaming: false,
+                supports_speed_control: false,
+                supports_auto_long_form: false,
+            },
             _ => return None,
         };
 
@@ -596,19 +632,19 @@ impl ModelVariant {
 
     /// Max output codec frames for this TTS variant, if known.
     pub fn tts_max_output_frames_hint(&self) -> Option<usize> {
-        if matches!(self.family(), crate::catalog::ModelFamily::Qwen3Tts) {
-            Some(Self::QWEN3_TTS_MAX_OUTPUT_FRAMES)
-        } else {
-            None
+        match self.family() {
+            crate::catalog::ModelFamily::Qwen3Tts => Some(Self::QWEN3_TTS_MAX_OUTPUT_FRAMES),
+            crate::catalog::ModelFamily::VoxtralTts => Some(Self::VOXTRAL_TTS_MAX_OUTPUT_FRAMES),
+            _ => None,
         }
     }
 
     /// Codec frame-rate hint for this TTS variant, if known.
     pub fn tts_output_frame_rate_hz_hint(&self) -> Option<f32> {
-        if matches!(self.family(), crate::catalog::ModelFamily::Qwen3Tts) {
-            Some(Self::QWEN3_TTS_FRAME_RATE_HZ)
-        } else {
-            None
+        match self.family() {
+            crate::catalog::ModelFamily::Qwen3Tts => Some(Self::QWEN3_TTS_FRAME_RATE_HZ),
+            crate::catalog::ModelFamily::VoxtralTts => Some(Self::VOXTRAL_TTS_FRAME_RATE_HZ),
+            _ => None,
         }
     }
 
@@ -768,6 +804,7 @@ impl ModelVariant {
             | Self::Kokoro82M => true,
             Self::Gemma34BIt => false,
             Self::VoxtralMini4BRealtime2602 => true,
+            Self::Voxtral4BTts2603 => true,
             Self::ParakeetTdt06BV3 => true,
             Self::WhisperLargeV3Turbo => true,
             Self::DiarStreamingSortformer4SpkV21 => true,
@@ -823,6 +860,7 @@ impl ModelVariant {
             Self::Qwen3ForcedAligner06B,
             Self::Qwen3ForcedAligner06B4Bit,
             Self::VoxtralMini4BRealtime2602,
+            Self::Voxtral4BTts2603,
         ]
     }
 }
@@ -1019,6 +1057,37 @@ mod tests {
         assert!(!variant.is_asr());
         assert!(!variant.is_audio_chat());
         assert_eq!(variant.speech_capabilities(), None);
+    }
+
+    #[test]
+    fn voxtral_tts_contract_exposes_builtin_voice_tts_only() {
+        let variant = ModelVariant::Voxtral4BTts2603;
+        assert!(variant.is_tts());
+        assert_eq!(variant.primary_task(), ModelTask::Tts);
+        assert!(variant.is_enabled());
+        assert!(!variant.is_voxtral());
+        assert_eq!(variant.repo_id(), "mistralai/Voxtral-4B-TTS-2603");
+        assert_eq!(variant.license_label(), Some("CC BY-NC 4.0"));
+        assert_eq!(
+            variant.tts_output_frame_rate_hz_hint(),
+            Some(ModelVariant::VOXTRAL_TTS_FRAME_RATE_HZ)
+        );
+        assert_eq!(
+            variant.tts_max_output_frames_hint(),
+            Some(ModelVariant::VOXTRAL_TTS_MAX_OUTPUT_FRAMES)
+        );
+        assert_eq!(
+            variant.speech_capabilities(),
+            Some(SpeechModelCapabilities {
+                supports_builtin_voices: true,
+                built_in_voice_count: Some(ModelVariant::VOXTRAL_TTS_BUILT_IN_VOICE_COUNT),
+                supports_reference_voice: false,
+                supports_voice_description: false,
+                supports_streaming: false,
+                supports_speed_control: false,
+                supports_auto_long_form: false,
+            })
+        );
     }
 
     #[test]

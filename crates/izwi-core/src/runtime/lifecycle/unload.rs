@@ -48,6 +48,9 @@ impl RuntimeService {
                 self.model_registry.unload_kokoro(variant).await;
                 self.clear_active_tts_variant(variant).await;
             }
+            ModelFamily::VoxtralTts => {
+                self.clear_active_tts_variant(variant).await;
+            }
             ModelFamily::Tokenizer => {
                 let mut tokenizer_guard = self.tokenizer.write().await;
                 *tokenizer_guard = None;

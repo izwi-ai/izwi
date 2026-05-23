@@ -167,6 +167,17 @@ mod tests {
             "izwi tts 'Hello' -m Kokoro-82M"
         );
     }
+
+    #[test]
+    fn post_download_hint_for_voxtral_tts_uses_tts() {
+        let model = "Voxtral-4B-TTS-2603";
+
+        assert_eq!(post_download_usage_label(model), "Generate speech");
+        assert_eq!(
+            post_download_usage_command(model),
+            "izwi tts 'Hello' -m Voxtral-4B-TTS-2603"
+        );
+    }
 }
 
 fn post_download_usage_command(model: &str) -> String {

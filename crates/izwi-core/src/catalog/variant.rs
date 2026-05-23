@@ -8,6 +8,7 @@ use super::ModelVariant;
 pub enum ModelFamily {
     Qwen3Tts,
     KokoroTts,
+    VoxtralTts,
     ParakeetAsr,
     WhisperAsr,
     Qwen3Asr,
@@ -99,6 +100,7 @@ impl ModelVariant {
             | Qwen3Tts12Hz17BVoiceDesign8Bit
             | Qwen3Tts12Hz17BVoiceDesignBf16 => ModelFamily::Qwen3Tts,
             Kokoro82M => ModelFamily::KokoroTts,
+            Voxtral4BTts2603 => ModelFamily::VoxtralTts,
             Qwen3TtsTokenizer12Hz => ModelFamily::Tokenizer,
             ParakeetTdt06BV3 => ModelFamily::ParakeetAsr,
             WhisperLargeV3Turbo => ModelFamily::WhisperAsr,
@@ -117,7 +119,9 @@ impl ModelVariant {
 
     pub fn primary_task(&self) -> ModelTask {
         match self.family() {
-            ModelFamily::Qwen3Tts | ModelFamily::KokoroTts => ModelTask::Tts,
+            ModelFamily::Qwen3Tts | ModelFamily::KokoroTts | ModelFamily::VoxtralTts => {
+                ModelTask::Tts
+            }
             ModelFamily::ParakeetAsr | ModelFamily::WhisperAsr | ModelFamily::Qwen3Asr => {
                 ModelTask::Asr
             }
@@ -255,6 +259,12 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
     use ModelVariant::*;
 
     if normalized.contains("voxtral") {
+        if normalized.contains("tts")
+            || normalized.contains("texttospeech")
+            || normalized.contains("2603")
+        {
+            return Some(Voxtral4BTts2603);
+        }
         return Some(VoxtralMini4BRealtime2602);
     }
 
@@ -578,6 +588,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_tts_accepts_voxtral_tts_repo_alias() {
+        let parsed = parse_tts_model_variant("mistralai/Voxtral-4B-TTS-2603")
+            .expect("Voxtral TTS should parse for tts");
+        assert_eq!(parsed, ModelVariant::Voxtral4BTts2603);
+        assert_eq!(parsed.family(), ModelFamily::VoxtralTts);
+    }
+
+    #[test]
     fn resolve_asr_fallback_defaults_to_parakeet_v3() {
         let resolved = resolve_asr_model_variant(Some("not-a-real-model"));
         assert_eq!(resolved, ModelVariant::ParakeetTdt06BV3);
@@ -644,6 +662,13 @@ mod tests {
         let parsed = parse_model_variant("mistralai/Voxtral-Mini-4B-Realtime-2602").unwrap();
         assert_eq!(parsed, ModelVariant::VoxtralMini4BRealtime2602);
         assert_eq!(parsed.family(), ModelFamily::Voxtral);
+    }
+
+    #[test]
+    fn parse_voxtral_tts_repo_alias() {
+        let parsed = parse_model_variant("mistralai/Voxtral-4B-TTS-2603").unwrap();
+        assert_eq!(parsed, ModelVariant::Voxtral4BTts2603);
+        assert_eq!(parsed.family(), ModelFamily::VoxtralTts);
     }
 
     #[test]
