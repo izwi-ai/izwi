@@ -514,11 +514,18 @@ mod tests {
     }
 
     #[test]
-    fn dtype_plan_keeps_cpu_codec_in_f32_and_allows_cuda_bf16() {
+    fn dtype_plan_keeps_cpu_and_metal_in_f32_and_allows_cuda_bf16() {
         let cpu = profile(DeviceKind::Cpu, false, false);
         let cpu_plan = select_voxtral_tts_dtypes(&cpu, None).unwrap();
         assert_eq!(cpu_plan.language_model, DType::F32);
+        assert_eq!(cpu_plan.acoustic_transformer, DType::F32);
         assert_eq!(cpu_plan.codec, DType::F32);
+
+        let metal = profile(DeviceKind::Metal, false, true);
+        let metal_plan = select_voxtral_tts_dtypes(&metal, None).unwrap();
+        assert_eq!(metal_plan.language_model, DType::F32);
+        assert_eq!(metal_plan.acoustic_transformer, DType::F32);
+        assert_eq!(metal_plan.codec, DType::F32);
 
         let cuda = profile(DeviceKind::Cuda, true, true);
         let cuda_plan = select_voxtral_tts_dtypes(&cuda, None).unwrap();
