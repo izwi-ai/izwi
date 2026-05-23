@@ -131,6 +131,23 @@ fn tts_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
     }
 }
 
+fn tts_streaming_mode(model_variant: ModelVariant) -> StreamingMode {
+    let Some(capabilities) = model_variant.speech_capabilities() else {
+        return StreamingMode::None;
+    };
+    if capabilities.supports_streaming
+        || model_variant.is_lfm25_audio_gguf()
+        || matches!(
+            model_variant.family(),
+            crate::catalog::ModelFamily::VoxtralTts
+        )
+    {
+        StreamingMode::Chunked
+    } else {
+        StreamingMode::None
+    }
+}
+
 fn asr_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
     if model_variant.is_audio_chat() || model_variant.is_voxtral() {
         ExecutionTargetKind::DirectModel
@@ -144,18 +161,12 @@ struct TtsCapabilityAdapter;
 
 impl ModelCapabilityAdapter for TtsCapabilityAdapter {
     fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
-        let capabilities = model_variant.speech_capabilities()?;
+        model_variant.speech_capabilities()?;
         Some(AdapterMetadata {
             id: "builtin.tts",
             capability: CapabilityKind::Tts,
             model_variant,
-            streaming_mode: if capabilities.supports_streaming
-                || model_variant.is_lfm25_audio_gguf()
-            {
-                StreamingMode::Chunked
-            } else {
-                StreamingMode::None
-            },
+            streaming_mode: tts_streaming_mode(model_variant),
             execution_target: tts_execution_target(model_variant),
         })
     }
@@ -490,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn built_in_registry_marks_voxtral_tts_as_direct_tts_without_streaming() {
+    fn built_in_registry_marks_voxtral_tts_as_direct_tts_with_final_only_streaming() {
         let registry = RuntimeAdapterRegistry::built_in();
         let variant = ModelVariant::Voxtral4BTts2603;
 
@@ -498,7 +509,7 @@ mod tests {
             .require(CapabilityKind::Tts, variant)
             .expect("voxtral tts adapter");
         assert_eq!(adapter.execution_target, ExecutionTargetKind::DirectModel);
-        assert_eq!(adapter.streaming_mode, StreamingMode::None);
+        assert_eq!(adapter.streaming_mode, StreamingMode::Chunked);
         assert!(registry
             .require(CapabilityKind::StreamingTts, variant)
             .is_err());

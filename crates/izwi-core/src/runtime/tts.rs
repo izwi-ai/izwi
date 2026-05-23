@@ -11,6 +11,7 @@ use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::lfm25_audio::lfm25_audio_tts_system_prompt;
 use crate::models::architectures::qwen3::tts::qwen_tts_cuda_chunked_codec_stream_enabled;
+use crate::models::architectures::voxtral::tts::VoxtralTtsGenerationParams;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 use crate::runtime::adapters::CapabilityKind;
 use crate::runtime::request::TtsRuntimeRequest;
@@ -126,6 +127,84 @@ impl RuntimeService {
         Ok(())
     }
 
+    async fn voxtral_tts_generate(
+        &self,
+        request: GenerationRequest,
+        variant: ModelVariant,
+        streaming_required: bool,
+    ) -> Result<GenerationResult> {
+        self.observe_broker_capability_request(
+            CapabilityKind::Tts,
+            Some(variant),
+            streaming_required,
+        )?;
+        self.load_model(variant).await?;
+        let _lease = self.acquire_model_residency_lease(variant);
+
+        let text = request.text.trim().to_string();
+        if text.is_empty() {
+            return Err(Error::InvalidInput("TTS request missing text".to_string()));
+        }
+
+        let model = self
+            .model_registry
+            .get_voxtral_tts(variant)
+            .await
+            .ok_or_else(|| Error::InferenceError("No Voxtral TTS model loaded".to_string()))?;
+        let voice = request
+            .config
+            .options
+            .speaker
+            .as_deref()
+            .or(request.config.options.voice.as_deref())
+            .map(str::to_string)
+            .or_else(|| model.available_speakers().into_iter().next())
+            .ok_or_else(|| {
+                Error::InferenceError("Voxtral TTS model exposes no preset voices".to_string())
+            })?;
+        let params = VoxtralTtsGenerationParams::from_generation_config(&request.config);
+        let started = Instant::now();
+        let output = model.generate_with_voice(&text, &voice, params)?;
+        let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
+        let sample_rate = u32::try_from(output.sample_rate).map_err(|_| {
+            Error::InferenceError(format!(
+                "Voxtral TTS sample rate {} exceeds u32",
+                output.sample_rate
+            ))
+        })?;
+
+        Ok(GenerationResult {
+            request_id: request.id,
+            samples: output.samples,
+            sample_rate,
+            total_tokens: output.frames_generated,
+            total_time_ms,
+        })
+    }
+
+    async fn voxtral_tts_generate_streaming(
+        &self,
+        request: GenerationRequest,
+        variant: ModelVariant,
+        chunk_tx: mpsc::Sender<AudioChunk>,
+    ) -> Result<()> {
+        let result = self.voxtral_tts_generate(request, variant, true).await?;
+        let generation_time_ms = result.total_time_ms;
+        let tokens_generated = result.total_tokens;
+        let rtf = result.rtf();
+        let mut chunk = AudioChunk::final_chunk(result.request_id.clone(), 0, result.samples);
+        chunk.stats = Some(ChunkStats {
+            generation_time_ms,
+            tokens_generated,
+            rtf,
+        });
+        chunk_tx
+            .send(chunk)
+            .await
+            .map_err(|_| Error::InferenceError("Streaming output channel closed".to_string()))?;
+        Ok(())
+    }
+
     async fn qwen_tts_final_only_streaming(
         &self,
         mut request: GenerationRequest,
@@ -165,6 +244,11 @@ impl RuntimeService {
         if matches!(resolved_variant.family(), ModelFamily::Lfm25Audio) {
             return self
                 .lfm25_audio_tts_generate(request, resolved_variant, false)
+                .await;
+        }
+        if matches!(resolved_variant.family(), ModelFamily::VoxtralTts) {
+            return self
+                .voxtral_tts_generate(request, resolved_variant, false)
                 .await;
         }
         self.load_model(resolved_variant).await?;
@@ -210,6 +294,11 @@ impl RuntimeService {
         if matches!(resolved_variant.family(), ModelFamily::Lfm25Audio) {
             return self
                 .lfm25_audio_tts_generate_streaming(request, resolved_variant, chunk_tx)
+                .await;
+        }
+        if matches!(resolved_variant.family(), ModelFamily::VoxtralTts) {
+            return self
+                .voxtral_tts_generate_streaming(request, resolved_variant, chunk_tx)
                 .await;
         }
         if qwen_tts_streaming_uses_final_only(
