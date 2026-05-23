@@ -1,6 +1,7 @@
 //! Tekken tokenizer wrapper for Voxtral TTS.
 
 use std::fmt::Display;
+use std::ops::Range;
 use std::path::Path;
 
 use tekken::{SpecialTokenPolicy, Tekkenizer};
@@ -13,6 +14,10 @@ const EOS_TOKEN_CANDIDATES: &[&str] = &["</s>", "~~ "];
 const END_AUDIO_TOKEN_CANDIDATES: &[&str] = &["[END_AUDIO]"];
 const TEXT_TO_AUDIO_TOKEN_CANDIDATES: &[&str] = &["[NEXT_AUDIO_TEXT]"];
 const AUDIO_TO_TEXT_TOKEN_CANDIDATES: &[&str] = &["[REPEAT_AUDIO_TEXT]"];
+const INST_START_TOKEN_CANDIDATES: &[&str] = &["[INST]"];
+const INST_END_TOKEN_CANDIDATES: &[&str] = &["[/INST]"];
+const FALLBACK_INST_START_TOKEN_ID: u32 = 35;
+const FALLBACK_INST_END_TOKEN_ID: u32 = 36;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VoxtralTtsSpecialTokens {
@@ -23,6 +28,8 @@ pub struct VoxtralTtsSpecialTokens {
     pub end_audio: Option<u32>,
     pub text_to_audio: Option<u32>,
     pub audio_to_text: Option<u32>,
+    pub inst_start: Option<u32>,
+    pub inst_end: Option<u32>,
 }
 
 impl VoxtralTtsSpecialTokens {
@@ -35,6 +42,8 @@ impl VoxtralTtsSpecialTokens {
             end_audio: None,
             text_to_audio: None,
             audio_to_text: None,
+            inst_start: None,
+            inst_end: None,
         }
     }
 
@@ -43,6 +52,10 @@ impl VoxtralTtsSpecialTokens {
         self.end_audio = optional_control_token(tokenizer, END_AUDIO_TOKEN_CANDIDATES);
         self.text_to_audio = optional_control_token(tokenizer, TEXT_TO_AUDIO_TOKEN_CANDIDATES);
         self.audio_to_text = optional_control_token(tokenizer, AUDIO_TO_TEXT_TOKEN_CANDIDATES);
+        self.inst_start = optional_control_token(tokenizer, INST_START_TOKEN_CANDIDATES)
+            .or(Some(FALLBACK_INST_START_TOKEN_ID));
+        self.inst_end = optional_control_token(tokenizer, INST_END_TOKEN_CANDIDATES)
+            .or(Some(FALLBACK_INST_END_TOKEN_ID));
         self
     }
 
@@ -54,6 +67,8 @@ impl VoxtralTtsSpecialTokens {
             || self.end_audio == Some(token)
             || self.text_to_audio == Some(token)
             || self.audio_to_text == Some(token)
+            || self.inst_start == Some(token)
+            || self.inst_end == Some(token)
     }
 }
 
@@ -61,6 +76,7 @@ impl VoxtralTtsSpecialTokens {
 pub struct VoxtralTtsPrompt {
     pub input_ids: Vec<u32>,
     pub text_token_count: usize,
+    pub voice_token_range: Option<Range<usize>>,
 }
 
 pub struct VoxtralTtsTokenizer {
@@ -106,6 +122,33 @@ impl VoxtralTtsTokenizer {
         Ok(VoxtralTtsPrompt {
             input_ids,
             text_token_count: text_tokens.len(),
+            voice_token_range: None,
+        })
+    }
+
+    pub fn build_speech_prompt(&self, text: &str, voice_frames: usize) -> Result<VoxtralTtsPrompt> {
+        let text_tokens = self.encode_text(text)?;
+        let inst_start = self.specials.inst_start.ok_or_else(|| {
+            Error::TokenizationError("Voxtral TTS tokenizer is missing [INST] token".to_string())
+        })?;
+        let inst_end = self.specials.inst_end.ok_or_else(|| {
+            Error::TokenizationError("Voxtral TTS tokenizer is missing [/INST] token".to_string())
+        })?;
+
+        let mut input_ids = Vec::with_capacity(text_tokens.len() + voice_frames + 5);
+        input_ids.push(self.specials.bos);
+        input_ids.push(self.specials.begin_audio);
+        let voice_start = input_ids.len();
+        input_ids.extend(std::iter::repeat(self.specials.audio).take(voice_frames));
+        let voice_end = input_ids.len();
+        input_ids.push(inst_end);
+        input_ids.extend(text_tokens.iter().copied());
+        input_ids.push(inst_start);
+        input_ids.push(self.specials.begin_audio);
+        Ok(VoxtralTtsPrompt {
+            input_ids,
+            text_token_count: text_tokens.len(),
+            voice_token_range: Some(voice_start..voice_end),
         })
     }
 

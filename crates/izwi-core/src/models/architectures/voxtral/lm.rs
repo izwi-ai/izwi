@@ -21,6 +21,7 @@ const EMBEDDING_WEIGHT_CANDIDATES: &[&str] = &[
     "model.embed_tokens.weight",
     "language_model.embed_tokens.weight",
     "language_model.model.embed_tokens.weight",
+    "mm_audio_embeddings.tok_embeddings.weight",
     "mm_streams_embeddings.embedding_module.tok_embeddings.weight",
 ];
 
@@ -137,6 +138,19 @@ impl VoxtralLM {
         &self,
         embeds: &Tensor,
         start_pos: usize,
+        cache: Option<&mut Qwen3Cache>,
+        position_ids: Option<&Tensor>,
+        t_cond: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let hidden =
+            self.forward_hidden_with_embeds(embeds, start_pos, cache, position_ids, t_cond)?;
+        self.logits_from_hidden(&hidden)
+    }
+
+    pub fn forward_hidden_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
         mut cache: Option<&mut Qwen3Cache>,
         position_ids: Option<&Tensor>,
         t_cond: Option<&Tensor>,
@@ -146,9 +160,11 @@ impl VoxtralLM {
             let cache_ref = cache.as_deref_mut();
             x = layer.forward(&x, start_pos, position_ids, cache_ref, idx, t_cond)?;
         }
-        let x = self.norm.forward(&x)?;
-        let logits = self.lm_head.forward(&x)?;
-        Ok(logits)
+        self.norm.forward(&x).map_err(Error::from)
+    }
+
+    pub fn logits_from_hidden(&self, hidden: &Tensor) -> Result<Tensor> {
+        self.lm_head.forward(hidden).map_err(Error::from)
     }
 }
 

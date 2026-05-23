@@ -193,6 +193,15 @@ impl FlowMatchingAudioTransformer {
         llm_hidden: &Tensor,
         cfg_alpha: f32,
     ) -> Result<Vec<Vec<u32>>> {
+        self.forward_audio_codes_with_steps(llm_hidden, cfg_alpha, self.generation.n_decoding_steps)
+    }
+
+    pub fn forward_audio_codes_with_steps(
+        &self,
+        llm_hidden: &Tensor,
+        cfg_alpha: f32,
+        n_decoding_steps: usize,
+    ) -> Result<Vec<Vec<u32>>> {
         let llm_hidden = match llm_hidden.rank() {
             1 => llm_hidden.unsqueeze(0)?,
             2 => llm_hidden.clone(),
@@ -213,7 +222,8 @@ impl FlowMatchingAudioTransformer {
         let semantic_logits = self.semantic_codebook_output.forward(&llm_hidden)?;
         let semantic_codes =
             semantic_codes_from_logits(&semantic_logits, self.generation.semantic_codebook_size)?;
-        let acoustic_codes = self.decode_one_frame(&semantic_codes, &llm_hidden, cfg_alpha)?;
+        let acoustic_codes =
+            self.decode_one_frame(&semantic_codes, &llm_hidden, cfg_alpha, n_decoding_steps)?;
         let mut frames = Vec::with_capacity(semantic_codes.len());
         for (semantic, acoustic) in semantic_codes.into_iter().zip(acoustic_codes) {
             let mut frame = Vec::with_capacity(self.generation.num_codebooks);
@@ -229,6 +239,7 @@ impl FlowMatchingAudioTransformer {
         semantic_codes: &[u32],
         llm_hidden: &Tensor,
         cfg_alpha: f32,
+        n_decoding_steps: usize,
     ) -> Result<Vec<Vec<u32>>> {
         let batch = semantic_codes.len();
         let dtype = llm_hidden.dtype();
@@ -241,7 +252,7 @@ impl FlowMatchingAudioTransformer {
         )?
         .to_dtype(dtype)?;
         let llm_hidden_zero = Tensor::zeros(llm_hidden.shape(), dtype, device)?;
-        let n_steps = self.generation.n_decoding_steps.max(1);
+        let n_steps = n_decoding_steps.max(1);
         for step in 0..n_steps {
             let t = step as f32 / n_steps as f32;
             let dt = 1.0f64 / n_steps as f64;
