@@ -76,11 +76,14 @@ impl VoxtralConfig {
             sampling_rate: whisper.audio_encoding_args.sampling_rate,
             is_causal: whisper.causal,
             conv1_kernel_size: 3,
-            conv1_stride: 1,
+            conv1_stride: 2,
             conv2_kernel_size: 3,
             conv2_stride: 2,
             global_log_mel_max: whisper.audio_encoding_args.global_log_mel_max,
             head_dim: whisper.head_dim,
+            rope_theta: whisper.rope_theta,
+            pos_embed: whisper.pos_embed.clone(),
+            sliding_window: whisper.sliding_window,
         }
     }
 
@@ -217,6 +220,12 @@ pub struct AudioEncoderConfig {
     pub global_log_mel_max: Option<f32>,
     #[serde(default)]
     pub head_dim: usize,
+    #[serde(default)]
+    pub rope_theta: f64,
+    #[serde(default)]
+    pub pos_embed: String,
+    #[serde(default)]
+    pub sliding_window: usize,
 }
 
 fn default_global_log_mel_max() -> Option<f32> {

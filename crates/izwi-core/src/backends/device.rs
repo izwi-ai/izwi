@@ -367,8 +367,20 @@ impl DeviceProfile {
                 reason: "CPU default dtype is F32".into(),
             },
             DeviceKind::Metal => DTypeSelection {
-                dtype: DType::F32,
-                reason: "Metal default dtype remains F32".into(),
+                dtype: if request.model_family == Some(ModelFamily::Voxtral)
+                    && request.checkpoint_dtype != Some(DType::F32)
+                {
+                    DType::F16
+                } else {
+                    DType::F32
+                },
+                reason: if request.model_family == Some(ModelFamily::Voxtral)
+                    && request.checkpoint_dtype != Some(DType::F32)
+                {
+                    "Voxtral Metal policy uses F16 to keep realtime decoding within Apple GPU memory and latency limits".into()
+                } else {
+                    "Metal default dtype remains F32".into()
+                },
             },
             DeviceKind::Cuda => self.default_cuda_dtype_selection(request),
         }
@@ -539,7 +551,7 @@ impl DeviceSelector {
                 capabilities: DeviceCapabilities {
                     prefers_f32: true,    // Metal on Apple Silicon prefers F32
                     supports_bf16: false, // Metal doesn't have good BF16 support
-                    supports_f16: false,  // Current Metal policy intentionally uses F32
+                    supports_f16: true,   // Used by model-specific Metal policies.
                     supports_int8_tensor_cores: false,
                     has_unified_memory: true, // Apple Silicon has unified memory
                     recommended_batch_size: 4, // Conservative for unified memory
@@ -777,6 +789,35 @@ mod tests {
 
         // F32 request should give F32
         assert_eq!(metal_profile.select_dtype(Some("f32")), DType::F32);
+    }
+
+    #[test]
+    fn metal_voxtral_defaults_to_f16_for_realtime_latency() {
+        let metal_profile = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Metal,
+            capabilities: DeviceCapabilities {
+                prefers_f32: true,
+                supports_f16: true,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+
+        assert_eq!(
+            metal_profile
+                .select_model_dtype_with_checkpoint(ModelFamily::Voxtral, Some(DType::BF16)),
+            DType::F16
+        );
+        assert_eq!(
+            metal_profile
+                .select_model_dtype_with_checkpoint(ModelFamily::Voxtral, Some(DType::F32)),
+            DType::F32
+        );
+        assert_eq!(
+            metal_profile.select_model_dtype(ModelFamily::Qwen3Tts, None),
+            DType::F32
+        );
     }
 
     #[test]

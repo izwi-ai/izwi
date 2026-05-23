@@ -452,10 +452,7 @@ impl VoxtralAttention {
         start_pos: usize,
         position_ids: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let bsz = x.dim(0)?;
         let seq_len = x.dim(1)?;
-        let heads = x.dim(2)?;
-        let half_dim = self.head_dim / 2;
 
         let (cos, sin) = if self.use_mrope {
             let position_ids = if let Some(position_ids) = position_ids {
@@ -490,24 +487,33 @@ impl VoxtralAttention {
             )?
         };
 
-        let x = x.reshape((bsz, seq_len, heads, half_dim, 2))?;
-        let x1 = x.narrow(4, 0, 1)?.squeeze(4)?;
-        let x2 = x.narrow(4, 1, 1)?.squeeze(4)?;
-
-        let cos = cos.unsqueeze(0)?.unsqueeze(2)?;
-        let sin = sin.unsqueeze(0)?.unsqueeze(2)?;
-
-        let rot1 = x1.broadcast_mul(&cos)?;
-        let rot1 = rot1.broadcast_sub(&x2.broadcast_mul(&sin)?)?;
-        let rot2 = x1.broadcast_mul(&sin)?;
-        let rot2 = rot2.broadcast_add(&x2.broadcast_mul(&cos)?)?;
-
-        let rot1 = rot1.unsqueeze(4)?;
-        let rot2 = rot2.unsqueeze(4)?;
-        let out = Tensor::cat(&[rot1, rot2], 4)?;
-        out.reshape((bsz, seq_len, heads, self.head_dim))
-            .map_err(Error::from)
+        apply_interleaved_rotary_emb(&x, &cos, &sin)
     }
+}
+
+fn apply_interleaved_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    let bsz = x.dim(0)?;
+    let seq_len = x.dim(1)?;
+    let heads = x.dim(2)?;
+    let head_dim = x.dim(3)?;
+    let half_dim = head_dim / 2;
+    let x = x.reshape((bsz, seq_len, heads, half_dim, 2))?;
+    let x1 = x.narrow(4, 0, 1)?.squeeze(4)?;
+    let x2 = x.narrow(4, 1, 1)?.squeeze(4)?;
+
+    let cos = cos.unsqueeze(0)?.unsqueeze(2)?;
+    let sin = sin.unsqueeze(0)?.unsqueeze(2)?;
+    let rot1 = x1
+        .broadcast_mul(&cos)?
+        .broadcast_sub(&x2.broadcast_mul(&sin)?)?;
+    let rot2 = x1
+        .broadcast_mul(&sin)?
+        .broadcast_add(&x2.broadcast_mul(&cos)?)?;
+    let rot1 = rot1.unsqueeze(4)?;
+    let rot2 = rot2.unsqueeze(4)?;
+    Tensor::cat(&[rot1, rot2], 4)?
+        .reshape((bsz, seq_len, heads, head_dim))
+        .map_err(Error::from)
 }
 
 impl VoxtralAdaRmsNorm {
@@ -801,6 +807,26 @@ mod tests {
             .to_vec2::<f32>()
             .unwrap();
         assert_eq!(decode_mask, vec![vec![-1e4, -1e4, 0.0, 0.0, 0.0]]);
+    }
+
+    #[test]
+    fn voxtral_text_rope_uses_interleaved_pairs() {
+        let device = Device::Cpu;
+        let x = Tensor::from_vec(vec![1.0f32, 10.0, 2.0, 20.0], (1, 1, 1, 4), &device).unwrap();
+        let cos = Tensor::from_vec(vec![0.5f32, 0.25], (1, 2), &device).unwrap();
+        let sin = Tensor::from_vec(vec![0.1f32, 0.2], (1, 2), &device).unwrap();
+
+        let rotated = apply_interleaved_rotary_emb(&x, &cos, &sin).unwrap();
+
+        assert_eq!(
+            rotated.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![
+                1.0 * 0.5 - 10.0 * 0.1,
+                1.0 * 0.1 + 10.0 * 0.5,
+                2.0 * 0.25 - 20.0 * 0.2,
+                2.0 * 0.2 + 20.0 * 0.25,
+            ]
+        );
     }
 
     #[test]
