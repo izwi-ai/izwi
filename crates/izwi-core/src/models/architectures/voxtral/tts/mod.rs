@@ -18,7 +18,9 @@ pub use acoustic::{
     AudioCodeValue, AudioSpecialToken, FlowMatchingAudioTransformer, ACOUSTIC_CODEBOOK_OFFSET,
     AUDIO_SPECIAL_TOKEN_COUNT,
 };
-pub use codec::{VoxtralCodecConfig, VoxtralCodecTimeline, VOXTRAL_CODEC_CHUNK_FRAMES};
+pub use codec::{
+    VoxtralCodecConfig, VoxtralCodecDecoder, VoxtralCodecTimeline, VOXTRAL_CODEC_CHUNK_FRAMES,
+};
 pub use config::{
     VoxtralTtsAcousticTransformerArgs, VoxtralTtsAudioEncodingArgs, VoxtralTtsAudioModelArgs,
     VoxtralTtsAudioTokenizerArgs, VoxtralTtsConfig, VoxtralTtsMultimodalConfig, DEFAULT_CFG_ALPHA,
