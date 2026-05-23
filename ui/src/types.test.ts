@@ -39,6 +39,12 @@ describe("speech route model filters", () => {
       false,
     );
   });
+
+  it("includes voxtral tts on the standalone tts route filter", () => {
+    expect(VIEW_CONFIGS["custom-voice"].modelFilter("Voxtral-4B-TTS-2603")).toBe(
+      true,
+    );
+  });
 });
 
 describe("getSpeakerProfilesForVariant", () => {
@@ -48,5 +54,34 @@ describe("getSpeakerProfilesForVariant", () => {
         (speaker) => speaker.id,
       ),
     ).toEqual(["US Female", "US Male", "UK Female", "UK Male"]);
+  });
+
+  it("maps voxtral tts to the official preset voices", () => {
+    expect(
+      getSpeakerProfilesForVariant("mistralai/Voxtral-4B-TTS-2603").map(
+        (speaker) => speaker.id,
+      ),
+    ).toEqual([
+      "casual_female",
+      "casual_male",
+      "cheerful_female",
+      "neutral_female",
+      "neutral_male",
+      "pt_male",
+      "pt_female",
+      "nl_male",
+      "nl_female",
+      "it_male",
+      "it_female",
+      "fr_male",
+      "fr_female",
+      "es_male",
+      "es_female",
+      "de_male",
+      "de_female",
+      "ar_male",
+      "hi_male",
+      "hi_female",
+    ]);
   });
 });

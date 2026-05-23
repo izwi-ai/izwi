@@ -582,6 +582,50 @@ describe("TextToSpeechPage", () => {
     expect(screen.queryByText("bf_alice")).not.toBeInTheDocument();
   });
 
+  it("uses voxtral tts built-in voices instead of qwen defaults", async () => {
+    hookMocks.useRouteModelSelection.mockReturnValue({
+      routeModels: [],
+      resolvedSelectedModel: "Voxtral-4B-TTS-2603",
+      selectedModelInfo: {
+        variant: "Voxtral-4B-TTS-2603",
+        status: "ready",
+        speech_capabilities: buildSpeechCapabilities({
+          supports_reference_voice: false,
+          supports_voice_description: false,
+        }),
+      },
+      selectedModelReady: true,
+      isModelModalOpen: false,
+      intentVariant: null,
+      closeModelModal: vi.fn(),
+      openModelManager: vi.fn(),
+      requestModel: vi.fn(),
+    });
+
+    renderRoute("/text-to-speech?speaker=Vivian");
+
+    expect(
+      await screen.findByRole("heading", { name: "New text-to-speech job" }),
+    ).toBeInTheDocument();
+
+    expect(screen.getByText("Casual Female")).toBeInTheDocument();
+    expect(screen.queryByText("Vivian")).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByPlaceholderText("Write the text to speak..."), {
+      target: { value: "Hello from Voxtral" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Create generation/i }));
+
+    await waitFor(() =>
+      expect(apiMocks.createTextToSpeechRecordStream).toHaveBeenCalled(),
+    );
+    expect(apiMocks.createTextToSpeechRecordStream.mock.calls[0][0]).toMatchObject({
+      model_id: "Voxtral-4B-TTS-2603",
+      speaker: "casual_female",
+      text: "Hello from Voxtral",
+    });
+  });
+
   it("loads the selected model from the modal readiness action", async () => {
     const onLoad = vi.fn();
 
