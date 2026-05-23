@@ -14,8 +14,9 @@ pub mod voice;
 
 pub use acoustic::{
     apply_audio_token_offset, cfg_velocity_blend, fsq_code_to_unit, fsq_unit_to_code,
-    strip_audio_token_offset, AcousticCodeFrame, AcousticGenerationConfig, AudioCodeValue,
-    AudioSpecialToken, ACOUSTIC_CODEBOOK_OFFSET, AUDIO_SPECIAL_TOKEN_COUNT,
+    padded_codebook_size, strip_audio_token_offset, AcousticCodeFrame, AcousticGenerationConfig,
+    AudioCodeValue, AudioSpecialToken, FlowMatchingAudioTransformer, ACOUSTIC_CODEBOOK_OFFSET,
+    AUDIO_SPECIAL_TOKEN_COUNT,
 };
 pub use codec::{VoxtralCodecConfig, VoxtralCodecTimeline, VOXTRAL_CODEC_CHUNK_FRAMES};
 pub use config::{
