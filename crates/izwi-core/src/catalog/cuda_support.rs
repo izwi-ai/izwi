@@ -131,6 +131,7 @@ impl ModelVariant {
             ),
             ModelFamily::Qwen3Tts
             | ModelFamily::KokoroTts
+            | ModelFamily::VoxtralTts
             | ModelFamily::ParakeetAsr
             | ModelFamily::WhisperAsr
             | ModelFamily::Qwen3Asr

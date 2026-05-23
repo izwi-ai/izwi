@@ -2,7 +2,7 @@ use tracing::info;
 
 use crate::catalog::ModelFamily;
 use crate::catalog::ModelVariant;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::runtime::lifecycle::phases::AcquiredModelLoad;
 use crate::runtime::service::RuntimeService;
 use crate::tokenizer::Tokenizer;
@@ -80,6 +80,11 @@ impl RuntimeService {
                     )
                     .await?;
                 InstantiatedPayload::None
+            }
+            ModelFamily::VoxtralTts => {
+                return Err(Error::ModelLoadError(
+                    "Voxtral TTS runtime loader is not implemented yet".to_string(),
+                ));
             }
             ModelFamily::Tokenizer => {
                 let tokenizer = match Tokenizer::from_path(&model_path) {

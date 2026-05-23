@@ -18,12 +18,16 @@ Those endpoints only show variants that are enabled for download/use.
 | Qwen3 Base (reference-voice cloning) | `Qwen3-TTS-12Hz-0.6B-Base`, `Qwen3-TTS-12Hz-0.6B-Base-4bit`, `Qwen3-TTS-12Hz-1.7B-Base`, `Qwen3-TTS-12Hz-1.7B-Base-4bit` |
 | Qwen3 CustomVoice (built-in speakers) | `Qwen3-TTS-12Hz-0.6B-CustomVoice`, `Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit`, `Qwen3-TTS-12Hz-1.7B-CustomVoice`, `Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit` |
 | Qwen3 VoiceDesign | `Qwen3-TTS-12Hz-1.7B-VoiceDesign`, `Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit` |
+| Voxtral TTS | `Voxtral-4B-TTS-2603` |
 | Kokoro | `Kokoro-82M` |
 
 > `Kokoro-82M` requires `espeak-ng`:
 > [macOS](../installation/macos.md#optional-install-espeak-ng-for-kokoro-82m),
 > [Linux](../installation/linux.md#optional-install-espeak-ng-for-kokoro-82m),
 > [Windows](../installation/windows.md#optional-install-espeak-ng-for-kokoro-82m)
+
+> `Voxtral-4B-TTS-2603` includes bundled voice assets licensed under CC BY-NC
+> 4.0 and supports 20 preset voices with 24 kHz output.
 
 ### Speech Recognition (ASR)
 

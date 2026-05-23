@@ -134,6 +134,7 @@ izwi tts "Long text for streaming" --stream --play
 | `qwen3-tts-0.6b-base` | Base | General-purpose TTS + reference-voice workflows |
 | `qwen3-tts-0.6b-customvoice` | CustomVoice | Built-in speaker presets |
 | `Qwen3-TTS-12Hz-1.7B-VoiceDesign` | Design | Voice design-capable model family |
+| `Voxtral-4B-TTS-2603` | Preset voices | 20 built-in voices, 24 kHz output, CC BY-NC 4.0 |
 | `qwen3-tts-1.7b-*` | Larger | Higher quality variants |
 
 ---

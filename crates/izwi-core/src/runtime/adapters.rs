@@ -118,7 +118,13 @@ impl RuntimeAdapterRegistry {
 }
 
 fn tts_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
-    if model_variant.is_kokoro() || model_variant.is_lfm25_audio_gguf() {
+    if model_variant.is_kokoro()
+        || model_variant.is_lfm25_audio_gguf()
+        || matches!(
+            model_variant.family(),
+            crate::catalog::ModelFamily::VoxtralTts
+        )
+    {
         ExecutionTargetKind::DirectModel
     } else {
         ExecutionTargetKind::TokenEngine
@@ -480,6 +486,21 @@ mod tests {
             .is_err());
         assert!(registry
             .require(CapabilityKind::SpeechToSpeech, variant)
+            .is_err());
+    }
+
+    #[test]
+    fn built_in_registry_marks_voxtral_tts_as_direct_tts_without_streaming() {
+        let registry = RuntimeAdapterRegistry::built_in();
+        let variant = ModelVariant::Voxtral4BTts2603;
+
+        let adapter = registry
+            .require(CapabilityKind::Tts, variant)
+            .expect("voxtral tts adapter");
+        assert_eq!(adapter.execution_target, ExecutionTargetKind::DirectModel);
+        assert_eq!(adapter.streaming_mode, StreamingMode::None);
+        assert!(registry
+            .require(CapabilityKind::StreamingTts, variant)
             .is_err());
     }
 

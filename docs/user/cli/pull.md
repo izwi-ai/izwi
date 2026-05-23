@@ -68,6 +68,7 @@ Common models:
 | `Qwen3-TTS-12Hz-0.6B-Base` | TTS (base) | ~2.3 GB |
 | `Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit` | TTS (built-in voices) | ~1.6 GB |
 | `Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit` | TTS (voice design) | ~2.2 GB |
+| `Voxtral-4B-TTS-2603` | TTS (20 preset voices, CC BY-NC 4.0) | ~8.1 GB |
 | `Parakeet-TDT-0.6B-v3` | ASR (default) | ~9.4 GB |
 | `Qwen3-ASR-0.6B-GGUF` | ASR (compact) | ~1.0 GB |
 | `Voxtral-Mini-4B-Realtime-2602` | ASR (offline transcription; realtime planned) | ~8 GB |

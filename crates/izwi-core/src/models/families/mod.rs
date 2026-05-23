@@ -41,6 +41,7 @@ const QWEN3_TTS_VARIANTS: &[ModelVariant] = &[
     ModelVariant::Qwen3Tts12Hz17BVoiceDesignBf16,
 ];
 const KOKORO_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::Kokoro82M];
+const VOXTRAL_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::Voxtral4BTts2603];
 const PARAKEET_ASR_VARIANTS: &[ModelVariant] = &[ModelVariant::ParakeetTdt06BV3];
 const WHISPER_ASR_VARIANTS: &[ModelVariant] = &[ModelVariant::WhisperLargeV3Turbo];
 const QWEN3_ASR_VARIANTS: &[ModelVariant] =
@@ -82,6 +83,8 @@ const TTS_STREAMING_CAPABILITIES: &[ConformanceCapability] = &[
     ConformanceCapability::StreamingTts,
 ];
 const TTS_STREAMING_FIXTURES: &[&str] = &["tts.short_text.binary", "streaming_tts.short_text"];
+const TTS_CAPABILITIES: &[ConformanceCapability] = &[ConformanceCapability::Tts];
+const TTS_FIXTURES: &[&str] = &["tts.short_text.binary"];
 const ASR_CAPABILITIES: &[ConformanceCapability] = &[ConformanceCapability::Asr];
 const ASR_FIXTURES: &[&str] = &["asr.short_wav.transcript"];
 const DIARIZATION_CAPABILITIES: &[ConformanceCapability] = &[ConformanceCapability::Diarization];
@@ -122,6 +125,13 @@ pub const MODEL_FAMILY_REGISTRATIONS: &[FamilyRegistration] = &[
         variants: KOKORO_TTS_VARIANTS,
         capabilities: TTS_STREAMING_CAPABILITIES,
         fixture_ids: TTS_STREAMING_FIXTURES,
+    },
+    FamilyRegistration {
+        family: ModelFamily::VoxtralTts,
+        module_path: "crate::models::architectures::voxtral::tts",
+        variants: VOXTRAL_TTS_VARIANTS,
+        capabilities: TTS_CAPABILITIES,
+        fixture_ids: TTS_FIXTURES,
     },
     FamilyRegistration {
         family: ModelFamily::ParakeetAsr,
