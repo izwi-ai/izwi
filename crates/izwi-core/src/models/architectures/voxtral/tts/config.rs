@@ -107,6 +107,8 @@ pub struct VoxtralTtsAcousticTransformerArgs {
     pub n_kv_heads: usize,
     #[serde(default)]
     pub use_biases: bool,
+    #[serde(default = "default_norm_eps")]
+    pub norm_eps: f64,
     pub rope_theta: f64,
     pub sigma: f32,
     #[serde(default)]
@@ -397,6 +399,10 @@ fn parse_usize_csv(name: &str, raw: &str) -> Result<Vec<usize>> {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_norm_eps() -> f64 {
+    1e-5
 }
 
 #[cfg(test)]
