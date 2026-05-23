@@ -210,19 +210,22 @@ impl VoxtralTtsPipeline {
         let voice_embedding = model.voice_embeddings.load(voice)?;
         let voice_frames = voice_embedding.dim(1)?;
         let prompt = self.tokenizer.build_speech_prompt(text, voice_frames)?;
-        let prompt_embeds = self.prompt_embeddings(
-            &prompt.input_ids,
-            &voice_embedding,
-            prompt.voice_token_range.as_ref(),
-        )?;
+        let prompt_embeds = self
+            .prompt_embeddings(
+                &prompt.input_ids,
+                &voice_embedding,
+                prompt.voice_token_range.as_ref(),
+            )
+            .map_err(|err| {
+                Error::InferenceError(format!("Voxtral TTS prompt embedding failed: {err}"))
+            })?;
         let mut cache = Qwen3Cache::new(self.language_model.num_layers());
-        let _prefill_hidden = self.language_model.forward_hidden_with_embeds(
-            &prompt_embeds,
-            0,
-            Some(&mut cache),
-            None,
-            None,
-        )?;
+        let _prefill_hidden = self
+            .language_model
+            .forward_hidden_with_embeds(&prompt_embeds, 0, Some(&mut cache), None, None)
+            .map_err(|err| {
+                Error::InferenceError(format!("Voxtral TTS LM prefill failed: {err}"))
+            })?;
         let mut pos = prompt.input_ids.len();
         let mut next_embed = self.language_model.embeddings(&Tensor::from_vec(
             vec![model.config.audio_token_id()],
@@ -232,20 +235,24 @@ impl VoxtralTtsPipeline {
         let mut frames = Vec::new();
 
         for _frame_idx in 0..params.max_frames.max(1) {
-            let hidden = self.language_model.forward_hidden_with_embeds(
-                &next_embed,
-                pos,
-                Some(&mut cache),
-                None,
-                None,
-            )?;
+            let hidden = self
+                .language_model
+                .forward_hidden_with_embeds(&next_embed, pos, Some(&mut cache), None, None)
+                .map_err(|err| {
+                    Error::InferenceError(format!("Voxtral TTS LM decode failed: {err}"))
+                })?;
             pos += 1;
             let last_hidden = hidden.i((0, hidden.dim(1)? - 1, ..))?;
-            let generated = self.acoustic_transformer.forward_audio_codes_with_steps(
-                &last_hidden,
-                params.cfg_alpha,
-                params.n_decoding_steps,
-            )?;
+            let generated = self
+                .acoustic_transformer
+                .forward_audio_codes_with_steps(
+                    &last_hidden,
+                    params.cfg_alpha,
+                    params.n_decoding_steps,
+                )
+                .map_err(|err| {
+                    Error::InferenceError(format!("Voxtral TTS acoustic generation failed: {err}"))
+                })?;
             let frame = generated.into_iter().next().ok_or_else(|| {
                 Error::InferenceError("Voxtral acoustic transformer returned no frames".to_string())
             })?;
@@ -262,8 +269,15 @@ impl VoxtralTtsPipeline {
             ));
         }
         let frames_generated = frames.len();
-        let timeline = VoxtralCodecTimeline::new(frames_to_codebooks(frames)?)?;
-        let samples = self.codec_decoder.decode_timeline(&timeline)?;
+        let timeline = VoxtralCodecTimeline::new(frames_to_codebooks(frames)?).map_err(|err| {
+            Error::InferenceError(format!("Voxtral TTS timeline construction failed: {err}"))
+        })?;
+        let samples = self
+            .codec_decoder
+            .decode_timeline(&timeline)
+            .map_err(|err| {
+                Error::InferenceError(format!("Voxtral TTS codec decode failed: {err}"))
+            })?;
         Ok(VoxtralTtsOutput {
             samples,
             sample_rate: model.codec_config.sample_rate,

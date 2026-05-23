@@ -11,6 +11,7 @@ use candle_nn::{
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::core::repeat_kv;
 
+use super::super::layers::linear_forward_last_dim;
 use super::acoustic::{strip_audio_token_offset, AudioCodeValue};
 use super::config::{VoxtralTtsAudioTokenizerArgs, VoxtralTtsConfig};
 
@@ -616,9 +617,9 @@ impl VoxtralCodecAttention {
         let seq_len = x.dim(1)?;
         let q_dim = self.n_heads * self.head_dim;
         let kv_dim = self.n_kv_heads * self.head_dim;
-        let mut q = self.wq.forward(x)?;
-        let mut k = self.wk.forward(x)?;
-        let v = self.wv.forward(x)?;
+        let mut q = linear_forward_last_dim(&self.wq, x)?;
+        let mut k = linear_forward_last_dim(&self.wk, x)?;
+        let v = linear_forward_last_dim(&self.wv, x)?;
         if let Some(norm) = &self.q_norm {
             q = norm.forward(&q)?;
         }
@@ -663,7 +664,7 @@ impl VoxtralCodecAttention {
                 "Voxtral codec attention produced an invalid shape".to_string(),
             ));
         }
-        self.wo.forward(&out).map_err(Error::from)
+        linear_forward_last_dim(&self.wo, &out)
     }
 }
 
@@ -677,10 +678,10 @@ impl VoxtralCodecFeedForward {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = self.w1.forward(x)?;
-        let up = self.w3.forward(x)?;
+        let gate = linear_forward_last_dim(&self.w1, x)?;
+        let up = linear_forward_last_dim(&self.w3, x)?;
         let hidden = ops::silu(&gate)?.broadcast_mul(&up)?;
-        self.w2.forward(&hidden).map_err(Error::from)
+        linear_forward_last_dim(&self.w2, &hidden)
     }
 }
 

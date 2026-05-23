@@ -6,6 +6,7 @@ use candle_nn::{ops, Linear, Module, RmsNorm, VarBuilder};
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::core::repeat_kv;
 
+use super::super::layers::linear_forward_last_dim;
 use super::config::{
     VoxtralTtsAcousticTransformerArgs, VoxtralTtsConfig, DEFAULT_CFG_ALPHA,
     DEFAULT_N_DECODING_STEPS,
@@ -219,11 +220,14 @@ impl FlowMatchingAudioTransformer {
             )));
         }
 
-        let semantic_logits = self.semantic_codebook_output.forward(&llm_hidden)?;
+        let semantic_logits = linear_forward_last_dim(&self.semantic_codebook_output, &llm_hidden)
+            .map_err(|err| Error::InferenceError(format!("semantic projection failed: {err}")))?;
         let semantic_codes =
-            semantic_codes_from_logits(&semantic_logits, self.generation.semantic_codebook_size)?;
-        let acoustic_codes =
-            self.decode_one_frame(&semantic_codes, &llm_hidden, cfg_alpha, n_decoding_steps)?;
+            semantic_codes_from_logits(&semantic_logits, self.generation.semantic_codebook_size)
+                .map_err(|err| Error::InferenceError(format!("semantic sampling failed: {err}")))?;
+        let acoustic_codes = self
+            .decode_one_frame(&semantic_codes, &llm_hidden, cfg_alpha, n_decoding_steps)
+            .map_err(|err| Error::InferenceError(format!("acoustic frame decode failed: {err}")))?;
         let mut frames = Vec::with_capacity(semantic_codes.len());
         for (semantic, acoustic) in semantic_codes.into_iter().zip(acoustic_codes) {
             let mut frame = Vec::with_capacity(self.generation.num_codebooks);
@@ -257,11 +261,20 @@ impl FlowMatchingAudioTransformer {
             let t = step as f32 / n_steps as f32;
             let dt = 1.0f64 / n_steps as f64;
             let t_values = Tensor::from_vec(vec![t; batch], (batch, 1), device)?.to_dtype(dtype)?;
-            let t_emb = self.time_embedding.forward(&t_values)?.to_dtype(dtype)?;
+            let t_emb = (|| -> Result<Tensor> {
+                Ok(self.time_embedding.forward(&t_values)?.to_dtype(dtype)?)
+            })()
+            .map_err(|err| {
+                Error::InferenceError(format!("time embedding step {step} failed: {err}"))
+            })?;
             let x_batched = Tensor::cat(&[sampled.clone(), sampled.clone()], 0)?;
             let llm_batched = Tensor::cat(&[llm_hidden.clone(), llm_hidden_zero.clone()], 0)?;
             let t_emb_batched = Tensor::cat(&[t_emb.clone(), t_emb], 0)?;
-            let velocity = self.predict_velocity(&x_batched, &llm_batched, &t_emb_batched)?;
+            let velocity = self
+                .predict_velocity(&x_batched, &llm_batched, &t_emb_batched)
+                .map_err(|err| {
+                    Error::InferenceError(format!("velocity prediction step {step} failed: {err}"))
+                })?;
             let cond = velocity.narrow(0, 0, batch)?;
             let uncond = velocity.narrow(0, batch, batch)?;
             let blended = blend_cfg_tensors(&cond, &uncond, cfg_alpha)?;
@@ -294,18 +307,21 @@ impl FlowMatchingAudioTransformer {
         t_emb: &Tensor,
     ) -> Result<Tensor> {
         let x_t = x_t.to_dtype(llm_output.dtype())?;
-        let projected_x = self.input_projection.forward(&x_t.unsqueeze(1)?)?;
-        let projected_t = self.time_projection.forward(t_emb)?.unsqueeze(1)?;
-        let projected_llm = self.llm_projection.forward(llm_output)?.unsqueeze(1)?;
+        let projected_x = linear_forward_last_dim(&self.input_projection, &x_t.unsqueeze(1)?)?;
+        let projected_t = linear_forward_last_dim(&self.time_projection, t_emb)?.unsqueeze(1)?;
+        let projected_llm =
+            linear_forward_last_dim(&self.llm_projection, llm_output)?.unsqueeze(1)?;
         let mut hidden = Tensor::cat(&[projected_x, projected_t, projected_llm], 1)?;
-        for layer in &self.layers {
-            hidden = layer.forward(&hidden)?;
+        for (idx, layer) in self.layers.iter().enumerate() {
+            hidden = layer.forward(&hidden).map_err(|err| {
+                Error::InferenceError(format!(
+                    "Voxtral acoustic transformer layer {idx} failed: {err}"
+                ))
+            })?;
         }
         let hidden = self.norm.forward(&hidden)?;
         let first = hidden.i((.., 0, ..))?;
-        self.acoustic_codebook_output
-            .forward(&first)
-            .map_err(Error::from)
+        linear_forward_last_dim(&self.acoustic_codebook_output, &first)
     }
 }
 
@@ -324,11 +340,15 @@ impl AcousticTransformerBlock {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let attn = self.attention.forward(&self.attention_norm.forward(x)?)?;
+        let attn = self
+            .attention
+            .forward(&self.attention_norm.forward(x)?)
+            .map_err(|err| Error::InferenceError(format!("attention failed: {err}")))?;
         let hidden = x.broadcast_add(&attn)?;
         let ff = self
             .feed_forward
-            .forward(&self.ffn_norm.forward(&hidden)?)?;
+            .forward(&self.ffn_norm.forward(&hidden)?)
+            .map_err(|err| Error::InferenceError(format!("feed-forward failed: {err}")))?;
         hidden.broadcast_add(&ff).map_err(Error::from)
     }
 }
@@ -368,18 +388,24 @@ impl BidirectionalAttention {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let batch = x.dim(0)?;
         let seq_len = x.dim(1)?;
-        let q = self
-            .wq
-            .forward(x)?
-            .reshape((batch, seq_len, self.n_heads, self.head_dim))?;
-        let k = self
-            .wk
-            .forward(x)?
-            .reshape((batch, seq_len, self.n_kv_heads, self.head_dim))?;
-        let v = self
-            .wv
-            .forward(x)?
-            .reshape((batch, seq_len, self.n_kv_heads, self.head_dim))?;
+        let q = linear_forward_last_dim(&self.wq, x)?.reshape((
+            batch,
+            seq_len,
+            self.n_heads,
+            self.head_dim,
+        ))?;
+        let k = linear_forward_last_dim(&self.wk, x)?.reshape((
+            batch,
+            seq_len,
+            self.n_kv_heads,
+            self.head_dim,
+        ))?;
+        let v = linear_forward_last_dim(&self.wv, x)?.reshape((
+            batch,
+            seq_len,
+            self.n_kv_heads,
+            self.head_dim,
+        ))?;
         let k = repeat_kv(&k, self.n_heads, self.n_kv_heads)?;
         let v = repeat_kv(&v, self.n_heads, self.n_kv_heads)?;
         let q = q.transpose(1, 2)?;
@@ -398,7 +424,7 @@ impl BidirectionalAttention {
             .reshape((batch, self.n_heads, seq_len, self.head_dim))?
             .transpose(1, 2)?
             .reshape((batch, seq_len, self.n_heads * self.head_dim))?;
-        self.wo.forward(&out).map_err(Error::from)
+        linear_forward_last_dim(&self.wo, &out)
     }
 }
 
@@ -411,10 +437,10 @@ impl AcousticFeedForward {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = self.w1.forward(x)?;
-        let up = self.w3.forward(x)?;
+        let gate = linear_forward_last_dim(&self.w1, x)?;
+        let up = linear_forward_last_dim(&self.w3, x)?;
         let hidden = ops::silu(&gate)?.broadcast_mul(&up)?;
-        self.w2.forward(&hidden).map_err(Error::from)
+        linear_forward_last_dim(&self.w2, &hidden)
     }
 }
 
@@ -617,6 +643,24 @@ mod tests {
         assert_eq!(padded_codebook_size(8192, true, 128), 8320);
         assert_eq!(padded_codebook_size(21, true, 128), 128);
         assert_eq!(padded_codebook_size(21, false, 0), 21);
+    }
+
+    #[test]
+    fn acoustic_linear_flattens_rank3_inputs_over_last_dim() {
+        let device = Device::Cpu;
+        let linear = Linear::new(Tensor::ones((4, 2), DType::F32, &device).unwrap(), None);
+        let input = Tensor::ones((3, 2), DType::F32, &device)
+            .unwrap()
+            .unsqueeze(1)
+            .unwrap();
+
+        let output = linear_forward_last_dim(&linear, &input).unwrap();
+
+        assert_eq!(output.dims(), &[3, 1, 4]);
+        assert_eq!(
+            output.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![2.0; 12]
+        );
     }
 
     #[test]
