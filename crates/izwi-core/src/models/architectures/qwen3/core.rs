@@ -55,6 +55,8 @@ pub struct Qwen3Config {
     #[serde(default)]
     pub lm_head_size: Option<usize>,
     #[serde(default)]
+    pub tie_word_embeddings: bool,
+    #[serde(default)]
     pub rope_scaling: Option<RopeScalingConfig>,
     #[serde(default)]
     pub sliding_window: Option<usize>,
