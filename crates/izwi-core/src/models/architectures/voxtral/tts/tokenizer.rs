@@ -128,28 +128,7 @@ impl VoxtralTtsTokenizer {
 
     pub fn build_speech_prompt(&self, text: &str, voice_frames: usize) -> Result<VoxtralTtsPrompt> {
         let text_tokens = self.encode_text(text)?;
-        let inst_start = self.specials.inst_start.ok_or_else(|| {
-            Error::TokenizationError("Voxtral TTS tokenizer is missing [INST] token".to_string())
-        })?;
-        let inst_end = self.specials.inst_end.ok_or_else(|| {
-            Error::TokenizationError("Voxtral TTS tokenizer is missing [/INST] token".to_string())
-        })?;
-
-        let mut input_ids = Vec::with_capacity(text_tokens.len() + voice_frames + 5);
-        input_ids.push(self.specials.bos);
-        input_ids.push(self.specials.begin_audio);
-        let voice_start = input_ids.len();
-        input_ids.extend(std::iter::repeat(self.specials.audio).take(voice_frames));
-        let voice_end = input_ids.len();
-        input_ids.push(inst_end);
-        input_ids.extend(text_tokens.iter().copied());
-        input_ids.push(inst_start);
-        input_ids.push(self.specials.begin_audio);
-        Ok(VoxtralTtsPrompt {
-            input_ids,
-            text_token_count: text_tokens.len(),
-            voice_token_range: Some(voice_start..voice_end),
-        })
+        build_speech_prompt_ids(&self.specials, &text_tokens, voice_frames)
     }
 
     pub fn decode_text(&self, tokens: &[u32]) -> Result<String> {
@@ -174,6 +153,35 @@ fn tokenization_error(context: impl Display, err: impl Display) -> Error {
     Error::TokenizationError(format!("{context}: {err}"))
 }
 
+fn build_speech_prompt_ids(
+    specials: &VoxtralTtsSpecialTokens,
+    text_tokens: &[u32],
+    voice_frames: usize,
+) -> Result<VoxtralTtsPrompt> {
+    let inst_start = specials.inst_start.ok_or_else(|| {
+        Error::TokenizationError("Voxtral TTS tokenizer is missing [INST] token".to_string())
+    })?;
+    let inst_end = specials.inst_end.ok_or_else(|| {
+        Error::TokenizationError("Voxtral TTS tokenizer is missing [/INST] token".to_string())
+    })?;
+
+    let mut input_ids = Vec::with_capacity(text_tokens.len() + voice_frames + 5);
+    input_ids.push(specials.bos);
+    input_ids.push(specials.begin_audio);
+    let voice_start = input_ids.len();
+    input_ids.extend(std::iter::repeat(specials.audio).take(voice_frames));
+    let voice_end = input_ids.len();
+    input_ids.push(inst_end);
+    input_ids.extend(text_tokens.iter().copied());
+    input_ids.push(inst_start);
+    input_ids.push(specials.begin_audio);
+    Ok(VoxtralTtsPrompt {
+        input_ids,
+        text_token_count: text_tokens.len(),
+        voice_token_range: Some(voice_start..voice_end),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +195,21 @@ mod tests {
         assert_eq!(specials.audio, 24);
         assert_eq!(specials.begin_audio, 25);
         assert!(specials.eos.is_none());
+    }
+
+    #[test]
+    fn speech_prompt_matches_mistral_reference_layout() {
+        let config = VoxtralTtsConfig::from_json_str(fixture_json()).unwrap();
+        let mut specials = VoxtralTtsSpecialTokens::from_config(&config);
+        specials.inst_start = Some(FALLBACK_INST_START_TOKEN_ID);
+        specials.inst_end = Some(FALLBACK_INST_END_TOKEN_ID);
+        let prompt = build_speech_prompt_ids(&specials, &[100, 101], 3).unwrap();
+
+        assert_eq!(
+            prompt.input_ids,
+            vec![1, 25, 24, 24, 24, 36, 100, 101, 35, 25]
+        );
+        assert_eq!(prompt.text_token_count, 2);
+        assert_eq!(prompt.voice_token_range, Some(2..5));
     }
 }
