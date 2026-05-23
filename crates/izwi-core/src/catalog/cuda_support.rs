@@ -129,9 +129,12 @@ impl ModelVariant {
                 CudaSupportLevel::CandleCudaGeneric,
                 "Sortformer uses Candle CUDA tensor kernels for inference when selected; preprocessing/postprocessing remain host-side orchestration",
             ),
+            ModelFamily::VoxtralTts => CudaSupportInfo::new(
+                CudaSupportLevel::CandleCudaGeneric,
+                "Voxtral TTS uses dense Candle CUDA tensor kernels for the LM, flow-matching acoustic transformer, and codec; progressive streaming remains final-only until CUDA-only chunked decode is proven",
+            ),
             ModelFamily::Qwen3Tts
             | ModelFamily::KokoroTts
-            | ModelFamily::VoxtralTts
             | ModelFamily::ParakeetAsr
             | ModelFamily::WhisperAsr
             | ModelFamily::Qwen3Asr
@@ -168,6 +171,10 @@ impl ModelVariant {
             ModelFamily::SortformerDiarization => CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::Dense,
                 "Sortformer checkpoint is dense F32 when loaded on CUDA",
+            ),
+            ModelFamily::VoxtralTts => CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::Dense,
+                "Voxtral TTS checkpoint is dense safetensors; CUDA dtype policy, not quantization, controls memory/performance tradeoffs",
             ),
             _ if self.is_qwen_chat_gguf()
                 || self.is_qwen35_chat_gguf()
@@ -297,6 +304,10 @@ mod tests {
                 .cuda_quantization()
                 .level,
             CudaQuantizationSupportLevel::DenseDequantizedFallback
+        );
+        assert_eq!(
+            ModelVariant::Voxtral4BTts2603.cuda_quantization().level,
+            CudaQuantizationSupportLevel::Dense
         );
     }
 

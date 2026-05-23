@@ -367,14 +367,18 @@ impl DeviceProfile {
                 reason: "CPU default dtype is F32".into(),
             },
             DeviceKind::Metal => DTypeSelection {
-                dtype: if request.model_family == Some(ModelFamily::Voxtral)
+                dtype: if request.model_family == Some(ModelFamily::VoxtralTts) {
+                    DType::F32
+                } else if request.model_family == Some(ModelFamily::Voxtral)
                     && request.checkpoint_dtype != Some(DType::F32)
                 {
                     DType::F16
                 } else {
                     DType::F32
                 },
-                reason: if request.model_family == Some(ModelFamily::Voxtral)
+                reason: if request.model_family == Some(ModelFamily::VoxtralTts) {
+                    "Voxtral TTS Metal policy keeps F32 across LM, acoustic transformer, and codec until lower-precision kernels are proven".into()
+                } else if request.model_family == Some(ModelFamily::Voxtral)
                     && request.checkpoint_dtype != Some(DType::F32)
                 {
                     "Voxtral Metal policy uses F16 to keep realtime decoding within Apple GPU memory and latency limits".into()
@@ -478,6 +482,26 @@ impl DeviceProfile {
                 dtype: DType::F32,
                 reason: "model family policy keeps CUDA default in F32".into(),
             }),
+            ModelFamily::VoxtralTts => {
+                if self.capabilities.supports_bf16 {
+                    Some(DTypeSelection {
+                        dtype: DType::BF16,
+                        reason: "Voxtral TTS CUDA policy defaults dense LM/acoustic stages to BF16 when supported".into(),
+                    })
+                } else if self.capabilities.supports_f16 {
+                    Some(DTypeSelection {
+                        dtype: DType::F16,
+                        reason:
+                            "Voxtral TTS CUDA policy falls back to F16 when BF16 is unavailable"
+                                .into(),
+                    })
+                } else {
+                    Some(DTypeSelection {
+                        dtype: DType::F32,
+                        reason: "Voxtral TTS CUDA policy falls back to F32 without reported half precision support".into(),
+                    })
+                }
+            }
             _ => None,
         }
     }
@@ -818,6 +842,10 @@ mod tests {
             metal_profile.select_model_dtype(ModelFamily::Qwen3Tts, None),
             DType::F32
         );
+        assert_eq!(
+            metal_profile.select_model_dtype(ModelFamily::VoxtralTts, None),
+            DType::F32
+        );
     }
 
     #[test]
@@ -909,6 +937,10 @@ mod tests {
         );
         assert_eq!(
             cuda_profile.select_model_dtype(ModelFamily::Voxtral, None),
+            DType::BF16
+        );
+        assert_eq!(
+            cuda_profile.select_model_dtype(ModelFamily::VoxtralTts, None),
             DType::BF16
         );
     }
