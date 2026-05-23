@@ -29,4 +29,7 @@ pub use model::{
 };
 pub use sampling::VoxtralTtsGenerationParams;
 pub use tokenizer::{VoxtralTtsPrompt, VoxtralTtsSpecialTokens, VoxtralTtsTokenizer};
-pub use voice::{VoxtralVoiceCatalog, VoxtralVoiceInfo, VOXTRAL_TTS_BUILT_IN_VOICES};
+pub use voice::{
+    VoxtralVoiceCatalog, VoxtralVoiceEmbeddingLibrary, VoxtralVoiceEmbeddingShape,
+    VoxtralVoiceInfo, VOXTRAL_TTS_BUILT_IN_VOICES,
+};
