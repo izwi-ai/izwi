@@ -1,0 +1,148 @@
+//! Tekken tokenizer wrapper for Voxtral TTS.
+
+use std::fmt::Display;
+use std::path::Path;
+
+use tekken::{SpecialTokenPolicy, Tekkenizer};
+
+use crate::error::{Error, Result};
+
+use super::config::VoxtralTtsConfig;
+
+const EOS_TOKEN_CANDIDATES: &[&str] = &["</s>", "~~ "];
+const END_AUDIO_TOKEN_CANDIDATES: &[&str] = &["[END_AUDIO]"];
+const TEXT_TO_AUDIO_TOKEN_CANDIDATES: &[&str] = &["[NEXT_AUDIO_TEXT]"];
+const AUDIO_TO_TEXT_TOKEN_CANDIDATES: &[&str] = &["[REPEAT_AUDIO_TEXT]"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoxtralTtsSpecialTokens {
+    pub bos: u32,
+    pub eos: Option<u32>,
+    pub audio: u32,
+    pub begin_audio: u32,
+    pub end_audio: Option<u32>,
+    pub text_to_audio: Option<u32>,
+    pub audio_to_text: Option<u32>,
+}
+
+impl VoxtralTtsSpecialTokens {
+    pub fn from_config(config: &VoxtralTtsConfig) -> Self {
+        Self {
+            bos: config.bos_token_id(),
+            eos: None,
+            audio: config.audio_token_id(),
+            begin_audio: config.begin_audio_token_id(),
+            end_audio: None,
+            text_to_audio: None,
+            audio_to_text: None,
+        }
+    }
+
+    fn with_tekken(mut self, tokenizer: &Tekkenizer) -> Self {
+        self.eos = optional_control_token(tokenizer, EOS_TOKEN_CANDIDATES);
+        self.end_audio = optional_control_token(tokenizer, END_AUDIO_TOKEN_CANDIDATES);
+        self.text_to_audio = optional_control_token(tokenizer, TEXT_TO_AUDIO_TOKEN_CANDIDATES);
+        self.audio_to_text = optional_control_token(tokenizer, AUDIO_TO_TEXT_TOKEN_CANDIDATES);
+        self
+    }
+
+    pub fn is_tts_control_token(&self, token: u32) -> bool {
+        token == self.bos
+            || token == self.audio
+            || token == self.begin_audio
+            || self.eos == Some(token)
+            || self.end_audio == Some(token)
+            || self.text_to_audio == Some(token)
+            || self.audio_to_text == Some(token)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoxtralTtsPrompt {
+    pub input_ids: Vec<u32>,
+    pub text_token_count: usize,
+}
+
+pub struct VoxtralTtsTokenizer {
+    inner: Tekkenizer,
+    specials: VoxtralTtsSpecialTokens,
+}
+
+impl VoxtralTtsTokenizer {
+    pub fn load(model_dir: &Path, config: &VoxtralTtsConfig) -> Result<Self> {
+        let tekken_path = model_dir.join("tekken.json");
+        let inner = Tekkenizer::from_file(&tekken_path)
+            .map_err(|err| tokenization_error(format!("load {}", tekken_path.display()), err))?;
+        let specials = VoxtralTtsSpecialTokens::from_config(config).with_tekken(&inner);
+        Ok(Self { inner, specials })
+    }
+
+    pub fn specials(&self) -> &VoxtralTtsSpecialTokens {
+        &self.specials
+    }
+
+    pub fn vocab_size(&self) -> usize {
+        self.inner.vocab_size()
+    }
+
+    pub fn encode_text(&self, text: &str) -> Result<Vec<u32>> {
+        self.inner
+            .encode(text, false, false)
+            .map_err(|err| tokenization_error("encode Voxtral TTS text", err))
+    }
+
+    /// Build the conservative text-to-audio prefix used before acoustic frames
+    /// are generated. Full voice-conditioning prompt assembly lives in the
+    /// generation phase because it depends on loaded preset embeddings.
+    pub fn build_text_to_audio_prompt(&self, text: &str) -> Result<VoxtralTtsPrompt> {
+        let text_tokens = self.encode_text(text)?;
+        let mut input_ids = Vec::with_capacity(text_tokens.len() + 3);
+        input_ids.push(self.specials.bos);
+        input_ids.extend(text_tokens.iter().copied());
+        if let Some(text_to_audio) = self.specials.text_to_audio {
+            input_ids.push(text_to_audio);
+        }
+        input_ids.push(self.specials.begin_audio);
+        Ok(VoxtralTtsPrompt {
+            input_ids,
+            text_token_count: text_tokens.len(),
+        })
+    }
+
+    pub fn decode_text(&self, tokens: &[u32]) -> Result<String> {
+        let text_tokens = tokens
+            .iter()
+            .copied()
+            .filter(|token| !self.specials.is_tts_control_token(*token))
+            .collect::<Vec<_>>();
+        self.inner
+            .decode(&text_tokens, SpecialTokenPolicy::Ignore)
+            .map_err(|err| tokenization_error("decode Voxtral TTS text", err))
+    }
+}
+
+fn optional_control_token(tokenizer: &Tekkenizer, candidates: &[&str]) -> Option<u32> {
+    candidates
+        .iter()
+        .find_map(|candidate| tokenizer.get_control_token(candidate).ok())
+}
+
+fn tokenization_error(context: impl Display, err: impl Display) -> Error {
+    Error::TokenizationError(format!("{context}: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::architectures::voxtral::tts::config::{fixture_json, VoxtralTtsConfig};
+
+    #[test]
+    fn special_tokens_come_from_params_without_tekken() {
+        let config = VoxtralTtsConfig::from_json_str(fixture_json()).unwrap();
+        let specials = VoxtralTtsSpecialTokens::from_config(&config);
+        assert_eq!(specials.bos, 1);
+        assert_eq!(specials.audio, 24);
+        assert_eq!(specials.begin_audio, 25);
+        assert!(specials.eos.is_none());
+    }
+}
