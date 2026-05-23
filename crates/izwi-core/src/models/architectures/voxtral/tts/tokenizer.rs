@@ -216,4 +216,20 @@ mod tests {
         assert_eq!(prompt.text_token_count, 2);
         assert_eq!(prompt.voice_token_range, Some(2..5));
     }
+
+    #[test]
+    fn speech_prompt_uses_text_audio_separators_even_when_inst_tokens_exist() {
+        let config = VoxtralTtsConfig::from_json_str(fixture_json()).unwrap();
+        let mut specials = VoxtralTtsSpecialTokens::from_config(&config);
+        specials.text_to_audio = Some(36);
+        specials.audio_to_text = Some(35);
+        specials.inst_start = Some(3);
+        specials.inst_end = Some(4);
+
+        let prompt = build_speech_prompt_ids(&specials, &[100, 101], 2).unwrap();
+
+        assert_eq!(prompt.input_ids, vec![1, 25, 24, 24, 36, 100, 101, 35, 25]);
+        assert!(!prompt.input_ids.contains(&3));
+        assert!(!prompt.input_ids.contains(&4));
+    }
 }
