@@ -240,6 +240,7 @@ impl From<MistralConfig> for Qwen3Config {
             rope_theta: cfg.rope_theta as f64,
             vocab_size: cfg.vocab_size,
             lm_head_size: None,
+            tie_word_embeddings: cfg.tie_word_embeddings,
             rope_scaling: None,
             sliding_window: cfg.use_sliding_window.then_some(cfg.sliding_window),
             use_sliding_window: cfg.use_sliding_window,

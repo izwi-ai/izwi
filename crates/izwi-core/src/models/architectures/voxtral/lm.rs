@@ -90,7 +90,7 @@ impl VoxtralLM {
 
         let norm = candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))?;
 
-        let lm_head = load_lm_head_from_candidates(&vb, &cfg)?;
+        let lm_head = load_lm_head_from_candidates(&vb, &cfg, &embed_tokens)?;
 
         let use_mrope = cfg
             .rope_scaling
@@ -167,7 +167,11 @@ fn load_embedding_from_candidates(vb: &VarBuilder, cfg: &Qwen3Config) -> Result<
     )))
 }
 
-fn load_lm_head_from_candidates(vb: &VarBuilder, cfg: &Qwen3Config) -> Result<Linear> {
+fn load_lm_head_from_candidates(
+    vb: &VarBuilder,
+    cfg: &Qwen3Config,
+    embed_tokens: &Embedding,
+) -> Result<Linear> {
     let root = vb.root();
     for candidate in LM_HEAD_WEIGHT_CANDIDATES {
         if root.contains_tensor(candidate) {
@@ -176,9 +180,13 @@ fn load_lm_head_from_candidates(vb: &VarBuilder, cfg: &Qwen3Config) -> Result<Li
         }
     }
 
+    if cfg.tie_word_embeddings {
+        return Ok(Linear::new(embed_tokens.embeddings().clone(), None));
+    }
+
     Err(Error::ModelLoadError(format!(
-        "Voxtral checkpoint is missing LM head weights; tried {}",
-        LM_HEAD_WEIGHT_CANDIDATES.join(", ")
+        "Voxtral checkpoint is missing LM head weights and tie_word_embeddings is false; tried {}",
+        LM_HEAD_WEIGHT_CANDIDATES.join(", "),
     )))
 }
 
@@ -613,6 +621,7 @@ mod tests {
             rope_theta: 10000.0,
             vocab_size: 3,
             lm_head_size: None,
+            tie_word_embeddings: false,
             rope_scaling: None,
             sliding_window: None,
             use_sliding_window: false,
@@ -667,7 +676,7 @@ mod tests {
         );
 
         let embeddings = load_embedding_from_candidates(&vb, &cfg).unwrap();
-        let head = load_lm_head_from_candidates(&vb, &cfg).unwrap();
+        let head = load_lm_head_from_candidates(&vb, &cfg, &embeddings).unwrap();
 
         assert_eq!(embeddings.embeddings().dims(), &[3, 4]);
         assert_eq!(head.weight().dims(), &[3, 4]);
@@ -680,10 +689,36 @@ mod tests {
         let vb = VarBuilder::from_tensors(HashMap::new(), DType::F32, &device);
 
         let embed_err = load_embedding_from_candidates(&vb, &cfg).unwrap_err();
-        let head_err = load_lm_head_from_candidates(&vb, &cfg).unwrap_err();
+        let embed_weight = Tensor::zeros((3, 4), DType::F32, &device).unwrap();
+        let embeddings = Embedding::new(embed_weight, cfg.hidden_size);
+        let head_err = load_lm_head_from_candidates(&vb, &cfg, &embeddings).unwrap_err();
 
         assert!(format!("{embed_err}").contains("missing token embedding weights"));
         assert!(format!("{head_err}").contains("missing LM head weights"));
+    }
+
+    #[test]
+    fn voxtral_lm_ties_missing_head_to_embeddings_when_configured() {
+        let device = Device::Cpu;
+        let mut cfg = tiny_cfg();
+        cfg.tie_word_embeddings = true;
+        let embed_weight = Tensor::from_vec(
+            (0..12).map(|v| v as f32).collect::<Vec<_>>(),
+            (3, 4),
+            &device,
+        )
+        .unwrap();
+        let vb = VarBuilder::from_tensors(
+            HashMap::from([("tok_embeddings.weight".to_string(), embed_weight.clone())]),
+            DType::F32,
+            &device,
+        );
+        let embeddings = load_embedding_from_candidates(&vb, &cfg).unwrap();
+
+        let head = load_lm_head_from_candidates(&vb, &cfg, &embeddings).unwrap();
+
+        assert_eq!(head.weight().dims(), &[3, 4]);
+        assert_eq!(max_abs_diff(head.weight(), &embed_weight), 0.0);
     }
 
     #[test]
