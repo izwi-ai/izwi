@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use candle_core::{DType, IndexOp, Tensor, D};
+use candle_core::{DType, IndexOp, Tensor};
 use candle_nn::{Module, VarBuilder};
 use tracing::info;
 
@@ -10,7 +10,7 @@ use crate::audio::{MelConfig, MelSpectrogram};
 use crate::backends::{DeviceKind, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
-use crate::models::architectures::qwen3::core::Qwen3Cache;
+use crate::models::architectures::qwen3::core::{build_rope_cache, Qwen3Cache};
 use crate::models::architectures::voxtral::lm::VoxtralLM;
 use crate::models::shared::attention::flash::{
     flash_attention_compiled, flash_attention_requested, try_fused_self_attention,
@@ -33,8 +33,10 @@ pub struct VoxtralRealtimeModel {
     language_model: VoxtralLM,
     time_embedding: TimeEmbedding,
     mel: MelSpectrogram,
+    global_log_mel_max: Option<f32>,
     num_delay_tokens: usize,
     streaming_left_pad_tokens: usize,
+    offline_left_pad_tokens: usize,
     streaming_right_pad_tokens: usize,
     raw_audio_length_per_tok: usize,
     block_pool_size: usize,
@@ -101,7 +103,7 @@ impl VoxtralRealtimeModel {
             n_mels: audio_cfg.num_mel_bins,
             f_min: 0.0,
             f_max: 8000.0,
-            normalize: true,
+            normalize: audio_cfg.global_log_mel_max.is_none(),
         };
         let mel = MelSpectrogram::new(mel_cfg)?;
 
@@ -117,6 +119,8 @@ impl VoxtralRealtimeModel {
         };
         let tokenizer = VoxtralTokenizer::load(model_dir, audio_config)?;
         let streaming_left_pad_tokens = tokenizer.audio_config().streaming_left_pad_tokens;
+        let offline_left_pad_tokens =
+            offline_left_pad_tokens_for_generation(streaming_left_pad_tokens, num_delay_tokens);
         let streaming_right_pad_tokens = tokenizer.audio_config().offline_right_pad_tokens();
         let raw_audio_length_per_tok = tokenizer.audio_config().raw_audio_length_per_tok();
 
@@ -159,8 +163,10 @@ impl VoxtralRealtimeModel {
             language_model,
             time_embedding,
             mel,
+            global_log_mel_max: audio_cfg.global_log_mel_max,
             num_delay_tokens,
             streaming_left_pad_tokens,
+            offline_left_pad_tokens,
             streaming_right_pad_tokens,
             raw_audio_length_per_tok,
             block_pool_size,
@@ -219,20 +225,15 @@ impl VoxtralRealtimeModel {
         let padded_audio = self.pad_offline_streaming_audio(&audio);
 
         // Compute mel spectrogram
-        let mel_spec = self.mel.compute(&padded_audio)?;
+        let mut mel_spec = self.mel.compute(&padded_audio)?;
+        drop_last_mel_frame_for_voxtral(&mut mel_spec);
+        if let Some(max_val) = self.global_log_mel_max {
+            normalize_log_mel_with_max(&mut mel_spec, max_val);
+        }
         let n_mels = self.mel.config().n_mels;
         let frames = mel_spec.len();
 
-        // Convert to tensor: [n_mels, frames] -> [1, n_mels, frames]
-        let mut flat = Vec::with_capacity(frames * n_mels);
-        for frame in mel_spec.iter() {
-            flat.extend_from_slice(frame);
-        }
-
-        let mel = Tensor::from_vec(flat, (n_mels, frames), &self.device.device)?
-            .transpose(0, 1)?
-            .unsqueeze(0)? // [1, frames, n_mels]
-            .to_dtype(self.dtype)?;
+        let mel = mel_frames_to_tensor(&mel_spec, n_mels, &self.device.device, self.dtype)?;
 
         // Process through whisper encoder
         let audio_embeds = self.whisper_encoder.forward(&mel)?;
@@ -272,30 +273,70 @@ impl VoxtralRealtimeModel {
         let t_cond = self.time_embedding.forward(&time_tensor)?;
 
         // Generate
-        let prompt_tokens = self.tokenizer.build_transcription_prompt()?;
+        let mut prompt_tokens = self.tokenizer.build_transcription_prompt()?;
+        prompt_tokens.truncate(voxtral_generation_prefix_len(prompt_tokens.len()));
         let prompt_len = prompt_tokens.len();
         let max_frames = audio_frames.min(1024);
+        if prompt_len > max_frames {
+            return Err(Error::InferenceError(format!(
+                "Voxtral prompt length ({prompt_len}) exceeds available audio frames ({max_frames})"
+            )));
+        }
         let mut cache = self.build_decode_cache(max_frames);
         let cache_diagnostics = self.cache_diagnostics(&cache);
         let mut generated = Vec::new();
         let mut assembled = String::new();
         let specials = self.tokenizer.specials().clone();
-        let mut prev_token: Option<u32> = None;
 
-        for frame_idx in 0..max_frames {
-            let input_token = prompt_tokens
-                .get(frame_idx)
-                .copied()
-                .or(prev_token)
-                .unwrap_or(specials.eos);
-            let input_tensor = Tensor::from_vec(vec![input_token], (1, 1), &self.device.device)?;
+        let prompt_tensor =
+            Tensor::from_vec(prompt_tokens.clone(), (1, prompt_len), &self.device.device)?;
+        let text_embeds = self.language_model.embeddings(&prompt_tensor)?;
+        let mut audio_prompt = audio_embeds.narrow(1, 0, prompt_len)?;
+        if audio_prompt.dtype() != text_embeds.dtype() {
+            audio_prompt = audio_prompt.to_dtype(text_embeds.dtype())?;
+        }
+        let prompt_embeds = audio_prompt.broadcast_add(&text_embeds)?;
+        let prompt_t_cond = if t_cond.dtype() == prompt_embeds.dtype() {
+            t_cond.clone()
+        } else {
+            t_cond.to_dtype(prompt_embeds.dtype())?
+        };
+        let logits = self.language_model.forward_with_embeds(
+            &prompt_embeds,
+            0,
+            Some(&mut cache),
+            None,
+            Some(&prompt_t_cond),
+        )?;
+        let next_logits = logits.i((0, logits.dim(1)? - 1))?;
+        let mut next = argmax(&next_logits)?;
+        let mut frame_idx = prompt_len;
+
+        loop {
+            if next == specials.eos || Some(next) == specials.end_audio {
+                break;
+            }
+
+            append_generated_token(
+                &self.tokenizer,
+                &mut generated,
+                &mut assembled,
+                next,
+                &mut on_delta,
+            )?;
+
+            if frame_idx >= max_frames {
+                break;
+            }
+
+            let input_tensor = Tensor::from_vec(vec![next], (1, 1), &self.device.device)?;
             let text_embed = self.language_model.embeddings(&input_tensor)?;
             let mut audio_step = audio_embeds.narrow(1, frame_idx, 1)?;
             if audio_step.dtype() != text_embed.dtype() {
                 audio_step = audio_step.to_dtype(text_embed.dtype())?;
             }
             let step_embeds = audio_step.broadcast_add(&text_embed)?;
-            let t_cond = if t_cond.dtype() == step_embeds.dtype() {
+            let step_t_cond = if t_cond.dtype() == step_embeds.dtype() {
                 t_cond.clone()
             } else {
                 t_cond.to_dtype(step_embeds.dtype())?
@@ -306,31 +347,11 @@ impl VoxtralRealtimeModel {
                 frame_idx,
                 Some(&mut cache),
                 None,
-                Some(&t_cond),
+                Some(&step_t_cond),
             )?;
             let next_logits = logits.i((0, logits.dim(1)? - 1))?;
-            let next = argmax(&next_logits)?;
-
-            let should_emit = frame_idx + 1 >= prompt_len;
-            if !should_emit {
-                continue;
-            }
-
-            if next == specials.eos || Some(next) == specials.end_audio {
-                break;
-            }
-
-            generated.push(next);
-            let decoded = self.tokenizer.decode_text(&generated)?;
-            let delta = text_delta(&assembled, &decoded);
-            if let Some(on_delta) = on_delta.as_deref_mut() {
-                for ch in delta.chars() {
-                    let mut buf = [0u8; 4];
-                    on_delta(ch.encode_utf8(&mut buf));
-                }
-            }
-            assembled = decoded;
-            prev_token = Some(next);
+            next = argmax(&next_logits)?;
+            frame_idx += 1;
         }
 
         Ok(VoxtralTranscriptionOutput {
@@ -354,7 +375,7 @@ impl VoxtralRealtimeModel {
         let (left_pad, right_pad) = offline_streaming_padding_samples(
             audio.len(),
             self.raw_audio_length_per_tok,
-            self.streaming_left_pad_tokens,
+            self.offline_left_pad_tokens,
             self.streaming_right_pad_tokens,
         );
         let mut padded = Vec::with_capacity(left_pad + audio.len() + right_pad);
@@ -421,6 +442,7 @@ impl VoxtralRealtimeModel {
             "config": {
                 "num_delay_tokens": self.num_delay_tokens,
                 "streaming_left_pad_tokens": self.streaming_left_pad_tokens,
+                "offline_left_pad_tokens": self.offline_left_pad_tokens,
                 "streaming_right_pad_tokens": self.streaming_right_pad_tokens,
                 "raw_audio_length_per_tok": self.raw_audio_length_per_tok,
                 "block_pool_size": self.block_pool_size,
@@ -431,21 +453,26 @@ impl VoxtralRealtimeModel {
 
     /// Pool audio embeddings by block_size
     fn pool_audio_embeddings(&self, audio_embeds: &Tensor) -> Result<Tensor> {
-        let (bsz, seq_len, hidden) = audio_embeds.dims3()?;
-        let pool_size = self.block_pool_size;
+        pool_audio_embeddings_by_block(audio_embeds, self.block_pool_size)
+    }
+}
 
-        // Ensure seq_len is divisible by pool_size
-        let new_len = seq_len / pool_size;
-        let truncated_len = new_len * pool_size;
+fn pool_audio_embeddings_by_block(audio_embeds: &Tensor, pool_size: usize) -> Result<Tensor> {
+    let (bsz, seq_len, hidden) = audio_embeds.dims3()?;
+    let pool_size = pool_size.max(1);
 
-        if truncated_len < seq_len {
-            let audio_embeds = audio_embeds.narrow(1, seq_len - truncated_len, truncated_len)?;
-            let reshaped = audio_embeds.reshape((bsz, new_len, hidden * pool_size))?;
-            Ok(reshaped)
-        } else {
-            let reshaped = audio_embeds.reshape((bsz, new_len, hidden * pool_size))?;
-            Ok(reshaped)
-        }
+    // Ensure seq_len is divisible by pool_size, keeping the left padding/prefix
+    // alignment intact and dropping only trailing frames.
+    let new_len = seq_len / pool_size;
+    let truncated_len = new_len * pool_size;
+
+    if truncated_len < seq_len {
+        let audio_embeds = audio_embeds.narrow(1, 0, truncated_len)?;
+        let reshaped = audio_embeds.reshape((bsz, new_len, hidden * pool_size))?;
+        Ok(reshaped)
+    } else {
+        let reshaped = audio_embeds.reshape((bsz, new_len, hidden * pool_size))?;
+        Ok(reshaped)
     }
 }
 
@@ -456,7 +483,7 @@ pub struct WhisperEncoder {
     layers: Vec<WhisperEncoderLayer>,
     ln_post: Option<candle_nn::LayerNorm>,
     ln_post_rms: Option<candle_nn::RmsNorm>,
-    embed_positions: Tensor,
+    embed_positions: Option<Tensor>,
     is_causal: bool,
 }
 
@@ -546,28 +573,16 @@ impl WhisperEncoder {
             (Some(norm), None)
         };
 
-        // Sinusoidal position embeddings
-        let max_len = cfg.max_source_positions;
-        let hidden = cfg.d_model;
-        let half_hidden = hidden / 2;
-        let log_theta = (10000f32).ln() / (half_hidden as f32 - 1.0);
-        let inv_freq: Vec<f32> = (0..half_hidden)
-            .map(|i| (-log_theta * i as f32).exp())
-            .collect();
-
-        let mut pos_embed_data = Vec::with_capacity(max_len * hidden);
-        for pos in 0..max_len {
-            for i in 0..half_hidden {
-                let timescale = inv_freq[i];
-                pos_embed_data.push((pos as f32 * timescale).sin());
-            }
-            for i in 0..half_hidden {
-                let timescale = inv_freq[i];
-                pos_embed_data.push((pos as f32 * timescale).cos());
-            }
-        }
-
-        let embed_positions = Tensor::from_vec(pos_embed_data, (max_len, hidden), vb.device())?;
+        let use_rope_positions = is_voxtral && cfg.pos_embed.eq_ignore_ascii_case("rope");
+        let embed_positions = if use_rope_positions {
+            None
+        } else {
+            Some(build_sinusoidal_positions(
+                cfg.max_source_positions,
+                cfg.d_model,
+                vb.device(),
+            )?)
+        };
 
         Ok(Self {
             conv1,
@@ -594,11 +609,16 @@ impl WhisperEncoder {
         // Transpose back: [batch, hidden, frames] -> [batch, frames, hidden]
         let x = x.transpose(1, 2)?;
 
-        // Add positional embeddings
+        // Add absolute positional embeddings for classic Whisper. Voxtral Realtime uses RoPE
+        // inside each causal attention layer instead.
         let seq_len = x.dim(1)?;
-        let pos_embed = self.embed_positions.narrow(0, 0, seq_len)?;
-        let pos_embed = pos_embed.unsqueeze(0)?.broadcast_as(x.shape())?;
-        let x = x.broadcast_add(&pos_embed)?;
+        let x = if let Some(embed_positions) = &self.embed_positions {
+            let pos_embed = embed_positions.narrow(0, 0, seq_len)?;
+            let pos_embed = pos_embed.unsqueeze(0)?.broadcast_as(x.shape())?;
+            x.broadcast_add(&pos_embed)?
+        } else {
+            x
+        };
 
         // Transformer layers
         let mut x = x;
@@ -649,6 +669,30 @@ fn prepare_realtime_conv_input(mel: &Tensor) -> Result<Tensor> {
     mel.unsqueeze(0).map_err(Error::from)
 }
 
+fn build_sinusoidal_positions(
+    max_len: usize,
+    hidden: usize,
+    device: &candle_core::Device,
+) -> Result<Tensor> {
+    let half_hidden = hidden / 2;
+    let log_theta = (10000f32).ln() / (half_hidden as f32 - 1.0);
+    let inv_freq: Vec<f32> = (0..half_hidden)
+        .map(|i| (-log_theta * i as f32).exp())
+        .collect();
+
+    let mut pos_embed_data = Vec::with_capacity(max_len * hidden);
+    for pos in 0..max_len {
+        for timescale in inv_freq.iter().take(half_hidden) {
+            pos_embed_data.push((pos as f32 * timescale).sin());
+        }
+        for timescale in inv_freq.iter().take(half_hidden) {
+            pos_embed_data.push((pos as f32 * timescale).cos());
+        }
+    }
+
+    Tensor::from_vec(pos_embed_data, (max_len, hidden), device).map_err(Error::from)
+}
+
 /// Whisper encoder layer
 struct WhisperEncoderLayer {
     self_attn_layer_norm: Option<candle_nn::LayerNorm>,
@@ -684,17 +728,13 @@ impl WhisperEncoderLayer {
             };
 
         let (fc1, fc2, ffn_w1, ffn_w2, ffn_w3) = if is_voxtral {
-            // Voxtral uses w1, w2, w3 for feed-forward (no bias)
+            // Voxtral audio uses SwiGLU with a biased down projection.
             let w1 = candle_nn::linear_no_bias(
                 cfg.d_model,
                 cfg.encoder_ffn_dim,
                 vb.pp("feed_forward.w1"),
             )?;
-            let w2 = candle_nn::linear_no_bias(
-                cfg.encoder_ffn_dim,
-                cfg.d_model,
-                vb.pp("feed_forward.w2"),
-            )?;
+            let w2 = candle_nn::linear(cfg.encoder_ffn_dim, cfg.d_model, vb.pp("feed_forward.w2"))?;
             let w3 = candle_nn::linear_no_bias(
                 cfg.d_model,
                 cfg.encoder_ffn_dim,
@@ -768,6 +808,9 @@ struct WhisperAttention {
     num_heads: usize,
     head_dim: usize,
     scale: f64,
+    use_rope_positions: bool,
+    rope_theta: f64,
+    sliding_window: Option<usize>,
 }
 
 impl WhisperAttention {
@@ -821,6 +864,9 @@ impl WhisperAttention {
             num_heads: cfg.encoder_attention_heads,
             head_dim,
             scale,
+            use_rope_positions: is_voxtral && cfg.pos_embed.eq_ignore_ascii_case("rope"),
+            rope_theta: cfg.rope_theta,
+            sliding_window: (cfg.is_causal && cfg.sliding_window > 0).then_some(cfg.sliding_window),
         })
     }
 
@@ -832,28 +878,42 @@ impl WhisperAttention {
         let v = self.v_proj.forward(x)?;
 
         // Reshape for multi-head attention
-        let q = q
-            .reshape((bsz, seq_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((bsz, seq_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
+        let mut q = q.reshape((bsz, seq_len, self.num_heads, self.head_dim))?;
+        let mut k = k.reshape((bsz, seq_len, self.num_heads, self.head_dim))?;
         let v = v
             .reshape((bsz, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        if let Some(fused_out) =
-            try_fused_self_attention(&q, &k, &v, None, self.head_dim, is_causal)?
-        {
-            let attn_output = fused_out.transpose(1, 2)?.reshape((
-                bsz,
+        if self.use_rope_positions {
+            let (cos, sin) = build_rope_cache(
                 seq_len,
-                self.num_heads * self.head_dim,
-            ))?;
-            return self
-                .out_proj
-                .forward(&attn_output)
-                .map_err(|e| Error::InferenceError(e.to_string()));
+                self.head_dim,
+                0,
+                self.rope_theta,
+                x.device(),
+                q.dtype(),
+            )?;
+            q = apply_interleaved_rotary_emb(&q, &cos, &sin)?;
+            k = apply_interleaved_rotary_emb(&k, &cos, &sin)?;
+        }
+
+        let q = q.transpose(1, 2)?;
+        let k = k.transpose(1, 2)?;
+
+        if self.sliding_window.is_none() {
+            if let Some(fused_out) =
+                try_fused_self_attention(&q, &k, &v, None, self.head_dim, is_causal)?
+            {
+                let attn_output = fused_out.transpose(1, 2)?.reshape((
+                    bsz,
+                    seq_len,
+                    self.num_heads * self.head_dim,
+                ))?;
+                return self
+                    .out_proj
+                    .forward(&attn_output)
+                    .map_err(|e| Error::InferenceError(e.to_string()));
+            }
         }
 
         // Scaled dot-product attention
@@ -862,15 +922,17 @@ impl WhisperAttention {
         let v = v.reshape((bsz * self.num_heads, seq_len, self.head_dim))?;
 
         let attn_weights = q.matmul(&k.transpose(1, 2)?)?;
-        let attn_weights = attn_weights.broadcast_mul(&Tensor::from_vec(
-            vec![self.scale as f32],
-            (1, 1, 1),
-            attn_weights.device(),
-        )?)?;
+        let attn_scale = attention_scale_tensor(self.scale, &attn_weights)?;
+        let attn_weights = attn_weights.broadcast_mul(&attn_scale)?;
 
-        // Apply causal mask if needed
+        // Apply causal/sliding mask if needed
         let attn_weights = if is_causal {
-            let mask = create_causal_mask(seq_len, x.device(), attn_weights.dtype())?;
+            let mask = create_causal_mask(
+                seq_len,
+                self.sliding_window,
+                x.device(),
+                attn_weights.dtype(),
+            )?;
             attn_weights.broadcast_add(&mask)?
         } else {
             attn_weights
@@ -893,19 +955,120 @@ impl WhisperAttention {
 
 fn create_causal_mask(
     seq_len: usize,
+    sliding_window: Option<usize>,
     device: &candle_core::Device,
     dtype: DType,
 ) -> Result<Tensor> {
     let mut mask = vec![0.0f32; seq_len * seq_len];
     for i in 0..seq_len {
-        for j in (i + 1)..seq_len {
-            mask[i * seq_len + j] = f32::MIN;
+        let earliest = sliding_window
+            .filter(|window| *window > 0)
+            .map(|window| i.saturating_add(1).saturating_sub(window))
+            .unwrap_or(0);
+        for j in 0..seq_len {
+            if j > i || j < earliest {
+                mask[i * seq_len + j] = f32::MIN;
+            }
         }
     }
     let mask_tensor = Tensor::from_vec(mask, (seq_len, seq_len), device)?;
     mask_tensor
         .to_dtype(dtype)
         .map_err(|e| Error::InferenceError(e.to_string()))
+}
+
+fn attention_scale_tensor(scale: f64, reference: &Tensor) -> Result<Tensor> {
+    Tensor::from_vec(vec![scale as f32], (1, 1, 1), reference.device())?
+        .to_dtype(reference.dtype())
+        .map_err(Error::from)
+}
+
+fn apply_interleaved_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    let bsz = x.dim(0)?;
+    let seq_len = x.dim(1)?;
+    let heads = x.dim(2)?;
+    let head_dim = x.dim(3)?;
+    let half_dim = head_dim / 2;
+    let x = x.reshape((bsz, seq_len, heads, half_dim, 2))?;
+    let x1 = x.narrow(4, 0, 1)?.squeeze(4)?;
+    let x2 = x.narrow(4, 1, 1)?.squeeze(4)?;
+
+    let cos = cos.unsqueeze(0)?.unsqueeze(2)?;
+    let sin = sin.unsqueeze(0)?.unsqueeze(2)?;
+    let rot1 = x1
+        .broadcast_mul(&cos)?
+        .broadcast_sub(&x2.broadcast_mul(&sin)?)?;
+    let rot2 = x1
+        .broadcast_mul(&sin)?
+        .broadcast_add(&x2.broadcast_mul(&cos)?)?;
+    let rot1 = rot1.unsqueeze(4)?;
+    let rot2 = rot2.unsqueeze(4)?;
+    Tensor::cat(&[rot1, rot2], 4)?
+        .reshape((bsz, seq_len, heads, head_dim))
+        .map_err(Error::from)
+}
+
+fn mel_frames_to_tensor(
+    mel_spec: &[Vec<f32>],
+    n_mels: usize,
+    device: &candle_core::Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    let frames = mel_spec.len();
+    let mut flat = Vec::with_capacity(frames * n_mels);
+    for (idx, frame) in mel_spec.iter().enumerate() {
+        if frame.len() != n_mels {
+            return Err(Error::InferenceError(format!(
+                "Mel frame {idx} has {} bins, expected {n_mels}",
+                frame.len()
+            )));
+        }
+        flat.extend_from_slice(frame);
+    }
+
+    Tensor::from_vec(flat, (1, frames, n_mels), device)?
+        .to_dtype(dtype)
+        .map_err(Error::from)
+}
+
+fn normalize_log_mel_with_max(log_mel: &mut [Vec<f32>], max_val: f32) {
+    let clamp_min = max_val - 8.0;
+    for frame in log_mel.iter_mut() {
+        for value in frame.iter_mut() {
+            if *value < clamp_min {
+                *value = clamp_min;
+            }
+            *value = (*value + 4.0) / 4.0;
+        }
+    }
+}
+
+fn drop_last_mel_frame_for_voxtral(log_mel: &mut Vec<Vec<f32>>) {
+    log_mel.pop();
+}
+
+fn voxtral_generation_prefix_len(standard_prompt_len: usize) -> usize {
+    standard_prompt_len.saturating_sub(1).max(1)
+}
+
+fn append_generated_token(
+    tokenizer: &VoxtralTokenizer,
+    generated: &mut Vec<u32>,
+    assembled: &mut String,
+    token: u32,
+    on_delta: &mut Option<&mut dyn FnMut(&str)>,
+) -> Result<()> {
+    generated.push(token);
+    let decoded = tokenizer.decode_text(generated)?;
+    let delta = text_delta(assembled, &decoded);
+    if let Some(on_delta) = on_delta.as_deref_mut() {
+        for ch in delta.chars() {
+            let mut buf = [0u8; 4];
+            on_delta(ch.encode_utf8(&mut buf));
+        }
+    }
+    *assembled = decoded;
+    Ok(())
 }
 
 fn argmax(logits: &Tensor) -> Result<u32> {
@@ -926,15 +1089,18 @@ fn argmax(logits: &Tensor) -> Result<u32> {
             )));
         }
     };
-    let idx = logits.argmax(D::Minus1)?;
-    let idx = if idx.rank() == 0 {
-        idx
-    } else {
-        idx.squeeze(0)?
-    };
-    idx.to_dtype(DType::U32)?
-        .to_scalar::<u32>()
-        .map_err(Error::from)
+    let values = logits
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let (idx, _) = values
+        .iter()
+        .copied()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Less))
+        .ok_or_else(|| Error::InferenceError("Voxtral logits are empty".to_string()))?;
+    u32::try_from(idx)
+        .map_err(|_| Error::InferenceError(format!("Voxtral token index exceeds u32: {idx}")))
 }
 
 fn text_delta(previous: &str, current: &str) -> String {
@@ -990,6 +1156,16 @@ fn offline_streaming_padding_samples(
     let alignment_pad = (token_samples - (sample_len % token_samples)) % token_samples;
     let right_pad = alignment_pad.saturating_add(token_samples.saturating_mul(right_pad_tokens));
     (left_pad, right_pad)
+}
+
+fn offline_left_pad_tokens_for_generation(
+    streaming_left_pad_tokens: usize,
+    num_delay_tokens: usize,
+) -> usize {
+    let generation_prefix_tokens = streaming_left_pad_tokens.saturating_add(num_delay_tokens);
+    generation_prefix_tokens
+        .saturating_mul(2)
+        .max(streaming_left_pad_tokens)
 }
 
 fn load_weights<'a>(
@@ -1121,9 +1297,13 @@ fn gelu(x: &Tensor) -> Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::{
-        argmax, build_voxtral_decode_cache, load_voxtral_runtime_config,
-        offline_streaming_padding_samples, prepare_realtime_conv_input, resample_audio,
+        apply_interleaved_rotary_emb, argmax, attention_scale_tensor,
+        build_voxtral_decode_cache, drop_last_mel_frame_for_voxtral,
+        load_voxtral_runtime_config, mel_frames_to_tensor, normalize_log_mel_with_max,
+        offline_left_pad_tokens_for_generation, offline_streaming_padding_samples,
+        pool_audio_embeddings_by_block, prepare_realtime_conv_input, resample_audio,
         select_voxtral_dtype, text_delta, voxtral_dense_decode_max_tokens,
+        voxtral_generation_prefix_len,
     };
     use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile};
     use crate::models::shared::attention::paged::DEFAULT_KV_PAGE_SIZE;
@@ -1197,6 +1377,25 @@ mod tests {
     }
 
     #[test]
+    fn voxtral_offline_padding_covers_generation_prefix() {
+        assert_eq!(offline_left_pad_tokens_for_generation(32, 6), 76);
+
+        let (left, _right) = offline_streaming_padding_samples(
+            16_001,
+            1_280,
+            offline_left_pad_tokens_for_generation(32, 6),
+            17,
+        );
+
+        assert_eq!(left, 76 * 1_280);
+    }
+
+    #[test]
+    fn voxtral_generation_uses_reference_prefix_length() {
+        assert_eq!(voxtral_generation_prefix_len(39), 38);
+    }
+
+    #[test]
     fn text_delta_preserves_word_boundary_space() {
         assert_eq!(text_delta("hello", "hello world"), " world");
     }
@@ -1209,6 +1408,88 @@ mod tests {
         let conv_input = prepare_realtime_conv_input(&mel).unwrap();
 
         assert_eq!(conv_input.dims(), &[1, 80, 7]);
+    }
+
+    #[test]
+    fn voxtral_mel_tensor_preserves_frame_major_layout() {
+        let device = Device::Cpu;
+        let mel = vec![vec![1.0f32, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
+
+        let tensor = mel_frames_to_tensor(&mel, 3, &device, DType::F32).unwrap();
+
+        assert_eq!(tensor.dims(), &[1, 2, 3]);
+        assert_eq!(
+            tensor.to_vec3::<f32>().unwrap(),
+            vec![vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]]]
+        );
+    }
+
+    #[test]
+    fn voxtral_log_mel_normalization_uses_configured_global_max() {
+        let mut mel = vec![vec![-10.0f32, -6.0, 2.0]];
+
+        normalize_log_mel_with_max(&mut mel, 1.5);
+
+        assert_eq!(mel, vec![vec![(-6.5 + 4.0) / 4.0, -0.5, 1.5]]);
+    }
+
+    #[test]
+    fn voxtral_mel_drops_final_stft_frame() {
+        let mut mel = vec![vec![1.0f32], vec![2.0], vec![3.0]];
+
+        drop_last_mel_frame_for_voxtral(&mut mel);
+
+        assert_eq!(mel, vec![vec![1.0f32], vec![2.0]]);
+    }
+
+    #[test]
+    fn voxtral_audio_pooling_preserves_left_prefix_frames() {
+        let device = Device::Cpu;
+        let x = Tensor::from_vec(
+            vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
+            (1, 5, 2),
+            &device,
+        )
+        .unwrap();
+
+        let pooled = pool_audio_embeddings_by_block(&x, 4).unwrap();
+
+        assert_eq!(pooled.dims(), &[1, 1, 8]);
+        assert_eq!(
+            pooled.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+        );
+    }
+
+    #[test]
+    fn voxtral_audio_rope_uses_interleaved_pairs() {
+        let device = Device::Cpu;
+        let x = Tensor::from_vec(vec![1.0f32, 10.0, 2.0, 20.0], (1, 1, 1, 4), &device).unwrap();
+        let cos = Tensor::from_vec(vec![0.5f32, 0.25], (1, 2), &device).unwrap();
+        let sin = Tensor::from_vec(vec![0.1f32, 0.2], (1, 2), &device).unwrap();
+
+        let rotated = apply_interleaved_rotary_emb(&x, &cos, &sin).unwrap();
+
+        assert_eq!(
+            rotated.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![
+                1.0 * 0.5 - 10.0 * 0.1,
+                1.0 * 0.1 + 10.0 * 0.5,
+                2.0 * 0.25 - 20.0 * 0.2,
+                2.0 * 0.2 + 20.0 * 0.25,
+            ]
+        );
+    }
+
+    #[test]
+    fn voxtral_audio_attention_scale_matches_activation_dtype() {
+        let device = Device::Cpu;
+        let reference = Tensor::zeros((1, 1, 1), DType::F16, &device).unwrap();
+
+        let scale = attention_scale_tensor(0.125, &reference).unwrap();
+
+        assert_eq!(scale.dtype(), DType::F16);
+        assert_eq!(scale.dims(), &[1, 1, 1]);
     }
 
     #[test]
