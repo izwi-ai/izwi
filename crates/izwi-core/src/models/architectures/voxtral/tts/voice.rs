@@ -2,8 +2,12 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
+
+use candle_core::{DType, Device, Tensor};
 
 use crate::error::{Error, Result};
+use crate::models::shared::weights::pytorch::read_single_tensor_pth;
 
 use super::config::VoxtralTtsConfig;
 
@@ -40,6 +44,23 @@ pub struct VoxtralVoiceInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VoxtralVoiceCatalog {
     voices: BTreeMap<String, VoxtralVoiceInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoxtralVoiceEmbeddingShape {
+    pub rank: usize,
+    pub batch_size: Option<usize>,
+    pub frames: usize,
+    pub hidden_size: usize,
+}
+
+#[derive(Debug)]
+pub struct VoxtralVoiceEmbeddingLibrary {
+    catalog: VoxtralVoiceCatalog,
+    device: Device,
+    dtype: DType,
+    expected_hidden_size: usize,
+    cache: RwLock<BTreeMap<String, Tensor>>,
 }
 
 impl VoxtralVoiceCatalog {
@@ -124,6 +145,106 @@ impl VoxtralVoiceCatalog {
     }
 }
 
+impl VoxtralVoiceEmbeddingLibrary {
+    pub fn new(
+        catalog: VoxtralVoiceCatalog,
+        device: Device,
+        dtype: DType,
+        expected_hidden_size: usize,
+    ) -> Self {
+        Self {
+            catalog,
+            device,
+            dtype,
+            expected_hidden_size,
+            cache: RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    pub fn available_speakers(&self) -> Vec<String> {
+        self.catalog.names_by_id()
+    }
+
+    pub fn load(&self, voice: &str) -> Result<Tensor> {
+        if let Some(cached) = self
+            .cache
+            .read()
+            .map_err(|_| Error::ModelLoadError("Voxtral voice cache lock poisoned".to_string()))?
+            .get(voice)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+
+        let info = self.catalog.resolve(voice)?;
+        let tensor =
+            read_single_tensor_pth(&info.embedding_path, &self.device, self.dtype, &info.name)?;
+        let tensor = normalize_voice_embedding_tensor(
+            tensor,
+            self.expected_hidden_size,
+            &info.embedding_path,
+        )?;
+
+        self.cache
+            .write()
+            .map_err(|_| Error::ModelLoadError("Voxtral voice cache lock poisoned".to_string()))?
+            .insert(voice.to_string(), tensor.clone());
+        Ok(tensor)
+    }
+}
+
+pub fn validate_voice_embedding_shape(
+    dims: &[usize],
+    expected_hidden_size: usize,
+) -> Result<VoxtralVoiceEmbeddingShape> {
+    if dims.len() != 2 && dims.len() != 3 {
+        return Err(Error::ModelLoadError(format!(
+            "Voxtral voice embedding rank must be 2 or 3, got shape {:?}",
+            dims
+        )));
+    }
+    if dims.iter().any(|dim| *dim == 0) {
+        return Err(Error::ModelLoadError(format!(
+            "Voxtral voice embedding dimensions must be non-zero, got shape {:?}",
+            dims
+        )));
+    }
+    let hidden_size = *dims.last().unwrap_or(&0);
+    if hidden_size != expected_hidden_size {
+        return Err(Error::ModelLoadError(format!(
+            "Voxtral voice embedding hidden size {hidden_size} does not match text hidden size {expected_hidden_size}"
+        )));
+    }
+
+    let (batch_size, frames) = if dims.len() == 2 {
+        (None, dims[0])
+    } else {
+        (Some(dims[0]), dims[1])
+    };
+
+    Ok(VoxtralVoiceEmbeddingShape {
+        rank: dims.len(),
+        batch_size,
+        frames,
+        hidden_size,
+    })
+}
+
+fn normalize_voice_embedding_tensor(
+    tensor: Tensor,
+    expected_hidden_size: usize,
+    path: &Path,
+) -> Result<Tensor> {
+    let dims = tensor.shape().dims().to_vec();
+    validate_voice_embedding_shape(&dims, expected_hidden_size)
+        .map_err(|err| Error::ModelLoadError(format!("{} in {}", err, path.display())))?;
+    if dims.len() == 2 {
+        tensor.unsqueeze(0).map_err(Error::from)
+    } else {
+        Ok(tensor)
+    }
+}
+
 pub fn voice_embedding_path(model_dir: &Path, voice: &str) -> PathBuf {
     model_dir
         .join("voice_embedding")
@@ -158,5 +279,23 @@ mod tests {
     fn built_in_voice_constant_matches_params_order() {
         let config = VoxtralTtsConfig::from_json_str(fixture_json()).unwrap();
         assert_eq!(config.voice_names_by_id(), VOXTRAL_TTS_BUILT_IN_VOICES);
+    }
+
+    #[test]
+    fn validates_voice_embedding_shapes_against_text_hidden_size() {
+        let shape = validate_voice_embedding_shape(&[12, 3072], 3072).unwrap();
+        assert_eq!(shape.rank, 2);
+        assert_eq!(shape.batch_size, None);
+        assert_eq!(shape.frames, 12);
+        assert_eq!(shape.hidden_size, 3072);
+
+        let batched = validate_voice_embedding_shape(&[1, 12, 3072], 3072).unwrap();
+        assert_eq!(batched.rank, 3);
+        assert_eq!(batched.batch_size, Some(1));
+        assert_eq!(batched.frames, 12);
+
+        assert!(validate_voice_embedding_shape(&[12, 2048], 3072).is_err());
+        assert!(validate_voice_embedding_shape(&[3072], 3072).is_err());
+        assert!(validate_voice_embedding_shape(&[1, 0, 3072], 3072).is_err());
     }
 }

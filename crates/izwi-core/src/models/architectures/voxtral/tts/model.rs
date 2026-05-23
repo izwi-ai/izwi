@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use super::codec::VoxtralCodecConfig;
 use super::config::VoxtralTtsConfig;
 use super::sampling::VoxtralTtsGenerationParams;
-use super::voice::{voice_embedding_path, VoxtralVoiceCatalog};
+use super::voice::{voice_embedding_path, VoxtralVoiceCatalog, VoxtralVoiceEmbeddingLibrary};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VoxtralTtsDTypePlan {
@@ -40,6 +40,7 @@ pub struct VoxtralTtsModel {
     pub model_dir: PathBuf,
     pub config: VoxtralTtsConfig,
     pub voices: VoxtralVoiceCatalog,
+    pub voice_embeddings: VoxtralVoiceEmbeddingLibrary,
     pub codec_config: VoxtralCodecConfig,
     pub dtype_plan: VoxtralTtsDTypePlan,
 }
@@ -101,21 +102,33 @@ impl VoxtralTtsModel {
         let codec_config = VoxtralCodecConfig::from_config(&config)?;
         let dtype_plan =
             select_voxtral_tts_dtypes(&device, voxtral_tts_dtype_override().as_deref())?;
+        let voice_embeddings = VoxtralVoiceEmbeddingLibrary::new(
+            voices.clone(),
+            device.device.clone(),
+            dtype_plan.language_model,
+            config.text_dim,
+        );
         Ok(Self {
             model_dir: model_dir.to_path_buf(),
             config,
             voices,
+            voice_embeddings,
             codec_config,
             dtype_plan,
         })
     }
 
+    pub fn available_speakers(&self) -> Vec<String> {
+        self.voices.names_by_id()
+    }
+
     pub fn generate_with_voice(
         &self,
         _text: &str,
-        _voice: &str,
+        voice: &str,
         _params: VoxtralTtsGenerationParams,
     ) -> Result<VoxtralTtsOutput> {
+        self.voices.resolve(voice)?;
         Err(Error::InferenceError(
             "Voxtral TTS generation is not wired until the acoustic transformer and codec phases are complete"
                 .to_string(),
