@@ -30,6 +30,15 @@ export function isLfm25AudioVariant(variant: string): boolean {
   );
 }
 
+export function isVoxtralTtsVariant(variant: string): boolean {
+  const normalized = variant.trim().toLowerCase();
+  return (
+    normalized === "voxtral-4b-tts-2603" ||
+    normalized === "mistralai/voxtral-4b-tts-2603" ||
+    normalized === "voxtral 4b tts 2603"
+  );
+}
+
 function isQwenAsrVariant(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   return (
@@ -49,6 +58,9 @@ export function getSpeakerProfilesForVariant(variant: string | null): SpeakerPro
   if (isLfm25AudioVariant(variant)) {
     return LFM25_AUDIO_SPEAKERS;
   }
+  if (isVoxtralTtsVariant(variant)) {
+    return VOXTRAL_TTS_SPEAKERS;
+  }
   if (isKokoroVariant(variant)) {
     return KOKORO_SPEAKERS;
   }
@@ -59,13 +71,16 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
   "custom-voice": {
     id: "custom-voice",
     label: "Text to Speech",
-    description: "Generate speech with built-in voice profiles (Qwen3, Kokoro)",
+    description:
+      "Generate speech with built-in voice profiles (Qwen3, Kokoro, Voxtral)",
     icon: "Volume2",
     modelFilter: (variant) =>
-      variant.includes("CustomVoice") || isKokoroVariant(variant),
+      variant.includes("CustomVoice") ||
+      isKokoroVariant(variant) ||
+      isVoxtralTtsVariant(variant),
     emptyStateTitle: "No TTS Model Loaded",
     emptyStateDescription:
-      "Load a CustomVoice or Kokoro model to generate speech",
+      "Load a CustomVoice, Kokoro, or Voxtral TTS model to generate speech",
   },
   "voice-clone": {
     id: "voice-clone",
@@ -216,6 +231,129 @@ const LFM25_AUDIO_SPEAKERS: SpeakerProfile[] = [
     name: "UK Male",
     language: "English",
     description: "UK male preset voice",
+  },
+];
+
+const VOXTRAL_TTS_SPEAKERS: SpeakerProfile[] = [
+  {
+    id: "casual_female",
+    name: "Casual Female",
+    language: "English",
+    description: "Casual English female preset voice (Voxtral)",
+  },
+  {
+    id: "casual_male",
+    name: "Casual Male",
+    language: "English",
+    description: "Casual English male preset voice (Voxtral)",
+  },
+  {
+    id: "cheerful_female",
+    name: "Cheerful Female",
+    language: "English",
+    description: "Cheerful English female preset voice (Voxtral)",
+  },
+  {
+    id: "neutral_female",
+    name: "Neutral Female",
+    language: "English",
+    description: "Neutral English female preset voice (Voxtral)",
+  },
+  {
+    id: "neutral_male",
+    name: "Neutral Male",
+    language: "English",
+    description: "Neutral English male preset voice (Voxtral)",
+  },
+  {
+    id: "pt_male",
+    name: "Portuguese Male",
+    language: "Portuguese",
+    description: "Portuguese male preset voice (Voxtral)",
+  },
+  {
+    id: "pt_female",
+    name: "Portuguese Female",
+    language: "Portuguese",
+    description: "Portuguese female preset voice (Voxtral)",
+  },
+  {
+    id: "nl_male",
+    name: "Dutch Male",
+    language: "Dutch",
+    description: "Dutch male preset voice (Voxtral)",
+  },
+  {
+    id: "nl_female",
+    name: "Dutch Female",
+    language: "Dutch",
+    description: "Dutch female preset voice (Voxtral)",
+  },
+  {
+    id: "it_male",
+    name: "Italian Male",
+    language: "Italian",
+    description: "Italian male preset voice (Voxtral)",
+  },
+  {
+    id: "it_female",
+    name: "Italian Female",
+    language: "Italian",
+    description: "Italian female preset voice (Voxtral)",
+  },
+  {
+    id: "fr_male",
+    name: "French Male",
+    language: "French",
+    description: "French male preset voice (Voxtral)",
+  },
+  {
+    id: "fr_female",
+    name: "French Female",
+    language: "French",
+    description: "French female preset voice (Voxtral)",
+  },
+  {
+    id: "es_male",
+    name: "Spanish Male",
+    language: "Spanish",
+    description: "Spanish male preset voice (Voxtral)",
+  },
+  {
+    id: "es_female",
+    name: "Spanish Female",
+    language: "Spanish",
+    description: "Spanish female preset voice (Voxtral)",
+  },
+  {
+    id: "de_male",
+    name: "German Male",
+    language: "German",
+    description: "German male preset voice (Voxtral)",
+  },
+  {
+    id: "de_female",
+    name: "German Female",
+    language: "German",
+    description: "German female preset voice (Voxtral)",
+  },
+  {
+    id: "ar_male",
+    name: "Arabic Male",
+    language: "Arabic",
+    description: "Arabic male preset voice (Voxtral)",
+  },
+  {
+    id: "hi_male",
+    name: "Hindi Male",
+    language: "Hindi",
+    description: "Hindi male preset voice (Voxtral)",
+  },
+  {
+    id: "hi_female",
+    name: "Hindi Female",
+    language: "Hindi",
+    description: "Hindi female preset voice (Voxtral)",
   },
 ];
 

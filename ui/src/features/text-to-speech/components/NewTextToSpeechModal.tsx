@@ -122,6 +122,15 @@ export function NewTextToSpeechModal({
         : [],
     [selectedModel, usesBuiltInVoiceSelection],
   );
+  const resolvedBuiltInSpeaker = useMemo(() => {
+    if (!usesBuiltInVoiceSelection) {
+      return "";
+    }
+    if (speakerOptions.some((option) => option.id === speaker)) {
+      return speaker;
+    }
+    return speakerOptions[0]?.id ?? "";
+  }, [speaker, speakerOptions, usesBuiltInVoiceSelection]);
 
   const resetModalState = useCallback(() => {
     setText("");
@@ -279,7 +288,7 @@ export function NewTextToSpeechModal({
       return;
     }
 
-    if (usesBuiltInVoiceSelection && !speaker) {
+    if (usesBuiltInVoiceSelection && !resolvedBuiltInSpeaker) {
       setError("Select a built-in voice before starting generation.");
       return;
     }
@@ -287,7 +296,7 @@ export function NewTextToSpeechModal({
     const request: SpeechHistoryRecordCreateRequest = {
       model_id: selectedModel,
       text: trimmedText,
-      speaker: usesBuiltInVoiceSelection ? speaker : undefined,
+      speaker: usesBuiltInVoiceSelection ? resolvedBuiltInSpeaker : undefined,
       saved_voice_id: usesSavedVoiceSelection ? savedVoiceId : undefined,
       voice_description: usesVoiceDescription ? trimmedVoiceDescription : undefined,
     };
@@ -370,10 +379,10 @@ export function NewTextToSpeechModal({
     onStreamingFinal,
     onStreamingStart,
     effectiveVoiceWorkflow,
+    resolvedBuiltInSpeaker,
     savedVoiceId,
     selectedModel,
     selectedModelReady,
-    speaker,
     streamAvailable,
     streamingEnabled,
     text,
