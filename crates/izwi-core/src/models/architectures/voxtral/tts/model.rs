@@ -220,29 +220,18 @@ impl VoxtralTtsPipeline {
                 Error::InferenceError(format!("Voxtral TTS prompt embedding failed: {err}"))
             })?;
         let mut cache = Qwen3Cache::new(self.language_model.num_layers());
-        let _prefill_hidden = self
+        let prefill_hidden = self
             .language_model
             .forward_hidden_with_embeds(&prompt_embeds, 0, Some(&mut cache), None, None)
             .map_err(|err| {
                 Error::InferenceError(format!("Voxtral TTS LM prefill failed: {err}"))
             })?;
         let mut pos = prompt.input_ids.len();
-        let mut next_embed = self.language_model.embeddings(&Tensor::from_vec(
-            vec![model.config.audio_token_id()],
-            (1, 1),
-            &self.device,
-        )?)?;
+        let mut last_hidden = last_sequence_hidden(&prefill_hidden, "Voxtral TTS LM prefill")?;
         let mut frames = Vec::new();
 
-        for _frame_idx in 0..params.max_frames.max(1) {
-            let hidden = self
-                .language_model
-                .forward_hidden_with_embeds(&next_embed, pos, Some(&mut cache), None, None)
-                .map_err(|err| {
-                    Error::InferenceError(format!("Voxtral TTS LM decode failed: {err}"))
-                })?;
-            pos += 1;
-            let last_hidden = hidden.i((0, hidden.dim(1)? - 1, ..))?;
+        let max_frames = params.max_frames.max(1);
+        for frame_idx in 0..max_frames {
             let generated = self
                 .acoustic_transformer
                 .forward_audio_codes_with_steps(
@@ -259,8 +248,21 @@ impl VoxtralTtsPipeline {
             if frame.first().copied() == Some(AudioSpecialToken::End.id()) {
                 break;
             }
-            next_embed = self.audio_embeddings.embedding_for_shifted_codes(&frame)?;
+            let next_embed = self.audio_embeddings.embedding_for_shifted_codes(&frame)?;
             frames.push(frame);
+
+            if frame_idx + 1 >= max_frames {
+                break;
+            }
+
+            let hidden = self
+                .language_model
+                .forward_hidden_with_embeds(&next_embed, pos, Some(&mut cache), None, None)
+                .map_err(|err| {
+                    Error::InferenceError(format!("Voxtral TTS LM decode failed: {err}"))
+                })?;
+            pos += 1;
+            last_hidden = last_sequence_hidden(&hidden, "Voxtral TTS LM decode")?;
         }
 
         if frames.is_empty() {
@@ -313,6 +315,28 @@ impl VoxtralTtsPipeline {
         }
         Tensor::cat(&parts, 1).map_err(Error::from)
     }
+}
+
+fn last_sequence_hidden(hidden: &Tensor, context: &str) -> Result<Tensor> {
+    if hidden.rank() != 3 {
+        return Err(Error::InferenceError(format!(
+            "{context} returned rank-{} hidden states; expected [batch, seq, hidden]",
+            hidden.rank()
+        )));
+    }
+    if hidden.dim(0)? != 1 {
+        return Err(Error::InferenceError(format!(
+            "{context} returned batch size {}; Voxtral TTS only supports batch size 1",
+            hidden.dim(0)?
+        )));
+    }
+    let seq_len = hidden.dim(1)?;
+    if seq_len == 0 {
+        return Err(Error::InferenceError(format!(
+            "{context} returned no sequence positions"
+        )));
+    }
+    hidden.i((0, seq_len - 1, ..)).map_err(Error::from)
 }
 
 impl VoxtralAudioTokenEmbeddings {
@@ -597,6 +621,18 @@ mod tests {
         let codebooks = frames_to_codebooks(vec![vec![2, 3, 4], vec![5, 6, 7]]).unwrap();
         assert_eq!(codebooks, vec![vec![2, 5], vec![3, 6], vec![4, 7]]);
         assert!(frames_to_codebooks(vec![vec![1], vec![1, 2]]).is_err());
+    }
+
+    #[test]
+    fn first_acoustic_step_uses_prefill_tail_hidden() {
+        let device = Device::Cpu;
+        let hidden =
+            Tensor::from_vec(vec![0.0f32, 0.1, 1.0, 1.1, 2.0, 2.1], (1, 3, 2), &device).unwrap();
+
+        let last = last_sequence_hidden(&hidden, "test").unwrap();
+
+        assert_eq!(last.dims(), &[2]);
+        assert_eq!(last.to_vec1::<f32>().unwrap(), vec![2.0, 2.1]);
     }
 
     #[test]
