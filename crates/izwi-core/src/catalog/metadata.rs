@@ -109,6 +109,13 @@ pub enum ModelVariant {
         alias = "qwen3_asr_1.7b_q8_0.gguf"
     )]
     Qwen3Asr17BGguf,
+    /// VibeVoice ASR model from Microsoft
+    #[serde(
+        rename = "VibeVoice-ASR",
+        alias = "microsoft/VibeVoice-ASR",
+        alias = "vibevoice-asr"
+    )]
+    VibeVoiceAsr,
     /// Streaming Sortformer 4-speaker diarization model (.nemo)
     #[serde(rename = "diar_streaming_sortformer_4spk-v2.1")]
     DiarStreamingSortformer4SpkV21,
@@ -194,6 +201,14 @@ pub enum ModelVariant {
         alias = "Voxtral 4B TTS 2603"
     )]
     Voxtral4BTts2603,
+    /// VibeVoice 1.5B long-form TTS model from Microsoft
+    #[serde(
+        rename = "VibeVoice-1.5B",
+        alias = "microsoft/VibeVoice-1.5B",
+        alias = "VibeVoice 1.5B",
+        alias = "vibevoice-1.5b"
+    )]
+    VibeVoice15BTts,
 }
 
 impl ModelVariant {
@@ -208,6 +223,8 @@ impl ModelVariant {
     pub const VOXTRAL_TTS_BUILT_IN_VOICE_COUNT: usize = 20;
     pub const VOXTRAL_TTS_MAX_OUTPUT_FRAMES: usize = 1500;
     pub const VOXTRAL_TTS_FRAME_RATE_HZ: f32 = 12.5;
+    pub const VIBEVOICE_TTS_MAX_OUTPUT_FRAMES: usize = 40_500;
+    pub const VIBEVOICE_TTS_FRAME_RATE_HZ: f32 = 7.5;
 
     /// Get HuggingFace repository ID
     pub fn repo_id(&self) -> &'static str {
@@ -250,6 +267,7 @@ impl ModelVariant {
             Self::ParakeetTdt06BV3 => "nvidia/parakeet-tdt-0.6b-v3",
             Self::WhisperLargeV3Turbo => "openai/whisper-large-v3-turbo",
             Self::Qwen3Asr06BGguf | Self::Qwen3Asr17BGguf => "Alkd/qwen3-asr-gguf",
+            Self::VibeVoiceAsr => "microsoft/VibeVoice-ASR",
             Self::DiarStreamingSortformer4SpkV21 => "nvidia/diar_streaming_sortformer_4spk-v2.1",
             Self::Qwen306B => "Qwen/Qwen3-0.6B",
             Self::Qwen306B4Bit => "mlx-community/Qwen3-0.6B-4bit",
@@ -270,6 +288,7 @@ impl ModelVariant {
             Self::Qwen3ForcedAligner06B4Bit => "mlx-community/Qwen3-ForcedAligner-0.6B-4bit",
             Self::VoxtralMini4BRealtime2602 => "mistralai/Voxtral-Mini-4B-Realtime-2602",
             Self::Voxtral4BTts2603 => "mistralai/Voxtral-4B-TTS-2603",
+            Self::VibeVoice15BTts => "microsoft/VibeVoice-1.5B",
         }
     }
 
@@ -301,6 +320,7 @@ impl ModelVariant {
             Self::WhisperLargeV3Turbo => "Whisper Large v3 Turbo",
             Self::Qwen3Asr06BGguf => "Qwen3 ASR 0.6B GGUF",
             Self::Qwen3Asr17BGguf => "Qwen3 ASR 1.7B GGUF",
+            Self::VibeVoiceAsr => "VibeVoice ASR",
             Self::DiarStreamingSortformer4SpkV21 => "Streaming Sortformer 4spk v2.1",
             Self::Qwen306B => "Qwen3 0.6B",
             Self::Qwen306B4Bit => "Qwen3 0.6B 4-bit",
@@ -321,6 +341,7 @@ impl ModelVariant {
             Self::Qwen3ForcedAligner06B4Bit => "Qwen3-ForcedAligner 0.6B 4-bit",
             Self::VoxtralMini4BRealtime2602 => "Voxtral Mini 4B Realtime",
             Self::Voxtral4BTts2603 => "Voxtral 4B TTS",
+            Self::VibeVoice15BTts => "VibeVoice 1.5B TTS",
         }
     }
 
@@ -352,6 +373,7 @@ impl ModelVariant {
             Self::WhisperLargeV3Turbo => "Whisper-Large-v3-Turbo",
             Self::Qwen3Asr06BGguf => "Qwen3-ASR-0.6B-GGUF",
             Self::Qwen3Asr17BGguf => "Qwen3-ASR-1.7B-GGUF",
+            Self::VibeVoiceAsr => "VibeVoice-ASR",
             Self::DiarStreamingSortformer4SpkV21 => "diar_streaming_sortformer_4spk-v2.1",
             Self::Qwen306B => "Qwen3-0.6B",
             Self::Qwen306B4Bit => "Qwen3-0.6B-4bit",
@@ -372,6 +394,7 @@ impl ModelVariant {
             Self::Qwen3ForcedAligner06B4Bit => "Qwen3-ForcedAligner-0.6B-4bit",
             Self::VoxtralMini4BRealtime2602 => "Voxtral-Mini-4B-Realtime-2602",
             Self::Voxtral4BTts2603 => "Voxtral-4B-TTS-2603",
+            Self::VibeVoice15BTts => "VibeVoice-1.5B",
         }
     }
 
@@ -403,6 +426,7 @@ impl ModelVariant {
             Self::WhisperLargeV3Turbo => 1_617_824_864, // ~1.51 GB (HF x-linked-size)
             Self::Qwen3Asr06BGguf => 1_012_824_608,     // HF x-linked-size, Mar 2026
             Self::Qwen3Asr17BGguf => 2_512_740_320,     // HF x-linked-size, Mar 2026
+            Self::VibeVoiceAsr => 17_348_198_410, // safetensors index metadata total_size
             Self::DiarStreamingSortformer4SpkV21 => 510_000_000, // ~0.47 GB (est)
             Self::Qwen306B => 1_520_000_000,            // ~1.42 GB (est)
             Self::Qwen306B4Bit => 900_000_000,          // ~0.84 GB (est)
@@ -423,6 +447,7 @@ impl ModelVariant {
             Self::Qwen3ForcedAligner06B4Bit => 703_200_000, // ~0.65 GB
             Self::VoxtralMini4BRealtime2602 => 8_000_000_000, // ~7.45 GB (est)
             Self::Voxtral4BTts2603 => 8_650_000_000, // ~8.04 GB plus voice assets
+            Self::VibeVoice15BTts => 5_408_043_974, // safetensors index metadata total_size
         }
     }
 
@@ -453,6 +478,7 @@ impl ModelVariant {
             Self::WhisperLargeV3Turbo => 4.0,
             Self::Qwen3Asr06BGguf => 4.0,
             Self::Qwen3Asr17BGguf => 8.0,
+            Self::VibeVoiceAsr => 36.0,
             Self::DiarStreamingSortformer4SpkV21 => 3.0,
             Self::Qwen306B => 3.0,
             Self::Qwen306B4Bit => 2.0,
@@ -473,6 +499,7 @@ impl ModelVariant {
             Self::Qwen3ForcedAligner06B4Bit => 1.5,
             Self::VoxtralMini4BRealtime2602 => 16.0,
             Self::Voxtral4BTts2603 => 16.0,
+            Self::VibeVoice15BTts => 12.0,
         }
     }
 
@@ -493,6 +520,7 @@ impl ModelVariant {
             crate::catalog::ModelFamily::ParakeetAsr
                 | crate::catalog::ModelFamily::WhisperAsr
                 | crate::catalog::ModelFamily::Qwen3Asr
+                | crate::catalog::ModelFamily::VibeVoiceAsr
         )
     }
 
@@ -534,6 +562,7 @@ impl ModelVariant {
             crate::catalog::ModelFamily::Qwen3Tts
                 | crate::catalog::ModelFamily::KokoroTts
                 | crate::catalog::ModelFamily::VoxtralTts
+                | crate::catalog::ModelFamily::VibeVoiceTts
         )
     }
 
@@ -542,6 +571,7 @@ impl ModelVariant {
     pub fn license_label(&self) -> Option<&'static str> {
         match self {
             Self::Voxtral4BTts2603 => Some("CC BY-NC 4.0"),
+            Self::VibeVoiceAsr | Self::VibeVoice15BTts => Some("MIT"),
             _ => None,
         }
     }
@@ -624,6 +654,15 @@ impl ModelVariant {
                 supports_speed_control: false,
                 supports_auto_long_form: false,
             },
+            Self::VibeVoice15BTts => SpeechModelCapabilities {
+                supports_builtin_voices: false,
+                built_in_voice_count: None,
+                supports_reference_voice: true,
+                supports_voice_description: false,
+                supports_streaming: false,
+                supports_speed_control: false,
+                supports_auto_long_form: true,
+            },
             _ => return None,
         };
 
@@ -635,6 +674,9 @@ impl ModelVariant {
         match self.family() {
             crate::catalog::ModelFamily::Qwen3Tts => Some(Self::QWEN3_TTS_MAX_OUTPUT_FRAMES),
             crate::catalog::ModelFamily::VoxtralTts => Some(Self::VOXTRAL_TTS_MAX_OUTPUT_FRAMES),
+            crate::catalog::ModelFamily::VibeVoiceTts => {
+                Some(Self::VIBEVOICE_TTS_MAX_OUTPUT_FRAMES)
+            }
             _ => None,
         }
     }
@@ -644,6 +686,7 @@ impl ModelVariant {
         match self.family() {
             crate::catalog::ModelFamily::Qwen3Tts => Some(Self::QWEN3_TTS_FRAME_RATE_HZ),
             crate::catalog::ModelFamily::VoxtralTts => Some(Self::VOXTRAL_TTS_FRAME_RATE_HZ),
+            crate::catalog::ModelFamily::VibeVoiceTts => Some(Self::VIBEVOICE_TTS_FRAME_RATE_HZ),
             _ => None,
         }
     }
@@ -841,6 +884,7 @@ impl ModelVariant {
             Self::WhisperLargeV3Turbo,
             Self::Qwen3Asr06BGguf,
             Self::Qwen3Asr17BGguf,
+            Self::VibeVoiceAsr,
             Self::DiarStreamingSortformer4SpkV21,
             Self::Qwen306B,
             Self::Qwen306B4Bit,
@@ -861,6 +905,7 @@ impl ModelVariant {
             Self::Qwen3ForcedAligner06B4Bit,
             Self::VoxtralMini4BRealtime2602,
             Self::Voxtral4BTts2603,
+            Self::VibeVoice15BTts,
         ]
     }
 }
@@ -1086,6 +1131,46 @@ mod tests {
                 supports_streaming: false,
                 supports_speed_control: false,
                 supports_auto_long_form: false,
+            })
+        );
+    }
+
+    #[test]
+    fn vibevoice_variants_expose_long_form_contracts() {
+        let asr = ModelVariant::VibeVoiceAsr;
+        assert!(asr.is_asr());
+        assert!(!asr.is_tts());
+        assert_eq!(asr.primary_task(), ModelTask::Asr);
+        assert_eq!(asr.repo_id(), "microsoft/VibeVoice-ASR");
+        assert_eq!(asr.license_label(), Some("MIT"));
+
+        let tts = ModelVariant::VibeVoice15BTts;
+        assert!(tts.is_tts());
+        assert_eq!(tts.primary_task(), ModelTask::Tts);
+        assert_eq!(tts.repo_id(), "microsoft/VibeVoice-1.5B");
+        assert_eq!(tts.license_label(), Some("MIT"));
+        assert_eq!(
+            tts.tts_max_output_frames_hint(),
+            Some(ModelVariant::VIBEVOICE_TTS_MAX_OUTPUT_FRAMES)
+        );
+        assert_eq!(
+            tts.tts_output_frame_rate_hz_hint(),
+            Some(ModelVariant::VIBEVOICE_TTS_FRAME_RATE_HZ)
+        );
+        assert!(
+            tts.tts_max_output_seconds_hint()
+                .is_some_and(|seconds| seconds >= 5_400.0)
+        );
+        assert_eq!(
+            tts.speech_capabilities(),
+            Some(SpeechModelCapabilities {
+                supports_builtin_voices: false,
+                built_in_voice_count: None,
+                supports_reference_voice: true,
+                supports_voice_description: false,
+                supports_streaming: false,
+                supports_speed_control: false,
+                supports_auto_long_form: true,
             })
         );
     }

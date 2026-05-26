@@ -42,10 +42,12 @@ const QWEN3_TTS_VARIANTS: &[ModelVariant] = &[
 ];
 const KOKORO_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::Kokoro82M];
 const VOXTRAL_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::Voxtral4BTts2603];
+const VIBEVOICE_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::VibeVoice15BTts];
 const PARAKEET_ASR_VARIANTS: &[ModelVariant] = &[ModelVariant::ParakeetTdt06BV3];
 const WHISPER_ASR_VARIANTS: &[ModelVariant] = &[ModelVariant::WhisperLargeV3Turbo];
 const QWEN3_ASR_VARIANTS: &[ModelVariant] =
     &[ModelVariant::Qwen3Asr06BGguf, ModelVariant::Qwen3Asr17BGguf];
+const VIBEVOICE_ASR_VARIANTS: &[ModelVariant] = &[ModelVariant::VibeVoiceAsr];
 const SORTFORMER_DIARIZATION_VARIANTS: &[ModelVariant] =
     &[ModelVariant::DiarStreamingSortformer4SpkV21];
 const QWEN3_CHAT_VARIANTS: &[ModelVariant] = &[
@@ -134,6 +136,13 @@ pub const MODEL_FAMILY_REGISTRATIONS: &[FamilyRegistration] = &[
         fixture_ids: TTS_FIXTURES,
     },
     FamilyRegistration {
+        family: ModelFamily::VibeVoiceTts,
+        module_path: "crate::models::architectures::vibevoice::tts",
+        variants: VIBEVOICE_TTS_VARIANTS,
+        capabilities: TTS_CAPABILITIES,
+        fixture_ids: TTS_FIXTURES,
+    },
+    FamilyRegistration {
         family: ModelFamily::ParakeetAsr,
         module_path: "crate::models::architectures::parakeet::asr",
         variants: PARAKEET_ASR_VARIANTS,
@@ -151,6 +160,13 @@ pub const MODEL_FAMILY_REGISTRATIONS: &[FamilyRegistration] = &[
         family: ModelFamily::Qwen3Asr,
         module_path: "crate::models::architectures::qwen3::asr",
         variants: QWEN3_ASR_VARIANTS,
+        capabilities: ASR_CAPABILITIES,
+        fixture_ids: ASR_FIXTURES,
+    },
+    FamilyRegistration {
+        family: ModelFamily::VibeVoiceAsr,
+        module_path: "crate::models::architectures::vibevoice::asr",
+        variants: VIBEVOICE_ASR_VARIANTS,
         capabilities: ASR_CAPABILITIES,
         fixture_ids: ASR_FIXTURES,
     },

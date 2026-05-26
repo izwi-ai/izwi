@@ -354,6 +354,7 @@ impl RuntimeService {
                     .ok_or_else(|| Error::InferenceError("No TTS model loaded".to_string()))?;
                 Ok(model.available_speakers())
             }
+            crate::catalog::ModelFamily::VibeVoiceTts => Ok(Vec::new()),
             crate::catalog::ModelFamily::Lfm25Audio => Ok(
                 crate::models::architectures::lfm25_audio::LFM25_AUDIO_BUILT_IN_SPEAKERS
                     .iter()

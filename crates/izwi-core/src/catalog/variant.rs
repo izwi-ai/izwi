@@ -9,9 +9,11 @@ pub enum ModelFamily {
     Qwen3Tts,
     KokoroTts,
     VoxtralTts,
+    VibeVoiceTts,
     ParakeetAsr,
     WhisperAsr,
     Qwen3Asr,
+    VibeVoiceAsr,
     SortformerDiarization,
     Qwen3Chat,
     Qwen35Chat,
@@ -101,10 +103,12 @@ impl ModelVariant {
             | Qwen3Tts12Hz17BVoiceDesignBf16 => ModelFamily::Qwen3Tts,
             Kokoro82M => ModelFamily::KokoroTts,
             Voxtral4BTts2603 => ModelFamily::VoxtralTts,
+            VibeVoice15BTts => ModelFamily::VibeVoiceTts,
             Qwen3TtsTokenizer12Hz => ModelFamily::Tokenizer,
             ParakeetTdt06BV3 => ModelFamily::ParakeetAsr,
             WhisperLargeV3Turbo => ModelFamily::WhisperAsr,
             Qwen3Asr06BGguf | Qwen3Asr17BGguf => ModelFamily::Qwen3Asr,
+            VibeVoiceAsr => ModelFamily::VibeVoiceAsr,
             DiarStreamingSortformer4SpkV21 => ModelFamily::SortformerDiarization,
             Qwen306B | Qwen306B4Bit | Qwen306BGguf | Qwen317B | Qwen317B4Bit | Qwen317BGguf
             | Qwen34BGguf | Qwen38BGguf | Qwen314BGguf => ModelFamily::Qwen3Chat,
@@ -119,12 +123,14 @@ impl ModelVariant {
 
     pub fn primary_task(&self) -> ModelTask {
         match self.family() {
-            ModelFamily::Qwen3Tts | ModelFamily::KokoroTts | ModelFamily::VoxtralTts => {
-                ModelTask::Tts
-            }
-            ModelFamily::ParakeetAsr | ModelFamily::WhisperAsr | ModelFamily::Qwen3Asr => {
-                ModelTask::Asr
-            }
+            ModelFamily::Qwen3Tts
+            | ModelFamily::KokoroTts
+            | ModelFamily::VoxtralTts
+            | ModelFamily::VibeVoiceTts => ModelTask::Tts,
+            ModelFamily::ParakeetAsr
+            | ModelFamily::WhisperAsr
+            | ModelFamily::Qwen3Asr
+            | ModelFamily::VibeVoiceAsr => ModelTask::Asr,
             ModelFamily::SortformerDiarization => ModelTask::Diarization,
             ModelFamily::Qwen3Chat
             | ModelFamily::Qwen35Chat
@@ -218,6 +224,8 @@ pub fn resolve_asr_model_variant(input: Option<&str>) -> ModelVariant {
             let normalized = normalize_identifier(raw);
             if normalized.contains("voxtral") {
                 VoxtralMini4BRealtime2602
+            } else if normalized.contains("vibevoice") && normalized.contains("asr") {
+                VibeVoiceAsr
             } else if normalized.contains("whisper")
                 && normalized.contains("largev3")
                 && normalized.contains("turbo")
@@ -266,6 +274,19 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
             return Some(Voxtral4BTts2603);
         }
         return Some(VoxtralMini4BRealtime2602);
+    }
+
+    if normalized.contains("vibevoice") {
+        if normalized.contains("asr") {
+            return Some(VibeVoiceAsr);
+        }
+        if normalized.contains("15b")
+            || normalized.contains("1dot5b")
+            || normalized.contains("tts")
+            || normalized.contains("texttospeech")
+        {
+            return Some(VibeVoice15BTts);
+        }
     }
 
     if normalized.contains("sortformer") && normalized.contains("diar") {
@@ -596,6 +617,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_tts_accepts_vibevoice_repo_alias() {
+        let parsed = parse_tts_model_variant("microsoft/VibeVoice-1.5B")
+            .expect("VibeVoice TTS should parse for tts");
+        assert_eq!(parsed, ModelVariant::VibeVoice15BTts);
+        assert_eq!(parsed.family(), ModelFamily::VibeVoiceTts);
+    }
+
+    #[test]
     fn resolve_asr_fallback_defaults_to_parakeet_v3() {
         let resolved = resolve_asr_model_variant(Some("not-a-real-model"));
         assert_eq!(resolved, ModelVariant::ParakeetTdt06BV3);
@@ -605,6 +634,13 @@ mod tests {
     fn resolve_asr_accepts_qwen3_asr_family_alias() {
         let resolved = resolve_asr_model_variant(Some("Qwen3-ASR-1.7B"));
         assert_eq!(resolved, ModelVariant::Qwen3Asr17BGguf);
+    }
+
+    #[test]
+    fn resolve_asr_accepts_vibevoice_aliases() {
+        let resolved = resolve_asr_model_variant(Some("microsoft/VibeVoice-ASR"));
+        assert_eq!(resolved, ModelVariant::VibeVoiceAsr);
+        assert_eq!(resolved.family(), ModelFamily::VibeVoiceAsr);
     }
 
     #[test]

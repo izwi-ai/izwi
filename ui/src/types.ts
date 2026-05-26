@@ -39,11 +39,29 @@ export function isVoxtralTtsVariant(variant: string): boolean {
   );
 }
 
+export function isVibeVoiceTtsVariant(variant: string): boolean {
+  const normalized = variant.trim().toLowerCase();
+  return (
+    normalized === "vibevoice-1.5b" ||
+    normalized === "microsoft/vibevoice-1.5b" ||
+    normalized === "vibevoice 1.5b" ||
+    normalized === "vibevoice 1.5b tts"
+  );
+}
+
 function isVoxtralAsrVariant(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   return (
     normalized === "voxtral-mini-4b-realtime-2602" ||
     normalized === "mistralai/voxtral-mini-4b-realtime-2602"
+  );
+}
+
+function isVibeVoiceAsrVariant(variant: string): boolean {
+  const normalized = variant.trim().toLowerCase();
+  return (
+    normalized === "vibevoice-asr" ||
+    normalized === "microsoft/vibevoice-asr"
   );
 }
 
@@ -68,6 +86,9 @@ export function getSpeakerProfilesForVariant(variant: string | null): SpeakerPro
   }
   if (isVoxtralTtsVariant(variant)) {
     return VOXTRAL_TTS_SPEAKERS;
+  }
+  if (isVibeVoiceTtsVariant(variant)) {
+    return [];
   }
   if (isKokoroVariant(variant)) {
     return KOKORO_SPEAKERS;
@@ -96,10 +117,11 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     description: "Clone any voice with a reference audio sample",
     icon: "Users",
     modelFilter: (variant) =>
-      variant.includes("Base") && !variant.includes("Tokenizer"),
+      (variant.includes("Base") && !variant.includes("Tokenizer")) ||
+      isVibeVoiceTtsVariant(variant),
     emptyStateTitle: "No Base Model Loaded",
     emptyStateDescription:
-      "Load a Base model to clone voices from reference audio",
+      "Load a Base or VibeVoice model to clone voices from reference audio",
   },
   "voice-design": {
     id: "voice-design",
@@ -115,17 +137,18 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     id: "transcription",
     label: "Transcription",
     description:
-      "Speech-to-text with Qwen3-ASR, Whisper, Parakeet-TDT, Voxtral, and LFM2.5 Audio models",
+      "Speech-to-text with Qwen3-ASR, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, and LFM2.5 Audio models",
     icon: "FileText",
     modelFilter: (variant) =>
       isQwenAsrVariant(variant) ||
+      isVibeVoiceAsrVariant(variant) ||
       variant.includes("Whisper-Large-v3-Turbo") ||
       variant.includes("Parakeet-TDT") ||
       isVoxtralAsrVariant(variant) ||
       isLfm25AudioVariant(variant),
     emptyStateTitle: "No ASR Model Loaded",
     emptyStateDescription:
-      "Download and load a Qwen3-ASR, Whisper, Parakeet-TDT, Voxtral, or LFM2.5 Audio model for speech transcription",
+      "Download and load a Qwen3-ASR, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, or LFM2.5 Audio model for speech transcription",
   },
   chat: {
     id: "chat",

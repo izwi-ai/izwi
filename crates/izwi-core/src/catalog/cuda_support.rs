@@ -133,11 +133,16 @@ impl ModelVariant {
                 CudaSupportLevel::CandleCudaGeneric,
                 "Voxtral TTS uses dense Candle CUDA tensor kernels for the LM, flow-matching acoustic transformer, and codec; progressive streaming remains final-only until CUDA-only chunked decode is proven",
             ),
+            ModelFamily::VibeVoiceTts => CudaSupportInfo::new(
+                CudaSupportLevel::CandleCudaGeneric,
+                "VibeVoice TTS uses dense Candle CUDA tensor kernels for the Qwen decoder, continuous tokenizers, and diffusion head; long-form generation is final-only until chunked decode is proven",
+            ),
             ModelFamily::Qwen3Tts
             | ModelFamily::KokoroTts
             | ModelFamily::ParakeetAsr
             | ModelFamily::WhisperAsr
             | ModelFamily::Qwen3Asr
+            | ModelFamily::VibeVoiceAsr
             | ModelFamily::Qwen3Chat
             | ModelFamily::Qwen35Chat
             | ModelFamily::Lfm2Chat
@@ -175,6 +180,10 @@ impl ModelVariant {
             ModelFamily::VoxtralTts => CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::Dense,
                 "Voxtral TTS checkpoint is dense safetensors; CUDA dtype policy, not quantization, controls memory/performance tradeoffs",
+            ),
+            ModelFamily::VibeVoiceTts | ModelFamily::VibeVoiceAsr => CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::Dense,
+                "VibeVoice checkpoint is dense safetensors; CUDA dtype policy, not quantization, controls memory/performance tradeoffs",
             ),
             _ if self.is_qwen_chat_gguf()
                 || self.is_qwen35_chat_gguf()
