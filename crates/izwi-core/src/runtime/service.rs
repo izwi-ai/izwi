@@ -2,11 +2,11 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::FutureExt;
-use tokio::sync::{broadcast, oneshot, Mutex, Notify, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock, broadcast, oneshot};
 use tokio::task::yield_now;
 use tracing::{debug, error, info_span};
 
@@ -16,11 +16,11 @@ use crate::backends::{BackendPreference, BackendRouter, BackendSelectionSource, 
 use crate::catalog::{ModelInfo, ModelVariant};
 use crate::config::EngineConfig;
 use crate::engine::{
-    engine_stream_backpressure_total, Engine as CoreEngine, EngineCoreConfig, EngineCoreRequest,
-    EngineOutput, StreamingOutput, WorkerConfig, ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
-    ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_HITS_TOTAL, ENGINE_KV_CACHE_MISSES_TOTAL,
-    ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL, ENGINE_SCHEDULER_QUEUE_DEPTH,
-    ENGINE_SCHEDULER_RUNNING_REQUESTS, ENGINE_STREAM_BACKPRESSURE_TOTAL,
+    ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_HITS_TOTAL,
+    ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL,
+    ENGINE_SCHEDULER_QUEUE_DEPTH, ENGINE_SCHEDULER_RUNNING_REQUESTS,
+    ENGINE_STREAM_BACKPRESSURE_TOTAL, Engine as CoreEngine, EngineCoreConfig, EngineCoreRequest,
+    EngineOutput, StreamingOutput, WorkerConfig, engine_stream_backpressure_total,
 };
 use crate::error::{Error, Result};
 use crate::model::ModelResidencyLease;
@@ -31,8 +31,8 @@ use crate::runtime::broker::{
 };
 use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
 use crate::runtime::telemetry::{
-    push_engine_metric, EngineRuntimeTelemetrySnapshot, RuntimeTelemetryCollector,
-    RuntimeTelemetrySnapshot,
+    EngineRuntimeTelemetrySnapshot, RuntimeTelemetryCollector, RuntimeTelemetrySnapshot,
+    push_engine_metric,
 };
 use crate::runtime_models::ModelRegistry;
 use crate::tokenizer::Tokenizer;
@@ -354,7 +354,14 @@ impl RuntimeService {
                     .ok_or_else(|| Error::InferenceError("No TTS model loaded".to_string()))?;
                 Ok(model.available_speakers())
             }
-            crate::catalog::ModelFamily::VibeVoiceTts => Ok(Vec::new()),
+            crate::catalog::ModelFamily::VibeVoiceTts => {
+                let model = self
+                    .model_registry
+                    .get_vibevoice_tts(variant)
+                    .await
+                    .ok_or_else(|| Error::InferenceError("No TTS model loaded".to_string()))?;
+                Ok(model.available_speakers())
+            }
             crate::catalog::ModelFamily::Lfm25Audio => Ok(
                 crate::models::architectures::lfm25_audio::LFM25_AUDIO_BUILT_IN_SPEAKERS
                     .iter()

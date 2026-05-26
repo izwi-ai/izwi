@@ -54,7 +54,7 @@ impl RuntimeService {
                 self.clear_active_tts_variant(variant).await;
             }
             ModelFamily::VibeVoiceTts => {
-                self.model_registry.unload_asr(variant).await;
+                self.model_registry.unload_vibevoice_tts(variant).await;
                 self.clear_active_tts_variant(variant).await;
             }
             ModelFamily::Tokenizer => {

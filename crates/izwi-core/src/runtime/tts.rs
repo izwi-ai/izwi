@@ -11,9 +11,13 @@ use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::lfm25_audio::lfm25_audio_tts_system_prompt;
 use crate::models::architectures::qwen3::tts::qwen_tts_cuda_chunked_codec_stream_enabled;
+use crate::models::architectures::vibevoice::tts::{
+    VibeVoiceSpeakerReference, VibeVoiceTtsGenerationParams,
+};
 use crate::models::architectures::voxtral::tts::VoxtralTtsGenerationParams;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 use crate::runtime::adapters::CapabilityKind;
+use crate::runtime::audio_io::{base64_decode, decode_audio_bytes};
 use crate::runtime::request::TtsRuntimeRequest;
 use crate::runtime::service::RuntimeService;
 use crate::runtime::types::{
@@ -21,6 +25,33 @@ use crate::runtime::types::{
 };
 
 const LFM25_AUDIO_DEFAULT_MAX_NEW_TOKENS: usize = 1024;
+
+fn vibevoice_reference_from_request(
+    request: &GenerationRequest,
+) -> Result<VibeVoiceSpeakerReference> {
+    let ref_audio = request.reference_audio.as_deref().ok_or_else(|| {
+        Error::InvalidInput(
+            "VibeVoice TTS requires `reference_audio` and `reference_text`".to_string(),
+        )
+    })?;
+    let ref_text = request.reference_text.as_deref().ok_or_else(|| {
+        Error::InvalidInput(
+            "VibeVoice TTS requires `reference_audio` and `reference_text`".to_string(),
+        )
+    })?;
+    if ref_text.trim().is_empty() {
+        return Err(Error::InvalidInput(
+            "VibeVoice TTS reference_text cannot be empty".to_string(),
+        ));
+    }
+    let audio_bytes = base64_decode(ref_audio)?;
+    let (audio_samples, sample_rate) = decode_audio_bytes(&audio_bytes)?;
+    Ok(VibeVoiceSpeakerReference {
+        audio_samples,
+        sample_rate,
+        text: ref_text.to_string(),
+    })
+}
 
 fn qwen_tts_streaming_uses_final_only(
     is_cuda: bool,
@@ -206,6 +237,72 @@ impl RuntimeService {
         Ok(())
     }
 
+    async fn vibevoice_tts_generate(
+        &self,
+        request: GenerationRequest,
+        variant: ModelVariant,
+        streaming_required: bool,
+    ) -> Result<GenerationResult> {
+        self.observe_broker_capability_request(
+            CapabilityKind::Tts,
+            Some(variant),
+            streaming_required,
+        )?;
+        self.load_model(variant).await?;
+        let _lease = self.acquire_model_residency_lease(variant);
+
+        let text = request.text.trim().to_string();
+        if text.is_empty() {
+            return Err(Error::InvalidInput("TTS request missing text".to_string()));
+        }
+
+        let model = self
+            .model_registry
+            .get_vibevoice_tts(variant)
+            .await
+            .ok_or_else(|| Error::InferenceError("No VibeVoice TTS model loaded".to_string()))?;
+        let reference = vibevoice_reference_from_request(&request)?;
+        let params = VibeVoiceTtsGenerationParams::from_generation_config_for_text(
+            &request.config,
+            &text,
+            model.default_diffusion_steps(),
+        );
+        let started = Instant::now();
+        let output = model.generate_with_reference(&text, &reference, params)?;
+        let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
+
+        Ok(GenerationResult {
+            request_id: request.id,
+            samples: output.samples,
+            sample_rate: output.sample_rate,
+            total_tokens: output.frames_generated,
+            total_time_ms,
+        })
+    }
+
+    async fn vibevoice_tts_generate_streaming(
+        &self,
+        request: GenerationRequest,
+        variant: ModelVariant,
+        chunk_tx: mpsc::Sender<AudioChunk>,
+    ) -> Result<()> {
+        let result = self.vibevoice_tts_generate(request, variant, true).await?;
+        let generation_time_ms = result.total_time_ms;
+        let tokens_generated = result.total_tokens;
+        let rtf = result.rtf();
+        let mut chunk = AudioChunk::final_chunk(result.request_id.clone(), 0, result.samples);
+        chunk.stats = Some(ChunkStats {
+            generation_time_ms,
+            tokens_generated,
+            rtf,
+        });
+        chunk_tx
+            .send(chunk)
+            .await
+            .map_err(|_| Error::InferenceError("Streaming output channel closed".to_string()))?;
+        Ok(())
+    }
+
     async fn qwen_tts_final_only_streaming(
         &self,
         mut request: GenerationRequest,
@@ -250,6 +347,11 @@ impl RuntimeService {
         if matches!(resolved_variant.family(), ModelFamily::VoxtralTts) {
             return self
                 .voxtral_tts_generate(request, resolved_variant, false)
+                .await;
+        }
+        if matches!(resolved_variant.family(), ModelFamily::VibeVoiceTts) {
+            return self
+                .vibevoice_tts_generate(request, resolved_variant, false)
                 .await;
         }
         self.load_model(resolved_variant).await?;
@@ -300,6 +402,11 @@ impl RuntimeService {
         if matches!(resolved_variant.family(), ModelFamily::VoxtralTts) {
             return self
                 .voxtral_tts_generate_streaming(request, resolved_variant, chunk_tx)
+                .await;
+        }
+        if matches!(resolved_variant.family(), ModelFamily::VibeVoiceTts) {
+            return self
+                .vibevoice_tts_generate_streaming(request, resolved_variant, chunk_tx)
                 .await;
         }
         if qwen_tts_streaming_uses_final_only(
