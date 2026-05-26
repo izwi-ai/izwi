@@ -175,9 +175,9 @@ fn build_speech_prompt_ids(
     let voice_start = input_ids.len();
     input_ids.extend(std::iter::repeat(specials.audio).take(voice_frames));
     let voice_end = input_ids.len();
-    input_ids.push(text_to_audio);
-    input_ids.extend(text_tokens.iter().copied());
     input_ids.push(audio_to_text);
+    input_ids.extend(text_tokens.iter().copied());
+    input_ids.push(text_to_audio);
     input_ids.push(specials.begin_audio);
     Ok(VoxtralTtsPrompt {
         input_ids,
@@ -189,7 +189,7 @@ fn build_speech_prompt_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::architectures::voxtral::tts::config::{fixture_json, VoxtralTtsConfig};
+    use crate::models::architectures::voxtral::tts::config::{VoxtralTtsConfig, fixture_json};
 
     #[test]
     fn special_tokens_come_from_params_without_tekken() {
@@ -211,7 +211,7 @@ mod tests {
 
         assert_eq!(
             prompt.input_ids,
-            vec![1, 25, 24, 24, 24, 36, 100, 101, 35, 25]
+            vec![1, 25, 24, 24, 24, 35, 100, 101, 36, 25]
         );
         assert_eq!(prompt.text_token_count, 2);
         assert_eq!(prompt.voice_token_range, Some(2..5));
@@ -228,7 +228,7 @@ mod tests {
 
         let prompt = build_speech_prompt_ids(&specials, &[100, 101], 2).unwrap();
 
-        assert_eq!(prompt.input_ids, vec![1, 25, 24, 24, 36, 100, 101, 35, 25]);
+        assert_eq!(prompt.input_ids, vec![1, 25, 24, 24, 35, 100, 101, 36, 25]);
         assert!(!prompt.input_ids.contains(&3));
         assert!(!prompt.input_ids.contains(&4));
     }
