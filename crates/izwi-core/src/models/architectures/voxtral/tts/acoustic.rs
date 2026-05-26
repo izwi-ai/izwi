@@ -1,15 +1,15 @@
 //! Flow-matching acoustic-token shape helpers.
 
-use candle_core::{DType, IndexOp, Tensor, D};
-use candle_nn::{ops, Linear, Module, RmsNorm, VarBuilder};
+use candle_core::{D, DType, IndexOp, Tensor};
+use candle_nn::{Linear, Module, RmsNorm, VarBuilder, ops};
 
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::core::repeat_kv;
 
 use super::super::layers::linear_forward_last_dim;
 use super::config::{
-    VoxtralTtsAcousticTransformerArgs, VoxtralTtsConfig, DEFAULT_CFG_ALPHA,
-    DEFAULT_N_DECODING_STEPS,
+    DEFAULT_CFG_ALPHA, DEFAULT_N_DECODING_STEPS, VoxtralTtsAcousticTransformerArgs,
+    VoxtralTtsConfig,
 };
 
 pub const AUDIO_SPECIAL_TOKEN_COUNT: u32 = 2;
@@ -203,6 +203,21 @@ impl FlowMatchingAudioTransformer {
         cfg_alpha: f32,
         n_decoding_steps: usize,
     ) -> Result<Vec<Vec<u32>>> {
+        self.forward_audio_codes_with_steps_and_eos_policy(
+            llm_hidden,
+            cfg_alpha,
+            n_decoding_steps,
+            true,
+        )
+    }
+
+    pub fn forward_audio_codes_with_steps_and_eos_policy(
+        &self,
+        llm_hidden: &Tensor,
+        cfg_alpha: f32,
+        n_decoding_steps: usize,
+        allow_end_audio: bool,
+    ) -> Result<Vec<Vec<u32>>> {
         let llm_hidden = match llm_hidden.rank() {
             1 => llm_hidden.unsqueeze(0)?,
             2 => llm_hidden.clone(),
@@ -222,9 +237,12 @@ impl FlowMatchingAudioTransformer {
 
         let semantic_logits = linear_forward_last_dim(&self.semantic_codebook_output, &llm_hidden)
             .map_err(|err| Error::InferenceError(format!("semantic projection failed: {err}")))?;
-        let semantic_codes =
-            semantic_codes_from_logits(&semantic_logits, self.generation.semantic_codebook_size)
-                .map_err(|err| Error::InferenceError(format!("semantic sampling failed: {err}")))?;
+        let semantic_codes = semantic_codes_from_logits_with_eos_policy(
+            &semantic_logits,
+            self.generation.semantic_codebook_size,
+            allow_end_audio,
+        )
+        .map_err(|err| Error::InferenceError(format!("semantic sampling failed: {err}")))?;
         let acoustic_codes = self
             .decode_one_frame(&semantic_codes, &llm_hidden, cfg_alpha, n_decoding_steps)
             .map_err(|err| Error::InferenceError(format!("acoustic frame decode failed: {err}")))?;
@@ -546,6 +564,17 @@ fn linear_maybe_bias(
 }
 
 fn semantic_codes_from_logits(logits: &Tensor, semantic_codebook_size: usize) -> Result<Vec<u32>> {
+    semantic_codes_from_logits_with_eos_policy(logits, semantic_codebook_size, true)
+}
+
+fn semantic_codes_from_logits_with_eos_policy(
+    logits: &Tensor,
+    semantic_codebook_size: usize,
+    allow_end_audio: bool,
+) -> Result<Vec<u32>> {
+    // Non-empty TTS requests should produce at least one audible frame. Some
+    // voices can rank end-of-audio first, so the generation loop masks EOS only
+    // for frame zero and restores the normal stop token immediately after.
     let logits = match logits.rank() {
         1 => logits.unsqueeze(0)?,
         2 => logits.clone(),
@@ -559,10 +588,17 @@ fn semantic_codes_from_logits(logits: &Tensor, semantic_codebook_size: usize) ->
     let rows = logits.to_dtype(DType::F32)?.to_vec2::<f32>()?;
     rows.into_iter()
         .map(|row| {
-            let mut best_idx = AudioSpecialToken::End.id() as usize;
+            let mut best_idx = if allow_end_audio {
+                AudioSpecialToken::End.id() as usize
+            } else {
+                AUDIO_SPECIAL_TOKEN_COUNT as usize
+            };
             let mut best_value = f32::NEG_INFINITY;
             for (idx, value) in row.iter().take(allowed).enumerate() {
                 if idx == AudioSpecialToken::Empty.id() as usize {
+                    continue;
+                }
+                if !allow_end_audio && idx == AudioSpecialToken::End.id() as usize {
                     continue;
                 }
                 if *value > best_value {
@@ -586,7 +622,7 @@ fn blend_cfg_tensors(cond: &Tensor, uncond: &Tensor, alpha: f32) -> Result<Tenso
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::architectures::voxtral::tts::config::{fixture_json, VoxtralTtsConfig};
+    use crate::models::architectures::voxtral::tts::config::{VoxtralTtsConfig, fixture_json};
     use candle_core::{Device, Shape};
     use candle_nn::VarBuilder;
     use serde_json::json;
@@ -670,6 +706,19 @@ mod tests {
             Tensor::from_vec(vec![100.0, 0.0, 1.0, 2.0, 99.0, 98.0], (1, 6), &device).unwrap();
         let codes = semantic_codes_from_logits(&logits, 2).unwrap();
         assert_eq!(codes, vec![3]);
+    }
+
+    #[test]
+    fn semantic_logits_can_mask_end_audio_for_first_frame() {
+        let device = Device::Cpu;
+        let logits =
+            Tensor::from_vec(vec![100.0, 99.0, 1.0, 2.0, 98.0, 97.0], (1, 6), &device).unwrap();
+
+        let eos_allowed = semantic_codes_from_logits_with_eos_policy(&logits, 2, true).unwrap();
+        let eos_masked = semantic_codes_from_logits_with_eos_policy(&logits, 2, false).unwrap();
+
+        assert_eq!(eos_allowed, vec![1]);
+        assert_eq!(eos_masked, vec![3]);
     }
 
     #[test]
