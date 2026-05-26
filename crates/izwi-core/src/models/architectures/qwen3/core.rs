@@ -4,8 +4,8 @@
 //! (used for audio-conditioned ASR).
 
 use candle_core::quantized::QMatMul;
-use candle_core::{DType, Device, Module, Tensor, D};
-use candle_nn::{ops, rotary_emb, Embedding, Linear, RmsNorm, VarBuilder};
+use candle_core::{D, DType, Device, Module, Tensor};
+use candle_nn::{Embedding, Linear, RmsNorm, VarBuilder, ops, rotary_emb};
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -13,15 +13,15 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::kernels::try_fused_silu_mul;
 use crate::models::shared::attention::batched::{
-    batched_scaled_dot_product_attention, BatchedAttentionConfig, BatchedAttentionInput,
+    BatchedAttentionConfig, BatchedAttentionInput, batched_scaled_dot_product_attention,
 };
 use crate::models::shared::attention::flash::try_fused_self_attention;
 use crate::models::shared::attention::paged::{
-    append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
-    paged_decode_attention, KvCacheQuantization, KvPage,
+    KvCacheQuantization, KvPage, append_to_pages, default_kv_page_size, default_kv_quantization,
+    materialize_pages, paged_decode_attention,
 };
 use crate::models::shared::telemetry::{
-    record_decode_attention_path, record_rope_kernel, record_rope_manual, DecodeAttentionPath,
+    DecodeAttentionPath, record_decode_attention_path, record_rope_kernel, record_rope_manual,
 };
 use crate::models::shared::weights::gguf::GgufLoader;
 use crate::models::shared::weights::mlx;
@@ -1018,18 +1018,63 @@ pub struct Qwen3Model {
     use_mrope: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen3WeightLayout {
+    pub model_prefix: &'static str,
+    pub lm_head_prefix: Option<&'static str>,
+}
+
+impl Qwen3WeightLayout {
+    pub const STANDARD: Self = Self {
+        model_prefix: "model",
+        lm_head_prefix: Some("lm_head"),
+    };
+
+    pub const VIBEVOICE: Self = Self {
+        model_prefix: "model.language_model",
+        lm_head_prefix: Some("lm_head"),
+    };
+}
+
+impl Default for Qwen3WeightLayout {
+    fn default() -> Self {
+        Self::STANDARD
+    }
+}
+
 impl Qwen3Model {
     pub fn load(cfg: Qwen3Config, vb: VarBuilder) -> Result<Self> {
+        Self::load_with_layout(cfg, vb, Qwen3WeightLayout::STANDARD)
+    }
+
+    pub fn load_with_layout(
+        cfg: Qwen3Config,
+        vb: VarBuilder,
+        layout: Qwen3WeightLayout,
+    ) -> Result<Self> {
         let lm_head_size = cfg.lm_head_size.unwrap_or(cfg.vocab_size);
-        let embed_tokens =
-            mlx::load_embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
-        let lm_head = if vb.contains_tensor("lm_head.weight") {
-            Qwen3Projection::dense(cfg.hidden_size, lm_head_size, vb.pp("lm_head"))?
+        let embed_tokens = mlx::load_embedding(
+            cfg.vocab_size,
+            cfg.hidden_size,
+            vb.pp(qwen3_join_prefix(layout.model_prefix, "embed_tokens")),
+        )?;
+        let lm_head = if let Some(lm_head_prefix) = layout.lm_head_prefix {
+            let lm_head_weight = qwen3_join_prefix(lm_head_prefix, "weight");
+            if vb.contains_tensor(&lm_head_weight) {
+                Qwen3Projection::dense(cfg.hidden_size, lm_head_size, vb.pp(lm_head_prefix))?
+            } else {
+                if lm_head_size != cfg.vocab_size {
+                    return Err(Error::InvalidInput(format!(
+                        "lm_head_size ({lm_head_size}) differs from vocab_size ({}) but {} is missing",
+                        cfg.vocab_size, lm_head_weight
+                    )));
+                }
+                Qwen3Projection::tied_dense(embed_tokens.embeddings().clone())
+            }
         } else {
-            // Some MLX checkpoints omit lm_head and tie it to token embeddings.
             if lm_head_size != cfg.vocab_size {
                 return Err(Error::InvalidInput(format!(
-                    "lm_head_size ({lm_head_size}) differs from vocab_size ({}) but lm_head.weight is missing",
+                    "lm_head_size ({lm_head_size}) differs from vocab_size ({}) but no lm_head prefix was configured",
                     cfg.vocab_size
                 )));
             }
@@ -1037,10 +1082,20 @@ impl Qwen3Model {
         };
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for idx in 0..cfg.num_hidden_layers {
-            let layer = Qwen3Layer::load(&cfg, vb.pp(format!("model.layers.{idx}")))?;
+            let layer = Qwen3Layer::load(
+                &cfg,
+                vb.pp(qwen3_join_prefix(
+                    layout.model_prefix,
+                    &format!("layers.{idx}"),
+                )),
+            )?;
             layers.push(layer);
         }
-        let norm = candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
+        let norm = candle_nn::rms_norm(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            vb.pp(qwen3_join_prefix(layout.model_prefix, "norm")),
+        )?;
         let use_mrope = cfg
             .rope_scaling
             .as_ref()
@@ -1159,14 +1214,28 @@ impl Qwen3Model {
         mut cache: Option<&mut Qwen3Cache>,
         position_ids: Option<&Tensor>,
     ) -> Result<Tensor> {
+        let hidden =
+            self.forward_hidden_with_embeds(embeds, start_pos, cache.as_deref_mut(), position_ids)?;
+        self.logits_from_hidden(&hidden)
+    }
+
+    pub fn forward_hidden_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        mut cache: Option<&mut Qwen3Cache>,
+        position_ids: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let mut x = embeds.clone();
         for (idx, layer) in self.layers.iter().enumerate() {
             let cache_ref = cache.as_deref_mut();
             x = layer.forward(&x, start_pos, position_ids, cache_ref, idx)?;
         }
-        let x = self.norm.forward(&x)?;
-        let logits = self.lm_head.forward(&x)?;
-        Ok(logits)
+        self.norm.forward(&x).map_err(Error::from)
+    }
+
+    pub fn logits_from_hidden(&self, hidden: &Tensor) -> Result<Tensor> {
+        self.lm_head.forward(hidden).map_err(Error::from)
     }
 
     pub fn uses_mrope(&self) -> bool {
