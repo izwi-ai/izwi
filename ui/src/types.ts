@@ -39,6 +39,14 @@ export function isVoxtralTtsVariant(variant: string): boolean {
   );
 }
 
+function isVoxtralAsrVariant(variant: string): boolean {
+  const normalized = variant.trim().toLowerCase();
+  return (
+    normalized === "voxtral-mini-4b-realtime-2602" ||
+    normalized === "mistralai/voxtral-mini-4b-realtime-2602"
+  );
+}
+
 function isQwenAsrVariant(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   return (
@@ -113,7 +121,7 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
       isQwenAsrVariant(variant) ||
       variant.includes("Whisper-Large-v3-Turbo") ||
       variant.includes("Parakeet-TDT") ||
-      variant.includes("Voxtral") ||
+      isVoxtralAsrVariant(variant) ||
       isLfm25AudioVariant(variant),
     emptyStateTitle: "No ASR Model Loaded",
     emptyStateDescription:
