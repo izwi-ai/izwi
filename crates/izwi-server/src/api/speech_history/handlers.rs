@@ -23,6 +23,7 @@ use crate::speech_history_store::{
 };
 use crate::state::AppState;
 use izwi_core::audio::{AudioEncoder, AudioFormat};
+use izwi_core::runtime_models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use izwi_core::{
     parse_tts_model_variant, AudioChunk, GenerationConfig, GenerationRequest, ModelVariant,
 };
@@ -521,6 +522,7 @@ async fn synthesize_record_internal(
     let timeout = Duration::from_secs(resolve_generation_timeout_secs(
         state.request_timeout_secs,
         variant,
+        &input_text,
         req.max_output_tokens.or(req.max_tokens),
         req.speed,
         planned_request_count,
@@ -1049,6 +1051,8 @@ fn build_generation_request(
     }
     if let Some(max_tokens) = req.max_output_tokens.or(req.max_tokens) {
         generation_config.options.max_tokens = max_tokens;
+    } else if variant == ModelVariant::Voxtral4BTts2603 {
+        generation_config.options.max_tokens = 0;
     }
     if let Some(top_k) = req.top_k {
         generation_config.options.top_k = top_k;
@@ -1215,6 +1219,7 @@ fn has_non_empty_text(raw: &str) -> bool {
 fn resolve_generation_timeout_secs(
     default_timeout_secs: u64,
     variant: ModelVariant,
+    text: &str,
     requested_frames: Option<usize>,
     requested_speed: Option<f32>,
     planned_request_count: usize,
@@ -1227,6 +1232,9 @@ fn resolve_generation_timeout_secs(
     };
 
     let effective_frames = match requested_frames {
+        Some(0) | None if variant == ModelVariant::Voxtral4BTts2603 => {
+            voxtral_tts_auto_max_frames_for_text(text)
+        }
         Some(0) | None => model_max_frames,
         Some(value) => value.clamp(1, model_max_frames),
     };
@@ -1348,6 +1356,35 @@ mod tests {
         assert!(err
             .message
             .contains("Provide both `reference_audio` and `reference_text` together."));
+    }
+
+    #[test]
+    fn voxtral_tts_history_requests_default_to_text_sized_auto_budget() {
+        let mut req = base_request();
+        req.model_id = Some("Voxtral-4B-TTS-2603".to_string());
+        req.text = Some("The costs split cleanly into three buckets".to_string());
+        req.speaker = Some("casual_male".to_string());
+
+        let generation = build_generation_request(
+            req,
+            "test-correlation".to_string(),
+            "The costs split cleanly into three buckets".to_string(),
+            false,
+            ModelVariant::Voxtral4BTts2603,
+        );
+
+        assert_eq!(generation.config.options.max_tokens, 0);
+        assert_eq!(
+            resolve_generation_timeout_secs(
+                1,
+                ModelVariant::Voxtral4BTts2603,
+                &generation.text,
+                None,
+                None,
+                1,
+            ),
+            61
+        );
     }
 
     #[test]

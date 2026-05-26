@@ -30,7 +30,7 @@ pub use model::{
     select_voxtral_tts_dtypes, VoxtralTtsAssets, VoxtralTtsDTypePlan, VoxtralTtsModel,
     VoxtralTtsOutput,
 };
-pub use sampling::VoxtralTtsGenerationParams;
+pub use sampling::{voxtral_tts_auto_max_frames_for_text, VoxtralTtsGenerationParams};
 pub use tokenizer::{VoxtralTtsPrompt, VoxtralTtsSpecialTokens, VoxtralTtsTokenizer};
 pub use voice::{
     VoxtralVoiceCatalog, VoxtralVoiceEmbeddingLibrary, VoxtralVoiceEmbeddingShape,

@@ -19,6 +19,7 @@ use crate::api::saved_voices::resolve_saved_voice_reference;
 use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::audio::AudioFormat;
+use izwi_core::runtime_models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use izwi_core::{
     AudioChunk, GenerationConfig, GenerationRequest, ModelVariant, parse_tts_model_variant,
 };
@@ -221,9 +222,14 @@ fn resolve_speech_timeout_secs(
         return default_timeout_secs.max(1);
     };
 
-    // `0` means auto for TTS; treat that as native model max.
+    // `0`/omitted means auto for TTS. Voxtral uses a text-sized default
+    // budget because every native frame is expensive and audio is emitted only
+    // after the final codec pass; other TTS models keep the historical max.
     let requested_frames = req.max_output_tokens.or(req.max_tokens);
     let effective_frames = match requested_frames {
+        Some(0) | None if variant == ModelVariant::Voxtral4BTts2603 => {
+            voxtral_tts_auto_max_frames_for_text(&req.input)
+        }
         Some(0) | None => model_max_frames,
         Some(value) => value.clamp(1, model_max_frames),
     };
@@ -553,6 +559,8 @@ fn build_generation_request(
     }
     if let Some(max_tokens) = req.max_output_tokens.or(req.max_tokens) {
         gen_config.options.max_tokens = max_tokens;
+    } else if variant == ModelVariant::Voxtral4BTts2603 {
+        gen_config.options.max_tokens = 0;
     }
     if let Some(top_k) = req.top_k {
         gen_config.options.top_k = top_k;
@@ -734,6 +742,40 @@ mod tests {
 
         let timeout = resolve_speech_timeout_secs(300, ModelVariant::Kokoro82M, &req);
         assert_eq!(timeout, 300);
+    }
+
+    #[test]
+    fn voxtral_tts_omitted_max_tokens_uses_text_sized_auto_budget() {
+        let req = SpeechRequest {
+            model: "Voxtral-4B-TTS-2603".to_string(),
+            input: "The costs split cleanly into three buckets".to_string(),
+            voice: Some("casual_male".to_string()),
+            response_format: Some("wav".to_string()),
+            allow_format_fallback: None,
+            speed: None,
+            language: None,
+            temperature: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            top_k: None,
+            stream: Some(false),
+            stream_format: None,
+            instructions: None,
+            reference_audio: None,
+            reference_text: None,
+            saved_voice_id: None,
+        };
+
+        let timeout = resolve_speech_timeout_secs(1, ModelVariant::Voxtral4BTts2603, &req);
+        assert_eq!(timeout, 61);
+
+        let generation = build_generation_request(
+            &req,
+            "test-correlation".to_string(),
+            false,
+            ModelVariant::Voxtral4BTts2603,
+        );
+        assert_eq!(generation.config.options.max_tokens, 0);
     }
 
     #[test]

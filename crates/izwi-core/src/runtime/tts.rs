@@ -162,7 +162,8 @@ impl RuntimeService {
             .ok_or_else(|| {
                 Error::InferenceError("Voxtral TTS model exposes no preset voices".to_string())
             })?;
-        let params = VoxtralTtsGenerationParams::from_generation_config(&request.config);
+        let params =
+            VoxtralTtsGenerationParams::from_generation_config_for_text(&request.config, &text);
         let started = Instant::now();
         let output = model.generate_with_voice(&text, &voice, params)?;
         let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;

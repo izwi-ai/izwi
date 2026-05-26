@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{Embedding, Module, VarBuilder};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::backends::DeviceProfile;
 use crate::catalog::ModelFamily;
@@ -250,6 +250,16 @@ impl VoxtralTtsPipeline {
             }
             let next_embed = self.audio_embeddings.embedding_for_shifted_codes(&frame)?;
             frames.push(frame);
+            if params.auto_frame_budget
+                && (frames.len() == 1 || frames.len() % 8 == 0 || frame_idx + 1 >= max_frames)
+            {
+                info!(
+                    "Voxtral TTS generated {}/{} acoustic frame(s) (~{:.2}s audio budget)",
+                    frames.len(),
+                    max_frames,
+                    frames.len() as f32 / model.config.frame_rate()
+                );
+            }
 
             if frame_idx + 1 >= max_frames {
                 break;
@@ -269,6 +279,12 @@ impl VoxtralTtsPipeline {
             return Err(Error::InferenceError(
                 "Voxtral TTS generated no audio frames".to_string(),
             ));
+        }
+        if params.auto_frame_budget && frames.len() >= max_frames {
+            warn!(
+                "Voxtral TTS reached auto frame budget of {} frame(s) before the model emitted end-of-audio",
+                max_frames
+            );
         }
         let frames_generated = frames.len();
         let timeline = VoxtralCodecTimeline::new(frames_to_codebooks(frames)?).map_err(|err| {
