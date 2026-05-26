@@ -45,6 +45,20 @@ describe("speech route model filters", () => {
       true,
     );
   });
+
+  it("keeps voxtral tts off transcription routes", () => {
+    expect(VIEW_CONFIGS.transcription.modelFilter("Voxtral-4B-TTS-2603")).toBe(
+      false,
+    );
+    expect(
+      VIEW_CONFIGS.transcription.modelFilter("mistralai/Voxtral-4B-TTS-2603"),
+    ).toBe(false);
+    expect(
+      VIEW_CONFIGS.transcription.modelFilter(
+        "mistralai/Voxtral-Mini-4B-Realtime-2602",
+      ),
+    ).toBe(true);
+  });
 });
 
 describe("getSpeakerProfilesForVariant", () => {
