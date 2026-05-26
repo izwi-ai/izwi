@@ -4,13 +4,13 @@
 //! which uses different tensor naming conventions (wq/wk/wv/wo, w1/w2/w3) and
 //! root-level layer structure compared to standard Qwen3.
 
-use candle_core::{Device, Tensor};
-use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
+use candle_core::{DType, Device, Tensor};
+use candle_nn::{Embedding, Linear, Module, RmsNorm, VarBuilder, ops};
 
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::core::{
-    build_mrope_cache, build_rope_cache, causal_mask, dense_decode_attention, repeat_kv,
-    Qwen3Cache, Qwen3Config,
+    Qwen3Cache, Qwen3Config, build_mrope_cache, build_rope_cache, causal_mask,
+    dense_decode_attention, repeat_kv,
 };
 use crate::models::shared::attention::flash::try_fused_self_attention;
 use crate::models::shared::attention::paged::paged_decode_attention;
@@ -400,7 +400,11 @@ impl VoxtralAttention {
         let v_kv_heads = v.transpose(1, 2)?;
 
         let total_len = k_kv_heads.dim(2)?;
-        if start_pos == 0 && total_len == seq_len && self.sliding_window.is_none() {
+        if start_pos == 0
+            && total_len == seq_len
+            && self.sliding_window.is_none()
+            && voxtral_prefill_fused_attention_allowed(q.device().is_metal(), q.dtype())
+        {
             if let Some(fused_out) = try_fused_self_attention(
                 &q_heads,
                 &k_kv_heads,
@@ -524,6 +528,10 @@ impl VoxtralAttention {
     }
 }
 
+fn voxtral_prefill_fused_attention_allowed(is_metal: bool, dtype: DType) -> bool {
+    !(is_metal && dtype == DType::F32)
+}
+
 fn apply_interleaved_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let bsz = x.dim(0)?;
     let seq_len = x.dim(1)?;
@@ -645,7 +653,7 @@ impl VoxtralMlp {
 mod tests {
     use super::*;
     use crate::models::shared::attention::paged::KvCacheQuantization;
-    use candle_core::{DType, D};
+    use candle_core::{D, DType};
     use std::collections::HashMap;
 
     fn tiny_cfg() -> Qwen3Config {
@@ -860,6 +868,13 @@ mod tests {
                 2.0 * 0.2 + 20.0 * 0.25,
             ]
         );
+    }
+
+    #[test]
+    fn voxtral_metal_f32_prefill_skips_fused_attention() {
+        assert!(!voxtral_prefill_fused_attention_allowed(true, DType::F32));
+        assert!(voxtral_prefill_fused_attention_allowed(true, DType::F16));
+        assert!(voxtral_prefill_fused_attention_allowed(false, DType::F32));
     }
 
     #[test]

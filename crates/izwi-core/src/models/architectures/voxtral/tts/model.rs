@@ -220,32 +220,18 @@ impl VoxtralTtsPipeline {
                 Error::InferenceError(format!("Voxtral TTS prompt embedding failed: {err}"))
             })?;
         let mut cache = Qwen3Cache::new(self.language_model.num_layers());
-        let _prefill_hidden = self
+        let prefill_hidden = self
             .language_model
             .forward_hidden_with_embeds(&prompt_embeds, 0, Some(&mut cache), None, None)
             .map_err(|err| {
                 Error::InferenceError(format!("Voxtral TTS LM prefill failed: {err}"))
             })?;
         let mut pos = prompt.input_ids.len();
-        // Match the autoregressive TTS contract: after the text/voice prompt,
-        // decode one explicit [AUDIO] token before running the acoustic head.
-        let mut next_embed = self.language_model.embeddings(&Tensor::from_vec(
-            vec![model.config.audio_token_id()],
-            (1, 1),
-            &self.device,
-        )?)?;
+        let mut last_hidden = last_sequence_hidden(&prefill_hidden, "Voxtral TTS LM prefill")?;
         let mut frames = Vec::new();
 
         let max_frames = params.max_frames.max(1);
         for frame_idx in 0..max_frames {
-            let hidden = self
-                .language_model
-                .forward_hidden_with_embeds(&next_embed, pos, Some(&mut cache), None, None)
-                .map_err(|err| {
-                    Error::InferenceError(format!("Voxtral TTS LM decode failed: {err}"))
-                })?;
-            pos += 1;
-            let last_hidden = last_sequence_hidden(&hidden, "Voxtral TTS LM decode")?;
             let generated = self
                 .acoustic_transformer
                 .forward_audio_codes_with_steps_and_eos_policy(
@@ -263,7 +249,7 @@ impl VoxtralTtsPipeline {
             if frame.first().copied() == Some(AudioSpecialToken::End.id()) {
                 break;
             }
-            next_embed = self.audio_embeddings.embedding_for_shifted_codes(&frame)?;
+            let feedback_frame = frame.clone();
             frames.push(frame);
             if params.auto_frame_budget
                 && (frames.len() == 1 || frames.len() % 8 == 0 || frame_idx + 1 >= max_frames)
@@ -275,6 +261,20 @@ impl VoxtralTtsPipeline {
                     frames.len() as f32 / model.config.frame_rate()
                 );
             }
+            if frame_idx + 1 >= max_frames {
+                break;
+            }
+            let next_embed = self
+                .audio_embeddings
+                .embedding_for_shifted_codes(&feedback_frame)?;
+            let hidden = self
+                .language_model
+                .forward_hidden_with_embeds(&next_embed, pos, Some(&mut cache), None, None)
+                .map_err(|err| {
+                    Error::InferenceError(format!("Voxtral TTS LM decode failed: {err}"))
+                })?;
+            pos += 1;
+            last_hidden = last_sequence_hidden(&hidden, "Voxtral TTS LM decode")?;
         }
 
         if frames.is_empty() {
