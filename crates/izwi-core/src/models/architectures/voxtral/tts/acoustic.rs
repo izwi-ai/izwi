@@ -588,11 +588,7 @@ fn semantic_codes_from_logits_with_eos_policy(
     let rows = logits.to_dtype(DType::F32)?.to_vec2::<f32>()?;
     rows.into_iter()
         .map(|row| {
-            let mut best_idx = if allow_end_audio {
-                AudioSpecialToken::End.id() as usize
-            } else {
-                AUDIO_SPECIAL_TOKEN_COUNT as usize
-            };
+            let mut best_idx = None;
             let mut best_value = f32::NEG_INFINITY;
             for (idx, value) in row.iter().take(allowed).enumerate() {
                 if idx == AudioSpecialToken::Empty.id() as usize {
@@ -601,11 +597,19 @@ fn semantic_codes_from_logits_with_eos_policy(
                 if !allow_end_audio && idx == AudioSpecialToken::End.id() as usize {
                     continue;
                 }
+                if !value.is_finite() {
+                    continue;
+                }
                 if *value > best_value {
-                    best_idx = idx;
+                    best_idx = Some(idx);
                     best_value = *value;
                 }
             }
+            let best_idx = best_idx.ok_or_else(|| {
+                Error::InferenceError(
+                    "Voxtral semantic logits contained no finite valid audio tokens".to_string(),
+                )
+            })?;
             Ok(best_idx as u32)
         })
         .collect()
@@ -719,6 +723,21 @@ mod tests {
 
         assert_eq!(eos_allowed, vec![1]);
         assert_eq!(eos_masked, vec![3]);
+    }
+
+    #[test]
+    fn semantic_logits_reject_non_finite_rows() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(
+            vec![100.0, f32::NAN, f32::NEG_INFINITY, f32::NAN, 99.0],
+            (1, 5),
+            &device,
+        )
+        .unwrap();
+
+        let err = semantic_codes_from_logits_with_eos_policy(&logits, 2, true).unwrap_err();
+
+        assert!(format!("{err}").contains("no finite valid audio tokens"));
     }
 
     #[test]
