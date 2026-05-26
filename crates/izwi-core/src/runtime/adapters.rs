@@ -139,7 +139,7 @@ fn tts_streaming_mode(model_variant: ModelVariant) -> StreamingMode {
         || model_variant.is_lfm25_audio_gguf()
         || matches!(
             model_variant.family(),
-            crate::catalog::ModelFamily::VoxtralTts
+            crate::catalog::ModelFamily::VoxtralTts | crate::catalog::ModelFamily::VibeVoiceTts
         )
     {
         StreamingMode::Chunked

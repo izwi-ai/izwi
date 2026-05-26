@@ -28,6 +28,13 @@ describe("speech route model filters", () => {
     );
   });
 
+  it("includes vibevoice asr on transcription routes", () => {
+    expect(VIEW_CONFIGS.transcription.modelFilter("VibeVoice-ASR")).toBe(true);
+    expect(
+      VIEW_CONFIGS.transcription.modelFilter("microsoft/VibeVoice-ASR"),
+    ).toBe(true);
+  });
+
   it("includes lfm25 audio on transcription routes", () => {
     expect(VIEW_CONFIGS.transcription.modelFilter("LFM2.5-Audio-1.5B-GGUF")).toBe(
       true,
@@ -58,6 +65,18 @@ describe("speech route model filters", () => {
         "mistralai/Voxtral-Mini-4B-Realtime-2602",
       ),
     ).toBe(true);
+  });
+
+  it("routes vibevoice tts to voice cloning only", () => {
+    expect(VIEW_CONFIGS["voice-clone"].modelFilter("VibeVoice-1.5B")).toBe(
+      true,
+    );
+    expect(VIEW_CONFIGS["custom-voice"].modelFilter("VibeVoice-1.5B")).toBe(
+      false,
+    );
+    expect(VIEW_CONFIGS.transcription.modelFilter("VibeVoice-1.5B")).toBe(
+      false,
+    );
   });
 });
 
@@ -97,5 +116,11 @@ describe("getSpeakerProfilesForVariant", () => {
       "hi_male",
       "hi_female",
     ]);
+  });
+
+  it("does not surface builtin speaker presets for vibevoice tts", () => {
+    expect(getSpeakerProfilesForVariant("microsoft/VibeVoice-1.5B")).toEqual(
+      [],
+    );
   });
 });

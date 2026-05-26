@@ -502,6 +502,25 @@ impl DeviceProfile {
                     })
                 }
             }
+            ModelFamily::VibeVoiceTts | ModelFamily::VibeVoiceAsr => {
+                if self.capabilities.supports_bf16 {
+                    Some(DTypeSelection {
+                        dtype: DType::BF16,
+                        reason: "VibeVoice CUDA policy defaults dense language and speech stages to BF16 when supported".into(),
+                    })
+                } else if self.capabilities.supports_f16 {
+                    Some(DTypeSelection {
+                        dtype: DType::F16,
+                        reason: "VibeVoice CUDA policy falls back to F16 when BF16 is unavailable"
+                            .into(),
+                    })
+                } else {
+                    Some(DTypeSelection {
+                        dtype: DType::F32,
+                        reason: "VibeVoice CUDA policy falls back to F32 without reported half precision support".into(),
+                    })
+                }
+            }
             _ => None,
         }
     }

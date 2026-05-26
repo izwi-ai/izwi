@@ -97,6 +97,37 @@ const VOXTRAL_TTS_VOICE_EMBEDDINGS: &[&str] = &[
     "voice_embedding/pt_male.pt",
 ];
 
+const VIBEVOICE_QWEN_TOKENIZER_FILES: &[&str] = &[
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "vocab.json",
+    "merges.txt",
+    "special_tokens_map.json",
+];
+
+fn vibevoice_tokenizer_repo(variant: ModelVariant) -> Option<&'static str> {
+    match variant {
+        ModelVariant::VibeVoice15BTts => Some("Qwen/Qwen2.5-1.5B"),
+        ModelVariant::VibeVoiceAsr => Some("Qwen/Qwen2.5-7B"),
+        _ => None,
+    }
+}
+
+fn vibevoice_shard_count(variant: ModelVariant) -> Option<usize> {
+    match variant {
+        ModelVariant::VibeVoice15BTts => Some(3),
+        ModelVariant::VibeVoiceAsr => Some(8),
+        _ => None,
+    }
+}
+
+fn vibevoice_safetensor_shards(variant: ModelVariant) -> Vec<String> {
+    let total = vibevoice_shard_count(variant).expect("checked by VibeVoice family");
+    (1..=total)
+        .map(|idx| format!("model-{idx:05}-of-{total:05}.safetensors"))
+        .collect()
+}
+
 #[derive(Debug, Deserialize)]
 struct HfRepoTreeEntry {
     path: String,
@@ -502,6 +533,15 @@ impl ModelDownloader {
                     qwen_asr_gguf_filename(variant).expect("checked by qwen3-asr family");
                 path.join(gguf_file).exists()
             }
+            ModelFamily::VibeVoiceAsr => {
+                path.join("config.json").exists()
+                    && path.join("model.safetensors.index.json").exists()
+                    && path.join("tokenizer.json").exists()
+                    && path.join("tokenizer_config.json").exists()
+                    && vibevoice_safetensor_shards(variant)
+                        .iter()
+                        .all(|file| path.join(file).exists())
+            }
             ModelFamily::SortformerDiarization => path
                 .join("diar_streaming_sortformer_4spk-v2.1.nemo")
                 .exists(),
@@ -558,6 +598,16 @@ impl ModelDownloader {
                     && path.join("tekken.json").exists()
                     && path.join("consolidated.safetensors").exists()
                     && VOXTRAL_TTS_VOICE_EMBEDDINGS
+                        .iter()
+                        .all(|file| path.join(file).exists())
+            }
+            ModelFamily::VibeVoiceTts => {
+                path.join("config.json").exists()
+                    && path.join("preprocessor_config.json").exists()
+                    && path.join("model.safetensors.index.json").exists()
+                    && path.join("tokenizer.json").exists()
+                    && path.join("tokenizer_config.json").exists()
+                    && vibevoice_safetensor_shards(variant)
                         .iter()
                         .all(|file| path.join(file).exists())
             }
@@ -1040,6 +1090,19 @@ impl ModelDownloader {
             ModelFamily::Qwen3Asr => vec![qwen_asr_gguf_filename(variant)
                 .expect("checked by qwen3-asr family")
                 .to_string()],
+            ModelFamily::VibeVoiceAsr => {
+                let mut files = vec![
+                    "config.json".to_string(),
+                    "model.safetensors.index.json".to_string(),
+                ];
+                files.extend(vibevoice_safetensor_shards(variant));
+                files.extend(
+                    VIBEVOICE_QWEN_TOKENIZER_FILES
+                        .iter()
+                        .map(|file| (*file).to_string()),
+                );
+                files
+            }
             ModelFamily::SortformerDiarization => vec![
                 "diar_streaming_sortformer_4spk-v2.1.nemo".to_string(),
                 "README.md".to_string(),
@@ -1146,6 +1209,20 @@ impl ModelDownloader {
                 );
                 files
             }
+            ModelFamily::VibeVoiceTts => {
+                let mut files = vec![
+                    "config.json".to_string(),
+                    "preprocessor_config.json".to_string(),
+                    "model.safetensors.index.json".to_string(),
+                ];
+                files.extend(vibevoice_safetensor_shards(variant));
+                files.extend(
+                    VIBEVOICE_QWEN_TOKENIZER_FILES
+                        .iter()
+                        .map(|file| (*file).to_string()),
+                );
+                files
+            }
             ModelFamily::Tokenizer => vec![
                 "config.json".to_string(),
                 "generation_config.json".to_string(),
@@ -1178,6 +1255,26 @@ impl ModelDownloader {
 
     fn get_model_file_specs(&self, variant: ModelVariant) -> Vec<ModelFileSpec> {
         let default_repo = variant.repo_id().to_string();
+
+        if let Some(tokenizer_repo) = vibevoice_tokenizer_repo(variant) {
+            return self
+                .get_model_files(variant)
+                .into_iter()
+                .map(|file| {
+                    let source_repo = if VIBEVOICE_QWEN_TOKENIZER_FILES.contains(&file.as_str()) {
+                        tokenizer_repo.to_string()
+                    } else {
+                        default_repo.clone()
+                    };
+
+                    ModelFileSpec {
+                        source_repo,
+                        source_file: file.clone(),
+                        local_file: file,
+                    }
+                })
+                .collect();
+        }
 
         if variant.is_qwen_chat_gguf() {
             let tokenizer_repo = match variant {
@@ -1487,7 +1584,12 @@ impl ModelDownloader {
                 _ => 8_000_000_000,
             }
         } else if file.contains("model.safetensors") && !file.contains("index") {
-            if file.contains("00001") || file.contains("00002") {
+            if matches!(
+                variant,
+                ModelVariant::VibeVoice15BTts | ModelVariant::VibeVoiceAsr
+            ) {
+                variant.estimated_size() / vibevoice_shard_count(variant).unwrap_or(1) as u64
+            } else if file.contains("00001") || file.contains("00002") {
                 2_000_000_000
             } else {
                 match variant {
@@ -1824,6 +1926,84 @@ mod tests {
             [0u8],
         )
         .expect("last voice embedding");
+        assert!(downloader.is_downloaded(variant));
+
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn vibevoice_tts_files_include_model_shards_and_qwen_tokenizer_assets() {
+        let (downloader, temp_dir) = test_downloader();
+        let files = downloader.get_model_files(ModelVariant::VibeVoice15BTts);
+
+        assert!(files.contains(&"config.json".to_string()));
+        assert!(files.contains(&"preprocessor_config.json".to_string()));
+        assert!(files.contains(&"model.safetensors.index.json".to_string()));
+        assert!(files.contains(&"model-00001-of-00003.safetensors".to_string()));
+        assert!(files.contains(&"model-00003-of-00003.safetensors".to_string()));
+        assert!(files.contains(&"tokenizer.json".to_string()));
+        assert!(files.contains(&"tokenizer_config.json".to_string()));
+
+        let specs = downloader.get_model_file_specs(ModelVariant::VibeVoice15BTts);
+        let tokenizer_spec = specs
+            .iter()
+            .find(|spec| spec.local_file == "tokenizer.json")
+            .expect("tokenizer spec");
+        assert_eq!(tokenizer_spec.source_repo, "Qwen/Qwen2.5-1.5B");
+        let shard_spec = specs
+            .iter()
+            .find(|spec| spec.local_file == "model-00001-of-00003.safetensors")
+            .expect("shard spec");
+        assert_eq!(shard_spec.source_repo, "microsoft/VibeVoice-1.5B");
+
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn vibevoice_asr_files_include_eight_model_shards_and_qwen_tokenizer_assets() {
+        let (downloader, temp_dir) = test_downloader();
+        let files = downloader.get_model_files(ModelVariant::VibeVoiceAsr);
+
+        assert!(files.contains(&"config.json".to_string()));
+        assert!(files.contains(&"model.safetensors.index.json".to_string()));
+        assert!(files.contains(&"model-00001-of-00008.safetensors".to_string()));
+        assert!(files.contains(&"model-00008-of-00008.safetensors".to_string()));
+        assert!(files.contains(&"tokenizer.json".to_string()));
+        assert!(files.contains(&"tokenizer_config.json".to_string()));
+
+        let specs = downloader.get_model_file_specs(ModelVariant::VibeVoiceAsr);
+        let tokenizer_spec = specs
+            .iter()
+            .find(|spec| spec.local_file == "tokenizer.json")
+            .expect("tokenizer spec");
+        assert_eq!(tokenizer_spec.source_repo, "Qwen/Qwen2.5-7B");
+        let shard_spec = specs
+            .iter()
+            .find(|spec| spec.local_file == "model-00008-of-00008.safetensors")
+            .expect("shard spec");
+        assert_eq!(shard_spec.source_repo, "microsoft/VibeVoice-ASR");
+
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn vibevoice_is_downloaded_only_when_required_assets_exist() {
+        let (downloader, temp_dir) = test_downloader();
+        let variant = ModelVariant::VibeVoice15BTts;
+        let model_dir = downloader.model_path(variant);
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+        std::fs::write(model_dir.join("config.json"), "{}").expect("config");
+        std::fs::write(model_dir.join("preprocessor_config.json"), "{}").expect("processor");
+        std::fs::write(model_dir.join("model.safetensors.index.json"), "{}").expect("index");
+        std::fs::write(model_dir.join("tokenizer.json"), "{}").expect("tokenizer");
+        std::fs::write(model_dir.join("tokenizer_config.json"), "{}").expect("tokenizer config");
+        for file in vibevoice_safetensor_shards(variant).iter().take(2) {
+            std::fs::write(model_dir.join(file), [0u8]).expect("partial shard");
+        }
+        assert!(!downloader.is_downloaded(variant));
+
+        std::fs::write(model_dir.join("model-00003-of-00003.safetensors"), [0u8])
+            .expect("last shard");
         assert!(downloader.is_downloaded(variant));
 
         std::fs::remove_dir_all(temp_dir).ok();

@@ -21,6 +21,7 @@ impl RuntimeService {
             ModelFamily::ParakeetAsr
             | ModelFamily::WhisperAsr
             | ModelFamily::Qwen3Asr
+            | ModelFamily::VibeVoiceAsr
             | ModelFamily::Qwen3ForcedAligner => {
                 self.model_registry.unload_asr(variant).await;
             }
@@ -50,6 +51,10 @@ impl RuntimeService {
             }
             ModelFamily::VoxtralTts => {
                 self.model_registry.unload_voxtral_tts(variant).await;
+                self.clear_active_tts_variant(variant).await;
+            }
+            ModelFamily::VibeVoiceTts => {
+                self.model_registry.unload_asr(variant).await;
                 self.clear_active_tts_variant(variant).await;
             }
             ModelFamily::Tokenizer => {
