@@ -10,8 +10,7 @@ use serde::Deserialize;
 use crate::error::Result;
 use crate::tokenizer::Tokenizer;
 
-const TTS_SYSTEM_PROMPT: &str =
-    "Transform the text provided by the user into natural-sounding speech.";
+const TTS_SYSTEM_PROMPT: &str = " Transform the text provided by various speakers into speech output, utilizing the distinct voice of each respective speaker.\n";
 const ASR_SYSTEM_PROMPT: &str =
     "You are a speech recognition model. Transcribe the user's audio faithfully.";
 
@@ -26,6 +25,7 @@ pub struct VibeVoiceSpecialTokens {
     pub speech_start: u32,
     pub speech_end: u32,
     pub speech_pad: u32,
+    pub image_pad: u32,
 }
 
 impl Default for VibeVoiceSpecialTokens {
@@ -40,6 +40,7 @@ impl Default for VibeVoiceSpecialTokens {
             speech_start: 151_652,
             speech_end: 151_653,
             speech_pad: 151_654,
+            image_pad: 151_655,
         }
     }
 }
@@ -92,16 +93,13 @@ impl VibeVoicePromptTokenizer {
         speaker: &str,
         reference_frames: usize,
     ) -> Result<VibeVoiceTtsPrompt> {
-        let speaker = sanitize_speaker(speaker);
+        let speaker = sanitize_tts_speaker(speaker);
         let mut input_ids = Vec::new();
-        self.push_chat_segment(&mut input_ids, "system", TTS_SYSTEM_PROMPT)?;
-        input_ids.push(self.specials.im_end);
-        input_ids.extend(self.encode_text("\n")?);
-        self.push_role_header(&mut input_ids, "user")?;
+        input_ids.extend(self.encode_text(TTS_SYSTEM_PROMPT)?);
 
         let reference_voice_range = if reference_frames > 0 {
-            input_ids.extend(self.encode_text("Voice input:\n")?);
-            input_ids.extend(self.encode_text(&format!("{speaker}: "))?);
+            input_ids.extend(self.encode_text(" Voice input:\n")?);
+            input_ids.extend(self.encode_text(&format!(" {speaker}:"))?);
             input_ids.push(self.specials.speech_start);
             let start = input_ids.len();
             input_ids.extend(std::iter::repeat(self.specials.speech_pad).take(reference_frames));
@@ -113,10 +111,10 @@ impl VibeVoicePromptTokenizer {
             None
         };
 
-        input_ids.extend(self.encode_text("Text input:\n")?);
-        input_ids.extend(self.encode_text(&format!("{speaker}: {text}\n"))?);
+        input_ids.extend(self.encode_text(" Text input:\n")?);
+        input_ids.extend(self.encode_text(&format!(" {speaker}:{text}\n"))?);
         let text_token_count = self.encode_text(text)?.len();
-        input_ids.extend(self.encode_text("Speech output:\n")?);
+        input_ids.extend(self.encode_text(" Speech output:\n")?);
         input_ids.push(self.specials.speech_start);
 
         Ok(VibeVoiceTtsPrompt {
@@ -178,12 +176,14 @@ impl VibeVoicePromptTokenizer {
     }
 }
 
-fn sanitize_speaker(speaker: &str) -> String {
+fn sanitize_tts_speaker(speaker: &str) -> String {
     let trimmed = speaker.trim();
     if trimmed.is_empty() {
-        "Speaker 1".to_string()
-    } else {
+        "Speaker 0".to_string()
+    } else if trimmed.starts_with("Speaker ") {
         trimmed.to_string()
+    } else {
+        "Speaker 0".to_string()
     }
 }
 
@@ -249,5 +249,9 @@ fn read_special_tokens(model_dir: &Path) -> Result<VibeVoiceSpecialTokens> {
             .get("<|vision_pad|>")
             .copied()
             .unwrap_or(defaults.speech_pad),
+        image_pad: by_token
+            .get("<|image_pad|>")
+            .copied()
+            .unwrap_or(defaults.image_pad),
     })
 }

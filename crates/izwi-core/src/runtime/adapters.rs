@@ -122,7 +122,7 @@ fn tts_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
         || model_variant.is_lfm25_audio_gguf()
         || matches!(
             model_variant.family(),
-            crate::catalog::ModelFamily::VoxtralTts
+            crate::catalog::ModelFamily::VoxtralTts | crate::catalog::ModelFamily::VibeVoiceTts
         )
     {
         ExecutionTargetKind::DirectModel
@@ -489,15 +489,21 @@ mod tests {
                 .streaming_mode,
             StreamingMode::None
         );
-        assert!(registry
-            .require(CapabilityKind::RealtimeAsr, variant)
-            .is_err());
-        assert!(registry
-            .require(CapabilityKind::AudioChat, variant)
-            .is_err());
-        assert!(registry
-            .require(CapabilityKind::SpeechToSpeech, variant)
-            .is_err());
+        assert!(
+            registry
+                .require(CapabilityKind::RealtimeAsr, variant)
+                .is_err()
+        );
+        assert!(
+            registry
+                .require(CapabilityKind::AudioChat, variant)
+                .is_err()
+        );
+        assert!(
+            registry
+                .require(CapabilityKind::SpeechToSpeech, variant)
+                .is_err()
+        );
     }
 
     #[test]
@@ -510,9 +516,28 @@ mod tests {
             .expect("voxtral tts adapter");
         assert_eq!(adapter.execution_target, ExecutionTargetKind::DirectModel);
         assert_eq!(adapter.streaming_mode, StreamingMode::Chunked);
-        assert!(registry
-            .require(CapabilityKind::StreamingTts, variant)
-            .is_err());
+        assert!(
+            registry
+                .require(CapabilityKind::StreamingTts, variant)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn built_in_registry_marks_vibevoice_tts_as_direct_tts_with_final_only_streaming() {
+        let registry = RuntimeAdapterRegistry::built_in();
+        let variant = ModelVariant::VibeVoice15BTts;
+
+        let adapter = registry
+            .require(CapabilityKind::Tts, variant)
+            .expect("vibevoice tts adapter");
+        assert_eq!(adapter.execution_target, ExecutionTargetKind::DirectModel);
+        assert_eq!(adapter.streaming_mode, StreamingMode::Chunked);
+        assert!(
+            registry
+                .require(CapabilityKind::StreamingTts, variant)
+                .is_err()
+        );
     }
 
     #[test]

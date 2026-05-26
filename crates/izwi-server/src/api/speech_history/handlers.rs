@@ -4,14 +4,14 @@ use std::time::Duration;
 use axum::{
     body::Body,
     extract::{Extension, Json, Path, Query, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::api::pagination::{encode_cursor, CursorPagination, CursorPaginationQuery};
+use crate::api::pagination::{CursorPagination, CursorPaginationQuery, encode_cursor};
 use crate::api::request_context::RequestContext;
 use crate::api::saved_voices::resolve_saved_voice_reference;
 use crate::api::tts_long_form::{expand_generation_requests_for_long_form, generate_long_form_tts};
@@ -23,9 +23,10 @@ use crate::speech_history_store::{
 };
 use crate::state::AppState;
 use izwi_core::audio::{AudioEncoder, AudioFormat};
+use izwi_core::runtime_models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
 use izwi_core::runtime_models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use izwi_core::{
-    parse_tts_model_variant, AudioChunk, GenerationConfig, GenerationRequest, ModelVariant,
+    AudioChunk, GenerationConfig, GenerationRequest, ModelVariant, parse_tts_model_variant,
 };
 
 const HISTORY_LIST_LIMIT: usize = 200;
@@ -1235,6 +1236,9 @@ fn resolve_generation_timeout_secs(
         Some(0) | None if variant == ModelVariant::Voxtral4BTts2603 => {
             voxtral_tts_auto_max_frames_for_text(text)
         }
+        Some(0) | None if variant == ModelVariant::VibeVoice15BTts => {
+            vibevoice_tts_auto_max_frames_for_text(text)
+        }
         Some(0) | None => model_max_frames,
         Some(value) => value.clamp(1, model_max_frames),
     };
@@ -1340,9 +1344,11 @@ mod tests {
         })
         .expect_err("expected mixed reference inputs to fail");
 
-        assert!(err
-            .message
-            .contains("Use either `saved_voice_id` or direct `reference_audio`/`reference_text`"));
+        assert!(
+            err.message.contains(
+                "Use either `saved_voice_id` or direct `reference_audio`/`reference_text`"
+            )
+        );
     }
 
     #[test]
@@ -1353,9 +1359,10 @@ mod tests {
         })
         .expect_err("expected incomplete reference inputs to fail");
 
-        assert!(err
-            .message
-            .contains("Provide both `reference_audio` and `reference_text` together."));
+        assert!(
+            err.message
+                .contains("Provide both `reference_audio` and `reference_text` together.")
+        );
     }
 
     #[test]
@@ -1388,6 +1395,36 @@ mod tests {
     }
 
     #[test]
+    fn vibevoice_tts_history_requests_default_to_text_sized_auto_budget() {
+        let mut req = base_request();
+        req.model_id = Some("VibeVoice-1.5B".to_string());
+        req.text = Some("The costs split cleanly into three buckets".to_string());
+        req.reference_audio = Some("UklGRg==".to_string());
+        req.reference_text = Some("hello".to_string());
+
+        let generation = build_generation_request(
+            req,
+            "test-correlation".to_string(),
+            "The costs split cleanly into three buckets".to_string(),
+            false,
+            ModelVariant::VibeVoice15BTts,
+        );
+
+        assert_eq!(generation.config.options.max_tokens, 0);
+        assert_eq!(
+            resolve_generation_timeout_secs(
+                1,
+                ModelVariant::VibeVoice15BTts,
+                &generation.text,
+                None,
+                None,
+                1,
+            ),
+            59
+        );
+    }
+
+    #[test]
     fn voice_cloning_requires_reference_source_after_resolution() {
         let err = normalize_for_model_capabilities(
             SpeechRouteKind::VoiceCloning,
@@ -1396,9 +1433,10 @@ mod tests {
         )
         .expect_err("expected missing reference source to fail");
 
-        assert!(err
-            .message
-            .contains("Voice cloning requests require `saved_voice_id` or both"));
+        assert!(
+            err.message
+                .contains("Voice cloning requests require `saved_voice_id` or both")
+        );
     }
 
     #[test]
@@ -1410,9 +1448,10 @@ mod tests {
         )
         .expect_err("expected base model to require reference input");
 
-        assert!(err
-            .message
-            .contains("requires `saved_voice_id` or direct reference audio/text"));
+        assert!(
+            err.message
+                .contains("requires `saved_voice_id` or direct reference audio/text")
+        );
     }
 
     #[test]
@@ -1424,9 +1463,10 @@ mod tests {
         )
         .expect_err("expected voice-design model to require voice_description");
 
-        assert!(err
-            .message
-            .contains("requires `voice_description` on text-to-speech routes"));
+        assert!(
+            err.message
+                .contains("requires `voice_description` on text-to-speech routes")
+        );
     }
 
     #[test]

@@ -19,6 +19,7 @@ use crate::api::saved_voices::resolve_saved_voice_reference;
 use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::audio::AudioFormat;
+use izwi_core::runtime_models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
 use izwi_core::runtime_models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use izwi_core::{
     AudioChunk, GenerationConfig, GenerationRequest, ModelVariant, parse_tts_model_variant,
@@ -229,6 +230,9 @@ fn resolve_speech_timeout_secs(
     let effective_frames = match requested_frames {
         Some(0) | None if variant == ModelVariant::Voxtral4BTts2603 => {
             voxtral_tts_auto_max_frames_for_text(&req.input)
+        }
+        Some(0) | None if variant == ModelVariant::VibeVoice15BTts => {
+            vibevoice_tts_auto_max_frames_for_text(&req.input)
         }
         Some(0) | None => model_max_frames,
         Some(value) => value.clamp(1, model_max_frames),
@@ -774,6 +778,40 @@ mod tests {
             "test-correlation".to_string(),
             false,
             ModelVariant::Voxtral4BTts2603,
+        );
+        assert_eq!(generation.config.options.max_tokens, 0);
+    }
+
+    #[test]
+    fn vibevoice_tts_omitted_max_tokens_uses_text_sized_auto_budget() {
+        let req = SpeechRequest {
+            model: "VibeVoice-1.5B".to_string(),
+            input: "The costs split cleanly into three buckets".to_string(),
+            voice: None,
+            response_format: Some("wav".to_string()),
+            allow_format_fallback: None,
+            speed: None,
+            language: None,
+            temperature: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            top_k: None,
+            stream: Some(false),
+            stream_format: None,
+            instructions: None,
+            reference_audio: Some("UklGRg==".to_string()),
+            reference_text: Some("hello".to_string()),
+            saved_voice_id: None,
+        };
+
+        let timeout = resolve_speech_timeout_secs(1, ModelVariant::VibeVoice15BTts, &req);
+        assert_eq!(timeout, 59);
+
+        let generation = build_generation_request(
+            &req,
+            "test-correlation".to_string(),
+            false,
+            ModelVariant::VibeVoice15BTts,
         );
         assert_eq!(generation.config.options.max_tokens, 0);
     }

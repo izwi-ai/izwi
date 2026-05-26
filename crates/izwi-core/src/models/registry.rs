@@ -32,6 +32,7 @@ use crate::models::architectures::sortformer::diarization::SortformerDiarizerMod
 use crate::models::architectures::vibevoice::asr::{
     VibeVoiceAsrModel, VibeVoiceAsrTranscriptionOutput,
 };
+use crate::models::architectures::vibevoice::tts::VibeVoiceTtsModel;
 use crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel;
 use crate::models::architectures::voxtral::tts::VoxtralTtsModel;
 use crate::models::architectures::whisper::asr::{
@@ -46,6 +47,7 @@ type ChatLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeChatM
 type DiarizationLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeDiarizationModel>;
 type VoxtralLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VoxtralRealtimeModel>;
 type VoxtralTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VoxtralTtsModel>;
+type VibeVoiceTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VibeVoiceTtsModel>;
 type QwenTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile, usize, &str) -> Result<Qwen3TtsModel>;
 type KokoroLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<KokoroTtsModel>;
 
@@ -83,6 +85,12 @@ struct VoxtralTtsLoaderRegistration {
     name: &'static str,
     family: ModelFamily,
     loader: VoxtralTtsLoaderFn,
+}
+
+struct VibeVoiceTtsLoaderRegistration {
+    name: &'static str,
+    family: ModelFamily,
+    loader: VibeVoiceTtsLoaderFn,
 }
 
 struct QwenTtsLoaderRegistration {
@@ -223,6 +231,14 @@ fn load_voxtral_tts_model(
     VoxtralTtsModel::load(model_dir, device)
 }
 
+fn load_vibevoice_tts_model(
+    model_dir: &Path,
+    variant: ModelVariant,
+    device: DeviceProfile,
+) -> Result<VibeVoiceTtsModel> {
+    VibeVoiceTtsModel::load(model_dir, variant, device)
+}
+
 fn load_qwen_tts_model(
     model_dir: &Path,
     _variant: ModelVariant,
@@ -318,6 +334,13 @@ const VOXTRAL_TTS_LOADER_REGISTRY: &[VoxtralTtsLoaderRegistration] =
         loader: load_voxtral_tts_model,
     }];
 
+const VIBEVOICE_TTS_LOADER_REGISTRY: &[VibeVoiceTtsLoaderRegistration] =
+    &[VibeVoiceTtsLoaderRegistration {
+        name: "vibevoice_tts",
+        family: ModelFamily::VibeVoiceTts,
+        loader: load_vibevoice_tts_model,
+    }];
+
 const QWEN_TTS_LOADER_REGISTRY: &[QwenTtsLoaderRegistration] = &[QwenTtsLoaderRegistration {
     name: "qwen3_tts",
     family: ModelFamily::Qwen3Tts,
@@ -388,6 +411,15 @@ fn resolve_voxtral_tts_loader_registration(
 ) -> Option<&'static VoxtralTtsLoaderRegistration> {
     let family = variant.family();
     VOXTRAL_TTS_LOADER_REGISTRY
+        .iter()
+        .find(|registration| registration.family == family)
+}
+
+fn resolve_vibevoice_tts_loader_registration(
+    variant: ModelVariant,
+) -> Option<&'static VibeVoiceTtsLoaderRegistration> {
+    let family = variant.family();
+    VIBEVOICE_TTS_LOADER_REGISTRY
         .iter()
         .find(|registration| registration.family == family)
 }
@@ -1003,6 +1035,7 @@ pub struct ModelRegistry {
     chat_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<NativeChatModel>>>>>>,
     voxtral_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<VoxtralRealtimeModel>>>>>>,
     voxtral_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<VoxtralTtsModel>>>>>>,
+    vibevoice_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<VibeVoiceTtsModel>>>>>>,
     qwen_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<Qwen3TtsModel>>>>>>,
     kokoro_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<KokoroTtsModel>>>>>>,
 }
@@ -1025,6 +1058,7 @@ impl ModelRegistry {
             chat_models: Arc::new(RwLock::new(HashMap::new())),
             voxtral_models: Arc::new(RwLock::new(HashMap::new())),
             voxtral_tts_models: Arc::new(RwLock::new(HashMap::new())),
+            vibevoice_tts_models: Arc::new(RwLock::new(HashMap::new())),
             qwen_tts_models: Arc::new(RwLock::new(HashMap::new())),
             kokoro_models: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -1336,6 +1370,47 @@ impl ModelRegistry {
         Ok(model.clone())
     }
 
+    pub async fn load_vibevoice_tts(
+        &self,
+        variant: ModelVariant,
+        model_dir: &Path,
+    ) -> Result<Arc<VibeVoiceTtsModel>> {
+        let registration = resolve_vibevoice_tts_loader_registration(variant).ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "Unsupported VibeVoice TTS model variant: {variant}"
+            ))
+        })?;
+
+        let cell = {
+            let mut guard = self.vibevoice_tts_models.write().await;
+            guard
+                .entry(variant)
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+
+        info!(
+            "Loading VibeVoice TTS model {variant} ({}) from {model_dir:?}",
+            registration.name
+        );
+
+        let model = cell
+            .get_or_try_init({
+                let model_dir = model_dir.to_path_buf();
+                let device = self.device.clone();
+                let loader = registration.loader;
+                move || async move {
+                    tokio::task::spawn_blocking(move || loader(&model_dir, variant, device))
+                        .await
+                        .map_err(|e| Error::ModelLoadError(e.to_string()))?
+                        .map(Arc::new)
+                }
+            })
+            .await?;
+
+        Ok(model.clone())
+    }
+
     pub async fn load_kokoro(
         &self,
         variant: ModelVariant,
@@ -1441,6 +1516,16 @@ impl ModelRegistry {
         guard.get(&variant).and_then(|cell| cell.get().cloned())
     }
 
+    pub async fn get_vibevoice_tts(&self, variant: ModelVariant) -> Option<Arc<VibeVoiceTtsModel>> {
+        let guard = self.vibevoice_tts_models.read().await;
+        guard.get(&variant).and_then(|cell| cell.get().cloned())
+    }
+
+    pub fn try_get_vibevoice_tts(&self, variant: ModelVariant) -> Option<Arc<VibeVoiceTtsModel>> {
+        let guard = self.vibevoice_tts_models.try_read().ok()?;
+        guard.get(&variant).and_then(|cell| cell.get().cloned())
+    }
+
     pub async fn get_qwen_tts(&self, variant: ModelVariant) -> Option<Arc<Qwen3TtsModel>> {
         let guard = self.qwen_tts_models.read().await;
         guard.get(&variant).and_then(|cell| cell.get().cloned())
@@ -1491,6 +1576,11 @@ impl ModelRegistry {
         guard.remove(&variant);
     }
 
+    pub async fn unload_vibevoice_tts(&self, variant: ModelVariant) {
+        let mut guard = self.vibevoice_tts_models.write().await;
+        guard.remove(&variant);
+    }
+
     pub async fn unload_qwen_tts(&self, variant: ModelVariant) {
         let mut guard = self.qwen_tts_models.write().await;
         guard.remove(&variant);
@@ -1518,5 +1608,14 @@ mod tests {
     #[test]
     fn vibevoice_tts_is_not_registered_as_asr() {
         assert!(resolve_asr_loader_registration(ModelVariant::VibeVoice15BTts).is_none());
+    }
+
+    #[test]
+    fn resolves_vibevoice_tts_loader_registration() {
+        let registration = resolve_vibevoice_tts_loader_registration(ModelVariant::VibeVoice15BTts)
+            .expect("VibeVoice TTS loader should be registered");
+
+        assert_eq!(registration.name, "vibevoice_tts");
+        assert_eq!(registration.family, ModelFamily::VibeVoiceTts);
     }
 }
