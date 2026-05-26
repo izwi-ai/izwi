@@ -29,6 +29,9 @@ use crate::models::architectures::qwen35::chat::{
     ChatDecodeState as Qwen35ChatDecodeState, Qwen35ChatModel,
 };
 use crate::models::architectures::sortformer::diarization::SortformerDiarizerModel;
+use crate::models::architectures::vibevoice::asr::{
+    VibeVoiceAsrModel, VibeVoiceAsrTranscriptionOutput,
+};
 use crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel;
 use crate::models::architectures::voxtral::tts::VoxtralTtsModel;
 use crate::models::architectures::whisper::asr::{
@@ -131,6 +134,16 @@ fn load_whisper_asr_model(
 ) -> Result<NativeAsrModel> {
     Ok(NativeAsrModel::WhisperTurbo(WhisperTurboAsrModel::load(
         model_dir, device,
+    )?))
+}
+
+fn load_vibevoice_asr_model(
+    model_dir: &Path,
+    variant: ModelVariant,
+    device: DeviceProfile,
+) -> Result<NativeAsrModel> {
+    Ok(NativeAsrModel::VibeVoice(VibeVoiceAsrModel::load(
+        model_dir, variant, device,
     )?))
 }
 
@@ -249,6 +262,11 @@ const ASR_LOADER_REGISTRY: &[AsrLoaderRegistration] = &[
         family: ModelFamily::Qwen3ForcedAligner,
         loader: load_qwen_forced_aligner_model,
     },
+    AsrLoaderRegistration {
+        name: "vibevoice_asr",
+        family: ModelFamily::VibeVoiceAsr,
+        loader: load_vibevoice_asr_model,
+    },
 ];
 
 const AUDIO_CHAT_LOADER_REGISTRY: &[AudioChatLoaderRegistration] = &[AudioChatLoaderRegistration {
@@ -320,6 +338,7 @@ fn resolve_asr_loader_registration(
         ModelFamily::Qwen3ForcedAligner => ModelFamily::Qwen3ForcedAligner,
         ModelFamily::ParakeetAsr => ModelFamily::ParakeetAsr,
         ModelFamily::WhisperAsr => ModelFamily::WhisperAsr,
+        ModelFamily::VibeVoiceAsr => ModelFamily::VibeVoiceAsr,
         _ => return None,
     };
 
@@ -395,6 +414,7 @@ pub enum NativeAsrModel {
     Qwen3(Qwen3AsrModel),
     Parakeet(ParakeetAsrModel),
     WhisperTurbo(WhisperTurboAsrModel),
+    VibeVoice(VibeVoiceAsrModel),
 }
 
 pub enum NativeAudioChatModel {
@@ -491,6 +511,13 @@ impl NativeAsrModel {
                 prompt,
                 on_delta,
             ),
+            Self::VibeVoice(model) => model.transcribe_with_callback_and_prompt(
+                audio,
+                sample_rate,
+                language,
+                prompt,
+                on_delta,
+            ),
         }
     }
 
@@ -516,7 +543,12 @@ impl NativeAsrModel {
                     text,
                     language,
                     diagnostics,
-                } = model.transcribe_with_details_and_prompt(audio, sample_rate, language, prompt)?;
+                } = model.transcribe_with_details_and_prompt(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                )?;
                 Ok(NativeAsrTranscription {
                     text,
                     language,
@@ -530,6 +562,23 @@ impl NativeAsrModel {
             }),
             Self::WhisperTurbo(model) => {
                 let WhisperAsrTranscriptionOutput {
+                    text,
+                    language,
+                    diagnostics,
+                } = model.transcribe_with_details_and_prompt(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                )?;
+                Ok(NativeAsrTranscription {
+                    text,
+                    language,
+                    diagnostics,
+                })
+            }
+            Self::VibeVoice(model) => {
+                let VibeVoiceAsrTranscriptionOutput {
                     text,
                     language,
                     diagnostics,
@@ -563,6 +612,9 @@ impl NativeAsrModel {
             Self::WhisperTurbo(_) => Err(Error::InvalidInput(
                 "Forced alignment is only available for Qwen3-ForcedAligner models".to_string(),
             )),
+            Self::VibeVoice(_) => Err(Error::InvalidInput(
+                "Forced alignment is only available for Qwen3-ForcedAligner models".to_string(),
+            )),
         }
     }
 
@@ -575,6 +627,7 @@ impl NativeAsrModel {
             Self::Qwen3(model) => model.max_audio_seconds_hint(),
             Self::Parakeet(_) => None,
             Self::WhisperTurbo(model) => model.max_audio_seconds_hint(),
+            Self::VibeVoice(model) => model.max_audio_seconds_hint(),
         }
     }
 
@@ -597,17 +650,22 @@ impl NativeAsrModel {
         max_new_tokens: usize,
     ) -> Result<NativeAsrDecodeState> {
         match self {
-            Self::Qwen3(model) => Ok(NativeAsrDecodeState::Qwen3(model.start_decode_with_prompt(
-                audio,
-                sample_rate,
-                language,
-                prompt,
-                max_new_tokens,
-            )?)),
+            Self::Qwen3(model) => Ok(NativeAsrDecodeState::Qwen3(
+                model.start_decode_with_prompt(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                    max_new_tokens,
+                )?,
+            )),
             Self::Parakeet(_) => Err(Error::InvalidInput(
                 "Incremental decode state is not available for this ASR model".to_string(),
             )),
             Self::WhisperTurbo(_) => Err(Error::InvalidInput(
+                "Incremental decode state is not available for this ASR model".to_string(),
+            )),
+            Self::VibeVoice(_) => Err(Error::InvalidInput(
                 "Incremental decode state is not available for this ASR model".to_string(),
             )),
         }
@@ -1441,5 +1499,24 @@ impl ModelRegistry {
     pub async fn unload_kokoro(&self, variant: ModelVariant) {
         let mut guard = self.kokoro_models.write().await;
         guard.remove(&variant);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_vibevoice_asr_loader_registration() {
+        let registration = resolve_asr_loader_registration(ModelVariant::VibeVoiceAsr)
+            .expect("VibeVoice-ASR loader should be registered");
+
+        assert_eq!(registration.name, "vibevoice_asr");
+        assert_eq!(registration.family, ModelFamily::VibeVoiceAsr);
+    }
+
+    #[test]
+    fn vibevoice_tts_is_not_registered_as_asr() {
+        assert!(resolve_asr_loader_registration(ModelVariant::VibeVoice15BTts).is_none());
     }
 }
