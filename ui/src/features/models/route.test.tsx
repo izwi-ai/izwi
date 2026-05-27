@@ -42,4 +42,27 @@ describe("MyModelsPage", () => {
     expect(screen.getByText("Qwen3 0.6B")).toBeInTheDocument();
     expect(screen.queryByText(/Qwen3 Chat 0\.6B/i)).not.toBeInTheDocument();
   });
+
+  it("renders VibeVoice models from the backend catalog under Microsoft", () => {
+    render(
+      <MyModelsPage
+        models={[
+          buildModel({ variant: "VibeVoice-ASR", size_bytes: 17_348_198_410 }),
+          buildModel({ variant: "VibeVoice-1.5B", size_bytes: 5_408_043_974 }),
+        ]}
+        loading={false}
+        downloadProgress={{}}
+        onDownload={vi.fn()}
+        onLoad={vi.fn()}
+        onUnload={vi.fn()}
+        onDelete={vi.fn()}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/^Microsoft$/)).toBeInTheDocument();
+    expect(screen.getByText("VibeVoice ASR")).toBeInTheDocument();
+    expect(screen.getByText("VibeVoice 1.5B TTS")).toBeInTheDocument();
+    expect(screen.queryByText(/^Other$/)).not.toBeInTheDocument();
+  });
 });

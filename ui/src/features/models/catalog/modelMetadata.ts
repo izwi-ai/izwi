@@ -1,6 +1,7 @@
 export const PROVIDER_ORDER = [
   "Qwen",
   "OpenAI",
+  "Microsoft",
   "Liquid AI",
   "Google",
   "NVIDIA",
@@ -14,6 +15,12 @@ export function getModelProviderLabel(variant: string): string {
     return "Qwen";
   }
   if (variant.startsWith("Whisper-")) return "OpenAI";
+  if (
+    variant.startsWith("VibeVoice-") ||
+    variant.startsWith("microsoft/VibeVoice-")
+  ) {
+    return "Microsoft";
+  }
   if (variant.startsWith("LFM2")) return "Liquid AI";
   if (variant.startsWith("Gemma-")) return "Google";
   if (
@@ -183,6 +190,15 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     capabilities: ["Text to Speech", "54 Voices", "24 kHz"],
     size: "346 MB",
   },
+  "VibeVoice-1.5B": {
+    shortName: "VibeVoice 1.5B TTS",
+    fullName: "Microsoft VibeVoice 1.5B",
+    description:
+      "Long-form Microsoft text-to-speech model with reference voice cloning",
+    category: "tts",
+    capabilities: ["Text to Speech", "Voice Cloning", "Long-form", "24 kHz"],
+    size: "5.04 GB",
+  },
   // Text Chat
   "Qwen3-0.6B-GGUF": {
     shortName: "Qwen3 0.6B",
@@ -328,6 +344,15 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     category: "asr",
     capabilities: ["Transcription", "GGUF", "Q8_0"],
     size: "2.5 GB",
+  },
+  "VibeVoice-ASR": {
+    shortName: "VibeVoice ASR",
+    fullName: "Microsoft VibeVoice ASR",
+    description:
+      "Native Microsoft speech recognition model for long-form audio transcription",
+    category: "asr",
+    capabilities: ["Transcription", "Long-form", "24 kHz"],
+    size: "16.16 GB",
   },
   "Qwen3-ForcedAligner-0.6B": {
     shortName: "ForcedAligner 0.6B",
