@@ -2,15 +2,17 @@
 
 use std::path::{Path, PathBuf};
 
-use candle_core::{DType, IndexOp, Tensor};
+use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use serde::Serialize;
 use tracing::{debug, info, warn};
 
-use crate::backends::{DeviceKind, DeviceProfile};
+use crate::backends::DeviceProfile;
 use crate::catalog::{ModelFamily, ModelVariant};
 use crate::error::{Error, Result};
-use crate::models::architectures::qwen3::core::{Qwen3Cache, Qwen3Model, Qwen3WeightLayout};
+use crate::models::architectures::qwen3::core::{
+    Qwen3Cache, Qwen3Model, Qwen3WeightLayout, qwen3_dense_decode_max_tokens,
+};
 use crate::models::architectures::vibevoice::config::{
     VibeVoiceConfig, VibeVoicePreprocessorConfig,
 };
@@ -20,7 +22,7 @@ use crate::models::architectures::vibevoice::diffusion::{
 };
 use crate::models::architectures::vibevoice::prompt::VibeVoicePromptTokenizer;
 use crate::models::architectures::vibevoice::tokenizer::VibeVoiceAcousticTokenizer;
-use crate::models::shared::attention::paged::{default_kv_page_size, KvCacheQuantization};
+use crate::models::shared::attention::paged::{KvCacheQuantization, default_kv_page_size};
 use crate::models::shared::weights::gguf::load_model_weights;
 
 const TARGET_SAMPLE_RATE: u32 = 24_000;
@@ -240,7 +242,11 @@ impl VibeVoiceTtsModel {
             } else {
                 "reference_statistics"
             },
-            dense_decode_supported: vibevoice_dense_decode_enabled_for_kind(self.device.kind),
+            dense_decode_supported: vibevoice_dense_decode_max_tokens_for_device(
+                &self.device.device,
+                default_kv_page_size(),
+                1,
+            ) > 0,
             dense_projection_count: projection_diagnostics.dense_projection_count,
             dense_bias_projection_count: projection_diagnostics.dense_bias_projection_count,
             quantized_projection_count: projection_diagnostics.quantized_projection_count,
@@ -439,11 +445,16 @@ impl VibeVoiceTtsModel {
     }
 
     fn build_decode_cache(&self, max_tokens: usize) -> Qwen3Cache {
+        let page_size = default_kv_page_size();
         Qwen3Cache::with_page_size_quantization_and_dense_decode_tokens(
             self.language_model.num_layers(),
-            default_kv_page_size(),
+            page_size,
             KvCacheQuantization::None,
-            vibevoice_dense_decode_max_tokens_for_kind(self.device.kind, max_tokens),
+            vibevoice_dense_decode_max_tokens_for_device(
+                &self.device.device,
+                page_size,
+                max_tokens,
+            ),
         )
     }
 
@@ -506,15 +517,20 @@ pub fn vibevoice_tts_auto_max_frames_for_text(text: &str) -> usize {
     estimated_frames.clamp(AUTO_MIN_OUTPUT_FRAMES, AUTO_MAX_OUTPUT_FRAMES)
 }
 
-fn vibevoice_dense_decode_enabled_for_kind(kind: DeviceKind) -> bool {
-    matches!(kind, DeviceKind::Metal | DeviceKind::Cuda)
+fn vibevoice_dense_decode_max_tokens_for_device(
+    device: &Device,
+    page_size: usize,
+    max_tokens: usize,
+) -> usize {
+    let qwen_budget = qwen3_dense_decode_max_tokens(device, page_size, KvCacheQuantization::None);
+    cap_vibevoice_dense_decode_tokens(max_tokens, qwen_budget)
 }
 
-fn vibevoice_dense_decode_max_tokens_for_kind(kind: DeviceKind, max_tokens: usize) -> usize {
-    if vibevoice_dense_decode_enabled_for_kind(kind) {
-        max_tokens.max(1)
-    } else {
+fn cap_vibevoice_dense_decode_tokens(max_tokens: usize, qwen_budget: usize) -> usize {
+    if qwen_budget == 0 {
         0
+    } else {
+        max_tokens.max(1).min(qwen_budget)
     }
 }
 
@@ -812,19 +828,16 @@ mod tests {
     }
 
     #[test]
-    fn decode_cache_policy_enables_dense_decode_only_on_accelerators() {
+    fn decode_cache_policy_uses_qwen_gate_and_caps_requested_tokens() {
+        let device = Device::Cpu;
+
         assert_eq!(
-            vibevoice_dense_decode_max_tokens_for_kind(DeviceKind::Cpu, 128),
+            vibevoice_dense_decode_max_tokens_for_device(&device, 64, 128),
             0
         );
-        assert_eq!(
-            vibevoice_dense_decode_max_tokens_for_kind(DeviceKind::Metal, 128),
-            128
-        );
-        assert_eq!(
-            vibevoice_dense_decode_max_tokens_for_kind(DeviceKind::Cuda, 128),
-            128
-        );
+        assert_eq!(cap_vibevoice_dense_decode_tokens(32, 128), 32);
+        assert_eq!(cap_vibevoice_dense_decode_tokens(4096, 128), 128);
+        assert_eq!(cap_vibevoice_dense_decode_tokens(128, 0), 0);
     }
 
     #[test]
