@@ -276,12 +276,10 @@ impl VibeVoiceTtsModel {
             ));
         }
 
-        let reference_text = reference.text.trim().to_string();
         let reference = self.encode_reference(reference)?;
         let prompt = self.tokenizer.build_tts_prompt(
             text.trim(),
             speaker.unwrap_or("Speaker 0"),
-            Some(&reference_text),
             reference.scaled_latents.dim(1)?,
         )?;
         let input_ids = Tensor::from_vec(

@@ -91,17 +91,16 @@ impl VibeVoicePromptTokenizer {
         &self,
         text: &str,
         speaker: &str,
-        reference_text: Option<&str>,
         reference_frames: usize,
     ) -> Result<VibeVoiceTtsPrompt> {
-        let speaker = sanitize_tts_speaker(speaker);
-        let text = text.trim();
+        let script = parse_tts_script(text, speaker)?;
+        let voice_speaker = single_tts_voice_speaker(&script)?;
         let mut input_ids = Vec::new();
         input_ids.extend(self.encode_text(TTS_SYSTEM_PROMPT)?);
 
         let reference_voice_range = if reference_frames > 0 {
             input_ids.extend(self.encode_text(" Voice input:\n")?);
-            input_ids.extend(self.encode_text(&format!(" {speaker}:"))?);
+            input_ids.extend(self.encode_text(&format!(" {voice_speaker}:"))?);
             input_ids.push(self.specials.speech_start);
             let start = input_ids.len();
             input_ids.extend(std::iter::repeat(self.specials.speech_pad).take(reference_frames));
@@ -113,13 +112,10 @@ impl VibeVoicePromptTokenizer {
             None
         };
 
-        input_ids.extend(self.encode_text(&build_tts_text_input(
-            text,
-            &speaker,
-            reference_text,
-            reference_frames > 0,
-        )?)?);
-        let text_token_count = self.encode_text(text)?.len();
+        let text_input = build_tts_text_input(&script);
+        let text_tokens = self.encode_text(&text_input)?;
+        let text_token_count = text_tokens.len();
+        input_ids.extend(text_tokens);
         input_ids.extend(self.encode_text(" Speech output:\n")?);
         input_ids.push(self.specials.speech_start);
 
@@ -182,35 +178,152 @@ impl VibeVoicePromptTokenizer {
     }
 }
 
-fn build_tts_text_input(
-    text: &str,
-    speaker: &str,
-    reference_text: Option<&str>,
-    include_reference: bool,
-) -> Result<String> {
-    let mut input = String::from(" Text input:\n");
-    if include_reference {
-        let reference_text = reference_text.unwrap_or_default().trim();
-        if reference_text.is_empty() {
-            return Err(Error::InvalidInput(
-                "VibeVoice TTS reference_text cannot be empty when reference audio is provided"
-                    .to_string(),
-            ));
-        }
-        input.push_str(&format!(" {speaker}:{reference_text}\n"));
-    }
-    input.push_str(&format!(" {speaker}:{}\n", text.trim()));
-    Ok(input)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VibeVoiceTtsScriptLine {
+    speaker_id: usize,
+    text: String,
 }
 
-fn sanitize_tts_speaker(speaker: &str) -> String {
+fn build_tts_text_input(script: &[VibeVoiceTtsScriptLine]) -> String {
+    let mut input = String::from(" Text input:\n");
+    for line in script {
+        input.push_str(&format!(" Speaker {}: {}\n", line.speaker_id, line.text));
+    }
+    input
+}
+
+fn parse_tts_script(text: &str, default_speaker: &str) -> Result<Vec<VibeVoiceTtsScriptLine>> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(Error::InvalidInput(
+            "VibeVoice TTS text input cannot be empty".to_string(),
+        ));
+    }
+
+    let mut parsed = Vec::new();
+    let mut unparsed_nonempty_lines = Vec::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(script_line) = parse_tts_speaker_line(line)? {
+            parsed.push(script_line);
+        } else {
+            unparsed_nonempty_lines.push(line.to_string());
+        }
+    }
+
+    if parsed.is_empty() {
+        return Ok(vec![VibeVoiceTtsScriptLine {
+            speaker_id: sanitize_tts_speaker_id(default_speaker),
+            text: normalize_tts_text_line(text),
+        }]);
+    }
+    if !unparsed_nonempty_lines.is_empty() {
+        return Err(Error::InvalidInput(
+            "VibeVoice TTS script input must put every non-empty line in `Speaker N:` format"
+                .to_string(),
+        ));
+    }
+
+    normalize_tts_script_speakers(&mut parsed);
+    if parsed
+        .iter()
+        .any(|line| line.speaker_id != parsed[0].speaker_id)
+    {
+        return Err(Error::InvalidInput(
+            "VibeVoice TTS currently supports one reference speaker per generation request"
+                .to_string(),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn parse_tts_speaker_line(line: &str) -> Result<Option<VibeVoiceTtsScriptLine>> {
+    let Some(rest) = line.strip_prefix("Speaker ") else {
+        return Ok(None);
+    };
+    let Some((speaker_id, text)) = rest.split_once(':') else {
+        return Ok(None);
+    };
+    let speaker_id = speaker_id.trim().parse::<usize>().map_err(|_| {
+        Error::InvalidInput(format!(
+            "VibeVoice TTS speaker label must use `Speaker N:` syntax, got `Speaker {speaker_id}`"
+        ))
+    })?;
+    let text = normalize_tts_text_line(text);
+    if text.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(VibeVoiceTtsScriptLine { speaker_id, text }))
+}
+
+fn normalize_tts_script_speakers(script: &mut [VibeVoiceTtsScriptLine]) {
+    let min_speaker = script.iter().map(|line| line.speaker_id).min().unwrap_or(0);
+    if min_speaker > 0 {
+        for line in script {
+            line.speaker_id = line.speaker_id.saturating_sub(1);
+        }
+    }
+}
+
+fn single_tts_voice_speaker(script: &[VibeVoiceTtsScriptLine]) -> Result<String> {
+    script
+        .first()
+        .map(|line| format!("Speaker {}", line.speaker_id))
+        .ok_or_else(|| Error::InvalidInput("VibeVoice TTS text input cannot be empty".to_string()))
+}
+
+fn normalize_tts_text_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn sanitize_tts_speaker_id(speaker: &str) -> usize {
     let trimmed = speaker.trim();
-    if trimmed.is_empty() {
-        "Speaker 0".to_string()
-    } else if trimmed.starts_with("Speaker ") {
-        trimmed.to_string()
-    } else {
-        "Speaker 0".to_string()
+    let Some(rest) = trimmed.strip_prefix("Speaker ") else {
+        return 0;
+    };
+    rest.trim().parse::<usize>().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tts_text_input_uses_target_text_only_for_reference_audio() {
+        let script = parse_tts_script("Generate this line.", "Speaker 0").expect("script");
+        let block = build_tts_text_input(&script);
+
+        assert_eq!(block, " Text input:\n Speaker 0: Generate this line.\n");
+        assert!(!block.contains("Reference transcript."));
+    }
+
+    #[test]
+    fn tts_text_input_normalizes_one_based_script_speaker_to_zero_based_voice() {
+        let script =
+            parse_tts_script("Speaker 1: Generate this line.", "Speaker 0").expect("script");
+        let block = build_tts_text_input(&script);
+
+        assert_eq!(block, " Text input:\n Speaker 0: Generate this line.\n");
+        assert_eq!(single_tts_voice_speaker(&script).unwrap(), "Speaker 0");
+    }
+
+    #[test]
+    fn tts_text_input_rejects_multiple_speakers_for_single_reference_voice() {
+        let err = parse_tts_script("Speaker 1: One.\nSpeaker 2: Two.", "Speaker 0")
+            .expect_err("multi speaker error");
+
+        assert!(format!("{err}").contains("one reference speaker"));
+    }
+
+    #[test]
+    fn tts_script_input_rejects_mixed_speaker_and_plain_lines() {
+        let err = parse_tts_script("Speaker 1: One.\nplain continuation", "Speaker 0")
+            .expect_err("mixed script error");
+
+        assert!(format!("{err}").contains("Speaker N"));
     }
 }
 
@@ -281,33 +394,4 @@ fn read_special_tokens(model_dir: &Path) -> Result<VibeVoiceSpecialTokens> {
             .copied()
             .unwrap_or(defaults.image_pad),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tts_text_input_pairs_reference_transcript_before_target_text() {
-        let block = build_tts_text_input(
-            "Generate this line.",
-            "Speaker 1",
-            Some("Reference transcript."),
-            true,
-        )
-        .expect("text input");
-
-        assert_eq!(
-            block,
-            " Text input:\n Speaker 1:Reference transcript.\n Speaker 1:Generate this line.\n"
-        );
-    }
-
-    #[test]
-    fn tts_text_input_omits_reference_line_without_reference_audio() {
-        let block = build_tts_text_input("Generate this line.", "Speaker 0", None, false)
-            .expect("text input");
-
-        assert_eq!(block, " Text input:\n Speaker 0:Generate this line.\n");
-    }
 }
