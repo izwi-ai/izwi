@@ -1,6 +1,7 @@
 //! Native VibeVoice-1.5B TTS model path.
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
@@ -81,6 +82,25 @@ pub struct VibeVoiceTtsOutput {
     pub samples: Vec<f32>,
     pub sample_rate: u32,
     pub frames_generated: usize,
+    pub profile: VibeVoiceTtsProfile,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct VibeVoiceTtsProfile {
+    pub reference_encode_ms: f32,
+    pub prompt_embed_ms: f32,
+    pub positive_prefill_ms: f32,
+    pub negative_prefill_ms: f32,
+    pub control_score_ms: f32,
+    pub diffusion_sample_ms: f32,
+    pub feedback_acoustic_decode_ms: f32,
+    pub feedback_semantic_encode_ms: f32,
+    pub feedback_connector_ms: f32,
+    pub positive_decode_ms: f32,
+    pub negative_decode_ms: f32,
+    pub final_decode_ms: f32,
+    pub host_audio_ms: f32,
+    pub frames_generated: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -99,6 +119,13 @@ pub struct VibeVoiceTtsDiagnostics {
 struct EncodedReference {
     scaled_latents: Tensor,
     normalization: LatentNormalization,
+}
+
+struct GeneratedSpeechFeedback {
+    embed: Tensor,
+    acoustic_decode_ms: f32,
+    semantic_encode_ms: f32,
+    connector_ms: f32,
 }
 
 struct LatentNormalization {
@@ -293,7 +320,12 @@ impl VibeVoiceTtsModel {
             ));
         }
 
+        let mut profile = VibeVoiceTtsProfile::default();
+        let started = Instant::now();
         let reference = self.encode_reference(reference)?;
+        profile.reference_encode_ms = elapsed_ms(started);
+
+        let started = Instant::now();
         let prompt = self.tokenizer.build_tts_prompt(
             text.trim(),
             speaker.unwrap_or("Speaker 0"),
@@ -313,27 +345,32 @@ impl VibeVoiceTtsModel {
         } else {
             input_embeds
         };
+        profile.prompt_embed_ms = elapsed_ms(started);
 
         let max_frames = params.max_frames.max(1);
         let mut cache = self.build_decode_cache(prompt.input_ids.len().saturating_add(max_frames));
+        let started = Instant::now();
         let prefill_hidden = self.language_model.forward_hidden_with_embeds(
             &input_embeds,
             0,
             Some(&mut cache),
             None,
         )?;
+        profile.positive_prefill_ms = elapsed_ms(started);
         let mut pos = prompt.input_ids.len();
         let mut last_hidden = last_sequence_hidden(&prefill_hidden, "VibeVoice TTS prefill")?;
 
         let mut negative_cache = self.build_decode_cache(1usize.saturating_add(max_frames));
         let negative_id = vibevoice_tts_negative_prefill_token(self.tokenizer.specials());
         let negative_ids = Tensor::from_vec(vec![negative_id], (1, 1), &self.device.device)?;
+        let started = Instant::now();
         let negative_hidden = self.language_model.forward_hidden_with_embeds(
             &self.language_model.embeddings(&negative_ids)?,
             0,
             Some(&mut negative_cache),
             None,
         )?;
+        profile.negative_prefill_ms = elapsed_ms(started);
         let mut negative_pos = 1usize;
         let mut negative_last_hidden =
             last_sequence_hidden(&negative_hidden, "VibeVoice TTS negative prefill")?;
@@ -345,11 +382,13 @@ impl VibeVoiceTtsModel {
         let mut scaled_latents = Vec::with_capacity(max_frames);
         for frame_idx in 0..max_frames {
             if frame_idx >= MIN_FRAMES_BEFORE_STOP {
+                let started = Instant::now();
                 let predicted_id = next_tts_control_token_from_hidden(
                     &self.language_model,
                     &last_hidden,
                     self.tokenizer.specials(),
                 )?;
+                profile.control_score_ms += elapsed_ms(started);
                 if predicted_id == self.tokenizer.specials().speech_end
                     || predicted_id == self.tokenizer.specials().endoftext
                 {
@@ -360,32 +399,40 @@ impl VibeVoiceTtsModel {
                 }
             }
 
+            let started = Instant::now();
             let latent = self.sample_speech_latent(
                 &last_hidden,
                 Some(&negative_last_hidden),
                 params.cfg_scale,
                 &scheduler,
             )?;
+            profile.diffusion_sample_ms += elapsed_ms(started);
             let latent_frame = latent.unsqueeze(1)?;
-            let generated_embed =
-                self.generated_speech_embed(&latent_frame, &reference.normalization)?;
+            let feedback = self.generated_speech_embed(&latent_frame, &reference.normalization)?;
+            profile.feedback_acoustic_decode_ms += feedback.acoustic_decode_ms;
+            profile.feedback_semantic_encode_ms += feedback.semantic_encode_ms;
+            profile.feedback_connector_ms += feedback.connector_ms;
             scaled_latents.push(latent_frame);
 
+            let started = Instant::now();
             let hidden = self.language_model.forward_hidden_with_embeds(
-                &generated_embed,
+                &feedback.embed,
                 pos,
                 Some(&mut cache),
                 None,
             )?;
+            profile.positive_decode_ms += elapsed_ms(started);
             pos += 1;
             last_hidden = last_sequence_hidden(&hidden, "VibeVoice TTS generated frame")?;
 
+            let started = Instant::now();
             let negative_hidden = self.language_model.forward_hidden_with_embeds(
-                &generated_embed,
+                &feedback.embed,
                 negative_pos,
                 Some(&mut negative_cache),
                 None,
             )?;
+            profile.negative_decode_ms += elapsed_ms(started);
             negative_pos += 1;
             negative_last_hidden =
                 last_sequence_hidden(&negative_hidden, "VibeVoice TTS negative frame")?;
@@ -402,21 +449,28 @@ impl VibeVoiceTtsModel {
             );
         }
 
+        profile.frames_generated = scaled_latents.len();
         let scaled_latents = Tensor::cat(&scaled_latents, 1)?;
         let unscaled = unscale_latents(
             &scaled_latents,
             &reference.normalization.bias,
             &reference.normalization.scale,
         )?;
+        let started = Instant::now();
         let audio = self.acoustic_tokenizer.decode(&unscaled)?;
+        profile.final_decode_ms = elapsed_ms(started);
+        let started = Instant::now();
         let samples = audio
             .to_dtype(DType::F32)?
             .flatten_all()?
             .to_vec1::<f32>()?;
+        profile.host_audio_ms = elapsed_ms(started);
+        info!(?profile, "VibeVoice TTS generation profile");
         Ok(VibeVoiceTtsOutput {
             samples,
             sample_rate: self.preprocessor.target_sample_rate(),
             frames_generated: scaled_latents.dim(1)?,
+            profile,
         })
     }
 
@@ -468,21 +522,34 @@ impl VibeVoiceTtsModel {
         &self,
         scaled_latent_frame: &Tensor,
         normalization: &LatentNormalization,
-    ) -> Result<Tensor> {
+    ) -> Result<GeneratedSpeechFeedback> {
+        let started = Instant::now();
         let acoustic_embed = self.acoustic_connector.forward(scaled_latent_frame)?;
+        let connector_acoustic_ms = elapsed_ms(started);
         let unscaled_frame = unscale_latents(
             scaled_latent_frame,
             &normalization.bias,
             &normalization.scale,
         )?;
+        let started = Instant::now();
         let audio_chunk = self.acoustic_tokenizer.decode(&unscaled_frame)?;
+        let acoustic_decode_ms = elapsed_ms(started);
+        let started = Instant::now();
         let semantic = self.semantic_tokenizer.encode(&audio_chunk)?.mode();
+        let semantic_encode_ms = elapsed_ms(started);
+        let started = Instant::now();
         let semantic_embed = self.semantic_connector.forward(&semantic)?;
-        combine_speech_embeddings(
+        let embed = combine_speech_embeddings(
             &acoustic_embed,
             &semantic_embed,
             "VibeVoice TTS generated frame",
-        )
+        )?;
+        Ok(GeneratedSpeechFeedback {
+            embed,
+            acoustic_decode_ms,
+            semantic_encode_ms,
+            connector_ms: connector_acoustic_ms + elapsed_ms(started),
+        })
     }
 
     fn build_decode_cache(&self, max_tokens: usize) -> Qwen3Cache {
@@ -784,6 +851,10 @@ fn scalar_like(value: f32, like: &Tensor) -> Result<Tensor> {
     Tensor::new(value, like.device())?
         .to_dtype(like.dtype())
         .map_err(Error::from)
+}
+
+fn elapsed_ms(started: Instant) -> f32 {
+    started.elapsed().as_secs_f32() * 1000.0
 }
 
 fn preprocess_reference_audio(
