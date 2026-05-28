@@ -1,9 +1,10 @@
 //! VibeVoice diffusion prediction head and scheduler helpers.
 
-use candle_core::{D, DType, Device, Tensor};
-use candle_nn::{Linear, Module, RmsNorm, VarBuilder, ops};
+use candle_core::{DType, Device, Tensor, D};
+use candle_nn::{ops, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::error::{Error, Result};
+use crate::kernels::try_fused_silu_mul;
 use crate::models::architectures::vibevoice::config::VibeVoiceDiffusionHeadConfig;
 use crate::models::shared::weights::mlx;
 
@@ -11,11 +12,13 @@ pub struct TimestepEmbedder {
     linear_1: Linear,
     linear_2: Linear,
     frequency_embedding_size: usize,
+    frequencies: Tensor,
 }
 
 impl TimestepEmbedder {
     pub fn load(hidden_size: usize, vb: VarBuilder) -> Result<Self> {
         let frequency_embedding_size = 256;
+        let frequencies = timestep_frequencies(frequency_embedding_size, vb.device())?;
         let linear_1 =
             mlx::load_linear_no_bias(frequency_embedding_size, hidden_size, vb.pp("mlp.0"))?;
         let linear_2 = mlx::load_linear_no_bias(hidden_size, hidden_size, vb.pp("mlp.2"))?;
@@ -23,16 +26,12 @@ impl TimestepEmbedder {
             linear_1,
             linear_2,
             frequency_embedding_size,
+            frequencies,
         })
     }
 
     pub fn forward(&self, timesteps: &Tensor) -> Result<Tensor> {
-        let emb = timestep_embedding(
-            timesteps,
-            self.frequency_embedding_size,
-            timesteps.device(),
-            timesteps.dtype(),
-        )?;
+        let emb = timestep_embedding(timesteps, self.frequency_embedding_size, &self.frequencies)?;
         let emb = self.linear_1.forward(&emb)?;
         let emb = ops::silu(&emb)?;
         self.linear_2.forward(&emb).map_err(Error::from)
@@ -123,9 +122,13 @@ impl FeedForwardNetwork {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = ops::silu(&self.gate_proj.forward(x)?)?;
+        let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        let hidden = gate.mul(&up)?;
+        let hidden = if let Some(fused) = try_fused_silu_mul(&gate, &up) {
+            fused
+        } else {
+            ops::silu(&gate)?.broadcast_mul(&up)?
+        };
         self.down_proj.forward(&hidden).map_err(Error::from)
     }
 }
@@ -215,20 +218,26 @@ fn rms_norm_no_affine(x: &Tensor, eps: f64) -> Result<Tensor> {
     x.broadcast_mul(&denom).map_err(Error::from)
 }
 
-fn timestep_embedding(t: &Tensor, dim: usize, device: &Device, dtype: DType) -> Result<Tensor> {
-    let t = t.flatten_all()?.to_dtype(DType::F32)?;
+fn timestep_frequencies(dim: usize, device: &Device) -> Result<Tensor> {
     let half = dim / 2;
     let mut freqs = Vec::with_capacity(half);
     for idx in 0..half {
         freqs.push((-((10_000f32).ln()) * (idx as f32) / (half as f32)).exp());
     }
-    let freqs = Tensor::from_vec(freqs, (half,), device)?;
-    let args = t.unsqueeze(1)?.broadcast_mul(&freqs.unsqueeze(0)?)?;
+    Tensor::from_vec(freqs, (half,), device).map_err(Error::from)
+}
+
+fn timestep_embedding(t: &Tensor, dim: usize, frequencies: &Tensor) -> Result<Tensor> {
+    let dtype = t.dtype();
+    let t = t.flatten_all()?.to_dtype(DType::F32)?;
+    let half = dim / 2;
+    let frequencies = frequencies.narrow(0, 0, half)?;
+    let args = t.unsqueeze(1)?.broadcast_mul(&frequencies.unsqueeze(0)?)?;
     let cos = args.cos()?;
     let sin = args.sin()?;
     let mut emb = Tensor::cat(&[&cos, &sin], 1)?;
     if dim % 2 == 1 {
-        let zeros = Tensor::zeros((emb.dim(0)?, 1), DType::F32, device)?;
+        let zeros = Tensor::zeros((emb.dim(0)?, 1), DType::F32, t.device())?;
         emb = Tensor::cat(&[&emb, &zeros], 1)?;
     }
     emb.to_dtype(dtype).map_err(Error::from)
@@ -237,6 +246,16 @@ fn timestep_embedding(t: &Tensor, dim: usize, device: &Device, dtype: DType) -> 
 pub struct VibeVoiceDiffusionScheduler {
     alphas_cumprod: Vec<f32>,
     timesteps: Vec<usize>,
+}
+
+pub struct VibeVoiceDiffusionStepTensors {
+    pub timestep: usize,
+    pub prev_timestep: Option<usize>,
+    pub timestep_tensor: Tensor,
+    sqrt_alpha: Tensor,
+    sqrt_beta: Tensor,
+    sqrt_prev_alpha: Tensor,
+    sqrt_prev_beta: Tensor,
 }
 
 impl VibeVoiceDiffusionScheduler {
@@ -277,6 +296,32 @@ impl VibeVoiceDiffusionScheduler {
             .unwrap_or(1.0)
     }
 
+    pub fn step_tensors(
+        &self,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Vec<VibeVoiceDiffusionStepTensors>> {
+        self.timesteps
+            .iter()
+            .enumerate()
+            .map(|(idx, &timestep)| {
+                let prev_timestep = self.timesteps.get(idx + 1).copied();
+                let coeffs = self.step_coefficients(timestep, prev_timestep);
+                Ok(VibeVoiceDiffusionStepTensors {
+                    timestep,
+                    prev_timestep,
+                    timestep_tensor: Tensor::from_vec(vec![timestep as f32], (1,), device)?
+                        .to_dtype(dtype)?,
+                    sqrt_alpha: Tensor::new(coeffs.sqrt_alpha, device)?.to_dtype(dtype)?,
+                    sqrt_beta: Tensor::new(coeffs.sqrt_beta, device)?.to_dtype(dtype)?,
+                    sqrt_prev_alpha: Tensor::new(coeffs.sqrt_prev_alpha, device)?
+                        .to_dtype(dtype)?,
+                    sqrt_prev_beta: Tensor::new(coeffs.sqrt_prev_beta, device)?.to_dtype(dtype)?,
+                })
+            })
+            .collect()
+    }
+
     pub fn step_v_prediction(
         &self,
         model_output: &Tensor,
@@ -284,33 +329,83 @@ impl VibeVoiceDiffusionScheduler {
         prev_timestep: Option<usize>,
         sample: &Tensor,
     ) -> Result<Tensor> {
+        let coeffs = self.step_coefficients(timestep, prev_timestep);
+        let sqrt_alpha =
+            Tensor::new(coeffs.sqrt_alpha, sample.device())?.to_dtype(sample.dtype())?;
+        let sqrt_beta = Tensor::new(coeffs.sqrt_beta, sample.device())?.to_dtype(sample.dtype())?;
+        let sqrt_prev_alpha =
+            Tensor::new(coeffs.sqrt_prev_alpha, sample.device())?.to_dtype(sample.dtype())?;
+        let sqrt_prev_beta =
+            Tensor::new(coeffs.sqrt_prev_beta, sample.device())?.to_dtype(sample.dtype())?;
+        step_v_prediction_with_tensors(
+            model_output,
+            sample,
+            &sqrt_alpha,
+            &sqrt_beta,
+            &sqrt_prev_alpha,
+            &sqrt_prev_beta,
+        )
+    }
+
+    pub fn step_v_prediction_with_tensors(
+        &self,
+        model_output: &Tensor,
+        sample: &Tensor,
+        step: &VibeVoiceDiffusionStepTensors,
+    ) -> Result<Tensor> {
+        step_v_prediction_with_tensors(
+            model_output,
+            sample,
+            &step.sqrt_alpha,
+            &step.sqrt_beta,
+            &step.sqrt_prev_alpha,
+            &step.sqrt_prev_beta,
+        )
+    }
+
+    fn step_coefficients(
+        &self,
+        timestep: usize,
+        prev_timestep: Option<usize>,
+    ) -> DiffusionStepCoefficients {
         let alpha = self.alpha_cumprod(timestep);
         let prev_alpha = prev_timestep.map(|t| self.alpha_cumprod(t)).unwrap_or(1.0);
         let beta = (1.0 - alpha).max(0.0);
         let prev_beta = (1.0 - prev_alpha).max(0.0);
-        let sqrt_alpha = alpha.sqrt();
-        let sqrt_beta = beta.sqrt();
-        let sqrt_prev_alpha = prev_alpha.sqrt();
-        let sqrt_prev_beta = prev_beta.sqrt();
-
-        let sqrt_alpha = Tensor::new(sqrt_alpha, sample.device())?.to_dtype(sample.dtype())?;
-        let sqrt_beta = Tensor::new(sqrt_beta, sample.device())?.to_dtype(sample.dtype())?;
-        let sqrt_prev_alpha =
-            Tensor::new(sqrt_prev_alpha, sample.device())?.to_dtype(sample.dtype())?;
-        let sqrt_prev_beta =
-            Tensor::new(sqrt_prev_beta, sample.device())?.to_dtype(sample.dtype())?;
-
-        let pred_original = sample
-            .broadcast_mul(&sqrt_alpha)?
-            .broadcast_sub(&model_output.broadcast_mul(&sqrt_beta)?)?;
-        let pred_epsilon = model_output
-            .broadcast_mul(&sqrt_alpha)?
-            .broadcast_add(&sample.broadcast_mul(&sqrt_beta)?)?;
-        pred_original
-            .broadcast_mul(&sqrt_prev_alpha)?
-            .broadcast_add(&pred_epsilon.broadcast_mul(&sqrt_prev_beta)?)
-            .map_err(Error::from)
+        DiffusionStepCoefficients {
+            sqrt_alpha: alpha.sqrt(),
+            sqrt_beta: beta.sqrt(),
+            sqrt_prev_alpha: prev_alpha.sqrt(),
+            sqrt_prev_beta: prev_beta.sqrt(),
+        }
     }
+}
+
+struct DiffusionStepCoefficients {
+    sqrt_alpha: f32,
+    sqrt_beta: f32,
+    sqrt_prev_alpha: f32,
+    sqrt_prev_beta: f32,
+}
+
+fn step_v_prediction_with_tensors(
+    model_output: &Tensor,
+    sample: &Tensor,
+    sqrt_alpha: &Tensor,
+    sqrt_beta: &Tensor,
+    sqrt_prev_alpha: &Tensor,
+    sqrt_prev_beta: &Tensor,
+) -> Result<Tensor> {
+    let pred_original = sample
+        .broadcast_mul(sqrt_alpha)?
+        .broadcast_sub(&model_output.broadcast_mul(sqrt_beta)?)?;
+    let pred_epsilon = model_output
+        .broadcast_mul(sqrt_alpha)?
+        .broadcast_add(&sample.broadcast_mul(sqrt_beta)?)?;
+    pred_original
+        .broadcast_mul(sqrt_prev_alpha)?
+        .broadcast_add(&pred_epsilon.broadcast_mul(sqrt_prev_beta)?)
+        .map_err(Error::from)
 }
 
 fn cosine_beta_schedule(num_steps: usize) -> Vec<f32> {
@@ -346,5 +441,35 @@ mod tests {
         assert_eq!(scheduler.timesteps()[0], 999);
         assert_eq!(*scheduler.timesteps().last().unwrap(), 0);
         assert!(scheduler.alpha_cumprod(999) > 0.0);
+    }
+
+    #[test]
+    fn scheduler_step_tensors_match_scalar_step_path() {
+        let device = Device::Cpu;
+        let scheduler = VibeVoiceDiffusionScheduler::new(1000, 4);
+        let sample = Tensor::from_vec(vec![0.1f32, -0.2, 0.3, -0.4], (1, 4), &device).unwrap();
+        let model_output =
+            Tensor::from_vec(vec![0.05f32, 0.1, -0.15, -0.2], (1, 4), &device).unwrap();
+        let steps = scheduler
+            .step_tensors(&device, DType::F32)
+            .expect("step tensors");
+
+        let scalar = scheduler
+            .step_v_prediction(
+                &model_output,
+                steps[0].timestep,
+                steps[0].prev_timestep,
+                &sample,
+            )
+            .expect("scalar step");
+        let cached = scheduler
+            .step_v_prediction_with_tensors(&model_output, &sample, &steps[0])
+            .expect("cached step");
+        let scalar = scalar.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let cached = cached.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        for (lhs, rhs) in scalar.iter().zip(cached.iter()) {
+            assert!((lhs - rhs).abs() < 1e-6);
+        }
     }
 }
