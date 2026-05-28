@@ -25,7 +25,7 @@ use crate::models::architectures::vibevoice::prompt::{
     VibeVoicePromptTokenizer, VibeVoiceSpecialTokens,
 };
 use crate::models::architectures::vibevoice::tokenizer::{
-    VibeVoiceAcousticTokenizer, VibeVoiceSemanticTokenizer,
+    VibeVoiceAcousticTokenizer, VibeVoiceSemanticTokenizer, VibeVoiceTokenizerStreamingCache,
 };
 use crate::models::shared::attention::paged::{KvCacheQuantization, default_kv_page_size};
 use crate::models::shared::weights::gguf::load_model_weights;
@@ -379,6 +379,8 @@ impl VibeVoiceTtsModel {
             self.prediction_head.config().ddpm_num_steps,
             params.diffusion_steps,
         );
+        let mut feedback_acoustic_cache = VibeVoiceTokenizerStreamingCache::new();
+        let mut feedback_semantic_cache = VibeVoiceTokenizerStreamingCache::new();
         let mut scaled_latents = Vec::with_capacity(max_frames);
         for frame_idx in 0..max_frames {
             if frame_idx >= MIN_FRAMES_BEFORE_STOP {
@@ -408,7 +410,12 @@ impl VibeVoiceTtsModel {
             )?;
             profile.diffusion_sample_ms += elapsed_ms(started);
             let latent_frame = latent.unsqueeze(1)?;
-            let feedback = self.generated_speech_embed(&latent_frame, &reference.normalization)?;
+            let feedback = self.generated_speech_embed(
+                &latent_frame,
+                &reference.normalization,
+                &mut feedback_acoustic_cache,
+                &mut feedback_semantic_cache,
+            )?;
             profile.feedback_acoustic_decode_ms += feedback.acoustic_decode_ms;
             profile.feedback_semantic_encode_ms += feedback.semantic_encode_ms;
             profile.feedback_connector_ms += feedback.connector_ms;
@@ -522,6 +529,8 @@ impl VibeVoiceTtsModel {
         &self,
         scaled_latent_frame: &Tensor,
         normalization: &LatentNormalization,
+        acoustic_cache: &mut VibeVoiceTokenizerStreamingCache,
+        semantic_cache: &mut VibeVoiceTokenizerStreamingCache,
     ) -> Result<GeneratedSpeechFeedback> {
         let started = Instant::now();
         let acoustic_embed = self.acoustic_connector.forward(scaled_latent_frame)?;
@@ -532,10 +541,15 @@ impl VibeVoiceTtsModel {
             &normalization.scale,
         )?;
         let started = Instant::now();
-        let audio_chunk = self.acoustic_tokenizer.decode(&unscaled_frame)?;
+        let audio_chunk = self
+            .acoustic_tokenizer
+            .decode_streaming(&unscaled_frame, acoustic_cache)?;
         let acoustic_decode_ms = elapsed_ms(started);
         let started = Instant::now();
-        let semantic = self.semantic_tokenizer.encode(&audio_chunk)?.mode();
+        let semantic = self
+            .semantic_tokenizer
+            .encode_streaming(&audio_chunk, semantic_cache)?
+            .mode();
         let semantic_encode_ms = elapsed_ms(started);
         let started = Instant::now();
         let semantic_embed = self.semantic_connector.forward(&semantic)?;

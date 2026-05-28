@@ -21,6 +21,28 @@ impl VibeVoiceTokenizerEncoderOutput {
     }
 }
 
+#[derive(Default)]
+pub struct VibeVoiceTokenizerStreamingCache {
+    encoder: Option<TokenizerEncoderStreamingCache>,
+    decoder: Option<TokenizerDecoderStreamingCache>,
+}
+
+impl VibeVoiceTokenizerStreamingCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn encoder_mut(&mut self, encoder: &TokenizerEncoder) -> &mut TokenizerEncoderStreamingCache {
+        self.encoder
+            .get_or_insert_with(|| encoder.streaming_cache())
+    }
+
+    fn decoder_mut(&mut self, decoder: &TokenizerDecoder) -> &mut TokenizerDecoderStreamingCache {
+        self.decoder
+            .get_or_insert_with(|| decoder.streaming_cache())
+    }
+}
+
 pub struct VibeVoiceAcousticTokenizer {
     encoder: TokenizerEncoder,
     decoder: TokenizerDecoder,
@@ -114,6 +136,20 @@ impl VibeVoiceAcousticTokenizer {
         };
         self.decoder.forward(&latents)
     }
+
+    pub fn decode_streaming(
+        &self,
+        latents: &Tensor,
+        cache: &mut VibeVoiceTokenizerStreamingCache,
+    ) -> Result<Tensor> {
+        let latents = if latents.dim(1)? == self.vae_dim {
+            latents.clone()
+        } else {
+            latents.transpose(1, 2)?
+        };
+        self.decoder
+            .forward_streaming(&latents, cache.decoder_mut(&self.decoder))
+    }
 }
 
 pub struct VibeVoiceSemanticTokenizer {
@@ -148,6 +184,20 @@ impl VibeVoiceSemanticTokenizer {
 
     pub fn encode(&self, audio: &Tensor) -> Result<VibeVoiceTokenizerEncoderOutput> {
         let latents = self.encoder.forward(audio)?;
+        Ok(VibeVoiceTokenizerEncoderOutput {
+            mean: latents.transpose(1, 2)?,
+            std: None,
+        })
+    }
+
+    pub fn encode_streaming(
+        &self,
+        audio: &Tensor,
+        cache: &mut VibeVoiceTokenizerStreamingCache,
+    ) -> Result<VibeVoiceTokenizerEncoderOutput> {
+        let latents = self
+            .encoder
+            .forward_streaming(audio, cache.encoder_mut(&self.encoder))?;
         Ok(VibeVoiceTokenizerEncoderOutput {
             mean: latents.transpose(1, 2)?,
             std: None,
@@ -269,6 +319,54 @@ impl TokenizerEncoder {
         let x = self.norm.forward(&x)?;
         self.head.forward(&x)
     }
+
+    fn forward_streaming(
+        &self,
+        x: &Tensor,
+        cache: &mut TokenizerEncoderStreamingCache,
+    ) -> Result<Tensor> {
+        validate_cache_len(
+            "VibeVoice tokenizer encoder downsample",
+            cache.downsample_layers.len(),
+            self.downsample_layers.len(),
+        )?;
+        validate_cache_len(
+            "VibeVoice tokenizer encoder stages",
+            cache.stages.len(),
+            self.stages.len(),
+        )?;
+        let mut x = x.clone();
+        for idx in 0..self.stages.len() {
+            x = self.downsample_layers[idx]
+                .forward_streaming(&x, &mut cache.downsample_layers[idx])?;
+            validate_cache_len(
+                "VibeVoice tokenizer encoder stage blocks",
+                cache.stages[idx].len(),
+                self.stages[idx].len(),
+            )?;
+            for (block, block_cache) in self.stages[idx].iter().zip(cache.stages[idx].iter_mut()) {
+                x = block.forward_streaming(&x, block_cache)?;
+            }
+        }
+        let x = self.norm.forward(&x)?;
+        self.head.forward_streaming(&x, &mut cache.head)
+    }
+
+    fn streaming_cache(&self) -> TokenizerEncoderStreamingCache {
+        TokenizerEncoderStreamingCache {
+            downsample_layers: self
+                .downsample_layers
+                .iter()
+                .map(SConv1d::streaming_cache)
+                .collect(),
+            stages: self
+                .stages
+                .iter()
+                .map(|stage| stage.iter().map(Block1D::streaming_cache).collect())
+                .collect(),
+            head: self.head.streaming_cache(),
+        }
+    }
 }
 
 struct TokenizerDecoder {
@@ -365,6 +463,53 @@ impl TokenizerDecoder {
         let x = self.norm.forward(&x)?;
         self.head.forward(&x)
     }
+
+    fn forward_streaming(
+        &self,
+        x: &Tensor,
+        cache: &mut TokenizerDecoderStreamingCache,
+    ) -> Result<Tensor> {
+        validate_cache_len(
+            "VibeVoice tokenizer decoder upsample",
+            cache.upsample_layers.len(),
+            self.upsample_layers.len(),
+        )?;
+        validate_cache_len(
+            "VibeVoice tokenizer decoder stages",
+            cache.stages.len(),
+            self.stages.len(),
+        )?;
+        let mut x = x.clone();
+        for idx in 0..self.stages.len() {
+            x = self.upsample_layers[idx].forward_streaming(&x, &mut cache.upsample_layers[idx])?;
+            validate_cache_len(
+                "VibeVoice tokenizer decoder stage blocks",
+                cache.stages[idx].len(),
+                self.stages[idx].len(),
+            )?;
+            for (block, block_cache) in self.stages[idx].iter().zip(cache.stages[idx].iter_mut()) {
+                x = block.forward_streaming(&x, block_cache)?;
+            }
+        }
+        let x = self.norm.forward(&x)?;
+        self.head.forward_streaming(&x, &mut cache.head)
+    }
+
+    fn streaming_cache(&self) -> TokenizerDecoderStreamingCache {
+        TokenizerDecoderStreamingCache {
+            upsample_layers: self
+                .upsample_layers
+                .iter()
+                .map(UpsampleLayer::streaming_cache)
+                .collect(),
+            stages: self
+                .stages
+                .iter()
+                .map(|stage| stage.iter().map(Block1D::streaming_cache).collect())
+                .collect(),
+            head: self.head.streaming_cache(),
+        }
+    }
 }
 
 enum UpsampleLayer {
@@ -377,6 +522,33 @@ impl UpsampleLayer {
         match self {
             Self::Conv(layer) => layer.forward(x),
             Self::Transposed(layer) => layer.forward(x),
+        }
+    }
+
+    fn forward_streaming(
+        &self,
+        x: &Tensor,
+        cache: &mut UpsampleLayerStreamingCache,
+    ) -> Result<Tensor> {
+        match (self, cache) {
+            (Self::Conv(layer), UpsampleLayerStreamingCache::Conv(cache)) => {
+                layer.forward_streaming(x, cache)
+            }
+            (Self::Transposed(layer), UpsampleLayerStreamingCache::Transposed(cache)) => {
+                layer.forward_streaming(x, cache)
+            }
+            _ => Err(Error::InferenceError(
+                "VibeVoice tokenizer streaming cache layer type mismatch".to_string(),
+            )),
+        }
+    }
+
+    fn streaming_cache(&self) -> UpsampleLayerStreamingCache {
+        match self {
+            Self::Conv(layer) => UpsampleLayerStreamingCache::Conv(layer.streaming_cache()),
+            Self::Transposed(layer) => {
+                UpsampleLayerStreamingCache::Transposed(layer.streaming_cache())
+            }
         }
     }
 }
@@ -453,6 +625,31 @@ impl Block1D {
         }
         residual.broadcast_add(&hidden).map_err(Error::from)
     }
+
+    fn forward_streaming(&self, x: &Tensor, cache: &mut Block1DStreamingCache) -> Result<Tensor> {
+        let residual = x;
+        let normed = self.norm.forward(x)?;
+        let mut mixed = self.mixer.forward_streaming(&normed, &mut cache.mixer)?;
+        if let Some(gamma) = &self.gamma {
+            mixed = mixed.broadcast_mul(&gamma.reshape((1, gamma.dim(0)?, 1))?)?;
+        }
+        let x = residual.broadcast_add(&mixed)?;
+
+        let residual = &x;
+        let ffn_in = self.ffn_norm.forward(&x)?.transpose(1, 2)?;
+        let hidden = self.linear1.forward(&ffn_in)?.gelu()?;
+        let mut hidden = self.linear2.forward(&hidden)?.transpose(1, 2)?;
+        if let Some(gamma) = &self.ffn_gamma {
+            hidden = hidden.broadcast_mul(&gamma.reshape((1, gamma.dim(0)?, 1))?)?;
+        }
+        residual.broadcast_add(&hidden).map_err(Error::from)
+    }
+
+    fn streaming_cache(&self) -> Block1DStreamingCache {
+        Block1DStreamingCache {
+            mixer: self.mixer.streaming_cache(),
+        }
+    }
 }
 
 struct SConv1d {
@@ -509,6 +706,34 @@ impl SConv1d {
         };
         self.conv.forward(&x).map_err(Error::from)
     }
+
+    fn forward_streaming(&self, x: &Tensor, cache: &mut SConv1dStreamingCache) -> Result<Tensor> {
+        if self.right_padding > 0 {
+            return Err(Error::InferenceError(
+                "VibeVoice tokenizer streaming cache requires causal SConv1d padding".to_string(),
+            ));
+        }
+        let stride = self.conv.config().stride.max(1);
+        if stride > 1 && x.dim(2)? % stride != 0 {
+            return Err(Error::InferenceError(format!(
+                "VibeVoice tokenizer streaming SConv1d chunk length {} is not aligned to stride {stride}",
+                x.dim(2)?
+            )));
+        }
+        let padded = if self.causal_padding > 0 {
+            let prefix = cache.prefix_or_zeros(x, self.causal_padding)?;
+            Tensor::cat(&[prefix, x.clone()], 2)?
+        } else {
+            x.clone()
+        };
+        let output = self.conv.forward(&padded)?;
+        cache.update_from_padded_input(&padded, self.causal_padding)?;
+        Ok(output)
+    }
+
+    fn streaming_cache(&self) -> SConv1dStreamingCache {
+        SConv1dStreamingCache::default()
+    }
 }
 
 struct SConvTranspose1d {
@@ -563,6 +788,120 @@ impl SConvTranspose1d {
         y.narrow(2, self.left_trim.min(len), keep)
             .map_err(Error::from)
     }
+
+    fn forward_streaming(
+        &self,
+        x: &Tensor,
+        cache: &mut SConvTranspose1dStreamingCache,
+    ) -> Result<Tensor> {
+        if self.left_trim > 0 {
+            return Err(Error::InferenceError(
+                "VibeVoice tokenizer streaming cache requires causal transposed-conv trim"
+                    .to_string(),
+            ));
+        }
+        let mut y = self.conv.forward(x)?;
+        if let Some(tail) = cache.tail.take() {
+            y = add_transposed_overlap(y, tail, self.conv.bias())?;
+        }
+        let len = y.dim(2)?;
+        let emit_len = len.saturating_sub(self.right_trim);
+        let emitted = y.narrow(2, 0, emit_len)?;
+        cache.tail = if self.right_trim > 0 {
+            Some(y.narrow(2, emit_len, len - emit_len)?)
+        } else {
+            None
+        };
+        Ok(emitted)
+    }
+
+    fn streaming_cache(&self) -> SConvTranspose1dStreamingCache {
+        SConvTranspose1dStreamingCache::default()
+    }
+}
+
+#[derive(Default)]
+struct TokenizerEncoderStreamingCache {
+    downsample_layers: Vec<SConv1dStreamingCache>,
+    stages: Vec<Vec<Block1DStreamingCache>>,
+    head: SConv1dStreamingCache,
+}
+
+#[derive(Default)]
+struct TokenizerDecoderStreamingCache {
+    upsample_layers: Vec<UpsampleLayerStreamingCache>,
+    stages: Vec<Vec<Block1DStreamingCache>>,
+    head: SConv1dStreamingCache,
+}
+
+enum UpsampleLayerStreamingCache {
+    Conv(SConv1dStreamingCache),
+    Transposed(SConvTranspose1dStreamingCache),
+}
+
+struct Block1DStreamingCache {
+    mixer: SConv1dStreamingCache,
+}
+
+#[derive(Default)]
+struct SConv1dStreamingCache {
+    prefix: Option<Tensor>,
+}
+
+impl SConv1dStreamingCache {
+    fn prefix_or_zeros(&mut self, x: &Tensor, len: usize) -> Result<Tensor> {
+        if let Some(prefix) = &self.prefix {
+            return Ok(prefix.clone());
+        }
+        Tensor::zeros((x.dim(0)?, x.dim(1)?, len), x.dtype(), x.device()).map_err(Error::from)
+    }
+
+    fn update_from_padded_input(&mut self, x: &Tensor, len: usize) -> Result<()> {
+        if len == 0 {
+            self.prefix = None;
+            return Ok(());
+        }
+        let input_len = x.dim(2)?;
+        let start = input_len.saturating_sub(len);
+        self.prefix = Some(x.narrow(2, start, input_len - start)?);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct SConvTranspose1dStreamingCache {
+    tail: Option<Tensor>,
+}
+
+fn add_transposed_overlap(y: Tensor, tail: Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+    let y_len = y.dim(2)?;
+    let tail_len = tail.dim(2)?;
+    if tail_len == 0 {
+        return Ok(y);
+    }
+    if y_len < tail_len {
+        return Err(Error::InferenceError(format!(
+            "VibeVoice transposed-conv streaming overlap length {tail_len} exceeds chunk length {y_len}"
+        )));
+    }
+    let mut overlap = y.narrow(2, 0, tail_len)?.broadcast_add(&tail)?;
+    if let Some(bias) = bias {
+        overlap = overlap.broadcast_sub(&bias.reshape((1, bias.dim(0)?, 1))?)?;
+    }
+    let mut parts = vec![overlap];
+    if tail_len < y_len {
+        parts.push(y.narrow(2, tail_len, y_len - tail_len)?);
+    }
+    Tensor::cat(&parts, 2).map_err(Error::from)
+}
+
+fn validate_cache_len(context: &str, actual: usize, expected: usize) -> Result<()> {
+    if actual == expected {
+        return Ok(());
+    }
+    Err(Error::InferenceError(format!(
+        "{context} streaming cache has {actual} entries, expected {expected}"
+    )))
 }
 
 enum ConvNorm {
@@ -621,6 +960,10 @@ fn _dtype_name(dtype: DType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    use candle_core::Device;
+    use candle_nn::VarBuilder;
 
     #[test]
     fn semantic_encode_shape_matches_continuous_latent_contract() {
@@ -629,5 +972,87 @@ mod tests {
             std: None,
         };
         assert_eq!(output.mode().dims(), &[1, 3, 128]);
+    }
+
+    #[test]
+    fn causal_sconv1d_streaming_matches_full_strided_forward() {
+        let device = Device::Cpu;
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "conv.conv.weight".to_string(),
+            Tensor::from_vec(vec![0.25f32, -0.5, 0.75, 0.125], (1, 1, 4), &device).unwrap(),
+        );
+        tensors.insert(
+            "conv.conv.bias".to_string(),
+            Tensor::from_vec(vec![0.1f32], (1,), &device).unwrap(),
+        );
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
+        let layer = SConv1d::load(1, 1, 4, 2, 1, 1, true, true, vb).unwrap();
+        let x = Tensor::from_vec(
+            (0..12).map(|value| value as f32 / 10.0).collect::<Vec<_>>(),
+            (1, 1, 12),
+            &device,
+        )
+        .unwrap();
+
+        let full = layer.forward(&x).unwrap();
+        let mut cache = layer.streaming_cache();
+        let mut chunks = Vec::new();
+        for offset in [0usize, 4, 8] {
+            let chunk = x.narrow(2, offset, 4).unwrap();
+            chunks.push(layer.forward_streaming(&chunk, &mut cache).unwrap());
+        }
+        let streamed = Tensor::cat(&chunks, 2).unwrap();
+
+        assert_tensor_close(&streamed, &full, 1e-6);
+    }
+
+    #[test]
+    fn causal_sconvtranspose_streaming_matches_full_overlap_forward() {
+        let device = Device::Cpu;
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "convtr.convtr.weight".to_string(),
+            Tensor::from_vec(vec![0.2f32, -0.4, 0.6, 0.8], (1, 1, 4), &device).unwrap(),
+        );
+        tensors.insert(
+            "convtr.convtr.bias".to_string(),
+            Tensor::from_vec(vec![0.3f32], (1,), &device).unwrap(),
+        );
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
+        let layer = SConvTranspose1d::load(1, 1, 4, 2, true, 1.0, vb).unwrap();
+        let x = Tensor::from_vec(vec![0.5f32, -1.0, 0.25, 0.75, -0.5], (1, 1, 5), &device).unwrap();
+
+        let full = layer.forward(&x).unwrap();
+        let mut cache = layer.streaming_cache();
+        let chunks = [
+            x.narrow(2, 0, 1).unwrap(),
+            x.narrow(2, 1, 2).unwrap(),
+            x.narrow(2, 3, 2).unwrap(),
+        ];
+        let streamed_chunks = chunks
+            .iter()
+            .map(|chunk| layer.forward_streaming(chunk, &mut cache).unwrap())
+            .collect::<Vec<_>>();
+        let streamed = Tensor::cat(&streamed_chunks, 2).unwrap();
+
+        assert_tensor_close(&streamed, &full, 1e-6);
+    }
+
+    fn assert_tensor_close(actual: &Tensor, expected: &Tensor, epsilon: f32) {
+        assert_eq!(actual.dims(), expected.dims());
+        let actual = actual.to_vec3::<f32>().unwrap();
+        let expected = expected.to_vec3::<f32>().unwrap();
+        for (actual_batch, expected_batch) in actual.iter().zip(expected.iter()) {
+            for (actual_channel, expected_channel) in actual_batch.iter().zip(expected_batch.iter())
+            {
+                for (actual, expected) in actual_channel.iter().zip(expected_channel.iter()) {
+                    assert!(
+                        (*actual - *expected).abs() <= epsilon,
+                        "expected {actual} to be within {epsilon} of {expected}"
+                    );
+                }
+            }
+        }
     }
 }
