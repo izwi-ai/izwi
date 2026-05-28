@@ -1,7 +1,7 @@
 //! VibeVoice diffusion prediction head and scheduler helpers.
 
-use candle_core::{DType, Device, Tensor, D};
-use candle_nn::{ops, Linear, Module, RmsNorm, VarBuilder};
+use candle_core::{D, DType, Device, Tensor};
+use candle_nn::{Linear, Module, RmsNorm, VarBuilder, ops};
 
 use crate::error::{Error, Result};
 use crate::kernels::try_fused_silu_mul;
@@ -103,6 +103,23 @@ impl VibeVoiceDiffusionHead {
             x = layer.forward(&x, &c)?;
         }
         self.final_layer.forward(&x, &c)
+    }
+
+    pub fn forward_cfg_batched(
+        &self,
+        noisy_latents: &Tensor,
+        timesteps: &Tensor,
+        condition: &Tensor,
+        negative_condition: &Tensor,
+        cfg_scale: &Tensor,
+    ) -> Result<Tensor> {
+        let latents = Tensor::cat(&[noisy_latents.clone(), noisy_latents.clone()], 0)?;
+        let timesteps = Tensor::cat(&[timesteps.clone(), timesteps.clone()], 0)?;
+        let conditions = Tensor::cat(&[condition.clone(), negative_condition.clone()], 0)?;
+        let output = self.forward(&latents, &timesteps, &conditions)?;
+        let positive = output.narrow(0, 0, 1)?;
+        let negative = output.narrow(0, 1, 1)?;
+        classifier_free_guidance(&positive, &negative, cfg_scale)
     }
 }
 
@@ -216,6 +233,17 @@ fn rms_norm_no_affine(x: &Tensor, eps: f64) -> Result<Tensor> {
     let eps = Tensor::new(eps as f32, x.device())?.to_dtype(x.dtype())?;
     let denom = mean.broadcast_add(&eps)?.sqrt()?.recip()?;
     x.broadcast_mul(&denom).map_err(Error::from)
+}
+
+fn classifier_free_guidance(
+    positive_output: &Tensor,
+    negative_output: &Tensor,
+    cfg_scale: &Tensor,
+) -> Result<Tensor> {
+    let guidance = positive_output.broadcast_sub(negative_output)?;
+    negative_output
+        .broadcast_add(&guidance.broadcast_mul(cfg_scale)?)
+        .map_err(Error::from)
 }
 
 fn timestep_frequencies(dim: usize, device: &Device) -> Result<Tensor> {
@@ -433,6 +461,9 @@ fn cosine_beta_schedule(num_steps: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    use candle_nn::VarBuilder;
 
     #[test]
     fn scheduler_builds_descending_inference_timesteps() {
@@ -470,6 +501,174 @@ mod tests {
 
         for (lhs, rhs) in scalar.iter().zip(cached.iter()) {
             assert!((lhs - rhs).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn cfg_batched_prediction_matches_two_independent_passes() {
+        let device = Device::Cpu;
+        let head = tiny_diffusion_head(&device);
+        let speech = Tensor::from_vec(vec![0.1f32, -0.2], (1, 2), &device).unwrap();
+        let timestep = Tensor::from_vec(vec![42.0f32], (1,), &device).unwrap();
+        let positive_condition =
+            Tensor::from_vec(vec![0.25f32, -0.5, 0.75, 0.1], (1, 4), &device).unwrap();
+        let negative_condition =
+            Tensor::from_vec(vec![-0.1f32, 0.2, -0.3, 0.4], (1, 4), &device).unwrap();
+        let cfg_scale = Tensor::new(1.5f32, &device).unwrap();
+
+        let positive = head
+            .forward(&speech, &timestep, &positive_condition)
+            .unwrap();
+        let negative = head
+            .forward(&speech, &timestep, &negative_condition)
+            .unwrap();
+        let expected = classifier_free_guidance(&positive, &negative, &cfg_scale).unwrap();
+        let batched = head
+            .forward_cfg_batched(
+                &speech,
+                &timestep,
+                &positive_condition,
+                &negative_condition,
+                &cfg_scale,
+            )
+            .unwrap();
+
+        assert_tensor_close(&batched, &expected, 1e-5);
+    }
+
+    fn tiny_diffusion_head(device: &Device) -> VibeVoiceDiffusionHead {
+        let hidden = 4;
+        let latent = 2;
+        let ffn = 4;
+        let mut tensors = HashMap::new();
+        insert_linear(
+            &mut tensors,
+            "noisy_images_proj.weight",
+            hidden,
+            latent,
+            device,
+            0.01,
+        );
+        insert_linear(
+            &mut tensors,
+            "cond_proj.weight",
+            hidden,
+            hidden,
+            device,
+            -0.015,
+        );
+        insert_linear(
+            &mut tensors,
+            "t_embedder.mlp.0.weight",
+            hidden,
+            256,
+            device,
+            0.002,
+        );
+        insert_linear(
+            &mut tensors,
+            "t_embedder.mlp.2.weight",
+            hidden,
+            hidden,
+            device,
+            0.02,
+        );
+        insert_linear(
+            &mut tensors,
+            "layers.0.ffn.gate_proj.weight",
+            ffn,
+            hidden,
+            device,
+            0.01,
+        );
+        insert_linear(
+            &mut tensors,
+            "layers.0.ffn.up_proj.weight",
+            ffn,
+            hidden,
+            device,
+            -0.0125,
+        );
+        insert_linear(
+            &mut tensors,
+            "layers.0.ffn.down_proj.weight",
+            hidden,
+            ffn,
+            device,
+            0.0175,
+        );
+        insert_linear(
+            &mut tensors,
+            "layers.0.adaLN_modulation.1.weight",
+            3 * hidden,
+            hidden,
+            device,
+            0.006,
+        );
+        tensors.insert(
+            "layers.0.norm.weight".to_string(),
+            Tensor::from_vec(vec![1.0f32; hidden], (hidden,), device).unwrap(),
+        );
+        insert_linear(
+            &mut tensors,
+            "final_layer.linear.weight",
+            latent,
+            hidden,
+            device,
+            -0.02,
+        );
+        insert_linear(
+            &mut tensors,
+            "final_layer.adaLN_modulation.1.weight",
+            2 * hidden,
+            hidden,
+            device,
+            0.0075,
+        );
+        let cfg = VibeVoiceDiffusionHeadConfig {
+            hidden_size: hidden,
+            head_layers: 1,
+            head_ffn_ratio: 1.0,
+            rms_norm_eps: 1e-5,
+            latent_size: latent,
+            speech_vae_dim: None,
+            prediction_type: "v_prediction".to_string(),
+            diffusion_type: "ddpm".to_string(),
+            ddpm_num_steps: 1000,
+            ddpm_num_inference_steps: 4,
+            ddpm_beta_schedule: "cosine".to_string(),
+            ddpm_batch_mul: 4,
+        };
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
+        VibeVoiceDiffusionHead::load(cfg, vb).unwrap()
+    }
+
+    fn insert_linear(
+        tensors: &mut HashMap<String, Tensor>,
+        name: &str,
+        rows: usize,
+        cols: usize,
+        device: &Device,
+        scale: f32,
+    ) {
+        let values = (0..rows * cols)
+            .map(|idx| (idx as f32 + 1.0) * scale)
+            .collect::<Vec<_>>();
+        tensors.insert(
+            name.to_string(),
+            Tensor::from_vec(values, (rows, cols), device).unwrap(),
+        );
+    }
+
+    fn assert_tensor_close(actual: &Tensor, expected: &Tensor, epsilon: f32) {
+        assert_eq!(actual.dims(), expected.dims());
+        let actual = actual.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let expected = expected.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (actual, expected) in actual.iter().zip(expected.iter()) {
+            assert!(
+                (*actual - *expected).abs() <= epsilon,
+                "expected {actual} to be within {epsilon} of {expected}"
+            );
         }
     }
 }

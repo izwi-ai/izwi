@@ -601,19 +601,20 @@ impl VibeVoiceTtsModel {
             None
         };
         for step in &steps {
-            let mut model_output =
-                self.prediction_head
-                    .forward(&speech, &step.timestep_tensor, condition)?;
-            if let (Some(negative_condition), Some(cfg)) = (negative_condition, cfg_tensor.as_ref())
+            let model_output = if let (Some(negative_condition), Some(cfg)) =
+                (negative_condition, cfg_tensor.as_ref())
             {
-                let negative_output = self.prediction_head.forward(
+                self.prediction_head.forward_cfg_batched(
                     &speech,
                     &step.timestep_tensor,
+                    condition,
                     negative_condition,
-                )?;
-                let guidance = model_output.broadcast_sub(&negative_output)?;
-                model_output = negative_output.broadcast_add(&guidance.broadcast_mul(&cfg)?)?;
-            }
+                    cfg,
+                )?
+            } else {
+                self.prediction_head
+                    .forward(&speech, &step.timestep_tensor, condition)?
+            };
             speech = scheduler.step_v_prediction_with_tensors(&model_output, &speech, step)?;
         }
         Ok(speech)
