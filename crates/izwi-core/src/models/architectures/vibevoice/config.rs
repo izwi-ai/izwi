@@ -10,6 +10,8 @@ use crate::models::architectures::qwen3::core::Qwen3Config;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct VibeVoiceConfig {
+    #[serde(default)]
+    pub architectures: Vec<String>,
     pub decoder_config: Qwen3Config,
     pub acoustic_tokenizer_config: VibeVoiceTokenizerConfig,
     pub semantic_tokenizer_config: VibeVoiceTokenizerConfig,
@@ -44,7 +46,24 @@ impl VibeVoiceConfig {
             .unwrap_or(self.semantic_tokenizer_config.vae_dim)
     }
 
+    pub fn is_asr(&self) -> bool {
+        self.architectures
+            .iter()
+            .any(|architecture| architecture.to_ascii_lowercase().contains("asr"))
+    }
+
     pub fn is_tts(&self) -> bool {
+        if self.is_asr() {
+            return false;
+        }
+        if self.architectures.iter().any(|architecture| {
+            let normalized = architecture.to_ascii_lowercase();
+            normalized.contains("conditionalgeneration")
+                || normalized.contains("tts")
+                || normalized.contains("texttospeech")
+        }) {
+            return true;
+        }
         self.diffusion_head_config.is_some()
     }
 }
@@ -266,6 +285,7 @@ mod tests {
     #[test]
     fn parses_vibevoice_tts_config_shape_contract() {
         let raw = r#"{
+            "architectures": ["VibeVoiceForConditionalGeneration"],
             "decoder_config": {
                 "hidden_size": 1536,
                 "intermediate_size": 8960,
@@ -298,6 +318,7 @@ mod tests {
         }"#;
         let cfg: VibeVoiceConfig = serde_json::from_str(raw).unwrap();
         assert!(cfg.is_tts());
+        assert!(!cfg.is_asr());
         assert_eq!(cfg.acoustic_vae_dim(), 64);
         assert_eq!(cfg.semantic_vae_dim(), 128);
         assert_eq!(cfg.acoustic_tokenizer_config.hop_length(), 3200);
@@ -309,5 +330,47 @@ mod tests {
             cfg.acoustic_tokenizer_config.decoder_depths_vec().unwrap(),
             vec![8, 3, 3, 3, 3, 3, 3]
         );
+    }
+
+    #[test]
+    fn parses_vibevoice_asr_config_with_diffusion_head_as_asr() {
+        let raw = r#"{
+            "architectures": ["VibeVoiceForASRTraining"],
+            "decoder_config": {
+                "hidden_size": 3584,
+                "intermediate_size": 18944,
+                "num_attention_heads": 28,
+                "num_hidden_layers": 28,
+                "num_key_value_heads": 4,
+                "rms_norm_eps": 0.000001,
+                "rope_theta": 1000000.0,
+                "vocab_size": 152064,
+                "tie_word_embeddings": true
+            },
+            "acoustic_tokenizer_config": {
+                "vae_dim": 64,
+                "encoder_ratios": [8, 5, 5, 4, 2, 2],
+                "decoder_ratios": [8, 5, 5, 4, 2, 2],
+                "fix_std": 0.5
+            },
+            "semantic_tokenizer_config": {
+                "vae_dim": 128,
+                "encoder_ratios": [8, 5, 5, 4, 2, 2],
+                "fix_std": 0.0,
+                "std_dist_type": "none"
+            },
+            "diffusion_head_config": {
+                "hidden_size": 3584,
+                "head_layers": 4,
+                "latent_size": 64,
+                "ddpm_num_inference_steps": 20
+            }
+        }"#;
+        let cfg: VibeVoiceConfig = serde_json::from_str(raw).unwrap();
+        assert!(cfg.is_asr());
+        assert!(!cfg.is_tts());
+        assert!(cfg.diffusion_head_config.is_some());
+        assert_eq!(cfg.decoder_config.hidden_size, 3584);
+        assert_eq!(cfg.decoder_config.vocab_size, 152064);
     }
 }
