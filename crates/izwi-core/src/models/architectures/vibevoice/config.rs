@@ -25,6 +25,51 @@ pub struct VibeVoiceConfig {
     pub torch_dtype: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct VibeVoicePreprocessorConfig {
+    #[serde(default = "default_preprocessor_sampling_rate")]
+    pub sampling_rate: u32,
+    #[serde(default = "default_preprocessor_compress_ratio")]
+    pub speech_tok_compress_ratio: usize,
+    #[serde(default = "default_true")]
+    pub normalize_audio: bool,
+    #[serde(default = "default_target_db_fs", rename = "target_dB_FS")]
+    pub target_db_fs: f32,
+    #[serde(default = "default_preprocessor_eps")]
+    pub eps: f32,
+}
+
+impl Default for VibeVoicePreprocessorConfig {
+    fn default() -> Self {
+        Self {
+            sampling_rate: default_preprocessor_sampling_rate(),
+            speech_tok_compress_ratio: default_preprocessor_compress_ratio(),
+            normalize_audio: default_true(),
+            target_db_fs: default_target_db_fs(),
+            eps: default_preprocessor_eps(),
+        }
+    }
+}
+
+impl VibeVoicePreprocessorConfig {
+    pub fn load(model_dir: &Path) -> Result<Self> {
+        let path = model_dir.join("preprocessor_config.json");
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let raw = fs::read_to_string(&path).map_err(|err| {
+            Error::ModelLoadError(format!("Failed to read {}: {err}", path.display()))
+        })?;
+        serde_json::from_str(&raw).map_err(|err| {
+            Error::ModelLoadError(format!("Failed to parse {}: {err}", path.display()))
+        })
+    }
+
+    pub fn target_sample_rate(&self) -> u32 {
+        self.sampling_rate.max(1)
+    }
+}
+
 impl VibeVoiceConfig {
     pub fn load(model_dir: &Path) -> Result<Self> {
         let path = model_dir.join("config.json");
@@ -277,6 +322,18 @@ fn default_beta_schedule() -> String {
 fn default_ddpm_batch_mul() -> usize {
     4
 }
+fn default_preprocessor_sampling_rate() -> u32 {
+    24_000
+}
+fn default_preprocessor_compress_ratio() -> usize {
+    3_200
+}
+fn default_target_db_fs() -> f32 {
+    -25.0
+}
+fn default_preprocessor_eps() -> f32 {
+    1e-6
+}
 
 #[cfg(test)]
 mod tests {
@@ -372,5 +429,23 @@ mod tests {
         assert!(cfg.diffusion_head_config.is_some());
         assert_eq!(cfg.decoder_config.hidden_size, 3584);
         assert_eq!(cfg.decoder_config.vocab_size, 152064);
+    }
+
+    #[test]
+    fn parses_vibevoice_preprocessor_config_contract() {
+        let raw = r#"{
+            "sampling_rate": 24000,
+            "speech_tok_compress_ratio": 3200,
+            "normalize_audio": true,
+            "target_dB_FS": -25,
+            "eps": 0.000001
+        }"#;
+        let cfg: VibeVoicePreprocessorConfig = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(cfg.sampling_rate, 24_000);
+        assert_eq!(cfg.speech_tok_compress_ratio, 3_200);
+        assert!(cfg.normalize_audio);
+        assert_eq!(cfg.target_db_fs, -25.0);
+        assert_eq!(cfg.eps, 1e-6);
     }
 }
