@@ -139,9 +139,15 @@ impl VibeVoiceTtsModel {
             vb,
             Qwen3WeightLayout::VIBEVOICE,
         )?;
+        let projection_diagnostics = language_model.projection_diagnostics();
         info!(
-            "Loaded VibeVoice-1.5B TTS from {:?} on {:?} with dtype {:?}",
-            model_dir, device.kind, dtype
+            "Loaded VibeVoice-1.5B TTS from {:?} on {:?} with dtype {:?} (dense_projections={}, dense_bias_projections={}, quantized_projections={})",
+            model_dir,
+            device.kind,
+            dtype,
+            projection_diagnostics.dense_projection_count,
+            projection_diagnostics.dense_bias_projection_count,
+            projection_diagnostics.quantized_projection_count
         );
         Ok(Self {
             model_dir: model_dir.to_path_buf(),

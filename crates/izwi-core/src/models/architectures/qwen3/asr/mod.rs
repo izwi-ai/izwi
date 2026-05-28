@@ -123,6 +123,7 @@ struct Qwen3AsrExecutionDiagnostics {
     text_projection_quantized: bool,
     qmatmul_projection_count: usize,
     dense_projection_count: usize,
+    dense_bias_projection_count: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -194,6 +195,7 @@ impl Qwen3AsrDiagnostics {
                 "text_projection_quantized": self.execution.text_projection_quantized,
                 "qmatmul_projection_count": self.execution.qmatmul_projection_count,
                 "dense_projection_count": self.execution.dense_projection_count,
+                "dense_bias_projection_count": self.execution.dense_bias_projection_count,
             },
             "timings_ms": {
                 "resample": self.timings.resample_ms,
@@ -519,6 +521,7 @@ impl Qwen3AsrModel {
             text_projection_quantized,
             qmatmul_projection_count: projection_diagnostics.quantized_projection_count,
             dense_projection_count: projection_diagnostics.dense_projection_count,
+            dense_bias_projection_count: projection_diagnostics.dense_bias_projection_count,
         }
     }
 
@@ -2758,6 +2761,7 @@ mod tests {
                 text_projection_quantized: true,
                 qmatmul_projection_count: 197,
                 dense_projection_count: 0,
+                dense_bias_projection_count: 0,
             },
             timings: Qwen3AsrTimingDiagnostics {
                 resample_ms: 1.0,
