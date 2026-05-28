@@ -223,7 +223,8 @@ impl FinalLayer {
 }
 
 fn modulate(x: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
-    let scaled = x.broadcast_mul(&scale.broadcast_add(&Tensor::new(1f32, x.device())?)?)?;
+    let one = Tensor::new(1f32, x.device())?.to_dtype(scale.dtype())?;
+    let scaled = x.broadcast_mul(&scale.broadcast_add(&one)?)?;
     scaled.broadcast_add(shift).map_err(Error::from)
 }
 
@@ -534,6 +535,33 @@ mod tests {
             .unwrap();
 
         assert_tensor_close(&batched, &expected, 1e-5);
+    }
+
+    #[test]
+    fn modulate_keeps_bf16_scalar_add_in_bf16() {
+        let device = Device::Cpu;
+        let x = Tensor::from_vec(vec![1.0f32, -2.0], (1, 2), &device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let shift = Tensor::from_vec(vec![0.5f32, -0.25], (1, 2), &device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let scale = Tensor::from_vec(vec![0.25f32, -0.5], (1, 2), &device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+
+        let output = modulate(&x, &shift, &scale).unwrap();
+
+        assert_eq!(output.dtype(), DType::BF16);
+        let output = output.to_dtype(DType::F32).unwrap();
+        assert_tensor_close(
+            &output,
+            &Tensor::from_vec(vec![1.75f32, -1.25], (1, 2), &device).unwrap(),
+            1e-2,
+        );
     }
 
     fn tiny_diffusion_head(device: &Device) -> VibeVoiceDiffusionHead {
