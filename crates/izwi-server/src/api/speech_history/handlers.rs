@@ -4,14 +4,14 @@ use std::time::Duration;
 use axum::{
     body::Body,
     extract::{Extension, Json, Path, Query, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::api::pagination::{CursorPagination, CursorPaginationQuery, encode_cursor};
+use crate::api::pagination::{encode_cursor, CursorPagination, CursorPaginationQuery};
 use crate::api::request_context::RequestContext;
 use crate::api::saved_voices::resolve_saved_voice_reference;
 use crate::api::tts_long_form::{expand_generation_requests_for_long_form, generate_long_form_tts};
@@ -26,7 +26,7 @@ use izwi_core::audio::{AudioEncoder, AudioFormat};
 use izwi_core::runtime_models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
 use izwi_core::runtime_models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use izwi_core::{
-    AudioChunk, GenerationConfig, GenerationRequest, ModelVariant, parse_tts_model_variant,
+    parse_tts_model_variant, AudioChunk, GenerationConfig, GenerationRequest, ModelVariant,
 };
 
 const HISTORY_LIST_LIMIT: usize = 200;
@@ -1344,11 +1344,9 @@ mod tests {
         })
         .expect_err("expected mixed reference inputs to fail");
 
-        assert!(
-            err.message.contains(
-                "Use either `saved_voice_id` or direct `reference_audio`/`reference_text`"
-            )
-        );
+        assert!(err
+            .message
+            .contains("Use either `saved_voice_id` or direct `reference_audio`/`reference_text`"));
     }
 
     #[test]
@@ -1359,10 +1357,9 @@ mod tests {
         })
         .expect_err("expected incomplete reference inputs to fail");
 
-        assert!(
-            err.message
-                .contains("Provide both `reference_audio` and `reference_text` together.")
-        );
+        assert!(err
+            .message
+            .contains("Provide both `reference_audio` and `reference_text` together."));
     }
 
     #[test]
@@ -1433,10 +1430,9 @@ mod tests {
         )
         .expect_err("expected missing reference source to fail");
 
-        assert!(
-            err.message
-                .contains("Voice cloning requests require `saved_voice_id` or both")
-        );
+        assert!(err
+            .message
+            .contains("Voice cloning requests require `saved_voice_id` or both"));
     }
 
     #[test]
@@ -1448,9 +1444,43 @@ mod tests {
         )
         .expect_err("expected base model to require reference input");
 
-        assert!(
-            err.message
-                .contains("requires `saved_voice_id` or direct reference audio/text")
+        assert!(err
+            .message
+            .contains("requires `saved_voice_id` or direct reference audio/text"));
+    }
+
+    #[test]
+    fn text_to_speech_vibevoice_requires_reference_input() {
+        let err = normalize_for_model_capabilities(
+            SpeechRouteKind::TextToSpeech,
+            ModelVariant::VibeVoice15BTts,
+            base_request(),
+        )
+        .expect_err("expected VibeVoice to require reference input");
+
+        assert!(err
+            .message
+            .contains("requires `saved_voice_id` or direct reference audio/text"));
+    }
+
+    #[test]
+    fn generation_request_preserves_direct_reference_voice_fields() {
+        let mut req = base_request();
+        req.reference_audio = Some("UklGRg==".to_string());
+        req.reference_text = Some("reference words".to_string());
+
+        let generation = build_generation_request(
+            req,
+            "test-correlation".to_string(),
+            "target words".to_string(),
+            false,
+            ModelVariant::VibeVoice15BTts,
+        );
+
+        assert_eq!(generation.reference_audio.as_deref(), Some("UklGRg=="));
+        assert_eq!(
+            generation.reference_text.as_deref(),
+            Some("reference words")
         );
     }
 
@@ -1463,10 +1493,9 @@ mod tests {
         )
         .expect_err("expected voice-design model to require voice_description");
 
-        assert!(
-            err.message
-                .contains("requires `voice_description` on text-to-speech routes")
-        );
+        assert!(err
+            .message
+            .contains("requires `voice_description` on text-to-speech routes"));
     }
 
     #[test]
