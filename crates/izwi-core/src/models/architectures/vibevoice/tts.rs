@@ -3,13 +3,16 @@
 use std::path::{Path, PathBuf};
 
 use candle_core::{DType, IndexOp, Tensor};
-use tracing::{debug, info};
+use candle_nn::VarBuilder;
+use tracing::{debug, info, warn};
 
 use crate::backends::DeviceProfile;
 use crate::catalog::{ModelFamily, ModelVariant};
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::core::{Qwen3Cache, Qwen3Model, Qwen3WeightLayout};
-use crate::models::architectures::vibevoice::config::VibeVoiceConfig;
+use crate::models::architectures::vibevoice::config::{
+    VibeVoiceConfig, VibeVoicePreprocessorConfig,
+};
 use crate::models::architectures::vibevoice::connector::SpeechConnector;
 use crate::models::architectures::vibevoice::diffusion::{
     VibeVoiceDiffusionHead, VibeVoiceDiffusionScheduler,
@@ -74,8 +77,24 @@ pub struct VibeVoiceTtsOutput {
 
 struct EncodedReference {
     scaled_latents: Tensor,
-    scaling_factor: f32,
-    bias_factor: f32,
+    normalization: LatentNormalization,
+}
+
+struct LatentNormalization {
+    bias: Tensor,
+    scale: Tensor,
+    source: LatentNormalizationSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LatentNormalizationSource {
+    Checkpoint,
+    ReferenceStatistics,
+}
+
+struct CheckpointLatentNormalization {
+    bias: Tensor,
+    scale: Tensor,
 }
 
 pub struct VibeVoiceTtsModel {
@@ -83,6 +102,8 @@ pub struct VibeVoiceTtsModel {
     device: DeviceProfile,
     dtype: DType,
     config: VibeVoiceConfig,
+    preprocessor: VibeVoicePreprocessorConfig,
+    checkpoint_latent_normalization: Option<CheckpointLatentNormalization>,
     tokenizer: VibeVoicePromptTokenizer,
     acoustic_tokenizer: VibeVoiceAcousticTokenizer,
     acoustic_connector: SpeechConnector,
@@ -102,6 +123,14 @@ impl VibeVoiceTtsModel {
             return Err(Error::ModelLoadError(
                 "VibeVoice TTS loader received a non-TTS config".to_string(),
             ));
+        }
+        let preprocessor = VibeVoicePreprocessorConfig::load(model_dir)?;
+        if preprocessor.speech_tok_compress_ratio != config.acoustic_tokenizer_config.hop_length() {
+            warn!(
+                "VibeVoice preprocessor speech_tok_compress_ratio={} differs from acoustic tokenizer hop_length={}",
+                preprocessor.speech_tok_compress_ratio,
+                config.acoustic_tokenizer_config.hop_length()
+            );
         }
         let diffusion_config = config.diffusion_head_config.clone().ok_or_else(|| {
             Error::ModelLoadError("VibeVoice TTS config missing diffusion head".to_string())
@@ -134,17 +163,26 @@ impl VibeVoiceTtsModel {
         )?;
         let prediction_head =
             VibeVoiceDiffusionHead::load(diffusion_config, vb.pp("model.prediction_head"))?;
+        let checkpoint_latent_normalization =
+            load_checkpoint_latent_normalization(vb.pp("model"), config.acoustic_vae_dim())?;
         let language_model = Qwen3Model::load_with_layout(
             config.decoder_config.clone(),
             vb,
             Qwen3WeightLayout::VIBEVOICE,
         )?;
         let projection_diagnostics = language_model.projection_diagnostics();
+        let latent_normalization_source = if checkpoint_latent_normalization.is_some() {
+            "checkpoint"
+        } else {
+            "reference_statistics"
+        };
         info!(
-            "Loaded VibeVoice-1.5B TTS from {:?} on {:?} with dtype {:?} (dense_projections={}, dense_bias_projections={}, quantized_projections={})",
+            "Loaded VibeVoice-1.5B TTS from {:?} on {:?} with dtype {:?} (sample_rate={}, latent_normalization={}, dense_projections={}, dense_bias_projections={}, quantized_projections={})",
             model_dir,
             device.kind,
             dtype,
+            preprocessor.target_sample_rate(),
+            latent_normalization_source,
             projection_diagnostics.dense_projection_count,
             projection_diagnostics.dense_bias_projection_count,
             projection_diagnostics.quantized_projection_count
@@ -154,6 +192,8 @@ impl VibeVoiceTtsModel {
             device,
             dtype,
             config,
+            preprocessor,
+            checkpoint_latent_normalization,
             tokenizer,
             acoustic_tokenizer,
             acoustic_connector,
@@ -305,8 +345,8 @@ impl VibeVoiceTtsModel {
         let scaled_latents = Tensor::cat(&scaled_latents, 1)?;
         let unscaled = unscale_latents(
             &scaled_latents,
-            reference.bias_factor,
-            reference.scaling_factor,
+            &reference.normalization.bias,
+            &reference.normalization.scale,
         )?;
         let audio = self.acoustic_tokenizer.decode(&unscaled)?;
         let samples = audio
@@ -315,22 +355,24 @@ impl VibeVoiceTtsModel {
             .to_vec1::<f32>()?;
         Ok(VibeVoiceTtsOutput {
             samples,
-            sample_rate: TARGET_SAMPLE_RATE,
+            sample_rate: self.preprocessor.target_sample_rate(),
             frames_generated: scaled_latents.dim(1)?,
         })
     }
 
     fn encode_reference(&self, reference: &VibeVoiceSpeakerReference) -> Result<EncodedReference> {
-        let cleaned = crate::runtime::audio_io::preprocess_reference_audio(
+        let cleaned = preprocess_reference_audio(
             reference.audio_samples.clone(),
             reference.sample_rate,
+            &self.preprocessor,
         );
         if cleaned.is_empty() {
             return Err(Error::InvalidInput(
                 "VibeVoice TTS reference_audio contains no usable speech".to_string(),
             ));
         }
-        let resampled = resample_linear(&cleaned, reference.sample_rate, TARGET_SAMPLE_RATE)?;
+        let target_sample_rate = self.preprocessor.target_sample_rate();
+        let resampled = resample_linear(&cleaned, reference.sample_rate, target_sample_rate)?;
         let speech = Tensor::from_vec(
             resampled.clone(),
             (1, 1, resampled.len()),
@@ -338,14 +380,28 @@ impl VibeVoiceTtsModel {
         )?
         .to_dtype(self.dtype)?;
         let acoustic = self.acoustic_tokenizer.encode(&speech)?;
-        let latents = self.acoustic_tokenizer.sample(&acoustic)?;
-        let (bias_factor, scaling_factor) = latent_normalization(&latents)?;
-        let scaled_latents = scale_latents(&latents, bias_factor, scaling_factor)?;
+        let latents = acoustic.mode();
+        let normalization = self.latent_normalization(&latents)?;
+        let scaled_latents = scale_latents(&latents, &normalization.bias, &normalization.scale)?;
+        debug!(
+            "VibeVoice reference encoded with {:?} latent normalization",
+            normalization.source
+        );
         Ok(EncodedReference {
             scaled_latents,
-            scaling_factor,
-            bias_factor,
+            normalization,
         })
+    }
+
+    fn latent_normalization(&self, latents: &Tensor) -> Result<LatentNormalization> {
+        if let Some(checkpoint) = &self.checkpoint_latent_normalization {
+            return Ok(LatentNormalization {
+                bias: factor_like(&checkpoint.bias, latents)?,
+                scale: factor_like(&checkpoint.scale, latents)?,
+                source: LatentNormalizationSource::Checkpoint,
+            });
+        }
+        reference_latent_normalization(latents)
     }
 
     fn sample_speech_latent(
@@ -454,7 +510,50 @@ fn argmax_from_hidden(language_model: &Qwen3Model, hidden: &Tensor) -> Result<u3
         .ok_or_else(|| Error::InferenceError("VibeVoice TTS logits row was empty".to_string()))
 }
 
-fn latent_normalization(latents: &Tensor) -> Result<(f32, f32)> {
+fn load_checkpoint_latent_normalization(
+    vb: VarBuilder,
+    latent_dim: usize,
+) -> Result<Option<CheckpointLatentNormalization>> {
+    let has_bias = vb.contains_tensor("speech_bias_factor");
+    let has_scale = vb.contains_tensor("speech_scaling_factor");
+    if !has_bias && !has_scale {
+        return Ok(None);
+    }
+    if has_bias != has_scale {
+        return Err(Error::ModelLoadError(
+            "VibeVoice checkpoint must contain both speech_bias_factor and speech_scaling_factor"
+                .to_string(),
+        ));
+    }
+
+    let bias = vb.get_unchecked_dtype("speech_bias_factor", vb.dtype())?;
+    let scale = vb.get_unchecked_dtype("speech_scaling_factor", vb.dtype())?;
+    validate_latent_factor("speech_bias_factor", &bias, latent_dim)?;
+    validate_latent_factor("speech_scaling_factor", &scale, latent_dim)?;
+    Ok(Some(CheckpointLatentNormalization { bias, scale }))
+}
+
+fn validate_latent_factor(name: &str, factor: &Tensor, latent_dim: usize) -> Result<()> {
+    let count = factor.elem_count();
+    if count == 1 || count == latent_dim {
+        return Ok(());
+    }
+    Err(Error::ModelLoadError(format!(
+        "VibeVoice {name} has {} values, expected scalar or acoustic latent dim {latent_dim}",
+        count
+    )))
+}
+
+fn reference_latent_normalization(latents: &Tensor) -> Result<LatentNormalization> {
+    let (bias, scale) = latent_normalization_values(latents)?;
+    Ok(LatentNormalization {
+        bias: scalar_like(bias, latents)?,
+        scale: scalar_like(scale, latents)?,
+        source: LatentNormalizationSource::ReferenceStatistics,
+    })
+}
+
+fn latent_normalization_values(latents: &Tensor) -> Result<(f32, f32)> {
     let values = latents
         .to_dtype(DType::F32)?
         .flatten_all()?
@@ -477,17 +576,24 @@ fn latent_normalization(latents: &Tensor) -> Result<(f32, f32)> {
     Ok((-mean, 1.0 / std))
 }
 
-fn scale_latents(latents: &Tensor, bias_factor: f32, scaling_factor: f32) -> Result<Tensor> {
+fn scale_latents(latents: &Tensor, bias: &Tensor, scale: &Tensor) -> Result<Tensor> {
     latents
-        .broadcast_add(&scalar_like(bias_factor, latents)?)?
-        .broadcast_mul(&scalar_like(scaling_factor, latents)?)
+        .broadcast_add(&factor_like(bias, latents)?)?
+        .broadcast_mul(&factor_like(scale, latents)?)
         .map_err(Error::from)
 }
 
-fn unscale_latents(latents: &Tensor, bias_factor: f32, scaling_factor: f32) -> Result<Tensor> {
+fn unscale_latents(latents: &Tensor, bias: &Tensor, scale: &Tensor) -> Result<Tensor> {
     latents
-        .broadcast_div(&scalar_like(scaling_factor, latents)?)?
-        .broadcast_sub(&scalar_like(bias_factor, latents)?)
+        .broadcast_div(&factor_like(scale, latents)?)?
+        .broadcast_sub(&factor_like(bias, latents)?)
+        .map_err(Error::from)
+}
+
+fn factor_like(factor: &Tensor, like: &Tensor) -> Result<Tensor> {
+    factor
+        .to_device(like.device())?
+        .to_dtype(like.dtype())
         .map_err(Error::from)
 }
 
@@ -495,6 +601,107 @@ fn scalar_like(value: f32, like: &Tensor) -> Result<Tensor> {
     Tensor::new(value, like.device())?
         .to_dtype(like.dtype())
         .map_err(Error::from)
+}
+
+fn preprocess_reference_audio(
+    mut samples: Vec<f32>,
+    sample_rate: u32,
+    config: &VibeVoicePreprocessorConfig,
+) -> Vec<f32> {
+    if samples.is_empty() || sample_rate == 0 {
+        return Vec::new();
+    }
+
+    for sample in &mut samples {
+        if !sample.is_finite() {
+            *sample = 0.0;
+        }
+    }
+
+    let mean = samples.iter().copied().sum::<f32>() / samples.len() as f32;
+    for sample in &mut samples {
+        *sample -= mean;
+    }
+
+    let initial_peak = samples.iter().fold(0.0f32, |peak, &s| peak.max(s.abs()));
+    if initial_peak <= config.eps.max(1e-8) {
+        return Vec::new();
+    }
+
+    let silence_threshold = (initial_peak * 0.04).max(0.0025);
+    let first_idx = samples.iter().position(|s| s.abs() >= silence_threshold);
+    let last_idx = samples.iter().rposition(|s| s.abs() >= silence_threshold);
+    if let (Some(first), Some(last)) = (first_idx, last_idx) {
+        let margin = ((sample_rate as f32) * 0.12) as usize;
+        let start = first.saturating_sub(margin);
+        let end = (last + margin + 1).min(samples.len());
+        samples = samples[start..end].to_vec();
+    }
+
+    let max_len = sample_rate as usize * 12;
+    if max_len > 0 && samples.len() > max_len {
+        let start = highest_energy_window_start(&samples, max_len);
+        samples = samples[start..start + max_len].to_vec();
+    }
+
+    if config.normalize_audio {
+        normalize_reference_loudness(&mut samples, config.target_db_fs, config.eps);
+    }
+
+    samples
+}
+
+fn normalize_reference_loudness(samples: &mut [f32], target_db_fs: f32, eps: f32) {
+    if samples.is_empty() {
+        return;
+    }
+    let rms = (samples
+        .iter()
+        .map(|&sample| (sample as f64) * (sample as f64))
+        .sum::<f64>()
+        / samples.len() as f64)
+        .sqrt() as f32;
+    if rms <= eps.max(1e-8) {
+        return;
+    }
+    let target_rms = 10f32.powf(target_db_fs / 20.0);
+    let gain = target_rms / rms;
+    for sample in samples.iter_mut() {
+        *sample *= gain;
+    }
+
+    let peak = samples.iter().fold(0.0f32, |peak, &s| peak.max(s.abs()));
+    if peak > 0.99 {
+        let limit = 0.99 / peak;
+        for sample in samples.iter_mut() {
+            *sample *= limit;
+        }
+    }
+}
+
+fn highest_energy_window_start(samples: &[f32], window: usize) -> usize {
+    if samples.is_empty() || window == 0 || samples.len() <= window {
+        return 0;
+    }
+
+    let mut prefix = Vec::with_capacity(samples.len() + 1);
+    prefix.push(0.0f64);
+    for &sample in samples {
+        let energy = (sample as f64) * (sample as f64);
+        let next = prefix.last().copied().unwrap_or(0.0) + energy;
+        prefix.push(next);
+    }
+
+    let mut best_start = 0usize;
+    let mut best_energy = f64::NEG_INFINITY;
+    for start in 0..=(samples.len() - window) {
+        let energy = prefix[start + window] - prefix[start];
+        if energy > best_energy {
+            best_energy = energy;
+            best_start = start;
+        }
+    }
+    best_start
 }
 
 fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>> {
@@ -551,14 +758,64 @@ mod tests {
     fn latent_scaling_round_trips() {
         let device = candle_core::Device::Cpu;
         let latents = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (1, 2, 2), &device).unwrap();
-        let (bias, scale) = latent_normalization(&latents).unwrap();
-        let scaled = scale_latents(&latents, bias, scale).unwrap();
-        let unscaled = unscale_latents(&scaled, bias, scale).unwrap();
+        let normalization = reference_latent_normalization(&latents).unwrap();
+        let scaled = scale_latents(&latents, &normalization.bias, &normalization.scale).unwrap();
+        let unscaled = unscale_latents(&scaled, &normalization.bias, &normalization.scale).unwrap();
         let values = unscaled.flatten_all().unwrap().to_vec1::<f32>().unwrap();
 
         for (actual, expected) in values.iter().zip([1.0f32, 2.0, 3.0, 4.0]) {
             assert!((actual - expected).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn checkpoint_latent_scaling_round_trips_vector_factors() {
+        let device = candle_core::Device::Cpu;
+        let latents = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (1, 2, 2), &device).unwrap();
+        let bias = Tensor::from_vec(vec![0.5f32, -1.0], (2,), &device).unwrap();
+        let scale = Tensor::from_vec(vec![2.0f32, 4.0], (2,), &device).unwrap();
+        let scaled = scale_latents(&latents, &bias, &scale).unwrap();
+        let unscaled = unscale_latents(&scaled, &bias, &scale).unwrap();
+        let values = unscaled.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        for (actual, expected) in values.iter().zip([1.0f32, 2.0, 3.0, 4.0]) {
+            assert!((actual - expected).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn latent_factor_validation_accepts_scalar_or_latent_dim_only() {
+        let device = candle_core::Device::Cpu;
+        let scalar = Tensor::new(0.5f32, &device).unwrap();
+        let vector = Tensor::zeros((64,), DType::F32, &device).unwrap();
+        let wrong = Tensor::zeros((63,), DType::F32, &device).unwrap();
+
+        validate_latent_factor("factor", &scalar, 64).unwrap();
+        validate_latent_factor("factor", &vector, 64).unwrap();
+        assert!(validate_latent_factor("factor", &wrong, 64).is_err());
+    }
+
+    #[test]
+    fn reference_preprocessing_normalizes_to_configured_loudness() {
+        let config = VibeVoicePreprocessorConfig {
+            target_db_fs: -20.0,
+            ..VibeVoicePreprocessorConfig::default()
+        };
+        let processed = preprocess_reference_audio(
+            (0..24_000)
+                .map(|idx| if idx % 2 == 0 { 0.2 } else { -0.2 })
+                .collect(),
+            24_000,
+            &config,
+        );
+        let rms = (processed
+            .iter()
+            .map(|&sample| (sample as f64) * (sample as f64))
+            .sum::<f64>()
+            / processed.len() as f64)
+            .sqrt() as f32;
+
+        assert!((rms - 0.1).abs() < 1e-4);
     }
 
     #[test]
