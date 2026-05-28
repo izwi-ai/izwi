@@ -28,6 +28,8 @@ pub struct RuntimeBackendResponse {
     pub dtype_policy: DTypePolicyResponse,
     pub fused_attention: FusedAttentionResponse,
     pub cuda_runtime: CudaRuntimeResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loaded_tts_model: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -81,6 +83,7 @@ pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse>
     let device = context.device.clone();
     let dtype_selection = device.resolve_dtype(DTypeSelectionRequest::new(None));
     let cuda_runtime = CudaRuntimeDiagnostics::detect(&current_server_binary_name());
+    let loaded_tts_model = state.runtime.loaded_tts_model_diagnostics().await;
 
     Json(HealthResponse {
         status: "ok",
@@ -119,6 +122,7 @@ pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse>
                 requested: flash_attention_requested(),
             },
             cuda_runtime: CudaRuntimeResponse::from(cuda_runtime),
+            loaded_tts_model,
         },
     })
 }
@@ -181,5 +185,64 @@ mod tests {
                 .and_then(|entry| entry.as_bool()),
             Some(true)
         );
+    }
+
+    #[test]
+    fn runtime_backend_health_serializes_loaded_tts_model_diagnostics() {
+        let response = RuntimeBackendResponse {
+            requested_backend: "cuda".to_string(),
+            requested_backend_available: true,
+            selected_backend: "cuda".to_string(),
+            selection_source: "cli".to_string(),
+            selection_reason: "requested".to_string(),
+            compiled_backends: CompiledBackendsResponse {
+                cpu: true,
+                metal: false,
+                cuda: true,
+            },
+            detected_device: DetectedDeviceResponse {
+                kind: "cuda".to_string(),
+                supports_bf16: true,
+                supports_f16: true,
+                supports_int8_tensor_cores: false,
+                has_unified_memory: false,
+                recommended_batch_size: 1,
+                available_memory_bytes: None,
+                cuda_compute_capability: Some("8.9".to_string()),
+                cuda_device_name: Some("CUDA Device".to_string()),
+            },
+            dtype_policy: DTypePolicyResponse {
+                selected_dtype: "bf16".to_string(),
+                reason: "policy".to_string(),
+            },
+            fused_attention: FusedAttentionResponse {
+                cuda_flash_attention_compiled: true,
+                requested: true,
+            },
+            cuda_runtime: CudaRuntimeResponse {
+                current_binary_cuda_compiled: true,
+                private_runtime_active: false,
+                private_runtime_packaged: false,
+                runtime_libraries_available: true,
+                missing_runtime_libraries: Vec::new(),
+                driver_available: true,
+                device_usable: Some(true),
+                notes: Vec::new(),
+            },
+            loaded_tts_model: Some(serde_json::json!({
+                "model_family": "vibevoice_tts",
+                "device_kind": "Cuda",
+                "dtype": "BF16"
+            })),
+        };
+
+        let value =
+            serde_json::to_value(response).expect("serialize runtime backend health response");
+        assert_eq!(
+            value["loaded_tts_model"]["model_family"],
+            serde_json::json!("vibevoice_tts")
+        );
+        assert_eq!(value["loaded_tts_model"]["device_kind"], "Cuda");
+        assert_eq!(value["loaded_tts_model"]["dtype"], "BF16");
     }
 }

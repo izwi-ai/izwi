@@ -962,6 +962,14 @@ mod tests {
             cuda_profile.select_model_dtype(ModelFamily::VoxtralTts, None),
             DType::BF16
         );
+        assert_eq!(
+            cuda_profile.select_model_dtype(ModelFamily::VibeVoiceTts, None),
+            DType::BF16
+        );
+        assert_eq!(
+            cuda_profile.select_model_dtype(ModelFamily::VibeVoiceAsr, None),
+            DType::BF16
+        );
     }
 
     #[test]
@@ -1124,6 +1132,77 @@ mod tests {
             metal_profile
                 .select_model_dtype_checked(ModelFamily::WhisperAsr, Some("bf16"), "Whisper")
                 .unwrap(),
+            DType::F32
+        );
+    }
+
+    #[test]
+    fn cpu_and_metal_vibevoice_model_dtype_stays_f32() {
+        let cpu_profile = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Cpu,
+            capabilities: DeviceCapabilities::default(),
+            memory_pool: None,
+        };
+        let metal_profile = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Metal,
+            capabilities: DeviceCapabilities {
+                prefers_f32: true,
+                supports_f16: true,
+                supports_bf16: true,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+
+        for family in [ModelFamily::VibeVoiceTts, ModelFamily::VibeVoiceAsr] {
+            assert_eq!(cpu_profile.select_model_dtype(family, None), DType::F32);
+            assert_eq!(
+                cpu_profile
+                    .select_model_dtype_checked(family, Some("bf16"), "VibeVoice")
+                    .unwrap(),
+                DType::F32
+            );
+            assert_eq!(metal_profile.select_model_dtype(family, None), DType::F32);
+            assert_eq!(
+                metal_profile
+                    .select_model_dtype_checked(family, Some("f16"), "VibeVoice")
+                    .unwrap(),
+                DType::F32
+            );
+        }
+    }
+
+    #[test]
+    fn cuda_vibevoice_dtype_falls_back_by_capability() {
+        let cuda_f16_profile = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Cuda,
+            capabilities: DeviceCapabilities {
+                supports_bf16: false,
+                supports_f16: true,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+        let cuda_f32_profile = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Cuda,
+            capabilities: DeviceCapabilities {
+                supports_bf16: false,
+                supports_f16: false,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+
+        assert_eq!(
+            cuda_f16_profile.select_model_dtype(ModelFamily::VibeVoiceTts, None),
+            DType::F16
+        );
+        assert_eq!(
+            cuda_f32_profile.select_model_dtype(ModelFamily::VibeVoiceTts, None),
             DType::F32
         );
     }

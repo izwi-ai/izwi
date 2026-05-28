@@ -25,6 +25,7 @@ struct RuntimeBackendStatus {
     dtype_policy: Option<DTypePolicyStatus>,
     fused_attention: Option<FusedAttentionStatus>,
     cuda_runtime: Option<CudaRuntimeStatus>,
+    loaded_tts_model: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -285,6 +286,9 @@ async fn show_status(server: &str, detailed: bool) -> Result<()> {
                     println!("  DType why: {}", reason);
                 }
             }
+            if let Some(model) = runtime.loaded_tts_model.as_ref() {
+                println!("  TTS model: {}", format_loaded_tts_model(model));
+            }
             if let Some(fused) = runtime.fused_attention.as_ref() {
                 println!(
                     "  FlashAttn: compiled={} requested={}",
@@ -354,6 +358,22 @@ fn model_cuda_quant_level(model: &serde_json::Value) -> &str {
         .and_then(|value| value.get("level"))
         .and_then(|value| value.as_str())
         .unwrap_or("unknown")
+}
+
+fn format_loaded_tts_model(model: &serde_json::Value) -> String {
+    let family = model
+        .get("model_family")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let device = model
+        .get("device_kind")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let dtype = model
+        .get("dtype")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    format!("{family} on {device} ({dtype})")
 }
 
 fn yes_no(value: bool) -> &'static str {
