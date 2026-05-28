@@ -21,7 +21,9 @@ use crate::models::architectures::vibevoice::diffusion::{
     VibeVoiceDiffusionHead, VibeVoiceDiffusionScheduler,
 };
 use crate::models::architectures::vibevoice::prompt::VibeVoicePromptTokenizer;
-use crate::models::architectures::vibevoice::tokenizer::VibeVoiceAcousticTokenizer;
+use crate::models::architectures::vibevoice::tokenizer::{
+    VibeVoiceAcousticTokenizer, VibeVoiceSemanticTokenizer,
+};
 use crate::models::shared::attention::paged::{KvCacheQuantization, default_kv_page_size};
 use crate::models::shared::weights::gguf::load_model_weights;
 
@@ -123,7 +125,9 @@ pub struct VibeVoiceTtsModel {
     checkpoint_latent_normalization: Option<CheckpointLatentNormalization>,
     tokenizer: VibeVoicePromptTokenizer,
     acoustic_tokenizer: VibeVoiceAcousticTokenizer,
+    semantic_tokenizer: VibeVoiceSemanticTokenizer,
     acoustic_connector: SpeechConnector,
+    semantic_connector: SpeechConnector,
     language_model: Qwen3Model,
     prediction_head: VibeVoiceDiffusionHead,
 }
@@ -173,10 +177,19 @@ impl VibeVoiceTtsModel {
             &config.acoustic_tokenizer_config,
             vb.pp("model.acoustic_tokenizer"),
         )?;
+        let semantic_tokenizer = VibeVoiceSemanticTokenizer::load(
+            &config.semantic_tokenizer_config,
+            vb.pp("model.semantic_tokenizer"),
+        )?;
         let acoustic_connector = SpeechConnector::load(
             config.acoustic_vae_dim(),
             config.decoder_config.hidden_size,
             vb.pp("model.acoustic_connector"),
+        )?;
+        let semantic_connector = SpeechConnector::load(
+            config.semantic_vae_dim(),
+            config.decoder_config.hidden_size,
+            vb.pp("model.semantic_connector"),
         )?;
         let prediction_head =
             VibeVoiceDiffusionHead::load(diffusion_config, vb.pp("model.prediction_head"))?;
@@ -213,7 +226,9 @@ impl VibeVoiceTtsModel {
             checkpoint_latent_normalization,
             tokenizer,
             acoustic_tokenizer,
+            semantic_tokenizer,
             acoustic_connector,
+            semantic_connector,
             language_model,
             prediction_head,
         })
@@ -346,11 +361,12 @@ impl VibeVoiceTtsModel {
                 &scheduler,
             )?;
             let latent_frame = latent.unsqueeze(1)?;
-            let acoustic_embed = self.acoustic_connector.forward(&latent_frame)?;
+            let generated_embed =
+                self.generated_speech_embed(&latent_frame, &reference.normalization)?;
             scaled_latents.push(latent_frame);
 
             let hidden = self.language_model.forward_hidden_with_embeds(
-                &acoustic_embed,
+                &generated_embed,
                 pos,
                 Some(&mut cache),
                 None,
@@ -359,7 +375,7 @@ impl VibeVoiceTtsModel {
             last_hidden = last_sequence_hidden(&hidden, "VibeVoice TTS generated frame")?;
 
             let negative_hidden = self.language_model.forward_hidden_with_embeds(
-                &acoustic_embed,
+                &generated_embed,
                 negative_pos,
                 Some(&mut negative_cache),
                 None,
@@ -440,6 +456,27 @@ impl VibeVoiceTtsModel {
             });
         }
         reference_latent_normalization(latents)
+    }
+
+    fn generated_speech_embed(
+        &self,
+        scaled_latent_frame: &Tensor,
+        normalization: &LatentNormalization,
+    ) -> Result<Tensor> {
+        let acoustic_embed = self.acoustic_connector.forward(scaled_latent_frame)?;
+        let unscaled_frame = unscale_latents(
+            scaled_latent_frame,
+            &normalization.bias,
+            &normalization.scale,
+        )?;
+        let audio_chunk = self.acoustic_tokenizer.decode(&unscaled_frame)?;
+        let semantic = self.semantic_tokenizer.encode(&audio_chunk)?.mode();
+        let semantic_embed = self.semantic_connector.forward(&semantic)?;
+        combine_speech_embeddings(
+            &acoustic_embed,
+            &semantic_embed,
+            "VibeVoice TTS generated frame",
+        )
     }
 
     fn build_decode_cache(&self, max_tokens: usize) -> Qwen3Cache {
@@ -554,6 +591,21 @@ fn replace_range_with_features(
         parts.push(embeds.narrow(1, range.end, seq_len - range.end)?);
     }
     Tensor::cat(&parts, 1).map_err(Error::from)
+}
+
+fn combine_speech_embeddings(
+    acoustic: &Tensor,
+    semantic: &Tensor,
+    context: &str,
+) -> Result<Tensor> {
+    if acoustic.dims() != semantic.dims() {
+        return Err(Error::InferenceError(format!(
+            "{context} acoustic/semantic feature shape mismatch: {:?} vs {:?}",
+            acoustic.dims(),
+            semantic.dims()
+        )));
+    }
+    acoustic.broadcast_add(semantic).map_err(Error::from)
 }
 
 fn last_sequence_hidden(hidden: &Tensor, context: &str) -> Result<Tensor> {
@@ -887,6 +939,31 @@ mod tests {
         for (actual, expected) in values.iter().zip([1.0f32, 2.0, 3.0, 4.0]) {
             assert!((actual - expected).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn speech_embedding_feedback_adds_acoustic_and_semantic_features() {
+        let device = candle_core::Device::Cpu;
+        let acoustic = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (1, 2, 2), &device).unwrap();
+        let semantic = Tensor::from_vec(vec![0.5f32, -1.0, 2.0, -0.5], (1, 2, 2), &device).unwrap();
+        let combined = combine_speech_embeddings(&acoustic, &semantic, "test feedback").unwrap();
+
+        assert_eq!(
+            combined.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![1.5, 1.0, 5.0, 3.5]
+        );
+    }
+
+    #[test]
+    fn speech_embedding_feedback_rejects_shape_mismatch() {
+        let device = candle_core::Device::Cpu;
+        let acoustic = Tensor::zeros((1, 1, 2), DType::F32, &device).unwrap();
+        let semantic = Tensor::zeros((1, 2, 2), DType::F32, &device).unwrap();
+
+        let err = combine_speech_embeddings(&acoustic, &semantic, "test feedback")
+            .expect_err("shape mismatch");
+
+        assert!(format!("{err}").contains("shape mismatch"));
     }
 
     #[test]
