@@ -324,7 +324,7 @@ impl VibeVoiceTtsModel {
         let mut last_hidden = last_sequence_hidden(&prefill_hidden, "VibeVoice TTS prefill")?;
 
         let mut negative_cache = self.build_decode_cache(1usize.saturating_add(max_frames));
-        let negative_id = self.tokenizer.specials().image_pad;
+        let negative_id = vibevoice_tts_negative_prefill_token(self.tokenizer.specials());
         let negative_ids = Tensor::from_vec(vec![negative_id], (1, 1), &self.device.device)?;
         let negative_hidden = self.language_model.forward_hidden_with_embeds(
             &self.language_model.embeddings(&negative_ids)?,
@@ -567,6 +567,12 @@ fn cap_vibevoice_dense_decode_tokens(max_tokens: usize, qwen_budget: usize) -> u
     } else {
         max_tokens.max(1).min(qwen_budget)
     }
+}
+
+fn vibevoice_tts_negative_prefill_token(
+    specials: &crate::models::architectures::vibevoice::prompt::VibeVoiceSpecialTokens,
+) -> u32 {
+    specials.speech_start
 }
 
 fn replace_range_with_features(
@@ -925,6 +931,17 @@ mod tests {
         assert_eq!(cap_vibevoice_dense_decode_tokens(32, 128), 32);
         assert_eq!(cap_vibevoice_dense_decode_tokens(4096, 128), 128);
         assert_eq!(cap_vibevoice_dense_decode_tokens(128, 0), 0);
+    }
+
+    #[test]
+    fn negative_cfg_prefill_uses_speech_start_like_reference_generation() {
+        let specials = crate::models::architectures::vibevoice::prompt::VibeVoiceSpecialTokens {
+            speech_start: 11,
+            image_pad: 22,
+            ..Default::default()
+        };
+
+        assert_eq!(vibevoice_tts_negative_prefill_token(&specials), 11);
     }
 
     #[test]
