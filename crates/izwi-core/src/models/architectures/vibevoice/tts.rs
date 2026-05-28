@@ -703,24 +703,24 @@ fn next_tts_control_token_from_hidden(
     hidden: &Tensor,
     specials: &VibeVoiceSpecialTokens,
 ) -> Result<u32> {
-    let logits = language_model.logits_from_hidden(&hidden.unsqueeze(1)?)?;
-    let row = logits.i((0, 0))?.to_dtype(DType::F32)?;
-    let values = row.to_vec1::<f32>()?;
-    select_next_tts_control_token(&values, specials)
+    let scores =
+        language_model.logits_from_hidden_for_tokens(hidden, &tts_control_tokens(specials))?;
+    select_next_tts_control_token(&scores)
 }
 
-fn select_next_tts_control_token(logits: &[f32], specials: &VibeVoiceSpecialTokens) -> Result<u32> {
+fn tts_control_tokens(specials: &VibeVoiceSpecialTokens) -> [u32; 3] {
     [specials.speech_pad, specials.speech_end, specials.endoftext]
-        .into_iter()
-        .filter_map(|token| {
-            logits
-                .get(token as usize)
-                .copied()
-                .map(|score| (token, score))
-        })
+}
+
+fn select_next_tts_control_token(token_scores: &[(u32, f32)]) -> Result<u32> {
+    token_scores
+        .iter()
+        .copied()
         .max_by(|(_, left), (_, right)| left.total_cmp(right))
         .map(|(token, _)| token)
-        .ok_or_else(|| Error::InferenceError("VibeVoice TTS logits row was empty".to_string()))
+        .ok_or_else(|| {
+            Error::InferenceError("VibeVoice TTS control-token scores were empty".to_string())
+        })
 }
 
 fn load_checkpoint_latent_normalization(
@@ -1034,41 +1034,17 @@ mod tests {
 
     #[test]
     fn tts_control_token_selection_ignores_non_speech_vocab_logits() {
-        let specials = crate::models::architectures::vibevoice::prompt::VibeVoiceSpecialTokens {
-            endoftext: 1,
-            speech_end: 2,
-            speech_pad: 3,
-            image_pad: 4,
-            ..Default::default()
-        };
-        let mut logits = vec![0.0f32; 5];
-        logits[0] = 100.0;
-        logits[specials.speech_pad as usize] = 2.0;
-        logits[specials.speech_end as usize] = 1.0;
-        logits[specials.endoftext as usize] = 0.5;
-
         assert_eq!(
-            select_next_tts_control_token(&logits, &specials).unwrap(),
-            specials.speech_pad
+            select_next_tts_control_token(&[(3, 2.0), (2, 1.0), (1, 0.5)]).unwrap(),
+            3
         );
     }
 
     #[test]
     fn tts_control_token_selection_can_choose_speech_end() {
-        let specials = crate::models::architectures::vibevoice::prompt::VibeVoiceSpecialTokens {
-            endoftext: 1,
-            speech_end: 2,
-            speech_pad: 3,
-            image_pad: 4,
-            ..Default::default()
-        };
-        let mut logits = vec![0.0f32; 5];
-        logits[specials.speech_pad as usize] = 2.0;
-        logits[specials.speech_end as usize] = 3.0;
-
         assert_eq!(
-            select_next_tts_control_token(&logits, &specials).unwrap(),
-            specials.speech_end
+            select_next_tts_control_token(&[(3, 2.0), (2, 3.0), (1, 0.5)]).unwrap(),
+            2
         );
     }
 
