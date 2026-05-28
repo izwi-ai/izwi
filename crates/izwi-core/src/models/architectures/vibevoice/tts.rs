@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 
 use candle_core::{DType, IndexOp, Tensor};
 use candle_nn::VarBuilder;
+use serde::Serialize;
 use tracing::{debug, info, warn};
 
-use crate::backends::DeviceProfile;
+use crate::backends::{DeviceKind, DeviceProfile};
 use crate::catalog::{ModelFamily, ModelVariant};
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::core::{Qwen3Cache, Qwen3Model, Qwen3WeightLayout};
@@ -19,6 +20,7 @@ use crate::models::architectures::vibevoice::diffusion::{
 };
 use crate::models::architectures::vibevoice::prompt::VibeVoicePromptTokenizer;
 use crate::models::architectures::vibevoice::tokenizer::VibeVoiceAcousticTokenizer;
+use crate::models::shared::attention::paged::{default_kv_page_size, KvCacheQuantization};
 use crate::models::shared::weights::gguf::load_model_weights;
 
 const TARGET_SAMPLE_RATE: u32 = 24_000;
@@ -73,6 +75,19 @@ pub struct VibeVoiceTtsOutput {
     pub samples: Vec<f32>,
     pub sample_rate: u32,
     pub frames_generated: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VibeVoiceTtsDiagnostics {
+    pub model_family: &'static str,
+    pub device_kind: String,
+    pub dtype: String,
+    pub sample_rate: u32,
+    pub latent_normalization: &'static str,
+    pub dense_decode_supported: bool,
+    pub dense_projection_count: usize,
+    pub dense_bias_projection_count: usize,
+    pub quantized_projection_count: usize,
 }
 
 struct EncodedReference {
@@ -213,6 +228,25 @@ impl VibeVoiceTtsModel {
         Vec::new()
     }
 
+    pub fn diagnostics(&self) -> VibeVoiceTtsDiagnostics {
+        let projection_diagnostics = self.language_model.projection_diagnostics();
+        VibeVoiceTtsDiagnostics {
+            model_family: "vibevoice_tts",
+            device_kind: format!("{:?}", self.device.kind),
+            dtype: format!("{:?}", self.dtype),
+            sample_rate: self.preprocessor.target_sample_rate(),
+            latent_normalization: if self.checkpoint_latent_normalization.is_some() {
+                "checkpoint"
+            } else {
+                "reference_statistics"
+            },
+            dense_decode_supported: vibevoice_dense_decode_enabled_for_kind(self.device.kind),
+            dense_projection_count: projection_diagnostics.dense_projection_count,
+            dense_bias_projection_count: projection_diagnostics.dense_bias_projection_count,
+            quantized_projection_count: projection_diagnostics.quantized_projection_count,
+        }
+    }
+
     pub fn generate_with_reference(
         &self,
         text: &str,
@@ -259,7 +293,8 @@ impl VibeVoiceTtsModel {
             input_embeds
         };
 
-        let mut cache = Qwen3Cache::new(self.language_model.num_layers());
+        let max_frames = params.max_frames.max(1);
+        let mut cache = self.build_decode_cache(prompt.input_ids.len().saturating_add(max_frames));
         let prefill_hidden = self.language_model.forward_hidden_with_embeds(
             &input_embeds,
             0,
@@ -269,7 +304,7 @@ impl VibeVoiceTtsModel {
         let mut pos = prompt.input_ids.len();
         let mut last_hidden = last_sequence_hidden(&prefill_hidden, "VibeVoice TTS prefill")?;
 
-        let mut negative_cache = Qwen3Cache::new(self.language_model.num_layers());
+        let mut negative_cache = self.build_decode_cache(1usize.saturating_add(max_frames));
         let negative_id = self.tokenizer.specials().image_pad;
         let negative_ids = Tensor::from_vec(vec![negative_id], (1, 1), &self.device.device)?;
         let negative_hidden = self.language_model.forward_hidden_with_embeds(
@@ -282,7 +317,6 @@ impl VibeVoiceTtsModel {
         let mut negative_last_hidden =
             last_sequence_hidden(&negative_hidden, "VibeVoice TTS negative prefill")?;
 
-        let max_frames = params.max_frames.max(1);
         let scheduler = VibeVoiceDiffusionScheduler::new(
             self.prediction_head.config().ddpm_num_steps,
             params.diffusion_steps,
@@ -404,6 +438,15 @@ impl VibeVoiceTtsModel {
         reference_latent_normalization(latents)
     }
 
+    fn build_decode_cache(&self, max_tokens: usize) -> Qwen3Cache {
+        Qwen3Cache::with_page_size_quantization_and_dense_decode_tokens(
+            self.language_model.num_layers(),
+            default_kv_page_size(),
+            KvCacheQuantization::None,
+            vibevoice_dense_decode_max_tokens_for_kind(self.device.kind, max_tokens),
+        )
+    }
+
     fn sample_speech_latent(
         &self,
         condition: &Tensor,
@@ -459,6 +502,18 @@ pub fn vibevoice_tts_auto_max_frames_for_text(text: &str) -> usize {
     let estimated_frames =
         (estimated_secs * ModelVariant::VIBEVOICE_TTS_FRAME_RATE_HZ).ceil() as usize;
     estimated_frames.clamp(AUTO_MIN_OUTPUT_FRAMES, AUTO_MAX_OUTPUT_FRAMES)
+}
+
+fn vibevoice_dense_decode_enabled_for_kind(kind: DeviceKind) -> bool {
+    matches!(kind, DeviceKind::Metal | DeviceKind::Cuda)
+}
+
+fn vibevoice_dense_decode_max_tokens_for_kind(kind: DeviceKind, max_tokens: usize) -> usize {
+    if vibevoice_dense_decode_enabled_for_kind(kind) {
+        max_tokens.max(1)
+    } else {
+        0
+    }
 }
 
 fn replace_range_with_features(
@@ -752,6 +807,22 @@ mod tests {
         assert!(params.auto_frame_budget);
         assert_eq!(params.diffusion_steps, 20);
         assert_eq!(params.cfg_scale, DEFAULT_CFG_SCALE);
+    }
+
+    #[test]
+    fn decode_cache_policy_enables_dense_decode_only_on_accelerators() {
+        assert_eq!(
+            vibevoice_dense_decode_max_tokens_for_kind(DeviceKind::Cpu, 128),
+            0
+        );
+        assert_eq!(
+            vibevoice_dense_decode_max_tokens_for_kind(DeviceKind::Metal, 128),
+            128
+        );
+        assert_eq!(
+            vibevoice_dense_decode_max_tokens_for_kind(DeviceKind::Cuda, 128),
+            128
+        );
     }
 
     #[test]
