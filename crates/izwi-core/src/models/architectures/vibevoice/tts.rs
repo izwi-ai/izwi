@@ -461,25 +461,27 @@ impl VibeVoiceTtsModel {
             &self.device.device,
         )?
         .to_dtype(self.dtype)?;
-        let timesteps = scheduler.timesteps();
-        for (idx, &timestep) in timesteps.iter().enumerate() {
-            let timestep_tensor =
-                Tensor::from_vec(vec![timestep as f32], (1,), &self.device.device)?
-                    .to_dtype(self.dtype)?;
+        let steps = scheduler.step_tensors(&self.device.device, self.dtype)?;
+        let cfg_tensor = if cfg_scale > 1.0 {
+            Some(scalar_like(cfg_scale, &speech)?)
+        } else {
+            None
+        };
+        for step in &steps {
             let mut model_output =
                 self.prediction_head
-                    .forward(&speech, &timestep_tensor, condition)?;
-            if let Some(negative_condition) = negative_condition.filter(|_| cfg_scale > 1.0) {
-                let negative_output =
-                    self.prediction_head
-                        .forward(&speech, &timestep_tensor, negative_condition)?;
+                    .forward(&speech, &step.timestep_tensor, condition)?;
+            if let (Some(negative_condition), Some(cfg)) = (negative_condition, cfg_tensor.as_ref())
+            {
+                let negative_output = self.prediction_head.forward(
+                    &speech,
+                    &step.timestep_tensor,
+                    negative_condition,
+                )?;
                 let guidance = model_output.broadcast_sub(&negative_output)?;
-                let cfg = scalar_like(cfg_scale, &speech)?;
                 model_output = negative_output.broadcast_add(&guidance.broadcast_mul(&cfg)?)?;
             }
-            let prev_timestep = timesteps.get(idx + 1).copied();
-            speech =
-                scheduler.step_v_prediction(&model_output, timestep, prev_timestep, &speech)?;
+            speech = scheduler.step_v_prediction_with_tensors(&model_output, &speech, step)?;
         }
         Ok(speech)
     }
