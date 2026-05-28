@@ -20,7 +20,9 @@ use crate::models::architectures::vibevoice::connector::SpeechConnector;
 use crate::models::architectures::vibevoice::diffusion::{
     VibeVoiceDiffusionHead, VibeVoiceDiffusionScheduler,
 };
-use crate::models::architectures::vibevoice::prompt::VibeVoicePromptTokenizer;
+use crate::models::architectures::vibevoice::prompt::{
+    VibeVoicePromptTokenizer, VibeVoiceSpecialTokens,
+};
 use crate::models::architectures::vibevoice::tokenizer::{
     VibeVoiceAcousticTokenizer, VibeVoiceSemanticTokenizer,
 };
@@ -343,7 +345,11 @@ impl VibeVoiceTtsModel {
         let mut scaled_latents = Vec::with_capacity(max_frames);
         for frame_idx in 0..max_frames {
             if frame_idx >= MIN_FRAMES_BEFORE_STOP {
-                let predicted_id = argmax_from_hidden(&self.language_model, &last_hidden)?;
+                let predicted_id = next_tts_control_token_from_hidden(
+                    &self.language_model,
+                    &last_hidden,
+                    self.tokenizer.specials(),
+                )?;
                 if predicted_id == self.tokenizer.specials().speech_end
                     || predicted_id == self.tokenizer.specials().endoftext
                 {
@@ -569,9 +575,7 @@ fn cap_vibevoice_dense_decode_tokens(max_tokens: usize, qwen_budget: usize) -> u
     }
 }
 
-fn vibevoice_tts_negative_prefill_token(
-    specials: &crate::models::architectures::vibevoice::prompt::VibeVoiceSpecialTokens,
-) -> u32 {
+fn vibevoice_tts_negative_prefill_token(specials: &VibeVoiceSpecialTokens) -> u32 {
     specials.speech_start
 }
 
@@ -627,15 +631,28 @@ fn last_sequence_hidden(hidden: &Tensor, context: &str) -> Result<Tensor> {
         .map_err(Error::from)
 }
 
-fn argmax_from_hidden(language_model: &Qwen3Model, hidden: &Tensor) -> Result<u32> {
+fn next_tts_control_token_from_hidden(
+    language_model: &Qwen3Model,
+    hidden: &Tensor,
+    specials: &VibeVoiceSpecialTokens,
+) -> Result<u32> {
     let logits = language_model.logits_from_hidden(&hidden.unsqueeze(1)?)?;
     let row = logits.i((0, 0))?.to_dtype(DType::F32)?;
     let values = row.to_vec1::<f32>()?;
-    values
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))
-        .map(|(idx, _)| idx as u32)
+    select_next_tts_control_token(&values, specials)
+}
+
+fn select_next_tts_control_token(logits: &[f32], specials: &VibeVoiceSpecialTokens) -> Result<u32> {
+    [specials.speech_pad, specials.speech_end, specials.endoftext]
+        .into_iter()
+        .filter_map(|token| {
+            logits
+                .get(token as usize)
+                .copied()
+                .map(|score| (token, score))
+        })
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(token, _)| token)
         .ok_or_else(|| Error::InferenceError("VibeVoice TTS logits row was empty".to_string()))
 }
 
@@ -942,6 +959,46 @@ mod tests {
         };
 
         assert_eq!(vibevoice_tts_negative_prefill_token(&specials), 11);
+    }
+
+    #[test]
+    fn tts_control_token_selection_ignores_non_speech_vocab_logits() {
+        let specials = crate::models::architectures::vibevoice::prompt::VibeVoiceSpecialTokens {
+            endoftext: 1,
+            speech_end: 2,
+            speech_pad: 3,
+            image_pad: 4,
+            ..Default::default()
+        };
+        let mut logits = vec![0.0f32; 5];
+        logits[0] = 100.0;
+        logits[specials.speech_pad as usize] = 2.0;
+        logits[specials.speech_end as usize] = 1.0;
+        logits[specials.endoftext as usize] = 0.5;
+
+        assert_eq!(
+            select_next_tts_control_token(&logits, &specials).unwrap(),
+            specials.speech_pad
+        );
+    }
+
+    #[test]
+    fn tts_control_token_selection_can_choose_speech_end() {
+        let specials = crate::models::architectures::vibevoice::prompt::VibeVoiceSpecialTokens {
+            endoftext: 1,
+            speech_end: 2,
+            speech_pad: 3,
+            image_pad: 4,
+            ..Default::default()
+        };
+        let mut logits = vec![0.0f32; 5];
+        logits[specials.speech_pad as usize] = 2.0;
+        logits[specials.speech_end as usize] = 3.0;
+
+        assert_eq!(
+            select_next_tts_control_token(&logits, &specials).unwrap(),
+            specials.speech_end
+        );
     }
 
     #[test]
