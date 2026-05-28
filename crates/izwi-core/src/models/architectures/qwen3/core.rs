@@ -4,8 +4,8 @@
 //! (used for audio-conditioned ASR).
 
 use candle_core::quantized::QMatMul;
-use candle_core::{DType, Device, Module, Tensor, D};
-use candle_nn::{ops, rotary_emb, Embedding, Linear, RmsNorm, VarBuilder};
+use candle_core::{D, DType, Device, Module, Tensor};
+use candle_nn::{Embedding, Linear, RmsNorm, VarBuilder, ops, rotary_emb};
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -13,15 +13,15 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::kernels::try_fused_silu_mul;
 use crate::models::shared::attention::batched::{
-    batched_scaled_dot_product_attention, BatchedAttentionConfig, BatchedAttentionInput,
+    BatchedAttentionConfig, BatchedAttentionInput, batched_scaled_dot_product_attention,
 };
 use crate::models::shared::attention::flash::try_fused_self_attention;
 use crate::models::shared::attention::paged::{
-    append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
-    paged_decode_attention, KvCacheQuantization, KvPage,
+    KvCacheQuantization, KvPage, append_to_pages, default_kv_page_size, default_kv_quantization,
+    materialize_pages, paged_decode_attention,
 };
 use crate::models::shared::telemetry::{
-    record_decode_attention_path, record_rope_kernel, record_rope_manual, DecodeAttentionPath,
+    DecodeAttentionPath, record_decode_attention_path, record_rope_kernel, record_rope_manual,
 };
 use crate::models::shared::weights::gguf::GgufLoader;
 use crate::models::shared::weights::mlx;
@@ -330,7 +330,7 @@ fn append_dense_kv_cache_h(cache: &mut Option<Tensor>, append: &Tensor) -> Resul
     Ok(())
 }
 
-fn qwen3_dense_decode_max_tokens(
+pub(crate) fn qwen3_dense_decode_max_tokens(
     device: &Device,
     page_size: usize,
     quantization: KvCacheQuantization,
