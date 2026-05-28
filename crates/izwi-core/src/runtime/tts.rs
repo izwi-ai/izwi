@@ -262,13 +262,18 @@ impl RuntimeService {
             .await
             .ok_or_else(|| Error::InferenceError("No VibeVoice TTS model loaded".to_string()))?;
         let reference = vibevoice_reference_from_request(&request)?;
+        let requested_speaker = request.config.options.speaker.as_deref().or(request
+            .config
+            .options
+            .voice
+            .as_deref());
         let params = VibeVoiceTtsGenerationParams::from_generation_config_for_text(
             &request.config,
             &text,
             model.default_diffusion_steps(),
         );
         let started = Instant::now();
-        let output = model.generate_with_reference(&text, &reference, params)?;
+        let output = model.generate_with_reference(&text, &reference, requested_speaker, params)?;
         let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
 
         Ok(GenerationResult {

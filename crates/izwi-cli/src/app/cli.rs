@@ -205,9 +205,29 @@ pub enum Commands {
         #[arg(short, long, default_value = "qwen3-tts-0.6b-base")]
         model: String,
 
-        /// Speaker voice (built-in or reference audio path)
-        #[arg(short, long, default_value = "default")]
-        speaker: String,
+        /// Speaker voice or VibeVoice speaker label
+        #[arg(short, long)]
+        speaker: Option<String>,
+
+        /// Saved reference voice ID
+        #[arg(long, value_name = "ID")]
+        saved_voice_id: Option<String>,
+
+        /// Reference audio file for voice cloning
+        #[arg(long, value_name = "PATH")]
+        reference_audio: Option<PathBuf>,
+
+        /// Reference transcript for voice cloning
+        #[arg(long)]
+        reference_text: Option<String>,
+
+        /// File containing the reference transcript
+        #[arg(long, value_name = "PATH")]
+        reference_text_file: Option<PathBuf>,
+
+        /// Voice direction prompt for supported models
+        #[arg(long)]
+        instructions: Option<String>,
 
         /// Output file path
         #[arg(short, long, value_name = "PATH")]

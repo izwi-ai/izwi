@@ -2,15 +2,24 @@ use crate::error::{CliError, Result};
 use crate::http;
 use crate::style::Theme;
 use crate::AudioFormat;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::header::HeaderMap;
+use serde_json::{json, Value};
+use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
 
 pub struct TtsArgs {
     pub text: String,
     pub model: String,
-    pub speaker: String,
+    pub speaker: Option<String>,
+    pub saved_voice_id: Option<String>,
+    pub reference_audio: Option<PathBuf>,
+    pub reference_text: Option<String>,
+    pub reference_text_file: Option<PathBuf>,
+    pub instructions: Option<String>,
     pub output: Option<PathBuf>,
     pub format: AudioFormat,
     pub speed: f32,
@@ -25,6 +34,11 @@ pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
         text,
         model,
         speaker,
+        saved_voice_id,
+        reference_audio,
+        reference_text,
+        reference_text_file,
+        instructions,
         output,
         format,
         speed,
@@ -48,21 +62,25 @@ pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
     if text.trim().is_empty() {
         return Err(CliError::InvalidInput("Text cannot be empty".to_string()));
     }
+    reject_unsupported_cli_stream(&model, stream)?;
 
     theme.step(1, 2, &format!("Generating speech with '{}'...", model));
 
-    let format_str = requested_format_label(&format);
-
-    let request_body = serde_json::json!({
-        "model": model,
-        "input": text,
-        "voice": speaker,
-        "speed": speed,
-        "temperature": temperature,
-        "response_format": format_str,
-        "stream": stream,
-        "allow_format_fallback": allow_format_fallback,
-    });
+    let request_body = build_request_body(BuildRequestArgs {
+        model,
+        text,
+        speaker,
+        saved_voice_id,
+        reference_audio,
+        reference_text,
+        reference_text_file,
+        instructions,
+        format: &format,
+        speed,
+        temperature,
+        stream,
+        allow_format_fallback,
+    })?;
 
     let client = http::client(Some(std::time::Duration::from_secs(300)))?;
 
@@ -240,6 +258,106 @@ fn requested_format_label(format: &AudioFormat) -> &'static str {
     }
 }
 
+struct BuildRequestArgs<'a> {
+    model: String,
+    text: String,
+    speaker: Option<String>,
+    saved_voice_id: Option<String>,
+    reference_audio: Option<PathBuf>,
+    reference_text: Option<String>,
+    reference_text_file: Option<PathBuf>,
+    instructions: Option<String>,
+    format: &'a AudioFormat,
+    speed: f32,
+    temperature: f32,
+    stream: bool,
+    allow_format_fallback: bool,
+}
+
+fn build_request_body(args: BuildRequestArgs<'_>) -> Result<Value> {
+    let reference_text = resolve_reference_text(args.reference_text, args.reference_text_file)?;
+    let has_reference_audio = args.reference_audio.is_some();
+    let has_reference_text = reference_text.is_some();
+    let has_saved_voice = normalize_optional_text(args.saved_voice_id.clone()).is_some();
+    if has_saved_voice && (has_reference_audio || has_reference_text) {
+        return Err(CliError::InvalidInput(
+            "Use either --saved-voice-id or --reference-audio/--reference-text, not both."
+                .to_string(),
+        ));
+    }
+    if has_reference_audio != has_reference_text {
+        return Err(CliError::InvalidInput(
+            "Provide --reference-audio and --reference-text together.".to_string(),
+        ));
+    }
+
+    let mut request_body = json!({
+        "model": args.model,
+        "input": args.text,
+        "speed": args.speed,
+        "temperature": args.temperature,
+        "response_format": requested_format_label(args.format),
+        "stream": args.stream,
+        "allow_format_fallback": args.allow_format_fallback,
+    });
+
+    if let Some(speaker) = normalize_optional_text(args.speaker) {
+        request_body["voice"] = Value::String(speaker);
+    }
+    if let Some(saved_voice_id) = normalize_optional_text(args.saved_voice_id) {
+        request_body["saved_voice_id"] = Value::String(saved_voice_id);
+    }
+    if let Some(reference_audio) = args.reference_audio {
+        let audio = fs::read(&reference_audio).map_err(CliError::Io)?;
+        request_body["reference_audio"] = Value::String(STANDARD.encode(audio));
+    }
+    if let Some(reference_text) = reference_text {
+        request_body["reference_text"] = Value::String(reference_text);
+    }
+    if let Some(instructions) = normalize_optional_text(args.instructions) {
+        request_body["instructions"] = Value::String(instructions);
+    }
+
+    Ok(request_body)
+}
+
+fn resolve_reference_text(inline: Option<String>, file: Option<PathBuf>) -> Result<Option<String>> {
+    let inline = normalize_optional_text(inline);
+    let has_file = file.is_some();
+    if inline.is_some() && has_file {
+        return Err(CliError::InvalidInput(
+            "Use either --reference-text or --reference-text-file, not both.".to_string(),
+        ));
+    }
+    if let Some(path) = file {
+        return Ok(normalize_optional_text(Some(
+            fs::read_to_string(path).map_err(CliError::Io)?,
+        )));
+    }
+    Ok(inline)
+}
+
+fn normalize_optional_text(raw: Option<String>) -> Option<String> {
+    raw.map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn reject_unsupported_cli_stream(model: &str, stream: bool) -> Result<()> {
+    if !stream {
+        return Ok(());
+    }
+    if matches!(
+        izwi_core::parse_tts_model_variant(model),
+        Ok(izwi_core::ModelVariant::VibeVoice15BTts)
+    ) {
+        return Err(CliError::InvalidInput(
+            "VibeVoice TTS uses final-only SSE streaming on the speech endpoint; omit --stream for CLI audio output."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn output_extension(requested_format: &AudioFormat, actual_format: Option<&str>) -> &'static str {
     match actual_format.map(normalize_format_label).as_deref() {
         Some("wav") => "wav",
@@ -260,6 +378,7 @@ fn normalize_format_label(label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn output_extension_uses_actual_format_after_fallback() {
@@ -274,5 +393,78 @@ mod tests {
     #[test]
     fn output_extension_handles_raw_audio_labels() {
         assert_eq!(output_extension(&AudioFormat::Wav, Some("pcm-f32")), "f32");
+    }
+
+    #[test]
+    fn request_body_includes_saved_voice_without_default_voice() {
+        let body = build_request_body(BuildRequestArgs {
+            model: "VibeVoice-1.5B".to_string(),
+            text: "hello".to_string(),
+            speaker: None,
+            saved_voice_id: Some(" voice-1 ".to_string()),
+            reference_audio: None,
+            reference_text: None,
+            reference_text_file: None,
+            instructions: None,
+            format: &AudioFormat::Wav,
+            speed: 1.0,
+            temperature: 0.7,
+            stream: false,
+            allow_format_fallback: false,
+        })
+        .expect("request body");
+
+        assert!(body.get("voice").is_none());
+        assert_eq!(body["saved_voice_id"], "voice-1");
+    }
+
+    #[test]
+    fn request_body_encodes_direct_reference_voice_pair() {
+        let dir = tempdir().expect("temp dir");
+        let audio_path = dir.path().join("voice.wav");
+        fs::write(&audio_path, b"RIFF").expect("audio fixture");
+
+        let body = build_request_body(BuildRequestArgs {
+            model: "VibeVoice-1.5B".to_string(),
+            text: "hello".to_string(),
+            speaker: Some("Speaker 1".to_string()),
+            saved_voice_id: None,
+            reference_audio: Some(audio_path),
+            reference_text: Some(" reference words ".to_string()),
+            reference_text_file: None,
+            instructions: None,
+            format: &AudioFormat::Wav,
+            speed: 1.0,
+            temperature: 0.7,
+            stream: false,
+            allow_format_fallback: false,
+        })
+        .expect("request body");
+
+        assert_eq!(body["voice"], "Speaker 1");
+        assert_eq!(body["reference_audio"], "UklGRg==");
+        assert_eq!(body["reference_text"], "reference words");
+    }
+
+    #[test]
+    fn request_body_rejects_partial_direct_reference() {
+        let err = build_request_body(BuildRequestArgs {
+            model: "VibeVoice-1.5B".to_string(),
+            text: "hello".to_string(),
+            speaker: None,
+            saved_voice_id: None,
+            reference_audio: None,
+            reference_text: Some("reference words".to_string()),
+            reference_text_file: None,
+            instructions: None,
+            format: &AudioFormat::Wav,
+            speed: 1.0,
+            temperature: 0.7,
+            stream: false,
+            allow_format_fallback: false,
+        })
+        .expect_err("partial reference should fail");
+
+        assert!(err.to_string().contains("Provide --reference-audio"));
     }
 }

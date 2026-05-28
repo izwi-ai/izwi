@@ -177,6 +177,7 @@ impl VibeVoiceTtsModel {
         &self,
         text: &str,
         reference: &VibeVoiceSpeakerReference,
+        speaker: Option<&str>,
         params: VibeVoiceTtsGenerationParams,
     ) -> Result<VibeVoiceTtsOutput> {
         if text.trim().is_empty() {
@@ -195,10 +196,12 @@ impl VibeVoiceTtsModel {
             ));
         }
 
+        let reference_text = reference.text.trim().to_string();
         let reference = self.encode_reference(reference)?;
         let prompt = self.tokenizer.build_tts_prompt(
             text.trim(),
-            "Speaker 0",
+            speaker.unwrap_or("Speaker 0"),
+            Some(&reference_text),
             reference.scaled_latents.dim(1)?,
         )?;
         let input_ids = Tensor::from_vec(

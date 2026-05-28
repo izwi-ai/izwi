@@ -7,7 +7,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::tokenizer::Tokenizer;
 
 const TTS_SYSTEM_PROMPT: &str = " Transform the text provided by various speakers into speech output, utilizing the distinct voice of each respective speaker.\n";
@@ -91,9 +91,11 @@ impl VibeVoicePromptTokenizer {
         &self,
         text: &str,
         speaker: &str,
+        reference_text: Option<&str>,
         reference_frames: usize,
     ) -> Result<VibeVoiceTtsPrompt> {
         let speaker = sanitize_tts_speaker(speaker);
+        let text = text.trim();
         let mut input_ids = Vec::new();
         input_ids.extend(self.encode_text(TTS_SYSTEM_PROMPT)?);
 
@@ -111,8 +113,12 @@ impl VibeVoicePromptTokenizer {
             None
         };
 
-        input_ids.extend(self.encode_text(" Text input:\n")?);
-        input_ids.extend(self.encode_text(&format!(" {speaker}:{text}\n"))?);
+        input_ids.extend(self.encode_text(&build_tts_text_input(
+            text,
+            &speaker,
+            reference_text,
+            reference_frames > 0,
+        )?)?);
         let text_token_count = self.encode_text(text)?.len();
         input_ids.extend(self.encode_text(" Speech output:\n")?);
         input_ids.push(self.specials.speech_start);
@@ -174,6 +180,27 @@ impl VibeVoicePromptTokenizer {
         ids.extend(self.encode_text(text)?);
         Ok(())
     }
+}
+
+fn build_tts_text_input(
+    text: &str,
+    speaker: &str,
+    reference_text: Option<&str>,
+    include_reference: bool,
+) -> Result<String> {
+    let mut input = String::from(" Text input:\n");
+    if include_reference {
+        let reference_text = reference_text.unwrap_or_default().trim();
+        if reference_text.is_empty() {
+            return Err(Error::InvalidInput(
+                "VibeVoice TTS reference_text cannot be empty when reference audio is provided"
+                    .to_string(),
+            ));
+        }
+        input.push_str(&format!(" {speaker}:{reference_text}\n"));
+    }
+    input.push_str(&format!(" {speaker}:{}\n", text.trim()));
+    Ok(input)
 }
 
 fn sanitize_tts_speaker(speaker: &str) -> String {
@@ -254,4 +281,33 @@ fn read_special_tokens(model_dir: &Path) -> Result<VibeVoiceSpecialTokens> {
             .copied()
             .unwrap_or(defaults.image_pad),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tts_text_input_pairs_reference_transcript_before_target_text() {
+        let block = build_tts_text_input(
+            "Generate this line.",
+            "Speaker 1",
+            Some("Reference transcript."),
+            true,
+        )
+        .expect("text input");
+
+        assert_eq!(
+            block,
+            " Text input:\n Speaker 1:Reference transcript.\n Speaker 1:Generate this line.\n"
+        );
+    }
+
+    #[test]
+    fn tts_text_input_omits_reference_line_without_reference_audio() {
+        let block = build_tts_text_input("Generate this line.", "Speaker 0", None, false)
+            .expect("text input");
+
+        assert_eq!(block, " Text input:\n Speaker 0:Generate this line.\n");
+    }
 }

@@ -1,11 +1,11 @@
 //! OpenAI-compatible speech synthesis endpoints.
 
 use axum::{
-    Json,
     body::Body,
     extract::{Extension, State},
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     response::Response,
+    Json,
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -22,7 +22,7 @@ use izwi_core::audio::AudioFormat;
 use izwi_core::runtime_models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
 use izwi_core::runtime_models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use izwi_core::{
-    AudioChunk, GenerationConfig, GenerationRequest, ModelVariant, parse_tts_model_variant,
+    parse_tts_model_variant, AudioChunk, GenerationConfig, GenerationRequest, ModelVariant,
 };
 
 const DEFAULT_STREAM_EVENT_QUEUE_CAPACITY: usize = 32;
@@ -137,6 +137,7 @@ pub async fn speech(
 
     let variant = parse_tts_model_variant(&req.model)
         .map_err(|err| ApiError::bad_request(format!("Unsupported TTS model: {}", err)))?;
+    validate_speech_voice_contract(&req, variant)?;
     let streaming = resolve_streaming_mode(&req)?;
     let resolved_format = parse_response_format(
         req.response_format.as_deref().unwrap_or("wav"),
@@ -306,6 +307,64 @@ async fn resolve_saved_voice_request(
     req.reference_audio = Some(saved_voice.reference_audio_base64);
     req.reference_text = Some(saved_voice.reference_text);
     Ok(req)
+}
+
+fn validate_speech_voice_contract(
+    req: &SpeechRequest,
+    variant: ModelVariant,
+) -> Result<(), ApiError> {
+    let has_direct_reference_audio = req
+        .reference_audio
+        .as_deref()
+        .map(has_non_empty_text)
+        .unwrap_or(false);
+    let has_direct_reference_text = req
+        .reference_text
+        .as_deref()
+        .map(has_non_empty_text)
+        .unwrap_or(false);
+    if has_direct_reference_audio != has_direct_reference_text {
+        return Err(ApiError::bad_request(
+            "Provide both `reference_audio` and `reference_text` together.",
+        ));
+    }
+
+    if has_direct_reference_audio {
+        let supports_reference_voice = variant
+            .speech_capabilities()
+            .map(|capabilities| capabilities.supports_reference_voice)
+            .unwrap_or(false);
+        if !supports_reference_voice {
+            return Err(ApiError::bad_request(format!(
+                "{variant} does not support reference or saved voices.",
+            )));
+        }
+    }
+
+    let has_voice_description = req
+        .instructions
+        .as_deref()
+        .map(has_non_empty_text)
+        .unwrap_or(false);
+    if has_voice_description {
+        let supports_voice_description = variant
+            .speech_capabilities()
+            .map(|capabilities| capabilities.supports_voice_description)
+            .unwrap_or(false);
+        if !supports_voice_description {
+            return Err(ApiError::bad_request(format!(
+                "{variant} does not support voice direction prompts.",
+            )));
+        }
+    }
+
+    if variant == ModelVariant::VibeVoice15BTts && !has_direct_reference_audio {
+        return Err(ApiError::bad_request(
+            "VibeVoice-1.5B requires `saved_voice_id` or both `reference_audio` and `reference_text`.",
+        ));
+    }
+
+    Ok(())
 }
 
 async fn stream_speech(
@@ -563,7 +622,10 @@ fn build_generation_request(
     }
     if let Some(max_tokens) = req.max_output_tokens.or(req.max_tokens) {
         gen_config.options.max_tokens = max_tokens;
-    } else if variant == ModelVariant::Voxtral4BTts2603 {
+    } else if matches!(
+        variant,
+        ModelVariant::Voxtral4BTts2603 | ModelVariant::VibeVoice15BTts
+    ) {
         gen_config.options.max_tokens = 0;
     }
     if let Some(top_k) = req.top_k {
@@ -814,6 +876,102 @@ mod tests {
             ModelVariant::VibeVoice15BTts,
         );
         assert_eq!(generation.config.options.max_tokens, 0);
+    }
+
+    #[test]
+    fn vibevoice_speech_requests_require_reference_voice() {
+        let req = SpeechRequest {
+            model: "VibeVoice-1.5B".to_string(),
+            input: "hello".to_string(),
+            voice: None,
+            response_format: Some("wav".to_string()),
+            allow_format_fallback: None,
+            speed: None,
+            language: None,
+            temperature: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            top_k: None,
+            stream: Some(false),
+            stream_format: None,
+            instructions: None,
+            reference_audio: None,
+            reference_text: None,
+            saved_voice_id: None,
+        };
+
+        let err = validate_speech_voice_contract(&req, ModelVariant::VibeVoice15BTts)
+            .expect_err("missing reference should fail");
+        assert!(err.message.contains("requires `saved_voice_id`"));
+    }
+
+    #[test]
+    fn direct_reference_audio_and_text_must_be_paired() {
+        let req = SpeechRequest {
+            model: "VibeVoice-1.5B".to_string(),
+            input: "hello".to_string(),
+            voice: None,
+            response_format: Some("wav".to_string()),
+            allow_format_fallback: None,
+            speed: None,
+            language: None,
+            temperature: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            top_k: None,
+            stream: Some(false),
+            stream_format: None,
+            instructions: None,
+            reference_audio: Some("UklGRg==".to_string()),
+            reference_text: None,
+            saved_voice_id: None,
+        };
+
+        let err = validate_speech_voice_contract(&req, ModelVariant::VibeVoice15BTts)
+            .expect_err("partial reference should fail");
+        assert!(err.message.contains("Provide both `reference_audio`"));
+    }
+
+    #[test]
+    fn generation_request_preserves_vibevoice_reference_fields_and_voice_label() {
+        let req = SpeechRequest {
+            model: "VibeVoice-1.5B".to_string(),
+            input: "hello".to_string(),
+            voice: Some("Speaker 1".to_string()),
+            response_format: Some("wav".to_string()),
+            allow_format_fallback: None,
+            speed: None,
+            language: None,
+            temperature: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            top_k: None,
+            stream: Some(false),
+            stream_format: None,
+            instructions: None,
+            reference_audio: Some("UklGRg==".to_string()),
+            reference_text: Some("reference words".to_string()),
+            saved_voice_id: None,
+        };
+
+        validate_speech_voice_contract(&req, ModelVariant::VibeVoice15BTts)
+            .expect("valid reference");
+        let generation = build_generation_request(
+            &req,
+            "test-correlation".to_string(),
+            false,
+            ModelVariant::VibeVoice15BTts,
+        );
+
+        assert_eq!(
+            generation.config.options.speaker.as_deref(),
+            Some("Speaker 1")
+        );
+        assert_eq!(generation.reference_audio.as_deref(), Some("UklGRg=="));
+        assert_eq!(
+            generation.reference_text.as_deref(),
+            Some("reference words")
+        );
     }
 
     #[test]
