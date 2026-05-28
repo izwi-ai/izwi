@@ -4,7 +4,7 @@
 //! (used for audio-conditioned ASR).
 
 use candle_core::quantized::QMatMul;
-use candle_core::{D, DType, Device, Module, Tensor};
+use candle_core::{D, DType, Device, IndexOp, Module, Tensor};
 use candle_nn::{Embedding, Linear, RmsNorm, VarBuilder, ops, rotary_emb};
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 use serde::{Deserialize, Serialize};
@@ -451,6 +451,21 @@ impl Qwen3Projection {
                 quantized_projection_count: 1,
             },
         }
+    }
+
+    fn logits_for_tokens(&self, hidden: &Tensor, token_ids: &[u32]) -> Result<Vec<(u32, f32)>> {
+        if token_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let logits = match self {
+            Self::Dense(dense) => dense_logits_for_tokens(dense, hidden, token_ids)?,
+            Self::Quantized(_) => logits_for_tokens_from_full(&self.forward(hidden)?, token_ids)?,
+        };
+        let values = logits
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        Ok(token_ids.iter().copied().zip(values).collect())
     }
 }
 
@@ -1256,9 +1271,58 @@ impl Qwen3Model {
         self.lm_head.forward(hidden).map_err(Error::from)
     }
 
+    pub fn logits_from_hidden_for_tokens(
+        &self,
+        hidden: &Tensor,
+        token_ids: &[u32],
+    ) -> Result<Vec<(u32, f32)>> {
+        self.lm_head.logits_for_tokens(hidden, token_ids)
+    }
+
     pub fn uses_mrope(&self) -> bool {
         self.use_mrope
     }
+}
+
+fn dense_logits_for_tokens(
+    dense: &Qwen3DenseProjection,
+    hidden: &Tensor,
+    token_ids: &[u32],
+) -> Result<Tensor> {
+    let token_indices = token_index_tensor(token_ids, hidden.device())?;
+    let weight_rows = dense.linear.weight().index_select(&token_indices, 0)?;
+    let mut logits = hidden.matmul(&weight_rows.t()?)?;
+    if let Some(bias) = dense.linear.bias() {
+        let bias_rows = bias.index_select(&token_indices, 0)?;
+        logits = logits.broadcast_add(&bias_rows)?;
+    }
+    Ok(logits)
+}
+
+fn logits_for_tokens_from_full(logits: &Tensor, token_ids: &[u32]) -> Result<Tensor> {
+    let token_indices = token_index_tensor(token_ids, logits.device())?;
+    match logits.dims() {
+        [1, _] => logits
+            .i(0)?
+            .index_select(&token_indices, 0)
+            .map_err(Error::from),
+        [1, 1, _] => logits
+            .i((0, 0))?
+            .index_select(&token_indices, 0)
+            .map_err(Error::from),
+        _ => Err(Error::InferenceError(format!(
+            "Qwen3 selected-token logits expected [1,vocab] or [1,1,vocab], got {:?}",
+            logits.dims()
+        ))),
+    }
+}
+
+fn token_index_tensor(token_ids: &[u32], device: &Device) -> Result<Tensor> {
+    let indices = token_ids
+        .iter()
+        .map(|token| i64::from(*token))
+        .collect::<Vec<_>>();
+    Tensor::from_vec(indices, (token_ids.len(),), device).map_err(Error::from)
 }
 
 fn qwen3_join_prefix(prefix: &str, suffix: &str) -> String {
@@ -1567,6 +1631,40 @@ mod tests {
             .to_vec2::<f32>()
             .expect("output values");
         assert_eq!(out, vec![vec![8.5, 17.0]]);
+    }
+
+    #[test]
+    fn selected_dense_projection_logits_match_full_projection() {
+        let device = Device::Cpu;
+        let weight = Tensor::from_vec(
+            vec![
+                1.0f32, 0.0, 0.5, -1.0, 0.25, 2.0, -0.5, 1.5, 0.75, -0.25, 1.25, 0.5,
+            ],
+            (4, 3),
+            &device,
+        )
+        .expect("weight");
+        let bias = Tensor::from_vec(vec![0.1f32, -0.2, 0.3, 0.4], (4,), &device).expect("bias");
+        let projection = Qwen3Projection::Dense(Qwen3DenseProjection {
+            linear: Linear::new(weight, Some(bias)),
+            has_bias: true,
+        });
+        let hidden = Tensor::from_vec(vec![0.5f32, -1.0, 2.0], (1, 3), &device).expect("hidden");
+
+        let selected = projection
+            .logits_for_tokens(&hidden, &[3, 1])
+            .expect("selected logits");
+        let full = projection
+            .forward(&hidden)
+            .expect("full logits")
+            .i(0)
+            .expect("row")
+            .to_vec1::<f32>()
+            .expect("values");
+
+        assert_eq!(selected.len(), 2);
+        assert!((selected[0].1 - full[3]).abs() < 1e-6);
+        assert!((selected[1].1 - full[1]).abs() < 1e-6);
     }
 
     #[test]
