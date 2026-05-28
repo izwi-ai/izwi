@@ -8,7 +8,7 @@ use candle_nn::VarBuilder;
 use serde::Serialize;
 use tracing::{debug, info, warn};
 
-use crate::backends::DeviceProfile;
+use crate::backends::{DeviceKind, DeviceProfile};
 use crate::catalog::{ModelFamily, ModelVariant};
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::core::{
@@ -19,7 +19,7 @@ use crate::models::architectures::vibevoice::config::{
 };
 use crate::models::architectures::vibevoice::connector::SpeechConnector;
 use crate::models::architectures::vibevoice::diffusion::{
-    VibeVoiceDiffusionHead, VibeVoiceDiffusionScheduler,
+    VibeVoiceDiffusionHead, VibeVoiceDiffusionScheduler, VibeVoiceDiffusionStepTensors,
 };
 use crate::models::architectures::vibevoice::prompt::{
     VibeVoicePromptTokenizer, VibeVoiceSpecialTokens,
@@ -38,6 +38,7 @@ const AUTO_MAX_OUTPUT_FRAMES: usize = 384;
 const WORDS_PER_SECOND: f32 = 2.6;
 const AUTO_PADDING_SECONDS: f32 = 0.8;
 const DEFAULT_CFG_SCALE: f32 = 1.5;
+const VIBEVOICE_CFG_BATCHING_ENV: &str = "IZWI_VIBEVOICE_CFG_BATCHING";
 
 #[derive(Debug, Clone)]
 pub struct VibeVoiceSpeakerReference {
@@ -114,6 +115,7 @@ pub struct VibeVoiceTtsDiagnostics {
     pub dense_projection_count: usize,
     pub dense_bias_projection_count: usize,
     pub quantized_projection_count: usize,
+    pub cfg_batching_enabled: bool,
 }
 
 struct EncodedReference {
@@ -126,6 +128,13 @@ struct GeneratedSpeechFeedback {
     acoustic_decode_ms: f32,
     semantic_encode_ms: f32,
     connector_ms: f32,
+}
+
+struct VibeVoiceDiffusionPlan {
+    scheduler: VibeVoiceDiffusionScheduler,
+    steps: Vec<VibeVoiceDiffusionStepTensors>,
+    cfg_tensor: Option<Tensor>,
+    batch_cfg_prediction: bool,
 }
 
 struct LatentNormalization {
@@ -294,6 +303,7 @@ impl VibeVoiceTtsModel {
             dense_projection_count: projection_diagnostics.dense_projection_count,
             dense_bias_projection_count: projection_diagnostics.dense_bias_projection_count,
             quantized_projection_count: projection_diagnostics.quantized_projection_count,
+            cfg_batching_enabled: vibevoice_cfg_batching_enabled(self.device.kind),
         }
     }
 
@@ -375,10 +385,16 @@ impl VibeVoiceTtsModel {
         let mut negative_last_hidden =
             last_sequence_hidden(&negative_hidden, "VibeVoice TTS negative prefill")?;
 
-        let scheduler = VibeVoiceDiffusionScheduler::new(
-            self.prediction_head.config().ddpm_num_steps,
-            params.diffusion_steps,
-        );
+        let diffusion_plan = vibevoice_diffusion_plan(
+            VibeVoiceDiffusionScheduler::new(
+                self.prediction_head.config().ddpm_num_steps,
+                params.diffusion_steps,
+            ),
+            &self.device.device,
+            self.dtype,
+            params.cfg_scale,
+            self.device.kind,
+        )?;
         let mut feedback_acoustic_cache = VibeVoiceTokenizerStreamingCache::new();
         let mut feedback_semantic_cache = VibeVoiceTokenizerStreamingCache::new();
         let mut scaled_latents = Vec::with_capacity(max_frames);
@@ -405,8 +421,7 @@ impl VibeVoiceTtsModel {
             let latent = self.sample_speech_latent(
                 &last_hidden,
                 Some(&negative_last_hidden),
-                params.cfg_scale,
-                &scheduler,
+                &diffusion_plan,
             )?;
             profile.diffusion_sample_ms += elapsed_ms(started);
             let latent_frame = latent.unsqueeze(1)?;
@@ -584,8 +599,7 @@ impl VibeVoiceTtsModel {
         &self,
         condition: &Tensor,
         negative_condition: Option<&Tensor>,
-        cfg_scale: f32,
-        scheduler: &VibeVoiceDiffusionScheduler,
+        plan: &VibeVoiceDiffusionPlan,
     ) -> Result<Tensor> {
         let mut speech = Tensor::randn(
             0f32,
@@ -594,28 +608,37 @@ impl VibeVoiceTtsModel {
             &self.device.device,
         )?
         .to_dtype(self.dtype)?;
-        let steps = scheduler.step_tensors(&self.device.device, self.dtype)?;
-        let cfg_tensor = if cfg_scale > 1.0 {
-            Some(scalar_like(cfg_scale, &speech)?)
-        } else {
-            None
-        };
-        for step in &steps {
+        for step in &plan.steps {
             let model_output = if let (Some(negative_condition), Some(cfg)) =
-                (negative_condition, cfg_tensor.as_ref())
+                (negative_condition, plan.cfg_tensor.as_ref())
             {
-                self.prediction_head.forward_cfg_batched(
-                    &speech,
-                    &step.timestep_tensor,
-                    condition,
-                    negative_condition,
-                    cfg,
-                )?
+                if plan.batch_cfg_prediction {
+                    self.prediction_head.forward_cfg_batched(
+                        &speech,
+                        &step.timestep_tensor,
+                        condition,
+                        negative_condition,
+                        cfg,
+                    )?
+                } else {
+                    let positive_output =
+                        self.prediction_head
+                            .forward(&speech, &step.timestep_tensor, condition)?;
+                    let negative_output = self.prediction_head.forward(
+                        &speech,
+                        &step.timestep_tensor,
+                        negative_condition,
+                    )?;
+                    let guidance = positive_output.broadcast_sub(&negative_output)?;
+                    negative_output.broadcast_add(&guidance.broadcast_mul(cfg)?)?
+                }
             } else {
                 self.prediction_head
                     .forward(&speech, &step.timestep_tensor, condition)?
             };
-            speech = scheduler.step_v_prediction_with_tensors(&model_output, &speech, step)?;
+            speech = plan
+                .scheduler
+                .step_v_prediction_with_tensors(&model_output, &speech, step)?;
         }
         Ok(speech)
     }
@@ -655,6 +678,59 @@ fn cap_vibevoice_dense_decode_tokens(max_tokens: usize, qwen_budget: usize) -> u
     } else {
         max_tokens.max(1).min(qwen_budget)
     }
+}
+
+fn vibevoice_diffusion_plan(
+    scheduler: VibeVoiceDiffusionScheduler,
+    device: &Device,
+    dtype: DType,
+    cfg_scale: f32,
+    device_kind: DeviceKind,
+) -> Result<VibeVoiceDiffusionPlan> {
+    let steps = scheduler.step_tensors(device, dtype)?;
+    Ok(VibeVoiceDiffusionPlan {
+        scheduler,
+        steps,
+        cfg_tensor: if cfg_scale > 1.0 {
+            Some(Tensor::new(cfg_scale, device)?.to_dtype(dtype)?)
+        } else {
+            None
+        },
+        batch_cfg_prediction: vibevoice_cfg_batching_enabled(device_kind),
+    })
+}
+
+fn vibevoice_cfg_batching_enabled(device_kind: DeviceKind) -> bool {
+    let override_value = std::env::var(VIBEVOICE_CFG_BATCHING_ENV).ok();
+    vibevoice_cfg_batching_enabled_for(device_kind, override_value.as_deref())
+}
+
+fn vibevoice_cfg_batching_enabled_for(
+    device_kind: DeviceKind,
+    override_value: Option<&str>,
+) -> bool {
+    let default = vibevoice_cfg_batching_default(device_kind);
+    let Some(raw) = override_value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return default;
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "auto" => default,
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        other => {
+            warn!(
+                "{VIBEVOICE_CFG_BATCHING_ENV}={other:?} is invalid; using auto CFG batching policy"
+            );
+            default
+        }
+    }
+}
+
+fn vibevoice_cfg_batching_default(device_kind: DeviceKind) -> bool {
+    device_kind.is_metal() || device_kind.is_cuda()
 }
 
 fn vibevoice_tts_negative_prefill_token(specials: &VibeVoiceSpecialTokens) -> u32 {
@@ -1034,6 +1110,64 @@ mod tests {
         assert_eq!(cap_vibevoice_dense_decode_tokens(32, 128), 32);
         assert_eq!(cap_vibevoice_dense_decode_tokens(4096, 128), 128);
         assert_eq!(cap_vibevoice_dense_decode_tokens(128, 0), 0);
+    }
+
+    #[test]
+    fn cfg_batching_policy_defaults_to_accelerators() {
+        assert!(!vibevoice_cfg_batching_enabled_for(DeviceKind::Cpu, None));
+        assert!(vibevoice_cfg_batching_enabled_for(DeviceKind::Metal, None));
+        assert!(vibevoice_cfg_batching_enabled_for(DeviceKind::Cuda, None));
+    }
+
+    #[test]
+    fn cfg_batching_policy_honors_overrides() {
+        assert!(vibevoice_cfg_batching_enabled_for(
+            DeviceKind::Cpu,
+            Some("on")
+        ));
+        assert!(!vibevoice_cfg_batching_enabled_for(
+            DeviceKind::Metal,
+            Some("off")
+        ));
+        assert!(vibevoice_cfg_batching_enabled_for(
+            DeviceKind::Cuda,
+            Some("auto")
+        ));
+        assert!(!vibevoice_cfg_batching_enabled_for(
+            DeviceKind::Cpu,
+            Some("not-a-mode")
+        ));
+    }
+
+    #[test]
+    fn diffusion_plan_reuses_step_tensors_and_cfg_policy() {
+        let device = Device::Cpu;
+        let plan = vibevoice_diffusion_plan(
+            VibeVoiceDiffusionScheduler::new(1000, 3),
+            &device,
+            DType::F32,
+            1.5,
+            DeviceKind::Metal,
+        )
+        .unwrap();
+
+        assert_eq!(plan.steps.len(), 3);
+        assert!(plan.batch_cfg_prediction);
+        assert_eq!(
+            plan.cfg_tensor.as_ref().unwrap().to_vec0::<f32>().unwrap(),
+            1.5
+        );
+
+        let cpu_no_cfg = vibevoice_diffusion_plan(
+            VibeVoiceDiffusionScheduler::new(1000, 3),
+            &device,
+            DType::F32,
+            1.0,
+            DeviceKind::Cpu,
+        )
+        .unwrap();
+        assert!(!cpu_no_cfg.batch_cfg_prediction);
+        assert!(cpu_no_cfg.cfg_tensor.is_none());
     }
 
     #[test]
