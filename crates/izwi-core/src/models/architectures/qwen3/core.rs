@@ -4,8 +4,8 @@
 //! (used for audio-conditioned ASR).
 
 use candle_core::quantized::QMatMul;
-use candle_core::{D, DType, Device, Module, Tensor};
-use candle_nn::{Embedding, Linear, RmsNorm, VarBuilder, ops, rotary_emb};
+use candle_core::{DType, Device, Module, Tensor, D};
+use candle_nn::{ops, rotary_emb, Embedding, Linear, RmsNorm, VarBuilder};
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -13,15 +13,15 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::kernels::try_fused_silu_mul;
 use crate::models::shared::attention::batched::{
-    BatchedAttentionConfig, BatchedAttentionInput, batched_scaled_dot_product_attention,
+    batched_scaled_dot_product_attention, BatchedAttentionConfig, BatchedAttentionInput,
 };
 use crate::models::shared::attention::flash::try_fused_self_attention;
 use crate::models::shared::attention::paged::{
-    KvCacheQuantization, KvPage, append_to_pages, default_kv_page_size, default_kv_quantization,
-    materialize_pages, paged_decode_attention,
+    append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
+    paged_decode_attention, KvCacheQuantization, KvPage,
 };
 use crate::models::shared::telemetry::{
-    DecodeAttentionPath, record_decode_attention_path, record_rope_kernel, record_rope_manual,
+    record_decode_attention_path, record_rope_kernel, record_rope_manual, DecodeAttentionPath,
 };
 use crate::models::shared::weights::gguf::GgufLoader;
 use crate::models::shared::weights::mlx;
@@ -380,14 +380,20 @@ fn parse_env_bool(raw: &str) -> Option<bool> {
     }
 }
 
+struct Qwen3DenseProjection {
+    linear: Linear,
+    has_bias: bool,
+}
+
 enum Qwen3Projection {
-    Dense(Linear),
+    Dense(Qwen3DenseProjection),
     Quantized(QMatMul),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Qwen3ProjectionDiagnostics {
     pub dense_projection_count: usize,
+    pub dense_bias_projection_count: usize,
     pub quantized_projection_count: usize,
 }
 
@@ -397,6 +403,9 @@ impl Qwen3ProjectionDiagnostics {
             dense_projection_count: self
                 .dense_projection_count
                 .saturating_add(other.dense_projection_count),
+            dense_bias_projection_count: self
+                .dense_bias_projection_count
+                .saturating_add(other.dense_bias_projection_count),
             quantized_projection_count: self
                 .quantized_projection_count
                 .saturating_add(other.quantized_projection_count),
@@ -406,9 +415,13 @@ impl Qwen3ProjectionDiagnostics {
 
 impl Qwen3Projection {
     fn dense(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
-        mlx::load_linear_no_bias(in_dim, out_dim, vb)
-            .map(Self::Dense)
-            .map_err(Error::from)
+        let has_bias = vb.contains_tensor("bias");
+        let linear = if has_bias {
+            mlx::load_linear(in_dim, out_dim, vb)
+        } else {
+            mlx::load_linear_no_bias(in_dim, out_dim, vb)
+        }?;
+        Ok(Self::Dense(Qwen3DenseProjection { linear, has_bias }))
     }
 
     fn quantized(loader: &GgufLoader, device: &Device, name: &str) -> Result<Self> {
@@ -419,17 +432,22 @@ impl Qwen3Projection {
     }
 
     fn tied_dense(weight: Tensor) -> Self {
-        Self::Dense(Linear::new(weight, None))
+        Self::Dense(Qwen3DenseProjection {
+            linear: Linear::new(weight, None),
+            has_bias: false,
+        })
     }
 
     fn diagnostics(&self) -> Qwen3ProjectionDiagnostics {
         match self {
-            Self::Dense(_) => Qwen3ProjectionDiagnostics {
+            Self::Dense(dense) => Qwen3ProjectionDiagnostics {
                 dense_projection_count: 1,
+                dense_bias_projection_count: usize::from(dense.has_bias),
                 quantized_projection_count: 0,
             },
             Self::Quantized(_) => Qwen3ProjectionDiagnostics {
                 dense_projection_count: 0,
+                dense_bias_projection_count: 0,
                 quantized_projection_count: 1,
             },
         }
@@ -443,7 +461,7 @@ fn qwen3_cuda_qmatmul_input_dtype(device_is_cuda: bool, activation_dtype: DType)
 impl Module for Qwen3Projection {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         match self {
-            Self::Dense(linear) => linear.forward(x),
+            Self::Dense(dense) => dense.linear.forward(x),
             Self::Quantized(qmatmul) => {
                 let activation_dtype = x.dtype();
                 let x = if let Some(dtype) =
@@ -1516,6 +1534,69 @@ fn qwen3_rope_kernel_enabled(device: &Device) -> bool {
 mod tests {
     use super::*;
     use candle_nn::rotary_emb;
+    use std::collections::HashMap;
+
+    #[test]
+    fn qwen3_dense_projection_loads_optional_bias() {
+        let device = Device::Cpu;
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "weight".to_string(),
+            Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (2, 2), &device).expect("weight"),
+        );
+        tensors.insert(
+            "bias".to_string(),
+            Tensor::from_vec(vec![0.5f32, -1.0], (2,), &device).expect("bias"),
+        );
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
+
+        let projection = Qwen3Projection::dense(2, 2, vb).expect("projection");
+        assert_eq!(
+            projection.diagnostics(),
+            Qwen3ProjectionDiagnostics {
+                dense_projection_count: 1,
+                dense_bias_projection_count: 1,
+                quantized_projection_count: 0,
+            }
+        );
+
+        let input = Tensor::from_vec(vec![2.0f32, 3.0], (1, 2), &device).expect("input");
+        let out = projection
+            .forward(&input)
+            .expect("projection forward")
+            .to_vec2::<f32>()
+            .expect("output values");
+        assert_eq!(out, vec![vec![8.5, 17.0]]);
+    }
+
+    #[test]
+    fn qwen3_dense_projection_keeps_no_bias_path() {
+        let device = Device::Cpu;
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "weight".to_string(),
+            Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (2, 2), &device).expect("weight"),
+        );
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
+
+        let projection = Qwen3Projection::dense(2, 2, vb).expect("projection");
+        assert_eq!(
+            projection.diagnostics(),
+            Qwen3ProjectionDiagnostics {
+                dense_projection_count: 1,
+                dense_bias_projection_count: 0,
+                quantized_projection_count: 0,
+            }
+        );
+
+        let input = Tensor::from_vec(vec![2.0f32, 3.0], (1, 2), &device).expect("input");
+        let out = projection
+            .forward(&input)
+            .expect("projection forward")
+            .to_vec2::<f32>()
+            .expect("output values");
+        assert_eq!(out, vec![vec![8.0, 18.0]]);
+    }
 
     #[test]
     fn repeat_kv_returns_rank4_heads_last() {
