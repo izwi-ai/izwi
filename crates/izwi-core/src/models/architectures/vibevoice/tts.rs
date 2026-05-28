@@ -601,12 +601,12 @@ fn load_checkpoint_latent_normalization(
 
     let bias = vb.get_unchecked_dtype("speech_bias_factor", vb.dtype())?;
     let scale = vb.get_unchecked_dtype("speech_scaling_factor", vb.dtype())?;
-    validate_latent_factor("speech_bias_factor", &bias, latent_dim)?;
-    validate_latent_factor("speech_scaling_factor", &scale, latent_dim)?;
+    validate_latent_bias_factor("speech_bias_factor", &bias, latent_dim)?;
+    validate_latent_scale_factor("speech_scaling_factor", &scale, latent_dim)?;
     Ok(Some(CheckpointLatentNormalization { bias, scale }))
 }
 
-fn validate_latent_factor(name: &str, factor: &Tensor, latent_dim: usize) -> Result<()> {
+fn validate_latent_factor_shape(name: &str, factor: &Tensor, latent_dim: usize) -> Result<()> {
     let count = factor.elem_count();
     if count == 1 || count == latent_dim {
         return Ok(());
@@ -615,6 +615,42 @@ fn validate_latent_factor(name: &str, factor: &Tensor, latent_dim: usize) -> Res
         "VibeVoice {name} has {} values, expected scalar or acoustic latent dim {latent_dim}",
         count
     )))
+}
+
+fn validate_latent_bias_factor(name: &str, factor: &Tensor, latent_dim: usize) -> Result<()> {
+    validate_latent_factor_shape(name, factor, latent_dim)?;
+    for value in latent_factor_values(name, factor)? {
+        if !value.is_finite() {
+            return Err(Error::ModelLoadError(format!(
+                "VibeVoice {name} contains non-finite values"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_latent_scale_factor(name: &str, factor: &Tensor, latent_dim: usize) -> Result<()> {
+    validate_latent_factor_shape(name, factor, latent_dim)?;
+    for value in latent_factor_values(name, factor)? {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(Error::ModelLoadError(format!(
+                "VibeVoice {name} must contain only finite positive values"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn latent_factor_values(name: &str, factor: &Tensor) -> Result<Vec<f32>> {
+    factor
+        .to_dtype(DType::F32)
+        .and_then(|factor| factor.flatten_all())
+        .and_then(|factor| factor.to_vec1::<f32>())
+        .map_err(|err| {
+            Error::ModelLoadError(format!(
+                "Failed to validate VibeVoice latent factor {name}: {err}"
+            ))
+        })
 }
 
 fn reference_latent_normalization(latents: &Tensor) -> Result<LatentNormalization> {
@@ -650,6 +686,7 @@ fn latent_normalization_values(latents: &Tensor) -> Result<(f32, f32)> {
 }
 
 fn scale_latents(latents: &Tensor, bias: &Tensor, scale: &Tensor) -> Result<Tensor> {
+    // VibeVoice normalizes speech latents as `(audio_tokens + bias) * scale`.
     latents
         .broadcast_add(&factor_like(bias, latents)?)?
         .broadcast_mul(&factor_like(scale, latents)?)
@@ -855,12 +892,15 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_latent_scaling_round_trips_vector_factors() {
+    fn checkpoint_latent_scaling_matches_vibevoice_reference_formula() {
         let device = candle_core::Device::Cpu;
         let latents = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (1, 2, 2), &device).unwrap();
         let bias = Tensor::from_vec(vec![0.5f32, -1.0], (2,), &device).unwrap();
         let scale = Tensor::from_vec(vec![2.0f32, 4.0], (2,), &device).unwrap();
         let scaled = scale_latents(&latents, &bias, &scale).unwrap();
+        let scaled_values = scaled.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(scaled_values, vec![3.0, 4.0, 7.0, 12.0]);
+
         let unscaled = unscale_latents(&scaled, &bias, &scale).unwrap();
         let values = unscaled.flatten_all().unwrap().to_vec1::<f32>().unwrap();
 
@@ -873,12 +913,24 @@ mod tests {
     fn latent_factor_validation_accepts_scalar_or_latent_dim_only() {
         let device = candle_core::Device::Cpu;
         let scalar = Tensor::new(0.5f32, &device).unwrap();
-        let vector = Tensor::zeros((64,), DType::F32, &device).unwrap();
+        let vector = Tensor::from_vec(vec![1.0f32; 64], (64,), &device).unwrap();
         let wrong = Tensor::zeros((63,), DType::F32, &device).unwrap();
 
-        validate_latent_factor("factor", &scalar, 64).unwrap();
-        validate_latent_factor("factor", &vector, 64).unwrap();
-        assert!(validate_latent_factor("factor", &wrong, 64).is_err());
+        validate_latent_bias_factor("factor", &scalar, 64).unwrap();
+        validate_latent_scale_factor("factor", &vector, 64).unwrap();
+        assert!(validate_latent_bias_factor("factor", &wrong, 64).is_err());
+    }
+
+    #[test]
+    fn latent_factor_validation_rejects_nonfinite_bias_and_nonpositive_scale() {
+        let device = candle_core::Device::Cpu;
+        let nan = Tensor::new(f32::NAN, &device).unwrap();
+        let zero = Tensor::new(0.0f32, &device).unwrap();
+        let negative = Tensor::new(-1.0f32, &device).unwrap();
+
+        assert!(validate_latent_bias_factor("speech_bias_factor", &nan, 64).is_err());
+        assert!(validate_latent_scale_factor("speech_scaling_factor", &zero, 64).is_err());
+        assert!(validate_latent_scale_factor("speech_scaling_factor", &negative, 64).is_err());
     }
 
     #[test]
