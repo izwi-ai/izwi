@@ -1218,6 +1218,10 @@ impl Qwen3Model {
         self.layers.len()
     }
 
+    pub fn attention_head_dim(&self) -> usize {
+        self.cfg.head_dim()
+    }
+
     pub fn projection_diagnostics(&self) -> Qwen3ProjectionDiagnostics {
         self.layers
             .iter()
