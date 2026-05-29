@@ -451,6 +451,16 @@ At startup, `EngineCore` inspects the configured device and selects:
 - `KvCacheBackend::Metal(MetalKVCacheManager)` — when Metal is enabled
 - `KvCacheBackend::Standard(KVCacheManager)` — for CPU / other backends
 
+### VibeVoice ASR Verification Status
+
+The native Rust/Candle VibeVoice ASR path now has processor parity,
+request-scoped text generation controls, structured transcript parsing, and
+60-second tokenizer streaming chunks. See
+[VibeVoice ASR Verification Notes](./VIBEVOICE_ASR_VERIFICATION.md) for the
+backend smoke commands, the current CPU smoke evidence, CUDA host validation
+steps, and the profiling gates for future tokenizer, connector, attention, or
+KV-cache kernels.
+
 ---
 
 ## 9. Configuration Reference
