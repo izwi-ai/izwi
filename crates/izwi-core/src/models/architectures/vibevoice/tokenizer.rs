@@ -114,6 +114,20 @@ impl VibeVoiceAcousticTokenizer {
         })
     }
 
+    pub fn encode_streaming(
+        &self,
+        audio: &Tensor,
+        cache: &mut VibeVoiceTokenizerStreamingCache,
+    ) -> Result<VibeVoiceTokenizerEncoderOutput> {
+        let latents = self
+            .encoder
+            .forward_streaming(audio, cache.encoder_mut(&self.encoder))?;
+        Ok(VibeVoiceTokenizerEncoderOutput {
+            mean: latents.transpose(1, 2)?,
+            std: Some(self.fix_std),
+        })
+    }
+
     pub fn sample(&self, output: &VibeVoiceTokenizerEncoderOutput) -> Result<Tensor> {
         if self.std_dist_type == "none" || self.fix_std == 0.0 {
             return Ok(output.mean.clone());
