@@ -11,7 +11,9 @@ use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::core::{Qwen3Cache, Qwen3Model, Qwen3WeightLayout};
-use crate::models::architectures::vibevoice::config::VibeVoiceConfig;
+use crate::models::architectures::vibevoice::config::{
+    VibeVoiceConfig, VibeVoicePreprocessorConfig,
+};
 use crate::models::architectures::vibevoice::connector::SpeechConnector;
 use crate::models::architectures::vibevoice::prompt::VibeVoicePromptTokenizer;
 use crate::models::architectures::vibevoice::tokenizer::{
@@ -19,8 +21,16 @@ use crate::models::architectures::vibevoice::tokenizer::{
 };
 use crate::models::shared::weights::gguf::load_model_weights;
 
-const TARGET_SAMPLE_RATE: u32 = 24_000;
 const DEFAULT_MAX_NEW_TOKENS: usize = 768;
+
+#[derive(Debug, Clone)]
+struct VibeVoiceAsrPreprocessStats {
+    normalized: bool,
+    target_db_fs: f32,
+    rms_before: f32,
+    gain: f32,
+    clipping_divisor: f32,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VibeVoiceAsrTranscriptionOutput {
@@ -34,6 +44,7 @@ pub struct VibeVoiceAsrModel {
     device: DeviceProfile,
     dtype: DType,
     config: VibeVoiceConfig,
+    preprocessor: VibeVoicePreprocessorConfig,
     tokenizer: VibeVoicePromptTokenizer,
     acoustic_tokenizer: VibeVoiceAcousticTokenizer,
     semantic_tokenizer: VibeVoiceSemanticTokenizer,
@@ -55,6 +66,7 @@ impl VibeVoiceAsrModel {
                 "VibeVoice-ASR loader received a TTS config".to_string(),
             ));
         }
+        let preprocessor = VibeVoicePreprocessorConfig::load(model_dir)?;
         let dtype = std::env::var("IZWI_VIBEVOICE_ASR_DTYPE")
             .ok()
             .as_deref()
@@ -104,6 +116,7 @@ impl VibeVoiceAsrModel {
             device,
             dtype,
             config,
+            preprocessor,
             tokenizer,
             acoustic_tokenizer,
             semantic_tokenizer,
@@ -154,20 +167,37 @@ impl VibeVoiceAsrModel {
                 "VibeVoice-ASR audio input cannot be empty".to_string(),
             ));
         }
-        let resampled = resample_linear(audio, sample_rate, TARGET_SAMPLE_RATE)?;
-        let audio_seconds = resampled.len() as f32 / TARGET_SAMPLE_RATE as f32;
-        let speech = Tensor::from_vec(
-            resampled.clone(),
-            (1, 1, resampled.len()),
-            &self.device.device,
-        )?
-        .to_dtype(self.dtype)?;
+        let (processed_audio, preprocess_stats) =
+            preprocess_asr_audio(audio, sample_rate, &self.preprocessor)?;
+        if processed_audio.is_empty() {
+            return Err(Error::InvalidInput(
+                "VibeVoice-ASR audio input produced no samples after preprocessing".to_string(),
+            ));
+        }
+        let target_sample_rate = self.preprocessor.target_sample_rate();
+        let audio_seconds = processed_audio.len() as f32 / target_sample_rate as f32;
+        let compress_ratio = self.preprocessor.speech_tok_compress_ratio.max(1);
+        let expected_acoustic_frames = asr_placeholder_count(processed_audio.len(), compress_ratio);
+        let mut encoder_audio = processed_audio.clone();
+        let encoder_samples = expected_acoustic_frames.saturating_mul(compress_ratio);
+        if encoder_audio.len() < encoder_samples {
+            encoder_audio.resize(encoder_samples, 0.0);
+        }
+        let speech = Tensor::from_vec(encoder_audio, (1, 1, encoder_samples), &self.device.device)?
+            .to_dtype(self.dtype)?;
         let speech_features = self.encode_speech(&speech)?;
         let acoustic_frames = speech_features.dim(1)?;
+        if acoustic_frames != expected_acoustic_frames {
+            return Err(Error::InferenceError(format!(
+                "VibeVoice-ASR tokenizer produced {acoustic_frames} frames but processor reserved {expected_acoustic_frames}"
+            )));
+        }
         let extra = prompt_instruction(language, prompt);
-        let prompt =
-            self.tokenizer
-                .build_asr_prompt(audio_seconds, acoustic_frames, extra.as_deref())?;
+        let prompt = self.tokenizer.build_asr_prompt(
+            audio_seconds,
+            expected_acoustic_frames,
+            extra.as_deref(),
+        )?;
         let input_ids = Tensor::from_vec(
             prompt.input_ids.clone(),
             (1, prompt.input_ids.len()),
@@ -220,10 +250,18 @@ impl VibeVoiceAsrModel {
                 "audio": {
                     "input_sample_rate": sample_rate,
                     "input_samples": audio.len(),
-                    "resampled_sample_rate": TARGET_SAMPLE_RATE,
-                    "resampled_samples": resampled.len(),
+                    "resampled_sample_rate": target_sample_rate,
+                    "resampled_samples": processed_audio.len(),
+                    "encoder_samples": encoder_samples,
                     "duration_seconds": audio_seconds,
                     "acoustic_frames": acoustic_frames,
+                    "expected_acoustic_frames": expected_acoustic_frames,
+                    "speech_tok_compress_ratio": compress_ratio,
+                    "normalized": preprocess_stats.normalized,
+                    "target_db_fs": preprocess_stats.target_db_fs,
+                    "rms_before_normalization": preprocess_stats.rms_before,
+                    "normalization_gain": preprocess_stats.gain,
+                    "clipping_divisor": preprocess_stats.clipping_divisor,
                 },
                 "prompt": {
                     "tokens": prompt.prompt_token_count,
@@ -320,6 +358,85 @@ fn cleanup_transcript_text(raw: &str) -> String {
         .to_string()
 }
 
+fn preprocess_asr_audio(
+    audio: &[f32],
+    sample_rate: u32,
+    config: &VibeVoicePreprocessorConfig,
+) -> Result<(Vec<f32>, VibeVoiceAsrPreprocessStats)> {
+    let mut resampled = resample_linear(audio, sample_rate, config.target_sample_rate())?;
+    for sample in &mut resampled {
+        if !sample.is_finite() {
+            *sample = 0.0;
+        }
+    }
+    let stats = if config.normalize_audio {
+        normalize_asr_loudness(&mut resampled, config.target_db_fs, config.eps)
+    } else {
+        VibeVoiceAsrPreprocessStats {
+            normalized: false,
+            target_db_fs: config.target_db_fs,
+            rms_before: audio_rms(&resampled),
+            gain: 1.0,
+            clipping_divisor: 1.0,
+        }
+    };
+    Ok((resampled, stats))
+}
+
+fn normalize_asr_loudness(
+    samples: &mut [f32],
+    target_db_fs: f32,
+    eps: f32,
+) -> VibeVoiceAsrPreprocessStats {
+    if samples.is_empty() {
+        return VibeVoiceAsrPreprocessStats {
+            normalized: true,
+            target_db_fs,
+            rms_before: 0.0,
+            gain: 1.0,
+            clipping_divisor: 1.0,
+        };
+    }
+    let rms = audio_rms(samples);
+    let gain = 10f32.powf(target_db_fs / 20.0) / (rms + eps.max(0.0));
+    for sample in samples.iter_mut() {
+        *sample *= gain;
+    }
+
+    let peak = samples.iter().fold(0.0f32, |peak, &s| peak.max(s.abs()));
+    let clipping_divisor = if peak > 1.0 { peak + eps.max(0.0) } else { 1.0 };
+    if clipping_divisor != 1.0 {
+        for sample in samples.iter_mut() {
+            *sample /= clipping_divisor;
+        }
+    }
+
+    VibeVoiceAsrPreprocessStats {
+        normalized: true,
+        target_db_fs,
+        rms_before: rms,
+        gain,
+        clipping_divisor,
+    }
+}
+
+fn audio_rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    (samples
+        .iter()
+        .map(|&sample| (sample as f64) * (sample as f64))
+        .sum::<f64>()
+        / samples.len() as f64)
+        .sqrt() as f32
+}
+
+fn asr_placeholder_count(samples: usize, speech_tok_compress_ratio: usize) -> usize {
+    let ratio = speech_tok_compress_ratio.max(1);
+    samples.saturating_add(ratio - 1) / ratio
+}
+
 fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>> {
     if src_rate == 0 || dst_rate == 0 {
         return Err(Error::InvalidInput(
@@ -353,6 +470,55 @@ mod tests {
     fn resample_linear_preserves_identity_rate() {
         let audio = vec![0.0, 0.5, -0.25];
         assert_eq!(resample_linear(&audio, 24_000, 24_000).unwrap(), audio);
+    }
+
+    #[test]
+    fn asr_placeholder_count_ceil_divides_samples_by_compress_ratio() {
+        assert_eq!(asr_placeholder_count(0, 3_200), 0);
+        assert_eq!(asr_placeholder_count(1, 3_200), 1);
+        assert_eq!(asr_placeholder_count(3_200, 3_200), 1);
+        assert_eq!(asr_placeholder_count(3_201, 3_200), 2);
+        assert_eq!(asr_placeholder_count(9_599, 3_200), 3);
+        assert_eq!(asr_placeholder_count(9_600, 3_200), 3);
+    }
+
+    #[test]
+    fn normalize_asr_loudness_matches_reference_dbfs_formula() {
+        let mut audio = vec![0.5, -0.5, 0.5, -0.5];
+        let stats = normalize_asr_loudness(&mut audio, -20.0, 1e-6);
+
+        let rms = audio_rms(&audio);
+        assert!((rms - 0.1).abs() < 1e-5);
+        assert!(stats.normalized);
+        assert!((stats.rms_before - 0.5).abs() < 1e-6);
+        assert!((stats.gain - 0.2).abs() < 1e-5);
+        assert_eq!(stats.clipping_divisor, 1.0);
+    }
+
+    #[test]
+    fn normalize_asr_loudness_avoids_clipping() {
+        let mut audio = vec![1.0, -1.0];
+        let stats = normalize_asr_loudness(&mut audio, 6.0, 1e-6);
+
+        assert!(stats.clipping_divisor > 1.0);
+        assert!(audio.iter().all(|sample| sample.abs() <= 1.0));
+    }
+
+    #[test]
+    fn preprocess_asr_audio_sanitizes_and_resamples() {
+        let config = VibeVoicePreprocessorConfig {
+            sampling_rate: 4,
+            speech_tok_compress_ratio: 2,
+            normalize_audio: false,
+            target_db_fs: -25.0,
+            eps: 1e-6,
+        };
+        let (audio, stats) =
+            preprocess_asr_audio(&[0.0, f32::NAN, 1.0], 2, &config).expect("preprocess");
+
+        assert_eq!(audio.len(), 6);
+        assert!(audio.iter().all(|sample| sample.is_finite()));
+        assert!(!stats.normalized);
     }
 
     #[test]
