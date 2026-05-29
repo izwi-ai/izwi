@@ -4,7 +4,7 @@ use candle_core::{D, DType, Device, Tensor};
 use candle_nn::{Linear, Module, RmsNorm, VarBuilder, ops};
 
 use crate::error::{Error, Result};
-use crate::kernels::try_fused_silu_mul;
+use crate::kernels::{try_fused_rms_norm, try_fused_silu_mul};
 use crate::models::architectures::vibevoice::config::VibeVoiceDiffusionHeadConfig;
 use crate::models::shared::weights::mlx;
 
@@ -227,6 +227,7 @@ impl HeadLayer {
 struct FinalLayer {
     linear: Linear,
     ada_ln: Linear,
+    unit_norm_weight: Tensor,
     hidden_size: usize,
     eps: f64,
 }
@@ -239,6 +240,7 @@ impl FinalLayer {
         eps: f64,
         vb: VarBuilder,
     ) -> Result<Self> {
+        let unit_norm_weight = Tensor::ones((hidden_size,), vb.dtype(), vb.device())?;
         Ok(Self {
             linear: mlx::load_linear_no_bias(hidden_size, output_size, vb.pp("linear"))?,
             ada_ln: mlx::load_linear_no_bias(
@@ -246,6 +248,7 @@ impl FinalLayer {
                 2 * hidden_size,
                 vb.pp("adaLN_modulation.1"),
             )?,
+            unit_norm_weight,
             hidden_size,
             eps,
         })
@@ -255,7 +258,7 @@ impl FinalLayer {
         let modulation = self.ada_ln.forward(&ops::silu(c)?)?;
         let shift = modulation.narrow(D::Minus1, 0, self.hidden_size)?;
         let scale = modulation.narrow(D::Minus1, self.hidden_size, self.hidden_size)?;
-        let normed = rms_norm_no_affine(x, self.eps)?;
+        let normed = rms_norm_no_affine(x, self.eps, &self.unit_norm_weight)?;
         let modulated = modulate(&normed, &shift, &scale)?;
         self.linear.forward(&modulated).map_err(Error::from)
     }
@@ -267,7 +270,13 @@ fn modulate(x: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
     scaled.broadcast_add(shift).map_err(Error::from)
 }
 
-fn rms_norm_no_affine(x: &Tensor, eps: f64) -> Result<Tensor> {
+fn rms_norm_no_affine(x: &Tensor, eps: f64, unit_weight: &Tensor) -> Result<Tensor> {
+    if x.device().is_cuda() {
+        let unit_weight = unit_weight.to_device(x.device())?.to_dtype(x.dtype())?;
+        if let Some(output) = try_fused_rms_norm(x, &unit_weight, eps) {
+            return Ok(output);
+        }
+    }
     let squared = x.sqr()?;
     let mean = squared.mean_keepdim(D::Minus1)?;
     let eps = Tensor::new(eps as f32, x.device())?.to_dtype(x.dtype())?;
@@ -616,6 +625,26 @@ mod tests {
         assert_tensor_close(
             &output,
             &Tensor::from_vec(vec![1.75f32, -1.25], (1, 2), &device).unwrap(),
+            1e-2,
+        );
+    }
+
+    #[test]
+    fn rms_norm_no_affine_keeps_bf16_manual_path_in_bf16() {
+        let device = Device::Cpu;
+        let x = Tensor::from_vec(vec![3.0f32, 4.0], (1, 2), &device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let unit_weight = Tensor::ones((2,), DType::BF16, &device).unwrap();
+
+        let output = rms_norm_no_affine(&x, 0.0, &unit_weight).unwrap();
+
+        assert_eq!(output.dtype(), DType::BF16);
+        let output = output.to_dtype(DType::F32).unwrap();
+        assert_tensor_close(
+            &output,
+            &Tensor::from_vec(vec![0.84852815f32, 1.1313709], (1, 2), &device).unwrap(),
             1e-2,
         );
     }
