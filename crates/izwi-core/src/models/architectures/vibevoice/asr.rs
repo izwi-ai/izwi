@@ -19,11 +19,13 @@ use crate::models::architectures::vibevoice::config::{
 use crate::models::architectures::vibevoice::connector::SpeechConnector;
 use crate::models::architectures::vibevoice::prompt::VibeVoicePromptTokenizer;
 use crate::models::architectures::vibevoice::tokenizer::{
-    VibeVoiceAcousticTokenizer, VibeVoiceSemanticTokenizer,
+    VibeVoiceAcousticTokenizer, VibeVoiceSemanticTokenizer, VibeVoiceTokenizerEncoderOutput,
+    VibeVoiceTokenizerStreamingCache,
 };
 use crate::models::shared::weights::gguf::load_model_weights;
 
 const DEFAULT_MAX_NEW_TOKENS: usize = 768;
+const TOKENIZER_STREAMING_CHUNK_SECONDS: usize = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VibeVoiceAsrGenerationOptions {
@@ -65,6 +67,13 @@ struct VibeVoiceAsrPreprocessStats {
     rms_before: f32,
     gain: f32,
     clipping_divisor: f32,
+}
+
+#[derive(Debug, Clone)]
+struct VibeVoiceAsrEncodeStats {
+    streaming: bool,
+    chunks: usize,
+    chunk_samples: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,7 +270,7 @@ impl VibeVoiceAsrModel {
         let speech = Tensor::from_vec(encoder_audio, (1, 1, encoder_samples), &self.device.device)?
             .to_dtype(self.dtype)?;
         let audio_encode_started = Instant::now();
-        let speech_features = self.encode_speech(&speech)?;
+        let (speech_features, encode_stats) = self.encode_speech(&speech)?;
         let audio_encode_ms = elapsed_ms(audio_encode_started);
         let acoustic_frames = speech_features.dim(1)?;
         if acoustic_frames != expected_acoustic_frames {
@@ -366,6 +375,9 @@ impl VibeVoiceAsrModel {
                     "rms_before_normalization": preprocess_stats.rms_before,
                     "normalization_gain": preprocess_stats.gain,
                     "clipping_divisor": preprocess_stats.clipping_divisor,
+                    "tokenizer_streaming": encode_stats.streaming,
+                    "tokenizer_chunks": encode_stats.chunks,
+                    "tokenizer_chunk_samples": encode_stats.chunk_samples,
                 },
                 "prompt": {
                     "tokens": prompt.prompt_token_count,
@@ -405,7 +417,30 @@ impl VibeVoiceAsrModel {
         })
     }
 
-    fn encode_speech(&self, speech: &Tensor) -> Result<Tensor> {
+    fn encode_speech(&self, speech: &Tensor) -> Result<(Tensor, VibeVoiceAsrEncodeStats)> {
+        let total_samples = speech.dim(2)?;
+        let chunk_samples = tokenizer_streaming_chunk_samples(
+            self.preprocessor.target_sample_rate(),
+            self.preprocessor.speech_tok_compress_ratio,
+        );
+        let can_stream = total_samples > chunk_samples
+            && self.config.acoustic_tokenizer_config.causal
+            && self.config.semantic_tokenizer_config.causal;
+        if can_stream {
+            return self.encode_speech_streaming(speech, chunk_samples);
+        }
+
+        Ok((
+            self.encode_speech_full(speech)?,
+            VibeVoiceAsrEncodeStats {
+                streaming: false,
+                chunks: 1,
+                chunk_samples: total_samples,
+            },
+        ))
+    }
+
+    fn encode_speech_full(&self, speech: &Tensor) -> Result<Tensor> {
         let acoustic = self.acoustic_tokenizer.encode(speech)?;
         let acoustic = self.acoustic_tokenizer.sample(&acoustic)?;
         let acoustic = self.acoustic_connector.forward(&acoustic)?;
@@ -413,6 +448,57 @@ impl VibeVoiceAsrModel {
         let semantic = self.semantic_tokenizer.encode(speech)?.mode();
         let semantic = self.semantic_connector.forward(&semantic)?;
 
+        self.combine_speech_features(acoustic, semantic)
+    }
+
+    fn encode_speech_streaming(
+        &self,
+        speech: &Tensor,
+        chunk_samples: usize,
+    ) -> Result<(Tensor, VibeVoiceAsrEncodeStats)> {
+        let total_samples = speech.dim(2)?;
+        let ranges = tokenizer_chunk_ranges(total_samples, chunk_samples);
+        let mut acoustic_cache = VibeVoiceTokenizerStreamingCache::new();
+        let mut semantic_cache = VibeVoiceTokenizerStreamingCache::new();
+        let mut acoustic_means = Vec::with_capacity(ranges.len());
+        let mut semantic_means = Vec::with_capacity(ranges.len());
+        let mut acoustic_std = None;
+
+        for (start, len) in &ranges {
+            let chunk = speech.narrow(2, *start, *len)?;
+            let acoustic = self
+                .acoustic_tokenizer
+                .encode_streaming(&chunk, &mut acoustic_cache)?;
+            acoustic_std = acoustic_std.or(acoustic.std);
+            acoustic_means.push(acoustic.mean);
+
+            let semantic = self
+                .semantic_tokenizer
+                .encode_streaming(&chunk, &mut semantic_cache)?;
+            semantic_means.push(semantic.mean);
+        }
+
+        let acoustic = VibeVoiceTokenizerEncoderOutput {
+            mean: Tensor::cat(&acoustic_means, 1)?,
+            std: acoustic_std,
+        };
+        let acoustic = self.acoustic_tokenizer.sample(&acoustic)?;
+        let acoustic = self.acoustic_connector.forward(&acoustic)?;
+
+        let semantic = Tensor::cat(&semantic_means, 1)?;
+        let semantic = self.semantic_connector.forward(&semantic)?;
+        let features = self.combine_speech_features(acoustic, semantic)?;
+        Ok((
+            features,
+            VibeVoiceAsrEncodeStats {
+                streaming: true,
+                chunks: ranges.len(),
+                chunk_samples,
+            },
+        ))
+    }
+
+    fn combine_speech_features(&self, acoustic: Tensor, semantic: Tensor) -> Result<Tensor> {
         if acoustic.dims() != semantic.dims() {
             return Err(Error::InferenceError(format!(
                 "VibeVoice-ASR acoustic/semantic feature shape mismatch: {:?} vs {:?}",
@@ -798,6 +884,28 @@ fn asr_placeholder_count(samples: usize, speech_tok_compress_ratio: usize) -> us
     samples.saturating_add(ratio - 1) / ratio
 }
 
+fn tokenizer_streaming_chunk_samples(sample_rate: u32, speech_tok_compress_ratio: usize) -> usize {
+    let ratio = speech_tok_compress_ratio.max(1);
+    let raw = sample_rate as usize * TOKENIZER_STREAMING_CHUNK_SECONDS;
+    let aligned = raw / ratio * ratio;
+    aligned.max(ratio)
+}
+
+fn tokenizer_chunk_ranges(total_samples: usize, chunk_samples: usize) -> Vec<(usize, usize)> {
+    if total_samples == 0 {
+        return Vec::new();
+    }
+    let chunk_samples = chunk_samples.max(1);
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    while start < total_samples {
+        let len = chunk_samples.min(total_samples - start);
+        ranges.push((start, len));
+        start = start.saturating_add(len);
+    }
+    ranges
+}
+
 fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>> {
     if src_rate == 0 || dst_rate == 0 {
         return Err(Error::InvalidInput(
@@ -841,6 +949,23 @@ mod tests {
         assert_eq!(asr_placeholder_count(3_201, 3_200), 2);
         assert_eq!(asr_placeholder_count(9_599, 3_200), 3);
         assert_eq!(asr_placeholder_count(9_600, 3_200), 3);
+    }
+
+    #[test]
+    fn tokenizer_streaming_chunk_size_uses_aligned_sixty_second_windows() {
+        assert_eq!(tokenizer_streaming_chunk_samples(24_000, 3_200), 1_440_000);
+        assert_eq!(tokenizer_streaming_chunk_samples(1_000, 3_200), 57_600);
+        assert_eq!(tokenizer_streaming_chunk_samples(10, 3_200), 3_200);
+    }
+
+    #[test]
+    fn tokenizer_chunk_ranges_cover_audio_without_overlap() {
+        let ranges = tokenizer_chunk_ranges(10_000, 3_200);
+
+        assert_eq!(
+            ranges,
+            vec![(0, 3_200), (3_200, 3_200), (6_400, 3_200), (9_600, 400)]
+        );
     }
 
     #[test]
