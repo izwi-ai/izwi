@@ -93,9 +93,21 @@ pub struct Qwen3Cache {
     dense_v_cache_h: Vec<Option<Tensor>>,
     dense_kv_tokens: Vec<usize>,
     dense_decode_overflowed: Vec<bool>,
+    rope_cache: Vec<Qwen3RopeCacheEntry>,
     dense_decode_max_tokens: usize,
     page_size: usize,
     quantization: KvCacheQuantization,
+}
+
+struct Qwen3RopeCacheEntry {
+    seq_len: usize,
+    start_pos: usize,
+    head_dim: usize,
+    dtype: DType,
+    use_mrope: bool,
+    mrope_section: Vec<usize>,
+    cos_half: Tensor,
+    sin_half: Tensor,
 }
 
 impl Qwen3Cache {
@@ -186,6 +198,7 @@ impl Qwen3Cache {
             dense_v_cache_h: vec![None; num_layers],
             dense_kv_tokens: vec![0; num_layers],
             dense_decode_overflowed: vec![false; num_layers],
+            rope_cache: Vec::new(),
             dense_decode_max_tokens,
             page_size: page_size.max(1),
             quantization,
@@ -310,6 +323,63 @@ impl Qwen3Cache {
         let k = self.dense_k_cache_h.get(layer)?.as_ref()?;
         let v = self.dense_v_cache_h.get(layer)?.as_ref()?;
         Some((k, v))
+    }
+
+    fn cached_rope_pair(
+        &mut self,
+        seq_len: usize,
+        start_pos: usize,
+        head_dim: usize,
+        device: &Device,
+        dtype: DType,
+        use_mrope: bool,
+        mrope_section: &[usize],
+        inv_freqs: &[f32],
+    ) -> Result<(Tensor, Tensor)> {
+        if let Some(entry) = self.rope_cache.iter().find(|entry| {
+            entry.seq_len == seq_len
+                && entry.start_pos == start_pos
+                && entry.head_dim == head_dim
+                && entry.dtype == dtype
+                && entry.use_mrope == use_mrope
+                && entry.mrope_section == mrope_section
+        }) {
+            return Ok((entry.cos_half.clone(), entry.sin_half.clone()));
+        }
+
+        let (cos_half, sin_half) = if use_mrope {
+            let mut data = Vec::with_capacity(3 * seq_len);
+            let base = start_pos as i64;
+            for _axis in 0..3 {
+                for idx in 0..seq_len {
+                    data.push(base + idx as i64);
+                }
+            }
+            let position_ids = Tensor::from_vec(data, (3, seq_len), device)?;
+            build_mrope_cache_with_inv_freqs(
+                seq_len,
+                head_dim,
+                device,
+                dtype,
+                &position_ids,
+                mrope_section,
+                inv_freqs,
+            )?
+        } else {
+            build_rope_cache_with_inv_freqs(seq_len, start_pos, device, dtype, inv_freqs)?
+        };
+
+        self.rope_cache.push(Qwen3RopeCacheEntry {
+            seq_len,
+            start_pos,
+            head_dim,
+            dtype,
+            use_mrope,
+            mrope_section: mrope_section.to_vec(),
+            cos_half: cos_half.clone(),
+            sin_half: sin_half.clone(),
+        });
+        Ok((cos_half, sin_half))
     }
 }
 
@@ -671,6 +741,7 @@ impl Qwen3Attention {
         k: Tensor,
         start_pos: usize,
         position_ids: Option<&Tensor>,
+        cache: Option<&mut Qwen3Cache>,
     ) -> Result<(Tensor, Tensor)> {
         let seq_len = q.dim(1)?;
         if k.dim(1)? != seq_len {
@@ -683,19 +754,46 @@ impl Qwen3Attention {
         let q = q.contiguous()?;
         let k = k.contiguous()?;
 
-        let (cos_half, sin_half) = if self.use_mrope {
-            let position_ids = if let Some(position_ids) = position_ids {
-                position_ids.clone()
+        let (cos_half, sin_half) = if let Some(position_ids) = position_ids {
+            if self.use_mrope {
+                build_mrope_cache_with_inv_freqs(
+                    seq_len,
+                    self.head_dim,
+                    q.device(),
+                    q.dtype(),
+                    position_ids,
+                    self.mrope_section.as_deref().unwrap_or(&[]),
+                    &self.rope_inv_freqs,
+                )?
             } else {
-                let mut data = Vec::with_capacity(3 * seq_len);
-                let base = start_pos as i64;
-                for _axis in 0..3 {
-                    for idx in 0..seq_len {
-                        data.push(base + idx as i64);
-                    }
+                build_rope_cache_with_inv_freqs(
+                    seq_len,
+                    start_pos,
+                    q.device(),
+                    q.dtype(),
+                    &self.rope_inv_freqs,
+                )?
+            }
+        } else if let Some(cache) = cache {
+            cache.cached_rope_pair(
+                seq_len,
+                start_pos,
+                self.head_dim,
+                q.device(),
+                q.dtype(),
+                self.use_mrope,
+                self.mrope_section.as_deref().unwrap_or(&[]),
+                &self.rope_inv_freqs,
+            )?
+        } else if self.use_mrope {
+            let mut data = Vec::with_capacity(3 * seq_len);
+            let base = start_pos as i64;
+            for _axis in 0..3 {
+                for idx in 0..seq_len {
+                    data.push(base + idx as i64);
                 }
-                Tensor::from_vec(data, (3, seq_len), q.device())?
-            };
+            }
+            let position_ids = Tensor::from_vec(data, (3, seq_len), q.device())?;
             build_mrope_cache_with_inv_freqs(
                 seq_len,
                 self.head_dim,
@@ -748,7 +846,7 @@ impl Qwen3Attention {
         x: &Tensor,
         start_pos: usize,
         position_ids: Option<&Tensor>,
-        cache: Option<&mut Qwen3Cache>,
+        mut cache: Option<&mut Qwen3Cache>,
         layer_idx: usize,
     ) -> Result<Tensor> {
         let bsz = x.dim(0)?;
@@ -771,7 +869,7 @@ impl Qwen3Attention {
         q = self.apply_qk_norm(q, &self.q_norm, self.num_heads, seq_len)?;
         k = self.apply_qk_norm(k, &self.k_norm, self.num_kv_heads, seq_len)?;
 
-        (q, k) = self.apply_rope_pair(q, k, start_pos, position_ids)?;
+        (q, k) = self.apply_rope_pair(q, k, start_pos, position_ids, cache.as_deref_mut())?;
 
         let (k, v) = if let Some(cache) = cache {
             cache.append(layer_idx, k.clone(), v.clone())?;
@@ -1828,6 +1926,36 @@ mod tests {
         cache.append(0, k_next, v_next).expect("append next");
         let (k_dense, _) = cache.dense_heads(0).expect("dense heads after append");
         assert_eq!(k_dense.dims4().expect("k dims"), (1, 1, 3, 4));
+    }
+
+    #[test]
+    fn qwen3_cache_reuses_rope_windows() {
+        let device = Device::Cpu;
+        let mut cache = Qwen3Cache::new(1);
+        let head_dim = 8usize;
+        let inv_freqs = build_rope_inv_freqs(head_dim, 10000.0);
+
+        let (first_cos, first_sin) = cache
+            .cached_rope_pair(2, 4, head_dim, &device, DType::F32, false, &[], &inv_freqs)
+            .expect("first rope cache");
+        let (second_cos, second_sin) = cache
+            .cached_rope_pair(2, 4, head_dim, &device, DType::F32, false, &[], &inv_freqs)
+            .expect("cached rope cache");
+
+        assert_eq!(cache.rope_cache.len(), 1);
+        assert_eq!(
+            first_cos.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            second_cos.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+        assert_eq!(
+            first_sin.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            second_sin.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+
+        cache
+            .cached_rope_pair(2, 5, head_dim, &device, DType::F32, false, &[], &inv_freqs)
+            .expect("new rope window");
+        assert_eq!(cache.rope_cache.len(), 2);
     }
 
     #[test]
