@@ -12,7 +12,7 @@ use crate::tokenizer::Tokenizer;
 
 const TTS_SYSTEM_PROMPT: &str = " Transform the text provided by various speakers into speech output, utilizing the distinct voice of each respective speaker.\n";
 const ASR_SYSTEM_PROMPT: &str =
-    "You are a speech recognition model. Transcribe the user's audio faithfully.";
+    "You are a helpful assistant that transcribes audio input into text output in JSON format.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VibeVoiceSpecialTokens {
@@ -144,15 +144,18 @@ impl VibeVoicePromptTokenizer {
         let end = input_ids.len();
         input_ids.push(self.specials.object_ref_end);
         input_ids.extend(self.encode_text(&format!(
-            "\nThis is a {:.1} seconds audio, ",
+            "\nThis is a {:.2} seconds audio,",
             audio_seconds.max(0.0)
         ))?);
         if let Some(extra) = extra_instruction.filter(|extra| !extra.trim().is_empty()) {
+            input_ids.extend(self.encode_text(" with extra info: ")?);
             input_ids.extend(self.encode_text(extra.trim())?);
+            input_ids.extend(self.encode_text("\n\n")?);
+        } else {
             input_ids.extend(self.encode_text(" ")?);
         }
         input_ids.extend(self.encode_text(
-            "Please transcribe it with these keys: Start time, End time, Speaker ID, Content",
+            "please transcribe it with these keys: Start time, End time, Speaker ID, Content",
         )?);
         input_ids.push(self.specials.im_end);
         input_ids.extend(self.encode_text("\n")?);
