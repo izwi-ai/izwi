@@ -1,11 +1,12 @@
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
+use crate::models::registry::NativeAsrGenerationOptions;
 use std::time::Instant;
 
 use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
-use super::audio::{AsrChunkTranscription, decode_request_audio_with_rate};
+use super::audio::{decode_request_audio_with_rate, AsrChunkTranscription};
 use super::state::ActiveAsrDecode;
 use super::{ExecutorOutput, NativeExecutor};
 
@@ -21,6 +22,7 @@ impl NativeExecutor {
         let family = variant.family();
         let language = request.language.as_deref();
         let asr_prompt = request.asr_prompt.as_deref();
+        let generation_options = Self::asr_generation_options(request);
         let stream_tx = Self::stream_sender(request);
         let stream_policy = request.stream_policy;
 
@@ -80,12 +82,14 @@ impl NativeExecutor {
                                     &chunk_plan.config,
                                     chunk_stream_options,
                                     |chunk_audio, sr| {
-                                        let details = model.transcribe_with_details_and_prompt(
-                                            chunk_audio,
-                                            sr,
-                                            language,
-                                            asr_prompt,
-                                        )?;
+                                        let details = model
+                                            .transcribe_with_details_and_prompt_and_options(
+                                                chunk_audio,
+                                                sr,
+                                                language,
+                                                asr_prompt,
+                                                generation_options.clone(),
+                                            )?;
                                         Ok(AsrChunkTranscription {
                                             text: details.text,
                                             diagnostics: details.diagnostics,
@@ -338,11 +342,12 @@ impl NativeExecutor {
                     &chunk_plan.chunks,
                     &chunk_plan.config,
                     |chunk_audio, sr| {
-                        let details = model.transcribe_with_details_and_prompt(
+                        let details = model.transcribe_with_details_and_prompt_and_options(
                             chunk_audio,
                             sr,
                             language,
                             asr_prompt,
+                            generation_options.clone(),
                         )?;
                         Ok(AsrChunkTranscription {
                             text: details.text,
@@ -374,11 +379,12 @@ impl NativeExecutor {
                             }
                         }
                     };
-                    let text = model.transcribe_with_callback_and_prompt(
+                    let text = model.transcribe_with_callback_and_prompt_and_options(
                         &samples,
                         sample_rate,
                         language,
                         asr_prompt,
+                        generation_options.clone(),
                         &mut emit,
                     )?;
                     if let Some(err) = stream_err {
@@ -393,11 +399,12 @@ impl NativeExecutor {
                     return Ok((text, None));
                 }
             }
-            let details = model.transcribe_with_details_and_prompt(
+            let details = model.transcribe_with_details_and_prompt_and_options(
                 &samples,
                 sample_rate,
                 language,
                 asr_prompt,
+                generation_options.clone(),
             )?;
             Ok((details.text, details.diagnostics))
         })?;
@@ -450,6 +457,14 @@ impl NativeExecutor {
         }
 
         Some(payload)
+    }
+
+    fn asr_generation_options(request: &EngineCoreRequest) -> NativeAsrGenerationOptions {
+        NativeAsrGenerationOptions {
+            max_new_tokens: request.params.max_tokens.max(1),
+            stop_token_ids: request.params.stop_token_ids.clone(),
+            stop_sequences: request.params.stop_sequences.clone(),
+        }
     }
 }
 

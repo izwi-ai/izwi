@@ -1,8 +1,10 @@
 //! Native VibeVoice-ASR model path.
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use candle_core::{DType, IndexOp, Tensor};
+use serde::Serialize;
 use serde_json::json;
 use tracing::info;
 
@@ -22,6 +24,39 @@ use crate::models::architectures::vibevoice::tokenizer::{
 use crate::models::shared::weights::gguf::load_model_weights;
 
 const DEFAULT_MAX_NEW_TOKENS: usize = 768;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VibeVoiceAsrGenerationOptions {
+    pub max_new_tokens: usize,
+    pub stop_token_ids: Vec<u32>,
+    pub stop_sequences: Vec<String>,
+}
+
+impl Default for VibeVoiceAsrGenerationOptions {
+    fn default() -> Self {
+        Self {
+            max_new_tokens: DEFAULT_MAX_NEW_TOKENS,
+            stop_token_ids: Vec::new(),
+            stop_sequences: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct VibeVoiceAsrSegment {
+    start_time: Option<f32>,
+    end_time: Option<f32>,
+    speaker_id: Option<String>,
+    content: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct VibeVoiceAsrParsedOutput {
+    text: String,
+    raw_text: String,
+    format: &'static str,
+    segments: Vec<VibeVoiceAsrSegment>,
+}
 
 #[derive(Debug, Clone)]
 struct VibeVoiceAsrPreprocessStats {
@@ -133,8 +168,25 @@ impl VibeVoiceAsrModel {
         language: Option<&str>,
         prompt: Option<&str>,
     ) -> Result<VibeVoiceAsrTranscriptionOutput> {
+        self.transcribe_with_details_and_prompt_and_options(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            VibeVoiceAsrGenerationOptions::default(),
+        )
+    }
+
+    pub fn transcribe_with_details_and_prompt_and_options(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        options: VibeVoiceAsrGenerationOptions,
+    ) -> Result<VibeVoiceAsrTranscriptionOutput> {
         let mut no_op = |_delta: &str| {};
-        self.transcribe_internal(audio, sample_rate, language, prompt, &mut no_op)
+        self.transcribe_internal(audio, sample_rate, language, prompt, options, &mut no_op)
     }
 
     pub fn transcribe_with_callback_and_prompt(
@@ -145,8 +197,27 @@ impl VibeVoiceAsrModel {
         prompt: Option<&str>,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<String> {
+        self.transcribe_with_callback_and_prompt_and_options(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            VibeVoiceAsrGenerationOptions::default(),
+            on_delta,
+        )
+    }
+
+    pub fn transcribe_with_callback_and_prompt_and_options(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        options: VibeVoiceAsrGenerationOptions,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<String> {
         Ok(self
-            .transcribe_internal(audio, sample_rate, language, prompt, on_delta)?
+            .transcribe_internal(audio, sample_rate, language, prompt, options, on_delta)?
             .text)
     }
 
@@ -160,6 +231,7 @@ impl VibeVoiceAsrModel {
         sample_rate: u32,
         language: Option<&str>,
         prompt: Option<&str>,
+        options: VibeVoiceAsrGenerationOptions,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<VibeVoiceAsrTranscriptionOutput> {
         if audio.is_empty() {
@@ -167,8 +239,11 @@ impl VibeVoiceAsrModel {
                 "VibeVoice-ASR audio input cannot be empty".to_string(),
             ));
         }
+        let total_started = Instant::now();
+        let preprocess_started = Instant::now();
         let (processed_audio, preprocess_stats) =
             preprocess_asr_audio(audio, sample_rate, &self.preprocessor)?;
+        let preprocess_ms = elapsed_ms(preprocess_started);
         if processed_audio.is_empty() {
             return Err(Error::InvalidInput(
                 "VibeVoice-ASR audio input produced no samples after preprocessing".to_string(),
@@ -185,7 +260,9 @@ impl VibeVoiceAsrModel {
         }
         let speech = Tensor::from_vec(encoder_audio, (1, 1, encoder_samples), &self.device.device)?
             .to_dtype(self.dtype)?;
+        let audio_encode_started = Instant::now();
         let speech_features = self.encode_speech(&speech)?;
+        let audio_encode_ms = elapsed_ms(audio_encode_started);
         let acoustic_frames = speech_features.dim(1)?;
         if acoustic_frames != expected_acoustic_frames {
             return Err(Error::InferenceError(format!(
@@ -211,38 +288,65 @@ impl VibeVoiceAsrModel {
         )?;
 
         let mut cache = Qwen3Cache::new(self.language_model.num_layers());
+        let prefill_started = Instant::now();
         let logits =
             self.language_model
                 .forward_with_embeds(&input_embeds, 0, Some(&mut cache), None)?;
+        let prefill_ms = elapsed_ms(prefill_started);
         let mut pos = prompt.input_ids.len();
         let mut next = argmax_last_logits(&logits)?;
         let mut generated = Vec::new();
         let mut assembled = String::new();
-        let stop_tokens = [
+        let built_in_stop_tokens = [
             self.tokenizer.specials().im_end,
             self.tokenizer.specials().endoftext,
         ];
+        let stop_tokens = collect_stop_token_ids(&built_in_stop_tokens, &options.stop_token_ids);
+        let stop_sequences = sanitize_stop_sequences(&options.stop_sequences);
+        let max_new_tokens = options.max_new_tokens.max(1);
+        let mut stop_reason = None::<&'static str>;
+        let mut stop_token_id = None::<u32>;
+        let mut stop_sequence = None::<String>;
+        let decode_started = Instant::now();
 
-        for _ in 0..DEFAULT_MAX_NEW_TOKENS {
+        for _ in 0..max_new_tokens {
             if stop_tokens.contains(&next) {
+                stop_reason = Some(if built_in_stop_tokens.contains(&next) {
+                    "model_stop_token"
+                } else {
+                    "request_stop_token"
+                });
+                stop_token_id = Some(next);
                 break;
             }
             generated.push(next);
             let decoded = self.tokenizer.decode(&generated)?;
-            if decoded.len() > assembled.len() {
-                on_delta(&decoded[assembled.len()..]);
+            let (visible_decoded, matched_stop_sequence) =
+                truncate_at_stop_sequence(&decoded, &stop_sequences);
+            if visible_decoded.len() > assembled.len() {
+                on_delta(&visible_decoded[assembled.len()..]);
             }
-            assembled = decoded;
+            assembled = visible_decoded;
+            if let Some(sequence) = matched_stop_sequence {
+                stop_reason = Some("stop_sequence");
+                stop_sequence = Some(sequence);
+                break;
+            }
 
             let token = Tensor::from_vec(vec![next], (1, 1), &self.device.device)?;
             let logits = self.language_model.forward(&token, pos, Some(&mut cache))?;
             pos += 1;
             next = argmax_last_logits(&logits)?;
         }
+        let decode_ms = elapsed_ms(decode_started);
+        let reached_max_tokens = stop_reason.is_none() && generated.len() >= max_new_tokens;
+        if reached_max_tokens {
+            stop_reason = Some("max_tokens");
+        }
 
-        let text = cleanup_transcript_text(&assembled);
+        let parsed = parse_vibevoice_asr_output(&assembled);
         Ok(VibeVoiceAsrTranscriptionOutput {
-            text,
+            text: parsed.text.clone(),
             language: language.map(ToOwned::to_owned),
             diagnostics: Some(json!({
                 "model_family": "vibevoice_asr",
@@ -271,12 +375,31 @@ impl VibeVoiceAsrModel {
                 },
                 "decode": {
                     "generated_tokens": generated.len(),
-                    "max_new_tokens": DEFAULT_MAX_NEW_TOKENS,
+                    "max_new_tokens": max_new_tokens,
+                    "stop_reason": stop_reason,
+                    "stop_token_id": stop_token_id,
+                    "stop_sequence": stop_sequence,
+                    "reached_max_tokens": reached_max_tokens,
+                    "configured_stop_token_ids": options.stop_token_ids,
+                    "configured_stop_sequences": stop_sequences,
+                },
+                "output": {
+                    "format": parsed.format,
+                    "raw_text": parsed.raw_text,
+                    "segment_count": parsed.segments.len(),
+                    "segments": parsed.segments,
                 },
                 "execution": {
                     "dtype": format!("{:?}", self.dtype),
                     "device_kind": format!("{:?}", self.device.kind),
                     "decoder_layers": self.config.decoder_config.num_hidden_layers,
+                },
+                "timings_ms": {
+                    "preprocess": preprocess_ms,
+                    "audio_encode": audio_encode_ms,
+                    "prefill": prefill_ms,
+                    "decode": decode_ms,
+                    "model_total": elapsed_ms(total_started),
                 }
             })),
         })
@@ -351,11 +474,249 @@ fn argmax_last_logits(logits: &Tensor) -> Result<u32> {
         .ok_or_else(|| Error::InferenceError("VibeVoice-ASR logits row was empty".to_string()))
 }
 
+fn collect_stop_token_ids(built_in: &[u32], requested: &[u32]) -> Vec<u32> {
+    let mut stop_tokens = Vec::with_capacity(built_in.len() + requested.len());
+    for token in built_in.iter().chain(requested.iter()).copied() {
+        if !stop_tokens.contains(&token) {
+            stop_tokens.push(token);
+        }
+    }
+    stop_tokens
+}
+
+fn sanitize_stop_sequences(sequences: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for sequence in sequences {
+        let trimmed = sequence.trim();
+        if !trimmed.is_empty() && !out.iter().any(|existing: &String| existing == trimmed) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
+fn truncate_at_stop_sequence(text: &str, stop_sequences: &[String]) -> (String, Option<String>) {
+    let mut earliest: Option<(usize, &str)> = None;
+    for sequence in stop_sequences {
+        let Some(idx) = text.find(sequence) else {
+            continue;
+        };
+        if earliest
+            .map(|(existing_idx, _)| idx < existing_idx)
+            .unwrap_or(true)
+        {
+            earliest = Some((idx, sequence.as_str()));
+        }
+    }
+
+    if let Some((idx, sequence)) = earliest {
+        (text[..idx].to_string(), Some(sequence.to_string()))
+    } else {
+        (text.to_string(), None)
+    }
+}
+
+fn parse_vibevoice_asr_output(raw: &str) -> VibeVoiceAsrParsedOutput {
+    let raw_text = cleanup_transcript_text(raw);
+    for candidate in json_output_candidates(&raw_text) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&candidate) else {
+            continue;
+        };
+        let segments = vibevoice_segments_from_value(&value);
+        if !segments.is_empty() {
+            return VibeVoiceAsrParsedOutput {
+                text: join_segment_contents(&segments),
+                raw_text,
+                format: "segments",
+                segments,
+            };
+        }
+    }
+
+    VibeVoiceAsrParsedOutput {
+        text: raw_text.clone(),
+        raw_text,
+        format: "text",
+        segments: Vec::new(),
+    }
+}
+
+fn json_output_candidates(text: &str) -> Vec<String> {
+    let stripped = strip_json_code_fence(text.trim());
+    let mut candidates = Vec::new();
+    push_unique_candidate(&mut candidates, stripped);
+
+    if let Some(candidate) = balanced_json_slice(stripped, '[', ']') {
+        push_unique_candidate(&mut candidates, candidate);
+    }
+    if let Some(candidate) = balanced_json_slice(stripped, '{', '}') {
+        push_unique_candidate(&mut candidates, candidate);
+    }
+
+    candidates
+}
+
+fn strip_json_code_fence(text: &str) -> &str {
+    let trimmed = text.trim();
+    let Some(rest) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    let rest = rest
+        .strip_prefix("json")
+        .or_else(|| rest.strip_prefix("JSON"))
+        .unwrap_or(rest)
+        .trim_start_matches(|ch: char| ch.is_whitespace());
+    rest.rsplit_once("```")
+        .map(|(body, _)| body.trim())
+        .unwrap_or(trimmed)
+}
+
+fn balanced_json_slice(text: &str, open: char, close: char) -> Option<&str> {
+    let start = text.find(open)?;
+    let end = text.rfind(close)?;
+    (end >= start).then(|| text[start..=end].trim())
+}
+
+fn push_unique_candidate(candidates: &mut Vec<String>, candidate: &str) {
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        return;
+    }
+    if !candidates.iter().any(|existing| existing == candidate) {
+        candidates.push(candidate.to_string());
+    }
+}
+
+fn vibevoice_segments_from_value(value: &serde_json::Value) -> Vec<VibeVoiceAsrSegment> {
+    match value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(vibevoice_segment_from_value)
+            .collect(),
+        serde_json::Value::Object(map) => {
+            if let Some(segment) = vibevoice_segment_from_map(map) {
+                return vec![segment];
+            }
+            for key in [
+                "segments",
+                "transcription",
+                "transcript",
+                "results",
+                "utterances",
+            ] {
+                if let Some(segments) = get_value_case_insensitive(map, key)
+                    .map(vibevoice_segments_from_value)
+                    .filter(|segments| !segments.is_empty())
+                {
+                    return segments;
+                }
+            }
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn vibevoice_segment_from_value(value: &serde_json::Value) -> Option<VibeVoiceAsrSegment> {
+    let serde_json::Value::Object(map) = value else {
+        return None;
+    };
+    vibevoice_segment_from_map(map)
+}
+
+fn vibevoice_segment_from_map(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Option<VibeVoiceAsrSegment> {
+    let content = ["Content", "content", "Text", "text", "transcript"]
+        .iter()
+        .find_map(|key| get_value_case_insensitive(map, key).and_then(value_to_string))
+        .unwrap_or_default();
+    let content = content.trim().to_string();
+    if content.is_empty() {
+        return None;
+    }
+
+    Some(VibeVoiceAsrSegment {
+        start_time: ["Start time", "start_time", "start", "begin"]
+            .iter()
+            .find_map(|key| get_value_case_insensitive(map, key).and_then(value_to_seconds)),
+        end_time: ["End time", "end_time", "end", "stop"]
+            .iter()
+            .find_map(|key| get_value_case_insensitive(map, key).and_then(value_to_seconds)),
+        speaker_id: ["Speaker ID", "speaker_id", "speaker", "speaker_id"]
+            .iter()
+            .find_map(|key| get_value_case_insensitive(map, key).and_then(value_to_string))
+            .map(|speaker| speaker.trim().to_string())
+            .filter(|speaker| !speaker.is_empty()),
+        content,
+    })
+}
+
+fn get_value_case_insensitive<'a>(
+    map: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    map.get(key).or_else(|| {
+        map.iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value)
+    })
+}
+
+fn value_to_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn value_to_seconds(value: &serde_json::Value) -> Option<f32> {
+    match value {
+        serde_json::Value::Number(number) => number.as_f64().map(|value| value as f32),
+        serde_json::Value::String(text) => parse_timestamp_seconds(text),
+        _ => None,
+    }
+    .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn parse_timestamp_seconds(text: &str) -> Option<f32> {
+    let trimmed = text
+        .trim()
+        .trim_end_matches(|ch: char| ch.eq_ignore_ascii_case(&'s'))
+        .trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains(':') {
+        let mut seconds = 0.0f32;
+        for part in trimmed.split(':') {
+            seconds = seconds * 60.0 + part.trim().parse::<f32>().ok()?;
+        }
+        return Some(seconds);
+    }
+    trimmed.parse::<f32>().ok()
+}
+
+fn join_segment_contents(segments: &[VibeVoiceAsrSegment]) -> String {
+    segments
+        .iter()
+        .map(|segment| segment.content.trim())
+        .filter(|content| !content.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn cleanup_transcript_text(raw: &str) -> String {
     raw.replace("<|im_end|>", "")
         .replace("<|endoftext|>", "")
         .trim()
         .to_string()
+}
+
+fn elapsed_ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
 }
 
 fn preprocess_asr_audio(
@@ -519,6 +880,55 @@ mod tests {
         assert_eq!(audio.len(), 6);
         assert!(audio.iter().all(|sample| sample.is_finite()));
         assert!(!stats.normalized);
+    }
+
+    #[test]
+    fn stop_sequences_are_trimmed_and_deduplicated() {
+        let sequences = vec![" END ".to_string(), "".to_string(), "END".to_string()];
+        assert_eq!(sanitize_stop_sequences(&sequences), vec!["END".to_string()]);
+        assert_eq!(
+            truncate_at_stop_sequence("hello END ignored", &sanitize_stop_sequences(&sequences)),
+            ("hello ".to_string(), Some("END".to_string()))
+        );
+    }
+
+    #[test]
+    fn stop_token_ids_merge_built_ins_and_request_tokens() {
+        assert_eq!(collect_stop_token_ids(&[1, 2], &[2, 3, 1]), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn parses_vibevoice_json_segments_into_plain_text() {
+        let parsed = parse_vibevoice_asr_output(
+            r#"[{"Start time": 0.0, "End time": "1.25", "Speaker ID": "Speaker 0", "Content": "Hello"}, {"Start time": "00:00:01.25", "End time": 2.0, "Speaker ID": 1, "Content": "world."}]"#,
+        );
+
+        assert_eq!(parsed.format, "segments");
+        assert_eq!(parsed.text, "Hello world.");
+        assert_eq!(parsed.segments.len(), 2);
+        assert_eq!(parsed.segments[0].speaker_id.as_deref(), Some("Speaker 0"));
+        assert_eq!(parsed.segments[1].speaker_id.as_deref(), Some("1"));
+        assert!((parsed.segments[1].start_time.unwrap() - 1.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parses_vibevoice_segments_inside_code_fence_and_wrapper() {
+        let parsed = parse_vibevoice_asr_output(
+            "```json\n{\"segments\":[{\"start\":0,\"end\":1,\"speaker\":\"A\",\"text\":\"Hi there\"}]}\n```",
+        );
+
+        assert_eq!(parsed.format, "segments");
+        assert_eq!(parsed.text, "Hi there");
+        assert_eq!(parsed.segments[0].end_time, Some(1.0));
+    }
+
+    #[test]
+    fn parse_vibevoice_output_falls_back_to_cleaned_text() {
+        let parsed = parse_vibevoice_asr_output("  plain text <|im_end|> ");
+
+        assert_eq!(parsed.format, "text");
+        assert_eq!(parsed.text, "plain text");
+        assert!(parsed.segments.is_empty());
     }
 
     #[test]

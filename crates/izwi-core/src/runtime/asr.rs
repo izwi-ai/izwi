@@ -90,6 +90,7 @@ impl RuntimeService {
         audio_input: AsrAudioInput<'_>,
         language: Option<&str>,
         prompt: Option<&str>,
+        max_tokens: Option<usize>,
         correlation_id: Option<&str>,
     ) -> Result<EngineCoreRequest> {
         self.load_model(variant).await?;
@@ -109,7 +110,11 @@ impl RuntimeService {
             )?,
         }
         .with_prompt(prompt.map(ToOwned::to_owned));
-        Ok(runtime_request.into_engine_request())
+        let mut request = runtime_request.into_engine_request();
+        if let Some(max_tokens) = max_tokens {
+            request.params.max_tokens = max_tokens;
+        }
+        Ok(request)
     }
 
     pub(crate) async fn asr_transcribe_with_variant(
@@ -137,6 +142,26 @@ impl RuntimeService {
         prompt: Option<&str>,
         correlation_id: Option<&str>,
     ) -> Result<AsrTranscription> {
+        self.asr_transcribe_with_variant_and_prompt_options(
+            variant,
+            audio_base64,
+            language,
+            prompt,
+            None,
+            correlation_id,
+        )
+        .await
+    }
+
+    pub(crate) async fn asr_transcribe_with_variant_and_prompt_options(
+        &self,
+        variant: ModelVariant,
+        audio_base64: &str,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_tokens: Option<usize>,
+        correlation_id: Option<&str>,
+    ) -> Result<AsrTranscription> {
         if variant.is_audio_chat() {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
             return self
@@ -150,6 +175,7 @@ impl RuntimeService {
                 AsrAudioInput::Base64(audio_base64),
                 language,
                 prompt,
+                max_tokens,
                 correlation_id,
             )
             .await?;
@@ -193,6 +219,31 @@ impl RuntimeService {
         language: Option<&str>,
         prompt: Option<&str>,
         correlation_id: Option<&str>,
+        on_delta: F,
+    ) -> Result<AsrTranscription>
+    where
+        F: FnMut(String) + Send + 'static,
+    {
+        self.asr_transcribe_with_variant_streaming_and_prompt_options(
+            variant,
+            audio_base64,
+            language,
+            prompt,
+            None,
+            correlation_id,
+            on_delta,
+        )
+        .await
+    }
+
+    pub(crate) async fn asr_transcribe_with_variant_streaming_and_prompt_options<F>(
+        &self,
+        variant: ModelVariant,
+        audio_base64: &str,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_tokens: Option<usize>,
+        correlation_id: Option<&str>,
         mut on_delta: F,
     ) -> Result<AsrTranscription>
     where
@@ -211,6 +262,7 @@ impl RuntimeService {
                 AsrAudioInput::Base64(audio_base64),
                 language,
                 prompt,
+                max_tokens,
                 correlation_id,
             )
             .await?;
@@ -274,6 +326,7 @@ impl RuntimeService {
                 AsrAudioInput::Bytes(audio_bytes),
                 language,
                 prompt,
+                None,
                 correlation_id,
             )
             .await?;
@@ -335,6 +388,7 @@ impl RuntimeService {
                 AsrAudioInput::Bytes(audio_bytes),
                 language,
                 prompt,
+                None,
                 correlation_id,
             )
             .await?;
@@ -439,6 +493,28 @@ impl RuntimeService {
             audio_base64,
             language,
             prompt,
+            correlation_id,
+        )
+        .await
+    }
+
+    /// Transcribe audio with optional ASR prompt and max-token decode budget.
+    pub async fn asr_transcribe_with_prompt_max_tokens_and_correlation(
+        &self,
+        audio_base64: &str,
+        model_id: Option<&str>,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_tokens: Option<usize>,
+        correlation_id: Option<&str>,
+    ) -> Result<AsrTranscription> {
+        let variant = resolve_asr_model_variant(model_id);
+        self.asr_transcribe_with_variant_and_prompt_options(
+            variant,
+            audio_base64,
+            language,
+            prompt,
+            max_tokens,
             correlation_id,
         )
         .await
@@ -555,6 +631,32 @@ impl RuntimeService {
             audio_base64,
             language,
             prompt,
+            correlation_id,
+            on_delta,
+        )
+        .await
+    }
+
+    pub async fn asr_transcribe_streaming_with_prompt_max_tokens_and_correlation<F>(
+        &self,
+        audio_base64: &str,
+        model_id: Option<&str>,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_tokens: Option<usize>,
+        correlation_id: Option<&str>,
+        on_delta: F,
+    ) -> Result<AsrTranscription>
+    where
+        F: FnMut(String) + Send + 'static,
+    {
+        let variant = resolve_asr_model_variant(model_id);
+        self.asr_transcribe_with_variant_streaming_and_prompt_options(
+            variant,
+            audio_base64,
+            language,
+            prompt,
+            max_tokens,
             correlation_id,
             on_delta,
         )

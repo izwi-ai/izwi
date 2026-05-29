@@ -1,14 +1,14 @@
 //! OpenAI-compatible transcription endpoints.
 
 use axum::{
-    Json, RequestExt,
     body::Body,
     extract::{Extension, Multipart, Request, State},
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     response::{
-        IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
     },
+    Json, RequestExt,
 };
 use base64::Engine;
 use std::convert::Infallible;
@@ -32,6 +32,7 @@ struct TranscriptionRequest {
     response_format: Option<String>,
     stream: bool,
     prompt: Option<String>,
+    max_tokens: Option<usize>,
     _temperature: Option<f32>,
     timestamp_granularities: Option<Vec<String>>,
 }
@@ -142,11 +143,12 @@ pub async fn transcriptions(
     let started = Instant::now();
     let output = state
         .runtime
-        .asr_transcribe_with_prompt_and_correlation(
+        .asr_transcribe_with_prompt_max_tokens_and_correlation(
             &audio_base64,
             req.model.as_deref(),
             req.language.as_deref(),
             req.prompt.as_deref(),
+            req.max_tokens,
             Some(&ctx.correlation_id),
         )
         .await?;
@@ -155,7 +157,14 @@ pub async fn transcriptions(
     let mut segments = None;
     let mut subtitle_segments = None;
     let chunk_boundaries = extract_chunk_segment_boundaries(output.asr_diagnostics.as_ref());
-    if timestamp_request.any() && !output.text.trim().is_empty() {
+    let model_segments = extract_model_timestamp_segments(output.asr_diagnostics.as_ref());
+    if timestamp_request.segments && !model_segments.is_empty() {
+        segments = Some(model_segments.clone());
+    }
+    if timestamp_request.any()
+        && !output.text.trim().is_empty()
+        && (timestamp_request.words || (timestamp_request.segments && segments.is_none()))
+    {
         let alignments = state
             .runtime
             .force_align_with_model_and_language(
@@ -169,35 +178,41 @@ pub async fn transcriptions(
         if timestamp_request.words {
             words = Some(timestamp_words.clone());
         }
-        if timestamp_request.segments {
+        if timestamp_request.segments && segments.is_none() {
             segments = Some(build_timestamp_segments(
                 &timestamp_words,
                 &chunk_boundaries,
             ));
         }
     } else if matches!(response_format.as_str(), "srt" | "vtt") && !output.text.trim().is_empty() {
-        match state
-            .runtime
-            .force_align_with_model_and_language(
-                &audio_base64,
-                output.text.as_str(),
-                output.language.as_deref().or(req.language.as_deref()),
-                req.aligner_model.as_deref(),
-            )
-            .await
-        {
-            Ok(alignments) => {
-                let timestamp_words = alignments_to_timestamp_words(alignments);
-                let built_segments = build_timestamp_segments(&timestamp_words, &chunk_boundaries);
-                if !built_segments.is_empty() {
-                    subtitle_segments = Some(built_segments);
+        if !model_segments.is_empty() {
+            subtitle_segments = Some(model_segments.clone());
+        }
+        if subtitle_segments.is_none() {
+            match state
+                .runtime
+                .force_align_with_model_and_language(
+                    &audio_base64,
+                    output.text.as_str(),
+                    output.language.as_deref().or(req.language.as_deref()),
+                    req.aligner_model.as_deref(),
+                )
+                .await
+            {
+                Ok(alignments) => {
+                    let timestamp_words = alignments_to_timestamp_words(alignments);
+                    let built_segments =
+                        build_timestamp_segments(&timestamp_words, &chunk_boundaries);
+                    if !built_segments.is_empty() {
+                        subtitle_segments = Some(built_segments);
+                    }
                 }
-            }
-            Err(err) => {
-                debug!(
-                    "Falling back to coarse transcription subtitle timestamps: {}",
-                    err
-                );
+                Err(err) => {
+                    debug!(
+                        "Falling back to coarse transcription subtitle timestamps: {}",
+                        err
+                    );
+                }
             }
         }
     }
@@ -269,6 +284,7 @@ async fn transcriptions_stream(
     let model = req.model;
     let language = req.language;
     let prompt = req.prompt;
+    let max_tokens = req.max_tokens;
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<String>();
     let engine = state.runtime.clone();
@@ -287,11 +303,12 @@ async fn transcriptions_stream(
         // Keep transcription streaming unbounded by wall-clock timeout so valid
         // long jobs are not cut off mid-flight.
         let result = engine
-            .asr_transcribe_streaming_with_prompt_and_correlation(
+            .asr_transcribe_streaming_with_prompt_max_tokens_and_correlation(
                 &audio_base64,
                 model.as_deref(),
                 language.as_deref(),
                 prompt.as_deref(),
+                max_tokens,
                 Some(correlation_id.as_str()),
                 move |delta| {
                     let _ = delta_tx.send(transcript_delta_event_payload(delta));
@@ -353,6 +370,8 @@ struct JsonRequestBody {
     #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
+    max_tokens: Option<usize>,
+    #[serde(default)]
     temperature: Option<f32>,
     #[serde(default)]
     timestamp_granularities: Option<Vec<String>>,
@@ -380,6 +399,7 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
             response_format: payload.response_format,
             stream: payload.stream.unwrap_or(false),
             prompt: payload.prompt,
+            max_tokens: payload.max_tokens,
             _temperature: payload.temperature,
             timestamp_granularities: payload.timestamp_granularities,
         });
@@ -470,6 +490,21 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
                     })?;
                     if !text.trim().is_empty() {
                         out.prompt = Some(text.trim().to_string());
+                    }
+                }
+                "max_tokens" => {
+                    let text = field.text().await.map_err(|e| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart 'max_tokens' field: {e}"
+                        ))
+                    })?;
+                    if !text.trim().is_empty() {
+                        let value = text.trim().parse::<usize>().map_err(|_| {
+                            ApiError::bad_request(
+                                "Invalid multipart 'max_tokens' field: expected a non-negative integer",
+                            )
+                        })?;
+                        out.max_tokens = Some(value);
                     }
                 }
                 "temperature" => {
@@ -678,6 +713,56 @@ fn extract_chunk_segment_boundaries(diagnostics: Option<&serde_json::Value>) -> 
     starts.sort_by(|left, right| left.total_cmp(right));
     starts.dedup_by(|left, right| (*left - *right).abs() <= TIMESTAMP_SEGMENT_BOUNDARY_EPS);
     starts
+}
+
+fn extract_model_timestamp_segments(
+    diagnostics: Option<&serde_json::Value>,
+) -> Vec<TranscriptionTimestampSegment> {
+    let Some(diagnostics) = diagnostics else {
+        return Vec::new();
+    };
+    let Some(output) = diagnostics
+        .get("output")
+        .or_else(|| diagnostics.get("model_diagnostics")?.get("output"))
+    else {
+        return Vec::new();
+    };
+    let Some(raw_segments) = output.get("segments").and_then(|value| value.as_array()) else {
+        return Vec::new();
+    };
+
+    raw_segments
+        .iter()
+        .filter_map(|segment| {
+            let start = segment
+                .get("start_time")
+                .or_else(|| segment.get("start"))
+                .and_then(|value| value.as_f64())?;
+            let end = segment
+                .get("end_time")
+                .or_else(|| segment.get("end"))
+                .and_then(|value| value.as_f64())
+                .unwrap_or(start);
+            let text = segment
+                .get("content")
+                .or_else(|| segment.get("text"))
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if !start.is_finite() || !end.is_finite() || text.is_empty() {
+                return None;
+            }
+            Some((start as f32, end as f32, text))
+        })
+        .enumerate()
+        .map(|(id, (start, end, text))| TranscriptionTimestampSegment {
+            id,
+            start: start.max(0.0),
+            end: end.max(start + 0.01),
+            text,
+        })
+        .collect()
 }
 
 fn push_timestamp_segment(
@@ -1020,6 +1105,35 @@ mod tests {
         let chunk_boundaries = extract_chunk_segment_boundaries(Some(&diagnostics));
 
         assert_eq!(chunk_boundaries, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn extracts_model_timestamp_segments_from_vibevoice_diagnostics() {
+        let diagnostics = serde_json::json!({
+            "output": {
+                "segments": [
+                    {
+                        "start_time": 0.0,
+                        "end_time": 1.5,
+                        "speaker_id": "Speaker 0",
+                        "content": "hello"
+                    },
+                    {
+                        "start_time": 1.5,
+                        "end_time": 2.0,
+                        "speaker_id": "Speaker 1",
+                        "content": "world"
+                    }
+                ]
+            }
+        });
+
+        let segments = extract_model_timestamp_segments(Some(&diagnostics));
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].id, 0);
+        assert_eq!(segments[0].text, "hello");
+        assert_eq!(segments[1].start, 1.5);
     }
 
     #[test]
