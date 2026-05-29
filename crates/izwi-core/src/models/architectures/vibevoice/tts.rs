@@ -27,7 +27,14 @@ use crate::models::architectures::vibevoice::prompt::{
 use crate::models::architectures::vibevoice::tokenizer::{
     VibeVoiceAcousticTokenizer, VibeVoiceSemanticTokenizer, VibeVoiceTokenizerStreamingCache,
 };
+use crate::models::shared::attention::flash::{
+    cuda_flash_attention_head_dim_supported, flash_attention_compiled, flash_attention_requested,
+    should_enable_flash_attention_v2,
+};
 use crate::models::shared::attention::paged::{KvCacheQuantization, default_kv_page_size};
+use crate::models::shared::telemetry::{
+    KernelPathTelemetrySnapshot, snapshot as kernel_telemetry_snapshot,
+};
 use crate::models::shared::weights::gguf::load_model_weights;
 
 const TARGET_SAMPLE_RATE: u32 = 24_000;
@@ -102,6 +109,13 @@ pub struct VibeVoiceTtsProfile {
     pub final_decode_ms: f32,
     pub host_audio_ms: f32,
     pub frames_generated: usize,
+    pub decode_attention_dense_calls: u64,
+    pub decode_attention_paged_calls: u64,
+    pub rope_kernel_calls: u64,
+    pub rope_manual_calls: u64,
+    pub fused_attention_attempts: u64,
+    pub fused_attention_successes: u64,
+    pub fused_attention_fallbacks: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -116,6 +130,11 @@ pub struct VibeVoiceTtsDiagnostics {
     pub dense_bias_projection_count: usize,
     pub quantized_projection_count: usize,
     pub cfg_batching_enabled: bool,
+    pub dense_decode_max_tokens: usize,
+    pub cuda_flash_attention_requested: bool,
+    pub cuda_flash_attention_compiled: bool,
+    pub cuda_flash_attention_head_dim_supported: bool,
+    pub cuda_flash_attention_active: bool,
 }
 
 struct EncodedReference {
@@ -285,6 +304,12 @@ impl VibeVoiceTtsModel {
 
     pub fn diagnostics(&self) -> VibeVoiceTtsDiagnostics {
         let projection_diagnostics = self.language_model.projection_diagnostics();
+        let page_size = default_kv_page_size();
+        let dense_decode_max_tokens =
+            vibevoice_dense_decode_max_tokens_for_device(&self.device.device, page_size, 1);
+        let head_dim = self.language_model.attention_head_dim();
+        let cuda_flash_attention_head_dim_supported =
+            cuda_flash_attention_head_dim_supported(head_dim);
         VibeVoiceTtsDiagnostics {
             model_family: "vibevoice_tts",
             device_kind: format!("{:?}", self.device.kind),
@@ -295,15 +320,17 @@ impl VibeVoiceTtsModel {
             } else {
                 "reference_statistics"
             },
-            dense_decode_supported: vibevoice_dense_decode_max_tokens_for_device(
-                &self.device.device,
-                default_kv_page_size(),
-                1,
-            ) > 0,
+            dense_decode_supported: dense_decode_max_tokens > 0,
             dense_projection_count: projection_diagnostics.dense_projection_count,
             dense_bias_projection_count: projection_diagnostics.dense_bias_projection_count,
             quantized_projection_count: projection_diagnostics.quantized_projection_count,
             cfg_batching_enabled: vibevoice_cfg_batching_enabled(self.device.kind),
+            dense_decode_max_tokens,
+            cuda_flash_attention_requested: flash_attention_requested(),
+            cuda_flash_attention_compiled: flash_attention_compiled(),
+            cuda_flash_attention_head_dim_supported,
+            cuda_flash_attention_active: should_enable_flash_attention_v2(&self.device.device)
+                && cuda_flash_attention_head_dim_supported,
         }
     }
 
@@ -331,6 +358,7 @@ impl VibeVoiceTtsModel {
         }
 
         let mut profile = VibeVoiceTtsProfile::default();
+        let kernel_telemetry_start = kernel_telemetry_snapshot();
         let started = Instant::now();
         let reference = self.encode_reference(reference)?;
         profile.reference_encode_ms = elapsed_ms(started);
@@ -487,6 +515,8 @@ impl VibeVoiceTtsModel {
             .flatten_all()?
             .to_vec1::<f32>()?;
         profile.host_audio_ms = elapsed_ms(started);
+        let kernel_telemetry_end = kernel_telemetry_snapshot();
+        apply_kernel_telemetry_delta(&mut profile, &kernel_telemetry_start, &kernel_telemetry_end);
         info!(?profile, "VibeVoice TTS generation profile");
         Ok(VibeVoiceTtsOutput {
             samples,
@@ -735,6 +765,34 @@ fn vibevoice_cfg_batching_default(device_kind: DeviceKind) -> bool {
 
 fn vibevoice_tts_negative_prefill_token(specials: &VibeVoiceSpecialTokens) -> u32 {
     specials.speech_start
+}
+
+fn apply_kernel_telemetry_delta(
+    profile: &mut VibeVoiceTtsProfile,
+    start: &KernelPathTelemetrySnapshot,
+    end: &KernelPathTelemetrySnapshot,
+) {
+    profile.decode_attention_dense_calls = end
+        .decode_attention_dense_total
+        .saturating_sub(start.decode_attention_dense_total);
+    profile.decode_attention_paged_calls = end
+        .decode_attention_paged_total
+        .saturating_sub(start.decode_attention_paged_total);
+    profile.rope_kernel_calls = end
+        .rope_kernel_total
+        .saturating_sub(start.rope_kernel_total);
+    profile.rope_manual_calls = end
+        .rope_manual_total
+        .saturating_sub(start.rope_manual_total);
+    profile.fused_attention_attempts = end
+        .fused_attention_attempts_total
+        .saturating_sub(start.fused_attention_attempts_total);
+    profile.fused_attention_successes = end
+        .fused_attention_success_total
+        .saturating_sub(start.fused_attention_success_total);
+    profile.fused_attention_fallbacks = end
+        .fused_attention_fallback_total
+        .saturating_sub(start.fused_attention_fallback_total);
 }
 
 fn replace_range_with_features(
