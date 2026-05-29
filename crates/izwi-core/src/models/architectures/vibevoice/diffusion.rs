@@ -92,9 +92,27 @@ impl VibeVoiceDiffusionHead {
         timesteps: &Tensor,
         condition: &Tensor,
     ) -> Result<Tensor> {
+        let timestep_embedding = self.timestep_embedding(timesteps)?;
+        let condition = self.condition_projection(condition)?;
+        self.forward_with_precomputed(noisy_latents, &timestep_embedding, &condition)
+    }
+
+    pub fn timestep_embedding(&self, timesteps: &Tensor) -> Result<Tensor> {
+        self.t_embedder.forward(timesteps)
+    }
+
+    pub fn condition_projection(&self, condition: &Tensor) -> Result<Tensor> {
+        self.cond_proj.forward(condition).map_err(Error::from)
+    }
+
+    pub fn forward_with_precomputed(
+        &self,
+        noisy_latents: &Tensor,
+        timestep_embedding: &Tensor,
+        condition: &Tensor,
+    ) -> Result<Tensor> {
         let mut x = self.noisy_images_proj.forward(noisy_latents)?;
-        let mut t = self.t_embedder.forward(timesteps)?;
-        let condition = self.cond_proj.forward(condition)?;
+        let mut t = timestep_embedding.clone();
         if condition.rank() == 3 && t.rank() == 2 {
             t = t.unsqueeze(1)?;
         }
@@ -113,10 +131,31 @@ impl VibeVoiceDiffusionHead {
         negative_condition: &Tensor,
         cfg_scale: &Tensor,
     ) -> Result<Tensor> {
+        let timestep_embedding = self.timestep_embedding(timesteps)?;
+        let condition = self.condition_projection(condition)?;
+        let negative_condition = self.condition_projection(negative_condition)?;
+        self.forward_cfg_batched_with_precomputed(
+            noisy_latents,
+            &timestep_embedding,
+            &condition,
+            &negative_condition,
+            cfg_scale,
+        )
+    }
+
+    pub fn forward_cfg_batched_with_precomputed(
+        &self,
+        noisy_latents: &Tensor,
+        timestep_embedding: &Tensor,
+        condition: &Tensor,
+        negative_condition: &Tensor,
+        cfg_scale: &Tensor,
+    ) -> Result<Tensor> {
         let latents = Tensor::cat(&[noisy_latents.clone(), noisy_latents.clone()], 0)?;
-        let timesteps = Tensor::cat(&[timesteps.clone(), timesteps.clone()], 0)?;
+        let timestep_embeddings =
+            Tensor::cat(&[timestep_embedding.clone(), timestep_embedding.clone()], 0)?;
         let conditions = Tensor::cat(&[condition.clone(), negative_condition.clone()], 0)?;
-        let output = self.forward(&latents, &timesteps, &conditions)?;
+        let output = self.forward_with_precomputed(&latents, &timestep_embeddings, &conditions)?;
         let positive = output.narrow(0, 0, 1)?;
         let negative = output.narrow(0, 1, 1)?;
         classifier_free_guidance(&positive, &negative, cfg_scale)
@@ -533,8 +572,25 @@ mod tests {
                 &cfg_scale,
             )
             .unwrap();
+        let timestep_embedding = head.timestep_embedding(&timestep).unwrap();
+        let positive_condition_projection = head.condition_projection(&positive_condition).unwrap();
+        let negative_condition_projection = head.condition_projection(&negative_condition).unwrap();
+        let precomputed_batched = head
+            .forward_cfg_batched_with_precomputed(
+                &speech,
+                &timestep_embedding,
+                &positive_condition_projection,
+                &negative_condition_projection,
+                &cfg_scale,
+            )
+            .unwrap();
+        let precomputed_positive = head
+            .forward_with_precomputed(&speech, &timestep_embedding, &positive_condition_projection)
+            .unwrap();
 
         assert_tensor_close(&batched, &expected, 1e-5);
+        assert_tensor_close(&precomputed_batched, &expected, 1e-5);
+        assert_tensor_close(&precomputed_positive, &positive, 1e-5);
     }
 
     #[test]
