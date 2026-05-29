@@ -312,8 +312,11 @@ impl VibeVoiceTtsModel {
     pub fn diagnostics(&self) -> VibeVoiceTtsDiagnostics {
         let projection_diagnostics = self.language_model.projection_diagnostics();
         let page_size = default_kv_page_size();
-        let dense_decode_max_tokens =
-            vibevoice_dense_decode_max_tokens_for_device(&self.device.device, page_size, 1);
+        let dense_decode_max_tokens = qwen3_dense_decode_max_tokens(
+            &self.device.device,
+            page_size,
+            KvCacheQuantization::None,
+        );
         let head_dim = self.language_model.attention_head_dim();
         let cuda_flash_attention_head_dim_supported =
             cuda_flash_attention_head_dim_supported(head_dim);
@@ -643,9 +646,13 @@ impl VibeVoiceTtsModel {
         plan: &VibeVoiceDiffusionPlan,
     ) -> Result<Tensor> {
         let condition = self.prediction_head.condition_projection(condition)?;
-        let negative_condition = negative_condition
-            .map(|condition| self.prediction_head.condition_projection(condition))
-            .transpose()?;
+        let negative_condition = if plan.cfg_tensor.is_some() {
+            negative_condition
+                .map(|condition| self.prediction_head.condition_projection(condition))
+                .transpose()?
+        } else {
+            None
+        };
         let mut speech = Tensor::randn(
             0f32,
             1f32,
@@ -765,13 +772,21 @@ fn vibevoice_diffusion_plan(
 }
 
 fn vibevoice_effective_diffusion_steps(device_kind: DeviceKind, requested_steps: usize) -> usize {
+    let override_value = std::env::var(VIBEVOICE_CUDA_DDPM_STEPS_ENV).ok();
+    vibevoice_effective_diffusion_steps_for(device_kind, requested_steps, override_value.as_deref())
+}
+
+fn vibevoice_effective_diffusion_steps_for(
+    device_kind: DeviceKind,
+    requested_steps: usize,
+    override_value: Option<&str>,
+) -> usize {
     let requested_steps = requested_steps.max(1);
     if !device_kind.is_cuda() {
         return requested_steps;
     }
-    let Some(raw) = std::env::var(VIBEVOICE_CUDA_DDPM_STEPS_ENV)
-        .ok()
-        .map(|value| value.trim().to_string())
+    let Some(raw) = override_value
+        .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
         return requested_steps;
@@ -1293,33 +1308,34 @@ mod tests {
 
     #[test]
     fn cuda_diffusion_steps_override_is_cuda_only() {
-        with_env_var(VIBEVOICE_CUDA_DDPM_STEPS_ENV, Some("10"), || {
-            assert_eq!(
-                vibevoice_effective_diffusion_steps(DeviceKind::Cuda, 20),
-                10
-            );
-            assert_eq!(
-                vibevoice_effective_diffusion_steps(DeviceKind::Metal, 20),
-                20
-            );
-            assert_eq!(vibevoice_effective_diffusion_steps(DeviceKind::Cpu, 20), 20);
-        });
+        assert_eq!(
+            vibevoice_effective_diffusion_steps_for(DeviceKind::Cuda, 20, Some("10")),
+            10
+        );
+        assert_eq!(
+            vibevoice_effective_diffusion_steps_for(DeviceKind::Metal, 20, Some("10")),
+            20
+        );
+        assert_eq!(
+            vibevoice_effective_diffusion_steps_for(DeviceKind::Cpu, 20, Some("10")),
+            20
+        );
     }
 
     #[test]
     fn cuda_diffusion_steps_override_rejects_invalid_values() {
-        with_env_var(VIBEVOICE_CUDA_DDPM_STEPS_ENV, Some("0"), || {
-            assert_eq!(
-                vibevoice_effective_diffusion_steps(DeviceKind::Cuda, 20),
-                20
-            );
-        });
-        with_env_var(VIBEVOICE_CUDA_DDPM_STEPS_ENV, Some("not-a-number"), || {
-            assert_eq!(
-                vibevoice_effective_diffusion_steps(DeviceKind::Cuda, 20),
-                20
-            );
-        });
+        assert_eq!(
+            vibevoice_effective_diffusion_steps_for(DeviceKind::Cuda, 20, Some("0")),
+            20
+        );
+        assert_eq!(
+            vibevoice_effective_diffusion_steps_for(DeviceKind::Cuda, 20, Some("not-a-number")),
+            20
+        );
+        assert_eq!(
+            vibevoice_effective_diffusion_steps_for(DeviceKind::Cuda, 20, None),
+            20
+        );
     }
 
     #[test]
@@ -1586,19 +1602,5 @@ mod tests {
             name.to_string(),
             Tensor::from_vec(values, (rows, cols), device).unwrap(),
         );
-    }
-
-    fn with_env_var<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
-        let previous = std::env::var(key).ok();
-        match value {
-            Some(value) => std::env::set_var(key, value),
-            None => std::env::remove_var(key),
-        }
-        let output = f();
-        match previous {
-            Some(previous) => std::env::set_var(key, previous),
-            None => std::env::remove_var(key),
-        }
-        output
     }
 }
