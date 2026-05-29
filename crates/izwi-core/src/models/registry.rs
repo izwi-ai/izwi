@@ -30,7 +30,7 @@ use crate::models::architectures::qwen35::chat::{
 };
 use crate::models::architectures::sortformer::diarization::SortformerDiarizerModel;
 use crate::models::architectures::vibevoice::asr::{
-    VibeVoiceAsrModel, VibeVoiceAsrTranscriptionOutput,
+    VibeVoiceAsrGenerationOptions, VibeVoiceAsrModel, VibeVoiceAsrTranscriptionOutput,
 };
 use crate::models::architectures::vibevoice::tts::VibeVoiceTtsModel;
 use crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel;
@@ -479,11 +479,36 @@ pub struct NativeAsrDecodeStep {
     pub finished: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeAsrGenerationOptions {
+    pub max_new_tokens: usize,
+    pub stop_token_ids: Vec<u32>,
+    pub stop_sequences: Vec<String>,
+}
+
+impl Default for NativeAsrGenerationOptions {
+    fn default() -> Self {
+        Self {
+            max_new_tokens: 768,
+            stop_token_ids: Vec::new(),
+            stop_sequences: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NativeAsrTranscription {
     pub text: String,
     pub language: Option<String>,
     pub diagnostics: Option<serde_json::Value>,
+}
+
+fn vibevoice_asr_options(options: NativeAsrGenerationOptions) -> VibeVoiceAsrGenerationOptions {
+    VibeVoiceAsrGenerationOptions {
+        max_new_tokens: options.max_new_tokens,
+        stop_token_ids: options.stop_token_ids,
+        stop_sequences: options.stop_sequences,
+    }
 }
 
 impl NativeAsrModel {
@@ -544,6 +569,34 @@ impl NativeAsrModel {
                 on_delta,
             ),
             Self::VibeVoice(model) => model.transcribe_with_callback_and_prompt(
+                audio,
+                sample_rate,
+                language,
+                prompt,
+                on_delta,
+            ),
+        }
+    }
+
+    pub fn transcribe_with_callback_and_prompt_and_options(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        options: NativeAsrGenerationOptions,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        match self {
+            Self::VibeVoice(model) => model.transcribe_with_callback_and_prompt_and_options(
+                audio,
+                sample_rate,
+                language,
+                prompt,
+                vibevoice_asr_options(options),
+                on_delta,
+            ),
+            _ => self.transcribe_with_callback_and_prompt(
                 audio,
                 sample_rate,
                 language,
@@ -626,6 +679,37 @@ impl NativeAsrModel {
                     diagnostics,
                 })
             }
+        }
+    }
+
+    pub fn transcribe_with_details_and_prompt_and_options(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        options: NativeAsrGenerationOptions,
+    ) -> Result<NativeAsrTranscription> {
+        match self {
+            Self::VibeVoice(model) => {
+                let VibeVoiceAsrTranscriptionOutput {
+                    text,
+                    language,
+                    diagnostics,
+                } = model.transcribe_with_details_and_prompt_and_options(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                    vibevoice_asr_options(options),
+                )?;
+                Ok(NativeAsrTranscription {
+                    text,
+                    language,
+                    diagnostics,
+                })
+            }
+            _ => self.transcribe_with_details_and_prompt(audio, sample_rate, language, prompt),
         }
     }
 
