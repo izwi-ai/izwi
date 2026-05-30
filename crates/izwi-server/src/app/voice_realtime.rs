@@ -26,6 +26,11 @@ use izwi_core::{
     parse_chat_model_variant, parse_model_variant, parse_tts_model_variant, ChatMessage, ChatRole,
     GenerationConfig, GenerationParams, GenerationRequest, VoiceSession,
 };
+use izwi_vad::{
+    legacy_rms_threshold_to_score_threshold, EndpointConfig, EndpointDetector, EndpointEndReason,
+    EndpointEvent, VadScorer, DEFAULT_MAX_UTTERANCE_MS, DEFAULT_MIN_SPEECH_MS, DEFAULT_PRE_ROLL_MS,
+    DEFAULT_SILENCE_MS, DEFAULT_SPEECH_THRESHOLD, VAD_FRAME_MS, VAD_SAMPLE_RATE,
+};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -47,11 +52,11 @@ const WS_BIN_KIND_CLIENT_PCM16: u8 = 1;
 const WS_BIN_KIND_ASSISTANT_PCM16: u8 = 2;
 const WS_BIN_CLIENT_HEADER_LEN: usize = 16;
 const WS_BIN_ASSISTANT_HEADER_LEN: usize = 24;
-const DEFAULT_STREAM_VAD_THRESHOLD: f32 = 0.02;
-const DEFAULT_STREAM_MIN_SPEECH_MS: u32 = 300;
-const DEFAULT_STREAM_SILENCE_MS: u32 = 900;
-const DEFAULT_STREAM_MAX_UTTERANCE_MS: u32 = 20_000;
-const DEFAULT_STREAM_PRE_ROLL_MS: u32 = 160;
+const DEFAULT_STREAM_VAD_THRESHOLD: f32 = DEFAULT_SPEECH_THRESHOLD;
+const DEFAULT_STREAM_MIN_SPEECH_MS: u32 = DEFAULT_MIN_SPEECH_MS;
+const DEFAULT_STREAM_SILENCE_MS: u32 = DEFAULT_SILENCE_MS;
+const DEFAULT_STREAM_MAX_UTTERANCE_MS: u32 = DEFAULT_MAX_UTTERANCE_MS;
+const DEFAULT_STREAM_PRE_ROLL_MS: u32 = DEFAULT_PRE_ROLL_MS;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -167,6 +172,18 @@ struct StreamingInputConfig {
     input_sample_rate_hint: Option<u32>,
 }
 
+impl StreamingInputConfig {
+    fn endpoint_config(&self) -> EndpointConfig {
+        EndpointConfig {
+            start_threshold: self.vad_threshold,
+            end_threshold: (self.vad_threshold * 0.7).min(self.vad_threshold),
+            min_speech_ms: self.min_speech_ms,
+            silence_ms: self.silence_duration_ms,
+            max_utterance_ms: self.max_utterance_ms,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct StreamingActiveUtterance {
     utterance_id: String,
@@ -177,9 +194,10 @@ struct StreamingActiveUtterance {
     silence_ms: f32,
 }
 
-#[derive(Debug)]
 struct StreamingInputState {
     config: StreamingInputConfig,
+    vad_scorer: VadScorer,
+    endpoint: EndpointDetector,
     next_utterance_seq: u64,
     frame_seq_last: Option<u32>,
     current_sample_rate: Option<u32>,
@@ -209,6 +227,16 @@ impl UtteranceEndReason {
             Self::Silence => "silence",
             Self::MaxDuration => "max_duration",
             Self::StreamStopped => "stream_stopped",
+        }
+    }
+}
+
+impl From<EndpointEndReason> for UtteranceEndReason {
+    fn from(reason: EndpointEndReason) -> Self {
+        match reason {
+            EndpointEndReason::Silence => Self::Silence,
+            EndpointEndReason::MaxDuration => Self::MaxDuration,
+            EndpointEndReason::StreamStopped => Self::StreamStopped,
         }
     }
 }
@@ -330,8 +358,11 @@ struct StreamingFrameResult {
 
 impl StreamingInputState {
     fn new(config: StreamingInputConfig) -> Self {
+        let endpoint = EndpointDetector::new(config.endpoint_config());
         Self {
             config,
+            vad_scorer: VadScorer::new(),
+            endpoint,
             next_utterance_seq: 0,
             frame_seq_last: None,
             current_sample_rate: None,
@@ -384,79 +415,100 @@ impl StreamingInputState {
             });
         }
 
-        let rms = rms_i16(&samples);
         let frame_ms = (samples.len() as f32 * 1000.0) / (sample_rate as f32);
-        let is_speech = rms >= self.config.vad_threshold;
+        let vad_frames = self
+            .vad_scorer
+            .push_i16(&samples, sample_rate)
+            .map_err(|err| format!("VAD scoring error: {err}"))?;
+        let mut chunk_has_speech = false;
+        let mut chunk_voiced_ms = 0.0f32;
+        let mut speech_started = false;
+        let mut end_reason: Option<UtteranceEndReason> = None;
+
+        for vad_frame in &vad_frames {
+            let decision = self.endpoint.process_score(vad_frame.score, VAD_FRAME_MS);
+            if decision.is_speech {
+                chunk_has_speech = true;
+                chunk_voiced_ms += VAD_FRAME_MS;
+            }
+            for event in decision.events {
+                match event {
+                    EndpointEvent::SpeechStart => speech_started = true,
+                    EndpointEvent::SpeechEnd(reason) => end_reason = Some(reason.into()),
+                    EndpointEvent::NoiseRejected => {}
+                }
+            }
+        }
 
         let mut result = StreamingFrameResult {
             speech_start: None,
             finalized_utterance: None,
         };
 
-        if is_speech {
-            if self.active.is_none() {
-                let utterance_seq = self.next_utterance_seq.saturating_add(1);
-                self.next_utterance_seq = utterance_seq;
-                let utterance_id = format!("utt-{utterance_seq}");
+        if speech_started && self.active.is_none() {
+            let utterance_seq = self.next_utterance_seq.saturating_add(1);
+            self.next_utterance_seq = utterance_seq;
+            let utterance_id = format!("utt-{utterance_seq}");
 
-                let mut capture = StreamingActiveUtterance {
-                    utterance_id: utterance_id.clone(),
-                    utterance_seq,
-                    samples_i16: Vec::new(),
-                    voiced_ms: 0.0,
-                    total_ms: 0.0,
-                    silence_ms: 0.0,
-                };
-                if !self.pre_roll.is_empty() {
-                    capture.samples_i16.extend_from_slice(&self.pre_roll);
-                }
-                capture.samples_i16.extend_from_slice(&samples);
-                capture.voiced_ms += frame_ms;
-                capture.total_ms += frame_ms;
-                self.active = Some(capture);
-
-                result.speech_start = Some(SpeechStartEvent {
-                    utterance_id,
-                    utterance_seq,
-                });
-            } else if let Some(active) = self.active.as_mut() {
-                active.samples_i16.extend_from_slice(&samples);
-                active.voiced_ms += frame_ms;
-                active.total_ms += frame_ms;
-                active.silence_ms = 0.0;
+            let mut capture = StreamingActiveUtterance {
+                utterance_id: utterance_id.clone(),
+                utterance_seq,
+                samples_i16: Vec::new(),
+                voiced_ms: 0.0,
+                total_ms: 0.0,
+                silence_ms: 0.0,
+            };
+            if !self.pre_roll.is_empty() {
+                capture.samples_i16.extend_from_slice(&self.pre_roll);
             }
+            capture.samples_i16.extend_from_slice(&samples);
+            self.active = Some(capture);
+
+            result.speech_start = Some(SpeechStartEvent {
+                utterance_id,
+                utterance_seq,
+            });
         } else if let Some(active) = self.active.as_mut() {
             active.samples_i16.extend_from_slice(&samples);
-            active.total_ms += frame_ms;
-            active.silence_ms += frame_ms;
         } else {
             self.push_pre_roll(&samples, sample_rate);
             return Ok(result);
         }
 
-        let should_finalize = if let Some(active) = self.active.as_ref() {
-            if active.total_ms >= self.config.max_utterance_ms as f32 {
-                Some(UtteranceEndReason::MaxDuration)
-            } else if active.voiced_ms >= self.config.min_speech_ms as f32
-                && active.silence_ms >= self.config.silence_duration_ms as f32
-            {
-                Some(UtteranceEndReason::Silence)
+        if let Some(active) = self.active.as_mut() {
+            active.voiced_ms += chunk_voiced_ms;
+            active.total_ms += frame_ms;
+            if chunk_has_speech {
+                active.silence_ms = 0.0;
             } else {
-                None
+                active.silence_ms += frame_ms;
             }
-        } else {
-            None
-        };
+        }
 
-        if let Some(reason) = should_finalize {
+        if let Some(reason) = end_reason {
             result.finalized_utterance = self.finalize_active_utterance(reason)?;
         }
 
-        if !is_speech {
+        if !chunk_has_speech {
             self.push_pre_roll(&samples, sample_rate);
         }
 
         Ok(result)
+    }
+
+    fn finish_stream(
+        &mut self,
+    ) -> Result<Option<(PendingAudioCommit, Vec<u8>, UtteranceEndReason)>, String> {
+        match self.endpoint.finish() {
+            Some(EndpointEvent::SpeechEnd(EndpointEndReason::StreamStopped)) => {
+                self.finalize_active_utterance(UtteranceEndReason::StreamStopped)
+            }
+            Some(EndpointEvent::NoiseRejected) => {
+                self.active = None;
+                Ok(None)
+            }
+            _ => self.finalize_active_utterance(UtteranceEndReason::StreamStopped),
+        }
     }
 
     fn finalize_active_utterance(
@@ -585,6 +637,13 @@ async fn finalize_stream_vad_utterance(
     Ok(())
 }
 
+fn normalize_stream_vad_threshold(value: Option<f32>) -> f32 {
+    value
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(legacy_rms_threshold_to_score_threshold)
+        .unwrap_or(DEFAULT_STREAM_VAD_THRESHOLD)
+}
+
 fn parse_binary_message(data: &[u8]) -> Result<BinaryMessageKind, String> {
     if data.len() < WS_BIN_CLIENT_HEADER_LEN || &data[..4] != WS_BIN_MAGIC {
         return Err("Unexpected binary message (missing voice realtime frame header)".to_string());
@@ -619,18 +678,6 @@ fn pcm16_bytes_to_i16(bytes: &[u8]) -> Vec<i16> {
         out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
     }
     out
-}
-
-fn rms_i16(samples: &[i16]) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    let mut sum = 0.0f64;
-    for &s in samples {
-        let v = s as f64 / 32768.0f64;
-        sum += v * v;
-    }
-    (sum / samples.len() as f64).sqrt() as f32
 }
 
 fn wav_bytes_from_pcm16_mono(samples_i16: &[i16], sample_rate: u32) -> Result<Vec<u8>, String> {
@@ -900,10 +947,7 @@ async fn handle_text_message(
 
             conn.streaming_input = Some(StreamingInputState::new(StreamingInputConfig {
                 turn_config,
-                vad_threshold: vad_threshold
-                    .filter(|v| v.is_finite() && *v >= 0.0)
-                    .unwrap_or(DEFAULT_STREAM_VAD_THRESHOLD)
-                    .clamp(0.0, 1.0),
+                vad_threshold: normalize_stream_vad_threshold(vad_threshold),
                 min_speech_ms: min_speech_ms
                     .unwrap_or(DEFAULT_STREAM_MIN_SPEECH_MS)
                     .clamp(50, 10_000),
@@ -926,7 +970,10 @@ async fn handle_text_message(
                 json!({
                     "type": "input_stream_ready",
                     "vad": {
+                        "backend": "earshot",
                         "threshold": conn.streaming_input.as_ref().map(|s| s.config.vad_threshold),
+                        "score_sample_rate": VAD_SAMPLE_RATE,
+                        "score_frame_ms": VAD_FRAME_MS,
                         "min_speech_ms": conn.streaming_input.as_ref().map(|s| s.config.min_speech_ms),
                         "silence_duration_ms": conn.streaming_input.as_ref().map(|s| s.config.silence_duration_ms),
                     }
@@ -935,9 +982,7 @@ async fn handle_text_message(
         }
         ClientEvent::InputStreamStop => {
             if let Some(mut streaming) = conn.streaming_input.take() {
-                if let Some((commit, wav_bytes, end_reason)) =
-                    streaming.finalize_active_utterance(UtteranceEndReason::StreamStopped)?
-                {
+                if let Some((commit, wav_bytes, end_reason)) = streaming.finish_stream()? {
                     send_json(
                         out_tx,
                         json!({
@@ -2109,5 +2154,23 @@ impl ModelBackend for IzwiRuntimeBackend {
             tokens_generated: generation.tokens_generated,
             generation_time_ms: generation.generation_time_ms,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_vad_threshold_maps_legacy_rms_default_to_score_default() {
+        assert_eq!(
+            normalize_stream_vad_threshold(Some(0.02)),
+            DEFAULT_STREAM_VAD_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn stream_vad_threshold_accepts_score_values_directly() {
+        assert_eq!(normalize_stream_vad_threshold(Some(0.62)), 0.62);
     }
 }

@@ -3789,6 +3789,7 @@ dependencies = [
  "izwi-agent",
  "izwi-core",
  "izwi-hooks",
+ "izwi-vad",
  "scalar_api_reference",
  "sea-orm",
  "serde",
