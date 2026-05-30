@@ -566,7 +566,7 @@ pub fn legacy_rms_threshold_to_score_threshold(value: f32) -> f32 {
     if !value.is_finite() {
         return DEFAULT_SPEECH_THRESHOLD;
     }
-    if value <= 0.1 {
+    if value < 0.1 {
         ((value.max(0.001) / 0.02) * DEFAULT_SPEECH_THRESHOLD).clamp(0.2, 0.8)
     } else {
         sanitize_score_threshold(value)
@@ -819,5 +819,10 @@ mod tests {
             legacy_rms_threshold_to_score_threshold(0.02),
             DEFAULT_SPEECH_THRESHOLD
         );
+    }
+
+    #[test]
+    fn legacy_threshold_keeps_minimum_score_threshold_as_score() {
+        assert_eq!(legacy_rms_threshold_to_score_threshold(0.1), 0.1);
     }
 }
