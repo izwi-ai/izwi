@@ -5,6 +5,7 @@ members = [
     "crates/izwi-agent",
     "crates/izwi-core",
     "crates/izwi-hooks",
+    "crates/izwi-vad",
     "crates/izwi-server",
     "crates/izwi-cli",
     "crates/izwi-desktop",
