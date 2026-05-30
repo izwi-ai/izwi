@@ -350,7 +350,7 @@ Converts raw logits from the executor into user-facing output:
 
 `signal_frontend.rs` handles audio pre-processing before tokens reach the scheduler:
 - Resampling, normalisation, mel-spectrogram extraction
-- **Voice Activity Detection (VAD):** current implementation uses a simple energy-based detector. Silero VAD integration is planned (marked `TODO` in source).
+- **Voice Activity Detection (VAD):** shared Rust-native Earshot scoring and endpointing from `izwi-vad`.
 
 ---
 
@@ -642,7 +642,6 @@ The following features are scaffolded or partially implemented but not yet activ
 | Feature | Status | Notes |
 |---|---|---|
 | **Speculative Decoding** | Stub only | Draft model infrastructure not wired |
-| **Silero VAD** | TODO | Energy-based VAD is active; Silero integration pending |
 | **KV Cache Quantization (Int8)** | Config flag exists | Quantization kernel not yet applied |
 | **Flash Attention** | Planned | Standard attention used; Flash Attention would reduce memory bandwidth |
 | **Prefix Caching** | Planned | Block sharing infrastructure exists; hash-based prefix lookup not implemented |
@@ -687,7 +686,7 @@ The following features are scaffolded or partially implemented but not yet activ
 | **Flash Attention** | 2–4× memory bandwidth reduction during decode; lower latency |
 | **Prefix Caching** | Eliminate redundant prefill for shared prompt prefixes (e.g., system prompts) |
 | **KV Int8 Quantization** | ~50% KV memory reduction; enable larger batches |
-| **Silero VAD** | More accurate silence detection; reduce wasted decode steps |
+| **VAD Calibration** | Tune Earshot score thresholds and endpoint durations against production speech/noise captures |
 
 ### Medium-Term
 

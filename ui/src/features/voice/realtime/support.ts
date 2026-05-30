@@ -17,7 +17,10 @@ export type VoiceRealtimeServerEvent =
   | {
       type: "input_stream_ready";
       vad?: {
+        backend?: string;
         threshold?: number;
+        score_sample_rate?: number;
+        score_frame_ms?: number;
         min_speech_ms?: number;
         silence_duration_ms?: number;
       };

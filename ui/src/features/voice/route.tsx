@@ -98,7 +98,7 @@ export function VoicePage({
   const [selectedSpeaker, setSelectedSpeaker] = useState("Serena");
   const [voiceMode, setVoiceMode] = useState<VoiceRealtimeMode>("modular");
 
-  const [vadThreshold, setVadThreshold] = useState(0.02);
+  const [vadThreshold, setVadThreshold] = useState(0.5);
   const [silenceDurationMs, setSilenceDurationMs] = useState(900);
   const [minSpeechMs, setMinSpeechMs] = useState(300);
   const [isConfigOpen, setIsConfigOpen] = useState(false);
@@ -1552,22 +1552,6 @@ export function VoicePage({
         }
         const rms = Math.sqrt(sumSquares / data.length);
         setAudioLevel(rms);
-
-        const isSpeech = rms >= vadThreshold;
-        if (isSpeech && runtimeStatusRef.current === "assistant_speaking") {
-          const nextAccepted = (voiceWsPlaybackRef.current?.utteranceSeq ?? 0) + 1;
-          voiceMinAcceptedAssistantSeqRef.current = Math.max(
-            voiceMinAcceptedAssistantSeqRef.current,
-            nextAccepted,
-          );
-          try {
-            sendVoiceRealtimeJson({ type: "interrupt", reason: "barge_in" });
-          } catch {
-            // Best-effort; local playback is stopped immediately.
-          }
-          clearAudioPlayback();
-          setRuntimeStatus("listening");
-        }
       }, VAD_INTERVAL);
     } catch (err) {
       const message =
@@ -1579,7 +1563,6 @@ export function VoicePage({
       stopSession();
     }
   }, [
-    clearAudioPlayback,
     ensureVoiceRealtimeInputStreamStarted,
     hasRunnableConfig,
     onError,
@@ -1588,9 +1571,7 @@ export function VoicePage({
     selectedTextModel,
     selectedTtsModel,
     sendVoiceRealtimeBinary,
-    sendVoiceRealtimeJson,
     stopSession,
-    vadThreshold,
   ]);
 
   const toggleSession = useCallback(() => {
@@ -1653,7 +1634,7 @@ export function VoicePage({
 
   const vadPercent = Math.min(
     100,
-    Math.round((audioLevel / Math.max(vadThreshold, 0.001)) * 40),
+    Math.round(audioLevel * 250),
   );
 
   const getStatusClass = (status: ModelInfo["status"]) => {
@@ -2257,13 +2238,13 @@ export function VoicePage({
         <div className="mt-4 grid gap-5 md:grid-cols-3">
           <div>
             <label className="text-sm font-medium text-[var(--text-primary)]">
-              VAD Sensitivity ({vadThreshold.toFixed(3)})
+              Speech Threshold ({vadThreshold.toFixed(2)})
             </label>
             <Slider
-              aria-label="VAD sensitivity"
-              min={0.005}
-              max={0.08}
-              step={0.001}
+              aria-label="Speech threshold"
+              min={0.1}
+              max={0.9}
+              step={0.01}
               value={[vadThreshold]}
               onValueChange={(value) => {
                 const next = value[0];
