@@ -1860,6 +1860,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1d926b4d407d372f141f93bb444696142c29d32962ccbd3531117cf3aa0bfa9"
 
 [[package]]
+name = "earshot"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7984231f8b4c72eb3b88c70040dc1e4ff6803fa9169e93c0ac465942d74fa36a"
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3798,6 +3804,13 @@ dependencies = [
  "tracing-subscriber",
  "utoipa",
  "uuid",
+]
+
+[[package]]
+name = "izwi-vad"
+version = "0.1.0-beta-15"
+dependencies = [
+ "earshot",
 ]
 
 [[package]]
