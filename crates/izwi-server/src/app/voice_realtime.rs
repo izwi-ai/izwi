@@ -353,6 +353,7 @@ struct SpeechStartEvent {
 #[derive(Debug)]
 struct StreamingFrameResult {
     speech_start: Option<SpeechStartEvent>,
+    speech_rejected: Option<SpeechStartEvent>,
     finalized_utterance: Option<(PendingAudioCommit, Vec<u8>, UtteranceEndReason)>,
 }
 
@@ -383,6 +384,7 @@ impl StreamingInputState {
         if payload.is_empty() {
             return Ok(StreamingFrameResult {
                 speech_start: None,
+                speech_rejected: None,
                 finalized_utterance: None,
             });
         }
@@ -411,6 +413,7 @@ impl StreamingInputState {
         if samples.is_empty() {
             return Ok(StreamingFrameResult {
                 speech_start: None,
+                speech_rejected: None,
                 finalized_utterance: None,
             });
         }
@@ -423,6 +426,7 @@ impl StreamingInputState {
         let mut chunk_has_speech = false;
         let mut chunk_voiced_ms = 0.0f32;
         let mut speech_started = false;
+        let mut noise_rejected = false;
         let mut end_reason: Option<UtteranceEndReason> = None;
 
         for vad_frame in &vad_frames {
@@ -435,13 +439,14 @@ impl StreamingInputState {
                 match event {
                     EndpointEvent::SpeechStart => speech_started = true,
                     EndpointEvent::SpeechEnd(reason) => end_reason = Some(reason.into()),
-                    EndpointEvent::NoiseRejected => {}
+                    EndpointEvent::NoiseRejected => noise_rejected = true,
                 }
             }
         }
 
         let mut result = StreamingFrameResult {
             speech_start: None,
+            speech_rejected: None,
             finalized_utterance: None,
         };
 
@@ -487,6 +492,8 @@ impl StreamingInputState {
 
         if let Some(reason) = end_reason {
             result.finalized_utterance = self.finalize_active_utterance(reason)?;
+        } else if noise_rejected {
+            result.speech_rejected = self.reject_active_utterance();
         }
 
         if !chunk_has_speech {
@@ -494,6 +501,14 @@ impl StreamingInputState {
         }
 
         Ok(result)
+    }
+
+    fn reject_active_utterance(&mut self) -> Option<SpeechStartEvent> {
+        let active = self.active.take()?;
+        Some(SpeechStartEvent {
+            utterance_id: active.utterance_id,
+            utterance_seq: active.utterance_seq,
+        })
     }
 
     fn finish_stream(
@@ -1098,6 +1113,17 @@ async fn handle_binary_message(
                     end_reason,
                 )
                 .await?;
+            }
+
+            if let Some(evt) = frame_result.speech_rejected {
+                send_json(
+                    out_tx,
+                    json!({
+                        "type": "user_speech_rejected",
+                        "utterance_id": evt.utterance_id,
+                        "utterance_seq": evt.utterance_seq,
+                    }),
+                );
             }
 
             return Ok(());
