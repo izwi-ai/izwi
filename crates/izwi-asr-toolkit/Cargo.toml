@@ -6,3 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+izwi-vad = { path = "../izwi-vad" }
+
+[dev-dependencies]
+hound = { workspace = true }

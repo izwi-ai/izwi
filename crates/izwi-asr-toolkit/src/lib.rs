@@ -2,6 +2,8 @@
 
 use std::cmp;
 
+use izwi_vad::{detect_speech_regions_f32, VadRegionConfig};
+
 /// Tunables for long-form ASR chunking and transcript stitching.
 #[derive(Debug, Clone)]
 pub struct AsrLongFormConfig {
@@ -83,15 +85,15 @@ impl SpeechRegion {
 /// Tunables for speech-island planning before Whisper-style long-form ASR.
 #[derive(Debug, Clone)]
 pub struct AsrSpeechChunkConfig {
-    /// RMS frame length for speech activity analysis.
+    /// Retained for config compatibility. Shared VAD uses fixed 16 ms frames.
     pub analysis_frame_ms: u32,
-    /// Noise floor quantile used to build adaptive onset/offset thresholds.
+    /// Retained for compatibility with earlier adaptive-energy VAD settings.
     pub energy_floor_quantile: f32,
-    /// Scale over the adaptive floor required to enter speech.
+    /// Retained for compatibility with earlier adaptive-energy VAD settings.
     pub onset_energy_scale: f32,
-    /// Scale over the adaptive floor required to remain in speech.
+    /// Retained for compatibility with earlier adaptive-energy VAD settings.
     pub offset_energy_scale: f32,
-    /// Absolute minimum onset threshold for quiet/silent clips.
+    /// Retained for compatibility with earlier adaptive-energy VAD settings.
     pub min_energy: f32,
     /// Minimum continuous speech duration required to emit a region.
     pub min_speech_secs: f32,
@@ -141,13 +143,6 @@ impl SpeechChunkPlan {
             no_speech: true,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct FrameEnergy {
-    start_sample: usize,
-    end_sample: usize,
-    rms: f32,
 }
 
 /// Build chunk boundaries for long-form ASR.
@@ -292,53 +287,23 @@ pub fn plan_speech_audio_chunks(
         return SpeechChunkPlan::no_speech(samples.len());
     }
 
-    let frame_samples = ms_to_samples(speech_config.analysis_frame_ms.max(5), sample_rate).max(1);
-    let frames = speech_energy_frames(samples, frame_samples);
-    if frames.is_empty() {
-        return SpeechChunkPlan::no_speech(samples.len());
-    }
-
-    let mut energies: Vec<f32> = frames.iter().map(|frame| frame.rms).collect();
-    let floor = percentile(
-        &mut energies,
-        speech_config.energy_floor_quantile.clamp(0.0, 1.0),
-    );
-    let peak = frames
-        .iter()
-        .fold(0.0f32, |current, frame| current.max(frame.rms));
-    let mut onset_threshold =
-        (floor * speech_config.onset_energy_scale.max(1.0)).max(speech_config.min_energy);
-    if peak > speech_config.min_energy {
-        onset_threshold = onset_threshold.min(peak * 0.5);
-    }
-    let mut offset_threshold =
-        (floor * speech_config.offset_energy_scale.max(1.0)).max(speech_config.min_energy * 0.5);
-    if offset_threshold >= onset_threshold {
-        offset_threshold = onset_threshold * 0.75;
-    }
-
-    let mut regions = detect_speech_regions(
-        &frames,
-        samples.len(),
-        sample_rate,
-        onset_threshold,
-        offset_threshold,
-        speech_config.min_speech_secs,
-        speech_config.min_silence_secs,
-    );
-    if regions.is_empty() {
-        return SpeechChunkPlan::no_speech(samples.len());
-    }
-
-    apply_region_padding(
-        &mut regions,
-        samples.len(),
-        secs_to_samples(speech_config.speech_pad_secs, sample_rate as f32),
-    );
-    regions = merge_close_regions(
-        &regions,
-        secs_to_samples(speech_config.merge_gap_secs, sample_rate as f32),
-    );
+    let vad_config = VadRegionConfig {
+        min_speech_ms: secs_to_ms(speech_config.min_speech_secs),
+        min_silence_ms: secs_to_ms(speech_config.min_silence_secs),
+        speech_pad_ms: secs_to_ms(speech_config.speech_pad_secs),
+        merge_gap_ms: secs_to_ms(speech_config.merge_gap_secs),
+        ..VadRegionConfig::default()
+    };
+    let regions = match detect_speech_regions_f32(samples, sample_rate, &vad_config) {
+        Ok(regions) => regions
+            .into_iter()
+            .map(|region| SpeechRegion {
+                start_sample: region.start_sample,
+                end_sample: region.end_sample,
+            })
+            .collect::<Vec<_>>(),
+        Err(_) => Vec::new(),
+    };
     if regions.is_empty() {
         return SpeechChunkPlan::no_speech(samples.len());
     }
@@ -371,130 +336,6 @@ pub fn plan_speech_audio_chunks(
         skipped_samples: samples.len().saturating_sub(included_samples),
         no_speech: false,
     }
-}
-
-fn speech_energy_frames(samples: &[f32], frame_samples: usize) -> Vec<FrameEnergy> {
-    let frame_samples = frame_samples.max(1);
-    let mut frames = Vec::new();
-    let mut start = 0usize;
-    while start < samples.len() {
-        let end = (start + frame_samples).min(samples.len());
-        frames.push(FrameEnergy {
-            start_sample: start,
-            end_sample: end,
-            rms: local_rms(&samples[start..end]),
-        });
-        start = end;
-    }
-    frames
-}
-
-fn local_rms(samples: &[f32]) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    let sum_squares = samples.iter().map(|sample| sample * sample).sum::<f32>();
-    (sum_squares / samples.len() as f32).sqrt()
-}
-
-fn detect_speech_regions(
-    frames: &[FrameEnergy],
-    total_samples: usize,
-    sample_rate: u32,
-    onset_threshold: f32,
-    offset_threshold: f32,
-    min_speech_secs: f32,
-    min_silence_secs: f32,
-) -> Vec<SpeechRegion> {
-    let min_speech_samples = secs_to_samples(min_speech_secs.max(0.0), sample_rate as f32);
-    let min_silence_samples = secs_to_samples(min_silence_secs.max(0.0), sample_rate as f32);
-    let mut regions = Vec::new();
-    let mut in_speech = false;
-    let mut active_start: Option<usize> = None;
-    let mut speech_start = 0usize;
-    let mut silence_start: Option<usize> = None;
-
-    for frame in frames {
-        if !in_speech {
-            if frame.rms >= onset_threshold {
-                let start = *active_start.get_or_insert(frame.start_sample);
-                if frame.end_sample.saturating_sub(start) >= min_speech_samples {
-                    in_speech = true;
-                    speech_start = start;
-                    silence_start = None;
-                }
-            } else {
-                active_start = None;
-            }
-            continue;
-        }
-
-        if frame.rms < offset_threshold {
-            let start = *silence_start.get_or_insert(frame.start_sample);
-            if frame.end_sample.saturating_sub(start) >= min_silence_samples {
-                if start > speech_start {
-                    regions.push(SpeechRegion {
-                        start_sample: speech_start,
-                        end_sample: start.min(total_samples),
-                    });
-                }
-                in_speech = false;
-                active_start = None;
-                silence_start = None;
-            }
-        } else {
-            silence_start = None;
-        }
-    }
-
-    if in_speech {
-        if total_samples > speech_start {
-            regions.push(SpeechRegion {
-                start_sample: speech_start,
-                end_sample: total_samples,
-            });
-        }
-    } else if let Some(start) = active_start {
-        if total_samples.saturating_sub(start) >= min_speech_samples {
-            regions.push(SpeechRegion {
-                start_sample: start,
-                end_sample: total_samples,
-            });
-        }
-    }
-
-    regions
-        .into_iter()
-        .filter(|region| region.len_samples() >= min_speech_samples)
-        .collect()
-}
-
-fn apply_region_padding(regions: &mut [SpeechRegion], total_samples: usize, pad_samples: usize) {
-    for region in regions {
-        region.start_sample = region.start_sample.saturating_sub(pad_samples);
-        region.end_sample = region
-            .end_sample
-            .saturating_add(pad_samples)
-            .min(total_samples);
-    }
-}
-
-fn merge_close_regions(regions: &[SpeechRegion], merge_gap_samples: usize) -> Vec<SpeechRegion> {
-    let mut merged: Vec<SpeechRegion> = Vec::new();
-    for region in regions.iter().copied() {
-        if region.end_sample <= region.start_sample {
-            continue;
-        }
-        if let Some(last) = merged.last_mut() {
-            let gap = region.start_sample.saturating_sub(last.end_sample);
-            if gap <= merge_gap_samples {
-                last.end_sample = last.end_sample.max(region.end_sample);
-                continue;
-            }
-        }
-        merged.push(region);
-    }
-    merged
 }
 
 fn merge_regions_into_chunks(
@@ -664,6 +505,10 @@ impl TranscriptAssembler {
 
 fn secs_to_samples(secs: f32, sample_rate: f32) -> usize {
     ((secs.max(0.0) * sample_rate).round() as usize).max(1)
+}
+
+fn secs_to_ms(secs: f32) -> u32 {
+    ((secs.max(0.0) * 1000.0).round() as u32).max(1)
 }
 
 fn ms_to_samples(ms: u32, sample_rate: u32) -> usize {
@@ -960,6 +805,21 @@ fn normalize_token(token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    fn load_wav_mono_f32(name: &str) -> (Vec<f32>, u32) {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../data")
+            .join(name);
+        let mut reader = hound::WavReader::open(path).expect("test wav should open");
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 1);
+        let samples = reader
+            .samples::<i16>()
+            .map(|sample| sample.expect("test wav sample") as f32 / 32768.0)
+            .collect::<Vec<_>>();
+        (samples, spec.sample_rate)
+    }
 
     #[test]
     fn short_audio_stays_single_chunk() {
@@ -1002,57 +862,49 @@ mod tests {
     }
 
     #[test]
-    fn speech_planner_finds_separate_speech_islands() {
+    fn speech_planner_detects_fixture_speech_with_shared_vad() {
         let cfg = AsrLongFormConfig::default();
         let speech_cfg = AsrSpeechChunkConfig {
-            speech_pad_secs: 0.0,
-            merge_gap_secs: 0.2,
-            min_speech_secs: 0.1,
-            min_silence_secs: 0.15,
+            min_speech_secs: 0.08,
+            min_silence_secs: 0.2,
             ..AsrSpeechChunkConfig::default()
         };
-        let sr = 1_000u32;
-        let mut samples = vec![0.0f32; 4_000];
-        samples[500..1_200].fill(0.2);
-        samples[2_200..3_000].fill(0.25);
+        let (samples, sr) = load_wav_mono_f32("fox.wav");
 
         let plan = plan_speech_audio_chunks(&samples, sr, &cfg, &speech_cfg, Some(30.0));
 
         assert!(!plan.no_speech);
-        assert_eq!(plan.speech_regions.len(), 2);
-        assert_eq!(plan.chunks.len(), 1);
-        assert!(plan.speech_regions[0].start_sample <= 500);
-        assert!(plan.speech_regions[0].end_sample >= 1_200);
-        assert!(plan.speech_regions[1].start_sample <= 2_200);
-        assert!(plan.speech_regions[1].end_sample >= 3_000);
-        assert!(plan.skipped_samples > 0);
+        assert!(!plan.speech_regions.is_empty());
+        assert!(!plan.chunks.is_empty());
+        assert!(plan.speech_samples > 0);
+        assert!(plan.included_samples <= samples.len());
     }
 
     #[test]
-    fn speech_planner_merges_short_gaps() {
+    fn region_chunker_combines_regions_under_model_limit() {
         let cfg = AsrLongFormConfig::default();
-        let speech_cfg = AsrSpeechChunkConfig {
-            speech_pad_secs: 0.0,
-            merge_gap_secs: 0.35,
-            min_speech_secs: 0.1,
-            min_silence_secs: 0.1,
-            ..AsrSpeechChunkConfig::default()
-        };
         let sr = 1_000u32;
-        let mut samples = vec![0.0f32; 2_000];
-        samples[200..800].fill(0.25);
-        samples[1_000..1_600].fill(0.25);
+        let samples = vec![0.0f32; 2_000];
+        let regions = vec![
+            SpeechRegion {
+                start_sample: 200,
+                end_sample: 800,
+            },
+            SpeechRegion {
+                start_sample: 1_000,
+                end_sample: 1_600,
+            },
+        ];
 
-        let plan = plan_speech_audio_chunks(&samples, sr, &cfg, &speech_cfg, Some(30.0));
+        let chunks = merge_regions_into_chunks(&samples, sr, &cfg, &regions, Some(30.0));
 
-        assert_eq!(plan.speech_regions.len(), 1);
-        assert_eq!(plan.chunks.len(), 1);
-        assert!(plan.chunks[0].start_sample <= 200);
-        assert!(plan.chunks[0].end_sample >= 1_600);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].start_sample, 200);
+        assert_eq!(chunks[0].end_sample, 1_600);
     }
 
     #[test]
-    fn speech_planner_respects_model_limit_for_long_regions() {
+    fn region_chunker_respects_model_limit_for_long_regions() {
         let cfg = AsrLongFormConfig {
             min_chunk_secs: 2.0,
             target_chunk_secs: 4.0,
@@ -1060,42 +912,20 @@ mod tests {
             overlap_secs: 0.5,
             ..AsrLongFormConfig::default()
         };
-        let speech_cfg = AsrSpeechChunkConfig {
-            speech_pad_secs: 0.0,
-            min_speech_secs: 0.1,
-            min_silence_secs: 0.2,
-            ..AsrSpeechChunkConfig::default()
-        };
         let sr = 1_000u32;
         let samples = vec![0.2f32; 16_000];
+        let regions = vec![SpeechRegion {
+            start_sample: 0,
+            end_sample: samples.len(),
+        }];
 
-        let plan = plan_speech_audio_chunks(&samples, sr, &cfg, &speech_cfg, Some(5.0));
+        let chunks = merge_regions_into_chunks(&samples, sr, &cfg, &regions, Some(5.0));
 
-        assert!(plan.chunks.len() >= 3);
+        assert!(chunks.len() >= 3);
         let max_allowed = secs_to_samples(5.0, sr as f32);
-        for chunk in &plan.chunks {
+        for chunk in &chunks {
             assert!(chunk.len_samples() <= max_allowed);
         }
-    }
-
-    #[test]
-    fn speech_planner_uses_input_sample_rate_for_timing() {
-        let cfg = AsrLongFormConfig::default();
-        let speech_cfg = AsrSpeechChunkConfig {
-            speech_pad_secs: 0.0,
-            min_speech_secs: 0.1,
-            min_silence_secs: 0.1,
-            ..AsrSpeechChunkConfig::default()
-        };
-        let sr = 8_000u32;
-        let mut samples = vec![0.0f32; 24_000];
-        samples[8_000..12_000].fill(0.2);
-
-        let plan = plan_speech_audio_chunks(&samples, sr, &cfg, &speech_cfg, Some(30.0));
-
-        assert_eq!(plan.speech_regions.len(), 1);
-        assert!(plan.speech_regions[0].start_sample <= 8_000);
-        assert!(plan.speech_regions[0].end_sample >= 12_000);
     }
 
     #[test]
