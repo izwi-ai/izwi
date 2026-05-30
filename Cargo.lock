@@ -3646,6 +3646,10 @@ dependencies = [
 [[package]]
 name = "izwi-asr-toolkit"
 version = "0.1.0-beta-15"
+dependencies = [
+ "hound",
+ "izwi-vad",
+]
 
 [[package]]
 name = "izwi-cli"
