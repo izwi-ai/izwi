@@ -9,6 +9,7 @@ use candle_nn::{
     batch_norm, layer_norm, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, LayerNorm, Linear, Module,
     ModuleT, VarBuilder,
 };
+use izwi_vad::{speech_mask_for_frames_f32, VadRegionConfig};
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
 
@@ -27,7 +28,6 @@ const DEFAULT_MIN_SILENCE_MS: f32 = 200.0;
 const PREEMPH: f32 = 0.97;
 const LOG_GUARD: f32 = 5.960_464_5e-8;
 const NORMALIZE_EPS: f32 = 1e-5;
-const REALTIME_VAD_THRESHOLD: f32 = 0.02;
 const TS_VAD_FRAME_LENGTH_SECS: f32 = 0.01;
 const TS_VAD_UNIT_FRAME_COUNT: usize = 8;
 
@@ -338,19 +338,15 @@ impl SortformerDiarizerModel {
             );
 
         let mut gated_probs = speaker_probs;
-        if sortformer_rms_gating_enabled() {
-            let frame_ms = frame_stride_samples as f32 * 1000.0 / TARGET_SAMPLE_RATE as f32;
-            let min_speech_frames = ((min_speech_ms / frame_ms).round() as usize).max(1);
-            let min_silence_frames = ((min_silence_ms / frame_ms).round() as usize).max(1);
-
+        if sortformer_vad_gating_enabled() {
             let frame_count = gated_probs.len();
-            let mut vad_mask = realtime_voice_vad_frame_mask(
+            let vad_mask = sortformer_vad_frame_mask(
                 &samples,
                 frame_count,
                 frame_stride_samples,
-                REALTIME_VAD_THRESHOLD,
+                min_speech_ms,
+                min_silence_ms,
             );
-            smooth_activity_mask(&mut vad_mask, min_speech_frames, min_silence_frames);
 
             for (frame_idx, active) in vad_mask.iter().copied().enumerate() {
                 if !active {
@@ -2059,8 +2055,10 @@ fn env_flag(key: &str) -> Option<bool> {
         })
 }
 
-fn sortformer_rms_gating_enabled() -> bool {
-    env_flag("IZWI_SORTFORMER_ENABLE_RMS_GATING").unwrap_or(false)
+fn sortformer_vad_gating_enabled() -> bool {
+    env_flag("IZWI_SORTFORMER_ENABLE_VAD_GATING")
+        .or_else(|| env_flag("IZWI_SORTFORMER_ENABLE_RMS_GATING"))
+        .unwrap_or(false)
 }
 
 fn select_speaker_channels(
@@ -2285,80 +2283,36 @@ fn average_speaker_probability_for_range(
     (count > 0).then_some((sum / count as f32).clamp(0.0, 1.0))
 }
 
-fn realtime_voice_vad_frame_mask(
+fn sortformer_vad_frame_mask(
     samples: &[f32],
     frame_count: usize,
     frame_stride_samples: usize,
-    vad_threshold: f32,
+    min_speech_ms: f32,
+    min_silence_ms: f32,
 ) -> Vec<bool> {
     if frame_count == 0 || frame_stride_samples == 0 {
         return Vec::new();
     }
 
-    let threshold = vad_threshold.clamp(0.001, 1.0);
-    let mut mask = vec![false; frame_count];
-    for (frame_idx, active) in mask.iter_mut().enumerate().take(frame_count) {
-        let start = frame_idx * frame_stride_samples;
-        if start >= samples.len() {
-            break;
-        }
-        let end = ((frame_idx + 1) * frame_stride_samples).min(samples.len());
-        *active = rms_f32(&samples[start..end]) >= threshold;
-    }
-    mask
+    let vad_config = VadRegionConfig {
+        min_speech_ms: ms_f32_to_u32(min_speech_ms),
+        min_silence_ms: ms_f32_to_u32(min_silence_ms),
+        speech_pad_ms: 0,
+        merge_gap_ms: ms_f32_to_u32(min_silence_ms),
+        ..VadRegionConfig::default()
+    };
+    speech_mask_for_frames_f32(
+        samples,
+        TARGET_SAMPLE_RATE,
+        frame_count,
+        frame_stride_samples,
+        &vad_config,
+    )
+    .unwrap_or_else(|_| vec![true; frame_count])
 }
 
-fn rms_f32(samples: &[f32]) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    let sum_squares: f32 = samples.iter().map(|s| s * s).sum();
-    (sum_squares / samples.len() as f32).sqrt()
-}
-
-fn smooth_activity_mask(active: &mut [bool], min_speech_frames: usize, min_silence_frames: usize) {
-    if active.is_empty() {
-        return;
-    }
-
-    let mut idx = 0usize;
-    while idx < active.len() {
-        if active[idx] {
-            idx += 1;
-            continue;
-        }
-        let start = idx;
-        while idx < active.len() && !active[idx] {
-            idx += 1;
-        }
-        let end = idx;
-        let gap_len = end - start;
-        let has_left_speech = start > 0 && active[start - 1];
-        let has_right_speech = end < active.len() && active[end];
-        if has_left_speech && has_right_speech && gap_len <= min_silence_frames {
-            for value in &mut active[start..end] {
-                *value = true;
-            }
-        }
-    }
-
-    idx = 0;
-    while idx < active.len() {
-        if !active[idx] {
-            idx += 1;
-            continue;
-        }
-        let start = idx;
-        while idx < active.len() && active[idx] {
-            idx += 1;
-        }
-        let end = idx;
-        if end - start < min_speech_frames {
-            for value in &mut active[start..end] {
-                *value = false;
-            }
-        }
-    }
+fn ms_f32_to_u32(ms: f32) -> u32 {
+    ms.round().max(1.0) as u32
 }
 
 fn collect_active_regions(active: &[bool]) -> Vec<(usize, usize)> {
@@ -2689,15 +2643,12 @@ mod tests {
     }
 
     #[test]
-    fn realtime_voice_vad_frame_mask_uses_rms_threshold() {
-        let samples = vec![
-            0.0, 0.0, 0.0, 0.0, // silence
-            0.3, 0.3, 0.3, 0.3, // speech
-            0.0, 0.0, 0.0, 0.0, // silence
-            0.4, 0.4, 0.4, 0.4, // speech
-        ];
-        let mask = realtime_voice_vad_frame_mask(&samples, 4, 4, 0.02);
-        assert_eq!(mask, vec![false, true, false, true]);
+    fn sortformer_vad_frame_mask_returns_silence_for_silent_audio() {
+        let samples = vec![0.0; TARGET_SAMPLE_RATE as usize];
+        let mask = sortformer_vad_frame_mask(&samples, 100, 160, 240.0, 200.0);
+
+        assert_eq!(mask.len(), 100);
+        assert!(mask.iter().all(|active| !active));
     }
 
     #[test]
@@ -2983,18 +2934,6 @@ mod tests {
 
         assert!(filtering(&segments, &speech_first).is_empty());
         assert_eq!(filtering(&segments, &nonspeech_first), vec![(0.0, 0.22)]);
-    }
-
-    #[test]
-    fn smooth_activity_mask_fills_gaps_and_removes_short_bursts() {
-        let mut active = vec![
-            true, true, false, true, true, false, false, false, true, false, false,
-        ];
-        smooth_activity_mask(&mut active, 2, 1);
-        assert_eq!(
-            active,
-            vec![true, true, true, true, true, false, false, false, false, false, false]
-        );
     }
 
     #[test]
