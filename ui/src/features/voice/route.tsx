@@ -906,6 +906,12 @@ export function VoicePage({
             setRuntimeStatus("user_speaking");
           }
           return;
+        case "user_speech_rejected":
+          processingRef.current = false;
+          if (isSessionActiveRef.current) {
+            setRuntimeStatus("listening");
+          }
+          return;
         case "user_speech_end":
           processingRef.current = true;
           if (isSessionActiveRef.current) {

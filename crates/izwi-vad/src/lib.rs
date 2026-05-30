@@ -289,6 +289,11 @@ impl EndpointDetector {
         if self.total_ms >= self.config.max_utterance_ms as f32 {
             events.push(EndpointEvent::SpeechEnd(EndpointEndReason::MaxDuration));
             self.reset();
+        } else if self.speech_ms < self.config.min_speech_ms as f32
+            && self.silence_ms >= self.config.silence_ms as f32
+        {
+            events.push(EndpointEvent::NoiseRejected);
+            self.reset();
         } else if self.speech_ms >= self.config.min_speech_ms as f32
             && self.silence_ms >= self.config.silence_ms as f32
         {
@@ -748,6 +753,25 @@ mod tests {
 
         detector.process_score(0.9, 16.0);
         assert_eq!(detector.finish(), Some(EndpointEvent::NoiseRejected));
+        assert!(!detector.is_active());
+    }
+
+    #[test]
+    fn endpoint_detector_rejects_too_short_speech_after_silence() {
+        let mut detector = EndpointDetector::new(EndpointConfig {
+            start_threshold: 0.5,
+            end_threshold: 0.35,
+            min_speech_ms: 100,
+            silence_ms: 32,
+            max_utterance_ms: 10_000,
+        });
+
+        detector.process_score(0.8, 16.0);
+        let quiet = detector.process_score(0.0, 16.0);
+        assert!(quiet.events.is_empty());
+        let rejected = detector.process_score(0.0, 16.0);
+
+        assert_eq!(rejected.events, vec![EndpointEvent::NoiseRejected]);
         assert!(!detector.is_active());
     }
 
