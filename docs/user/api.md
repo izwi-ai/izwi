@@ -957,7 +957,7 @@ Client JSON messages:
 | `speaker` | TTS speaker/voice. |
 | `asr_language` | Language hint. |
 | `max_output_tokens` | Text output budget. |
-| `vad_threshold` | Speech detection threshold. |
+| `vad_threshold` | Earshot speech score threshold, default `0.5`. Legacy RMS-style values such as `0.02` are accepted and mapped server-side for compatibility. |
 | `min_speech_ms` | Minimum speech duration. |
 | `silence_duration_ms` | Silence before utterance end. |
 | `max_utterance_ms` | Hard utterance duration cap. |
@@ -994,7 +994,7 @@ Server events:
 | Type | Notes |
 |------|-------|
 | `session_ready` | Voice session initialized. |
-| `input_stream_ready` | Includes resolved VAD settings. |
+| `input_stream_ready` | Includes resolved VAD settings, including backend, score sample rate, and score frame duration. |
 | `input_stream_stopped` | Input stream stopped. |
 | `listening` | Ready for an utterance. |
 | `user_speech_start`, `user_speech_end` | VAD utterance boundaries. |

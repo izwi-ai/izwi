@@ -14,7 +14,7 @@
 //! │          SIGNAL FRONTEND              │
 //! │  ┌─────────────┐  ┌────────────────┐  │
 //! │  │     VAD     │  │    Feature     │  │
-//! │  │  (Silero)   │→ │   Extractor    │  │
+//! │  │  (Earshot)  │→ │   Extractor    │  │
 //! │  └─────────────┘  │  (Mel-Spec)    │  │
 //! │                   └────────────────┘  │
 //! │  ┌─────────────────────────────────┐  │
@@ -28,6 +28,8 @@
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
+
+use izwi_vad::{EndpointConfig, EndpointDetector, EndpointEvent, VadScorer, VAD_FRAME_MS};
 
 /// Configuration for the signal frontend.
 #[derive(Debug, Clone)]
@@ -108,117 +110,82 @@ pub struct AudioChunk {
 }
 
 /// Voice Activity Detector.
-///
-/// Currently implements a simple energy-based VAD.
-/// TODO: Integrate Silero VAD for production use.
 pub struct VoiceActivityDetector {
     config: SignalFrontendConfig,
     state: VadState,
     state_start: Instant,
-    speech_frames: usize,
-    silence_frames: usize,
-    /// Energy threshold for simple VAD
-    energy_threshold: f32,
-    /// Smoothed speech probability
-    smoothed_prob: f32,
+    scorer: VadScorer,
+    endpoint: EndpointDetector,
+    last_score: f32,
 }
 
 impl VoiceActivityDetector {
     /// Create a new VAD instance.
     pub fn new(config: SignalFrontendConfig) -> Self {
+        let endpoint = EndpointDetector::new(EndpointConfig {
+            start_threshold: config.vad_threshold,
+            end_threshold: (config.vad_threshold * 0.7).min(config.vad_threshold),
+            min_speech_ms: config.min_speech_duration_ms,
+            silence_ms: config.silence_end_duration_ms,
+            max_utterance_ms: 120_000,
+        });
         Self {
             config,
             state: VadState::Silence,
             state_start: Instant::now(),
-            speech_frames: 0,
-            silence_frames: 0,
-            energy_threshold: 0.01,
-            smoothed_prob: 0.0,
+            scorer: VadScorer::new(),
+            endpoint,
+            last_score: 0.0,
         }
     }
 
     /// Process an audio frame and return VAD result.
     pub fn process(&mut self, samples: &[f32], is_ai_speaking: bool) -> VadResult {
-        // Calculate frame energy (RMS)
-        let energy = Self::calculate_rms(samples);
+        let frames = self
+            .scorer
+            .push_f32(samples, self.config.sample_rate)
+            .unwrap_or_default();
+        let mut speech_now = false;
 
-        // Simple energy-based speech probability
-        // In production, this would use Silero VAD model
-        let raw_prob = (energy / self.energy_threshold).min(1.0);
+        if self.state == VadState::SpeechEnding && !frames.is_empty() {
+            self.set_state(VadState::Silence);
+        }
 
-        // Exponential smoothing
-        let alpha = 0.3;
-        self.smoothed_prob = alpha * raw_prob + (1.0 - alpha) * self.smoothed_prob;
-
-        let is_speech = self.smoothed_prob > self.config.vad_threshold;
-
-        // State machine for VAD
-        let frame_duration_ms =
-            (self.config.hop_size as f32 / self.config.sample_rate as f32 * 1000.0) as u32;
-
-        match self.state {
-            VadState::Silence => {
-                if is_speech {
-                    self.speech_frames += 1;
-                    let speech_duration = self.speech_frames as u32 * frame_duration_ms;
-                    if speech_duration >= self.config.min_speech_duration_ms {
-                        self.state = VadState::Speech;
-                        self.state_start = Instant::now();
-                        self.silence_frames = 0;
-                    }
-                } else {
-                    self.speech_frames = 0;
-                }
-            }
-            VadState::Speech => {
-                if !is_speech {
-                    self.silence_frames += 1;
-                    let silence_duration = self.silence_frames as u32 * frame_duration_ms;
-                    if silence_duration >= self.config.silence_end_duration_ms {
-                        self.state = VadState::SpeechEnding;
-                        self.state_start = Instant::now();
-                    }
-                } else {
-                    self.silence_frames = 0;
-                }
-            }
-            VadState::SpeechEnding => {
-                if is_speech {
-                    self.state = VadState::Speech;
-                    self.state_start = Instant::now();
-                    self.silence_frames = 0;
-                } else {
-                    self.state = VadState::Silence;
-                    self.state_start = Instant::now();
-                    self.speech_frames = 0;
+        for frame in frames {
+            self.last_score = frame.score;
+            let decision = self.endpoint.process_score(frame.score, VAD_FRAME_MS);
+            speech_now |= decision.is_speech;
+            for event in decision.events {
+                match event {
+                    EndpointEvent::SpeechStart => self.set_state(VadState::Speech),
+                    EndpointEvent::SpeechEnd(_) => self.set_state(VadState::SpeechEnding),
+                    EndpointEvent::NoiseRejected => self.set_state(VadState::Silence),
                 }
             }
         }
 
         VadResult {
             state: self.state,
-            speech_probability: self.smoothed_prob,
+            speech_probability: self.last_score,
             state_duration: self.state_start.elapsed(),
-            is_interruption: is_speech && is_ai_speaking,
+            is_interruption: speech_now && is_ai_speaking,
         }
     }
 
-    /// Calculate RMS energy of samples.
-    fn calculate_rms(samples: &[f32]) -> f32 {
-        if samples.is_empty() {
-            return 0.0;
+    fn set_state(&mut self, state: VadState) {
+        if self.state != state {
+            self.state = state;
+            self.state_start = Instant::now();
         }
-        let sum_squares: f32 = samples.iter().map(|s| s * s).sum();
-        (sum_squares / samples.len() as f32).sqrt()
     }
 
     /// Reset VAD state.
     pub fn reset(&mut self) {
         self.state = VadState::Silence;
         self.state_start = Instant::now();
-        self.speech_frames = 0;
-        self.silence_frames = 0;
-        self.smoothed_prob = 0.0;
+        self.scorer.reset();
+        self.endpoint.reset();
+        self.last_score = 0.0;
     }
 
     /// Get current state.
@@ -542,6 +509,21 @@ impl SignalFrontend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    fn load_wav_mono_f32(name: &str) -> (Vec<f32>, u32) {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../data")
+            .join(name);
+        let mut reader = hound::WavReader::open(path).expect("test wav should open");
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 1);
+        let samples = reader
+            .samples::<i16>()
+            .map(|sample| sample.expect("test wav sample") as f32 / 32768.0)
+            .collect::<Vec<_>>();
+        (samples, spec.sample_rate)
+    }
 
     #[test]
     fn test_vad_silence() {
@@ -558,22 +540,28 @@ mod tests {
 
     #[test]
     fn test_vad_speech() {
+        let (samples, sr) = load_wav_mono_f32("fox.wav");
         let config = SignalFrontendConfig {
-            min_speech_duration_ms: 0, // Instant detection for test
+            sample_rate: sr,
+            min_speech_duration_ms: 32,
             ..Default::default()
         };
         let mut vad = VoiceActivityDetector::new(config);
+        let chunk_size = (sr as usize / 25).max(1);
 
-        // "Loud" samples
-        let samples: Vec<f32> = (0..160).map(|i| (i as f32 * 0.1).sin() * 0.5).collect();
-
-        // Process multiple frames to trigger speech state
-        for _ in 0..10 {
-            vad.process(&samples, false);
+        let mut detected = false;
+        let mut max_score = 0.0f32;
+        for chunk in samples.chunks(chunk_size) {
+            let result = vad.process(chunk, false);
+            max_score = max_score.max(result.speech_probability);
+            if result.state == VadState::Speech {
+                detected = true;
+                break;
+            }
         }
 
-        let result = vad.process(&samples, false);
-        assert!(result.speech_probability > 0.1);
+        assert!(detected);
+        assert!(max_score > 0.5);
     }
 
     #[test]
