@@ -2,7 +2,9 @@
 
 use std::cmp;
 
-use izwi_vad::{detect_speech_regions_f32, VadRegionConfig};
+use izwi_vad::{
+    detect_speech_regions_f32, VadRegionConfig, DEFAULT_EXIT_THRESHOLD, DEFAULT_SPEECH_THRESHOLD,
+};
 
 /// Tunables for long-form ASR chunking and transcript stitching.
 #[derive(Debug, Clone)]
@@ -87,14 +89,22 @@ impl SpeechRegion {
 pub struct AsrSpeechChunkConfig {
     /// Retained for config compatibility. Shared VAD uses fixed 16 ms frames.
     pub analysis_frame_ms: u32,
-    /// Retained for compatibility with earlier adaptive-energy VAD settings.
+    /// Deprecated compatibility field from the earlier adaptive-energy VAD; ignored by shared VAD.
+    #[deprecated(note = "shared ASR VAD uses Earshot score thresholds; this field is ignored")]
     pub energy_floor_quantile: f32,
-    /// Retained for compatibility with earlier adaptive-energy VAD settings.
+    /// Deprecated compatibility field from the earlier adaptive-energy VAD; ignored by shared VAD.
+    #[deprecated(note = "shared ASR VAD uses Earshot score thresholds; this field is ignored")]
     pub onset_energy_scale: f32,
-    /// Retained for compatibility with earlier adaptive-energy VAD settings.
+    /// Deprecated compatibility field from the earlier adaptive-energy VAD; ignored by shared VAD.
+    #[deprecated(note = "shared ASR VAD uses Earshot score thresholds; this field is ignored")]
     pub offset_energy_scale: f32,
-    /// Retained for compatibility with earlier adaptive-energy VAD settings.
+    /// Deprecated compatibility field from the earlier adaptive-energy VAD; ignored by shared VAD.
+    #[deprecated(note = "shared ASR VAD uses Earshot score thresholds; this field is ignored")]
     pub min_energy: f32,
+    /// Earshot score required to enter speech.
+    pub start_threshold: f32,
+    /// Earshot score below which active speech may exit.
+    pub end_threshold: f32,
     /// Minimum continuous speech duration required to emit a region.
     pub min_speech_secs: f32,
     /// Minimum continuous silence duration required to close a region.
@@ -106,6 +116,7 @@ pub struct AsrSpeechChunkConfig {
 }
 
 impl Default for AsrSpeechChunkConfig {
+    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             analysis_frame_ms: 20,
@@ -113,6 +124,8 @@ impl Default for AsrSpeechChunkConfig {
             onset_energy_scale: 3.0,
             offset_energy_scale: 1.8,
             min_energy: 0.003,
+            start_threshold: DEFAULT_SPEECH_THRESHOLD,
+            end_threshold: DEFAULT_EXIT_THRESHOLD,
             min_speech_secs: 0.25,
             min_silence_secs: 0.45,
             speech_pad_secs: 0.2,
@@ -287,13 +300,7 @@ pub fn plan_speech_audio_chunks(
         return SpeechChunkPlan::no_speech(samples.len());
     }
 
-    let vad_config = VadRegionConfig {
-        min_speech_ms: secs_to_ms(speech_config.min_speech_secs),
-        min_silence_ms: secs_to_ms(speech_config.min_silence_secs),
-        speech_pad_ms: secs_to_ms(speech_config.speech_pad_secs),
-        merge_gap_ms: secs_to_ms(speech_config.merge_gap_secs),
-        ..VadRegionConfig::default()
-    };
+    let vad_config = speech_config_to_vad_region_config(speech_config);
     let regions = match detect_speech_regions_f32(samples, sample_rate, &vad_config) {
         Ok(regions) => regions
             .into_iter()
@@ -335,6 +342,17 @@ pub fn plan_speech_audio_chunks(
         included_samples,
         skipped_samples: samples.len().saturating_sub(included_samples),
         no_speech: false,
+    }
+}
+
+fn speech_config_to_vad_region_config(speech_config: &AsrSpeechChunkConfig) -> VadRegionConfig {
+    VadRegionConfig {
+        start_threshold: speech_config.start_threshold,
+        end_threshold: speech_config.end_threshold,
+        min_speech_ms: secs_to_ms(speech_config.min_speech_secs),
+        min_silence_ms: secs_to_ms(speech_config.min_silence_secs),
+        speech_pad_ms: secs_to_ms(speech_config.speech_pad_secs),
+        merge_gap_ms: secs_to_ms(speech_config.merge_gap_secs),
     }
 }
 
@@ -859,6 +877,20 @@ mod tests {
         assert!(plan.chunks.is_empty());
         assert!(plan.speech_regions.is_empty());
         assert_eq!(plan.skipped_samples, samples.len());
+    }
+
+    #[test]
+    fn speech_config_exposes_shared_vad_thresholds() {
+        let speech_cfg = AsrSpeechChunkConfig {
+            start_threshold: 0.61,
+            end_threshold: 0.29,
+            ..AsrSpeechChunkConfig::default()
+        };
+
+        let vad_cfg = speech_config_to_vad_region_config(&speech_cfg);
+
+        assert_eq!(vad_cfg.start_threshold, 0.61);
+        assert_eq!(vad_cfg.end_threshold, 0.29);
     }
 
     #[test]
