@@ -340,7 +340,6 @@ impl NativeExecutor {
             model_max_chunk_secs,
             streaming_low_latency,
             allow_speech_planner,
-            Self::env_bool("IZWI_ASR_VAD_CHUNKING").unwrap_or(false),
         )
     }
 
@@ -350,7 +349,6 @@ impl NativeExecutor {
         model_max_chunk_secs: Option<f32>,
         mut streaming_low_latency: bool,
         allow_speech_planner: bool,
-        vad_chunking_enabled: bool,
     ) -> PlannedAsrChunks {
         let planning_started = Instant::now();
         if allow_speech_planner {
@@ -369,7 +367,6 @@ impl NativeExecutor {
             && model_fit_limit_secs
                 .map(|limit| audio_secs <= limit)
                 .unwrap_or(false)
-            && !(allow_speech_planner && vad_chunking_enabled)
         {
             let mut single_chunk_cfg = Self::asr_long_form_config();
             let single_chunk_secs = audio_secs.max(single_chunk_cfg.min_chunk_secs.max(0.5));
@@ -406,7 +403,7 @@ impl NativeExecutor {
             .filter(|v| v.is_finite() && *v > 0.0)
             .map(|v| (v * 0.95).max(cfg.min_chunk_secs.max(1.0)));
 
-        if allow_speech_planner && vad_chunking_enabled {
+        if allow_speech_planner {
             let speech_cfg = AsrSpeechChunkConfig::default();
             let speech_plan =
                 plan_speech_audio_chunks(samples, sample_rate, &cfg, &speech_cfg, tuned_limit);
@@ -956,33 +953,22 @@ mod tests {
     }
 
     #[test]
-    fn vad_chunk_plan_is_disabled_by_default_path() {
+    fn speech_chunk_plan_is_default_for_allowed_models() {
         let sr = 16_000u32;
         let samples = vec![0.0f32; (sr as usize) * 4];
-        let plan = NativeExecutor::asr_chunk_plan_with_options(
-            &samples,
-            sr,
-            Some(30.0),
-            false,
-            true,
-            false,
-        );
-        assert_eq!(plan.planner, AsrChunkPlannerKind::Duration);
-        assert_eq!(plan.chunks.len(), 1);
+        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), false, true);
+        assert_eq!(plan.planner, AsrChunkPlannerKind::Speech);
+        assert!(plan.requires_chunk_path());
+        assert!(plan.chunks.is_empty());
+        assert!(plan.speech_plan.as_ref().expect("speech plan").no_speech);
     }
 
     #[test]
     fn vad_chunk_plan_can_return_no_speech() {
         let sr = 16_000u32;
         let samples = vec![0.0f32; (sr as usize) * 4];
-        let plan = NativeExecutor::asr_chunk_plan_with_options(
-            &samples,
-            sr,
-            Some(30.0),
-            false,
-            true,
-            true,
-        );
+        let plan =
+            NativeExecutor::asr_chunk_plan_with_options(&samples, sr, Some(30.0), false, true);
         assert_eq!(plan.planner, AsrChunkPlannerKind::Speech);
         assert!(plan.requires_chunk_path());
         assert!(plan.chunks.is_empty());
@@ -993,14 +979,8 @@ mod tests {
     fn chunk_plan_diagnostics_include_timing_and_seconds() {
         let sr = 16_000u32;
         let samples = vec![0.0f32; (sr as usize) * 4];
-        let plan = NativeExecutor::asr_chunk_plan_with_options(
-            &samples,
-            sr,
-            Some(30.0),
-            false,
-            true,
-            true,
-        );
+        let plan =
+            NativeExecutor::asr_chunk_plan_with_options(&samples, sr, Some(30.0), false, true);
 
         let diagnostics = plan.diagnostics();
         let chunking = diagnostics

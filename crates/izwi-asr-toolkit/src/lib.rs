@@ -87,20 +87,6 @@ impl SpeechRegion {
 /// Tunables for speech-island planning before Whisper-style long-form ASR.
 #[derive(Debug, Clone)]
 pub struct AsrSpeechChunkConfig {
-    /// Retained for config compatibility. Shared VAD uses fixed 16 ms frames.
-    pub analysis_frame_ms: u32,
-    /// Deprecated compatibility field from the earlier adaptive-energy VAD; ignored by shared VAD.
-    #[deprecated(note = "shared ASR VAD uses Earshot score thresholds; this field is ignored")]
-    pub energy_floor_quantile: f32,
-    /// Deprecated compatibility field from the earlier adaptive-energy VAD; ignored by shared VAD.
-    #[deprecated(note = "shared ASR VAD uses Earshot score thresholds; this field is ignored")]
-    pub onset_energy_scale: f32,
-    /// Deprecated compatibility field from the earlier adaptive-energy VAD; ignored by shared VAD.
-    #[deprecated(note = "shared ASR VAD uses Earshot score thresholds; this field is ignored")]
-    pub offset_energy_scale: f32,
-    /// Deprecated compatibility field from the earlier adaptive-energy VAD; ignored by shared VAD.
-    #[deprecated(note = "shared ASR VAD uses Earshot score thresholds; this field is ignored")]
-    pub min_energy: f32,
     /// Earshot score required to enter speech.
     pub start_threshold: f32,
     /// Earshot score below which active speech may exit.
@@ -116,14 +102,8 @@ pub struct AsrSpeechChunkConfig {
 }
 
 impl Default for AsrSpeechChunkConfig {
-    #[allow(deprecated)]
     fn default() -> Self {
         Self {
-            analysis_frame_ms: 20,
-            energy_floor_quantile: 0.2,
-            onset_energy_scale: 3.0,
-            offset_energy_scale: 1.8,
-            min_energy: 0.003,
             start_threshold: DEFAULT_SPEECH_THRESHOLD,
             end_threshold: DEFAULT_EXIT_THRESHOLD,
             min_speech_secs: 0.25,
