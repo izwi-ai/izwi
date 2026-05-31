@@ -2,11 +2,12 @@
 //!
 //! Frontend responsibilities:
 //! - microphone capture
-//! - simple local VAD (speech start/stop)
+//! - level metering and audio framing
 //! - audio playback
 //!
 //! Backend responsibilities:
 //! - ASR -> agent -> TTS orchestration
+//! - shared VAD and endpointing
 //! - streaming assistant audio/text events
 //! - interruption / barge-in cancellation
 
@@ -27,8 +28,8 @@ use izwi_core::{
     GenerationConfig, GenerationParams, GenerationRequest, VoiceSession,
 };
 use izwi_vad::{
-    legacy_rms_threshold_to_score_threshold, EndpointConfig, EndpointDetector, EndpointEndReason,
-    EndpointEvent, VadScorer, DEFAULT_MAX_UTTERANCE_MS, DEFAULT_MIN_SPEECH_MS, DEFAULT_PRE_ROLL_MS,
+    sanitize_score_threshold, EndpointConfig, EndpointDetector, EndpointEndReason, EndpointEvent,
+    VadScorer, DEFAULT_MAX_UTTERANCE_MS, DEFAULT_MIN_SPEECH_MS, DEFAULT_PRE_ROLL_MS,
     DEFAULT_SILENCE_MS, DEFAULT_SPEECH_THRESHOLD, VAD_FRAME_MS, VAD_SAMPLE_RATE,
 };
 use serde::Deserialize;
@@ -655,7 +656,7 @@ async fn finalize_stream_vad_utterance(
 fn normalize_stream_vad_threshold(value: Option<f32>) -> f32 {
     value
         .filter(|v| v.is_finite() && *v >= 0.0)
-        .map(legacy_rms_threshold_to_score_threshold)
+        .map(sanitize_score_threshold)
         .unwrap_or(DEFAULT_STREAM_VAD_THRESHOLD)
 }
 
@@ -2188,11 +2189,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stream_vad_threshold_maps_legacy_rms_default_to_score_default() {
-        assert_eq!(
-            normalize_stream_vad_threshold(Some(0.02)),
-            DEFAULT_STREAM_VAD_THRESHOLD
-        );
+    fn stream_vad_threshold_uses_score_values_directly() {
+        assert_eq!(normalize_stream_vad_threshold(Some(0.02)), 0.02);
     }
 
     #[test]
