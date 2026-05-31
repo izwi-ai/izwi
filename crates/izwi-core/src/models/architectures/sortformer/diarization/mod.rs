@@ -338,21 +338,19 @@ impl SortformerDiarizerModel {
             );
 
         let mut gated_probs = speaker_probs;
-        if sortformer_vad_gating_enabled() {
-            let frame_count = gated_probs.len();
-            let vad_mask = sortformer_vad_frame_mask(
-                &samples,
-                frame_count,
-                frame_stride_samples,
-                min_speech_ms,
-                min_silence_ms,
-            );
+        let frame_count = gated_probs.len();
+        let vad_mask = sortformer_vad_frame_mask(
+            &samples,
+            frame_count,
+            frame_stride_samples,
+            min_speech_ms,
+            min_silence_ms,
+        );
 
-            for (frame_idx, active) in vad_mask.iter().copied().enumerate() {
-                if !active {
-                    for spk in 0..MAX_SUPPORTED_SPEAKERS {
-                        gated_probs[frame_idx][spk] = 0.0;
-                    }
+        for (frame_idx, active) in vad_mask.iter().copied().enumerate() {
+            if !active {
+                for spk in 0..MAX_SUPPORTED_SPEAKERS {
+                    gated_probs[frame_idx][spk] = 0.0;
                 }
             }
         }
@@ -2053,12 +2051,6 @@ fn env_flag(key: &str) -> Option<bool> {
             "0" | "false" | "no" | "off" => Some(false),
             _ => None,
         })
-}
-
-fn sortformer_vad_gating_enabled() -> bool {
-    env_flag("IZWI_SORTFORMER_ENABLE_VAD_GATING")
-        .or_else(|| env_flag("IZWI_SORTFORMER_ENABLE_RMS_GATING"))
-        .unwrap_or(false)
 }
 
 fn select_speaker_channels(
