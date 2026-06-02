@@ -13,7 +13,8 @@ use std::{
 };
 
 use crate::api::audio_payload::{
-    decode_base64_media_payload, inspect_audio_payload_bytes, is_audio_content_type,
+    decode_base64_media_payload, inspect_audio_payload_bytes_with_diagnostics,
+    is_audio_content_type,
 };
 use crate::error::ApiError;
 use crate::persistence::{
@@ -119,7 +120,12 @@ pub async fn create_media(
     )
     .ok_or_else(|| ApiError::bad_request("Invalid content_type"))?;
     if is_audio_content_type(&content_type) {
-        inspect_audio_payload_bytes(&bytes)?;
+        inspect_audio_payload_bytes_with_diagnostics(
+            "media.upload",
+            &bytes,
+            Some(content_type.as_str()),
+            req.filename.as_deref(),
+        )?;
     }
     let namespace = sanitize_media_namespace(req.namespace.as_deref());
     let record_id = uuid::Uuid::new_v4().to_string();

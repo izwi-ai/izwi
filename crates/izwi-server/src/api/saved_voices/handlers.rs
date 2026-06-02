@@ -6,7 +6,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::api::audio_payload::{decode_base64_audio_payload, inspect_audio_payload};
+use crate::api::audio_payload::{
+    decode_base64_audio_payload, inspect_audio_payload_with_diagnostics,
+};
 use crate::api::pagination::{CursorPagination, CursorPaginationQuery, encode_cursor};
 use crate::error::ApiError;
 use crate::saved_voice_store::{
@@ -117,7 +119,7 @@ pub async fn create_saved_voice(
         .as_deref()
         .ok_or_else(|| ApiError::bad_request("Missing required `audio_base64` field."))?;
     let audio_payload = decode_base64_audio_payload(audio_payload)?;
-    inspect_audio_payload(&audio_payload)?;
+    inspect_audio_payload_with_diagnostics("saved_voices.create", &audio_payload)?;
     let audio_mime_type = req
         .audio_mime_type
         .or_else(|| audio_payload.content_type_hint().map(str::to_string))

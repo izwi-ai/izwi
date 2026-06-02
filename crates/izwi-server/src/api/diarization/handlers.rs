@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::api::audio_payload::{
-    decode_base64_audio_payload, inspect_audio_payload, read_multipart_audio_base64_payload,
-    read_multipart_audio_file_payload,
+    decode_base64_audio_payload, inspect_audio_payload_with_diagnostics,
+    read_multipart_audio_base64_payload, read_multipart_audio_file_payload,
 };
 use crate::api::pagination::{CursorPagination, CursorPaginationQuery, encode_cursor};
 use crate::api::request_context::RequestContext;
@@ -885,7 +885,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
             .map_err(|err| ApiError::bad_request(format!("Invalid JSON payload: {err}")))?;
 
         let audio_payload = decode_base64_audio_payload(payload.audio_base64.as_str())?;
-        inspect_audio_payload(&audio_payload)?;
+        inspect_audio_payload_with_diagnostics("diarization.create", &audio_payload)?;
         let audio_filename = sanitize_optional(payload.audio_filename);
         let audio_mime_type = sanitize_optional(payload.audio_mime_type)
             .or_else(|| audio_payload.content_type_hint().map(str::to_string))
@@ -936,7 +936,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
                     )
                     .await?
                     {
-                        inspect_audio_payload(&payload)?;
+                        inspect_audio_payload_with_diagnostics("diarization.create", &payload)?;
                         out.audio_mime_type = payload.source_mime_type;
                         out.audio_filename = payload.filename;
                         out.audio_bytes = payload.bytes;
@@ -946,7 +946,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
                     if let Some(payload) =
                         read_multipart_audio_base64_payload(field, "audio_base64").await?
                     {
-                        inspect_audio_payload(&payload)?;
+                        inspect_audio_payload_with_diagnostics("diarization.create", &payload)?;
                         if out.audio_mime_type.is_none() {
                             out.audio_mime_type = payload.content_type_hint().map(str::to_string);
                         }
