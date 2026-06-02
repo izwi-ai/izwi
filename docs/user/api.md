@@ -993,12 +993,12 @@ Server events:
 
 | Type | Notes |
 |------|-------|
+| `connected` | Socket accepted and protocol version announced. |
 | `session_ready` | Voice session initialized. |
 | `input_stream_ready` | Includes resolved VAD settings, including backend, score sample rate, and score frame duration. |
 | `input_stream_stopped` | Input stream stopped. |
-| `listening` | Ready for an utterance. |
 | `user_speech_start`, `user_speech_end` | VAD utterance boundaries. |
-| `user_speech_rejected` | A too-short speech start was rejected as noise and the stream returned to listening. |
+| `user_speech_rejected` | A too-short speech start was rejected as noise and the input stream remains ready. |
 | `turn_processing` | Turn started. |
 | `user_transcript_start`, `user_transcript_delta`, `user_transcript_final` | User transcript events. |
 | `assistant_text_start`, `assistant_text_delta`, `assistant_text_final` | Assistant text events. |

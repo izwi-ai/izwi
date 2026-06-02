@@ -725,6 +725,39 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     );
   });
 
+  it("rejects oversized first-party audio uploads before creating requests", async () => {
+    MockXMLHttpRequest.instances = [];
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+    const oversizedAudio = {
+      size: 64 * 1024 * 1024 + 1,
+    } as Blob;
+
+    await expect(
+      client.createDiarizationRecord({
+        audio_file: oversizedAudio,
+        audio_filename: "too-large.wav",
+      }),
+    ).rejects.toThrow("Uploaded audio is too large for this server.");
+
+    const callbacks = {
+      onUploadProgress: vi.fn(),
+      onError: vi.fn(),
+      onDone: vi.fn(),
+    };
+    expect(() =>
+      client.createTranscriptionRecordStream(
+        {
+          audio_file: oversizedAudio,
+          audio_filename: "too-large.wav",
+        },
+        callbacks,
+      ),
+    ).toThrow("Uploaded audio is too large for this server.");
+    expect(MockXMLHttpRequest.instances).toHaveLength(0);
+  });
+
   it("aborts progress-enabled upload requests", async () => {
     MockXMLHttpRequest.instances = [];
     vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);

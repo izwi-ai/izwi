@@ -1459,7 +1459,13 @@ fn create_speech() {}
     path = "/v1/audio/transcriptions",
     tag = "OpenAI Compatible",
     summary = "Create transcription",
-    request_body(content = TranscriptionMultipartRequest, content_type = "multipart/form-data"),
+    request_body(
+        description = "Transcription input. Send application/json with audio_base64, or multipart/form-data with an audio file or audio_base64 field.",
+        content(
+            (TranscriptionJsonRequest = "application/json"),
+            (TranscriptionMultipartRequest = "multipart/form-data")
+        )
+    ),
     responses(
         (status = 200, description = "Transcription result as JSON, verbose JSON, text, SRT, VTT, or server-sent events", body = TranscriptionResponse),
         (status = 400, description = "Invalid request", body = ApiErrorEnvelope),
@@ -1777,6 +1783,7 @@ pub struct TranscriptionMultipartRequest {
     pub response_format: Option<String>,
     pub stream: Option<bool>,
     pub prompt: Option<String>,
+    pub max_tokens: Option<usize>,
     pub temperature: Option<f32>,
     pub timestamp_granularities: Option<Vec<String>>,
 }
@@ -1790,6 +1797,9 @@ pub struct TranscriptionJsonRequest {
     pub language: Option<String>,
     pub response_format: Option<String>,
     pub stream: Option<bool>,
+    pub prompt: Option<String>,
+    pub max_tokens: Option<usize>,
+    pub temperature: Option<f32>,
     pub timestamp_granularities: Option<Vec<String>>,
 }
 
@@ -2035,6 +2045,42 @@ mod tests {
             content["multipart/form-data"]["schema"]["$ref"].as_str(),
             Some("#/components/schemas/AlignmentMultipartRequest")
         );
+    }
+
+    #[test]
+    fn openapi_documents_transcription_json_and_multipart_request_bodies() {
+        let openapi = document();
+        let content =
+            openapi["paths"]["/v1/audio/transcriptions"]["post"]["requestBody"]["content"]
+                .as_object()
+                .expect("transcription request body content should exist");
+
+        assert_eq!(
+            content["application/json"]["schema"]["$ref"].as_str(),
+            Some("#/components/schemas/TranscriptionJsonRequest")
+        );
+        assert_eq!(
+            content["multipart/form-data"]["schema"]["$ref"].as_str(),
+            Some("#/components/schemas/TranscriptionMultipartRequest")
+        );
+
+        let schemas = openapi["components"]["schemas"]
+            .as_object()
+            .expect("schemas should exist");
+        for field in ["prompt", "max_tokens", "temperature"] {
+            assert!(
+                schemas["TranscriptionJsonRequest"]["properties"]
+                    .get(field)
+                    .is_some(),
+                "TranscriptionJsonRequest should document {field}"
+            );
+            assert!(
+                schemas["TranscriptionMultipartRequest"]["properties"]
+                    .get(field)
+                    .is_some(),
+                "TranscriptionMultipartRequest should document {field}"
+            );
+        }
     }
 
     #[test]
