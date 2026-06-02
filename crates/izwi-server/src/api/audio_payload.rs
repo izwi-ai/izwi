@@ -1,6 +1,8 @@
 use axum::extract::multipart::{Field, MultipartError};
 use base64::Engine;
 use izwi_core::audio::{AudioInspection, inspect_audio_bytes};
+use serde::Serialize;
+use tracing::info;
 
 use crate::api::speech_text_upload::multipart_upload_api_error;
 use crate::error::ApiError;
@@ -11,6 +13,24 @@ pub(crate) struct AudioPayload {
     pub source_mime_type: Option<String>,
     pub filename: Option<String>,
     pub data_url_mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct AudioIngestDiagnostics {
+    pub route: String,
+    pub source_bytes: usize,
+    pub source_mime_type: Option<String>,
+    pub data_url_mime_type: Option<String>,
+    pub filename_extension: Option<String>,
+    pub decoded_sample_rate: u32,
+    pub decoded_channels: u16,
+    pub decoded_sample_count: usize,
+    pub decoded_duration_secs: f32,
+    pub peak: f32,
+    pub rms: f32,
+    pub clipped_samples: usize,
+    pub clipped_ratio: f32,
+    pub resampler: &'static str,
 }
 
 impl AudioPayload {
@@ -93,12 +113,40 @@ pub(crate) fn inspect_audio_payload(payload: &AudioPayload) -> Result<AudioInspe
     inspect_audio_payload_bytes(&payload.bytes)
 }
 
+pub(crate) fn inspect_audio_payload_with_diagnostics(
+    route: &str,
+    payload: &AudioPayload,
+) -> Result<AudioInspection, ApiError> {
+    let inspection = inspect_audio_payload(payload)?;
+    AudioIngestDiagnostics::from_payload(route, payload, &inspection).emit();
+    Ok(inspection)
+}
+
 pub(crate) fn inspect_audio_payload_bytes(bytes: &[u8]) -> Result<AudioInspection, ApiError> {
     inspect_audio_bytes(bytes).map_err(|err| {
         ApiError::bad_request(format!(
             "Invalid audio payload: failed to decode audio metadata: {err}"
         ))
     })
+}
+
+pub(crate) fn inspect_audio_payload_bytes_with_diagnostics(
+    route: &str,
+    bytes: &[u8],
+    source_mime_type: Option<&str>,
+    filename: Option<&str>,
+) -> Result<AudioInspection, ApiError> {
+    let inspection = inspect_audio_payload_bytes(bytes)?;
+    AudioIngestDiagnostics::from_parts(
+        route,
+        bytes.len(),
+        source_mime_type,
+        None,
+        filename,
+        &inspection,
+    )
+    .emit();
+    Ok(inspection)
 }
 
 pub(crate) fn is_audio_content_type(content_type: &str) -> bool {
@@ -125,6 +173,72 @@ pub(crate) fn split_data_url_base64(raw: &str) -> (Option<String>, &str) {
         .next()
         .and_then(|value| sanitize_metadata(Some(value.to_string())));
     (content_type, payload)
+}
+
+impl AudioIngestDiagnostics {
+    fn from_payload(route: &str, payload: &AudioPayload, inspection: &AudioInspection) -> Self {
+        Self::from_parts(
+            route,
+            payload.bytes.len(),
+            payload.source_mime_type.as_deref(),
+            payload.data_url_mime_type.as_deref(),
+            payload.filename.as_deref(),
+            inspection,
+        )
+    }
+
+    fn from_parts(
+        route: &str,
+        source_bytes: usize,
+        source_mime_type: Option<&str>,
+        data_url_mime_type: Option<&str>,
+        filename: Option<&str>,
+        inspection: &AudioInspection,
+    ) -> Self {
+        let clipped_ratio = if inspection.sample_count == 0 {
+            0.0
+        } else {
+            inspection.clipped_samples as f32 / inspection.sample_count as f32
+        };
+
+        Self {
+            route: route.to_string(),
+            source_bytes,
+            source_mime_type: source_mime_type.map(ToOwned::to_owned),
+            data_url_mime_type: data_url_mime_type.map(ToOwned::to_owned),
+            filename_extension: filename.and_then(filename_extension),
+            decoded_sample_rate: inspection.sample_rate,
+            decoded_channels: 1,
+            decoded_sample_count: inspection.sample_count,
+            decoded_duration_secs: inspection.duration_secs,
+            peak: inspection.peak,
+            rms: inspection.rms,
+            clipped_samples: inspection.clipped_samples,
+            clipped_ratio,
+            resampler: "none",
+        }
+    }
+
+    fn emit(&self) {
+        info!(
+            target: "izwi.audio",
+            route = self.route.as_str(),
+            source_bytes = self.source_bytes,
+            source_mime_type = self.source_mime_type.as_deref().unwrap_or(""),
+            data_url_mime_type = self.data_url_mime_type.as_deref().unwrap_or(""),
+            filename_extension = self.filename_extension.as_deref().unwrap_or(""),
+            decoded_sample_rate = self.decoded_sample_rate,
+            decoded_channels = self.decoded_channels,
+            decoded_sample_count = self.decoded_sample_count,
+            decoded_duration_secs = self.decoded_duration_secs,
+            peak = self.peak,
+            rms = self.rms,
+            clipped_samples = self.clipped_samples,
+            clipped_ratio = self.clipped_ratio,
+            resampler = self.resampler,
+            "audio ingest diagnostics"
+        );
+    }
 }
 
 fn decode_base64_payload(raw: &str, payload_kind: &str) -> Result<AudioPayload, ApiError> {
@@ -186,6 +300,22 @@ fn sanitize_metadata(raw: Option<String>) -> Option<String> {
     raw.filter(|value| !value.contains(['\r', '\n']))
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty() && !value.contains(['\r', '\n']))
+}
+
+fn filename_extension(filename: &str) -> Option<String> {
+    let basename = filename
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(filename)
+        .trim();
+    let extension = basename.rsplit_once('.')?.1.trim().to_ascii_lowercase();
+    if extension.is_empty()
+        || extension.len() > 16
+        || !extension.chars().all(|ch| ch.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    Some(extension)
 }
 
 fn title_case(raw: &str) -> String {
@@ -273,5 +403,45 @@ mod tests {
         assert!(is_audio_content_type(" AUDIO/WAV "));
         assert!(!is_audio_content_type("video/mp4"));
         assert!(!is_audio_content_type("application/octet-stream"));
+    }
+
+    #[test]
+    fn ingest_diagnostics_report_safe_metadata_without_filename() {
+        let payload = AudioPayload::from_bytes(
+            b"RIFF".to_vec(),
+            Some(" audio/wav ".to_string()),
+            Some("private session.Name.WAV".to_string()),
+        );
+        let inspection = AudioInspection::from_mono_samples(&[0.0, 0.5, -1.0, 1.0], 4);
+
+        let diagnostics =
+            AudioIngestDiagnostics::from_payload("transcription.create", &payload, &inspection);
+
+        assert_eq!(diagnostics.route, "transcription.create");
+        assert_eq!(diagnostics.source_bytes, 4);
+        assert_eq!(diagnostics.source_mime_type.as_deref(), Some("audio/wav"));
+        assert_eq!(diagnostics.filename_extension.as_deref(), Some("wav"));
+        assert_eq!(diagnostics.decoded_sample_rate, 4);
+        assert_eq!(diagnostics.decoded_channels, 1);
+        assert_eq!(diagnostics.clipped_samples, 2);
+        assert_eq!(diagnostics.clipped_ratio, 0.5);
+
+        let serialized = serde_json::to_value(&diagnostics).expect("serialize diagnostics");
+        assert!(serialized.get("filename").is_none());
+        assert_eq!(serialized["filename_extension"], "wav");
+    }
+
+    #[test]
+    fn filename_extension_rejects_path_like_or_unsafe_extensions() {
+        assert_eq!(
+            filename_extension("/Users/me/audio.webm"),
+            Some("webm".to_string())
+        );
+        assert_eq!(
+            filename_extension("capture.wav.bak"),
+            Some("bak".to_string())
+        );
+        assert_eq!(filename_extension("capture.bad-ext"), None);
+        assert_eq!(filename_extension("capture."), None);
     }
 }

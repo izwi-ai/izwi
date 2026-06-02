@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::api::audio_payload::{
-    decode_base64_audio_payload, inspect_audio_payload, read_multipart_audio_base64_payload,
-    read_multipart_audio_file_payload,
+    decode_base64_audio_payload, inspect_audio_payload_with_diagnostics,
+    read_multipart_audio_base64_payload, read_multipart_audio_file_payload,
 };
 use crate::api::request_context::RequestContext;
 use crate::error::ApiError;
@@ -535,7 +535,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
 
         let model_id = payload.model_id.or(payload.model);
         let audio_payload = decode_base64_audio_payload(payload.audio_base64.as_str())?;
-        inspect_audio_payload(&audio_payload)?;
+        inspect_audio_payload_with_diagnostics("transcription.create", &audio_payload)?;
         let audio_mime_type = audio_payload
             .content_type_hint()
             .map(str::to_string)
@@ -578,7 +578,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
                     )
                     .await?
                     {
-                        inspect_audio_payload(&payload)?;
+                        inspect_audio_payload_with_diagnostics("transcription.create", &payload)?;
                         out.audio_filename = payload.filename;
                         out.audio_mime_type = payload.source_mime_type;
                         out.audio_bytes = payload.bytes;
@@ -588,7 +588,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
                     if let Some(payload) =
                         read_multipart_audio_base64_payload(field, "audio_base64").await?
                     {
-                        inspect_audio_payload(&payload)?;
+                        inspect_audio_payload_with_diagnostics("transcription.create", &payload)?;
                         if out.audio_mime_type.is_none() {
                             out.audio_mime_type = payload.content_type_hint().map(str::to_string);
                         }

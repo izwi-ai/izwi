@@ -9,10 +9,10 @@ use izwi_core::{
     RuntimeService,
     audio::{AudioEncoder, AudioFormat},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::state::AppState;
 
@@ -119,8 +119,24 @@ enum WorkerCommand {
 struct PendingInference {
     sequence: u64,
     started_at: Instant,
+    sample_rate: u32,
+    sample_count: usize,
     receiver: oneshot::Receiver<Result<InferenceResult, String>>,
     task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct RealtimeInferenceDiagnostics {
+    route: &'static str,
+    sequence: u64,
+    sample_rate: u32,
+    input_sample_count: usize,
+    audio_duration_secs: f32,
+    queue_wait_ms: f64,
+    processing_time_ms: f64,
+    rtf: Option<f64>,
+    output_text_chars: usize,
+    cancellation_reason: Option<&'static str>,
 }
 
 struct RealtimeSessionState {
@@ -163,6 +179,72 @@ struct InferenceResult {
     text: String,
     language: Option<String>,
     duration_secs: f32,
+    queue_wait_ms: f64,
+}
+
+impl RealtimeInferenceDiagnostics {
+    fn success(
+        pending: &PendingInference,
+        output: &InferenceResult,
+        processing_time_ms: f64,
+        rtf: Option<f64>,
+    ) -> Self {
+        Self {
+            route: "transcription.realtime",
+            sequence: pending.sequence,
+            sample_rate: pending.sample_rate,
+            input_sample_count: pending.sample_count,
+            audio_duration_secs: output.duration_secs,
+            queue_wait_ms: output.queue_wait_ms,
+            processing_time_ms,
+            rtf,
+            output_text_chars: output.text.chars().count(),
+            cancellation_reason: None,
+        }
+    }
+
+    fn failure(
+        pending: &PendingInference,
+        processing_time_ms: f64,
+        cancellation_reason: &'static str,
+    ) -> Self {
+        let audio_duration_secs = if pending.sample_rate == 0 {
+            0.0
+        } else {
+            pending.sample_count as f32 / pending.sample_rate as f32
+        };
+
+        Self {
+            route: "transcription.realtime",
+            sequence: pending.sequence,
+            sample_rate: pending.sample_rate,
+            input_sample_count: pending.sample_count,
+            audio_duration_secs,
+            queue_wait_ms: 0.0,
+            processing_time_ms,
+            rtf: None,
+            output_text_chars: 0,
+            cancellation_reason: Some(cancellation_reason),
+        }
+    }
+
+    fn emit(&self) {
+        info!(
+            target: "izwi.audio",
+            route = self.route,
+            sequence = self.sequence,
+            sample_rate = self.sample_rate,
+            input_sample_count = self.input_sample_count,
+            audio_duration_secs = self.audio_duration_secs,
+            queue_wait_ms = self.queue_wait_ms,
+            processing_time_ms = self.processing_time_ms,
+            rtf = self.rtf.unwrap_or(0.0),
+            has_rtf = self.rtf.is_some(),
+            output_text_chars = self.output_text_chars,
+            cancellation_reason = self.cancellation_reason.unwrap_or(""),
+            "realtime transcription inference diagnostics"
+        );
+    }
 }
 
 pub async fn handle_socket(socket: WebSocket, state: AppState, correlation_id: String) {
@@ -511,6 +593,7 @@ fn maybe_schedule_inference(
     let keep_samples = window_samples.max(min_samples);
     let start = session.samples_i16.len().saturating_sub(keep_samples);
     let inference_samples = session.samples_i16[start..].to_vec();
+    let inference_sample_count = inference_samples.len();
 
     let sequence = session.inference_sequence.saturating_add(1);
     session.inference_sequence = sequence;
@@ -541,6 +624,8 @@ fn maybe_schedule_inference(
     session.in_flight = Some(PendingInference {
         sequence,
         started_at,
+        sample_rate,
+        sample_count: inference_sample_count,
         receiver: rx,
         task,
     });
@@ -573,6 +658,8 @@ fn handle_inference_result(
             } else {
                 None
             };
+            RealtimeInferenceDiagnostics::success(&pending, &output, processing_time_ms, rtf)
+                .emit();
 
             send_json(
                 out_tx,
@@ -589,6 +676,12 @@ fn handle_inference_result(
             session.last_emitted_sequence = sequence;
         }
         Ok(Err(err)) => {
+            RealtimeInferenceDiagnostics::failure(
+                &pending,
+                pending.started_at.elapsed().as_secs_f64() * 1000.0,
+                "asr_failed",
+            )
+            .emit();
             send_json(
                 out_tx,
                 json!({
@@ -598,6 +691,12 @@ fn handle_inference_result(
             );
         }
         Err(err) => {
+            RealtimeInferenceDiagnostics::failure(
+                &pending,
+                pending.started_at.elapsed().as_secs_f64() * 1000.0,
+                "task_failed",
+            )
+            .emit();
             send_json(
                 out_tx,
                 json!({
@@ -619,7 +718,9 @@ async fn run_inference(
 ) -> Result<InferenceResult, String> {
     let wav_bytes = wav_bytes_from_pcm16_mono(&samples_i16, sample_rate)?;
 
+    let permit_wait_started = Instant::now();
     let _permit = state.acquire_permit().await;
+    let queue_wait_ms = permit_wait_started.elapsed().as_secs_f64() * 1000.0;
     let output = state
         .runtime
         .asr_transcribe_bytes(
@@ -641,6 +742,7 @@ async fn run_inference(
         text: output.text,
         language: output.language,
         duration_secs: output.duration_secs,
+        queue_wait_ms,
     })
 }
 
@@ -1096,9 +1198,33 @@ fn send_worker_command(tx: &mpsc::Sender<WorkerCommand>, command: WorkerCommand)
 #[cfg(test)]
 mod tests {
     use super::{
-        collapse_unstable_repetition, merge_online_transcript,
+        RealtimeInferenceDiagnostics, collapse_unstable_repetition, merge_online_transcript,
         strip_suffix_prefix_overlap_with_lookahead_by_words,
     };
+
+    #[test]
+    fn realtime_inference_diagnostics_omit_transcript_content() {
+        let diagnostics = RealtimeInferenceDiagnostics {
+            route: "transcription.realtime",
+            sequence: 7,
+            sample_rate: 16_000,
+            input_sample_count: 8_000,
+            audio_duration_secs: 0.5,
+            queue_wait_ms: 2.0,
+            processing_time_ms: 125.0,
+            rtf: Some(0.25),
+            output_text_chars: "private words".chars().count(),
+            cancellation_reason: None,
+        };
+
+        let value = serde_json::to_value(&diagnostics).expect("serialize diagnostics");
+
+        assert_eq!(value["route"], "transcription.realtime");
+        assert_eq!(value["sample_rate"], 16_000);
+        assert_eq!(value["output_text_chars"], 13);
+        assert!(value.get("text").is_none());
+        assert!(value.get("transcript").is_none());
+    }
 
     #[test]
     fn merge_online_transcript_deduplicates_committed_prefix_restarts() {
