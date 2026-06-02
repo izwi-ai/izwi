@@ -149,7 +149,8 @@ impl RuntimeService {
         let result = self
             .lfm25_audio_tts_generate(request, variant, true)
             .await?;
-        let mut chunk = AudioChunk::final_chunk(result.request_id.clone(), 0, result.samples);
+        let mut chunk = AudioChunk::final_chunk(result.request_id.clone(), 0, result.samples)
+            .with_sample_rate(result.sample_rate);
         chunk.is_final = true;
         chunk_tx
             .send(chunk)
@@ -224,7 +225,8 @@ impl RuntimeService {
         let generation_time_ms = result.total_time_ms;
         let tokens_generated = result.total_tokens;
         let rtf = result.rtf();
-        let mut chunk = AudioChunk::final_chunk(result.request_id.clone(), 0, result.samples);
+        let mut chunk = AudioChunk::final_chunk(result.request_id.clone(), 0, result.samples)
+            .with_sample_rate(result.sample_rate);
         chunk.stats = Some(ChunkStats {
             generation_time_ms,
             tokens_generated,
@@ -295,7 +297,8 @@ impl RuntimeService {
         let generation_time_ms = result.total_time_ms;
         let tokens_generated = result.total_tokens;
         let rtf = result.rtf();
-        let mut chunk = AudioChunk::final_chunk(result.request_id.clone(), 0, result.samples);
+        let mut chunk = AudioChunk::final_chunk(result.request_id.clone(), 0, result.samples)
+            .with_sample_rate(result.sample_rate);
         chunk.stats = Some(ChunkStats {
             generation_time_ms,
             tokens_generated,
@@ -318,7 +321,8 @@ impl RuntimeService {
         let generation_time_ms = result.total_time_ms;
         let tokens_generated = result.total_tokens;
         let rtf = result.rtf();
-        let mut chunk = AudioChunk::final_chunk(result.request_id.clone(), 0, result.samples);
+        let mut chunk = AudioChunk::final_chunk(result.request_id.clone(), 0, result.samples)
+            .with_sample_rate(result.sample_rate);
         chunk.stats = Some(ChunkStats {
             generation_time_ms,
             tokens_generated,
@@ -438,7 +442,8 @@ impl RuntimeService {
                     stream_chunk.request_id.clone(),
                     stream_chunk.sequence,
                     stream_chunk.samples,
-                );
+                )
+                .with_sample_rate(stream_chunk.sample_rate);
                 chunk.is_final = stream_chunk.is_final;
                 tx.send(chunk).await.map_err(|_| {
                     Error::InferenceError("Streaming output channel closed".to_string())

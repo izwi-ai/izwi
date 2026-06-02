@@ -119,7 +119,8 @@ impl RuntimeService {
                 _ => {}
             }
 
-            let mut chunk = AudioChunk::new(request_id.clone(), sequence, synthesis.samples);
+            let mut chunk = AudioChunk::new(request_id.clone(), sequence, synthesis.samples)
+                .with_sample_rate(current_sample_rate);
             chunk.is_final = sequence + 1 == total_chunks;
             chunk_tx.send(chunk).await.map_err(|_| {
                 Error::InferenceError("Streaming output channel closed".to_string())

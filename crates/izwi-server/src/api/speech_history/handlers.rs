@@ -4,14 +4,14 @@ use std::time::Duration;
 use axum::{
     body::Body,
     extract::{Extension, Json, Path, Query, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::api::pagination::{encode_cursor, CursorPagination, CursorPaginationQuery};
+use crate::api::pagination::{CursorPagination, CursorPaginationQuery, encode_cursor};
 use crate::api::request_context::RequestContext;
 use crate::api::saved_voices::resolve_saved_voice_reference;
 use crate::api::tts_long_form::{expand_generation_requests_for_long_form, generate_long_form_tts};
@@ -26,7 +26,7 @@ use izwi_core::audio::{AudioEncoder, AudioFormat};
 use izwi_core::runtime_models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
 use izwi_core::runtime_models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use izwi_core::{
-    parse_tts_model_variant, AudioChunk, GenerationConfig, GenerationRequest, ModelVariant,
+    AudioChunk, GenerationConfig, GenerationRequest, ModelVariant, parse_tts_model_variant,
 };
 
 const HISTORY_LIST_LIMIT: usize = 200;
@@ -536,7 +536,7 @@ async fn synthesize_record_internal(
     .await
     .map_err(|_| ApiError::internal("Speech generation timed out"))??;
 
-    let encoder = state.runtime.audio_encoder().await;
+    let encoder = AudioEncoder::new(output.sample_rate, 1);
     let output_samples = output.samples.clone();
     let encoded_audio =
         tokio::task::spawn_blocking(move || encoder.encode(&output_samples, AudioFormat::Wav))
@@ -717,7 +717,7 @@ async fn stream_record_creation(
             )
             .await;
 
-        let sample_rate = runtime.sample_rate().await;
+        let fallback_sample_rate = runtime.sample_rate().await;
         if send_stream_event(
             &event_tx,
             SpeechStreamEvent {
@@ -726,7 +726,7 @@ async fn stream_record_creation(
                 sequence: None,
                 audio_base64: None,
                 sample_count: None,
-                sample_rate: Some(sample_rate),
+                sample_rate: Some(fallback_sample_rate),
                 audio_format: Some("pcm_i16"),
                 tokens_generated: None,
                 generation_time_ms: None,
@@ -743,10 +743,11 @@ async fn stream_record_creation(
         }
 
         let mut total_samples = 0usize;
+        let mut audio_duration_secs = 0.0f32;
         let mut total_tokens = 0usize;
         let stream_started = std::time::Instant::now();
-        let stream_encoder = AudioEncoder::new(sample_rate, 1);
         let mut merged_samples: Vec<f32> = Vec::new();
+        let mut merged_sample_rate: Option<u32> = None;
         let mut global_sequence = 0usize;
         let mut failed = false;
         let mut failure_message: Option<String> = None;
@@ -766,12 +767,47 @@ async fn stream_record_creation(
                     continue;
                 }
 
+                let chunk_sample_rate = chunk.sample_rate_or(fallback_sample_rate).max(1);
+                match merged_sample_rate {
+                    Some(expected) if expected != chunk_sample_rate => {
+                        let message = format!(
+                            "Streaming sample rate changed from {expected} Hz to {chunk_sample_rate} Hz"
+                        );
+                        let _ = send_stream_event(
+                            &event_tx,
+                            SpeechStreamEvent {
+                                event: "error",
+                                request_id: Some(stream_request_id.clone()),
+                                sequence: None,
+                                audio_base64: None,
+                                sample_count: None,
+                                sample_rate: None,
+                                audio_format: None,
+                                tokens_generated: None,
+                                generation_time_ms: None,
+                                audio_duration_secs: None,
+                                rtf: None,
+                                record: None,
+                                error: Some(message.clone()),
+                            },
+                        )
+                        .await;
+                        encoding_failed = true;
+                        failure_message = Some(message);
+                        break;
+                    }
+                    None => merged_sample_rate = Some(chunk_sample_rate),
+                    _ => {}
+                }
+
                 total_samples += chunk.samples.len();
+                audio_duration_secs += chunk.samples.len() as f32 / chunk_sample_rate as f32;
                 if let Some(stats) = chunk.stats.as_ref() {
                     total_tokens = total_tokens.saturating_add(stats.tokens_generated);
                 }
                 merged_samples.extend_from_slice(&chunk.samples);
 
+                let stream_encoder = AudioEncoder::new(chunk_sample_rate, 1);
                 let chunk_bytes = match stream_encoder.encode(&chunk.samples, AudioFormat::RawI16) {
                     Ok(bytes) => bytes,
                     Err(err) => {
@@ -810,8 +846,8 @@ async fn stream_record_creation(
                             base64::engine::general_purpose::STANDARD.encode(chunk_bytes),
                         ),
                         sample_count: Some(chunk.samples.len()),
-                        sample_rate: None,
-                        audio_format: None,
+                        sample_rate: Some(chunk_sample_rate),
+                        audio_format: Some("pcm_i16"),
                         tokens_generated: None,
                         generation_time_ms: None,
                         audio_duration_secs: None,
@@ -858,7 +894,6 @@ async fn stream_record_creation(
             }
         } else {
             let generation_time_ms = stream_started.elapsed().as_secs_f32() * 1000.0;
-            let audio_duration_secs = total_samples as f32 / sample_rate as f32;
             if total_tokens == 0 {
                 total_tokens = total_samples / 256;
             }
@@ -868,7 +903,8 @@ async fn stream_record_creation(
                 0.0
             };
 
-            let wav_encoder = AudioEncoder::new(sample_rate, 1);
+            let record_sample_rate = merged_sample_rate.unwrap_or(fallback_sample_rate).max(1);
+            let wav_encoder = AudioEncoder::new(record_sample_rate, 1);
             match wav_encoder.encode(merged_samples.as_slice(), AudioFormat::Wav) {
                 Ok(wav_bytes) => {
                     let record_result = speech_store
@@ -1344,9 +1380,11 @@ mod tests {
         })
         .expect_err("expected mixed reference inputs to fail");
 
-        assert!(err
-            .message
-            .contains("Use either `saved_voice_id` or direct `reference_audio`/`reference_text`"));
+        assert!(
+            err.message.contains(
+                "Use either `saved_voice_id` or direct `reference_audio`/`reference_text`"
+            )
+        );
     }
 
     #[test]
@@ -1357,9 +1395,10 @@ mod tests {
         })
         .expect_err("expected incomplete reference inputs to fail");
 
-        assert!(err
-            .message
-            .contains("Provide both `reference_audio` and `reference_text` together."));
+        assert!(
+            err.message
+                .contains("Provide both `reference_audio` and `reference_text` together.")
+        );
     }
 
     #[test]
@@ -1430,9 +1469,10 @@ mod tests {
         )
         .expect_err("expected missing reference source to fail");
 
-        assert!(err
-            .message
-            .contains("Voice cloning requests require `saved_voice_id` or both"));
+        assert!(
+            err.message
+                .contains("Voice cloning requests require `saved_voice_id` or both")
+        );
     }
 
     #[test]
@@ -1444,9 +1484,10 @@ mod tests {
         )
         .expect_err("expected base model to require reference input");
 
-        assert!(err
-            .message
-            .contains("requires `saved_voice_id` or direct reference audio/text"));
+        assert!(
+            err.message
+                .contains("requires `saved_voice_id` or direct reference audio/text")
+        );
     }
 
     #[test]
@@ -1458,9 +1499,10 @@ mod tests {
         )
         .expect_err("expected VibeVoice to require reference input");
 
-        assert!(err
-            .message
-            .contains("requires `saved_voice_id` or direct reference audio/text"));
+        assert!(
+            err.message
+                .contains("requires `saved_voice_id` or direct reference audio/text")
+        );
     }
 
     #[test]
@@ -1493,9 +1535,10 @@ mod tests {
         )
         .expect_err("expected voice-design model to require voice_description");
 
-        assert!(err
-            .message
-            .contains("requires `voice_description` on text-to-speech routes"));
+        assert!(
+            err.message
+                .contains("requires `voice_description` on text-to-speech routes")
+        );
     }
 
     #[test]

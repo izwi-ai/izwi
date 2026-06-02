@@ -220,6 +220,10 @@ pub struct AudioChunk {
     /// Audio samples (f32, mono)
     pub samples: Vec<f32>,
 
+    /// Audio sample rate in Hz. A value of 0 means the producer did not attach
+    /// rate metadata and callers should fall back to their negotiated rate.
+    pub sample_rate: u32,
+
     /// Whether this is the final chunk
     pub is_final: bool,
 
@@ -233,6 +237,7 @@ impl AudioChunk {
             request_id,
             sequence,
             samples,
+            sample_rate: 0,
             is_final: false,
             stats: None,
         }
@@ -243,13 +248,31 @@ impl AudioChunk {
             request_id,
             sequence,
             samples,
+            sample_rate: 0,
             is_final: true,
             stats: None,
         }
     }
 
+    pub fn with_sample_rate(mut self, sample_rate: u32) -> Self {
+        self.sample_rate = sample_rate;
+        self
+    }
+
+    pub fn sample_rate_or(&self, fallback_sample_rate: u32) -> u32 {
+        if self.sample_rate > 0 {
+            self.sample_rate
+        } else {
+            fallback_sample_rate
+        }
+    }
+
     /// Duration in seconds
     pub fn duration_secs(&self, sample_rate: u32) -> f32 {
+        let sample_rate = self.sample_rate_or(sample_rate);
+        if sample_rate == 0 {
+            return 0.0;
+        }
         self.samples.len() as f32 / sample_rate as f32
     }
 }
@@ -313,5 +336,14 @@ mod tests {
                 .expect("deserialize generation request");
 
         assert_eq!(request.model_variant, None);
+    }
+
+    #[test]
+    fn audio_chunk_duration_prefers_attached_sample_rate() {
+        let chunk =
+            AudioChunk::new("req".to_string(), 0, vec![0.0; 48_000]).with_sample_rate(48_000);
+
+        assert_eq!(chunk.duration_secs(24_000), 1.0);
+        assert_eq!(chunk.sample_rate_or(24_000), 48_000);
     }
 }
