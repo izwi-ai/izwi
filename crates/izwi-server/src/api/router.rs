@@ -181,7 +181,11 @@ mod tests {
         response::Response,
         routing::get,
     };
-    use izwi_core::RuntimeService;
+    use base64::Engine;
+    use izwi_core::{
+        RuntimeService,
+        audio::{AudioEncoder, AudioFormat},
+    };
     use izwi_hooks::{
         AuthorizationDecision, AuthorizationRequest, EnterpriseHooks, HookResult, PolicyEngine,
     };
@@ -499,13 +503,14 @@ mod tests {
             "unified_transcription_job_read_routes_support_both_job_kinds",
             true,
         );
+        let audio_body = tiny_audio_json_body();
 
         let transcription_create = send_request(
             app.clone(),
             build_request(
                 Method::POST,
                 "/v1/speech-to-text/jobs?job_kind=transcription",
-                Some("{\"audio_base64\":\"AQ==\"}"),
+                Some(audio_body.as_str()),
             ),
         )
         .await;
@@ -519,11 +524,7 @@ mod tests {
 
         let diarization_create = send_request(
             app.clone(),
-            build_request(
-                Method::POST,
-                "/v1/diarizations",
-                Some("{\"audio_base64\":\"AQ==\"}"),
-            ),
+            build_request(Method::POST, "/v1/diarizations", Some(audio_body.as_str())),
         )
         .await;
         assert_eq!(diarization_create.status(), StatusCode::ACCEPTED);
@@ -681,13 +682,14 @@ mod tests {
             "unified_transcription_job_mutation_routes_support_both_job_kinds",
             true,
         );
+        let audio_body = tiny_audio_json_body();
 
         let transcription_create = send_request(
             app.clone(),
             build_request(
                 Method::POST,
                 "/v1/speech-to-text/jobs?job_kind=transcription",
-                Some("{\"audio_base64\":\"AQ==\"}"),
+                Some(audio_body.as_str()),
             ),
         )
         .await;
@@ -704,7 +706,7 @@ mod tests {
             build_request(
                 Method::POST,
                 "/v1/speech-to-text/jobs?job_kind=diarization",
-                Some("{\"audio_base64\":\"AQ==\"}"),
+                Some(audio_body.as_str()),
             ),
         )
         .await;
@@ -841,7 +843,7 @@ mod tests {
             build_request(
                 Method::POST,
                 "/v1/diarizations",
-                Some("{\"audio_base64\":\"AQ==\"}"),
+                Some(tiny_audio_json_body().as_str()),
             ),
         )
         .await;
@@ -1748,6 +1750,16 @@ mod tests {
                 Body::empty()
             })
             .expect("request should build")
+    }
+
+    fn tiny_audio_json_body() -> String {
+        let wav = AudioEncoder::new(16_000, 1)
+            .encode(&[0.0], AudioFormat::Wav)
+            .expect("tiny wav should encode");
+        format!(
+            r#"{{"audio_base64":"{}"}}"#,
+            base64::engine::general_purpose::STANDARD.encode(wav)
+        )
     }
 
     fn test_api_app(name: &str, ui_enabled: bool) -> (Router, TempDirGuard) {
