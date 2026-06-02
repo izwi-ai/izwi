@@ -17,20 +17,21 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 use izwi_agent::{
-    planner::{PlanningMode, SimplePlanner},
     AgentDefinition, AgentEngine, AgentSession, AgentTurnOptions, MemoryMessage, MemoryMessageMeta,
     MemoryMessageRole, MemoryStore, ModelBackend, ModelOutput, ModelRequest, NoopTool, TimeTool,
     ToolRegistry, TurnInput,
+    planner::{PlanningMode, SimplePlanner},
 };
 use izwi_core::{
+    ChatMessage, ChatRole, GenerationConfig, GenerationParams, GenerationRequest, RuntimeService,
+    VoiceSession,
     audio::{AudioEncoder, AudioFormat},
-    parse_chat_model_variant, parse_model_variant, parse_tts_model_variant, ChatMessage, ChatRole,
-    GenerationConfig, GenerationParams, GenerationRequest, VoiceSession,
+    parse_chat_model_variant, parse_model_variant, parse_tts_model_variant,
 };
 use izwi_vad::{
-    sanitize_score_threshold, EndpointConfig, EndpointDetector, EndpointEndReason, EndpointEvent,
-    VadScorer, DEFAULT_MAX_UTTERANCE_MS, DEFAULT_MIN_SPEECH_MS, DEFAULT_PRE_ROLL_MS,
-    DEFAULT_SILENCE_MS, DEFAULT_SPEECH_THRESHOLD, VAD_FRAME_MS, VAD_SAMPLE_RATE,
+    DEFAULT_MAX_UTTERANCE_MS, DEFAULT_MIN_SPEECH_MS, DEFAULT_PRE_ROLL_MS, DEFAULT_SILENCE_MS,
+    DEFAULT_SPEECH_THRESHOLD, EndpointConfig, EndpointDetector, EndpointEndReason, EndpointEvent,
+    VAD_FRAME_MS, VAD_SAMPLE_RATE, VadScorer, sanitize_score_threshold,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -58,6 +59,35 @@ const DEFAULT_STREAM_MIN_SPEECH_MS: u32 = DEFAULT_MIN_SPEECH_MS;
 const DEFAULT_STREAM_SILENCE_MS: u32 = DEFAULT_SILENCE_MS;
 const DEFAULT_STREAM_MAX_UTTERANCE_MS: u32 = DEFAULT_MAX_UTTERANCE_MS;
 const DEFAULT_STREAM_PRE_ROLL_MS: u32 = DEFAULT_PRE_ROLL_MS;
+const WS_OUTBOUND_QUEUE_CAPACITY: usize = 256;
+
+#[derive(Clone)]
+struct OutboundTx {
+    tx: mpsc::Sender<Message>,
+    runtime: Arc<RuntimeService>,
+    label: &'static str,
+}
+
+impl OutboundTx {
+    fn new(tx: mpsc::Sender<Message>, runtime: Arc<RuntimeService>, label: &'static str) -> Self {
+        Self { tx, runtime, label }
+    }
+
+    fn send(&self, message: Message) -> bool {
+        match self.tx.try_send(message) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.runtime.record_voice_stream_backpressure();
+                warn!(
+                    "{} outbound websocket queue is full; dropping message",
+                    self.label
+                );
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -579,7 +609,7 @@ impl StreamingInputState {
 async fn finalize_stream_vad_utterance(
     state: &AppState,
     correlation_id: &str,
-    out_tx: &mpsc::UnboundedSender<Message>,
+    out_tx: &OutboundTx,
     conn: &mut ConnectionState,
     commit: PendingAudioCommit,
     wav_bytes: Vec<u8>,
@@ -728,7 +758,8 @@ fn encode_assistant_audio_binary_frame(
 
 pub async fn handle_socket(socket: WebSocket, state: AppState, correlation_id: String) {
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
+    let (raw_out_tx, mut out_rx) = mpsc::channel::<Message>(WS_OUTBOUND_QUEUE_CAPACITY);
+    let out_tx = OutboundTx::new(raw_out_tx, state.runtime.clone(), "voice realtime");
 
     let writer = tokio::spawn(async move {
         while let Some(message) = out_rx.recv().await {
@@ -804,7 +835,7 @@ pub async fn handle_socket(socket: WebSocket, state: AppState, correlation_id: S
 async fn handle_text_message(
     state: &AppState,
     correlation_id: &str,
-    out_tx: &mpsc::UnboundedSender<Message>,
+    out_tx: &OutboundTx,
     conn: &mut ConnectionState,
     text: &str,
 ) -> Result<(), String> {
@@ -1057,7 +1088,7 @@ async fn handle_text_message(
 async fn handle_binary_message(
     state: &AppState,
     correlation_id: &str,
-    out_tx: &mpsc::UnboundedSender<Message>,
+    out_tx: &OutboundTx,
     conn: &mut ConnectionState,
     audio_bytes: Vec<u8>,
 ) -> Result<(), String> {
@@ -1135,7 +1166,7 @@ async fn handle_binary_message(
 fn spawn_turn_task(
     state: AppState,
     correlation_id: String,
-    out_tx: mpsc::UnboundedSender<Message>,
+    out_tx: OutboundTx,
     commit: PendingAudioCommit,
     audio_bytes: Vec<u8>,
     agent_session_id: Option<String>,
@@ -1525,7 +1556,7 @@ fn spawn_turn_task(
 
 async fn stream_tts_to_socket(
     state: &AppState,
-    out_tx: &mpsc::UnboundedSender<Message>,
+    out_tx: &OutboundTx,
     correlation_id: &str,
     utterance_id: &str,
     utterance_seq: u64,
@@ -1656,7 +1687,7 @@ async fn build_unified_history(
 #[allow(clippy::too_many_arguments)]
 async fn stream_unified_s2s_to_socket(
     state: &AppState,
-    out_tx: &mpsc::UnboundedSender<Message>,
+    out_tx: &OutboundTx,
     correlation_id: &str,
     utterance_id: &str,
     utterance_seq: u64,
@@ -1767,7 +1798,7 @@ async fn stream_unified_s2s_to_socket(
 }
 
 fn interrupt_active_turn(
-    out_tx: &mpsc::UnboundedSender<Message>,
+    out_tx: &OutboundTx,
     active_turn: &mut Option<ActiveTurn>,
     reason: &str,
 ) -> bool {
@@ -2008,9 +2039,9 @@ fn resolve_chat_model_id(raw: Option<&str>) -> Result<String, String> {
     Ok(variant.dir_name().to_string())
 }
 
-fn send_json(out_tx: &mpsc::UnboundedSender<Message>, value: serde_json::Value) -> bool {
+fn send_json(out_tx: &OutboundTx, value: serde_json::Value) -> bool {
     match serde_json::to_string(&value) {
-        Ok(text) => out_tx.send(Message::Text(text.into())).is_ok(),
+        Ok(text) => out_tx.send(Message::Text(text.into())),
         Err(err) => {
             warn!("failed to serialize voice ws event: {err}");
             false
@@ -2019,7 +2050,7 @@ fn send_json(out_tx: &mpsc::UnboundedSender<Message>, value: serde_json::Value) 
 }
 
 fn send_error(
-    out_tx: &mpsc::UnboundedSender<Message>,
+    out_tx: &OutboundTx,
     utterance_id: Option<String>,
     utterance_seq: Option<u64>,
     message: impl Into<String>,
@@ -2106,7 +2137,7 @@ impl MemoryStore for VoiceContextMemoryStore {
                 other => {
                     return Err(izwi_agent::AgentError::Memory(format!(
                         "Invalid stored chat role: {other}"
-                    )))
+                    )));
                 }
             };
             out.push(MemoryMessage {
