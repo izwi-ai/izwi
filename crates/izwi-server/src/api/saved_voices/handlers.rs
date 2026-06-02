@@ -4,9 +4,9 @@ use axum::{
     http::{header, HeaderValue, StatusCode},
     response::Response,
 };
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 
+use crate::api::audio_payload::decode_base64_audio_payload;
 use crate::api::pagination::{encode_cursor, CursorPagination, CursorPaginationQuery};
 use crate::error::ApiError;
 use crate::saved_voice_store::{
@@ -116,18 +116,20 @@ pub async fn create_saved_voice(
         .audio_base64
         .as_deref()
         .ok_or_else(|| ApiError::bad_request("Missing required `audio_base64` field."))?;
-    let audio_bytes = decode_audio_base64(audio_payload)?;
+    let audio_payload = decode_base64_audio_payload(audio_payload)?;
+    let audio_mime_type = req
+        .audio_mime_type
+        .or_else(|| audio_payload.content_type_hint().map(str::to_string))
+        .unwrap_or_else(|| "audio/wav".to_string());
 
     let voice = state
         .saved_voice_store
         .create_voice(NewSavedVoice {
             name,
             reference_text,
-            audio_mime_type: req
-                .audio_mime_type
-                .unwrap_or_else(|| "audio/wav".to_string()),
+            audio_mime_type,
             audio_filename: req.audio_filename,
-            audio_bytes,
+            audio_bytes: audio_payload.bytes,
             source_route_kind: req.source_route_kind,
             source_record_id: req.source_record_id,
         })
@@ -165,22 +167,6 @@ fn required_trimmed(raw: Option<&str>, field_name: &str) -> Result<String, ApiEr
         )));
     }
     Ok(trimmed.to_string())
-}
-
-fn decode_audio_base64(input: &str) -> Result<Vec<u8>, ApiError> {
-    let payload = input
-        .split_once(',')
-        .map(|(_, value)| value)
-        .unwrap_or(input)
-        .trim();
-
-    if payload.is_empty() {
-        return Err(ApiError::bad_request("Audio payload is empty"));
-    }
-
-    base64::engine::general_purpose::STANDARD
-        .decode(payload)
-        .map_err(|err| ApiError::bad_request(format!("Invalid base64 audio payload: {err}")))
 }
 
 fn audio_response(audio: StoredSavedVoiceAudio, as_attachment: bool) -> Response {

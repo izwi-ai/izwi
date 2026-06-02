@@ -11,10 +11,13 @@ use axum::{
     },
     Json, RequestExt,
 };
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use crate::api::audio_payload::{
+    decode_base64_audio_payload, read_multipart_audio_base64_payload,
+    read_multipart_audio_file_payload,
+};
 use crate::api::request_context::RequestContext;
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -531,11 +534,15 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
             .map_err(|e| ApiError::bad_request(format!("Invalid JSON payload: {e}")))?;
 
         let model_id = payload.model_id.or(payload.model);
-        let audio_bytes = decode_audio_base64(payload.audio_base64.as_str())?;
+        let audio_payload = decode_base64_audio_payload(payload.audio_base64.as_str())?;
+        let audio_mime_type = audio_payload
+            .content_type_hint()
+            .map(str::to_string)
+            .unwrap_or_else(|| "audio/wav".to_string());
 
         return Ok(ParsedTranscriptionCreateRequest {
-            audio_bytes,
-            audio_mime_type: Some("audio/wav".to_string()),
+            audio_bytes: audio_payload.bytes,
+            audio_mime_type: Some(audio_mime_type),
             audio_filename: None,
             model_id,
             aligner_model_id: sanitize_optional(payload.aligner_model_id),
@@ -562,30 +569,27 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
             let name = field.name().unwrap_or_default().to_string();
             match name.as_str() {
                 "file" | "audio" => {
-                    let filename = field.file_name().map(|value| value.to_string());
-                    let mime_type = field.content_type().map(|value| value.to_string());
-                    let bytes = field.bytes().await.map_err(|err| {
-                        multipart_upload_error(
-                            "Transcription",
-                            &name,
-                            AUDIO_UPLOAD_LIMIT_BYTES,
-                            err,
-                        )
-                    })?;
-                    if !bytes.is_empty() {
-                        out.audio_bytes = bytes.to_vec();
-                        out.audio_filename = filename;
-                        out.audio_mime_type = mime_type;
+                    if let Some(payload) = read_multipart_audio_file_payload(
+                        field,
+                        "Transcription",
+                        &name,
+                        AUDIO_UPLOAD_LIMIT_BYTES,
+                    )
+                    .await?
+                    {
+                        out.audio_filename = payload.filename;
+                        out.audio_mime_type = payload.source_mime_type;
+                        out.audio_bytes = payload.bytes;
                     }
                 }
                 "audio_base64" => {
-                    let text = field.text().await.map_err(|e| {
-                        ApiError::bad_request(format!(
-                            "Failed reading multipart 'audio_base64' field: {e}"
-                        ))
-                    })?;
-                    if !text.trim().is_empty() {
-                        out.audio_bytes = decode_audio_base64(text.as_str())?;
+                    if let Some(payload) =
+                        read_multipart_audio_base64_payload(field, "audio_base64").await?
+                    {
+                        if out.audio_mime_type.is_none() {
+                            out.audio_mime_type = payload.content_type_hint().map(str::to_string);
+                        }
+                        out.audio_bytes = payload.bytes;
                     }
                 }
                 "model" | "model_id" => {
@@ -645,22 +649,6 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
         status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
         message: "Expected `Content-Type: application/json` or `multipart/form-data`".to_string(),
     })
-}
-
-fn decode_audio_base64(input: &str) -> Result<Vec<u8>, ApiError> {
-    let payload = input
-        .split_once(',')
-        .map(|(_, value)| value)
-        .unwrap_or(input)
-        .trim();
-
-    if payload.is_empty() {
-        return Err(ApiError::bad_request("Audio payload is empty"));
-    }
-
-    base64::engine::general_purpose::STANDARD
-        .decode(payload)
-        .map_err(|err| ApiError::bad_request(format!("Invalid base64 audio payload: {err}")))
 }
 
 fn parse_bool(raw: &str) -> bool {
@@ -988,13 +976,38 @@ fn map_store_error(err: anyhow::Error) -> ApiError {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::StatusCode;
+    use axum::{
+        body::Body,
+        http::{header, StatusCode},
+    };
 
     use super::{
         alignments_to_word_records, build_segment_records, initial_summary_state,
-        multipart_field_api_error, parse_bool, sanitize_summary_output, TranscriptionSummaryStatus,
-        TranscriptionWordRecord,
+        multipart_field_api_error, parse_bool, parse_create_request, sanitize_summary_output,
+        TranscriptionSummaryStatus, TranscriptionWordRecord,
     };
+
+    #[tokio::test]
+    async fn json_create_request_accepts_data_url_audio_and_uses_mime_hint() {
+        let request = axum::http::Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "audio_base64": "data:audio/webm;base64, YXVk\naW8=",
+                    "model": "Parakeet-TDT-0.6B-v3"
+                })
+                .to_string(),
+            ))
+            .expect("request should build");
+
+        let parsed = parse_create_request(request)
+            .await
+            .expect("request should parse");
+
+        assert_eq!(parsed.audio_bytes, b"audio");
+        assert_eq!(parsed.audio_mime_type.as_deref(), Some("audio/webm"));
+        assert_eq!(parsed.model_id.as_deref(), Some("Parakeet-TDT-0.6B-v3"));
+    }
 
     #[test]
     fn converts_alignment_millis_into_word_records() {

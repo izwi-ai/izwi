@@ -1,11 +1,10 @@
 use axum::{
-    Json,
     body::Body,
     extract::{Path, Query, State},
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     response::Response,
+    Json,
 };
-use base64::Engine;
 use izwi_hooks::{HookMetadata, MediaNamespace};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -13,9 +12,10 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+use crate::api::audio_payload::decode_base64_media_payload;
 use crate::error::ApiError;
 use crate::persistence::{
-    MediaStorageError, delete_media_object, persist_audio_object, read_media_object,
+    delete_media_object, persist_audio_object, read_media_object, MediaStorageError,
 };
 use crate::state::AppState;
 use crate::storage_layout;
@@ -100,13 +100,9 @@ pub async fn create_media(
         .data_base64
         .as_deref()
         .ok_or_else(|| ApiError::bad_request("Missing data_base64 media payload"))?;
-    let (data_url_content_type, base64_payload) = split_data_url_base64(raw_data);
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(base64_payload.trim())
-        .map_err(|err| ApiError::bad_request(format!("Invalid base64 media payload: {err}")))?;
-    if bytes.is_empty() {
-        return Err(ApiError::bad_request("Media payload cannot be empty"));
-    }
+    let payload = decode_base64_media_payload(raw_data)?;
+    let data_url_content_type = payload.data_url_mime_type.clone();
+    let bytes = payload.bytes;
 
     let content_type = normalize_content_type(
         req.content_type
@@ -319,24 +315,6 @@ fn media_url(path: &str) -> String {
     format!("/v1/media/{path}")
 }
 
-fn split_data_url_base64(raw: &str) -> (Option<String>, &str) {
-    let Some(data_url) = raw.strip_prefix("data:") else {
-        return (None, raw);
-    };
-    let Some((metadata, payload)) = data_url.split_once(',') else {
-        return (None, raw);
-    };
-    if !metadata.to_ascii_lowercase().contains(";base64") {
-        return (None, raw);
-    }
-    let content_type = metadata
-        .split(';')
-        .next()
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string);
-    (content_type, payload)
-}
-
 fn normalize_content_type(content_type: &str) -> Option<String> {
     if content_type.contains(['\r', '\n']) {
         return None;
@@ -407,7 +385,7 @@ mod tests {
     #[test]
     fn media_upload_helpers_sanitize_untrusted_fields() {
         assert_eq!(
-            split_data_url_base64("data:audio/wav;base64,YXVkaW8="),
+            crate::api::audio_payload::split_data_url_base64("data:audio/wav;base64,YXVkaW8="),
             (Some("audio/wav".to_string()), "YXVkaW8=")
         );
         assert_eq!(normalize_filename("../secret.wav"), None);
