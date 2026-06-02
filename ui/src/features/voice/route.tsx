@@ -885,14 +885,6 @@ export function VoicePage({
             new Error("Voice realtime input stream stopped"),
           );
           return;
-        case "listening":
-          if (
-            isSessionActiveRef.current &&
-            runtimeStatusRef.current !== "user_speaking"
-          ) {
-            setRuntimeStatus("listening");
-          }
-          return;
         case "user_speech_start":
           voiceMinAcceptedAssistantSeqRef.current = Math.max(
             voiceMinAcceptedAssistantSeqRef.current,

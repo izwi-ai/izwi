@@ -10,6 +10,8 @@ import {
   type CursorPaginationQuery,
 } from "@/shared/api/pagination";
 
+const FIRST_PARTY_AUDIO_UPLOAD_LIMIT_BYTES = 64 * 1024 * 1024;
+
 export interface TTSRequest {
   text: string;
   model_id: string;
@@ -2848,6 +2850,7 @@ export class AudioApiClient {
     stream: boolean,
   ): RequestInit {
     if (request.audio_file) {
+      assertFirstPartyAudioUploadWithinLimit(request.audio_file);
       const form = new FormData();
       form.append(
         "file",
@@ -2901,6 +2904,7 @@ export class AudioApiClient {
     const enableLlmRefinement = request.enable_llm_refinement ?? true;
 
     if (request.audio_file) {
+      assertFirstPartyAudioUploadWithinLimit(request.audio_file);
       const form = new FormData();
       form.append(
         "file",
@@ -2987,5 +2991,11 @@ export class AudioApiClient {
       transcription: result.transcription,
       language: result.language,
     };
+  }
+}
+
+function assertFirstPartyAudioUploadWithinLimit(file: Blob): void {
+  if (file.size > FIRST_PARTY_AUDIO_UPLOAD_LIMIT_BYTES) {
+    throw new Error("Uploaded audio is too large for this server.");
   }
 }

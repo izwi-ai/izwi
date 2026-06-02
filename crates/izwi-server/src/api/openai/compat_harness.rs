@@ -3,10 +3,10 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
-    body::{to_bytes, Body},
+    Router,
+    body::{Body, to_bytes},
     http::{Method, Request, StatusCode},
     response::Response,
-    Router,
 };
 use izwi_core::{RuntimeService, ServeRuntimeConfig};
 use serde::Deserialize;
@@ -66,13 +66,11 @@ fn marker_matches_source(marker: &str, source: &str) -> bool {
     if marker == "[DONE]" {
         return source.contains("[DONE]");
     }
-    let marker = marker
-        .split('(')
-        .next()
-        .unwrap_or(marker)
-        .trim();
+    let marker = marker.split('(').next().unwrap_or(marker).trim();
     if marker.contains('|') {
-        return marker.split('|').any(|option| source.contains(option.trim()));
+        return marker
+            .split('|')
+            .any(|option| source.contains(option.trim()));
     }
     source.contains(marker)
 }
@@ -157,6 +155,7 @@ fn contract_supported_scope_matches_expected_endpoints() {
         .collect();
     let expected: HashSet<&str> = vec![
         "/v1/models",
+        "/v1/models/{model}",
         "/v1/chat/completions",
         "/v1/responses",
         "/v1/responses/:response_id",
@@ -221,7 +220,11 @@ async fn out_of_scope_endpoints_return_not_found() {
 #[test]
 fn chat_stream_contract_markers_exist_in_source() {
     let contract = parse_contract();
-    for marker in &contract.streaming_contracts.chat_completions.required_sequence {
+    for marker in &contract
+        .streaming_contracts
+        .chat_completions
+        .required_sequence
+    {
         assert!(
             marker_matches_source(marker, OPENAI_CHAT_COMPLETIONS_SRC),
             "missing chat stream marker in source: {}",
@@ -246,7 +249,10 @@ fn responses_stream_contract_markers_exist_in_source() {
 fn audio_streaming_contract_lists_required_events() {
     let contract = parse_contract();
     assert_eq!(
-        contract.streaming_contracts.audio_transcriptions.required_events,
+        contract
+            .streaming_contracts
+            .audio_transcriptions
+            .required_events,
         vec!["transcript.text.delta", "transcript.text.done"]
     );
     assert_eq!(

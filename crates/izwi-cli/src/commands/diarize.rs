@@ -1,10 +1,10 @@
+use crate::TranscriptFormat;
 use crate::error::{CliError, Result};
 use crate::http;
-use crate::TranscriptFormat;
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 pub struct DiarizeArgs {
@@ -137,6 +137,12 @@ pub async fn execute(args: DiarizeArgs, server: &str) -> Result<()> {
         "audio_base64": audio_base64,
         "asr_model": asr_model,
     });
+    if let Some(filename) = audio_filename_from_path(&file) {
+        request_body["audio_filename"] = serde_json::Value::String(filename);
+    }
+    if let Some(mime_type) = audio_mime_type_from_path(&file) {
+        request_body["audio_mime_type"] = serde_json::Value::String(mime_type.to_string());
+    }
 
     if let Some(num) = num_speakers {
         request_body["min_speakers"] = serde_json::Value::Number(num.into());
@@ -267,6 +273,31 @@ fn diarization_job_url(server: &str, record_id: &str) -> String {
     )
 }
 
+fn audio_filename_from_path(path: &Path) -> Option<String> {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.contains(['\r', '\n']))
+        .map(ToOwned::to_owned)
+}
+
+fn audio_mime_type_from_path(path: &Path) -> Option<&'static str> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.trim().to_ascii_lowercase())?;
+    match extension.as_str() {
+        "wav" | "wave" => Some("audio/wav"),
+        "mp3" => Some("audio/mpeg"),
+        "m4a" | "mp4" => Some("audio/mp4"),
+        "webm" => Some("audio/webm"),
+        "ogg" | "oga" | "opus" => Some("audio/ogg"),
+        "flac" => Some("audio/flac"),
+        "aac" => Some("audio/aac"),
+        _ => None,
+    }
+}
+
 fn format_diarization_output(
     record: &DiarizationJobRecord,
     format: TranscriptFormat,
@@ -365,6 +396,8 @@ mod tests {
             serde_json::from_str(&requests[0].body).expect("valid request json");
         assert_eq!(request_json["model"], "nvidia/sortformer");
         assert_eq!(request_json["asr_model"], "distil-whisper");
+        assert_eq!(request_json["audio_filename"], "sample.wav");
+        assert_eq!(request_json["audio_mime_type"], "audio/wav");
         assert_eq!(request_json["min_speakers"], 2);
         assert_eq!(request_json["max_speakers"], 2);
         assert_eq!(
@@ -438,6 +471,18 @@ mod tests {
             diarization_job_url("http://localhost:8080/", "abc"),
             "http://localhost:8080/v1/speech-to-text/jobs/abc?job_kind=diarization"
         );
+    }
+
+    #[test]
+    fn audio_upload_metadata_uses_basename_and_known_mime() {
+        let path = PathBuf::from("/Users/example/private/call.OPUS");
+
+        assert_eq!(
+            audio_filename_from_path(&path).as_deref(),
+            Some("call.OPUS")
+        );
+        assert_eq!(audio_mime_type_from_path(&path), Some("audio/ogg"));
+        assert_eq!(audio_mime_type_from_path(Path::new("unknown.bin")), None);
     }
 
     async fn spawn_flow_server(

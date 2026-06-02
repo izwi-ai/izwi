@@ -26,7 +26,6 @@ export type VoiceRealtimeServerEvent =
       };
     }
   | { type: "input_stream_stopped" }
-  | { type: "listening"; utterance_id: string; utterance_seq: number }
   | { type: "user_speech_start"; utterance_id: string; utterance_seq: number }
   | { type: "user_speech_rejected"; utterance_id: string; utterance_seq: number }
   | {
