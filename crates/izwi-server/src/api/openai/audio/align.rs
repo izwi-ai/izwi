@@ -7,12 +7,15 @@ use axum::{
     response::Response,
     Json, RequestExt,
 };
-use base64::Engine;
 use serde::Serialize;
 use std::time::Instant;
 use utoipa::ToSchema;
 
 use super::resolve_audio_upload_limit_bytes;
+use crate::api::audio_payload::{
+    decode_base64_audio_payload, read_multipart_audio_base64_payload,
+    read_multipart_audio_file_payload,
+};
 use crate::api::speech_text_upload::multipart_upload_api_error;
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -153,9 +156,10 @@ async fn parse_alignment_request(req: Request) -> Result<AlignmentRequest, ApiEr
             .extract::<Json<AlignmentJsonRequest>, _>()
             .await
             .map_err(|e| ApiError::bad_request(format!("Invalid JSON payload: {e}")))?;
+        let audio_payload = decode_base64_audio_payload(payload.audio_base64.as_str())?;
 
         return Ok(AlignmentRequest {
-            audio_base64: Some(payload.audio_base64),
+            audio_base64: Some(audio_payload.to_base64()),
             text: Some(payload.text),
             model: payload.model,
             language: payload.language,
@@ -178,19 +182,22 @@ async fn parse_alignment_request(req: Request) -> Result<AlignmentRequest, ApiEr
             let name = field.name().unwrap_or_default().to_string();
             match name.as_str() {
                 "file" | "audio" => {
-                    let bytes = field
-                        .bytes()
-                        .await
-                        .map_err(|e| multipart_field_error(&name, e))?;
-                    if !bytes.is_empty() {
-                        out.audio_base64 =
-                            Some(base64::engine::general_purpose::STANDARD.encode(&bytes));
+                    if let Some(payload) = read_multipart_audio_file_payload(
+                        field,
+                        "OpenAI-compatible audio",
+                        &name,
+                        resolve_audio_upload_limit_bytes(),
+                    )
+                    .await?
+                    {
+                        out.audio_base64 = Some(payload.to_base64());
                     }
                 }
                 "audio_base64" => {
-                    let text = read_multipart_text(field, "audio_base64").await?;
-                    if !text.trim().is_empty() {
-                        out.audio_base64 = Some(text);
+                    if let Some(payload) =
+                        read_multipart_audio_base64_payload(field, "audio_base64").await?
+                    {
+                        out.audio_base64 = Some(payload.to_base64());
                     }
                 }
                 "text" | "reference_text" => {
@@ -301,6 +308,27 @@ fn format_alignment_text(words: &[AlignmentWord]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn parse_json_request_canonicalizes_data_url_audio() {
+        let request = Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "audio_base64": "data:audio/wav;base64, YXVk\naW8=",
+                    "text": "audio"
+                })
+                .to_string(),
+            ))
+            .expect("request should build");
+
+        let parsed = parse_alignment_request(request)
+            .await
+            .expect("request should parse");
+
+        assert_eq!(parsed.audio_base64.as_deref(), Some("YXVkaW8="));
+        assert_eq!(parsed.text.as_deref(), Some("audio"));
+    }
 
     #[test]
     fn alignment_words_convert_millis_to_seconds() {

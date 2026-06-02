@@ -10,13 +10,16 @@ use axum::{
     },
     Json, RequestExt,
 };
-use base64::Engine;
 use std::convert::Infallible;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
 use super::resolve_audio_upload_limit_bytes;
+use crate::api::audio_payload::{
+    decode_base64_audio_payload, read_multipart_audio_base64_payload,
+    read_multipart_audio_file_payload,
+};
 use crate::api::request_context::RequestContext;
 use crate::api::speech_text_upload::multipart_upload_api_error;
 use crate::error::ApiError;
@@ -390,9 +393,10 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
             .extract::<Json<JsonRequestBody>, _>()
             .await
             .map_err(|e| ApiError::bad_request(format!("Invalid JSON payload: {e}")))?;
+        let audio_payload = decode_base64_audio_payload(payload.audio_base64.as_str())?;
 
         return Ok(TranscriptionRequest {
-            audio_base64: Some(payload.audio_base64),
+            audio_base64: Some(audio_payload.to_base64()),
             model: payload.model,
             aligner_model: payload.aligner_model,
             language: payload.language,
@@ -421,24 +425,22 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
             let name = field.name().unwrap_or_default().to_string();
             match name.as_str() {
                 "file" | "audio" => {
-                    let bytes = field
-                        .bytes()
-                        .await
-                        .map_err(|e| multipart_field_error(&name, e))?;
-                    if !bytes.is_empty() {
-                        out.audio_base64 =
-                            Some(base64::engine::general_purpose::STANDARD.encode(&bytes));
+                    if let Some(payload) = read_multipart_audio_file_payload(
+                        field,
+                        "OpenAI-compatible audio",
+                        &name,
+                        resolve_audio_upload_limit_bytes(),
+                    )
+                    .await?
+                    {
+                        out.audio_base64 = Some(payload.to_base64());
                     }
                 }
                 "audio_base64" => {
-                    let text = field.text().await.map_err(|e| {
-                        ApiError::bad_request(format!(
-                            "Failed reading multipart 'audio_base64' field: {}",
-                            e
-                        ))
-                    })?;
-                    if !text.trim().is_empty() {
-                        out.audio_base64 = Some(text);
+                    if let Some(payload) =
+                        read_multipart_audio_base64_payload(field, "audio_base64").await?
+                    {
+                        out.audio_base64 = Some(payload.to_base64());
                     }
                 }
                 "model" => {
@@ -904,6 +906,28 @@ fn secs_to_vtt(secs: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn parse_json_request_canonicalizes_data_url_audio() {
+        let request = Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "audio_base64": "data:audio/wav;base64, YXVk\naW8=",
+                    "model": "Parakeet-TDT-0.6B-v3",
+                    "response_format": "json"
+                })
+                .to_string(),
+            ))
+            .expect("request should build");
+
+        let parsed = parse_transcription_request(request)
+            .await
+            .expect("request should parse");
+
+        assert_eq!(parsed.audio_base64.as_deref(), Some("YXVkaW8="));
+        assert_eq!(parsed.model.as_deref(), Some("Parakeet-TDT-0.6B-v3"));
+    }
 
     #[test]
     fn renders_srt_and_vtt() {
