@@ -1,11 +1,11 @@
 //! OpenAI-compatible speech synthesis endpoints.
 
 use axum::{
+    Json,
     body::Body,
     extract::{Extension, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::Response,
-    Json,
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -18,14 +18,15 @@ use crate::api::request_context::RequestContext;
 use crate::api::saved_voices::resolve_saved_voice_reference;
 use crate::error::ApiError;
 use crate::state::AppState;
-use izwi_core::audio::AudioFormat;
+use izwi_core::audio::{AudioEncoder, AudioFormat};
 use izwi_core::runtime_models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
 use izwi_core::runtime_models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use izwi_core::{
-    parse_tts_model_variant, AudioChunk, GenerationConfig, GenerationRequest, ModelVariant,
+    AudioChunk, GenerationConfig, GenerationRequest, ModelVariant, parse_tts_model_variant,
 };
 
 const DEFAULT_STREAM_EVENT_QUEUE_CAPACITY: usize = 32;
+const SPEECH_RESPONSE_EXPOSED_HEADERS: &str = "X-Generation-Time-Ms, X-Audio-Duration-Secs, X-RTF, X-Tokens-Generated, X-Audio-Sample-Rate, X-Requested-Response-Format, X-Actual-Response-Format, X-Response-Format-Fallback";
 
 /// OpenAI-compatible speech synthesis request.
 #[derive(Debug, Deserialize)]
@@ -168,13 +169,14 @@ pub async fn speech(
     .await
     .map_err(|_| ApiError::internal("Request timeout"))??;
 
-    let encoder = state.runtime.audio_encoder().await;
+    let sample_rate = result.sample_rate;
     let samples = result.samples.clone();
-    let audio_bytes = tokio::task::spawn_blocking(move || encoder.encode(&samples, format))
-        .await
-        .map_err(|e| ApiError::internal(format!("Audio encoding failed: {}", e)))??;
+    let audio_bytes =
+        tokio::task::spawn_blocking(move || encode_speech_samples(&samples, sample_rate, format))
+            .await
+            .map_err(|e| ApiError::internal(format!("Audio encoding failed: {}", e)))??;
 
-    let content_type = izwi_core::audio::AudioEncoder::content_type(format);
+    let content_type = AudioEncoder::content_type(format);
     let duration_secs = result.duration_secs();
     let generation_time_ms = result.total_time_ms;
     let rtf = result.rtf();
@@ -186,9 +188,10 @@ pub async fn speech(
         .header("X-Audio-Duration-Secs", format!("{:.2}", duration_secs))
         .header("X-RTF", format!("{:.3}", rtf))
         .header("X-Tokens-Generated", tokens_generated.to_string())
+        .header("X-Audio-Sample-Rate", sample_rate.to_string())
         .header(
             "Access-Control-Expose-Headers",
-            "X-Generation-Time-Ms, X-Audio-Duration-Secs, X-RTF, X-Tokens-Generated, X-Requested-Response-Format, X-Actual-Response-Format, X-Response-Format-Fallback",
+            SPEECH_RESPONSE_EXPOSED_HEADERS,
         )
         .header(
             "X-Requested-Response-Format",
@@ -407,7 +410,7 @@ async fn stream_speech(
             }
         };
 
-        let sample_rate = engine.sample_rate().await;
+        let fallback_sample_rate = engine.sample_rate().await;
         let start_event = SpeechStreamEvent {
             event: "audio.started",
             request_id: Some(stream_request_id.clone()),
@@ -415,7 +418,7 @@ async fn stream_speech(
             audio_base64: None,
             sample_count: None,
             is_final: None,
-            sample_rate: Some(sample_rate),
+            sample_rate: Some(fallback_sample_rate),
             audio_format: Some(stream_audio_format),
             tokens_generated: None,
             generation_time_ms: None,
@@ -438,8 +441,9 @@ async fn stream_speech(
         });
 
         let mut total_samples = 0usize;
+        let mut audio_duration_secs = 0.0f32;
+        let mut last_sample_rate = fallback_sample_rate;
         let stream_started = Instant::now();
-        let encoder = izwi_core::audio::AudioEncoder::new(sample_rate, 1);
         let mut client_closed = false;
         let mut stream_failed = false;
         while let Some(chunk) = chunk_rx.recv().await {
@@ -447,8 +451,11 @@ async fn stream_speech(
                 continue;
             }
 
+            let chunk_sample_rate = chunk.sample_rate_or(fallback_sample_rate).max(1);
             total_samples += chunk.samples.len();
-            let bytes = match encoder.encode(&chunk.samples, format) {
+            audio_duration_secs += chunk.samples.len() as f32 / chunk_sample_rate as f32;
+            last_sample_rate = chunk_sample_rate;
+            let bytes = match encode_speech_samples(&chunk.samples, chunk_sample_rate, format) {
                 Ok(bytes) => bytes,
                 Err(err) => {
                     let error_event = SpeechStreamEvent {
@@ -479,8 +486,8 @@ async fn stream_speech(
                 audio_base64: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
                 sample_count: Some(chunk.samples.len()),
                 is_final: Some(chunk.is_final),
-                sample_rate: None,
-                audio_format: None,
+                sample_rate: Some(chunk_sample_rate),
+                audio_format: Some(stream_audio_format),
                 tokens_generated: None,
                 generation_time_ms: None,
                 audio_duration_secs: None,
@@ -524,7 +531,6 @@ async fn stream_speech(
         match generation_outcome {
             Ok(Ok(())) => {
                 let generation_time_ms = stream_started.elapsed().as_secs_f32() * 1000.0;
-                let audio_duration_secs = total_samples as f32 / sample_rate as f32;
                 let tokens_generated = total_samples / 256;
                 let rtf = if audio_duration_secs > 0.0 {
                     (generation_time_ms / 1000.0) / audio_duration_secs
@@ -539,7 +545,7 @@ async fn stream_speech(
                     audio_base64: None,
                     sample_count: None,
                     is_final: None,
-                    sample_rate: None,
+                    sample_rate: Some(last_sample_rate),
                     audio_format: None,
                     tokens_generated: Some(tokens_generated),
                     generation_time_ms: Some(generation_time_ms),
@@ -726,9 +732,18 @@ fn stream_audio_format_label(format: AudioFormat) -> &'static str {
     }
 }
 
+fn encode_speech_samples(
+    samples: &[f32],
+    sample_rate: u32,
+    format: AudioFormat,
+) -> izwi_core::Result<Vec<u8>> {
+    AudioEncoder::new(sample_rate, 1).encode(samples, format)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn qwen_auto_timeout_expands_for_long_form() {
@@ -1014,5 +1029,39 @@ mod tests {
             saved_voice_id: None,
         };
         assert!(resolve_streaming_mode(&req).expect("streaming mode"));
+    }
+
+    #[test]
+    fn speech_wav_encoding_uses_generated_sample_rate() {
+        let bytes = encode_speech_samples(&[0.0, 0.25, -0.25], 16_000, AudioFormat::Wav)
+            .expect("encode wav");
+        let reader = hound::WavReader::new(Cursor::new(bytes)).expect("decode wav");
+
+        assert_eq!(reader.spec().sample_rate, 16_000);
+        assert_eq!(reader.spec().channels, 1);
+    }
+
+    #[test]
+    fn speech_stream_chunk_event_includes_audio_rate_and_format() {
+        let event = SpeechStreamEvent {
+            event: "audio.chunk",
+            request_id: Some("req".to_string()),
+            sequence: Some(3),
+            audio_base64: Some("AA==".to_string()),
+            sample_count: Some(1),
+            is_final: Some(false),
+            sample_rate: Some(48_000),
+            audio_format: Some("pcm_i16"),
+            tokens_generated: None,
+            generation_time_ms: None,
+            audio_duration_secs: None,
+            rtf: None,
+            error: None,
+        };
+
+        let value = serde_json::to_value(event).expect("serialize event");
+
+        assert_eq!(value["sample_rate"], 48_000);
+        assert_eq!(value["audio_format"], "pcm_i16");
     }
 }

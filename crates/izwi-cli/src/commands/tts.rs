@@ -1,12 +1,12 @@
+use crate::AudioFormat;
 use crate::error::{CliError, Result};
 use crate::http;
 use crate::style::Theme;
-use crate::AudioFormat;
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::header::HeaderMap;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
@@ -342,20 +342,14 @@ fn normalize_optional_text(raw: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn reject_unsupported_cli_stream(model: &str, stream: bool) -> Result<()> {
+fn reject_unsupported_cli_stream(_model: &str, stream: bool) -> Result<()> {
     if !stream {
         return Ok(());
     }
-    if matches!(
-        izwi_core::parse_tts_model_variant(model),
-        Ok(izwi_core::ModelVariant::VibeVoice15BTts)
-    ) {
-        return Err(CliError::InvalidInput(
-            "VibeVoice TTS uses final-only SSE streaming on the speech endpoint; omit --stream for CLI audio output."
-                .to_string(),
-        ));
-    }
-    Ok(())
+    Err(CliError::InvalidInput(
+        "`izwi tts --stream` receives Server-Sent Events that the CLI does not yet assemble into a playable audio file; omit --stream for CLI audio output."
+            .to_string(),
+    ))
 }
 
 fn output_extension(requested_format: &AudioFormat, actual_format: Option<&str>) -> &'static str {
@@ -393,6 +387,15 @@ mod tests {
     #[test]
     fn output_extension_handles_raw_audio_labels() {
         assert_eq!(output_extension(&AudioFormat::Wav, Some("pcm-f32")), "f32");
+    }
+
+    #[test]
+    fn cli_streaming_is_rejected_before_request() {
+        let err = reject_unsupported_cli_stream("Kokoro-82M", true)
+            .expect_err("streaming should be rejected");
+
+        assert!(err.to_string().contains("omit --stream"));
+        reject_unsupported_cli_stream("Kokoro-82M", false).expect("non-streaming is supported");
     }
 
     #[test]
