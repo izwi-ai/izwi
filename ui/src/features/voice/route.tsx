@@ -17,7 +17,6 @@ import { cn } from "@/lib/utils";
 import { api, type ModelInfo, type VoiceObservation } from "@/api";
 import { PageShell } from "@/components/PageShell";
 import { Button } from "@/components/ui/button";
-import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import {
   Select,
@@ -98,9 +97,6 @@ export function VoicePage({
   const [selectedSpeaker, setSelectedSpeaker] = useState("Serena");
   const [voiceMode, setVoiceMode] = useState<VoiceRealtimeMode>("modular");
 
-  const [vadThreshold, setVadThreshold] = useState(0.5);
-  const [silenceDurationMs, setSilenceDurationMs] = useState(900);
-  const [minSpeechMs, setMinSpeechMs] = useState(300);
   const [isConfigOpen, setIsConfigOpen] = useState(false);
   const [configTab, setConfigTab] = useState<VoiceConfigTab>("setup");
   const [isLoadAllRequested, setIsLoadAllRequested] = useState(false);
@@ -1293,9 +1289,6 @@ export function VoicePage({
             s2s_model_id: selectedUnifiedModel,
             speaker: selectedSpeaker,
             max_output_tokens: 1536,
-            vad_threshold: vadThreshold,
-            min_speech_ms: minSpeechMs,
-            silence_duration_ms: silenceDurationMs,
             max_utterance_ms: 20_000,
             pre_roll_ms: 160,
             input_sample_rate: Math.round(inputSampleRate),
@@ -1315,9 +1308,6 @@ export function VoicePage({
             speaker: selectedSpeaker,
             asr_language: "Auto",
             max_output_tokens: 1536,
-            vad_threshold: vadThreshold,
-            min_speech_ms: minSpeechMs,
-            silence_duration_ms: silenceDurationMs,
             max_utterance_ms: 20_000,
             pre_roll_ms: 160,
             input_sample_rate: Math.round(inputSampleRate),
@@ -1336,15 +1326,12 @@ export function VoicePage({
     },
     [
       ensureVoiceRealtimeSocket,
-      minSpeechMs,
       selectedAsrModel,
       selectedSpeaker,
       selectedTextModel,
       selectedTtsModel,
       selectedUnifiedModel,
       sendVoiceRealtimeJson,
-      silenceDurationMs,
-      vadThreshold,
       voiceMode,
       waitForVoiceRealtimeInputStreamReady,
     ],
@@ -1693,7 +1680,7 @@ export function VoicePage({
     {
       value: "setup",
       label: "Setup",
-      description: "Runtime mode, voice, playback, and speech detection.",
+      description: "Runtime mode, voice, and playback.",
     },
     {
       value: "models",
@@ -1835,7 +1822,6 @@ export function VoicePage({
           )}
         </div>
       </section>
-      {renderAdvancedSpeechSettings()}
     </div>
   );
 
@@ -2228,79 +2214,6 @@ export function VoicePage({
           </div>
         ))}
       </div>
-    </section>
-  );
-
-  const renderAdvancedSpeechSettings = () => (
-    <section className="border-t border-[var(--border-muted)] pt-6">
-      <details>
-        <summary className="cursor-pointer text-sm font-semibold text-[var(--text-primary)]">
-          Advanced Speech Detection
-        </summary>
-        <p className="mt-1 text-sm text-[var(--text-muted)]">
-          Tune how aggressively the microphone detects the start and end of
-          speech.
-        </p>
-        <div className="mt-4 grid gap-5 md:grid-cols-3">
-          <div>
-            <label className="text-sm font-medium text-[var(--text-primary)]">
-              Speech Threshold ({vadThreshold.toFixed(2)})
-            </label>
-            <Slider
-              aria-label="Speech threshold"
-              min={0.1}
-              max={0.9}
-              step={0.01}
-              value={[vadThreshold]}
-              onValueChange={(value) => {
-                const next = value[0];
-                if (typeof next === "number") {
-                  setVadThreshold(next);
-                }
-              }}
-              className="mt-2"
-            />
-          </div>
-          <div>
-            <label className="text-sm font-medium text-[var(--text-primary)]">
-              End Silence (ms): {silenceDurationMs}
-            </label>
-            <Slider
-              aria-label="End silence duration"
-              min={400}
-              max={1800}
-              step={50}
-              value={[silenceDurationMs]}
-              onValueChange={(value) => {
-                const next = value[0];
-                if (typeof next === "number") {
-                  setSilenceDurationMs(next);
-                }
-              }}
-              className="mt-2"
-            />
-          </div>
-          <div>
-            <label className="text-sm font-medium text-[var(--text-primary)]">
-              Minimum Speech (ms): {minSpeechMs}
-            </label>
-            <Slider
-              aria-label="Minimum speech duration"
-              min={150}
-              max={1200}
-              step={50}
-              value={[minSpeechMs]}
-              onValueChange={(value) => {
-                const next = value[0];
-                if (typeof next === "number") {
-                  setMinSpeechMs(next);
-                }
-              }}
-              className="mt-2"
-            />
-          </div>
-        </div>
-      </details>
     </section>
   );
 
