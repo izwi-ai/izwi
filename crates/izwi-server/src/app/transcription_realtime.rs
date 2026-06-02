@@ -1,10 +1,14 @@
 //! Realtime transcription websocket endpoint for `/transcription`.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
-use izwi_core::audio::{AudioEncoder, AudioFormat};
+use izwi_core::{
+    RuntimeService,
+    audio::{AudioEncoder, AudioFormat},
+};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
@@ -24,6 +28,8 @@ const MAX_STREAM_BUFFER_SECS: f32 = 32.0;
 const INFERENCE_WINDOW_SECS: f32 = 14.0;
 const INFERENCE_MIN_INTERVAL_MS: u64 = 350;
 const MIN_INFERENCE_AUDIO_MS: u32 = 180;
+const WS_OUTBOUND_QUEUE_CAPACITY: usize = 256;
+const WORKER_COMMAND_QUEUE_CAPACITY: usize = 512;
 // LocalAgreement-2 style stabilization (as used in whisper_streaming):
 // commit only the common prefix between the previous and current hypothesis.
 // Text-only approximation of whisper_streaming's timestamp boundary filtering:
@@ -41,6 +47,34 @@ const REPETITION_APPROX_MAX_LEN_DELTA: usize = 2;
 const REPETITION_APPROX_MIN_LCS_RATIO: f32 = 0.84;
 const REPETITION_APPROX_PREFIX_WINDOW_WORDS: usize = 3;
 const REPETITION_APPROX_MIN_PREFIX_MATCH_WORDS: usize = 2;
+
+#[derive(Clone)]
+struct OutboundTx {
+    tx: mpsc::Sender<Message>,
+    runtime: Arc<RuntimeService>,
+    label: &'static str,
+}
+
+impl OutboundTx {
+    fn new(tx: mpsc::Sender<Message>, runtime: Arc<RuntimeService>, label: &'static str) -> Self {
+        Self { tx, runtime, label }
+    }
+
+    fn send(&self, message: Message) -> bool {
+        match self.tx.try_send(message) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.runtime.record_voice_stream_backpressure();
+                warn!(
+                    "{} outbound websocket queue is full; dropping message",
+                    self.label
+                );
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -133,8 +167,9 @@ struct InferenceResult {
 
 pub async fn handle_socket(socket: WebSocket, state: AppState, correlation_id: String) {
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
-    let (worker_tx, worker_rx) = mpsc::unbounded_channel::<WorkerCommand>();
+    let (raw_out_tx, mut out_rx) = mpsc::channel::<Message>(WS_OUTBOUND_QUEUE_CAPACITY);
+    let out_tx = OutboundTx::new(raw_out_tx, state.runtime.clone(), "transcription realtime");
+    let (worker_tx, worker_rx) = mpsc::channel::<WorkerCommand>(WORKER_COMMAND_QUEUE_CAPACITY);
 
     let writer = tokio::spawn(async move {
         while let Some(message) = out_rx.recv().await {
@@ -181,14 +216,14 @@ pub async fn handle_socket(socket: WebSocket, state: AppState, correlation_id: S
                     sample_rate,
                     payload,
                 }) => {
-                    if worker_tx
-                        .send(WorkerCommand::AudioFrame {
+                    if !send_worker_command(
+                        &worker_tx,
+                        WorkerCommand::AudioFrame {
                             frame_seq,
                             sample_rate,
                             payload,
-                        })
-                        .is_err()
-                    {
+                        },
+                    ) {
                         break;
                     }
                 }
@@ -210,7 +245,7 @@ pub async fn handle_socket(socket: WebSocket, state: AppState, correlation_id: S
         }
     }
 
-    let _ = worker_tx.send(WorkerCommand::Shutdown);
+    let _ = send_worker_command(&worker_tx, WorkerCommand::Shutdown);
     let _ = worker.await;
 
     drop(out_tx);
@@ -218,8 +253,8 @@ pub async fn handle_socket(socket: WebSocket, state: AppState, correlation_id: S
 }
 
 fn handle_text_message(
-    out_tx: &mpsc::UnboundedSender<Message>,
-    worker_tx: &mpsc::UnboundedSender<WorkerCommand>,
+    out_tx: &OutboundTx,
+    worker_tx: &mpsc::Sender<WorkerCommand>,
     text: &str,
 ) -> bool {
     let event: ClientEvent = match serde_json::from_str(text) {
@@ -238,16 +273,16 @@ fn handle_text_message(
 
     match event {
         ClientEvent::SessionStart { model_id, language } => {
-            if worker_tx
-                .send(WorkerCommand::SessionStart { model_id, language })
-                .is_err()
-            {
+            if !send_worker_command(
+                worker_tx,
+                WorkerCommand::SessionStart { model_id, language },
+            ) {
                 return true;
             }
             false
         }
         ClientEvent::SessionStop => {
-            let _ = worker_tx.send(WorkerCommand::SessionStop);
+            let _ = send_worker_command(worker_tx, WorkerCommand::SessionStop);
             true
         }
         ClientEvent::Ping { timestamp_ms } => {
@@ -266,8 +301,8 @@ fn handle_text_message(
 async fn run_worker(
     state: AppState,
     correlation_id: String,
-    out_tx: mpsc::UnboundedSender<Message>,
-    mut worker_rx: mpsc::UnboundedReceiver<WorkerCommand>,
+    out_tx: OutboundTx,
+    mut worker_rx: mpsc::Receiver<WorkerCommand>,
 ) {
     let mut session = RealtimeSessionState::default();
     let mut ticker = tokio::time::interval(Duration::from_millis(120));
@@ -331,7 +366,7 @@ async fn run_worker(
 async fn handle_worker_command(
     state: &AppState,
     correlation_id: &str,
-    out_tx: &mpsc::UnboundedSender<Message>,
+    out_tx: &OutboundTx,
     session: &mut RealtimeSessionState,
     command: WorkerCommand,
 ) -> bool {
@@ -514,7 +549,7 @@ fn maybe_schedule_inference(
 }
 
 fn handle_inference_result(
-    out_tx: &mpsc::UnboundedSender<Message>,
+    out_tx: &OutboundTx,
     session: &mut RealtimeSessionState,
     pending: PendingInference,
     result: Result<Result<InferenceResult, String>, oneshot::error::RecvError>,
@@ -1043,8 +1078,19 @@ fn wav_bytes_from_pcm16_mono(samples_i16: &[i16], sample_rate: u32) -> Result<Ve
         .map_err(|err| format!("Failed to encode streamed WAV: {err}"))
 }
 
-fn send_json(tx: &mpsc::UnboundedSender<Message>, value: serde_json::Value) {
+fn send_json(tx: &OutboundTx, value: serde_json::Value) {
     let _ = tx.send(Message::Text(value.to_string().into()));
+}
+
+fn send_worker_command(tx: &mpsc::Sender<WorkerCommand>, command: WorkerCommand) -> bool {
+    match tx.try_send(command) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            warn!("transcription realtime worker command queue is full; dropping command");
+            false
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+    }
 }
 
 #[cfg(test)]

@@ -7,20 +7,22 @@ use std::time::Instant;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
+use crate::KernelPathTelemetrySnapshot;
 use crate::engine::{
-    engine_metric_catalog, prometheus_engine_metric_name, prometheus_engine_metric_type,
-    EngineMetricDescriptor, EngineOutput,
+    EngineMetricDescriptor, EngineOutput, engine_metric_catalog, prometheus_engine_metric_name,
+    prometheus_engine_metric_type,
 };
 use crate::models::shared::telemetry::{
     prometheus as kernel_path_prometheus, snapshot as kernel_path_telemetry_snapshot,
 };
-use crate::runtime::pipeline::{PipelineExecutionSummary, PipelineExecutor, PipelineGraph, PipelineKind};
-use crate::runtime::voice_metrics::{
-    prometheus_voice_metric_name, voice_metric_catalog, voice_metric_prometheus_contract,
-    VoiceMetricDescriptor, VOICE_BARGE_IN_TOTAL, VOICE_SESSION_CLOSED_TOTAL,
-    VOICE_SESSION_INTERRUPTED_TOTAL, VOICE_SESSION_STARTED_TOTAL,
+use crate::runtime::pipeline::{
+    PipelineExecutionSummary, PipelineExecutor, PipelineGraph, PipelineKind,
 };
-use crate::KernelPathTelemetrySnapshot;
+use crate::runtime::voice_metrics::{
+    VOICE_BARGE_IN_TOTAL, VOICE_SESSION_CLOSED_TOTAL, VOICE_SESSION_INTERRUPTED_TOTAL,
+    VOICE_SESSION_STARTED_TOTAL, VOICE_STREAM_BACKPRESSURE_TOTAL, VoiceMetricDescriptor,
+    prometheus_voice_metric_name, voice_metric_catalog, voice_metric_prometheus_contract,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VoiceRuntimeTelemetrySnapshot {
@@ -28,6 +30,7 @@ pub struct VoiceRuntimeTelemetrySnapshot {
     pub sessions_closed: u64,
     pub interruptions: u64,
     pub barge_ins: u64,
+    pub stream_backpressure_total: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -104,6 +107,7 @@ pub(crate) struct RuntimeTelemetryCollector {
     voice_sessions_closed: AtomicU64,
     voice_interruptions: AtomicU64,
     voice_barge_ins: AtomicU64,
+    voice_stream_backpressure: AtomicU64,
     broker_shadow_requests: AtomicU64,
     broker_execution_requests: AtomicU64,
     broker_validation_failures: AtomicU64,
@@ -133,6 +137,7 @@ impl RuntimeTelemetryCollector {
             voice_sessions_closed: AtomicU64::new(0),
             voice_interruptions: AtomicU64::new(0),
             voice_barge_ins: AtomicU64::new(0),
+            voice_stream_backpressure: AtomicU64::new(0),
             broker_shadow_requests: AtomicU64::new(0),
             broker_execution_requests: AtomicU64::new(0),
             broker_validation_failures: AtomicU64::new(0),
@@ -232,12 +237,18 @@ impl RuntimeTelemetryCollector {
         self.voice_barge_ins.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_voice_stream_backpressure(&self) {
+        self.voice_stream_backpressure
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_broker_shadow_request(&self) {
         self.broker_shadow_requests.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_broker_execution_request(&self) {
-        self.broker_execution_requests.fetch_add(1, Ordering::Relaxed);
+        self.broker_execution_requests
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_broker_validation_failure(&self) {
@@ -306,6 +317,7 @@ impl RuntimeTelemetryCollector {
                 sessions_closed: self.voice_sessions_closed.load(Ordering::Relaxed),
                 interruptions: self.voice_interruptions.load(Ordering::Relaxed),
                 barge_ins: self.voice_barge_ins.load(Ordering::Relaxed),
+                stream_backpressure_total: self.voice_stream_backpressure.load(Ordering::Relaxed),
             },
             broker: InferenceBrokerRuntimeTelemetrySnapshot {
                 shadow_requests: self.broker_shadow_requests.load(Ordering::Relaxed),
@@ -386,6 +398,12 @@ impl RuntimeTelemetryCollector {
             "Voice barge-in interruptions.",
             snapshot.voice.barge_ins,
         );
+        push_voice_counter(
+            &mut payload,
+            VOICE_STREAM_BACKPRESSURE_TOTAL,
+            "Runtime stream backpressure events.",
+            snapshot.voice.stream_backpressure_total,
+        );
         payload.push_str(&format!(
             "# TYPE izwi_inference_broker_shadow_requests_total counter\nizwi_inference_broker_shadow_requests_total {}\n\
 # TYPE izwi_inference_broker_execution_requests_total counter\nizwi_inference_broker_execution_requests_total {}\n\
@@ -462,20 +480,25 @@ mod tests {
         telemetry.record_voice_session_closed();
         telemetry.record_voice_interruption();
         telemetry.record_voice_barge_in();
+        telemetry.record_voice_stream_backpressure();
 
         let snapshot = telemetry.snapshot().await;
         assert_eq!(snapshot.voice.sessions_started, 1);
         assert_eq!(snapshot.voice.sessions_closed, 1);
         assert_eq!(snapshot.voice.interruptions, 1);
         assert_eq!(snapshot.voice.barge_ins, 1);
-        assert!(snapshot
-            .voice_metrics
-            .iter()
-            .any(|metric| metric.name == VOICE_SESSION_STARTED_TOTAL));
+        assert_eq!(snapshot.voice.stream_backpressure_total, 1);
+        assert!(
+            snapshot
+                .voice_metrics
+                .iter()
+                .any(|metric| metric.name == VOICE_SESSION_STARTED_TOTAL)
+        );
 
         let payload = telemetry.prometheus().await;
         assert!(payload.contains("izwi_voice_session_started_total 1"));
         assert!(payload.contains("izwi_voice_session_closed_total 1"));
+        assert!(payload.contains("izwi_voice_stream_backpressure_total 1"));
         assert!(payload.contains("izwi_voice_session_interruptions_total 1"));
         assert!(payload.contains("izwi_voice_barge_in_events_total 1"));
         assert!(payload.contains("izwi_voice_metric_contract_info"));
