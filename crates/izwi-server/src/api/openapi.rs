@@ -1921,6 +1921,48 @@ mod tests {
     }
 
     #[test]
+    fn openapi_documents_audio_processing_contract_routes() {
+        let contract: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../docs/audio-processing-contract.json"
+        ))
+        .expect("audio processing contract should parse");
+        let protected = contract["scope"]["protected_model_processing"]
+            .as_array()
+            .expect("protected model processing should be an array");
+        assert!(
+            protected.iter().any(|rule| {
+                rule.as_str() == Some("model_specific_feature_extraction_owned_by_model_adapters")
+            }),
+            "audio contract must protect model-specific feature extraction"
+        );
+
+        let openapi = serde_json::to_value(document()).expect("openapi should serialize");
+        let paths = openapi["paths"].as_object().expect("paths should exist");
+        let routes = contract["routes"]
+            .as_array()
+            .expect("contract routes should be an array");
+
+        for route in routes {
+            if route["openapi"].as_bool() != Some(true) {
+                continue;
+            }
+            let path = route["path"]
+                .as_str()
+                .expect("contract route path should be a string");
+            let method = route["method"]
+                .as_str()
+                .expect("contract route method should be a string");
+            assert!(
+                paths
+                    .get(path)
+                    .and_then(|operations| operations.get(method))
+                    .is_some(),
+                "{method} {path} from the audio contract should be documented"
+            );
+        }
+    }
+
+    #[test]
     fn openapi_marks_stable_and_preview_methods() {
         let openapi = serde_json::to_value(document()).expect("openapi should serialize");
         let paths = openapi["paths"].as_object().expect("paths should exist");

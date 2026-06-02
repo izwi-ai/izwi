@@ -1,0 +1,121 @@
+{
+  "version": "2026-06-02",
+  "scope": {
+    "purpose": "Production audio boundary contract for Izwi request ingestion, realtime transport, and output encoding.",
+    "protected_model_processing": [
+      "model_specific_feature_extraction_owned_by_model_adapters",
+      "model_specific_codec_paths_owned_by_model_adapters",
+      "model_specific_reference_audio_preprocessing_owned_by_model_adapters",
+      "model_specific_target_sample_rates_owned_by_model_adapters"
+    ],
+    "implementation_rule": "Shared ingestion may validate, decode, and record metadata, but must preserve PCM samples plus the original decoded sample rate for model-specific adapters unless a route already requires encoded bytes."
+  },
+  "limits": {
+    "openai_audio_default_upload_mb": 25,
+    "openai_audio_relaxed_upload_mb": 64,
+    "first_party_audio_upload_mb": 64
+  },
+  "ingress": {
+    "accepted_payload_shapes": [
+      "json.audio_base64",
+      "multipart.file",
+      "multipart.audio",
+      "multipart.audio_base64"
+    ],
+    "base64_policy": {
+      "accepts_raw_base64": true,
+      "accepts_data_urls": true,
+      "accepts_ascii_whitespace": true,
+      "invalid_or_empty_audio_is_bad_request": true
+    },
+    "metadata_policy": {
+      "track_source_mime": true,
+      "track_filename": true,
+      "track_decoded_sample_rate": true,
+      "track_decoded_channels": true,
+      "track_duration_seconds": true,
+      "track_byte_count": true
+    },
+    "decode_policy": {
+      "primary_decoder": "symphonia",
+      "wav_fallback": "hound",
+      "multi_channel_policy": "downmix_to_mono_by_averaging",
+      "sample_sanitization": "replace_non_finite_and_clamp_to_minus_one_plus_one"
+    }
+  },
+  "routes": [
+    {
+      "path": "/v1/audio/speech",
+      "method": "post",
+      "openapi": true,
+      "class": "openai_audio_tts",
+      "accepted_audio_inputs": [
+        "json.reference_audio.audio_base64",
+        "json.saved_voice_id"
+      ],
+      "default_output_format": "wav",
+      "native_output_formats": [
+        "wav",
+        "pcm_i16",
+        "pcm_f32"
+      ],
+      "compressed_output_policy": "rejected_unless_explicit_wav_fallback_is_allowed"
+    },
+    {
+      "path": "/v1/audio/transcriptions",
+      "method": "post",
+      "openapi": true,
+      "class": "openai_audio_asr",
+      "accepted_audio_inputs": [
+        "json.audio_base64",
+        "multipart.file",
+        "multipart.audio",
+        "multipart.audio_base64"
+      ],
+      "response_formats": [
+        "json",
+        "verbose_json",
+        "text",
+        "srt",
+        "vtt"
+      ]
+    },
+    {
+      "path": "/v1/audio/align",
+      "method": "post",
+      "openapi": true,
+      "class": "openai_audio_alignment",
+      "accepted_audio_inputs": [
+        "json.audio_base64",
+        "multipart.file",
+        "multipart.audio",
+        "multipart.audio_base64"
+      ],
+      "requires_text": true
+    },
+    {
+      "path": "/v1/speech-to-text/realtime/ws",
+      "method": "get",
+      "openapi": true,
+      "class": "realtime_transcription",
+      "binary_frame_magic": "ITRW",
+      "binary_sample_format": "pcm_i16"
+    },
+    {
+      "path": "/v1/voice/realtime/ws",
+      "method": "get",
+      "openapi": true,
+      "class": "realtime_voice",
+      "binary_frame_magic": "IVWS",
+      "binary_sample_format": "pcm_i16"
+    }
+  ],
+  "verification_gates": [
+    "payload_contract_tests_cover_raw_base64_data_urls_whitespace_multipart_invalid_and_missing_audio",
+    "format_fixtures_cover_common_codecs_channels_and_sample_rates",
+    "resampler_tests_cover_duration_sample_count_finite_output_and_antialiasing",
+    "realtime_tests_cover_binary_frames_backpressure_interrupt_and_disconnect",
+    "tts_tests_cover_sample_rate_headers_streaming_and_no_placeholder_audio",
+    "observability_tests_cover_ingest_metadata_without_audio_content_leakage"
+  ]
+}
