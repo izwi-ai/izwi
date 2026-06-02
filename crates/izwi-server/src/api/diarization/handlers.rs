@@ -1,9 +1,9 @@
 use axum::{
+    Json, RequestExt,
     body::Body,
     extract::{Extension, Multipart, Path, Query, Request, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    Json, RequestExt,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -11,10 +11,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::api::audio_payload::{
-    decode_base64_audio_payload, read_multipart_audio_base64_payload,
+    decode_base64_audio_payload, inspect_audio_payload, read_multipart_audio_base64_payload,
     read_multipart_audio_file_payload,
 };
-use crate::api::pagination::{encode_cursor, CursorPagination, CursorPaginationQuery};
+use crate::api::pagination::{CursorPagination, CursorPaginationQuery, encode_cursor};
 use crate::api::request_context::RequestContext;
 use crate::diarization_store::{
     CompleteDiarizationRecord, DiarizationProcessingStatus, DiarizationRecord,
@@ -25,8 +25,8 @@ use crate::diarization_store::{
 use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::{
-    parse_chat_model_variant, ChatMessage, ChatRole, DiarizationConfig, GenerationParams,
-    RuntimeService,
+    ChatMessage, ChatRole, DiarizationConfig, GenerationParams, RuntimeService,
+    parse_chat_model_variant,
 };
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
@@ -885,6 +885,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
             .map_err(|err| ApiError::bad_request(format!("Invalid JSON payload: {err}")))?;
 
         let audio_payload = decode_base64_audio_payload(payload.audio_base64.as_str())?;
+        inspect_audio_payload(&audio_payload)?;
         let audio_filename = sanitize_optional(payload.audio_filename);
         let audio_mime_type = sanitize_optional(payload.audio_mime_type)
             .or_else(|| audio_payload.content_type_hint().map(str::to_string))
@@ -935,6 +936,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
                     )
                     .await?
                     {
+                        inspect_audio_payload(&payload)?;
                         out.audio_mime_type = payload.source_mime_type;
                         out.audio_filename = payload.filename;
                         out.audio_bytes = payload.bytes;
@@ -944,6 +946,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
                     if let Some(payload) =
                         read_multipart_audio_base64_payload(field, "audio_base64").await?
                     {
+                        inspect_audio_payload(&payload)?;
                         if out.audio_mime_type.is_none() {
                             out.audio_mime_type = payload.content_type_hint().map(str::to_string);
                         }
@@ -1127,6 +1130,16 @@ fn audio_response(audio: StoredDiarizationAudio) -> Response {
 mod tests {
     use super::*;
     use axum::body::Body;
+    use base64::Engine as _;
+    use izwi_core::audio::{AudioEncoder, AudioFormat};
+
+    fn wav_data_url(content_type: &str) -> String {
+        let wav = AudioEncoder::new(16_000, 1)
+            .encode(&[0.0, 0.1, -0.1, 0.0], AudioFormat::Wav)
+            .expect("wav should encode");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(wav);
+        format!("data:{content_type};base64, {b64}\n")
+    }
 
     fn sample_record() -> DiarizationRecord {
         DiarizationRecord {
@@ -1182,7 +1195,7 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
                 serde_json::json!({
-                    "audio_base64": "data:audio/webm;base64, YXVk\naW8=",
+                    "audio_base64": wav_data_url("audio/wav"),
                     "model_id": "diar_streaming_sortformer_4spk-v2.1"
                 })
                 .to_string(),
@@ -1193,8 +1206,8 @@ mod tests {
             .await
             .expect("request should parse");
 
-        assert_eq!(parsed.audio_bytes, b"audio");
-        assert_eq!(parsed.audio_mime_type.as_deref(), Some("audio/webm"));
+        assert!(!parsed.audio_bytes.is_empty());
+        assert_eq!(parsed.audio_mime_type.as_deref(), Some("audio/wav"));
         assert_eq!(
             parsed.model_id.as_deref(),
             Some("diar_streaming_sortformer_4spk-v2.1")
