@@ -1,9 +1,9 @@
 use axum::{
+    Json,
     body::Body,
     extract::{Path, Query, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::Response,
-    Json,
 };
 use izwi_hooks::{HookMetadata, MediaNamespace};
 use serde::{Deserialize, Serialize};
@@ -12,10 +12,12 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-use crate::api::audio_payload::decode_base64_media_payload;
+use crate::api::audio_payload::{
+    decode_base64_media_payload, inspect_audio_payload_bytes, is_audio_content_type,
+};
 use crate::error::ApiError;
 use crate::persistence::{
-    delete_media_object, persist_audio_object, read_media_object, MediaStorageError,
+    MediaStorageError, delete_media_object, persist_audio_object, read_media_object,
 };
 use crate::state::AppState;
 use crate::storage_layout;
@@ -116,6 +118,9 @@ pub async fn create_media(
             }),
     )
     .ok_or_else(|| ApiError::bad_request("Invalid content_type"))?;
+    if is_audio_content_type(&content_type) {
+        inspect_audio_payload_bytes(&bytes)?;
+    }
     let namespace = sanitize_media_namespace(req.namespace.as_deref());
     let record_id = uuid::Uuid::new_v4().to_string();
     let filename = req.filename.as_deref().and_then(normalize_filename);

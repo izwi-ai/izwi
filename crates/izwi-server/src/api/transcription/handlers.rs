@@ -3,19 +3,19 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::{Extension, Multipart, Path, Request, State},
-    http::{header, HeaderValue, StatusCode},
-    response::{
-        sse::{Event, KeepAlive, Sse},
-        IntoResponse, Response,
-    },
     Json, RequestExt,
+    extract::{Extension, Multipart, Path, Request, State},
+    http::{HeaderValue, StatusCode, header},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::api::audio_payload::{
-    decode_base64_audio_payload, read_multipart_audio_base64_payload,
+    decode_base64_audio_payload, inspect_audio_payload, read_multipart_audio_base64_payload,
     read_multipart_audio_file_payload,
 };
 use crate::api::request_context::RequestContext;
@@ -27,7 +27,7 @@ use crate::transcription_store::{
     TranscriptionSummaryStatus, TranscriptionWordRecord, UpdateTranscriptionSummary,
 };
 use izwi_core::{
-    parse_chat_model_variant, ChatMessage, ChatRole, GenerationParams, RuntimeService,
+    ChatMessage, ChatRole, GenerationParams, RuntimeService, parse_chat_model_variant,
 };
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
@@ -535,6 +535,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
 
         let model_id = payload.model_id.or(payload.model);
         let audio_payload = decode_base64_audio_payload(payload.audio_base64.as_str())?;
+        inspect_audio_payload(&audio_payload)?;
         let audio_mime_type = audio_payload
             .content_type_hint()
             .map(str::to_string)
@@ -577,6 +578,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
                     )
                     .await?
                     {
+                        inspect_audio_payload(&payload)?;
                         out.audio_filename = payload.filename;
                         out.audio_mime_type = payload.source_mime_type;
                         out.audio_bytes = payload.bytes;
@@ -586,6 +588,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
                     if let Some(payload) =
                         read_multipart_audio_base64_payload(field, "audio_base64").await?
                     {
+                        inspect_audio_payload(&payload)?;
                         if out.audio_mime_type.is_none() {
                             out.audio_mime_type = payload.content_type_hint().map(str::to_string);
                         }
@@ -978,14 +981,24 @@ fn map_store_error(err: anyhow::Error) -> ApiError {
 mod tests {
     use axum::{
         body::Body,
-        http::{header, StatusCode},
+        http::{StatusCode, header},
     };
+    use base64::Engine as _;
+    use izwi_core::audio::{AudioEncoder, AudioFormat};
 
     use super::{
-        alignments_to_word_records, build_segment_records, initial_summary_state,
-        multipart_field_api_error, parse_bool, parse_create_request, sanitize_summary_output,
-        TranscriptionSummaryStatus, TranscriptionWordRecord,
+        TranscriptionSummaryStatus, TranscriptionWordRecord, alignments_to_word_records,
+        build_segment_records, initial_summary_state, multipart_field_api_error, parse_bool,
+        parse_create_request, sanitize_summary_output,
     };
+
+    fn wav_data_url(content_type: &str) -> String {
+        let wav = AudioEncoder::new(16_000, 1)
+            .encode(&[0.0, 0.1, -0.1, 0.0], AudioFormat::Wav)
+            .expect("wav should encode");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(wav);
+        format!("data:{content_type};base64, {b64}\n")
+    }
 
     #[tokio::test]
     async fn json_create_request_accepts_data_url_audio_and_uses_mime_hint() {
@@ -993,7 +1006,7 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
                 serde_json::json!({
-                    "audio_base64": "data:audio/webm;base64, YXVk\naW8=",
+                    "audio_base64": wav_data_url("audio/wav"),
                     "model": "Parakeet-TDT-0.6B-v3"
                 })
                 .to_string(),
@@ -1004,9 +1017,30 @@ mod tests {
             .await
             .expect("request should parse");
 
-        assert_eq!(parsed.audio_bytes, b"audio");
-        assert_eq!(parsed.audio_mime_type.as_deref(), Some("audio/webm"));
+        assert!(!parsed.audio_bytes.is_empty());
+        assert_eq!(parsed.audio_mime_type.as_deref(), Some("audio/wav"));
         assert_eq!(parsed.model_id.as_deref(), Some("Parakeet-TDT-0.6B-v3"));
+    }
+
+    #[tokio::test]
+    async fn json_create_request_rejects_undecodable_audio_before_queueing() {
+        let request = axum::http::Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "audio_base64": "YXVkaW8=",
+                    "model": "Parakeet-TDT-0.6B-v3"
+                })
+                .to_string(),
+            ))
+            .expect("request should build");
+
+        let err = parse_create_request(request)
+            .await
+            .expect_err("undecodable audio should fail before queueing");
+
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("failed to decode audio metadata"));
     }
 
     #[test]

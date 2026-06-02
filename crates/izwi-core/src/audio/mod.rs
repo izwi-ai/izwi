@@ -2,10 +2,12 @@
 
 mod codec;
 mod encoder;
+mod inspection;
 mod preprocessing;
 mod streaming;
 
 pub use codec::{AudioCodec, CodecConfig};
 pub use encoder::{AudioEncoder, AudioFormat};
+pub use inspection::{AudioInspection, inspect_audio_bytes};
 pub use preprocessing::{MelConfig, MelSpectrogram};
 pub use streaming::{AudioChunkBuffer, StreamingConfig};

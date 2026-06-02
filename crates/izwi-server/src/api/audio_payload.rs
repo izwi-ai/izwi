@@ -1,5 +1,6 @@
 use axum::extract::multipart::{Field, MultipartError};
 use base64::Engine;
+use izwi_core::audio::{AudioInspection, inspect_audio_bytes};
 
 use crate::api::speech_text_upload::multipart_upload_api_error;
 use crate::error::ApiError;
@@ -86,6 +87,26 @@ pub(crate) async fn read_multipart_audio_base64_payload(
         ))
     })?;
     decode_optional_base64_audio_payload(text.as_str())
+}
+
+pub(crate) fn inspect_audio_payload(payload: &AudioPayload) -> Result<AudioInspection, ApiError> {
+    inspect_audio_payload_bytes(&payload.bytes)
+}
+
+pub(crate) fn inspect_audio_payload_bytes(bytes: &[u8]) -> Result<AudioInspection, ApiError> {
+    inspect_audio_bytes(bytes).map_err(|err| {
+        ApiError::bad_request(format!(
+            "Invalid audio payload: failed to decode audio metadata: {err}"
+        ))
+    })
+}
+
+pub(crate) fn is_audio_content_type(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .map(str::trim)
+        .is_some_and(|value| value.to_ascii_lowercase().starts_with("audio/"))
 }
 
 pub(crate) fn split_data_url_base64(raw: &str) -> (Option<String>, &str) {
@@ -244,5 +265,13 @@ mod tests {
             .expect_err("invalid media payload should fail");
         assert!(err.message.contains("Invalid base64 media payload"));
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn detects_audio_content_types() {
+        assert!(is_audio_content_type("audio/webm;codecs=opus"));
+        assert!(is_audio_content_type(" AUDIO/WAV "));
+        assert!(!is_audio_content_type("video/mp4"));
+        assert!(!is_audio_content_type("application/octet-stream"));
     }
 }
