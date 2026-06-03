@@ -180,8 +180,8 @@ pub async fn create_record(
     Extension(ctx): Extension<RequestContext>,
     req: Request,
 ) -> Result<Response, ApiError> {
-    let parsed = parse_create_request(req).await?;
-    let placeholder = create_pending_record(&state, &parsed).await?;
+    let mut parsed = parse_create_request(req).await?;
+    let placeholder = create_pending_record(&state, &mut parsed).await?;
 
     if parsed.stream {
         return create_record_stream(state, parsed, placeholder, ctx.correlation_id).await;
@@ -248,7 +248,7 @@ async fn create_record_stream(
 
 async fn create_pending_record(
     state: &AppState,
-    parsed: &ParsedTranscriptionCreateRequest,
+    parsed: &mut ParsedTranscriptionCreateRequest,
 ) -> Result<TranscriptionRecord, ApiError> {
     state
         .transcription_store
@@ -266,7 +266,7 @@ async fn create_pending_record(
                 parsed.audio_filename.as_deref(),
             ),
             audio_filename: parsed.audio_filename.clone(),
-            audio_bytes: parsed.audio_bytes.clone(),
+            audio_bytes: std::mem::take(&mut parsed.audio_bytes),
             transcription: String::new(),
             segments: Vec::new(),
             words: Vec::new(),
@@ -336,8 +336,52 @@ fn spawn_transcription_processing_task(
         let aligner_model_id = parsed.aligner_model_id.clone();
         let requested_language = parsed.language.clone();
         let include_timestamps = parsed.include_timestamps;
-        let audio_bytes = parsed.audio_bytes;
         let correlation_id_ref = correlation_id.clone();
+        let audio_bytes = match transcription_store.get_audio(record_id.clone()).await {
+            Ok(Some(audio)) => audio.audio_bytes,
+            Ok(None) => {
+                let message = "Transcription audio payload not found".to_string();
+                let _ = transcription_store
+                    .update_processing_status(
+                        record_id.clone(),
+                        TranscriptionProcessingStatus::Failed,
+                        Some(message.clone()),
+                    )
+                    .await;
+                send_event(
+                    serde_json::to_string(&StreamErrorEvent {
+                        event: "error",
+                        error: message,
+                    })
+                    .unwrap_or_default(),
+                );
+                send_event(
+                    serde_json::to_string(&StreamDoneEvent { event: "done" }).unwrap_or_default(),
+                );
+                return;
+            }
+            Err(err) => {
+                let message = format!("Failed to read transcription audio payload: {err}");
+                let _ = transcription_store
+                    .update_processing_status(
+                        record_id.clone(),
+                        TranscriptionProcessingStatus::Failed,
+                        Some(message.clone()),
+                    )
+                    .await;
+                send_event(
+                    serde_json::to_string(&StreamErrorEvent {
+                        event: "error",
+                        error: message,
+                    })
+                    .unwrap_or_default(),
+                );
+                send_event(
+                    serde_json::to_string(&StreamDoneEvent { event: "done" }).unwrap_or_default(),
+                );
+                return;
+            }
+        };
 
         // Keep transcription processing unbounded by wall-clock timeout so
         // valid long jobs can finish and persist successfully.
@@ -585,8 +629,13 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
                     }
                 }
                 "audio_base64" => {
-                    if let Some(payload) =
-                        read_multipart_audio_base64_payload(field, "audio_base64").await?
+                    if let Some(payload) = read_multipart_audio_base64_payload(
+                        field,
+                        "Transcription",
+                        "audio_base64",
+                        AUDIO_UPLOAD_LIMIT_BYTES,
+                    )
+                    .await?
                     {
                         inspect_audio_payload_with_diagnostics("transcription.create", &payload)?;
                         if out.audio_mime_type.is_none() {

@@ -220,8 +220,8 @@ pub async fn rerun_record(
         .map_err(map_store_error)?
         .ok_or_else(|| ApiError::not_found("Diarization audio not found"))?;
 
-    let rerun_request = build_rerun_create_request(&source_record, source_audio, req);
-    let placeholder = create_pending_record(&state, &rerun_request).await?;
+    let mut rerun_request = build_rerun_create_request(&source_record, source_audio, req);
+    let placeholder = create_pending_record(&state, &mut rerun_request).await?;
     spawn_diarization_processing_task(
         state.runtime.clone(),
         state.diarization_store.clone(),
@@ -271,7 +271,7 @@ pub async fn create_record(
     Extension(ctx): Extension<RequestContext>,
     req: Request,
 ) -> Result<Response, ApiError> {
-    let parsed = parse_create_request(req).await?;
+    let mut parsed = parse_create_request(req).await?;
 
     if parsed.stream {
         return Err(ApiError::bad_request(
@@ -279,7 +279,7 @@ pub async fn create_record(
         ));
     }
 
-    let placeholder = create_pending_record(&state, &parsed).await?;
+    let placeholder = create_pending_record(&state, &mut parsed).await?;
     spawn_diarization_processing_task(
         state.runtime.clone(),
         state.diarization_store.clone(),
@@ -328,7 +328,7 @@ pub async fn regenerate_summary(
 
 async fn create_pending_record(
     state: &AppState,
-    parsed: &ParsedDiarizationCreateRequest,
+    parsed: &mut ParsedDiarizationCreateRequest,
 ) -> Result<DiarizationRecord, ApiError> {
     validate_speaker_bounds(parsed.min_speakers, parsed.max_speakers)?;
 
@@ -370,7 +370,7 @@ async fn create_pending_record(
                 parsed.audio_filename.as_deref(),
             ),
             audio_filename: parsed.audio_filename.clone(),
-            audio_bytes: parsed.audio_bytes.clone(),
+            audio_bytes: std::mem::take(&mut parsed.audio_bytes),
         })
         .await
         .map_err(map_store_error)
@@ -413,9 +413,34 @@ fn spawn_diarization_processing_task(
             )
             .await;
 
+        let audio_bytes = match diarization_store.get_audio(record_id.clone()).await {
+            Ok(Some(audio)) => audio.audio_bytes,
+            Ok(None) => {
+                let _ = diarization_store
+                    .update_processing_status(
+                        record_id,
+                        DiarizationProcessingStatus::Failed,
+                        Some("Diarization audio payload not found".to_string()),
+                    )
+                    .await;
+                return;
+            }
+            Err(err) => {
+                let _ = diarization_store
+                    .update_processing_status(
+                        record_id,
+                        DiarizationProcessingStatus::Failed,
+                        Some(format!("Failed to read diarization audio payload: {err}")),
+                    )
+                    .await;
+                return;
+            }
+        };
+
         match generate_diarization_artifacts(
             runtime.clone(),
             semaphore.clone(),
+            audio_bytes.as_slice(),
             &parsed,
             correlation_id.as_deref(),
         )
@@ -495,6 +520,7 @@ fn spawn_diarization_processing_task(
 async fn generate_diarization_artifacts(
     runtime: Arc<RuntimeService>,
     semaphore: Arc<tokio::sync::Semaphore>,
+    audio_bytes: &[u8],
     parsed: &ParsedDiarizationCreateRequest,
     _correlation_id: Option<&str>,
 ) -> Result<GeneratedDiarizationArtifacts, ApiError> {
@@ -504,7 +530,7 @@ async fn generate_diarization_artifacts(
     // long jobs can finish and persist successfully.
     let output = runtime
         .diarize_with_transcript_bytes(
-            parsed.audio_bytes.as_slice(),
+            audio_bytes,
             parsed.model_id.as_deref(),
             parsed.asr_model_id.as_deref(),
             parsed.aligner_model_id.as_deref(),
@@ -943,8 +969,13 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
                     }
                 }
                 "audio_base64" => {
-                    if let Some(payload) =
-                        read_multipart_audio_base64_payload(field, "audio_base64").await?
+                    if let Some(payload) = read_multipart_audio_base64_payload(
+                        field,
+                        "Diarization",
+                        "audio_base64",
+                        AUDIO_UPLOAD_LIMIT_BYTES,
+                    )
+                    .await?
                     {
                         inspect_audio_payload_with_diagnostics("diarization.create", &payload)?;
                         if out.audio_mime_type.is_none() {
