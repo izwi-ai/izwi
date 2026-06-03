@@ -13,8 +13,8 @@ use utoipa::ToSchema;
 
 use super::resolve_audio_upload_limit_bytes;
 use crate::api::audio_payload::{
-    AudioPayload, decode_base64_audio_payload, read_multipart_audio_base64_payload,
-    read_multipart_audio_file_payload,
+    AudioPayload, decode_base64_audio_payload, inspect_audio_payload_with_diagnostics,
+    read_multipart_audio_base64_payload, read_multipart_audio_file_payload,
 };
 use crate::api::speech_text_upload::multipart_upload_api_error;
 use crate::error::ApiError;
@@ -157,6 +157,7 @@ async fn parse_alignment_request(req: Request) -> Result<AlignmentRequest, ApiEr
             .await
             .map_err(|e| ApiError::bad_request(format!("Invalid JSON payload: {e}")))?;
         let audio_payload = decode_base64_audio_payload(payload.audio_base64.as_str())?;
+        inspect_audio_payload_with_diagnostics("openai.audio.align", &audio_payload)?;
 
         return Ok(AlignmentRequest {
             audio: Some(audio_payload),
@@ -190,6 +191,7 @@ async fn parse_alignment_request(req: Request) -> Result<AlignmentRequest, ApiEr
                     )
                     .await?
                     {
+                        inspect_audio_payload_with_diagnostics("openai.audio.align", &payload)?;
                         out.audio = Some(payload);
                     }
                 }
@@ -202,6 +204,7 @@ async fn parse_alignment_request(req: Request) -> Result<AlignmentRequest, ApiEr
                     )
                     .await?
                     {
+                        inspect_audio_payload_with_diagnostics("openai.audio.align", &payload)?;
                         out.audio = Some(payload);
                     }
                 }
@@ -313,6 +316,16 @@ fn format_alignment_text(words: &[AlignmentWord]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+    use izwi_core::audio::{AudioEncoder, AudioFormat};
+
+    fn wav_data_url() -> String {
+        let wav = AudioEncoder::new(16_000, 1)
+            .encode(&[0.0, 0.1, -0.1, 0.0], AudioFormat::Wav)
+            .expect("wav should encode");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(wav);
+        format!("data:audio/wav;base64, {b64}\n")
+    }
 
     #[tokio::test]
     async fn parse_json_request_canonicalizes_data_url_audio() {
@@ -320,7 +333,7 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
                 serde_json::json!({
-                    "audio_base64": "data:audio/wav;base64, YXVk\naW8=",
+                    "audio_base64": wav_data_url(),
                     "text": "audio"
                 })
                 .to_string(),
@@ -332,10 +345,30 @@ mod tests {
             .expect("request should parse");
 
         let audio = parsed.audio.expect("audio payload should parse");
-        assert_eq!(audio.bytes, b"audio");
-        assert_eq!(audio.to_base64(), "YXVkaW8=");
+        assert!(audio.bytes.starts_with(b"RIFF"));
         assert_eq!(audio.data_url_mime_type.as_deref(), Some("audio/wav"));
         assert_eq!(parsed.text.as_deref(), Some("audio"));
+    }
+
+    #[tokio::test]
+    async fn parse_json_request_rejects_undecodable_audio() {
+        let request = Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "audio_base64": "data:audio/wav;base64, YXVk\naW8=",
+                    "text": "audio"
+                })
+                .to_string(),
+            ))
+            .expect("request should build");
+
+        let err = parse_alignment_request(request)
+            .await
+            .expect_err("invalid audio should fail");
+
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("Invalid audio payload"));
     }
 
     #[test]
