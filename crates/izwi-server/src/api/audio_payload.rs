@@ -1,4 +1,7 @@
-use axum::extract::multipart::{Field, MultipartError};
+use axum::{
+    extract::multipart::{Field, MultipartError},
+    http::StatusCode,
+};
 use base64::Engine;
 use izwi_core::audio::{AudioInspection, inspect_audio_bytes};
 use serde::Serialize;
@@ -53,6 +56,7 @@ impl AudioPayload {
             .or(self.data_url_mime_type.as_deref())
     }
 
+    #[cfg(test)]
     pub(crate) fn to_base64(&self) -> String {
         base64::engine::general_purpose::STANDARD.encode(&self.bytes)
     }
@@ -76,36 +80,61 @@ pub(crate) fn decode_optional_base64_audio_payload(
 }
 
 pub(crate) async fn read_multipart_audio_file_payload(
-    field: Field<'_>,
+    mut field: Field<'_>,
     route_label: &str,
     field_name: &str,
     limit_bytes: usize,
 ) -> Result<Option<AudioPayload>, ApiError> {
     let source_mime_type = field.content_type().map(str::to_string);
     let filename = field.file_name().map(str::to_string);
-    let bytes = field
-        .bytes()
+    let mut bytes = Vec::new();
+    while let Some(chunk) = field
+        .chunk()
         .await
-        .map_err(|err| multipart_audio_error(route_label, field_name, limit_bytes, err))?;
+        .map_err(|err| multipart_audio_error(route_label, field_name, limit_bytes, err))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > limit_bytes {
+            return Err(audio_field_too_large(route_label, field_name, limit_bytes));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     if bytes.is_empty() {
         return Ok(None);
     }
     Ok(Some(AudioPayload::from_bytes(
-        bytes.to_vec(),
+        bytes,
         source_mime_type,
         filename,
     )))
 }
 
 pub(crate) async fn read_multipart_audio_base64_payload(
-    field: Field<'_>,
+    mut field: Field<'_>,
+    route_label: &str,
     field_name: &str,
+    decoded_limit_bytes: usize,
 ) -> Result<Option<AudioPayload>, ApiError> {
-    let text = field.text().await.map_err(|err| {
-        ApiError::bad_request(format!(
-            "Failed reading multipart '{field_name}' field: {err}"
-        ))
-    })?;
+    let encoded_limit_bytes = encoded_base64_limit_bytes(decoded_limit_bytes);
+    let mut text = String::new();
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|err| multipart_audio_error(route_label, field_name, encoded_limit_bytes, err))?
+    {
+        if text.len().saturating_add(chunk.len()) > encoded_limit_bytes {
+            return Err(audio_field_too_large(
+                route_label,
+                field_name,
+                encoded_limit_bytes,
+            ));
+        }
+        let chunk_text = std::str::from_utf8(&chunk).map_err(|_| {
+            ApiError::bad_request(format!(
+                "Invalid multipart '{field_name}' field: expected UTF-8 base64 text"
+            ))
+        })?;
+        text.push_str(chunk_text);
+    }
     decode_optional_base64_audio_payload(text.as_str())
 }
 
@@ -288,6 +317,23 @@ fn multipart_audio_error(
         err.status(),
         err.body_text(),
     )
+}
+
+fn audio_field_too_large(route_label: &str, field_name: &str, limit_bytes: usize) -> ApiError {
+    multipart_upload_api_error(
+        route_label,
+        field_name,
+        limit_bytes,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "field exceeded configured audio upload limit",
+    )
+}
+
+fn encoded_base64_limit_bytes(decoded_limit_bytes: usize) -> usize {
+    decoded_limit_bytes
+        .saturating_mul(4)
+        .saturating_div(3)
+        .saturating_add(8 * 1024)
 }
 
 fn strip_data_url_prefix(raw: &str) -> Option<&str> {

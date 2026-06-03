@@ -1,11 +1,11 @@
 //! Forced alignment audio endpoint.
 
 use axum::{
+    Json, RequestExt,
     body::Body,
     extract::{Multipart, Request, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::Response,
-    Json, RequestExt,
 };
 use serde::Serialize;
 use std::time::Instant;
@@ -13,7 +13,7 @@ use utoipa::ToSchema;
 
 use super::resolve_audio_upload_limit_bytes;
 use crate::api::audio_payload::{
-    decode_base64_audio_payload, read_multipart_audio_base64_payload,
+    AudioPayload, decode_base64_audio_payload, read_multipart_audio_base64_payload,
     read_multipart_audio_file_payload,
 };
 use crate::api::speech_text_upload::multipart_upload_api_error;
@@ -22,7 +22,7 @@ use crate::state::AppState;
 
 #[derive(Debug, Default)]
 struct AlignmentRequest {
-    audio_base64: Option<String>,
+    audio: Option<AudioPayload>,
     text: Option<String>,
     model: Option<String>,
     language: Option<String>,
@@ -77,8 +77,8 @@ pub async fn align(
     req: Request,
 ) -> Result<Response<Body>, ApiError> {
     let mut req = parse_alignment_request(req).await?;
-    let audio_base64 = req
-        .audio_base64
+    let audio = req
+        .audio
         .take()
         .ok_or_else(|| ApiError::bad_request("Missing audio input (`file` or `audio_base64`)"))?;
     let text = req
@@ -103,8 +103,8 @@ pub async fn align(
     let started = Instant::now();
     let raw_alignments = state
         .runtime
-        .force_align_with_model_and_language(
-            audio_base64.as_str(),
+        .force_align_bytes_with_model_and_language(
+            audio.bytes.as_slice(),
             text.as_str(),
             req.language.as_deref(),
             req.model.as_deref(),
@@ -159,7 +159,7 @@ async fn parse_alignment_request(req: Request) -> Result<AlignmentRequest, ApiEr
         let audio_payload = decode_base64_audio_payload(payload.audio_base64.as_str())?;
 
         return Ok(AlignmentRequest {
-            audio_base64: Some(audio_payload.to_base64()),
+            audio: Some(audio_payload),
             text: Some(payload.text),
             model: payload.model,
             language: payload.language,
@@ -190,14 +190,19 @@ async fn parse_alignment_request(req: Request) -> Result<AlignmentRequest, ApiEr
                     )
                     .await?
                     {
-                        out.audio_base64 = Some(payload.to_base64());
+                        out.audio = Some(payload);
                     }
                 }
                 "audio_base64" => {
-                    if let Some(payload) =
-                        read_multipart_audio_base64_payload(field, "audio_base64").await?
+                    if let Some(payload) = read_multipart_audio_base64_payload(
+                        field,
+                        "OpenAI-compatible audio",
+                        "audio_base64",
+                        resolve_audio_upload_limit_bytes(),
+                    )
+                    .await?
                     {
-                        out.audio_base64 = Some(payload.to_base64());
+                        out.audio = Some(payload);
                     }
                 }
                 "text" | "reference_text" => {
@@ -326,7 +331,10 @@ mod tests {
             .await
             .expect("request should parse");
 
-        assert_eq!(parsed.audio_base64.as_deref(), Some("YXVkaW8="));
+        let audio = parsed.audio.expect("audio payload should parse");
+        assert_eq!(audio.bytes, b"audio");
+        assert_eq!(audio.to_base64(), "YXVkaW8=");
+        assert_eq!(audio.data_url_mime_type.as_deref(), Some("audio/wav"));
         assert_eq!(parsed.text.as_deref(), Some("audio"));
     }
 

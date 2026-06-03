@@ -313,6 +313,26 @@ impl RuntimeService {
         prompt: Option<&str>,
         correlation_id: Option<&str>,
     ) -> Result<AsrTranscription> {
+        self.asr_transcribe_bytes_with_variant_and_prompt_options(
+            variant,
+            audio_bytes,
+            language,
+            prompt,
+            None,
+            correlation_id,
+        )
+        .await
+    }
+
+    pub(crate) async fn asr_transcribe_bytes_with_variant_and_prompt_options(
+        &self,
+        variant: ModelVariant,
+        audio_bytes: &[u8],
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_tokens: Option<usize>,
+        correlation_id: Option<&str>,
+    ) -> Result<AsrTranscription> {
         if variant.is_audio_chat() {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
             return self
@@ -326,7 +346,7 @@ impl RuntimeService {
                 AsrAudioInput::Bytes(audio_bytes),
                 language,
                 prompt,
-                None,
+                max_tokens,
                 correlation_id,
             )
             .await?;
@@ -370,6 +390,31 @@ impl RuntimeService {
         language: Option<&str>,
         prompt: Option<&str>,
         correlation_id: Option<&str>,
+        on_delta: F,
+    ) -> Result<AsrTranscription>
+    where
+        F: FnMut(String) + Send + 'static,
+    {
+        self.asr_transcribe_bytes_with_variant_streaming_and_prompt_options(
+            variant,
+            audio_bytes,
+            language,
+            prompt,
+            None,
+            correlation_id,
+            on_delta,
+        )
+        .await
+    }
+
+    pub(crate) async fn asr_transcribe_bytes_with_variant_streaming_and_prompt_options<F>(
+        &self,
+        variant: ModelVariant,
+        audio_bytes: &[u8],
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_tokens: Option<usize>,
+        correlation_id: Option<&str>,
         mut on_delta: F,
     ) -> Result<AsrTranscription>
     where
@@ -388,7 +433,7 @@ impl RuntimeService {
                 AsrAudioInput::Bytes(audio_bytes),
                 language,
                 prompt,
-                None,
+                max_tokens,
                 correlation_id,
             )
             .await?;
@@ -548,6 +593,27 @@ impl RuntimeService {
         .await
     }
 
+    pub async fn asr_transcribe_bytes_with_prompt_max_tokens_and_correlation(
+        &self,
+        audio_bytes: &[u8],
+        model_id: Option<&str>,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_tokens: Option<usize>,
+        correlation_id: Option<&str>,
+    ) -> Result<AsrTranscription> {
+        let variant = resolve_asr_model_variant(model_id);
+        self.asr_transcribe_bytes_with_variant_and_prompt_options(
+            variant,
+            audio_bytes,
+            language,
+            prompt,
+            max_tokens,
+            correlation_id,
+        )
+        .await
+    }
+
     /// Transcribe audio and emit deltas.
     pub async fn asr_transcribe_streaming<F>(
         &self,
@@ -703,6 +769,32 @@ impl RuntimeService {
             audio_bytes,
             language,
             prompt,
+            correlation_id,
+            on_delta,
+        )
+        .await
+    }
+
+    pub async fn asr_transcribe_streaming_bytes_with_prompt_max_tokens_and_correlation<F>(
+        &self,
+        audio_bytes: &[u8],
+        model_id: Option<&str>,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_tokens: Option<usize>,
+        correlation_id: Option<&str>,
+        on_delta: F,
+    ) -> Result<AsrTranscription>
+    where
+        F: FnMut(String) + Send + 'static,
+    {
+        let variant = resolve_asr_model_variant(model_id);
+        self.asr_transcribe_bytes_with_variant_streaming_and_prompt_options(
+            variant,
+            audio_bytes,
+            language,
+            prompt,
+            max_tokens,
             correlation_id,
             on_delta,
         )

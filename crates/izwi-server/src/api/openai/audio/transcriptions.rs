@@ -1,14 +1,14 @@
 //! OpenAI-compatible transcription endpoints.
 
 use axum::{
+    Json, RequestExt,
     body::Body,
     extract::{Extension, Multipart, Request, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{
-        sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
     },
-    Json, RequestExt,
 };
 use std::convert::Infallible;
 use std::time::Instant;
@@ -17,7 +17,7 @@ use tracing::{debug, info};
 
 use super::resolve_audio_upload_limit_bytes;
 use crate::api::audio_payload::{
-    decode_base64_audio_payload, read_multipart_audio_base64_payload,
+    AudioPayload, decode_base64_audio_payload, read_multipart_audio_base64_payload,
     read_multipart_audio_file_payload,
 };
 use crate::api::request_context::RequestContext;
@@ -28,7 +28,7 @@ use izwi_core::parse_model_variant;
 
 #[derive(Debug, Default)]
 struct TranscriptionRequest {
-    audio_base64: Option<String>,
+    audio: Option<AudioPayload>,
     model: Option<String>,
     aligner_model: Option<String>,
     language: Option<String>,
@@ -118,16 +118,20 @@ pub async fn transcriptions(
 ) -> Result<Response<Body>, ApiError> {
     let mut req = parse_transcription_request(req).await?;
     validate_transcription_model(req.model.as_deref())?;
-    let audio_base64 = req
-        .audio_base64
+    let audio = req
+        .audio
         .take()
         .ok_or_else(|| ApiError::bad_request("Missing audio input (`file` or `audio_base64`)"))?;
 
-    info!("OpenAI transcription request: {} bytes", audio_base64.len());
+    info!(
+        "OpenAI transcription request: {} source bytes",
+        audio.bytes.len()
+    );
 
     if req.stream {
-        return transcriptions_stream(state, req, audio_base64, ctx.correlation_id).await;
+        return transcriptions_stream(state, req, audio, ctx.correlation_id).await;
     }
+    let audio_bytes = audio.bytes;
 
     let response_format = req
         .response_format
@@ -146,8 +150,8 @@ pub async fn transcriptions(
     let started = Instant::now();
     let output = state
         .runtime
-        .asr_transcribe_with_prompt_max_tokens_and_correlation(
-            &audio_base64,
+        .asr_transcribe_bytes_with_prompt_max_tokens_and_correlation(
+            audio_bytes.as_slice(),
             req.model.as_deref(),
             req.language.as_deref(),
             req.prompt.as_deref(),
@@ -170,8 +174,8 @@ pub async fn transcriptions(
     {
         let alignments = state
             .runtime
-            .force_align_with_model_and_language(
-                &audio_base64,
+            .force_align_bytes_with_model_and_language(
+                audio_bytes.as_slice(),
                 output.text.as_str(),
                 output.language.as_deref().or(req.language.as_deref()),
                 req.aligner_model.as_deref(),
@@ -194,8 +198,8 @@ pub async fn transcriptions(
         if subtitle_segments.is_none() {
             match state
                 .runtime
-                .force_align_with_model_and_language(
-                    &audio_base64,
+                .force_align_bytes_with_model_and_language(
+                    audio_bytes.as_slice(),
                     output.text.as_str(),
                     output.language.as_deref().or(req.language.as_deref()),
                     req.aligner_model.as_deref(),
@@ -281,13 +285,14 @@ pub async fn transcriptions(
 async fn transcriptions_stream(
     state: AppState,
     req: TranscriptionRequest,
-    audio_base64: String,
+    audio: AudioPayload,
     correlation_id: String,
 ) -> Result<Response<Body>, ApiError> {
     let model = req.model;
     let language = req.language;
     let prompt = req.prompt;
     let max_tokens = req.max_tokens;
+    let audio_bytes = audio.bytes;
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<String>();
     let engine = state.runtime.clone();
@@ -306,8 +311,8 @@ async fn transcriptions_stream(
         // Keep transcription streaming unbounded by wall-clock timeout so valid
         // long jobs are not cut off mid-flight.
         let result = engine
-            .asr_transcribe_streaming_with_prompt_max_tokens_and_correlation(
-                &audio_base64,
+            .asr_transcribe_streaming_bytes_with_prompt_max_tokens_and_correlation(
+                audio_bytes.as_slice(),
                 model.as_deref(),
                 language.as_deref(),
                 prompt.as_deref(),
@@ -396,7 +401,7 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
         let audio_payload = decode_base64_audio_payload(payload.audio_base64.as_str())?;
 
         return Ok(TranscriptionRequest {
-            audio_base64: Some(audio_payload.to_base64()),
+            audio: Some(audio_payload),
             model: payload.model,
             aligner_model: payload.aligner_model,
             language: payload.language,
@@ -433,14 +438,19 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
                     )
                     .await?
                     {
-                        out.audio_base64 = Some(payload.to_base64());
+                        out.audio = Some(payload);
                     }
                 }
                 "audio_base64" => {
-                    if let Some(payload) =
-                        read_multipart_audio_base64_payload(field, "audio_base64").await?
+                    if let Some(payload) = read_multipart_audio_base64_payload(
+                        field,
+                        "OpenAI-compatible audio",
+                        "audio_base64",
+                        resolve_audio_upload_limit_bytes(),
+                    )
+                    .await?
                     {
-                        out.audio_base64 = Some(payload.to_base64());
+                        out.audio = Some(payload);
                     }
                 }
                 "model" => {
@@ -925,7 +935,10 @@ mod tests {
             .await
             .expect("request should parse");
 
-        assert_eq!(parsed.audio_base64.as_deref(), Some("YXVkaW8="));
+        let audio = parsed.audio.expect("audio payload should parse");
+        assert_eq!(audio.bytes, b"audio");
+        assert_eq!(audio.to_base64(), "YXVkaW8=");
+        assert_eq!(audio.data_url_mime_type.as_deref(), Some("audio/wav"));
         assert_eq!(parsed.model.as_deref(), Some("Parakeet-TDT-0.6B-v3"));
     }
 
