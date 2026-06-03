@@ -2217,7 +2217,41 @@ impl ModelBackend for IzwiRuntimeBackend {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use axum::extract::ws::Message;
+    use izwi_core::{EngineConfig, RuntimeService};
+    use tokio::sync::mpsc;
+
     use super::*;
+
+    #[tokio::test]
+    async fn outbound_tx_drops_full_queue_and_records_backpressure() {
+        let runtime = Arc::new(RuntimeService::new(EngineConfig::default()).expect("runtime"));
+        let before = runtime
+            .telemetry_snapshot()
+            .await
+            .voice
+            .stream_backpressure_total;
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(Message::Text("occupied".into()))
+            .expect("queue should accept first message");
+        let outbound = OutboundTx::new(tx, runtime.clone(), "voice test");
+
+        assert!(!outbound.send(Message::Text("dropped".into())));
+
+        let after = runtime
+            .telemetry_snapshot()
+            .await
+            .voice
+            .stream_backpressure_total;
+        assert_eq!(after, before + 1);
+        assert!(rx.try_recv().is_ok());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
 
     #[test]
     fn stream_vad_threshold_uses_score_values_directly() {
