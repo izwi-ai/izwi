@@ -31,6 +31,7 @@ use izwi_core::{
 
 const HISTORY_LIST_LIMIT: usize = 200;
 const DEFAULT_STREAM_EVENT_QUEUE_CAPACITY: usize = 32;
+const STREAM_CLIENT_DISCONNECTED_MESSAGE: &str = "Streaming client disconnected before completion";
 
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct RecordAudioQuery {
@@ -739,6 +740,7 @@ async fn stream_record_creation(
         .await
         .is_err()
         {
+            mark_failed(STREAM_CLIENT_DISCONNECTED_MESSAGE.to_string()).await;
             return;
         }
 
@@ -868,6 +870,9 @@ async fn stream_record_creation(
             drop(chunk_rx);
             let generation_outcome = generation_task.await;
             if encoding_failed || stream_closed {
+                if stream_closed && failure_message.is_none() {
+                    failure_message = Some(STREAM_CLIENT_DISCONNECTED_MESSAGE.to_string());
+                }
                 let _ = generation_outcome;
                 failed = true;
                 break;
@@ -889,9 +894,7 @@ async fn stream_record_creation(
         }
 
         if failed {
-            if let Some(message) = failure_message {
-                mark_failed(message).await;
-            }
+            mark_failed(stream_terminal_failure_message(failure_message)).await;
         } else {
             let generation_time_ms = stream_started.elapsed().as_secs_f32() * 1000.0;
             if total_tokens == 0 {
@@ -1326,6 +1329,10 @@ fn default_audio_filename(route_kind: SpeechRouteKind, extension: &str) -> Strin
     format!("{prefix}-{}.{}", uuid::Uuid::new_v4().simple(), extension)
 }
 
+fn stream_terminal_failure_message(message: Option<String>) -> String {
+    message.unwrap_or_else(|| STREAM_CLIENT_DISCONNECTED_MESSAGE.to_string())
+}
+
 fn to_stream_json(event: SpeechStreamEvent) -> String {
     serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string())
 }
@@ -1368,6 +1375,18 @@ mod tests {
         );
         assert_eq!(normalized.text.as_deref(), Some("Hello there"));
         assert_eq!(normalized.saved_voice_id.as_deref(), Some("voice-1"));
+    }
+
+    #[test]
+    fn stream_terminal_failure_message_defaults_to_client_disconnect() {
+        assert_eq!(
+            stream_terminal_failure_message(None),
+            STREAM_CLIENT_DISCONNECTED_MESSAGE
+        );
+        assert_eq!(
+            stream_terminal_failure_message(Some("encoder failed".to_string())),
+            "encoder failed"
+        );
     }
 
     #[test]
