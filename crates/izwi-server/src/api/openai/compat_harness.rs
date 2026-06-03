@@ -8,6 +8,8 @@ use axum::{
     http::{Method, Request, StatusCode},
     response::Response,
 };
+use base64::Engine as _;
+use izwi_core::audio::{AudioEncoder, AudioFormat};
 use izwi_core::{RuntimeService, ServeRuntimeConfig};
 use serde::Deserialize;
 use tower::Service;
@@ -89,6 +91,13 @@ fn build_json_request(method: Method, path: &str, body: &str) -> Request<Body> {
         .header("content-type", "application/json")
         .body(Body::from(body.to_owned()))
         .expect("request should build")
+}
+
+fn valid_wav_base64() -> String {
+    let wav = AudioEncoder::new(16_000, 1)
+        .encode(&[0.0, 0.1, -0.1, 0.0], AudioFormat::Wav)
+        .expect("wav should encode");
+    base64::engine::general_purpose::STANDARD.encode(wav)
 }
 
 fn test_ui_dir(name: &str) -> PathBuf {
@@ -264,13 +273,15 @@ fn audio_streaming_contract_lists_required_events() {
 #[tokio::test]
 async fn transcriptions_unknown_model_returns_openai_error_envelope() {
     let (app, _temp_dir) = test_api_app("transcriptions-unknown-model");
+    let audio_base64 = valid_wav_base64();
+    let body = serde_json::json!({
+        "audio_base64": audio_base64,
+        "model": "not-a-real-model"
+    })
+    .to_string();
     let response = send_request(
         app,
-        build_json_request(
-            Method::POST,
-            "/v1/audio/transcriptions",
-            r#"{"audio_base64":"UklGRg==","model":"not-a-real-model"}"#,
-        ),
+        build_json_request(Method::POST, "/v1/audio/transcriptions", body.as_str()),
     )
     .await;
 
