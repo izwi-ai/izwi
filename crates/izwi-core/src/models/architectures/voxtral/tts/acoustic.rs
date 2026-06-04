@@ -517,6 +517,7 @@ impl TimeEmbedding {
     }
 
     fn forward(&self, t: &Tensor) -> Result<Tensor> {
+        let t = t.to_dtype(self.inv_freq.dtype())?;
         let emb = t.matmul(&self.inv_freq.unsqueeze(0)?)?;
         Tensor::cat(&[emb.cos()?, emb.sin()?], 1).map_err(Error::from)
     }
@@ -947,6 +948,21 @@ mod tests {
             output.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             vec![2.0; 12]
         );
+    }
+
+    #[test]
+    fn time_embedding_accepts_bf16_step_values() {
+        let device = Device::Cpu;
+        let embedding = TimeEmbedding::new(4, 10000.0, &device).unwrap();
+        let t = Tensor::from_vec(vec![0.0f32], (1, 1), &device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+
+        let output = embedding.forward(&t).unwrap();
+
+        assert_eq!(output.dtype(), DType::F32);
+        assert_eq!(output.dims(), &[1, 4]);
     }
 
     #[test]
