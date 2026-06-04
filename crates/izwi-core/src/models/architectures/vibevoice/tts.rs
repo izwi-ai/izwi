@@ -155,12 +155,14 @@ struct VibeVoiceDiffusionPlan {
     scheduler: VibeVoiceDiffusionScheduler,
     cfg_tensor: Option<Tensor>,
     batch_cfg_prediction: bool,
+    cuda_prebatched_cfg: bool,
     steps: Vec<VibeVoiceDiffusionPlanStep>,
 }
 
 struct VibeVoiceDiffusionPlanStep {
     tensors: VibeVoiceDiffusionStepTensors,
     timestep_embedding: Tensor,
+    cuda_batched_timestep_embedding: Option<Tensor>,
 }
 
 struct LatentNormalization {
@@ -653,6 +655,14 @@ impl VibeVoiceTtsModel {
         } else {
             None
         };
+        let cuda_batched_conditions = if plan.cuda_prebatched_cfg {
+            negative_condition
+                .as_ref()
+                .map(|negative| Tensor::cat(&[condition.clone(), negative.clone()], 0))
+                .transpose()?
+        } else {
+            None
+        };
         let mut speech = Tensor::randn(
             0f32,
             1f32,
@@ -664,7 +674,18 @@ impl VibeVoiceTtsModel {
             let model_output = if let (Some(negative_condition), Some(cfg)) =
                 (negative_condition.as_ref(), plan.cfg_tensor.as_ref())
             {
-                if plan.batch_cfg_prediction {
+                if let (Some(batched_conditions), Some(batched_timestep_embedding)) = (
+                    cuda_batched_conditions.as_ref(),
+                    step.cuda_batched_timestep_embedding.as_ref(),
+                ) {
+                    let latents = Tensor::cat(&[speech.clone(), speech.clone()], 0)?;
+                    self.prediction_head.forward_cfg_batched_with_prebatched(
+                        &latents,
+                        batched_timestep_embedding,
+                        batched_conditions,
+                        cfg,
+                    )?
+                } else if plan.batch_cfg_prediction {
                     self.prediction_head.forward_cfg_batched_with_precomputed(
                         &speech,
                         &step.timestep_embedding,
@@ -747,15 +768,27 @@ fn vibevoice_diffusion_plan(
     cfg_scale: f32,
     device_kind: DeviceKind,
 ) -> Result<VibeVoiceDiffusionPlan> {
+    let batch_cfg_prediction = vibevoice_cfg_batching_enabled(device_kind);
+    let cfg_enabled = cfg_scale > 1.0;
+    let cuda_prebatched_cfg = cfg_enabled && batch_cfg_prediction && device_kind.is_cuda();
     let steps = scheduler
         .step_tensors(device, dtype)?
         .into_iter()
         .map(|tensors| {
             let timestep_embedding =
                 prediction_head.timestep_embedding(&tensors.timestep_tensor)?;
+            let cuda_batched_timestep_embedding = if cuda_prebatched_cfg {
+                Some(Tensor::cat(
+                    &[timestep_embedding.clone(), timestep_embedding.clone()],
+                    0,
+                )?)
+            } else {
+                None
+            };
             Ok(VibeVoiceDiffusionPlanStep {
                 tensors,
                 timestep_embedding,
+                cuda_batched_timestep_embedding,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -766,7 +799,8 @@ fn vibevoice_diffusion_plan(
         } else {
             None
         },
-        batch_cfg_prediction: vibevoice_cfg_batching_enabled(device_kind),
+        batch_cfg_prediction,
+        cuda_prebatched_cfg,
         steps,
     })
 }
@@ -1015,6 +1049,9 @@ fn latent_factor_values(name: &str, factor: &Tensor) -> Result<Vec<f32>> {
 }
 
 fn reference_latent_normalization(latents: &Tensor) -> Result<LatentNormalization> {
+    if latents.device().is_cuda() {
+        return reference_latent_normalization_cuda(latents);
+    }
     let (bias, scale) = latent_normalization_values(latents)?;
     Ok(LatentNormalization {
         bias: scalar_like(bias, latents)?,
@@ -1046,8 +1083,34 @@ fn latent_normalization_values(latents: &Tensor) -> Result<(f32, f32)> {
     Ok((-mean, 1.0 / std))
 }
 
+fn reference_latent_normalization_cuda(latents: &Tensor) -> Result<LatentNormalization> {
+    let flattened = latents.to_dtype(DType::F32)?.flatten_all()?;
+    let count = flattened.elem_count();
+    if count == 0 {
+        return Err(Error::InferenceError(
+            "VibeVoice TTS reference encoder produced no latents".to_string(),
+        ));
+    }
+    let count = count as f64;
+    let mean = (flattened.sum_all()? / count)?;
+    let centered = flattened.broadcast_sub(&mean)?;
+    let variance = (centered.sqr()?.sum_all()? / count)?;
+    let std = variance.sqrt()?.clamp(1e-5f64, f64::MAX)?;
+    Ok(LatentNormalization {
+        bias: mean.neg()?.to_dtype(latents.dtype())?,
+        scale: std.recip()?.to_dtype(latents.dtype())?,
+        source: LatentNormalizationSource::ReferenceStatistics,
+    })
+}
+
 fn scale_latents(latents: &Tensor, bias: &Tensor, scale: &Tensor) -> Result<Tensor> {
     // VibeVoice normalizes speech latents as `(audio_tokens + bias) * scale`.
+    if latents.device().is_cuda() {
+        return latents
+            .broadcast_add(bias)?
+            .broadcast_mul(scale)
+            .map_err(Error::from);
+    }
     latents
         .broadcast_add(&factor_like(bias, latents)?)?
         .broadcast_mul(&factor_like(scale, latents)?)
@@ -1055,6 +1118,12 @@ fn scale_latents(latents: &Tensor, bias: &Tensor, scale: &Tensor) -> Result<Tens
 }
 
 fn unscale_latents(latents: &Tensor, bias: &Tensor, scale: &Tensor) -> Result<Tensor> {
+    if latents.device().is_cuda() {
+        return latents
+            .broadcast_div(scale)?
+            .broadcast_sub(bias)
+            .map_err(Error::from);
+    }
     latents
         .broadcast_div(&factor_like(scale, latents)?)?
         .broadcast_sub(&factor_like(bias, latents)?)
@@ -1288,9 +1357,35 @@ mod tests {
 
         assert_eq!(plan.steps.len(), 3);
         assert!(plan.batch_cfg_prediction);
+        assert!(!plan.cuda_prebatched_cfg);
+        assert!(
+            plan.steps
+                .iter()
+                .all(|step| step.cuda_batched_timestep_embedding.is_none())
+        );
         assert_eq!(
             plan.cfg_tensor.as_ref().unwrap().to_vec0::<f32>().unwrap(),
             1.5
+        );
+
+        let cuda_plan = vibevoice_diffusion_plan(
+            &head,
+            VibeVoiceDiffusionScheduler::new(1000, 3),
+            &device,
+            DType::F32,
+            1.5,
+            DeviceKind::Cuda,
+        )
+        .unwrap();
+        assert!(cuda_plan.batch_cfg_prediction);
+        assert!(cuda_plan.cuda_prebatched_cfg);
+        assert_eq!(
+            cuda_plan.steps[0]
+                .cuda_batched_timestep_embedding
+                .as_ref()
+                .unwrap()
+                .dims(),
+            &[2, 4]
         );
 
         let cpu_no_cfg = vibevoice_diffusion_plan(
