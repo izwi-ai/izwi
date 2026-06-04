@@ -1,15 +1,15 @@
 //! Flow-matching acoustic-token shape helpers.
 
-use candle_core::{D, DType, IndexOp, Tensor};
-use candle_nn::{Linear, Module, RmsNorm, VarBuilder, ops};
+use candle_core::{DType, IndexOp, Tensor, D};
+use candle_nn::{ops, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::core::repeat_kv;
 
 use super::super::layers::linear_forward_last_dim;
 use super::config::{
-    DEFAULT_CFG_ALPHA, DEFAULT_N_DECODING_STEPS, VoxtralTtsAcousticTransformerArgs,
-    VoxtralTtsConfig,
+    VoxtralTtsAcousticTransformerArgs, VoxtralTtsConfig, DEFAULT_CFG_ALPHA,
+    DEFAULT_N_DECODING_STEPS,
 };
 
 pub const AUDIO_SPECIAL_TOKEN_COUNT: u32 = 2;
@@ -41,6 +41,24 @@ pub enum AudioCodeValue {
 pub struct AcousticCodeFrame {
     pub semantic: u32,
     pub acoustic: Vec<u32>,
+}
+
+#[derive(Debug)]
+pub struct VoxtralGeneratedAudioCodes {
+    pub frames: Vec<Vec<u32>>,
+    pub shifted_code_tensor: Option<Tensor>,
+}
+
+#[derive(Debug)]
+struct SemanticCodeSelection {
+    codes: Vec<u32>,
+    code_tensor: Option<Tensor>,
+}
+
+#[derive(Debug)]
+struct DecodedAcousticCodes {
+    shifted_codes: Vec<Vec<u32>>,
+    shifted_code_tensor: Option<Tensor>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -218,6 +236,23 @@ impl FlowMatchingAudioTransformer {
         n_decoding_steps: usize,
         allow_end_audio: bool,
     ) -> Result<Vec<Vec<u32>>> {
+        Ok(self
+            .forward_audio_codes_with_feedback_tensor(
+                llm_hidden,
+                cfg_alpha,
+                n_decoding_steps,
+                allow_end_audio,
+            )?
+            .frames)
+    }
+
+    pub fn forward_audio_codes_with_feedback_tensor(
+        &self,
+        llm_hidden: &Tensor,
+        cfg_alpha: f32,
+        n_decoding_steps: usize,
+        allow_end_audio: bool,
+    ) -> Result<VoxtralGeneratedAudioCodes> {
         let llm_hidden = match llm_hidden.rank() {
             1 => llm_hidden.unsqueeze(0)?,
             2 => llm_hidden.clone(),
@@ -237,23 +272,43 @@ impl FlowMatchingAudioTransformer {
 
         let semantic_logits = linear_forward_last_dim(&self.semantic_codebook_output, &llm_hidden)
             .map_err(|err| Error::InferenceError(format!("semantic projection failed: {err}")))?;
-        let semantic_codes = semantic_codes_from_logits_with_eos_policy(
+        let semantic_selection = semantic_code_selection_from_logits_with_eos_policy(
             &semantic_logits,
             self.generation.semantic_codebook_size,
             allow_end_audio,
         )
         .map_err(|err| Error::InferenceError(format!("semantic sampling failed: {err}")))?;
         let acoustic_codes = self
-            .decode_one_frame(&semantic_codes, &llm_hidden, cfg_alpha, n_decoding_steps)
+            .decode_one_frame(
+                &semantic_selection.codes,
+                &llm_hidden,
+                cfg_alpha,
+                n_decoding_steps,
+            )
             .map_err(|err| Error::InferenceError(format!("acoustic frame decode failed: {err}")))?;
-        let mut frames = Vec::with_capacity(semantic_codes.len());
-        for (semantic, acoustic) in semantic_codes.into_iter().zip(acoustic_codes) {
+        let mut frames = Vec::with_capacity(semantic_selection.codes.len());
+        for (semantic, acoustic) in semantic_selection
+            .codes
+            .iter()
+            .copied()
+            .zip(acoustic_codes.shifted_codes)
+        {
             let mut frame = Vec::with_capacity(self.generation.num_codebooks);
             frame.push(semantic);
             frame.extend(acoustic);
             frames.push(frame);
         }
-        Ok(frames)
+        let shifted_code_tensor = match (
+            semantic_selection.code_tensor,
+            acoustic_codes.shifted_code_tensor,
+        ) {
+            (Some(semantic), Some(acoustic)) => Some(Tensor::cat(&[semantic, acoustic], 1)?),
+            _ => None,
+        };
+        Ok(VoxtralGeneratedAudioCodes {
+            frames,
+            shifted_code_tensor,
+        })
     }
 
     fn decode_one_frame(
@@ -262,7 +317,7 @@ impl FlowMatchingAudioTransformer {
         llm_hidden: &Tensor,
         cfg_alpha: f32,
         n_decoding_steps: usize,
-    ) -> Result<Vec<Vec<u32>>> {
+    ) -> Result<DecodedAcousticCodes> {
         let batch = semantic_codes.len();
         let dtype = llm_hidden.dtype();
         let device = llm_hidden.device();
@@ -299,23 +354,11 @@ impl FlowMatchingAudioTransformer {
             sampled = sampled.broadcast_add(&(blended * dt)?)?;
         }
 
-        let sampled = sampled.clamp(-1.0, 1.0)?.to_dtype(DType::F32)?;
-        let rows = sampled.to_vec2::<f32>()?;
-        let mut output = Vec::with_capacity(batch);
-        for (semantic, row) in semantic_codes.iter().zip(rows) {
-            let should_decode = *semantic != AudioSpecialToken::End.id();
-            let mut acoustic = Vec::with_capacity(row.len());
-            for value in row {
-                let raw = if should_decode {
-                    fsq_unit_to_code(value, self.generation.acoustic_codebook_size)
-                } else {
-                    AudioSpecialToken::Empty.id()
-                };
-                acoustic.push(apply_audio_token_offset(raw));
-            }
-            output.push(acoustic);
-        }
-        Ok(output)
+        shifted_acoustic_codes_from_sampled_tensor(
+            &sampled,
+            semantic_codes,
+            self.generation.acoustic_codebook_size,
+        )
     }
 
     fn predict_velocity(
@@ -531,6 +574,90 @@ pub fn fsq_code_to_unit(code: u32, codebook_size: usize) -> f32 {
     (clamped / (codebook_size as f32 - 1.0)) * 2.0 - 1.0
 }
 
+fn shifted_acoustic_codes_from_sampled_tensor(
+    sampled: &Tensor,
+    semantic_codes: &[u32],
+    acoustic_codebook_size: usize,
+) -> Result<DecodedAcousticCodes> {
+    if sampled.device().is_cuda() {
+        if let Some(decoded) = shifted_acoustic_codes_from_sampled_tensor_cuda(
+            sampled,
+            semantic_codes,
+            acoustic_codebook_size,
+        )? {
+            return Ok(decoded);
+        }
+    }
+    shifted_acoustic_codes_from_sampled_tensor_host(sampled, semantic_codes, acoustic_codebook_size)
+}
+
+fn shifted_acoustic_codes_from_sampled_tensor_cuda(
+    sampled: &Tensor,
+    semantic_codes: &[u32],
+    acoustic_codebook_size: usize,
+) -> Result<Option<DecodedAcousticCodes>> {
+    let shifted = sampled
+        .clamp(-1.0, 1.0)?
+        .to_dtype(DType::F32)?
+        .broadcast_add(&Tensor::full(
+            1.0f32,
+            sampled.shape().clone(),
+            sampled.device(),
+        )?)?;
+    let scale = 0.5f64 * (acoustic_codebook_size as f64 - 1.0);
+    let shifted = (shifted * scale)?
+        .round()?
+        .broadcast_add(&Tensor::full(
+            AUDIO_SPECIAL_TOKEN_COUNT as f32,
+            sampled.shape().clone(),
+            sampled.device(),
+        )?)?
+        .to_dtype(DType::U32)?;
+    let mut rows = shifted.to_vec2::<u32>()?;
+    let contains_end = semantic_codes
+        .iter()
+        .any(|semantic| *semantic == AudioSpecialToken::End.id());
+    if contains_end {
+        let empty = apply_audio_token_offset(AudioSpecialToken::Empty.id());
+        for (semantic, row) in semantic_codes.iter().zip(rows.iter_mut()) {
+            if *semantic == AudioSpecialToken::End.id() {
+                row.fill(empty);
+            }
+        }
+    }
+    Ok(Some(DecodedAcousticCodes {
+        shifted_codes: rows,
+        shifted_code_tensor: (!contains_end).then_some(shifted),
+    }))
+}
+
+fn shifted_acoustic_codes_from_sampled_tensor_host(
+    sampled: &Tensor,
+    semantic_codes: &[u32],
+    acoustic_codebook_size: usize,
+) -> Result<DecodedAcousticCodes> {
+    let sampled = sampled.clamp(-1.0, 1.0)?.to_dtype(DType::F32)?;
+    let rows = sampled.to_vec2::<f32>()?;
+    let mut output = Vec::with_capacity(semantic_codes.len());
+    for (semantic, row) in semantic_codes.iter().zip(rows) {
+        let should_decode = *semantic != AudioSpecialToken::End.id();
+        let mut acoustic = Vec::with_capacity(row.len());
+        for value in row {
+            let raw = if should_decode {
+                fsq_unit_to_code(value, acoustic_codebook_size)
+            } else {
+                AudioSpecialToken::Empty.id()
+            };
+            acoustic.push(apply_audio_token_offset(raw));
+        }
+        output.push(acoustic);
+    }
+    Ok(DecodedAcousticCodes {
+        shifted_codes: output,
+        shifted_code_tensor: None,
+    })
+}
+
 pub fn cfg_velocity_blend(conditional: f32, unconditional: f32, alpha: f32) -> f32 {
     alpha.mul_add(conditional, (1.0 - alpha) * unconditional)
 }
@@ -572,6 +699,19 @@ fn semantic_codes_from_logits_with_eos_policy(
     semantic_codebook_size: usize,
     allow_end_audio: bool,
 ) -> Result<Vec<u32>> {
+    Ok(semantic_code_selection_from_logits_with_eos_policy(
+        logits,
+        semantic_codebook_size,
+        allow_end_audio,
+    )?
+    .codes)
+}
+
+fn semantic_code_selection_from_logits_with_eos_policy(
+    logits: &Tensor,
+    semantic_codebook_size: usize,
+    allow_end_audio: bool,
+) -> Result<SemanticCodeSelection> {
     // Non-empty TTS requests should produce at least one audible frame. Some
     // voices can rank end-of-audio first, so the generation loop masks EOS only
     // for frame zero and restores the normal stop token immediately after.
@@ -585,8 +725,73 @@ fn semantic_codes_from_logits_with_eos_policy(
         }
     };
     let allowed = (semantic_codebook_size + AUDIO_SPECIAL_TOKEN_COUNT as usize).min(logits.dim(1)?);
+    if logits.device().is_cuda() {
+        if let Some(selection) =
+            semantic_code_selection_from_logits_cuda(&logits, allowed, allow_end_audio)?
+        {
+            return Ok(selection);
+        }
+    }
+    semantic_code_selection_from_logits_host(&logits, allowed, allow_end_audio)
+}
+
+fn semantic_code_selection_from_logits_cuda(
+    logits: &Tensor,
+    allowed: usize,
+    allow_end_audio: bool,
+) -> Result<Option<SemanticCodeSelection>> {
+    if allowed == 0 {
+        return Ok(None);
+    }
+    let batch = logits.dim(0)?;
+    let token_logits = logits.narrow(1, 0, allowed)?;
+    let mask = semantic_validity_mask(batch, allowed, allow_end_audio);
+    let mask = Tensor::from_vec(mask, (batch, allowed), logits.device())?;
+    let neg_inf = Tensor::full(f32::NEG_INFINITY, token_logits.shape(), logits.device())?
+        .to_dtype(token_logits.dtype())?;
+    let masked = mask.where_cond(&token_logits, &neg_inf)?;
+    let indices = masked.argmax(D::Minus1)?.to_dtype(DType::U32)?;
+    let selected_scores = masked
+        .gather(&indices.unsqueeze(1)?, 1)?
+        .to_dtype(DType::F32)?
+        .to_vec2::<f32>()?;
+    if selected_scores
+        .iter()
+        .flatten()
+        .any(|score| !score.is_finite())
+    {
+        return Ok(None);
+    }
+    let codes = indices.to_vec1::<u32>()?;
+    Ok(Some(SemanticCodeSelection {
+        codes,
+        code_tensor: Some(indices.unsqueeze(1)?),
+    }))
+}
+
+fn semantic_validity_mask(batch: usize, allowed: usize, allow_end_audio: bool) -> Vec<u8> {
+    let mut row = vec![1u8; allowed];
+    if (AudioSpecialToken::Empty.id() as usize) < allowed {
+        row[AudioSpecialToken::Empty.id() as usize] = 0;
+    }
+    if !allow_end_audio && (AudioSpecialToken::End.id() as usize) < allowed {
+        row[AudioSpecialToken::End.id() as usize] = 0;
+    }
+    let mut mask = Vec::with_capacity(batch * allowed);
+    for _ in 0..batch {
+        mask.extend_from_slice(&row);
+    }
+    mask
+}
+
+fn semantic_code_selection_from_logits_host(
+    logits: &Tensor,
+    allowed: usize,
+    allow_end_audio: bool,
+) -> Result<SemanticCodeSelection> {
     let rows = logits.to_dtype(DType::F32)?.to_vec2::<f32>()?;
-    rows.into_iter()
+    let codes = rows
+        .into_iter()
         .map(|row| {
             let mut best_idx = None;
             let mut best_value = f32::NEG_INFINITY;
@@ -612,7 +817,11 @@ fn semantic_codes_from_logits_with_eos_policy(
             })?;
             Ok(best_idx as u32)
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok(SemanticCodeSelection {
+        codes,
+        code_tensor: None,
+    })
 }
 
 fn blend_cfg_tensors(cond: &Tensor, uncond: &Tensor, alpha: f32) -> Result<Tensor> {
@@ -626,7 +835,7 @@ fn blend_cfg_tensors(cond: &Tensor, uncond: &Tensor, alpha: f32) -> Result<Tenso
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::architectures::voxtral::tts::config::{VoxtralTtsConfig, fixture_json};
+    use crate::models::architectures::voxtral::tts::config::{fixture_json, VoxtralTtsConfig};
     use candle_core::{Device, Shape};
     use candle_nn::VarBuilder;
     use serde_json::json;
@@ -660,6 +869,43 @@ mod tests {
         assert_eq!(fsq_unit_to_code(1.0, 21), 20);
         assert_eq!(fsq_unit_to_code(2.0, 21), 20);
         assert!((fsq_code_to_unit(10, 21) - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tensorized_fsq_quantization_matches_shifted_codes() {
+        let device = Device::Cpu;
+        let sampled = Tensor::from_vec(vec![-1.0f32, 0.0, 1.0], (1, 3), &device).unwrap();
+
+        let decoded = shifted_acoustic_codes_from_sampled_tensor_cuda(&sampled, &[2], 21)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(decoded.shifted_codes, vec![vec![2, 12, 22]]);
+        assert_eq!(
+            decoded
+                .shifted_code_tensor
+                .unwrap()
+                .to_vec2::<u32>()
+                .unwrap(),
+            vec![vec![2, 12, 22]]
+        );
+    }
+
+    #[test]
+    fn tensorized_fsq_omits_feedback_tensor_for_end_audio() {
+        let device = Device::Cpu;
+        let sampled = Tensor::from_vec(vec![-1.0f32, 0.0, 1.0], (1, 3), &device).unwrap();
+
+        let decoded = shifted_acoustic_codes_from_sampled_tensor_cuda(
+            &sampled,
+            &[AudioSpecialToken::End.id()],
+            21,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(decoded.shifted_codes, vec![vec![2, 2, 2]]);
+        assert!(decoded.shifted_code_tensor.is_none());
     }
 
     #[test]
@@ -723,6 +969,33 @@ mod tests {
 
         assert_eq!(eos_allowed, vec![1]);
         assert_eq!(eos_masked, vec![3]);
+    }
+
+    #[test]
+    fn tensorized_semantic_selection_masks_empty_and_eos() {
+        let device = Device::Cpu;
+        let logits =
+            Tensor::from_vec(vec![100.0f32, 99.0, 1.0, 2.0, 98.0], (1, 5), &device).unwrap();
+
+        let selection = semantic_code_selection_from_logits_cuda(&logits, 4, false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(selection.codes, vec![3]);
+        assert_eq!(
+            selection.code_tensor.unwrap().to_vec2::<u32>().unwrap(),
+            vec![vec![3]]
+        );
+    }
+
+    #[test]
+    fn tensorized_semantic_selection_falls_back_on_non_finite_selected_score() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![0.0f32, f32::NAN, f32::NAN], (1, 3), &device).unwrap();
+
+        let selection = semantic_code_selection_from_logits_cuda(&logits, 3, true).unwrap();
+
+        assert!(selection.is_none());
     }
 
     #[test]
