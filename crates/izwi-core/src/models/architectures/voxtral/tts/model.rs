@@ -254,6 +254,8 @@ impl VoxtralTtsPipeline {
         let mut frames = Vec::new();
         let mut acoustic_duration = Duration::ZERO;
         let mut lm_decode_duration = Duration::ZERO;
+        let mut tensor_feedback_frames = 0usize;
+        let mut host_feedback_frames = 0usize;
 
         for frame_idx in 0..max_frames {
             let acoustic_start = Instant::now();
@@ -292,9 +294,11 @@ impl VoxtralTtsPipeline {
                 break;
             }
             let next_embed = if let Some(feedback_code_tensor) = feedback_code_tensor.as_ref() {
+                tensor_feedback_frames += 1;
                 self.audio_embeddings
                     .embedding_for_shifted_code_tensor(feedback_code_tensor)?
             } else {
+                host_feedback_frames += 1;
                 let feedback_frame = feedback_frame.as_ref().ok_or_else(|| {
                     Error::InferenceError(
                         "Voxtral TTS feedback frame missing host and tensor codes".to_string(),
@@ -340,9 +344,12 @@ impl VoxtralTtsPipeline {
         let codec_duration = codec_start.elapsed();
         let total_duration = total_start.elapsed();
         info!(
-            "Voxtral TTS timings: frames={}, samples={}, prompt={:.2}ms, lm_prefill={:.2}ms, acoustic={:.2}ms, lm_decode={:.2}ms, codec={:.2}ms, total={:.2}ms",
+            "Voxtral TTS timings: frames={}, samples={}, dense_decode_tokens={}, tensor_feedback_frames={}, host_feedback_frames={}, prompt={:.2}ms, lm_prefill={:.2}ms, acoustic={:.2}ms, lm_decode={:.2}ms, codec={:.2}ms, total={:.2}ms",
             frames_generated,
             samples.len(),
+            cache.dense_decode_max_tokens(),
+            tensor_feedback_frames,
+            host_feedback_frames,
             duration_ms(prompt_duration),
             duration_ms(lm_prefill_duration),
             duration_ms(acoustic_duration),
