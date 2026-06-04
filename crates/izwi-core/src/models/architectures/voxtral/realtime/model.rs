@@ -1,6 +1,7 @@
 //! Main Voxtral Realtime model implementation.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use candle_core::{DType, IndexOp, Tensor};
 use candle_nn::{Module, VarBuilder};
@@ -149,8 +150,8 @@ impl VoxtralRealtimeModel {
             TimeEmbedding::new(config.text_config().hidden_size, 10000.0, &device.device)?;
 
         info!(
-            "Loaded Voxtral Realtime model on {:?} with dtype {:?}",
-            device.kind, dtype
+            "Loaded Voxtral Realtime model on {:?} with dtype {:?} (checkpoint_dtype={:?})",
+            device.kind, dtype, checkpoint_dtype
         );
 
         Ok(Self {
@@ -215,6 +216,8 @@ impl VoxtralRealtimeModel {
         mut on_delta: Option<&mut dyn FnMut(&str)>,
     ) -> Result<VoxtralTranscriptionOutput> {
         let input_samples = audio.len();
+        let total_start = Instant::now();
+        let preprocess_start = Instant::now();
         // Resample to 16kHz if needed
         let audio = if sample_rate != 16_000 {
             resample_audio(audio, sample_rate, 16_000)?
@@ -234,7 +237,9 @@ impl VoxtralRealtimeModel {
         let frames = mel_spec.len();
 
         let mel = mel_frames_to_tensor(&mel_spec, n_mels, &self.device.device, self.dtype)?;
+        let preprocess_duration = preprocess_start.elapsed();
 
+        let encoder_start = Instant::now();
         // Process through whisper encoder
         let audio_embeds = self.whisper_encoder.forward(&mel)?;
 
@@ -243,9 +248,17 @@ impl VoxtralRealtimeModel {
 
         // Project to language model dimension
         let audio_embeds = self.audio_adapter.forward(&audio_embeds)?;
+        let encoder_adapter_duration = encoder_start.elapsed();
 
         let audio_frames = audio_embeds.dim(1)?;
         if audio_frames == 0 {
+            let timings = VoxtralRealtimeTimings {
+                preprocess: preprocess_duration,
+                encoder_adapter: encoder_adapter_duration,
+                total: total_start.elapsed(),
+                ..Default::default()
+            };
+            self.log_transcription_timings(&timings, 0, 0, 0);
             return Ok(VoxtralTranscriptionOutput {
                 text: String::new(),
                 language: language.map(str::to_string),
@@ -259,6 +272,7 @@ impl VoxtralRealtimeModel {
                     0,
                     0,
                     None,
+                    Some(timings),
                 )),
             });
         }
@@ -288,6 +302,7 @@ impl VoxtralRealtimeModel {
         let mut assembled = String::new();
         let specials = self.tokenizer.specials().clone();
 
+        let lm_prefill_start = Instant::now();
         let prompt_tensor =
             Tensor::from_vec(prompt_tokens.clone(), (1, prompt_len), &self.device.device)?;
         let text_embeds = self.language_model.embeddings(&prompt_tensor)?;
@@ -310,7 +325,9 @@ impl VoxtralRealtimeModel {
         )?;
         let next_logits = logits.i((0, logits.dim(1)? - 1))?;
         let mut next = argmax(&next_logits)?;
+        let lm_prefill_duration = lm_prefill_start.elapsed();
         let mut frame_idx = prompt_len;
+        let decode_start = Instant::now();
 
         loop {
             if next == specials.eos || Some(next) == specials.end_audio {
@@ -353,6 +370,15 @@ impl VoxtralRealtimeModel {
             next = argmax(&next_logits)?;
             frame_idx += 1;
         }
+        let token_decode_duration = decode_start.elapsed();
+        let timings = VoxtralRealtimeTimings {
+            preprocess: preprocess_duration,
+            encoder_adapter: encoder_adapter_duration,
+            lm_prefill: lm_prefill_duration,
+            token_decode: token_decode_duration,
+            total: total_start.elapsed(),
+        };
+        self.log_transcription_timings(&timings, generated.len(), prompt_len, max_frames);
 
         Ok(VoxtralTranscriptionOutput {
             text: assembled.trim().to_string(),
@@ -367,6 +393,7 @@ impl VoxtralRealtimeModel {
                 prompt_len,
                 generated.len(),
                 Some(cache_diagnostics),
+                Some(timings),
             )),
         })
     }
@@ -413,6 +440,7 @@ impl VoxtralRealtimeModel {
         prompt_tokens: usize,
         generated_tokens: usize,
         cache: Option<serde_json::Value>,
+        timings: Option<VoxtralRealtimeTimings>,
     ) -> serde_json::Value {
         serde_json::json!({
             "model_family": "voxtral",
@@ -437,7 +465,8 @@ impl VoxtralRealtimeModel {
                 "flash_attention_compiled": flash_attention_compiled(),
                 "cache": cache.unwrap_or_else(|| self.cache_diagnostics(
                     &self.build_decode_cache(decode_frames)
-                ))
+                )),
+                "timings_ms": timings.map(VoxtralRealtimeTimings::to_json)
             },
             "config": {
                 "num_delay_tokens": self.num_delay_tokens,
@@ -451,10 +480,55 @@ impl VoxtralRealtimeModel {
         })
     }
 
+    fn log_transcription_timings(
+        &self,
+        timings: &VoxtralRealtimeTimings,
+        generated_tokens: usize,
+        prompt_tokens: usize,
+        decode_frames: usize,
+    ) {
+        info!(
+            "Voxtral Realtime timings: generated_tokens={}, prompt_tokens={}, decode_frames={}, preprocess={:.2}ms, encoder_adapter={:.2}ms, lm_prefill={:.2}ms, token_decode={:.2}ms, total={:.2}ms",
+            generated_tokens,
+            prompt_tokens,
+            decode_frames,
+            duration_ms(timings.preprocess),
+            duration_ms(timings.encoder_adapter),
+            duration_ms(timings.lm_prefill),
+            duration_ms(timings.token_decode),
+            duration_ms(timings.total)
+        );
+    }
+
     /// Pool audio embeddings by block_size
     fn pool_audio_embeddings(&self, audio_embeds: &Tensor) -> Result<Tensor> {
         pool_audio_embeddings_by_block(audio_embeds, self.block_pool_size)
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct VoxtralRealtimeTimings {
+    preprocess: Duration,
+    encoder_adapter: Duration,
+    lm_prefill: Duration,
+    token_decode: Duration,
+    total: Duration,
+}
+
+impl VoxtralRealtimeTimings {
+    fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "preprocess": duration_ms(self.preprocess),
+            "encoder_adapter": duration_ms(self.encoder_adapter),
+            "lm_prefill": duration_ms(self.lm_prefill),
+            "token_decode": duration_ms(self.token_decode),
+            "total": duration_ms(self.total)
+        })
+    }
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
 }
 
 fn pool_audio_embeddings_by_block(audio_embeds: &Tensor, pool_size: usize) -> Result<Tensor> {
@@ -1297,13 +1371,12 @@ fn gelu(x: &Tensor) -> Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_interleaved_rotary_emb, argmax, attention_scale_tensor,
-        build_voxtral_decode_cache, drop_last_mel_frame_for_voxtral,
-        load_voxtral_runtime_config, mel_frames_to_tensor, normalize_log_mel_with_max,
-        offline_left_pad_tokens_for_generation, offline_streaming_padding_samples,
-        pool_audio_embeddings_by_block, prepare_realtime_conv_input, resample_audio,
-        select_voxtral_dtype, text_delta, voxtral_dense_decode_max_tokens,
-        voxtral_generation_prefix_len,
+        apply_interleaved_rotary_emb, argmax, attention_scale_tensor, build_voxtral_decode_cache,
+        drop_last_mel_frame_for_voxtral, load_voxtral_runtime_config, mel_frames_to_tensor,
+        normalize_log_mel_with_max, offline_left_pad_tokens_for_generation,
+        offline_streaming_padding_samples, pool_audio_embeddings_by_block,
+        prepare_realtime_conv_input, resample_audio, select_voxtral_dtype, text_delta,
+        voxtral_dense_decode_max_tokens, voxtral_generation_prefix_len,
     };
     use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile};
     use crate::models::shared::attention::paged::DEFAULT_KV_PAGE_SIZE;

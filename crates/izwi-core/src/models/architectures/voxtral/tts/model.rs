@@ -1,6 +1,7 @@
 //! High-level Voxtral TTS model contract.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{Embedding, Module, VarBuilder};
@@ -12,12 +13,12 @@ use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::core::Qwen3Cache;
 use crate::models::architectures::voxtral::lm::VoxtralLM;
 
-use super::acoustic::{AUDIO_SPECIAL_TOKEN_COUNT, AudioSpecialToken, FlowMatchingAudioTransformer};
+use super::acoustic::{AudioSpecialToken, FlowMatchingAudioTransformer, AUDIO_SPECIAL_TOKEN_COUNT};
 use super::codec::{VoxtralCodecConfig, VoxtralCodecDecoder, VoxtralCodecTimeline};
 use super::config::VoxtralTtsConfig;
 use super::sampling::VoxtralTtsGenerationParams;
 use super::tokenizer::VoxtralTtsTokenizer;
-use super::voice::{VoxtralVoiceCatalog, VoxtralVoiceEmbeddingLibrary, voice_embedding_path};
+use super::voice::{voice_embedding_path, VoxtralVoiceCatalog, VoxtralVoiceEmbeddingLibrary};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VoxtralTtsDTypePlan {
@@ -120,6 +121,13 @@ impl VoxtralTtsModel {
             "Loading Voxtral TTS generation pipeline from {:?}",
             model_dir
         );
+        info!(
+            "Voxtral TTS dtype plan on {:?}: language_model={:?}, acoustic_transformer={:?}, codec={:?}",
+            device.kind,
+            model.dtype_plan.language_model,
+            model.dtype_plan.acoustic_transformer,
+            model.dtype_plan.codec
+        );
         let language_vb =
             load_voxtral_tts_weights(model_dir, model.dtype_plan.language_model, &device)?;
         let acoustic_vb =
@@ -207,6 +215,8 @@ impl VoxtralTtsPipeline {
                 "Voxtral TTS text input cannot be empty".to_string(),
             ));
         }
+        let total_start = Instant::now();
+        let prompt_start = Instant::now();
         let voice_embedding = model.voice_embeddings.load(voice)?;
         let voice_frames = voice_embedding.dim(1)?;
         let prompt = self.tokenizer.build_speech_prompt(text, voice_frames)?;
@@ -219,19 +229,25 @@ impl VoxtralTtsPipeline {
             .map_err(|err| {
                 Error::InferenceError(format!("Voxtral TTS prompt embedding failed: {err}"))
             })?;
+        let prompt_duration = prompt_start.elapsed();
         let mut cache = Qwen3Cache::new(self.language_model.num_layers());
+        let lm_prefill_start = Instant::now();
         let prefill_hidden = self
             .language_model
             .forward_hidden_with_embeds(&prompt_embeds, 0, Some(&mut cache), None, None)
             .map_err(|err| {
                 Error::InferenceError(format!("Voxtral TTS LM prefill failed: {err}"))
             })?;
+        let lm_prefill_duration = lm_prefill_start.elapsed();
         let mut pos = prompt.input_ids.len();
         let mut last_hidden = last_sequence_hidden(&prefill_hidden, "Voxtral TTS LM prefill")?;
         let mut frames = Vec::new();
+        let mut acoustic_duration = Duration::ZERO;
+        let mut lm_decode_duration = Duration::ZERO;
 
         let max_frames = params.max_frames.max(1);
         for frame_idx in 0..max_frames {
+            let acoustic_start = Instant::now();
             let generated = self
                 .acoustic_transformer
                 .forward_audio_codes_with_steps_and_eos_policy(
@@ -243,6 +259,7 @@ impl VoxtralTtsPipeline {
                 .map_err(|err| {
                     Error::InferenceError(format!("Voxtral TTS acoustic generation failed: {err}"))
                 })?;
+            acoustic_duration += acoustic_start.elapsed();
             let frame = generated.into_iter().next().ok_or_else(|| {
                 Error::InferenceError("Voxtral acoustic transformer returned no frames".to_string())
             })?;
@@ -267,12 +284,14 @@ impl VoxtralTtsPipeline {
             let next_embed = self
                 .audio_embeddings
                 .embedding_for_shifted_codes(&feedback_frame)?;
+            let lm_decode_start = Instant::now();
             let hidden = self
                 .language_model
                 .forward_hidden_with_embeds(&next_embed, pos, Some(&mut cache), None, None)
                 .map_err(|err| {
                     Error::InferenceError(format!("Voxtral TTS LM decode failed: {err}"))
                 })?;
+            lm_decode_duration += lm_decode_start.elapsed();
             pos += 1;
             last_hidden = last_sequence_hidden(&hidden, "Voxtral TTS LM decode")?;
         }
@@ -292,12 +311,26 @@ impl VoxtralTtsPipeline {
         let timeline = VoxtralCodecTimeline::new(frames_to_codebooks(frames)?).map_err(|err| {
             Error::InferenceError(format!("Voxtral TTS timeline construction failed: {err}"))
         })?;
+        let codec_start = Instant::now();
         let samples = self
             .codec_decoder
             .decode_timeline(&timeline)
             .map_err(|err| {
                 Error::InferenceError(format!("Voxtral TTS codec decode failed: {err}"))
             })?;
+        let codec_duration = codec_start.elapsed();
+        let total_duration = total_start.elapsed();
+        info!(
+            "Voxtral TTS timings: frames={}, samples={}, prompt={:.2}ms, lm_prefill={:.2}ms, acoustic={:.2}ms, lm_decode={:.2}ms, codec={:.2}ms, total={:.2}ms",
+            frames_generated,
+            samples.len(),
+            duration_ms(prompt_duration),
+            duration_ms(lm_prefill_duration),
+            duration_ms(acoustic_duration),
+            duration_ms(lm_decode_duration),
+            duration_ms(codec_duration),
+            duration_ms(total_duration)
+        );
         Ok(VoxtralTtsOutput {
             samples,
             sample_rate: model.codec_config.sample_rate,
@@ -355,6 +388,10 @@ fn last_sequence_hidden(hidden: &Tensor, context: &str) -> Result<Tensor> {
         )));
     }
     hidden.i((0, seq_len - 1, ..)).map_err(Error::from)
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
 }
 
 impl VoxtralAudioTokenEmbeddings {
@@ -532,7 +569,7 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::backends::{DeviceCapabilities, DeviceKind};
-    use crate::models::architectures::voxtral::tts::config::{VoxtralTtsConfig, fixture_json};
+    use crate::models::architectures::voxtral::tts::config::{fixture_json, VoxtralTtsConfig};
 
     fn profile(kind: DeviceKind, supports_bf16: bool, supports_f16: bool) -> DeviceProfile {
         DeviceProfile {
