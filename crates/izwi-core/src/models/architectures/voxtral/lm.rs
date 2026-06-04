@@ -5,14 +5,17 @@
 //! root-level layer structure compared to standard Qwen3.
 
 use candle_core::{DType, Device, Tensor};
-use candle_nn::{Embedding, Linear, Module, RmsNorm, VarBuilder, ops};
+use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::core::{
-    Qwen3Cache, Qwen3Config, build_mrope_cache, build_rope_cache, causal_mask,
-    dense_decode_attention, repeat_kv,
+    build_mrope_cache, build_rope_cache, causal_mask, dense_decode_attention, repeat_kv,
+    Qwen3Cache, Qwen3Config,
 };
-use crate::models::shared::attention::flash::try_fused_self_attention;
+use crate::models::shared::attention::flash::{
+    flash_attention_requested, try_fused_self_attention, try_fused_self_attention_with_options,
+    CudaFlashAttentionOptions,
+};
 use crate::models::shared::attention::paged::paged_decode_attention;
 
 use super::layers::linear_forward_last_dim;
@@ -422,6 +425,31 @@ impl VoxtralAttention {
                 return Ok(out);
             }
         }
+        if start_pos == 0
+            && total_len == seq_len
+            && self.sliding_window.is_some()
+            && q_heads.device().is_cuda()
+            && flash_attention_requested()
+        {
+            let cuda_options = voxtral_sliding_cuda_flash_attention_options(self.sliding_window);
+            if let Some(fused_out) = try_fused_self_attention_with_options(
+                &q_heads,
+                &k_kv_heads,
+                &v_kv_heads,
+                None,
+                self.head_dim,
+                true,
+                cuda_options,
+            )? {
+                let out = fused_out.transpose(1, 2)?.reshape((
+                    bsz,
+                    seq_len,
+                    self.num_heads * self.head_dim,
+                ))?;
+                let out = linear_forward_last_dim(&self.o_proj, &out)?;
+                return Ok(out);
+            }
+        }
 
         let k = repeat_kv(&k, self.num_heads, self.num_kv_heads)?;
         let v = repeat_kv(&v, self.num_heads, self.num_kv_heads)?;
@@ -624,6 +652,15 @@ fn voxtral_attention_mask(
         .map_err(Error::from)
 }
 
+fn voxtral_sliding_cuda_flash_attention_options(
+    sliding_window: Option<usize>,
+) -> CudaFlashAttentionOptions<'static> {
+    CudaFlashAttentionOptions {
+        window_size_left: sliding_window.map(|window| window.saturating_sub(1)),
+        ..CudaFlashAttentionOptions::default()
+    }
+}
+
 impl VoxtralMlp {
     fn load(cfg: &Qwen3Config, vb: VarBuilder) -> Result<Self> {
         let gate_proj =
@@ -653,7 +690,7 @@ impl VoxtralMlp {
 mod tests {
     use super::*;
     use crate::models::shared::attention::paged::KvCacheQuantization;
-    use candle_core::{D, DType};
+    use candle_core::{DType, D};
     use std::collections::HashMap;
 
     fn tiny_cfg() -> Qwen3Config {
@@ -848,6 +885,20 @@ mod tests {
             .to_vec2::<f32>()
             .unwrap();
         assert_eq!(decode_mask, vec![vec![-1e4, -1e4, 0.0, 0.0, 0.0]]);
+    }
+
+    #[test]
+    fn voxtral_sliding_flash_options_match_mask_window_width() {
+        let options = voxtral_sliding_cuda_flash_attention_options(Some(3));
+        assert_eq!(options.window_size_left, Some(2));
+        assert_eq!(options.window_size_right, None);
+        assert!(options.alibi_slopes.is_none());
+
+        let single_token = voxtral_sliding_cuda_flash_attention_options(Some(1));
+        assert_eq!(single_token.window_size_left, Some(0));
+
+        let full_context = voxtral_sliding_cuda_flash_attention_options(None);
+        assert_eq!(full_context.window_size_left, None);
     }
 
     #[test]

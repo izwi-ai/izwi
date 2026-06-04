@@ -10,6 +10,9 @@ use candle_nn::{
 
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::core::repeat_kv;
+use crate::models::shared::attention::flash::{
+    flash_attention_requested, try_fused_self_attention_with_options, CudaFlashAttentionOptions,
+};
 
 use super::super::layers::linear_forward_last_dim;
 use super::acoustic::{strip_audio_token_offset, AudioCodeValue};
@@ -136,6 +139,7 @@ struct VoxtralCodecAttention {
     sliding_window: usize,
     causal: bool,
     alibi_slopes: Vec<f32>,
+    alibi_slopes_tensor: Option<Tensor>,
 }
 
 struct VoxtralCodecFeedForward {
@@ -596,6 +600,16 @@ impl VoxtralCodecAttention {
         } else {
             None
         };
+        let alibi_slopes = alibi_slopes(args.n_heads);
+        let alibi_slopes_tensor = if vb.device().is_cuda() {
+            Some(Tensor::from_vec(
+                alibi_slopes.clone(),
+                (args.n_heads,),
+                vb.device(),
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             wq,
             wk,
@@ -608,7 +622,8 @@ impl VoxtralCodecAttention {
             head_dim: args.head_dim,
             sliding_window: window_size,
             causal: args.causal,
-            alibi_slopes: alibi_slopes(args.n_heads),
+            alibi_slopes,
+            alibi_slopes_tensor,
         })
     }
 
@@ -629,9 +644,40 @@ impl VoxtralCodecAttention {
         let q = q.reshape((batch, seq_len, self.n_heads, self.head_dim))?;
         let k = k.reshape((batch, seq_len, self.n_kv_heads, self.head_dim))?;
         let v = v.reshape((batch, seq_len, self.n_kv_heads, self.head_dim))?;
+        let q_heads = q.transpose(1, 2)?;
+        let k_kv_heads = k.transpose(1, 2)?;
+        let v_kv_heads = v.transpose(1, 2)?;
+        if let Some(alibi_slopes) = self.alibi_slopes_tensor.as_ref() {
+            if q_heads.device().is_cuda() && flash_attention_requested() {
+                let cuda_options = voxtral_codec_cuda_flash_attention_options(
+                    self.sliding_window,
+                    self.causal,
+                    alibi_slopes,
+                );
+                if let Some(fused_out) = try_fused_self_attention_with_options(
+                    &q_heads,
+                    &k_kv_heads,
+                    &v_kv_heads,
+                    None,
+                    self.head_dim,
+                    self.causal,
+                    cuda_options,
+                )? {
+                    let out = fused_out
+                        .transpose(1, 2)?
+                        .reshape((batch, seq_len, q_dim))?;
+                    if out.dim(2)? != q_dim || kv_dim == 0 {
+                        return Err(Error::InferenceError(
+                            "Voxtral codec attention produced an invalid shape".to_string(),
+                        ));
+                    }
+                    return linear_forward_last_dim(&self.wo, &out);
+                }
+            }
+        }
         let k = repeat_kv(&k, self.n_heads, self.n_kv_heads)?;
         let v = repeat_kv(&v, self.n_heads, self.n_kv_heads)?;
-        let q = q.transpose(1, 2)?;
+        let q = q_heads;
         let k = k.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
         let q = q.reshape((batch * self.n_heads, seq_len, self.head_dim))?;
@@ -982,6 +1028,19 @@ fn alibi_slopes(n_heads: usize) -> Vec<f32> {
     slopes
 }
 
+fn voxtral_codec_cuda_flash_attention_options<'a>(
+    sliding_window: usize,
+    causal: bool,
+    alibi_slopes: &'a Tensor,
+) -> CudaFlashAttentionOptions<'a> {
+    CudaFlashAttentionOptions {
+        window_size_left: Some(sliding_window),
+        window_size_right: if causal { None } else { Some(sliding_window) },
+        alibi_slopes: Some(alibi_slopes),
+        ..CudaFlashAttentionOptions::default()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn alibi_attention_bias(
     batch: usize,
@@ -1131,6 +1190,22 @@ mod tests {
         assert!(values[0][0][1].is_infinite());
         assert!(values[0][3][0].is_infinite());
         assert_eq!(values[0][3][1], -2.0);
+    }
+
+    #[test]
+    fn codec_flash_options_use_raw_window_and_alibi_slopes() {
+        let device = Device::Cpu;
+        let slopes = Tensor::from_vec(vec![1.0f32, 0.5], (2,), &device).unwrap();
+
+        let causal = voxtral_codec_cuda_flash_attention_options(4, true, &slopes);
+        assert_eq!(causal.window_size_left, Some(4));
+        assert_eq!(causal.window_size_right, None);
+        assert!(causal.alibi_slopes.is_some());
+
+        let bidirectional = voxtral_codec_cuda_flash_attention_options(4, false, &slopes);
+        assert_eq!(bidirectional.window_size_left, Some(4));
+        assert_eq!(bidirectional.window_size_right, Some(4));
+        assert!(bidirectional.alibi_slopes.is_some());
     }
 
     fn tiny_codec_config() -> VoxtralTtsConfig {

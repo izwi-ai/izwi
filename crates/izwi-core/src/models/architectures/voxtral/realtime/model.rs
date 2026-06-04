@@ -15,6 +15,7 @@ use crate::models::architectures::qwen3::core::{build_rope_cache, Qwen3Cache};
 use crate::models::architectures::voxtral::lm::VoxtralLM;
 use crate::models::shared::attention::flash::{
     flash_attention_compiled, flash_attention_requested, try_fused_self_attention,
+    try_fused_self_attention_with_options, CudaFlashAttentionOptions,
 };
 use crate::models::shared::attention::paged::{KvCacheQuantization, DEFAULT_KV_PAGE_SIZE};
 use crate::models::shared::config::checkpoint_dtype_from_config_json;
@@ -989,6 +990,32 @@ impl WhisperAttention {
                     .map_err(|e| Error::InferenceError(e.to_string()));
             }
         }
+        if is_causal
+            && self.sliding_window.is_some()
+            && q.device().is_cuda()
+            && flash_attention_requested()
+        {
+            let cuda_options = voxtral_realtime_cuda_sliding_flash_options(self.sliding_window);
+            if let Some(fused_out) = try_fused_self_attention_with_options(
+                &q,
+                &k,
+                &v,
+                None,
+                self.head_dim,
+                true,
+                cuda_options,
+            )? {
+                let attn_output = fused_out.transpose(1, 2)?.reshape((
+                    bsz,
+                    seq_len,
+                    self.num_heads * self.head_dim,
+                ))?;
+                return self
+                    .out_proj
+                    .forward(&attn_output)
+                    .map_err(|e| Error::InferenceError(e.to_string()));
+            }
+        }
 
         // Scaled dot-product attention
         let q = q.reshape((bsz * self.num_heads, seq_len, self.head_dim))?;
@@ -1049,6 +1076,15 @@ fn create_causal_mask(
     mask_tensor
         .to_dtype(dtype)
         .map_err(|e| Error::InferenceError(e.to_string()))
+}
+
+fn voxtral_realtime_cuda_sliding_flash_options(
+    sliding_window: Option<usize>,
+) -> CudaFlashAttentionOptions<'static> {
+    CudaFlashAttentionOptions {
+        window_size_left: sliding_window.map(|window| window.saturating_sub(1)),
+        ..CudaFlashAttentionOptions::default()
+    }
 }
 
 fn attention_scale_tensor(scale: f64, reference: &Tensor) -> Result<Tensor> {
@@ -1377,6 +1413,7 @@ mod tests {
         offline_streaming_padding_samples, pool_audio_embeddings_by_block,
         prepare_realtime_conv_input, resample_audio, select_voxtral_dtype, text_delta,
         voxtral_dense_decode_max_tokens, voxtral_generation_prefix_len,
+        voxtral_realtime_cuda_sliding_flash_options,
     };
     use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile};
     use crate::models::shared::attention::paged::DEFAULT_KV_PAGE_SIZE;
@@ -1412,6 +1449,17 @@ mod tests {
         let cuda_cache = build_voxtral_decode_cache(2, DeviceKind::Cuda, 128);
         assert_eq!(cuda_cache.page_size(), DEFAULT_KV_PAGE_SIZE);
         assert_eq!(cuda_cache.dense_decode_max_tokens(), 128);
+    }
+
+    #[test]
+    fn voxtral_realtime_flash_options_match_causal_mask_window_width() {
+        let options = voxtral_realtime_cuda_sliding_flash_options(Some(76));
+        assert_eq!(options.window_size_left, Some(75));
+        assert_eq!(options.window_size_right, None);
+        assert!(options.alibi_slopes.is_none());
+
+        let single_token = voxtral_realtime_cuda_sliding_flash_options(Some(1));
+        assert_eq!(single_token.window_size_left, Some(0));
     }
 
     #[test]
