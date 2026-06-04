@@ -5,10 +5,10 @@ use crate::catalog::ModelVariant;
 use super::config::{DEFAULT_CFG_ALPHA, DEFAULT_N_DECODING_STEPS};
 
 pub const VOXTRAL_TTS_AUTO_MIN_OUTPUT_FRAMES: usize = 12;
-pub const VOXTRAL_TTS_AUTO_MAX_OUTPUT_FRAMES: usize = 96;
-const VOXTRAL_TTS_WORDS_PER_SECOND: f32 = 2.5;
-const VOXTRAL_TTS_AUTO_PADDING_SECONDS: f32 = 0.6;
-const VOXTRAL_TTS_AUTO_PADDING_FRAMES: usize = 4;
+pub const VOXTRAL_TTS_AUTO_MAX_OUTPUT_FRAMES: usize = ModelVariant::VOXTRAL_TTS_MAX_OUTPUT_FRAMES;
+const VOXTRAL_TTS_WORDS_PER_SECOND: f32 = 2.0;
+const VOXTRAL_TTS_AUTO_PADDING_SECONDS: f32 = 1.0;
+const VOXTRAL_TTS_AUTO_PADDING_FRAMES: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VoxtralTtsGenerationParams {
@@ -145,7 +145,14 @@ mod tests {
             "The costs split cleanly into three buckets",
         );
         assert!(short.auto_frame_budget);
-        assert_eq!(short.max_frames, 47);
+        assert_eq!(short.max_frames, 65);
+
+        let moderate = VoxtralTtsGenerationParams::from_generation_config_for_text(
+            &config,
+            &"word ".repeat(120),
+        );
+        assert!(moderate.max_frames > 96);
+        assert!(moderate.max_frames < VOXTRAL_TTS_AUTO_MAX_OUTPUT_FRAMES);
 
         let long = VoxtralTtsGenerationParams::from_generation_config_for_text(
             &config,
