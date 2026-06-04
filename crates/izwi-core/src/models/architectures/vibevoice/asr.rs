@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use candle_core::{DType, IndexOp, Tensor};
+use candle_core::{D, DType, IndexOp, Tensor};
 use serde::Serialize;
 use serde_json::json;
 use tracing::info;
@@ -22,6 +22,7 @@ use crate::models::architectures::vibevoice::tokenizer::{
     VibeVoiceAcousticTokenizer, VibeVoiceSemanticTokenizer, VibeVoiceTokenizerEncoderOutput,
     VibeVoiceTokenizerStreamingCache,
 };
+use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::weights::gguf::load_model_weights;
 
 const DEFAULT_MAX_NEW_TOKENS: usize = 768;
@@ -296,14 +297,16 @@ impl VibeVoiceAsrModel {
             &speech_features.to_dtype(input_embeds.dtype())?,
         )?;
 
-        let mut cache = Qwen3Cache::new(self.language_model.num_layers());
+        let mut cache = self.build_decode_cache();
+        let decode_cache_dense_max_tokens = cache.dense_decode_max_tokens();
+        let cuda_device_argmax = self.device.kind.is_cuda();
         let prefill_started = Instant::now();
         let logits =
             self.language_model
                 .forward_with_embeds(&input_embeds, 0, Some(&mut cache), None)?;
         let prefill_ms = elapsed_ms(prefill_started);
         let mut pos = prompt.input_ids.len();
-        let mut next = argmax_last_logits(&logits)?;
+        let mut next = argmax_last_logits(&logits, cuda_device_argmax)?;
         let mut generated = Vec::new();
         let mut assembled = String::new();
         let built_in_stop_tokens = [
@@ -345,7 +348,7 @@ impl VibeVoiceAsrModel {
             let token = Tensor::from_vec(vec![next], (1, 1), &self.device.device)?;
             let logits = self.language_model.forward(&token, pos, Some(&mut cache))?;
             pos += 1;
-            next = argmax_last_logits(&logits)?;
+            next = argmax_last_logits(&logits, cuda_device_argmax)?;
         }
         let decode_ms = elapsed_ms(decode_started);
         let reached_max_tokens = stop_reason.is_none() && generated.len() >= max_new_tokens;
@@ -405,6 +408,9 @@ impl VibeVoiceAsrModel {
                     "dtype": format!("{:?}", self.dtype),
                     "device_kind": format!("{:?}", self.device.kind),
                     "decoder_layers": self.config.decoder_config.num_hidden_layers,
+                    "cuda_dense_decode_cache": decode_cache_dense_max_tokens > 0,
+                    "dense_decode_max_tokens": decode_cache_dense_max_tokens,
+                    "cuda_device_argmax": cuda_device_argmax,
                 },
                 "timings_ms": {
                     "preprocess": preprocess_ms,
@@ -415,6 +421,17 @@ impl VibeVoiceAsrModel {
                 }
             })),
         })
+    }
+
+    fn build_decode_cache(&self) -> Qwen3Cache {
+        if self.device.kind.is_cuda() {
+            return Qwen3Cache::with_page_size_and_dense_decode(
+                self.language_model.num_layers(),
+                default_kv_page_size(),
+                &self.device.device,
+            );
+        }
+        Qwen3Cache::new(self.language_model.num_layers())
     }
 
     fn encode_speech(&self, speech: &Tensor) -> Result<(Tensor, VibeVoiceAsrEncodeStats)> {
@@ -548,9 +565,17 @@ fn replace_range_with_features(
     Tensor::cat(&parts, 1).map_err(Error::from)
 }
 
-fn argmax_last_logits(logits: &Tensor) -> Result<u32> {
+fn argmax_last_logits(logits: &Tensor, use_device_argmax: bool) -> Result<u32> {
     let seq_len = logits.dim(1)?;
-    let row = logits.i((0, seq_len - 1))?.to_dtype(DType::F32)?;
+    let row = logits.i((0, seq_len - 1))?;
+    if use_device_argmax {
+        return argmax_logits_row_device(&row);
+    }
+    argmax_logits_row_host(&row)
+}
+
+fn argmax_logits_row_host(row: &Tensor) -> Result<u32> {
+    let row = row.to_dtype(DType::F32)?;
     let values = row.to_vec1::<f32>()?;
     values
         .iter()
@@ -558,6 +583,35 @@ fn argmax_last_logits(logits: &Tensor) -> Result<u32> {
         .max_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(idx, _)| idx as u32)
         .ok_or_else(|| Error::InferenceError("VibeVoice-ASR logits row was empty".to_string()))
+}
+
+fn argmax_logits_row_device(logits: &Tensor) -> Result<u32> {
+    let logits = match logits.rank() {
+        1 => logits.clone(),
+        2 => {
+            let (batch, _vocab) = logits.dims2()?;
+            if batch != 1 {
+                return Err(Error::InferenceError(format!(
+                    "Unexpected batched VibeVoice-ASR logits row: expected batch=1, got {batch}"
+                )));
+            }
+            logits.i(0)?
+        }
+        rank => {
+            return Err(Error::InferenceError(format!(
+                "Unexpected VibeVoice-ASR logits row rank for argmax: {rank}"
+            )));
+        }
+    };
+    let idx = logits.argmax(D::Minus1)?;
+    let idx = if idx.rank() == 0 {
+        idx
+    } else {
+        idx.squeeze(0)?
+    };
+    idx.to_dtype(DType::U32)?
+        .to_scalar::<u32>()
+        .map_err(Error::from)
 }
 
 fn collect_stop_token_ids(built_in: &[u32], requested: &[u32]) -> Vec<u32> {
@@ -1020,6 +1074,24 @@ mod tests {
     #[test]
     fn stop_token_ids_merge_built_ins_and_request_tokens() {
         assert_eq!(collect_stop_token_ids(&[1, 2], &[2, 3, 1]), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn argmax_last_logits_preserves_host_fallback_selection() {
+        let device = candle_core::Device::Cpu;
+        let logits =
+            Tensor::from_vec(vec![0.0f32, 3.0, 1.0, 2.0, -1.0, 5.0], (1, 2, 3), &device).unwrap();
+
+        assert_eq!(argmax_last_logits(&logits, false).unwrap(), 2);
+    }
+
+    #[test]
+    fn argmax_last_logits_can_select_on_device() {
+        let device = candle_core::Device::Cpu;
+        let logits =
+            Tensor::from_vec(vec![0.0f32, 3.0, 1.0, 2.0, -1.0, 5.0], (1, 2, 3), &device).unwrap();
+
+        assert_eq!(argmax_last_logits(&logits, true).unwrap(), 2);
     }
 
     #[test]
