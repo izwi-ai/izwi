@@ -155,7 +155,26 @@ impl VibeVoiceDiffusionHead {
         let timestep_embeddings =
             Tensor::cat(&[timestep_embedding.clone(), timestep_embedding.clone()], 0)?;
         let conditions = Tensor::cat(&[condition.clone(), negative_condition.clone()], 0)?;
-        let output = self.forward_with_precomputed(&latents, &timestep_embeddings, &conditions)?;
+        self.forward_cfg_batched_with_prebatched(
+            &latents,
+            &timestep_embeddings,
+            &conditions,
+            cfg_scale,
+        )
+    }
+
+    pub fn forward_cfg_batched_with_prebatched(
+        &self,
+        batched_latents: &Tensor,
+        batched_timestep_embedding: &Tensor,
+        batched_conditions: &Tensor,
+        cfg_scale: &Tensor,
+    ) -> Result<Tensor> {
+        let output = self.forward_with_precomputed(
+            batched_latents,
+            batched_timestep_embedding,
+            batched_conditions,
+        )?;
         let positive = output.narrow(0, 0, 1)?;
         let negative = output.narrow(0, 1, 1)?;
         classifier_free_guidance(&positive, &negative, cfg_scale)
