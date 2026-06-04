@@ -66,6 +66,7 @@ struct VoxtralTtsPipeline {
 struct VoxtralAudioTokenEmbeddings {
     embeddings: Embedding,
     offsets: Vec<u32>,
+    offsets_tensor: Option<Tensor>,
     codebook_sizes: Vec<u32>,
     num_codebooks: usize,
 }
@@ -258,7 +259,7 @@ impl VoxtralTtsPipeline {
             let acoustic_start = Instant::now();
             let generated = self
                 .acoustic_transformer
-                .forward_audio_codes_with_steps_and_eos_policy(
+                .forward_audio_codes_with_feedback_tensor(
                     &last_hidden,
                     params.cfg_alpha,
                     params.n_decoding_steps,
@@ -267,14 +268,15 @@ impl VoxtralTtsPipeline {
                 .map_err(|err| {
                     Error::InferenceError(format!("Voxtral TTS acoustic generation failed: {err}"))
                 })?;
+            let feedback_code_tensor = generated.shifted_code_tensor;
             acoustic_duration += acoustic_start.elapsed();
-            let frame = generated.into_iter().next().ok_or_else(|| {
+            let frame = generated.frames.into_iter().next().ok_or_else(|| {
                 Error::InferenceError("Voxtral acoustic transformer returned no frames".to_string())
             })?;
             if frame.first().copied() == Some(AudioSpecialToken::End.id()) {
                 break;
             }
-            let feedback_frame = frame.clone();
+            let feedback_frame = feedback_code_tensor.is_none().then(|| frame.clone());
             frames.push(frame);
             if params.auto_frame_budget
                 && (frames.len() == 1 || frames.len() % 8 == 0 || frame_idx + 1 >= max_frames)
@@ -289,9 +291,18 @@ impl VoxtralTtsPipeline {
             if frame_idx + 1 >= max_frames {
                 break;
             }
-            let next_embed = self
-                .audio_embeddings
-                .embedding_for_shifted_codes(&feedback_frame)?;
+            let next_embed = if let Some(feedback_code_tensor) = feedback_code_tensor.as_ref() {
+                self.audio_embeddings
+                    .embedding_for_shifted_code_tensor(feedback_code_tensor)?
+            } else {
+                let feedback_frame = feedback_frame.as_ref().ok_or_else(|| {
+                    Error::InferenceError(
+                        "Voxtral TTS feedback frame missing host and tensor codes".to_string(),
+                    )
+                })?;
+                self.audio_embeddings
+                    .embedding_for_shifted_codes(feedback_frame)?
+            };
             let lm_decode_start = Instant::now();
             let hidden = self
                 .language_model
@@ -413,6 +424,16 @@ impl VoxtralAudioTokenEmbeddings {
                 Error::ConfigError("Voxtral audio embedding table size overflowed".to_string())
             })?;
         let padded_size = 128 * total_size.div_ceil(128);
+        let num_codebooks = config.num_codebooks();
+        let offsets_tensor = if vb.device().is_cuda() {
+            Some(Tensor::from_vec(
+                offsets.clone(),
+                (1, num_codebooks),
+                vb.device(),
+            )?)
+        } else {
+            None
+        };
         for candidate in [
             "mm_audio_embeddings.audio_codebook_embeddings.embeddings.weight",
             "audio_tokenizer.audio_token_embedding.embeddings.weight",
@@ -423,8 +444,9 @@ impl VoxtralAudioTokenEmbeddings {
                 return Ok(Self {
                     embeddings: Embedding::new(weights, embedding_dim),
                     offsets,
+                    offsets_tensor: offsets_tensor.clone(),
                     codebook_sizes,
-                    num_codebooks: config.num_codebooks(),
+                    num_codebooks,
                 });
             }
         }
@@ -456,6 +478,36 @@ impl VoxtralAudioTokenEmbeddings {
             (1, shifted_codes.len()),
             self.embeddings.embeddings().device(),
         )?;
+        self.embeddings
+            .forward(&ids)?
+            .sum(1)?
+            .unsqueeze(1)
+            .map_err(Error::from)
+    }
+
+    fn embedding_for_shifted_code_tensor(&self, shifted_codes: &Tensor) -> Result<Tensor> {
+        let shifted_codes = match shifted_codes.rank() {
+            1 => shifted_codes.unsqueeze(0)?,
+            2 => shifted_codes.clone(),
+            rank => {
+                return Err(Error::InferenceError(format!(
+                    "Voxtral audio code tensor expected rank 1 or 2, got rank {rank}"
+                )));
+            }
+        };
+        if shifted_codes.dim(1)? != self.num_codebooks {
+            return Err(Error::InferenceError(format!(
+                "Voxtral audio embedding expected {} codebooks, got {}",
+                self.num_codebooks,
+                shifted_codes.dim(1)?
+            )));
+        }
+        let offsets = self.offsets_tensor.as_ref().ok_or_else(|| {
+            Error::InferenceError(
+                "Voxtral audio tensor embedding requires CUDA offsets tensor".to_string(),
+            )
+        })?;
+        let ids = shifted_codes.to_dtype(DType::U32)?.broadcast_add(offsets)?;
         self.embeddings
             .forward(&ids)?
             .sum(1)?
@@ -717,6 +769,44 @@ mod tests {
         let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
         let embeddings = VoxtralAudioTokenEmbeddings::load(&config, 4, vb).unwrap();
         let embed = embeddings.embedding_for_shifted_codes(&[2, 3, 4]).unwrap();
+        assert_eq!(embed.dims(), &[1, 1, 4]);
+        let values = embed.to_vec3::<f32>().unwrap();
+        assert_eq!(values[0][0], vec![26.0, 26.75, 27.5, 28.25]);
+    }
+
+    #[test]
+    fn audio_embedding_accepts_shifted_code_tensors() {
+        let device = Device::Cpu;
+        let config = tiny_audio_embedding_config();
+        let mut rows = Vec::new();
+        for row in 0..128 {
+            rows.extend([
+                row as f32,
+                row as f32 + 0.25,
+                row as f32 + 0.5,
+                row as f32 + 0.75,
+            ]);
+        }
+        let tensors = HashMap::from([(
+            "mm_audio_embeddings.audio_codebook_embeddings.embeddings.weight".to_string(),
+            Tensor::from_vec(rows, (128, 4), &device).unwrap(),
+        )]);
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
+        let mut embeddings = VoxtralAudioTokenEmbeddings::load(&config, 4, vb).unwrap();
+        embeddings.offsets_tensor = Some(
+            Tensor::from_vec(
+                embeddings.offsets.clone(),
+                (1, embeddings.num_codebooks),
+                &device,
+            )
+            .unwrap(),
+        );
+        let codes = Tensor::from_vec(vec![2u32, 3, 4], (1, 3), &device).unwrap();
+
+        let embed = embeddings
+            .embedding_for_shifted_code_tensor(&codes)
+            .unwrap();
+
         assert_eq!(embed.dims(), &[1, 1, 4]);
         let values = embed.to_vec3::<f32>().unwrap();
         assert_eq!(values[0][0], vec![26.0, 26.75, 27.5, 28.25]);
