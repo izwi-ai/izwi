@@ -7,11 +7,12 @@ use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{Embedding, Module, VarBuilder};
 use tracing::{info, warn};
 
-use crate::backends::DeviceProfile;
+use crate::backends::{DeviceKind, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::core::Qwen3Cache;
 use crate::models::architectures::voxtral::lm::VoxtralLM;
+use crate::models::shared::attention::paged::{KvCacheQuantization, DEFAULT_KV_PAGE_SIZE};
 
 use super::acoustic::{AudioSpecialToken, FlowMatchingAudioTransformer, AUDIO_SPECIAL_TOKEN_COUNT};
 use super::codec::{VoxtralCodecConfig, VoxtralCodecDecoder, VoxtralCodecTimeline};
@@ -59,6 +60,7 @@ struct VoxtralTtsPipeline {
     codec_decoder: VoxtralCodecDecoder,
     audio_embeddings: VoxtralAudioTokenEmbeddings,
     device: Device,
+    device_kind: DeviceKind,
 }
 
 struct VoxtralAudioTokenEmbeddings {
@@ -150,6 +152,7 @@ impl VoxtralTtsModel {
             codec_decoder,
             audio_embeddings,
             device: device.device.clone(),
+            device_kind: device.kind,
         });
         Ok(model)
     }
@@ -230,7 +233,13 @@ impl VoxtralTtsPipeline {
                 Error::InferenceError(format!("Voxtral TTS prompt embedding failed: {err}"))
             })?;
         let prompt_duration = prompt_start.elapsed();
-        let mut cache = Qwen3Cache::new(self.language_model.num_layers());
+        let max_frames = params.max_frames.max(1);
+        let dense_decode_tokens = prompt.input_ids.len().saturating_add(max_frames);
+        let mut cache = build_voxtral_tts_decode_cache(
+            self.language_model.num_layers(),
+            self.device_kind,
+            dense_decode_tokens,
+        );
         let lm_prefill_start = Instant::now();
         let prefill_hidden = self
             .language_model
@@ -245,7 +254,6 @@ impl VoxtralTtsPipeline {
         let mut acoustic_duration = Duration::ZERO;
         let mut lm_decode_duration = Duration::ZERO;
 
-        let max_frames = params.max_frames.max(1);
         for frame_idx in 0..max_frames {
             let acoustic_start = Instant::now();
             let generated = self
@@ -527,6 +535,27 @@ fn load_voxtral_tts_weights<'a>(
     }
 }
 
+fn build_voxtral_tts_decode_cache(
+    num_layers: usize,
+    device_kind: DeviceKind,
+    max_decode_tokens: usize,
+) -> Qwen3Cache {
+    Qwen3Cache::with_page_size_quantization_and_dense_decode_tokens(
+        num_layers,
+        DEFAULT_KV_PAGE_SIZE,
+        KvCacheQuantization::None,
+        voxtral_tts_dense_decode_max_tokens(device_kind, max_decode_tokens),
+    )
+}
+
+fn voxtral_tts_dense_decode_max_tokens(device_kind: DeviceKind, max_decode_tokens: usize) -> usize {
+    if device_kind.is_cuda() {
+        max_decode_tokens.max(1)
+    } else {
+        0
+    }
+}
+
 pub fn select_voxtral_tts_dtypes(
     device: &DeviceProfile,
     dtype_override: Option<&str>,
@@ -625,6 +654,28 @@ mod tests {
         assert_eq!(cuda_plan.language_model, DType::BF16);
         assert_eq!(cuda_plan.acoustic_transformer, DType::BF16);
         assert_eq!(cuda_plan.codec, DType::BF16);
+    }
+
+    #[test]
+    fn tts_dense_decode_cache_is_cuda_only() {
+        assert_eq!(voxtral_tts_dense_decode_max_tokens(DeviceKind::Cpu, 128), 0);
+        assert_eq!(
+            voxtral_tts_dense_decode_max_tokens(DeviceKind::Metal, 128),
+            0
+        );
+        assert_eq!(
+            voxtral_tts_dense_decode_max_tokens(DeviceKind::Cuda, 128),
+            128
+        );
+
+        let cpu_cache = build_voxtral_tts_decode_cache(2, DeviceKind::Cpu, 128);
+        assert_eq!(cpu_cache.dense_decode_max_tokens(), 0);
+
+        let metal_cache = build_voxtral_tts_decode_cache(2, DeviceKind::Metal, 128);
+        assert_eq!(metal_cache.dense_decode_max_tokens(), 0);
+
+        let cuda_cache = build_voxtral_tts_decode_cache(2, DeviceKind::Cuda, 128);
+        assert_eq!(cuda_cache.dense_decode_max_tokens(), 128);
     }
 
     #[test]
