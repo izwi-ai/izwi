@@ -1,0 +1,27 @@
+# VibeVoice CUDA benchmark matrix.
+#
+# Run against a CUDA server with:
+#   IZWI_BACKEND=cuda IZWI_USE_FLASH_ATTENTION=1 izwi bench run benchmarks/manifests/vibevoice-cuda.toml
+#
+# The TTS case uses the small fox fixture as both reference audio and
+# transcript so benchmark client setup stays deterministic.
+
+[[benchmarks]]
+name = "vibevoice-tts-reference-c1"
+command = "tts"
+model = "VibeVoice-1.5B"
+iterations = 1
+concurrent = 1
+warmup = false
+text = "This is a short VibeVoice CUDA benchmark."
+reference_audio = "../../data/fox.wav"
+reference_text_file = "../../data/fox.md"
+
+[[benchmarks]]
+name = "vibevoice-asr-short-c1"
+command = "asr"
+model = "VibeVoice-ASR"
+file = "../../data/test.wav"
+iterations = 1
+concurrent = 1
+warmup = false

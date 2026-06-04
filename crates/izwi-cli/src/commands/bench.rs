@@ -2,14 +2,14 @@ use crate::error::{CliError, Result};
 use crate::http;
 use crate::style::Theme;
 use crate::{BenchCommands, OutputFormat};
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use chrono::{DateTime, Utc};
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -118,6 +118,14 @@ struct TtsBenchSample {
     tokens_generated: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct TtsBenchReference {
+    saved_voice_id: Option<String>,
+    reference_audio_base64: Option<String>,
+    reference_audio_path: Option<String>,
+    reference_text: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 struct AsrBenchResponse {
     #[serde(default)]
@@ -218,6 +226,9 @@ struct BenchmarkRunConfig {
     max_tokens: Option<usize>,
     text: Option<String>,
     file: Option<String>,
+    saved_voice_id: Option<String>,
+    reference_audio: Option<String>,
+    reference_text: Option<String>,
     language: Option<String>,
     duration_secs: Option<u64>,
 }
@@ -295,6 +306,10 @@ struct BenchmarkManifestCase {
     max_tokens: Option<usize>,
     text: Option<String>,
     file: Option<String>,
+    saved_voice_id: Option<String>,
+    reference_audio: Option<String>,
+    reference_text: Option<String>,
+    reference_text_file: Option<String>,
     language: Option<String>,
     duration_secs: Option<u64>,
     matrix: Option<BenchmarkManifestMatrix>,
@@ -311,6 +326,10 @@ struct BenchmarkManifestMatrix {
     max_tokens: Option<Vec<usize>>,
     text: Option<Vec<String>>,
     file: Option<Vec<String>>,
+    saved_voice_id: Option<Vec<String>>,
+    reference_audio: Option<Vec<String>>,
+    reference_text: Option<Vec<String>>,
+    reference_text_file: Option<Vec<String>>,
     language: Option<Vec<String>>,
     duration_secs: Option<Vec<u64>>,
 }
@@ -332,6 +351,10 @@ enum MatrixValue {
     MaxTokens(usize),
     Text(String),
     File(String),
+    SavedVoiceId(String),
+    ReferenceAudio(String),
+    ReferenceText(String),
+    ReferenceTextFile(String),
     Language(String),
     DurationSecs(u64),
 }
@@ -444,10 +467,25 @@ pub async fn execute(
             model,
             iterations,
             text,
+            saved_voice_id,
+            reference_audio,
+            reference_text,
+            reference_text_file,
             concurrent,
             warmup,
         } => bench_tts(
-            server, &model, iterations, &text, concurrent, warmup, &options, theme,
+            server,
+            &model,
+            iterations,
+            &text,
+            saved_voice_id.as_deref(),
+            reference_audio.as_deref(),
+            reference_text.as_deref(),
+            reference_text_file.as_deref(),
+            concurrent,
+            warmup,
+            &options,
+            theme,
         )
         .await
         .and_then(|report| emit_report(&options, &report)),
@@ -603,6 +641,10 @@ impl MatrixValue {
             MatrixValue::MaxTokens(value) => case.max_tokens = Some(*value),
             MatrixValue::Text(value) => case.text = Some(value.clone()),
             MatrixValue::File(value) => case.file = Some(value.clone()),
+            MatrixValue::SavedVoiceId(value) => case.saved_voice_id = Some(value.clone()),
+            MatrixValue::ReferenceAudio(value) => case.reference_audio = Some(value.clone()),
+            MatrixValue::ReferenceText(value) => case.reference_text = Some(value.clone()),
+            MatrixValue::ReferenceTextFile(value) => case.reference_text_file = Some(value.clone()),
             MatrixValue::Language(value) => case.language = Some(value.clone()),
             MatrixValue::DurationSecs(value) => case.duration_secs = Some(*value),
         }
@@ -615,6 +657,10 @@ impl MatrixValue {
             | MatrixValue::System(value)
             | MatrixValue::Text(value)
             | MatrixValue::File(value)
+            | MatrixValue::SavedVoiceId(value)
+            | MatrixValue::ReferenceAudio(value)
+            | MatrixValue::ReferenceText(value)
+            | MatrixValue::ReferenceTextFile(value)
             | MatrixValue::Language(value) => matrix_label_string(value),
             MatrixValue::Iterations(value) => value.to_string(),
             MatrixValue::Concurrent(value) => value.to_string(),
@@ -652,6 +698,30 @@ impl BenchmarkManifestMatrix {
         )?;
         add_matrix_dimension(&mut dimensions, "text", &self.text, MatrixValue::Text)?;
         add_matrix_dimension(&mut dimensions, "file", &self.file, MatrixValue::File)?;
+        add_matrix_dimension(
+            &mut dimensions,
+            "saved_voice_id",
+            &self.saved_voice_id,
+            MatrixValue::SavedVoiceId,
+        )?;
+        add_matrix_dimension(
+            &mut dimensions,
+            "reference_audio",
+            &self.reference_audio,
+            MatrixValue::ReferenceAudio,
+        )?;
+        add_matrix_dimension(
+            &mut dimensions,
+            "reference_text",
+            &self.reference_text,
+            MatrixValue::ReferenceText,
+        )?;
+        add_matrix_dimension(
+            &mut dimensions,
+            "reference_text_file",
+            &self.reference_text_file,
+            MatrixValue::ReferenceTextFile,
+        )?;
         add_matrix_dimension(
             &mut dimensions,
             "language",
@@ -880,14 +950,21 @@ fn summary_metric(summary: &serde_json::Value, path: &[&str]) -> Option<f64> {
 
 fn percent_change(current: f64, baseline: f64) -> f64 {
     if baseline == 0.0 {
-        if current == 0.0 {
-            0.0
-        } else {
-            f64::INFINITY
-        }
+        if current == 0.0 { 0.0 } else { f64::INFINITY }
     } else {
         (current - baseline) * 100.0 / baseline
     }
+}
+
+fn resolve_manifest_path(raw: Option<&str>, manifest_dir: &Path) -> Option<PathBuf> {
+    raw.map(|file| {
+        let path = Path::new(file);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            manifest_dir.join(path)
+        }
+    })
 }
 
 async fn bench_manifest(
@@ -960,11 +1037,19 @@ async fn bench_manifest(
                     .as_deref()
                     .unwrap_or("Hello, this is a benchmark test for text to speech synthesis.");
                 let model = case.model.as_deref().unwrap_or("qwen3-tts-0.6b-base");
+                let reference_audio =
+                    resolve_manifest_path(case.reference_audio.as_deref(), manifest_dir);
+                let reference_text_file =
+                    resolve_manifest_path(case.reference_text_file.as_deref(), manifest_dir);
                 bench_tts(
                     &suite_server,
                     model,
                     case.iterations.unwrap_or(10),
                     text,
+                    case.saved_voice_id.as_deref(),
+                    reference_audio.as_deref(),
+                    case.reference_text.as_deref(),
+                    reference_text_file.as_deref(),
                     case.concurrent.unwrap_or(1),
                     case.warmup.unwrap_or(false),
                     options,
@@ -1304,6 +1389,9 @@ async fn bench_chat(
             max_tokens: Some(max_tokens),
             text: None,
             file: None,
+            saved_voice_id: None,
+            reference_audio: None,
+            reference_text: None,
             language: None,
             duration_secs: None,
         },
@@ -1360,6 +1448,10 @@ async fn bench_tts(
     model: &str,
     iterations: u32,
     text: &str,
+    saved_voice_id: Option<&str>,
+    reference_audio: Option<&Path>,
+    reference_text: Option<&str>,
+    reference_text_file: Option<&Path>,
     concurrent: u32,
     warmup: bool,
     options: &BenchOptions,
@@ -1382,12 +1474,19 @@ async fn bench_tts(
     let started_at = Utc::now();
     let run_start = Instant::now();
     let metrics_before = fetch_runtime_metrics(server).await;
+    let reference = resolve_tts_bench_reference(
+        saved_voice_id,
+        reference_audio,
+        reference_text,
+        reference_text_file,
+    )
+    .await?;
 
     if warmup {
         if options.interactive() {
             theme.info("Running warmup iteration...");
         }
-        let _ = run_tts_request(server, model, text).await?;
+        let _ = run_tts_request(server, model, text, &reference).await?;
     }
 
     let pb = progress_bar(options.interactive(), iterations as u64);
@@ -1402,22 +1501,23 @@ async fn bench_tts(
 
     let progress = Arc::new(pb);
     let text = Arc::new(text.to_string());
+    let reference = Arc::new(reference);
     let wall_start = Instant::now();
     let samples: Vec<TtsBenchSample> = stream::iter(0..iterations)
         .map(|_| {
             let progress = Arc::clone(&progress);
             let text = Arc::clone(&text);
+            let reference = Arc::clone(&reference);
             let model = model.to_string();
             let server = server.to_string();
             async move {
                 let start = Instant::now();
-                let result =
-                    run_tts_request(&server, &model, text.as_str())
-                        .await
-                        .map(|mut sample| {
-                            sample.total_ms = start.elapsed().as_secs_f64() * 1000.0;
-                            sample
-                        });
+                let result = run_tts_request(&server, &model, text.as_str(), reference.as_ref())
+                    .await
+                    .map(|mut sample| {
+                        sample.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+                        sample
+                    });
                 progress.inc(1);
                 result
             }
@@ -1531,6 +1631,9 @@ async fn bench_tts(
             max_tokens: None,
             text: Some(text.as_ref().clone()),
             file: None,
+            saved_voice_id: reference.saved_voice_id.clone(),
+            reference_audio: reference.reference_audio_path.clone(),
+            reference_text: reference.reference_text.clone(),
             language: None,
             duration_secs: None,
         },
@@ -1777,6 +1880,9 @@ async fn bench_asr(
             max_tokens: None,
             text: None,
             file: Some(audio_file.display().to_string()),
+            saved_voice_id: None,
+            reference_audio: None,
+            reference_text: None,
             language: language.as_deref().map(|value| value.to_string()),
             duration_secs: None,
         },
@@ -1912,6 +2018,9 @@ async fn bench_throughput(
             max_tokens: None,
             text: None,
             file: None,
+            saved_voice_id: None,
+            reference_audio: None,
+            reference_text: None,
             language: None,
             duration_secs: Some(duration),
         },
@@ -1957,14 +2066,96 @@ fn header_u64(response: &reqwest::Response, name: &'static str) -> Option<u64> {
         .and_then(|value| value.parse::<u64>().ok())
 }
 
-async fn run_tts_request(server: &str, model: &str, text: &str) -> Result<TtsBenchSample> {
+async fn resolve_tts_bench_reference(
+    saved_voice_id: Option<&str>,
+    reference_audio: Option<&Path>,
+    reference_text: Option<&str>,
+    reference_text_file: Option<&Path>,
+) -> Result<TtsBenchReference> {
+    let saved_voice_id = normalize_optional_bench_text(saved_voice_id);
+    let reference_text = normalize_optional_bench_text(reference_text);
+    if reference_text.is_some() && reference_text_file.is_some() {
+        return Err(CliError::InvalidInput(
+            "Use either --reference-text or --reference-text-file, not both.".to_string(),
+        ));
+    }
+    let reference_text = match (reference_text, reference_text_file) {
+        (Some(text), None) => Some(text),
+        (None, Some(path)) => normalize_optional_bench_string(
+            tokio::fs::read_to_string(path)
+                .await
+                .map_err(CliError::Io)?,
+        ),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("checked above"),
+    };
+
+    if saved_voice_id.is_some() && (reference_audio.is_some() || reference_text.is_some()) {
+        return Err(CliError::InvalidInput(
+            "Use either --saved-voice-id or --reference-audio/--reference-text, not both."
+                .to_string(),
+        ));
+    }
+    if reference_audio.is_some() != reference_text.is_some() {
+        return Err(CliError::InvalidInput(
+            "Provide --reference-audio and --reference-text together.".to_string(),
+        ));
+    }
+
+    let (reference_audio_base64, reference_audio_path) = match reference_audio {
+        Some(path) => {
+            let audio = tokio::fs::read(path).await.map_err(CliError::Io)?;
+            (
+                Some(STANDARD.encode(audio)),
+                Some(path.display().to_string()),
+            )
+        }
+        None => (None, None),
+    };
+
+    Ok(TtsBenchReference {
+        saved_voice_id,
+        reference_audio_base64,
+        reference_audio_path,
+        reference_text,
+    })
+}
+
+fn normalize_optional_bench_text(value: Option<&str>) -> Option<String> {
+    value.and_then(|value| normalize_optional_bench_string(value.to_string()))
+}
+
+fn normalize_optional_bench_string(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+async fn run_tts_request(
+    server: &str,
+    model: &str,
+    text: &str,
+    reference: &TtsBenchReference,
+) -> Result<TtsBenchSample> {
     let client = http::client(Some(std::time::Duration::from_secs(300)))?;
-    let request_body = serde_json::json!({
+    let mut request_body = serde_json::json!({
         "model": model,
         "input": text,
         "voice": "default",
         "response_format": "wav",
     });
+    if let Some(saved_voice_id) = reference.saved_voice_id.as_deref() {
+        request_body["saved_voice_id"] = serde_json::Value::String(saved_voice_id.to_string());
+    }
+    if let Some(reference_audio) = reference.reference_audio_base64.as_deref() {
+        request_body["reference_audio"] = serde_json::Value::String(reference_audio.to_string());
+    }
+    if let Some(reference_text) = reference.reference_text.as_deref() {
+        request_body["reference_text"] = serde_json::Value::String(reference_text.to_string());
+    }
 
     let response = client
         .post(format!("{}/v1/audio/speech", server))
@@ -2294,9 +2485,7 @@ async fn fetch_runtime_metrics(server: &str) -> Option<RuntimeTelemetrySnapshot>
     None
 }
 
-fn asr_stage_timings_from_diagnostics(
-    diagnostics: &serde_json::Value,
-) -> Option<AsrStageTimings> {
+fn asr_stage_timings_from_diagnostics(diagnostics: &serde_json::Value) -> Option<AsrStageTimings> {
     let timings = diagnostics.get("timings_ms")?.as_object()?;
     let prompt = diagnostics.get("prompt");
     let audio = diagnostics.get("audio");
@@ -2316,12 +2505,8 @@ fn asr_stage_timings_from_diagnostics(
         prefill: timings.get("prefill").and_then(|value| value.as_f64()),
         decode: timings.get("decode").and_then(|value| value.as_f64()),
         model_total: timings.get("model_total").and_then(|value| value.as_f64()),
-        prompt_tokens: prompt
-            .and_then(|value| value.get("prompt_tokens"))
-            .and_then(|value| value.as_u64()),
-        audio_tokens: audio
-            .and_then(|value| value.get("audio_tokens"))
-            .and_then(|value| value.as_u64()),
+        prompt_tokens: diagnostic_u64(prompt, &["prompt_tokens", "tokens"]),
+        audio_tokens: diagnostic_u64(audio, &["audio_tokens", "acoustic_frames"]),
         generated_tokens: decode
             .and_then(|value| value.get("generated_tokens"))
             .and_then(|value| value.as_u64()),
@@ -2329,6 +2514,12 @@ fn asr_stage_timings_from_diagnostics(
             .and_then(|value| value.get("max_new_tokens"))
             .and_then(|value| value.as_u64()),
     })
+}
+
+fn diagnostic_u64(value: Option<&serde_json::Value>, keys: &[&str]) -> Option<u64> {
+    let value = value?;
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(|value| value.as_u64()))
 }
 
 fn diagnostics_contains_whisper_model(diagnostics: &serde_json::Value) -> bool {
@@ -2574,7 +2765,9 @@ fn print_runtime_delta(
         after.decode_ms_avg, after.decode_ms_p50, after.decode_ms_p95
     );
     if matches!(context, RuntimeTelemetryContext::AsrWhisper) {
-        println!("  Decode rolling note: single-pass Whisper ASR may report near-zero engine decode phase.");
+        println!(
+            "  Decode rolling note: single-pass Whisper ASR may report near-zero engine decode phase."
+        );
     }
     println!(
         "  TTFT rolling(avg/p50/p95):       {:.2} / {:.2} / {:.2} ms",
@@ -2852,6 +3045,40 @@ mod tests {
     }
 
     #[test]
+    fn asr_stage_timing_collection_includes_vibevoice_diagnostics() {
+        let diagnostics = serde_json::json!({
+            "model_family": "vibevoice_asr",
+            "audio": {
+                "acoustic_frames": 186
+            },
+            "prompt": {
+                "tokens": 221
+            },
+            "decode": {
+                "generated_tokens": 37,
+                "max_new_tokens": 512
+            },
+            "timings_ms": {
+                "audio_encode": 420.0,
+                "prefill": 530.0,
+                "decode": 910.0,
+                "model_total": 1860.0
+            }
+        });
+
+        let samples = collect_asr_stage_timings_from_diagnostics(&diagnostics);
+
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].audio_encode, Some(420.0));
+        assert_eq!(samples[0].prefill, Some(530.0));
+        assert_eq!(samples[0].decode, Some(910.0));
+        assert_eq!(samples[0].prompt_tokens, Some(221));
+        assert_eq!(samples[0].audio_tokens, Some(186));
+        assert_eq!(samples[0].generated_tokens, Some(37));
+        assert_eq!(samples[0].max_new_tokens, Some(512));
+    }
+
+    #[test]
     fn asr_stage_timing_collection_includes_nested_model_diagnostics() {
         let diagnostics = serde_json::json!({
             "timings_ms": {
@@ -2884,6 +3111,53 @@ mod tests {
         assert_eq!(samples[1].audio_encode, Some(820.0));
         assert_eq!(samples[1].prefill, Some(1080.0));
         assert_eq!(samples[1].generated_tokens, Some(93));
+    }
+
+    #[tokio::test]
+    async fn tts_bench_reference_resolves_audio_and_text_file_once() {
+        let dir = tempdir().expect("temp dir should be created");
+        let audio = dir.path().join("reference.wav");
+        let text = dir.path().join("reference.txt");
+        tokio::fs::write(&audio, b"RIFF")
+            .await
+            .expect("write audio");
+        tokio::fs::write(&text, " reference words \n")
+            .await
+            .expect("write text");
+
+        let reference =
+            resolve_tts_bench_reference(None, Some(audio.as_path()), None, Some(text.as_path()))
+                .await
+                .expect("reference should resolve");
+
+        assert_eq!(
+            reference.reference_audio_base64.as_deref(),
+            Some("UklGRg==")
+        );
+        let expected_path = audio.display().to_string();
+        assert_eq!(
+            reference.reference_audio_path.as_deref(),
+            Some(expected_path.as_str())
+        );
+        assert_eq!(reference.reference_text.as_deref(), Some("reference words"));
+        assert!(reference.saved_voice_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn tts_bench_reference_rejects_mixed_saved_and_direct_reference() {
+        let err = resolve_tts_bench_reference(
+            Some("voice-1"),
+            Some(Path::new("reference.wav")),
+            Some("reference words"),
+            None,
+        )
+        .await
+        .expect_err("saved and direct references should conflict");
+
+        assert!(
+            err.to_string()
+                .contains("Use either --saved-voice-id or --reference-audio/--reference-text")
+        );
     }
 
     #[test]
