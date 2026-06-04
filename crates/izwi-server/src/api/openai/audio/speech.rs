@@ -848,7 +848,7 @@ mod tests {
         };
 
         let timeout = resolve_speech_timeout_secs(1, ModelVariant::Voxtral4BTts2603, &req);
-        assert_eq!(timeout, 61);
+        assert_eq!(timeout, 72);
 
         let generation = build_generation_request(
             &req,
