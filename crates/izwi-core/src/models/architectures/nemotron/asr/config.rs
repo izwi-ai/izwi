@@ -16,6 +16,7 @@ pub struct NemotronConfigInventory {
     pub left_context_frames: Option<usize>,
     pub right_context_frames: Vec<usize>,
     pub model_target: Option<String>,
+    pub output_vocabulary: Vec<String>,
 }
 
 impl NemotronConfigInventory {
@@ -40,8 +41,15 @@ impl NemotronConfigInventory {
             left_context_frames: att_context_size(&value).and_then(|pair| pair.first().copied()),
             right_context_frames: collect_right_context_frames(&value),
             model_target: find_string_by_keys(&value, &["_target_", "target"]),
+            output_vocabulary: output_vocabulary(&value),
         })
     }
+}
+
+fn output_vocabulary(value: &Value) -> Vec<String> {
+    find_non_empty_string_sequence_by_key(value, "labels")
+        .or_else(|| find_non_empty_string_sequence_by_key(value, "vocabulary"))
+        .unwrap_or_default()
 }
 
 fn collect_right_context_frames(value: &Value) -> Vec<usize> {
@@ -122,6 +130,35 @@ fn find_sequence_by_key(value: &Value, target: &str) -> Option<Vec<Value>> {
     }
 }
 
+fn find_non_empty_string_sequence_by_key(value: &Value, target: &str) -> Option<Vec<String>> {
+    match value {
+        Value::Mapping(map) => {
+            for (key, child) in map {
+                if scalar_key(key).is_some_and(|key| key == target) {
+                    if let Some(seq) = child.as_sequence() {
+                        let tokens = seq
+                            .iter()
+                            .filter_map(value_to_string_scalar)
+                            .collect::<Vec<_>>();
+                        if !tokens.is_empty() {
+                            return Some(tokens);
+                        }
+                    }
+                }
+
+                if let Some(found) = find_non_empty_string_sequence_by_key(child, target) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Sequence(items) => items
+            .iter()
+            .find_map(|item| find_non_empty_string_sequence_by_key(item, target)),
+        _ => None,
+    }
+}
+
 fn find_usize_by_keys(value: &Value, keys: &[&str]) -> Option<usize> {
     match value {
         Value::Mapping(map) => {
@@ -174,6 +211,25 @@ fn value_to_usize(value: &Value) -> Option<usize> {
     value.as_str()?.parse::<usize>().ok()
 }
 
+fn value_to_string_scalar(value: &Value) -> Option<String> {
+    if let Some(value) = value.as_str() {
+        return Some(value.to_string());
+    }
+    if let Some(value) = value.as_u64() {
+        return Some(value.to_string());
+    }
+    if let Some(value) = value.as_i64() {
+        return Some(value.to_string());
+    }
+    if let Some(value) = value.as_f64() {
+        return Some(value.to_string());
+    }
+    if let Some(value) = value.as_bool() {
+        return Some(value.to_string());
+    }
+    None
+}
+
 fn scalar_key(value: &Value) -> Option<&str> {
     value.as_str()
 }
@@ -206,8 +262,16 @@ model:
     vocab_size: 1024
   joint:
     joint_hidden: 512
+    vocabulary:
+      - <unk>
+      - ▁joint
   prompt:
     prompt_dim: 128
+labels:
+  - <unk>
+  - <en-US>
+  - ▁Hello
+  - world
 "#;
 
         let inventory = NemotronConfigInventory::from_yaml_str(yaml).unwrap();
@@ -223,5 +287,29 @@ model:
         assert_eq!(inventory.prompt_dim, Some(128));
         assert_eq!(inventory.left_context_frames, Some(56));
         assert_eq!(inventory.right_context_frames, vec![0, 1, 3, 6, 13]);
+        assert_eq!(
+            inventory.output_vocabulary,
+            vec!["<unk>", "<en-US>", "▁Hello", "world"]
+        );
+    }
+
+    #[test]
+    fn config_inventory_falls_back_to_non_empty_joint_vocabulary() {
+        let yaml = r#"
+model:
+  tokenizer:
+    vocabulary: []
+  joint:
+    num_classes: 3
+    vocabulary:
+      - <unk>
+      - hello
+      - world
+"#;
+
+        let inventory = NemotronConfigInventory::from_yaml_str(yaml).unwrap();
+
+        assert_eq!(inventory.vocab_size, Some(3));
+        assert_eq!(inventory.output_vocabulary, vec!["<unk>", "hello", "world"]);
     }
 }
