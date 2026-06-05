@@ -9,6 +9,7 @@ pub struct NemotronConfigInventory {
     pub n_fft: Option<usize>,
     pub window_length: Option<usize>,
     pub hop_length: Option<usize>,
+    pub normalize: Option<String>,
     pub encoder_layers: Option<usize>,
     pub encoder_dim: Option<usize>,
     pub encoder_heads: Option<usize>,
@@ -42,6 +43,7 @@ impl NemotronConfigInventory {
             n_fft: find_usize_by_keys(&value, &["n_fft", "fft_length"]),
             window_length: find_frame_samples(&value, sample_rate, &["win_length", "window_size"]),
             hop_length: find_frame_samples(&value, sample_rate, &["hop_length", "window_stride"]),
+            normalize: find_string_by_keys(&value, &["normalize"]),
             encoder_layers: find_usize_by_keys(&value, &["n_layers", "num_layers", "layers"]),
             encoder_dim: find_usize_by_keys(&value, &["d_model", "feat_out", "encoder_dim"]),
             encoder_heads: find_usize_by_keys(&value, &["n_heads", "num_heads"]),
@@ -348,6 +350,7 @@ model:
     n_fft: 512
     window_size: 0.025
     window_stride: 0.01
+    normalize: NA
   encoder:
     n_layers: 24
     d_model: 512
@@ -393,6 +396,7 @@ labels:
         assert_eq!(inventory.n_fft, Some(512));
         assert_eq!(inventory.window_length, Some(400));
         assert_eq!(inventory.hop_length, Some(160));
+        assert_eq!(inventory.normalize.as_deref(), Some("NA"));
         assert_eq!(inventory.encoder_layers, Some(24));
         assert_eq!(inventory.encoder_dim, Some(512));
         assert_eq!(inventory.encoder_heads, Some(8));

@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod nemo;
+mod network;
 
 use std::fs;
 use std::path::Path;
@@ -123,6 +124,7 @@ struct NemotronRuntimePlan {
     n_fft: Option<usize>,
     window_length: Option<usize>,
     hop_length: Option<usize>,
+    normalize: Option<String>,
     encoder_layers: Option<usize>,
     encoder_dim: Option<usize>,
     encoder_heads: Option<usize>,
@@ -160,6 +162,7 @@ impl NemotronRuntimePlan {
             n_fft: inventory.n_fft,
             window_length: inventory.window_length,
             hop_length: inventory.hop_length,
+            normalize: inventory.normalize.clone(),
             encoder_layers: inventory.encoder_layers,
             encoder_dim: inventory.encoder_dim,
             encoder_heads: inventory.encoder_heads,
@@ -185,6 +188,7 @@ impl NemotronRuntimePlan {
             "n_fft": self.n_fft,
             "window_length": self.window_length,
             "hop_length": self.hop_length,
+            "normalize": self.normalize,
             "encoder_layers": self.encoder_layers,
             "encoder_dim": self.encoder_dim,
             "encoder_heads": self.encoder_heads,
