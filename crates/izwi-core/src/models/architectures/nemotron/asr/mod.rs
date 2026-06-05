@@ -120,12 +120,21 @@ impl NemotronDecoder {
 struct NemotronRuntimePlan {
     sample_rate: u32,
     feature_bins: Option<usize>,
+    n_fft: Option<usize>,
+    window_length: Option<usize>,
+    hop_length: Option<usize>,
     encoder_layers: Option<usize>,
     encoder_dim: Option<usize>,
     encoder_heads: Option<usize>,
+    subsampling_factor: Option<usize>,
+    subsampling_conv_channels: Option<usize>,
+    ff_expansion_factor: Option<usize>,
+    conv_kernel_size: Option<usize>,
     predictor_hidden: Option<usize>,
+    predictor_layers: Option<usize>,
     joint_hidden: Option<usize>,
     prompt_dim: Option<usize>,
+    prompt_dictionary_size: usize,
     vocab_size: Option<usize>,
     default_streaming_profile: NemotronStreamingProfile,
     streaming_profiles: Vec<NemotronStreamingProfile>,
@@ -141,22 +150,28 @@ impl NemotronRuntimePlan {
         }
 
         let streaming_profiles = NemotronStreamingProfile::profiles_from_inventory(inventory)?;
-        let default_streaming_profile = streaming_profiles
-            .last()
-            .cloned()
-            .ok_or_else(|| {
-                Error::ModelLoadError("Nemotron config did not yield a streaming profile".to_string())
-            })?;
+        let default_streaming_profile = streaming_profiles.last().cloned().ok_or_else(|| {
+            Error::ModelLoadError("Nemotron config did not yield a streaming profile".to_string())
+        })?;
 
         Ok(Self {
             sample_rate: SAMPLE_RATE,
             feature_bins: inventory.features,
+            n_fft: inventory.n_fft,
+            window_length: inventory.window_length,
+            hop_length: inventory.hop_length,
             encoder_layers: inventory.encoder_layers,
             encoder_dim: inventory.encoder_dim,
             encoder_heads: inventory.encoder_heads,
+            subsampling_factor: inventory.subsampling_factor,
+            subsampling_conv_channels: inventory.subsampling_conv_channels,
+            ff_expansion_factor: inventory.ff_expansion_factor,
+            conv_kernel_size: inventory.conv_kernel_size,
             predictor_hidden: inventory.predictor_hidden,
+            predictor_layers: inventory.predictor_layers,
             joint_hidden: inventory.joint_hidden,
             prompt_dim: inventory.prompt_dim,
+            prompt_dictionary_size: inventory.prompt_dictionary.len(),
             vocab_size: inventory.vocab_size,
             default_streaming_profile,
             streaming_profiles,
@@ -167,12 +182,21 @@ impl NemotronRuntimePlan {
         json!({
             "sample_rate": self.sample_rate,
             "feature_bins": self.feature_bins,
+            "n_fft": self.n_fft,
+            "window_length": self.window_length,
+            "hop_length": self.hop_length,
             "encoder_layers": self.encoder_layers,
             "encoder_dim": self.encoder_dim,
             "encoder_heads": self.encoder_heads,
+            "subsampling_factor": self.subsampling_factor,
+            "subsampling_conv_channels": self.subsampling_conv_channels,
+            "ff_expansion_factor": self.ff_expansion_factor,
+            "conv_kernel_size": self.conv_kernel_size,
             "predictor_hidden": self.predictor_hidden,
+            "predictor_layers": self.predictor_layers,
             "joint_hidden": self.joint_hidden,
             "prompt_dim": self.prompt_dim,
+            "prompt_dictionary_size": self.prompt_dictionary_size,
             "vocab_size": self.vocab_size,
             "streaming_profile": self.default_streaming_profile.diagnostics(),
             "streaming_profiles": self.streaming_profiles.iter().map(|profile| profile.diagnostics()).collect::<Vec<_>>(),
@@ -400,9 +424,11 @@ struct NemotronPromptCondition {
 
 impl NemotronPromptCondition {
     fn resolve(language: Option<&str>, prompt: Option<&str>) -> Result<Self> {
-        let language_hint = language
-            .and_then(non_empty_trimmed)
-            .or_else(|| prompt.and_then(non_empty_trimmed).filter(|value| looks_like_lang(value)));
+        let language_hint = language.and_then(non_empty_trimmed).or_else(|| {
+            prompt
+                .and_then(non_empty_trimmed)
+                .filter(|value| looks_like_lang(value))
+        });
         let target_lang = normalize_target_lang(language_hint.unwrap_or("auto"))?;
         let context_prompt = prompt
             .and_then(non_empty_trimmed)
@@ -668,8 +694,9 @@ fn language_alias_key(value: &str) -> String {
 
 fn default_locale_for_language_name(name: &str) -> Option<&'static str> {
     match name {
-        "english" | "american english" | "us english" | "u s english"
-        | "united states english" => Some("en-US"),
+        "english" | "american english" | "us english" | "u s english" | "united states english" => {
+            Some("en-US")
+        }
         "british english" | "uk english" | "u k english" | "united kingdom english" => {
             Some("en-GB")
         }
@@ -898,8 +925,8 @@ mod tests {
 
     #[test]
     fn prompt_condition_preserves_non_language_prompt_as_context() {
-        let prompt = NemotronPromptCondition::resolve(Some("fr-CA"), Some("medical dictation"))
-            .unwrap();
+        let prompt =
+            NemotronPromptCondition::resolve(Some("fr-CA"), Some("medical dictation")).unwrap();
 
         assert_eq!(prompt.target_lang, "fr-CA");
         assert_eq!(prompt.context_prompt.as_deref(), Some("medical dictation"));
@@ -1044,6 +1071,9 @@ mod tests {
             "<en-US>".to_string(),
         ];
 
-        assert_eq!(decode_vocab_tokens(&[0, 1, 2, 3, 4, 5], &vocab), "Hello, world!");
+        assert_eq!(
+            decode_vocab_tokens(&[0, 1, 2, 3, 4, 5], &vocab),
+            "Hello, world!"
+        );
     }
 }
