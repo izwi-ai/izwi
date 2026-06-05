@@ -177,19 +177,36 @@ impl NemotronNetwork {
         } else {
             features.to_dtype(self.dtype)?
         };
-        let (mut x, encoded_len) = self.pre_encode.forward(&features, feature_frames)?;
+        let (x, encoded_len) = self.pre_encode.forward(&features, feature_frames)?;
         if encoded_len == 0 {
             return Err(Error::InferenceError(
                 "Nemotron encoder produced zero frames".to_string(),
             ));
         }
 
+        self.encode_preencoded_with_prompt(
+            x,
+            encoded_len,
+            prompt_id,
+            self.left_context_frames,
+            self.right_context_frames,
+        )
+    }
+
+    fn encode_preencoded_with_prompt(
+        &self,
+        mut x: Tensor,
+        encoded_len: usize,
+        prompt_id: usize,
+        left_context_frames: usize,
+        right_context_frames: usize,
+    ) -> Result<(Tensor, usize)> {
         let pos_len = x.dim(1)?;
         let pos_emb = self.rel_positional_embedding(pos_len, x.dtype(), x.device())?;
         let att_mask = self.limited_context_mask(
             pos_len,
-            self.left_context_frames,
-            self.right_context_frames,
+            left_context_frames,
+            right_context_frames,
             x.dtype(),
             x.device(),
         )?;
@@ -199,6 +216,45 @@ impl NemotronNetwork {
 
         let x = self.prompt_kernel.forward(&x, prompt_id)?;
         Ok((x, encoded_len.min(pos_len)))
+    }
+
+    pub(super) fn encode_streaming_chunk(
+        &self,
+        state: &mut NemotronStreamingEncoderState,
+        prompt_id: usize,
+    ) -> Result<Option<NemotronStreamingEncoderChunk>> {
+        let Some(pre_encoded) = state.pre_encoded.as_ref() else {
+            return Ok(None);
+        };
+        let ready_frames = state.ready_frames();
+        if ready_frames <= state.emitted_frames {
+            return Ok(None);
+        }
+
+        let (encoded, encoded_len) = self.encode_preencoded_with_prompt(
+            pre_encoded.clone(),
+            state.encoded_frames,
+            prompt_id,
+            state.left_context_frames,
+            state.right_context_frames,
+        )?;
+        let ready_frames = ready_frames.min(encoded_len);
+        if ready_frames <= state.emitted_frames {
+            return Ok(None);
+        }
+
+        let start_frame = state.emitted_frames;
+        let frames = ready_frames - start_frame;
+        let encoded = encoded.narrow(1, start_frame, frames)?.contiguous()?;
+        state.emitted_frames = ready_frames;
+
+        Ok(Some(NemotronStreamingEncoderChunk {
+            encoded,
+            start_frame,
+            frames,
+            total_ready_frames: ready_frames,
+            is_final: state.input_finished && ready_frames == encoded_len,
+        }))
     }
 
     pub(super) fn decode_rnnt_greedy(
@@ -520,6 +576,23 @@ pub(super) struct NemotronStreamingEncodedChunk {
     pub is_final: bool,
 }
 
+pub(super) struct NemotronStreamingEncoderState {
+    pre_encoded: Option<Tensor>,
+    encoded_frames: usize,
+    emitted_frames: usize,
+    left_context_frames: usize,
+    right_context_frames: usize,
+    input_finished: bool,
+}
+
+pub(super) struct NemotronStreamingEncoderChunk {
+    pub encoded: Tensor,
+    pub start_frame: usize,
+    pub frames: usize,
+    pub total_ready_frames: usize,
+    pub is_final: bool,
+}
+
 impl NemotronStreamingFeatureState {
     pub(super) fn new() -> Self {
         Self {
@@ -614,6 +687,60 @@ impl NemotronStreamingPreEncodeState {
 
     pub(super) fn finish_input(&mut self) {
         self.input_finished = true;
+    }
+}
+
+impl NemotronStreamingEncoderState {
+    pub(super) fn new(left_context_frames: usize, right_context_frames: usize) -> Self {
+        Self {
+            pre_encoded: None,
+            encoded_frames: 0,
+            emitted_frames: 0,
+            left_context_frames,
+            right_context_frames,
+            input_finished: false,
+        }
+    }
+
+    pub(super) fn push_pre_encoded(
+        &mut self,
+        chunk: NemotronStreamingEncodedChunk,
+    ) -> Result<()> {
+        if self.input_finished {
+            return Err(Error::InvalidInput(
+                "Cannot push encoder frames into a finalized Nemotron encoder stream".to_string(),
+            ));
+        }
+        if chunk.start_frame != self.encoded_frames {
+            return Err(Error::InvalidInput(format!(
+                "Nemotron encoder stream expected start frame {}, got {}",
+                self.encoded_frames, chunk.start_frame
+            )));
+        }
+        if chunk.frames == 0 {
+            return Ok(());
+        }
+
+        self.pre_encoded = Some(if let Some(existing) = self.pre_encoded.as_ref() {
+            Tensor::cat(&[existing, &chunk.encoded], 1)?
+        } else {
+            chunk.encoded
+        });
+        self.encoded_frames = self.encoded_frames.saturating_add(chunk.frames);
+        self.input_finished = chunk.is_final;
+        Ok(())
+    }
+
+    pub(super) fn finish_input(&mut self) {
+        self.input_finished = true;
+    }
+
+    fn ready_frames(&self) -> usize {
+        if self.input_finished {
+            self.encoded_frames
+        } else {
+            self.encoded_frames.saturating_sub(self.right_context_frames)
+        }
     }
 }
 
@@ -1784,6 +1911,20 @@ mod tests {
         }
     }
 
+    fn encoded_chunk(
+        start_frame: usize,
+        frames: usize,
+        is_final: bool,
+    ) -> NemotronStreamingEncodedChunk {
+        NemotronStreamingEncodedChunk {
+            encoded: Tensor::zeros((1, frames, ENCODER_DIM), DType::F32, &Device::Cpu).unwrap(),
+            start_frame,
+            frames,
+            total_stable_frames: start_frame + frames,
+            is_final,
+        }
+    }
+
     fn assert_tensor_close(lhs: &Tensor, rhs: &Tensor, tolerance: f32) {
         assert_eq!(lhs.dims(), rhs.dims());
         let lhs = lhs.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -2043,6 +2184,31 @@ mod tests {
         let err = state
             .push_features(feature_chunk(&features, 1, 1, false))
             .unwrap_err();
+        assert!(err.to_string().contains("expected start frame 0"));
+    }
+
+    #[test]
+    fn streaming_encoder_state_delays_until_right_context_is_available() {
+        let mut state = NemotronStreamingEncoderState::new(56, 3);
+
+        state.push_pre_encoded(encoded_chunk(0, 2, false)).unwrap();
+        assert_eq!(state.ready_frames(), 0);
+
+        state.push_pre_encoded(encoded_chunk(2, 2, false)).unwrap();
+        assert_eq!(state.ready_frames(), 1);
+
+        state.push_pre_encoded(encoded_chunk(4, 4, false)).unwrap();
+        assert_eq!(state.ready_frames(), 5);
+
+        state.finish_input();
+        assert_eq!(state.ready_frames(), 8);
+    }
+
+    #[test]
+    fn streaming_encoder_state_rejects_out_of_order_frames() {
+        let mut state = NemotronStreamingEncoderState::new(56, 1);
+
+        let err = state.push_pre_encoded(encoded_chunk(1, 1, false)).unwrap_err();
         assert!(err.to_string().contains("expected start frame 0"));
     }
 
