@@ -542,6 +542,7 @@ impl ModelDownloader {
                         .iter()
                         .all(|file| path.join(file).exists())
             }
+            ModelFamily::NemotronAsr => path.join("nemotron-3.5-asr-streaming-0.6b.nemo").exists(),
             ModelFamily::SortformerDiarization => path
                 .join("diar_streaming_sortformer_4spk-v2.1.nemo")
                 .exists(),
@@ -1103,6 +1104,9 @@ impl ModelDownloader {
                 );
                 files
             }
+            ModelFamily::NemotronAsr => {
+                vec!["nemotron-3.5-asr-streaming-0.6b.nemo".to_string()]
+            }
             ModelFamily::SortformerDiarization => vec![
                 "diar_streaming_sortformer_4spk-v2.1.nemo".to_string(),
                 "README.md".to_string(),
@@ -1629,6 +1633,7 @@ impl ModelDownloader {
         } else if file.ends_with(".nemo") {
             match variant {
                 ModelVariant::ParakeetTdt06BV3 => 10_036_761_167,
+                ModelVariant::Nemotron35AsrStreaming06B => 2_370_000_000,
                 ModelVariant::DiarStreamingSortformer4SpkV21 => 510_000_000,
                 _ => 4_000_000_000,
             }
@@ -1809,6 +1814,33 @@ mod tests {
         std::fs::create_dir_all(&model_dir).expect("model dir");
         assert!(!downloader.is_downloaded(variant));
         std::fs::write(model_dir.join("qwen3_asr_1.7b_q8_0.gguf"), [0u8]).expect("gguf");
+        assert!(downloader.is_downloaded(variant));
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn nemotron_asr_model_files_only_include_nemo_checkpoint() {
+        let (downloader, temp_dir) = test_downloader();
+        let files = downloader.get_model_files(ModelVariant::Nemotron35AsrStreaming06B);
+        assert_eq!(
+            files,
+            vec!["nemotron-3.5-asr-streaming-0.6b.nemo".to_string()]
+        );
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn nemotron_asr_is_downloaded_when_nemo_checkpoint_exists() {
+        let (downloader, temp_dir) = test_downloader();
+        let variant = ModelVariant::Nemotron35AsrStreaming06B;
+        let model_dir = downloader.model_path(variant);
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+        assert!(!downloader.is_downloaded(variant));
+        std::fs::write(
+            model_dir.join("nemotron-3.5-asr-streaming-0.6b.nemo"),
+            [0u8],
+        )
+        .expect("nemo");
         assert!(downloader.is_downloaded(variant));
         std::fs::remove_dir_all(temp_dir).ok();
     }

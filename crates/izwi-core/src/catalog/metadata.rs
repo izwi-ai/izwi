@@ -116,6 +116,14 @@ pub enum ModelVariant {
         alias = "vibevoice-asr"
     )]
     VibeVoiceAsr,
+    /// NVIDIA Nemotron 3.5 streaming multilingual ASR model (.nemo)
+    #[serde(
+        rename = "Nemotron-3.5-ASR-Streaming-0.6B",
+        alias = "nvidia/nemotron-3.5-asr-streaming-0.6b",
+        alias = "nemotron-3.5-asr-streaming-0.6b",
+        alias = "Nemotron 3.5 ASR Streaming 0.6B"
+    )]
+    Nemotron35AsrStreaming06B,
     /// Streaming Sortformer 4-speaker diarization model (.nemo)
     #[serde(rename = "diar_streaming_sortformer_4spk-v2.1")]
     DiarStreamingSortformer4SpkV21,
@@ -268,6 +276,7 @@ impl ModelVariant {
             Self::WhisperLargeV3Turbo => "openai/whisper-large-v3-turbo",
             Self::Qwen3Asr06BGguf | Self::Qwen3Asr17BGguf => "Alkd/qwen3-asr-gguf",
             Self::VibeVoiceAsr => "microsoft/VibeVoice-ASR",
+            Self::Nemotron35AsrStreaming06B => "nvidia/nemotron-3.5-asr-streaming-0.6b",
             Self::DiarStreamingSortformer4SpkV21 => "nvidia/diar_streaming_sortformer_4spk-v2.1",
             Self::Qwen306B => "Qwen/Qwen3-0.6B",
             Self::Qwen306B4Bit => "mlx-community/Qwen3-0.6B-4bit",
@@ -321,6 +330,7 @@ impl ModelVariant {
             Self::Qwen3Asr06BGguf => "Qwen3 ASR 0.6B GGUF",
             Self::Qwen3Asr17BGguf => "Qwen3 ASR 1.7B GGUF",
             Self::VibeVoiceAsr => "VibeVoice ASR",
+            Self::Nemotron35AsrStreaming06B => "Nemotron 3.5 ASR Streaming 0.6B",
             Self::DiarStreamingSortformer4SpkV21 => "Streaming Sortformer 4spk v2.1",
             Self::Qwen306B => "Qwen3 0.6B",
             Self::Qwen306B4Bit => "Qwen3 0.6B 4-bit",
@@ -374,6 +384,7 @@ impl ModelVariant {
             Self::Qwen3Asr06BGguf => "Qwen3-ASR-0.6B-GGUF",
             Self::Qwen3Asr17BGguf => "Qwen3-ASR-1.7B-GGUF",
             Self::VibeVoiceAsr => "VibeVoice-ASR",
+            Self::Nemotron35AsrStreaming06B => "Nemotron-3.5-ASR-Streaming-0.6B",
             Self::DiarStreamingSortformer4SpkV21 => "diar_streaming_sortformer_4spk-v2.1",
             Self::Qwen306B => "Qwen3-0.6B",
             Self::Qwen306B4Bit => "Qwen3-0.6B-4bit",
@@ -426,7 +437,8 @@ impl ModelVariant {
             Self::WhisperLargeV3Turbo => 1_617_824_864, // ~1.51 GB (HF x-linked-size)
             Self::Qwen3Asr06BGguf => 1_012_824_608,     // HF x-linked-size, Mar 2026
             Self::Qwen3Asr17BGguf => 2_512_740_320,     // HF x-linked-size, Mar 2026
-            Self::VibeVoiceAsr => 17_348_198_410, // safetensors index metadata total_size
+            Self::VibeVoiceAsr => 17_348_198_410,       // safetensors index metadata total_size
+            Self::Nemotron35AsrStreaming06B => 2_370_000_000, // ~2.37 GB .nemo, HF tree, Jun 2026
             Self::DiarStreamingSortformer4SpkV21 => 510_000_000, // ~0.47 GB (est)
             Self::Qwen306B => 1_520_000_000,            // ~1.42 GB (est)
             Self::Qwen306B4Bit => 900_000_000,          // ~0.84 GB (est)
@@ -479,6 +491,7 @@ impl ModelVariant {
             Self::Qwen3Asr06BGguf => 4.0,
             Self::Qwen3Asr17BGguf => 8.0,
             Self::VibeVoiceAsr => 36.0,
+            Self::Nemotron35AsrStreaming06B => 6.0,
             Self::DiarStreamingSortformer4SpkV21 => 3.0,
             Self::Qwen306B => 3.0,
             Self::Qwen306B4Bit => 2.0,
@@ -521,6 +534,7 @@ impl ModelVariant {
                 | crate::catalog::ModelFamily::WhisperAsr
                 | crate::catalog::ModelFamily::Qwen3Asr
                 | crate::catalog::ModelFamily::VibeVoiceAsr
+                | crate::catalog::ModelFamily::NemotronAsr
         )
     }
 
@@ -572,6 +586,7 @@ impl ModelVariant {
         match self {
             Self::Voxtral4BTts2603 => Some("CC BY-NC 4.0"),
             Self::VibeVoiceAsr | Self::VibeVoice15BTts => Some("MIT"),
+            Self::Nemotron35AsrStreaming06B => Some("OpenMDW-1.1"),
             _ => None,
         }
     }
@@ -885,6 +900,7 @@ impl ModelVariant {
             Self::Qwen3Asr06BGguf,
             Self::Qwen3Asr17BGguf,
             Self::VibeVoiceAsr,
+            Self::Nemotron35AsrStreaming06B,
             Self::DiarStreamingSortformer4SpkV21,
             Self::Qwen306B,
             Self::Qwen306B4Bit,
@@ -1157,10 +1173,9 @@ mod tests {
             tts.tts_output_frame_rate_hz_hint(),
             Some(ModelVariant::VIBEVOICE_TTS_FRAME_RATE_HZ)
         );
-        assert!(
-            tts.tts_max_output_seconds_hint()
-                .is_some_and(|seconds| seconds >= 5_400.0)
-        );
+        assert!(tts
+            .tts_max_output_seconds_hint()
+            .is_some_and(|seconds| seconds >= 5_400.0));
         assert_eq!(
             tts.speech_capabilities(),
             Some(SpeechModelCapabilities {
@@ -1173,6 +1188,18 @@ mod tests {
                 supports_auto_long_form: true,
             })
         );
+    }
+
+    #[test]
+    fn nemotron_asr_catalog_contract_matches_hf_artifact() {
+        let variant = ModelVariant::Nemotron35AsrStreaming06B;
+        assert!(variant.is_asr());
+        assert_eq!(variant.primary_task(), ModelTask::Asr);
+        assert_eq!(variant.repo_id(), "nvidia/nemotron-3.5-asr-streaming-0.6b");
+        assert_eq!(variant.dir_name(), "Nemotron-3.5-ASR-Streaming-0.6B");
+        assert_eq!(variant.license_label(), Some("OpenMDW-1.1"));
+        assert!(!variant.is_quantized());
+        assert_eq!(variant.memory_required_gb(), 6.0);
     }
 
     #[test]
