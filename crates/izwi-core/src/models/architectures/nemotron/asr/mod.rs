@@ -967,6 +967,9 @@ fn ms_to_samples(ms: usize, sample_rate: u32) -> usize {
 mod tests {
     use super::*;
 
+    use std::path::PathBuf;
+
+    use crate::backends::{DeviceKind, DeviceSelector};
     use uuid::Uuid;
 
     #[test]
@@ -1161,5 +1164,58 @@ mod tests {
             decode_vocab_tokens(&[0, 1, 2, 3, 4, 5], &vocab),
             "Hello, world!"
         );
+    }
+
+    #[test]
+    #[ignore = "requires local Nemotron-3.5-ASR-Streaming-0.6B assets and loads a 2.4 GB checkpoint"]
+    fn nemotron_local_silence_forward_smoke_if_available() {
+        let models_root = std::env::var("IZWI_MODELS_DIR")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                dirs::data_local_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("izwi")
+                    .join("models")
+            });
+        let model_dir = models_root.join(ModelVariant::Nemotron35AsrStreaming06B.dir_name());
+        let ckpt_path = model_dir.join("nemotron-native").join("model_weights.ckpt");
+        if !ckpt_path.exists() {
+            eprintln!(
+                "Skipping local Nemotron smoke test, checkpoint not found at {}",
+                ckpt_path.display()
+            );
+            return;
+        }
+
+        let backend = std::env::var("IZWI_NEMOTRON_ASR_SMOKE_BACKEND")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "cpu".to_string());
+        let device =
+            DeviceSelector::detect_with_preference(Some(&backend)).expect("requested device");
+        if backend.eq_ignore_ascii_case("metal") && device.kind != DeviceKind::Metal {
+            eprintln!("Skipping local Nemotron Metal smoke test, Metal device was not selected");
+            return;
+        }
+        let model =
+            NemotronAsrModel::load(&model_dir, ModelVariant::Nemotron35AsrStreaming06B, device)
+                .expect("Nemotron ASR model should load");
+        let silence = vec![0.0f32; 1_600];
+        let output = model
+            .transcribe_with_details_and_prompt(&silence, 16_000, Some("English"), None)
+            .expect("Nemotron silent forward should run");
+
+        assert_eq!(output.language.as_deref(), Some("en-US"));
+        let diagnostics = output.diagnostics.expect("diagnostics");
+        assert_eq!(
+            diagnostics["native_forward_status"],
+            "enabled_offline_fastconformer_rnnt"
+        );
+        assert_eq!(diagnostics["prompt_id"], 0);
+        assert!(diagnostics["decode"]["encoded_frames"]
+            .as_u64()
+            .is_some_and(|frames| frames > 0));
     }
 }
