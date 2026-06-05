@@ -1693,6 +1693,22 @@ mod tests {
     }
 
     #[test]
+    fn streaming_state_retains_audio_samples_for_native_pipeline() {
+        let profile = NemotronStreamingProfile::new(56, 0).unwrap();
+        let prompt = NemotronPromptCondition::resolve(Some("en-US"), None).unwrap();
+        let mut state = NemotronStreamingState::new(profile, prompt, 16_000);
+
+        state.push_samples(&[0.1, 0.2, 0.3]).unwrap();
+        state.push_samples(&[0.4]).unwrap();
+
+        assert_eq!(state.buffered_samples(), 4);
+        assert_eq!(state.samples, vec![0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(state.text(), "");
+        assert_eq!(state.emitted_tokens(), 0);
+        assert_eq!(state.diagnostics()["supports_realtime_stream_decode"], false);
+    }
+
+    #[test]
     fn streaming_state_emits_non_overlapping_ready_chunks() {
         let profile = NemotronStreamingProfile::new(56, 1).unwrap();
         let prompt = NemotronPromptCondition::resolve(Some("en-US"), None).unwrap();
