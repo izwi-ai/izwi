@@ -63,6 +63,7 @@ phases can verify registry coverage without changing public behavior.
 | `WhisperLargeV3Turbo` | WhisperAsr | ASR | `asr` | Yes |
 | `Qwen3Asr06BGguf` | Qwen3Asr | ASR | `asr` | Yes |
 | `Qwen3Asr17BGguf` | Qwen3Asr | ASR | `asr` | Yes |
+| `Nemotron35AsrStreaming06B` | NemotronAsr | ASR | `asr` | Yes |
 | `DiarStreamingSortformer4SpkV21` | SortformerDiarization | Diarization | `diarization` | Yes |
 | `Qwen306B` | Qwen3Chat | Chat | `chat` | No |
 | `Qwen306B4Bit` | Qwen3Chat | Chat | `chat` | No |

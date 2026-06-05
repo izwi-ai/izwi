@@ -25,6 +25,8 @@ export function getModelProviderLabel(variant: string): string {
   if (variant.startsWith("Gemma-")) return "Google";
   if (
     variant.startsWith("Parakeet-") ||
+    variant.startsWith("Nemotron-") ||
+    variant.startsWith("nvidia/nemotron-") ||
     variant.startsWith("diar_streaming_sortformer")
   ) {
     return "NVIDIA";
@@ -353,6 +355,21 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     category: "asr",
     capabilities: ["Transcription", "Long-form", "24 kHz"],
     size: "16.16 GB",
+  },
+  "Nemotron-3.5-ASR-Streaming-0.6B": {
+    shortName: "Nemotron 3.5 ASR",
+    fullName: "NVIDIA Nemotron 3.5 ASR Streaming 0.6B",
+    description:
+      "Multilingual cache-aware FastConformer-RNNT ASR model with language-ID prompt conditioning; native Rust loader and streaming state are scaffolded",
+    category: "asr",
+    capabilities: [
+      "Transcription",
+      "40 locales",
+      "16 kHz",
+      "RNNT",
+      "Streaming profiles",
+    ],
+    size: "2.37 GB",
   },
   "Qwen3-ForcedAligner-0.6B": {
     shortName: "ForcedAligner 0.6B",
