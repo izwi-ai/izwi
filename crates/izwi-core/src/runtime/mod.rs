@@ -24,6 +24,7 @@ mod types;
 mod voice_metrics;
 mod voice_session;
 
+pub use asr::{RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream};
 pub use conformance::{
     capability_conformance_cases, required_conformance_capabilities,
     CapabilityConformanceCase, ConformanceCapability, ConformanceExecutionClass,

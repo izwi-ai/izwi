@@ -1,9 +1,12 @@
 //! ASR runtime methods routed through the unified core engine.
 
-use crate::catalog::{parse_model_variant, resolve_asr_model_variant};
+use std::sync::Arc;
+
+use crate::catalog::{parse_model_variant, resolve_asr_model_variant, ModelFamily};
 use crate::engine::EngineCoreRequest;
 use crate::error::{Error, Result};
-use crate::model::ModelVariant;
+use crate::model::{ModelResidencyLease, ModelVariant};
+use crate::models::registry::{NativeAsrModel, NativeAsrRealtimeEvent, NativeAsrRealtimeState};
 use crate::runtime::adapters::CapabilityKind;
 use crate::runtime::audio_io::{base64_decode, decode_audio_bytes};
 use crate::runtime::request::{AlignmentRuntimeRequest, AsrRuntimeRequest};
@@ -15,7 +18,93 @@ enum AsrAudioInput<'a> {
     Bytes(&'a [u8]),
 }
 
+fn resolve_asr_realtime_stream_variant(model_id: Option<&str>) -> Option<ModelVariant> {
+    let variant = resolve_asr_model_variant(model_id);
+    (variant.family() == ModelFamily::NemotronAsr).then_some(variant)
+}
+
+pub struct RuntimeAsrRealtimeStream {
+    variant: ModelVariant,
+    model: Arc<NativeAsrModel>,
+    state: NativeAsrRealtimeState,
+    _lease: ModelResidencyLease,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeAsrRealtimeEvent {
+    pub delta: String,
+    pub text: String,
+    pub is_final: bool,
+    pub chunk_index: usize,
+}
+
+fn map_native_realtime_events(events: Vec<NativeAsrRealtimeEvent>) -> Vec<RuntimeAsrRealtimeEvent> {
+    events
+        .into_iter()
+        .map(|event| RuntimeAsrRealtimeEvent {
+            delta: event.delta,
+            text: event.text,
+            is_final: event.is_final,
+            chunk_index: event.chunk_index,
+        })
+        .collect()
+}
+
 impl RuntimeService {
+    pub async fn try_start_asr_realtime_stream(
+        &self,
+        model_id: Option<&str>,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<Option<RuntimeAsrRealtimeStream>> {
+        let Some(variant) = resolve_asr_realtime_stream_variant(model_id) else {
+            return Ok(None);
+        };
+
+        self.load_model(variant).await?;
+        let lease = self.acquire_model_residency_lease(variant);
+        let model =
+            self.model_registry.get_asr(variant).await.ok_or_else(|| {
+                Error::ModelNotFound(format!("ASR model {variant} is not loaded"))
+            })?;
+        if !model.supports_realtime_stream_decode() {
+            return Ok(None);
+        }
+        let state = model.start_realtime_stream_state(language, prompt, None)?;
+
+        Ok(Some(RuntimeAsrRealtimeStream {
+            variant,
+            model,
+            state,
+            _lease: lease,
+        }))
+    }
+
+    pub fn push_asr_realtime_samples(
+        &self,
+        stream: &mut RuntimeAsrRealtimeStream,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> Result<Vec<RuntimeAsrRealtimeEvent>> {
+        let events =
+            stream
+                .model
+                .push_realtime_stream_samples(&mut stream.state, samples, sample_rate)?;
+        Ok(map_native_realtime_events(events))
+    }
+
+    pub fn finish_asr_realtime_stream(
+        &self,
+        stream: &mut RuntimeAsrRealtimeStream,
+    ) -> Result<Vec<RuntimeAsrRealtimeEvent>> {
+        let events = stream.model.finish_realtime_stream(&mut stream.state)?;
+        Ok(map_native_realtime_events(events))
+    }
+
+    pub fn asr_realtime_stream_variant(&self, stream: &RuntimeAsrRealtimeStream) -> ModelVariant {
+        stream.variant
+    }
+
     async fn asr_transcribe_audio_chat_samples<F>(
         &self,
         variant: ModelVariant,
@@ -901,6 +990,36 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn realtime_stream_variant_resolves_only_nemotron_asr() {
+        assert_eq!(
+            resolve_asr_realtime_stream_variant(Some("nvidia/nemotron-3.5-asr-streaming-0.6b",)),
+            Some(ModelVariant::Nemotron35AsrStreaming06B)
+        );
+        assert_eq!(
+            resolve_asr_realtime_stream_variant(Some("Nemotron 3.5 ASR Streaming 0.6B")),
+            Some(ModelVariant::Nemotron35AsrStreaming06B)
+        );
+
+        assert_eq!(resolve_asr_realtime_stream_variant(None), None);
+        assert_eq!(
+            resolve_asr_realtime_stream_variant(Some("Qwen3-ASR-1.7B")),
+            None
+        );
+        assert_eq!(
+            resolve_asr_realtime_stream_variant(Some("Whisper-Large-v3-Turbo")),
+            None
+        );
+        assert_eq!(
+            resolve_asr_realtime_stream_variant(Some("Parakeet-TDT-0.6B-v3")),
+            None
+        );
+        assert_eq!(
+            resolve_asr_realtime_stream_variant(Some("not-a-real-model")),
+            None
+        );
     }
 
     #[tokio::test]
