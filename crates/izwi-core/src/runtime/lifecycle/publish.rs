@@ -27,6 +27,7 @@ impl RuntimeService {
             | ModelFamily::Gemma3Chat
             | ModelFamily::Voxtral
             | ModelFamily::VibeVoiceAsr
+            | ModelFamily::NemotronAsr
             | ModelFamily::Lfm25Audio
             | ModelFamily::Qwen3Tts
             | ModelFamily::KokoroTts

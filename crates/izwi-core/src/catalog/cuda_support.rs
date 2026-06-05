@@ -137,6 +137,10 @@ impl ModelVariant {
                 CudaSupportLevel::CandleCudaGeneric,
                 "VibeVoice TTS uses dense Candle CUDA tensor kernels for the Qwen decoder, continuous tokenizers, and diffusion head; long-form generation is final-only until chunked decode is proven",
             ),
+            ModelFamily::NemotronAsr => CudaSupportInfo::new(
+                CudaSupportLevel::CandleCudaGeneric,
+                "Nemotron ASR uses dense Candle CUDA tensor kernels once the native FastConformer-RNNT loader is selected; cache-aware streaming remains disabled until encoder cache state is proven",
+            ),
             ModelFamily::Qwen3Tts
             | ModelFamily::KokoroTts
             | ModelFamily::ParakeetAsr
@@ -180,6 +184,10 @@ impl ModelVariant {
             ModelFamily::VoxtralTts => CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::Dense,
                 "Voxtral TTS checkpoint is dense safetensors; CUDA dtype policy, not quantization, controls memory/performance tradeoffs",
+            ),
+            ModelFamily::NemotronAsr => CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::Dense,
+                "Nemotron ASR ships a dense .nemo checkpoint; CUDA dtype policy, not quantization, controls memory/performance tradeoffs",
             ),
             ModelFamily::VibeVoiceTts | ModelFamily::VibeVoiceAsr => CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::Dense,
@@ -316,6 +324,12 @@ mod tests {
         );
         assert_eq!(
             ModelVariant::Voxtral4BTts2603.cuda_quantization().level,
+            CudaQuantizationSupportLevel::Dense
+        );
+        assert_eq!(
+            ModelVariant::Nemotron35AsrStreaming06B
+                .cuda_quantization()
+                .level,
             CudaQuantizationSupportLevel::Dense
         );
     }

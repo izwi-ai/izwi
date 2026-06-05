@@ -14,6 +14,7 @@ pub enum ModelFamily {
     WhisperAsr,
     Qwen3Asr,
     VibeVoiceAsr,
+    NemotronAsr,
     SortformerDiarization,
     Qwen3Chat,
     Qwen35Chat,
@@ -109,6 +110,7 @@ impl ModelVariant {
             WhisperLargeV3Turbo => ModelFamily::WhisperAsr,
             Qwen3Asr06BGguf | Qwen3Asr17BGguf => ModelFamily::Qwen3Asr,
             VibeVoiceAsr => ModelFamily::VibeVoiceAsr,
+            Nemotron35AsrStreaming06B => ModelFamily::NemotronAsr,
             DiarStreamingSortformer4SpkV21 => ModelFamily::SortformerDiarization,
             Qwen306B | Qwen306B4Bit | Qwen306BGguf | Qwen317B | Qwen317B4Bit | Qwen317BGguf
             | Qwen34BGguf | Qwen38BGguf | Qwen314BGguf => ModelFamily::Qwen3Chat,
@@ -130,7 +132,8 @@ impl ModelVariant {
             ModelFamily::ParakeetAsr
             | ModelFamily::WhisperAsr
             | ModelFamily::Qwen3Asr
-            | ModelFamily::VibeVoiceAsr => ModelTask::Asr,
+            | ModelFamily::VibeVoiceAsr
+            | ModelFamily::NemotronAsr => ModelTask::Asr,
             ModelFamily::SortformerDiarization => ModelTask::Diarization,
             ModelFamily::Qwen3Chat
             | ModelFamily::Qwen35Chat
@@ -224,6 +227,8 @@ pub fn resolve_asr_model_variant(input: Option<&str>) -> ModelVariant {
             let normalized = normalize_identifier(raw);
             if normalized.contains("voxtral") {
                 VoxtralMini4BRealtime2602
+            } else if normalized.contains("nemotron") && normalized.contains("asr") {
+                Nemotron35AsrStreaming06B
             } else if normalized.contains("vibevoice") && normalized.contains("asr") {
                 VibeVoiceAsr
             } else if normalized.contains("whisper")
@@ -287,6 +292,10 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
         {
             return Some(VibeVoice15BTts);
         }
+    }
+
+    if normalized.contains("nemotron") && normalized.contains("asr") {
+        return Some(Nemotron35AsrStreaming06B);
     }
 
     if normalized.contains("sortformer") && normalized.contains("diar") {
@@ -641,6 +650,19 @@ mod tests {
         let resolved = resolve_asr_model_variant(Some("microsoft/VibeVoice-ASR"));
         assert_eq!(resolved, ModelVariant::VibeVoiceAsr);
         assert_eq!(resolved.family(), ModelFamily::VibeVoiceAsr);
+    }
+
+    #[test]
+    fn parse_nemotron_asr_repo_alias() {
+        let parsed = parse_model_variant("nvidia/nemotron-3.5-asr-streaming-0.6b").unwrap();
+        assert_eq!(parsed, ModelVariant::Nemotron35AsrStreaming06B);
+        assert_eq!(parsed.family(), ModelFamily::NemotronAsr);
+    }
+
+    #[test]
+    fn resolve_asr_accepts_nemotron_family_alias() {
+        let resolved = resolve_asr_model_variant(Some("nemotron asr streaming"));
+        assert_eq!(resolved, ModelVariant::Nemotron35AsrStreaming06B);
     }
 
     #[test]
