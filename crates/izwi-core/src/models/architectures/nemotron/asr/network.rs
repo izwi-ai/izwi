@@ -3,8 +3,7 @@ use std::collections::HashMap;
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::ops;
 use candle_nn::{
-    batch_norm, layer_norm, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, LayerNorm, Linear, Module,
-    ModuleT, VarBuilder,
+    layer_norm, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, LayerNorm, Linear, Module, VarBuilder,
 };
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
@@ -452,6 +451,7 @@ struct ConvSubsamplingDw {
     conv5: Conv2d,
     conv6: Conv2d,
     out: Linear,
+    out_feature_bins: usize,
 }
 
 impl ConvSubsamplingDw {
@@ -487,7 +487,7 @@ impl ConvSubsamplingDw {
             point_cfg,
             vb.pp("conv.6"),
         )?;
-        let out = mlx::load_linear(CONV_SUB_CHANNELS * 16, ENCODER_DIM, vb.pp("out"))?;
+        let (out, out_feature_bins) = load_subsampling_out_projection(vb.pp("out"))?;
 
         Ok(Self {
             conv0,
@@ -496,6 +496,7 @@ impl ConvSubsamplingDw {
             conv5,
             conv6,
             out,
+            out_feature_bins,
         })
     }
 
@@ -508,7 +509,19 @@ impl ConvSubsamplingDw {
         x = self.conv5.forward(&x)?;
         x = self.conv6.forward(&x)?.relu()?;
 
-        let (b, c, t, f) = x.dims4()?;
+        let (b, c, t, mut f) = x.dims4()?;
+        if c != CONV_SUB_CHANNELS {
+            return Err(Error::InferenceError(format!(
+                "Nemotron subsampling channel mismatch: expected {CONV_SUB_CHANNELS}, got {c}"
+            )));
+        }
+        if f < self.out_feature_bins {
+            x = x.pad_with_zeros(3, 0, self.out_feature_bins - f)?;
+            f = self.out_feature_bins;
+        } else if f > self.out_feature_bins {
+            x = x.narrow(3, 0, self.out_feature_bins)?;
+            f = self.out_feature_bins;
+        }
         let x = x
             .transpose(1, 2)?
             .reshape((b, t, c * f))?
@@ -516,6 +529,22 @@ impl ConvSubsamplingDw {
         let encoded_len = subsampled_len_3x(feature_frames).min(t).max(1);
         Ok((x, encoded_len))
     }
+}
+
+fn load_subsampling_out_projection(vb: VarBuilder) -> Result<(Linear, usize)> {
+    let ws = vb.get_unchecked_dtype("weight", DType::F32)?;
+    let (out_dim, in_dim) = ws.dims2()?;
+    if out_dim != ENCODER_DIM || in_dim % CONV_SUB_CHANNELS != 0 {
+        return Err(Error::ModelLoadError(format!(
+            "Unexpected Nemotron subsampling projection shape: expected out_dim={ENCODER_DIM} and input multiple of {CONV_SUB_CHANNELS}, got ({out_dim},{in_dim})"
+        )));
+    }
+    let bias = if vb.contains_tensor("bias") {
+        Some(vb.get(out_dim, "bias")?)
+    } else {
+        None
+    };
+    Ok((Linear::new(ws, bias), in_dim / CONV_SUB_CHANNELS))
 }
 
 fn subsampled_len_3x(mut len: usize) -> usize {
@@ -600,7 +629,7 @@ impl FeedForward {
 struct ConformerConv {
     pointwise_conv1: Conv1d,
     depthwise_conv: Conv1d,
-    batch_norm: candle_nn::BatchNorm,
+    conv_norm: LayerNorm,
     pointwise_conv2: Conv1d,
 }
 
@@ -629,7 +658,7 @@ impl ConformerConv {
         Ok(Self {
             pointwise_conv1,
             depthwise_conv,
-            batch_norm: batch_norm(ENCODER_DIM, 1e-5, vb.pp("batch_norm"))?,
+            conv_norm: load_conv_channel_layer_norm(vb.pp("batch_norm"))?,
             pointwise_conv2: mlx::load_conv1d_no_bias(
                 ENCODER_DIM,
                 ENCODER_DIM,
@@ -649,12 +678,21 @@ impl ConformerConv {
 
         x = x.pad_with_zeros(2, CONV_KERNEL_1D - 1, 0)?;
         x = self.depthwise_conv.forward(&x)?;
-        x = self.batch_norm.forward_t(&x, false)?;
+        x = self
+            .conv_norm
+            .forward(&x.transpose(1, 2)?)?
+            .transpose(1, 2)?;
         x = swish(&x)?;
         x = self.pointwise_conv2.forward(&x)?;
 
         x.transpose(1, 2).map_err(Error::from)
     }
+}
+
+fn load_conv_channel_layer_norm(vb: VarBuilder) -> Result<LayerNorm> {
+    let weight = vb.get(ENCODER_DIM, "weight")?;
+    let bias = vb.get(ENCODER_DIM, "bias")?;
+    Ok(LayerNorm::new(weight, bias, 1e-5))
 }
 
 struct RelPosSelfAttention {

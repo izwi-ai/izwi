@@ -360,7 +360,7 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     shortName: "Nemotron 3.5 ASR",
     fullName: "NVIDIA Nemotron 3.5 ASR Streaming 0.6B",
     description:
-      "Multilingual cache-aware FastConformer-RNNT ASR model with language-ID prompt conditioning; native Rust loader and streaming state are scaffolded",
+      "Multilingual cache-aware FastConformer-RNNT ASR model with native Rust/Candle offline transcription and language-ID prompt conditioning",
     category: "asr",
     capabilities: [
       "Transcription",

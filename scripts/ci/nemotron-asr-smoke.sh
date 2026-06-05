@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Nemotron-ASR scaffold smoke verification against a running izwi server.
+Nemotron-ASR native offline smoke verification against a running izwi server.
 
 Optional environment:
   IZWI_NEMOTRON_ASR_SMOKE_SERVER       Default: http://127.0.0.1:8080
@@ -12,9 +12,10 @@ Optional environment:
   IZWI_NEMOTRON_ASR_SMOKE_OUT_DIR      Default: target/nemotron-asr-smoke
   IZWI_NEMOTRON_ASR_SMOKE_TIMEOUT_SECS Default: 900
 
-This script validates the current native Rust scaffold: model artifacts should
-load, and transcription should fail with the expected pending FastConformer-RNNT
-forward-pass diagnostic until the tensor mapping is completed.
+This script validates the native Rust/Candle offline path: model artifacts
+should load, and transcription should reach the enabled FastConformer-RNNT
+forward pass. A generated silent WAV is enough to catch loader/tensor-shape
+regressions; set IZWI_NEMOTRON_ASR_SMOKE_AUDIO for a content fixture.
 
 Start the server separately, for example:
   IZWI_BACKEND=cpu izwi serve --backend cpu
@@ -87,20 +88,23 @@ payload = {
     "model": model,
     "audio_base64": base64.b64encode(Path(audio_path).read_bytes()).decode("ascii"),
     "response_format": "json",
-    "language": "auto",
+    "language": "English",
 }
 status, body = post_json("/v1/audio/transcriptions", payload)
 Path(out_dir, "transcription.json").write_text(body)
 
-expected = "native FastConformer-RNNT forward pass is not enabled yet"
-if status < 400:
-    raise SystemExit(
-        "Nemotron transcription unexpectedly succeeded before native forward mapping was completed"
-    )
-if expected not in body:
-    raise SystemExit(
-        f"Nemotron scaffold error did not contain expected diagnostic {expected!r}: {body[:500]}"
-    )
+if status >= 400:
+    raise SystemExit(f"transcription failed with HTTP {status}: {body[:500]}")
+if "forward pass is not enabled yet" in body:
+    raise SystemExit(f"Nemotron transcription returned stale scaffold diagnostic: {body[:500]}")
 
-print("Nemotron ASR scaffold smoke passed.")
+try:
+    parsed = json.loads(body)
+except json.JSONDecodeError as exc:
+    raise SystemExit(f"transcription response is not JSON: {exc}: {body[:500]}")
+
+if "text" not in parsed:
+    raise SystemExit(f"transcription response did not include text field: {body[:500]}")
+
+print("Nemotron ASR native offline smoke passed.")
 PY
