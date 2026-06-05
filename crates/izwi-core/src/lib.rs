@@ -74,8 +74,9 @@ pub use runtime::{
 pub use runtime::{
     AudioChunk, EngineRuntimeTelemetrySnapshot, GenerationConfig,
     InferenceBrokerRuntimeTelemetrySnapshot, InferenceOptions, PipelineRuntimeTelemetrySnapshot,
-    ReplayRedaction, RuntimeReplayRecord, RuntimeService, RuntimeTelemetrySnapshot,
-    RuntimeTraceContract, RuntimeTracePhase, SpeechToSpeechGeneration,
+    ReplayRedaction, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeReplayRecord,
+    RuntimeService, RuntimeTelemetrySnapshot, RuntimeTraceContract, RuntimeTracePhase,
+    SpeechToSpeechGeneration,
     VoiceRuntimeTelemetrySnapshot, VoiceSession, VoiceSessionPhase, RUNTIME_REPLAY_REDACTION,
     RUNTIME_TRACE_CONTRACTS, TRACE_CAPABILITY, TRACE_CORRELATION_ID, TRACE_ERROR_KIND,
     TRACE_EXECUTION_TARGET, TRACE_MODEL_VARIANT, TRACE_PIPELINE_KIND, TRACE_PIPELINE_STAGE,

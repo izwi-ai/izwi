@@ -488,6 +488,10 @@ pub enum NativeAsrDecodeState {
     Nemotron(NemotronStreamingState),
 }
 
+pub enum NativeAsrRealtimeState {
+    Nemotron(NemotronStreamingState),
+}
+
 pub enum NativeDiarizationModel {
     Sortformer(SortformerDiarizerModel),
 }
@@ -498,6 +502,14 @@ pub struct NativeAsrDecodeStep {
     pub text: String,
     pub tokens_generated: usize,
     pub finished: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeAsrRealtimeEvent {
+    pub delta: String,
+    pub text: String,
+    pub is_final: bool,
+    pub chunk_index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -783,7 +795,71 @@ impl NativeAsrModel {
     }
 
     pub fn supports_incremental_decode(&self) -> bool {
-        matches!(self, Self::Qwen3(_) | Self::Nemotron(_))
+        matches!(self, Self::Qwen3(_))
+    }
+
+    pub fn supports_realtime_stream_decode(&self) -> bool {
+        matches!(self, Self::Nemotron(_))
+    }
+
+    pub fn start_realtime_stream_state(
+        &self,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        right_context_frames: Option<usize>,
+    ) -> Result<NativeAsrRealtimeState> {
+        match self {
+            Self::Nemotron(model) => Ok(NativeAsrRealtimeState::Nemotron(
+                model.start_stream_state(language, prompt, right_context_frames)?,
+            )),
+            _ => Err(Error::InvalidInput(
+                "Realtime audio stream state is not available for this ASR model".to_string(),
+            )),
+        }
+    }
+
+    pub fn push_realtime_stream_samples(
+        &self,
+        state: &mut NativeAsrRealtimeState,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> Result<Vec<NativeAsrRealtimeEvent>> {
+        match (self, state) {
+            (Self::Nemotron(model), NativeAsrRealtimeState::Nemotron(state)) => Ok(model
+                .push_stream_samples(state, samples, sample_rate)?
+                .into_iter()
+                .map(|event| NativeAsrRealtimeEvent {
+                    delta: event.delta,
+                    text: event.text,
+                    is_final: event.is_final,
+                    chunk_index: event.chunk_index,
+                })
+                .collect()),
+            _ => Err(Error::InvalidInput(
+                "ASR realtime stream state does not match loaded ASR model".to_string(),
+            )),
+        }
+    }
+
+    pub fn finish_realtime_stream(
+        &self,
+        state: &mut NativeAsrRealtimeState,
+    ) -> Result<Vec<NativeAsrRealtimeEvent>> {
+        match (self, state) {
+            (Self::Nemotron(model), NativeAsrRealtimeState::Nemotron(state)) => Ok(model
+                .finish_stream(state)?
+                .into_iter()
+                .map(|event| NativeAsrRealtimeEvent {
+                    delta: event.delta,
+                    text: event.text,
+                    is_final: event.is_final,
+                    chunk_index: event.chunk_index,
+                })
+                .collect()),
+            _ => Err(Error::InvalidInput(
+                "ASR realtime stream state does not match loaded ASR model".to_string(),
+            )),
+        }
     }
 
     pub fn max_audio_seconds_hint(&self) -> Option<f32> {

@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 use izwi_core::{
-    RuntimeService,
     audio::{AudioEncoder, AudioFormat},
+    RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeService,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -153,6 +153,8 @@ struct RealtimeSessionState {
     last_emitted_sequence: u64,
     committed_text: String,
     trailing_text: String,
+    native_stream_checked: bool,
+    native_asr_stream: Option<RuntimeAsrRealtimeStream>,
 }
 
 impl Default for RealtimeSessionState {
@@ -171,6 +173,8 @@ impl Default for RealtimeSessionState {
             last_emitted_sequence: 0,
             committed_text: String::new(),
             trailing_text: String::new(),
+            native_stream_checked: false,
+            native_asr_stream: None,
         }
     }
 }
@@ -470,6 +474,8 @@ async fn handle_worker_command(
             session.last_emitted_sequence = 0;
             session.committed_text.clear();
             session.trailing_text.clear();
+            session.native_stream_checked = false;
+            session.native_asr_stream = None;
 
             send_json(out_tx, json!({ "type": "session_started" }));
             false
@@ -479,17 +485,40 @@ async fn handle_worker_command(
             sample_rate,
             payload,
         } => {
-            if let Err(err) = ingest_audio_frame(session, frame_seq, sample_rate, &payload) {
-                send_json(out_tx, json!({ "type": "error", "message": err }));
-                return false;
-            }
+            let frame_samples = match ingest_audio_frame(session, frame_seq, sample_rate, &payload)
+            {
+                Ok(samples) => samples,
+                Err(err) => {
+                    send_json(out_tx, json!({ "type": "error", "message": err }));
+                    return false;
+                }
+            };
 
-            if let Err(err) = maybe_schedule_inference(state, correlation_id, session, false) {
-                send_json(out_tx, json!({ "type": "error", "message": err }));
+            match maybe_process_native_stream_frame(
+                state,
+                out_tx,
+                session,
+                &frame_samples,
+                sample_rate,
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    if let Err(err) =
+                        maybe_schedule_inference(state, correlation_id, session, false)
+                    {
+                        send_json(out_tx, json!({ "type": "error", "message": err }));
+                    }
+                }
+                Err(err) => send_json(out_tx, json!({ "type": "error", "message": err })),
             }
             false
         }
         WorkerCommand::SessionStop => {
+            if let Err(err) = finish_native_stream_if_needed(state, out_tx, session).await {
+                send_json(out_tx, json!({ "type": "error", "message": err }));
+            }
             send_json(out_tx, json!({ "type": "session_done" }));
             true
         }
@@ -502,12 +531,12 @@ fn ingest_audio_frame(
     frame_seq: u32,
     sample_rate: u32,
     payload: &[u8],
-) -> Result<(), String> {
+) -> Result<Vec<i16>, String> {
     if !session.started {
         return Err("session_start is required before streaming audio".to_string());
     }
     if payload.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     if payload.len() > MAX_FRAME_BYTES {
         return Err(format!(
@@ -529,7 +558,7 @@ fn ingest_audio_frame(
                 "transcription realtime stale frame ignored: frame_seq={} last_frame_seq={}",
                 frame_seq, last
             );
-            return Ok(());
+            return Ok(Vec::new());
         }
     }
     session.last_frame_seq = Some(frame_seq);
@@ -546,7 +575,7 @@ fn ingest_audio_frame(
 
     let samples = pcm16_bytes_to_i16(payload);
     if samples.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     session.samples_i16.extend_from_slice(&samples);
@@ -558,7 +587,109 @@ fn ingest_audio_frame(
         session.samples_i16.drain(0..drain);
     }
 
+    Ok(samples)
+}
+
+async fn maybe_process_native_stream_frame(
+    state: &AppState,
+    out_tx: &OutboundTx,
+    session: &mut RealtimeSessionState,
+    frame_samples: &[i16],
+    sample_rate: u32,
+) -> Result<bool, String> {
+    if frame_samples.is_empty() {
+        return Ok(session.native_asr_stream.is_some());
+    }
+
+    if !session.native_stream_checked {
+        session.native_stream_checked = true;
+        let _permit = state.acquire_permit().await;
+        session.native_asr_stream = state
+            .runtime
+            .try_start_asr_realtime_stream(
+                session.model_id.as_deref(),
+                session.language.as_deref(),
+                None,
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+    }
+
+    let Some(stream) = session.native_asr_stream.as_mut() else {
+        return Ok(false);
+    };
+
+    let samples = pcm16_i16_to_f32(frame_samples);
+    let started = Instant::now();
+    let _permit = state.acquire_permit().await;
+    let events = state
+        .runtime
+        .push_asr_realtime_samples(stream, &samples, sample_rate)
+        .map_err(|err| err.to_string())?;
+    let processing_time_ms = started.elapsed().as_secs_f64() * 1000.0;
+    emit_native_stream_events(out_tx, session, events, sample_rate, processing_time_ms);
+    session.pending_recompute = false;
+    Ok(true)
+}
+
+async fn finish_native_stream_if_needed(
+    state: &AppState,
+    out_tx: &OutboundTx,
+    session: &mut RealtimeSessionState,
+) -> Result<(), String> {
+    let Some(mut stream) = session.native_asr_stream.take() else {
+        return Ok(());
+    };
+
+    let sample_rate = session.sample_rate.unwrap_or(16_000);
+    let started = Instant::now();
+    let _permit = state.acquire_permit().await;
+    let events = state
+        .runtime
+        .finish_asr_realtime_stream(&mut stream)
+        .map_err(|err| err.to_string())?;
+    let processing_time_ms = started.elapsed().as_secs_f64() * 1000.0;
+    emit_native_stream_events(out_tx, session, events, sample_rate, processing_time_ms);
     Ok(())
+}
+
+fn emit_native_stream_events(
+    out_tx: &OutboundTx,
+    session: &mut RealtimeSessionState,
+    events: Vec<RuntimeAsrRealtimeEvent>,
+    sample_rate: u32,
+    processing_time_ms: f64,
+) {
+    let audio_duration_secs = if sample_rate > 0 {
+        session.samples_i16.len() as f32 / sample_rate as f32
+    } else {
+        0.0
+    };
+    let rtf = (audio_duration_secs > 0.0)
+        .then_some((processing_time_ms / 1000.0) / audio_duration_secs as f64);
+
+    for event in events {
+        if event.delta.is_empty() && !event.is_final {
+            continue;
+        }
+        session.committed_text = event.text.clone();
+        session.trailing_text.clear();
+        session.last_emitted_sequence = event.chunk_index as u64;
+        send_json(
+            out_tx,
+            json!({
+                "type": "transcript_partial",
+                "sequence": event.chunk_index,
+                "text": event.text,
+                "language": session.language.clone(),
+                "audio_duration_secs": audio_duration_secs,
+                "processing_time_ms": processing_time_ms,
+                "rtf": rtf,
+                "native_stream": true,
+                "is_final": event.is_final,
+            }),
+        );
+    }
 }
 
 fn maybe_schedule_inference(
@@ -567,6 +698,9 @@ fn maybe_schedule_inference(
     session: &mut RealtimeSessionState,
     force_interval_check: bool,
 ) -> Result<(), String> {
+    if session.native_asr_stream.is_some() {
+        return Ok(());
+    }
     if !session.started || session.in_flight.is_some() || !session.pending_recompute {
         return Ok(());
     }
@@ -1170,11 +1304,18 @@ fn pcm16_bytes_to_i16(bytes: &[u8]) -> Vec<i16> {
     out
 }
 
+fn pcm16_i16_to_f32(samples_i16: &[i16]) -> Vec<f32> {
+    samples_i16
+        .iter()
+        .map(|sample| *sample as f32 / 32768.0)
+        .collect()
+}
+
 fn wav_bytes_from_pcm16_mono(samples_i16: &[i16], sample_rate: u32) -> Result<Vec<u8>, String> {
     if sample_rate == 0 {
         return Err("Invalid sample rate 0".to_string());
     }
-    let samples_f32: Vec<f32> = samples_i16.iter().map(|s| *s as f32 / 32768.0).collect();
+    let samples_f32 = pcm16_i16_to_f32(samples_i16);
     AudioEncoder::new(sample_rate, 1)
         .encode(&samples_f32, AudioFormat::Wav)
         .map_err(|err| format!("Failed to encode streamed WAV: {err}"))
@@ -1204,8 +1345,9 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        OutboundTx, RealtimeInferenceDiagnostics, collapse_unstable_repetition,
-        merge_online_transcript, strip_suffix_prefix_overlap_with_lookahead_by_words,
+        collapse_unstable_repetition, ingest_audio_frame, merge_online_transcript,
+        pcm16_i16_to_f32, strip_suffix_prefix_overlap_with_lookahead_by_words, OutboundTx,
+        RealtimeInferenceDiagnostics, RealtimeSessionState,
     };
 
     #[tokio::test]
@@ -1258,6 +1400,40 @@ mod tests {
         assert_eq!(value["output_text_chars"], 13);
         assert!(value.get("text").is_none());
         assert!(value.get("transcript").is_none());
+    }
+
+    #[test]
+    fn pcm16_i16_to_f32_uses_standard_pcm16_scale() {
+        let converted = pcm16_i16_to_f32(&[-32768, -16384, 0, 16384, 32767]);
+
+        assert_eq!(converted[0], -1.0);
+        assert_eq!(converted[1], -0.5);
+        assert_eq!(converted[2], 0.0);
+        assert_eq!(converted[3], 0.5);
+        assert!((converted[4] - 0.9999695).abs() < 1e-7);
+    }
+
+    #[test]
+    fn ingest_audio_frame_returns_only_fresh_samples_for_native_streaming() {
+        let mut session = RealtimeSessionState {
+            started: true,
+            ..RealtimeSessionState::default()
+        };
+        let payload = [0x00, 0x00, 0x00, 0x80, 0xff, 0x7f];
+
+        let samples = ingest_audio_frame(&mut session, 1, 16_000, &payload).expect("fresh frame");
+
+        assert_eq!(samples, vec![0, -32768, 32767]);
+        assert_eq!(session.samples_i16, samples);
+        assert_eq!(session.sample_rate, Some(16_000));
+        assert_eq!(session.last_frame_seq, Some(1));
+        assert!(session.pending_recompute);
+
+        let stale_samples =
+            ingest_audio_frame(&mut session, 1, 16_000, &payload).expect("stale frame ignored");
+
+        assert!(stale_samples.is_empty());
+        assert_eq!(session.samples_i16, samples);
     }
 
     #[test]
