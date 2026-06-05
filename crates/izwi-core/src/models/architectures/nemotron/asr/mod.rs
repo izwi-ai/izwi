@@ -636,14 +636,85 @@ fn normalize_target_lang(value: &str) -> Result<String> {
         return Ok(locale.to_string());
     }
 
+    let alias_key = language_alias_key(&normalized);
+    if let Some(locale) = default_locale_for_language_name(&alias_key) {
+        return Ok(locale.to_string());
+    }
+
     if let Some(locale) = default_locale_for_short_code(&normalized.to_ascii_lowercase()) {
         return Ok(locale.to_string());
     }
 
     Err(Error::InvalidInput(format!(
-        "Unsupported Nemotron target_lang '{value}'. Use 'auto' or one of: {}",
+        "Unsupported Nemotron target_lang '{value}'. Use 'auto', a supported language name, or one of: {}",
         SUPPORTED_TARGET_LANGS.join(", ")
     )))
+}
+
+fn language_alias_key(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut last_was_space = true;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_space = false;
+        } else if !last_was_space {
+            out.push(' ');
+            last_was_space = true;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn default_locale_for_language_name(name: &str) -> Option<&'static str> {
+    match name {
+        "english" | "american english" | "us english" | "u s english"
+        | "united states english" => Some("en-US"),
+        "british english" | "uk english" | "u k english" | "united kingdom english" => {
+            Some("en-GB")
+        }
+        "spanish" | "castilian" | "european spanish" | "spain spanish" => Some("es-ES"),
+        "us spanish" | "u s spanish" | "united states spanish" | "american spanish" => {
+            Some("es-US")
+        }
+        "french" | "european french" | "france french" => Some("fr-FR"),
+        "canadian french" | "canada french" => Some("fr-CA"),
+        "italian" => Some("it-IT"),
+        "portuguese" | "brazilian portuguese" | "brazil portuguese" => Some("pt-BR"),
+        "european portuguese" | "portugal portuguese" => Some("pt-PT"),
+        "dutch" => Some("nl-NL"),
+        "german" => Some("de-DE"),
+        "turkish" => Some("tr-TR"),
+        "russian" => Some("ru-RU"),
+        "arabic" => Some("ar-AR"),
+        "hindi" => Some("hi-IN"),
+        "japanese" => Some("ja-JP"),
+        "korean" => Some("ko-KR"),
+        "vietnamese" => Some("vi-VN"),
+        "ukrainian" => Some("uk-UA"),
+        "polish" => Some("pl-PL"),
+        "swedish" => Some("sv-SE"),
+        "czech" => Some("cs-CZ"),
+        "norwegian" | "norwegian bokmal" | "bokmal" => Some("nb-NO"),
+        "norwegian nynorsk" | "nynorsk" => Some("nn-NO"),
+        "danish" => Some("da-DK"),
+        "bulgarian" => Some("bg-BG"),
+        "finnish" => Some("fi-FI"),
+        "croatian" => Some("hr-HR"),
+        "slovak" => Some("sk-SK"),
+        "chinese" | "mandarin" | "mandarin chinese" | "simplified chinese" => Some("zh-CN"),
+        "hungarian" => Some("hu-HU"),
+        "romanian" => Some("ro-RO"),
+        "estonian" => Some("et-EE"),
+        "greek" => Some("el-GR"),
+        "lithuanian" => Some("lt-LT"),
+        "latvian" => Some("lv-LV"),
+        "maltese" => Some("mt-MT"),
+        "slovenian" | "slovene" => Some("sl-SI"),
+        "hebrew" => Some("he-IL"),
+        "thai" => Some("th-TH"),
+        _ => None,
+    }
 }
 
 fn default_locale_for_short_code(code: &str) -> Option<&'static str> {
@@ -805,6 +876,27 @@ mod tests {
     }
 
     #[test]
+    fn prompt_condition_accepts_public_language_names() {
+        let prompt = NemotronPromptCondition::resolve(Some("English"), None).unwrap();
+        assert_eq!(prompt.target_lang, "en-US");
+
+        let prompt = NemotronPromptCondition::resolve(Some("Auto"), None).unwrap();
+        assert_eq!(prompt.target_lang, "auto");
+
+        let prompt = NemotronPromptCondition::resolve(Some("British English"), None).unwrap();
+        assert_eq!(prompt.target_lang, "en-GB");
+
+        let prompt = NemotronPromptCondition::resolve(Some("Canadian French"), None).unwrap();
+        assert_eq!(prompt.target_lang, "fr-CA");
+
+        let prompt = NemotronPromptCondition::resolve(Some("European Portuguese"), None).unwrap();
+        assert_eq!(prompt.target_lang, "pt-PT");
+
+        let prompt = NemotronPromptCondition::resolve(Some("Mandarin"), None).unwrap();
+        assert_eq!(prompt.target_lang, "zh-CN");
+    }
+
+    #[test]
     fn prompt_condition_preserves_non_language_prompt_as_context() {
         let prompt = NemotronPromptCondition::resolve(Some("fr-CA"), Some("medical dictation"))
             .unwrap();
@@ -818,6 +910,15 @@ mod tests {
         let err = NemotronPromptCondition::resolve(Some("xx-YY"), None).unwrap_err();
 
         assert!(err.to_string().contains("Unsupported Nemotron target_lang"));
+    }
+
+    #[test]
+    fn prompt_condition_rejects_unsupported_public_language_name() {
+        let err = NemotronPromptCondition::resolve(Some("Cantonese"), None).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(msg.contains("Unsupported Nemotron target_lang 'Cantonese'"));
+        assert!(msg.contains("supported language name"));
     }
 
     #[test]
