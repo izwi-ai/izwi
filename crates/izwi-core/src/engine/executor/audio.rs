@@ -914,6 +914,55 @@ mod tests {
     }
 
     #[test]
+    fn streaming_chunk_plan_keeps_long_audio_single_chunk_when_model_hint_fits() {
+        let sr = 10u32;
+        let audio_secs = 50 * 60;
+        let samples = vec![0.0f32; sr as usize * audio_secs];
+
+        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(60.0 * 60.0), true, false);
+
+        assert_eq!(
+            plan.chunks.len(),
+            1,
+            "expected model-fit 50-minute audio to stay single chunk"
+        );
+        assert!(
+            !plan.requires_chunk_path(),
+            "model-fit single chunk should bypass chunked transcription"
+        );
+    }
+
+    #[test]
+    fn streaming_chunk_plan_forces_long_audio_chunk_path_before_model_prefill() {
+        let sr = 10u32;
+        let audio_secs = 50 * 60;
+        let model_hint_secs = 120.0f32;
+        let model_fit_limit_secs = model_hint_secs * 0.95;
+        let samples = vec![0.0f32; sr as usize * audio_secs];
+
+        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(model_hint_secs), true, false);
+
+        assert!(
+            plan.requires_chunk_path(),
+            "expected 50-minute model-limited audio to use chunked transcription"
+        );
+        assert!(
+            plan.chunks.len() > 1,
+            "expected multiple chunks, got {}",
+            plan.chunks.len()
+        );
+        let max_chunk_secs = plan
+            .chunks
+            .iter()
+            .map(|chunk| chunk.len_samples() as f32 / sr as f32)
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_chunk_secs <= model_fit_limit_secs + 1.0 / sr as f32,
+            "expected chunk duration <= {model_fit_limit_secs}s, got {max_chunk_secs}s"
+        );
+    }
+
+    #[test]
     fn whisper_streaming_chunk_plan_keeps_standard_long_form_chunks() {
         let sr = 16_000u32;
         let samples = vec![0.0f32; (sr as usize) * 40];
