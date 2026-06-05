@@ -7,6 +7,8 @@ mod network;
 use std::fs;
 use std::path::Path;
 
+use candle_core::{DType, Device};
+use candle_nn::VarBuilder;
 use serde_json::json;
 
 use crate::backends::DeviceProfile;
@@ -16,6 +18,7 @@ use crate::tokenizer::Tokenizer;
 
 pub use config::NemotronConfigInventory;
 pub use nemo::{ensure_nemotron_artifacts, NemotronArtifacts, NEMOTRON_NEMO_FILENAME};
+use network::{resample_linear, NemotronNetwork};
 
 const SAMPLE_RATE: u32 = 16_000;
 const DEFAULT_STRIP_LANG_TAGS: bool = true;
@@ -40,6 +43,7 @@ pub struct NemotronAsrModel {
     variant: ModelVariant,
     artifacts: NemotronArtifacts,
     decoder: NemotronDecoder,
+    network: NemotronNetwork,
     runtime_plan: NemotronRuntimePlan,
     device_profile: DeviceProfile,
 }
@@ -491,11 +495,22 @@ impl NemotronAsrModel {
         let runtime_plan = NemotronRuntimePlan::from_inventory(&artifacts.config_inventory)?;
         validate_config_output_vocabulary(&artifacts.config_inventory)?;
         let decoder = NemotronDecoder::load(&artifacts)?;
+        let device = select_device_for_nemotron(&device_profile);
+        let vb =
+            VarBuilder::from_pth(&artifacts.checkpoint_path, DType::F32, &device).map_err(|e| {
+                Error::ModelLoadError(format!(
+                    "Failed to load Nemotron checkpoint {}: {}",
+                    artifacts.checkpoint_path.display(),
+                    e
+                ))
+            })?;
+        let network = NemotronNetwork::load(&vb, &artifacts.config_inventory)?;
 
         Ok(Self {
             variant,
             artifacts,
             decoder,
+            network,
             runtime_plan,
             device_profile,
         })
@@ -527,10 +542,11 @@ impl NemotronAsrModel {
         sample_rate: u32,
         language: Option<&str>,
         prompt: Option<&str>,
-        _on_delta: &mut dyn FnMut(&str),
+        on_delta: &mut dyn FnMut(&str),
     ) -> Result<String> {
         let request = self.prepare_decode_request(audio, sample_rate, language, prompt)?;
-        Err(self.native_forward_not_ready_error(&request))
+        let output = self.decode_offline(audio, &request, on_delta)?;
+        Ok(output.text)
     }
 
     pub fn transcribe_with_details_and_prompt(
@@ -541,7 +557,8 @@ impl NemotronAsrModel {
         prompt: Option<&str>,
     ) -> Result<NemotronAsrTranscriptionOutput> {
         let request = self.prepare_decode_request(audio, sample_rate, language, prompt)?;
-        Err(self.native_forward_not_ready_error(&request))
+        let mut no_op = |_delta: &str| {};
+        self.decode_offline(audio, &request, &mut no_op)
     }
 
     pub fn max_audio_seconds_hint(&self) -> Option<f32> {
@@ -587,6 +604,7 @@ impl NemotronAsrModel {
         prompt: Option<&str>,
     ) -> Result<serde_json::Value> {
         let prompt = NemotronPromptCondition::resolve(language, prompt)?;
+        let prompt_id = self.network.prompt_id(&prompt.target_lang)?;
         Ok(json!({
             "variant": self.variant.dir_name(),
             "repo_id": self.variant.repo_id(),
@@ -599,7 +617,10 @@ impl NemotronAsrModel {
             "decoder_source": self.decoder.source(),
             "runtime": self.runtime_plan.diagnostics(),
             "prompt": prompt.diagnostics(),
-            "native_forward_status": "pending_fastconformer_rnnt_weight_mapping",
+            "prompt_id": prompt_id,
+            "blank_id": self.network.blank_idx(),
+            "native_forward_status": "enabled_offline_fastconformer_rnnt",
+            "supports_realtime_cache_decode": false,
         }))
     }
 
@@ -627,12 +648,61 @@ impl NemotronAsrModel {
         })
     }
 
-    fn native_forward_not_ready_error(&self, request: &NemotronDecodeRequest) -> Error {
-        Error::InferenceError(format!(
-            "Nemotron 3.5 ASR native FastConformer-RNNT forward pass is not enabled yet; loaded artifacts and prompt diagnostics: {}",
-            request.diagnostics()
-        ))
+    fn decode_offline(
+        &self,
+        audio: &[f32],
+        request: &NemotronDecodeRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<NemotronAsrTranscriptionOutput> {
+        let audio_16khz = if request.input_sample_rate == request.target_sample_rate {
+            audio.to_vec()
+        } else {
+            resample_linear(audio, request.input_sample_rate, request.target_sample_rate)
+        };
+        let prompt_id = self.network.prompt_id(&request.prompt.target_lang)?;
+        let (encoded, encoded_len) = self.network.encode_with_prompt(&audio_16khz, prompt_id)?;
+
+        let mut token_ids = Vec::<usize>::new();
+        let mut assembled = String::new();
+        let mut on_token = |token_id: usize| {
+            token_ids.push(token_id);
+            let decoded = self.decoder.decode(&token_ids);
+            let delta = text_delta(&assembled, &decoded);
+            if !delta.is_empty() {
+                on_delta(delta.as_str());
+            }
+            assembled = decoded;
+        };
+        let decoded = self
+            .network
+            .decode_rnnt_greedy(&encoded, encoded_len, &mut on_token)?;
+        if assembled.is_empty() {
+            assembled = self.decoder.decode(&decoded.token_ids);
+        }
+
+        Ok(NemotronAsrTranscriptionOutput {
+            text: assembled,
+            language: Some(request.prompt.target_lang.clone()),
+            diagnostics: Some(json!({
+                "audio": {
+                    "input_sample_rate": request.input_sample_rate,
+                    "target_sample_rate": request.target_sample_rate,
+                    "input_samples": request.samples,
+                    "resampled_samples": audio_16khz.len(),
+                },
+                "prompt": request.prompt.diagnostics(),
+                "prompt_id": prompt_id,
+                "blank_id": self.network.blank_idx(),
+                "native_forward_status": "enabled_offline_fastconformer_rnnt",
+                "decode": decoded.stats.diagnostics(),
+                "supports_realtime_cache_decode": false,
+            })),
+        })
     }
+}
+
+fn select_device_for_nemotron(device_profile: &DeviceProfile) -> Device {
+    device_profile.device.clone()
 }
 
 fn validate_config_output_vocabulary(inventory: &NemotronConfigInventory) -> Result<()> {
@@ -860,6 +930,18 @@ fn decode_vocab_tokens(ids: &[usize], vocab: &[String]) -> String {
     }
 
     normalize_decoded_text(out)
+}
+
+fn text_delta(previous: &str, current: &str) -> String {
+    if let Some(delta) = current.strip_prefix(previous) {
+        return delta.to_string();
+    }
+    let common = previous
+        .chars()
+        .zip(current.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    current.chars().skip(common).collect()
 }
 
 fn should_skip_token(token: &str) -> bool {
