@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 use candle_nn::ops;
@@ -7,7 +7,7 @@ use candle_nn::{
     layer_norm, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, LayerNorm, Linear, Module, VarBuilder,
 };
 use rustfft::num_complex::Complex;
-use rustfft::FftPlanner;
+use rustfft::{Fft, FftPlanner};
 use serde_json::json;
 
 use super::config::NemotronConfigInventory;
@@ -486,7 +486,76 @@ struct NemotronPreprocessor {
     device: Device,
     padded_window: Vec<f32>,
     fb: Vec<f32>,
+    fft: Arc<dyn Fft<f32>>,
     normalize: FeatureNormalize,
+}
+
+pub(super) struct NemotronStreamingFeatureState {
+    preemphasized: Vec<f32>,
+    last_raw_sample: Option<f32>,
+    next_frame: usize,
+    input_finished: bool,
+}
+
+pub(super) struct NemotronStreamingFeatureChunk {
+    pub features: Tensor,
+    pub start_frame: usize,
+    pub frames: usize,
+    pub total_ready_frames: usize,
+    pub is_final: bool,
+}
+
+impl NemotronStreamingFeatureState {
+    pub(super) fn new() -> Self {
+        Self {
+            preemphasized: Vec::new(),
+            last_raw_sample: None,
+            next_frame: 0,
+            input_finished: false,
+        }
+    }
+
+    pub(super) fn push_samples(&mut self, samples: &[f32]) -> Result<()> {
+        if self.input_finished {
+            return Err(Error::InvalidInput(
+                "Cannot push audio into a finalized Nemotron feature stream".to_string(),
+            ));
+        }
+        if samples.is_empty() {
+            return Ok(());
+        }
+
+        self.preemphasized.reserve(samples.len());
+        for &sample in samples {
+            let value = if let Some(prev) = self.last_raw_sample {
+                sample - PREEMPH * prev
+            } else {
+                sample
+            };
+            self.preemphasized.push(value);
+            self.last_raw_sample = Some(sample);
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish_input(&mut self) {
+        self.input_finished = true;
+    }
+
+    fn ready_frames(&self) -> usize {
+        if self.preemphasized.is_empty() {
+            return 0;
+        }
+        if self.input_finished {
+            return ((self.preemphasized.len() + HOP_LENGTH - 1) / HOP_LENGTH).max(1);
+        }
+
+        let center_pad = N_FFT / 2;
+        if self.preemphasized.len() < center_pad {
+            return 0;
+        }
+        ((self.preemphasized.len() - center_pad) / HOP_LENGTH) + 1
+    }
 }
 
 impl NemotronPreprocessor {
@@ -531,10 +600,14 @@ impl NemotronPreprocessor {
         let offset = (N_FFT - WIN_LENGTH) / 2;
         padded_window[offset..offset + WIN_LENGTH].copy_from_slice(&window);
 
+        let mut planner = FftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(N_FFT);
+
         Ok(Self {
             device,
             padded_window,
             fb,
+            fft,
             normalize: FeatureNormalize::from_config(inventory.normalize.as_deref()),
         })
     }
@@ -559,8 +632,6 @@ impl NemotronPreprocessor {
             1
         };
 
-        let mut planner = FftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(N_FFT);
         let mut spectrum = vec![0f32; frame_count * (N_FFT / 2 + 1)];
         let mut buffer = vec![Complex::<f32>::new(0.0, 0.0); N_FFT];
 
@@ -572,7 +643,7 @@ impl NemotronPreprocessor {
                 buffer[i].im = 0.0;
             }
 
-            fft.process(&mut buffer);
+            self.fft.process(&mut buffer);
 
             for k in 0..(N_FFT / 2 + 1) {
                 let mag = (buffer[k].re * buffer[k].re + buffer[k].im * buffer[k].im).sqrt();
@@ -611,6 +682,100 @@ impl NemotronPreprocessor {
 
         let features = Tensor::from_vec(mel, (1, N_MELS, frame_count), &self.device)?;
         Ok((features, valid_frames))
+    }
+
+    pub(super) fn compute_streaming_features(
+        &self,
+        state: &mut NemotronStreamingFeatureState,
+    ) -> Result<Option<NemotronStreamingFeatureChunk>> {
+        if self.normalize == FeatureNormalize::PerFeature {
+            return Err(Error::InferenceError(
+                "Nemotron streaming frontend does not support per-feature normalization".to_string(),
+            ));
+        }
+
+        let ready_frames = state.ready_frames();
+        if ready_frames <= state.next_frame {
+            return Ok(None);
+        }
+
+        let start_frame = state.next_frame;
+        let frames = ready_frames - start_frame;
+        let mel = self.compute_mel_frames(
+            &state.preemphasized,
+            start_frame,
+            frames,
+            state.input_finished,
+        )?;
+        let features = Tensor::from_vec(mel, (1, N_MELS, frames), &self.device)?;
+        state.next_frame = ready_frames;
+
+        Ok(Some(NemotronStreamingFeatureChunk {
+            features,
+            start_frame,
+            frames,
+            total_ready_frames: ready_frames,
+            is_final: state.input_finished,
+        }))
+    }
+
+    fn compute_mel_frames(
+        &self,
+        preemphasized: &[f32],
+        start_frame: usize,
+        frames: usize,
+        allow_right_padding: bool,
+    ) -> Result<Vec<f32>> {
+        if frames == 0 {
+            return Ok(Vec::new());
+        }
+
+        let n_freqs = N_FFT / 2 + 1;
+        let center_pad = N_FFT / 2;
+        let mut spectrum = vec![0f32; frames * n_freqs];
+        let mut buffer = vec![Complex::<f32>::new(0.0, 0.0); N_FFT];
+
+        for local_frame in 0..frames {
+            let frame_idx = start_frame + local_frame;
+            let center = frame_idx * HOP_LENGTH;
+            for i in 0..N_FFT {
+                let sample = match center.checked_add(i).and_then(|v| v.checked_sub(center_pad)) {
+                    Some(src_idx) if src_idx < preemphasized.len() => preemphasized[src_idx],
+                    Some(_) if allow_right_padding => 0.0,
+                    Some(src_idx) => {
+                        return Err(Error::InferenceError(format!(
+                            "Nemotron streaming frontend frame {frame_idx} requires sample {src_idx}, but only {} samples are available",
+                            preemphasized.len()
+                        )));
+                    }
+                    None => 0.0,
+                };
+                buffer[i].re = sample * self.padded_window[i];
+                buffer[i].im = 0.0;
+            }
+
+            self.fft.process(&mut buffer);
+
+            for k in 0..n_freqs {
+                let mag = (buffer[k].re * buffer[k].re + buffer[k].im * buffer[k].im).sqrt();
+                spectrum[local_frame * n_freqs + k] = mag * mag;
+            }
+        }
+
+        let mut mel = vec![0f32; N_MELS * frames];
+        for m in 0..N_MELS {
+            for t in 0..frames {
+                let mut acc = 0f32;
+                let spec_row = &spectrum[t * n_freqs..(t + 1) * n_freqs];
+                let fb_row = &self.fb[m * n_freqs..(m + 1) * n_freqs];
+                for f in 0..n_freqs {
+                    acc += spec_row[f] * fb_row[f];
+                }
+                mel[m * frames + t] = (acc + LOG_GUARD).ln();
+            }
+        }
+
+        Ok(mel)
     }
 }
 
@@ -1408,6 +1573,38 @@ fn normalize_per_feature(mel: &mut [f32], n_mels: usize, frames: usize, valid_fr
 mod tests {
     use super::*;
 
+    fn test_preprocessor(normalize: FeatureNormalize) -> NemotronPreprocessor {
+        let device = Device::Cpu;
+        let mut planner = FftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(N_FFT);
+        let mut fb = vec![0f32; N_MELS * (N_FFT / 2 + 1)];
+        let n_freqs = N_FFT / 2 + 1;
+        for m in 0..N_MELS {
+            fb[m * n_freqs + (m % n_freqs)] = 1.0;
+        }
+
+        NemotronPreprocessor {
+            device,
+            padded_window: vec![1.0; N_FFT],
+            fb,
+            fft,
+            normalize,
+        }
+    }
+
+    fn assert_tensor_close(lhs: &Tensor, rhs: &Tensor, tolerance: f32) {
+        assert_eq!(lhs.dims(), rhs.dims());
+        let lhs = lhs.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let rhs = rhs.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (idx, (a, b)) in lhs.iter().zip(rhs.iter()).enumerate() {
+            let diff = (a - b).abs();
+            assert!(
+                diff <= tolerance,
+                "tensor mismatch at {idx}: lhs={a} rhs={b} diff={diff}"
+            );
+        }
+    }
+
     #[test]
     fn resample_linear_downsamples_24khz_to_16khz_length() {
         let audio = vec![0.0f32; 24_000];
@@ -1504,6 +1701,78 @@ mod tests {
         assert_eq!(prompt.dims(), &[1, 1, PROMPT_DIM]);
         assert_eq!(values[3], 1.0);
         assert_eq!(values.iter().filter(|value| **value == 1.0).count(), 1);
+    }
+
+    #[test]
+    fn streaming_feature_state_waits_for_centered_frame_samples() {
+        let preprocessor = test_preprocessor(FeatureNormalize::None);
+        let mut state = NemotronStreamingFeatureState::new();
+
+        state.push_samples(&vec![0.25; (N_FFT / 2) - 1]).unwrap();
+        assert!(preprocessor
+            .compute_streaming_features(&mut state)
+            .unwrap()
+            .is_none());
+
+        state.push_samples(&[0.5]).unwrap();
+        let chunk = preprocessor
+            .compute_streaming_features(&mut state)
+            .unwrap()
+            .expect("first centered frame");
+
+        assert_eq!(chunk.start_frame, 0);
+        assert_eq!(chunk.frames, 1);
+        assert_eq!(chunk.total_ready_frames, 1);
+        assert!(!chunk.is_final);
+    }
+
+    #[test]
+    fn streaming_features_match_full_valid_features_after_chunked_pushes() {
+        let preprocessor = test_preprocessor(FeatureNormalize::None);
+        let audio = (0..4_013)
+            .map(|idx| ((idx as f32) * 0.017).sin() * 0.3)
+            .collect::<Vec<_>>();
+        let (full, valid_frames) = preprocessor.compute_features(&audio).unwrap();
+        let full = full.narrow(2, 0, valid_frames).unwrap();
+
+        let mut state = NemotronStreamingFeatureState::new();
+        let mut chunks = Vec::<Tensor>::new();
+        let mut offset = 0usize;
+        for size in [17usize, 439, 811, 1_003, 571, 1_172] {
+            let end = offset.saturating_add(size).min(audio.len());
+            if end == offset {
+                break;
+            }
+            state.push_samples(&audio[offset..end]).unwrap();
+            if let Some(chunk) = preprocessor.compute_streaming_features(&mut state).unwrap() {
+                chunks.push(chunk.features);
+            }
+            offset = end;
+        }
+        if offset < audio.len() {
+            state.push_samples(&audio[offset..]).unwrap();
+            if let Some(chunk) = preprocessor.compute_streaming_features(&mut state).unwrap() {
+                chunks.push(chunk.features);
+            }
+        }
+        state.finish_input();
+        if let Some(chunk) = preprocessor.compute_streaming_features(&mut state).unwrap() {
+            assert!(chunk.is_final);
+            chunks.push(chunk.features);
+        }
+
+        let refs = chunks.iter().collect::<Vec<_>>();
+        let streamed = Tensor::cat(&refs, 2).unwrap();
+        assert_tensor_close(&streamed, &full, 1e-4);
+    }
+
+    #[test]
+    fn streaming_feature_state_rejects_push_after_finish() {
+        let mut state = NemotronStreamingFeatureState::new();
+        state.finish_input();
+
+        let err = state.push_samples(&[0.0]).unwrap_err();
+        assert!(err.to_string().contains("finalized"));
     }
 
     #[test]
