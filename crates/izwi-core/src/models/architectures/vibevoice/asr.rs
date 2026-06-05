@@ -3,12 +3,12 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use candle_core::{D, DType, IndexOp, Tensor};
+use candle_core::{DType, IndexOp, Tensor, D};
 use serde::Serialize;
 use serde_json::json;
 use tracing::info;
 
-use crate::backends::DeviceProfile;
+use crate::backends::{DeviceKind, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
@@ -26,6 +26,9 @@ use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::weights::gguf::load_model_weights;
 
 const DEFAULT_MAX_NEW_TOKENS: usize = 768;
+const DEFAULT_MAX_AUDIO_SECONDS: f32 = 60.0 * 60.0;
+const DEFAULT_CUDA_MAX_AUDIO_SECONDS: f32 = 2.0 * 60.0;
+const CUDA_MAX_AUDIO_SECONDS_ENV: &str = "IZWI_VIBEVOICE_ASR_CUDA_MAX_AUDIO_SECS";
 const TOKENIZER_STREAMING_CHUNK_SECONDS: usize = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,7 +235,7 @@ impl VibeVoiceAsrModel {
     }
 
     pub fn max_audio_seconds_hint(&self) -> Option<f32> {
-        Some(60.0 * 60.0)
+        Some(vibevoice_asr_max_audio_seconds_hint(self.device.kind))
     }
 
     fn transcribe_internal(
@@ -938,6 +941,31 @@ fn asr_placeholder_count(samples: usize, speech_tok_compress_ratio: usize) -> us
     samples.saturating_add(ratio - 1) / ratio
 }
 
+fn vibevoice_asr_max_audio_seconds_hint(device_kind: DeviceKind) -> f32 {
+    let cuda_override = std::env::var(CUDA_MAX_AUDIO_SECONDS_ENV).ok();
+    vibevoice_asr_max_audio_seconds_hint_for(device_kind, cuda_override.as_deref())
+}
+
+fn vibevoice_asr_max_audio_seconds_hint_for(
+    device_kind: DeviceKind,
+    cuda_override: Option<&str>,
+) -> f32 {
+    if !device_kind.is_cuda() {
+        return DEFAULT_MAX_AUDIO_SECONDS;
+    }
+
+    cuda_override
+        .and_then(parse_positive_finite_f32)
+        .unwrap_or(DEFAULT_CUDA_MAX_AUDIO_SECONDS)
+}
+
+fn parse_positive_finite_f32(raw: &str) -> Option<f32> {
+    raw.trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite() && *value > 0.0)
+}
+
 fn tokenizer_streaming_chunk_samples(sample_rate: u32, speech_tok_compress_ratio: usize) -> usize {
     let ratio = speech_tok_compress_ratio.max(1);
     let raw = sample_rate as usize * TOKENIZER_STREAMING_CHUNK_SECONDS;
@@ -1003,6 +1031,44 @@ mod tests {
         assert_eq!(asr_placeholder_count(3_201, 3_200), 2);
         assert_eq!(asr_placeholder_count(9_599, 3_200), 3);
         assert_eq!(asr_placeholder_count(9_600, 3_200), 3);
+    }
+
+    #[test]
+    fn max_audio_seconds_hint_preserves_cpu_and_metal_window() {
+        assert_eq!(
+            vibevoice_asr_max_audio_seconds_hint_for(DeviceKind::Cpu, Some("30")),
+            DEFAULT_MAX_AUDIO_SECONDS
+        );
+        assert_eq!(
+            vibevoice_asr_max_audio_seconds_hint_for(DeviceKind::Metal, Some("30")),
+            DEFAULT_MAX_AUDIO_SECONDS
+        );
+    }
+
+    #[test]
+    fn max_audio_seconds_hint_limits_cuda_window_by_default() {
+        assert_eq!(
+            vibevoice_asr_max_audio_seconds_hint_for(DeviceKind::Cuda, None),
+            DEFAULT_CUDA_MAX_AUDIO_SECONDS
+        );
+    }
+
+    #[test]
+    fn max_audio_seconds_hint_accepts_positive_cuda_override() {
+        assert_eq!(
+            vibevoice_asr_max_audio_seconds_hint_for(DeviceKind::Cuda, Some("45.5")),
+            45.5
+        );
+    }
+
+    #[test]
+    fn max_audio_seconds_hint_rejects_invalid_cuda_override() {
+        for raw in ["", "0", "-1", "nan", "inf", "not-a-number"] {
+            assert_eq!(
+                vibevoice_asr_max_audio_seconds_hint_for(DeviceKind::Cuda, Some(raw)),
+                DEFAULT_CUDA_MAX_AUDIO_SECONDS
+            );
+        }
     }
 
     #[test]
