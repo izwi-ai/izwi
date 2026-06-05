@@ -17,7 +17,7 @@ use crate::models::architectures::lfm25_audio::{
     Lfm25AudioGenerationConfig, Lfm25AudioModel, Lfm25AudioStreamConfig,
 };
 use crate::models::architectures::nemotron::asr::{
-    NemotronAsrModel, NemotronAsrTranscriptionOutput,
+    NemotronAsrDecodeStep, NemotronAsrModel, NemotronAsrTranscriptionOutput, NemotronStreamingState,
 };
 use crate::models::architectures::parakeet::asr::ParakeetAsrModel;
 use crate::models::architectures::qwen3::asr::{
@@ -485,6 +485,7 @@ pub struct NativeAudioChatGeneration {
 
 pub enum NativeAsrDecodeState {
     Qwen3(Qwen3AsrDecodeState),
+    Nemotron(NemotronStreamingState),
 }
 
 pub enum NativeDiarizationModel {
@@ -782,7 +783,7 @@ impl NativeAsrModel {
     }
 
     pub fn supports_incremental_decode(&self) -> bool {
-        matches!(self, Self::Qwen3(_))
+        matches!(self, Self::Qwen3(_) | Self::Nemotron(_))
     }
 
     pub fn max_audio_seconds_hint(&self) -> Option<f32> {
@@ -826,8 +827,14 @@ impl NativeAsrModel {
             Self::Parakeet(_) => Err(Error::InvalidInput(
                 "Incremental decode state is not available for this ASR model".to_string(),
             )),
-            Self::Nemotron(_) => Err(Error::InvalidInput(
-                "Incremental decode state is not available for this ASR model".to_string(),
+            Self::Nemotron(model) => Ok(NativeAsrDecodeState::Nemotron(
+                model.start_decode_with_prompt(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                    max_new_tokens,
+                )?,
             )),
             Self::WhisperTurbo(_) => Err(Error::InvalidInput(
                 "Incremental decode state is not available for this ASR model".to_string(),
@@ -842,6 +849,15 @@ impl NativeAsrModel {
         match (self, state) {
             (Self::Qwen3(model), NativeAsrDecodeState::Qwen3(state)) => {
                 let step: Qwen3AsrDecodeStep = model.decode_step(state)?;
+                Ok(NativeAsrDecodeStep {
+                    delta: step.delta,
+                    text: step.text,
+                    tokens_generated: step.tokens_generated,
+                    finished: step.finished,
+                })
+            }
+            (Self::Nemotron(model), NativeAsrDecodeState::Nemotron(state)) => {
+                let step: NemotronAsrDecodeStep = model.decode_step(state)?;
                 Ok(NativeAsrDecodeStep {
                     delta: step.delta,
                     text: step.text,
@@ -1742,9 +1758,8 @@ mod tests {
 
     #[test]
     fn resolves_nemotron_asr_loader_registration() {
-        let registration =
-            resolve_asr_loader_registration(ModelVariant::Nemotron35AsrStreaming06B)
-                .expect("Nemotron ASR loader should be registered");
+        let registration = resolve_asr_loader_registration(ModelVariant::Nemotron35AsrStreaming06B)
+            .expect("Nemotron ASR loader should be registered");
 
         assert_eq!(registration.name, "nemotron_asr");
         assert_eq!(registration.family, ModelFamily::NemotronAsr);

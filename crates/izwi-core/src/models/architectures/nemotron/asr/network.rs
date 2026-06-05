@@ -257,6 +257,20 @@ impl NemotronNetwork {
         }))
     }
 
+    pub(super) fn compute_streaming_features(
+        &self,
+        state: &mut NemotronStreamingFeatureState,
+    ) -> Result<Option<NemotronStreamingFeatureChunk>> {
+        self.preprocessor.compute_streaming_features(state)
+    }
+
+    pub(super) fn pre_encode_streaming_chunk(
+        &self,
+        state: &mut NemotronStreamingPreEncodeState,
+    ) -> Result<Option<NemotronStreamingEncodedChunk>> {
+        self.pre_encode.forward_streaming_chunk(state)
+    }
+
     pub(super) fn decode_rnnt_greedy(
         &self,
         encoded: &Tensor,
@@ -386,9 +400,11 @@ impl NemotronNetwork {
                                     .to_string(),
                             )
                         })?;
-                    self.joint.joint_from_projections(&enc_t, predictor_projection)?
+                    self.joint
+                        .joint_from_projections(&enc_t, predictor_projection)?
                 } else {
-                    self.joint.joint_after_projection(&enc_t, &state.predictor_out)?
+                    self.joint
+                        .joint_after_projection(&enc_t, &state.predictor_out)?
                 }
                 .squeeze(0)?
                 .squeeze(0)?
@@ -778,10 +794,7 @@ impl NemotronStreamingPreEncodeState {
         }
     }
 
-    pub(super) fn push_features(
-        &mut self,
-        chunk: NemotronStreamingFeatureChunk,
-    ) -> Result<()> {
+    pub(super) fn push_features(&mut self, chunk: NemotronStreamingFeatureChunk) -> Result<()> {
         if self.input_finished {
             return Err(Error::InvalidInput(
                 "Cannot push features into a finalized Nemotron pre-encode stream".to_string(),
@@ -824,10 +837,7 @@ impl NemotronStreamingEncoderState {
         }
     }
 
-    pub(super) fn push_pre_encoded(
-        &mut self,
-        chunk: NemotronStreamingEncodedChunk,
-    ) -> Result<()> {
+    pub(super) fn push_pre_encoded(&mut self, chunk: NemotronStreamingEncodedChunk) -> Result<()> {
         if self.input_finished {
             return Err(Error::InvalidInput(
                 "Cannot push encoder frames into a finalized Nemotron encoder stream".to_string(),
@@ -861,7 +871,8 @@ impl NemotronStreamingEncoderState {
         if self.input_finished {
             self.encoded_frames
         } else {
-            self.encoded_frames.saturating_sub(self.right_context_frames)
+            self.encoded_frames
+                .saturating_sub(self.right_context_frames)
         }
     }
 }
@@ -1004,7 +1015,8 @@ impl NemotronPreprocessor {
     ) -> Result<Option<NemotronStreamingFeatureChunk>> {
         if self.normalize == FeatureNormalize::PerFeature {
             return Err(Error::InferenceError(
-                "Nemotron streaming frontend does not support per-feature normalization".to_string(),
+                "Nemotron streaming frontend does not support per-feature normalization"
+                    .to_string(),
             ));
         }
 
@@ -1053,7 +1065,10 @@ impl NemotronPreprocessor {
             let frame_idx = start_frame + local_frame;
             let center = frame_idx * HOP_LENGTH;
             for i in 0..N_FFT {
-                let sample = match center.checked_add(i).and_then(|v| v.checked_sub(center_pad)) {
+                let sample = match center
+                    .checked_add(i)
+                    .and_then(|v| v.checked_sub(center_pad))
+                {
                     Some(src_idx) if src_idx < preemphasized.len() => preemphasized[src_idx],
                     Some(_) if allow_right_padding => 0.0,
                     Some(src_idx) => {
@@ -2049,8 +2064,12 @@ mod tests {
         let device = Device::Cpu;
         PromptKernel {
             linear0: Linear::new(
-                Tensor::zeros((PROMPT_HIDDEN, ENCODER_DIM + PROMPT_DIM), DType::F32, &device)
-                    .unwrap(),
+                Tensor::zeros(
+                    (PROMPT_HIDDEN, ENCODER_DIM + PROMPT_DIM),
+                    DType::F32,
+                    &device,
+                )
+                .unwrap(),
                 Some(Tensor::zeros(PROMPT_HIDDEN, DType::F32, &device).unwrap()),
             ),
             linear2: Linear::new(
@@ -2407,7 +2426,9 @@ mod tests {
     fn streaming_encoder_state_rejects_out_of_order_frames() {
         let mut state = NemotronStreamingEncoderState::new(56, 1);
 
-        let err = state.push_pre_encoded(encoded_chunk(1, 1, false)).unwrap_err();
+        let err = state
+            .push_pre_encoded(encoded_chunk(1, 1, false))
+            .unwrap_err();
         assert!(err.to_string().contains("expected start frame 0"));
     }
 
@@ -2444,18 +2465,14 @@ mod tests {
         let mut emitted = Vec::new();
 
         let first = network
-            .decode_rnnt_streaming_chunk(&mut state, &encoded, 1, &mut |token| {
-                emitted.push(token)
-            })
+            .decode_rnnt_streaming_chunk(&mut state, &encoded, 1, &mut |token| emitted.push(token))
             .unwrap();
         assert_eq!(first.new_token_ids, vec![0, 0]);
         assert_eq!(first.token_ids, vec![0, 0]);
         assert_eq!(first.stats.guard_exits, 1);
 
         let second = network
-            .decode_rnnt_streaming_chunk(&mut state, &encoded, 1, &mut |token| {
-                emitted.push(token)
-            })
+            .decode_rnnt_streaming_chunk(&mut state, &encoded, 1, &mut |token| emitted.push(token))
             .unwrap();
         assert_eq!(second.new_token_ids, vec![0, 0]);
         assert_eq!(second.token_ids, vec![0, 0, 0, 0]);

@@ -21,7 +21,10 @@ use crate::tokenizer::Tokenizer;
 
 pub use config::NemotronConfigInventory;
 pub use nemo::{ensure_nemotron_artifacts, NemotronArtifacts, NEMOTRON_NEMO_FILENAME};
-use network::{resample_linear, NemotronNetwork};
+use network::{
+    resample_linear, NemotronNetwork, NemotronRnntStreamState, NemotronStreamingEncoderState,
+    NemotronStreamingFeatureState, NemotronStreamingPreEncodeState,
+};
 
 const SAMPLE_RATE: u32 = 16_000;
 const DEFAULT_STRIP_LANG_TAGS: bool = true;
@@ -41,6 +44,14 @@ pub struct NemotronAsrTranscriptionOutput {
     pub text: String,
     pub language: Option<String>,
     pub diagnostics: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NemotronAsrDecodeStep {
+    pub delta: String,
+    pub text: String,
+    pub tokens_generated: usize,
+    pub finished: bool,
 }
 
 pub struct NemotronAsrModel {
@@ -387,16 +398,24 @@ pub enum NemotronStreamingCacheStatus {
     PendingNativeCacheImplementation,
 }
 
-#[derive(Debug, Clone)]
 pub struct NemotronStreamingState {
     profile: NemotronStreamingProfile,
     prompt: NemotronPromptCondition,
     sample_rate: u32,
+    samples: Vec<f32>,
     buffered_samples: usize,
     consumed_samples: usize,
     chunks_processed: usize,
+    events_emitted: usize,
     input_finished: bool,
+    final_event_emitted: bool,
     cache_status: NemotronStreamingCacheStatus,
+    feature_state: NemotronStreamingFeatureState,
+    pre_encode_state: NemotronStreamingPreEncodeState,
+    encoder_state: NemotronStreamingEncoderState,
+    rnnt_state: Option<NemotronRnntStreamState>,
+    assembled_text: String,
+    emitted_tokens: usize,
 }
 
 impl NemotronStreamingState {
@@ -405,16 +424,33 @@ impl NemotronStreamingState {
         prompt: NemotronPromptCondition,
         sample_rate: u32,
     ) -> Self {
+        let encoder_state = NemotronStreamingEncoderState::new(
+            profile.left_context_frames,
+            profile.right_context_frames,
+        );
         Self {
             profile,
             prompt,
             sample_rate,
+            samples: Vec::new(),
             buffered_samples: 0,
             consumed_samples: 0,
             chunks_processed: 0,
+            events_emitted: 0,
             input_finished: false,
+            final_event_emitted: false,
             cache_status: NemotronStreamingCacheStatus::PendingNativeCacheImplementation,
+            feature_state: NemotronStreamingFeatureState::new(),
+            pre_encode_state: NemotronStreamingPreEncodeState::new(),
+            encoder_state,
+            rnnt_state: None,
+            assembled_text: String::new(),
+            emitted_tokens: 0,
         }
+    }
+
+    fn attach_rnnt_state(&mut self, rnnt_state: NemotronRnntStreamState) {
+        self.rnnt_state = Some(rnnt_state);
     }
 
     pub fn profile(&self) -> &NemotronStreamingProfile {
@@ -437,12 +473,21 @@ impl NemotronStreamingState {
         self.chunks_processed
     }
 
+    pub fn text(&self) -> &str {
+        &self.assembled_text
+    }
+
+    pub fn emitted_tokens(&self) -> usize {
+        self.emitted_tokens
+    }
+
     pub fn push_samples(&mut self, samples: &[f32]) -> Result<()> {
         if self.input_finished {
             return Err(Error::InvalidInput(
                 "Cannot push audio into a finalized Nemotron streaming state".to_string(),
             ));
         }
+        self.samples.extend_from_slice(samples);
         self.buffered_samples = self.buffered_samples.saturating_add(samples.len());
         Ok(())
     }
@@ -505,9 +550,13 @@ impl NemotronStreamingState {
             "buffered_samples": self.buffered_samples,
             "consumed_samples": self.consumed_samples,
             "chunks_processed": self.chunks_processed,
+            "events_emitted": self.events_emitted,
             "input_finished": self.input_finished,
+            "final_event_emitted": self.final_event_emitted,
+            "emitted_tokens": self.emitted_tokens,
             "cache_status": format!("{:?}", self.cache_status),
             "supports_realtime_cache_decode": false,
+            "supports_realtime_stream_decode": self.rnnt_state.is_some(),
         })
     }
 }
@@ -713,12 +762,11 @@ impl NemotronAsrModel {
     ) -> Result<NemotronStreamingState> {
         let prompt = config.prompt_condition()?;
         let profile = self.resolve_streaming_profile(config.right_context_frames)?;
+        let rnnt_state = self.network.start_rnnt_stream()?;
 
-        Ok(NemotronStreamingState::new(
-            profile,
-            prompt,
-            self.runtime_plan.sample_rate,
-        ))
+        let mut state = NemotronStreamingState::new(profile, prompt, self.runtime_plan.sample_rate);
+        state.attach_rnnt_state(rnnt_state);
+        Ok(state)
     }
 
     fn resolve_streaming_profile(
@@ -739,6 +787,187 @@ impl NemotronAsrModel {
                 })?,
             None => self.runtime_plan.default_streaming_profile.clone(),
         })
+    }
+
+    pub fn push_stream_samples(
+        &self,
+        state: &mut NemotronStreamingState,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> Result<Vec<NemotronRealtimeStreamEvent>> {
+        if samples.is_empty() {
+            return Ok(Vec::new());
+        }
+        if sample_rate == 0 {
+            return Err(Error::InvalidInput(
+                "Audio sample rate must be greater than zero".to_string(),
+            ));
+        }
+        let samples = if sample_rate == state.sample_rate {
+            samples.to_vec()
+        } else {
+            resample_linear(samples, sample_rate, state.sample_rate)
+        };
+        state.push_samples(&samples)?;
+        self.decode_ready_stream_chunks(state)
+    }
+
+    pub fn finish_stream(
+        &self,
+        state: &mut NemotronStreamingState,
+    ) -> Result<Vec<NemotronRealtimeStreamEvent>> {
+        state.finish_input();
+        let mut events = self.decode_ready_stream_chunks(state)?;
+        if !state.final_event_emitted {
+            state.final_event_emitted = true;
+            let event = NemotronRealtimeStreamEvent {
+                text: state.assembled_text.clone(),
+                delta: String::new(),
+                is_final: true,
+                chunk_index: state.events_emitted,
+            };
+            state.events_emitted = state.events_emitted.saturating_add(1);
+            events.push(event);
+        }
+        Ok(events)
+    }
+
+    pub fn start_decode_with_prompt(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        _max_new_tokens: usize,
+    ) -> Result<NemotronStreamingState> {
+        let mut state = self.start_stream_state(language, prompt, None)?;
+        let audio_16khz = if sample_rate == self.runtime_plan.sample_rate {
+            audio.to_vec()
+        } else {
+            resample_linear(audio, sample_rate, self.runtime_plan.sample_rate)
+        };
+        state.push_samples(&audio_16khz)?;
+        state.finish_input();
+        Ok(state)
+    }
+
+    pub fn decode_step(&self, state: &mut NemotronStreamingState) -> Result<NemotronAsrDecodeStep> {
+        let events = self.decode_next_stream_chunk(state)?;
+        let mut delta = String::new();
+        let mut finished = false;
+        for event in events {
+            delta.push_str(&event.delta);
+            finished |= event.is_final;
+        }
+        if state.input_finished && state.consumed_samples >= state.buffered_samples && !finished {
+            let final_events = self.finish_stream(state)?;
+            for event in final_events {
+                delta.push_str(&event.delta);
+                finished |= event.is_final;
+            }
+        }
+        Ok(NemotronAsrDecodeStep {
+            delta,
+            text: state.assembled_text.clone(),
+            tokens_generated: state.emitted_tokens,
+            finished,
+        })
+    }
+
+    fn decode_ready_stream_chunks(
+        &self,
+        state: &mut NemotronStreamingState,
+    ) -> Result<Vec<NemotronRealtimeStreamEvent>> {
+        let mut events = Vec::new();
+        while state.next_ready_chunk().is_some() {
+            events.extend(self.decode_next_stream_chunk(state)?);
+        }
+        Ok(events)
+    }
+
+    fn decode_next_stream_chunk(
+        &self,
+        state: &mut NemotronStreamingState,
+    ) -> Result<Vec<NemotronRealtimeStreamEvent>> {
+        let Some(chunk) = state.next_ready_chunk() else {
+            return Ok(Vec::new());
+        };
+        let chunk_samples = state.samples[chunk.start_sample..chunk.end_sample].to_vec();
+        state.feature_state.push_samples(&chunk_samples)?;
+        if chunk.is_final {
+            state.feature_state.finish_input();
+        }
+        state.mark_chunk_consumed(&chunk)?;
+        let prompt_id = self.network.prompt_id(&state.prompt.target_lang)?;
+        self.drain_streaming_network(state, prompt_id)
+    }
+
+    fn drain_streaming_network(
+        &self,
+        state: &mut NemotronStreamingState,
+        prompt_id: usize,
+    ) -> Result<Vec<NemotronRealtimeStreamEvent>> {
+        let mut events = Vec::new();
+        loop {
+            let mut progressed = false;
+
+            if let Some(feature_chunk) = self
+                .network
+                .compute_streaming_features(&mut state.feature_state)?
+            {
+                state.pre_encode_state.push_features(feature_chunk)?;
+                progressed = true;
+            } else if state.input_finished {
+                state.pre_encode_state.finish_input();
+            }
+
+            if let Some(pre_encoded) = self
+                .network
+                .pre_encode_streaming_chunk(&mut state.pre_encode_state)?
+            {
+                state.encoder_state.push_pre_encoded(pre_encoded)?;
+                progressed = true;
+            } else if state.input_finished {
+                state.encoder_state.finish_input();
+            }
+
+            if let Some(encoder_chunk) = self
+                .network
+                .encode_streaming_chunk(&mut state.encoder_state, prompt_id)?
+            {
+                let rnnt_state = state.rnnt_state.as_mut().ok_or_else(|| {
+                    Error::InferenceError("Nemotron stream is missing RNNT state".to_string())
+                })?;
+                let mut ignored = |_token_id: usize| {};
+                let decoded = self.network.decode_rnnt_streaming_chunk(
+                    rnnt_state,
+                    &encoder_chunk.encoded,
+                    encoder_chunk.frames,
+                    &mut ignored,
+                )?;
+                state.emitted_tokens = decoded.stats.emitted_tokens;
+                let text = self.decoder.decode(&decoded.token_ids);
+                let delta = text_delta(&state.assembled_text, &text);
+                state.assembled_text = text.clone();
+                if !delta.is_empty() || encoder_chunk.is_final {
+                    let is_final = encoder_chunk.is_final;
+                    state.final_event_emitted |= is_final;
+                    events.push(NemotronRealtimeStreamEvent {
+                        text,
+                        delta,
+                        is_final,
+                        chunk_index: state.events_emitted,
+                    });
+                    state.events_emitted = state.events_emitted.saturating_add(1);
+                }
+                progressed = true;
+            }
+
+            if !progressed {
+                break;
+            }
+        }
+        Ok(events)
     }
 
     pub fn diagnostics_for_prompt(
