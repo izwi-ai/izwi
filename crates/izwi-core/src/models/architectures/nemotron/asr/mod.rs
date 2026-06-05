@@ -45,11 +45,18 @@ pub struct NemotronAsrModel {
 
 enum NemotronDecoder {
     HfTokenizer(Tokenizer),
+    ConfigLabels(Vec<String>),
     Vocab(Vec<String>),
 }
 
 impl NemotronDecoder {
     fn load(artifacts: &NemotronArtifacts) -> Result<Self> {
+        if !artifacts.config_inventory.output_vocabulary.is_empty() {
+            return Ok(Self::ConfigLabels(
+                artifacts.config_inventory.output_vocabulary.clone(),
+            ));
+        }
+
         if let Ok(tokenizer) = Tokenizer::from_path(&artifacts.extracted_dir) {
             return Ok(Self::HfTokenizer(tokenizer));
         }
@@ -87,6 +94,7 @@ impl NemotronDecoder {
                 let ids = ids.iter().map(|id| *id as u32).collect::<Vec<_>>();
                 tokenizer.decode(&ids).unwrap_or_default()
             }
+            Self::ConfigLabels(vocab) => decode_vocab_tokens(ids, vocab),
             Self::Vocab(vocab) => decode_vocab_tokens(ids, vocab),
         }
     }
@@ -94,7 +102,16 @@ impl NemotronDecoder {
     fn vocab_size(&self) -> usize {
         match self {
             Self::HfTokenizer(tokenizer) => tokenizer.vocab_size(),
+            Self::ConfigLabels(vocab) => vocab.len(),
             Self::Vocab(vocab) => vocab.len(),
+        }
+    }
+
+    fn source(&self) -> &'static str {
+        match self {
+            Self::HfTokenizer(_) => "huggingface_tokenizer",
+            Self::ConfigLabels(_) => "config_labels",
+            Self::Vocab(_) => "vocab_file",
         }
     }
 }
@@ -442,15 +459,8 @@ impl NemotronAsrModel {
 
         let artifacts = ensure_nemotron_artifacts(model_dir, variant)?;
         let runtime_plan = NemotronRuntimePlan::from_inventory(&artifacts.config_inventory)?;
+        validate_config_output_vocabulary(&artifacts.config_inventory)?;
         let decoder = NemotronDecoder::load(&artifacts)?;
-        if let Some(expected) = runtime_plan.vocab_size {
-            let actual = decoder.vocab_size();
-            if actual < expected {
-                return Err(Error::ModelLoadError(format!(
-                    "Nemotron tokenizer vocabulary is smaller than config: tokenizer={actual}, config={expected}"
-                )));
-            }
-        }
 
         Ok(Self {
             variant,
@@ -555,6 +565,8 @@ impl NemotronAsrModel {
             "checkpoint_path": self.artifacts.checkpoint_path.display().to_string(),
             "model_config_path": self.artifacts.model_config_path.display().to_string(),
             "tokenizer_vocab_size": self.decoder.vocab_size(),
+            "decoder_vocabulary_size": self.decoder.vocab_size(),
+            "decoder_source": self.decoder.source(),
             "runtime": self.runtime_plan.diagnostics(),
             "prompt": prompt.diagnostics(),
             "native_forward_status": "pending_fastconformer_rnnt_weight_mapping",
@@ -591,6 +603,23 @@ impl NemotronAsrModel {
             request.diagnostics()
         ))
     }
+}
+
+fn validate_config_output_vocabulary(inventory: &NemotronConfigInventory) -> Result<()> {
+    let Some(expected) = inventory.vocab_size else {
+        return Ok(());
+    };
+    if inventory.output_vocabulary.is_empty() {
+        return Ok(());
+    }
+
+    let actual = inventory.output_vocabulary.len();
+    if actual != expected {
+        return Err(Error::ModelLoadError(format!(
+            "Nemotron output vocabulary length does not match config: labels={actual}, config={expected}"
+        )));
+    }
+    Ok(())
 }
 
 fn normalize_target_lang(value: &str) -> Result<String> {
@@ -754,6 +783,8 @@ fn ms_to_samples(ms: usize, sample_rate: u32) -> usize {
 mod tests {
     use super::*;
 
+    use uuid::Uuid;
+
     #[test]
     fn prompt_condition_defaults_to_auto_language() {
         let prompt = NemotronPromptCondition::resolve(None, None).unwrap();
@@ -850,6 +881,55 @@ mod tests {
         let err = state.mark_chunk_consumed(&chunk).unwrap_err();
 
         assert!(err.to_string().contains("chunk index mismatch"));
+    }
+
+    #[test]
+    fn decoder_prefers_config_labels_over_short_vocab_txt() {
+        let temp_dir = std::env::temp_dir().join(format!("nemotron-decoder-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let vocab_path = temp_dir.join("vocab.txt");
+        fs::write(&vocab_path, "##hello\n##world\n").unwrap();
+        let artifacts = NemotronArtifacts {
+            nemo_path: temp_dir.join("model.nemo"),
+            extracted_dir: temp_dir.clone(),
+            model_config_path: temp_dir.join("model_config.yaml"),
+            checkpoint_path: temp_dir.join("model_weights.ckpt"),
+            tokenizer_paths: vec![vocab_path],
+            config_inventory: NemotronConfigInventory {
+                vocab_size: Some(4),
+                output_vocabulary: vec![
+                    "<unk>".to_string(),
+                    "<en-US>".to_string(),
+                    "▁hello".to_string(),
+                    "▁world".to_string(),
+                ],
+                ..Default::default()
+            },
+        };
+
+        validate_config_output_vocabulary(&artifacts.config_inventory).unwrap();
+        let decoder = NemotronDecoder::load(&artifacts).unwrap();
+
+        assert_eq!(decoder.source(), "config_labels");
+        assert_eq!(decoder.vocab_size(), 4);
+        assert_eq!(decoder.decode(&[0, 1, 2, 3]), "hello world");
+
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn config_output_vocabulary_must_match_config_vocab_size() {
+        let inventory = NemotronConfigInventory {
+            vocab_size: Some(3),
+            output_vocabulary: vec!["<unk>".to_string(), "hello".to_string()],
+            ..Default::default()
+        };
+
+        let err = validate_config_output_vocabulary(&inventory).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("output vocabulary length does not match config"));
     }
 
     #[test]
