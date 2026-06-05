@@ -19,6 +19,7 @@ pub use nemo::{ensure_nemotron_artifacts, NemotronArtifacts, NEMOTRON_NEMO_FILEN
 const SAMPLE_RATE: u32 = 16_000;
 const DEFAULT_STRIP_LANG_TAGS: bool = true;
 const DEFAULT_MAX_AUDIO_SECONDS_HINT: f32 = 30.0;
+const STREAMING_FRAME_MS: usize = 80;
 const SUPPORTED_TARGET_LANGS: &[&str] = &[
     "auto", "en-US", "en-GB", "es-US", "es-ES", "fr-FR", "fr-CA", "it-IT", "pt-BR", "pt-PT",
     "nl-NL", "de-DE", "tr-TR", "ru-RU", "ar-AR", "hi-IN", "ja-JP", "ko-KR", "vi-VN", "uk-UA",
@@ -110,6 +111,7 @@ struct NemotronRuntimePlan {
     prompt_dim: Option<usize>,
     vocab_size: Option<usize>,
     default_streaming_profile: NemotronStreamingProfile,
+    streaming_profiles: Vec<NemotronStreamingProfile>,
 }
 
 impl NemotronRuntimePlan {
@@ -121,6 +123,14 @@ impl NemotronRuntimePlan {
             )));
         }
 
+        let streaming_profiles = NemotronStreamingProfile::profiles_from_inventory(inventory)?;
+        let default_streaming_profile = streaming_profiles
+            .last()
+            .cloned()
+            .ok_or_else(|| {
+                Error::ModelLoadError("Nemotron config did not yield a streaming profile".to_string())
+            })?;
+
         Ok(Self {
             sample_rate: SAMPLE_RATE,
             feature_bins: inventory.features,
@@ -131,7 +141,8 @@ impl NemotronRuntimePlan {
             joint_hidden: inventory.joint_hidden,
             prompt_dim: inventory.prompt_dim,
             vocab_size: inventory.vocab_size,
-            default_streaming_profile: NemotronStreamingProfile::from_inventory(inventory)?,
+            default_streaming_profile,
+            streaming_profiles,
         })
     }
 
@@ -147,6 +158,7 @@ impl NemotronRuntimePlan {
             "prompt_dim": self.prompt_dim,
             "vocab_size": self.vocab_size,
             "streaming_profile": self.default_streaming_profile.diagnostics(),
+            "streaming_profiles": self.streaming_profiles.iter().map(|profile| profile.diagnostics()).collect::<Vec<_>>(),
         })
     }
 }
@@ -160,15 +172,19 @@ pub struct NemotronStreamingProfile {
 }
 
 impl NemotronStreamingProfile {
-    fn from_inventory(inventory: &NemotronConfigInventory) -> Result<Self> {
+    fn profiles_from_inventory(inventory: &NemotronConfigInventory) -> Result<Vec<Self>> {
         let left_context_frames = inventory.left_context_frames.unwrap_or(56);
-        let right_context_frames = inventory
-            .right_context_frames
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(13);
-        Self::new(left_context_frames, right_context_frames)
+        let mut right_context_frames = if inventory.right_context_frames.is_empty() {
+            vec![0, 1, 3, 6, 13]
+        } else {
+            inventory.right_context_frames.clone()
+        };
+        right_context_frames.sort_unstable();
+        right_context_frames.dedup();
+        right_context_frames
+            .into_iter()
+            .map(|right| Self::new(left_context_frames, right))
+            .collect()
     }
 
     pub fn new(left_context_frames: usize, right_context_frames: usize) -> Result<Self> {
@@ -188,8 +204,20 @@ impl NemotronStreamingProfile {
             left_context_frames,
             right_context_frames,
             chunk_frames,
-            chunk_ms: chunk_frames * 80,
+            chunk_ms: chunk_frames * STREAMING_FRAME_MS,
         })
+    }
+
+    pub fn chunk_samples(&self, sample_rate: u32) -> usize {
+        ms_to_samples(self.chunk_ms, sample_rate)
+    }
+
+    pub fn left_context_samples(&self, sample_rate: u32) -> usize {
+        ms_to_samples(self.left_context_frames * STREAMING_FRAME_MS, sample_rate)
+    }
+
+    pub fn right_context_samples(&self, sample_rate: u32) -> usize {
+        ms_to_samples(self.right_context_frames * STREAMING_FRAME_MS, sample_rate)
     }
 
     fn diagnostics(&self) -> serde_json::Value {
@@ -197,6 +225,151 @@ impl NemotronStreamingProfile {
             "att_context_size": [self.left_context_frames, self.right_context_frames],
             "chunk_frames": self.chunk_frames,
             "chunk_ms": self.chunk_ms,
+            "cache_reuse_ready": false,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NemotronStreamChunkRange {
+    pub chunk_index: usize,
+    pub start_sample: usize,
+    pub end_sample: usize,
+    pub is_final: bool,
+}
+
+impl NemotronStreamChunkRange {
+    pub fn len_samples(&self) -> usize {
+        self.end_sample.saturating_sub(self.start_sample)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NemotronStreamingCacheStatus {
+    PendingNativeCacheImplementation,
+}
+
+#[derive(Debug, Clone)]
+pub struct NemotronStreamingState {
+    profile: NemotronStreamingProfile,
+    prompt: NemotronPromptCondition,
+    sample_rate: u32,
+    buffered_samples: usize,
+    consumed_samples: usize,
+    chunks_processed: usize,
+    input_finished: bool,
+    cache_status: NemotronStreamingCacheStatus,
+}
+
+impl NemotronStreamingState {
+    fn new(
+        profile: NemotronStreamingProfile,
+        prompt: NemotronPromptCondition,
+        sample_rate: u32,
+    ) -> Self {
+        Self {
+            profile,
+            prompt,
+            sample_rate,
+            buffered_samples: 0,
+            consumed_samples: 0,
+            chunks_processed: 0,
+            input_finished: false,
+            cache_status: NemotronStreamingCacheStatus::PendingNativeCacheImplementation,
+        }
+    }
+
+    pub fn profile(&self) -> &NemotronStreamingProfile {
+        &self.profile
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    pub fn buffered_samples(&self) -> usize {
+        self.buffered_samples
+    }
+
+    pub fn consumed_samples(&self) -> usize {
+        self.consumed_samples
+    }
+
+    pub fn chunks_processed(&self) -> usize {
+        self.chunks_processed
+    }
+
+    pub fn push_samples(&mut self, samples: &[f32]) -> Result<()> {
+        if self.input_finished {
+            return Err(Error::InvalidInput(
+                "Cannot push audio into a finalized Nemotron streaming state".to_string(),
+            ));
+        }
+        self.buffered_samples = self.buffered_samples.saturating_add(samples.len());
+        Ok(())
+    }
+
+    pub fn finish_input(&mut self) {
+        self.input_finished = true;
+    }
+
+    pub fn next_ready_chunk(&self) -> Option<NemotronStreamChunkRange> {
+        if self.consumed_samples >= self.buffered_samples {
+            return None;
+        }
+
+        let chunk_samples = self.profile.chunk_samples(self.sample_rate);
+        let planned_end = self.consumed_samples.saturating_add(chunk_samples);
+        if planned_end <= self.buffered_samples {
+            return Some(NemotronStreamChunkRange {
+                chunk_index: self.chunks_processed,
+                start_sample: self.consumed_samples,
+                end_sample: planned_end,
+                is_final: self.input_finished && planned_end == self.buffered_samples,
+            });
+        }
+
+        self.input_finished.then_some(NemotronStreamChunkRange {
+            chunk_index: self.chunks_processed,
+            start_sample: self.consumed_samples,
+            end_sample: self.buffered_samples,
+            is_final: true,
+        })
+    }
+
+    pub fn mark_chunk_consumed(&mut self, chunk: &NemotronStreamChunkRange) -> Result<()> {
+        if chunk.chunk_index != self.chunks_processed {
+            return Err(Error::InvalidInput(format!(
+                "Nemotron stream chunk index mismatch: got {}, expected {}",
+                chunk.chunk_index, self.chunks_processed
+            )));
+        }
+        if chunk.start_sample != self.consumed_samples
+            || chunk.end_sample <= chunk.start_sample
+            || chunk.end_sample > self.buffered_samples
+        {
+            return Err(Error::InvalidInput(format!(
+                "Invalid Nemotron stream chunk range {}..{} for consumed={} buffered={}",
+                chunk.start_sample, chunk.end_sample, self.consumed_samples, self.buffered_samples
+            )));
+        }
+
+        self.consumed_samples = chunk.end_sample;
+        self.chunks_processed = self.chunks_processed.saturating_add(1);
+        Ok(())
+    }
+
+    pub fn diagnostics(&self) -> serde_json::Value {
+        json!({
+            "profile": self.profile.diagnostics(),
+            "prompt": self.prompt.diagnostics(),
+            "sample_rate": self.sample_rate,
+            "buffered_samples": self.buffered_samples,
+            "consumed_samples": self.consumed_samples,
+            "chunks_processed": self.chunks_processed,
+            "input_finished": self.input_finished,
+            "cache_status": format!("{:?}", self.cache_status),
+            "supports_realtime_cache_decode": false,
         })
     }
 }
@@ -333,6 +506,39 @@ impl NemotronAsrModel {
 
     pub fn max_audio_seconds_hint(&self) -> Option<f32> {
         Some(DEFAULT_MAX_AUDIO_SECONDS_HINT)
+    }
+
+    pub fn available_streaming_profiles(&self) -> &[NemotronStreamingProfile] {
+        &self.runtime_plan.streaming_profiles
+    }
+
+    pub fn start_stream_state(
+        &self,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        right_context_frames: Option<usize>,
+    ) -> Result<NemotronStreamingState> {
+        let prompt = NemotronPromptCondition::resolve(language, prompt)?;
+        let profile = match right_context_frames {
+            Some(right_context_frames) => self
+                .runtime_plan
+                .streaming_profiles
+                .iter()
+                .find(|profile| profile.right_context_frames == right_context_frames)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "Nemotron streaming profile with right-context {right_context_frames} is not available"
+                    ))
+                })?,
+            None => self.runtime_plan.default_streaming_profile.clone(),
+        };
+
+        Ok(NemotronStreamingState::new(
+            profile,
+            prompt,
+            self.runtime_plan.sample_rate,
+        ))
     }
 
     pub fn diagnostics_for_prompt(
@@ -540,6 +746,10 @@ fn normalize_decoded_text(mut text: String) -> String {
     text.trim().to_string()
 }
 
+fn ms_to_samples(ms: usize, sample_rate: u32) -> usize {
+    ((sample_rate as usize).saturating_mul(ms)) / 1000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,6 +795,61 @@ mod tests {
 
         assert_eq!(profile.chunk_frames, 14);
         assert_eq!(profile.chunk_ms, 1120);
+        assert_eq!(profile.chunk_samples(16_000), 17_920);
+        assert_eq!(profile.right_context_samples(16_000), 16_640);
+    }
+
+    #[test]
+    fn streaming_profiles_from_inventory_cover_all_model_card_profiles() {
+        let inventory = NemotronConfigInventory {
+            left_context_frames: Some(56),
+            right_context_frames: vec![13, 0, 6, 1, 3],
+            ..Default::default()
+        };
+
+        let profiles = NemotronStreamingProfile::profiles_from_inventory(&inventory).unwrap();
+        let chunk_ms = profiles
+            .iter()
+            .map(|profile| profile.chunk_ms)
+            .collect::<Vec<_>>();
+
+        assert_eq!(chunk_ms, vec![80, 160, 320, 560, 1120]);
+    }
+
+    #[test]
+    fn streaming_state_emits_non_overlapping_ready_chunks() {
+        let profile = NemotronStreamingProfile::new(56, 1).unwrap();
+        let prompt = NemotronPromptCondition::resolve(Some("en-US"), None).unwrap();
+        let mut state = NemotronStreamingState::new(profile, prompt, 16_000);
+
+        state.push_samples(&vec![0.0; 2_560]).unwrap();
+        let first = state.next_ready_chunk().expect("first chunk");
+        assert_eq!(first.start_sample, 0);
+        assert_eq!(first.end_sample, 2_560);
+        assert!(!first.is_final);
+        state.mark_chunk_consumed(&first).unwrap();
+
+        state.push_samples(&vec![0.0; 1_280]).unwrap();
+        assert!(state.next_ready_chunk().is_none());
+        state.finish_input();
+        let tail = state.next_ready_chunk().expect("final tail chunk");
+        assert_eq!(tail.start_sample, 2_560);
+        assert_eq!(tail.end_sample, 3_840);
+        assert!(tail.is_final);
+    }
+
+    #[test]
+    fn streaming_state_rejects_out_of_order_chunk_accounting() {
+        let profile = NemotronStreamingProfile::new(56, 0).unwrap();
+        let prompt = NemotronPromptCondition::resolve(None, None).unwrap();
+        let mut state = NemotronStreamingState::new(profile, prompt, 16_000);
+        state.push_samples(&vec![0.0; 1_280]).unwrap();
+
+        let mut chunk = state.next_ready_chunk().unwrap();
+        chunk.chunk_index = 3;
+        let err = state.mark_chunk_consumed(&chunk).unwrap_err();
+
+        assert!(err.to_string().contains("chunk index mismatch"));
     }
 
     #[test]
