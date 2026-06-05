@@ -327,6 +327,114 @@ impl NemotronNetwork {
         })
     }
 
+    pub(super) fn start_rnnt_stream(&self) -> Result<NemotronRnntStreamState> {
+        let device = &self.preprocessor.device;
+        let mut predictor_state = self.predictor.initial_state(1, device)?;
+        let predictor_out = self
+            .predictor
+            .step(self.blank_idx, &mut predictor_state, device)?;
+        let predictor_projection = if device.is_cuda() {
+            Some(self.joint.project_predictor(&predictor_out)?)
+        } else {
+            None
+        };
+
+        Ok(NemotronRnntStreamState {
+            predictor_state,
+            predictor_out,
+            predictor_projection,
+            token_ids: Vec::new(),
+            stats: NemotronDecodeStats {
+                encoded_frames: 0,
+                emitted_tokens: 0,
+                blank_frames: 0,
+                guard_exits: 0,
+                max_symbols_per_frame: self.max_symbols_per_frame,
+            },
+        })
+    }
+
+    pub(super) fn decode_rnnt_streaming_chunk(
+        &self,
+        state: &mut NemotronRnntStreamState,
+        encoded: &Tensor,
+        encoded_len: usize,
+        on_token: &mut dyn FnMut(usize),
+    ) -> Result<NemotronRnntStreamStep> {
+        let encoded = encoded.i((0, ..encoded_len, ..))?;
+        let encoded_projection = if encoded.device().is_cuda() {
+            Some(self.joint.project_encoder(&encoded)?)
+        } else {
+            None
+        };
+        let mut new_token_ids = Vec::new();
+
+        for t in 0..encoded_len {
+            let enc_t = if let Some(projection) = encoded_projection.as_ref() {
+                projection.i((t, ..))?.unsqueeze(0)?.unsqueeze(0)?
+            } else {
+                encoded.i((t, ..))?.unsqueeze(0)?.unsqueeze(0)?
+            };
+            let mut symbols_this_frame = 0usize;
+
+            loop {
+                let logits = if encoded_projection.is_some() {
+                    let predictor_projection =
+                        state.predictor_projection.as_ref().ok_or_else(|| {
+                            Error::InferenceError(
+                                "Nemotron CUDA RNNT stream is missing predictor projection"
+                                    .to_string(),
+                            )
+                        })?;
+                    self.joint.joint_from_projections(&enc_t, predictor_projection)?
+                } else {
+                    self.joint.joint_after_projection(&enc_t, &state.predictor_out)?
+                }
+                .squeeze(0)?
+                .squeeze(0)?
+                .squeeze(0)?;
+                let label = argmax_1d(&logits)?;
+
+                if label == self.blank_idx {
+                    state.stats.blank_frames = state.stats.blank_frames.saturating_add(1);
+                    break;
+                }
+                if label > self.blank_idx {
+                    return Err(Error::InferenceError(format!(
+                        "Nemotron RNNT emitted invalid label {label}; blank_idx={}",
+                        self.blank_idx
+                    )));
+                }
+
+                state.token_ids.push(label);
+                new_token_ids.push(label);
+                on_token(label);
+                symbols_this_frame = symbols_this_frame.saturating_add(1);
+                if symbols_this_frame >= self.max_symbols_per_frame {
+                    state.stats.guard_exits = state.stats.guard_exits.saturating_add(1);
+                    break;
+                }
+
+                state.predictor_out =
+                    self.predictor
+                        .step(label, &mut state.predictor_state, encoded.device())?;
+                if encoded_projection.is_some() {
+                    state.predictor_projection =
+                        Some(self.joint.project_predictor(&state.predictor_out)?);
+                }
+            }
+        }
+
+        state.stats.encoded_frames = state.stats.encoded_frames.saturating_add(encoded_len);
+        state.stats.emitted_tokens = state.token_ids.len();
+
+        Ok(NemotronRnntStreamStep {
+            token_ids: state.token_ids.clone(),
+            new_token_ids,
+            stats: state.stats.clone(),
+        })
+    }
+
     fn decode_rnnt_greedy_cuda_cached(
         &self,
         encoded: &Tensor,
@@ -593,6 +701,20 @@ pub(super) struct NemotronStreamingEncoderChunk {
     pub is_final: bool,
 }
 
+pub(super) struct NemotronRnntStreamState {
+    predictor_state: PredictorState,
+    predictor_out: Tensor,
+    predictor_projection: Option<Tensor>,
+    token_ids: Vec<usize>,
+    stats: NemotronDecodeStats,
+}
+
+pub(super) struct NemotronRnntStreamStep {
+    pub token_ids: Vec<usize>,
+    pub new_token_ids: Vec<usize>,
+    pub stats: NemotronDecodeStats,
+}
+
 impl NemotronStreamingFeatureState {
     pub(super) fn new() -> Self {
         Self {
@@ -741,6 +863,12 @@ impl NemotronStreamingEncoderState {
         } else {
             self.encoded_frames.saturating_sub(self.right_context_frames)
         }
+    }
+}
+
+impl NemotronRnntStreamState {
+    fn token_ids(&self) -> &[usize] {
+        &self.token_ids
     }
 }
 
@@ -1896,6 +2024,77 @@ mod tests {
         }
     }
 
+    fn zero_lstm_cell() -> LstmCell {
+        let device = Device::Cpu;
+        LstmCell {
+            w_ih: Tensor::zeros((PRED_HIDDEN * 4, PRED_HIDDEN), DType::F32, &device).unwrap(),
+            w_hh: Tensor::zeros((PRED_HIDDEN * 4, PRED_HIDDEN), DType::F32, &device).unwrap(),
+            b_ih: Tensor::zeros(PRED_HIDDEN * 4, DType::F32, &device).unwrap(),
+            b_hh: Tensor::zeros(PRED_HIDDEN * 4, DType::F32, &device).unwrap(),
+            cuda_views: None,
+        }
+    }
+
+    fn zero_predictor(vocab_plus_blank: usize) -> Predictor {
+        Predictor {
+            embed: Tensor::zeros((vocab_plus_blank, PRED_HIDDEN), DType::F32, &Device::Cpu)
+                .unwrap(),
+            lstm_l0: zero_lstm_cell(),
+            lstm_l1: zero_lstm_cell(),
+            blank_idx: vocab_plus_blank - 1,
+        }
+    }
+
+    fn zero_prompt_kernel() -> PromptKernel {
+        let device = Device::Cpu;
+        PromptKernel {
+            linear0: Linear::new(
+                Tensor::zeros((PROMPT_HIDDEN, ENCODER_DIM + PROMPT_DIM), DType::F32, &device)
+                    .unwrap(),
+                Some(Tensor::zeros(PROMPT_HIDDEN, DType::F32, &device).unwrap()),
+            ),
+            linear2: Linear::new(
+                Tensor::zeros((ENCODER_DIM, PROMPT_HIDDEN), DType::F32, &device).unwrap(),
+                Some(Tensor::zeros(ENCODER_DIM, DType::F32, &device).unwrap()),
+            ),
+            prompt_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn rnnt_test_network(output_bias: Vec<f32>, max_symbols_per_frame: usize) -> NemotronNetwork {
+        let device = Device::Cpu;
+        let vocab_plus_blank = output_bias.len();
+        NemotronNetwork {
+            preprocessor: test_preprocessor(FeatureNormalize::None),
+            pre_encode: zero_subsampling(),
+            layers: Vec::new(),
+            predictor: zero_predictor(vocab_plus_blank),
+            joint: Joint {
+                pred: Linear::new(
+                    Tensor::zeros((JOINT_HIDDEN, PRED_HIDDEN), DType::F32, &device).unwrap(),
+                    Some(Tensor::zeros(JOINT_HIDDEN, DType::F32, &device).unwrap()),
+                ),
+                enc: Linear::new(
+                    Tensor::zeros((JOINT_HIDDEN, ENCODER_DIM), DType::F32, &device).unwrap(),
+                    Some(Tensor::zeros(JOINT_HIDDEN, DType::F32, &device).unwrap()),
+                ),
+                out: Linear::new(
+                    Tensor::zeros((vocab_plus_blank, JOINT_HIDDEN), DType::F32, &device).unwrap(),
+                    Some(Tensor::from_vec(output_bias, vocab_plus_blank, &device).unwrap()),
+                ),
+            },
+            prompt_kernel: zero_prompt_kernel(),
+            prompt_dictionary: HashMap::from([("auto".to_string(), 0usize)]),
+            left_context_frames: 56,
+            right_context_frames: 0,
+            blank_idx: vocab_plus_blank - 1,
+            max_symbols_per_frame,
+            rel_pos_cache: Mutex::new(HashMap::new()),
+            att_mask_cache: Mutex::new(HashMap::new()),
+            dtype: DType::F32,
+        }
+    }
+
     fn feature_chunk(
         features: &Tensor,
         start_frame: usize,
@@ -2210,6 +2409,60 @@ mod tests {
 
         let err = state.push_pre_encoded(encoded_chunk(1, 1, false)).unwrap_err();
         assert!(err.to_string().contains("expected start frame 0"));
+    }
+
+    #[test]
+    fn rnnt_stream_state_accumulates_blank_stats_across_chunks() {
+        let network = rnnt_test_network(vec![0.0, 0.0, 10.0], DEFAULT_MAX_SYMBOLS_PER_FRAME);
+        let mut state = network.start_rnnt_stream().unwrap();
+        let first = Tensor::zeros((1, 2, ENCODER_DIM), DType::F32, &Device::Cpu).unwrap();
+        let second = Tensor::zeros((1, 1, ENCODER_DIM), DType::F32, &Device::Cpu).unwrap();
+        let mut emitted = Vec::new();
+
+        let step = network
+            .decode_rnnt_streaming_chunk(&mut state, &first, 2, &mut |token| emitted.push(token))
+            .unwrap();
+        assert!(step.new_token_ids.is_empty());
+        assert!(step.token_ids.is_empty());
+        assert_eq!(step.stats.encoded_frames, 2);
+        assert_eq!(step.stats.blank_frames, 2);
+
+        let step = network
+            .decode_rnnt_streaming_chunk(&mut state, &second, 1, &mut |token| emitted.push(token))
+            .unwrap();
+        assert!(emitted.is_empty());
+        assert_eq!(step.stats.encoded_frames, 3);
+        assert_eq!(step.stats.blank_frames, 3);
+        assert!(state.token_ids().is_empty());
+    }
+
+    #[test]
+    fn rnnt_stream_state_keeps_token_history_across_chunks() {
+        let network = rnnt_test_network(vec![10.0, 0.0, 1.0], 2);
+        let mut state = network.start_rnnt_stream().unwrap();
+        let encoded = Tensor::zeros((1, 1, ENCODER_DIM), DType::F32, &Device::Cpu).unwrap();
+        let mut emitted = Vec::new();
+
+        let first = network
+            .decode_rnnt_streaming_chunk(&mut state, &encoded, 1, &mut |token| {
+                emitted.push(token)
+            })
+            .unwrap();
+        assert_eq!(first.new_token_ids, vec![0, 0]);
+        assert_eq!(first.token_ids, vec![0, 0]);
+        assert_eq!(first.stats.guard_exits, 1);
+
+        let second = network
+            .decode_rnnt_streaming_chunk(&mut state, &encoded, 1, &mut |token| {
+                emitted.push(token)
+            })
+            .unwrap();
+        assert_eq!(second.new_token_ids, vec![0, 0]);
+        assert_eq!(second.token_ids, vec![0, 0, 0, 0]);
+        assert_eq!(second.stats.encoded_frames, 2);
+        assert_eq!(second.stats.emitted_tokens, 4);
+        assert_eq!(second.stats.guard_exits, 2);
+        assert_eq!(emitted, vec![0, 0, 0, 0]);
     }
 
     #[test]
