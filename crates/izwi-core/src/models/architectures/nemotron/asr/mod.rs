@@ -299,6 +299,90 @@ impl NemotronStreamChunkRange {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NemotronRealtimeStreamConfig {
+    pub language: Option<String>,
+    pub prompt: Option<String>,
+    pub right_context_frames: Option<usize>,
+    pub emit_partials: bool,
+}
+
+impl Default for NemotronRealtimeStreamConfig {
+    fn default() -> Self {
+        Self {
+            language: None,
+            prompt: None,
+            right_context_frames: None,
+            emit_partials: true,
+        }
+    }
+}
+
+impl NemotronRealtimeStreamConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_language(mut self, language: impl Into<String>) -> Self {
+        self.language = Some(language.into());
+        self
+    }
+
+    fn with_optional_language(mut self, language: Option<&str>) -> Self {
+        self.language = language.map(ToOwned::to_owned);
+        self
+    }
+
+    pub fn with_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.prompt = Some(prompt.into());
+        self
+    }
+
+    fn with_optional_prompt(mut self, prompt: Option<&str>) -> Self {
+        self.prompt = prompt.map(ToOwned::to_owned);
+        self
+    }
+
+    pub fn with_right_context_frames(mut self, right_context_frames: usize) -> Self {
+        self.right_context_frames = Some(right_context_frames);
+        self
+    }
+
+    fn with_optional_right_context_frames(mut self, right_context_frames: Option<usize>) -> Self {
+        self.right_context_frames = right_context_frames;
+        self
+    }
+
+    pub fn with_emit_partials(mut self, emit_partials: bool) -> Self {
+        self.emit_partials = emit_partials;
+        self
+    }
+
+    fn prompt_condition(&self) -> Result<NemotronPromptCondition> {
+        NemotronPromptCondition::resolve(self.language.as_deref(), self.prompt.as_deref())
+    }
+
+    fn diagnostics(&self) -> serde_json::Value {
+        let prompt = self.prompt_condition().ok();
+        json!({
+            "target_lang": prompt.as_ref().map(|prompt| prompt.target_lang.as_str()).unwrap_or("auto"),
+            "context_prompt_present": prompt
+                .as_ref()
+                .is_some_and(|prompt| prompt.context_prompt.is_some()),
+            "right_context_frames": self.right_context_frames,
+            "emit_partials": self.emit_partials,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NemotronRealtimeStreamEvent {
+    pub text: String,
+    pub delta: String,
+    pub is_final: bool,
+    pub chunk_index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NemotronStreamingCacheStatus {
     PendingNativeCacheImplementation,
 }
@@ -614,8 +698,34 @@ impl NemotronAsrModel {
         prompt: Option<&str>,
         right_context_frames: Option<usize>,
     ) -> Result<NemotronStreamingState> {
-        let prompt = NemotronPromptCondition::resolve(language, prompt)?;
-        let profile = match right_context_frames {
+        self.start_stream_state_with_config(
+            &NemotronRealtimeStreamConfig::new()
+                .with_emit_partials(true)
+                .with_optional_language(language)
+                .with_optional_prompt(prompt)
+                .with_optional_right_context_frames(right_context_frames),
+        )
+    }
+
+    pub fn start_stream_state_with_config(
+        &self,
+        config: &NemotronRealtimeStreamConfig,
+    ) -> Result<NemotronStreamingState> {
+        let prompt = config.prompt_condition()?;
+        let profile = self.resolve_streaming_profile(config.right_context_frames)?;
+
+        Ok(NemotronStreamingState::new(
+            profile,
+            prompt,
+            self.runtime_plan.sample_rate,
+        ))
+    }
+
+    fn resolve_streaming_profile(
+        &self,
+        right_context_frames: Option<usize>,
+    ) -> Result<NemotronStreamingProfile> {
+        Ok(match right_context_frames {
             Some(right_context_frames) => self
                 .runtime_plan
                 .streaming_profiles
@@ -628,13 +738,7 @@ impl NemotronAsrModel {
                     ))
                 })?,
             None => self.runtime_plan.default_streaming_profile.clone(),
-        };
-
-        Ok(NemotronStreamingState::new(
-            profile,
-            prompt,
-            self.runtime_plan.sample_rate,
-        ))
+        })
     }
 
     pub fn diagnostics_for_prompt(
@@ -1324,6 +1428,39 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(chunk_ms, vec![80, 160, 320, 560, 1120]);
+    }
+
+    #[test]
+    fn realtime_stream_config_resolves_prompt_and_profile_contract() {
+        let config = NemotronRealtimeStreamConfig::new()
+            .with_language("German")
+            .with_prompt("medical dictation")
+            .with_right_context_frames(3);
+
+        let prompt = config.prompt_condition().unwrap();
+        let diagnostics = config.diagnostics();
+
+        assert_eq!(prompt.target_lang, "de-DE");
+        assert_eq!(prompt.context_prompt.as_deref(), Some("medical dictation"));
+        assert_eq!(config.right_context_frames, Some(3));
+        assert_eq!(diagnostics["target_lang"], "de-DE");
+        assert_eq!(diagnostics["right_context_frames"], 3);
+        assert_eq!(diagnostics["emit_partials"], true);
+    }
+
+    #[test]
+    fn streaming_state_contract_does_not_claim_native_cache_before_wiring() {
+        let profile = NemotronStreamingProfile::new(56, 3).unwrap();
+        let prompt = NemotronPromptCondition::resolve(Some("auto"), None).unwrap();
+        let state = NemotronStreamingState::new(profile, prompt, 16_000);
+        let diagnostics = state.diagnostics();
+
+        assert_eq!(diagnostics["supports_realtime_cache_decode"], false);
+        assert_eq!(
+            diagnostics["cache_status"],
+            "PendingNativeCacheImplementation"
+        );
+        assert_eq!(diagnostics["profile"]["cache_reuse_ready"], false);
     }
 
     #[test]
