@@ -77,6 +77,8 @@ pub(super) struct NemotronNetwork {
     max_symbols_per_frame: usize,
     rel_pos_cache: Mutex<HashMap<RelPosCacheKey, Tensor>>,
     att_mask_cache: Mutex<HashMap<LimitedMaskCacheKey, Tensor>>,
+    stream_rel_pos_cache: Mutex<HashMap<StreamingRelPosCacheKey, Tensor>>,
+    stream_att_mask_cache: Mutex<HashMap<StreamingMaskCacheKey, Tensor>>,
     dtype: DType,
 }
 
@@ -89,6 +91,24 @@ struct RelPosCacheKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct LimitedMaskCacheKey {
     len: usize,
+    left_context: usize,
+    right_context: usize,
+    dtype: DType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct StreamingRelPosCacheKey {
+    q_len: usize,
+    key_len: usize,
+    query_offset: usize,
+    dtype: DType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct StreamingMaskCacheKey {
+    q_len: usize,
+    key_len: usize,
+    query_offset: usize,
     left_context: usize,
     right_context: usize,
     dtype: DType,
@@ -151,6 +171,8 @@ impl NemotronNetwork {
             max_symbols_per_frame: DEFAULT_MAX_SYMBOLS_PER_FRAME,
             rel_pos_cache: Mutex::new(HashMap::new()),
             att_mask_cache: Mutex::new(HashMap::new()),
+            stream_rel_pos_cache: Mutex::new(HashMap::new()),
+            stream_att_mask_cache: Mutex::new(HashMap::new()),
             dtype: vb.dtype(),
         })
     }
@@ -223,37 +245,47 @@ impl NemotronNetwork {
         state: &mut NemotronStreamingEncoderState,
         prompt_id: usize,
     ) -> Result<Option<NemotronStreamingEncoderChunk>> {
-        let Some(pre_encoded) = state.pre_encoded.as_ref() else {
+        let Some(mut x) = state.take_ready_pre_encoded_chunk()? else {
             return Ok(None);
         };
-        let ready_frames = state.ready_frames();
-        if ready_frames <= state.emitted_frames {
-            return Ok(None);
-        }
-
-        let (encoded, encoded_len) = self.encode_preencoded_with_prompt(
-            pre_encoded.clone(),
-            state.encoded_frames,
-            prompt_id,
+        let frames = x.dim(1)?;
+        let cache_len = state.attention_cache_len();
+        let key_len = cache_len.saturating_add(frames);
+        let pos_pair = self.streaming_rel_positional_embedding(
+            frames,
+            key_len,
+            cache_len,
+            x.dtype(),
+            x.device(),
+        )?;
+        let att_mask = self.streaming_limited_context_mask(
+            frames,
+            key_len,
+            cache_len,
             state.left_context_frames,
             state.right_context_frames,
+            x.dtype(),
+            x.device(),
         )?;
-        let ready_frames = ready_frames.min(encoded_len);
-        if ready_frames <= state.emitted_frames {
-            return Ok(None);
+
+        for (layer, layer_state) in self.layers.iter().zip(state.layer_states.iter_mut()) {
+            x = layer.forward_streaming(
+                &x,
+                layer_state,
+                &pos_pair,
+                &att_mask,
+                state.left_context_frames,
+            )?;
         }
 
-        let start_frame = state.emitted_frames;
-        let frames = ready_frames - start_frame;
-        let encoded = encoded.narrow(1, start_frame, frames)?.contiguous()?;
-        state.emitted_frames = ready_frames;
+        let encoded = self.prompt_kernel.forward(&x, prompt_id)?;
 
         Ok(Some(NemotronStreamingEncoderChunk {
             encoded,
-            start_frame,
+            start_frame: state.last_chunk_start_frame,
             frames,
-            total_ready_frames: ready_frames,
-            is_final: state.input_finished && ready_frames == encoded_len,
+            total_ready_frames: state.processed_frames,
+            is_final: state.input_finished && state.pending_frames()? == 0,
         }))
     }
 
@@ -593,6 +625,89 @@ impl NemotronNetwork {
             .insert(key, tensor.clone());
         Ok(tensor)
     }
+
+    fn streaming_rel_positional_embedding(
+        &self,
+        q_len: usize,
+        key_len: usize,
+        query_offset: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let key = StreamingRelPosCacheKey {
+            q_len,
+            key_len,
+            query_offset,
+            dtype,
+        };
+        if let Some(cached) = self
+            .stream_rel_pos_cache
+            .lock()
+            .map_err(|_| Error::InferenceError("Nemotron stream rel-pos cache lock poisoned".into()))?
+            .get(&key)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+
+        let tensor = build_streaming_rel_positional_embedding_for_dtype(
+            q_len,
+            key_len,
+            query_offset,
+            ENCODER_DIM,
+            device,
+            dtype,
+        )?;
+        self.stream_rel_pos_cache
+            .lock()
+            .map_err(|_| Error::InferenceError("Nemotron stream rel-pos cache lock poisoned".into()))?
+            .insert(key, tensor.clone());
+        Ok(tensor)
+    }
+
+    fn streaming_limited_context_mask(
+        &self,
+        q_len: usize,
+        key_len: usize,
+        query_offset: usize,
+        left_context: usize,
+        right_context: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let key = StreamingMaskCacheKey {
+            q_len,
+            key_len,
+            query_offset,
+            left_context,
+            right_context,
+            dtype,
+        };
+        if let Some(cached) = self
+            .stream_att_mask_cache
+            .lock()
+            .map_err(|_| Error::InferenceError("Nemotron stream mask cache lock poisoned".into()))?
+            .get(&key)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+
+        let tensor = build_streaming_limited_context_mask_for_dtype(
+            q_len,
+            key_len,
+            query_offset,
+            left_context,
+            right_context,
+            device,
+            dtype,
+        )?;
+        self.stream_att_mask_cache
+            .lock()
+            .map_err(|_| Error::InferenceError("Nemotron stream mask cache lock poisoned".into()))?
+            .insert(key, tensor.clone());
+        Ok(tensor)
+    }
 }
 
 fn validate_inventory_for_forward(inventory: &NemotronConfigInventory) -> Result<()> {
@@ -701,12 +816,16 @@ pub(super) struct NemotronStreamingEncodedChunk {
 }
 
 pub(super) struct NemotronStreamingEncoderState {
-    pre_encoded: Option<Tensor>,
-    encoded_frames: usize,
-    emitted_frames: usize,
+    pending_pre_encoded: Option<Tensor>,
+    pending_start_frame: usize,
+    received_frames: usize,
+    processed_frames: usize,
+    last_chunk_start_frame: usize,
     left_context_frames: usize,
     right_context_frames: usize,
+    chunk_frames: usize,
     input_finished: bool,
+    layer_states: Vec<ConformerLayerStreamState>,
 }
 
 pub(super) struct NemotronStreamingEncoderChunk {
@@ -729,6 +848,11 @@ pub(super) struct NemotronRnntStreamStep {
     pub token_ids: Vec<usize>,
     pub new_token_ids: Vec<usize>,
     pub stats: NemotronDecodeStats,
+}
+
+struct ConformerLayerStreamState {
+    attn_cache: Option<Tensor>,
+    conv_cache: Option<Tensor>,
 }
 
 impl NemotronStreamingFeatureState {
@@ -828,12 +952,18 @@ impl NemotronStreamingPreEncodeState {
 impl NemotronStreamingEncoderState {
     pub(super) fn new(left_context_frames: usize, right_context_frames: usize) -> Self {
         Self {
-            pre_encoded: None,
-            encoded_frames: 0,
-            emitted_frames: 0,
+            pending_pre_encoded: None,
+            pending_start_frame: 0,
+            received_frames: 0,
+            processed_frames: 0,
+            last_chunk_start_frame: 0,
             left_context_frames,
             right_context_frames,
+            chunk_frames: right_context_frames.saturating_add(1).max(1),
             input_finished: false,
+            layer_states: (0..ENCODER_LAYERS)
+                .map(|_| ConformerLayerStreamState::new())
+                .collect(),
         }
     }
 
@@ -843,22 +973,25 @@ impl NemotronStreamingEncoderState {
                 "Cannot push encoder frames into a finalized Nemotron encoder stream".to_string(),
             ));
         }
-        if chunk.start_frame != self.encoded_frames {
+        if chunk.start_frame != self.received_frames {
             return Err(Error::InvalidInput(format!(
                 "Nemotron encoder stream expected start frame {}, got {}",
-                self.encoded_frames, chunk.start_frame
+                self.received_frames, chunk.start_frame
             )));
         }
         if chunk.frames == 0 {
             return Ok(());
         }
 
-        self.pre_encoded = Some(if let Some(existing) = self.pre_encoded.as_ref() {
+        if self.pending_pre_encoded.is_none() {
+            self.pending_start_frame = chunk.start_frame;
+        }
+        self.pending_pre_encoded = Some(if let Some(existing) = self.pending_pre_encoded.as_ref() {
             Tensor::cat(&[existing, &chunk.encoded], 1)?
         } else {
             chunk.encoded
         });
-        self.encoded_frames = self.encoded_frames.saturating_add(chunk.frames);
+        self.received_frames = self.received_frames.saturating_add(chunk.frames);
         self.input_finished = chunk.is_final;
         Ok(())
     }
@@ -867,19 +1000,70 @@ impl NemotronStreamingEncoderState {
         self.input_finished = true;
     }
 
+    fn pending_frames(&self) -> Result<usize> {
+        self.pending_pre_encoded
+            .as_ref()
+            .map(|tensor| tensor.dim(1).map_err(Error::from))
+            .unwrap_or(Ok(0))
+    }
+
+    fn attention_cache_len(&self) -> usize {
+        self.layer_states
+            .first()
+            .and_then(|state| state.attn_cache.as_ref())
+            .and_then(|cache| cache.dim(1).ok())
+            .unwrap_or(0)
+    }
+
     fn ready_frames(&self) -> usize {
-        if self.input_finished {
-            self.encoded_frames
+        let pending = self.pending_frames().unwrap_or(0);
+        if pending >= self.chunk_frames || (self.input_finished && pending > 0) {
+            self.processed_frames + pending.min(self.chunk_frames)
         } else {
-            self.encoded_frames
-                .saturating_sub(self.right_context_frames)
+            self.processed_frames
         }
+    }
+
+    fn take_ready_pre_encoded_chunk(&mut self) -> Result<Option<Tensor>> {
+        let pending_frames = self.pending_frames()?;
+        if pending_frames == 0 {
+            return Ok(None);
+        }
+        if pending_frames < self.chunk_frames && !self.input_finished {
+            return Ok(None);
+        }
+
+        let frames = pending_frames.min(self.chunk_frames);
+        let pending = self
+            .pending_pre_encoded
+            .take()
+            .ok_or_else(|| Error::InferenceError("Nemotron encoder stream lost pending frames".into()))?;
+        let chunk = pending.narrow(1, 0, frames)?.contiguous()?;
+        let remaining = pending_frames - frames;
+        self.last_chunk_start_frame = self.pending_start_frame;
+        self.pending_start_frame = self.pending_start_frame.saturating_add(frames);
+        self.processed_frames = self.processed_frames.saturating_add(frames);
+        self.pending_pre_encoded = if remaining > 0 {
+            Some(pending.narrow(1, frames, remaining)?.contiguous()?)
+        } else {
+            None
+        };
+        Ok(Some(chunk))
     }
 }
 
 impl NemotronRnntStreamState {
     fn token_ids(&self) -> &[usize] {
         &self.token_ids
+    }
+}
+
+impl ConformerLayerStreamState {
+    fn new() -> Self {
+        Self {
+            attn_cache: None,
+            conv_cache: None,
+        }
     }
 }
 
@@ -1313,6 +1497,46 @@ impl ConformerLayer {
             .forward(&residual)
             .map_err(|e| Error::InferenceError(e.to_string()))
     }
+
+    fn forward_streaming(
+        &self,
+        x: &Tensor,
+        state: &mut ConformerLayerStreamState,
+        pos_pair: &Tensor,
+        att_mask: &Tensor,
+        left_context_frames: usize,
+    ) -> Result<Tensor> {
+        let mut residual = x.clone();
+
+        let ff1 = self.ff1.forward(&self.norm_ff1.forward(&residual)?)?;
+        residual = residual.broadcast_add(&ff1.affine(0.5, 0.0)?)?;
+
+        let att_input = self.norm_self_att.forward(&residual)?;
+        let attn = self.self_attn.forward_streaming(
+            &att_input,
+            state.attn_cache.as_ref(),
+            pos_pair,
+            att_mask,
+        )?;
+        state.attn_cache = update_time_cache_dim1(
+            state.attn_cache.take(),
+            &att_input,
+            left_context_frames,
+        )?;
+        residual = residual.broadcast_add(&attn)?;
+
+        let conv =
+            self.conv
+                .forward_streaming(&self.norm_conv.forward(&residual)?, &mut state.conv_cache)?;
+        residual = residual.broadcast_add(&conv)?;
+
+        let ff2 = self.ff2.forward(&self.norm_ff2.forward(&residual)?)?;
+        residual = residual.broadcast_add(&ff2.affine(0.5, 0.0)?)?;
+
+        self.norm_out
+            .forward(&residual)
+            .map_err(|e| Error::InferenceError(e.to_string()))
+    }
 }
 
 struct FeedForward {
@@ -1389,6 +1613,37 @@ impl ConformerConv {
 
         x = x.pad_with_zeros(2, CONV_KERNEL_1D - 1, 0)?;
         x = self.depthwise_conv.forward(&x)?;
+        x = self
+            .conv_norm
+            .forward(&x.transpose(1, 2)?)?
+            .transpose(1, 2)?;
+        x = swish(&x)?;
+        x = self.pointwise_conv2.forward(&x)?;
+
+        x.transpose(1, 2).map_err(Error::from)
+    }
+
+    fn forward_streaming(&self, x: &Tensor, cache: &mut Option<Tensor>) -> Result<Tensor> {
+        let mut x = x.transpose(1, 2)?;
+        x = self.pointwise_conv1.forward(&x)?;
+        let x_a = x.i((.., ..ENCODER_DIM, ..))?;
+        let x_b = x.i((.., ENCODER_DIM.., ..))?;
+        let x = x_a.broadcast_mul(&ops::sigmoid(&x_b)?)?;
+
+        let cache_len = cache.as_ref().and_then(|cache| cache.dim(2).ok()).unwrap_or(0);
+        let cached_and_current = if let Some(existing) = cache.as_ref() {
+            Tensor::cat(&[existing, &x], 2)?
+        } else {
+            x.clone()
+        };
+        let conv_input = if cache_len < CONV_KERNEL_1D - 1 {
+            cached_and_current.pad_with_zeros(2, CONV_KERNEL_1D - 1 - cache_len, 0)?
+        } else {
+            cached_and_current.clone()
+        };
+        *cache = update_time_cache_dim2(None, &cached_and_current, CONV_KERNEL_1D - 1)?;
+
+        let mut x = self.depthwise_conv.forward(&conv_input)?;
         x = self
             .conv_norm
             .forward(&x.transpose(1, 2)?)?
@@ -1485,6 +1740,81 @@ impl RelPosSelfAttention {
         let attn = ops::softmax(&scores, 3)?;
         let out = attn.matmul(&v)?;
         let out = out.transpose(1, 2)?.reshape((b, t, ENCODER_DIM))?;
+
+        self.linear_out
+            .forward(&out)
+            .map_err(|e| Error::InferenceError(e.to_string()))
+    }
+
+    fn forward_streaming(
+        &self,
+        x: &Tensor,
+        cache: Option<&Tensor>,
+        pos_pair: &Tensor,
+        att_mask: &Tensor,
+    ) -> Result<Tensor> {
+        let (b, q_len, _d) = x.dims3()?;
+        let key_value = if let Some(cache) = cache {
+            Tensor::cat(&[cache, x], 1)?
+        } else {
+            x.clone()
+        };
+        let key_len = key_value.dim(1)?;
+
+        let q = self
+            .linear_q
+            .forward(x)?
+            .reshape((b, q_len, ENCODER_HEADS, ENCODER_HEAD_DIM))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = self
+            .linear_k
+            .forward(&key_value)?
+            .reshape((b, key_len, ENCODER_HEADS, ENCODER_HEAD_DIM))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = self
+            .linear_v
+            .forward(&key_value)?
+            .reshape((b, key_len, ENCODER_HEADS, ENCODER_HEAD_DIM))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        let p = self
+            .linear_pos
+            .forward(pos_pair)?
+            .reshape((1, q_len, key_len, ENCODER_HEADS, ENCODER_HEAD_DIM))?
+            .permute((0, 3, 1, 2, 4))?
+            .contiguous()?;
+
+        let pos_bias_u = self.pos_bias_u.to_dtype(q.dtype())?.reshape((
+            1,
+            ENCODER_HEADS,
+            1,
+            ENCODER_HEAD_DIM,
+        ))?;
+        let pos_bias_v = self.pos_bias_v.to_dtype(q.dtype())?.reshape((
+            1,
+            ENCODER_HEADS,
+            1,
+            ENCODER_HEAD_DIM,
+        ))?;
+        let matrix_ac = q
+            .broadcast_add(&pos_bias_u)?
+            .matmul(&k.transpose(2, 3)?.contiguous()?)?;
+        let matrix_bd = q
+            .broadcast_add(&pos_bias_v)?
+            .unsqueeze(3)?
+            .broadcast_mul(&p)?
+            .sum(D::Minus1)?;
+
+        let scores = matrix_ac
+            .broadcast_add(&matrix_bd)?
+            .affine(1.0 / (ENCODER_HEAD_DIM as f64).sqrt(), 0.0)?
+            .broadcast_add(att_mask)?;
+        let attn = ops::softmax(&scores, 3)?;
+        let out = attn.matmul(&v)?;
+        let out = out.transpose(1, 2)?.reshape((b, q_len, ENCODER_DIM))?;
 
         self.linear_out
             .forward(&out)
@@ -1823,6 +2153,58 @@ fn build_rel_positional_embedding_for_dtype(
         .map_err(Error::from)
 }
 
+fn build_streaming_rel_positional_embedding(
+    q_len: usize,
+    key_len: usize,
+    query_offset: usize,
+    d_model: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    if q_len == 0 || key_len == 0 {
+        return Err(Error::InvalidInput(
+            "Cannot build streaming positional embedding for an empty attention window".to_string(),
+        ));
+    }
+    if query_offset.saturating_add(q_len) > key_len {
+        return Err(Error::InvalidInput(format!(
+            "Invalid Nemotron streaming attention window: q_len={q_len}, key_len={key_len}, query_offset={query_offset}"
+        )));
+    }
+
+    let mut emb = vec![0f32; q_len * key_len * d_model];
+    let denom = (10_000f32).ln() / d_model as f32;
+    for q in 0..q_len {
+        let query_pos = query_offset + q;
+        for k in 0..key_len {
+            let distance = query_pos as isize - k as isize;
+            let base = (q * key_len + k) * d_model;
+            for i in (0..d_model).step_by(2) {
+                let div = (-denom * i as f32).exp();
+                let angle = distance as f32 * div;
+                emb[base + i] = angle.sin();
+                if i + 1 < d_model {
+                    emb[base + i + 1] = angle.cos();
+                }
+            }
+        }
+    }
+
+    Tensor::from_vec(emb, (1, q_len * key_len, d_model), device).map_err(Error::from)
+}
+
+fn build_streaming_rel_positional_embedding_for_dtype(
+    q_len: usize,
+    key_len: usize,
+    query_offset: usize,
+    d_model: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    build_streaming_rel_positional_embedding(q_len, key_len, query_offset, d_model, device)?
+        .to_dtype(dtype)
+        .map_err(Error::from)
+}
+
 fn build_limited_context_mask(
     len: usize,
     left_context: usize,
@@ -1852,6 +2234,58 @@ fn build_limited_context_mask_for_dtype(
         .map_err(Error::from)
 }
 
+fn build_streaming_limited_context_mask(
+    q_len: usize,
+    key_len: usize,
+    query_offset: usize,
+    left_context: usize,
+    right_context: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    if q_len == 0 || key_len == 0 {
+        return Err(Error::InvalidInput(
+            "Cannot build streaming attention mask for an empty attention window".to_string(),
+        ));
+    }
+    if query_offset.saturating_add(q_len) > key_len {
+        return Err(Error::InvalidInput(format!(
+            "Invalid Nemotron streaming attention mask window: q_len={q_len}, key_len={key_len}, query_offset={query_offset}"
+        )));
+    }
+
+    let mut mask = vec![0f32; q_len * key_len];
+    for q in 0..q_len {
+        let query_pos = query_offset + q;
+        for k in 0..key_len {
+            if k + left_context < query_pos || k > query_pos.saturating_add(right_context) {
+                mask[q * key_len + k] = -1.0e9;
+            }
+        }
+    }
+    Tensor::from_vec(mask, (1, 1, q_len, key_len), device).map_err(Error::from)
+}
+
+fn build_streaming_limited_context_mask_for_dtype(
+    q_len: usize,
+    key_len: usize,
+    query_offset: usize,
+    left_context: usize,
+    right_context: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    build_streaming_limited_context_mask(
+        q_len,
+        key_len,
+        query_offset,
+        left_context,
+        right_context,
+        device,
+    )?
+    .to_dtype(dtype)
+    .map_err(Error::from)
+}
+
 fn build_prompt_one_hot(prompt_id: usize, device: &Device, dtype: DType) -> Result<Tensor> {
     if prompt_id >= PROMPT_DIM {
         return Err(Error::InvalidInput(format!(
@@ -1867,6 +2301,50 @@ fn build_prompt_one_hot(prompt_id: usize, device: &Device, dtype: DType) -> Resu
 
 fn swish(x: &Tensor) -> Result<Tensor> {
     x.broadcast_mul(&ops::sigmoid(x)?).map_err(Error::from)
+}
+
+fn update_time_cache_dim1(
+    existing: Option<Tensor>,
+    current: &Tensor,
+    max_frames: usize,
+) -> Result<Option<Tensor>> {
+    if max_frames == 0 {
+        return Ok(None);
+    }
+    let combined = if let Some(existing) = existing.as_ref() {
+        Tensor::cat(&[existing, current], 1)?
+    } else {
+        current.clone()
+    };
+    let len = combined.dim(1)?;
+    let start = len.saturating_sub(max_frames);
+    Ok(Some(
+        combined
+            .narrow(1, start, len.saturating_sub(start))?
+            .contiguous()?,
+    ))
+}
+
+fn update_time_cache_dim2(
+    existing: Option<Tensor>,
+    current: &Tensor,
+    max_frames: usize,
+) -> Result<Option<Tensor>> {
+    if max_frames == 0 {
+        return Ok(None);
+    }
+    let combined = if let Some(existing) = existing.as_ref() {
+        Tensor::cat(&[existing, current], 2)?
+    } else {
+        current.clone()
+    };
+    let len = combined.dim(2)?;
+    let start = len.saturating_sub(max_frames);
+    Ok(Some(
+        combined
+            .narrow(2, start, len.saturating_sub(start))?
+            .contiguous()?,
+    ))
 }
 
 fn argmax_1d(x: &Tensor) -> Result<usize> {
@@ -2110,6 +2588,8 @@ mod tests {
             max_symbols_per_frame,
             rel_pos_cache: Mutex::new(HashMap::new()),
             att_mask_cache: Mutex::new(HashMap::new()),
+            stream_rel_pos_cache: Mutex::new(HashMap::new()),
+            stream_att_mask_cache: Mutex::new(HashMap::new()),
             dtype: DType::F32,
         }
     }
@@ -2223,6 +2703,35 @@ mod tests {
 
         assert_eq!(pos.dtype(), DType::F32);
         assert_eq!(pos.dims(), &[1, 5, 8]);
+    }
+
+    #[test]
+    fn streaming_limited_context_mask_uses_bounded_key_window() {
+        let mask =
+            build_streaming_limited_context_mask(2, 5, 3, 2, 1, &Device::Cpu).unwrap();
+        let values = mask
+            .squeeze(0)
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+
+        assert_eq!(mask.dims(), &[1, 1, 2, 5]);
+        assert!(values[0][0] < -1.0e8, "query 3 cannot attend before left context");
+        assert_eq!(values[0][1], 0.0);
+        assert_eq!(values[0][4], 0.0, "query 3 can attend one frame right");
+        assert_eq!(values[1][2], 0.0);
+    }
+
+    #[test]
+    fn streaming_rel_positional_embedding_is_pairwise_bounded() {
+        let pos =
+            build_streaming_rel_positional_embedding_for_dtype(2, 5, 3, 8, &Device::Cpu, DType::F32)
+                .unwrap();
+
+        assert_eq!(pos.dtype(), DType::F32);
+        assert_eq!(pos.dims(), &[1, 10, 8]);
     }
 
     #[test]
@@ -2406,17 +2915,31 @@ mod tests {
     }
 
     #[test]
-    fn streaming_encoder_state_delays_until_right_context_is_available() {
+    fn streaming_encoder_state_groups_non_overlapping_model_card_chunks() {
         let mut state = NemotronStreamingEncoderState::new(56, 3);
 
         state.push_pre_encoded(encoded_chunk(0, 2, false)).unwrap();
         assert_eq!(state.ready_frames(), 0);
 
         state.push_pre_encoded(encoded_chunk(2, 2, false)).unwrap();
-        assert_eq!(state.ready_frames(), 1);
+        assert_eq!(state.ready_frames(), 4);
+        let first = state
+            .take_ready_pre_encoded_chunk()
+            .unwrap()
+            .expect("first model-card chunk");
+        assert_eq!(first.dim(1).unwrap(), 4);
+        assert_eq!(state.last_chunk_start_frame, 0);
+        assert_eq!(state.processed_frames, 4);
 
         state.push_pre_encoded(encoded_chunk(4, 4, false)).unwrap();
-        assert_eq!(state.ready_frames(), 5);
+        assert_eq!(state.ready_frames(), 8);
+        let second = state
+            .take_ready_pre_encoded_chunk()
+            .unwrap()
+            .expect("second model-card chunk");
+        assert_eq!(second.dim(1).unwrap(), 4);
+        assert_eq!(state.last_chunk_start_frame, 4);
+        assert_eq!(state.processed_frames, 8);
 
         state.finish_input();
         assert_eq!(state.ready_frames(), 8);
