@@ -10,8 +10,10 @@ use std::path::Path;
 use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
 use serde_json::json;
+use tracing::info;
 
-use crate::backends::DeviceProfile;
+use crate::backends::{DTypeSelection, DTypeSelectionRequest, DeviceProfile};
+use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::tokenizer::Tokenizer;
@@ -24,6 +26,7 @@ const SAMPLE_RATE: u32 = 16_000;
 const DEFAULT_STRIP_LANG_TAGS: bool = true;
 const DEFAULT_MAX_AUDIO_SECONDS_HINT: f32 = 30.0;
 const STREAMING_FRAME_MS: usize = 80;
+const NEMOTRON_ASR_DTYPE_ENV: &str = "IZWI_NEMOTRON_ASR_DTYPE";
 const SUPPORTED_TARGET_LANGS: &[&str] = &[
     "auto", "en-US", "en-GB", "es-US", "es-ES", "fr-FR", "fr-CA", "it-IT", "pt-BR", "pt-PT",
     "nl-NL", "de-DE", "tr-TR", "ru-RU", "ar-AR", "hi-IN", "ja-JP", "ko-KR", "vi-VN", "uk-UA",
@@ -46,6 +49,7 @@ pub struct NemotronAsrModel {
     network: NemotronNetwork,
     runtime_plan: NemotronRuntimePlan,
     device_profile: DeviceProfile,
+    dtype_selection: DTypeSelection,
 }
 
 enum NemotronDecoder {
@@ -496,15 +500,29 @@ impl NemotronAsrModel {
         validate_config_output_vocabulary(&artifacts.config_inventory)?;
         let decoder = NemotronDecoder::load(&artifacts)?;
         let device = select_device_for_nemotron(&device_profile);
-        let vb =
-            VarBuilder::from_pth(&artifacts.checkpoint_path, DType::F32, &device).map_err(|e| {
-                Error::ModelLoadError(format!(
-                    "Failed to load Nemotron checkpoint {}: {}",
-                    artifacts.checkpoint_path.display(),
-                    e
-                ))
-            })?;
+        let dtype_override = std::env::var(NEMOTRON_ASR_DTYPE_ENV).ok();
+        let dtype_selection =
+            select_nemotron_asr_dtype(&device_profile, dtype_override.as_deref())?;
+        let checkpoint_display = artifacts.checkpoint_path.display();
+        let vb = match VarBuilder::from_pth(
+            &artifacts.checkpoint_path,
+            dtype_selection.dtype,
+            &device,
+        ) {
+            Ok(vb) => vb,
+            Err(e) => {
+                return Err(Error::ModelLoadError(format!(
+                    "Failed to load Nemotron checkpoint {checkpoint_display}: {e}"
+                )));
+            }
+        };
         let network = NemotronNetwork::load(&vb, &artifacts.config_inventory)?;
+        info!(
+            "Loaded Nemotron ASR model on {:?} with dtype {:?} ({})",
+            device_profile.kind,
+            dtype_selection.dtype,
+            dtype_selection.reason.as_ref()
+        );
 
         Ok(Self {
             variant,
@@ -513,6 +531,7 @@ impl NemotronAsrModel {
             network,
             runtime_plan,
             device_profile,
+            dtype_selection,
         })
     }
 
@@ -616,6 +635,7 @@ impl NemotronAsrModel {
             "decoder_vocabulary_size": self.decoder.vocab_size(),
             "decoder_source": self.decoder.source(),
             "runtime": self.runtime_plan.diagnostics(),
+            "dtype_plan": nemotron_dtype_diagnostics(&self.dtype_selection, &self.device_profile, self.network.dtype()),
             "prompt": prompt.diagnostics(),
             "prompt_id": prompt_id,
             "blank_id": self.network.blank_idx(),
@@ -693,6 +713,7 @@ impl NemotronAsrModel {
                 "prompt": request.prompt.diagnostics(),
                 "prompt_id": prompt_id,
                 "blank_id": self.network.blank_idx(),
+                "dtype_plan": nemotron_dtype_diagnostics(&self.dtype_selection, &self.device_profile, self.network.dtype()),
                 "native_forward_status": "enabled_offline_fastconformer_rnnt",
                 "decode": decoded.stats.diagnostics(),
                 "supports_realtime_cache_decode": false,
@@ -703,6 +724,48 @@ impl NemotronAsrModel {
 
 fn select_device_for_nemotron(device_profile: &DeviceProfile) -> Device {
     device_profile.device.clone()
+}
+
+fn select_nemotron_asr_dtype(
+    device_profile: &DeviceProfile,
+    dtype_override: Option<&str>,
+) -> Result<DTypeSelection> {
+    let requested = dtype_override.map(str::trim).filter(|raw| !raw.is_empty());
+    let request = DTypeSelectionRequest::new(if device_profile.kind.is_cuda() {
+        requested
+    } else {
+        None
+    })
+    .with_model_family(ModelFamily::NemotronAsr);
+
+    if device_profile.kind.is_cuda() && requested.is_some() {
+        return device_profile.try_resolve_dtype(request).map_err(|err| {
+            Error::InvalidInput(format!("Invalid CUDA Nemotron ASR dtype override: {err}"))
+        });
+    }
+
+    Ok(device_profile.resolve_dtype(request))
+}
+
+fn nemotron_dtype_diagnostics(
+    selection: &DTypeSelection,
+    device_profile: &DeviceProfile,
+    actual_network_dtype: DType,
+) -> serde_json::Value {
+    let cuda_compute_capability = device_profile
+        .capabilities
+        .cuda_compute_capability
+        .map(|(major, minor)| format!("{major}.{minor}"));
+    json!({
+        "model_weights": format!("{:?}", selection.dtype),
+        "activations": format!("{:?}", actual_network_dtype),
+        "reason": selection.reason.to_string(),
+        "device": format!("{:?}", device_profile.kind),
+        "supports_bf16": device_profile.capabilities.supports_bf16,
+        "supports_f16": device_profile.capabilities.supports_f16,
+        "cuda_compute_capability": cuda_compute_capability,
+        "cuda_device_name": device_profile.capabilities.cuda_device_name.as_deref(),
+    })
 }
 
 fn validate_config_output_vocabulary(inventory: &NemotronConfigInventory) -> Result<()> {
@@ -969,7 +1032,7 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use crate::backends::{DeviceKind, DeviceSelector};
+    use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile, DeviceSelector};
     use uuid::Uuid;
 
     #[test]
@@ -979,6 +1042,87 @@ mod tests {
         assert_eq!(prompt.target_lang, "auto");
         assert!(prompt.strip_lang_tags);
         assert!(prompt.context_prompt.is_none());
+    }
+
+    fn test_device_profile(
+        kind: DeviceKind,
+        supports_bf16: bool,
+        supports_f16: bool,
+    ) -> DeviceProfile {
+        DeviceProfile {
+            device: Device::Cpu,
+            kind,
+            capabilities: DeviceCapabilities {
+                prefers_f32: kind.is_metal(),
+                supports_bf16,
+                supports_f16,
+                cuda_compute_capability: kind.is_cuda().then_some((8, 9)),
+                cuda_device_name: kind.is_cuda().then_some("test-cuda".to_string()),
+                ..Default::default()
+            },
+            memory_pool: None,
+        }
+    }
+
+    #[test]
+    fn nemotron_dtype_plan_keeps_cpu_and_metal_f32() {
+        let cpu = test_device_profile(DeviceKind::Cpu, true, true);
+        let metal = test_device_profile(DeviceKind::Metal, true, true);
+
+        assert_eq!(
+            select_nemotron_asr_dtype(&cpu, None).unwrap().dtype,
+            DType::F32
+        );
+        assert_eq!(
+            select_nemotron_asr_dtype(&cpu, Some("bf16")).unwrap().dtype,
+            DType::F32
+        );
+        assert_eq!(
+            select_nemotron_asr_dtype(&metal, None).unwrap().dtype,
+            DType::F32
+        );
+        assert_eq!(
+            select_nemotron_asr_dtype(&metal, Some("f16"))
+                .unwrap()
+                .dtype,
+            DType::F32
+        );
+    }
+
+    #[test]
+    fn nemotron_dtype_plan_uses_cuda_capability_order_and_diagnostics() {
+        let cuda_bf16 = test_device_profile(DeviceKind::Cuda, true, true);
+        let cuda_f16 = test_device_profile(DeviceKind::Cuda, false, true);
+        let cuda_f32 = test_device_profile(DeviceKind::Cuda, false, false);
+
+        let selection = select_nemotron_asr_dtype(&cuda_bf16, None).unwrap();
+        assert_eq!(selection.dtype, DType::BF16);
+        assert_eq!(
+            select_nemotron_asr_dtype(&cuda_f16, None).unwrap().dtype,
+            DType::F16
+        );
+        assert_eq!(
+            select_nemotron_asr_dtype(&cuda_f32, None).unwrap().dtype,
+            DType::F32
+        );
+
+        let diagnostics = nemotron_dtype_diagnostics(&selection, &cuda_bf16, DType::BF16);
+        assert_eq!(diagnostics["model_weights"], "BF16");
+        assert_eq!(diagnostics["activations"], "BF16");
+        assert_eq!(diagnostics["device"], "Cuda");
+        assert_eq!(diagnostics["cuda_compute_capability"], "8.9");
+        assert_eq!(diagnostics["cuda_device_name"], "test-cuda");
+    }
+
+    #[test]
+    fn nemotron_dtype_plan_rejects_bad_cuda_overrides() {
+        let cuda = test_device_profile(DeviceKind::Cuda, false, true);
+
+        let err = select_nemotron_asr_dtype(&cuda, Some("bf16")).unwrap_err();
+        assert!(err.to_string().contains("Invalid CUDA Nemotron ASR"));
+
+        let err = select_nemotron_asr_dtype(&cuda, Some("float8")).unwrap_err();
+        assert!(err.to_string().contains("expected one of"));
     }
 
     #[test]

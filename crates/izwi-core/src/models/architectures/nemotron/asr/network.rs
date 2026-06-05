@@ -77,6 +77,7 @@ pub(super) struct NemotronNetwork {
     max_symbols_per_frame: usize,
     rel_pos_cache: Mutex<HashMap<RelPosCacheKey, Tensor>>,
     att_mask_cache: Mutex<HashMap<LimitedMaskCacheKey, Tensor>>,
+    dtype: DType,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -150,6 +151,7 @@ impl NemotronNetwork {
             max_symbols_per_frame: DEFAULT_MAX_SYMBOLS_PER_FRAME,
             rel_pos_cache: Mutex::new(HashMap::new()),
             att_mask_cache: Mutex::new(HashMap::new()),
+            dtype: vb.dtype(),
         })
     }
 
@@ -170,6 +172,11 @@ impl NemotronNetwork {
         prompt_id: usize,
     ) -> Result<(Tensor, usize)> {
         let (features, feature_frames) = self.preprocessor.compute_features(audio_16khz)?;
+        let features = if features.dtype() == self.dtype {
+            features
+        } else {
+            features.to_dtype(self.dtype)?
+        };
         let (mut x, encoded_len) = self.pre_encode.forward(&features, feature_frames)?;
         if encoded_len == 0 {
             return Err(Error::InferenceError(
@@ -335,6 +342,10 @@ impl NemotronNetwork {
 
     pub(super) fn blank_idx(&self) -> usize {
         self.blank_idx
+    }
+
+    pub(super) fn dtype(&self) -> DType {
+        self.dtype
     }
 
     fn rel_positional_embedding(
@@ -691,7 +702,7 @@ impl ConvSubsamplingDw {
 }
 
 fn load_subsampling_out_projection(vb: VarBuilder) -> Result<(Linear, usize)> {
-    let ws = vb.get_unchecked_dtype("weight", DType::F32)?;
+    let ws = vb.get_unchecked_dtype("weight", vb.dtype())?;
     let (out_dim, in_dim) = ws.dims2()?;
     if out_dim != ENCODER_DIM || in_dim % CONV_SUB_CHANNELS != 0 {
         return Err(Error::ModelLoadError(format!(
@@ -905,12 +916,18 @@ impl RelPosSelfAttention {
             .reshape((1, 2 * t - 1, ENCODER_HEADS, ENCODER_HEAD_DIM))?
             .transpose(1, 2)?;
 
-        let pos_bias_u = self
-            .pos_bias_u
-            .reshape((1, ENCODER_HEADS, 1, ENCODER_HEAD_DIM))?;
-        let pos_bias_v = self
-            .pos_bias_v
-            .reshape((1, ENCODER_HEADS, 1, ENCODER_HEAD_DIM))?;
+        let pos_bias_u = self.pos_bias_u.to_dtype(q.dtype())?.reshape((
+            1,
+            ENCODER_HEADS,
+            1,
+            ENCODER_HEAD_DIM,
+        ))?;
+        let pos_bias_v = self.pos_bias_v.to_dtype(q.dtype())?.reshape((
+            1,
+            ENCODER_HEADS,
+            1,
+            ENCODER_HEAD_DIM,
+        ))?;
         let matrix_ac = q
             .broadcast_add(&pos_bias_u)?
             .matmul(&k.transpose(2, 3)?.contiguous()?)?;
@@ -1038,7 +1055,7 @@ struct PredictorState {
 
 impl Predictor {
     fn load(vb: VarBuilder) -> Result<Self> {
-        let embed = vb.pp("embed").get_unchecked_dtype("weight", DType::F32)?;
+        let embed = vb.pp("embed").get_unchecked_dtype("weight", vb.dtype())?;
         let vocab_plus_blank = embed.dim(0)?;
         let hidden = embed.dim(1)?;
         if hidden != PRED_HIDDEN {
@@ -1056,7 +1073,8 @@ impl Predictor {
     }
 
     fn initial_state(&self, batch: usize, device: &Device) -> Result<PredictorState> {
-        let zeros = |dim| Tensor::zeros((batch, dim), DType::F32, device).map_err(Error::from);
+        let dtype = self.embed.dtype();
+        let zeros = |dim| Tensor::zeros((batch, dim), dtype, device).map_err(Error::from);
         Ok(PredictorState {
             h0: zeros(PRED_HIDDEN)?,
             c0: zeros(PRED_HIDDEN)?,
@@ -1067,7 +1085,7 @@ impl Predictor {
 
     fn step(&self, label: usize, state: &mut PredictorState, device: &Device) -> Result<Tensor> {
         let x = if label == self.blank_idx {
-            Tensor::zeros((1, PRED_HIDDEN), DType::F32, device)?
+            Tensor::zeros((1, PRED_HIDDEN), self.embed.dtype(), device)?
         } else {
             self.embed.i((label, ..))?.unsqueeze(0)?
         };
@@ -1171,7 +1189,7 @@ impl Joint {
         let enc = mlx::load_linear(enc_hidden, JOINT_HIDDEN, vb.pp("enc"))?;
         let out_bias = vb
             .pp("joint_net.2")
-            .get_unchecked_dtype("bias", DType::F32)?;
+            .get_unchecked_dtype("bias", vb.dtype())?;
         let out_dim = out_bias.dim(0)?;
         if out_dim != num_classes_with_blank {
             return Err(Error::ModelLoadError(format!(
