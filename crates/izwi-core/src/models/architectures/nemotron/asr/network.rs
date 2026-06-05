@@ -180,6 +180,10 @@ impl NemotronNetwork {
         encoded_len: usize,
         on_token: &mut dyn FnMut(usize),
     ) -> Result<NemotronDecodedTokens> {
+        if encoded.device().is_cuda() {
+            return self.decode_rnnt_greedy_cuda_cached(encoded, encoded_len, on_token);
+        }
+
         let encoded = encoded.i((0, ..encoded_len, ..))?; // [T, D]
         let mut predictor_state = self.predictor.initial_state(1, encoded.device())?;
         let mut predictor_out =
@@ -225,6 +229,75 @@ impl NemotronNetwork {
                 predictor_out =
                     self.predictor
                         .step(label, &mut predictor_state, encoded.device())?;
+            }
+        }
+
+        Ok(NemotronDecodedTokens {
+            stats: NemotronDecodeStats {
+                encoded_frames: encoded_len,
+                emitted_tokens: token_ids.len(),
+                blank_frames,
+                guard_exits,
+                max_symbols_per_frame: self.max_symbols_per_frame,
+            },
+            token_ids,
+        })
+    }
+
+    fn decode_rnnt_greedy_cuda_cached(
+        &self,
+        encoded: &Tensor,
+        encoded_len: usize,
+        on_token: &mut dyn FnMut(usize),
+    ) -> Result<NemotronDecodedTokens> {
+        let encoded = encoded.i((0, ..encoded_len, ..))?; // [T, D]
+        let encoded_projection = self.joint.project_encoder(&encoded)?; // [T, H]
+        let mut predictor_state = self.predictor.initial_state(1, encoded.device())?;
+        let mut predictor_out =
+            self.predictor
+                .step(self.blank_idx, &mut predictor_state, encoded.device())?;
+        let mut predictor_projection = self.joint.project_predictor(&predictor_out)?;
+
+        let mut token_ids = Vec::new();
+        let mut blank_frames = 0usize;
+        let mut guard_exits = 0usize;
+
+        for t in 0..encoded_len {
+            let enc_t = encoded_projection.i((t, ..))?.unsqueeze(0)?.unsqueeze(0)?;
+            let mut symbols_this_frame = 0usize;
+
+            loop {
+                let logits = self
+                    .joint
+                    .joint_from_projections(&enc_t, &predictor_projection)?
+                    .squeeze(0)?
+                    .squeeze(0)?
+                    .squeeze(0)?;
+                let label = argmax_1d(&logits)?;
+
+                if label == self.blank_idx {
+                    blank_frames = blank_frames.saturating_add(1);
+                    break;
+                }
+                if label > self.blank_idx {
+                    return Err(Error::InferenceError(format!(
+                        "Nemotron RNNT emitted invalid label {label}; blank_idx={}",
+                        self.blank_idx
+                    )));
+                }
+
+                token_ids.push(label);
+                on_token(label);
+                symbols_this_frame = symbols_this_frame.saturating_add(1);
+                if symbols_this_frame >= self.max_symbols_per_frame {
+                    guard_exits = guard_exits.saturating_add(1);
+                    break;
+                }
+
+                predictor_out =
+                    self.predictor
+                        .step(label, &mut predictor_state, encoded.device())?;
+                predictor_projection = self.joint.project_predictor(&predictor_out)?;
             }
         }
 
@@ -887,6 +960,14 @@ struct LstmCell {
     w_hh: Tensor,
     b_ih: Tensor,
     b_hh: Tensor,
+    cuda_views: Option<LstmCellCudaViews>,
+}
+
+struct LstmCellCudaViews {
+    w_ih_t: Tensor,
+    w_hh_t: Tensor,
+    b_ih_batched: Tensor,
+    b_hh_batched: Tensor,
 }
 
 impl LstmCell {
@@ -896,20 +977,42 @@ impl LstmCell {
         let b_ih_name = format!("bias_ih_l{layer}");
         let b_hh_name = format!("bias_hh_l{layer}");
 
+        let w_ih = vb.get((PRED_HIDDEN * 4, PRED_HIDDEN), &w_ih_name)?;
+        let w_hh = vb.get((PRED_HIDDEN * 4, PRED_HIDDEN), &w_hh_name)?;
+        let b_ih = vb.get(PRED_HIDDEN * 4, &b_ih_name)?;
+        let b_hh = vb.get(PRED_HIDDEN * 4, &b_hh_name)?;
+        let cuda_views = if w_ih.device().is_cuda() {
+            Some(LstmCellCudaViews {
+                w_ih_t: w_ih.transpose(0, 1)?.contiguous()?,
+                w_hh_t: w_hh.transpose(0, 1)?.contiguous()?,
+                b_ih_batched: b_ih.unsqueeze(0)?,
+                b_hh_batched: b_hh.unsqueeze(0)?,
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
-            w_ih: vb.get((PRED_HIDDEN * 4, PRED_HIDDEN), &w_ih_name)?,
-            w_hh: vb.get((PRED_HIDDEN * 4, PRED_HIDDEN), &w_hh_name)?,
-            b_ih: vb.get(PRED_HIDDEN * 4, &b_ih_name)?,
-            b_hh: vb.get(PRED_HIDDEN * 4, &b_hh_name)?,
+            w_ih,
+            w_hh,
+            b_ih,
+            b_hh,
+            cuda_views,
         })
     }
 
     fn step(&self, x: &Tensor, h_prev: &Tensor, c_prev: &Tensor) -> Result<(Tensor, Tensor)> {
-        let gates = x
-            .matmul(&self.w_ih.transpose(0, 1)?)?
-            .broadcast_add(&self.b_ih.unsqueeze(0)?)?
-            .broadcast_add(&h_prev.matmul(&self.w_hh.transpose(0, 1)?)?)?
-            .broadcast_add(&self.b_hh.unsqueeze(0)?)?;
+        let gates = if let Some(views) = &self.cuda_views {
+            x.matmul(&views.w_ih_t)?
+                .broadcast_add(&views.b_ih_batched)?
+                .broadcast_add(&h_prev.matmul(&views.w_hh_t)?)?
+                .broadcast_add(&views.b_hh_batched)?
+        } else {
+            x.matmul(&self.w_ih.transpose(0, 1)?)?
+                .broadcast_add(&self.b_ih.unsqueeze(0)?)?
+                .broadcast_add(&h_prev.matmul(&self.w_hh.transpose(0, 1)?)?)?
+                .broadcast_add(&self.b_hh.unsqueeze(0)?)?
+        };
 
         let i = ops::sigmoid(&gates.i((.., 0..PRED_HIDDEN))?)?;
         let f = ops::sigmoid(&gates.i((.., PRED_HIDDEN..(PRED_HIDDEN * 2)))?)?;
@@ -951,8 +1054,24 @@ impl Joint {
     }
 
     fn joint_after_projection(&self, f: &Tensor, g: &Tensor) -> Result<Tensor> {
-        let f = self.enc.forward(f)?;
-        let g = self.pred.forward(g)?;
+        let f = self.project_encoder(f)?;
+        let g = self.project_predictor(g)?;
+        self.joint_from_projections(&f, &g)
+    }
+
+    fn project_encoder(&self, f: &Tensor) -> Result<Tensor> {
+        self.enc
+            .forward(f)
+            .map_err(|e| Error::InferenceError(e.to_string()))
+    }
+
+    fn project_predictor(&self, g: &Tensor) -> Result<Tensor> {
+        self.pred
+            .forward(g)
+            .map_err(|e| Error::InferenceError(e.to_string()))
+    }
+
+    fn joint_from_projections(&self, f: &Tensor, g: &Tensor) -> Result<Tensor> {
         let inp = f.unsqueeze(2)?.broadcast_add(&g.unsqueeze(1)?)?;
         let inp = inp.relu()?;
         self.out
@@ -1168,5 +1287,46 @@ mod tests {
         let err = argmax_1d(&logits).expect_err("rank-2 logits should fail");
 
         assert!(err.to_string().contains("expected rank-1 logits"));
+    }
+
+    #[test]
+    fn joint_projection_helpers_match_uncached_joint_logits() {
+        let device = Device::Cpu;
+        let joint = Joint {
+            pred: Linear::new(
+                Tensor::ones((JOINT_HIDDEN, PRED_HIDDEN), DType::F32, &device).unwrap(),
+                Some(Tensor::zeros(JOINT_HIDDEN, DType::F32, &device).unwrap()),
+            ),
+            enc: Linear::new(
+                Tensor::ones((JOINT_HIDDEN, ENCODER_DIM), DType::F32, &device).unwrap(),
+                Some(Tensor::zeros(JOINT_HIDDEN, DType::F32, &device).unwrap()),
+            ),
+            out: Linear::new(
+                Tensor::ones((4, JOINT_HIDDEN), DType::F32, &device).unwrap(),
+                Some(Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0], 4, &device).unwrap()),
+            ),
+        };
+        let enc = Tensor::ones((1, 1, ENCODER_DIM), DType::F32, &device).unwrap();
+        let pred = Tensor::ones((1, 1, PRED_HIDDEN), DType::F32, &device).unwrap();
+
+        let uncached = joint
+            .joint_after_projection(&enc, &pred)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let cached = joint
+            .joint_from_projections(
+                &joint.project_encoder(&enc).unwrap(),
+                &joint.project_predictor(&pred).unwrap(),
+            )
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        assert_eq!(cached, uncached);
     }
 }
