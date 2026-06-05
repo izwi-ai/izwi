@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 use candle_nn::ops;
@@ -74,6 +75,22 @@ pub(super) struct NemotronNetwork {
     right_context_frames: usize,
     blank_idx: usize,
     max_symbols_per_frame: usize,
+    rel_pos_cache: Mutex<HashMap<RelPosCacheKey, Tensor>>,
+    att_mask_cache: Mutex<HashMap<LimitedMaskCacheKey, Tensor>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RelPosCacheKey {
+    len: usize,
+    dtype: DType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LimitedMaskCacheKey {
+    len: usize,
+    left_context: usize,
+    right_context: usize,
+    dtype: DType,
 }
 
 impl NemotronNetwork {
@@ -131,6 +148,8 @@ impl NemotronNetwork {
                 .unwrap_or(13),
             blank_idx,
             max_symbols_per_frame: DEFAULT_MAX_SYMBOLS_PER_FRAME,
+            rel_pos_cache: Mutex::new(HashMap::new()),
+            att_mask_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -159,11 +178,12 @@ impl NemotronNetwork {
         }
 
         let pos_len = x.dim(1)?;
-        let pos_emb = build_rel_positional_embedding(pos_len, ENCODER_DIM, x.device())?;
-        let att_mask = build_limited_context_mask(
+        let pos_emb = self.rel_positional_embedding(pos_len, x.dtype(), x.device())?;
+        let att_mask = self.limited_context_mask(
             pos_len,
             self.left_context_frames,
             self.right_context_frames,
+            x.dtype(),
             x.device(),
         )?;
         for layer in &self.layers {
@@ -315,6 +335,72 @@ impl NemotronNetwork {
 
     pub(super) fn blank_idx(&self) -> usize {
         self.blank_idx
+    }
+
+    fn rel_positional_embedding(
+        &self,
+        len: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Tensor> {
+        if !device.is_cuda() {
+            return build_rel_positional_embedding(len, ENCODER_DIM, device);
+        }
+
+        let key = RelPosCacheKey { len, dtype };
+        if let Some(cached) = self
+            .rel_pos_cache
+            .lock()
+            .map_err(|_| Error::InferenceError("Nemotron rel-pos cache lock poisoned".into()))?
+            .get(&key)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+
+        let tensor = build_rel_positional_embedding_for_dtype(len, ENCODER_DIM, device, dtype)?;
+        self.rel_pos_cache
+            .lock()
+            .map_err(|_| Error::InferenceError("Nemotron rel-pos cache lock poisoned".into()))?
+            .insert(key, tensor.clone());
+        Ok(tensor)
+    }
+
+    fn limited_context_mask(
+        &self,
+        len: usize,
+        left_context: usize,
+        right_context: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Tensor> {
+        if !device.is_cuda() {
+            return build_limited_context_mask(len, left_context, right_context, device);
+        }
+
+        let key = LimitedMaskCacheKey {
+            len,
+            left_context,
+            right_context,
+            dtype,
+        };
+        if let Some(cached) = self
+            .att_mask_cache
+            .lock()
+            .map_err(|_| Error::InferenceError("Nemotron mask cache lock poisoned".into()))?
+            .get(&key)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+
+        let tensor =
+            build_limited_context_mask_for_dtype(len, left_context, right_context, device, dtype)?;
+        self.att_mask_cache
+            .lock()
+            .map_err(|_| Error::InferenceError("Nemotron mask cache lock poisoned".into()))?
+            .insert(key, tensor.clone());
+        Ok(tensor)
     }
 }
 
@@ -859,6 +945,13 @@ fn rel_shift(x: &Tensor) -> Result<Tensor> {
 struct PromptKernel {
     linear0: Linear,
     linear2: Linear,
+    prompt_cache: Mutex<HashMap<PromptCacheKey, Tensor>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PromptCacheKey {
+    prompt_id: usize,
+    dtype: DType,
 }
 
 impl PromptKernel {
@@ -866,6 +959,7 @@ impl PromptKernel {
         Ok(Self {
             linear0: mlx::load_linear(ENCODER_DIM + PROMPT_DIM, PROMPT_HIDDEN, vb.pp("0"))?,
             linear2: mlx::load_linear(PROMPT_HIDDEN, ENCODER_DIM, vb.pp("2"))?,
+            prompt_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -877,18 +971,53 @@ impl PromptKernel {
         }
 
         let (b, t, _d) = encoded.dims3()?;
-        let mut prompt = vec![0f32; b * t * PROMPT_DIM];
-        for bi in 0..b {
-            for ti in 0..t {
-                prompt[(bi * t + ti) * PROMPT_DIM + prompt_id] = 1.0;
-            }
-        }
-        let prompt = Tensor::from_vec(prompt, (b, t, PROMPT_DIM), encoded.device())?;
+        let prompt = self.prompt_tensor(encoded, prompt_id, b, t)?;
         let x = Tensor::cat(&[encoded, &prompt], 2)?;
         let x = self.linear0.forward(&x)?.relu()?;
         self.linear2
             .forward(&x)
             .map_err(|e| Error::InferenceError(e.to_string()))
+    }
+
+    fn prompt_tensor(
+        &self,
+        encoded: &Tensor,
+        prompt_id: usize,
+        b: usize,
+        t: usize,
+    ) -> Result<Tensor> {
+        if !encoded.device().is_cuda() {
+            let mut prompt = vec![0f32; b * t * PROMPT_DIM];
+            for bi in 0..b {
+                for ti in 0..t {
+                    prompt[(bi * t + ti) * PROMPT_DIM + prompt_id] = 1.0;
+                }
+            }
+            return Tensor::from_vec(prompt, (b, t, PROMPT_DIM), encoded.device())
+                .map_err(Error::from);
+        }
+
+        let key = PromptCacheKey {
+            prompt_id,
+            dtype: encoded.dtype(),
+        };
+        let base = if let Some(cached) = self
+            .prompt_cache
+            .lock()
+            .map_err(|_| Error::InferenceError("Nemotron prompt cache lock poisoned".into()))?
+            .get(&key)
+            .cloned()
+        {
+            cached
+        } else {
+            let tensor = build_prompt_one_hot(prompt_id, encoded.device(), encoded.dtype())?;
+            self.prompt_cache
+                .lock()
+                .map_err(|_| Error::InferenceError("Nemotron prompt cache lock poisoned".into()))?
+                .insert(key, tensor.clone());
+            tensor
+        };
+        base.broadcast_as((b, t, PROMPT_DIM)).map_err(Error::from)
     }
 }
 
@@ -1124,6 +1253,17 @@ fn build_rel_positional_embedding(len: usize, d_model: usize, device: &Device) -
     Tensor::from_vec(emb, (1, pos_len, d_model), device).map_err(Error::from)
 }
 
+fn build_rel_positional_embedding_for_dtype(
+    len: usize,
+    d_model: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    build_rel_positional_embedding(len, d_model, device)?
+        .to_dtype(dtype)
+        .map_err(Error::from)
+}
+
 fn build_limited_context_mask(
     len: usize,
     left_context: usize,
@@ -1139,6 +1279,31 @@ fn build_limited_context_mask(
         }
     }
     Tensor::from_vec(mask, (1, 1, len, len), device).map_err(Error::from)
+}
+
+fn build_limited_context_mask_for_dtype(
+    len: usize,
+    left_context: usize,
+    right_context: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    build_limited_context_mask(len, left_context, right_context, device)?
+        .to_dtype(dtype)
+        .map_err(Error::from)
+}
+
+fn build_prompt_one_hot(prompt_id: usize, device: &Device, dtype: DType) -> Result<Tensor> {
+    if prompt_id >= PROMPT_DIM {
+        return Err(Error::InvalidInput(format!(
+            "Nemotron prompt id {prompt_id} exceeds prompt feature dimension {PROMPT_DIM}"
+        )));
+    }
+    let mut prompt = vec![0f32; PROMPT_DIM];
+    prompt[prompt_id] = 1.0;
+    Tensor::from_vec(prompt, (1, 1, PROMPT_DIM), device)?
+        .to_dtype(dtype)
+        .map_err(Error::from)
 }
 
 fn swish(x: &Tensor) -> Result<Tensor> {
@@ -1261,6 +1426,30 @@ mod tests {
     }
 
     #[test]
+    fn typed_limited_context_mask_matches_f32_builder_values() {
+        let mask = build_limited_context_mask_for_dtype(4, 1, 1, &Device::Cpu, DType::F32).unwrap();
+        let values = mask
+            .squeeze(0)
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+
+        assert_eq!(mask.dtype(), DType::F32);
+        assert_eq!(values[0][0], 0.0);
+        assert!(values[0][2] < -1.0e8);
+    }
+
+    #[test]
+    fn typed_rel_positional_embedding_matches_f32_builder_shape() {
+        let pos = build_rel_positional_embedding_for_dtype(3, 8, &Device::Cpu, DType::F32).unwrap();
+
+        assert_eq!(pos.dtype(), DType::F32);
+        assert_eq!(pos.dims(), &[1, 5, 8]);
+    }
+
+    #[test]
     fn normalize_mode_respects_nemo_na_value() {
         assert_eq!(
             FeatureNormalize::from_config(Some("NA")),
@@ -1287,6 +1476,16 @@ mod tests {
         let err = argmax_1d(&logits).expect_err("rank-2 logits should fail");
 
         assert!(err.to_string().contains("expected rank-1 logits"));
+    }
+
+    #[test]
+    fn prompt_one_hot_builder_sets_only_requested_prompt_id() {
+        let prompt = build_prompt_one_hot(3, &Device::Cpu, DType::F32).unwrap();
+        let values = prompt.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        assert_eq!(prompt.dims(), &[1, 1, PROMPT_DIM]);
+        assert_eq!(values[3], 1.0);
+        assert_eq!(values.iter().filter(|value| **value == 1.0).count(), 1);
     }
 
     #[test]
