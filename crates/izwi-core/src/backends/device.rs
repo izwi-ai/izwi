@@ -521,6 +521,26 @@ impl DeviceProfile {
                     })
                 }
             }
+            ModelFamily::NemotronAsr => {
+                if self.capabilities.supports_bf16 {
+                    Some(DTypeSelection {
+                        dtype: DType::BF16,
+                        reason: "Nemotron ASR CUDA policy defaults dense FastConformer/RNNT stages to BF16 when supported".into(),
+                    })
+                } else if self.capabilities.supports_f16 {
+                    Some(DTypeSelection {
+                        dtype: DType::F16,
+                        reason:
+                            "Nemotron ASR CUDA policy falls back to F16 when BF16 is unavailable"
+                                .into(),
+                    })
+                } else {
+                    Some(DTypeSelection {
+                        dtype: DType::F32,
+                        reason: "Nemotron ASR CUDA policy falls back to F32 without reported half precision support".into(),
+                    })
+                }
+            }
             _ => None,
         }
     }
@@ -970,6 +990,10 @@ mod tests {
             cuda_profile.select_model_dtype(ModelFamily::VibeVoiceAsr, None),
             DType::BF16
         );
+        assert_eq!(
+            cuda_profile.select_model_dtype(ModelFamily::NemotronAsr, None),
+            DType::BF16
+        );
     }
 
     #[test]
@@ -1175,6 +1199,48 @@ mod tests {
     }
 
     #[test]
+    fn cpu_and_metal_nemotron_model_dtype_stays_f32() {
+        let cpu_profile = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Cpu,
+            capabilities: DeviceCapabilities::default(),
+            memory_pool: None,
+        };
+        let metal_profile = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Metal,
+            capabilities: DeviceCapabilities {
+                prefers_f32: true,
+                supports_f16: true,
+                supports_bf16: true,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+
+        assert_eq!(
+            cpu_profile.select_model_dtype(ModelFamily::NemotronAsr, None),
+            DType::F32
+        );
+        assert_eq!(
+            cpu_profile
+                .select_model_dtype_checked(ModelFamily::NemotronAsr, Some("bf16"), "Nemotron ASR")
+                .unwrap(),
+            DType::F32
+        );
+        assert_eq!(
+            metal_profile.select_model_dtype(ModelFamily::NemotronAsr, None),
+            DType::F32
+        );
+        assert_eq!(
+            metal_profile
+                .select_model_dtype_checked(ModelFamily::NemotronAsr, Some("f16"), "Nemotron ASR")
+                .unwrap(),
+            DType::F32
+        );
+    }
+
+    #[test]
     fn cuda_vibevoice_dtype_falls_back_by_capability() {
         let cuda_f16_profile = DeviceProfile {
             device: Device::Cpu,
@@ -1203,6 +1269,53 @@ mod tests {
         );
         assert_eq!(
             cuda_f32_profile.select_model_dtype(ModelFamily::VibeVoiceTts, None),
+            DType::F32
+        );
+    }
+
+    #[test]
+    fn cuda_nemotron_dtype_falls_back_by_capability() {
+        let cuda_bf16_profile = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Cuda,
+            capabilities: DeviceCapabilities {
+                supports_bf16: true,
+                supports_f16: true,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+        let cuda_f16_profile = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Cuda,
+            capabilities: DeviceCapabilities {
+                supports_bf16: false,
+                supports_f16: true,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+        let cuda_f32_profile = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Cuda,
+            capabilities: DeviceCapabilities {
+                supports_bf16: false,
+                supports_f16: false,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+
+        assert_eq!(
+            cuda_bf16_profile.select_model_dtype(ModelFamily::NemotronAsr, None),
+            DType::BF16
+        );
+        assert_eq!(
+            cuda_f16_profile.select_model_dtype(ModelFamily::NemotronAsr, None),
+            DType::F16
+        );
+        assert_eq!(
+            cuda_f32_profile.select_model_dtype(ModelFamily::NemotronAsr, None),
             DType::F32
         );
     }
