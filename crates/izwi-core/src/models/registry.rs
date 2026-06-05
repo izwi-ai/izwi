@@ -16,6 +16,9 @@ use crate::models::architectures::lfm2::chat::Lfm2ChatModel;
 use crate::models::architectures::lfm25_audio::{
     Lfm25AudioGenerationConfig, Lfm25AudioModel, Lfm25AudioStreamConfig,
 };
+use crate::models::architectures::nemotron::asr::{
+    NemotronAsrModel, NemotronAsrTranscriptionOutput,
+};
 use crate::models::architectures::parakeet::asr::ParakeetAsrModel;
 use crate::models::architectures::qwen3::asr::{
     AsrDecodeState as Qwen3AsrDecodeState, AsrDecodeStep as Qwen3AsrDecodeStep,
@@ -131,6 +134,16 @@ fn load_parakeet_asr_model(
     device: DeviceProfile,
 ) -> Result<NativeAsrModel> {
     Ok(NativeAsrModel::Parakeet(ParakeetAsrModel::load(
+        model_dir, variant, device,
+    )?))
+}
+
+fn load_nemotron_asr_model(
+    model_dir: &Path,
+    variant: ModelVariant,
+    device: DeviceProfile,
+) -> Result<NativeAsrModel> {
+    Ok(NativeAsrModel::Nemotron(NemotronAsrModel::load(
         model_dir, variant, device,
     )?))
 }
@@ -264,6 +277,11 @@ const ASR_LOADER_REGISTRY: &[AsrLoaderRegistration] = &[
         loader: load_parakeet_asr_model,
     },
     AsrLoaderRegistration {
+        name: "nemotron_asr",
+        family: ModelFamily::NemotronAsr,
+        loader: load_nemotron_asr_model,
+    },
+    AsrLoaderRegistration {
         name: "whisper_asr",
         family: ModelFamily::WhisperAsr,
         loader: load_whisper_asr_model,
@@ -360,6 +378,7 @@ fn resolve_asr_loader_registration(
         ModelFamily::Qwen3Asr => ModelFamily::Qwen3Asr,
         ModelFamily::Qwen3ForcedAligner => ModelFamily::Qwen3ForcedAligner,
         ModelFamily::ParakeetAsr => ModelFamily::ParakeetAsr,
+        ModelFamily::NemotronAsr => ModelFamily::NemotronAsr,
         ModelFamily::WhisperAsr => ModelFamily::WhisperAsr,
         ModelFamily::VibeVoiceAsr => ModelFamily::VibeVoiceAsr,
         _ => return None,
@@ -445,6 +464,7 @@ fn resolve_kokoro_loader_registration(
 pub enum NativeAsrModel {
     Qwen3(Qwen3AsrModel),
     Parakeet(ParakeetAsrModel),
+    Nemotron(NemotronAsrModel),
     WhisperTurbo(WhisperTurboAsrModel),
     VibeVoice(VibeVoiceAsrModel),
 }
@@ -561,6 +581,13 @@ impl NativeAsrModel {
             Self::Parakeet(model) => {
                 model.transcribe_with_callback(audio, sample_rate, language, on_delta)
             }
+            Self::Nemotron(model) => model.transcribe_with_callback_and_prompt(
+                audio,
+                sample_rate,
+                language,
+                prompt,
+                on_delta,
+            ),
             Self::WhisperTurbo(model) => model.transcribe_with_callback_and_prompt(
                 audio,
                 sample_rate,
@@ -645,6 +672,23 @@ impl NativeAsrModel {
                 language: language.map(|value| value.to_string()),
                 diagnostics: None,
             }),
+            Self::Nemotron(model) => {
+                let NemotronAsrTranscriptionOutput {
+                    text,
+                    language,
+                    diagnostics,
+                } = model.transcribe_with_details_and_prompt(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                )?;
+                Ok(NativeAsrTranscription {
+                    text,
+                    language,
+                    diagnostics,
+                })
+            }
             Self::WhisperTurbo(model) => {
                 let WhisperAsrTranscriptionOutput {
                     text,
@@ -725,6 +769,9 @@ impl NativeAsrModel {
             Self::Parakeet(_) => Err(Error::InvalidInput(
                 "Forced alignment is only available for Qwen3-ForcedAligner models".to_string(),
             )),
+            Self::Nemotron(_) => Err(Error::InvalidInput(
+                "Forced alignment is only available for Qwen3-ForcedAligner models".to_string(),
+            )),
             Self::WhisperTurbo(_) => Err(Error::InvalidInput(
                 "Forced alignment is only available for Qwen3-ForcedAligner models".to_string(),
             )),
@@ -742,6 +789,7 @@ impl NativeAsrModel {
         match self {
             Self::Qwen3(model) => model.max_audio_seconds_hint(),
             Self::Parakeet(_) => None,
+            Self::Nemotron(model) => model.max_audio_seconds_hint(),
             Self::WhisperTurbo(model) => model.max_audio_seconds_hint(),
             Self::VibeVoice(model) => model.max_audio_seconds_hint(),
         }
@@ -776,6 +824,9 @@ impl NativeAsrModel {
                 )?,
             )),
             Self::Parakeet(_) => Err(Error::InvalidInput(
+                "Incremental decode state is not available for this ASR model".to_string(),
+            )),
+            Self::Nemotron(_) => Err(Error::InvalidInput(
                 "Incremental decode state is not available for this ASR model".to_string(),
             )),
             Self::WhisperTurbo(_) => Err(Error::InvalidInput(
@@ -1687,6 +1738,16 @@ mod tests {
 
         assert_eq!(registration.name, "vibevoice_asr");
         assert_eq!(registration.family, ModelFamily::VibeVoiceAsr);
+    }
+
+    #[test]
+    fn resolves_nemotron_asr_loader_registration() {
+        let registration =
+            resolve_asr_loader_registration(ModelVariant::Nemotron35AsrStreaming06B)
+                .expect("Nemotron ASR loader should be registered");
+
+        assert_eq!(registration.name, "nemotron_asr");
+        assert_eq!(registration.family, ModelFamily::NemotronAsr);
     }
 
     #[test]
