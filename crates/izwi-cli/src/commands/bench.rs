@@ -160,6 +160,14 @@ struct AsrStageTimings {
     audio_tokens: Option<u64>,
     generated_tokens: Option<u64>,
     max_new_tokens: Option<u64>,
+    execution: Option<AsrExecutionDiagnostics>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct AsrExecutionDiagnostics {
+    cuda_dense_decode_cache: Option<bool>,
+    dense_decode_max_tokens: Option<u64>,
+    cuda_device_argmax: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,6 +286,8 @@ struct BenchmarkSample {
     audio_duration_secs: Option<f64>,
     rtf: Option<f64>,
     tokens_generated: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    asr_execution: Option<AsrExecutionDiagnostics>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1433,6 +1443,7 @@ async fn bench_chat(
                 audio_duration_secs: None,
                 rtf: None,
                 tokens_generated: None,
+                asr_execution: None,
             })
             .collect(),
         telemetry: RuntimeTelemetryReport {
@@ -1674,6 +1685,7 @@ async fn bench_tts(
                 audio_duration_secs: sample.audio_duration_secs,
                 rtf: sample.rtf,
                 tokens_generated: sample.tokens_generated,
+                asr_execution: None,
             })
             .collect(),
         telemetry: RuntimeTelemetryReport {
@@ -1920,6 +1932,11 @@ async fn bench_asr(
                 audio_duration_secs: sample.response.duration,
                 rtf: sample.response.rtf,
                 tokens_generated: None,
+                asr_execution: sample
+                    .response
+                    .izwi_asr_diagnostics
+                    .as_ref()
+                    .and_then(asr_execution_from_diagnostics),
             })
             .collect(),
         telemetry: RuntimeTelemetryReport {
@@ -2490,6 +2507,7 @@ fn asr_stage_timings_from_diagnostics(diagnostics: &serde_json::Value) -> Option
     let prompt = diagnostics.get("prompt");
     let audio = diagnostics.get("audio");
     let decode = diagnostics.get("decode");
+    let execution = asr_execution_from_single_diagnostics(diagnostics);
     Some(AsrStageTimings {
         audio_decode: timings.get("audio_decode").and_then(|value| value.as_f64()),
         mel_prepare: timings.get("mel_prepare").and_then(|value| value.as_f64()),
@@ -2513,6 +2531,7 @@ fn asr_stage_timings_from_diagnostics(diagnostics: &serde_json::Value) -> Option
         max_new_tokens: decode
             .and_then(|value| value.get("max_new_tokens"))
             .and_then(|value| value.as_u64()),
+        execution,
     })
 }
 
@@ -2520,6 +2539,35 @@ fn diagnostic_u64(value: Option<&serde_json::Value>, keys: &[&str]) -> Option<u6
     let value = value?;
     keys.iter()
         .find_map(|key| value.get(*key).and_then(|value| value.as_u64()))
+}
+
+fn asr_execution_from_diagnostics(
+    diagnostics: &serde_json::Value,
+) -> Option<AsrExecutionDiagnostics> {
+    collect_asr_stage_timings_from_diagnostics(diagnostics)
+        .into_iter()
+        .find_map(|sample| sample.execution)
+}
+
+fn asr_execution_from_single_diagnostics(
+    diagnostics: &serde_json::Value,
+) -> Option<AsrExecutionDiagnostics> {
+    let execution = diagnostics.get("execution")?;
+    let sample = AsrExecutionDiagnostics {
+        cuda_dense_decode_cache: execution
+            .get("cuda_dense_decode_cache")
+            .and_then(|value| value.as_bool()),
+        dense_decode_max_tokens: execution
+            .get("dense_decode_max_tokens")
+            .and_then(|value| value.as_u64()),
+        cuda_device_argmax: execution
+            .get("cuda_device_argmax")
+            .and_then(|value| value.as_bool()),
+    };
+    (sample.cuda_dense_decode_cache.is_some()
+        || sample.dense_decode_max_tokens.is_some()
+        || sample.cuda_device_argmax.is_some())
+    .then_some(sample)
 }
 
 fn diagnostics_contains_whisper_model(diagnostics: &serde_json::Value) -> bool {
@@ -2605,6 +2653,14 @@ fn summarize_count(stage: &str, values: &[u64]) {
     );
 }
 
+fn summarize_bool_count(stage: &str, values: &[bool]) {
+    if values.is_empty() {
+        return;
+    }
+    let enabled = values.iter().filter(|value| **value).count();
+    println!("  {:<14} enabled: {}/{}", stage, enabled, values.len());
+}
+
 fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     if samples.is_empty() {
         return;
@@ -2624,6 +2680,9 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     let mut audio_tokens = Vec::new();
     let mut generated_tokens = Vec::new();
     let mut max_new_tokens = Vec::new();
+    let mut cuda_dense_decode_cache = Vec::new();
+    let mut dense_decode_max_tokens = Vec::new();
+    let mut cuda_device_argmax = Vec::new();
 
     for sample in samples {
         if let Some(value) = sample.audio_decode {
@@ -2668,6 +2727,17 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         if let Some(value) = sample.max_new_tokens {
             max_new_tokens.push(value);
         }
+        if let Some(execution) = sample.execution {
+            if let Some(value) = execution.cuda_dense_decode_cache {
+                cuda_dense_decode_cache.push(value);
+            }
+            if let Some(value) = execution.dense_decode_max_tokens {
+                dense_decode_max_tokens.push(value);
+            }
+            if let Some(value) = execution.cuda_device_argmax {
+                cuda_device_argmax.push(value);
+            }
+        }
     }
 
     if audio_decode.is_empty()
@@ -2684,6 +2754,9 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         && audio_tokens.is_empty()
         && generated_tokens.is_empty()
         && max_new_tokens.is_empty()
+        && cuda_dense_decode_cache.is_empty()
+        && dense_decode_max_tokens.is_empty()
+        && cuda_device_argmax.is_empty()
     {
         return;
     }
@@ -2708,6 +2781,9 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     summarize_count("audio_tokens", &audio_tokens);
     summarize_count("gen_tokens", &generated_tokens);
     summarize_count("max_new_tokens", &max_new_tokens);
+    summarize_bool_count("cuda_dense", &cuda_dense_decode_cache);
+    summarize_count("dense_max", &dense_decode_max_tokens);
+    summarize_bool_count("cuda_argmax", &cuda_device_argmax);
 }
 
 fn print_runtime_delta(
@@ -3058,6 +3134,11 @@ mod tests {
                 "generated_tokens": 37,
                 "max_new_tokens": 512
             },
+            "execution": {
+                "cuda_dense_decode_cache": true,
+                "dense_decode_max_tokens": 384,
+                "cuda_device_argmax": true
+            },
             "timings_ms": {
                 "audio_encode": 420.0,
                 "prefill": 530.0,
@@ -3076,6 +3157,18 @@ mod tests {
         assert_eq!(samples[0].audio_tokens, Some(186));
         assert_eq!(samples[0].generated_tokens, Some(37));
         assert_eq!(samples[0].max_new_tokens, Some(512));
+        let execution = samples[0]
+            .execution
+            .expect("execution diagnostics should be extracted");
+        assert_eq!(execution.cuda_dense_decode_cache, Some(true));
+        assert_eq!(execution.dense_decode_max_tokens, Some(384));
+        assert_eq!(execution.cuda_device_argmax, Some(true));
+        assert_eq!(
+            asr_execution_from_diagnostics(&diagnostics)
+                .expect("execution diagnostics")
+                .dense_decode_max_tokens,
+            Some(384)
+        );
     }
 
     #[test]
