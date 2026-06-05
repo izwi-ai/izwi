@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use candle_core::{DType, Device, IndexOp, Tensor};
+use candle_core::{DType, Device, IndexOp, Tensor, D};
 use candle_nn::ops;
 use candle_nn::{
     layer_norm, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, LayerNorm, Linear, Module, VarBuilder,
@@ -1027,6 +1027,31 @@ fn swish(x: &Tensor) -> Result<Tensor> {
 }
 
 fn argmax_1d(x: &Tensor) -> Result<usize> {
+    if x.rank() != 1 {
+        return Err(Error::InferenceError(format!(
+            "Nemotron RNNT argmax expected rank-1 logits, got shape {:?}",
+            x.shape().dims()
+        )));
+    }
+    if x.device().is_cuda() {
+        return argmax_1d_device(x);
+    }
+
+    argmax_1d_host(x)
+}
+
+fn argmax_1d_device(x: &Tensor) -> Result<usize> {
+    let idx = x.argmax(D::Minus1)?;
+    let idx = if idx.rank() == 0 {
+        idx
+    } else {
+        idx.squeeze(0)?
+    };
+    Ok(idx.to_dtype(DType::U32)?.to_scalar::<u32>()? as usize)
+}
+
+fn argmax_1d_host(x: &Tensor) -> Result<usize> {
+    let x = x.to_dtype(DType::F32)?;
     let v = x.to_vec1::<f32>()?;
     let mut best_idx = 0usize;
     let mut best_val = f32::NEG_INFINITY;
@@ -1126,5 +1151,22 @@ mod tests {
             FeatureNormalize::from_config(Some("per_feature")),
             FeatureNormalize::PerFeature
         );
+    }
+
+    #[test]
+    fn argmax_1d_selects_max_from_rank1_logits() {
+        let logits =
+            Tensor::from_vec(vec![0.1f32, 3.2, -4.0, 2.7], 4, &Device::Cpu).expect("logits");
+
+        assert_eq!(argmax_1d(&logits).expect("argmax"), 1);
+    }
+
+    #[test]
+    fn argmax_1d_rejects_non_vector_logits() {
+        let logits =
+            Tensor::from_vec(vec![0.1f32; 8], (2, 4), &Device::Cpu).expect("batched logits");
+        let err = argmax_1d(&logits).expect_err("rank-2 logits should fail");
+
+        assert!(err.to_string().contains("expected rank-1 logits"));
     }
 }
