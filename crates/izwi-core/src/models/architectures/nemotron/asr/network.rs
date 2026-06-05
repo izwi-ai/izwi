@@ -505,6 +505,21 @@ pub(super) struct NemotronStreamingFeatureChunk {
     pub is_final: bool,
 }
 
+pub(super) struct NemotronStreamingPreEncodeState {
+    features: Option<Tensor>,
+    feature_frames: usize,
+    emitted_encoded_frames: usize,
+    input_finished: bool,
+}
+
+pub(super) struct NemotronStreamingEncodedChunk {
+    pub encoded: Tensor,
+    pub start_frame: usize,
+    pub frames: usize,
+    pub total_stable_frames: usize,
+    pub is_final: bool,
+}
+
 impl NemotronStreamingFeatureState {
     pub(super) fn new() -> Self {
         Self {
@@ -555,6 +570,50 @@ impl NemotronStreamingFeatureState {
             return 0;
         }
         ((self.preemphasized.len() - center_pad) / HOP_LENGTH) + 1
+    }
+}
+
+impl NemotronStreamingPreEncodeState {
+    pub(super) fn new() -> Self {
+        Self {
+            features: None,
+            feature_frames: 0,
+            emitted_encoded_frames: 0,
+            input_finished: false,
+        }
+    }
+
+    pub(super) fn push_features(
+        &mut self,
+        chunk: NemotronStreamingFeatureChunk,
+    ) -> Result<()> {
+        if self.input_finished {
+            return Err(Error::InvalidInput(
+                "Cannot push features into a finalized Nemotron pre-encode stream".to_string(),
+            ));
+        }
+        if chunk.start_frame != self.feature_frames {
+            return Err(Error::InvalidInput(format!(
+                "Nemotron feature stream expected start frame {}, got {}",
+                self.feature_frames, chunk.start_frame
+            )));
+        }
+        if chunk.frames == 0 {
+            return Ok(());
+        }
+
+        self.features = Some(if let Some(existing) = self.features.as_ref() {
+            Tensor::cat(&[existing, &chunk.features], 2)?
+        } else {
+            chunk.features
+        });
+        self.feature_frames = self.feature_frames.saturating_add(chunk.frames);
+        self.input_finished = chunk.is_final;
+        Ok(())
+    }
+
+    pub(super) fn finish_input(&mut self) {
+        self.input_finished = true;
     }
 }
 
@@ -864,6 +923,46 @@ impl ConvSubsamplingDw {
         let encoded_len = subsampled_len_3x(feature_frames).min(t).max(1);
         Ok((x, encoded_len))
     }
+
+    pub(super) fn forward_streaming_chunk(
+        &self,
+        state: &mut NemotronStreamingPreEncodeState,
+    ) -> Result<Option<NemotronStreamingEncodedChunk>> {
+        let Some(features) = state.features.as_ref() else {
+            return Ok(None);
+        };
+        if state.feature_frames == 0 {
+            return Ok(None);
+        }
+
+        let stable_frames = if state.input_finished {
+            subsampled_len_3x(state.feature_frames)
+        } else {
+            stable_subsampled_len_3x(state.feature_frames)
+        };
+        if stable_frames <= state.emitted_encoded_frames {
+            return Ok(None);
+        }
+
+        let (encoded, encoded_len) = self.forward(features, state.feature_frames)?;
+        let stable_frames = stable_frames.min(encoded_len);
+        if stable_frames <= state.emitted_encoded_frames {
+            return Ok(None);
+        }
+
+        let start_frame = state.emitted_encoded_frames;
+        let frames = stable_frames - start_frame;
+        let encoded = encoded.narrow(1, start_frame, frames)?.contiguous()?;
+        state.emitted_encoded_frames = stable_frames;
+
+        Ok(Some(NemotronStreamingEncodedChunk {
+            encoded,
+            start_frame,
+            frames,
+            total_stable_frames: stable_frames,
+            is_final: state.input_finished && stable_frames == encoded_len,
+        }))
+    }
 }
 
 fn load_subsampling_out_projection(vb: VarBuilder) -> Result<(Linear, usize)> {
@@ -887,6 +986,13 @@ fn subsampled_len_3x(mut len: usize) -> usize {
         len = len.div_ceil(2);
     }
     len
+}
+
+fn stable_subsampled_len_3x(feature_frames: usize) -> usize {
+    if feature_frames < SUBSAMPLING_FACTOR {
+        return 0;
+    }
+    ((feature_frames - SUBSAMPLING_FACTOR) / SUBSAMPLING_FACTOR) + 1
 }
 
 struct ConformerLayer {
@@ -1592,6 +1698,92 @@ mod tests {
         }
     }
 
+    fn zero_subsampling() -> ConvSubsamplingDw {
+        let device = Device::Cpu;
+        let stride_cfg = Conv2dConfig {
+            stride: 2,
+            padding: 1,
+            ..Default::default()
+        };
+        let mut dw_stride_cfg = stride_cfg;
+        dw_stride_cfg.groups = CONV_SUB_CHANNELS;
+        let point_cfg = Conv2dConfig {
+            stride: 1,
+            padding: 0,
+            ..Default::default()
+        };
+        let conv0 = Conv2d::new(
+            Tensor::zeros((CONV_SUB_CHANNELS, 1, 3, 3), DType::F32, &device).unwrap(),
+            None,
+            stride_cfg,
+        );
+        let conv2 = Conv2d::new(
+            Tensor::zeros((CONV_SUB_CHANNELS, 1, 3, 3), DType::F32, &device).unwrap(),
+            None,
+            dw_stride_cfg,
+        );
+        let conv3 = Conv2d::new(
+            Tensor::zeros(
+                (CONV_SUB_CHANNELS, CONV_SUB_CHANNELS, 1, 1),
+                DType::F32,
+                &device,
+            )
+            .unwrap(),
+            None,
+            point_cfg,
+        );
+        let conv5 = Conv2d::new(
+            Tensor::zeros((CONV_SUB_CHANNELS, 1, 3, 3), DType::F32, &device).unwrap(),
+            None,
+            dw_stride_cfg,
+        );
+        let conv6 = Conv2d::new(
+            Tensor::zeros(
+                (CONV_SUB_CHANNELS, CONV_SUB_CHANNELS, 1, 1),
+                DType::F32,
+                &device,
+            )
+            .unwrap(),
+            None,
+            point_cfg,
+        );
+        let out_feature_bins = 16;
+        let out = Linear::new(
+            Tensor::zeros(
+                (ENCODER_DIM, CONV_SUB_CHANNELS * out_feature_bins),
+                DType::F32,
+                &device,
+            )
+            .unwrap(),
+            Some(Tensor::zeros(ENCODER_DIM, DType::F32, &device).unwrap()),
+        );
+
+        ConvSubsamplingDw {
+            conv0,
+            conv2,
+            conv3,
+            conv5,
+            conv6,
+            out,
+            out_feature_bins,
+        }
+    }
+
+    fn feature_chunk(
+        features: &Tensor,
+        start_frame: usize,
+        frames: usize,
+        is_final: bool,
+    ) -> NemotronStreamingFeatureChunk {
+        NemotronStreamingFeatureChunk {
+            features: features.narrow(2, start_frame, frames).unwrap(),
+            start_frame,
+            frames,
+            total_ready_frames: start_frame + frames,
+            is_final,
+        }
+    }
+
     fn assert_tensor_close(lhs: &Tensor, rhs: &Tensor, tolerance: f32) {
         assert_eq!(lhs.dims(), rhs.dims());
         let lhs = lhs.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -1619,6 +1811,16 @@ mod tests {
         assert_eq!(subsampled_len_3x(8), 1);
         assert_eq!(subsampled_len_3x(9), 2);
         assert_eq!(subsampled_len_3x(100), 13);
+    }
+
+    #[test]
+    fn stable_subsampled_length_waits_for_full_stride_receptive_field() {
+        assert_eq!(stable_subsampled_len_3x(0), 0);
+        assert_eq!(stable_subsampled_len_3x(7), 0);
+        assert_eq!(stable_subsampled_len_3x(8), 1);
+        assert_eq!(stable_subsampled_len_3x(15), 1);
+        assert_eq!(stable_subsampled_len_3x(16), 2);
+        assert_eq!(stable_subsampled_len_3x(41), 5);
     }
 
     #[test]
@@ -1773,6 +1975,75 @@ mod tests {
 
         let err = state.push_samples(&[0.0]).unwrap_err();
         assert!(err.to_string().contains("finalized"));
+    }
+
+    #[test]
+    fn streaming_pre_encode_delays_tail_and_matches_full_output() {
+        let subsampling = zero_subsampling();
+        let device = Device::Cpu;
+        let feature_frames = 41usize;
+        let values = (0..(N_MELS * feature_frames))
+            .map(|idx| (idx as f32) / 1000.0)
+            .collect::<Vec<_>>();
+        let features = Tensor::from_vec(values, (1, N_MELS, feature_frames), &device).unwrap();
+        let (full, encoded_len) = subsampling.forward(&features, feature_frames).unwrap();
+
+        let mut state = NemotronStreamingPreEncodeState::new();
+        state
+            .push_features(feature_chunk(&features, 0, 7, false))
+            .unwrap();
+        assert!(subsampling
+            .forward_streaming_chunk(&mut state)
+            .unwrap()
+            .is_none());
+
+        state
+            .push_features(feature_chunk(&features, 7, 1, false))
+            .unwrap();
+        let first = subsampling
+            .forward_streaming_chunk(&mut state)
+            .unwrap()
+            .expect("first stable encoded frame");
+        assert_eq!(first.start_frame, 0);
+        assert_eq!(first.frames, 1);
+        assert_eq!(first.total_stable_frames, 1);
+        assert!(!first.is_final);
+
+        state
+            .push_features(feature_chunk(&features, 8, 24, false))
+            .unwrap();
+        let middle = subsampling
+            .forward_streaming_chunk(&mut state)
+            .unwrap()
+            .expect("middle stable frames");
+        assert_eq!(middle.start_frame, 1);
+        assert_eq!(middle.total_stable_frames, 4);
+
+        state
+            .push_features(feature_chunk(&features, 32, 9, false))
+            .unwrap();
+        state.finish_input();
+        let tail = subsampling
+            .forward_streaming_chunk(&mut state)
+            .unwrap()
+            .expect("final tail frames");
+        assert!(tail.is_final);
+        assert_eq!(tail.total_stable_frames, encoded_len);
+
+        let streamed = Tensor::cat(&[&first.encoded, &middle.encoded, &tail.encoded], 1).unwrap();
+        let full = full.narrow(1, 0, encoded_len).unwrap();
+        assert_tensor_close(&streamed, &full, 0.0);
+    }
+
+    #[test]
+    fn streaming_pre_encode_rejects_out_of_order_features() {
+        let features = Tensor::zeros((1, N_MELS, 2), DType::F32, &Device::Cpu).unwrap();
+        let mut state = NemotronStreamingPreEncodeState::new();
+
+        let err = state
+            .push_features(feature_chunk(&features, 1, 1, false))
+            .unwrap_err();
+        assert!(err.to_string().contains("expected start frame 0"));
     }
 
     #[test]
