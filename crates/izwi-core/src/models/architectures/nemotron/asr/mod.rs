@@ -6,6 +6,7 @@ mod network;
 
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
@@ -471,6 +472,25 @@ struct NemotronDecodeRequest {
     prompt: NemotronPromptCondition,
 }
 
+#[derive(Debug, Clone, Default)]
+struct NemotronStageTimings {
+    resample: Duration,
+    encode: Duration,
+    rnnt_decode: Duration,
+    text_assembly: Duration,
+}
+
+impl NemotronStageTimings {
+    fn diagnostics(&self) -> serde_json::Value {
+        json!({
+            "resample_ms": duration_ms(self.resample),
+            "encode_ms": duration_ms(self.encode),
+            "rnnt_decode_ms": duration_ms(self.rnnt_decode),
+            "text_assembly_ms": duration_ms(self.text_assembly),
+        })
+    }
+}
+
 impl NemotronDecodeRequest {
     fn diagnostics(&self) -> serde_json::Value {
         json!({
@@ -541,8 +561,9 @@ impl NemotronAsrModel {
         sample_rate: u32,
         language: Option<&str>,
     ) -> Result<String> {
-        let mut no_op = |_delta: &str| {};
-        self.transcribe_with_callback_and_prompt(audio, sample_rate, language, None, &mut no_op)
+        let request = self.prepare_decode_request(audio, sample_rate, language, None)?;
+        let output = self.decode_offline_final(audio, &request)?;
+        Ok(output.text)
     }
 
     pub fn transcribe_with_callback(
@@ -576,8 +597,7 @@ impl NemotronAsrModel {
         prompt: Option<&str>,
     ) -> Result<NemotronAsrTranscriptionOutput> {
         let request = self.prepare_decode_request(audio, sample_rate, language, prompt)?;
-        let mut no_op = |_delta: &str| {};
-        self.decode_offline(audio, &request, &mut no_op)
+        self.decode_offline_final(audio, &request)
     }
 
     pub fn max_audio_seconds_hint(&self) -> Option<f32> {
@@ -674,51 +694,129 @@ impl NemotronAsrModel {
         request: &NemotronDecodeRequest,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<NemotronAsrTranscriptionOutput> {
+        let mut timings = NemotronStageTimings::default();
+        let resample_start = Instant::now();
         let audio_16khz = if request.input_sample_rate == request.target_sample_rate {
             audio.to_vec()
         } else {
             resample_linear(audio, request.input_sample_rate, request.target_sample_rate)
         };
+        timings.resample = resample_start.elapsed();
         let prompt_id = self.network.prompt_id(&request.prompt.target_lang)?;
+        let encode_start = Instant::now();
         let (encoded, encoded_len) = self.network.encode_with_prompt(&audio_16khz, prompt_id)?;
+        timings.encode = encode_start.elapsed();
 
         let mut token_ids = Vec::<usize>::new();
         let mut assembled = String::new();
-        let mut on_token = |token_id: usize| {
-            token_ids.push(token_id);
-            let decoded = self.decoder.decode(&token_ids);
-            let delta = text_delta(&assembled, &decoded);
-            if !delta.is_empty() {
-                on_delta(delta.as_str());
-            }
-            assembled = decoded;
+        let decoded = {
+            let mut on_token = |token_id: usize| {
+                token_ids.push(token_id);
+                let text_start = Instant::now();
+                let decoded = self.decoder.decode(&token_ids);
+                let delta = text_delta(&assembled, &decoded);
+                if !delta.is_empty() {
+                    on_delta(delta.as_str());
+                }
+                assembled = decoded;
+                timings.text_assembly += text_start.elapsed();
+            };
+            let decode_start = Instant::now();
+            let decoded = self
+                .network
+                .decode_rnnt_greedy(&encoded, encoded_len, &mut on_token)?;
+            timings.rnnt_decode = decode_start.elapsed();
+            decoded
         };
-        let decoded = self
-            .network
-            .decode_rnnt_greedy(&encoded, encoded_len, &mut on_token)?;
         if assembled.is_empty() {
+            let text_start = Instant::now();
             assembled = self.decoder.decode(&decoded.token_ids);
+            timings.text_assembly += text_start.elapsed();
         }
 
-        Ok(NemotronAsrTranscriptionOutput {
-            text: assembled,
+        Ok(self.build_decode_output(
+            assembled,
+            request,
+            prompt_id,
+            audio_16khz.len(),
+            decoded,
+            timings,
+            "callback_delta",
+        ))
+    }
+
+    fn decode_offline_final(
+        &self,
+        audio: &[f32],
+        request: &NemotronDecodeRequest,
+    ) -> Result<NemotronAsrTranscriptionOutput> {
+        let mut timings = NemotronStageTimings::default();
+        let resample_start = Instant::now();
+        let audio_16khz = if request.input_sample_rate == request.target_sample_rate {
+            audio.to_vec()
+        } else {
+            resample_linear(audio, request.input_sample_rate, request.target_sample_rate)
+        };
+        timings.resample = resample_start.elapsed();
+
+        let prompt_id = self.network.prompt_id(&request.prompt.target_lang)?;
+        let encode_start = Instant::now();
+        let (encoded, encoded_len) = self.network.encode_with_prompt(&audio_16khz, prompt_id)?;
+        timings.encode = encode_start.elapsed();
+
+        let mut no_op = |_token_id: usize| {};
+        let decode_start = Instant::now();
+        let decoded = self
+            .network
+            .decode_rnnt_greedy(&encoded, encoded_len, &mut no_op)?;
+        timings.rnnt_decode = decode_start.elapsed();
+
+        let text_start = Instant::now();
+        let assembled = self.decoder.decode(&decoded.token_ids);
+        timings.text_assembly = text_start.elapsed();
+
+        Ok(self.build_decode_output(
+            assembled,
+            request,
+            prompt_id,
+            audio_16khz.len(),
+            decoded,
+            timings,
+            "final_only",
+        ))
+    }
+
+    fn build_decode_output(
+        &self,
+        text: String,
+        request: &NemotronDecodeRequest,
+        prompt_id: usize,
+        resampled_samples: usize,
+        decoded: network::NemotronDecodedTokens,
+        timings: NemotronStageTimings,
+        decode_mode: &'static str,
+    ) -> NemotronAsrTranscriptionOutput {
+        NemotronAsrTranscriptionOutput {
+            text,
             language: Some(request.prompt.target_lang.clone()),
             diagnostics: Some(json!({
                 "audio": {
                     "input_sample_rate": request.input_sample_rate,
                     "target_sample_rate": request.target_sample_rate,
                     "input_samples": request.samples,
-                    "resampled_samples": audio_16khz.len(),
+                    "resampled_samples": resampled_samples,
                 },
                 "prompt": request.prompt.diagnostics(),
                 "prompt_id": prompt_id,
                 "blank_id": self.network.blank_idx(),
                 "dtype_plan": nemotron_dtype_diagnostics(&self.dtype_selection, &self.device_profile, self.network.dtype()),
                 "native_forward_status": "enabled_offline_fastconformer_rnnt",
+                "decode_mode": decode_mode,
                 "decode": decoded.stats.diagnostics(),
+                "timings_ms": timings.diagnostics(),
                 "supports_realtime_cache_decode": false,
             })),
-        })
+        }
     }
 }
 
@@ -1026,6 +1124,10 @@ fn ms_to_samples(ms: usize, sample_rate: u32) -> usize {
     ((sample_rate as usize).saturating_mul(ms)) / 1000
 }
 
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1123,6 +1225,22 @@ mod tests {
 
         let err = select_nemotron_asr_dtype(&cuda, Some("float8")).unwrap_err();
         assert!(err.to_string().contains("expected one of"));
+    }
+
+    #[test]
+    fn stage_timings_diagnostics_report_milliseconds() {
+        let timings = NemotronStageTimings {
+            resample: Duration::from_micros(1_500),
+            encode: Duration::from_millis(2),
+            rnnt_decode: Duration::from_micros(3_250),
+            text_assembly: Duration::from_millis(4),
+        };
+        let diagnostics = timings.diagnostics();
+
+        assert_eq!(diagnostics["resample_ms"], 1.5);
+        assert_eq!(diagnostics["encode_ms"], 2.0);
+        assert_eq!(diagnostics["rnnt_decode_ms"], 3.25);
+        assert_eq!(diagnostics["text_assembly_ms"], 4.0);
     }
 
     #[test]
