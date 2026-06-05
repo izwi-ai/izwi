@@ -34,6 +34,7 @@ export const TRANSCRIPTION_PREFERRED_MODELS = [
   "Qwen3-ASR-1.7B-GGUF",
   "Parakeet-TDT-0.6B-v3",
   "Whisper-Large-v3-Turbo",
+  "Nemotron-3.5-ASR-Streaming-0.6B",
 ] as const;
 
 export const DIARIZATION_PREFERRED_MODELS = [

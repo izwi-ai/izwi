@@ -35,6 +35,19 @@ describe("speech route model filters", () => {
     ).toBe(true);
   });
 
+  it("includes nemotron asr on transcription routes", () => {
+    expect(
+      VIEW_CONFIGS.transcription.modelFilter(
+        "Nemotron-3.5-ASR-Streaming-0.6B",
+      ),
+    ).toBe(true);
+    expect(
+      VIEW_CONFIGS.transcription.modelFilter(
+        "nvidia/nemotron-3.5-asr-streaming-0.6b",
+      ),
+    ).toBe(true);
+  });
+
   it("includes lfm25 audio on transcription routes", () => {
     expect(VIEW_CONFIGS.transcription.modelFilter("LFM2.5-Audio-1.5B-GGUF")).toBe(
       true,

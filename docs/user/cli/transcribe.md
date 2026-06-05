@@ -141,6 +141,7 @@ the option.
 | `Whisper-Large-v3-Turbo` | 1.5 GB | Medium | Strong multilingual baseline |
 | `Qwen3-ASR-0.6B-GGUF` | 1.0 GB | Fast | Good |
 | `Qwen3-ASR-1.7B-GGUF` | 2.5 GB | Medium | Better |
+| `Nemotron-3.5-ASR-Streaming-0.6B` | 2.37 GB | Medium | 40-locale NVIDIA FastConformer-RNNT; native forward path pending final weight-map work |
 | `Voxtral-Mini-4B-Realtime-2602` | 8 GB | Medium | Rust/Candle offline transcription; realtime planned |
 
 ---

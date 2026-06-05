@@ -65,6 +65,15 @@ function isVibeVoiceAsrVariant(variant: string): boolean {
   );
 }
 
+function isNemotronAsrVariant(variant: string): boolean {
+  const normalized = variant.trim().toLowerCase();
+  return (
+    normalized === "nemotron-3.5-asr-streaming-0.6b" ||
+    normalized === "nvidia/nemotron-3.5-asr-streaming-0.6b" ||
+    normalized === "nemotron 3.5 asr streaming 0.6b"
+  );
+}
+
 function isQwenAsrVariant(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   return (
@@ -137,10 +146,11 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     id: "transcription",
     label: "Transcription",
     description:
-      "Speech-to-text with Qwen3-ASR, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, and LFM2.5 Audio models",
+      "Speech-to-text with Qwen3-ASR, Nemotron ASR, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, and LFM2.5 Audio models",
     icon: "FileText",
     modelFilter: (variant) =>
       isQwenAsrVariant(variant) ||
+      isNemotronAsrVariant(variant) ||
       isVibeVoiceAsrVariant(variant) ||
       variant.includes("Whisper-Large-v3-Turbo") ||
       variant.includes("Parakeet-TDT") ||
@@ -148,7 +158,7 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
       isLfm25AudioVariant(variant),
     emptyStateTitle: "No ASR Model Loaded",
     emptyStateDescription:
-      "Download and load a Qwen3-ASR, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, or LFM2.5 Audio model for speech transcription",
+      "Download and load a Qwen3-ASR, Nemotron ASR, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, or LFM2.5 Audio model for speech transcription",
   },
   chat: {
     id: "chat",
