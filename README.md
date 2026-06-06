@@ -4,196 +4,133 @@
 
 <h1 align="center">Izwi</h1>
 
-<p align="center"><strong>Local-first audio inference engine for TTS, ASR, and voice AI workflows.</strong></p>
+<p align="center"><strong>Local-first voice AI for speech, chat, and audio workflows.</strong></p>
 
 <p align="center">
-  <a href="https://izwiai.com">Website</a> •
-  <a href="https://izwiai.com/docs">Documentation</a> •
-  <a href="https://github.com/izwi-ai/izwi/releases">Releases</a> •
-  <a href="https://izwiai.com/docs/getting-started">Getting Started</a>
+  <a href="https://izwiai.com">Website</a> -
+  <a href="https://izwiai.com/docs">Documentation</a> -
+  <a href="https://github.com/izwi-ai/izwi/releases">Releases</a> -
+  <a href="https://github.com/izwi-ai/izwi/issues">Issues</a>
 </p>
 
 <p align="center">
-  <img src="images/screenshot.png" alt="Izwi Screenshot" width="800" />
+  <img src="images/screenshot.png" alt="Izwi app screenshot" width="800" />
 </p>
 
----
+Izwi is a desktop app, web UI, CLI, and local inference server for voice AI.
+It runs on your machine and exposes both product workflows and OpenAI-compatible
+API routes without requiring cloud services or API keys.
 
-## Overview
+## What It Does
 
-Izwi is a privacy-focused audio AI platform that runs entirely on your machine. No cloud services, no API keys, no data leaving your device.
+- Real-time voice conversations with local ASR, chat, and TTS models.
+- Text-to-speech, long-form Studio projects, voice cloning, voice design, and
+  saved voices.
+- Transcription, speaker diarization, forced alignment, and realtime speech-to-text.
+- Local chat, model download/load/unload/delete, history, exports, and settings.
+- OpenAI-compatible `/v1` APIs for models, chat completions, audio speech,
+  audio transcriptions, and preview Responses support.
 
-**Core capabilities:**
+Inference data stays local. Optional anonymous desktop analytics are disabled
+unless a user explicitly opts in, and they do not send prompts, transcripts,
+audio payloads, local paths, or personal identifiers.
 
-- **Voice Mode** — Real-time voice conversations with AI
-- **Text-to-Speech** — Generate natural speech from text
-- **Studio** — Build long-form TTS projects and exports
-- **Speech Recognition** — Convert audio to text with high accuracy
-- **Speaker Diarization** — Identify and separate multiple speakers
-- **Voice Cloning** — Clone any voice from a short audio sample
-- **Voice Design** — Create custom voices from text descriptions
-- **Forced Alignment** — Word-level audio-text alignment
-- **Chat** — Text-based AI conversations
+## Install
 
-The server exposes OpenAI-compatible API routes under `/v1`. When the server is
-running, the local Scalar API reference is available at
-`http://localhost:8080/docs`, and the raw OpenAPI document is available at
-`http://localhost:8080/openapi.json`. Scalar includes navigation entries for
-preview first-party, operator, and realtime route families; detailed guidance is
-documented in the [API Reference](https://izwiai.com/docs/api).
+Download the latest build from
+[GitHub Releases](https://github.com/izwi-ai/izwi/releases).
 
-## Runtime Support Matrix
+- **macOS:** install the `.dmg`, drag `Izwi.app` to Applications, then launch
+  it.
+- **Linux:** install the `.deb` package with `sudo dpkg -i izwi_*.deb`.
+- **Windows:** run the `.exe` installer.
 
-Backend support depends on both the host and the artifact you install.
+Runtime support depends on the artifact:
 
-- macOS on Apple Silicon: Metal is the recommended and stable GPU path.
-- Linux and Windows GitHub Release artifacts: public commands remain `izwi` / `izwi-server` and their Windows `.exe` counterparts, and are intentionally CPU-only.
-- Source builds: CUDA is supported when you build with `--features cuda` on a compatible NVIDIA host.
-- Docker CUDA profile: the CUDA distribution path for NVIDIA Linux hosts; when building on a machine without `nvidia-smi`, set `CUDA_COMPUTE_CAP` for the target GPU architecture.
+- macOS Apple Silicon release builds use Metal.
+- Linux and Windows release builds are CPU-only.
+- CUDA is supported through the Docker CUDA profile or source builds on
+  compatible NVIDIA hosts.
 
-See the full [Runtime Support Matrix](https://izwiai.com/docs/support-matrix).
-
----
-
-## Quick Install
-
-### macOS
-
-Download the latest `.dmg` from [GitHub Releases](https://github.com/izwi-ai/izwi/releases):
-
-1. Open the `.dmg` file
-2. Drag **Izwi.app** to Applications
-3. Launch Izwi
-
-### Linux
-
-```bash
-wget https://github.com/izwi-ai/izwi/releases/latest/download/izwi_amd64.deb
-sudo dpkg -i izwi_amd64.deb
-```
-
-### Windows
-
-Download and run the installer from [GitHub Releases](https://github.com/izwi-ai/izwi/releases).
-
-> **Full installation guides:** [macOS](https://izwiai.com/docs/installation/macos) • [Linux](https://izwiai.com/docs/installation/linux) • [Windows](https://izwiai.com/docs/installation/windows) • [From Source](https://izwiai.com/docs/installation/from-source)
-
----
+See the [Runtime Support Matrix](https://izwiai.com/docs/support-matrix) for
+the full contract.
 
 ## Quick Start
 
-### 1. Start the server
+Start the local server and web UI:
+
+```bash
+izwi serve --mode web
+```
+
+Server-only and desktop modes are also available:
 
 ```bash
 izwi serve
+izwi serve --mode desktop
 ```
 
-Open `http://localhost:8080` in your browser.
-
-API users can also open `http://localhost:8080/docs` for the local Scalar API
-reference.
-
-### 2. Download a model
+Download a model and generate speech:
 
 ```bash
 izwi pull Qwen3-TTS-12Hz-0.6B-Base
+izwi tts "Hello from Izwi." --output hello.wav
 ```
 
-### 3. Generate speech
-
-```bash
-izwi tts "Hello from Izwi!" --output hello.wav
-```
-
-### 4. Transcribe audio
+Transcribe audio:
 
 ```bash
 izwi pull Parakeet-TDT-0.6B-v3
-izwi transcribe audio.wav
+izwi transcribe audio.wav --model Parakeet-TDT-0.6B-v3
 ```
 
-Long-form ASR is handled automatically: Izwi now chunks long recordings,
-stitches overlapping transcripts, and returns a full transcript instead of
-only the first model window.
+Open the app at `http://localhost:8080`. The local API reference is available
+at `http://localhost:8080/docs`, and the raw OpenAPI document is available at
+`http://localhost:8080/openapi.json`.
 
-Optional tuning knobs:
+## Model Families
+
+Run `izwi list` to see the enabled catalog. Current families include:
+
+- **TTS:** Qwen3-TTS, Kokoro-82M, Voxtral TTS, and VibeVoice.
+- **ASR:** Parakeet, Whisper, Qwen3-ASR, Nemotron 3.5 ASR, VibeVoice ASR,
+  LFM2.5 Audio, and Voxtral Mini.
+- **Diarization and alignment:** Sortformer diarization and Qwen3 ForcedAligner.
+- **Chat:** Qwen3, Qwen3.5, LFM2.5, and Gemma.
+
+Some model weights and bundled assets have their own licenses or access terms.
+Check the [Models Guide](https://izwiai.com/docs/models) before redistribution
+or commercial use of downloaded model artifacts.
+
+## Build From Source
+
+For CLI/server installs, use the project install script:
 
 ```bash
-IZWI_ASR_CHUNK_TARGET_SECS=24
-IZWI_ASR_CHUNK_MAX_SECS=30
-IZWI_ASR_CHUNK_OVERLAP_SECS=3
-# Optional: preload models at server startup to reduce first-request cold latency.
-# Comma-separated model IDs (for example Whisper-Large-v3-Turbo,Qwen3.5-4B)
-IZWI_PRELOAD_MODELS=Whisper-Large-v3-Turbo
-# Optional: run a short synthetic ASR warmup after preloading (enabled by default).
-IZWI_WARMUP_PRELOADED_MODELS=1
-IZWI_ASR_WARMUP_DURATION_MS=800
-# Optional: tune text streaming queue depth when using per-character ASR streaming.
-IZWI_STREAM_TEXT_QUEUE_CAPACITY=4096
+./scripts/install-cli.sh
 ```
 
----
-
-## Anonymous Analytics (Desktop)
-
-Izwi desktop supports optional, opt-in anonymous usage analytics powered by Aptabase.
-
-- Disabled by default until users explicitly opt in.
-- Can be enabled during onboarding or later in **Settings**.
-- Users can opt out at any time.
-- No prompts, transcripts, audio payloads, local paths, or personal identifiers are sent.
-
-To enable analytics transport in the desktop shell, set the app key in the runtime environment:
+For manual builds, scope Cargo to the binaries you need:
 
 ```bash
-APTABASE_APP_KEY=A-US-XXXXXXXXXXXXXXX
+cargo build --release -p izwi-cli
+cargo build --release -p izwi-server
 ```
 
-Use the exact key from Aptabase (for example `A-US-...` or `A-EU-...`).
-
-Without this variable, analytics calls are treated as no-op events.
-
----
-
-## Supported Models
-
-| Category | Models |
-|----------|--------|
-| **TTS** | Qwen3-TTS 12Hz (0.6B Base/CustomVoice, 1.7B Base/CustomVoice/VoiceDesign), Kokoro-82M |
-| **ASR** | Qwen3-ASR GGUF (0.6B, 1.7B), Parakeet-TDT-0.6B-v3, Whisper-Large-v3-Turbo |
-| **Diarization** | Sortformer 4-speaker |
-| **Chat** | Qwen3 GGUF (0.6B, 1.7B, 4B, 8B), Qwen3.5 GGUF (0.8B, 2B, 4B, 9B), LFM2.5 (1.2B Instruct/Thinking GGUF), Gemma 3 (1B) |
-| **Audio** | LFM2.5-Audio-1.5B-GGUF |
-| **Alignment** | Qwen3-ForcedAligner-0.6B (full, 4-bit) |
-
-Run `izwi list` to see all available models.
-
-> **Full model documentation:** [Models Guide](https://izwiai.com/docs/models)
-
----
+CUDA source builds require the matching CUDA toolkit and Cargo features for the
+target host. See [From Source](https://izwiai.com/docs/installation/from-source)
+for platform-specific setup.
 
 ## Documentation
 
-| Resource | Link |
-|----------|------|
-| **Getting Started** | [izwiai.com/docs/getting-started](https://izwiai.com/docs/getting-started) |
-| **Installation** | [izwiai.com/docs/installation](https://izwiai.com/docs/installation) |
-| **Features** | [izwiai.com/docs/features](https://izwiai.com/docs/features) |
-| **CLI Reference** | [izwiai.com/docs/cli](https://izwiai.com/docs/cli) |
-| **API Reference** | [izwiai.com/docs/api](https://izwiai.com/docs/api) |
-| **Models** | [izwiai.com/docs/models](https://izwiai.com/docs/models) |
-| **Local OpenAPI Reference** | `http://localhost:8080/docs` when `izwi serve` is running |
-| **Troubleshooting** | [izwiai.com/docs/troubleshooting](https://izwiai.com/docs/troubleshooting) |
-
----
+- [Getting Started](https://izwiai.com/docs/getting-started)
+- [Installation](https://izwiai.com/docs/installation)
+- [Features](https://izwiai.com/docs/features)
+- [CLI Reference](https://izwiai.com/docs/cli)
+- [API Reference](https://izwiai.com/docs/api)
+- [Models](https://izwiai.com/docs/models)
+- [Troubleshooting](https://izwiai.com/docs/troubleshooting)
 
 ## License
 
-Apache 2.0
-
-## Acknowledgments
-
-- [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) by Alibaba
-- [Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) by NVIDIA
-- [Gemma](https://ai.google.dev/gemma) by Google
-- [HuggingFace Hub](https://huggingface.co/) for model hosting
+Izwi is licensed under the [MIT License](LICENSE).
