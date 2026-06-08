@@ -21,6 +21,33 @@ const hookMocks = vi.hoisted(() => ({
   useRouteModelSelection: vi.fn(),
 }));
 
+const componentMocks = vi.hoisted(() => ({
+  routeModelModal: vi.fn(
+    ({
+      isOpen,
+      title,
+      zIndexClassName,
+      onClose,
+    }: {
+      isOpen: boolean;
+      title: string;
+      zIndexClassName?: string;
+      onClose: () => void;
+    }) =>
+      isOpen ? (
+        <div
+          data-testid="route-model-modal"
+          data-z-index={zIndexClassName ?? ""}
+        >
+          {title}
+          <button type="button" onClick={onClose}>
+            Close model modal
+          </button>
+        </div>
+      ) : null,
+  ),
+}));
+
 vi.mock("@/api", () => ({
   api: {
     listTextToSpeechRecords: apiMocks.listTextToSpeechRecords,
@@ -40,7 +67,7 @@ vi.mock("@/features/models/hooks/useRouteModelSelection", () => ({
 }));
 
 vi.mock("@/features/models/components/RouteModelModal", () => ({
-  RouteModelModal: () => null,
+  RouteModelModal: componentMocks.routeModelModal,
 }));
 
 const baseProps = {
@@ -180,6 +207,7 @@ describe("TextToSpeechPage", () => {
     apiMocks.listSavedVoices.mockReset();
     apiMocks.downloadAudioFile.mockReset();
     hookMocks.useRouteModelSelection.mockReset();
+    componentMocks.routeModelModal.mockClear();
 
     apiMocks.listTextToSpeechRecords.mockResolvedValue([]);
     apiMocks.listTextToSpeechRecordPage.mockImplementation(async () => ({
@@ -700,6 +728,54 @@ describe("TextToSpeechPage", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /Open models/i }));
     expect(openModelManager).toHaveBeenCalledTimes(1);
+  });
+
+  it("raises the model modal above the new generation modal", async () => {
+    const closeModelModal = vi.fn();
+
+    hookMocks.useRouteModelSelection.mockReturnValue({
+      routeModels: [],
+      resolvedSelectedModel: "Qwen3-TTS-12Hz-1.7B-Chat",
+      selectedModelInfo: {
+        variant: "Qwen3-TTS-12Hz-1.7B-Chat",
+        status: "downloaded",
+        speech_capabilities: {
+          supports_builtin_voices: true,
+          supports_reference_voice: false,
+          supports_voice_description: true,
+          supports_streaming: true,
+          supports_speed_control: true,
+        },
+      },
+      selectedModelReady: false,
+      isModelModalOpen: true,
+      intentVariant: null,
+      closeModelModal,
+      openModelManager: vi.fn(),
+      requestModel: vi.fn(),
+    });
+
+    renderRoute("/text-to-speech");
+
+    await waitFor(() =>
+      expect(apiMocks.listTextToSpeechRecords).toHaveBeenCalled(),
+    );
+
+    expect(screen.getByTestId("route-model-modal")).toHaveAttribute(
+      "data-z-index",
+      "z-50",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /New generation/i }));
+    await screen.findByRole("heading", { name: "New text-to-speech job" });
+
+    expect(screen.getByTestId("route-model-modal")).toHaveAttribute(
+      "data-z-index",
+      "z-[70]",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /Close model modal/i }));
+    expect(closeModelModal).toHaveBeenCalledTimes(1);
   });
 
   it("unloads the selected model from the modal readiness action", async () => {

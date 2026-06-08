@@ -32,6 +32,7 @@ interface NewTextToSpeechModalProps {
   selectedModel: string | null;
   selectedModelInfo: ModelInfo | null;
   selectedModelReady: boolean;
+  isModelManagerOpen?: boolean;
   initialSavedVoiceId?: string | null;
   initialSpeaker?: string | null;
   onLoadSelectedModel?: (variant: string) => Promise<void> | void;
@@ -67,6 +68,7 @@ export function NewTextToSpeechModal({
   selectedModel,
   selectedModelInfo,
   selectedModelReady,
+  isModelManagerOpen = false,
   initialSavedVoiceId = null,
   initialSpeaker = null,
   onLoadSelectedModel,
@@ -416,8 +418,29 @@ export function NewTextToSpeechModal({
     : "mt-3 h-9 w-full gap-2";
 
   return (
-    <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-w-[52rem] overflow-hidden border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0">
+    <Dialog
+      open={isOpen}
+      modal={!isModelManagerOpen}
+      onOpenChange={(open) => !open && onClose()}
+    >
+      <DialogContent
+        className="max-w-[52rem] overflow-hidden border-[var(--border-strong)] bg-[var(--bg-surface-0)] p-0"
+        onEscapeKeyDown={(event) => {
+          if (isModelManagerOpen) {
+            event.preventDefault();
+          }
+        }}
+        onPointerDownOutside={(event) => {
+          if (isModelManagerOpen) {
+            event.preventDefault();
+          }
+        }}
+        onInteractOutside={(event) => {
+          if (isModelManagerOpen) {
+            event.preventDefault();
+          }
+        }}
+      >
         <div className="border-b border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-5 py-5 sm:px-6">
           <DialogTitle className="text-xl font-semibold tracking-tight text-[var(--text-primary)]">
             New text-to-speech job
