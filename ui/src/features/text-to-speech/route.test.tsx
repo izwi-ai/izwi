@@ -664,6 +664,44 @@ describe("TextToSpeechPage", () => {
     expect(onLoad).toHaveBeenCalledWith("Qwen3-TTS-12Hz-1.7B-Chat");
   });
 
+  it("opens TTS models from the new generation modal", async () => {
+    const openModelManager = vi.fn();
+
+    hookMocks.useRouteModelSelection.mockReturnValue({
+      routeModels: [],
+      resolvedSelectedModel: "Qwen3-TTS-12Hz-1.7B-Chat",
+      selectedModelInfo: {
+        variant: "Qwen3-TTS-12Hz-1.7B-Chat",
+        status: "downloaded",
+        speech_capabilities: {
+          supports_builtin_voices: true,
+          supports_reference_voice: false,
+          supports_voice_description: true,
+          supports_streaming: true,
+          supports_speed_control: true,
+        },
+      },
+      selectedModelReady: false,
+      isModelModalOpen: false,
+      intentVariant: null,
+      closeModelModal: vi.fn(),
+      openModelManager,
+      requestModel: vi.fn(),
+    });
+
+    renderRoute("/text-to-speech");
+
+    await waitFor(() =>
+      expect(apiMocks.listTextToSpeechRecords).toHaveBeenCalled(),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /New generation/i }));
+    await screen.findByRole("heading", { name: "New text-to-speech job" });
+
+    fireEvent.click(screen.getByRole("button", { name: /Open models/i }));
+    expect(openModelManager).toHaveBeenCalledTimes(1);
+  });
+
   it("unloads the selected model from the modal readiness action", async () => {
     const onUnload = vi.fn();
 
