@@ -36,6 +36,7 @@ interface NewTextToSpeechModalProps {
   initialSpeaker?: string | null;
   onLoadSelectedModel?: (variant: string) => Promise<void> | void;
   onUnloadSelectedModel?: (variant: string) => Promise<void> | void;
+  onOpenModelManager: () => void;
   onModelRequired: () => void;
   onCreated: (record: SpeechHistoryRecord) => Promise<void> | void;
   onStreamingStart?: () => void;
@@ -70,6 +71,7 @@ export function NewTextToSpeechModal({
   initialSpeaker = null,
   onLoadSelectedModel,
   onUnloadSelectedModel,
+  onOpenModelManager,
   onModelRequired,
   onCreated,
   onStreamingStart,
@@ -510,6 +512,16 @@ export function NewTextToSpeechModal({
                     <Loader2 className="h-4 w-4 animate-spin" />
                   ) : null}
                   {modelActionLabel}
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="mt-2 h-9 w-full gap-2"
+                  onClick={onOpenModelManager}
+                  disabled={isSubmitting}
+                >
+                  Open models
                 </Button>
               </div>
 

@@ -465,6 +465,7 @@ export function TextToSpeechPage({
         onUnloadSelectedModel={(variant) => {
           onUnload(variant);
         }}
+        onOpenModelManager={openModelManager}
         onModelRequired={() => {
           requestModel();
           onError(
