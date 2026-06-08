@@ -515,7 +515,7 @@ export function NewTextToSpeechModal({
                 </Button>
                 <Button
                   type="button"
-                  variant="outline"
+                  variant="default"
                   size="sm"
                   className="mt-2 h-9 w-full gap-2"
                   onClick={onOpenModelManager}
