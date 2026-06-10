@@ -274,6 +274,14 @@ pub enum Commands {
         #[arg(short, long)]
         language: Option<String>,
 
+        /// Initial ASR prompt or keyword guidance
+        #[arg(long)]
+        prompt: Option<String>,
+
+        /// Maximum number of ASR decoder tokens to generate
+        #[arg(long)]
+        max_tokens: Option<usize>,
+
         /// Output format
         #[arg(short, long, value_enum, default_value = "text")]
         format: TranscriptFormat,
