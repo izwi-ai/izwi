@@ -2,6 +2,7 @@ export const PROVIDER_ORDER = [
   "Qwen",
   "OpenAI",
   "Microsoft",
+  "IBM",
   "Liquid AI",
   "Google",
   "NVIDIA",
@@ -20,6 +21,12 @@ export function getModelProviderLabel(variant: string): string {
     variant.startsWith("microsoft/VibeVoice-")
   ) {
     return "Microsoft";
+  }
+  if (
+    variant.startsWith("Granite-Speech-") ||
+    variant.startsWith("ibm-granite/granite-speech-")
+  ) {
+    return "IBM";
   }
   if (variant.startsWith("LFM2")) return "Liquid AI";
   if (variant.startsWith("Gemma-")) return "Google";
@@ -370,6 +377,22 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
       "Streaming profiles",
     ],
     size: "2.37 GB",
+  },
+  "Granite-Speech-4.1-2B-Plus": {
+    shortName: "Granite Speech 4.1",
+    fullName: "IBM Granite Speech 4.1 2B Plus",
+    description:
+      "IBM Granite Speech rich transcription model with multilingual ASR, speaker-attributed transcripts, word timestamps, prefix prompting, and keyword biasing",
+    category: "asr",
+    capabilities: [
+      "Transcription",
+      "Speaker attribution",
+      "Word timestamps",
+      "Prefix text",
+      "Keyword biasing",
+      "16 kHz",
+    ],
+    size: "4.22 GB",
   },
   "Qwen3-ForcedAligner-0.6B": {
     shortName: "ForcedAligner 0.6B",

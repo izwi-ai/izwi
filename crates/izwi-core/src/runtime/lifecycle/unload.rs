@@ -23,6 +23,7 @@ impl RuntimeService {
             | ModelFamily::Qwen3Asr
             | ModelFamily::VibeVoiceAsr
             | ModelFamily::NemotronAsr
+            | ModelFamily::GraniteSpeechAsr
             | ModelFamily::Qwen3ForcedAligner => {
                 self.model_registry.unload_asr(variant).await;
             }
