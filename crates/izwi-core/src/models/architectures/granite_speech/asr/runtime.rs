@@ -233,9 +233,15 @@ fn argmax_last_logits(logits: &Tensor) -> Result<u32> {
     let last = match logits.dims() {
         [1, vocab] => logits.reshape((*vocab,))?,
         [1, 1, vocab] => logits.reshape((*vocab,))?,
+        [1, seq, vocab] if *seq > 0 => logits.narrow(1, seq - 1, 1)?.reshape((*vocab,))?,
+        [1, 0, _] => {
+            return Err(Error::InferenceError(
+                "Granite Speech logits sequence is empty".to_string(),
+            ));
+        }
         dims => {
             return Err(Error::InferenceError(format!(
-                "Granite Speech logits expected [1,vocab] or [1,1,vocab], got {dims:?}"
+                "Granite Speech logits expected [1,vocab] or [1,seq,vocab], got {dims:?}"
             )));
         }
     };
@@ -1257,6 +1263,30 @@ mod tests {
         assert!(heads.is_contiguous());
         assert_eq!(heads.stride(), &[15360, 960, 64, 1]);
         assert_eq!(heads.t().unwrap().stride(), &[15360, 960, 1, 64]);
+    }
+
+    #[test]
+    fn argmax_last_logits_uses_last_prefill_position() {
+        let logits = Tensor::from_vec(
+            vec![
+                0.0f32, 100.0, 0.0, 0.0, //
+                0.0, 0.0, 90.0, 0.0, //
+                0.0, 0.0, 0.0, 7.0,
+            ],
+            (1, 3, 4),
+            &Device::Cpu,
+        )
+        .unwrap();
+
+        assert_eq!(argmax_last_logits(&logits).unwrap(), 3);
+    }
+
+    #[test]
+    fn argmax_last_logits_rejects_empty_prefill_sequence() {
+        let logits = Tensor::zeros((1, 0, 4), DType::F32, &Device::Cpu).unwrap();
+        let err = argmax_last_logits(&logits).unwrap_err();
+
+        assert!(format!("{err}").contains("logits sequence is empty"));
     }
 
     #[test]
