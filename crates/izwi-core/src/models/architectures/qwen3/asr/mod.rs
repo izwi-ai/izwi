@@ -329,6 +329,7 @@ impl Qwen3AsrModel {
         let mel_cfg = MelConfig {
             sample_rate: 16_000,
             n_fft: preprocessor.n_fft.max(1),
+            win_length: None,
             hop_length: preprocessor.hop_length.max(1),
             n_mels: preprocessor.feature_size.max(1),
             f_min: 0.0,

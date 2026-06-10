@@ -11,8 +11,11 @@ pub struct GraniteSpeechAudioFeatures {
     pub audio_seconds: f32,
     pub mel_frames: usize,
     pub mel_bins: usize,
+    pub encoder_frames: usize,
+    pub encoder_dim: usize,
     pub projected_frames_hint: usize,
     pub log_mel: Vec<Vec<f32>>,
+    pub input_features: Vec<Vec<f32>>,
 }
 
 pub struct GraniteSpeechPreprocessor {
@@ -25,6 +28,7 @@ impl GraniteSpeechPreprocessor {
         let mel_cfg = MelConfig {
             sample_rate: config.sample_rate() as usize,
             n_fft: config.audio_processor.melspec_kwargs.n_fft,
+            win_length: Some(config.audio_processor.melspec_kwargs.win_length),
             hop_length: config.audio_processor.melspec_kwargs.hop_length,
             n_mels: config.audio_processor.melspec_kwargs.n_mels,
             f_min: 0.0,
@@ -59,11 +63,20 @@ impl GraniteSpeechPreprocessor {
             }
         }
 
-        let log_mel = self.mel.compute(&samples)?;
+        let mut log_mel = self.mel.compute(&samples)?;
         let mel_frames = log_mel.len();
         let mel_bins = log_mel.first().map(|frame| frame.len()).unwrap_or(0);
+        if !log_mel.len().is_multiple_of(2) {
+            log_mel.pop();
+        }
+        let input_features = stack_adjacent_mel_frames(&log_mel);
+        let encoder_frames = input_features.len();
+        let encoder_dim = input_features.first().map(|frame| frame.len()).unwrap_or(0);
+        let window = self.config.audio_processor.projector_window_size.max(1);
         let downsample = self.config.audio_processor.projector_downsample_rate.max(1);
-        let projected_frames_hint = mel_frames.saturating_add(downsample - 1) / downsample;
+        let per_window = window / downsample;
+        let projected_frames_hint =
+            encoder_frames.saturating_add(window - 1) / window * per_window.max(1);
 
         Ok(GraniteSpeechAudioFeatures {
             audio_seconds: samples.len() as f32 / target_rate as f32,
@@ -71,10 +84,25 @@ impl GraniteSpeechPreprocessor {
             sample_rate: target_rate,
             mel_frames,
             mel_bins,
+            encoder_frames,
+            encoder_dim,
             projected_frames_hint,
             log_mel,
+            input_features,
         })
     }
+}
+
+fn stack_adjacent_mel_frames(log_mel: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    log_mel
+        .chunks_exact(2)
+        .map(|pair| {
+            let mut frame = Vec::with_capacity(pair[0].len() + pair[1].len());
+            frame.extend_from_slice(&pair[0]);
+            frame.extend_from_slice(&pair[1]);
+            frame
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -121,9 +149,8 @@ mod tests {
         assert_eq!(features.sample_rate, 16_000);
         assert_eq!(features.mel_bins, 80);
         assert!(features.mel_frames > 0);
-        assert_eq!(
-            features.projected_frames_hint,
-            features.mel_frames.saturating_add(4) / 5
-        );
+        assert_eq!(features.encoder_dim, 160);
+        assert_eq!(features.encoder_frames, features.log_mel.len() / 2);
+        assert_eq!(features.projected_frames_hint % 3, 0);
     }
 }

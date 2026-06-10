@@ -101,6 +101,7 @@ impl VoxtralRealtimeModel {
         let mel_cfg = MelConfig {
             sample_rate: audio_cfg.sampling_rate,
             n_fft: audio_cfg.window_size,
+            win_length: None,
             hop_length: audio_cfg.hop_length,
             n_mels: audio_cfg.num_mel_bins,
             f_min: 0.0,
