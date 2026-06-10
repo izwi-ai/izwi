@@ -182,6 +182,7 @@ streaming events, upload limits, and exact response shapes.
 | `Qwen3-ASR-0.6B-GGUF` | 1.0 GB | Good | Fast |
 | `Qwen3-ASR-1.7B-GGUF` | 2.5 GB | Better | Medium |
 | `Nemotron-3.5-ASR-Streaming-0.6B` | 2.37 GB | 40-locale NVIDIA FastConformer-RNNT; native offline transcription with prompt-conditioned language control | Medium |
+| `Granite-Speech-4.1-2B-Plus` | 4.2 GB | IBM rich transcription model with prompt guidance, speaker-attributed output, and word timestamps | Medium |
 | `LFM2.5-Audio-1.5B-GGUF` | 1.2 GB | Good integrated speech model | Medium |
 | `Voxtral-Mini-4B-Realtime-2602` | 8 GB | Rust/Candle offline transcription; realtime planned | Medium |
 

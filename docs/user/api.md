@@ -303,13 +303,15 @@ Multipart fields:
 |-------|-------|
 | `file` or `audio` | Uploaded audio file. |
 | `audio_base64` | Base64 audio alternative. |
-| `model` | Optional ASR, Voxtral offline transcription, or audio-chat model variant. Voxtral realtime is planned separately. |
+| `model` | Optional ASR, Granite Speech, Voxtral offline transcription, or audio-chat model variant. Voxtral realtime is planned separately. |
 | `language` | Optional language hint. |
 | `response_format` | `json`, `verbose_json`, `text`, `srt`, or `vtt`. Default `json`. |
 | `stream` | `true`, `1`, `yes`, or `on` enables SSE. |
-| `timestamp_granularities[]` | Optional `word`, `segment`, or both. Requires `response_format=verbose_json` and uses the forced aligner for timestamps. |
+| `timestamp_granularities[]` | Optional `word`, `segment`, or both. Requires `response_format=verbose_json`; model-provided timestamps are used before forced alignment fallback. |
 | `aligner_model` | Optional forced-aligner model for timestamp generation. Defaults to `Qwen3-ForcedAligner-0.6B`. |
-| `prompt`, `temperature` | Accepted for compatibility; currently not used by the runtime path. |
+| `prompt` | Optional ASR prompt/context. Granite Speech uses this for prompt guidance and keyword biasing. |
+| `max_tokens` | Optional ASR decoder token budget. |
+| `temperature` | Accepted for compatibility; currently ignored by native ASR models. |
 
 `json` response:
 

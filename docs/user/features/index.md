@@ -65,7 +65,7 @@ Different features require different models:
 | Chat | Chat model (Qwen3, Qwen3.5, LFM2.5, or Gemma) |
 | Text-to-Speech | TTS model |
 | Studio | TTS model |
-| Transcription | ASR model (`Parakeet-TDT-0.6B-v3` default; Qwen3/Whisper/LFM2.5 also supported) |
+| Transcription | ASR model (`Parakeet-TDT-0.6B-v3` default; Qwen3/Whisper/Granite Speech/LFM2.5 also supported) |
 | Diarization | `diar_streaming_sortformer_4spk-v2.1` (+ optional ASR and aligner models) |
 | Forced Alignment | `Qwen3-ForcedAligner-0.6B` (or `-4bit`) |
 | Voice Cloning | Qwen3 TTS Base model (`Qwen3-TTS-12Hz-*-Base*`) |
