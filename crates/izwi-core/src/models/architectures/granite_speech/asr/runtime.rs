@@ -470,8 +470,9 @@ impl GraniteConformerAttention {
 }
 
 fn relative_position_score_row(q_row: &Tensor, rel_row: &Tensor) -> Result<Tensor> {
-    let q_row = q_row.squeeze(1)?;
-    q_row.matmul(&rel_row.t()?)?.unsqueeze(1).map_err(Error::from)
+    let q_row = q_row.squeeze(1)?.contiguous()?;
+    let rel_row = rel_row.t()?.contiguous()?;
+    q_row.matmul(&rel_row)?.unsqueeze(1).map_err(Error::from)
 }
 
 fn encoder_attention_dists(context: usize, max_pos_emb: usize, device: &Device) -> Result<Tensor> {
@@ -1172,9 +1173,11 @@ mod tests {
     #[test]
     fn relative_position_score_row_handles_head_batched_query_rows() {
         let device = Device::Cpu;
-        let q_row = Tensor::zeros((8, 1, 128), DType::F32, &device).unwrap();
+        let q = Tensor::zeros((8, 200, 128), DType::F32, &device).unwrap();
+        let q_row = q.narrow(1, 17, 1).unwrap();
         let rel_row = Tensor::zeros((200, 128), DType::F32, &device).unwrap();
 
+        assert!(!q_row.squeeze(1).unwrap().is_contiguous());
         let scores = relative_position_score_row(&q_row, &rel_row).unwrap();
 
         assert_eq!(scores.dims(), &[8, 1, 200]);
