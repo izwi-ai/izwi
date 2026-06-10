@@ -38,6 +38,7 @@ Those endpoints only show variants that are enabled for download/use.
 | `Qwen3-ASR-0.6B-GGUF` | Smaller Qwen3 ASR |
 | `Qwen3-ASR-1.7B-GGUF` | Higher-accuracy Qwen3 ASR |
 | `Nemotron-3.5-ASR-Streaming-0.6B` | NVIDIA multilingual FastConformer-RNNT `.nemo`; native artifact/config/tokenizer and streaming-state support |
+| `Granite-Speech-4.1-2B-Plus` | IBM Granite Speech rich transcription model with prompt guidance, speaker-attributed output, and word timestamp support |
 | `LFM2.5-Audio-1.5B-GGUF` | Unified audio model (ASR + speech generation) |
 | `Voxtral-Mini-4B-Realtime-2602` | Mistral Voxtral offline transcription; realtime support planned |
 
@@ -83,6 +84,9 @@ izwi pull Qwen3-ASR-0.6B-GGUF
 
 # Download NVIDIA Nemotron 3.5 ASR
 izwi pull Nemotron-3.5-ASR-Streaming-0.6B
+
+# Download IBM Granite Speech rich ASR
+izwi pull Granite-Speech-4.1-2B-Plus
 ```
 
 ### Via Web UI

@@ -72,6 +72,7 @@ Common models:
 | `Parakeet-TDT-0.6B-v3` | ASR (default) | ~9.4 GB |
 | `Qwen3-ASR-0.6B-GGUF` | ASR (compact) | ~1.0 GB |
 | `Nemotron-3.5-ASR-Streaming-0.6B` | ASR (NVIDIA multilingual `.nemo`) | ~2.37 GB |
+| `Granite-Speech-4.1-2B-Plus` | ASR (IBM rich transcription) | ~4.2 GB |
 | `Voxtral-Mini-4B-Realtime-2602` | ASR (offline transcription; realtime planned) | ~8 GB |
 | `Qwen3-8B-GGUF` | Chat | ~5.2 GB |
 | `Qwen3.5-4B` | Chat | ~3.4 GB |

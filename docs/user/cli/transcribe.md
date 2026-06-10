@@ -32,9 +32,11 @@ Transcribes audio files to text using automatic speech recognition (ASR). Suppor
 |--------|-------------|---------|
 | `-m, --model <MODEL>` | ASR model to use | `parakeet-tdt-0.6b-v3` |
 | `-l, --language <LANG>` | Language hint (e.g., `en`, `es`) | Auto-detect |
+| `--prompt <TEXT>` | Initial ASR prompt or keyword guidance | — |
+| `--max-tokens <N>` | Maximum number of ASR decoder tokens to generate | Model default |
 | `-f, --format <FORMAT>` | Output format: `text`, `json`, `verbose_json` | `text` |
 | `-o, --output <PATH>` | Output file (default: stdout) | — |
-| `--word-timestamps` | Future-compatible flag; current server warns and ignores it | — |
+| `--word-timestamps` | Request word-level timestamps; automatically uses `verbose_json` response format | — |
 
 ---
 
@@ -56,6 +58,24 @@ izwi transcribe audio.wav --output transcript.txt
 
 ```bash
 izwi transcribe audio.wav --format json
+```
+
+### Prompt-guided Granite Speech transcription
+
+```bash
+izwi transcribe meeting.wav \
+  --model Granite-Speech-4.1-2B-Plus \
+  --prompt "keywords: Izwi, Granite Speech" \
+  --max-tokens 256 \
+  --format verbose-json
+```
+
+### Word timestamps
+
+```bash
+izwi transcribe audio.wav \
+  --model Granite-Speech-4.1-2B-Plus \
+  --word-timestamps
 ```
 
 ### With timestamps
@@ -116,9 +136,8 @@ Hello, this is a transcription test.
 }
 ```
 
-`--word-timestamps` is accepted by the CLI for future compatibility, but the
-current server warns that word-level timestamps are not yet supported and ignores
-the option.
+`--word-timestamps` requests `verbose_json` output with a `words` array when the
+selected model or forced aligner can provide word timing metadata.
 
 ---
 
@@ -142,6 +161,7 @@ the option.
 | `Qwen3-ASR-0.6B-GGUF` | 1.0 GB | Fast | Good |
 | `Qwen3-ASR-1.7B-GGUF` | 2.5 GB | Medium | Better |
 | `Nemotron-3.5-ASR-Streaming-0.6B` | 2.37 GB | Medium | 40-locale NVIDIA FastConformer-RNNT; native offline transcription with prompt-conditioned language control |
+| `Granite-Speech-4.1-2B-Plus` | 4.2 GB | Medium | IBM rich transcription model with prompt guidance and word timestamps |
 | `Voxtral-Mini-4B-Realtime-2602` | 8 GB | Medium | Rust/Candle offline transcription; realtime planned |
 
 ---
