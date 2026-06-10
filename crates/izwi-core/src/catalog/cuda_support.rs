@@ -141,6 +141,10 @@ impl ModelVariant {
                 CudaSupportLevel::CandleCudaGeneric,
                 "Nemotron ASR uses dense Candle CUDA tensor kernels once the native FastConformer-RNNT loader is selected; cache-aware streaming remains disabled until encoder cache state is proven",
             ),
+            ModelFamily::GraniteSpeechAsr => CudaSupportInfo::new(
+                CudaSupportLevel::CandleCudaGeneric,
+                "Granite Speech ASR uses dense Candle CUDA tensor kernels for the audio encoder, Q-Former projector, and Granite decoder once the native loader is selected",
+            ),
             ModelFamily::Qwen3Tts
             | ModelFamily::KokoroTts
             | ModelFamily::ParakeetAsr
@@ -188,6 +192,10 @@ impl ModelVariant {
             ModelFamily::NemotronAsr => CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::Dense,
                 "Nemotron ASR ships a dense .nemo checkpoint; CUDA dtype policy, not quantization, controls memory/performance tradeoffs",
+            ),
+            ModelFamily::GraniteSpeechAsr => CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::Dense,
+                "Granite Speech ships dense BF16 safetensors; CUDA dtype policy, not quantization, controls memory/performance tradeoffs",
             ),
             ModelFamily::VibeVoiceTts | ModelFamily::VibeVoiceAsr => CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::Dense,

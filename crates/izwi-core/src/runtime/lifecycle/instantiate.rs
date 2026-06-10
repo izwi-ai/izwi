@@ -36,6 +36,7 @@ impl RuntimeService {
             | ModelFamily::Qwen3Asr
             | ModelFamily::VibeVoiceAsr
             | ModelFamily::NemotronAsr
+            | ModelFamily::GraniteSpeechAsr
             | ModelFamily::Qwen3ForcedAligner => {
                 self.model_registry.load_asr(variant, &model_path).await?;
                 InstantiatedPayload::None

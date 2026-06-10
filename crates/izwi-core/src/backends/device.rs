@@ -521,23 +521,22 @@ impl DeviceProfile {
                     })
                 }
             }
-            ModelFamily::NemotronAsr => {
+            ModelFamily::NemotronAsr | ModelFamily::GraniteSpeechAsr => {
                 if self.capabilities.supports_bf16 {
                     Some(DTypeSelection {
                         dtype: DType::BF16,
-                        reason: "Nemotron ASR CUDA policy defaults dense FastConformer/RNNT stages to BF16 when supported".into(),
+                        reason: "dense ASR CUDA policy defaults native speech stages to BF16 when supported".into(),
                     })
                 } else if self.capabilities.supports_f16 {
                     Some(DTypeSelection {
                         dtype: DType::F16,
-                        reason:
-                            "Nemotron ASR CUDA policy falls back to F16 when BF16 is unavailable"
-                                .into(),
+                        reason: "dense ASR CUDA policy falls back to F16 when BF16 is unavailable"
+                            .into(),
                     })
                 } else {
                     Some(DTypeSelection {
                         dtype: DType::F32,
-                        reason: "Nemotron ASR CUDA policy falls back to F32 without reported half precision support".into(),
+                        reason: "dense ASR CUDA policy falls back to F32 without reported half precision support".into(),
                     })
                 }
             }

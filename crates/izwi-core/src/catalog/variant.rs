@@ -15,6 +15,7 @@ pub enum ModelFamily {
     Qwen3Asr,
     VibeVoiceAsr,
     NemotronAsr,
+    GraniteSpeechAsr,
     SortformerDiarization,
     Qwen3Chat,
     Qwen35Chat,
@@ -111,6 +112,7 @@ impl ModelVariant {
             Qwen3Asr06BGguf | Qwen3Asr17BGguf => ModelFamily::Qwen3Asr,
             VibeVoiceAsr => ModelFamily::VibeVoiceAsr,
             Nemotron35AsrStreaming06B => ModelFamily::NemotronAsr,
+            GraniteSpeech412BPlus => ModelFamily::GraniteSpeechAsr,
             DiarStreamingSortformer4SpkV21 => ModelFamily::SortformerDiarization,
             Qwen306B | Qwen306B4Bit | Qwen306BGguf | Qwen317B | Qwen317B4Bit | Qwen317BGguf
             | Qwen34BGguf | Qwen38BGguf | Qwen314BGguf => ModelFamily::Qwen3Chat,
@@ -133,7 +135,8 @@ impl ModelVariant {
             | ModelFamily::WhisperAsr
             | ModelFamily::Qwen3Asr
             | ModelFamily::VibeVoiceAsr
-            | ModelFamily::NemotronAsr => ModelTask::Asr,
+            | ModelFamily::NemotronAsr
+            | ModelFamily::GraniteSpeechAsr => ModelTask::Asr,
             ModelFamily::SortformerDiarization => ModelTask::Diarization,
             ModelFamily::Qwen3Chat
             | ModelFamily::Qwen35Chat
@@ -229,6 +232,8 @@ pub fn resolve_asr_model_variant(input: Option<&str>) -> ModelVariant {
                 VoxtralMini4BRealtime2602
             } else if normalized.contains("nemotron") && normalized.contains("asr") {
                 Nemotron35AsrStreaming06B
+            } else if resolve_granite_speech_variant(&normalized).is_some() {
+                GraniteSpeech412BPlus
             } else if normalized.contains("vibevoice") && normalized.contains("asr") {
                 VibeVoiceAsr
             } else if normalized.contains("whisper")
@@ -296,6 +301,10 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
 
     if normalized.contains("nemotron") && normalized.contains("asr") {
         return Some(Nemotron35AsrStreaming06B);
+    }
+
+    if let Some(granite_speech) = resolve_granite_speech_variant(normalized) {
+        return Some(granite_speech);
     }
 
     if normalized.contains("sortformer") && normalized.contains("diar") {
@@ -469,6 +478,28 @@ fn resolve_qwen3_asr_variant(normalized: &str) -> Option<ModelVariant> {
     }
 
     Some(Qwen3Asr06BGguf)
+}
+
+fn resolve_granite_speech_variant(normalized: &str) -> Option<ModelVariant> {
+    use ModelVariant::*;
+
+    if !normalized.contains("granite") || !normalized.contains("speech") {
+        return None;
+    }
+
+    if normalized.contains("chat") || normalized.contains("code") || normalized.contains("vision") {
+        return None;
+    }
+
+    if normalized.contains("41") || normalized.contains("4dot1") || normalized.contains("2b") {
+        return Some(GraniteSpeech412BPlus);
+    }
+
+    if normalized.contains("plus") {
+        return Some(GraniteSpeech412BPlus);
+    }
+
+    Some(GraniteSpeech412BPlus)
 }
 
 fn resolve_qwen35_chat_variant(normalized: &str) -> Option<ModelVariant> {
@@ -663,6 +694,19 @@ mod tests {
     fn resolve_asr_accepts_nemotron_family_alias() {
         let resolved = resolve_asr_model_variant(Some("nemotron asr streaming"));
         assert_eq!(resolved, ModelVariant::Nemotron35AsrStreaming06B);
+    }
+
+    #[test]
+    fn parse_granite_speech_repo_alias() {
+        let parsed = parse_model_variant("ibm-granite/granite-speech-4.1-2b-plus").unwrap();
+        assert_eq!(parsed, ModelVariant::GraniteSpeech412BPlus);
+        assert_eq!(parsed.family(), ModelFamily::GraniteSpeechAsr);
+    }
+
+    #[test]
+    fn resolve_asr_accepts_granite_speech_family_alias() {
+        let resolved = resolve_asr_model_variant(Some("granite speech plus"));
+        assert_eq!(resolved, ModelVariant::GraniteSpeech412BPlus);
     }
 
     #[test]

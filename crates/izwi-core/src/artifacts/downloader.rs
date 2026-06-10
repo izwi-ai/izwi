@@ -128,6 +128,26 @@ fn vibevoice_safetensor_shards(variant: ModelVariant) -> Vec<String> {
         .collect()
 }
 
+const GRANITE_SPEECH_FILES: &[&str] = &[
+    "chat_template.jinja",
+    "config.json",
+    "generation_config.json",
+    "model.safetensors.index.json",
+    "model-00001-of-00003.safetensors",
+    "model-00002-of-00003.safetensors",
+    "model-00003-of-00003.safetensors",
+    "processor_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+];
+
+fn granite_speech_files() -> Vec<String> {
+    GRANITE_SPEECH_FILES
+        .iter()
+        .map(|file| (*file).to_string())
+        .collect()
+}
+
 #[derive(Debug, Deserialize)]
 struct HfRepoTreeEntry {
     path: String,
@@ -543,6 +563,9 @@ impl ModelDownloader {
                         .all(|file| path.join(file).exists())
             }
             ModelFamily::NemotronAsr => path.join("nemotron-3.5-asr-streaming-0.6b.nemo").exists(),
+            ModelFamily::GraniteSpeechAsr => GRANITE_SPEECH_FILES
+                .iter()
+                .all(|file| path.join(file).exists()),
             ModelFamily::SortformerDiarization => path
                 .join("diar_streaming_sortformer_4spk-v2.1.nemo")
                 .exists(),
@@ -1107,6 +1130,7 @@ impl ModelDownloader {
             ModelFamily::NemotronAsr => {
                 vec!["nemotron-3.5-asr-streaming-0.6b.nemo".to_string()]
             }
+            ModelFamily::GraniteSpeechAsr => granite_speech_files(),
             ModelFamily::SortformerDiarization => vec![
                 "diar_streaming_sortformer_4spk-v2.1.nemo".to_string(),
                 "README.md".to_string(),
@@ -1593,6 +1617,12 @@ impl ModelDownloader {
                 ModelVariant::VibeVoice15BTts | ModelVariant::VibeVoiceAsr
             ) {
                 variant.estimated_size() / vibevoice_shard_count(variant).unwrap_or(1) as u64
+            } else if matches!(variant, ModelVariant::GraniteSpeech412BPlus) {
+                if file.contains("00003") {
+                    238_000_000
+                } else {
+                    1_990_000_000
+                }
             } else if file.contains("00001") || file.contains("00002") {
                 2_000_000_000
             } else {
@@ -1842,6 +1872,42 @@ mod tests {
         )
         .expect("nemo");
         assert!(downloader.is_downloaded(variant));
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn granite_speech_model_files_include_required_hf_bundle() {
+        let (downloader, temp_dir) = test_downloader();
+        let files = downloader.get_model_files(ModelVariant::GraniteSpeech412BPlus);
+        assert_eq!(
+            files,
+            GRANITE_SPEECH_FILES
+                .iter()
+                .map(|file| (*file).to_string())
+                .collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn granite_speech_is_downloaded_only_when_all_required_assets_exist() {
+        let (downloader, temp_dir) = test_downloader();
+        let variant = ModelVariant::GraniteSpeech412BPlus;
+        let model_dir = downloader.model_path(variant);
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+
+        for file in GRANITE_SPEECH_FILES
+            .iter()
+            .take(GRANITE_SPEECH_FILES.len() - 1)
+        {
+            std::fs::write(model_dir.join(file), [0u8]).expect("partial granite asset");
+        }
+        assert!(!downloader.is_downloaded(variant));
+
+        std::fs::write(model_dir.join(GRANITE_SPEECH_FILES.last().unwrap()), [0u8])
+            .expect("last granite asset");
+        assert!(downloader.is_downloaded(variant));
+
         std::fs::remove_dir_all(temp_dir).ok();
     }
 

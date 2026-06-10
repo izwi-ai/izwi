@@ -28,6 +28,7 @@ impl RuntimeService {
             | ModelFamily::Voxtral
             | ModelFamily::VibeVoiceAsr
             | ModelFamily::NemotronAsr
+            | ModelFamily::GraniteSpeechAsr
             | ModelFamily::Lfm25Audio
             | ModelFamily::Qwen3Tts
             | ModelFamily::KokoroTts
