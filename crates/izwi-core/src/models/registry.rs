@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::gemma3::chat::Gemma3ChatModel;
 use crate::models::architectures::granite_speech::asr::{
-    GraniteSpeechAsrModel, GraniteSpeechAsrTranscriptionOutput,
+    GraniteSpeechAsrGenerationOptions, GraniteSpeechAsrModel, GraniteSpeechAsrTranscriptionOutput,
 };
 use crate::models::architectures::kokoro::KokoroTtsModel;
 use crate::models::architectures::lfm2::chat::Lfm2ChatModel;
@@ -564,6 +564,16 @@ fn vibevoice_asr_options(options: NativeAsrGenerationOptions) -> VibeVoiceAsrGen
     }
 }
 
+fn granite_speech_asr_options(
+    options: NativeAsrGenerationOptions,
+) -> GraniteSpeechAsrGenerationOptions {
+    GraniteSpeechAsrGenerationOptions {
+        max_new_tokens: options.max_new_tokens,
+        stop_token_ids: options.stop_token_ids,
+        stop_sequences: options.stop_sequences,
+    }
+}
+
 impl NativeAsrModel {
     pub fn transcribe(
         &self,
@@ -663,6 +673,16 @@ impl NativeAsrModel {
                 vibevoice_asr_options(options),
                 on_delta,
             ),
+            Self::GraniteSpeech(model) => model
+                .transcribe_with_callback_and_prompt_and_options(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                    granite_speech_asr_options(options),
+                    on_delta,
+                )
+                .map(|output| output.text),
             _ => self.transcribe_with_callback_and_prompt(
                 audio,
                 sample_rate,
@@ -803,6 +823,24 @@ impl NativeAsrModel {
                     language,
                     prompt,
                     vibevoice_asr_options(options),
+                )?;
+                Ok(NativeAsrTranscription {
+                    text,
+                    language,
+                    diagnostics,
+                })
+            }
+            Self::GraniteSpeech(model) => {
+                let GraniteSpeechAsrTranscriptionOutput {
+                    text,
+                    language,
+                    diagnostics,
+                } = model.transcribe_with_details_and_prompt_and_options(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                    granite_speech_asr_options(options),
                 )?;
                 Ok(NativeAsrTranscription {
                     text,

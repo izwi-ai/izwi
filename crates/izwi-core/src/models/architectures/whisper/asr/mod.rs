@@ -422,6 +422,7 @@ impl WhisperTurboAsrModel {
         let mel = MelSpectrogram::new(MelConfig {
             sample_rate: whisper::SAMPLE_RATE,
             n_fft: whisper::N_FFT,
+            win_length: None,
             hop_length: whisper::HOP_LENGTH,
             n_mels: config.num_mel_bins,
             f_min: 0.0,

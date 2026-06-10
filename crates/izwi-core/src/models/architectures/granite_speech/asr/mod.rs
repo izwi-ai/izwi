@@ -16,6 +16,7 @@ use crate::model::ModelVariant;
 mod config;
 mod preprocessor;
 mod prompt;
+mod runtime;
 mod transcript;
 
 pub use config::{
@@ -30,6 +31,7 @@ pub use prompt::{
     GraniteSpeechSpecialTokens, GraniteSpeechTask, GRANITE_SPEECH_ASR_PROMPT,
     GRANITE_SPEECH_SPEAKER_PROMPT, GRANITE_SPEECH_SYSTEM_PROMPT, GRANITE_SPEECH_TIMESTAMP_PROMPT,
 };
+pub use runtime::{GraniteSpeechGeneration, GraniteSpeechGenerationStats, GraniteSpeechRuntime};
 pub use transcript::{
     parse_granite_speech_output, GraniteSpeechParsedTranscript, GraniteSpeechSegment,
     GraniteSpeechTimestampWord,
@@ -55,6 +57,23 @@ pub struct GraniteSpeechAsrTranscriptionOutput {
     pub diagnostics: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraniteSpeechAsrGenerationOptions {
+    pub max_new_tokens: usize,
+    pub stop_token_ids: Vec<u32>,
+    pub stop_sequences: Vec<String>,
+}
+
+impl Default for GraniteSpeechAsrGenerationOptions {
+    fn default() -> Self {
+        Self {
+            max_new_tokens: 768,
+            stop_token_ids: Vec::new(),
+            stop_sequences: Vec::new(),
+        }
+    }
+}
+
 pub struct GraniteSpeechAsrModel {
     model_dir: PathBuf,
     device: DeviceProfile,
@@ -66,6 +85,7 @@ pub struct GraniteSpeechAsrModel {
     chat_template: String,
     prompt_tokenizer: GraniteSpeechPromptTokenizer,
     preprocessor: GraniteSpeechPreprocessor,
+    runtime: GraniteSpeechRuntime,
 }
 
 impl GraniteSpeechAsrModel {
@@ -101,9 +121,10 @@ impl GraniteSpeechAsrModel {
             })
             .transpose()?
             .unwrap_or_else(|| device.select_model_dtype(ModelFamily::GraniteSpeechAsr, None));
+        let runtime = GraniteSpeechRuntime::load(&shards, &config, &device, dtype)?;
 
         info!(
-            "Validated Granite Speech ASR metadata in {:?} on {:?} with dtype {:?} ({} shard files)",
+            "Loaded Granite Speech ASR in {:?} on {:?} with dtype {:?} ({} shard files)",
             model_dir,
             device.kind,
             dtype,
@@ -121,6 +142,7 @@ impl GraniteSpeechAsrModel {
             chat_template,
             prompt_tokenizer,
             preprocessor,
+            runtime,
         })
     }
 
@@ -182,8 +204,25 @@ impl GraniteSpeechAsrModel {
         language: Option<&str>,
         prompt: Option<&str>,
     ) -> Result<GraniteSpeechAsrTranscriptionOutput> {
-        let _ = (audio, sample_rate, language, prompt);
-        Err(granite_speech_inference_not_ready())
+        self.transcribe_with_details_and_prompt_and_options(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            GraniteSpeechAsrGenerationOptions::default(),
+        )
+    }
+
+    pub fn transcribe_with_details_and_prompt_and_options(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        options: GraniteSpeechAsrGenerationOptions,
+    ) -> Result<GraniteSpeechAsrTranscriptionOutput> {
+        let mut no_op = |_delta: &str| {};
+        self.transcribe_internal(audio, sample_rate, language, prompt, options, &mut no_op)
     }
 
     pub fn transcribe_with_callback_and_prompt(
@@ -194,8 +233,27 @@ impl GraniteSpeechAsrModel {
         prompt: Option<&str>,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<String> {
-        let _ = (audio, sample_rate, language, prompt, on_delta);
-        Err(granite_speech_inference_not_ready())
+        self.transcribe_with_callback_and_prompt_and_options(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            GraniteSpeechAsrGenerationOptions::default(),
+            on_delta,
+        )
+        .map(|output| output.text)
+    }
+
+    pub fn transcribe_with_callback_and_prompt_and_options(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        options: GraniteSpeechAsrGenerationOptions,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<GraniteSpeechAsrTranscriptionOutput> {
+        self.transcribe_internal(audio, sample_rate, language, prompt, options, on_delta)
     }
 
     pub fn diagnostics_summary(&self) -> serde_json::Value {
@@ -213,13 +271,99 @@ impl GraniteSpeechAsrModel {
             "max_timestamp_audio_seconds": TIMESTAMP_MAX_AUDIO_SECONDS,
         })
     }
+
+    fn transcribe_internal(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        options: GraniteSpeechAsrGenerationOptions,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<GraniteSpeechAsrTranscriptionOutput> {
+        let features = self.prepare_audio_features(audio, sample_rate)?;
+        if features.audio_seconds > DEFAULT_MAX_AUDIO_SECONDS {
+            return Err(Error::InvalidInput(format!(
+                "Granite Speech ASR supports audio up to {DEFAULT_MAX_AUDIO_SECONDS:.0}s, got {:.1}s",
+                features.audio_seconds
+            )));
+        }
+
+        let prompt_options = GraniteSpeechPromptOptions {
+            task: GraniteSpeechTask::Asr,
+            language: language.map(str::to_string),
+            custom_prompt: prompt.map(str::to_string),
+            ..GraniteSpeechPromptOptions::default()
+        };
+        let granite_prompt = self.build_prompt(&prompt_options)?;
+        let audio_embeds = self.runtime.audio_embeddings(&features)?;
+        let special_tokens = self.prompt_tokenizer.special_tokens().clone();
+        let mut decode = |ids: &[u32]| self.prompt_tokenizer.decode(ids);
+        let generation = self.runtime.generate(
+            &granite_prompt,
+            &special_tokens,
+            &audio_embeds,
+            options.max_new_tokens,
+            &options.stop_token_ids,
+            &options.stop_sequences,
+            &mut decode,
+            on_delta,
+        )?;
+        let parsed = parse_granite_speech_output(&generation.text);
+        let text = parsed.text.clone();
+
+        Ok(GraniteSpeechAsrTranscriptionOutput {
+            text,
+            language: language.map(str::to_string),
+            diagnostics: Some(granite_diagnostics(
+                &features,
+                &granite_prompt,
+                &generation,
+                &parsed,
+                self.dtype,
+                &self.device,
+            )),
+        })
+    }
 }
 
-fn granite_speech_inference_not_ready() -> Error {
-    Error::InferenceError(
-        "Granite Speech native inference is not wired yet; decoder forward/generation lands in the next implementation phase"
-            .to_string(),
-    )
+fn granite_diagnostics(
+    features: &GraniteSpeechAudioFeatures,
+    prompt: &GraniteSpeechPrompt,
+    generation: &GraniteSpeechGeneration,
+    parsed: &GraniteSpeechParsedTranscript,
+    dtype: DType,
+    device: &DeviceProfile,
+) -> serde_json::Value {
+    json!({
+        "family": "granite_speech_asr",
+        "dtype": format!("{:?}", dtype),
+        "device_kind": format!("{:?}", device.kind),
+        "audio_seconds": features.audio_seconds,
+        "sample_rate": features.sample_rate,
+        "mel_frames": features.mel_frames,
+        "mel_bins": features.mel_bins,
+        "encoder_frames": features.encoder_frames,
+        "encoder_dim": features.encoder_dim,
+        "projected_audio_tokens": generation.stats.audio_tokens,
+        "prompt_tokens": generation.stats.prompt_tokens,
+        "prompt_audio_placeholders": prompt.audio_token_positions.len(),
+        "generated_tokens": generation.stats.generated_tokens,
+        "stop_reason": generation.stats.stop_reason,
+        "stop_token": generation.stats.stop_token,
+        "speaker_segments": parsed.segments.iter().map(|segment| {
+            json!({
+                "speaker": segment.speaker,
+                "text": segment.text,
+            })
+        }).collect::<Vec<_>>(),
+        "timestamp_words": parsed.timestamp_words.iter().map(|word| {
+            json!({
+                "word": word.word,
+                "end_time_seconds": word.end_time_seconds,
+            })
+        }).collect::<Vec<_>>(),
+    })
 }
 
 pub fn ensure_granite_speech_artifacts(model_dir: &Path) -> Result<Vec<PathBuf>> {

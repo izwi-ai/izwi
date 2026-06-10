@@ -9,6 +9,7 @@ use crate::error::Result;
 pub struct MelConfig {
     pub sample_rate: usize,
     pub n_fft: usize,
+    pub win_length: Option<usize>,
     pub hop_length: usize,
     pub n_mels: usize,
     pub f_min: f32,
@@ -21,6 +22,7 @@ impl Default for MelConfig {
         Self {
             sample_rate: 16_000,
             n_fft: 400,      // Whisper and the retained Qwen forced-aligner stack use 25 ms windows
+            win_length: None,
             hop_length: 160, // 10ms at 16kHz
             n_mels: 128,
             f_min: 0.0,
@@ -45,7 +47,8 @@ impl MelSpectrogram {
             config.f_min,
             config.f_max,
         );
-        let window = Self::hann_window(config.n_fft);
+        let window =
+            Self::hann_window_padded(config.n_fft, config.win_length.unwrap_or(config.n_fft));
 
         Ok(Self {
             config,
@@ -160,6 +163,19 @@ impl MelSpectrogram {
         (0..size)
             .map(|i| 0.5 * (1.0 - f32::cos(2.0 * std::f32::consts::PI * i as f32 / size as f32)))
             .collect()
+    }
+
+    fn hann_window_padded(n_fft: usize, win_length: usize) -> Vec<f32> {
+        let win_length = win_length.clamp(1, n_fft.max(1));
+        if win_length == n_fft {
+            return Self::hann_window(n_fft);
+        }
+        let mut window = vec![0.0; n_fft];
+        let offset = (n_fft - win_length) / 2;
+        for (idx, value) in Self::hann_window(win_length).into_iter().enumerate() {
+            window[offset + idx] = value;
+        }
+        window
     }
 
     fn create_mel_filterbank(

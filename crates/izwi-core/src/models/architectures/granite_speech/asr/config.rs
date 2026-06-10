@@ -50,7 +50,13 @@ pub struct GraniteSpeechEncoderConfig {
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct GraniteSpeechProjectorConfig {
+    #[serde(default = "default_attention_probs_dropout_prob")]
+    pub attention_probs_dropout_prob: f32,
     pub encoder_hidden_size: usize,
+    #[serde(default = "default_hidden_act")]
+    pub hidden_act: String,
+    #[serde(default = "default_hidden_dropout_prob")]
+    pub hidden_dropout_prob: f32,
     pub hidden_size: usize,
     pub intermediate_size: usize,
     #[serde(default = "default_layer_norm_eps")]
@@ -66,6 +72,8 @@ pub struct GraniteSpeechProjectorConfig {
     pub use_qformer_text_input: bool,
     #[serde(default = "default_cross_attention_frequency")]
     pub cross_attention_frequency: usize,
+    #[serde(default)]
+    pub chunk_size_feed_forward: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -187,10 +195,12 @@ impl GraniteSpeechConfig {
             )));
         }
 
-        if self.encoder_config.output_dim != self.projector_config.encoder_hidden_size {
+        let projected_encoder_width =
+            self.encoder_config.hidden_dim * (self.encoder_config.cat_hidden_layers.len() + 1);
+        if projected_encoder_width != self.projector_config.encoder_hidden_size {
             return Err(Error::ModelLoadError(format!(
-                "Granite Speech encoder output_dim {} does not match projector encoder_hidden_size {}",
-                self.encoder_config.output_dim, self.projector_config.encoder_hidden_size
+                "Granite Speech concatenated encoder width {} does not match projector encoder_hidden_size {}",
+                projected_encoder_width, self.projector_config.encoder_hidden_size
             )));
         }
 
@@ -309,6 +319,18 @@ fn default_layer_norm_eps() -> f64 {
 
 fn default_cross_attention_frequency() -> usize {
     1
+}
+
+fn default_hidden_act() -> String {
+    "gelu".to_string()
+}
+
+fn default_hidden_dropout_prob() -> f32 {
+    0.1
+}
+
+fn default_attention_probs_dropout_prob() -> f32 {
+    0.1
 }
 
 fn default_rope_theta() -> f64 {
