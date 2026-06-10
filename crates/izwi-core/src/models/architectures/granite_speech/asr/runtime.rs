@@ -446,10 +446,11 @@ impl GraniteConformerAttention {
     }
 
     fn relative_position_bias(&self, q: &Tensor) -> Result<Tensor> {
+        let out_dtype = q.dtype();
         let rel = self
             .rel_pos_emb
             .forward(&self.attention_dists)?
-            .to_dtype(q.dtype())?;
+            .to_dtype(out_dtype)?;
         let (batch, blocks, heads, context, dim) = q.dims5()?;
         let q = q
             .reshape((batch * blocks * heads, context, dim))?
@@ -459,13 +460,18 @@ impl GraniteConformerAttention {
         for query_idx in 0..context {
             let q_row = q.narrow(1, query_idx, 1)?;
             let rel_row = rel.narrow(0, query_idx, 1)?.squeeze(0)?;
-            rows.push(q_row.matmul(&rel_row.t()?)?);
+            rows.push(relative_position_score_row(&q_row, &rel_row)?);
         }
         let refs = rows.iter().collect::<Vec<_>>();
         let out = Tensor::cat(&refs, 1)?
             .reshape((batch, blocks, heads, context, context))?;
-        (out / (dim as f64).sqrt())?.to_dtype(q.dtype()).map_err(Error::from)
+        (out / (dim as f64).sqrt())?.to_dtype(out_dtype).map_err(Error::from)
     }
+}
+
+fn relative_position_score_row(q_row: &Tensor, rel_row: &Tensor) -> Result<Tensor> {
+    let q_row = q_row.squeeze(1)?;
+    q_row.matmul(&rel_row.t()?)?.unsqueeze(1).map_err(Error::from)
 }
 
 fn encoder_attention_dists(context: usize, max_pos_emb: usize, device: &Device) -> Result<Tensor> {
