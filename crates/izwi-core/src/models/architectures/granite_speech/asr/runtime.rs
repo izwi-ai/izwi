@@ -786,11 +786,16 @@ impl GraniteQFormerAttention {
     }
 
     fn transpose_for_scores(&self, x: &Tensor) -> Result<Tensor> {
-        let (batch, seq_len, _) = x.dims3()?;
-        x.reshape((batch, seq_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)
-            .map_err(Error::from)
+        qformer_attention_heads(x, self.num_heads, self.head_dim)
     }
+}
+
+fn qformer_attention_heads(x: &Tensor, num_heads: usize, head_dim: usize) -> Result<Tensor> {
+    let (batch, seq_len, _) = x.dims3()?;
+    x.reshape((batch, seq_len, num_heads, head_dim))?
+        .transpose(1, 2)?
+        .contiguous()
+        .map_err(Error::from)
 }
 
 struct GraniteLanguageModel {
@@ -1231,6 +1236,27 @@ mod tests {
         assert!(heads.is_contiguous());
         assert_eq!(heads.stride(), &[204800, 204800, 25600, 128, 1]);
         assert_eq!(heads.t().unwrap().stride(), &[204800, 204800, 25600, 1, 128]);
+    }
+
+    #[test]
+    fn qformer_attention_heads_compacts_transposed_sequence_layout() {
+        let device = Device::Cpu;
+        let projected = Tensor::zeros((2, 15, 1024), DType::F32, &device).unwrap();
+        let strided = projected
+            .reshape((2, 15, 16, 64))
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap();
+
+        assert_eq!(strided.dims(), &[2, 16, 15, 64]);
+        assert!(!strided.is_contiguous());
+
+        let heads = qformer_attention_heads(&projected, 16, 64).unwrap();
+
+        assert_eq!(heads.dims(), &[2, 16, 15, 64]);
+        assert!(heads.is_contiguous());
+        assert_eq!(heads.stride(), &[15360, 960, 64, 1]);
+        assert_eq!(heads.t().unwrap().stride(), &[15360, 960, 1, 64]);
     }
 
     #[test]
