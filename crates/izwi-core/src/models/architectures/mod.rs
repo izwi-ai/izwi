@@ -6,6 +6,7 @@
 //! 3. Wire loading in `crate::models::registry`.
 
 pub mod gemma3;
+pub mod granite_speech;
 pub mod kokoro;
 pub mod lfm2;
 pub mod lfm25_audio;
