@@ -282,12 +282,7 @@ impl GraniteSpeechAsrModel {
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<GraniteSpeechAsrTranscriptionOutput> {
         let features = self.prepare_audio_features(audio, sample_rate)?;
-        if features.audio_seconds > DEFAULT_MAX_AUDIO_SECONDS {
-            return Err(Error::InvalidInput(format!(
-                "Granite Speech ASR supports audio up to {DEFAULT_MAX_AUDIO_SECONDS:.0}s, got {:.1}s",
-                features.audio_seconds
-            )));
-        }
+        validate_granite_audio_duration(features.audio_seconds)?;
 
         let prompt_options = GraniteSpeechPromptOptions {
             task: GraniteSpeechTask::Asr,
@@ -325,6 +320,15 @@ impl GraniteSpeechAsrModel {
             )),
         })
     }
+}
+
+fn validate_granite_audio_duration(audio_seconds: f32) -> Result<()> {
+    if audio_seconds <= DEFAULT_MAX_AUDIO_SECONDS {
+        return Ok(());
+    }
+    Err(Error::InvalidInput(format!(
+        "Granite Speech ASR supports audio up to {DEFAULT_MAX_AUDIO_SECONDS:.0}s, got {audio_seconds:.1}s"
+    )))
 }
 
 fn granite_diagnostics(
@@ -508,5 +512,59 @@ mod tests {
             .to_string()
             .contains("Invalid Granite Speech safetensors shard path"));
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn audio_duration_guard_allows_nine_minutes_only() {
+        assert!(validate_granite_audio_duration(DEFAULT_MAX_AUDIO_SECONDS).is_ok());
+        let err = validate_granite_audio_duration(DEFAULT_MAX_AUDIO_SECONDS + 0.1).unwrap_err();
+        assert!(err.to_string().contains("supports audio up to 540s"));
+    }
+
+    #[test]
+    fn diagnostics_include_prompt_audio_and_rich_transcript_metadata() {
+        let features = GraniteSpeechAudioFeatures {
+            samples: vec![0.0; 160],
+            sample_rate: 16_000,
+            audio_seconds: 0.01,
+            mel_frames: 2,
+            mel_bins: 80,
+            encoder_frames: 1,
+            encoder_dim: 160,
+            projected_frames_hint: 3,
+            log_mel: vec![vec![0.0; 80]; 2],
+            input_features: vec![vec![0.0; 160]],
+        };
+        let prompt = GraniteSpeechPrompt {
+            text: "<|audio|>".to_string(),
+            input_ids: vec![100_352],
+            audio_token_positions: vec![0],
+            prefix_text_token_count: 0,
+        };
+        let generation = GraniteSpeechGeneration {
+            token_ids: vec![1, 2],
+            text: "[Speaker 1]: hello [T:045]".to_string(),
+            stats: GraniteSpeechGenerationStats {
+                prompt_tokens: 4,
+                audio_tokens: 3,
+                generated_tokens: 2,
+                stop_reason: "stop_token".to_string(),
+                stop_token: Some(100_257),
+            },
+        };
+        let parsed = parse_granite_speech_output(&generation.text);
+        let diagnostics = granite_diagnostics(
+            &features,
+            &prompt,
+            &generation,
+            &parsed,
+            DType::F32,
+            &DeviceProfile::cpu(),
+        );
+
+        assert_eq!(diagnostics["projected_audio_tokens"], 3);
+        assert_eq!(diagnostics["prompt_audio_placeholders"], 1);
+        assert_eq!(diagnostics["speaker_segments"][0]["speaker"], "Speaker 1");
+        assert_eq!(diagnostics["timestamp_words"][0]["word"], "hello");
     }
 }

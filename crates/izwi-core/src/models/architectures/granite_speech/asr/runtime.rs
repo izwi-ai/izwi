@@ -142,18 +142,9 @@ impl GraniteSpeechRuntime {
 
             generated.push(token);
             let mut next_text = decode(&generated)?;
-            let mut stopped_on_sequence = false;
-            for stop in stop_sequences
-                .iter()
-                .map(|value| value.as_str())
-                .filter(|value| !value.is_empty())
-            {
-                if let Some(stop_at) = next_text.find(stop) {
-                    next_text.truncate(stop_at);
-                    stop_reason = "stop_sequence".to_string();
-                    stopped_on_sequence = true;
-                    break;
-                }
+            let stopped_on_sequence = truncate_at_stop_sequence(&mut next_text, stop_sequences);
+            if stopped_on_sequence {
+                stop_reason = "stop_sequence".to_string();
             }
             if next_text.len() > rendered.len() {
                 let delta = &next_text[rendered.len()..];
@@ -222,6 +213,20 @@ fn stop_token_set(special_tokens: &GraniteSpeechSpecialTokens, extra: &[u32]) ->
     tokens.sort_unstable();
     tokens.dedup();
     tokens
+}
+
+fn truncate_at_stop_sequence(text: &mut String, stop_sequences: &[String]) -> bool {
+    for stop in stop_sequences
+        .iter()
+        .map(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+    {
+        if let Some(stop_at) = text.find(stop) {
+            text.truncate(stop_at);
+            return true;
+        }
+    }
+    false
 }
 
 fn argmax_last_logits(logits: &Tensor) -> Result<u32> {
@@ -1168,5 +1173,12 @@ mod tests {
             audio_token: "<|audio|>".to_string(),
         };
         assert_eq!(stop_token_set(&tokens, &[4, 2, 4]), vec![2, 4]);
+    }
+
+    #[test]
+    fn stop_sequence_truncates_generated_text() {
+        let mut text = "hello<stop>ignored".to_string();
+        assert!(truncate_at_stop_sequence(&mut text, &["<stop>".to_string()]));
+        assert_eq!(text, "hello");
     }
 }

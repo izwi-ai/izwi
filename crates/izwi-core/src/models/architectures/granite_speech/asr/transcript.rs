@@ -21,9 +21,10 @@ pub struct GraniteSpeechParsedTranscript {
 
 pub fn parse_granite_speech_output(raw: &str) -> GraniteSpeechParsedTranscript {
     let text = cleanup_transcript_text(raw);
+    let timestamp_text = strip_speaker_markers(&text);
     GraniteSpeechParsedTranscript {
         segments: parse_speaker_segments(&text),
-        timestamp_words: parse_timestamp_words(&text),
+        timestamp_words: parse_timestamp_words(&timestamp_text),
         text,
     }
 }
@@ -78,6 +79,22 @@ fn push_segment(segments: &mut Vec<GraniteSpeechSegment>, speaker: Option<String
     });
 }
 
+fn strip_speaker_markers(text: &str) -> String {
+    let mut stripped = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    while let Some(relative_start) = text[cursor..].find("[Speaker ") {
+        let marker_start = cursor + relative_start;
+        stripped.push_str(&text[cursor..marker_start]);
+        let Some(relative_end) = text[marker_start..].find("]:") else {
+            stripped.push_str(&text[marker_start..]);
+            return stripped;
+        };
+        cursor = marker_start + relative_end + 2;
+    }
+    stripped.push_str(&text[cursor..]);
+    stripped
+}
+
 fn parse_timestamp_words(text: &str) -> Vec<GraniteSpeechTimestampWord> {
     let mut words = Vec::new();
     let mut pending_word = String::new();
@@ -86,7 +103,8 @@ fn parse_timestamp_words(text: &str) -> Vec<GraniteSpeechTimestampWord> {
 
     for token in text.split_whitespace() {
         if let Some(centiseconds) = parse_timestamp_token(token) {
-            if pending_word.trim().is_empty() {
+            if pending_word.trim().is_empty() || pending_word.trim() == "_" {
+                pending_word.clear();
                 continue;
             }
             let mut seconds = centiseconds as f32 / 100.0 + rollover;
@@ -147,6 +165,30 @@ mod tests {
                     end_time_seconds: 10.05,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn parser_skips_silence_timestamp_tokens() {
+        let parsed = parse_granite_speech_output("_ [T:012] hello [T:045]");
+        assert_eq!(
+            parsed.timestamp_words,
+            vec![GraniteSpeechTimestampWord {
+                word: "hello".to_string(),
+                end_time_seconds: 0.45,
+            }]
+        );
+    }
+
+    #[test]
+    fn parser_removes_speaker_labels_from_timestamp_words() {
+        let parsed = parse_granite_speech_output("[Speaker 1]: hello [T:045]");
+        assert_eq!(
+            parsed.timestamp_words,
+            vec![GraniteSpeechTimestampWord {
+                word: "hello".to_string(),
+                end_time_seconds: 0.45,
+            }]
         );
     }
 }
