@@ -81,7 +81,7 @@ impl NativeExecutor {
                                     &chunk_plan.chunks,
                                     &chunk_plan.config,
                                     chunk_stream_options,
-                                    |chunk_audio, sr| {
+                                    |chunk_audio, sr, _prefix_text| {
                                         let details = model
                                             .transcribe_with_details_and_prompt_and_options(
                                                 chunk_audio,
@@ -332,7 +332,7 @@ impl NativeExecutor {
                 matches!(family, ModelFamily::WhisperAsr),
             );
             if chunk_plan.requires_chunk_path() {
-                let chunked = Self::transcribe_with_chunk_plan_with_details(
+                let chunked = Self::transcribe_with_chunk_plan_with_context_and_details(
                     &request.id,
                     stream_tx.as_ref(),
                     stream_policy,
@@ -341,12 +341,16 @@ impl NativeExecutor {
                     sample_rate,
                     &chunk_plan.chunks,
                     &chunk_plan.config,
-                    |chunk_audio, sr| {
-                        let details = model.transcribe_with_details_and_prompt_and_options(
+                    |chunk_audio, sr, prefix_text| {
+                        let prefix_text = matches!(family, ModelFamily::GraniteSpeechAsr)
+                            .then_some(prefix_text)
+                            .filter(|value| !value.trim().is_empty());
+                        let details = model.transcribe_with_details_prompt_prefix_and_options(
                             chunk_audio,
                             sr,
                             language,
                             asr_prompt,
+                            prefix_text,
                             generation_options.clone(),
                         )?;
                         Ok(AsrChunkTranscription {

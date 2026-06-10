@@ -494,10 +494,37 @@ impl NativeExecutor {
         sample_rate: u32,
         chunk_plan: &[AudioChunk],
         chunk_cfg: &AsrLongFormConfig,
-        transcribe_chunk: F,
+        mut transcribe_chunk: F,
     ) -> Result<ChunkedAsrTranscription>
     where
         F: FnMut(&[f32], u32) -> Result<AsrChunkTranscription>,
+    {
+        Self::transcribe_with_chunk_plan_with_context_and_details(
+            request_id,
+            stream_tx,
+            stream_policy,
+            sequence,
+            samples,
+            sample_rate,
+            chunk_plan,
+            chunk_cfg,
+            |chunk_audio, sr, _prefix_text| transcribe_chunk(chunk_audio, sr),
+        )
+    }
+
+    pub(super) fn transcribe_with_chunk_plan_with_context_and_details<F>(
+        request_id: &str,
+        stream_tx: Option<&mpsc::Sender<StreamingOutput>>,
+        stream_policy: EngineStreamPolicy,
+        sequence: &mut usize,
+        samples: &[f32],
+        sample_rate: u32,
+        chunk_plan: &[AudioChunk],
+        chunk_cfg: &AsrLongFormConfig,
+        transcribe_chunk: F,
+    ) -> Result<ChunkedAsrTranscription>
+    where
+        F: FnMut(&[f32], u32, &str) -> Result<AsrChunkTranscription>,
     {
         Self::transcribe_with_chunk_plan_with_details_and_options(
             request_id,
@@ -526,7 +553,7 @@ impl NativeExecutor {
         mut transcribe_chunk: F,
     ) -> Result<ChunkedAsrTranscription>
     where
-        F: FnMut(&[f32], u32) -> Result<AsrChunkTranscription>,
+        F: FnMut(&[f32], u32, &str) -> Result<AsrChunkTranscription>,
     {
         if chunk_plan.is_empty() {
             if let Some(tx) = stream_tx {
@@ -567,8 +594,9 @@ impl NativeExecutor {
                 continue;
             }
             let chunk_audio = &samples[chunk.start_sample..chunk.end_sample];
+            let prefix_text = assembler.text().to_string();
             let chunk_started = Instant::now();
-            let chunk_result = transcribe_chunk(chunk_audio, sample_rate)?;
+            let chunk_result = transcribe_chunk(chunk_audio, sample_rate, prefix_text.as_str())?;
             let chunk_text = chunk_result.text.clone();
             let transcribe_ms = chunk_started.elapsed().as_secs_f64() * 1000.0;
             chunk_diagnostics.push(Self::chunk_transcription_diagnostics(
@@ -1155,6 +1183,51 @@ mod tests {
             .get("transcribe_ms")
             .and_then(|value| value.as_f64())
             .is_some());
+    }
+
+    #[test]
+    fn chunk_plan_context_callback_receives_assembled_prefix_text() {
+        let sr = 10u32;
+        let samples = vec![0.0f32; sr as usize * 2];
+        let chunk_plan = vec![
+            AudioChunk {
+                start_sample: 0,
+                end_sample: sr as usize,
+            },
+            AudioChunk {
+                start_sample: sr as usize,
+                end_sample: sr as usize * 2,
+            },
+        ];
+
+        let mut prefixes = Vec::new();
+        let mut chunk_idx = 0usize;
+        let mut sequence = 0usize;
+        let merged = NativeExecutor::transcribe_with_chunk_plan_with_context_and_details(
+            "req-prefix",
+            None,
+            EngineStreamPolicy::FailOnFull,
+            &mut sequence,
+            &samples,
+            sr,
+            &chunk_plan,
+            &NativeExecutor::asr_long_form_config(),
+            |_chunk_audio, _sr, prefix_text| {
+                prefixes.push(prefix_text.to_string());
+                let idx = chunk_idx;
+                chunk_idx = chunk_idx.saturating_add(1);
+                Ok(AsrChunkTranscription {
+                    text: format!("chunk-{idx}"),
+                    diagnostics: None,
+                })
+            },
+        )
+        .expect("chunk plan should complete");
+
+        assert_eq!(prefixes.len(), 2);
+        assert!(prefixes[0].is_empty());
+        assert!(prefixes[1].contains("chunk-0"));
+        assert!(merged.text.contains("chunk-1"));
     }
 
     #[test]

@@ -307,6 +307,55 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     expect(onFinal).toHaveBeenCalledWith("Hello", "English", 1.2);
   });
 
+  it("posts direct ASR prompt and timestamp controls", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          text: "hello world",
+          language: "en",
+          duration: 1.2,
+          processing_time_ms: 100,
+          rtf: 0.1,
+          words: [{ word: "hello", start: 0, end: 0.5 }],
+        }),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+          },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+    await client.asrTranscribe({
+      audio_base64: "AAAA",
+      model_id: "Granite-Speech-4.1-2B-Plus",
+      language: "en",
+      prompt: "keywords: izwi, granite",
+      max_tokens: 64,
+      timestamp_granularities: ["word"],
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost/v1/audio/transcriptions",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          audio_base64: "AAAA",
+          model: "Granite-Speech-4.1-2B-Plus",
+          language: "en",
+          prompt: "keywords: izwi, granite",
+          max_tokens: 64,
+          timestamp_granularities: ["word"],
+          response_format: "verbose_json",
+          stream: false,
+        }),
+      }),
+    );
+  });
+
   it("lists transcriptions through the canonical collection route", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ records: [] }), {

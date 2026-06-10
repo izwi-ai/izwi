@@ -507,6 +507,24 @@ mod tests {
     }
 
     #[test]
+    fn built_in_registry_marks_granite_speech_as_batch_asr_only() {
+        let registry = RuntimeAdapterRegistry::built_in();
+        let variant = ModelVariant::GraniteSpeech412BPlus;
+
+        let adapter = registry
+            .require(CapabilityKind::Asr, variant)
+            .expect("granite speech asr adapter");
+        assert_eq!(adapter.execution_target, ExecutionTargetKind::BatchRunner);
+        assert_eq!(adapter.streaming_mode, StreamingMode::None);
+        assert!(
+            registry
+                .require(CapabilityKind::RealtimeAsr, variant)
+                .is_err()
+        );
+        assert!(registry.require(CapabilityKind::AudioChat, variant).is_err());
+    }
+
+    #[test]
     fn built_in_registry_marks_voxtral_tts_as_direct_tts_with_final_only_streaming() {
         let registry = RuntimeAdapterRegistry::built_in();
         let variant = ModelVariant::Voxtral4BTts2603;

@@ -440,6 +440,9 @@ export interface ASRTranscribeRequest {
   audio_filename?: string;
   model_id?: string;
   language?: string;
+  prompt?: string;
+  max_tokens?: number;
+  timestamp_granularities?: Array<"word" | "words" | "segment" | "segments">;
 }
 
 export interface ASRTranscribeResponse {
@@ -2816,6 +2819,17 @@ export class AudioApiClient {
       if (request.language) {
         form.append("language", request.language);
       }
+      if (request.prompt?.trim()) {
+        form.append("prompt", request.prompt.trim());
+      }
+      if (typeof request.max_tokens === "number") {
+        form.append("max_tokens", String(request.max_tokens));
+      }
+      if (responseFormat === "verbose_json") {
+        for (const granularity of request.timestamp_granularities ?? []) {
+          form.append("timestamp_granularities[]", granularity);
+        }
+      }
       form.append("response_format", responseFormat);
       if (stream) {
         form.append("stream", "true");
@@ -2839,6 +2853,12 @@ export class AudioApiClient {
         audio_base64: request.audio_base64,
         model: request.model_id,
         language: request.language,
+        prompt: request.prompt?.trim() || undefined,
+        max_tokens: request.max_tokens,
+        timestamp_granularities:
+          responseFormat === "verbose_json"
+            ? request.timestamp_granularities
+            : undefined,
         response_format: responseFormat,
         stream,
       }),

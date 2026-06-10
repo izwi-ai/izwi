@@ -222,7 +222,36 @@ impl GraniteSpeechAsrModel {
         options: GraniteSpeechAsrGenerationOptions,
     ) -> Result<GraniteSpeechAsrTranscriptionOutput> {
         let mut no_op = |_delta: &str| {};
-        self.transcribe_internal(audio, sample_rate, language, prompt, options, &mut no_op)
+        self.transcribe_internal(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            None,
+            options,
+            &mut no_op,
+        )
+    }
+
+    pub fn transcribe_with_details_and_prompt_prefix_and_options(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        prefix_text: Option<&str>,
+        options: GraniteSpeechAsrGenerationOptions,
+    ) -> Result<GraniteSpeechAsrTranscriptionOutput> {
+        let mut no_op = |_delta: &str| {};
+        self.transcribe_internal(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            prefix_text,
+            options,
+            &mut no_op,
+        )
     }
 
     pub fn transcribe_with_callback_and_prompt(
@@ -253,7 +282,15 @@ impl GraniteSpeechAsrModel {
         options: GraniteSpeechAsrGenerationOptions,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<GraniteSpeechAsrTranscriptionOutput> {
-        self.transcribe_internal(audio, sample_rate, language, prompt, options, on_delta)
+        self.transcribe_internal(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            None,
+            options,
+            on_delta,
+        )
     }
 
     pub fn diagnostics_summary(&self) -> serde_json::Value {
@@ -278,6 +315,7 @@ impl GraniteSpeechAsrModel {
         sample_rate: u32,
         language: Option<&str>,
         prompt: Option<&str>,
+        prefix_text: Option<&str>,
         options: GraniteSpeechAsrGenerationOptions,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<GraniteSpeechAsrTranscriptionOutput> {
@@ -288,6 +326,7 @@ impl GraniteSpeechAsrModel {
             task: GraniteSpeechTask::Asr,
             language: language.map(str::to_string),
             custom_prompt: prompt.map(str::to_string),
+            prefix_text: prefix_text.map(str::to_string),
             ..GraniteSpeechPromptOptions::default()
         };
         let granite_prompt = self.build_prompt(&prompt_options)?;
@@ -351,6 +390,7 @@ fn granite_diagnostics(
         "encoder_dim": features.encoder_dim,
         "projected_audio_tokens": generation.stats.audio_tokens,
         "prompt_tokens": generation.stats.prompt_tokens,
+        "prompt_prefix_tokens": prompt.prefix_text_token_count,
         "prompt_audio_placeholders": prompt.audio_token_positions.len(),
         "generated_tokens": generation.stats.generated_tokens,
         "stop_reason": generation.stats.stop_reason,
@@ -563,6 +603,7 @@ mod tests {
         );
 
         assert_eq!(diagnostics["projected_audio_tokens"], 3);
+        assert_eq!(diagnostics["prompt_prefix_tokens"], 0);
         assert_eq!(diagnostics["prompt_audio_placeholders"], 1);
         assert_eq!(diagnostics["speaker_segments"][0]["speaker"], "Speaker 1");
         assert_eq!(diagnostics["timestamp_words"][0]["word"], "hello");

@@ -852,6 +852,45 @@ impl NativeAsrModel {
         }
     }
 
+    pub fn transcribe_with_details_prompt_prefix_and_options(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        prefix_text: Option<&str>,
+        options: NativeAsrGenerationOptions,
+    ) -> Result<NativeAsrTranscription> {
+        match self {
+            Self::GraniteSpeech(model) => {
+                let GraniteSpeechAsrTranscriptionOutput {
+                    text,
+                    language,
+                    diagnostics,
+                } = model.transcribe_with_details_and_prompt_prefix_and_options(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                    prefix_text,
+                    granite_speech_asr_options(options),
+                )?;
+                Ok(NativeAsrTranscription {
+                    text,
+                    language,
+                    diagnostics,
+                })
+            }
+            _ => self.transcribe_with_details_and_prompt_and_options(
+                audio,
+                sample_rate,
+                language,
+                prompt,
+                options,
+            ),
+        }
+    }
+
     pub fn force_align(
         &self,
         audio: &[f32],

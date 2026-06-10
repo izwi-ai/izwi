@@ -1,14 +1,14 @@
 //! OpenAI-compatible transcription endpoints.
 
 use axum::{
-    Json, RequestExt,
     body::Body,
     extract::{Extension, Multipart, Request, State},
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     response::{
-        IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
     },
+    Json, RequestExt,
 };
 use std::convert::Infallible;
 use std::time::Instant;
@@ -17,8 +17,8 @@ use tracing::{debug, info};
 
 use super::resolve_audio_upload_limit_bytes;
 use crate::api::audio_payload::{
-    AudioPayload, decode_base64_audio_payload, inspect_audio_payload_with_diagnostics,
-    read_multipart_audio_base64_payload, read_multipart_audio_file_payload,
+    decode_base64_audio_payload, inspect_audio_payload_with_diagnostics,
+    read_multipart_audio_base64_payload, read_multipart_audio_file_payload, AudioPayload,
 };
 use crate::api::request_context::RequestContext;
 use crate::api::speech_text_upload::multipart_upload_api_error;
@@ -164,13 +164,21 @@ pub async fn transcriptions(
     let mut segments = None;
     let mut subtitle_segments = None;
     let chunk_boundaries = extract_chunk_segment_boundaries(output.asr_diagnostics.as_ref());
+    let model_words = extract_model_timestamp_words(output.asr_diagnostics.as_ref());
     let model_segments = extract_model_timestamp_segments(output.asr_diagnostics.as_ref());
+    if timestamp_request.words && !model_words.is_empty() {
+        words = Some(model_words.clone());
+    }
     if timestamp_request.segments && !model_segments.is_empty() {
         segments = Some(model_segments.clone());
     }
+    if timestamp_request.segments && segments.is_none() && !model_words.is_empty() {
+        segments = Some(build_timestamp_segments(&model_words, &chunk_boundaries));
+    }
     if timestamp_request.any()
         && !output.text.trim().is_empty()
-        && (timestamp_request.words || (timestamp_request.segments && segments.is_none()))
+        && ((timestamp_request.words && words.is_none())
+            || (timestamp_request.segments && segments.is_none()))
     {
         let alignments = state
             .runtime
@@ -182,7 +190,7 @@ pub async fn transcriptions(
             )
             .await?;
         let timestamp_words = alignments_to_timestamp_words(alignments);
-        if timestamp_request.words {
+        if timestamp_request.words && words.is_none() {
             words = Some(timestamp_words.clone());
         }
         if timestamp_request.segments && segments.is_none() {
@@ -194,6 +202,9 @@ pub async fn transcriptions(
     } else if matches!(response_format.as_str(), "srt" | "vtt") && !output.text.trim().is_empty() {
         if !model_segments.is_empty() {
             subtitle_segments = Some(model_segments.clone());
+        }
+        if subtitle_segments.is_none() && !model_words.is_empty() {
+            subtitle_segments = Some(build_timestamp_segments(&model_words, &chunk_boundaries));
         }
         if subtitle_segments.is_none() {
             match state
@@ -736,19 +747,66 @@ fn extract_chunk_segment_boundaries(diagnostics: Option<&serde_json::Value>) -> 
     starts
 }
 
+fn extract_model_timestamp_words(
+    diagnostics: Option<&serde_json::Value>,
+) -> Vec<TranscriptionTimestampWord> {
+    let Some(diagnostics) = diagnostics else {
+        return Vec::new();
+    };
+    let Some(raw_words) = diagnostic_array(diagnostics, "timestamp_words") else {
+        return Vec::new();
+    };
+
+    let mut previous_end = 0.0f32;
+    raw_words
+        .iter()
+        .filter_map(|word| {
+            let text = word
+                .get("word")
+                .or_else(|| word.get("text"))
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if text.is_empty() {
+                return None;
+            }
+            let start = word
+                .get("start_time_seconds")
+                .or_else(|| word.get("start_time"))
+                .or_else(|| word.get("start"))
+                .and_then(|value| value.as_f64())
+                .map(|value| value as f32)
+                .unwrap_or(previous_end)
+                .max(0.0);
+            let end = word
+                .get("end_time_seconds")
+                .or_else(|| word.get("end_time"))
+                .or_else(|| word.get("end"))
+                .and_then(|value| value.as_f64())
+                .map(|value| value as f32)
+                .unwrap_or(start);
+            if !start.is_finite() || !end.is_finite() {
+                return None;
+            }
+            let end = end.max(start + 0.01);
+            previous_end = end;
+            Some(TranscriptionTimestampWord {
+                word: text,
+                start,
+                end,
+            })
+        })
+        .collect()
+}
+
 fn extract_model_timestamp_segments(
     diagnostics: Option<&serde_json::Value>,
 ) -> Vec<TranscriptionTimestampSegment> {
     let Some(diagnostics) = diagnostics else {
         return Vec::new();
     };
-    let Some(output) = diagnostics
-        .get("output")
-        .or_else(|| diagnostics.get("model_diagnostics")?.get("output"))
-    else {
-        return Vec::new();
-    };
-    let Some(raw_segments) = output.get("segments").and_then(|value| value.as_array()) else {
+    let Some(raw_segments) = diagnostic_array(diagnostics, "segments") else {
         return Vec::new();
     };
 
@@ -784,6 +842,34 @@ fn extract_model_timestamp_segments(
             text,
         })
         .collect()
+}
+
+fn diagnostic_array<'a>(
+    diagnostics: &'a serde_json::Value,
+    key: &str,
+) -> Option<&'a Vec<serde_json::Value>> {
+    diagnostics
+        .get(key)
+        .and_then(|value| value.as_array())
+        .or_else(|| {
+            diagnostics
+                .get("output")?
+                .get(key)
+                .and_then(|value| value.as_array())
+        })
+        .or_else(|| {
+            diagnostics
+                .get("model_diagnostics")?
+                .get(key)
+                .and_then(|value| value.as_array())
+        })
+        .or_else(|| {
+            diagnostics
+                .get("model_diagnostics")?
+                .get("output")?
+                .get(key)
+                .and_then(|value| value.as_array())
+        })
 }
 
 fn push_timestamp_segment(
@@ -1035,6 +1121,12 @@ mod tests {
     }
 
     #[test]
+    fn transcription_model_validation_accepts_granite_speech() {
+        validate_transcription_model(Some("ibm-granite/granite-speech-4.1-2b-plus"))
+            .expect("Granite Speech should be accepted for offline transcription");
+    }
+
+    #[test]
     fn transcription_model_validation_rejects_tts_or_chat_model() {
         let tts = validate_transcription_model(Some("Kokoro-82M"))
             .expect_err("TTS model should be rejected for transcription");
@@ -1210,6 +1302,52 @@ mod tests {
         assert_eq!(segments[0].id, 0);
         assert_eq!(segments[0].text, "hello");
         assert_eq!(segments[1].start, 1.5);
+    }
+
+    #[test]
+    fn extracts_granite_timestamp_words_from_root_diagnostics() {
+        let diagnostics = serde_json::json!({
+            "family": "granite_speech_asr",
+            "timestamp_words": [
+                {
+                    "word": "hello",
+                    "end_time_seconds": 0.45
+                },
+                {
+                    "word": "world",
+                    "end_time_seconds": 0.9
+                }
+            ]
+        });
+
+        let words = extract_model_timestamp_words(Some(&diagnostics));
+
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].word, "hello");
+        assert!((words[0].start - 0.0).abs() < f32::EPSILON);
+        assert!((words[0].end - 0.45).abs() < f32::EPSILON);
+        assert_eq!(words[1].word, "world");
+        assert!((words[1].start - 0.45).abs() < f32::EPSILON);
+        assert!((words[1].end - 0.9).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn builds_verbose_segments_from_granite_timestamp_words() {
+        let diagnostics = serde_json::json!({
+            "family": "granite_speech_asr",
+            "timestamp_words": [
+                { "word": "hello", "end_time_seconds": 0.4 },
+                { "word": "world", "end_time_seconds": 0.9 }
+            ]
+        });
+
+        let words = extract_model_timestamp_words(Some(&diagnostics));
+        let segments = build_timestamp_segments(&words, &[]);
+
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].text, "hello world");
+        assert!((segments[0].start - 0.0).abs() < f32::EPSILON);
+        assert!((segments[0].end - 0.9).abs() < f32::EPSILON);
     }
 
     #[test]
