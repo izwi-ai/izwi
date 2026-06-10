@@ -336,3 +336,108 @@ fn default_attention_probs_dropout_prob() -> f32 {
 fn default_rope_theta() -> f64 {
     10_000.0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plus_config() -> GraniteSpeechConfig {
+        GraniteSpeechConfig {
+            architectures: vec!["GraniteSpeechPlusForConditionalGeneration".to_string()],
+            audio_token_index: 100_352,
+            downsample_rate: 5,
+            dtype: Some("bfloat16".to_string()),
+            encoder_config: GraniteSpeechEncoderConfig {
+                cat_hidden_layers: vec![3],
+                context_size: 200,
+                conv_expansion_factor: 2,
+                conv_kernel_size: 15,
+                dim_head: 128,
+                dropout: 0.0,
+                feedforward_mult: 4,
+                hidden_dim: 1024,
+                input_dim: 160,
+                max_pos_emb: 512,
+                model_type: Some("granite_speech_plus_encoder".to_string()),
+                num_heads: 8,
+                num_layers: 16,
+                output_dim: 348,
+            },
+            has_lora_adapter: false,
+            projector_config: GraniteSpeechProjectorConfig {
+                attention_probs_dropout_prob: default_attention_probs_dropout_prob(),
+                encoder_hidden_size: 2048,
+                hidden_act: default_hidden_act(),
+                hidden_dropout_prob: default_hidden_dropout_prob(),
+                hidden_size: 1024,
+                intermediate_size: 4096,
+                layer_norm_eps: default_layer_norm_eps(),
+                max_position_embeddings: 512,
+                model_type: Some("blip_2_qformer".to_string()),
+                num_attention_heads: 16,
+                num_hidden_layers: 2,
+                pad_token_id: Some(0),
+                use_qformer_text_input: false,
+                cross_attention_frequency: 1,
+                chunk_size_feed_forward: 0,
+            },
+            text_config: GraniteTextConfig {
+                attention_multiplier: 0.0078125,
+                bos_token_id: 100_257,
+                dtype: Some("bfloat16".to_string()),
+                embedding_multiplier: 12.0,
+                eos_token_id: 100_257,
+                hidden_size: 2048,
+                intermediate_size: 4096,
+                logits_scaling: 8.0,
+                max_position_embeddings: 4096,
+                model_type: Some("granite".to_string()),
+                num_attention_heads: 16,
+                num_hidden_layers: 40,
+                num_key_value_heads: 4,
+                pad_token_id: 100_256,
+                residual_multiplier: 0.22,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10_000.0,
+                tie_word_embeddings: true,
+                use_cache: true,
+                vocab_size: 100_353,
+            },
+            window_size: 15,
+            model_type: Some("granite_speech_plus".to_string()),
+        }
+    }
+
+    #[test]
+    fn validate_plus_accepts_concatenated_encoder_width() {
+        let cfg = plus_config();
+        cfg.validate_plus().unwrap();
+    }
+
+    #[test]
+    fn validate_plus_rejects_projector_width_mismatch() {
+        let mut cfg = plus_config();
+        cfg.projector_config.encoder_hidden_size = 1024;
+        let err = cfg.validate_plus().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("concatenated encoder width 2048"));
+    }
+
+    #[test]
+    fn projector_config_defaults_blip2_fields_when_omitted() {
+        let raw = r#"{
+            "encoder_hidden_size": 2048,
+            "hidden_size": 1024,
+            "intermediate_size": 4096,
+            "max_position_embeddings": 512,
+            "num_attention_heads": 16,
+            "num_hidden_layers": 2
+        }"#;
+        let cfg: GraniteSpeechProjectorConfig = serde_json::from_str(raw).unwrap();
+        assert_eq!(cfg.hidden_act, "gelu");
+        assert_eq!(cfg.hidden_dropout_prob, 0.1);
+        assert_eq!(cfg.attention_probs_dropout_prob, 0.1);
+        assert_eq!(cfg.cross_attention_frequency, 1);
+    }
+}
