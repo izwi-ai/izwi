@@ -1170,6 +1170,17 @@ mod tests {
     }
 
     #[test]
+    fn relative_position_score_row_handles_head_batched_query_rows() {
+        let device = Device::Cpu;
+        let q_row = Tensor::zeros((8, 1, 128), DType::F32, &device).unwrap();
+        let rel_row = Tensor::zeros((200, 128), DType::F32, &device).unwrap();
+
+        let scores = relative_position_score_row(&q_row, &rel_row).unwrap();
+
+        assert_eq!(scores.dims(), &[8, 1, 200]);
+    }
+
+    #[test]
     fn stop_token_set_deduplicates_eos_pad_and_extra_ids() {
         let tokens = GraniteSpeechSpecialTokens {
             bos_token_id: 1,
