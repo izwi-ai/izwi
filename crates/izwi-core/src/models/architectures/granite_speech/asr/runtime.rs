@@ -412,15 +412,30 @@ impl GraniteConformerAttention {
         let kv = self.to_kv.forward(&padded)?;
         let k = kv.narrow(2, 0, self.num_heads * self.dim_head)?;
         let v = kv.narrow(2, self.num_heads * self.dim_head, self.num_heads * self.dim_head)?;
-        let q = q
-            .reshape((batch, nblocks, self.context_size, self.num_heads, self.dim_head))?
-            .transpose(2, 3)?;
-        let k = k
-            .reshape((batch, nblocks, self.context_size, self.num_heads, self.dim_head))?
-            .transpose(2, 3)?;
-        let v = v
-            .reshape((batch, nblocks, self.context_size, self.num_heads, self.dim_head))?
-            .transpose(2, 3)?;
+        let q = encoder_attention_heads(
+            &q,
+            batch,
+            nblocks,
+            self.context_size,
+            self.num_heads,
+            self.dim_head,
+        )?;
+        let k = encoder_attention_heads(
+            &k,
+            batch,
+            nblocks,
+            self.context_size,
+            self.num_heads,
+            self.dim_head,
+        )?;
+        let v = encoder_attention_heads(
+            &v,
+            batch,
+            nblocks,
+            self.context_size,
+            self.num_heads,
+            self.dim_head,
+        )?;
 
         let pos_bias = self.relative_position_bias(&q)?;
         let scale = 1.0 / (self.dim_head as f64).sqrt();
@@ -467,6 +482,20 @@ impl GraniteConformerAttention {
             .reshape((batch, blocks, heads, context, context))?;
         (out / (dim as f64).sqrt())?.to_dtype(out_dtype).map_err(Error::from)
     }
+}
+
+fn encoder_attention_heads(
+    x: &Tensor,
+    batch: usize,
+    nblocks: usize,
+    context: usize,
+    num_heads: usize,
+    dim_head: usize,
+) -> Result<Tensor> {
+    x.reshape((batch, nblocks, context, num_heads, dim_head))?
+        .transpose(2, 3)?
+        .contiguous()
+        .map_err(Error::from)
 }
 
 fn relative_position_score_row(q_row: &Tensor, rel_row: &Tensor) -> Result<Tensor> {
@@ -1181,6 +1210,27 @@ mod tests {
         let scores = relative_position_score_row(&q_row, &rel_row).unwrap();
 
         assert_eq!(scores.dims(), &[8, 1, 200]);
+    }
+
+    #[test]
+    fn encoder_attention_heads_compacts_transposed_context_layout() {
+        let device = Device::Cpu;
+        let projected = Tensor::zeros((1, 200, 1024), DType::F32, &device).unwrap();
+        let strided = projected
+            .reshape((1, 1, 200, 8, 128))
+            .unwrap()
+            .transpose(2, 3)
+            .unwrap();
+
+        assert_eq!(strided.dims(), &[1, 1, 8, 200, 128]);
+        assert!(!strided.is_contiguous());
+
+        let heads = encoder_attention_heads(&projected, 1, 1, 200, 8, 128).unwrap();
+
+        assert_eq!(heads.dims(), &[1, 1, 8, 200, 128]);
+        assert!(heads.is_contiguous());
+        assert_eq!(heads.stride(), &[204800, 204800, 25600, 128, 1]);
+        assert_eq!(heads.t().unwrap().stride(), &[204800, 204800, 25600, 1, 128]);
     }
 
     #[test]
