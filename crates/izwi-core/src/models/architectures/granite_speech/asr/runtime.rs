@@ -1098,7 +1098,7 @@ impl GraniteTextAttention {
         k = apply_rotary_emb(&k, &cos, &sin)?;
         let (k, v, total_len) = if let Some(cache) = cache {
             cache.append(layer_idx, k.clone(), v.clone())?;
-            if seq_len == 1 && start_pos > 0 {
+            if granite_dense_head_decode_allowed(q.device()) && seq_len == 1 && start_pos > 0 {
                 if let Some((k_heads, v_heads)) = cache.dense_heads(layer_idx) {
                     record_decode_attention_path(DecodeAttentionPath::Dense);
                     let out = dense_decode_attention_heads_scaled(
@@ -1148,6 +1148,10 @@ impl GraniteTextAttention {
         let out = out.reshape((batch, seq_len, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&out).map_err(Error::from)
     }
+}
+
+fn granite_dense_head_decode_allowed(device: &Device) -> bool {
+    device.is_cuda()
 }
 
 fn build_rope_cache(
@@ -1472,6 +1476,11 @@ mod tests {
             .fold(0.0f32, f32::max);
 
         assert!(max_diff < 1e-6, "max diff {max_diff}");
+    }
+
+    #[test]
+    fn dense_head_decode_policy_skips_cpu() {
+        assert!(!granite_dense_head_decode_allowed(&Device::Cpu));
     }
 
     #[test]
