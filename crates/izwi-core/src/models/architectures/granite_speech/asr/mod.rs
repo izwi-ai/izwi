@@ -21,24 +21,24 @@ mod runtime;
 mod transcript;
 
 pub use config::{
-    load_granite_speech_chat_template, GraniteSpeechAudioProcessorConfig, GraniteSpeechConfig,
-    GraniteSpeechEncoderConfig, GraniteSpeechGenerationConfig, GraniteSpeechMelSpecConfig,
-    GraniteSpeechProcessorConfig, GraniteSpeechProjectorConfig, GraniteSpeechTokenizerConfig,
-    GraniteTextConfig,
+    GraniteSpeechAudioProcessorConfig, GraniteSpeechConfig, GraniteSpeechEncoderConfig,
+    GraniteSpeechGenerationConfig, GraniteSpeechMelSpecConfig, GraniteSpeechProcessorConfig,
+    GraniteSpeechProjectorConfig, GraniteSpeechTokenizerConfig, GraniteTextConfig,
+    load_granite_speech_chat_template,
 };
 pub use preprocessor::{GraniteSpeechAudioFeatures, GraniteSpeechPreprocessor};
 pub use prompt::{
-    GraniteSpeechPrompt, GraniteSpeechPromptOptions, GraniteSpeechPromptTokenizer,
-    GraniteSpeechSpecialTokens, GraniteSpeechTask, GRANITE_SPEECH_ASR_PROMPT,
-    GRANITE_SPEECH_SPEAKER_PROMPT, GRANITE_SPEECH_SYSTEM_PROMPT, GRANITE_SPEECH_TIMESTAMP_PROMPT,
+    GRANITE_SPEECH_ASR_PROMPT, GRANITE_SPEECH_SPEAKER_PROMPT, GRANITE_SPEECH_SYSTEM_PROMPT,
+    GRANITE_SPEECH_TIMESTAMP_PROMPT, GraniteSpeechPrompt, GraniteSpeechPromptOptions,
+    GraniteSpeechPromptTokenizer, GraniteSpeechSpecialTokens, GraniteSpeechTask,
 };
 pub use runtime::{
     GraniteSpeechAudioEmbeddingStats, GraniteSpeechGeneration, GraniteSpeechGenerationStats,
     GraniteSpeechGenerationTimings, GraniteSpeechRuntime,
 };
 pub use transcript::{
-    parse_granite_speech_output, GraniteSpeechParsedTranscript, GraniteSpeechSegment,
-    GraniteSpeechTimestampWord,
+    GraniteSpeechParsedTranscript, GraniteSpeechSegment, GraniteSpeechTimestampWord,
+    parse_granite_speech_output,
 };
 
 const REQUIRED_ARTIFACTS: &[&str] = &[
@@ -446,6 +446,7 @@ fn granite_diagnostics(
         "stop_token": generation.stats.stop_token,
         "decode": {
             "generated_tokens": generation.stats.generated_tokens,
+            "max_new_tokens": generation.stats.max_new_tokens,
             "stop_reason": generation.stats.stop_reason,
             "stop_token": generation.stats.stop_token,
         },
@@ -628,9 +629,10 @@ mod tests {
         )
         .unwrap();
         let err = ensure_granite_speech_artifacts(&dir).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("Invalid Granite Speech safetensors shard path"));
+        assert!(
+            err.to_string()
+                .contains("Invalid Granite Speech safetensors shard path")
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -668,6 +670,7 @@ mod tests {
                 prompt_tokens: 4,
                 audio_tokens: 3,
                 generated_tokens: 2,
+                max_new_tokens: 128,
                 stop_reason: "stop_token".to_string(),
                 stop_token: Some(100_257),
                 dense_decode_cache_enabled: true,
@@ -722,6 +725,7 @@ mod tests {
         assert_eq!(diagnostics["audio"]["conformer_pad_frames"], 199);
         assert_eq!(diagnostics["audio"]["qformer_queries_per_window"], 3);
         assert_eq!(diagnostics["decode"]["generated_tokens"], 2);
+        assert_eq!(diagnostics["decode"]["max_new_tokens"], 128);
         assert_eq!(diagnostics["execution"]["dense_decode_cache"], true);
         assert_eq!(
             diagnostics["execution"]["dense_decode_cache_configured"],

@@ -3,22 +3,22 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use candle_core::{DType, Device, Tensor, D};
+use candle_core::{D, DType, Device, Tensor};
 use candle_nn::{
-    batch_norm, conv1d, conv1d_no_bias, embedding, layer_norm, linear, linear_no_bias, ops,
     BatchNorm, Conv1d, Conv1dConfig, Embedding, LayerNorm, Linear, Module, ModuleT, RmsNorm,
-    VarBuilder,
+    VarBuilder, batch_norm, conv1d, conv1d_no_bias, embedding, layer_norm, linear, linear_no_bias,
+    ops,
 };
 
 use crate::backends::DeviceProfile;
 use crate::error::{Error, Result};
 use crate::kernels::try_fused_silu_mul;
-use crate::models::architectures::qwen3::core::{causal_mask, repeat_kv, Qwen3Cache};
+use crate::models::architectures::qwen3::core::{Qwen3Cache, causal_mask, repeat_kv};
 use crate::models::shared::attention::flash::{
     try_fused_self_attention, try_fused_self_attention_scaled,
 };
 use crate::models::shared::attention::paged::default_kv_page_size;
-use crate::models::shared::telemetry::{record_decode_attention_path, DecodeAttentionPath};
+use crate::models::shared::telemetry::{DecodeAttentionPath, record_decode_attention_path};
 
 use super::config::{GraniteSpeechConfig, GraniteSpeechEncoderConfig, GraniteTextConfig};
 use super::preprocessor::GraniteSpeechAudioFeatures;
@@ -29,6 +29,7 @@ pub struct GraniteSpeechGenerationStats {
     pub prompt_tokens: usize,
     pub audio_tokens: usize,
     pub generated_tokens: usize,
+    pub max_new_tokens: usize,
     pub stop_reason: String,
     pub stop_token: Option<u32>,
     pub dense_decode_cache_enabled: bool,
@@ -245,6 +246,7 @@ impl GraniteSpeechRuntime {
                 prompt_tokens: input_ids.len(),
                 audio_tokens,
                 generated_tokens: generated.len(),
+                max_new_tokens,
                 stop_reason,
                 stop_token,
                 dense_decode_cache_enabled,

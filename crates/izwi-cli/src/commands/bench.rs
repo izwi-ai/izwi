@@ -504,6 +504,7 @@ pub async fn execute(
             iterations,
             file,
             language,
+            max_tokens,
             concurrent,
             warmup,
         } => bench_asr(
@@ -512,6 +513,7 @@ pub async fn execute(
             iterations,
             file,
             language.as_deref(),
+            max_tokens,
             concurrent,
             warmup,
             &options,
@@ -1083,6 +1085,7 @@ async fn bench_manifest(
                     case.iterations.unwrap_or(10),
                     file,
                     case.language.as_deref(),
+                    case.max_tokens,
                     case.concurrent.unwrap_or(1),
                     case.warmup.unwrap_or(false),
                     options,
@@ -1702,6 +1705,7 @@ async fn bench_asr(
     iterations: u32,
     file: Option<std::path::PathBuf>,
     language: Option<&str>,
+    max_tokens: Option<usize>,
     concurrent: u32,
     warmup: bool,
     options: &BenchOptions,
@@ -1742,12 +1746,22 @@ async fn bench_asr(
             theme.info(&format!("Using language hint: {}", language));
         }
     }
+    if let Some(max_tokens) = max_tokens {
+        if max_tokens == 0 {
+            return Err(CliError::InvalidInput(
+                "ASR max tokens must be greater than 0".to_string(),
+            ));
+        }
+        if options.interactive() {
+            theme.info(&format!("Using ASR max tokens: {}", max_tokens));
+        }
+    }
 
     if warmup {
         if options.interactive() {
             theme.info("Running warmup iteration...");
         }
-        let _ = run_asr_request(server, model, &audio_base64, language).await?;
+        let _ = run_asr_request(server, model, &audio_base64, language, max_tokens).await?;
     }
 
     let pb = progress_bar(options.interactive(), iterations as u64);
@@ -1778,6 +1792,7 @@ async fn bench_asr(
                     &model,
                     audio_base64.as_str(),
                     language.as_deref().map(|value| value.as_str()),
+                    max_tokens,
                 )
                 .await
                 .map(|response| AsrBenchSample {
@@ -1889,7 +1904,7 @@ async fn bench_asr(
             warmup,
             prompt: None,
             system: None,
-            max_tokens: None,
+            max_tokens,
             text: None,
             file: Some(audio_file.display().to_string()),
             saved_voice_id: None,
@@ -2204,6 +2219,7 @@ async fn run_asr_request(
     model: &str,
     audio_base64: &str,
     language: Option<&str>,
+    max_tokens: Option<usize>,
 ) -> Result<AsrBenchResponse> {
     let client = http::client(Some(std::time::Duration::from_secs(300)))?;
     let mut request_body = serde_json::json!({
@@ -2213,6 +2229,9 @@ async fn run_asr_request(
     });
     if let Some(language) = language {
         request_body["language"] = serde_json::Value::String(language.to_string());
+    }
+    if let Some(max_tokens) = max_tokens {
+        request_body["max_tokens"] = serde_json::json!(max_tokens);
     }
 
     let response = client
