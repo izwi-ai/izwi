@@ -1170,7 +1170,7 @@ impl GraniteTextAttention {
 }
 
 fn granite_dense_head_decode_allowed(device: &Device) -> bool {
-    device.is_metal() || device.is_cuda()
+    device.is_cuda()
 }
 
 fn granite_qformer_fused_attention_allowed(device: &Device) -> bool {
