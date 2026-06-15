@@ -234,6 +234,7 @@ impl GraniteSpeechAsrModel {
             None,
             options,
             &mut no_op,
+            false,
         )
     }
 
@@ -255,6 +256,7 @@ impl GraniteSpeechAsrModel {
             prefix_text,
             options,
             &mut no_op,
+            false,
         )
     }
 
@@ -294,6 +296,7 @@ impl GraniteSpeechAsrModel {
             None,
             options,
             on_delta,
+            true,
         )
     }
 
@@ -322,6 +325,7 @@ impl GraniteSpeechAsrModel {
         prefix_text: Option<&str>,
         options: GraniteSpeechAsrGenerationOptions,
         on_delta: &mut dyn FnMut(&str),
+        emit_deltas: bool,
     ) -> Result<GraniteSpeechAsrTranscriptionOutput> {
         let model_start = Instant::now();
         let prepare_start = Instant::now();
@@ -351,6 +355,7 @@ impl GraniteSpeechAsrModel {
             &options.stop_sequences,
             &mut decode,
             on_delta,
+            emit_deltas,
         )?;
         let model_total = model_start.elapsed();
         let parsed = parse_granite_speech_output(&generation.text);
