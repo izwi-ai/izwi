@@ -8,6 +8,8 @@ use rubato::{FftFixedInOut, Resampler};
 
 use crate::error::{Error, Result};
 
+const DEFAULT_FFT_RESAMPLE_CHUNK_FRAMES: usize = 4096;
+
 pub fn resample_mono_high_quality(
     samples: &[f32],
     src_rate: u32,
@@ -27,19 +29,49 @@ pub fn resample_mono_high_quality(
         return Ok(Vec::new());
     }
 
+    let chunk_frames = samples.len().min(DEFAULT_FFT_RESAMPLE_CHUNK_FRAMES).max(1);
     let mut resampler =
-        FftFixedInOut::<f32>::new(src_rate as usize, dst_rate as usize, samples.len(), 1)
+        FftFixedInOut::<f32>::new(src_rate as usize, dst_rate as usize, chunk_frames, 1)
             .map_err(|err| Error::AudioError(format!("Failed to construct resampler: {err}")))?;
-    let input_frames = resampler.input_frames_next();
-    let mut input = samples.to_vec();
-    input.resize(input_frames, 0.0);
+    let output_delay = resampler.output_delay();
+    let mut output = Vec::with_capacity(target_len.saturating_add(output_delay));
+    let mut outbuffer = vec![vec![0.0f32; resampler.output_frames_max()]; 1];
+    let mut input_offset = 0usize;
 
-    let mut output = resampler
-        .process(&[input], None)
-        .map_err(|err| Error::AudioError(format!("Failed to resample audio: {err}")))?
-        .into_iter()
-        .next()
-        .unwrap_or_default();
+    while samples.len().saturating_sub(input_offset) >= resampler.input_frames_next() {
+        let input = [&samples[input_offset..]];
+        let (consumed, written) = resampler
+            .process_into_buffer(&input, &mut outbuffer, None)
+            .map_err(|err| Error::AudioError(format!("Failed to resample audio: {err}")))?;
+        input_offset = input_offset.saturating_add(consumed);
+        output.extend_from_slice(&outbuffer[0][..written]);
+    }
+
+    if input_offset < samples.len() {
+        let input = [&samples[input_offset..]];
+        let (_consumed, written) = resampler
+            .process_partial_into_buffer(Some(&input), &mut outbuffer, None)
+            .map_err(|err| Error::AudioError(format!("Failed to resample audio: {err}")))?;
+        output.extend_from_slice(&outbuffer[0][..written]);
+    }
+
+    while output.len() < target_len.saturating_add(output_delay) {
+        let (_consumed, written) = resampler
+            .process_partial_into_buffer::<Vec<f32>, Vec<f32>>(None, &mut outbuffer, None)
+            .map_err(|err| Error::AudioError(format!("Failed to resample audio: {err}")))?;
+        if written == 0 {
+            break;
+        }
+        output.extend_from_slice(&outbuffer[0][..written]);
+    }
+
+    if output_delay > 0 {
+        if output.len() > output_delay {
+            output.drain(..output_delay);
+        } else {
+            output.clear();
+        }
+    }
     output.truncate(target_len);
 
     if output.len() < target_len {
@@ -109,6 +141,29 @@ mod tests {
     }
 
     #[test]
+    fn resampling_trims_fft_output_delay_for_short_clips() {
+        let mut impulse = vec![0.0f32; 86_400];
+        impulse[120] = 1.0;
+
+        let delayed = resample_one_fft_chunk_for_test(&impulse, 24_000, 16_000);
+        let corrected =
+            resample_mono_high_quality(&impulse, 24_000, 16_000).expect("resampling should pass");
+
+        assert_eq!(
+            corrected.len(),
+            target_sample_count(impulse.len(), 24_000, 16_000)
+        );
+        assert!(
+            max_abs_index(&delayed) > corrected.len() / 3,
+            "single whole-clip FFT resampling should retain a large delay"
+        );
+        assert!(
+            max_abs_index(&corrected) < 2_000,
+            "corrected resampling should keep the impulse near the start"
+        );
+    }
+
+    #[test]
     fn rejects_zero_sample_rates() {
         let err =
             resample_mono_high_quality(&[0.0], 0, 16_000).expect_err("zero input rate should fail");
@@ -131,6 +186,28 @@ mod tests {
             .sum::<f64>()
             / samples.len() as f64)
             .sqrt() as f32
+    }
+
+    fn max_abs_index(samples: &[f32]) -> usize {
+        samples
+            .iter()
+            .enumerate()
+            .max_by(|(_, lhs), (_, rhs)| lhs.abs().total_cmp(&rhs.abs()))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0)
+    }
+
+    fn resample_one_fft_chunk_for_test(samples: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
+        let target_len = target_sample_count(samples.len(), src_rate, dst_rate);
+        let mut resampler =
+            FftFixedInOut::<f32>::new(src_rate as usize, dst_rate as usize, samples.len(), 1)
+                .unwrap();
+        let input_frames = resampler.input_frames_next();
+        let mut input = samples.to_vec();
+        input.resize(input_frames, 0.0);
+        let mut output = resampler.process(&[input], None).unwrap().remove(0);
+        output.truncate(target_len);
+        output
     }
 
     fn resample_linear_for_test(samples: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {

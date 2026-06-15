@@ -9,7 +9,7 @@ mod streaming;
 
 pub use codec::{AudioCodec, CodecConfig};
 pub use encoder::{AudioEncoder, AudioFormat};
-pub use inspection::{AudioInspection, inspect_audio_bytes};
-pub use preprocessing::{MelConfig, MelSpectrogram};
+pub use inspection::{inspect_audio_bytes, AudioInspection};
+pub use preprocessing::{MelConfig, MelNorm, MelScale, MelSpectrogram};
 pub use resampling::{resample_mono_high_quality, target_sample_count};
 pub use streaming::{AudioChunkBuffer, StreamingConfig};

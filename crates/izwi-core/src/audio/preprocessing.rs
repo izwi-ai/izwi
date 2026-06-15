@@ -15,19 +15,35 @@ pub struct MelConfig {
     pub f_min: f32,
     pub f_max: f32,
     pub normalize: bool,
+    pub mel_scale: MelScale,
+    pub mel_norm: MelNorm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MelScale {
+    Slaney,
+    Htk,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MelNorm {
+    Slaney,
+    None,
 }
 
 impl Default for MelConfig {
     fn default() -> Self {
         Self {
             sample_rate: 16_000,
-            n_fft: 400,      // Whisper and the retained Qwen forced-aligner stack use 25 ms windows
+            n_fft: 400, // Whisper and the retained Qwen forced-aligner stack use 25 ms windows
             win_length: None,
             hop_length: 160, // 10ms at 16kHz
             n_mels: 128,
             f_min: 0.0,
             f_max: 8_000.0,
             normalize: true,
+            mel_scale: MelScale::Slaney,
+            mel_norm: MelNorm::Slaney,
         }
     }
 }
@@ -46,6 +62,8 @@ impl MelSpectrogram {
             config.sample_rate as f32,
             config.f_min,
             config.f_max,
+            config.mel_scale,
+            config.mel_norm,
         );
         let window =
             Self::hann_window_padded(config.n_fft, config.win_length.unwrap_or(config.n_fft));
@@ -184,17 +202,22 @@ impl MelSpectrogram {
         sample_rate: f32,
         f_min: f32,
         f_max: f32,
+        mel_scale: MelScale,
+        mel_norm: MelNorm,
     ) -> Vec<Vec<f32>> {
         let fft_freqs: Vec<f32> = (0..n_freqs)
             .map(|i| (sample_rate / 2.0) * (i as f32) / (n_freqs - 1) as f32)
             .collect();
 
-        let mel_min = hertz_to_mel(f_min);
-        let mel_max = hertz_to_mel(f_max);
+        let mel_min = hertz_to_mel(f_min, mel_scale);
+        let mel_max = hertz_to_mel(f_max, mel_scale);
         let mel_points: Vec<f32> = (0..=n_mels + 1)
             .map(|i| mel_min + (mel_max - mel_min) * i as f32 / (n_mels + 1) as f32)
             .collect();
-        let filter_freqs: Vec<f32> = mel_points.iter().map(|&m| mel_to_hertz(m)).collect();
+        let filter_freqs: Vec<f32> = mel_points
+            .iter()
+            .map(|&m| mel_to_hertz(m, mel_scale))
+            .collect();
 
         // Shape: [n_mels, n_freqs] - each row is a mel bin's weights across frequencies
         let mut mel_filters = vec![vec![0.0; n_freqs]; n_mels];
@@ -221,16 +244,18 @@ impl MelSpectrogram {
             }
         }
 
-        // Slaney-style normalization (constant energy per channel).
-        let mut norms = vec![0.0; n_mels];
-        for mel_idx in 0..n_mels {
-            let low = filter_freqs[mel_idx];
-            let high = filter_freqs[mel_idx + 2];
-            norms[mel_idx] = if high > low { 2.0 / (high - low) } else { 0.0 };
-        }
-        for mel_idx in 0..n_mels {
-            for freq_idx in 0..n_freqs {
-                mel_filters[mel_idx][freq_idx] *= norms[mel_idx];
+        if mel_norm == MelNorm::Slaney {
+            // Slaney-style normalization (constant energy per channel).
+            let mut norms = vec![0.0; n_mels];
+            for mel_idx in 0..n_mels {
+                let low = filter_freqs[mel_idx];
+                let high = filter_freqs[mel_idx + 2];
+                norms[mel_idx] = if high > low { 2.0 / (high - low) } else { 0.0 };
+            }
+            for mel_idx in 0..n_mels {
+                for freq_idx in 0..n_freqs {
+                    mel_filters[mel_idx][freq_idx] *= norms[mel_idx];
+                }
             }
         }
 
@@ -265,26 +290,84 @@ impl MelSpectrogram {
     }
 }
 
-fn hertz_to_mel(freq: f32) -> f32 {
-    let min_log_hertz = 1000.0;
-    let min_log_mel = 15.0;
-    let logstep = 27.0 / (6.4f32).ln();
+fn hertz_to_mel(freq: f32, scale: MelScale) -> f32 {
+    match scale {
+        MelScale::Slaney => {
+            let min_log_hertz = 1000.0;
+            let min_log_mel = 15.0;
+            let logstep = 27.0 / (6.4f32).ln();
 
-    if freq < min_log_hertz {
-        3.0 * freq / 200.0
-    } else {
-        min_log_mel + (freq / min_log_hertz).ln() * logstep
+            if freq < min_log_hertz {
+                3.0 * freq / 200.0
+            } else {
+                min_log_mel + (freq / min_log_hertz).ln() * logstep
+            }
+        }
+        MelScale::Htk => 2595.0 * (1.0 + freq / 700.0).log10(),
     }
 }
 
-fn mel_to_hertz(mel: f32) -> f32 {
-    let min_log_hertz = 1000.0;
-    let min_log_mel = 15.0;
-    let logstep = (6.4f32).ln() / 27.0;
+fn mel_to_hertz(mel: f32, scale: MelScale) -> f32 {
+    match scale {
+        MelScale::Slaney => {
+            let min_log_hertz = 1000.0;
+            let min_log_mel = 15.0;
+            let logstep = (6.4f32).ln() / 27.0;
 
-    if mel < min_log_mel {
-        200.0 * mel / 3.0
-    } else {
-        min_log_hertz * ((mel - min_log_mel) * logstep).exp()
+            if mel < min_log_mel {
+                200.0 * mel / 3.0
+            } else {
+                min_log_hertz * ((mel - min_log_mel) * logstep).exp()
+            }
+        }
+        MelScale::Htk => 700.0 * (10f32.powf(mel / 2595.0) - 1.0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn htk_mel_scale_matches_standard_reference_points() {
+        let mel_1000 = hertz_to_mel(1000.0, MelScale::Htk);
+        assert!((mel_1000 - 999.9855).abs() < 0.001);
+
+        let hz = mel_to_hertz(mel_1000, MelScale::Htk);
+        assert!((hz - 1000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn default_mel_config_preserves_slaney_filterbank_behavior() {
+        let cfg = MelConfig::default();
+        assert_eq!(cfg.mel_scale, MelScale::Slaney);
+        assert_eq!(cfg.mel_norm, MelNorm::Slaney);
+    }
+
+    #[test]
+    fn mel_filterbank_can_disable_slaney_area_normalization() {
+        let slaney = MelSpectrogram::create_mel_filterbank(
+            257,
+            80,
+            16_000.0,
+            0.0,
+            8_000.0,
+            MelScale::Slaney,
+            MelNorm::Slaney,
+        );
+        let htk_no_norm = MelSpectrogram::create_mel_filterbank(
+            257,
+            80,
+            16_000.0,
+            0.0,
+            8_000.0,
+            MelScale::Htk,
+            MelNorm::None,
+        );
+
+        let slaney_sum: f32 = slaney.iter().flatten().copied().sum();
+        let htk_sum: f32 = htk_no_norm.iter().flatten().copied().sum();
+        assert!(htk_sum > slaney_sum);
+        assert!((htk_sum - slaney_sum).abs() > 1.0);
     }
 }
