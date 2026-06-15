@@ -823,13 +823,17 @@ impl GraniteQFormerAttention {
         let q = self.transpose_for_scores(&self.query.forward(x)?)?;
         let k = self.transpose_for_scores(&self.key.forward(kv_input)?)?;
         let v = self.transpose_for_scores(&self.value.forward(kv_input)?)?;
-        if let Some(context) = try_fused_self_attention(&q, &k, &v, None, self.head_dim, false)? {
-            let context = context.transpose(1, 2)?.flatten_from(D::Minus2)?;
-            let out = self.output_dense.forward(&context)?;
-            return self
-                .output_norm
-                .forward(&out.broadcast_add(x)?)
-                .map_err(Error::from);
+        if granite_qformer_fused_attention_allowed(q.device()) {
+            if let Some(context) =
+                try_fused_self_attention(&q, &k, &v, None, self.head_dim, false)?
+            {
+                let context = context.transpose(1, 2)?.flatten_from(D::Minus2)?;
+                let out = self.output_dense.forward(&context)?;
+                return self
+                    .output_norm
+                    .forward(&out.broadcast_add(x)?)
+                    .map_err(Error::from);
+            }
         }
         let mut scores = q.matmul(&k.t()?)?;
         scores = (scores / (self.head_dim as f64).sqrt())?;
@@ -1167,6 +1171,10 @@ fn granite_dense_head_decode_allowed(device: &Device) -> bool {
     device.is_cuda()
 }
 
+fn granite_qformer_fused_attention_allowed(device: &Device) -> bool {
+    device.is_cuda()
+}
+
 fn build_rope_cache(
     seq_len: usize,
     head_dim: usize,
@@ -1494,6 +1502,11 @@ mod tests {
     #[test]
     fn dense_head_decode_policy_skips_cpu() {
         assert!(!granite_dense_head_decode_allowed(&Device::Cpu));
+    }
+
+    #[test]
+    fn qformer_fused_attention_policy_skips_cpu() {
+        assert!(!granite_qformer_fused_attention_allowed(&Device::Cpu));
     }
 
     #[test]
