@@ -29,6 +29,7 @@ pub struct GraniteSpeechGenerationStats {
     pub stop_reason: String,
     pub stop_token: Option<u32>,
     pub dense_decode_cache_enabled: bool,
+    pub dense_head_decode_enabled: bool,
     pub dense_decode_max_tokens: usize,
     pub timings: GraniteSpeechGenerationTimings,
 }
@@ -139,6 +140,8 @@ impl GraniteSpeechRuntime {
         );
         let dense_decode_max_tokens = cache.dense_decode_max_tokens();
         let dense_decode_cache_enabled = dense_decode_max_tokens > 0;
+        let dense_head_decode_enabled =
+            dense_decode_cache_enabled && granite_dense_head_decode_allowed(&self.device);
         let prefill_start = Instant::now();
         let mut logits = self.text_model.forward_prompt_with_audio(
             &input_ids,
@@ -195,6 +198,7 @@ impl GraniteSpeechRuntime {
                 stop_reason,
                 stop_token,
                 dense_decode_cache_enabled,
+                dense_head_decode_enabled,
                 dense_decode_max_tokens,
                 timings: GraniteSpeechGenerationTimings { prefill, decode },
             },
