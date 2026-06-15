@@ -566,6 +566,10 @@ pub enum BenchCommands {
         #[arg(short = 'l', long)]
         language: Option<String>,
 
+        /// Maximum ASR decode tokens to request
+        #[arg(long)]
+        max_tokens: Option<usize>,
+
         /// Maximum concurrent requests
         #[arg(short, long, default_value = "1")]
         concurrent: u32,
