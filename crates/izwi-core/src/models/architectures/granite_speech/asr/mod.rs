@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use candle_core::DType;
 use serde_json::json;
@@ -31,7 +32,10 @@ pub use prompt::{
     GraniteSpeechSpecialTokens, GraniteSpeechTask, GRANITE_SPEECH_ASR_PROMPT,
     GRANITE_SPEECH_SPEAKER_PROMPT, GRANITE_SPEECH_SYSTEM_PROMPT, GRANITE_SPEECH_TIMESTAMP_PROMPT,
 };
-pub use runtime::{GraniteSpeechGeneration, GraniteSpeechGenerationStats, GraniteSpeechRuntime};
+pub use runtime::{
+    GraniteSpeechGeneration, GraniteSpeechGenerationStats, GraniteSpeechGenerationTimings,
+    GraniteSpeechRuntime,
+};
 pub use transcript::{
     parse_granite_speech_output, GraniteSpeechParsedTranscript, GraniteSpeechSegment,
     GraniteSpeechTimestampWord,
@@ -319,7 +323,10 @@ impl GraniteSpeechAsrModel {
         options: GraniteSpeechAsrGenerationOptions,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<GraniteSpeechAsrTranscriptionOutput> {
+        let model_start = Instant::now();
+        let prepare_start = Instant::now();
         let features = self.prepare_audio_features(audio, sample_rate)?;
+        let mel_prepare = prepare_start.elapsed();
         validate_granite_audio_duration(features.audio_seconds)?;
 
         let prompt_options = GraniteSpeechPromptOptions {
@@ -330,7 +337,9 @@ impl GraniteSpeechAsrModel {
             ..GraniteSpeechPromptOptions::default()
         };
         let granite_prompt = self.build_prompt(&prompt_options)?;
+        let encoder_start = Instant::now();
         let audio_embeds = self.runtime.audio_embeddings(&features)?;
+        let encoder_forward = encoder_start.elapsed();
         let special_tokens = self.prompt_tokenizer.special_tokens().clone();
         let mut decode = |ids: &[u32]| self.prompt_tokenizer.decode(ids);
         let generation = self.runtime.generate(
@@ -343,8 +352,16 @@ impl GraniteSpeechAsrModel {
             &mut decode,
             on_delta,
         )?;
+        let model_total = model_start.elapsed();
         let parsed = parse_granite_speech_output(&generation.text);
         let text = parsed.text.clone();
+        let timings = GraniteSpeechAsrTimings {
+            mel_prepare,
+            encoder_forward,
+            prefill: generation.stats.timings.prefill,
+            decode: generation.stats.timings.decode,
+            model_total,
+        };
 
         Ok(GraniteSpeechAsrTranscriptionOutput {
             text,
@@ -356,9 +373,19 @@ impl GraniteSpeechAsrModel {
                 &parsed,
                 self.dtype,
                 &self.device,
+                timings,
             )),
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GraniteSpeechAsrTimings {
+    mel_prepare: Duration,
+    encoder_forward: Duration,
+    prefill: Duration,
+    decode: Duration,
+    model_total: Duration,
 }
 
 fn validate_granite_audio_duration(audio_seconds: f32) -> Result<()> {
@@ -377,6 +404,7 @@ fn granite_diagnostics(
     parsed: &GraniteSpeechParsedTranscript,
     dtype: DType,
     device: &DeviceProfile,
+    timings: GraniteSpeechAsrTimings,
 ) -> serde_json::Value {
     json!({
         "family": "granite_speech_asr",
@@ -392,9 +420,36 @@ fn granite_diagnostics(
         "prompt_tokens": generation.stats.prompt_tokens,
         "prompt_prefix_tokens": prompt.prefix_text_token_count,
         "prompt_audio_placeholders": prompt.audio_token_positions.len(),
+        "prompt": {
+            "prompt_tokens": generation.stats.prompt_tokens,
+            "prefix_tokens": prompt.prefix_text_token_count,
+            "audio_placeholders": prompt.audio_token_positions.len(),
+        },
+        "audio": {
+            "audio_tokens": generation.stats.audio_tokens,
+            "mel_frames": features.mel_frames,
+            "encoder_frames": features.encoder_frames,
+        },
         "generated_tokens": generation.stats.generated_tokens,
         "stop_reason": generation.stats.stop_reason,
         "stop_token": generation.stats.stop_token,
+        "decode": {
+            "generated_tokens": generation.stats.generated_tokens,
+            "stop_reason": generation.stats.stop_reason,
+            "stop_token": generation.stats.stop_token,
+        },
+        "execution": {
+            "dense_decode_cache": generation.stats.dense_decode_cache_enabled,
+            "cuda_dense_decode_cache": generation.stats.dense_decode_cache_enabled,
+            "dense_decode_max_tokens": generation.stats.dense_decode_max_tokens,
+        },
+        "timings_ms": {
+            "mel_prepare": duration_ms(timings.mel_prepare),
+            "encoder_forward": duration_ms(timings.encoder_forward),
+            "prefill": duration_ms(timings.prefill),
+            "decode": duration_ms(timings.decode),
+            "model_total": duration_ms(timings.model_total),
+        },
         "speaker_segments": parsed.segments.iter().map(|segment| {
             json!({
                 "speaker": segment.speaker,
@@ -408,6 +463,10 @@ fn granite_diagnostics(
             })
         }).collect::<Vec<_>>(),
     })
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
 }
 
 pub fn ensure_granite_speech_artifacts(model_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -590,7 +649,20 @@ mod tests {
                 generated_tokens: 2,
                 stop_reason: "stop_token".to_string(),
                 stop_token: Some(100_257),
+                dense_decode_cache_enabled: true,
+                dense_decode_max_tokens: 8192,
+                timings: GraniteSpeechGenerationTimings {
+                    prefill: Duration::from_millis(7),
+                    decode: Duration::from_millis(3),
+                },
             },
+        };
+        let timings = GraniteSpeechAsrTimings {
+            mel_prepare: Duration::from_millis(1),
+            encoder_forward: Duration::from_millis(2),
+            prefill: generation.stats.timings.prefill,
+            decode: generation.stats.timings.decode,
+            model_total: Duration::from_millis(12),
         };
         let parsed = parse_granite_speech_output(&generation.text);
         let diagnostics = granite_diagnostics(
@@ -600,11 +672,19 @@ mod tests {
             &parsed,
             DType::F32,
             &DeviceProfile::cpu(),
+            timings,
         );
 
         assert_eq!(diagnostics["projected_audio_tokens"], 3);
         assert_eq!(diagnostics["prompt_prefix_tokens"], 0);
         assert_eq!(diagnostics["prompt_audio_placeholders"], 1);
+        assert_eq!(diagnostics["prompt"]["prompt_tokens"], 4);
+        assert_eq!(diagnostics["audio"]["audio_tokens"], 3);
+        assert_eq!(diagnostics["decode"]["generated_tokens"], 2);
+        assert_eq!(diagnostics["execution"]["dense_decode_cache"], true);
+        assert_eq!(diagnostics["execution"]["dense_decode_max_tokens"], 8192);
+        assert_eq!(diagnostics["timings_ms"]["prefill"], 7.0);
+        assert_eq!(diagnostics["timings_ms"]["decode"], 3.0);
         assert_eq!(diagnostics["speaker_segments"][0]["speaker"], "Speaker 1");
         assert_eq!(diagnostics["timestamp_words"][0]["word"], "hello");
     }

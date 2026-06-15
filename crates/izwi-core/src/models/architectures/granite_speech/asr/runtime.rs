@@ -1,6 +1,7 @@
 //! Native Candle runtime for Granite Speech ASR.
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use candle_core::{DType, Device, Tensor, D};
 use candle_nn::{
@@ -11,7 +12,9 @@ use candle_nn::{
 
 use crate::backends::DeviceProfile;
 use crate::error::{Error, Result};
+use crate::kernels::try_fused_silu_mul;
 use crate::models::architectures::qwen3::core::{causal_mask, repeat_kv, Qwen3Cache};
+use crate::models::shared::attention::paged::default_kv_page_size;
 
 use super::config::{GraniteSpeechConfig, GraniteSpeechEncoderConfig, GraniteTextConfig};
 use super::preprocessor::GraniteSpeechAudioFeatures;
@@ -24,6 +27,15 @@ pub struct GraniteSpeechGenerationStats {
     pub generated_tokens: usize,
     pub stop_reason: String,
     pub stop_token: Option<u32>,
+    pub dense_decode_cache_enabled: bool,
+    pub dense_decode_max_tokens: usize,
+    pub timings: GraniteSpeechGenerationTimings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraniteSpeechGenerationTimings {
+    pub prefill: Duration,
+    pub decode: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,11 +61,13 @@ impl GraniteSpeechRuntime {
         dtype: DType,
     ) -> Result<Self> {
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(shard_paths, dtype, &device.device).map_err(|err| {
-                Error::ModelLoadError(format!(
-                    "Failed to mmap Granite Speech safetensors: {err}"
-                ))
-            })?
+            VarBuilder::from_mmaped_safetensors(shard_paths, dtype, &device.device).map_err(
+                |err| {
+                    Error::ModelLoadError(format!(
+                        "Failed to mmap Granite Speech safetensors: {err}"
+                    ))
+                },
+            )?
         };
         let encoder = GraniteSpeechEncoder::load(&config.encoder_config, vb.pp("encoder"))?;
         let projector = GraniteSpeechProjector::load(config, vb.pp("projector"))?;
@@ -88,8 +102,7 @@ impl GraniteSpeechRuntime {
             .iter()
             .flat_map(|frame| frame.iter().copied())
             .collect::<Vec<_>>();
-        let input = Tensor::from_vec(flat, (1, frames, dim), &self.device)?
-            .to_dtype(self.dtype)?;
+        let input = Tensor::from_vec(flat, (1, frames, dim), &self.device)?.to_dtype(self.dtype)?;
         let encoded = self.encoder.forward(&input)?;
         self.projector.forward(&encoded)
     }
@@ -118,7 +131,14 @@ impl GraniteSpeechRuntime {
             .copied()
             .ok_or_else(|| Error::InvalidInput("Granite prompt has no audio token".to_string()))?;
 
-        let mut cache = Qwen3Cache::new(self.text_model.num_layers());
+        let mut cache = Qwen3Cache::with_page_size_and_dense_decode(
+            self.text_model.num_layers(),
+            default_kv_page_size(),
+            &self.device,
+        );
+        let dense_decode_max_tokens = cache.dense_decode_max_tokens();
+        let dense_decode_cache_enabled = dense_decode_max_tokens > 0;
+        let prefill_start = Instant::now();
         let mut logits = self.text_model.forward_prompt_with_audio(
             &input_ids,
             audio_start,
@@ -126,11 +146,13 @@ impl GraniteSpeechRuntime {
             audio_embeds,
             &mut cache,
         )?;
+        let prefill = prefill_start.elapsed();
         let mut generated = Vec::new();
         let mut rendered = String::new();
         let mut stop_reason = "max_tokens".to_string();
         let mut stop_token = None;
         let stop_tokens = stop_token_set(special_tokens, extra_stop_token_ids);
+        let decode_start = Instant::now();
 
         for step in 0..max_new_tokens.max(1) {
             let token = argmax_last_logits(&logits)?;
@@ -156,12 +178,11 @@ impl GraniteSpeechRuntime {
             }
 
             let token_tensor = Tensor::from_vec(vec![token], (1, 1), &self.device)?;
-            logits = self.text_model.forward(
-                &token_tensor,
-                input_ids.len() + step,
-                Some(&mut cache),
-            )?;
+            logits =
+                self.text_model
+                    .forward(&token_tensor, input_ids.len() + step, Some(&mut cache))?;
         }
+        let decode = decode_start.elapsed();
 
         Ok(GraniteSpeechGeneration {
             text: rendered,
@@ -172,6 +193,9 @@ impl GraniteSpeechRuntime {
                 generated_tokens: generated.len(),
                 stop_reason,
                 stop_token,
+                dense_decode_cache_enabled,
+                dense_decode_max_tokens,
+                timings: GraniteSpeechGenerationTimings { prefill, decode },
             },
         })
     }
@@ -417,7 +441,11 @@ impl GraniteConformerAttention {
         let q = self.to_q.forward(&padded)?;
         let kv = self.to_kv.forward(&padded)?;
         let k = kv.narrow(2, 0, self.num_heads * self.dim_head)?;
-        let v = kv.narrow(2, self.num_heads * self.dim_head, self.num_heads * self.dim_head)?;
+        let v = kv.narrow(
+            2,
+            self.num_heads * self.dim_head,
+            self.num_heads * self.dim_head,
+        )?;
         let q = encoder_attention_heads(
             &q,
             batch,
@@ -484,9 +512,10 @@ impl GraniteConformerAttention {
             rows.push(relative_position_score_row(&q_row, &rel_row)?);
         }
         let refs = rows.iter().collect::<Vec<_>>();
-        let out = Tensor::cat(&refs, 1)?
-            .reshape((batch, blocks, heads, context, context))?;
-        (out / (dim as f64).sqrt())?.to_dtype(out_dtype).map_err(Error::from)
+        let out = Tensor::cat(&refs, 1)?.reshape((batch, blocks, heads, context, context))?;
+        (out / (dim as f64).sqrt())?
+            .to_dtype(out_dtype)
+            .map_err(Error::from)
     }
 }
 
@@ -559,7 +588,13 @@ impl GraniteConformerConv {
         depth_cfg.groups = inner;
         Ok(Self {
             norm: layer_norm(hidden, 1e-5, vb.pp("norm"))?,
-            up_conv: conv1d(hidden, inner * 2, 1, Conv1dConfig::default(), vb.pp("up_conv"))?,
+            up_conv: conv1d(
+                hidden,
+                inner * 2,
+                1,
+                Conv1dConfig::default(),
+                vb.pp("up_conv"),
+            )?,
             depth_conv: conv1d_no_bias(
                 inner,
                 inner,
@@ -568,7 +603,13 @@ impl GraniteConformerConv {
                 vb.pp("depth_conv.conv"),
             )?,
             batch_norm: batch_norm(inner, 1e-5, vb.pp("batch_norm"))?,
-            down_conv: conv1d(inner, hidden, 1, Conv1dConfig::default(), vb.pp("down_conv"))?,
+            down_conv: conv1d(
+                inner,
+                hidden,
+                1,
+                Conv1dConfig::default(),
+                vb.pp("down_conv"),
+            )?,
         })
     }
 
@@ -643,9 +684,9 @@ impl GraniteSpeechProjector {
             hidden.clone()
         };
         let windows = hidden.reshape((batch * nblocks, self.window_size, dim))?;
-        let query = self
-            .query
-            .broadcast_as((batch * nblocks, self.num_queries, self.query.dim(2)?))?;
+        let query =
+            self.query
+                .broadcast_as((batch * nblocks, self.num_queries, self.query.dim(2)?))?;
         let output = self.qformer.forward(&query, &windows)?;
         let output = output.reshape((batch, nblocks * self.num_queries, output.dim(2)?))?;
         self.linear.forward(&output).map_err(Error::from)
@@ -669,7 +710,11 @@ impl GraniteQFormer {
             )?);
         }
         Ok(Self {
-            layernorm: layer_norm(hidden, config.projector_config.layer_norm_eps, vb.pp("layernorm"))?,
+            layernorm: layer_norm(
+                hidden,
+                config.projector_config.layer_norm_eps,
+                vb.pp("layernorm"),
+            )?,
             layers,
         })
     }
@@ -707,16 +752,8 @@ impl GraniteQFormerLayer {
             } else {
                 None
             },
-            intermediate_query: linear(
-                hidden,
-                intermediate,
-                vb.pp("intermediate_query.dense"),
-            )?,
-            output_query_dense: linear(
-                intermediate,
-                hidden,
-                vb.pp("output_query.dense"),
-            )?,
+            intermediate_query: linear(hidden, intermediate, vb.pp("intermediate_query.dense"))?,
+            output_query_dense: linear(intermediate, hidden, vb.pp("output_query.dense"))?,
             output_query_norm: layer_norm(
                 hidden,
                 config.projector_config.layer_norm_eps,
@@ -781,10 +818,7 @@ impl GraniteQFormerAttention {
         let mut scores = q.matmul(&k.t()?)?;
         scores = (scores / (self.head_dim as f64).sqrt())?;
         let probs = ops::softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q.dtype())?;
-        let context = probs
-            .matmul(&v)?
-            .transpose(1, 2)?
-            .flatten_from(D::Minus2)?;
+        let context = probs.matmul(&v)?.transpose(1, 2)?.flatten_from(D::Minus2)?;
         let out = self.output_dense.forward(&context)?;
         self.output_norm
             .forward(&out.broadcast_add(x)?)
@@ -827,11 +861,8 @@ impl GraniteLanguageModel {
                 vb.pp(format!("model.layers.{idx}")),
             )?);
         }
-        let norm = candle_nn::rms_norm(
-            config.hidden_size,
-            config.rms_norm_eps,
-            vb.pp("model.norm"),
-        )?;
+        let norm =
+            candle_nn::rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("model.norm"))?;
         let lm_head = if config.tie_word_embeddings {
             Linear::new(embed_tokens.embeddings().clone(), None)
         } else {
@@ -907,11 +938,26 @@ impl GraniteLanguageModel {
         mut cache: Option<&mut Qwen3Cache>,
     ) -> Result<Tensor> {
         let mut x = (embeds * self.cfg.embedding_multiplier as f64)?;
+        let rope = self
+            .layers
+            .first()
+            .map(|layer| {
+                build_rope_cache(
+                    x.dim(1)?,
+                    layer.self_attn.head_dim,
+                    start_pos,
+                    layer.self_attn.rope_theta,
+                    x.device(),
+                    x.dtype(),
+                )
+            })
+            .transpose()?;
         for (idx, layer) in self.layers.iter().enumerate() {
             let cache_ref = cache.as_deref_mut();
-            x = layer.forward(&x, start_pos, cache_ref, idx)?;
+            x = layer.forward(&x, start_pos, cache_ref, idx, rope.as_ref())?;
         }
         let hidden = self.norm.forward(&x)?;
+        let hidden = last_hidden_for_logits(&hidden)?;
         let logits = self.lm_head.forward(&hidden)?;
         (logits / self.cfg.logits_scaling as f64)
             .and_then(|tensor| tensor.to_dtype(DType::F32))
@@ -952,10 +998,13 @@ impl GraniteDecoderLayer {
         start_pos: usize,
         cache: Option<&mut Qwen3Cache>,
         layer_idx: usize,
+        rope: Option<&(Tensor, Tensor)>,
     ) -> Result<Tensor> {
         let residual = x;
         let normed = self.input_layernorm.forward(x)?;
-        let attn = self.self_attn.forward(&normed, start_pos, cache, layer_idx)?;
+        let attn = self
+            .self_attn
+            .forward(&normed, start_pos, cache, layer_idx, rope)?;
         let x = residual.broadcast_add(&(attn * self.residual_multiplier as f64)?)?;
         let residual = &x;
         let normed = self.post_attention_layernorm.forward(&x)?;
@@ -1016,28 +1065,32 @@ impl GraniteTextAttention {
         start_pos: usize,
         cache: Option<&mut Qwen3Cache>,
         layer_idx: usize,
+        rope: Option<&(Tensor, Tensor)>,
     ) -> Result<Tensor> {
         let (batch, seq_len, _) = x.dims3()?;
-        let mut q = self
-            .q_proj
-            .forward(x)?
-            .reshape((batch, seq_len, self.num_heads, self.head_dim))?;
-        let mut k = self
-            .k_proj
-            .forward(x)?
-            .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?;
-        let v = self
-            .v_proj
-            .forward(x)?
-            .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?;
-        let (cos, sin) = build_rope_cache(
-            seq_len,
-            self.head_dim,
-            start_pos,
-            self.rope_theta,
-            x.device(),
-            q.dtype(),
-        )?;
+        let mut q =
+            self.q_proj
+                .forward(x)?
+                .reshape((batch, seq_len, self.num_heads, self.head_dim))?;
+        let mut k =
+            self.k_proj
+                .forward(x)?
+                .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?;
+        let v =
+            self.v_proj
+                .forward(x)?
+                .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?;
+        let (cos, sin) = match rope {
+            Some((cos, sin)) => (cos.clone(), sin.clone()),
+            None => build_rope_cache(
+                seq_len,
+                self.head_dim,
+                start_pos,
+                self.rope_theta,
+                x.device(),
+                q.dtype(),
+            )?,
+        };
         q = apply_rotary_emb(&q, &cos, &sin)?;
         k = apply_rotary_emb(&k, &cos, &sin)?;
         let (k, v, total_len) = if let Some(cache) = cache {
@@ -1119,6 +1172,21 @@ fn apply_rotary_emb(x: &Tensor, cos_half: &Tensor, sin_half: &Tensor) -> Result<
     Tensor::cat(&[first, second], 3).map_err(Error::from)
 }
 
+fn last_hidden_for_logits(hidden: &Tensor) -> Result<Tensor> {
+    match hidden.dims() {
+        [batch, seq, dim] if *seq > 0 => hidden
+            .narrow(1, seq - 1, 1)?
+            .reshape((*batch, 1, *dim))
+            .map_err(Error::from),
+        [_, 0, _] => Err(Error::InferenceError(
+            "Granite Speech hidden sequence is empty".to_string(),
+        )),
+        dims => Err(Error::InferenceError(format!(
+            "Granite Speech hidden states expected [batch,seq,dim], got {dims:?}"
+        ))),
+    }
+}
+
 fn text_attention(
     q: &Tensor,
     k: &Tensor,
@@ -1143,7 +1211,10 @@ fn text_attention(
     attn.matmul(&v_heads)?
         .transpose(1, 2)
         .map_err(Error::from)
-        .and_then(|out| out.reshape((q.dim(0)?, q.dim(1)?, num_heads, head_dim)).map_err(Error::from))
+        .and_then(|out| {
+            out.reshape((q.dim(0)?, q.dim(1)?, num_heads, head_dim))
+                .map_err(Error::from)
+        })
 }
 
 fn dense_decode_attention_scaled(
@@ -1178,18 +1249,34 @@ struct GraniteTextMlp {
 impl GraniteTextMlp {
     fn load(config: &GraniteTextConfig, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            gate_proj: linear_no_bias(config.hidden_size, config.intermediate_size, vb.pp("gate_proj"))?,
-            up_proj: linear_no_bias(config.hidden_size, config.intermediate_size, vb.pp("up_proj"))?,
-            down_proj: linear_no_bias(config.intermediate_size, config.hidden_size, vb.pp("down_proj"))?,
+            gate_proj: linear_no_bias(
+                config.hidden_size,
+                config.intermediate_size,
+                vb.pp("gate_proj"),
+            )?,
+            up_proj: linear_no_bias(
+                config.hidden_size,
+                config.intermediate_size,
+                vb.pp("up_proj"),
+            )?,
+            down_proj: linear_no_bias(
+                config.intermediate_size,
+                config.hidden_size,
+                vb.pp("down_proj"),
+            )?,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = self.gate_proj.forward(x)?.silu()?;
+        let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        self.down_proj
-            .forward(&gate.broadcast_mul(&up)?)
-            .map_err(Error::from)
+        let hidden = if let Some(fused) = try_fused_silu_mul(&gate, &up) {
+            fused
+        } else {
+            let gate = gate.silu()?;
+            gate.broadcast_mul(&up)?
+        };
+        self.down_proj.forward(&hidden).map_err(Error::from)
     }
 }
 
@@ -1241,7 +1328,10 @@ mod tests {
         assert_eq!(heads.dims(), &[1, 1, 8, 200, 128]);
         assert!(heads.is_contiguous());
         assert_eq!(heads.stride(), &[204800, 204800, 25600, 128, 1]);
-        assert_eq!(heads.t().unwrap().stride(), &[204800, 204800, 25600, 1, 128]);
+        assert_eq!(
+            heads.t().unwrap().stride(),
+            &[204800, 204800, 25600, 1, 128]
+        );
     }
 
     #[test]
@@ -1304,7 +1394,10 @@ mod tests {
     #[test]
     fn stop_sequence_truncates_generated_text() {
         let mut text = "hello<stop>ignored".to_string();
-        assert!(truncate_at_stop_sequence(&mut text, &["<stop>".to_string()]));
+        assert!(truncate_at_stop_sequence(
+            &mut text,
+            &["<stop>".to_string()]
+        ));
         assert_eq!(text, "hello");
     }
 }
