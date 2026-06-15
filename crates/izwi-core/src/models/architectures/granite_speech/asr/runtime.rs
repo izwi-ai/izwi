@@ -1271,7 +1271,11 @@ impl GraniteTextAttention {
 }
 
 fn granite_dense_head_decode_allowed(device: &Device) -> bool {
-    device.is_cuda()
+    granite_dense_head_decode_policy(device.is_metal(), device.is_cuda())
+}
+
+fn granite_dense_head_decode_policy(is_metal: bool, is_cuda: bool) -> bool {
+    is_metal || is_cuda
 }
 
 fn granite_qformer_fused_attention_allowed(device: &Device) -> bool {
@@ -1623,6 +1627,14 @@ mod tests {
     #[test]
     fn dense_head_decode_policy_skips_cpu() {
         assert!(!granite_dense_head_decode_allowed(&Device::Cpu));
+    }
+
+    #[test]
+    fn dense_head_decode_policy_enables_accelerated_backends() {
+        assert!(!granite_dense_head_decode_policy(false, false));
+        assert!(granite_dense_head_decode_policy(true, false));
+        assert!(granite_dense_head_decode_policy(false, true));
+        assert!(granite_dense_head_decode_policy(true, true));
     }
 
     #[test]
