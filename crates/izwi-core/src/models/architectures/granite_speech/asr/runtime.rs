@@ -170,6 +170,7 @@ impl GraniteSpeechRuntime {
         stop_sequences: &[String],
         decode: &mut dyn FnMut(&[u32]) -> Result<String>,
         on_delta: &mut dyn FnMut(&str),
+        emit_deltas: bool,
     ) -> Result<GraniteSpeechGeneration> {
         let audio_tokens = audio_embeds.dim(1)?;
         let input_ids = expand_audio_tokens(
@@ -207,6 +208,7 @@ impl GraniteSpeechRuntime {
         let mut stop_reason = "max_tokens".to_string();
         let mut stop_token = None;
         let stop_tokens = stop_token_set(special_tokens, extra_stop_token_ids);
+        let decode_each_step = emit_deltas || !stop_sequences.is_empty();
         let decode_start = Instant::now();
 
         for step in 0..max_new_tokens.max(1) {
@@ -218,24 +220,29 @@ impl GraniteSpeechRuntime {
             }
 
             generated.push(token);
-            let mut next_text = decode(&generated)?;
-            let stopped_on_sequence = truncate_at_stop_sequence(&mut next_text, stop_sequences);
-            if stopped_on_sequence {
-                stop_reason = "stop_sequence".to_string();
-            }
-            if next_text.len() > rendered.len() {
-                let delta = &next_text[rendered.len()..];
-                on_delta(delta);
-            }
-            rendered = next_text;
-            if stopped_on_sequence {
-                break;
+            if decode_each_step {
+                let mut next_text = decode(&generated)?;
+                let stopped_on_sequence = truncate_at_stop_sequence(&mut next_text, stop_sequences);
+                if stopped_on_sequence {
+                    stop_reason = "stop_sequence".to_string();
+                }
+                if emit_deltas && next_text.len() > rendered.len() {
+                    let delta = &next_text[rendered.len()..];
+                    on_delta(delta);
+                }
+                rendered = next_text;
+                if stopped_on_sequence {
+                    break;
+                }
             }
 
             let token_tensor = Tensor::from_vec(vec![token], (1, 1), &self.device)?;
             logits =
                 self.text_model
                     .forward(&token_tensor, input_ids.len() + step, Some(&mut cache))?;
+        }
+        if !decode_each_step && !generated.is_empty() {
+            rendered = decode(&generated)?;
         }
         let decode = decode_start.elapsed();
 
