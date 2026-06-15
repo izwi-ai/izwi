@@ -15,6 +15,7 @@ use crate::error::{Error, Result};
 use crate::kernels::try_fused_silu_mul;
 use crate::models::architectures::qwen3::core::{causal_mask, repeat_kv, Qwen3Cache};
 use crate::models::shared::attention::paged::default_kv_page_size;
+use crate::models::shared::telemetry::{record_decode_attention_path, DecodeAttentionPath};
 
 use super::config::{GraniteSpeechConfig, GraniteSpeechEncoderConfig, GraniteTextConfig};
 use super::preprocessor::GraniteSpeechAudioFeatures;
@@ -269,13 +270,15 @@ fn argmax_last_logits(logits: &Tensor) -> Result<u32> {
             )));
         }
     };
-    let values = last.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-    let (idx, _) = values
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))
-        .ok_or_else(|| Error::InferenceError("Granite Speech empty logits".to_string()))?;
-    Ok(idx as u32)
+    let idx = last.argmax(D::Minus1)?;
+    let idx = if idx.rank() == 0 {
+        idx
+    } else {
+        idx.squeeze(0)?
+    };
+    idx.to_dtype(DType::U32)?
+        .to_scalar::<u32>()
+        .map_err(Error::from)
 }
 
 struct GraniteSpeechEncoder {
@@ -1095,6 +1098,22 @@ impl GraniteTextAttention {
         k = apply_rotary_emb(&k, &cos, &sin)?;
         let (k, v, total_len) = if let Some(cache) = cache {
             cache.append(layer_idx, k.clone(), v.clone())?;
+            if seq_len == 1 && start_pos > 0 {
+                if let Some((k_heads, v_heads)) = cache.dense_heads(layer_idx) {
+                    record_decode_attention_path(DecodeAttentionPath::Dense);
+                    let out = dense_decode_attention_heads_scaled(
+                        &q,
+                        k_heads,
+                        v_heads,
+                        self.num_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        self.attention_multiplier,
+                    )?;
+                    let out = out.reshape((batch, seq_len, self.num_heads * self.head_dim))?;
+                    return self.o_proj.forward(&out).map_err(Error::from);
+                }
+            }
             let (cached_k, cached_v) = cache.materialize(layer_idx)?;
             let total_len = cached_k.dim(1)?;
             (cached_k, cached_v, total_len)
@@ -1240,6 +1259,41 @@ fn dense_decode_attention_scaled(
         .map_err(Error::from)
 }
 
+fn dense_decode_attention_heads_scaled(
+    q: &Tensor,
+    k_heads: &Tensor,
+    v_heads: &Tensor,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    attention_multiplier: f32,
+) -> Result<Tensor> {
+    let q_heads = q.transpose(1, 2)?.contiguous()?;
+    let k_heads = if num_heads == num_kv_heads {
+        k_heads.clone()
+    } else {
+        let k = k_heads.transpose(1, 2)?.contiguous()?;
+        repeat_kv(&k, num_heads, num_kv_heads)?
+            .transpose(1, 2)?
+            .contiguous()?
+    };
+    let v_heads = if num_heads == num_kv_heads {
+        v_heads.clone()
+    } else {
+        let v = v_heads.transpose(1, 2)?.contiguous()?;
+        repeat_kv(&v, num_heads, num_kv_heads)?
+            .transpose(1, 2)?
+            .contiguous()?
+    };
+    let mut attn = q_heads.matmul(&k_heads.t()?)?;
+    attn = (attn * attention_multiplier as f64)?;
+    let attn = ops::softmax(&attn.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q.dtype())?;
+    let out = attn.matmul(&v_heads)?;
+    out.transpose(1, 2)?
+        .reshape((q.dim(0)?, q.dim(1)?, num_heads, head_dim))
+        .map_err(Error::from)
+}
+
 struct GraniteTextMlp {
     gate_proj: Linear,
     up_proj: Linear,
@@ -1353,6 +1407,71 @@ mod tests {
         assert!(heads.is_contiguous());
         assert_eq!(heads.stride(), &[15360, 960, 64, 1]);
         assert_eq!(heads.t().unwrap().stride(), &[15360, 960, 1, 64]);
+    }
+
+    #[test]
+    fn dense_head_decode_matches_materialized_scaled_attention() {
+        let device = Device::Cpu;
+        let num_heads = 4;
+        let num_kv_heads = 2;
+        let head_dim = 2;
+        let attention_multiplier = 0.37;
+        let q = Tensor::from_vec(
+            vec![0.2f32, -0.4, 0.1, 0.8, -0.3, 0.7, 0.5, -0.6],
+            (1, 1, num_heads, head_dim),
+            &device,
+        )
+        .unwrap();
+        let k = Tensor::from_vec(
+            vec![
+                0.1f32, 0.2, -0.3, 0.4, 0.5, -0.2, //
+                -0.6, 0.7, 0.2, -0.1, 0.3, 0.9,
+            ],
+            (1, 3, num_kv_heads, head_dim),
+            &device,
+        )
+        .unwrap();
+        let v = Tensor::from_vec(
+            vec![
+                -0.2f32, 0.4, 0.6, -0.1, 0.8, 0.3, //
+                0.5, -0.7, -0.4, 0.2, 0.1, 0.9,
+            ],
+            (1, 3, num_kv_heads, head_dim),
+            &device,
+        )
+        .unwrap();
+        let k_heads = k.transpose(1, 2).unwrap().contiguous().unwrap();
+        let v_heads = v.transpose(1, 2).unwrap().contiguous().unwrap();
+
+        let materialized = dense_decode_attention_scaled(
+            &q,
+            &k,
+            &v,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            attention_multiplier,
+        )
+        .unwrap();
+        let dense_heads = dense_decode_attention_heads_scaled(
+            &q,
+            &k_heads,
+            &v_heads,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            attention_multiplier,
+        )
+        .unwrap();
+        let lhs = materialized.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let rhs = dense_heads.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let max_diff = lhs
+            .iter()
+            .zip(rhs.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        assert!(max_diff < 1e-6, "max diff {max_diff}");
     }
 
     #[test]
