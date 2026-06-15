@@ -153,13 +153,30 @@ pub fn try_fused_self_attention(
     head_dim: usize,
     causal: bool,
 ) -> Result<Option<Tensor>> {
-    try_fused_self_attention_with_options(
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    try_fused_self_attention_scaled(q, k, v, mask, head_dim, causal, scale)
+}
+
+/// Try a fused self-attention kernel with an explicit attention score scale.
+///
+/// Input/output layout: `[batch, heads, seq, head_dim]`.
+pub fn try_fused_self_attention_scaled(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    head_dim: usize,
+    causal: bool,
+    scale: f32,
+) -> Result<Option<Tensor>> {
+    try_fused_self_attention_with_options_and_scale(
         q,
         k,
         v,
         mask,
         head_dim,
         causal,
+        scale,
         CudaFlashAttentionOptions::default(),
     )
 }
@@ -179,6 +196,28 @@ pub fn try_fused_self_attention_with_options(
     cuda_options: CudaFlashAttentionOptions<'_>,
 ) -> Result<Option<Tensor>> {
     let scale = 1.0f32 / (head_dim as f32).sqrt();
+    try_fused_self_attention_with_options_and_scale(
+        q,
+        k,
+        v,
+        mask,
+        head_dim,
+        causal,
+        scale,
+        cuda_options,
+    )
+}
+
+fn try_fused_self_attention_with_options_and_scale(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    head_dim: usize,
+    causal: bool,
+    scale: f32,
+    cuda_options: CudaFlashAttentionOptions<'_>,
+) -> Result<Option<Tensor>> {
     let masked = mask.is_some();
     record_fused_attention_attempt();
     if masked {

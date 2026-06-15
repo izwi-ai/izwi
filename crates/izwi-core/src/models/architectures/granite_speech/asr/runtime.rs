@@ -14,7 +14,9 @@ use crate::backends::DeviceProfile;
 use crate::error::{Error, Result};
 use crate::kernels::try_fused_silu_mul;
 use crate::models::architectures::qwen3::core::{causal_mask, repeat_kv, Qwen3Cache};
-use crate::models::shared::attention::flash::try_fused_self_attention;
+use crate::models::shared::attention::flash::{
+    try_fused_self_attention, try_fused_self_attention_scaled,
+};
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::telemetry::{record_decode_attention_path, DecodeAttentionPath};
 
@@ -1168,7 +1170,7 @@ impl GraniteTextAttention {
 }
 
 fn granite_dense_head_decode_allowed(device: &Device) -> bool {
-    device.is_cuda()
+    device.is_metal() || device.is_cuda()
 }
 
 fn granite_qformer_fused_attention_allowed(device: &Device) -> bool {
@@ -1294,6 +1296,20 @@ fn dense_decode_attention_heads_scaled(
     attention_multiplier: f32,
 ) -> Result<Tensor> {
     let q_heads = q.transpose(1, 2)?.contiguous()?;
+    if let Some(out) = try_fused_self_attention_scaled(
+        &q_heads,
+        k_heads,
+        v_heads,
+        None,
+        head_dim,
+        false,
+        attention_multiplier,
+    )? {
+        return out
+            .transpose(1, 2)?
+            .reshape((q.dim(0)?, q.dim(1)?, num_heads, head_dim))
+            .map_err(Error::from);
+    }
     let k_heads = if num_heads == num_kv_heads {
         k_heads.clone()
     } else {
