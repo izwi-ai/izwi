@@ -7,7 +7,7 @@ use candle_core::{DType, IndexOp, Tensor};
 use candle_nn::{Module, VarBuilder};
 use tracing::info;
 
-use crate::audio::{MelConfig, MelSpectrogram};
+use crate::audio::{MelConfig, MelNorm, MelScale, MelSpectrogram};
 use crate::backends::{DeviceKind, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
@@ -107,6 +107,8 @@ impl VoxtralRealtimeModel {
             f_min: 0.0,
             f_max: 8000.0,
             normalize: audio_cfg.global_log_mel_max.is_none(),
+            mel_scale: MelScale::Slaney,
+            mel_norm: MelNorm::Slaney,
         };
         let mel = MelSpectrogram::new(mel_cfg)?;
 

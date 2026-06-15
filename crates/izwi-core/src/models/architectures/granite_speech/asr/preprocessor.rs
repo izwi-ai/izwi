@@ -1,6 +1,6 @@
 //! Audio preprocessing for Granite Speech ASR.
 
-use crate::audio::{resample_mono_high_quality, MelConfig, MelSpectrogram};
+use crate::audio::{resample_mono_high_quality, MelConfig, MelNorm, MelScale, MelSpectrogram};
 use crate::error::{Error, Result};
 use crate::models::architectures::granite_speech::asr::config::GraniteSpeechProcessorConfig;
 
@@ -34,6 +34,8 @@ impl GraniteSpeechPreprocessor {
             f_min: 0.0,
             f_max: (config.sample_rate() / 2) as f32,
             normalize: true,
+            mel_scale: MelScale::Htk,
+            mel_norm: MelNorm::None,
         };
         let mel = MelSpectrogram::new(mel_cfg)?;
         Ok(Self { config, mel })
@@ -144,6 +146,9 @@ mod tests {
     #[test]
     fn preprocessor_prepares_16khz_log_mel_features() {
         let preprocessor = GraniteSpeechPreprocessor::new(test_processor()).unwrap();
+        assert_eq!(preprocessor.mel.config().mel_scale, MelScale::Htk);
+        assert_eq!(preprocessor.mel.config().mel_norm, MelNorm::None);
+
         let audio = vec![0.0f32; 16_000];
         let features = preprocessor.prepare(&audio, 16_000).unwrap();
         assert_eq!(features.sample_rate, 16_000);

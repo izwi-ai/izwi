@@ -23,7 +23,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::{debug, info};
 
-use crate::audio::{MelConfig, MelSpectrogram};
+use crate::audio::{MelConfig, MelNorm, MelScale, MelSpectrogram};
 use crate::backends::{DeviceKind, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
@@ -428,6 +428,8 @@ impl WhisperTurboAsrModel {
             f_min: 0.0,
             f_max: (whisper::SAMPLE_RATE / 2) as f32,
             normalize: true,
+            mel_scale: MelScale::Slaney,
+            mel_norm: MelNorm::Slaney,
         })?;
 
         info!(

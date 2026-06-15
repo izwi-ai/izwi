@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::{debug, info, warn};
 
-use crate::audio::{MelConfig, MelSpectrogram};
+use crate::audio::{MelConfig, MelNorm, MelScale, MelSpectrogram};
 use crate::backends::{backend_kind_for_device, DTypeSelectionRequest, DeviceKind, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
@@ -335,6 +335,8 @@ impl Qwen3AsrModel {
             f_min: 0.0,
             f_max: 8_000.0,
             normalize: true,
+            mel_scale: MelScale::Slaney,
+            mel_norm: MelNorm::Slaney,
         };
         let mel = MelSpectrogram::new(mel_cfg)?;
 
