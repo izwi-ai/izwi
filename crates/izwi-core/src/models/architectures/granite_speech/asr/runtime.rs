@@ -161,8 +161,7 @@ impl GraniteSpeechRuntime {
         let stop_tokens = stop_token_set(special_tokens, extra_stop_token_ids);
         let decode_start = Instant::now();
 
-        let max_steps = max_new_tokens.max(1);
-        for step in 0..max_steps {
+        for step in 0..max_new_tokens.max(1) {
             let token = argmax_last_logits(&logits)?;
             if stop_tokens.contains(&token) {
                 stop_reason = "stop_token".to_string();
@@ -182,9 +181,6 @@ impl GraniteSpeechRuntime {
             }
             rendered = next_text;
             if stopped_on_sequence {
-                break;
-            }
-            if step + 1 == max_steps {
                 break;
             }
 
