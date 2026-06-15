@@ -212,7 +212,17 @@ impl GraniteSpeechRuntime {
         let decode_start = Instant::now();
 
         for step in 0..max_new_tokens.max(1) {
-            let token = argmax_last_logits(&logits)?;
+            let token_tensor = argmax_last_token_tensor(&logits)?;
+            let next_logits = if !decode_each_step && step + 1 < max_new_tokens.max(1) {
+                Some(self.text_model.forward(
+                    &token_tensor,
+                    input_ids.len() + step,
+                    Some(&mut cache),
+                )?)
+            } else {
+                None
+            };
+            let token = token_tensor.reshape(())?.to_scalar::<u32>()?;
             if stop_tokens.contains(&token) {
                 stop_reason = "stop_token".to_string();
                 stop_token = Some(token);
@@ -236,10 +246,13 @@ impl GraniteSpeechRuntime {
                 }
             }
 
-            let token_tensor = Tensor::from_vec(vec![token], (1, 1), &self.device)?;
-            logits =
+            logits = if let Some(next_logits) = next_logits {
+                next_logits
+            } else {
+                let token_tensor = Tensor::from_vec(vec![token], (1, 1), &self.device)?;
                 self.text_model
-                    .forward(&token_tensor, input_ids.len() + step, Some(&mut cache))?;
+                    .forward(&token_tensor, input_ids.len() + step, Some(&mut cache))?
+            };
         }
         if !decode_each_step && !generated.is_empty() {
             rendered = decode(&generated)?;
@@ -318,6 +331,13 @@ fn truncate_at_stop_sequence(text: &mut String, stop_sequences: &[String]) -> bo
 }
 
 fn argmax_last_logits(logits: &Tensor) -> Result<u32> {
+    argmax_last_token_tensor(logits)?
+        .reshape(())?
+        .to_scalar::<u32>()
+        .map_err(Error::from)
+}
+
+fn argmax_last_token_tensor(logits: &Tensor) -> Result<Tensor> {
     let last = match logits.dims() {
         [1, vocab] => logits.reshape((*vocab,))?,
         [1, 1, vocab] => logits.reshape((*vocab,))?,
@@ -340,7 +360,7 @@ fn argmax_last_logits(logits: &Tensor) -> Result<u32> {
         idx.squeeze(0)?
     };
     idx.to_dtype(DType::U32)?
-        .to_scalar::<u32>()
+        .reshape((1, 1))
         .map_err(Error::from)
 }
 
@@ -1686,6 +1706,25 @@ mod tests {
         .unwrap();
 
         assert_eq!(argmax_last_logits(&logits).unwrap(), 3);
+    }
+
+    #[test]
+    fn argmax_last_token_tensor_matches_scalar_argmax() {
+        let logits = Tensor::from_vec(
+            vec![
+                0.0f32, 100.0, 0.0, 0.0, //
+                0.0, 0.0, 90.0, 0.0, //
+                0.0, 0.0, 0.0, 7.0,
+            ],
+            (1, 3, 4),
+            &Device::Cpu,
+        )
+        .unwrap();
+
+        let token = argmax_last_token_tensor(&logits).unwrap();
+
+        assert_eq!(token.dims(), &[1, 1]);
+        assert_eq!(token.reshape(()).unwrap().to_scalar::<u32>().unwrap(), 3);
     }
 
     #[test]
