@@ -1364,6 +1364,41 @@ fn dense_decode_attention_scaled(
     head_dim: usize,
     attention_multiplier: f32,
 ) -> Result<Tensor> {
+    if q.dim(0)? == 1
+        && q.dim(1)? == 1
+        && num_heads != num_kv_heads
+        && num_heads % num_kv_heads == 0
+    {
+        return dense_decode_attention_gqa_scaled(
+            q,
+            k,
+            v,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            attention_multiplier,
+        );
+    }
+    dense_decode_attention_repeated_scaled(
+        q,
+        k,
+        v,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        attention_multiplier,
+    )
+}
+
+fn dense_decode_attention_repeated_scaled(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    attention_multiplier: f32,
+) -> Result<Tensor> {
     let k = repeat_kv(k, num_heads, num_kv_heads)?;
     let v = repeat_kv(v, num_heads, num_kv_heads)?;
     let q_heads = q.transpose(1, 2)?.contiguous()?;
@@ -1375,6 +1410,60 @@ fn dense_decode_attention_scaled(
     let out = attn.matmul(&v_heads)?;
     out.transpose(1, 2)?
         .reshape((q.dim(0)?, q.dim(1)?, num_heads, head_dim))
+        .map_err(Error::from)
+}
+
+fn dense_decode_attention_gqa_scaled(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    attention_multiplier: f32,
+) -> Result<Tensor> {
+    let batch = q.dim(0)?;
+    let seq_len = q.dim(1)?;
+    let kv_groups = num_heads / num_kv_heads;
+    if batch != 1 || seq_len != 1 {
+        return dense_decode_attention_repeated_scaled(
+            q,
+            k,
+            v,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            attention_multiplier,
+        );
+    }
+    let mut head_groups = Vec::with_capacity(num_kv_heads);
+    for kv_idx in 0..num_kv_heads {
+        let q_group = q
+            .narrow(2, kv_idx * kv_groups, kv_groups)?
+            .squeeze(0)?
+            .squeeze(0)?
+            .contiguous()?;
+        let k_group = k
+            .narrow(2, kv_idx, 1)?
+            .squeeze(0)?
+            .squeeze(1)?
+            .t()?
+            .contiguous()?;
+        let v_group = v
+            .narrow(2, kv_idx, 1)?
+            .squeeze(0)?
+            .squeeze(1)?
+            .contiguous()?;
+        let mut attn = q_group.matmul(&k_group)?;
+        attn = (attn * attention_multiplier as f64)?;
+        let attn = ops::softmax(&attn.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q.dtype())?;
+        head_groups.push(attn.matmul(&v_group)?);
+    }
+    let head_refs = head_groups.iter().collect::<Vec<_>>();
+    Tensor::cat(&head_refs, 0)?
+        .unsqueeze(0)?
+        .unsqueeze(0)?
+        .reshape((batch, seq_len, num_heads, head_dim))
         .map_err(Error::from)
 }
 
@@ -1602,6 +1691,70 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         let rhs = dense_heads.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let max_diff = lhs
+            .iter()
+            .zip(rhs.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        assert!(max_diff < 1e-6, "max diff {max_diff}");
+    }
+
+    #[test]
+    fn grouped_decode_attention_matches_repeated_kv_reference() {
+        let device = Device::Cpu;
+        let num_heads = 8;
+        let num_kv_heads = 2;
+        let head_dim = 4;
+        let total_len = 5;
+        let attention_multiplier = 0.42;
+        let q = Tensor::from_vec(
+            (0..(num_heads * head_dim))
+                .map(|value| (value as f32) * 0.03 - 0.5)
+                .collect::<Vec<_>>(),
+            (1, 1, num_heads, head_dim),
+            &device,
+        )
+        .unwrap();
+        let k = Tensor::from_vec(
+            (0..(total_len * num_kv_heads * head_dim))
+                .map(|value| (value as f32) * 0.02 - 0.3)
+                .collect::<Vec<_>>(),
+            (1, total_len, num_kv_heads, head_dim),
+            &device,
+        )
+        .unwrap();
+        let v = Tensor::from_vec(
+            (0..(total_len * num_kv_heads * head_dim))
+                .map(|value| (value as f32) * -0.015 + 0.4)
+                .collect::<Vec<_>>(),
+            (1, total_len, num_kv_heads, head_dim),
+            &device,
+        )
+        .unwrap();
+
+        let grouped = dense_decode_attention_gqa_scaled(
+            &q,
+            &k,
+            &v,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            attention_multiplier,
+        )
+        .unwrap();
+        let repeated = dense_decode_attention_repeated_scaled(
+            &q,
+            &k,
+            &v,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            attention_multiplier,
+        )
+        .unwrap();
+        let lhs = grouped.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let rhs = repeated.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let max_diff = lhs
             .iter()
             .zip(rhs.iter())
