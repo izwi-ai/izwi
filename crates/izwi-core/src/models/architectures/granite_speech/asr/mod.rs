@@ -440,6 +440,8 @@ fn granite_diagnostics(
         },
         "execution": {
             "dense_decode_cache": generation.stats.dense_decode_cache_enabled,
+            "dense_decode_cache_configured": generation.stats.dense_decode_cache_enabled,
+            "dense_head_decode_enabled": generation.stats.dense_head_decode_enabled,
             "cuda_dense_decode_cache": generation.stats.dense_decode_cache_enabled,
             "dense_decode_max_tokens": generation.stats.dense_decode_max_tokens,
         },
@@ -650,6 +652,7 @@ mod tests {
                 stop_reason: "stop_token".to_string(),
                 stop_token: Some(100_257),
                 dense_decode_cache_enabled: true,
+                dense_head_decode_enabled: false,
                 dense_decode_max_tokens: 8192,
                 timings: GraniteSpeechGenerationTimings {
                     prefill: Duration::from_millis(7),
@@ -682,6 +685,11 @@ mod tests {
         assert_eq!(diagnostics["audio"]["audio_tokens"], 3);
         assert_eq!(diagnostics["decode"]["generated_tokens"], 2);
         assert_eq!(diagnostics["execution"]["dense_decode_cache"], true);
+        assert_eq!(
+            diagnostics["execution"]["dense_decode_cache_configured"],
+            true
+        );
+        assert_eq!(diagnostics["execution"]["dense_head_decode_enabled"], false);
         assert_eq!(diagnostics["execution"]["dense_decode_max_tokens"], 8192);
         assert_eq!(diagnostics["timings_ms"]["prefill"], 7.0);
         assert_eq!(diagnostics["timings_ms"]["decode"], 3.0);
