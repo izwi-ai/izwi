@@ -43,6 +43,23 @@ pub struct GraniteSpeechGenerationTimings {
     pub decode: Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraniteSpeechAudioEmbeddingStats {
+    pub upload: Duration,
+    pub encoder: Duration,
+    pub projector: Duration,
+    pub encoder_frames: usize,
+    pub encoder_dim: usize,
+    pub conformer_context_size: usize,
+    pub conformer_blocks: usize,
+    pub conformer_pad_frames: usize,
+    pub conformer_layers: usize,
+    pub qformer_windows: usize,
+    pub qformer_window_size: usize,
+    pub qformer_queries_per_window: usize,
+    pub qformer_layers: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraniteSpeechGeneration {
     pub token_ids: Vec<u32>,
@@ -95,6 +112,14 @@ impl GraniteSpeechRuntime {
     }
 
     pub fn audio_embeddings(&self, features: &GraniteSpeechAudioFeatures) -> Result<Tensor> {
+        self.audio_embeddings_with_stats(features)
+            .map(|(embeddings, _stats)| embeddings)
+    }
+
+    pub fn audio_embeddings_with_stats(
+        &self,
+        features: &GraniteSpeechAudioFeatures,
+    ) -> Result<(Tensor, GraniteSpeechAudioEmbeddingStats)> {
         let frames = features.encoder_frames;
         let dim = features.encoder_dim;
         if frames == 0 || dim == 0 {
@@ -107,9 +132,31 @@ impl GraniteSpeechRuntime {
             .iter()
             .flat_map(|frame| frame.iter().copied())
             .collect::<Vec<_>>();
+        let upload_start = Instant::now();
         let input = Tensor::from_vec(flat, (1, frames, dim), &self.device)?.to_dtype(self.dtype)?;
+        let upload = upload_start.elapsed();
+        let encoder_start = Instant::now();
         let encoded = self.encoder.forward(&input)?;
-        self.projector.forward(&encoded)
+        let encoder = encoder_start.elapsed();
+        let projector_start = Instant::now();
+        let embeddings = self.projector.forward(&encoded)?;
+        let projector = projector_start.elapsed();
+        let stats = GraniteSpeechAudioEmbeddingStats {
+            upload,
+            encoder,
+            projector,
+            encoder_frames: frames,
+            encoder_dim: dim,
+            conformer_context_size: self.encoder.context_size(),
+            conformer_blocks: self.encoder.block_count_for_frames(frames),
+            conformer_pad_frames: self.encoder.pad_frames_for_frames(frames),
+            conformer_layers: self.encoder.layer_count(),
+            qformer_windows: self.projector.window_count_for_frames(encoded.dim(1)?),
+            qformer_window_size: self.projector.window_size(),
+            qformer_queries_per_window: self.projector.num_queries(),
+            qformer_layers: self.projector.layer_count(),
+        };
+        Ok((embeddings, stats))
     }
 
     pub fn generate(
@@ -344,6 +391,28 @@ impl GraniteSpeechEncoder {
             Tensor::cat(&refs, 2).map_err(Error::from)
         }
     }
+
+    fn context_size(&self) -> usize {
+        self.layers
+            .first()
+            .map(|layer| layer.context_size())
+            .unwrap_or(0)
+    }
+
+    fn block_count_for_frames(&self, frames: usize) -> usize {
+        let context = self.context_size().max(1);
+        frames.saturating_add(context - 1) / context
+    }
+
+    fn pad_frames_for_frames(&self, frames: usize) -> usize {
+        self.block_count_for_frames(frames)
+            .saturating_mul(self.context_size().max(1))
+            .saturating_sub(frames)
+    }
+
+    fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
 }
 
 struct GraniteConformerBlock {
@@ -375,6 +444,10 @@ impl GraniteConformerBlock {
         let ff2 = self.ff2.forward(&out)?;
         out = out.broadcast_add(&(ff2 * 0.5)?)?;
         self.post_norm.forward(&out).map_err(Error::from)
+    }
+
+    fn context_size(&self) -> usize {
+        self.attn.context_size
     }
 }
 
@@ -701,6 +774,22 @@ impl GraniteSpeechProjector {
         let output = output.reshape((batch, nblocks * self.num_queries, output.dim(2)?))?;
         self.linear.forward(&output).map_err(Error::from)
     }
+
+    fn window_count_for_frames(&self, frames: usize) -> usize {
+        frames.saturating_add(self.window_size - 1) / self.window_size
+    }
+
+    fn window_size(&self) -> usize {
+        self.window_size
+    }
+
+    fn num_queries(&self) -> usize {
+        self.num_queries
+    }
+
+    fn layer_count(&self) -> usize {
+        self.qformer.layer_count()
+    }
 }
 
 struct GraniteQFormer {
@@ -735,6 +824,10 @@ impl GraniteQFormer {
             x = layer.forward(&x, encoder_hidden)?;
         }
         Ok(x)
+    }
+
+    fn layer_count(&self) -> usize {
+        self.layers.len()
     }
 }
 
@@ -826,8 +919,7 @@ impl GraniteQFormerAttention {
         let k = self.transpose_for_scores(&self.key.forward(kv_input)?)?;
         let v = self.transpose_for_scores(&self.value.forward(kv_input)?)?;
         if granite_qformer_fused_attention_allowed(q.device()) {
-            if let Some(context) =
-                try_fused_self_attention(&q, &k, &v, None, self.head_dim, false)?
+            if let Some(context) = try_fused_self_attention(&q, &k, &v, None, self.head_dim, false)?
             {
                 let context = context.transpose(1, 2)?.flatten_from(D::Minus2)?;
                 let out = self.output_dense.forward(&context)?;
@@ -1504,7 +1596,11 @@ mod tests {
             attention_multiplier,
         )
         .unwrap();
-        let lhs = materialized.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let lhs = materialized
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         let rhs = dense_heads.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let max_diff = lhs
             .iter()

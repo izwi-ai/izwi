@@ -33,8 +33,8 @@ pub use prompt::{
     GRANITE_SPEECH_SPEAKER_PROMPT, GRANITE_SPEECH_SYSTEM_PROMPT, GRANITE_SPEECH_TIMESTAMP_PROMPT,
 };
 pub use runtime::{
-    GraniteSpeechGeneration, GraniteSpeechGenerationStats, GraniteSpeechGenerationTimings,
-    GraniteSpeechRuntime,
+    GraniteSpeechAudioEmbeddingStats, GraniteSpeechGeneration, GraniteSpeechGenerationStats,
+    GraniteSpeechGenerationTimings, GraniteSpeechRuntime,
 };
 pub use transcript::{
     parse_granite_speech_output, GraniteSpeechParsedTranscript, GraniteSpeechSegment,
@@ -338,7 +338,7 @@ impl GraniteSpeechAsrModel {
         };
         let granite_prompt = self.build_prompt(&prompt_options)?;
         let encoder_start = Instant::now();
-        let audio_embeds = self.runtime.audio_embeddings(&features)?;
+        let (audio_embeds, audio_stats) = self.runtime.audio_embeddings_with_stats(&features)?;
         let encoder_forward = encoder_start.elapsed();
         let special_tokens = self.prompt_tokenizer.special_tokens().clone();
         let mut decode = |ids: &[u32]| self.prompt_tokenizer.decode(ids);
@@ -374,6 +374,7 @@ impl GraniteSpeechAsrModel {
                 self.dtype,
                 &self.device,
                 timings,
+                audio_stats,
             )),
         })
     }
@@ -405,6 +406,7 @@ fn granite_diagnostics(
     dtype: DType,
     device: &DeviceProfile,
     timings: GraniteSpeechAsrTimings,
+    audio_stats: GraniteSpeechAudioEmbeddingStats,
 ) -> serde_json::Value {
     json!({
         "family": "granite_speech_asr",
@@ -429,6 +431,15 @@ fn granite_diagnostics(
             "audio_tokens": generation.stats.audio_tokens,
             "mel_frames": features.mel_frames,
             "encoder_frames": features.encoder_frames,
+            "encoder_dim": features.encoder_dim,
+            "conformer_context_size": audio_stats.conformer_context_size,
+            "conformer_blocks": audio_stats.conformer_blocks,
+            "conformer_pad_frames": audio_stats.conformer_pad_frames,
+            "conformer_layers": audio_stats.conformer_layers,
+            "qformer_windows": audio_stats.qformer_windows,
+            "qformer_window_size": audio_stats.qformer_window_size,
+            "qformer_queries_per_window": audio_stats.qformer_queries_per_window,
+            "qformer_layers": audio_stats.qformer_layers,
         },
         "generated_tokens": generation.stats.generated_tokens,
         "stop_reason": generation.stats.stop_reason,
@@ -448,8 +459,16 @@ fn granite_diagnostics(
         "timings_ms": {
             "mel_prepare": duration_ms(timings.mel_prepare),
             "encoder_forward": duration_ms(timings.encoder_forward),
+            "audio_input_upload": duration_ms(audio_stats.upload),
+            "audio_encoder": duration_ms(audio_stats.encoder),
+            "audio_projector": duration_ms(audio_stats.projector),
+            "audio_frontend_total": duration_ms(timings.mel_prepare + timings.encoder_forward),
             "prefill": duration_ms(timings.prefill),
             "decode": duration_ms(timings.decode),
+            "generation_total": duration_ms(timings.prefill + timings.decode),
+            "model_non_generation": duration_ms(
+                timings.model_total.saturating_sub(timings.prefill + timings.decode),
+            ),
             "model_total": duration_ms(timings.model_total),
         },
         "speaker_segments": parsed.segments.iter().map(|segment| {
@@ -667,6 +686,21 @@ mod tests {
             decode: generation.stats.timings.decode,
             model_total: Duration::from_millis(12),
         };
+        let audio_stats = GraniteSpeechAudioEmbeddingStats {
+            upload: Duration::from_millis(1),
+            encoder: Duration::from_millis(2),
+            projector: Duration::from_millis(3),
+            encoder_frames: 1,
+            encoder_dim: 160,
+            conformer_context_size: 200,
+            conformer_blocks: 1,
+            conformer_pad_frames: 199,
+            conformer_layers: 16,
+            qformer_windows: 1,
+            qformer_window_size: 15,
+            qformer_queries_per_window: 3,
+            qformer_layers: 2,
+        };
         let parsed = parse_granite_speech_output(&generation.text);
         let diagnostics = granite_diagnostics(
             &features,
@@ -676,6 +710,7 @@ mod tests {
             DType::F32,
             &DeviceProfile::cpu(),
             timings,
+            audio_stats,
         );
 
         assert_eq!(diagnostics["projected_audio_tokens"], 3);
@@ -683,6 +718,9 @@ mod tests {
         assert_eq!(diagnostics["prompt_audio_placeholders"], 1);
         assert_eq!(diagnostics["prompt"]["prompt_tokens"], 4);
         assert_eq!(diagnostics["audio"]["audio_tokens"], 3);
+        assert_eq!(diagnostics["audio"]["conformer_context_size"], 200);
+        assert_eq!(diagnostics["audio"]["conformer_pad_frames"], 199);
+        assert_eq!(diagnostics["audio"]["qformer_queries_per_window"], 3);
         assert_eq!(diagnostics["decode"]["generated_tokens"], 2);
         assert_eq!(diagnostics["execution"]["dense_decode_cache"], true);
         assert_eq!(
@@ -693,6 +731,12 @@ mod tests {
         assert_eq!(diagnostics["execution"]["dense_decode_max_tokens"], 8192);
         assert_eq!(diagnostics["timings_ms"]["prefill"], 7.0);
         assert_eq!(diagnostics["timings_ms"]["decode"], 3.0);
+        assert_eq!(diagnostics["timings_ms"]["audio_input_upload"], 1.0);
+        assert_eq!(diagnostics["timings_ms"]["audio_encoder"], 2.0);
+        assert_eq!(diagnostics["timings_ms"]["audio_projector"], 3.0);
+        assert_eq!(diagnostics["timings_ms"]["audio_frontend_total"], 3.0);
+        assert_eq!(diagnostics["timings_ms"]["generation_total"], 10.0);
+        assert_eq!(diagnostics["timings_ms"]["model_non_generation"], 2.0);
         assert_eq!(diagnostics["speaker_segments"][0]["speaker"], "Speaker 1");
         assert_eq!(diagnostics["timestamp_words"][0]["word"], "hello");
     }
