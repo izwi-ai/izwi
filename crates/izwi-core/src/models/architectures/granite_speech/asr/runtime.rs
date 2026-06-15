@@ -14,6 +14,7 @@ use crate::backends::DeviceProfile;
 use crate::error::{Error, Result};
 use crate::kernels::try_fused_silu_mul;
 use crate::models::architectures::qwen3::core::{causal_mask, repeat_kv, Qwen3Cache};
+use crate::models::shared::attention::flash::try_fused_self_attention;
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::telemetry::{record_decode_attention_path, DecodeAttentionPath};
 
@@ -822,6 +823,14 @@ impl GraniteQFormerAttention {
         let q = self.transpose_for_scores(&self.query.forward(x)?)?;
         let k = self.transpose_for_scores(&self.key.forward(kv_input)?)?;
         let v = self.transpose_for_scores(&self.value.forward(kv_input)?)?;
+        if let Some(context) = try_fused_self_attention(&q, &k, &v, None, self.head_dim, false)? {
+            let context = context.transpose(1, 2)?.flatten_from(D::Minus2)?;
+            let out = self.output_dense.forward(&context)?;
+            return self
+                .output_norm
+                .forward(&out.broadcast_add(x)?)
+                .map_err(Error::from);
+        }
         let mut scores = q.matmul(&k.t()?)?;
         scores = (scores / (self.head_dim as f64).sqrt())?;
         let probs = ops::softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q.dtype())?;
@@ -1485,6 +1494,36 @@ mod tests {
     #[test]
     fn dense_head_decode_policy_skips_cpu() {
         assert!(!granite_dense_head_decode_allowed(&Device::Cpu));
+    }
+
+    #[test]
+    fn qformer_attention_cpu_fallback_preserves_shape() {
+        let device = Device::Cpu;
+        let hidden = 8;
+        let heads = 2;
+        let linear = || {
+            Linear::new(
+                Tensor::zeros((hidden, hidden), DType::F32, &device).unwrap(),
+                Some(Tensor::zeros(hidden, DType::F32, &device).unwrap()),
+            )
+        };
+        let attention = GraniteQFormerAttention {
+            query: linear(),
+            key: linear(),
+            value: linear(),
+            output_dense: linear(),
+            output_norm: LayerNorm::new(
+                Tensor::ones(hidden, DType::F32, &device).unwrap(),
+                Tensor::zeros(hidden, DType::F32, &device).unwrap(),
+                1e-12,
+            ),
+            num_heads: heads,
+            head_dim: hidden / heads,
+        };
+        let x = Tensor::zeros((3, 5, hidden), DType::F32, &device).unwrap();
+        let out = attention.forward(&x, None).unwrap();
+
+        assert_eq!(out.dims(), &[3, 5, hidden]);
     }
 
     #[test]
