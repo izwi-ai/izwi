@@ -3,13 +3,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    Json, RequestExt,
     extract::{Extension, Multipart, Path, Request, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{header, HeaderValue, StatusCode},
     response::{
-        IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
     },
+    Json, RequestExt,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -27,7 +27,8 @@ use crate::transcription_store::{
     TranscriptionSummaryStatus, TranscriptionWordRecord, UpdateTranscriptionSummary,
 };
 use izwi_core::{
-    ChatMessage, ChatRole, GenerationParams, RuntimeService, parse_chat_model_variant,
+    parse_chat_model_variant, ChatMessage, ChatRequestConfig, ChatRole, GenerationParams,
+    ModelVariant, RuntimeService,
 };
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
@@ -935,28 +936,54 @@ async fn generate_transcription_summary(
         parse_chat_model_variant(Some(DEFAULT_TRANSCRIPTION_SUMMARY_MODEL)).map_err(|err| {
             format!("Invalid summary model '{DEFAULT_TRANSCRIPTION_SUMMARY_MODEL}': {err}")
         })?;
-    let mut params = GenerationParams::default();
-    params.max_tokens = DEFAULT_TRANSCRIPTION_SUMMARY_MAX_TOKENS;
-    params.temperature = 0.2;
-    params.top_p = 0.9;
 
+    let first = generate_transcription_summary_attempt(
+        runtime.clone(),
+        variant,
+        transcription,
+        correlation_id,
+        None,
+    )
+    .await;
+    match first {
+        Ok(summary) => Ok(summary),
+        Err(err) if should_retry_transcription_summary_generation(&err) => {
+            tracing::warn!(
+                summary_model = DEFAULT_TRANSCRIPTION_SUMMARY_MODEL,
+                error = %err,
+                "transcription summary sampled decode failed; retrying with thinking disabled"
+            );
+            generate_transcription_summary_attempt(
+                runtime,
+                variant,
+                transcription,
+                correlation_id,
+                Some(false),
+            )
+            .await
+            .map_err(|retry_err| format!("{err}; retry with thinking disabled failed: {retry_err}"))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn generate_transcription_summary_attempt(
+    runtime: Arc<RuntimeService>,
+    variant: ModelVariant,
+    transcription: &str,
+    correlation_id: Option<&str>,
+    enable_thinking: Option<bool>,
+) -> Result<String, String> {
     let generation = runtime
-        .chat_generate_with_generation_params_and_correlation(
+        .chat_generate_with_generation_params_and_chat_config_and_correlation(
             variant,
-            vec![
-                ChatMessage {
-                    role: ChatRole::System,
-                    content: TRANSCRIPTION_SUMMARY_SYSTEM_PROMPT.to_string(),
-                },
-                ChatMessage {
-                    role: ChatRole::User,
-                    content: format!(
-                        "Summarize the following transcript.\n\nTranscript:\n{}",
-                        transcription
-                    ),
-                },
-            ],
-            params,
+            transcription_summary_messages(transcription),
+            transcription_summary_params(),
+            ChatRequestConfig {
+                enable_thinking,
+                tools: Vec::new(),
+                media_inputs: Vec::new(),
+            },
             correlation_id,
         )
         .await
@@ -964,6 +991,37 @@ async fn generate_transcription_summary(
 
     sanitize_summary_output(generation.text.as_str())
         .ok_or_else(|| "Summary generation returned empty text".to_string())
+}
+
+fn transcription_summary_params() -> GenerationParams {
+    let mut params = GenerationParams::default();
+    params.max_tokens = DEFAULT_TRANSCRIPTION_SUMMARY_MAX_TOKENS;
+    params.temperature = 0.2;
+    params.top_p = 0.9;
+    params
+}
+
+fn transcription_summary_messages(transcription: &str) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage {
+            role: ChatRole::System,
+            content: TRANSCRIPTION_SUMMARY_SYSTEM_PROMPT.to_string(),
+        },
+        ChatMessage {
+            role: ChatRole::User,
+            content: format!(
+                "Summarize the following transcript.\n\nTranscript:\n{}",
+                transcription
+            ),
+        },
+    ]
+}
+
+fn should_retry_transcription_summary_generation(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("no valid qwen3.5 logits to sample")
+        || normalized.contains("non-finite")
+        || (normalized.contains("logit") && normalized.contains("nan"))
 }
 
 fn sanitize_summary_output(raw: &str) -> Option<String> {
@@ -1030,15 +1088,16 @@ fn map_store_error(err: anyhow::Error) -> ApiError {
 mod tests {
     use axum::{
         body::Body,
-        http::{StatusCode, header},
+        http::{header, StatusCode},
     };
     use base64::Engine as _;
     use izwi_core::audio::{AudioEncoder, AudioFormat};
 
     use super::{
-        TranscriptionSummaryStatus, TranscriptionWordRecord, alignments_to_word_records,
-        build_segment_records, initial_summary_state, multipart_field_api_error, parse_bool,
-        parse_create_request, sanitize_summary_output,
+        alignments_to_word_records, build_segment_records, initial_summary_state,
+        multipart_field_api_error, parse_bool, parse_create_request, sanitize_summary_output,
+        should_retry_transcription_summary_generation, transcription_summary_messages,
+        transcription_summary_params, TranscriptionSummaryStatus, TranscriptionWordRecord,
     };
 
     fn wav_data_url(content_type: &str) -> String {
@@ -1183,5 +1242,37 @@ mod tests {
             sanitize_summary_output(close_only).as_deref(),
             Some("Final summary")
         );
+    }
+
+    #[test]
+    fn transcription_summary_uses_sampled_qwen35_settings() {
+        let params = transcription_summary_params();
+        assert_eq!(params.max_tokens, 384);
+        assert_eq!(params.temperature, 0.2);
+        assert_eq!(params.top_p, 0.9);
+
+        let messages = transcription_summary_messages("hello world");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, izwi_core::ChatRole::System);
+        assert!(messages[1].content.contains("hello world"));
+    }
+
+    #[test]
+    fn transcription_summary_retries_invalid_qwen35_logits() {
+        assert!(should_retry_transcription_summary_generation(
+            "Summary generation failed: Inference error: No valid Qwen3.5 logits to sample"
+        ));
+        assert!(should_retry_transcription_summary_generation(
+            "Summary generation failed: non-finite logits"
+        ));
+        assert!(should_retry_transcription_summary_generation(
+            "Summary generation failed: logits contained NaN values"
+        ));
+        assert!(!should_retry_transcription_summary_generation(
+            "Summary generation failed: Model not found"
+        ));
+        assert!(!should_retry_transcription_summary_generation(
+            "Summary generation failed: missing banana model"
+        ));
     }
 }
