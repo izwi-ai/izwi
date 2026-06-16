@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::catalog::{parse_model_variant, resolve_asr_model_variant, ModelFamily};
+use crate::catalog::{ModelFamily, parse_model_variant, resolve_asr_model_variant};
 use crate::engine::EngineCoreRequest;
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
@@ -13,14 +13,53 @@ use crate::runtime::request::{AlignmentRuntimeRequest, AsrRuntimeRequest};
 use crate::runtime::service::RuntimeService;
 use crate::runtime::types::AsrTranscription;
 
+#[derive(Clone, Copy)]
 enum AsrAudioInput<'a> {
     Base64(&'a str),
     Bytes(&'a [u8]),
 }
 
+const GRANITE_ASR_AUTO_MIN_TOKENS: usize = 96;
+const GRANITE_ASR_AUTO_MAX_TOKENS: usize = 2048;
+const GRANITE_ASR_AUTO_TOKENS_PER_SECOND: f32 = 4.0;
+const GRANITE_ASR_AUTO_TOKEN_MARGIN: usize = 16;
+
 fn resolve_asr_realtime_stream_variant(model_id: Option<&str>) -> Option<ModelVariant> {
     let variant = resolve_asr_model_variant(model_id);
     (variant.family() == ModelFamily::NemotronAsr).then_some(variant)
+}
+
+fn granite_auto_asr_max_tokens_for_duration(audio_seconds: f32) -> usize {
+    let duration_budget = if audio_seconds.is_finite() && audio_seconds > 0.0 {
+        (audio_seconds * GRANITE_ASR_AUTO_TOKENS_PER_SECOND).ceil() as usize
+    } else {
+        0
+    };
+    duration_budget
+        .saturating_add(GRANITE_ASR_AUTO_TOKEN_MARGIN)
+        .clamp(GRANITE_ASR_AUTO_MIN_TOKENS, GRANITE_ASR_AUTO_MAX_TOKENS)
+}
+
+fn granite_auto_asr_max_tokens(
+    variant: ModelVariant,
+    audio_input: AsrAudioInput<'_>,
+) -> Result<Option<usize>> {
+    if variant.family() != ModelFamily::GraniteSpeechAsr {
+        return Ok(None);
+    }
+    let audio_bytes = match audio_input {
+        AsrAudioInput::Base64(audio_base64) => base64_decode(audio_base64)?,
+        AsrAudioInput::Bytes(audio_bytes) => audio_bytes.to_vec(),
+    };
+    let (samples, sample_rate) = decode_audio_bytes(&audio_bytes)?;
+    let audio_seconds = if sample_rate > 0 {
+        samples.len() as f32 / sample_rate as f32
+    } else {
+        0.0
+    };
+    Ok(Some(granite_auto_asr_max_tokens_for_duration(
+        audio_seconds,
+    )))
 }
 
 pub struct RuntimeAsrRealtimeStream {
@@ -202,6 +241,8 @@ impl RuntimeService {
         let mut request = runtime_request.into_engine_request();
         if let Some(max_tokens) = max_tokens {
             request.params.max_tokens = max_tokens;
+        } else if let Some(auto_max_tokens) = granite_auto_asr_max_tokens(variant, audio_input)? {
+            request.params.max_tokens = auto_max_tokens;
         }
         Ok(request)
     }
@@ -1020,6 +1061,15 @@ mod tests {
             resolve_asr_realtime_stream_variant(Some("not-a-real-model")),
             None
         );
+    }
+
+    #[test]
+    fn granite_auto_asr_budget_scales_with_audio_duration() {
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(0.0), 96);
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(3.6), 96);
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(27.303175), 126);
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(60.0), 256);
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(600.0), 2048);
     }
 
     #[tokio::test]
