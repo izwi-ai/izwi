@@ -19,10 +19,10 @@ enum AsrAudioInput<'a> {
     Bytes(&'a [u8]),
 }
 
-const GRANITE_ASR_AUTO_MIN_TOKENS: usize = 96;
+const GRANITE_ASR_AUTO_MIN_TOKENS: usize = 76;
 const GRANITE_ASR_AUTO_MAX_TOKENS: usize = 2048;
+const GRANITE_ASR_AUTO_BASE_SECONDS: f32 = 28.0;
 const GRANITE_ASR_AUTO_TOKENS_PER_SECOND: f32 = 4.0;
-const GRANITE_ASR_AUTO_TOKEN_MARGIN: usize = 16;
 
 fn resolve_asr_realtime_stream_variant(model_id: Option<&str>) -> Option<ModelVariant> {
     let variant = resolve_asr_model_variant(model_id);
@@ -30,13 +30,15 @@ fn resolve_asr_realtime_stream_variant(model_id: Option<&str>) -> Option<ModelVa
 }
 
 fn granite_auto_asr_max_tokens_for_duration(audio_seconds: f32) -> usize {
-    let duration_budget = if audio_seconds.is_finite() && audio_seconds > 0.0 {
-        (audio_seconds * GRANITE_ASR_AUTO_TOKENS_PER_SECOND).ceil() as usize
-    } else {
-        0
-    };
-    duration_budget
-        .saturating_add(GRANITE_ASR_AUTO_TOKEN_MARGIN)
+    let duration_budget =
+        if audio_seconds.is_finite() && audio_seconds > GRANITE_ASR_AUTO_BASE_SECONDS {
+            ((audio_seconds - GRANITE_ASR_AUTO_BASE_SECONDS) * GRANITE_ASR_AUTO_TOKENS_PER_SECOND)
+                .ceil() as usize
+        } else {
+            0
+        };
+    GRANITE_ASR_AUTO_MIN_TOKENS
+        .saturating_add(duration_budget)
         .clamp(GRANITE_ASR_AUTO_MIN_TOKENS, GRANITE_ASR_AUTO_MAX_TOKENS)
 }
 
@@ -1065,11 +1067,13 @@ mod tests {
 
     #[test]
     fn granite_auto_asr_budget_scales_with_audio_duration() {
-        assert_eq!(granite_auto_asr_max_tokens_for_duration(0.0), 96);
-        assert_eq!(granite_auto_asr_max_tokens_for_duration(3.6), 96);
-        assert_eq!(granite_auto_asr_max_tokens_for_duration(27.303175), 126);
-        assert_eq!(granite_auto_asr_max_tokens_for_duration(60.0), 256);
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(0.0), 76);
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(3.6), 76);
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(27.303175), 76);
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(28.0), 76);
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(60.0), 204);
         assert_eq!(granite_auto_asr_max_tokens_for_duration(600.0), 2048);
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(1200.0), 2048);
     }
 
     #[tokio::test]
