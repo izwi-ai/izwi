@@ -63,6 +63,10 @@ struct ServerArgs {
     /// Log output format (`text`, `json`)
     #[arg(long, value_enum, env = "IZWI_LOG_FORMAT", default_value = "text")]
     log_format: LogFormat,
+
+    /// Enable Granite ASR decode-profile diagnostics after backend selection.
+    #[arg(long)]
+    granite_decode_profile: bool,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -113,6 +117,10 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
 
     // Create runtime service
     let runtime = RuntimeService::new(config)?;
+    if args.granite_decode_profile {
+        std::env::set_var("IZWI_GRANITE_DECODE_PROFILE", "1");
+        info!("Granite ASR decode profiling enabled");
+    }
     let persistence = PersistenceContext::resolve(&enterprise_hooks).await?;
     info!(
         database_backend = ?persistence.database.backend(),
@@ -516,6 +524,7 @@ mod tests {
         std::env::remove_var("IZWI_PRELOAD_MODELS");
         std::env::remove_var("IZWI_WARMUP_PRELOADED_MODELS");
         std::env::remove_var("IZWI_ASR_WARMUP_DURATION_MS");
+        std::env::remove_var("IZWI_GRANITE_DECODE_PROFILE");
     }
 
     fn parse(args: &[&str]) -> ServerArgs {
@@ -594,6 +603,16 @@ mod tests {
             result.is_err(),
             "invalid backend should fail argument parsing"
         );
+    }
+
+    #[test]
+    fn granite_decode_profile_flag_defaults_off_and_parses() {
+        let _guard = env_lock();
+        clear_bind_env();
+
+        assert!(!parse(&["izwi-server"]).granite_decode_profile);
+        assert!(parse(&["izwi-server", "--granite-decode-profile"]).granite_decode_profile);
+        clear_bind_env();
     }
 
     #[test]
