@@ -201,6 +201,13 @@ fn granite_decode_profile_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn granite_projection_fusion_enabled() -> bool {
+    std::env::var("IZWI_GRANITE_PROJECTION_FUSION")
+        .ok()
+        .and_then(|raw| parse_env_bool(&raw))
+        .unwrap_or(true)
+}
+
 fn parse_env_bool(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -1429,10 +1436,99 @@ impl GraniteDecoderLayer {
     }
 }
 
+struct GraniteTextFusedQkvProjection {
+    fused: Linear,
+    q_out: usize,
+    k_out: usize,
+    v_out: usize,
+}
+
+impl GraniteTextFusedQkvProjection {
+    fn new(q_proj: &Linear, k_proj: &Linear, v_proj: &Linear) -> Result<Self> {
+        let q_weight = q_proj.weight();
+        let k_weight = k_proj.weight();
+        let v_weight = v_proj.weight();
+        let q_out = q_weight.dim(0)?;
+        let k_out = k_weight.dim(0)?;
+        let v_out = v_weight.dim(0)?;
+        let in_dim = q_weight.dim(1)?;
+        if k_weight.dim(1)? != in_dim || v_weight.dim(1)? != in_dim {
+            return Err(Error::InferenceError(
+                "Granite fused QKV projection input dimensions do not match".to_string(),
+            ));
+        }
+        let weight = Tensor::cat(&[q_weight, k_weight, v_weight], 0)?;
+        Ok(Self {
+            fused: Linear::new(weight, None),
+            q_out,
+            k_out,
+            v_out,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let qkv = self.fused.forward(x)?;
+        let last_dim = qkv.rank().saturating_sub(1);
+        let q = qkv.narrow(last_dim, 0, self.q_out)?;
+        let k = qkv.narrow(last_dim, self.q_out, self.k_out)?;
+        let v = qkv.narrow(last_dim, self.q_out + self.k_out, self.v_out)?;
+        Ok((q, k, v))
+    }
+}
+
+enum GraniteTextQkvProjection {
+    Fused(GraniteTextFusedQkvProjection),
+    Separate {
+        q_proj: Linear,
+        k_proj: Linear,
+        v_proj: Linear,
+    },
+}
+
+impl GraniteTextQkvProjection {
+    fn load(config: &GraniteTextConfig, head_dim: usize, vb: VarBuilder) -> Result<Self> {
+        let q_proj = linear_no_bias(
+            config.hidden_size,
+            config.num_attention_heads * head_dim,
+            vb.pp("q_proj"),
+        )?;
+        let k_proj = linear_no_bias(
+            config.hidden_size,
+            config.num_key_value_heads * head_dim,
+            vb.pp("k_proj"),
+        )?;
+        let v_proj = linear_no_bias(
+            config.hidden_size,
+            config.num_key_value_heads * head_dim,
+            vb.pp("v_proj"),
+        )?;
+        if granite_projection_fusion_enabled() {
+            Ok(Self::Fused(GraniteTextFusedQkvProjection::new(
+                &q_proj, &k_proj, &v_proj,
+            )?))
+        } else {
+            Ok(Self::Separate {
+                q_proj,
+                k_proj,
+                v_proj,
+            })
+        }
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        match self {
+            Self::Fused(fused) => fused.forward(x),
+            Self::Separate {
+                q_proj,
+                k_proj,
+                v_proj,
+            } => Ok((q_proj.forward(x)?, k_proj.forward(x)?, v_proj.forward(x)?)),
+        }
+    }
+}
+
 struct GraniteTextAttention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
+    qkv_proj: GraniteTextQkvProjection,
     o_proj: Linear,
     num_heads: usize,
     num_kv_heads: usize,
@@ -1445,21 +1541,7 @@ impl GraniteTextAttention {
     fn load(config: &GraniteTextConfig, vb: VarBuilder) -> Result<Self> {
         let head_dim = config.hidden_size / config.num_attention_heads;
         Ok(Self {
-            q_proj: linear_no_bias(
-                config.hidden_size,
-                config.num_attention_heads * head_dim,
-                vb.pp("q_proj"),
-            )?,
-            k_proj: linear_no_bias(
-                config.hidden_size,
-                config.num_key_value_heads * head_dim,
-                vb.pp("k_proj"),
-            )?,
-            v_proj: linear_no_bias(
-                config.hidden_size,
-                config.num_key_value_heads * head_dim,
-                vb.pp("v_proj"),
-            )?,
+            qkv_proj: GraniteTextQkvProjection::load(config, head_dim, vb.clone())?,
             o_proj: linear_no_bias(
                 config.num_attention_heads * head_dim,
                 config.hidden_size,
@@ -1485,18 +1567,10 @@ impl GraniteTextAttention {
         let profiling = profile.is_some();
         let (batch, seq_len, _) = x.dims3()?;
         let qkv_start = profile_start(profiling);
-        let mut q =
-            self.q_proj
-                .forward(x)?
-                .reshape((batch, seq_len, self.num_heads, self.head_dim))?;
-        let mut k =
-            self.k_proj
-                .forward(x)?
-                .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?;
-        let v =
-            self.v_proj
-                .forward(x)?
-                .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?;
+        let (q, k, v) = self.qkv_proj.forward(x)?;
+        let mut q = q.reshape((batch, seq_len, self.num_heads, self.head_dim))?;
+        let mut k = k.reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?;
+        let v = v.reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?;
         if let Some(profile) = profile.as_deref_mut() {
             profile.qkv += profile_elapsed(qkv_start);
         }
@@ -1766,25 +1840,82 @@ fn dense_decode_attention_heads_scaled(
         .map_err(Error::from)
 }
 
+struct GraniteTextFusedGateUpProjection {
+    fused: Linear,
+    intermediate_size: usize,
+}
+
+impl GraniteTextFusedGateUpProjection {
+    fn new(gate_proj: &Linear, up_proj: &Linear) -> Result<Self> {
+        let gate_weight = gate_proj.weight();
+        let up_weight = up_proj.weight();
+        let intermediate_size = gate_weight.dim(0)?;
+        if up_weight.dim(0)? != intermediate_size || up_weight.dim(1)? != gate_weight.dim(1)? {
+            return Err(Error::InferenceError(
+                "Granite fused MLP projection dimensions do not match".to_string(),
+            ));
+        }
+        let weight = Tensor::cat(&[gate_weight, up_weight], 0)?;
+        Ok(Self {
+            fused: Linear::new(weight, None),
+            intermediate_size,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
+        let gate_up = self.fused.forward(x)?;
+        let last_dim = gate_up.rank().saturating_sub(1);
+        let gate = gate_up.narrow(last_dim, 0, self.intermediate_size)?;
+        let up = gate_up.narrow(last_dim, self.intermediate_size, self.intermediate_size)?;
+        Ok((gate, up))
+    }
+}
+
+enum GraniteTextGateUpProjection {
+    Fused(GraniteTextFusedGateUpProjection),
+    Separate { gate_proj: Linear, up_proj: Linear },
+}
+
+impl GraniteTextGateUpProjection {
+    fn load(config: &GraniteTextConfig, vb: VarBuilder) -> Result<Self> {
+        let gate_proj = linear_no_bias(
+            config.hidden_size,
+            config.intermediate_size,
+            vb.pp("gate_proj"),
+        )?;
+        let up_proj = linear_no_bias(
+            config.hidden_size,
+            config.intermediate_size,
+            vb.pp("up_proj"),
+        )?;
+        if granite_projection_fusion_enabled() {
+            Ok(Self::Fused(GraniteTextFusedGateUpProjection::new(
+                &gate_proj, &up_proj,
+            )?))
+        } else {
+            Ok(Self::Separate { gate_proj, up_proj })
+        }
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
+        match self {
+            Self::Fused(fused) => fused.forward(x),
+            Self::Separate { gate_proj, up_proj } => {
+                Ok((gate_proj.forward(x)?, up_proj.forward(x)?))
+            }
+        }
+    }
+}
+
 struct GraniteTextMlp {
-    gate_proj: Linear,
-    up_proj: Linear,
+    gate_up_proj: GraniteTextGateUpProjection,
     down_proj: Linear,
 }
 
 impl GraniteTextMlp {
     fn load(config: &GraniteTextConfig, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            gate_proj: linear_no_bias(
-                config.hidden_size,
-                config.intermediate_size,
-                vb.pp("gate_proj"),
-            )?,
-            up_proj: linear_no_bias(
-                config.hidden_size,
-                config.intermediate_size,
-                vb.pp("up_proj"),
-            )?,
+            gate_up_proj: GraniteTextGateUpProjection::load(config, vb.clone())?,
             down_proj: linear_no_bias(
                 config.intermediate_size,
                 config.hidden_size,
@@ -1800,8 +1931,7 @@ impl GraniteTextMlp {
     ) -> Result<Tensor> {
         let profiling = profile.is_some();
         let gate_up_start = profile_start(profiling);
-        let gate = self.gate_proj.forward(x)?;
-        let up = self.up_proj.forward(x)?;
+        let (gate, up) = self.gate_up_proj.forward(x)?;
         if let Some(profile) = profile.as_deref_mut() {
             profile.gate_up += profile_elapsed(gate_up_start);
         }
@@ -1827,6 +1957,102 @@ impl GraniteTextMlp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_tensor_close(lhs: &Tensor, rhs: &Tensor) {
+        assert_eq!(lhs.dims(), rhs.dims());
+        let lhs = lhs
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let rhs = rhs
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        for (idx, (lhs, rhs)) in lhs.iter().zip(rhs.iter()).enumerate() {
+            assert!(
+                (lhs - rhs).abs() <= 1e-5,
+                "tensor mismatch at {idx}: {lhs} != {rhs}"
+            );
+        }
+    }
+
+    #[test]
+    fn fused_granite_qkv_projection_matches_separate_linears() {
+        let device = Device::Cpu;
+        let q_proj = Linear::new(
+            Tensor::from_vec(
+                vec![
+                    0.1f32, 0.2, 0.3, -0.4, 0.5, 0.6, 0.7, -0.8, 0.9, 1.0, -1.1, 1.2,
+                ],
+                (4, 3),
+                &device,
+            )
+            .unwrap(),
+            None,
+        );
+        let k_proj = Linear::new(
+            Tensor::from_vec(vec![0.3f32, -0.2, 0.1, 0.6, 0.4, -0.5], (2, 3), &device).unwrap(),
+            None,
+        );
+        let v_proj = Linear::new(
+            Tensor::from_vec(vec![-0.7f32, 0.8, 0.9, 0.2, -0.1, 0.4], (2, 3), &device).unwrap(),
+            None,
+        );
+        let fused = GraniteTextFusedQkvProjection::new(&q_proj, &k_proj, &v_proj).unwrap();
+        let input = Tensor::from_vec(
+            vec![1.0f32, -2.0, 0.5, 0.25, 1.5, -0.75],
+            (1, 2, 3),
+            &device,
+        )
+        .unwrap();
+
+        let (q, k, v) = fused.forward(&input).unwrap();
+
+        assert_tensor_close(&q, &q_proj.forward(&input).unwrap());
+        assert_tensor_close(&k, &k_proj.forward(&input).unwrap());
+        assert_tensor_close(&v, &v_proj.forward(&input).unwrap());
+    }
+
+    #[test]
+    fn fused_granite_gate_up_projection_matches_separate_linears() {
+        let device = Device::Cpu;
+        let gate_proj = Linear::new(
+            Tensor::from_vec(
+                vec![0.1f32, -0.2, 0.3, 0.4, 0.5, -0.6, -0.7, 0.8, 0.9],
+                (3, 3),
+                &device,
+            )
+            .unwrap(),
+            None,
+        );
+        let up_proj = Linear::new(
+            Tensor::from_vec(
+                vec![-0.3f32, 0.2, 0.1, 0.6, -0.4, 0.5, 0.7, 0.9, -0.8],
+                (3, 3),
+                &device,
+            )
+            .unwrap(),
+            None,
+        );
+        let fused = GraniteTextFusedGateUpProjection::new(&gate_proj, &up_proj).unwrap();
+        let input = Tensor::from_vec(
+            vec![1.0f32, -2.0, 0.5, 0.25, 1.5, -0.75],
+            (1, 2, 3),
+            &device,
+        )
+        .unwrap();
+
+        let (gate, up) = fused.forward(&input).unwrap();
+
+        assert_tensor_close(&gate, &gate_proj.forward(&input).unwrap());
+        assert_tensor_close(&up, &up_proj.forward(&input).unwrap());
+    }
 
     #[test]
     fn expands_single_audio_placeholder_to_projected_token_count() {
