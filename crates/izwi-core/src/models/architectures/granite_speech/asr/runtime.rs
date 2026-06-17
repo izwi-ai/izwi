@@ -217,6 +217,22 @@ fn granite_projection_fusion_policy(is_cuda: bool, override_enabled: Option<bool
     override_enabled.unwrap_or(is_cuda)
 }
 
+fn granite_gate_up_projection_fusion_enabled(device: &Device) -> bool {
+    let override_enabled = std::env::var("IZWI_GRANITE_GATE_UP_PROJECTION_FUSION")
+        .ok()
+        .or_else(|| std::env::var("IZWI_GRANITE_PROJECTION_FUSION").ok())
+        .and_then(|raw| parse_env_bool(&raw));
+    granite_gate_up_projection_fusion_policy(device.is_metal(), device.is_cuda(), override_enabled)
+}
+
+fn granite_gate_up_projection_fusion_policy(
+    _is_metal: bool,
+    is_cuda: bool,
+    override_enabled: Option<bool>,
+) -> bool {
+    override_enabled.unwrap_or(is_cuda)
+}
+
 fn granite_rope_kernel_enabled(device: &Device, dtype: DType, head_dim: usize) -> bool {
     let override_enabled = std::env::var("IZWI_GRANITE_ROPE_KERNEL")
         .ok()
@@ -2165,7 +2181,7 @@ impl GraniteTextGateUpProjection {
             config.intermediate_size,
             vb.pp("up_proj"),
         )?;
-        if granite_projection_fusion_enabled(vb.device()) {
+        if granite_gate_up_projection_fusion_enabled(vb.device()) {
             Ok(Self::Fused(GraniteTextFusedGateUpProjection::new(
                 &gate_proj, &up_proj,
             )?))
@@ -2342,6 +2358,29 @@ mod tests {
         assert!(!granite_projection_fusion_policy(false, None));
         assert!(granite_projection_fusion_policy(false, Some(true)));
         assert!(!granite_projection_fusion_policy(true, Some(false)));
+    }
+
+    #[test]
+    fn granite_gate_up_projection_fusion_defaults_to_cuda_only() {
+        assert!(!granite_gate_up_projection_fusion_policy(
+            true, false, None
+        ));
+        assert!(granite_gate_up_projection_fusion_policy(
+            false, true, None
+        ));
+        assert!(!granite_gate_up_projection_fusion_policy(
+            false, false, None
+        ));
+        assert!(granite_gate_up_projection_fusion_policy(
+            false,
+            false,
+            Some(true)
+        ));
+        assert!(!granite_gate_up_projection_fusion_policy(
+            true,
+            false,
+            Some(false)
+        ));
     }
 
     #[test]
