@@ -3,22 +3,24 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use candle_core::{D, DType, Device, Tensor};
+use candle_core::{DType, Device, Tensor, D};
 use candle_nn::{
-    BatchNorm, Conv1d, Conv1dConfig, Embedding, LayerNorm, Linear, Module, ModuleT, RmsNorm,
-    VarBuilder, batch_norm, conv1d, conv1d_no_bias, embedding, layer_norm, linear, linear_no_bias,
-    ops,
+    batch_norm, conv1d, conv1d_no_bias, embedding, layer_norm, linear, linear_no_bias, ops,
+    rotary_emb, BatchNorm, Conv1d, Conv1dConfig, Embedding, LayerNorm, Linear, Module, ModuleT,
+    RmsNorm, VarBuilder,
 };
 
 use crate::backends::DeviceProfile;
 use crate::error::{Error, Result};
 use crate::kernels::try_fused_silu_mul;
-use crate::models::architectures::qwen3::core::{Qwen3Cache, causal_mask, repeat_kv};
+use crate::models::architectures::qwen3::core::{causal_mask, repeat_kv, Qwen3Cache};
 use crate::models::shared::attention::flash::{
     try_fused_self_attention, try_fused_self_attention_scaled,
 };
 use crate::models::shared::attention::paged::default_kv_page_size;
-use crate::models::shared::telemetry::{DecodeAttentionPath, record_decode_attention_path};
+use crate::models::shared::telemetry::{
+    record_decode_attention_path, record_rope_kernel, record_rope_manual, DecodeAttentionPath,
+};
 
 use super::config::{GraniteSpeechConfig, GraniteSpeechEncoderConfig, GraniteTextConfig};
 use super::preprocessor::GraniteSpeechAudioFeatures;
@@ -35,6 +37,7 @@ pub struct GraniteSpeechGenerationStats {
     pub dense_decode_cache_enabled: bool,
     pub dense_head_decode_enabled: bool,
     pub cuda_device_argmax: bool,
+    pub deferred_stop_check: bool,
     pub dense_decode_max_tokens: usize,
     pub timings: GraniteSpeechGenerationTimings,
     pub decode_profile: Option<GraniteSpeechDecodeProfile>,
@@ -212,11 +215,65 @@ fn granite_projection_fusion_policy(is_cuda: bool, override_enabled: Option<bool
     override_enabled.unwrap_or(is_cuda)
 }
 
+fn granite_rope_kernel_enabled(device: &Device, dtype: DType, head_dim: usize) -> bool {
+    let override_enabled = std::env::var("IZWI_GRANITE_ROPE_KERNEL")
+        .ok()
+        .and_then(|raw| parse_env_bool(&raw));
+    if !granite_rope_kernel_policy(device.is_metal(), device.is_cuda(), override_enabled) {
+        return false;
+    }
+    if head_dim == 0 || head_dim % 2 != 0 {
+        return false;
+    }
+    matches!(dtype, DType::F16 | DType::BF16 | DType::F32)
+}
+
+fn granite_rope_kernel_policy(
+    _is_metal: bool,
+    is_cuda: bool,
+    override_enabled: Option<bool>,
+) -> bool {
+    override_enabled.unwrap_or(is_cuda)
+}
+
 fn granite_native_greedy_logits_enabled() -> bool {
     std::env::var("IZWI_GRANITE_NATIVE_GREEDY_LOGITS")
         .ok()
         .and_then(|raw| parse_env_bool(&raw))
         .unwrap_or(true)
+}
+
+fn granite_deferred_stop_check_enabled(
+    device: &Device,
+    decode_each_step: bool,
+    max_new_tokens: usize,
+) -> bool {
+    if decode_each_step {
+        return false;
+    }
+    let override_enabled = std::env::var("IZWI_GRANITE_DEFER_STOP_CHECK")
+        .ok()
+        .and_then(|raw| parse_env_bool(&raw));
+    let default_max_tokens = std::env::var("IZWI_GRANITE_DEFER_STOP_MAX_TOKENS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(128);
+    granite_deferred_stop_check_policy(
+        device.is_metal(),
+        override_enabled,
+        max_new_tokens.max(1),
+        default_max_tokens,
+    )
+}
+
+fn granite_deferred_stop_check_policy(
+    _is_metal: bool,
+    override_enabled: Option<bool>,
+    _max_new_tokens: usize,
+    _default_max_tokens: usize,
+) -> bool {
+    override_enabled.unwrap_or(false)
 }
 
 fn parse_env_bool(raw: &str) -> Option<bool> {
@@ -371,15 +428,39 @@ impl GraniteSpeechRuntime {
         let mut stop_token = None;
         let stop_tokens = stop_token_set(special_tokens, extra_stop_token_ids);
         let decode_each_step = emit_deltas || !stop_sequences.is_empty();
+        let max_steps = max_new_tokens.max(1);
+        let deferred_stop_check =
+            granite_deferred_stop_check_enabled(&self.device, decode_each_step, max_steps);
+        let mut deferred_token_tensors =
+            Vec::with_capacity(if deferred_stop_check { max_steps } else { 0 });
         let decode_start = Instant::now();
 
-        for step in 0..max_new_tokens.max(1) {
+        for step in 0..max_steps {
             let step_start = profile_start(profiling);
             let mut step_profile = GraniteSpeechDecodeLoopProfile::default();
             let argmax_start = profile_start(profiling);
             let token_tensor = argmax_last_token_tensor(&logits)?;
             step_profile.argmax = profile_elapsed(argmax_start);
-            let next_logits = if !decode_each_step && step + 1 < max_new_tokens.max(1) {
+            if deferred_stop_check {
+                deferred_token_tensors.push(token_tensor.clone());
+                if step + 1 < max_steps {
+                    let forward_start = profile_start(profiling);
+                    logits = self.text_model.forward_profiled(
+                        &token_tensor,
+                        input_ids.len() + step,
+                        Some(&mut cache),
+                        profiler.as_mut(),
+                    )?;
+                    step_profile.model_forward += profile_elapsed(forward_start);
+                }
+                step_profile.step_total = profile_elapsed(step_start);
+                if let Some(profiler) = profiler.as_mut() {
+                    profiler.add_step(step_profile);
+                }
+                continue;
+            }
+
+            let next_logits = if !decode_each_step && step + 1 < max_steps {
                 let forward_start = profile_start(profiling);
                 let next_logits = self.text_model.forward_profiled(
                     &token_tensor,
@@ -452,6 +533,15 @@ impl GraniteSpeechRuntime {
                 profiler.add_step(step_profile);
             };
         }
+        if deferred_stop_check && !deferred_token_tensors.is_empty() {
+            let tokens = collect_deferred_token_tensors(&deferred_token_tensors)?;
+            let (tokens, first_stop_token) = truncate_tokens_at_first_stop(tokens, &stop_tokens);
+            generated = tokens;
+            if let Some(token) = first_stop_token {
+                stop_reason = "stop_token".to_string();
+                stop_token = Some(token);
+            }
+        }
         if !decode_each_step && !generated.is_empty() {
             let text_decode_start = profile_start(profiling);
             rendered = decode(&generated)?;
@@ -475,6 +565,7 @@ impl GraniteSpeechRuntime {
                 dense_decode_cache_enabled,
                 dense_head_decode_enabled,
                 cuda_device_argmax,
+                deferred_stop_check,
                 dense_decode_max_tokens,
                 timings: GraniteSpeechGenerationTimings { prefill, decode },
                 decode_profile,
@@ -519,6 +610,32 @@ fn stop_token_set(special_tokens: &GraniteSpeechSpecialTokens, extra: &[u32]) ->
     tokens.sort_unstable();
     tokens.dedup();
     tokens
+}
+
+fn collect_deferred_token_tensors(token_tensors: &[Tensor]) -> Result<Vec<u32>> {
+    if token_tensors.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tokens = Tensor::cat(token_tensors, 1)?;
+    match tokens.dims() {
+        [1, _] => tokens.squeeze(0)?.to_vec1::<u32>().map_err(Error::from),
+        dims => Err(Error::InferenceError(format!(
+            "Granite deferred token collection expected [1,tokens], got {dims:?}"
+        ))),
+    }
+}
+
+fn truncate_tokens_at_first_stop(tokens: Vec<u32>, stop_tokens: &[u32]) -> (Vec<u32>, Option<u32>) {
+    let Some(stop_at) = tokens
+        .iter()
+        .position(|token| stop_tokens.binary_search(token).is_ok())
+    else {
+        return (tokens, None);
+    };
+    let stop_token = tokens[stop_at];
+    let mut tokens = tokens;
+    tokens.truncate(stop_at);
+    (tokens, Some(stop_token))
 }
 
 fn truncate_at_stop_sequence(text: &mut String, stop_sequences: &[String]) -> bool {
@@ -1601,8 +1718,26 @@ impl GraniteTextAttention {
                 q.dtype(),
             )?,
         };
-        q = apply_rotary_emb(&q, &cos, &sin)?;
-        k = apply_rotary_emb(&k, &cos, &sin)?;
+        if granite_rope_kernel_enabled(q.device(), q.dtype(), self.head_dim) {
+            let cos_kernel = cos.unsqueeze(0)?.contiguous()?;
+            let sin_kernel = sin.unsqueeze(0)?.contiguous()?;
+            if let Some((q_out, k_out)) =
+                try_apply_granite_rope_pair_thd(&q, &k, &cos_kernel, &sin_kernel)?
+            {
+                record_rope_kernel();
+                record_rope_kernel();
+                q = q_out;
+                k = k_out;
+            } else {
+                record_rope_manual();
+                record_rope_manual();
+                q = apply_rotary_emb(&q, &cos, &sin)?;
+                k = apply_rotary_emb(&k, &cos, &sin)?;
+            }
+        } else {
+            q = apply_rotary_emb(&q, &cos, &sin)?;
+            k = apply_rotary_emb(&k, &cos, &sin)?;
+        }
         if let Some(profile) = profile.as_deref_mut() {
             profile.rope += profile_elapsed(rope_start);
         }
@@ -1736,6 +1871,23 @@ fn apply_rotary_emb(x: &Tensor, cos_half: &Tensor, sin_half: &Tensor) -> Result<
         .broadcast_mul(&sin)?
         .broadcast_add(&x2.broadcast_mul(&cos)?)?;
     Tensor::cat(&[first, second], 3).map_err(Error::from)
+}
+
+fn try_apply_granite_rope_pair_thd(
+    q: &Tensor,
+    k: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+) -> Result<Option<(Tensor, Tensor)>> {
+    let kernel_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let q_out = rotary_emb::rope_thd(&q.contiguous()?, cos, sin)?;
+        let k_out = rotary_emb::rope_thd(&k.contiguous()?, cos, sin)?;
+        candle_core::Result::<(Tensor, Tensor)>::Ok((q_out, k_out))
+    }));
+    match kernel_result {
+        Ok(Ok((q_out, k_out))) => Ok(Some((q_out, k_out))),
+        Ok(Err(_)) | Err(_) => Ok(None),
+    }
 }
 
 fn last_hidden_for_logits(hidden: &Tensor) -> Result<Tensor> {
@@ -2078,6 +2230,44 @@ mod tests {
     }
 
     #[test]
+    fn granite_rope_kernel_defaults_to_cuda_only() {
+        assert!(!granite_rope_kernel_policy(true, false, None));
+        assert!(granite_rope_kernel_policy(false, true, None));
+        assert!(!granite_rope_kernel_policy(false, false, None));
+        assert!(granite_rope_kernel_policy(false, false, Some(true)));
+        assert!(!granite_rope_kernel_policy(true, true, Some(false)));
+    }
+
+    #[test]
+    fn granite_manual_rotary_matches_rope_thd() {
+        let device = Device::Cpu;
+        let seq_len = 4usize;
+        let head_dim = 8usize;
+        let x = Tensor::from_vec(
+            (0..(seq_len * 2 * head_dim))
+                .map(|v| (v as f32) * 0.01)
+                .collect::<Vec<_>>(),
+            (1, seq_len, 2, head_dim),
+            &device,
+        )
+        .expect("x");
+        let (cos, sin) =
+            build_rope_cache(seq_len, head_dim, 0, 10000.0, &device, DType::F32).expect("cache");
+
+        let manual = apply_rotary_emb(&x, &cos, &sin).expect("manual");
+        let (kernel, _) = try_apply_granite_rope_pair_thd(
+            &x,
+            &x,
+            &cos.unsqueeze(0).expect("cos").contiguous().expect("cos"),
+            &sin.unsqueeze(0).expect("sin").contiguous().expect("sin"),
+        )
+        .expect("kernel result")
+        .expect("kernel output");
+
+        assert_tensor_close(&manual, &kernel);
+    }
+
+    #[test]
     fn expands_single_audio_placeholder_to_projected_token_count() {
         let input = vec![10, 20, 30];
         let expanded = expand_audio_tokens(&input, &[1], 3, 99).unwrap();
@@ -2340,6 +2530,53 @@ mod tests {
             audio_token: "<|audio|>".to_string(),
         };
         assert_eq!(stop_token_set(&tokens, &[4, 2, 4]), vec![2, 4]);
+    }
+
+    #[test]
+    fn deferred_stop_check_policy_is_opt_in() {
+        assert!(!granite_deferred_stop_check_policy(true, None, 76, 128));
+        assert!(!granite_deferred_stop_check_policy(true, None, 129, 128));
+        assert!(!granite_deferred_stop_check_policy(false, None, 76, 128));
+        assert!(granite_deferred_stop_check_policy(
+            false,
+            Some(true),
+            4096,
+            128
+        ));
+        assert!(!granite_deferred_stop_check_policy(
+            true,
+            Some(false),
+            76,
+            128
+        ));
+    }
+
+    #[test]
+    fn deferred_stop_tokens_match_incremental_stop_semantics() {
+        let (tokens, stop) = truncate_tokens_at_first_stop(vec![10, 11, 2, 12], &[2, 4]);
+
+        assert_eq!(tokens, vec![10, 11]);
+        assert_eq!(stop, Some(2));
+    }
+
+    #[test]
+    fn deferred_stop_tokens_preserve_max_token_outputs_without_stop() {
+        let (tokens, stop) = truncate_tokens_at_first_stop(vec![10, 11, 12], &[2, 4]);
+
+        assert_eq!(tokens, vec![10, 11, 12]);
+        assert_eq!(stop, None);
+    }
+
+    #[test]
+    fn collect_deferred_token_tensors_returns_single_host_read_row() {
+        let device = Device::Cpu;
+        let first = Tensor::from_vec(vec![7u32], (1, 1), &device).unwrap();
+        let second = Tensor::from_vec(vec![8u32], (1, 1), &device).unwrap();
+
+        assert_eq!(
+            collect_deferred_token_tensors(&[first, second]).unwrap(),
+            vec![7, 8]
+        );
     }
 
     #[test]
