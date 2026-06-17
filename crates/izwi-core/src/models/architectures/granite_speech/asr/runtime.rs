@@ -245,6 +245,14 @@ fn granite_native_greedy_logits_enabled() -> bool {
         .unwrap_or(true)
 }
 
+fn granite_mlp_try_fused_silu_mul(device: &Device) -> bool {
+    granite_mlp_fused_silu_mul_policy(device.is_metal())
+}
+
+fn granite_mlp_fused_silu_mul_policy(is_metal: bool) -> bool {
+    !is_metal
+}
+
 fn granite_deferred_stop_check_enabled(
     device: &Device,
     decode_each_step: bool,
@@ -2205,8 +2213,13 @@ impl GraniteTextMlp {
             profile.gate_up += profile_elapsed(gate_up_start);
         }
         let activation_start = profile_start(profiling);
-        let hidden = if let Some(fused) = try_fused_silu_mul(&gate, &up) {
-            fused
+        let hidden = if granite_mlp_try_fused_silu_mul(gate.device()) {
+            if let Some(fused) = try_fused_silu_mul(&gate, &up) {
+                fused
+            } else {
+                let gate = gate.silu()?;
+                gate.broadcast_mul(&up)?
+            }
         } else {
             let gate = gate.silu()?;
             gate.broadcast_mul(&up)?
@@ -2329,6 +2342,12 @@ mod tests {
         assert!(!granite_projection_fusion_policy(false, None));
         assert!(granite_projection_fusion_policy(false, Some(true)));
         assert!(!granite_projection_fusion_policy(true, Some(false)));
+    }
+
+    #[test]
+    fn granite_mlp_fused_silu_mul_skips_metal_wrapper() {
+        assert!(!granite_mlp_fused_silu_mul_policy(true));
+        assert!(granite_mlp_fused_silu_mul_policy(false));
     }
 
     #[test]
