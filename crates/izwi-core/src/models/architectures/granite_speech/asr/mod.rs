@@ -581,6 +581,8 @@ fn granite_diagnostics(
             "cuda_dense_decode_cache": generation.stats.dense_decode_cache_enabled,
             "cuda_device_argmax": generation.stats.cuda_device_argmax,
             "deferred_stop_check": generation.stats.deferred_stop_check,
+            "chunked_stop_check": generation.stats.chunked_stop_check,
+            "stop_check_interval": generation.stats.stop_check_interval,
             "dense_decode_max_tokens": generation.stats.dense_decode_max_tokens,
             "audio_embedding_cache_hit": timings.audio_cache_hit,
         },
@@ -933,6 +935,8 @@ mod tests {
                 dense_head_decode_enabled: false,
                 cuda_device_argmax: false,
                 deferred_stop_check: true,
+                chunked_stop_check: false,
+                stop_check_interval: 1,
                 dense_decode_max_tokens: 8192,
                 timings: GraniteSpeechGenerationTimings {
                     prefill: Duration::from_millis(7),
@@ -1033,6 +1037,8 @@ mod tests {
         assert_eq!(diagnostics["execution"]["dense_head_decode_enabled"], false);
         assert_eq!(diagnostics["execution"]["cuda_device_argmax"], false);
         assert_eq!(diagnostics["execution"]["deferred_stop_check"], true);
+        assert_eq!(diagnostics["execution"]["chunked_stop_check"], false);
+        assert_eq!(diagnostics["execution"]["stop_check_interval"], 1);
         assert_eq!(diagnostics["execution"]["dense_decode_max_tokens"], 8192);
         assert_eq!(diagnostics["execution"]["audio_embedding_cache_hit"], true);
         assert_eq!(diagnostics["decode_profile"]["enabled"], true);

@@ -38,6 +38,8 @@ pub struct GraniteSpeechGenerationStats {
     pub dense_head_decode_enabled: bool,
     pub cuda_device_argmax: bool,
     pub deferred_stop_check: bool,
+    pub chunked_stop_check: bool,
+    pub stop_check_interval: usize,
     pub dense_decode_max_tokens: usize,
     pub timings: GraniteSpeechGenerationTimings,
     pub decode_profile: Option<GraniteSpeechDecodeProfile>,
@@ -276,6 +278,48 @@ fn granite_deferred_stop_check_policy(
     override_enabled.unwrap_or(false)
 }
 
+fn granite_chunked_stop_check_enabled(
+    device: &Device,
+    decode_each_step: bool,
+    max_new_tokens: usize,
+) -> bool {
+    if decode_each_step {
+        return false;
+    }
+    let override_enabled = std::env::var("IZWI_GRANITE_CHUNKED_STOP_CHECK")
+        .ok()
+        .and_then(|raw| parse_env_bool(&raw));
+    let default_max_tokens = std::env::var("IZWI_GRANITE_CHUNKED_STOP_MAX_TOKENS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(128);
+    granite_chunked_stop_check_policy(
+        device.is_metal(),
+        override_enabled,
+        max_new_tokens.max(1),
+        default_max_tokens,
+    )
+}
+
+fn granite_chunked_stop_check_policy(
+    _is_metal: bool,
+    override_enabled: Option<bool>,
+    _max_new_tokens: usize,
+    _default_max_tokens: usize,
+) -> bool {
+    override_enabled.unwrap_or(false)
+}
+
+fn granite_chunked_stop_check_interval(max_new_tokens: usize) -> usize {
+    let interval = std::env::var("IZWI_GRANITE_CHUNKED_STOP_INTERVAL")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8);
+    interval.clamp(1, max_new_tokens.max(1))
+}
+
 fn parse_env_bool(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -431,8 +475,20 @@ impl GraniteSpeechRuntime {
         let max_steps = max_new_tokens.max(1);
         let deferred_stop_check =
             granite_deferred_stop_check_enabled(&self.device, decode_each_step, max_steps);
+        let chunked_stop_check = !deferred_stop_check
+            && granite_chunked_stop_check_enabled(&self.device, decode_each_step, max_steps);
+        let stop_check_interval = if chunked_stop_check {
+            granite_chunked_stop_check_interval(max_steps)
+        } else {
+            1
+        };
         let mut deferred_token_tensors =
             Vec::with_capacity(if deferred_stop_check { max_steps } else { 0 });
+        let mut chunk_token_tensors = Vec::with_capacity(if chunked_stop_check {
+            stop_check_interval
+        } else {
+            0
+        });
         let decode_start = Instant::now();
 
         for step in 0..max_steps {
@@ -453,6 +509,50 @@ impl GraniteSpeechRuntime {
                     )?;
                     step_profile.model_forward += profile_elapsed(forward_start);
                 }
+                step_profile.step_total = profile_elapsed(step_start);
+                if let Some(profiler) = profiler.as_mut() {
+                    profiler.add_step(step_profile);
+                }
+                continue;
+            }
+            if chunked_stop_check {
+                chunk_token_tensors.push(token_tensor.clone());
+                if step + 1 < max_steps {
+                    let forward_start = profile_start(profiling);
+                    logits = self.text_model.forward_profiled(
+                        &token_tensor,
+                        input_ids.len() + step,
+                        Some(&mut cache),
+                        profiler.as_mut(),
+                    )?;
+                    step_profile.model_forward += profile_elapsed(forward_start);
+                }
+
+                let should_check_stop =
+                    chunk_token_tensors.len() >= stop_check_interval || step + 1 == max_steps;
+                if should_check_stop {
+                    let scalar_start = profile_start(profiling);
+                    let tokens = collect_deferred_token_tensors(&chunk_token_tensors)?;
+                    step_profile.scalar_read = profile_elapsed(scalar_start);
+                    chunk_token_tensors.clear();
+
+                    let stop_start = profile_start(profiling);
+                    let (tokens, first_stop_token) =
+                        truncate_tokens_at_first_stop(tokens, &stop_tokens);
+                    generated.extend(tokens);
+                    if let Some(token) = first_stop_token {
+                        stop_reason = "stop_token".to_string();
+                        stop_token = Some(token);
+                        step_profile.stop_check = profile_elapsed(stop_start);
+                        step_profile.step_total = profile_elapsed(step_start);
+                        if let Some(profiler) = profiler.as_mut() {
+                            profiler.add_step(step_profile);
+                        }
+                        break;
+                    }
+                    step_profile.stop_check = profile_elapsed(stop_start);
+                }
+
                 step_profile.step_total = profile_elapsed(step_start);
                 if let Some(profiler) = profiler.as_mut() {
                     profiler.add_step(step_profile);
@@ -566,6 +666,8 @@ impl GraniteSpeechRuntime {
                 dense_head_decode_enabled,
                 cuda_device_argmax,
                 deferred_stop_check,
+                chunked_stop_check,
+                stop_check_interval,
                 dense_decode_max_tokens,
                 timings: GraniteSpeechGenerationTimings { prefill, decode },
                 decode_profile,
@@ -2544,6 +2646,26 @@ mod tests {
             128
         ));
         assert!(!granite_deferred_stop_check_policy(
+            true,
+            Some(false),
+            76,
+            128
+        ));
+    }
+
+    #[test]
+    fn chunked_stop_check_policy_is_opt_in() {
+        assert!(!granite_chunked_stop_check_policy(true, None, 76, 128));
+        assert!(!granite_chunked_stop_check_policy(true, None, 128, 128));
+        assert!(!granite_chunked_stop_check_policy(true, None, 129, 128));
+        assert!(!granite_chunked_stop_check_policy(false, None, 76, 128));
+        assert!(granite_chunked_stop_check_policy(
+            false,
+            Some(true),
+            4096,
+            128
+        ));
+        assert!(!granite_chunked_stop_check_policy(
             true,
             Some(false),
             76,
