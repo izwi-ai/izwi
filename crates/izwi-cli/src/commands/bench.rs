@@ -163,6 +163,31 @@ struct AsrStageTimings {
     execution: Option<AsrExecutionDiagnostics>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AsrDecodeProfileTimings {
+    steps: Option<u64>,
+    step_total_avg_ms: Option<f64>,
+    step_total_p95_ms: Option<f64>,
+    loop_argmax_ms: Option<f64>,
+    loop_scalar_read_ms: Option<f64>,
+    loop_model_forward_ms: Option<f64>,
+    forward_token_embedding_ms: Option<f64>,
+    forward_rope_build_ms: Option<f64>,
+    forward_layers_total_ms: Option<f64>,
+    forward_final_norm_ms: Option<f64>,
+    forward_lm_head_ms: Option<f64>,
+    decoder_total_ms: Option<f64>,
+    attention_qkv_ms: Option<f64>,
+    attention_rope_ms: Option<f64>,
+    attention_cache_ms: Option<f64>,
+    attention_kernel_ms: Option<f64>,
+    attention_output_ms: Option<f64>,
+    mlp_gate_up_ms: Option<f64>,
+    mlp_activation_ms: Option<f64>,
+    mlp_down_ms: Option<f64>,
+    residual_ms: Option<f64>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize)]
 struct AsrExecutionDiagnostics {
     cuda_dense_decode_cache: Option<bool>,
@@ -1831,6 +1856,7 @@ async fn bench_asr(
         .filter_map(|sample| sample.response.rtf)
         .collect();
     let mut stage_samples = Vec::new();
+    let mut decode_profile_samples = Vec::new();
     let mut saw_whisper_diagnostics = false;
     for sample in &samples {
         if let Some(diagnostics) = sample.response.izwi_asr_diagnostics.as_ref() {
@@ -1838,6 +1864,9 @@ async fn bench_asr(
                 saw_whisper_diagnostics = true;
             }
             stage_samples.extend(collect_asr_stage_timings_from_diagnostics(diagnostics));
+            decode_profile_samples.extend(collect_asr_decode_profiles_from_diagnostics(
+                diagnostics,
+            ));
         }
     }
 
@@ -1878,6 +1907,7 @@ async fn bench_asr(
             );
         }
         print_asr_stage_timing_summary(&stage_samples);
+        print_asr_decode_profile_summary(&decode_profile_samples);
     }
 
     let model_lower = model.to_ascii_lowercase();
@@ -2670,6 +2700,92 @@ fn collect_asr_stage_timings_from_diagnostics(
     samples
 }
 
+fn asr_decode_profile_from_diagnostics(
+    diagnostics: &serde_json::Value,
+) -> Option<AsrDecodeProfileTimings> {
+    let profile = diagnostics.get("decode_profile")?;
+    if profile
+        .get("enabled")
+        .and_then(|value| value.as_bool())
+        != Some(true)
+    {
+        return None;
+    }
+
+    Some(AsrDecodeProfileTimings {
+        steps: profile.get("steps").and_then(|value| value.as_u64()),
+        step_total_avg_ms: summary_metric(profile, &["step_total_ms", "avg"]),
+        step_total_p95_ms: summary_metric(profile, &["step_total_ms", "p95"]),
+        loop_argmax_ms: summary_metric(profile, &["loop_totals_ms", "argmax"]),
+        loop_scalar_read_ms: summary_metric(profile, &["loop_totals_ms", "scalar_read"]),
+        loop_model_forward_ms: summary_metric(profile, &["loop_totals_ms", "model_forward"]),
+        forward_token_embedding_ms: summary_metric(
+            profile,
+            &["forward_totals_ms", "token_embedding"],
+        ),
+        forward_rope_build_ms: summary_metric(profile, &["forward_totals_ms", "rope_build"]),
+        forward_layers_total_ms: summary_metric(profile, &["forward_totals_ms", "layers_total"]),
+        forward_final_norm_ms: summary_metric(profile, &["forward_totals_ms", "final_norm"]),
+        forward_lm_head_ms: summary_metric(profile, &["forward_totals_ms", "lm_head"]),
+        decoder_total_ms: summary_metric(profile, &["decoder_totals_ms", "total"]),
+        attention_qkv_ms: summary_metric(
+            profile,
+            &["decoder_totals_ms", "attention", "qkv"],
+        ),
+        attention_rope_ms: summary_metric(
+            profile,
+            &["decoder_totals_ms", "attention", "rope"],
+        ),
+        attention_cache_ms: summary_metric(
+            profile,
+            &["decoder_totals_ms", "attention", "cache"],
+        ),
+        attention_kernel_ms: summary_metric(
+            profile,
+            &["decoder_totals_ms", "attention", "kernel"],
+        ),
+        attention_output_ms: summary_metric(
+            profile,
+            &["decoder_totals_ms", "attention", "output"],
+        ),
+        mlp_gate_up_ms: summary_metric(profile, &["decoder_totals_ms", "mlp", "gate_up"]),
+        mlp_activation_ms: summary_metric(profile, &["decoder_totals_ms", "mlp", "activation"]),
+        mlp_down_ms: summary_metric(profile, &["decoder_totals_ms", "mlp", "down"]),
+        residual_ms: summary_metric(profile, &["decoder_totals_ms", "residual"]),
+    })
+}
+
+fn collect_asr_decode_profiles_from_diagnostics(
+    diagnostics: &serde_json::Value,
+) -> Vec<AsrDecodeProfileTimings> {
+    let mut samples = Vec::new();
+    if let Some(profile) = asr_decode_profile_from_diagnostics(diagnostics) {
+        samples.push(profile);
+    }
+    if let Some(model_diagnostics) = diagnostics.get("model_diagnostics") {
+        if let Some(profile) = asr_decode_profile_from_diagnostics(model_diagnostics) {
+            samples.push(profile);
+        }
+    }
+
+    if let Some(chunks) = diagnostics
+        .get("chunking")
+        .and_then(|value| value.get("chunk_transcriptions"))
+        .and_then(|value| value.as_array())
+    {
+        for chunk in chunks {
+            let Some(model_diagnostics) = chunk.get("model_diagnostics") else {
+                continue;
+            };
+            if let Some(profile) = asr_decode_profile_from_diagnostics(model_diagnostics) {
+                samples.push(profile);
+            }
+        }
+    }
+
+    samples
+}
+
 fn summarize_stage(stage: &str, values: &[f64]) {
     if values.is_empty() {
         return;
@@ -2858,6 +2974,128 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     summarize_bool_count("defer_stop", &deferred_stop_check);
     summarize_bool_count("chunk_stop", &chunked_stop_check);
     summarize_count("stop_interval", &stop_check_interval);
+}
+
+fn print_asr_decode_profile_summary(samples: &[AsrDecodeProfileTimings]) {
+    if samples.is_empty() {
+        return;
+    }
+
+    let mut steps = Vec::new();
+    let mut step_total_avg = Vec::new();
+    let mut step_total_p95 = Vec::new();
+    let mut loop_argmax = Vec::new();
+    let mut loop_scalar_read = Vec::new();
+    let mut loop_model_forward = Vec::new();
+    let mut forward_token_embedding = Vec::new();
+    let mut forward_rope_build = Vec::new();
+    let mut forward_layers_total = Vec::new();
+    let mut forward_final_norm = Vec::new();
+    let mut forward_lm_head = Vec::new();
+    let mut decoder_total = Vec::new();
+    let mut attention_qkv = Vec::new();
+    let mut attention_rope = Vec::new();
+    let mut attention_cache = Vec::new();
+    let mut attention_kernel = Vec::new();
+    let mut attention_output = Vec::new();
+    let mut mlp_gate_up = Vec::new();
+    let mut mlp_activation = Vec::new();
+    let mut mlp_down = Vec::new();
+    let mut residual = Vec::new();
+
+    for sample in samples {
+        if let Some(value) = sample.steps {
+            steps.push(value);
+        }
+        if let Some(value) = sample.step_total_avg_ms {
+            step_total_avg.push(value);
+        }
+        if let Some(value) = sample.step_total_p95_ms {
+            step_total_p95.push(value);
+        }
+        if let Some(value) = sample.loop_argmax_ms {
+            loop_argmax.push(value);
+        }
+        if let Some(value) = sample.loop_scalar_read_ms {
+            loop_scalar_read.push(value);
+        }
+        if let Some(value) = sample.loop_model_forward_ms {
+            loop_model_forward.push(value);
+        }
+        if let Some(value) = sample.forward_token_embedding_ms {
+            forward_token_embedding.push(value);
+        }
+        if let Some(value) = sample.forward_rope_build_ms {
+            forward_rope_build.push(value);
+        }
+        if let Some(value) = sample.forward_layers_total_ms {
+            forward_layers_total.push(value);
+        }
+        if let Some(value) = sample.forward_final_norm_ms {
+            forward_final_norm.push(value);
+        }
+        if let Some(value) = sample.forward_lm_head_ms {
+            forward_lm_head.push(value);
+        }
+        if let Some(value) = sample.decoder_total_ms {
+            decoder_total.push(value);
+        }
+        if let Some(value) = sample.attention_qkv_ms {
+            attention_qkv.push(value);
+        }
+        if let Some(value) = sample.attention_rope_ms {
+            attention_rope.push(value);
+        }
+        if let Some(value) = sample.attention_cache_ms {
+            attention_cache.push(value);
+        }
+        if let Some(value) = sample.attention_kernel_ms {
+            attention_kernel.push(value);
+        }
+        if let Some(value) = sample.attention_output_ms {
+            attention_output.push(value);
+        }
+        if let Some(value) = sample.mlp_gate_up_ms {
+            mlp_gate_up.push(value);
+        }
+        if let Some(value) = sample.mlp_activation_ms {
+            mlp_activation.push(value);
+        }
+        if let Some(value) = sample.mlp_down_ms {
+            mlp_down.push(value);
+        }
+        if let Some(value) = sample.residual_ms {
+            residual.push(value);
+        }
+    }
+
+    println!(
+        "\n{}",
+        console::style("ASR Decode Profile (run-local):")
+            .bold()
+            .underlined()
+    );
+    summarize_count("steps", &steps);
+    summarize_stage("step_avg", &step_total_avg);
+    summarize_stage("step_p95", &step_total_p95);
+    summarize_stage("loop_fwd", &loop_model_forward);
+    summarize_stage("argmax", &loop_argmax);
+    summarize_stage("scalar_read", &loop_scalar_read);
+    summarize_stage("embed", &forward_token_embedding);
+    summarize_stage("rope_build", &forward_rope_build);
+    summarize_stage("layers_total", &forward_layers_total);
+    summarize_stage("final_norm", &forward_final_norm);
+    summarize_stage("lm_head", &forward_lm_head);
+    summarize_stage("dec_total", &decoder_total);
+    summarize_stage("attn_qkv", &attention_qkv);
+    summarize_stage("attn_rope", &attention_rope);
+    summarize_stage("attn_cache", &attention_cache);
+    summarize_stage("attn_kernel", &attention_kernel);
+    summarize_stage("attn_out", &attention_output);
+    summarize_stage("mlp_gate_up", &mlp_gate_up);
+    summarize_stage("mlp_act", &mlp_activation);
+    summarize_stage("mlp_down", &mlp_down);
+    summarize_stage("residual", &residual);
 }
 
 fn print_runtime_delta(
@@ -3253,6 +3491,62 @@ mod tests {
                 .dense_decode_max_tokens,
             Some(384)
         );
+    }
+
+    #[test]
+    fn asr_decode_profile_collection_includes_nested_granite_diagnostics() {
+        let diagnostics = serde_json::json!({
+            "model_diagnostics": {
+                "model_family": "granite_speech_asr",
+                "decode_profile": {
+                    "enabled": true,
+                    "steps": 75,
+                    "step_total_ms": {
+                        "avg": 76.0,
+                        "p95": 80.0
+                    },
+                    "loop_totals_ms": {
+                        "argmax": 12.0,
+                        "scalar_read": 15.0,
+                        "model_forward": 5500.0
+                    },
+                    "forward_totals_ms": {
+                        "token_embedding": 3.0,
+                        "rope_build": 4.0,
+                        "layers_total": 5300.0,
+                        "final_norm": 5.0,
+                        "lm_head": 120.0
+                    },
+                    "decoder_totals_ms": {
+                        "total": 5300.0,
+                        "attention": {
+                            "qkv": 900.0,
+                            "rope": 180.0,
+                            "cache": 75.0,
+                            "kernel": 1100.0,
+                            "output": 650.0
+                        },
+                        "mlp": {
+                            "gate_up": 800.0,
+                            "activation": 250.0,
+                            "down": 700.0
+                        },
+                        "residual": 120.0
+                    }
+                }
+            }
+        });
+
+        let samples = collect_asr_decode_profiles_from_diagnostics(&diagnostics);
+
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].steps, Some(75));
+        assert_eq!(samples[0].step_total_avg_ms, Some(76.0));
+        assert_eq!(samples[0].loop_model_forward_ms, Some(5500.0));
+        assert_eq!(samples[0].forward_lm_head_ms, Some(120.0));
+        assert_eq!(samples[0].attention_kernel_ms, Some(1100.0));
+        assert_eq!(samples[0].mlp_activation_ms, Some(250.0));
+        assert_eq!(samples[0].residual_ms, Some(120.0));
     }
 
     #[test]
