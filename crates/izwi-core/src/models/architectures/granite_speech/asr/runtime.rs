@@ -201,11 +201,15 @@ fn granite_decode_profile_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn granite_projection_fusion_enabled() -> bool {
-    std::env::var("IZWI_GRANITE_PROJECTION_FUSION")
+fn granite_projection_fusion_enabled(device: &Device) -> bool {
+    let override_enabled = std::env::var("IZWI_GRANITE_PROJECTION_FUSION")
         .ok()
-        .and_then(|raw| parse_env_bool(&raw))
-        .unwrap_or(true)
+        .and_then(|raw| parse_env_bool(&raw));
+    granite_projection_fusion_policy(device.is_cuda(), override_enabled)
+}
+
+fn granite_projection_fusion_policy(is_cuda: bool, override_enabled: Option<bool>) -> bool {
+    override_enabled.unwrap_or(is_cuda)
 }
 
 fn granite_native_greedy_logits_enabled() -> bool {
@@ -1513,7 +1517,7 @@ impl GraniteTextQkvProjection {
             config.num_key_value_heads * head_dim,
             vb.pp("v_proj"),
         )?;
-        if granite_projection_fusion_enabled() {
+        if granite_projection_fusion_enabled(vb.device()) {
             Ok(Self::Fused(GraniteTextFusedQkvProjection::new(
                 &q_proj, &k_proj, &v_proj,
             )?))
@@ -1899,7 +1903,7 @@ impl GraniteTextGateUpProjection {
             config.intermediate_size,
             vb.pp("up_proj"),
         )?;
-        if granite_projection_fusion_enabled() {
+        if granite_projection_fusion_enabled(vb.device()) {
             Ok(Self::Fused(GraniteTextFusedGateUpProjection::new(
                 &gate_proj, &up_proj,
             )?))
@@ -2063,6 +2067,14 @@ mod tests {
 
         assert_tensor_close(&gate, &gate_proj.forward(&input).unwrap());
         assert_tensor_close(&up, &up_proj.forward(&input).unwrap());
+    }
+
+    #[test]
+    fn granite_projection_fusion_defaults_to_cuda_only() {
+        assert!(granite_projection_fusion_policy(true, None));
+        assert!(!granite_projection_fusion_policy(false, None));
+        assert!(granite_projection_fusion_policy(false, Some(true)));
+        assert!(!granite_projection_fusion_policy(true, Some(false)));
     }
 
     #[test]
