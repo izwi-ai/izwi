@@ -5,16 +5,16 @@
 //! root-level layer structure compared to standard Qwen3.
 
 use candle_core::{DType, Device, Tensor};
-use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
+use candle_nn::{Embedding, Linear, Module, RmsNorm, VarBuilder, ops};
 
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::core::{
-    build_mrope_cache, build_rope_cache, causal_mask, dense_decode_attention, repeat_kv,
-    Qwen3Cache, Qwen3Config,
+    Qwen3Cache, Qwen3Config, build_mrope_cache, build_rope_cache, causal_mask,
+    dense_decode_attention, repeat_kv,
 };
 use crate::models::shared::attention::flash::{
-    flash_attention_requested, try_fused_self_attention, try_fused_self_attention_with_options,
-    CudaFlashAttentionOptions,
+    CudaFlashAttentionOptions, flash_attention_requested, try_fused_self_attention,
+    try_fused_self_attention_with_options,
 };
 use crate::models::shared::attention::paged::paged_decode_attention;
 
@@ -367,11 +367,11 @@ impl VoxtralAttention {
             cache.append(layer_idx, k.clone(), v.clone())?;
 
             if seq_len == 1 && start_pos > 0 && self.sliding_window.is_none() {
-                if let Some((k_heads, v_heads)) = cache.dense_heads(layer_idx) {
+                if let Some((k_heads, v_heads)) = cache.dense_heads(layer_idx)? {
                     let out = dense_decode_attention(
                         &q,
-                        k_heads,
-                        v_heads,
+                        &k_heads,
+                        &v_heads,
                         self.num_heads,
                         self.num_kv_heads,
                         self.head_dim,
@@ -690,7 +690,7 @@ impl VoxtralMlp {
 mod tests {
     use super::*;
     use crate::models::shared::attention::paged::KvCacheQuantization;
-    use candle_core::{DType, D};
+    use candle_core::{D, DType};
     use std::collections::HashMap;
 
     fn tiny_cfg() -> Qwen3Config {

@@ -1521,7 +1521,7 @@ impl GraniteTextAttention {
         let (k, v, total_len) = if let Some(cache) = cache {
             cache.append(layer_idx, k.clone(), v.clone())?;
             if granite_dense_head_decode_allowed(q.device()) && seq_len == 1 && start_pos > 0 {
-                if let Some((k_heads, v_heads)) = cache.dense_heads(layer_idx) {
+                if let Some((k_heads, v_heads)) = cache.dense_heads(layer_idx)? {
                     if let Some(profile) = profile.as_deref_mut() {
                         profile.cache += profile_elapsed(cache_start);
                     }
@@ -1529,8 +1529,8 @@ impl GraniteTextAttention {
                     let kernel_start = profile_start(profiling);
                     let out = dense_decode_attention_heads_scaled(
                         &q,
-                        k_heads,
-                        v_heads,
+                        &k_heads,
+                        &v_heads,
                         self.num_heads,
                         self.num_kv_heads,
                         self.head_dim,
