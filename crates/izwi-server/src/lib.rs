@@ -67,6 +67,10 @@ struct ServerArgs {
     /// Enable Granite ASR decode-profile diagnostics after backend selection.
     #[arg(long)]
     granite_decode_profile: bool,
+
+    /// Override Granite ASR dtype after backend selection (`f32`, `f16`, `bf16`).
+    #[arg(long, value_name = "DTYPE")]
+    granite_speech_dtype: Option<String>,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -120,6 +124,15 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
     if args.granite_decode_profile {
         std::env::set_var("IZWI_GRANITE_DECODE_PROFILE", "1");
         info!("Granite ASR decode profiling enabled");
+    }
+    if let Some(dtype) = args
+        .granite_speech_dtype
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        std::env::set_var("IZWI_GRANITE_SPEECH_DTYPE", dtype);
+        info!(dtype, "Granite ASR dtype override enabled");
     }
     let persistence = PersistenceContext::resolve(&enterprise_hooks).await?;
     info!(
@@ -525,6 +538,7 @@ mod tests {
         std::env::remove_var("IZWI_WARMUP_PRELOADED_MODELS");
         std::env::remove_var("IZWI_ASR_WARMUP_DURATION_MS");
         std::env::remove_var("IZWI_GRANITE_DECODE_PROFILE");
+        std::env::remove_var("IZWI_GRANITE_SPEECH_DTYPE");
     }
 
     fn parse(args: &[&str]) -> ServerArgs {
@@ -612,6 +626,21 @@ mod tests {
 
         assert!(!parse(&["izwi-server"]).granite_decode_profile);
         assert!(parse(&["izwi-server", "--granite-decode-profile"]).granite_decode_profile);
+        clear_bind_env();
+    }
+
+    #[test]
+    fn granite_speech_dtype_flag_defaults_empty_and_parses() {
+        let _guard = env_lock();
+        clear_bind_env();
+
+        assert!(parse(&["izwi-server"]).granite_speech_dtype.is_none());
+        assert_eq!(
+            parse(&["izwi-server", "--granite-speech-dtype", "f16"])
+                .granite_speech_dtype
+                .as_deref(),
+            Some("f16")
+        );
         clear_bind_env();
     }
 

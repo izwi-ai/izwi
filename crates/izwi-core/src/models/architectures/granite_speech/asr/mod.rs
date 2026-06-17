@@ -12,7 +12,7 @@ use candle_core::{DType, Tensor};
 use serde_json::json;
 use tracing::info;
 
-use crate::backends::DeviceProfile;
+use crate::backends::{parse_dtype_name, DeviceKind, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
@@ -132,21 +132,7 @@ impl GraniteSpeechAsrModel {
         let prompt_tokenizer =
             GraniteSpeechPromptTokenizer::load(model_dir, &config, &processor, &tokenizer_config)?;
         let preprocessor = GraniteSpeechPreprocessor::new(processor.clone())?;
-        let dtype = std::env::var("IZWI_GRANITE_SPEECH_DTYPE")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .filter(|raw| !raw.is_empty())
-            .or(config.target_dtype_hint())
-            .map(|raw| {
-                device.select_model_dtype_checked(
-                    ModelFamily::GraniteSpeechAsr,
-                    Some(raw),
-                    "Granite Speech ASR",
-                )
-            })
-            .transpose()?
-            .unwrap_or_else(|| device.select_model_dtype(ModelFamily::GraniteSpeechAsr, None));
+        let dtype = select_granite_speech_dtype(&device, config.target_dtype_hint())?;
         let runtime = GraniteSpeechRuntime::load(&shards, &config, &device, dtype)?;
 
         info!(
@@ -522,6 +508,60 @@ fn validate_granite_audio_duration(audio_seconds: f32) -> Result<()> {
     )))
 }
 
+fn select_granite_speech_dtype(device: &DeviceProfile, config_hint: Option<&str>) -> Result<DType> {
+    let explicit = std::env::var("IZWI_GRANITE_SPEECH_DTYPE")
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty());
+
+    if let Some(raw) = explicit.as_deref() {
+        return resolve_explicit_granite_speech_dtype(device, raw);
+    }
+
+    config_hint
+        .map(|raw| {
+            device.select_model_dtype_checked(
+                ModelFamily::GraniteSpeechAsr,
+                Some(raw),
+                "Granite Speech ASR",
+            )
+        })
+        .transpose()
+        .map(|dtype| {
+            dtype.unwrap_or_else(|| device.select_model_dtype(ModelFamily::GraniteSpeechAsr, None))
+        })
+}
+
+fn resolve_explicit_granite_speech_dtype(device: &DeviceProfile, raw: &str) -> Result<DType> {
+    let dtype = parse_dtype_name(raw).ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "Invalid Granite Speech ASR dtype override {raw:?}: expected one of f32, f16, or bf16"
+        ))
+    })?;
+    match device.kind {
+        DeviceKind::Metal => match dtype {
+            DType::F32 => Ok(DType::F32),
+            DType::F16 if device.capabilities.supports_f16 => Ok(DType::F16),
+            DType::F16 => Err(Error::InvalidInput(
+                "Invalid Granite Speech ASR dtype override \"f16\": Metal device does not report F16 support"
+                    .to_string(),
+            )),
+            DType::BF16 => Err(Error::InvalidInput(
+                "Invalid Granite Speech ASR dtype override \"bf16\": BF16 is not supported on Metal"
+                    .to_string(),
+            )),
+            _ => Err(Error::InvalidInput(format!(
+                "Invalid Granite Speech ASR dtype override {raw:?}: dtype is not supported"
+            ))),
+        },
+        _ => device.select_model_dtype_checked(
+            ModelFamily::GraniteSpeechAsr,
+            Some(raw),
+            "Granite Speech ASR",
+        ),
+    }
+}
+
 fn granite_diagnostics(
     features: &GraniteSpeechAudioFeatures,
     prompt: &GraniteSpeechPrompt,
@@ -835,7 +875,10 @@ fn validate_shard_filename(file: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::DeviceCapabilities;
     use uuid::Uuid;
+
+    static GRANITE_DTYPE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn temp_model_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("granite-speech-test-{}", Uuid::new_v4()));
@@ -850,6 +893,55 @@ mod tests {
         std::fs::write(model_dir.join("processor_config.json"), "{}").unwrap();
         std::fs::write(model_dir.join("tokenizer.json"), "{}").unwrap();
         std::fs::write(model_dir.join("tokenizer_config.json"), "{}").unwrap();
+    }
+
+    fn test_profile(kind: DeviceKind, supports_f16: bool) -> DeviceProfile {
+        DeviceProfile {
+            device: candle_core::Device::Cpu,
+            kind,
+            capabilities: DeviceCapabilities {
+                supports_f16,
+                prefers_f32: kind.is_metal(),
+                ..Default::default()
+            },
+            memory_pool: None,
+        }
+    }
+
+    #[test]
+    fn granite_speech_dtype_config_hint_keeps_existing_metal_f32_policy() {
+        let _guard = GRANITE_DTYPE_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("IZWI_GRANITE_SPEECH_DTYPE");
+        let metal = test_profile(DeviceKind::Metal, true);
+
+        assert_eq!(
+            select_granite_speech_dtype(&metal, Some("torch.bfloat16")).unwrap(),
+            DType::F32
+        );
+    }
+
+    #[test]
+    fn granite_speech_dtype_explicit_f16_can_opt_into_metal_half_precision() {
+        let _guard = GRANITE_DTYPE_ENV_LOCK.lock().unwrap();
+        std::env::set_var("IZWI_GRANITE_SPEECH_DTYPE", "f16");
+        let metal = test_profile(DeviceKind::Metal, true);
+
+        assert_eq!(
+            select_granite_speech_dtype(&metal, None).unwrap(),
+            DType::F16
+        );
+        std::env::remove_var("IZWI_GRANITE_SPEECH_DTYPE");
+    }
+
+    #[test]
+    fn granite_speech_dtype_rejects_bf16_on_metal() {
+        let _guard = GRANITE_DTYPE_ENV_LOCK.lock().unwrap();
+        std::env::set_var("IZWI_GRANITE_SPEECH_DTYPE", "bf16");
+        let metal = test_profile(DeviceKind::Metal, true);
+
+        let err = select_granite_speech_dtype(&metal, None).unwrap_err();
+        assert!(err.to_string().contains("BF16 is not supported on Metal"));
+        std::env::remove_var("IZWI_GRANITE_SPEECH_DTYPE");
     }
 
     #[test]
