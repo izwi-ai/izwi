@@ -5,7 +5,7 @@
 
 use candle_core::quantized::QMatMul;
 use candle_core::{D, DType, Device, IndexOp, Module, Tensor};
-use candle_nn::{Embedding, Linear, RmsNorm, VarBuilder, ops, rotary_emb};
+use candle_nn::{Embedding, Linear, RmsNorm, VarBuilder, kv_cache::Cache, ops, rotary_emb};
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -89,8 +89,8 @@ impl Qwen3Config {
 pub struct Qwen3Cache {
     k_pages: Vec<Vec<KvPage>>,
     v_pages: Vec<Vec<KvPage>>,
-    dense_k_cache_h: Vec<Option<Tensor>>,
-    dense_v_cache_h: Vec<Option<Tensor>>,
+    dense_k_cache_h: Vec<Cache>,
+    dense_v_cache_h: Vec<Cache>,
     dense_kv_tokens: Vec<usize>,
     dense_decode_overflowed: Vec<bool>,
     rope_cache: Vec<Qwen3RopeCacheEntry>,
@@ -194,8 +194,12 @@ impl Qwen3Cache {
         Self {
             k_pages: vec![Vec::new(); num_layers],
             v_pages: vec![Vec::new(); num_layers],
-            dense_k_cache_h: vec![None; num_layers],
-            dense_v_cache_h: vec![None; num_layers],
+            dense_k_cache_h: (0..num_layers)
+                .map(|_| Cache::new(2, dense_decode_max_tokens))
+                .collect(),
+            dense_v_cache_h: (0..num_layers)
+                .map(|_| Cache::new(2, dense_decode_max_tokens))
+                .collect(),
             dense_kv_tokens: vec![0; num_layers],
             dense_decode_overflowed: vec![false; num_layers],
             rope_cache: Vec::new(),
@@ -246,26 +250,24 @@ impl Qwen3Cache {
 
         let k_h = k.transpose(1, 2)?.contiguous()?;
         let v_h = v.transpose(1, 2)?.contiguous()?;
-        append_dense_kv_cache_h(&mut self.dense_k_cache_h[layer], &k_h)?;
-        append_dense_kv_cache_h(&mut self.dense_v_cache_h[layer], &v_h)?;
+        self.dense_k_cache_h[layer].append(&k_h)?;
+        self.dense_v_cache_h[layer].append(&v_h)?;
         self.dense_kv_tokens[layer] = self.dense_kv_tokens[layer].saturating_add(append_tokens);
         Ok(())
     }
 
     fn has_dense_cache(&self, layer: usize) -> bool {
         self.dense_kv_tokens[layer] > 0
-            && self.dense_k_cache_h[layer].is_some()
-            && self.dense_v_cache_h[layer].is_some()
     }
 
     fn materialize_dense_to_pages(&mut self, layer: usize) -> Result<()> {
         if !self.has_dense_cache(layer) {
             return Ok(());
         }
-        let k_cache_h = self.dense_k_cache_h[layer].take().ok_or_else(|| {
+        let k_cache_h = self.dense_k_cache_h[layer].current_data()?.ok_or_else(|| {
             Error::InferenceError("Qwen3 missing dense key cache during page migration".to_string())
         })?;
-        let v_cache_h = self.dense_v_cache_h[layer].take().ok_or_else(|| {
+        let v_cache_h = self.dense_v_cache_h[layer].current_data()?.ok_or_else(|| {
             Error::InferenceError(
                 "Qwen3 missing dense value cache during page migration".to_string(),
             )
@@ -284,6 +286,8 @@ impl Qwen3Cache {
             &v_dense,
             self.quantization,
         )?;
+        self.dense_k_cache_h[layer].reset();
+        self.dense_v_cache_h[layer].reset();
         self.dense_kv_tokens[layer] = 0;
         Ok(())
     }
@@ -306,7 +310,7 @@ impl Qwen3Cache {
             Error::InferenceError(format!("Invalid Qwen3Cache layer index: {layer}"))
         })?;
         if k.is_empty() && v.is_empty() {
-            if let Some((k_dense_h, v_dense_h)) = self.dense_heads(layer) {
+            if let Some((k_dense_h, v_dense_h)) = self.dense_heads(layer)? {
                 return Ok((
                     k_dense_h.transpose(1, 2)?.contiguous()?,
                     v_dense_h.transpose(1, 2)?.contiguous()?,
@@ -316,13 +320,23 @@ impl Qwen3Cache {
         Ok((materialize_pages(k)?, materialize_pages(v)?))
     }
 
-    pub fn dense_heads(&self, layer: usize) -> Option<(&Tensor, &Tensor)> {
+    pub fn dense_heads(&self, layer: usize) -> Result<Option<(Tensor, Tensor)>> {
         if self.dense_decode_max_tokens == 0 || self.dense_decode_overflowed[layer] {
-            return None;
+            return Ok(None);
         }
-        let k = self.dense_k_cache_h.get(layer)?.as_ref()?;
-        let v = self.dense_v_cache_h.get(layer)?.as_ref()?;
-        Some((k, v))
+        let Some(k_cache) = self.dense_k_cache_h.get(layer) else {
+            return Ok(None);
+        };
+        let Some(v_cache) = self.dense_v_cache_h.get(layer) else {
+            return Ok(None);
+        };
+        let Some(k) = k_cache.current_data()? else {
+            return Ok(None);
+        };
+        let Some(v) = v_cache.current_data()? else {
+            return Ok(None);
+        };
+        Ok(Some((k, v)))
     }
 
     fn cached_rope_pair(
@@ -381,23 +395,6 @@ impl Qwen3Cache {
         });
         Ok((cos_half, sin_half))
     }
-}
-
-fn append_dense_kv_cache_h(cache: &mut Option<Tensor>, append: &Tensor) -> Result<()> {
-    if append.dim(2)? == 0 {
-        return Ok(());
-    }
-    let append = append.contiguous()?;
-    match cache {
-        Some(existing) => {
-            let existing_ref: &Tensor = &*existing;
-            *cache = Some(Tensor::cat(&[existing_ref, &append], 2)?);
-        }
-        None => {
-            *cache = Some(append);
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn qwen3_dense_decode_max_tokens(
@@ -876,12 +873,12 @@ impl Qwen3Attention {
 
             // Decode path hot loop: for single-token decode, avoid rematerializing full KV.
             if seq_len == 1 && start_pos > 0 {
-                if let Some((k_dense_h, v_dense_h)) = cache.dense_heads(layer_idx) {
+                if let Some((k_dense_h, v_dense_h)) = cache.dense_heads(layer_idx)? {
                     record_decode_attention_path(DecodeAttentionPath::Dense);
                     let out = dense_decode_attention(
                         &q,
-                        k_dense_h,
-                        v_dense_h,
+                        &k_dense_h,
+                        &v_dense_h,
                         self.num_heads,
                         self.num_kv_heads,
                         self.head_dim,
@@ -1914,7 +1911,7 @@ mod tests {
         .expect("v");
 
         cache.append(0, k, v).expect("append");
-        let (k_dense, v_dense) = cache.dense_heads(0).expect("dense heads");
+        let (k_dense, v_dense) = cache.dense_heads(0).expect("dense heads").expect("dense");
         assert_eq!(k_dense.dims4().expect("k dims"), (1, 1, 2, 4));
         assert_eq!(v_dense.dims4().expect("v dims"), (1, 1, 2, 4));
         assert!(cache.pages(0).is_none());
@@ -1924,7 +1921,10 @@ mod tests {
         let v_next =
             Tensor::from_vec(vec![4.0f32, 4.5, 5.0, 5.5], (1, 1, 1, 4), &device).expect("v next");
         cache.append(0, k_next, v_next).expect("append next");
-        let (k_dense, _) = cache.dense_heads(0).expect("dense heads after append");
+        let (k_dense, _) = cache
+            .dense_heads(0)
+            .expect("dense heads after append")
+            .expect("dense");
         assert_eq!(k_dense.dims4().expect("k dims"), (1, 1, 3, 4));
     }
 
@@ -1972,7 +1972,7 @@ mod tests {
         cache
             .append(0, k.clone(), v.clone())
             .expect("append beyond threshold");
-        assert!(cache.dense_heads(0).is_none());
+        assert!(cache.dense_heads(0).expect("dense heads").is_none());
 
         let mut quantized_cache = Qwen3Cache::with_page_size_quantization_and_dense_decode_tokens(
             1,
@@ -1981,7 +1981,12 @@ mod tests {
             8,
         );
         quantized_cache.append(0, k, v).expect("append quantized");
-        assert!(quantized_cache.dense_heads(0).is_none());
+        assert!(
+            quantized_cache
+                .dense_heads(0)
+                .expect("dense heads")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2006,7 +2011,7 @@ mod tests {
         )
         .expect("first v");
         cache.append(0, first_k, first_v).expect("append first");
-        assert!(cache.dense_heads(0).is_some());
+        assert!(cache.dense_heads(0).expect("dense heads").is_some());
         assert!(cache.pages(0).is_none());
 
         let next_k =
@@ -2015,7 +2020,7 @@ mod tests {
             .expect("next v");
         cache.append(0, next_k, next_v).expect("append next");
 
-        assert!(cache.dense_heads(0).is_none());
+        assert!(cache.dense_heads(0).expect("dense heads").is_none());
         let (k_pages, v_pages) = cache.pages(0).expect("pages after migration");
         assert_eq!(k_pages.len(), 2);
         assert_eq!(v_pages.len(), 2);
