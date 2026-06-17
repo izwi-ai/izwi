@@ -1,7 +1,7 @@
 //! Native Granite Speech ASR facade.
 
-use std::collections::BTreeSet;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::BTreeSet;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -24,16 +24,16 @@ mod runtime;
 mod transcript;
 
 pub use config::{
-    GraniteSpeechAudioProcessorConfig, GraniteSpeechConfig, GraniteSpeechEncoderConfig,
-    GraniteSpeechGenerationConfig, GraniteSpeechMelSpecConfig, GraniteSpeechProcessorConfig,
-    GraniteSpeechProjectorConfig, GraniteSpeechTokenizerConfig, GraniteTextConfig,
-    load_granite_speech_chat_template,
+    load_granite_speech_chat_template, GraniteSpeechAudioProcessorConfig, GraniteSpeechConfig,
+    GraniteSpeechEncoderConfig, GraniteSpeechGenerationConfig, GraniteSpeechMelSpecConfig,
+    GraniteSpeechProcessorConfig, GraniteSpeechProjectorConfig, GraniteSpeechTokenizerConfig,
+    GraniteTextConfig,
 };
 pub use preprocessor::{GraniteSpeechAudioFeatures, GraniteSpeechPreprocessor};
 pub use prompt::{
-    GRANITE_SPEECH_ASR_PROMPT, GRANITE_SPEECH_SPEAKER_PROMPT, GRANITE_SPEECH_SYSTEM_PROMPT,
-    GRANITE_SPEECH_TIMESTAMP_PROMPT, GraniteSpeechPrompt, GraniteSpeechPromptOptions,
-    GraniteSpeechPromptTokenizer, GraniteSpeechSpecialTokens, GraniteSpeechTask,
+    GraniteSpeechPrompt, GraniteSpeechPromptOptions, GraniteSpeechPromptTokenizer,
+    GraniteSpeechSpecialTokens, GraniteSpeechTask, GRANITE_SPEECH_ASR_PROMPT,
+    GRANITE_SPEECH_SPEAKER_PROMPT, GRANITE_SPEECH_SYSTEM_PROMPT, GRANITE_SPEECH_TIMESTAMP_PROMPT,
 };
 pub use runtime::{
     GraniteSpeechAttentionDecodeProfile, GraniteSpeechAudioEmbeddingStats,
@@ -42,8 +42,8 @@ pub use runtime::{
     GraniteSpeechLayerDecodeProfile, GraniteSpeechMlpDecodeProfile, GraniteSpeechRuntime,
 };
 pub use transcript::{
-    GraniteSpeechParsedTranscript, GraniteSpeechSegment, GraniteSpeechTimestampWord,
-    parse_granite_speech_output,
+    parse_granite_speech_output, GraniteSpeechParsedTranscript, GraniteSpeechSegment,
+    GraniteSpeechTimestampWord,
 };
 
 const REQUIRED_ARTIFACTS: &[&str] = &[
@@ -580,6 +580,7 @@ fn granite_diagnostics(
             "dense_head_decode_enabled": generation.stats.dense_head_decode_enabled,
             "cuda_dense_decode_cache": generation.stats.dense_decode_cache_enabled,
             "cuda_device_argmax": generation.stats.cuda_device_argmax,
+            "deferred_stop_check": generation.stats.deferred_stop_check,
             "dense_decode_max_tokens": generation.stats.dense_decode_max_tokens,
             "audio_embedding_cache_hit": timings.audio_cache_hit,
         },
@@ -885,10 +886,9 @@ mod tests {
         )
         .unwrap();
         let err = ensure_granite_speech_artifacts(&dir).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("Invalid Granite Speech safetensors shard path")
-        );
+        assert!(err
+            .to_string()
+            .contains("Invalid Granite Speech safetensors shard path"));
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -932,6 +932,7 @@ mod tests {
                 dense_decode_cache_enabled: true,
                 dense_head_decode_enabled: false,
                 cuda_device_argmax: false,
+                deferred_stop_check: true,
                 dense_decode_max_tokens: 8192,
                 timings: GraniteSpeechGenerationTimings {
                     prefill: Duration::from_millis(7),
@@ -1031,6 +1032,7 @@ mod tests {
         );
         assert_eq!(diagnostics["execution"]["dense_head_decode_enabled"], false);
         assert_eq!(diagnostics["execution"]["cuda_device_argmax"], false);
+        assert_eq!(diagnostics["execution"]["deferred_stop_check"], true);
         assert_eq!(diagnostics["execution"]["dense_decode_max_tokens"], 8192);
         assert_eq!(diagnostics["execution"]["audio_embedding_cache_hit"], true);
         assert_eq!(diagnostics["decode_profile"]["enabled"], true);

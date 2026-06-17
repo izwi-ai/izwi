@@ -170,6 +170,7 @@ struct AsrExecutionDiagnostics {
     dense_decode_max_tokens: Option<u64>,
     audio_embedding_cache_hit: Option<bool>,
     cuda_device_argmax: Option<bool>,
+    deferred_stop_check: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2590,12 +2591,16 @@ fn asr_execution_from_single_diagnostics(
         cuda_device_argmax: execution
             .get("cuda_device_argmax")
             .and_then(|value| value.as_bool()),
+        deferred_stop_check: execution
+            .get("deferred_stop_check")
+            .and_then(|value| value.as_bool()),
     };
     (sample.cuda_dense_decode_cache.is_some()
         || sample.dense_head_decode_enabled.is_some()
         || sample.dense_decode_max_tokens.is_some()
         || sample.audio_embedding_cache_hit.is_some()
-        || sample.cuda_device_argmax.is_some())
+        || sample.cuda_device_argmax.is_some()
+        || sample.deferred_stop_check.is_some())
     .then_some(sample)
 }
 
@@ -2714,6 +2719,7 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     let mut dense_decode_max_tokens = Vec::new();
     let mut audio_embedding_cache_hit = Vec::new();
     let mut cuda_device_argmax = Vec::new();
+    let mut deferred_stop_check = Vec::new();
 
     for sample in samples {
         if let Some(value) = sample.audio_decode {
@@ -2774,6 +2780,9 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
             if let Some(value) = execution.cuda_device_argmax {
                 cuda_device_argmax.push(value);
             }
+            if let Some(value) = execution.deferred_stop_check {
+                deferred_stop_check.push(value);
+            }
         }
     }
 
@@ -2796,6 +2805,7 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         && dense_decode_max_tokens.is_empty()
         && audio_embedding_cache_hit.is_empty()
         && cuda_device_argmax.is_empty()
+        && deferred_stop_check.is_empty()
     {
         return;
     }
@@ -2825,6 +2835,7 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     summarize_count("dense_max", &dense_decode_max_tokens);
     summarize_bool_count("audio_cache", &audio_embedding_cache_hit);
     summarize_bool_count("cuda_argmax", &cuda_device_argmax);
+    summarize_bool_count("defer_stop", &deferred_stop_check);
 }
 
 fn print_runtime_delta(
@@ -3180,7 +3191,8 @@ mod tests {
                 "dense_head_decode_enabled": true,
                 "dense_decode_max_tokens": 384,
                 "audio_embedding_cache_hit": true,
-                "cuda_device_argmax": true
+                "cuda_device_argmax": true,
+                "deferred_stop_check": true
             },
             "timings_ms": {
                 "audio_encode": 420.0,
@@ -3208,6 +3220,7 @@ mod tests {
         assert_eq!(execution.dense_decode_max_tokens, Some(384));
         assert_eq!(execution.audio_embedding_cache_hit, Some(true));
         assert_eq!(execution.cuda_device_argmax, Some(true));
+        assert_eq!(execution.deferred_stop_check, Some(true));
         assert_eq!(
             asr_execution_from_diagnostics(&diagnostics)
                 .expect("execution diagnostics")
