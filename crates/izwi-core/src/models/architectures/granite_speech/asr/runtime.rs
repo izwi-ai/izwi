@@ -34,14 +34,73 @@ pub struct GraniteSpeechGenerationStats {
     pub stop_token: Option<u32>,
     pub dense_decode_cache_enabled: bool,
     pub dense_head_decode_enabled: bool,
+    pub cuda_device_argmax: bool,
     pub dense_decode_max_tokens: usize,
     pub timings: GraniteSpeechGenerationTimings,
+    pub decode_profile: Option<GraniteSpeechDecodeProfile>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GraniteSpeechGenerationTimings {
     pub prefill: Duration,
     pub decode: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraniteSpeechDecodeProfile {
+    pub timing_kind: &'static str,
+    pub steps: usize,
+    pub layer_count: usize,
+    pub step_total_samples: Vec<Duration>,
+    pub totals: GraniteSpeechDecodeLoopProfile,
+    pub forward: GraniteSpeechForwardProfile,
+    pub layers: Vec<GraniteSpeechLayerDecodeProfile>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GraniteSpeechDecodeLoopProfile {
+    pub argmax: Duration,
+    pub scalar_read: Duration,
+    pub stop_check: Duration,
+    pub model_forward: Duration,
+    pub text_decode: Duration,
+    pub delta_emit: Duration,
+    pub step_total: Duration,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GraniteSpeechForwardProfile {
+    pub token_embedding: Duration,
+    pub rope_build: Duration,
+    pub layers_total: Duration,
+    pub final_norm: Duration,
+    pub lm_head: Duration,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GraniteSpeechLayerDecodeProfile {
+    pub total: Duration,
+    pub input_norm: Duration,
+    pub attention: GraniteSpeechAttentionDecodeProfile,
+    pub post_attention_norm: Duration,
+    pub mlp: GraniteSpeechMlpDecodeProfile,
+    pub residual: Duration,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GraniteSpeechAttentionDecodeProfile {
+    pub qkv: Duration,
+    pub rope: Duration,
+    pub cache: Duration,
+    pub kernel: Duration,
+    pub output: Duration,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GraniteSpeechMlpDecodeProfile {
+    pub gate_up: Duration,
+    pub activation: Duration,
+    pub down: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +133,88 @@ pub struct GraniteSpeechRuntime {
     encoder: GraniteSpeechEncoder,
     projector: GraniteSpeechProjector,
     text_model: GraniteLanguageModel,
+}
+
+struct GraniteSpeechDecodeProfiler {
+    profile: GraniteSpeechDecodeProfile,
+}
+
+impl GraniteSpeechDecodeProfiler {
+    fn from_env(layer_count: usize) -> Option<Self> {
+        granite_decode_profile_enabled().then(|| Self {
+            profile: GraniteSpeechDecodeProfile {
+                timing_kind: "host_wall_clock_no_device_sync",
+                steps: 0,
+                layer_count,
+                step_total_samples: Vec::new(),
+                totals: GraniteSpeechDecodeLoopProfile::default(),
+                forward: GraniteSpeechForwardProfile::default(),
+                layers: vec![GraniteSpeechLayerDecodeProfile::default(); layer_count],
+            },
+        })
+    }
+
+    fn add_step(&mut self, step: GraniteSpeechDecodeLoopProfile) {
+        self.profile.steps = self.profile.steps.saturating_add(1);
+        self.profile.step_total_samples.push(step.step_total);
+        self.profile.totals.argmax += step.argmax;
+        self.profile.totals.scalar_read += step.scalar_read;
+        self.profile.totals.stop_check += step.stop_check;
+        self.profile.totals.model_forward += step.model_forward;
+        self.profile.totals.text_decode += step.text_decode;
+        self.profile.totals.delta_emit += step.delta_emit;
+        self.profile.totals.step_total += step.step_total;
+    }
+
+    fn add_final_text_decode(&mut self, duration: Duration) {
+        self.profile.totals.text_decode += duration;
+    }
+
+    fn add_layer(&mut self, layer_idx: usize, layer: GraniteSpeechLayerDecodeProfile) {
+        self.profile.forward.layers_total += layer.total;
+        if let Some(total) = self.profile.layers.get_mut(layer_idx) {
+            total.total += layer.total;
+            total.input_norm += layer.input_norm;
+            total.attention.qkv += layer.attention.qkv;
+            total.attention.rope += layer.attention.rope;
+            total.attention.cache += layer.attention.cache;
+            total.attention.kernel += layer.attention.kernel;
+            total.attention.output += layer.attention.output;
+            total.post_attention_norm += layer.post_attention_norm;
+            total.mlp.gate_up += layer.mlp.gate_up;
+            total.mlp.activation += layer.mlp.activation;
+            total.mlp.down += layer.mlp.down;
+            total.residual += layer.residual;
+        }
+    }
+
+    fn finish(self) -> GraniteSpeechDecodeProfile {
+        self.profile
+    }
+}
+
+fn granite_decode_profile_enabled() -> bool {
+    std::env::var("IZWI_GRANITE_DECODE_PROFILE")
+        .ok()
+        .or_else(|| std::env::var("IZWI_GRANITE_DECODE_PROFILING").ok())
+        .and_then(|raw| parse_env_bool(&raw))
+        .unwrap_or(false)
+}
+
+fn parse_env_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn profile_start(enabled: bool) -> Option<Instant> {
+    enabled.then(Instant::now)
+}
+
+fn profile_elapsed(start: Option<Instant>) -> Duration {
+    start.map(|started| started.elapsed()).unwrap_or_default()
 }
 
 impl GraniteSpeechRuntime {
@@ -194,6 +335,9 @@ impl GraniteSpeechRuntime {
         let dense_decode_cache_enabled = dense_decode_max_tokens > 0;
         let dense_head_decode_enabled =
             dense_decode_cache_enabled && granite_dense_head_decode_allowed(&self.device);
+        let cuda_device_argmax = self.device.is_cuda();
+        let mut profiler = GraniteSpeechDecodeProfiler::from_env(self.text_model.num_layers());
+        let profiling = profiler.is_some();
         let prefill_start = Instant::now();
         let mut logits = self.text_model.forward_prompt_with_audio(
             &input_ids,
@@ -212,36 +356,61 @@ impl GraniteSpeechRuntime {
         let decode_start = Instant::now();
 
         for step in 0..max_new_tokens.max(1) {
+            let step_start = profile_start(profiling);
+            let mut step_profile = GraniteSpeechDecodeLoopProfile::default();
+            let argmax_start = profile_start(profiling);
             let token_tensor = argmax_last_token_tensor(&logits)?;
+            step_profile.argmax = profile_elapsed(argmax_start);
             let next_logits = if !decode_each_step && step + 1 < max_new_tokens.max(1) {
-                Some(self.text_model.forward(
+                let forward_start = profile_start(profiling);
+                let next_logits = self.text_model.forward_profiled(
                     &token_tensor,
                     input_ids.len() + step,
                     Some(&mut cache),
-                )?)
+                    profiler.as_mut(),
+                )?;
+                step_profile.model_forward += profile_elapsed(forward_start);
+                Some(next_logits)
             } else {
                 None
             };
+            let scalar_start = profile_start(profiling);
             let token = token_tensor.reshape(())?.to_scalar::<u32>()?;
+            step_profile.scalar_read = profile_elapsed(scalar_start);
+            let stop_start = profile_start(profiling);
             if stop_tokens.contains(&token) {
                 stop_reason = "stop_token".to_string();
                 stop_token = Some(token);
+                step_profile.stop_check = profile_elapsed(stop_start);
+                step_profile.step_total = profile_elapsed(step_start);
+                if let Some(profiler) = profiler.as_mut() {
+                    profiler.add_step(step_profile);
+                }
                 break;
             }
+            step_profile.stop_check = profile_elapsed(stop_start);
 
             generated.push(token);
             if decode_each_step {
+                let text_decode_start = profile_start(profiling);
                 let mut next_text = decode(&generated)?;
+                step_profile.text_decode += profile_elapsed(text_decode_start);
                 let stopped_on_sequence = truncate_at_stop_sequence(&mut next_text, stop_sequences);
                 if stopped_on_sequence {
                     stop_reason = "stop_sequence".to_string();
                 }
                 if emit_deltas && next_text.len() > rendered.len() {
                     let delta = &next_text[rendered.len()..];
+                    let delta_start = profile_start(profiling);
                     on_delta(delta);
+                    step_profile.delta_emit += profile_elapsed(delta_start);
                 }
                 rendered = next_text;
                 if stopped_on_sequence {
+                    step_profile.step_total = profile_elapsed(step_start);
+                    if let Some(profiler) = profiler.as_mut() {
+                        profiler.add_step(step_profile);
+                    }
                     break;
                 }
             }
@@ -250,14 +419,30 @@ impl GraniteSpeechRuntime {
                 next_logits
             } else {
                 let token_tensor = Tensor::from_vec(vec![token], (1, 1), &self.device)?;
-                self.text_model
-                    .forward(&token_tensor, input_ids.len() + step, Some(&mut cache))?
+                let forward_start = profile_start(profiling);
+                let next_logits = self.text_model.forward_profiled(
+                    &token_tensor,
+                    input_ids.len() + step,
+                    Some(&mut cache),
+                    profiler.as_mut(),
+                )?;
+                step_profile.model_forward += profile_elapsed(forward_start);
+                next_logits
+            };
+            step_profile.step_total = profile_elapsed(step_start);
+            if let Some(profiler) = profiler.as_mut() {
+                profiler.add_step(step_profile);
             };
         }
         if !decode_each_step && !generated.is_empty() {
+            let text_decode_start = profile_start(profiling);
             rendered = decode(&generated)?;
+            if let Some(profiler) = profiler.as_mut() {
+                profiler.add_final_text_decode(profile_elapsed(text_decode_start));
+            }
         }
         let decode = decode_start.elapsed();
+        let decode_profile = profiler.map(GraniteSpeechDecodeProfiler::finish);
 
         Ok(GraniteSpeechGeneration {
             text: rendered,
@@ -271,8 +456,10 @@ impl GraniteSpeechRuntime {
                 stop_token,
                 dense_decode_cache_enabled,
                 dense_head_decode_enabled,
+                cuda_device_argmax,
                 dense_decode_max_tokens,
                 timings: GraniteSpeechGenerationTimings { prefill, decode },
+                decode_profile,
             },
         })
     }
@@ -1037,8 +1224,23 @@ impl GraniteLanguageModel {
         start_pos: usize,
         cache: Option<&mut Qwen3Cache>,
     ) -> Result<Tensor> {
+        self.forward_profiled(input_ids, start_pos, cache, None)
+    }
+
+    fn forward_profiled(
+        &self,
+        input_ids: &Tensor,
+        start_pos: usize,
+        cache: Option<&mut Qwen3Cache>,
+        mut profile: Option<&mut GraniteSpeechDecodeProfiler>,
+    ) -> Result<Tensor> {
+        let profiling = profile.is_some();
+        let embed_start = profile_start(profiling);
         let embeds = self.embed_tokens.forward(input_ids)?;
-        self.forward_with_embeds(&embeds, start_pos, cache)
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.profile.forward.token_embedding += profile_elapsed(embed_start);
+        }
+        self.forward_with_embeds_profiled(&embeds, start_pos, cache, profile)
     }
 
     fn forward_prompt_with_audio(
@@ -1078,9 +1280,21 @@ impl GraniteLanguageModel {
         &self,
         embeds: &Tensor,
         start_pos: usize,
-        mut cache: Option<&mut Qwen3Cache>,
+        cache: Option<&mut Qwen3Cache>,
     ) -> Result<Tensor> {
+        self.forward_with_embeds_profiled(embeds, start_pos, cache, None)
+    }
+
+    fn forward_with_embeds_profiled(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        mut cache: Option<&mut Qwen3Cache>,
+        mut profile: Option<&mut GraniteSpeechDecodeProfiler>,
+    ) -> Result<Tensor> {
+        let profiling = profile.is_some();
         let mut x = (embeds * self.cfg.embedding_multiplier as f64)?;
+        let rope_start = profile_start(profiling);
         let rope = self
             .layers
             .first()
@@ -1095,13 +1309,39 @@ impl GraniteLanguageModel {
                 )
             })
             .transpose()?;
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.profile.forward.rope_build += profile_elapsed(rope_start);
+        }
         for (idx, layer) in self.layers.iter().enumerate() {
             let cache_ref = cache.as_deref_mut();
-            x = layer.forward(&x, start_pos, cache_ref, idx, rope.as_ref())?;
+            if let Some(profile) = profile.as_deref_mut() {
+                let layer_start = profile_start(profiling);
+                let mut layer_profile = GraniteSpeechLayerDecodeProfile::default();
+                x = layer.forward(
+                    &x,
+                    start_pos,
+                    cache_ref,
+                    idx,
+                    rope.as_ref(),
+                    Some(&mut layer_profile),
+                )?;
+                layer_profile.total = profile_elapsed(layer_start);
+                profile.add_layer(idx, layer_profile);
+            } else {
+                x = layer.forward(&x, start_pos, cache_ref, idx, rope.as_ref(), None)?;
+            }
         }
+        let final_norm_start = profile_start(profiling);
         let hidden = self.norm.forward(&x)?;
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.profile.forward.final_norm += profile_elapsed(final_norm_start);
+        }
         let hidden = last_hidden_for_logits(&hidden)?;
+        let lm_head_start = profile_start(profiling);
         let logits = self.lm_head.forward(&hidden)?;
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.profile.forward.lm_head += profile_elapsed(lm_head_start);
+        }
         (logits / self.cfg.logits_scaling as f64)
             .and_then(|tensor| tensor.to_dtype(DType::F32))
             .map_err(Error::from)
@@ -1142,19 +1382,50 @@ impl GraniteDecoderLayer {
         cache: Option<&mut Qwen3Cache>,
         layer_idx: usize,
         rope: Option<&(Tensor, Tensor)>,
+        mut profile: Option<&mut GraniteSpeechLayerDecodeProfile>,
     ) -> Result<Tensor> {
+        let profiling = profile.is_some();
         let residual = x;
+        let norm_start = profile_start(profiling);
         let normed = self.input_layernorm.forward(x)?;
-        let attn = self
-            .self_attn
-            .forward(&normed, start_pos, cache, layer_idx, rope)?;
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.input_norm += profile_elapsed(norm_start);
+        }
+        let attn = if let Some(profile) = profile.as_deref_mut() {
+            self.self_attn.forward(
+                &normed,
+                start_pos,
+                cache,
+                layer_idx,
+                rope,
+                Some(&mut profile.attention),
+            )?
+        } else {
+            self.self_attn
+                .forward(&normed, start_pos, cache, layer_idx, rope, None)?
+        };
+        let residual_start = profile_start(profiling);
         let x = residual.broadcast_add(&(attn * self.residual_multiplier as f64)?)?;
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.residual += profile_elapsed(residual_start);
+        }
         let residual = &x;
+        let post_norm_start = profile_start(profiling);
         let normed = self.post_attention_layernorm.forward(&x)?;
-        let mlp = self.mlp.forward(&normed)?;
-        residual
-            .broadcast_add(&(mlp * self.residual_multiplier as f64)?)
-            .map_err(Error::from)
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.post_attention_norm += profile_elapsed(post_norm_start);
+        }
+        let mlp = if let Some(profile) = profile.as_deref_mut() {
+            self.mlp.forward(&normed, Some(&mut profile.mlp))?
+        } else {
+            self.mlp.forward(&normed, None)?
+        };
+        let residual_start = profile_start(profiling);
+        let out = residual.broadcast_add(&(mlp * self.residual_multiplier as f64)?)?;
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.residual += profile_elapsed(residual_start);
+        }
+        Ok(out)
     }
 }
 
@@ -1209,8 +1480,11 @@ impl GraniteTextAttention {
         cache: Option<&mut Qwen3Cache>,
         layer_idx: usize,
         rope: Option<&(Tensor, Tensor)>,
+        mut profile: Option<&mut GraniteSpeechAttentionDecodeProfile>,
     ) -> Result<Tensor> {
+        let profiling = profile.is_some();
         let (batch, seq_len, _) = x.dims3()?;
+        let qkv_start = profile_start(profiling);
         let mut q =
             self.q_proj
                 .forward(x)?
@@ -1223,6 +1497,10 @@ impl GraniteTextAttention {
             self.v_proj
                 .forward(x)?
                 .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?;
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.qkv += profile_elapsed(qkv_start);
+        }
+        let rope_start = profile_start(profiling);
         let (cos, sin) = match rope {
             Some((cos, sin)) => (cos.clone(), sin.clone()),
             None => build_rope_cache(
@@ -1236,11 +1514,19 @@ impl GraniteTextAttention {
         };
         q = apply_rotary_emb(&q, &cos, &sin)?;
         k = apply_rotary_emb(&k, &cos, &sin)?;
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.rope += profile_elapsed(rope_start);
+        }
+        let cache_start = profile_start(profiling);
         let (k, v, total_len) = if let Some(cache) = cache {
             cache.append(layer_idx, k.clone(), v.clone())?;
             if granite_dense_head_decode_allowed(q.device()) && seq_len == 1 && start_pos > 0 {
                 if let Some((k_heads, v_heads)) = cache.dense_heads(layer_idx) {
+                    if let Some(profile) = profile.as_deref_mut() {
+                        profile.cache += profile_elapsed(cache_start);
+                    }
                     record_decode_attention_path(DecodeAttentionPath::Dense);
+                    let kernel_start = profile_start(profiling);
                     let out = dense_decode_attention_heads_scaled(
                         &q,
                         k_heads,
@@ -1250,8 +1536,16 @@ impl GraniteTextAttention {
                         self.head_dim,
                         self.attention_multiplier,
                     )?;
+                    if let Some(profile) = profile.as_deref_mut() {
+                        profile.kernel += profile_elapsed(kernel_start);
+                    }
                     let out = out.reshape((batch, seq_len, self.num_heads * self.head_dim))?;
-                    return self.o_proj.forward(&out).map_err(Error::from);
+                    let output_start = profile_start(profiling);
+                    let out = self.o_proj.forward(&out)?;
+                    if let Some(profile) = profile.as_deref_mut() {
+                        profile.output += profile_elapsed(output_start);
+                    }
+                    return Ok(out);
                 }
             }
             let (cached_k, cached_v) = cache.materialize(layer_idx)?;
@@ -1261,7 +1555,11 @@ impl GraniteTextAttention {
             let total_len = k.dim(1)?;
             (k, v, total_len)
         };
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.cache += profile_elapsed(cache_start);
+        }
 
+        let kernel_start = profile_start(profiling);
         let out = if seq_len == 1 {
             dense_decode_attention_scaled(
                 &q,
@@ -1285,8 +1583,16 @@ impl GraniteTextAttention {
                 self.attention_multiplier,
             )?
         };
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.kernel += profile_elapsed(kernel_start);
+        }
         let out = out.reshape((batch, seq_len, self.num_heads * self.head_dim))?;
-        self.o_proj.forward(&out).map_err(Error::from)
+        let output_start = profile_start(profiling);
+        let out = self.o_proj.forward(&out)?;
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.output += profile_elapsed(output_start);
+        }
+        Ok(out)
     }
 }
 
@@ -1487,16 +1793,34 @@ impl GraniteTextMlp {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        mut profile: Option<&mut GraniteSpeechMlpDecodeProfile>,
+    ) -> Result<Tensor> {
+        let profiling = profile.is_some();
+        let gate_up_start = profile_start(profiling);
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.gate_up += profile_elapsed(gate_up_start);
+        }
+        let activation_start = profile_start(profiling);
         let hidden = if let Some(fused) = try_fused_silu_mul(&gate, &up) {
             fused
         } else {
             let gate = gate.silu()?;
             gate.broadcast_mul(&up)?
         };
-        self.down_proj.forward(&hidden).map_err(Error::from)
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.activation += profile_elapsed(activation_start);
+        }
+        let down_start = profile_start(profiling);
+        let out = self.down_proj.forward(&hidden)?;
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.down += profile_elapsed(down_start);
+        }
+        Ok(out)
     }
 }
 

@@ -166,7 +166,9 @@ struct AsrStageTimings {
 #[derive(Debug, Clone, Copy, Serialize)]
 struct AsrExecutionDiagnostics {
     cuda_dense_decode_cache: Option<bool>,
+    dense_head_decode_enabled: Option<bool>,
     dense_decode_max_tokens: Option<u64>,
+    audio_embedding_cache_hit: Option<bool>,
     cuda_device_argmax: Option<bool>,
 }
 
@@ -2576,15 +2578,23 @@ fn asr_execution_from_single_diagnostics(
         cuda_dense_decode_cache: execution
             .get("cuda_dense_decode_cache")
             .and_then(|value| value.as_bool()),
+        dense_head_decode_enabled: execution
+            .get("dense_head_decode_enabled")
+            .and_then(|value| value.as_bool()),
         dense_decode_max_tokens: execution
             .get("dense_decode_max_tokens")
             .and_then(|value| value.as_u64()),
+        audio_embedding_cache_hit: execution
+            .get("audio_embedding_cache_hit")
+            .and_then(|value| value.as_bool()),
         cuda_device_argmax: execution
             .get("cuda_device_argmax")
             .and_then(|value| value.as_bool()),
     };
     (sample.cuda_dense_decode_cache.is_some()
+        || sample.dense_head_decode_enabled.is_some()
         || sample.dense_decode_max_tokens.is_some()
+        || sample.audio_embedding_cache_hit.is_some()
         || sample.cuda_device_argmax.is_some())
     .then_some(sample)
 }
@@ -2700,7 +2710,9 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     let mut generated_tokens = Vec::new();
     let mut max_new_tokens = Vec::new();
     let mut cuda_dense_decode_cache = Vec::new();
+    let mut dense_head_decode_enabled = Vec::new();
     let mut dense_decode_max_tokens = Vec::new();
+    let mut audio_embedding_cache_hit = Vec::new();
     let mut cuda_device_argmax = Vec::new();
 
     for sample in samples {
@@ -2750,8 +2762,14 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
             if let Some(value) = execution.cuda_dense_decode_cache {
                 cuda_dense_decode_cache.push(value);
             }
+            if let Some(value) = execution.dense_head_decode_enabled {
+                dense_head_decode_enabled.push(value);
+            }
             if let Some(value) = execution.dense_decode_max_tokens {
                 dense_decode_max_tokens.push(value);
+            }
+            if let Some(value) = execution.audio_embedding_cache_hit {
+                audio_embedding_cache_hit.push(value);
             }
             if let Some(value) = execution.cuda_device_argmax {
                 cuda_device_argmax.push(value);
@@ -2774,7 +2792,9 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         && generated_tokens.is_empty()
         && max_new_tokens.is_empty()
         && cuda_dense_decode_cache.is_empty()
+        && dense_head_decode_enabled.is_empty()
         && dense_decode_max_tokens.is_empty()
+        && audio_embedding_cache_hit.is_empty()
         && cuda_device_argmax.is_empty()
     {
         return;
@@ -2801,7 +2821,9 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     summarize_count("gen_tokens", &generated_tokens);
     summarize_count("max_new_tokens", &max_new_tokens);
     summarize_bool_count("cuda_dense", &cuda_dense_decode_cache);
+    summarize_bool_count("dense_head", &dense_head_decode_enabled);
     summarize_count("dense_max", &dense_decode_max_tokens);
+    summarize_bool_count("audio_cache", &audio_embedding_cache_hit);
     summarize_bool_count("cuda_argmax", &cuda_device_argmax);
 }
 
@@ -3155,7 +3177,9 @@ mod tests {
             },
             "execution": {
                 "cuda_dense_decode_cache": true,
+                "dense_head_decode_enabled": true,
                 "dense_decode_max_tokens": 384,
+                "audio_embedding_cache_hit": true,
                 "cuda_device_argmax": true
             },
             "timings_ms": {
@@ -3180,7 +3204,9 @@ mod tests {
             .execution
             .expect("execution diagnostics should be extracted");
         assert_eq!(execution.cuda_dense_decode_cache, Some(true));
+        assert_eq!(execution.dense_head_decode_enabled, Some(true));
         assert_eq!(execution.dense_decode_max_tokens, Some(384));
+        assert_eq!(execution.audio_embedding_cache_hit, Some(true));
         assert_eq!(execution.cuda_device_argmax, Some(true));
         assert_eq!(
             asr_execution_from_diagnostics(&diagnostics)

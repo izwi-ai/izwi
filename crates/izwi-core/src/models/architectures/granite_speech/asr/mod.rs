@@ -1,7 +1,7 @@
 //! Native Granite Speech ASR facade.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeSet;
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -36,8 +36,10 @@ pub use prompt::{
     GraniteSpeechPromptTokenizer, GraniteSpeechSpecialTokens, GraniteSpeechTask,
 };
 pub use runtime::{
-    GraniteSpeechAudioEmbeddingStats, GraniteSpeechGeneration, GraniteSpeechGenerationStats,
-    GraniteSpeechGenerationTimings, GraniteSpeechRuntime,
+    GraniteSpeechAttentionDecodeProfile, GraniteSpeechAudioEmbeddingStats,
+    GraniteSpeechDecodeLoopProfile, GraniteSpeechDecodeProfile, GraniteSpeechForwardProfile,
+    GraniteSpeechGeneration, GraniteSpeechGenerationStats, GraniteSpeechGenerationTimings,
+    GraniteSpeechLayerDecodeProfile, GraniteSpeechMlpDecodeProfile, GraniteSpeechRuntime,
 };
 pub use transcript::{
     GraniteSpeechParsedTranscript, GraniteSpeechSegment, GraniteSpeechTimestampWord,
@@ -577,9 +579,15 @@ fn granite_diagnostics(
             "dense_decode_cache_configured": generation.stats.dense_decode_cache_enabled,
             "dense_head_decode_enabled": generation.stats.dense_head_decode_enabled,
             "cuda_dense_decode_cache": generation.stats.dense_decode_cache_enabled,
+            "cuda_device_argmax": generation.stats.cuda_device_argmax,
             "dense_decode_max_tokens": generation.stats.dense_decode_max_tokens,
             "audio_embedding_cache_hit": timings.audio_cache_hit,
         },
+        "decode_profile": generation
+            .stats
+            .decode_profile
+            .as_ref()
+            .map(granite_decode_profile_json),
         "timings_ms": {
             "mel_prepare": duration_ms(timings.mel_prepare),
             "encoder_forward": duration_ms(timings.encoder_forward),
@@ -608,6 +616,131 @@ fn granite_diagnostics(
             })
         }).collect::<Vec<_>>(),
     })
+}
+
+fn granite_decode_profile_json(profile: &GraniteSpeechDecodeProfile) -> serde_json::Value {
+    let layer_totals = granite_layer_totals(&profile.layers);
+    json!({
+        "enabled": true,
+        "timing_kind": profile.timing_kind,
+        "steps": profile.steps,
+        "layer_count": profile.layer_count,
+        "step_total_ms": duration_stats_json(&profile.step_total_samples),
+        "loop_totals_ms": decode_loop_profile_json(profile.totals),
+        "forward_totals_ms": forward_profile_json(profile.forward),
+        "decoder_totals_ms": layer_profile_json(layer_totals),
+        "layers": profile.layers.iter().enumerate().map(|(idx, layer)| {
+            json!({
+                "index": idx,
+                "timings_ms": layer_profile_json(*layer),
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn granite_layer_totals(
+    layers: &[GraniteSpeechLayerDecodeProfile],
+) -> GraniteSpeechLayerDecodeProfile {
+    let mut total = GraniteSpeechLayerDecodeProfile::default();
+    for layer in layers {
+        total.total += layer.total;
+        total.input_norm += layer.input_norm;
+        total.attention.qkv += layer.attention.qkv;
+        total.attention.rope += layer.attention.rope;
+        total.attention.cache += layer.attention.cache;
+        total.attention.kernel += layer.attention.kernel;
+        total.attention.output += layer.attention.output;
+        total.post_attention_norm += layer.post_attention_norm;
+        total.mlp.gate_up += layer.mlp.gate_up;
+        total.mlp.activation += layer.mlp.activation;
+        total.mlp.down += layer.mlp.down;
+        total.residual += layer.residual;
+    }
+    total
+}
+
+fn decode_loop_profile_json(profile: GraniteSpeechDecodeLoopProfile) -> serde_json::Value {
+    json!({
+        "argmax": duration_ms(profile.argmax),
+        "scalar_read": duration_ms(profile.scalar_read),
+        "stop_check": duration_ms(profile.stop_check),
+        "model_forward": duration_ms(profile.model_forward),
+        "text_decode": duration_ms(profile.text_decode),
+        "delta_emit": duration_ms(profile.delta_emit),
+        "step_total": duration_ms(profile.step_total),
+    })
+}
+
+fn forward_profile_json(profile: GraniteSpeechForwardProfile) -> serde_json::Value {
+    json!({
+        "token_embedding": duration_ms(profile.token_embedding),
+        "rope_build": duration_ms(profile.rope_build),
+        "layers_total": duration_ms(profile.layers_total),
+        "final_norm": duration_ms(profile.final_norm),
+        "lm_head": duration_ms(profile.lm_head),
+    })
+}
+
+fn layer_profile_json(profile: GraniteSpeechLayerDecodeProfile) -> serde_json::Value {
+    json!({
+        "total": duration_ms(profile.total),
+        "input_norm": duration_ms(profile.input_norm),
+        "attention": attention_profile_json(profile.attention),
+        "post_attention_norm": duration_ms(profile.post_attention_norm),
+        "mlp": mlp_profile_json(profile.mlp),
+        "residual": duration_ms(profile.residual),
+    })
+}
+
+fn attention_profile_json(profile: GraniteSpeechAttentionDecodeProfile) -> serde_json::Value {
+    json!({
+        "qkv": duration_ms(profile.qkv),
+        "rope": duration_ms(profile.rope),
+        "cache": duration_ms(profile.cache),
+        "kernel": duration_ms(profile.kernel),
+        "output": duration_ms(profile.output),
+    })
+}
+
+fn mlp_profile_json(profile: GraniteSpeechMlpDecodeProfile) -> serde_json::Value {
+    json!({
+        "gate_up": duration_ms(profile.gate_up),
+        "activation": duration_ms(profile.activation),
+        "down": duration_ms(profile.down),
+    })
+}
+
+fn duration_stats_json(samples: &[Duration]) -> serde_json::Value {
+    if samples.is_empty() {
+        return json!({
+            "count": 0,
+            "avg": 0.0,
+            "p50": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+        });
+    }
+    let mut values = samples
+        .iter()
+        .map(|value| duration_ms(*value))
+        .collect::<Vec<_>>();
+    values.sort_by(f64::total_cmp);
+    let sum = values.iter().sum::<f64>();
+    json!({
+        "count": values.len(),
+        "avg": sum / values.len() as f64,
+        "p50": percentile_sorted(&values, 0.50),
+        "p95": percentile_sorted(&values, 0.95),
+        "max": values.last().copied().unwrap_or(0.0),
+    })
+}
+
+fn percentile_sorted(values: &[f64], percentile: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let idx = ((values.len() - 1) as f64 * percentile).ceil() as usize;
+    values[idx.min(values.len() - 1)]
 }
 
 fn duration_ms(duration: Duration) -> f64 {
@@ -798,11 +931,52 @@ mod tests {
                 stop_token: Some(100_257),
                 dense_decode_cache_enabled: true,
                 dense_head_decode_enabled: false,
+                cuda_device_argmax: false,
                 dense_decode_max_tokens: 8192,
                 timings: GraniteSpeechGenerationTimings {
                     prefill: Duration::from_millis(7),
                     decode: Duration::from_millis(3),
                 },
+                decode_profile: Some(GraniteSpeechDecodeProfile {
+                    timing_kind: "host_wall_clock_no_device_sync",
+                    steps: 2,
+                    layer_count: 1,
+                    step_total_samples: vec![Duration::from_millis(2), Duration::from_millis(3)],
+                    totals: GraniteSpeechDecodeLoopProfile {
+                        argmax: Duration::from_millis(1),
+                        scalar_read: Duration::from_millis(1),
+                        stop_check: Duration::from_millis(1),
+                        model_forward: Duration::from_millis(4),
+                        text_decode: Duration::from_millis(1),
+                        delta_emit: Duration::ZERO,
+                        step_total: Duration::from_millis(5),
+                    },
+                    forward: GraniteSpeechForwardProfile {
+                        token_embedding: Duration::from_millis(1),
+                        rope_build: Duration::from_millis(1),
+                        layers_total: Duration::from_millis(2),
+                        final_norm: Duration::from_millis(1),
+                        lm_head: Duration::from_millis(1),
+                    },
+                    layers: vec![GraniteSpeechLayerDecodeProfile {
+                        total: Duration::from_millis(2),
+                        input_norm: Duration::from_millis(1),
+                        attention: GraniteSpeechAttentionDecodeProfile {
+                            qkv: Duration::from_millis(1),
+                            rope: Duration::from_millis(1),
+                            cache: Duration::from_millis(1),
+                            kernel: Duration::from_millis(1),
+                            output: Duration::from_millis(1),
+                        },
+                        post_attention_norm: Duration::from_millis(1),
+                        mlp: GraniteSpeechMlpDecodeProfile {
+                            gate_up: Duration::from_millis(1),
+                            activation: Duration::from_millis(1),
+                            down: Duration::from_millis(1),
+                        },
+                        residual: Duration::from_millis(1),
+                    }],
+                }),
             },
         };
         let timings = GraniteSpeechAsrTimings {
@@ -856,8 +1030,29 @@ mod tests {
             true
         );
         assert_eq!(diagnostics["execution"]["dense_head_decode_enabled"], false);
+        assert_eq!(diagnostics["execution"]["cuda_device_argmax"], false);
         assert_eq!(diagnostics["execution"]["dense_decode_max_tokens"], 8192);
         assert_eq!(diagnostics["execution"]["audio_embedding_cache_hit"], true);
+        assert_eq!(diagnostics["decode_profile"]["enabled"], true);
+        assert_eq!(
+            diagnostics["decode_profile"]["timing_kind"],
+            "host_wall_clock_no_device_sync"
+        );
+        assert_eq!(diagnostics["decode_profile"]["steps"], 2);
+        assert_eq!(diagnostics["decode_profile"]["step_total_ms"]["count"], 2);
+        assert_eq!(diagnostics["decode_profile"]["step_total_ms"]["p50"], 3.0);
+        assert_eq!(
+            diagnostics["decode_profile"]["loop_totals_ms"]["model_forward"],
+            4.0
+        );
+        assert_eq!(
+            diagnostics["decode_profile"]["decoder_totals_ms"]["attention"]["cache"],
+            1.0
+        );
+        assert_eq!(
+            diagnostics["decode_profile"]["layers"][0]["timings_ms"]["mlp"]["down"],
+            1.0
+        );
         assert_eq!(diagnostics["timings_ms"]["prefill"], 7.0);
         assert_eq!(diagnostics["timings_ms"]["decode"], 3.0);
         assert_eq!(diagnostics["timings_ms"]["audio_input_upload"], 1.0);
