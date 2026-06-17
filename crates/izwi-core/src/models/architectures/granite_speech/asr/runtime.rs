@@ -208,6 +208,13 @@ fn granite_projection_fusion_enabled() -> bool {
         .unwrap_or(true)
 }
 
+fn granite_native_greedy_logits_enabled() -> bool {
+    std::env::var("IZWI_GRANITE_NATIVE_GREEDY_LOGITS")
+        .ok()
+        .and_then(|raw| parse_env_bool(&raw))
+        .unwrap_or(true)
+}
+
 fn parse_env_bool(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -385,7 +392,7 @@ impl GraniteSpeechRuntime {
             let token = token_tensor.reshape(())?.to_scalar::<u32>()?;
             step_profile.scalar_read = profile_elapsed(scalar_start);
             let stop_start = profile_start(profiling);
-            if stop_tokens.contains(&token) {
+            if stop_tokens.binary_search(&token).is_ok() {
                 stop_reason = "stop_token".to_string();
                 stop_token = Some(token);
                 step_profile.stop_check = profile_elapsed(stop_start);
@@ -1349,9 +1356,13 @@ impl GraniteLanguageModel {
         if let Some(profile) = profile.as_deref_mut() {
             profile.profile.forward.lm_head += profile_elapsed(lm_head_start);
         }
-        (logits / self.cfg.logits_scaling as f64)
-            .and_then(|tensor| tensor.to_dtype(DType::F32))
-            .map_err(Error::from)
+        if granite_native_greedy_logits_enabled() {
+            Ok(logits)
+        } else {
+            (logits / self.cfg.logits_scaling as f64)
+                .and_then(|tensor| tensor.to_dtype(DType::F32))
+                .map_err(Error::from)
+        }
     }
 }
 
@@ -2275,6 +2286,28 @@ mod tests {
 
         assert_eq!(token.dims(), &[1, 1]);
         assert_eq!(token.reshape(()).unwrap().to_scalar::<u32>().unwrap(), 3);
+    }
+
+    #[test]
+    fn argmax_last_token_is_unchanged_by_positive_logit_scaling() {
+        let logits = Tensor::from_vec(
+            vec![
+                -1.0f32, 0.5, 0.0, 0.25, //
+                0.0, -4.0, 8.0, 2.0,
+            ],
+            (1, 2, 4),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let scaled = (logits.clone() / 8.0)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+
+        assert_eq!(
+            argmax_last_logits(&logits).unwrap(),
+            argmax_last_logits(&scaled).unwrap()
+        );
     }
 
     #[test]
