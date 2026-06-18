@@ -40,6 +40,7 @@ export const TRANSCRIPTION_PREFERRED_MODELS = [
 
 export const DIARIZATION_PREFERRED_MODELS = [
   "diar_streaming_sortformer_4spk-v2.1",
+  "Granite-Speech-4.1-2B-Plus",
 ] as const;
 
 export const DIARIZATION_PREFERRED_ASR_MODELS = [

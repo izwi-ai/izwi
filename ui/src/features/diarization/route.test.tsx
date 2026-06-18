@@ -114,7 +114,7 @@ const graniteModel: ModelInfo = {
 
 const baseProps = {
   models: baseModels,
-  selectedModel: "diar_streaming_sortformer_4spk-v2.1",
+  selectedModel: "diar_streaming_sortformer_4spk-v2.1" as string | null,
   loading: false,
   downloadProgress: {},
   onDownload: vi.fn(),
@@ -594,6 +594,89 @@ describe("DiarizationPage routes", () => {
     expect(request).not.toHaveProperty("aligner_model_id");
     expect(request).not.toHaveProperty("min_speech_duration_ms");
     expect(request).not.toHaveProperty("min_silence_duration_ms");
+  });
+
+  it("prefers ready Granite over a non-ready classic diarization stack", async () => {
+    apiMocks.createDiarizationRecord.mockResolvedValueOnce({
+      ...fullRecord,
+      model_id: "Granite-Speech-4.1-2B-Plus",
+      asr_model_id: null,
+      aligner_model_id: null,
+    });
+    apiMocks.getDiarizationRecord.mockResolvedValue(fullRecord);
+    const props = createRouteProps({
+      models: [
+        {
+          variant: "diar_streaming_sortformer_4spk-v2.1",
+          status: "downloaded" as const,
+          local_path: "/models/diar",
+          size_bytes: null,
+          download_progress: null,
+          error_message: null,
+        },
+        {
+          variant: "Whisper-Large-v3-Turbo",
+          status: "not_downloaded" as const,
+          local_path: "/models/asr",
+          size_bytes: null,
+          download_progress: null,
+          error_message: null,
+        },
+        {
+          variant: "Qwen3-ForcedAligner-0.6B",
+          status: "not_downloaded" as const,
+          local_path: "/models/aligner",
+          size_bytes: null,
+          download_progress: null,
+          error_message: null,
+        },
+        {
+          variant: "Qwen3.5-4B",
+          status: "ready" as const,
+          local_path: "/models/llm",
+          size_bytes: null,
+          download_progress: null,
+          error_message: null,
+        },
+        graniteModel,
+      ],
+      selectedModel: null,
+    });
+
+    renderRoute("/diarization", props);
+
+    await waitFor(() =>
+      expect(apiMocks.listDiarizationRecords).toHaveBeenCalledTimes(1),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
+
+    expect(await screen.findByText("Granite Speech")).toBeInTheDocument();
+    expect(screen.getByText("READY")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Load ASR and forced aligner models before diarization."),
+    ).not.toBeInTheDocument();
+
+    const fileInput = document.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement | null;
+    expect(fileInput).not.toBeNull();
+
+    fireEvent.change(fileInput!, {
+      target: {
+        files: [new File(["audio"], "granite-ready.wav", { type: "audio/wav" })],
+      },
+    });
+
+    await waitFor(() =>
+      expect(apiMocks.createDiarizationRecord).toHaveBeenCalledTimes(1),
+    );
+    expect(apiMocks.createDiarizationRecord.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({
+        model_id: "Granite-Speech-4.1-2B-Plus",
+        audio_filename: "granite-ready.wav",
+      }),
+    );
   });
 
   it("polls a newly created pending diarization record until processing completes", async () => {
