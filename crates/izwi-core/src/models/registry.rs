@@ -13,6 +13,7 @@ use crate::model::ModelVariant;
 use crate::models::architectures::gemma3::chat::Gemma3ChatModel;
 use crate::models::architectures::granite_speech::asr::{
     GraniteSpeechAsrGenerationOptions, GraniteSpeechAsrModel, GraniteSpeechAsrTranscriptionOutput,
+    GraniteSpeechTask,
 };
 use crate::models::architectures::kokoro::KokoroTtsModel;
 use crate::models::architectures::lfm2::chat::Lfm2ChatModel;
@@ -888,6 +889,41 @@ impl NativeAsrModel {
                 prompt,
                 options,
             ),
+        }
+    }
+
+    pub fn transcribe_with_granite_speech_task_and_options(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        task: GraniteSpeechTask,
+        prefix_text: Option<&str>,
+        options: NativeAsrGenerationOptions,
+    ) -> Result<NativeAsrTranscription> {
+        match self {
+            Self::GraniteSpeech(model) => {
+                let GraniteSpeechAsrTranscriptionOutput {
+                    text,
+                    language,
+                    diagnostics,
+                } = model.transcribe_with_details_task_prefix_and_options(
+                    audio,
+                    sample_rate,
+                    language,
+                    task,
+                    prefix_text,
+                    granite_speech_asr_options(options),
+                )?;
+                Ok(NativeAsrTranscription {
+                    text,
+                    language,
+                    diagnostics,
+                })
+            }
+            _ => Err(Error::InvalidInput(
+                "Granite Speech task transcription requires a Granite Speech model".to_string(),
+            )),
         }
     }
 
