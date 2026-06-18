@@ -2,10 +2,10 @@ use crate::error::{CliError, Result};
 use crate::http;
 use crate::style::Theme;
 use crate::{BenchCommands, OutputFormat};
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use chrono::{DateTime, Utc};
-use futures::{StreamExt, stream};
+use futures::{stream, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -148,7 +148,15 @@ struct AsrBenchSample {
 struct AsrStageTimings {
     audio_decode: Option<f64>,
     mel_prepare: Option<f64>,
+    feature_extract: Option<f64>,
+    feature_upload: Option<f64>,
+    subsample: Option<f64>,
     encoder_forward: Option<f64>,
+    encoder_ffn: Option<f64>,
+    encoder_attention: Option<f64>,
+    encoder_conv: Option<f64>,
+    encoder_norm: Option<f64>,
+    prompt_kernel: Option<f64>,
     language_detect: Option<f64>,
     resample: Option<f64>,
     mel: Option<f64>,
@@ -160,6 +168,9 @@ struct AsrStageTimings {
     audio_tokens: Option<u64>,
     generated_tokens: Option<u64>,
     max_new_tokens: Option<u64>,
+    rnnt_joint_steps: Option<u64>,
+    host_argmax_reads: Option<u64>,
+    device_argmax_reads: Option<u64>,
     execution: Option<AsrExecutionDiagnostics>,
 }
 
@@ -995,7 +1006,11 @@ fn summary_metric(summary: &serde_json::Value, path: &[&str]) -> Option<f64> {
 
 fn percent_change(current: f64, baseline: f64) -> f64 {
     if baseline == 0.0 {
-        if current == 0.0 { 0.0 } else { f64::INFINITY }
+        if current == 0.0 {
+            0.0
+        } else {
+            f64::INFINITY
+        }
     } else {
         (current - baseline) * 100.0 / baseline
     }
@@ -1867,9 +1882,8 @@ async fn bench_asr(
                 saw_whisper_diagnostics = true;
             }
             stage_samples.extend(collect_asr_stage_timings_from_diagnostics(diagnostics));
-            decode_profile_samples.extend(collect_asr_decode_profiles_from_diagnostics(
-                diagnostics,
-            ));
+            decode_profile_samples
+                .extend(collect_asr_decode_profiles_from_diagnostics(diagnostics));
         }
     }
 
@@ -2568,8 +2582,24 @@ fn asr_stage_timings_from_diagnostics(diagnostics: &serde_json::Value) -> Option
     Some(AsrStageTimings {
         audio_decode: timings.get("audio_decode").and_then(|value| value.as_f64()),
         mel_prepare: timings.get("mel_prepare").and_then(|value| value.as_f64()),
+        feature_extract: timings
+            .get("feature_extract")
+            .and_then(|value| value.as_f64()),
+        feature_upload: timings
+            .get("feature_upload")
+            .and_then(|value| value.as_f64()),
+        subsample: timings.get("subsample").and_then(|value| value.as_f64()),
         encoder_forward: timings
             .get("encoder_forward")
+            .and_then(|value| value.as_f64()),
+        encoder_ffn: timings.get("encoder_ffn").and_then(|value| value.as_f64()),
+        encoder_attention: timings
+            .get("encoder_attention")
+            .and_then(|value| value.as_f64()),
+        encoder_conv: timings.get("encoder_conv").and_then(|value| value.as_f64()),
+        encoder_norm: timings.get("encoder_norm").and_then(|value| value.as_f64()),
+        prompt_kernel: timings
+            .get("prompt_kernel")
             .and_then(|value| value.as_f64()),
         language_detect: timings
             .get("language_detect")
@@ -2596,6 +2626,9 @@ fn asr_stage_timings_from_diagnostics(diagnostics: &serde_json::Value) -> Option
                     .or_else(|| value.get("max_steps"))
             })
             .and_then(|value| value.as_u64()),
+        rnnt_joint_steps: diagnostic_u64(decode, &["joint_steps", "rnnt_joint_steps"]),
+        host_argmax_reads: diagnostic_u64(decode, &["host_argmax_reads"]),
+        device_argmax_reads: diagnostic_u64(decode, &["device_argmax_reads"]),
         execution,
     })
 }
@@ -2743,13 +2776,19 @@ fn asr_decode_profile_from_diagnostics(
                 &["forward_totals_ms", "token_embedding"],
             ),
             forward_rope_build_ms: summary_metric(profile, &["forward_totals_ms", "rope_build"]),
-            forward_layers_total_ms: summary_metric(profile, &["forward_totals_ms", "layers_total"]),
+            forward_layers_total_ms: summary_metric(
+                profile,
+                &["forward_totals_ms", "layers_total"],
+            ),
             forward_final_norm_ms: summary_metric(profile, &["forward_totals_ms", "final_norm"]),
             forward_lm_head_ms: summary_metric(profile, &["forward_totals_ms", "lm_head"]),
             decoder_total_ms: summary_metric(profile, &["decoder_totals_ms", "total"]),
             attention_qkv_ms: summary_metric(profile, &["decoder_totals_ms", "attention", "qkv"]),
             attention_rope_ms: summary_metric(profile, &["decoder_totals_ms", "attention", "rope"]),
-            attention_cache_ms: summary_metric(profile, &["decoder_totals_ms", "attention", "cache"]),
+            attention_cache_ms: summary_metric(
+                profile,
+                &["decoder_totals_ms", "attention", "cache"],
+            ),
             attention_kernel_ms: summary_metric(
                 profile,
                 &["decoder_totals_ms", "attention", "kernel"],
@@ -2773,7 +2812,9 @@ fn asr_decode_profile_from_diagnostics(
 
     Some(AsrDecodeProfileTimings {
         steps: diagnostic_u64(Some(decode), &["generated_tokens", "generated_token_count"]),
-        step_total_avg_ms: profile.get("step_total_ms").and_then(|value| value.as_f64()),
+        step_total_avg_ms: profile
+            .get("step_total_ms")
+            .and_then(|value| value.as_f64()),
         step_total_p95_ms: None,
         loop_argmax_ms: None,
         loop_scalar_read_ms: profile.get("sampling_ms").and_then(|value| value.as_f64()),
@@ -2786,8 +2827,12 @@ fn asr_decode_profile_from_diagnostics(
         forward_rope_build_ms: None,
         forward_layers_total_ms: None,
         forward_final_norm_ms: None,
-        forward_lm_head_ms: profile.get("final_linear_ms").and_then(|value| value.as_f64()),
-        decoder_total_ms: profile.get("step_total_ms").and_then(|value| value.as_f64()),
+        forward_lm_head_ms: profile
+            .get("final_linear_ms")
+            .and_then(|value| value.as_f64()),
+        decoder_total_ms: profile
+            .get("step_total_ms")
+            .and_then(|value| value.as_f64()),
         attention_qkv_ms: None,
         attention_rope_ms: None,
         attention_cache_ms: None,
@@ -2796,7 +2841,9 @@ fn asr_decode_profile_from_diagnostics(
         mlp_gate_up_ms: None,
         mlp_activation_ms: None,
         mlp_down_ms: None,
-        residual_ms: profile.get("unattributed_ms").and_then(|value| value.as_f64()),
+        residual_ms: profile
+            .get("unattributed_ms")
+            .and_then(|value| value.as_f64()),
     })
 }
 
@@ -2873,7 +2920,15 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
 
     let mut audio_decode = Vec::new();
     let mut mel_prepare = Vec::new();
+    let mut feature_extract = Vec::new();
+    let mut feature_upload = Vec::new();
+    let mut subsample = Vec::new();
     let mut encoder_forward = Vec::new();
+    let mut encoder_ffn = Vec::new();
+    let mut encoder_attention = Vec::new();
+    let mut encoder_conv = Vec::new();
+    let mut encoder_norm = Vec::new();
+    let mut prompt_kernel = Vec::new();
     let mut language_detect = Vec::new();
     let mut resample = Vec::new();
     let mut mel = Vec::new();
@@ -2885,6 +2940,9 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     let mut audio_tokens = Vec::new();
     let mut generated_tokens = Vec::new();
     let mut max_new_tokens = Vec::new();
+    let mut rnnt_joint_steps = Vec::new();
+    let mut host_argmax_reads = Vec::new();
+    let mut device_argmax_reads = Vec::new();
     let mut cuda_dense_decode_cache = Vec::new();
     let mut dense_head_decode_enabled = Vec::new();
     let mut dense_decode_max_tokens = Vec::new();
@@ -2904,8 +2962,32 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         if let Some(value) = sample.mel_prepare {
             mel_prepare.push(value);
         }
+        if let Some(value) = sample.feature_extract {
+            feature_extract.push(value);
+        }
+        if let Some(value) = sample.feature_upload {
+            feature_upload.push(value);
+        }
+        if let Some(value) = sample.subsample {
+            subsample.push(value);
+        }
         if let Some(value) = sample.encoder_forward {
             encoder_forward.push(value);
+        }
+        if let Some(value) = sample.encoder_ffn {
+            encoder_ffn.push(value);
+        }
+        if let Some(value) = sample.encoder_attention {
+            encoder_attention.push(value);
+        }
+        if let Some(value) = sample.encoder_conv {
+            encoder_conv.push(value);
+        }
+        if let Some(value) = sample.encoder_norm {
+            encoder_norm.push(value);
+        }
+        if let Some(value) = sample.prompt_kernel {
+            prompt_kernel.push(value);
         }
         if let Some(value) = sample.language_detect {
             language_detect.push(value);
@@ -2939,6 +3021,15 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         }
         if let Some(value) = sample.max_new_tokens {
             max_new_tokens.push(value);
+        }
+        if let Some(value) = sample.rnnt_joint_steps {
+            rnnt_joint_steps.push(value);
+        }
+        if let Some(value) = sample.host_argmax_reads {
+            host_argmax_reads.push(value);
+        }
+        if let Some(value) = sample.device_argmax_reads {
+            device_argmax_reads.push(value);
         }
         if let Some(execution) = sample.execution {
             if let Some(value) = execution.cuda_dense_decode_cache {
@@ -2979,7 +3070,15 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
 
     if audio_decode.is_empty()
         && mel_prepare.is_empty()
+        && feature_extract.is_empty()
+        && feature_upload.is_empty()
+        && subsample.is_empty()
         && encoder_forward.is_empty()
+        && encoder_ffn.is_empty()
+        && encoder_attention.is_empty()
+        && encoder_conv.is_empty()
+        && encoder_norm.is_empty()
+        && prompt_kernel.is_empty()
         && language_detect.is_empty()
         && resample.is_empty()
         && mel.is_empty()
@@ -2991,6 +3090,9 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         && audio_tokens.is_empty()
         && generated_tokens.is_empty()
         && max_new_tokens.is_empty()
+        && rnnt_joint_steps.is_empty()
+        && host_argmax_reads.is_empty()
+        && device_argmax_reads.is_empty()
         && cuda_dense_decode_cache.is_empty()
         && dense_head_decode_enabled.is_empty()
         && dense_decode_max_tokens.is_empty()
@@ -3014,7 +3116,15 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     );
     summarize_stage("audio_decode", &audio_decode);
     summarize_stage("mel_prepare", &mel_prepare);
+    summarize_stage("feature_ext", &feature_extract);
+    summarize_stage("feature_up", &feature_upload);
+    summarize_stage("subsample", &subsample);
     summarize_stage("encoder_fwd", &encoder_forward);
+    summarize_stage("encoder_ffn", &encoder_ffn);
+    summarize_stage("encoder_attn", &encoder_attention);
+    summarize_stage("encoder_conv", &encoder_conv);
+    summarize_stage("encoder_norm", &encoder_norm);
+    summarize_stage("prompt", &prompt_kernel);
     summarize_stage("lang_detect", &language_detect);
     summarize_stage("resample", &resample);
     summarize_stage("mel", &mel);
@@ -3026,6 +3136,9 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     summarize_count("audio_tokens", &audio_tokens);
     summarize_count("gen_tokens", &generated_tokens);
     summarize_count("max_new_tokens", &max_new_tokens);
+    summarize_count("rnnt_steps", &rnnt_joint_steps);
+    summarize_count("host_argmax", &host_argmax_reads);
+    summarize_count("dev_argmax", &device_argmax_reads);
     summarize_bool_count("cuda_dense", &cuda_dense_decode_cache);
     summarize_bool_count("dense_head", &dense_head_decode_enabled);
     summarize_count("dense_max", &dense_decode_max_tokens);
@@ -3745,10 +3858,9 @@ mod tests {
         .await
         .expect_err("saved and direct references should conflict");
 
-        assert!(
-            err.to_string()
-                .contains("Use either --saved-voice-id or --reference-audio/--reference-text")
-        );
+        assert!(err
+            .to_string()
+            .contains("Use either --saved-voice-id or --reference-audio/--reference-text"));
     }
 
     #[test]

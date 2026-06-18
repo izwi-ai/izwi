@@ -1,6 +1,7 @@
 //! Nemotron 3.5 ASR artifact and native inference support.
 
 pub mod config;
+mod metal_kernels;
 pub mod nemo;
 mod network;
 
@@ -22,8 +23,8 @@ use crate::tokenizer::Tokenizer;
 pub use config::NemotronConfigInventory;
 pub use nemo::{ensure_nemotron_artifacts, NemotronArtifacts, NEMOTRON_NEMO_FILENAME};
 use network::{
-    resample_linear, NemotronNetwork, NemotronRnntStreamState, NemotronStreamingEncoderState,
-    NemotronStreamingFeatureState, NemotronStreamingPreEncodeState,
+    resample_linear, NemotronEncodeProfile, NemotronNetwork, NemotronRnntStreamState,
+    NemotronStreamingEncoderState, NemotronStreamingFeatureState, NemotronStreamingPreEncodeState,
 };
 
 const SAMPLE_RATE: u32 = 16_000;
@@ -609,13 +610,53 @@ struct NemotronDecodeRequest {
 struct NemotronStageTimings {
     resample: Duration,
     encode: Duration,
+    encode_profile: Option<NemotronEncodeProfile>,
     rnnt_decode: Duration,
     text_assembly: Duration,
 }
 
 impl NemotronStageTimings {
     fn diagnostics(&self) -> serde_json::Value {
+        let profile = self.encode_profile.as_ref();
+        let profile_timing =
+            |f: fn(&network::NemotronEncodeProfile) -> Duration| profile.map(f).map(duration_ms);
+        let feature_extract = profile_timing(|profile| profile.timings.feature_extract);
+        let feature_upload = profile_timing(|profile| profile.timings.feature_upload);
+        let dtype_cast = profile_timing(|profile| profile.timings.dtype_cast);
+        let subsample = profile_timing(|profile| profile.timings.subsample);
+        let pos_emb = profile_timing(|profile| profile.timings.pos_emb);
+        let att_mask = profile_timing(|profile| profile.timings.att_mask);
+        let encoder_ffn = profile_timing(|profile| profile.timings.encoder_ffn);
+        let encoder_attention = profile_timing(|profile| profile.timings.encoder_attention);
+        let encoder_conv = profile_timing(|profile| profile.timings.encoder_conv);
+        let encoder_norm = profile_timing(|profile| profile.timings.encoder_norm);
+        let prompt_kernel = profile_timing(|profile| profile.timings.prompt_kernel);
+        let encoder_forward = profile_timing(|profile| profile.timings.encoder_layers_total());
+        let mel_prepare = profile.map(|profile| {
+            duration_ms(profile.timings.feature_extract + profile.timings.feature_upload)
+        });
+        let model_total = self.resample + self.encode + self.rnnt_decode + self.text_assembly;
+
         json!({
+            "resample": duration_ms(self.resample),
+            "feature_extract": feature_extract,
+            "feature_upload": feature_upload,
+            "mel_prepare": mel_prepare,
+            "mel": feature_extract,
+            "dtype_cast": dtype_cast,
+            "subsample": subsample,
+            "pos_emb": pos_emb,
+            "att_mask": att_mask,
+            "encoder_forward": encoder_forward,
+            "encoder_ffn": encoder_ffn,
+            "encoder_attention": encoder_attention,
+            "encoder_conv": encoder_conv,
+            "encoder_norm": encoder_norm,
+            "prompt_kernel": prompt_kernel,
+            "audio_encode": duration_ms(self.encode),
+            "prefill": duration_ms(model_total),
+            "decode": duration_ms(self.rnnt_decode),
+            "model_total": duration_ms(model_total),
             "resample_ms": duration_ms(self.resample),
             "encode_ms": duration_ms(self.encode),
             "rnnt_decode_ms": duration_ms(self.rnnt_decode),
@@ -1037,8 +1078,11 @@ impl NemotronAsrModel {
         timings.resample = resample_start.elapsed();
         let prompt_id = self.network.prompt_id(&request.prompt.target_lang)?;
         let encode_start = Instant::now();
-        let (encoded, encoded_len) = self.network.encode_with_prompt(&audio_16khz, prompt_id)?;
+        let (encoded, encoded_len, encode_profile) = self
+            .network
+            .encode_with_prompt_profile(&audio_16khz, prompt_id)?;
         timings.encode = encode_start.elapsed();
+        timings.encode_profile = Some(encode_profile);
 
         let mut token_ids = Vec::<usize>::new();
         let mut assembled = String::new();
@@ -1094,8 +1138,11 @@ impl NemotronAsrModel {
 
         let prompt_id = self.network.prompt_id(&request.prompt.target_lang)?;
         let encode_start = Instant::now();
-        let (encoded, encoded_len) = self.network.encode_with_prompt(&audio_16khz, prompt_id)?;
+        let (encoded, encoded_len, encode_profile) = self
+            .network
+            .encode_with_prompt_profile(&audio_16khz, prompt_id)?;
         timings.encode = encode_start.elapsed();
+        timings.encode_profile = Some(encode_profile);
 
         let mut no_op = |_token_id: usize| {};
         let decode_start = Instant::now();
@@ -1129,6 +1176,14 @@ impl NemotronAsrModel {
         timings: NemotronStageTimings,
         decode_mode: &'static str,
     ) -> NemotronAsrTranscriptionOutput {
+        let encode_diagnostics = timings
+            .encode_profile
+            .as_ref()
+            .map(|profile| profile.stats.diagnostics());
+        let feature_frames = timings
+            .encode_profile
+            .as_ref()
+            .map(|profile| profile.stats.feature_frames);
         NemotronAsrTranscriptionOutput {
             text,
             language: Some(request.prompt.target_lang.clone()),
@@ -1138,7 +1193,9 @@ impl NemotronAsrModel {
                     "target_sample_rate": request.target_sample_rate,
                     "input_samples": request.samples,
                     "resampled_samples": resampled_samples,
+                    "acoustic_frames": feature_frames,
                 },
+                "encode": encode_diagnostics,
                 "prompt": request.prompt.diagnostics(),
                 "prompt_id": prompt_id,
                 "blank_id": self.network.blank_idx(),
@@ -1567,9 +1624,14 @@ mod tests {
             encode: Duration::from_millis(2),
             rnnt_decode: Duration::from_micros(3_250),
             text_assembly: Duration::from_millis(4),
+            ..Default::default()
         };
         let diagnostics = timings.diagnostics();
 
+        assert_eq!(diagnostics["resample"], 1.5);
+        assert_eq!(diagnostics["audio_encode"], 2.0);
+        assert_eq!(diagnostics["decode"], 3.25);
+        assert_eq!(diagnostics["model_total"], 10.75);
         assert_eq!(diagnostics["resample_ms"], 1.5);
         assert_eq!(diagnostics["encode_ms"], 2.0);
         assert_eq!(diagnostics["rnnt_decode_ms"], 3.25);
@@ -1705,7 +1767,10 @@ mod tests {
         assert_eq!(state.samples, vec![0.1, 0.2, 0.3, 0.4]);
         assert_eq!(state.text(), "");
         assert_eq!(state.emitted_tokens(), 0);
-        assert_eq!(state.diagnostics()["supports_realtime_stream_decode"], false);
+        assert_eq!(
+            state.diagnostics()["supports_realtime_stream_decode"],
+            false
+        );
     }
 
     #[test]
