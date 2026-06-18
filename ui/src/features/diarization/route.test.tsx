@@ -565,7 +565,8 @@ describe("DiarizationPage routes", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
-    expect(await screen.findByText("Granite Speech")).toBeInTheDocument();
+    expect(await screen.findByText("Diarization stack")).toBeInTheDocument();
+    expect(screen.getByText("Loaded")).toBeInTheDocument();
     expect(screen.queryByLabelText("Min speakers")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Min speech (ms)")).not.toBeInTheDocument();
 
@@ -651,8 +652,8 @@ describe("DiarizationPage routes", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
 
-    expect(await screen.findByText("Granite Speech")).toBeInTheDocument();
-    expect(screen.getByText("READY")).toBeInTheDocument();
+    expect(await screen.findByText("Diarization stack")).toBeInTheDocument();
+    expect(screen.getByText("Loaded")).toBeInTheDocument();
     expect(
       screen.queryByText("Load ASR and forced aligner models before diarization."),
     ).not.toBeInTheDocument();
@@ -734,8 +735,8 @@ describe("DiarizationPage routes", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
 
-    expect(await screen.findByText("Granite Speech")).toBeInTheDocument();
-    expect(screen.getByText("READY")).toBeInTheDocument();
+    expect(await screen.findByText("Diarization stack")).toBeInTheDocument();
+    expect(screen.getByText("Loaded")).toBeInTheDocument();
     expect(screen.queryByLabelText("Min speakers")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Min speech (ms)")).not.toBeInTheDocument();
     expect(
@@ -859,7 +860,7 @@ describe("DiarizationPage routes", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
-    expect(await screen.findByText("NOT LOADED")).toBeInTheDocument();
+    expect(await screen.findByText("Not loaded")).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "Unload Models" }),
     ).not.toBeInTheDocument();
@@ -963,7 +964,8 @@ describe("DiarizationPage routes", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
-    expect(await screen.findByText("Granite Speech")).toBeInTheDocument();
+    expect(await screen.findByText("Diarization stack")).toBeInTheDocument();
+    expect(screen.getByText("Loaded")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Open Models" }));
 
@@ -992,7 +994,7 @@ describe("DiarizationPage routes", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
-    expect(await screen.findByText("READY")).toBeInTheDocument();
+    expect(await screen.findByText("Loaded")).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "Load Models" }),
     ).not.toBeInTheDocument();
@@ -1052,7 +1054,7 @@ describe("DiarizationPage routes", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
-    expect(await screen.findByText("LOADING")).toBeInTheDocument();
+    expect(await screen.findByText("Loading")).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Loading models..." }),
     ).toBeDisabled();

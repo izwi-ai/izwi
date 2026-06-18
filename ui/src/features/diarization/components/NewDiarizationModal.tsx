@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   Loader2,
@@ -67,6 +67,11 @@ interface NewDiarizationModalProps {
 interface SubmitAudioOptions {
   filename?: string;
 }
+
+const DIARIZATION_MODEL_REQUIRED_ERROR =
+  "Select and load a diarization model before creating a run.";
+const CLASSIC_PIPELINE_REQUIRED_ERROR =
+  "Load ASR and forced aligner models before diarization.";
 
 export function NewDiarizationModal({
   isOpen,
@@ -147,7 +152,7 @@ export function NewDiarizationModal({
   const requireReadyModel = useCallback(() => {
     if (!selectedModel || !selectedModelReady) {
       onModelRequired();
-      setError("Select and load a diarization model before creating a run.");
+      setError(DIARIZATION_MODEL_REQUIRED_ERROR);
       return false;
     }
     return true;
@@ -163,7 +168,7 @@ export function NewDiarizationModal({
       !pipelineModelsReady
     ) {
       onPipelineModelsRequired();
-      setError("Load ASR and forced aligner models before diarization.");
+      setError(CLASSIC_PIPELINE_REQUIRED_ERROR);
       return false;
     }
     return true;
@@ -174,6 +179,24 @@ export function NewDiarizationModal({
     pipelineAsrModelId,
     pipelineModelsReady,
   ]);
+
+  useEffect(() => {
+    setError((current) => {
+      if (!current) {
+        return current;
+      }
+      if (current === DIARIZATION_MODEL_REQUIRED_ERROR && selectedModelReady) {
+        return null;
+      }
+      if (
+        current === CLASSIC_PIPELINE_REQUIRED_ERROR &&
+        (isGranitePipeline || pipelineModelsReady)
+      ) {
+        return null;
+      }
+      return current;
+    });
+  }, [isGranitePipeline, pipelineModelsReady, selectedModelReady]);
 
   const normalizeSettings = useCallback(() => {
     let nextMinSpeakers = clampIntegerDraft(minSpeakers, 1, 1, 4);
@@ -422,10 +445,10 @@ export function NewDiarizationModal({
   const allManagedModelsReady =
     managedModelCount > 0 && readyManagedModelCount === managedModelCount;
   const readinessStatusLabel = allManagedModelsReady
-    ? "READY"
+    ? "Loaded"
     : isManagedModelActionBusy
-      ? "LOADING"
-      : "NOT LOADED";
+      ? "Loading"
+      : "Not loaded";
   const readinessTone = allManagedModelsReady ? "success" : "warning";
   const readinessActionIsUnload = allManagedModelsReady;
   const readinessActionLabel = isManagedModelActionBusy
@@ -436,9 +459,7 @@ export function NewDiarizationModal({
   const readinessActionClass = readinessActionIsUnload
     ? "mt-3 h-9 w-full gap-2 border-[var(--danger-border)] bg-[var(--danger-bg)] text-[var(--danger-text)] hover:bg-[var(--danger-bg-hover)] hover:text-[var(--danger-text)]"
     : "mt-3 h-9 w-full gap-2";
-  const readinessLabel = isGranitePipeline
-    ? "Granite Speech"
-    : "Diarization stack";
+  const readinessLabel = "Diarization stack";
   const canRunReadinessAction = readinessActionIsUnload
     ? canUnloadAnyManagedModels
     : canLoadAnyManagedModels;
