@@ -1,5 +1,7 @@
 import type { ModelInfo } from "@/api";
 
+export const GRANITE_SPEECH_PLUS_VARIANT = "Granite-Speech-4.1-2B-Plus";
+
 export function filterAndSortModels(
   models: ModelInfo[],
   matchesVariant: (variant: string) => boolean,
@@ -19,7 +21,17 @@ export function isTranscriptionSummaryVariant(variant: string): boolean {
 
 export function isDiarizationVariant(variant: string): boolean {
   const normalized = variant.toLowerCase();
-  return normalized.includes("sortformer") || normalized.includes("diar");
+  return (
+    normalized.includes("sortformer") ||
+    normalized.includes("diar") ||
+    isGraniteDiarizationVariant(variant)
+  );
+}
+
+export function isGraniteDiarizationVariant(
+  variant: string | null | undefined,
+): boolean {
+  return variant === GRANITE_SPEECH_PLUS_VARIANT;
 }
 
 export function isDiarizationPipelineAsrVariant(variant: string): boolean {
