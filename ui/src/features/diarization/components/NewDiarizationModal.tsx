@@ -44,6 +44,7 @@ interface NewDiarizationModalProps {
   renderInDialog?: boolean;
   selectedMode?: SpeechTextCreationMode;
   onSelectMode?: (mode: SpeechTextCreationMode) => void;
+  pipelineMode?: "classic" | "granite";
   selectedModel: string | null;
   selectedModelReady: boolean;
   pipelineAsrModelId?: string | null;
@@ -73,6 +74,7 @@ export function NewDiarizationModal({
   renderInDialog = true,
   selectedMode = "diarization",
   onSelectMode,
+  pipelineMode = "classic",
   selectedModel,
   selectedModelReady,
   pipelineAsrModelId = null,
@@ -106,6 +108,7 @@ export function NewDiarizationModal({
   const [error, setError] = useState<string | null>(null);
   const [uploadState, setUploadState] =
     useState<SpeechTextUploadState | null>(null);
+  const isGranitePipeline = pipelineMode === "granite";
 
   const updateUploadProgress = useCallback((progress: UploadProgressInfo) => {
     setUploadState((current) => {
@@ -151,6 +154,9 @@ export function NewDiarizationModal({
   }, [onModelRequired, selectedModel, selectedModelReady]);
 
   const requireReadyPipelineModels = useCallback(() => {
+    if (isGranitePipeline) {
+      return true;
+    }
     if (
       !pipelineAsrModelId ||
       !pipelineAlignerModelId ||
@@ -162,6 +168,7 @@ export function NewDiarizationModal({
     }
     return true;
   }, [
+    isGranitePipeline,
     onPipelineModelsRequired,
     pipelineAlignerModelId,
     pipelineAsrModelId,
@@ -235,18 +242,25 @@ export function NewDiarizationModal({
         );
 
         const record = await api.createDiarizationRecord(
-          {
-            audio_file: uploadedBlob,
-            audio_filename: uploadFilename,
-            model_id: selectedModel || undefined,
-            asr_model_id: pipelineAsrModelId || undefined,
-            aligner_model_id: pipelineAlignerModelId || undefined,
-            llm_model_id: pipelineLlmModelId || undefined,
-            min_speakers: captureSettings.minSpeakers,
-            max_speakers: captureSettings.maxSpeakers,
-            min_speech_duration_ms: captureSettings.minSpeechMs,
-            min_silence_duration_ms: captureSettings.minSilenceMs,
-          },
+          isGranitePipeline
+            ? {
+                audio_file: uploadedBlob,
+                audio_filename: uploadFilename,
+                model_id: selectedModel || undefined,
+                llm_model_id: pipelineLlmModelId || undefined,
+              }
+            : {
+                audio_file: uploadedBlob,
+                audio_filename: uploadFilename,
+                model_id: selectedModel || undefined,
+                asr_model_id: pipelineAsrModelId || undefined,
+                aligner_model_id: pipelineAlignerModelId || undefined,
+                llm_model_id: pipelineLlmModelId || undefined,
+                min_speakers: captureSettings.minSpeakers,
+                max_speakers: captureSettings.maxSpeakers,
+                min_speech_duration_ms: captureSettings.minSpeechMs,
+                min_silence_duration_ms: captureSettings.minSilenceMs,
+              },
           {
             signal: uploadController.signal,
             onUploadProgress: updateUploadProgress,
@@ -308,6 +322,7 @@ export function NewDiarizationModal({
       normalizeSettings,
       onClose,
       onCreated,
+      isGranitePipeline,
       pipelineAlignerModelId,
       pipelineAsrModelId,
       pipelineLlmModelId,
@@ -421,6 +436,9 @@ export function NewDiarizationModal({
   const readinessActionClass = readinessActionIsUnload
     ? "mt-3 h-9 w-full gap-2 border-[var(--danger-border)] bg-[var(--danger-bg)] text-[var(--danger-text)] hover:bg-[var(--danger-bg-hover)] hover:text-[var(--danger-text)]"
     : "mt-3 h-9 w-full gap-2";
+  const readinessLabel = isGranitePipeline
+    ? "Granite Speech"
+    : "Diarization stack";
   const canRunReadinessAction = readinessActionIsUnload
     ? canUnloadAnyManagedModels
     : canLoadAnyManagedModels;
@@ -584,6 +602,8 @@ export function NewDiarizationModal({
 
         <div className="px-6 py-5 sm:px-6">
           <div className="space-y-2.5">
+            {!isGranitePipeline ? (
+              <>
               <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
                 <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--text-muted)]">
                   Speaker range
@@ -649,6 +669,8 @@ export function NewDiarizationModal({
                   </label>
                 </div>
               </div>
+              </>
+            ) : null}
 
               <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
                 <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--text-muted)]">
@@ -658,7 +680,7 @@ export function NewDiarizationModal({
                 <div className="mt-2.5 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-3">
                   <div className="flex items-center justify-between gap-3">
                     <span className="text-xs text-[var(--text-muted)]">
-                      Diarization stack
+                      {readinessLabel}
                     </span>
                     <StatusBadge tone={readinessTone}>
                       {readinessStatusLabel}

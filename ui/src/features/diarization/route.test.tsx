@@ -103,6 +103,15 @@ const baseModels: ModelInfo[] = [
   },
 ];
 
+const graniteModel: ModelInfo = {
+  variant: "Granite-Speech-4.1-2B-Plus",
+  status: "ready" as const,
+  local_path: "/models/granite",
+  size_bytes: null,
+  download_progress: null,
+  error_message: null,
+};
+
 const baseProps = {
   models: baseModels,
   selectedModel: "diar_streaming_sortformer_4spk-v2.1",
@@ -528,6 +537,65 @@ describe("DiarizationPage routes", () => {
     ).toBeInTheDocument();
   });
 
+  it("creates Granite diarization records without classic pipeline model ids", async () => {
+    apiMocks.createDiarizationRecord.mockResolvedValueOnce({
+      ...fullRecord,
+      model_id: "Granite-Speech-4.1-2B-Plus",
+      asr_model_id: null,
+      aligner_model_id: null,
+    });
+    apiMocks.getDiarizationRecord.mockResolvedValue(fullRecord);
+    const props = createRouteProps({
+      models: [
+        ...baseModels.map((model) =>
+          model.variant === "Whisper-Large-v3-Turbo" ||
+          model.variant === "Qwen3-ForcedAligner-0.6B"
+            ? { ...model, status: "not_downloaded" as const }
+            : model,
+        ),
+        graniteModel,
+      ],
+      selectedModel: "Granite-Speech-4.1-2B-Plus",
+    });
+
+    renderRoute("/diarization", props);
+
+    await waitFor(() =>
+      expect(apiMocks.listDiarizationRecords).toHaveBeenCalledTimes(1),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
+    expect(await screen.findByText("Granite Speech")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Min speakers")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Min speech (ms)")).not.toBeInTheDocument();
+
+    const fileInput = document.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement | null;
+    expect(fileInput).not.toBeNull();
+
+    fireEvent.change(fileInput!, {
+      target: {
+        files: [new File(["audio"], "granite.wav", { type: "audio/wav" })],
+      },
+    });
+
+    await waitFor(() =>
+      expect(apiMocks.createDiarizationRecord).toHaveBeenCalledTimes(1),
+    );
+    const request = apiMocks.createDiarizationRecord.mock.calls[0]?.[0];
+    expect(request).toEqual(
+      expect.objectContaining({
+        audio_filename: "granite.wav",
+        model_id: "Granite-Speech-4.1-2B-Plus",
+      }),
+    );
+    expect(request).not.toHaveProperty("asr_model_id");
+    expect(request).not.toHaveProperty("aligner_model_id");
+    expect(request).not.toHaveProperty("min_speech_duration_ms");
+    expect(request).not.toHaveProperty("min_silence_duration_ms");
+  });
+
   it("polls a newly created pending diarization record until processing completes", async () => {
     vi.useFakeTimers();
     const pendingCreatedRecord = {
@@ -707,6 +775,38 @@ describe("DiarizationPage routes", () => {
       "Diarization,ASR,Forced Aligner,Refiner + Summary",
     );
     expect(props.onError).not.toHaveBeenCalled();
+  });
+
+  it("opens only standalone Granite model groups when Granite is selected", async () => {
+    const props = createRouteProps({
+      models: [...baseModels, graniteModel],
+      selectedModel: "Granite-Speech-4.1-2B-Plus",
+    });
+
+    renderRoute("/diarization", props);
+
+    await waitFor(() =>
+      expect(apiMocks.listDiarizationRecords).toHaveBeenCalledTimes(1),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
+    expect(await screen.findByText("Granite Speech")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Models" }));
+
+    const modelModal = await screen.findByTestId("route-model-modal");
+    expect(modelModal.getAttribute("data-models")).toContain(
+      "Granite-Speech-4.1-2B-Plus",
+    );
+    expect(modelModal.getAttribute("data-models")).not.toContain(
+      "Whisper-Large-v3-Turbo",
+    );
+    expect(modelModal.getAttribute("data-models")).not.toContain(
+      "Qwen3-ForcedAligner-0.6B",
+    );
+    expect(modelModal.getAttribute("data-sections")).toBe(
+      "Diarization,Refiner + Summary",
+    );
   });
 
   it("shows unload only after the full diarization stack is ready", async () => {
