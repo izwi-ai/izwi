@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Instant;
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -106,6 +107,15 @@ impl ParakeetPreprocessor {
     }
 
     pub fn compute_features(&self, audio: &[f32]) -> Result<(Tensor, usize)> {
+        let (features, valid_frames, _upload_ms) =
+            self.compute_features_with_upload_timing(audio)?;
+        Ok((features, valid_frames))
+    }
+
+    pub fn compute_features_with_upload_timing(
+        &self,
+        audio: &[f32],
+    ) -> Result<(Tensor, usize, f64)> {
         if audio.is_empty() {
             return Err(Error::InvalidInput("Empty audio input".to_string()));
         }
@@ -183,10 +193,16 @@ impl ParakeetPreprocessor {
             }
         }
 
+        let upload_started = Instant::now();
         let features = Tensor::from_vec(mel, (1, self.n_mels, frame_count), &self.device)?;
+        let upload_ms = elapsed_ms(upload_started);
 
-        Ok((features, valid_frames.min(frame_count)))
+        Ok((features, valid_frames.min(frame_count), upload_ms))
     }
+}
+
+fn elapsed_ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
 }
 
 fn is_missing_tensor_error(err: &candle_core::Error) -> bool {

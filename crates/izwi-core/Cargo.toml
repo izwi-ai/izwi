@@ -27,6 +27,8 @@ candle-core = { workspace = true }
 candle-nn = { workspace = true }
 candle-transformers = { workspace = true }
 candle-flash-attn = { version = "0.10.2", optional = true }
+candle-metal-kernels = { version = "0.10.2", optional = true }
+objc2-metal = { version = "0.3.2", optional = true }
 
 hound = { workspace = true }
 symphonia = { workspace = true, default-features = false, features = [
@@ -70,7 +72,13 @@ cudnn = [
     "candle-transformers/cudnn",
     "candle-flash-attn?/cudnn",
 ]
-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+metal = [
+    "candle-core/metal",
+    "candle-nn/metal",
+    "candle-transformers/metal",
+    "dep:candle-metal-kernels",
+    "dep:objc2-metal",
+]
 flash-attn = ["cuda", "dep:candle-flash-attn", "candle-transformers/flash-attn"]
 accelerate = [
     "candle-core/accelerate",
