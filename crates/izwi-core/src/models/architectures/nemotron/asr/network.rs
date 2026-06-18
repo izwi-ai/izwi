@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 use candle_nn::ops;
@@ -36,12 +37,15 @@ const LOG_GUARD: f32 = 5.960_464_5e-8;
 const NORMALIZE_EPS: f32 = 1e-5;
 const DEFAULT_MAX_SYMBOLS_PER_FRAME: usize = 10;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct NemotronDecodeStats {
     pub encoded_frames: usize,
     pub emitted_tokens: usize,
     pub blank_frames: usize,
     pub guard_exits: usize,
+    pub joint_steps: usize,
+    pub host_argmax_reads: usize,
+    pub device_argmax_reads: usize,
     pub max_symbols_per_frame: usize,
 }
 
@@ -50,8 +54,12 @@ impl NemotronDecodeStats {
         json!({
             "encoded_frames": self.encoded_frames,
             "emitted_tokens": self.emitted_tokens,
+            "generated_tokens": self.emitted_tokens,
             "blank_frames": self.blank_frames,
             "guard_exits": self.guard_exits,
+            "joint_steps": self.joint_steps,
+            "host_argmax_reads": self.host_argmax_reads,
+            "device_argmax_reads": self.device_argmax_reads,
             "max_symbols_per_frame": self.max_symbols_per_frame,
         })
     }
@@ -61,6 +69,61 @@ impl NemotronDecodeStats {
 pub(super) struct NemotronDecodedTokens {
     pub token_ids: Vec<usize>,
     pub stats: NemotronDecodeStats,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct NemotronEncodeTimings {
+    pub feature_extract: Duration,
+    pub feature_upload: Duration,
+    pub dtype_cast: Duration,
+    pub subsample: Duration,
+    pub pos_emb: Duration,
+    pub att_mask: Duration,
+    pub encoder_ffn: Duration,
+    pub encoder_attention: Duration,
+    pub encoder_conv: Duration,
+    pub encoder_norm: Duration,
+    pub prompt_kernel: Duration,
+}
+
+impl NemotronEncodeTimings {
+    pub(super) fn encoder_layers_total(&self) -> Duration {
+        self.encoder_ffn + self.encoder_attention + self.encoder_conv + self.encoder_norm
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct NemotronEncodeStats {
+    pub feature_frames: usize,
+    pub encoded_frames: usize,
+    pub encoder_layers: usize,
+}
+
+impl NemotronEncodeStats {
+    pub(super) fn diagnostics(&self) -> serde_json::Value {
+        json!({
+            "feature_frames": self.feature_frames,
+            "encoded_frames": self.encoded_frames,
+            "encoder_layers": self.encoder_layers,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct NemotronEncodeProfile {
+    pub timings: NemotronEncodeTimings,
+    pub stats: NemotronEncodeStats,
+}
+
+struct NemotronFeatureTimings {
+    feature_extract: Duration,
+    feature_upload: Duration,
+}
+
+struct NemotronFeatureOutput {
+    features: Tensor,
+    valid_frames: usize,
+    timings: NemotronFeatureTimings,
 }
 
 pub(super) struct NemotronNetwork {
@@ -193,38 +256,88 @@ impl NemotronNetwork {
         audio_16khz: &[f32],
         prompt_id: usize,
     ) -> Result<(Tensor, usize)> {
-        let (features, feature_frames) = self.preprocessor.compute_features(audio_16khz)?;
+        let (encoded, encoded_len, _profile) =
+            self.encode_with_prompt_profile(audio_16khz, prompt_id)?;
+        Ok((encoded, encoded_len))
+    }
+
+    pub(super) fn encode_with_prompt_profile(
+        &self,
+        audio_16khz: &[f32],
+        prompt_id: usize,
+    ) -> Result<(Tensor, usize, NemotronEncodeProfile)> {
+        let mut profile = NemotronEncodeProfile::default();
+        let feature_output = self.preprocessor.compute_features_profile(audio_16khz)?;
+        profile.timings.feature_extract = feature_output.timings.feature_extract;
+        profile.timings.feature_upload = feature_output.timings.feature_upload;
+        profile.stats.feature_frames = feature_output.valid_frames;
+
+        let dtype_start = Instant::now();
+        let features = feature_output.features;
         let features = if features.dtype() == self.dtype {
             features
         } else {
             features.to_dtype(self.dtype)?
         };
-        let (x, encoded_len) = self.pre_encode.forward(&features, feature_frames)?;
+        profile.timings.dtype_cast = dtype_start.elapsed();
+
+        let subsample_start = Instant::now();
+        let (x, encoded_len) = self
+            .pre_encode
+            .forward(&features, feature_output.valid_frames)?;
+        profile.timings.subsample = subsample_start.elapsed();
+        profile.stats.encoded_frames = encoded_len;
         if encoded_len == 0 {
             return Err(Error::InferenceError(
                 "Nemotron encoder produced zero frames".to_string(),
             ));
         }
 
-        self.encode_preencoded_with_prompt(
+        let (encoded, encoded_len) = self.encode_preencoded_with_prompt_profile(
             x,
             encoded_len,
             prompt_id,
             self.left_context_frames,
             self.right_context_frames,
-        )
+            &mut profile,
+        )?;
+        profile.stats.encoded_frames = encoded_len;
+        Ok((encoded, encoded_len, profile))
     }
 
     fn encode_preencoded_with_prompt(
+        &self,
+        x: Tensor,
+        encoded_len: usize,
+        prompt_id: usize,
+        left_context_frames: usize,
+        right_context_frames: usize,
+    ) -> Result<(Tensor, usize)> {
+        let mut profile = NemotronEncodeProfile::default();
+        self.encode_preencoded_with_prompt_profile(
+            x,
+            encoded_len,
+            prompt_id,
+            left_context_frames,
+            right_context_frames,
+            &mut profile,
+        )
+    }
+
+    fn encode_preencoded_with_prompt_profile(
         &self,
         mut x: Tensor,
         encoded_len: usize,
         prompt_id: usize,
         left_context_frames: usize,
         right_context_frames: usize,
+        profile: &mut NemotronEncodeProfile,
     ) -> Result<(Tensor, usize)> {
         let pos_len = x.dim(1)?;
+        let pos_start = Instant::now();
         let pos_emb = self.rel_positional_embedding(pos_len, x.dtype(), x.device())?;
+        profile.timings.pos_emb += pos_start.elapsed();
+        let mask_start = Instant::now();
         let att_mask = self.limited_context_mask(
             pos_len,
             left_context_frames,
@@ -232,11 +345,15 @@ impl NemotronNetwork {
             x.dtype(),
             x.device(),
         )?;
+        profile.timings.att_mask += mask_start.elapsed();
         for layer in &self.layers {
-            x = layer.forward(&x, &pos_emb, &att_mask)?;
+            x = layer.forward_profile(&x, &pos_emb, &att_mask, profile)?;
+            profile.stats.encoder_layers = profile.stats.encoder_layers.saturating_add(1);
         }
 
+        let prompt_start = Instant::now();
         let x = self.prompt_kernel.forward(&x, prompt_id)?;
+        profile.timings.prompt_kernel += prompt_start.elapsed();
         Ok((x, encoded_len.min(pos_len)))
     }
 
@@ -309,7 +426,7 @@ impl NemotronNetwork {
         encoded_len: usize,
         on_token: &mut dyn FnMut(usize),
     ) -> Result<NemotronDecodedTokens> {
-        if encoded.device().is_cuda() {
+        if use_rnnt_cached_projection(encoded.device()) {
             return self.decode_rnnt_greedy_cuda_cached(encoded, encoded_len, on_token);
         }
 
@@ -322,6 +439,9 @@ impl NemotronNetwork {
         let mut token_ids = Vec::new();
         let mut blank_frames = 0usize;
         let mut guard_exits = 0usize;
+        let mut joint_steps = 0usize;
+        let mut host_argmax_reads = 0usize;
+        let mut device_argmax_reads = 0usize;
 
         for t in 0..encoded_len {
             let enc_t = encoded.i((t, ..))?.unsqueeze(0)?.unsqueeze(0)?; // [1, 1, D]
@@ -334,6 +454,12 @@ impl NemotronNetwork {
                     .squeeze(0)?
                     .squeeze(0)?
                     .squeeze(0)?; // [V + blank]
+                joint_steps = joint_steps.saturating_add(1);
+                if argmax_uses_device(&logits) {
+                    device_argmax_reads = device_argmax_reads.saturating_add(1);
+                } else {
+                    host_argmax_reads = host_argmax_reads.saturating_add(1);
+                }
                 let label = argmax_1d(&logits)?;
 
                 if label == self.blank_idx {
@@ -367,6 +493,9 @@ impl NemotronNetwork {
                 emitted_tokens: token_ids.len(),
                 blank_frames,
                 guard_exits,
+                joint_steps,
+                host_argmax_reads,
+                device_argmax_reads,
                 max_symbols_per_frame: self.max_symbols_per_frame,
             },
             token_ids,
@@ -379,7 +508,7 @@ impl NemotronNetwork {
         let predictor_out = self
             .predictor
             .step(self.blank_idx, &mut predictor_state, device)?;
-        let predictor_projection = if device.is_cuda() {
+        let predictor_projection = if use_rnnt_cached_projection(device) {
             Some(self.joint.project_predictor(&predictor_out)?)
         } else {
             None
@@ -395,6 +524,9 @@ impl NemotronNetwork {
                 emitted_tokens: 0,
                 blank_frames: 0,
                 guard_exits: 0,
+                joint_steps: 0,
+                host_argmax_reads: 0,
+                device_argmax_reads: 0,
                 max_symbols_per_frame: self.max_symbols_per_frame,
             },
         })
@@ -408,7 +540,7 @@ impl NemotronNetwork {
         on_token: &mut dyn FnMut(usize),
     ) -> Result<NemotronRnntStreamStep> {
         let encoded = encoded.i((0, ..encoded_len, ..))?;
-        let encoded_projection = if encoded.device().is_cuda() {
+        let encoded_projection = if use_rnnt_cached_projection(encoded.device()) {
             Some(self.joint.project_encoder(&encoded)?)
         } else {
             None
@@ -428,7 +560,7 @@ impl NemotronNetwork {
                     let predictor_projection =
                         state.predictor_projection.as_ref().ok_or_else(|| {
                             Error::InferenceError(
-                                "Nemotron CUDA RNNT stream is missing predictor projection"
+                                "Nemotron accelerated RNNT stream is missing predictor projection"
                                     .to_string(),
                             )
                         })?;
@@ -441,6 +573,13 @@ impl NemotronNetwork {
                 .squeeze(0)?
                 .squeeze(0)?
                 .squeeze(0)?;
+                state.stats.joint_steps = state.stats.joint_steps.saturating_add(1);
+                if argmax_uses_device(&logits) {
+                    state.stats.device_argmax_reads =
+                        state.stats.device_argmax_reads.saturating_add(1);
+                } else {
+                    state.stats.host_argmax_reads = state.stats.host_argmax_reads.saturating_add(1);
+                }
                 let label = argmax_1d(&logits)?;
 
                 if label == self.blank_idx {
@@ -500,6 +639,9 @@ impl NemotronNetwork {
         let mut token_ids = Vec::new();
         let mut blank_frames = 0usize;
         let mut guard_exits = 0usize;
+        let mut joint_steps = 0usize;
+        let mut host_argmax_reads = 0usize;
+        let mut device_argmax_reads = 0usize;
 
         for t in 0..encoded_len {
             let enc_t = encoded_projection.i((t, ..))?.unsqueeze(0)?.unsqueeze(0)?;
@@ -512,6 +654,12 @@ impl NemotronNetwork {
                     .squeeze(0)?
                     .squeeze(0)?
                     .squeeze(0)?;
+                joint_steps = joint_steps.saturating_add(1);
+                if argmax_uses_device(&logits) {
+                    device_argmax_reads = device_argmax_reads.saturating_add(1);
+                } else {
+                    host_argmax_reads = host_argmax_reads.saturating_add(1);
+                }
                 let label = argmax_1d(&logits)?;
 
                 if label == self.blank_idx {
@@ -546,6 +694,9 @@ impl NemotronNetwork {
                 emitted_tokens: token_ids.len(),
                 blank_frames,
                 guard_exits,
+                joint_steps,
+                host_argmax_reads,
+                device_argmax_reads,
                 max_symbols_per_frame: self.max_symbols_per_frame,
             },
             token_ids,
@@ -643,7 +794,9 @@ impl NemotronNetwork {
         if let Some(cached) = self
             .stream_rel_pos_cache
             .lock()
-            .map_err(|_| Error::InferenceError("Nemotron stream rel-pos cache lock poisoned".into()))?
+            .map_err(|_| {
+                Error::InferenceError("Nemotron stream rel-pos cache lock poisoned".into())
+            })?
             .get(&key)
             .cloned()
         {
@@ -660,7 +813,9 @@ impl NemotronNetwork {
         )?;
         self.stream_rel_pos_cache
             .lock()
-            .map_err(|_| Error::InferenceError("Nemotron stream rel-pos cache lock poisoned".into()))?
+            .map_err(|_| {
+                Error::InferenceError("Nemotron stream rel-pos cache lock poisoned".into())
+            })?
             .insert(key, tensor.clone());
         Ok(tensor)
     }
@@ -986,11 +1141,12 @@ impl NemotronStreamingEncoderState {
         if self.pending_pre_encoded.is_none() {
             self.pending_start_frame = chunk.start_frame;
         }
-        self.pending_pre_encoded = Some(if let Some(existing) = self.pending_pre_encoded.as_ref() {
-            Tensor::cat(&[existing, &chunk.encoded], 1)?
-        } else {
-            chunk.encoded
-        });
+        self.pending_pre_encoded =
+            Some(if let Some(existing) = self.pending_pre_encoded.as_ref() {
+                Tensor::cat(&[existing, &chunk.encoded], 1)?
+            } else {
+                chunk.encoded
+            });
         self.received_frames = self.received_frames.saturating_add(chunk.frames);
         self.input_finished = chunk.is_final;
         Ok(())
@@ -1034,10 +1190,9 @@ impl NemotronStreamingEncoderState {
         }
 
         let frames = pending_frames.min(self.chunk_frames);
-        let pending = self
-            .pending_pre_encoded
-            .take()
-            .ok_or_else(|| Error::InferenceError("Nemotron encoder stream lost pending frames".into()))?;
+        let pending = self.pending_pre_encoded.take().ok_or_else(|| {
+            Error::InferenceError("Nemotron encoder stream lost pending frames".into())
+        })?;
         let chunk = pending.narrow(1, 0, frames)?.contiguous()?;
         let remaining = pending_frames - frames;
         self.last_chunk_start_frame = self.pending_start_frame;
@@ -1122,6 +1277,12 @@ impl NemotronPreprocessor {
     }
 
     fn compute_features(&self, audio: &[f32]) -> Result<(Tensor, usize)> {
+        let output = self.compute_features_profile(audio)?;
+        Ok((output.features, output.valid_frames))
+    }
+
+    fn compute_features_profile(&self, audio: &[f32]) -> Result<NemotronFeatureOutput> {
+        let feature_start = Instant::now();
         if audio.is_empty() {
             return Err(Error::InvalidInput("Empty audio input".to_string()));
         }
@@ -1189,8 +1350,18 @@ impl NemotronPreprocessor {
             }
         }
 
+        let feature_extract = feature_start.elapsed();
+        let upload_start = Instant::now();
         let features = Tensor::from_vec(mel, (1, N_MELS, frame_count), &self.device)?;
-        Ok((features, valid_frames))
+        let feature_upload = upload_start.elapsed();
+        Ok(NemotronFeatureOutput {
+            features,
+            valid_frames,
+            timings: NemotronFeatureTimings {
+                feature_extract,
+                feature_upload,
+            },
+        })
     }
 
     pub(super) fn compute_streaming_features(
@@ -1352,9 +1523,9 @@ impl ConvSubsamplingDw {
         let mut x = features.transpose(1, 2)?.unsqueeze(1)?;
 
         x = self.conv0.forward(&x)?.relu()?;
-        x = self.conv2.forward(&x)?;
+        x = self.depthwise_conv2d_forward(&self.conv2, &x)?;
         x = self.conv3.forward(&x)?.relu()?;
-        x = self.conv5.forward(&x)?;
+        x = self.depthwise_conv2d_forward(&self.conv5, &x)?;
         x = self.conv6.forward(&x)?.relu()?;
 
         let (b, c, t, mut f) = x.dims4()?;
@@ -1417,6 +1588,25 @@ impl ConvSubsamplingDw {
             is_final: state.input_finished && stable_frames == encoded_len,
         }))
     }
+
+    fn depthwise_conv2d_forward(&self, conv: &Conv2d, x: &Tensor) -> Result<Tensor> {
+        let cfg = conv.config();
+        if let Some(bias) = conv.bias() {
+            if let Some(y) = super::metal_kernels::try_depthwise_conv2d_bias(
+                x,
+                conv.weight(),
+                bias,
+                cfg.padding,
+                cfg.stride,
+                cfg.dilation,
+            ) {
+                return Ok(y);
+            }
+        }
+
+        conv.forward(x)
+            .map_err(|e| Error::InferenceError(e.to_string()))
+    }
 }
 
 fn load_subsampling_out_projection(vb: VarBuilder) -> Result<(Linear, usize)> {
@@ -1477,25 +1667,48 @@ impl ConformerLayer {
     }
 
     fn forward(&self, x: &Tensor, pos_emb: &Tensor, att_mask: &Tensor) -> Result<Tensor> {
+        let mut profile = NemotronEncodeProfile::default();
+        self.forward_profile(x, pos_emb, att_mask, &mut profile)
+    }
+
+    fn forward_profile(
+        &self,
+        x: &Tensor,
+        pos_emb: &Tensor,
+        att_mask: &Tensor,
+        profile: &mut NemotronEncodeProfile,
+    ) -> Result<Tensor> {
         let mut residual = x.clone();
 
+        let ff1_start = Instant::now();
         let ff1 = self.ff1.forward(&self.norm_ff1.forward(&residual)?)?;
         residual = residual.broadcast_add(&ff1.affine(0.5, 0.0)?)?;
+        profile.timings.encoder_ffn += ff1_start.elapsed();
 
+        let attn_start = Instant::now();
         let attn =
             self.self_attn
                 .forward(&self.norm_self_att.forward(&residual)?, pos_emb, att_mask)?;
         residual = residual.broadcast_add(&attn)?;
+        profile.timings.encoder_attention += attn_start.elapsed();
 
+        let conv_start = Instant::now();
         let conv = self.conv.forward(&self.norm_conv.forward(&residual)?)?;
         residual = residual.broadcast_add(&conv)?;
+        profile.timings.encoder_conv += conv_start.elapsed();
 
+        let ff2_start = Instant::now();
         let ff2 = self.ff2.forward(&self.norm_ff2.forward(&residual)?)?;
         residual = residual.broadcast_add(&ff2.affine(0.5, 0.0)?)?;
+        profile.timings.encoder_ffn += ff2_start.elapsed();
 
-        self.norm_out
+        let norm_start = Instant::now();
+        let out = self
+            .norm_out
             .forward(&residual)
-            .map_err(|e| Error::InferenceError(e.to_string()))
+            .map_err(|e| Error::InferenceError(e.to_string()))?;
+        profile.timings.encoder_norm += norm_start.elapsed();
+        Ok(out)
     }
 
     fn forward_streaming(
@@ -1518,16 +1731,13 @@ impl ConformerLayer {
             pos_pair,
             att_mask,
         )?;
-        state.attn_cache = update_time_cache_dim1(
-            state.attn_cache.take(),
-            &att_input,
-            left_context_frames,
-        )?;
+        state.attn_cache =
+            update_time_cache_dim1(state.attn_cache.take(), &att_input, left_context_frames)?;
         residual = residual.broadcast_add(&attn)?;
 
-        let conv =
-            self.conv
-                .forward_streaming(&self.norm_conv.forward(&residual)?, &mut state.conv_cache)?;
+        let conv = self
+            .conv
+            .forward_streaming(&self.norm_conv.forward(&residual)?, &mut state.conv_cache)?;
         residual = residual.broadcast_add(&conv)?;
 
         let ff2 = self.ff2.forward(&self.norm_ff2.forward(&residual)?)?;
@@ -1612,7 +1822,7 @@ impl ConformerConv {
         x = x_a.broadcast_mul(&ops::sigmoid(&x_b)?)?;
 
         x = x.pad_with_zeros(2, CONV_KERNEL_1D - 1, 0)?;
-        x = self.depthwise_conv.forward(&x)?;
+        x = self.depthwise_conv_forward(&x)?;
         x = self
             .conv_norm
             .forward(&x.transpose(1, 2)?)?
@@ -1630,7 +1840,10 @@ impl ConformerConv {
         let x_b = x.i((.., ENCODER_DIM.., ..))?;
         let x = x_a.broadcast_mul(&ops::sigmoid(&x_b)?)?;
 
-        let cache_len = cache.as_ref().and_then(|cache| cache.dim(2).ok()).unwrap_or(0);
+        let cache_len = cache
+            .as_ref()
+            .and_then(|cache| cache.dim(2).ok())
+            .unwrap_or(0);
         let cached_and_current = if let Some(existing) = cache.as_ref() {
             Tensor::cat(&[existing, &x], 2)?
         } else {
@@ -1643,7 +1856,7 @@ impl ConformerConv {
         };
         *cache = update_time_cache_dim2(None, &cached_and_current, CONV_KERNEL_1D - 1)?;
 
-        let mut x = self.depthwise_conv.forward(&conv_input)?;
+        let mut x = self.depthwise_conv_forward(&conv_input)?;
         x = self
             .conv_norm
             .forward(&x.transpose(1, 2)?)?
@@ -1652,6 +1865,23 @@ impl ConformerConv {
         x = self.pointwise_conv2.forward(&x)?;
 
         x.transpose(1, 2).map_err(Error::from)
+    }
+
+    fn depthwise_conv_forward(&self, x: &Tensor) -> Result<Tensor> {
+        let cfg = self.depthwise_conv.config();
+        if let Some(y) = super::metal_kernels::try_depthwise_conv1d(
+            x,
+            self.depthwise_conv.weight(),
+            cfg.padding,
+            cfg.stride,
+            cfg.dilation,
+        ) {
+            return Ok(y);
+        }
+
+        self.depthwise_conv
+            .forward(x)
+            .map_err(|e| Error::InferenceError(e.to_string()))
     }
 }
 
@@ -2354,11 +2584,19 @@ fn argmax_1d(x: &Tensor) -> Result<usize> {
             x.shape().dims()
         )));
     }
-    if x.device().is_cuda() {
+    if argmax_uses_device(x) {
         return argmax_1d_device(x);
     }
 
     argmax_1d_host(x)
+}
+
+fn argmax_uses_device(x: &Tensor) -> bool {
+    x.device().is_cuda()
+}
+
+fn use_rnnt_cached_projection(device: &Device) -> bool {
+    device.is_cuda() || device.is_metal()
 }
 
 fn argmax_1d_device(x: &Tensor) -> Result<usize> {
@@ -2707,8 +2945,7 @@ mod tests {
 
     #[test]
     fn streaming_limited_context_mask_uses_bounded_key_window() {
-        let mask =
-            build_streaming_limited_context_mask(2, 5, 3, 2, 1, &Device::Cpu).unwrap();
+        let mask = build_streaming_limited_context_mask(2, 5, 3, 2, 1, &Device::Cpu).unwrap();
         let values = mask
             .squeeze(0)
             .unwrap()
@@ -2718,7 +2955,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(mask.dims(), &[1, 1, 2, 5]);
-        assert!(values[0][0] < -1.0e8, "query 3 cannot attend before left context");
+        assert!(
+            values[0][0] < -1.0e8,
+            "query 3 cannot attend before left context"
+        );
         assert_eq!(values[0][1], 0.0);
         assert_eq!(values[0][4], 0.0, "query 3 can attend one frame right");
         assert_eq!(values[1][2], 0.0);
@@ -2726,9 +2966,15 @@ mod tests {
 
     #[test]
     fn streaming_rel_positional_embedding_is_pairwise_bounded() {
-        let pos =
-            build_streaming_rel_positional_embedding_for_dtype(2, 5, 3, 8, &Device::Cpu, DType::F32)
-                .unwrap();
+        let pos = build_streaming_rel_positional_embedding_for_dtype(
+            2,
+            5,
+            3,
+            8,
+            &Device::Cpu,
+            DType::F32,
+        )
+        .unwrap();
 
         assert_eq!(pos.dtype(), DType::F32);
         assert_eq!(pos.dims(), &[1, 10, 8]);
