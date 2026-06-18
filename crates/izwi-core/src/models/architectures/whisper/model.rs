@@ -45,16 +45,18 @@ fn can_skip_attention_mask_for_fused_attention(
     !masked || (q_len == 1 && kv_len == query_pos + 1)
 }
 
-fn whisper_metal_full_sdpa_enabled() -> bool {
-    std::env::var("IZWI_WHISPER_METAL_FULL_SDPA")
+fn whisper_metal_sdpa_enabled() -> bool {
+    std::env::var("IZWI_WHISPER_METAL_SDPA")
         .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
+        .map(|value| whisper_metal_sdpa_env_value_enabled(&value))
         .unwrap_or(false)
+}
+
+fn whisper_metal_sdpa_env_value_enabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -197,8 +199,7 @@ impl MultiHeadAttention {
         let can_skip_mask =
             can_skip_attention_mask_for_fused_attention(mask.is_some(), query_pos, q_len, kv_len);
         let can_try_fused = if can_skip_mask {
-            q.device().is_cuda()
-                || (q.device().is_metal() && (q_len <= 8 || whisper_metal_full_sdpa_enabled()))
+            q.device().is_cuda() || (q.device().is_metal() && whisper_metal_sdpa_enabled())
         } else {
             false
         };
@@ -564,7 +565,7 @@ impl Whisper {
 mod tests {
     use super::{
         attention_mask_window, can_skip_attention_mask_for_fused_attention, causal_attention_mask,
-        sinusoids,
+        sinusoids, whisper_metal_sdpa_env_value_enabled,
     };
     use candle_core::{DType, Device, Tensor};
 
@@ -610,5 +611,16 @@ mod tests {
         assert!(can_skip_attention_mask_for_fused_attention(true, 4, 1, 5));
         assert!(!can_skip_attention_mask_for_fused_attention(true, 0, 4, 4));
         assert!(!can_skip_attention_mask_for_fused_attention(true, 4, 1, 6));
+    }
+
+    #[test]
+    fn whisper_metal_sdpa_is_opt_in() {
+        assert!(whisper_metal_sdpa_env_value_enabled("1"));
+        assert!(whisper_metal_sdpa_env_value_enabled("true"));
+        assert!(whisper_metal_sdpa_env_value_enabled("yes"));
+        assert!(whisper_metal_sdpa_env_value_enabled("on"));
+        assert!(!whisper_metal_sdpa_env_value_enabled(""));
+        assert!(!whisper_metal_sdpa_env_value_enabled("0"));
+        assert!(!whisper_metal_sdpa_env_value_enabled("false"));
     }
 }
