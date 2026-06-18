@@ -1275,6 +1275,29 @@ mod tests {
             Some(true)
         );
 
+        let granite_model = find_model("Granite-Speech-4.1-2B-Plus");
+        assert_eq!(
+            granite_model["route_capabilities"]["diarization_records"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            granite_model["route_capabilities"]["speech_to_text_jobs"].as_bool(),
+            Some(true)
+        );
+        let granite_modalities = granite_model["modalities"]
+            .as_array()
+            .expect("Granite modalities should be an array");
+        assert!(
+            granite_modalities
+                .iter()
+                .any(|modality| modality.as_str() == Some("speaker_labels"))
+        );
+        assert!(
+            granite_modalities
+                .iter()
+                .any(|modality| modality.as_str() == Some("timestamps"))
+        );
+
         let voxtral_model = find_model("Voxtral-Mini-4B-Realtime-2602");
         assert_eq!(
             voxtral_model["route_capabilities"]["openai_audio_transcriptions"].as_bool(),
