@@ -95,6 +95,7 @@ pub struct Qwen3Cache {
     dense_decode_overflowed: Vec<bool>,
     rope_cache: Vec<Qwen3RopeCacheEntry>,
     dense_decode_max_tokens: usize,
+    dense_decode_initial_capacity: usize,
     page_size: usize,
     quantization: KvCacheQuantization,
 }
@@ -147,6 +148,24 @@ impl Qwen3Cache {
         )
     }
 
+    pub fn with_page_size_and_dense_decode_initial_capacity(
+        num_layers: usize,
+        page_size: usize,
+        device: &Device,
+        dense_decode_initial_capacity: usize,
+    ) -> Self {
+        let quantization = default_kv_quantization();
+        let dense_decode_max_tokens =
+            qwen3_dense_decode_max_tokens(device, page_size, quantization);
+        Self::with_page_size_quantization_dense_decode_tokens_initial_capacity(
+            num_layers,
+            page_size,
+            quantization,
+            dense_decode_max_tokens,
+            dense_decode_initial_capacity,
+        )
+    }
+
     pub fn with_page_size_and_dense_decode_tokens(
         num_layers: usize,
         page_size: usize,
@@ -186,8 +205,29 @@ impl Qwen3Cache {
         quantization: KvCacheQuantization,
         dense_decode_max_tokens: usize,
     ) -> Self {
+        Self::with_page_size_quantization_dense_decode_tokens_initial_capacity(
+            num_layers,
+            page_size,
+            quantization,
+            dense_decode_max_tokens,
+            0,
+        )
+    }
+
+    fn with_page_size_quantization_dense_decode_tokens_initial_capacity(
+        num_layers: usize,
+        page_size: usize,
+        quantization: KvCacheQuantization,
+        dense_decode_max_tokens: usize,
+        dense_decode_initial_capacity: usize,
+    ) -> Self {
         let dense_decode_max_tokens = if quantization == KvCacheQuantization::None {
             dense_decode_max_tokens
+        } else {
+            0
+        };
+        let dense_decode_initial_capacity = if dense_decode_max_tokens > 0 {
+            dense_decode_initial_capacity.min(dense_decode_max_tokens)
         } else {
             0
         };
@@ -200,6 +240,7 @@ impl Qwen3Cache {
             dense_decode_overflowed: vec![false; num_layers],
             rope_cache: Vec::new(),
             dense_decode_max_tokens,
+            dense_decode_initial_capacity,
             page_size: page_size.max(1),
             quantization,
         }
@@ -250,6 +291,7 @@ impl Qwen3Cache {
             append_tokens,
             self.page_size,
             self.dense_decode_max_tokens,
+            self.dense_decode_initial_capacity,
         );
         self.dense_k_cache_h[layer]
             .get_or_insert_with(|| Cache::new(2, initial_capacity))
@@ -418,9 +460,11 @@ fn dense_cache_initial_capacity(
     append_tokens: usize,
     page_size: usize,
     dense_decode_max_tokens: usize,
+    requested_initial_capacity: usize,
 ) -> usize {
     let page_size = page_size.max(1);
-    append_tokens
+    requested_initial_capacity
+        .max(append_tokens)
         .saturating_add(page_size - 1)
         .saturating_div(page_size)
         .saturating_mul(page_size)
@@ -1989,6 +2033,45 @@ mod tests {
             4
         );
 
+        let k_next = Tensor::zeros((1, 3, 1, 4), DType::F32, &device).expect("next k");
+        let v_next = Tensor::zeros((1, 3, 1, 4), DType::F32, &device).expect("next v");
+        cache.append(0, k_next, v_next).expect("append next");
+
+        assert_eq!(
+            cache.dense_k_cache_h[0]
+                .as_ref()
+                .expect("dense key cache")
+                .max_seq_len(),
+            8
+        );
+        let (k_dense, v_dense) = cache.dense_heads(0).expect("dense heads").expect("dense");
+        assert_eq!(k_dense.dims4().expect("k dims"), (1, 1, 5, 4));
+        assert_eq!(v_dense.dims4().expect("v dims"), (1, 1, 5, 4));
+    }
+
+    #[test]
+    fn qwen3_cache_dense_decode_honors_initial_capacity_hint() {
+        let device = Device::Cpu;
+        let mut cache =
+            Qwen3Cache::with_page_size_quantization_dense_decode_tokens_initial_capacity(
+                1,
+                4,
+                KvCacheQuantization::None,
+                16,
+                5,
+            );
+        let k = Tensor::zeros((1, 2, 1, 4), DType::F32, &device).expect("k");
+        let v = Tensor::zeros((1, 2, 1, 4), DType::F32, &device).expect("v");
+
+        cache.append(0, k, v).expect("append");
+
+        assert_eq!(
+            cache.dense_k_cache_h[0]
+                .as_ref()
+                .expect("dense key cache")
+                .max_seq_len(),
+            8
+        );
         let k_next = Tensor::zeros((1, 3, 1, 4), DType::F32, &device).expect("next k");
         let v_next = Tensor::zeros((1, 3, 1, 4), DType::F32, &device).expect("next v");
         cache.append(0, k_next, v_next).expect("append next");
