@@ -195,6 +195,7 @@ struct AsrExecutionDiagnostics {
     dense_decode_max_tokens: Option<u64>,
     audio_embedding_cache_hit: Option<bool>,
     cuda_device_argmax: Option<bool>,
+    residual_branches_prescaled: Option<bool>,
     deferred_stop_check: Option<bool>,
     chunked_stop_check: Option<bool>,
     stop_check_interval: Option<u64>,
@@ -2623,6 +2624,9 @@ fn asr_execution_from_single_diagnostics(
         cuda_device_argmax: execution
             .get("cuda_device_argmax")
             .and_then(|value| value.as_bool()),
+        residual_branches_prescaled: execution
+            .get("residual_branches_prescaled")
+            .and_then(|value| value.as_bool()),
         deferred_stop_check: execution
             .get("deferred_stop_check")
             .and_then(|value| value.as_bool()),
@@ -2638,6 +2642,7 @@ fn asr_execution_from_single_diagnostics(
         || sample.dense_decode_max_tokens.is_some()
         || sample.audio_embedding_cache_hit.is_some()
         || sample.cuda_device_argmax.is_some()
+        || sample.residual_branches_prescaled.is_some()
         || sample.deferred_stop_check.is_some()
         || sample.chunked_stop_check.is_some()
         || sample.stop_check_interval.is_some())
@@ -2845,6 +2850,7 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     let mut dense_decode_max_tokens = Vec::new();
     let mut audio_embedding_cache_hit = Vec::new();
     let mut cuda_device_argmax = Vec::new();
+    let mut residual_branches_prescaled = Vec::new();
     let mut deferred_stop_check = Vec::new();
     let mut chunked_stop_check = Vec::new();
     let mut stop_check_interval = Vec::new();
@@ -2908,6 +2914,9 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
             if let Some(value) = execution.cuda_device_argmax {
                 cuda_device_argmax.push(value);
             }
+            if let Some(value) = execution.residual_branches_prescaled {
+                residual_branches_prescaled.push(value);
+            }
             if let Some(value) = execution.deferred_stop_check {
                 deferred_stop_check.push(value);
             }
@@ -2939,6 +2948,7 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         && dense_decode_max_tokens.is_empty()
         && audio_embedding_cache_hit.is_empty()
         && cuda_device_argmax.is_empty()
+        && residual_branches_prescaled.is_empty()
         && deferred_stop_check.is_empty()
         && chunked_stop_check.is_empty()
         && stop_check_interval.is_empty()
@@ -2971,6 +2981,7 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     summarize_count("dense_max", &dense_decode_max_tokens);
     summarize_bool_count("audio_cache", &audio_embedding_cache_hit);
     summarize_bool_count("cuda_argmax", &cuda_device_argmax);
+    summarize_bool_count("resid_prescale", &residual_branches_prescaled);
     summarize_bool_count("defer_stop", &deferred_stop_check);
     summarize_bool_count("chunk_stop", &chunked_stop_check);
     summarize_count("stop_interval", &stop_check_interval);
@@ -3452,6 +3463,7 @@ mod tests {
                 "dense_decode_max_tokens": 384,
                 "audio_embedding_cache_hit": true,
                 "cuda_device_argmax": true,
+                "residual_branches_prescaled": true,
                 "deferred_stop_check": true,
                 "chunked_stop_check": true,
                 "stop_check_interval": 8
@@ -3482,6 +3494,7 @@ mod tests {
         assert_eq!(execution.dense_decode_max_tokens, Some(384));
         assert_eq!(execution.audio_embedding_cache_hit, Some(true));
         assert_eq!(execution.cuda_device_argmax, Some(true));
+        assert_eq!(execution.residual_branches_prescaled, Some(true));
         assert_eq!(execution.deferred_stop_check, Some(true));
         assert_eq!(execution.chunked_stop_check, Some(true));
         assert_eq!(execution.stop_check_interval, Some(8));

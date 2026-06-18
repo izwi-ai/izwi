@@ -37,6 +37,7 @@ pub struct GraniteSpeechGenerationStats {
     pub dense_decode_cache_enabled: bool,
     pub dense_head_decode_enabled: bool,
     pub cuda_device_argmax: bool,
+    pub residual_branches_prescaled: bool,
     pub deferred_stop_check: bool,
     pub chunked_stop_check: bool,
     pub stop_check_interval: usize,
@@ -267,6 +268,17 @@ fn granite_mlp_try_fused_silu_mul(device: &Device) -> bool {
 
 fn granite_mlp_fused_silu_mul_policy(is_metal: bool) -> bool {
     !is_metal
+}
+
+fn granite_residual_prescale_enabled(device: &Device) -> bool {
+    let override_enabled = std::env::var("IZWI_GRANITE_RESIDUAL_PRESCALE")
+        .ok()
+        .and_then(|raw| parse_env_bool(&raw));
+    granite_residual_prescale_policy(device.is_metal(), override_enabled)
+}
+
+fn granite_residual_prescale_policy(_is_metal: bool, override_enabled: Option<bool>) -> bool {
+    override_enabled.unwrap_or(false)
 }
 
 fn granite_deferred_stop_check_enabled(
@@ -689,6 +701,7 @@ impl GraniteSpeechRuntime {
                 dense_decode_cache_enabled,
                 dense_head_decode_enabled,
                 cuda_device_argmax,
+                residual_branches_prescaled: self.text_model.residual_branches_prescaled(),
                 deferred_stop_check,
                 chunked_stop_check,
                 stop_check_interval,
@@ -1436,6 +1449,7 @@ struct GraniteLanguageModel {
     lm_head: Linear,
     cfg: GraniteTextConfig,
     device: Device,
+    residual_branches_prescaled: bool,
 }
 
 impl GraniteLanguageModel {
@@ -1446,10 +1460,12 @@ impl GraniteLanguageModel {
             vb.pp("model.embed_tokens"),
         )?;
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        let residual_branches_prescaled = granite_residual_prescale_enabled(vb.device());
         for idx in 0..config.num_hidden_layers {
             layers.push(GraniteDecoderLayer::load(
                 config,
                 vb.pp(format!("model.layers.{idx}")),
+                residual_branches_prescaled,
             )?);
         }
         let norm =
@@ -1466,11 +1482,16 @@ impl GraniteLanguageModel {
             lm_head,
             cfg: config.clone(),
             device: vb.device().clone(),
+            residual_branches_prescaled,
         })
     }
 
     fn num_layers(&self) -> usize {
         self.layers.len()
+    }
+
+    fn residual_branches_prescaled(&self) -> bool {
+        self.residual_branches_prescaled
     }
 
     fn embeddings(&self, input_ids: &[u32]) -> Result<Tensor> {
@@ -1619,24 +1640,34 @@ struct GraniteDecoderLayer {
     post_attention_layernorm: RmsNorm,
     mlp: GraniteTextMlp,
     residual_multiplier: f32,
+    residual_branches_prescaled: bool,
 }
 
 impl GraniteDecoderLayer {
-    fn load(config: &GraniteTextConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(
+        config: &GraniteTextConfig,
+        vb: VarBuilder,
+        residual_branches_prescaled: bool,
+    ) -> Result<Self> {
         Ok(Self {
             input_layernorm: candle_nn::rms_norm(
                 config.hidden_size,
                 config.rms_norm_eps,
                 vb.pp("input_layernorm"),
             )?,
-            self_attn: GraniteTextAttention::load(config, vb.pp("self_attn"))?,
+            self_attn: GraniteTextAttention::load(
+                config,
+                vb.pp("self_attn"),
+                residual_branches_prescaled,
+            )?,
             post_attention_layernorm: candle_nn::rms_norm(
                 config.hidden_size,
                 config.rms_norm_eps,
                 vb.pp("post_attention_layernorm"),
             )?,
-            mlp: GraniteTextMlp::load(config, vb.pp("mlp"))?,
+            mlp: GraniteTextMlp::load(config, vb.pp("mlp"), residual_branches_prescaled)?,
             residual_multiplier: config.residual_multiplier,
+            residual_branches_prescaled,
         })
     }
 
@@ -1670,7 +1701,8 @@ impl GraniteDecoderLayer {
                 .forward(&normed, start_pos, cache, layer_idx, rope, None)?
         };
         let residual_start = profile_start(profiling);
-        let x = residual.broadcast_add(&(attn * self.residual_multiplier as f64)?)?;
+        let attn = self.scale_residual_branch(attn)?;
+        let x = residual.broadcast_add(&attn)?;
         if let Some(profile) = profile.as_deref_mut() {
             profile.residual += profile_elapsed(residual_start);
         }
@@ -1686,11 +1718,20 @@ impl GraniteDecoderLayer {
             self.mlp.forward(&normed, None)?
         };
         let residual_start = profile_start(profiling);
-        let out = residual.broadcast_add(&(mlp * self.residual_multiplier as f64)?)?;
+        let mlp = self.scale_residual_branch(mlp)?;
+        let out = residual.broadcast_add(&mlp)?;
         if let Some(profile) = profile.as_deref_mut() {
             profile.residual += profile_elapsed(residual_start);
         }
         Ok(out)
+    }
+
+    fn scale_residual_branch(&self, branch: Tensor) -> Result<Tensor> {
+        if self.residual_branches_prescaled {
+            Ok(branch)
+        } else {
+            (branch * self.residual_multiplier as f64).map_err(Error::from)
+        }
     }
 }
 
@@ -1796,14 +1837,19 @@ struct GraniteTextAttention {
 }
 
 impl GraniteTextAttention {
-    fn load(config: &GraniteTextConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(config: &GraniteTextConfig, vb: VarBuilder, prescale_residual: bool) -> Result<Self> {
         let head_dim = config.hidden_size / config.num_attention_heads;
+        let o_proj = linear_no_bias(
+            config.num_attention_heads * head_dim,
+            config.hidden_size,
+            vb.pp("o_proj"),
+        )?;
         Ok(Self {
             qkv_proj: GraniteTextQkvProjection::load(config, head_dim, vb.clone())?,
-            o_proj: linear_no_bias(
-                config.num_attention_heads * head_dim,
-                config.hidden_size,
-                vb.pp("o_proj"),
+            o_proj: maybe_prescale_residual_linear(
+                o_proj,
+                config.residual_multiplier,
+                prescale_residual,
             )?,
             num_heads: config.num_attention_heads,
             num_kv_heads: config.num_key_value_heads,
@@ -2206,13 +2252,18 @@ struct GraniteTextMlp {
 }
 
 impl GraniteTextMlp {
-    fn load(config: &GraniteTextConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(config: &GraniteTextConfig, vb: VarBuilder, prescale_residual: bool) -> Result<Self> {
+        let down_proj = linear_no_bias(
+            config.intermediate_size,
+            config.hidden_size,
+            vb.pp("down_proj"),
+        )?;
         Ok(Self {
             gate_up_proj: GraniteTextGateUpProjection::load(config, vb.clone())?,
-            down_proj: linear_no_bias(
-                config.intermediate_size,
-                config.hidden_size,
-                vb.pp("down_proj"),
+            down_proj: maybe_prescale_residual_linear(
+                down_proj,
+                config.residual_multiplier,
+                prescale_residual,
             )?,
         })
     }
@@ -2250,6 +2301,23 @@ impl GraniteTextMlp {
         }
         Ok(out)
     }
+}
+
+fn maybe_prescale_residual_linear(
+    linear: Linear,
+    residual_multiplier: f32,
+    enabled: bool,
+) -> Result<Linear> {
+    if !enabled || residual_multiplier == 1.0 {
+        return Ok(linear);
+    }
+    if linear.bias().is_some() {
+        return Err(Error::InferenceError(
+            "Granite residual pre-scaling only supports bias-free projections".to_string(),
+        ));
+    }
+    let weight = (linear.weight() * residual_multiplier as f64)?;
+    Ok(Linear::new(weight, None))
 }
 
 #[cfg(test)]
@@ -2362,12 +2430,8 @@ mod tests {
 
     #[test]
     fn granite_gate_up_projection_fusion_defaults_to_cuda_only() {
-        assert!(!granite_gate_up_projection_fusion_policy(
-            true, false, None
-        ));
-        assert!(granite_gate_up_projection_fusion_policy(
-            false, true, None
-        ));
+        assert!(!granite_gate_up_projection_fusion_policy(true, false, None));
+        assert!(granite_gate_up_projection_fusion_policy(false, true, None));
         assert!(!granite_gate_up_projection_fusion_policy(
             false, false, None
         ));
@@ -2387,6 +2451,38 @@ mod tests {
     fn granite_mlp_fused_silu_mul_skips_metal_wrapper() {
         assert!(!granite_mlp_fused_silu_mul_policy(true));
         assert!(granite_mlp_fused_silu_mul_policy(false));
+    }
+
+    #[test]
+    fn granite_residual_prescale_policy_is_opt_in() {
+        assert!(!granite_residual_prescale_policy(true, None));
+        assert!(!granite_residual_prescale_policy(false, None));
+        assert!(granite_residual_prescale_policy(false, Some(true)));
+        assert!(granite_residual_prescale_policy(true, Some(true)));
+        assert!(!granite_residual_prescale_policy(true, Some(false)));
+    }
+
+    #[test]
+    fn residual_prescaled_linear_matches_post_projection_scale() {
+        let device = Device::Cpu;
+        let weight = Tensor::from_vec(
+            vec![
+                0.5f32, -1.0, 0.25, //
+                1.5, 0.75, -0.5,
+            ],
+            (2, 3),
+            &device,
+        )
+        .unwrap();
+        let input = Tensor::from_vec(vec![2.0f32, -3.0, 4.0], (1, 1, 3), &device).unwrap();
+        let linear = Linear::new(weight, None);
+        let residual_multiplier = 0.22f32;
+
+        let explicit = (linear.forward(&input).unwrap() * residual_multiplier as f64).unwrap();
+        let prescaled = maybe_prescale_residual_linear(linear, residual_multiplier, true).unwrap();
+        let folded = prescaled.forward(&input).unwrap();
+
+        assert_tensor_close(&explicit, &folded);
     }
 
     #[test]
