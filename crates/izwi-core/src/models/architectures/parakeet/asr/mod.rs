@@ -1,8 +1,10 @@
 mod decode;
+mod metal_kernels;
 mod nemo;
 mod preprocessor;
 
 use std::path::Path;
+use std::time::Instant;
 
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::ops;
@@ -33,6 +35,42 @@ const CONV_KERNEL_1D: usize = 9;
 const SUBSAMPLING_FACTOR: usize = 8;
 const FRAME_HOP_MS: f32 = 10.0;
 const DEFAULT_MAX_SYMBOLS: usize = 10;
+
+pub struct ParakeetAsrTranscriptionOutput {
+    pub text: String,
+    pub language: Option<String>,
+    pub diagnostics: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ParakeetTimings {
+    resample_ms: f64,
+    feature_extract_ms: f64,
+    feature_upload_ms: f64,
+    pre_encode_ms: f64,
+    pos_emb_ms: f64,
+    encoder_layers_ms: f64,
+    tdt_decode_ms: f64,
+    model_total_ms: f64,
+}
+
+impl ParakeetTimings {
+    fn mel_prepare_ms(&self) -> f64 {
+        self.feature_extract_ms + self.feature_upload_ms
+    }
+
+    fn encoder_forward_ms(&self) -> f64 {
+        self.pre_encode_ms + self.pos_emb_ms + self.encoder_layers_ms
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct ParakeetDecodeCounters {
+    tdt_joint_steps: usize,
+    tdt_emitted_tokens: usize,
+    tdt_blank_steps: usize,
+    host_argmax_reads: usize,
+}
 
 pub struct ParakeetAsrModel {
     variant: ModelVariant,
@@ -138,28 +176,64 @@ impl ParakeetAsrModel {
         self.transcribe_with_callback(audio, sample_rate, language, &mut no_op)
     }
 
+    pub fn transcribe_with_details(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+    ) -> Result<ParakeetAsrTranscriptionOutput> {
+        let mut no_op = |_delta: &str| {};
+        self.transcribe_with_callback_internal(audio, sample_rate, language, &mut no_op)
+    }
+
     pub fn transcribe_with_callback(
         &self,
         audio: &[f32],
         sample_rate: u32,
-        _language: Option<&str>,
+        language: Option<&str>,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<String> {
+        Ok(self
+            .transcribe_with_callback_internal(audio, sample_rate, language, on_delta)?
+            .text)
+    }
+
+    fn transcribe_with_callback_internal(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ParakeetAsrTranscriptionOutput> {
         if audio.is_empty() {
             return Err(Error::InvalidInput("Empty audio input".to_string()));
         }
 
+        let model_started = Instant::now();
+        let mut timings = ParakeetTimings::default();
+        let resample_started = Instant::now();
         let mono_16khz = if sample_rate == SAMPLE_RATE {
             audio.to_vec()
         } else {
             resample_linear(audio, sample_rate, SAMPLE_RATE)
         };
+        timings.resample_ms = elapsed_ms(resample_started);
 
-        let (features, feature_frames) = self.preprocessor.compute_features(&mono_16khz)?;
-        let (encoded, encoded_len) = self.network.encode(&features, feature_frames)?;
+        let feature_started = Instant::now();
+        let (features, feature_frames, feature_upload_ms) = self
+            .preprocessor
+            .compute_features_with_upload_timing(&mono_16khz)?;
+        let feature_prepare_ms = elapsed_ms(feature_started);
+        timings.feature_upload_ms = feature_upload_ms;
+        timings.feature_extract_ms = (feature_prepare_ms - feature_upload_ms).max(0.0);
+
+        let (encoded, encoded_len) =
+            self.network
+                .encode_with_timings(&features, feature_frames, &mut timings)?;
 
         let mut token_ids = Vec::<usize>::new();
         let mut assembled = String::new();
+        let mut decode_counters = ParakeetDecodeCounters::default();
 
         let mut on_token = |token_id: usize| {
             token_ids.push(token_id);
@@ -171,20 +245,44 @@ impl ParakeetAsrModel {
             assembled = decoded;
         };
 
+        let decode_started = Instant::now();
         self.network.decode_tdt_greedy(
             &encoded,
             encoded_len,
             self.blank_idx,
             self.num_durations,
             self.max_symbols,
+            &mut decode_counters,
             &mut on_token,
         )?;
+        timings.tdt_decode_ms = elapsed_ms(decode_started);
 
         if assembled.is_empty() {
             assembled = self.decoder.decode(&token_ids);
         }
 
-        Ok(assembled)
+        decode_counters.tdt_emitted_tokens = token_ids.len();
+        timings.model_total_ms = elapsed_ms(model_started);
+
+        let diagnostics = parakeet_diagnostics_json(
+            &self.variant,
+            &features,
+            &timings,
+            &decode_counters,
+            sample_rate,
+            audio.len(),
+            mono_16khz.len(),
+            feature_frames,
+            encoded_len,
+            language,
+            self.max_symbols,
+        );
+
+        Ok(ParakeetAsrTranscriptionOutput {
+            text: assembled,
+            language: language.map(ToString::to_string),
+            diagnostics: Some(diagnostics),
+        })
     }
 }
 
@@ -211,6 +309,89 @@ fn load_mlx_decoder(model_dir: &Path) -> Result<ParakeetDecoder> {
 
 fn select_device_for_parakeet(device_profile: &DeviceProfile) -> Device {
     device_profile.device.clone()
+}
+
+fn parakeet_diagnostics_json(
+    variant: &ModelVariant,
+    features: &Tensor,
+    timings: &ParakeetTimings,
+    decode: &ParakeetDecodeCounters,
+    input_sample_rate: u32,
+    input_samples: usize,
+    resampled_samples: usize,
+    feature_frames: usize,
+    encoded_frames: usize,
+    requested_language: Option<&str>,
+    max_symbols: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "model_family": "parakeet_tdt",
+        "model": variant.dir_name(),
+        "audio": {
+            "input_sample_rate": input_sample_rate,
+            "sample_rate": SAMPLE_RATE,
+            "input_samples": input_samples,
+            "resampled_samples": resampled_samples,
+            "duration_seconds": resampled_samples as f64 / SAMPLE_RATE as f64,
+            "feature_frames": feature_frames,
+            "encoded_frames": encoded_frames,
+            "subsampling_factor": SUBSAMPLING_FACTOR,
+            "frame_hop_ms": FRAME_HOP_MS,
+        },
+        "prompt": {
+            "language": requested_language,
+        },
+        "decode": {
+            "tdt_joint_steps": decode.tdt_joint_steps,
+            "tdt_emitted_tokens": decode.tdt_emitted_tokens,
+            "tdt_blank_steps": decode.tdt_blank_steps,
+            "host_argmax_reads": decode.host_argmax_reads,
+            "generated_tokens": decode.tdt_emitted_tokens,
+            "max_symbols_per_frame": max_symbols,
+        },
+        "execution": {
+            "device_kind": parakeet_device_kind(features.device()),
+            "encoder_layers": ENCODER_LAYERS,
+            "encoder_dim": ENCODER_DIM,
+            "encoder_heads": ENCODER_HEADS,
+            "encoder_head_dim": ENCODER_HEAD_DIM,
+            "conformer_conv_kernel": CONV_KERNEL_1D,
+            "depthwise_conv1d_groups": ENCODER_DIM,
+            "subsampling_channels": CONV_SUB_CHANNELS,
+            "metal_softmax_last_dim": features.device().is_metal(),
+            "metal_depthwise_conv1d": metal_kernels::depthwise_conv1d_enabled_for_device(features.device()),
+            "metal_depthwise_conv2d": metal_kernels::depthwise_conv2d_enabled_for_device(features.device()),
+            "conformer_conv_fused": metal_kernels::depthwise_conv1d_bias_swish_enabled_for_device(features.device()),
+        },
+        "timings_ms": {
+            "resample": timings.resample_ms,
+            "feature_extract": timings.feature_extract_ms,
+            "feature_upload": timings.feature_upload_ms,
+            "mel_prepare": timings.mel_prepare_ms(),
+            "mel": timings.mel_prepare_ms(),
+            "pre_encode": timings.pre_encode_ms,
+            "pos_emb": timings.pos_emb_ms,
+            "encoder_layers": timings.encoder_layers_ms,
+            "encoder_forward": timings.encoder_forward_ms(),
+            "tdt_decode": timings.tdt_decode_ms,
+            "decode": timings.tdt_decode_ms,
+            "model_total": timings.model_total_ms,
+        },
+    })
+}
+
+fn parakeet_device_kind(device: &Device) -> &'static str {
+    if device.is_metal() {
+        "Metal"
+    } else if device.is_cuda() {
+        "Cuda"
+    } else {
+        "Cpu"
+    }
+}
+
+fn elapsed_ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
 }
 
 struct ParakeetNetwork {
@@ -250,13 +431,30 @@ impl ParakeetNetwork {
     }
 
     fn encode(&self, features: &Tensor, feature_frames: usize) -> Result<(Tensor, usize)> {
-        let (mut x, encoded_len) = self.pre_encode.forward(features, feature_frames)?;
+        let mut timings = ParakeetTimings::default();
+        self.encode_with_timings(features, feature_frames, &mut timings)
+    }
 
+    fn encode_with_timings(
+        &self,
+        features: &Tensor,
+        feature_frames: usize,
+        timings: &mut ParakeetTimings,
+    ) -> Result<(Tensor, usize)> {
+        let pre_encode_started = Instant::now();
+        let (mut x, encoded_len) = self.pre_encode.forward(features, feature_frames)?;
+        timings.pre_encode_ms = elapsed_ms(pre_encode_started);
+
+        let pos_started = Instant::now();
         let pos_len = x.dim(1)?;
         let pos_emb = build_rel_positional_embedding(pos_len, ENCODER_DIM, x.device())?;
+        timings.pos_emb_ms = elapsed_ms(pos_started);
+
+        let layers_started = Instant::now();
         for layer in &self.layers {
             x = layer.forward(&x, &pos_emb)?;
         }
+        timings.encoder_layers_ms = elapsed_ms(layers_started);
 
         Ok((x, encoded_len))
     }
@@ -268,6 +466,7 @@ impl ParakeetNetwork {
         blank_idx: usize,
         num_durations: usize,
         max_symbols: usize,
+        counters: &mut ParakeetDecodeCounters,
         on_token: &mut dyn FnMut(usize),
     ) -> Result<()> {
         let encoded = encoded.i((0, ..encoded_len, ..))?; // [T, D]
@@ -301,6 +500,8 @@ impl ParakeetNetwork {
             let token_logits = logits.i(..(blank_idx + 1))?;
             let duration_logits = logits.i((blank_idx + 1)..)?;
 
+            counters.tdt_joint_steps = counters.tdt_joint_steps.saturating_add(1);
+            counters.host_argmax_reads = counters.host_argmax_reads.saturating_add(2);
             let mut label = argmax_1d(&token_logits)?;
             let duration_idx = argmax_1d(&duration_logits)?;
             let mut jump = duration_idx.min(num_durations.saturating_sub(1));
@@ -312,6 +513,7 @@ impl ParakeetNetwork {
             t = t.saturating_add(jump);
 
             while label == blank_idx && t < encoded_len {
+                counters.tdt_blank_steps = counters.tdt_blank_steps.saturating_add(1);
                 let enc_t = encoded.i((t, ..))?.unsqueeze(0)?.unsqueeze(0)?;
                 let logits = self
                     .joint
@@ -323,6 +525,8 @@ impl ParakeetNetwork {
                 let token_logits = logits.i(..(blank_idx + 1))?;
                 let duration_logits = logits.i((blank_idx + 1)..)?;
 
+                counters.tdt_joint_steps = counters.tdt_joint_steps.saturating_add(1);
+                counters.host_argmax_reads = counters.host_argmax_reads.saturating_add(2);
                 label = argmax_1d(&token_logits)?;
                 let duration_idx = argmax_1d(&duration_logits)?;
                 jump = duration_idx.min(num_durations.saturating_sub(1));
@@ -436,11 +640,11 @@ impl ConvSubsamplingDw {
         x = self.conv0.forward(&x)?;
         x = x.relu()?;
 
-        x = self.conv2.forward(&x)?;
+        x = forward_depthwise_conv2d(&self.conv2, &x)?;
         x = self.conv3.forward(&x)?;
         x = x.relu()?;
 
-        x = self.conv5.forward(&x)?;
+        x = forward_depthwise_conv2d(&self.conv5, &x)?;
         x = self.conv6.forward(&x)?;
         x = x.relu()?;
 
@@ -455,6 +659,25 @@ impl ConvSubsamplingDw {
         let encoded_len = subsampled_len_3x(feature_frames).min(t);
         Ok((x, encoded_len))
     }
+}
+
+fn forward_depthwise_conv2d(conv: &Conv2d, x: &Tensor) -> Result<Tensor> {
+    let Some(mut x) = metal_kernels::try_depthwise_conv2d(
+        x,
+        conv.weight(),
+        conv.config().padding,
+        conv.config().stride,
+        conv.config().dilation,
+    ) else {
+        return conv.forward(x).map_err(Error::from);
+    };
+
+    if let Some(bias) = conv.bias() {
+        let b = bias.dims1()?;
+        x = x.broadcast_add(&bias.reshape((1, b, 1, 1))?)?;
+    }
+
+    Ok(x)
 }
 
 fn subsampled_len_3x(mut len: usize) -> usize {
@@ -552,6 +775,8 @@ impl FeedForward {
 struct ConformerConv {
     pointwise_conv1: Conv1d,
     depthwise_conv: Conv1d,
+    folded_depthwise_weight: Tensor,
+    folded_depthwise_bias: Tensor,
     batch_norm: candle_nn::BatchNorm,
     pointwise_conv2: Conv1d,
 }
@@ -579,6 +804,8 @@ impl ConformerConv {
         )?;
 
         let batch_norm = batch_norm(ENCODER_DIM, 1e-5, vb.pp("batch_norm"))?;
+        let (folded_depthwise_weight, folded_depthwise_bias) =
+            fold_depthwise_conv1d_batch_norm(&depthwise_conv, &batch_norm)?;
 
         let pointwise_conv2 = mlx::load_conv1d_no_bias(
             ENCODER_DIM,
@@ -591,6 +818,8 @@ impl ConformerConv {
         Ok(Self {
             pointwise_conv1,
             depthwise_conv,
+            folded_depthwise_weight,
+            folded_depthwise_bias,
             batch_norm,
             pointwise_conv2,
         })
@@ -605,13 +834,60 @@ impl ConformerConv {
         let x_b = x.i((.., ENCODER_DIM.., ..))?;
         x = x_a.broadcast_mul(&ops::sigmoid(&x_b)?)?;
 
-        x = self.depthwise_conv.forward(&x)?;
-        x = self.batch_norm.forward_t(&x, false)?;
-        x = swish(&x)?;
+        if let Some(fused) = metal_kernels::try_depthwise_conv1d_bias_swish(
+            &x,
+            &self.folded_depthwise_weight,
+            &self.folded_depthwise_bias,
+            self.depthwise_conv.config().padding,
+            self.depthwise_conv.config().stride,
+            self.depthwise_conv.config().dilation,
+        ) {
+            x = fused;
+        } else {
+            x = if let Some(depthwise) = metal_kernels::try_depthwise_conv1d(
+                &x,
+                self.depthwise_conv.weight(),
+                self.depthwise_conv.config().padding,
+                self.depthwise_conv.config().stride,
+                self.depthwise_conv.config().dilation,
+            ) {
+                depthwise
+            } else {
+                self.depthwise_conv.forward(&x)?
+            };
+            x = self.batch_norm.forward_t(&x, false)?;
+            x = swish(&x)?;
+        }
         x = self.pointwise_conv2.forward(&x)?;
 
         x.transpose(1, 2).map_err(Error::from)
     }
+}
+
+fn fold_depthwise_conv1d_batch_norm(
+    conv: &Conv1d,
+    batch_norm: &candle_nn::BatchNorm,
+) -> Result<(Tensor, Tensor)> {
+    let std = (batch_norm.running_var() + batch_norm.eps())?.sqrt()?;
+    let scale = match batch_norm.weight_and_bias() {
+        Some((weight, _bias)) => weight.broadcast_div(&std)?,
+        None => std.recip()?,
+    };
+    let folded_bias = match batch_norm.weight_and_bias() {
+        Some((_weight, bias)) => {
+            bias.broadcast_sub(&scale.broadcast_mul(batch_norm.running_mean())?)?
+        }
+        None => scale
+            .broadcast_mul(batch_norm.running_mean())?
+            .affine(-1.0, 0.0)?,
+    };
+
+    let channels = scale.dim(0)?;
+    let folded_weight = conv
+        .weight()
+        .broadcast_mul(&scale.reshape((channels, 1, 1))?)?;
+
+    Ok((folded_weight, folded_bias))
 }
 
 struct RelPosSelfAttention {
@@ -694,7 +970,12 @@ impl RelPosSelfAttention {
         let scores = matrix_ac
             .broadcast_add(&matrix_bd)?
             .affine(1.0 / (ENCODER_HEAD_DIM as f64).sqrt(), 0.0)?;
-        let attn = ops::softmax(&scores, 3)?;
+        let scores = if scores.is_contiguous() {
+            scores
+        } else {
+            scores.contiguous()?
+        };
+        let attn = ops::softmax_last_dim(&scores)?;
 
         let out = attn.matmul(&v)?;
         let out = out.transpose(1, 2)?.reshape((b, t, ENCODER_DIM))?;

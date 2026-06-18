@@ -23,7 +23,9 @@ use crate::models::architectures::lfm25_audio::{
 use crate::models::architectures::nemotron::asr::{
     NemotronAsrDecodeStep, NemotronAsrModel, NemotronAsrTranscriptionOutput, NemotronStreamingState,
 };
-use crate::models::architectures::parakeet::asr::ParakeetAsrModel;
+use crate::models::architectures::parakeet::asr::{
+    ParakeetAsrModel, ParakeetAsrTranscriptionOutput,
+};
 use crate::models::architectures::qwen3::asr::{
     AsrDecodeState as Qwen3AsrDecodeState, AsrDecodeStep as Qwen3AsrDecodeStep,
     AsrTranscriptionOutput as Qwen3AsrTranscriptionOutput, Qwen3AsrModel,
@@ -728,11 +730,18 @@ impl NativeAsrModel {
                     diagnostics,
                 })
             }
-            Self::Parakeet(model) => Ok(NativeAsrTranscription {
-                text: model.transcribe(audio, sample_rate, language)?,
-                language: language.map(|value| value.to_string()),
-                diagnostics: None,
-            }),
+            Self::Parakeet(model) => {
+                let ParakeetAsrTranscriptionOutput {
+                    text,
+                    language,
+                    diagnostics,
+                } = model.transcribe_with_details(audio, sample_rate, language)?;
+                Ok(NativeAsrTranscription {
+                    text,
+                    language,
+                    diagnostics,
+                })
+            }
             Self::Nemotron(model) => {
                 let NemotronAsrTranscriptionOutput {
                     text,
