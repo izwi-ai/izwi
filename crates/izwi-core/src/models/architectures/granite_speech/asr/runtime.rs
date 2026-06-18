@@ -247,12 +247,29 @@ fn granite_rope_kernel_enabled(device: &Device, dtype: DType, head_dim: usize) -
     matches!(dtype, DType::F16 | DType::BF16 | DType::F32)
 }
 
+fn granite_rope_bhtd_kernel_enabled(device: &Device, dtype: DType, head_dim: usize) -> bool {
+    let override_enabled = std::env::var("IZWI_GRANITE_ROPE_BHTD_KERNEL")
+        .ok()
+        .and_then(|raw| parse_env_bool(&raw));
+    if !granite_rope_bhtd_kernel_policy(device.is_metal(), override_enabled) {
+        return false;
+    }
+    if head_dim == 0 || head_dim % 2 != 0 {
+        return false;
+    }
+    matches!(dtype, DType::F16 | DType::BF16 | DType::F32)
+}
+
 fn granite_rope_kernel_policy(
     _is_metal: bool,
     is_cuda: bool,
     override_enabled: Option<bool>,
 ) -> bool {
     override_enabled.unwrap_or(is_cuda)
+}
+
+fn granite_rope_bhtd_kernel_policy(is_metal: bool, override_enabled: Option<bool>) -> bool {
+    override_enabled.unwrap_or(is_metal)
 }
 
 fn granite_native_greedy_logits_enabled() -> bool {
@@ -1890,7 +1907,19 @@ impl GraniteTextAttention {
                 q.dtype(),
             )?,
         };
-        if granite_rope_kernel_enabled(q.device(), q.dtype(), self.head_dim) {
+        if granite_rope_bhtd_kernel_enabled(q.device(), q.dtype(), self.head_dim) {
+            if let Some((q_out, k_out)) = try_apply_granite_rope_pair_bhtd(&q, &k, &cos, &sin)? {
+                record_rope_kernel();
+                record_rope_kernel();
+                q = q_out;
+                k = k_out;
+            } else {
+                record_rope_manual();
+                record_rope_manual();
+                q = apply_rotary_emb(&q, &cos, &sin)?;
+                k = apply_rotary_emb(&k, &cos, &sin)?;
+            }
+        } else if granite_rope_kernel_enabled(q.device(), q.dtype(), self.head_dim) {
             let cos_kernel = cos.unsqueeze(0)?.contiguous()?;
             let sin_kernel = sin.unsqueeze(0)?.contiguous()?;
             if let Some((q_out, k_out)) =
@@ -2043,6 +2072,29 @@ fn apply_rotary_emb(x: &Tensor, cos_half: &Tensor, sin_half: &Tensor) -> Result<
         .broadcast_mul(&sin)?
         .broadcast_add(&x2.broadcast_mul(&cos)?)?;
     Tensor::cat(&[first, second], 3).map_err(Error::from)
+}
+
+fn try_apply_granite_rope_pair_bhtd(
+    q: &Tensor,
+    k: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+) -> Result<Option<(Tensor, Tensor)>> {
+    let kernel_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let q_heads = q.transpose(1, 2)?.contiguous()?;
+        let k_heads = k.transpose(1, 2)?.contiguous()?;
+        let q_out = rotary_emb::rope(&q_heads, cos, sin)?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k_out = rotary_emb::rope(&k_heads, cos, sin)?
+            .transpose(1, 2)?
+            .contiguous()?;
+        candle_core::Result::<(Tensor, Tensor)>::Ok((q_out, k_out))
+    }));
+    match kernel_result {
+        Ok(Ok((q_out, k_out))) => Ok(Some((q_out, k_out))),
+        Ok(Err(_)) | Err(_) => Ok(None),
+    }
 }
 
 fn try_apply_granite_rope_pair_thd(
@@ -2495,6 +2547,14 @@ mod tests {
     }
 
     #[test]
+    fn granite_rope_bhtd_kernel_defaults_to_metal_only() {
+        assert!(granite_rope_bhtd_kernel_policy(true, None));
+        assert!(!granite_rope_bhtd_kernel_policy(false, None));
+        assert!(granite_rope_bhtd_kernel_policy(false, Some(true)));
+        assert!(!granite_rope_bhtd_kernel_policy(true, Some(false)));
+    }
+
+    #[test]
     fn granite_manual_rotary_matches_rope_thd() {
         let device = Device::Cpu;
         let seq_len = 4usize;
@@ -2521,6 +2581,43 @@ mod tests {
         .expect("kernel output");
 
         assert_tensor_close(&manual, &kernel);
+    }
+
+    #[test]
+    fn granite_manual_rotary_matches_rope_bhtd() {
+        let device = Device::Cpu;
+        let seq_len = 4usize;
+        let head_dim = 8usize;
+        let q_heads = 2usize;
+        let k_heads = 1usize;
+        let q = Tensor::from_vec(
+            (0..(seq_len * q_heads * head_dim))
+                .map(|v| (v as f32) * 0.01)
+                .collect::<Vec<_>>(),
+            (1, seq_len, q_heads, head_dim),
+            &device,
+        )
+        .expect("q");
+        let k = Tensor::from_vec(
+            (0..(seq_len * k_heads * head_dim))
+                .map(|v| (v as f32) * -0.02)
+                .collect::<Vec<_>>(),
+            (1, seq_len, k_heads, head_dim),
+            &device,
+        )
+        .expect("k");
+        let (cos, sin) =
+            build_rope_cache(seq_len, head_dim, 0, 10000.0, &device, DType::F32).expect("cache");
+
+        let q_manual = apply_rotary_emb(&q, &cos, &sin).expect("manual q");
+        let k_manual = apply_rotary_emb(&k, &cos, &sin).expect("manual k");
+        let (q_kernel, k_kernel) =
+            try_apply_granite_rope_pair_bhtd(&q, &k, &cos, &sin)
+                .expect("kernel result")
+                .expect("kernel output");
+
+        assert_tensor_close(&q_manual, &q_kernel);
+        assert_tensor_close(&k_manual, &k_kernel);
     }
 
     #[test]
