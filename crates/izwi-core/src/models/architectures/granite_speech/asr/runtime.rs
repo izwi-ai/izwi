@@ -38,6 +38,8 @@ pub struct GraniteSpeechGenerationStats {
     pub dense_head_decode_enabled: bool,
     pub cuda_device_argmax: bool,
     pub residual_branches_prescaled: bool,
+    pub dense_decode_preallocated: bool,
+    pub dense_decode_initial_capacity: usize,
     pub deferred_stop_check: bool,
     pub chunked_stop_check: bool,
     pub stop_check_interval: usize,
@@ -298,6 +300,31 @@ fn granite_residual_prescale_policy(_is_metal: bool, override_enabled: Option<bo
     override_enabled.unwrap_or(false)
 }
 
+fn granite_dense_decode_preallocate_enabled(device: &Device) -> bool {
+    let override_enabled = std::env::var("IZWI_GRANITE_DENSE_CACHE_PREALLOCATE")
+        .ok()
+        .and_then(|raw| parse_env_bool(&raw));
+    granite_dense_decode_preallocate_policy(device.is_metal(), override_enabled)
+}
+
+fn granite_dense_decode_preallocate_policy(
+    is_metal: bool,
+    override_enabled: Option<bool>,
+) -> bool {
+    override_enabled.unwrap_or(is_metal)
+}
+
+fn granite_dense_decode_initial_capacity(
+    device: &Device,
+    prompt_tokens: usize,
+    max_new_tokens: usize,
+) -> usize {
+    if !granite_dense_decode_preallocate_enabled(device) {
+        return 0;
+    }
+    prompt_tokens.saturating_add(max_new_tokens.max(1))
+}
+
 fn granite_deferred_stop_check_enabled(
     device: &Device,
     decode_each_step: bool,
@@ -497,11 +524,15 @@ impl GraniteSpeechRuntime {
             .first()
             .copied()
             .ok_or_else(|| Error::InvalidInput("Granite prompt has no audio token".to_string()))?;
+        let max_steps = max_new_tokens.max(1);
+        let dense_decode_initial_capacity =
+            granite_dense_decode_initial_capacity(&self.device, input_ids.len(), max_steps);
 
-        let mut cache = Qwen3Cache::with_page_size_and_dense_decode(
+        let mut cache = Qwen3Cache::with_page_size_and_dense_decode_initial_capacity(
             self.text_model.num_layers(),
             default_kv_page_size(),
             &self.device,
+            dense_decode_initial_capacity,
         );
         let dense_decode_max_tokens = cache.dense_decode_max_tokens();
         let dense_decode_cache_enabled = dense_decode_max_tokens > 0;
@@ -525,7 +556,6 @@ impl GraniteSpeechRuntime {
         let mut stop_token = None;
         let stop_tokens = stop_token_set(special_tokens, extra_stop_token_ids);
         let decode_each_step = emit_deltas || !stop_sequences.is_empty();
-        let max_steps = max_new_tokens.max(1);
         let deferred_stop_check =
             granite_deferred_stop_check_enabled(&self.device, decode_each_step, max_steps);
         let chunked_stop_check = !deferred_stop_check
@@ -719,6 +749,8 @@ impl GraniteSpeechRuntime {
                 dense_head_decode_enabled,
                 cuda_device_argmax,
                 residual_branches_prescaled: self.text_model.residual_branches_prescaled(),
+                dense_decode_preallocated: dense_decode_initial_capacity > 0,
+                dense_decode_initial_capacity,
                 deferred_stop_check,
                 chunked_stop_check,
                 stop_check_interval,
@@ -2512,6 +2544,14 @@ mod tests {
         assert!(granite_residual_prescale_policy(false, Some(true)));
         assert!(granite_residual_prescale_policy(true, Some(true)));
         assert!(!granite_residual_prescale_policy(true, Some(false)));
+    }
+
+    #[test]
+    fn granite_dense_decode_preallocate_defaults_to_metal_only() {
+        assert!(granite_dense_decode_preallocate_policy(true, None));
+        assert!(!granite_dense_decode_preallocate_policy(false, None));
+        assert!(granite_dense_decode_preallocate_policy(false, Some(true)));
+        assert!(!granite_dense_decode_preallocate_policy(true, Some(false)));
     }
 
     #[test]
