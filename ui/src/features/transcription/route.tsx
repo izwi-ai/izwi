@@ -30,6 +30,7 @@ import type { SpeechTextCreationMode } from "@/features/speech-text/creationMode
 import {
   collectManagedModels,
   filterAndSortModels,
+  isGraniteDiarizationVariant,
   isDiarizationPipelineAlignerVariant,
   isDiarizationPipelineAsrVariant,
   isDiarizationPipelineLlmVariant,
@@ -45,6 +46,7 @@ import { Settings2 } from "lucide-react";
 
 const TRANSCRIPTION_PREFERRED_SUMMARY_MODELS = ["Qwen3.5-4B"] as const;
 type ModelModalContext = "transcription" | "diarization";
+type DiarizationPipelineMode = "classic" | "granite";
 
 interface TranscriptionPageProps {
   models: ModelInfo[];
@@ -185,7 +187,16 @@ export function TranscriptionPage({
         return `Download and load ${modelName} in Transcription Models to generate summaries.`;
     }
   }, [resolvedSummaryModel, summaryModelStatus]);
-  const resolvedDiarizationModel = useMemo(
+  const readyGraniteDiarizationModel = useMemo(
+    () =>
+      diarizationModels.find(
+        (model) =>
+          isGraniteDiarizationVariant(model.variant) &&
+          model.status === "ready",
+      ) ?? null,
+    [diarizationModels],
+  );
+  const baseResolvedDiarizationModel = useMemo(
     () =>
       resolvePreferredRouteModel({
         models: diarizationModels,
@@ -195,6 +206,30 @@ export function TranscriptionPage({
       }),
     [diarizationModels, selectedModel],
   );
+  const resolvedDiarizationModel = useMemo(() => {
+    if (!baseResolvedDiarizationModel || !readyGraniteDiarizationModel) {
+      return baseResolvedDiarizationModel;
+    }
+
+    const baseDiarizationModelInfo =
+      diarizationModels.find(
+        (model) => model.variant === baseResolvedDiarizationModel,
+      ) ?? null;
+
+    if (
+      baseDiarizationModelInfo &&
+      !isGraniteDiarizationVariant(baseDiarizationModelInfo.variant) &&
+      baseDiarizationModelInfo.status !== "ready"
+    ) {
+      return readyGraniteDiarizationModel.variant;
+    }
+
+    return baseResolvedDiarizationModel;
+  }, [
+    baseResolvedDiarizationModel,
+    diarizationModels,
+    readyGraniteDiarizationModel,
+  ]);
   const diarizationModelReady =
     resolvedDiarizationModel != null &&
     diarizationModels.some(
@@ -244,9 +279,16 @@ export function TranscriptionPage({
         model.variant === resolvedDiarizationAlignerModel &&
         model.status === "ready",
     );
-  const diarizationPipelineModelsReady =
-    diarizationAsrModelReady && diarizationAlignerModelReady;
-  const diarizationPipelineModels = useMemo(
+  const diarizationPipelineMode: DiarizationPipelineMode =
+    isGraniteDiarizationVariant(resolvedDiarizationModel)
+      ? "granite"
+      : "classic";
+  const usesGraniteDiarizationStandalone =
+    diarizationPipelineMode === "granite";
+  const diarizationPipelineModelsReady = usesGraniteDiarizationStandalone
+    ? diarizationModelReady
+    : diarizationAsrModelReady && diarizationAlignerModelReady;
+  const baseDiarizationPipelineModels = useMemo(
     () => [
       ...diarizationModels,
       ...diarizationAsrPipelineModels,
@@ -260,16 +302,30 @@ export function TranscriptionPage({
       diarizationModels,
     ],
   );
+  const diarizationPipelineModels = useMemo(
+    () =>
+      usesGraniteDiarizationStandalone
+        ? [...diarizationModels, ...diarizationLlmPipelineModels]
+        : baseDiarizationPipelineModels,
+    [
+      baseDiarizationPipelineModels,
+      diarizationLlmPipelineModels,
+      diarizationModels,
+      usesGraniteDiarizationStandalone,
+    ],
+  );
   const diarizationManagedModels = useMemo(
     () =>
       collectManagedModels({
         availableModels: diarizationPipelineModels,
-        managedVariants: [
-          resolvedDiarizationModel,
-          resolvedDiarizationAsrModel,
-          resolvedDiarizationAlignerModel,
-          resolvedDiarizationLlmModel,
-        ],
+        managedVariants: usesGraniteDiarizationStandalone
+          ? [resolvedDiarizationModel]
+          : [
+              resolvedDiarizationModel,
+              resolvedDiarizationAsrModel,
+              resolvedDiarizationAlignerModel,
+              resolvedDiarizationLlmModel,
+            ],
       }),
     [
       diarizationPipelineModels,
@@ -277,6 +333,7 @@ export function TranscriptionPage({
       resolvedDiarizationAsrModel,
       resolvedDiarizationLlmModel,
       resolvedDiarizationModel,
+      usesGraniteDiarizationStandalone,
     ],
   );
   const readyDiarizationManagedModelCount = diarizationManagedModels.filter(
@@ -319,7 +376,7 @@ export function TranscriptionPage({
     ],
     [transcriptionAlignerModels, transcriptionModels, transcriptionSummaryModels],
   );
-  const diarizationModelSections = useMemo(
+  const baseDiarizationModelSections = useMemo(
     () => [
       {
         key: "diarization",
@@ -353,6 +410,15 @@ export function TranscriptionPage({
       diarizationLlmPipelineModels,
       diarizationModels,
     ],
+  );
+  const diarizationModelSections = useMemo(
+    () =>
+      usesGraniteDiarizationStandalone
+        ? baseDiarizationModelSections.filter(
+            (section) => section.key === "diarization" || section.key === "llm",
+          )
+        : baseDiarizationModelSections,
+    [baseDiarizationModelSections, usesGraniteDiarizationStandalone],
   );
   const {
     records,
@@ -785,17 +851,32 @@ export function TranscriptionPage({
                       renderInDialog={false}
                       selectedMode={newSpeechTextMode}
                       onSelectMode={setNewSpeechTextMode}
+                      pipelineMode={diarizationPipelineMode}
                       selectedModel={resolvedDiarizationModel}
                       selectedModelReady={diarizationModelReady}
-                      pipelineAsrModelId={resolvedDiarizationAsrModel}
-                      pipelineAlignerModelId={resolvedDiarizationAlignerModel}
+                      pipelineAsrModelId={
+                        usesGraniteDiarizationStandalone
+                          ? null
+                          : resolvedDiarizationAsrModel
+                      }
+                      pipelineAlignerModelId={
+                        usesGraniteDiarizationStandalone
+                          ? null
+                          : resolvedDiarizationAlignerModel
+                      }
                       pipelineLlmModelId={resolvedDiarizationLlmModel}
                       pipelineModelsReady={diarizationPipelineModelsReady}
                       onModelRequired={() => {
+                        openDiarizationModelManager();
                         onError("Select and load a diarization model to start.");
                       }}
                       onPipelineModelsRequired={() => {
-                        onError("Load ASR and forced aligner models before diarization.");
+                        openDiarizationModelManager();
+                        onError(
+                          usesGraniteDiarizationStandalone
+                            ? "Load Granite Speech before diarization."
+                            : "Load ASR and forced aligner models before diarization.",
+                        );
                       }}
                       managedModelCount={diarizationManagedModels.length}
                       readyManagedModelCount={readyDiarizationManagedModelCount}

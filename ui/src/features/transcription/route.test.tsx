@@ -1032,6 +1032,133 @@ describe("TranscriptionPage detail route", () => {
     expect(apiMocks.createTranscriptionRecordStream).not.toHaveBeenCalled();
   });
 
+  it("uses ready Granite from the combined diarization modal without ASR or aligner requirements", async () => {
+    baseProps.selectedModel = "Granite-Speech-4.1-2B-Plus";
+    baseProps.models = [
+      {
+        variant: "Parakeet-TDT-0.6B-v3",
+        status: "ready",
+        local_path: "/models/parakeet",
+        size_bytes: null,
+        download_progress: null,
+        error_message: null,
+      },
+      {
+        variant: "diar_streaming_sortformer_4spk-v2.1",
+        status: "downloaded",
+        local_path: "/models/diar",
+        size_bytes: null,
+        download_progress: null,
+        error_message: null,
+      },
+      {
+        variant: "Whisper-Large-v3-Turbo",
+        status: "not_downloaded",
+        local_path: "/models/whisper",
+        size_bytes: null,
+        download_progress: null,
+        error_message: null,
+      },
+      {
+        variant: "Qwen3-ForcedAligner-0.6B",
+        status: "not_downloaded",
+        local_path: "/models/aligner",
+        size_bytes: null,
+        download_progress: null,
+        error_message: null,
+      },
+      {
+        variant: "Qwen3.5-4B",
+        status: "ready",
+        local_path: "/models/qwen",
+        size_bytes: null,
+        download_progress: null,
+        error_message: null,
+      },
+      {
+        variant: "Granite-Speech-4.1-2B-Plus",
+        status: "ready",
+        local_path: "/models/granite",
+        size_bytes: null,
+        download_progress: null,
+        error_message: null,
+      },
+    ];
+    apiMocks.getTranscriptionRecord.mockResolvedValue({
+      id: "diar-created-1",
+      created_at: 1,
+      model_id: "Granite-Speech-4.1-2B-Plus",
+      aligner_model_id: null,
+      language: "English",
+      processing_status: "processing",
+      processing_error: null,
+      duration_secs: null,
+      processing_time_ms: 0,
+      rtf: null,
+      audio_mime_type: "audio/wav",
+      audio_filename: "granite-meeting.wav",
+      transcription: "",
+      segments: [],
+      words: [],
+      summary_status: "not_requested",
+      summary_model_id: null,
+      summary_text: null,
+      summary_error: null,
+      summary_updated_at: null,
+    });
+
+    renderRoute("/transcription");
+
+    await waitFor(() =>
+      expect(apiMocks.listTranscriptionRecords).toHaveBeenCalled(),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /New transcript/i }));
+    fireEvent.click(await screen.findByRole("radio", { name: "Diarization" }));
+
+    await screen.findByRole("heading", { name: "New diarization" });
+    expect(screen.getByText("Diarization stack")).toBeInTheDocument();
+    expect(screen.getByText("Loaded")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Min speakers")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Min speech (ms)")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Load ASR and forced aligner models before diarization."),
+    ).not.toBeInTheDocument();
+
+    const uploadButtons = screen.getAllByRole("button", {
+      name: "Upload audio file",
+    });
+    const activeUploadButton = uploadButtons[uploadButtons.length - 1];
+    const fileInput = activeUploadButton?.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement | null;
+    expect(fileInput).not.toBeNull();
+
+    fireEvent.change(fileInput!, {
+      target: {
+        files: [
+          new File(["audio"], "granite-meeting.wav", { type: "audio/wav" }),
+        ],
+      },
+    });
+
+    await waitFor(() =>
+      expect(apiMocks.createDiarizationRecord).toHaveBeenCalledTimes(1),
+    );
+    const request = apiMocks.createDiarizationRecord.mock.calls[0]?.[0];
+    expect(request).toEqual(
+      expect.objectContaining({
+        audio_filename: "granite-meeting.wav",
+        model_id: "Granite-Speech-4.1-2B-Plus",
+      }),
+    );
+    expect(request).not.toHaveProperty("asr_model_id");
+    expect(request).not.toHaveProperty("aligner_model_id");
+    expect(request).not.toHaveProperty("min_speech_duration_ms");
+    expect(request).not.toHaveProperty("min_silence_duration_ms");
+    expect(apiMocks.createTranscriptionRecordStream).not.toHaveBeenCalled();
+  });
+
   it("shows streamed transcript deltas on the detail page while processing", async () => {
     let streamCallbacks:
       | {
