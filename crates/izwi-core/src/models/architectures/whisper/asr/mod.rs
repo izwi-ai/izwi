@@ -743,6 +743,7 @@ impl WhisperTurboAsrModel {
                 "no_speech_prob": final_attempt.no_speech_prob,
                 "compression_ratio": final_attempt.compression_ratio,
                 "decode_steps": final_attempt.decode_steps,
+                "generated_tokens": final_attempt.generated_token_count,
                 "generated_token_count": final_attempt.generated_token_count,
                 "sampled_token_count": final_attempt.sampled_token_count,
                 "generated_tokens_per_second": generated_tokens_per_second,
@@ -1964,37 +1965,43 @@ fn greedy_decode_step_from_masked_logits(
     } else {
         (&masked_f32 * inv_temperature as f64)?
     };
-    let max_scaled = scaled.max(0)?;
-    let max_scaled_value = max_scaled.to_scalar::<f32>()?;
-    if !max_scaled_value.is_finite() {
-        return Ok((special.eot, f32::NEG_INFINITY, None));
-    }
-
     let next = masked.argmax(0)?.to_scalar::<u32>()?;
+    let max_scaled = scaled.max(0)?;
     let logsumexp = scaled
         .broadcast_sub(&max_scaled)?
         .exp()?
         .sum_all()?
         .log()?
-        .broadcast_add(&max_scaled)?
-        .to_scalar::<f32>()?;
-    let next_scaled_logit = scaled.i(next as usize)?.to_scalar::<f32>()?;
+        .broadcast_add(&max_scaled)?;
+    let next_scaled_logit = scaled.i(next as usize)?;
+    let no_speech_scaled_logit = special
+        .no_speech
+        .filter(|token_id| (*token_id as usize) < vocab_size)
+        .and_then(|token_id| scaled.i(token_id as usize).ok());
+    let mut stat_tensors = vec![max_scaled, logsumexp, next_scaled_logit];
+    if let Some(no_speech_scaled_logit) = no_speech_scaled_logit {
+        stat_tensors.push(no_speech_scaled_logit);
+    }
+    let stat_refs: Vec<&Tensor> = stat_tensors.iter().collect();
+    let stats = Tensor::stack(&stat_refs, 0)?.to_vec1::<f32>()?;
+    let max_scaled_value = stats[0];
+    if !max_scaled_value.is_finite() {
+        return Ok((special.eot, f32::NEG_INFINITY, None));
+    }
+    let logsumexp = stats[1];
+    let next_scaled_logit = stats[2];
     let next_logprob = if next_scaled_logit.is_finite() && logsumexp.is_finite() {
         next_scaled_logit - logsumexp
     } else {
         f32::NEG_INFINITY
     };
-    let no_speech_prob = special
-        .no_speech
-        .filter(|token_id| (*token_id as usize) < vocab_size)
-        .and_then(|token_id| {
-            let scaled_logit = scaled.i(token_id as usize).ok()?.to_scalar::<f32>().ok()?;
-            if scaled_logit.is_finite() && logsumexp.is_finite() {
-                Some((scaled_logit - logsumexp).exp())
-            } else {
-                None
-            }
-        });
+    let no_speech_prob = stats.get(3).and_then(|scaled_logit| {
+        if scaled_logit.is_finite() && logsumexp.is_finite() {
+            Some((*scaled_logit - logsumexp).exp())
+        } else {
+            None
+        }
+    });
     Ok((next, next_logprob, no_speech_prob))
 }
 

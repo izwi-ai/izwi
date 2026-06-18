@@ -36,7 +36,7 @@ fn to_add_dtype(tensor: Tensor, dtype: DType) -> Result<Tensor> {
     }
 }
 
-fn can_skip_attention_mask_for_cuda_flash(
+fn can_skip_attention_mask_for_fused_attention(
     masked: bool,
     query_pos: usize,
     q_len: usize,
@@ -45,11 +45,24 @@ fn can_skip_attention_mask_for_cuda_flash(
     !masked || (q_len == 1 && kv_len == query_pos + 1)
 }
 
+fn whisper_metal_full_sdpa_enabled() -> bool {
+    std::env::var("IZWI_WHISPER_METAL_FULL_SDPA")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Clone)]
 struct MultiHeadAttention {
     query: Linear,
     key: Linear,
     value: Linear,
+    self_qkv: Option<Linear>,
     out: Linear,
     n_head: usize,
     span: tracing::Span,
@@ -72,12 +85,14 @@ impl MultiHeadAttention {
         let query = linear(n_state, n_state, vb.pp("q_proj"))?;
         let value = linear(n_state, n_state, vb.pp("v_proj"))?;
         let key = linear_no_bias(n_state, n_state, vb.pp("k_proj"))?;
+        let self_qkv = Some(Self::load_self_qkv(n_state, &vb)?);
         let out = linear(n_state, n_state, vb.pp("out_proj"))?;
-        let self_kv_cache = self_cache_len.map(|max_seq_len| KvCache::new(1, max_seq_len));
+        let self_kv_cache = self_cache_len.map(|max_seq_len| KvCache::new(2, max_seq_len));
         Ok(Self {
             query,
             key,
             value,
+            self_qkv,
             out,
             n_head,
             span,
@@ -97,39 +112,67 @@ impl MultiHeadAttention {
         query_pos: usize,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let q = self.query.forward(x)?;
-        let (k, v, query_pos) = match xa {
+        let (q, k, v, query_pos) = match xa {
             None => {
-                let k = self.key.forward(x)?;
-                let v = self.value.forward(x)?;
+                let (q, k, v) = self.project_self_attention_qkv(x)?;
                 if let Some(cache) = self.self_kv_cache.as_mut() {
                     if flush_cache {
                         cache.reset();
                     }
                     let query_pos = cache.current_seq_len();
-                    let (k, v) = cache.append(&k.contiguous()?, &v.contiguous()?)?;
-                    (k, v, query_pos)
+                    let (k, v) = cache.append(&k, &v)?;
+                    (q, k, v, query_pos)
                 } else {
-                    (k, v, query_pos)
+                    (q, k, v, query_pos)
                 }
             }
-            Some(x) => {
+            Some(xa) => {
+                let q = self.reshape_head(&self.query.forward(x)?)?;
                 if flush_cache {
                     self.cross_kv_cache = None;
                 }
                 if let Some((k, v)) = &self.cross_kv_cache {
-                    (k.clone(), v.clone(), 0)
+                    (q, k.clone(), v.clone(), 0)
                 } else {
-                    let k = self.key.forward(x)?;
-                    let v = self.value.forward(x)?;
+                    let k = self.reshape_head(&self.key.forward(xa)?)?.contiguous()?;
+                    let v = self.reshape_head(&self.value.forward(xa)?)?.contiguous()?;
                     self.cross_kv_cache = Some((k.clone(), v.clone()));
-                    (k, v, 0)
+                    (q, k, v, 0)
                 }
             }
         };
-        let wv = self.qkv_attention(&q, &k, &v, mask, query_pos)?;
+        let q_len = q.dim(2)?;
+        let wv = self.qkv_attention(&q, &k, &v, mask, query_pos, q_len)?;
         let out = self.out.forward(&wv)?;
         Ok(out)
+    }
+
+    fn load_self_qkv(n_state: usize, vb: &VarBuilder) -> Result<Linear> {
+        let q_weight = vb.pp("q_proj").get((n_state, n_state), "weight")?;
+        let k_weight = vb.pp("k_proj").get((n_state, n_state), "weight")?;
+        let v_weight = vb.pp("v_proj").get((n_state, n_state), "weight")?;
+        let q_bias = vb.pp("q_proj").get(n_state, "bias")?;
+        let k_bias = Tensor::zeros(n_state, q_bias.dtype(), q_bias.device())?;
+        let v_bias = vb.pp("v_proj").get(n_state, "bias")?;
+        let weight = Tensor::cat(&[&q_weight, &k_weight, &v_weight], 0)?;
+        let bias = Tensor::cat(&[&q_bias, &k_bias, &v_bias], 0)?;
+        Ok(Linear::from_weights(weight, Some(bias)))
+    }
+
+    fn project_self_attention_qkv(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        if let Some(self_qkv) = &self.self_qkv {
+            let qkv = self_qkv.forward(x)?;
+            let chunks = qkv.chunk(3, D::Minus1)?;
+            let q = self.reshape_head(&chunks[0])?;
+            let k = self.reshape_head(&chunks[1])?.contiguous()?;
+            let v = self.reshape_head(&chunks[2])?.contiguous()?;
+            Ok((q, k, v))
+        } else {
+            let q = self.reshape_head(&self.query.forward(x)?)?;
+            let k = self.reshape_head(&self.key.forward(x)?)?.contiguous()?;
+            let v = self.reshape_head(&self.value.forward(x)?)?.contiguous()?;
+            Ok((q, k, v))
+        }
     }
 
     fn reshape_head(&self, x: &Tensor) -> Result<Tensor> {
@@ -145,18 +188,21 @@ impl MultiHeadAttention {
         v: &Tensor,
         mask: Option<&Tensor>,
         query_pos: usize,
+        q_len: usize,
     ) -> Result<Tensor> {
-        let (_, q_len, n_state) = q.dims3()?;
-        let kv_len = k.dim(1)?;
-        let head_dim = n_state / self.n_head;
+        let (_, _, _, head_dim) = q.dims4()?;
+        let kv_len = k.dim(2)?;
         let scale = (head_dim as f64).powf(-0.25);
-        let q = self.reshape_head(q)?;
-        let k = self.reshape_head(k)?;
-        let v = self.reshape_head(v)?.contiguous()?;
 
-        if can_skip_attention_mask_for_cuda_flash(mask.is_some(), query_pos, q_len, kv_len)
-            && q.device().is_cuda()
-        {
+        let can_skip_mask =
+            can_skip_attention_mask_for_fused_attention(mask.is_some(), query_pos, q_len, kv_len);
+        let can_try_fused = if can_skip_mask {
+            q.device().is_cuda()
+                || (q.device().is_metal() && (q_len <= 8 || whisper_metal_full_sdpa_enabled()))
+        } else {
+            false
+        };
+        if can_try_fused {
             match try_fused_self_attention(&q, &k, &v, None, head_dim, false) {
                 Ok(Some(wv)) => {
                     return wv.transpose(1, 2)?.flatten_from(2);
@@ -517,7 +563,7 @@ impl Whisper {
 #[cfg(test)]
 mod tests {
     use super::{
-        attention_mask_window, can_skip_attention_mask_for_cuda_flash, causal_attention_mask,
+        attention_mask_window, can_skip_attention_mask_for_fused_attention, causal_attention_mask,
         sinusoids,
     };
     use candle_core::{DType, Device, Tensor};
@@ -560,9 +606,9 @@ mod tests {
 
     #[test]
     fn incremental_single_token_mask_can_be_skipped_for_flash_attention() {
-        assert!(can_skip_attention_mask_for_cuda_flash(false, 0, 8, 8));
-        assert!(can_skip_attention_mask_for_cuda_flash(true, 4, 1, 5));
-        assert!(!can_skip_attention_mask_for_cuda_flash(true, 0, 4, 4));
-        assert!(!can_skip_attention_mask_for_cuda_flash(true, 4, 1, 6));
+        assert!(can_skip_attention_mask_for_fused_attention(false, 0, 8, 8));
+        assert!(can_skip_attention_mask_for_fused_attention(true, 4, 1, 5));
+        assert!(!can_skip_attention_mask_for_fused_attention(true, 0, 4, 4));
+        assert!(!can_skip_attention_mask_for_fused_attention(true, 4, 1, 6));
     }
 }
