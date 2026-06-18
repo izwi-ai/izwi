@@ -620,6 +620,7 @@ fn granite_diagnostics(
             "dense_head_decode_enabled": generation.stats.dense_head_decode_enabled,
             "cuda_dense_decode_cache": generation.stats.dense_decode_cache_enabled,
             "cuda_device_argmax": generation.stats.cuda_device_argmax,
+            "residual_branches_prescaled": generation.stats.residual_branches_prescaled,
             "deferred_stop_check": generation.stats.deferred_stop_check,
             "chunked_stop_check": generation.stats.chunked_stop_check,
             "stop_check_interval": generation.stats.stop_check_interval,
@@ -1026,6 +1027,7 @@ mod tests {
                 dense_decode_cache_enabled: true,
                 dense_head_decode_enabled: false,
                 cuda_device_argmax: false,
+                residual_branches_prescaled: true,
                 deferred_stop_check: true,
                 chunked_stop_check: false,
                 stop_check_interval: 1,
@@ -1128,6 +1130,10 @@ mod tests {
         );
         assert_eq!(diagnostics["execution"]["dense_head_decode_enabled"], false);
         assert_eq!(diagnostics["execution"]["cuda_device_argmax"], false);
+        assert_eq!(
+            diagnostics["execution"]["residual_branches_prescaled"],
+            true
+        );
         assert_eq!(diagnostics["execution"]["deferred_stop_check"], true);
         assert_eq!(diagnostics["execution"]["chunked_stop_check"], false);
         assert_eq!(diagnostics["execution"]["stop_check_interval"], 1);
