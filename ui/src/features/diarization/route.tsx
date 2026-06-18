@@ -154,7 +154,17 @@ export function DiarizationPage({
     ],
   );
 
-  const resolvedSelectedModel = useMemo(
+  const readyGraniteDiarizationModel = useMemo(
+    () =>
+      diarizationModels.find(
+        (model) =>
+          isGraniteDiarizationVariant(model.variant) &&
+          model.status === "ready",
+      ) ?? null,
+    [diarizationModels],
+  );
+
+  const baseResolvedSelectedModel = useMemo(
     () =>
       resolvePreferredRouteModel({
         models: diarizationModels,
@@ -164,6 +174,31 @@ export function DiarizationPage({
       }),
     [diarizationModels, selectedModel],
   );
+
+  const resolvedSelectedModel = useMemo(() => {
+    if (!baseResolvedSelectedModel || !readyGraniteDiarizationModel) {
+      return baseResolvedSelectedModel;
+    }
+
+    const baseSelectedModelInfo =
+      diarizationModels.find(
+        (model) => model.variant === baseResolvedSelectedModel,
+      ) ?? null;
+
+    if (
+      baseSelectedModelInfo &&
+      !isGraniteDiarizationVariant(baseSelectedModelInfo.variant) &&
+      baseSelectedModelInfo.status !== "ready"
+    ) {
+      return readyGraniteDiarizationModel.variant;
+    }
+
+    return baseResolvedSelectedModel;
+  }, [
+    baseResolvedSelectedModel,
+    diarizationModels,
+    readyGraniteDiarizationModel,
+  ]);
 
   const selectedModelInfo =
     diarizationModels.find(
