@@ -269,13 +269,15 @@ struct DiarizationCapabilityAdapter;
 
 impl ModelCapabilityAdapter for DiarizationCapabilityAdapter {
     fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
-        model_variant.is_diarization().then_some(AdapterMetadata {
-            id: "builtin.diarization",
-            capability: CapabilityKind::Diarization,
-            model_variant,
-            streaming_mode: StreamingMode::None,
-            execution_target: ExecutionTargetKind::PipelineRunner,
-        })
+        model_variant
+            .supports_diarization_records()
+            .then_some(AdapterMetadata {
+                id: "builtin.diarization",
+                capability: CapabilityKind::Diarization,
+                model_variant,
+                streaming_mode: StreamingMode::None,
+                execution_target: ExecutionTargetKind::PipelineRunner,
+            })
     }
 }
 
@@ -338,7 +340,7 @@ mod tests {
             expected.insert(CapabilityKind::AudioChat);
             expected.insert(CapabilityKind::SpeechToSpeech);
         }
-        if model_variant.is_diarization() {
+        if model_variant.supports_diarization_records() {
             expected.insert(CapabilityKind::Diarization);
         }
         if model_variant.is_forced_aligner() {
@@ -507,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn built_in_registry_marks_granite_speech_as_batch_asr_only() {
+    fn built_in_registry_marks_granite_speech_as_batch_asr_and_diarization_record_pipeline() {
         let registry = RuntimeAdapterRegistry::built_in();
         let variant = ModelVariant::GraniteSpeech412BPlus;
 
@@ -516,6 +518,14 @@ mod tests {
             .expect("granite speech asr adapter");
         assert_eq!(adapter.execution_target, ExecutionTargetKind::BatchRunner);
         assert_eq!(adapter.streaming_mode, StreamingMode::None);
+        let diarization_adapter = registry
+            .require(CapabilityKind::Diarization, variant)
+            .expect("granite speech diarization-record adapter");
+        assert_eq!(
+            diarization_adapter.execution_target,
+            ExecutionTargetKind::PipelineRunner
+        );
+        assert_eq!(diarization_adapter.streaming_mode, StreamingMode::None);
         assert!(
             registry
                 .require(CapabilityKind::RealtimeAsr, variant)

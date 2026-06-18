@@ -157,9 +157,9 @@ impl AdminModelRouteCapabilities {
                 || variant.is_audio_chat(),
             speech_to_text_jobs: variant.is_asr()
                 || variant.is_voxtral()
-                || variant.is_diarization(),
+                || variant.supports_diarization_records(),
             speech_to_text_realtime: variant.is_asr() || variant.is_audio_chat(),
-            diarization_records: variant.is_diarization(),
+            diarization_records: variant.supports_diarization_records(),
             text_to_speech_records: supports_tts,
             voice_design_records: supports_voice_description,
             voice_clone_records: supports_reference_voice,
@@ -210,7 +210,7 @@ fn model_modalities(variant: ModelVariant) -> Vec<String> {
         push("text_input");
         push("audio_output");
     }
-    if variant.is_diarization() {
+    if variant.supports_diarization_records() {
         push("audio_input");
         push("speaker_labels");
         push("timestamps");
