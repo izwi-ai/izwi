@@ -2583,10 +2583,18 @@ fn asr_stage_timings_from_diagnostics(diagnostics: &serde_json::Value) -> Option
         prompt_tokens: diagnostic_u64(prompt, &["prompt_tokens", "tokens"]),
         audio_tokens: diagnostic_u64(audio, &["audio_tokens", "acoustic_frames"]),
         generated_tokens: decode
-            .and_then(|value| value.get("generated_tokens"))
+            .and_then(|value| {
+                value
+                    .get("generated_tokens")
+                    .or_else(|| value.get("generated_token_count"))
+            })
             .and_then(|value| value.as_u64()),
         max_new_tokens: decode
-            .and_then(|value| value.get("max_new_tokens"))
+            .and_then(|value| {
+                value
+                    .get("max_new_tokens")
+                    .or_else(|| value.get("max_steps"))
+            })
             .and_then(|value| value.as_u64()),
         execution,
     })
@@ -2718,55 +2726,77 @@ fn collect_asr_stage_timings_from_diagnostics(
 fn asr_decode_profile_from_diagnostics(
     diagnostics: &serde_json::Value,
 ) -> Option<AsrDecodeProfileTimings> {
-    let profile = diagnostics.get("decode_profile")?;
-    if profile
-        .get("enabled")
-        .and_then(|value| value.as_bool())
-        != Some(true)
-    {
+    if let Some(profile) = diagnostics.get("decode_profile") {
+        if profile.get("enabled").and_then(|value| value.as_bool()) != Some(true) {
+            return None;
+        }
+
+        return Some(AsrDecodeProfileTimings {
+            steps: profile.get("steps").and_then(|value| value.as_u64()),
+            step_total_avg_ms: summary_metric(profile, &["step_total_ms", "avg"]),
+            step_total_p95_ms: summary_metric(profile, &["step_total_ms", "p95"]),
+            loop_argmax_ms: summary_metric(profile, &["loop_totals_ms", "argmax"]),
+            loop_scalar_read_ms: summary_metric(profile, &["loop_totals_ms", "scalar_read"]),
+            loop_model_forward_ms: summary_metric(profile, &["loop_totals_ms", "model_forward"]),
+            forward_token_embedding_ms: summary_metric(
+                profile,
+                &["forward_totals_ms", "token_embedding"],
+            ),
+            forward_rope_build_ms: summary_metric(profile, &["forward_totals_ms", "rope_build"]),
+            forward_layers_total_ms: summary_metric(profile, &["forward_totals_ms", "layers_total"]),
+            forward_final_norm_ms: summary_metric(profile, &["forward_totals_ms", "final_norm"]),
+            forward_lm_head_ms: summary_metric(profile, &["forward_totals_ms", "lm_head"]),
+            decoder_total_ms: summary_metric(profile, &["decoder_totals_ms", "total"]),
+            attention_qkv_ms: summary_metric(profile, &["decoder_totals_ms", "attention", "qkv"]),
+            attention_rope_ms: summary_metric(profile, &["decoder_totals_ms", "attention", "rope"]),
+            attention_cache_ms: summary_metric(profile, &["decoder_totals_ms", "attention", "cache"]),
+            attention_kernel_ms: summary_metric(
+                profile,
+                &["decoder_totals_ms", "attention", "kernel"],
+            ),
+            attention_output_ms: summary_metric(
+                profile,
+                &["decoder_totals_ms", "attention", "output"],
+            ),
+            mlp_gate_up_ms: summary_metric(profile, &["decoder_totals_ms", "mlp", "gate_up"]),
+            mlp_activation_ms: summary_metric(profile, &["decoder_totals_ms", "mlp", "activation"]),
+            mlp_down_ms: summary_metric(profile, &["decoder_totals_ms", "mlp", "down"]),
+            residual_ms: summary_metric(profile, &["decoder_totals_ms", "residual"]),
+        });
+    }
+
+    let decode = diagnostics.get("decode")?;
+    let profile = decode.get("profile")?;
+    if profile.get("enabled").and_then(|value| value.as_bool()) != Some(true) {
         return None;
     }
 
     Some(AsrDecodeProfileTimings {
-        steps: profile.get("steps").and_then(|value| value.as_u64()),
-        step_total_avg_ms: summary_metric(profile, &["step_total_ms", "avg"]),
-        step_total_p95_ms: summary_metric(profile, &["step_total_ms", "p95"]),
-        loop_argmax_ms: summary_metric(profile, &["loop_totals_ms", "argmax"]),
-        loop_scalar_read_ms: summary_metric(profile, &["loop_totals_ms", "scalar_read"]),
-        loop_model_forward_ms: summary_metric(profile, &["loop_totals_ms", "model_forward"]),
-        forward_token_embedding_ms: summary_metric(
-            profile,
-            &["forward_totals_ms", "token_embedding"],
-        ),
-        forward_rope_build_ms: summary_metric(profile, &["forward_totals_ms", "rope_build"]),
-        forward_layers_total_ms: summary_metric(profile, &["forward_totals_ms", "layers_total"]),
-        forward_final_norm_ms: summary_metric(profile, &["forward_totals_ms", "final_norm"]),
-        forward_lm_head_ms: summary_metric(profile, &["forward_totals_ms", "lm_head"]),
-        decoder_total_ms: summary_metric(profile, &["decoder_totals_ms", "total"]),
-        attention_qkv_ms: summary_metric(
-            profile,
-            &["decoder_totals_ms", "attention", "qkv"],
-        ),
-        attention_rope_ms: summary_metric(
-            profile,
-            &["decoder_totals_ms", "attention", "rope"],
-        ),
-        attention_cache_ms: summary_metric(
-            profile,
-            &["decoder_totals_ms", "attention", "cache"],
-        ),
-        attention_kernel_ms: summary_metric(
-            profile,
-            &["decoder_totals_ms", "attention", "kernel"],
-        ),
-        attention_output_ms: summary_metric(
-            profile,
-            &["decoder_totals_ms", "attention", "output"],
-        ),
-        mlp_gate_up_ms: summary_metric(profile, &["decoder_totals_ms", "mlp", "gate_up"]),
-        mlp_activation_ms: summary_metric(profile, &["decoder_totals_ms", "mlp", "activation"]),
-        mlp_down_ms: summary_metric(profile, &["decoder_totals_ms", "mlp", "down"]),
-        residual_ms: summary_metric(profile, &["decoder_totals_ms", "residual"]),
+        steps: diagnostic_u64(Some(decode), &["generated_tokens", "generated_token_count"]),
+        step_total_avg_ms: profile.get("step_total_ms").and_then(|value| value.as_f64()),
+        step_total_p95_ms: None,
+        loop_argmax_ms: None,
+        loop_scalar_read_ms: profile.get("sampling_ms").and_then(|value| value.as_f64()),
+        loop_model_forward_ms: profile
+            .get("decoder_forward_ms")
+            .and_then(|value| value.as_f64()),
+        forward_token_embedding_ms: profile
+            .get("token_tensor_ms")
+            .and_then(|value| value.as_f64()),
+        forward_rope_build_ms: None,
+        forward_layers_total_ms: None,
+        forward_final_norm_ms: None,
+        forward_lm_head_ms: profile.get("final_linear_ms").and_then(|value| value.as_f64()),
+        decoder_total_ms: profile.get("step_total_ms").and_then(|value| value.as_f64()),
+        attention_qkv_ms: None,
+        attention_rope_ms: None,
+        attention_cache_ms: None,
+        attention_kernel_ms: None,
+        attention_output_ms: None,
+        mlp_gate_up_ms: None,
+        mlp_activation_ms: None,
+        mlp_down_ms: None,
+        residual_ms: profile.get("unattributed_ms").and_then(|value| value.as_f64()),
     })
 }
 
@@ -3466,6 +3496,28 @@ mod tests {
     }
 
     #[test]
+    fn asr_stage_timing_collection_accepts_whisper_generated_token_count() {
+        let diagnostics = serde_json::json!({
+            "model_family": "whisper_asr",
+            "decode": {
+                "generated_token_count": 41,
+                "max_steps": 448
+            },
+            "timings_ms": {
+                "decode": 1234.0,
+                "model_total": 1300.0
+            }
+        });
+
+        let samples = collect_asr_stage_timings_from_diagnostics(&diagnostics);
+
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].decode, Some(1234.0));
+        assert_eq!(samples[0].generated_tokens, Some(41));
+        assert_eq!(samples[0].max_new_tokens, Some(448));
+    }
+
+    #[test]
     fn asr_stage_timing_collection_includes_vibevoice_diagnostics() {
         let diagnostics = serde_json::json!({
             "model_family": "vibevoice_asr",
@@ -3586,6 +3638,35 @@ mod tests {
         assert_eq!(samples[0].attention_kernel_ms, Some(1100.0));
         assert_eq!(samples[0].mlp_activation_ms, Some(250.0));
         assert_eq!(samples[0].residual_ms, Some(120.0));
+    }
+
+    #[test]
+    fn asr_decode_profile_collection_includes_whisper_decode_profile() {
+        let diagnostics = serde_json::json!({
+            "model_family": "whisper_asr",
+            "decode": {
+                "generated_token_count": 95,
+                "profile": {
+                    "enabled": true,
+                    "token_tensor_ms": 2.0,
+                    "decoder_forward_ms": 700.0,
+                    "final_linear_ms": 80.0,
+                    "sampling_ms": 30.0,
+                    "step_total_ms": 830.0,
+                    "unattributed_ms": 18.0
+                }
+            }
+        });
+
+        let samples = collect_asr_decode_profiles_from_diagnostics(&diagnostics);
+
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].steps, Some(95));
+        assert_eq!(samples[0].loop_model_forward_ms, Some(700.0));
+        assert_eq!(samples[0].forward_lm_head_ms, Some(80.0));
+        assert_eq!(samples[0].loop_scalar_read_ms, Some(30.0));
+        assert_eq!(samples[0].decoder_total_ms, Some(830.0));
+        assert_eq!(samples[0].residual_ms, Some(18.0));
     }
 
     #[test]
