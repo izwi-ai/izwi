@@ -239,6 +239,7 @@ impl GraniteSpeechAsrModel {
             audio,
             sample_rate,
             language,
+            GraniteSpeechTask::Asr,
             prompt,
             None,
             options,
@@ -261,7 +262,31 @@ impl GraniteSpeechAsrModel {
             audio,
             sample_rate,
             language,
+            GraniteSpeechTask::Asr,
             prompt,
+            prefix_text,
+            options,
+            &mut no_op,
+            false,
+        )
+    }
+
+    pub fn transcribe_with_details_task_prefix_and_options(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        task: GraniteSpeechTask,
+        prefix_text: Option<&str>,
+        options: GraniteSpeechAsrGenerationOptions,
+    ) -> Result<GraniteSpeechAsrTranscriptionOutput> {
+        let mut no_op = |_delta: &str| {};
+        self.transcribe_internal(
+            audio,
+            sample_rate,
+            language,
+            task,
+            None,
             prefix_text,
             options,
             &mut no_op,
@@ -301,6 +326,7 @@ impl GraniteSpeechAsrModel {
             audio,
             sample_rate,
             language,
+            GraniteSpeechTask::Asr,
             prompt,
             None,
             options,
@@ -330,6 +356,7 @@ impl GraniteSpeechAsrModel {
         audio: &[f32],
         sample_rate: u32,
         language: Option<&str>,
+        task: GraniteSpeechTask,
         prompt: Option<&str>,
         prefix_text: Option<&str>,
         options: GraniteSpeechAsrGenerationOptions,
@@ -381,7 +408,7 @@ impl GraniteSpeechAsrModel {
         validate_granite_audio_duration(features.audio_seconds)?;
 
         let prompt_options = GraniteSpeechPromptOptions {
-            task: GraniteSpeechTask::Asr,
+            task,
             language: language.map(str::to_string),
             custom_prompt: prompt.map(str::to_string),
             prefix_text: prefix_text.map(str::to_string),
