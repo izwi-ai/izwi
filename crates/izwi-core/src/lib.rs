@@ -43,11 +43,11 @@ pub mod tokenizer;
 
 // Re-export main types from the new engine module
 pub use engine::{
-    AsrEngineInput, AudioChatEngineInput, CacheResidency, ChatEngineInput, Engine, EngineAudioInput,
-    EngineCore, EngineCoreConfig, EngineCoreRequest, EngineMetrics, EngineOutput, EngineTask,
-    GenerationParams, KVCacheManager, ModelExecutor, OutputProcessor, PinnedBlockHandle,
-    RequestProcessor, RequestStatus, Scheduler, SchedulerConfig, SchedulingPolicy,
-    StreamingOutput, TtsEngineInput,
+    AsrEngineInput, AudioChatEngineInput, CacheResidency, ChatEngineInput, Engine,
+    EngineAudioInput, EngineCore, EngineCoreConfig, EngineCoreRequest, EngineMetrics, EngineOutput,
+    EngineTask, GenerationParams, KVCacheManager, ModelExecutor, OutputProcessor,
+    PinnedBlockHandle, RequestProcessor, RequestStatus, Scheduler, SchedulerConfig,
+    SchedulingPolicy, StreamingOutput, TtsEngineInput,
 };
 
 // Legacy re-exports for backward compatibility
@@ -67,21 +67,20 @@ pub use runtime::{
     VOICE_TTS_FIRST_AUDIO_MS, VOICE_VAD_SPEECH_START_MS,
 };
 pub use runtime::{
-    AsrTranscription, ChatGeneration, ChunkStats, DiarizationConfig, DiarizationResult,
-    DiarizationSegment, DiarizationTranscriptResult, DiarizationUtterance, DiarizationWord,
-    GenerationRequest, GenerationResult,
-};
-pub use runtime::{
-    AudioChunk, EngineRuntimeTelemetrySnapshot, GenerationConfig,
-    InferenceBrokerRuntimeTelemetrySnapshot, InferenceOptions, PipelineRuntimeTelemetrySnapshot,
-    ReplayRedaction, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeReplayRecord,
-    RuntimeService, RuntimeTelemetrySnapshot, RuntimeTraceContract, RuntimeTracePhase,
-    SpeechToSpeechGeneration,
+    runtime_trace_contracts, sanitized_replay_record, trace_contract_for_phase, AudioChunk,
+    EngineRuntimeTelemetrySnapshot, GenerationConfig, InferenceBrokerRuntimeTelemetrySnapshot,
+    InferenceOptions, PipelineRuntimeTelemetrySnapshot, ReplayRedaction, RuntimeAsrRealtimeEvent,
+    RuntimeAsrRealtimeStream, RuntimeReplayRecord, RuntimeService, RuntimeTelemetrySnapshot,
+    RuntimeTraceContract, RuntimeTracePhase, SpeechToSpeechGeneration,
     VoiceRuntimeTelemetrySnapshot, VoiceSession, VoiceSessionPhase, RUNTIME_REPLAY_REDACTION,
     RUNTIME_TRACE_CONTRACTS, TRACE_CAPABILITY, TRACE_CORRELATION_ID, TRACE_ERROR_KIND,
     TRACE_EXECUTION_TARGET, TRACE_MODEL_VARIANT, TRACE_PIPELINE_KIND, TRACE_PIPELINE_STAGE,
-    TRACE_REQUEST_ID, TRACE_STREAMING_MODE, runtime_trace_contracts, sanitized_replay_record,
-    trace_contract_for_phase,
+    TRACE_REQUEST_ID, TRACE_STREAMING_MODE,
+};
+pub use runtime::{
+    AsrTranscription, ChatGeneration, ChunkStats, DiarizationConfig, DiarizationResult,
+    DiarizationSegment, DiarizationTranscriptResult, DiarizationUtterance, DiarizationWord,
+    ForcedAlignmentResult, GenerationRequest, GenerationResult,
 };
 pub use serve_runtime::{ServeRuntimeConfig, ServeRuntimeConfigOverrides};
 

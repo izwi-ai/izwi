@@ -13,6 +13,12 @@ pub struct AsrTranscription {
     pub asr_diagnostics: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ForcedAlignmentResult {
+    pub alignments: Vec<(String, u32, u32)>,
+    pub diagnostics: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiarizationSegment {
     pub speaker: String,
@@ -27,6 +33,7 @@ pub struct DiarizationResult {
     pub segments: Vec<DiarizationSegment>,
     pub duration_secs: f32,
     pub speaker_count: usize,
+    pub diagnostics: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +65,7 @@ pub struct DiarizationTranscriptResult {
     pub segments: Vec<DiarizationSegment>,
     pub words: Vec<DiarizationWord>,
     pub utterances: Vec<DiarizationUtterance>,
+    pub diarization_diagnostics: Option<serde_json::Value>,
     pub asr_text: String,
     pub raw_transcript: String,
     pub transcript: String,

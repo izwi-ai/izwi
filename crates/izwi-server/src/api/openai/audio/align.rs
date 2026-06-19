@@ -1,11 +1,11 @@
 //! Forced alignment audio endpoint.
 
 use axum::{
-    Json, RequestExt,
     body::Body,
     extract::{Multipart, Request, State},
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     response::Response,
+    Json, RequestExt,
 };
 use serde::Serialize;
 use std::time::Instant;
@@ -13,8 +13,8 @@ use utoipa::ToSchema;
 
 use super::resolve_audio_upload_limit_bytes;
 use crate::api::audio_payload::{
-    AudioPayload, decode_base64_audio_payload, inspect_audio_payload_with_diagnostics,
-    read_multipart_audio_base64_payload, read_multipart_audio_file_payload,
+    decode_base64_audio_payload, inspect_audio_payload_with_diagnostics,
+    read_multipart_audio_base64_payload, read_multipart_audio_file_payload, AudioPayload,
 };
 use crate::api::speech_text_upload::multipart_upload_api_error;
 use crate::error::ApiError;
@@ -70,6 +70,8 @@ pub struct VerboseAlignmentResponse {
     pub language: Option<String>,
     pub word_count: usize,
     pub processing_time_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub izwi_asr_diagnostics: Option<serde_json::Value>,
 }
 
 pub async fn align(
@@ -101,9 +103,9 @@ pub async fn align(
 
     let _permit = state.acquire_permit().await;
     let started = Instant::now();
-    let raw_alignments = state
+    let alignment_output = state
         .runtime
-        .force_align_bytes_with_model_and_language(
+        .force_align_bytes_with_model_and_language_details(
             audio.bytes.as_slice(),
             text.as_str(),
             req.language.as_deref(),
@@ -112,7 +114,7 @@ pub async fn align(
         .await?;
     let processing_time_ms = started.elapsed().as_secs_f64() * 1000.0;
 
-    let alignments = alignment_words(raw_alignments);
+    let alignments = alignment_words(alignment_output.alignments);
     let duration = alignment_duration(&alignments);
 
     match response_format.as_str() {
@@ -127,6 +129,7 @@ pub async fn align(
             model: req.model,
             language: req.language,
             processing_time_ms,
+            izwi_asr_diagnostics: alignment_output.diagnostics,
         }),
         "text" => Ok(Response::builder()
             .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")

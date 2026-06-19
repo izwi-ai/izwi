@@ -189,6 +189,7 @@ const BASELINE_SCHEMA: &[&str] = &[
         words_json TEXT NOT NULL,
         utterances_json TEXT NOT NULL,
         speaker_name_overrides_json TEXT NOT NULL DEFAULT '{}',
+        diarization_diagnostics_json TEXT NULL,
         audio_mime_type TEXT NOT NULL,
         audio_filename TEXT NULL,
         audio_storage_path TEXT NOT NULL
@@ -415,6 +416,11 @@ const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
         table: "diarization_records",
         column: "speaker_name_overrides_json",
         definition: "TEXT NOT NULL DEFAULT '{}'",
+    },
+    CompatibilityColumn {
+        table: "diarization_records",
+        column: "diarization_diagnostics_json",
+        definition: "TEXT NULL",
     },
     CompatibilityColumn {
         table: "diarization_records",

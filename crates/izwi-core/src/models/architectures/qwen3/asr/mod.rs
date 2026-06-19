@@ -97,6 +97,12 @@ pub struct AsrTranscriptionOutput {
     pub diagnostics: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AsrAlignmentOutput {
+    pub alignments: Vec<(String, u32, u32)>,
+    pub diagnostics: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct Qwen3AsrTimingDiagnostics {
     resample_ms: f64,
@@ -115,6 +121,7 @@ struct Qwen3AsrExecutionDiagnostics {
     checkpoint_format: String,
     flash_attention_requested: bool,
     flash_attention_compiled: bool,
+    kv_cache_enabled: bool,
     kv_page_size: usize,
     dense_decode_enabled: bool,
     dense_decode_max_tokens: usize,
@@ -187,6 +194,7 @@ impl Qwen3AsrDiagnostics {
                 "checkpoint_format": &self.execution.checkpoint_format,
                 "flash_attention_requested": self.execution.flash_attention_requested,
                 "flash_attention_compiled": self.execution.flash_attention_compiled,
+                "kv_cache_enabled": self.execution.kv_cache_enabled,
                 "kv_page_size": self.execution.kv_page_size,
                 "dense_decode_enabled": self.execution.dense_decode_enabled,
                 "dense_decode_max_tokens": self.execution.dense_decode_max_tokens,
@@ -203,6 +211,100 @@ impl Qwen3AsrDiagnostics {
                 "audio_encode": self.timings.audio_encode_ms,
                 "prefill": self.timings.prefill_ms,
                 "decode": self.timings.decode_ms,
+                "model_total": self.timings.total_ms,
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct Qwen3ForcedAlignTimingDiagnostics {
+    resample_ms: f64,
+    mel_ms: f64,
+    audio_encode_ms: f64,
+    prompt_build_ms: f64,
+    prefill_ms: f64,
+    timestamp_argmax_ms: f64,
+    timestamp_fixup_ms: f64,
+    postprocess_ms: f64,
+    total_ms: f64,
+}
+
+#[derive(Debug, Clone)]
+struct Qwen3ForcedAlignDiagnostics {
+    input_sample_rate: u32,
+    input_samples: usize,
+    resampled_sample_rate: u32,
+    resampled_samples: usize,
+    mel_frames: usize,
+    mel_frames_before_truncate: usize,
+    mel_frames_truncated: bool,
+    audio_tokens: usize,
+    prompt_tokens: usize,
+    word_count: usize,
+    timestamp_positions: usize,
+    timestamp_segment_time_ms: u32,
+    execution: Qwen3AsrExecutionDiagnostics,
+    timings: Qwen3ForcedAlignTimingDiagnostics,
+}
+
+impl Qwen3ForcedAlignDiagnostics {
+    fn to_json(&self) -> serde_json::Value {
+        let decode_ms = self.timings.timestamp_argmax_ms
+            + self.timings.timestamp_fixup_ms
+            + self.timings.postprocess_ms;
+        json!({
+            "model_family": "qwen3_forced_aligner",
+            "audio": {
+                "input_sample_rate": self.input_sample_rate,
+                "input_samples": self.input_samples,
+                "resampled_sample_rate": self.resampled_sample_rate,
+                "resampled_samples": self.resampled_samples,
+                "mel_frames": self.mel_frames,
+                "mel_frames_before_truncate": self.mel_frames_before_truncate,
+                "mel_frames_truncated": self.mel_frames_truncated,
+                "audio_tokens": self.audio_tokens,
+            },
+            "prompt": {
+                "prompt_tokens": self.prompt_tokens,
+            },
+            "alignment": {
+                "word_count": self.word_count,
+                "timestamp_positions": self.timestamp_positions,
+                "timestamp_segment_time_ms": self.timestamp_segment_time_ms,
+            },
+            "decode": {
+                "generated_tokens": self.timestamp_positions,
+                "host_argmax_reads": 1,
+            },
+            "execution": {
+                "device_kind": &self.execution.device_kind,
+                "audio_dtype": &self.execution.audio_dtype,
+                "text_dtype": &self.execution.text_dtype,
+                "checkpoint_format": &self.execution.checkpoint_format,
+                "flash_attention_requested": self.execution.flash_attention_requested,
+                "flash_attention_compiled": self.execution.flash_attention_compiled,
+                "kv_cache_enabled": self.execution.kv_cache_enabled,
+                "kv_page_size": self.execution.kv_page_size,
+                "dense_decode_enabled": self.execution.dense_decode_enabled,
+                "dense_decode_max_tokens": self.execution.dense_decode_max_tokens,
+                "gguf_qmatmul_text_enabled": self.execution.gguf_qmatmul_text_enabled,
+                "text_projection_backend": &self.execution.text_projection_backend,
+                "text_projection_quantized": self.execution.text_projection_quantized,
+                "qmatmul_projection_count": self.execution.qmatmul_projection_count,
+                "dense_projection_count": self.execution.dense_projection_count,
+                "dense_bias_projection_count": self.execution.dense_bias_projection_count,
+            },
+            "timings_ms": {
+                "resample": self.timings.resample_ms,
+                "mel": self.timings.mel_ms,
+                "audio_encode": self.timings.audio_encode_ms,
+                "prompt_build": self.timings.prompt_build_ms,
+                "prefill": self.timings.prefill_ms,
+                "timestamp_argmax": self.timings.timestamp_argmax_ms,
+                "timestamp_fixup": self.timings.timestamp_fixup_ms,
+                "postprocess": self.timings.postprocess_ms,
+                "decode": decode_ms,
                 "model_total": self.timings.total_ms,
             }
         })
@@ -516,9 +618,42 @@ impl Qwen3AsrModel {
             checkpoint_format: self.checkpoint_format.to_string(),
             flash_attention_requested: flash_attention_requested(),
             flash_attention_compiled: flash_attention_compiled(),
+            kv_cache_enabled: true,
             kv_page_size: cache.page_size(),
             dense_decode_enabled: cache.dense_decode_max_tokens() > 0,
             dense_decode_max_tokens: cache.dense_decode_max_tokens(),
+            gguf_qmatmul_text_enabled: self.gguf_qmatmul_text_enabled,
+            text_projection_backend: text_projection_backend.to_string(),
+            text_projection_quantized,
+            qmatmul_projection_count: projection_diagnostics.quantized_projection_count,
+            dense_projection_count: projection_diagnostics.dense_projection_count,
+            dense_bias_projection_count: projection_diagnostics.dense_bias_projection_count,
+        }
+    }
+
+    fn execution_diagnostics_without_cache(
+        &self,
+        prompt_tokens: usize,
+    ) -> Qwen3AsrExecutionDiagnostics {
+        let projection_diagnostics = self.text_model.projection_diagnostics();
+        let text_projection_quantized = projection_diagnostics.quantized_projection_count > 0;
+        let text_projection_backend = if text_projection_quantized {
+            "qmatmul"
+        } else {
+            "dense_linear"
+        };
+
+        Qwen3AsrExecutionDiagnostics {
+            device_kind: format!("{:?}", self.device.kind),
+            audio_dtype: format!("{:?}", self.audio_dtype),
+            text_dtype: format!("{:?}", self.text_dtype),
+            checkpoint_format: self.checkpoint_format.to_string(),
+            flash_attention_requested: flash_attention_requested(),
+            flash_attention_compiled: flash_attention_compiled(),
+            kv_cache_enabled: false,
+            kv_page_size: qwen3_asr_kv_page_size(&self.device.device, prompt_tokens),
+            dense_decode_enabled: false,
+            dense_decode_max_tokens: 0,
             gguf_qmatmul_text_enabled: self.gguf_qmatmul_text_enabled,
             text_projection_backend: text_projection_backend.to_string(),
             text_projection_quantized,
@@ -740,7 +875,7 @@ impl Qwen3AsrModel {
             &audio_embeds,
             prompt.audio_pad_start,
             prompt.audio_pad_len,
-            &mut cache,
+            Some(&mut cache),
         )?;
         let prefill_ms = elapsed_ms(prefill_started);
         let pos = embeds.dim(1)?;
@@ -911,14 +1046,29 @@ impl Qwen3AsrModel {
         audio: &[f32],
         sample_rate: u32,
         reference_text: &str,
-        _language: Option<&str>,
+        language: Option<&str>,
     ) -> Result<Vec<(String, u32, u32)>> {
+        self.force_align_with_details(audio, sample_rate, reference_text, language)
+            .map(|output| output.alignments)
+    }
+
+    pub fn force_align_with_details(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        reference_text: &str,
+        _language: Option<&str>,
+    ) -> Result<AsrAlignmentOutput> {
         if self.is_forced_aligner {
-            return self.force_align_with_nar_head(audio, sample_rate, reference_text);
+            return self.force_align_with_nar_head_with_details(audio, sample_rate, reference_text);
         }
 
         let audio = if sample_rate != 16_000 {
-            resample(audio, sample_rate, 16_000)?
+            if qwen3_forced_aligner_fast_resample_enabled(self.device.kind) {
+                resample_linear(audio, sample_rate, 16_000)?
+            } else {
+                resample(audio, sample_rate, 16_000)?
+            }
         } else {
             audio.to_vec()
         };
@@ -967,7 +1117,7 @@ impl Qwen3AsrModel {
             &audio_embeds,
             prompt.audio_pad_start,
             prompt.audio_pad_len,
-            &mut cache,
+            Some(&mut cache),
         )?;
 
         let mut pos = embeds.dim(1)?;
@@ -990,25 +1140,43 @@ impl Qwen3AsrModel {
             pos += 1;
         }
 
-        self.parse_alignment(&generated, reference_text, audio.len() as u32 / 16)
+        Ok(AsrAlignmentOutput {
+            alignments: self.parse_alignment(
+                &generated,
+                reference_text,
+                audio.len() as u32 / 16,
+            )?,
+            diagnostics: None,
+        })
     }
 
-    fn force_align_with_nar_head(
+    fn force_align_with_nar_head_with_details(
         &self,
         audio: &[f32],
         sample_rate: u32,
         reference_text: &str,
-    ) -> Result<Vec<(String, u32, u32)>> {
+    ) -> Result<AsrAlignmentOutput> {
+        let input_samples = audio.len();
+        let total_started = Instant::now();
+        let resample_started = Instant::now();
         let audio = if sample_rate != 16_000 {
-            resample(audio, sample_rate, 16_000)?
+            if qwen3_forced_aligner_fast_resample_enabled(self.device.kind) {
+                resample_linear(audio, sample_rate, 16_000)?
+            } else {
+                resample(audio, sample_rate, 16_000)?
+            }
         } else {
             audio.to_vec()
         };
+        let resample_ms = elapsed_ms(resample_started);
 
+        let mel_started = Instant::now();
         let mut mel_spec = self.mel.compute(&audio)?;
+        let mel_frames_before_truncate = mel_spec.len();
         if self.preprocessor.nb_max_frames > 0 && mel_spec.len() > self.preprocessor.nb_max_frames {
             mel_spec.truncate(self.preprocessor.nb_max_frames);
         }
+        let mel_ms = elapsed_ms(mel_started);
 
         let n_mels = self.mel.config().n_mels;
         if mel_spec.is_empty() {
@@ -1028,12 +1196,15 @@ impl Qwen3AsrModel {
             .to_dtype(self.audio_dtype)?;
 
         let feature_lens = vec![frames];
+        let audio_started = Instant::now();
         let mut audio_embeds = self.audio_tower.forward(&mel, Some(&feature_lens))?;
         if audio_embeds.dtype() != self.text_dtype {
             audio_embeds = audio_embeds.to_dtype(self.text_dtype)?;
         }
+        let audio_encode_ms = elapsed_ms(audio_started);
         let audio_len = audio_embeds.dim(1)?;
 
+        let prompt_started = Instant::now();
         let words = extract_alignment_words(reference_text);
         if words.is_empty() {
             return Err(Error::InvalidInput(
@@ -1059,29 +1230,42 @@ impl Qwen3AsrModel {
             (1, prompt.ids.len()),
             &self.device.device,
         )?;
+        let prompt_build_ms = elapsed_ms(prompt_started);
 
-        let mut cache = self.build_decode_cache(prompt.ids.len(), 1);
+        let use_no_cache = qwen3_forced_aligner_nar_no_cache_enabled(self.device.kind);
+        let mut cache = (!use_no_cache).then(|| self.build_decode_cache(prompt.ids.len(), 1));
+        let execution = cache
+            .as_ref()
+            .map(|cache| self.execution_diagnostics(cache))
+            .unwrap_or_else(|| self.execution_diagnostics_without_cache(prompt.ids.len()));
+        let prefill_started = Instant::now();
         let logits = self.forward_with_audio(
             &input_ids,
             &audio_embeds,
             prompt.audio_pad_start,
             prompt.audio_pad_len,
-            &mut cache,
+            cache.as_mut(),
         )?;
+        let prefill_ms = elapsed_ms(prefill_started);
 
         let segment_time_ms = self.timestamp_segment_time_ms.unwrap_or(20).max(1);
+        let timestamp_argmax_started = Instant::now();
         let timestamp_ms = batched_timestamp_argmax(&logits, &timestamp_positions)?
             .into_iter()
             .map(|cls_idx| cls_idx.saturating_mul(segment_time_ms))
             .collect::<Vec<_>>();
+        let timestamp_argmax_ms = elapsed_ms(timestamp_argmax_started);
 
+        let timestamp_fixup_started = Instant::now();
         let mut fixed = fix_timestamp_sequence(&timestamp_ms);
         let required = words.len().saturating_mul(2);
         if fixed.len() < required {
             let fill = fixed.last().copied().unwrap_or(0);
             fixed.resize(required, fill);
         }
+        let timestamp_fixup_ms = elapsed_ms(timestamp_fixup_started);
 
+        let postprocess_started = Instant::now();
         let mut alignments = Vec::with_capacity(words.len());
         for (idx, word) in words.iter().enumerate() {
             let start = fixed.get(idx * 2).copied().unwrap_or(0);
@@ -1104,7 +1288,39 @@ impl Qwen3AsrModel {
             alignments = distribute_words_over_interval(&words, 0, audio_duration_ms.max(1));
             normalize_alignment_bounds(&mut alignments, audio_duration_ms);
         }
-        Ok(alignments)
+        let postprocess_ms = elapsed_ms(postprocess_started);
+
+        let diagnostics = Qwen3ForcedAlignDiagnostics {
+            input_sample_rate: sample_rate,
+            input_samples,
+            resampled_sample_rate: 16_000,
+            resampled_samples: audio.len(),
+            mel_frames: frames,
+            mel_frames_before_truncate,
+            mel_frames_truncated: mel_frames_before_truncate > frames,
+            audio_tokens: audio_len,
+            prompt_tokens: prompt.ids.len(),
+            word_count: words.len(),
+            timestamp_positions: timestamp_positions.len(),
+            timestamp_segment_time_ms: segment_time_ms,
+            execution,
+            timings: Qwen3ForcedAlignTimingDiagnostics {
+                resample_ms,
+                mel_ms,
+                audio_encode_ms,
+                prompt_build_ms,
+                prefill_ms,
+                timestamp_argmax_ms,
+                timestamp_fixup_ms,
+                postprocess_ms,
+                total_ms: elapsed_ms(total_started),
+            },
+        };
+
+        Ok(AsrAlignmentOutput {
+            alignments,
+            diagnostics: Some(diagnostics.to_json()),
+        })
     }
 
     fn build_forced_aligner_prompt(
@@ -1158,7 +1374,7 @@ impl Qwen3AsrModel {
         audio_embeds: &Tensor,
         audio_pad_start: usize,
         audio_pad_len: usize,
-        cache: &mut Qwen3Cache,
+        cache: Option<&mut Qwen3Cache>,
     ) -> Result<Tensor> {
         let embeds = self.text_model.embeddings(input_ids)?;
         let seq_len = embeds.dim(1)?;
@@ -1206,7 +1422,7 @@ impl Qwen3AsrModel {
             None
         };
         self.text_model
-            .forward_with_embeds(&embeds, 0, Some(cache), position_ids.as_ref())
+            .forward_with_embeds(&embeds, 0, cache, position_ids.as_ref())
     }
 
     fn build_prompt(
@@ -2430,6 +2646,14 @@ fn qwen_asr_drop_last_mel_frame() -> bool {
     env_bool("IZWI_QWEN_ASR_DROP_LAST_MEL_FRAME").unwrap_or(false)
 }
 
+fn qwen3_forced_aligner_nar_no_cache_enabled(kind: DeviceKind) -> bool {
+    kind.is_metal() && env_bool("IZWI_QWEN3_FORCED_ALIGNER_NAR_NO_CACHE").unwrap_or(true)
+}
+
+fn qwen3_forced_aligner_fast_resample_enabled(kind: DeviceKind) -> bool {
+    kind.is_metal() && env_bool("IZWI_QWEN3_FORCED_ALIGNER_FAST_RESAMPLE").unwrap_or(true)
+}
+
 fn env_bool(name: &str) -> Option<bool> {
     std::env::var(name).ok().and_then(|raw| {
         let normalized = raw.trim().to_ascii_lowercase();
@@ -2503,6 +2727,43 @@ fn resample(audio: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>> {
             0.0
         });
     }
+    Ok(out)
+}
+
+fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>> {
+    if src_rate == dst_rate {
+        return Ok(audio.to_vec());
+    }
+    if src_rate == 0 || dst_rate == 0 {
+        return Err(Error::InvalidInput(format!(
+            "Invalid sample rate for resampling: {src_rate} -> {dst_rate}"
+        )));
+    }
+    if audio.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let out_len = ((audio.len() as u64)
+        .saturating_mul(dst_rate as u64)
+        .checked_div(src_rate as u64)
+        .unwrap_or(0) as usize)
+        .max(1);
+    if audio.len() == 1 {
+        return Ok(vec![audio[0]; out_len]);
+    }
+
+    let step = src_rate as f64 / dst_rate as f64;
+    let last_idx = audio.len() - 1;
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let src_pos = i as f64 * step;
+        let idx = src_pos.floor() as usize;
+        let frac = (src_pos - idx as f64) as f32;
+        let left = audio[idx.min(last_idx)];
+        let right = audio[(idx + 1).min(last_idx)];
+        out.push(left + (right - left) * frac);
+    }
+
     Ok(out)
 }
 
@@ -2756,6 +3017,7 @@ mod tests {
                 checkpoint_format: "gguf".to_string(),
                 flash_attention_requested: true,
                 flash_attention_compiled: true,
+                kv_cache_enabled: true,
                 kv_page_size: 256,
                 dense_decode_enabled: true,
                 dense_decode_max_tokens: 1024,
@@ -2939,6 +3201,15 @@ mod tests {
         for value in output {
             assert!((value - 0.75).abs() < 1e-3, "unexpected value: {value}");
         }
+    }
+
+    #[test]
+    fn resample_linear_downsamples_24khz_to_16khz_length() {
+        let input = vec![0.5f32; 24_000];
+        let output = resample_linear(&input, 24_000, 16_000).expect("linear resample");
+
+        assert_eq!(output.len(), 16_000);
+        assert!(output.iter().all(|value| (*value - 0.5).abs() < 1e-6));
     }
 
     #[test]

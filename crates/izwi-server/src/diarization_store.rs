@@ -5,6 +5,7 @@ use izwi_hooks::{HookMetadata, MediaNamespace, MediaStorageProvider};
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryResult, Set};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -165,6 +166,8 @@ pub struct DiarizationRecord {
     pub words: Vec<DiarizationWordRecord>,
     pub utterances: Vec<DiarizationUtteranceRecord>,
     pub speaker_name_overrides: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub izwi_diarization_diagnostics: Option<Value>,
     pub audio_mime_type: String,
     pub audio_filename: Option<String>,
 }
@@ -208,6 +211,7 @@ pub struct NewDiarizationRecord {
     pub words: Vec<DiarizationWordRecord>,
     pub utterances: Vec<DiarizationUtteranceRecord>,
     pub speaker_name_overrides: BTreeMap<String, String>,
+    pub izwi_diarization_diagnostics: Option<Value>,
     pub audio_mime_type: String,
     pub audio_filename: Option<String>,
     pub audio_bytes: Vec<u8>,
@@ -251,6 +255,7 @@ pub struct CompleteDiarizationRecord {
     pub segments: Vec<DiarizationSegmentRecord>,
     pub words: Vec<DiarizationWordRecord>,
     pub utterances: Vec<DiarizationUtteranceRecord>,
+    pub izwi_diarization_diagnostics: Option<Value>,
 }
 
 #[derive(Clone)]
@@ -472,6 +477,12 @@ impl DiarizationStore {
             serde_json::to_string(&record.utterances).context("Failed serializing utterances")?;
         let speaker_name_overrides_json = serde_json::to_string(&speaker_name_overrides)
             .context("Failed serializing speaker name overrides")?;
+        let diagnostics_json = record
+            .izwi_diarization_diagnostics
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("Failed serializing diarization diagnostics")?;
 
         if let Err(err) = diarization_records::Entity::insert(diarization_records::ActiveModel {
             id: Set(record_id.clone()),
@@ -510,6 +521,7 @@ impl DiarizationStore {
             words_json: Set(words_json),
             utterances_json: Set(utterances_json),
             speaker_name_overrides_json: Set(speaker_name_overrides_json),
+            diarization_diagnostics_json: Set(diagnostics_json),
             audio_mime_type: Set(audio_mime_type),
             audio_filename: Set(audio_filename),
             audio_storage_path: Set(audio_storage_path.clone()),
@@ -715,6 +727,12 @@ impl DiarizationStore {
             serde_json::to_string(&record.words).context("Failed serializing words")?;
         let utterances_json =
             serde_json::to_string(&record.utterances).context("Failed serializing utterances")?;
+        let diagnostics_json = record
+            .izwi_diarization_diagnostics
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("Failed serializing diarization diagnostics")?;
         let summary_model_id = sanitize_optional_text(record.summary_model_id.as_deref(), 160);
         let summary_text = sanitize_optional_text(record.summary_text.as_deref(), 20_000);
         let summary_error = sanitize_optional_text(record.summary_error.as_deref(), 1_000);
@@ -837,6 +855,10 @@ impl DiarizationStore {
                 diarization_records::Column::UtterancesJson,
                 Expr::value(utterances_json),
             )
+            .col_expr(
+                diarization_records::Column::DiarizationDiagnosticsJson,
+                Expr::value(diagnostics_json),
+            )
             .filter(diarization_records::Column::Id.eq(record_id.clone()))
             .filter(
                 diarization_records::Column::ProcessingStatus
@@ -934,6 +956,7 @@ const DIARIZATION_RECORD_COLUMNS: &str = r#"
     words_json,
     utterances_json,
     speaker_name_overrides_json,
+    diarization_diagnostics_json,
     audio_mime_type,
     audio_filename
 "#;
@@ -1035,6 +1058,7 @@ fn map_diarization_record(row: &QueryResult) -> anyhow::Result<DiarizationRecord
     let words_raw: String = row.try_get_by_index(29)?;
     let utterances_raw: String = row.try_get_by_index(30)?;
     let speaker_name_overrides = parse_json_map(row.try_get_by_index(31)?);
+    let izwi_diarization_diagnostics = parse_json_value(row.try_get_by_index(32)?);
     let segments: Vec<DiarizationSegmentRecord> = parse_json_vec(Some(segments_raw));
     let words: Vec<DiarizationWordRecord> = parse_json_vec(Some(words_raw));
     let utterances: Vec<DiarizationUtteranceRecord> = parse_json_vec(Some(utterances_raw));
@@ -1080,8 +1104,9 @@ fn map_diarization_record(row: &QueryResult) -> anyhow::Result<DiarizationRecord
         words,
         utterances,
         speaker_name_overrides,
-        audio_mime_type: row.try_get_by_index(32)?,
-        audio_filename: row.try_get_by_index(33)?,
+        izwi_diarization_diagnostics,
+        audio_mime_type: row.try_get_by_index(33)?,
+        audio_filename: row.try_get_by_index(34)?,
     })
 }
 
@@ -1096,6 +1121,10 @@ where
 fn parse_json_map(raw: Option<String>) -> BTreeMap<String, String> {
     raw.and_then(|value| serde_json::from_str::<BTreeMap<String, String>>(value.as_str()).ok())
         .unwrap_or_default()
+}
+
+fn parse_json_value(raw: Option<String>) -> Option<Value> {
+    raw.and_then(|value| serde_json::from_str::<Value>(value.as_str()).ok())
 }
 
 fn parse_processing_status(raw: Option<String>) -> DiarizationProcessingStatus {
@@ -1470,6 +1499,7 @@ mod tests {
                 },
             ],
             speaker_name_overrides: BTreeMap::new(),
+            izwi_diarization_diagnostics: None,
             audio_mime_type: "audio/wav".to_string(),
             audio_filename: Some("meeting.wav".to_string()),
             audio_bytes: vec![0_u8, 1_u8, 2_u8, 3_u8],
@@ -1505,6 +1535,7 @@ mod tests {
             segments: sample_record().segments,
             words: sample_record().words,
             utterances: sample_record().utterances,
+            izwi_diarization_diagnostics: None,
         }
     }
 

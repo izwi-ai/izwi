@@ -144,6 +144,52 @@ struct AsrBenchSample {
     response: AsrBenchResponse,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+struct DiarizeBenchResponse {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    duration_secs: Option<f64>,
+    #[serde(default)]
+    processing_time_ms: f64,
+    #[serde(default)]
+    rtf: Option<f64>,
+    #[serde(default)]
+    speaker_count: usize,
+    #[serde(default)]
+    processing_status: String,
+    #[serde(default)]
+    processing_error: Option<String>,
+    #[serde(default)]
+    izwi_diarization_diagnostics: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+struct DiarizeBenchSample {
+    total_ms: f64,
+    response: DiarizeBenchResponse,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct AlignBenchResponse {
+    #[serde(default)]
+    duration: Option<f64>,
+    #[serde(default)]
+    processing_time_ms: Option<f64>,
+    #[serde(default)]
+    word_count: Option<usize>,
+    #[serde(default)]
+    izwi_asr_diagnostics: Option<serde_json::Value>,
+    #[serde(default)]
+    izwi_alignment_diagnostics: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+struct AlignBenchSample {
+    total_ms: f64,
+    response: AlignBenchResponse,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AsrStageTimings {
     audio_decode: Option<f64>,
@@ -156,12 +202,19 @@ struct AsrStageTimings {
     encoder_attention: Option<f64>,
     encoder_conv: Option<f64>,
     encoder_norm: Option<f64>,
+    transformer_forward: Option<f64>,
+    head: Option<f64>,
+    host_read: Option<f64>,
     prompt_kernel: Option<f64>,
     language_detect: Option<f64>,
     resample: Option<f64>,
     mel: Option<f64>,
     audio_encode: Option<f64>,
+    prompt_build: Option<f64>,
     prefill: Option<f64>,
+    timestamp_argmax: Option<f64>,
+    timestamp_fixup: Option<f64>,
+    postprocess: Option<f64>,
     decode: Option<f64>,
     model_total: Option<f64>,
     prompt_tokens: Option<u64>,
@@ -201,6 +254,7 @@ struct AsrDecodeProfileTimings {
 
 #[derive(Debug, Clone, Copy, Serialize)]
 struct AsrExecutionDiagnostics {
+    kv_cache_enabled: Option<bool>,
     cuda_dense_decode_cache: Option<bool>,
     dense_head_decode_enabled: Option<bool>,
     dense_decode_max_tokens: Option<u64>,
@@ -270,6 +324,7 @@ struct BenchmarkReport {
 #[derive(Debug, Serialize)]
 struct BenchmarkRunConfig {
     model: Option<String>,
+    asr_model: Option<String>,
     iterations: Option<u32>,
     concurrent: Option<u32>,
     warmup: bool,
@@ -277,7 +332,9 @@ struct BenchmarkRunConfig {
     system: Option<String>,
     max_tokens: Option<usize>,
     text: Option<String>,
+    text_file: Option<String>,
     file: Option<String>,
+    num_speakers: Option<u32>,
     saved_voice_id: Option<String>,
     reference_audio: Option<String>,
     reference_text: Option<String>,
@@ -352,6 +409,7 @@ struct BenchmarkManifestCase {
     name: Option<String>,
     command: String,
     model: Option<String>,
+    asr_model: Option<String>,
     iterations: Option<u32>,
     concurrent: Option<u32>,
     warmup: Option<bool>,
@@ -359,7 +417,9 @@ struct BenchmarkManifestCase {
     system: Option<String>,
     max_tokens: Option<usize>,
     text: Option<String>,
+    text_file: Option<String>,
     file: Option<String>,
+    num_speakers: Option<u32>,
     saved_voice_id: Option<String>,
     reference_audio: Option<String>,
     reference_text: Option<String>,
@@ -372,6 +432,7 @@ struct BenchmarkManifestCase {
 #[derive(Debug, Clone, Deserialize, Default)]
 struct BenchmarkManifestMatrix {
     model: Option<Vec<String>>,
+    asr_model: Option<Vec<String>>,
     iterations: Option<Vec<u32>>,
     concurrent: Option<Vec<u32>>,
     warmup: Option<Vec<bool>>,
@@ -379,7 +440,9 @@ struct BenchmarkManifestMatrix {
     system: Option<Vec<String>>,
     max_tokens: Option<Vec<usize>>,
     text: Option<Vec<String>>,
+    text_file: Option<Vec<String>>,
     file: Option<Vec<String>>,
+    num_speakers: Option<Vec<u32>>,
     saved_voice_id: Option<Vec<String>>,
     reference_audio: Option<Vec<String>>,
     reference_text: Option<Vec<String>>,
@@ -397,6 +460,7 @@ struct MatrixDimension {
 #[derive(Debug, Clone)]
 enum MatrixValue {
     Model(String),
+    AsrModel(String),
     Iterations(u32),
     Concurrent(u32),
     Warmup(bool),
@@ -404,7 +468,9 @@ enum MatrixValue {
     System(String),
     MaxTokens(usize),
     Text(String),
+    TextFile(String),
     File(String),
+    NumSpeakers(u32),
     SavedVoiceId(String),
     ReferenceAudio(String),
     ReferenceText(String),
@@ -565,6 +631,52 @@ pub async fn execute(
         )
         .await
         .and_then(|report| emit_report(&options, &report)),
+        BenchCommands::Diarize {
+            model,
+            iterations,
+            file,
+            num_speakers,
+            asr_model,
+            concurrent,
+            warmup,
+        } => bench_diarize(
+            server,
+            &model,
+            iterations,
+            file,
+            num_speakers,
+            &asr_model,
+            concurrent,
+            warmup,
+            &options,
+            theme,
+        )
+        .await
+        .and_then(|report| emit_report(&options, &report)),
+        BenchCommands::Align {
+            model,
+            iterations,
+            file,
+            text,
+            text_file,
+            language,
+            concurrent,
+            warmup,
+        } => bench_align(
+            server,
+            &model,
+            iterations,
+            file,
+            text.as_deref(),
+            text_file.as_deref(),
+            language.as_deref(),
+            concurrent,
+            warmup,
+            &options,
+            theme,
+        )
+        .await
+        .and_then(|report| emit_report(&options, &report)),
         BenchCommands::Throughput {
             duration,
             concurrent,
@@ -689,6 +801,7 @@ impl MatrixValue {
     fn apply(&self, case: &mut BenchmarkManifestCase) {
         match self {
             MatrixValue::Model(value) => case.model = Some(value.clone()),
+            MatrixValue::AsrModel(value) => case.asr_model = Some(value.clone()),
             MatrixValue::Iterations(value) => case.iterations = Some(*value),
             MatrixValue::Concurrent(value) => case.concurrent = Some(*value),
             MatrixValue::Warmup(value) => case.warmup = Some(*value),
@@ -696,7 +809,9 @@ impl MatrixValue {
             MatrixValue::System(value) => case.system = Some(value.clone()),
             MatrixValue::MaxTokens(value) => case.max_tokens = Some(*value),
             MatrixValue::Text(value) => case.text = Some(value.clone()),
+            MatrixValue::TextFile(value) => case.text_file = Some(value.clone()),
             MatrixValue::File(value) => case.file = Some(value.clone()),
+            MatrixValue::NumSpeakers(value) => case.num_speakers = Some(*value),
             MatrixValue::SavedVoiceId(value) => case.saved_voice_id = Some(value.clone()),
             MatrixValue::ReferenceAudio(value) => case.reference_audio = Some(value.clone()),
             MatrixValue::ReferenceText(value) => case.reference_text = Some(value.clone()),
@@ -709,9 +824,11 @@ impl MatrixValue {
     fn label_value(&self) -> String {
         match self {
             MatrixValue::Model(value)
+            | MatrixValue::AsrModel(value)
             | MatrixValue::Prompt(value)
             | MatrixValue::System(value)
             | MatrixValue::Text(value)
+            | MatrixValue::TextFile(value)
             | MatrixValue::File(value)
             | MatrixValue::SavedVoiceId(value)
             | MatrixValue::ReferenceAudio(value)
@@ -721,6 +838,7 @@ impl MatrixValue {
             MatrixValue::Iterations(value) => value.to_string(),
             MatrixValue::Concurrent(value) => value.to_string(),
             MatrixValue::MaxTokens(value) => value.to_string(),
+            MatrixValue::NumSpeakers(value) => value.to_string(),
             MatrixValue::DurationSecs(value) => value.to_string(),
             MatrixValue::Warmup(value) => value.to_string(),
         }
@@ -731,6 +849,12 @@ impl BenchmarkManifestMatrix {
     fn dimensions(&self) -> Result<Vec<MatrixDimension>> {
         let mut dimensions = Vec::new();
         add_matrix_dimension(&mut dimensions, "model", &self.model, MatrixValue::Model)?;
+        add_matrix_dimension(
+            &mut dimensions,
+            "asr_model",
+            &self.asr_model,
+            MatrixValue::AsrModel,
+        )?;
         add_matrix_dimension(
             &mut dimensions,
             "iterations",
@@ -753,7 +877,19 @@ impl BenchmarkManifestMatrix {
             MatrixValue::MaxTokens,
         )?;
         add_matrix_dimension(&mut dimensions, "text", &self.text, MatrixValue::Text)?;
+        add_matrix_dimension(
+            &mut dimensions,
+            "text_file",
+            &self.text_file,
+            MatrixValue::TextFile,
+        )?;
         add_matrix_dimension(&mut dimensions, "file", &self.file, MatrixValue::File)?;
+        add_matrix_dimension(
+            &mut dimensions,
+            "num_speakers",
+            &self.num_speakers,
+            MatrixValue::NumSpeakers,
+        )?;
         add_matrix_dimension(
             &mut dimensions,
             "saved_voice_id",
@@ -1141,6 +1277,68 @@ async fn bench_manifest(
                 )
                 .await?
             }
+            "diarize" | "diarization" => {
+                let file = case.file.as_ref().map(|file| {
+                    let path = Path::new(file);
+                    if path.is_absolute() {
+                        path.to_path_buf()
+                    } else {
+                        manifest_dir.join(path)
+                    }
+                });
+                let model = case.model.as_deref().unwrap_or("sortformer-4spk");
+                let asr_model = case.asr_model.as_deref().unwrap_or("parakeet-tdt-0.6b-v3");
+                bench_diarize(
+                    &suite_server,
+                    model,
+                    case.iterations.unwrap_or(10),
+                    file,
+                    case.num_speakers,
+                    asr_model,
+                    case.concurrent.unwrap_or(1),
+                    case.warmup.unwrap_or(false),
+                    options,
+                    theme,
+                )
+                .await?
+            }
+            "align" | "alignment" => {
+                let file = case.file.as_ref().map(|file| {
+                    let path = Path::new(file);
+                    if path.is_absolute() {
+                        path.to_path_buf()
+                    } else {
+                        manifest_dir.join(path)
+                    }
+                });
+                let text_file = case
+                    .text_file
+                    .as_ref()
+                    .or(case.reference_text_file.as_ref())
+                    .map(|file| {
+                        let path = Path::new(file);
+                        if path.is_absolute() {
+                            path.to_path_buf()
+                        } else {
+                            manifest_dir.join(path)
+                        }
+                    });
+                let model = case.model.as_deref().unwrap_or("Qwen3-ForcedAligner-0.6B");
+                bench_align(
+                    &suite_server,
+                    model,
+                    case.iterations.unwrap_or(10),
+                    file,
+                    case.text.as_deref(),
+                    text_file.as_deref(),
+                    case.language.as_deref(),
+                    case.concurrent.unwrap_or(1),
+                    case.warmup.unwrap_or(false),
+                    options,
+                    theme,
+                )
+                .await?
+            }
             "throughput" => {
                 bench_throughput(
                     &suite_server,
@@ -1442,6 +1640,7 @@ async fn bench_chat(
         duration_ms: run_start.elapsed().as_secs_f64() * 1000.0,
         config: BenchmarkRunConfig {
             model: Some(model.to_string()),
+            asr_model: None,
             iterations: Some(iterations),
             concurrent: Some(concurrent),
             warmup,
@@ -1449,7 +1648,9 @@ async fn bench_chat(
             system: system.as_deref().map(|value| value.to_string()),
             max_tokens: Some(max_tokens),
             text: None,
+            text_file: None,
             file: None,
+            num_speakers: None,
             saved_voice_id: None,
             reference_audio: None,
             reference_text: None,
@@ -1685,6 +1886,7 @@ async fn bench_tts(
         duration_ms: run_start.elapsed().as_secs_f64() * 1000.0,
         config: BenchmarkRunConfig {
             model: Some(model.to_string()),
+            asr_model: None,
             iterations: Some(iterations),
             concurrent: Some(concurrent),
             warmup,
@@ -1692,7 +1894,9 @@ async fn bench_tts(
             system: None,
             max_tokens: None,
             text: Some(text.as_ref().clone()),
+            text_file: None,
             file: None,
+            num_speakers: None,
             saved_voice_id: reference.saved_voice_id.clone(),
             reference_audio: reference.reference_audio_path.clone(),
             reference_text: reference.reference_text.clone(),
@@ -1951,6 +2155,7 @@ async fn bench_asr(
         duration_ms: run_start.elapsed().as_secs_f64() * 1000.0,
         config: BenchmarkRunConfig {
             model: Some(model.to_string()),
+            asr_model: None,
             iterations: Some(iterations),
             concurrent: Some(concurrent),
             warmup,
@@ -1958,7 +2163,9 @@ async fn bench_asr(
             system: None,
             max_tokens,
             text: None,
+            text_file: None,
             file: Some(audio_file.display().to_string()),
+            num_speakers: None,
             saved_voice_id: None,
             reference_audio: None,
             reference_text: None,
@@ -2003,6 +2210,518 @@ async fn bench_asr(
                     .response
                     .izwi_asr_diagnostics
                     .as_ref()
+                    .and_then(asr_execution_from_diagnostics),
+            })
+            .collect(),
+        telemetry: RuntimeTelemetryReport {
+            delta_available: metrics_before.is_some() && metrics_after.is_some(),
+            before: metrics_before,
+            after: metrics_after,
+        },
+    })
+}
+
+async fn bench_diarize(
+    server: &str,
+    model: &str,
+    iterations: u32,
+    file: Option<PathBuf>,
+    num_speakers: Option<u32>,
+    asr_model: &str,
+    concurrent: u32,
+    warmup: bool,
+    options: &BenchOptions,
+    theme: &Theme,
+) -> Result<BenchmarkReport> {
+    if iterations == 0 {
+        return Err(CliError::InvalidInput(
+            "Iterations must be greater than 0".to_string(),
+        ));
+    }
+    if concurrent == 0 {
+        return Err(CliError::InvalidInput(
+            "Concurrent requests must be greater than 0".to_string(),
+        ));
+    }
+
+    if options.interactive() {
+        theme.step(1, 3, &format!("Benchmarking diarization with '{}'", model));
+    }
+    let started_at = Utc::now();
+    let run_start = Instant::now();
+    let metrics_before = fetch_runtime_metrics(server).await;
+
+    let audio_file = file.unwrap_or_else(|| PathBuf::from("data/diarization.wav"));
+    if !audio_file.exists() {
+        return Err(CliError::InvalidInput(format!(
+            "Audio file not found: {}",
+            audio_file.display()
+        )));
+    }
+    let audio_data = tokio::fs::read(&audio_file).await.map_err(CliError::Io)?;
+    let audio_base64 = STANDARD.encode(&audio_data);
+
+    if let Some(num_speakers) = num_speakers {
+        if num_speakers == 0 {
+            return Err(CliError::InvalidInput(
+                "Speaker count must be greater than 0".to_string(),
+            ));
+        }
+        if options.interactive() {
+            theme.info(&format!("Using fixed speaker count: {}", num_speakers));
+        }
+    }
+
+    if warmup {
+        if options.interactive() {
+            theme.info("Running warmup iteration...");
+        }
+        let _ = run_diarize_request(
+            server,
+            model,
+            asr_model,
+            &audio_file,
+            &audio_base64,
+            num_speakers,
+        )
+        .await?;
+    }
+
+    let pb = progress_bar(options.interactive(), iterations as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} iterations",
+            )
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+
+    let progress = Arc::new(pb);
+    let audio_base64 = Arc::new(audio_base64);
+    let audio_file = Arc::new(audio_file);
+    let wall_start = Instant::now();
+    let samples: Vec<DiarizeBenchSample> = stream::iter(0..iterations)
+        .map(|_| {
+            let progress = Arc::clone(&progress);
+            let audio_base64 = Arc::clone(&audio_base64);
+            let audio_file = Arc::clone(&audio_file);
+            let model = model.to_string();
+            let asr_model = asr_model.to_string();
+            let server = server.to_string();
+            async move {
+                let start = Instant::now();
+                let result = run_diarize_request(
+                    &server,
+                    &model,
+                    &asr_model,
+                    audio_file.as_ref(),
+                    audio_base64.as_str(),
+                    num_speakers,
+                )
+                .await
+                .map(|response| DiarizeBenchSample {
+                    total_ms: start.elapsed().as_secs_f64() * 1000.0,
+                    response,
+                });
+                progress.inc(1);
+                result
+            }
+        })
+        .buffer_unordered(concurrent as usize)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    let wall_elapsed = wall_start.elapsed();
+    progress.finish_with_message("Benchmark complete");
+
+    let times: Vec<f64> = samples.iter().map(|sample| sample.total_ms).collect();
+    let processing_ms: Vec<f64> = samples
+        .iter()
+        .map(|sample| sample.response.processing_time_ms)
+        .collect();
+    let audio_duration_secs: Vec<f64> = samples
+        .iter()
+        .filter_map(|sample| sample.response.duration_secs)
+        .collect();
+    let rtf: Vec<f64> = samples
+        .iter()
+        .filter_map(|sample| sample.response.rtf)
+        .collect();
+    let stage_samples: Vec<AsrStageTimings> = samples
+        .iter()
+        .filter_map(|sample| sample.response.izwi_diarization_diagnostics.as_ref())
+        .flat_map(collect_asr_stage_timings_from_diagnostics)
+        .collect();
+
+    let avg = times.iter().sum::<f64>() / times.len() as f64;
+    let min = times.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = times.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let p50 = percentile(&times, 0.5);
+    let p95 = percentile(&times, 0.95);
+    let p99 = percentile(&times, 0.99);
+    if options.human_output() {
+        println!("\n{}", console::style("Results:").bold().underlined());
+        println!("  Iterations: {}", iterations);
+        println!("  Concurrent: {}", concurrent);
+        println!("  Average:    {:.2} ms", avg);
+        println!("  Min:        {:.2} ms", min);
+        println!("  Max:        {:.2} ms", max);
+        println!("  P50:        {:.2} ms", p50);
+        println!("  P95:        {:.2} ms", p95);
+        println!("  P99:        {:.2} ms", p99);
+        println!(
+            "  Throughput: {:.2} req/s",
+            iterations as f64 / wall_elapsed.as_secs_f64()
+        );
+        if !audio_duration_secs.is_empty() {
+            println!(
+                "  Audio duration (avg/p50/p95): {:.2} / {:.2} / {:.2} s",
+                audio_duration_secs.iter().sum::<f64>() / audio_duration_secs.len() as f64,
+                percentile(&audio_duration_secs, 0.5),
+                percentile(&audio_duration_secs, 0.95)
+            );
+        }
+        if !rtf.is_empty() {
+            println!(
+                "  RTF (avg/p50/p95):            {:.3} / {:.3} / {:.3}",
+                rtf.iter().sum::<f64>() / rtf.len() as f64,
+                percentile(&rtf, 0.5),
+                percentile(&rtf, 0.95)
+            );
+        }
+        print_asr_stage_timing_summary(&stage_samples);
+    }
+
+    let metrics_after = fetch_runtime_metrics(server).await;
+    if options.human_output() {
+        print_runtime_delta(
+            metrics_before.clone(),
+            metrics_after.clone(),
+            RuntimeTelemetryContext::Default,
+        );
+    }
+    let ended_at = Utc::now();
+    Ok(BenchmarkReport {
+        schema_version: 1,
+        command: "diarize",
+        server: server.to_string(),
+        started_at,
+        ended_at,
+        duration_ms: run_start.elapsed().as_secs_f64() * 1000.0,
+        config: BenchmarkRunConfig {
+            model: Some(model.to_string()),
+            asr_model: Some(asr_model.to_string()),
+            iterations: Some(iterations),
+            concurrent: Some(concurrent),
+            warmup,
+            prompt: None,
+            system: None,
+            max_tokens: None,
+            text: None,
+            text_file: None,
+            file: Some(audio_file.display().to_string()),
+            num_speakers,
+            saved_voice_id: None,
+            reference_audio: None,
+            reference_text: None,
+            language: None,
+            duration_secs: None,
+        },
+        summary: BenchmarkSummary {
+            latency_ms: stats(&times),
+            ttft_ms: None,
+            end_to_end_ms: stats(&times),
+            completion_tps: None,
+            tokens_per_second: None,
+            server_generation_ms: None,
+            server_processing_ms: stats(&processing_ms),
+            audio_duration_secs: stats(&audio_duration_secs),
+            rtf: stats(&rtf),
+            prompt_tokens_avg: None,
+            completion_tokens_avg: None,
+            throughput_rps: Some(iterations as f64 / wall_elapsed.as_secs_f64()),
+            successful: Some(iterations as u64),
+            failed: Some(0),
+            total: Some(iterations as u64),
+        },
+        samples: samples
+            .iter()
+            .enumerate()
+            .map(|(index, sample)| BenchmarkSample {
+                index: index + 1,
+                latency_ms: Some(sample.total_ms),
+                ttft_ms: None,
+                end_to_end_ms: Some(sample.total_ms),
+                completion_tps: None,
+                tokens_per_second: None,
+                prompt_tokens: None,
+                completion_tokens: None,
+                server_generation_ms: None,
+                server_processing_ms: Some(sample.response.processing_time_ms),
+                audio_duration_secs: sample.response.duration_secs,
+                rtf: sample.response.rtf,
+                tokens_generated: None,
+                asr_execution: None,
+            })
+            .collect(),
+        telemetry: RuntimeTelemetryReport {
+            delta_available: metrics_before.is_some() && metrics_after.is_some(),
+            before: metrics_before,
+            after: metrics_after,
+        },
+    })
+}
+
+async fn bench_align(
+    server: &str,
+    model: &str,
+    iterations: u32,
+    file: Option<PathBuf>,
+    text: Option<&str>,
+    text_file: Option<&Path>,
+    language: Option<&str>,
+    concurrent: u32,
+    warmup: bool,
+    options: &BenchOptions,
+    theme: &Theme,
+) -> Result<BenchmarkReport> {
+    if iterations == 0 {
+        return Err(CliError::InvalidInput(
+            "Iterations must be greater than 0".to_string(),
+        ));
+    }
+    if concurrent == 0 {
+        return Err(CliError::InvalidInput(
+            "Concurrent requests must be greater than 0".to_string(),
+        ));
+    }
+
+    if options.interactive() {
+        theme.step(
+            1,
+            3,
+            &format!("Benchmarking forced alignment with '{}'", model),
+        );
+    }
+    let started_at = Utc::now();
+    let run_start = Instant::now();
+    let metrics_before = fetch_runtime_metrics(server).await;
+
+    let audio_file = file.unwrap_or_else(|| PathBuf::from("data/fox.wav"));
+    if !audio_file.exists() {
+        return Err(CliError::InvalidInput(format!(
+            "Audio file not found: {}",
+            audio_file.display()
+        )));
+    }
+    let reference_text = resolve_align_bench_text(text, text_file).await?;
+    let audio_data = tokio::fs::read(&audio_file).await.map_err(CliError::Io)?;
+    let audio_base64 = STANDARD.encode(&audio_data);
+
+    if let Some(language) = language {
+        if options.interactive() {
+            theme.info(&format!("Using language hint: {}", language));
+        }
+    }
+
+    if warmup {
+        if options.interactive() {
+            theme.info("Running warmup iteration...");
+        }
+        let _ = run_align_request(server, model, &audio_base64, &reference_text, language).await?;
+    }
+
+    let pb = progress_bar(options.interactive(), iterations as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} iterations",
+            )
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+
+    let progress = Arc::new(pb);
+    let audio_base64 = Arc::new(audio_base64);
+    let reference_text = Arc::new(reference_text);
+    let language = language.map(|value| Arc::new(value.to_string()));
+    let wall_start = Instant::now();
+    let samples: Vec<AlignBenchSample> = stream::iter(0..iterations)
+        .map(|_| {
+            let progress = Arc::clone(&progress);
+            let audio_base64 = Arc::clone(&audio_base64);
+            let reference_text = Arc::clone(&reference_text);
+            let language = language.clone();
+            let model = model.to_string();
+            let server = server.to_string();
+            async move {
+                let start = Instant::now();
+                let result = run_align_request(
+                    &server,
+                    &model,
+                    audio_base64.as_str(),
+                    reference_text.as_str(),
+                    language.as_deref().map(|value| value.as_str()),
+                )
+                .await
+                .map(|response| AlignBenchSample {
+                    total_ms: start.elapsed().as_secs_f64() * 1000.0,
+                    response,
+                });
+                progress.inc(1);
+                result
+            }
+        })
+        .buffer_unordered(concurrent as usize)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    let wall_elapsed = wall_start.elapsed();
+    progress.finish_with_message("Benchmark complete");
+
+    let times: Vec<f64> = samples.iter().map(|sample| sample.total_ms).collect();
+    let processing_ms: Vec<f64> = samples
+        .iter()
+        .filter_map(|sample| sample.response.processing_time_ms)
+        .collect();
+    let audio_duration_secs: Vec<f64> = samples
+        .iter()
+        .filter_map(|sample| sample.response.duration)
+        .collect();
+    let rtf: Vec<f64> = samples
+        .iter()
+        .filter_map(|sample| align_sample_rtf(&sample.response))
+        .collect();
+    let word_counts: Vec<f64> = samples
+        .iter()
+        .filter_map(|sample| sample.response.word_count.map(|value| value as f64))
+        .collect();
+    let stage_samples: Vec<AsrStageTimings> = samples
+        .iter()
+        .filter_map(|sample| align_response_diagnostics(&sample.response))
+        .flat_map(collect_asr_stage_timings_from_diagnostics)
+        .collect();
+
+    let avg = times.iter().sum::<f64>() / times.len() as f64;
+    let min = times.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = times.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let p50 = percentile(&times, 0.5);
+    let p95 = percentile(&times, 0.95);
+    let p99 = percentile(&times, 0.99);
+    if options.human_output() {
+        println!("\n{}", console::style("Results:").bold().underlined());
+        println!("  Iterations: {}", iterations);
+        println!("  Concurrent: {}", concurrent);
+        println!("  Average:    {:.2} ms", avg);
+        println!("  Min:        {:.2} ms", min);
+        println!("  Max:        {:.2} ms", max);
+        println!("  P50:        {:.2} ms", p50);
+        println!("  P95:        {:.2} ms", p95);
+        println!("  P99:        {:.2} ms", p99);
+        println!(
+            "  Throughput: {:.2} req/s",
+            iterations as f64 / wall_elapsed.as_secs_f64()
+        );
+        if !word_counts.is_empty() {
+            println!(
+                "  Words (avg/p50/p95):          {:.1} / {:.1} / {:.1}",
+                word_counts.iter().sum::<f64>() / word_counts.len() as f64,
+                percentile(&word_counts, 0.5),
+                percentile(&word_counts, 0.95)
+            );
+        }
+        if !audio_duration_secs.is_empty() {
+            println!(
+                "  Alignment duration (avg/p50/p95): {:.2} / {:.2} / {:.2} s",
+                audio_duration_secs.iter().sum::<f64>() / audio_duration_secs.len() as f64,
+                percentile(&audio_duration_secs, 0.5),
+                percentile(&audio_duration_secs, 0.95)
+            );
+        }
+        if !rtf.is_empty() {
+            println!(
+                "  RTF (avg/p50/p95):            {:.3} / {:.3} / {:.3}",
+                rtf.iter().sum::<f64>() / rtf.len() as f64,
+                percentile(&rtf, 0.5),
+                percentile(&rtf, 0.95)
+            );
+        }
+        print_asr_stage_timing_summary(&stage_samples);
+    }
+
+    let metrics_after = fetch_runtime_metrics(server).await;
+    if options.human_output() {
+        print_runtime_delta(
+            metrics_before.clone(),
+            metrics_after.clone(),
+            RuntimeTelemetryContext::Default,
+        );
+    }
+    let ended_at = Utc::now();
+    Ok(BenchmarkReport {
+        schema_version: 1,
+        command: "align",
+        server: server.to_string(),
+        started_at,
+        ended_at,
+        duration_ms: run_start.elapsed().as_secs_f64() * 1000.0,
+        config: BenchmarkRunConfig {
+            model: Some(model.to_string()),
+            asr_model: None,
+            iterations: Some(iterations),
+            concurrent: Some(concurrent),
+            warmup,
+            prompt: None,
+            system: None,
+            max_tokens: None,
+            text: Some(reference_text.as_ref().clone()),
+            text_file: text_file.map(|path| path.display().to_string()),
+            file: Some(audio_file.display().to_string()),
+            num_speakers: None,
+            saved_voice_id: None,
+            reference_audio: None,
+            reference_text: None,
+            language: language.as_deref().map(|value| value.to_string()),
+            duration_secs: None,
+        },
+        summary: BenchmarkSummary {
+            latency_ms: stats(&times),
+            ttft_ms: None,
+            end_to_end_ms: stats(&times),
+            completion_tps: None,
+            tokens_per_second: None,
+            server_generation_ms: None,
+            server_processing_ms: stats(&processing_ms),
+            audio_duration_secs: stats(&audio_duration_secs),
+            rtf: stats(&rtf),
+            prompt_tokens_avg: None,
+            completion_tokens_avg: None,
+            throughput_rps: Some(iterations as f64 / wall_elapsed.as_secs_f64()),
+            successful: Some(iterations as u64),
+            failed: Some(0),
+            total: Some(iterations as u64),
+        },
+        samples: samples
+            .iter()
+            .enumerate()
+            .map(|(index, sample)| BenchmarkSample {
+                index: index + 1,
+                latency_ms: Some(sample.total_ms),
+                ttft_ms: None,
+                end_to_end_ms: Some(sample.total_ms),
+                completion_tps: None,
+                tokens_per_second: None,
+                prompt_tokens: None,
+                completion_tokens: None,
+                server_generation_ms: None,
+                server_processing_ms: sample.response.processing_time_ms,
+                audio_duration_secs: sample.response.duration,
+                rtf: align_sample_rtf(&sample.response),
+                tokens_generated: sample.response.word_count.map(|value| value as u64),
+                asr_execution: align_response_diagnostics(&sample.response)
                     .and_then(asr_execution_from_diagnostics),
             })
             .collect(),
@@ -2094,6 +2813,7 @@ async fn bench_throughput(
         duration_ms: measured_elapsed.as_secs_f64() * 1000.0,
         config: BenchmarkRunConfig {
             model: None,
+            asr_model: None,
             iterations: None,
             concurrent: Some(concurrent),
             warmup: false,
@@ -2101,7 +2821,9 @@ async fn bench_throughput(
             system: None,
             max_tokens: None,
             text: None,
+            text_file: None,
             file: None,
+            num_speakers: None,
             saved_voice_id: None,
             reference_audio: None,
             reference_text: None,
@@ -2306,6 +3028,230 @@ async fn run_asr_request(
         .json::<AsrBenchResponse>()
         .await
         .map_err(|e| CliError::Other(format!("Failed to parse ASR benchmark response: {e}")))
+}
+
+async fn run_diarize_request(
+    server: &str,
+    model: &str,
+    asr_model: &str,
+    audio_file: &Path,
+    audio_base64: &str,
+    num_speakers: Option<u32>,
+) -> Result<DiarizeBenchResponse> {
+    let client = http::client(Some(std::time::Duration::from_secs(600)))?;
+    let mut request_body = serde_json::json!({
+        "model": model,
+        "audio_base64": audio_base64,
+        "asr_model": asr_model,
+        "include_transcript": false,
+    });
+    if let Some(filename) = audio_filename_from_path(audio_file) {
+        request_body["audio_filename"] = serde_json::Value::String(filename);
+    }
+    if let Some(mime_type) = audio_mime_type_from_path(audio_file) {
+        request_body["audio_mime_type"] = serde_json::Value::String(mime_type.to_string());
+    }
+    if let Some(num_speakers) = num_speakers {
+        request_body["min_speakers"] = serde_json::json!(num_speakers);
+        request_body["max_speakers"] = serde_json::json!(num_speakers);
+    }
+
+    let response = client
+        .post(create_diarization_job_url(server))
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| CliError::ConnectionError(e.to_string()))?;
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+        return Err(CliError::ApiError {
+            status,
+            message: text,
+        });
+    }
+
+    let created = response
+        .json::<DiarizeBenchResponse>()
+        .await
+        .map_err(|e| CliError::Other(format!("Failed to parse diarization job response: {e}")))?;
+    wait_for_diarization_bench_job(&client, server, created).await
+}
+
+async fn wait_for_diarization_bench_job(
+    client: &reqwest::Client,
+    server: &str,
+    mut record: DiarizeBenchResponse,
+) -> Result<DiarizeBenchResponse> {
+    let started = Instant::now();
+    let timeout = Duration::from_secs(600);
+    let poll_interval = Duration::from_millis(500);
+    let job_id = record.id.clone();
+    if job_id.trim().is_empty() {
+        return Err(CliError::Other(
+            "Diarization job response missing id".to_string(),
+        ));
+    }
+
+    loop {
+        match record.processing_status.as_str() {
+            "ready" => return Ok(record),
+            "failed" => {
+                return Err(CliError::ApiError {
+                    status: 500,
+                    message: record
+                        .processing_error
+                        .unwrap_or_else(|| "Diarization failed".to_string()),
+                });
+            }
+            "pending" | "processing" | "" => {}
+            other => {
+                return Err(CliError::Other(format!(
+                    "Unexpected diarization status: {other}"
+                )));
+            }
+        }
+
+        if started.elapsed() >= timeout {
+            return Err(CliError::Other(
+                "Timed out waiting for diarization benchmark job".to_string(),
+            ));
+        }
+
+        tokio::time::sleep(poll_interval).await;
+        let response = client
+            .get(diarization_job_url(server, &job_id))
+            .send()
+            .await
+            .map_err(|e| CliError::ConnectionError(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let text = response.text().await.unwrap_or_default();
+            return Err(CliError::ApiError {
+                status,
+                message: text,
+            });
+        }
+
+        record = response.json::<DiarizeBenchResponse>().await.map_err(|e| {
+            CliError::Other(format!("Failed to parse diarization poll response: {e}"))
+        })?;
+    }
+}
+
+async fn run_align_request(
+    server: &str,
+    model: &str,
+    audio_base64: &str,
+    reference_text: &str,
+    language: Option<&str>,
+) -> Result<AlignBenchResponse> {
+    let client = http::client(Some(std::time::Duration::from_secs(300)))?;
+    let mut request_body = serde_json::json!({
+        "model": model,
+        "audio_base64": audio_base64,
+        "text": reference_text,
+        "response_format": "verbose_json",
+    });
+    if let Some(language) = language {
+        request_body["language"] = serde_json::Value::String(language.to_string());
+    }
+
+    let response = client
+        .post(format!("{}/v1/audio/align", server))
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| CliError::ConnectionError(e.to_string()))?;
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+        return Err(CliError::ApiError {
+            status,
+            message: text,
+        });
+    }
+
+    response
+        .json::<AlignBenchResponse>()
+        .await
+        .map_err(|e| CliError::Other(format!("Failed to parse align benchmark response: {e}")))
+}
+
+async fn resolve_align_bench_text(text: Option<&str>, text_file: Option<&Path>) -> Result<String> {
+    if text.is_some() && text_file.is_some() {
+        return Err(CliError::InvalidInput(
+            "Use either --text or --text-file, not both.".to_string(),
+        ));
+    }
+    let resolved = match (text, text_file) {
+        (Some(text), None) => text.to_string(),
+        (None, Some(path)) => tokio::fs::read_to_string(path)
+            .await
+            .map_err(CliError::Io)?,
+        (None, None) => tokio::fs::read_to_string("data/fox.md")
+            .await
+            .unwrap_or_else(|_| "The quick brown fox jumps over the lazy dog".to_string()),
+        (Some(_), Some(_)) => unreachable!("checked above"),
+    };
+    let trimmed = resolved.trim();
+    if trimmed.is_empty() {
+        return Err(CliError::InvalidInput(
+            "Reference text cannot be empty".to_string(),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn align_sample_rtf(response: &AlignBenchResponse) -> Option<f64> {
+    let processing_time_ms = response.processing_time_ms?;
+    let duration_secs = response.duration?;
+    (duration_secs > 0.0).then_some((processing_time_ms / 1000.0) / duration_secs)
+}
+
+fn align_response_diagnostics(response: &AlignBenchResponse) -> Option<&serde_json::Value> {
+    response
+        .izwi_asr_diagnostics
+        .as_ref()
+        .or(response.izwi_alignment_diagnostics.as_ref())
+}
+
+fn create_diarization_job_url(server: &str) -> String {
+    format!("{}/v1/speech-to-text/jobs?job_kind=diarization", server)
+}
+
+fn diarization_job_url(server: &str, job_id: &str) -> String {
+    format!(
+        "{}/v1/speech-to-text/jobs/{}?job_kind=diarization",
+        server, job_id
+    )
+}
+
+fn audio_filename_from_path(path: &Path) -> Option<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn audio_mime_type_from_path(path: &Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("wav") => Some("audio/wav"),
+        Some("mp3") => Some("audio/mpeg"),
+        Some("flac") => Some("audio/flac"),
+        Some("ogg") => Some("audio/ogg"),
+        Some("m4a") => Some("audio/mp4"),
+        Some("aac") => Some("audio/aac"),
+        _ => None,
+    }
 }
 
 async fn run_chat_request(
@@ -2588,16 +3534,29 @@ fn asr_stage_timings_from_diagnostics(diagnostics: &serde_json::Value) -> Option
         feature_upload: timings
             .get("feature_upload")
             .and_then(|value| value.as_f64()),
-        subsample: timings.get("subsample").and_then(|value| value.as_f64()),
+        subsample: timings
+            .get("subsample")
+            .or_else(|| timings.get("pre_encode"))
+            .and_then(|value| value.as_f64()),
         encoder_forward: timings
             .get("encoder_forward")
+            .or_else(|| timings.get("conformer_forward"))
             .and_then(|value| value.as_f64()),
         encoder_ffn: timings.get("encoder_ffn").and_then(|value| value.as_f64()),
         encoder_attention: timings
             .get("encoder_attention")
+            .or_else(|| timings.get("conformer_attention"))
             .and_then(|value| value.as_f64()),
-        encoder_conv: timings.get("encoder_conv").and_then(|value| value.as_f64()),
+        encoder_conv: timings
+            .get("encoder_conv")
+            .or_else(|| timings.get("conformer_conv"))
+            .and_then(|value| value.as_f64()),
         encoder_norm: timings.get("encoder_norm").and_then(|value| value.as_f64()),
+        transformer_forward: timings
+            .get("transformer_forward")
+            .and_then(|value| value.as_f64()),
+        head: timings.get("head").and_then(|value| value.as_f64()),
+        host_read: timings.get("host_read").and_then(|value| value.as_f64()),
         prompt_kernel: timings
             .get("prompt_kernel")
             .and_then(|value| value.as_f64()),
@@ -2607,7 +3566,15 @@ fn asr_stage_timings_from_diagnostics(diagnostics: &serde_json::Value) -> Option
         resample: timings.get("resample").and_then(|value| value.as_f64()),
         mel: timings.get("mel").and_then(|value| value.as_f64()),
         audio_encode: timings.get("audio_encode").and_then(|value| value.as_f64()),
+        prompt_build: timings.get("prompt_build").and_then(|value| value.as_f64()),
         prefill: timings.get("prefill").and_then(|value| value.as_f64()),
+        timestamp_argmax: timings
+            .get("timestamp_argmax")
+            .and_then(|value| value.as_f64()),
+        timestamp_fixup: timings
+            .get("timestamp_fixup")
+            .and_then(|value| value.as_f64()),
+        postprocess: timings.get("postprocess").and_then(|value| value.as_f64()),
         decode: timings.get("decode").and_then(|value| value.as_f64()),
         model_total: timings.get("model_total").and_then(|value| value.as_f64()),
         prompt_tokens: diagnostic_u64(prompt, &["prompt_tokens", "tokens"]),
@@ -2652,6 +3619,9 @@ fn asr_execution_from_single_diagnostics(
 ) -> Option<AsrExecutionDiagnostics> {
     let execution = diagnostics.get("execution")?;
     let sample = AsrExecutionDiagnostics {
+        kv_cache_enabled: execution
+            .get("kv_cache_enabled")
+            .and_then(|value| value.as_bool()),
         cuda_dense_decode_cache: execution
             .get("cuda_dense_decode_cache")
             .and_then(|value| value.as_bool()),
@@ -2686,7 +3656,8 @@ fn asr_execution_from_single_diagnostics(
             .get("stop_check_interval")
             .and_then(|value| value.as_u64()),
     };
-    (sample.cuda_dense_decode_cache.is_some()
+    (sample.kv_cache_enabled.is_some()
+        || sample.cuda_dense_decode_cache.is_some()
         || sample.dense_head_decode_enabled.is_some()
         || sample.dense_decode_max_tokens.is_some()
         || sample.audio_embedding_cache_hit.is_some()
@@ -2928,12 +3899,19 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     let mut encoder_attention = Vec::new();
     let mut encoder_conv = Vec::new();
     let mut encoder_norm = Vec::new();
+    let mut transformer_forward = Vec::new();
+    let mut head = Vec::new();
+    let mut host_read = Vec::new();
     let mut prompt_kernel = Vec::new();
     let mut language_detect = Vec::new();
     let mut resample = Vec::new();
     let mut mel = Vec::new();
     let mut audio_encode = Vec::new();
+    let mut prompt_build = Vec::new();
     let mut prefill = Vec::new();
+    let mut timestamp_argmax = Vec::new();
+    let mut timestamp_fixup = Vec::new();
+    let mut postprocess = Vec::new();
     let mut decode = Vec::new();
     let mut model_total = Vec::new();
     let mut prompt_tokens = Vec::new();
@@ -2944,6 +3922,7 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     let mut host_argmax_reads = Vec::new();
     let mut device_argmax_reads = Vec::new();
     let mut cuda_dense_decode_cache = Vec::new();
+    let mut kv_cache_enabled = Vec::new();
     let mut dense_head_decode_enabled = Vec::new();
     let mut dense_decode_max_tokens = Vec::new();
     let mut audio_embedding_cache_hit = Vec::new();
@@ -2986,6 +3965,15 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         if let Some(value) = sample.encoder_norm {
             encoder_norm.push(value);
         }
+        if let Some(value) = sample.transformer_forward {
+            transformer_forward.push(value);
+        }
+        if let Some(value) = sample.head {
+            head.push(value);
+        }
+        if let Some(value) = sample.host_read {
+            host_read.push(value);
+        }
         if let Some(value) = sample.prompt_kernel {
             prompt_kernel.push(value);
         }
@@ -3001,8 +3989,20 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         if let Some(value) = sample.audio_encode {
             audio_encode.push(value);
         }
+        if let Some(value) = sample.prompt_build {
+            prompt_build.push(value);
+        }
         if let Some(value) = sample.prefill {
             prefill.push(value);
+        }
+        if let Some(value) = sample.timestamp_argmax {
+            timestamp_argmax.push(value);
+        }
+        if let Some(value) = sample.timestamp_fixup {
+            timestamp_fixup.push(value);
+        }
+        if let Some(value) = sample.postprocess {
+            postprocess.push(value);
         }
         if let Some(value) = sample.decode {
             decode.push(value);
@@ -3032,6 +4032,9 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
             device_argmax_reads.push(value);
         }
         if let Some(execution) = sample.execution {
+            if let Some(value) = execution.kv_cache_enabled {
+                kv_cache_enabled.push(value);
+            }
             if let Some(value) = execution.cuda_dense_decode_cache {
                 cuda_dense_decode_cache.push(value);
             }
@@ -3078,12 +4081,19 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         && encoder_attention.is_empty()
         && encoder_conv.is_empty()
         && encoder_norm.is_empty()
+        && transformer_forward.is_empty()
+        && head.is_empty()
+        && host_read.is_empty()
         && prompt_kernel.is_empty()
         && language_detect.is_empty()
         && resample.is_empty()
         && mel.is_empty()
         && audio_encode.is_empty()
+        && prompt_build.is_empty()
         && prefill.is_empty()
+        && timestamp_argmax.is_empty()
+        && timestamp_fixup.is_empty()
+        && postprocess.is_empty()
         && decode.is_empty()
         && model_total.is_empty()
         && prompt_tokens.is_empty()
@@ -3093,6 +4103,7 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         && rnnt_joint_steps.is_empty()
         && host_argmax_reads.is_empty()
         && device_argmax_reads.is_empty()
+        && kv_cache_enabled.is_empty()
         && cuda_dense_decode_cache.is_empty()
         && dense_head_decode_enabled.is_empty()
         && dense_decode_max_tokens.is_empty()
@@ -3110,7 +4121,7 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
 
     println!(
         "\n{}",
-        console::style("ASR Stage Timings (run-local):")
+        console::style("Model Stage Timings (run-local):")
             .bold()
             .underlined()
     );
@@ -3124,12 +4135,19 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     summarize_stage("encoder_attn", &encoder_attention);
     summarize_stage("encoder_conv", &encoder_conv);
     summarize_stage("encoder_norm", &encoder_norm);
+    summarize_stage("transformer", &transformer_forward);
+    summarize_stage("head", &head);
+    summarize_stage("host_read", &host_read);
     summarize_stage("prompt", &prompt_kernel);
     summarize_stage("lang_detect", &language_detect);
     summarize_stage("resample", &resample);
     summarize_stage("mel", &mel);
     summarize_stage("audio_encode", &audio_encode);
+    summarize_stage("prompt_build", &prompt_build);
     summarize_stage("prefill", &prefill);
+    summarize_stage("ts_argmax", &timestamp_argmax);
+    summarize_stage("ts_fixup", &timestamp_fixup);
+    summarize_stage("postprocess", &postprocess);
     summarize_stage("decode", &decode);
     summarize_stage("model_total", &model_total);
     summarize_count("prompt_tokens", &prompt_tokens);
@@ -3139,6 +4157,7 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     summarize_count("rnnt_steps", &rnnt_joint_steps);
     summarize_count("host_argmax", &host_argmax_reads);
     summarize_count("dev_argmax", &device_argmax_reads);
+    summarize_bool_count("kv_cache", &kv_cache_enabled);
     summarize_bool_count("cuda_dense", &cuda_dense_decode_cache);
     summarize_bool_count("dense_head", &dense_head_decode_enabled);
     summarize_count("dense_max", &dense_decode_max_tokens);

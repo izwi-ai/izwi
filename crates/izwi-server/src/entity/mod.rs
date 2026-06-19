@@ -212,6 +212,7 @@ pub mod diarization_records {
         pub words_json: String,
         pub utterances_json: String,
         pub speaker_name_overrides_json: String,
+        pub diarization_diagnostics_json: Option<String>,
         pub audio_mime_type: String,
         pub audio_filename: Option<String>,
         pub audio_storage_path: String,

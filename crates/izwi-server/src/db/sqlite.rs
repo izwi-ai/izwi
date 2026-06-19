@@ -293,6 +293,7 @@ mod tests {
         ("speech_history_records", "processing_status"),
         ("speech_history_records", "processing_error"),
         ("diarization_records", "speaker_name_overrides_json"),
+        ("diarization_records", "diarization_diagnostics_json"),
         ("diarization_records", "processing_status"),
         ("diarization_records", "processing_error"),
         ("diarization_records", "summary_status"),

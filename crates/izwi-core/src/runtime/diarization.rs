@@ -115,13 +115,12 @@ impl RuntimeService {
         model_id: Option<&str>,
         config: &DiarizationConfig,
     ) -> Result<DiarizationResult> {
-        let runtime_request =
-            DiarizationRuntimeRequest::from_bytes(
-                resolve_diarization_model_variant(model_id),
-                audio_bytes.to_vec(),
-                config.clone(),
-            )?
-            .with_pipeline_models(model_id.map(ToOwned::to_owned), None, None, None);
+        let runtime_request = DiarizationRuntimeRequest::from_bytes(
+            resolve_diarization_model_variant(model_id),
+            audio_bytes.to_vec(),
+            config.clone(),
+        )?
+        .with_pipeline_models(model_id.map(ToOwned::to_owned), None, None, None);
         let audio = decode_pipeline_audio_bytes(audio_bytes)?;
         self.diarize_samples(
             &audio.samples,
@@ -167,19 +166,18 @@ impl RuntimeService {
         enable_llm_refinement: bool,
     ) -> Result<DiarizationTranscriptResult> {
         let pipeline = resolve_diarization_transcript_pipeline(diarization_model_id);
-        let runtime_request =
-            DiarizationRuntimeRequest::from_bytes(
-                pipeline.model_variant(),
-                audio_bytes.to_vec(),
-                config.clone(),
-            )?
-            .with_pipeline_models(
-                diarization_model_id.map(ToOwned::to_owned),
-                asr_model_id.map(ToOwned::to_owned),
-                aligner_model_id.map(ToOwned::to_owned),
-                llm_model_id.map(ToOwned::to_owned),
-            )
-            .with_llm_refinement(enable_llm_refinement);
+        let runtime_request = DiarizationRuntimeRequest::from_bytes(
+            pipeline.model_variant(),
+            audio_bytes.to_vec(),
+            config.clone(),
+        )?
+        .with_pipeline_models(
+            diarization_model_id.map(ToOwned::to_owned),
+            asr_model_id.map(ToOwned::to_owned),
+            aligner_model_id.map(ToOwned::to_owned),
+            llm_model_id.map(ToOwned::to_owned),
+        )
+        .with_llm_refinement(enable_llm_refinement);
         self.record_diarization_transcript_pipeline(runtime_request.enable_llm_refinement);
         let audio = decode_pipeline_audio_bytes(audio_bytes)?;
         if matches!(pipeline, DiarizationTranscriptPipeline::GraniteStandalone) {
@@ -199,10 +197,9 @@ impl RuntimeService {
 
         let asr_variant = resolve_asr_model_variant(runtime_request.asr_model_id.as_deref());
 
-        let aligner_variant =
-            crate::runtime::asr::resolve_forced_aligner_variant(
-                runtime_request.aligner_model_id.as_deref(),
-            )?;
+        let aligner_variant = crate::runtime::asr::resolve_forced_aligner_variant(
+            runtime_request.aligner_model_id.as_deref(),
+        )?;
         let aligner_lease = match self.load_model(aligner_variant).await {
             Ok(()) => Some(self.acquire_model_residency_lease(aligner_variant)),
             Err(err) => {
@@ -378,6 +375,7 @@ impl RuntimeService {
             segments: diarization.segments,
             words,
             utterances,
+            diarization_diagnostics: diarization.diagnostics,
             asr_text,
             raw_transcript,
             transcript,
@@ -503,7 +501,9 @@ fn resolve_chat_variant(model_id: Option<&str>) -> Result<ModelVariant> {
 
 fn resolve_diarization_transcript_pipeline(input: Option<&str>) -> DiarizationTranscriptPipeline {
     let Some(raw) = input else {
-        return DiarizationTranscriptPipeline::ClassicStack(resolve_diarization_model_variant(None));
+        return DiarizationTranscriptPipeline::ClassicStack(resolve_diarization_model_variant(
+            None,
+        ));
     };
 
     if let Ok(variant) = parse_model_variant(raw) {
@@ -583,6 +583,7 @@ fn granite_diarization_result_from_texts(
         segments,
         words,
         utterances,
+        diarization_diagnostics: None,
         asr_text: speaker_parsed.text,
         raw_transcript: raw_transcript.clone(),
         transcript: raw_transcript,
@@ -2142,7 +2143,10 @@ mod tests {
         assert_eq!(result.words[0].speaker, "SPEAKER_00");
         assert_eq!(result.words[2].speaker, "SPEAKER_01");
         assert_eq!(result.alignment_coverage, 0.0);
-        assert!(result.words.iter().all(|word| word.end_secs > word.start_secs));
+        assert!(result
+            .words
+            .iter()
+            .all(|word| word.end_secs > word.start_secs));
     }
 
     #[test]

@@ -2,6 +2,7 @@ mod nemo;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::time::Instant;
 
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::ops;
@@ -16,6 +17,7 @@ use rustfft::FftPlanner;
 use crate::backends::{DeviceKind, DeviceProfile};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
+use crate::models::architectures::parakeet::asr::metal_kernels;
 use crate::models::shared::weights::mlx;
 use crate::runtime::{DiarizationConfig, DiarizationResult, DiarizationSegment};
 
@@ -30,6 +32,103 @@ const LOG_GUARD: f32 = 5.960_464_5e-8;
 const NORMALIZE_EPS: f32 = 1e-5;
 const TS_VAD_FRAME_LENGTH_SECS: f32 = 0.01;
 const TS_VAD_UNIT_FRAME_COUNT: usize = 8;
+
+#[derive(Debug, Clone, Default)]
+struct SortformerTimingDiagnostics {
+    resample_ms: f64,
+    feature_extract_ms: f64,
+    feature_upload_ms: f64,
+    pre_encode_ms: f64,
+    conformer_forward_ms: f64,
+    conformer_conv_ms: f64,
+    conformer_attention_ms: f64,
+    transformer_forward_ms: f64,
+    head_ms: f64,
+    host_read_ms: f64,
+    postprocess_ms: f64,
+    model_total_ms: f64,
+}
+
+#[derive(Debug, Clone)]
+struct SortformerDiarizationDiagnostics {
+    timings: SortformerTimingDiagnostics,
+    input_sample_rate: u32,
+    original_samples: usize,
+    resampled_samples: usize,
+    duration_secs: f32,
+    feature_frames: usize,
+    encoded_frames: usize,
+    prediction_frames: usize,
+    frame_stride_samples: usize,
+    streaming_chunks: usize,
+    backend: String,
+    streaming: bool,
+}
+
+impl SortformerDiarizationDiagnostics {
+    fn new(
+        input_sample_rate: u32,
+        original_samples: usize,
+        resampled_samples: usize,
+        duration_secs: f32,
+        backend: String,
+        streaming: bool,
+    ) -> Self {
+        Self {
+            timings: SortformerTimingDiagnostics::default(),
+            input_sample_rate,
+            original_samples,
+            resampled_samples,
+            duration_secs,
+            feature_frames: 0,
+            encoded_frames: 0,
+            prediction_frames: 0,
+            frame_stride_samples: 0,
+            streaming_chunks: 0,
+            backend,
+            streaming,
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "model_family": "sortformer_diarization",
+            "backend": self.backend,
+            "streaming": self.streaming,
+            "audio": {
+                "input_sample_rate": self.input_sample_rate,
+                "original_samples": self.original_samples,
+                "resampled_samples": self.resampled_samples,
+                "duration_secs": self.duration_secs,
+            },
+            "frames": {
+                "feature": self.feature_frames,
+                "encoded": self.encoded_frames,
+                "prediction": self.prediction_frames,
+                "frame_stride_samples": self.frame_stride_samples,
+                "streaming_chunks": self.streaming_chunks,
+            },
+            "timings_ms": {
+                "resample": self.timings.resample_ms,
+                "feature_extract": self.timings.feature_extract_ms,
+                "feature_upload": self.timings.feature_upload_ms,
+                "pre_encode": self.timings.pre_encode_ms,
+                "conformer_forward": self.timings.conformer_forward_ms,
+                "conformer_conv": self.timings.conformer_conv_ms,
+                "conformer_attention": self.timings.conformer_attention_ms,
+                "transformer_forward": self.timings.transformer_forward_ms,
+                "head": self.timings.head_ms,
+                "host_read": self.timings.host_read_ms,
+                "postprocess": self.timings.postprocess_ms,
+                "model_total": self.timings.model_total_ms,
+            },
+        })
+    }
+}
+
+fn elapsed_ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
+}
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct SortformerModelConfig {
@@ -274,6 +373,7 @@ impl SortformerDiarizerModel {
         sample_rate: u32,
         config: &DiarizationConfig,
     ) -> Result<DiarizationResult> {
+        let model_started = Instant::now();
         if audio.is_empty() {
             return Err(Error::InvalidInput("Empty audio input".to_string()));
         }
@@ -281,31 +381,52 @@ impl SortformerDiarizerModel {
             return Err(Error::InvalidInput("Invalid sample rate: 0".to_string()));
         }
 
+        let resample_started = Instant::now();
         let samples = if sample_rate == TARGET_SAMPLE_RATE {
             audio.to_vec()
         } else {
             resample_linear(audio, sample_rate, TARGET_SAMPLE_RATE)
         };
+        let resample_ms = if sample_rate == TARGET_SAMPLE_RATE {
+            0.0
+        } else {
+            elapsed_ms(resample_started)
+        };
 
         let duration_secs = samples.len() as f32 / TARGET_SAMPLE_RATE as f32;
+        let mut diagnostics = SortformerDiarizationDiagnostics::new(
+            sample_rate,
+            audio.len(),
+            samples.len(),
+            duration_secs,
+            sortformer_device_backend(&self.model.device).to_string(),
+            self.model.streaming.is_some(),
+        );
+        diagnostics.timings.resample_ms = resample_ms;
         if samples.is_empty() {
+            diagnostics.timings.model_total_ms = elapsed_ms(model_started);
             return Ok(DiarizationResult {
                 segments: Vec::new(),
                 duration_secs,
                 speaker_count: 0,
+                diagnostics: Some(diagnostics.to_json()),
             });
         }
 
-        let (speaker_probs, frame_stride_samples) =
-            self.model.infer_speaker_probabilities(&samples)?;
+        let (speaker_probs, frame_stride_samples) = self
+            .model
+            .infer_speaker_probabilities_with_diagnostics(&samples, &mut diagnostics)?;
         if speaker_probs.is_empty() {
+            diagnostics.timings.model_total_ms = elapsed_ms(model_started);
             return Ok(DiarizationResult {
                 segments: Vec::new(),
                 duration_secs,
                 speaker_count: 0,
+                diagnostics: Some(diagnostics.to_json()),
             });
         }
 
+        let postprocess_started = Instant::now();
         let explicit_min_speech_ms = config
             .min_speech_duration_ms
             .filter(|value| value.is_finite())
@@ -425,10 +546,13 @@ impl SortformerDiarizerModel {
         }
 
         if raw_segments.is_empty() {
+            diagnostics.timings.postprocess_ms += elapsed_ms(postprocess_started);
+            diagnostics.timings.model_total_ms = elapsed_ms(model_started);
             return Ok(DiarizationResult {
                 segments: Vec::new(),
                 duration_secs,
                 speaker_count: 0,
+                diagnostics: Some(diagnostics.to_json()),
             });
         }
 
@@ -499,11 +623,14 @@ impl SortformerDiarizerModel {
             .map(|segment| segment.speaker.as_str())
             .collect::<std::collections::BTreeSet<_>>()
             .len();
+        diagnostics.timings.postprocess_ms += elapsed_ms(postprocess_started);
+        diagnostics.timings.model_total_ms = elapsed_ms(model_started);
 
         Ok(DiarizationResult {
             segments,
             duration_secs,
             speaker_count,
+            diagnostics: Some(diagnostics.to_json()),
         })
     }
 
@@ -521,7 +648,37 @@ fn sortformer_model_device(device_profile: &DeviceProfile) -> Device {
 }
 
 fn sortformer_uses_selected_model_device(kind: DeviceKind) -> bool {
-    kind.is_cuda()
+    sortformer_uses_selected_model_device_with_metal_override(
+        kind,
+        sortformer_env_bool("IZWI_SORTFORMER_ENABLE_METAL")
+            .or_else(|| sortformer_env_bool("IZWI_SORTFORMER_METAL")),
+    )
+}
+
+fn sortformer_uses_selected_model_device_with_metal_override(
+    kind: DeviceKind,
+    metal_enabled: Option<bool>,
+) -> bool {
+    kind.is_cuda() || (kind.is_metal() && metal_enabled.unwrap_or(false))
+}
+
+fn sortformer_env_bool(name: &str) -> Option<bool> {
+    let value = std::env::var(name).ok()?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn sortformer_device_backend(device: &Device) -> &'static str {
+    if device.is_cuda() {
+        "cuda"
+    } else if device.is_metal() {
+        "metal"
+    } else {
+        "cpu"
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -607,10 +764,12 @@ impl SortformerInferenceModel {
         })
     }
 
-    fn infer_speaker_probabilities(
+    fn infer_speaker_probabilities_with_diagnostics(
         &self,
         samples: &[f32],
+        diagnostics: &mut SortformerDiarizationDiagnostics,
     ) -> Result<(Vec<[f32; MAX_SUPPORTED_SPEAKERS]>, usize)> {
+        let feature_started = Instant::now();
         let normalized_storage;
         let feature_input = if self.streaming.is_some() {
             samples
@@ -632,55 +791,85 @@ impl SortformerInferenceModel {
         };
 
         let (features, feature_frames) = self.preprocessor.compute_features(feature_input)?;
+        diagnostics.feature_frames = feature_frames;
+        diagnostics.timings.feature_extract_ms += elapsed_ms(feature_started);
         if feature_frames == 0 {
+            diagnostics.frame_stride_samples = self.encoder.frame_stride_samples();
             return Ok((Vec::new(), self.encoder.frame_stride_samples()));
         }
+        let upload_started = Instant::now();
         let features = features
             .narrow(2, 0, feature_frames)?
             .to_device(&self.device)?;
+        diagnostics.timings.feature_upload_ms += elapsed_ms(upload_started);
 
         let out = if let Some(streaming_cfg) = self.streaming {
-            self.infer_speaker_probabilities_streaming(&features, feature_frames, streaming_cfg)?
+            self.infer_speaker_probabilities_streaming_with_diagnostics(
+                &features,
+                feature_frames,
+                streaming_cfg,
+                diagnostics,
+            )?
         } else {
-            self.infer_speaker_probabilities_offline(&features, feature_frames)?
+            self.infer_speaker_probabilities_offline_with_diagnostics(
+                &features,
+                feature_frames,
+                diagnostics,
+            )?
         };
 
+        diagnostics.frame_stride_samples = self.encoder.frame_stride_samples();
+        diagnostics.prediction_frames = out.len();
         Ok((out, self.encoder.frame_stride_samples()))
     }
 
-    fn infer_speaker_probabilities_offline(
+    fn infer_speaker_probabilities_offline_with_diagnostics(
         &self,
         features: &Tensor,
         feature_frames: usize,
+        diagnostics: &mut SortformerDiarizationDiagnostics,
     ) -> Result<Vec<[f32; MAX_SUPPORTED_SPEAKERS]>> {
-        let (encoded, encoded_len) = self.encoder.forward(features, feature_frames)?;
+        let (encoded, encoded_len) =
+            self.encoder
+                .forward_with_diagnostics(features, feature_frames, diagnostics)?;
+        diagnostics.encoded_frames = encoded_len;
         if encoded_len == 0 {
             return Ok(Vec::new());
         }
-        let probs = self.forward_probabilities(&encoded, encoded_len)?;
-        tensor_to_probability_rows(&probs, encoded_len)
+        let probs =
+            self.forward_probabilities_with_diagnostics(&encoded, encoded_len, diagnostics)?;
+        let host_started = Instant::now();
+        let rows = tensor_to_probability_rows(&probs, encoded_len)?;
+        diagnostics.timings.host_read_ms += elapsed_ms(host_started);
+        Ok(rows)
     }
 
-    fn infer_speaker_probabilities_streaming(
+    fn infer_speaker_probabilities_streaming_with_diagnostics(
         &self,
         features: &Tensor,
         feature_frames: usize,
         cfg: SortformerStreamingConfig,
+        diagnostics: &mut SortformerDiarizationDiagnostics,
     ) -> Result<Vec<[f32; MAX_SUPPORTED_SPEAKERS]>> {
         let mut state = SortformerStreamingState::new(cfg.fc_d_model);
         let mut total_preds = Vec::new();
         for plan in plan_streaming_feature_chunks(feature_frames, cfg) {
+            diagnostics.streaming_chunks += 1;
             let chunk = features
                 .i((.., .., plan.feature_start..plan.feature_end))?
                 .transpose(1, 2)?
                 .contiguous()?;
+            let pre_encode_started = Instant::now();
             let (chunk_pre_encoded, chunk_pre_encoded_len) =
                 self.encoder.pre_encode(&chunk, chunk.dim(1)?)?;
+            diagnostics.timings.pre_encode_ms += elapsed_ms(pre_encode_started);
             if chunk_pre_encoded_len == 0 {
                 continue;
             }
 
+            let host_started = Instant::now();
             let chunk_rows = tensor_to_embedding_rows(&chunk_pre_encoded, chunk_pre_encoded_len)?;
+            diagnostics.timings.host_read_ms += elapsed_ms(host_started);
             let mut composite_rows =
                 Vec::with_capacity(state.spkcache.len() + state.fifo.len() + chunk_rows.len());
             composite_rows.extend(state.spkcache.iter().cloned());
@@ -695,12 +884,17 @@ impl SortformerInferenceModel {
                 cfg.fc_d_model,
                 chunk_pre_encoded.device(),
             )?;
-            let (encoded, encoded_len) = self.encoder.forward_pre_encoded(
+            let (encoded, encoded_len) = self.encoder.forward_pre_encoded_with_diagnostics(
                 &composite,
                 state.spkcache.len() + state.fifo.len() + chunk_rows.len(),
+                diagnostics,
             )?;
-            let probs = self.forward_probabilities(&encoded, encoded_len)?;
+            diagnostics.encoded_frames += encoded_len;
+            let probs =
+                self.forward_probabilities_with_diagnostics(&encoded, encoded_len, diagnostics)?;
+            let host_started = Instant::now();
             let pred_rows = tensor_to_probability_rows(&probs, encoded_len)?;
+            diagnostics.timings.host_read_ms += elapsed_ms(host_started);
             let (updated_state, chunk_preds) = update_streaming_state(
                 state,
                 &chunk_rows,
@@ -716,11 +910,20 @@ impl SortformerInferenceModel {
         Ok(total_preds)
     }
 
-    fn forward_probabilities(&self, encoded: &Tensor, encoded_len: usize) -> Result<Tensor> {
+    fn forward_probabilities_with_diagnostics(
+        &self,
+        encoded: &Tensor,
+        encoded_len: usize,
+        diagnostics: &mut SortformerDiarizationDiagnostics,
+    ) -> Result<Tensor> {
         let mut x = encoded.i((.., ..encoded_len, ..))?;
+        let transformer_started = Instant::now();
         x = x.apply(&self.encoder_proj)?;
         x = self.transformer.forward(&x)?;
+        diagnostics.timings.transformer_forward_ms += elapsed_ms(transformer_started);
+        let head_started = Instant::now();
         let probs = self.head.forward(&x)?;
+        diagnostics.timings.head_ms += elapsed_ms(head_started);
         let (_, _, speaker_dim) = probs.dims3()?;
         if speaker_dim != MAX_SUPPORTED_SPEAKERS {
             return Err(Error::InferenceError(format!(
@@ -1370,6 +1573,19 @@ impl SortformerConformerEncoder {
         self.forward_pre_encoded(&x, encoded_len)
     }
 
+    fn forward_with_diagnostics(
+        &self,
+        features: &Tensor,
+        feature_frames: usize,
+        diagnostics: &mut SortformerDiarizationDiagnostics,
+    ) -> Result<(Tensor, usize)> {
+        let features_t = features.transpose(1, 2)?;
+        let pre_encode_started = Instant::now();
+        let (x, encoded_len) = self.pre_encode(&features_t, feature_frames)?;
+        diagnostics.timings.pre_encode_ms += elapsed_ms(pre_encode_started);
+        self.forward_pre_encoded_with_diagnostics(&x, encoded_len, diagnostics)
+    }
+
     fn pre_encode(&self, features_t: &Tensor, feature_frames: usize) -> Result<(Tensor, usize)> {
         self.pre_encode.forward(features_t, feature_frames)
     }
@@ -1379,6 +1595,24 @@ impl SortformerConformerEncoder {
         pre_encoded: &Tensor,
         encoded_len: usize,
     ) -> Result<(Tensor, usize)> {
+        self.forward_pre_encoded_inner(pre_encoded, encoded_len, None)
+    }
+
+    fn forward_pre_encoded_with_diagnostics(
+        &self,
+        pre_encoded: &Tensor,
+        encoded_len: usize,
+        diagnostics: &mut SortformerDiarizationDiagnostics,
+    ) -> Result<(Tensor, usize)> {
+        self.forward_pre_encoded_inner(pre_encoded, encoded_len, Some(diagnostics))
+    }
+
+    fn forward_pre_encoded_inner(
+        &self,
+        pre_encoded: &Tensor,
+        encoded_len: usize,
+        mut diagnostics: Option<&mut SortformerDiarizationDiagnostics>,
+    ) -> Result<(Tensor, usize)> {
         let mut x = if self.input_scale != 1.0 {
             pre_encoded.affine(self.input_scale, 0.0)?
         } else {
@@ -1386,8 +1620,15 @@ impl SortformerConformerEncoder {
         };
         let pos_len = x.dim(1)?;
         let pos_emb = build_rel_positional_embedding(pos_len, self.d_model, x.device())?;
+        let conformer_started = Instant::now();
         for layer in &self.layers {
-            x = layer.forward(&x, &pos_emb)?;
+            x = match diagnostics.as_deref_mut() {
+                Some(diag) => layer.forward_with_diagnostics(&x, &pos_emb, diag)?,
+                None => layer.forward(&x, &pos_emb)?,
+            };
+        }
+        if let Some(diag) = diagnostics.as_deref_mut() {
+            diag.timings.conformer_forward_ms += elapsed_ms(conformer_started);
         }
         Ok((x, encoded_len))
     }
@@ -1539,17 +1780,43 @@ impl ConformerLayer {
     }
 
     fn forward(&self, x: &Tensor, pos_emb: &Tensor) -> Result<Tensor> {
+        self.forward_inner(x, pos_emb, None)
+    }
+
+    fn forward_with_diagnostics(
+        &self,
+        x: &Tensor,
+        pos_emb: &Tensor,
+        diagnostics: &mut SortformerDiarizationDiagnostics,
+    ) -> Result<Tensor> {
+        self.forward_inner(x, pos_emb, Some(diagnostics))
+    }
+
+    fn forward_inner(
+        &self,
+        x: &Tensor,
+        pos_emb: &Tensor,
+        mut diagnostics: Option<&mut SortformerDiarizationDiagnostics>,
+    ) -> Result<Tensor> {
         let mut residual = x.clone();
 
         let ff1 = self.ff1.forward(&self.norm_ff1.forward(&residual)?)?;
         residual = residual.broadcast_add(&ff1.affine(0.5, 0.0)?)?;
 
+        let attention_started = Instant::now();
         let attn = self
             .self_attn
             .forward(&self.norm_self_att.forward(&residual)?, pos_emb)?;
+        if let Some(diag) = diagnostics.as_deref_mut() {
+            diag.timings.conformer_attention_ms += elapsed_ms(attention_started);
+        }
         residual = residual.broadcast_add(&attn)?;
 
+        let conv_started = Instant::now();
         let conv = self.conv.forward(&self.norm_conv.forward(&residual)?)?;
+        if let Some(diag) = diagnostics.as_deref_mut() {
+            diag.timings.conformer_conv_ms += elapsed_ms(conv_started);
+        }
         residual = residual.broadcast_add(&conv)?;
 
         let ff2 = self.ff2.forward(&self.norm_ff2.forward(&residual)?)?;
@@ -1585,6 +1852,8 @@ impl FeedForward {
 struct ConformerConv {
     pointwise_conv1: Conv1d,
     depthwise_conv: Conv1d,
+    folded_depthwise_weight: Tensor,
+    folded_depthwise_bias: Tensor,
     batch_norm: candle_nn::BatchNorm,
     pointwise_conv2: Conv1d,
     d_model: usize,
@@ -1619,6 +1888,8 @@ impl ConformerConv {
         )?;
 
         let batch_norm = batch_norm(d_model, 1e-5, vb.pp("batch_norm"))?;
+        let (folded_depthwise_weight, folded_depthwise_bias) =
+            fold_depthwise_conv1d_batch_norm(&depthwise_conv, &batch_norm)?;
 
         let pointwise_conv2 = mlx::load_conv1d(
             d_model,
@@ -1631,6 +1902,8 @@ impl ConformerConv {
         Ok(Self {
             pointwise_conv1,
             depthwise_conv,
+            folded_depthwise_weight,
+            folded_depthwise_bias,
             batch_norm,
             pointwise_conv2,
             d_model,
@@ -1645,13 +1918,61 @@ impl ConformerConv {
         let x_b = x.i((.., self.d_model.., ..))?;
         x = x_a.broadcast_mul(&ops::sigmoid(&x_b)?)?;
 
-        x = self.depthwise_conv.forward(&x)?;
-        x = self.batch_norm.forward_t(&x, false)?;
-        x = swish(&x)?;
+        if let Some(fused) = metal_kernels::try_depthwise_conv1d_bias_swish(
+            &x,
+            &self.folded_depthwise_weight,
+            &self.folded_depthwise_bias,
+            self.depthwise_conv.config().padding,
+            self.depthwise_conv.config().stride,
+            self.depthwise_conv.config().dilation,
+        ) {
+            x = fused;
+        } else {
+            x = if let Some(depthwise) = metal_kernels::try_depthwise_conv1d(
+                &x,
+                self.depthwise_conv.weight(),
+                self.depthwise_conv.config().padding,
+                self.depthwise_conv.config().stride,
+                self.depthwise_conv.config().dilation,
+            ) {
+                depthwise
+            } else {
+                self.depthwise_conv.forward(&x)?
+            };
+            x = self.batch_norm.forward_t(&x, false)?;
+            x = swish(&x)?;
+        }
         x = self.pointwise_conv2.forward(&x)?;
 
         x.transpose(1, 2).map_err(Error::from)
     }
+}
+
+fn fold_depthwise_conv1d_batch_norm(
+    conv: &Conv1d,
+    batch_norm: &candle_nn::BatchNorm,
+) -> Result<(Tensor, Tensor)> {
+    let std = (batch_norm.running_var() + batch_norm.eps())?.sqrt()?;
+    let (scale, batch_norm_bias) = match batch_norm.weight_and_bias() {
+        Some((weight, bias)) => (weight.broadcast_div(&std)?, bias.clone()),
+        None => (
+            std.recip()?,
+            Tensor::zeros(std.dim(0)?, std.dtype(), std.device())?,
+        ),
+    };
+    let channels = scale.dim(0)?;
+    let folded_weight = conv
+        .weight()
+        .broadcast_mul(&scale.reshape((channels, 1, 1))?)?;
+    let centered_bias = match conv.bias() {
+        Some(bias) => bias.broadcast_sub(batch_norm.running_mean())?,
+        None => batch_norm.running_mean().affine(-1.0, 0.0)?,
+    };
+    let folded_bias = scale
+        .broadcast_mul(&centered_bias)?
+        .broadcast_add(&batch_norm_bias)?;
+
+    Ok((folded_weight, folded_bias))
 }
 
 struct RelPosSelfAttention {
@@ -2628,10 +2949,27 @@ mod tests {
     }
 
     #[test]
-    fn sortformer_only_uses_selected_model_device_for_cuda() {
-        assert!(!sortformer_uses_selected_model_device(DeviceKind::Cpu));
-        assert!(!sortformer_uses_selected_model_device(DeviceKind::Metal));
-        assert!(sortformer_uses_selected_model_device(DeviceKind::Cuda));
+    fn sortformer_uses_metal_only_when_explicitly_enabled() {
+        assert!(!sortformer_uses_selected_model_device_with_metal_override(
+            DeviceKind::Cpu,
+            Some(true),
+        ));
+        assert!(!sortformer_uses_selected_model_device_with_metal_override(
+            DeviceKind::Metal,
+            None,
+        ));
+        assert!(!sortformer_uses_selected_model_device_with_metal_override(
+            DeviceKind::Metal,
+            Some(false),
+        ));
+        assert!(sortformer_uses_selected_model_device_with_metal_override(
+            DeviceKind::Metal,
+            Some(true),
+        ));
+        assert!(sortformer_uses_selected_model_device_with_metal_override(
+            DeviceKind::Cuda,
+            Some(false),
+        ));
     }
 
     #[test]

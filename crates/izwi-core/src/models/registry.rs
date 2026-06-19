@@ -27,8 +27,9 @@ use crate::models::architectures::parakeet::asr::{
     ParakeetAsrModel, ParakeetAsrTranscriptionOutput,
 };
 use crate::models::architectures::qwen3::asr::{
-    AsrDecodeState as Qwen3AsrDecodeState, AsrDecodeStep as Qwen3AsrDecodeStep,
-    AsrTranscriptionOutput as Qwen3AsrTranscriptionOutput, Qwen3AsrModel,
+    AsrAlignmentOutput as Qwen3AsrAlignmentOutput, AsrDecodeState as Qwen3AsrDecodeState,
+    AsrDecodeStep as Qwen3AsrDecodeStep, AsrTranscriptionOutput as Qwen3AsrTranscriptionOutput,
+    Qwen3AsrModel,
 };
 use crate::models::architectures::qwen3::chat::{
     ChatDecodeState as Qwen3ChatDecodeState, ChatGenerationOutput, Qwen3ChatModel,
@@ -559,6 +560,12 @@ pub struct NativeAsrTranscription {
     pub diagnostics: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone)]
+pub struct NativeForcedAlignment {
+    pub alignments: Vec<(String, u32, u32)>,
+    pub diagnostics: Option<serde_json::Value>,
+}
+
 fn vibevoice_asr_options(options: NativeAsrGenerationOptions) -> VibeVoiceAsrGenerationOptions {
     VibeVoiceAsrGenerationOptions {
         max_new_tokens: options.max_new_tokens,
@@ -943,8 +950,28 @@ impl NativeAsrModel {
         reference_text: &str,
         language: Option<&str>,
     ) -> Result<Vec<(String, u32, u32)>> {
+        self.force_align_with_details(audio, sample_rate, reference_text, language)
+            .map(|output| output.alignments)
+    }
+
+    pub fn force_align_with_details(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        reference_text: &str,
+        language: Option<&str>,
+    ) -> Result<NativeForcedAlignment> {
         match self {
-            Self::Qwen3(model) => model.force_align(audio, sample_rate, reference_text, language),
+            Self::Qwen3(model) => {
+                let Qwen3AsrAlignmentOutput {
+                    alignments,
+                    diagnostics,
+                } = model.force_align_with_details(audio, sample_rate, reference_text, language)?;
+                Ok(NativeForcedAlignment {
+                    alignments,
+                    diagnostics,
+                })
+            }
             Self::Parakeet(_) => Err(Error::InvalidInput(
                 "Forced alignment is only available for Qwen3-ForcedAligner models".to_string(),
             )),

@@ -1,9 +1,9 @@
 use axum::{
-    Json, RequestExt,
     body::Body,
     extract::{Extension, Multipart, Path, Query, Request, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
+    Json, RequestExt,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -14,7 +14,7 @@ use crate::api::audio_payload::{
     decode_base64_audio_payload, inspect_audio_payload_with_diagnostics,
     read_multipart_audio_base64_payload, read_multipart_audio_file_payload,
 };
-use crate::api::pagination::{CursorPagination, CursorPaginationQuery, encode_cursor};
+use crate::api::pagination::{encode_cursor, CursorPagination, CursorPaginationQuery};
 use crate::api::request_context::RequestContext;
 use crate::diarization_store::{
     CompleteDiarizationRecord, DiarizationProcessingStatus, DiarizationRecord,
@@ -25,8 +25,8 @@ use crate::diarization_store::{
 use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::{
-    ChatMessage, ChatRole, DiarizationConfig, GenerationParams, RuntimeService,
-    parse_chat_model_variant,
+    parse_chat_model_variant, ChatMessage, ChatRole, DiarizationConfig, GenerationParams,
+    RuntimeService,
 };
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
@@ -83,6 +83,7 @@ struct ParsedDiarizationCreateRequest {
     min_speech_duration_ms: Option<f64>,
     min_silence_duration_ms: Option<f64>,
     enable_llm_refinement: Option<bool>,
+    include_transcript: Option<bool>,
     stream: bool,
 }
 
@@ -107,6 +108,8 @@ struct JsonCreateRequest {
     min_silence_duration_ms: Option<f64>,
     #[serde(default)]
     enable_llm_refinement: Option<bool>,
+    #[serde(default, alias = "transcribe")]
+    include_transcript: Option<bool>,
     #[serde(default)]
     audio_mime_type: Option<String>,
     #[serde(default)]
@@ -365,6 +368,7 @@ async fn create_pending_record(
             words: Vec::new(),
             utterances: Vec::new(),
             speaker_name_overrides: BTreeMap::new(),
+            izwi_diarization_diagnostics: None,
             audio_mime_type: resolve_source_audio_mime_type(
                 parsed.audio_mime_type.as_deref(),
                 parsed.audio_filename.as_deref(),
@@ -393,6 +397,7 @@ struct GeneratedDiarizationArtifacts {
     segments: Vec<DiarizationSegmentRecord>,
     words: Vec<DiarizationWordRecord>,
     utterances: Vec<DiarizationUtteranceRecord>,
+    izwi_diarization_diagnostics: Option<serde_json::Value>,
 }
 
 fn spawn_diarization_processing_task(
@@ -478,6 +483,7 @@ fn spawn_diarization_processing_task(
                             segments: artifacts.segments,
                             words: artifacts.words,
                             utterances: artifacts.utterances,
+                            izwi_diarization_diagnostics: artifacts.izwi_diarization_diagnostics,
                         },
                     )
                     .await
@@ -526,6 +532,52 @@ async fn generate_diarization_artifacts(
 ) -> Result<GeneratedDiarizationArtifacts, ApiError> {
     let _permit = stateful_acquire(semaphore).await?;
     let started = Instant::now();
+    let diarization_config = DiarizationConfig {
+        min_speakers: parsed.min_speakers,
+        max_speakers: parsed.max_speakers,
+        min_speech_duration_ms: parsed.min_speech_duration_ms.map(|v| v as f32),
+        min_silence_duration_ms: parsed.min_silence_duration_ms.map(|v| v as f32),
+    };
+    if parsed.include_transcript == Some(false) {
+        let output = runtime
+            .diarize_bytes(audio_bytes, parsed.model_id.as_deref(), &diarization_config)
+            .await?;
+        let processing_time_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let rtf = if output.duration_secs > 0.0 {
+            Some((processing_time_ms / 1000.0) / output.duration_secs as f64)
+        } else {
+            None
+        };
+        let (summary_status, summary_model_id) = initial_summary_state("");
+        return Ok(GeneratedDiarizationArtifacts {
+            duration_secs: output.duration_secs as f64,
+            processing_time_ms,
+            rtf,
+            speaker_count: output.speaker_count,
+            alignment_coverage: None,
+            unattributed_words: 0,
+            llm_refined: false,
+            asr_text: String::new(),
+            raw_transcript: String::new(),
+            transcript: String::new(),
+            summary_status,
+            summary_model_id,
+            segments: output
+                .segments
+                .into_iter()
+                .map(|segment| DiarizationSegmentRecord {
+                    speaker: segment.speaker,
+                    start: segment.start_secs,
+                    end: segment.end_secs,
+                    confidence: segment.confidence,
+                })
+                .collect(),
+            words: Vec::new(),
+            utterances: Vec::new(),
+            izwi_diarization_diagnostics: output.diagnostics,
+        });
+    }
+
     // Keep diarization processing unbounded by wall-clock timeout so valid
     // long jobs can finish and persist successfully.
     let output = runtime
@@ -535,12 +587,7 @@ async fn generate_diarization_artifacts(
             parsed.asr_model_id.as_deref(),
             parsed.aligner_model_id.as_deref(),
             parsed.llm_model_id.as_deref(),
-            &DiarizationConfig {
-                min_speakers: parsed.min_speakers,
-                max_speakers: parsed.max_speakers,
-                min_speech_duration_ms: parsed.min_speech_duration_ms.map(|v| v as f32),
-                min_silence_duration_ms: parsed.min_silence_duration_ms.map(|v| v as f32),
-            },
+            &diarization_config,
             parsed.enable_llm_refinement.unwrap_or(false),
         )
         .await?;
@@ -600,6 +647,7 @@ async fn generate_diarization_artifacts(
                 word_end: utterance.word_end,
             })
             .collect(),
+        izwi_diarization_diagnostics: output.diarization_diagnostics,
     })
 }
 
@@ -638,6 +686,7 @@ fn build_rerun_create_request(
                 .enable_llm_refinement
                 .unwrap_or(source_record.enable_llm_refinement),
         ),
+        include_transcript: Some(true),
         stream: false,
     }
 }
@@ -936,6 +985,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
             min_speech_duration_ms: payload.min_speech_duration_ms,
             min_silence_duration_ms: payload.min_silence_duration_ms,
             enable_llm_refinement: payload.enable_llm_refinement,
+            include_transcript: payload.include_transcript,
             stream: payload.stream.unwrap_or(false),
         });
     }
@@ -1076,6 +1126,15 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
                     })?;
                     out.enable_llm_refinement = Some(parse_truthy(text.as_str()));
                 }
+                "include_transcript" | "transcribe" => {
+                    let text = field.text().await.map_err(|err| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart '{}' field: {err}",
+                            name
+                        ))
+                    })?;
+                    out.include_transcript = Some(parse_truthy(text.as_str()));
+                }
                 "stream" => {
                     let text = field.text().await.map_err(|err| {
                         ApiError::bad_request(format!(
@@ -1207,6 +1266,7 @@ mod tests {
             words: Vec::new(),
             utterances: Vec::new(),
             speaker_name_overrides: BTreeMap::new(),
+            izwi_diarization_diagnostics: None,
             audio_mime_type: "audio/wav".to_string(),
             audio_filename: Some("meeting.wav".to_string()),
         }

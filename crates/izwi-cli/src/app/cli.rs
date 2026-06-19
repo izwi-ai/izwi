@@ -579,6 +579,72 @@ pub enum BenchCommands {
         warmup: bool,
     },
 
+    /// Benchmark diarization inference
+    Diarize {
+        /// Diarization model to benchmark
+        #[arg(short, long, default_value = "sortformer-4spk")]
+        model: String,
+
+        /// Number of iterations
+        #[arg(short, long, default_value = "10")]
+        iterations: u32,
+
+        /// Audio file to use
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+
+        /// Expected number of speakers (optional, auto-detect if not specified)
+        #[arg(short = 'n', long)]
+        num_speakers: Option<u32>,
+
+        /// ASR model used for transcript generation
+        #[arg(long, default_value = "parakeet-tdt-0.6b-v3")]
+        asr_model: String,
+
+        /// Maximum concurrent requests
+        #[arg(short, long, default_value = "1")]
+        concurrent: u32,
+
+        /// Enable warmup iteration
+        #[arg(long)]
+        warmup: bool,
+    },
+
+    /// Benchmark forced alignment inference
+    Align {
+        /// Forced aligner model to benchmark
+        #[arg(short, long, default_value = "Qwen3-ForcedAligner-0.6B")]
+        model: String,
+
+        /// Number of iterations
+        #[arg(short, long, default_value = "10")]
+        iterations: u32,
+
+        /// Audio file to use
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+
+        /// Reference text to align
+        #[arg(short, long)]
+        text: Option<String>,
+
+        /// File containing the reference text to align
+        #[arg(long, value_name = "PATH")]
+        text_file: Option<PathBuf>,
+
+        /// Optional language hint (for example: en, es)
+        #[arg(short = 'l', long)]
+        language: Option<String>,
+
+        /// Maximum concurrent requests
+        #[arg(short, long, default_value = "1")]
+        concurrent: u32,
+
+        /// Enable warmup iteration
+        #[arg(long)]
+        warmup: bool,
+    },
+
     /// Benchmark system throughput
     Throughput {
         /// Duration in seconds

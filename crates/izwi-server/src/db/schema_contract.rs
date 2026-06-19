@@ -1,5 +1,5 @@
 use crate::{db::raw, voice_defaults::DEFAULT_VOICE_PROFILE_ID};
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend};
 use std::collections::HashSet;
 
@@ -158,6 +158,7 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "words_json",
             "utterances_json",
             "speaker_name_overrides_json",
+            "diarization_diagnostics_json",
             "audio_mime_type",
             "audio_filename",
             "audio_storage_path",

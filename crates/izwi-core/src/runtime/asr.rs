@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::catalog::{ModelFamily, parse_model_variant, resolve_asr_model_variant};
+use crate::catalog::{parse_model_variant, resolve_asr_model_variant, ModelFamily};
 use crate::engine::EngineCoreRequest;
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
@@ -11,7 +11,7 @@ use crate::runtime::adapters::CapabilityKind;
 use crate::runtime::audio_io::{base64_decode, decode_audio_bytes};
 use crate::runtime::request::{AlignmentRuntimeRequest, AsrRuntimeRequest};
 use crate::runtime::service::RuntimeService;
-use crate::runtime::types::AsrTranscription;
+use crate::runtime::types::{AsrTranscription, ForcedAlignmentResult};
 
 #[derive(Clone, Copy)]
 enum AsrAudioInput<'a> {
@@ -978,6 +978,23 @@ impl RuntimeService {
         language: Option<&str>,
         model_id: Option<&str>,
     ) -> Result<Vec<(String, u32, u32)>> {
+        self.force_align_bytes_with_model_and_language_details(
+            audio_bytes,
+            reference_text,
+            language,
+            model_id,
+        )
+        .await
+        .map(|output| output.alignments)
+    }
+
+    pub async fn force_align_bytes_with_model_and_language_details(
+        &self,
+        audio_bytes: &[u8],
+        reference_text: &str,
+        language: Option<&str>,
+        model_id: Option<&str>,
+    ) -> Result<ForcedAlignmentResult> {
         let variant = resolve_forced_aligner_variant(model_id)?;
         let _runtime_request = AlignmentRuntimeRequest::from_bytes(
             variant,
@@ -1000,7 +1017,12 @@ impl RuntimeService {
             .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?;
 
         let (samples, sample_rate) = decode_audio_bytes(audio_bytes)?;
-        model.force_align(&samples, sample_rate, reference_text, language)
+        let output =
+            model.force_align_with_details(&samples, sample_rate, reference_text, language)?;
+        Ok(ForcedAlignmentResult {
+            alignments: output.alignments,
+            diagnostics: output.diagnostics,
+        })
     }
 }
 
