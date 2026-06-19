@@ -45,6 +45,8 @@ struct SortformerTimingDiagnostics {
     transformer_forward_ms: f64,
     head_ms: f64,
     host_read_ms: f64,
+    device_sync_ms: f64,
+    host_copy_ms: f64,
     postprocess_ms: f64,
     model_total_ms: f64,
 }
@@ -119,6 +121,8 @@ impl SortformerDiarizationDiagnostics {
                 "transformer_forward": self.timings.transformer_forward_ms,
                 "head": self.timings.head_ms,
                 "host_read": self.timings.host_read_ms,
+                "device_sync": self.timings.device_sync_ms,
+                "host_copy": self.timings.host_copy_ms,
                 "postprocess": self.timings.postprocess_ms,
                 "model_total": self.timings.model_total_ms,
             },
@@ -838,10 +842,7 @@ impl SortformerInferenceModel {
         }
         let probs =
             self.forward_probabilities_with_diagnostics(&encoded, encoded_len, diagnostics)?;
-        let host_started = Instant::now();
-        let rows = tensor_to_probability_rows(&probs, encoded_len)?;
-        diagnostics.timings.host_read_ms += elapsed_ms(host_started);
-        Ok(rows)
+        tensor_to_probability_rows_with_diagnostics(&probs, encoded_len, diagnostics)
     }
 
     fn infer_speaker_probabilities_streaming_with_diagnostics(
@@ -867,9 +868,11 @@ impl SortformerInferenceModel {
                 continue;
             }
 
-            let host_started = Instant::now();
-            let chunk_rows = tensor_to_embedding_rows(&chunk_pre_encoded, chunk_pre_encoded_len)?;
-            diagnostics.timings.host_read_ms += elapsed_ms(host_started);
+            let chunk_rows = tensor_to_embedding_rows_with_diagnostics(
+                &chunk_pre_encoded,
+                chunk_pre_encoded_len,
+                diagnostics,
+            )?;
             let mut composite_rows =
                 Vec::with_capacity(state.spkcache.len() + state.fifo.len() + chunk_rows.len());
             composite_rows.extend(state.spkcache.iter().cloned());
@@ -892,9 +895,8 @@ impl SortformerInferenceModel {
             diagnostics.encoded_frames += encoded_len;
             let probs =
                 self.forward_probabilities_with_diagnostics(&encoded, encoded_len, diagnostics)?;
-            let host_started = Instant::now();
-            let pred_rows = tensor_to_probability_rows(&probs, encoded_len)?;
-            diagnostics.timings.host_read_ms += elapsed_ms(host_started);
+            let pred_rows =
+                tensor_to_probability_rows_with_diagnostics(&probs, encoded_len, diagnostics)?;
             let (updated_state, chunk_preds) = update_streaming_state(
                 state,
                 &chunk_rows,
@@ -1055,6 +1057,22 @@ fn tensor_to_embedding_rows(tensor: &Tensor, row_count: usize) -> Result<Vec<Vec
         .collect::<Vec<_>>())
 }
 
+fn tensor_to_embedding_rows_with_diagnostics(
+    tensor: &Tensor,
+    row_count: usize,
+    diagnostics: &mut SortformerDiarizationDiagnostics,
+) -> Result<Vec<Vec<f32>>> {
+    let sync_ms = synchronize_tensor_for_host_read(tensor)?;
+    diagnostics.timings.device_sync_ms += sync_ms;
+
+    let copy_started = Instant::now();
+    let rows = tensor_to_embedding_rows(tensor, row_count)?;
+    let copy_ms = elapsed_ms(copy_started);
+    diagnostics.timings.host_copy_ms += copy_ms;
+    diagnostics.timings.host_read_ms += sync_ms + copy_ms;
+    Ok(rows)
+}
+
 fn tensor_to_probability_rows(
     tensor: &Tensor,
     row_count: usize,
@@ -1076,6 +1094,33 @@ fn tensor_to_probability_rows(
         .chunks(MAX_SUPPORTED_SPEAKERS)
         .map(|chunk| [chunk[0], chunk[1], chunk[2], chunk[3]])
         .collect::<Vec<_>>())
+}
+
+fn tensor_to_probability_rows_with_diagnostics(
+    tensor: &Tensor,
+    row_count: usize,
+    diagnostics: &mut SortformerDiarizationDiagnostics,
+) -> Result<Vec<[f32; MAX_SUPPORTED_SPEAKERS]>> {
+    let sync_ms = synchronize_tensor_for_host_read(tensor)?;
+    diagnostics.timings.device_sync_ms += sync_ms;
+
+    let copy_started = Instant::now();
+    let rows = tensor_to_probability_rows(tensor, row_count)?;
+    let copy_ms = elapsed_ms(copy_started);
+    diagnostics.timings.host_copy_ms += copy_ms;
+    diagnostics.timings.host_read_ms += sync_ms + copy_ms;
+    Ok(rows)
+}
+
+fn synchronize_tensor_for_host_read(tensor: &Tensor) -> Result<f64> {
+    let device = tensor.device();
+    if !(device.is_metal() || device.is_cuda()) {
+        return Ok(0.0);
+    }
+
+    let started = Instant::now();
+    device.synchronize()?;
+    Ok(elapsed_ms(started))
 }
 
 fn tensor_from_embedding_rows(

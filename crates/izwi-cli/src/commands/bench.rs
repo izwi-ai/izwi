@@ -205,6 +205,8 @@ struct AsrStageTimings {
     transformer_forward: Option<f64>,
     head: Option<f64>,
     host_read: Option<f64>,
+    device_sync: Option<f64>,
+    host_copy: Option<f64>,
     prompt_kernel: Option<f64>,
     language_detect: Option<f64>,
     resample: Option<f64>,
@@ -3557,6 +3559,8 @@ fn asr_stage_timings_from_diagnostics(diagnostics: &serde_json::Value) -> Option
             .and_then(|value| value.as_f64()),
         head: timings.get("head").and_then(|value| value.as_f64()),
         host_read: timings.get("host_read").and_then(|value| value.as_f64()),
+        device_sync: timings.get("device_sync").and_then(|value| value.as_f64()),
+        host_copy: timings.get("host_copy").and_then(|value| value.as_f64()),
         prompt_kernel: timings
             .get("prompt_kernel")
             .and_then(|value| value.as_f64()),
@@ -3902,6 +3906,8 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     let mut transformer_forward = Vec::new();
     let mut head = Vec::new();
     let mut host_read = Vec::new();
+    let mut device_sync = Vec::new();
+    let mut host_copy = Vec::new();
     let mut prompt_kernel = Vec::new();
     let mut language_detect = Vec::new();
     let mut resample = Vec::new();
@@ -3973,6 +3979,12 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         }
         if let Some(value) = sample.host_read {
             host_read.push(value);
+        }
+        if let Some(value) = sample.device_sync {
+            device_sync.push(value);
+        }
+        if let Some(value) = sample.host_copy {
+            host_copy.push(value);
         }
         if let Some(value) = sample.prompt_kernel {
             prompt_kernel.push(value);
@@ -4084,6 +4096,8 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         && transformer_forward.is_empty()
         && head.is_empty()
         && host_read.is_empty()
+        && device_sync.is_empty()
+        && host_copy.is_empty()
         && prompt_kernel.is_empty()
         && language_detect.is_empty()
         && resample.is_empty()
@@ -4138,6 +4152,8 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     summarize_stage("transformer", &transformer_forward);
     summarize_stage("head", &head);
     summarize_stage("host_read", &host_read);
+    summarize_stage("device_sync", &device_sync);
+    summarize_stage("host_copy", &host_copy);
     summarize_stage("prompt", &prompt_kernel);
     summarize_stage("lang_detect", &language_detect);
     summarize_stage("resample", &resample);
