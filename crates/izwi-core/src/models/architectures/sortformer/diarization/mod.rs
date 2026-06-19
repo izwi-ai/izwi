@@ -1527,8 +1527,8 @@ impl SortformerPreprocessor {
             }
             fft.process(&mut buffer);
             for k in 0..self.n_freqs {
-                let mag = (buffer[k].re * buffer[k].re + buffer[k].im * buffer[k].im).sqrt();
-                spectrum[frame_idx * self.n_freqs + k] = mag * mag;
+                spectrum[frame_idx * self.n_freqs + k] =
+                    buffer[k].re * buffer[k].re + buffer[k].im * buffer[k].im;
             }
         }
 
@@ -1741,11 +1741,11 @@ impl ConvSubsamplingDw {
         x = self.conv0.forward(&x)?;
         x = x.relu()?;
 
-        x = self.conv2.forward(&x)?;
+        x = forward_depthwise_conv2d(&self.conv2, &x)?;
         x = self.conv3.forward(&x)?;
         x = x.relu()?;
 
-        x = self.conv5.forward(&x)?;
+        x = forward_depthwise_conv2d(&self.conv5, &x)?;
         x = self.conv6.forward(&x)?;
         x = x.relu()?;
 
@@ -1757,6 +1757,25 @@ impl ConvSubsamplingDw {
         let encoded_len = subsampled_len_3x(feature_frames).min(t);
         Ok((x, encoded_len))
     }
+}
+
+fn forward_depthwise_conv2d(conv: &Conv2d, x: &Tensor) -> Result<Tensor> {
+    let Some(mut x) = metal_kernels::try_depthwise_conv2d(
+        x,
+        conv.weight(),
+        conv.config().padding,
+        conv.config().stride,
+        conv.config().dilation,
+    ) else {
+        return conv.forward(x).map_err(Error::from);
+    };
+
+    if let Some(bias) = conv.bias() {
+        let b = bias.dims1()?;
+        x = x.broadcast_add(&bias.reshape((1, b, 1, 1))?)?;
+    }
+
+    Ok(x)
 }
 
 fn subsampled_len_3x(mut len: usize) -> usize {
