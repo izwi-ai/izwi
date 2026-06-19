@@ -659,7 +659,7 @@ fn sortformer_uses_selected_model_device_with_metal_override(
     kind: DeviceKind,
     metal_enabled: Option<bool>,
 ) -> bool {
-    kind.is_cuda() || (kind.is_metal() && metal_enabled.unwrap_or(false))
+    kind.is_cuda() || (kind.is_metal() && metal_enabled.unwrap_or(true))
 }
 
 fn sortformer_env_bool(name: &str) -> Option<bool> {
@@ -2949,12 +2949,12 @@ mod tests {
     }
 
     #[test]
-    fn sortformer_uses_metal_only_when_explicitly_enabled() {
+    fn sortformer_uses_metal_by_default_with_explicit_opt_out() {
         assert!(!sortformer_uses_selected_model_device_with_metal_override(
             DeviceKind::Cpu,
             Some(true),
         ));
-        assert!(!sortformer_uses_selected_model_device_with_metal_override(
+        assert!(sortformer_uses_selected_model_device_with_metal_override(
             DeviceKind::Metal,
             None,
         ));
