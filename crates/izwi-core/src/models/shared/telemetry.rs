@@ -39,6 +39,16 @@ pub struct KernelPathTelemetrySnapshot {
     pub fused_attention_fallback_metal_sdpa_mask_shape_unsupported_total: u64,
     pub fused_attention_fallback_metal_sdpa_mask_dtype_unsupported_total: u64,
     pub fused_attention_fallback_unsupported_backend_total: u64,
+    pub qwen35_linear_decode_steps_total: u64,
+    pub qwen35_linear_sequence_spans_total: u64,
+    pub qwen35_linear_sequence_tokens_total: u64,
+    pub qwen35_deltanet_decode_fused_total: u64,
+    pub qwen35_deltanet_decode_unfused_total: u64,
+    pub qwen35_deltanet_sequence_tiled_total: u64,
+    pub qwen35_deltanet_sequence_unfused_total: u64,
+    pub qwen35_dense_kv_appends_total: u64,
+    pub qwen35_dense_kv_cache_inits_total: u64,
+    pub qwen35_dense_kv_page_migrations_total: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -113,6 +123,17 @@ static FUSED_ATTN_FALLBACK_METAL_SDPA_MASK_POLICY_DISABLED_TOTAL: AtomicU64 = At
 static FUSED_ATTN_FALLBACK_METAL_SDPA_MASK_SHAPE_UNSUPPORTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FUSED_ATTN_FALLBACK_METAL_SDPA_MASK_DTYPE_UNSUPPORTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FUSED_ATTN_FALLBACK_UNSUPPORTED_BACKEND_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+static QWEN35_LINEAR_DECODE_STEPS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static QWEN35_LINEAR_SEQUENCE_SPANS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static QWEN35_LINEAR_SEQUENCE_TOKENS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static QWEN35_DELTANET_DECODE_FUSED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static QWEN35_DELTANET_DECODE_UNFUSED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static QWEN35_DELTANET_SEQUENCE_TILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static QWEN35_DELTANET_SEQUENCE_UNFUSED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static QWEN35_DENSE_KV_APPENDS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static QWEN35_DENSE_KV_CACHE_INITS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static QWEN35_DENSE_KV_PAGE_MIGRATIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 pub fn record_prefill_token_mode_step() {
     PREFILL_TOKEN_MODE_STEPS_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -222,6 +243,43 @@ pub fn record_fused_attention_fallback(reason: AttentionFallbackReason) {
     }
 }
 
+pub fn record_qwen35_linear_decode_step() {
+    QWEN35_LINEAR_DECODE_STEPS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_qwen35_linear_sequence_span(token_count: usize) {
+    QWEN35_LINEAR_SEQUENCE_SPANS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    QWEN35_LINEAR_SEQUENCE_TOKENS_TOTAL.fetch_add(token_count as u64, Ordering::Relaxed);
+}
+
+pub fn record_qwen35_deltanet_decode_fused() {
+    QWEN35_DELTANET_DECODE_FUSED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_qwen35_deltanet_decode_unfused() {
+    QWEN35_DELTANET_DECODE_UNFUSED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_qwen35_deltanet_sequence_tiled() {
+    QWEN35_DELTANET_SEQUENCE_TILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_qwen35_deltanet_sequence_unfused() {
+    QWEN35_DELTANET_SEQUENCE_UNFUSED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_qwen35_dense_kv_append() {
+    QWEN35_DENSE_KV_APPENDS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_qwen35_dense_kv_cache_init() {
+    QWEN35_DENSE_KV_CACHE_INITS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_qwen35_dense_kv_page_migration() {
+    QWEN35_DENSE_KV_PAGE_MIGRATIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn snapshot() -> KernelPathTelemetrySnapshot {
     KernelPathTelemetrySnapshot {
         prefill_token_mode_steps_total: PREFILL_TOKEN_MODE_STEPS_TOTAL.load(Ordering::Relaxed),
@@ -272,6 +330,25 @@ pub fn snapshot() -> KernelPathTelemetrySnapshot {
             FUSED_ATTN_FALLBACK_METAL_SDPA_MASK_DTYPE_UNSUPPORTED_TOTAL.load(Ordering::Relaxed),
         fused_attention_fallback_unsupported_backend_total:
             FUSED_ATTN_FALLBACK_UNSUPPORTED_BACKEND_TOTAL.load(Ordering::Relaxed),
+        qwen35_linear_decode_steps_total: QWEN35_LINEAR_DECODE_STEPS_TOTAL
+            .load(Ordering::Relaxed),
+        qwen35_linear_sequence_spans_total: QWEN35_LINEAR_SEQUENCE_SPANS_TOTAL
+            .load(Ordering::Relaxed),
+        qwen35_linear_sequence_tokens_total: QWEN35_LINEAR_SEQUENCE_TOKENS_TOTAL
+            .load(Ordering::Relaxed),
+        qwen35_deltanet_decode_fused_total: QWEN35_DELTANET_DECODE_FUSED_TOTAL
+            .load(Ordering::Relaxed),
+        qwen35_deltanet_decode_unfused_total: QWEN35_DELTANET_DECODE_UNFUSED_TOTAL
+            .load(Ordering::Relaxed),
+        qwen35_deltanet_sequence_tiled_total: QWEN35_DELTANET_SEQUENCE_TILED_TOTAL
+            .load(Ordering::Relaxed),
+        qwen35_deltanet_sequence_unfused_total: QWEN35_DELTANET_SEQUENCE_UNFUSED_TOTAL
+            .load(Ordering::Relaxed),
+        qwen35_dense_kv_appends_total: QWEN35_DENSE_KV_APPENDS_TOTAL.load(Ordering::Relaxed),
+        qwen35_dense_kv_cache_inits_total: QWEN35_DENSE_KV_CACHE_INITS_TOTAL
+            .load(Ordering::Relaxed),
+        qwen35_dense_kv_page_migrations_total: QWEN35_DENSE_KV_PAGE_MIGRATIONS_TOTAL
+            .load(Ordering::Relaxed),
     }
 }
 
@@ -310,7 +387,17 @@ pub fn prometheus() -> String {
 # TYPE izwi_kernel_fused_attention_fallback_total counter\nizwi_kernel_fused_attention_fallback_total {}\n\
 # TYPE izwi_kernel_fused_attention_masked_attempts_total counter\nizwi_kernel_fused_attention_masked_attempts_total {}\n\
 # TYPE izwi_kernel_fused_attention_masked_success_total counter\nizwi_kernel_fused_attention_masked_success_total {}\n\
-# TYPE izwi_kernel_fused_attention_masked_fallback_total counter\nizwi_kernel_fused_attention_masked_fallback_total {}\n",
+# TYPE izwi_kernel_fused_attention_masked_fallback_total counter\nizwi_kernel_fused_attention_masked_fallback_total {}\n\
+# TYPE izwi_kernel_qwen35_linear_decode_steps_total counter\nizwi_kernel_qwen35_linear_decode_steps_total {}\n\
+# TYPE izwi_kernel_qwen35_linear_sequence_spans_total counter\nizwi_kernel_qwen35_linear_sequence_spans_total {}\n\
+# TYPE izwi_kernel_qwen35_linear_sequence_tokens_total counter\nizwi_kernel_qwen35_linear_sequence_tokens_total {}\n\
+# TYPE izwi_kernel_qwen35_deltanet_decode_fused_total counter\nizwi_kernel_qwen35_deltanet_decode_fused_total {}\n\
+# TYPE izwi_kernel_qwen35_deltanet_decode_unfused_total counter\nizwi_kernel_qwen35_deltanet_decode_unfused_total {}\n\
+# TYPE izwi_kernel_qwen35_deltanet_sequence_tiled_total counter\nizwi_kernel_qwen35_deltanet_sequence_tiled_total {}\n\
+# TYPE izwi_kernel_qwen35_deltanet_sequence_unfused_total counter\nizwi_kernel_qwen35_deltanet_sequence_unfused_total {}\n\
+# TYPE izwi_kernel_qwen35_dense_kv_appends_total counter\nizwi_kernel_qwen35_dense_kv_appends_total {}\n\
+# TYPE izwi_kernel_qwen35_dense_kv_cache_inits_total counter\nizwi_kernel_qwen35_dense_kv_cache_inits_total {}\n\
+# TYPE izwi_kernel_qwen35_dense_kv_page_migrations_total counter\nizwi_kernel_qwen35_dense_kv_page_migrations_total {}\n",
         metrics.prefill_token_mode_steps_total,
         metrics.prefill_sequence_spans_total,
         metrics.prefill_sequence_tokens_total,
@@ -330,6 +417,16 @@ pub fn prometheus() -> String {
         metrics.fused_attention_masked_attempts_total,
         metrics.fused_attention_masked_success_total,
         metrics.fused_attention_masked_fallback_total,
+        metrics.qwen35_linear_decode_steps_total,
+        metrics.qwen35_linear_sequence_spans_total,
+        metrics.qwen35_linear_sequence_tokens_total,
+        metrics.qwen35_deltanet_decode_fused_total,
+        metrics.qwen35_deltanet_decode_unfused_total,
+        metrics.qwen35_deltanet_sequence_tiled_total,
+        metrics.qwen35_deltanet_sequence_unfused_total,
+        metrics.qwen35_dense_kv_appends_total,
+        metrics.qwen35_dense_kv_cache_inits_total,
+        metrics.qwen35_dense_kv_page_migrations_total,
     );
 
     output.push_str("# TYPE izwi_kernel_fused_attention_fallback_reason_total counter\n");

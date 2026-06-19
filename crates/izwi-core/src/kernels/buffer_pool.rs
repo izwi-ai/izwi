@@ -119,7 +119,7 @@ impl Default for BufferPoolConfig {
             num_medium: 8,
             medium_size: 32768,
             num_large: 4,
-            large_size: 262144,
+            large_size: 524288,
             dtype: DType::F32,
         }
     }

@@ -23,7 +23,12 @@ use crate::models::shared::attention::paged::{
 };
 use crate::models::shared::telemetry::{
     record_decode_attention_path, record_prefill_sequence_span, record_prefill_token_mode_step,
-    record_rope_kernel, record_rope_manual, DecodeAttentionPath,
+    record_qwen35_deltanet_decode_fused, record_qwen35_deltanet_decode_unfused,
+    record_qwen35_deltanet_sequence_tiled, record_qwen35_deltanet_sequence_unfused,
+    record_qwen35_dense_kv_append, record_qwen35_dense_kv_cache_init,
+    record_qwen35_dense_kv_page_migration, record_qwen35_linear_decode_step,
+    record_qwen35_linear_sequence_span, record_rope_kernel, record_rope_manual,
+    DecodeAttentionPath,
 };
 use crate::models::shared::weights::gguf::GgufLoader;
 
@@ -1132,6 +1137,7 @@ impl Qwen35LinearAttention {
         hidden_states: &Tensor,
         state: &mut Qwen35LayerRuntimeState,
     ) -> Result<Tensor> {
+        record_qwen35_linear_decode_step();
         let (conv_state, recurrent_state) = match state {
             Qwen35LayerRuntimeState::Linear {
                 conv_state,
@@ -1215,6 +1221,7 @@ impl Qwen35LinearAttention {
         if seq_len == 1 {
             return self.forward(hidden_states, state);
         }
+        record_qwen35_linear_sequence_span(seq_len);
 
         let (conv_state, recurrent_state) = match state {
             Qwen35LayerRuntimeState::Linear {
@@ -1295,11 +1302,14 @@ impl Qwen35LinearAttention {
                 &current_state,
                 tile_size,
             ) {
+                record_qwen35_deltanet_sequence_tiled();
                 (tiled_output, tiled_state)
             } else {
+                record_qwen35_deltanet_sequence_unfused();
                 recurrent_gated_delta_sequence(&query, &key, &value, &g, &beta, current_state)?
             }
         } else {
+            record_qwen35_deltanet_sequence_unfused();
             recurrent_gated_delta_sequence(&query, &key, &value, &g, &beta, current_state)?
         };
         *recurrent_state = Some(next_state);
@@ -1769,8 +1779,10 @@ fn append_dense_kv_cache_h(cache: &mut Option<Tensor>, append: &Tensor) -> Resul
         }
         None => {
             *cache = Some(append);
+            record_qwen35_dense_kv_cache_init();
         }
     }
+    record_qwen35_dense_kv_append();
     Ok(())
 }
 
@@ -1820,6 +1832,7 @@ fn maybe_materialize_dense_kv_pages(
     append_to_pages(page_size, k_pages, &k_dense, quantization)?;
     append_to_pages(page_size, v_pages, &v_dense, quantization)?;
     *dense_kv_tokens = 0;
+    record_qwen35_dense_kv_page_migration();
     Ok(())
 }
 
@@ -1896,9 +1909,11 @@ fn recurrent_gated_delta(
     // Try fused Metal kernel first (for F32 on Metal devices)
     if query.dtype() == DType::F32 {
         if let Some(result) = try_fused_gated_delta_recurrent(query, key, value, g, beta, &state) {
+            record_qwen35_deltanet_decode_fused();
             return Ok(result);
         }
     }
+    record_qwen35_deltanet_decode_unfused();
 
     // Optimized implementation using matmul for batched reductions.
     // Shapes: query/key (1, H, Dk), value (1, H, Dv), state (1, H, Dk, Dv)

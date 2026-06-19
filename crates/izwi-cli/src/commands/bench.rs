@@ -98,6 +98,26 @@ struct KernelPathTelemetrySnapshot {
     fused_attention_fallback_metal_sdpa_mask_dtype_unsupported_total: u64,
     #[serde(default)]
     fused_attention_fallback_unsupported_backend_total: u64,
+    #[serde(default)]
+    qwen35_linear_decode_steps_total: u64,
+    #[serde(default)]
+    qwen35_linear_sequence_spans_total: u64,
+    #[serde(default)]
+    qwen35_linear_sequence_tokens_total: u64,
+    #[serde(default)]
+    qwen35_deltanet_decode_fused_total: u64,
+    #[serde(default)]
+    qwen35_deltanet_decode_unfused_total: u64,
+    #[serde(default)]
+    qwen35_deltanet_sequence_tiled_total: u64,
+    #[serde(default)]
+    qwen35_deltanet_sequence_unfused_total: u64,
+    #[serde(default)]
+    qwen35_dense_kv_appends_total: u64,
+    #[serde(default)]
+    qwen35_dense_kv_cache_inits_total: u64,
+    #[serde(default)]
+    qwen35_dense_kv_page_migrations_total: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -3439,6 +3459,36 @@ fn print_runtime_delta(
     let fused_unsupported_backend_delta = kernel_after
         .fused_attention_fallback_unsupported_backend_total
         .saturating_sub(kernel_before.fused_attention_fallback_unsupported_backend_total);
+    let qwen35_linear_decode_steps_delta = kernel_after
+        .qwen35_linear_decode_steps_total
+        .saturating_sub(kernel_before.qwen35_linear_decode_steps_total);
+    let qwen35_linear_sequence_spans_delta = kernel_after
+        .qwen35_linear_sequence_spans_total
+        .saturating_sub(kernel_before.qwen35_linear_sequence_spans_total);
+    let qwen35_linear_sequence_tokens_delta = kernel_after
+        .qwen35_linear_sequence_tokens_total
+        .saturating_sub(kernel_before.qwen35_linear_sequence_tokens_total);
+    let qwen35_deltanet_decode_fused_delta = kernel_after
+        .qwen35_deltanet_decode_fused_total
+        .saturating_sub(kernel_before.qwen35_deltanet_decode_fused_total);
+    let qwen35_deltanet_decode_unfused_delta = kernel_after
+        .qwen35_deltanet_decode_unfused_total
+        .saturating_sub(kernel_before.qwen35_deltanet_decode_unfused_total);
+    let qwen35_deltanet_sequence_tiled_delta = kernel_after
+        .qwen35_deltanet_sequence_tiled_total
+        .saturating_sub(kernel_before.qwen35_deltanet_sequence_tiled_total);
+    let qwen35_deltanet_sequence_unfused_delta = kernel_after
+        .qwen35_deltanet_sequence_unfused_total
+        .saturating_sub(kernel_before.qwen35_deltanet_sequence_unfused_total);
+    let qwen35_dense_kv_appends_delta = kernel_after
+        .qwen35_dense_kv_appends_total
+        .saturating_sub(kernel_before.qwen35_dense_kv_appends_total);
+    let qwen35_dense_kv_cache_inits_delta = kernel_after
+        .qwen35_dense_kv_cache_inits_total
+        .saturating_sub(kernel_before.qwen35_dense_kv_cache_inits_total);
+    let qwen35_dense_kv_page_migrations_delta = kernel_after
+        .qwen35_dense_kv_page_migrations_total
+        .saturating_sub(kernel_before.qwen35_dense_kv_page_migrations_total);
     let decode_total = dense_decode_delta + paged_decode_delta;
     println!(
         "  Prefill path counts (token-mode/sequence-spans/sequence-tokens): {} / {} / {}",
@@ -3494,6 +3544,33 @@ fn print_runtime_delta(
         "  Fused backend fallback reasons (metal-runtime/unsupported): {} / {}",
         fused_metal_runtime_error_delta, fused_unsupported_backend_delta
     );
+    if qwen35_linear_decode_steps_delta
+        + qwen35_linear_sequence_spans_delta
+        + qwen35_dense_kv_appends_delta
+        + qwen35_dense_kv_cache_inits_delta
+        + qwen35_dense_kv_page_migrations_delta
+        > 0
+    {
+        println!(
+            "  Qwen3.5 linear (decode/seq-spans/seq-tokens): {} / {} / {}",
+            qwen35_linear_decode_steps_delta,
+            qwen35_linear_sequence_spans_delta,
+            qwen35_linear_sequence_tokens_delta
+        );
+        println!(
+            "  Qwen3.5 DeltaNet (decode fused/unfused, seq tiled/unfused): {} / {} / {} / {}",
+            qwen35_deltanet_decode_fused_delta,
+            qwen35_deltanet_decode_unfused_delta,
+            qwen35_deltanet_sequence_tiled_delta,
+            qwen35_deltanet_sequence_unfused_delta
+        );
+        println!(
+            "  Qwen3.5 dense KV (appends/cache-inits/page-migrations): {} / {} / {}",
+            qwen35_dense_kv_appends_delta,
+            qwen35_dense_kv_cache_inits_delta,
+            qwen35_dense_kv_page_migrations_delta
+        );
+    }
     if matches!(context, RuntimeTelemetryContext::AsrWhisper) {
         println!(
             "  Kernel-path note: fused-attention/RoPE counters track shared LLM/TTS paths and are not Whisper decoder proxies."
