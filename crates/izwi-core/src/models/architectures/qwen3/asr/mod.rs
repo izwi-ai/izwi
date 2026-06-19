@@ -313,6 +313,12 @@ impl Qwen3ForcedAlignDiagnostics {
             "prefill_profile_ms": {
                 "input_norm": self.prefill_profile.input_norm_ms,
                 "attention": self.prefill_profile.attention_ms,
+                "attention_qkv_proj": self.prefill_profile.attention_qkv_proj_ms,
+                "attention_qk_norm": self.prefill_profile.attention_qk_norm_ms,
+                "attention_rope": self.prefill_profile.attention_rope_ms,
+                "attention_cache": self.prefill_profile.attention_cache_ms,
+                "attention_core": self.prefill_profile.attention_core_ms,
+                "attention_o_proj": self.prefill_profile.attention_o_proj_ms,
                 "attention_residual": self.prefill_profile.attention_residual_ms,
                 "post_attention_norm": self.prefill_profile.post_attention_norm_ms,
                 "mlp": self.prefill_profile.mlp_ms,

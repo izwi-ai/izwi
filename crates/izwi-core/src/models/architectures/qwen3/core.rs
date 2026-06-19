@@ -561,6 +561,12 @@ impl Qwen3ProjectionDiagnostics {
 pub struct Qwen3ForwardDiagnostics {
     pub input_norm_ms: f64,
     pub attention_ms: f64,
+    pub attention_qkv_proj_ms: f64,
+    pub attention_qk_norm_ms: f64,
+    pub attention_rope_ms: f64,
+    pub attention_cache_ms: f64,
+    pub attention_core_ms: f64,
+    pub attention_o_proj_ms: f64,
     pub attention_residual_ms: f64,
     pub post_attention_norm_ms: f64,
     pub mlp_ms: f64,
@@ -939,11 +945,13 @@ impl Qwen3Attention {
         position_ids: Option<&Tensor>,
         mut cache: Option<&mut Qwen3Cache>,
         layer_idx: usize,
+        mut diagnostics: Option<&mut Qwen3ForwardDiagnostics>,
     ) -> Result<Tensor> {
         let bsz = x.dim(0)?;
         let seq_len = x.dim(1)?;
         let use_batched = cache.is_none() && start_pos == 0 && bsz > 1;
 
+        let qkv_started = diagnostics.as_ref().map(|_| Instant::now());
         let mut q =
             self.q_proj
                 .forward(x)?
@@ -956,19 +964,37 @@ impl Qwen3Attention {
             self.v_proj
                 .forward(x)?
                 .reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
+        if let (Some(diag), Some(started)) = (diagnostics.as_deref_mut(), qkv_started) {
+            diag.attention_qkv_proj_ms += qwen3_elapsed_ms(started);
+        }
 
+        let qk_norm_started = diagnostics.as_ref().map(|_| Instant::now());
         q = self.apply_qk_norm(q, &self.q_norm, self.num_heads, seq_len)?;
         k = self.apply_qk_norm(k, &self.k_norm, self.num_kv_heads, seq_len)?;
+        if let (Some(diag), Some(started)) = (diagnostics.as_deref_mut(), qk_norm_started) {
+            diag.attention_qk_norm_ms += qwen3_elapsed_ms(started);
+        }
 
+        let rope_started = diagnostics.as_ref().map(|_| Instant::now());
         (q, k) = self.apply_rope_pair(q, k, start_pos, position_ids, cache.as_deref_mut())?;
+        if let (Some(diag), Some(started)) = (diagnostics.as_deref_mut(), rope_started) {
+            diag.attention_rope_ms += qwen3_elapsed_ms(started);
+        }
 
+        let cache_started = diagnostics.as_ref().map(|_| Instant::now());
         let (k, v) = if let Some(cache) = cache {
             cache.append(layer_idx, k.clone(), v.clone())?;
 
             // Decode path hot loop: for single-token decode, avoid rematerializing full KV.
             if seq_len == 1 && start_pos > 0 {
                 if let Some((k_dense_h, v_dense_h)) = cache.dense_heads(layer_idx)? {
+                    if let (Some(diag), Some(started)) =
+                        (diagnostics.as_deref_mut(), cache_started)
+                    {
+                        diag.attention_cache_ms += qwen3_elapsed_ms(started);
+                    }
                     record_decode_attention_path(DecodeAttentionPath::Dense);
+                    let core_started = diagnostics.as_ref().map(|_| Instant::now());
                     let out = dense_decode_attention(
                         &q,
                         &k_dense_h,
@@ -978,9 +1004,20 @@ impl Qwen3Attention {
                         self.head_dim,
                     )?;
                     let out = out.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
-                    return self.o_proj.forward(&out).map_err(Error::from);
+                    if let (Some(diag), Some(started)) =
+                        (diagnostics.as_deref_mut(), core_started)
+                    {
+                        diag.attention_core_ms += qwen3_elapsed_ms(started);
+                    }
+                    return self.forward_o_proj(&out, diagnostics.as_deref_mut());
                 }
                 if let Some((k_pages, v_pages)) = cache.pages(layer_idx) {
+                    if let (Some(diag), Some(started)) =
+                        (diagnostics.as_deref_mut(), cache_started)
+                    {
+                        diag.attention_cache_ms += qwen3_elapsed_ms(started);
+                    }
+                    let core_started = diagnostics.as_ref().map(|_| Instant::now());
                     let out = paged_decode_attention(
                         &q,
                         k_pages,
@@ -990,7 +1027,12 @@ impl Qwen3Attention {
                         self.head_dim,
                     )?;
                     let out = out.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
-                    return self.o_proj.forward(&out).map_err(Error::from);
+                    if let (Some(diag), Some(started)) =
+                        (diagnostics.as_deref_mut(), core_started)
+                    {
+                        diag.attention_core_ms += qwen3_elapsed_ms(started);
+                    }
+                    return self.forward_o_proj(&out, diagnostics.as_deref_mut());
                 }
             }
 
@@ -998,7 +1040,11 @@ impl Qwen3Attention {
         } else {
             (k, v)
         };
+        if let (Some(diag), Some(started)) = (diagnostics.as_deref_mut(), cache_started) {
+            diag.attention_cache_ms += qwen3_elapsed_ms(started);
+        }
 
+        let core_started = diagnostics.as_ref().map(|_| Instant::now());
         if use_batched {
             let k = repeat_kv(&k, self.num_heads, self.num_kv_heads)?;
             let v = repeat_kv(&v, self.num_heads, self.num_kv_heads)?;
@@ -1025,7 +1071,10 @@ impl Qwen3Attention {
             };
             let config = BatchedAttentionConfig::new(self.num_heads, self.head_dim);
             let out = batched_scaled_dot_product_attention(&input, &config)?;
-            return self.o_proj.forward(&out).map_err(Error::from);
+            if let (Some(diag), Some(started)) = (diagnostics.as_deref_mut(), core_started) {
+                diag.attention_core_ms += qwen3_elapsed_ms(started);
+            }
+            return self.forward_o_proj(&out, diagnostics.as_deref_mut());
         }
 
         let q = q.transpose(1, 2)?; // [b, h, s, d]
@@ -1042,7 +1091,10 @@ impl Qwen3Attention {
                     seq_len,
                     self.num_heads * self.head_dim,
                 ))?;
-                return self.o_proj.forward(&out).map_err(Error::from);
+                if let (Some(diag), Some(started)) = (diagnostics.as_deref_mut(), core_started) {
+                    diag.attention_core_ms += qwen3_elapsed_ms(started);
+                }
+                return self.forward_o_proj(&out, diagnostics.as_deref_mut());
             }
         }
 
@@ -1060,7 +1112,10 @@ impl Qwen3Attention {
                     seq_len,
                     self.num_heads * self.head_dim,
                 ))?;
-                return self.o_proj.forward(&out).map_err(Error::from);
+                if let (Some(diag), Some(started)) = (diagnostics.as_deref_mut(), core_started) {
+                    diag.attention_core_ms += qwen3_elapsed_ms(started);
+                }
+                return self.forward_o_proj(&out, diagnostics.as_deref_mut());
             }
         }
 
@@ -1085,8 +1140,23 @@ impl Qwen3Attention {
         let out = out
             .transpose(1, 2)?
             .reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
+        if let (Some(diag), Some(started)) = (diagnostics.as_deref_mut(), core_started) {
+            diag.attention_core_ms += qwen3_elapsed_ms(started);
+        }
 
-        let out = self.o_proj.forward(&out)?;
+        self.forward_o_proj(&out, diagnostics.as_deref_mut())
+    }
+
+    fn forward_o_proj(
+        &self,
+        out: &Tensor,
+        diagnostics: Option<&mut Qwen3ForwardDiagnostics>,
+    ) -> Result<Tensor> {
+        let started = diagnostics.as_ref().map(|_| Instant::now());
+        let out = self.o_proj.forward(out)?;
+        if let (Some(diag), Some(started)) = (diagnostics, started) {
+            diag.attention_o_proj_ms += qwen3_elapsed_ms(started);
+        }
         Ok(out)
     }
 }
@@ -1255,9 +1325,15 @@ impl Qwen3Layer {
         }
 
         let attention_started = diagnostics.as_ref().map(|_| Instant::now());
-        let attn_out =
-            self.self_attn
-                .forward(&normed, start_pos, position_ids, cache, layer_idx)?;
+        let attn_out = match diagnostics.as_deref_mut() {
+            Some(diag) => {
+                self.self_attn
+                    .forward(&normed, start_pos, position_ids, cache, layer_idx, Some(diag))?
+            }
+            None => self
+                .self_attn
+                .forward(&normed, start_pos, position_ids, cache, layer_idx, None)?,
+        };
         if let (Some(diag), Some(started)) = (diagnostics.as_deref_mut(), attention_started) {
             diag.attention_ms += qwen3_elapsed_ms(started);
         }

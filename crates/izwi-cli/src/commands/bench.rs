@@ -216,6 +216,12 @@ struct AsrStageTimings {
     prefill: Option<f64>,
     prefill_input_norm: Option<f64>,
     prefill_attention: Option<f64>,
+    prefill_attention_qkv_proj: Option<f64>,
+    prefill_attention_qk_norm: Option<f64>,
+    prefill_attention_rope: Option<f64>,
+    prefill_attention_cache: Option<f64>,
+    prefill_attention_core: Option<f64>,
+    prefill_attention_o_proj: Option<f64>,
     prefill_attention_residual: Option<f64>,
     prefill_post_attention_norm: Option<f64>,
     prefill_mlp: Option<f64>,
@@ -3584,6 +3590,12 @@ fn asr_stage_timings_from_diagnostics(diagnostics: &serde_json::Value) -> Option
         prefill: timings.get("prefill").and_then(|value| value.as_f64()),
         prefill_input_norm: diagnostic_f64(prefill_profile, &["input_norm"]),
         prefill_attention: diagnostic_f64(prefill_profile, &["attention"]),
+        prefill_attention_qkv_proj: diagnostic_f64(prefill_profile, &["attention_qkv_proj"]),
+        prefill_attention_qk_norm: diagnostic_f64(prefill_profile, &["attention_qk_norm"]),
+        prefill_attention_rope: diagnostic_f64(prefill_profile, &["attention_rope"]),
+        prefill_attention_cache: diagnostic_f64(prefill_profile, &["attention_cache"]),
+        prefill_attention_core: diagnostic_f64(prefill_profile, &["attention_core"]),
+        prefill_attention_o_proj: diagnostic_f64(prefill_profile, &["attention_o_proj"]),
         prefill_attention_residual: diagnostic_f64(prefill_profile, &["attention_residual"]),
         prefill_post_attention_norm: diagnostic_f64(prefill_profile, &["post_attention_norm"]),
         prefill_mlp: diagnostic_f64(prefill_profile, &["mlp"]),
@@ -3942,6 +3954,12 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     let mut prefill = Vec::new();
     let mut prefill_input_norm = Vec::new();
     let mut prefill_attention = Vec::new();
+    let mut prefill_attention_qkv_proj = Vec::new();
+    let mut prefill_attention_qk_norm = Vec::new();
+    let mut prefill_attention_rope = Vec::new();
+    let mut prefill_attention_cache = Vec::new();
+    let mut prefill_attention_core = Vec::new();
+    let mut prefill_attention_o_proj = Vec::new();
     let mut prefill_attention_residual = Vec::new();
     let mut prefill_post_attention_norm = Vec::new();
     let mut prefill_mlp = Vec::new();
@@ -4046,6 +4064,24 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         }
         if let Some(value) = sample.prefill_attention {
             prefill_attention.push(value);
+        }
+        if let Some(value) = sample.prefill_attention_qkv_proj {
+            prefill_attention_qkv_proj.push(value);
+        }
+        if let Some(value) = sample.prefill_attention_qk_norm {
+            prefill_attention_qk_norm.push(value);
+        }
+        if let Some(value) = sample.prefill_attention_rope {
+            prefill_attention_rope.push(value);
+        }
+        if let Some(value) = sample.prefill_attention_cache {
+            prefill_attention_cache.push(value);
+        }
+        if let Some(value) = sample.prefill_attention_core {
+            prefill_attention_core.push(value);
+        }
+        if let Some(value) = sample.prefill_attention_o_proj {
+            prefill_attention_o_proj.push(value);
         }
         if let Some(value) = sample.prefill_attention_residual {
             prefill_attention_residual.push(value);
@@ -4168,6 +4204,12 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         && prefill.is_empty()
         && prefill_input_norm.is_empty()
         && prefill_attention.is_empty()
+        && prefill_attention_qkv_proj.is_empty()
+        && prefill_attention_qk_norm.is_empty()
+        && prefill_attention_rope.is_empty()
+        && prefill_attention_cache.is_empty()
+        && prefill_attention_core.is_empty()
+        && prefill_attention_o_proj.is_empty()
         && prefill_attention_residual.is_empty()
         && prefill_post_attention_norm.is_empty()
         && prefill_mlp.is_empty()
@@ -4233,6 +4275,12 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     summarize_stage("prefill", &prefill);
     summarize_stage("pf_in_norm", &prefill_input_norm);
     summarize_stage("pf_attn", &prefill_attention);
+    summarize_stage("pf_qkv", &prefill_attention_qkv_proj);
+    summarize_stage("pf_qk_norm", &prefill_attention_qk_norm);
+    summarize_stage("pf_rope", &prefill_attention_rope);
+    summarize_stage("pf_cache", &prefill_attention_cache);
+    summarize_stage("pf_core", &prefill_attention_core);
+    summarize_stage("pf_o_proj", &prefill_attention_o_proj);
     summarize_stage("pf_attn_res", &prefill_attention_residual);
     summarize_stage("pf_postnorm", &prefill_post_attention_norm);
     summarize_stage("pf_mlp", &prefill_mlp);
