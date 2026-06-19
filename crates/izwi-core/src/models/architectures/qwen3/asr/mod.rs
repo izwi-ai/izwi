@@ -1649,7 +1649,9 @@ impl Qwen3AsrModel {
             data.extend_from_slice(&positions);
         }
 
-        Tensor::from_vec(data, (3, seq_len), &self.device.device).map_err(Error::from)
+        // Position IDs are only read back to build M-RoPE tables. Keeping them
+        // on CPU avoids forcing a Metal queue sync before the table upload.
+        Tensor::from_vec(data, (3, seq_len), &candle_core::Device::Cpu).map_err(Error::from)
     }
 }
 
