@@ -1525,6 +1525,24 @@ impl Qwen3Model {
         Ok((logits, diagnostics))
     }
 
+    pub fn forward_hidden_with_embeds_profiled(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        mut cache: Option<&mut Qwen3Cache>,
+        position_ids: Option<&Tensor>,
+    ) -> Result<(Tensor, Qwen3ForwardDiagnostics)> {
+        let mut diagnostics = Qwen3ForwardDiagnostics::default();
+        let hidden = self.forward_hidden_with_embeds_inner(
+            embeds,
+            start_pos,
+            cache.as_deref_mut(),
+            position_ids,
+            Some(&mut diagnostics),
+        )?;
+        Ok((hidden, diagnostics))
+    }
+
     pub fn forward_hidden_with_embeds(
         &self,
         embeds: &Tensor,

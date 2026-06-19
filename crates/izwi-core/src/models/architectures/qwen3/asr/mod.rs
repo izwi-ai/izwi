@@ -243,6 +243,7 @@ struct Qwen3ForcedAlignDiagnostics {
     prompt_tokens: usize,
     word_count: usize,
     timestamp_positions: usize,
+    single_timestamp_per_word: bool,
     timestamp_segment_time_ms: u32,
     execution: Qwen3AsrExecutionDiagnostics,
     prefill_profile: Qwen3ForwardDiagnostics,
@@ -272,6 +273,7 @@ impl Qwen3ForcedAlignDiagnostics {
             "alignment": {
                 "word_count": self.word_count,
                 "timestamp_positions": self.timestamp_positions,
+                "single_timestamp_per_word": self.single_timestamp_per_word,
                 "timestamp_segment_time_ms": self.timestamp_segment_time_ms,
             },
             "decode": {
@@ -1224,7 +1226,10 @@ impl Qwen3AsrModel {
             ));
         }
 
-        let prompt = self.build_forced_aligner_prompt(audio_len, &words)?;
+        let single_timestamp_per_word =
+            qwen3_forced_aligner_single_timestamp_enabled(self.device.kind);
+        let prompt =
+            self.build_forced_aligner_prompt(audio_len, &words, single_timestamp_per_word)?;
         let timestamp_positions: Vec<usize> = prompt
             .ids
             .iter()
@@ -1251,47 +1256,35 @@ impl Qwen3AsrModel {
             .map(|cache| self.execution_diagnostics(cache))
             .unwrap_or_else(|| self.execution_diagnostics_without_cache(prompt.ids.len()));
         let prefill_started = Instant::now();
-        let (logits, prefill_profile) = self.forward_with_audio_profiled(
+        let (logits, prefill_profile) = self.forward_timestamp_logits_with_audio_profiled(
             &input_ids,
             &audio_embeds,
             prompt.audio_pad_start,
             prompt.audio_pad_len,
+            &timestamp_positions,
             cache.as_mut(),
         )?;
         let prefill_ms = elapsed_ms(prefill_started);
 
         let segment_time_ms = self.timestamp_segment_time_ms.unwrap_or(20).max(1);
         let timestamp_argmax_started = Instant::now();
-        let timestamp_ms = batched_timestamp_argmax(&logits, &timestamp_positions)?
+        let timestamp_ms = timestamp_argmax_from_selected_logits(&logits)?
             .into_iter()
             .map(|cls_idx| cls_idx.saturating_mul(segment_time_ms))
             .collect::<Vec<_>>();
         let timestamp_argmax_ms = elapsed_ms(timestamp_argmax_started);
 
         let timestamp_fixup_started = Instant::now();
-        let mut fixed = fix_timestamp_sequence(&timestamp_ms);
-        let required = words.len().saturating_mul(2);
-        if fixed.len() < required {
-            let fill = fixed.last().copied().unwrap_or(0);
-            fixed.resize(required, fill);
-        }
+        let fixed = fix_timestamp_sequence(&timestamp_ms);
         let timestamp_fixup_ms = elapsed_ms(timestamp_fixup_started);
 
         let postprocess_started = Instant::now();
-        let mut alignments = Vec::with_capacity(words.len());
-        for (idx, word) in words.iter().enumerate() {
-            let start = fixed.get(idx * 2).copied().unwrap_or(0);
-            let mut end = fixed
-                .get(idx * 2 + 1)
-                .copied()
-                .unwrap_or_else(|| start.saturating_add(segment_time_ms));
-            if end <= start {
-                end = start.saturating_add(1);
-            }
-            alignments.push((word.clone(), start, end));
-        }
-
         let audio_duration_ms = ((audio.len() as f32 / 16_000.0) * 1000.0).round() as u32;
+        let mut alignments = if single_timestamp_per_word {
+            align_words_from_single_timestamps(&words, &fixed, segment_time_ms, audio_duration_ms)
+        } else {
+            align_words_from_paired_timestamps(&words, &fixed, segment_time_ms)
+        };
         normalize_alignment_bounds(&mut alignments, audio_duration_ms);
         if alignment_distribution_is_degenerate(&alignments, audio_duration_ms) {
             warn!(
@@ -1314,6 +1307,7 @@ impl Qwen3AsrModel {
             prompt_tokens: prompt.ids.len(),
             word_count: words.len(),
             timestamp_positions: timestamp_positions.len(),
+            single_timestamp_per_word,
             timestamp_segment_time_ms: segment_time_ms,
             execution,
             prefill_profile,
@@ -1340,6 +1334,7 @@ impl Qwen3AsrModel {
         &self,
         audio_len: usize,
         words: &[String],
+        single_timestamp_per_word: bool,
     ) -> Result<ForcedAlignerPrompt> {
         let timestamp_token_id = self
             .specials
@@ -1360,7 +1355,9 @@ impl Qwen3AsrModel {
         for word in words {
             ids.extend(self.tokenizer.encode_text(word)?);
             ids.push(timestamp_token_id);
-            ids.push(timestamp_token_id);
+            if !single_timestamp_per_word {
+                ids.push(timestamp_token_id);
+            }
         }
 
         Ok(ForcedAlignerPrompt {
@@ -1407,6 +1404,31 @@ impl Qwen3AsrModel {
             self.audio_conditioned_embeds(input_ids, audio_embeds, audio_pad_start, audio_pad_len)?;
         self.text_model
             .forward_with_embeds_profiled(&embeds, 0, cache, position_ids.as_ref())
+    }
+
+    fn forward_timestamp_logits_with_audio_profiled(
+        &self,
+        input_ids: &Tensor,
+        audio_embeds: &Tensor,
+        audio_pad_start: usize,
+        audio_pad_len: usize,
+        timestamp_positions: &[usize],
+        cache: Option<&mut Qwen3Cache>,
+    ) -> Result<(Tensor, Qwen3ForwardDiagnostics)> {
+        let (embeds, position_ids) =
+            self.audio_conditioned_embeds(input_ids, audio_embeds, audio_pad_start, audio_pad_len)?;
+        let (hidden, mut diagnostics) = self.text_model.forward_hidden_with_embeds_profiled(
+            &embeds,
+            0,
+            cache,
+            position_ids.as_ref(),
+        )?;
+        let timestamp_hidden = select_sequence_positions(&hidden, timestamp_positions)?;
+
+        let lm_head_started = Instant::now();
+        let logits = self.text_model.logits_from_hidden(&timestamp_hidden)?;
+        diagnostics.lm_head_ms += elapsed_ms(lm_head_started);
+        Ok((logits, diagnostics))
     }
 
     fn audio_conditioned_embeds(
@@ -2314,6 +2336,68 @@ fn fix_timestamp_sequence(data: &[u32]) -> Vec<u32> {
         .collect()
 }
 
+fn align_words_from_paired_timestamps(
+    words: &[String],
+    timestamps_ms: &[u32],
+    segment_time_ms: u32,
+) -> Vec<(String, u32, u32)> {
+    let mut fixed = timestamps_ms.to_vec();
+    let required = words.len().saturating_mul(2);
+    if fixed.len() < required {
+        let fill = fixed.last().copied().unwrap_or(0);
+        fixed.resize(required, fill);
+    }
+
+    let mut alignments = Vec::with_capacity(words.len());
+    for (idx, word) in words.iter().enumerate() {
+        let start = fixed.get(idx * 2).copied().unwrap_or(0);
+        let mut end = fixed
+            .get(idx * 2 + 1)
+            .copied()
+            .unwrap_or_else(|| start.saturating_add(segment_time_ms));
+        if end <= start {
+            end = start.saturating_add(1);
+        }
+        alignments.push((word.clone(), start, end));
+    }
+    alignments
+}
+
+fn align_words_from_single_timestamps(
+    words: &[String],
+    timestamps_ms: &[u32],
+    segment_time_ms: u32,
+    audio_duration_ms: u32,
+) -> Vec<(String, u32, u32)> {
+    if words.is_empty() {
+        return Vec::new();
+    }
+
+    let mut fixed = timestamps_ms.to_vec();
+    if fixed.len() < words.len() {
+        let fill = fixed
+            .last()
+            .copied()
+            .unwrap_or(audio_duration_ms.max(segment_time_ms));
+        fixed.resize(words.len(), fill);
+    }
+
+    let mut alignments = Vec::with_capacity(words.len());
+    let mut start = 0u32;
+    for (idx, word) in words.iter().enumerate() {
+        let mut end = fixed
+            .get(idx)
+            .copied()
+            .unwrap_or_else(|| start.saturating_add(segment_time_ms));
+        if end <= start {
+            end = start.saturating_add(1);
+        }
+        alignments.push((word.clone(), start, end));
+        start = end;
+    }
+    alignments
+}
+
 fn validate_quantization_config(config: &Qwen3AsrConfig) -> Result<()> {
     let quant = config
         .quantization_config
@@ -2693,6 +2777,10 @@ fn qwen3_forced_aligner_fast_resample_enabled(kind: DeviceKind) -> bool {
     kind.is_metal() && env_bool("IZWI_QWEN3_FORCED_ALIGNER_FAST_RESAMPLE").unwrap_or(true)
 }
 
+fn qwen3_forced_aligner_single_timestamp_enabled(kind: DeviceKind) -> bool {
+    kind.is_metal() && env_bool("IZWI_QWEN3_FORCED_ALIGNER_SINGLE_TIMESTAMP").unwrap_or(true)
+}
+
 fn env_bool(name: &str) -> Option<bool> {
     std::env::var(name).ok().and_then(|raw| {
         let normalized = raw.trim().to_ascii_lowercase();
@@ -2911,6 +2999,52 @@ fn batched_timestamp_argmax(logits: &Tensor, positions: &[usize]) -> Result<Vec<
     let positions = Tensor::from_vec(position_ids, (positions.len(),), logits.device())?;
     let token_logits = logits.i(0)?.index_select(&positions, 0)?;
     let indices = token_logits.argmax(D::Minus1)?.to_dtype(DType::U32)?;
+    indices.to_vec1::<u32>().map_err(Error::from)
+}
+
+fn select_sequence_positions(tensor: &Tensor, positions: &[usize]) -> Result<Tensor> {
+    let dims = tensor.dims();
+    if dims.len() != 3 || dims[0] != 1 {
+        return Err(Error::InferenceError(format!(
+            "Sequence position selection expects tensor shape [1, seq, hidden], got {dims:?}"
+        )));
+    }
+    let seq_len = dims[1];
+    let hidden_dim = dims[2];
+    if positions.is_empty() {
+        return Tensor::zeros((1, 0, hidden_dim), tensor.dtype(), tensor.device())
+            .map_err(Error::from);
+    }
+    let mut position_ids = Vec::with_capacity(positions.len());
+    for &position in positions {
+        if position >= seq_len {
+            return Err(Error::InferenceError(format!(
+                "Sequence selection position {position} is out of range for sequence length {seq_len}"
+            )));
+        }
+        position_ids.push(position as i64);
+    }
+
+    let positions = Tensor::from_vec(position_ids, (positions.len(),), tensor.device())?;
+    tensor
+        .i(0)?
+        .index_select(&positions, 0)?
+        .unsqueeze(0)
+        .map_err(Error::from)
+}
+
+fn timestamp_argmax_from_selected_logits(logits: &Tensor) -> Result<Vec<u32>> {
+    let dims = logits.dims();
+    if dims.len() != 3 || dims[0] != 1 {
+        return Err(Error::InferenceError(format!(
+            "Forced aligner selected timestamp logits expect shape [1, positions, classes], got {dims:?}"
+        )));
+    }
+    if dims[1] == 0 {
+        return Ok(Vec::new());
+    }
+
+    let indices = logits.i(0)?.argmax(D::Minus1)?.to_dtype(DType::U32)?;
     indices.to_vec1::<u32>().map_err(Error::from)
 }
 
@@ -3323,6 +3457,25 @@ mod tests {
     }
 
     #[test]
+    fn single_timestamp_alignment_uses_previous_end_as_next_start() {
+        let words = vec![
+            "hello".to_string(),
+            "world".to_string(),
+            "again".to_string(),
+        ];
+        let alignments = align_words_from_single_timestamps(&words, &[100, 240, 240], 20, 500);
+
+        assert_eq!(
+            alignments,
+            vec![
+                ("hello".to_string(), 0, 100),
+                ("world".to_string(), 100, 240),
+                ("again".to_string(), 240, 241),
+            ]
+        );
+    }
+
+    #[test]
     fn qwen_asr_gguf_filename_matches_new_variants() {
         assert_eq!(
             qwen_asr_gguf_filename(ModelVariant::Qwen3Asr06BGguf),
@@ -3427,6 +3580,25 @@ mod tests {
             .expect_err("timestamp position should be out of range");
 
         assert!(format!("{err}").contains("out of range"));
+    }
+
+    #[test]
+    fn selected_timestamp_argmax_reads_position_rows_directly() {
+        let device = candle_core::Device::Cpu;
+        let logits = Tensor::from_vec(
+            vec![
+                0.1f32, 0.9, 0.2, 0.3, //
+                1.2, 0.1, 0.0, 0.4, //
+                -0.1, -0.2, 0.5, 0.4,
+            ],
+            (1, 3, 4),
+            &device,
+        )
+        .expect("logits");
+
+        let indices = timestamp_argmax_from_selected_logits(&logits).expect("argmax");
+
+        assert_eq!(indices, vec![1, 0, 2]);
     }
 
     #[test]
