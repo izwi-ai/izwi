@@ -22,7 +22,7 @@ use crate::error::{Error, Result};
 use crate::kernels::buffer_pool::maybe_init_global_buffer_pool;
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::core::{
-    Qwen3Cache, Qwen3Config, Qwen3Model, RopeScalingConfig,
+    Qwen3Cache, Qwen3Config, Qwen3ForwardDiagnostics, Qwen3Model, RopeScalingConfig,
 };
 use crate::models::shared::attention::flash::{
     flash_attention_compiled, flash_attention_requested,
@@ -245,6 +245,7 @@ struct Qwen3ForcedAlignDiagnostics {
     timestamp_positions: usize,
     timestamp_segment_time_ms: u32,
     execution: Qwen3AsrExecutionDiagnostics,
+    prefill_profile: Qwen3ForwardDiagnostics,
     timings: Qwen3ForcedAlignTimingDiagnostics,
 }
 
@@ -306,6 +307,17 @@ impl Qwen3ForcedAlignDiagnostics {
                 "postprocess": self.timings.postprocess_ms,
                 "decode": decode_ms,
                 "model_total": self.timings.total_ms,
+            },
+            "prefill_profile_ms": {
+                "input_norm": self.prefill_profile.input_norm_ms,
+                "attention": self.prefill_profile.attention_ms,
+                "attention_residual": self.prefill_profile.attention_residual_ms,
+                "post_attention_norm": self.prefill_profile.post_attention_norm_ms,
+                "mlp": self.prefill_profile.mlp_ms,
+                "mlp_residual": self.prefill_profile.mlp_residual_ms,
+                "layers_total": self.prefill_profile.layers_total_ms,
+                "final_norm": self.prefill_profile.final_norm_ms,
+                "lm_head": self.prefill_profile.lm_head_ms,
             }
         })
     }
@@ -1239,7 +1251,7 @@ impl Qwen3AsrModel {
             .map(|cache| self.execution_diagnostics(cache))
             .unwrap_or_else(|| self.execution_diagnostics_without_cache(prompt.ids.len()));
         let prefill_started = Instant::now();
-        let logits = self.forward_with_audio(
+        let (logits, prefill_profile) = self.forward_with_audio_profiled(
             &input_ids,
             &audio_embeds,
             prompt.audio_pad_start,
@@ -1304,6 +1316,7 @@ impl Qwen3AsrModel {
             timestamp_positions: timestamp_positions.len(),
             timestamp_segment_time_ms: segment_time_ms,
             execution,
+            prefill_profile,
             timings: Qwen3ForcedAlignTimingDiagnostics {
                 resample_ms,
                 mel_ms,
@@ -1376,6 +1389,33 @@ impl Qwen3AsrModel {
         audio_pad_len: usize,
         cache: Option<&mut Qwen3Cache>,
     ) -> Result<Tensor> {
+        let (embeds, position_ids) =
+            self.audio_conditioned_embeds(input_ids, audio_embeds, audio_pad_start, audio_pad_len)?;
+        self.text_model
+            .forward_with_embeds(&embeds, 0, cache, position_ids.as_ref())
+    }
+
+    fn forward_with_audio_profiled(
+        &self,
+        input_ids: &Tensor,
+        audio_embeds: &Tensor,
+        audio_pad_start: usize,
+        audio_pad_len: usize,
+        cache: Option<&mut Qwen3Cache>,
+    ) -> Result<(Tensor, Qwen3ForwardDiagnostics)> {
+        let (embeds, position_ids) =
+            self.audio_conditioned_embeds(input_ids, audio_embeds, audio_pad_start, audio_pad_len)?;
+        self.text_model
+            .forward_with_embeds_profiled(&embeds, 0, cache, position_ids.as_ref())
+    }
+
+    fn audio_conditioned_embeds(
+        &self,
+        input_ids: &Tensor,
+        audio_embeds: &Tensor,
+        audio_pad_start: usize,
+        audio_pad_len: usize,
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let embeds = self.text_model.embeddings(input_ids)?;
         let seq_len = embeds.dim(1)?;
         let model_audio_len = audio_embeds.dim(1)?;
@@ -1421,8 +1461,7 @@ impl Qwen3AsrModel {
         } else {
             None
         };
-        self.text_model
-            .forward_with_embeds(&embeds, 0, cache, position_ids.as_ref())
+        Ok((embeds, position_ids))
     }
 
     fn build_prompt(

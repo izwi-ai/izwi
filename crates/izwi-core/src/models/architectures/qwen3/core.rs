@@ -25,6 +25,7 @@ use crate::models::shared::telemetry::{
 };
 use crate::models::shared::weights::gguf::GgufLoader;
 use crate::models::shared::weights::mlx;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RopeScalingConfig {
@@ -554,6 +555,23 @@ impl Qwen3ProjectionDiagnostics {
                 .saturating_add(other.quantized_projection_count),
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Qwen3ForwardDiagnostics {
+    pub input_norm_ms: f64,
+    pub attention_ms: f64,
+    pub attention_residual_ms: f64,
+    pub post_attention_norm_ms: f64,
+    pub mlp_ms: f64,
+    pub mlp_residual_ms: f64,
+    pub layers_total_ms: f64,
+    pub final_norm_ms: f64,
+    pub lm_head_ms: f64,
+}
+
+fn qwen3_elapsed_ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
 }
 
 impl Qwen3Projection {
@@ -1199,15 +1217,74 @@ impl Qwen3Layer {
         cache: Option<&mut Qwen3Cache>,
         layer_idx: usize,
     ) -> Result<Tensor> {
+        self.forward_inner(x, start_pos, position_ids, cache, layer_idx, None)
+    }
+
+    fn forward_with_diagnostics(
+        &self,
+        x: &Tensor,
+        start_pos: usize,
+        position_ids: Option<&Tensor>,
+        cache: Option<&mut Qwen3Cache>,
+        layer_idx: usize,
+        diagnostics: &mut Qwen3ForwardDiagnostics,
+    ) -> Result<Tensor> {
+        self.forward_inner(
+            x,
+            start_pos,
+            position_ids,
+            cache,
+            layer_idx,
+            Some(diagnostics),
+        )
+    }
+
+    fn forward_inner(
+        &self,
+        x: &Tensor,
+        start_pos: usize,
+        position_ids: Option<&Tensor>,
+        cache: Option<&mut Qwen3Cache>,
+        layer_idx: usize,
+        mut diagnostics: Option<&mut Qwen3ForwardDiagnostics>,
+    ) -> Result<Tensor> {
+        let norm_started = diagnostics.as_ref().map(|_| Instant::now());
         let normed = self.input_layernorm.forward(x)?;
+        if let (Some(diag), Some(started)) = (diagnostics.as_deref_mut(), norm_started) {
+            diag.input_norm_ms += qwen3_elapsed_ms(started);
+        }
+
+        let attention_started = diagnostics.as_ref().map(|_| Instant::now());
         let attn_out =
             self.self_attn
                 .forward(&normed, start_pos, position_ids, cache, layer_idx)?;
-        let x = x.broadcast_add(&attn_out)?;
+        if let (Some(diag), Some(started)) = (diagnostics.as_deref_mut(), attention_started) {
+            diag.attention_ms += qwen3_elapsed_ms(started);
+        }
 
+        let residual_started = diagnostics.as_ref().map(|_| Instant::now());
+        let x = x.broadcast_add(&attn_out)?;
+        if let (Some(diag), Some(started)) = (diagnostics.as_deref_mut(), residual_started) {
+            diag.attention_residual_ms += qwen3_elapsed_ms(started);
+        }
+
+        let norm_started = diagnostics.as_ref().map(|_| Instant::now());
         let normed = self.post_attention_layernorm.forward(&x)?;
+        if let (Some(diag), Some(started)) = (diagnostics.as_deref_mut(), norm_started) {
+            diag.post_attention_norm_ms += qwen3_elapsed_ms(started);
+        }
+
+        let mlp_started = diagnostics.as_ref().map(|_| Instant::now());
         let mlp_out = self.mlp.forward(&normed)?;
+        if let (Some(diag), Some(started)) = (diagnostics.as_deref_mut(), mlp_started) {
+            diag.mlp_ms += qwen3_elapsed_ms(started);
+        }
+
+        let residual_started = diagnostics.as_ref().map(|_| Instant::now());
         let x = x.broadcast_add(&mlp_out)?;
+        if let (Some(diag), Some(started)) = (diagnostics.as_deref_mut(), residual_started) {
+            diag.mlp_residual_ms += qwen3_elapsed_ms(started);
+        }
         Ok(x)
     }
 }
@@ -1427,6 +1504,27 @@ impl Qwen3Model {
         self.logits_from_hidden(&hidden)
     }
 
+    pub fn forward_with_embeds_profiled(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        mut cache: Option<&mut Qwen3Cache>,
+        position_ids: Option<&Tensor>,
+    ) -> Result<(Tensor, Qwen3ForwardDiagnostics)> {
+        let mut diagnostics = Qwen3ForwardDiagnostics::default();
+        let hidden = self.forward_hidden_with_embeds_inner(
+            embeds,
+            start_pos,
+            cache.as_deref_mut(),
+            position_ids,
+            Some(&mut diagnostics),
+        )?;
+        let lm_head_started = Instant::now();
+        let logits = self.logits_from_hidden(&hidden)?;
+        diagnostics.lm_head_ms += qwen3_elapsed_ms(lm_head_started);
+        Ok((logits, diagnostics))
+    }
+
     pub fn forward_hidden_with_embeds(
         &self,
         embeds: &Tensor,
@@ -1434,12 +1532,44 @@ impl Qwen3Model {
         mut cache: Option<&mut Qwen3Cache>,
         position_ids: Option<&Tensor>,
     ) -> Result<Tensor> {
+        self.forward_hidden_with_embeds_inner(
+            embeds,
+            start_pos,
+            cache.as_deref_mut(),
+            position_ids,
+            None,
+        )
+    }
+
+    fn forward_hidden_with_embeds_inner(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        mut cache: Option<&mut Qwen3Cache>,
+        position_ids: Option<&Tensor>,
+        mut diagnostics: Option<&mut Qwen3ForwardDiagnostics>,
+    ) -> Result<Tensor> {
         let mut x = embeds.clone();
+        let layers_started = diagnostics.as_ref().map(|_| Instant::now());
         for (idx, layer) in self.layers.iter().enumerate() {
             let cache_ref = cache.as_deref_mut();
-            x = layer.forward(&x, start_pos, position_ids, cache_ref, idx)?;
+            x = match diagnostics.as_deref_mut() {
+                Some(diag) => {
+                    layer.forward_with_diagnostics(&x, start_pos, position_ids, cache_ref, idx, diag)?
+                }
+                None => layer.forward(&x, start_pos, position_ids, cache_ref, idx)?,
+            };
         }
-        self.norm.forward(&x).map_err(Error::from)
+        if let (Some(diag), Some(started)) = (diagnostics.as_deref_mut(), layers_started) {
+            diag.layers_total_ms += qwen3_elapsed_ms(started);
+        }
+
+        let norm_started = diagnostics.as_ref().map(|_| Instant::now());
+        let x = self.norm.forward(&x)?;
+        if let (Some(diag), Some(started)) = (diagnostics.as_deref_mut(), norm_started) {
+            diag.final_norm_ms += qwen3_elapsed_ms(started);
+        }
+        Ok(x)
     }
 
     pub fn logits_from_hidden(&self, hidden: &Tensor) -> Result<Tensor> {

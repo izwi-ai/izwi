@@ -214,6 +214,15 @@ struct AsrStageTimings {
     audio_encode: Option<f64>,
     prompt_build: Option<f64>,
     prefill: Option<f64>,
+    prefill_input_norm: Option<f64>,
+    prefill_attention: Option<f64>,
+    prefill_attention_residual: Option<f64>,
+    prefill_post_attention_norm: Option<f64>,
+    prefill_mlp: Option<f64>,
+    prefill_mlp_residual: Option<f64>,
+    prefill_layers_total: Option<f64>,
+    prefill_final_norm: Option<f64>,
+    prefill_lm_head: Option<f64>,
     timestamp_argmax: Option<f64>,
     timestamp_fixup: Option<f64>,
     postprocess: Option<f64>,
@@ -3526,6 +3535,7 @@ fn asr_stage_timings_from_diagnostics(diagnostics: &serde_json::Value) -> Option
     let prompt = diagnostics.get("prompt");
     let audio = diagnostics.get("audio");
     let decode = diagnostics.get("decode");
+    let prefill_profile = diagnostics.get("prefill_profile_ms");
     let execution = asr_execution_from_single_diagnostics(diagnostics);
     Some(AsrStageTimings {
         audio_decode: timings.get("audio_decode").and_then(|value| value.as_f64()),
@@ -3572,6 +3582,15 @@ fn asr_stage_timings_from_diagnostics(diagnostics: &serde_json::Value) -> Option
         audio_encode: timings.get("audio_encode").and_then(|value| value.as_f64()),
         prompt_build: timings.get("prompt_build").and_then(|value| value.as_f64()),
         prefill: timings.get("prefill").and_then(|value| value.as_f64()),
+        prefill_input_norm: diagnostic_f64(prefill_profile, &["input_norm"]),
+        prefill_attention: diagnostic_f64(prefill_profile, &["attention"]),
+        prefill_attention_residual: diagnostic_f64(prefill_profile, &["attention_residual"]),
+        prefill_post_attention_norm: diagnostic_f64(prefill_profile, &["post_attention_norm"]),
+        prefill_mlp: diagnostic_f64(prefill_profile, &["mlp"]),
+        prefill_mlp_residual: diagnostic_f64(prefill_profile, &["mlp_residual"]),
+        prefill_layers_total: diagnostic_f64(prefill_profile, &["layers_total"]),
+        prefill_final_norm: diagnostic_f64(prefill_profile, &["final_norm"]),
+        prefill_lm_head: diagnostic_f64(prefill_profile, &["lm_head"]),
         timestamp_argmax: timings
             .get("timestamp_argmax")
             .and_then(|value| value.as_f64()),
@@ -3608,6 +3627,12 @@ fn diagnostic_u64(value: Option<&serde_json::Value>, keys: &[&str]) -> Option<u6
     let value = value?;
     keys.iter()
         .find_map(|key| value.get(*key).and_then(|value| value.as_u64()))
+}
+
+fn diagnostic_f64(value: Option<&serde_json::Value>, keys: &[&str]) -> Option<f64> {
+    let value = value?;
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(|value| value.as_f64()))
 }
 
 fn asr_execution_from_diagnostics(
@@ -3915,6 +3940,15 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     let mut audio_encode = Vec::new();
     let mut prompt_build = Vec::new();
     let mut prefill = Vec::new();
+    let mut prefill_input_norm = Vec::new();
+    let mut prefill_attention = Vec::new();
+    let mut prefill_attention_residual = Vec::new();
+    let mut prefill_post_attention_norm = Vec::new();
+    let mut prefill_mlp = Vec::new();
+    let mut prefill_mlp_residual = Vec::new();
+    let mut prefill_layers_total = Vec::new();
+    let mut prefill_final_norm = Vec::new();
+    let mut prefill_lm_head = Vec::new();
     let mut timestamp_argmax = Vec::new();
     let mut timestamp_fixup = Vec::new();
     let mut postprocess = Vec::new();
@@ -4006,6 +4040,33 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         }
         if let Some(value) = sample.prefill {
             prefill.push(value);
+        }
+        if let Some(value) = sample.prefill_input_norm {
+            prefill_input_norm.push(value);
+        }
+        if let Some(value) = sample.prefill_attention {
+            prefill_attention.push(value);
+        }
+        if let Some(value) = sample.prefill_attention_residual {
+            prefill_attention_residual.push(value);
+        }
+        if let Some(value) = sample.prefill_post_attention_norm {
+            prefill_post_attention_norm.push(value);
+        }
+        if let Some(value) = sample.prefill_mlp {
+            prefill_mlp.push(value);
+        }
+        if let Some(value) = sample.prefill_mlp_residual {
+            prefill_mlp_residual.push(value);
+        }
+        if let Some(value) = sample.prefill_layers_total {
+            prefill_layers_total.push(value);
+        }
+        if let Some(value) = sample.prefill_final_norm {
+            prefill_final_norm.push(value);
+        }
+        if let Some(value) = sample.prefill_lm_head {
+            prefill_lm_head.push(value);
         }
         if let Some(value) = sample.timestamp_argmax {
             timestamp_argmax.push(value);
@@ -4105,6 +4166,15 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         && audio_encode.is_empty()
         && prompt_build.is_empty()
         && prefill.is_empty()
+        && prefill_input_norm.is_empty()
+        && prefill_attention.is_empty()
+        && prefill_attention_residual.is_empty()
+        && prefill_post_attention_norm.is_empty()
+        && prefill_mlp.is_empty()
+        && prefill_mlp_residual.is_empty()
+        && prefill_layers_total.is_empty()
+        && prefill_final_norm.is_empty()
+        && prefill_lm_head.is_empty()
         && timestamp_argmax.is_empty()
         && timestamp_fixup.is_empty()
         && postprocess.is_empty()
@@ -4161,6 +4231,15 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     summarize_stage("audio_encode", &audio_encode);
     summarize_stage("prompt_build", &prompt_build);
     summarize_stage("prefill", &prefill);
+    summarize_stage("pf_in_norm", &prefill_input_norm);
+    summarize_stage("pf_attn", &prefill_attention);
+    summarize_stage("pf_attn_res", &prefill_attention_residual);
+    summarize_stage("pf_postnorm", &prefill_post_attention_norm);
+    summarize_stage("pf_mlp", &prefill_mlp);
+    summarize_stage("pf_mlp_res", &prefill_mlp_residual);
+    summarize_stage("pf_layers", &prefill_layers_total);
+    summarize_stage("pf_norm", &prefill_final_norm);
+    summarize_stage("pf_lm_head", &prefill_lm_head);
     summarize_stage("ts_argmax", &timestamp_argmax);
     summarize_stage("ts_fixup", &timestamp_fixup);
     summarize_stage("postprocess", &postprocess);
