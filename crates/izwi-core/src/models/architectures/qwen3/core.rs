@@ -839,6 +839,7 @@ impl Qwen3Attention {
         start_pos: usize,
         position_ids: Option<&Tensor>,
         cache: Option<&mut Qwen3Cache>,
+        forward_rope_pair: Option<&(Tensor, Tensor)>,
     ) -> Result<(Tensor, Tensor)> {
         let seq_len = q.dim(1)?;
         if k.dim(1)? != seq_len {
@@ -851,7 +852,9 @@ impl Qwen3Attention {
         let q = q.contiguous()?;
         let k = k.contiguous()?;
 
-        let (cos_half, sin_half) = if let Some(position_ids) = position_ids {
+        let (cos_half, sin_half) = if let Some((cos_half, sin_half)) = forward_rope_pair {
+            (cos_half.clone(), sin_half.clone())
+        } else if let Some(position_ids) = position_ids {
             if self.use_mrope {
                 build_mrope_cache_with_inv_freqs(
                     seq_len,
@@ -928,6 +931,57 @@ impl Qwen3Attention {
         ))
     }
 
+    fn build_forward_rope_pair(
+        &self,
+        seq_len: usize,
+        start_pos: usize,
+        device: &Device,
+        dtype: DType,
+        position_ids: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        if let Some(position_ids) = position_ids {
+            if self.use_mrope {
+                build_mrope_cache_with_inv_freqs(
+                    seq_len,
+                    self.head_dim,
+                    device,
+                    dtype,
+                    position_ids,
+                    self.mrope_section.as_deref().unwrap_or(&[]),
+                    &self.rope_inv_freqs,
+                )
+            } else {
+                build_rope_cache_with_inv_freqs(
+                    seq_len,
+                    start_pos,
+                    device,
+                    dtype,
+                    &self.rope_inv_freqs,
+                )
+            }
+        } else if self.use_mrope {
+            let mut data = Vec::with_capacity(3 * seq_len);
+            let base = start_pos as i64;
+            for _axis in 0..3 {
+                for idx in 0..seq_len {
+                    data.push(base + idx as i64);
+                }
+            }
+            let position_ids = Tensor::from_vec(data, (3, seq_len), device)?;
+            build_mrope_cache_with_inv_freqs(
+                seq_len,
+                self.head_dim,
+                device,
+                dtype,
+                &position_ids,
+                self.mrope_section.as_deref().unwrap_or(&[]),
+                &self.rope_inv_freqs,
+            )
+        } else {
+            build_rope_cache_with_inv_freqs(seq_len, start_pos, device, dtype, &self.rope_inv_freqs)
+        }
+    }
+
     fn should_try_rope_kernel(&self, dtype: DType) -> bool {
         if !self.rope_kernel_enabled {
             return false;
@@ -946,6 +1000,7 @@ impl Qwen3Attention {
         mut cache: Option<&mut Qwen3Cache>,
         layer_idx: usize,
         mut diagnostics: Option<&mut Qwen3ForwardDiagnostics>,
+        forward_rope_pair: Option<&(Tensor, Tensor)>,
     ) -> Result<Tensor> {
         let bsz = x.dim(0)?;
         let seq_len = x.dim(1)?;
@@ -976,7 +1031,14 @@ impl Qwen3Attention {
         }
 
         let rope_started = diagnostics.as_ref().map(|_| Instant::now());
-        (q, k) = self.apply_rope_pair(q, k, start_pos, position_ids, cache.as_deref_mut())?;
+        (q, k) = self.apply_rope_pair(
+            q,
+            k,
+            start_pos,
+            position_ids,
+            cache.as_deref_mut(),
+            forward_rope_pair,
+        )?;
         if let (Some(diag), Some(started)) = (diagnostics.as_deref_mut(), rope_started) {
             diag.attention_rope_ms += qwen3_elapsed_ms(started);
         }
@@ -1286,8 +1348,17 @@ impl Qwen3Layer {
         position_ids: Option<&Tensor>,
         cache: Option<&mut Qwen3Cache>,
         layer_idx: usize,
+        forward_rope_pair: Option<&(Tensor, Tensor)>,
     ) -> Result<Tensor> {
-        self.forward_inner(x, start_pos, position_ids, cache, layer_idx, None)
+        self.forward_inner(
+            x,
+            start_pos,
+            position_ids,
+            cache,
+            layer_idx,
+            None,
+            forward_rope_pair,
+        )
     }
 
     fn forward_with_diagnostics(
@@ -1298,6 +1369,7 @@ impl Qwen3Layer {
         cache: Option<&mut Qwen3Cache>,
         layer_idx: usize,
         diagnostics: &mut Qwen3ForwardDiagnostics,
+        forward_rope_pair: Option<&(Tensor, Tensor)>,
     ) -> Result<Tensor> {
         self.forward_inner(
             x,
@@ -1306,6 +1378,7 @@ impl Qwen3Layer {
             cache,
             layer_idx,
             Some(diagnostics),
+            forward_rope_pair,
         )
     }
 
@@ -1317,6 +1390,7 @@ impl Qwen3Layer {
         cache: Option<&mut Qwen3Cache>,
         layer_idx: usize,
         mut diagnostics: Option<&mut Qwen3ForwardDiagnostics>,
+        forward_rope_pair: Option<&(Tensor, Tensor)>,
     ) -> Result<Tensor> {
         let norm_started = diagnostics.as_ref().map(|_| Instant::now());
         let normed = self.input_layernorm.forward(x)?;
@@ -1328,11 +1402,27 @@ impl Qwen3Layer {
         let attn_out = match diagnostics.as_deref_mut() {
             Some(diag) => {
                 self.self_attn
-                    .forward(&normed, start_pos, position_ids, cache, layer_idx, Some(diag))?
+                    .forward(
+                        &normed,
+                        start_pos,
+                        position_ids,
+                        cache,
+                        layer_idx,
+                        Some(diag),
+                        forward_rope_pair,
+                    )?
             }
             None => self
                 .self_attn
-                .forward(&normed, start_pos, position_ids, cache, layer_idx, None)?,
+                .forward(
+                    &normed,
+                    start_pos,
+                    position_ids,
+                    cache,
+                    layer_idx,
+                    None,
+                    forward_rope_pair,
+                )?,
         };
         if let (Some(diag), Some(started)) = (diagnostics.as_deref_mut(), attention_started) {
             diag.attention_ms += qwen3_elapsed_ms(started);
@@ -1644,14 +1734,50 @@ impl Qwen3Model {
         mut diagnostics: Option<&mut Qwen3ForwardDiagnostics>,
     ) -> Result<Tensor> {
         let mut x = embeds.clone();
+        let forward_rope_started = diagnostics.as_ref().map(|_| Instant::now());
+        let forward_rope_pair = if cache.is_none() {
+            self.layers
+                .first()
+                .map(|layer| {
+                    layer.self_attn.build_forward_rope_pair(
+                        embeds.dim(1)?,
+                        start_pos,
+                        embeds.device(),
+                        embeds.dtype(),
+                        position_ids,
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        if let (Some(diag), Some(started)) = (diagnostics.as_deref_mut(), forward_rope_started) {
+            diag.attention_rope_ms += qwen3_elapsed_ms(started);
+        }
+        let forward_rope_pair_ref = forward_rope_pair.as_ref();
         let layers_started = diagnostics.as_ref().map(|_| Instant::now());
         for (idx, layer) in self.layers.iter().enumerate() {
             let cache_ref = cache.as_deref_mut();
             x = match diagnostics.as_deref_mut() {
                 Some(diag) => {
-                    layer.forward_with_diagnostics(&x, start_pos, position_ids, cache_ref, idx, diag)?
+                    layer.forward_with_diagnostics(
+                        &x,
+                        start_pos,
+                        position_ids,
+                        cache_ref,
+                        idx,
+                        diag,
+                        forward_rope_pair_ref,
+                    )?
                 }
-                None => layer.forward(&x, start_pos, position_ids, cache_ref, idx)?,
+                None => layer.forward(
+                    &x,
+                    start_pos,
+                    position_ids,
+                    cache_ref,
+                    idx,
+                    forward_rope_pair_ref,
+                )?,
             };
         }
         if let (Some(diag), Some(started)) = (diagnostics.as_deref_mut(), layers_started) {
