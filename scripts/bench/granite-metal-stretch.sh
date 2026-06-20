@@ -230,6 +230,11 @@ for index, sample in enumerate(samples, start=1):
     ):
         if execution.get(key) is not True:
             fail(f"sample {index} expected execution.{key}=true")
+    if (
+        execution.get("chunked_stop_check") is not True
+        and execution.get("deferred_stop_check") is not True
+    ):
+        fail(f"sample {index} expected chunked or deferred stop checks")
 
     decode_ms = number_at(diagnostics, "timings_ms", "decode")
     if decode_ms is None:
