@@ -15,6 +15,12 @@ pub(crate) fn base64_decode(data: &str) -> Result<Vec<u8>> {
         data
     };
 
+    if !payload.as_bytes().iter().any(u8::is_ascii_whitespace) {
+        return base64::engine::general_purpose::STANDARD
+            .decode(payload.as_bytes())
+            .map_err(|e| Error::InferenceError(format!("Base64 decode error: {}", e)));
+    }
+
     let normalized: String = payload.chars().filter(|c| !c.is_whitespace()).collect();
     base64::engine::general_purpose::STANDARD
         .decode(normalized.as_bytes())
@@ -24,6 +30,20 @@ pub(crate) fn base64_decode(data: &str) -> Result<Vec<u8>> {
 pub(crate) fn decode_audio_bytes(audio_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
     if audio_bytes.is_empty() {
         return Err(Error::InvalidInput("Empty audio input".to_string()));
+    }
+
+    if is_riff_wave(audio_bytes) {
+        match decode_wav_bytes_fast(audio_bytes) {
+            Ok((samples, sample_rate)) => return finalize_decoded_audio(samples, sample_rate),
+            Err(wav_err) => {
+                return match decode_audio_bytes_symphonia(audio_bytes) {
+                    Ok((samples, sample_rate)) => finalize_decoded_audio(samples, sample_rate),
+                    Err(symphonia_err) => Err(Error::InferenceError(format!(
+                        "Failed to decode WAV. WAV fast path: {wav_err}; Symphonia: {symphonia_err}"
+                    ))),
+                };
+            }
+        }
     }
 
     match decode_audio_bytes_symphonia(audio_bytes) {
@@ -42,6 +62,129 @@ pub(crate) fn decode_audio_bytes(audio_bytes: &[u8]) -> Result<(Vec<f32>, u32)> 
 
 pub(crate) fn decode_wav_bytes(wav_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
     decode_audio_bytes(wav_bytes)
+}
+
+fn is_riff_wave(bytes: &[u8]) -> bool {
+    bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE"
+}
+
+fn decode_wav_bytes_fast(wav_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
+    decode_wav_pcm16_mono_fast(wav_bytes).or_else(|_| decode_wav_bytes_hound(wav_bytes))
+}
+
+fn decode_wav_pcm16_mono_fast(wav_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
+    let mut offset = 12usize;
+    let mut audio_format = None;
+    let mut channels = None;
+    let mut sample_rate = None;
+    let mut block_align = None;
+    let mut bits_per_sample = None;
+    let mut data_range = None;
+
+    while offset.saturating_add(8) <= wav_bytes.len() {
+        let chunk_id = &wav_bytes[offset..offset + 4];
+        let chunk_size = u32::from_le_bytes([
+            wav_bytes[offset + 4],
+            wav_bytes[offset + 5],
+            wav_bytes[offset + 6],
+            wav_bytes[offset + 7],
+        ]) as usize;
+        let chunk_start = offset + 8;
+        let Some(chunk_end) = chunk_start.checked_add(chunk_size) else {
+            break;
+        };
+        if chunk_end > wav_bytes.len() {
+            break;
+        }
+
+        match chunk_id {
+            b"fmt " if chunk_size >= 16 => {
+                audio_format = Some(u16::from_le_bytes([
+                    wav_bytes[chunk_start],
+                    wav_bytes[chunk_start + 1],
+                ]));
+                channels = Some(u16::from_le_bytes([
+                    wav_bytes[chunk_start + 2],
+                    wav_bytes[chunk_start + 3],
+                ]));
+                sample_rate = Some(u32::from_le_bytes([
+                    wav_bytes[chunk_start + 4],
+                    wav_bytes[chunk_start + 5],
+                    wav_bytes[chunk_start + 6],
+                    wav_bytes[chunk_start + 7],
+                ]));
+                block_align = Some(u16::from_le_bytes([
+                    wav_bytes[chunk_start + 12],
+                    wav_bytes[chunk_start + 13],
+                ]));
+                bits_per_sample = Some(u16::from_le_bytes([
+                    wav_bytes[chunk_start + 14],
+                    wav_bytes[chunk_start + 15],
+                ]));
+            }
+            b"data" => data_range = Some(chunk_start..chunk_end),
+            _ => {}
+        }
+
+        let padded = chunk_end + (chunk_size & 1);
+        if padded <= offset {
+            break;
+        }
+        offset = padded;
+    }
+
+    let audio_format =
+        audio_format.ok_or_else(|| Error::InferenceError("WAV missing fmt chunk".to_string()))?;
+    let channels =
+        channels.ok_or_else(|| Error::InferenceError("WAV missing channel count".to_string()))?;
+    let sample_rate =
+        sample_rate.ok_or_else(|| Error::InferenceError("WAV missing sample rate".to_string()))?;
+    let block_align =
+        block_align.ok_or_else(|| Error::InferenceError("WAV missing block align".to_string()))?;
+    let bits_per_sample = bits_per_sample
+        .ok_or_else(|| Error::InferenceError("WAV missing bits per sample".to_string()))?;
+    let data_range =
+        data_range.ok_or_else(|| Error::InferenceError("WAV missing data chunk".to_string()))?;
+
+    if audio_format != 1 || channels == 0 || sample_rate == 0 || bits_per_sample != 16 {
+        return Err(Error::InferenceError(
+            "WAV fast path only supports PCM16 audio".to_string(),
+        ));
+    }
+    let channels = channels as usize;
+    let block_align = block_align as usize;
+    if block_align != channels * 2 {
+        return Err(Error::InferenceError(format!(
+            "Unsupported PCM16 WAV block alignment: {block_align}"
+        )));
+    }
+
+    let data = &wav_bytes[data_range];
+    let frame_count = data.len() / block_align;
+    if frame_count == 0 {
+        return Err(Error::InferenceError(
+            "Decoded audio produced zero samples".to_string(),
+        ));
+    }
+
+    let mut samples = Vec::with_capacity(frame_count);
+    if channels == 1 {
+        for bytes in data[..frame_count * block_align].chunks_exact(2) {
+            let sample = i16::from_le_bytes([bytes[0], bytes[1]]) as f32 / 32767.0;
+            samples.push(sample.clamp(-1.0, 1.0));
+        }
+    } else {
+        for frame in data[..frame_count * block_align].chunks_exact(block_align) {
+            let mut sum = 0.0f32;
+            for channel in 0..channels {
+                let idx = channel * 2;
+                sum += i16::from_le_bytes([frame[idx], frame[idx + 1]]) as f32;
+            }
+            samples.push((sum / channels as f32 / 32767.0).clamp(-1.0, 1.0));
+        }
+    }
+
+    Ok((samples, sample_rate))
 }
 
 fn decode_audio_bytes_symphonia(audio_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {

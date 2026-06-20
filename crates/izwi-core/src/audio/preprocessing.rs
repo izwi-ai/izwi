@@ -98,6 +98,15 @@ impl MelSpectrogram {
     }
 
     pub fn compute(&self, waveform: &[f32]) -> Result<Vec<Vec<f32>>> {
+        let (flat, frames) = self.compute_flat(waveform)?;
+        Ok(flat
+            .chunks_exact(self.config.n_mels)
+            .take(frames)
+            .map(|frame| frame.to_vec())
+            .collect())
+    }
+
+    pub fn compute_flat(&self, waveform: &[f32]) -> Result<(Vec<f32>, usize)> {
         let padded = self.reflect_pad_center(waveform);
         let num_frames = if padded.len() >= self.config.n_fft {
             (padded.len() - self.config.n_fft) / self.config.hop_length + 1
@@ -107,7 +116,7 @@ impl MelSpectrogram {
         let n_freqs = self.config.n_fft / 2 + 1;
         let mut frame = vec![Complex::new(0.0, 0.0); self.config.n_fft];
         let mut power = vec![0.0f32; n_freqs];
-        let mut log_mel = Vec::with_capacity(num_frames);
+        let mut log_mel = Vec::with_capacity(num_frames * self.config.n_mels);
 
         for frame_idx in 0..num_frames {
             frame.fill(Complex::new(0.0, 0.0));
@@ -123,27 +132,24 @@ impl MelSpectrogram {
                 power[freq_idx] = frame[freq_idx].norm_sqr();
             }
 
-            let mut mel_frame = vec![0.0f32; self.config.n_mels];
-            for (mel_idx, value) in mel_frame.iter_mut().enumerate() {
+            for mel_idx in 0..self.config.n_mels {
                 let filter = &self.mel_filterbank_spans[mel_idx];
                 let mut sum = 0.0f32;
                 for (offset, &weight) in filter.weights.iter().enumerate() {
                     sum += power[filter.start + offset] * weight;
                 }
-                *value = sum.max(1e-10).log10();
+                log_mel.push(sum.max(1e-10).log10());
             }
-
-            log_mel.push(mel_frame);
         }
 
         // NOTE: The retained Qwen forced-aligner path may need all frames including the last one
         // Previously we did: if !log_mel.is_empty() { log_mel.pop(); }
 
         if self.config.normalize {
-            Self::whisper_normalize(&mut log_mel);
+            Self::whisper_normalize_flat(&mut log_mel);
         }
 
-        Ok(log_mel)
+        Ok((log_mel, num_frames))
     }
 
     #[cfg(test)]
@@ -244,6 +250,23 @@ impl MelSpectrogram {
                 }
                 *v = (*v + 4.0) / 4.0;
             }
+        }
+    }
+
+    fn whisper_normalize_flat(log_mel: &mut [f32]) {
+        let mut max_val = f32::NEG_INFINITY;
+        for &value in log_mel.iter() {
+            if value > max_val {
+                max_val = value;
+            }
+        }
+
+        let clamp_min = max_val - 8.0;
+        for value in log_mel.iter_mut() {
+            if *value < clamp_min {
+                *value = clamp_min;
+            }
+            *value = (*value + 4.0) / 4.0;
         }
     }
 
@@ -493,6 +516,33 @@ mod tests {
                 max_diff <= 1e-6,
                 "max diff {max_diff} exceeded tolerance at frame {frame_idx}"
             );
+        }
+    }
+
+    #[test]
+    fn mel_compute_flat_matches_frame_major_compute_layout() {
+        let mel = MelSpectrogram::new(MelConfig {
+            n_fft: 400,
+            hop_length: 160,
+            n_mels: 80,
+            ..MelConfig::default()
+        })
+        .expect("mel");
+        let waveform = (0..4096)
+            .map(|idx| {
+                let t = idx as f32;
+                (t * 0.011).sin() * 0.45 + (t * 0.047).cos() * 0.15
+            })
+            .collect::<Vec<_>>();
+
+        let nested = mel.compute(&waveform).expect("nested mel");
+        let (flat, frames) = mel.compute_flat(&waveform).expect("flat mel");
+
+        assert_eq!(frames, nested.len());
+        assert_eq!(flat.len(), frames * mel.config().n_mels);
+        for (frame_idx, frame) in nested.iter().enumerate() {
+            let start = frame_idx * mel.config().n_mels;
+            assert_eq!(frame.as_slice(), &flat[start..start + mel.config().n_mels]);
         }
     }
 
