@@ -4,9 +4,184 @@
 //! and kernel launch overhead. On Metal backends, these use Candle's Metal
 //! dispatch where possible; on other backends they use optimized CPU patterns.
 
+#[cfg(feature = "metal")]
+use std::collections::HashMap;
+#[cfg(feature = "metal")]
+use std::sync::{Mutex, OnceLock};
+
+#[cfg(feature = "metal")]
+use candle_core::{
+    backend::BackendStorage, bail, CpuStorage, CustomOp2, Layout, MetalStorage,
+    Result as CandleResult, Shape,
+};
 use candle_core::{DType, Tensor};
+#[cfg(feature = "metal")]
+use candle_metal_kernels::metal::{ComputePipeline, Device as MetalDevice};
 
 use super::{FusedKernelError, FusedResult};
+
+#[cfg(feature = "metal")]
+const IZWI_METAL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void izwi_silu_mul_f32(
+    device const float* gate [[buffer(0)]],
+    device const float* up [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& elem_count [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= elem_count) {
+        return;
+    }
+
+    float x = gate[gid];
+    output[gid] = (x / (1.0f + exp(-x))) * up[gid];
+}
+
+kernel void izwi_silu_mul_f16(
+    device const half* gate [[buffer(0)]],
+    device const half* up [[buffer(1)]],
+    device half* output [[buffer(2)]],
+    constant uint& elem_count [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= elem_count) {
+        return;
+    }
+
+    float x = float(gate[gid]);
+    float y = float(up[gid]);
+    output[gid] = half((x / (1.0f + exp(-x))) * y);
+}
+"#;
+
+#[cfg(feature = "metal")]
+#[derive(Debug, Clone, Copy)]
+struct SiluMulOp;
+
+#[cfg(feature = "metal")]
+impl CustomOp2 for SiluMulOp {
+    fn name(&self) -> &'static str {
+        "izwi-silu-mul-metal"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+    ) -> CandleResult<(CpuStorage, Shape)> {
+        bail!("izwi-silu-mul-metal requires Metal tensors")
+    }
+
+    fn metal_fwd(
+        &self,
+        gate_storage: &MetalStorage,
+        gate_layout: &Layout,
+        up_storage: &MetalStorage,
+        up_layout: &Layout,
+    ) -> CandleResult<(MetalStorage, Shape)> {
+        let dtype = gate_storage.dtype();
+        if up_storage.dtype() != dtype {
+            bail!("izwi-silu-mul-metal requires matching dtypes")
+        }
+        if !matches!(dtype, DType::F32 | DType::F16) {
+            bail!("izwi-silu-mul-metal only supports F32 and F16 tensors")
+        }
+        if gate_layout.shape() != up_layout.shape() {
+            bail!("izwi-silu-mul-metal requires matching shapes")
+        }
+        if !gate_layout.is_contiguous() || !up_layout.is_contiguous() {
+            bail!("izwi-silu-mul-metal requires contiguous inputs")
+        }
+
+        let elem_count = gate_layout.shape().elem_count();
+        if elem_count > u32::MAX as usize {
+            bail!("izwi-silu-mul-metal tensor is too large")
+        }
+
+        let device = gate_storage.device().clone();
+        let output = device.new_buffer(elem_count, dtype, "izwi-silu-mul")?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("izwi-silu-mul");
+        let pipeline = silu_mul_pipeline(device.metal_device(), dtype)?;
+        encoder.set_compute_pipeline_state(&pipeline);
+
+        encoder.set_buffer(
+            0,
+            Some(gate_storage.buffer()),
+            gate_layout.start_offset() * dtype.size_in_bytes(),
+        );
+        encoder.set_buffer(
+            1,
+            Some(up_storage.buffer()),
+            up_layout.start_offset() * dtype.size_in_bytes(),
+        );
+        encoder.set_buffer(2, Some(&output), 0);
+        encoder.set_bytes(3, &(elem_count as u32));
+
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        encoder.dispatch_threads(
+            objc2_metal::MTLSize {
+                width: elem_count,
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: threads_per_threadgroup,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        Ok((
+            MetalStorage::new(output, device, elem_count, dtype),
+            gate_layout.shape().clone(),
+        ))
+    }
+}
+
+#[cfg(feature = "metal")]
+fn silu_mul_pipeline(device: &MetalDevice, dtype: DType) -> CandleResult<ComputePipeline> {
+    static PIPELINES: OnceLock<Mutex<HashMap<(u64, DType), ComputePipeline>>> = OnceLock::new();
+    let registry_id = device.registry_id();
+    let pipelines = PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (registry_id, dtype);
+
+    if let Some(pipeline) = pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .get(&key)
+        .cloned()
+    {
+        return Ok(pipeline);
+    }
+
+    let function_name = match dtype {
+        DType::F32 => "izwi_silu_mul_f32",
+        DType::F16 => "izwi_silu_mul_f16",
+        _ => bail!("izwi-silu-mul-metal only supports F32 and F16 tensors"),
+    };
+    let library = device
+        .new_library_with_source(IZWI_METAL_SOURCE, None)
+        .map_err(candle_core::Error::wrap)?;
+    let function = library
+        .get_function(function_name, None)
+        .map_err(candle_core::Error::wrap)?;
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(candle_core::Error::wrap)?;
+
+    pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .insert(key, pipeline.clone());
+
+    Ok(pipeline)
+}
 
 /// Try fused gated delta recurrent computation.
 ///
@@ -159,8 +334,22 @@ pub fn try_fused_silu_mul(gate: &Tensor, up: &Tensor) -> Option<Tensor> {
         return None;
     }
 
-    // For now, use standard operations
-    // A truly fused version would require custom kernels
+    #[cfg(feature = "metal")]
+    {
+        if gate.device().is_metal()
+            && up.device().is_metal()
+            && gate.dtype() == up.dtype()
+            && matches!(gate.dtype(), DType::F32 | DType::F16)
+            && gate.dims() == up.dims()
+            && gate.is_contiguous()
+            && up.is_contiguous()
+        {
+            if let Ok(result) = gate.apply_op2_no_bwd(up, &SiluMulOp) {
+                return Some(result);
+            }
+        }
+    }
+
     let silu_gate = candle_nn::ops::silu(gate).ok()?;
     silu_gate.broadcast_mul(up).ok()
 }
@@ -496,6 +685,8 @@ pub fn use_fused_kernels() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    use candle_core::DType;
     use candle_core::{Device, Tensor};
 
     #[test]
@@ -541,6 +732,51 @@ mod tests {
             assert!((result_data[0][1] - silu_1 * 2.0).abs() < 1e-5);
             assert!((result_data[1][0] - silu_m1 * 3.0).abs() < 1e-5);
             assert!((result_data[1][1] - silu_2 * 4.0).abs() < 1e-5);
+        }
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn metal_silu_mul_kernel_matches_reference_if_available() {
+        let Ok(device) = Device::new_metal(0) else {
+            return;
+        };
+        for dtype in [DType::F32, DType::F16] {
+            let gate = Tensor::from_vec(vec![0.0f32, 1.0, -1.0, 2.0, -3.0, 4.0], (2, 3), &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let up = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, -0.5, 0.25], (2, 3), &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+
+            let result = gate.apply_op2_no_bwd(&up, &SiluMulOp).unwrap();
+            let reference = candle_nn::ops::silu(&gate)
+                .unwrap()
+                .broadcast_mul(&up)
+                .unwrap();
+            let result = result
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let reference = reference
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let tolerance = if dtype == DType::F16 { 5e-3 } else { 1e-5 };
+            for (idx, (actual, expected)) in result.iter().zip(reference.iter()).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "{dtype:?} mismatch at {idx}: {actual} != {expected}"
+                );
+            }
         }
     }
 }
