@@ -144,7 +144,7 @@ struct AsrBenchSample {
     response: AsrBenchResponse,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct AsrStageTimings {
     audio_decode: Option<f64>,
     mel_prepare: Option<f64>,
@@ -160,6 +160,7 @@ struct AsrStageTimings {
     language_detect: Option<f64>,
     resample: Option<f64>,
     mel: Option<f64>,
+    mel_flatten_upload: Option<f64>,
     audio_encode: Option<f64>,
     prefill: Option<f64>,
     decode: Option<f64>,
@@ -172,6 +173,7 @@ struct AsrStageTimings {
     host_argmax_reads: Option<u64>,
     device_argmax_reads: Option<u64>,
     execution: Option<AsrExecutionDiagnostics>,
+    qwen_profile: Option<AsrQwenProfileDiagnostics>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -201,9 +203,17 @@ struct AsrDecodeProfileTimings {
 
 #[derive(Debug, Clone, Copy, Serialize)]
 struct AsrExecutionDiagnostics {
+    flash_attention_requested: Option<bool>,
+    flash_attention_compiled: Option<bool>,
+    kv_page_size: Option<u64>,
     cuda_dense_decode_cache: Option<bool>,
     dense_head_decode_enabled: Option<bool>,
     dense_decode_max_tokens: Option<u64>,
+    gguf_qmatmul_text_enabled: Option<bool>,
+    text_projection_quantized: Option<bool>,
+    qmatmul_projection_count: Option<u64>,
+    dense_projection_count: Option<u64>,
+    dense_bias_projection_count: Option<u64>,
     audio_embedding_cache_hit: Option<bool>,
     cuda_device_argmax: Option<bool>,
     residual_branches_prescaled: Option<bool>,
@@ -212,6 +222,23 @@ struct AsrExecutionDiagnostics {
     deferred_stop_check: Option<bool>,
     chunked_stop_check: Option<bool>,
     stop_check_interval: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct AsrQwenProfileDiagnostics {
+    qwen3_profile_enabled: Option<bool>,
+    qmatmul_calls: Option<u64>,
+    qmatmul_ms: Option<f64>,
+    qmatmul_input_casts: Option<u64>,
+    qmatmul_input_cast_ms: Option<f64>,
+    qmatmul_output_casts: Option<u64>,
+    qmatmul_output_cast_ms: Option<f64>,
+    lm_head_calls: Option<u64>,
+    lm_head_ms: Option<f64>,
+    silu_mul_fused_calls: Option<u64>,
+    silu_mul_fallback_calls: Option<u64>,
+    argmax_calls: Option<u64>,
+    argmax_ms: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2579,6 +2606,7 @@ fn asr_stage_timings_from_diagnostics(diagnostics: &serde_json::Value) -> Option
     let audio = diagnostics.get("audio");
     let decode = diagnostics.get("decode");
     let execution = asr_execution_from_single_diagnostics(diagnostics);
+    let qwen_profile = asr_qwen_profile_from_single_diagnostics(diagnostics);
     Some(AsrStageTimings {
         audio_decode: timings.get("audio_decode").and_then(|value| value.as_f64()),
         mel_prepare: timings.get("mel_prepare").and_then(|value| value.as_f64()),
@@ -2606,6 +2634,9 @@ fn asr_stage_timings_from_diagnostics(diagnostics: &serde_json::Value) -> Option
             .and_then(|value| value.as_f64()),
         resample: timings.get("resample").and_then(|value| value.as_f64()),
         mel: timings.get("mel").and_then(|value| value.as_f64()),
+        mel_flatten_upload: timings
+            .get("mel_flatten_upload")
+            .and_then(|value| value.as_f64()),
         audio_encode: timings.get("audio_encode").and_then(|value| value.as_f64()),
         prefill: timings.get("prefill").and_then(|value| value.as_f64()),
         decode: timings.get("decode").and_then(|value| value.as_f64()),
@@ -2630,6 +2661,7 @@ fn asr_stage_timings_from_diagnostics(diagnostics: &serde_json::Value) -> Option
         host_argmax_reads: diagnostic_u64(decode, &["host_argmax_reads"]),
         device_argmax_reads: diagnostic_u64(decode, &["device_argmax_reads"]),
         execution,
+        qwen_profile,
     })
 }
 
@@ -2652,14 +2684,39 @@ fn asr_execution_from_single_diagnostics(
 ) -> Option<AsrExecutionDiagnostics> {
     let execution = diagnostics.get("execution")?;
     let sample = AsrExecutionDiagnostics {
+        flash_attention_requested: execution
+            .get("flash_attention_requested")
+            .and_then(|value| value.as_bool()),
+        flash_attention_compiled: execution
+            .get("flash_attention_compiled")
+            .and_then(|value| value.as_bool()),
+        kv_page_size: execution
+            .get("kv_page_size")
+            .and_then(|value| value.as_u64()),
         cuda_dense_decode_cache: execution
             .get("cuda_dense_decode_cache")
             .and_then(|value| value.as_bool()),
         dense_head_decode_enabled: execution
             .get("dense_head_decode_enabled")
+            .or_else(|| execution.get("dense_decode_enabled"))
             .and_then(|value| value.as_bool()),
         dense_decode_max_tokens: execution
             .get("dense_decode_max_tokens")
+            .and_then(|value| value.as_u64()),
+        gguf_qmatmul_text_enabled: execution
+            .get("gguf_qmatmul_text_enabled")
+            .and_then(|value| value.as_bool()),
+        text_projection_quantized: execution
+            .get("text_projection_quantized")
+            .and_then(|value| value.as_bool()),
+        qmatmul_projection_count: execution
+            .get("qmatmul_projection_count")
+            .and_then(|value| value.as_u64()),
+        dense_projection_count: execution
+            .get("dense_projection_count")
+            .and_then(|value| value.as_u64()),
+        dense_bias_projection_count: execution
+            .get("dense_bias_projection_count")
             .and_then(|value| value.as_u64()),
         audio_embedding_cache_hit: execution
             .get("audio_embedding_cache_hit")
@@ -2686,9 +2743,17 @@ fn asr_execution_from_single_diagnostics(
             .get("stop_check_interval")
             .and_then(|value| value.as_u64()),
     };
-    (sample.cuda_dense_decode_cache.is_some()
+    (sample.flash_attention_requested.is_some()
+        || sample.flash_attention_compiled.is_some()
+        || sample.kv_page_size.is_some()
+        || sample.cuda_dense_decode_cache.is_some()
         || sample.dense_head_decode_enabled.is_some()
         || sample.dense_decode_max_tokens.is_some()
+        || sample.gguf_qmatmul_text_enabled.is_some()
+        || sample.text_projection_quantized.is_some()
+        || sample.qmatmul_projection_count.is_some()
+        || sample.dense_projection_count.is_some()
+        || sample.dense_bias_projection_count.is_some()
         || sample.audio_embedding_cache_hit.is_some()
         || sample.cuda_device_argmax.is_some()
         || sample.residual_branches_prescaled.is_some()
@@ -2698,6 +2763,51 @@ fn asr_execution_from_single_diagnostics(
         || sample.chunked_stop_check.is_some()
         || sample.stop_check_interval.is_some())
     .then_some(sample)
+}
+
+fn asr_qwen_profile_from_single_diagnostics(
+    diagnostics: &serde_json::Value,
+) -> Option<AsrQwenProfileDiagnostics> {
+    let profile = diagnostics.get("profile")?;
+    let sample = AsrQwenProfileDiagnostics {
+        qwen3_profile_enabled: profile
+            .get("qwen3_profile_enabled")
+            .and_then(|value| value.as_bool()),
+        qmatmul_calls: profile
+            .get("qmatmul_calls")
+            .and_then(|value| value.as_u64()),
+        qmatmul_ms: profile.get("qmatmul_ms").and_then(|value| value.as_f64()),
+        qmatmul_input_casts: profile
+            .get("qmatmul_input_casts")
+            .and_then(|value| value.as_u64()),
+        qmatmul_input_cast_ms: profile
+            .get("qmatmul_input_cast_ms")
+            .and_then(|value| value.as_f64()),
+        qmatmul_output_casts: profile
+            .get("qmatmul_output_casts")
+            .and_then(|value| value.as_u64()),
+        qmatmul_output_cast_ms: profile
+            .get("qmatmul_output_cast_ms")
+            .and_then(|value| value.as_f64()),
+        lm_head_calls: profile
+            .get("lm_head_calls")
+            .and_then(|value| value.as_u64()),
+        lm_head_ms: profile.get("lm_head_ms").and_then(|value| value.as_f64()),
+        silu_mul_fused_calls: profile
+            .get("silu_mul_fused_calls")
+            .and_then(|value| value.as_u64()),
+        silu_mul_fallback_calls: profile
+            .get("silu_mul_fallback_calls")
+            .and_then(|value| value.as_u64()),
+        argmax_calls: profile.get("argmax_calls").and_then(|value| value.as_u64()),
+        argmax_ms: profile.get("argmax_ms").and_then(|value| value.as_f64()),
+    };
+    (sample.qwen3_profile_enabled.unwrap_or(false)
+        || sample.qmatmul_calls.unwrap_or(0) > 0
+        || sample.argmax_calls.unwrap_or(0) > 0
+        || sample.silu_mul_fused_calls.unwrap_or(0) > 0
+        || sample.silu_mul_fallback_calls.unwrap_or(0) > 0)
+        .then_some(sample)
 }
 
 fn diagnostics_contains_whisper_model(diagnostics: &serde_json::Value) -> bool {
@@ -2932,6 +3042,7 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     let mut language_detect = Vec::new();
     let mut resample = Vec::new();
     let mut mel = Vec::new();
+    let mut mel_flatten_upload = Vec::new();
     let mut audio_encode = Vec::new();
     let mut prefill = Vec::new();
     let mut decode = Vec::new();
@@ -2943,9 +3054,17 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     let mut rnnt_joint_steps = Vec::new();
     let mut host_argmax_reads = Vec::new();
     let mut device_argmax_reads = Vec::new();
+    let mut flash_attention_requested = Vec::new();
+    let mut flash_attention_compiled = Vec::new();
+    let mut kv_page_size = Vec::new();
     let mut cuda_dense_decode_cache = Vec::new();
     let mut dense_head_decode_enabled = Vec::new();
     let mut dense_decode_max_tokens = Vec::new();
+    let mut gguf_qmatmul_text_enabled = Vec::new();
+    let mut text_projection_quantized = Vec::new();
+    let mut qmatmul_projection_count = Vec::new();
+    let mut dense_projection_count = Vec::new();
+    let mut dense_bias_projection_count = Vec::new();
     let mut audio_embedding_cache_hit = Vec::new();
     let mut cuda_device_argmax = Vec::new();
     let mut residual_branches_prescaled = Vec::new();
@@ -2954,6 +3073,19 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     let mut deferred_stop_check = Vec::new();
     let mut chunked_stop_check = Vec::new();
     let mut stop_check_interval = Vec::new();
+    let mut qwen_profile_enabled = Vec::new();
+    let mut qwen_qmatmul_calls = Vec::new();
+    let mut qwen_qmatmul_ms = Vec::new();
+    let mut qwen_qmatmul_input_casts = Vec::new();
+    let mut qwen_qmatmul_input_cast_ms = Vec::new();
+    let mut qwen_qmatmul_output_casts = Vec::new();
+    let mut qwen_qmatmul_output_cast_ms = Vec::new();
+    let mut qwen_lm_head_calls = Vec::new();
+    let mut qwen_lm_head_ms = Vec::new();
+    let mut qwen_silu_mul_fused_calls = Vec::new();
+    let mut qwen_silu_mul_fallback_calls = Vec::new();
+    let mut qwen_argmax_calls = Vec::new();
+    let mut qwen_argmax_ms = Vec::new();
 
     for sample in samples {
         if let Some(value) = sample.audio_decode {
@@ -2998,6 +3130,9 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         if let Some(value) = sample.mel {
             mel.push(value);
         }
+        if let Some(value) = sample.mel_flatten_upload {
+            mel_flatten_upload.push(value);
+        }
         if let Some(value) = sample.audio_encode {
             audio_encode.push(value);
         }
@@ -3031,7 +3166,16 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         if let Some(value) = sample.device_argmax_reads {
             device_argmax_reads.push(value);
         }
-        if let Some(execution) = sample.execution {
+        if let Some(execution) = sample.execution.as_ref() {
+            if let Some(value) = execution.flash_attention_requested {
+                flash_attention_requested.push(value);
+            }
+            if let Some(value) = execution.flash_attention_compiled {
+                flash_attention_compiled.push(value);
+            }
+            if let Some(value) = execution.kv_page_size {
+                kv_page_size.push(value);
+            }
             if let Some(value) = execution.cuda_dense_decode_cache {
                 cuda_dense_decode_cache.push(value);
             }
@@ -3040,6 +3184,21 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
             }
             if let Some(value) = execution.dense_decode_max_tokens {
                 dense_decode_max_tokens.push(value);
+            }
+            if let Some(value) = execution.gguf_qmatmul_text_enabled {
+                gguf_qmatmul_text_enabled.push(value);
+            }
+            if let Some(value) = execution.text_projection_quantized {
+                text_projection_quantized.push(value);
+            }
+            if let Some(value) = execution.qmatmul_projection_count {
+                qmatmul_projection_count.push(value);
+            }
+            if let Some(value) = execution.dense_projection_count {
+                dense_projection_count.push(value);
+            }
+            if let Some(value) = execution.dense_bias_projection_count {
+                dense_bias_projection_count.push(value);
             }
             if let Some(value) = execution.audio_embedding_cache_hit {
                 audio_embedding_cache_hit.push(value);
@@ -3066,6 +3225,47 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
                 stop_check_interval.push(value);
             }
         }
+        if let Some(profile) = sample.qwen_profile {
+            if let Some(value) = profile.qwen3_profile_enabled {
+                qwen_profile_enabled.push(value);
+            }
+            if let Some(value) = profile.qmatmul_calls {
+                qwen_qmatmul_calls.push(value);
+            }
+            if let Some(value) = profile.qmatmul_ms {
+                qwen_qmatmul_ms.push(value);
+            }
+            if let Some(value) = profile.qmatmul_input_casts {
+                qwen_qmatmul_input_casts.push(value);
+            }
+            if let Some(value) = profile.qmatmul_input_cast_ms {
+                qwen_qmatmul_input_cast_ms.push(value);
+            }
+            if let Some(value) = profile.qmatmul_output_casts {
+                qwen_qmatmul_output_casts.push(value);
+            }
+            if let Some(value) = profile.qmatmul_output_cast_ms {
+                qwen_qmatmul_output_cast_ms.push(value);
+            }
+            if let Some(value) = profile.lm_head_calls {
+                qwen_lm_head_calls.push(value);
+            }
+            if let Some(value) = profile.lm_head_ms {
+                qwen_lm_head_ms.push(value);
+            }
+            if let Some(value) = profile.silu_mul_fused_calls {
+                qwen_silu_mul_fused_calls.push(value);
+            }
+            if let Some(value) = profile.silu_mul_fallback_calls {
+                qwen_silu_mul_fallback_calls.push(value);
+            }
+            if let Some(value) = profile.argmax_calls {
+                qwen_argmax_calls.push(value);
+            }
+            if let Some(value) = profile.argmax_ms {
+                qwen_argmax_ms.push(value);
+            }
+        }
     }
 
     if audio_decode.is_empty()
@@ -3082,6 +3282,7 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         && language_detect.is_empty()
         && resample.is_empty()
         && mel.is_empty()
+        && mel_flatten_upload.is_empty()
         && audio_encode.is_empty()
         && prefill.is_empty()
         && decode.is_empty()
@@ -3093,9 +3294,17 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         && rnnt_joint_steps.is_empty()
         && host_argmax_reads.is_empty()
         && device_argmax_reads.is_empty()
+        && flash_attention_requested.is_empty()
+        && flash_attention_compiled.is_empty()
+        && kv_page_size.is_empty()
         && cuda_dense_decode_cache.is_empty()
         && dense_head_decode_enabled.is_empty()
         && dense_decode_max_tokens.is_empty()
+        && gguf_qmatmul_text_enabled.is_empty()
+        && text_projection_quantized.is_empty()
+        && qmatmul_projection_count.is_empty()
+        && dense_projection_count.is_empty()
+        && dense_bias_projection_count.is_empty()
         && audio_embedding_cache_hit.is_empty()
         && cuda_device_argmax.is_empty()
         && residual_branches_prescaled.is_empty()
@@ -3104,6 +3313,19 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         && deferred_stop_check.is_empty()
         && chunked_stop_check.is_empty()
         && stop_check_interval.is_empty()
+        && qwen_profile_enabled.is_empty()
+        && qwen_qmatmul_calls.is_empty()
+        && qwen_qmatmul_ms.is_empty()
+        && qwen_qmatmul_input_casts.is_empty()
+        && qwen_qmatmul_input_cast_ms.is_empty()
+        && qwen_qmatmul_output_casts.is_empty()
+        && qwen_qmatmul_output_cast_ms.is_empty()
+        && qwen_lm_head_calls.is_empty()
+        && qwen_lm_head_ms.is_empty()
+        && qwen_silu_mul_fused_calls.is_empty()
+        && qwen_silu_mul_fallback_calls.is_empty()
+        && qwen_argmax_calls.is_empty()
+        && qwen_argmax_ms.is_empty()
     {
         return;
     }
@@ -3128,6 +3350,7 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     summarize_stage("lang_detect", &language_detect);
     summarize_stage("resample", &resample);
     summarize_stage("mel", &mel);
+    summarize_stage("mel_flat_upload", &mel_flatten_upload);
     summarize_stage("audio_encode", &audio_encode);
     summarize_stage("prefill", &prefill);
     summarize_stage("decode", &decode);
@@ -3139,9 +3362,17 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     summarize_count("rnnt_steps", &rnnt_joint_steps);
     summarize_count("host_argmax", &host_argmax_reads);
     summarize_count("dev_argmax", &device_argmax_reads);
+    summarize_bool_count("flash_req", &flash_attention_requested);
+    summarize_bool_count("flash_compiled", &flash_attention_compiled);
+    summarize_count("kv_page", &kv_page_size);
     summarize_bool_count("cuda_dense", &cuda_dense_decode_cache);
     summarize_bool_count("dense_head", &dense_head_decode_enabled);
     summarize_count("dense_max", &dense_decode_max_tokens);
+    summarize_bool_count("gguf_qmatmul", &gguf_qmatmul_text_enabled);
+    summarize_bool_count("qproj_quant", &text_projection_quantized);
+    summarize_count("qmatmul_proj", &qmatmul_projection_count);
+    summarize_count("dense_proj", &dense_projection_count);
+    summarize_count("dense_bias_proj", &dense_bias_projection_count);
     summarize_bool_count("audio_cache", &audio_embedding_cache_hit);
     summarize_bool_count("cuda_argmax", &cuda_device_argmax);
     summarize_bool_count("resid_prescale", &residual_branches_prescaled);
@@ -3150,6 +3381,19 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     summarize_bool_count("defer_stop", &deferred_stop_check);
     summarize_bool_count("chunk_stop", &chunked_stop_check);
     summarize_count("stop_interval", &stop_check_interval);
+    summarize_bool_count("qwen_profile", &qwen_profile_enabled);
+    summarize_count("qmatmul_calls", &qwen_qmatmul_calls);
+    summarize_stage("qmatmul", &qwen_qmatmul_ms);
+    summarize_count("qmatmul_in_casts", &qwen_qmatmul_input_casts);
+    summarize_stage("qmatmul_in_cast", &qwen_qmatmul_input_cast_ms);
+    summarize_count("qmatmul_out_casts", &qwen_qmatmul_output_casts);
+    summarize_stage("qmatmul_out_cast", &qwen_qmatmul_output_cast_ms);
+    summarize_count("lm_head_calls", &qwen_lm_head_calls);
+    summarize_stage("lm_head", &qwen_lm_head_ms);
+    summarize_count("silu_fused", &qwen_silu_mul_fused_calls);
+    summarize_count("silu_fallback", &qwen_silu_mul_fallback_calls);
+    summarize_count("argmax_calls", &qwen_argmax_calls);
+    summarize_stage("argmax", &qwen_argmax_ms);
 }
 
 fn print_asr_decode_profile_summary(samples: &[AsrDecodeProfileTimings]) {
@@ -3585,9 +3829,37 @@ mod tests {
                 "generated_tokens": 93,
                 "max_new_tokens": 512
             },
+            "execution": {
+                "flash_attention_requested": true,
+                "flash_attention_compiled": true,
+                "kv_page_size": 64,
+                "dense_decode_enabled": true,
+                "dense_decode_max_tokens": 882,
+                "gguf_qmatmul_text_enabled": true,
+                "text_projection_quantized": true,
+                "qmatmul_projection_count": 197,
+                "dense_projection_count": 0,
+                "dense_bias_projection_count": 0
+            },
+            "profile": {
+                "qwen3_profile_enabled": true,
+                "qmatmul_calls": 128,
+                "qmatmul_ms": 40.5,
+                "qmatmul_input_casts": 96,
+                "qmatmul_input_cast_ms": 3.5,
+                "qmatmul_output_casts": 96,
+                "qmatmul_output_cast_ms": 2.5,
+                "lm_head_calls": 4,
+                "lm_head_ms": 8.5,
+                "silu_mul_fused_calls": 28,
+                "silu_mul_fallback_calls": 0,
+                "argmax_calls": 3,
+                "argmax_ms": 1.25
+            },
             "timings_ms": {
                 "resample": 0.0,
                 "mel": 12.5,
+                "mel_flatten_upload": 0.75,
                 "audio_encode": 820.0,
                 "prefill": 1080.0,
                 "decode": 21230.0,
@@ -3599,6 +3871,7 @@ mod tests {
 
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].mel, Some(12.5));
+        assert_eq!(samples[0].mel_flatten_upload, Some(0.75));
         assert_eq!(samples[0].audio_encode, Some(820.0));
         assert_eq!(samples[0].prefill, Some(1080.0));
         assert_eq!(samples[0].decode, Some(21230.0));
@@ -3606,6 +3879,22 @@ mod tests {
         assert_eq!(samples[0].audio_tokens, Some(355));
         assert_eq!(samples[0].generated_tokens, Some(93));
         assert_eq!(samples[0].max_new_tokens, Some(512));
+        let execution = samples[0].execution.as_ref().expect("execution");
+        assert_eq!(execution.flash_attention_requested, Some(true));
+        assert_eq!(execution.kv_page_size, Some(64));
+        assert_eq!(execution.dense_head_decode_enabled, Some(true));
+        assert_eq!(execution.dense_decode_max_tokens, Some(882));
+        assert_eq!(execution.gguf_qmatmul_text_enabled, Some(true));
+        assert_eq!(execution.qmatmul_projection_count, Some(197));
+        let profile = samples[0].qwen_profile.expect("qwen profile");
+        assert_eq!(profile.qwen3_profile_enabled, Some(true));
+        assert_eq!(profile.qmatmul_calls, Some(128));
+        assert_eq!(profile.qmatmul_ms, Some(40.5));
+        assert_eq!(profile.qmatmul_input_casts, Some(96));
+        assert_eq!(profile.qmatmul_output_casts, Some(96));
+        assert_eq!(profile.lm_head_calls, Some(4));
+        assert_eq!(profile.silu_mul_fused_calls, Some(28));
+        assert_eq!(profile.argmax_calls, Some(3));
     }
 
     #[test]

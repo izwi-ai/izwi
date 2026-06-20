@@ -15,6 +15,11 @@ pub mod metal;
 use crate::error::Error;
 use candle_core::{Device, Tensor};
 
+pub struct FusedSiluMulResult {
+    pub tensor: Tensor,
+    pub used_custom_kernel: bool,
+}
+
 /// Whether any fused kernel backend is available in this build.
 pub fn fused_kernels_available() -> bool {
     metal_fused_kernels_available() || cuda::fused_kernels_available()
@@ -83,16 +88,20 @@ pub fn use_block_fusion_for_device(device: &Device) -> bool {
 }
 
 pub fn try_fused_silu_mul(gate: &Tensor, up: &Tensor) -> Option<Tensor> {
+    try_fused_silu_mul_with_status(gate, up).map(|result| result.tensor)
+}
+
+pub fn try_fused_silu_mul_with_status(gate: &Tensor, up: &Tensor) -> Option<FusedSiluMulResult> {
     if !use_fused_kernels_for_device(gate.device()) {
         return None;
     }
 
     if gate.device().is_cuda() {
-        return cuda::try_fused_silu_mul(gate, up);
+        return cuda::try_fused_silu_mul_with_status(gate, up);
     }
 
     if gate.device().is_metal() {
-        return metal::try_fused_silu_mul(gate, up);
+        return metal::try_fused_silu_mul_with_status(gate, up);
     }
 
     None
