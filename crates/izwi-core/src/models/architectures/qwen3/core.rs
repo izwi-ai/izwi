@@ -13,7 +13,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use crate::error::{Error, Result};
-use crate::kernels::try_fused_silu_mul_with_status;
+use crate::kernels::{try_fused_qk_rms_norm, try_fused_silu_mul_with_status};
 use crate::models::shared::attention::batched::{
     batched_scaled_dot_product_attention, BatchedAttentionConfig, BatchedAttentionInput,
 };
@@ -533,6 +533,17 @@ fn qwen3_dense_projection_fusion_enabled(device: &Device) -> bool {
 }
 
 fn qwen3_dense_projection_fusion_policy(is_metal: bool, override_enabled: Option<bool>) -> bool {
+    override_enabled.unwrap_or(is_metal)
+}
+
+fn qwen3_qk_rms_norm_fusion_enabled(device: &Device) -> bool {
+    let override_enabled = std::env::var("IZWI_QWEN3_QK_RMS_NORM_FUSION")
+        .ok()
+        .and_then(|raw| parse_env_bool(&raw));
+    qwen3_qk_rms_norm_fusion_policy(device.is_metal(), override_enabled)
+}
+
+fn qwen3_qk_rms_norm_fusion_policy(is_metal: bool, override_enabled: Option<bool>) -> bool {
     override_enabled.unwrap_or(is_metal)
 }
 
@@ -1063,11 +1074,23 @@ fn load_optional_rms_norm_from_gguf(
     Ok(Some(RmsNorm::new(weight, eps)))
 }
 
+fn qk_norm_weight(q_norm: &Option<RmsNorm>, k_norm: &Option<RmsNorm>) -> Result<Option<Tensor>> {
+    match (q_norm, k_norm) {
+        (Some(q_norm), Some(k_norm)) if q_norm.weight().dtype() == k_norm.weight().dtype() => {
+            Tensor::cat(&[q_norm.weight(), k_norm.weight()], 0)
+                .map(Some)
+                .map_err(Error::from)
+        }
+        _ => Ok(None),
+    }
+}
+
 struct Qwen3Attention {
     qkv_proj: Qwen3QkvProjection,
     o_proj: Qwen3Projection,
     q_norm: Option<RmsNorm>,
     k_norm: Option<RmsNorm>,
+    qk_norm_weight: Option<Tensor>,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -1104,6 +1127,7 @@ impl Qwen3Attention {
 
         let q_norm = candle_nn::rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("q_norm")).ok();
         let k_norm = candle_nn::rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("k_norm")).ok();
+        let qk_norm_weight = qk_norm_weight(&q_norm, &k_norm)?;
         let (use_mrope, mrope_section) = cfg
             .rope_scaling
             .as_ref()
@@ -1119,6 +1143,7 @@ impl Qwen3Attention {
             o_proj,
             q_norm,
             k_norm,
+            qk_norm_weight,
             num_heads: cfg.num_attention_heads,
             num_kv_heads: cfg.num_key_value_heads,
             head_dim,
@@ -1161,6 +1186,7 @@ impl Qwen3Attention {
             &format!("{prefix}.k_norm.weight"),
             cfg.rms_norm_eps,
         )?;
+        let qk_norm_weight = qk_norm_weight(&q_norm, &k_norm)?;
         let (use_mrope, mrope_section) = cfg
             .rope_scaling
             .as_ref()
@@ -1176,6 +1202,7 @@ impl Qwen3Attention {
             o_proj,
             q_norm,
             k_norm,
+            qk_norm_weight,
             num_heads: cfg.num_attention_heads,
             num_kv_heads: cfg.num_key_value_heads,
             head_dim,
@@ -1207,6 +1234,22 @@ impl Qwen3Attention {
         } else {
             Ok(x)
         }
+    }
+
+    fn apply_qk_norm_pair(&self, q: Tensor, k: Tensor, seq_len: usize) -> Result<(Tensor, Tensor)> {
+        if let (Some(q_norm), Some(_k_norm), Some(qk_weight)) =
+            (&self.q_norm, &self.k_norm, &self.qk_norm_weight)
+        {
+            if seq_len == 1 && qwen3_qk_rms_norm_fusion_enabled(q.device()) {
+                if let Some((q, k)) = try_fused_qk_rms_norm(&q, &k, qk_weight, q_norm.eps()) {
+                    return Ok((q, k));
+                }
+            }
+        }
+
+        let q = self.apply_qk_norm(q, &self.q_norm, self.num_heads, seq_len)?;
+        let k = self.apply_qk_norm(k, &self.k_norm, self.num_kv_heads, seq_len)?;
+        Ok((q, k))
     }
 
     fn apply_rope_pair(
@@ -1332,8 +1375,7 @@ impl Qwen3Attention {
         let mut k = k.reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
         let v = v.reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
 
-        q = self.apply_qk_norm(q, &self.q_norm, self.num_heads, seq_len)?;
-        k = self.apply_qk_norm(k, &self.k_norm, self.num_kv_heads, seq_len)?;
+        (q, k) = self.apply_qk_norm_pair(q, k, seq_len)?;
 
         (q, k) = self.apply_rope_pair(q, k, start_pos, position_ids, cache.as_deref_mut())?;
 
@@ -2268,6 +2310,27 @@ mod tests {
     }
 
     #[test]
+    fn qk_norm_weight_concatenates_query_and_key_weights() {
+        let device = Device::Cpu;
+        let q_norm = RmsNorm::new(
+            Tensor::from_vec(vec![1.0f32, 1.1, 1.2], 3, &device).expect("q weight"),
+            1e-6,
+        );
+        let k_norm = RmsNorm::new(
+            Tensor::from_vec(vec![0.7f32, 0.8, 0.9], 3, &device).expect("k weight"),
+            1e-6,
+        );
+
+        let weight = qk_norm_weight(&Some(q_norm), &Some(k_norm))
+            .expect("qk weight")
+            .expect("qk weight present")
+            .to_vec1::<f32>()
+            .expect("values");
+
+        assert_eq!(weight, vec![1.0, 1.1, 1.2, 0.7, 0.8, 0.9]);
+    }
+
+    #[test]
     fn qwen3_dense_projection_keeps_no_bias_path() {
         let device = Device::Cpu;
         let mut tensors = HashMap::new();
@@ -2391,6 +2454,14 @@ mod tests {
         assert!(!qwen3_dense_projection_fusion_policy(false, None));
         assert!(qwen3_dense_projection_fusion_policy(false, Some(true)));
         assert!(!qwen3_dense_projection_fusion_policy(true, Some(false)));
+    }
+
+    #[test]
+    fn qwen3_qk_rms_norm_fusion_defaults_to_metal_only() {
+        assert!(qwen3_qk_rms_norm_fusion_policy(true, None));
+        assert!(!qwen3_qk_rms_norm_fusion_policy(false, None));
+        assert!(qwen3_qk_rms_norm_fusion_policy(false, Some(true)));
+        assert!(!qwen3_qk_rms_norm_fusion_policy(true, Some(false)));
     }
 
     #[test]

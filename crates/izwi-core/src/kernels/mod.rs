@@ -107,6 +107,23 @@ pub fn try_fused_silu_mul_with_status(gate: &Tensor, up: &Tensor) -> Option<Fuse
     None
 }
 
+pub fn try_fused_qk_rms_norm(
+    q: &Tensor,
+    k: &Tensor,
+    qk_weight: &Tensor,
+    eps: f64,
+) -> Option<(Tensor, Tensor)> {
+    if !use_fused_kernels_for_device(q.device()) {
+        return None;
+    }
+
+    if q.device().is_metal() {
+        return metal::try_fused_qk_rms_norm(q, k, qk_weight, eps);
+    }
+
+    None
+}
+
 pub fn try_fused_l2_norm(input: &Tensor, eps: f64) -> Option<Tensor> {
     if !use_fused_kernels_for_device(input.device()) {
         return None;
