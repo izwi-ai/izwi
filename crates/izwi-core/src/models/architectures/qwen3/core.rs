@@ -4,8 +4,8 @@
 //! (used for audio-conditioned ASR).
 
 use candle_core::quantized::QMatMul;
-use candle_core::{D, DType, Device, IndexOp, Module, Tensor};
-use candle_nn::{Embedding, Linear, RmsNorm, VarBuilder, kv_cache::Cache, ops, rotary_emb};
+use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
+use candle_nn::{kv_cache::Cache, ops, rotary_emb, Embedding, Linear, RmsNorm, VarBuilder};
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -13,15 +13,15 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::kernels::try_fused_silu_mul;
 use crate::models::shared::attention::batched::{
-    BatchedAttentionConfig, BatchedAttentionInput, batched_scaled_dot_product_attention,
+    batched_scaled_dot_product_attention, BatchedAttentionConfig, BatchedAttentionInput,
 };
 use crate::models::shared::attention::flash::try_fused_self_attention;
 use crate::models::shared::attention::paged::{
-    KvCacheQuantization, KvPage, append_to_pages, default_kv_page_size, default_kv_quantization,
-    materialize_pages, paged_decode_attention,
+    append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
+    paged_decode_attention, KvCacheQuantization, KvPage,
 };
 use crate::models::shared::telemetry::{
-    DecodeAttentionPath, record_decode_attention_path, record_rope_kernel, record_rope_manual,
+    record_decode_attention_path, record_rope_kernel, record_rope_manual, DecodeAttentionPath,
 };
 use crate::models::shared::weights::gguf::GgufLoader;
 use crate::models::shared::weights::mlx;
@@ -523,6 +523,17 @@ fn parse_env_bool(raw: &str) -> Option<bool> {
     }
 }
 
+fn qwen3_dense_projection_fusion_enabled(device: &Device) -> bool {
+    let override_enabled = std::env::var("IZWI_QWEN3_DENSE_PROJECTION_FUSION")
+        .ok()
+        .and_then(|raw| parse_env_bool(&raw));
+    qwen3_dense_projection_fusion_policy(device.is_metal(), override_enabled)
+}
+
+fn qwen3_dense_projection_fusion_policy(is_metal: bool, override_enabled: Option<bool>) -> bool {
+    override_enabled.unwrap_or(is_metal)
+}
+
 struct Qwen3DenseProjection {
     linear: Linear,
     has_bias: bool,
@@ -640,6 +651,256 @@ impl Module for Qwen3Projection {
     }
 }
 
+fn concat_linear_biases(name: &str, linears: &[&Linear]) -> Result<Option<Tensor>> {
+    let bias_count = linears
+        .iter()
+        .filter(|linear| linear.bias().is_some())
+        .count();
+    if bias_count == 0 {
+        return Ok(None);
+    }
+    if bias_count != linears.len() {
+        return Err(Error::InferenceError(format!(
+            "{name} cannot fuse projections with mixed bias presence"
+        )));
+    }
+    let biases = linears
+        .iter()
+        .map(|linear| linear.bias().expect("bias checked"))
+        .collect::<Vec<_>>();
+    Tensor::cat(&biases, 0).map(Some).map_err(Error::from)
+}
+
+struct Qwen3FusedQkvProjection {
+    fused: Linear,
+    q_out: usize,
+    k_out: usize,
+    v_out: usize,
+    bias_count: usize,
+}
+
+impl Qwen3FusedQkvProjection {
+    fn new(
+        q_proj: &Qwen3DenseProjection,
+        k_proj: &Qwen3DenseProjection,
+        v_proj: &Qwen3DenseProjection,
+    ) -> Result<Self> {
+        let q_weight = q_proj.linear.weight();
+        let k_weight = k_proj.linear.weight();
+        let v_weight = v_proj.linear.weight();
+        let q_out = q_weight.dim(0)?;
+        let k_out = k_weight.dim(0)?;
+        let v_out = v_weight.dim(0)?;
+        let in_dim = q_weight.dim(1)?;
+        if k_weight.dim(1)? != in_dim || v_weight.dim(1)? != in_dim {
+            return Err(Error::InferenceError(
+                "Qwen3 fused QKV projection input dimensions do not match".to_string(),
+            ));
+        }
+        let weight = Tensor::cat(&[q_weight, k_weight, v_weight], 0)?;
+        let bias = concat_linear_biases(
+            "Qwen3 fused QKV projection",
+            &[&q_proj.linear, &k_proj.linear, &v_proj.linear],
+        )?;
+        let bias_count = usize::from(q_proj.has_bias)
+            .saturating_add(usize::from(k_proj.has_bias))
+            .saturating_add(usize::from(v_proj.has_bias));
+        Ok(Self {
+            fused: Linear::new(weight, bias),
+            q_out,
+            k_out,
+            v_out,
+            bias_count,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let qkv = self.fused.forward(x)?;
+        let last_dim = qkv.rank().saturating_sub(1);
+        let q = qkv.narrow(last_dim, 0, self.q_out)?;
+        let k = qkv.narrow(last_dim, self.q_out, self.k_out)?;
+        let v = qkv.narrow(last_dim, self.q_out + self.k_out, self.v_out)?;
+        Ok((q, k, v))
+    }
+
+    fn diagnostics(&self) -> Qwen3ProjectionDiagnostics {
+        Qwen3ProjectionDiagnostics {
+            dense_projection_count: 3,
+            dense_bias_projection_count: self.bias_count,
+            quantized_projection_count: 0,
+        }
+    }
+}
+
+enum Qwen3QkvProjection {
+    Fused(Qwen3FusedQkvProjection),
+    Separate {
+        q_proj: Qwen3Projection,
+        k_proj: Qwen3Projection,
+        v_proj: Qwen3Projection,
+    },
+}
+
+impl Qwen3QkvProjection {
+    fn new_dense(
+        q_proj: Qwen3Projection,
+        k_proj: Qwen3Projection,
+        v_proj: Qwen3Projection,
+        device: &Device,
+    ) -> Result<Self> {
+        if qwen3_dense_projection_fusion_enabled(device) {
+            if let (
+                Qwen3Projection::Dense(q_dense),
+                Qwen3Projection::Dense(k_dense),
+                Qwen3Projection::Dense(v_dense),
+            ) = (&q_proj, &k_proj, &v_proj)
+            {
+                return Ok(Self::Fused(Qwen3FusedQkvProjection::new(
+                    q_dense, k_dense, v_dense,
+                )?));
+            }
+        }
+        Ok(Self::Separate {
+            q_proj,
+            k_proj,
+            v_proj,
+        })
+    }
+
+    fn new_separate(
+        q_proj: Qwen3Projection,
+        k_proj: Qwen3Projection,
+        v_proj: Qwen3Projection,
+    ) -> Self {
+        Self::Separate {
+            q_proj,
+            k_proj,
+            v_proj,
+        }
+    }
+
+    fn diagnostics(&self) -> Qwen3ProjectionDiagnostics {
+        match self {
+            Self::Fused(fused) => fused.diagnostics(),
+            Self::Separate {
+                q_proj,
+                k_proj,
+                v_proj,
+            } => q_proj
+                .diagnostics()
+                .add(k_proj.diagnostics())
+                .add(v_proj.diagnostics()),
+        }
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        match self {
+            Self::Fused(fused) => fused.forward(x),
+            Self::Separate {
+                q_proj,
+                k_proj,
+                v_proj,
+            } => Ok((q_proj.forward(x)?, k_proj.forward(x)?, v_proj.forward(x)?)),
+        }
+    }
+}
+
+struct Qwen3FusedGateUpProjection {
+    fused: Linear,
+    intermediate_size: usize,
+    bias_count: usize,
+}
+
+impl Qwen3FusedGateUpProjection {
+    fn new(gate_proj: &Qwen3DenseProjection, up_proj: &Qwen3DenseProjection) -> Result<Self> {
+        let gate_weight = gate_proj.linear.weight();
+        let up_weight = up_proj.linear.weight();
+        let intermediate_size = gate_weight.dim(0)?;
+        if up_weight.dim(0)? != intermediate_size || up_weight.dim(1)? != gate_weight.dim(1)? {
+            return Err(Error::InferenceError(
+                "Qwen3 fused MLP projection dimensions do not match".to_string(),
+            ));
+        }
+        let weight = Tensor::cat(&[gate_weight, up_weight], 0)?;
+        let bias = concat_linear_biases(
+            "Qwen3 fused MLP projection",
+            &[&gate_proj.linear, &up_proj.linear],
+        )?;
+        let bias_count =
+            usize::from(gate_proj.has_bias).saturating_add(usize::from(up_proj.has_bias));
+        Ok(Self {
+            fused: Linear::new(weight, bias),
+            intermediate_size,
+            bias_count,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
+        let gate_up = self.fused.forward(x)?;
+        let last_dim = gate_up.rank().saturating_sub(1);
+        let gate = gate_up.narrow(last_dim, 0, self.intermediate_size)?;
+        let up = gate_up.narrow(last_dim, self.intermediate_size, self.intermediate_size)?;
+        Ok((gate, up))
+    }
+
+    fn diagnostics(&self) -> Qwen3ProjectionDiagnostics {
+        Qwen3ProjectionDiagnostics {
+            dense_projection_count: 2,
+            dense_bias_projection_count: self.bias_count,
+            quantized_projection_count: 0,
+        }
+    }
+}
+
+enum Qwen3GateUpProjection {
+    Fused(Qwen3FusedGateUpProjection),
+    Separate {
+        gate_proj: Qwen3Projection,
+        up_proj: Qwen3Projection,
+    },
+}
+
+impl Qwen3GateUpProjection {
+    fn new_dense(
+        gate_proj: Qwen3Projection,
+        up_proj: Qwen3Projection,
+        device: &Device,
+    ) -> Result<Self> {
+        if qwen3_dense_projection_fusion_enabled(device) {
+            if let (Qwen3Projection::Dense(gate_dense), Qwen3Projection::Dense(up_dense)) =
+                (&gate_proj, &up_proj)
+            {
+                return Ok(Self::Fused(Qwen3FusedGateUpProjection::new(
+                    gate_dense, up_dense,
+                )?));
+            }
+        }
+        Ok(Self::Separate { gate_proj, up_proj })
+    }
+
+    fn new_separate(gate_proj: Qwen3Projection, up_proj: Qwen3Projection) -> Self {
+        Self::Separate { gate_proj, up_proj }
+    }
+
+    fn diagnostics(&self) -> Qwen3ProjectionDiagnostics {
+        match self {
+            Self::Fused(fused) => fused.diagnostics(),
+            Self::Separate { gate_proj, up_proj } => {
+                gate_proj.diagnostics().add(up_proj.diagnostics())
+            }
+        }
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
+        match self {
+            Self::Fused(fused) => fused.forward(x),
+            Self::Separate { gate_proj, up_proj } => {
+                Ok((gate_proj.forward(x)?, up_proj.forward(x)?))
+            }
+        }
+    }
+}
+
 fn load_optional_rms_norm_from_gguf(
     loader: &GgufLoader,
     device: &Device,
@@ -655,9 +916,7 @@ fn load_optional_rms_norm_from_gguf(
 }
 
 struct Qwen3Attention {
-    q_proj: Qwen3Projection,
-    k_proj: Qwen3Projection,
-    v_proj: Qwen3Projection,
+    qkv_proj: Qwen3QkvProjection,
     o_proj: Qwen3Projection,
     q_norm: Option<RmsNorm>,
     k_norm: Option<RmsNorm>,
@@ -693,6 +952,7 @@ impl Qwen3Attention {
             cfg.hidden_size,
             vb.pp("o_proj"),
         )?;
+        let qkv_proj = Qwen3QkvProjection::new_dense(q_proj, k_proj, v_proj, vb.device())?;
 
         let q_norm = candle_nn::rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("q_norm")).ok();
         let k_norm = candle_nn::rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("k_norm")).ok();
@@ -707,9 +967,7 @@ impl Qwen3Attention {
             .unwrap_or((false, None));
 
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv_proj,
             o_proj,
             q_norm,
             k_norm,
@@ -739,6 +997,7 @@ impl Qwen3Attention {
             Qwen3Projection::quantized(loader, device, &format!("{prefix}.v_proj.weight"))?;
         let o_proj =
             Qwen3Projection::quantized(loader, device, &format!("{prefix}.o_proj.weight"))?;
+        let qkv_proj = Qwen3QkvProjection::new_separate(q_proj, k_proj, v_proj);
 
         let q_norm = load_optional_rms_norm_from_gguf(
             loader,
@@ -765,9 +1024,7 @@ impl Qwen3Attention {
             .unwrap_or((false, None));
 
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv_proj,
             o_proj,
             q_norm,
             k_norm,
@@ -782,11 +1039,7 @@ impl Qwen3Attention {
     }
 
     fn projection_diagnostics(&self) -> Qwen3ProjectionDiagnostics {
-        self.q_proj
-            .diagnostics()
-            .add(self.k_proj.diagnostics())
-            .add(self.v_proj.diagnostics())
-            .add(self.o_proj.diagnostics())
+        self.qkv_proj.diagnostics().add(self.o_proj.diagnostics())
     }
 
     fn apply_qk_norm(
@@ -926,18 +1179,10 @@ impl Qwen3Attention {
         let seq_len = x.dim(1)?;
         let use_batched = cache.is_none() && start_pos == 0 && bsz > 1;
 
-        let mut q =
-            self.q_proj
-                .forward(x)?
-                .reshape((bsz, seq_len, self.num_heads, self.head_dim))?;
-        let mut k =
-            self.k_proj
-                .forward(x)?
-                .reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
-        let v =
-            self.v_proj
-                .forward(x)?
-                .reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
+        let (q, k, v) = self.qkv_proj.forward(x)?;
+        let mut q = q.reshape((bsz, seq_len, self.num_heads, self.head_dim))?;
+        let mut k = k.reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
+        let v = v.reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
 
         q = self.apply_qk_norm(q, &self.q_norm, self.num_heads, seq_len)?;
         k = self.apply_qk_norm(k, &self.k_norm, self.num_kv_heads, seq_len)?;
@@ -1074,8 +1319,7 @@ impl Qwen3Attention {
 }
 
 struct Qwen3Mlp {
-    gate_proj: Qwen3Projection,
-    up_proj: Qwen3Projection,
+    gate_up_proj: Qwen3GateUpProjection,
     down_proj: Qwen3Projection,
 }
 
@@ -1087,9 +1331,9 @@ impl Qwen3Mlp {
             Qwen3Projection::dense(cfg.hidden_size, cfg.intermediate_size, vb.pp("up_proj"))?;
         let down_proj =
             Qwen3Projection::dense(cfg.intermediate_size, cfg.hidden_size, vb.pp("down_proj"))?;
+        let gate_up_proj = Qwen3GateUpProjection::new_dense(gate_proj, up_proj, vb.device())?;
         Ok(Self {
-            gate_proj,
-            up_proj,
+            gate_up_proj,
             down_proj,
         })
     }
@@ -1101,23 +1345,21 @@ impl Qwen3Mlp {
             Qwen3Projection::quantized(loader, device, &format!("{prefix}.up_proj.weight"))?;
         let down_proj =
             Qwen3Projection::quantized(loader, device, &format!("{prefix}.down_proj.weight"))?;
+        let gate_up_proj = Qwen3GateUpProjection::new_separate(gate_proj, up_proj);
         Ok(Self {
-            gate_proj,
-            up_proj,
+            gate_up_proj,
             down_proj,
         })
     }
 
     fn projection_diagnostics(&self) -> Qwen3ProjectionDiagnostics {
-        self.gate_proj
+        self.gate_up_proj
             .diagnostics()
-            .add(self.up_proj.diagnostics())
             .add(self.down_proj.diagnostics())
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = self.gate_proj.forward(x)?;
-        let up = self.up_proj.forward(x)?;
+        let (gate, up) = self.gate_up_proj.forward(x)?;
         let hidden = if let Some(fused) = try_fused_silu_mul(&gate, &up) {
             fused
         } else {
@@ -1775,6 +2017,30 @@ mod tests {
     use candle_nn::rotary_emb;
     use std::collections::HashMap;
 
+    fn assert_tensor_close(lhs: &Tensor, rhs: &Tensor) {
+        assert_eq!(lhs.dims(), rhs.dims());
+        let lhs = lhs
+            .to_dtype(DType::F32)
+            .expect("lhs dtype")
+            .flatten_all()
+            .expect("lhs flat")
+            .to_vec1::<f32>()
+            .expect("lhs values");
+        let rhs = rhs
+            .to_dtype(DType::F32)
+            .expect("rhs dtype")
+            .flatten_all()
+            .expect("rhs flat")
+            .to_vec1::<f32>()
+            .expect("rhs values");
+        for (idx, (lhs, rhs)) in lhs.iter().zip(rhs.iter()).enumerate() {
+            assert!(
+                (lhs - rhs).abs() <= 1e-5,
+                "tensor mismatch at {idx}: {lhs} != {rhs}"
+            );
+        }
+    }
+
     #[test]
     fn qwen3_dense_projection_loads_optional_bias() {
         let device = Device::Cpu;
@@ -1869,6 +2135,103 @@ mod tests {
             .to_vec2::<f32>()
             .expect("output values");
         assert_eq!(out, vec![vec![8.0, 18.0]]);
+    }
+
+    #[test]
+    fn fused_qwen3_qkv_projection_matches_separate_dense_projections() {
+        let device = Device::Cpu;
+        let q_proj = Qwen3DenseProjection {
+            linear: Linear::new(
+                Tensor::from_vec(
+                    vec![
+                        0.1f32, 0.2, 0.3, -0.4, 0.5, 0.6, 0.7, -0.8, 0.9, 1.0, -1.1, 1.2,
+                    ],
+                    (4, 3),
+                    &device,
+                )
+                .expect("q weight"),
+                None,
+            ),
+            has_bias: false,
+        };
+        let k_proj = Qwen3DenseProjection {
+            linear: Linear::new(
+                Tensor::from_vec(vec![0.3f32, -0.2, 0.1, 0.6, 0.4, -0.5], (2, 3), &device)
+                    .expect("k weight"),
+                None,
+            ),
+            has_bias: false,
+        };
+        let v_proj = Qwen3DenseProjection {
+            linear: Linear::new(
+                Tensor::from_vec(vec![-0.7f32, 0.8, 0.9, 0.2, -0.1, 0.4], (2, 3), &device)
+                    .expect("v weight"),
+                None,
+            ),
+            has_bias: false,
+        };
+        let fused = Qwen3FusedQkvProjection::new(&q_proj, &k_proj, &v_proj).expect("fused qkv");
+        let input = Tensor::from_vec(
+            vec![1.0f32, -2.0, 0.5, 0.25, 1.5, -0.75],
+            (1, 2, 3),
+            &device,
+        )
+        .expect("input");
+
+        let (q, k, v) = fused.forward(&input).expect("fused forward");
+
+        assert_tensor_close(&q, &q_proj.linear.forward(&input).expect("q"));
+        assert_tensor_close(&k, &k_proj.linear.forward(&input).expect("k"));
+        assert_tensor_close(&v, &v_proj.linear.forward(&input).expect("v"));
+    }
+
+    #[test]
+    fn fused_qwen3_gate_up_projection_matches_separate_dense_projections() {
+        let device = Device::Cpu;
+        let gate_proj = Qwen3DenseProjection {
+            linear: Linear::new(
+                Tensor::from_vec(
+                    vec![0.1f32, -0.2, 0.3, 0.4, 0.5, -0.6, -0.7, 0.8, 0.9],
+                    (3, 3),
+                    &device,
+                )
+                .expect("gate weight"),
+                Some(Tensor::from_vec(vec![0.1f32, -0.2, 0.3], (3,), &device).expect("gate bias")),
+            ),
+            has_bias: true,
+        };
+        let up_proj = Qwen3DenseProjection {
+            linear: Linear::new(
+                Tensor::from_vec(
+                    vec![-0.3f32, 0.2, 0.1, 0.6, -0.4, 0.5, 0.7, 0.9, -0.8],
+                    (3, 3),
+                    &device,
+                )
+                .expect("up weight"),
+                Some(Tensor::from_vec(vec![0.2f32, 0.4, -0.6], (3,), &device).expect("up bias")),
+            ),
+            has_bias: true,
+        };
+        let fused = Qwen3FusedGateUpProjection::new(&gate_proj, &up_proj).expect("fused gate/up");
+        let input = Tensor::from_vec(
+            vec![1.0f32, -2.0, 0.5, 0.25, 1.5, -0.75],
+            (1, 2, 3),
+            &device,
+        )
+        .expect("input");
+
+        let (gate, up) = fused.forward(&input).expect("fused forward");
+
+        assert_tensor_close(&gate, &gate_proj.linear.forward(&input).expect("gate"));
+        assert_tensor_close(&up, &up_proj.linear.forward(&input).expect("up"));
+    }
+
+    #[test]
+    fn qwen3_dense_projection_fusion_defaults_to_metal_only() {
+        assert!(qwen3_dense_projection_fusion_policy(true, None));
+        assert!(!qwen3_dense_projection_fusion_policy(false, None));
+        assert!(qwen3_dense_projection_fusion_policy(false, Some(true)));
+        assert!(!qwen3_dense_projection_fusion_policy(true, Some(false)));
     }
 
     #[test]
@@ -2141,12 +2504,10 @@ mod tests {
             8,
         );
         quantized_cache.append(0, k, v).expect("append quantized");
-        assert!(
-            quantized_cache
-                .dense_heads(0)
-                .expect("dense heads")
-                .is_none()
-        );
+        assert!(quantized_cache
+            .dense_heads(0)
+            .expect("dense heads")
+            .is_none());
     }
 
     #[test]
