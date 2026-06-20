@@ -41,6 +41,7 @@ pub struct GraniteSpeechGenerationStats {
     pub rope_cache_precomputed: bool,
     pub cuda_device_argmax: bool,
     pub residual_branches_prescaled: bool,
+    pub f16_lm_head: bool,
     pub dense_decode_preallocated: bool,
     pub dense_decode_initial_capacity: usize,
     pub deferred_stop_check: bool,
@@ -407,6 +408,21 @@ fn granite_chunked_stop_check_interval(max_new_tokens: usize) -> usize {
     interval.clamp(1, max_new_tokens.max(1))
 }
 
+fn granite_f16_lm_head_enabled(device: &Device, dtype: DType) -> bool {
+    let override_enabled = std::env::var("IZWI_GRANITE_F16_LM_HEAD")
+        .ok()
+        .and_then(|raw| parse_env_bool(&raw));
+    granite_f16_lm_head_policy(device.is_metal(), dtype, override_enabled)
+}
+
+fn granite_f16_lm_head_policy(
+    is_metal: bool,
+    dtype: DType,
+    override_enabled: Option<bool>,
+) -> bool {
+    override_enabled.unwrap_or(is_metal && dtype == DType::F32)
+}
+
 fn parse_env_bool(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -767,6 +783,7 @@ impl GraniteSpeechRuntime {
                 rope_cache_precomputed: rope_cache.is_some(),
                 cuda_device_argmax,
                 residual_branches_prescaled: self.text_model.residual_branches_prescaled(),
+                f16_lm_head: self.text_model.f16_lm_head(),
                 dense_decode_preallocated: dense_decode_initial_capacity > 0,
                 dense_decode_initial_capacity,
                 deferred_stop_check,
@@ -1514,6 +1531,7 @@ struct GraniteLanguageModel {
     layers: Vec<GraniteDecoderLayer>,
     norm: RmsNorm,
     lm_head: Linear,
+    lm_head_f16: Option<Linear>,
     cfg: GraniteTextConfig,
     device: Device,
     residual_branches_prescaled: bool,
@@ -1542,11 +1560,18 @@ impl GraniteLanguageModel {
         } else {
             linear_no_bias(config.hidden_size, config.vocab_size, vb.pp("lm_head"))?
         };
+        let lm_head_f16 =
+            if granite_f16_lm_head_enabled(vb.device(), embed_tokens.embeddings().dtype()) {
+                Some(Linear::new(lm_head.weight().to_dtype(DType::F16)?, None))
+            } else {
+                None
+            };
         Ok(Self {
             embed_tokens,
             layers,
             norm,
             lm_head,
+            lm_head_f16,
             cfg: config.clone(),
             device: vb.device().clone(),
             residual_branches_prescaled,
@@ -1559,6 +1584,10 @@ impl GraniteLanguageModel {
 
     fn residual_branches_prescaled(&self) -> bool {
         self.residual_branches_prescaled
+    }
+
+    fn f16_lm_head(&self) -> bool {
+        self.lm_head_f16.is_some()
     }
 
     fn qkv_projection_fused(&self) -> bool {
@@ -1740,7 +1769,11 @@ impl GraniteLanguageModel {
         }
         let hidden = last_hidden_for_logits(&hidden)?;
         let lm_head_start = profile_start(profiling);
-        let logits = self.lm_head.forward(&hidden)?;
+        let logits = if let Some(lm_head_f16) = self.lm_head_f16.as_ref() {
+            lm_head_f16.forward(&hidden.to_dtype(DType::F16)?)?
+        } else {
+            self.lm_head.forward(&hidden)?
+        };
         if let Some(profile) = profile.as_deref_mut() {
             profile.profile.forward.lm_head += profile_elapsed(lm_head_start);
         }
@@ -3052,6 +3085,15 @@ mod tests {
         let err = argmax_last_logits(&logits).unwrap_err();
 
         assert!(format!("{err}").contains("logits sequence is empty"));
+    }
+
+    #[test]
+    fn f16_lm_head_policy_defaults_to_metal_f32_only() {
+        assert!(granite_f16_lm_head_policy(true, DType::F32, None));
+        assert!(!granite_f16_lm_head_policy(true, DType::F16, None));
+        assert!(!granite_f16_lm_head_policy(false, DType::F32, None));
+        assert!(granite_f16_lm_head_policy(false, DType::F32, Some(true)));
+        assert!(!granite_f16_lm_head_policy(true, DType::F32, Some(false)));
     }
 
     #[test]
