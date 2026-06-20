@@ -1649,9 +1649,13 @@ fn qwen3_asr_gguf_text_tensor_matches(name: &str, prefix: &str) -> bool {
     }
 }
 
-fn qwen3_asr_use_gguf_qmatmul_text(device: &candle_core::Device) -> bool {
-    let default_enabled = !device.is_metal();
-    env_bool("IZWI_QWEN3_ASR_GGUF_QMATMUL_TEXT").unwrap_or(default_enabled)
+fn qwen3_asr_gguf_qmatmul_text_policy(override_enabled: Option<bool>) -> bool {
+    override_enabled.unwrap_or(true)
+}
+
+fn qwen3_asr_use_gguf_qmatmul_text(_device: &candle_core::Device) -> bool {
+    let override_enabled = env_bool("IZWI_QWEN3_ASR_GGUF_QMATMUL_TEXT");
+    qwen3_asr_gguf_qmatmul_text_policy(override_enabled)
 }
 
 fn preprocessor_config_from_gguf(loader: &GgufLoader) -> Result<PreprocessorConfig> {
@@ -2749,6 +2753,13 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::backends::DeviceSelector;
+
+    #[test]
+    fn gguf_qmatmul_text_defaults_on_with_env_override() {
+        assert!(qwen3_asr_gguf_qmatmul_text_policy(None));
+        assert!(qwen3_asr_gguf_qmatmul_text_policy(Some(true)));
+        assert!(!qwen3_asr_gguf_qmatmul_text_policy(Some(false)));
+    }
 
     #[test]
     fn collect_stop_token_ids_deduplicates_alt_eos() {
