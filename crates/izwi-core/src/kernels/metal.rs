@@ -18,7 +18,7 @@ use candle_core::{DType, Tensor};
 #[cfg(feature = "metal")]
 use candle_metal_kernels::metal::{ComputePipeline, Device as MetalDevice};
 
-use super::{FusedKernelError, FusedResult};
+use super::{FusedKernelError, FusedResult, FusedSiluMulResult};
 
 #[cfg(feature = "metal")]
 const IZWI_METAL_SOURCE: &str = r#"
@@ -330,6 +330,10 @@ pub fn try_fused_l2_norm(input: &Tensor, eps: f64) -> Option<Tensor> {
 /// This fuses the SiLU activation with the elementwise multiplication,
 /// reducing memory bandwidth by 50% for this operation.
 pub fn try_fused_silu_mul(gate: &Tensor, up: &Tensor) -> Option<Tensor> {
+    try_fused_silu_mul_with_status(gate, up).map(|result| result.tensor)
+}
+
+pub fn try_fused_silu_mul_with_status(gate: &Tensor, up: &Tensor) -> Option<FusedSiluMulResult> {
     if !use_fused_kernels() {
         return None;
     }
@@ -345,13 +349,20 @@ pub fn try_fused_silu_mul(gate: &Tensor, up: &Tensor) -> Option<Tensor> {
             && up.is_contiguous()
         {
             if let Ok(result) = gate.apply_op2_no_bwd(up, &SiluMulOp) {
-                return Some(result);
+                return Some(FusedSiluMulResult {
+                    tensor: result,
+                    used_custom_kernel: true,
+                });
             }
         }
     }
 
     let silu_gate = candle_nn::ops::silu(gate).ok()?;
-    silu_gate.broadcast_mul(up).ok()
+    let tensor = silu_gate.broadcast_mul(up).ok()?;
+    Some(FusedSiluMulResult {
+        tensor,
+        used_custom_kernel: false,
+    })
 }
 
 /// Try fused RMS normalization.

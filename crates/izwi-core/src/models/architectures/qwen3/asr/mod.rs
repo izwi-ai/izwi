@@ -24,7 +24,8 @@ use crate::error::{Error, Result};
 use crate::kernels::buffer_pool::maybe_init_global_buffer_pool;
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::core::{
-    Qwen3Cache, Qwen3Config, Qwen3Model, RopeScalingConfig,
+    qwen3_runtime_profile_delta, qwen3_runtime_profile_snapshot, qwen3_runtime_profiling_enabled,
+    Qwen3Cache, Qwen3Config, Qwen3Model, Qwen3RuntimeProfileSnapshot, RopeScalingConfig,
 };
 use crate::models::shared::attention::flash::{
     flash_attention_compiled, flash_attention_requested,
@@ -79,6 +80,7 @@ pub struct AsrDecodeState {
     tokens_since_resync: usize,
     assembled: String,
     diagnostics: Qwen3AsrDiagnostics,
+    profile_start: Qwen3RuntimeProfileSnapshot,
     stop_tokens: Vec<u32>,
     max_new_tokens: usize,
     finished: bool,
@@ -103,10 +105,43 @@ pub struct AsrTranscriptionOutput {
 struct Qwen3AsrTimingDiagnostics {
     resample_ms: f64,
     mel_ms: f64,
+    mel_flatten_upload_ms: f64,
     audio_encode_ms: f64,
     prefill_ms: f64,
     decode_ms: f64,
     total_ms: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Qwen3AsrProfileDiagnostics {
+    qwen3_profile_enabled: bool,
+    qmatmul_calls: u64,
+    qmatmul_ms: f64,
+    qmatmul_input_casts: u64,
+    qmatmul_input_cast_ms: f64,
+    qmatmul_output_casts: u64,
+    qmatmul_output_cast_ms: f64,
+    lm_head_calls: u64,
+    lm_head_ms: f64,
+    silu_mul_fused_calls: u64,
+    silu_mul_fallback_calls: u64,
+    argmax_calls: u64,
+    argmax_ms: f64,
+}
+
+impl Qwen3AsrProfileDiagnostics {
+    fn update_from_runtime_delta(&mut self, delta: Qwen3RuntimeProfileSnapshot) {
+        self.qmatmul_calls = delta.qmatmul_calls;
+        self.qmatmul_ms = ns_to_ms(delta.qmatmul_ns);
+        self.qmatmul_input_casts = delta.qmatmul_input_casts;
+        self.qmatmul_input_cast_ms = ns_to_ms(delta.qmatmul_input_cast_ns);
+        self.qmatmul_output_casts = delta.qmatmul_output_casts;
+        self.qmatmul_output_cast_ms = ns_to_ms(delta.qmatmul_output_cast_ns);
+        self.lm_head_calls = delta.lm_head_calls;
+        self.lm_head_ms = ns_to_ms(delta.lm_head_ns);
+        self.silu_mul_fused_calls = delta.silu_mul_fused_calls;
+        self.silu_mul_fallback_calls = delta.silu_mul_fallback_calls;
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -150,6 +185,7 @@ struct Qwen3AsrDiagnostics {
     max_new_tokens: usize,
     generated_tokens: usize,
     execution: Qwen3AsrExecutionDiagnostics,
+    profile: Qwen3AsrProfileDiagnostics,
     timings: Qwen3AsrTimingDiagnostics,
 }
 
@@ -202,10 +238,26 @@ impl Qwen3AsrDiagnostics {
             "timings_ms": {
                 "resample": self.timings.resample_ms,
                 "mel": self.timings.mel_ms,
+                "mel_flatten_upload": self.timings.mel_flatten_upload_ms,
                 "audio_encode": self.timings.audio_encode_ms,
                 "prefill": self.timings.prefill_ms,
                 "decode": self.timings.decode_ms,
                 "model_total": self.timings.total_ms,
+            },
+            "profile": {
+                "qwen3_profile_enabled": self.profile.qwen3_profile_enabled,
+                "qmatmul_calls": self.profile.qmatmul_calls,
+                "qmatmul_ms": self.profile.qmatmul_ms,
+                "qmatmul_input_casts": self.profile.qmatmul_input_casts,
+                "qmatmul_input_cast_ms": self.profile.qmatmul_input_cast_ms,
+                "qmatmul_output_casts": self.profile.qmatmul_output_casts,
+                "qmatmul_output_cast_ms": self.profile.qmatmul_output_cast_ms,
+                "lm_head_calls": self.profile.lm_head_calls,
+                "lm_head_ms": self.profile.lm_head_ms,
+                "silu_mul_fused_calls": self.profile.silu_mul_fused_calls,
+                "silu_mul_fallback_calls": self.profile.silu_mul_fallback_calls,
+                "argmax_calls": self.profile.argmax_calls,
+                "argmax_ms": self.profile.argmax_ms,
             }
         })
     }
@@ -646,6 +698,11 @@ impl Qwen3AsrModel {
                 state.diagnostics.timings.decode_ms = elapsed_ms(decode_started);
                 state.diagnostics.timings.total_ms += state.diagnostics.timings.decode_ms;
                 state.diagnostics.generated_tokens = step.tokens_generated;
+                if state.diagnostics.profile.qwen3_profile_enabled {
+                    state.diagnostics.profile.update_from_runtime_delta(
+                        qwen3_runtime_profile_delta(state.profile_start),
+                    );
+                }
                 let (detected_language, text) = parse_asr_output(&step.text, language);
                 return Ok(AsrTranscriptionOutput {
                     text,
@@ -680,6 +737,8 @@ impl Qwen3AsrModel {
             ));
         }
         let input_samples = audio.len();
+        let profile_start = qwen3_runtime_profile_snapshot();
+        let profile_enabled = qwen3_runtime_profiling_enabled();
         let total_started = Instant::now();
         let resample_started = Instant::now();
         let audio = if sample_rate != 16_000 {
@@ -705,6 +764,7 @@ impl Qwen3AsrModel {
             return Err(Error::InvalidInput("Empty audio input".to_string()));
         }
 
+        let mel_flatten_upload_started = Instant::now();
         let frames = mel_spec.len();
         let mut flat = Vec::with_capacity(frames * n_mels);
         for frame in &mel_spec {
@@ -716,6 +776,7 @@ impl Qwen3AsrModel {
             .unsqueeze(0)?
             .unsqueeze(0)?
             .to_dtype(self.audio_dtype)?;
+        let mel_flatten_upload_ms = elapsed_ms(mel_flatten_upload_started);
 
         let feature_lens = vec![frames];
         let audio_started = Instant::now();
@@ -767,9 +828,14 @@ impl Qwen3AsrModel {
             max_new_tokens,
             generated_tokens: 0,
             execution,
+            profile: Qwen3AsrProfileDiagnostics {
+                qwen3_profile_enabled: profile_enabled,
+                ..Default::default()
+            },
             timings: Qwen3AsrTimingDiagnostics {
                 resample_ms,
                 mel_ms,
+                mel_flatten_upload_ms,
                 audio_encode_ms,
                 prefill_ms,
                 decode_ms: 0.0,
@@ -788,6 +854,7 @@ impl Qwen3AsrModel {
             tokens_since_resync: 0,
             assembled: String::new(),
             diagnostics,
+            profile_start,
             stop_tokens: collect_stop_token_ids(&self.specials),
             max_new_tokens,
             finished: false,
@@ -859,7 +926,17 @@ impl Qwen3AsrModel {
         }
 
         let logits = state.embeds.i((0, state.embeds.dim(1)? - 1))?;
+        let argmax_started = state
+            .diagnostics
+            .profile
+            .qwen3_profile_enabled
+            .then(Instant::now);
         let next = argmax(&logits)?;
+        if let Some(started) = argmax_started {
+            state.diagnostics.profile.argmax_calls =
+                state.diagnostics.profile.argmax_calls.saturating_add(1);
+            state.diagnostics.profile.argmax_ms += elapsed_ms(started);
+        }
         if state.stop_tokens.contains(&next) {
             state.finished = true;
             self.refresh_full_decoded_text(state)?;
@@ -2116,6 +2193,10 @@ fn elapsed_ms(started: Instant) -> f64 {
     started.elapsed().as_secs_f64() * 1000.0
 }
 
+fn ns_to_ms(ns: u64) -> f64 {
+    ns as f64 / 1_000_000.0
+}
+
 fn build_qwen_asr_prompt_tokens(
     specials: &SpecialTokenIds,
     audio_len: usize,
@@ -2905,9 +2986,25 @@ mod tests {
                 dense_projection_count: 0,
                 dense_bias_projection_count: 0,
             },
+            profile: Qwen3AsrProfileDiagnostics {
+                qwen3_profile_enabled: true,
+                qmatmul_calls: 10,
+                qmatmul_ms: 6.5,
+                qmatmul_input_casts: 4,
+                qmatmul_input_cast_ms: 0.75,
+                qmatmul_output_casts: 4,
+                qmatmul_output_cast_ms: 0.5,
+                lm_head_calls: 2,
+                lm_head_ms: 1.25,
+                silu_mul_fused_calls: 3,
+                silu_mul_fallback_calls: 1,
+                argmax_calls: 2,
+                argmax_ms: 0.2,
+            },
             timings: Qwen3AsrTimingDiagnostics {
                 resample_ms: 1.0,
                 mel_ms: 2.0,
+                mel_flatten_upload_ms: 0.25,
                 audio_encode_ms: 3.0,
                 prefill_ms: 4.0,
                 decode_ms: 5.0,
@@ -2930,6 +3027,11 @@ mod tests {
             "qmatmul"
         );
         assert_eq!(diagnostics["execution"]["qmatmul_projection_count"], 197);
+        assert_eq!(diagnostics["timings_ms"]["mel_flatten_upload"], 0.25);
+        assert_eq!(diagnostics["profile"]["qwen3_profile_enabled"], true);
+        assert_eq!(diagnostics["profile"]["qmatmul_calls"], 10);
+        assert_eq!(diagnostics["profile"]["silu_mul_fused_calls"], 3);
+        assert_eq!(diagnostics["profile"]["argmax_calls"], 2);
         assert_eq!(diagnostics["timings_ms"]["model_total"], 15.0);
     }
 

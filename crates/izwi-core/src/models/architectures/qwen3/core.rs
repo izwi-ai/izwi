@@ -8,10 +8,12 @@ use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_nn::{kv_cache::Cache, ops, rotary_emb, Embedding, Linear, RmsNorm, VarBuilder};
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use crate::error::{Error, Result};
-use crate::kernels::try_fused_silu_mul;
+use crate::kernels::try_fused_silu_mul_with_status;
 use crate::models::shared::attention::batched::{
     batched_scaled_dot_product_attention, BatchedAttentionConfig, BatchedAttentionInput,
 };
@@ -539,6 +541,107 @@ struct Qwen3DenseProjection {
     has_bias: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Qwen3RuntimeProfileSnapshot {
+    pub qmatmul_calls: u64,
+    pub qmatmul_ns: u64,
+    pub qmatmul_input_casts: u64,
+    pub qmatmul_input_cast_ns: u64,
+    pub qmatmul_output_casts: u64,
+    pub qmatmul_output_cast_ns: u64,
+    pub lm_head_calls: u64,
+    pub lm_head_ns: u64,
+    pub silu_mul_fused_calls: u64,
+    pub silu_mul_fallback_calls: u64,
+}
+
+impl Qwen3RuntimeProfileSnapshot {
+    fn saturating_delta(self, baseline: Self) -> Self {
+        Self {
+            qmatmul_calls: self.qmatmul_calls.saturating_sub(baseline.qmatmul_calls),
+            qmatmul_ns: self.qmatmul_ns.saturating_sub(baseline.qmatmul_ns),
+            qmatmul_input_casts: self
+                .qmatmul_input_casts
+                .saturating_sub(baseline.qmatmul_input_casts),
+            qmatmul_input_cast_ns: self
+                .qmatmul_input_cast_ns
+                .saturating_sub(baseline.qmatmul_input_cast_ns),
+            qmatmul_output_casts: self
+                .qmatmul_output_casts
+                .saturating_sub(baseline.qmatmul_output_casts),
+            qmatmul_output_cast_ns: self
+                .qmatmul_output_cast_ns
+                .saturating_sub(baseline.qmatmul_output_cast_ns),
+            lm_head_calls: self.lm_head_calls.saturating_sub(baseline.lm_head_calls),
+            lm_head_ns: self.lm_head_ns.saturating_sub(baseline.lm_head_ns),
+            silu_mul_fused_calls: self
+                .silu_mul_fused_calls
+                .saturating_sub(baseline.silu_mul_fused_calls),
+            silu_mul_fallback_calls: self
+                .silu_mul_fallback_calls
+                .saturating_sub(baseline.silu_mul_fallback_calls),
+        }
+    }
+}
+
+static QWEN3_PROFILE_QMATMUL_CALLS: AtomicU64 = AtomicU64::new(0);
+static QWEN3_PROFILE_QMATMUL_NS: AtomicU64 = AtomicU64::new(0);
+static QWEN3_PROFILE_QMATMUL_INPUT_CASTS: AtomicU64 = AtomicU64::new(0);
+static QWEN3_PROFILE_QMATMUL_INPUT_CAST_NS: AtomicU64 = AtomicU64::new(0);
+static QWEN3_PROFILE_QMATMUL_OUTPUT_CASTS: AtomicU64 = AtomicU64::new(0);
+static QWEN3_PROFILE_QMATMUL_OUTPUT_CAST_NS: AtomicU64 = AtomicU64::new(0);
+static QWEN3_PROFILE_LM_HEAD_CALLS: AtomicU64 = AtomicU64::new(0);
+static QWEN3_PROFILE_LM_HEAD_NS: AtomicU64 = AtomicU64::new(0);
+static QWEN3_PROFILE_SILU_MUL_FUSED_CALLS: AtomicU64 = AtomicU64::new(0);
+static QWEN3_PROFILE_SILU_MUL_FALLBACK_CALLS: AtomicU64 = AtomicU64::new(0);
+
+pub fn qwen3_runtime_profiling_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("IZWI_QWEN3_PROFILE")
+            .ok()
+            .and_then(|raw| parse_env_bool(&raw))
+            .unwrap_or(false)
+    })
+}
+
+pub fn qwen3_runtime_profile_snapshot() -> Qwen3RuntimeProfileSnapshot {
+    Qwen3RuntimeProfileSnapshot {
+        qmatmul_calls: QWEN3_PROFILE_QMATMUL_CALLS.load(Ordering::Relaxed),
+        qmatmul_ns: QWEN3_PROFILE_QMATMUL_NS.load(Ordering::Relaxed),
+        qmatmul_input_casts: QWEN3_PROFILE_QMATMUL_INPUT_CASTS.load(Ordering::Relaxed),
+        qmatmul_input_cast_ns: QWEN3_PROFILE_QMATMUL_INPUT_CAST_NS.load(Ordering::Relaxed),
+        qmatmul_output_casts: QWEN3_PROFILE_QMATMUL_OUTPUT_CASTS.load(Ordering::Relaxed),
+        qmatmul_output_cast_ns: QWEN3_PROFILE_QMATMUL_OUTPUT_CAST_NS.load(Ordering::Relaxed),
+        lm_head_calls: QWEN3_PROFILE_LM_HEAD_CALLS.load(Ordering::Relaxed),
+        lm_head_ns: QWEN3_PROFILE_LM_HEAD_NS.load(Ordering::Relaxed),
+        silu_mul_fused_calls: QWEN3_PROFILE_SILU_MUL_FUSED_CALLS.load(Ordering::Relaxed),
+        silu_mul_fallback_calls: QWEN3_PROFILE_SILU_MUL_FALLBACK_CALLS.load(Ordering::Relaxed),
+    }
+}
+
+pub fn qwen3_runtime_profile_delta(
+    baseline: Qwen3RuntimeProfileSnapshot,
+) -> Qwen3RuntimeProfileSnapshot {
+    qwen3_runtime_profile_snapshot().saturating_delta(baseline)
+}
+
+fn elapsed_ns(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+fn record_qwen3_silu_mul_profile(fused: bool) {
+    if !qwen3_runtime_profiling_enabled() {
+        return;
+    }
+    let counter = if fused {
+        &QWEN3_PROFILE_SILU_MUL_FUSED_CALLS
+    } else {
+        &QWEN3_PROFILE_SILU_MUL_FALLBACK_CALLS
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
 enum Qwen3Projection {
     Dense(Qwen3DenseProjection),
     Quantized(QMatMul),
@@ -659,15 +762,35 @@ impl Module for Qwen3Projection {
             Self::Dense(dense) => dense.linear.forward(x),
             Self::Quantized(qmatmul) => {
                 let activation_dtype = x.dtype();
+                let profile = qwen3_runtime_profiling_enabled();
                 let x = if let Some(dtype) = qwen3_qmatmul_input_dtype(x.device(), activation_dtype)
                 {
-                    x.to_dtype(dtype)?
+                    let started = profile.then(Instant::now);
+                    let casted = x.to_dtype(dtype)?;
+                    if let Some(started) = started {
+                        QWEN3_PROFILE_QMATMUL_INPUT_CASTS.fetch_add(1, Ordering::Relaxed);
+                        QWEN3_PROFILE_QMATMUL_INPUT_CAST_NS
+                            .fetch_add(elapsed_ns(started), Ordering::Relaxed);
+                    }
+                    casted
                 } else {
                     x.clone()
                 };
+                let qmatmul_started = profile.then(Instant::now);
                 let out = qmatmul.forward(&x)?;
+                if let Some(started) = qmatmul_started {
+                    QWEN3_PROFILE_QMATMUL_CALLS.fetch_add(1, Ordering::Relaxed);
+                    QWEN3_PROFILE_QMATMUL_NS.fetch_add(elapsed_ns(started), Ordering::Relaxed);
+                }
                 if out.dtype() != activation_dtype {
-                    out.to_dtype(activation_dtype)
+                    let started = profile.then(Instant::now);
+                    let casted = out.to_dtype(activation_dtype);
+                    if let Some(started) = started {
+                        QWEN3_PROFILE_QMATMUL_OUTPUT_CASTS.fetch_add(1, Ordering::Relaxed);
+                        QWEN3_PROFILE_QMATMUL_OUTPUT_CAST_NS
+                            .fetch_add(elapsed_ns(started), Ordering::Relaxed);
+                    }
+                    casted
                 } else {
                     Ok(out)
                 }
@@ -1385,9 +1508,11 @@ impl Qwen3Mlp {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (gate, up) = self.gate_up_proj.forward(x)?;
-        let hidden = if let Some(fused) = try_fused_silu_mul(&gate, &up) {
-            fused
+        let hidden = if let Some(fused) = try_fused_silu_mul_with_status(&gate, &up) {
+            record_qwen3_silu_mul_profile(fused.used_custom_kernel);
+            fused.tensor
         } else {
+            record_qwen3_silu_mul_profile(false);
             let act = ops::silu(&gate)?;
             act.broadcast_mul(&up)?
         };
@@ -1710,7 +1835,16 @@ impl Qwen3Model {
     }
 
     pub fn logits_from_hidden(&self, hidden: &Tensor) -> Result<Tensor> {
-        self.lm_head.forward(hidden).map_err(Error::from)
+        if !qwen3_runtime_profiling_enabled() {
+            return self.lm_head.forward(hidden).map_err(Error::from);
+        }
+        let started = Instant::now();
+        let logits = self.lm_head.forward(hidden).map_err(Error::from);
+        QWEN3_PROFILE_LM_HEAD_CALLS.fetch_add(1, Ordering::Relaxed);
+        if logits.is_ok() {
+            QWEN3_PROFILE_LM_HEAD_NS.fetch_add(elapsed_ns(started), Ordering::Relaxed);
+        }
+        logits
     }
 
     pub fn logits_from_hidden_for_tokens(

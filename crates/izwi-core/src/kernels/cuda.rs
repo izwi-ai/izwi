@@ -7,6 +7,8 @@
 
 use candle_core::{DType, Tensor, D};
 
+use crate::kernels::FusedSiluMulResult;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CudaKernelStatus {
     pub compiled: bool,
@@ -43,12 +45,20 @@ pub fn status() -> CudaKernelStatus {
 }
 
 pub fn try_fused_silu_mul(gate: &Tensor, up: &Tensor) -> Option<Tensor> {
+    try_fused_silu_mul_with_status(gate, up).map(|result| result.tensor)
+}
+
+pub fn try_fused_silu_mul_with_status(gate: &Tensor, up: &Tensor) -> Option<FusedSiluMulResult> {
     if !cuda_tensor_pair_supported(gate, up) {
         return None;
     }
 
     let silu_gate = candle_nn::ops::silu(gate).ok()?;
-    silu_gate.broadcast_mul(up).ok()
+    let tensor = silu_gate.broadcast_mul(up).ok()?;
+    Some(FusedSiluMulResult {
+        tensor,
+        used_custom_kernel: false,
+    })
 }
 
 pub fn try_fused_l2_norm(input: &Tensor, eps: f64) -> Option<Tensor> {
