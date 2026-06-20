@@ -749,38 +749,31 @@ impl Qwen3AsrModel {
         let resample_ms = elapsed_ms(resample_started);
 
         let mel_started = Instant::now();
-        let mut mel_spec = self.mel.compute(&audio)?;
-        let mel_frames_before_drop = mel_spec.len();
-        let mel_last_frame_dropped =
-            apply_qwen_mel_frame_policy(&mut mel_spec, qwen_asr_drop_last_mel_frame());
-        let mel_frames_before_truncate = mel_spec.len();
-        if self.preprocessor.nb_max_frames > 0 && mel_spec.len() > self.preprocessor.nb_max_frames {
-            mel_spec.truncate(self.preprocessor.nb_max_frames);
+        let n_mels = self.mel.config().n_mels;
+        let (mut flat, mut frames) = self.mel.compute_flat(&audio)?;
+        let mel_frames_before_drop = frames;
+        let mel_last_frame_dropped = qwen_asr_drop_last_mel_frame() && frames > 0;
+        if mel_last_frame_dropped {
+            frames -= 1;
         }
+        let mel_frames_before_truncate = frames;
+        if self.preprocessor.nb_max_frames > 0 && frames > self.preprocessor.nb_max_frames {
+            frames = self.preprocessor.nb_max_frames;
+        }
+        flat.truncate(frames * n_mels);
         let mel_ms = elapsed_ms(mel_started);
 
-        let n_mels = self.mel.config().n_mels;
-        if mel_spec.is_empty() {
+        if frames == 0 {
             return Err(Error::InvalidInput("Empty audio input".to_string()));
         }
 
         let mel_flatten_upload_started = Instant::now();
-        let frames = mel_spec.len();
-        let mut flat = Vec::with_capacity(frames * n_mels);
-        for frame in &mel_spec {
-            flat.extend_from_slice(frame);
-        }
-
         let mel = Tensor::from_vec(flat, (frames, n_mels), &self.device.device)?
-            .transpose(0, 1)?
-            .unsqueeze(0)?
-            .unsqueeze(0)?
             .to_dtype(self.audio_dtype)?;
         let mel_flatten_upload_ms = elapsed_ms(mel_flatten_upload_started);
 
-        let feature_lens = vec![frames];
         let audio_started = Instant::now();
-        let mut audio_embeds = self.audio_tower.forward(&mel, Some(&feature_lens))?;
+        let mut audio_embeds = self.audio_tower.forward_feature_sequence(&mel, frames)?;
         if audio_embeds.dtype() != self.text_dtype {
             audio_embeds = audio_embeds.to_dtype(self.text_dtype)?;
         }
@@ -2561,11 +2554,26 @@ fn resample(audio: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>> {
         let center = (numerator / (dst_rate as u128)) as isize;
         let phase_idx = ((numerator % (dst_rate as u128)) / (kernel.gcd as u128)) as usize;
         let phase = &kernel.phases[phase_idx];
+        let sample_start = center - RESAMPLE_SINC_HALF + 1;
+
+        if sample_start >= 0
+            && sample_start + RESAMPLE_SINC_TAPS as isize <= audio.len() as isize
+            && phase.weight_sum.abs() > 1e-9
+        {
+            let base = sample_start as usize;
+            let mut acc = 0.0f64;
+            for (tap_idx, coeff) in phase.coeffs.iter().copied().enumerate() {
+                acc += audio[base + tap_idx] as f64 * coeff;
+            }
+            out.push((acc / phase.weight_sum) as f32);
+            continue;
+        }
+
         let mut acc = 0.0f64;
         let mut weight_sum = 0.0f64;
 
         for (tap_idx, coeff) in phase.coeffs.iter().copied().enumerate() {
-            let j = center + tap_idx as isize - RESAMPLE_SINC_HALF + 1;
+            let j = sample_start + tap_idx as isize;
             if let Some(sample) = (j >= 0)
                 .then_some(j as usize)
                 .and_then(|idx| audio.get(idx))
@@ -2590,6 +2598,7 @@ const RESAMPLE_KAISER_BETA: f64 = 6.0;
 
 struct ResamplePhase {
     coeffs: [f64; RESAMPLE_SINC_TAPS],
+    weight_sum: f64,
 }
 
 struct ResampleKernel {
@@ -2646,7 +2655,8 @@ impl ResampleKernel {
                     )
                     * cutoff;
             }
-            phases.push(ResamplePhase { coeffs });
+            let weight_sum = coeffs.iter().copied().sum();
+            phases.push(ResamplePhase { coeffs, weight_sum });
         }
 
         Self { gcd, phases }

@@ -523,8 +523,28 @@ impl AudioTower {
         Tensor::cat(&refs, 0).map_err(crate::error::Error::from)
     }
 
+    pub fn forward_feature_sequence(&self, features: &Tensor, input_len: usize) -> Result<Tensor> {
+        let (frames, _n_mels) = features.dims2()?;
+        let input_len = input_len.min(frames);
+        if input_len == 0 {
+            return Err(crate::error::Error::InvalidInput(
+                "Empty audio feature sequence".to_string(),
+            ));
+        }
+        self.forward_single_feature_sequence(features, input_len)
+    }
+
     fn forward_single_sample(&self, mel_sample: &Tensor, input_len: usize) -> Result<Tensor> {
-        let n_mels = mel_sample.dim(0)?;
+        let feature_seq = mel_sample.transpose(0, 1)?; // [frames, n_mels]
+        self.forward_single_feature_sequence(&feature_seq, input_len)
+    }
+
+    fn forward_single_feature_sequence(
+        &self,
+        feature_seq: &Tensor,
+        input_len: usize,
+    ) -> Result<Tensor> {
+        let n_mels = feature_seq.dim(1)?;
         let n_window = self.cfg.n_window.unwrap_or(50);
         let n_window_infer = self.cfg.n_window_infer.unwrap_or(800);
         let chunk_input_len = n_window * 2;
@@ -535,7 +555,6 @@ impl AudioTower {
         }
 
         // Match upstream: split features into fixed-size chunks before CNN.
-        let feature_seq = mel_sample.transpose(0, 1)?; // [frames, n_mels]
         let mut chunk_lengths = Vec::new();
         let mut remaining = input_len;
         while remaining > 0 {
