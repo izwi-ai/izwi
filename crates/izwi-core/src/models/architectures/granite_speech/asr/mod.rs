@@ -641,6 +641,11 @@ fn granite_diagnostics(
             "stop_reason": generation.stats.stop_reason,
             "stop_token": generation.stats.stop_token,
         },
+        "token_debug": granite_token_debug_enabled().then(|| json!({
+            "token_ids": generation.token_ids,
+            "token_count": generation.token_ids.len(),
+            "decoded_text": generation.text,
+        })),
         "execution": {
             "dense_decode_cache": generation.stats.dense_decode_cache_enabled,
             "dense_decode_cache_configured": generation.stats.dense_decode_cache_enabled,
@@ -821,6 +826,18 @@ fn percentile_sorted(values: &[f64], percentile: f64) -> f64 {
 
 fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
+}
+
+fn granite_token_debug_enabled() -> bool {
+    std::env::var("IZWI_GRANITE_TOKEN_DEBUG")
+        .ok()
+        .or_else(|| std::env::var("IZWI_GRANITE_TOKEN_DIAGNOSTICS").ok())
+        .and_then(|raw| match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(false)
 }
 
 pub fn ensure_granite_speech_artifacts(model_dir: &Path) -> Result<Vec<PathBuf>> {
