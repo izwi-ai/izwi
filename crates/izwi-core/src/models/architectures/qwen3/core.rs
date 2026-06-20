@@ -3,7 +3,7 @@
 //! Adapted from the Qwen3 architecture to allow embedding overrides
 //! (used for audio-conditioned ASR).
 
-use candle_core::quantized::QMatMul;
+use candle_core::quantized::{ggml_file, GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_nn::{kv_cache::Cache, ops, rotary_emb, Embedding, Linear, RmsNorm, VarBuilder};
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
@@ -547,6 +547,21 @@ fn qwen3_qk_rms_norm_fusion_policy(is_metal: bool, override_enabled: Option<bool
     override_enabled.unwrap_or(is_metal)
 }
 
+fn qwen3_quantized_projection_grouping_enabled(device: &Device, cfg: &Qwen3Config) -> bool {
+    let override_enabled = std::env::var("IZWI_QWEN3_QUANTIZED_PROJECTION_GROUPING")
+        .ok()
+        .and_then(|raw| parse_env_bool(&raw));
+    qwen3_quantized_projection_grouping_policy(device.is_metal(), cfg.hidden_size, override_enabled)
+}
+
+fn qwen3_quantized_projection_grouping_policy(
+    is_metal: bool,
+    hidden_size: usize,
+    override_enabled: Option<bool>,
+) -> bool {
+    is_metal && override_enabled.unwrap_or(hidden_size <= 1024)
+}
+
 struct Qwen3DenseProjection {
     linear: Linear,
     has_bias: bool,
@@ -699,6 +714,12 @@ impl Qwen3Projection {
             .map_err(Error::from)
     }
 
+    fn packed_quantized(loader: &GgufLoader, device: &Device, names: &[&str]) -> Result<Self> {
+        packed_quantized_qmatmul(loader, device, names)
+            .map(Self::Quantized)
+            .map_err(Error::from)
+    }
+
     fn tied_dense(weight: Tensor) -> Self {
         Self::Dense(Qwen3DenseProjection {
             linear: Linear::new(weight, None),
@@ -810,6 +831,83 @@ impl Module for Qwen3Projection {
     }
 }
 
+fn packed_quantized_qmatmul(
+    loader: &GgufLoader,
+    device: &Device,
+    names: &[&str],
+) -> Result<QMatMul> {
+    let mut tensors = Vec::with_capacity(names.len());
+    for name in names {
+        tensors.push(loader.load_qtensor(name, device)?);
+    }
+    packed_qmatmul_from_qtensors(&tensors, device)
+}
+
+fn packed_qmatmul_from_qtensors(tensors: &[QTensor], device: &Device) -> Result<QMatMul> {
+    if tensors.is_empty() {
+        return Err(Error::InferenceError(
+            "Cannot pack empty Qwen3 quantized projection group".to_string(),
+        ));
+    }
+
+    let dtype = tensors[0].dtype();
+    let (mut total_rows, common_cols) = qtensor_dims2(&tensors[0])?;
+    let mut raw = tensors[0].data()?.into_owned();
+
+    for tensor in &tensors[1..] {
+        let (rows, cols) = qtensor_dims2(tensor)?;
+        if cols != common_cols {
+            return Err(Error::InferenceError(format!(
+                "Qwen3 quantized projection group input mismatch: expected {common_cols}, got {cols}"
+            )));
+        }
+        if tensor.dtype() != dtype {
+            return Err(Error::InferenceError(format!(
+                "Qwen3 quantized projection group dtype mismatch: expected {dtype:?}, got {:?}",
+                tensor.dtype()
+            )));
+        }
+        raw.extend_from_slice(tensor.data()?.as_ref());
+        total_rows = total_rows.saturating_add(rows);
+    }
+
+    let expected_bytes = quantized_storage_bytes(total_rows, common_cols, dtype)?;
+    if raw.len() != expected_bytes {
+        return Err(Error::InferenceError(format!(
+            "Qwen3 packed quantized projection has {} bytes, expected {expected_bytes}",
+            raw.len()
+        )));
+    }
+
+    let qtensor = ggml_file::qtensor_from_ggml(dtype, &raw, vec![total_rows, common_cols], device)
+        .map_err(Error::from)?;
+    QMatMul::from_qtensor(qtensor).map_err(Error::from)
+}
+
+fn qtensor_dims2(tensor: &QTensor) -> Result<(usize, usize)> {
+    tensor.shape().dims2().map_err(Error::from)
+}
+
+fn quantized_storage_bytes(rows: usize, cols: usize, dtype: GgmlDType) -> Result<usize> {
+    let elems = rows.checked_mul(cols).ok_or_else(|| {
+        Error::InferenceError("Qwen3 quantized projection shape overflows usize".to_string())
+    })?;
+    if !elems.is_multiple_of(dtype.block_size()) {
+        return Err(Error::InferenceError(format!(
+            "Qwen3 quantized projection element count {elems} is not divisible by block size {}",
+            dtype.block_size()
+        )));
+    }
+    elems
+        .checked_div(dtype.block_size())
+        .and_then(|blocks| blocks.checked_mul(dtype.type_size()))
+        .ok_or_else(|| {
+            Error::InferenceError(
+                "Qwen3 quantized projection byte size overflows usize".to_string(),
+            )
+        })
+}
+
 fn concat_linear_biases(name: &str, linears: &[&Linear]) -> Result<Option<Tensor>> {
     let bias_count = linears
         .iter()
@@ -891,8 +989,63 @@ impl Qwen3FusedQkvProjection {
     }
 }
 
+struct Qwen3FusedQuantizedQkvProjection {
+    fused: Qwen3Projection,
+    q_out: usize,
+    k_out: usize,
+    v_out: usize,
+}
+
+impl Qwen3FusedQuantizedQkvProjection {
+    fn load_gguf(
+        loader: &GgufLoader,
+        cfg: &Qwen3Config,
+        device: &Device,
+        prefix: &str,
+    ) -> Result<Self> {
+        let head_dim = cfg.head_dim();
+        let q_out = cfg.num_attention_heads * head_dim;
+        let k_out = cfg.num_key_value_heads * head_dim;
+        let v_out = cfg.num_key_value_heads * head_dim;
+        let names = [
+            format!("{prefix}.q_proj.weight"),
+            format!("{prefix}.k_proj.weight"),
+            format!("{prefix}.v_proj.weight"),
+        ];
+        let fused = Qwen3Projection::packed_quantized(
+            loader,
+            device,
+            &[names[0].as_str(), names[1].as_str(), names[2].as_str()],
+        )?;
+        Ok(Self {
+            fused,
+            q_out,
+            k_out,
+            v_out,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let qkv = self.fused.forward(x)?;
+        let last_dim = qkv.rank().saturating_sub(1);
+        let q = qkv.narrow(last_dim, 0, self.q_out)?;
+        let k = qkv.narrow(last_dim, self.q_out, self.k_out)?;
+        let v = qkv.narrow(last_dim, self.q_out + self.k_out, self.v_out)?;
+        Ok((q, k, v))
+    }
+
+    fn diagnostics(&self) -> Qwen3ProjectionDiagnostics {
+        Qwen3ProjectionDiagnostics {
+            dense_projection_count: 0,
+            dense_bias_projection_count: 0,
+            quantized_projection_count: 3,
+        }
+    }
+}
+
 enum Qwen3QkvProjection {
     Fused(Qwen3FusedQkvProjection),
+    FusedQuantized(Qwen3FusedQuantizedQkvProjection),
     Separate {
         q_proj: Qwen3Projection,
         k_proj: Qwen3Projection,
@@ -938,9 +1091,20 @@ impl Qwen3QkvProjection {
         }
     }
 
+    fn new_quantized_grouped(
+        loader: &GgufLoader,
+        cfg: &Qwen3Config,
+        device: &Device,
+        prefix: &str,
+    ) -> Result<Self> {
+        Qwen3FusedQuantizedQkvProjection::load_gguf(loader, cfg, device, prefix)
+            .map(Self::FusedQuantized)
+    }
+
     fn diagnostics(&self) -> Qwen3ProjectionDiagnostics {
         match self {
             Self::Fused(fused) => fused.diagnostics(),
+            Self::FusedQuantized(fused) => fused.diagnostics(),
             Self::Separate {
                 q_proj,
                 k_proj,
@@ -955,6 +1119,7 @@ impl Qwen3QkvProjection {
     fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         match self {
             Self::Fused(fused) => fused.forward(x),
+            Self::FusedQuantized(fused) => fused.forward(x),
             Self::Separate {
                 q_proj,
                 k_proj,
@@ -1011,8 +1176,53 @@ impl Qwen3FusedGateUpProjection {
     }
 }
 
+struct Qwen3FusedQuantizedGateUpProjection {
+    fused: Qwen3Projection,
+    intermediate_size: usize,
+}
+
+impl Qwen3FusedQuantizedGateUpProjection {
+    fn load_gguf(
+        loader: &GgufLoader,
+        cfg: &Qwen3Config,
+        device: &Device,
+        prefix: &str,
+    ) -> Result<Self> {
+        let names = [
+            format!("{prefix}.gate_proj.weight"),
+            format!("{prefix}.up_proj.weight"),
+        ];
+        let fused = Qwen3Projection::packed_quantized(
+            loader,
+            device,
+            &[names[0].as_str(), names[1].as_str()],
+        )?;
+        Ok(Self {
+            fused,
+            intermediate_size: cfg.intermediate_size,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
+        let gate_up = self.fused.forward(x)?;
+        let last_dim = gate_up.rank().saturating_sub(1);
+        let gate = gate_up.narrow(last_dim, 0, self.intermediate_size)?;
+        let up = gate_up.narrow(last_dim, self.intermediate_size, self.intermediate_size)?;
+        Ok((gate, up))
+    }
+
+    fn diagnostics(&self) -> Qwen3ProjectionDiagnostics {
+        Qwen3ProjectionDiagnostics {
+            dense_projection_count: 0,
+            dense_bias_projection_count: 0,
+            quantized_projection_count: 2,
+        }
+    }
+}
+
 enum Qwen3GateUpProjection {
     Fused(Qwen3FusedGateUpProjection),
+    FusedQuantized(Qwen3FusedQuantizedGateUpProjection),
     Separate {
         gate_proj: Qwen3Projection,
         up_proj: Qwen3Projection,
@@ -1041,9 +1251,20 @@ impl Qwen3GateUpProjection {
         Self::Separate { gate_proj, up_proj }
     }
 
+    fn new_quantized_grouped(
+        loader: &GgufLoader,
+        cfg: &Qwen3Config,
+        device: &Device,
+        prefix: &str,
+    ) -> Result<Self> {
+        Qwen3FusedQuantizedGateUpProjection::load_gguf(loader, cfg, device, prefix)
+            .map(Self::FusedQuantized)
+    }
+
     fn diagnostics(&self) -> Qwen3ProjectionDiagnostics {
         match self {
             Self::Fused(fused) => fused.diagnostics(),
+            Self::FusedQuantized(fused) => fused.diagnostics(),
             Self::Separate { gate_proj, up_proj } => {
                 gate_proj.diagnostics().add(up_proj.diagnostics())
             }
@@ -1053,6 +1274,7 @@ impl Qwen3GateUpProjection {
     fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
         match self {
             Self::Fused(fused) => fused.forward(x),
+            Self::FusedQuantized(fused) => fused.forward(x),
             Self::Separate { gate_proj, up_proj } => {
                 Ok((gate_proj.forward(x)?, up_proj.forward(x)?))
             }
@@ -1162,15 +1384,19 @@ impl Qwen3Attention {
         prefix: &str,
     ) -> Result<Self> {
         let head_dim = cfg.head_dim();
-        let q_proj =
-            Qwen3Projection::quantized(loader, device, &format!("{prefix}.q_proj.weight"))?;
-        let k_proj =
-            Qwen3Projection::quantized(loader, device, &format!("{prefix}.k_proj.weight"))?;
-        let v_proj =
-            Qwen3Projection::quantized(loader, device, &format!("{prefix}.v_proj.weight"))?;
+        let qkv_proj = if qwen3_quantized_projection_grouping_enabled(device, cfg) {
+            Qwen3QkvProjection::new_quantized_grouped(loader, cfg, device, prefix)?
+        } else {
+            let q_proj =
+                Qwen3Projection::quantized(loader, device, &format!("{prefix}.q_proj.weight"))?;
+            let k_proj =
+                Qwen3Projection::quantized(loader, device, &format!("{prefix}.k_proj.weight"))?;
+            let v_proj =
+                Qwen3Projection::quantized(loader, device, &format!("{prefix}.v_proj.weight"))?;
+            Qwen3QkvProjection::new_separate(q_proj, k_proj, v_proj)
+        };
         let o_proj =
             Qwen3Projection::quantized(loader, device, &format!("{prefix}.o_proj.weight"))?;
-        let qkv_proj = Qwen3QkvProjection::new_separate(q_proj, k_proj, v_proj);
 
         let q_norm = load_optional_rms_norm_from_gguf(
             loader,
@@ -1528,14 +1754,23 @@ impl Qwen3Mlp {
         })
     }
 
-    fn load_gguf(loader: &GgufLoader, device: &Device, prefix: &str) -> Result<Self> {
-        let gate_proj =
-            Qwen3Projection::quantized(loader, device, &format!("{prefix}.gate_proj.weight"))?;
-        let up_proj =
-            Qwen3Projection::quantized(loader, device, &format!("{prefix}.up_proj.weight"))?;
+    fn load_gguf(
+        cfg: &Qwen3Config,
+        loader: &GgufLoader,
+        device: &Device,
+        prefix: &str,
+    ) -> Result<Self> {
+        let gate_up_proj = if qwen3_quantized_projection_grouping_enabled(device, cfg) {
+            Qwen3GateUpProjection::new_quantized_grouped(loader, cfg, device, prefix)?
+        } else {
+            let gate_proj =
+                Qwen3Projection::quantized(loader, device, &format!("{prefix}.gate_proj.weight"))?;
+            let up_proj =
+                Qwen3Projection::quantized(loader, device, &format!("{prefix}.up_proj.weight"))?;
+            Qwen3GateUpProjection::new_separate(gate_proj, up_proj)
+        };
         let down_proj =
             Qwen3Projection::quantized(loader, device, &format!("{prefix}.down_proj.weight"))?;
-        let gate_up_proj = Qwen3GateUpProjection::new_separate(gate_proj, up_proj);
         Ok(Self {
             gate_up_proj,
             down_proj,
@@ -1610,7 +1845,7 @@ impl Qwen3Layer {
             )?,
             cfg.rms_norm_eps,
         );
-        let mlp = Qwen3Mlp::load_gguf(loader, device, &format!("{prefix}.mlp"))?;
+        let mlp = Qwen3Mlp::load_gguf(cfg, loader, device, &format!("{prefix}.mlp"))?;
         Ok(Self {
             input_layernorm,
             self_attn,
@@ -2833,6 +3068,77 @@ mod tests {
         assert!(!qwen3_metal_qmatmul_f32_input_policy(false, None));
         assert!(!qwen3_metal_qmatmul_f32_input_policy(false, Some(true)));
         assert!(!qwen3_metal_qmatmul_f32_input_policy(true, Some(false)));
+    }
+
+    #[test]
+    fn qwen3_quantized_projection_grouping_defaults_to_small_metal_models() {
+        assert!(qwen3_quantized_projection_grouping_policy(true, 1024, None));
+        assert!(!qwen3_quantized_projection_grouping_policy(
+            true, 2048, None
+        ));
+        assert!(!qwen3_quantized_projection_grouping_policy(
+            false, 1024, None
+        ));
+        assert!(qwen3_quantized_projection_grouping_policy(
+            true,
+            2048,
+            Some(true)
+        ));
+        assert!(!qwen3_quantized_projection_grouping_policy(
+            false,
+            1024,
+            Some(true)
+        ));
+        assert!(!qwen3_quantized_projection_grouping_policy(
+            true,
+            1024,
+            Some(false)
+        ));
+    }
+
+    #[test]
+    fn packed_qmatmul_matches_separate_q8_0_on_cpu() {
+        use candle_core::quantized::GgmlDType;
+
+        let device = Device::Cpu;
+        let w1_data = (0..64)
+            .map(|idx| (idx as f32 - 31.0) / 8.0)
+            .collect::<Vec<_>>();
+        let w2_data = (0..32)
+            .map(|idx| (15.0 - idx as f32) / 7.0)
+            .collect::<Vec<_>>();
+        let w1 = Tensor::from_vec(w1_data, (2, 32), &device).unwrap();
+        let w2 = Tensor::from_vec(w2_data, (1, 32), &device).unwrap();
+        let q1 = QTensor::quantize(&w1, GgmlDType::Q8_0).unwrap();
+        let q2 = QTensor::quantize(&w2, GgmlDType::Q8_0).unwrap();
+
+        let packed = packed_qmatmul_from_qtensors(&[q1, q2], &device).unwrap();
+        let x = Tensor::from_vec(
+            (0..32)
+                .map(|idx| (idx as f32 + 1.0) / 16.0)
+                .collect::<Vec<_>>(),
+            (1, 32),
+            &device,
+        )
+        .unwrap();
+
+        let packed_out = packed.forward(&x).unwrap();
+        let expected = Tensor::cat(
+            &[
+                &QMatMul::from_qtensor(QTensor::quantize(&w1, GgmlDType::Q8_0).unwrap())
+                    .unwrap()
+                    .forward(&x)
+                    .unwrap(),
+                &QMatMul::from_qtensor(QTensor::quantize(&w2, GgmlDType::Q8_0).unwrap())
+                    .unwrap()
+                    .forward(&x)
+                    .unwrap(),
+            ],
+            1,
+        )
+        .unwrap();
+
+        assert_tensor_close(&packed_out, &expected);
     }
 
     #[test]
