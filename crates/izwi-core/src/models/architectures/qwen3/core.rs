@@ -623,8 +623,34 @@ impl Qwen3Projection {
     }
 }
 
-fn qwen3_cuda_qmatmul_input_dtype(device_is_cuda: bool, activation_dtype: DType) -> Option<DType> {
-    (device_is_cuda && activation_dtype != DType::F32).then_some(DType::F32)
+fn qwen3_metal_qmatmul_f32_input_enabled(device: &Device) -> bool {
+    let override_enabled = std::env::var("IZWI_QWEN3_METAL_QMATMUL_F32_INPUT")
+        .ok()
+        .and_then(|raw| parse_env_bool(&raw));
+    qwen3_metal_qmatmul_f32_input_policy(device.is_metal(), override_enabled)
+}
+
+fn qwen3_metal_qmatmul_f32_input_policy(is_metal: bool, override_enabled: Option<bool>) -> bool {
+    is_metal && override_enabled.unwrap_or(true)
+}
+
+fn qwen3_qmatmul_input_dtype(device: &Device, activation_dtype: DType) -> Option<DType> {
+    qwen3_qmatmul_input_dtype_policy(
+        device.is_cuda(),
+        qwen3_metal_qmatmul_f32_input_enabled(device),
+        activation_dtype,
+    )
+}
+
+fn qwen3_qmatmul_input_dtype_policy(
+    is_cuda: bool,
+    metal_f32_input_enabled: bool,
+    activation_dtype: DType,
+) -> Option<DType> {
+    if activation_dtype == DType::F32 {
+        return None;
+    }
+    (is_cuda || metal_f32_input_enabled).then_some(DType::F32)
 }
 
 impl Module for Qwen3Projection {
@@ -633,8 +659,7 @@ impl Module for Qwen3Projection {
             Self::Dense(dense) => dense.linear.forward(x),
             Self::Quantized(qmatmul) => {
                 let activation_dtype = x.dtype();
-                let x = if let Some(dtype) =
-                    qwen3_cuda_qmatmul_input_dtype(x.device().is_cuda(), activation_dtype)
+                let x = if let Some(dtype) = qwen3_qmatmul_input_dtype(x.device(), activation_dtype)
                 {
                     x.to_dtype(dtype)?
                 } else {
@@ -2574,17 +2599,35 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_cuda_qmatmul_uses_f32_input_for_lower_precision_activations() {
+    fn qwen3_qmatmul_uses_f32_input_for_accelerated_lower_precision_activations() {
         assert_eq!(
-            qwen3_cuda_qmatmul_input_dtype(true, DType::BF16),
+            qwen3_qmatmul_input_dtype_policy(true, false, DType::BF16),
             Some(DType::F32)
         );
         assert_eq!(
-            qwen3_cuda_qmatmul_input_dtype(true, DType::F16),
+            qwen3_qmatmul_input_dtype_policy(true, false, DType::F16),
             Some(DType::F32)
         );
-        assert_eq!(qwen3_cuda_qmatmul_input_dtype(true, DType::F32), None);
-        assert_eq!(qwen3_cuda_qmatmul_input_dtype(false, DType::BF16), None);
+        assert_eq!(
+            qwen3_qmatmul_input_dtype_policy(true, false, DType::F32),
+            None
+        );
+        assert_eq!(
+            qwen3_qmatmul_input_dtype_policy(false, true, DType::F16),
+            Some(DType::F32)
+        );
+        assert_eq!(
+            qwen3_qmatmul_input_dtype_policy(false, false, DType::BF16),
+            None
+        );
+    }
+
+    #[test]
+    fn qwen3_metal_qmatmul_f32_input_defaults_on_for_metal_only() {
+        assert!(qwen3_metal_qmatmul_f32_input_policy(true, None));
+        assert!(!qwen3_metal_qmatmul_f32_input_policy(false, None));
+        assert!(!qwen3_metal_qmatmul_f32_input_policy(false, Some(true)));
+        assert!(!qwen3_metal_qmatmul_f32_input_policy(true, Some(false)));
     }
 
     #[test]
