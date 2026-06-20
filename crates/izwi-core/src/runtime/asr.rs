@@ -2,13 +2,13 @@
 
 use std::sync::Arc;
 
-use crate::catalog::{ModelFamily, parse_model_variant, resolve_asr_model_variant};
+use crate::catalog::{parse_model_variant, resolve_asr_model_variant, ModelFamily};
 use crate::engine::EngineCoreRequest;
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
 use crate::models::registry::{NativeAsrModel, NativeAsrRealtimeEvent, NativeAsrRealtimeState};
 use crate::runtime::adapters::CapabilityKind;
-use crate::runtime::audio_io::{base64_decode, decode_audio_bytes};
+use crate::runtime::audio_io::{base64_decode, decode_audio_bytes, wav_duration_seconds_fast};
 use crate::runtime::request::{AlignmentRuntimeRequest, AsrRuntimeRequest};
 use crate::runtime::service::RuntimeService;
 use crate::runtime::types::AsrTranscription;
@@ -53,11 +53,15 @@ fn granite_auto_asr_max_tokens(
         AsrAudioInput::Base64(audio_base64) => base64_decode(audio_base64)?,
         AsrAudioInput::Bytes(audio_bytes) => audio_bytes.to_vec(),
     };
-    let (samples, sample_rate) = decode_audio_bytes(&audio_bytes)?;
-    let audio_seconds = if sample_rate > 0 {
-        samples.len() as f32 / sample_rate as f32
+    let audio_seconds = if let Some(duration) = wav_duration_seconds_fast(&audio_bytes) {
+        duration
     } else {
-        0.0
+        let (samples, sample_rate) = decode_audio_bytes(&audio_bytes)?;
+        if sample_rate > 0 {
+            samples.len() as f32 / sample_rate as f32
+        } else {
+            0.0
+        }
     };
     Ok(Some(granite_auto_asr_max_tokens_for_duration(
         audio_seconds,
@@ -1074,6 +1078,34 @@ mod tests {
         assert_eq!(granite_auto_asr_max_tokens_for_duration(60.0), 204);
         assert_eq!(granite_auto_asr_max_tokens_for_duration(600.0), 2048);
         assert_eq!(granite_auto_asr_max_tokens_for_duration(1200.0), 2048);
+    }
+
+    #[test]
+    fn granite_auto_asr_budget_reads_wav_duration_without_full_decode() {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut wav_bytes = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut wav_bytes);
+            let mut writer = hound::WavWriter::new(cursor, spec).expect("writer");
+            for _ in 0..960_000 {
+                writer.write_sample(0i16).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+
+        let budget = granite_auto_asr_max_tokens(
+            ModelVariant::GraniteSpeech412BPlus,
+            AsrAudioInput::Bytes(&wav_bytes),
+        )
+        .expect("auto budget")
+        .expect("granite budget");
+
+        assert_eq!(budget, 204);
     }
 
     #[tokio::test]

@@ -68,6 +68,66 @@ fn is_riff_wave(bytes: &[u8]) -> bool {
     bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE"
 }
 
+pub(crate) fn wav_duration_seconds_fast(wav_bytes: &[u8]) -> Option<f32> {
+    if !is_riff_wave(wav_bytes) {
+        return None;
+    }
+
+    let mut offset = 12usize;
+    let mut sample_rate = None;
+    let mut block_align = None;
+    let mut data_len = None;
+
+    while offset.saturating_add(8) <= wav_bytes.len() {
+        let chunk_id = &wav_bytes[offset..offset + 4];
+        let chunk_size = u32::from_le_bytes([
+            wav_bytes[offset + 4],
+            wav_bytes[offset + 5],
+            wav_bytes[offset + 6],
+            wav_bytes[offset + 7],
+        ]) as usize;
+        let chunk_start = offset + 8;
+        let Some(chunk_end) = chunk_start.checked_add(chunk_size) else {
+            break;
+        };
+        if chunk_end > wav_bytes.len() {
+            break;
+        }
+
+        match chunk_id {
+            b"fmt " if chunk_size >= 16 => {
+                sample_rate = Some(u32::from_le_bytes([
+                    wav_bytes[chunk_start + 4],
+                    wav_bytes[chunk_start + 5],
+                    wav_bytes[chunk_start + 6],
+                    wav_bytes[chunk_start + 7],
+                ]));
+                block_align = Some(u16::from_le_bytes([
+                    wav_bytes[chunk_start + 12],
+                    wav_bytes[chunk_start + 13],
+                ]));
+            }
+            b"data" => data_len = Some(chunk_size),
+            _ => {}
+        }
+
+        let padded = chunk_end + (chunk_size & 1);
+        if padded <= offset {
+            break;
+        }
+        offset = padded;
+    }
+
+    let sample_rate = sample_rate?;
+    let block_align = usize::from(block_align?);
+    let data_len = data_len?;
+    if sample_rate == 0 || block_align == 0 {
+        return None;
+    }
+    let frames = data_len / block_align;
+    Some(frames as f32 / sample_rate as f32)
+}
+
 fn decode_wav_bytes_fast(wav_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
     decode_wav_pcm16_mono_fast(wav_bytes).or_else(|_| decode_wav_bytes_hound(wav_bytes))
 }
@@ -534,5 +594,29 @@ mod tests {
             samples[0]
         );
         assert!(samples[1].abs() < 0.02, "second sample {}", samples[1]);
+    }
+
+    #[test]
+    fn wav_duration_seconds_fast_reads_data_duration_without_decoding() {
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+
+        let mut wav_bytes = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut wav_bytes);
+            let mut writer = hound::WavWriter::new(cursor, spec).expect("writer");
+            for _ in 0..32_000 {
+                writer.write_sample(0i16).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+
+        let duration = wav_duration_seconds_fast(&wav_bytes).expect("wav duration");
+
+        assert!((duration - 1.0).abs() < 1e-6, "duration {duration}");
     }
 }
