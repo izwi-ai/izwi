@@ -52,8 +52,14 @@ impl Default for MelConfig {
 pub struct MelSpectrogram {
     config: MelConfig,
     mel_filterbank_flat: Vec<f32>,
+    mel_filterbank_spans: Vec<MelFilterSpan>,
     window: Vec<f32>,
     fft: Arc<dyn Fft<f32>>,
+}
+
+struct MelFilterSpan {
+    start: usize,
+    weights: Vec<f32>,
 }
 
 impl MelSpectrogram {
@@ -72,6 +78,7 @@ impl MelSpectrogram {
             .iter()
             .flat_map(|row| row.iter().copied())
             .collect();
+        let mel_filterbank_spans = Self::sparse_mel_filterbank(&mel_filterbank);
         let window =
             Self::hann_window_padded(config.n_fft, config.win_length.unwrap_or(config.n_fft));
         let mut planner = FftPlanner::new();
@@ -80,6 +87,7 @@ impl MelSpectrogram {
         Ok(Self {
             config,
             mel_filterbank_flat,
+            mel_filterbank_spans,
             window,
             fft,
         })
@@ -117,10 +125,10 @@ impl MelSpectrogram {
 
             let mut mel_frame = vec![0.0f32; self.config.n_mels];
             for (mel_idx, value) in mel_frame.iter_mut().enumerate() {
-                let filter = &self.mel_filterbank_flat[mel_idx * n_freqs..(mel_idx + 1) * n_freqs];
+                let filter = &self.mel_filterbank_spans[mel_idx];
                 let mut sum = 0.0f32;
-                for freq_idx in 0..n_freqs {
-                    sum += power[freq_idx] * filter[freq_idx];
+                for (offset, &weight) in filter.weights.iter().enumerate() {
+                    sum += power[filter.start + offset] * weight;
                 }
                 *value = sum.max(1e-10).log10();
             }
@@ -322,6 +330,24 @@ impl MelSpectrogram {
         }
 
         mel_filters
+    }
+
+    fn sparse_mel_filterbank(mel_filterbank: &[Vec<f32>]) -> Vec<MelFilterSpan> {
+        mel_filterbank
+            .iter()
+            .map(|filter| {
+                let start = filter.iter().position(|&value| value != 0.0).unwrap_or(0);
+                let end = filter
+                    .iter()
+                    .rposition(|&value| value != 0.0)
+                    .map(|idx| idx + 1)
+                    .unwrap_or(start);
+                MelFilterSpan {
+                    start,
+                    weights: filter[start..end].to_vec(),
+                }
+            })
+            .collect()
     }
 
     fn reflect_pad_center(&self, waveform: &[f32]) -> Vec<f32> {
