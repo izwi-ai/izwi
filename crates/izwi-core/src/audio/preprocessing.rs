@@ -1,7 +1,8 @@
 //! Audio preprocessing utilities for ASR.
 
 use rustfft::num_complex::Complex;
-use rustfft::FftPlanner;
+use rustfft::{Fft, FftPlanner};
+use std::sync::Arc;
 
 use crate::error::Result;
 
@@ -50,14 +51,16 @@ impl Default for MelConfig {
 
 pub struct MelSpectrogram {
     config: MelConfig,
-    mel_filterbank: Vec<Vec<f32>>,
+    mel_filterbank_flat: Vec<f32>,
     window: Vec<f32>,
+    fft: Arc<dyn Fft<f32>>,
 }
 
 impl MelSpectrogram {
     pub fn new(config: MelConfig) -> Result<Self> {
+        let n_freqs = config.n_fft / 2 + 1;
         let mel_filterbank = Self::create_mel_filterbank(
-            config.n_fft / 2 + 1,
+            n_freqs,
             config.n_mels,
             config.sample_rate as f32,
             config.f_min,
@@ -65,13 +68,20 @@ impl MelSpectrogram {
             config.mel_scale,
             config.mel_norm,
         );
+        let mel_filterbank_flat = mel_filterbank
+            .iter()
+            .flat_map(|row| row.iter().copied())
+            .collect();
         let window =
             Self::hann_window_padded(config.n_fft, config.win_length.unwrap_or(config.n_fft));
+        let mut planner = FftPlanner::new();
+        let fft = planner.plan_fft_forward(config.n_fft);
 
         Ok(Self {
             config,
-            mel_filterbank,
+            mel_filterbank_flat,
             window,
+            fft,
         })
     }
 
@@ -80,10 +90,43 @@ impl MelSpectrogram {
     }
 
     pub fn compute(&self, waveform: &[f32]) -> Result<Vec<Vec<f32>>> {
-        let stft = self.stft(waveform)?;
-        let power_spec = self.power_spectrogram(&stft);
-        let mel_spec = self.apply_mel_filterbank(&power_spec);
-        let mut log_mel = self.log_mel(&mel_spec);
+        let padded = self.reflect_pad_center(waveform);
+        let num_frames = if padded.len() >= self.config.n_fft {
+            (padded.len() - self.config.n_fft) / self.config.hop_length + 1
+        } else {
+            1
+        };
+        let n_freqs = self.config.n_fft / 2 + 1;
+        let mut frame = vec![Complex::new(0.0, 0.0); self.config.n_fft];
+        let mut power = vec![0.0f32; n_freqs];
+        let mut log_mel = Vec::with_capacity(num_frames);
+
+        for frame_idx in 0..num_frames {
+            frame.fill(Complex::new(0.0, 0.0));
+
+            let start = frame_idx * self.config.hop_length;
+            let end = (start + self.config.n_fft).min(padded.len());
+            for sample_idx in 0..(end - start) {
+                frame[sample_idx].re = padded[start + sample_idx] * self.window[sample_idx];
+            }
+
+            self.fft.process(&mut frame);
+            for freq_idx in 0..n_freqs {
+                power[freq_idx] = frame[freq_idx].norm_sqr();
+            }
+
+            let mut mel_frame = vec![0.0f32; self.config.n_mels];
+            for (mel_idx, value) in mel_frame.iter_mut().enumerate() {
+                let filter = &self.mel_filterbank_flat[mel_idx * n_freqs..(mel_idx + 1) * n_freqs];
+                let mut sum = 0.0f32;
+                for freq_idx in 0..n_freqs {
+                    sum += power[freq_idx] * filter[freq_idx];
+                }
+                *value = sum.max(1e-10).log10();
+            }
+
+            log_mel.push(mel_frame);
+        }
 
         // NOTE: The retained Qwen forced-aligner path may need all frames including the last one
         // Previously we did: if !log_mel.is_empty() { log_mel.pop(); }
@@ -95,7 +138,22 @@ impl MelSpectrogram {
         Ok(log_mel)
     }
 
-    fn stft(&self, waveform: &[f32]) -> Result<Vec<Vec<Complex<f32>>>> {
+    #[cfg(test)]
+    fn compute_reference(&self, waveform: &[f32]) -> Result<Vec<Vec<f32>>> {
+        let stft = self.stft_reference(waveform)?;
+        let power_spec = self.power_spectrogram_reference(&stft);
+        let mel_spec = self.apply_mel_filterbank_reference(&power_spec);
+        let mut log_mel = self.log_mel_reference(&mel_spec);
+
+        if self.config.normalize {
+            Self::whisper_normalize(&mut log_mel);
+        }
+
+        Ok(log_mel)
+    }
+
+    #[cfg(test)]
+    fn stft_reference(&self, waveform: &[f32]) -> Result<Vec<Vec<Complex<f32>>>> {
         let mut planner = FftPlanner::new();
         let fft = planner.plan_fft_forward(self.config.n_fft);
 
@@ -126,7 +184,8 @@ impl MelSpectrogram {
         Ok(result)
     }
 
-    fn power_spectrogram(&self, stft: &[Vec<Complex<f32>>]) -> Vec<Vec<f32>> {
+    #[cfg(test)]
+    fn power_spectrogram_reference(&self, stft: &[Vec<Complex<f32>>]) -> Vec<Vec<f32>> {
         stft.iter()
             .map(|frame| {
                 frame[..self.config.n_fft / 2 + 1]
@@ -137,19 +196,22 @@ impl MelSpectrogram {
             .collect()
     }
 
-    fn apply_mel_filterbank(&self, power_spec: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    #[cfg(test)]
+    fn apply_mel_filterbank_reference(&self, power_spec: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        let n_freqs = self.config.n_fft / 2 + 1;
         power_spec
             .iter()
             .map(|frame| {
-                self.mel_filterbank
-                    .iter()
+                self.mel_filterbank_flat
+                    .chunks_exact(n_freqs)
                     .map(|mel_filter| frame.iter().zip(mel_filter).map(|(&p, &m)| p * m).sum())
                     .collect()
             })
             .collect()
     }
 
-    fn log_mel(&self, mel_spec: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    #[cfg(test)]
+    fn log_mel_reference(&self, mel_spec: &[Vec<f32>]) -> Vec<Vec<f32>> {
         mel_spec
             .iter()
             .map(|frame| frame.iter().map(|&x| (x.max(1e-10)).log10()).collect())
@@ -369,5 +431,50 @@ mod tests {
         let htk_sum: f32 = htk_no_norm.iter().flatten().copied().sum();
         assert!(htk_sum > slaney_sum);
         assert!((htk_sum - slaney_sum).abs() > 1.0);
+    }
+
+    #[test]
+    fn mel_compute_matches_reference_pipeline() {
+        let mel = MelSpectrogram::new(MelConfig {
+            n_fft: 400,
+            hop_length: 160,
+            n_mels: 80,
+            ..MelConfig::default()
+        })
+        .expect("mel");
+        let waveform = (0..4096)
+            .map(|idx| {
+                let t = idx as f32;
+                (t * 0.011).sin() * 0.45 + (t * 0.047).cos() * 0.15
+            })
+            .collect::<Vec<_>>();
+
+        let optimized = mel.compute(&waveform).expect("optimized mel");
+        let reference = mel.compute_reference(&waveform).expect("reference mel");
+        assert_eq!(optimized.len(), reference.len());
+        for (frame_idx, (lhs, rhs)) in optimized.iter().zip(reference.iter()).enumerate() {
+            assert_eq!(
+                lhs.len(),
+                rhs.len(),
+                "mel bins mismatch at frame {frame_idx}"
+            );
+            let max_diff = lhs
+                .iter()
+                .zip(rhs.iter())
+                .map(|(lhs, rhs)| (lhs - rhs).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff <= 1e-6,
+                "max diff {max_diff} exceeded tolerance at frame {frame_idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn mel_compute_matches_reference_for_empty_waveform() {
+        let mel = MelSpectrogram::new(MelConfig::default()).expect("mel");
+        let optimized = mel.compute(&[]).expect("optimized mel");
+        let reference = mel.compute_reference(&[]).expect("reference mel");
+        assert_eq!(optimized, reference);
     }
 }
