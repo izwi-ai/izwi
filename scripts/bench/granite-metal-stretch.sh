@@ -224,6 +224,9 @@ for index, sample in enumerate(samples, start=1):
         "dense_head_decode_enabled",
         "dense_decode_preallocated",
         "audio_embedding_cache_hit",
+        "qkv_projection_fused",
+        "gate_up_projection_fused",
+        "residual_branches_prescaled",
     ):
         if execution.get(key) is not True:
             fail(f"sample {index} expected execution.{key}=true")
