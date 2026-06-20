@@ -210,6 +210,8 @@ struct AsrExecutionDiagnostics {
     kv_page_size: Option<u64>,
     cuda_dense_decode_cache: Option<bool>,
     dense_head_decode_enabled: Option<bool>,
+    qkv_projection_fused: Option<bool>,
+    gate_up_projection_fused: Option<bool>,
     dense_decode_max_tokens: Option<u64>,
     gguf_qmatmul_text_enabled: Option<bool>,
     text_projection_quantized: Option<bool>,
@@ -2712,6 +2714,12 @@ fn asr_execution_from_single_diagnostics(
             .get("dense_head_decode_enabled")
             .or_else(|| execution.get("dense_decode_enabled"))
             .and_then(|value| value.as_bool()),
+        qkv_projection_fused: execution
+            .get("qkv_projection_fused")
+            .and_then(|value| value.as_bool()),
+        gate_up_projection_fused: execution
+            .get("gate_up_projection_fused")
+            .and_then(|value| value.as_bool()),
         dense_decode_max_tokens: execution
             .get("dense_decode_max_tokens")
             .and_then(|value| value.as_u64()),
@@ -2760,6 +2768,8 @@ fn asr_execution_from_single_diagnostics(
         || sample.kv_page_size.is_some()
         || sample.cuda_dense_decode_cache.is_some()
         || sample.dense_head_decode_enabled.is_some()
+        || sample.qkv_projection_fused.is_some()
+        || sample.gate_up_projection_fused.is_some()
         || sample.dense_decode_max_tokens.is_some()
         || sample.gguf_qmatmul_text_enabled.is_some()
         || sample.text_projection_quantized.is_some()
@@ -3071,6 +3081,8 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     let mut kv_page_size = Vec::new();
     let mut cuda_dense_decode_cache = Vec::new();
     let mut dense_head_decode_enabled = Vec::new();
+    let mut qkv_projection_fused = Vec::new();
+    let mut gate_up_projection_fused = Vec::new();
     let mut dense_decode_max_tokens = Vec::new();
     let mut gguf_qmatmul_text_enabled = Vec::new();
     let mut text_projection_quantized = Vec::new();
@@ -3194,6 +3206,12 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
             if let Some(value) = execution.dense_head_decode_enabled {
                 dense_head_decode_enabled.push(value);
             }
+            if let Some(value) = execution.qkv_projection_fused {
+                qkv_projection_fused.push(value);
+            }
+            if let Some(value) = execution.gate_up_projection_fused {
+                gate_up_projection_fused.push(value);
+            }
             if let Some(value) = execution.dense_decode_max_tokens {
                 dense_decode_max_tokens.push(value);
             }
@@ -3311,6 +3329,8 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         && kv_page_size.is_empty()
         && cuda_dense_decode_cache.is_empty()
         && dense_head_decode_enabled.is_empty()
+        && qkv_projection_fused.is_empty()
+        && gate_up_projection_fused.is_empty()
         && dense_decode_max_tokens.is_empty()
         && gguf_qmatmul_text_enabled.is_empty()
         && text_projection_quantized.is_empty()
@@ -3379,6 +3399,8 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     summarize_count("kv_page", &kv_page_size);
     summarize_bool_count("cuda_dense", &cuda_dense_decode_cache);
     summarize_bool_count("dense_head", &dense_head_decode_enabled);
+    summarize_bool_count("qkv_fused", &qkv_projection_fused);
+    summarize_bool_count("gate_up_fused", &gate_up_projection_fused);
     summarize_count("dense_max", &dense_decode_max_tokens);
     summarize_bool_count("gguf_qmatmul", &gguf_qmatmul_text_enabled);
     summarize_bool_count("qproj_quant", &text_projection_quantized);
@@ -3948,6 +3970,8 @@ mod tests {
             "execution": {
                 "cuda_dense_decode_cache": true,
                 "dense_head_decode_enabled": true,
+                "qkv_projection_fused": true,
+                "gate_up_projection_fused": true,
                 "dense_decode_max_tokens": 384,
                 "audio_embedding_cache_hit": true,
                 "cuda_device_argmax": true,
@@ -3981,6 +4005,8 @@ mod tests {
             .expect("execution diagnostics should be extracted");
         assert_eq!(execution.cuda_dense_decode_cache, Some(true));
         assert_eq!(execution.dense_head_decode_enabled, Some(true));
+        assert_eq!(execution.qkv_projection_fused, Some(true));
+        assert_eq!(execution.gate_up_projection_fused, Some(true));
         assert_eq!(execution.dense_decode_max_tokens, Some(384));
         assert_eq!(execution.audio_embedding_cache_hit, Some(true));
         assert_eq!(execution.cuda_device_argmax, Some(true));

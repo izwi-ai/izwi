@@ -645,6 +645,8 @@ fn granite_diagnostics(
             "dense_decode_cache": generation.stats.dense_decode_cache_enabled,
             "dense_decode_cache_configured": generation.stats.dense_decode_cache_enabled,
             "dense_head_decode_enabled": generation.stats.dense_head_decode_enabled,
+            "qkv_projection_fused": generation.stats.qkv_projection_fused,
+            "gate_up_projection_fused": generation.stats.gate_up_projection_fused,
             "cuda_dense_decode_cache": generation.stats.dense_decode_cache_enabled,
             "cuda_device_argmax": generation.stats.cuda_device_argmax,
             "residual_branches_prescaled": generation.stats.residual_branches_prescaled,
@@ -1055,6 +1057,8 @@ mod tests {
                 stop_token: Some(100_257),
                 dense_decode_cache_enabled: true,
                 dense_head_decode_enabled: false,
+                qkv_projection_fused: true,
+                gate_up_projection_fused: true,
                 cuda_device_argmax: false,
                 residual_branches_prescaled: true,
                 dense_decode_preallocated: true,
@@ -1160,13 +1164,18 @@ mod tests {
             true
         );
         assert_eq!(diagnostics["execution"]["dense_head_decode_enabled"], false);
+        assert_eq!(diagnostics["execution"]["qkv_projection_fused"], true);
+        assert_eq!(diagnostics["execution"]["gate_up_projection_fused"], true);
         assert_eq!(diagnostics["execution"]["cuda_device_argmax"], false);
         assert_eq!(
             diagnostics["execution"]["residual_branches_prescaled"],
             true
         );
         assert_eq!(diagnostics["execution"]["dense_decode_preallocated"], true);
-        assert_eq!(diagnostics["execution"]["dense_decode_initial_capacity"], 512);
+        assert_eq!(
+            diagnostics["execution"]["dense_decode_initial_capacity"],
+            512
+        );
         assert_eq!(diagnostics["execution"]["deferred_stop_check"], true);
         assert_eq!(diagnostics["execution"]["chunked_stop_check"], false);
         assert_eq!(diagnostics["execution"]["stop_check_interval"], 1);

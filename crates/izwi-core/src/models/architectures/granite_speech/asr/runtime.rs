@@ -36,6 +36,8 @@ pub struct GraniteSpeechGenerationStats {
     pub stop_token: Option<u32>,
     pub dense_decode_cache_enabled: bool,
     pub dense_head_decode_enabled: bool,
+    pub qkv_projection_fused: bool,
+    pub gate_up_projection_fused: bool,
     pub cuda_device_argmax: bool,
     pub residual_branches_prescaled: bool,
     pub dense_decode_preallocated: bool,
@@ -213,11 +215,15 @@ fn granite_projection_fusion_enabled(device: &Device) -> bool {
     let override_enabled = std::env::var("IZWI_GRANITE_PROJECTION_FUSION")
         .ok()
         .and_then(|raw| parse_env_bool(&raw));
-    granite_projection_fusion_policy(device.is_cuda(), override_enabled)
+    granite_projection_fusion_policy(device.is_metal(), device.is_cuda(), override_enabled)
 }
 
-fn granite_projection_fusion_policy(is_cuda: bool, override_enabled: Option<bool>) -> bool {
-    override_enabled.unwrap_or(is_cuda)
+fn granite_projection_fusion_policy(
+    is_metal: bool,
+    is_cuda: bool,
+    override_enabled: Option<bool>,
+) -> bool {
+    override_enabled.unwrap_or(is_metal || is_cuda)
 }
 
 fn granite_gate_up_projection_fusion_enabled(device: &Device) -> bool {
@@ -229,11 +235,11 @@ fn granite_gate_up_projection_fusion_enabled(device: &Device) -> bool {
 }
 
 fn granite_gate_up_projection_fusion_policy(
-    _is_metal: bool,
+    is_metal: bool,
     is_cuda: bool,
     override_enabled: Option<bool>,
 ) -> bool {
-    override_enabled.unwrap_or(is_cuda)
+    override_enabled.unwrap_or(is_metal || is_cuda)
 }
 
 fn granite_rope_kernel_enabled(device: &Device, dtype: DType, head_dim: usize) -> bool {
@@ -282,11 +288,14 @@ fn granite_native_greedy_logits_enabled() -> bool {
 }
 
 fn granite_mlp_try_fused_silu_mul(device: &Device) -> bool {
-    granite_mlp_fused_silu_mul_policy(device.is_metal())
+    let override_enabled = std::env::var("IZWI_GRANITE_FUSED_SILU_MUL")
+        .ok()
+        .and_then(|raw| parse_env_bool(&raw));
+    granite_mlp_fused_silu_mul_policy(device.is_metal(), override_enabled)
 }
 
-fn granite_mlp_fused_silu_mul_policy(is_metal: bool) -> bool {
-    !is_metal
+fn granite_mlp_fused_silu_mul_policy(_is_metal: bool, override_enabled: Option<bool>) -> bool {
+    override_enabled.unwrap_or(true)
 }
 
 fn granite_residual_prescale_enabled(device: &Device) -> bool {
@@ -296,8 +305,8 @@ fn granite_residual_prescale_enabled(device: &Device) -> bool {
     granite_residual_prescale_policy(device.is_metal(), override_enabled)
 }
 
-fn granite_residual_prescale_policy(_is_metal: bool, override_enabled: Option<bool>) -> bool {
-    override_enabled.unwrap_or(false)
+fn granite_residual_prescale_policy(is_metal: bool, override_enabled: Option<bool>) -> bool {
+    override_enabled.unwrap_or(is_metal)
 }
 
 fn granite_dense_decode_preallocate_enabled(device: &Device) -> bool {
@@ -307,10 +316,7 @@ fn granite_dense_decode_preallocate_enabled(device: &Device) -> bool {
     granite_dense_decode_preallocate_policy(device.is_metal(), override_enabled)
 }
 
-fn granite_dense_decode_preallocate_policy(
-    is_metal: bool,
-    override_enabled: Option<bool>,
-) -> bool {
+fn granite_dense_decode_preallocate_policy(is_metal: bool, override_enabled: Option<bool>) -> bool {
     override_enabled.unwrap_or(is_metal)
 }
 
@@ -747,6 +753,8 @@ impl GraniteSpeechRuntime {
                 stop_token,
                 dense_decode_cache_enabled,
                 dense_head_decode_enabled,
+                qkv_projection_fused: self.text_model.qkv_projection_fused(),
+                gate_up_projection_fused: self.text_model.gate_up_projection_fused(),
                 cuda_device_argmax,
                 residual_branches_prescaled: self.text_model.residual_branches_prescaled(),
                 dense_decode_preallocated: dense_decode_initial_capacity > 0,
@@ -1543,6 +1551,20 @@ impl GraniteLanguageModel {
         self.residual_branches_prescaled
     }
 
+    fn qkv_projection_fused(&self) -> bool {
+        self.layers
+            .first()
+            .map(|layer| layer.qkv_projection_fused())
+            .unwrap_or(false)
+    }
+
+    fn gate_up_projection_fused(&self) -> bool {
+        self.layers
+            .first()
+            .map(|layer| layer.gate_up_projection_fused())
+            .unwrap_or(false)
+    }
+
     fn embeddings(&self, input_ids: &[u32]) -> Result<Tensor> {
         let ids = input_ids.iter().map(|id| *id as i64).collect::<Vec<_>>();
         let ids = Tensor::from_vec(ids, (1, input_ids.len()), &self.device)?;
@@ -1782,6 +1804,14 @@ impl GraniteDecoderLayer {
             (branch * self.residual_multiplier as f64).map_err(Error::from)
         }
     }
+
+    fn qkv_projection_fused(&self) -> bool {
+        self.self_attn.qkv_projection_fused()
+    }
+
+    fn gate_up_projection_fused(&self) -> bool {
+        self.mlp.gate_up_projection_fused()
+    }
 }
 
 struct GraniteTextFusedQkvProjection {
@@ -1872,6 +1902,10 @@ impl GraniteTextQkvProjection {
                 v_proj,
             } => Ok((q_proj.forward(x)?, k_proj.forward(x)?, v_proj.forward(x)?)),
         }
+    }
+
+    fn is_fused(&self) -> bool {
+        matches!(self, Self::Fused(_))
     }
 }
 
@@ -2050,6 +2084,10 @@ impl GraniteTextAttention {
             profile.output += profile_elapsed(output_start);
         }
         Ok(out)
+    }
+
+    fn qkv_projection_fused(&self) -> bool {
+        self.qkv_proj.is_fused()
     }
 }
 
@@ -2328,6 +2366,10 @@ impl GraniteTextGateUpProjection {
             }
         }
     }
+
+    fn is_fused(&self) -> bool {
+        matches!(self, Self::Fused(_))
+    }
 }
 
 struct GraniteTextMlp {
@@ -2384,6 +2426,10 @@ impl GraniteTextMlp {
             profile.down += profile_elapsed(down_start);
         }
         Ok(out)
+    }
+
+    fn gate_up_projection_fused(&self) -> bool {
+        self.gate_up_proj.is_fused()
     }
 }
 
@@ -2505,16 +2551,18 @@ mod tests {
     }
 
     #[test]
-    fn granite_projection_fusion_defaults_to_cuda_only() {
-        assert!(granite_projection_fusion_policy(true, None));
-        assert!(!granite_projection_fusion_policy(false, None));
-        assert!(granite_projection_fusion_policy(false, Some(true)));
-        assert!(!granite_projection_fusion_policy(true, Some(false)));
+    fn granite_projection_fusion_defaults_to_accelerated_backends() {
+        assert!(granite_projection_fusion_policy(true, false, None));
+        assert!(granite_projection_fusion_policy(false, true, None));
+        assert!(granite_projection_fusion_policy(true, true, None));
+        assert!(!granite_projection_fusion_policy(false, false, None));
+        assert!(granite_projection_fusion_policy(false, false, Some(true)));
+        assert!(!granite_projection_fusion_policy(true, true, Some(false)));
     }
 
     #[test]
-    fn granite_gate_up_projection_fusion_defaults_to_cuda_only() {
-        assert!(!granite_gate_up_projection_fusion_policy(true, false, None));
+    fn granite_gate_up_projection_fusion_defaults_to_accelerated_backends() {
+        assert!(granite_gate_up_projection_fusion_policy(true, false, None));
         assert!(granite_gate_up_projection_fusion_policy(false, true, None));
         assert!(!granite_gate_up_projection_fusion_policy(
             false, false, None
@@ -2532,14 +2580,16 @@ mod tests {
     }
 
     #[test]
-    fn granite_mlp_fused_silu_mul_skips_metal_wrapper() {
-        assert!(!granite_mlp_fused_silu_mul_policy(true));
-        assert!(granite_mlp_fused_silu_mul_policy(false));
+    fn granite_mlp_fused_silu_mul_defaults_on_with_override() {
+        assert!(granite_mlp_fused_silu_mul_policy(true, None));
+        assert!(granite_mlp_fused_silu_mul_policy(false, None));
+        assert!(granite_mlp_fused_silu_mul_policy(true, Some(true)));
+        assert!(!granite_mlp_fused_silu_mul_policy(true, Some(false)));
     }
 
     #[test]
-    fn granite_residual_prescale_policy_is_opt_in() {
-        assert!(!granite_residual_prescale_policy(true, None));
+    fn granite_residual_prescale_policy_defaults_to_metal_only() {
+        assert!(granite_residual_prescale_policy(true, None));
         assert!(!granite_residual_prescale_policy(false, None));
         assert!(granite_residual_prescale_policy(false, Some(true)));
         assert!(granite_residual_prescale_policy(true, Some(true)));
@@ -2651,10 +2701,9 @@ mod tests {
 
         let q_manual = apply_rotary_emb(&q, &cos, &sin).expect("manual q");
         let k_manual = apply_rotary_emb(&k, &cos, &sin).expect("manual k");
-        let (q_kernel, k_kernel) =
-            try_apply_granite_rope_pair_bhtd(&q, &k, &cos, &sin)
-                .expect("kernel result")
-                .expect("kernel output");
+        let (q_kernel, k_kernel) = try_apply_granite_rope_pair_bhtd(&q, &k, &cos, &sin)
+            .expect("kernel result")
+            .expect("kernel output");
 
         assert_tensor_close(&q_manual, &q_kernel);
         assert_tensor_close(&k_manual, &k_kernel);
