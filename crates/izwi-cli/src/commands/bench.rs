@@ -129,6 +129,8 @@ struct TtsBenchReference {
 #[derive(Debug, Clone, Deserialize, Default)]
 struct AsrBenchResponse {
     #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
     duration: Option<f64>,
     #[serde(default)]
     processing_time_ms: Option<f64>,
@@ -359,6 +361,10 @@ struct BenchmarkSample {
     tokens_generated: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     asr_execution: Option<AsrExecutionDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    asr_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    asr_diagnostics: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1522,6 +1528,8 @@ async fn bench_chat(
                 rtf: None,
                 tokens_generated: None,
                 asr_execution: None,
+                asr_text: None,
+                asr_diagnostics: None,
             })
             .collect(),
         telemetry: RuntimeTelemetryReport {
@@ -1764,6 +1772,8 @@ async fn bench_tts(
                 rtf: sample.rtf,
                 tokens_generated: sample.tokens_generated,
                 asr_execution: None,
+                asr_text: None,
+                asr_diagnostics: None,
             })
             .collect(),
         telemetry: RuntimeTelemetryReport {
@@ -2031,6 +2041,8 @@ async fn bench_asr(
                     .izwi_asr_diagnostics
                     .as_ref()
                     .and_then(asr_execution_from_diagnostics),
+                asr_text: sample.response.text.clone(),
+                asr_diagnostics: sample.response.izwi_asr_diagnostics.clone(),
             })
             .collect(),
         telemetry: RuntimeTelemetryReport {
@@ -4104,6 +4116,40 @@ mod tests {
         assert_eq!(samples[1].audio_encode, Some(820.0));
         assert_eq!(samples[1].prefill, Some(1080.0));
         assert_eq!(samples[1].generated_tokens, Some(93));
+    }
+
+    #[test]
+    fn benchmark_sample_serializes_raw_asr_diagnostics_when_present() {
+        let diagnostics = serde_json::json!({
+            "model_family": "granite_speech_asr",
+            "execution": {
+                "device_kind": "Metal",
+                "dense_head_decode_enabled": true
+            }
+        });
+        let sample = BenchmarkSample {
+            index: 1,
+            latency_ms: Some(123.0),
+            ttft_ms: None,
+            end_to_end_ms: Some(123.0),
+            completion_tps: None,
+            tokens_per_second: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            server_generation_ms: None,
+            server_processing_ms: Some(120.0),
+            audio_duration_secs: Some(10.0),
+            rtf: Some(0.012),
+            tokens_generated: None,
+            asr_execution: None,
+            asr_text: Some("hello granite".to_string()),
+            asr_diagnostics: Some(diagnostics.clone()),
+        };
+
+        let serialized = serde_json::to_value(sample).expect("sample should serialize");
+
+        assert_eq!(serialized["asr_text"], "hello granite");
+        assert_eq!(serialized["asr_diagnostics"], diagnostics);
     }
 
     #[tokio::test]
