@@ -11,7 +11,7 @@ use std::sync::{Mutex, OnceLock};
 
 #[cfg(feature = "metal")]
 use candle_core::{
-    backend::BackendStorage, bail, CpuStorage, CustomOp2, Layout, MetalStorage,
+    backend::BackendStorage, bail, CpuStorage, CustomOp2, CustomOp3, Layout, MetalStorage,
     Result as CandleResult, Shape,
 };
 use candle_core::{DType, Tensor};
@@ -54,6 +54,94 @@ kernel void izwi_silu_mul_f16(
     float x = float(gate[gid]);
     float y = float(up[gid]);
     output[gid] = half((x / (1.0f + exp(-x))) * y);
+}
+
+kernel void izwi_qk_rms_norm_f32(
+    device const float* q [[buffer(0)]],
+    device const float* k [[buffer(1)]],
+    device const float* weights [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& q_rows [[buffer(4)]],
+    constant uint& k_rows [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant float& eps [[buffer(7)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint row [[threadgroup_position_in_grid]],
+    uint threads_per_threadgroup [[threads_per_threadgroup]]
+) {
+    threadgroup float sums[256];
+
+    const bool is_q = row < q_rows;
+    const uint local_row = is_q ? row : (row - q_rows);
+    const device float* src = is_q ? q : k;
+    const uint weight_offset = is_q ? 0 : head_dim;
+    const uint out_offset = row * head_dim;
+    const uint src_offset = local_row * head_dim;
+
+    float sum = 0.0f;
+    if (tid < head_dim) {
+        const float value = src[src_offset + tid];
+        sum = value * value;
+    }
+    sums[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads_per_threadgroup >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sums[tid] += sums[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid < head_dim) {
+        const float value = src[src_offset + tid];
+        const float scale = rsqrt((sums[0] / float(head_dim)) + eps);
+        output[out_offset + tid] = value * scale * weights[weight_offset + tid];
+    }
+}
+
+kernel void izwi_qk_rms_norm_f16(
+    device const half* q [[buffer(0)]],
+    device const half* k [[buffer(1)]],
+    device const half* weights [[buffer(2)]],
+    device half* output [[buffer(3)]],
+    constant uint& q_rows [[buffer(4)]],
+    constant uint& k_rows [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant float& eps [[buffer(7)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint row [[threadgroup_position_in_grid]],
+    uint threads_per_threadgroup [[threads_per_threadgroup]]
+) {
+    threadgroup float sums[256];
+
+    const bool is_q = row < q_rows;
+    const uint local_row = is_q ? row : (row - q_rows);
+    const device half* src = is_q ? q : k;
+    const uint weight_offset = is_q ? 0 : head_dim;
+    const uint out_offset = row * head_dim;
+    const uint src_offset = local_row * head_dim;
+
+    float sum = 0.0f;
+    if (tid < head_dim) {
+        const float value = float(src[src_offset + tid]);
+        sum = value * value;
+    }
+    sums[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads_per_threadgroup >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sums[tid] += sums[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid < head_dim) {
+        const float value = float(src[src_offset + tid]);
+        const float scale = rsqrt((sums[0] / float(head_dim)) + eps);
+        output[out_offset + tid] = half(value * scale * float(weights[weight_offset + tid]));
+    }
 }
 "#;
 
@@ -164,6 +252,169 @@ fn silu_mul_pipeline(device: &MetalDevice, dtype: DType) -> CandleResult<Compute
         DType::F32 => "izwi_silu_mul_f32",
         DType::F16 => "izwi_silu_mul_f16",
         _ => bail!("izwi-silu-mul-metal only supports F32 and F16 tensors"),
+    };
+    let library = device
+        .new_library_with_source(IZWI_METAL_SOURCE, None)
+        .map_err(candle_core::Error::wrap)?;
+    let function = library
+        .get_function(function_name, None)
+        .map_err(candle_core::Error::wrap)?;
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(candle_core::Error::wrap)?;
+
+    pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .insert(key, pipeline.clone());
+
+    Ok(pipeline)
+}
+
+#[cfg(feature = "metal")]
+#[derive(Debug, Clone, Copy)]
+struct QkRmsNormOp {
+    q_rows: usize,
+    k_rows: usize,
+    head_dim: usize,
+    eps: f32,
+}
+
+#[cfg(feature = "metal")]
+impl CustomOp3 for QkRmsNormOp {
+    fn name(&self) -> &'static str {
+        "izwi-qk-rms-norm-metal"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> CandleResult<(CpuStorage, Shape)> {
+        bail!("izwi-qk-rms-norm-metal requires Metal tensors")
+    }
+
+    fn metal_fwd(
+        &self,
+        q_storage: &MetalStorage,
+        q_layout: &Layout,
+        k_storage: &MetalStorage,
+        k_layout: &Layout,
+        weight_storage: &MetalStorage,
+        weight_layout: &Layout,
+    ) -> CandleResult<(MetalStorage, Shape)> {
+        let dtype = q_storage.dtype();
+        if k_storage.dtype() != dtype || weight_storage.dtype() != dtype {
+            bail!("izwi-qk-rms-norm-metal requires matching dtypes")
+        }
+        if !matches!(dtype, DType::F32 | DType::F16) {
+            bail!("izwi-qk-rms-norm-metal only supports F32 and F16 tensors")
+        }
+        if !q_layout.is_contiguous() || !k_layout.is_contiguous() || !weight_layout.is_contiguous()
+        {
+            bail!("izwi-qk-rms-norm-metal requires contiguous tensors")
+        }
+        if self.head_dim == 0 || self.head_dim > 256 {
+            bail!("izwi-qk-rms-norm-metal requires 1..=256 head_dim")
+        }
+        if q_layout.shape().elem_count() != self.q_rows.saturating_mul(self.head_dim) {
+            bail!("izwi-qk-rms-norm-metal q shape does not match q_rows/head_dim")
+        }
+        if k_layout.shape().elem_count() != self.k_rows.saturating_mul(self.head_dim) {
+            bail!("izwi-qk-rms-norm-metal k shape does not match k_rows/head_dim")
+        }
+        if weight_layout.shape().elem_count() != self.head_dim.saturating_mul(2) {
+            bail!("izwi-qk-rms-norm-metal weight must contain q and k norm weights")
+        }
+
+        let rows = self.q_rows.saturating_add(self.k_rows);
+        let elem_count = rows.saturating_mul(self.head_dim);
+        if elem_count > u32::MAX as usize
+            || self.q_rows > u32::MAX as usize
+            || self.k_rows > u32::MAX as usize
+            || self.head_dim > u32::MAX as usize
+        {
+            bail!("izwi-qk-rms-norm-metal tensor is too large")
+        }
+
+        let device = q_storage.device().clone();
+        let output = device.new_buffer(elem_count, dtype, "izwi-qk-rms-norm")?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("izwi-qk-rms-norm");
+        let pipeline = qk_rms_norm_pipeline(device.metal_device(), dtype)?;
+        encoder.set_compute_pipeline_state(&pipeline);
+
+        encoder.set_buffer(
+            0,
+            Some(q_storage.buffer()),
+            q_layout.start_offset() * dtype.size_in_bytes(),
+        );
+        encoder.set_buffer(
+            1,
+            Some(k_storage.buffer()),
+            k_layout.start_offset() * dtype.size_in_bytes(),
+        );
+        encoder.set_buffer(
+            2,
+            Some(weight_storage.buffer()),
+            weight_layout.start_offset() * dtype.size_in_bytes(),
+        );
+        encoder.set_buffer(3, Some(&output), 0);
+        encoder.set_bytes(4, &(self.q_rows as u32));
+        encoder.set_bytes(5, &(self.k_rows as u32));
+        encoder.set_bytes(6, &(self.head_dim as u32));
+        encoder.set_bytes(7, &self.eps);
+
+        let threads_per_threadgroup = self
+            .head_dim
+            .next_power_of_two()
+            .min(pipeline.max_total_threads_per_threadgroup())
+            .min(256)
+            .max(1);
+        encoder.dispatch_thread_groups(
+            objc2_metal::MTLSize {
+                width: rows,
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: threads_per_threadgroup,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        Ok((
+            MetalStorage::new(output, device, elem_count, dtype),
+            Shape::from((rows, self.head_dim)),
+        ))
+    }
+}
+
+#[cfg(feature = "metal")]
+fn qk_rms_norm_pipeline(device: &MetalDevice, dtype: DType) -> CandleResult<ComputePipeline> {
+    static PIPELINES: OnceLock<Mutex<HashMap<(u64, DType), ComputePipeline>>> = OnceLock::new();
+    let registry_id = device.registry_id();
+    let pipelines = PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (registry_id, dtype);
+
+    if let Some(pipeline) = pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .get(&key)
+        .cloned()
+    {
+        return Ok(pipeline);
+    }
+
+    let function_name = match dtype {
+        DType::F32 => "izwi_qk_rms_norm_f32",
+        DType::F16 => "izwi_qk_rms_norm_f16",
+        _ => bail!("izwi-qk-rms-norm-metal only supports F32 and F16 tensors"),
     };
     let library = device
         .new_library_with_source(IZWI_METAL_SOURCE, None)
@@ -363,6 +614,81 @@ pub fn try_fused_silu_mul_with_status(gate: &Tensor, up: &Tensor) -> Option<Fuse
         tensor,
         used_custom_kernel: false,
     })
+}
+
+/// Try fused q_norm + k_norm for Qwen single-token decode.
+///
+/// Returns normalized q and k tensors with the same shapes as the inputs. This
+/// custom kernel intentionally supports only the small contiguous Metal decode
+/// case where q/k norm launch overhead dominates.
+pub fn try_fused_qk_rms_norm(
+    q: &Tensor,
+    k: &Tensor,
+    qk_weight: &Tensor,
+    eps: f64,
+) -> Option<(Tensor, Tensor)> {
+    #[cfg(not(feature = "metal"))]
+    let _ = (q, k, qk_weight, eps);
+
+    if !use_fused_kernels() {
+        return None;
+    }
+
+    #[cfg(feature = "metal")]
+    {
+        let (q_bsz, q_seq, q_heads, q_head_dim) = q.dims4().ok()?;
+        let (k_bsz, k_seq, k_heads, k_head_dim) = k.dims4().ok()?;
+        if q_seq != 1 || k_seq != 1 {
+            return None;
+        }
+        if q_bsz != k_bsz || q_head_dim != k_head_dim {
+            return None;
+        }
+        if !q.device().is_metal()
+            || !k.device().is_metal()
+            || !qk_weight.device().is_metal()
+            || q.dtype() != k.dtype()
+            || q.dtype() != qk_weight.dtype()
+            || !matches!(q.dtype(), DType::F32 | DType::F16)
+            || !q.is_contiguous()
+            || !k.is_contiguous()
+            || !qk_weight.is_contiguous()
+            || qk_weight.dims() != [q_head_dim * 2]
+            || q_head_dim == 0
+            || q_head_dim > 256
+        {
+            return None;
+        }
+
+        let q_rows = q_bsz.checked_mul(q_seq)?.checked_mul(q_heads)?;
+        let k_rows = k_bsz.checked_mul(k_seq)?.checked_mul(k_heads)?;
+        let fused = q
+            .apply_op3_no_bwd(
+                k,
+                qk_weight,
+                &QkRmsNormOp {
+                    q_rows,
+                    k_rows,
+                    head_dim: q_head_dim,
+                    eps: eps as f32,
+                },
+            )
+            .ok()?;
+        let q_out = fused
+            .narrow(0, 0, q_rows)
+            .ok()?
+            .reshape((q_bsz, q_seq, q_heads, q_head_dim))
+            .ok()?;
+        let k_out = fused
+            .narrow(0, q_rows, k_rows)
+            .ok()?
+            .reshape((k_bsz, k_seq, k_heads, k_head_dim))
+            .ok()?;
+        return Some((q_out, k_out));
+    }
+
+    #[allow(unreachable_code)]
+    None
 }
 
 /// Try fused RMS normalization.
@@ -696,9 +1022,7 @@ pub fn use_fused_kernels() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    use candle_core::DType;
-    use candle_core::{Device, Tensor};
+    use candle_core::{DType, Device, Tensor};
 
     #[test]
     fn test_l2_norm_matches_reference() {
@@ -786,6 +1110,103 @@ mod tests {
                 assert!(
                     (actual - expected).abs() <= tolerance,
                     "{dtype:?} mismatch at {idx}: {actual} != {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn qk_rms_norm_returns_none_on_cpu() {
+        let device = Device::Cpu;
+        let q = Tensor::zeros((1, 1, 2, 4), DType::F32, &device).unwrap();
+        let k = Tensor::zeros((1, 1, 1, 4), DType::F32, &device).unwrap();
+        let weight = Tensor::ones(8, DType::F32, &device).unwrap();
+
+        assert!(try_fused_qk_rms_norm(&q, &k, &weight, 1e-6).is_none());
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn metal_qk_rms_norm_kernel_matches_reference_if_available() {
+        let Ok(device) = Device::new_metal(0) else {
+            return;
+        };
+        for dtype in [DType::F32, DType::F16] {
+            let q = Tensor::from_vec(
+                vec![
+                    0.2f32, -0.4, 0.6, 0.8, //
+                    -1.0, 1.2, -1.4, 1.6,
+                ],
+                (1, 1, 2, 4),
+                &device,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            let k = Tensor::from_vec(vec![0.3f32, -0.5, 0.7, -0.9], (1, 1, 1, 4), &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let q_weight = Tensor::from_vec(vec![1.0f32, 1.1, 0.9, 0.8], 4, &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let k_weight = Tensor::from_vec(vec![0.7f32, 1.2, 0.6, 1.3], 4, &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let qk_weight = Tensor::cat(&[&q_weight, &k_weight], 0).unwrap();
+
+            let (q_out, k_out) = try_fused_qk_rms_norm(&q, &k, &qk_weight, 1e-6)
+                .expect("fused q/k norm should run on Metal");
+            let q_ref = candle_nn::ops::rms_norm(&q.reshape((2, 4)).unwrap(), &q_weight, 1e-6)
+                .unwrap()
+                .reshape((1, 1, 2, 4))
+                .unwrap();
+            let k_ref = candle_nn::ops::rms_norm(&k.reshape((1, 4)).unwrap(), &k_weight, 1e-6)
+                .unwrap()
+                .reshape((1, 1, 1, 4))
+                .unwrap();
+
+            let q_out = q_out
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let q_ref = q_ref
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let k_out = k_out
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let k_ref = k_ref
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let tolerance = if dtype == DType::F16 { 5e-3 } else { 1e-5 };
+            for (idx, (actual, expected)) in q_out.iter().zip(q_ref.iter()).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "{dtype:?} q mismatch at {idx}: {actual} != {expected}"
+                );
+            }
+            for (idx, (actual, expected)) in k_out.iter().zip(k_ref.iter()).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "{dtype:?} k mismatch at {idx}: {actual} != {expected}"
                 );
             }
         }
