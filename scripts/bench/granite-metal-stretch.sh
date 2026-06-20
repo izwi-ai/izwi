@@ -226,6 +226,7 @@ for index, sample in enumerate(samples, start=1):
         "audio_embedding_cache_hit",
         "qkv_projection_fused",
         "gate_up_projection_fused",
+        "rope_cache_precomputed",
         "residual_branches_prescaled",
     ):
         if execution.get(key) is not True:

@@ -212,6 +212,7 @@ struct AsrExecutionDiagnostics {
     dense_head_decode_enabled: Option<bool>,
     qkv_projection_fused: Option<bool>,
     gate_up_projection_fused: Option<bool>,
+    rope_cache_precomputed: Option<bool>,
     dense_decode_max_tokens: Option<u64>,
     gguf_qmatmul_text_enabled: Option<bool>,
     text_projection_quantized: Option<bool>,
@@ -2720,6 +2721,9 @@ fn asr_execution_from_single_diagnostics(
         gate_up_projection_fused: execution
             .get("gate_up_projection_fused")
             .and_then(|value| value.as_bool()),
+        rope_cache_precomputed: execution
+            .get("rope_cache_precomputed")
+            .and_then(|value| value.as_bool()),
         dense_decode_max_tokens: execution
             .get("dense_decode_max_tokens")
             .and_then(|value| value.as_u64()),
@@ -2770,6 +2774,7 @@ fn asr_execution_from_single_diagnostics(
         || sample.dense_head_decode_enabled.is_some()
         || sample.qkv_projection_fused.is_some()
         || sample.gate_up_projection_fused.is_some()
+        || sample.rope_cache_precomputed.is_some()
         || sample.dense_decode_max_tokens.is_some()
         || sample.gguf_qmatmul_text_enabled.is_some()
         || sample.text_projection_quantized.is_some()
@@ -3083,6 +3088,7 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     let mut dense_head_decode_enabled = Vec::new();
     let mut qkv_projection_fused = Vec::new();
     let mut gate_up_projection_fused = Vec::new();
+    let mut rope_cache_precomputed = Vec::new();
     let mut dense_decode_max_tokens = Vec::new();
     let mut gguf_qmatmul_text_enabled = Vec::new();
     let mut text_projection_quantized = Vec::new();
@@ -3212,6 +3218,9 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
             if let Some(value) = execution.gate_up_projection_fused {
                 gate_up_projection_fused.push(value);
             }
+            if let Some(value) = execution.rope_cache_precomputed {
+                rope_cache_precomputed.push(value);
+            }
             if let Some(value) = execution.dense_decode_max_tokens {
                 dense_decode_max_tokens.push(value);
             }
@@ -3331,6 +3340,7 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         && dense_head_decode_enabled.is_empty()
         && qkv_projection_fused.is_empty()
         && gate_up_projection_fused.is_empty()
+        && rope_cache_precomputed.is_empty()
         && dense_decode_max_tokens.is_empty()
         && gguf_qmatmul_text_enabled.is_empty()
         && text_projection_quantized.is_empty()
@@ -3401,6 +3411,7 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     summarize_bool_count("dense_head", &dense_head_decode_enabled);
     summarize_bool_count("qkv_fused", &qkv_projection_fused);
     summarize_bool_count("gate_up_fused", &gate_up_projection_fused);
+    summarize_bool_count("rope_cache", &rope_cache_precomputed);
     summarize_count("dense_max", &dense_decode_max_tokens);
     summarize_bool_count("gguf_qmatmul", &gguf_qmatmul_text_enabled);
     summarize_bool_count("qproj_quant", &text_projection_quantized);
@@ -3972,6 +3983,7 @@ mod tests {
                 "dense_head_decode_enabled": true,
                 "qkv_projection_fused": true,
                 "gate_up_projection_fused": true,
+                "rope_cache_precomputed": true,
                 "dense_decode_max_tokens": 384,
                 "audio_embedding_cache_hit": true,
                 "cuda_device_argmax": true,
@@ -4007,6 +4019,7 @@ mod tests {
         assert_eq!(execution.dense_head_decode_enabled, Some(true));
         assert_eq!(execution.qkv_projection_fused, Some(true));
         assert_eq!(execution.gate_up_projection_fused, Some(true));
+        assert_eq!(execution.rope_cache_precomputed, Some(true));
         assert_eq!(execution.dense_decode_max_tokens, Some(384));
         assert_eq!(execution.audio_embedding_cache_hit, Some(true));
         assert_eq!(execution.cuda_device_argmax, Some(true));

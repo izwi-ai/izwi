@@ -38,6 +38,7 @@ pub struct GraniteSpeechGenerationStats {
     pub dense_head_decode_enabled: bool,
     pub qkv_projection_fused: bool,
     pub gate_up_projection_fused: bool,
+    pub rope_cache_precomputed: bool,
     pub cuda_device_argmax: bool,
     pub residual_branches_prescaled: bool,
     pub dense_decode_preallocated: bool,
@@ -548,12 +549,16 @@ impl GraniteSpeechRuntime {
         let mut profiler = GraniteSpeechDecodeProfiler::from_env(self.text_model.num_layers());
         let profiling = profiler.is_some();
         let prefill_start = Instant::now();
-        let mut logits = self.text_model.forward_prompt_with_audio(
+        let rope_cache = self
+            .text_model
+            .precompute_rope_cache(input_ids.len().saturating_add(max_steps))?;
+        let mut logits = self.text_model.forward_prompt_with_audio_with_rope(
             &input_ids,
             audio_start,
             audio_tokens,
             audio_embeds,
             &mut cache,
+            rope_cache.as_ref(),
         )?;
         let prefill = prefill_start.elapsed();
         let mut generated = Vec::new();
@@ -594,6 +599,7 @@ impl GraniteSpeechRuntime {
                         &token_tensor,
                         input_ids.len() + step,
                         Some(&mut cache),
+                        rope_cache.as_ref(),
                         profiler.as_mut(),
                     )?;
                     step_profile.model_forward += profile_elapsed(forward_start);
@@ -612,6 +618,7 @@ impl GraniteSpeechRuntime {
                         &token_tensor,
                         input_ids.len() + step,
                         Some(&mut cache),
+                        rope_cache.as_ref(),
                         profiler.as_mut(),
                     )?;
                     step_profile.model_forward += profile_elapsed(forward_start);
@@ -655,6 +662,7 @@ impl GraniteSpeechRuntime {
                     &token_tensor,
                     input_ids.len() + step,
                     Some(&mut cache),
+                    rope_cache.as_ref(),
                     profiler.as_mut(),
                 )?;
                 step_profile.model_forward += profile_elapsed(forward_start);
@@ -712,6 +720,7 @@ impl GraniteSpeechRuntime {
                     &token_tensor,
                     input_ids.len() + step,
                     Some(&mut cache),
+                    rope_cache.as_ref(),
                     profiler.as_mut(),
                 )?;
                 step_profile.model_forward += profile_elapsed(forward_start);
@@ -755,6 +764,7 @@ impl GraniteSpeechRuntime {
                 dense_head_decode_enabled,
                 qkv_projection_fused: self.text_model.qkv_projection_fused(),
                 gate_up_projection_fused: self.text_model.gate_up_projection_fused(),
+                rope_cache_precomputed: rope_cache.is_some(),
                 cuda_device_argmax,
                 residual_branches_prescaled: self.text_model.residual_branches_prescaled(),
                 dense_decode_preallocated: dense_decode_initial_capacity > 0,
@@ -1565,6 +1575,20 @@ impl GraniteLanguageModel {
             .unwrap_or(false)
     }
 
+    fn precompute_rope_cache(&self, total_len: usize) -> Result<Option<GraniteRopeCache>> {
+        let Some(layer) = self.layers.first() else {
+            return Ok(None);
+        };
+        GraniteRopeCache::build(
+            total_len,
+            layer.self_attn.head_dim,
+            layer.self_attn.rope_theta,
+            &self.device,
+            self.embed_tokens.embeddings().dtype(),
+        )
+        .map(Some)
+    }
+
     fn embeddings(&self, input_ids: &[u32]) -> Result<Tensor> {
         let ids = input_ids.iter().map(|id| *id as i64).collect::<Vec<_>>();
         let ids = Tensor::from_vec(ids, (1, input_ids.len()), &self.device)?;
@@ -1577,7 +1601,7 @@ impl GraniteLanguageModel {
         start_pos: usize,
         cache: Option<&mut Qwen3Cache>,
     ) -> Result<Tensor> {
-        self.forward_profiled(input_ids, start_pos, cache, None)
+        self.forward_profiled(input_ids, start_pos, cache, None, None)
     }
 
     fn forward_profiled(
@@ -1585,6 +1609,7 @@ impl GraniteLanguageModel {
         input_ids: &Tensor,
         start_pos: usize,
         cache: Option<&mut Qwen3Cache>,
+        rope_cache: Option<&GraniteRopeCache>,
         mut profile: Option<&mut GraniteSpeechDecodeProfiler>,
     ) -> Result<Tensor> {
         let profiling = profile.is_some();
@@ -1593,7 +1618,7 @@ impl GraniteLanguageModel {
         if let Some(profile) = profile.as_deref_mut() {
             profile.profile.forward.token_embedding += profile_elapsed(embed_start);
         }
-        self.forward_with_embeds_profiled(&embeds, start_pos, cache, profile)
+        self.forward_with_embeds_profiled(&embeds, start_pos, cache, rope_cache, profile)
     }
 
     fn forward_prompt_with_audio(
@@ -1603,6 +1628,25 @@ impl GraniteLanguageModel {
         audio_len: usize,
         audio_embeds: &Tensor,
         cache: &mut Qwen3Cache,
+    ) -> Result<Tensor> {
+        self.forward_prompt_with_audio_with_rope(
+            input_ids,
+            audio_start,
+            audio_len,
+            audio_embeds,
+            cache,
+            None,
+        )
+    }
+
+    fn forward_prompt_with_audio_with_rope(
+        &self,
+        input_ids: &[u32],
+        audio_start: usize,
+        audio_len: usize,
+        audio_embeds: &Tensor,
+        cache: &mut Qwen3Cache,
+        rope_cache: Option<&GraniteRopeCache>,
     ) -> Result<Tensor> {
         let mut llm_ids = input_ids.to_vec();
         for idx in audio_start..audio_start + audio_len {
@@ -1626,7 +1670,7 @@ impl GraniteLanguageModel {
         };
         let audio = audio_embeds.to_dtype(embeds.dtype())?;
         let merged = Tensor::cat(&[before, audio, after], 1)?;
-        self.forward_with_embeds(&merged, 0, Some(cache))
+        self.forward_with_embeds_profiled(&merged, 0, Some(cache), rope_cache, None)
     }
 
     fn forward_with_embeds(
@@ -1635,7 +1679,7 @@ impl GraniteLanguageModel {
         start_pos: usize,
         cache: Option<&mut Qwen3Cache>,
     ) -> Result<Tensor> {
-        self.forward_with_embeds_profiled(embeds, start_pos, cache, None)
+        self.forward_with_embeds_profiled(embeds, start_pos, cache, None, None)
     }
 
     fn forward_with_embeds_profiled(
@@ -1643,6 +1687,7 @@ impl GraniteLanguageModel {
         embeds: &Tensor,
         start_pos: usize,
         mut cache: Option<&mut Qwen3Cache>,
+        rope_cache: Option<&GraniteRopeCache>,
         mut profile: Option<&mut GraniteSpeechDecodeProfiler>,
     ) -> Result<Tensor> {
         let profiling = profile.is_some();
@@ -1652,14 +1697,18 @@ impl GraniteLanguageModel {
             .layers
             .first()
             .map(|layer| {
-                build_rope_cache(
-                    x.dim(1)?,
-                    layer.self_attn.head_dim,
-                    start_pos,
-                    layer.self_attn.rope_theta,
-                    x.device(),
-                    x.dtype(),
-                )
+                rope_cache
+                    .map(|cache| cache.slice(start_pos, x.dim(1)?))
+                    .unwrap_or_else(|| {
+                        build_rope_cache(
+                            x.dim(1)?,
+                            layer.self_attn.head_dim,
+                            start_pos,
+                            layer.self_attn.rope_theta,
+                            x.device(),
+                            x.dtype(),
+                        )
+                    })
             })
             .transpose()?;
         if let Some(profile) = profile.as_deref_mut() {
@@ -2101,6 +2150,37 @@ fn granite_dense_head_decode_policy(is_metal: bool, is_cuda: bool) -> bool {
 
 fn granite_qformer_fused_attention_allowed(device: &Device) -> bool {
     device.is_cuda()
+}
+
+#[derive(Debug, Clone)]
+struct GraniteRopeCache {
+    cos: Tensor,
+    sin: Tensor,
+}
+
+impl GraniteRopeCache {
+    fn build(
+        total_len: usize,
+        head_dim: usize,
+        rope_theta: f64,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        let (cos, sin) = build_rope_cache(total_len, head_dim, 0, rope_theta, device, dtype)?;
+        Ok(Self { cos, sin })
+    }
+
+    fn slice(&self, start_pos: usize, seq_len: usize) -> Result<(Tensor, Tensor)> {
+        if start_pos.saturating_add(seq_len) > self.cos.dim(0)? {
+            return Err(Error::InferenceError(format!(
+                "Granite RoPE cache too short for start_pos={start_pos}, seq_len={seq_len}"
+            )));
+        }
+        Ok((
+            self.cos.narrow(0, start_pos, seq_len)?,
+            self.sin.narrow(0, start_pos, seq_len)?,
+        ))
+    }
 }
 
 fn build_rope_cache(
@@ -2548,6 +2628,18 @@ mod tests {
 
         assert_tensor_close(&gate, &gate_proj.forward(&input).unwrap());
         assert_tensor_close(&up, &up_proj.forward(&input).unwrap());
+    }
+
+    #[test]
+    fn granite_rope_cache_slice_matches_direct_build() {
+        let device = Device::Cpu;
+        let cache = GraniteRopeCache::build(16, 4, 10000.0, &device, DType::F32).unwrap();
+        let (cached_cos, cached_sin) = cache.slice(5, 3).unwrap();
+        let (direct_cos, direct_sin) =
+            build_rope_cache(3, 4, 5, 10000.0, &device, DType::F32).unwrap();
+
+        assert_tensor_close(&cached_cos, &direct_cos);
+        assert_tensor_close(&cached_sin, &direct_sin);
     }
 
     #[test]

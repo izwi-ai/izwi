@@ -647,6 +647,7 @@ fn granite_diagnostics(
             "dense_head_decode_enabled": generation.stats.dense_head_decode_enabled,
             "qkv_projection_fused": generation.stats.qkv_projection_fused,
             "gate_up_projection_fused": generation.stats.gate_up_projection_fused,
+            "rope_cache_precomputed": generation.stats.rope_cache_precomputed,
             "cuda_dense_decode_cache": generation.stats.dense_decode_cache_enabled,
             "cuda_device_argmax": generation.stats.cuda_device_argmax,
             "residual_branches_prescaled": generation.stats.residual_branches_prescaled,
@@ -1059,6 +1060,7 @@ mod tests {
                 dense_head_decode_enabled: false,
                 qkv_projection_fused: true,
                 gate_up_projection_fused: true,
+                rope_cache_precomputed: true,
                 cuda_device_argmax: false,
                 residual_branches_prescaled: true,
                 dense_decode_preallocated: true,
@@ -1166,6 +1168,7 @@ mod tests {
         assert_eq!(diagnostics["execution"]["dense_head_decode_enabled"], false);
         assert_eq!(diagnostics["execution"]["qkv_projection_fused"], true);
         assert_eq!(diagnostics["execution"]["gate_up_projection_fused"], true);
+        assert_eq!(diagnostics["execution"]["rope_cache_precomputed"], true);
         assert_eq!(diagnostics["execution"]["cuda_device_argmax"], false);
         assert_eq!(
             diagnostics["execution"]["residual_branches_prescaled"],
