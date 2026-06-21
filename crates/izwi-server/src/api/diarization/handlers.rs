@@ -25,8 +25,8 @@ use crate::diarization_store::{
 use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::{
-    ChatMessage, ChatRole, DiarizationConfig, GenerationParams, RuntimeService,
-    parse_chat_model_variant,
+    ChatMessage, ChatRole, DiarizationConfig, GenerationParams, ModelVariant, RuntimeService,
+    parse_chat_model_variant, parse_model_variant,
 };
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
@@ -330,6 +330,7 @@ async fn create_pending_record(
     state: &AppState,
     parsed: &mut ParsedDiarizationCreateRequest,
 ) -> Result<DiarizationRecord, ApiError> {
+    reject_granite_diarization_model(parsed.model_id.as_deref())?;
     validate_speaker_bounds(parsed.min_speakers, parsed.max_speakers)?;
 
     state
@@ -374,6 +375,21 @@ async fn create_pending_record(
         })
         .await
         .map_err(map_store_error)
+}
+
+fn reject_granite_diarization_model(model_id: Option<&str>) -> Result<(), ApiError> {
+    let Some(raw_model_id) = model_id else {
+        return Ok(());
+    };
+    let Ok(variant) = parse_model_variant(raw_model_id) else {
+        return Ok(());
+    };
+    if variant == ModelVariant::GraniteSpeech412BPlus {
+        return Err(ApiError::bad_request(
+            "Granite-Speech-4.1-2B-Plus is a speaker-attributed ASR model, not a diarization model. Use `job_kind=speaker_attributed_asr` to preserve Granite's speaker-turn transcript.",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]

@@ -1,6 +1,6 @@
 //! Persistent transcription history storage backed by SQLite.
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use izwi_core::AsrProgress;
 use izwi_hooks::{HookMetadata, MediaNamespace, MediaStorageProvider};
 use sea_orm::sea_query::Expr;
@@ -11,11 +11,11 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    db::{raw, StoreDatabase},
+    db::{StoreDatabase, raw},
     entity::transcription_records,
     ids::new_uuid,
     persistence::{
-        delete_media_object, persist_audio_object, read_media_object, LocalMediaStorageProvider,
+        LocalMediaStorageProvider, delete_media_object, persist_audio_object, read_media_object,
     },
     storage_layout,
 };
@@ -340,6 +340,62 @@ impl TranscriptionStore {
             .await
         }
         .context("Failed to list transcription records")?;
+
+        let mut records = rows
+            .iter()
+            .map(map_transcription_summary)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let page_limit = usize::try_from(list_limit).unwrap_or(200);
+        let has_more = records.len() > page_limit;
+        if has_more {
+            records.truncate(page_limit);
+        }
+        let next_cursor = if has_more {
+            records.last().map(|record| TranscriptionRecordListCursor {
+                created_at: record.created_at,
+                id: record.id.clone(),
+            })
+        } else {
+            None
+        };
+
+        Ok((records, next_cursor))
+    }
+
+    pub async fn list_records_page_for_mode(
+        &self,
+        mode: TranscriptionRecordMode,
+        limit: usize,
+        cursor: Option<TranscriptionRecordListCursor>,
+    ) -> anyhow::Result<(
+        Vec<TranscriptionRecordSummary>,
+        Option<TranscriptionRecordListCursor>,
+    )> {
+        let db = self.db.connection().await?;
+        let list_limit = i64::try_from(limit.clamp(1, 500).max(1)).unwrap_or(200);
+        let fetch_limit = list_limit.saturating_add(1);
+        let rows = if let Some(cursor) = cursor {
+            let cursor_created_at = i64::try_from(cursor.created_at).unwrap_or(i64::MAX);
+            db.query_all_raw(raw::statement(
+                db,
+                TRANSCRIPTION_PAGE_FOR_MODE_AFTER_CURSOR_SQL,
+                vec![
+                    mode.as_db_value().into(),
+                    cursor_created_at.into(),
+                    cursor.id.into(),
+                    fetch_limit.into(),
+                ],
+            )?)
+            .await
+        } else {
+            db.query_all_raw(raw::statement(
+                db,
+                TRANSCRIPTION_PAGE_FOR_MODE_SQL,
+                vec![mode.as_db_value().into(), fetch_limit.into()],
+            )?)
+            .await
+        }
+        .context("Failed to list transcription records for mode")?;
 
         let mut records = rows
             .iter()
@@ -846,6 +902,63 @@ const TRANSCRIPTION_PAGE_AFTER_CURSOR_SQL: &str = r#"
     LIMIT ?3
 "#;
 
+const TRANSCRIPTION_PAGE_FOR_MODE_SQL: &str = r#"
+    SELECT
+        id,
+        created_at,
+        transcription_mode,
+        model_id,
+        language,
+        processing_status,
+        processing_error,
+        processing_progress_json,
+        duration_secs,
+        processing_time_ms,
+        rtf,
+        audio_mime_type,
+        audio_filename,
+        transcription,
+        speaker_attributed_text,
+        speaker_turns_json,
+        saa_status,
+        saa_warnings_json,
+        summary_status,
+        summary_text
+    FROM transcription_records
+    WHERE transcription_mode = ?1
+    ORDER BY created_at DESC, id DESC
+    LIMIT ?2
+"#;
+
+const TRANSCRIPTION_PAGE_FOR_MODE_AFTER_CURSOR_SQL: &str = r#"
+    SELECT
+        id,
+        created_at,
+        transcription_mode,
+        model_id,
+        language,
+        processing_status,
+        processing_error,
+        processing_progress_json,
+        duration_secs,
+        processing_time_ms,
+        rtf,
+        audio_mime_type,
+        audio_filename,
+        transcription,
+        speaker_attributed_text,
+        speaker_turns_json,
+        saa_status,
+        saa_warnings_json,
+        summary_status,
+        summary_text
+    FROM transcription_records
+    WHERE transcription_mode = ?1
+      AND (created_at < ?2 OR (created_at = ?2 AND id < ?3))
+    ORDER BY created_at DESC, id DESC
+    LIMIT ?4
+"#;
+
 const TRANSCRIPTION_RECORD_COLUMNS: &str = r#"
     id,
     created_at,
@@ -1299,11 +1412,7 @@ fn now_unix_millis_i64() -> i64 {
 }
 
 fn i64_to_u64(value: i64) -> u64 {
-    if value.is_negative() {
-        0
-    } else {
-        value as u64
-    }
+    if value.is_negative() { 0 } else { value as u64 }
 }
 
 #[allow(dead_code)]
@@ -1492,6 +1601,24 @@ mod tests {
             summaries[0].speaker_attributed_text_preview.as_deref(),
             Some("[Speaker 1]: hello [Speaker 2]: hi there")
         );
+
+        let normal_record = store
+            .create_record(sample_record())
+            .await
+            .expect("normal record should be created");
+        let (transcription_summaries, _) = store
+            .list_records_page_for_mode(TranscriptionRecordMode::Transcription, 10, None)
+            .await
+            .expect("transcription summaries should load");
+        assert_eq!(transcription_summaries.len(), 1);
+        assert_eq!(transcription_summaries[0].id, normal_record.id);
+
+        let (saa_summaries, _) = store
+            .list_records_page_for_mode(TranscriptionRecordMode::SpeakerAttributedAsr, 10, None)
+            .await
+            .expect("SAA summaries should load");
+        assert_eq!(saa_summaries.len(), 1);
+        assert_eq!(saa_summaries[0].id, created.id);
 
         std::fs::remove_dir_all(root).expect("test temp dir should be removable");
     }

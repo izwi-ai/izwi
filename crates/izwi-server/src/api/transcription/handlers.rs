@@ -3,13 +3,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::{Extension, Multipart, Path, Request, State},
-    http::{header, HeaderValue, StatusCode},
-    response::{
-        sse::{Event, KeepAlive, Sse},
-        IntoResponse, Response,
-    },
     Json, RequestExt,
+    extract::{Extension, Multipart, Path, Request, State},
+    http::{HeaderValue, StatusCode, header},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -23,19 +23,21 @@ use crate::error::ApiError;
 use crate::state::AppState;
 use crate::transcription_store::{
     CompleteTranscriptionRecord, NewTranscriptionRecord, SpeakerAttributedAsrStatus,
-    TranscriptionProcessingStatus, TranscriptionRecord, TranscriptionRecordMode,
-    TranscriptionSegmentRecord, TranscriptionStore, TranscriptionSummaryStatus,
-    TranscriptionWordRecord, UpdateTranscriptionSummary,
+    SpeakerAttributedTurnRecord, TranscriptionProcessingStatus, TranscriptionRecord,
+    TranscriptionRecordMode, TranscriptionSegmentRecord, TranscriptionStore,
+    TranscriptionSummaryStatus, TranscriptionWordRecord, UpdateTranscriptionSummary,
 };
+use izwi_core::runtime::SpeakerAttributedAsrStatus as RuntimeSpeakerAttributedAsrStatus;
 use izwi_core::{
-    parse_chat_model_variant, AsrProgress, AsrProgressPhase, ChatMessage, ChatRequestConfig,
-    ChatRole, GenerationParams, ModelVariant, RuntimeService,
+    AsrProgress, AsrProgressPhase, ChatMessage, ChatRequestConfig, ChatRole, GenerationParams,
+    ModelVariant, RuntimeService, parse_chat_model_variant, parse_model_variant,
 };
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
 use crate::api::speech_text_upload::{multipart_upload_error, resolve_source_audio_mime_type};
 
 const DEFAULT_TRANSCRIPTION_ALIGNER_MODEL: &str = "Qwen3-ForcedAligner-0.6B";
+const DEFAULT_SPEAKER_ATTRIBUTED_ASR_MODEL: &str = "Granite-Speech-4.1-2B-Plus";
 const DEFAULT_TRANSCRIPTION_SUMMARY_MODEL: &str = "Qwen3.5-4B";
 const DEFAULT_TRANSCRIPTION_SUMMARY_MAX_TOKENS: usize = 384;
 const TRANSCRIPTION_SUMMARY_SYSTEM_PROMPT: &str = "You summarize transcripts for fast review. Return only the final summary text. Do not output markdown, bullet markers, XML tags, code fences, or <think> content. Keep the summary concise while covering key topics, decisions, action items, and unresolved questions when present.";
@@ -55,12 +57,15 @@ struct ParsedTranscriptionCreateRequest {
     audio_bytes: Vec<u8>,
     audio_mime_type: Option<String>,
     audio_filename: Option<String>,
+    record_mode: TranscriptionRecordMode,
     model_id: Option<String>,
     aligner_model_id: Option<String>,
     language: Option<String>,
     include_timestamps: bool,
     stream: bool,
     generate_summary: bool,
+    min_speakers: Option<usize>,
+    max_speakers: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,6 +87,10 @@ struct JsonCreateRequest {
     stream: Option<bool>,
     #[serde(default)]
     generate_summary: Option<bool>,
+    #[serde(default)]
+    min_speakers: Option<usize>,
+    #[serde(default)]
+    max_speakers: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -126,12 +135,17 @@ struct StreamDoneEvent {
 
 #[derive(Debug)]
 struct GeneratedTranscriptionArtifacts {
+    transcription_mode: TranscriptionRecordMode,
     text: String,
     language: Option<String>,
     duration_secs: f64,
     aligner_model_id: Option<String>,
     segments: Vec<TranscriptionSegmentRecord>,
     words: Vec<TranscriptionWordRecord>,
+    speaker_attributed_text: Option<String>,
+    speaker_turns: Vec<SpeakerAttributedTurnRecord>,
+    saa_status: SpeakerAttributedAsrStatus,
+    saa_warnings: Vec<String>,
 }
 
 pub async fn delete_record(
@@ -191,7 +205,32 @@ pub async fn create_record(
     Extension(ctx): Extension<RequestContext>,
     req: Request,
 ) -> Result<Response, ApiError> {
+    create_record_for_mode(state, ctx, req, TranscriptionRecordMode::Transcription).await
+}
+
+pub async fn create_speaker_attributed_asr_record(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<RequestContext>,
+    req: Request,
+) -> Result<Response, ApiError> {
+    create_record_for_mode(
+        state,
+        ctx,
+        req,
+        TranscriptionRecordMode::SpeakerAttributedAsr,
+    )
+    .await
+}
+
+async fn create_record_for_mode(
+    state: AppState,
+    ctx: RequestContext,
+    req: Request,
+    record_mode: TranscriptionRecordMode,
+) -> Result<Response, ApiError> {
     let mut parsed = parse_create_request(req).await?;
+    parsed.record_mode = record_mode;
+    prepare_create_request(&mut parsed)?;
     let placeholder = create_pending_record(&state, &mut parsed).await?;
 
     if parsed.stream {
@@ -264,9 +303,14 @@ async fn create_pending_record(
     state
         .transcription_store
         .create_record(NewTranscriptionRecord {
-            transcription_mode: TranscriptionRecordMode::Transcription,
+            transcription_mode: parsed.record_mode,
             model_id: parsed.model_id.clone(),
-            aligner_model_id: parsed.aligner_model_id.clone(),
+            aligner_model_id: if parsed.record_mode == TranscriptionRecordMode::SpeakerAttributedAsr
+            {
+                None
+            } else {
+                parsed.aligner_model_id.clone()
+            },
             language: parsed.language.clone(),
             processing_status: TranscriptionProcessingStatus::Pending,
             processing_error: None,
@@ -362,6 +406,9 @@ fn spawn_transcription_processing_task(
         let requested_language = parsed.language.clone();
         let include_timestamps = parsed.include_timestamps;
         let generate_summary = parsed.generate_summary;
+        let record_mode = parsed.record_mode;
+        let min_speakers = parsed.min_speakers;
+        let max_speakers = parsed.max_speakers;
         let correlation_id_ref = correlation_id.clone();
         let audio_bytes = match transcription_store.get_audio(record_id.clone()).await {
             Ok(Some(audio)) => audio.audio_bytes,
@@ -411,37 +458,52 @@ fn spawn_transcription_processing_task(
 
         // Keep transcription processing unbounded by wall-clock timeout so
         // valid long jobs can finish and persist successfully.
-        let generation_result = generate_transcription_artifacts(
-            runtime.clone(),
-            audio_bytes.as_slice(),
-            model_id.as_deref(),
-            aligner_model_id.as_deref(),
-            requested_language.as_deref(),
-            include_timestamps,
-            correlation_id_ref.as_deref(),
-            move |delta| {
-                if let Some(tx) = &delta_tx {
-                    let _ = tx.send(
-                        serde_json::to_string(&StreamDeltaEvent {
-                            event: "delta",
-                            delta,
-                        })
-                        .unwrap_or_default(),
-                    );
-                }
-            },
-            move |progress| {
-                if let Some(tx) = &progress_tx {
-                    let _ = tx.send(progress_event_payload(progress.clone()));
-                }
-                let store = progress_store.clone();
-                let id = progress_record_id.clone();
-                tokio::spawn(async move {
-                    let _ = store.update_processing_progress(id, Some(progress)).await;
-                });
-            },
-        )
-        .await;
+        let generation_result = match record_mode {
+            TranscriptionRecordMode::Transcription => {
+                generate_transcription_artifacts(
+                    runtime.clone(),
+                    audio_bytes.as_slice(),
+                    model_id.as_deref(),
+                    aligner_model_id.as_deref(),
+                    requested_language.as_deref(),
+                    include_timestamps,
+                    correlation_id_ref.as_deref(),
+                    move |delta| {
+                        if let Some(tx) = &delta_tx {
+                            let _ = tx.send(
+                                serde_json::to_string(&StreamDeltaEvent {
+                                    event: "delta",
+                                    delta,
+                                })
+                                .unwrap_or_default(),
+                            );
+                        }
+                    },
+                    move |progress| {
+                        if let Some(tx) = &progress_tx {
+                            let _ = tx.send(progress_event_payload(progress.clone()));
+                        }
+                        let store = progress_store.clone();
+                        let id = progress_record_id.clone();
+                        tokio::spawn(async move {
+                            let _ = store.update_processing_progress(id, Some(progress)).await;
+                        });
+                    },
+                )
+                .await
+            }
+            TranscriptionRecordMode::SpeakerAttributedAsr => {
+                generate_speaker_attributed_asr_artifacts(
+                    runtime.clone(),
+                    audio_bytes.as_slice(),
+                    model_id.as_deref(),
+                    requested_language.as_deref(),
+                    min_speakers,
+                    max_speakers,
+                )
+                .await
+            }
+        };
 
         match generation_result {
             Ok(artifacts) => {
@@ -458,7 +520,7 @@ fn spawn_transcription_processing_task(
                     .complete_record(
                         record_id.clone(),
                         CompleteTranscriptionRecord {
-                            transcription_mode: TranscriptionRecordMode::Transcription,
+                            transcription_mode: artifacts.transcription_mode,
                             model_id,
                             aligner_model_id: artifacts.aligner_model_id,
                             language: artifacts.language,
@@ -468,10 +530,10 @@ fn spawn_transcription_processing_task(
                             transcription: artifacts.text,
                             segments: artifacts.segments,
                             words: artifacts.words,
-                            speaker_attributed_text: None,
-                            speaker_turns: Vec::new(),
-                            saa_status: SpeakerAttributedAsrStatus::NotRequested,
-                            saa_warnings: Vec::new(),
+                            speaker_attributed_text: artifacts.speaker_attributed_text,
+                            speaker_turns: artifacts.speaker_turns,
+                            saa_status: artifacts.saa_status,
+                            saa_warnings: artifacts.saa_warnings,
                             summary_status,
                             summary_model_id,
                             summary_text: None,
@@ -607,12 +669,68 @@ where
         };
 
     Ok(GeneratedTranscriptionArtifacts {
+        transcription_mode: TranscriptionRecordMode::Transcription,
         text: output.text,
         language: resolved_language,
         duration_secs: output.duration_secs as f64,
         aligner_model_id,
         segments,
         words,
+        speaker_attributed_text: None,
+        speaker_turns: Vec::new(),
+        saa_status: SpeakerAttributedAsrStatus::NotRequested,
+        saa_warnings: Vec::new(),
+    })
+}
+
+async fn generate_speaker_attributed_asr_artifacts(
+    runtime: std::sync::Arc<izwi_core::RuntimeService>,
+    audio_bytes: &[u8],
+    model_id: Option<&str>,
+    requested_language: Option<&str>,
+    min_speakers: Option<usize>,
+    max_speakers: Option<usize>,
+) -> Result<GeneratedTranscriptionArtifacts, ApiError> {
+    let output = runtime
+        .speaker_attributed_asr_bytes(
+            audio_bytes,
+            model_id,
+            requested_language,
+            min_speakers,
+            max_speakers,
+        )
+        .await?;
+    let resolved_language = output
+        .language
+        .clone()
+        .or_else(|| requested_language.map(|value| value.to_string()));
+    let saa_status = match output.status {
+        RuntimeSpeakerAttributedAsrStatus::Ready => SpeakerAttributedAsrStatus::Ready,
+        RuntimeSpeakerAttributedAsrStatus::Warning => SpeakerAttributedAsrStatus::Warning,
+    };
+    let speaker_turns = output
+        .speaker_turns
+        .into_iter()
+        .map(|turn| SpeakerAttributedTurnRecord {
+            speaker: turn.speaker,
+            text: turn.text,
+            start: turn.start_secs,
+            end: turn.end_secs,
+        })
+        .collect::<Vec<_>>();
+
+    Ok(GeneratedTranscriptionArtifacts {
+        transcription_mode: TranscriptionRecordMode::SpeakerAttributedAsr,
+        text: output.text.clone(),
+        language: resolved_language,
+        duration_secs: output.duration_secs as f64,
+        aligner_model_id: None,
+        segments: Vec::new(),
+        words: Vec::new(),
+        speaker_attributed_text: Some(output.text),
+        speaker_turns,
+        saa_status,
+        saa_warnings: output.warnings,
     })
 }
 
@@ -677,6 +795,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
             audio_bytes: audio_payload.bytes,
             audio_mime_type: Some(audio_mime_type),
             audio_filename: None,
+            record_mode: TranscriptionRecordMode::Transcription,
             model_id,
             aligner_model_id: sanitize_optional(payload.aligner_model_id),
             language: sanitize_optional(payload.language),
@@ -686,6 +805,8 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
                 .unwrap_or(false),
             stream: payload.stream.unwrap_or(false),
             generate_summary: payload.generate_summary.unwrap_or(false),
+            min_speakers: payload.min_speakers,
+            max_speakers: payload.max_speakers,
         });
     }
 
@@ -781,6 +902,22 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
                     })?;
                     out.generate_summary = parse_bool(text.as_str());
                 }
+                "min_speakers" => {
+                    let text = field.text().await.map_err(|e| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart 'min_speakers' field: {e}"
+                        ))
+                    })?;
+                    out.min_speakers = parse_optional_usize(text.as_str(), "min_speakers")?;
+                }
+                "max_speakers" => {
+                    let text = field.text().await.map_err(|e| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart 'max_speakers' field: {e}"
+                        ))
+                    })?;
+                    out.max_speakers = parse_optional_usize(text.as_str(), "max_speakers")?;
+                }
                 _ => {}
             }
         }
@@ -798,6 +935,68 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
         status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
         message: "Expected `Content-Type: application/json` or `multipart/form-data`".to_string(),
     })
+}
+
+fn prepare_create_request(parsed: &mut ParsedTranscriptionCreateRequest) -> Result<(), ApiError> {
+    if parsed.record_mode != TranscriptionRecordMode::SpeakerAttributedAsr {
+        return Ok(());
+    }
+
+    if parsed.stream {
+        return Err(ApiError::bad_request(
+            "Streaming speaker-attributed ASR jobs are not supported. Submit a non-streaming `job_kind=speaker_attributed_asr` request.",
+        ));
+    }
+    validate_speaker_bounds(parsed.min_speakers, parsed.max_speakers)?;
+    validate_speaker_attributed_asr_model(parsed.model_id.as_deref())?;
+    parsed
+        .model_id
+        .get_or_insert_with(|| DEFAULT_SPEAKER_ATTRIBUTED_ASR_MODEL.to_string());
+    parsed.aligner_model_id = None;
+    parsed.include_timestamps = false;
+    Ok(())
+}
+
+fn validate_speaker_attributed_asr_model(model_id: Option<&str>) -> Result<(), ApiError> {
+    let Some(raw_model_id) = model_id else {
+        return Ok(());
+    };
+
+    let variant = parse_model_variant(raw_model_id).map_err(|err| {
+        ApiError::bad_request(format!("Invalid speaker-attributed ASR model: {err}"))
+    })?;
+    if variant != ModelVariant::GraniteSpeech412BPlus {
+        return Err(ApiError::bad_request(format!(
+            "Speaker-attributed ASR currently requires {DEFAULT_SPEAKER_ATTRIBUTED_ASR_MODEL}.",
+        )));
+    }
+    Ok(())
+}
+
+fn validate_speaker_bounds(
+    min_speakers: Option<usize>,
+    max_speakers: Option<usize>,
+) -> Result<(), ApiError> {
+    if let (Some(min), Some(max)) = (min_speakers, max_speakers) {
+        if min > max {
+            return Err(ApiError::bad_request(
+                "`min_speakers` cannot be greater than `max_speakers`.",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_optional_usize(raw: &str, field: &str) -> Result<Option<usize>, ApiError> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value
+        .parse::<usize>()
+        .map(Some)
+        .map_err(|_| ApiError::bad_request(format!("`{field}` must be a non-negative integer.")))
 }
 
 fn parse_bool(raw: &str) -> bool {
@@ -1187,18 +1386,18 @@ fn map_store_error(err: anyhow::Error) -> ApiError {
 mod tests {
     use axum::{
         body::Body,
-        http::{header, StatusCode},
+        http::{StatusCode, header},
     };
     use base64::Engine as _;
     use izwi_core::audio::{AudioEncoder, AudioFormat};
     use izwi_core::{AsrProgress, AsrProgressPhase};
 
     use super::{
-        alignments_to_word_records, build_segment_records, initial_summary_state,
-        multipart_field_api_error, parse_bool, parse_create_request, progress_event_payload,
-        sanitize_summary_output, should_retry_transcription_summary_generation,
-        transcription_summary_messages, transcription_summary_params, TranscriptionSummaryStatus,
-        TranscriptionWordRecord,
+        TranscriptionSummaryStatus, TranscriptionWordRecord, alignments_to_word_records,
+        build_segment_records, initial_summary_state, multipart_field_api_error, parse_bool,
+        parse_create_request, progress_event_payload, sanitize_summary_output,
+        should_retry_transcription_summary_generation, transcription_summary_messages,
+        transcription_summary_params,
     };
 
     fn wav_bytes() -> Vec<u8> {
