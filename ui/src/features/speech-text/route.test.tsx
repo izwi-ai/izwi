@@ -5,7 +5,11 @@ import { describe, expect, it, vi } from "vitest";
 import { SpeechTextPage } from "@/features/speech-text/route";
 
 vi.mock("@/features/transcription/route", () => ({
-  TranscriptionPage: () => <div data-testid="transcription-page">transcription</div>,
+  TranscriptionPage: ({ speechTextMode }: { speechTextMode?: string }) => (
+    <div data-testid="transcription-page">
+      transcription:{speechTextMode ?? "transcription"}
+    </div>
+  ),
 }));
 
 vi.mock("@/features/diarization/route", () => ({
@@ -70,6 +74,13 @@ describe("SpeechTextPage", () => {
     renderRoute("/transcription/diar-1?job_kind=diarization");
     expect(await screen.findByTestId("diarization-page")).toHaveTextContent(
       "diarization:/transcription",
+    );
+  });
+
+  it("uses SAA mode for detail routes when mode=speaker_attributed_asr", async () => {
+    renderRoute("/transcription/saa-1?mode=speaker_attributed_asr");
+    expect(await screen.findByTestId("transcription-page")).toHaveTextContent(
+      "transcription:speaker_attributed_asr",
     );
   });
 });

@@ -10,12 +10,17 @@ const apiMocks = vi.hoisted(() => ({
   listTranscriptionRecords: vi.fn(),
   listSpeechTextJobPage: vi.fn(),
   getTranscriptionRecord: vi.fn(),
+  getSpeakerAttributedAsrRecord: vi.fn(),
   getDiarizationRecord: vi.fn(),
   transcriptionRecordAudioUrl: vi.fn(),
+  speakerAttributedAsrRecordAudioUrl: vi.fn(),
   deleteTranscriptionRecord: vi.fn(),
+  deleteSpeakerAttributedAsrRecord: vi.fn(),
   deleteDiarizationRecord: vi.fn(),
   regenerateTranscriptionSummary: vi.fn(),
+  regenerateSpeakerAttributedAsrSummary: vi.fn(),
   createTranscriptionRecord: vi.fn(),
+  createSpeakerAttributedAsrRecord: vi.fn(),
   createTranscriptionRecordStream: vi.fn(),
   createDiarizationRecord: vi.fn(),
 }));
@@ -59,12 +64,19 @@ vi.mock("@/api", () => ({
     listTranscriptionRecords: apiMocks.listTranscriptionRecords,
     listSpeechTextJobPage: apiMocks.listSpeechTextJobPage,
     getTranscriptionRecord: apiMocks.getTranscriptionRecord,
+    getSpeakerAttributedAsrRecord: apiMocks.getSpeakerAttributedAsrRecord,
     getDiarizationRecord: apiMocks.getDiarizationRecord,
     transcriptionRecordAudioUrl: apiMocks.transcriptionRecordAudioUrl,
+    speakerAttributedAsrRecordAudioUrl:
+      apiMocks.speakerAttributedAsrRecordAudioUrl,
     deleteTranscriptionRecord: apiMocks.deleteTranscriptionRecord,
+    deleteSpeakerAttributedAsrRecord: apiMocks.deleteSpeakerAttributedAsrRecord,
     deleteDiarizationRecord: apiMocks.deleteDiarizationRecord,
     regenerateTranscriptionSummary: apiMocks.regenerateTranscriptionSummary,
+    regenerateSpeakerAttributedAsrSummary:
+      apiMocks.regenerateSpeakerAttributedAsrSummary,
     createTranscriptionRecord: apiMocks.createTranscriptionRecord,
+    createSpeakerAttributedAsrRecord: apiMocks.createSpeakerAttributedAsrRecord,
     createTranscriptionRecordStream: apiMocks.createTranscriptionRecordStream,
     createDiarizationRecord: apiMocks.createDiarizationRecord,
   },
@@ -133,14 +145,19 @@ function deferredPromise<T>() {
 describe("TranscriptionPage detail route", () => {
   beforeEach(() => {
     apiMocks.getTranscriptionRecord.mockReset();
+    apiMocks.getSpeakerAttributedAsrRecord.mockReset();
     apiMocks.listTranscriptionRecords.mockReset();
     apiMocks.listSpeechTextJobPage.mockReset();
     apiMocks.getDiarizationRecord.mockReset();
     apiMocks.transcriptionRecordAudioUrl.mockReset();
+    apiMocks.speakerAttributedAsrRecordAudioUrl.mockReset();
     apiMocks.deleteTranscriptionRecord.mockReset();
+    apiMocks.deleteSpeakerAttributedAsrRecord.mockReset();
     apiMocks.deleteDiarizationRecord.mockReset();
     apiMocks.regenerateTranscriptionSummary.mockReset();
+    apiMocks.regenerateSpeakerAttributedAsrSummary.mockReset();
     apiMocks.createTranscriptionRecord.mockReset();
+    apiMocks.createSpeakerAttributedAsrRecord.mockReset();
     apiMocks.createTranscriptionRecordStream.mockReset();
     apiMocks.createDiarizationRecord.mockReset();
     hookMocks.useRouteModelSelection.mockReset();
@@ -197,6 +214,7 @@ describe("TranscriptionPage detail route", () => {
     baseProps.onError = vi.fn();
 
     apiMocks.transcriptionRecordAudioUrl.mockReturnValue("/audio/transcription.wav");
+    apiMocks.speakerAttributedAsrRecordAudioUrl.mockReturnValue("/audio/saa.wav");
     apiMocks.listTranscriptionRecords.mockResolvedValue([]);
     apiMocks.listSpeechTextJobPage.mockImplementation(async () => ({
       items: await apiMocks.listTranscriptionRecords(),
@@ -207,6 +225,7 @@ describe("TranscriptionPage detail route", () => {
       },
     }));
     apiMocks.deleteTranscriptionRecord.mockResolvedValue(undefined);
+    apiMocks.deleteSpeakerAttributedAsrRecord.mockResolvedValue(undefined);
     apiMocks.deleteDiarizationRecord.mockResolvedValue(undefined);
     apiMocks.createTranscriptionRecord.mockResolvedValue({
       id: "txr-created-1",
@@ -224,6 +243,33 @@ describe("TranscriptionPage detail route", () => {
       transcription: "",
       segments: [],
       words: [],
+      summary_status: "not_requested",
+      summary_model_id: null,
+      summary_text: null,
+      summary_error: null,
+      summary_updated_at: null,
+    });
+    apiMocks.createSpeakerAttributedAsrRecord.mockResolvedValue({
+      id: "saa-created-1",
+      created_at: 1,
+      transcription_mode: "speaker_attributed_asr",
+      model_id: "Granite-Speech-4.1-2B-Plus",
+      aligner_model_id: null,
+      language: "English",
+      processing_status: "pending",
+      processing_error: null,
+      duration_secs: null,
+      processing_time_ms: 0,
+      rtf: null,
+      audio_mime_type: "audio/wav",
+      audio_filename: "clip.wav",
+      transcription: "",
+      segments: [],
+      words: [],
+      speaker_attributed_text: null,
+      speaker_turns: [],
+      saa_status: "not_requested",
+      saa_warnings: [],
       summary_status: "not_requested",
       summary_model_id: null,
       summary_text: null,
@@ -1044,8 +1090,7 @@ describe("TranscriptionPage detail route", () => {
     expect(apiMocks.createTranscriptionRecordStream).not.toHaveBeenCalled();
   });
 
-  it("uses ready Granite from the combined diarization modal without ASR or aligner requirements", async () => {
-    baseProps.selectedModel = "Granite-Speech-4.1-2B-Plus";
+  it("creates speaker-attributed ASR from the combined modal", async () => {
     baseProps.models = [
       {
         variant: "Parakeet-TDT-0.6B-v3",
@@ -1096,28 +1141,6 @@ describe("TranscriptionPage detail route", () => {
         error_message: null,
       },
     ];
-    apiMocks.getTranscriptionRecord.mockResolvedValue({
-      id: "diar-created-1",
-      created_at: 1,
-      model_id: "Granite-Speech-4.1-2B-Plus",
-      aligner_model_id: null,
-      language: "English",
-      processing_status: "processing",
-      processing_error: null,
-      duration_secs: null,
-      processing_time_ms: 0,
-      rtf: null,
-      audio_mime_type: "audio/wav",
-      audio_filename: "granite-meeting.wav",
-      transcription: "",
-      segments: [],
-      words: [],
-      summary_status: "not_requested",
-      summary_model_id: null,
-      summary_text: null,
-      summary_error: null,
-      summary_updated_at: null,
-    });
 
     renderRoute("/transcription");
 
@@ -1126,16 +1149,15 @@ describe("TranscriptionPage detail route", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: /New transcript/i }));
-    fireEvent.click(await screen.findByRole("radio", { name: "Diarization" }));
+    fireEvent.click(
+      await screen.findByRole("radio", { name: "Speaker Attributed ASR" }),
+    );
 
-    await screen.findByRole("heading", { name: "New diarization" });
-    expect(screen.getByText("Diarization stack")).toBeInTheDocument();
-    expect(screen.getByText("Loaded")).toBeInTheDocument();
-    expect(screen.queryByLabelText("Min speakers")).not.toBeInTheDocument();
-    expect(screen.queryByLabelText("Min speech (ms)")).not.toBeInTheDocument();
-    expect(
-      screen.queryByText("Load ASR and forced aligner models before diarization."),
-    ).not.toBeInTheDocument();
+    await screen.findByRole("heading", { name: "New speaker-attributed ASR" });
+    expect(screen.getByText("SAA model")).toBeInTheDocument();
+    expect(screen.getByText("Expected speakers")).toBeInTheDocument();
+    expect(screen.queryByText("Include timestamps")).not.toBeInTheDocument();
+    expect(screen.queryByText("Stream results")).not.toBeInTheDocument();
 
     const uploadButtons = screen.getAllByRole("button", {
       name: "Upload audio file",
@@ -1155,19 +1177,17 @@ describe("TranscriptionPage detail route", () => {
     });
 
     await waitFor(() =>
-      expect(apiMocks.createDiarizationRecord).toHaveBeenCalledTimes(1),
+      expect(apiMocks.createSpeakerAttributedAsrRecord).toHaveBeenCalledTimes(1),
     );
-    const request = apiMocks.createDiarizationRecord.mock.calls[0]?.[0];
+    const request = apiMocks.createSpeakerAttributedAsrRecord.mock.calls[0]?.[0];
     expect(request).toEqual(
       expect.objectContaining({
         audio_filename: "granite-meeting.wav",
         model_id: "Granite-Speech-4.1-2B-Plus",
+        min_speakers: 2,
       }),
     );
-    expect(request).not.toHaveProperty("asr_model_id");
-    expect(request).not.toHaveProperty("aligner_model_id");
-    expect(request).not.toHaveProperty("min_speech_duration_ms");
-    expect(request).not.toHaveProperty("min_silence_duration_ms");
+    expect(apiMocks.createDiarizationRecord).not.toHaveBeenCalled();
     expect(apiMocks.createTranscriptionRecordStream).not.toHaveBeenCalled();
   });
 

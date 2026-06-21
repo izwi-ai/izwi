@@ -21,16 +21,10 @@ export function isTranscriptionSummaryVariant(variant: string): boolean {
 
 export function isDiarizationVariant(variant: string): boolean {
   const normalized = variant.toLowerCase();
-  return (
-    normalized.includes("sortformer") ||
-    normalized.includes("diar") ||
-    isGraniteDiarizationVariant(variant)
-  );
+  return normalized.includes("sortformer") || normalized.includes("diar");
 }
 
-export function isGraniteDiarizationVariant(
-  variant: string | null | undefined,
-): boolean {
+export function isSpeakerAttributedAsrVariant(variant: string): boolean {
   return variant === GRANITE_SPEECH_PLUS_VARIANT;
 }
 

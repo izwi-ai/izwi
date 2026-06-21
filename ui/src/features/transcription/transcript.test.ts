@@ -72,4 +72,26 @@ describe("transcription transcript utilities", () => {
       }),
     ).toBe("Hello world");
   });
+
+  it("preserves speaker-attributed ASR turns as separate transcript lines", () => {
+    const record = {
+      duration_secs: 8,
+      transcription: "[Speaker 1]: hello [Speaker 2]: hi there",
+      speaker_attributed_text: "[Speaker 1]: hello [Speaker 2]: hi there",
+      speaker_turns: [
+        { speaker: "Speaker 1", text: "hello" },
+        { speaker: "Speaker 2", text: "hi there" },
+      ],
+      segments: [],
+      words: [],
+    };
+
+    expect(formatTranscriptionText(record)).toBe(
+      "[Speaker 1]: hello\n[Speaker 2]: hi there",
+    );
+    expect(transcriptionEntriesFromRecord(record).map((entry) => entry.text)).toEqual([
+      "[Speaker 1]: hello",
+      "[Speaker 2]: hi there",
+    ]);
+  });
 });

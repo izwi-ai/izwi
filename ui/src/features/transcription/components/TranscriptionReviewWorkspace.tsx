@@ -27,6 +27,8 @@ interface TranscriptionReviewWorkspaceProps {
     | "transcription"
     | "segments"
     | "words"
+    | "speaker_attributed_text"
+    | "speaker_turns"
     | "summary_status"
     | "summary_model_id"
     | "summary_text"

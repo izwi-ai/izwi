@@ -8,7 +8,7 @@ import { TranscriptionPage } from "@/features/transcription/route";
 function resolveSpeechTextMode(
   searchParams: URLSearchParams,
   options?: { recordId?: string },
-): "transcription" | "diarization" {
+): "transcription" | "speaker_attributed_asr" | "diarization" {
   if (!options?.recordId) {
     return "transcription";
   }
@@ -17,10 +17,16 @@ function resolveSpeechTextMode(
   if (mode === "diarization") {
     return "diarization";
   }
+  if (mode === "speaker_attributed_asr" || mode === "saa") {
+    return "speaker_attributed_asr";
+  }
 
   const jobKind = searchParams.get("job_kind")?.trim().toLowerCase();
   if (jobKind === "diarization") {
     return "diarization";
+  }
+  if (jobKind === "speaker_attributed_asr" || jobKind === "saa") {
+    return "speaker_attributed_asr";
   }
 
   return "transcription";
@@ -62,6 +68,11 @@ export function SpeechTextPage(props: SharedPageProps) {
 
   if (mode === "diarization") {
     return <DiarizationPage {...props} routeBasePath="/transcription" />;
+  }
+  if (mode === "speaker_attributed_asr") {
+    return (
+      <TranscriptionPage {...props} speechTextMode="speaker_attributed_asr" />
+    );
   }
 
   return <TranscriptionPage {...props} />;

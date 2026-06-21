@@ -175,6 +175,17 @@ export function TranscriptionRecordDetail({
     () => (record?.transcription ?? "").trim().length > 0,
     [record?.transcription],
   );
+  const isSpeakerAttributedAsr =
+    record?.transcription_mode === "speaker_attributed_asr" ||
+    record?.saa_status === "warning" ||
+    (record?.speaker_turns?.length ?? 0) > 0;
+  const saaWarning = useMemo(() => {
+    const warnings = record?.saa_warnings ?? [];
+    if (record?.saa_status !== "warning" || warnings.length === 0) {
+      return null;
+    }
+    return warnings.join(" ");
+  }, [record?.saa_status, record?.saa_warnings]);
   const statusMessage = useMemo(
     () =>
       processingStatus === "failed"
@@ -204,7 +215,9 @@ export function TranscriptionRecordDetail({
     <SpeechTextRecordShell
       title={record?.audio_filename || record?.model_id || "Transcription record"}
       onBack={onBack}
-      backLabel="Back to transcriptions"
+      backLabel={
+        isSpeakerAttributedAsr ? "Back to speech text" : "Back to transcriptions"
+      }
       metadata={
         <>
           {record ? <span>{formatCreatedAt(record.created_at)}</span> : null}
@@ -298,6 +311,15 @@ export function TranscriptionRecordDetail({
               <div className="flex items-start gap-3">
                 <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
                 <p>{statusMessage}</p>
+              </div>
+            </Card>
+          ) : null}
+
+          {saaWarning ? (
+            <Card className="border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] p-4 text-sm text-[var(--status-warning-text)]">
+              <div className="flex items-start gap-3">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                <p>{saaWarning}</p>
               </div>
             </Card>
           ) : null}

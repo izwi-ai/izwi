@@ -455,7 +455,10 @@ export interface ASRTranscribeResponse {
   };
 }
 
-export type SpeechTextJobKind = "transcription" | "diarization";
+export type SpeechTextJobKind =
+  | "transcription"
+  | "speaker_attributed_asr"
+  | "diarization";
 
 export type SpeechTextJobProcessingStatus =
   | "pending"
@@ -493,6 +496,32 @@ export interface SpeechTextTranscriptionSummary extends SpeechTextJobSummaryBase
   transcription_chars: number;
 }
 
+export type SpeakerAttributedAsrStatus =
+  | "not_requested"
+  | "ready"
+  | "warning"
+  | "failed";
+
+export interface SpeakerAttributedAsrTurn {
+  speaker: string;
+  text: string;
+  start?: number | null;
+  end?: number | null;
+}
+
+export interface SpeechTextSpeakerAttributedAsrSummary
+  extends SpeechTextJobSummaryBase {
+  kind: "speaker_attributed_asr";
+  language: string | null;
+  transcription_preview: string;
+  transcription_chars: number;
+  speaker_attributed_text_preview?: string | null;
+  speaker_attributed_text_chars?: number;
+  speaker_turn_count?: number;
+  saa_status?: SpeakerAttributedAsrStatus;
+  saa_warnings?: string[];
+}
+
 export interface SpeechTextDiarizationSummary extends SpeechTextJobSummaryBase {
   kind: "diarization";
   speaker_count: number;
@@ -504,6 +533,7 @@ export interface SpeechTextDiarizationSummary extends SpeechTextJobSummaryBase {
 
 export type SpeechTextJobSummary =
   | SpeechTextTranscriptionSummary
+  | SpeechTextSpeakerAttributedAsrSummary
   | SpeechTextDiarizationSummary;
 
 export interface SpeechTextJobBase {
@@ -534,6 +564,20 @@ export interface SpeechTextTranscriptionJob extends SpeechTextJobBase {
   words: TranscriptionWord[];
 }
 
+export interface SpeechTextSpeakerAttributedAsrJob extends SpeechTextJobBase {
+  kind: "speaker_attributed_asr";
+  aligner_model_id: string | null;
+  language: string | null;
+  transcription: string;
+  segments: TranscriptionSegment[];
+  words: TranscriptionWord[];
+  transcription_mode?: "speaker_attributed_asr";
+  speaker_attributed_text?: string | null;
+  speaker_turns?: SpeakerAttributedAsrTurn[];
+  saa_status?: SpeakerAttributedAsrStatus;
+  saa_warnings?: string[];
+}
+
 export interface SpeechTextDiarizationJob extends SpeechTextJobBase {
   kind: "diarization";
   asr_model_id: string | null;
@@ -558,7 +602,10 @@ export interface SpeechTextDiarizationJob extends SpeechTextJobBase {
   speaker_name_overrides?: Record<string, string>;
 }
 
-export type SpeechTextJob = SpeechTextTranscriptionJob | SpeechTextDiarizationJob;
+export type SpeechTextJob =
+  | SpeechTextTranscriptionJob
+  | SpeechTextSpeakerAttributedAsrJob
+  | SpeechTextDiarizationJob;
 
 export interface SpeechTextJobCreateRequestBase {
   kind: SpeechTextJobKind;
@@ -578,6 +625,16 @@ export interface SpeechTextTranscriptionJobCreateRequest
   stream?: boolean;
 }
 
+export interface SpeechTextSpeakerAttributedAsrJobCreateRequest
+  extends SpeechTextJobCreateRequestBase {
+  kind: "speaker_attributed_asr";
+  model_id?: string;
+  language?: string;
+  generate_summary?: boolean;
+  min_speakers?: number;
+  max_speakers?: number;
+}
+
 export interface SpeechTextDiarizationJobCreateRequest
   extends SpeechTextJobCreateRequestBase {
   kind: "diarization";
@@ -594,6 +651,7 @@ export interface SpeechTextDiarizationJobCreateRequest
 
 export type SpeechTextJobCreateRequest =
   | SpeechTextTranscriptionJobCreateRequest
+  | SpeechTextSpeakerAttributedAsrJobCreateRequest
   | SpeechTextDiarizationJobCreateRequest;
 
 export type SpeechTextJobQueryKind = SpeechTextJobKind | "all";
@@ -617,6 +675,12 @@ export interface TranscriptionRecordSummary {
   audio_filename: string | null;
   transcription_preview: string;
   transcription_chars: number;
+  transcription_mode?: "transcription" | "speaker_attributed_asr";
+  speaker_attributed_text_preview?: string | null;
+  speaker_attributed_text_chars?: number;
+  speaker_turn_count?: number;
+  saa_status?: SpeakerAttributedAsrStatus;
+  saa_warnings?: string[];
   summary_status?: TranscriptionSummaryStatus;
   summary_preview?: string | null;
   summary_chars?: number;
@@ -667,6 +731,7 @@ export interface TranscriptionProcessingProgress {
 export interface TranscriptionRecord {
   id: string;
   created_at: number;
+  transcription_mode?: "transcription" | "speaker_attributed_asr";
   model_id: string | null;
   aligner_model_id: string | null;
   language: string | null;
@@ -681,6 +746,10 @@ export interface TranscriptionRecord {
   transcription: string;
   segments: TranscriptionSegment[];
   words: TranscriptionWord[];
+  speaker_attributed_text?: string | null;
+  speaker_turns?: SpeakerAttributedAsrTurn[];
+  saa_status?: SpeakerAttributedAsrStatus;
+  saa_warnings?: string[];
   summary_status?: TranscriptionSummaryStatus;
   summary_model_id?: string | null;
   summary_text?: string | null;
@@ -697,6 +766,17 @@ export interface TranscriptionRecordCreateRequest {
   language?: string;
   include_timestamps?: boolean;
   generate_summary?: boolean;
+}
+
+export interface SpeakerAttributedAsrRecordCreateRequest {
+  audio_base64?: string;
+  audio_file?: Blob;
+  audio_filename?: string;
+  model_id?: string;
+  language?: string;
+  generate_summary?: boolean;
+  min_speakers?: number;
+  max_speakers?: number;
 }
 
 type TranscriptionRecordStreamEvent =
@@ -1394,7 +1474,9 @@ export class AudioApiClient {
         : {};
     const candidateKind = raw.kind;
     const explicitKind =
-      candidateKind === "transcription" || candidateKind === "diarization"
+      candidateKind === "transcription" ||
+      candidateKind === "speaker_attributed_asr" ||
+      candidateKind === "diarization"
         ? candidateKind
         : null;
     const inferredKind =
@@ -1409,7 +1491,9 @@ export class AudioApiClient {
   private resolveSpeechTextPreferredKind(
     jobKind?: SpeechTextJobQueryKind,
   ): SpeechTextJobKind | undefined {
-    return jobKind === "transcription" || jobKind === "diarization"
+    return jobKind === "transcription" ||
+      jobKind === "speaker_attributed_asr" ||
+      jobKind === "diarization"
       ? jobKind
       : undefined;
   }
@@ -2572,6 +2656,70 @@ export class AudioApiClient {
     });
   }
 
+  async listSpeakerAttributedAsrRecords(): Promise<TranscriptionRecordSummary[]> {
+    const page = await this.listSpeakerAttributedAsrRecordPage();
+    return page.items;
+  }
+
+  async listSpeakerAttributedAsrRecordPage(
+    query?: CursorPaginationQuery,
+  ): Promise<CursorPageResult<TranscriptionRecordSummary>> {
+    const page = await this.listSpeechTextJobPage({
+      ...query,
+      job_kind: "speaker_attributed_asr",
+    });
+    return {
+      items: page.items as TranscriptionRecordSummary[],
+      pagination: page.pagination,
+    };
+  }
+
+  async getSpeakerAttributedAsrRecord(
+    recordId: string,
+  ): Promise<TranscriptionRecord> {
+    const record = await this.getSpeechTextJob(recordId, {
+      job_kind: "speaker_attributed_asr",
+    });
+    return this.stripSpeechTextJobKind<TranscriptionRecord>(record);
+  }
+
+  async createSpeakerAttributedAsrRecord(
+    request: SpeakerAttributedAsrRecordCreateRequest,
+    options: SpeechTextJobUploadOptions = {},
+  ): Promise<TranscriptionRecord> {
+    const record = await this.createSpeechTextJob(
+      {
+        ...request,
+        kind: "speaker_attributed_asr",
+      },
+      options,
+    );
+    return this.stripSpeechTextJobKind<TranscriptionRecord>(record);
+  }
+
+  speakerAttributedAsrRecordAudioUrl(recordId: string): string {
+    return this.speechTextJobAudioUrl(recordId, {
+      job_kind: "speaker_attributed_asr",
+    });
+  }
+
+  async regenerateSpeakerAttributedAsrSummary(
+    recordId: string,
+  ): Promise<TranscriptionRecord> {
+    const record = await this.regenerateSpeechTextJobSummary(recordId, {
+      job_kind: "speaker_attributed_asr",
+    });
+    return this.stripSpeechTextJobKind<TranscriptionRecord>(record);
+  }
+
+  async deleteSpeakerAttributedAsrRecord(
+    recordId: string,
+  ): Promise<{ id: string; deleted: boolean }> {
+    return this.deleteSpeechTextJob(recordId, {
+      job_kind: "speaker_attributed_asr",
+    });
+  }
+
   async asrStatus(): Promise<ASRStatusResponse> {
     return {
       running: false,
@@ -2823,6 +2971,9 @@ export class AudioApiClient {
     if (request.kind === "transcription") {
       return this.buildTranscriptionRecordRequestInit(request, Boolean(request.stream));
     }
+    if (request.kind === "speaker_attributed_asr") {
+      return this.buildSpeakerAttributedAsrRecordRequestInit(request);
+    }
     return this.buildDiarizationRecordRequestInit(request);
   }
 
@@ -2943,6 +3094,58 @@ export class AudioApiClient {
         include_timestamps: Boolean(request.include_timestamps),
         generate_summary: Boolean(request.generate_summary),
         stream,
+      }),
+    };
+  }
+
+  private buildSpeakerAttributedAsrRecordRequestInit(
+    request: SpeechTextSpeakerAttributedAsrJobCreateRequest,
+  ): RequestInit {
+    if (request.audio_file) {
+      assertFirstPartyAudioUploadWithinLimit(request.audio_file);
+      const form = new FormData();
+      form.append(
+        "file",
+        request.audio_file,
+        request.audio_filename || "audio.wav",
+      );
+      if (request.model_id) {
+        form.append("model", request.model_id);
+      }
+      if (request.language) {
+        form.append("language", request.language);
+      }
+      if (request.generate_summary) {
+        form.append("generate_summary", "true");
+      }
+      if (typeof request.min_speakers === "number") {
+        form.append("min_speakers", String(request.min_speakers));
+      }
+      if (typeof request.max_speakers === "number") {
+        form.append("max_speakers", String(request.max_speakers));
+      }
+      return {
+        method: "POST",
+        body: form,
+      };
+    }
+
+    if (!request.audio_base64) {
+      throw new Error("Missing audio input");
+    }
+
+    return {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        audio_base64: request.audio_base64,
+        model: request.model_id,
+        language: request.language,
+        generate_summary: Boolean(request.generate_summary),
+        min_speakers: request.min_speakers,
+        max_speakers: request.max_speakers,
       }),
     };
   }

@@ -5,6 +5,7 @@ import {
   DIARIZATION_PREFERRED_ASR_MODELS,
   DIARIZATION_PREFERRED_MODELS,
   DIARIZATION_PREFERRED_SUMMARY_MODELS,
+  SPEAKER_ATTRIBUTED_ASR_PREFERRED_MODELS,
   TRANSCRIPTION_PREFERRED_MODELS,
   getChatRouteModelLabel,
   isThinkingChatModel,
@@ -102,10 +103,19 @@ describe("route model catalog", () => {
     expect(TRANSCRIPTION_PREFERRED_MODELS).toContain(
       "Nemotron-3.5-ASR-Streaming-0.6B",
     );
-    expect(TRANSCRIPTION_PREFERRED_MODELS).toContain(
+    expect(TRANSCRIPTION_PREFERRED_MODELS).not.toContain(
       "Granite-Speech-4.1-2B-Plus",
     );
     expect(TRANSCRIPTION_PREFERRED_MODELS[0]).toBe("Qwen3-ASR-0.6B-GGUF");
+  });
+
+  it("keeps Granite as the preferred speaker-attributed ASR model", () => {
+    expect(SPEAKER_ATTRIBUTED_ASR_PREFERRED_MODELS).toEqual([
+      "Granite-Speech-4.1-2B-Plus",
+    ]);
+    expect(DIARIZATION_PREFERRED_MODELS).not.toContain(
+      "Granite-Speech-4.1-2B-Plus",
+    );
   });
 
   it("treats Qwen3.5 models as thinking-capable chat models", () => {
