@@ -2,9 +2,9 @@ use tokio::sync::mpsc;
 
 use crate::error::{Error, Result};
 
-use super::super::output::StreamingOutput;
-use super::super::request::{EngineCoreRequest, EngineStreamPolicy};
 use super::super::metrics::record_engine_stream_backpressure;
+use super::super::output::{AsrProgress, StreamingOutput};
+use super::super::request::{EngineCoreRequest, EngineStreamPolicy};
 use super::NativeExecutor;
 
 pub(super) type StreamBackpressurePolicy = EngineStreamPolicy;
@@ -23,10 +23,7 @@ impl<'a> StreamSink<'a> {
         tx: &'a mpsc::Sender<StreamingOutput>,
         policy: StreamBackpressurePolicy,
     ) -> Self {
-        Self {
-            tx,
-            policy,
-        }
+        Self { tx, policy }
     }
 
     fn policy(&self) -> StreamBackpressurePolicy {
@@ -98,6 +95,7 @@ impl NativeExecutor {
             is_final: false,
             text: Some(text),
             stats: None,
+            asr_progress: None,
         })?;
         *sequence += 1;
         Ok(())
@@ -171,6 +169,28 @@ impl NativeExecutor {
             is_final,
             text: None,
             stats: None,
+            asr_progress: None,
+        })?;
+        *sequence += 1;
+        Ok(())
+    }
+
+    pub(super) fn stream_asr_progress_with_policy(
+        tx: &mpsc::Sender<StreamingOutput>,
+        policy: StreamBackpressurePolicy,
+        request_id: &str,
+        sequence: &mut usize,
+        progress: AsrProgress,
+    ) -> Result<()> {
+        StreamSink::with_policy(tx, policy).send(StreamingOutput {
+            request_id: request_id.to_string(),
+            sequence: *sequence,
+            samples: Vec::new(),
+            sample_rate: 0,
+            is_final: false,
+            text: None,
+            stats: None,
+            asr_progress: Some(progress),
         })?;
         *sequence += 1;
         Ok(())
@@ -262,6 +282,7 @@ mod tests {
             is_final: false,
             text: None,
             stats: None,
+            asr_progress: None,
         })
         .expect("first chunk should fit");
 
@@ -274,6 +295,7 @@ mod tests {
                 is_final: false,
                 text: None,
                 stats: None,
+                asr_progress: None,
             })
             .expect_err("full queue should fail with default policy");
 
@@ -296,6 +318,7 @@ mod tests {
             is_final: false,
             text: None,
             stats: None,
+            asr_progress: None,
         })
         .expect("first chunk should fit");
 
@@ -307,6 +330,7 @@ mod tests {
             is_final: false,
             text: None,
             stats: None,
+            asr_progress: None,
         })
         .expect("lossy policy should drop full-queue chunk");
     }
