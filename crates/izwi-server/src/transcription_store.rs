@@ -467,10 +467,6 @@ impl TranscriptionStore {
                 Expr::value(summary_updated_at),
             )
             .filter(transcription_records::Column::Id.eq(record_id.clone()))
-            .filter(transcription_records::Column::ProcessingStatus.is_in([
-                TranscriptionProcessingStatus::Pending.as_db_value(),
-                TranscriptionProcessingStatus::Processing.as_db_value(),
-            ]))
             .exec(db)
             .await
             .context("Failed to update transcription summary")?;
@@ -521,6 +517,10 @@ impl TranscriptionStore {
                 Expr::value(processing_progress_json),
             )
             .filter(transcription_records::Column::Id.eq(record_id.clone()))
+            .filter(transcription_records::Column::ProcessingStatus.is_in([
+                TranscriptionProcessingStatus::Pending.as_db_value(),
+                TranscriptionProcessingStatus::Processing.as_db_value(),
+            ]))
             .exec(db)
             .await
             .context("Failed to update transcription processing progress")?;
@@ -1305,7 +1305,7 @@ mod tests {
             .list_records_page(10, None)
             .await
             .expect("list should include progress");
-        assert_eq!(summaries[0].processing_progress, Some(progress));
+        assert_eq!(summaries[0].processing_progress, Some(progress.clone()));
 
         let completed = store
             .complete_record(
@@ -1352,6 +1352,38 @@ mod tests {
             TranscriptionSummaryStatus::Pending
         );
         assert_eq!(completed.transcription, "Hello there. General Kenobi.");
+
+        let ignored_late_progress = store
+            .update_processing_progress(created.id.clone(), Some(progress.clone()))
+            .await
+            .expect("late progress update should not fail");
+        assert!(
+            ignored_late_progress.is_none(),
+            "ready records should ignore stale progress writes"
+        );
+        let completed_after_late_progress = store
+            .get_record(created.id.clone())
+            .await
+            .expect("record reload should succeed")
+            .expect("record should still exist");
+        assert!(completed_after_late_progress.processing_progress.is_none());
+
+        let summarized = store
+            .update_summary(
+                created.id.clone(),
+                UpdateTranscriptionSummary {
+                    status: TranscriptionSummaryStatus::Ready,
+                    model_id: Some("Qwen3.5-4B".to_string()),
+                    text: Some("A concise summary.".to_string()),
+                    error: None,
+                    updated_at: None,
+                },
+            )
+            .await
+            .expect("summary update should succeed")
+            .expect("ready record should accept summary updates");
+        assert_eq!(summarized.summary_status, TranscriptionSummaryStatus::Ready);
+        assert_eq!(summarized.summary_text.as_deref(), Some("A concise summary."));
 
         std::fs::remove_dir_all(root).expect("test temp dir should be removable");
     }
