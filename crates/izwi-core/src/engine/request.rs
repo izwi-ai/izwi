@@ -123,6 +123,8 @@ pub struct EngineCoreRequest {
     pub audio_bytes: Option<Vec<u8>>,
     /// Optional ASR initial prompt/context hint.
     pub asr_prompt: Option<String>,
+    /// Whether ASR max_tokens was filled by a model-specific automatic heuristic.
+    pub asr_auto_max_tokens: bool,
     /// Reference audio for voice cloning (base64 encoded)
     pub reference_audio: Option<String>,
     /// Reference text for voice cloning
@@ -236,6 +238,7 @@ impl EngineCoreRequest {
             audio_input: None,
             audio_bytes: None,
             asr_prompt: None,
+            asr_auto_max_tokens: false,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -270,6 +273,7 @@ impl EngineCoreRequest {
             audio_input: Some(audio_base64),
             audio_bytes: None,
             asr_prompt: None,
+            asr_auto_max_tokens: false,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -304,6 +308,7 @@ impl EngineCoreRequest {
             audio_input: None,
             audio_bytes: Some(audio_bytes),
             asr_prompt: None,
+            asr_auto_max_tokens: false,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -337,6 +342,7 @@ impl EngineCoreRequest {
             audio_input: None,
             audio_bytes: None,
             asr_prompt: None,
+            asr_auto_max_tokens: false,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -371,6 +377,7 @@ impl EngineCoreRequest {
             audio_input: Some(audio_base64),
             audio_bytes: None,
             asr_prompt: None,
+            asr_auto_max_tokens: false,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -405,6 +412,7 @@ impl EngineCoreRequest {
             audio_input: None,
             audio_bytes: Some(audio_bytes),
             asr_prompt: None,
+            asr_auto_max_tokens: false,
             reference_audio: None,
             reference_text: None,
             voice_description: None,

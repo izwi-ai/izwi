@@ -24,21 +24,22 @@ mod types;
 mod voice_metrics;
 mod voice_session;
 
+pub(crate) use asr::granite_auto_asr_max_tokens_for_duration;
 pub use asr::{RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream};
 pub use conformance::{
-    capability_conformance_cases, required_conformance_capabilities,
-    CapabilityConformanceCase, ConformanceCapability, ConformanceExecutionClass,
+    capability_conformance_cases, required_conformance_capabilities, CapabilityConformanceCase,
+    ConformanceCapability, ConformanceExecutionClass,
 };
 pub use service::RuntimeService;
 pub use telemetry::{
+    runtime_trace_contracts, sanitized_replay_record, trace_contract_for_phase,
     EngineRuntimeTelemetrySnapshot, InferenceBrokerRuntimeTelemetrySnapshot,
     PipelineRuntimeTelemetrySnapshot, ReplayRedaction, RuntimeReplayRecord,
     RuntimeTelemetrySnapshot, RuntimeTraceContract, RuntimeTracePhase,
     VoiceRuntimeTelemetrySnapshot, RUNTIME_REPLAY_REDACTION, RUNTIME_TRACE_CONTRACTS,
     TRACE_CAPABILITY, TRACE_CORRELATION_ID, TRACE_ERROR_KIND, TRACE_EXECUTION_TARGET,
     TRACE_MODEL_VARIANT, TRACE_PIPELINE_KIND, TRACE_PIPELINE_STAGE, TRACE_REQUEST_ID,
-    TRACE_STREAMING_MODE, runtime_trace_contracts, sanitized_replay_record,
-    trace_contract_for_phase,
+    TRACE_STREAMING_MODE,
 };
 pub use types::{
     AsrTranscription, AudioChunk, ChatGeneration, ChunkStats, DiarizationConfig, DiarizationResult,
