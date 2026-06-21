@@ -561,11 +561,13 @@ impl ModelVariant {
     }
 
     /// Whether this model can produce persisted diarization records.
-    ///
-    /// Sortformer exposes native speaker segmentation, while Granite Speech
-    /// Plus produces diarized records through speaker-attributed transcription.
     pub fn supports_diarization_records(&self) -> bool {
-        self.is_diarization() || matches!(self, Self::GraniteSpeech412BPlus)
+        self.is_diarization()
+    }
+
+    /// Whether this model can produce model-native speaker-attributed ASR text.
+    pub fn supports_speaker_attributed_asr(&self) -> bool {
+        matches!(self, Self::GraniteSpeech412BPlus)
     }
 
     /// Whether this is a forced aligner model
