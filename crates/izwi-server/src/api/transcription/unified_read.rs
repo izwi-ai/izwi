@@ -1,21 +1,22 @@
 use axum::{
+    Json,
     body::Body,
     extract::{Path, Query, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{HeaderValue, StatusCode, header},
     response::Response,
-    Json,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::api::pagination::{encode_cursor, CursorPagination, CursorPaginationQuery};
+use crate::api::pagination::{CursorPagination, CursorPaginationQuery, encode_cursor};
 use crate::diarization_store::{
     DiarizationRecordListCursor, DiarizationRecordSummary, StoredDiarizationAudio,
 };
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::transcription_store::{
-    StoredTranscriptionAudio, TranscriptionRecordListCursor, TranscriptionRecordSummary,
+    StoredTranscriptionAudio, TranscriptionRecordListCursor, TranscriptionRecordMode,
+    TranscriptionRecordSummary,
 };
 
 const HISTORY_LIST_LIMIT: usize = 200;
@@ -24,6 +25,7 @@ const HISTORY_LIST_LIMIT: usize = 200;
 enum JobKindFilter {
     All,
     Transcription,
+    SpeakerAttributedAsr,
     Diarization,
 }
 
@@ -71,7 +73,33 @@ pub async fn list_jobs(
             let cursor = pagination.decode_cursor::<TranscriptionRecordListCursor>()?;
             let (records, next_cursor) = state
                 .transcription_store
-                .list_records_page(limit, cursor)
+                .list_records_page_for_mode(TranscriptionRecordMode::Transcription, limit, cursor)
+                .await
+                .map_err(map_store_error)?;
+            let values = records
+                .iter()
+                .map(map_transcription_summary)
+                .collect::<Vec<_>>();
+            let has_more = next_cursor.is_some();
+            let encoded_next_cursor = next_cursor.map(|value| encode_cursor(&value));
+            UnifiedJobListResponse {
+                records: values,
+                pagination: CursorPagination {
+                    next_cursor: encoded_next_cursor,
+                    has_more,
+                    limit,
+                },
+            }
+        }
+        JobKindFilter::SpeakerAttributedAsr => {
+            let cursor = pagination.decode_cursor::<TranscriptionRecordListCursor>()?;
+            let (records, next_cursor) = state
+                .transcription_store
+                .list_records_page_for_mode(
+                    TranscriptionRecordMode::SpeakerAttributedAsr,
+                    limit,
+                    cursor,
+                )
                 .await
                 .map_err(map_store_error)?;
             let values = records
@@ -187,7 +215,24 @@ pub async fn get_job(
                 .await
                 .map_err(map_store_error)?
                 .ok_or_else(|| ApiError::not_found("Transcription record not found"))?;
-            map_record_with_kind("transcription", &record)?
+            if record.transcription_mode != TranscriptionRecordMode::Transcription {
+                return Err(ApiError::not_found("Transcription record not found"));
+            }
+            map_record_with_kind(transcription_kind(record.transcription_mode), &record)?
+        }
+        JobKindFilter::SpeakerAttributedAsr => {
+            let record = state
+                .transcription_store
+                .get_record(record_id)
+                .await
+                .map_err(map_store_error)?
+                .ok_or_else(|| ApiError::not_found("Speaker-attributed ASR record not found"))?;
+            if record.transcription_mode != TranscriptionRecordMode::SpeakerAttributedAsr {
+                return Err(ApiError::not_found(
+                    "Speaker-attributed ASR record not found",
+                ));
+            }
+            map_record_with_kind(transcription_kind(record.transcription_mode), &record)?
         }
         JobKindFilter::Diarization => {
             let record = state
@@ -205,7 +250,7 @@ pub async fn get_job(
                 .await
                 .map_err(map_store_error)?
             {
-                map_record_with_kind("transcription", &record)?
+                map_record_with_kind(transcription_kind(record.transcription_mode), &record)?
             } else if let Some(record) = state
                 .diarization_store
                 .get_record(record_id)
@@ -230,12 +275,33 @@ pub async fn get_job_audio(
     let kind = parse_job_kind_filter(query.job_kind.as_deref(), true)?;
     match kind {
         JobKindFilter::Transcription => {
+            ensure_transcription_audio_kind(
+                &state,
+                record_id.as_str(),
+                TranscriptionRecordMode::Transcription,
+            )
+            .await?;
             let audio = state
                 .transcription_store
                 .get_audio(record_id)
                 .await
                 .map_err(map_store_error)?
                 .ok_or_else(|| ApiError::not_found("Transcription audio not found"))?;
+            Ok(transcription_audio_response(audio))
+        }
+        JobKindFilter::SpeakerAttributedAsr => {
+            ensure_transcription_audio_kind(
+                &state,
+                record_id.as_str(),
+                TranscriptionRecordMode::SpeakerAttributedAsr,
+            )
+            .await?;
+            let audio = state
+                .transcription_store
+                .get_audio(record_id)
+                .await
+                .map_err(map_store_error)?
+                .ok_or_else(|| ApiError::not_found("Speaker-attributed ASR audio not found"))?;
             Ok(transcription_audio_response(audio))
         }
         JobKindFilter::Diarization => {
@@ -269,10 +335,7 @@ pub async fn get_job_audio(
     }
 }
 
-fn parse_job_kind_filter(
-    raw: Option<&str>,
-    allow_all: bool,
-) -> Result<JobKindFilter, ApiError> {
+fn parse_job_kind_filter(raw: Option<&str>, allow_all: bool) -> Result<JobKindFilter, ApiError> {
     let Some(value) = raw.map(|value| value.trim().to_ascii_lowercase()) else {
         return Ok(if allow_all {
             JobKindFilter::All
@@ -292,18 +355,20 @@ fn parse_job_kind_filter(
     match value.as_str() {
         "all" if allow_all => Ok(JobKindFilter::All),
         "transcription" => Ok(JobKindFilter::Transcription),
+        "speaker_attributed_asr" | "saa" => Ok(JobKindFilter::SpeakerAttributedAsr),
         "diarization" => Ok(JobKindFilter::Diarization),
         _ => Err(ApiError::bad_request(
-            "Invalid `job_kind`. Supported values: all, transcription, diarization.",
+            "Invalid `job_kind`. Supported values: all, transcription, speaker_attributed_asr, diarization.",
         )),
     }
 }
 
 fn map_transcription_summary(record: &TranscriptionRecordSummary) -> Value {
     json!({
-        "kind": "transcription",
+        "kind": transcription_kind(record.transcription_mode),
         "id": record.id,
         "created_at": record.created_at,
+        "transcription_mode": record.transcription_mode,
         "model_id": record.model_id,
         "language": record.language,
         "processing_status": record.processing_status,
@@ -316,6 +381,11 @@ fn map_transcription_summary(record: &TranscriptionRecordSummary) -> Value {
         "audio_filename": record.audio_filename,
         "transcription_preview": record.transcription_preview,
         "transcription_chars": record.transcription_chars,
+        "speaker_attributed_text_preview": record.speaker_attributed_text_preview,
+        "speaker_attributed_text_chars": record.speaker_attributed_text_chars,
+        "speaker_turn_count": record.speaker_turn_count,
+        "saa_status": record.saa_status,
+        "saa_warnings": record.saa_warnings,
         "summary_status": record.summary_status,
         "summary_preview": record.summary_preview,
         "summary_chars": record.summary_chars,
@@ -354,6 +424,30 @@ fn map_record_with_kind<T: Serialize>(kind: &str, record: &T) -> Result<Value, A
         .ok_or_else(|| ApiError::internal("Failed serializing record payload"))?;
     object.insert("kind".to_string(), Value::String(kind.to_string()));
     Ok(payload)
+}
+
+fn transcription_kind(mode: TranscriptionRecordMode) -> &'static str {
+    match mode {
+        TranscriptionRecordMode::Transcription => "transcription",
+        TranscriptionRecordMode::SpeakerAttributedAsr => "speaker_attributed_asr",
+    }
+}
+
+async fn ensure_transcription_audio_kind(
+    state: &AppState,
+    record_id: &str,
+    expected_mode: TranscriptionRecordMode,
+) -> Result<(), ApiError> {
+    let record = state
+        .transcription_store
+        .get_record(record_id.to_string())
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("Speech text job audio not found"))?;
+    if record.transcription_mode != expected_mode {
+        return Err(ApiError::not_found("Speech text job audio not found"));
+    }
+    Ok(())
 }
 
 fn transcription_audio_response(audio: StoredTranscriptionAudio) -> Response {

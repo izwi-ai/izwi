@@ -1068,7 +1068,7 @@ fn add_speech_text_jobs_create_request_body(paths: &mut Map<String, Value>) {
 fn speech_text_job_create_json_schema() -> Value {
     json!({
         "type": "object",
-        "description": "Preview saved speech-to-text job creation request. Use job_kind=transcription for transcription jobs or job_kind=diarization for diarization jobs.",
+        "description": "Preview saved speech-to-text job creation request. Use job_kind=transcription for transcription jobs, job_kind=speaker_attributed_asr for Granite speaker-attributed ASR jobs, or job_kind=diarization for diarization jobs.",
         "properties": speech_text_job_create_properties(false),
     })
 }
@@ -1103,7 +1103,7 @@ fn speech_text_job_create_properties(include_form_aliases: bool) -> Map<String, 
         "model".to_string(),
         json!({
             "type": "string",
-            "description": "Transcription ASR model or diarization model."
+            "description": "Transcription ASR model, Granite speaker-attributed ASR model, or diarization model."
         }),
     );
     properties.insert(
@@ -1183,14 +1183,14 @@ fn speech_text_job_create_properties(include_form_aliases: bool) -> Map<String, 
         "min_speakers".to_string(),
         json!({
             "type": "integer",
-            "description": "Optional diarization minimum speaker count."
+            "description": "Optional diarization minimum speaker count, or expected minimum speaker labels for speaker-attributed ASR warnings."
         }),
     );
     properties.insert(
         "max_speakers".to_string(),
         json!({
             "type": "integer",
-            "description": "Optional diarization maximum speaker count."
+            "description": "Optional diarization maximum speaker count, or expected maximum speaker labels for speaker-attributed ASR warnings."
         }),
     );
     properties.insert(

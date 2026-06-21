@@ -522,6 +522,36 @@ mod tests {
             .expect("transcription id should exist")
             .to_string();
 
+        let saa_body = tiny_audio_json_body_with_fields(
+            r#""model_id":"Granite-Speech-4.1-2B-Plus","min_speakers":2"#,
+        );
+        let saa_create = send_request(
+            app.clone(),
+            build_request(
+                Method::POST,
+                "/v1/speech-to-text/jobs?job_kind=speaker_attributed_asr",
+                Some(saa_body.as_str()),
+            ),
+        )
+        .await;
+        assert_eq!(saa_create.status(), StatusCode::ACCEPTED);
+        let saa_body = read_json(saa_create).await;
+        assert_eq!(
+            saa_body
+                .get("transcription_mode")
+                .and_then(|value| value.as_str()),
+            Some("speaker_attributed_asr")
+        );
+        assert_eq!(
+            saa_body.get("model_id").and_then(|value| value.as_str()),
+            Some("Granite-Speech-4.1-2B-Plus")
+        );
+        let saa_id = saa_body
+            .get("id")
+            .and_then(|value| value.as_str())
+            .expect("SAA id should exist")
+            .to_string();
+
         let diarization_create = send_request(
             app.clone(),
             build_request(Method::POST, "/v1/diarizations", Some(audio_body.as_str())),
@@ -558,6 +588,48 @@ mod tests {
             kinds.contains(&"diarization"),
             "unified list should include diarization records"
         );
+        assert!(
+            kinds.contains(&"speaker_attributed_asr"),
+            "unified list should include SAA records"
+        );
+
+        let transcription_list = send_request(
+            app.clone(),
+            build_request(
+                Method::GET,
+                "/v1/speech-to-text/jobs?job_kind=transcription",
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(transcription_list.status(), StatusCode::OK);
+        let transcription_list_payload = read_json(transcription_list).await;
+        let transcription_records = transcription_list_payload
+            .get("records")
+            .and_then(|value| value.as_array())
+            .expect("transcription records array should exist");
+        assert!(transcription_records.iter().all(|record| {
+            record.get("kind").and_then(|value| value.as_str()) == Some("transcription")
+        }));
+
+        let saa_list = send_request(
+            app.clone(),
+            build_request(
+                Method::GET,
+                "/v1/speech-to-text/jobs?job_kind=speaker_attributed_asr",
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(saa_list.status(), StatusCode::OK);
+        let saa_list_payload = read_json(saa_list).await;
+        let saa_records = saa_list_payload
+            .get("records")
+            .and_then(|value| value.as_array())
+            .expect("SAA records array should exist");
+        assert!(saa_records.iter().all(|record| {
+            record.get("kind").and_then(|value| value.as_str()) == Some("speaker_attributed_asr")
+        }));
 
         let unified_list_with_limit = send_request(
             app.clone(),
@@ -596,6 +668,37 @@ mod tests {
             Some("transcription")
         );
 
+        let unified_saa_record = send_request(
+            app.clone(),
+            build_request(
+                Method::GET,
+                format!(
+                    "/v1/speech-to-text/jobs/{}?job_kind=speaker_attributed_asr",
+                    saa_id
+                )
+                .as_str(),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(unified_saa_record.status(), StatusCode::OK);
+        let saa_payload = read_json(unified_saa_record).await;
+        assert_eq!(
+            saa_payload.get("kind").and_then(|value| value.as_str()),
+            Some("speaker_attributed_asr")
+        );
+
+        let saa_as_transcription = send_request(
+            app.clone(),
+            build_request(
+                Method::GET,
+                format!("/v1/speech-to-text/jobs/{}?job_kind=transcription", saa_id).as_str(),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(saa_as_transcription.status(), StatusCode::NOT_FOUND);
+
         let unified_diarization_record = send_request(
             app.clone(),
             build_request(
@@ -632,6 +735,21 @@ mod tests {
         )
         .await;
         assert_eq!(transcription_audio.status(), StatusCode::OK);
+
+        let saa_audio = send_request(
+            app.clone(),
+            build_request(
+                Method::GET,
+                format!(
+                    "/v1/speech-to-text/jobs/{}/audio?job_kind=speaker_attributed_asr",
+                    saa_id
+                )
+                .as_str(),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(saa_audio.status(), StatusCode::OK);
 
         let diarization_audio = send_request(
             app.clone(),
@@ -699,6 +817,25 @@ mod tests {
             .get("id")
             .and_then(|value| value.as_str())
             .expect("transcription id should exist")
+            .to_string();
+
+        let saa_body =
+            tiny_audio_json_body_with_fields(r#""model_id":"Granite-Speech-4.1-2B-Plus""#);
+        let saa_create = send_request(
+            app.clone(),
+            build_request(
+                Method::POST,
+                "/v1/speech-to-text/jobs?job_kind=speaker_attributed_asr",
+                Some(saa_body.as_str()),
+            ),
+        )
+        .await;
+        assert_eq!(saa_create.status(), StatusCode::ACCEPTED);
+        let saa_id = read_json(saa_create)
+            .await
+            .get("id")
+            .and_then(|value| value.as_str())
+            .expect("SAA id should exist")
             .to_string();
 
         let diarization_create = send_request(
@@ -778,6 +915,21 @@ mod tests {
         .await;
         assert_eq!(regen_transcription_summary.status(), StatusCode::OK);
 
+        let regen_saa_summary = send_request(
+            app.clone(),
+            build_request(
+                Method::POST,
+                format!(
+                    "/v1/speech-to-text/jobs/{}/summary/regenerate?job_kind=speaker_attributed_asr",
+                    saa_id
+                )
+                .as_str(),
+                Some("{}"),
+            ),
+        )
+        .await;
+        assert_eq!(regen_saa_summary.status(), StatusCode::OK);
+
         let regen_diarization_summary = send_request(
             app.clone(),
             build_request(
@@ -807,6 +959,21 @@ mod tests {
         )
         .await;
         assert_eq!(delete_transcription.status(), StatusCode::OK);
+
+        let delete_saa = send_request(
+            app.clone(),
+            build_request(
+                Method::DELETE,
+                format!(
+                    "/v1/speech-to-text/jobs/{}?job_kind=speaker_attributed_asr",
+                    saa_id
+                )
+                .as_str(),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(delete_saa.status(), StatusCode::OK);
 
         let delete_diarization = send_request(
             app.clone(),
@@ -848,6 +1015,31 @@ mod tests {
         )
         .await;
         assert_eq!(canonical_diarization_create.status(), StatusCode::ACCEPTED);
+
+        drop(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn granite_speech_is_rejected_for_diarization_jobs() {
+        let (app, temp_dir) = test_api_app("granite_speech_is_rejected_for_diarization_jobs", true);
+        let body = tiny_audio_json_body_with_fields(r#""model_id":"Granite-Speech-4.1-2B-Plus""#);
+
+        let response = send_request(
+            app,
+            build_request(
+                Method::POST,
+                "/v1/speech-to-text/jobs?job_kind=diarization",
+                Some(body.as_str()),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = read_json(response).await;
+        let message = payload["error"]["message"]
+            .as_str()
+            .expect("error message should exist");
+        assert!(message.contains("speaker-attributed ASR"));
+        assert!(message.contains("job_kind=speaker_attributed_asr"));
 
         drop(temp_dir);
     }
@@ -1776,12 +1968,23 @@ mod tests {
     }
 
     fn tiny_audio_json_body() -> String {
+        tiny_audio_json_body_with_fields("")
+    }
+
+    fn tiny_audio_json_body_with_fields(extra_fields: &str) -> String {
         let wav = AudioEncoder::new(16_000, 1)
             .encode(&[0.0], AudioFormat::Wav)
             .expect("tiny wav should encode");
+        let extra_fields = extra_fields.trim();
+        let suffix = if extra_fields.is_empty() {
+            String::new()
+        } else {
+            format!(",{extra_fields}")
+        };
         format!(
-            r#"{{"audio_base64":"{}"}}"#,
-            base64::engine::general_purpose::STANDARD.encode(wav)
+            r#"{{"audio_base64":"{}"{}}}"#,
+            base64::engine::general_purpose::STANDARD.encode(wav),
+            suffix
         )
     }
 
