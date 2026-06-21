@@ -22,9 +22,10 @@ use crate::api::request_context::RequestContext;
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::transcription_store::{
-    CompleteTranscriptionRecord, NewTranscriptionRecord, TranscriptionProcessingStatus,
-    TranscriptionRecord, TranscriptionSegmentRecord, TranscriptionStore,
-    TranscriptionSummaryStatus, TranscriptionWordRecord, UpdateTranscriptionSummary,
+    CompleteTranscriptionRecord, NewTranscriptionRecord, SpeakerAttributedAsrStatus,
+    TranscriptionProcessingStatus, TranscriptionRecord, TranscriptionRecordMode,
+    TranscriptionSegmentRecord, TranscriptionStore, TranscriptionSummaryStatus,
+    TranscriptionWordRecord, UpdateTranscriptionSummary,
 };
 use izwi_core::{
     parse_chat_model_variant, AsrProgress, AsrProgressPhase, ChatMessage, ChatRequestConfig,
@@ -263,6 +264,7 @@ async fn create_pending_record(
     state
         .transcription_store
         .create_record(NewTranscriptionRecord {
+            transcription_mode: TranscriptionRecordMode::Transcription,
             model_id: parsed.model_id.clone(),
             aligner_model_id: parsed.aligner_model_id.clone(),
             language: parsed.language.clone(),
@@ -281,6 +283,10 @@ async fn create_pending_record(
             transcription: String::new(),
             segments: Vec::new(),
             words: Vec::new(),
+            speaker_attributed_text: None,
+            speaker_turns: Vec::new(),
+            saa_status: SpeakerAttributedAsrStatus::NotRequested,
+            saa_warnings: Vec::new(),
             summary_status: TranscriptionSummaryStatus::NotRequested,
             summary_model_id: None,
             summary_text: None,
@@ -452,6 +458,7 @@ fn spawn_transcription_processing_task(
                     .complete_record(
                         record_id.clone(),
                         CompleteTranscriptionRecord {
+                            transcription_mode: TranscriptionRecordMode::Transcription,
                             model_id,
                             aligner_model_id: artifacts.aligner_model_id,
                             language: artifacts.language,
@@ -461,6 +468,10 @@ fn spawn_transcription_processing_task(
                             transcription: artifacts.text,
                             segments: artifacts.segments,
                             words: artifacts.words,
+                            speaker_attributed_text: None,
+                            speaker_turns: Vec::new(),
+                            saa_status: SpeakerAttributedAsrStatus::NotRequested,
+                            saa_warnings: Vec::new(),
                             summary_status,
                             summary_model_id,
                             summary_text: None,

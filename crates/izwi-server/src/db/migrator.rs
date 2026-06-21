@@ -133,6 +133,7 @@ const BASELINE_SCHEMA: &[&str] = &[
     CREATE TABLE IF NOT EXISTS transcription_records (
         id TEXT PRIMARY KEY,
         created_at INTEGER NOT NULL,
+        transcription_mode TEXT NOT NULL DEFAULT 'transcription',
         model_id TEXT NULL,
         aligner_model_id TEXT NULL,
         language TEXT NULL,
@@ -148,6 +149,10 @@ const BASELINE_SCHEMA: &[&str] = &[
         transcription TEXT NOT NULL,
         segments_json TEXT NOT NULL DEFAULT '[]',
         words_json TEXT NOT NULL DEFAULT '[]',
+        speaker_attributed_text TEXT NULL,
+        speaker_turns_json TEXT NOT NULL DEFAULT '[]',
+        saa_status TEXT NOT NULL DEFAULT 'not_requested',
+        saa_warnings_json TEXT NOT NULL DEFAULT '[]',
         summary_status TEXT NOT NULL DEFAULT 'not_requested',
         summary_model_id TEXT NULL,
         summary_text TEXT NULL,
@@ -344,6 +349,11 @@ const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
     },
     CompatibilityColumn {
         table: "transcription_records",
+        column: "transcription_mode",
+        definition: "TEXT NOT NULL DEFAULT 'transcription'",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
         column: "aligner_model_id",
         definition: "TEXT NULL",
     },
@@ -370,6 +380,26 @@ const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
     CompatibilityColumn {
         table: "transcription_records",
         column: "words_json",
+        definition: "TEXT NOT NULL DEFAULT '[]'",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "speaker_attributed_text",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "speaker_turns_json",
+        definition: "TEXT NOT NULL DEFAULT '[]'",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "saa_status",
+        definition: "TEXT NOT NULL DEFAULT 'not_requested'",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "saa_warnings_json",
         definition: "TEXT NOT NULL DEFAULT '[]'",
     },
     CompatibilityColumn {

@@ -151,6 +151,7 @@ pub mod transcription_records {
         #[sea_orm(primary_key, auto_increment = false)]
         pub id: String,
         pub created_at: i64,
+        pub transcription_mode: String,
         pub model_id: Option<String>,
         pub aligner_model_id: Option<String>,
         pub language: Option<String>,
@@ -166,6 +167,10 @@ pub mod transcription_records {
         pub transcription: String,
         pub segments_json: String,
         pub words_json: String,
+        pub speaker_attributed_text: Option<String>,
+        pub speaker_turns_json: String,
+        pub saa_status: String,
+        pub saa_warnings_json: String,
         pub summary_status: String,
         pub summary_model_id: Option<String>,
         pub summary_text: Option<String>,
