@@ -12,7 +12,9 @@ use candle_nn::{
 
 use crate::backends::DeviceProfile;
 use crate::error::{Error, Result};
-use crate::kernels::{try_fused_rms_norm, try_fused_silu_mul_with_status};
+use crate::kernels::{
+    try_fused_rms_norm, try_fused_rope_pair_bshd, try_fused_silu_mul_with_status,
+};
 use crate::models::architectures::qwen3::core::{causal_mask, repeat_kv, Qwen3Cache};
 use crate::models::shared::attention::flash::{
     try_fused_self_attention, try_fused_self_attention_scaled,
@@ -292,6 +294,19 @@ fn granite_rope_bhtd_kernel_enabled(device: &Device, dtype: DType, head_dim: usi
     matches!(dtype, DType::F16 | DType::BF16 | DType::F32)
 }
 
+fn granite_rope_pair_bshd_kernel_enabled(device: &Device, dtype: DType, head_dim: usize) -> bool {
+    let override_enabled = std::env::var("IZWI_GRANITE_ROPE_PAIR_BSHD_KERNEL")
+        .ok()
+        .and_then(|raw| parse_env_bool(&raw));
+    if !granite_rope_pair_bshd_kernel_policy(device.is_metal(), override_enabled) {
+        return false;
+    }
+    if head_dim == 0 || head_dim % 2 != 0 {
+        return false;
+    }
+    matches!(dtype, DType::F16 | DType::F32)
+}
+
 fn granite_rope_kernel_policy(
     _is_metal: bool,
     is_cuda: bool,
@@ -301,6 +316,10 @@ fn granite_rope_kernel_policy(
 }
 
 fn granite_rope_bhtd_kernel_policy(is_metal: bool, override_enabled: Option<bool>) -> bool {
+    override_enabled.unwrap_or(is_metal)
+}
+
+fn granite_rope_pair_bshd_kernel_policy(is_metal: bool, override_enabled: Option<bool>) -> bool {
     override_enabled.unwrap_or(is_metal)
 }
 
@@ -1888,6 +1907,7 @@ impl GraniteLanguageModel {
                             x.device(),
                             x.dtype(),
                         )
+                        .and_then(|(cos, sin)| GraniteRopeSlice::new(cos, sin))
                     })
             })
             .transpose()?;
@@ -1989,7 +2009,7 @@ impl GraniteDecoderLayer {
         start_pos: usize,
         cache: Option<&mut Qwen3Cache>,
         layer_idx: usize,
-        rope: Option<&(Tensor, Tensor)>,
+        rope: Option<&GraniteRopeSlice>,
         mut profile: Option<&mut GraniteSpeechLayerDecodeProfile>,
     ) -> Result<Tensor> {
         let profiling = profile.is_some();
@@ -2325,7 +2345,7 @@ impl GraniteTextAttention {
         start_pos: usize,
         cache: Option<&mut Qwen3Cache>,
         layer_idx: usize,
-        rope: Option<&(Tensor, Tensor)>,
+        rope: Option<&GraniteRopeSlice>,
         mut profile: Option<&mut GraniteSpeechAttentionDecodeProfile>,
     ) -> Result<Tensor> {
         let profiling = profile.is_some();
@@ -2344,23 +2364,44 @@ impl GraniteTextAttention {
             profile.qkv += profile_elapsed(qkv_start);
         }
         let rope_start = profile_start(profiling);
-        let (cos, sin) = match rope {
-            Some((cos, sin)) => (cos.clone(), sin.clone()),
-            None => build_rope_cache(
-                seq_len,
-                self.head_dim,
-                start_pos,
-                self.rope_theta,
-                x.device(),
-                q.dtype(),
-            )?,
+        let rope_slice = match rope {
+            Some(slice) => slice.clone(),
+            None => {
+                let (cos, sin) = build_rope_cache(
+                    seq_len,
+                    self.head_dim,
+                    start_pos,
+                    self.rope_theta,
+                    x.device(),
+                    q.dtype(),
+                )?;
+                GraniteRopeSlice::new(cos, sin)?
+            }
         };
-        let (cos, sin) = if cos.dtype() == q.dtype() && sin.dtype() == q.dtype() {
-            (cos, sin)
+        let (cos, sin, packed) = if rope_slice.cos.dtype() == q.dtype()
+            && rope_slice.sin.dtype() == q.dtype()
+            && rope_slice.packed.dtype() == q.dtype()
+        {
+            (rope_slice.cos, rope_slice.sin, rope_slice.packed)
         } else {
-            (cos.to_dtype(q.dtype())?, sin.to_dtype(q.dtype())?)
+            (
+                rope_slice.cos.to_dtype(q.dtype())?,
+                rope_slice.sin.to_dtype(q.dtype())?,
+                rope_slice.packed.to_dtype(q.dtype())?,
+            )
         };
-        if granite_rope_bhtd_kernel_enabled(q.device(), q.dtype(), self.head_dim) {
+        let direct_rope =
+            if granite_rope_pair_bshd_kernel_enabled(q.device(), q.dtype(), self.head_dim) {
+                try_fused_rope_pair_bshd(&q, &k, &packed)
+            } else {
+                None
+            };
+        if let Some((q_out, k_out)) = direct_rope {
+            record_rope_kernel();
+            record_rope_kernel();
+            q = q_out;
+            k = k_out;
+        } else if granite_rope_bhtd_kernel_enabled(q.device(), q.dtype(), self.head_dim) {
             if let Some((q_out, k_out)) = try_apply_granite_rope_pair_bhtd(&q, &k, &cos, &sin)? {
                 record_rope_kernel();
                 record_rope_kernel();
@@ -2538,6 +2579,21 @@ fn granite_qformer_fused_attention_allowed(device: &Device) -> bool {
 struct GraniteRopeCache {
     cos: Tensor,
     sin: Tensor,
+    packed: Tensor,
+}
+
+#[derive(Debug, Clone)]
+struct GraniteRopeSlice {
+    cos: Tensor,
+    sin: Tensor,
+    packed: Tensor,
+}
+
+impl GraniteRopeSlice {
+    fn new(cos: Tensor, sin: Tensor) -> Result<Self> {
+        let packed = Tensor::cat(&[&cos, &sin], 1)?;
+        Ok(Self { cos, sin, packed })
+    }
 }
 
 impl GraniteRopeCache {
@@ -2549,19 +2605,21 @@ impl GraniteRopeCache {
         dtype: DType,
     ) -> Result<Self> {
         let (cos, sin) = build_rope_cache(total_len, head_dim, 0, rope_theta, device, dtype)?;
-        Ok(Self { cos, sin })
+        let packed = Tensor::cat(&[&cos, &sin], 1)?;
+        Ok(Self { cos, sin, packed })
     }
 
-    fn slice(&self, start_pos: usize, seq_len: usize) -> Result<(Tensor, Tensor)> {
+    fn slice(&self, start_pos: usize, seq_len: usize) -> Result<GraniteRopeSlice> {
         if start_pos.saturating_add(seq_len) > self.cos.dim(0)? {
             return Err(Error::InferenceError(format!(
                 "Granite RoPE cache too short for start_pos={start_pos}, seq_len={seq_len}"
             )));
         }
-        Ok((
-            self.cos.narrow(0, start_pos, seq_len)?,
-            self.sin.narrow(0, start_pos, seq_len)?,
-        ))
+        Ok(GraniteRopeSlice {
+            cos: self.cos.narrow(0, start_pos, seq_len)?,
+            sin: self.sin.narrow(0, start_pos, seq_len)?,
+            packed: self.packed.narrow(0, start_pos, seq_len)?,
+        })
     }
 }
 
@@ -3113,12 +3171,14 @@ mod tests {
     fn granite_rope_cache_slice_matches_direct_build() {
         let device = Device::Cpu;
         let cache = GraniteRopeCache::build(16, 4, 10000.0, &device, DType::F32).unwrap();
-        let (cached_cos, cached_sin) = cache.slice(5, 3).unwrap();
+        let cached = cache.slice(5, 3).unwrap();
         let (direct_cos, direct_sin) =
             build_rope_cache(3, 4, 5, 10000.0, &device, DType::F32).unwrap();
+        let direct_packed = Tensor::cat(&[&direct_cos, &direct_sin], 1).unwrap();
 
-        assert_tensor_close(&cached_cos, &direct_cos);
-        assert_tensor_close(&cached_sin, &direct_sin);
+        assert_tensor_close(&cached.cos, &direct_cos);
+        assert_tensor_close(&cached.sin, &direct_sin);
+        assert_tensor_close(&cached.packed, &direct_packed);
     }
 
     #[test]
@@ -3222,6 +3282,14 @@ mod tests {
         assert!(!granite_rope_bhtd_kernel_policy(false, None));
         assert!(granite_rope_bhtd_kernel_policy(false, Some(true)));
         assert!(!granite_rope_bhtd_kernel_policy(true, Some(false)));
+    }
+
+    #[test]
+    fn granite_rope_pair_bshd_kernel_defaults_to_metal_only() {
+        assert!(granite_rope_pair_bshd_kernel_policy(true, None));
+        assert!(!granite_rope_pair_bshd_kernel_policy(false, None));
+        assert!(granite_rope_pair_bshd_kernel_policy(false, Some(true)));
+        assert!(!granite_rope_pair_bshd_kernel_policy(true, Some(false)));
     }
 
     #[test]

@@ -156,6 +156,22 @@ pub fn try_fused_rms_norm(input: &Tensor, weight: &Tensor, eps: f64) -> Option<T
     None
 }
 
+pub fn try_fused_rope_pair_bshd(
+    q: &Tensor,
+    k: &Tensor,
+    cos_sin: &Tensor,
+) -> Option<(Tensor, Tensor)> {
+    if !use_fused_kernels_for_device(q.device()) {
+        return None;
+    }
+
+    if q.device().is_metal() {
+        return metal::try_fused_rope_pair_bshd(q, k, cos_sin);
+    }
+
+    None
+}
+
 pub fn try_fused_gated_rms_norm(
     hidden: &Tensor,
     gate: &Tensor,

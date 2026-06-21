@@ -223,6 +223,86 @@ kernel void izwi_rms_norm_f16(
         output[row_offset + idx] = half(value * scale * float(weight[idx]));
     }
 }
+
+kernel void izwi_rope_pair_bshd_f32(
+    device const float* q [[buffer(0)]],
+    device const float* k [[buffer(1)]],
+    device const float* cos_sin [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& q_rows [[buffer(4)]],
+    constant uint& k_rows [[buffer(5)]],
+    constant uint& seq_len [[buffer(6)]],
+    constant uint& q_heads [[buffer(7)]],
+    constant uint& k_heads [[buffer(8)]],
+    constant uint& head_dim [[buffer(9)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const uint half_dim = head_dim / 2;
+    const uint elem_count = (q_rows + k_rows) * head_dim;
+    if (gid >= elem_count) {
+        return;
+    }
+
+    const uint out_row = gid / head_dim;
+    const uint dim = gid - (out_row * head_dim);
+    const bool is_q = out_row < q_rows;
+    const uint local_row = is_q ? out_row : (out_row - q_rows);
+    const uint heads = is_q ? q_heads : k_heads;
+    const uint pos = (local_row / heads) % seq_len;
+    const uint in_base = local_row * head_dim;
+    const device float* input = is_q ? q : k;
+    const uint pair_dim = dim < half_dim ? dim : (dim - half_dim);
+    const float cos_value = cos_sin[pos * head_dim + pair_dim];
+    const float sin_value = cos_sin[pos * head_dim + half_dim + pair_dim];
+    const float x1 = input[in_base + pair_dim];
+    const float x2 = input[in_base + half_dim + pair_dim];
+
+    if (dim < half_dim) {
+        output[gid] = x1 * cos_value - x2 * sin_value;
+    } else {
+        output[gid] = x1 * sin_value + x2 * cos_value;
+    }
+}
+
+kernel void izwi_rope_pair_bshd_f16(
+    device const half* q [[buffer(0)]],
+    device const half* k [[buffer(1)]],
+    device const half* cos_sin [[buffer(2)]],
+    device half* output [[buffer(3)]],
+    constant uint& q_rows [[buffer(4)]],
+    constant uint& k_rows [[buffer(5)]],
+    constant uint& seq_len [[buffer(6)]],
+    constant uint& q_heads [[buffer(7)]],
+    constant uint& k_heads [[buffer(8)]],
+    constant uint& head_dim [[buffer(9)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const uint half_dim = head_dim / 2;
+    const uint elem_count = (q_rows + k_rows) * head_dim;
+    if (gid >= elem_count) {
+        return;
+    }
+
+    const uint out_row = gid / head_dim;
+    const uint dim = gid - (out_row * head_dim);
+    const bool is_q = out_row < q_rows;
+    const uint local_row = is_q ? out_row : (out_row - q_rows);
+    const uint heads = is_q ? q_heads : k_heads;
+    const uint pos = (local_row / heads) % seq_len;
+    const uint in_base = local_row * head_dim;
+    const device half* input = is_q ? q : k;
+    const uint pair_dim = dim < half_dim ? dim : (dim - half_dim);
+    const float cos_value = float(cos_sin[pos * head_dim + pair_dim]);
+    const float sin_value = float(cos_sin[pos * head_dim + half_dim + pair_dim]);
+    const float x1 = float(input[in_base + pair_dim]);
+    const float x2 = float(input[in_base + half_dim + pair_dim]);
+
+    if (dim < half_dim) {
+        output[gid] = half(x1 * cos_value - x2 * sin_value);
+    } else {
+        output[gid] = half(x1 * sin_value + x2 * cos_value);
+    }
+}
 "#;
 
 #[cfg(feature = "metal")]
@@ -659,6 +739,183 @@ fn rms_norm_pipeline(device: &MetalDevice, dtype: DType) -> CandleResult<Compute
     Ok(pipeline)
 }
 
+#[cfg(feature = "metal")]
+#[derive(Debug, Clone, Copy)]
+struct RopePairBshdOp {
+    q_rows: usize,
+    k_rows: usize,
+    seq_len: usize,
+    q_heads: usize,
+    k_heads: usize,
+    head_dim: usize,
+}
+
+#[cfg(feature = "metal")]
+impl CustomOp3 for RopePairBshdOp {
+    fn name(&self) -> &'static str {
+        "izwi-rope-pair-bshd-metal"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> CandleResult<(CpuStorage, Shape)> {
+        bail!("izwi-rope-pair-bshd-metal requires Metal tensors")
+    }
+
+    fn metal_fwd(
+        &self,
+        q_storage: &MetalStorage,
+        q_layout: &Layout,
+        k_storage: &MetalStorage,
+        k_layout: &Layout,
+        cos_sin_storage: &MetalStorage,
+        cos_sin_layout: &Layout,
+    ) -> CandleResult<(MetalStorage, Shape)> {
+        let dtype = q_storage.dtype();
+        if k_storage.dtype() != dtype || cos_sin_storage.dtype() != dtype {
+            bail!("izwi-rope-pair-bshd-metal requires matching dtypes")
+        }
+        if !matches!(dtype, DType::F32 | DType::F16) {
+            bail!("izwi-rope-pair-bshd-metal only supports F32 and F16 tensors")
+        }
+        if !q_layout.is_contiguous() || !k_layout.is_contiguous() || !cos_sin_layout.is_contiguous()
+        {
+            bail!("izwi-rope-pair-bshd-metal requires contiguous tensors")
+        }
+        if self.seq_len == 0
+            || self.q_heads == 0
+            || self.k_heads == 0
+            || self.head_dim == 0
+            || self.head_dim % 2 != 0
+        {
+            bail!("izwi-rope-pair-bshd-metal requires non-empty even head_dim")
+        }
+        if q_layout.shape().elem_count() != self.q_rows.saturating_mul(self.head_dim) {
+            bail!("izwi-rope-pair-bshd-metal q shape does not match rows/head_dim")
+        }
+        if k_layout.shape().elem_count() != self.k_rows.saturating_mul(self.head_dim) {
+            bail!("izwi-rope-pair-bshd-metal k shape does not match rows/head_dim")
+        }
+        if cos_sin_layout.shape().elem_count() != self.seq_len.saturating_mul(self.head_dim) {
+            bail!("izwi-rope-pair-bshd-metal packed cos/sin shape mismatch")
+        }
+        if self.q_rows % self.q_heads != 0
+            || self.k_rows % self.k_heads != 0
+            || (self.q_rows / self.q_heads) % self.seq_len != 0
+            || (self.k_rows / self.k_heads) % self.seq_len != 0
+        {
+            bail!("izwi-rope-pair-bshd-metal rows do not match heads/seq_len")
+        }
+
+        let rows = self.q_rows.saturating_add(self.k_rows);
+        let elem_count = rows.saturating_mul(self.head_dim);
+        if elem_count > u32::MAX as usize
+            || self.q_rows > u32::MAX as usize
+            || self.k_rows > u32::MAX as usize
+            || self.seq_len > u32::MAX as usize
+            || self.q_heads > u32::MAX as usize
+            || self.k_heads > u32::MAX as usize
+            || self.head_dim > u32::MAX as usize
+        {
+            bail!("izwi-rope-pair-bshd-metal tensor is too large")
+        }
+
+        let device = q_storage.device().clone();
+        let output = device.new_buffer(elem_count, dtype, "izwi-rope-pair-bshd")?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("izwi-rope-pair-bshd");
+        let pipeline = rope_pair_bshd_pipeline(device.metal_device(), dtype)?;
+        encoder.set_compute_pipeline_state(&pipeline);
+
+        encoder.set_buffer(
+            0,
+            Some(q_storage.buffer()),
+            q_layout.start_offset() * dtype.size_in_bytes(),
+        );
+        encoder.set_buffer(
+            1,
+            Some(k_storage.buffer()),
+            k_layout.start_offset() * dtype.size_in_bytes(),
+        );
+        encoder.set_buffer(
+            2,
+            Some(cos_sin_storage.buffer()),
+            cos_sin_layout.start_offset() * dtype.size_in_bytes(),
+        );
+        encoder.set_buffer(3, Some(&output), 0);
+        encoder.set_bytes(4, &(self.q_rows as u32));
+        encoder.set_bytes(5, &(self.k_rows as u32));
+        encoder.set_bytes(6, &(self.seq_len as u32));
+        encoder.set_bytes(7, &(self.q_heads as u32));
+        encoder.set_bytes(8, &(self.k_heads as u32));
+        encoder.set_bytes(9, &(self.head_dim as u32));
+
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        encoder.dispatch_threads(
+            objc2_metal::MTLSize {
+                width: elem_count,
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: threads_per_threadgroup,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        Ok((
+            MetalStorage::new(output, device, elem_count, dtype),
+            Shape::from((rows, self.head_dim)),
+        ))
+    }
+}
+
+#[cfg(feature = "metal")]
+fn rope_pair_bshd_pipeline(device: &MetalDevice, dtype: DType) -> CandleResult<ComputePipeline> {
+    static PIPELINES: OnceLock<Mutex<HashMap<(u64, DType), ComputePipeline>>> = OnceLock::new();
+    let registry_id = device.registry_id();
+    let pipelines = PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (registry_id, dtype);
+
+    if let Some(pipeline) = pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .get(&key)
+        .cloned()
+    {
+        return Ok(pipeline);
+    }
+
+    let function_name = match dtype {
+        DType::F32 => "izwi_rope_pair_bshd_f32",
+        DType::F16 => "izwi_rope_pair_bshd_f16",
+        _ => bail!("izwi-rope-pair-bshd-metal only supports F32 and F16 tensors"),
+    };
+    let library = device
+        .new_library_with_source(IZWI_METAL_SOURCE, None)
+        .map_err(candle_core::Error::wrap)?;
+    let function = library
+        .get_function(function_name, None)
+        .map_err(candle_core::Error::wrap)?;
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(candle_core::Error::wrap)?;
+
+    pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .insert(key, pipeline.clone());
+
+    Ok(pipeline)
+}
+
 /// Try fused gated delta recurrent computation.
 ///
 /// This fuses multiple operations:
@@ -956,6 +1213,79 @@ pub fn try_fused_rms_norm(input: &Tensor, weight: &Tensor, eps: f64) -> Option<T
                 },
             )
             .ok();
+    }
+
+    #[allow(unreachable_code)]
+    None
+}
+
+/// Try fused RoPE for q/k tensors in `[batch, seq, heads, head_dim]` layout.
+///
+/// `cos_sin` is packed as `[seq, head_dim]`, with cos in the first half of the
+/// last dimension and sin in the second half.
+pub fn try_fused_rope_pair_bshd(
+    q: &Tensor,
+    k: &Tensor,
+    cos_sin: &Tensor,
+) -> Option<(Tensor, Tensor)> {
+    #[cfg(not(feature = "metal"))]
+    let _ = (q, k, cos_sin);
+
+    if !use_fused_kernels() {
+        return None;
+    }
+
+    #[cfg(feature = "metal")]
+    {
+        let (q_bsz, q_seq, q_heads, q_head_dim) = q.dims4().ok()?;
+        let (k_bsz, k_seq, k_heads, k_head_dim) = k.dims4().ok()?;
+        if q_bsz != k_bsz
+            || q_seq != k_seq
+            || q_head_dim != k_head_dim
+            || q_head_dim == 0
+            || q_head_dim % 2 != 0
+            || cos_sin.dims() != [q_seq, q_head_dim]
+            || !q.device().is_metal()
+            || !k.device().is_metal()
+            || !cos_sin.device().is_metal()
+            || !q.device().same_device(k.device())
+            || !q.device().same_device(cos_sin.device())
+            || q.dtype() != k.dtype()
+            || q.dtype() != cos_sin.dtype()
+            || !matches!(q.dtype(), DType::F32 | DType::F16)
+            || !q.is_contiguous()
+            || !k.is_contiguous()
+            || !cos_sin.is_contiguous()
+        {
+            return None;
+        }
+        let q_rows = q_bsz.checked_mul(q_seq)?.checked_mul(q_heads)?;
+        let k_rows = k_bsz.checked_mul(k_seq)?.checked_mul(k_heads)?;
+        let fused = q
+            .apply_op3_no_bwd(
+                k,
+                cos_sin,
+                &RopePairBshdOp {
+                    q_rows,
+                    k_rows,
+                    seq_len: q_seq,
+                    q_heads,
+                    k_heads,
+                    head_dim: q_head_dim,
+                },
+            )
+            .ok()?;
+        let q_out = fused
+            .narrow(0, 0, q_rows)
+            .ok()?
+            .reshape((q_bsz, q_seq, q_heads, q_head_dim))
+            .ok()?;
+        let k_out = fused
+            .narrow(0, q_rows, k_rows)
+            .ok()?
+            .reshape((k_bsz, k_seq, k_heads, k_head_dim))
+            .ok()?;
+        return Some((q_out, k_out));
     }
 
     #[allow(unreachable_code)]
@@ -1385,6 +1715,16 @@ mod tests {
         assert!(try_fused_rms_norm(&input, &weight, 1e-6).is_none());
     }
 
+    #[test]
+    fn rope_pair_bshd_returns_none_on_cpu() {
+        let device = Device::Cpu;
+        let q = Tensor::zeros((1, 1, 2, 4), DType::F32, &device).unwrap();
+        let k = Tensor::zeros((1, 1, 1, 4), DType::F32, &device).unwrap();
+        let cos_sin = Tensor::zeros((1, 4), DType::F32, &device).unwrap();
+
+        assert!(try_fused_rope_pair_bshd(&q, &k, &cos_sin).is_none());
+    }
+
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_rms_norm_kernel_matches_reference_if_available() {
@@ -1431,6 +1771,114 @@ mod tests {
                 assert!(
                     (actual - expected).abs() <= tolerance,
                     "{dtype:?} mismatch at {idx}: {actual} != {expected}"
+                );
+            }
+        }
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn metal_rope_pair_bshd_kernel_matches_reference_if_available() {
+        let Ok(device) = Device::new_metal(0) else {
+            return;
+        };
+        for dtype in [DType::F32, DType::F16] {
+            let q = Tensor::from_vec(
+                vec![
+                    0.2f32, -0.4, 0.6, 0.8, //
+                    -1.0, 1.2, -1.4, 1.6, //
+                    1.8, -2.0, 2.2, -2.4, //
+                    -2.6, 2.8, -3.0, 3.2,
+                ],
+                (1, 2, 2, 4),
+                &device,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            let k = Tensor::from_vec(
+                vec![
+                    0.3f32, -0.5, 0.7, -0.9, //
+                    1.1, -1.3, 1.5, -1.7,
+                ],
+                (1, 2, 1, 4),
+                &device,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            let cos = Tensor::from_vec(vec![0.9f32, 0.8, 0.7, 0.6], (2, 2), &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let sin = Tensor::from_vec(vec![0.1f32, 0.2, 0.3, 0.4], (2, 2), &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let cos_sin = Tensor::cat(&[&cos, &sin], 1).unwrap();
+
+            let (q_out, k_out) = try_fused_rope_pair_bshd(&q, &k, &cos_sin)
+                .expect("fused RoPE pair should run on Metal");
+            let q_ref = candle_nn::rotary_emb::rope(
+                &q.transpose(1, 2).unwrap().contiguous().unwrap(),
+                &cos,
+                &sin,
+            )
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+            let k_ref = candle_nn::rotary_emb::rope(
+                &k.transpose(1, 2).unwrap().contiguous().unwrap(),
+                &cos,
+                &sin,
+            )
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+
+            let q_out = q_out
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let q_ref = q_ref
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let k_out = k_out
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let k_ref = k_ref
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let tolerance = if dtype == DType::F16 { 5e-3 } else { 1e-5 };
+            for (idx, (actual, expected)) in q_out.iter().zip(q_ref.iter()).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "{dtype:?} q mismatch at {idx}: {actual} != {expected}"
+                );
+            }
+            for (idx, (actual, expected)) in k_out.iter().zip(k_ref.iter()).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "{dtype:?} k mismatch at {idx}: {actual} != {expected}"
                 );
             }
         }
