@@ -11,7 +11,7 @@ use crate::engine::EngineCoreRequest;
 use crate::error::{Error, Result};
 use crate::runtime::audio_io::{base64_decode, decode_audio_bytes};
 
-use super::super::output::StreamingOutput;
+use super::super::output::{AsrProgress, AsrProgressPhase, StreamingOutput};
 use super::super::request::EngineStreamPolicy;
 use super::NativeExecutor;
 
@@ -572,6 +572,16 @@ impl NativeExecutor {
             samples.len() as f32 / sample_rate.max(1) as f32
         );
 
+        if let Some(tx) = stream_tx {
+            Self::stream_asr_progress_with_policy(
+                tx,
+                stream_policy,
+                request_id,
+                sequence,
+                Self::asr_processing_progress(chunk_plan, sample_rate),
+            )?;
+        }
+
         let mut assembler = TranscriptAssembler::new(chunk_cfg.clone());
         let mut deferred_boundary_delta = String::new();
         let mut emitted_stream_chars = 0usize;
@@ -596,6 +606,21 @@ impl NativeExecutor {
             }
             let chunk_audio = &samples[chunk.start_sample..chunk.end_sample];
             let prefix_text = assembler.text().to_string();
+            if let Some(tx) = stream_tx {
+                Self::stream_asr_progress_with_policy(
+                    tx,
+                    stream_policy,
+                    request_id,
+                    sequence,
+                    Self::asr_chunk_progress(
+                        AsrProgressPhase::ChunkStarted,
+                        idx,
+                        chunk,
+                        chunk_plan,
+                        sample_rate,
+                    ),
+                )?;
+            }
             let chunk_started = Instant::now();
             let chunk_result = transcribe_chunk(chunk_audio, sample_rate, prefix_text.as_str())?;
             let chunk_text = chunk_result.text.clone();
@@ -609,6 +634,21 @@ impl NativeExecutor {
                 &chunk_text,
                 chunk_result.diagnostics,
             ));
+            if let Some(tx) = stream_tx {
+                Self::stream_asr_progress_with_policy(
+                    tx,
+                    stream_policy,
+                    request_id,
+                    sequence,
+                    Self::asr_chunk_progress(
+                        AsrProgressPhase::ChunkFinished,
+                        idx,
+                        chunk,
+                        chunk_plan,
+                        sample_rate,
+                    ),
+                )?;
+            }
             let mut delta = assembler.push_chunk_text(&chunk_text);
             let is_last_chunk = idx + 1 == chunk_plan.len();
 
@@ -683,6 +723,13 @@ impl NativeExecutor {
         }
 
         if let Some(tx) = stream_tx {
+            Self::stream_asr_progress_with_policy(
+                tx,
+                stream_policy,
+                request_id,
+                sequence,
+                Self::asr_complete_progress(chunk_plan, sample_rate),
+            )?;
             Self::stream_final_marker_with_policy(tx, stream_policy, request_id, sequence)?;
         }
 
@@ -722,6 +769,68 @@ impl NativeExecutor {
             }
         }
         payload
+    }
+
+    fn asr_processing_progress(chunk_plan: &[AudioChunk], sample_rate: u32) -> AsrProgress {
+        let total_audio_secs = chunk_plan
+            .last()
+            .map(|chunk| f64::from(samples_to_seconds(chunk.end_sample, sample_rate)));
+        AsrProgress {
+            phase: AsrProgressPhase::Processing,
+            current_chunk: None,
+            total_chunks: Some(chunk_plan.len()),
+            processed_audio_secs: Some(0.0),
+            total_audio_secs,
+            percent: Some(0.0),
+        }
+    }
+
+    fn asr_complete_progress(chunk_plan: &[AudioChunk], sample_rate: u32) -> AsrProgress {
+        let total_audio_secs = chunk_plan
+            .last()
+            .map(|chunk| f64::from(samples_to_seconds(chunk.end_sample, sample_rate)));
+        AsrProgress {
+            phase: AsrProgressPhase::Complete,
+            current_chunk: Some(chunk_plan.len()),
+            total_chunks: Some(chunk_plan.len()),
+            processed_audio_secs: total_audio_secs,
+            total_audio_secs,
+            percent: Some(100.0),
+        }
+    }
+
+    fn asr_chunk_progress(
+        phase: AsrProgressPhase,
+        index: usize,
+        chunk: &AudioChunk,
+        chunk_plan: &[AudioChunk],
+        sample_rate: u32,
+    ) -> AsrProgress {
+        let total_audio_secs = chunk_plan
+            .last()
+            .map(|last| f64::from(samples_to_seconds(last.end_sample, sample_rate)));
+        let processed_audio_secs = match phase {
+            AsrProgressPhase::ChunkStarted => {
+                f64::from(samples_to_seconds(chunk.start_sample, sample_rate))
+            }
+            AsrProgressPhase::ChunkFinished => {
+                f64::from(samples_to_seconds(chunk.end_sample, sample_rate))
+            }
+            AsrProgressPhase::Processing => 0.0,
+            AsrProgressPhase::Complete => total_audio_secs.unwrap_or_default(),
+        };
+        let percent = total_audio_secs
+            .filter(|total| *total > 0.0)
+            .map(|total| ((processed_audio_secs / total) * 100.0).clamp(0.0, 100.0));
+
+        AsrProgress {
+            phase,
+            current_chunk: Some(index + 1),
+            total_chunks: Some(chunk_plan.len()),
+            processed_audio_secs: Some(processed_audio_secs),
+            total_audio_secs,
+            percent,
+        }
     }
 
     pub(super) fn next_audio_delta(all_samples: &[f32], emitted_samples: &mut usize) -> Vec<f32> {
@@ -815,6 +924,7 @@ mod tests {
     use izwi_asr_toolkit::AudioChunk;
     use tokio::sync::mpsc;
 
+    use crate::engine::output::AsrProgressPhase;
     use crate::engine::EngineStreamPolicy;
 
     use super::{AsrChunkPlannerKind, AsrChunkTranscription, NativeExecutor};
@@ -1188,6 +1298,82 @@ mod tests {
             .get("transcribe_ms")
             .and_then(|value| value.as_f64())
             .is_some());
+    }
+
+    #[test]
+    fn chunk_plan_streams_asr_progress_at_chunk_boundaries() {
+        let sr = 10u32;
+        let samples = vec![0.0f32; sr as usize * 2];
+        let chunk_plan = vec![
+            AudioChunk {
+                start_sample: 0,
+                end_sample: sr as usize,
+            },
+            AudioChunk {
+                start_sample: sr as usize,
+                end_sample: sr as usize * 2,
+            },
+        ];
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut chunk_idx = 0usize;
+        let mut sequence = 0usize;
+
+        let merged = NativeExecutor::transcribe_with_chunk_plan_with_details(
+            "req-progress",
+            Some(&tx),
+            EngineStreamPolicy::FailOnFull,
+            &mut sequence,
+            &samples,
+            sr,
+            &chunk_plan,
+            &NativeExecutor::asr_long_form_config(),
+            |_chunk_audio, _sr| {
+                let idx = chunk_idx;
+                chunk_idx = chunk_idx.saturating_add(1);
+                Ok(AsrChunkTranscription {
+                    text: format!("chunk-{idx}"),
+                    diagnostics: None,
+                })
+            },
+        )
+        .expect("chunk plan should complete");
+
+        assert!(merged.text.contains("chunk-0"));
+        assert!(sequence > 0);
+
+        let mut progress_events = Vec::new();
+        let mut final_seen = false;
+        while let Ok(event) = rx.try_recv() {
+            if let Some(progress) = event.asr_progress {
+                progress_events.push(progress);
+            }
+            if event.is_final {
+                final_seen = true;
+            }
+        }
+
+        assert!(final_seen);
+        assert_eq!(progress_events.len(), 6);
+        assert_eq!(progress_events[0].phase, AsrProgressPhase::Processing);
+        assert_eq!(progress_events[0].total_chunks, Some(2));
+        assert_eq!(progress_events[1].phase, AsrProgressPhase::ChunkStarted);
+        assert_eq!(progress_events[1].current_chunk, Some(1));
+        assert_eq!(progress_events[2].phase, AsrProgressPhase::ChunkFinished);
+        assert_eq!(progress_events[2].processed_audio_secs, Some(1.0));
+        assert_eq!(progress_events[3].phase, AsrProgressPhase::ChunkStarted);
+        assert_eq!(progress_events[3].current_chunk, Some(2));
+        assert_eq!(progress_events[4].phase, AsrProgressPhase::ChunkFinished);
+        assert_eq!(progress_events[4].percent, Some(100.0));
+        assert_eq!(progress_events[5].phase, AsrProgressPhase::Complete);
+
+        let percents: Vec<f64> = progress_events
+            .iter()
+            .filter_map(|progress| progress.percent)
+            .collect();
+        assert!(
+            percents.windows(2).all(|pair| pair[0] <= pair[1]),
+            "progress percent should be monotonic: {percents:?}"
+        );
     }
 
     #[test]

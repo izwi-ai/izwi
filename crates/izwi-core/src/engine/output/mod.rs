@@ -11,6 +11,32 @@ use tracing::debug;
 use super::executor::ExecutorOutput;
 use super::types::{AudioOutput, EngineOutput, FinishReason, RequestId, SequenceId, TokenStats};
 
+/// Coarse ASR processing progress for long-form and streaming transcription.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AsrProgress {
+    /// Current processing phase.
+    pub phase: AsrProgressPhase,
+    /// 1-based chunk index when chunk progress is known.
+    pub current_chunk: Option<usize>,
+    /// Total chunk count when chunk progress is known.
+    pub total_chunks: Option<usize>,
+    /// Amount of source audio processed so far.
+    pub processed_audio_secs: Option<f64>,
+    /// Total source audio duration.
+    pub total_audio_secs: Option<f64>,
+    /// Monotonic percentage in the range 0-100 when known.
+    pub percent: Option<f64>,
+}
+
+/// ASR progress phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsrProgressPhase {
+    Processing,
+    ChunkStarted,
+    ChunkFinished,
+    Complete,
+}
+
 /// Streaming output chunk.
 #[derive(Debug, Clone)]
 pub struct StreamingOutput {
@@ -28,6 +54,8 @@ pub struct StreamingOutput {
     pub text: Option<String>,
     /// Cumulative statistics
     pub stats: Option<StreamingStats>,
+    /// Optional ASR progress metadata.
+    pub asr_progress: Option<AsrProgress>,
 }
 
 impl StreamingOutput {
@@ -46,6 +74,7 @@ impl StreamingOutput {
             is_final: false,
             text: None,
             stats: None,
+            asr_progress: None,
         }
     }
 
@@ -64,6 +93,7 @@ impl StreamingOutput {
             is_final: true,
             text: None,
             stats: None,
+            asr_progress: None,
         }
     }
 
@@ -235,6 +265,7 @@ impl OutputProcessor {
                 is_final: false,
                 text: None,
                 stats: Some(stats),
+                asr_progress: None,
             };
 
             session.total_samples_sent += chunk_samples.len();
@@ -282,6 +313,7 @@ impl OutputProcessor {
             is_final: true,
             text,
             stats: Some(stats.clone()),
+            asr_progress: None,
         };
 
         let _ = session.tx.send(output).await;
