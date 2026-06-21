@@ -35,11 +35,13 @@ export const TRANSCRIPTION_PREFERRED_MODELS = [
   "Parakeet-TDT-0.6B-v3",
   "Whisper-Large-v3-Turbo",
   "Nemotron-3.5-ASR-Streaming-0.6B",
-  "Granite-Speech-4.1-2B-Plus",
 ] as const;
 
 export const DIARIZATION_PREFERRED_MODELS = [
   "diar_streaming_sortformer_4spk-v2.1",
+] as const;
+
+export const SPEAKER_ATTRIBUTED_ASR_PREFERRED_MODELS = [
   "Granite-Speech-4.1-2B-Plus",
 ] as const;
 

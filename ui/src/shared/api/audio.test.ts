@@ -482,6 +482,55 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     );
   });
 
+  it("creates speaker-attributed ASR records through the SAA job kind", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          ...createdTranscriptionRecord,
+          kind: "speaker_attributed_asr",
+          transcription_mode: "speaker_attributed_asr",
+          model_id: "Granite-Speech-4.1-2B-Plus",
+          speaker_attributed_text: null,
+          speaker_turns: [],
+          saa_status: "not_requested",
+          saa_warnings: [],
+        }),
+        {
+          status: 202,
+          headers: {
+            "Content-Type": "application/json",
+          },
+        },
+      ),
+    );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+    await client.createSpeakerAttributedAsrRecord({
+      audio_base64: "UklGRg==",
+      model_id: "Granite-Speech-4.1-2B-Plus",
+      language: "English",
+      generate_summary: true,
+      min_speakers: 2,
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost/v1/speech-to-text/jobs?job_kind=speaker_attributed_asr",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          audio_base64: "UklGRg==",
+          model: "Granite-Speech-4.1-2B-Plus",
+          language: "English",
+          generate_summary: true,
+          min_speakers: 2,
+          max_speakers: undefined,
+        }),
+      }),
+    );
+  });
+
   it("posts transcription summary regenerations to the canonical summary route", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
@@ -959,6 +1008,11 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
 
     expect(client.speechTextJobAudioUrl("diar-1", { job_kind: "diarization" })).toBe(
       "http://localhost/v1/speech-to-text/jobs/diar-1/audio?job_kind=diarization",
+    );
+    expect(
+      client.speakerAttributedAsrRecordAudioUrl("saa-1"),
+    ).toBe(
+      "http://localhost/v1/speech-to-text/jobs/saa-1/audio?job_kind=speaker_attributed_asr",
     );
   });
 

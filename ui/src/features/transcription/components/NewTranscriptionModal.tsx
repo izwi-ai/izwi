@@ -70,8 +70,16 @@ interface SubmitAudioOptions {
 
 const ASR_MODEL_REQUIRED_ERROR =
   "Select and load an ASR model before creating a transcription.";
+const SAA_MODEL_REQUIRED_ERROR =
+  "Select and load Granite Speech before creating speaker-attributed ASR.";
 const ALIGNER_MODEL_REQUIRED_ERROR =
   "Load the timestamp aligner model to include timestamps.";
+const SPEAKER_EXPECTATION_OPTIONS = [
+  { value: "auto", label: "Auto" },
+  { value: "2", label: "2+" },
+  { value: "3", label: "3+" },
+  { value: "4", label: "4+" },
+] as const;
 
 export function NewTranscriptionModal({
   isOpen,
@@ -104,11 +112,19 @@ export function NewTranscriptionModal({
   const [includeTimestamps, setIncludeTimestamps] = useState(false);
   const [streamingEnabled, setStreamingEnabled] = useState(true);
   const [generateSummary, setGenerateSummary] = useState(false);
+  const [speakerExpectation, setSpeakerExpectation] = useState("2");
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [uploadState, setUploadState] =
     useState<SpeechTextUploadState | null>(null);
+  const isSpeakerAttributedAsrMode = selectedMode === "speaker_attributed_asr";
+  const modelRequiredError = isSpeakerAttributedAsrMode
+    ? SAA_MODEL_REQUIRED_ERROR
+    : ASR_MODEL_REQUIRED_ERROR;
+  const modalTitle = isSpeakerAttributedAsrMode
+    ? "New speaker-attributed ASR"
+    : "New transcript";
 
   const updateUploadProgress = useCallback((progress: UploadProgressInfo) => {
     setUploadState((current) => {
@@ -147,11 +163,11 @@ export function NewTranscriptionModal({
   const requireReadyModel = useCallback(() => {
     if (!selectedModel || !selectedModelReady) {
       onModelRequired();
-      setError(ASR_MODEL_REQUIRED_ERROR);
+      setError(modelRequiredError);
       return false;
     }
     return true;
-  }, [onModelRequired, selectedModel, selectedModelReady]);
+  }, [modelRequiredError, onModelRequired, selectedModel, selectedModelReady]);
 
   const handleIncludeTimestampsChange = useCallback(
     (nextValue: boolean) => {
@@ -184,6 +200,9 @@ export function NewTranscriptionModal({
   }, []);
 
   const requireTimestampAligner = useCallback(() => {
+    if (isSpeakerAttributedAsrMode) {
+      return true;
+    }
     if (!includeTimestamps) {
       return true;
     }
@@ -195,10 +214,19 @@ export function NewTranscriptionModal({
     return false;
   }, [
     includeTimestamps,
+    isSpeakerAttributedAsrMode,
     onTimestampAlignerRequired,
     timestampAlignerModelId,
     timestampAlignerReady,
   ]);
+
+  useEffect(() => {
+    if (!isSpeakerAttributedAsrMode) {
+      return;
+    }
+    setIncludeTimestamps(false);
+    setStreamingEnabled(false);
+  }, [isSpeakerAttributedAsrMode]);
 
   const submitAudio = useCallback(
     async (audioBlob: Blob, options: SubmitAudioOptions = {}) => {
@@ -245,8 +273,26 @@ export function NewTranscriptionModal({
           generate_summary: generateSummary,
         };
         let streamingCreatedHandled: Promise<void> | null = null;
-        const record = streamingEnabled
-          ? await new Promise<TranscriptionRecord>((resolve, reject) => {
+        const record = isSpeakerAttributedAsrMode
+          ? await api.createSpeakerAttributedAsrRecord(
+              {
+                audio_file: uploadedBlob,
+                audio_filename: uploadFilename,
+                model_id: selectedModel || undefined,
+                language: selectedLanguage,
+                generate_summary: generateSummary,
+                min_speakers:
+                  speakerExpectation === "auto"
+                    ? undefined
+                    : Number(speakerExpectation),
+              },
+              {
+                signal: uploadController.signal,
+                onUploadProgress: updateUploadProgress,
+              },
+            )
+          : streamingEnabled
+            ? await new Promise<TranscriptionRecord>((resolve, reject) => {
               let settled = false;
               let streamController: AbortController | null = null;
               const handleCreated = (createdRecord: TranscriptionRecord) => {
@@ -317,8 +363,8 @@ export function NewTranscriptionModal({
                 once: true,
               });
             })
-          : await (() => {
-              return api.createTranscriptionRecord(request, {
+            : await (() => {
+                return api.createTranscriptionRecord(request, {
                 signal: uploadController.signal,
                 onUploadProgress: updateUploadProgress,
               });
@@ -381,6 +427,7 @@ export function NewTranscriptionModal({
     },
     [
       includeTimestamps,
+      isSpeakerAttributedAsrMode,
       generateSummary,
       onClose,
       onCreated,
@@ -394,6 +441,7 @@ export function NewTranscriptionModal({
       requireTimestampAligner,
       selectedLanguage,
       selectedModel,
+      speakerExpectation,
       streamingEnabled,
       timestampAlignerModelId,
       updateUploadProgress,
@@ -434,11 +482,14 @@ export function NewTranscriptionModal({
   );
 
   const alignerReadyForUse =
-    !includeTimestamps || (!!timestampAlignerModelId && timestampAlignerReady);
+    isSpeakerAttributedAsrMode ||
+    !includeTimestamps ||
+    (!!timestampAlignerModelId && timestampAlignerReady);
   const transcriptionStackReady = selectedModelReady && alignerReadyForUse;
   const isSelectedModelLoading =
     selectedModelStatus === "loading" || selectedModelStatus === "downloading";
   const isAlignerModelLoading =
+    !isSpeakerAttributedAsrMode &&
     includeTimestamps &&
     (timestampAlignerModelStatus === "loading" ||
       timestampAlignerModelStatus === "downloading");
@@ -461,7 +512,7 @@ export function NewTranscriptionModal({
     if (selectedModelReady && selectedModel) {
       models.push(selectedModel);
     }
-    if (timestampAlignerReady && timestampAlignerModelId) {
+    if (!isSpeakerAttributedAsrMode && timestampAlignerReady && timestampAlignerModelId) {
       const alreadyListed = models.includes(timestampAlignerModelId);
       if (!alreadyListed) {
         models.push(timestampAlignerModelId);
@@ -469,6 +520,7 @@ export function NewTranscriptionModal({
     }
     return models;
   }, [
+    isSpeakerAttributedAsrMode,
     selectedModel,
     selectedModelReady,
     timestampAlignerModelId,
@@ -480,7 +532,11 @@ export function NewTranscriptionModal({
       if (!current) {
         return current;
       }
-      if (current === ASR_MODEL_REQUIRED_ERROR && selectedModelReady) {
+      if (
+        (current === ASR_MODEL_REQUIRED_ERROR ||
+          current === SAA_MODEL_REQUIRED_ERROR) &&
+        selectedModelReady
+      ) {
         return null;
       }
       if (
@@ -493,6 +549,7 @@ export function NewTranscriptionModal({
     });
   }, [
     includeTimestamps,
+    isSpeakerAttributedAsrMode,
     selectedModelReady,
     timestampAlignerModelId,
     timestampAlignerReady,
@@ -511,7 +568,7 @@ export function NewTranscriptionModal({
     <>
       <div className="border-b border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-5 py-5 sm:px-6">
         <DialogTitle className="text-xl font-semibold tracking-tight text-[var(--text-primary)]">
-          New transcript
+          {modalTitle}
         </DialogTitle>
         <DialogDescription className="mt-1 max-w-3xl text-[13px] leading-5 text-[var(--text-muted)]">
           Upload a recording, choose streaming, and open the job page once the
@@ -639,56 +696,82 @@ export function NewTranscriptionModal({
                 </Select>
               </div>
 
-              <label className="flex items-start justify-between gap-3 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
-                <div className="min-w-0">
-                  <div className="text-sm font-semibold text-[var(--text-primary)]">
-                    Include timestamps
+              {isSpeakerAttributedAsrMode ? (
+                <div className="rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
+                  <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--text-muted)]">
+                    Expected speakers
                   </div>
-                  <div className="mt-0.5 text-[13px] leading-5 text-[var(--text-muted)]">
-                    Add word and segment timing when the aligner path is ready.
-                  </div>
-                </div>
-                <div className="relative mt-0.5 shrink-0">
-                  <input
-                    type="checkbox"
-                    checked={includeTimestamps}
-                    onChange={(event) =>
-                      handleIncludeTimestampsChange(event.target.checked)
-                    }
-                    className="peer sr-only"
+                  <Select
+                    value={speakerExpectation}
+                    onValueChange={setSpeakerExpectation}
                     disabled={isSubmitting}
-                  />
-                  <span className="flex h-5 w-5 items-center justify-center rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface-0)] text-white transition peer-checked:border-[var(--status-info-text)] peer-checked:bg-[var(--status-info-text)] peer-focus-visible:outline-none peer-focus-visible:ring-2 peer-focus-visible:ring-ring/45 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-background peer-disabled:opacity-50">
-                    <Check className="h-3.5 w-3.5 opacity-0 transition peer-checked:opacity-100" />
-                  </span>
+                  >
+                    <SelectTrigger className="h-10 w-full rounded-2xl border-[var(--border-muted)] bg-[var(--bg-surface-0)] text-sm">
+                      <SelectValue placeholder="Expected speakers" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {SPEAKER_EXPECTATION_OPTIONS.map((option) => (
+                        <SelectItem key={option.value} value={option.value}>
+                          {option.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                 </div>
-              </label>
+              ) : (
+                <>
+                  <label className="flex items-start justify-between gap-3 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
+                    <div className="min-w-0">
+                      <div className="text-sm font-semibold text-[var(--text-primary)]">
+                        Include timestamps
+                      </div>
+                      <div className="mt-0.5 text-[13px] leading-5 text-[var(--text-muted)]">
+                        Add word and segment timing when the aligner path is ready.
+                      </div>
+                    </div>
+                    <div className="relative mt-0.5 shrink-0">
+                      <input
+                        type="checkbox"
+                        checked={includeTimestamps}
+                        onChange={(event) =>
+                          handleIncludeTimestampsChange(event.target.checked)
+                        }
+                        className="peer sr-only"
+                        disabled={isSubmitting}
+                      />
+                      <span className="flex h-5 w-5 items-center justify-center rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface-0)] text-white transition peer-checked:border-[var(--status-info-text)] peer-checked:bg-[var(--status-info-text)] peer-focus-visible:outline-none peer-focus-visible:ring-2 peer-focus-visible:ring-ring/45 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-background peer-disabled:opacity-50">
+                        <Check className="h-3.5 w-3.5 opacity-0 transition peer-checked:opacity-100" />
+                      </span>
+                    </div>
+                  </label>
 
-              <label className="flex items-start justify-between gap-3 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
-                <div className="min-w-0">
-                  <div className="text-sm font-semibold text-[var(--text-primary)]">
-                    Stream results
-                  </div>
-                  <div className="mt-0.5 text-[13px] leading-5 text-[var(--text-muted)]">
-                    Start the job with live transcript updates instead of waiting
-                    for a single final response.
-                  </div>
-                </div>
-                <div className="relative mt-0.5 shrink-0">
-                  <input
-                    type="checkbox"
-                    checked={streamingEnabled}
-                    onChange={(event) =>
-                      handleStreamingEnabledChange(event.target.checked)
-                    }
-                    className="peer sr-only"
-                    disabled={isSubmitting}
-                  />
-                  <span className="flex h-5 w-5 items-center justify-center rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface-0)] text-white transition peer-checked:border-[var(--status-info-text)] peer-checked:bg-[var(--status-info-text)] peer-focus-visible:outline-none peer-focus-visible:ring-2 peer-focus-visible:ring-ring/45 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-background peer-disabled:opacity-50">
-                    <Check className="h-3.5 w-3.5 opacity-0 transition peer-checked:opacity-100" />
-                  </span>
-                </div>
-              </label>
+                  <label className="flex items-start justify-between gap-3 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
+                    <div className="min-w-0">
+                      <div className="text-sm font-semibold text-[var(--text-primary)]">
+                        Stream results
+                      </div>
+                      <div className="mt-0.5 text-[13px] leading-5 text-[var(--text-muted)]">
+                        Start the job with live transcript updates instead of waiting
+                        for a single final response.
+                      </div>
+                    </div>
+                    <div className="relative mt-0.5 shrink-0">
+                      <input
+                        type="checkbox"
+                        checked={streamingEnabled}
+                        onChange={(event) =>
+                          handleStreamingEnabledChange(event.target.checked)
+                        }
+                        className="peer sr-only"
+                        disabled={isSubmitting}
+                      />
+                      <span className="flex h-5 w-5 items-center justify-center rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface-0)] text-white transition peer-checked:border-[var(--status-info-text)] peer-checked:bg-[var(--status-info-text)] peer-focus-visible:outline-none peer-focus-visible:ring-2 peer-focus-visible:ring-ring/45 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-background peer-disabled:opacity-50">
+                        <Check className="h-3.5 w-3.5 opacity-0 transition peer-checked:opacity-100" />
+                      </span>
+                    </div>
+                  </label>
+                </>
+              )}
 
               <label className="flex items-start justify-between gap-3 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
                 <div className="min-w-0">
@@ -723,7 +806,7 @@ export function NewTranscriptionModal({
                 <div className="mt-2.5 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-3">
                   <div className="flex items-center justify-between gap-3">
                     <span className="text-xs text-[var(--text-muted)]">
-                      Transcription model
+                      {isSpeakerAttributedAsrMode ? "SAA model" : "Transcription model"}
                     </span>
                     <StatusBadge tone={readinessTone}>
                       {readinessStatusLabel}

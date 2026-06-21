@@ -20,6 +20,7 @@ import {
   DIARIZATION_PREFERRED_ASR_MODELS,
   DIARIZATION_PREFERRED_MODELS,
   DIARIZATION_PREFERRED_SUMMARY_MODELS,
+  SPEAKER_ATTRIBUTED_ASR_PREFERRED_MODELS,
   TRANSCRIPTION_PREFERRED_MODELS,
   resolvePreferredRouteModel,
 } from "@/features/models/catalog/routeModelCatalog";
@@ -30,11 +31,11 @@ import type { SpeechTextCreationMode } from "@/features/speech-text/creationMode
 import {
   collectManagedModels,
   filterAndSortModels,
-  isGraniteDiarizationVariant,
   isDiarizationPipelineAlignerVariant,
   isDiarizationPipelineAsrVariant,
   isDiarizationPipelineLlmVariant,
   isDiarizationVariant,
+  isSpeakerAttributedAsrVariant,
   isTranscriptionAlignerVariant,
   isTranscriptionSummaryVariant,
 } from "@/features/speech-text/modelFilters";
@@ -45,7 +46,10 @@ import { AnimatePresence, motion } from "framer-motion";
 import { Settings2 } from "lucide-react";
 
 const TRANSCRIPTION_PREFERRED_SUMMARY_MODELS = ["Qwen3.5-4B"] as const;
-type ModelModalContext = "transcription" | "diarization";
+type ModelModalContext =
+  | "transcription"
+  | "speaker_attributed_asr"
+  | "diarization";
 type DiarizationPipelineMode = "classic" | "granite";
 
 interface TranscriptionPageProps {
@@ -60,6 +64,7 @@ interface TranscriptionPageProps {
   onDelete: (variant: string) => void;
   onSelect: (variant: string) => void;
   onError: (message: string) => void;
+  speechTextMode?: "transcription" | "speaker_attributed_asr";
 }
 
 export function TranscriptionPage({
@@ -74,6 +79,7 @@ export function TranscriptionPage({
   onDelete,
   onSelect,
   onError,
+  speechTextMode = "transcription",
 }: TranscriptionPageProps) {
   const { recordId } = useParams<{ recordId: string }>();
   const navigate = useNavigate();
@@ -103,6 +109,10 @@ export function TranscriptionPage({
   );
   const diarizationModels = useMemo(
     () => filterAndSortModels(models, isDiarizationVariant),
+    [models],
+  );
+  const speakerAttributedAsrModels = useMemo(
+    () => filterAndSortModels(models, isSpeakerAttributedAsrVariant),
     [models],
   );
   const diarizationAsrPipelineModels = useMemo(
@@ -187,16 +197,31 @@ export function TranscriptionPage({
         return `Download and load ${modelName} in Transcription Models to generate summaries.`;
     }
   }, [resolvedSummaryModel, summaryModelStatus]);
-  const readyGraniteDiarizationModel = useMemo(
+  const resolvedSpeakerAttributedAsrModel = useMemo(
     () =>
-      diarizationModels.find(
-        (model) =>
-          isGraniteDiarizationVariant(model.variant) &&
-          model.status === "ready",
-      ) ?? null,
-    [diarizationModels],
+      resolvePreferredRouteModel({
+        models: speakerAttributedAsrModels,
+        selectedModel,
+        preferredVariants: SPEAKER_ATTRIBUTED_ASR_PREFERRED_MODELS,
+        preferAnyPreferredBeforeReadyAny: true,
+      }),
+    [selectedModel, speakerAttributedAsrModels],
   );
-  const baseResolvedDiarizationModel = useMemo(
+  const speakerAttributedAsrModelReady =
+    resolvedSpeakerAttributedAsrModel != null &&
+    speakerAttributedAsrModels.some(
+      (model) =>
+        model.variant === resolvedSpeakerAttributedAsrModel &&
+        model.status === "ready",
+    );
+  const selectedSpeakerAttributedAsrModelStatus = useMemo(
+    () =>
+      speakerAttributedAsrModels.find(
+        (model) => model.variant === resolvedSpeakerAttributedAsrModel,
+      )?.status ?? null,
+    [resolvedSpeakerAttributedAsrModel, speakerAttributedAsrModels],
+  );
+  const resolvedDiarizationModel = useMemo(
     () =>
       resolvePreferredRouteModel({
         models: diarizationModels,
@@ -206,30 +231,6 @@ export function TranscriptionPage({
       }),
     [diarizationModels, selectedModel],
   );
-  const resolvedDiarizationModel = useMemo(() => {
-    if (!baseResolvedDiarizationModel || !readyGraniteDiarizationModel) {
-      return baseResolvedDiarizationModel;
-    }
-
-    const baseDiarizationModelInfo =
-      diarizationModels.find(
-        (model) => model.variant === baseResolvedDiarizationModel,
-      ) ?? null;
-
-    if (
-      baseDiarizationModelInfo &&
-      !isGraniteDiarizationVariant(baseDiarizationModelInfo.variant) &&
-      baseDiarizationModelInfo.status !== "ready"
-    ) {
-      return readyGraniteDiarizationModel.variant;
-    }
-
-    return baseResolvedDiarizationModel;
-  }, [
-    baseResolvedDiarizationModel,
-    diarizationModels,
-    readyGraniteDiarizationModel,
-  ]);
   const diarizationModelReady =
     resolvedDiarizationModel != null &&
     diarizationModels.some(
@@ -279,15 +280,9 @@ export function TranscriptionPage({
         model.variant === resolvedDiarizationAlignerModel &&
         model.status === "ready",
     );
-  const diarizationPipelineMode: DiarizationPipelineMode =
-    isGraniteDiarizationVariant(resolvedDiarizationModel)
-      ? "granite"
-      : "classic";
-  const usesGraniteDiarizationStandalone =
-    diarizationPipelineMode === "granite";
-  const diarizationPipelineModelsReady = usesGraniteDiarizationStandalone
-    ? diarizationModelReady
-    : diarizationAsrModelReady && diarizationAlignerModelReady;
+  const diarizationPipelineMode: DiarizationPipelineMode = "classic";
+  const diarizationPipelineModelsReady =
+    diarizationAsrModelReady && diarizationAlignerModelReady;
   const baseDiarizationPipelineModels = useMemo(
     () => [
       ...diarizationModels,
@@ -302,30 +297,17 @@ export function TranscriptionPage({
       diarizationModels,
     ],
   );
-  const diarizationPipelineModels = useMemo(
-    () =>
-      usesGraniteDiarizationStandalone
-        ? [...diarizationModels, ...diarizationLlmPipelineModels]
-        : baseDiarizationPipelineModels,
-    [
-      baseDiarizationPipelineModels,
-      diarizationLlmPipelineModels,
-      diarizationModels,
-      usesGraniteDiarizationStandalone,
-    ],
-  );
+  const diarizationPipelineModels = baseDiarizationPipelineModels;
   const diarizationManagedModels = useMemo(
     () =>
       collectManagedModels({
         availableModels: diarizationPipelineModels,
-        managedVariants: usesGraniteDiarizationStandalone
-          ? [resolvedDiarizationModel]
-          : [
-              resolvedDiarizationModel,
-              resolvedDiarizationAsrModel,
-              resolvedDiarizationAlignerModel,
-              resolvedDiarizationLlmModel,
-            ],
+        managedVariants: [
+          resolvedDiarizationModel,
+          resolvedDiarizationAsrModel,
+          resolvedDiarizationAlignerModel,
+          resolvedDiarizationLlmModel,
+        ],
       }),
     [
       diarizationPipelineModels,
@@ -333,7 +315,6 @@ export function TranscriptionPage({
       resolvedDiarizationAsrModel,
       resolvedDiarizationLlmModel,
       resolvedDiarizationModel,
-      usesGraniteDiarizationStandalone,
     ],
   );
   const readyDiarizationManagedModelCount = diarizationManagedModels.filter(
@@ -376,6 +357,24 @@ export function TranscriptionPage({
     ],
     [transcriptionAlignerModels, transcriptionModels, transcriptionSummaryModels],
   );
+  const speakerAttributedAsrModelSections = useMemo(
+    () => [
+      {
+        key: "speaker_attributed_asr",
+        title: "Speaker Attributed ASR",
+        description: "Granite Speech models that return speaker-turn transcripts.",
+        models: speakerAttributedAsrModels,
+      },
+      {
+        key: "summary",
+        title: "Summary Models",
+        description:
+          "Model used to generate AI summaries for completed SAA transcripts.",
+        models: transcriptionSummaryModels,
+      },
+    ],
+    [speakerAttributedAsrModels, transcriptionSummaryModels],
+  );
   const baseDiarizationModelSections = useMemo(
     () => [
       {
@@ -411,15 +410,7 @@ export function TranscriptionPage({
       diarizationModels,
     ],
   );
-  const diarizationModelSections = useMemo(
-    () =>
-      usesGraniteDiarizationStandalone
-        ? baseDiarizationModelSections.filter(
-            (section) => section.key === "diarization" || section.key === "llm",
-          )
-        : baseDiarizationModelSections,
-    [baseDiarizationModelSections, usesGraniteDiarizationStandalone],
-  );
+  const diarizationModelSections = baseDiarizationModelSections;
   const {
     records,
     loading: historyLoading,
@@ -434,7 +425,12 @@ export function TranscriptionPage({
     loading: recordLoading,
     error: recordError,
     refresh: refreshRecord,
-  } = useTranscriptionRecord(recordId);
+  } = useTranscriptionRecord(recordId, {
+    jobKind:
+      speechTextMode === "speaker_attributed_asr"
+        ? "speaker_attributed_asr"
+        : "transcription",
+  });
 
   useEffect(() => {
     if (!recordId) {
@@ -465,13 +461,25 @@ export function TranscriptionPage({
     setModelModalContext("transcription");
     openModelManager();
   }, [openModelManager]);
+  const openSpeakerAttributedAsrModelManager = useCallback(() => {
+    setModelModalContext("speaker_attributed_asr");
+    openModelManager();
+  }, [openModelManager]);
   const openDiarizationModelManager = useCallback(() => {
     setModelModalContext("diarization");
     openModelManager();
   }, [openModelManager]);
   const handleOpenModels = useCallback(() => {
+    if (speechTextMode === "speaker_attributed_asr") {
+      openSpeakerAttributedAsrModelManager();
+      return;
+    }
     openTranscriptionModelManager();
-  }, [openTranscriptionModelManager]);
+  }, [
+    openSpeakerAttributedAsrModelManager,
+    openTranscriptionModelManager,
+    speechTextMode,
+  ]);
   const handleOpenNewTranscriptionModal = useCallback(() => {
     setNewSpeechTextMode("transcription");
     setIsNewTranscriptionModalOpen(true);
@@ -507,7 +515,11 @@ export function TranscriptionPage({
     setRecordDeletePending(true);
     setRecordActionError(null);
     try {
-      await api.deleteTranscriptionRecord(recordId);
+      if (speechTextMode === "speaker_attributed_asr") {
+        await api.deleteSpeakerAttributedAsrRecord(recordId);
+      } else {
+        await api.deleteTranscriptionRecord(recordId);
+      }
       await refreshHistory();
       navigate("/transcription", { replace: true });
     } catch (err) {
@@ -519,12 +531,14 @@ export function TranscriptionPage({
     } finally {
       setRecordDeletePending(false);
     }
-  }, [navigate, recordDeletePending, recordId, refreshHistory]);
+  }, [navigate, recordDeletePending, recordId, refreshHistory, speechTextMode]);
 
   const handleHistoryDelete = useCallback(
     async (targetRecord: SpeechTextJobSummary) => {
       if (targetRecord.kind === "diarization") {
         await api.deleteDiarizationRecord(targetRecord.id);
+      } else if (targetRecord.kind === "speaker_attributed_asr") {
+        await api.deleteSpeakerAttributedAsrRecord(targetRecord.id);
       } else {
         await api.deleteTranscriptionRecord(targetRecord.id);
       }
@@ -549,7 +563,11 @@ export function TranscriptionPage({
     setRecordActionError(null);
 
     try {
-      await api.regenerateTranscriptionSummary(recordId);
+      if (speechTextMode === "speaker_attributed_asr") {
+        await api.regenerateSpeakerAttributedAsrSummary(recordId);
+      } else {
+        await api.regenerateTranscriptionSummary(recordId);
+      }
       await refreshRecord();
     } catch (err) {
       setRecordSummaryRefreshError(
@@ -566,6 +584,7 @@ export function TranscriptionPage({
     recordId,
     recordSummaryRefreshPending,
     refreshRecord,
+    speechTextMode,
     summaryModelReady,
     summaryModelRequirementMessage,
   ]);
@@ -578,10 +597,17 @@ export function TranscriptionPage({
   );
 
   const detailAudioUrl = useMemo(
-    () => (recordId ? api.transcriptionRecordAudioUrl(recordId) : null),
-    [recordId],
+    () =>
+      recordId
+        ? speechTextMode === "speaker_attributed_asr"
+          ? api.speakerAttributedAsrRecordAudioUrl(recordId)
+          : api.transcriptionRecordAudioUrl(recordId)
+        : null,
+    [recordId, speechTextMode],
   );
   const isDiarizationModelModal = modelModalContext === "diarization";
+  const isSpeakerAttributedAsrModelModal =
+    modelModalContext === "speaker_attributed_asr";
   const transcriptionModalModels = useMemo(
     () => [
       ...transcriptionModels,
@@ -589,6 +615,10 @@ export function TranscriptionPage({
       ...transcriptionSummaryModels,
     ],
     [transcriptionAlignerModels, transcriptionModels, transcriptionSummaryModels],
+  );
+  const speakerAttributedAsrModalModels = useMemo(
+    () => [...speakerAttributedAsrModels, ...transcriptionSummaryModels],
+    [speakerAttributedAsrModels, transcriptionSummaryModels],
   );
   const timestampAlignerReady = useMemo(
     () =>
@@ -657,6 +687,8 @@ export function TranscriptionPage({
       processing_progress:
         streamingRecord.processing_progress ?? record.processing_progress,
       rtf: record.rtf ?? streamingRecord.rtf,
+      transcription_mode:
+        streamingRecord.transcription_mode ?? record.transcription_mode,
       transcription:
         streamingRecord.transcription || record.transcription,
       segments:
@@ -665,8 +697,31 @@ export function TranscriptionPage({
           : record.segments,
       words:
         streamingRecord.words.length > 0 ? streamingRecord.words : record.words,
+      speaker_attributed_text:
+        streamingRecord.speaker_attributed_text ??
+        record.speaker_attributed_text,
+      speaker_turns:
+        (streamingRecord.speaker_turns?.length ?? 0) > 0
+          ? streamingRecord.speaker_turns
+          : record.speaker_turns,
+      saa_status: streamingRecord.saa_status ?? record.saa_status,
+      saa_warnings: streamingRecord.saa_warnings ?? record.saa_warnings,
     };
   }, [record, recordId, streamingRecord]);
+  const isNewSpeakerAttributedAsrMode =
+    newSpeechTextMode === "speaker_attributed_asr";
+  const newTranscriptionSelectedModel = isNewSpeakerAttributedAsrMode
+    ? resolvedSpeakerAttributedAsrModel
+    : resolvedSelectedModel;
+  const newTranscriptionSelectedModelReady = isNewSpeakerAttributedAsrMode
+    ? speakerAttributedAsrModelReady
+    : selectedModelReady;
+  const newTranscriptionSelectedModelStatus = isNewSpeakerAttributedAsrMode
+    ? selectedSpeakerAttributedAsrModelStatus
+    : selectedTranscriptionModelStatus;
+  const openNewTranscriptionModelManager = isNewSpeakerAttributedAsrMode
+    ? openSpeakerAttributedAsrModelManager
+    : openTranscriptionModelManager;
 
   return (
     <PageShell className={recordId ? "pb-32 sm:pb-36" : undefined}>
@@ -751,6 +806,12 @@ export function TranscriptionPage({
                 navigate(`/transcription/${nextRecord.id}?mode=diarization`);
                 return;
               }
+              if (nextRecord.kind === "speaker_attributed_asr") {
+                navigate(
+                  `/transcription/${nextRecord.id}?mode=speaker_attributed_asr`,
+                );
+                return;
+              }
               navigate(`/transcription/${nextRecord.id}`);
             }}
           />
@@ -790,24 +851,31 @@ export function TranscriptionPage({
                   exit={{ opacity: 0, y: -6 }}
                   transition={{ duration: 0.18, ease: "easeOut" }}
                 >
-                  {newSpeechTextMode === "transcription" ? (
+                  {newSpeechTextMode !== "diarization" ? (
                     <NewTranscriptionModal
                       isOpen={isNewTranscriptionModalOpen}
                       onClose={handleCloseNewTranscriptionModal}
                       renderInDialog={false}
                       selectedMode={newSpeechTextMode}
                       onSelectMode={setNewSpeechTextMode}
-                      selectedModel={resolvedSelectedModel}
-                      selectedModelReady={selectedModelReady}
-                      selectedModelStatus={selectedTranscriptionModelStatus}
+                      selectedModel={newTranscriptionSelectedModel}
+                      selectedModelReady={newTranscriptionSelectedModelReady}
+                      selectedModelStatus={newTranscriptionSelectedModelStatus}
                       timestampAlignerModelId={resolvedAlignerModel}
                       timestampAlignerReady={timestampAlignerReady}
                       timestampAlignerModelStatus={selectedAlignerModelStatus}
-                      onOpenModelManager={openTranscriptionModelManager}
+                      onOpenModelManager={openNewTranscriptionModelManager}
                       onModelRequired={() => {
+                        if (isNewSpeakerAttributedAsrMode) {
+                          openSpeakerAttributedAsrModelManager();
+                          onError("Select and load Granite Speech to start SAA.");
+                          return;
+                        }
                         setModelModalContext("transcription");
                         requestModel();
-                        onError("Select and load an ASR model to start transcribing.");
+                        onError(
+                          "Select and load an ASR model to start transcribing.",
+                        );
                       }}
                       onTimestampAlignerRequired={() => {
                         openTranscriptionModelManager();
@@ -816,7 +884,11 @@ export function TranscriptionPage({
                       onCreated={async (createdRecord: TranscriptionRecord) => {
                         setStreamingRecord(createdRecord);
                         await refreshHistory().catch(() => undefined);
-                        navigate(`/transcription/${createdRecord.id}`);
+                        navigate(
+                          isNewSpeakerAttributedAsrMode
+                            ? `/transcription/${createdRecord.id}?mode=speaker_attributed_asr`
+                            : `/transcription/${createdRecord.id}`,
+                        );
                       }}
                       onStreamingStart={() => {
                         setStreamingRecord((current) =>
@@ -867,16 +939,8 @@ export function TranscriptionPage({
                       pipelineMode={diarizationPipelineMode}
                       selectedModel={resolvedDiarizationModel}
                       selectedModelReady={diarizationModelReady}
-                      pipelineAsrModelId={
-                        usesGraniteDiarizationStandalone
-                          ? null
-                          : resolvedDiarizationAsrModel
-                      }
-                      pipelineAlignerModelId={
-                        usesGraniteDiarizationStandalone
-                          ? null
-                          : resolvedDiarizationAlignerModel
-                      }
+                      pipelineAsrModelId={resolvedDiarizationAsrModel}
+                      pipelineAlignerModelId={resolvedDiarizationAlignerModel}
                       pipelineLlmModelId={resolvedDiarizationLlmModel}
                       pipelineModelsReady={diarizationPipelineModelsReady}
                       onModelRequired={() => {
@@ -886,9 +950,7 @@ export function TranscriptionPage({
                       onPipelineModelsRequired={() => {
                         openDiarizationModelManager();
                         onError(
-                          usesGraniteDiarizationStandalone
-                            ? "Load Granite Speech before diarization."
-                            : "Load ASR and forced aligner models before diarization.",
+                          "Load ASR and forced aligner models before diarization.",
                         );
                       }}
                       managedModelCount={diarizationManagedModels.length}
@@ -913,19 +975,39 @@ export function TranscriptionPage({
         isOpen={isModelModalOpen}
         onClose={closeModelModal}
         title={
-          isDiarizationModelModal ? "Diarization Models" : "Transcription Models"
+          isDiarizationModelModal
+            ? "Diarization Models"
+            : isSpeakerAttributedAsrModelModal
+              ? "Speaker Attributed ASR Models"
+              : "Transcription Models"
         }
         description={
           isDiarizationModelModal
             ? "Manage diarization pipeline models for /v1/diarizations."
-            : "Manage ASR models, the optional timestamp aligner, and the summary model for this route."
+            : isSpeakerAttributedAsrModelModal
+              ? "Manage Granite Speech and summary models for speaker-attributed ASR."
+              : "Manage ASR models, the optional timestamp aligner, and the summary model for this route."
         }
         models={
-          isDiarizationModelModal ? diarizationPipelineModels : transcriptionModalModels
+          isDiarizationModelModal
+            ? diarizationPipelineModels
+            : isSpeakerAttributedAsrModelModal
+              ? speakerAttributedAsrModalModels
+              : transcriptionModalModels
         }
         loading={loading}
-        selectedVariant={isDiarizationModelModal ? null : resolvedSelectedModel}
-        intentVariant={isDiarizationModelModal ? null : intentVariant}
+        selectedVariant={
+          isDiarizationModelModal
+            ? null
+            : isSpeakerAttributedAsrModelModal
+              ? resolvedSpeakerAttributedAsrModel
+              : resolvedSelectedModel
+        }
+        intentVariant={
+          isDiarizationModelModal || isSpeakerAttributedAsrModelModal
+            ? null
+            : intentVariant
+        }
         downloadProgress={downloadProgress}
         onDownload={onDownload}
         onCancelDownload={onCancelDownload}
@@ -936,18 +1018,27 @@ export function TranscriptionPage({
         emptyMessage={
           isDiarizationModelModal
             ? "No diarization pipeline models available for this route."
-            : "No transcription models available for this route."
+            : isSpeakerAttributedAsrModelModal
+              ? "No speaker-attributed ASR models available for this route."
+              : "No transcription models available for this route."
         }
         sections={
           isDiarizationModelModal
             ? diarizationModelSections
-            : transcriptionModelSections
+            : isSpeakerAttributedAsrModelModal
+              ? speakerAttributedAsrModelSections
+              : transcriptionModelSections
         }
         canUseModel={
           isDiarizationModelModal
             ? undefined
-            : (variant) =>
-                transcriptionModels.some((model) => model.variant === variant)
+            : isSpeakerAttributedAsrModelModal
+              ? (variant) =>
+                  speakerAttributedAsrModels.some(
+                    (model) => model.variant === variant,
+                  )
+              : (variant) =>
+                  transcriptionModels.some((model) => model.variant === variant)
         }
         selectionMode={isDiarizationModelModal ? "manage" : "route"}
         zIndexClassName={

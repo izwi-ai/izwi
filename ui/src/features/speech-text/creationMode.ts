@@ -1,1 +1,4 @@
-export type SpeechTextCreationMode = "transcription" | "diarization";
+export type SpeechTextCreationMode =
+  | "transcription"
+  | "speaker_attributed_asr"
+  | "diarization";

@@ -74,15 +74,6 @@ function isNemotronAsrVariant(variant: string): boolean {
   );
 }
 
-function isGraniteSpeechAsrVariant(variant: string): boolean {
-  const normalized = variant.trim().toLowerCase();
-  return (
-    normalized === "granite-speech-4.1-2b-plus" ||
-    normalized === "ibm-granite/granite-speech-4.1-2b-plus" ||
-    normalized === "granite speech 4.1 2b plus"
-  );
-}
-
 function isQwenAsrVariant(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   return (
@@ -155,11 +146,10 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     id: "transcription",
     label: "Transcription",
     description:
-      "Speech-to-text with Qwen3-ASR, Granite Speech, Nemotron ASR, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, and LFM2.5 Audio models",
+      "Speech-to-text with Qwen3-ASR, Nemotron ASR, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, and LFM2.5 Audio models",
     icon: "FileText",
     modelFilter: (variant) =>
       isQwenAsrVariant(variant) ||
-      isGraniteSpeechAsrVariant(variant) ||
       isNemotronAsrVariant(variant) ||
       isVibeVoiceAsrVariant(variant) ||
       variant.includes("Whisper-Large-v3-Turbo") ||
@@ -168,7 +158,7 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
       isLfm25AudioVariant(variant),
     emptyStateTitle: "No ASR Model Loaded",
     emptyStateDescription:
-      "Download and load a Qwen3-ASR, Granite Speech, Nemotron ASR, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, or LFM2.5 Audio model for speech transcription",
+      "Download and load a Qwen3-ASR, Nemotron ASR, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, or LFM2.5 Audio model for speech transcription",
   },
   chat: {
     id: "chat",

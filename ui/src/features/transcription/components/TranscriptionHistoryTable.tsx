@@ -13,6 +13,7 @@ import {
   api,
   type DiarizationRecord,
   type SpeechTextDiarizationSummary,
+  type SpeechTextSpeakerAttributedAsrSummary,
   type SpeechTextJobSummary,
 } from "@/api";
 import { useNotifications } from "@/app/providers/NotificationProvider";
@@ -69,8 +70,10 @@ type ExportableDiarizationRecord = Pick<
   | "raw_transcript"
 >;
 
-function rowKind(record: SpeechTextJobSummary): "transcription" | "diarization" {
-  return record.kind === "diarization" ? "diarization" : "transcription";
+function rowKind(
+  record: SpeechTextJobSummary,
+): "transcription" | "speaker_attributed_asr" | "diarization" {
+  return record.kind;
 }
 
 function isDiarizationSummary(
@@ -79,13 +82,30 @@ function isDiarizationSummary(
   return record.kind === "diarization";
 }
 
+function isSpeakerAttributedAsrSummary(
+  record: SpeechTextJobSummary,
+): record is SpeechTextSpeakerAttributedAsrSummary {
+  return record.kind === "speaker_attributed_asr";
+}
+
 function rowKindLabel(record: SpeechTextJobSummary): string {
-  return rowKind(record) === "diarization" ? "Diarization" : "Transcription";
+  switch (rowKind(record)) {
+    case "diarization":
+      return "Diarization";
+    case "speaker_attributed_asr":
+      return "Speaker Attributed ASR";
+    case "transcription":
+    default:
+      return "Transcription";
+  }
 }
 
 function rowPreview(record: SpeechTextJobSummary): string {
   if (isDiarizationSummary(record)) {
     return record.transcript_preview;
+  }
+  if (isSpeakerAttributedAsrSummary(record)) {
+    return record.speaker_attributed_text_preview || record.transcription_preview;
   }
   return record.transcription_preview;
 }
@@ -152,7 +172,11 @@ export function TranscriptionHistoryTable({
           ? formattedTranscriptFromRecord(
               await api.getDiarizationRecord(record.id),
             )
-          : formatTranscriptionText(await api.getTranscriptionRecord(record.id));
+          : formatTranscriptionText(
+              kind === "speaker_attributed_asr"
+                ? await api.getSpeakerAttributedAsrRecord(record.id)
+                : await api.getTranscriptionRecord(record.id),
+            );
 
       if (!transcript.trim()) {
         notify({
@@ -196,7 +220,11 @@ export function TranscriptionHistoryTable({
         setExportDiarizationRecord(await api.getDiarizationRecord(record.id));
       } else {
         setExportDiarizationRecord(null);
-        setExportTranscriptionRecord(await api.getTranscriptionRecord(record.id));
+        setExportTranscriptionRecord(
+          kind === "speaker_attributed_asr"
+            ? await api.getSpeakerAttributedAsrRecord(record.id)
+            : await api.getTranscriptionRecord(record.id),
+        );
       }
       setExportDialogOpen(true);
     } catch (err) {

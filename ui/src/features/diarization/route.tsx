@@ -23,7 +23,6 @@ import { RouteModelModal } from "@/features/models/components/RouteModelModal";
 import {
   collectManagedModels,
   filterAndSortModels,
-  isGraniteDiarizationVariant,
   isDiarizationPipelineAlignerVariant,
   isDiarizationPipelineAsrVariant,
   isDiarizationPipelineLlmVariant,
@@ -56,8 +55,6 @@ interface DiarizationModelGroup {
   description: string;
   models: ModelInfo[];
 }
-
-type DiarizationPipelineMode = "classic" | "granite";
 
 export function DiarizationPage({
   models,
@@ -154,17 +151,7 @@ export function DiarizationPage({
     ],
   );
 
-  const readyGraniteDiarizationModel = useMemo(
-    () =>
-      diarizationModels.find(
-        (model) =>
-          isGraniteDiarizationVariant(model.variant) &&
-          model.status === "ready",
-      ) ?? null,
-    [diarizationModels],
-  );
-
-  const baseResolvedSelectedModel = useMemo(
+  const resolvedSelectedModel = useMemo(
     () =>
       resolvePreferredRouteModel({
         models: diarizationModels,
@@ -175,52 +162,14 @@ export function DiarizationPage({
     [diarizationModels, selectedModel],
   );
 
-  const resolvedSelectedModel = useMemo(() => {
-    if (!baseResolvedSelectedModel || !readyGraniteDiarizationModel) {
-      return baseResolvedSelectedModel;
-    }
-
-    const baseSelectedModelInfo =
-      diarizationModels.find(
-        (model) => model.variant === baseResolvedSelectedModel,
-      ) ?? null;
-
-    if (
-      baseSelectedModelInfo &&
-      !isGraniteDiarizationVariant(baseSelectedModelInfo.variant) &&
-      baseSelectedModelInfo.status !== "ready"
-    ) {
-      return readyGraniteDiarizationModel.variant;
-    }
-
-    return baseResolvedSelectedModel;
-  }, [
-    baseResolvedSelectedModel,
-    diarizationModels,
-    readyGraniteDiarizationModel,
-  ]);
-
   const selectedModelInfo =
     diarizationModels.find(
       (model) => model.variant === resolvedSelectedModel,
     ) ?? null;
   const selectedModelReady = selectedModelInfo?.status === "ready";
-  const pipelineMode: DiarizationPipelineMode = isGraniteDiarizationVariant(
-    resolvedSelectedModel,
-  )
-    ? "granite"
-    : "classic";
-  const usesGraniteStandalone = pipelineMode === "granite";
+  const pipelineMode = "classic" as const;
 
-  const pipelineModelGroups = useMemo<DiarizationModelGroup[]>(
-    () =>
-      usesGraniteStandalone
-        ? basePipelineModelGroups.filter(
-            (group) => group.key === "diarization" || group.key === "llm",
-          )
-        : basePipelineModelGroups,
-    [basePipelineModelGroups, usesGraniteStandalone],
-  );
+  const pipelineModelGroups = basePipelineModelGroups;
 
   const pipelineModels = useMemo(
     () => pipelineModelGroups.flatMap((group) => group.models),
@@ -259,21 +208,17 @@ export function DiarizationPage({
   );
   const resolvedSummaryModel = resolvedLlmModel;
   const managedPipelineVariants = useMemo(
-    () =>
-      usesGraniteStandalone
-        ? [resolvedSelectedModel]
-        : [
-            resolvedSelectedModel,
-            resolvedAsrModel,
-            resolvedAlignerModel,
-            resolvedLlmModel,
-          ],
+    () => [
+      resolvedSelectedModel,
+      resolvedAsrModel,
+      resolvedAlignerModel,
+      resolvedLlmModel,
+    ],
     [
       resolvedAlignerModel,
       resolvedAsrModel,
       resolvedLlmModel,
       resolvedSelectedModel,
-      usesGraniteStandalone,
     ],
   );
   const managedModels = useMemo(
@@ -327,9 +272,7 @@ export function DiarizationPage({
         return `Download and load ${modelName} in Diarization Models to generate summaries.`;
     }
   }, [resolvedSummaryModel, summaryModelStatus]);
-  const pipelineModelsReady = usesGraniteStandalone
-    ? selectedModelReady
-    : asrModelReady && alignerModelReady;
+  const pipelineModelsReady = asrModelReady && alignerModelReady;
   const readyManagedModelCount = managedModels.filter(
     (model) => model.status === "ready",
   ).length;
@@ -444,11 +387,10 @@ export function DiarizationPage({
   };
 
   const openModelManagerForPipeline = () => {
-    const missingPipelineVariant = usesGraniteStandalone
-      ? resolvedSelectedModel
-      : (!asrModelReady && resolvedAsrModel) ||
-        (!alignerModelReady && resolvedAlignerModel) ||
-        resolvedSelectedModel;
+    const missingPipelineVariant =
+      (!asrModelReady && resolvedAsrModel) ||
+      (!alignerModelReady && resolvedAlignerModel) ||
+      resolvedSelectedModel;
     setModalIntentModel(missingPipelineVariant);
     setAutoCloseOnIntentReady(true);
     setIsModelModalOpen(true);
@@ -676,10 +618,8 @@ export function DiarizationPage({
             pipelineMode={pipelineMode}
             selectedModel={resolvedSelectedModel}
             selectedModelReady={selectedModelReady}
-            pipelineAsrModelId={usesGraniteStandalone ? null : resolvedAsrModel}
-            pipelineAlignerModelId={
-              usesGraniteStandalone ? null : resolvedAlignerModel
-            }
+            pipelineAsrModelId={resolvedAsrModel}
+            pipelineAlignerModelId={resolvedAlignerModel}
             pipelineLlmModelId={resolvedLlmModel}
             pipelineModelsReady={pipelineModelsReady}
             onModelRequired={() => {
@@ -690,11 +630,7 @@ export function DiarizationPage({
             }}
             onPipelineModelsRequired={() => {
               openModelManagerForPipeline();
-              onError(
-                usesGraniteStandalone
-                  ? "Load Granite Speech before diarization."
-                  : "Load ASR and forced aligner models before diarization.",
-              );
+              onError("Load ASR and forced aligner models before diarization.");
             }}
             managedModelCount={managedModels.length}
             readyManagedModelCount={readyManagedModelCount}

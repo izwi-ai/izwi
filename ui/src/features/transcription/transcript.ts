@@ -1,4 +1,5 @@
 import type {
+  SpeakerAttributedAsrTurn,
   TranscriptionRecord,
   TranscriptionSegment,
   TranscriptionWord,
@@ -19,11 +20,39 @@ export interface TranscriptionTranscriptEntry {
 
 type TranscriptRecordLike = Pick<
   TranscriptionRecord,
-  "duration_secs" | "transcription" | "segments" | "words"
+  | "duration_secs"
+  | "transcription"
+  | "segments"
+  | "words"
+  | "speaker_attributed_text"
+  | "speaker_turns"
 >;
 
 function normalizeTranscriptText(text: string): string {
   return text.trim().replace(/\s+/g, " ");
+}
+
+function speakerLabel(speaker: string): string {
+  const normalized = normalizeTranscriptText(speaker);
+  if (!normalized) {
+    return "[Speaker]";
+  }
+  if (normalized.startsWith("[") && normalized.endsWith("]")) {
+    return normalized;
+  }
+  return `[${normalized}]`;
+}
+
+function speakerTurnLines(turns: SpeakerAttributedAsrTurn[]): string[] {
+  return turns
+    .map((turn) => {
+      const text = normalizeTranscriptText(turn.text ?? "");
+      if (!text) {
+        return null;
+      }
+      return `${speakerLabel(turn.speaker ?? "")}: ${text}`;
+    })
+    .filter((line): line is string => line !== null);
 }
 
 function formatExportTimestamp(totalSeconds: number): string {
@@ -154,6 +183,47 @@ function buildEntriesFromWords(
   return entries;
 }
 
+function buildEntriesFromSpeakerTurns(
+  turns: SpeakerAttributedAsrTurn[],
+  durationSecs: number | null,
+): TranscriptionTranscriptEntry[] {
+  return turns
+    .map((turn, index) => {
+      const text = normalizeTranscriptText(turn.text ?? "");
+      if (!text) {
+        return null;
+      }
+      const hasTiming =
+        typeof turn.start === "number" &&
+        Number.isFinite(turn.start) &&
+        typeof turn.end === "number" &&
+        Number.isFinite(turn.end) &&
+        turn.end > turn.start;
+      const fallbackEnd =
+        typeof durationSecs === "number" && Number.isFinite(durationSecs)
+          ? Math.max(durationSecs, 0)
+          : 0;
+      const wordCount = text.split(/\s+/).filter(Boolean).length;
+      return {
+        start: hasTiming ? Number(turn.start) : 0,
+        end: hasTiming ? Number(turn.end) : fallbackEnd,
+        text: `${speakerLabel(turn.speaker ?? "")}: ${text}`,
+        wordStart: 0,
+        wordEnd: Math.max(wordCount - 1, 0),
+        timed: hasTiming,
+        index,
+      };
+    })
+    .filter(
+      (entry): entry is TranscriptionTranscriptEntry & { index: number } =>
+        entry !== null,
+    )
+    .sort((left, right) =>
+      left.timed && right.timed ? left.start - right.start : left.index - right.index,
+    )
+    .map(({ index: _index, ...entry }) => entry);
+}
+
 function buildFallbackEntry(
   transcription: string,
   durationSecs: number | null,
@@ -196,6 +266,14 @@ export function transcriptionEntriesFromRecord(
     return wordEntries;
   }
 
+  const speakerTurnEntries = buildEntriesFromSpeakerTurns(
+    record.speaker_turns ?? [],
+    record.duration_secs,
+  );
+  if (speakerTurnEntries.length > 0) {
+    return speakerTurnEntries;
+  }
+
   return buildFallbackEntry(record.transcription, record.duration_secs);
 }
 
@@ -224,6 +302,14 @@ export function transcriptionWordCount(
     return timedWords.length;
   }
 
+  const speakerWords = (record.speaker_turns ?? [])
+    .map((turn) => normalizeTranscriptText(turn.text ?? ""))
+    .filter(Boolean)
+    .join(" ");
+  if (speakerWords) {
+    return speakerWords.split(/\s+/).filter(Boolean).length;
+  }
+
   const normalized = normalizeTranscriptText(record.transcription);
   if (!normalized) {
     return 0;
@@ -240,6 +326,21 @@ export function formatTranscriptionText(
 ): string {
   if (!record) {
     return "";
+  }
+
+  const turnLines = speakerTurnLines(record.speaker_turns ?? []);
+  if (turnLines.length > 0) {
+    return turnLines.join("\n");
+  }
+
+  const nativeSpeakerText =
+    record.speaker_attributed_text
+      ?.split(/\r?\n/)
+      .map((line) => normalizeTranscriptText(line))
+      .filter(Boolean)
+      .join("\n") ?? "";
+  if (nativeSpeakerText) {
+    return nativeSpeakerText;
   }
 
   const normalizedTranscript = normalizeTranscriptText(record.transcription);
