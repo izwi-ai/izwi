@@ -244,10 +244,25 @@ export function NewTranscriptionModal({
           include_timestamps: includeTimestamps,
           generate_summary: generateSummary,
         };
+        let streamingCreatedHandled: Promise<void> | null = null;
         const record = streamingEnabled
           ? await new Promise<TranscriptionRecord>((resolve, reject) => {
               let settled = false;
               let streamController: AbortController | null = null;
+              const handleCreated = (createdRecord: TranscriptionRecord) => {
+                if (settled) {
+                  return;
+                }
+                settled = true;
+                try {
+                  streamingCreatedHandled = Promise.resolve(
+                    onCreated(createdRecord),
+                  );
+                } catch (err) {
+                  streamingCreatedHandled = Promise.reject(err);
+                }
+                resolve(createdRecord);
+              };
               const rejectIfAborted = () => {
                 if (settled) {
                   return;
@@ -261,13 +276,7 @@ export function NewTranscriptionModal({
                 onStart: () => {
                   onStreamingStart?.();
                 },
-                onCreated: (createdRecord) => {
-                  if (settled) {
-                    return;
-                  }
-                  settled = true;
-                  resolve(createdRecord);
-                },
+                onCreated: handleCreated,
                 onDelta: (delta) => {
                   onStreamingDelta?.(delta);
                 },
@@ -332,7 +341,11 @@ export function NewTranscriptionModal({
               }
             : current,
         );
-        await onCreated(record);
+        if (streamingCreatedHandled) {
+          await streamingCreatedHandled;
+        } else {
+          await onCreated(record);
+        }
         onClose();
       } catch (err) {
         if (isAbortError(err)) {

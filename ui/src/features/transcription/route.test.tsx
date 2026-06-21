@@ -1284,6 +1284,80 @@ describe("TranscriptionPage detail route", () => {
     expect(screen.getByText("Hello world")).toBeInTheDocument();
   });
 
+  it("keeps progress delivered in the same stream batch as the created event", async () => {
+    const createdRecord = {
+      id: "txr-early-progress-1",
+      created_at: 1,
+      model_id: "Parakeet-TDT-0.6B-v3",
+      aligner_model_id: null,
+      language: "English",
+      processing_status: "pending" as const,
+      processing_error: null,
+      duration_secs: null,
+      processing_time_ms: 0,
+      rtf: null,
+      audio_mime_type: "audio/wav",
+      audio_filename: "early-progress.wav",
+      transcription: "",
+      segments: [],
+      words: [],
+      summary_status: "not_requested" as const,
+      summary_model_id: null,
+      summary_text: null,
+      summary_error: null,
+      summary_updated_at: null,
+    };
+
+    apiMocks.createTranscriptionRecordStream.mockImplementationOnce(
+      (_request, callbacks) => {
+        callbacks.onCreated?.(createdRecord);
+        callbacks.onProgress?.({
+          phase: "chunk_finished",
+          current_chunk: 2,
+          total_chunks: 4,
+          processed_audio_secs: 8,
+          total_audio_secs: 16,
+          percent: 50,
+        });
+        return new AbortController();
+      },
+    );
+    apiMocks.getTranscriptionRecord.mockResolvedValue({
+      ...createdRecord,
+      processing_status: "processing",
+    });
+
+    renderRoute("/transcription");
+
+    await waitFor(() =>
+      expect(apiMocks.listTranscriptionRecords).toHaveBeenCalled(),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /New transcript/i }));
+
+    const fileInput = document.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement | null;
+    expect(fileInput).not.toBeNull();
+
+    fireEvent.change(fileInput!, {
+      target: {
+        files: [
+          new File(["audio"], "early-progress.wav", { type: "audio/wav" }),
+        ],
+      },
+    });
+
+    expect(
+      await screen.findByRole("heading", { name: "Transcription Record" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Transcribing audio")).toBeInTheDocument();
+    expect(screen.getByText("Chunk 2 of 4")).toBeInTheDocument();
+    expect(
+      screen.getByRole("progressbar", { name: "ASR processing progress" }),
+    ).toHaveAttribute("aria-valuenow", "50");
+  });
+
   it("refreshes transcription history after creating a record", async () => {
     apiMocks.listTranscriptionRecords
       .mockResolvedValueOnce([])
