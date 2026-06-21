@@ -1192,7 +1192,7 @@ impl GraniteConformerAttention {
 
         let pos_bias = self.relative_position_bias(&q)?;
         let scale = 1.0 / (self.dim_head as f64).sqrt();
-        let mut attn = q.matmul(&k.t()?)?;
+        let mut attn = encoder_attention_scores(&q, &k)?;
         attn = (attn * scale)?.broadcast_add(&pos_bias)?;
         if pad > 0 {
             let mask = encoder_padding_mask(
@@ -1205,7 +1205,7 @@ impl GraniteConformerAttention {
             attn = attn.broadcast_add(&mask)?;
         }
         let attn = ops::softmax(&attn.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q.dtype())?;
-        let out = attn.matmul(&v)?;
+        let out = encoder_attention_context(&attn, &v)?;
         let out = out
             .transpose(2, 3)?
             .reshape((batch, padded_len, self.num_heads * self.dim_head))?
@@ -1252,6 +1252,35 @@ fn encoder_attention_heads(
         .map_err(Error::from)
 }
 
+fn encoder_attention_scores(q: &Tensor, k: &Tensor) -> Result<Tensor> {
+    if q.device().is_cpu() {
+        let (batch, blocks, heads, context, dim_head) = q.dims5()?;
+        let flat = batch * blocks * heads;
+        let q = q.reshape((flat, context, dim_head))?;
+        let k = k.reshape((flat, context, dim_head))?;
+        return q
+            .matmul(&k.t()?)?
+            .reshape((batch, blocks, heads, context, context))
+            .map_err(Error::from);
+    }
+    q.matmul(&k.t()?).map_err(Error::from)
+}
+
+fn encoder_attention_context(attn: &Tensor, v: &Tensor) -> Result<Tensor> {
+    if attn.device().is_cpu() {
+        let (batch, blocks, heads, context, _) = attn.dims5()?;
+        let dim_head = v.dim(D::Minus1)?;
+        let flat = batch * blocks * heads;
+        let attn = attn.reshape((flat, context, context))?;
+        let v = v.reshape((flat, context, dim_head))?;
+        return attn
+            .matmul(&v)?
+            .reshape((batch, blocks, heads, context, dim_head))
+            .map_err(Error::from);
+    }
+    attn.matmul(v).map_err(Error::from)
+}
+
 fn relative_position_score_row(q_row: &Tensor, rel_row: &Tensor) -> Result<Tensor> {
     let q_row = q_row.squeeze(1)?.contiguous()?;
     let rel_row = rel_row.t()?.contiguous()?;
@@ -1278,11 +1307,14 @@ fn encoder_padding_mask(
     dtype: DType,
 ) -> Result<Tensor> {
     let valid = remainder.max(1);
-    let mut data = vec![0f32; context * context];
-    for q in 0..context {
-        for k in 0..context {
-            if q >= valid || k >= valid {
-                data[q * context + k] = -1e4;
+    let mut data = vec![0f32; nblocks * context * context];
+    if nblocks > 0 {
+        let final_block = (nblocks - 1) * context * context;
+        for q in 0..context {
+            for k in 0..context {
+                if q >= valid || k >= valid {
+                    data[final_block + q * context + k] = -1e4;
+                }
             }
         }
     }
@@ -3209,6 +3241,44 @@ mod tests {
             heads.t().unwrap().stride(),
             &[204800, 204800, 25600, 1, 128]
         );
+    }
+
+    #[test]
+    fn encoder_attention_scores_handle_cpu_five_dim_heads() {
+        let device = Device::Cpu;
+        let q = Tensor::zeros((1, 2, 3, 4, 5), DType::F32, &device).unwrap();
+        let k = Tensor::zeros((1, 2, 3, 4, 5), DType::F32, &device).unwrap();
+
+        let scores = encoder_attention_scores(&q, &k).unwrap();
+
+        assert_eq!(scores.dims(), &[1, 2, 3, 4, 4]);
+    }
+
+    #[test]
+    fn encoder_attention_context_handles_cpu_five_dim_heads() {
+        let device = Device::Cpu;
+        let attn = Tensor::zeros((1, 2, 3, 4, 4), DType::F32, &device).unwrap();
+        let v = Tensor::zeros((1, 2, 3, 4, 5), DType::F32, &device).unwrap();
+
+        let context = encoder_attention_context(&attn, &v).unwrap();
+
+        assert_eq!(context.dims(), &[1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn encoder_padding_mask_allocates_each_block_and_masks_final_block() {
+        let device = Device::Cpu;
+        let mask = encoder_padding_mask(4, 2, 2, &device, DType::F32).unwrap();
+        let values = mask.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        assert_eq!(mask.dims(), &[1, 2, 1, 4, 4]);
+        assert_eq!(values.len(), 32);
+        assert!(values[..16].iter().all(|value| *value == 0.0));
+        assert_eq!(values[16], 0.0);
+        assert_eq!(values[17], 0.0);
+        assert_eq!(values[18], -1e4);
+        assert_eq!(values[20], 0.0);
+        assert_eq!(values[24], -1e4);
     }
 
     #[test]
