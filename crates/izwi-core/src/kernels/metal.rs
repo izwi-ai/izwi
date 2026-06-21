@@ -143,6 +143,86 @@ kernel void izwi_qk_rms_norm_f16(
         output[out_offset + tid] = half(value * scale * float(weights[weight_offset + tid]));
     }
 }
+
+kernel void izwi_rms_norm_f32(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& rows [[buffer(3)]],
+    constant uint& hidden_dim [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint row [[threadgroup_position_in_grid]],
+    uint threads_per_threadgroup [[threads_per_threadgroup]]
+) {
+    threadgroup float sums[1024];
+
+    if (row >= rows) {
+        return;
+    }
+
+    const uint row_offset = row * hidden_dim;
+    float sum = 0.0f;
+    for (uint idx = tid; idx < hidden_dim; idx += threads_per_threadgroup) {
+        const float value = input[row_offset + idx];
+        sum += value * value;
+    }
+    sums[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads_per_threadgroup >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sums[tid] += sums[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float scale = rsqrt((sums[0] / float(hidden_dim)) + eps);
+    for (uint idx = tid; idx < hidden_dim; idx += threads_per_threadgroup) {
+        const float value = input[row_offset + idx];
+        output[row_offset + idx] = value * scale * weight[idx];
+    }
+}
+
+kernel void izwi_rms_norm_f16(
+    device const half* input [[buffer(0)]],
+    device const half* weight [[buffer(1)]],
+    device half* output [[buffer(2)]],
+    constant uint& rows [[buffer(3)]],
+    constant uint& hidden_dim [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint row [[threadgroup_position_in_grid]],
+    uint threads_per_threadgroup [[threads_per_threadgroup]]
+) {
+    threadgroup float sums[1024];
+
+    if (row >= rows) {
+        return;
+    }
+
+    const uint row_offset = row * hidden_dim;
+    float sum = 0.0f;
+    for (uint idx = tid; idx < hidden_dim; idx += threads_per_threadgroup) {
+        const float value = float(input[row_offset + idx]);
+        sum += value * value;
+    }
+    sums[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads_per_threadgroup >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sums[tid] += sums[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float scale = rsqrt((sums[0] / float(hidden_dim)) + eps);
+    for (uint idx = tid; idx < hidden_dim; idx += threads_per_threadgroup) {
+        const float value = float(input[row_offset + idx]);
+        output[row_offset + idx] = half(value * scale * float(weight[idx]));
+    }
+}
 "#;
 
 #[cfg(feature = "metal")]
@@ -434,6 +514,151 @@ fn qk_rms_norm_pipeline(device: &MetalDevice, dtype: DType) -> CandleResult<Comp
     Ok(pipeline)
 }
 
+#[cfg(feature = "metal")]
+#[derive(Debug, Clone, Copy)]
+struct RmsNormOp {
+    rows: usize,
+    hidden_dim: usize,
+    eps: f32,
+}
+
+#[cfg(feature = "metal")]
+impl CustomOp2 for RmsNormOp {
+    fn name(&self) -> &'static str {
+        "izwi-rms-norm-metal"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+    ) -> CandleResult<(CpuStorage, Shape)> {
+        bail!("izwi-rms-norm-metal requires Metal tensors")
+    }
+
+    fn metal_fwd(
+        &self,
+        input_storage: &MetalStorage,
+        input_layout: &Layout,
+        weight_storage: &MetalStorage,
+        weight_layout: &Layout,
+    ) -> CandleResult<(MetalStorage, Shape)> {
+        let dtype = input_storage.dtype();
+        if weight_storage.dtype() != dtype {
+            bail!("izwi-rms-norm-metal requires matching dtypes")
+        }
+        if !matches!(dtype, DType::F32 | DType::F16) {
+            bail!("izwi-rms-norm-metal only supports F32 and F16 tensors")
+        }
+        if !input_layout.is_contiguous() || !weight_layout.is_contiguous() {
+            bail!("izwi-rms-norm-metal requires contiguous tensors")
+        }
+        if self.rows == 0 || self.hidden_dim == 0 {
+            bail!("izwi-rms-norm-metal requires non-empty rows and hidden dim")
+        }
+        if input_layout.shape().elem_count() != self.rows.saturating_mul(self.hidden_dim) {
+            bail!("izwi-rms-norm-metal input shape does not match rows/hidden_dim")
+        }
+        if weight_layout.shape().elem_count() != self.hidden_dim {
+            bail!("izwi-rms-norm-metal weight length does not match hidden_dim")
+        }
+        let elem_count = input_layout.shape().elem_count();
+        if elem_count > u32::MAX as usize
+            || self.rows > u32::MAX as usize
+            || self.hidden_dim > u32::MAX as usize
+        {
+            bail!("izwi-rms-norm-metal tensor is too large")
+        }
+
+        let device = input_storage.device().clone();
+        let output = device.new_buffer(elem_count, dtype, "izwi-rms-norm")?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("izwi-rms-norm");
+        let pipeline = rms_norm_pipeline(device.metal_device(), dtype)?;
+        encoder.set_compute_pipeline_state(&pipeline);
+
+        encoder.set_buffer(
+            0,
+            Some(input_storage.buffer()),
+            input_layout.start_offset() * dtype.size_in_bytes(),
+        );
+        encoder.set_buffer(
+            1,
+            Some(weight_storage.buffer()),
+            weight_layout.start_offset() * dtype.size_in_bytes(),
+        );
+        encoder.set_buffer(2, Some(&output), 0);
+        encoder.set_bytes(3, &(self.rows as u32));
+        encoder.set_bytes(4, &(self.hidden_dim as u32));
+        encoder.set_bytes(5, &self.eps);
+
+        let threads_per_threadgroup = self
+            .hidden_dim
+            .next_power_of_two()
+            .min(pipeline.max_total_threads_per_threadgroup())
+            .min(1024)
+            .max(1);
+        encoder.dispatch_thread_groups(
+            objc2_metal::MTLSize {
+                width: self.rows,
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: threads_per_threadgroup,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        Ok((
+            MetalStorage::new(output, device, elem_count, dtype),
+            input_layout.shape().clone(),
+        ))
+    }
+}
+
+#[cfg(feature = "metal")]
+fn rms_norm_pipeline(device: &MetalDevice, dtype: DType) -> CandleResult<ComputePipeline> {
+    static PIPELINES: OnceLock<Mutex<HashMap<(u64, DType), ComputePipeline>>> = OnceLock::new();
+    let registry_id = device.registry_id();
+    let pipelines = PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (registry_id, dtype);
+
+    if let Some(pipeline) = pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .get(&key)
+        .cloned()
+    {
+        return Ok(pipeline);
+    }
+
+    let function_name = match dtype {
+        DType::F32 => "izwi_rms_norm_f32",
+        DType::F16 => "izwi_rms_norm_f16",
+        _ => bail!("izwi-rms-norm-metal only supports F32 and F16 tensors"),
+    };
+    let library = device
+        .new_library_with_source(IZWI_METAL_SOURCE, None)
+        .map_err(candle_core::Error::wrap)?;
+    let function = library
+        .get_function(function_name, None)
+        .map_err(candle_core::Error::wrap)?;
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(candle_core::Error::wrap)?;
+
+    pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .insert(key, pipeline.clone());
+
+    Ok(pipeline)
+}
+
 /// Try fused gated delta recurrent computation.
 ///
 /// This fuses multiple operations:
@@ -695,20 +920,46 @@ pub fn try_fused_qk_rms_norm(
 ///
 /// Computes: x / sqrt(mean(x^2) + eps) * weight
 pub fn try_fused_rms_norm(input: &Tensor, weight: &Tensor, eps: f64) -> Option<Tensor> {
+    #[cfg(not(feature = "metal"))]
+    let _ = (input, weight, eps);
+
     if !use_fused_kernels() {
         return None;
     }
 
-    let sq_mean = input
-        .sqr()
-        .ok()?
-        .mean_keepdim(candle_core::D::Minus1)
-        .ok()?;
+    #[cfg(feature = "metal")]
+    {
+        let dims = input.dims();
+        let hidden_dim = *dims.last()?;
+        if !input.device().is_metal()
+            || !weight.device().is_metal()
+            || input.dtype() != weight.dtype()
+            || !matches!(input.dtype(), DType::F32 | DType::F16)
+            || !input.is_contiguous()
+            || !weight.is_contiguous()
+            || hidden_dim == 0
+            || weight.dims() != [hidden_dim]
+        {
+            return None;
+        }
+        let rows = input.elem_count().checked_div(hidden_dim)?;
+        if rows == 0 {
+            return None;
+        }
+        return input
+            .apply_op2_no_bwd(
+                weight,
+                &RmsNormOp {
+                    rows,
+                    hidden_dim,
+                    eps: eps as f32,
+                },
+            )
+            .ok();
+    }
 
-    let rms = (sq_mean + eps).ok()?.sqrt().ok()?;
-
-    let normalized = input.broadcast_div(&rms).ok()?;
-    normalized.broadcast_mul(weight).ok()
+    #[allow(unreachable_code)]
+    None
 }
 
 /// Try fused gated RMS normalization.
@@ -1123,6 +1374,66 @@ mod tests {
         let weight = Tensor::ones(8, DType::F32, &device).unwrap();
 
         assert!(try_fused_qk_rms_norm(&q, &k, &weight, 1e-6).is_none());
+    }
+
+    #[test]
+    fn rms_norm_returns_none_on_cpu() {
+        let device = Device::Cpu;
+        let input = Tensor::zeros((1, 1, 4), DType::F32, &device).unwrap();
+        let weight = Tensor::ones(4, DType::F32, &device).unwrap();
+
+        assert!(try_fused_rms_norm(&input, &weight, 1e-6).is_none());
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn metal_rms_norm_kernel_matches_reference_if_available() {
+        let Ok(device) = Device::new_metal(0) else {
+            return;
+        };
+        for dtype in [DType::F32, DType::F16] {
+            let input = Tensor::from_vec(
+                vec![
+                    0.2f32, -0.4, 0.6, 0.8, //
+                    -1.0, 1.2, -1.4, 1.6, //
+                    1.8, -2.0, 2.2, -2.4,
+                ],
+                (1, 3, 4),
+                &device,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            let weight = Tensor::from_vec(vec![1.0f32, 1.1, 0.9, 0.8], 4, &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+
+            let out = try_fused_rms_norm(&input, &weight, 1e-6)
+                .expect("fused RMSNorm should run on Metal");
+            let reference = candle_nn::ops::rms_norm(&input, &weight, 1e-6).unwrap();
+            let out = out
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let reference = reference
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let tolerance = if dtype == DType::F16 { 5e-3 } else { 1e-5 };
+            for (idx, (actual, expected)) in out.iter().zip(reference.iter()).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "{dtype:?} mismatch at {idx}: {actual} != {expected}"
+                );
+            }
+        }
     }
 
     #[cfg(all(feature = "metal", target_os = "macos"))]
