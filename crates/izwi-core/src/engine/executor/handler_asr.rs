@@ -2,6 +2,7 @@ use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::models::registry::NativeAsrGenerationOptions;
 use crate::runtime::granite_auto_asr_max_tokens_for_duration;
+use serde_json::json;
 use std::time::Instant;
 
 use super::super::request::EngineCoreRequest;
@@ -357,14 +358,26 @@ impl NativeExecutor {
                             sr,
                             &generation_options,
                         );
-                        let details = model.transcribe_with_details_prompt_prefix_and_options(
+                        let mut details = model.transcribe_with_details_prompt_prefix_and_options(
                             chunk_audio,
                             sr,
                             language,
                             asr_prompt,
                             prefix_text,
-                            chunk_generation_options,
+                            chunk_generation_options.clone(),
                         )?;
+                        if matches!(family, ModelFamily::GraniteSpeechAsr) {
+                            details = Self::recover_granite_chunk_loop(
+                                &model,
+                                chunk_audio,
+                                sr,
+                                language,
+                                asr_prompt,
+                                prefix_text,
+                                &chunk_generation_options,
+                                details,
+                            )?;
+                        }
                         Ok(AsrChunkTranscription {
                             text: details.text,
                             diagnostics: details.diagnostics,
@@ -512,6 +525,82 @@ impl NativeExecutor {
     fn granite_asr_prefix_replay_text(prefix_text: &str) -> String {
         recent_word_suffix(prefix_text, Self::granite_asr_prefix_replay_words())
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn recover_granite_chunk_loop(
+        model: &crate::models::registry::NativeAsrModel,
+        chunk_audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        asr_prompt: Option<&str>,
+        prefix_text: Option<&str>,
+        base_options: &NativeAsrGenerationOptions,
+        mut details: crate::models::registry::NativeAsrTranscription,
+    ) -> Result<crate::models::registry::NativeAsrTranscription> {
+        let Some(original_loop) =
+            granite_chunk_loop_signal(&details.text, details.diagnostics.as_ref())
+        else {
+            return Ok(details);
+        };
+        let retry_max_tokens = granite_loop_recovery_max_tokens(
+            chunk_audio.len(),
+            sample_rate,
+            base_options.max_new_tokens,
+        );
+        if retry_max_tokens >= base_options.max_new_tokens {
+            details.diagnostics = with_granite_loop_recovery_diagnostics(
+                details.diagnostics,
+                &original_loop,
+                None,
+                base_options.max_new_tokens,
+                retry_max_tokens,
+                false,
+                "not_retried_budget_floor",
+            );
+            return Ok(details);
+        }
+
+        let mut retry_options = base_options.clone();
+        retry_options.max_new_tokens = retry_max_tokens;
+        let mut retry = model.transcribe_with_details_prompt_prefix_and_options(
+            chunk_audio,
+            sample_rate,
+            language,
+            asr_prompt,
+            prefix_text,
+            retry_options,
+        )?;
+        let retry_loop = granite_chunk_loop_signal(&retry.text, retry.diagnostics.as_ref());
+        let use_retry = !retry.text.trim().is_empty()
+            && retry_loop
+                .as_ref()
+                .map(|loop_signal| loop_signal.score() < original_loop.score())
+                .unwrap_or(true);
+
+        if use_retry {
+            retry.diagnostics = with_granite_loop_recovery_diagnostics(
+                retry.diagnostics,
+                &original_loop,
+                retry_loop.as_ref(),
+                base_options.max_new_tokens,
+                retry_max_tokens,
+                true,
+                "retry_selected",
+            );
+            Ok(retry)
+        } else {
+            details.diagnostics = with_granite_loop_recovery_diagnostics(
+                details.diagnostics,
+                &original_loop,
+                retry_loop.as_ref(),
+                base_options.max_new_tokens,
+                retry_max_tokens,
+                false,
+                "retry_not_better",
+            );
+            Ok(details)
+        }
+    }
 }
 
 fn recent_word_suffix(text: &str, max_words: usize) -> String {
@@ -523,6 +612,145 @@ fn recent_word_suffix(text: &str, max_words: usize) -> String {
         return text.trim().to_string();
     }
     words[words.len() - max_words..].join(" ")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GranitePhraseLoop {
+    phrase: String,
+    phrase_words: usize,
+    repeat_count: usize,
+}
+
+impl GranitePhraseLoop {
+    fn score(&self) -> usize {
+        self.phrase_words.saturating_mul(self.repeat_count)
+    }
+}
+
+fn granite_chunk_loop_signal(
+    text: &str,
+    diagnostics: Option<&serde_json::Value>,
+) -> Option<GranitePhraseLoop> {
+    if diagnostics
+        .and_then(|value| value.pointer("/decode/stop_reason"))
+        .and_then(|value| value.as_str())
+        != Some("max_tokens")
+    {
+        return None;
+    }
+    repeated_phrase_loop(text)
+}
+
+fn repeated_phrase_loop(text: &str) -> Option<GranitePhraseLoop> {
+    let words = normalized_words(text);
+    if words.len() < 9 {
+        return None;
+    }
+    let mut best: Option<GranitePhraseLoop> = None;
+    let max_phrase_words = 12.min(words.len() / 3);
+    for phrase_words in 3..=max_phrase_words {
+        let mut idx = 0usize;
+        while idx + phrase_words * 3 <= words.len() {
+            let phrase = &words[idx..idx + phrase_words];
+            let mut repeats = 1usize;
+            while idx + phrase_words * (repeats + 1) <= words.len()
+                && words[idx + phrase_words * repeats..idx + phrase_words * (repeats + 1)]
+                    == *phrase
+            {
+                repeats += 1;
+            }
+            if repeats >= 3 {
+                let candidate = GranitePhraseLoop {
+                    phrase: phrase.join(" "),
+                    phrase_words,
+                    repeat_count: repeats,
+                };
+                if best
+                    .as_ref()
+                    .map(|current| candidate.score() > current.score())
+                    .unwrap_or(true)
+                {
+                    best = Some(candidate);
+                }
+                idx += phrase_words * repeats;
+            } else {
+                idx += 1;
+            }
+        }
+    }
+    best
+}
+
+fn normalized_words(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|word| {
+            word.chars()
+                .filter(|ch| ch.is_alphanumeric() || matches!(ch, '\'' | '-'))
+                .flat_map(|ch| ch.to_lowercase())
+                .collect::<String>()
+        })
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+fn granite_loop_recovery_max_tokens(
+    chunk_sample_count: usize,
+    sample_rate: u32,
+    original_max_tokens: usize,
+) -> usize {
+    if original_max_tokens <= 1 {
+        return original_max_tokens;
+    }
+    let chunk_seconds = if sample_rate > 0 {
+        chunk_sample_count as f32 / sample_rate as f32
+    } else {
+        0.0
+    };
+    let auto_for_chunk = granite_auto_asr_max_tokens_for_duration(chunk_seconds);
+    let reduced = original_max_tokens.saturating_mul(3) / 4;
+    reduced
+        .min(auto_for_chunk)
+        .max(24.min(original_max_tokens.saturating_sub(1)))
+        .min(original_max_tokens.saturating_sub(1))
+        .max(1)
+}
+
+fn with_granite_loop_recovery_diagnostics(
+    diagnostics: Option<serde_json::Value>,
+    original_loop: &GranitePhraseLoop,
+    retry_loop: Option<&GranitePhraseLoop>,
+    original_max_tokens: usize,
+    retry_max_tokens: usize,
+    selected_retry: bool,
+    decision: &str,
+) -> Option<serde_json::Value> {
+    let mut diagnostics = diagnostics.unwrap_or_else(|| json!({}));
+    if !diagnostics.is_object() {
+        diagnostics = json!({ "model_diagnostics": diagnostics });
+    }
+    if let Some(root) = diagnostics.as_object_mut() {
+        root.insert(
+            "chunk_loop_recovery".to_string(),
+            json!({
+                "triggered": true,
+                "decision": decision,
+                "selected_retry": selected_retry,
+                "original_max_new_tokens": original_max_tokens,
+                "retry_max_new_tokens": retry_max_tokens,
+                "original_loop": {
+                    "phrase": original_loop.phrase,
+                    "phrase_words": original_loop.phrase_words,
+                    "repeat_count": original_loop.repeat_count,
+                },
+                "retry_loop": retry_loop.map(|loop_signal| json!({
+                    "phrase": loop_signal.phrase,
+                    "phrase_words": loop_signal.phrase_words,
+                    "repeat_count": loop_signal.repeat_count,
+                })),
+            }),
+        );
+    }
+    Some(diagnostics)
 }
 
 #[cfg(test)]
@@ -623,5 +851,43 @@ mod tests {
         assert_eq!(words.len(), 96);
         assert_eq!(words.first(), Some(&"word44"));
         assert_eq!(words.last(), Some(&"word139"));
+    }
+
+    #[test]
+    fn repeated_phrase_loop_detects_consecutive_phrase_repeats() {
+        let text = "intro words if you speak in trust their nervous system contracts \
+            if you speak in trust their nervous system contracts \
+            if you speak in trust their nervous system contracts tail";
+
+        let loop_signal = super::repeated_phrase_loop(text).expect("loop signal");
+
+        assert!(loop_signal.phrase.contains("if you speak"));
+        assert!(loop_signal.repeat_count >= 3);
+    }
+
+    #[test]
+    fn granite_chunk_loop_signal_requires_max_token_stop() {
+        let text = "alpha beta gamma alpha beta gamma alpha beta gamma";
+        let stopped = serde_json::json!({
+            "decode": {
+                "stop_reason": "stop_token"
+            }
+        });
+        let max_tokens = serde_json::json!({
+            "decode": {
+                "stop_reason": "max_tokens"
+            }
+        });
+
+        assert!(super::granite_chunk_loop_signal(text, Some(&stopped)).is_none());
+        assert!(super::granite_chunk_loop_signal(text, Some(&max_tokens)).is_some());
+    }
+
+    #[test]
+    fn granite_loop_recovery_budget_is_shorter_than_original() {
+        let retry = super::granite_loop_recovery_max_tokens(16_000 * 30, 16_000, 84);
+
+        assert!(retry < 84);
+        assert!(retry >= 24);
     }
 }
