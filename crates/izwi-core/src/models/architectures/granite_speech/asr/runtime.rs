@@ -476,6 +476,17 @@ fn granite_f16_lm_head_policy(
     override_enabled.unwrap_or(is_metal && dtype == DType::F32)
 }
 
+fn granite_cached_linear_t_enabled(device: &Device) -> bool {
+    let override_enabled = std::env::var("IZWI_GRANITE_CACHED_LINEAR_T")
+        .ok()
+        .and_then(|raw| parse_env_bool(&raw));
+    granite_cached_linear_t_policy(device.is_metal(), override_enabled)
+}
+
+fn granite_cached_linear_t_policy(is_metal: bool, override_enabled: Option<bool>) -> bool {
+    override_enabled.unwrap_or(is_metal)
+}
+
 fn granite_f16_qkv_enabled(device: &Device, dtype: DType) -> bool {
     let override_enabled = std::env::var("IZWI_GRANITE_F16_QKV")
         .ok()
@@ -1669,12 +1680,61 @@ fn qformer_attention_heads(x: &Tensor, num_heads: usize, head_dim: usize) -> Res
         .map_err(Error::from)
 }
 
+#[derive(Clone, Debug)]
+struct GraniteLinearNoBias {
+    linear: Linear,
+    weight_t: Option<Tensor>,
+}
+
+impl GraniteLinearNoBias {
+    fn new(linear: Linear) -> Result<Self> {
+        let weight_t = if granite_cached_linear_t_enabled(linear.weight().device()) {
+            Some(linear.weight().t()?)
+        } else {
+            None
+        };
+        Ok(Self { linear, weight_t })
+    }
+
+    fn from_weight(weight: Tensor) -> Result<Self> {
+        Self::new(Linear::new(weight, None))
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        if let Some(weight_t) = self.weight_t.as_ref() {
+            return cached_linear_no_bias_forward(x, weight_t)
+                .or_else(|_| self.linear.forward(x).map_err(Error::from));
+        }
+        self.linear.forward(x).map_err(Error::from)
+    }
+
+    fn weight(&self) -> &Tensor {
+        self.linear.weight()
+    }
+}
+
+fn cached_linear_no_bias_forward(x: &Tensor, weight_t: &Tensor) -> Result<Tensor> {
+    match *x.dims() {
+        [b1, b2, m, k] if x.is_contiguous() => x
+            .reshape((b1 * b2 * m, k))?
+            .matmul(weight_t)?
+            .reshape((b1, b2, m, ()))
+            .map_err(Error::from),
+        [bsize, m, k] if x.is_contiguous() => x
+            .reshape((bsize * m, k))?
+            .matmul(weight_t)?
+            .reshape((bsize, m, ()))
+            .map_err(Error::from),
+        _ => x.matmul(weight_t).map_err(Error::from),
+    }
+}
+
 struct GraniteLanguageModel {
     embed_tokens: Embedding,
     layers: Vec<GraniteDecoderLayer>,
     norm: RmsNorm,
-    lm_head: Linear,
-    lm_head_f16: Option<Linear>,
+    lm_head: GraniteLinearNoBias,
+    lm_head_f16: Option<GraniteLinearNoBias>,
     cfg: GraniteTextConfig,
     device: Device,
     residual_branches_prescaled: bool,
@@ -1703,9 +1763,12 @@ impl GraniteLanguageModel {
         } else {
             linear_no_bias(config.hidden_size, config.vocab_size, vb.pp("lm_head"))?
         };
+        let lm_head = GraniteLinearNoBias::new(lm_head)?;
         let lm_head_f16 =
             if granite_f16_lm_head_enabled(vb.device(), embed_tokens.embeddings().dtype()) {
-                Some(Linear::new(lm_head.weight().to_dtype(DType::F16)?, None))
+                Some(GraniteLinearNoBias::from_weight(
+                    lm_head.weight().to_dtype(DType::F16)?,
+                )?)
             } else {
                 None
             };
@@ -2093,7 +2156,7 @@ impl GraniteDecoderLayer {
 }
 
 struct GraniteTextFusedQkvProjection {
-    fused: Linear,
+    fused: GraniteLinearNoBias,
     q_out: usize,
     k_out: usize,
     v_out: usize,
@@ -2115,7 +2178,7 @@ impl GraniteTextFusedQkvProjection {
         }
         let weight = Tensor::cat(&[q_weight, k_weight, v_weight], 0)?;
         Ok(Self {
-            fused: Linear::new(weight, None),
+            fused: GraniteLinearNoBias::from_weight(weight)?,
             q_out,
             k_out,
             v_out,
@@ -2133,7 +2196,7 @@ impl GraniteTextFusedQkvProjection {
 
     fn to_dtype(&self, dtype: DType) -> Result<Self> {
         Ok(Self {
-            fused: Linear::new(self.fused.weight().to_dtype(dtype)?, None),
+            fused: GraniteLinearNoBias::from_weight(self.fused.weight().to_dtype(dtype)?)?,
             q_out: self.q_out,
             k_out: self.k_out,
             v_out: self.v_out,
@@ -2298,8 +2361,8 @@ fn granite_rms_norm_forward(norm: &RmsNorm, x: &Tensor) -> Result<Tensor> {
 
 struct GraniteTextAttention {
     qkv_proj: GraniteTextQkvProjection,
-    o_proj: Linear,
-    o_proj_f16: Option<Linear>,
+    o_proj: GraniteLinearNoBias,
+    o_proj_f16: Option<GraniteLinearNoBias>,
     f16_attention_core: bool,
     num_heads: usize,
     num_kv_heads: usize,
@@ -2318,10 +2381,13 @@ impl GraniteTextAttention {
         )?;
         let o_proj =
             maybe_prescale_residual_linear(o_proj, config.residual_multiplier, prescale_residual)?;
+        let o_proj = GraniteLinearNoBias::new(o_proj)?;
         let qkv_proj = GraniteTextQkvProjection::load(config, head_dim, vb.clone())?;
         let o_proj_f16 =
             if granite_f16_attention_output_enabled(vb.device(), o_proj.weight().dtype()) {
-                Some(Linear::new(o_proj.weight().to_dtype(DType::F16)?, None))
+                Some(GraniteLinearNoBias::from_weight(
+                    o_proj.weight().to_dtype(DType::F16)?,
+                )?)
             } else {
                 None
             };
@@ -2863,7 +2929,7 @@ fn dense_decode_attention_heads_scaled(
 }
 
 struct GraniteTextFusedGateUpProjection {
-    fused: Linear,
+    fused: GraniteLinearNoBias,
     intermediate_size: usize,
 }
 
@@ -2879,7 +2945,7 @@ impl GraniteTextFusedGateUpProjection {
         }
         let weight = Tensor::cat(&[gate_weight, up_weight], 0)?;
         Ok(Self {
-            fused: Linear::new(weight, None),
+            fused: GraniteLinearNoBias::from_weight(weight)?,
             intermediate_size,
         })
     }
@@ -2894,7 +2960,7 @@ impl GraniteTextFusedGateUpProjection {
 
     fn to_dtype(&self, dtype: DType) -> Result<Self> {
         Ok(Self {
-            fused: Linear::new(self.fused.weight().to_dtype(dtype)?, None),
+            fused: GraniteLinearNoBias::from_weight(self.fused.weight().to_dtype(dtype)?)?,
             intermediate_size: self.intermediate_size,
         })
     }
@@ -2952,20 +3018,23 @@ impl GraniteTextGateUpProjection {
 
 struct GraniteTextMlp {
     gate_up_proj: GraniteTextGateUpProjection,
-    down_proj: Linear,
+    down_proj: GraniteLinearNoBias,
     f16_mlp: Option<GraniteTextF16Mlp>,
 }
 
 struct GraniteTextF16Mlp {
     gate_up_proj: GraniteTextGateUpProjection,
-    down_proj: Linear,
+    down_proj: GraniteLinearNoBias,
 }
 
 impl GraniteTextF16Mlp {
-    fn new(gate_up_proj: &GraniteTextGateUpProjection, down_proj: &Linear) -> Result<Self> {
+    fn new(
+        gate_up_proj: &GraniteTextGateUpProjection,
+        down_proj: &GraniteLinearNoBias,
+    ) -> Result<Self> {
         Ok(Self {
             gate_up_proj: gate_up_proj.to_dtype(DType::F16)?,
-            down_proj: Linear::new(down_proj.weight().to_dtype(DType::F16)?, None),
+            down_proj: GraniteLinearNoBias::from_weight(down_proj.weight().to_dtype(DType::F16)?)?,
         })
     }
 
@@ -2999,6 +3068,7 @@ impl GraniteTextMlp {
             config.residual_multiplier,
             prescale_residual,
         )?;
+        let down_proj = GraniteLinearNoBias::new(down_proj)?;
         let f16_mlp = if granite_f16_mlp_enabled(vb.device(), down_proj.weight().dtype()) {
             Some(GraniteTextF16Mlp::new(&gate_up_proj, &down_proj)?)
         } else {
@@ -3024,7 +3094,7 @@ impl GraniteTextMlp {
 
     fn forward_with_parts(
         gate_up_proj: &GraniteTextGateUpProjection,
-        down_proj: &Linear,
+        down_proj: &GraniteLinearNoBias,
         x: &Tensor,
         mut profile: Option<&mut GraniteSpeechMlpDecodeProfile>,
     ) -> Result<Tensor> {
@@ -3695,6 +3765,39 @@ mod tests {
         assert!(!granite_f16_lm_head_policy(false, DType::F32, None));
         assert!(granite_f16_lm_head_policy(false, DType::F32, Some(true)));
         assert!(!granite_f16_lm_head_policy(true, DType::F32, Some(false)));
+    }
+
+    #[test]
+    fn cached_linear_t_policy_defaults_to_metal_only() {
+        assert!(granite_cached_linear_t_policy(true, None));
+        assert!(!granite_cached_linear_t_policy(false, None));
+        assert!(granite_cached_linear_t_policy(false, Some(true)));
+        assert!(!granite_cached_linear_t_policy(true, Some(false)));
+    }
+
+    #[test]
+    fn cached_linear_no_bias_forward_matches_linear() {
+        let device = Device::Cpu;
+        let weight = Tensor::from_vec(
+            vec![
+                0.5f32, -1.0, 0.25, //
+                1.5, 0.75, -0.5,
+            ],
+            (2, 3),
+            &device,
+        )
+        .unwrap();
+        let input = Tensor::from_vec(vec![2.0f32, -3.0, 4.0], (1, 1, 3), &device).unwrap();
+        let linear = Linear::new(weight.clone(), None);
+        let cached = GraniteLinearNoBias {
+            linear: linear.clone(),
+            weight_t: Some(weight.t().unwrap()),
+        };
+
+        assert_tensor_close(
+            &cached.forward(&input).unwrap(),
+            &linear.forward(&input).unwrap(),
+        );
     }
 
     #[test]
