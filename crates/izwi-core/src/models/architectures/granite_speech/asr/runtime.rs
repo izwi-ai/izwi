@@ -12,7 +12,7 @@ use candle_nn::{
 
 use crate::backends::DeviceProfile;
 use crate::error::{Error, Result};
-use crate::kernels::try_fused_silu_mul_with_status;
+use crate::kernels::{try_fused_rms_norm, try_fused_silu_mul_with_status};
 use crate::models::architectures::qwen3::core::{causal_mask, repeat_kv, Qwen3Cache};
 use crate::models::shared::attention::flash::{
     try_fused_self_attention, try_fused_self_attention_scaled,
@@ -320,6 +320,17 @@ fn granite_mlp_try_fused_silu_mul(device: &Device) -> bool {
 
 fn granite_mlp_fused_silu_mul_policy(_is_metal: bool, override_enabled: Option<bool>) -> bool {
     override_enabled.unwrap_or(true)
+}
+
+fn granite_try_fused_rms_norm(device: &Device) -> bool {
+    let override_enabled = std::env::var("IZWI_GRANITE_FUSED_RMS_NORM")
+        .ok()
+        .and_then(|raw| parse_env_bool(&raw));
+    granite_fused_rms_norm_policy(device.is_metal(), override_enabled)
+}
+
+fn granite_fused_rms_norm_policy(is_metal: bool, override_enabled: Option<bool>) -> bool {
+    override_enabled.unwrap_or(is_metal)
 }
 
 fn granite_residual_prescale_enabled(device: &Device) -> bool {
@@ -1903,7 +1914,7 @@ impl GraniteLanguageModel {
             }
         }
         let final_norm_start = profile_start(profiling);
-        let hidden = self.norm.forward(&x)?;
+        let hidden = granite_rms_norm_forward(&self.norm, &x)?;
         if let Some(profile) = profile.as_deref_mut() {
             profile.profile.forward.final_norm += profile_elapsed(final_norm_start);
         }
@@ -1984,7 +1995,7 @@ impl GraniteDecoderLayer {
         let profiling = profile.is_some();
         let residual = x;
         let norm_start = profile_start(profiling);
-        let normed = self.input_layernorm.forward(x)?;
+        let normed = granite_rms_norm_forward(&self.input_layernorm, x)?;
         if let Some(profile) = profile.as_deref_mut() {
             profile.input_norm += profile_elapsed(norm_start);
         }
@@ -2009,7 +2020,7 @@ impl GraniteDecoderLayer {
         }
         let residual = &x;
         let post_norm_start = profile_start(profiling);
-        let normed = self.post_attention_layernorm.forward(&x)?;
+        let normed = granite_rms_norm_forward(&self.post_attention_layernorm, &x)?;
         if let Some(profile) = profile.as_deref_mut() {
             profile.post_attention_norm += profile_elapsed(post_norm_start);
         }
@@ -2253,6 +2264,15 @@ fn cast_qkv_dtype(
         return Ok((q, k, v));
     }
     Ok((q.to_dtype(dtype)?, k.to_dtype(dtype)?, v.to_dtype(dtype)?))
+}
+
+fn granite_rms_norm_forward(norm: &RmsNorm, x: &Tensor) -> Result<Tensor> {
+    if granite_try_fused_rms_norm(x.device()) {
+        if let Some(out) = try_fused_rms_norm(x, norm.weight(), norm.eps()) {
+            return Ok(out);
+        }
+    }
+    norm.forward(x).map_err(Error::from)
 }
 
 struct GraniteTextAttention {
@@ -3136,6 +3156,15 @@ mod tests {
         assert!(granite_mlp_fused_silu_mul_policy(false, None));
         assert!(granite_mlp_fused_silu_mul_policy(true, Some(true)));
         assert!(!granite_mlp_fused_silu_mul_policy(true, Some(false)));
+    }
+
+    #[test]
+    fn granite_fused_rms_norm_defaults_to_metal_only() {
+        assert!(granite_fused_rms_norm_policy(true, None));
+        assert!(!granite_fused_rms_norm_policy(false, None));
+        assert!(granite_fused_rms_norm_policy(false, Some(true)));
+        assert!(granite_fused_rms_norm_policy(true, Some(true)));
+        assert!(!granite_fused_rms_norm_policy(true, Some(false)));
     }
 
     #[test]
