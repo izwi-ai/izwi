@@ -537,6 +537,13 @@ Canonical saved transcription and diarization job routes:
 
 The `job_kind` query parameter is important for shared IDs and for clients that want a specific record family.
 
+For transcription job creation, JSON and multipart requests accept
+`generate_summary`. It defaults to `false`; set it to `true` to generate an AI
+summary automatically after the transcript finishes. Records created without an
+automatic summary can still use
+`POST /v1/speech-to-text/jobs/{record_id}/summary/regenerate?job_kind=transcription`
+later.
+
 ### Diarization Records
 
 Persisted diarization routes:
