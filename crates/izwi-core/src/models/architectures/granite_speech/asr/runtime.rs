@@ -12,7 +12,7 @@ use candle_nn::{
 
 use crate::backends::DeviceProfile;
 use crate::error::{Error, Result};
-use crate::kernels::try_fused_silu_mul;
+use crate::kernels::try_fused_silu_mul_with_status;
 use crate::models::architectures::qwen3::core::{causal_mask, repeat_kv, Qwen3Cache};
 use crate::models::shared::attention::flash::{
     try_fused_self_attention, try_fused_self_attention_scaled,
@@ -91,6 +91,8 @@ pub struct GraniteSpeechForwardProfile {
     pub layers_total: Duration,
     pub final_norm: Duration,
     pub lm_head: Duration,
+    pub lm_head_f16_calls: usize,
+    pub lm_head_f32_calls: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -110,6 +112,11 @@ pub struct GraniteSpeechAttentionDecodeProfile {
     pub cache: Duration,
     pub kernel: Duration,
     pub output: Duration,
+    pub dense_head_calls: usize,
+    pub dense_head_fused: usize,
+    pub dense_head_fallback: usize,
+    pub materialized_decode_calls: usize,
+    pub prefill_attention_calls: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -117,6 +124,9 @@ pub struct GraniteSpeechMlpDecodeProfile {
     pub gate_up: Duration,
     pub activation: Duration,
     pub down: Duration,
+    pub fused_silu_mul_attempts: usize,
+    pub fused_silu_mul_custom: usize,
+    pub fused_silu_mul_fallback: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,10 +206,18 @@ impl GraniteSpeechDecodeProfiler {
             total.attention.cache += layer.attention.cache;
             total.attention.kernel += layer.attention.kernel;
             total.attention.output += layer.attention.output;
+            total.attention.dense_head_calls += layer.attention.dense_head_calls;
+            total.attention.dense_head_fused += layer.attention.dense_head_fused;
+            total.attention.dense_head_fallback += layer.attention.dense_head_fallback;
+            total.attention.materialized_decode_calls += layer.attention.materialized_decode_calls;
+            total.attention.prefill_attention_calls += layer.attention.prefill_attention_calls;
             total.post_attention_norm += layer.post_attention_norm;
             total.mlp.gate_up += layer.mlp.gate_up;
             total.mlp.activation += layer.mlp.activation;
             total.mlp.down += layer.mlp.down;
+            total.mlp.fused_silu_mul_attempts += layer.mlp.fused_silu_mul_attempts;
+            total.mlp.fused_silu_mul_custom += layer.mlp.fused_silu_mul_custom;
+            total.mlp.fused_silu_mul_fallback += layer.mlp.fused_silu_mul_fallback;
             total.residual += layer.residual;
         }
     }
@@ -1891,6 +1909,14 @@ impl GraniteLanguageModel {
         }
         let hidden = last_hidden_for_logits(&hidden)?;
         let lm_head_start = profile_start(profiling);
+        let use_f16_lm_head = self.lm_head_f16.is_some();
+        if let Some(profile) = profile.as_deref_mut() {
+            if use_f16_lm_head {
+                profile.profile.forward.lm_head_f16_calls += 1;
+            } else {
+                profile.profile.forward.lm_head_f32_calls += 1;
+            }
+        }
         let logits = if let Some(lm_head_f16) = self.lm_head_f16.as_ref() {
             lm_head_f16.forward(&hidden.to_dtype(DType::F16)?)?
         } else {
@@ -2359,7 +2385,7 @@ impl GraniteTextAttention {
                     }
                     record_decode_attention_path(DecodeAttentionPath::Dense);
                     let kernel_start = profile_start(profiling);
-                    let out = dense_decode_attention_heads_scaled(
+                    let (out, dense_kernel) = dense_decode_attention_heads_scaled(
                         &q,
                         &k_heads,
                         &v_heads,
@@ -2370,6 +2396,15 @@ impl GraniteTextAttention {
                     )?;
                     if let Some(profile) = profile.as_deref_mut() {
                         profile.kernel += profile_elapsed(kernel_start);
+                        profile.dense_head_calls += 1;
+                        match dense_kernel {
+                            GraniteDenseDecodeAttentionKernel::Fused => {
+                                profile.dense_head_fused += 1;
+                            }
+                            GraniteDenseDecodeAttentionKernel::Fallback => {
+                                profile.dense_head_fallback += 1;
+                            }
+                        }
                     }
                     let out = out.reshape((batch, seq_len, self.num_heads * self.head_dim))?;
                     let output_start = profile_start(profiling);
@@ -2392,6 +2427,13 @@ impl GraniteTextAttention {
         }
 
         let kernel_start = profile_start(profiling);
+        if let Some(profile) = profile.as_deref_mut() {
+            if seq_len == 1 {
+                profile.materialized_decode_calls += 1;
+            } else {
+                profile.prefill_attention_calls += 1;
+            }
+        }
         let out = if seq_len == 1 {
             dense_decode_attention_scaled(
                 &q,
@@ -2652,6 +2694,12 @@ fn dense_decode_attention_scaled(
         .map_err(Error::from)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraniteDenseDecodeAttentionKernel {
+    Fused,
+    Fallback,
+}
+
 fn dense_decode_attention_heads_scaled(
     q: &Tensor,
     k_heads: &Tensor,
@@ -2660,7 +2708,7 @@ fn dense_decode_attention_heads_scaled(
     num_kv_heads: usize,
     head_dim: usize,
     attention_multiplier: f32,
-) -> Result<Tensor> {
+) -> Result<(Tensor, GraniteDenseDecodeAttentionKernel)> {
     let q_heads = q.transpose(1, 2)?.contiguous()?;
     if let Some(out) = try_fused_self_attention_scaled(
         &q_heads,
@@ -2671,10 +2719,11 @@ fn dense_decode_attention_heads_scaled(
         false,
         attention_multiplier,
     )? {
-        return out
+        let out = out
             .transpose(1, 2)?
             .reshape((q.dim(0)?, q.dim(1)?, num_heads, head_dim))
-            .map_err(Error::from);
+            .map_err(Error::from)?;
+        return Ok((out, GraniteDenseDecodeAttentionKernel::Fused));
     }
     let k_heads = if num_heads == num_kv_heads {
         k_heads.clone()
@@ -2696,9 +2745,11 @@ fn dense_decode_attention_heads_scaled(
     attn = (attn * attention_multiplier as f64)?;
     let attn = ops::softmax(&attn.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q.dtype())?;
     let out = attn.matmul(&v_heads)?;
-    out.transpose(1, 2)?
+    let out = out
+        .transpose(1, 2)?
         .reshape((q.dim(0)?, q.dim(1)?, num_heads, head_dim))
-        .map_err(Error::from)
+        .map_err(Error::from)?;
+    Ok((out, GraniteDenseDecodeAttentionKernel::Fallback))
 }
 
 struct GraniteTextFusedGateUpProjection {
@@ -2874,10 +2925,26 @@ impl GraniteTextMlp {
             profile.gate_up += profile_elapsed(gate_up_start);
         }
         let activation_start = profile_start(profiling);
-        let hidden = if granite_mlp_try_fused_silu_mul(gate.device()) {
-            if let Some(fused) = try_fused_silu_mul(&gate, &up) {
-                fused
+        let try_fused_silu_mul = granite_mlp_try_fused_silu_mul(gate.device());
+        if let Some(profile) = profile.as_deref_mut() {
+            if try_fused_silu_mul {
+                profile.fused_silu_mul_attempts += 1;
+            }
+        }
+        let hidden = if try_fused_silu_mul {
+            if let Some(fused) = try_fused_silu_mul_with_status(&gate, &up) {
+                if let Some(profile) = profile.as_deref_mut() {
+                    if fused.used_custom_kernel {
+                        profile.fused_silu_mul_custom += 1;
+                    } else {
+                        profile.fused_silu_mul_fallback += 1;
+                    }
+                }
+                fused.tensor
             } else {
+                if let Some(profile) = profile.as_deref_mut() {
+                    profile.fused_silu_mul_fallback += 1;
+                }
                 let gate = gate.silu()?;
                 gate.broadcast_mul(&up)?
             }
@@ -3346,7 +3413,7 @@ mod tests {
             attention_multiplier,
         )
         .unwrap();
-        let dense_heads = dense_decode_attention_heads_scaled(
+        let (dense_heads, _path) = dense_decode_attention_heads_scaled(
             &q,
             &k_heads,
             &v_heads,

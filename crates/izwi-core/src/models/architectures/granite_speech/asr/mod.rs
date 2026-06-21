@@ -738,10 +738,18 @@ fn granite_layer_totals(
         total.attention.cache += layer.attention.cache;
         total.attention.kernel += layer.attention.kernel;
         total.attention.output += layer.attention.output;
+        total.attention.dense_head_calls += layer.attention.dense_head_calls;
+        total.attention.dense_head_fused += layer.attention.dense_head_fused;
+        total.attention.dense_head_fallback += layer.attention.dense_head_fallback;
+        total.attention.materialized_decode_calls += layer.attention.materialized_decode_calls;
+        total.attention.prefill_attention_calls += layer.attention.prefill_attention_calls;
         total.post_attention_norm += layer.post_attention_norm;
         total.mlp.gate_up += layer.mlp.gate_up;
         total.mlp.activation += layer.mlp.activation;
         total.mlp.down += layer.mlp.down;
+        total.mlp.fused_silu_mul_attempts += layer.mlp.fused_silu_mul_attempts;
+        total.mlp.fused_silu_mul_custom += layer.mlp.fused_silu_mul_custom;
+        total.mlp.fused_silu_mul_fallback += layer.mlp.fused_silu_mul_fallback;
         total.residual += layer.residual;
     }
     total
@@ -766,6 +774,8 @@ fn forward_profile_json(profile: GraniteSpeechForwardProfile) -> serde_json::Val
         "layers_total": duration_ms(profile.layers_total),
         "final_norm": duration_ms(profile.final_norm),
         "lm_head": duration_ms(profile.lm_head),
+        "lm_head_f16_calls": profile.lm_head_f16_calls,
+        "lm_head_f32_calls": profile.lm_head_f32_calls,
     })
 }
 
@@ -787,6 +797,11 @@ fn attention_profile_json(profile: GraniteSpeechAttentionDecodeProfile) -> serde
         "cache": duration_ms(profile.cache),
         "kernel": duration_ms(profile.kernel),
         "output": duration_ms(profile.output),
+        "dense_head_calls": profile.dense_head_calls,
+        "dense_head_fused": profile.dense_head_fused,
+        "dense_head_fallback": profile.dense_head_fallback,
+        "materialized_decode_calls": profile.materialized_decode_calls,
+        "prefill_attention_calls": profile.prefill_attention_calls,
     })
 }
 
@@ -795,6 +810,9 @@ fn mlp_profile_json(profile: GraniteSpeechMlpDecodeProfile) -> serde_json::Value
         "gate_up": duration_ms(profile.gate_up),
         "activation": duration_ms(profile.activation),
         "down": duration_ms(profile.down),
+        "fused_silu_mul_attempts": profile.fused_silu_mul_attempts,
+        "fused_silu_mul_custom": profile.fused_silu_mul_custom,
+        "fused_silu_mul_fallback": profile.fused_silu_mul_fallback,
     })
 }
 
@@ -1122,6 +1140,8 @@ mod tests {
                         layers_total: Duration::from_millis(2),
                         final_norm: Duration::from_millis(1),
                         lm_head: Duration::from_millis(1),
+                        lm_head_f16_calls: 2,
+                        lm_head_f32_calls: 0,
                     },
                     layers: vec![GraniteSpeechLayerDecodeProfile {
                         total: Duration::from_millis(2),
@@ -1132,12 +1152,20 @@ mod tests {
                             cache: Duration::from_millis(1),
                             kernel: Duration::from_millis(1),
                             output: Duration::from_millis(1),
+                            dense_head_calls: 2,
+                            dense_head_fused: 2,
+                            dense_head_fallback: 0,
+                            materialized_decode_calls: 0,
+                            prefill_attention_calls: 1,
                         },
                         post_attention_norm: Duration::from_millis(1),
                         mlp: GraniteSpeechMlpDecodeProfile {
                             gate_up: Duration::from_millis(1),
                             activation: Duration::from_millis(1),
                             down: Duration::from_millis(1),
+                            fused_silu_mul_attempts: 2,
+                            fused_silu_mul_custom: 2,
+                            fused_silu_mul_fallback: 0,
                         },
                         residual: Duration::from_millis(1),
                     }],
@@ -1230,8 +1258,26 @@ mod tests {
             1.0
         );
         assert_eq!(
+            diagnostics["decode_profile"]["forward_totals_ms"]["lm_head_f16_calls"],
+            2
+        );
+        assert_eq!(
+            diagnostics["decode_profile"]["decoder_totals_ms"]["attention"]["dense_head_fused"],
+            2
+        );
+        assert_eq!(
+            diagnostics["decode_profile"]["decoder_totals_ms"]["attention"]
+                ["prefill_attention_calls"],
+            1
+        );
+        assert_eq!(
             diagnostics["decode_profile"]["layers"][0]["timings_ms"]["mlp"]["down"],
             1.0
+        );
+        assert_eq!(
+            diagnostics["decode_profile"]["layers"][0]["timings_ms"]["mlp"]
+                ["fused_silu_mul_custom"],
+            2
         );
         assert_eq!(diagnostics["timings_ms"]["prefill"], 7.0);
         assert_eq!(diagnostics["timings_ms"]["decode"], 3.0);
