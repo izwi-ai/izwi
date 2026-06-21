@@ -1277,7 +1277,8 @@ describe("TranscriptionPage detail route", () => {
     });
 
     expect(screen.getByText("Transcribing audio")).toBeInTheDocument();
-    expect(screen.getByText("Chunk 1 of 3")).toBeInTheDocument();
+    expect(screen.getByText("33%")).toBeInTheDocument();
+    expect(screen.queryByText("Chunk 1 of 3")).not.toBeInTheDocument();
     expect(
       screen.getByRole("progressbar", { name: "ASR processing progress" }),
     ).toHaveAttribute("aria-valuenow", "33");
@@ -1352,7 +1353,8 @@ describe("TranscriptionPage detail route", () => {
       await screen.findByRole("heading", { name: "Transcription Record" }),
     ).toBeInTheDocument();
     expect(screen.getByText("Transcribing audio")).toBeInTheDocument();
-    expect(screen.getByText("Chunk 2 of 4")).toBeInTheDocument();
+    expect(screen.getByText("50%")).toBeInTheDocument();
+    expect(screen.queryByText("Chunk 2 of 4")).not.toBeInTheDocument();
     expect(
       screen.getByRole("progressbar", { name: "ASR processing progress" }),
     ).toHaveAttribute("aria-valuenow", "50");
