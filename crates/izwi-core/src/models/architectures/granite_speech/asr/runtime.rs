@@ -380,12 +380,12 @@ fn granite_deferred_stop_check_enabled(
 }
 
 fn granite_deferred_stop_check_policy(
-    _is_metal: bool,
+    is_metal: bool,
     override_enabled: Option<bool>,
-    _max_new_tokens: usize,
-    _default_max_tokens: usize,
+    max_new_tokens: usize,
+    default_max_tokens: usize,
 ) -> bool {
-    override_enabled.unwrap_or(false)
+    override_enabled.unwrap_or(is_metal && max_new_tokens <= default_max_tokens)
 }
 
 fn granite_chunked_stop_check_enabled(
@@ -3629,8 +3629,8 @@ mod tests {
     }
 
     #[test]
-    fn deferred_stop_check_policy_is_opt_in() {
-        assert!(!granite_deferred_stop_check_policy(true, None, 76, 128));
+    fn deferred_stop_check_policy_defaults_to_short_metal_decodes() {
+        assert!(granite_deferred_stop_check_policy(true, None, 76, 128));
         assert!(!granite_deferred_stop_check_policy(true, None, 129, 128));
         assert!(!granite_deferred_stop_check_policy(false, None, 76, 128));
         assert!(granite_deferred_stop_check_policy(
