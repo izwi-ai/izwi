@@ -29,7 +29,7 @@ fn resolve_asr_realtime_stream_variant(model_id: Option<&str>) -> Option<ModelVa
     (variant.family() == ModelFamily::NemotronAsr).then_some(variant)
 }
 
-fn granite_auto_asr_max_tokens_for_duration(audio_seconds: f32) -> usize {
+pub(crate) fn granite_auto_asr_max_tokens_for_duration(audio_seconds: f32) -> usize {
     let duration_budget =
         if audio_seconds.is_finite() && audio_seconds > GRANITE_ASR_AUTO_BASE_SECONDS {
             ((audio_seconds - GRANITE_ASR_AUTO_BASE_SECONDS) * GRANITE_ASR_AUTO_TOKENS_PER_SECOND)
@@ -249,6 +249,7 @@ impl RuntimeService {
             request.params.max_tokens = max_tokens;
         } else if let Some(auto_max_tokens) = granite_auto_asr_max_tokens(variant, audio_input)? {
             request.params.max_tokens = auto_max_tokens;
+            request.asr_auto_max_tokens = true;
         }
         Ok(request)
     }

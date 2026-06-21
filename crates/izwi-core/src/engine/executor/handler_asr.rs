@@ -1,6 +1,7 @@
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::models::registry::NativeAsrGenerationOptions;
+use crate::runtime::granite_auto_asr_max_tokens_for_duration;
 use std::time::Instant;
 
 use super::super::request::EngineCoreRequest;
@@ -345,13 +346,20 @@ impl NativeExecutor {
                         let prefix_text = matches!(family, ModelFamily::GraniteSpeechAsr)
                             .then_some(prefix_text)
                             .filter(|value| !value.trim().is_empty());
+                        let chunk_generation_options = Self::asr_chunk_generation_options(
+                            request,
+                            family,
+                            chunk_audio.len(),
+                            sr,
+                            &generation_options,
+                        );
                         let details = model.transcribe_with_details_prompt_prefix_and_options(
                             chunk_audio,
                             sr,
                             language,
                             asr_prompt,
                             prefix_text,
-                            generation_options.clone(),
+                            chunk_generation_options,
                         )?;
                         Ok(AsrChunkTranscription {
                             text: details.text,
@@ -470,11 +478,34 @@ impl NativeExecutor {
             stop_sequences: request.params.stop_sequences.clone(),
         }
     }
+
+    fn asr_chunk_generation_options(
+        request: &EngineCoreRequest,
+        family: ModelFamily,
+        chunk_sample_count: usize,
+        sample_rate: u32,
+        base: &NativeAsrGenerationOptions,
+    ) -> NativeAsrGenerationOptions {
+        let mut options = base.clone();
+        if request.asr_auto_max_tokens
+            && matches!(family, ModelFamily::GraniteSpeechAsr)
+            && sample_rate > 0
+        {
+            let chunk_seconds = chunk_sample_count as f32 / sample_rate as f32;
+            options.max_new_tokens =
+                granite_auto_asr_max_tokens_for_duration(chunk_seconds).min(base.max_new_tokens);
+        }
+        options.max_new_tokens = options.max_new_tokens.max(1);
+        options
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::NativeExecutor;
+    use crate::catalog::ModelFamily;
+    use crate::engine::request::EngineCoreRequest;
+    use crate::models::registry::NativeAsrGenerationOptions;
 
     #[test]
     fn audio_decode_timing_preserves_whisper_model_diagnostics() {
@@ -508,5 +539,49 @@ mod tests {
 
         assert_eq!(updated["model_diagnostics"], "old");
         assert_eq!(updated["timings_ms"]["audio_decode"], 5.0);
+    }
+
+    #[test]
+    fn granite_auto_chunk_generation_options_use_chunk_duration() {
+        let mut request = EngineCoreRequest::asr("UklGRg==");
+        request.asr_auto_max_tokens = true;
+        request.params.max_tokens = 2048;
+        let base = NativeAsrGenerationOptions {
+            max_new_tokens: 2048,
+            stop_token_ids: Vec::new(),
+            stop_sequences: Vec::new(),
+        };
+
+        let options = NativeExecutor::asr_chunk_generation_options(
+            &request,
+            ModelFamily::GraniteSpeechAsr,
+            16_000 * 30,
+            16_000,
+            &base,
+        );
+
+        assert_eq!(options.max_new_tokens, 84);
+    }
+
+    #[test]
+    fn granite_explicit_chunk_generation_options_preserve_user_budget() {
+        let mut request = EngineCoreRequest::asr("UklGRg==");
+        request.asr_auto_max_tokens = false;
+        request.params.max_tokens = 2048;
+        let base = NativeAsrGenerationOptions {
+            max_new_tokens: 2048,
+            stop_token_ids: Vec::new(),
+            stop_sequences: Vec::new(),
+        };
+
+        let options = NativeExecutor::asr_chunk_generation_options(
+            &request,
+            ModelFamily::GraniteSpeechAsr,
+            16_000 * 30,
+            16_000,
+            &base,
+        );
+
+        assert_eq!(options.max_new_tokens, 2048);
     }
 }
