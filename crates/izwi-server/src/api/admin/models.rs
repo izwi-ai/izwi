@@ -215,6 +215,9 @@ fn model_modalities(variant: ModelVariant) -> Vec<String> {
         push("speaker_labels");
         push("timestamps");
     }
+    if variant.supports_speaker_attributed_asr() {
+        push("speaker_labels");
+    }
     if variant.is_forced_aligner() {
         push("audio_input");
         push("text_input");

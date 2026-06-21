@@ -1,15 +1,10 @@
 //! Diarization runtime methods.
 
 use crate::catalog::{
-    parse_model_variant, resolve_asr_model_variant, resolve_diarization_llm_variant,
-    resolve_diarization_model_variant,
+    resolve_asr_model_variant, resolve_diarization_llm_variant, resolve_diarization_model_variant,
 };
 use crate::error::{Error, Result};
-use crate::models::architectures::granite_speech::asr::{
-    parse_granite_speech_output, GraniteSpeechSegment, GraniteSpeechTask,
-    GraniteSpeechTimestampWord,
-};
-use crate::models::registry::{NativeAsrGenerationOptions, NativeAsrModel};
+use crate::models::registry::NativeAsrModel;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 use crate::runtime::adapters::CapabilityKind;
 use crate::runtime::audio_io::{base64_decode, decode_audio_bytes};
@@ -21,7 +16,7 @@ use crate::runtime::types::{
 };
 use crate::ModelVariant;
 use izwi_asr_toolkit::{plan_audio_chunks, AsrLongFormConfig, AudioChunk, TranscriptAssembler};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::warn;
 
@@ -38,7 +33,6 @@ const MAX_FRAGMENT_DURATION_SECS: f32 = 1.25;
 const FRAGMENT_CONFIDENCE_MARGIN: f32 = 0.08;
 const PHRASE_CAPITALIZED_GAP_SECS: f32 = 0.35;
 const PHRASE_HARD_GAP_SECS: f32 = 0.75;
-const GRANITE_RICH_TRANSCRIPT_MAX_NEW_TOKENS: usize = 10_000;
 
 #[derive(Debug, Clone)]
 struct PipelineAudio {
@@ -52,28 +46,6 @@ struct TranscribedChunk {
     range: AudioChunk,
     text: String,
     language: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiarizationTranscriptPipeline {
-    ClassicStack(ModelVariant),
-    GraniteStandalone,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GraniteSpeakerWord {
-    word: String,
-    normalized_word: String,
-    speaker: String,
-}
-
-impl DiarizationTranscriptPipeline {
-    fn model_variant(self) -> ModelVariant {
-        match self {
-            Self::ClassicStack(variant) => variant,
-            Self::GraniteStandalone => ModelVariant::GraniteSpeech412BPlus,
-        }
-    }
 }
 
 impl RuntimeService {
@@ -166,10 +138,10 @@ impl RuntimeService {
         config: &DiarizationConfig,
         enable_llm_refinement: bool,
     ) -> Result<DiarizationTranscriptResult> {
-        let pipeline = resolve_diarization_transcript_pipeline(diarization_model_id);
+        let diarization_variant = resolve_diarization_model_variant(diarization_model_id);
         let runtime_request =
             DiarizationRuntimeRequest::from_bytes(
-                pipeline.model_variant(),
+                diarization_variant,
                 audio_bytes.to_vec(),
                 config.clone(),
             )?
@@ -182,11 +154,6 @@ impl RuntimeService {
             .with_llm_refinement(enable_llm_refinement);
         self.record_diarization_transcript_pipeline(runtime_request.enable_llm_refinement);
         let audio = decode_pipeline_audio_bytes(audio_bytes)?;
-        if matches!(pipeline, DiarizationTranscriptPipeline::GraniteStandalone) {
-            return self
-                .diarize_with_granite_transcript_audio(&audio, runtime_request)
-                .await;
-        }
 
         let diarization = self
             .diarize_samples(
@@ -389,86 +356,6 @@ impl RuntimeService {
         })
     }
 
-    async fn diarize_with_granite_transcript_audio(
-        &self,
-        audio: &PipelineAudio,
-        runtime_request: DiarizationRuntimeRequest,
-    ) -> Result<DiarizationTranscriptResult> {
-        let variant = ModelVariant::GraniteSpeech412BPlus;
-        self.observe_broker_capability_request(CapabilityKind::Diarization, Some(variant), false)?;
-        self.load_model(variant).await?;
-        let _lease = self.acquire_model_residency_lease(variant);
-        let asr_model = self
-            .model_registry
-            .get_asr(variant)
-            .await
-            .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?;
-
-        let options = NativeAsrGenerationOptions {
-            max_new_tokens: GRANITE_RICH_TRANSCRIPT_MAX_NEW_TOKENS,
-            ..NativeAsrGenerationOptions::default()
-        };
-
-        let speaker_audio = audio.samples.clone();
-        let speaker_model = asr_model.clone();
-        let speaker_options = options.clone();
-        let speaker_transcription = tokio::task::spawn_blocking(move || {
-            speaker_model.transcribe_with_granite_speech_task_and_options(
-                &speaker_audio,
-                PIPELINE_SAMPLE_RATE,
-                None,
-                GraniteSpeechTask::SpeakerAttributed,
-                None,
-                speaker_options,
-            )
-        })
-        .await
-        .map_err(|err| {
-            Error::InferenceError(format!("Granite speaker attribution task failed: {err}"))
-        })??;
-
-        let timestamp_audio = audio.samples.clone();
-        let timestamp_model = asr_model.clone();
-        let timestamp_transcription = tokio::task::spawn_blocking(move || {
-            timestamp_model.transcribe_with_granite_speech_task_and_options(
-                &timestamp_audio,
-                PIPELINE_SAMPLE_RATE,
-                None,
-                GraniteSpeechTask::WordTimestamps,
-                None,
-                options,
-            )
-        })
-        .await
-        .map_err(|err| Error::InferenceError(format!("Granite timestamp task failed: {err}")))??;
-
-        let mut result = granite_diarization_result_from_texts(
-            &speaker_transcription.text,
-            &timestamp_transcription.text,
-            audio.duration_secs,
-        );
-
-        if runtime_request.enable_llm_refinement && !result.raw_transcript.trim().is_empty() {
-            let llm_variant = resolve_chat_variant(runtime_request.llm_model_id.as_deref())?;
-            match self
-                .polish_diarized_transcript(llm_variant, &result.raw_transcript)
-                .await
-            {
-                Ok(polished) if !polished.trim().is_empty() => {
-                    let polished_trimmed = polished.trim();
-                    result.llm_refined = polished_trimmed != result.raw_transcript.trim();
-                    result.transcript = polished_trimmed.to_string();
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    warn!("Transcript refinement failed, returning raw speaker transcript: {err}");
-                }
-            }
-        }
-
-        Ok(result)
-    }
-
     async fn polish_diarized_transcript(
         &self,
         llm_variant: ModelVariant,
@@ -499,308 +386,6 @@ impl RuntimeService {
 
 fn resolve_chat_variant(model_id: Option<&str>) -> Result<ModelVariant> {
     resolve_diarization_llm_variant(model_id).map_err(|err| Error::InvalidInput(err.to_string()))
-}
-
-fn resolve_diarization_transcript_pipeline(input: Option<&str>) -> DiarizationTranscriptPipeline {
-    let Some(raw) = input else {
-        return DiarizationTranscriptPipeline::ClassicStack(resolve_diarization_model_variant(None));
-    };
-
-    if let Ok(variant) = parse_model_variant(raw) {
-        if variant == ModelVariant::GraniteSpeech412BPlus {
-            return DiarizationTranscriptPipeline::GraniteStandalone;
-        }
-        if variant.is_diarization() {
-            return DiarizationTranscriptPipeline::ClassicStack(variant);
-        }
-    }
-
-    let normalized = raw.to_ascii_lowercase();
-    if normalized.contains("granite") && normalized.contains("speech") {
-        DiarizationTranscriptPipeline::GraniteStandalone
-    } else {
-        DiarizationTranscriptPipeline::ClassicStack(resolve_diarization_model_variant(Some(raw)))
-    }
-}
-
-fn granite_diarization_result_from_texts(
-    speaker_text: &str,
-    timestamp_text: &str,
-    duration_secs: f32,
-) -> DiarizationTranscriptResult {
-    let speaker_parsed = parse_granite_speech_output(speaker_text);
-    let timestamp_parsed = parse_granite_speech_output(timestamp_text);
-    let speaker_words = granite_speaker_words(&speaker_parsed.segments);
-    let mut words = if timestamp_parsed.timestamp_words.is_empty() {
-        granite_words_from_speaker_segments_without_timestamps(
-            &speaker_words,
-            &speaker_parsed.text,
-            duration_secs,
-        )
-    } else {
-        granite_words_from_timestamp_words(
-            &timestamp_parsed.timestamp_words,
-            &speaker_words,
-            duration_secs,
-        )
-    };
-
-    if words.is_empty() {
-        let fallback_words = extract_words(&speaker_parsed.text);
-        let alignments = fallback_word_timings_from_words(&fallback_words, duration_secs);
-        words = alignments
-            .into_iter()
-            .map(|(word, start_ms, end_ms)| DiarizationWord {
-                word,
-                speaker: "SPEAKER_00".to_string(),
-                start_secs: start_ms as f32 / 1000.0,
-                end_secs: (end_ms as f32 / 1000.0).max(start_ms as f32 / 1000.0 + 0.001),
-                speaker_confidence: None,
-                overlaps_segment: false,
-            })
-            .collect();
-    }
-
-    let segments = granite_segments_from_words(&words);
-    let utterances = build_utterances(&words);
-    let raw_transcript = if utterances.is_empty() {
-        speaker_parsed.text.clone()
-    } else {
-        format_utterance_transcript(&utterances)
-    };
-    let speaker_count = count_distinct_speakers(&words);
-    let unattributed_words = words
-        .iter()
-        .filter(|word| word.speaker == UNKNOWN_SPEAKER)
-        .count();
-    let alignment_coverage = if words.is_empty() {
-        0.0
-    } else {
-        words.iter().filter(|word| word.overlaps_segment).count() as f32 / words.len() as f32
-    };
-
-    DiarizationTranscriptResult {
-        segments,
-        words,
-        utterances,
-        asr_text: speaker_parsed.text,
-        raw_transcript: raw_transcript.clone(),
-        transcript: raw_transcript,
-        duration_secs,
-        speaker_count,
-        alignment_coverage,
-        unattributed_words,
-        llm_refined: false,
-    }
-}
-
-fn granite_speaker_words(segments: &[GraniteSpeechSegment]) -> Vec<GraniteSpeakerWord> {
-    let mut speaker_ids = HashMap::<String, String>::new();
-    let mut words = Vec::new();
-
-    for segment in segments {
-        let speaker = normalize_granite_speaker(segment.speaker.as_deref(), &mut speaker_ids);
-        for word in extract_words(&segment.text) {
-            let normalized_word = normalize_word_for_match(&word);
-            if normalized_word.is_empty() {
-                continue;
-            }
-            words.push(GraniteSpeakerWord {
-                word,
-                normalized_word,
-                speaker: speaker.clone(),
-            });
-        }
-    }
-
-    words
-}
-
-fn normalize_granite_speaker(
-    raw: Option<&str>,
-    speaker_ids: &mut HashMap<String, String>,
-) -> String {
-    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
-        return UNKNOWN_SPEAKER.to_string();
-    };
-    if let Some(existing) = speaker_ids.get(raw) {
-        return existing.clone();
-    }
-
-    let speaker = format!("SPEAKER_{:02}", speaker_ids.len());
-    speaker_ids.insert(raw.to_string(), speaker.clone());
-    speaker
-}
-
-fn granite_words_from_timestamp_words(
-    timestamp_words: &[GraniteSpeechTimestampWord],
-    speaker_words: &[GraniteSpeakerWord],
-    duration_secs: f32,
-) -> Vec<DiarizationWord> {
-    let mut words = Vec::new();
-    let mut speaker_cursor = 0usize;
-    let mut previous_end = 0.0f32;
-    let mut last_speaker = "SPEAKER_00".to_string();
-
-    for timestamp_word in timestamp_words {
-        let cleaned = clean_granite_word(&timestamp_word.word);
-        if cleaned.is_empty() {
-            continue;
-        }
-        let normalized = normalize_word_for_match(&cleaned);
-        let (speaker, matched) =
-            match_granite_speaker_word(&normalized, speaker_words, &mut speaker_cursor)
-                .unwrap_or_else(|| (last_speaker.clone(), false));
-        if speaker != UNKNOWN_SPEAKER {
-            last_speaker = speaker.clone();
-        }
-
-        let start_secs = previous_end.max(0.0);
-        let max_end_secs = if duration_secs.is_finite() && duration_secs > 0.0 {
-            duration_secs
-        } else {
-            timestamp_word.end_time_seconds
-        };
-        let mut end_secs = timestamp_word
-            .end_time_seconds
-            .min(max_end_secs)
-            .max(start_secs + 0.001);
-        if !end_secs.is_finite() {
-            end_secs = start_secs + 0.001;
-        }
-        previous_end = end_secs;
-
-        words.push(DiarizationWord {
-            word: cleaned,
-            speaker,
-            start_secs,
-            end_secs,
-            speaker_confidence: None,
-            overlaps_segment: matched,
-        });
-    }
-
-    words
-}
-
-fn match_granite_speaker_word(
-    normalized: &str,
-    speaker_words: &[GraniteSpeakerWord],
-    speaker_cursor: &mut usize,
-) -> Option<(String, bool)> {
-    if speaker_words.is_empty() {
-        return Some(("SPEAKER_00".to_string(), false));
-    }
-
-    let search_end = (*speaker_cursor).saturating_add(8).min(speaker_words.len());
-    if !normalized.is_empty() {
-        for idx in *speaker_cursor..search_end {
-            if speaker_words[idx].normalized_word == normalized {
-                *speaker_cursor = idx + 1;
-                return Some((speaker_words[idx].speaker.clone(), true));
-            }
-        }
-    }
-
-    if *speaker_cursor < speaker_words.len() {
-        let speaker = speaker_words[*speaker_cursor].speaker.clone();
-        *speaker_cursor += 1;
-        Some((speaker, false))
-    } else {
-        None
-    }
-}
-
-fn granite_words_from_speaker_segments_without_timestamps(
-    speaker_words: &[GraniteSpeakerWord],
-    speaker_text: &str,
-    duration_secs: f32,
-) -> Vec<DiarizationWord> {
-    let fallback_words = if speaker_words.is_empty() {
-        extract_words(speaker_text)
-            .into_iter()
-            .map(|word| GraniteSpeakerWord {
-                normalized_word: normalize_word_for_match(&word),
-                word,
-                speaker: "SPEAKER_00".to_string(),
-            })
-            .collect::<Vec<_>>()
-    } else {
-        speaker_words.to_vec()
-    };
-    let timing_words = fallback_words
-        .iter()
-        .map(|word| word.word.clone())
-        .collect::<Vec<_>>();
-    let alignments = fallback_word_timings_from_words(&timing_words, duration_secs);
-
-    alignments
-        .into_iter()
-        .enumerate()
-        .map(|(idx, (word, start_ms, end_ms))| {
-            let speaker = fallback_words
-                .get(idx)
-                .map(|word| word.speaker.clone())
-                .unwrap_or_else(|| "SPEAKER_00".to_string());
-            DiarizationWord {
-                word,
-                speaker,
-                start_secs: start_ms as f32 / 1000.0,
-                end_secs: (end_ms as f32 / 1000.0).max(start_ms as f32 / 1000.0 + 0.001),
-                speaker_confidence: None,
-                overlaps_segment: false,
-            }
-        })
-        .collect()
-}
-
-fn granite_segments_from_words(words: &[DiarizationWord]) -> Vec<DiarizationSegment> {
-    if words.is_empty() {
-        return Vec::new();
-    }
-
-    let mut segments = Vec::new();
-    let mut start_idx = 0usize;
-    for idx in 1..words.len() {
-        let previous = &words[idx - 1];
-        let current = &words[idx];
-        let gap = (current.start_secs - previous.end_secs).max(0.0);
-        if current.speaker != words[start_idx].speaker || gap > MAX_UTTERANCE_GAP_SECS {
-            segments.push(granite_segment_from_word_run(&words[start_idx..idx]));
-            start_idx = idx;
-        }
-    }
-    segments.push(granite_segment_from_word_run(&words[start_idx..]));
-    segments
-}
-
-fn granite_segment_from_word_run(words: &[DiarizationWord]) -> DiarizationSegment {
-    let first = words.first().expect("segment run should be non-empty");
-    let last = words.last().expect("segment run should be non-empty");
-    DiarizationSegment {
-        speaker: first.speaker.clone(),
-        start_secs: first.start_secs,
-        end_secs: last.end_secs.max(first.start_secs + 0.001),
-        confidence: None,
-    }
-}
-
-fn count_distinct_speakers(words: &[DiarizationWord]) -> usize {
-    let speakers = words
-        .iter()
-        .filter(|word| word.speaker != UNKNOWN_SPEAKER)
-        .map(|word| word.speaker.as_str())
-        .collect::<HashSet<_>>();
-    speakers.len()
-}
-
-fn clean_granite_word(word: &str) -> String {
-    word.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '\'' && ch != '-')
-        .to_string()
-}
-
-fn normalize_word_for_match(word: &str) -> String {
-    clean_granite_word(word).to_ascii_lowercase()
 }
 
 fn decode_pipeline_audio(audio_base64: &str) -> Result<PipelineAudio> {
@@ -2092,58 +1677,6 @@ fn secs_to_ms(value: f32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn resolves_granite_transcript_pipeline_without_changing_classic_default() {
-        assert_eq!(
-            resolve_diarization_transcript_pipeline(Some("Granite-Speech-4.1-2B-Plus")),
-            DiarizationTranscriptPipeline::GraniteStandalone
-        );
-        assert_eq!(
-            resolve_diarization_transcript_pipeline(None),
-            DiarizationTranscriptPipeline::ClassicStack(
-                ModelVariant::DiarStreamingSortformer4SpkV21
-            )
-        );
-    }
-
-    #[test]
-    fn granite_diarization_result_merges_speaker_and_timestamp_outputs() {
-        let result = granite_diarization_result_from_texts(
-            "[Speaker 1]: hello there [Speaker 2]: good bye",
-            "hello [T:050] there [T:100] good [T:160] bye [T:220]",
-            3.0,
-        );
-
-        assert_eq!(result.speaker_count, 2);
-        assert_eq!(result.words.len(), 4);
-        assert_eq!(result.words[0].speaker, "SPEAKER_00");
-        assert_eq!(result.words[1].speaker, "SPEAKER_00");
-        assert_eq!(result.words[2].speaker, "SPEAKER_01");
-        assert_eq!(result.words[3].speaker, "SPEAKER_01");
-        assert_eq!(result.segments.len(), 2);
-        assert_eq!(result.utterances.len(), 2);
-        assert_eq!(result.alignment_coverage, 1.0);
-        assert_eq!(result.unattributed_words, 0);
-        assert!(result.raw_transcript.contains("SPEAKER_00"));
-        assert!(result.raw_transcript.contains("SPEAKER_01"));
-    }
-
-    #[test]
-    fn granite_diarization_result_falls_back_when_timestamps_are_missing() {
-        let result = granite_diarization_result_from_texts(
-            "[Speaker 1]: hello there [Speaker 2]: good bye",
-            "hello there good bye",
-            4.0,
-        );
-
-        assert_eq!(result.speaker_count, 2);
-        assert_eq!(result.words.len(), 4);
-        assert_eq!(result.words[0].speaker, "SPEAKER_00");
-        assert_eq!(result.words[2].speaker, "SPEAKER_01");
-        assert_eq!(result.alignment_coverage, 0.0);
-        assert!(result.words.iter().all(|word| word.end_secs > word.start_secs));
-    }
 
     #[test]
     fn fallback_word_timings_generates_monotonic_ranges() {
