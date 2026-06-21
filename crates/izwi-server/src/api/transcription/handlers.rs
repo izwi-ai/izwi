@@ -59,6 +59,7 @@ struct ParsedTranscriptionCreateRequest {
     language: Option<String>,
     include_timestamps: bool,
     stream: bool,
+    generate_summary: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +79,8 @@ struct JsonCreateRequest {
     word_timestamps: Option<bool>,
     #[serde(default)]
     stream: Option<bool>,
+    #[serde(default)]
+    generate_summary: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -337,6 +340,7 @@ fn spawn_transcription_processing_task(
         let aligner_model_id = parsed.aligner_model_id.clone();
         let requested_language = parsed.language.clone();
         let include_timestamps = parsed.include_timestamps;
+        let generate_summary = parsed.generate_summary;
         let correlation_id_ref = correlation_id.clone();
         let audio_bytes = match transcription_store.get_audio(record_id.clone()).await {
             Ok(Some(audio)) => audio.audio_bytes,
@@ -417,7 +421,7 @@ fn spawn_transcription_processing_task(
                     None
                 };
                 let (summary_status, summary_model_id) =
-                    initial_summary_state(artifacts.text.as_str());
+                    initial_summary_state(artifacts.text.as_str(), generate_summary);
 
                 match transcription_store
                     .complete_record(
@@ -598,6 +602,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
                 .or(payload.word_timestamps)
                 .unwrap_or(false),
             stream: payload.stream.unwrap_or(false),
+            generate_summary: payload.generate_summary.unwrap_or(false),
         });
     }
 
@@ -684,6 +689,14 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
                         ))
                     })?;
                     out.stream = parse_bool(text.as_str());
+                }
+                "generate_summary" => {
+                    let text = field.text().await.map_err(|e| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart 'generate_summary' field: {e}"
+                        ))
+                    })?;
+                    out.generate_summary = parse_bool(text.as_str());
                 }
                 _ => {}
             }
@@ -840,8 +853,11 @@ fn should_break_segment(
             && previous_token.ends_with(['.', '!', '?']))
 }
 
-fn initial_summary_state(transcription: &str) -> (TranscriptionSummaryStatus, Option<String>) {
-    if transcription.trim().is_empty() {
+fn initial_summary_state(
+    transcription: &str,
+    generate_summary: bool,
+) -> (TranscriptionSummaryStatus, Option<String>) {
+    if !generate_summary || transcription.trim().is_empty() {
         (TranscriptionSummaryStatus::NotRequested, None)
     } else {
         (
@@ -1100,11 +1116,14 @@ mod tests {
         transcription_summary_params, TranscriptionSummaryStatus, TranscriptionWordRecord,
     };
 
-    fn wav_data_url(content_type: &str) -> String {
-        let wav = AudioEncoder::new(16_000, 1)
+    fn wav_bytes() -> Vec<u8> {
+        AudioEncoder::new(16_000, 1)
             .encode(&[0.0, 0.1, -0.1, 0.0], AudioFormat::Wav)
-            .expect("wav should encode");
-        let b64 = base64::engine::general_purpose::STANDARD.encode(wav);
+            .expect("wav should encode")
+    }
+
+    fn wav_data_url(content_type: &str) -> String {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(wav_bytes());
         format!("data:{content_type};base64, {b64}\n")
     }
 
@@ -1128,6 +1147,60 @@ mod tests {
         assert!(!parsed.audio_bytes.is_empty());
         assert_eq!(parsed.audio_mime_type.as_deref(), Some("audio/wav"));
         assert_eq!(parsed.model_id.as_deref(), Some("Parakeet-TDT-0.6B-v3"));
+        assert!(!parsed.generate_summary);
+    }
+
+    #[tokio::test]
+    async fn json_create_request_accepts_generate_summary_true() {
+        let request = axum::http::Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "audio_base64": wav_data_url("audio/wav"),
+                    "model": "Parakeet-TDT-0.6B-v3",
+                    "generate_summary": true
+                })
+                .to_string(),
+            ))
+            .expect("request should build");
+
+        let parsed = parse_create_request(request)
+            .await
+            .expect("request should parse");
+
+        assert!(parsed.generate_summary);
+    }
+
+    #[tokio::test]
+    async fn multipart_create_request_accepts_generate_summary_true() {
+        let boundary = "izwi-transcription-boundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"clip.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(&wav_bytes());
+        body.extend_from_slice(
+            format!(
+                "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"generate_summary\"\r\n\r\ntrue\r\n--{boundary}--\r\n"
+            )
+            .as_bytes(),
+        );
+        let request = axum::http::Request::builder()
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .expect("request should build");
+
+        let parsed = parse_create_request(request)
+            .await
+            .expect("request should parse");
+
+        assert!(parsed.generate_summary);
     }
 
     #[tokio::test]
@@ -1219,12 +1292,16 @@ mod tests {
     }
 
     #[test]
-    fn defaults_summary_state_to_pending_for_non_empty_transcriptions() {
-        let (status, model_id) = initial_summary_state("hello world");
+    fn defaults_summary_state_to_not_requested_for_non_empty_transcriptions() {
+        let (status, model_id) = initial_summary_state("hello world", false);
+        assert_eq!(status, TranscriptionSummaryStatus::NotRequested);
+        assert_eq!(model_id, None);
+
+        let (status, model_id) = initial_summary_state("hello world", true);
         assert_eq!(status, TranscriptionSummaryStatus::Pending);
         assert_eq!(model_id.as_deref(), Some("Qwen3.5-4B"));
 
-        let (status, model_id) = initial_summary_state("   ");
+        let (status, model_id) = initial_summary_state("   ", true);
         assert_eq!(status, TranscriptionSummaryStatus::NotRequested);
         assert_eq!(model_id, None);
     }
