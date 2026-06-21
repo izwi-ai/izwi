@@ -13,7 +13,7 @@ use super::state::ActiveAsrDecode;
 use super::{ExecutorOutput, NativeExecutor};
 
 const MAX_ASR_NEW_TOKENS: usize = 512;
-const GRANITE_ASR_PREFIX_REPLAY_WORDS: usize = 96;
+const GRANITE_ASR_PREFIX_REPLAY_WORDS: usize = 0;
 const GRANITE_ASR_PREFIX_REPLAY_WORDS_MAX: usize = 240;
 
 impl NativeExecutor {
@@ -548,6 +548,7 @@ impl NativeExecutor {
             base_options.max_new_tokens,
         );
         if retry_max_tokens >= base_options.max_new_tokens {
+            let trim = trim_granite_looping_chunk_text(&mut details.text, &original_loop);
             details.diagnostics = with_granite_loop_recovery_diagnostics(
                 details.diagnostics,
                 &original_loop,
@@ -555,7 +556,12 @@ impl NativeExecutor {
                 base_options.max_new_tokens,
                 retry_max_tokens,
                 false,
-                "not_retried_budget_floor",
+                if trim.is_some() {
+                    "not_retried_budget_floor_trimmed_original"
+                } else {
+                    "not_retried_budget_floor"
+                },
+                trim.as_ref(),
             );
             return Ok(details);
         }
@@ -571,11 +577,15 @@ impl NativeExecutor {
             retry_options,
         )?;
         let retry_loop = granite_chunk_loop_signal(&retry.text, retry.diagnostics.as_ref());
+        let retry_trim = retry_loop
+            .as_ref()
+            .and_then(|loop_signal| trim_granite_looping_chunk_text(&mut retry.text, loop_signal));
         let use_retry = !retry.text.trim().is_empty()
-            && retry_loop
-                .as_ref()
-                .map(|loop_signal| loop_signal.score() < original_loop.score())
-                .unwrap_or(true);
+            && (retry_trim.is_some()
+                || retry_loop
+                    .as_ref()
+                    .map(|loop_signal| loop_signal.score() < original_loop.score())
+                    .unwrap_or(true));
 
         if use_retry {
             retry.diagnostics = with_granite_loop_recovery_diagnostics(
@@ -585,10 +595,16 @@ impl NativeExecutor {
                 base_options.max_new_tokens,
                 retry_max_tokens,
                 true,
-                "retry_selected",
+                if retry_trim.is_some() {
+                    "retry_selected_trimmed"
+                } else {
+                    "retry_selected"
+                },
+                retry_trim.as_ref(),
             );
             Ok(retry)
         } else {
+            let original_trim = trim_granite_looping_chunk_text(&mut details.text, &original_loop);
             details.diagnostics = with_granite_loop_recovery_diagnostics(
                 details.diagnostics,
                 &original_loop,
@@ -596,7 +612,12 @@ impl NativeExecutor {
                 base_options.max_new_tokens,
                 retry_max_tokens,
                 false,
-                "retry_not_better",
+                if original_trim.is_some() {
+                    "retry_not_better_trimmed_original"
+                } else {
+                    "retry_not_better"
+                },
+                original_trim.as_ref(),
             );
             Ok(details)
         }
@@ -619,6 +640,8 @@ struct GranitePhraseLoop {
     phrase: String,
     phrase_words: usize,
     repeat_count: usize,
+    start_word: usize,
+    trailing_words: usize,
 }
 
 impl GranitePhraseLoop {
@@ -660,10 +683,13 @@ fn repeated_phrase_loop(text: &str) -> Option<GranitePhraseLoop> {
                 repeats += 1;
             }
             if repeats >= 3 {
+                let repeated_words = phrase_words.saturating_mul(repeats);
                 let candidate = GranitePhraseLoop {
                     phrase: phrase.join(" "),
                     phrase_words,
                     repeat_count: repeats,
+                    start_word: idx,
+                    trailing_words: words.len().saturating_sub(idx + repeated_words),
                 };
                 if best
                     .as_ref()
@@ -691,6 +717,78 @@ fn normalized_words(text: &str) -> Vec<String> {
         })
         .filter(|word| !word.is_empty())
         .collect()
+}
+
+#[derive(Debug, Clone)]
+struct NormalizedWordSpan {
+    end_byte: usize,
+}
+
+fn normalized_word_spans(text: &str) -> Vec<NormalizedWordSpan> {
+    let mut spans = Vec::new();
+    let mut current = String::new();
+    let mut current_end = 0usize;
+    for (idx, ch) in text.char_indices() {
+        if ch.is_alphanumeric() || matches!(ch, '\'' | '-') {
+            current.extend(ch.to_lowercase());
+            current_end = idx + ch.len_utf8();
+        } else if !current.is_empty() {
+            spans.push(NormalizedWordSpan {
+                end_byte: current_end,
+            });
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        spans.push(NormalizedWordSpan {
+            end_byte: current_end,
+        });
+    }
+    spans
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GraniteLoopTrim {
+    original_chars: usize,
+    trimmed_chars: usize,
+    original_words: usize,
+    trimmed_words: usize,
+}
+
+fn trim_repeated_phrase_tail(text: &str, loop_signal: &GranitePhraseLoop) -> Option<String> {
+    if loop_signal.repeat_count < 3 || loop_signal.trailing_words > loop_signal.phrase_words.max(4)
+    {
+        return None;
+    }
+    let spans = normalized_word_spans(text);
+    let keep_words = loop_signal
+        .start_word
+        .saturating_add(loop_signal.phrase_words);
+    let trim_end = spans.get(keep_words.saturating_sub(1))?.end_byte;
+    let trimmed = text[..trim_end].trim_end();
+    if trimmed.len() < text.trim_end().len() {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+fn trim_granite_looping_chunk_text(
+    text: &mut String,
+    loop_signal: &GranitePhraseLoop,
+) -> Option<GraniteLoopTrim> {
+    let original_chars = text.chars().count();
+    let original_words = normalized_words(text).len();
+    let trimmed = trim_repeated_phrase_tail(text, loop_signal)?;
+    let trimmed_chars = trimmed.chars().count();
+    let trimmed_words = normalized_words(&trimmed).len();
+    *text = trimmed;
+    Some(GraniteLoopTrim {
+        original_chars,
+        trimmed_chars,
+        original_words,
+        trimmed_words,
+    })
 }
 
 fn granite_loop_recovery_max_tokens(
@@ -723,6 +821,7 @@ fn with_granite_loop_recovery_diagnostics(
     retry_max_tokens: usize,
     selected_retry: bool,
     decision: &str,
+    trim: Option<&GraniteLoopTrim>,
 ) -> Option<serde_json::Value> {
     let mut diagnostics = diagnostics.unwrap_or_else(|| json!({}));
     if !diagnostics.is_object() {
@@ -746,6 +845,12 @@ fn with_granite_loop_recovery_diagnostics(
                     "phrase": loop_signal.phrase,
                     "phrase_words": loop_signal.phrase_words,
                     "repeat_count": loop_signal.repeat_count,
+                })),
+                "trim": trim.map(|trim| json!({
+                    "original_chars": trim.original_chars,
+                    "trimmed_chars": trim.trimmed_chars,
+                    "original_words": trim.original_words,
+                    "trimmed_words": trim.trimmed_words,
                 })),
             }),
         );
@@ -839,13 +944,25 @@ mod tests {
     }
 
     #[test]
-    fn granite_prefix_replay_text_keeps_recent_words() {
+    fn granite_prefix_replay_text_is_disabled_by_default() {
         let prefix = (0..140)
             .map(|idx| format!("word{idx}"))
             .collect::<Vec<_>>()
             .join(" ");
 
         let replay = NativeExecutor::granite_asr_prefix_replay_text(&prefix);
+
+        assert!(replay.is_empty());
+    }
+
+    #[test]
+    fn recent_word_suffix_keeps_recent_words() {
+        let prefix = (0..140)
+            .map(|idx| format!("word{idx}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let replay = super::recent_word_suffix(&prefix, 96);
         let words = replay.split_whitespace().collect::<Vec<_>>();
 
         assert_eq!(words.len(), 96);
@@ -863,6 +980,30 @@ mod tests {
 
         assert!(loop_signal.phrase.contains("if you speak"));
         assert!(loop_signal.repeat_count >= 3);
+    }
+
+    #[test]
+    fn trim_repeated_phrase_tail_keeps_first_occurrence() {
+        let text = "better relationships with your friends and your family and your coworkers \
+            and your boss and your boss and your boss and your boss";
+        let loop_signal = super::repeated_phrase_loop(text).expect("loop signal");
+
+        let trimmed =
+            super::trim_repeated_phrase_tail(text, &loop_signal).expect("trimmed repeated tail");
+
+        assert_eq!(
+            trimmed,
+            "better relationships with your friends and your family and your coworkers and your boss"
+        );
+    }
+
+    #[test]
+    fn trim_repeated_phrase_tail_ignores_middle_repeats() {
+        let text = "alpha beta gamma alpha beta gamma alpha beta gamma then \
+            a normal ending with additional words that should remain";
+        let loop_signal = super::repeated_phrase_loop(text).expect("loop signal");
+
+        assert!(super::trim_repeated_phrase_tail(text, &loop_signal).is_none());
     }
 
     #[test]
