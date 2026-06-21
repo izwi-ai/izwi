@@ -76,19 +76,29 @@ function clampProgressPercent(
 function progressDetailLabel(
   progress: TranscriptionProcessingProgress | null | undefined,
 ): string | null {
-  const currentChunk = progress?.current_chunk;
-  const totalChunks = progress?.total_chunks;
-  if (
-    typeof currentChunk === "number" &&
-    typeof totalChunks === "number" &&
-    currentChunk > 0 &&
-    totalChunks > 0
-  ) {
-    return `Chunk ${currentChunk} of ${totalChunks}`;
+  const percent = clampProgressPercent(progress);
+  if (percent !== null) {
+    return `${Math.round(percent)}%`;
   }
 
-  const percent = clampProgressPercent(progress);
-  return percent === null ? null : `${Math.round(percent)}%`;
+  const processedAudioSecs = progress?.processed_audio_secs;
+  const totalAudioSecs = progress?.total_audio_secs;
+  if (
+    typeof processedAudioSecs === "number" &&
+    Number.isFinite(processedAudioSecs) &&
+    processedAudioSecs >= 0 &&
+    typeof totalAudioSecs === "number" &&
+    Number.isFinite(totalAudioSecs) &&
+    totalAudioSecs > 0
+  ) {
+    const derivedPercent = Math.min(
+      100,
+      Math.max(0, (processedAudioSecs / totalAudioSecs) * 100),
+    );
+    return `${Math.round(derivedPercent)}%`;
+  }
+
+  return null;
 }
 
 function ProcessingProgressCard({
