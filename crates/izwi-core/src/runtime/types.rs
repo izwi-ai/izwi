@@ -13,6 +13,34 @@ pub struct AsrTranscription {
     pub asr_diagnostics: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeakerAttributedAsrStatus {
+    Ready,
+    Warning,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SpeakerAttributedAsrTurn {
+    pub speaker: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_secs: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_secs: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeakerAttributedAsrResult {
+    pub text: String,
+    pub language: Option<String>,
+    pub duration_secs: f32,
+    pub speaker_turns: Vec<SpeakerAttributedAsrTurn>,
+    pub speaker_count: usize,
+    pub status: SpeakerAttributedAsrStatus,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiarizationSegment {
     pub speaker: String,

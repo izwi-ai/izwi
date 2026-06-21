@@ -1,17 +1,26 @@
 //! ASR runtime methods routed through the unified core engine.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::catalog::{parse_model_variant, resolve_asr_model_variant, ModelFamily};
+use crate::catalog::{ModelFamily, parse_model_variant, resolve_asr_model_variant};
 use crate::engine::{AsrProgress, EngineCoreRequest};
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
-use crate::models::registry::{NativeAsrModel, NativeAsrRealtimeEvent, NativeAsrRealtimeState};
+use crate::models::architectures::granite_speech::asr::{
+    GraniteSpeechTask, parse_granite_speech_output,
+};
+use crate::models::registry::{
+    NativeAsrGenerationOptions, NativeAsrModel, NativeAsrRealtimeEvent, NativeAsrRealtimeState,
+};
 use crate::runtime::adapters::CapabilityKind;
 use crate::runtime::audio_io::{base64_decode, decode_audio_bytes, wav_duration_seconds_fast};
 use crate::runtime::request::{AlignmentRuntimeRequest, AsrRuntimeRequest};
 use crate::runtime::service::RuntimeService;
-use crate::runtime::types::AsrTranscription;
+use crate::runtime::types::{
+    AsrTranscription, SpeakerAttributedAsrResult, SpeakerAttributedAsrStatus,
+    SpeakerAttributedAsrTurn,
+};
 
 #[derive(Clone, Copy)]
 enum AsrAudioInput<'a> {
@@ -23,6 +32,8 @@ const GRANITE_ASR_AUTO_MIN_TOKENS: usize = 76;
 const GRANITE_ASR_AUTO_MAX_TOKENS: usize = 2048;
 const GRANITE_ASR_AUTO_BASE_SECONDS: f32 = 28.0;
 const GRANITE_ASR_AUTO_TOKENS_PER_SECOND: f32 = 4.0;
+const GRANITE_SAA_MAX_NEW_TOKENS: usize = 10_000;
+const UNKNOWN_SAA_SPEAKER: &str = "UNKNOWN";
 
 fn resolve_asr_realtime_stream_variant(model_id: Option<&str>) -> Option<ModelVariant> {
     let variant = resolve_asr_model_variant(model_id);
@@ -1001,6 +1012,81 @@ impl RuntimeService {
         .await
     }
 
+    pub async fn speaker_attributed_asr(
+        &self,
+        audio_base64: &str,
+        model_id: Option<&str>,
+        language: Option<&str>,
+        min_speakers: Option<usize>,
+        max_speakers: Option<usize>,
+    ) -> Result<SpeakerAttributedAsrResult> {
+        let audio_bytes = base64_decode(audio_base64)?;
+        self.speaker_attributed_asr_bytes(
+            &audio_bytes,
+            model_id,
+            language,
+            min_speakers,
+            max_speakers,
+        )
+        .await
+    }
+
+    pub async fn speaker_attributed_asr_bytes(
+        &self,
+        audio_bytes: &[u8],
+        model_id: Option<&str>,
+        language: Option<&str>,
+        min_speakers: Option<usize>,
+        max_speakers: Option<usize>,
+    ) -> Result<SpeakerAttributedAsrResult> {
+        let variant = resolve_speaker_attributed_asr_variant(model_id)?;
+        self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
+        self.load_model(variant).await?;
+        let _lease = self.acquire_model_residency_lease(variant);
+        let model = self
+            .model_registry
+            .get_asr(variant)
+            .await
+            .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?;
+
+        let (samples, sample_rate) = decode_audio_bytes(audio_bytes)?;
+        let duration_secs = if sample_rate > 0 {
+            samples.len() as f32 / sample_rate as f32
+        } else {
+            0.0
+        };
+        let language_owned = language.map(ToOwned::to_owned);
+        let task_samples = samples.clone();
+        let task_model = model.clone();
+        let transcription = tokio::task::spawn_blocking(move || {
+            task_model.transcribe_with_granite_speech_task_and_options(
+                &task_samples,
+                sample_rate,
+                language_owned.as_deref(),
+                GraniteSpeechTask::SpeakerAttributed,
+                None,
+                NativeAsrGenerationOptions {
+                    max_new_tokens: GRANITE_SAA_MAX_NEW_TOKENS,
+                    ..NativeAsrGenerationOptions::default()
+                },
+            )
+        })
+        .await
+        .map_err(|err| {
+            Error::InferenceError(format!("Granite speaker attributed ASR task failed: {err}"))
+        })??;
+
+        Ok(speaker_attributed_asr_result_from_text(
+            transcription.text.as_str(),
+            transcription
+                .language
+                .or_else(|| language.map(ToOwned::to_owned)),
+            duration_secs,
+            min_speakers,
+            max_speakers,
+        ))
+    }
+
     /// Force alignment remains a specialized operation not expressed by the
     /// generic engine output type.
     pub async fn force_align(
@@ -1069,6 +1155,88 @@ impl RuntimeService {
 
         let (samples, sample_rate) = decode_audio_bytes(audio_bytes)?;
         model.force_align(&samples, sample_rate, reference_text, language)
+    }
+}
+
+fn resolve_speaker_attributed_asr_variant(model_id: Option<&str>) -> Result<ModelVariant> {
+    let variant = match model_id {
+        Some(raw) => {
+            parse_model_variant(raw).map_err(|err| Error::InvalidInput(err.to_string()))?
+        }
+        None => ModelVariant::GraniteSpeech412BPlus,
+    };
+
+    if variant != ModelVariant::GraniteSpeech412BPlus {
+        return Err(Error::InvalidInput(format!(
+            "Speaker attributed ASR currently requires Granite-Speech-4.1-2B-Plus, got {variant}"
+        )));
+    }
+
+    Ok(variant)
+}
+
+fn speaker_attributed_asr_result_from_text(
+    raw_text: &str,
+    language: Option<String>,
+    duration_secs: f32,
+    min_speakers: Option<usize>,
+    max_speakers: Option<usize>,
+) -> SpeakerAttributedAsrResult {
+    let parsed = parse_granite_speech_output(raw_text);
+    let mut speakers = HashSet::<String>::new();
+    let mut turns = Vec::new();
+
+    for segment in &parsed.segments {
+        let speaker = segment
+            .speaker
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(UNKNOWN_SAA_SPEAKER)
+            .to_string();
+        if speaker != UNKNOWN_SAA_SPEAKER {
+            speakers.insert(speaker.clone());
+        }
+        turns.push(SpeakerAttributedAsrTurn {
+            speaker,
+            text: segment.text.clone(),
+            start_secs: None,
+            end_secs: None,
+        });
+    }
+
+    let speaker_count = speakers.len();
+    let mut warnings = Vec::new();
+    if let Some(min_speakers) = min_speakers {
+        if speaker_count < min_speakers {
+            warnings.push(format!(
+                "Granite SAA emitted {speaker_count} speaker label(s), below requested minimum {min_speakers}."
+            ));
+        }
+    }
+    if let Some(max_speakers) = max_speakers {
+        if speaker_count > max_speakers {
+            warnings.push(format!(
+                "Granite SAA emitted {speaker_count} speaker label(s), above requested maximum {max_speakers}."
+            ));
+        }
+    }
+    if parsed.text.trim().is_empty() {
+        warnings.push("Granite SAA returned an empty transcript.".to_string());
+    }
+
+    SpeakerAttributedAsrResult {
+        text: parsed.text,
+        language,
+        duration_secs,
+        speaker_turns: turns,
+        speaker_count,
+        status: if warnings.is_empty() {
+            SpeakerAttributedAsrStatus::Ready
+        } else {
+            SpeakerAttributedAsrStatus::Warning
+        },
+        warnings,
     }
 }
 
@@ -1170,6 +1338,62 @@ mod tests {
         .expect("granite budget");
 
         assert_eq!(budget, 204);
+    }
+
+    #[test]
+    fn speaker_attributed_asr_result_preserves_granite_turns() {
+        let result = speaker_attributed_asr_result_from_text(
+            "[Speaker 1]: hello there [Speaker 2]: hi back",
+            Some("English".to_string()),
+            4.0,
+            Some(2),
+            None,
+        );
+
+        assert_eq!(result.status, SpeakerAttributedAsrStatus::Ready);
+        assert_eq!(result.language.as_deref(), Some("English"));
+        assert_eq!(result.speaker_count, 2);
+        assert!(result.warnings.is_empty());
+        assert_eq!(
+            result.speaker_turns,
+            vec![
+                SpeakerAttributedAsrTurn {
+                    speaker: "Speaker 1".to_string(),
+                    text: "hello there".to_string(),
+                    start_secs: None,
+                    end_secs: None,
+                },
+                SpeakerAttributedAsrTurn {
+                    speaker: "Speaker 2".to_string(),
+                    text: "hi back".to_string(),
+                    start_secs: None,
+                    end_secs: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn speaker_attributed_asr_warns_when_expected_speakers_are_missing() {
+        let result = speaker_attributed_asr_result_from_text(
+            "[Speaker 1]: one long turn",
+            None,
+            2.0,
+            Some(2),
+            None,
+        );
+
+        assert_eq!(result.status, SpeakerAttributedAsrStatus::Warning);
+        assert_eq!(result.speaker_count, 1);
+        assert_eq!(result.speaker_turns.len(), 1);
+        assert!(result.warnings[0].contains("below requested minimum 2"));
+    }
+
+    #[test]
+    fn speaker_attributed_asr_rejects_non_granite_models() {
+        let err = resolve_speaker_attributed_asr_variant(Some("Whisper-Large-v3-Turbo"))
+            .expect_err("SAA should be Granite-only");
+        assert!(err.to_string().contains("Granite-Speech-4.1-2B-Plus"));
     }
 
     #[tokio::test]
