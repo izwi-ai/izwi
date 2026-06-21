@@ -1,8 +1,8 @@
 //! Persistent transcription history storage backed by SQLite.
 
 use anyhow::{anyhow, Context};
-use izwi_hooks::{HookMetadata, MediaNamespace, MediaStorageProvider};
 use izwi_core::AsrProgress;
+use izwi_hooks::{HookMetadata, MediaNamespace, MediaStorageProvider};
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryResult, Set};
 use serde::{Deserialize, Serialize};
@@ -63,6 +63,54 @@ impl TranscriptionProcessingStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptionRecordMode {
+    Transcription,
+    SpeakerAttributedAsr,
+}
+
+impl Default for TranscriptionRecordMode {
+    fn default() -> Self {
+        Self::Transcription
+    }
+}
+
+impl TranscriptionRecordMode {
+    pub const fn as_db_value(self) -> &'static str {
+        match self {
+            Self::Transcription => "transcription",
+            Self::SpeakerAttributedAsr => "speaker_attributed_asr",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeakerAttributedAsrStatus {
+    NotRequested,
+    Ready,
+    Warning,
+    Failed,
+}
+
+impl Default for SpeakerAttributedAsrStatus {
+    fn default() -> Self {
+        Self::NotRequested
+    }
+}
+
+impl SpeakerAttributedAsrStatus {
+    pub const fn as_db_value(self) -> &'static str {
+        match self {
+            Self::NotRequested => "not_requested",
+            Self::Ready => "ready",
+            Self::Warning => "warning",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 impl TranscriptionSummaryStatus {
     fn as_db_value(self) -> &'static str {
         match self {
@@ -90,10 +138,19 @@ pub struct TranscriptionSegmentRecord {
     pub word_end: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeakerAttributedTurnRecord {
+    pub speaker: String,
+    pub text: String,
+    pub start: Option<f32>,
+    pub end: Option<f32>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TranscriptionRecordSummary {
     pub id: String,
     pub created_at: u64,
+    pub transcription_mode: TranscriptionRecordMode,
     pub model_id: Option<String>,
     pub language: Option<String>,
     pub processing_status: TranscriptionProcessingStatus,
@@ -106,6 +163,11 @@ pub struct TranscriptionRecordSummary {
     pub audio_filename: Option<String>,
     pub transcription_preview: String,
     pub transcription_chars: usize,
+    pub speaker_attributed_text_preview: Option<String>,
+    pub speaker_attributed_text_chars: usize,
+    pub speaker_turn_count: usize,
+    pub saa_status: SpeakerAttributedAsrStatus,
+    pub saa_warnings: Vec<String>,
     pub summary_status: TranscriptionSummaryStatus,
     pub summary_preview: Option<String>,
     pub summary_chars: usize,
@@ -121,6 +183,7 @@ pub struct TranscriptionRecordListCursor {
 pub struct TranscriptionRecord {
     pub id: String,
     pub created_at: u64,
+    pub transcription_mode: TranscriptionRecordMode,
     pub model_id: Option<String>,
     pub aligner_model_id: Option<String>,
     pub language: Option<String>,
@@ -135,6 +198,10 @@ pub struct TranscriptionRecord {
     pub transcription: String,
     pub segments: Vec<TranscriptionSegmentRecord>,
     pub words: Vec<TranscriptionWordRecord>,
+    pub speaker_attributed_text: Option<String>,
+    pub speaker_turns: Vec<SpeakerAttributedTurnRecord>,
+    pub saa_status: SpeakerAttributedAsrStatus,
+    pub saa_warnings: Vec<String>,
     pub summary_status: TranscriptionSummaryStatus,
     pub summary_model_id: Option<String>,
     pub summary_text: Option<String>,
@@ -151,6 +218,7 @@ pub struct StoredTranscriptionAudio {
 
 #[derive(Debug, Clone)]
 pub struct NewTranscriptionRecord {
+    pub transcription_mode: TranscriptionRecordMode,
     pub model_id: Option<String>,
     pub aligner_model_id: Option<String>,
     pub language: Option<String>,
@@ -166,6 +234,10 @@ pub struct NewTranscriptionRecord {
     pub transcription: String,
     pub segments: Vec<TranscriptionSegmentRecord>,
     pub words: Vec<TranscriptionWordRecord>,
+    pub speaker_attributed_text: Option<String>,
+    pub speaker_turns: Vec<SpeakerAttributedTurnRecord>,
+    pub saa_status: SpeakerAttributedAsrStatus,
+    pub saa_warnings: Vec<String>,
     pub summary_status: TranscriptionSummaryStatus,
     pub summary_model_id: Option<String>,
     pub summary_text: Option<String>,
@@ -184,6 +256,7 @@ pub struct UpdateTranscriptionSummary {
 
 #[derive(Debug, Clone)]
 pub struct CompleteTranscriptionRecord {
+    pub transcription_mode: TranscriptionRecordMode,
     pub model_id: Option<String>,
     pub aligner_model_id: Option<String>,
     pub language: Option<String>,
@@ -193,6 +266,10 @@ pub struct CompleteTranscriptionRecord {
     pub transcription: String,
     pub segments: Vec<TranscriptionSegmentRecord>,
     pub words: Vec<TranscriptionWordRecord>,
+    pub speaker_attributed_text: Option<String>,
+    pub speaker_turns: Vec<SpeakerAttributedTurnRecord>,
+    pub saa_status: SpeakerAttributedAsrStatus,
+    pub saa_warnings: Vec<String>,
     pub summary_status: TranscriptionSummaryStatus,
     pub summary_model_id: Option<String>,
     pub summary_text: Option<String>,
@@ -329,6 +406,7 @@ impl TranscriptionStore {
         let db = self.db.connection().await?;
         let now = now_unix_millis_i64();
         let record_id = new_uuid();
+        let transcription_mode = record.transcription_mode;
         let model_id = sanitize_optional_text(record.model_id.as_deref(), 160);
         let aligner_model_id = sanitize_optional_text(record.aligner_model_id.as_deref(), 160);
         let language = sanitize_optional_text(record.language.as_deref(), 80);
@@ -349,6 +427,15 @@ impl TranscriptionStore {
         let transcription = sanitize_required_text(record.transcription.as_str(), 100_000);
         let segments = sanitize_segments(record.segments);
         let words = sanitize_words(record.words);
+        let speaker_attributed_text =
+            sanitize_optional_text(record.speaker_attributed_text.as_deref(), 100_000);
+        let speaker_turns = sanitize_speaker_turns(record.speaker_turns);
+        let saa_warnings = sanitize_saa_warnings(record.saa_warnings);
+        let saa_status = normalize_saa_status(
+            record.saa_status,
+            speaker_attributed_text.as_deref(),
+            saa_warnings.as_slice(),
+        );
         let summary_model_id = sanitize_optional_text(record.summary_model_id.as_deref(), 160);
         let summary_text = sanitize_optional_text(record.summary_text.as_deref(), 20_000);
         let summary_error = sanitize_optional_text(record.summary_error.as_deref(), 1_000);
@@ -384,11 +471,16 @@ impl TranscriptionStore {
         let segments_json =
             serde_json::to_string(&segments).context("Failed serializing segments")?;
         let words_json = serde_json::to_string(&words).context("Failed serializing words")?;
+        let speaker_turns_json =
+            serde_json::to_string(&speaker_turns).context("Failed serializing SAA turns")?;
+        let saa_warnings_json =
+            serde_json::to_string(&saa_warnings).context("Failed serializing SAA warnings")?;
 
         if let Err(err) =
             transcription_records::Entity::insert(transcription_records::ActiveModel {
                 id: Set(record_id.clone()),
                 created_at: Set(now),
+                transcription_mode: Set(transcription_mode.as_db_value().to_string()),
                 model_id: Set(model_id),
                 aligner_model_id: Set(aligner_model_id),
                 language: Set(language),
@@ -404,6 +496,10 @@ impl TranscriptionStore {
                 transcription: Set(transcription),
                 segments_json: Set(segments_json),
                 words_json: Set(words_json),
+                speaker_attributed_text: Set(speaker_attributed_text),
+                speaker_turns_json: Set(speaker_turns_json),
+                saa_status: Set(saa_status.as_db_value().to_string()),
+                saa_warnings_json: Set(saa_warnings_json),
                 summary_status: Set(summary_status.as_db_value().to_string()),
                 summary_model_id: Set(summary_model_id),
                 summary_text: Set(summary_text),
@@ -536,6 +632,7 @@ impl TranscriptionStore {
         record: CompleteTranscriptionRecord,
     ) -> anyhow::Result<Option<TranscriptionRecord>> {
         let db = self.db.connection().await?;
+        let transcription_mode = record.transcription_mode;
         let model_id = sanitize_optional_text(record.model_id.as_deref(), 160);
         let aligner_model_id = sanitize_optional_text(record.aligner_model_id.as_deref(), 160);
         let language = sanitize_optional_text(record.language.as_deref(), 80);
@@ -549,6 +646,15 @@ impl TranscriptionStore {
         let transcription = sanitize_required_text(record.transcription.as_str(), 100_000);
         let segments = sanitize_segments(record.segments);
         let words = sanitize_words(record.words);
+        let speaker_attributed_text =
+            sanitize_optional_text(record.speaker_attributed_text.as_deref(), 100_000);
+        let speaker_turns = sanitize_speaker_turns(record.speaker_turns);
+        let saa_warnings = sanitize_saa_warnings(record.saa_warnings);
+        let saa_status = normalize_saa_status(
+            record.saa_status,
+            speaker_attributed_text.as_deref(),
+            saa_warnings.as_slice(),
+        );
         let summary_model_id = sanitize_optional_text(record.summary_model_id.as_deref(), 160);
         let summary_text = sanitize_optional_text(record.summary_text.as_deref(), 20_000);
         let summary_error = sanitize_optional_text(record.summary_error.as_deref(), 1_000);
@@ -561,7 +667,15 @@ impl TranscriptionStore {
         let segments_json =
             serde_json::to_string(&segments).context("Failed serializing segments")?;
         let words_json = serde_json::to_string(&words).context("Failed serializing words")?;
+        let speaker_turns_json =
+            serde_json::to_string(&speaker_turns).context("Failed serializing SAA turns")?;
+        let saa_warnings_json =
+            serde_json::to_string(&saa_warnings).context("Failed serializing SAA warnings")?;
         let result = transcription_records::Entity::update_many()
+            .col_expr(
+                transcription_records::Column::TranscriptionMode,
+                Expr::value(transcription_mode.as_db_value()),
+            )
             .col_expr(
                 transcription_records::Column::ModelId,
                 Expr::value(model_id),
@@ -606,6 +720,22 @@ impl TranscriptionStore {
             .col_expr(
                 transcription_records::Column::WordsJson,
                 Expr::value(words_json),
+            )
+            .col_expr(
+                transcription_records::Column::SpeakerAttributedText,
+                Expr::value(speaker_attributed_text),
+            )
+            .col_expr(
+                transcription_records::Column::SpeakerTurnsJson,
+                Expr::value(speaker_turns_json),
+            )
+            .col_expr(
+                transcription_records::Column::SaaStatus,
+                Expr::value(saa_status.as_db_value()),
+            )
+            .col_expr(
+                transcription_records::Column::SaaWarningsJson,
+                Expr::value(saa_warnings_json),
             )
             .col_expr(
                 transcription_records::Column::SummaryStatus,
@@ -665,6 +795,7 @@ const TRANSCRIPTION_PAGE_SQL: &str = r#"
     SELECT
         id,
         created_at,
+        transcription_mode,
         model_id,
         language,
         processing_status,
@@ -676,6 +807,10 @@ const TRANSCRIPTION_PAGE_SQL: &str = r#"
         audio_mime_type,
         audio_filename,
         transcription,
+        speaker_attributed_text,
+        speaker_turns_json,
+        saa_status,
+        saa_warnings_json,
         summary_status,
         summary_text
     FROM transcription_records
@@ -687,6 +822,7 @@ const TRANSCRIPTION_PAGE_AFTER_CURSOR_SQL: &str = r#"
     SELECT
         id,
         created_at,
+        transcription_mode,
         model_id,
         language,
         processing_status,
@@ -698,6 +834,10 @@ const TRANSCRIPTION_PAGE_AFTER_CURSOR_SQL: &str = r#"
         audio_mime_type,
         audio_filename,
         transcription,
+        speaker_attributed_text,
+        speaker_turns_json,
+        saa_status,
+        saa_warnings_json,
         summary_status,
         summary_text
     FROM transcription_records
@@ -709,6 +849,7 @@ const TRANSCRIPTION_PAGE_AFTER_CURSOR_SQL: &str = r#"
 const TRANSCRIPTION_RECORD_COLUMNS: &str = r#"
     id,
     created_at,
+    transcription_mode,
     model_id,
     aligner_model_id,
     language,
@@ -723,6 +864,10 @@ const TRANSCRIPTION_RECORD_COLUMNS: &str = r#"
     transcription,
     segments_json,
     words_json,
+    speaker_attributed_text,
+    speaker_turns_json,
+    saa_status,
+    saa_warnings_json,
     summary_status,
     summary_model_id,
     summary_text,
@@ -748,31 +893,46 @@ async fn fetch_record_without_audio(
 }
 
 fn map_transcription_summary(row: &QueryResult) -> anyhow::Result<TranscriptionRecordSummary> {
-    let processing_status = parse_processing_status(row.try_get_by_index(4)?);
-    let processing_error: Option<String> = row.try_get_by_index(5)?;
-    let processing_progress = parse_processing_progress(row.try_get_by_index(6)?);
-    let transcription: String = row.try_get_by_index(12)?;
-    let summary_status = parse_summary_status(row.try_get_by_index(13)?);
-    let summary_text: Option<String> = row.try_get_by_index(14)?;
+    let processing_status = parse_processing_status(row.try_get_by_index(5)?);
+    let processing_error: Option<String> = row.try_get_by_index(6)?;
+    let processing_progress = parse_processing_progress(row.try_get_by_index(7)?);
+    let transcription: String = row.try_get_by_index(13)?;
+    let speaker_attributed_text: Option<String> = row.try_get_by_index(14)?;
+    let speaker_turns: Vec<SpeakerAttributedTurnRecord> = parse_json_vec(row.try_get_by_index(15)?);
+    let saa_status = parse_saa_status(row.try_get_by_index(16)?);
+    let saa_warnings: Vec<String> = parse_json_vec(row.try_get_by_index(17)?);
+    let summary_status = parse_summary_status(row.try_get_by_index(18)?);
+    let summary_text: Option<String> = row.try_get_by_index(19)?;
     Ok(TranscriptionRecordSummary {
         id: row.try_get_by_index(0)?,
         created_at: i64_to_u64(row.try_get_by_index(1)?),
-        model_id: row.try_get_by_index(2)?,
-        language: row.try_get_by_index(3)?,
+        transcription_mode: parse_transcription_mode(row.try_get_by_index(2)?),
+        model_id: row.try_get_by_index(3)?,
+        language: row.try_get_by_index(4)?,
         processing_status,
         processing_error: processing_error.clone(),
         processing_progress,
-        duration_secs: row.try_get_by_index(7)?,
-        processing_time_ms: row.try_get_by_index(8)?,
-        rtf: row.try_get_by_index(9)?,
-        audio_mime_type: row.try_get_by_index(10)?,
-        audio_filename: row.try_get_by_index(11)?,
+        duration_secs: row.try_get_by_index(8)?,
+        processing_time_ms: row.try_get_by_index(9)?,
+        rtf: row.try_get_by_index(10)?,
+        audio_mime_type: row.try_get_by_index(11)?,
+        audio_filename: row.try_get_by_index(12)?,
         transcription_preview: transcription_preview(
             processing_status,
             processing_error.as_deref(),
             &transcription,
         ),
         transcription_chars: transcription.chars().count(),
+        speaker_attributed_text_preview: speaker_attributed_text
+            .as_deref()
+            .and_then(non_empty_preview),
+        speaker_attributed_text_chars: speaker_attributed_text
+            .as_ref()
+            .map(|text| text.chars().count())
+            .unwrap_or(0),
+        speaker_turn_count: speaker_turns.len(),
+        saa_status,
+        saa_warnings,
         summary_status,
         summary_preview: summary_preview(summary_text.as_deref()),
         summary_chars: summary_text
@@ -786,26 +946,43 @@ fn map_transcription_record(row: &QueryResult) -> anyhow::Result<TranscriptionRe
     Ok(TranscriptionRecord {
         id: row.try_get_by_index(0)?,
         created_at: i64_to_u64(row.try_get_by_index(1)?),
-        model_id: row.try_get_by_index(2)?,
-        aligner_model_id: row.try_get_by_index(3)?,
-        language: row.try_get_by_index(4)?,
-        processing_status: parse_processing_status(row.try_get_by_index(5)?),
-        processing_error: row.try_get_by_index(6)?,
-        processing_progress: parse_processing_progress(row.try_get_by_index(7)?),
-        duration_secs: row.try_get_by_index(8)?,
-        processing_time_ms: row.try_get_by_index(9)?,
-        rtf: row.try_get_by_index(10)?,
-        audio_mime_type: row.try_get_by_index(11)?,
-        audio_filename: row.try_get_by_index(12)?,
-        transcription: row.try_get_by_index(13)?,
-        segments: parse_json_vec(row.try_get_by_index(14)?),
-        words: parse_json_vec(row.try_get_by_index(15)?),
-        summary_status: parse_summary_status(row.try_get_by_index(16)?),
-        summary_model_id: row.try_get_by_index(17)?,
-        summary_text: row.try_get_by_index(18)?,
-        summary_error: row.try_get_by_index(19)?,
-        summary_updated_at: row.try_get_by_index::<Option<i64>>(20)?.map(i64_to_u64),
+        transcription_mode: parse_transcription_mode(row.try_get_by_index(2)?),
+        model_id: row.try_get_by_index(3)?,
+        aligner_model_id: row.try_get_by_index(4)?,
+        language: row.try_get_by_index(5)?,
+        processing_status: parse_processing_status(row.try_get_by_index(6)?),
+        processing_error: row.try_get_by_index(7)?,
+        processing_progress: parse_processing_progress(row.try_get_by_index(8)?),
+        duration_secs: row.try_get_by_index(9)?,
+        processing_time_ms: row.try_get_by_index(10)?,
+        rtf: row.try_get_by_index(11)?,
+        audio_mime_type: row.try_get_by_index(12)?,
+        audio_filename: row.try_get_by_index(13)?,
+        transcription: row.try_get_by_index(14)?,
+        segments: parse_json_vec(row.try_get_by_index(15)?),
+        words: parse_json_vec(row.try_get_by_index(16)?),
+        speaker_attributed_text: row.try_get_by_index(17)?,
+        speaker_turns: parse_json_vec(row.try_get_by_index(18)?),
+        saa_status: parse_saa_status(row.try_get_by_index(19)?),
+        saa_warnings: parse_json_vec(row.try_get_by_index(20)?),
+        summary_status: parse_summary_status(row.try_get_by_index(21)?),
+        summary_model_id: row.try_get_by_index(22)?,
+        summary_text: row.try_get_by_index(23)?,
+        summary_error: row.try_get_by_index(24)?,
+        summary_updated_at: row.try_get_by_index::<Option<i64>>(25)?.map(i64_to_u64),
     })
+}
+
+fn parse_transcription_mode(raw: Option<String>) -> TranscriptionRecordMode {
+    match raw
+        .unwrap_or_else(|| "transcription".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "speaker_attributed_asr" | "saa" => TranscriptionRecordMode::SpeakerAttributedAsr,
+        _ => TranscriptionRecordMode::Transcription,
+    }
 }
 
 fn parse_processing_status(raw: Option<String>) -> TranscriptionProcessingStatus {
@@ -819,6 +996,20 @@ fn parse_processing_status(raw: Option<String>) -> TranscriptionProcessingStatus
         "processing" => TranscriptionProcessingStatus::Processing,
         "failed" => TranscriptionProcessingStatus::Failed,
         _ => TranscriptionProcessingStatus::Ready,
+    }
+}
+
+fn parse_saa_status(raw: Option<String>) -> SpeakerAttributedAsrStatus {
+    match raw
+        .unwrap_or_else(|| "not_requested".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "ready" => SpeakerAttributedAsrStatus::Ready,
+        "warning" => SpeakerAttributedAsrStatus::Warning,
+        "failed" => SpeakerAttributedAsrStatus::Failed,
+        _ => SpeakerAttributedAsrStatus::NotRequested,
     }
 }
 
@@ -896,6 +1087,23 @@ fn normalize_summary_status(
     }
 }
 
+fn normalize_saa_status(
+    requested: SpeakerAttributedAsrStatus,
+    speaker_attributed_text: Option<&str>,
+    warnings: &[String],
+) -> SpeakerAttributedAsrStatus {
+    if requested == SpeakerAttributedAsrStatus::Failed {
+        return requested;
+    }
+    if speaker_attributed_text.unwrap_or("").trim().is_empty() {
+        return SpeakerAttributedAsrStatus::NotRequested;
+    }
+    if requested == SpeakerAttributedAsrStatus::Warning || !warnings.is_empty() {
+        return SpeakerAttributedAsrStatus::Warning;
+    }
+    SpeakerAttributedAsrStatus::Ready
+}
+
 fn normalize_optional_timestamp_i64(value: Option<u64>) -> Option<i64> {
     value.and_then(|raw| i64::try_from(raw).ok())
 }
@@ -939,6 +1147,15 @@ fn summary_preview(content: Option<&str>) -> Option<String> {
         None
     } else {
         Some(truncate_string(&normalized, 200))
+    }
+}
+
+fn non_empty_preview(content: &str) -> Option<String> {
+    let normalized = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(truncate_string(&normalized, 160))
     }
 }
 
@@ -1003,6 +1220,43 @@ fn sanitize_words(words: Vec<TranscriptionWordRecord>) -> Vec<TranscriptionWordR
                 end: end.max(start.max(0.0)),
             })
         })
+        .collect()
+}
+
+fn sanitize_speaker_turns(
+    turns: Vec<SpeakerAttributedTurnRecord>,
+) -> Vec<SpeakerAttributedTurnRecord> {
+    turns
+        .into_iter()
+        .filter_map(|turn| {
+            let speaker = sanitize_required_text(turn.speaker.as_str(), 120);
+            let text = sanitize_required_text(turn.text.as_str(), 20_000);
+            if speaker.is_empty() || text.is_empty() {
+                return None;
+            }
+            let start = turn
+                .start
+                .filter(|value| value.is_finite() && *value >= 0.0);
+            let end = turn.end.filter(|value| value.is_finite() && *value >= 0.0);
+            let (start, end) = match (start, end) {
+                (Some(start), Some(end)) if end <= start => (Some(start), None),
+                values => values,
+            };
+
+            Some(SpeakerAttributedTurnRecord {
+                speaker,
+                text,
+                start,
+                end,
+            })
+        })
+        .collect()
+}
+
+fn sanitize_saa_warnings(warnings: Vec<String>) -> Vec<String> {
+    warnings
+        .into_iter()
+        .filter_map(|warning| sanitize_optional_text(Some(warning.as_str()), 500))
         .collect()
 }
 
@@ -1074,6 +1328,7 @@ mod tests {
 
     fn sample_record() -> NewTranscriptionRecord {
         NewTranscriptionRecord {
+            transcription_mode: TranscriptionRecordMode::Transcription,
             model_id: Some("Parakeet-TDT-0.6B-v3".to_string()),
             aligner_model_id: Some("Qwen3-ForcedAligner-0.6B".to_string()),
             language: Some("English".to_string()),
@@ -1125,6 +1380,10 @@ mod tests {
                     end: 2.4,
                 },
             ],
+            speaker_attributed_text: None,
+            speaker_turns: Vec::new(),
+            saa_status: SpeakerAttributedAsrStatus::NotRequested,
+            saa_warnings: Vec::new(),
             summary_status: TranscriptionSummaryStatus::Ready,
             summary_model_id: Some("Qwen3.5-4B".to_string()),
             summary_text: Some("A short summary of the transcript.".to_string()),
@@ -1150,8 +1409,15 @@ mod tests {
             created.processing_status,
             TranscriptionProcessingStatus::Ready
         );
+        assert_eq!(
+            created.transcription_mode,
+            TranscriptionRecordMode::Transcription
+        );
         assert_eq!(created.words.len(), 4);
         assert_eq!(created.segments.len(), 2);
+        assert_eq!(created.saa_status, SpeakerAttributedAsrStatus::NotRequested);
+        assert!(created.speaker_attributed_text.is_none());
+        assert!(created.speaker_turns.is_empty());
         assert_eq!(created.summary_status, TranscriptionSummaryStatus::Ready);
         assert_eq!(created.summary_model_id.as_deref(), Some("Qwen3.5-4B"));
         assert_eq!(
@@ -1167,6 +1433,65 @@ mod tests {
 
         assert_eq!(fetched.words.len(), 4);
         assert_eq!(fetched.segments[0].text, "Hello there.");
+
+        std::fs::remove_dir_all(root).expect("test temp dir should be removable");
+    }
+
+    #[tokio::test]
+    async fn persists_speaker_attributed_asr_metadata() {
+        let (store, root) = build_test_store();
+        let mut record = sample_record();
+        record.transcription_mode = TranscriptionRecordMode::SpeakerAttributedAsr;
+        record.model_id = Some("Granite-Speech-4.1-2B-Plus".to_string());
+        record.transcription = "[Speaker 1]: hello\n[Speaker 2]: hi there".to_string();
+        record.speaker_attributed_text = Some(record.transcription.clone());
+        record.speaker_turns = vec![
+            SpeakerAttributedTurnRecord {
+                speaker: "Speaker 1".to_string(),
+                text: "hello".to_string(),
+                start: None,
+                end: None,
+            },
+            SpeakerAttributedTurnRecord {
+                speaker: "Speaker 2".to_string(),
+                text: "hi there".to_string(),
+                start: None,
+                end: None,
+            },
+        ];
+        record.saa_status = SpeakerAttributedAsrStatus::Warning;
+        record.saa_warnings = vec!["Expected 3 speakers but Granite emitted 2.".to_string()];
+
+        let created = store
+            .create_record(record)
+            .await
+            .expect("record should be created");
+
+        assert_eq!(
+            created.transcription_mode,
+            TranscriptionRecordMode::SpeakerAttributedAsr
+        );
+        assert_eq!(
+            created.speaker_attributed_text.as_deref(),
+            Some("[Speaker 1]: hello [Speaker 2]: hi there")
+        );
+        assert_eq!(created.speaker_turns.len(), 2);
+        assert_eq!(created.saa_status, SpeakerAttributedAsrStatus::Warning);
+        assert_eq!(created.saa_warnings.len(), 1);
+
+        let (summaries, _) = store
+            .list_records_page(10, None)
+            .await
+            .expect("summary should load");
+        assert_eq!(
+            summaries[0].transcription_mode,
+            TranscriptionRecordMode::SpeakerAttributedAsr
+        );
+        assert_eq!(summaries[0].speaker_turn_count, 2);
+        assert_eq!(
+            summaries[0].speaker_attributed_text_preview.as_deref(),
+            Some("[Speaker 1]: hello [Speaker 2]: hi there")
+        );
 
         std::fs::remove_dir_all(root).expect("test temp dir should be removable");
     }
@@ -1311,6 +1636,7 @@ mod tests {
             .complete_record(
                 created.id.clone(),
                 CompleteTranscriptionRecord {
+                    transcription_mode: TranscriptionRecordMode::Transcription,
                     model_id: Some("Parakeet-TDT-0.6B-v3".to_string()),
                     aligner_model_id: Some("Qwen3-ForcedAligner-0.6B".to_string()),
                     language: Some("English".to_string()),
@@ -1330,6 +1656,10 @@ mod tests {
                         start: 0.0,
                         end: 0.4,
                     }],
+                    speaker_attributed_text: None,
+                    speaker_turns: Vec::new(),
+                    saa_status: SpeakerAttributedAsrStatus::NotRequested,
+                    saa_warnings: Vec::new(),
                     summary_status: TranscriptionSummaryStatus::Pending,
                     summary_model_id: Some("Qwen3.5-4B".to_string()),
                     summary_text: None,
@@ -1383,7 +1713,10 @@ mod tests {
             .expect("summary update should succeed")
             .expect("ready record should accept summary updates");
         assert_eq!(summarized.summary_status, TranscriptionSummaryStatus::Ready);
-        assert_eq!(summarized.summary_text.as_deref(), Some("A concise summary."));
+        assert_eq!(
+            summarized.summary_text.as_deref(),
+            Some("A concise summary.")
+        );
 
         std::fs::remove_dir_all(root).expect("test temp dir should be removable");
     }

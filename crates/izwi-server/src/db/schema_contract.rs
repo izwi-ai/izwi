@@ -1,5 +1,5 @@
 use crate::{db::raw, voice_defaults::DEFAULT_VOICE_PROFILE_ID};
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend};
 use std::collections::HashSet;
 
@@ -102,6 +102,7 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
         columns: &[
             "id",
             "created_at",
+            "transcription_mode",
             "model_id",
             "aligner_model_id",
             "language",
@@ -117,6 +118,10 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "transcription",
             "segments_json",
             "words_json",
+            "speaker_attributed_text",
+            "speaker_turns_json",
+            "saa_status",
+            "saa_warnings_json",
             "summary_status",
             "summary_model_id",
             "summary_text",
