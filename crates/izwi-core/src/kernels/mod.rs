@@ -172,6 +172,34 @@ pub fn try_fused_rope_pair_bshd(
     None
 }
 
+pub fn try_fused_decode_gqa_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+) -> Option<Tensor> {
+    if !use_fused_kernels_for_device(q.device()) {
+        return None;
+    }
+
+    if q.device().is_metal() {
+        return metal::try_fused_decode_gqa_attention(
+            q,
+            k,
+            v,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        );
+    }
+
+    None
+}
+
 pub fn try_fused_gated_rms_norm(
     hidden: &Tensor,
     gate: &Tensor,

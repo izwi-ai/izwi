@@ -13,7 +13,8 @@ use candle_nn::{
 use crate::backends::DeviceProfile;
 use crate::error::{Error, Result};
 use crate::kernels::{
-    try_fused_rms_norm, try_fused_rope_pair_bshd, try_fused_silu_mul_with_status,
+    try_fused_decode_gqa_attention, try_fused_rms_norm, try_fused_rope_pair_bshd,
+    try_fused_silu_mul_with_status,
 };
 use crate::models::architectures::qwen3::core::{causal_mask, repeat_kv, Qwen3Cache};
 use crate::models::shared::attention::flash::{
@@ -2571,6 +2572,20 @@ fn granite_dense_head_decode_policy(is_metal: bool, is_cuda: bool) -> bool {
     is_metal || is_cuda
 }
 
+fn granite_decode_gqa_kernel_enabled(device: &Device, dtype: DType, total_len: usize) -> bool {
+    let override_enabled = std::env::var("IZWI_GRANITE_DECODE_GQA_KERNEL")
+        .ok()
+        .and_then(|raw| parse_env_bool(&raw));
+    if !granite_decode_gqa_kernel_policy(device.is_metal(), override_enabled) {
+        return false;
+    }
+    total_len > 0 && total_len <= 2048 && matches!(dtype, DType::F16 | DType::F32)
+}
+
+fn granite_decode_gqa_kernel_policy(is_metal: bool, override_enabled: Option<bool>) -> bool {
+    override_enabled.unwrap_or(is_metal)
+}
+
 fn granite_qformer_fused_attention_allowed(device: &Device) -> bool {
     device.is_cuda()
 }
@@ -2788,6 +2803,23 @@ fn dense_decode_attention_heads_scaled(
     attention_multiplier: f32,
 ) -> Result<(Tensor, GraniteDenseDecodeAttentionKernel)> {
     let q_heads = q.transpose(1, 2)?.contiguous()?;
+    if granite_decode_gqa_kernel_enabled(q.device(), q_heads.dtype(), k_heads.dim(2)?) {
+        if let Some(out) = try_fused_decode_gqa_attention(
+            &q_heads,
+            k_heads,
+            v_heads,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            attention_multiplier,
+        ) {
+            let out = out
+                .transpose(1, 2)?
+                .reshape((q.dim(0)?, q.dim(1)?, num_heads, head_dim))
+                .map_err(Error::from)?;
+            return Ok((out, GraniteDenseDecodeAttentionKernel::Fused));
+        }
+    }
     if let Some(out) = try_fused_self_attention_scaled(
         &q_heads,
         k_heads,
@@ -3546,6 +3578,14 @@ mod tests {
         assert!(granite_dense_head_decode_policy(true, false));
         assert!(granite_dense_head_decode_policy(false, true));
         assert!(granite_dense_head_decode_policy(true, true));
+    }
+
+    #[test]
+    fn granite_decode_gqa_kernel_defaults_to_metal_only() {
+        assert!(granite_decode_gqa_kernel_policy(true, None));
+        assert!(!granite_decode_gqa_kernel_policy(false, None));
+        assert!(granite_decode_gqa_kernel_policy(false, Some(true)));
+        assert!(!granite_decode_gqa_kernel_policy(true, Some(false)));
     }
 
     #[test]
