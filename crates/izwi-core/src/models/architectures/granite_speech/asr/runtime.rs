@@ -476,6 +476,32 @@ fn granite_f16_lm_head_policy(
     override_enabled.unwrap_or(is_metal && dtype == DType::F32)
 }
 
+fn granite_rope_cache_attention_dtype_enabled(device: &Device) -> bool {
+    let override_enabled = std::env::var("IZWI_GRANITE_ROPE_CACHE_ATTENTION_DTYPE")
+        .ok()
+        .and_then(|raw| parse_env_bool(&raw));
+    granite_rope_cache_attention_dtype_policy(device.is_metal(), override_enabled)
+}
+
+fn granite_rope_cache_attention_dtype_policy(
+    is_metal: bool,
+    override_enabled: Option<bool>,
+) -> bool {
+    override_enabled.unwrap_or(is_metal)
+}
+
+fn granite_rope_cache_dtype(
+    model_dtype: DType,
+    f16_attention_core: bool,
+    use_attention_dtype: bool,
+) -> DType {
+    if use_attention_dtype && f16_attention_core {
+        DType::F16
+    } else {
+        model_dtype
+    }
+}
+
 fn granite_cached_linear_t_enabled(device: &Device) -> bool {
     let override_enabled = std::env::var("IZWI_GRANITE_CACHED_LINEAR_T")
         .ok()
@@ -1842,12 +1868,17 @@ impl GraniteLanguageModel {
         let Some(layer) = self.layers.first() else {
             return Ok(None);
         };
+        let dtype = granite_rope_cache_dtype(
+            self.embed_tokens.embeddings().dtype(),
+            layer.self_attn.f16_attention_core,
+            granite_rope_cache_attention_dtype_enabled(&self.device),
+        );
         GraniteRopeCache::build(
             total_len,
             layer.self_attn.head_dim,
             layer.self_attn.rope_theta,
             &self.device,
-            self.embed_tokens.embeddings().dtype(),
+            dtype,
         )
         .map(Some)
     }
@@ -3765,6 +3796,36 @@ mod tests {
         assert!(!granite_f16_lm_head_policy(false, DType::F32, None));
         assert!(granite_f16_lm_head_policy(false, DType::F32, Some(true)));
         assert!(!granite_f16_lm_head_policy(true, DType::F32, Some(false)));
+    }
+
+    #[test]
+    fn rope_cache_dtype_tracks_attention_core_dtype() {
+        assert!(granite_rope_cache_attention_dtype_policy(true, None));
+        assert!(!granite_rope_cache_attention_dtype_policy(false, None));
+        assert!(granite_rope_cache_attention_dtype_policy(
+            false,
+            Some(true)
+        ));
+        assert!(!granite_rope_cache_attention_dtype_policy(
+            true,
+            Some(false)
+        ));
+        assert_eq!(
+            granite_rope_cache_dtype(DType::F32, false, true),
+            DType::F32
+        );
+        assert_eq!(
+            granite_rope_cache_dtype(DType::F16, false, true),
+            DType::F16
+        );
+        assert_eq!(
+            granite_rope_cache_dtype(DType::F32, true, true),
+            DType::F16
+        );
+        assert_eq!(
+            granite_rope_cache_dtype(DType::F32, true, false),
+            DType::F32
+        );
     }
 
     #[test]
