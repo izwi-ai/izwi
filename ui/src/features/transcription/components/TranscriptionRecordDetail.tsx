@@ -9,7 +9,10 @@ import {
   Trash2,
 } from "lucide-react";
 
-import { type TranscriptionRecord } from "@/api";
+import {
+  type TranscriptionProcessingProgress,
+  type TranscriptionRecord,
+} from "@/api";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import {
@@ -43,6 +46,95 @@ interface TranscriptionRecordDetailProps {
   summaryRefreshError?: string | null;
 }
 
+function progressPhaseLabel(
+  progress: TranscriptionProcessingProgress | null | undefined,
+): string {
+  switch (progress?.phase) {
+    case "chunk_started":
+    case "chunk_finished":
+      return "Transcribing audio";
+    case "aligning":
+      return "Aligning timestamps";
+    case "complete":
+      return "Finalizing transcript";
+    case "processing":
+    default:
+      return "Preparing transcription";
+  }
+}
+
+function clampProgressPercent(
+  progress: TranscriptionProcessingProgress | null | undefined,
+): number | null {
+  const percent = progress?.percent;
+  if (typeof percent !== "number" || !Number.isFinite(percent)) {
+    return null;
+  }
+  return Math.min(100, Math.max(0, percent));
+}
+
+function progressDetailLabel(
+  progress: TranscriptionProcessingProgress | null | undefined,
+): string | null {
+  const currentChunk = progress?.current_chunk;
+  const totalChunks = progress?.total_chunks;
+  if (
+    typeof currentChunk === "number" &&
+    typeof totalChunks === "number" &&
+    currentChunk > 0 &&
+    totalChunks > 0
+  ) {
+    return `Chunk ${currentChunk} of ${totalChunks}`;
+  }
+
+  const percent = clampProgressPercent(progress);
+  return percent === null ? null : `${Math.round(percent)}%`;
+}
+
+function ProcessingProgressCard({
+  progress,
+}: {
+  progress: TranscriptionProcessingProgress | null | undefined;
+}) {
+  const percent = clampProgressPercent(progress);
+  const detail = progressDetailLabel(progress);
+
+  return (
+    <Card className="border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] p-4 text-sm text-[var(--status-warning-text)]">
+      <div className="flex items-start gap-3">
+        <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin" />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center justify-between gap-3">
+            <p className="font-medium">{progressPhaseLabel(progress)}</p>
+            {detail ? (
+              <span className="shrink-0 text-xs text-[var(--text-muted)]">
+                {detail}
+              </span>
+            ) : null}
+          </div>
+          <div
+            className="mt-3 h-2 overflow-hidden rounded-full bg-[var(--border-muted)]"
+            role="progressbar"
+            aria-label="ASR processing progress"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={percent ?? undefined}
+          >
+            <div
+              className={
+                percent === null
+                  ? "h-full w-1/3 animate-pulse rounded-full bg-[var(--status-warning-text)]"
+                  : "h-full rounded-full bg-[var(--status-warning-text)] transition-[width] duration-300"
+              }
+              style={percent === null ? undefined : { width: `${percent}%` }}
+            />
+          </div>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
 export function TranscriptionRecordDetail({
   record,
   audioUrl,
@@ -73,19 +165,13 @@ export function TranscriptionRecordDetail({
     () => (record?.transcription ?? "").trim().length > 0,
     [record?.transcription],
   );
-  const statusMessage = useMemo(() => {
-    switch (processingStatus) {
-      case "pending":
-        return "This transcription is queued and will begin processing shortly.";
-      case "processing":
-        return "This transcription is currently being processed. Results will appear here automatically.";
-      case "failed":
-        return record?.processing_error || "Transcription processing failed.";
-      case "ready":
-      default:
-        return null;
-    }
-  }, [processingStatus, record?.processing_error]);
+  const statusMessage = useMemo(
+    () =>
+      processingStatus === "failed"
+        ? record?.processing_error || "Transcription processing failed."
+        : null,
+    [processingStatus, record?.processing_error],
+  );
 
   async function handleCopy(): Promise<void> {
     if (!exportText) {
@@ -193,20 +279,14 @@ export function TranscriptionRecordDetail({
             </Card>
           ) : null}
 
+          {processingStatus === "pending" || processingStatus === "processing" ? (
+            <ProcessingProgressCard progress={record?.processing_progress} />
+          ) : null}
+
           {statusMessage ? (
-            <Card
-              className={
-                processingStatus === "failed"
-                  ? "border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]"
-                  : "border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] p-4 text-sm text-[var(--status-warning-text)]"
-              }
-            >
+            <Card className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]">
               <div className="flex items-start gap-3">
-                {processingStatus === "failed" ? (
-                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-                ) : (
-                  <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin" />
-                )}
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
                 <p>{statusMessage}</p>
               </div>
             </Card>

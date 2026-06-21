@@ -882,6 +882,7 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     const onUploadProgress = vi.fn();
     const onCreated = vi.fn();
     const onDelta = vi.fn();
+    const onProgress = vi.fn();
     const onDone = vi.fn();
 
     client.createTranscriptionRecordStream(
@@ -897,6 +898,7 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
         onUploadProgress,
         onCreated,
         onDelta,
+        onProgress,
         onDone,
       },
     );
@@ -917,6 +919,19 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     xhr.appendResponse(
       `data: ${JSON.stringify({ event: "delta", delta: "Hello" })}\n\n`,
     );
+    xhr.appendResponse(
+      `data: ${JSON.stringify({
+        event: "progress",
+        progress: {
+          phase: "chunk_finished",
+          current_chunk: 1,
+          total_chunks: 2,
+          processed_audio_secs: 5,
+          total_audio_secs: 10,
+          percent: 50,
+        },
+      })}\n\n`,
+    );
     xhr.appendResponse(`data: ${JSON.stringify({ event: "done" })}\n\n`);
     xhr.complete();
 
@@ -928,6 +943,14 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     });
     expect(onCreated).toHaveBeenCalledWith(createdTranscriptionRecord);
     expect(onDelta).toHaveBeenCalledWith("Hello");
+    expect(onProgress).toHaveBeenCalledWith({
+      phase: "chunk_finished",
+      current_chunk: 1,
+      total_chunks: 2,
+      processed_audio_secs: 5,
+      total_audio_secs: 10,
+      percent: 50,
+    });
     expect(onDone).toHaveBeenCalledTimes(1);
   });
 

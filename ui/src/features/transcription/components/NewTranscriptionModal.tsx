@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Check, Loader2, Upload } from "lucide-react";
 
-import { api, type TranscriptionRecord } from "@/api";
+import {
+  api,
+  type TranscriptionProcessingProgress,
+  type TranscriptionRecord,
+} from "@/api";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -54,6 +58,7 @@ interface NewTranscriptionModalProps {
   onCreated: (record: TranscriptionRecord) => Promise<void> | void;
   onStreamingStart?: () => void;
   onStreamingDelta?: (delta: string) => void;
+  onStreamingProgress?: (progress: TranscriptionProcessingProgress) => void;
   onStreamingFinal?: (record: TranscriptionRecord) => void;
   onStreamingError?: (message: string) => void;
   onStreamingDone?: () => void;
@@ -87,6 +92,7 @@ export function NewTranscriptionModal({
   onCreated,
   onStreamingStart,
   onStreamingDelta,
+  onStreamingProgress,
   onStreamingFinal,
   onStreamingError,
   onStreamingDone,
@@ -265,6 +271,9 @@ export function NewTranscriptionModal({
                 onDelta: (delta) => {
                   onStreamingDelta?.(delta);
                 },
+                onProgress: (progress) => {
+                  onStreamingProgress?.(progress);
+                },
                 onFinal: (finalRecord) => {
                   onStreamingFinal?.(finalRecord);
                 },
@@ -366,6 +375,7 @@ export function NewTranscriptionModal({
       onStreamingDone,
       onStreamingError,
       onStreamingFinal,
+      onStreamingProgress,
       onStreamingStart,
       requireReadyModel,
       requireTimestampAligner,
