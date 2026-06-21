@@ -242,15 +242,21 @@ fn granite_projection_fusion_enabled(device: &Device) -> bool {
     let override_enabled = std::env::var("IZWI_GRANITE_PROJECTION_FUSION")
         .ok()
         .and_then(|raw| parse_env_bool(&raw));
-    granite_projection_fusion_policy(device.is_metal(), device.is_cuda(), override_enabled)
+    granite_projection_fusion_policy(
+        device.is_metal(),
+        device.is_cuda(),
+        device.is_cpu(),
+        override_enabled,
+    )
 }
 
 fn granite_projection_fusion_policy(
     is_metal: bool,
     is_cuda: bool,
+    is_cpu: bool,
     override_enabled: Option<bool>,
 ) -> bool {
-    override_enabled.unwrap_or(is_metal || is_cuda)
+    override_enabled.unwrap_or(is_metal || is_cuda || is_cpu)
 }
 
 fn granite_gate_up_projection_fusion_enabled(device: &Device) -> bool {
@@ -258,15 +264,21 @@ fn granite_gate_up_projection_fusion_enabled(device: &Device) -> bool {
         .ok()
         .or_else(|| std::env::var("IZWI_GRANITE_PROJECTION_FUSION").ok())
         .and_then(|raw| parse_env_bool(&raw));
-    granite_gate_up_projection_fusion_policy(device.is_metal(), device.is_cuda(), override_enabled)
+    granite_gate_up_projection_fusion_policy(
+        device.is_metal(),
+        device.is_cuda(),
+        device.is_cpu(),
+        override_enabled,
+    )
 }
 
 fn granite_gate_up_projection_fusion_policy(
     is_metal: bool,
     is_cuda: bool,
+    is_cpu: bool,
     override_enabled: Option<bool>,
 ) -> bool {
-    override_enabled.unwrap_or(is_metal || is_cuda)
+    override_enabled.unwrap_or(is_metal || is_cuda || is_cpu)
 }
 
 fn granite_rope_kernel_enabled(device: &Device, dtype: DType, head_dim: usize) -> bool {
@@ -3316,22 +3328,41 @@ mod tests {
 
     #[test]
     fn granite_projection_fusion_defaults_to_accelerated_backends() {
-        assert!(granite_projection_fusion_policy(true, false, None));
-        assert!(granite_projection_fusion_policy(false, true, None));
-        assert!(granite_projection_fusion_policy(true, true, None));
-        assert!(!granite_projection_fusion_policy(false, false, None));
-        assert!(granite_projection_fusion_policy(false, false, Some(true)));
-        assert!(!granite_projection_fusion_policy(true, true, Some(false)));
+        assert!(granite_projection_fusion_policy(true, false, false, None));
+        assert!(granite_projection_fusion_policy(false, true, false, None));
+        assert!(granite_projection_fusion_policy(false, false, true, None));
+        assert!(granite_projection_fusion_policy(true, true, false, None));
+        assert!(!granite_projection_fusion_policy(false, false, false, None));
+        assert!(granite_projection_fusion_policy(
+            false,
+            false,
+            false,
+            Some(true)
+        ));
+        assert!(!granite_projection_fusion_policy(
+            true,
+            true,
+            true,
+            Some(false)
+        ));
     }
 
     #[test]
     fn granite_gate_up_projection_fusion_defaults_to_accelerated_backends() {
-        assert!(granite_gate_up_projection_fusion_policy(true, false, None));
-        assert!(granite_gate_up_projection_fusion_policy(false, true, None));
-        assert!(!granite_gate_up_projection_fusion_policy(
-            false, false, None
+        assert!(granite_gate_up_projection_fusion_policy(
+            true, false, false, None
         ));
         assert!(granite_gate_up_projection_fusion_policy(
+            false, true, false, None
+        ));
+        assert!(granite_gate_up_projection_fusion_policy(
+            false, false, true, None
+        ));
+        assert!(!granite_gate_up_projection_fusion_policy(
+            false, false, false, None
+        ));
+        assert!(granite_gate_up_projection_fusion_policy(
+            false,
             false,
             false,
             Some(true)
@@ -3339,6 +3370,7 @@ mod tests {
         assert!(!granite_gate_up_projection_fusion_policy(
             true,
             false,
+            true,
             Some(false)
         ));
     }
@@ -3802,10 +3834,7 @@ mod tests {
     fn rope_cache_dtype_tracks_attention_core_dtype() {
         assert!(granite_rope_cache_attention_dtype_policy(true, None));
         assert!(!granite_rope_cache_attention_dtype_policy(false, None));
-        assert!(granite_rope_cache_attention_dtype_policy(
-            false,
-            Some(true)
-        ));
+        assert!(granite_rope_cache_attention_dtype_policy(false, Some(true)));
         assert!(!granite_rope_cache_attention_dtype_policy(
             true,
             Some(false)
@@ -3818,10 +3847,7 @@ mod tests {
             granite_rope_cache_dtype(DType::F16, false, true),
             DType::F16
         );
-        assert_eq!(
-            granite_rope_cache_dtype(DType::F32, true, true),
-            DType::F16
-        );
+        assert_eq!(granite_rope_cache_dtype(DType::F32, true, true), DType::F16);
         assert_eq!(
             granite_rope_cache_dtype(DType::F32, true, false),
             DType::F32
