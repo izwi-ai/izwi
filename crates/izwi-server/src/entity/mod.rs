@@ -156,6 +156,7 @@ pub mod transcription_records {
         pub language: Option<String>,
         pub processing_status: String,
         pub processing_error: Option<String>,
+        pub processing_progress_json: Option<String>,
         pub duration_secs: Option<f64>,
         pub processing_time_ms: f64,
         pub rtf: Option<f64>,

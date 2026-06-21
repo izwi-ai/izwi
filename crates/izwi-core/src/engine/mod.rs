@@ -55,7 +55,7 @@ pub use metrics::{
     ENGINE_SCHEDULER_RUNNING_REQUESTS, ENGINE_SCHEDULER_STEP_TOKENS_TOTAL,
     ENGINE_STREAM_BACKPRESSURE_TOTAL,
 };
-pub use output::{OutputProcessor, StreamingOutput};
+pub use output::{AsrProgress, AsrProgressPhase, OutputProcessor, StreamingOutput};
 pub use request::{
     AsrEngineInput, AudioChatEngineInput, ChatEngineInput, EngineAudioInput, EngineCoreRequest,
     EngineStreamPolicy, EngineTask, RequestProcessor, RequestStatus, TtsEngineInput,

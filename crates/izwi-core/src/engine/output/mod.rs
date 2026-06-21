@@ -11,8 +11,10 @@ use tracing::debug;
 use super::executor::ExecutorOutput;
 use super::types::{AudioOutput, EngineOutput, FinishReason, RequestId, SequenceId, TokenStats};
 
+use serde::{Deserialize, Serialize};
+
 /// Coarse ASR processing progress for long-form and streaming transcription.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AsrProgress {
     /// Current processing phase.
     pub phase: AsrProgressPhase,
@@ -29,11 +31,13 @@ pub struct AsrProgress {
 }
 
 /// ASR progress phase.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AsrProgressPhase {
     Processing,
     ChunkStarted,
     ChunkFinished,
+    Aligning,
     Complete,
 }
 

@@ -107,6 +107,7 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "language",
             "processing_status",
             "processing_error",
+            "processing_progress_json",
             "duration_secs",
             "processing_time_ms",
             "rtf",

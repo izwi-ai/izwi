@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::catalog::{parse_model_variant, resolve_asr_model_variant, ModelFamily};
-use crate::engine::EngineCoreRequest;
+use crate::engine::{AsrProgress, EngineCoreRequest};
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
 use crate::models::registry::{NativeAsrModel, NativeAsrRealtimeEvent, NativeAsrRealtimeState};
@@ -552,10 +552,42 @@ impl RuntimeService {
         prompt: Option<&str>,
         max_tokens: Option<usize>,
         correlation_id: Option<&str>,
-        mut on_delta: F,
+        on_delta: F,
     ) -> Result<AsrTranscription>
     where
         F: FnMut(String) + Send + 'static,
+    {
+        self.asr_transcribe_bytes_with_variant_streaming_and_prompt_options_with_progress(
+            variant,
+            audio_bytes,
+            language,
+            prompt,
+            max_tokens,
+            correlation_id,
+            on_delta,
+            |_progress| {},
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn asr_transcribe_bytes_with_variant_streaming_and_prompt_options_with_progress<
+        F,
+        P,
+    >(
+        &self,
+        variant: ModelVariant,
+        audio_bytes: &[u8],
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_tokens: Option<usize>,
+        correlation_id: Option<&str>,
+        mut on_delta: F,
+        mut on_progress: P,
+    ) -> Result<AsrTranscription>
+    where
+        F: FnMut(String) + Send + 'static,
+        P: FnMut(AsrProgress) + Send + 'static,
     {
         if variant.is_audio_chat() {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), true)?;
@@ -577,6 +609,9 @@ impl RuntimeService {
         let mut streamed_text = String::new();
         let output = self
             .run_streaming_request(request, |chunk| {
+                if let Some(progress) = chunk.asr_progress {
+                    on_progress(progress);
+                }
                 if let Some(delta) = chunk.text {
                     if !delta.is_empty() {
                         streamed_text.push_str(&delta);
@@ -934,6 +969,34 @@ impl RuntimeService {
             max_tokens,
             correlation_id,
             on_delta,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn asr_transcribe_streaming_bytes_with_progress_and_correlation<F, P>(
+        &self,
+        audio_bytes: &[u8],
+        model_id: Option<&str>,
+        language: Option<&str>,
+        correlation_id: Option<&str>,
+        on_delta: F,
+        on_progress: P,
+    ) -> Result<AsrTranscription>
+    where
+        F: FnMut(String) + Send + 'static,
+        P: FnMut(AsrProgress) + Send + 'static,
+    {
+        let variant = resolve_asr_model_variant(model_id);
+        self.asr_transcribe_bytes_with_variant_streaming_and_prompt_options_with_progress(
+            variant,
+            audio_bytes,
+            language,
+            None,
+            None,
+            correlation_id,
+            on_delta,
+            on_progress,
         )
         .await
     }

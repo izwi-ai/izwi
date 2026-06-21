@@ -2,6 +2,7 @@
 
 use anyhow::{anyhow, Context};
 use izwi_hooks::{HookMetadata, MediaNamespace, MediaStorageProvider};
+use izwi_core::AsrProgress;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryResult, Set};
 use serde::{Deserialize, Serialize};
@@ -97,6 +98,7 @@ pub struct TranscriptionRecordSummary {
     pub language: Option<String>,
     pub processing_status: TranscriptionProcessingStatus,
     pub processing_error: Option<String>,
+    pub processing_progress: Option<AsrProgress>,
     pub duration_secs: Option<f64>,
     pub processing_time_ms: f64,
     pub rtf: Option<f64>,
@@ -124,6 +126,7 @@ pub struct TranscriptionRecord {
     pub language: Option<String>,
     pub processing_status: TranscriptionProcessingStatus,
     pub processing_error: Option<String>,
+    pub processing_progress: Option<AsrProgress>,
     pub duration_secs: Option<f64>,
     pub processing_time_ms: f64,
     pub rtf: Option<f64>,
@@ -153,6 +156,7 @@ pub struct NewTranscriptionRecord {
     pub language: Option<String>,
     pub processing_status: TranscriptionProcessingStatus,
     pub processing_error: Option<String>,
+    pub processing_progress: Option<AsrProgress>,
     pub duration_secs: Option<f64>,
     pub processing_time_ms: f64,
     pub rtf: Option<f64>,
@@ -331,6 +335,8 @@ impl TranscriptionStore {
         let processing_error = sanitize_optional_text(record.processing_error.as_deref(), 1_000);
         let processing_status =
             normalize_processing_status(record.processing_status, processing_error.as_deref());
+        let processing_progress_json =
+            serialize_processing_progress(record.processing_progress.as_ref())?;
         let duration_secs = record.duration_secs.filter(|v| v.is_finite() && *v >= 0.0);
         let processing_time_ms = if record.processing_time_ms.is_finite() {
             record.processing_time_ms.max(0.0)
@@ -388,6 +394,7 @@ impl TranscriptionStore {
                 language: Set(language),
                 processing_status: Set(processing_status.as_db_value().to_string()),
                 processing_error: Set(processing_error),
+                processing_progress_json: Set(processing_progress_json),
                 duration_secs: Set(duration_secs),
                 processing_time_ms: Set(processing_time_ms),
                 rtf: Set(rtf),
@@ -460,6 +467,10 @@ impl TranscriptionStore {
                 Expr::value(summary_updated_at),
             )
             .filter(transcription_records::Column::Id.eq(record_id.clone()))
+            .filter(transcription_records::Column::ProcessingStatus.is_in([
+                TranscriptionProcessingStatus::Pending.as_db_value(),
+                TranscriptionProcessingStatus::Processing.as_db_value(),
+            ]))
             .exec(db)
             .await
             .context("Failed to update transcription summary")?;
@@ -491,6 +502,28 @@ impl TranscriptionStore {
             .exec(db)
             .await
             .context("Failed to update transcription processing status")?;
+        if result.rows_affected == 0 {
+            return Ok(None);
+        }
+        fetch_record_without_audio(db, &record_id).await
+    }
+
+    pub async fn update_processing_progress(
+        &self,
+        record_id: String,
+        progress: Option<AsrProgress>,
+    ) -> anyhow::Result<Option<TranscriptionRecord>> {
+        let db = self.db.connection().await?;
+        let processing_progress_json = serialize_processing_progress(progress.as_ref())?;
+        let result = transcription_records::Entity::update_many()
+            .col_expr(
+                transcription_records::Column::ProcessingProgressJson,
+                Expr::value(processing_progress_json),
+            )
+            .filter(transcription_records::Column::Id.eq(record_id.clone()))
+            .exec(db)
+            .await
+            .context("Failed to update transcription processing progress")?;
         if result.rows_affected == 0 {
             return Ok(None);
         }
@@ -547,6 +580,10 @@ impl TranscriptionStore {
             )
             .col_expr(
                 transcription_records::Column::ProcessingError,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                transcription_records::Column::ProcessingProgressJson,
                 Expr::value(Option::<String>::None),
             )
             .col_expr(
@@ -632,6 +669,7 @@ const TRANSCRIPTION_PAGE_SQL: &str = r#"
         language,
         processing_status,
         processing_error,
+        processing_progress_json,
         duration_secs,
         processing_time_ms,
         rtf,
@@ -653,6 +691,7 @@ const TRANSCRIPTION_PAGE_AFTER_CURSOR_SQL: &str = r#"
         language,
         processing_status,
         processing_error,
+        processing_progress_json,
         duration_secs,
         processing_time_ms,
         rtf,
@@ -675,6 +714,7 @@ const TRANSCRIPTION_RECORD_COLUMNS: &str = r#"
     language,
     processing_status,
     processing_error,
+    processing_progress_json,
     duration_secs,
     processing_time_ms,
     rtf,
@@ -710,9 +750,10 @@ async fn fetch_record_without_audio(
 fn map_transcription_summary(row: &QueryResult) -> anyhow::Result<TranscriptionRecordSummary> {
     let processing_status = parse_processing_status(row.try_get_by_index(4)?);
     let processing_error: Option<String> = row.try_get_by_index(5)?;
-    let transcription: String = row.try_get_by_index(11)?;
-    let summary_status = parse_summary_status(row.try_get_by_index(12)?);
-    let summary_text: Option<String> = row.try_get_by_index(13)?;
+    let processing_progress = parse_processing_progress(row.try_get_by_index(6)?);
+    let transcription: String = row.try_get_by_index(12)?;
+    let summary_status = parse_summary_status(row.try_get_by_index(13)?);
+    let summary_text: Option<String> = row.try_get_by_index(14)?;
     Ok(TranscriptionRecordSummary {
         id: row.try_get_by_index(0)?,
         created_at: i64_to_u64(row.try_get_by_index(1)?),
@@ -720,11 +761,12 @@ fn map_transcription_summary(row: &QueryResult) -> anyhow::Result<TranscriptionR
         language: row.try_get_by_index(3)?,
         processing_status,
         processing_error: processing_error.clone(),
-        duration_secs: row.try_get_by_index(6)?,
-        processing_time_ms: row.try_get_by_index(7)?,
-        rtf: row.try_get_by_index(8)?,
-        audio_mime_type: row.try_get_by_index(9)?,
-        audio_filename: row.try_get_by_index(10)?,
+        processing_progress,
+        duration_secs: row.try_get_by_index(7)?,
+        processing_time_ms: row.try_get_by_index(8)?,
+        rtf: row.try_get_by_index(9)?,
+        audio_mime_type: row.try_get_by_index(10)?,
+        audio_filename: row.try_get_by_index(11)?,
         transcription_preview: transcription_preview(
             processing_status,
             processing_error.as_deref(),
@@ -749,19 +791,20 @@ fn map_transcription_record(row: &QueryResult) -> anyhow::Result<TranscriptionRe
         language: row.try_get_by_index(4)?,
         processing_status: parse_processing_status(row.try_get_by_index(5)?),
         processing_error: row.try_get_by_index(6)?,
-        duration_secs: row.try_get_by_index(7)?,
-        processing_time_ms: row.try_get_by_index(8)?,
-        rtf: row.try_get_by_index(9)?,
-        audio_mime_type: row.try_get_by_index(10)?,
-        audio_filename: row.try_get_by_index(11)?,
-        transcription: row.try_get_by_index(12)?,
-        segments: parse_json_vec(row.try_get_by_index(13)?),
-        words: parse_json_vec(row.try_get_by_index(14)?),
-        summary_status: parse_summary_status(row.try_get_by_index(15)?),
-        summary_model_id: row.try_get_by_index(16)?,
-        summary_text: row.try_get_by_index(17)?,
-        summary_error: row.try_get_by_index(18)?,
-        summary_updated_at: row.try_get_by_index::<Option<i64>>(19)?.map(i64_to_u64),
+        processing_progress: parse_processing_progress(row.try_get_by_index(7)?),
+        duration_secs: row.try_get_by_index(8)?,
+        processing_time_ms: row.try_get_by_index(9)?,
+        rtf: row.try_get_by_index(10)?,
+        audio_mime_type: row.try_get_by_index(11)?,
+        audio_filename: row.try_get_by_index(12)?,
+        transcription: row.try_get_by_index(13)?,
+        segments: parse_json_vec(row.try_get_by_index(14)?),
+        words: parse_json_vec(row.try_get_by_index(15)?),
+        summary_status: parse_summary_status(row.try_get_by_index(16)?),
+        summary_model_id: row.try_get_by_index(17)?,
+        summary_text: row.try_get_by_index(18)?,
+        summary_error: row.try_get_by_index(19)?,
+        summary_updated_at: row.try_get_by_index::<Option<i64>>(20)?.map(i64_to_u64),
     })
 }
 
@@ -791,6 +834,34 @@ fn parse_summary_status(raw: Option<String>) -> TranscriptionSummaryStatus {
         "failed" => TranscriptionSummaryStatus::Failed,
         _ => TranscriptionSummaryStatus::NotRequested,
     }
+}
+
+fn parse_processing_progress(raw: Option<String>) -> Option<AsrProgress> {
+    raw.and_then(|value| serde_json::from_str::<AsrProgress>(value.as_str()).ok())
+        .map(sanitize_processing_progress)
+}
+
+fn serialize_processing_progress(progress: Option<&AsrProgress>) -> anyhow::Result<Option<String>> {
+    progress
+        .map(|value| {
+            serde_json::to_string(&sanitize_processing_progress(value.clone()))
+                .context("Failed serializing transcription processing progress")
+        })
+        .transpose()
+}
+
+fn sanitize_processing_progress(mut progress: AsrProgress) -> AsrProgress {
+    progress.processed_audio_secs = progress
+        .processed_audio_secs
+        .filter(|value| value.is_finite() && *value >= 0.0);
+    progress.total_audio_secs = progress
+        .total_audio_secs
+        .filter(|value| value.is_finite() && *value >= 0.0);
+    progress.percent = progress
+        .percent
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(0.0, 100.0));
+    progress
 }
 
 fn normalize_processing_status(
@@ -1008,6 +1079,7 @@ mod tests {
             language: Some("English".to_string()),
             processing_status: TranscriptionProcessingStatus::Ready,
             processing_error: None,
+            processing_progress: None,
             duration_secs: Some(6.0),
             processing_time_ms: 120.0,
             rtf: Some(0.5),
@@ -1197,6 +1269,7 @@ mod tests {
             TranscriptionProcessingStatus::Pending
         );
         assert_eq!(created.transcription, "");
+        assert!(created.processing_progress.is_none());
 
         let processing = store
             .update_processing_status(
@@ -1211,6 +1284,28 @@ mod tests {
             processing.processing_status,
             TranscriptionProcessingStatus::Processing
         );
+        assert!(processing.processing_progress.is_none());
+
+        let progress = AsrProgress {
+            phase: izwi_core::AsrProgressPhase::ChunkFinished,
+            current_chunk: Some(1),
+            total_chunks: Some(2),
+            processed_audio_secs: Some(3.0),
+            total_audio_secs: Some(6.0),
+            percent: Some(50.0),
+        };
+        let with_progress = store
+            .update_processing_progress(created.id.clone(), Some(progress.clone()))
+            .await
+            .expect("progress update should succeed")
+            .expect("record should exist");
+        assert_eq!(with_progress.processing_progress, Some(progress.clone()));
+
+        let (summaries, _) = store
+            .list_records_page(10, None)
+            .await
+            .expect("list should include progress");
+        assert_eq!(summaries[0].processing_progress, Some(progress));
 
         let completed = store
             .complete_record(
@@ -1251,6 +1346,7 @@ mod tests {
             TranscriptionProcessingStatus::Ready
         );
         assert!(completed.processing_error.is_none());
+        assert!(completed.processing_progress.is_none());
         assert_eq!(
             completed.summary_status,
             TranscriptionSummaryStatus::Pending
