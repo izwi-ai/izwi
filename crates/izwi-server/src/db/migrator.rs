@@ -138,6 +138,7 @@ const BASELINE_SCHEMA: &[&str] = &[
         language TEXT NULL,
         processing_status TEXT NOT NULL DEFAULT 'ready',
         processing_error TEXT NULL,
+        processing_progress_json TEXT NULL,
         duration_secs REAL NULL,
         processing_time_ms REAL NOT NULL,
         rtf REAL NULL,
@@ -354,6 +355,11 @@ const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
     CompatibilityColumn {
         table: "transcription_records",
         column: "processing_error",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "processing_progress_json",
         definition: "TEXT NULL",
     },
     CompatibilityColumn {

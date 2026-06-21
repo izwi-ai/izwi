@@ -308,6 +308,7 @@ fn map_transcription_summary(record: &TranscriptionRecordSummary) -> Value {
         "language": record.language,
         "processing_status": record.processing_status,
         "processing_error": record.processing_error,
+        "processing_progress": record.processing_progress,
         "duration_secs": record.duration_secs,
         "processing_time_ms": record.processing_time_ms,
         "rtf": record.rtf,

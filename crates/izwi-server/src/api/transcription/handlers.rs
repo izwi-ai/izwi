@@ -27,8 +27,8 @@ use crate::transcription_store::{
     TranscriptionSummaryStatus, TranscriptionWordRecord, UpdateTranscriptionSummary,
 };
 use izwi_core::{
-    parse_chat_model_variant, ChatMessage, ChatRequestConfig, ChatRole, GenerationParams,
-    ModelVariant, RuntimeService,
+    parse_chat_model_variant, AsrProgress, AsrProgressPhase, ChatMessage, ChatRequestConfig,
+    ChatRole, GenerationParams, ModelVariant, RuntimeService,
 };
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
@@ -98,6 +98,12 @@ struct StreamCreatedEvent {
 struct StreamDeltaEvent {
     event: &'static str,
     delta: String,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamProgressEvent {
+    event: &'static str,
+    progress: AsrProgress,
 }
 
 #[derive(Debug, Serialize)]
@@ -262,6 +268,7 @@ async fn create_pending_record(
             language: parsed.language.clone(),
             processing_status: TranscriptionProcessingStatus::Pending,
             processing_error: None,
+            processing_progress: None,
             duration_secs: None,
             processing_time_ms: 0.0,
             rtf: None,
@@ -332,9 +339,17 @@ fn spawn_transcription_processing_task(
                 None,
             )
             .await;
+        let initial_progress = transcription_processing_progress();
+        let _ = transcription_store
+            .update_processing_progress(record_id.clone(), Some(initial_progress.clone()))
+            .await;
+        send_event(progress_event_payload(initial_progress));
         send_event(serde_json::to_string(&StreamStartEvent { event: "start" }).unwrap_or_default());
 
         let delta_tx = event_tx.clone();
+        let progress_tx = event_tx.clone();
+        let progress_store = transcription_store.clone();
+        let progress_record_id = record_id.clone();
         let started = Instant::now();
         let model_id = parsed.model_id.clone();
         let aligner_model_id = parsed.aligner_model_id.clone();
@@ -408,6 +423,16 @@ fn spawn_transcription_processing_task(
                         .unwrap_or_default(),
                     );
                 }
+            },
+            move |progress| {
+                if let Some(tx) = &progress_tx {
+                    let _ = tx.send(progress_event_payload(progress.clone()));
+                }
+                let store = progress_store.clone();
+                let id = progress_record_id.clone();
+                tokio::spawn(async move {
+                    let _ = store.update_processing_progress(id, Some(progress)).await;
+                });
             },
         )
         .await;
@@ -511,7 +536,7 @@ fn spawn_transcription_processing_task(
     });
 }
 
-async fn generate_transcription_artifacts<F>(
+async fn generate_transcription_artifacts<F, P>(
     runtime: std::sync::Arc<izwi_core::RuntimeService>,
     audio_bytes: &[u8],
     model_id: Option<&str>,
@@ -520,17 +545,26 @@ async fn generate_transcription_artifacts<F>(
     include_timestamps: bool,
     correlation_id: Option<&str>,
     on_delta: F,
+    on_progress: P,
 ) -> Result<GeneratedTranscriptionArtifacts, ApiError>
 where
     F: FnMut(String) + Send + 'static,
+    P: FnMut(AsrProgress) + Send + 'static,
 {
+    let progress_callback = std::sync::Arc::new(std::sync::Mutex::new(on_progress));
+    let runtime_progress_callback = progress_callback.clone();
     let output = runtime
-        .asr_transcribe_streaming_bytes_with_correlation(
+        .asr_transcribe_streaming_bytes_with_progress_and_correlation(
             audio_bytes,
             model_id,
             requested_language,
             correlation_id,
             on_delta,
+            move |progress| {
+                if let Ok(mut callback) = runtime_progress_callback.lock() {
+                    callback(progress);
+                }
+            },
         )
         .await?;
 
@@ -541,6 +575,9 @@ where
 
     let (aligner_model_id, words, segments) =
         if include_timestamps && !output.text.trim().is_empty() {
+            if let Ok(mut callback) = progress_callback.lock() {
+                callback(transcription_aligning_progress(output.duration_secs));
+            }
             let resolved_aligner_model_id =
                 aligner_model_id.unwrap_or(DEFAULT_TRANSCRIPTION_ALIGNER_MODEL);
             let alignments = runtime
@@ -566,6 +603,41 @@ where
         segments,
         words,
     })
+}
+
+fn progress_event_payload(progress: AsrProgress) -> String {
+    serde_json::to_string(&StreamProgressEvent {
+        event: "progress",
+        progress,
+    })
+    .unwrap_or_default()
+}
+
+fn transcription_processing_progress() -> AsrProgress {
+    AsrProgress {
+        phase: AsrProgressPhase::Processing,
+        current_chunk: None,
+        total_chunks: None,
+        processed_audio_secs: None,
+        total_audio_secs: None,
+        percent: None,
+    }
+}
+
+fn transcription_aligning_progress(duration_secs: f32) -> AsrProgress {
+    let duration_secs = if duration_secs.is_finite() && duration_secs >= 0.0 {
+        Some(f64::from(duration_secs))
+    } else {
+        None
+    };
+    AsrProgress {
+        phase: AsrProgressPhase::Aligning,
+        current_chunk: None,
+        total_chunks: None,
+        processed_audio_secs: duration_secs,
+        total_audio_secs: duration_secs,
+        percent: Some(100.0),
+    }
 }
 
 async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateRequest, ApiError> {
@@ -1108,12 +1180,14 @@ mod tests {
     };
     use base64::Engine as _;
     use izwi_core::audio::{AudioEncoder, AudioFormat};
+    use izwi_core::{AsrProgress, AsrProgressPhase};
 
     use super::{
         alignments_to_word_records, build_segment_records, initial_summary_state,
-        multipart_field_api_error, parse_bool, parse_create_request, sanitize_summary_output,
-        should_retry_transcription_summary_generation, transcription_summary_messages,
-        transcription_summary_params, TranscriptionSummaryStatus, TranscriptionWordRecord,
+        multipart_field_api_error, parse_bool, parse_create_request, progress_event_payload,
+        sanitize_summary_output, should_retry_transcription_summary_generation,
+        transcription_summary_messages, transcription_summary_params, TranscriptionSummaryStatus,
+        TranscriptionWordRecord,
     };
 
     fn wav_bytes() -> Vec<u8> {
@@ -1277,6 +1351,26 @@ mod tests {
         assert!(parse_bool("YES"));
         assert!(parse_bool("1"));
         assert!(!parse_bool("false"));
+    }
+
+    #[test]
+    fn progress_event_payload_uses_sse_contract_shape() {
+        let payload = progress_event_payload(AsrProgress {
+            phase: AsrProgressPhase::ChunkFinished,
+            current_chunk: Some(1),
+            total_chunks: Some(2),
+            processed_audio_secs: Some(3.0),
+            total_audio_secs: Some(6.0),
+            percent: Some(50.0),
+        });
+        let value: serde_json::Value =
+            serde_json::from_str(payload.as_str()).expect("valid progress payload");
+
+        assert_eq!(value["event"], "progress");
+        assert_eq!(value["progress"]["phase"], "chunk_finished");
+        assert_eq!(value["progress"]["current_chunk"], 1);
+        assert_eq!(value["progress"]["total_chunks"], 2);
+        assert_eq!(value["progress"]["percent"], 50.0);
     }
 
     #[test]

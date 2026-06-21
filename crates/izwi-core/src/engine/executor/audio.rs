@@ -817,6 +817,7 @@ impl NativeExecutor {
                 f64::from(samples_to_seconds(chunk.end_sample, sample_rate))
             }
             AsrProgressPhase::Processing => 0.0,
+            AsrProgressPhase::Aligning => total_audio_secs.unwrap_or_default(),
             AsrProgressPhase::Complete => total_audio_secs.unwrap_or_default(),
         };
         let percent = total_audio_secs
