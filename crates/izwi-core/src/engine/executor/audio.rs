@@ -586,6 +586,7 @@ impl NativeExecutor {
                     sample_rate,
                     0.0,
                     "",
+                    "",
                     Some(json!({
                         "skipped": true,
                         "skip_reason": "invalid_bounds",
@@ -604,6 +605,7 @@ impl NativeExecutor {
                 chunk,
                 sample_rate,
                 transcribe_ms,
+                &prefix_text,
                 &chunk_text,
                 chunk_result.diagnostics,
             ));
@@ -695,6 +697,7 @@ impl NativeExecutor {
         chunk: &AudioChunk,
         sample_rate: u32,
         transcribe_ms: f64,
+        prefix_text: &str,
         text: &str,
         model_diagnostics: Option<serde_json::Value>,
     ) -> serde_json::Value {
@@ -708,6 +711,8 @@ impl NativeExecutor {
             "end_seconds": end_seconds,
             "duration_seconds": (end_seconds - start_seconds).max(0.0),
             "transcribe_ms": transcribe_ms,
+            "context_prefix_chars": prefix_text.chars().count(),
+            "context_prefix_words": prefix_text.split_whitespace().count(),
             "text_chars": text.chars().count(),
             "text_empty": text.trim().is_empty(),
         });
@@ -1227,6 +1232,8 @@ mod tests {
         assert_eq!(prefixes.len(), 2);
         assert!(prefixes[0].is_empty());
         assert!(prefixes[1].contains("chunk-0"));
+        assert_eq!(merged.chunk_diagnostics[0]["context_prefix_words"], 0);
+        assert_eq!(merged.chunk_diagnostics[1]["context_prefix_words"], 1);
         assert!(merged.text.contains("chunk-1"));
     }
 

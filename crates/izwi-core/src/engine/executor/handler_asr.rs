@@ -12,6 +12,8 @@ use super::state::ActiveAsrDecode;
 use super::{ExecutorOutput, NativeExecutor};
 
 const MAX_ASR_NEW_TOKENS: usize = 512;
+const GRANITE_ASR_PREFIX_REPLAY_WORDS: usize = 96;
+const GRANITE_ASR_PREFIX_REPLAY_WORDS_MAX: usize = 240;
 
 impl NativeExecutor {
     pub(super) fn transcribe_request(
@@ -343,8 +345,10 @@ impl NativeExecutor {
                     &chunk_plan.chunks,
                     &chunk_plan.config,
                     |chunk_audio, sr, prefix_text| {
-                        let prefix_text = matches!(family, ModelFamily::GraniteSpeechAsr)
-                            .then_some(prefix_text)
+                        let bounded_prefix_text = matches!(family, ModelFamily::GraniteSpeechAsr)
+                            .then(|| Self::granite_asr_prefix_replay_text(prefix_text));
+                        let prefix_text = bounded_prefix_text
+                            .as_deref()
                             .filter(|value| !value.trim().is_empty());
                         let chunk_generation_options = Self::asr_chunk_generation_options(
                             request,
@@ -498,6 +502,27 @@ impl NativeExecutor {
         options.max_new_tokens = options.max_new_tokens.max(1);
         options
     }
+
+    fn granite_asr_prefix_replay_words() -> usize {
+        Self::env_usize("IZWI_GRANITE_ASR_PREFIX_REPLAY_WORDS")
+            .unwrap_or(GRANITE_ASR_PREFIX_REPLAY_WORDS)
+            .min(GRANITE_ASR_PREFIX_REPLAY_WORDS_MAX)
+    }
+
+    fn granite_asr_prefix_replay_text(prefix_text: &str) -> String {
+        recent_word_suffix(prefix_text, Self::granite_asr_prefix_replay_words())
+    }
+}
+
+fn recent_word_suffix(text: &str, max_words: usize) -> String {
+    if max_words == 0 {
+        return String::new();
+    }
+    let words = text.split_whitespace().collect::<Vec<_>>();
+    if words.len() <= max_words {
+        return text.trim().to_string();
+    }
+    words[words.len() - max_words..].join(" ")
 }
 
 #[cfg(test)]
@@ -583,5 +608,20 @@ mod tests {
         );
 
         assert_eq!(options.max_new_tokens, 2048);
+    }
+
+    #[test]
+    fn granite_prefix_replay_text_keeps_recent_words() {
+        let prefix = (0..140)
+            .map(|idx| format!("word{idx}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let replay = NativeExecutor::granite_asr_prefix_replay_text(&prefix);
+        let words = replay.split_whitespace().collect::<Vec<_>>();
+
+        assert_eq!(words.len(), 96);
+        assert_eq!(words.first(), Some(&"word44"));
+        assert_eq!(words.last(), Some(&"word139"));
     }
 }
