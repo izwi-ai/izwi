@@ -361,6 +361,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "speech-to-text job",
         "List or create canonical saved transcription and diarization jobs.",
     );
+    add_speech_text_jobs_create_request_body(paths);
     add_get_patch_put_delete_member(
         paths,
         "/v1/speech-to-text/jobs/{record_id}",
@@ -1041,6 +1042,182 @@ fn add_collection(
         description,
         preview_response(),
     );
+}
+
+fn add_speech_text_jobs_create_request_body(paths: &mut Map<String, Value>) {
+    let Some(operation) = paths
+        .get_mut("/v1/speech-to-text/jobs")
+        .and_then(|path| path.get_mut("post"))
+    else {
+        return;
+    };
+
+    operation["requestBody"] = json!({
+        "required": true,
+        "content": {
+            "application/json": {
+                "schema": speech_text_job_create_json_schema()
+            },
+            "multipart/form-data": {
+                "schema": speech_text_job_create_multipart_schema()
+            }
+        }
+    });
+}
+
+fn speech_text_job_create_json_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Preview saved speech-to-text job creation request. Use job_kind=transcription for transcription jobs or job_kind=diarization for diarization jobs.",
+        "properties": speech_text_job_create_properties(false),
+    })
+}
+
+fn speech_text_job_create_multipart_schema() -> Value {
+    let mut properties = speech_text_job_create_properties(true);
+    properties.insert(
+        "file".to_string(),
+        json!({
+            "type": "string",
+            "format": "binary",
+            "description": "Audio file to upload."
+        }),
+    );
+    json!({
+        "type": "object",
+        "description": "Preview saved speech-to-text job multipart creation request.",
+        "properties": properties,
+    })
+}
+
+fn speech_text_job_create_properties(include_form_aliases: bool) -> Map<String, Value> {
+    let mut properties = Map::new();
+    properties.insert(
+        "audio_base64".to_string(),
+        json!({
+            "type": "string",
+            "description": "Base64 encoded audio payload."
+        }),
+    );
+    properties.insert(
+        "model".to_string(),
+        json!({
+            "type": "string",
+            "description": "Transcription ASR model or diarization model."
+        }),
+    );
+    properties.insert(
+        "model_id".to_string(),
+        json!({
+            "type": "string",
+            "description": "Alias for model on transcription jobs."
+        }),
+    );
+    properties.insert(
+        "aligner_model".to_string(),
+        json!({
+            "type": "string",
+            "description": "Optional forced aligner model for transcription timestamps or diarization alignment."
+        }),
+    );
+    properties.insert(
+        "aligner_model_id".to_string(),
+        json!({
+            "type": "string",
+            "description": "Alias for aligner_model."
+        }),
+    );
+    properties.insert(
+        "language".to_string(),
+        json!({
+            "type": "string",
+            "description": "Optional transcription language hint."
+        }),
+    );
+    properties.insert(
+        "include_timestamps".to_string(),
+        json!({
+            "type": "boolean",
+            "default": false,
+            "description": "For transcription jobs, include word and segment timestamps when an aligner is available."
+        }),
+    );
+    properties.insert(
+        "generate_summary".to_string(),
+        json!({
+            "type": "boolean",
+            "default": false,
+            "description": "For transcription jobs, generate an AI summary after the transcript is ready. Defaults to false."
+        }),
+    );
+    properties.insert(
+        "stream".to_string(),
+        json!({
+            "type": "boolean",
+            "default": false,
+            "description": "For transcription jobs, stream creation progress as server-sent events."
+        }),
+    );
+    properties.insert(
+        "asr_model".to_string(),
+        json!({
+            "type": "string",
+            "description": "Optional diarization ASR model override."
+        }),
+    );
+    properties.insert(
+        "llm_model".to_string(),
+        json!({
+            "type": "string",
+            "description": "Optional diarization transcript-refinement model."
+        }),
+    );
+    properties.insert(
+        "enable_llm_refinement".to_string(),
+        json!({
+            "type": "boolean",
+            "description": "For diarization jobs, enable optional LLM transcript refinement."
+        }),
+    );
+    properties.insert(
+        "min_speakers".to_string(),
+        json!({
+            "type": "integer",
+            "description": "Optional diarization minimum speaker count."
+        }),
+    );
+    properties.insert(
+        "max_speakers".to_string(),
+        json!({
+            "type": "integer",
+            "description": "Optional diarization maximum speaker count."
+        }),
+    );
+    properties.insert(
+        "min_speech_duration_ms".to_string(),
+        json!({
+            "type": "number",
+            "description": "Optional diarization VAD minimum speech-duration tuning."
+        }),
+    );
+    properties.insert(
+        "min_silence_duration_ms".to_string(),
+        json!({
+            "type": "number",
+            "description": "Optional diarization VAD minimum silence-duration tuning."
+        }),
+    );
+    if include_form_aliases {
+        properties.insert(
+            "word_timestamps".to_string(),
+            json!({
+                "type": "boolean",
+                "default": false,
+                "description": "Alias for include_timestamps."
+            }),
+        );
+    }
+    properties
 }
 
 fn add_collection_with_params(
@@ -2079,6 +2256,29 @@ mod tests {
                     .get(field)
                     .is_some(),
                 "TranscriptionMultipartRequest should document {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn openapi_documents_speech_text_job_generate_summary_field() {
+        let openapi = document();
+        let content = openapi["paths"]["/v1/speech-to-text/jobs"]["post"]["requestBody"]["content"]
+            .as_object()
+            .expect("speech-text create request body content should exist");
+
+        for content_type in ["application/json", "multipart/form-data"] {
+            let generate_summary =
+                &content[content_type]["schema"]["properties"]["generate_summary"];
+            assert_eq!(
+                generate_summary["type"].as_str(),
+                Some("boolean"),
+                "{content_type} generate_summary should be boolean"
+            );
+            assert_eq!(
+                generate_summary["default"].as_bool(),
+                Some(false),
+                "{content_type} generate_summary should default false"
             );
         }
     }
