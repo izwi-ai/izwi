@@ -654,6 +654,8 @@ export function TranscriptionPage({
       duration_secs: record.duration_secs ?? streamingRecord.duration_secs,
       processing_time_ms:
         record.processing_time_ms || streamingRecord.processing_time_ms,
+      processing_progress:
+        streamingRecord.processing_progress ?? record.processing_progress,
       rtf: record.rtf ?? streamingRecord.rtf,
       transcription:
         streamingRecord.transcription || record.transcription,
@@ -833,6 +835,17 @@ export function TranscriptionPage({
                                 ...current,
                                 processing_status: "processing",
                                 transcription: `${current.transcription}${delta}`,
+                              }
+                            : current,
+                        );
+                      }}
+                      onStreamingProgress={(progress) => {
+                        setStreamingRecord((current) =>
+                          current
+                            ? {
+                                ...current,
+                                processing_status: "processing",
+                                processing_progress: progress,
                               }
                             : current,
                         );

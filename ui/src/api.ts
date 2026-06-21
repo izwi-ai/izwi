@@ -83,6 +83,8 @@ export type {
   StudioProjectVoiceMode,
   TranscriptionRecord,
   TranscriptionRecordCreateRequest,
+  TranscriptionProcessingProgress,
+  TranscriptionProcessingProgressPhase,
   TranscriptionProcessingStatus,
   TranscriptionSummaryStatus,
   TranscriptionSegment,

@@ -1176,6 +1176,14 @@ describe("TranscriptionPage detail route", () => {
       | {
           onStart?: () => void;
           onDelta?: (delta: string) => void;
+          onProgress?: (progress: {
+            phase: "chunk_started" | "chunk_finished";
+            current_chunk: number;
+            total_chunks: number;
+            processed_audio_secs: number;
+            total_audio_secs: number;
+            percent: number;
+          }) => void;
           onFinal?: (record: unknown) => void;
         }
       | undefined;
@@ -1256,10 +1264,23 @@ describe("TranscriptionPage detail route", () => {
 
     await act(async () => {
       streamCallbacks?.onStart?.();
+      streamCallbacks?.onProgress?.({
+        phase: "chunk_finished",
+        current_chunk: 1,
+        total_chunks: 3,
+        processed_audio_secs: 4,
+        total_audio_secs: 12,
+        percent: 33,
+      });
       streamCallbacks?.onDelta?.("Hello ");
       streamCallbacks?.onDelta?.("world");
     });
 
+    expect(screen.getByText("Transcribing audio")).toBeInTheDocument();
+    expect(screen.getByText("Chunk 1 of 3")).toBeInTheDocument();
+    expect(
+      screen.getByRole("progressbar", { name: "ASR processing progress" }),
+    ).toHaveAttribute("aria-valuenow", "33");
     expect(screen.getByText("Hello world")).toBeInTheDocument();
   });
 

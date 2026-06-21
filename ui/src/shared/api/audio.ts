@@ -609,6 +609,7 @@ export interface TranscriptionRecordSummary {
   language: string | null;
   processing_status: TranscriptionProcessingStatus;
   processing_error?: string | null;
+  processing_progress?: TranscriptionProcessingProgress | null;
   duration_secs: number | null;
   processing_time_ms: number;
   rtf: number | null;
@@ -647,6 +648,22 @@ export type TranscriptionProcessingStatus =
   | "ready"
   | "failed";
 
+export type TranscriptionProcessingProgressPhase =
+  | "processing"
+  | "chunk_started"
+  | "chunk_finished"
+  | "aligning"
+  | "complete";
+
+export interface TranscriptionProcessingProgress {
+  phase: TranscriptionProcessingProgressPhase;
+  current_chunk?: number | null;
+  total_chunks?: number | null;
+  processed_audio_secs?: number | null;
+  total_audio_secs?: number | null;
+  percent?: number | null;
+}
+
 export interface TranscriptionRecord {
   id: string;
   created_at: number;
@@ -655,6 +672,7 @@ export interface TranscriptionRecord {
   language: string | null;
   processing_status: TranscriptionProcessingStatus;
   processing_error?: string | null;
+  processing_progress?: TranscriptionProcessingProgress | null;
   duration_secs: number | null;
   processing_time_ms: number;
   rtf: number | null;
@@ -685,6 +703,7 @@ type TranscriptionRecordStreamEvent =
   | { event: "created"; record: TranscriptionRecord }
   | { event: "start" }
   | { event: "delta"; delta: string }
+  | { event: "progress"; progress: TranscriptionProcessingProgress }
   | { event: "final"; record: TranscriptionRecord }
   | { event: "error"; error: string }
   | { event: "done" };
@@ -693,6 +712,7 @@ export interface TranscriptionRecordStreamCallbacks {
   onCreated?: (record: TranscriptionRecord) => void;
   onStart?: () => void;
   onDelta?: (delta: string) => void;
+  onProgress?: (progress: TranscriptionProcessingProgress) => void;
   onFinal?: (record: TranscriptionRecord) => void;
   onError?: (error: string) => void;
   onDone?: () => void;
@@ -1060,6 +1080,9 @@ export class AudioApiClient {
           break;
         case "delta":
           callbacks.onDelta?.(event.delta);
+          break;
+        case "progress":
+          callbacks.onProgress?.(event.progress);
           break;
         case "final":
           callbacks.onFinal?.(event.record);
