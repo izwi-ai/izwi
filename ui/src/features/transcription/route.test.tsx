@@ -843,6 +843,12 @@ describe("TranscriptionPage detail route", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /New transcript/i }));
 
+    const generateSummary = screen.getByLabelText(
+      /Generate summary/i,
+    ) as HTMLInputElement;
+    expect(generateSummary).not.toBeChecked();
+    fireEvent.click(generateSummary);
+
     const fileInput = document.querySelector(
       'input[type="file"]',
     ) as HTMLInputElement | null;
@@ -855,7 +861,12 @@ describe("TranscriptionPage detail route", () => {
     });
 
     await waitFor(() =>
-      expect(apiMocks.createTranscriptionRecordStream).toHaveBeenCalled(),
+      expect(apiMocks.createTranscriptionRecordStream).toHaveBeenCalledWith(
+        expect.objectContaining({
+          generate_summary: true,
+        }),
+        expect.any(Object),
+      ),
     );
     await waitFor(() =>
       expect(apiMocks.getTranscriptionRecord).toHaveBeenCalledWith(
@@ -949,6 +960,7 @@ describe("TranscriptionPage detail route", () => {
       expect(apiMocks.createTranscriptionRecordStream).toHaveBeenCalledWith(
         expect.objectContaining({
           audio_filename: "Aliko Dangote.mp3",
+          generate_summary: false,
         }),
         expect.objectContaining({
           onUploadProgress: expect.any(Function),

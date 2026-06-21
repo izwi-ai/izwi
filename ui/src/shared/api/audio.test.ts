@@ -382,7 +382,7 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     );
   });
 
-  it("posts transcription records with optional timestamp settings", async () => {
+  it("posts transcription records with optional timestamp and summary settings", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -421,6 +421,7 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
       aligner_model_id: "Qwen3-ForcedAligner-0.6B",
       language: "English",
       include_timestamps: true,
+      generate_summary: true,
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
@@ -433,6 +434,48 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
           aligner_model: "Qwen3-ForcedAligner-0.6B",
           language: "English",
           include_timestamps: true,
+          generate_summary: true,
+          stream: false,
+        }),
+      }),
+    );
+  });
+
+  it("defaults transcription summary generation to false in JSON requests", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          ...createdTranscriptionRecord,
+          processing_status: "pending",
+        }),
+        {
+          status: 202,
+          headers: {
+            "Content-Type": "application/json",
+          },
+        },
+      ),
+    );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+    await client.createTranscriptionRecord({
+      audio_base64: "UklGRg==",
+      model_id: "Parakeet-TDT-0.6B-v3",
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost/v1/speech-to-text/jobs?job_kind=transcription",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          audio_base64: "UklGRg==",
+          model: "Parakeet-TDT-0.6B-v3",
+          aligner_model: undefined,
+          language: undefined,
+          include_timestamps: false,
+          generate_summary: false,
           stream: false,
         }),
       }),
@@ -848,6 +891,7 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
         }),
         audio_filename: "stream.wav",
         model_id: "Parakeet-TDT-0.6B-v3",
+        generate_summary: true,
       },
       {
         onUploadProgress,
@@ -861,6 +905,8 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     expect(xhr.url).toBe(
       "http://localhost/v1/speech-to-text/jobs?job_kind=transcription",
     );
+    expect(xhr.body).toBeInstanceOf(FormData);
+    expect((xhr.body as FormData).get("generate_summary")).toBe("true");
     xhr.emitUploadProgress(4, 8);
     xhr.appendResponse(
       `data: ${JSON.stringify({
