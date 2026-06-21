@@ -574,6 +574,7 @@ export interface SpeechTextTranscriptionJobCreateRequest
   aligner_model_id?: string;
   language?: string;
   include_timestamps?: boolean;
+  generate_summary?: boolean;
   stream?: boolean;
 }
 
@@ -677,6 +678,7 @@ export interface TranscriptionRecordCreateRequest {
   aligner_model_id?: string;
   language?: string;
   include_timestamps?: boolean;
+  generate_summary?: boolean;
 }
 
 type TranscriptionRecordStreamEvent =
@@ -2889,6 +2891,9 @@ export class AudioApiClient {
       if (request.include_timestamps) {
         form.append("include_timestamps", "true");
       }
+      if (request.generate_summary) {
+        form.append("generate_summary", "true");
+      }
       if (stream) {
         form.append("stream", "true");
       }
@@ -2913,6 +2918,7 @@ export class AudioApiClient {
         aligner_model: request.aligner_model_id,
         language: request.language,
         include_timestamps: Boolean(request.include_timestamps),
+        generate_summary: Boolean(request.generate_summary),
         stream,
       }),
     };

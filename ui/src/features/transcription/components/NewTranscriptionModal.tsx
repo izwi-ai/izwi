@@ -97,6 +97,7 @@ export function NewTranscriptionModal({
   const [selectedLanguage, setSelectedLanguage] = useState("English");
   const [includeTimestamps, setIncludeTimestamps] = useState(false);
   const [streamingEnabled, setStreamingEnabled] = useState(true);
+  const [generateSummary, setGenerateSummary] = useState(false);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -235,6 +236,7 @@ export function NewTranscriptionModal({
             : undefined,
           language: selectedLanguage,
           include_timestamps: includeTimestamps,
+          generate_summary: generateSummary,
         };
         const record = streamingEnabled
           ? await new Promise<TranscriptionRecord>((resolve, reject) => {
@@ -357,6 +359,7 @@ export function NewTranscriptionModal({
     },
     [
       includeTimestamps,
+      generateSummary,
       onClose,
       onCreated,
       onStreamingDelta,
@@ -654,6 +657,31 @@ export function NewTranscriptionModal({
                     checked={streamingEnabled}
                     onChange={(event) =>
                       handleStreamingEnabledChange(event.target.checked)
+                    }
+                    className="peer sr-only"
+                    disabled={isSubmitting}
+                  />
+                  <span className="flex h-5 w-5 items-center justify-center rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface-0)] text-white transition peer-checked:border-[var(--status-info-text)] peer-checked:bg-[var(--status-info-text)] peer-focus-visible:outline-none peer-focus-visible:ring-2 peer-focus-visible:ring-ring/45 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-background peer-disabled:opacity-50">
+                    <Check className="h-3.5 w-3.5 opacity-0 transition peer-checked:opacity-100" />
+                  </span>
+                </div>
+              </label>
+
+              <label className="flex items-start justify-between gap-3 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3.5">
+                <div className="min-w-0">
+                  <div className="text-sm font-semibold text-[var(--text-primary)]">
+                    Generate summary
+                  </div>
+                  <div className="mt-0.5 text-[13px] leading-5 text-[var(--text-muted)]">
+                    Create an AI summary after the transcript is ready.
+                  </div>
+                </div>
+                <div className="relative mt-0.5 shrink-0">
+                  <input
+                    type="checkbox"
+                    checked={generateSummary}
+                    onChange={(event) =>
+                      setGenerateSummary(event.target.checked)
                     }
                     className="peer sr-only"
                     disabled={isSubmitting}
