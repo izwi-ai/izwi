@@ -129,7 +129,7 @@ saved voice routes and exact fields.
 - Music with vocals
 - Multiple speakers
 - Heavy background noise
-- Very short clips (<3 seconds)
+- Very short clips (under 3 seconds)
 - Whispered or distorted speech
 
 ---
