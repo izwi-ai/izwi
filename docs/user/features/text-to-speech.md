@@ -1,3 +1,9 @@
+---
+title: "Text-to-Speech"
+description: "Generate natural speech from text with Izwi models, voices, streaming, and audio output formats."
+sidebarTitle: "Text-to-Speech"
+icon: "volume-2"
+---
 # Text-to-Speech
 
 Generate natural, human-like speech from text using state-of-the-art TTS models.

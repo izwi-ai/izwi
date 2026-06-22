@@ -1,3 +1,8 @@
+---
+title: "izwi tts"
+description: "Generate text-to-speech audio from the command line with model, voice, and output options."
+icon: "volume-2"
+---
 # izwi tts
 
 Generate speech from text.

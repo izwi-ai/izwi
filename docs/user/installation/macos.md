@@ -1,3 +1,9 @@
+---
+title: "macOS Installation"
+description: "Install Izwi on macOS with the DMG, optional CLI tools, and Apple Silicon acceleration."
+sidebarTitle: "macOS"
+icon: "apple"
+---
 # macOS Installation
 
 Izwi is optimized for macOS with native Apple Silicon (M1/M2/M3/M4) acceleration via Metal.

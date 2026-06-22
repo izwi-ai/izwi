@@ -1,3 +1,8 @@
+---
+title: "izwi models"
+description: "Use model management subcommands to list, inspect, load, unload, and track model progress."
+icon: "database"
+---
 # izwi models
 
 Model management commands.

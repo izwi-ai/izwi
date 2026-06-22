@@ -1,3 +1,9 @@
+---
+title: "Build from Source"
+description: "Build Izwi from source for development, custom backends, and release packages."
+sidebarTitle: "From Source"
+icon: "code-2"
+---
 # Build from Source
 
 Build Izwi from source for development, backend-specific installs, or to customize your setup.

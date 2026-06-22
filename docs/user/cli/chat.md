@@ -1,3 +1,8 @@
+---
+title: "izwi chat"
+description: "Start an interactive local chat session from the command line."
+icon: "message-square"
+---
 # izwi chat
 
 Interactive chat with AI models.

@@ -1,3 +1,8 @@
+---
+title: "Diarization"
+description: "Identify multiple speakers in audio and generate speaker-attributed transcripts with Izwi."
+icon: "users"
+---
 # Diarization
 
 Identify and separate multiple speakers in audio recordings with speaker diarization.

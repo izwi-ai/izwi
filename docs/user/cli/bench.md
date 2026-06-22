@@ -1,3 +1,9 @@
+---
+title: "izwi bench"
+description: "Run chat, TTS, ASR, throughput, manifest, and regression comparison benchmarks."
+icon: "gauge"
+mode: "wide"
+---
 # izwi bench
 
 Run performance benchmarks.

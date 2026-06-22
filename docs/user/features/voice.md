@@ -1,3 +1,9 @@
+---
+title: "Voice Mode"
+description: "Use Izwi for real-time voice conversations with speech recognition, chat, and text-to-speech."
+sidebarTitle: "Voice Mode"
+icon: "audio-lines"
+---
 # Voice Mode
 
 Voice mode enables real-time spoken conversations with AI. Speak naturally and receive spoken responses — all processed locally on your device.

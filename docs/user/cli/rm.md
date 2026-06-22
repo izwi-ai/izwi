@@ -1,3 +1,8 @@
+---
+title: "izwi rm"
+description: "Remove a downloaded Izwi model from local storage."
+icon: "trash-2"
+---
 # izwi rm
 
 Remove a downloaded model.

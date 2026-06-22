@@ -1,3 +1,8 @@
+---
+title: "Features"
+description: "Explore Izwi capabilities across voice mode, chat, TTS, Studio, transcription, diarization, and voice creation."
+icon: "sparkles"
+---
 # Features
 
 Izwi provides a comprehensive suite of audio AI capabilities. Each feature is accessible via the web UI, desktop app, and command line.
