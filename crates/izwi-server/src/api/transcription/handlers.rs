@@ -493,6 +493,9 @@ fn spawn_transcription_processing_task(
                 .await
             }
             TranscriptionRecordMode::SpeakerAttributedAsr => {
+                let saa_progress_tx = progress_tx.clone();
+                let saa_progress_store = progress_store.clone();
+                let saa_progress_record_id = progress_record_id.clone();
                 generate_speaker_attributed_asr_artifacts(
                     runtime.clone(),
                     audio_bytes.as_slice(),
@@ -500,6 +503,16 @@ fn spawn_transcription_processing_task(
                     requested_language.as_deref(),
                     min_speakers,
                     max_speakers,
+                    move |progress| {
+                        if let Some(tx) = &saa_progress_tx {
+                            let _ = tx.send(progress_event_payload(progress.clone()));
+                        }
+                        let store = saa_progress_store.clone();
+                        let id = saa_progress_record_id.clone();
+                        tokio::spawn(async move {
+                            let _ = store.update_processing_progress(id, Some(progress)).await;
+                        });
+                    },
                 )
                 .await
             }
@@ -683,21 +696,26 @@ where
     })
 }
 
-async fn generate_speaker_attributed_asr_artifacts(
+async fn generate_speaker_attributed_asr_artifacts<P>(
     runtime: std::sync::Arc<izwi_core::RuntimeService>,
     audio_bytes: &[u8],
     model_id: Option<&str>,
     requested_language: Option<&str>,
     min_speakers: Option<usize>,
     max_speakers: Option<usize>,
-) -> Result<GeneratedTranscriptionArtifacts, ApiError> {
+    on_progress: P,
+) -> Result<GeneratedTranscriptionArtifacts, ApiError>
+where
+    P: FnMut(AsrProgress) + Send + 'static,
+{
     let output = runtime
-        .speaker_attributed_asr_bytes(
+        .speaker_attributed_asr_bytes_with_progress(
             audio_bytes,
             model_id,
             requested_language,
             min_speakers,
             max_speakers,
+            on_progress,
         )
         .await?;
     let resolved_language = output
