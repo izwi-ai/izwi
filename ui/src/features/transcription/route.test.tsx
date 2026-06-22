@@ -1537,6 +1537,143 @@ describe("TranscriptionPage detail route", () => {
     );
   });
 
+  it("shows SAA chunk progress on direct speaker-attributed routes", async () => {
+    apiMocks.getSpeakerAttributedAsrRecord.mockResolvedValue({
+      id: "saa-progress-1",
+      created_at: 1,
+      kind: "speaker_attributed_asr",
+      transcription_mode: "speaker_attributed_asr",
+      model_id: "Granite-Speech-4.1-2B-Plus",
+      aligner_model_id: null,
+      language: "English",
+      processing_status: "processing",
+      processing_error: null,
+      processing_progress: {
+        phase: "chunk_finished",
+        current_chunk: 2,
+        total_chunks: 7,
+        processed_audio_secs: 480,
+        total_audio_secs: 1556.5,
+        percent: 31,
+      },
+      duration_secs: null,
+      processing_time_ms: 0,
+      rtf: null,
+      audio_mime_type: "audio/wav",
+      audio_filename: "long-saa.wav",
+      transcription: "",
+      segments: [],
+      words: [],
+      speaker_attributed_text: null,
+      speaker_turns: [],
+      saa_status: "not_requested",
+      saa_warnings: [],
+      summary_status: "not_requested",
+      summary_model_id: null,
+      summary_text: null,
+      summary_error: null,
+      summary_updated_at: null,
+    });
+
+    render(
+      renderRouteElement("/transcription/saa-progress-1", {
+        ...baseProps,
+        speechTextMode: "speaker_attributed_asr",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(apiMocks.getSpeakerAttributedAsrRecord).toHaveBeenCalledWith(
+        "saa-progress-1",
+      ),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "Transcription Record" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Transcribing audio")).toBeInTheDocument();
+    expect(screen.getByText("31%")).toBeInTheDocument();
+    expect(
+      screen.getByRole("progressbar", { name: "ASR processing progress" }),
+    ).toHaveAttribute("aria-valuenow", "31");
+    expect(
+      screen.getByRole("button", { name: /Back to speech text/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("surfaces SAA quality warnings on completed speaker-attributed routes", async () => {
+    apiMocks.getSpeakerAttributedAsrRecord.mockResolvedValue({
+      id: "saa-warning-1",
+      created_at: 1,
+      kind: "speaker_attributed_asr",
+      transcription_mode: "speaker_attributed_asr",
+      model_id: "Granite-Speech-4.1-2B-Plus",
+      aligner_model_id: null,
+      language: "English",
+      processing_status: "ready",
+      processing_error: null,
+      processing_progress: null,
+      duration_secs: 1556.5,
+      processing_time_ms: 240000,
+      rtf: 0.15,
+      audio_mime_type: "audio/wav",
+      audio_filename: "long-saa.wav",
+      transcription: "[Speaker 1]: hello [Speaker 2]: hi back",
+      segments: [],
+      words: [],
+      speaker_attributed_text: "[Speaker 1]: hello [Speaker 2]: hi back",
+      speaker_turns: [
+        {
+          speaker: "Speaker 1",
+          text: "hello",
+          start: null,
+          end: null,
+        },
+        {
+          speaker: "Speaker 2",
+          text: "hi back",
+          start: null,
+          end: null,
+        },
+      ],
+      saa_status: "warning",
+      saa_warnings: [
+        "Granite SAA processed long audio in 7 chunks.",
+        "Speaker label continuity across chunks is best-effort.",
+      ],
+      summary_status: "not_requested",
+      summary_model_id: null,
+      summary_text: null,
+      summary_error: null,
+      summary_updated_at: null,
+    });
+
+    render(
+      renderRouteElement("/transcription/saa-warning-1", {
+        ...baseProps,
+        speechTextMode: "speaker_attributed_asr",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(apiMocks.getSpeakerAttributedAsrRecord).toHaveBeenCalledWith(
+        "saa-warning-1",
+      ),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "long-saa.wav" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Granite SAA processed long audio in 7 chunks/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Speaker label continuity across chunks is best-effort/),
+    ).toBeInTheDocument();
+    expect(document.body).toHaveTextContent("hello");
+    expect(document.body).toHaveTextContent("hi back");
+  });
+
   it("confirms deletion before removing a transcription record", async () => {
     apiMocks.listTranscriptionRecords
       .mockResolvedValueOnce([
