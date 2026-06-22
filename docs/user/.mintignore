@@ -1,0 +1,5 @@
+# Keep local drafts and generated outputs out of the published docs.
+drafts/
+*.draft.md
+*.draft.mdx
+export.zip
