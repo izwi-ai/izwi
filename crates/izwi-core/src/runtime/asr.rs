@@ -34,7 +34,10 @@ const GRANITE_ASR_AUTO_MIN_TOKENS: usize = 76;
 const GRANITE_ASR_AUTO_MAX_TOKENS: usize = 2048;
 const GRANITE_ASR_AUTO_BASE_SECONDS: f32 = 28.0;
 const GRANITE_ASR_AUTO_TOKENS_PER_SECOND: f32 = 4.0;
-const GRANITE_SAA_MAX_NEW_TOKENS: usize = 10_000;
+const GRANITE_SAA_MIN_NEW_TOKENS: usize = 800;
+const GRANITE_SAA_MAX_NEW_TOKENS: usize = 2_500;
+const GRANITE_SAA_NEW_TOKENS_PER_SECOND: f32 = 8.0;
+const GRANITE_SAA_NEW_TOKEN_RESERVE: usize = 256;
 const GRANITE_SAA_TARGET_CHUNK_SECS: f32 = 240.0;
 const GRANITE_SAA_HARD_MAX_CHUNK_SECS: f32 = 510.0;
 const GRANITE_SAA_OVERLAP_SECS: f32 = 12.0;
@@ -1501,6 +1504,31 @@ fn granite_saa_chunk_plan(
     plan_audio_chunks(samples, sample_rate, &cfg, Some(cfg.hard_max_chunk_secs))
 }
 
+fn granite_saa_max_new_tokens_for_duration(duration_secs: f32) -> usize {
+    if let Some(override_tokens) = env_positive_usize("IZWI_GRANITE_SAA_MAX_NEW_TOKENS") {
+        return override_tokens;
+    }
+
+    let duration_budget =
+        if duration_secs.is_finite() && duration_secs > 0.0 {
+            (duration_secs * GRANITE_SAA_NEW_TOKENS_PER_SECOND).ceil() as usize
+        } else {
+            0
+        };
+    GRANITE_SAA_NEW_TOKEN_RESERVE
+        .saturating_add(duration_budget)
+        .clamp(GRANITE_SAA_MIN_NEW_TOKENS, GRANITE_SAA_MAX_NEW_TOKENS)
+}
+
+fn granite_saa_max_new_tokens(audio: &[f32], sample_rate: u32) -> usize {
+    let duration_secs = if sample_rate > 0 {
+        audio.len() as f32 / sample_rate as f32
+    } else {
+        0.0
+    };
+    granite_saa_max_new_tokens_for_duration(duration_secs)
+}
+
 async fn granite_saa_long_form_transcribe<P>(
     model: Arc<NativeAsrModel>,
     samples: &[f32],
@@ -1605,6 +1633,7 @@ fn granite_saa_transcribe_chunk(
     language: Option<&str>,
     prefix_text: Option<&str>,
 ) -> Result<NativeAsrTranscription> {
+    let max_new_tokens = granite_saa_max_new_tokens(audio, sample_rate);
     model.transcribe_with_granite_speech_task_and_options(
         audio,
         sample_rate,
@@ -1612,7 +1641,7 @@ fn granite_saa_transcribe_chunk(
         GraniteSpeechTask::SpeakerAttributed,
         prefix_text,
         NativeAsrGenerationOptions {
-            max_new_tokens: GRANITE_SAA_MAX_NEW_TOKENS,
+            max_new_tokens,
             ..NativeAsrGenerationOptions::default()
         },
     )
@@ -1691,6 +1720,13 @@ fn env_positive_f32(key: &str) -> Option<f32> {
         .ok()
         .and_then(|raw| raw.trim().parse::<f32>().ok())
         .filter(|value| value.is_finite() && *value > 0.0)
+}
+
+fn env_positive_usize(key: &str) -> Option<usize> {
+    std::env::var(key)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
 }
 
 fn speaker_attributed_asr_result_from_text(
@@ -2019,6 +2055,45 @@ mod tests {
         assert_eq!(chunks.last().unwrap().end_sample, samples.len());
         assert!(chunks.iter().all(|chunk| chunk.len_samples()
             <= (GRANITE_SAA_HARD_MAX_CHUNK_SECS * sample_rate as f32) as usize));
+    }
+
+    #[test]
+    fn granite_saa_decode_budget_uses_saa_sized_limit() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let previous = std::env::var("IZWI_GRANITE_SAA_MAX_NEW_TOKENS").ok();
+        std::env::remove_var("IZWI_GRANITE_SAA_MAX_NEW_TOKENS");
+
+        assert_eq!(
+            granite_saa_max_new_tokens_for_duration(27.0),
+            GRANITE_SAA_MIN_NEW_TOKENS
+        );
+        assert_eq!(granite_saa_max_new_tokens_for_duration(240.0), 2176);
+        assert_eq!(
+            granite_saa_max_new_tokens_for_duration(510.0),
+            GRANITE_SAA_MAX_NEW_TOKENS
+        );
+        assert!(granite_saa_max_new_tokens_for_duration(510.0) < 10_000);
+
+        if let Some(previous) = previous {
+            std::env::set_var("IZWI_GRANITE_SAA_MAX_NEW_TOKENS", previous);
+        } else {
+            std::env::remove_var("IZWI_GRANITE_SAA_MAX_NEW_TOKENS");
+        }
+    }
+
+    #[test]
+    fn granite_saa_decode_budget_allows_explicit_override() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let previous = std::env::var("IZWI_GRANITE_SAA_MAX_NEW_TOKENS").ok();
+        std::env::set_var("IZWI_GRANITE_SAA_MAX_NEW_TOKENS", "1234");
+
+        assert_eq!(granite_saa_max_new_tokens_for_duration(240.0), 1234);
+
+        if let Some(previous) = previous {
+            std::env::set_var("IZWI_GRANITE_SAA_MAX_NEW_TOKENS", previous);
+        } else {
+            std::env::remove_var("IZWI_GRANITE_SAA_MAX_NEW_TOKENS");
+        }
     }
 
     #[test]
