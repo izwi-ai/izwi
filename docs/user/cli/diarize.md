@@ -139,5 +139,5 @@ izwi diarize interview.wav \
 
 ## See Also
 
-- [Diarization Guide](../features/diarization.md)
-- [`izwi transcribe`](./transcribe.md) — Single-speaker transcription
+- [Diarization Guide](/features/diarization)
+- [`izwi transcribe`](/cli/transcribe) — Single-speaker transcription

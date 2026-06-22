@@ -29,7 +29,7 @@ The server also serves a local API reference:
 The local Scalar/OpenAPI reference covers the stable OpenAI-compatible contract,
 the `/v1/responses` preview contract, readiness probes, and sidebar entries for
 preview first-party, operator, and realtime route families. Detailed route
-behavior is documented in the [API Reference](../api.md).
+behavior is documented in the [API Reference](/api).
 
 Resolution order for serve/runtime settings is:
 
@@ -205,5 +205,5 @@ During startup, `izwi serve` waits for the readiness endpoint before opening des
 
 ## See Also
 
-- [`izwi status`](./status.md) — Check server health
-- [`izwi config`](./config.md) — Manage configuration
+- [`izwi status`](/cli/status) — Check server health
+- [`izwi config`](/cli/config) — Manage configuration

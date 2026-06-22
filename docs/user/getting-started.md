@@ -11,7 +11,7 @@ Get Izwi running in under 5 minutes.
 
 ## Step 1: Install Izwi
 
-Before you pick an install path, check the [Runtime Support Matrix](./support-matrix.md) if backend support matters for your deployment. Linux and Windows release installers are CPU-only; use Docker CUDA on NVIDIA Linux hosts or source builds for custom CUDA validation.
+Before you pick an install path, check the [Runtime Support Matrix](/support-matrix) if backend support matters for your deployment. Linux and Windows release installers are CPU-only; use Docker CUDA on NVIDIA Linux hosts or source builds for custom CUDA validation.
 
 ### macOS
 
@@ -39,7 +39,7 @@ Download and run the `.exe` installer from [GitHub Releases](https://github.com/
 
 > The Windows release package is CPU-only. CUDA on Windows is currently a source-build preview path.
 
-> See [Installation](./installation/index.md) for detailed platform-specific instructions.
+> See [Installation](/installation) for detailed platform-specific instructions.
 
 ---
 
@@ -146,7 +146,7 @@ The web interface provides:
 
 ## Next Steps
 
-- [Learn about all features](./features/index.md)
-- [Explore the CLI commands](./cli/index.md)
-- [Download more models](./models/index.md)
-- [Troubleshoot common issues](./troubleshooting.md)
+- [Learn about all features](/features)
+- [Explore the CLI commands](/cli)
+- [Download more models](/models)
+- [Troubleshoot common issues](/troubleshooting)

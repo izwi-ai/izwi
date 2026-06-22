@@ -66,11 +66,11 @@ Features:
   (none)
 ```
 
-`Compiled Backends` reflects cargo features compiled into the binary. It does not mean the server is currently running on that backend; use [`izwi status --detailed`](./status.md) to verify runtime selection.
+`Compiled Backends` reflects cargo features compiled into the binary. It does not mean the server is currently running on that backend; use [`izwi status --detailed`](/cli/status) to verify runtime selection.
 
 ---
 
 ## See Also
 
-- [`izwi status`](./status.md) — Server status
-- [`izwi --version`](./index.md) — Quick version check
+- [`izwi status`](/cli/status) — Server status
+- [`izwi --version`](/cli) — Quick version check

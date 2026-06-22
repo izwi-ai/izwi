@@ -39,7 +39,7 @@ izwi models list --local
 izwi models list --detailed
 ```
 
-Same as [`izwi list`](./list.md).
+Same as [`izwi list`](/cli/list).
 
 ---
 
@@ -116,6 +116,6 @@ izwi models progress Qwen3-TTS-12Hz-0.6B-Base
 
 ## See Also
 
-- [`izwi list`](./list.md)
-- [`izwi pull`](./pull.md)
-- [`izwi rm`](./rm.md)
+- [`izwi list`](/cli/list)
+- [`izwi pull`](/cli/pull)
+- [`izwi rm`](/cli/rm)

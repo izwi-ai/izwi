@@ -35,9 +35,9 @@ izwi pull Qwen3-TTS-12Hz-0.6B-Base
 If you plan to use `Kokoro-82M`, install `espeak-ng` on your system first.
 Izwi uses it for Kokoro phonemization and will return an error if it is missing.
 
-- macOS: see [macOS Installation](../installation/macos.md#optional-install-espeak-ng-for-kokoro-82m)
-- Linux: see [Linux Installation](../installation/linux.md#optional-install-espeak-ng-for-kokoro-82m)
-- Windows: see [Windows Installation](../installation/windows.md#optional-install-espeak-ng-for-kokoro-82m)
+- macOS: see [macOS Installation](/installation/macos#optional-install-espeak-ng-for-kokoro-82m)
+- Linux: see [Linux Installation](/installation/linux#optional-install-espeak-ng-for-kokoro-82m)
+- Windows: see [Windows Installation](/installation/windows#optional-install-espeak-ng-for-kokoro-82m)
 
 ### Generate Speech
 
@@ -151,7 +151,7 @@ Binary audio data with appropriate `Content-Type` header.
 
 Set `stream` to `true` or `stream_format` to `sse` to receive server-sent
 audio events instead of one binary response. See the
-[API Reference](../api.md#audio-speech) for streaming event shapes,
+[API Reference](/api#audio-speech) for streaming event shapes,
 voice-cloning fields, saved voices, and model-specific controls.
 
 ### Example (curl)
@@ -206,6 +206,6 @@ model and bundled voice assets inherit a CC BY-NC 4.0 license.
 
 ## See Also
 
-- [Voice Cloning](./voice-cloning.md) — Clone custom voices
-- [Voice Design](./voice-design.md) — Create voices from descriptions
-- [CLI Reference](../cli/index.md) — Full command documentation
+- [Voice Cloning](/features/voice-cloning) — Clone custom voices
+- [Voice Design](/features/voice-design) — Create voices from descriptions
+- [CLI Reference](/cli) — Full command documentation

@@ -422,4 +422,4 @@ The `izwi bench chat` runtime delta now includes kernel-path counts for:
 
 ## See Also
 
-- [`izwi status`](./status.md) — System status
+- [`izwi status`](/cli/status) — System status

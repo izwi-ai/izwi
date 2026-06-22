@@ -8,7 +8,7 @@ icon: "monitor"
 
 Izwi runs on most modern Linux distributions. Linux GitHub Release assets keep the public `izwi` and `izwi-server` names and are intentionally CPU-only.
 
-See the [Runtime Support Matrix](../support-matrix.md) for the current artifact contract.
+See the [Runtime Support Matrix](/support-matrix) for the current artifact contract.
 
 ---
 
@@ -317,5 +317,5 @@ espeak-ng --version
 
 ## Next Steps
 
-- [Getting Started](../getting-started.md)
-- [Download Models](../models/index.md)
+- [Getting Started](/getting-started)
+- [Download Models](/models)

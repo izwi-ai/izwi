@@ -94,6 +94,6 @@ If a download is interrupted, run the same command again. The download will resu
 
 ## See Also
 
-- [`izwi list`](./list.md) — List models
-- [`izwi rm`](./rm.md) — Remove models
-- [Models Guide](../models/index.md) — Model documentation
+- [`izwi list`](/cli/list) — List models
+- [`izwi rm`](/cli/rm) — Remove models
+- [Models Guide](/models) — Model documentation

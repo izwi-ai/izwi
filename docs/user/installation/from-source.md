@@ -8,7 +8,7 @@ icon: "code-2"
 
 Build Izwi from source for development, backend-specific installs, or to customize your setup.
 
-See the [Runtime Support Matrix](../support-matrix.md) before choosing a build target. In particular:
+See the [Runtime Support Matrix](/support-matrix) before choosing a build target. In particular:
 
 - GitHub Release artifacts and source builds do not expose the same backend set.
 - Metal is the primary accelerated source-build path on Apple Silicon.
@@ -65,9 +65,9 @@ cd izwi
 
 If you plan to use `Kokoro-82M`, install `espeak-ng` using your platform guide before running TTS:
 
-- [macOS `espeak-ng` install](./macos.md#optional-install-espeak-ng-for-kokoro-82m)
-- [Linux `espeak-ng` install](./linux.md#optional-install-espeak-ng-for-kokoro-82m)
-- [Windows `espeak-ng` install](./windows.md#optional-install-espeak-ng-for-kokoro-82m)
+- [macOS `espeak-ng` install](/installation/macos#optional-install-espeak-ng-for-kokoro-82m)
+- [Linux `espeak-ng` install](/installation/linux#optional-install-espeak-ng-for-kokoro-82m)
+- [Windows `espeak-ng` install](/installation/windows#optional-install-espeak-ng-for-kokoro-82m)
 
 ---
 
@@ -334,5 +334,5 @@ Then retry the build.
 
 ## Next Steps
 
-- [Getting Started](../getting-started.md)
-- [CLI Reference](../cli/index.md)
+- [Getting Started](/getting-started)
+- [CLI Reference](/cli)

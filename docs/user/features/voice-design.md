@@ -147,7 +147,7 @@ curl -X POST http://localhost:8080/v1/audio/speech \
 
 Voice design history is also available through
 `/v1/voice-designs`. See the
-[API Reference](../api.md#speech-history) for the persisted route
+[API Reference](/api#speech-history) for the persisted route
 family and `/v1/audio/speech` streaming details.
 
 ---
@@ -210,6 +210,6 @@ Start broad, then refine:
 
 ## See Also
 
-- [Voice Cloning](./voice-cloning.md) — Clone from audio samples
-- [Text-to-Speech](./text-to-speech.md) — Standard TTS
-- [Models](../models/index.md) — Download models
+- [Voice Cloning](/features/voice-cloning) — Clone from audio samples
+- [Text-to-Speech](/features/text-to-speech) — Standard TTS
+- [Models](/models) — Download models

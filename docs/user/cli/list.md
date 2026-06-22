@@ -87,6 +87,6 @@ The list shows:
 
 ## See Also
 
-- [`izwi pull`](./pull.md) — Download models
-- [`izwi rm`](./rm.md) — Remove models
-- [`izwi models`](./models.md) — Model management
+- [`izwi pull`](/cli/pull) — Download models
+- [`izwi rm`](/cli/rm) — Remove models
+- [`izwi models`](/cli/models) — Model management

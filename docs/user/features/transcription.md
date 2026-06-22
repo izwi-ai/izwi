@@ -160,7 +160,7 @@ curl -X POST http://localhost:8080/v1/audio/transcriptions \
 Streaming responses emit SSE payloads with `type` values such as
 `transcript.text.delta`, `transcript.text.done`, and `error`.
 
-See the [API Reference](../api.md#audio-transcriptions) for JSON input,
+See the [API Reference](/api#audio-transcriptions) for JSON input,
 streaming events, upload limits, and exact response shapes.
 
 ---
@@ -247,6 +247,6 @@ endpoint.
 
 ## See Also
 
-- [Diarization](./diarization.md) — Identify multiple speakers
-- [Voice Mode](./voice.md) — Real-time transcription
-- [CLI Reference](../cli/index.md) — Full command documentation
+- [Diarization](/features/diarization) — Identify multiple speakers
+- [Voice Mode](/features/voice) — Real-time transcription
+- [CLI Reference](/cli) — Full command documentation
