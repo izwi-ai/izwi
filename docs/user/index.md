@@ -1,10 +1,14 @@
+---
+title: "Izwi Documentation"
+description: "User documentation for Izwi, a local-first audio inference engine for speech, voice, and chat workflows."
+sidebarTitle: "Overview"
+icon: "house"
+---
 # Izwi Documentation
 
 Welcome to the official documentation for **Izwi** — a local-first audio inference engine for text-to-speech, speech recognition, and voice AI workflows.
 
-<p align="center">
-  <img src="../../images/app-icon.png" alt="Izwi" width="120" />
-</p>
+![Izwi icon](/images/app-icon.png)
 
 ---
 

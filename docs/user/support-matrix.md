@@ -1,3 +1,9 @@
+---
+title: "Runtime Support Matrix"
+description: "Supported operating systems, hardware backends, deployment paths, and API maturity for Izwi."
+sidebarTitle: "Support Matrix"
+icon: "clipboard-check"
+---
 # Runtime Support Matrix
 
 This page is the public support contract for Izwi's current runtime surfaces.

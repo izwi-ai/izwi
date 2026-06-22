@@ -1,3 +1,8 @@
+---
+title: "izwi align"
+description: "Align reference text to audio and export timestamped word or segment results."
+icon: "git-compare-arrows"
+---
 # izwi align
 
 Forced alignment — align text to audio at word level.

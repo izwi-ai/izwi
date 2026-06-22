@@ -1,3 +1,8 @@
+---
+title: "izwi config"
+description: "Manage Izwi configuration values, files, and precedence from the command line."
+icon: "settings"
+---
 # izwi config
 
 Manage the local `config.toml` used by `izwi serve`.

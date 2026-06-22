@@ -1,3 +1,9 @@
+---
+title: "Linux Installation"
+description: "Install Izwi on Linux with release packages, source builds, services, and CUDA guidance."
+sidebarTitle: "Linux"
+icon: "monitor"
+---
 # Linux Installation
 
 Izwi runs on most modern Linux distributions. Linux GitHub Release assets keep the public `izwi` and `izwi-server` names and are intentionally CPU-only.

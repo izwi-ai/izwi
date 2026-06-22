@@ -1,3 +1,8 @@
+---
+title: "Studio"
+description: "Manage long-form text-to-speech projects, chapter workflows, and exports in Izwi Studio."
+icon: "layout-dashboard"
+---
 # Studio
 
 Studio is Izwi's long-form text-to-speech workspace for single-device, solo production workflows.

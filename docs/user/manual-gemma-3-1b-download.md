@@ -1,3 +1,9 @@
+---
+title: "Manual Download: Gemma 3 1B Instruct"
+description: "Download and install the gated Gemma 3 1B Instruct model manually for Izwi."
+sidebarTitle: "Gemma 3 1B Manual Download"
+icon: "key-round"
+---
 # Manual Download: Gemma 3 1B Instruct
 
 Gemma 3 1B Instruct (`Gemma-3-1b-it`) is a powerful compact language model from Google that requires manual download due to licensing requirements.

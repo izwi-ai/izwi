@@ -1,3 +1,9 @@
+---
+title: "CLI Reference"
+description: "Complete reference for the Izwi command-line interface, global options, commands, and environment variables."
+sidebarTitle: "Overview"
+icon: "terminal"
+---
 # CLI Reference
 
 The `izwi` command-line interface provides complete control over Izwi's audio inference capabilities.

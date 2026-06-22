@@ -1,3 +1,8 @@
+---
+title: "Installation"
+description: "Choose the right Izwi installation path for macOS, Linux, Windows, or source builds."
+icon: "download"
+---
 # Installation
 
 Choose your platform for detailed installation instructions.

@@ -1,3 +1,9 @@
+---
+title: "Voice Cloning"
+description: "Create custom voices from reference audio and use them for local text-to-speech generation."
+sidebarTitle: "Voice Cloning"
+icon: "copy"
+---
 # Voice Cloning
 
 Clone any voice from a short audio sample and use it for text-to-speech generation.

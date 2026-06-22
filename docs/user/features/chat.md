@@ -1,3 +1,8 @@
+---
+title: "Chat"
+description: "Run local text and multimodal chat conversations through the Izwi CLI, web UI, and API."
+icon: "message-square"
+---
 # Chat
 
 Have local conversations with chat models running on your own machine.

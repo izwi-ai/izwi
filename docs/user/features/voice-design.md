@@ -1,3 +1,9 @@
+---
+title: "Voice Design"
+description: "Design synthetic voices from text descriptions and use them in Izwi speech workflows."
+sidebarTitle: "Voice Design"
+icon: "wand-sparkles"
+---
 # Voice Design
 
 Create custom voices from text descriptions — no audio samples required.
