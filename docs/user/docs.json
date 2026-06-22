@@ -1,0 +1,153 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Izwi",
+  "description": "Local-first audio inference documentation for text-to-speech, transcription, diarization, chat, and voice AI workflows.",
+  "colors": {
+    "primary": "#B83A2F",
+    "light": "#D95545",
+    "dark": "#8F2A24"
+  },
+  "appearance": {
+    "default": "system"
+  },
+  "icons": {
+    "library": "lucide"
+  },
+  "styling": {
+    "eyebrows": "breadcrumbs",
+    "codeblocks": "system"
+  },
+  "metadata": {
+    "timestamp": true
+  },
+  "navbar": {
+    "links": [
+      {
+        "type": "github",
+        "href": "https://github.com/izwi-ai/izwi"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Get started",
+      "href": "/getting-started"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/izwi-ai/izwi"
+    }
+  },
+  "navigation": {
+    "directory": "card",
+    "groups": [
+      {
+        "group": "Home",
+        "icon": "house",
+        "pages": [
+          "index",
+          "getting-started",
+          "support-matrix"
+        ]
+      },
+      {
+        "group": "Installation",
+        "icon": "download",
+        "root": "installation/index",
+        "pages": [
+          "installation/macos",
+          "installation/linux",
+          "installation/windows",
+          "installation/from-source"
+        ]
+      },
+      {
+        "group": "Features",
+        "icon": "sparkles",
+        "root": "features/index",
+        "pages": [
+          "features/voice",
+          "features/chat",
+          "features/text-to-speech",
+          "features/studio",
+          "features/transcription",
+          "features/diarization",
+          "features/voice-cloning",
+          "features/voice-design"
+        ]
+      },
+      {
+        "group": "CLI Reference",
+        "icon": "terminal",
+        "root": "cli/index",
+        "pages": [
+          {
+            "group": "Server",
+            "pages": [
+              "cli/serve",
+              "cli/status",
+              "cli/config",
+              "cli/version",
+              "cli/completions"
+            ]
+          },
+          {
+            "group": "Models",
+            "pages": [
+              "cli/list",
+              "cli/pull",
+              "cli/rm",
+              "cli/models"
+            ]
+          },
+          {
+            "group": "Workflows",
+            "pages": [
+              "cli/tts",
+              "cli/transcribe",
+              "cli/diarize",
+              "cli/align",
+              "cli/chat"
+            ]
+          },
+          {
+            "group": "Benchmarks",
+            "pages": [
+              "cli/bench"
+            ]
+          }
+        ]
+      },
+      {
+        "group": "Models",
+        "icon": "database",
+        "root": "models/index",
+        "pages": [
+          "models/manual-download",
+          "manual-gemma-3-1b-download"
+        ]
+      },
+      {
+        "group": "API Reference",
+        "icon": "braces",
+        "pages": [
+          "api"
+        ]
+      },
+      {
+        "group": "Troubleshooting",
+        "icon": "wrench",
+        "pages": [
+          "troubleshooting"
+        ]
+      }
+    ]
+  },
+  "errors": {
+    "404": {
+      "title": "Page not found",
+      "description": "The page may have moved. Use the sidebar or search to find the current Izwi docs."
+    }
+  }
+}
