@@ -59,7 +59,7 @@ When the server is running, open `/docs` for the local Scalar API reference or
 covers the stable OpenAI-compatible contract, `/v1/responses` preview routes,
 readiness probes, and Scalar sidebar entries for preview first-party, operator,
 and realtime route families. Detailed preview behavior is documented in the
-[API Reference](./api.md).
+[API Reference](/api).
 
 | Surface | Status | Notes |
 |---------|--------|-------|
@@ -105,6 +105,6 @@ Use the following expectations when validating a host:
 
 ## See Also
 
-- [Installation](./installation/index.md)
-- [Getting Started](./getting-started.md)
-- [CLI Reference](./cli/index.md)
+- [Installation](/installation)
+- [Getting Started](/getting-started)
+- [CLI Reference](/cli)

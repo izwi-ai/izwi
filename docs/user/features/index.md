@@ -13,14 +13,14 @@ Izwi provides a comprehensive suite of audio AI capabilities. Each feature is ac
 
 | Feature | Description | Guide |
 |---------|-------------|-------|
-| **Voice** | Real-time voice conversations with AI | [Voice Guide](./voice.md) |
-| **Chat** | Text-based AI conversations | [Chat Guide](./chat.md) |
-| **Text-to-Speech** | Generate natural speech from text | [TTS Guide](./text-to-speech.md) |
-| **Studio** | Manage long-form TTS projects and exports | [Studio Guide](./studio.md) |
-| **Transcription** | Convert audio to text | [Transcription Guide](./transcription.md) |
-| **Diarization** | Identify multiple speakers | [Diarization Guide](./diarization.md) |
-| **Voice Cloning** | Clone voices from audio samples | [Voice Cloning Guide](./voice-cloning.md) |
-| **Voice Design** | Create voices from descriptions | [Voice Design Guide](./voice-design.md) |
+| **Voice** | Real-time voice conversations with AI | [Voice Guide](/features/voice) |
+| **Chat** | Text-based AI conversations | [Chat Guide](/features/chat) |
+| **Text-to-Speech** | Generate natural speech from text | [TTS Guide](/features/text-to-speech) |
+| **Studio** | Manage long-form TTS projects and exports | [Studio Guide](/features/studio) |
+| **Transcription** | Convert audio to text | [Transcription Guide](/features/transcription) |
+| **Diarization** | Identify multiple speakers | [Diarization Guide](/features/diarization) |
+| **Voice Cloning** | Clone voices from audio samples | [Voice Cloning Guide](/features/voice-cloning) |
+| **Voice Design** | Create voices from descriptions | [Voice Design Guide](/features/voice-design) |
 
 ---
 
@@ -82,8 +82,8 @@ Different features require different models:
 
 Choose a feature to learn more:
 
-- [Voice Mode](./voice.md) — Real-time conversations
-- [Text-to-Speech](./text-to-speech.md) — Generate speech
-- [Studio](./studio.md) — Build long-form TTS projects
-- [Transcription](./transcription.md) — Convert audio to text
-- [API Reference](../api.md) — Integrate with HTTP, SSE, and WebSocket APIs
+- [Voice Mode](/features/voice) — Real-time conversations
+- [Text-to-Speech](/features/text-to-speech) — Generate speech
+- [Studio](/features/studio) — Build long-form TTS projects
+- [Transcription](/features/transcription) — Convert audio to text
+- [API Reference](/api) — Integrate with HTTP, SSE, and WebSocket APIs

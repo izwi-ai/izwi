@@ -27,9 +27,9 @@ Those endpoints only show variants that are enabled for download/use.
 | Kokoro | `Kokoro-82M` |
 
 > `Kokoro-82M` requires `espeak-ng`:
-> [macOS](../installation/macos.md#optional-install-espeak-ng-for-kokoro-82m),
-> [Linux](../installation/linux.md#optional-install-espeak-ng-for-kokoro-82m),
-> [Windows](../installation/windows.md#optional-install-espeak-ng-for-kokoro-82m)
+> [macOS](/installation/macos#optional-install-espeak-ng-for-kokoro-82m),
+> [Linux](/installation/linux#optional-install-espeak-ng-for-kokoro-82m),
+> [Windows](/installation/windows#optional-install-espeak-ng-for-kokoro-82m)
 
 > `Voxtral-4B-TTS-2603` includes bundled voice assets licensed under CC BY-NC
 > 4.0 and supports 20 preset voices with 24 kHz output.
@@ -161,8 +161,8 @@ izwi serve
 
 Some models (for example Gemma) may require manual Hugging Face access setup:
 
-- [Manual Download: Gemma 3 1B](./manual-gemma-3-1b-download.md)
-- [Manual Download Guide](./manual-download.md)
+- [Manual Download: Gemma 3 1B](/models/manual-gemma-3-1b-download)
+- [Manual Download Guide](/models/manual-download)
 
 ---
 
@@ -194,6 +194,6 @@ izwi status --detailed
 
 ## Next Steps
 
-- [Manual Model Downloads](./manual-download.md)
-- [CLI Reference](../cli/index.md)
-- [Troubleshooting](../troubleshooting.md)
+- [Manual Model Downloads](/models/manual-download)
+- [CLI Reference](/cli)
+- [Troubleshooting](/troubleshooting)

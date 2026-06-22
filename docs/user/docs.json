@@ -125,7 +125,7 @@
         "root": "models/index",
         "pages": [
           "models/manual-download",
-          "manual-gemma-3-1b-download"
+          "models/manual-gemma-3-1b-download"
         ]
       },
       {
@@ -144,6 +144,13 @@
       }
     ]
   },
+  "redirects": [
+    {
+      "source": "/manual-gemma-3-1b-download",
+      "destination": "/models/manual-gemma-3-1b-download",
+      "permanent": true
+    }
+  ],
   "errors": {
     "404": {
       "title": "Page not found",

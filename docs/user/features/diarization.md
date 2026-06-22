@@ -118,7 +118,7 @@ Ready job records include `segments`, `words`, `utterances`, `speaker_count`,
 `duration_secs`, `alignment_coverage`, LLM refinement status, processing metrics,
 and the formatted `transcript`.
 
-See the [API Reference](../api.md#speech-text-jobs) for JSON input and exact response shapes.
+See the [API Reference](/api#speech-text-jobs) for JSON input and exact response shapes.
 
 ---
 
@@ -192,6 +192,6 @@ Identify speakers for editing and show notes:
 
 ## See Also
 
-- [Transcription](./transcription.md) — Single-speaker transcription
-- [Voice Mode](./voice.md) — Real-time conversations
-- [CLI Reference](../cli/index.md) — Command documentation
+- [Transcription](/features/transcription) — Single-speaker transcription
+- [Voice Mode](/features/voice) — Real-time conversations
+- [CLI Reference](/cli) — Command documentation

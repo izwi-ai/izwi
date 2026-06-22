@@ -192,4 +192,4 @@ Only keys you set need to be present in the file. `izwi serve` resolves runtime 
 
 ## See Also
 
-- [`izwi serve`](./serve.md) — Server options and runtime precedence
+- [`izwi serve`](/cli/serve) — Server options and runtime precedence

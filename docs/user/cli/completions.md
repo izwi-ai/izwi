@@ -92,4 +92,4 @@ izwi pull qwen3-<TAB>
 
 ## See Also
 
-- [CLI Reference](./index.md)
+- [CLI Reference](/cli)

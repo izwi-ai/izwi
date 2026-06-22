@@ -100,7 +100,7 @@ curl -X POST http://localhost:8080/v1/audio/speech \
 ```
 
 Saved voices can also be managed through `/v1/voices` and reused from
-`/v1/audio/speech`. See the [API Reference](../api.md#saved-voices) for the
+`/v1/audio/speech`. See the [API Reference](/api#saved-voices) for the
 saved voice routes and exact fields.
 
 ---
@@ -177,6 +177,6 @@ Voice cloning is a powerful technology. Please use it responsibly:
 
 ## See Also
 
-- [Voice Design](./voice-design.md) — Create voices from descriptions
-- [Text-to-Speech](./text-to-speech.md) — Standard TTS
-- [Models](../models/index.md) — Download models
+- [Voice Design](/features/voice-design) — Create voices from descriptions
+- [Text-to-Speech](/features/text-to-speech) — Standard TTS
+- [Models](/models) — Download models

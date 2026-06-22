@@ -170,6 +170,6 @@ Or via the web UI at `http://localhost:8080/chat`.
 
 ## See Also
 
-- [Models Overview](./models/index.md)
-- [Manual Download Guide](./models/manual-download.md)
-- [Troubleshooting](./troubleshooting.md)
+- [Models Overview](/models)
+- [Manual Download Guide](/models/manual-download)
+- [Troubleshooting](/troubleshooting)

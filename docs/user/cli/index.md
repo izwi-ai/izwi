@@ -43,36 +43,36 @@ These options work with all commands:
 
 | Command | Description |
 |---------|-------------|
-| [`serve`](./serve.md) | Start the inference server |
-| [`status`](./status.md) | Show server health and status |
+| [`serve`](/cli/serve) | Start the inference server |
+| [`status`](/cli/status) | Show server health and status |
 
 ### Models
 
 | Command | Description |
 |---------|-------------|
-| [`list`](./list.md) | List available models |
-| [`pull`](./pull.md) | Download a model |
-| [`rm`](./rm.md) | Remove a downloaded model |
-| [`models`](./models.md) | Model management subcommands |
+| [`list`](/cli/list) | List available models |
+| [`pull`](/cli/pull) | Download a model |
+| [`rm`](/cli/rm) | Remove a downloaded model |
+| [`models`](/cli/models) | Model management subcommands |
 
 ### Inference
 
 | Command | Description |
 |---------|-------------|
-| [`tts`](./tts.md) | Text-to-speech generation |
-| [`transcribe`](./transcribe.md) | Speech-to-text transcription |
-| [`diarize`](./diarize.md) | Speaker diarization |
-| [`align`](./align.md) | Forced alignment |
-| [`chat`](./chat.md) | Interactive chat |
+| [`tts`](/cli/tts) | Text-to-speech generation |
+| [`transcribe`](/cli/transcribe) | Speech-to-text transcription |
+| [`diarize`](/cli/diarize) | Speaker diarization |
+| [`align`](/cli/align) | Forced alignment |
+| [`chat`](/cli/chat) | Interactive chat |
 
 ### Utilities
 
 | Command | Description |
 |---------|-------------|
-| [`bench`](./bench.md) | Run benchmarks |
-| [`config`](./config.md) | Manage configuration |
-| [`completions`](./completions.md) | Generate shell completions |
-| [`version`](./version.md) | Show version information |
+| [`bench`](/cli/bench) | Run benchmarks |
+| [`config`](/cli/config) | Manage configuration |
+| [`completions`](/cli/completions) | Generate shell completions |
+| [`version`](/cli/version) | Show version information |
 
 ---
 
@@ -161,6 +161,6 @@ izwi tts --help
 
 ## See Also
 
-- [Getting Started](../getting-started.md)
-- [Features](../features/index.md)
-- [Troubleshooting](../troubleshooting.md)
+- [Getting Started](/getting-started)
+- [Features](/features)
+- [Troubleshooting](/troubleshooting)

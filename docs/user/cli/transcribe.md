@@ -173,5 +173,5 @@ selected model or forced aligner can provide word timing metadata.
 
 ## See Also
 
-- [Transcription Guide](../features/transcription.md)
-- [Diarization Guide](../features/diarization.md)
+- [Transcription Guide](/features/transcription)
+- [Diarization Guide](/features/diarization)

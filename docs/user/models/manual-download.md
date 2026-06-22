@@ -144,7 +144,7 @@ huggingface-cli download <repo-id> --local-dir "<path>"
 | Llama 3 | `meta-llama/Llama-3-*` | Requires license acceptance |
 
 See specific guides:
-- [Gemma 3 1B Download](./manual-gemma-3-1b-download.md)
+- [Gemma 3 1B Download](/models/manual-gemma-3-1b-download)
 
 ---
 
@@ -194,5 +194,5 @@ Large models can be 10+ GB. Ensure you have enough free space.
 
 ## Next Steps
 
-- [Models Overview](./index.md)
-- [Troubleshooting](../troubleshooting.md)
+- [Models Overview](/models)
+- [Troubleshooting](/troubleshooting)

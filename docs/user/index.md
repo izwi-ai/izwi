@@ -32,14 +32,14 @@ Izwi is a powerful, privacy-focused audio AI platform that runs entirely on your
 
 | Section | Description |
 |---------|-------------|
-| [Getting Started](./getting-started.md) | Install Izwi and run your first command |
-| [Installation](./installation/index.md) | Platform-specific installation guides |
-| [Runtime Support Matrix](./support-matrix.md) | Supported OS, hardware, artifact, and API surfaces |
-| [API Reference](./api.md) | Stable, preview, first-party, operator, and realtime HTTP/WebSocket APIs |
-| [Features](./features/index.md) | Learn about each feature in detail |
-| [Models](./models/index.md) | Understand and manage AI models |
-| [CLI Reference](./cli/index.md) | Complete command-line reference |
-| [Troubleshooting](./troubleshooting.md) | Common issues and solutions |
+| [Getting Started](/getting-started) | Install Izwi and run your first command |
+| [Installation](/installation) | Platform-specific installation guides |
+| [Runtime Support Matrix](/support-matrix) | Supported OS, hardware, artifact, and API surfaces |
+| [API Reference](/api) | Stable, preview, first-party, operator, and realtime HTTP/WebSocket APIs |
+| [Features](/features) | Learn about each feature in detail |
+| [Models](/models) | Understand and manage AI models |
+| [CLI Reference](/cli) | Complete command-line reference |
+| [Troubleshooting](/troubleshooting) | Common issues and solutions |
 
 ---
 
@@ -54,7 +54,7 @@ Izwi is a powerful, privacy-focused audio AI platform that runs entirely on your
 | **Storage** | 10 GB free | 50 GB+ free |
 | **GPU** | — | Apple Silicon / NVIDIA GPU (see support matrix) |
 
-> **Note:** Izwi is optimized for Apple Silicon Macs with Metal acceleration. NVIDIA CUDA support exists in the runtime, but artifact-level support varies by source build, Docker image, and release package. See the [Runtime Support Matrix](./support-matrix.md).
+> **Note:** Izwi is optimized for Apple Silicon Macs with Metal acceleration. NVIDIA CUDA support exists in the runtime, but artifact-level support varies by source build, Docker image, and release package. See the [Runtime Support Matrix](/support-matrix).
 
 ---
 

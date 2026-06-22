@@ -216,5 +216,5 @@ sw_vers
 
 ## Next Steps
 
-- [Getting Started](../getting-started.md)
-- [Download Models](../models/index.md)
+- [Getting Started](/getting-started)
+- [Download Models](/models)

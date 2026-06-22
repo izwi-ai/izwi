@@ -82,6 +82,6 @@ During a chat session:
 
 ## See Also
 
-- [Chat Guide](../features/chat.md)
-- [Voice Mode](../features/voice.md)
-- [Models Guide](../models/index.md)
+- [Chat Guide](/features/chat)
+- [Voice Mode](/features/voice)
+- [Models Guide](/models)

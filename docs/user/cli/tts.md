@@ -26,9 +26,9 @@ Converts text to speech using a TTS model. The OSS server emits WAV audio for th
 `Kokoro-82M` requires `espeak-ng` to be installed on the host system (used for phonemization).
 
 - Install instructions:
-  - [macOS](../installation/macos.md#optional-install-espeak-ng-for-kokoro-82m)
-  - [Linux](../installation/linux.md#optional-install-espeak-ng-for-kokoro-82m)
-  - [Windows](../installation/windows.md#optional-install-espeak-ng-for-kokoro-82m)
+  - [macOS](/installation/macos#optional-install-espeak-ng-for-kokoro-82m)
+  - [Linux](/installation/linux#optional-install-espeak-ng-for-kokoro-82m)
+  - [Windows](/installation/windows#optional-install-espeak-ng-for-kokoro-82m)
 
 ---
 
@@ -146,6 +146,6 @@ izwi tts "Long text for streaming" --stream --play
 
 ## See Also
 
-- [Text-to-Speech Guide](../features/text-to-speech.md)
-- [Voice Cloning Guide](../features/voice-cloning.md)
-- [Voice Design Guide](../features/voice-design.md)
+- [Text-to-Speech Guide](/features/text-to-speech)
+- [Voice Cloning Guide](/features/voice-cloning)
+- [Voice Design Guide](/features/voice-design)

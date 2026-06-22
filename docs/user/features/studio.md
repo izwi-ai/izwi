@@ -28,6 +28,6 @@ Studio is Izwi's long-form text-to-speech workspace for single-device, solo prod
 
 ## Using the API
 
-Studio's preview API is documented in the [API Reference](../api.md#studio).
+Studio's preview API is documented in the [API Reference](/api#studio).
 It covers projects, folders, metadata, pronunciations, snapshots, render jobs,
 segment editing, and project audio export query parameters.

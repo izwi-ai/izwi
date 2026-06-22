@@ -140,5 +140,5 @@ izwi align recording.wav "The quick brown fox" --format verbose_json
 
 ## See Also
 
-- [`izwi transcribe`](./transcribe.md) — Speech-to-text
-- [`izwi diarize`](./diarize.md) — Speaker diarization
+- [`izwi transcribe`](/cli/transcribe) — Speech-to-text
+- [`izwi diarize`](/cli/diarize) — Speaker diarization

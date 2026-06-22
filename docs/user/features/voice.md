@@ -102,8 +102,8 @@ Use **Observational Memory** in settings to review, enable, disable, or delete t
 
 Voice mode uses preview APIs for the voice profile, observations, saved
 sessions, and low-latency WebSocket transport. See the
-[API Reference](../api.md#voice-profile-memory-and-sessions) for persisted
-voice state and [Voice Realtime](../api.md#voice-realtime) for the WebSocket
+[API Reference](/api#voice-profile-memory-and-sessions) for persisted
+voice state and [Voice Realtime](/api#voice-realtime) for the WebSocket
 protocol.
 
 ### Audio Settings
@@ -159,6 +159,6 @@ protocol.
 
 ## See Also
 
-- [Chat](./chat.md) — Text-based conversations
-- [Transcription](./transcription.md) — Batch audio transcription
-- [Text-to-Speech](./text-to-speech.md) — Generate speech from text
+- [Chat](/features/chat) — Text-based conversations
+- [Transcription](/features/transcription) — Batch audio transcription
+- [Text-to-Speech](/features/text-to-speech) — Generate speech from text

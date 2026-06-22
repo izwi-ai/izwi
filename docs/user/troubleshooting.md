@@ -365,7 +365,7 @@ Check the endpoint URL:
 - Chat: `POST /v1/chat/completions`
 
 For the full route list, including preview first-party APIs, admin routes, and
-realtime WebSockets, see the [API Reference](./api.md).
+realtime WebSockets, see the [API Reference](/api).
 
 ### 500 Internal Server Error
 
@@ -410,6 +410,6 @@ Open an issue on GitHub with:
 
 ## See Also
 
-- [Installation](./installation/index.md)
-- [Getting Started](./getting-started.md)
-- [CLI Reference](./cli/index.md)
+- [Installation](/installation)
+- [Getting Started](/getting-started)
+- [CLI Reference](/cli)

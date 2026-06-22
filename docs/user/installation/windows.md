@@ -8,7 +8,7 @@ icon: "monitor-cog"
 
 Izwi runs on Windows 10 and later. GitHub Release installers keep the public `izwi.exe` and `izwi-server.exe` names and are intentionally CPU-only.
 
-See the [Runtime Support Matrix](../support-matrix.md) for the current artifact contract.
+See the [Runtime Support Matrix](/support-matrix) for the current artifact contract.
 
 ---
 
@@ -270,5 +270,5 @@ Binaries will be in `target\release\`.
 
 ## Next Steps
 
-- [Getting Started](../getting-started.md)
-- [Download Models](../models/index.md)
+- [Getting Started](/getting-started)
+- [Download Models](/models)

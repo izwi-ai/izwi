@@ -82,5 +82,5 @@ The status command shows:
 
 ## See Also
 
-- [`izwi serve`](./serve.md) — Start the server
-- [`izwi models`](./models.md) — Model management
+- [`izwi serve`](/cli/serve) — Start the server
+- [`izwi models`](/cli/models) — Model management

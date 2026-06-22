@@ -128,7 +128,7 @@ Image inputs are supported only on Qwen3.5 GGUF chat variants:
 
 The API also supports SSE streaming, `stream_options.include_usage`, tool-call
 payloads, and strict/relaxed OpenAI compatibility profiles. See the
-[API Reference](../api.md#chat-completions) for the full request contract and
+[API Reference](/api#chat-completions) for the full request contract and
 streaming sequence.
 
 ---
@@ -162,6 +162,6 @@ streaming sequence.
 
 ## See Also
 
-- [Voice Mode](./voice.md)
-- [Models](../models/index.md)
-- [CLI Reference](../cli/index.md)
+- [Voice Mode](/features/voice)
+- [Models](/models)
+- [CLI Reference](/cli)

@@ -65,5 +65,5 @@ izwi rm qwen3-tts-0.6b-base --yes
 
 ## See Also
 
-- [`izwi list`](./list.md) — List models
-- [`izwi pull`](./pull.md) — Download models
+- [`izwi list`](/cli/list) — List models
+- [`izwi pull`](/cli/pull) — Download models
