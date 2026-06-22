@@ -2,13 +2,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
-use crate::catalog::{ModelFamily, parse_model_variant, resolve_asr_model_variant};
+use crate::catalog::{parse_model_variant, resolve_asr_model_variant, ModelFamily};
 use crate::engine::{AsrProgress, AsrProgressPhase, EngineCoreRequest};
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
 use crate::models::architectures::granite_speech::asr::{
-    GraniteSpeechTask, parse_granite_speech_output,
+    parse_granite_speech_output, GraniteSpeechTask,
 };
 use crate::models::registry::{
     NativeAsrGenerationOptions, NativeAsrModel, NativeAsrRealtimeEvent, NativeAsrRealtimeState,
@@ -22,7 +23,7 @@ use crate::runtime::types::{
     AsrTranscription, SpeakerAttributedAsrResult, SpeakerAttributedAsrStatus,
     SpeakerAttributedAsrTurn,
 };
-use izwi_asr_toolkit::{AsrLongFormConfig, AudioChunk, plan_audio_chunks};
+use izwi_asr_toolkit::{plan_audio_chunks, AsrLongFormConfig, AudioChunk};
 
 #[derive(Clone, Copy)]
 enum AsrAudioInput<'a> {
@@ -64,6 +65,13 @@ impl GraniteSaaPrefixMode {
         {
             Some("full") | Some("full_transcript") | Some("legacy") => Self::FullTranscript,
             _ => Self::None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::FullTranscript => "full_transcript",
         }
     }
 }
@@ -1116,6 +1124,7 @@ impl RuntimeService {
             let language_owned = language.map(ToOwned::to_owned);
             let task_samples = samples.clone();
             let task_model = model.clone();
+            let max_new_tokens = granite_saa_max_new_tokens(&task_samples, sample_rate);
             let transcription = tokio::task::spawn_blocking(move || {
                 granite_saa_transcribe_chunk(
                     &task_model,
@@ -1123,6 +1132,7 @@ impl RuntimeService {
                     sample_rate,
                     language_owned.as_deref(),
                     None,
+                    max_new_tokens,
                 )
             })
             .await
@@ -1256,6 +1266,15 @@ struct GraniteSaaLongFormOutput {
     text: String,
     language: Option<String>,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct GraniteSaaChunkDecodeDiagnostics {
+    generated_tokens: Option<usize>,
+    max_new_tokens: Option<usize>,
+    stop_reason: Option<String>,
+    prompt_tokens: Option<usize>,
+    prompt_prefix_tokens: Option<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -1528,12 +1547,11 @@ fn granite_saa_max_new_tokens_for_duration(duration_secs: f32) -> usize {
         return override_tokens;
     }
 
-    let duration_budget =
-        if duration_secs.is_finite() && duration_secs > 0.0 {
-            (duration_secs * GRANITE_SAA_NEW_TOKENS_PER_SECOND).ceil() as usize
-        } else {
-            0
-        };
+    let duration_budget = if duration_secs.is_finite() && duration_secs > 0.0 {
+        (duration_secs * GRANITE_SAA_NEW_TOKENS_PER_SECOND).ceil() as usize
+    } else {
+        0
+    };
     GRANITE_SAA_NEW_TOKEN_RESERVE
         .saturating_add(duration_budget)
         .clamp(GRANITE_SAA_MIN_NEW_TOKENS, GRANITE_SAA_MAX_NEW_TOKENS)
@@ -1548,14 +1566,74 @@ fn granite_saa_max_new_tokens(audio: &[f32], sample_rate: u32) -> usize {
     granite_saa_max_new_tokens_for_duration(duration_secs)
 }
 
-fn granite_saa_chunk_prefix_text(assembler: &GraniteSaaTranscriptAssembler) -> Option<String> {
-    match GraniteSaaPrefixMode::from_env() {
+fn granite_saa_chunk_prefix_text(
+    assembler: &GraniteSaaTranscriptAssembler,
+    mode: GraniteSaaPrefixMode,
+) -> Option<String> {
+    match mode {
         GraniteSaaPrefixMode::None => None,
         GraniteSaaPrefixMode::FullTranscript => {
             let prefix_text = assembler.prefix_text();
             (!prefix_text.trim().is_empty()).then_some(prefix_text)
         }
     }
+}
+
+fn granite_saa_decode_diagnostics(
+    diagnostics: Option<&serde_json::Value>,
+) -> GraniteSaaChunkDecodeDiagnostics {
+    let Some(diagnostics) = diagnostics else {
+        return GraniteSaaChunkDecodeDiagnostics::default();
+    };
+    let decode = diagnostics.get("decode").unwrap_or(diagnostics);
+    let prompt = diagnostics.get("prompt");
+
+    GraniteSaaChunkDecodeDiagnostics {
+        generated_tokens: decode
+            .get("generated_tokens")
+            .or_else(|| diagnostics.get("generated_tokens"))
+            .and_then(json_usize),
+        max_new_tokens: decode.get("max_new_tokens").and_then(json_usize),
+        stop_reason: decode
+            .get("stop_reason")
+            .or_else(|| diagnostics.get("stop_reason"))
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned),
+        prompt_tokens: prompt
+            .and_then(|value| value.get("prompt_tokens"))
+            .or_else(|| diagnostics.get("prompt_tokens"))
+            .and_then(json_usize),
+        prompt_prefix_tokens: prompt
+            .and_then(|value| value.get("prefix_tokens"))
+            .or_else(|| diagnostics.get("prompt_prefix_tokens"))
+            .and_then(json_usize),
+    }
+}
+
+fn granite_saa_max_token_warning(
+    chunk_index: usize,
+    diagnostics: &GraniteSaaChunkDecodeDiagnostics,
+) -> Option<String> {
+    if diagnostics.stop_reason.as_deref() != Some("max_tokens") {
+        return None;
+    }
+
+    let generated = diagnostics
+        .generated_tokens
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let max_new_tokens = diagnostics
+        .max_new_tokens
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "configured".to_string());
+    Some(format!(
+        "Granite SAA chunk {} reached the decode token limit ({generated}/{max_new_tokens}); transcript may be incomplete.",
+        chunk_index + 1
+    ))
+}
+
+fn json_usize(value: &serde_json::Value) -> Option<usize> {
+    value.as_u64().and_then(|value| usize::try_from(value).ok())
 }
 
 async fn granite_saa_long_form_transcribe<P>(
@@ -1607,7 +1685,26 @@ where
         let chunk_audio = samples[chunk.start_sample..chunk.end_sample].to_vec();
         let task_model = model.clone();
         let language_owned = language.map(ToOwned::to_owned);
-        let prefix_text = granite_saa_chunk_prefix_text(&assembler);
+        let prefix_mode = GraniteSaaPrefixMode::from_env();
+        let prefix_text = granite_saa_chunk_prefix_text(&assembler, prefix_mode);
+        let prefix_chars = prefix_text
+            .as_deref()
+            .map(|text| text.chars().count())
+            .unwrap_or(0);
+        let max_new_tokens = granite_saa_max_new_tokens(&chunk_audio, sample_rate);
+        let chunk_duration_secs = samples_to_seconds_f64(chunk_audio.len(), sample_rate);
+        tracing::info!(
+            chunk_index = idx + 1,
+            total_chunks = chunks.len(),
+            chunk_start_secs = samples_to_seconds_f64(chunk.start_sample, sample_rate),
+            chunk_end_secs = samples_to_seconds_f64(chunk.end_sample, sample_rate),
+            chunk_duration_secs,
+            max_new_tokens,
+            prefix_mode = prefix_mode.as_str(),
+            prefix_chars,
+            "starting Granite SAA chunk decode"
+        );
+        let chunk_started = Instant::now();
         let transcription = tokio::task::spawn_blocking(move || {
             granite_saa_transcribe_chunk(
                 &task_model,
@@ -1615,6 +1712,7 @@ where
                 sample_rate,
                 language_owned.as_deref(),
                 prefix_text.as_deref(),
+                max_new_tokens,
             )
         })
         .await
@@ -1624,6 +1722,21 @@ where
                 idx + 1
             ))
         })??;
+        let decode_diagnostics = granite_saa_decode_diagnostics(transcription.diagnostics.as_ref());
+        tracing::info!(
+            chunk_index = idx + 1,
+            total_chunks = chunks.len(),
+            elapsed_ms = chunk_started.elapsed().as_secs_f64() * 1000.0,
+            generated_tokens = ?decode_diagnostics.generated_tokens,
+            max_new_tokens = decode_diagnostics.max_new_tokens.unwrap_or(max_new_tokens),
+            stop_reason = decode_diagnostics
+                .stop_reason
+                .as_deref()
+                .unwrap_or("unknown"),
+            prompt_tokens = ?decode_diagnostics.prompt_tokens,
+            prompt_prefix_tokens = ?decode_diagnostics.prompt_prefix_tokens,
+            "finished Granite SAA chunk decode"
+        );
 
         if language_out.is_none() {
             language_out = transcription.language.clone();
@@ -1633,6 +1746,14 @@ where
                 "Granite SAA chunk {} returned empty text.",
                 idx + 1
             ));
+        }
+        if let Some(warning) = granite_saa_max_token_warning(idx, &decode_diagnostics) {
+            tracing::warn!(
+                chunk_index = idx + 1,
+                warning = warning.as_str(),
+                "Granite SAA chunk reached decode token limit"
+            );
+            warnings.push(warning);
         }
         warnings.extend(assembler.push_chunk_text(transcription.text.as_str(), idx));
 
@@ -1660,8 +1781,8 @@ fn granite_saa_transcribe_chunk(
     sample_rate: u32,
     language: Option<&str>,
     prefix_text: Option<&str>,
+    max_new_tokens: usize,
 ) -> Result<NativeAsrTranscription> {
-    let max_new_tokens = granite_saa_max_new_tokens(audio, sample_rate);
     model.transcribe_with_granite_speech_task_and_options(
         audio,
         sample_rate,
@@ -2127,22 +2248,18 @@ mod tests {
     #[test]
     fn granite_saa_assembler_dedupes_overlap_and_preserves_turns() {
         let mut assembler = GraniteSaaTranscriptAssembler::default();
-        assert!(
-            assembler
-                .push_chunk_text(
-                    "[Speaker 1]: hello there [Speaker 2]: hi back from me now",
-                    0,
-                )
-                .is_empty()
-        );
-        assert!(
-            assembler
-                .push_chunk_text(
-                    "[Speaker 2]: hi back from me now and more [Speaker 1]: ok",
-                    1,
-                )
-                .is_empty()
-        );
+        assert!(assembler
+            .push_chunk_text(
+                "[Speaker 1]: hello there [Speaker 2]: hi back from me now",
+                0,
+            )
+            .is_empty());
+        assert!(assembler
+            .push_chunk_text(
+                "[Speaker 2]: hi back from me now and more [Speaker 1]: ok",
+                1,
+            )
+            .is_empty());
 
         let text = assembler.text();
         assert_eq!(text.matches("hi back from me now").count(), 1);
@@ -2192,7 +2309,10 @@ mod tests {
         assembler.push_chunk_text("[Speaker 1]: prior audio text", 0);
 
         assert_eq!(GraniteSaaPrefixMode::from_env(), GraniteSaaPrefixMode::None);
-        assert_eq!(granite_saa_chunk_prefix_text(&assembler), None);
+        assert_eq!(
+            granite_saa_chunk_prefix_text(&assembler, GraniteSaaPrefixMode::from_env()),
+            None
+        );
 
         if let Some(previous) = previous {
             std::env::set_var("IZWI_GRANITE_SAA_PREFIX_MODE", previous);
@@ -2211,7 +2331,8 @@ mod tests {
             assembler.push_chunk_text(format!("[Speaker 1]: turn {idx}").as_str(), idx);
         }
 
-        let prefix = granite_saa_chunk_prefix_text(&assembler).expect("full prefix");
+        let prefix = granite_saa_chunk_prefix_text(&assembler, GraniteSaaPrefixMode::from_env())
+            .expect("full prefix");
         assert_eq!(
             GraniteSaaPrefixMode::from_env(),
             GraniteSaaPrefixMode::FullTranscript
@@ -2224,6 +2345,37 @@ mod tests {
         } else {
             std::env::remove_var("IZWI_GRANITE_SAA_PREFIX_MODE");
         }
+    }
+
+    #[test]
+    fn granite_saa_decode_diagnostics_warn_when_chunk_hits_token_limit() {
+        let diagnostics = serde_json::json!({
+            "decode": {
+                "generated_tokens": 2500,
+                "max_new_tokens": 2500,
+                "stop_reason": "max_tokens"
+            },
+            "prompt": {
+                "prompt_tokens": 512,
+                "prefix_tokens": 0
+            }
+        });
+
+        let decoded = granite_saa_decode_diagnostics(Some(&diagnostics));
+        assert_eq!(
+            decoded,
+            GraniteSaaChunkDecodeDiagnostics {
+                generated_tokens: Some(2500),
+                max_new_tokens: Some(2500),
+                stop_reason: Some("max_tokens".to_string()),
+                prompt_tokens: Some(512),
+                prompt_prefix_tokens: Some(0),
+            }
+        );
+
+        let warning = granite_saa_max_token_warning(2, &decoded).expect("max token limit warning");
+        assert!(warning.contains("chunk 3"));
+        assert!(warning.contains("2500/2500"));
     }
 
     #[test]
