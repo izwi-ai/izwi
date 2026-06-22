@@ -49,6 +49,25 @@ const GRANITE_SAA_MIN_OVERLAP_WORDS: usize = 4;
 const GRANITE_SAA_MAX_OVERLAP_WORDS: usize = 80;
 const UNKNOWN_SAA_SPEAKER: &str = "UNKNOWN";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraniteSaaPrefixMode {
+    None,
+    FullTranscript,
+}
+
+impl GraniteSaaPrefixMode {
+    fn from_env() -> Self {
+        match std::env::var("IZWI_GRANITE_SAA_PREFIX_MODE")
+            .ok()
+            .map(|raw| raw.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("full") | Some("full_transcript") | Some("legacy") => Self::FullTranscript,
+            _ => Self::None,
+        }
+    }
+}
+
 fn resolve_asr_realtime_stream_variant(model_id: Option<&str>) -> Option<ModelVariant> {
     let variant = resolve_asr_model_variant(model_id);
     (variant.family() == ModelFamily::NemotronAsr).then_some(variant)
@@ -1529,6 +1548,16 @@ fn granite_saa_max_new_tokens(audio: &[f32], sample_rate: u32) -> usize {
     granite_saa_max_new_tokens_for_duration(duration_secs)
 }
 
+fn granite_saa_chunk_prefix_text(assembler: &GraniteSaaTranscriptAssembler) -> Option<String> {
+    match GraniteSaaPrefixMode::from_env() {
+        GraniteSaaPrefixMode::None => None,
+        GraniteSaaPrefixMode::FullTranscript => {
+            let prefix_text = assembler.prefix_text();
+            (!prefix_text.trim().is_empty()).then_some(prefix_text)
+        }
+    }
+}
+
 async fn granite_saa_long_form_transcribe<P>(
     model: Arc<NativeAsrModel>,
     samples: &[f32],
@@ -1578,8 +1607,7 @@ where
         let chunk_audio = samples[chunk.start_sample..chunk.end_sample].to_vec();
         let task_model = model.clone();
         let language_owned = language.map(ToOwned::to_owned);
-        let prefix_text = assembler.prefix_text();
-        let prefix_text = (!prefix_text.trim().is_empty()).then_some(prefix_text);
+        let prefix_text = granite_saa_chunk_prefix_text(&assembler);
         let transcription = tokio::task::spawn_blocking(move || {
             granite_saa_transcribe_chunk(
                 &task_model,
@@ -2153,6 +2181,49 @@ mod tests {
         assert!(prefix.chars().count() <= GRANITE_SAA_PREFIX_MAX_CHARS);
         assert!(prefix.contains("[Speaker 1]:"));
         assert!(!prefix.contains("turn 0"));
+    }
+
+    #[test]
+    fn granite_saa_chunk_prefix_defaults_to_none() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let previous = std::env::var("IZWI_GRANITE_SAA_PREFIX_MODE").ok();
+        std::env::remove_var("IZWI_GRANITE_SAA_PREFIX_MODE");
+        let mut assembler = GraniteSaaTranscriptAssembler::default();
+        assembler.push_chunk_text("[Speaker 1]: prior audio text", 0);
+
+        assert_eq!(GraniteSaaPrefixMode::from_env(), GraniteSaaPrefixMode::None);
+        assert_eq!(granite_saa_chunk_prefix_text(&assembler), None);
+
+        if let Some(previous) = previous {
+            std::env::set_var("IZWI_GRANITE_SAA_PREFIX_MODE", previous);
+        } else {
+            std::env::remove_var("IZWI_GRANITE_SAA_PREFIX_MODE");
+        }
+    }
+
+    #[test]
+    fn granite_saa_chunk_prefix_full_mode_is_explicit_and_bounded() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let previous = std::env::var("IZWI_GRANITE_SAA_PREFIX_MODE").ok();
+        std::env::set_var("IZWI_GRANITE_SAA_PREFIX_MODE", "full");
+        let mut assembler = GraniteSaaTranscriptAssembler::default();
+        for idx in 0..32 {
+            assembler.push_chunk_text(format!("[Speaker 1]: turn {idx}").as_str(), idx);
+        }
+
+        let prefix = granite_saa_chunk_prefix_text(&assembler).expect("full prefix");
+        assert_eq!(
+            GraniteSaaPrefixMode::from_env(),
+            GraniteSaaPrefixMode::FullTranscript
+        );
+        assert!(prefix.chars().count() <= GRANITE_SAA_PREFIX_MAX_CHARS);
+        assert!(prefix.contains("[Speaker 1]:"));
+
+        if let Some(previous) = previous {
+            std::env::set_var("IZWI_GRANITE_SAA_PREFIX_MODE", previous);
+        } else {
+            std::env::remove_var("IZWI_GRANITE_SAA_PREFIX_MODE");
+        }
     }
 
     #[test]
