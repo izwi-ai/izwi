@@ -8,6 +8,12 @@
     "light": "#D95545",
     "dark": "#8F2A24"
   },
+  "logo": {
+    "light": "/images/app-icon.png",
+    "dark": "/images/app-icon.png",
+    "href": "/"
+  },
+  "favicon": "/images/app-icon.png",
   "appearance": {
     "default": "system"
   },
@@ -37,6 +43,11 @@
   "footer": {
     "socials": {
       "github": "https://github.com/izwi-ai/izwi"
+    }
+  },
+  "api": {
+    "playground": {
+      "display": "none"
     }
   },
   "navigation": {
