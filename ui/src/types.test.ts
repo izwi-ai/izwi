@@ -48,15 +48,15 @@ describe("speech route model filters", () => {
     ).toBe(true);
   });
 
-  it("keeps granite speech off regular transcription routes", () => {
+  it("includes granite speech on regular transcription routes", () => {
     expect(
       VIEW_CONFIGS.transcription.modelFilter("Granite-Speech-4.1-2B-Plus"),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       VIEW_CONFIGS.transcription.modelFilter(
         "ibm-granite/granite-speech-4.1-2b-plus",
       ),
-    ).toBe(false);
+    ).toBe(true);
   });
 
   it("includes lfm25 audio on transcription routes", () => {
