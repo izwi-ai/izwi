@@ -1,17 +1,9 @@
 ---
-title: "Izwi Documentation"
+title: "Overview"
 description: "User documentation for Izwi, a local-first audio inference engine for speech, voice, and chat workflows."
 sidebarTitle: "Overview"
 icon: "house"
 ---
-# Izwi Documentation
-
-Welcome to the official documentation for **Izwi** — a local-first audio inference engine for text-to-speech, speech recognition, and voice AI workflows.
-
-![Izwi icon](/images/app-icon.png)
-
----
-
 ## What is Izwi?
 
 Izwi is a powerful, privacy-focused audio AI platform that runs entirely on your machine. No cloud services, no API keys, no data leaving your device.

@@ -4,8 +4,6 @@ description: "Reference built-in voice and speaker IDs for Qwen3 CustomVoice, Ko
 sidebarTitle: "Voice Presets"
 icon: "audio-lines"
 ---
-# Voice Presets
-
 Use these IDs with `izwi tts --speaker`, the Text to Speech page, or
 `voice`/`speaker` fields on `/v1/audio/speech`.
 

@@ -3,8 +3,6 @@ title: "izwi serve"
 description: "Start the Izwi inference server and configure host, port, backends, logging, and runtime behavior."
 icon: "server"
 ---
-# izwi serve
-
 Start the Izwi inference server.
 
 ---

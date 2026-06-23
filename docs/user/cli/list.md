@@ -3,8 +3,6 @@ title: "izwi list"
 description: "List available and downloaded Izwi models with status and storage details."
 icon: "list"
 ---
-# izwi list
-
 List available models.
 
 ---

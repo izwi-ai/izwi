@@ -3,8 +3,6 @@ title: "izwi status"
 description: "Check Izwi server health, model readiness, runtime status, and detailed diagnostics."
 icon: "activity"
 ---
-# izwi status
-
 Show server health and status.
 
 ---

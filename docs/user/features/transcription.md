@@ -3,8 +3,6 @@ title: "Transcription"
 description: "Convert audio to text with Izwi through the CLI, web UI, and local API."
 icon: "mic"
 ---
-# Transcription
-
 Convert audio to text with high accuracy using automatic speech recognition (ASR).
 
 ---

@@ -3,8 +3,6 @@ title: "izwi transcribe"
 description: "Transcribe audio files from the command line with output formats and ASR model options."
 icon: "mic"
 ---
-# izwi transcribe
-
 Convert audio to text.
 
 ---

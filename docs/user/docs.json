@@ -145,16 +145,10 @@
         ]
       },
       {
-        "group": "API Reference",
-        "icon": "braces",
+        "group": "Reference & Help",
+        "icon": "book-open",
         "pages": [
-          "api"
-        ]
-      },
-      {
-        "group": "Troubleshooting",
-        "icon": "wrench",
-        "pages": [
+          "api",
           "troubleshooting"
         ]
       }

@@ -4,8 +4,6 @@ description: "Install Izwi on Windows with the installer, optional eSpeak NG, CU
 sidebarTitle: "Windows"
 icon: "monitor-cog"
 ---
-# Windows Installation
-
 Izwi runs on Windows 10 and later. GitHub Release installers keep the public `izwi.exe` and `izwi-server.exe` names and are intentionally CPU-only.
 
 See the [Runtime Support Matrix](/support-matrix) for the current artifact contract.

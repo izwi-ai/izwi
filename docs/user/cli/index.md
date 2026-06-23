@@ -4,12 +4,6 @@ description: "Complete reference for the Izwi command-line interface, global opt
 sidebarTitle: "Overview"
 icon: "terminal"
 ---
-# CLI Reference
-
-The `izwi` command-line interface provides complete control over Izwi's audio inference capabilities.
-
----
-
 ## Installation
 
 The CLI is installed automatically with Izwi. Verify installation:

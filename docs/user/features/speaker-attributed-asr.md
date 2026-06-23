@@ -4,8 +4,6 @@ description: "Generate Granite Speech speaker-turn transcripts through the Trans
 sidebarTitle: "Speaker Attributed ASR"
 icon: "users-round"
 ---
-# Speaker Attributed ASR
-
 Speaker Attributed ASR (SAA) is a rich transcription mode that asks Granite
 Speech to produce a transcript with speaker-turn labels. Use it when you want a
 speaker-attributed text transcript, not acoustic diarization segments.

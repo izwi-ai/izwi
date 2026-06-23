@@ -3,8 +3,6 @@ title: "izwi completions"
 description: "Generate shell completions for Bash, Zsh, Fish, PowerShell, and Elvish."
 icon: "list-checks"
 ---
-# izwi completions
-
 Generate shell completions.
 
 ---
