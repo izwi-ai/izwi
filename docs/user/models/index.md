@@ -24,6 +24,7 @@ Those endpoints only show variants that are enabled for download/use.
 | Qwen3 CustomVoice (built-in speakers) | `Qwen3-TTS-12Hz-0.6B-CustomVoice`, `Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit`, `Qwen3-TTS-12Hz-1.7B-CustomVoice`, `Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit` |
 | Qwen3 VoiceDesign | `Qwen3-TTS-12Hz-1.7B-VoiceDesign`, `Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit` |
 | Voxtral TTS | `Voxtral-4B-TTS-2603` |
+| VibeVoice TTS | `VibeVoice-1.5B` |
 | Kokoro | `Kokoro-82M` |
 
 > `Kokoro-82M` requires `espeak-ng`:
@@ -34,6 +35,12 @@ Those endpoints only show variants that are enabled for download/use.
 > `Voxtral-4B-TTS-2603` includes bundled voice assets licensed under CC BY-NC
 > 4.0 and supports 20 preset voices with 24 kHz output.
 
+> `VibeVoice-1.5B` is a Microsoft long-form TTS model with reference-voice
+> cloning. It uses saved or direct reference voices rather than built-in speaker
+> presets.
+
+For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
+
 ### Speech Recognition (ASR)
 
 | Model | Notes |
@@ -42,6 +49,7 @@ Those endpoints only show variants that are enabled for download/use.
 | `Whisper-Large-v3-Turbo` | Whisper ASR option |
 | `Qwen3-ASR-0.6B-GGUF` | Smaller Qwen3 ASR |
 | `Qwen3-ASR-1.7B-GGUF` | Higher-accuracy Qwen3 ASR |
+| `VibeVoice-ASR` | Microsoft long-form ASR checkpoint |
 | `Nemotron-3.5-ASR-Streaming-0.6B` | NVIDIA multilingual FastConformer-RNNT `.nemo`; native artifact/config/tokenizer and streaming-state support |
 | `Granite-Speech-4.1-2B-Plus` | IBM Granite Speech rich transcription model with prompt guidance, speaker-attributed output, and word timestamp support |
 | `LFM2.5-Audio-1.5B-GGUF` | Unified audio model (ASR + speech generation) |
@@ -70,6 +78,9 @@ These variants exist in the catalog but are not currently enabled for standard l
 - Legacy Qwen3 chat IDs: `Qwen3-0.6B`, `Qwen3-0.6B-4bit`, `Qwen3-1.7B`, `Qwen3-1.7B-4bit`
 - `Qwen3-14B-GGUF`
 - `Gemma-3-4b-it`
+- TTS 8-bit and BF16 metadata variants such as `Qwen3-TTS-12Hz-0.6B-Base-8bit`
+  and `Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16`; selected 4-bit variants are the
+  standard low-memory downloads exposed by `izwi list`.
 
 ---
 
@@ -92,6 +103,10 @@ izwi pull Nemotron-3.5-ASR-Streaming-0.6B
 
 # Download IBM Granite Speech rich ASR
 izwi pull Granite-Speech-4.1-2B-Plus
+
+# Download Microsoft VibeVoice models
+izwi pull VibeVoice-1.5B
+izwi pull VibeVoice-ASR
 ```
 
 ### Via Web UI
@@ -189,11 +204,15 @@ izwi status --detailed
 - `-4bit` / `-8bit` / `-bf16` are reduced-precision variants.
 - `-GGUF` variants are quantized GGUF artifacts.
 - Smaller/quantized variants reduce memory and disk use at some quality/accuracy tradeoff.
+- `izwi list` shows enabled variants only. Some catalog metadata exists for
+  experimental 8-bit/BF16 TTS artifacts, but the standard downloadable
+  low-memory TTS variants are the explicit `-4bit` entries shown above.
 
 ---
 
 ## Next Steps
 
 - [Manual Model Downloads](/models/manual-download)
+- [Voice Presets](/models/voice-presets)
 - [CLI Reference](/cli)
 - [Troubleshooting](/troubleshooting)
