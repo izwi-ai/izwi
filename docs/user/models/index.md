@@ -119,6 +119,9 @@ izwi pull VibeVoice-ASR
 
 ## Managing Models
 
+For the complete UI, CLI, and API workflow, see
+[Model Management](/models/management).
+
 ### View Downloaded Models
 
 ```bash
@@ -213,6 +216,7 @@ izwi status --detailed
 ## Next Steps
 
 - [Manual Model Downloads](/models/manual-download)
+- [Model Management](/models/management)
 - [Voice Presets](/models/voice-presets)
 - [CLI Reference](/cli)
 - [Troubleshooting](/troubleshooting)
