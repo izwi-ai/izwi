@@ -16,7 +16,8 @@ Izwi's transcription feature converts spoken audio into written text. Capabiliti
 - **High accuracy** — State-of-the-art speech recognition
 - **Multiple formats** — Support for WAV, MP3, M4A, FLAC, and more
 - **Language detection** — Automatic language identification
-- **Timestamps** — Optional word-level timing
+- **Timestamps** — Optional word-level timing through a forced aligner
+- **Summaries** — Optional AI summaries for persisted speech-text jobs
 - **Local processing** — Complete privacy, no cloud
 
 ---
@@ -93,17 +94,26 @@ izwi transcribe audio.wav --language es
 ## Using the Web UI
 
 1. Navigate to **Transcription** in the sidebar
-2. Upload an audio file or record directly
-3. Select the ASR model
-4. Click **Transcribe**
-5. View, copy, or download the transcript
+2. Choose a mode
+3. Upload an audio file or record directly
+4. Select the required model
+5. Click **Transcribe** or submit the selected workflow
+6. View, copy, summarize, or download the result
 
-> The Transcription workspace now also hosts diarization workflows. Use the mode switch in `/transcription` to open speaker-separated runs.
+The Transcription workspace has three modes:
+
+| Mode | Best for | Notes |
+|------|----------|-------|
+| **Transcription** | Single-speaker or general ASR | Streaming is enabled by default. Word timestamps require a ready `Qwen3-ForcedAligner-0.6B` aligner and disable streaming. |
+| **Speaker Attributed ASR** | Granite Speech speaker-turn transcripts | Requires `Granite-Speech-4.1-2B-Plus`, accepts speaker expectation hints, and disables streaming/timestamps. |
+| **Diarization** | Speaker-separated timelines with start/end times | Uses the diarization pipeline and optional ASR/aligner models. |
 
 ### Features
 
 - **Drag and drop** — Upload files easily
 - **Record** — Transcribe directly from microphone
+- **Mode switch** — Choose Transcription, Speaker Attributed ASR, or Diarization
+- **Summaries** — Generate or regenerate AI summaries for saved records
 - **Copy** — One-click copy to clipboard
 - **Download** — Save as text or JSON
 
@@ -162,6 +172,21 @@ Streaming responses emit SSE payloads with `type` values such as
 
 See the [API Reference](/api#audio-transcriptions) for JSON input,
 streaming events, upload limits, and exact response shapes.
+
+### Persisted Speech-Text Jobs
+
+The web UI uses `/v1/speech-to-text/jobs` for saved transcription records,
+Speaker Attributed ASR records, and diarization jobs:
+
+```bash
+curl -X POST "http://localhost:8080/v1/speech-to-text/jobs?job_kind=transcription" \
+  -F "file=@meeting.wav" \
+  -F "model_id=Parakeet-TDT-0.6B-v3" \
+  -F "generate_summary=true"
+```
+
+Use `job_kind=speaker_attributed_asr` or `job_kind=saa` for Granite speaker-turn
+transcripts, and `job_kind=diarization` for speaker timelines.
 
 ---
 
@@ -248,5 +273,6 @@ endpoint.
 ## See Also
 
 - [Diarization](/features/diarization) — Identify multiple speakers
+- [Speaker Attributed ASR](/features/speaker-attributed-asr) — Granite speaker-turn transcripts
 - [Voice Mode](/features/voice) — Real-time transcription
 - [CLI Reference](/cli) — Full command documentation

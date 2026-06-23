@@ -81,6 +81,7 @@
           "features/voice",
           "features/chat",
           "features/transcription",
+          "features/speaker-attributed-asr",
           "features/voices",
           "features/text-to-speech",
           "features/studio",
