@@ -246,4 +246,5 @@ model and bundled voice assets inherit a CC BY-NC 4.0 license.
 
 - [Voice Cloning](/features/voice-cloning) — Clone custom voices
 - [Voice Design](/features/voice-design) — Create voices from descriptions
+- [Voices](/features/voices) — Manage saved and built-in voices
 - [CLI Reference](/cli) — Full command documentation

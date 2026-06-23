@@ -80,9 +80,10 @@
         "pages": [
           "features/voice",
           "features/chat",
+          "features/transcription",
+          "features/voices",
           "features/text-to-speech",
           "features/studio",
-          "features/transcription",
           "features/diarization",
           "features/voice-cloning",
           "features/voice-design"
@@ -159,6 +160,11 @@
     {
       "source": "/manual-gemma-3-1b-download",
       "destination": "/models/manual-gemma-3-1b-download",
+      "permanent": true
+    },
+    {
+      "source": "/features/voice-studio",
+      "destination": "/features/voices",
       "permanent": true
     }
   ],

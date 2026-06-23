@@ -38,6 +38,8 @@ izwi pull Qwen3-TTS-12Hz-0.6B-Base
 
 ## Using the Web UI
 
+Voice cloning now lives inside the unified **Voices** workspace.
+
 ### Step 1: Upload Reference Audio
 
 1. Navigate to **Voices** in the sidebar and choose the clone flow
@@ -209,6 +211,7 @@ Voice cloning is a powerful technology. Please use it responsibly:
 
 ## See Also
 
+- [Voices](/features/voices) — Manage and reuse saved voices
 - [Voice Design](/features/voice-design) — Create voices from descriptions
 - [Text-to-Speech](/features/text-to-speech) — Standard TTS
 - [Models](/models) — Download models
