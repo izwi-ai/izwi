@@ -44,7 +44,7 @@ Middle-aged, professional but approachable.
 
 ### Step 1: Describe Your Voice
 
-1. Navigate to **Voice Design** in the sidebar
+1. Navigate to **Voices** in the sidebar and choose the design flow
 2. Enter a description of your desired voice
 3. Be specific about characteristics you want
 
@@ -109,8 +109,24 @@ a storytelling quality.
 
 ## Using the CLI
 
-Prompt-driven voice design is available in Web UI/API workflows.
-CLI `izwi tts` currently does not expose a dedicated `voice_description`/`instructions` flag.
+Use `izwi tts` with a VoiceDesign model and pass the voice description with
+`--instructions`:
+
+```bash
+izwi tts "Hello, this is my designed voice." \
+  --model Qwen3-TTS-12Hz-1.7B-VoiceDesign \
+  --instructions "A warm, friendly female voice with a British accent" \
+  --output designed.wav
+```
+
+You can iterate quickly by changing only the prompt:
+
+```bash
+izwi tts "Welcome back to the show." \
+  --model Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit \
+  --instructions "A bright podcast host voice with crisp diction" \
+  --output podcast-host.wav
+```
 
 ---
 
