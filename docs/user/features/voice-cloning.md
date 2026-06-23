@@ -4,8 +4,6 @@ description: "Create custom voices from reference audio and use them for local t
 sidebarTitle: "Voice Cloning"
 icon: "copy"
 ---
-# Voice Cloning
-
 Clone any voice from a short audio sample and use it for text-to-speech generation.
 
 ---

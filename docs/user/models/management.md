@@ -4,8 +4,6 @@ description: "Download, load, unload, delete, filter, and inspect Izwi models fr
 sidebarTitle: "Management"
 icon: "hard-drive"
 ---
-# Model Management
-
 The **Models** workspace is the main place to manage local model files and
 runtime readiness.
 

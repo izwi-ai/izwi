@@ -4,8 +4,6 @@ description: "Create, clone, design, preview, manage, and reuse voices from the 
 sidebarTitle: "Voices"
 icon: "library"
 ---
-# Voice Studio
-
 Voice Studio is the unified workspace for reusable voices. In the current app,
 open **Voices** from the sidebar to manage saved voices, browse built-in voices,
 and create new cloned or designed voices.

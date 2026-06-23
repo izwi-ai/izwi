@@ -3,8 +3,6 @@ title: "Troubleshooting"
 description: "Common installation, model, audio, GPU, web UI, and API issues with practical fixes."
 icon: "wrench"
 ---
-# Troubleshooting
-
 Solutions to common issues with Izwi.
 
 ---

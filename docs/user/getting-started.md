@@ -3,8 +3,6 @@ title: "Getting Started"
 description: "Install Izwi, start the server, download a model, and run your first local audio AI workflows."
 icon: "rocket"
 ---
-# Getting Started
-
 Get Izwi running in under 5 minutes.
 
 ---

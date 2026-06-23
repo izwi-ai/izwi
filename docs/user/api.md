@@ -4,8 +4,6 @@ description: "HTTP, SSE, and WebSocket API contracts for the local Izwi server a
 icon: "braces"
 mode: "wide"
 ---
-# API Reference
-
 Izwi serves a local HTTP API from the same process that powers the web UI and desktop app. By default the base URL is:
 
 ```text

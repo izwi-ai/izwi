@@ -3,8 +3,6 @@ title: "izwi pull"
 description: "Download an Izwi model to the local model cache."
 icon: "download-cloud"
 ---
-# izwi pull
-
 Download a model from Hugging Face.
 
 ---

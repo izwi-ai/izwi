@@ -3,12 +3,6 @@ title: "Models"
 description: "Understand the Izwi model catalog, download models, manage local storage, and review quantization notes."
 icon: "database"
 ---
-# Models
-
-Izwi uses local models for text-to-speech, speech recognition, diarization, alignment, and chat.
-
----
-
 ## Current Model Catalog
 
 Use `izwi list` (or `GET /v1/models`) to see the live, currently enabled catalog.

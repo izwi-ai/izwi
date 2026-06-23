@@ -3,8 +3,6 @@ title: "izwi version"
 description: "Show Izwi version, build information, and compiled backend support."
 icon: "badge-info"
 ---
-# izwi version
-
 Show version information.
 
 ---

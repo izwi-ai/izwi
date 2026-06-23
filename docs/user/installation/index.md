@@ -3,10 +3,6 @@ title: "Installation"
 description: "Choose the right Izwi installation path for macOS, Linux, Windows, or source builds."
 icon: "download"
 ---
-# Installation
-
-Choose your platform for detailed installation instructions.
-
 Before choosing an install path, check the [Runtime Support Matrix](/support-matrix) for the current backend contract. In particular:
 
 - GitHub Release artifacts are not the same thing as CUDA source builds.

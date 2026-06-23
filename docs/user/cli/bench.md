@@ -4,8 +4,6 @@ description: "Run chat, TTS, ASR, throughput, manifest, and regression compariso
 icon: "gauge"
 mode: "wide"
 ---
-# izwi bench
-
 Run performance benchmarks.
 
 ---

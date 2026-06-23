@@ -4,8 +4,6 @@ description: "Build Izwi from source for development, custom backends, and relea
 sidebarTitle: "From Source"
 icon: "code-2"
 ---
-# Build from Source
-
 Build Izwi from source for development, backend-specific installs, or to customize your setup.
 
 See the [Runtime Support Matrix](/support-matrix) before choosing a build target. In particular:

@@ -4,8 +4,6 @@ description: "Manually download gated or externally hosted model files and place
 sidebarTitle: "Manual Downloads"
 icon: "folder-down"
 ---
-# Manual Model Downloads
-
 Some models require manual download from Hugging Face due to licensing requirements or access restrictions. This guide covers the general process.
 
 ---

@@ -3,8 +3,6 @@ title: "izwi diarize"
 description: "Run speaker diarization from the command line and export text or JSON results."
 icon: "users"
 ---
-# izwi diarize
-
 Speaker diarization — identify and separate multiple speakers in audio.
 
 ---

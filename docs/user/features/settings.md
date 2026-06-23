@@ -4,8 +4,6 @@ description: "Configure appearance, updates, analytics, desktop system behavior,
 sidebarTitle: "Settings"
 icon: "settings"
 ---
-# Settings and Onboarding
-
 The Settings page contains device-level controls for the local app. Open
 **Settings** from the bottom of the sidebar.
 

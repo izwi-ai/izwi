@@ -4,8 +4,6 @@ description: "Supported operating systems, hardware backends, deployment paths, 
 sidebarTitle: "Support Matrix"
 icon: "clipboard-check"
 ---
-# Runtime Support Matrix
-
 This page is the public support contract for Izwi's current runtime surfaces.
 
 It answers four questions:

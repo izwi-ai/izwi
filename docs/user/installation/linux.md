@@ -4,8 +4,6 @@ description: "Install Izwi on Linux with release packages, source builds, servic
 sidebarTitle: "Linux"
 icon: "monitor"
 ---
-# Linux Installation
-
 Izwi runs on most modern Linux distributions. Linux GitHub Release assets keep the public `izwi` and `izwi-server` names and are intentionally CPU-only.
 
 See the [Runtime Support Matrix](/support-matrix) for the current artifact contract.
