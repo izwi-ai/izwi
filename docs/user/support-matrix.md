@@ -33,7 +33,7 @@ If another page says something different, this page should win.
 | **Source build** | Linux x86_64 with `--features cuda` and CUDA toolkit installed | `cuda` | Supported | Useful for development, custom builds, and debugging outside Docker. Requires a compatible NVIDIA driver/toolkit environment. |
 | **Source build** | Windows with `--features cuda` and CUDA toolkit installed | `cuda` | Preview | Useful for development and custom validation. Native Windows release artifacts remain CPU-only. |
 | **Docker `production` target** | Linux x86_64 | `cpu` | Stable | CPU-only container image. |
-| **Docker `production-cuda` target / `docker compose --profile cuda`** | Linux x86_64 + NVIDIA GPU | `cuda` | Preview | Shipped CUDA binary path. The final image is based on `nvidia/cuda:12.4.1-runtime-ubuntu22.04`. When building on a machine without `nvidia-smi`, set `CUDA_COMPUTE_CAP` for the target GPU architecture. |
+| **Docker `production-cuda` target / `docker compose --profile cuda`** | Linux x86_64 + NVIDIA GPU | `cuda` | Preview | Shipped CUDA binary path. The final image is based on `nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04`. When building on a machine without `nvidia-smi`, set `CUDA_COMPUTE_CAP` for the target GPU architecture. |
 
 ---
 

@@ -21,9 +21,15 @@ See the [Runtime Support Matrix](/support-matrix) before choosing a build target
 ### All Platforms
 
 - **Git** — Version control
-- **Rust** — 1.83 or later (stable)
-- **Node.js** — 18+ (for UI development)
+- **Rust** — 1.83 or later (stable). CI and Docker builds use current stable
+  Rust; the Docker CPU builder currently uses Rust 1.88.
+- **Node.js** — 18+ for UI development. Release CI uses Node 20, while the
+  Docker UI builder currently uses Node 24.
 - **`espeak-ng`** (optional, required only for `Kokoro-82M` TTS)
+
+Treat Rust 1.83 and Node 18 as minimums. If you are reproducing release or
+Docker behavior exactly, use the toolchain versions from the release workflow
+or Dockerfile.
 
 ### macOS
 
