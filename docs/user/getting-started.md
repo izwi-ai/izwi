@@ -138,8 +138,8 @@ The web interface provides:
 - **Voice** — Real-time voice conversations
 - **Chat** — Text-based AI chat
 - **Transcription** — Upload and transcribe audio files
+- **Voices** — Create, preview, manage, and reuse voice assets
 - **Text to Speech** — Generate speech from text
-- **Voice Cloning** — Clone voices from samples
 - **Models** — Manage your downloaded models
 
 ---

@@ -19,12 +19,13 @@ Izwi is a powerful, privacy-focused audio AI platform that runs entirely on your
 **Key capabilities:**
 
 - **Voice Mode** — Real-time voice conversations with AI
+- **Chat** — Text-based AI conversations
+- **Transcription** — Convert audio to text with high accuracy
+- **Voices** — Manage built-in, cloned, and designed voices
 - **Text-to-Speech** — Generate natural speech from text
 - **Voice Cloning** — Clone any voice from a short audio sample
 - **Voice Design** — Create custom voices from text descriptions
-- **Transcription** — Convert audio to text with high accuracy
 - **Diarization** — Identify and separate multiple speakers
-- **Chat** — Text-based AI conversations
 
 ---
 

@@ -42,6 +42,8 @@ Middle-aged, professional but approachable.
 
 ## Using the Web UI
 
+Voice design now lives inside the unified **Voices** workspace.
+
 ### Step 1: Describe Your Voice
 
 1. Navigate to **Voices** in the sidebar and choose the design flow
@@ -226,6 +228,7 @@ Start broad, then refine:
 
 ## See Also
 
+- [Voices](/features/voices) — Manage and reuse saved voices
 - [Voice Cloning](/features/voice-cloning) — Clone from audio samples
 - [Text-to-Speech](/features/text-to-speech) — Standard TTS
 - [Models](/models) — Download models
