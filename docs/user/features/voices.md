@@ -73,6 +73,8 @@ Use built-in voices when you want quick, repeatable presets without reference
 audio or a design prompt. Use saved voices when you want a custom reusable voice
 asset.
 
+See [Voice Presets](/models/voice-presets) for the current speaker IDs.
+
 ---
 
 ## Creating New Voices

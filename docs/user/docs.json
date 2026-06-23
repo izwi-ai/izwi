@@ -137,6 +137,7 @@
         "icon": "database",
         "root": "models/index",
         "pages": [
+          "models/voice-presets",
           "models/manual-download",
           "models/manual-gemma-3-1b-download"
         ]

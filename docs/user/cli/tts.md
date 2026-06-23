@@ -202,5 +202,6 @@ izwi tts "Long text for streaming" --stream --play
 ## See Also
 
 - [Text-to-Speech Guide](/features/text-to-speech)
+- [Voice Presets](/models/voice-presets)
 - [Voice Cloning Guide](/features/voice-cloning)
 - [Voice Design Guide](/features/voice-design)
