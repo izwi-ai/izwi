@@ -141,6 +141,7 @@ The web interface provides:
 - **Voices** — Create, preview, manage, and reuse voice assets
 - **Text to Speech** — Generate speech from text
 - **Models** — Manage your downloaded models
+- **Settings** — Configure theme, updates, analytics, and desktop behavior
 
 ---
 
