@@ -40,7 +40,7 @@ izwi pull Qwen3-TTS-12Hz-0.6B-Base
 
 ### Step 1: Upload Reference Audio
 
-1. Navigate to **Voice Cloning** in the sidebar
+1. Navigate to **Voices** in the sidebar and choose the clone flow
 2. Upload a reference audio file
 3. The audio should be:
    - 5-30 seconds long
@@ -62,8 +62,39 @@ izwi pull Qwen3-TTS-12Hz-0.6B-Base
 
 ## Using the CLI
 
-Reference-audio cloning workflows are currently exposed in the Web UI and API routes.
-CLI `izwi tts` supports voice/speaker selection, but does not currently expose direct `reference_audio` + `reference_text` parameters.
+Use `izwi tts` with a Base or VibeVoice TTS model and provide both the
+reference audio and its transcript:
+
+```bash
+izwi tts "This sentence will use the cloned voice." \
+  --model Qwen3-TTS-12Hz-0.6B-Base \
+  --reference-audio samples/reference.wav \
+  --reference-text "This is the exact text spoken in the reference sample." \
+  --output cloned.wav
+```
+
+For longer reference transcripts, store the transcript in a file:
+
+```bash
+izwi tts "This sentence uses a transcript file." \
+  --model Qwen3-TTS-12Hz-1.7B-Base \
+  --reference-audio samples/reference.wav \
+  --reference-text-file samples/reference.txt \
+  --output cloned-from-file.wav
+```
+
+Saved voices created in Voice Studio or through `/v1/voices` can be reused from
+the CLI:
+
+```bash
+izwi tts "This sentence uses my saved voice." \
+  --model Qwen3-TTS-12Hz-0.6B-Base \
+  --saved-voice-id voice_abc123 \
+  --output saved-voice.wav
+```
+
+`--saved-voice-id` is mutually exclusive with direct `--reference-audio` and
+`--reference-text` input.
 
 ---
 
@@ -150,6 +181,7 @@ saved voice routes and exact fields.
 |-------|------|---------|
 | `Qwen3-TTS-12Hz-0.6B-Base` | ~2.3 GB | Good |
 | `Qwen3-TTS-12Hz-1.7B-Base` | ~4.2 GB | Better |
+| `VibeVoice-1.5B` | ~5.0 GB | Better long-form/reference voice |
 
 Larger models produce more accurate voice clones.
 
