@@ -16,6 +16,7 @@ Izwi provides a comprehensive suite of audio AI capabilities. Each feature is ac
 | **Voice** | Real-time voice conversations with AI | [Voice Guide](/features/voice) |
 | **Chat** | Text-based AI conversations | [Chat Guide](/features/chat) |
 | **Transcription** | Convert audio to text | [Transcription Guide](/features/transcription) |
+| **Speaker Attributed ASR** | Generate Granite speaker-turn transcripts | [SAA Guide](/features/speaker-attributed-asr) |
 | **Voices** | Create, clone, design, preview, manage, and reuse voice assets | [Voice Studio Guide](/features/voices) |
 | **Text-to-Speech** | Generate natural speech from text | [TTS Guide](/features/text-to-speech) |
 | **Studio** | Manage long-form TTS projects and exports | [Studio Guide](/features/studio) |
@@ -32,6 +33,7 @@ Izwi provides a comprehensive suite of audio AI capabilities. Each feature is ac
 | Voice | ✓ | ✓ | — | ✓ |
 | Chat | ✓ | ✓ | ✓ | ✓ |
 | Transcription | ✓ | ✓ | ✓ | ✓ |
+| Speaker Attributed ASR | ✓ | ✓ | — | ✓ |
 | Voices | ✓ | ✓ | ✓ | ✓ |
 | Text-to-Speech | ✓ | ✓ | ✓ | ✓ |
 | Studio | ✓ | ✓ | — | ✓ |
@@ -70,6 +72,7 @@ Different features require different models:
 |---------|-----------------|
 | Voice | TTS + ASR + Chat model (or unified `LFM2.5-Audio-1.5B-GGUF`) |
 | Chat | Chat model (Qwen3, Qwen3.5, LFM2.5, or Gemma) |
+| Speaker Attributed ASR | `Granite-Speech-4.1-2B-Plus` |
 | Voices | Built-in voice model for presets; Base or VibeVoice model for cloning; VoiceDesign model for design |
 | Text-to-Speech | TTS model |
 | Studio | TTS model |
@@ -90,4 +93,5 @@ Choose a feature to learn more:
 - [Text-to-Speech](/features/text-to-speech) — Generate speech
 - [Studio](/features/studio) — Build long-form TTS projects
 - [Transcription](/features/transcription) — Convert audio to text
+- [Speaker Attributed ASR](/features/speaker-attributed-asr) — Granite speaker-turn transcripts
 - [API Reference](/api) — Integrate with HTTP, SSE, and WebSocket APIs

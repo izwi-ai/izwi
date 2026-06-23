@@ -18,6 +18,10 @@ Speaker diarization answers the question "who spoke when?" It segments audio by 
 - **Podcasts** — Identify hosts and guests
 - **Call recordings** — Distinguish callers
 
+> Granite Speech speaker-turn transcripts are documented separately as
+> [Speaker Attributed ASR](/features/speaker-attributed-asr). Use diarization
+> when you need timestamped speaker segments.
+
 ---
 
 ## Getting Started
@@ -193,5 +197,6 @@ Identify speakers for editing and show notes:
 ## See Also
 
 - [Transcription](/features/transcription) — Single-speaker transcription
+- [Speaker Attributed ASR](/features/speaker-attributed-asr) — Granite speaker-turn transcripts
 - [Voice Mode](/features/voice) — Real-time conversations
 - [CLI Reference](/cli) — Command documentation

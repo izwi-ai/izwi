@@ -527,21 +527,24 @@ transcription records into the same collection.
 
 ### Speech-Text Jobs
 
-Canonical saved transcription and diarization job routes:
+Canonical saved transcription, speaker-attributed ASR, and diarization job
+routes:
 
 | Method | Path | Notes |
 |--------|------|-------|
-| `GET` | `/v1/speech-to-text/jobs` | List jobs. Supports `limit`, `cursor`, and `job_kind=transcription|diarization|all`. |
-| `POST` | `/v1/speech-to-text/jobs` | Create transcription or diarization job. Multipart uploads allowed. |
+| `GET` | `/v1/speech-to-text/jobs` | List jobs. Supports `limit`, `cursor`, and `job_kind=transcription|speaker_attributed_asr|saa|diarization|all`. |
+| `POST` | `/v1/speech-to-text/jobs` | Create transcription, speaker-attributed ASR, or diarization job. Multipart uploads allowed. |
 | `GET` | `/v1/speech-to-text/jobs/{record_id}` | Fetch one job. `job_kind` can disambiguate. |
 | `PATCH`, `PUT` | `/v1/speech-to-text/jobs/{record_id}` | Update editable metadata such as title, transcript fields, speaker labels, or summary state depending on job kind. |
 | `DELETE` | `/v1/speech-to-text/jobs/{record_id}` | Delete job and associated stored media. |
 | `GET` | `/v1/speech-to-text/jobs/{record_id}/audio` | Fetch stored source audio. |
 | `POST` | `/v1/speech-to-text/jobs/{record_id}/reruns` | Re-run diarization from stored source audio. |
 | `POST` | `/v1/speech-to-text/jobs/{record_id}/cancel` | Cancel an in-flight diarization job. |
-| `POST` | `/v1/speech-to-text/jobs/{record_id}/summary/regenerate` | Regenerate transcription or diarization summary. |
+| `POST` | `/v1/speech-to-text/jobs/{record_id}/summary/regenerate` | Regenerate transcription, speaker-attributed ASR, or diarization summary. |
 
-The `job_kind` query parameter is important for shared IDs and for clients that want a specific record family.
+The `job_kind` query parameter is important for shared IDs and for clients that
+want a specific record family. `speaker_attributed_asr` and `saa` select the
+Granite Speech speaker-turn transcript mode.
 
 For transcription job creation, JSON and multipart requests accept
 `generate_summary`. It defaults to `false`; set it to `true` to generate an AI
@@ -549,6 +552,18 @@ summary automatically after the transcript finishes. Records created without an
 automatic summary can still use
 `POST /v1/speech-to-text/jobs/{record_id}/summary/regenerate?job_kind=transcription`
 later.
+
+For speaker-attributed ASR, use:
+
+```http
+POST /v1/speech-to-text/jobs?job_kind=speaker_attributed_asr
+```
+
+SAA requests use the transcription store but require
+`Granite-Speech-4.1-2B-Plus`. JSON and multipart requests accept
+`model_id`/`model`, `language`, `generate_summary`, `min_speakers`, and
+`max_speakers`. SAA does not support streaming, timestamp alignment, or
+`include_timestamps`; the server clears aligner/timestamp fields for this mode.
 
 ### Diarization Records
 
