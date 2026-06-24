@@ -1,6 +1,15 @@
+#[cfg(feature = "metal")]
+use std::collections::HashMap;
+#[cfg(feature = "metal")]
+use std::sync::{Mutex, OnceLock};
+
+#[cfg(feature = "metal")]
+use candle_core::{backend::BackendStorage, MetalStorage};
 use candle_core::{
     CpuStorage, CustomOp3, DType, IndexOp, Layout, Result as CandleResult, Shape, Tensor,
 };
+#[cfg(feature = "metal")]
+use candle_metal_kernels::metal::{ComputePipeline, Device as MetalDevice};
 use candle_nn::rnn::Direction;
 use candle_nn::{
     ops, Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, Linear, Module, VarBuilder,
@@ -11,6 +20,76 @@ use rayon::prelude::*;
 use crate::error::{Error, Result};
 
 use super::config::KokoroConfig;
+
+#[cfg(feature = "metal")]
+const KOKORO_PROSODY_METAL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint KOKORO_ADAIN_THREADS = 256;
+
+kernel void kokoro_adain1d_snake_f32(
+    device const float* input [[buffer(0)]],
+    device const float* affine [[buffer(1)]],
+    device const float* alpha [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant uint& channels [[buffer(5)]],
+    constant uint& time [[buffer(6)]],
+    constant uint& alpha_by_channel [[buffer(7)]],
+    constant float& eps [[buffer(8)]],
+    uint gid [[thread_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    const uint row = gid / KOKORO_ADAIN_THREADS;
+    if (row >= rows || tid >= KOKORO_ADAIN_THREADS) {
+        return;
+    }
+
+    const uint channel = row % channels;
+    const uint batch = row / channels;
+    const uint base = row * time;
+
+    threadgroup float sums[KOKORO_ADAIN_THREADS];
+    threadgroup float sum_sqs[KOKORO_ADAIN_THREADS];
+
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    for (uint t = tid; t < time; t += KOKORO_ADAIN_THREADS) {
+        const float v = input[base + t];
+        sum += v;
+        sum_sq += v * v;
+    }
+    sums[tid] = sum;
+    sum_sqs[tid] = sum_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = KOKORO_ADAIN_THREADS / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sums[tid] += sums[tid + stride];
+            sum_sqs[tid] += sum_sqs[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float total = sums[0];
+    const float total_sq = sum_sqs[0];
+    const float mean = total / float(time);
+    const float denom = max(float(time - 1), 1.0f);
+    const float var = max((total_sq - total * total / float(time)) / denom, 0.0f);
+    const float inv_std = rsqrt(var + eps);
+    const uint affine_base = batch * channels * 2;
+    const float scale = affine[affine_base + channel] + 1.0f;
+    const float bias = affine[affine_base + channels + channel];
+    const float a = alpha_by_channel != 0 ? alpha[channel] : alpha[0];
+
+    for (uint t = tid; t < time; t += KOKORO_ADAIN_THREADS) {
+        const float y = (input[base + t] - mean) * inv_std * scale + bias;
+        const float s = sin(y * a);
+        output[base + t] = y + (s * s) / a;
+    }
+}
+"#;
 
 #[derive(Debug, Clone)]
 pub struct KokoroProsodyDebugOutput {
@@ -410,6 +489,16 @@ impl AdaIN1d {
             )));
         }
         let h = self.fc.forward(style).map_err(Error::from)?;
+        #[cfg(feature = "metal")]
+        if x.device().is_metal()
+            && x.dtype() == DType::F32
+            && h.dtype() == DType::F32
+            && alpha.dtype() == DType::F32
+        {
+            if let Ok(out) = x.apply_op3_no_bwd(&h, alpha, &AdaIN1dSnakeMetalOp { eps: self.eps }) {
+                return Ok(out);
+            }
+        }
         if x.device().is_cpu()
             && x.dtype() == DType::F32
             && h.dtype() == DType::F32
@@ -540,6 +629,167 @@ fn validate_adain_affine_shape(
 #[derive(Debug, Clone, Copy)]
 struct AdaIN1dSnakeCpuOp {
     eps: f64,
+}
+
+#[cfg(feature = "metal")]
+#[derive(Debug, Clone, Copy)]
+struct AdaIN1dSnakeMetalOp {
+    eps: f64,
+}
+
+#[cfg(feature = "metal")]
+impl CustomOp3 for AdaIN1dSnakeMetalOp {
+    fn name(&self) -> &'static str {
+        "kokoro-adain1d-snake-metal"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> CandleResult<(CpuStorage, Shape)> {
+        candle_core::bail!("kokoro-adain1d-snake-metal requires Metal tensors")
+    }
+
+    fn metal_fwd(
+        &self,
+        x_storage: &MetalStorage,
+        x_layout: &Layout,
+        h_storage: &MetalStorage,
+        h_layout: &Layout,
+        alpha_storage: &MetalStorage,
+        alpha_layout: &Layout,
+    ) -> CandleResult<(MetalStorage, Shape)> {
+        if x_storage.dtype() != DType::F32
+            || h_storage.dtype() != DType::F32
+            || alpha_storage.dtype() != DType::F32
+        {
+            candle_core::bail!("kokoro-adain1d-snake-metal only supports F32 tensors")
+        }
+        if !x_layout.is_contiguous() || !h_layout.is_contiguous() || !alpha_layout.is_contiguous() {
+            candle_core::bail!("kokoro-adain1d-snake-metal requires contiguous tensors")
+        }
+
+        let dims = x_layout.shape().dims();
+        if dims.len() != 3 {
+            candle_core::bail!("kokoro-adain1d-snake-metal expects [B,C,T] input")
+        }
+        let batch = dims[0];
+        let channels = dims[1];
+        let time = dims[2];
+        if time < 2 {
+            candle_core::bail!("kokoro-adain1d-snake-metal requires time length >= 2")
+        }
+        match h_layout.shape().dims() {
+            [b, two_c] if *b == batch && *two_c == channels * 2 => {}
+            other => candle_core::bail!(
+                "kokoro-adain1d-snake-metal affine shape {:?} cannot broadcast to [{batch},{channels},T]",
+                other
+            ),
+        }
+        let alpha_by_channel = validate_snake_alpha_shape(alpha_layout.shape().dims(), channels)?;
+        let alpha_len = alpha_layout.shape().elem_count();
+        if alpha_by_channel && alpha_len != channels {
+            candle_core::bail!(
+                "kokoro-adain1d-snake-metal alpha storage length {}, expected {}",
+                alpha_len,
+                channels
+            )
+        }
+        if !alpha_by_channel && alpha_len != 1 {
+            candle_core::bail!("kokoro-adain1d-snake-metal scalar alpha has invalid storage length")
+        }
+
+        let rows = batch.saturating_mul(channels);
+        let elem_count = rows.saturating_mul(time);
+        if rows > u32::MAX as usize || channels > u32::MAX as usize || time > u32::MAX as usize {
+            candle_core::bail!("kokoro-adain1d-snake-metal tensor is too large")
+        }
+
+        let device = x_storage.device().clone();
+        let output = device.new_buffer(elem_count, DType::F32, "kokoro-adain1d-snake")?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("kokoro-adain1d-snake");
+        let pipeline = adain1d_snake_pipeline(device.metal_device())?;
+        encoder.set_compute_pipeline_state(&pipeline);
+
+        encoder.set_buffer(
+            0,
+            Some(x_storage.buffer()),
+            x_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_buffer(
+            1,
+            Some(h_storage.buffer()),
+            h_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_buffer(
+            2,
+            Some(alpha_storage.buffer()),
+            alpha_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_buffer(3, Some(&output), 0);
+        encoder.set_bytes(4, &(rows as u32));
+        encoder.set_bytes(5, &(channels as u32));
+        encoder.set_bytes(6, &(time as u32));
+        encoder.set_bytes(7, &(u32::from(alpha_by_channel)));
+        encoder.set_bytes(8, &(self.eps as f32));
+
+        encoder.dispatch_threads(
+            objc2_metal::MTLSize {
+                width: rows * 256,
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        Ok((
+            MetalStorage::new(output, device, elem_count, DType::F32),
+            x_layout.shape().clone(),
+        ))
+    }
+}
+
+#[cfg(feature = "metal")]
+fn adain1d_snake_pipeline(device: &MetalDevice) -> CandleResult<ComputePipeline> {
+    static PIPELINES: OnceLock<Mutex<HashMap<u64, ComputePipeline>>> = OnceLock::new();
+    let registry_id = device.registry_id();
+    let pipelines = PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
+
+    if let Some(pipeline) = pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .get(&registry_id)
+        .cloned()
+    {
+        return Ok(pipeline);
+    }
+
+    let library = device
+        .new_library_with_source(KOKORO_PROSODY_METAL_SOURCE, None)
+        .map_err(candle_core::Error::wrap)?;
+    let function = library
+        .get_function("kokoro_adain1d_snake_f32", None)
+        .map_err(candle_core::Error::wrap)?;
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(candle_core::Error::wrap)?;
+
+    pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .insert(registry_id, pipeline.clone());
+
+    Ok(pipeline)
 }
 
 impl CustomOp3 for AdaIN1dSnakeCpuOp {
