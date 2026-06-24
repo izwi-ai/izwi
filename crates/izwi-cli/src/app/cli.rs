@@ -523,6 +523,10 @@ pub enum BenchCommands {
         )]
         text: String,
 
+        /// Speaker voice or VibeVoice speaker label
+        #[arg(short, long)]
+        speaker: Option<String>,
+
         /// Saved reference voice ID
         #[arg(long, value_name = "ID")]
         saved_voice_id: Option<String>,
