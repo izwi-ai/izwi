@@ -387,9 +387,7 @@ impl KokoroTtsModel {
         prepared: &KokoroPreparedRequest,
     ) -> Result<KokoroProsodyDebugOutput> {
         let input_ids = self.build_model_input_ids(prepared)?;
-        let (_b, seq_len) = input_ids.dims2().map_err(Error::from)?;
-        let attention_mask = Tensor::ones((1, seq_len), DType::U32, &self.device.device)?;
-        let bert_hidden = self.bert.forward(&input_ids, Some(&attention_mask))?;
+        let bert_hidden = self.bert.forward(&input_ids, None)?;
         let d_en = self
             .bert_encoder
             .forward(&bert_hidden)
@@ -402,9 +400,7 @@ impl KokoroTtsModel {
 
     fn run_bert_prosody(&self, prepared: &KokoroPreparedRequest) -> Result<KokoroProsodyOutput> {
         let input_ids = self.build_model_input_ids(prepared)?;
-        let (_b, seq_len) = input_ids.dims2().map_err(Error::from)?;
-        let attention_mask = Tensor::ones((1, seq_len), DType::U32, &self.device.device)?;
-        let bert_hidden = self.bert.forward(&input_ids, Some(&attention_mask))?;
+        let bert_hidden = self.bert.forward(&input_ids, None)?;
         let d_en = self
             .bert_encoder
             .forward(&bert_hidden)
