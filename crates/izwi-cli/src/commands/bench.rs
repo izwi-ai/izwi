@@ -120,6 +120,7 @@ struct TtsBenchSample {
 
 #[derive(Debug, Clone, Default)]
 struct TtsBenchReference {
+    speaker: Option<String>,
     saved_voice_id: Option<String>,
     reference_audio_base64: Option<String>,
     reference_audio_path: Option<String>,
@@ -309,6 +310,7 @@ struct BenchmarkRunConfig {
     system: Option<String>,
     max_tokens: Option<usize>,
     text: Option<String>,
+    speaker: Option<String>,
     file: Option<String>,
     saved_voice_id: Option<String>,
     reference_audio: Option<String>,
@@ -395,6 +397,7 @@ struct BenchmarkManifestCase {
     system: Option<String>,
     max_tokens: Option<usize>,
     text: Option<String>,
+    speaker: Option<String>,
     file: Option<String>,
     saved_voice_id: Option<String>,
     reference_audio: Option<String>,
@@ -415,6 +418,7 @@ struct BenchmarkManifestMatrix {
     system: Option<Vec<String>>,
     max_tokens: Option<Vec<usize>>,
     text: Option<Vec<String>>,
+    speaker: Option<Vec<String>>,
     file: Option<Vec<String>>,
     saved_voice_id: Option<Vec<String>>,
     reference_audio: Option<Vec<String>>,
@@ -440,6 +444,7 @@ enum MatrixValue {
     System(String),
     MaxTokens(usize),
     Text(String),
+    Speaker(String),
     File(String),
     SavedVoiceId(String),
     ReferenceAudio(String),
@@ -557,6 +562,7 @@ pub async fn execute(
             model,
             iterations,
             text,
+            speaker,
             saved_voice_id,
             reference_audio,
             reference_text,
@@ -568,6 +574,7 @@ pub async fn execute(
             &model,
             iterations,
             &text,
+            speaker.as_deref(),
             saved_voice_id.as_deref(),
             reference_audio.as_deref(),
             reference_text.as_deref(),
@@ -732,6 +739,7 @@ impl MatrixValue {
             MatrixValue::System(value) => case.system = Some(value.clone()),
             MatrixValue::MaxTokens(value) => case.max_tokens = Some(*value),
             MatrixValue::Text(value) => case.text = Some(value.clone()),
+            MatrixValue::Speaker(value) => case.speaker = Some(value.clone()),
             MatrixValue::File(value) => case.file = Some(value.clone()),
             MatrixValue::SavedVoiceId(value) => case.saved_voice_id = Some(value.clone()),
             MatrixValue::ReferenceAudio(value) => case.reference_audio = Some(value.clone()),
@@ -748,6 +756,7 @@ impl MatrixValue {
             | MatrixValue::Prompt(value)
             | MatrixValue::System(value)
             | MatrixValue::Text(value)
+            | MatrixValue::Speaker(value)
             | MatrixValue::File(value)
             | MatrixValue::SavedVoiceId(value)
             | MatrixValue::ReferenceAudio(value)
@@ -789,6 +798,12 @@ impl BenchmarkManifestMatrix {
             MatrixValue::MaxTokens,
         )?;
         add_matrix_dimension(&mut dimensions, "text", &self.text, MatrixValue::Text)?;
+        add_matrix_dimension(
+            &mut dimensions,
+            "speaker",
+            &self.speaker,
+            MatrixValue::Speaker,
+        )?;
         add_matrix_dimension(&mut dimensions, "file", &self.file, MatrixValue::File)?;
         add_matrix_dimension(
             &mut dimensions,
@@ -1142,6 +1157,7 @@ async fn bench_manifest(
                     model,
                     case.iterations.unwrap_or(10),
                     text,
+                    case.speaker.as_deref(),
                     case.saved_voice_id.as_deref(),
                     reference_audio.as_deref(),
                     case.reference_text.as_deref(),
@@ -1485,6 +1501,7 @@ async fn bench_chat(
             system: system.as_deref().map(|value| value.to_string()),
             max_tokens: Some(max_tokens),
             text: None,
+            speaker: None,
             file: None,
             saved_voice_id: None,
             reference_audio: None,
@@ -1548,6 +1565,7 @@ async fn bench_tts(
     model: &str,
     iterations: u32,
     text: &str,
+    speaker: Option<&str>,
     saved_voice_id: Option<&str>,
     reference_audio: Option<&Path>,
     reference_text: Option<&str>,
@@ -1575,6 +1593,7 @@ async fn bench_tts(
     let run_start = Instant::now();
     let metrics_before = fetch_runtime_metrics(server).await;
     let reference = resolve_tts_bench_reference(
+        speaker,
         saved_voice_id,
         reference_audio,
         reference_text,
@@ -1730,6 +1749,7 @@ async fn bench_tts(
             system: None,
             max_tokens: None,
             text: Some(text.as_ref().clone()),
+            speaker: reference.speaker.clone(),
             file: None,
             saved_voice_id: reference.saved_voice_id.clone(),
             reference_audio: reference.reference_audio_path.clone(),
@@ -1998,6 +2018,7 @@ async fn bench_asr(
             system: None,
             max_tokens,
             text: None,
+            speaker: None,
             file: Some(audio_file.display().to_string()),
             saved_voice_id: None,
             reference_audio: None,
@@ -2143,6 +2164,7 @@ async fn bench_throughput(
             system: None,
             max_tokens: None,
             text: None,
+            speaker: None,
             file: None,
             saved_voice_id: None,
             reference_audio: None,
@@ -2193,11 +2215,13 @@ fn header_u64(response: &reqwest::Response, name: &'static str) -> Option<u64> {
 }
 
 async fn resolve_tts_bench_reference(
+    speaker: Option<&str>,
     saved_voice_id: Option<&str>,
     reference_audio: Option<&Path>,
     reference_text: Option<&str>,
     reference_text_file: Option<&Path>,
 ) -> Result<TtsBenchReference> {
+    let speaker = normalize_optional_bench_text(speaker);
     let saved_voice_id = normalize_optional_bench_text(saved_voice_id);
     let reference_text = normalize_optional_bench_text(reference_text);
     if reference_text.is_some() && reference_text_file.is_some() {
@@ -2240,6 +2264,7 @@ async fn resolve_tts_bench_reference(
     };
 
     Ok(TtsBenchReference {
+        speaker,
         saved_voice_id,
         reference_audio_base64,
         reference_audio_path,
@@ -2267,21 +2292,7 @@ async fn run_tts_request(
     reference: &TtsBenchReference,
 ) -> Result<TtsBenchSample> {
     let client = http::client(Some(std::time::Duration::from_secs(300)))?;
-    let mut request_body = serde_json::json!({
-        "model": model,
-        "input": text,
-        "voice": "default",
-        "response_format": "wav",
-    });
-    if let Some(saved_voice_id) = reference.saved_voice_id.as_deref() {
-        request_body["saved_voice_id"] = serde_json::Value::String(saved_voice_id.to_string());
-    }
-    if let Some(reference_audio) = reference.reference_audio_base64.as_deref() {
-        request_body["reference_audio"] = serde_json::Value::String(reference_audio.to_string());
-    }
-    if let Some(reference_text) = reference.reference_text.as_deref() {
-        request_body["reference_text"] = serde_json::Value::String(reference_text.to_string());
-    }
+    let request_body = build_tts_bench_request_body(model, text, reference);
 
     let response = client
         .post(format!("{}/v1/audio/speech", server))
@@ -2306,6 +2317,31 @@ async fn run_tts_request(
         rtf: header_f64(&response, "x-rtf"),
         tokens_generated: header_u64(&response, "x-tokens-generated"),
     })
+}
+
+fn build_tts_bench_request_body(
+    model: &str,
+    text: &str,
+    reference: &TtsBenchReference,
+) -> serde_json::Value {
+    let mut request_body = serde_json::json!({
+        "model": model,
+        "input": text,
+        "response_format": "wav",
+    });
+    if let Some(speaker) = reference.speaker.as_deref() {
+        request_body["voice"] = serde_json::Value::String(speaker.to_string());
+    }
+    if let Some(saved_voice_id) = reference.saved_voice_id.as_deref() {
+        request_body["saved_voice_id"] = serde_json::Value::String(saved_voice_id.to_string());
+    }
+    if let Some(reference_audio) = reference.reference_audio_base64.as_deref() {
+        request_body["reference_audio"] = serde_json::Value::String(reference_audio.to_string());
+    }
+    if let Some(reference_text) = reference.reference_text.as_deref() {
+        request_body["reference_text"] = serde_json::Value::String(reference_text.to_string());
+    }
+    request_body
 }
 
 async fn run_asr_request(
@@ -4203,10 +4239,15 @@ mod tests {
             .await
             .expect("write text");
 
-        let reference =
-            resolve_tts_bench_reference(None, Some(audio.as_path()), None, Some(text.as_path()))
-                .await
-                .expect("reference should resolve");
+        let reference = resolve_tts_bench_reference(
+            None,
+            None,
+            Some(audio.as_path()),
+            None,
+            Some(text.as_path()),
+        )
+        .await
+        .expect("reference should resolve");
 
         assert_eq!(
             reference.reference_audio_base64.as_deref(),
@@ -4218,12 +4259,14 @@ mod tests {
             Some(expected_path.as_str())
         );
         assert_eq!(reference.reference_text.as_deref(), Some("reference words"));
+        assert!(reference.speaker.is_none());
         assert!(reference.saved_voice_id.is_none());
     }
 
     #[tokio::test]
     async fn tts_bench_reference_rejects_mixed_saved_and_direct_reference() {
         let err = resolve_tts_bench_reference(
+            None,
             Some("voice-1"),
             Some(Path::new("reference.wav")),
             Some("reference words"),
@@ -4235,6 +4278,36 @@ mod tests {
         assert!(err
             .to_string()
             .contains("Use either --saved-voice-id or --reference-audio/--reference-text"));
+    }
+
+    #[tokio::test]
+    async fn tts_bench_reference_trims_speaker() {
+        let reference = resolve_tts_bench_reference(Some(" af_bella "), None, None, None, None)
+            .await
+            .expect("speaker should resolve");
+
+        assert_eq!(reference.speaker.as_deref(), Some("af_bella"));
+    }
+
+    #[test]
+    fn tts_bench_request_omits_voice_without_speaker() {
+        let body =
+            build_tts_bench_request_body("Kokoro-82M", "hello", &TtsBenchReference::default());
+
+        assert!(body.get("voice").is_none());
+    }
+
+    #[test]
+    fn tts_bench_request_includes_speaker_when_provided() {
+        let reference = TtsBenchReference {
+            speaker: Some("af_bella".to_string()),
+            ..TtsBenchReference::default()
+        };
+        let body = build_tts_bench_request_body("Kokoro-82M", "hello", &reference);
+
+        assert_eq!(body["voice"], "af_bella");
+        assert_eq!(body["model"], "Kokoro-82M");
+        assert_eq!(body["input"], "hello");
     }
 
     #[test]
@@ -4430,6 +4503,34 @@ concurrent = [1, 1]
 
         let err = expand_manifest_cases(&manifest).expect_err("duplicate matrix names should fail");
         assert!(format!("{err}").contains("duplicate case name `chat-short[concurrent=1]`"));
+    }
+
+    #[test]
+    fn manifest_matrix_expands_tts_speaker_cases() {
+        let manifest: BenchmarkManifest = toml::from_str(
+            r#"
+[[benchmarks]]
+name = "kokoro"
+command = "tts"
+model = "Kokoro-82M"
+
+[benchmarks.matrix]
+speaker = ["af_bella", "am_adam"]
+"#,
+        )
+        .expect("manifest should parse");
+
+        let cases = expand_manifest_cases(&manifest).expect("matrix should expand");
+        let names: Vec<_> = cases
+            .iter()
+            .map(|case| case.name.as_deref().expect("expanded cases are named"))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["kokoro[speaker=af_bella]", "kokoro[speaker=am_adam]"]
+        );
+        assert_eq!(cases[0].speaker.as_deref(), Some("af_bella"));
+        assert_eq!(cases[1].speaker.as_deref(), Some("am_adam"));
     }
 
     #[test]
