@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use candle_core::{DType, Tensor};
+use candle_core::{CpuStorage, CustomOp2, DType, Layout, Result as CandleResult, Shape, Tensor};
 use candle_nn::{
     ops, Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, Module, VarBuilder,
 };
@@ -13,6 +13,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::Distribution;
 use rand_distr::StandardNormal;
+use rayon::prelude::*;
 use rustfft::num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 
@@ -399,10 +400,11 @@ impl KokoroIstftGenerator {
             }
             x = x_up;
             let t_stage_add = if profile { Some(Instant::now()) } else { None };
-            if i + 1 == self.num_upsamples {
-                x = reflection_pad_left1(&x)?;
-            }
-            x = match_time_add(&x, &x_source)?;
+            x = if i + 1 == self.num_upsamples {
+                reflection_pad_left1_match_time_add(&x, &x_source)?
+            } else {
+                match_time_add(&x, &x_source)?
+            };
             if let Some(t) = t_stage_add {
                 log_kokoro_profile(&format!("generator.stage.{i}.pad_add"), t.elapsed());
             }
@@ -940,6 +942,106 @@ fn reflection_pad_left1(x: &Tensor) -> Result<Tensor> {
     Tensor::cat(&[left, x.clone()], 2).map_err(Error::from)
 }
 
+fn reflection_pad_left1_match_time_add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    if a.device().is_cpu() {
+        if let Ok(out) = a.apply_op2_no_bwd(b, &ReflectionPadLeft1AddCpuOp) {
+            return Ok(out);
+        }
+    }
+    let padded = reflection_pad_left1(a)?;
+    match_time_add(&padded, b)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReflectionPadLeft1AddCpuOp;
+
+impl CustomOp2 for ReflectionPadLeft1AddCpuOp {
+    fn name(&self) -> &'static str {
+        "kokoro-reflection-pad-left1-add-cpu"
+    }
+
+    fn cpu_fwd(
+        &self,
+        a_storage: &CpuStorage,
+        a_layout: &Layout,
+        b_storage: &CpuStorage,
+        b_layout: &Layout,
+    ) -> CandleResult<(CpuStorage, Shape)> {
+        let a = match a_storage {
+            CpuStorage::F32(values) => values,
+            _ => candle_core::bail!("kokoro-reflection-pad-left1-add-cpu only supports F32 lhs"),
+        };
+        let b = match b_storage {
+            CpuStorage::F32(values) => values,
+            _ => candle_core::bail!("kokoro-reflection-pad-left1-add-cpu only supports F32 rhs"),
+        };
+        let a = match a_layout.contiguous_offsets() {
+            Some((start, end)) => &a[start..end],
+            None => {
+                candle_core::bail!("kokoro-reflection-pad-left1-add-cpu requires contiguous lhs")
+            }
+        };
+        let b = match b_layout.contiguous_offsets() {
+            Some((start, end)) => &b[start..end],
+            None => {
+                candle_core::bail!("kokoro-reflection-pad-left1-add-cpu requires contiguous rhs")
+            }
+        };
+
+        let a_dims = a_layout.shape().dims();
+        let b_dims = b_layout.shape().dims();
+        if a_dims.len() != 3 || b_dims.len() != 3 {
+            candle_core::bail!("kokoro-reflection-pad-left1-add-cpu expects [B,C,T] tensors")
+        }
+        let batch = a_dims[0];
+        let channels = a_dims[1];
+        let a_time = a_dims[2];
+        let b_time = b_dims[2];
+        if b_dims[0] != batch || b_dims[1] != channels {
+            candle_core::bail!(
+                "kokoro-reflection-pad-left1-add-cpu shape mismatch {:?} vs {:?}",
+                a_dims,
+                b_dims
+            )
+        }
+        if a_time < 2 {
+            candle_core::bail!("kokoro-reflection-pad-left1-add-cpu requires lhs time >= 2")
+        }
+        let out_time = (a_time + 1).min(b_time);
+        if out_time == 0 {
+            candle_core::bail!("kokoro-reflection-pad-left1-add-cpu requires non-empty output")
+        }
+        let expected_a = batch * channels * a_time;
+        let expected_b = batch * channels * b_time;
+        if a.len() != expected_a || b.len() != expected_b {
+            candle_core::bail!(
+                "kokoro-reflection-pad-left1-add-cpu storage length mismatch: lhs={}, rhs={}, expected lhs={}, rhs={}",
+                a.len(),
+                b.len(),
+                expected_a,
+                expected_b
+            )
+        }
+
+        let mut out = vec![0.0f32; batch * channels * out_time];
+        out.par_chunks_mut(out_time)
+            .enumerate()
+            .for_each(|(row, out_row)| {
+                let a_base = row * a_time;
+                let b_base = row * b_time;
+                for t in 0..out_time {
+                    let a_t = if t == 0 { 1 } else { t - 1 };
+                    out_row[t] = a[a_base + a_t] + b[b_base + t];
+                }
+            });
+
+        Ok((
+            CpuStorage::F32(out),
+            Shape::from((batch, channels, out_time)),
+        ))
+    }
+}
+
 fn match_time_add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let (ba, ca, ta) = a.dims3().map_err(Error::from)?;
     let (bb, cb, tb) = b.dims3().map_err(Error::from)?;
@@ -1194,6 +1296,32 @@ mod tests {
         let down = linear_resample_time_time_major(&input, 8, 2, 3);
         let up = linear_resample_time_time_major(&down, 2, 8, 3);
         assert!(up.iter().all(|v| (*v - 1.25).abs() < 1e-5));
+    }
+
+    #[test]
+    fn kokoro_reflection_pad_left1_add_cpu_matches_expression() {
+        let device = candle_core::Device::Cpu;
+        let a_values = (0..2 * 3 * 4).map(|v| v as f32 * 0.25).collect::<Vec<_>>();
+        let b_values = (0..2 * 3 * 5)
+            .map(|v| 10.0 + v as f32 * 0.5)
+            .collect::<Vec<_>>();
+        let a = Tensor::from_vec(a_values, (2, 3, 4), &device).expect("lhs");
+        let b = Tensor::from_vec(b_values, (2, 3, 5), &device).expect("rhs");
+
+        let reference = match_time_add(&reflection_pad_left1(&a).expect("pad"), &b)
+            .expect("reference")
+            .flatten_all()
+            .expect("flatten reference")
+            .to_vec1::<f32>()
+            .expect("reference values");
+        let fused = reflection_pad_left1_match_time_add(&a, &b)
+            .expect("fused")
+            .flatten_all()
+            .expect("flatten fused")
+            .to_vec1::<f32>()
+            .expect("fused values");
+
+        assert_eq!(fused, reference);
     }
 
     #[test]
