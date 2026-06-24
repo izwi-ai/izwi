@@ -125,6 +125,16 @@ fn kokoro_cpu_stage_branches_parallel_enabled() -> bool {
     }
 }
 
+fn kokoro_metal_harmonic_overlap_enabled() -> bool {
+    match std::env::var("IZWI_KOKORO_METAL_HARMONIC_OVERLAP") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "serial" | "sequential"
+        ),
+        Err(_) => true,
+    }
+}
+
 #[derive(Debug)]
 pub struct KokoroDecoder {
     f0_conv: Conv1d,
@@ -217,49 +227,81 @@ impl KokoroDecoder {
         style: &Tensor,    // [B, 128]
         rng_seed: Option<u64>,
     ) -> Result<Vec<f32>> {
-        let profile = kokoro_profile_enabled();
-        let t0 = Instant::now();
-        let f0 = self
-            .f0_conv
-            .forward(&f0_curve.unsqueeze(1).map_err(Error::from)?)
-            .map_err(Error::from)?;
-        let n = self
-            .n_conv
-            .forward(&n_curve.unsqueeze(1).map_err(Error::from)?)
-            .map_err(Error::from)?;
-        if profile {
-            log_kokoro_profile("decoder.f0n_conv", t0.elapsed());
-        }
+        thread::scope(|scope| {
+            let profile = kokoro_profile_enabled();
+            let t0 = Instant::now();
+            let overlap_harmonic =
+                asr.device().is_metal() && kokoro_metal_harmonic_overlap_enabled();
+            let harmonic_handle = if overlap_harmonic {
+                let generator = &self.generator;
+                Some(scope.spawn(move || {
+                    generator
+                        .harmonic_features(f0_curve, f0_curve.device(), rng_seed)
+                        .map_err(|e| e.to_string())
+                }))
+            } else {
+                None
+            };
 
-        let t1 = Instant::now();
-        let x = Tensor::cat(&[asr.clone(), f0.clone(), n.clone()], 1).map_err(Error::from)?;
-        let mut x = self.encode.forward(&x, style)?;
-        let asr_res = self.asr_res.forward(asr).map_err(Error::from)?;
-
-        let mut still_concat_res = true;
-        for block in &self.decode {
-            if still_concat_res {
-                x = Tensor::cat(&[x, asr_res.clone(), f0.clone(), n.clone()], 1)
-                    .map_err(Error::from)?;
+            let f0 = self
+                .f0_conv
+                .forward(&f0_curve.unsqueeze(1).map_err(Error::from)?)
+                .map_err(Error::from)?;
+            let n = self
+                .n_conv
+                .forward(&n_curve.unsqueeze(1).map_err(Error::from)?)
+                .map_err(Error::from)?;
+            if profile {
+                log_kokoro_profile("decoder.f0n_conv", t0.elapsed());
             }
-            x = block.forward(&x, style)?;
-            let (_b, _c, t) = x.dims3().map_err(Error::from)?;
-            let (_, _, asr_t) = asr_res.dims3().map_err(Error::from)?;
-            if t > asr_t {
-                still_concat_res = false;
-            }
-        }
-        if profile {
-            log_kokoro_profile("decoder.encode_decode_blocks", t1.elapsed());
-        }
 
-        let t2 = Instant::now();
-        let out = self.generator.forward(&x, style, f0_curve, rng_seed)?;
-        if profile {
-            log_kokoro_profile("decoder.generator_total", t2.elapsed());
-            log_kokoro_profile("decoder.total", t0.elapsed());
-        }
-        Ok(out)
+            let t1 = Instant::now();
+            let x = Tensor::cat(&[asr.clone(), f0.clone(), n.clone()], 1).map_err(Error::from)?;
+            let mut x = self.encode.forward(&x, style)?;
+            let asr_res = self.asr_res.forward(asr).map_err(Error::from)?;
+
+            let mut still_concat_res = true;
+            for block in &self.decode {
+                if still_concat_res {
+                    x = Tensor::cat(&[x, asr_res.clone(), f0.clone(), n.clone()], 1)
+                        .map_err(Error::from)?;
+                }
+                x = block.forward(&x, style)?;
+                let (_b, _c, t) = x.dims3().map_err(Error::from)?;
+                let (_, _, asr_t) = asr_res.dims3().map_err(Error::from)?;
+                if t > asr_t {
+                    still_concat_res = false;
+                }
+            }
+            if profile {
+                log_kokoro_profile("decoder.encode_decode_blocks", t1.elapsed());
+            }
+
+            let t2 = Instant::now();
+            let out = if let Some(handle) = harmonic_handle {
+                let t_join = if profile { Some(Instant::now()) } else { None };
+                let har = match handle.join() {
+                    Ok(Ok(t)) => t,
+                    Ok(Err(msg)) => return Err(Error::InferenceError(msg)),
+                    Err(_) => {
+                        return Err(Error::InferenceError(
+                            "Kokoro harmonic feature worker thread panicked".to_string(),
+                        ))
+                    }
+                };
+                if let Some(t) = t_join {
+                    log_kokoro_profile("decoder.harmonic_overlap_join", t.elapsed());
+                }
+                self.generator.forward_with_harmonic(&x, style, &har)?
+            } else {
+                self.generator.forward(&x, style, f0_curve, rng_seed)?
+            };
+            if profile {
+                log_kokoro_profile("decoder.generator_total", t2.elapsed());
+                log_kokoro_profile("decoder.total", t0.elapsed());
+            }
+            Ok(out)
+        })
     }
 }
 
@@ -450,7 +492,15 @@ impl KokoroIstftGenerator {
         if profile {
             log_kokoro_profile("generator.harmonic_features", t0.elapsed());
         }
+        let out = self.forward_with_harmonic(x, style, &har)?;
+        if profile {
+            log_kokoro_profile("generator.total", t0.elapsed());
+        }
+        Ok(out)
+    }
 
+    fn forward_with_harmonic(&self, x: &Tensor, style: &Tensor, har: &Tensor) -> Result<Vec<f32>> {
+        let profile = kokoro_profile_enabled();
         let t1 = Instant::now();
         let mut x = x.clone();
         for i in 0..self.num_upsamples {
@@ -535,7 +585,6 @@ impl KokoroIstftGenerator {
         self.stft.inverse(&spec, &phase).inspect(|_| {
             if profile {
                 log_kokoro_profile("generator.istft_inverse", t3.elapsed());
-                log_kokoro_profile("generator.total", t0.elapsed());
             }
         })
     }
