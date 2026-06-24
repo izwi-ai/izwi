@@ -386,17 +386,41 @@ impl KokoroIstftGenerator {
         let t1 = Instant::now();
         let mut x = x.clone();
         for i in 0..self.num_upsamples {
+            let stage_t0 = if profile { Some(Instant::now()) } else { None };
+            let t_stage_leaky = if profile { Some(Instant::now()) } else { None };
             x = ops::leaky_relu(&x, 0.1).map_err(Error::from)?;
+            if let Some(t) = t_stage_leaky {
+                log_kokoro_profile(&format!("generator.stage.{i}.leaky_relu"), t.elapsed());
+            }
+            let t_stage_branches = if profile { Some(Instant::now()) } else { None };
             let (x_up, x_source) = self.run_stage_branches(i, &x, &har, style)?;
+            if let Some(t) = t_stage_branches {
+                log_kokoro_profile(&format!("generator.stage.{i}.branches"), t.elapsed());
+            }
             x = x_up;
+            let t_stage_add = if profile { Some(Instant::now()) } else { None };
             if i + 1 == self.num_upsamples {
                 x = reflection_pad_left1(&x)?;
             }
             x = match_time_add(&x, &x_source)?;
+            if let Some(t) = t_stage_add {
+                log_kokoro_profile(&format!("generator.stage.{i}.pad_add"), t.elapsed());
+            }
 
             let base = i * self.num_kernels;
+            let t_stage_resblocks = if profile { Some(Instant::now()) } else { None };
             let xs = self.run_stage_resblocks(base, &x, style)?;
+            if let Some(t) = t_stage_resblocks {
+                log_kokoro_profile(&format!("generator.stage.{i}.resblocks"), t.elapsed());
+            }
+            let t_stage_avg = if profile { Some(Instant::now()) } else { None };
             x = (xs / self.num_kernels as f64).map_err(Error::from)?;
+            if let Some(t) = t_stage_avg {
+                log_kokoro_profile(&format!("generator.stage.{i}.average"), t.elapsed());
+            }
+            if let Some(t) = stage_t0 {
+                log_kokoro_profile(&format!("generator.stage.{i}.total"), t.elapsed());
+            }
         }
         if profile {
             log_kokoro_profile("generator.neural_upsample", t1.elapsed());
