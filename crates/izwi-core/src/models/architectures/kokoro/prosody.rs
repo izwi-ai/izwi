@@ -394,6 +394,34 @@ impl AdaIN1d {
             .broadcast_add(&beta)
             .map_err(Error::from)
     }
+
+    pub(crate) fn forward_snake(
+        &self,
+        x: &Tensor,
+        style: &Tensor,
+        alpha: &Tensor,
+    ) -> Result<Tensor> {
+        let (_b, c, _t) = x.dims3().map_err(Error::from)?;
+        if c != self.channels {
+            return Err(Error::InferenceError(format!(
+                "AdaIN1d expected channels {}, got {}",
+                self.channels, c
+            )));
+        }
+        let h = self.fc.forward(style).map_err(Error::from)?;
+        if x.device().is_cpu()
+            && x.dtype() == DType::F32
+            && h.dtype() == DType::F32
+            && alpha.dtype() == DType::F32
+        {
+            if let Ok(out) = x.apply_op3_no_bwd(&h, alpha, &AdaIN1dSnakeCpuOp { eps: self.eps }) {
+                return Ok(out);
+            }
+        }
+
+        let normalized = self.forward(x, style)?;
+        snake1d_expr(&normalized, alpha)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -504,6 +532,132 @@ fn validate_adain_affine_shape(
             dims
         ),
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AdaIN1dSnakeCpuOp {
+    eps: f64,
+}
+
+impl CustomOp3 for AdaIN1dSnakeCpuOp {
+    fn name(&self) -> &'static str {
+        "kokoro-adain1d-snake-cpu"
+    }
+
+    fn cpu_fwd(
+        &self,
+        x_storage: &CpuStorage,
+        x_layout: &Layout,
+        h_storage: &CpuStorage,
+        h_layout: &Layout,
+        alpha_storage: &CpuStorage,
+        alpha_layout: &Layout,
+    ) -> CandleResult<(CpuStorage, Shape)> {
+        let x = match x_storage {
+            CpuStorage::F32(values) => values,
+            _ => candle_core::bail!("kokoro-adain1d-snake-cpu only supports F32 input"),
+        };
+        let h = match h_storage {
+            CpuStorage::F32(values) => values,
+            _ => candle_core::bail!("kokoro-adain1d-snake-cpu only supports F32 affine"),
+        };
+        let alpha = match alpha_storage {
+            CpuStorage::F32(values) => values,
+            _ => candle_core::bail!("kokoro-adain1d-snake-cpu only supports F32 alpha"),
+        };
+        let x = match x_layout.contiguous_offsets() {
+            Some((start, end)) => &x[start..end],
+            None => candle_core::bail!("kokoro-adain1d-snake-cpu requires contiguous input"),
+        };
+        let h = match h_layout.contiguous_offsets() {
+            Some((start, end)) => &h[start..end],
+            None => candle_core::bail!("kokoro-adain1d-snake-cpu requires contiguous affine"),
+        };
+        let alpha = match alpha_layout.contiguous_offsets() {
+            Some((start, end)) => &alpha[start..end],
+            None => candle_core::bail!("kokoro-adain1d-snake-cpu requires contiguous alpha"),
+        };
+
+        let dims = x_layout.shape().dims();
+        if dims.len() != 3 {
+            candle_core::bail!("kokoro-adain1d-snake-cpu expects [B,C,T] input")
+        }
+        let batch = dims[0];
+        let channels = dims[1];
+        let time = dims[2];
+        if time < 2 {
+            candle_core::bail!("kokoro-adain1d-snake-cpu requires time length >= 2")
+        }
+        match h_layout.shape().dims() {
+            [b, two_c] if *b == batch && *two_c == channels * 2 => {}
+            other => candle_core::bail!(
+                "kokoro-adain1d-snake-cpu affine shape {:?} cannot broadcast to [{batch},{channels},T]",
+                other
+            ),
+        }
+        let alpha_by_channel = validate_snake_alpha_shape(alpha_layout.shape().dims(), channels)?;
+        if alpha_by_channel && alpha.len() != channels {
+            candle_core::bail!(
+                "kokoro-adain1d-snake-cpu alpha storage length {}, expected {}",
+                alpha.len(),
+                channels
+            )
+        }
+        if !alpha_by_channel && alpha.len() != 1 {
+            candle_core::bail!("kokoro-adain1d-snake-cpu scalar alpha has invalid storage length")
+        }
+
+        let mut out = vec![0.0f32; x.len()];
+        let denom_scale = (time - 1) as f32;
+        for b in 0..batch {
+            let h_base = b * channels * 2;
+            for c in 0..channels {
+                let base = (b * channels + c) * time;
+                let values = &x[base..base + time];
+                let mean = values.iter().copied().sum::<f32>() / time as f32;
+                let var = values
+                    .iter()
+                    .map(|v| {
+                        let d = *v - mean;
+                        d * d
+                    })
+                    .sum::<f32>()
+                    / denom_scale;
+                let inv_std = 1.0f32 / (var + self.eps as f32).sqrt();
+                let scale = h[h_base + c] + 1.0;
+                let bias = h[h_base + channels + c];
+                let alpha = if alpha_by_channel { alpha[c] } else { alpha[0] };
+                for t in 0..time {
+                    let v = x[base + t];
+                    let y = (v - mean) * inv_std * scale + bias;
+                    let s = (y * alpha).sin();
+                    out[base + t] = y + (s * s) / alpha;
+                }
+            }
+        }
+        Ok((CpuStorage::F32(out), x_layout.shape().clone()))
+    }
+}
+
+fn validate_snake_alpha_shape(dims: &[usize], channels: usize) -> CandleResult<bool> {
+    match dims {
+        [1] => Ok(false),
+        [c] if *c == channels => Ok(true),
+        [1, c, 1] if *c == channels => Ok(true),
+        [c, 1] if *c == channels => Ok(true),
+        _ => candle_core::bail!(
+            "kokoro-adain1d-snake-cpu alpha shape {:?} cannot broadcast to channel count {}",
+            dims,
+            channels
+        ),
+    }
+}
+
+fn snake1d_expr(x: &Tensor, alpha: &Tensor) -> Result<Tensor> {
+    let ax = x.broadcast_mul(alpha).map_err(Error::from)?;
+    let sin_sq = ax.sin().map_err(Error::from)?.sqr().map_err(Error::from)?;
+    let scaled = sin_sq.broadcast_div(alpha).map_err(Error::from)?;
+    x.broadcast_add(&scaled).map_err(Error::from)
 }
 
 #[derive(Debug)]
@@ -826,6 +980,64 @@ mod tests {
             .expect("mul gamma")
             .broadcast_add(&beta)
             .expect("add beta")
+            .flatten_all()
+            .expect("flatten reference")
+            .to_vec1::<f32>()
+            .expect("reference values");
+
+        assert_eq!(fused.len(), reference.len());
+        for (got, expected) in fused.iter().zip(reference.iter()) {
+            assert!((got - expected).abs() < 1e-5, "{got} != {expected}");
+        }
+    }
+
+    #[test]
+    fn adain1d_snake_cpu_op_matches_separate_expression() {
+        let device = candle_core::Device::Cpu;
+        let eps = 1e-5;
+        let x = Tensor::from_vec(
+            vec![-0.4f32, 0.0, 0.25, 0.7, -1.2, 0.3, 0.9, 1.4],
+            (1, 2, 4),
+            &device,
+        )
+        .expect("x tensor");
+        let affine = Tensor::from_vec(vec![0.2f32, -0.15, 0.05, -0.2], (1, 4), &device)
+            .expect("affine tensor");
+        let alpha = Tensor::from_vec(vec![0.7f32, 1.3], (1, 2, 1), &device).expect("alpha tensor");
+
+        let fused = x
+            .apply_op3_no_bwd(&affine, &alpha, &AdaIN1dSnakeCpuOp { eps })
+            .expect("fused adain snake")
+            .flatten_all()
+            .expect("flatten fused")
+            .to_vec1::<f32>()
+            .expect("fused values");
+
+        let gamma = affine
+            .narrow(1, 0, 2)
+            .expect("gamma")
+            .unsqueeze(2)
+            .expect("gamma unsqueeze");
+        let beta = affine
+            .narrow(1, 2, 2)
+            .expect("beta")
+            .unsqueeze(2)
+            .expect("beta unsqueeze");
+        let mean = x.mean_keepdim(2).expect("mean");
+        let var = x.var_keepdim(2).expect("var");
+        let denom = (var + eps).expect("eps").sqrt().expect("sqrt");
+        let xhat = x
+            .broadcast_sub(&mean)
+            .expect("sub mean")
+            .broadcast_div(&denom)
+            .expect("div denom");
+        let adain = xhat
+            .broadcast_mul(&(gamma + 1.0f64).expect("gamma plus one"))
+            .expect("mul gamma")
+            .broadcast_add(&beta)
+            .expect("add beta");
+        let reference = snake1d_expr(&adain, &alpha)
+            .expect("snake")
             .flatten_all()
             .expect("flatten reference")
             .to_vec1::<f32>()
