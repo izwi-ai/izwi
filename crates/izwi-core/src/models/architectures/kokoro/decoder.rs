@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use candle_core::{DType, Tensor};
+use candle_core::{CpuStorage, CustomOp2, DType, Layout, Result as CandleResult, Shape, Tensor};
 use candle_nn::{
     ops, Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, Module, VarBuilder,
 };
@@ -39,12 +39,10 @@ fn log_kokoro_profile(stage: &str, dur: Duration) {
 
 fn kokoro_cpu_resblocks_parallel_enabled() -> bool {
     match std::env::var("IZWI_KOKORO_CPU_RESBLOCKS") {
-        Ok(value) => {
-            !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "off" | "serial" | "sequential"
-            )
-        }
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "serial" | "sequential"
+        ),
         Err(_) => true,
     }
 }
@@ -495,10 +493,7 @@ impl KokoroIstftGenerator {
     }
 
     fn run_stage_resblocks(&self, base: usize, x: &Tensor, style: &Tensor) -> Result<Tensor> {
-        if x.device().is_cpu()
-            && self.num_kernels > 1
-            && kokoro_cpu_resblocks_parallel_enabled()
-        {
+        if x.device().is_cpu() && self.num_kernels > 1 && kokoro_cpu_resblocks_parallel_enabled() {
             return self.run_stage_resblocks_parallel_cpu(base, x, style);
         }
         let mut xs = self.resblocks[base].forward(x, style)?;
@@ -798,7 +793,87 @@ fn get_padding(kernel_size: usize, dilation: usize) -> usize {
         / 2
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Snake1dCpuOp;
+
+impl CustomOp2 for Snake1dCpuOp {
+    fn name(&self) -> &'static str {
+        "kokoro-snake1d-cpu"
+    }
+
+    fn cpu_fwd(
+        &self,
+        x_storage: &CpuStorage,
+        x_layout: &Layout,
+        alpha_storage: &CpuStorage,
+        alpha_layout: &Layout,
+    ) -> CandleResult<(CpuStorage, Shape)> {
+        let x = match x_storage {
+            CpuStorage::F32(values) => values,
+            _ => candle_core::bail!("kokoro-snake1d-cpu only supports F32 input"),
+        };
+        let alpha = match alpha_storage {
+            CpuStorage::F32(values) => values,
+            _ => candle_core::bail!("kokoro-snake1d-cpu only supports F32 alpha"),
+        };
+        let x = match x_layout.contiguous_offsets() {
+            Some((start, end)) => &x[start..end],
+            None => candle_core::bail!("kokoro-snake1d-cpu requires contiguous input"),
+        };
+        let alpha = match alpha_layout.contiguous_offsets() {
+            Some((start, end)) => &alpha[start..end],
+            None => candle_core::bail!("kokoro-snake1d-cpu requires contiguous alpha"),
+        };
+
+        let dims = x_layout.shape().dims();
+        if dims.len() != 3 {
+            candle_core::bail!("kokoro-snake1d-cpu expects [B,C,T] input")
+        }
+        let batch = dims[0];
+        let channels = dims[1];
+        let time = dims[2];
+        let alpha_dims = alpha_layout.shape().dims();
+        let alpha_by_channel = match alpha_dims {
+            [1] => false,
+            [c] if *c == channels => true,
+            [1, c, 1] if *c == channels => true,
+            [c, 1] if *c == channels => true,
+            _ => candle_core::bail!(
+                "kokoro-snake1d-cpu alpha shape {:?} cannot broadcast to {:?}",
+                alpha_dims,
+                dims
+            ),
+        };
+        if !alpha_by_channel && alpha.len() != 1 {
+            candle_core::bail!("kokoro-snake1d-cpu scalar alpha has invalid storage length")
+        }
+
+        let mut out = vec![0.0f32; x.len()];
+        for b in 0..batch {
+            for c in 0..channels {
+                let a = if alpha_by_channel { alpha[c] } else { alpha[0] };
+                for t in 0..time {
+                    let idx = (b * channels + c) * time + t;
+                    let v = x[idx];
+                    let s = (v * a).sin();
+                    out[idx] = v + (s * s) / a;
+                }
+            }
+        }
+        Ok((CpuStorage::F32(out), x_layout.shape().clone()))
+    }
+}
+
 fn snake1d(x: &Tensor, alpha: &Tensor) -> Result<Tensor> {
+    if x.device().is_cpu() && x.dtype() == DType::F32 && alpha.dtype() == DType::F32 {
+        if let Ok(out) = x.apply_op2_no_bwd(alpha, &Snake1dCpuOp) {
+            return Ok(out);
+        }
+    }
+    snake1d_candle(x, alpha)
+}
+
+fn snake1d_candle(x: &Tensor, alpha: &Tensor) -> Result<Tensor> {
     let ax = x.broadcast_mul(alpha).map_err(Error::from)?;
     let sin_sq = ax.sin().map_err(Error::from)?.sqr().map_err(Error::from)?;
     let scaled = sin_sq.broadcast_div(alpha).map_err(Error::from)?;
@@ -1048,6 +1123,36 @@ mod tests {
         assert_eq!(y[0], 1.0);
         assert_eq!(y[4], 2.0);
         assert_eq!(y[8], 3.0);
+    }
+
+    #[test]
+    fn kokoro_snake1d_cpu_matches_candle_expression() {
+        let device = candle_core::Device::Cpu;
+        let x = Tensor::from_vec(
+            vec![-0.4f32, 0.0, 0.25, 0.7, -1.2, 0.3, 0.9, 1.4],
+            (1, 2, 4),
+            &device,
+        )
+        .expect("x tensor");
+        let alpha = Tensor::from_vec(vec![0.7f32, 1.3], (1, 2, 1), &device).expect("alpha tensor");
+
+        let fused = snake1d(&x, &alpha)
+            .expect("fused snake")
+            .flatten_all()
+            .expect("flatten fused")
+            .to_vec1::<f32>()
+            .expect("fused values");
+        let reference = snake1d_candle(&x, &alpha)
+            .expect("reference snake")
+            .flatten_all()
+            .expect("flatten reference")
+            .to_vec1::<f32>()
+            .expect("reference values");
+
+        assert_eq!(fused.len(), reference.len());
+        for (got, expected) in fused.iter().zip(reference.iter()) {
+            assert!((got - expected).abs() < 1e-6, "{got} != {expected}");
+        }
     }
 
     #[test]
