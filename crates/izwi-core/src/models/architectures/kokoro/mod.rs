@@ -16,6 +16,7 @@ pub use config::KokoroConfig;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use candle_core::pickle::read_pth_tensor_info;
@@ -54,6 +55,16 @@ fn log_kokoro_profile(stage: &str, dur: Duration) {
             "kokoro profile: {stage} = {:.2} ms",
             dur.as_secs_f64() * 1_000.0
         );
+    }
+}
+
+fn kokoro_cpu_predecoder_parallel_enabled() -> bool {
+    match std::env::var("IZWI_KOKORO_CPU_PREDECODER") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "serial" | "sequential"
+        ),
+        Err(_) => true,
     }
 }
 
@@ -387,6 +398,19 @@ impl KokoroTtsModel {
         prepared: &KokoroPreparedRequest,
     ) -> Result<KokoroProsodyDebugOutput> {
         let input_ids = self.build_model_input_ids(prepared)?;
+        self.run_bert_prosody_debug_for_input(&input_ids, prepared)
+    }
+
+    fn run_bert_prosody(&self, prepared: &KokoroPreparedRequest) -> Result<KokoroProsodyOutput> {
+        let input_ids = self.build_model_input_ids(prepared)?;
+        self.run_bert_prosody_for_input(&input_ids, prepared)
+    }
+
+    fn run_bert_prosody_debug_for_input(
+        &self,
+        input_ids: &Tensor,
+        prepared: &KokoroPreparedRequest,
+    ) -> Result<KokoroProsodyDebugOutput> {
         let bert_hidden = self.bert.forward(&input_ids, None)?;
         let d_en = self
             .bert_encoder
@@ -398,9 +422,12 @@ impl KokoroTtsModel {
             .forward_debug(&d_en, &prepared.ref_style, prepared.speed)
     }
 
-    fn run_bert_prosody(&self, prepared: &KokoroPreparedRequest) -> Result<KokoroProsodyOutput> {
-        let input_ids = self.build_model_input_ids(prepared)?;
-        let bert_hidden = self.bert.forward(&input_ids, None)?;
+    fn run_bert_prosody_for_input(
+        &self,
+        input_ids: &Tensor,
+        prepared: &KokoroPreparedRequest,
+    ) -> Result<KokoroProsodyOutput> {
+        let bert_hidden = self.bert.forward(input_ids, None)?;
         let d_en = self
             .bert_encoder
             .forward(&bert_hidden)
@@ -430,9 +457,8 @@ impl KokoroTtsModel {
 
     fn run_predecoder(&self, prepared: &KokoroPreparedRequest) -> Result<KokoroPredecoderOutput> {
         let input_ids = self.build_model_input_ids(prepared)?;
-        let prosody = self.run_bert_prosody(prepared)?;
+        let (prosody, t_en) = self.run_predecoder_branches(&input_ids, prepared)?;
         let pred_aln = build_alignment_matrix(&prosody.duration_frames, &self.device.device)?;
-        let t_en = self.text_encoder.forward(&input_ids)?;
         let asr = t_en
             .contiguous()
             .map_err(Error::from)?
@@ -443,6 +469,60 @@ impl KokoroTtsModel {
             prosody,
             text_encoder_shape,
             asr,
+        })
+    }
+
+    fn run_predecoder_branches(
+        &self,
+        input_ids: &Tensor,
+        prepared: &KokoroPreparedRequest,
+    ) -> Result<(KokoroProsodyOutput, Tensor)> {
+        if input_ids.device().is_cpu() && kokoro_cpu_predecoder_parallel_enabled() {
+            return self.run_predecoder_branches_parallel_cpu(input_ids, prepared);
+        }
+
+        let prosody = self.run_bert_prosody_for_input(input_ids, prepared)?;
+        let t_en = self.text_encoder.forward(input_ids)?;
+        Ok((prosody, t_en))
+    }
+
+    fn run_predecoder_branches_parallel_cpu(
+        &self,
+        input_ids: &Tensor,
+        prepared: &KokoroPreparedRequest,
+    ) -> Result<(KokoroProsodyOutput, Tensor)> {
+        thread::scope(|scope| {
+            let prosody_handle = scope.spawn(|| {
+                self.run_bert_prosody_for_input(input_ids, prepared)
+                    .map_err(|e| e.to_string())
+            });
+            let text_handle = scope.spawn(|| {
+                self.text_encoder
+                    .forward(input_ids)
+                    .map_err(Error::from)
+                    .map_err(|e| e.to_string())
+            });
+
+            let prosody = match prosody_handle.join() {
+                Ok(Ok(t)) => t,
+                Ok(Err(msg)) => return Err(Error::InferenceError(msg)),
+                Err(_) => {
+                    return Err(Error::InferenceError(
+                        "Kokoro predecoder prosody worker thread panicked".to_string(),
+                    ))
+                }
+            };
+            let t_en = match text_handle.join() {
+                Ok(Ok(t)) => t,
+                Ok(Err(msg)) => return Err(Error::InferenceError(msg)),
+                Err(_) => {
+                    return Err(Error::InferenceError(
+                        "Kokoro predecoder text encoder worker thread panicked".to_string(),
+                    ))
+                }
+            };
+
+            Ok((prosody, t_en))
         })
     }
 
