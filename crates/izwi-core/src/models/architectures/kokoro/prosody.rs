@@ -1,4 +1,6 @@
-use candle_core::{DType, IndexOp, Tensor};
+use candle_core::{
+    CpuStorage, CustomOp3, DType, IndexOp, Layout, Result as CandleResult, Shape, Tensor,
+};
 use candle_nn::rnn::Direction;
 use candle_nn::{
     ops, Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, Linear, Module, VarBuilder,
@@ -363,6 +365,21 @@ impl AdaIN1d {
                 self.channels, c
             )));
         }
+        let h = self.fc.forward(style).map_err(Error::from)?;
+        let chunks = h.chunk(2, 1).map_err(Error::from)?;
+        let gamma = chunks[0].unsqueeze(2).map_err(Error::from)?;
+        let beta = chunks[1].unsqueeze(2).map_err(Error::from)?;
+
+        if x.device().is_cpu()
+            && x.dtype() == DType::F32
+            && gamma.dtype() == DType::F32
+            && beta.dtype() == DType::F32
+        {
+            if let Ok(out) = x.apply_op3_no_bwd(&gamma, &beta, &AdaIN1dCpuOp { eps: self.eps }) {
+                return Ok(out);
+            }
+        }
+
         let mean = x.mean_keepdim(2).map_err(Error::from)?;
         let var = x.var_keepdim(2).map_err(Error::from)?;
         let denom = (var + self.eps)
@@ -372,15 +389,120 @@ impl AdaIN1d {
         let xhat = (x.broadcast_sub(&mean).map_err(Error::from)?)
             .broadcast_div(&denom)
             .map_err(Error::from)?;
-
-        let h = self.fc.forward(style).map_err(Error::from)?;
-        let chunks = h.chunk(2, 1).map_err(Error::from)?;
-        let gamma = chunks[0].unsqueeze(2).map_err(Error::from)?;
-        let beta = chunks[1].unsqueeze(2).map_err(Error::from)?;
         xhat.broadcast_mul(&(gamma + 1.0f64).map_err(Error::from)?)
             .map_err(Error::from)?
             .broadcast_add(&beta)
             .map_err(Error::from)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AdaIN1dCpuOp {
+    eps: f64,
+}
+
+impl CustomOp3 for AdaIN1dCpuOp {
+    fn name(&self) -> &'static str {
+        "kokoro-adain1d-cpu"
+    }
+
+    fn cpu_fwd(
+        &self,
+        x_storage: &CpuStorage,
+        x_layout: &Layout,
+        gamma_storage: &CpuStorage,
+        gamma_layout: &Layout,
+        beta_storage: &CpuStorage,
+        beta_layout: &Layout,
+    ) -> CandleResult<(CpuStorage, Shape)> {
+        let x = match x_storage {
+            CpuStorage::F32(values) => values,
+            _ => candle_core::bail!("kokoro-adain1d-cpu only supports F32 input"),
+        };
+        let gamma = match gamma_storage {
+            CpuStorage::F32(values) => values,
+            _ => candle_core::bail!("kokoro-adain1d-cpu only supports F32 gamma"),
+        };
+        let beta = match beta_storage {
+            CpuStorage::F32(values) => values,
+            _ => candle_core::bail!("kokoro-adain1d-cpu only supports F32 beta"),
+        };
+        let x = match x_layout.contiguous_offsets() {
+            Some((start, end)) => &x[start..end],
+            None => candle_core::bail!("kokoro-adain1d-cpu requires contiguous input"),
+        };
+        let gamma = match gamma_layout.contiguous_offsets() {
+            Some((start, end)) => &gamma[start..end],
+            None => candle_core::bail!("kokoro-adain1d-cpu requires contiguous gamma"),
+        };
+        let beta = match beta_layout.contiguous_offsets() {
+            Some((start, end)) => &beta[start..end],
+            None => candle_core::bail!("kokoro-adain1d-cpu requires contiguous beta"),
+        };
+
+        let dims = x_layout.shape().dims();
+        if dims.len() != 3 {
+            candle_core::bail!("kokoro-adain1d-cpu expects [B,C,T] input")
+        }
+        let batch = dims[0];
+        let channels = dims[1];
+        let time = dims[2];
+        if time < 2 {
+            candle_core::bail!("kokoro-adain1d-cpu requires time length >= 2")
+        }
+        validate_adain_affine_shape(gamma_layout.shape().dims(), batch, channels, "gamma")?;
+        validate_adain_affine_shape(beta_layout.shape().dims(), batch, channels, "beta")?;
+        if gamma.len() != batch * channels || beta.len() != batch * channels {
+            candle_core::bail!(
+                "kokoro-adain1d-cpu affine storage length mismatch: gamma={}, beta={}, expected={}",
+                gamma.len(),
+                beta.len(),
+                batch * channels
+            )
+        }
+
+        let mut out = vec![0.0f32; x.len()];
+        let denom_scale = (time - 1) as f32;
+        for b in 0..batch {
+            for c in 0..channels {
+                let base = (b * channels + c) * time;
+                let values = &x[base..base + time];
+                let mean = values.iter().copied().sum::<f32>() / time as f32;
+                let var = values
+                    .iter()
+                    .map(|v| {
+                        let d = *v - mean;
+                        d * d
+                    })
+                    .sum::<f32>()
+                    / denom_scale;
+                let inv_std = 1.0f32 / (var + self.eps as f32).sqrt();
+                let affine_idx = b * channels + c;
+                let scale = gamma[affine_idx] + 1.0;
+                let bias = beta[affine_idx];
+                for t in 0..time {
+                    let v = x[base + t];
+                    out[base + t] = (v - mean) * inv_std * scale + bias;
+                }
+            }
+        }
+        Ok((CpuStorage::F32(out), x_layout.shape().clone()))
+    }
+}
+
+fn validate_adain_affine_shape(
+    dims: &[usize],
+    batch: usize,
+    channels: usize,
+    name: &str,
+) -> CandleResult<()> {
+    match dims {
+        [b, c, 1] if *b == batch && *c == channels => Ok(()),
+        [b, c] if *b == batch && *c == channels => Ok(()),
+        _ => candle_core::bail!(
+            "kokoro-adain1d-cpu {name} shape {:?} cannot broadcast to [{batch},{channels},T]",
+            dims
+        ),
     }
 }
 
@@ -663,4 +785,55 @@ pub(crate) fn fuse_weight_norm_dim0(weight_v: &Tensor, weight_g: &Tensor) -> Res
     .map_err(Error::from)?;
     let scale = weight_g.broadcast_div(&norm).map_err(Error::from)?;
     weight_v.broadcast_mul(&scale).map_err(Error::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adain1d_cpu_op_matches_candle_expression() {
+        let device = candle_core::Device::Cpu;
+        let eps = 1e-5;
+        let x = Tensor::from_vec(
+            vec![-0.4f32, 0.0, 0.25, 0.7, -1.2, 0.3, 0.9, 1.4],
+            (1, 2, 4),
+            &device,
+        )
+        .expect("x tensor");
+        let gamma =
+            Tensor::from_vec(vec![0.2f32, -0.15], (1, 2, 1), &device).expect("gamma tensor");
+        let beta = Tensor::from_vec(vec![0.05f32, -0.2], (1, 2, 1), &device).expect("beta tensor");
+
+        let fused = x
+            .apply_op3_no_bwd(&gamma, &beta, &AdaIN1dCpuOp { eps })
+            .expect("fused adain")
+            .flatten_all()
+            .expect("flatten fused")
+            .to_vec1::<f32>()
+            .expect("fused values");
+
+        let mean = x.mean_keepdim(2).expect("mean");
+        let var = x.var_keepdim(2).expect("var");
+        let denom = (var + eps).expect("eps").sqrt().expect("sqrt");
+        let xhat = x
+            .broadcast_sub(&mean)
+            .expect("sub mean")
+            .broadcast_div(&denom)
+            .expect("div denom");
+        let reference = xhat
+            .broadcast_mul(&(gamma + 1.0f64).expect("gamma plus one"))
+            .expect("mul gamma")
+            .broadcast_add(&beta)
+            .expect("add beta")
+            .flatten_all()
+            .expect("flatten reference")
+            .to_vec1::<f32>()
+            .expect("reference values");
+
+        assert_eq!(fused.len(), reference.len());
+        for (got, expected) in fused.iter().zip(reference.iter()) {
+            assert!((got - expected).abs() < 1e-5, "{got} != {expected}");
+        }
+    }
 }
