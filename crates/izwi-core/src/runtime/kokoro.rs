@@ -1,6 +1,7 @@
 //! Kokoro TTS runtime helpers (isolated from generic runtime routing).
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::mpsc;
 use tracing::info;
@@ -53,6 +54,7 @@ impl RuntimeService {
 
         let opts = &request.config.options;
         let speaker = opts.speaker.as_deref().or(opts.voice.as_deref());
+        let started = Instant::now();
         let result = synthesize_kokoro_with_fallback(
             model.clone(),
             &request.text,
@@ -60,13 +62,14 @@ impl RuntimeService {
             request.language.as_deref(),
             opts.speed,
         )?;
+        let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
 
         Ok(GenerationResult {
             request_id: request.id,
             samples: result.samples,
             sample_rate: result.sample_rate,
             total_tokens: result.tokens_generated,
-            total_time_ms: 0.0,
+            total_time_ms,
         })
     }
 
