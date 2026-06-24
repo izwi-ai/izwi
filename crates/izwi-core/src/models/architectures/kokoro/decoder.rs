@@ -37,6 +37,18 @@ fn log_kokoro_profile(stage: &str, dur: Duration) {
     }
 }
 
+fn kokoro_cpu_resblocks_parallel_enabled() -> bool {
+    match std::env::var("IZWI_KOKORO_CPU_RESBLOCKS") {
+        Ok(value) => {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "serial" | "sequential"
+            )
+        }
+        Err(_) => true,
+    }
+}
+
 #[derive(Debug)]
 pub struct KokoroDecoder {
     f0_conv: Conv1d,
@@ -483,7 +495,10 @@ impl KokoroIstftGenerator {
     }
 
     fn run_stage_resblocks(&self, base: usize, x: &Tensor, style: &Tensor) -> Result<Tensor> {
-        if x.device().is_cpu() && self.num_kernels > 1 {
+        if x.device().is_cpu()
+            && self.num_kernels > 1
+            && kokoro_cpu_resblocks_parallel_enabled()
+        {
             return self.run_stage_resblocks_parallel_cpu(base, x, style);
         }
         let mut xs = self.resblocks[base].forward(x, style)?;
