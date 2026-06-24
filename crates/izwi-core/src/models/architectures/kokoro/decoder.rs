@@ -549,6 +549,7 @@ impl KokoroIstftGenerator {
         har: &Tensor,
         style: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
+        let profile = kokoro_profile_enabled();
         thread::scope(|scope| {
             let noise_conv = &self.noise_convs[i];
             let noise_res = &self.noise_res[i];
@@ -558,16 +559,39 @@ impl KokoroIstftGenerator {
             let x = x.clone();
 
             let source_handle = scope.spawn(move || {
+                let t0 = if profile { Some(Instant::now()) } else { None };
                 let mut x_source = noise_conv.forward(&har).map_err(|e| e.to_string())?;
+                if let Some(t) = t0 {
+                    log_kokoro_profile(
+                        &format!("generator.stage.{i}.branch.source_conv"),
+                        t.elapsed(),
+                    );
+                }
+                let t1 = if profile { Some(Instant::now()) } else { None };
                 x_source = noise_res
                     .forward(&x_source, &style)
                     .map_err(|e| e.to_string())?;
+                if let Some(t) = t1 {
+                    log_kokoro_profile(
+                        &format!("generator.stage.{i}.branch.source_res"),
+                        t.elapsed(),
+                    );
+                }
                 Ok::<Tensor, String>(x_source)
             });
             let up_handle = scope.spawn(move || {
-                up.forward(&x)
+                let t0 = if profile { Some(Instant::now()) } else { None };
+                let out = up
+                    .forward(&x)
                     .map_err(Error::from)
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| e.to_string());
+                if let Some(t) = t0 {
+                    log_kokoro_profile(
+                        &format!("generator.stage.{i}.branch.upsample"),
+                        t.elapsed(),
+                    );
+                }
+                out
             });
 
             let x_source = match source_handle.join() {
