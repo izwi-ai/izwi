@@ -559,9 +559,31 @@ impl KokoroIstftGenerator {
             return self.run_stage_branches_parallel_cpu(i, x, har, style);
         }
 
+        let profile = kokoro_profile_enabled();
+        let t0 = if profile { Some(Instant::now()) } else { None };
         let mut x_source = self.noise_convs[i].forward(har).map_err(Error::from)?;
+        if let Some(t) = t0 {
+            sync_kokoro_profile_tensor(&x_source);
+            log_kokoro_profile(
+                &format!("generator.stage.{i}.branch.source_conv"),
+                t.elapsed(),
+            );
+        }
+        let t1 = if profile { Some(Instant::now()) } else { None };
         x_source = self.noise_res[i].forward(&x_source, style)?;
+        if let Some(t) = t1 {
+            sync_kokoro_profile_tensor(&x_source);
+            log_kokoro_profile(
+                &format!("generator.stage.{i}.branch.source_res"),
+                t.elapsed(),
+            );
+        }
+        let t2 = if profile { Some(Instant::now()) } else { None };
         let x_up = self.ups[i].forward(x).map_err(Error::from)?;
+        if let Some(t) = t2 {
+            sync_kokoro_profile_tensor(&x_up);
+            log_kokoro_profile(&format!("generator.stage.{i}.branch.upsample"), t.elapsed());
+        }
         Ok((x_up, x_source))
     }
 
