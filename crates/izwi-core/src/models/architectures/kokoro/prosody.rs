@@ -6,6 +6,7 @@ use candle_nn::{
     ops, Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, Linear, Module, VarBuilder,
 };
 use candle_nn::{LSTMConfig, RNN};
+use rayon::prelude::*;
 
 use crate::error::{Error, Result};
 
@@ -491,9 +492,12 @@ impl CustomOp3 for AdaIN1dCpuOp {
 
         let mut out = vec![0.0f32; x.len()];
         let denom_scale = (time - 1) as f32;
-        for b in 0..batch {
-            for c in 0..channels {
-                let base = (b * channels + c) * time;
+        out.par_chunks_mut(time)
+            .enumerate()
+            .for_each(|(row, out_row)| {
+                let b = row / channels;
+                let c = row % channels;
+                let base = row * time;
                 let values = &x[base..base + time];
                 let mean = values.iter().copied().sum::<f32>() / time as f32;
                 let var = values
@@ -509,11 +513,10 @@ impl CustomOp3 for AdaIN1dCpuOp {
                 let scale = gamma[affine_idx] + 1.0;
                 let bias = beta[affine_idx];
                 for t in 0..time {
-                    let v = x[base + t];
-                    out[base + t] = (v - mean) * inv_std * scale + bias;
+                    let v = values[t];
+                    out_row[t] = (v - mean) * inv_std * scale + bias;
                 }
-            }
-        }
+            });
         Ok((CpuStorage::F32(out), x_layout.shape().clone()))
     }
 }
@@ -609,10 +612,12 @@ impl CustomOp3 for AdaIN1dSnakeCpuOp {
 
         let mut out = vec![0.0f32; x.len()];
         let denom_scale = (time - 1) as f32;
-        for b in 0..batch {
-            let h_base = b * channels * 2;
-            for c in 0..channels {
-                let base = (b * channels + c) * time;
+        out.par_chunks_mut(time)
+            .enumerate()
+            .for_each(|(row, out_row)| {
+                let b = row / channels;
+                let c = row % channels;
+                let base = row * time;
                 let values = &x[base..base + time];
                 let mean = values.iter().copied().sum::<f32>() / time as f32;
                 let var = values
@@ -624,17 +629,16 @@ impl CustomOp3 for AdaIN1dSnakeCpuOp {
                     .sum::<f32>()
                     / denom_scale;
                 let inv_std = 1.0f32 / (var + self.eps as f32).sqrt();
+                let h_base = b * channels * 2;
                 let scale = h[h_base + c] + 1.0;
                 let bias = h[h_base + channels + c];
                 let alpha = if alpha_by_channel { alpha[c] } else { alpha[0] };
                 for t in 0..time {
-                    let v = x[base + t];
-                    let y = (v - mean) * inv_std * scale + bias;
+                    let y = (values[t] - mean) * inv_std * scale + bias;
                     let s = (y * alpha).sin();
-                    out[base + t] = y + (s * s) / alpha;
+                    out_row[t] = y + (s * s) / alpha;
                 }
-            }
-        }
+            });
         Ok((CpuStorage::F32(out), x_layout.shape().clone()))
     }
 }
