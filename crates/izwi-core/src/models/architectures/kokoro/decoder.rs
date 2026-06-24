@@ -1,10 +1,20 @@
+#[cfg(feature = "metal")]
+use std::collections::HashMap;
 use std::f32::consts::PI;
 use std::fmt;
 use std::sync::Arc;
+#[cfg(feature = "metal")]
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "metal")]
+use candle_core::CustomOp3;
+#[cfg(feature = "metal")]
+use candle_core::{backend::BackendStorage, MetalStorage};
 use candle_core::{CpuStorage, CustomOp2, DType, Layout, Result as CandleResult, Shape, Tensor};
+#[cfg(feature = "metal")]
+use candle_metal_kernels::metal::{ComputePipeline, Device as MetalDevice};
 use candle_nn::{
     ops, Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, Module, VarBuilder,
 };
@@ -24,6 +34,53 @@ use super::prosody::{
     load_plain_conv1d, load_weight_norm_conv1d, load_weight_norm_conv_transpose1d, AdaIN1d,
     AdainResBlk1d,
 };
+
+#[cfg(feature = "metal")]
+const KOKORO_DECODER_METAL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void kokoro_conv_transpose1d_stride_f32(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& batch [[buffer(4)]],
+    constant uint& c_in [[buffer(5)]],
+    constant uint& c_out [[buffer(6)]],
+    constant uint& l_in [[buffer(7)]],
+    constant uint& l_out [[buffer(8)]],
+    constant uint& k_size [[buffer(9)]],
+    constant uint& stride [[buffer(10)]],
+    constant uint& padding [[buffer(11)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const uint total = batch * c_out * l_out;
+    if (gid >= total) {
+        return;
+    }
+
+    const uint out_t = gid % l_out;
+    const uint out_c = (gid / l_out) % c_out;
+    const uint b = gid / (l_out * c_out);
+    const uint padded_t = out_t + padding;
+    const uint first_k = padded_t % stride;
+
+    float acc = bias[out_c];
+    for (uint in_c = 0; in_c < c_in; ++in_c) {
+        const uint input_base = (b * c_in + in_c) * l_in;
+        const uint weight_base = (in_c * c_out + out_c) * k_size;
+        for (uint k = first_k; k < k_size; k += stride) {
+            const uint numerator = padded_t - k;
+            const uint in_t = numerator / stride;
+            if (in_t < l_in) {
+                acc += input[input_base + in_t] * weight[weight_base + k];
+            }
+        }
+    }
+    output[gid] = acc;
+}
+"#;
 
 fn kokoro_profile_enabled() -> bool {
     std::env::var_os("IZWI_KOKORO_PROFILE").is_some()
@@ -579,7 +636,7 @@ impl KokoroIstftGenerator {
             );
         }
         let t2 = if profile { Some(Instant::now()) } else { None };
-        let x_up = self.ups[i].forward(x).map_err(Error::from)?;
+        let x_up = kokoro_upsample_conv_transpose1d(&self.ups[i], x)?;
         if let Some(t) = t2 {
             sync_kokoro_profile_tensor(&x_up);
             log_kokoro_profile(&format!("generator.stage.{i}.branch.upsample"), t.elapsed());
@@ -709,6 +766,215 @@ impl KokoroIstftGenerator {
         }
         Ok(acc)
     }
+}
+
+fn kokoro_upsample_conv_transpose1d(up: &ConvTranspose1d, x: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "metal")]
+    {
+        let cfg = *up.config();
+        if x.device().is_metal()
+            && x.dtype() == DType::F32
+            && cfg.groups == 1
+            && cfg.dilation == 1
+            && cfg.output_padding == 0
+            && matches!((cfg.stride, cfg.padding), (10, 5) | (6, 3))
+        {
+            if let Some(bias) = up.bias() {
+                let op = KokoroConvTranspose1dStrideMetalOp {
+                    stride: cfg.stride,
+                    padding: cfg.padding,
+                };
+                if let Ok(out) = x.apply_op3_no_bwd(up.weight(), bias, &op) {
+                    return Ok(out);
+                }
+            }
+        }
+    }
+
+    up.forward(x).map_err(Error::from)
+}
+
+#[cfg(feature = "metal")]
+#[derive(Debug, Clone, Copy)]
+struct KokoroConvTranspose1dStrideMetalOp {
+    stride: usize,
+    padding: usize,
+}
+
+#[cfg(feature = "metal")]
+impl CustomOp3 for KokoroConvTranspose1dStrideMetalOp {
+    fn name(&self) -> &'static str {
+        "kokoro-conv-transpose1d-stride-metal"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> CandleResult<(CpuStorage, Shape)> {
+        candle_core::bail!("kokoro-conv-transpose1d-stride-metal requires Metal tensors")
+    }
+
+    fn metal_fwd(
+        &self,
+        input_storage: &MetalStorage,
+        input_layout: &Layout,
+        weight_storage: &MetalStorage,
+        weight_layout: &Layout,
+        bias_storage: &MetalStorage,
+        bias_layout: &Layout,
+    ) -> CandleResult<(MetalStorage, Shape)> {
+        if input_storage.dtype() != DType::F32
+            || weight_storage.dtype() != DType::F32
+            || bias_storage.dtype() != DType::F32
+        {
+            candle_core::bail!("kokoro-conv-transpose1d-stride-metal only supports F32 tensors")
+        }
+        if !input_layout.is_contiguous()
+            || !weight_layout.is_contiguous()
+            || !bias_layout.is_contiguous()
+        {
+            candle_core::bail!("kokoro-conv-transpose1d-stride-metal requires contiguous tensors")
+        }
+        let input_dims = input_layout.shape().dims();
+        let weight_dims = weight_layout.shape().dims();
+        let bias_dims = bias_layout.shape().dims();
+        if input_dims.len() != 3 || weight_dims.len() != 3 {
+            candle_core::bail!("kokoro-conv-transpose1d-stride-metal expects rank-3 tensors")
+        }
+        let batch = input_dims[0];
+        let c_in = input_dims[1];
+        let l_in = input_dims[2];
+        let weight_c_in = weight_dims[0];
+        let c_out = weight_dims[1];
+        let k_size = weight_dims[2];
+        if weight_c_in != c_in {
+            candle_core::bail!(
+                "kokoro-conv-transpose1d-stride-metal channel mismatch: input={c_in}, weight={weight_c_in}"
+            )
+        }
+        match bias_dims {
+            [b] if *b == c_out => {}
+            other => candle_core::bail!(
+                "kokoro-conv-transpose1d-stride-metal bias shape {:?} does not match c_out={c_out}",
+                other
+            ),
+        }
+        if !matches!(
+            (self.stride, self.padding, k_size),
+            (10, 5, 20) | (6, 3, 12)
+        ) {
+            candle_core::bail!(
+                "kokoro-conv-transpose1d-stride-metal unsupported stride/padding/kernel: {}/{}/{}",
+                self.stride,
+                self.padding,
+                k_size
+            )
+        }
+        let l_out = (l_in - 1)
+            .saturating_mul(self.stride)
+            .saturating_sub(2 * self.padding)
+            .saturating_add(k_size);
+        let elem_count = batch.saturating_mul(c_out).saturating_mul(l_out);
+        if elem_count > u32::MAX as usize
+            || batch > u32::MAX as usize
+            || c_in > u32::MAX as usize
+            || c_out > u32::MAX as usize
+            || l_in > u32::MAX as usize
+            || l_out > u32::MAX as usize
+            || k_size > u32::MAX as usize
+        {
+            candle_core::bail!("kokoro-conv-transpose1d-stride-metal tensor is too large")
+        }
+
+        let device = input_storage.device().clone();
+        let output = device.new_buffer(elem_count, DType::F32, "kokoro-conv-transpose1d")?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("kokoro-conv-transpose1d");
+        let pipeline = kokoro_conv_transpose1d_stride_pipeline(device.metal_device())?;
+        encoder.set_compute_pipeline_state(&pipeline);
+
+        encoder.set_buffer(
+            0,
+            Some(input_storage.buffer()),
+            input_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_buffer(
+            1,
+            Some(weight_storage.buffer()),
+            weight_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_buffer(
+            2,
+            Some(bias_storage.buffer()),
+            bias_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_buffer(3, Some(&output), 0);
+        encoder.set_bytes(4, &(batch as u32));
+        encoder.set_bytes(5, &(c_in as u32));
+        encoder.set_bytes(6, &(c_out as u32));
+        encoder.set_bytes(7, &(l_in as u32));
+        encoder.set_bytes(8, &(l_out as u32));
+        encoder.set_bytes(9, &(k_size as u32));
+        encoder.set_bytes(10, &(self.stride as u32));
+        encoder.set_bytes(11, &(self.padding as u32));
+
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        encoder.dispatch_threads(
+            objc2_metal::MTLSize {
+                width: elem_count,
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: threads_per_threadgroup,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        Ok((
+            MetalStorage::new(output, device, elem_count, DType::F32),
+            Shape::from((batch, c_out, l_out)),
+        ))
+    }
+}
+
+#[cfg(feature = "metal")]
+fn kokoro_conv_transpose1d_stride_pipeline(device: &MetalDevice) -> CandleResult<ComputePipeline> {
+    static PIPELINES: OnceLock<Mutex<HashMap<u64, ComputePipeline>>> = OnceLock::new();
+    let registry_id = device.registry_id();
+    let pipelines = PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
+
+    if let Some(pipeline) = pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .get(&registry_id)
+        .cloned()
+    {
+        return Ok(pipeline);
+    }
+
+    let library = device
+        .new_library_with_source(KOKORO_DECODER_METAL_SOURCE, None)
+        .map_err(candle_core::Error::wrap)?;
+    let function = library
+        .get_function("kokoro_conv_transpose1d_stride_f32", None)
+        .map_err(candle_core::Error::wrap)?;
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(candle_core::Error::wrap)?;
+
+    pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .insert(registry_id, pipeline.clone());
+
+    Ok(pipeline)
 }
 
 #[derive(Debug)]
