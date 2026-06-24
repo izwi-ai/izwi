@@ -627,7 +627,13 @@ impl KokoroIstftGenerator {
             );
         }
         let t1 = if profile { Some(Instant::now()) } else { None };
-        x_source = self.noise_res[i].forward(&x_source, style)?;
+        let source_res_prefix = if profile {
+            Some(format!("generator.stage.{i}.branch.source_res"))
+        } else {
+            None
+        };
+        x_source =
+            self.noise_res[i].forward_profiled(&x_source, style, source_res_prefix.as_deref())?;
         if let Some(t) = t1 {
             sync_kokoro_profile_tensor(&x_source);
             log_kokoro_profile(
@@ -723,9 +729,27 @@ impl KokoroIstftGenerator {
         if x.device().is_cpu() && self.num_kernels > 1 && kokoro_cpu_resblocks_parallel_enabled() {
             return self.run_stage_resblocks_parallel_cpu(base, x, style);
         }
-        let mut xs = self.resblocks[base].forward(x, style)?;
+        let profile = kokoro_profile_enabled();
+        let mut xs = if profile {
+            self.resblocks[base].forward_profiled(
+                x,
+                style,
+                Some(&format!("generator.resblock.{base}")),
+            )?
+        } else {
+            self.resblocks[base].forward(x, style)?
+        };
         for j in 1..self.num_kernels {
-            let y = self.resblocks[base + j].forward(x, style)?;
+            let idx = base + j;
+            let y = if profile {
+                self.resblocks[idx].forward_profiled(
+                    x,
+                    style,
+                    Some(&format!("generator.resblock.{idx}")),
+                )?
+            } else {
+                self.resblocks[idx].forward(x, style)?
+            };
             xs = (xs + y).map_err(Error::from)?;
         }
         Ok(xs)
@@ -1059,13 +1083,48 @@ impl AdaInResBlock1 {
     }
 
     fn forward(&self, x: &Tensor, style: &Tensor) -> Result<Tensor> {
+        self.forward_profiled(x, style, None)
+    }
+
+    fn forward_profiled(
+        &self,
+        x: &Tensor,
+        style: &Tensor,
+        profile_prefix: Option<&str>,
+    ) -> Result<Tensor> {
+        let profile = profile_prefix.is_some() && kokoro_profile_enabled();
         let mut x = x.clone();
         for j in 0..3 {
+            let t_adain1 = if profile { Some(Instant::now()) } else { None };
             let mut xt = self.adain1[j].forward_snake(&x, style, &self.alpha1[j])?;
+            if let (Some(prefix), Some(t)) = (profile_prefix, t_adain1) {
+                sync_kokoro_profile_tensor(&xt);
+                log_kokoro_profile(&format!("{prefix}.iter.{j}.adain1_snake"), t.elapsed());
+            }
+            let t_conv1 = if profile { Some(Instant::now()) } else { None };
             xt = self.convs1[j].forward(&xt).map_err(Error::from)?;
+            if let (Some(prefix), Some(t)) = (profile_prefix, t_conv1) {
+                sync_kokoro_profile_tensor(&xt);
+                log_kokoro_profile(&format!("{prefix}.iter.{j}.conv1"), t.elapsed());
+            }
+            let t_adain2 = if profile { Some(Instant::now()) } else { None };
             xt = self.adain2[j].forward_snake(&xt, style, &self.alpha2[j])?;
+            if let (Some(prefix), Some(t)) = (profile_prefix, t_adain2) {
+                sync_kokoro_profile_tensor(&xt);
+                log_kokoro_profile(&format!("{prefix}.iter.{j}.adain2_snake"), t.elapsed());
+            }
+            let t_conv2 = if profile { Some(Instant::now()) } else { None };
             xt = self.convs2[j].forward(&xt).map_err(Error::from)?;
+            if let (Some(prefix), Some(t)) = (profile_prefix, t_conv2) {
+                sync_kokoro_profile_tensor(&xt);
+                log_kokoro_profile(&format!("{prefix}.iter.{j}.conv2"), t.elapsed());
+            }
+            let t_add = if profile { Some(Instant::now()) } else { None };
             x = (xt + x).map_err(Error::from)?;
+            if let (Some(prefix), Some(t)) = (profile_prefix, t_add) {
+                sync_kokoro_profile_tensor(&x);
+                log_kokoro_profile(&format!("{prefix}.iter.{j}.residual_add"), t.elapsed());
+            }
         }
         Ok(x)
     }
