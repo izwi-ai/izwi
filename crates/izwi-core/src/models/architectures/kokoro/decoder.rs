@@ -29,6 +29,16 @@ fn kokoro_profile_enabled() -> bool {
     std::env::var_os("IZWI_KOKORO_PROFILE").is_some()
 }
 
+fn kokoro_profile_sync_enabled() -> bool {
+    std::env::var_os("IZWI_KOKORO_PROFILE_SYNC").is_some()
+}
+
+fn sync_kokoro_profile_tensor(tensor: &Tensor) {
+    if kokoro_profile_sync_enabled() {
+        let _ = tensor.device().synchronize();
+    }
+}
+
 fn log_kokoro_profile(stage: &str, dur: Duration) {
     if kokoro_profile_enabled() {
         eprintln!(
@@ -391,11 +401,14 @@ impl KokoroIstftGenerator {
             let t_stage_leaky = if profile { Some(Instant::now()) } else { None };
             x = ops::leaky_relu(&x, 0.1).map_err(Error::from)?;
             if let Some(t) = t_stage_leaky {
+                sync_kokoro_profile_tensor(&x);
                 log_kokoro_profile(&format!("generator.stage.{i}.leaky_relu"), t.elapsed());
             }
             let t_stage_branches = if profile { Some(Instant::now()) } else { None };
             let (x_up, x_source) = self.run_stage_branches(i, &x, &har, style)?;
             if let Some(t) = t_stage_branches {
+                sync_kokoro_profile_tensor(&x_up);
+                sync_kokoro_profile_tensor(&x_source);
                 log_kokoro_profile(&format!("generator.stage.{i}.branches"), t.elapsed());
             }
             x = x_up;
@@ -406,6 +419,7 @@ impl KokoroIstftGenerator {
                 match_time_add(&x, &x_source)?
             };
             if let Some(t) = t_stage_add {
+                sync_kokoro_profile_tensor(&x);
                 log_kokoro_profile(&format!("generator.stage.{i}.pad_add"), t.elapsed());
             }
 
@@ -413,11 +427,13 @@ impl KokoroIstftGenerator {
             let t_stage_resblocks = if profile { Some(Instant::now()) } else { None };
             let xs = self.run_stage_resblocks(base, &x, style)?;
             if let Some(t) = t_stage_resblocks {
+                sync_kokoro_profile_tensor(&xs);
                 log_kokoro_profile(&format!("generator.stage.{i}.resblocks"), t.elapsed());
             }
             let t_stage_avg = if profile { Some(Instant::now()) } else { None };
             x = (xs / self.num_kernels as f64).map_err(Error::from)?;
             if let Some(t) = t_stage_avg {
+                sync_kokoro_profile_tensor(&x);
                 log_kokoro_profile(&format!("generator.stage.{i}.average"), t.elapsed());
             }
             if let Some(t) = stage_t0 {
@@ -431,6 +447,9 @@ impl KokoroIstftGenerator {
         let t2 = Instant::now();
         x = ops::leaky_relu(&x, 0.01).map_err(Error::from)?;
         x = self.conv_post.forward(&x).map_err(Error::from)?;
+        if profile {
+            sync_kokoro_profile_tensor(&x);
+        }
         let (_b, c, _t) = x.dims3().map_err(Error::from)?;
         let n_bins = self.cfg.gen_istft_n_fft / 2 + 1;
         if c < n_bins * 2 {
@@ -451,6 +470,8 @@ impl KokoroIstftGenerator {
             .sin()
             .map_err(Error::from)?;
         if profile {
+            sync_kokoro_profile_tensor(&spec);
+            sync_kokoro_profile_tensor(&phase);
             log_kokoro_profile("generator.conv_post_spec_phase", t2.elapsed());
         }
         let t3 = Instant::now();
