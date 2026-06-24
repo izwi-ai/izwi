@@ -47,6 +47,16 @@ fn kokoro_cpu_resblocks_parallel_enabled() -> bool {
     }
 }
 
+fn kokoro_cpu_stage_branches_parallel_enabled() -> bool {
+    match std::env::var("IZWI_KOKORO_CPU_STAGE_BRANCHES") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "serial" | "sequential"
+        ),
+        Err(_) => true,
+    }
+}
+
 #[derive(Debug)]
 pub struct KokoroDecoder {
     f0_conv: Conv1d,
@@ -377,9 +387,8 @@ impl KokoroIstftGenerator {
         let mut x = x.clone();
         for i in 0..self.num_upsamples {
             x = ops::leaky_relu(&x, 0.1).map_err(Error::from)?;
-            let mut x_source = self.noise_convs[i].forward(&har).map_err(Error::from)?;
-            x_source = self.noise_res[i].forward(&x_source, style)?;
-            x = self.ups[i].forward(&x).map_err(Error::from)?;
+            let (x_up, x_source) = self.run_stage_branches(i, &x, &har, style)?;
+            x = x_up;
             if i + 1 == self.num_upsamples {
                 x = reflection_pad_left1(&x)?;
             }
@@ -490,6 +499,74 @@ impl KokoroIstftGenerator {
             log_kokoro_profile("generator.harmonic.total", t0.elapsed());
         }
         Ok(har_t)
+    }
+
+    fn run_stage_branches(
+        &self,
+        i: usize,
+        x: &Tensor,
+        har: &Tensor,
+        style: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        if x.device().is_cpu() && kokoro_cpu_stage_branches_parallel_enabled() {
+            return self.run_stage_branches_parallel_cpu(i, x, har, style);
+        }
+
+        let mut x_source = self.noise_convs[i].forward(har).map_err(Error::from)?;
+        x_source = self.noise_res[i].forward(&x_source, style)?;
+        let x_up = self.ups[i].forward(x).map_err(Error::from)?;
+        Ok((x_up, x_source))
+    }
+
+    fn run_stage_branches_parallel_cpu(
+        &self,
+        i: usize,
+        x: &Tensor,
+        har: &Tensor,
+        style: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        thread::scope(|scope| {
+            let noise_conv = &self.noise_convs[i];
+            let noise_res = &self.noise_res[i];
+            let up = &self.ups[i];
+            let har = har.clone();
+            let style = style.clone();
+            let x = x.clone();
+
+            let source_handle = scope.spawn(move || {
+                let mut x_source = noise_conv.forward(&har).map_err(|e| e.to_string())?;
+                x_source = noise_res
+                    .forward(&x_source, &style)
+                    .map_err(|e| e.to_string())?;
+                Ok::<Tensor, String>(x_source)
+            });
+            let up_handle = scope.spawn(move || {
+                up.forward(&x)
+                    .map_err(Error::from)
+                    .map_err(|e| e.to_string())
+            });
+
+            let x_source = match source_handle.join() {
+                Ok(Ok(t)) => t,
+                Ok(Err(msg)) => return Err(Error::InferenceError(msg)),
+                Err(_) => {
+                    return Err(Error::InferenceError(
+                        "Kokoro generator source branch worker thread panicked".to_string(),
+                    ))
+                }
+            };
+            let x_up = match up_handle.join() {
+                Ok(Ok(t)) => t,
+                Ok(Err(msg)) => return Err(Error::InferenceError(msg)),
+                Err(_) => {
+                    return Err(Error::InferenceError(
+                        "Kokoro generator upsample branch worker thread panicked".to_string(),
+                    ))
+                }
+            };
+
+            Ok((x_up, x_source))
+        })
     }
 
     fn run_stage_resblocks(&self, base: usize, x: &Tensor, style: &Tensor) -> Result<Tensor> {
