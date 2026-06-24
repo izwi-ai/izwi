@@ -31,8 +31,8 @@ use crate::error::{Error, Result};
 
 use super::config::{KokoroConfig, KokoroIstftNetConfig};
 use super::prosody::{
-    load_plain_conv1d, load_weight_norm_conv1d, load_weight_norm_conv_transpose1d, AdaIN1d,
-    AdainResBlk1d,
+    load_plain_conv1d, load_weight_norm_conv1d, load_weight_norm_conv1d_no_bias,
+    load_weight_norm_conv_transpose1d, AdaIN1d, AdainResBlk1d,
 };
 
 #[cfg(feature = "metal")]
@@ -1009,7 +1009,7 @@ impl AdaInResBlock1 {
         let mut alpha2 = Vec::with_capacity(3);
         for j in 0..3 {
             let d1 = dilations[j];
-            convs1.push(load_weight_norm_conv1d(
+            convs1.push(load_weight_norm_conv1d_no_bias(
                 vb.pp(format!("convs1.{j}")),
                 Conv1dConfig {
                     padding: get_padding(kernel_size, d1),

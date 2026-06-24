@@ -685,7 +685,7 @@ impl AdainResBlk1d {
         vb: VarBuilder,
     ) -> Result<Self> {
         let learned_sc = dim_in != dim_out;
-        let conv1 = load_weight_norm_conv1d(
+        let conv1 = load_weight_norm_conv1d_no_bias(
             vb.pp("conv1"),
             Conv1dConfig {
                 padding: 1,
@@ -902,6 +902,17 @@ pub(crate) fn load_weight_norm_conv1d(vb: VarBuilder, cfg: Conv1dConfig) -> Resu
     };
     let w = fuse_weight_norm_dim0(&wv, &wg)?;
     Ok(Conv1d::new(w, b, cfg))
+}
+
+pub(crate) fn load_weight_norm_conv1d_no_bias(vb: VarBuilder, cfg: Conv1dConfig) -> Result<Conv1d> {
+    let wv = vb
+        .get_unchecked_dtype("weight_v", DType::F32)
+        .map_err(Error::from)?;
+    let wg = vb
+        .get_unchecked_dtype("weight_g", DType::F32)
+        .map_err(Error::from)?;
+    let w = fuse_weight_norm_dim0(&wv, &wg)?;
+    Ok(Conv1d::new(w, None, cfg))
 }
 
 pub(crate) fn load_weight_norm_conv_transpose1d(
