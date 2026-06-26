@@ -27,6 +27,11 @@
   "metadata": {
     "timestamp": true
   },
+  "integrations": {
+    "ga4": {
+      "measurementId": "G-SQ2MXW4RY2"
+    }
+  },
   "navbar": {
     "links": [
       {
