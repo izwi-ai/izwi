@@ -1532,6 +1532,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn media_upload_registers_runtime_assets_and_canonical_derivative() {
+        let (app, temp_dir) = test_api_app("media_upload_runtime_assets", false);
+        let upload_body = media_upload_audio_json_body();
+
+        let upload = send_request(
+            app.clone(),
+            build_request(Method::POST, "/v1/media", Some(upload_body.as_str())),
+        )
+        .await;
+        assert_eq!(upload.status(), StatusCode::OK);
+        let upload_body = read_json(upload).await;
+        assert!(upload_body["media_asset_id"].as_str().is_some());
+        assert!(upload_body["canonical_media_asset_id"].as_str().is_some());
+        let canonical_path = upload_body["canonical_path"]
+            .as_str()
+            .expect("canonical path should be returned");
+        assert!(
+            canonical_path.contains("/canonical/"),
+            "canonical path should use canonical namespace: {canonical_path}"
+        );
+        let expected_canonical_url = format!("/v1/media/{canonical_path}");
+        assert_eq!(
+            upload_body["canonical_url"].as_str(),
+            Some(expected_canonical_url.as_str())
+        );
+
+        let canonical = send_request(
+            app,
+            build_request(
+                Method::GET,
+                upload_body["canonical_url"]
+                    .as_str()
+                    .expect("canonical url should be returned"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(canonical.status(), StatusCode::OK);
+        assert_eq!(
+            canonical
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("audio/wav")
+        );
+
+        drop(temp_dir);
+    }
+
+    #[tokio::test]
     async fn root_and_v1_probe_routes_are_available() {
         let (app, temp_dir) = test_api_app("probe_routes_available", false);
 
@@ -2104,6 +2154,19 @@ mod tests {
 
     fn tiny_audio_json_body() -> String {
         tiny_audio_json_body_with_fields("")
+    }
+
+    fn media_upload_audio_json_body() -> String {
+        let wav = AudioEncoder::new(22_050, 1)
+            .encode(&[0.0, 0.2, -0.2, 0.0], AudioFormat::Wav)
+            .expect("tiny wav should encode");
+        serde_json::json!({
+            "data_base64": base64::engine::general_purpose::STANDARD.encode(wav),
+            "content_type": "audio/wav",
+            "filename": "clip.wav",
+            "namespace": "phase-1f"
+        })
+        .to_string()
     }
 
     fn tiny_audio_json_body_with_fields(extra_fields: &str) -> String {
