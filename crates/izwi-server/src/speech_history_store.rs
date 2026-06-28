@@ -139,6 +139,7 @@ pub struct StoredSpeechAudio {
     pub audio_bytes: Vec<u8>,
     pub audio_mime_type: String,
     pub audio_filename: Option<String>,
+    pub audio_storage_path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -313,6 +314,7 @@ impl SpeechHistoryStore {
             audio_bytes: audio.bytes,
             audio_mime_type,
             audio_filename,
+            audio_storage_path,
         }))
     }
 

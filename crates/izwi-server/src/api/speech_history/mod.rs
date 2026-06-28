@@ -7,7 +7,9 @@ use axum::{Router, extract::DefaultBodyLimit, routing::get};
 
 use crate::state::AppState;
 
-pub(crate) use handlers::{CreateSpeechHistoryRecordRequest, synthesize_record};
+pub(crate) use handlers::{
+    CreateSpeechHistoryRecordRequest, batch_tts_stage_executor, synthesize_record,
+};
 
 pub fn router() -> Router<AppState> {
     const AUDIO_UPLOAD_LIMIT_BYTES: usize = 64 * 1024 * 1024;
