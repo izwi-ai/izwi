@@ -29,6 +29,13 @@ impl ApiError {
         }
     }
 
+    pub fn forbidden(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: msg.into(),
+        }
+    }
+
     pub fn internal(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -51,6 +58,7 @@ impl IntoResponse for ApiError {
                 "message": self.message,
                 "type": match self.status {
                     StatusCode::BAD_REQUEST => "invalid_request_error",
+                    StatusCode::FORBIDDEN => "permission_denied_error",
                     StatusCode::NOT_FOUND => "not_found_error",
                     StatusCode::PAYLOAD_TOO_LARGE => "invalid_request_error",
                     StatusCode::SERVICE_UNAVAILABLE => "service_unavailable_error",

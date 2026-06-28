@@ -237,7 +237,12 @@ const BASELINE_SCHEMA: &[&str] = &[
         audio_filename TEXT NULL,
         audio_storage_path TEXT NOT NULL,
         source_route_kind TEXT NULL,
-        source_record_id TEXT NULL
+        source_record_id TEXT NULL,
+        permission_scope TEXT NOT NULL DEFAULT 'legacy_local',
+        consent_status TEXT NOT NULL DEFAULT 'granted',
+        allowed_uses_json TEXT NOT NULL DEFAULT '["local_tts","voice_clone_reference"]',
+        permission_provenance TEXT NULL,
+        permission_revoked_at INTEGER NULL
     );
     "#,
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_voices_name_nocase ON saved_voices(name COLLATE NOCASE);",
@@ -605,6 +610,31 @@ const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
         table: "speech_history_records",
         column: "processing_error",
         definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "saved_voices",
+        column: "permission_scope",
+        definition: "TEXT NOT NULL DEFAULT 'legacy_local'",
+    },
+    CompatibilityColumn {
+        table: "saved_voices",
+        column: "consent_status",
+        definition: "TEXT NOT NULL DEFAULT 'granted'",
+    },
+    CompatibilityColumn {
+        table: "saved_voices",
+        column: "allowed_uses_json",
+        definition: "TEXT NOT NULL DEFAULT '[\"local_tts\",\"voice_clone_reference\"]'",
+    },
+    CompatibilityColumn {
+        table: "saved_voices",
+        column: "permission_provenance",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "saved_voices",
+        column: "permission_revoked_at",
+        definition: "INTEGER NULL",
     },
     CompatibilityColumn {
         table: "diarization_records",

@@ -45,6 +45,11 @@ pub(crate) async fn resolve_saved_voice_reference(
         .await
         .map_err(map_saved_voice_store_error)?
         .ok_or_else(|| ApiError::not_found("Saved voice not found"))?;
+    if !saved_voice.allows_local_tts_use() {
+        return Err(ApiError::forbidden(
+            "Saved voice permission does not allow local TTS reuse",
+        ));
+    }
     let audio = state
         .saved_voice_store
         .get_audio(voice_id.to_string())
