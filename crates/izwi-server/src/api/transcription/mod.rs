@@ -14,6 +14,7 @@ use axum::{
 use crate::state::AppState;
 
 pub(crate) use crate::api::speech_text_upload::FIRST_PARTY_AUDIO_UPLOAD_LIMIT_BYTES as AUDIO_UPLOAD_LIMIT_BYTES;
+pub(crate) use handlers::batch_asr_stage_executor;
 
 pub fn router() -> Router<AppState> {
     const CANONICAL_UNIFIED_COLLECTION: &str = "/speech-to-text/jobs";

@@ -38,6 +38,7 @@ use izwi_core::{
     parse_model_variant, RuntimeService, ServeRuntimeConfig, ServeRuntimeConfigOverrides,
 };
 use izwi_hooks::EnterpriseHooks;
+use batch_runtime::worker::{BatchWorkerConfig, BatchWorkerRunner, BatchWorkerSupervisor};
 use logging::{LogFormat, SERVICE_NAME, SERVICE_VERSION};
 use persistence::PersistenceContext;
 use state::AppState;
@@ -161,6 +162,7 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
     state.lifecycle.mark_ready();
 
     info!("Runtime service initialized");
+    let batch_worker_supervisor = start_batch_runtime_worker(&state);
 
     // Build router
     let app = api::create_router(state.clone(), &serve_config);
@@ -181,9 +183,23 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
     let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(shutdown_state));
 
     info!("Server ready. Press Ctrl+C to stop.");
-    server.await?;
+    let server_result = server.await;
+    batch_worker_supervisor.shutdown().await?;
+    server_result?;
 
     Ok(())
+}
+
+fn start_batch_runtime_worker(state: &AppState) -> BatchWorkerSupervisor {
+    let mut config = BatchWorkerConfig::local(format!("local-batch-worker-{}", std::process::id()));
+    config.lease_duration = Duration::from_secs(24 * 60 * 60);
+    BatchWorkerRunner::new(
+        state.batch_runtime_store.clone(),
+        vec![api::transcription::batch_asr_stage_executor(state.clone())],
+        config,
+        state.batch_worker_health.clone(),
+    )
+    .spawn()
 }
 
 fn maybe_delegate_to_private_cuda_runtime(args: &ServerArgs) -> anyhow::Result<()> {
