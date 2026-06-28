@@ -6,8 +6,8 @@ use serde_json::{Map, Value, json};
 use utoipa::{OpenApi, ToSchema};
 
 use crate::api::admin::models::{
-    AdminModelActionResponse, AdminModelDownloadProgressEvent, AdminModelInfo,
-    AdminModelRouteCapabilities, AdminModelsResponse, AdminSpeechModelCapabilities,
+    AdminModelActionResponse, AdminModelBatchCapabilities, AdminModelDownloadProgressEvent,
+    AdminModelInfo, AdminModelRouteCapabilities, AdminModelsResponse, AdminSpeechModelCapabilities,
 };
 use crate::api::openai::audio::align::{
     AlignmentJsonRequest, AlignmentMultipartRequest, AlignmentResponse, AlignmentWord,
@@ -43,6 +43,7 @@ use crate::api::openai::audio::align::{
         ApiErrorBody,
         ApiErrorEnvelope,
         AdminModelActionResponse,
+        AdminModelBatchCapabilities,
         AdminModelDownloadProgressEvent,
         AdminModelInfo,
         AdminModelRouteCapabilities,
@@ -110,6 +111,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "Speech to Text",
         "Preview persisted transcription workflows",
     );
+    add_tag(doc, "Jobs", "Durable batch runtime job management");
     add_tag(
         doc,
         "Diarization",
@@ -211,11 +213,64 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
     );
     add_operation(
         paths,
+        "/v1/metrics/batch-runtime",
+        "get",
+        "Runtime",
+        "Get batch runtime metrics",
+        "Batch job status, queue depth, stage status, and local worker health.",
+        ok_response(),
+    );
+    add_operation(
+        paths,
         "/v1/metrics/prometheus",
         "get",
         "Runtime",
         "Get Prometheus metrics",
         "Runtime telemetry in Prometheus text format.",
+        ok_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/jobs/{job_id}",
+        "get",
+        "Jobs",
+        "Get runtime job",
+        "Fetch a durable runtime job trace with stages and artifacts.",
+        ok_response(),
+    );
+    add_operation(
+        paths,
+        "/v1/jobs/{job_id}/cancel",
+        "post",
+        "Jobs",
+        "Cancel runtime job",
+        "Cancel a queued or running durable runtime job.",
+        response_with_statuses(&[
+            ("200", "Runtime job cancelled"),
+            ("400", "Job is not cancellable"),
+            ("404", "Job not found"),
+        ]),
+    );
+    add_operation(
+        paths,
+        "/v1/jobs/{job_id}/retry",
+        "post",
+        "Jobs",
+        "Rerun runtime job",
+        "Requeue failed, cancelled, or expired runtime job stages.",
+        response_with_statuses(&[
+            ("200", "Runtime job retried"),
+            ("400", "Job is not retryable"),
+            ("404", "Job not found"),
+        ]),
+    );
+    add_operation(
+        paths,
+        "/v1/jobs/{job_id}/artifacts",
+        "get",
+        "Jobs",
+        "List runtime job artifacts",
+        "List durable artifacts produced or consumed by a runtime job.",
         ok_response(),
     );
     add_operation(
@@ -244,6 +299,15 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "Check internal readiness",
         "Compatibility alias for readiness.",
         response_with_statuses(&[("200", "Ready"), ("503", "Alive but not ready")]),
+    );
+    add_operation(
+        paths,
+        "/internal/metrics/batch-runtime",
+        "get",
+        "Runtime",
+        "Get internal batch runtime metrics",
+        "Compatibility alias for batch job status, queue depth, stage status, and local worker health.",
+        ok_response(),
     );
     add_operation(
         paths,

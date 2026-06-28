@@ -36,8 +36,10 @@ pub struct AdminModelInfo {
     pub size_bytes: Option<u64>,
     pub download_progress: Option<f32>,
     pub error_message: Option<String>,
+    pub deployment_state: String,
     pub modalities: Vec<String>,
     pub route_capabilities: AdminModelRouteCapabilities,
+    pub batch_capabilities: AdminModelBatchCapabilities,
     pub speech_capabilities: Option<AdminSpeechModelCapabilities>,
     pub cuda_support: serde_json::Value,
     pub cuda_quantization: serde_json::Value,
@@ -76,6 +78,17 @@ pub struct AdminModelRouteCapabilities {
     pub tokenizer: bool,
 }
 
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AdminModelBatchCapabilities {
+    pub batch_asr: bool,
+    pub batch_tts: bool,
+    pub durable_jobs: bool,
+    pub artifacts: bool,
+    pub cancellation: bool,
+    pub retry: bool,
+    pub requires_voice_permission: bool,
+}
+
 #[derive(Serialize, ToSchema)]
 pub struct AdminModelActionResponse {
     pub status: &'static str,
@@ -110,8 +123,10 @@ impl From<ModelInfo> for AdminModelInfo {
             size_bytes: info.size_bytes,
             download_progress: info.download_progress,
             error_message: info.error_message,
+            deployment_state: model_deployment_state_as_str(info.status).to_string(),
             modalities: model_modalities(variant),
             route_capabilities: AdminModelRouteCapabilities::from_variant(variant),
+            batch_capabilities: AdminModelBatchCapabilities::from_variant(variant),
             speech_capabilities: info
                 .speech_capabilities
                 .map(AdminSpeechModelCapabilities::from),
@@ -175,6 +190,31 @@ impl AdminModelRouteCapabilities {
     }
 }
 
+impl AdminModelBatchCapabilities {
+    fn from_variant(variant: ModelVariant) -> Self {
+        let speech_capabilities = variant.speech_capabilities();
+        let supports_reference_voice = speech_capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.supports_reference_voice);
+        let supports_voice_description = speech_capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.supports_voice_description);
+        let batch_asr = variant.is_asr() || variant.is_voxtral() || variant.is_audio_chat();
+        let batch_tts = speech_capabilities.is_some();
+        let durable_jobs = batch_asr || batch_tts;
+
+        Self {
+            batch_asr,
+            batch_tts,
+            durable_jobs,
+            artifacts: durable_jobs,
+            cancellation: durable_jobs,
+            retry: durable_jobs,
+            requires_voice_permission: supports_reference_voice || supports_voice_description,
+        }
+    }
+}
+
 fn model_status_as_str(status: ModelStatus) -> &'static str {
     match status {
         ModelStatus::NotDownloaded => "not_downloaded",
@@ -183,6 +223,17 @@ fn model_status_as_str(status: ModelStatus) -> &'static str {
         ModelStatus::Loading => "loading",
         ModelStatus::Ready => "ready",
         ModelStatus::Error => "error",
+    }
+}
+
+fn model_deployment_state_as_str(status: ModelStatus) -> &'static str {
+    match status {
+        ModelStatus::NotDownloaded => "not_deployed",
+        ModelStatus::Downloading => "installing",
+        ModelStatus::Downloaded => "available",
+        ModelStatus::Loading => "starting",
+        ModelStatus::Ready => "ready",
+        ModelStatus::Error => "failed",
     }
 }
 

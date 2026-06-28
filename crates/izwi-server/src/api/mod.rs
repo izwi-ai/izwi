@@ -7,6 +7,7 @@ pub mod chat;
 pub mod diarization;
 pub mod docs;
 pub mod internal;
+pub mod jobs;
 pub mod media;
 pub mod onboarding;
 pub mod openai;
