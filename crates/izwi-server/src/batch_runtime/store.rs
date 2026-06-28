@@ -118,6 +118,18 @@ pub struct WorkerHeartbeatUpdate {
     pub diagnostic_json: serde_json::Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RuntimeJobStatusCount {
+    pub status: RuntimeJobStatus,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RuntimeStageStatusCount {
+    pub status: RuntimeStageStatus,
+    pub count: u64,
+}
+
 impl BatchRuntimeStore {
     pub fn initialize_with_database(db: StoreDatabase) -> Self {
         Self { db }
@@ -350,6 +362,28 @@ impl BatchRuntimeStore {
         row.as_ref().map(map_runtime_job).transpose()
     }
 
+    pub async fn job_status_counts(&self) -> anyhow::Result<Vec<RuntimeJobStatusCount>> {
+        let db = self.db.connection().await?;
+        let rows = db
+            .query_all_raw(raw::statement(
+                db,
+                "SELECT status, COUNT(*) FROM runtime_jobs GROUP BY status ORDER BY status",
+                vec![],
+            )?)
+            .await
+            .context("Failed to count runtime jobs by status")?;
+
+        rows.iter()
+            .map(|row| {
+                let status_raw: String = row.try_get_by_index(0)?;
+                let status = RuntimeJobStatus::from_db_value(status_raw.as_str())
+                    .ok_or_else(|| anyhow!("Unknown runtime job status: {status_raw}"))?;
+                let count = i64_to_u64(row.try_get_by_index(1)?)?;
+                Ok(RuntimeJobStatusCount { status, count })
+            })
+            .collect()
+    }
+
     pub async fn transition_job_status(
         &self,
         job_id: &str,
@@ -407,6 +441,88 @@ impl BatchRuntimeStore {
         if result.rows_affected() == 0 {
             return Ok(None);
         }
+
+        self.get_job(job_id).await
+    }
+
+    pub async fn retry_job(&self, job_id: &str) -> anyhow::Result<Option<RuntimeJob>> {
+        let Some(job) = self.get_job(job_id).await? else {
+            return Ok(None);
+        };
+        if !matches!(
+            job.status,
+            RuntimeJobStatus::Failed | RuntimeJobStatus::Cancelled | RuntimeJobStatus::Expired
+        ) {
+            return Ok(None);
+        }
+
+        let db = self.db.connection().await?;
+        let retryable_stage_count = db
+            .query_one_raw(raw::statement(
+                db,
+                r#"
+                SELECT COUNT(*)
+                FROM job_stages
+                WHERE job_id = ?1
+                  AND status IN ('failed', 'cancelled', 'expired')
+                "#,
+                vec![job_id.into()],
+            )?)
+            .await
+            .context("Failed to count retryable runtime job stages")?
+            .ok_or_else(|| anyhow!("Runtime retryable stage count returned no row"))?
+            .try_get_by_index::<i64>(0)?;
+        if retryable_stage_count == 0 {
+            return Ok(None);
+        }
+
+        let now = current_timestamp_millis();
+        let result = db
+            .execute_raw(raw::statement(
+                db,
+                r#"
+                UPDATE runtime_jobs
+                SET
+                    status = 'queued',
+                    updated_at = ?1,
+                    queued_at = ?1,
+                    started_at = NULL,
+                    finished_at = NULL,
+                    error_code = NULL,
+                    error_message = NULL,
+                    attempt_count = attempt_count + 1,
+                    cancellation_reason = NULL
+                WHERE id = ?2
+                  AND status IN ('failed', 'cancelled', 'expired')
+                "#,
+                vec![now.into(), job_id.into()],
+            )?)
+            .await
+            .context("Failed to retry runtime job")?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        db.execute_raw(raw::statement(
+            db,
+            r#"
+            UPDATE job_stages
+            SET
+                status = 'retrying',
+                updated_at = ?1,
+                finished_at = NULL,
+                lease_expires_at = NULL,
+                worker_id = NULL,
+                output_artifact_ids_json = '[]',
+                error_code = NULL,
+                error_message = NULL
+            WHERE job_id = ?2
+              AND status IN ('failed', 'cancelled', 'expired')
+            "#,
+            vec![now.into(), job_id.into()],
+        )?)
+        .await
+        .context("Failed to retry runtime job stages")?;
 
         self.get_job(job_id).await
     }
@@ -671,6 +787,28 @@ impl BatchRuntimeStore {
         i64_to_u64(count)
     }
 
+    pub async fn stage_status_counts(&self) -> anyhow::Result<Vec<RuntimeStageStatusCount>> {
+        let db = self.db.connection().await?;
+        let rows = db
+            .query_all_raw(raw::statement(
+                db,
+                "SELECT status, COUNT(*) FROM job_stages GROUP BY status ORDER BY status",
+                vec![],
+            )?)
+            .await
+            .context("Failed to count runtime stages by status")?;
+
+        rows.iter()
+            .map(|row| {
+                let status_raw: String = row.try_get_by_index(0)?;
+                let status = RuntimeStageStatus::from_db_value(status_raw.as_str())
+                    .ok_or_else(|| anyhow!("Unknown runtime stage status: {status_raw}"))?;
+                let count = i64_to_u64(row.try_get_by_index(1)?)?;
+                Ok(RuntimeStageStatusCount { status, count })
+            })
+            .collect()
+    }
+
     pub async fn create_stage(&self, input: NewJobStage) -> anyhow::Result<JobStage> {
         let db = self.db.connection().await?;
         let now = current_timestamp_millis();
@@ -733,6 +871,20 @@ impl BatchRuntimeStore {
             .context("Failed to load runtime job stage")?;
 
         row.as_ref().map(map_job_stage).transpose()
+    }
+
+    pub async fn list_stages_for_job(&self, job_id: &str) -> anyhow::Result<Vec<JobStage>> {
+        let db = self.db.connection().await?;
+        let rows = db
+            .query_all_raw(raw::statement(
+                db,
+                JOB_STAGE_LIST_FOR_JOB_SQL,
+                vec![job_id.into()],
+            )?)
+            .await
+            .context("Failed to list runtime job stages")?;
+
+        rows.iter().map(map_job_stage).collect()
     }
 
     pub async fn create_artifact(
@@ -804,6 +956,23 @@ impl BatchRuntimeStore {
             .context("Failed to load runtime artifact")?;
 
         row.as_ref().map(map_runtime_artifact).transpose()
+    }
+
+    pub async fn list_artifacts_for_job(
+        &self,
+        job_id: &str,
+    ) -> anyhow::Result<Vec<RuntimeArtifact>> {
+        let db = self.db.connection().await?;
+        let rows = db
+            .query_all_raw(raw::statement(
+                db,
+                RUNTIME_ARTIFACT_LIST_FOR_JOB_SQL,
+                vec![job_id.into()],
+            )?)
+            .await
+            .context("Failed to list runtime job artifacts")?;
+
+        rows.iter().map(map_runtime_artifact).collect()
     }
 
     pub async fn record_idempotency(
@@ -1075,8 +1244,12 @@ const RUNTIME_JOB_COLUMNS_SQL: &str =
     "SELECT id, created_at, updated_at, queued_at, started_at, finished_at, job_kind, status, priority, model_id, capability, route_record_kind, route_record_id, input_media_asset_id, input_text_asset_id, request_json, model_snapshot_json, progress_json, error_code, error_message, attempt_count, max_attempts, retry_policy_json, idempotency_key, correlation_id, cancellation_reason FROM runtime_jobs WHERE id = ?1";
 const JOB_STAGE_COLUMNS_SQL: &str =
     "SELECT id, job_id, created_at, updated_at, sequence, stage_kind, status, capability, model_id, worker_id, lease_expires_at, attempt_count, max_attempts, input_artifact_ids_json, output_artifact_ids_json, progress_json, started_at, finished_at, error_code, error_message FROM job_stages WHERE id = ?1";
+const JOB_STAGE_LIST_FOR_JOB_SQL: &str =
+    "SELECT id, job_id, created_at, updated_at, sequence, stage_kind, status, capability, model_id, worker_id, lease_expires_at, attempt_count, max_attempts, input_artifact_ids_json, output_artifact_ids_json, progress_json, started_at, finished_at, error_code, error_message FROM job_stages WHERE job_id = ?1 ORDER BY sequence ASC, created_at ASC, id ASC";
 const RUNTIME_ARTIFACT_COLUMNS_SQL: &str =
     "SELECT id, job_id, stage_id, created_at, artifact_kind, artifact_role, media_asset_id, text_asset_id, storage_key, content_type, filename, size_bytes, sha256, metadata_json, retention_policy FROM runtime_artifacts WHERE id = ?1";
+const RUNTIME_ARTIFACT_LIST_FOR_JOB_SQL: &str =
+    "SELECT id, job_id, stage_id, created_at, artifact_kind, artifact_role, media_asset_id, text_asset_id, storage_key, content_type, filename, size_bytes, sha256, metadata_json, retention_policy FROM runtime_artifacts WHERE job_id = ?1 ORDER BY created_at ASC, id ASC";
 const IDEMPOTENCY_RECORD_COLUMNS_SQL: &str =
     "SELECT operation, idempotency_key, created_at, expires_at, request_hash, response_json, runtime_job_id, conflict_message, metadata_json FROM idempotency_keys WHERE operation = ?1 AND idempotency_key = ?2";
 const WORKER_HEARTBEAT_COLUMNS_SQL: &str =
@@ -1656,10 +1829,7 @@ mod tests {
         assert_eq!(claimed.stage.status, RuntimeStageStatus::Running);
         assert_eq!(claimed.stage.attempt_count, 1);
 
-        let recovered = store
-            .recover_expired_stage_leases()
-            .await
-            .expect("recover");
+        let recovered = store.recover_expired_stage_leases().await.expect("recover");
         assert_eq!(recovered, 1);
 
         let retried = store
@@ -1683,5 +1853,102 @@ mod tests {
             .expect("stage")
             .expect("stage exists");
         assert_eq!(cancelled_stage.status, RuntimeStageStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn manual_retry_requeues_failed_job_and_stage() {
+        let (store, _root) = build_store();
+        let job = store
+            .create_job(NewRuntimeJob {
+                job_kind: RuntimeJobKind::TtsSpeech,
+                status: RuntimeJobStatus::Queued,
+                priority: 0,
+                model_id: Some("Qwen3-TTS-0.6B".to_string()),
+                capability: Some("tts".to_string()),
+                route_record_kind: Some("text_to_speech".to_string()),
+                route_record_id: Some("speech-1".to_string()),
+                input_media_asset_id: None,
+                input_text_asset_id: None,
+                request_json: json!({"text": "hello"}),
+                model_snapshot_json: json!({}),
+                retry_policy_json: json!({"max_attempts": 1}),
+                max_attempts: 1,
+                idempotency_key: None,
+                correlation_id: None,
+            })
+            .await
+            .expect("job");
+        let stage = store
+            .create_stage(NewJobStage {
+                job_id: job.id.clone(),
+                sequence: 0,
+                stage_kind: "tts_synthesize".to_string(),
+                status: RuntimeStageStatus::Queued,
+                capability: Some("tts".to_string()),
+                model_id: job.model_id.clone(),
+                max_attempts: 1,
+                input_artifact_ids: vec![],
+            })
+            .await
+            .expect("stage");
+
+        let claimed = store
+            .claim_next_stage("worker-1", 60_000)
+            .await
+            .expect("claim")
+            .expect("stage should be claimed");
+        assert_eq!(claimed.stage.id, stage.id);
+
+        let failed_stage = store
+            .fail_stage(
+                &stage.id,
+                false,
+                Some("boom".to_string()),
+                Some("first attempt failed".to_string()),
+            )
+            .await
+            .expect("fail")
+            .expect("stage should fail");
+        assert_eq!(failed_stage.status, RuntimeStageStatus::Failed);
+
+        let failed_job = store
+            .get_job(&job.id)
+            .await
+            .expect("job")
+            .expect("job exists");
+        assert_eq!(failed_job.status, RuntimeJobStatus::Failed);
+
+        let retried_job = store
+            .retry_job(&job.id)
+            .await
+            .expect("retry")
+            .expect("job should retry");
+        assert_eq!(retried_job.status, RuntimeJobStatus::Queued);
+        assert_eq!(retried_job.attempt_count, 1);
+        assert!(retried_job.error_code.is_none());
+        assert!(retried_job.finished_at.is_none());
+
+        let retried_stage = store
+            .get_stage(&stage.id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        assert_eq!(retried_stage.status, RuntimeStageStatus::Retrying);
+        assert!(retried_stage.error_code.is_none());
+        assert!(retried_stage.finished_at.is_none());
+
+        let stages = store
+            .list_stages_for_job(&job.id)
+            .await
+            .expect("list stages");
+        assert_eq!(stages.len(), 1);
+        let stage_counts = store.stage_status_counts().await.expect("stage counts");
+        assert_eq!(
+            stage_counts,
+            vec![RuntimeStageStatusCount {
+                status: RuntimeStageStatus::Retrying,
+                count: 1,
+            }]
+        );
     }
 }

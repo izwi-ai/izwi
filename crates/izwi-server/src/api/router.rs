@@ -87,6 +87,7 @@ pub fn create_router(state: AppState, serve_config: &ServeRuntimeConfig) -> Rout
         .merge(crate::api::preferences::router())
         .merge(crate::api::agent::router())
         .merge(crate::api::chat::router())
+        .merge(crate::api::jobs::router())
         .merge(crate::api::media::router())
         .merge(crate::api::transcription::router())
         .merge(crate::api::diarization::router())
@@ -172,6 +173,13 @@ fn build_cors_layer(serve_config: &ServeRuntimeConfig) -> Option<CorsLayer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::batch_runtime::{
+        store::{NewJobStage, NewRuntimeArtifact, NewRuntimeJob},
+        types::{
+            RuntimeArtifactKind, RuntimeArtifactRole, RuntimeJobKind, RuntimeJobStatus,
+            RuntimeStageStatus,
+        },
+    };
     use crate::state::AppState;
     use crate::test_support::env_lock;
     use async_trait::async_trait;
@@ -1392,6 +1400,133 @@ mod tests {
         )
         .await;
         assert_route_status(app, Method::GET, "/v1/metrics", None, StatusCode::OK).await;
+
+        drop(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn runtime_job_routes_return_trace_and_support_cancel_retry() {
+        let (state, temp_dir) = test_state("runtime_job_routes_return_trace", false);
+        state.lifecycle.mark_ready();
+        let job = state
+            .batch_runtime_store
+            .create_job(NewRuntimeJob {
+                job_kind: RuntimeJobKind::TtsSpeech,
+                status: RuntimeJobStatus::Queued,
+                priority: 0,
+                model_id: Some("Qwen3-TTS-0.6B".to_string()),
+                capability: Some("tts".to_string()),
+                route_record_kind: None,
+                route_record_id: None,
+                input_media_asset_id: None,
+                input_text_asset_id: None,
+                request_json: serde_json::json!({"text": "hello"}),
+                model_snapshot_json: serde_json::json!({}),
+                retry_policy_json: serde_json::json!({"max_attempts": 1}),
+                max_attempts: 1,
+                idempotency_key: None,
+                correlation_id: None,
+            })
+            .await
+            .expect("runtime job");
+        let stage = state
+            .batch_runtime_store
+            .create_stage(NewJobStage {
+                job_id: job.id.clone(),
+                sequence: 0,
+                stage_kind: "tts_synthesize".to_string(),
+                status: RuntimeStageStatus::Queued,
+                capability: Some("tts".to_string()),
+                model_id: job.model_id.clone(),
+                max_attempts: 1,
+                input_artifact_ids: vec![],
+            })
+            .await
+            .expect("runtime stage");
+        let artifact = state
+            .batch_runtime_store
+            .create_artifact(NewRuntimeArtifact {
+                job_id: job.id.clone(),
+                stage_id: Some(stage.id.clone()),
+                artifact_kind: RuntimeArtifactKind::Metadata,
+                artifact_role: RuntimeArtifactRole::Debug,
+                media_asset_id: None,
+                text_asset_id: None,
+                storage_key: Some("runtime/jobs/test/trace.json".to_string()),
+                content_type: Some("application/json".to_string()),
+                filename: Some("trace.json".to_string()),
+                size_bytes: Some(2),
+                sha256: None,
+                metadata_json: serde_json::json!({"source": "test"}),
+                retention_policy: "debug".to_string(),
+            })
+            .await
+            .expect("runtime artifact");
+        let serve_config = ServeRuntimeConfig {
+            backend: izwi_core::backends::BackendPreference::Cpu,
+            ui_enabled: false,
+            ..ServeRuntimeConfig::default()
+        };
+        let app = create_router(state, &serve_config);
+
+        let trace = send_request(
+            app.clone(),
+            build_request(Method::GET, &format!("/v1/jobs/{}", job.id), None),
+        )
+        .await;
+        assert_eq!(trace.status(), StatusCode::OK);
+        let trace_body = read_json(trace).await;
+        assert_eq!(trace_body["job"]["id"].as_str(), Some(job.id.as_str()));
+        assert_eq!(
+            trace_body["stages"][0]["id"].as_str(),
+            Some(stage.id.as_str())
+        );
+        assert_eq!(
+            trace_body["artifacts"][0]["id"].as_str(),
+            Some(artifact.id.as_str())
+        );
+
+        let artifacts = send_request(
+            app.clone(),
+            build_request(
+                Method::GET,
+                &format!("/v1/jobs/{}/artifacts", job.id),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(artifacts.status(), StatusCode::OK);
+        let artifacts_body = read_json(artifacts).await;
+        assert_eq!(
+            artifacts_body["artifacts"][0]["id"].as_str(),
+            Some(artifact.id.as_str())
+        );
+
+        let cancel = send_request(
+            app.clone(),
+            build_request(Method::POST, &format!("/v1/jobs/{}/cancel", job.id), None),
+        )
+        .await;
+        assert_eq!(cancel.status(), StatusCode::OK);
+        let cancel_body = read_json(cancel).await;
+        assert_eq!(cancel_body["job"]["status"].as_str(), Some("cancelled"));
+        assert_eq!(
+            cancel_body["stages"][0]["status"].as_str(),
+            Some("cancelled")
+        );
+
+        let retry = send_request(
+            app,
+            build_request(Method::POST, &format!("/v1/jobs/{}/retry", job.id), None),
+        )
+        .await;
+        assert_eq!(retry.status(), StatusCode::OK);
+        let retry_body = read_json(retry).await;
+        assert_eq!(retry_body["job"]["status"].as_str(), Some("queued"));
+        assert_eq!(
+            retry_body["stages"][0]["status"].as_str(),
+            Some("retrying")
+        );
 
         drop(temp_dir);
     }

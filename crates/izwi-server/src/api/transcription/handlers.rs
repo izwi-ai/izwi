@@ -1293,6 +1293,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
 
 fn prepare_create_request(parsed: &mut ParsedTranscriptionCreateRequest) -> Result<(), ApiError> {
     if parsed.record_mode != TranscriptionRecordMode::SpeakerAttributedAsr {
+        validate_batch_transcription_model(parsed.model_id.as_deref())?;
         return Ok(());
     }
 
@@ -1308,6 +1309,21 @@ fn prepare_create_request(parsed: &mut ParsedTranscriptionCreateRequest) -> Resu
         .get_or_insert_with(|| DEFAULT_SPEAKER_ATTRIBUTED_ASR_MODEL.to_string());
     parsed.aligner_model_id = None;
     parsed.include_timestamps = false;
+    Ok(())
+}
+
+fn validate_batch_transcription_model(model_id: Option<&str>) -> Result<(), ApiError> {
+    let Some(raw_model_id) = model_id else {
+        return Ok(());
+    };
+
+    let variant = parse_model_variant(raw_model_id)
+        .map_err(|err| ApiError::bad_request(format!("Invalid transcription model: {err}")))?;
+    if !(variant.is_asr() || variant.is_voxtral() || variant.is_audio_chat()) {
+        return Err(ApiError::bad_request(format!(
+            "{variant} does not support batch transcription."
+        )));
+    }
     Ok(())
 }
 
@@ -1751,7 +1767,7 @@ mod tests {
         build_segment_records, initial_summary_state, multipart_field_api_error, parse_bool,
         parse_create_request, progress_event_payload, sanitize_summary_output,
         should_retry_transcription_summary_generation, transcription_summary_messages,
-        transcription_summary_params,
+        transcription_summary_params, validate_batch_transcription_model,
     };
 
     fn wav_bytes() -> Vec<u8> {
@@ -1860,6 +1876,18 @@ mod tests {
 
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert!(err.message.contains("failed to decode audio metadata"));
+    }
+
+    #[test]
+    fn batch_transcription_model_admission_rejects_non_asr_models() {
+        validate_batch_transcription_model(Some("Parakeet-TDT-0.6B-v3"))
+            .expect("ASR model should be accepted");
+
+        let err = validate_batch_transcription_model(Some("Qwen3-TTS-12Hz-1.7B-Base"))
+            .expect_err("TTS model should not be accepted for batch ASR");
+
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("does not support batch transcription"));
     }
 
     #[test]

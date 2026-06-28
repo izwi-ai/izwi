@@ -14,5 +14,9 @@ pub fn router() -> Router<AppState> {
         .route("/live", get(probes::live_check))
         .route("/ready", get(probes::ready_check))
         .route("/metrics", get(metrics::metrics_json))
+        .route(
+            "/metrics/batch-runtime",
+            get(metrics::batch_runtime_metrics_json),
+        )
         .route("/metrics/prometheus", get(metrics::metrics_prometheus))
 }
