@@ -29,6 +29,9 @@ When `izwi serve` is running:
 | `/livez`, `/readyz`, `/v1/live`, `/v1/ready`, `/v1/health` | Stable | Operational health and readiness endpoints. |
 | `/v1/responses*` | Preview | OpenAI-compatible Responses API shape with process-local response retention. |
 | First-party workflow routes | Preview | Persisted local product APIs used by the web UI and desktop app. |
+| `/v1/jobs/*` | Preview | Durable batch runtime job trace, artifact, cancel, and retry APIs. |
+| `/v1/media*` | Preview | Local media lifecycle APIs with runtime asset registration for uploads. |
+| `/v1/metrics/batch-runtime` | Preview | Durable batch runtime queue, job, stage, and worker telemetry. |
 | `/v1/admin/*` | Preview | Local model-management APIs. Bind carefully on shared hosts. |
 | WebSocket realtime routes | Preview | Browser-facing low-latency protocols that may evolve. |
 | `/internal/*` aliases | Internal | Compatibility aliases for tooling. Prefer `/v1/*` or root probes where available. |
@@ -63,6 +66,7 @@ Common status codes:
 | Status | Meaning |
 |--------|---------|
 | `400` | Invalid request shape, model id, unsupported field, or invalid option. |
+| `403` | Authenticated request or local voice reuse is not permitted by policy metadata. |
 | `404` | Resource, model, media object, or process-local record was not found. |
 | `413` | Body exceeded an upload limit before the handler could parse it. |
 | `415` | Endpoint expected JSON or multipart content but received another content type. |
@@ -490,6 +494,12 @@ response.completed or response.failed
 
 These routes are preview APIs used by the web UI and desktop app. They are local, SQLite-backed stores unless otherwise noted.
 
+Non-streaming first-party speech-to-text and text-to-speech create routes are
+backed by durable runtime jobs. Route-specific records remain the compatibility
+contract for web and desktop clients; the generic `/v1/jobs/*` APIs expose
+runtime traces, artifacts, cancellation, and retry controls once a runtime job
+ID is known.
+
 ### Route Rename Migration
 
 The following preview route names were replaced by canonical names. The old
@@ -563,6 +573,12 @@ SAA requests use the transcription store but require
 `max_speakers`. SAA does not support streaming, timestamp alignment, or
 `include_timestamps`; the server clears aligner/timestamp fields for this mode.
 
+Non-streaming transcription and SAA creates return `202` with the route record
+as before, then run through the durable batch worker. The runtime records the
+source media asset, input artifact, execution stage, transcript text asset, and
+output transcript artifact. Streaming ASR remains on the SSE path and does not
+use the batch runtime in this phase.
+
 ### Diarization Records
 
 Persisted diarization routes:
@@ -594,6 +610,12 @@ Routes:
 | `GET`, `DELETE` | `/v1/{family}/{record_id}` |
 | `GET` | `/v1/{family}/{record_id}/audio` |
 
+Non-streaming `/v1/text-to-speech` creates return `202` with a pending history
+record, then run through the durable batch worker. The runtime records the
+input text asset and generated WAV media asset/artifact before projecting the
+finished state back into the speech history record. Streaming TTS, voice
+design, and voice cloning stay on their route-specific execution paths.
+
 Streaming create responses emit JSON SSE events with an `event` field:
 
 | Event | Notes |
@@ -604,6 +626,24 @@ Streaming create responses emit JSON SSE events with an `event` field:
 | `final` | Includes generation stats and the completed record. |
 | `error` | Includes an error string. |
 | `done` | Terminal stream marker. |
+
+### Durable Runtime Jobs
+
+Preview runtime job routes expose the durable batch execution graph for
+first-party ASR and non-streaming text-to-speech jobs:
+
+| Method | Path | Notes |
+|--------|------|-------|
+| `GET` | `/v1/jobs/{job_id}` | Fetch the runtime job, ordered stages, and artifacts. |
+| `GET` | `/v1/jobs/{job_id}/artifacts` | Fetch only artifact lineage for the job. |
+| `POST` | `/v1/jobs/{job_id}/cancel` | Cancel a non-terminal job and update the linked route record when one exists. |
+| `POST` | `/v1/jobs/{job_id}/retry` | Requeue failed, cancelled, or expired jobs that have retryable stages. |
+
+Runtime jobs use statuses such as `created`, `queued`, `running`, `paused`,
+`retrying`, `postprocessing`, `completed`, `failed`, `cancelled`, and
+`expired`. Stages and artifacts include IDs, capability/model metadata, attempt
+counts, timing/error fields, media/text asset references, and storage keys when
+available.
 
 ### Saved Voices
 
@@ -618,6 +658,15 @@ Reusable voice clone references:
 | `GET` | `/v1/voices/{voice_id}/audio` | Fetch saved reference audio. |
 
 Use `saved_voice_id` on `/v1/audio/speech` or first-party generation routes to reuse a saved voice without resending reference audio.
+
+Saved voice records include a local permission baseline:
+`permission_scope`, `consent_status`, `allowed_uses`,
+`permission_provenance`, and `permission_revoked_at`. Newly created local
+voices default to `permission_scope: "local_owner"`,
+`consent_status: "granted"`, and `allowed_uses` containing `local_tts`.
+Migrated local voices use `permission_scope: "legacy_local"`. Reuse through
+`saved_voice_id` returns `403` when consent is not granted, the voice is
+revoked, or `local_tts` is not allowed.
 
 ### Studio
 
@@ -764,7 +813,14 @@ Upload request:
 
 `audio_base64` is accepted as an alias for `data_base64`, and data URLs such as
 `data:audio/wav;base64,...` are accepted. Upload responses include `path`,
-`url`, `content_type`, `filename`, and `size_bytes`.
+`url`, `content_type`, `filename`, `size_bytes`, `media_asset_id`,
+`canonical_media_asset_id`, `canonical_path`, and `canonical_url`.
+
+For audio uploads, the server preserves the original object at `path`/`url`,
+registers it as a `media_assets` row, and writes a canonical 16 kHz mono WAV
+derivative when decoding succeeds. The canonical derivative has its own media
+asset ID and media path/URL. Non-audio uploads keep the existing object
+lifecycle behavior and leave canonical audio fields empty.
 
 Rules:
 
@@ -805,9 +861,16 @@ Small first-party UI state APIs:
 | Method | Path | Notes |
 |--------|------|-------|
 | `GET` | `/v1/metrics` | JSON runtime telemetry snapshot. |
+| `GET` | `/v1/metrics/batch-runtime` | JSON durable batch runtime queue, job, stage, and worker telemetry. |
 | `GET` | `/v1/metrics/prometheus` | Prometheus text format. |
 | `GET` | `/internal/metrics` | Internal alias. |
+| `GET` | `/internal/metrics/batch-runtime` | Internal alias for batch runtime telemetry. |
 | `GET` | `/internal/metrics/prometheus` | Internal alias. |
+
+Batch runtime metrics include `queued_stages`, `jobs_by_status`,
+`stages_by_status`, and a local worker snapshot. Prometheus output appends
+`izwi_batch_runtime_queued_stages`, `izwi_batch_runtime_jobs`,
+`izwi_batch_runtime_stages`, and `izwi_batch_runtime_worker_running`.
 
 ### Admin Model Management
 
@@ -849,13 +912,14 @@ Speech model capabilities, when present:
 }
 ```
 
-Model records also expose route capability flags so clients can discover which models can drive OpenAI-compatible speech, persisted speech-to-text jobs, diarization records, Studio projects, realtime voice sessions, saved voices, forced alignment, and tokenizer workflows:
+Model records also expose route and batch capability flags so clients can discover which models can drive OpenAI-compatible speech, persisted speech-to-text jobs, diarization records, Studio projects, realtime voice sessions, saved voices, forced alignment, tokenizer workflows, and durable ASR/TTS jobs:
 
 ```json
 {
   "variant": "Kokoro-82M",
   "enabled": true,
   "status": "ready",
+  "deployment_state": "ready",
   "modalities": ["text_input", "audio_output"],
   "route_capabilities": {
     "openai_chat_completions": false,
@@ -876,6 +940,15 @@ Model records also expose route capability flags so clients can discover which m
     "voice_realtime_unified": false,
     "forced_alignment": false,
     "tokenizer": false
+  },
+  "batch_capabilities": {
+    "batch_asr": false,
+    "batch_tts": true,
+    "durable_jobs": true,
+    "artifacts": true,
+    "cancellation": true,
+    "retry": true,
+    "requires_voice_permission": false
   }
 }
 ```

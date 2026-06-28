@@ -18,6 +18,10 @@ use crate::{
 };
 
 const DEFAULT_LIST_LIMIT: usize = 500;
+const DEFAULT_PERMISSION_SCOPE: &str = "local_owner";
+const DEFAULT_CONSENT_STATUS: &str = "granted";
+const LOCAL_TTS_ALLOWED_USE: &str = "local_tts";
+const DEFAULT_ALLOWED_USES_JSON: &str = r#"["local_tts","voice_clone_reference"]"#;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -55,6 +59,11 @@ pub struct SavedVoiceSummary {
     pub audio_filename: Option<String>,
     pub source_route_kind: Option<SavedVoiceSourceRouteKind>,
     pub source_record_id: Option<String>,
+    pub permission_scope: String,
+    pub consent_status: String,
+    pub allowed_uses: Vec<String>,
+    pub permission_provenance: Option<String>,
+    pub permission_revoked_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -68,6 +77,22 @@ pub struct SavedVoice {
     pub audio_filename: Option<String>,
     pub source_route_kind: Option<SavedVoiceSourceRouteKind>,
     pub source_record_id: Option<String>,
+    pub permission_scope: String,
+    pub consent_status: String,
+    pub allowed_uses: Vec<String>,
+    pub permission_provenance: Option<String>,
+    pub permission_revoked_at: Option<u64>,
+}
+
+impl SavedVoice {
+    pub fn allows_local_tts_use(&self) -> bool {
+        self.permission_revoked_at.is_none()
+            && self.consent_status == DEFAULT_CONSENT_STATUS
+            && self
+                .allowed_uses
+                .iter()
+                .any(|use_case| use_case == LOCAL_TTS_ALLOWED_USE)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -232,6 +257,11 @@ impl SavedVoiceStore {
             .source_route_kind
             .map(|kind| kind.as_db_value().to_string());
         let source_record_id = sanitize_optional_text(voice.source_record_id.as_deref(), 200);
+        let permission_provenance = source_route_kind
+            .as_ref()
+            .zip(source_record_id.as_ref())
+            .map(|(kind, record_id)| format!("{kind}:{record_id}"))
+            .or_else(|| Some("local_upload".to_string()));
 
         if voice.audio_bytes.is_empty() {
             return Err(anyhow!("Audio payload cannot be empty"));
@@ -259,6 +289,11 @@ impl SavedVoiceStore {
             audio_storage_path: Set(audio_storage_path.clone()),
             source_route_kind: Set(source_route_kind),
             source_record_id: Set(source_record_id),
+            permission_scope: Set(DEFAULT_PERMISSION_SCOPE.to_string()),
+            consent_status: Set(DEFAULT_CONSENT_STATUS.to_string()),
+            allowed_uses_json: Set(DEFAULT_ALLOWED_USES_JSON.to_string()),
+            permission_provenance: Set(permission_provenance),
+            permission_revoked_at: Set(None),
         })
         .exec(db)
         .await
@@ -308,7 +343,12 @@ const SAVED_VOICE_COLUMNS: &str = r#"
     audio_mime_type,
     audio_filename,
     source_route_kind,
-    source_record_id
+    source_record_id,
+    permission_scope,
+    consent_status,
+    allowed_uses_json,
+    permission_provenance,
+    permission_revoked_at
 "#;
 
 const SAVED_VOICE_PAGE_SQL: &str = r#"
@@ -321,7 +361,12 @@ const SAVED_VOICE_PAGE_SQL: &str = r#"
         audio_mime_type,
         audio_filename,
         source_route_kind,
-        source_record_id
+        source_record_id,
+        permission_scope,
+        consent_status,
+        allowed_uses_json,
+        permission_provenance,
+        permission_revoked_at
     FROM saved_voices
     ORDER BY updated_at DESC, created_at DESC, id DESC
     LIMIT ?1
@@ -337,7 +382,12 @@ const SAVED_VOICE_PAGE_AFTER_CURSOR_SQL: &str = r#"
         audio_mime_type,
         audio_filename,
         source_route_kind,
-        source_record_id
+        source_record_id,
+        permission_scope,
+        consent_status,
+        allowed_uses_json,
+        permission_provenance,
+        permission_revoked_at
     FROM saved_voices
     WHERE
         updated_at < ?1
@@ -369,6 +419,7 @@ async fn fetch_voice_without_audio(
 
 fn map_saved_voice(row: &QueryResult) -> anyhow::Result<SavedVoice> {
     let source_route_raw: Option<String> = row.try_get_by_index(7)?;
+    let allowed_uses_raw: String = row.try_get_by_index(11)?;
     Ok(SavedVoice {
         id: row.try_get_by_index(0)?,
         created_at: i64_to_u64(row.try_get_by_index(1)?),
@@ -381,12 +432,18 @@ fn map_saved_voice(row: &QueryResult) -> anyhow::Result<SavedVoice> {
             .as_deref()
             .and_then(SavedVoiceSourceRouteKind::from_db_value),
         source_record_id: row.try_get_by_index(8)?,
+        permission_scope: row.try_get_by_index(9)?,
+        consent_status: row.try_get_by_index(10)?,
+        allowed_uses: parse_allowed_uses(allowed_uses_raw.as_str()),
+        permission_provenance: row.try_get_by_index(12)?,
+        permission_revoked_at: row.try_get_by_index::<Option<i64>>(13)?.map(i64_to_u64),
     })
 }
 
 fn map_saved_voice_summary(row: &QueryResult) -> anyhow::Result<SavedVoiceSummary> {
     let reference_text: String = row.try_get_by_index(4)?;
     let source_route_raw: Option<String> = row.try_get_by_index(7)?;
+    let allowed_uses_raw: String = row.try_get_by_index(11)?;
 
     Ok(SavedVoiceSummary {
         id: row.try_get_by_index(0)?,
@@ -401,7 +458,16 @@ fn map_saved_voice_summary(row: &QueryResult) -> anyhow::Result<SavedVoiceSummar
             .as_deref()
             .and_then(SavedVoiceSourceRouteKind::from_db_value),
         source_record_id: row.try_get_by_index(8)?,
+        permission_scope: row.try_get_by_index(9)?,
+        consent_status: row.try_get_by_index(10)?,
+        allowed_uses: parse_allowed_uses(allowed_uses_raw.as_str()),
+        permission_provenance: row.try_get_by_index(12)?,
+        permission_revoked_at: row.try_get_by_index::<Option<i64>>(13)?.map(i64_to_u64),
     })
+}
+
+fn parse_allowed_uses(raw: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
 }
 
 fn sanitize_required_text(raw: &str, max_chars: usize, field_name: &str) -> anyhow::Result<String> {
@@ -483,6 +549,7 @@ pub const fn default_list_limit() -> usize {
 mod tests {
     use super::*;
     use crate::test_support::env_lock;
+    use sea_orm::ConnectionTrait;
 
     fn setup_store() -> (tempfile::TempDir, SavedVoiceStore) {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -522,6 +589,18 @@ mod tests {
             created.source_route_kind,
             Some(SavedVoiceSourceRouteKind::VoiceCloning)
         );
+        assert_eq!(created.permission_scope, "local_owner");
+        assert_eq!(created.consent_status, "granted");
+        assert_eq!(
+            created.allowed_uses,
+            vec!["local_tts".to_string(), "voice_clone_reference".to_string()]
+        );
+        assert_eq!(
+            created.permission_provenance.as_deref(),
+            Some("voice_cloning:speech-1")
+        );
+        assert!(created.permission_revoked_at.is_none());
+        assert!(created.allows_local_tts_use());
 
         let audio = store
             .get_audio(created.id.clone())
@@ -537,6 +616,28 @@ mod tests {
         assert!(cursor.is_none());
         assert_eq!(voices.len(), 1);
         assert_eq!(voices[0].name, "Demo Voice");
+        assert_eq!(voices[0].permission_scope, "local_owner");
+        assert!(voices[0]
+            .allowed_uses
+            .iter()
+            .any(|allowed_use| allowed_use == "local_tts"));
+
+        let db = store.db.connection().await.expect("db connection");
+        let revoke_statement = raw::statement(
+            db,
+            "UPDATE saved_voices SET permission_revoked_at = 1 WHERE id = ?1",
+            vec![created.id.clone().into()],
+        )
+        .expect("revoke statement");
+        db.execute_raw(revoke_statement)
+            .await
+            .expect("voice permission should update");
+        let revoked = store
+            .get_voice(created.id.clone())
+            .await
+            .expect("voice lookup should succeed")
+            .expect("voice should exist");
+        assert!(!revoked.allows_local_tts_use());
 
         assert!(store
             .delete_voice(created.id.clone())

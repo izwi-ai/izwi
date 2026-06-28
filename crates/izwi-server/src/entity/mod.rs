@@ -271,6 +271,11 @@ pub mod saved_voices {
         pub audio_storage_path: String,
         pub source_route_kind: Option<String>,
         pub source_record_id: Option<String>,
+        pub permission_scope: String,
+        pub consent_status: String,
+        pub allowed_uses_json: String,
+        pub permission_provenance: Option<String>,
+        pub permission_revoked_at: Option<i64>,
     }
     empty_relation!();
 }

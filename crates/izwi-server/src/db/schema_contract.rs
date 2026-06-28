@@ -207,6 +207,11 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "audio_storage_path",
             "source_route_kind",
             "source_record_id",
+            "permission_scope",
+            "consent_status",
+            "allowed_uses_json",
+            "permission_provenance",
+            "permission_revoked_at",
         ],
     },
     RequiredSchemaTable {
