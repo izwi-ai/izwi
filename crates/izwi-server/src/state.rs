@@ -4,6 +4,10 @@ use crate::chat_store::ChatStore;
 use crate::db::StoreDatabase;
 use crate::diarization_store::DiarizationStore;
 use crate::onboarding_store::OnboardingStore;
+use crate::batch_runtime::{
+    store::BatchRuntimeStore,
+    worker::BatchWorkerHealth,
+};
 use crate::persistence::PersistenceContext;
 use crate::saved_voice_store::SavedVoiceStore;
 use crate::speech_history_store::SpeechHistoryStore;
@@ -184,6 +188,10 @@ pub struct AppState {
     pub voice_store: Arc<VoiceStore>,
     /// SQLite-backed voice observation store.
     pub voice_observation_store: Arc<VoiceObservationStore>,
+    /// Durable batch runtime store for media/text assets, jobs, stages, and artifacts.
+    pub batch_runtime_store: Arc<BatchRuntimeStore>,
+    /// In-process batch worker health snapshot used by readiness and diagnostics.
+    pub batch_worker_health: BatchWorkerHealth,
 }
 
 impl AppState {
@@ -216,6 +224,10 @@ impl AppState {
         let voice_store = Arc::new(VoiceStore::initialize()?);
         let voice_observation_store = Arc::new(VoiceObservationStore::initialize()?);
         let onboarding_store = Arc::new(OnboardingStore::initialize()?);
+        let batch_runtime_store = Arc::new(BatchRuntimeStore::initialize_with_database(
+            StoreDatabase::from_default_path()?,
+        ));
+        let batch_worker_health = BatchWorkerHealth::new("local-batch-worker");
 
         Ok(Self {
             runtime: Arc::new(runtime),
@@ -237,6 +249,8 @@ impl AppState {
             studio_store,
             voice_store,
             voice_observation_store,
+            batch_runtime_store,
+            batch_worker_health,
         })
     }
 
@@ -282,7 +296,13 @@ impl AppState {
         let voice_observation_store = Arc::new(VoiceObservationStore::initialize_with_database(
             store_database.clone(),
         ));
-        let onboarding_store = Arc::new(OnboardingStore::initialize_with_database(store_database));
+        let onboarding_store = Arc::new(OnboardingStore::initialize_with_database(
+            store_database.clone(),
+        ));
+        let batch_runtime_store = Arc::new(BatchRuntimeStore::initialize_with_database(
+            store_database.clone(),
+        ));
+        let batch_worker_health = BatchWorkerHealth::new("local-batch-worker");
 
         Ok(Self {
             runtime: Arc::new(runtime),
@@ -304,6 +324,8 @@ impl AppState {
             studio_store,
             voice_store,
             voice_observation_store,
+            batch_runtime_store,
+            batch_worker_health,
         })
     }
 

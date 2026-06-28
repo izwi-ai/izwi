@@ -118,6 +118,22 @@ async fn readiness_response(state: &AppState) -> ReadyResponse {
         }),
     });
 
+    let batch_worker = state.batch_worker_health.snapshot();
+    checks.push(ProbeCheck {
+        name: "batch_worker_health",
+        ok: batch_worker.last_error.is_none(),
+        message: batch_worker.last_error,
+    });
+
+    let batch_store_check = state.batch_runtime_store.queued_stage_count().await;
+    checks.push(ProbeCheck {
+        name: "batch_runtime_store",
+        ok: batch_store_check.is_ok(),
+        message: batch_store_check
+            .err()
+            .map(|err| format!("batch runtime store unavailable: {err}")),
+    });
+
     let ready = checks.iter().all(|check| check.ok);
 
     ReadyResponse {
