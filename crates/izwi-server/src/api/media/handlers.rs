@@ -5,6 +5,10 @@ use axum::{
     http::{StatusCode, header},
     response::Response,
 };
+use izwi_core::audio::{
+    AudioEncoder, AudioFormat, AudioInspection, decode_audio_bytes_to_mono,
+    resample_mono_high_quality,
+};
 use izwi_hooks::{HookMetadata, MediaNamespace};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -12,6 +16,7 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+use crate::batch_runtime::store::{NewMediaAsset, sha256_hex};
 use crate::api::audio_payload::{
     decode_base64_media_payload, inspect_audio_payload_bytes_with_diagnostics,
     is_audio_content_type,
@@ -62,12 +67,23 @@ pub struct UploadMediaResponse {
     pub content_type: String,
     pub filename: Option<String>,
     pub size_bytes: u64,
+    pub media_asset_id: Option<String>,
+    pub canonical_media_asset_id: Option<String>,
+    pub canonical_path: Option<String>,
+    pub canonical_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct DeleteMediaResponse {
     pub path: String,
     pub deleted: bool,
+}
+
+const CANONICAL_AUDIO_SAMPLE_RATE: u32 = 16_000;
+
+struct CanonicalAudioDerivative {
+    bytes: Vec<u8>,
+    inspection: AudioInspection,
 }
 
 pub async fn list_media(
@@ -119,14 +135,16 @@ pub async fn create_media(
             }),
     )
     .ok_or_else(|| ApiError::bad_request("Invalid content_type"))?;
-    if is_audio_content_type(&content_type) {
-        inspect_audio_payload_bytes_with_diagnostics(
+    let original_audio_inspection = if is_audio_content_type(&content_type) {
+        Some(inspect_audio_payload_bytes_with_diagnostics(
             "media.upload",
             &bytes,
             Some(content_type.as_str()),
             req.filename.as_deref(),
-        )?;
-    }
+        )?)
+    } else {
+        None
+    };
     let namespace = sanitize_media_namespace(req.namespace.as_deref());
     let record_id = uuid::Uuid::new_v4().to_string();
     let filename = req.filename.as_deref().and_then(normalize_filename);
@@ -137,7 +155,7 @@ pub async fn create_media(
         persist_audio_object(
             &provider,
             MediaNamespace::Other(format!("media/{namespace}")),
-            record_id,
+            record_id.clone(),
             filename.as_deref(),
             &content_type,
             &bytes,
@@ -159,13 +177,173 @@ pub async fn create_media(
         .map_err(map_media_error)?
     };
 
+    let mut media_asset_id = None;
+    let mut canonical_media_asset_id = None;
+    let mut canonical_path = None;
+    let mut canonical_url = None;
+    if let Some(original_inspection) = original_audio_inspection {
+        let original_sha256 = sha256_hex(&bytes);
+        let original_asset = register_media_asset(
+            &state,
+            "audio_original",
+            &format!("media/{namespace}"),
+            &path,
+            &content_type,
+            filename.as_deref(),
+            bytes.len() as u64,
+            Some(original_sha256),
+            &original_inspection,
+            serde_json::json!({
+                "route": "/v1/media",
+                "normalized": false,
+                "canonical_sample_rate_hz": CANONICAL_AUDIO_SAMPLE_RATE,
+            }),
+        )
+        .await?;
+        media_asset_id = Some(original_asset.id.clone());
+
+        let canonical = build_canonical_audio_derivative(&bytes)?;
+        let canonical_filename = canonical_filename(filename.as_deref());
+        let canonical_storage_path = persist_canonical_audio(
+            &state,
+            &namespace,
+            &record_id,
+            canonical_filename.as_deref(),
+            &canonical.bytes,
+        )
+        .await?;
+        let canonical_sha256 = sha256_hex(&canonical.bytes);
+        let canonical_asset = register_media_asset(
+            &state,
+            "audio_canonical_wav",
+            &format!("media/{namespace}/canonical"),
+            &canonical_storage_path,
+            AudioEncoder::content_type(AudioFormat::Wav),
+            canonical_filename.as_deref(),
+            canonical.bytes.len() as u64,
+            Some(canonical_sha256),
+            &canonical.inspection,
+            serde_json::json!({
+                "route": "/v1/media",
+                "normalized": true,
+                "source_media_asset_id": original_asset.id,
+                "source_storage_key": path.clone(),
+                "source_sample_rate_hz": original_inspection.sample_rate,
+            }),
+        )
+        .await?;
+        canonical_url = Some(media_url(&canonical_storage_path));
+        canonical_path = Some(canonical_storage_path);
+        canonical_media_asset_id = Some(canonical_asset.id);
+    }
+
     Ok(Json(UploadMediaResponse {
         url: media_url(&path),
         path,
         content_type,
         filename,
         size_bytes: bytes.len() as u64,
+        media_asset_id,
+        canonical_media_asset_id,
+        canonical_path,
+        canonical_url,
     }))
+}
+
+fn build_canonical_audio_derivative(bytes: &[u8]) -> Result<CanonicalAudioDerivative, ApiError> {
+    let (samples, source_sample_rate) = decode_audio_bytes_to_mono(bytes).map_err(|err| {
+        ApiError::bad_request(format!(
+            "Invalid audio payload: failed to decode audio for normalization: {err}"
+        ))
+    })?;
+    let canonical_samples =
+        resample_mono_high_quality(&samples, source_sample_rate, CANONICAL_AUDIO_SAMPLE_RATE)
+            .map_err(|err| {
+                ApiError::bad_request(format!(
+                    "Invalid audio payload: failed to resample audio: {err}"
+                ))
+            })?;
+    let inspection =
+        AudioInspection::from_mono_samples(&canonical_samples, CANONICAL_AUDIO_SAMPLE_RATE);
+    let bytes = AudioEncoder::new(CANONICAL_AUDIO_SAMPLE_RATE, 1)
+        .encode(&canonical_samples, AudioFormat::Wav)
+        .map_err(|err| ApiError::internal(format!("Failed encoding canonical WAV: {err}")))?;
+
+    Ok(CanonicalAudioDerivative { bytes, inspection })
+}
+
+async fn persist_canonical_audio(
+    state: &AppState,
+    namespace: &str,
+    record_id: &str,
+    filename: Option<&str>,
+    bytes: &[u8],
+) -> Result<String, ApiError> {
+    let canonical_namespace = format!("{namespace}/canonical");
+    if let Some(persistence) = state.persistence.as_ref() {
+        let provider = persistence.media_storage();
+        let mut metadata = HookMetadata::new();
+        metadata.insert("route".to_string(), "/v1/media".to_string());
+        metadata.insert("normalized".to_string(), "true".to_string());
+        persist_audio_object(
+            &provider,
+            MediaNamespace::Other(format!("media/{canonical_namespace}")),
+            record_id.to_string(),
+            filename,
+            AudioEncoder::content_type(AudioFormat::Wav),
+            bytes,
+            metadata,
+        )
+        .await
+        .map_err(map_media_error)
+    } else {
+        let media_root = storage_layout::resolve_media_root();
+        storage_layout::persist_audio_file(
+            &media_root,
+            storage_layout::MediaGroup::Uploads,
+            &canonical_namespace,
+            record_id,
+            filename,
+            AudioEncoder::content_type(AudioFormat::Wav),
+            bytes,
+        )
+        .map_err(map_media_error)
+    }
+}
+
+async fn register_media_asset(
+    state: &AppState,
+    asset_kind: &str,
+    storage_namespace: &str,
+    storage_key: &str,
+    content_type: &str,
+    filename: Option<&str>,
+    size_bytes: u64,
+    sha256: Option<String>,
+    inspection: &AudioInspection,
+    metadata_json: serde_json::Value,
+) -> Result<crate::batch_runtime::types::MediaAsset, ApiError> {
+    state
+        .batch_runtime_store
+        .create_media_asset(NewMediaAsset {
+            asset_kind: asset_kind.to_string(),
+            storage_namespace: storage_namespace.to_string(),
+            storage_key: storage_key.to_string(),
+            content_type: content_type.to_string(),
+            filename: filename.map(ToOwned::to_owned),
+            size_bytes,
+            sha256,
+            duration_secs: Some(inspection.duration_secs as f64),
+            sample_rate_hz: Some(inspection.sample_rate),
+            channel_count: Some(1),
+            peak_amplitude: Some(inspection.peak),
+            rms_amplitude: Some(inspection.rms),
+            scan_status: "passed".to_string(),
+            retention_policy: "default".to_string(),
+            metadata_json,
+        })
+        .await
+        .map_err(|err| ApiError::internal(format!("Batch runtime media asset error: {err}")))
 }
 
 pub async fn get_media(
@@ -351,6 +529,19 @@ fn normalize_filename(filename: &str) -> Option<String> {
         return None;
     }
     Some(trimmed.chars().take(180).collect())
+}
+
+fn canonical_filename(filename: Option<&str>) -> Option<String> {
+    let filename = filename?;
+    let stem = FsPath::new(filename)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::trim)
+        .filter(|stem| !stem.is_empty())?;
+    Some(format!(
+        "{}.canonical.wav",
+        stem.chars().take(120).collect::<String>()
+    ))
 }
 
 fn sanitize_media_namespace(namespace: Option<&str>) -> String {

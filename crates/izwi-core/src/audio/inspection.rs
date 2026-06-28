@@ -17,6 +17,10 @@ pub fn inspect_audio_bytes(audio_bytes: &[u8]) -> Result<AudioInspection> {
     Ok(AudioInspection::from_mono_samples(&samples, sample_rate))
 }
 
+pub fn decode_audio_bytes_to_mono(audio_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
+    crate::runtime::audio_io::decode_audio_bytes(audio_bytes)
+}
+
 impl AudioInspection {
     pub fn from_mono_samples(samples: &[f32], sample_rate: u32) -> Self {
         let sample_count = samples.len();
@@ -85,5 +89,19 @@ mod tests {
         assert_eq!(inspection.sample_count, samples.len());
         assert!((inspection.duration_secs - samples.len() as f32 / 16_000.0).abs() < 1e-6);
         assert!(inspection.peak > 0.24);
+    }
+
+    #[test]
+    fn decode_audio_bytes_to_mono_returns_samples_and_rate() {
+        let samples = [0.0, 0.5, -0.5, 0.0];
+        let wav = AudioEncoder::new(22_050, 1)
+            .encode(&samples, AudioFormat::Wav)
+            .expect("wav should encode");
+
+        let (decoded, sample_rate) =
+            decode_audio_bytes_to_mono(&wav).expect("wav should decode");
+
+        assert_eq!(sample_rate, 22_050);
+        assert_eq!(decoded.len(), samples.len());
     }
 }
