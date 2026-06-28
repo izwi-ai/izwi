@@ -336,3 +336,9 @@ pub struct RuntimeWorkerHeartbeat {
     pub current_stage_id: Option<String>,
     pub diagnostic_json: serde_json::Value,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClaimedStage {
+    pub job: RuntimeJob,
+    pub stage: JobStage,
+}
