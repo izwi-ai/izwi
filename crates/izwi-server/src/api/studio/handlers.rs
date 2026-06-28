@@ -1042,6 +1042,7 @@ pub async fn get_studio_project_audio(
             audio_bytes: wav_bytes,
             audio_mime_type: AudioEncoder::content_type(export_format).to_string(),
             audio_filename: Some(project_audio_filename(project.name.as_str(), export_format)),
+            audio_storage_path: String::new(),
         },
         query.download,
     ))

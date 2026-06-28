@@ -195,7 +195,10 @@ fn start_batch_runtime_worker(state: &AppState) -> BatchWorkerSupervisor {
     config.lease_duration = Duration::from_secs(24 * 60 * 60);
     BatchWorkerRunner::new(
         state.batch_runtime_store.clone(),
-        vec![api::transcription::batch_asr_stage_executor(state.clone())],
+        vec![
+            api::transcription::batch_asr_stage_executor(state.clone()),
+            api::speech_history::batch_tts_stage_executor(state.clone()),
+        ],
         config,
         state.batch_worker_health.clone(),
     )
