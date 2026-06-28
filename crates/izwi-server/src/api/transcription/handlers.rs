@@ -2,6 +2,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Instant;
 
+use anyhow::Context;
 use axum::{
     Json, RequestExt,
     extract::{Extension, Multipart, Path, Request, State},
@@ -14,9 +15,21 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use crate::batch_runtime::{
+    store::{
+        BatchRuntimeStore, NewIdempotencyRecord, NewJobStage, NewMediaAsset, NewRuntimeArtifact,
+        NewRuntimeJob, NewTextAsset, sha256_hex,
+    },
+    types::{
+        ClaimedStage, RuntimeArtifactKind, RuntimeArtifactRole, RuntimeJobKind, RuntimeJobStatus,
+        RuntimeStageStatus,
+    },
+    worker::{StageExecutionOutcome, StageExecutor},
+};
 use crate::api::audio_payload::{
     decode_base64_audio_payload, inspect_audio_payload_with_diagnostics,
-    read_multipart_audio_base64_payload, read_multipart_audio_file_payload,
+    inspect_audio_payload_bytes, read_multipart_audio_base64_payload,
+    read_multipart_audio_file_payload,
 };
 use crate::api::request_context::RequestContext;
 use crate::error::ApiError;
@@ -32,6 +45,7 @@ use izwi_core::{
     AsrProgress, AsrProgressPhase, ChatMessage, ChatRequestConfig, ChatRole, GenerationParams,
     ModelVariant, RuntimeService, parse_chat_model_variant, parse_model_variant,
 };
+use async_trait::async_trait;
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
 use crate::api::speech_text_upload::{multipart_upload_error, resolve_source_audio_mime_type};
@@ -45,6 +59,7 @@ const MAX_SEGMENT_WORDS: usize = 18;
 const MAX_SEGMENT_DURATION_SECS: f32 = 9.0;
 const MIN_SENTENCE_BREAK_WORDS: usize = 5;
 const SEGMENT_GAP_BREAK_SECS: f32 = 0.85;
+const BATCH_ASR_STAGE_KIND: &str = "asr_transcribe";
 
 #[derive(Debug, Serialize)]
 pub struct DeleteTranscriptionRecordResponse {
@@ -66,6 +81,50 @@ struct ParsedTranscriptionCreateRequest {
     generate_summary: bool,
     min_speakers: Option<usize>,
     max_speakers: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BatchTranscriptionRequest {
+    record_mode: TranscriptionRecordMode,
+    model_id: Option<String>,
+    aligner_model_id: Option<String>,
+    language: Option<String>,
+    include_timestamps: bool,
+    generate_summary: bool,
+    min_speakers: Option<usize>,
+    max_speakers: Option<usize>,
+}
+
+impl BatchTranscriptionRequest {
+    fn from_parsed(parsed: &ParsedTranscriptionCreateRequest) -> Self {
+        Self {
+            record_mode: parsed.record_mode,
+            model_id: parsed.model_id.clone(),
+            aligner_model_id: parsed.aligner_model_id.clone(),
+            language: parsed.language.clone(),
+            include_timestamps: parsed.include_timestamps,
+            generate_summary: parsed.generate_summary,
+            min_speakers: parsed.min_speakers,
+            max_speakers: parsed.max_speakers,
+        }
+    }
+
+    fn into_parsed(self) -> ParsedTranscriptionCreateRequest {
+        ParsedTranscriptionCreateRequest {
+            audio_bytes: Vec::new(),
+            audio_mime_type: None,
+            audio_filename: None,
+            record_mode: self.record_mode,
+            model_id: self.model_id,
+            aligner_model_id: self.aligner_model_id,
+            language: self.language,
+            include_timestamps: self.include_timestamps,
+            stream: false,
+            generate_summary: self.generate_summary,
+            min_speakers: self.min_speakers,
+            max_speakers: self.max_speakers,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -228,6 +287,7 @@ async fn create_record_for_mode(
     req: Request,
     record_mode: TranscriptionRecordMode,
 ) -> Result<Response, ApiError> {
+    let idempotency_key = extract_idempotency_key(&req);
     let mut parsed = parse_create_request(req).await?;
     parsed.record_mode = record_mode;
     prepare_create_request(&mut parsed)?;
@@ -237,15 +297,25 @@ async fn create_record_for_mode(
         return create_record_stream(state, parsed, placeholder, ctx.correlation_id).await;
     }
 
-    spawn_transcription_processing_task(
-        state.runtime.clone(),
-        state.transcription_store.clone(),
-        state.request_semaphore.clone(),
-        placeholder.id.clone(),
-        parsed,
+    if let Err(err) = enqueue_batch_transcription_job(
+        &state,
+        &placeholder,
+        &parsed,
         Some(ctx.correlation_id),
-        None,
-    );
+        idempotency_key,
+    )
+    .await
+    {
+        let _ = state
+            .transcription_store
+            .update_processing_status(
+                placeholder.id.clone(),
+                TranscriptionProcessingStatus::Failed,
+                Some(err.message.clone()),
+            )
+            .await;
+        return Err(err);
+    }
 
     Ok((StatusCode::ACCEPTED, Json(placeholder)).into_response())
 }
@@ -339,6 +409,272 @@ async fn create_pending_record(
         })
         .await
         .map_err(map_store_error)
+}
+
+fn extract_idempotency_key(req: &Request) -> Option<String> {
+    req.headers()
+        .get("idempotency-key")
+        .or_else(|| req.headers().get("x-idempotency-key"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+async fn enqueue_batch_transcription_job(
+    state: &AppState,
+    placeholder: &TranscriptionRecord,
+    parsed: &ParsedTranscriptionCreateRequest,
+    correlation_id: Option<String>,
+    idempotency_key: Option<String>,
+) -> Result<(), ApiError> {
+    let audio = state
+        .transcription_store
+        .get_audio(placeholder.id.clone())
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("Transcription audio payload not found"))?;
+    let inspection = inspect_audio_payload_bytes(audio.audio_bytes.as_slice())?;
+    let request_snapshot = BatchTranscriptionRequest::from_parsed(parsed);
+    let request_json =
+        serde_json::to_value(&request_snapshot).map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let request_hash = sha256_hex(
+        serde_json::to_string(&request_json)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+
+    let media_asset = state
+        .batch_runtime_store
+        .create_media_asset(NewMediaAsset {
+            asset_kind: "audio_original".to_string(),
+            storage_namespace: "transcription_upload".to_string(),
+            storage_key: audio.audio_storage_path,
+            content_type: audio.audio_mime_type,
+            filename: audio.audio_filename,
+            size_bytes: audio.audio_bytes.len() as u64,
+            sha256: Some(sha256_hex(audio.audio_bytes.as_slice())),
+            duration_secs: Some(inspection.duration_secs as f64),
+            sample_rate_hz: Some(inspection.sample_rate),
+            channel_count: Some(1),
+            peak_amplitude: Some(inspection.peak),
+            rms_amplitude: Some(inspection.rms),
+            scan_status: "passed".to_string(),
+            retention_policy: "default".to_string(),
+            metadata_json: serde_json::json!({
+                "route_record_id": placeholder.id,
+                "route": "speech_to_text",
+                "normalized": false
+            }),
+        })
+        .await
+        .map_err(map_store_error)?;
+
+    let job = state
+        .batch_runtime_store
+        .create_job(NewRuntimeJob {
+            job_kind: RuntimeJobKind::AsrTranscription,
+            status: RuntimeJobStatus::Queued,
+            priority: 0,
+            model_id: request_snapshot.model_id.clone(),
+            capability: Some("asr".to_string()),
+            route_record_kind: Some(request_snapshot.record_mode.as_db_value().to_string()),
+            route_record_id: Some(placeholder.id.clone()),
+            input_media_asset_id: Some(media_asset.id.clone()),
+            input_text_asset_id: None,
+            request_json: request_json.clone(),
+            model_snapshot_json: serde_json::json!({}),
+            retry_policy_json: serde_json::json!({"max_attempts": 2}),
+            max_attempts: 2,
+            idempotency_key: idempotency_key.clone(),
+            correlation_id,
+        })
+        .await
+        .map_err(map_store_error)?;
+
+    let input_artifact = state
+        .batch_runtime_store
+        .create_artifact(NewRuntimeArtifact {
+            job_id: job.id.clone(),
+            stage_id: None,
+            artifact_kind: RuntimeArtifactKind::Media,
+            artifact_role: RuntimeArtifactRole::InputOriginal,
+            media_asset_id: Some(media_asset.id),
+            text_asset_id: None,
+            storage_key: Some(media_asset.storage_key),
+            content_type: Some(media_asset.content_type),
+            filename: media_asset.filename,
+            size_bytes: Some(media_asset.size_bytes),
+            sha256: media_asset.sha256,
+            metadata_json: serde_json::json!({"route_record_id": placeholder.id}),
+            retention_policy: "default".to_string(),
+        })
+        .await
+        .map_err(map_store_error)?;
+
+    state
+        .batch_runtime_store
+        .create_stage(NewJobStage {
+            job_id: job.id.clone(),
+            sequence: 0,
+            stage_kind: BATCH_ASR_STAGE_KIND.to_string(),
+            status: RuntimeStageStatus::Queued,
+            capability: Some("asr".to_string()),
+            model_id: request_snapshot.model_id,
+            max_attempts: 2,
+            input_artifact_ids: vec![input_artifact.id],
+        })
+        .await
+        .map_err(map_store_error)?;
+
+    if let Some(idempotency_key) = idempotency_key {
+        state
+            .batch_runtime_store
+            .record_idempotency(NewIdempotencyRecord {
+                operation: "transcription.create".to_string(),
+                idempotency_key,
+                expires_at: None,
+                request_hash,
+                response_json: Some(serde_json::json!({"record_id": placeholder.id, "job_id": job.id})),
+                runtime_job_id: Some(job.id),
+                conflict_message: None,
+                metadata_json: serde_json::json!({}),
+            })
+            .await
+            .map_err(map_store_error)?;
+    }
+
+    Ok(())
+}
+
+pub(crate) fn batch_asr_stage_executor(state: AppState) -> Arc<dyn StageExecutor> {
+    Arc::new(BatchAsrStageExecutor { state })
+}
+
+struct BatchAsrStageExecutor {
+    state: AppState,
+}
+
+#[async_trait]
+impl StageExecutor for BatchAsrStageExecutor {
+    fn stage_kind(&self) -> &'static str {
+        BATCH_ASR_STAGE_KIND
+    }
+
+    async fn execute(&self, claimed: ClaimedStage) -> anyhow::Result<StageExecutionOutcome> {
+        let record_id = claimed
+            .job
+            .route_record_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("ASR batch job is missing route_record_id"))?;
+        let request: BatchTranscriptionRequest =
+            serde_json::from_value(claimed.job.request_json.clone())
+                .context("Failed to decode ASR batch request")?;
+        let parsed = request.into_parsed();
+
+        spawn_transcription_processing_task(
+            self.state.runtime.clone(),
+            self.state.transcription_store.clone(),
+            self.state.request_semaphore.clone(),
+            record_id.clone(),
+            parsed,
+            claimed.job.correlation_id.clone(),
+            None,
+        );
+
+        let record = wait_for_transcription_completion(
+            self.state.transcription_store.clone(),
+            record_id.as_str(),
+        )
+        .await?;
+        let output_artifact = create_transcript_runtime_artifact(
+            self.state.batch_runtime_store.clone(),
+            &claimed,
+            &record,
+        )
+        .await?;
+
+        Ok(StageExecutionOutcome {
+            output_artifact_ids: vec![output_artifact.id],
+        })
+    }
+}
+
+async fn wait_for_transcription_completion(
+    transcription_store: Arc<TranscriptionStore>,
+    record_id: &str,
+) -> anyhow::Result<TranscriptionRecord> {
+    loop {
+        let record = transcription_store
+            .get_record(record_id.to_string())
+            .await
+            .context("Failed to poll transcription record")?
+            .ok_or_else(|| anyhow::anyhow!("Transcription record disappeared while processing"))?;
+
+        match record.processing_status {
+            TranscriptionProcessingStatus::Ready => return Ok(record),
+            TranscriptionProcessingStatus::Failed => {
+                anyhow::bail!(
+                    "{}",
+                    record
+                        .processing_error
+                        .unwrap_or_else(|| "Transcription processing failed".to_string())
+                );
+            }
+            TranscriptionProcessingStatus::Pending | TranscriptionProcessingStatus::Processing => {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        }
+    }
+}
+
+async fn create_transcript_runtime_artifact(
+    batch_store: Arc<BatchRuntimeStore>,
+    claimed: &ClaimedStage,
+    record: &TranscriptionRecord,
+) -> anyhow::Result<crate::batch_runtime::types::RuntimeArtifact> {
+    let transcript_payload = serde_json::json!({
+        "record_id": record.id,
+        "text": record.transcription.clone(),
+        "segments": record.segments.clone(),
+        "words": record.words.clone(),
+        "speaker_attributed_text": record.speaker_attributed_text.clone(),
+        "speaker_turns": record.speaker_turns.clone(),
+        "summary_status": record.summary_status,
+    });
+    let transcript_json = serde_json::to_string(&transcript_payload)?;
+    let text_asset = batch_store
+        .create_text_asset(NewTextAsset {
+            raw_text: record.transcription.clone(),
+            normalized_text: Some(record.transcription.clone()),
+            language_hint: record.language.clone(),
+            sha256: Some(sha256_hex(record.transcription.as_bytes())),
+            safety_status: "unchecked".to_string(),
+            retention_policy: "default".to_string(),
+            structure_json: serde_json::json!({
+                "source": "asr_transcript",
+                "record_id": record.id
+            }),
+        })
+        .await?;
+
+    batch_store
+        .create_artifact(NewRuntimeArtifact {
+            job_id: claimed.job.id.clone(),
+            stage_id: Some(claimed.stage.id.clone()),
+            artifact_kind: RuntimeArtifactKind::Transcript,
+            artifact_role: RuntimeArtifactRole::OutputPrimary,
+            media_asset_id: None,
+            text_asset_id: Some(text_asset.id),
+            storage_key: None,
+            content_type: Some("application/json".to_string()),
+            filename: Some(format!("{}.transcript.json", record.id)),
+            size_bytes: Some(transcript_json.len() as u64),
+            sha256: Some(sha256_hex(transcript_json.as_bytes())),
+            metadata_json: transcript_payload,
+            retention_policy: "default".to_string(),
+        })
+        .await
 }
 
 fn spawn_transcription_processing_task(
