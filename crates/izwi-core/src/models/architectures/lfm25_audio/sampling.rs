@@ -157,6 +157,26 @@ pub fn greedy_from_logits(logits: &Tensor, vocab_limit: usize) -> Result<u32> {
     greedy_from_logits_row(&logits, vocab_limit)
 }
 
+pub fn greedy_token_tensor_from_logits(
+    logits: &Tensor,
+    vocab_limit: usize,
+) -> Result<Option<Tensor>> {
+    let logits = logits_row(logits)?;
+    let vocab_limit = effective_vocab_limit(&logits, vocab_limit)?;
+    if !(logits.device().is_metal() || logits.device().is_cuda()) {
+        return Ok(None);
+    }
+
+    let logits = logits.narrow(0, 0, vocab_limit)?;
+    let idx = logits.argmax(D::Minus1)?;
+    let idx = if idx.rank() == 0 {
+        idx.unsqueeze(0)?
+    } else {
+        idx.reshape((1,))?
+    };
+    idx.to_dtype(DType::U32).map(Some).map_err(Error::from)
+}
+
 fn logits_row(logits: &Tensor) -> Result<Tensor> {
     match logits.rank() {
         1 => Ok(logits.clone()),
@@ -204,16 +224,10 @@ fn greedy_from_logits_row(logits: &Tensor, vocab_limit: usize) -> Result<u32> {
 }
 
 fn argmax_row_device(logits: &Tensor, vocab_limit: usize) -> Result<u32> {
-    let logits = logits.narrow(0, 0, vocab_limit)?;
-    let idx = logits.argmax(D::Minus1)?;
-    let idx = if idx.rank() == 0 {
-        idx
-    } else {
-        idx.squeeze(0)?
-    };
-    idx.to_dtype(DType::U32)?
-        .to_scalar::<u32>()
-        .map_err(Error::from)
+    let idx = greedy_token_tensor_from_logits(logits, vocab_limit)?.ok_or_else(|| {
+        Error::InferenceError("Device argmax requested for non-device logits".to_string())
+    })?;
+    idx.squeeze(0)?.to_scalar::<u32>().map_err(Error::from)
 }
 
 fn argmax_row_host(logits: &Tensor, vocab_limit: usize) -> Result<u32> {
@@ -265,6 +279,15 @@ mod tests {
             .expect("logits");
         let token = greedy_from_logits(&logits, 2).expect("sample token");
         assert_eq!(token, 1);
+    }
+
+    #[test]
+    fn greedy_token_tensor_returns_none_for_cpu_logits() {
+        let logits = Tensor::from_vec(vec![0.1f32, 0.9, 7.0], (3,), &candle_core::Device::Cpu)
+            .expect("logits");
+        assert!(greedy_token_tensor_from_logits(&logits, 2)
+            .expect("device token path")
+            .is_none());
     }
 
     #[test]
