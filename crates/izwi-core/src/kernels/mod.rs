@@ -242,6 +242,18 @@ pub fn try_lfm_shortconv_decode3(cache: &Tensor, bx: &Tensor, conv: &Tensor) -> 
     None
 }
 
+pub fn try_lfm_shortconv_update3(cache: &Tensor, bx: &Tensor) -> Option<Tensor> {
+    if !use_fused_kernels_for_device(cache.device()) {
+        return None;
+    }
+
+    if cache.device().is_metal() {
+        return metal::try_lfm_shortconv_update3(cache, bx);
+    }
+
+    None
+}
+
 pub fn try_lfm_shortconv_sequence3(bx: &Tensor, conv: &Tensor) -> Option<Tensor> {
     if !use_fused_kernels_for_device(bx.device()) {
         return None;

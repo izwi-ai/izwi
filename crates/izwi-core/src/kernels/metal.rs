@@ -479,6 +479,27 @@ kernel void izwi_lfm_shortconv_decode3_f32(
         bx[gid] * conv[conv_base + 2];
 }
 
+kernel void izwi_lfm_shortconv_update3_f32(
+    device const float* cache [[buffer(0)]],
+    device const float* bx [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& hidden_size [[buffer(3)]],
+    constant uint& elem_count [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= elem_count) {
+        return;
+    }
+
+    const uint h = gid % hidden_size;
+    const uint b = gid / hidden_size;
+    const uint cache_base = ((b * hidden_size) + h) * 3;
+    const uint out_base = cache_base;
+    output[out_base] = cache[cache_base + 1];
+    output[out_base + 1] = cache[cache_base + 2];
+    output[out_base + 2] = bx[gid];
+}
+
 kernel void izwi_lfm_shortconv_sequence3_f32(
     device const float* bx [[buffer(0)]],
     device const float* conv [[buffer(1)]],
@@ -1138,6 +1159,13 @@ struct LfmShortConvDecode3Op {
 
 #[cfg(feature = "metal")]
 #[derive(Debug, Clone, Copy)]
+struct LfmShortConvUpdate3Op {
+    batch_size: usize,
+    hidden_size: usize,
+}
+
+#[cfg(feature = "metal")]
+#[derive(Debug, Clone, Copy)]
 struct LfmShortConvSequence3Op {
     batch_size: usize,
     hidden_size: usize,
@@ -1430,6 +1458,127 @@ fn lfm_shortconv_decode3_pipeline(device: &MetalDevice) -> CandleResult<ComputeP
         .map_err(candle_core::Error::wrap)?;
     let function = library
         .get_function("izwi_lfm_shortconv_decode3_f32", None)
+        .map_err(candle_core::Error::wrap)?;
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(candle_core::Error::wrap)?;
+
+    pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .insert(registry_id, pipeline.clone());
+
+    Ok(pipeline)
+}
+
+#[cfg(feature = "metal")]
+impl CustomOp2 for LfmShortConvUpdate3Op {
+    fn name(&self) -> &'static str {
+        "izwi-lfm-shortconv-update3-metal"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+    ) -> CandleResult<(CpuStorage, Shape)> {
+        bail!("izwi-lfm-shortconv-update3-metal requires Metal tensors")
+    }
+
+    fn metal_fwd(
+        &self,
+        cache_storage: &MetalStorage,
+        cache_layout: &Layout,
+        bx_storage: &MetalStorage,
+        bx_layout: &Layout,
+    ) -> CandleResult<(MetalStorage, Shape)> {
+        if cache_storage.dtype() != DType::F32 || bx_storage.dtype() != DType::F32 {
+            bail!("izwi-lfm-shortconv-update3-metal only supports F32 tensors")
+        }
+        if !cache_layout.is_contiguous() || !bx_layout.is_contiguous() {
+            bail!("izwi-lfm-shortconv-update3-metal requires contiguous tensors")
+        }
+        if self.batch_size == 0 || self.hidden_size == 0 {
+            bail!("izwi-lfm-shortconv-update3-metal requires non-empty dimensions")
+        }
+        let elem_count = self.batch_size.saturating_mul(self.hidden_size);
+        if cache_layout.shape().elem_count() != elem_count.saturating_mul(3)
+            || bx_layout.shape().elem_count() != elem_count
+        {
+            bail!("izwi-lfm-shortconv-update3-metal input shape mismatch")
+        }
+        if elem_count > u32::MAX as usize || self.hidden_size > u32::MAX as usize {
+            bail!("izwi-lfm-shortconv-update3-metal tensor is too large")
+        }
+
+        let device = cache_storage.device().clone();
+        let output = device.new_buffer(
+            elem_count.saturating_mul(3),
+            DType::F32,
+            "izwi-lfm-shortconv-update3",
+        )?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("izwi-lfm-shortconv-update3");
+        let pipeline = lfm_shortconv_update3_pipeline(device.metal_device())?;
+        encoder.set_compute_pipeline_state(&pipeline);
+
+        encoder.set_buffer(
+            0,
+            Some(cache_storage.buffer()),
+            cache_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_buffer(
+            1,
+            Some(bx_storage.buffer()),
+            bx_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_buffer(2, Some(&output), 0);
+        encoder.set_bytes(3, &(self.hidden_size as u32));
+        encoder.set_bytes(4, &(elem_count as u32));
+
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        encoder.dispatch_threads(
+            objc2_metal::MTLSize {
+                width: elem_count,
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: threads_per_threadgroup,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        Ok((
+            MetalStorage::new(output, device, elem_count.saturating_mul(3), DType::F32),
+            Shape::from((self.batch_size, self.hidden_size, 3)),
+        ))
+    }
+}
+
+#[cfg(feature = "metal")]
+fn lfm_shortconv_update3_pipeline(device: &MetalDevice) -> CandleResult<ComputePipeline> {
+    static PIPELINES: OnceLock<Mutex<HashMap<u64, ComputePipeline>>> = OnceLock::new();
+    let registry_id = device.registry_id();
+    let pipelines = PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
+
+    if let Some(pipeline) = pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .get(&registry_id)
+        .cloned()
+    {
+        return Ok(pipeline);
+    }
+
+    let library = device
+        .new_library_with_source(IZWI_METAL_SOURCE, None)
+        .map_err(candle_core::Error::wrap)?;
+    let function = library
+        .get_function("izwi_lfm_shortconv_update3_f32", None)
         .map_err(candle_core::Error::wrap)?;
     let pipeline = device
         .new_compute_pipeline_state_with_function(&function)
@@ -2092,6 +2241,47 @@ pub fn try_lfm_shortconv_decode3(cache: &Tensor, bx: &Tensor, conv: &Tensor) -> 
     None
 }
 
+pub fn try_lfm_shortconv_update3(cache: &Tensor, bx: &Tensor) -> Option<Tensor> {
+    #[cfg(not(feature = "metal"))]
+    let _ = (cache, bx);
+
+    if !use_fused_kernels() {
+        return None;
+    }
+
+    #[cfg(feature = "metal")]
+    {
+        let (batch_size, hidden_size, cache_len) = cache.dims3().ok()?;
+        let (bx_batch, bx_hidden, bx_len) = bx.dims3().ok()?;
+        if cache_len != 3
+            || bx_len != 1
+            || bx_batch != batch_size
+            || bx_hidden != hidden_size
+            || !cache.device().is_metal()
+            || !bx.device().is_metal()
+            || !cache.device().same_device(bx.device())
+            || cache.dtype() != DType::F32
+            || bx.dtype() != DType::F32
+            || !cache.is_contiguous()
+            || !bx.is_contiguous()
+        {
+            return None;
+        }
+        return cache
+            .apply_op2_no_bwd(
+                bx,
+                &LfmShortConvUpdate3Op {
+                    batch_size,
+                    hidden_size,
+                },
+            )
+            .ok();
+    }
+
+    #[allow(unreachable_code)]
+    None
+}
+
 pub fn try_lfm_shortconv_sequence3(bx: &Tensor, conv: &Tensor) -> Option<Tensor> {
     #[cfg(not(feature = "metal"))]
     let _ = (bx, conv);
@@ -2597,6 +2787,15 @@ mod tests {
         assert!(try_lfm_shortconv_sequence3(&bx, &conv).is_none());
     }
 
+    #[test]
+    fn lfm_shortconv_update3_returns_none_on_cpu() {
+        let device = Device::Cpu;
+        let cache = Tensor::zeros((1, 2, 3), DType::F32, &device).unwrap();
+        let bx = Tensor::zeros((1, 2, 1), DType::F32, &device).unwrap();
+
+        assert!(try_lfm_shortconv_update3(&cache, &bx).is_none());
+    }
+
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn metal_lfm_shortconv_decode3_matches_reference_if_available() {
@@ -2636,6 +2835,34 @@ mod tests {
                 "shortconv mismatch at {idx}: {actual} != {expected}"
             );
         }
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn metal_lfm_shortconv_update3_matches_reference_if_available() {
+        let Ok(device) = Device::new_metal(0) else {
+            return;
+        };
+        let cache = Tensor::from_vec(
+            vec![
+                1.0f32, 2.0, 3.0, //
+                4.0, 5.0, 6.0,
+            ],
+            (1, 2, 3),
+            &device,
+        )
+        .unwrap();
+        let bx = Tensor::from_vec(vec![7.0f32, 8.0], (1, 2, 1), &device).unwrap();
+
+        let out =
+            try_lfm_shortconv_update3(&cache, &bx).expect("shortconv update3 should run on Metal");
+        let tail = cache.narrow(2, 1, 2).unwrap();
+        let reference = Tensor::cat(&[&tail, &bx], 2).unwrap();
+
+        assert_eq!(
+            out.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            reference.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
     }
 
     #[cfg(all(feature = "metal", target_os = "macos"))]

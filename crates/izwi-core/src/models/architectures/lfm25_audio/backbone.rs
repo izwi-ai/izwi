@@ -11,6 +11,7 @@ use crate::error::{Error, Result};
 use crate::kernels::{
     try_fused_decode_gqa_attention_with_kv_len, try_fused_qk_rms_norm, try_fused_rope_pair_bshd,
     try_fused_silu_mul_with_status, try_lfm_shortconv_decode3, try_lfm_shortconv_sequence3,
+    try_lfm_shortconv_update3,
 };
 use crate::models::shared::attention::flash::{
     flash_attention_requested, try_fused_self_attention_with_options, CudaFlashAttentionOptions,
@@ -400,7 +401,15 @@ impl ShortConvLayer {
                 None
             };
 
-            if self.l_cache > 1 {
+            let fused_state = if self.l_cache == 3 {
+                try_lfm_shortconv_update3(&state, &bx)
+            } else {
+                None
+            };
+
+            if let Some(updated) = fused_state {
+                state = updated;
+            } else if self.l_cache > 1 {
                 let tail = state.narrow(2, 1, self.l_cache - 1)?;
                 state = Tensor::cat(&[&tail, &bx], 2)?;
             } else {
