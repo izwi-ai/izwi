@@ -1,6 +1,8 @@
+use std::sync::Arc;
+
 use candle_core::{Device, Tensor};
 use rustfft::num_complex::Complex;
-use rustfft::FftPlanner;
+use rustfft::{Fft, FftPlanner};
 
 use crate::error::{Error, Result};
 
@@ -15,23 +17,32 @@ const F_MAX: f32 = 8_000.0;
 const NORMALIZE_EPS: f32 = 1e-5;
 
 pub struct Lfm25AudioPreprocessor {
-    mel_filterbank: Vec<Vec<f32>>,
+    mel_filterbank_spans: Vec<MelFilterSpan>,
     window: Vec<f32>,
+    fft: Arc<dyn Fft<f32>>,
+}
+
+struct MelFilterSpan {
+    start: usize,
+    weights: Vec<f32>,
 }
 
 impl Lfm25AudioPreprocessor {
     pub fn load() -> Result<Self> {
-        let mel_filterbank = create_mel_filterbank(
+        let mel_filterbank_spans = sparse_mel_filterbank(&create_mel_filterbank(
             LFM25_AUDIO_INPUT_N_FFT / 2 + 1,
             NUM_MEL_BINS,
             LFM25_AUDIO_INPUT_SAMPLE_RATE as f32,
             F_MIN,
             F_MAX,
-        );
+        ));
         let window = hann_window_padded(LFM25_AUDIO_INPUT_N_FFT, LFM25_AUDIO_INPUT_WIN_LENGTH);
+        let mut planner = FftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(LFM25_AUDIO_INPUT_N_FFT);
         Ok(Self {
-            mel_filterbank,
+            mel_filterbank_spans,
             window,
+            fft,
         })
     }
 
@@ -41,87 +52,50 @@ impl Lfm25AudioPreprocessor {
         }
 
         let effective_frames = effective_frame_count(waveform.len());
-        let stft = self.stft(waveform)?;
-        let power = self.power_spectrogram(&stft);
-        let mel = self.apply_mel_filterbank(&power);
-        let mut log_mel = self.log_mel(&mel);
-        normalize_per_feature(&mut log_mel, effective_frames);
-
-        let total_frames = log_mel.len().max(1);
-        let mut flat = Vec::with_capacity(NUM_MEL_BINS * total_frames);
-        for mel_idx in 0..NUM_MEL_BINS {
-            for frame in &log_mel {
-                flat.push(frame[mel_idx]);
-            }
-        }
-
-        let features = Tensor::from_vec(flat, (1, NUM_MEL_BINS, total_frames), device)?;
-        Ok((features, effective_frames.min(total_frames)))
-    }
-
-    fn stft(&self, waveform: &[f32]) -> Result<Vec<Vec<Complex<f32>>>> {
-        let mut planner = FftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(LFM25_AUDIO_INPUT_N_FFT);
-
         let padded = reflect_pad_center(waveform, LFM25_AUDIO_INPUT_N_FFT / 2);
-        let num_frames = if padded.len() >= LFM25_AUDIO_INPUT_N_FFT {
+        let total_frames = if padded.len() >= LFM25_AUDIO_INPUT_N_FFT {
             (padded.len() - LFM25_AUDIO_INPUT_N_FFT) / LFM25_AUDIO_INPUT_HOP_LENGTH + 1
         } else {
             1
         };
 
-        let mut frames = Vec::with_capacity(num_frames);
-        for frame_idx in 0..num_frames {
+        let mut log_mel = Vec::with_capacity(total_frames * NUM_MEL_BINS);
+        let mut frame = vec![Complex::<f32>::new(0.0, 0.0); LFM25_AUDIO_INPUT_N_FFT];
+        for frame_idx in 0..total_frames {
             let start = frame_idx * LFM25_AUDIO_INPUT_HOP_LENGTH;
-            let end = (start + LFM25_AUDIO_INPUT_N_FFT).min(padded.len());
+            let frame_len = padded
+                .len()
+                .saturating_sub(start)
+                .min(LFM25_AUDIO_INPUT_N_FFT);
+            for (sample_idx, slot) in frame.iter_mut().enumerate() {
+                if sample_idx < frame_len {
+                    slot.re = padded[start + sample_idx] * self.window[sample_idx];
+                } else {
+                    slot.re = 0.0;
+                }
+                slot.im = 0.0;
+            }
 
-            let mut frame: Vec<Complex<f32>> = padded[start..end]
-                .iter()
-                .zip(self.window.iter())
-                .map(|(&sample, &window)| Complex::new(sample * window, 0.0))
-                .collect();
-            frame.resize(LFM25_AUDIO_INPUT_N_FFT, Complex::new(0.0, 0.0));
-            fft.process(&mut frame);
-            frames.push(frame);
+            self.fft.process(&mut frame);
+            for filter in &self.mel_filterbank_spans {
+                let mut sum = 0.0f32;
+                for (offset, weight) in filter.weights.iter().copied().enumerate() {
+                    sum += frame[filter.start + offset].norm_sqr() * weight;
+                }
+                log_mel.push(sum.max(1e-10).ln());
+            }
+        }
+        normalize_flat_per_feature(&mut log_mel, total_frames, effective_frames, NUM_MEL_BINS);
+
+        let mut flat = Vec::with_capacity(NUM_MEL_BINS * total_frames);
+        for mel_idx in 0..NUM_MEL_BINS {
+            for frame_idx in 0..total_frames {
+                flat.push(log_mel[frame_idx * NUM_MEL_BINS + mel_idx]);
+            }
         }
 
-        Ok(frames)
-    }
-
-    fn power_spectrogram(&self, stft: &[Vec<Complex<f32>>]) -> Vec<Vec<f32>> {
-        stft.iter()
-            .map(|frame| {
-                frame[..LFM25_AUDIO_INPUT_N_FFT / 2 + 1]
-                    .iter()
-                    .map(|value| value.norm_sqr())
-                    .collect()
-            })
-            .collect()
-    }
-
-    fn apply_mel_filterbank(&self, power_spec: &[Vec<f32>]) -> Vec<Vec<f32>> {
-        power_spec
-            .iter()
-            .map(|frame| {
-                self.mel_filterbank
-                    .iter()
-                    .map(|mel_filter| {
-                        frame
-                            .iter()
-                            .zip(mel_filter.iter())
-                            .map(|(&power, &weight)| power * weight)
-                            .sum::<f32>()
-                    })
-                    .collect()
-            })
-            .collect()
-    }
-
-    fn log_mel(&self, mel_spec: &[Vec<f32>]) -> Vec<Vec<f32>> {
-        mel_spec
-            .iter()
-            .map(|frame| frame.iter().map(|&x| x.max(1e-10).ln()).collect())
-            .collect()
+        let features = Tensor::from_vec(flat, (1, NUM_MEL_BINS, total_frames), device)?;
+        Ok((features, effective_frames.min(total_frames)))
     }
 }
 
@@ -163,6 +137,46 @@ fn normalize_per_feature(log_mel: &mut [Vec<f32>], effective_frames: usize) {
         }
         for frame in &mut log_mel[usable_frames..] {
             frame[mel_idx] = 0.0;
+        }
+    }
+}
+
+fn normalize_flat_per_feature(
+    log_mel: &mut [f32],
+    total_frames: usize,
+    effective_frames: usize,
+    mel_bins: usize,
+) {
+    if total_frames == 0 || mel_bins == 0 {
+        return;
+    }
+
+    let usable_frames = effective_frames.min(total_frames).max(1);
+    for mel_idx in 0..mel_bins {
+        let mean = (0..usable_frames)
+            .map(|frame_idx| log_mel[frame_idx * mel_bins + mel_idx])
+            .sum::<f32>()
+            / usable_frames as f32;
+
+        let variance = if usable_frames > 1 {
+            (0..usable_frames)
+                .map(|frame_idx| {
+                    let delta = log_mel[frame_idx * mel_bins + mel_idx] - mean;
+                    delta * delta
+                })
+                .sum::<f32>()
+                / (usable_frames - 1) as f32
+        } else {
+            0.0
+        };
+        let inv_std = 1.0 / (variance + NORMALIZE_EPS).sqrt();
+
+        for frame_idx in 0..usable_frames {
+            let idx = frame_idx * mel_bins + mel_idx;
+            log_mel[idx] = (log_mel[idx] - mean) * inv_std;
+        }
+        for frame_idx in usable_frames..total_frames {
+            log_mel[frame_idx * mel_bins + mel_idx] = 0.0;
         }
     }
 }
@@ -227,6 +241,26 @@ fn create_mel_filterbank(
     }
 
     filters
+}
+
+fn sparse_mel_filterbank(filters: &[Vec<f32>]) -> Vec<MelFilterSpan> {
+    filters
+        .iter()
+        .map(|filter| {
+            let start = filter.iter().position(|weight| *weight != 0.0);
+            let end = filter.iter().rposition(|weight| *weight != 0.0);
+            match (start, end) {
+                (Some(start), Some(end)) if start <= end => MelFilterSpan {
+                    start,
+                    weights: filter[start..=end].to_vec(),
+                },
+                _ => MelFilterSpan {
+                    start: 0,
+                    weights: Vec::new(),
+                },
+            }
+        })
+        .collect()
 }
 
 fn reflect_pad_center(waveform: &[f32], pad: usize) -> Vec<f32> {
