@@ -3,12 +3,19 @@ use std::sync::Arc;
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{Embedding, Module};
 use candle_transformers::models::with_tracing::QMatMul;
-use candle_transformers::quantized_nn::RmsNorm;
 
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 
 use crate::error::{Error, Result};
-use crate::models::shared::telemetry::record_rope_kernel;
+use crate::kernels::{
+    try_fused_decode_gqa_attention, try_fused_qk_rms_norm, try_fused_rope_pair_bshd,
+    try_fused_silu_mul_with_status,
+};
+use crate::models::shared::telemetry::{
+    record_decode_attention_path, record_fused_attention_attempt, record_fused_attention_fallback,
+    record_fused_attention_success, record_rope_kernel, AttentionFallbackReason,
+    DecodeAttentionPath,
+};
 use crate::models::shared::weights::gguf::GgufLoader;
 
 use super::config::Lfm25AudioDecoderConfig;
@@ -176,9 +183,9 @@ impl Depthformer {
 }
 
 struct DepthformerBlock {
-    attn_norm: RmsNorm,
+    attn_norm: DepthRmsNorm,
     attn: DepthAttention,
-    ffn_norm: RmsNorm,
+    ffn_norm: DepthRmsNorm,
     mlp: DepthMlp,
 }
 
@@ -223,10 +230,37 @@ impl DepthformerBlock {
 struct DepthAttention {
     qkv: DepthQkvProjection,
     o_proj: QLinear,
-    q_norm: RmsNorm,
-    k_norm: RmsNorm,
+    q_norm: DepthRmsNorm,
+    k_norm: DepthRmsNorm,
+    qk_norm_weight: Tensor,
     cos: Tensor,
     sin: Tensor,
+    cos_sin: Tensor,
+}
+
+#[derive(Debug, Clone)]
+struct DepthRmsNorm {
+    weight: Tensor,
+    eps: f64,
+}
+
+impl DepthRmsNorm {
+    fn from_qtensor(weight: candle_core::quantized::QTensor, eps: f64) -> Result<Self> {
+        let weight = weight.dequantize(&weight.device()).map_err(Error::from)?;
+        Ok(Self { weight, eps })
+    }
+
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        candle_nn::ops::rms_norm(input, &self.weight, self.eps as f32).map_err(Error::from)
+    }
+
+    fn eps(&self) -> f64 {
+        self.eps
+    }
+
+    fn weight(&self) -> &Tensor {
+        &self.weight
+    }
 }
 
 enum DepthQkvProjection {
@@ -299,15 +333,19 @@ impl DepthAttention {
                 format!("depthformer.layers.{idx}.operator.attention.k_layernorm.weight"),
             ],
         )?;
+        let qk_norm_weight = Tensor::cat(&[q_norm.weight(), k_norm.weight()], 0)?.contiguous()?;
         let (cos, sin) =
             precompute_freqs(dim / DEPTHFORMER_HEADS, DEPTHFORMER_ROPE_BASE, 32, device)?;
+        let cos_sin = Tensor::cat(&[&cos, &sin], 1)?.contiguous()?;
         Ok(Self {
             qkv,
             o_proj,
             q_norm,
             k_norm,
+            qk_norm_weight,
             cos,
             sin,
+            cos_sin,
         })
     }
 
@@ -344,30 +382,50 @@ impl DepthAttention {
             ),
         };
 
-        // reshape [b, s, hidden] -> [b, s, heads, head_dim] then transpose to [b, heads, s, head_dim]
+        // reshape [b, s, hidden] -> [b, s, heads, head_dim]
         let q = q_hidden
             .reshape((batch, seq_len, DEPTHFORMER_HEADS, head_dim))?
-            .transpose(1, 2)?
             .contiguous()?;
         let k = k_hidden
             .reshape((batch, seq_len, DEPTHFORMER_KV_HEADS, head_dim))?
-            .transpose(1, 2)?
             .contiguous()?;
         let v = v_hidden
             .reshape((batch, seq_len, DEPTHFORMER_KV_HEADS, head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
 
-        // norm on last dim (head_dim), then RoPE — all in [b, h, s, d] layout
-        let q = self.q_norm.forward(&q)?;
-        let k = self.k_norm.forward(&k)?;
+        // norm on last dim (head_dim), then RoPE
+        let (q, k) = if seq_len == 1 && q.device().is_metal() {
+            if let Some((q, k)) =
+                try_fused_qk_rms_norm(&q, &k, &self.qk_norm_weight, self.q_norm.eps())
+            {
+                (q, k)
+            } else {
+                (self.q_norm.forward(&q)?, self.k_norm.forward(&k)?)
+            }
+        } else {
+            (self.q_norm.forward(&q)?, self.k_norm.forward(&k)?)
+        };
 
         let index_pos = cache
             .as_ref()
             .map(|(keys, _values)| keys.dim(2).unwrap_or(0))
             .unwrap_or(0);
-        let q = apply_rotary_emb(&q, &self.cos, &self.sin, index_pos)?;
-        let k = apply_rotary_emb(&k, &self.cos, &self.sin, index_pos)?;
+        let (q, k) = if let Some((q, k)) =
+            try_apply_rotary_emb_pair_bshd(&q, &k, &self.cos_sin, index_pos)?
+        {
+            (
+                q.transpose(1, 2)?.contiguous()?,
+                k.transpose(1, 2)?.contiguous()?,
+            )
+        } else {
+            let q = q.transpose(1, 2)?.contiguous()?;
+            let k = k.transpose(1, 2)?.contiguous()?;
+            (
+                apply_rotary_emb(&q, &self.cos, &self.sin, index_pos)?,
+                apply_rotary_emb(&k, &self.cos, &self.sin, index_pos)?,
+            )
+        };
 
         // KV cache in [b, h, s, d] layout — cat on dim 2 (seq)
         let (all_k, all_v): (Tensor, Tensor) = if let Some((old_k, old_v)) = cache.as_ref() {
@@ -376,6 +434,26 @@ impl DepthAttention {
             (k, v)
         };
         *cache = Some((all_k.clone(), all_v.clone()));
+
+        if batch == 1 && seq_len == 1 && q.device().is_metal() {
+            record_fused_attention_attempt();
+            if let Some(out) = try_fused_decode_gqa_attention(
+                &q.contiguous()?,
+                &all_k.contiguous()?,
+                &all_v.contiguous()?,
+                DEPTHFORMER_HEADS,
+                DEPTHFORMER_KV_HEADS,
+                head_dim,
+                (1.0f64 / (head_dim as f64).sqrt()) as f32,
+            ) {
+                record_fused_attention_success();
+                let out = out
+                    .transpose(1, 2)?
+                    .reshape((batch, seq_len, hidden_size))?;
+                return self.o_proj.forward(&out);
+            }
+            record_fused_attention_fallback(AttentionFallbackReason::UnsupportedBackend);
+        }
 
         // GQA repeat_kv directly on [b, h, s, d] layout
         let (key, value) = if DEPTHFORMER_HEADS != DEPTHFORMER_KV_HEADS {
@@ -387,6 +465,9 @@ impl DepthAttention {
         } else {
             (all_k, all_v)
         };
+        if seq_len == 1 {
+            record_decode_attention_path(DecodeAttentionPath::Dense);
+        }
         let scores = (q.matmul(&key.transpose(2, 3)?.contiguous()?)?
             / ((hidden_size / DEPTHFORMER_HEADS) as f64).sqrt())?;
         let scores = causal_mask(scores, index_pos)?;
@@ -439,15 +520,21 @@ impl DepthMlp {
     }
 
     fn forward(&self, hidden: &Tensor) -> Result<Tensor> {
-        let gate = candle_nn::ops::silu(&self.w1.forward(hidden)?)?;
+        let gate = self.w1.forward(hidden)?;
         let up = self.w3.forward(hidden)?;
-        self.w2.forward(&(&gate * &up)?)
+        let hidden = if let Some(fused) = try_fused_silu_mul_with_status(&gate, &up) {
+            fused.tensor
+        } else {
+            let gate = candle_nn::ops::silu(&gate)?;
+            gate.broadcast_mul(&up)?
+        };
+        self.w2.forward(&hidden)
     }
 }
 
 struct CodebookEmbeddingHead {
     embedding: Embedding,
-    norm: RmsNorm,
+    norm: DepthRmsNorm,
     to_logits: QLinear,
 }
 
@@ -537,12 +624,15 @@ fn load_embedding_any(loader: &GgufLoader, device: &Device, names: &[String]) ->
     Ok(Embedding::new(weight, dim))
 }
 
-fn load_rms_norm_any(loader: &GgufLoader, device: &Device, names: &[String]) -> Result<RmsNorm> {
-    RmsNorm::from_qtensor(
+fn load_rms_norm_any(
+    loader: &GgufLoader,
+    device: &Device,
+    names: &[String],
+) -> Result<DepthRmsNorm> {
+    DepthRmsNorm::from_qtensor(
         load_qtensor_any(loader, device, names)?,
         DEPTHFORMER_NORM_EPS,
     )
-    .map_err(Error::from)
 }
 
 fn load_qtensor_any(
@@ -599,6 +689,22 @@ fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor, index_pos: usize) ->
     let sin = sin.narrow(0, index_pos, seq_len)?;
     record_rope_kernel();
     candle_nn::rotary_emb::rope(&x.contiguous()?, &cos, &sin).map_err(Error::from)
+}
+
+fn try_apply_rotary_emb_pair_bshd(
+    q: &Tensor,
+    k: &Tensor,
+    cos_sin: &Tensor,
+    index_pos: usize,
+) -> Result<Option<(Tensor, Tensor)>> {
+    let (_, seq_len, _, _) = q.dims4()?;
+    let packed = cos_sin.narrow(0, index_pos, seq_len)?.contiguous()?;
+    if let Some((q, k)) = try_fused_rope_pair_bshd(&q.contiguous()?, &k.contiguous()?, &packed) {
+        record_rope_kernel();
+        record_rope_kernel();
+        return Ok(Some((q, k)));
+    }
+    Ok(None)
 }
 
 fn causal_mask(scores: Tensor, index_pos: usize) -> Result<Tensor> {

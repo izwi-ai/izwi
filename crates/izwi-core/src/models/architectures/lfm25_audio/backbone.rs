@@ -4,15 +4,22 @@ use std::sync::Arc;
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{Conv1d, Conv1dConfig, Embedding, Module};
 use candle_transformers::models::with_tracing::QMatMul;
-use candle_transformers::quantized_nn::RmsNorm;
 
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 
 use crate::error::{Error, Result};
+use crate::kernels::{
+    try_fused_decode_gqa_attention, try_fused_qk_rms_norm, try_fused_rope_pair_bshd,
+    try_fused_silu_mul_with_status,
+};
 use crate::models::shared::attention::flash::{
     flash_attention_requested, try_fused_self_attention_with_options, CudaFlashAttentionOptions,
 };
-use crate::models::shared::telemetry::record_rope_kernel;
+use crate::models::shared::telemetry::{
+    record_decode_attention_path, record_fused_attention_attempt, record_fused_attention_fallback,
+    record_fused_attention_success, record_rope_kernel, AttentionFallbackReason,
+    DecodeAttentionPath,
+};
 use crate::models::shared::weights::gguf::GgufLoader;
 
 use super::config::Lfm2BackboneConfig;
@@ -30,14 +37,16 @@ struct AttentionLayer {
     wk: QMatMul,
     wv: QMatMul,
     wo: QMatMul,
-    q_norm: RmsNorm,
-    k_norm: RmsNorm,
+    q_norm: LfmRmsNorm,
+    k_norm: LfmRmsNorm,
+    qk_norm_weight: Tensor,
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
     sliding_window: Option<usize>,
     cos: Tensor,
     sin: Tensor,
+    cos_sin: Tensor,
     neg_inf: Tensor,
     kv_cache: Option<(Tensor, Tensor)>,
 }
@@ -59,8 +68,8 @@ enum LayerKind {
 
 #[derive(Debug)]
 struct LayerWeights {
-    operator_norm: RmsNorm,
-    ffn_norm: RmsNorm,
+    operator_norm: LfmRmsNorm,
+    ffn_norm: LfmRmsNorm,
     mlp: Mlp,
     kind: LayerKind,
 }
@@ -76,9 +85,34 @@ pub struct QuantizedLfm2Backbone {
     token_embeddings: Embedding,
     output_head: ProjectionHead,
     layers: Vec<LayerWeights>,
-    norm: RmsNorm,
+    norm: LfmRmsNorm,
     masks: HashMap<usize, Tensor>,
     vocab_size: usize,
+}
+
+#[derive(Debug, Clone)]
+struct LfmRmsNorm {
+    weight: Tensor,
+    eps: f64,
+}
+
+impl LfmRmsNorm {
+    fn from_qtensor(weight: candle_core::quantized::QTensor, eps: f64) -> Result<Self> {
+        let weight = weight.dequantize(&weight.device()).map_err(Error::from)?;
+        Ok(Self { weight, eps })
+    }
+
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        candle_nn::ops::rms_norm(input, &self.weight, self.eps as f32).map_err(Error::from)
+    }
+
+    fn eps(&self) -> f64 {
+        self.eps
+    }
+
+    fn weight(&self) -> &Tensor {
+        &self.weight
+    }
 }
 
 impl Mlp {
@@ -120,9 +154,15 @@ impl Mlp {
     }
 
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
-        let gate = candle_nn::ops::silu(&self.gate.forward(hidden_states)?)?;
+        let gate = self.gate.forward(hidden_states)?;
         let up = self.up.forward(hidden_states)?;
-        self.down.forward(&(&gate * &up)?).map_err(Error::from)
+        let hidden = if let Some(fused) = try_fused_silu_mul_with_status(&gate, &up) {
+            fused.tensor
+        } else {
+            let gate = candle_nn::ops::silu(&gate)?;
+            gate.broadcast_mul(&up)?
+        };
+        self.down.forward(&hidden).map_err(Error::from)
     }
 }
 
@@ -133,6 +173,23 @@ impl AttentionLayer {
         let sin = self.sin.narrow(0, index_pos, seq_len)?;
         record_rope_kernel();
         candle_nn::rotary_emb::rope(&x.contiguous()?, &cos, &sin).map_err(Error::from)
+    }
+
+    fn try_apply_rotary_emb_pair_bshd(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        index_pos: usize,
+    ) -> Result<Option<(Tensor, Tensor)>> {
+        let (_, seq_len, _, _) = q.dims4()?;
+        let packed = self.cos_sin.narrow(0, index_pos, seq_len)?.contiguous()?;
+        if let Some((q, k)) = try_fused_rope_pair_bshd(&q.contiguous()?, &k.contiguous()?, &packed)
+        {
+            record_rope_kernel();
+            record_rope_kernel();
+            return Ok(Some((q, k)));
+        }
+        Ok(None)
     }
 
     fn forward(
@@ -162,14 +219,45 @@ impl AttentionLayer {
             self.head_dim,
         ))?;
 
-        let query_states = query_states.transpose(1, 2)?.contiguous()?;
-        let key_states = key_states.transpose(1, 2)?.contiguous()?;
         let value_states = value_states.transpose(1, 2)?.contiguous()?;
 
-        let query_states = self.q_norm.forward(&query_states)?;
-        let key_states = self.k_norm.forward(&key_states)?;
-        let query_states = self.apply_rotary_emb(&query_states, index_pos)?;
-        let key_states = self.apply_rotary_emb(&key_states, index_pos)?;
+        let query_states = query_states.contiguous()?;
+        let key_states = key_states.contiguous()?;
+        let (query_states, key_states) = if seq_len == 1 && query_states.device().is_metal() {
+            if let Some((query_states, key_states)) = try_fused_qk_rms_norm(
+                &query_states,
+                &key_states,
+                &self.qk_norm_weight,
+                self.q_norm.eps(),
+            ) {
+                (query_states, key_states)
+            } else {
+                (
+                    self.q_norm.forward(&query_states)?,
+                    self.k_norm.forward(&key_states)?,
+                )
+            }
+        } else {
+            (
+                self.q_norm.forward(&query_states)?,
+                self.k_norm.forward(&key_states)?,
+            )
+        };
+        let (query_states, key_states) = if let Some((query_states, key_states)) =
+            self.try_apply_rotary_emb_pair_bshd(&query_states, &key_states, index_pos)?
+        {
+            (
+                query_states.transpose(1, 2)?.contiguous()?,
+                key_states.transpose(1, 2)?.contiguous()?,
+            )
+        } else {
+            let query_states = query_states.transpose(1, 2)?.contiguous()?;
+            let key_states = key_states.transpose(1, 2)?.contiguous()?;
+            (
+                self.apply_rotary_emb(&query_states, index_pos)?,
+                self.apply_rotary_emb(&key_states, index_pos)?,
+            )
+        };
 
         let (all_keys, all_values) = if let Some((cached_keys, cached_values)) = &self.kv_cache {
             if index_pos == 0 {
@@ -205,6 +293,27 @@ impl AttentionLayer {
             }
         }
 
+        if batch_size == 1 && seq_len == 1 && mask.is_none() && query_states.device().is_metal() {
+            record_fused_attention_attempt();
+            if let Some(attn_output) = try_fused_decode_gqa_attention(
+                &query_states.contiguous()?,
+                &all_keys.contiguous()?,
+                &all_values.contiguous()?,
+                self.n_head,
+                self.n_kv_head,
+                self.head_dim,
+                (1.0f64 / (self.head_dim as f64).sqrt()) as f32,
+            ) {
+                record_fused_attention_success();
+                let attn_output =
+                    attn_output
+                        .transpose(1, 2)?
+                        .reshape((batch_size, seq_len, hidden_size))?;
+                return self.wo.forward(&attn_output).map_err(Error::from);
+            }
+            record_fused_attention_fallback(AttentionFallbackReason::UnsupportedBackend);
+        }
+
         let (key_states, value_states) = if self.n_head != self.n_kv_head {
             let repeats = self.n_head / self.n_kv_head;
             (
@@ -223,6 +332,9 @@ impl AttentionLayer {
         } else {
             attn_weights
         };
+        if seq_len == 1 {
+            record_decode_attention_path(DecodeAttentionPath::Dense);
+        }
         let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
         let attn_output = attn_weights
             .contiguous()?
@@ -379,6 +491,7 @@ impl QuantizedLfm2Backbone {
             cfg.context_length,
             device,
         )?;
+        let cos_sin = Tensor::cat(&[&cos, &sin], 1)?.contiguous()?;
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
 
         let token_embedding_q = load_qtensor_any(
@@ -403,7 +516,7 @@ impl QuantizedLfm2Backbone {
         }
 
         let token_embeddings = Embedding::new(token_embeddings_weight, hidden_size);
-        let norm = RmsNorm::from_qtensor(
+        let norm = LfmRmsNorm::from_qtensor(
             load_qtensor_any(
                 loader,
                 device,
@@ -417,15 +530,14 @@ impl QuantizedLfm2Backbone {
                 ],
             )?,
             cfg.attention_layer_norm_rms_epsilon,
-        )
-        .map_err(Error::from)?;
+        )?;
         let output_head = ProjectionHead::load(loader, device)?;
 
         let mut layers = Vec::with_capacity(cfg.block_count);
         for layer_idx in 0..cfg.block_count {
             let prefix = format!("blk.{layer_idx}");
             let legacy_prefix = format!("lfm.layers.{layer_idx}");
-            let operator_norm = RmsNorm::from_qtensor(
+            let operator_norm = LfmRmsNorm::from_qtensor(
                 load_qtensor_any(
                     loader,
                     device,
@@ -437,9 +549,8 @@ impl QuantizedLfm2Backbone {
                     ],
                 )?,
                 cfg.attention_layer_norm_rms_epsilon,
-            )
-            .map_err(Error::from)?;
-            let ffn_norm = RmsNorm::from_qtensor(
+            )?;
+            let ffn_norm = LfmRmsNorm::from_qtensor(
                 load_qtensor_any(
                     loader,
                     device,
@@ -450,8 +561,7 @@ impl QuantizedLfm2Backbone {
                     ],
                 )?,
                 cfg.attention_layer_norm_rms_epsilon,
-            )
-            .map_err(Error::from)?;
+            )?;
             let mlp =
                 Mlp::load_with_prefixes(loader, device, &[prefix.clone(), legacy_prefix.clone()])?;
 
@@ -463,6 +573,34 @@ impl QuantizedLfm2Backbone {
                 > 0;
             let kind = if is_attention {
                 let n_kv_head = cfg.attention_head_count_kv[layer_idx];
+                let q_norm = LfmRmsNorm::from_qtensor(
+                    load_qtensor_any(
+                        loader,
+                        device,
+                        &[
+                            format!("{prefix}.attn_q_norm.weight"),
+                            format!("{prefix}.self_attn.q_layernorm.weight"),
+                            format!("{prefix}.attention.q_norm.weight"),
+                            format!("{legacy_prefix}.self_attn.q_layernorm.weight"),
+                        ],
+                    )?,
+                    cfg.attention_layer_norm_rms_epsilon,
+                )?;
+                let k_norm = LfmRmsNorm::from_qtensor(
+                    load_qtensor_any(
+                        loader,
+                        device,
+                        &[
+                            format!("{prefix}.attn_k_norm.weight"),
+                            format!("{prefix}.self_attn.k_layernorm.weight"),
+                            format!("{prefix}.attention.k_norm.weight"),
+                            format!("{legacy_prefix}.self_attn.k_layernorm.weight"),
+                        ],
+                    )?,
+                    cfg.attention_layer_norm_rms_epsilon,
+                )?;
+                let qk_norm_weight =
+                    Tensor::cat(&[q_norm.weight(), k_norm.weight()], 0)?.contiguous()?;
                 LayerKind::Attention(AttentionLayer {
                     wq: load_qmatmul_any(
                         loader,
@@ -500,40 +638,16 @@ impl QuantizedLfm2Backbone {
                             format!("{legacy_prefix}.self_attn.out_proj.weight"),
                         ],
                     )?,
-                    q_norm: RmsNorm::from_qtensor(
-                        load_qtensor_any(
-                            loader,
-                            device,
-                            &[
-                                format!("{prefix}.attn_q_norm.weight"),
-                                format!("{prefix}.self_attn.q_layernorm.weight"),
-                                format!("{prefix}.attention.q_norm.weight"),
-                                format!("{legacy_prefix}.self_attn.q_layernorm.weight"),
-                            ],
-                        )?,
-                        cfg.attention_layer_norm_rms_epsilon,
-                    )
-                    .map_err(Error::from)?,
-                    k_norm: RmsNorm::from_qtensor(
-                        load_qtensor_any(
-                            loader,
-                            device,
-                            &[
-                                format!("{prefix}.attn_k_norm.weight"),
-                                format!("{prefix}.self_attn.k_layernorm.weight"),
-                                format!("{prefix}.attention.k_norm.weight"),
-                                format!("{legacy_prefix}.self_attn.k_layernorm.weight"),
-                            ],
-                        )?,
-                        cfg.attention_layer_norm_rms_epsilon,
-                    )
-                    .map_err(Error::from)?,
+                    q_norm,
+                    k_norm,
+                    qk_norm_weight,
                     n_head: cfg.attention_head_count,
                     n_kv_head,
                     head_dim: cfg.embedding_length / cfg.attention_head_count,
                     sliding_window: cfg.attention_sliding_window,
                     cos: cos.clone(),
                     sin: sin.clone(),
+                    cos_sin: cos_sin.clone(),
                     neg_inf: neg_inf.clone(),
                     kv_cache: None,
                 })
