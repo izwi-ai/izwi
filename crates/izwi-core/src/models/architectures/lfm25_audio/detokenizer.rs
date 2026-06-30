@@ -1,9 +1,9 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{Embedding, Module};
 use rustfft::num_complex::Complex;
-use rustfft::FftPlanner;
+use rustfft::{Fft, FftPlanner};
 
 use crate::error::{Error, Result};
 use crate::models::shared::weights::gguf::GgufLoader;
@@ -15,6 +15,8 @@ pub struct Lfm25AudioDetokenizer {
     fused_embedding: Embedding,
     backbone: Mutex<QuantizedLfm2Backbone>,
     istft_window: Vec<f32>,
+    istft_window_sq: Vec<f32>,
+    ifft: Arc<dyn Fft<f32>>,
     upsample_factor: usize,
     n_fft: usize,
     hop_length: usize,
@@ -30,13 +32,8 @@ impl Lfm25AudioDetokenizer {
         decoder_config: &Lfm25AudioDecoderConfig,
         device: &Device,
     ) -> Result<Self> {
-        let fused_embedding = load_embedding_any(
-            decoder_loader,
-            device,
-            &[
-                "emb.emb.weight".to_string(),
-            ],
-        )?;
+        let fused_embedding =
+            load_embedding_any(decoder_loader, device, &["emb.emb.weight".to_string()])?;
         let backbone = QuantizedLfm2Backbone::load(backbone_loader, backbone_config, device)?;
         let istft_window = load_vector_any(
             decoder_loader,
@@ -45,6 +42,12 @@ impl Lfm25AudioDetokenizer {
             decoder_config.output_n_fft,
         )?
         .to_vec1::<f32>()?;
+        let istft_window_sq = istft_window
+            .iter()
+            .map(|value| value * value)
+            .collect::<Vec<_>>();
+        let mut planner = FftPlanner::<f32>::new();
+        let ifft = planner.plan_fft_inverse(decoder_config.output_n_fft);
         let codebook_offsets = (0..decoder_config.codebooks)
             .map(|idx| {
                 u32::try_from(idx * (LFM25_AUDIO_AUDIO_VOCAB_SIZE - 1)).map_err(|_| {
@@ -59,6 +62,8 @@ impl Lfm25AudioDetokenizer {
             fused_embedding,
             backbone: Mutex::new(backbone),
             istft_window,
+            istft_window_sq,
+            ifft,
             upsample_factor: decoder_config.detokenizer_upsample_factor,
             n_fft: decoder_config.output_n_fft,
             hop_length: decoder_config.output_hop_length,
@@ -136,7 +141,7 @@ impl Lfm25AudioDetokenizer {
 
     fn projected_to_waveform(&self, projected: &Tensor) -> Result<Vec<f32>> {
         let projected = projected.i(0)?.to_dtype(DType::F32)?;
-        let (frames, width) = projected.dims2()?;
+        let (_frames, width) = projected.dims2()?;
         let freq_bins = self.n_fft / 2 + 1;
         if width != freq_bins * 2 {
             return Err(Error::InferenceError(format!(
@@ -145,27 +150,12 @@ impl Lfm25AudioDetokenizer {
             )));
         }
 
-        let log_abs = projected.narrow(1, 0, freq_bins)?.to_vec2::<f32>()?;
-        let angle = projected
-            .narrow(1, freq_bins, freq_bins)?
-            .to_vec2::<f32>()?;
-
-        let mut spectrum = vec![vec![Complex::<f32>::new(0.0, 0.0); frames]; freq_bins];
-        for frame_idx in 0..frames {
-            for freq_idx in 0..freq_bins {
-                spectrum[freq_idx][frame_idx] = Complex::from_polar(
-                    log_abs[frame_idx][freq_idx].exp(),
-                    angle[frame_idx][freq_idx],
-                );
-            }
-        }
-
-        self.istft_same(&spectrum)
+        let projected = projected.to_vec2::<f32>()?;
+        self.istft_same(&projected, freq_bins)
     }
 
-    fn istft_same(&self, spectrum: &[Vec<Complex<f32>>]) -> Result<Vec<f32>> {
-        let freq_bins = spectrum.len();
-        let frames = spectrum.first().map(Vec::len).unwrap_or(0);
+    fn istft_same(&self, projected: &[Vec<f32>], freq_bins: usize) -> Result<Vec<f32>> {
+        let frames = projected.len();
         if freq_bins != self.n_fft / 2 + 1 || frames == 0 {
             return Ok(Vec::new());
         }
@@ -174,26 +164,26 @@ impl Lfm25AudioDetokenizer {
         let output_size = (frames - 1) * self.hop_length + self.n_fft;
         let mut output = vec![0.0f32; output_size];
         let mut envelope = vec![0.0f32; output_size];
-
-        let mut planner = FftPlanner::<f32>::new();
-        let ifft = planner.plan_fft_inverse(self.n_fft);
+        let mut full = vec![Complex::<f32>::new(0.0, 0.0); self.n_fft];
 
         for frame_idx in 0..frames {
-            let mut full = vec![Complex::<f32>::new(0.0, 0.0); self.n_fft];
+            full.fill(Complex::new(0.0, 0.0));
+            let frame = &projected[frame_idx];
             for freq_idx in 0..freq_bins {
-                full[freq_idx] = spectrum[freq_idx][frame_idx];
+                full[freq_idx] =
+                    Complex::from_polar(frame[freq_idx].exp(), frame[freq_bins + freq_idx]);
             }
             for freq_idx in 1..(freq_bins - 1) {
-                full[self.n_fft - freq_idx] = spectrum[freq_idx][frame_idx].conj();
+                full[self.n_fft - freq_idx] = full[freq_idx].conj();
             }
 
-            ifft.process(&mut full);
+            self.ifft.process(&mut full);
             for sample_idx in 0..self.n_fft {
                 let sample =
                     full[sample_idx].re / self.n_fft as f32 * self.istft_window[sample_idx];
                 let out_idx = frame_idx * self.hop_length + sample_idx;
                 output[out_idx] += sample;
-                envelope[out_idx] += self.istft_window[sample_idx] * self.istft_window[sample_idx];
+                envelope[out_idx] += self.istft_window_sq[sample_idx];
             }
         }
 
