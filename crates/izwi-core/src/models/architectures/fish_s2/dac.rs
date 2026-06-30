@@ -6,6 +6,7 @@ use candle_nn::{
     Linear, Module, RmsNorm, VarBuilder,
 };
 
+use crate::audio::resample_mono_high_quality;
 use crate::error::{Error, Result};
 use crate::models::architectures::fish_s2::codec::fuse_weight_norm_dim0;
 use crate::models::architectures::fish_s2::contracts::FishS2DacContract;
@@ -15,6 +16,10 @@ use crate::models::architectures::qwen3::core::{build_rope_cache, causal_mask, r
 #[derive(Debug, Clone, PartialEq)]
 pub struct FishS2DacConfig {
     pub sample_rate: u32,
+    pub encoder_dim: usize,
+    pub encoder_rates: Vec<usize>,
+    pub encoder_transformer_layers: Vec<usize>,
+    pub encoder_window_size: usize,
     pub latent_dim: usize,
     pub decoder_dim: usize,
     pub decoder_rates: Vec<usize>,
@@ -35,6 +40,7 @@ pub struct FishS2DacConfig {
 
 pub struct FishS2DacDecoder {
     config: FishS2DacConfig,
+    encoder: FishS2DacAudioEncoder,
     quantizer: FishS2DownsampleResidualVectorQuantizer,
     decoder: FishS2DacAudioDecoder,
 }
@@ -42,6 +48,8 @@ pub struct FishS2DacDecoder {
 struct FishS2DownsampleResidualVectorQuantizer {
     semantic_quantizer: FishS2ResidualVectorQuantizer,
     residual_quantizer: FishS2ResidualVectorQuantizer,
+    downsample: Vec<FishS2DownsampleBlock>,
+    pre_module: FishS2WindowLimitedTransformer,
     post_module: FishS2WindowLimitedTransformer,
     upsample: Vec<FishS2UpsampleBlock>,
 }
@@ -56,9 +64,28 @@ struct FishS2VectorQuantizer {
     codebook: Embedding,
 }
 
+struct FishS2DownsampleBlock {
+    conv: FishS2CausalConv1d,
+    convnext: FishS2ConvNeXtBlock,
+}
+
 struct FishS2UpsampleBlock {
     transposed: FishS2CausalConvTranspose1d,
     convnext: FishS2ConvNeXtBlock,
+}
+
+struct FishS2DacAudioEncoder {
+    first: FishS2CausalConv1d,
+    blocks: Vec<FishS2EncoderBlock>,
+    final_snake: FishS2Snake1d,
+    final_conv: FishS2CausalConv1d,
+}
+
+struct FishS2EncoderBlock {
+    residuals: Vec<FishS2ResidualUnit>,
+    snake: FishS2Snake1d,
+    conv: FishS2CausalConv1d,
+    transformer: Option<FishS2WindowLimitedTransformer>,
 }
 
 struct FishS2ConvNeXtBlock {
@@ -140,11 +167,28 @@ struct FishS2DacFeedForward {
     w3: Linear,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct FishS2DacTransformerParams {
+    dim: usize,
+    layers: usize,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    intermediate: usize,
+    window_size: usize,
+    rope_theta: f64,
+    rms_norm_eps: f64,
+}
+
 impl FishS2DacConfig {
     pub fn current() -> Self {
         let contract = FishS2DacContract::CURRENT;
         Self {
             sample_rate: contract.sample_rate,
+            encoder_dim: 64,
+            encoder_rates: contract.encoder_rates.to_vec(),
+            encoder_transformer_layers: vec![0, 0, 0, 4],
+            encoder_window_size: 512,
             latent_dim: 1024,
             decoder_dim: 1536,
             decoder_rates: contract.decoder_rates.to_vec(),
@@ -182,12 +226,50 @@ impl FishS2DacConfig {
     }
 }
 
+impl FishS2DacTransformerParams {
+    fn quantizer_post(config: &FishS2DacConfig) -> Self {
+        Self {
+            dim: config.transformer_heads * config.transformer_head_dim,
+            layers: config.transformer_layers,
+            heads: config.transformer_heads,
+            kv_heads: config.transformer_kv_heads,
+            head_dim: config.transformer_head_dim,
+            intermediate: config.transformer_intermediate,
+            window_size: config.transformer_window_size,
+            rope_theta: config.rope_theta,
+            rms_norm_eps: config.rms_norm_eps,
+        }
+    }
+
+    fn encoder_stage(
+        dim: usize,
+        layers: usize,
+        window_size: usize,
+        config: &FishS2DacConfig,
+    ) -> Self {
+        let heads = (dim / config.transformer_head_dim).max(1);
+        Self {
+            dim,
+            layers,
+            heads,
+            kv_heads: heads,
+            head_dim: config.transformer_head_dim,
+            intermediate: dim * 3,
+            window_size,
+            rope_theta: config.rope_theta,
+            rms_norm_eps: config.rms_norm_eps,
+        }
+    }
+}
+
 impl FishS2DacDecoder {
     pub fn load(config: FishS2DacConfig, vb: VarBuilder) -> Result<Self> {
+        let encoder = FishS2DacAudioEncoder::load(&config, vb.pp("encoder"))?;
         let quantizer = FishS2DownsampleResidualVectorQuantizer::load(&config, vb.pp("quantizer"))?;
         let decoder = FishS2DacAudioDecoder::load(&config, vb.pp("decoder"))?;
         Ok(Self {
             config,
+            encoder,
             quantizer,
             decoder,
         })
@@ -212,8 +294,36 @@ impl FishS2DacDecoder {
         self.decoder.forward(&latents)?.tanh().map_err(Error::from)
     }
 
+    pub fn encode_reference_audio(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> Result<FishS2VqCodes> {
+        let prepared = prepare_reference_samples(samples, sample_rate, &self.config)?;
+        let device = self.encoder_device()?;
+        let frames = prepared.len();
+        let audio = Tensor::from_vec(prepared, (1, 1, frames), device)?;
+        let codes = self.encode_tensor(&audio)?;
+        tensor_to_vq_codes(&codes, &self.config)
+    }
+
+    pub fn encode_tensor(&self, audio: &Tensor) -> Result<Tensor> {
+        if audio.rank() != 3 || audio.dim(1)? != 1 {
+            return Err(Error::AudioError(format!(
+                "Fish S2 DAC encoder expects audio shape [B, 1, T], got {:?}",
+                audio.dims()
+            )));
+        }
+        let z = self.encoder.forward(audio)?;
+        self.quantizer.encode(&z, &self.config)
+    }
+
     fn decoder_device(&self) -> Result<&candle_core::Device> {
         Ok(self.decoder.final_conv.conv.weight().device())
+    }
+
+    fn encoder_device(&self) -> Result<&candle_core::Device> {
+        Ok(self.encoder.first.conv.weight().device())
     }
 }
 
@@ -233,17 +343,34 @@ impl FishS2DownsampleResidualVectorQuantizer {
             config.codebook_dim,
             vb.pp("quantizer"),
         )?;
+        let dims = std::iter::once(config.latent_dim)
+            .chain(std::iter::repeat(config.latent_dim).take(config.downsample_factors.len()))
+            .collect::<Vec<_>>();
+        let mut downsample = Vec::with_capacity(config.downsample_factors.len());
+        for (idx, factor) in config.downsample_factors.iter().copied().enumerate() {
+            downsample.push(FishS2DownsampleBlock::load(
+                dims[idx],
+                dims[idx + 1],
+                factor,
+                vb.pp(format!("downsample.{idx}")),
+            )?);
+        }
+        let post_params = FishS2DacTransformerParams::quantizer_post(config);
+        let pre_module = FishS2WindowLimitedTransformer::load(
+            config.latent_dim,
+            config.latent_dim,
+            &post_params,
+            true,
+            vb.pp("pre_module"),
+        )?;
         let post_module = FishS2WindowLimitedTransformer::load(
             config.latent_dim,
             config.latent_dim,
-            config,
+            &post_params,
             true,
             vb.pp("post_module"),
         )?;
 
-        let dims = std::iter::once(config.latent_dim)
-            .chain(std::iter::repeat(config.latent_dim).take(config.downsample_factors.len()))
-            .collect::<Vec<_>>();
         let mut upsample = Vec::with_capacity(config.downsample_factors.len());
         for (out_idx, (idx, factor)) in config
             .downsample_factors
@@ -264,9 +391,33 @@ impl FishS2DownsampleResidualVectorQuantizer {
         Ok(Self {
             semantic_quantizer,
             residual_quantizer,
+            downsample,
+            pre_module,
             post_module,
             upsample,
         })
+    }
+
+    fn encode(&self, z: &Tensor, config: &FishS2DacConfig) -> Result<Tensor> {
+        let mut hidden = z.clone();
+        for block in &self.downsample {
+            hidden = block.forward(&hidden)?;
+        }
+        hidden = self.pre_module.forward(&hidden)?;
+        let (semantic_z, semantic_codes) = self.semantic_quantizer.encode(&hidden)?;
+        let residual_input = hidden.broadcast_sub(&semantic_z)?;
+        let (_residual_z, residual_codes) = self.residual_quantizer.encode(&residual_input)?;
+        if semantic_codes.len() != 1 || residual_codes.len() != config.residual_codebooks {
+            return Err(Error::InferenceError(
+                "Fish S2 DAC quantizer produced an unexpected codebook count".to_string(),
+            ));
+        }
+        let mut code_tensors = Vec::with_capacity(config.num_codebooks());
+        code_tensors.push(semantic_codes[0].unsqueeze(1)?);
+        for code in residual_codes {
+            code_tensors.push(code.unsqueeze(1)?);
+        }
+        Tensor::cat(&code_tensors, 1).map_err(Error::from)
     }
 
     fn decode(&self, codes: &Tensor, config: &FishS2DacConfig) -> Result<Tensor> {
@@ -330,6 +481,25 @@ impl FishS2ResidualVectorQuantizer {
         }
         sum.ok_or_else(|| Error::AudioError("Fish S2 DAC has no quantizers".to_string()))
     }
+
+    fn encode(&self, z: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
+        let mut residual = z.clone();
+        let mut sum: Option<Tensor> = None;
+        let mut codes = Vec::with_capacity(self.quantizers.len());
+        for quantizer in &self.quantizers {
+            let (z_q_i, indices_i) = quantizer.encode(&residual)?;
+            sum = Some(match sum {
+                Some(current) => current.broadcast_add(&z_q_i)?,
+                None => z_q_i.clone(),
+            });
+            residual = residual.broadcast_sub(&z_q_i)?;
+            codes.push(indices_i);
+        }
+        let sum = sum.ok_or_else(|| {
+            Error::AudioError("Fish S2 DAC cannot encode with no quantizers".to_string())
+        })?;
+        Ok((sum, codes))
+    }
 }
 
 impl FishS2VectorQuantizer {
@@ -351,11 +521,42 @@ impl FishS2VectorQuantizer {
     }
 
     fn decode_code(&self, codes: &Tensor) -> Result<Tensor> {
-        let _ = &self.in_proj;
         self.codebook
             .forward(codes)?
             .transpose(1, 2)
             .map_err(Error::from)
+    }
+
+    fn encode(&self, z: &Tensor) -> Result<(Tensor, Tensor)> {
+        let z_e = self.in_proj.forward(z)?;
+        let (z_p, indices) = self.decode_latents(&z_e)?;
+        let z_q = self.out_proj.forward(&z_p)?;
+        Ok((z_q, indices))
+    }
+
+    fn decode_latents(&self, latents: &Tensor) -> Result<(Tensor, Tensor)> {
+        let (batch, dim, frames) = latents.dims3()?;
+        let encodings = latents.transpose(1, 2)?.reshape((batch * frames, dim))?;
+        let encodings = l2_normalize_last_dim(&encodings)?;
+        let codebook = l2_normalize_last_dim(self.codebook.embeddings())?;
+        let mut dist = encodings.sqr()?.sum_keepdim(1)?;
+        dist = dist.broadcast_sub(&(encodings.matmul(&codebook.t()?)? * 2.0)?)?;
+        dist = dist.broadcast_add(&codebook.sqr()?.sum_keepdim(1)?.t()?)?;
+        let indices = dist.argmin(1)?.reshape((batch, frames))?;
+        let z_q = self.decode_code(&indices)?;
+        Ok((z_q, indices))
+    }
+}
+
+impl FishS2DownsampleBlock {
+    fn load(in_dim: usize, out_dim: usize, factor: usize, vb: VarBuilder) -> Result<Self> {
+        let conv = FishS2CausalConv1d::load(in_dim, out_dim, factor, factor, 1, vb.pp("0"))?;
+        let convnext = FishS2ConvNeXtBlock::load(out_dim, vb.pp("1"))?;
+        Ok(Self { conv, convnext })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.convnext.forward(&self.conv.forward(x)?)
     }
 }
 
@@ -406,6 +607,120 @@ impl FishS2ConvNeXtBlock {
         }
         hidden = hidden.transpose(1, 2)?;
         residual.broadcast_add(&hidden).map_err(Error::from)
+    }
+}
+
+impl FishS2DacAudioEncoder {
+    fn load(config: &FishS2DacConfig, vb: VarBuilder) -> Result<Self> {
+        if config.encoder_rates.len() != config.encoder_transformer_layers.len() {
+            return Err(Error::ConfigError(format!(
+                "Fish S2 DAC encoder rate count {} does not match transformer layer count {}",
+                config.encoder_rates.len(),
+                config.encoder_transformer_layers.len()
+            )));
+        }
+        let vb = vb.pp("block");
+        let first = FishS2CausalConv1d::load(1, config.encoder_dim, 7, 1, 1, vb.pp("0"))?;
+        let mut blocks = Vec::with_capacity(config.encoder_rates.len());
+        let mut dim = config.encoder_dim;
+        for (idx, (stride, transformer_layers)) in config
+            .encoder_rates
+            .iter()
+            .copied()
+            .zip(config.encoder_transformer_layers.iter().copied())
+            .enumerate()
+        {
+            dim = dim.checked_mul(2).ok_or_else(|| {
+                Error::ConfigError("Fish S2 DAC encoder channel count overflowed".to_string())
+            })?;
+            blocks.push(FishS2EncoderBlock::load(
+                dim,
+                stride,
+                transformer_layers,
+                config,
+                vb.pp(idx + 1),
+            )?);
+        }
+        let final_snake = FishS2Snake1d::load(dim, vb.pp(config.encoder_rates.len() + 1))?;
+        let final_conv = FishS2CausalConv1d::load(
+            dim,
+            config.latent_dim,
+            3,
+            1,
+            1,
+            vb.pp(config.encoder_rates.len() + 2),
+        )?;
+        Ok(Self {
+            first,
+            blocks,
+            final_snake,
+            final_conv,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mut hidden = self.first.forward(x)?;
+        for block in &self.blocks {
+            hidden = block.forward(&hidden)?;
+        }
+        self.final_conv.forward(&self.final_snake.forward(&hidden)?)
+    }
+}
+
+impl FishS2EncoderBlock {
+    fn load(
+        dim: usize,
+        stride: usize,
+        transformer_layers: usize,
+        config: &FishS2DacConfig,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        let vb = vb.pp("block");
+        let residual_dim = dim / 2;
+        let residuals = [1usize, 3, 9]
+            .into_iter()
+            .enumerate()
+            .map(|(idx, dilation)| {
+                FishS2ResidualUnit::load(residual_dim, dilation, true, vb.pp(idx))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let snake = FishS2Snake1d::load(residual_dim, vb.pp("3"))?;
+        let conv = FishS2CausalConv1d::load(residual_dim, dim, 2 * stride, stride, 1, vb.pp("4"))?;
+        let transformer = if transformer_layers == 0 {
+            None
+        } else {
+            let params = FishS2DacTransformerParams::encoder_stage(
+                dim,
+                transformer_layers,
+                config.encoder_window_size,
+                config,
+            );
+            Some(FishS2WindowLimitedTransformer::load(
+                dim,
+                dim,
+                &params,
+                true,
+                vb.pp("5"),
+            )?)
+        };
+        Ok(Self {
+            residuals,
+            snake,
+            conv,
+            transformer,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mut hidden = x.clone();
+        for residual in &self.residuals {
+            hidden = residual.forward(&hidden)?;
+        }
+        hidden = self.conv.forward(&self.snake.forward(&hidden)?)?;
+        if let Some(transformer) = &self.transformer {
+            hidden = transformer.forward(&hidden)?;
+        }
+        Ok(hidden)
     }
 }
 
@@ -640,7 +955,7 @@ impl FishS2WindowLimitedTransformer {
     fn load(
         input_dim: usize,
         dim: usize,
-        config: &FishS2DacConfig,
+        params: &FishS2DacTransformerParams,
         channels_first: bool,
         vb: VarBuilder,
     ) -> Result<Self> {
@@ -649,14 +964,14 @@ impl FishS2WindowLimitedTransformer {
         } else {
             None
         };
-        let mut layers = Vec::with_capacity(config.transformer_layers);
-        for idx in 0..config.transformer_layers {
+        let mut layers = Vec::with_capacity(params.layers);
+        for idx in 0..params.layers {
             layers.push(FishS2DacTransformerBlock::load(
-                config,
+                params,
                 vb.pp(format!("layers.{idx}")),
             )?);
         }
-        let norm = candle_nn::rms_norm(dim, config.rms_norm_eps, vb.pp("norm"))?;
+        let norm = candle_nn::rms_norm(dim, params.rms_norm_eps, vb.pp("norm"))?;
         let output_proj = if input_dim != dim || vb.contains_tensor("output_proj.weight") {
             Some(candle_nn::linear(dim, input_dim, vb.pp("output_proj"))?)
         } else {
@@ -696,13 +1011,13 @@ impl FishS2WindowLimitedTransformer {
 }
 
 impl FishS2DacTransformerBlock {
-    fn load(config: &FishS2DacConfig, vb: VarBuilder) -> Result<Self> {
-        let dim = config.transformer_heads * config.transformer_head_dim;
+    fn load(params: &FishS2DacTransformerParams, vb: VarBuilder) -> Result<Self> {
+        let dim = params.dim;
         Ok(Self {
-            attention: FishS2DacAttention::load(config, vb.pp("attention"))?,
-            feed_forward: FishS2DacFeedForward::load(config, vb.pp("feed_forward"))?,
-            attention_norm: candle_nn::rms_norm(dim, config.rms_norm_eps, vb.pp("attention_norm"))?,
-            ffn_norm: candle_nn::rms_norm(dim, config.rms_norm_eps, vb.pp("ffn_norm"))?,
+            attention: FishS2DacAttention::load(params, vb.pp("attention"))?,
+            feed_forward: FishS2DacFeedForward::load(params, vb.pp("feed_forward"))?,
+            attention_norm: candle_nn::rms_norm(dim, params.rms_norm_eps, vb.pp("attention_norm"))?,
+            ffn_norm: candle_nn::rms_norm(dim, params.rms_norm_eps, vb.pp("ffn_norm"))?,
             attention_scale: vb.get((dim,), "attention_layer_scale.gamma")?,
             ffn_scale: vb.get((dim,), "ffn_layer_scale.gamma")?,
         })
@@ -727,18 +1042,18 @@ impl FishS2DacTransformerBlock {
 }
 
 impl FishS2DacAttention {
-    fn load(config: &FishS2DacConfig, vb: VarBuilder) -> Result<Self> {
-        let q_dim = config.transformer_heads * config.transformer_head_dim;
-        let kv_dim = config.transformer_kv_heads * config.transformer_head_dim;
+    fn load(params: &FishS2DacTransformerParams, vb: VarBuilder) -> Result<Self> {
+        let q_dim = params.heads * params.head_dim;
+        let kv_dim = params.kv_heads * params.head_dim;
         let total = q_dim + 2 * kv_dim;
         Ok(Self {
             wqkv: candle_nn::linear_no_bias(q_dim, total, vb.pp("wqkv"))?,
             wo: candle_nn::linear_no_bias(q_dim, q_dim, vb.pp("wo"))?,
-            num_heads: config.transformer_heads,
-            num_kv_heads: config.transformer_kv_heads,
-            head_dim: config.transformer_head_dim,
-            rope_theta: config.rope_theta,
-            window_size: config.transformer_window_size.max(1),
+            num_heads: params.heads,
+            num_kv_heads: params.kv_heads,
+            head_dim: params.head_dim,
+            rope_theta: params.rope_theta,
+            window_size: params.window_size.max(1),
         })
     }
 
@@ -797,12 +1112,12 @@ impl FishS2DacAttention {
 }
 
 impl FishS2DacFeedForward {
-    fn load(config: &FishS2DacConfig, vb: VarBuilder) -> Result<Self> {
-        let dim = config.transformer_heads * config.transformer_head_dim;
+    fn load(params: &FishS2DacTransformerParams, vb: VarBuilder) -> Result<Self> {
+        let dim = params.dim;
         Ok(Self {
-            w1: candle_nn::linear_no_bias(dim, config.transformer_intermediate, vb.pp("w1"))?,
-            w2: candle_nn::linear_no_bias(config.transformer_intermediate, dim, vb.pp("w2"))?,
-            w3: candle_nn::linear_no_bias(dim, config.transformer_intermediate, vb.pp("w3"))?,
+            w1: candle_nn::linear_no_bias(dim, params.intermediate, vb.pp("w1"))?,
+            w2: candle_nn::linear_no_bias(params.intermediate, dim, vb.pp("w2"))?,
+            w3: candle_nn::linear_no_bias(dim, params.intermediate, vb.pp("w3"))?,
         })
     }
 
@@ -850,6 +1165,65 @@ fn codebooks_to_tensor(
         }
     }
     Tensor::from_vec(values, (1, codebooks.len(), frames), device).map_err(Error::from)
+}
+
+fn tensor_to_vq_codes(codes: &Tensor, config: &FishS2DacConfig) -> Result<FishS2VqCodes> {
+    if codes.rank() != 3 || codes.dim(0)? != 1 || codes.dim(1)? != config.num_codebooks() {
+        return Err(Error::AudioError(format!(
+            "Fish S2 DAC produced invalid code tensor shape {:?}",
+            codes.dims()
+        )));
+    }
+    let frames = codes.dim(2)?;
+    let values = codes.to_dtype(DType::U32)?.to_vec3::<u32>()?;
+    let mut codebooks = Vec::with_capacity(config.num_codebooks());
+    for idx in 0..config.num_codebooks() {
+        let row = values
+            .first()
+            .and_then(|batch| batch.get(idx))
+            .ok_or_else(|| Error::AudioError("Fish S2 DAC code tensor missing row".to_string()))?;
+        if row.len() != frames {
+            return Err(Error::AudioError(
+                "Fish S2 DAC code tensor row length mismatch".to_string(),
+            ));
+        }
+        codebooks.push(row.clone());
+    }
+    Ok(FishS2VqCodes { codebooks })
+}
+
+fn prepare_reference_samples(
+    samples: &[f32],
+    sample_rate: u32,
+    config: &FishS2DacConfig,
+) -> Result<Vec<f32>> {
+    if sample_rate == 0 {
+        return Err(Error::InvalidInput(
+            "Fish S2 reference audio sample rate must be greater than zero".to_string(),
+        ));
+    }
+    if samples.is_empty() {
+        return Err(Error::InvalidInput(
+            "Fish S2 reference audio cannot be empty".to_string(),
+        ));
+    }
+    let mut prepared = resample_mono_high_quality(samples, sample_rate, config.sample_rate)?;
+    for sample in &mut prepared {
+        if !sample.is_finite() {
+            *sample = 0.0;
+        }
+    }
+    let frame = config.samples_per_frame()?.max(1);
+    let target_len = prepared.len().div_ceil(frame) * frame;
+    prepared.resize(target_len.max(frame), 0.0);
+    Ok(prepared)
+}
+
+fn l2_normalize_last_dim(x: &Tensor) -> Result<Tensor> {
+    let norm = x.sqr()?.sum_keepdim(D::Minus1)?.sqrt()?;
+    let eps = Tensor::new(1e-12f32, x.device())?.to_dtype(x.dtype())?;
+    x.broadcast_div(&norm.broadcast_add(&eps)?)
+        .map_err(Error::from)
 }
 
 fn get_extra_padding_for_conv1d(
@@ -984,6 +1358,10 @@ mod tests {
     fn tiny_config() -> FishS2DacConfig {
         FishS2DacConfig {
             sample_rate: 100,
+            encoder_dim: 2,
+            encoder_rates: vec![1],
+            encoder_transformer_layers: vec![0],
+            encoder_window_size: 4,
             latent_dim: 4,
             decoder_dim: 4,
             decoder_rates: vec![1],
@@ -1113,9 +1491,74 @@ mod tests {
         tensors.insert(format!("{prefix}.gamma"), tensor(device, (dim,), 1.0));
     }
 
+    fn insert_transformer(
+        tensors: &mut HashMap<String, Tensor>,
+        device: &Device,
+        prefix: &str,
+        dim: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        intermediate: usize,
+    ) {
+        let q_dim = heads * head_dim;
+        let kv_dim = kv_heads * head_dim;
+        tensors.insert(
+            format!("{prefix}.layers.0.attention.wqkv.weight"),
+            tensor(device, (q_dim + 2 * kv_dim, dim), 0.0),
+        );
+        tensors.insert(
+            format!("{prefix}.layers.0.attention.wo.weight"),
+            tensor(device, (dim, q_dim), 0.0),
+        );
+        tensors.insert(
+            format!("{prefix}.layers.0.feed_forward.w1.weight"),
+            tensor(device, (intermediate, dim), 0.0),
+        );
+        tensors.insert(
+            format!("{prefix}.layers.0.feed_forward.w2.weight"),
+            tensor(device, (dim, intermediate), 0.0),
+        );
+        tensors.insert(
+            format!("{prefix}.layers.0.feed_forward.w3.weight"),
+            tensor(device, (intermediate, dim), 0.0),
+        );
+        for name in [
+            "layers.0.attention_norm.weight",
+            "layers.0.ffn_norm.weight",
+            "layers.0.attention_layer_scale.gamma",
+            "layers.0.ffn_layer_scale.gamma",
+            "norm.weight",
+        ] {
+            tensors.insert(format!("{prefix}.{name}"), tensor(device, (dim,), 1.0));
+        }
+    }
+
     fn tiny_decoder(device: &Device) -> FishS2DacDecoder {
         let config = tiny_config();
         let mut tensors = HashMap::new();
+        insert_conv(&mut tensors, device, "encoder.block.0", 2, 1, 7, 0.0);
+        for idx in 0..=2 {
+            insert_residual_unit(
+                &mut tensors,
+                device,
+                &format!("encoder.block.1.block.{idx}"),
+                2,
+            );
+        }
+        insert_snake(&mut tensors, device, "encoder.block.1.block.3", 2);
+        insert_conv(
+            &mut tensors,
+            device,
+            "encoder.block.1.block.4",
+            4,
+            2,
+            2,
+            0.01,
+        );
+        insert_snake(&mut tensors, device, "encoder.block.2", 4);
+        insert_conv(&mut tensors, device, "encoder.block.3", 4, 4, 3, 0.01);
+
         for root in [
             "quantizer.semantic_quantizer.quantizers.0",
             "quantizer.quantizer.quantizers.0",
@@ -1144,35 +1587,18 @@ mod tests {
             );
         }
 
-        tensors.insert(
-            "quantizer.post_module.layers.0.attention.wqkv.weight".to_string(),
-            tensor(device, (12, 4), 0.0),
+        insert_conv(
+            &mut tensors,
+            device,
+            "quantizer.downsample.0.0",
+            4,
+            4,
+            1,
+            0.0,
         );
-        tensors.insert(
-            "quantizer.post_module.layers.0.attention.wo.weight".to_string(),
-            tensor(device, (4, 4), 0.0),
-        );
-        tensors.insert(
-            "quantizer.post_module.layers.0.feed_forward.w1.weight".to_string(),
-            tensor(device, (8, 4), 0.0),
-        );
-        tensors.insert(
-            "quantizer.post_module.layers.0.feed_forward.w2.weight".to_string(),
-            tensor(device, (4, 8), 0.0),
-        );
-        tensors.insert(
-            "quantizer.post_module.layers.0.feed_forward.w3.weight".to_string(),
-            tensor(device, (8, 4), 0.0),
-        );
-        for name in [
-            "quantizer.post_module.layers.0.attention_norm.weight",
-            "quantizer.post_module.layers.0.ffn_norm.weight",
-            "quantizer.post_module.layers.0.attention_layer_scale.gamma",
-            "quantizer.post_module.layers.0.ffn_layer_scale.gamma",
-            "quantizer.post_module.norm.weight",
-        ] {
-            tensors.insert(name.to_string(), tensor(device, (4,), 1.0));
-        }
+        insert_convnext(&mut tensors, device, "quantizer.downsample.0.1", 4);
+        insert_transformer(&mut tensors, device, "quantizer.pre_module", 4, 2, 2, 2, 8);
+        insert_transformer(&mut tensors, device, "quantizer.post_module", 4, 2, 2, 2, 8);
 
         insert_trans_conv(&mut tensors, device, "quantizer.upsample.0.0", 4, 4, 1, 0.0);
         insert_convnext(&mut tensors, device, "quantizer.upsample.0.1", 4);
@@ -1222,6 +1648,18 @@ mod tests {
             .decode_codebooks(&[vec![0, 1], vec![2]])
             .unwrap_err();
         assert!(err.to_string().contains("same frame count"));
+    }
+
+    #[test]
+    fn dac_encode_reference_audio_returns_codebook_major_codes() {
+        let device = Device::Cpu;
+        let codec = tiny_decoder(&device);
+        let codes = codec
+            .encode_reference_audio(&[0.0, 0.25, -0.25], 100)
+            .unwrap();
+        assert_eq!(codes.codebooks.len(), 2);
+        assert_eq!(codes.codebooks[0].len(), 3);
+        assert!(codes.codebooks.iter().flatten().all(|code| *code < 8));
     }
 
     #[test]
