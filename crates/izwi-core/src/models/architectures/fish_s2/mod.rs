@@ -15,6 +15,7 @@ pub mod codec;
 pub mod config;
 pub mod contracts;
 pub mod tokenizer;
+pub mod weights;
 
 pub use artifacts::FishS2ArtifactManifest;
 pub use codec::{FishS2CodecArtifact, FishS2CodecSupport};
@@ -24,6 +25,7 @@ pub use contracts::{
     semantic_token_id, FishS2DacContract, FishS2PromptTensorShape,
 };
 pub use tokenizer::{FishS2PromptTokenizer, FishS2SpecialTokens};
+pub use weights::{FishS2TensorSpec, FishS2WeightIndex, FishS2Weights};
 
 #[derive(Debug, Clone)]
 pub struct FishS2TtsModel {
