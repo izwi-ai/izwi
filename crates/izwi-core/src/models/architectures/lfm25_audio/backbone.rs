@@ -9,7 +9,7 @@ use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 
 use crate::error::{Error, Result};
 use crate::kernels::{
-    try_fused_decode_gqa_attention, try_fused_qk_rms_norm, try_fused_rope_pair_bshd,
+    try_fused_decode_gqa_attention_with_kv_len, try_fused_qk_rms_norm, try_fused_rope_pair_bshd,
     try_fused_silu_mul_with_status,
 };
 use crate::models::shared::attention::flash::{
@@ -22,6 +22,7 @@ use crate::models::shared::telemetry::{
 };
 use crate::models::shared::weights::gguf::GgufLoader;
 
+use super::cache::DenseKvCache;
 use super::config::Lfm2BackboneConfig;
 
 #[derive(Debug)]
@@ -48,7 +49,7 @@ struct AttentionLayer {
     sin: Tensor,
     cos_sin: Tensor,
     neg_inf: Tensor,
-    kv_cache: Option<(Tensor, Tensor)>,
+    kv_cache: DenseKvCache,
 }
 
 #[derive(Debug)]
@@ -259,19 +260,16 @@ impl AttentionLayer {
             )
         };
 
-        let (all_keys, all_values) = if let Some((cached_keys, cached_values)) = &self.kv_cache {
-            if index_pos == 0 {
-                (key_states, value_states)
-            } else {
-                (
-                    Tensor::cat(&[cached_keys, &key_states], 2)?,
-                    Tensor::cat(&[cached_values, &value_states], 2)?,
-                )
-            }
-        } else {
-            (key_states, value_states)
-        };
-        self.kv_cache = Some((all_keys.clone(), all_values.clone()));
+        if index_pos == 0 {
+            self.kv_cache.reset();
+        }
+        let super::cache::DenseKvCacheView {
+            current_k: all_keys,
+            current_v: all_values,
+            full_k: cache_full_keys,
+            full_v: cache_full_values,
+            valid_len: cache_valid_len,
+        } = self.kv_cache.append(&key_states, &value_states)?;
 
         if query_states.device().is_cuda() && flash_attention_requested() {
             let cuda_options =
@@ -295,13 +293,14 @@ impl AttentionLayer {
 
         if batch_size == 1 && seq_len == 1 && mask.is_none() && query_states.device().is_metal() {
             record_fused_attention_attempt();
-            if let Some(attn_output) = try_fused_decode_gqa_attention(
+            if let Some(attn_output) = try_fused_decode_gqa_attention_with_kv_len(
                 &query_states.contiguous()?,
-                &all_keys.contiguous()?,
-                &all_values.contiguous()?,
+                &cache_full_keys,
+                &cache_full_values,
                 self.n_head,
                 self.n_kv_head,
                 self.head_dim,
+                cache_valid_len,
                 (1.0f64 / (self.head_dim as f64).sqrt()) as f32,
             ) {
                 record_fused_attention_success();
@@ -347,7 +346,7 @@ impl AttentionLayer {
     }
 
     fn reset_state(&mut self) {
-        self.kv_cache = None;
+        self.kv_cache.reset();
     }
 }
 
@@ -649,7 +648,7 @@ impl QuantizedLfm2Backbone {
                     sin: sin.clone(),
                     cos_sin: cos_sin.clone(),
                     neg_inf: neg_inf.clone(),
-                    kv_cache: None,
+                    kv_cache: DenseKvCache::new(1),
                 })
             } else {
                 LayerKind::ShortConv(ShortConvLayer {

@@ -3,6 +3,7 @@
 mod audio_output;
 mod backbone;
 mod bundle;
+mod cache;
 mod config;
 mod conformer;
 mod detokenizer;

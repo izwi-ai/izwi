@@ -8,7 +8,7 @@ use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 
 use crate::error::{Error, Result};
 use crate::kernels::{
-    try_fused_decode_gqa_attention, try_fused_qk_rms_norm, try_fused_rope_pair_bshd,
+    try_fused_decode_gqa_attention_with_kv_len, try_fused_qk_rms_norm, try_fused_rope_pair_bshd,
     try_fused_silu_mul_with_status,
 };
 use crate::models::shared::telemetry::{
@@ -18,6 +18,7 @@ use crate::models::shared::telemetry::{
 };
 use crate::models::shared::weights::gguf::GgufLoader;
 
+use super::cache::DenseKvCache;
 use super::config::Lfm25AudioDecoderConfig;
 use super::sampling::{sample_from_logits, Lfm25SamplingConfig, SimpleRng};
 
@@ -149,6 +150,7 @@ impl Lfm25AudioHead {
 
 struct Depthformer {
     layers: Vec<DepthformerBlock>,
+    cache_initial_capacity: usize,
 }
 
 impl Depthformer {
@@ -162,18 +164,19 @@ impl Depthformer {
                 cfg.depthformer_dim,
             )?);
         }
-        Ok(Self { layers })
+        Ok(Self {
+            layers,
+            cache_initial_capacity: cfg.codebooks.max(1),
+        })
     }
 
-    fn empty_cache(&self) -> Vec<Option<(Tensor, Tensor)>> {
-        vec![None; self.layers.len()]
+    fn empty_cache(&self) -> Vec<DenseKvCache> {
+        (0..self.layers.len())
+            .map(|_| DenseKvCache::new(self.cache_initial_capacity))
+            .collect()
     }
 
-    fn forward_cached(
-        &self,
-        x: &Tensor,
-        caches: &mut [Option<(Tensor, Tensor)>],
-    ) -> Result<Tensor> {
+    fn forward_cached(&self, x: &Tensor, caches: &mut [DenseKvCache]) -> Result<Tensor> {
         let mut hidden = x.clone();
         for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
             hidden = layer.forward_cached(&hidden, cache)?;
@@ -219,7 +222,7 @@ impl DepthformerBlock {
         })
     }
 
-    fn forward_cached(&self, x: &Tensor, cache: &mut Option<(Tensor, Tensor)>) -> Result<Tensor> {
+    fn forward_cached(&self, x: &Tensor, cache: &mut DenseKvCache) -> Result<Tensor> {
         let hidden = self.attn.forward(&self.attn_norm.forward(x)?, cache)?;
         let hidden = hidden.broadcast_add(x)?;
         let ffn = self.mlp.forward(&self.ffn_norm.forward(&hidden)?)?;
@@ -349,7 +352,7 @@ impl DepthAttention {
         })
     }
 
-    fn forward(&self, hidden: &Tensor, cache: &mut Option<(Tensor, Tensor)>) -> Result<Tensor> {
+    fn forward(&self, hidden: &Tensor, cache: &mut DenseKvCache) -> Result<Tensor> {
         let (batch, seq_len, hidden_size) = hidden.dims3()?;
         let head_dim = hidden_size / DEPTHFORMER_HEADS;
         let kv_hidden = DEPTHFORMER_KV_HEADS * head_dim;
@@ -407,10 +410,7 @@ impl DepthAttention {
             (self.q_norm.forward(&q)?, self.k_norm.forward(&k)?)
         };
 
-        let index_pos = cache
-            .as_ref()
-            .map(|(keys, _values)| keys.dim(2).unwrap_or(0))
-            .unwrap_or(0);
+        let index_pos = cache.len();
         let (q, k) = if let Some((q, k)) =
             try_apply_rotary_emb_pair_bshd(&q, &k, &self.cos_sin, index_pos)?
         {
@@ -427,23 +427,24 @@ impl DepthAttention {
             )
         };
 
-        // KV cache in [b, h, s, d] layout — cat on dim 2 (seq)
-        let (all_k, all_v): (Tensor, Tensor) = if let Some((old_k, old_v)) = cache.as_ref() {
-            (Tensor::cat(&[old_k, &k], 2)?, Tensor::cat(&[old_v, &v], 2)?)
-        } else {
-            (k, v)
-        };
-        *cache = Some((all_k.clone(), all_v.clone()));
+        let super::cache::DenseKvCacheView {
+            current_k: all_k,
+            current_v: all_v,
+            full_k: cache_full_k,
+            full_v: cache_full_v,
+            valid_len: cache_valid_len,
+        } = cache.append(&k, &v)?;
 
         if batch == 1 && seq_len == 1 && q.device().is_metal() {
             record_fused_attention_attempt();
-            if let Some(out) = try_fused_decode_gqa_attention(
+            if let Some(out) = try_fused_decode_gqa_attention_with_kv_len(
                 &q.contiguous()?,
-                &all_k.contiguous()?,
-                &all_v.contiguous()?,
+                &cache_full_k,
+                &cache_full_v,
                 DEPTHFORMER_HEADS,
                 DEPTHFORMER_KV_HEADS,
                 head_dim,
+                cache_valid_len,
                 (1.0f64 / (head_dim as f64).sqrt()) as f32,
             ) {
                 record_fused_attention_success();
