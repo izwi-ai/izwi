@@ -3158,8 +3158,11 @@ fn asr_decode_profile_from_diagnostics(
             .get("step_total_ms")
             .and_then(|value| value.as_f64()),
         step_total_p95_ms: None,
-        loop_argmax_ms: None,
-        loop_scalar_read_ms: profile.get("sampling_ms").and_then(|value| value.as_f64()),
+        loop_argmax_ms: profile.get("argmax_ms").and_then(|value| value.as_f64()),
+        loop_scalar_read_ms: profile
+            .get("host_read_ms")
+            .or_else(|| profile.get("sampling_ms"))
+            .and_then(|value| value.as_f64()),
         loop_model_forward_ms: profile
             .get("decoder_forward_ms")
             .and_then(|value| value.as_f64()),

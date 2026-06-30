@@ -22,14 +22,16 @@ use super::conformer::Lfm25AudioEncoder;
 use super::detokenizer::Lfm25AudioDetokenizer;
 use super::preprocessor::Lfm25AudioPreprocessor;
 use super::sampling::{
-    greedy_from_logits, sample_from_logits, Lfm25AudioGenerationConfig, SimpleRng,
+    greedy_from_logits, greedy_token_tensor_from_logits, sample_from_logits,
+    Lfm25AudioGenerationConfig, SimpleRng,
 };
-use super::tokenizer::Lfm25TextTokenizer;
+use super::tokenizer::{Lfm25SpecialTokenIds, Lfm25TextTokenizer};
 use super::LFM25_AUDIO_DEFAULT_INTERLEAVED_SYSTEM_PROMPT;
 
 const DEFAULT_MAX_NEW_TOKENS: usize = 1024;
 const DEFAULT_AUDIO_STREAM_DECODE_STRIDE_FRAMES: usize = 6;
 const DEFAULT_AUDIO_STREAM_HOLDBACK_FRAMES: usize = 2;
+const DEFAULT_ASR_STOP_CHECK_INTERVAL: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct Lfm25AudioTextOutput {
@@ -87,10 +89,14 @@ struct Lfm25AsrProfile {
     main_prefill_ms: f64,
     decode_loop_ms: f64,
     decode_argmax_ms: f64,
+    decode_host_read_ms: f64,
     decode_token_tensor_ms: f64,
     decode_forward_ms: f64,
     tokenizer_decode_ms: f64,
     token_select_reads: u64,
+    host_token_reads: u64,
+    host_read_chunks: u64,
+    device_token_steps: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -305,46 +311,105 @@ impl Lfm25AudioModel {
             let mut generated_ids = Vec::new();
             let mut assembled = String::new();
             let max_new_tokens = max_new_tokens.max(1);
+            let stop_check_interval = lfm25_asr_stop_check_interval();
+            let use_deferred_device_decode = (self.device.device.is_metal()
+                || self.device.device.is_cuda())
+                && stop_check_interval > 1;
 
             let decode_started = Instant::now();
-            while generated_ids.len() < max_new_tokens {
-                let argmax_started = Instant::now();
-                let next = greedy_from_logits(&logits, vocab_limit)?;
-                profile.decode_argmax_ms += elapsed_ms(argmax_started);
-                profile.token_select_reads = profile.token_select_reads.saturating_add(1);
-                if next == specials.im_end
-                    || next == specials.eos
-                    || specials.eos_alt == Some(next)
-                    || next == specials.text_end
-                    || next == specials.audio_start
-                {
-                    break;
-                }
+            if use_deferred_device_decode {
+                while generated_ids.len() < max_new_tokens {
+                    let remaining = max_new_tokens.saturating_sub(generated_ids.len());
+                    let chunk_len = remaining.min(stop_check_interval);
+                    let mut chunk_tokens = Vec::with_capacity(chunk_len);
 
-                generated_ids.push(next);
-                let tokenizer_started = Instant::now();
-                let decoded = self.tokenizer.decode_text(&generated_ids)?;
-                profile.tokenizer_decode_ms += elapsed_ms(tokenizer_started);
-                let delta = text_delta(&assembled, &decoded);
-                if !delta.is_empty() {
-                    for ch in delta.chars() {
-                        let mut buf = [0u8; 4];
-                        on_delta(ch.encode_utf8(&mut buf));
+                    for _ in 0..chunk_len {
+                        let argmax_started = Instant::now();
+                        let next_token = greedy_token_tensor_from_logits(&logits, vocab_limit)?
+                            .ok_or_else(|| {
+                                Error::InferenceError(
+                                    "Device ASR argmax returned no token tensor".to_string(),
+                                )
+                            })?;
+                        profile.decode_argmax_ms += elapsed_ms(argmax_started);
+                        profile.token_select_reads = profile.token_select_reads.saturating_add(1);
+                        profile.device_token_steps = profile.device_token_steps.saturating_add(1);
+
+                        let token_tensor_started = Instant::now();
+                        let next_tensor = next_token.reshape((1, 1))?;
+                        profile.decode_token_tensor_ms += elapsed_ms(token_tensor_started);
+
+                        let decode_forward_started = Instant::now();
+                        logits = main_backbone.forward_tokens(&next_tensor, position)?;
+                        profile.decode_forward_ms += elapsed_ms(decode_forward_started);
+                        position += 1;
+                        chunk_tokens.push(next_token);
+                    }
+
+                    let read_started = Instant::now();
+                    let token_refs = chunk_tokens.iter().collect::<Vec<_>>();
+                    let host_tokens = Tensor::cat(&token_refs, 0)?
+                        .to_vec1::<u32>()
+                        .map_err(Error::from)?;
+                    profile.decode_host_read_ms += elapsed_ms(read_started);
+                    profile.host_read_chunks = profile.host_read_chunks.saturating_add(1);
+                    profile.host_token_reads = profile
+                        .host_token_reads
+                        .saturating_add(u64::try_from(host_tokens.len()).unwrap_or(u64::MAX));
+
+                    let mut should_stop = false;
+                    for next in host_tokens {
+                        if is_asr_stop_token(next, &specials) {
+                            should_stop = true;
+                            break;
+                        }
+
+                        if append_asr_text_token(
+                            &self.tokenizer,
+                            &mut generated_ids,
+                            &mut assembled,
+                            next,
+                            &mut profile,
+                            on_delta,
+                        )? {
+                            should_stop = true;
+                            break;
+                        }
+                    }
+                    if should_stop {
+                        break;
                     }
                 }
-                assembled = decoded;
+            } else {
+                while generated_ids.len() < max_new_tokens {
+                    let argmax_started = Instant::now();
+                    let next = greedy_from_logits(&logits, vocab_limit)?;
+                    profile.decode_argmax_ms += elapsed_ms(argmax_started);
+                    profile.token_select_reads = profile.token_select_reads.saturating_add(1);
+                    profile.host_token_reads = profile.host_token_reads.saturating_add(1);
+                    if is_asr_stop_token(next, &specials) {
+                        break;
+                    }
 
-                if has_token_repetition_loop(&generated_ids) {
-                    break;
+                    if append_asr_text_token(
+                        &self.tokenizer,
+                        &mut generated_ids,
+                        &mut assembled,
+                        next,
+                        &mut profile,
+                        on_delta,
+                    )? {
+                        break;
+                    }
+
+                    let token_tensor_started = Instant::now();
+                    let next_tensor = Tensor::from_vec(vec![next], (1, 1), &self.device.device)?;
+                    profile.decode_token_tensor_ms += elapsed_ms(token_tensor_started);
+                    let decode_forward_started = Instant::now();
+                    logits = main_backbone.forward_tokens(&next_tensor, position)?;
+                    profile.decode_forward_ms += elapsed_ms(decode_forward_started);
+                    position += 1;
                 }
-
-                let token_tensor_started = Instant::now();
-                let next_tensor = Tensor::from_vec(vec![next], (1, 1), &self.device.device)?;
-                profile.decode_token_tensor_ms += elapsed_ms(token_tensor_started);
-                let decode_forward_started = Instant::now();
-                logits = main_backbone.forward_tokens(&next_tensor, position)?;
-                profile.decode_forward_ms += elapsed_ms(decode_forward_started);
-                position += 1;
             }
             profile.decode_loop_ms = elapsed_ms(decode_started);
 
@@ -360,15 +425,14 @@ impl Lfm25AudioModel {
         })?;
         let main_backbone_ms = elapsed_ms(main_started);
         let model_total_ms = elapsed_ms(total_started);
-        let device_token_select_reads =
-            if self.device.device.is_metal() || self.device.device.is_cuda() {
-                profile.token_select_reads
-            } else {
-                0
-            };
-        let host_argmax_reads = profile
-            .token_select_reads
-            .saturating_sub(device_token_select_reads);
+        let device_token_select_reads = profile.device_token_steps;
+        let host_argmax_reads = if device_token_select_reads > 0 {
+            0
+        } else {
+            profile.host_token_reads
+        };
+        let stop_check_interval = lfm25_asr_stop_check_interval();
+        let deferred_stop_check = device_token_select_reads > 0 && stop_check_interval > 1;
         output.diagnostics = Some(serde_json::json!({
             "model": "lfm25_audio",
             "task": "asr",
@@ -385,6 +449,7 @@ impl Lfm25AudioModel {
                 "main_prefill": profile.main_prefill_ms,
                 "decode": profile.decode_loop_ms,
                 "decode_argmax": profile.decode_argmax_ms,
+                "decode_host_read": profile.decode_host_read_ms,
                 "decode_token_tensor": profile.decode_token_tensor_ms,
                 "decode_forward": profile.decode_forward_ms,
                 "tokenizer_decode": profile.tokenizer_decode_ms,
@@ -409,14 +474,25 @@ impl Lfm25AudioModel {
                 "token_select_reads": profile.token_select_reads,
                 "device_argmax_reads": device_token_select_reads,
                 "host_argmax_reads": host_argmax_reads,
+                "host_read_chunks": profile.host_read_chunks,
+                "host_token_reads": profile.host_token_reads,
+                "device_token_steps": profile.device_token_steps,
                 "profile": {
                     "enabled": true,
-                    "sampling_ms": profile.decode_argmax_ms,
+                    "sampling_ms": profile.decode_argmax_ms + profile.decode_host_read_ms,
+                    "argmax_ms": profile.decode_argmax_ms,
+                    "host_read_ms": profile.decode_host_read_ms,
+                    "host_read_chunks": profile.host_read_chunks,
                     "token_tensor_ms": profile.decode_token_tensor_ms,
                     "decoder_forward_ms": profile.decode_forward_ms,
                     "tokenizer_decode_ms": profile.tokenizer_decode_ms,
                     "step_total_ms": profile.decode_loop_ms
                 }
+            },
+            "execution": {
+                "deferred_stop_check": deferred_stop_check,
+                "chunked_stop_check": deferred_stop_check,
+                "stop_check_interval": stop_check_interval
             }
         }));
         Ok(output)
@@ -1116,6 +1192,45 @@ fn text_delta(previous: &str, current: &str) -> String {
         .take_while(|(left, right)| left == right)
         .count();
     current.chars().skip(common).collect()
+}
+
+fn append_asr_text_token(
+    tokenizer: &Lfm25TextTokenizer,
+    generated_ids: &mut Vec<u32>,
+    assembled: &mut String,
+    next: u32,
+    profile: &mut Lfm25AsrProfile,
+    on_delta: &mut dyn FnMut(&str),
+) -> Result<bool> {
+    generated_ids.push(next);
+    let tokenizer_started = Instant::now();
+    let decoded = tokenizer.decode_text(generated_ids)?;
+    profile.tokenizer_decode_ms += elapsed_ms(tokenizer_started);
+    let delta = text_delta(assembled, &decoded);
+    if !delta.is_empty() {
+        for ch in delta.chars() {
+            let mut buf = [0u8; 4];
+            on_delta(ch.encode_utf8(&mut buf));
+        }
+    }
+    *assembled = decoded;
+    Ok(has_token_repetition_loop(generated_ids))
+}
+
+fn is_asr_stop_token(next: u32, specials: &Lfm25SpecialTokenIds) -> bool {
+    next == specials.im_end
+        || next == specials.eos
+        || specials.eos_alt == Some(next)
+        || next == specials.text_end
+        || next == specials.audio_start
+}
+
+fn lfm25_asr_stop_check_interval() -> usize {
+    std::env::var("IZWI_LFM25_ASR_STOP_CHECK_INTERVAL")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_ASR_STOP_CHECK_INTERVAL)
+        .clamp(1, 64)
 }
 
 fn next_audio_delta_stable(
