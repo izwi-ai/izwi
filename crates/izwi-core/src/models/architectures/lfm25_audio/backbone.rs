@@ -382,18 +382,7 @@ impl ShortConvLayer {
         let x = projected.narrow(1, hidden_size * 2, hidden_size)?;
         let bx = (&b * &x)?.contiguous()?;
 
-        let mut conv_weight = self.conv.clone();
-        match conv_weight.rank() {
-            3 => conv_weight = conv_weight.squeeze(1)?,
-            2 => {
-                let (d0, d1) = conv_weight.dims2()?;
-                if d0 == self.l_cache && d1 == hidden_size {
-                    conv_weight = conv_weight.transpose(0, 1)?.contiguous()?;
-                }
-            }
-            _ => {}
-        }
-        let conv_weight = conv_weight.contiguous()?;
+        let conv_weight = &self.conv;
 
         let conv_out = if seq_len == 1 {
             let mut state = if let Some(cache) = &self.cache {
@@ -693,16 +682,20 @@ impl QuantizedLfm2Backbone {
                             format!("{legacy_prefix}.conv.out_proj.weight"),
                         ],
                     )?,
-                    conv: load_dense_any(
-                        loader,
-                        device,
-                        &[
-                            format!("{prefix}.shortconv.conv.weight"),
-                            format!("{prefix}.conv.conv.weight"),
-                            format!("{prefix}.shortconv.conv"),
-                            format!("{legacy_prefix}.conv.conv.weight"),
-                        ],
-                        Some(DType::F32),
+                    conv: normalize_shortconv_weight(
+                        load_dense_any(
+                            loader,
+                            device,
+                            &[
+                                format!("{prefix}.shortconv.conv.weight"),
+                                format!("{prefix}.conv.conv.weight"),
+                                format!("{prefix}.shortconv.conv"),
+                                format!("{legacy_prefix}.conv.conv.weight"),
+                            ],
+                            Some(DType::F32),
+                        )?,
+                        cfg.shortconv_l_cache,
+                        cfg.embedding_length,
                     )?,
                     l_cache: cfg.shortconv_l_cache,
                     cache: None,
@@ -859,6 +852,34 @@ fn lfm25_metal_prefill_sdpa_enabled() -> bool {
             )
         })
         .unwrap_or(true)
+}
+
+fn normalize_shortconv_weight(
+    mut conv_weight: Tensor,
+    l_cache: usize,
+    hidden_size: usize,
+) -> Result<Tensor> {
+    match conv_weight.rank() {
+        3 => conv_weight = conv_weight.squeeze(1)?,
+        2 => {}
+        rank => {
+            return Err(Error::ModelLoadError(format!(
+                "Unexpected LFM2 shortconv weight rank: {rank}"
+            )));
+        }
+    }
+
+    let (mut rows, mut cols) = conv_weight.dims2()?;
+    if rows == l_cache && cols == hidden_size {
+        conv_weight = conv_weight.transpose(0, 1)?;
+        (rows, cols) = conv_weight.dims2()?;
+    }
+    if rows != hidden_size || cols != l_cache {
+        return Err(Error::ModelLoadError(format!(
+            "Unexpected LFM2 shortconv weight shape: expected [{hidden_size}, {l_cache}], found [{rows}, {cols}]"
+        )));
+    }
+    conv_weight.contiguous().map_err(Error::from)
 }
 
 fn precompute_freqs(

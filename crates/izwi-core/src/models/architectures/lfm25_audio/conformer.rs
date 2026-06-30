@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::ops;
 use candle_nn::{Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, LayerNorm, Linear, Module};
@@ -12,6 +15,7 @@ pub struct Lfm25AudioEncoder {
     layers: Vec<ConformerLayer>,
     adapter: AudioAdapter,
     cfg: Lfm25AudioEncoderConfig,
+    pos_emb_cache: Mutex<HashMap<usize, Tensor>>,
 }
 
 impl Lfm25AudioEncoder {
@@ -34,6 +38,7 @@ impl Lfm25AudioEncoder {
             layers,
             adapter,
             cfg,
+            pos_emb_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -41,13 +46,26 @@ impl Lfm25AudioEncoder {
         let (mut x, encoded_len) = self.pre_encode.forward(features, feature_frames)?;
         x = x.narrow(1, 0, encoded_len)?;
 
-        let pos_emb =
-            build_rel_positional_embedding(encoded_len, self.cfg.embedding_length, x.device())?;
+        let pos_emb = self.rel_positional_embedding(encoded_len, x.device())?;
         for layer in &self.layers {
             x = layer.forward(&x, &pos_emb)?;
         }
 
         self.adapter.forward(&x)
+    }
+
+    fn rel_positional_embedding(&self, encoded_len: usize, device: &Device) -> Result<Tensor> {
+        let mut cache = self.pos_emb_cache.lock().map_err(|_| {
+            Error::InferenceError("LFM2.5 Audio encoder position cache mutex poisoned".to_string())
+        })?;
+        if let Some(pos_emb) = cache.get(&encoded_len) {
+            return Ok(pos_emb.clone());
+        }
+
+        let pos_emb =
+            build_rel_positional_embedding(encoded_len, self.cfg.embedding_length, device)?;
+        cache.insert(encoded_len, pos_emb.clone());
+        Ok(pos_emb)
     }
 }
 
