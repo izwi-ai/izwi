@@ -421,6 +421,8 @@ struct ConformerConv {
     pointwise_conv1: Conv1d,
     depthwise_conv: Conv1d,
     affine_norm: AffineNorm1d,
+    folded_depthwise_weight: Tensor,
+    folded_depthwise_bias: Tensor,
     pointwise_conv2: Conv1d,
 }
 
@@ -496,11 +498,15 @@ impl ConformerConv {
                 format!("audio_encoder.layers.{idx}.conv.pointwise_conv2.bias"),
             ],
         )?;
+        let (folded_depthwise_weight, folded_depthwise_bias) =
+            fold_depthwise_conv_affine(&depthwise_conv, &affine_norm)?;
 
         Ok(Self {
             pointwise_conv1,
             depthwise_conv,
             affine_norm,
+            folded_depthwise_weight,
+            folded_depthwise_bias,
             pointwise_conv2,
         })
     }
@@ -514,13 +520,62 @@ impl ConformerConv {
         let x_b = x.i((.., hidden.., ..))?;
         x = x_a.broadcast_mul(&ops::sigmoid(&x_b)?)?;
 
-        x = forward_depthwise_conv1d(&self.depthwise_conv, &x)?;
-        x = self.affine_norm.forward(&x)?;
-        x = swish(&x)?;
+        x = if let Some(fused) = try_forward_depthwise_conv1d_affine_swish(
+            &self.depthwise_conv,
+            &self.folded_depthwise_weight,
+            &self.folded_depthwise_bias,
+            &x,
+        ) {
+            fused
+        } else {
+            let x = forward_depthwise_conv1d(&self.depthwise_conv, &x)?;
+            let x = self.affine_norm.forward(&x)?;
+            swish(&x)?
+        };
         x = self.pointwise_conv2.forward(&x)?;
 
         x.transpose(1, 2).map_err(Error::from)
     }
+}
+
+fn fold_depthwise_conv_affine(
+    conv: &Conv1d,
+    affine_norm: &AffineNorm1d,
+) -> Result<(Tensor, Tensor)> {
+    let weight = conv.weight();
+    let channels = affine_norm.weight.dim(0)?;
+    let scale = affine_norm.weight.reshape((channels, 1, 1))?;
+    let folded_weight = weight.broadcast_mul(&scale)?.contiguous()?;
+    let conv_bias = match conv.bias() {
+        Some(bias) => bias.clone(),
+        None => Tensor::zeros(
+            channels,
+            affine_norm.weight.dtype(),
+            affine_norm.weight.device(),
+        )?,
+    };
+    let folded_bias = conv_bias
+        .broadcast_mul(&affine_norm.weight)?
+        .broadcast_add(&affine_norm.bias)?
+        .contiguous()?;
+    Ok((folded_weight, folded_bias))
+}
+
+fn try_forward_depthwise_conv1d_affine_swish(
+    conv: &Conv1d,
+    folded_weight: &Tensor,
+    folded_bias: &Tensor,
+    x: &Tensor,
+) -> Option<Tensor> {
+    let cfg = conv.config();
+    parakeet_metal_kernels::try_depthwise_conv1d_bias_swish(
+        x,
+        folded_weight,
+        folded_bias,
+        cfg.padding,
+        cfg.stride,
+        cfg.dilation,
+    )
 }
 
 fn forward_depthwise_conv1d(conv: &Conv1d, x: &Tensor) -> Result<Tensor> {
@@ -1239,12 +1294,12 @@ mod tests {
     use candle_core::quantized::gguf_file::{write as write_gguf, Value as GgufValue};
     use candle_core::quantized::{GgmlDType, QTensor};
     use candle_core::{Device, Module, Tensor};
-    use candle_nn::Linear;
+    use candle_nn::{Conv1d, Conv1dConfig, Linear};
     use uuid::Uuid;
 
     use super::{
-        build_rel_positional_embedding, load_linear_any, rel_shift, subsampled_len_3x,
-        Lfm25AudioEncoder, RelPosSelfAttention,
+        build_rel_positional_embedding, fold_depthwise_conv_affine, load_linear_any, rel_shift,
+        subsampled_len_3x, AffineNorm1d, Lfm25AudioEncoder, RelPosSelfAttention,
     };
     use crate::models::architectures::lfm25_audio::config::parse_audio_encoder_config;
     use crate::models::shared::weights::gguf::GgufLoader;
@@ -1302,6 +1357,57 @@ mod tests {
         let device = Device::Cpu;
         let emb = build_rel_positional_embedding(5, 8, &device).expect("build embedding");
         assert_eq!(emb.dims3().unwrap(), (1, 9, 8));
+    }
+
+    #[test]
+    fn folded_depthwise_conv_affine_matches_explicit_path() {
+        let device = Device::Cpu;
+        let cfg = Conv1dConfig {
+            padding: 1,
+            groups: 2,
+            ..Default::default()
+        };
+        let weight = Tensor::from_vec(
+            vec![
+                1.0f32, 2.0, 3.0, //
+                -1.0, 0.5, 0.25,
+            ],
+            (2, 1, 3),
+            &device,
+        )
+        .expect("conv weight");
+        let bias = Tensor::from_vec(vec![0.5f32, -0.25], 2, &device).expect("conv bias");
+        let conv = Conv1d::new(weight, Some(bias), cfg);
+        let affine_norm = AffineNorm1d {
+            weight: Tensor::from_vec(vec![2.0f32, -3.0], 2, &device).expect("affine weight"),
+            bias: Tensor::from_vec(vec![0.1f32, 0.2], 2, &device).expect("affine bias"),
+        };
+        let input = Tensor::from_vec(
+            vec![
+                0.1f32, 0.2, 0.3, 0.4, //
+                -0.5, -0.4, -0.3, -0.2,
+            ],
+            (1, 2, 4),
+            &device,
+        )
+        .expect("input");
+
+        let (folded_weight, folded_bias) =
+            fold_depthwise_conv_affine(&conv, &affine_norm).expect("fold affine");
+        let folded_conv = Conv1d::new(folded_weight, Some(folded_bias), cfg);
+        let expected = affine_norm
+            .forward(&conv.forward(&input).expect("conv forward"))
+            .expect("affine forward");
+        let actual = folded_conv.forward(&input).expect("folded conv forward");
+
+        let expected = expected.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let actual = actual.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (idx, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1e-5,
+                "folded conv mismatch at {idx}: {actual} != {expected}"
+            );
+        }
     }
 
     #[test]
