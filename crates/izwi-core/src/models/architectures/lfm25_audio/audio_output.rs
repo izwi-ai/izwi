@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{Embedding, Module};
@@ -38,6 +39,19 @@ pub struct Lfm25AudioHead {
     codebooks: usize,
     depthformer_dim: usize,
     audio_end_token_id: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Lfm25AudioHeadProfile {
+    pub depth_linear_ms: f64,
+    pub depth_reshape_ms: f64,
+    pub cache_setup_ms: f64,
+    pub codebook_input_ms: f64,
+    pub depthformer_ms: f64,
+    pub sample_ms: f64,
+    pub embed_ms: f64,
+    pub materialize_ms: f64,
+    pub codebook_steps: u64,
 }
 
 impl Lfm25AudioHead {
@@ -126,28 +140,61 @@ impl Lfm25AudioHead {
         config: &Lfm25SamplingConfig,
         rng: &mut SimpleRng,
     ) -> Result<Vec<u32>> {
+        self.sample_audio_frame_with_profile(hidden, config, rng)
+            .map(|(samples, _profile)| samples)
+    }
+
+    pub fn sample_audio_frame_with_profile(
+        &self,
+        hidden: &Tensor,
+        config: &Lfm25SamplingConfig,
+        rng: &mut SimpleRng,
+    ) -> Result<(Vec<u32>, Lfm25AudioHeadProfile)> {
+        let mut profile = Lfm25AudioHeadProfile::default();
         let hidden = ensure_rank3(hidden)?;
+        let depth_linear_started = Instant::now();
         let depth_input = self.depth_linear.forward(&hidden)?;
+        profile.depth_linear_ms = elapsed_ms(depth_linear_started);
+
+        let depth_reshape_started = Instant::now();
         let depth_input = depth_input
             .reshape((1, 1, self.codebooks, self.depthformer_dim))?
             .squeeze(0)?
             .squeeze(0)?; // [C, D]
+        profile.depth_reshape_ms = elapsed_ms(depth_reshape_started);
 
+        let cache_setup_started = Instant::now();
         let mut next_embed = Tensor::zeros(self.depthformer_dim, hidden.dtype(), hidden.device())?;
         let mut caches = self.depthformer.empty_cache();
         let mut samples = Vec::with_capacity(self.codebooks);
+        profile.cache_setup_ms = elapsed_ms(cache_setup_started);
 
         for codebook_idx in 0..self.codebooks {
+            let codebook_input_started = Instant::now();
             let cur = depth_input.i(codebook_idx)?.broadcast_add(&next_embed)?;
             let cur = cur.unsqueeze(0)?.unsqueeze(0)?;
+            profile.codebook_input_ms += elapsed_ms(codebook_input_started);
+
+            let depthformer_started = Instant::now();
             let out = self.depthformer.forward_cached(&cur, &mut caches)?;
+            profile.depthformer_ms += elapsed_ms(depthformer_started);
+
+            let sample_started = Instant::now();
             let sample = self.depth_embeddings[codebook_idx].sample(&out, config, rng)?;
+            profile.sample_ms += elapsed_ms(sample_started);
+
+            let embed_started = Instant::now();
             next_embed =
                 self.depth_embeddings[codebook_idx].embed_sample(&sample, hidden.device())?;
+            profile.embed_ms += elapsed_ms(embed_started);
             samples.push(sample);
+            profile.codebook_steps = profile.codebook_steps.saturating_add(1);
         }
 
-        materialize_codebook_samples(&samples)
+        let materialize_started = Instant::now();
+        let samples = materialize_codebook_samples(&samples)?;
+        profile.materialize_ms = elapsed_ms(materialize_started);
+        Ok((samples, profile))
     }
 }
 
@@ -670,6 +717,10 @@ impl QLinear {
             Ok(out)
         }
     }
+}
+
+fn elapsed_ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
 }
 
 fn load_embedding_any(loader: &GgufLoader, device: &Device, names: &[String]) -> Result<Embedding> {
