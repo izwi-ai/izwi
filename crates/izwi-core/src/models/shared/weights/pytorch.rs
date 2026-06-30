@@ -1,5 +1,6 @@
 //! Minimal PyTorch zip/pickle tensor loading helpers.
 
+use std::collections::BTreeMap;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
@@ -8,6 +9,21 @@ use candle_core::{DType, Device, Tensor};
 use zip::ZipArchive;
 
 use crate::error::{Error, Result};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PthTensorSpec {
+    pub name: String,
+    pub dtype: DType,
+    pub shape: Vec<usize>,
+    pub archive_member_path: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PthTensorMap {
+    path: PathBuf,
+    tensor_infos: BTreeMap<String, TensorInfo>,
+    selected_key: Option<String>,
+}
 
 pub fn read_single_tensor_pth(
     path: &Path,
@@ -136,4 +152,104 @@ fn read_tensor_from_zip(path: &Path, info: &TensorInfo, member_path: &str) -> Re
     };
 
     Ok(tensor)
+}
+
+impl PthTensorMap {
+    pub fn open(path: &Path, key: Option<&str>) -> Result<Self> {
+        let tensor_infos = candle_core::pickle::read_pth_tensor_info(path, false, key)
+            .map_err(Error::from)?
+            .into_iter()
+            .map(|info| (info.name.clone(), info))
+            .collect::<BTreeMap<_, _>>();
+        Ok(Self {
+            path: path.to_path_buf(),
+            tensor_infos,
+            selected_key: key.map(str::to_string),
+        })
+    }
+
+    pub fn open_first_non_empty(path: &Path, keys: &[Option<&str>]) -> Result<Self> {
+        let mut errors = Vec::new();
+        for key in keys {
+            match Self::open(path, *key) {
+                Ok(map) if !map.is_empty() => return Ok(map),
+                Ok(_) => {}
+                Err(err) => errors.push(format!("key {key:?}: {err}")),
+            }
+        }
+        let detail = if errors.is_empty() {
+            "all candidate keys were empty".to_string()
+        } else {
+            errors.join("; ")
+        };
+        Err(Error::ModelLoadError(format!(
+            "PyTorch archive {} did not contain named tensors ({detail})",
+            path.display()
+        )))
+    }
+
+    pub fn selected_key(&self) -> Option<&str> {
+        self.selected_key.as_deref()
+    }
+
+    pub fn len(&self) -> usize {
+        self.tensor_infos.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tensor_infos.is_empty()
+    }
+
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.tensor_infos.contains_key(name)
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.tensor_infos.keys().map(String::as_str)
+    }
+
+    pub fn specs(&self) -> Vec<PthTensorSpec> {
+        self.tensor_infos
+            .values()
+            .map(|info| PthTensorSpec {
+                name: info.name.clone(),
+                dtype: info.dtype,
+                shape: info.layout.dims().to_vec(),
+                archive_member_path: info.path.clone(),
+            })
+            .collect()
+    }
+
+    pub fn get(&self, name: &str, device: &Device, dtype: Option<DType>) -> Result<Option<Tensor>> {
+        let Some(info) = self.tensor_infos.get(name) else {
+            return Ok(None);
+        };
+        let mut tensor = read_tensor_from_zip(&self.path, info, &info.path)?;
+        if let Some(dtype) = dtype {
+            if tensor.dtype() != dtype {
+                tensor = tensor.to_dtype(dtype)?;
+            }
+        }
+        if !tensor.device().same_device(device) {
+            tensor = tensor.to_device(device)?;
+        }
+        Ok(Some(tensor))
+    }
+
+    pub fn read_all(
+        &self,
+        device: &Device,
+        dtype: Option<DType>,
+    ) -> Result<BTreeMap<String, Tensor>> {
+        let mut tensors = BTreeMap::new();
+        for name in self.tensor_infos.keys() {
+            let tensor = self.get(name, device, dtype)?.ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "PyTorch archive tensor disappeared while reading: {name}"
+                ))
+            })?;
+            tensors.insert(name.clone(), tensor);
+        }
+        Ok(tensors)
+    }
 }
