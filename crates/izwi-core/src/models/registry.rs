@@ -11,6 +11,7 @@ use crate::backends::DeviceProfile;
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
+use crate::models::architectures::fish_s2::FishS2TtsModel;
 use crate::models::architectures::gemma3::chat::Gemma3ChatModel;
 use crate::models::architectures::granite_speech::asr::{
     GraniteSpeechAsrGenerationOptions, GraniteSpeechAsrModel, GraniteSpeechAsrTranscriptionOutput,
@@ -58,6 +59,7 @@ type DiarizationLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<Nati
 type VoxtralLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VoxtralRealtimeModel>;
 type VoxtralTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VoxtralTtsModel>;
 type VibeVoiceTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VibeVoiceTtsModel>;
+type FishS2TtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<FishS2TtsModel>;
 type QwenTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile, usize, &str) -> Result<Qwen3TtsModel>;
 type KokoroLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<KokoroTtsModel>;
 
@@ -106,6 +108,12 @@ struct VibeVoiceTtsLoaderRegistration {
     name: &'static str,
     family: ModelFamily,
     loader: VibeVoiceTtsLoaderFn,
+}
+
+struct FishS2TtsLoaderRegistration {
+    name: &'static str,
+    family: ModelFamily,
+    loader: FishS2TtsLoaderFn,
 }
 
 struct QwenTtsLoaderRegistration {
@@ -274,6 +282,14 @@ fn load_vibevoice_tts_model(
     VibeVoiceTtsModel::load(model_dir, variant, device)
 }
 
+fn load_fish_s2_tts_model(
+    model_dir: &Path,
+    variant: ModelVariant,
+    _device: DeviceProfile,
+) -> Result<FishS2TtsModel> {
+    FishS2TtsModel::load_metadata(model_dir, variant)
+}
+
 fn load_qwen_tts_model(
     model_dir: &Path,
     _variant: ModelVariant,
@@ -386,6 +402,13 @@ const VIBEVOICE_TTS_LOADER_REGISTRY: &[VibeVoiceTtsLoaderRegistration] =
         loader: load_vibevoice_tts_model,
     }];
 
+const FISH_S2_TTS_LOADER_REGISTRY: &[FishS2TtsLoaderRegistration] =
+    &[FishS2TtsLoaderRegistration {
+        name: "fish_s2_tts",
+        family: ModelFamily::FishS2Tts,
+        loader: load_fish_s2_tts_model,
+    }];
+
 const QWEN_TTS_LOADER_REGISTRY: &[QwenTtsLoaderRegistration] = &[QwenTtsLoaderRegistration {
     name: "qwen3_tts",
     family: ModelFamily::Qwen3Tts,
@@ -467,6 +490,15 @@ fn resolve_vibevoice_tts_loader_registration(
 ) -> Option<&'static VibeVoiceTtsLoaderRegistration> {
     let family = variant.family();
     VIBEVOICE_TTS_LOADER_REGISTRY
+        .iter()
+        .find(|registration| registration.family == family)
+}
+
+fn resolve_fish_s2_tts_loader_registration(
+    variant: ModelVariant,
+) -> Option<&'static FishS2TtsLoaderRegistration> {
+    let family = variant.family();
+    FISH_S2_TTS_LOADER_REGISTRY
         .iter()
         .find(|registration| registration.family == family)
 }
@@ -1657,6 +1689,7 @@ pub struct ModelRegistry {
     voxtral_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<VoxtralRealtimeModel>>>>>>,
     voxtral_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<VoxtralTtsModel>>>>>>,
     vibevoice_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<VibeVoiceTtsModel>>>>>>,
+    fish_s2_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<FishS2TtsModel>>>>>>,
     qwen_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<Qwen3TtsModel>>>>>>,
     kokoro_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<KokoroTtsModel>>>>>>,
 }
@@ -1680,6 +1713,7 @@ impl ModelRegistry {
             voxtral_models: Arc::new(RwLock::new(HashMap::new())),
             voxtral_tts_models: Arc::new(RwLock::new(HashMap::new())),
             vibevoice_tts_models: Arc::new(RwLock::new(HashMap::new())),
+            fish_s2_tts_models: Arc::new(RwLock::new(HashMap::new())),
             qwen_tts_models: Arc::new(RwLock::new(HashMap::new())),
             kokoro_models: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -2032,6 +2066,45 @@ impl ModelRegistry {
         Ok(model.clone())
     }
 
+    pub async fn load_fish_s2_tts(
+        &self,
+        variant: ModelVariant,
+        model_dir: &Path,
+    ) -> Result<Arc<FishS2TtsModel>> {
+        let registration = resolve_fish_s2_tts_loader_registration(variant).ok_or_else(|| {
+            Error::InvalidInput(format!("Unsupported Fish S2 TTS model variant: {variant}"))
+        })?;
+
+        let cell = {
+            let mut guard = self.fish_s2_tts_models.write().await;
+            guard
+                .entry(variant)
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+
+        info!(
+            "Loading Fish S2 TTS model metadata {variant} ({}) from {model_dir:?}",
+            registration.name
+        );
+
+        let model = cell
+            .get_or_try_init({
+                let model_dir = model_dir.to_path_buf();
+                let device = self.device.clone();
+                let loader = registration.loader;
+                move || async move {
+                    tokio::task::spawn_blocking(move || loader(&model_dir, variant, device))
+                        .await
+                        .map_err(|e| Error::ModelLoadError(e.to_string()))?
+                        .map(Arc::new)
+                }
+            })
+            .await?;
+
+        Ok(model.clone())
+    }
+
     pub async fn load_kokoro(
         &self,
         variant: ModelVariant,
@@ -2147,6 +2220,16 @@ impl ModelRegistry {
         guard.get(&variant).and_then(|cell| cell.get().cloned())
     }
 
+    pub async fn get_fish_s2_tts(&self, variant: ModelVariant) -> Option<Arc<FishS2TtsModel>> {
+        let guard = self.fish_s2_tts_models.read().await;
+        guard.get(&variant).and_then(|cell| cell.get().cloned())
+    }
+
+    pub fn try_get_fish_s2_tts(&self, variant: ModelVariant) -> Option<Arc<FishS2TtsModel>> {
+        let guard = self.fish_s2_tts_models.try_read().ok()?;
+        guard.get(&variant).and_then(|cell| cell.get().cloned())
+    }
+
     pub async fn get_qwen_tts(&self, variant: ModelVariant) -> Option<Arc<Qwen3TtsModel>> {
         let guard = self.qwen_tts_models.read().await;
         guard.get(&variant).and_then(|cell| cell.get().cloned())
@@ -2199,6 +2282,11 @@ impl ModelRegistry {
 
     pub async fn unload_vibevoice_tts(&self, variant: ModelVariant) {
         let mut guard = self.vibevoice_tts_models.write().await;
+        guard.remove(&variant);
+    }
+
+    pub async fn unload_fish_s2_tts(&self, variant: ModelVariant) {
+        let mut guard = self.fish_s2_tts_models.write().await;
         guard.remove(&variant);
     }
 
@@ -2262,6 +2350,15 @@ mod tests {
 
         assert_eq!(registration.name, "vibevoice_tts");
         assert_eq!(registration.family, ModelFamily::VibeVoiceTts);
+    }
+
+    #[test]
+    fn resolves_fish_s2_tts_loader_registration() {
+        let registration = resolve_fish_s2_tts_loader_registration(ModelVariant::FishAudioS2Pro)
+            .expect("Fish S2 TTS loader should be registered");
+
+        assert_eq!(registration.name, "fish_s2_tts");
+        assert_eq!(registration.family, ModelFamily::FishS2Tts);
     }
 
     #[test]
