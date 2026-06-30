@@ -291,6 +291,29 @@ impl AttentionLayer {
             }
         }
 
+        if should_try_lfm25_metal_prefill_sdpa(
+            &query_states,
+            seq_len,
+            index_pos,
+            self.sliding_window,
+        ) {
+            if let Some(attn_output) = try_fused_self_attention_with_options(
+                &query_states,
+                &all_keys,
+                &all_values,
+                None,
+                self.head_dim,
+                true,
+                CudaFlashAttentionOptions::default(),
+            )? {
+                let attn_output =
+                    attn_output
+                        .transpose(1, 2)?
+                        .reshape((batch_size, seq_len, hidden_size))?;
+                return self.wo.forward(&attn_output).map_err(Error::from);
+            }
+        }
+
         if batch_size == 1 && seq_len == 1 && mask.is_none() && query_states.device().is_metal() {
             record_fused_attention_attempt();
             if let Some(attn_output) = try_fused_decode_gqa_attention_with_kv_len(
@@ -811,6 +834,31 @@ fn lfm25_cuda_flash_attention_options(
         window_size_left: if masked_prefill { sliding_window } else { None },
         ..CudaFlashAttentionOptions::default()
     }
+}
+
+fn should_try_lfm25_metal_prefill_sdpa(
+    query_states: &Tensor,
+    seq_len: usize,
+    index_pos: usize,
+    sliding_window: Option<usize>,
+) -> bool {
+    seq_len > 1
+        && index_pos == 0
+        && sliding_window.is_none()
+        && query_states.device().is_metal()
+        && lfm25_metal_prefill_sdpa_enabled()
+}
+
+fn lfm25_metal_prefill_sdpa_enabled() -> bool {
+    std::env::var("IZWI_LFM25_METAL_PREFILL_SDPA")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(true)
 }
 
 fn precompute_freqs(
