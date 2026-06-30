@@ -10,6 +10,7 @@ pub enum ModelFamily {
     KokoroTts,
     VoxtralTts,
     VibeVoiceTts,
+    FishS2Tts,
     ParakeetAsr,
     WhisperAsr,
     Qwen3Asr,
@@ -106,6 +107,7 @@ impl ModelVariant {
             Kokoro82M => ModelFamily::KokoroTts,
             Voxtral4BTts2603 => ModelFamily::VoxtralTts,
             VibeVoice15BTts => ModelFamily::VibeVoiceTts,
+            FishAudioS2Pro => ModelFamily::FishS2Tts,
             Qwen3TtsTokenizer12Hz => ModelFamily::Tokenizer,
             ParakeetTdt06BV3 => ModelFamily::ParakeetAsr,
             WhisperLargeV3Turbo => ModelFamily::WhisperAsr,
@@ -130,7 +132,8 @@ impl ModelVariant {
             ModelFamily::Qwen3Tts
             | ModelFamily::KokoroTts
             | ModelFamily::VoxtralTts
-            | ModelFamily::VibeVoiceTts => ModelTask::Tts,
+            | ModelFamily::VibeVoiceTts
+            | ModelFamily::FishS2Tts => ModelTask::Tts,
             ModelFamily::ParakeetAsr
             | ModelFamily::WhisperAsr
             | ModelFamily::Qwen3Asr
@@ -297,6 +300,13 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
         {
             return Some(VibeVoice15BTts);
         }
+    }
+
+    if normalized.contains("fishaudio")
+        || normalized.contains("fishspeech")
+        || (normalized.contains("fish") && normalized.contains("s2"))
+    {
+        return Some(FishAudioS2Pro);
     }
 
     if normalized.contains("nemotron") && normalized.contains("asr") {
@@ -662,6 +672,21 @@ mod tests {
             .expect("VibeVoice TTS should parse for tts");
         assert_eq!(parsed, ModelVariant::VibeVoice15BTts);
         assert_eq!(parsed.family(), ModelFamily::VibeVoiceTts);
+    }
+
+    #[test]
+    fn parse_tts_accepts_fish_s2_aliases() {
+        for alias in [
+            "FishAudio-S2-Pro",
+            "fishaudio/s2-pro",
+            "s2-pro",
+            "Fish Audio S2 Pro",
+        ] {
+            let parsed =
+                parse_tts_model_variant(alias).expect("Fish Audio S2 Pro should parse for tts");
+            assert_eq!(parsed, ModelVariant::FishAudioS2Pro);
+            assert_eq!(parsed.family(), ModelFamily::FishS2Tts);
+        }
     }
 
     #[test]

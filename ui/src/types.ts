@@ -49,6 +49,16 @@ export function isVibeVoiceTtsVariant(variant: string): boolean {
   );
 }
 
+export function isFishS2TtsVariant(variant: string): boolean {
+  const normalized = variant.trim().toLowerCase();
+  return (
+    normalized === "fishaudio-s2-pro" ||
+    normalized === "fishaudio/s2-pro" ||
+    normalized === "fish audio s2 pro" ||
+    normalized === "s2-pro"
+  );
+}
+
 function isVoxtralAsrVariant(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   return (
@@ -107,6 +117,9 @@ export function getSpeakerProfilesForVariant(variant: string | null): SpeakerPro
   if (isVibeVoiceTtsVariant(variant)) {
     return [];
   }
+  if (isFishS2TtsVariant(variant)) {
+    return [];
+  }
   if (isKokoroVariant(variant)) {
     return KOKORO_SPEAKERS;
   }
@@ -135,10 +148,11 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     icon: "Users",
     modelFilter: (variant) =>
       (variant.includes("Base") && !variant.includes("Tokenizer")) ||
-      isVibeVoiceTtsVariant(variant),
+      isVibeVoiceTtsVariant(variant) ||
+      isFishS2TtsVariant(variant),
     emptyStateTitle: "No Base Model Loaded",
     emptyStateDescription:
-      "Load a Base or VibeVoice model to clone voices from reference audio",
+      "Load a Base, VibeVoice, or Fish S2 model to clone voices from reference audio",
   },
   "voice-design": {
     id: "voice-design",

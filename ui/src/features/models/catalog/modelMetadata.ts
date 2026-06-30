@@ -8,6 +8,7 @@ export const PROVIDER_ORDER = [
   "NVIDIA",
   "Mistral AI",
   "hexgrad",
+  "Fish Audio",
   "Other",
 ] as const;
 
@@ -40,6 +41,9 @@ export function getModelProviderLabel(variant: string): string {
   }
   if (variant.startsWith("Voxtral-")) return "Mistral AI";
   if (variant.startsWith("Kokoro-")) return "hexgrad";
+  if (variant.startsWith("FishAudio-") || variant.startsWith("fishaudio/")) {
+    return "Fish Audio";
+  }
   return "Other";
 }
 
@@ -207,6 +211,15 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     category: "tts",
     capabilities: ["Text to Speech", "Voice Cloning", "Long-form", "24 kHz"],
     size: "5.04 GB",
+  },
+  "FishAudio-S2-Pro": {
+    shortName: "Fish S2 Pro",
+    fullName: "Fish Audio S2 Pro",
+    description:
+      "Multilingual Fish Audio text-to-speech model with reference voice cloning",
+    category: "tts",
+    capabilities: ["Text to Speech", "Voice Cloning", "Reference Voice"],
+    size: "10.7 GB",
   },
   // Text Chat
   "Qwen3-0.6B-GGUF": {

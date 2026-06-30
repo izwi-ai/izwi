@@ -43,6 +43,7 @@ const QWEN3_TTS_VARIANTS: &[ModelVariant] = &[
 const KOKORO_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::Kokoro82M];
 const VOXTRAL_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::Voxtral4BTts2603];
 const VIBEVOICE_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::VibeVoice15BTts];
+const FISH_S2_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::FishAudioS2Pro];
 const PARAKEET_ASR_VARIANTS: &[ModelVariant] = &[ModelVariant::ParakeetTdt06BV3];
 const WHISPER_ASR_VARIANTS: &[ModelVariant] = &[ModelVariant::WhisperLargeV3Turbo];
 const QWEN3_ASR_VARIANTS: &[ModelVariant] =
@@ -141,6 +142,13 @@ pub const MODEL_FAMILY_REGISTRATIONS: &[FamilyRegistration] = &[
         family: ModelFamily::VibeVoiceTts,
         module_path: "crate::models::architectures::vibevoice::tts",
         variants: VIBEVOICE_TTS_VARIANTS,
+        capabilities: TTS_CAPABILITIES,
+        fixture_ids: TTS_FIXTURES,
+    },
+    FamilyRegistration {
+        family: ModelFamily::FishS2Tts,
+        module_path: "crate::models::architectures::fish_s2",
+        variants: FISH_S2_TTS_VARIANTS,
         capabilities: TTS_CAPABILITIES,
         fixture_ids: TTS_FIXTURES,
     },
