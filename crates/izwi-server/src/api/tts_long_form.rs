@@ -230,6 +230,7 @@ pub async fn generate_long_form_tts(
         sample_rate,
         total_tokens,
         total_time_ms,
+        diagnostics: None,
     })
 }
 

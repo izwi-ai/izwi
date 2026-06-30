@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use candle_core::{DType, IndexOp, Tensor, D};
 use tracing::info;
@@ -33,6 +34,7 @@ pub struct Lfm25AudioTextOutput {
     pub text: String,
     pub prompt_tokens: usize,
     pub tokens_generated: usize,
+    pub diagnostics: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +45,7 @@ pub struct Lfm25AudioGenerationOutput {
     pub audio_frames_generated: usize,
     pub samples: Vec<f32>,
     pub sample_rate: u32,
+    pub diagnostics: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -73,6 +76,33 @@ pub struct Lfm25AudioModel {
     audio_head: Lfm25AudioHead,
     detokenizer: Lfm25AudioDetokenizer,
     main_backbone: Mutex<QuantizedLfm2Backbone>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Lfm25AsrProfile {
+    prompt_embed_ms: f64,
+    prompt_concat_ms: f64,
+    main_prefill_ms: f64,
+    decode_loop_ms: f64,
+    decode_argmax_ms: f64,
+    decode_token_tensor_ms: f64,
+    decode_forward_ms: f64,
+    tokenizer_decode_ms: f64,
+    host_argmax_reads: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Lfm25TtsProfile {
+    prompt_embed_ms: f64,
+    main_prefill_ms: f64,
+    text_sampling_ms: f64,
+    tokenizer_decode_ms: f64,
+    text_forward_ms: f64,
+    audio_head_ms: f64,
+    audio_embed_ms: f64,
+    audio_forward_ms: f64,
+    audio_head_calls: u64,
+    text_sample_calls: u64,
 }
 
 impl Lfm25AudioModel {
@@ -204,6 +234,8 @@ impl Lfm25AudioModel {
             return Err(Error::InvalidInput("Empty audio input".to_string()));
         }
 
+        let total_started = Instant::now();
+        let resample_started = Instant::now();
         let mono_16khz = if sample_rate == super::config::LFM25_AUDIO_INPUT_SAMPLE_RATE {
             audio.to_vec()
         } else {
@@ -213,32 +245,55 @@ impl Lfm25AudioModel {
                 super::config::LFM25_AUDIO_INPUT_SAMPLE_RATE,
             )
         };
+        let resample_ms = elapsed_ms(resample_started);
 
+        let feature_started = Instant::now();
         let (features, feature_frames) = self
             .preprocessor
             .compute_features(&mono_16khz, &self.device.device)?;
+        let feature_extract_ms = elapsed_ms(feature_started);
+
+        let encoder_started = Instant::now();
         let audio_embeds = self.encoder.encode(&features, feature_frames)?;
+        let encoder_forward_ms = elapsed_ms(encoder_started);
+        let audio_tokens = audio_embeds.dim(1)?;
+
+        let prompt_started = Instant::now();
         let (prefix_ids, suffix_ids) = self.build_asr_prompt_segments()?;
+        let prompt_build_ms = elapsed_ms(prompt_started);
         let vocab_limit = self.tokenizer.vocab_size();
         let specials = self.tokenizer.specials().clone();
 
-        self.with_main_backbone(|main_backbone| {
+        let main_started = Instant::now();
+        let (mut output, profile) = self.with_main_backbone(|main_backbone| {
+            let mut profile = Lfm25AsrProfile::default();
             main_backbone.reset_state();
 
+            let prompt_embed_started = Instant::now();
             let prefix_embeds = embed_token_ids(main_backbone, &self.device.device, &prefix_ids)?;
             let suffix_embeds = embed_token_ids(main_backbone, &self.device.device, &suffix_ids)?;
+            profile.prompt_embed_ms = elapsed_ms(prompt_embed_started);
+
+            let prompt_concat_started = Instant::now();
             let prompt_embeds = Tensor::cat(&[&prefix_embeds, &audio_embeds, &suffix_embeds], 1)?;
             let prompt_tokens = prompt_embeds.dim(1)?;
+            profile.prompt_concat_ms = elapsed_ms(prompt_concat_started);
 
+            let prefill_started = Instant::now();
             let hidden = main_backbone.forward_embeds(&prompt_embeds, 0)?;
             let mut logits = main_backbone.project_last_hidden(&hidden)?;
+            profile.main_prefill_ms = elapsed_ms(prefill_started);
             let mut position = prompt_tokens;
             let mut generated_ids = Vec::new();
             let mut assembled = String::new();
             let max_new_tokens = max_new_tokens.max(1);
 
+            let decode_started = Instant::now();
             while generated_ids.len() < max_new_tokens {
+                let argmax_started = Instant::now();
                 let next = argmax(&logits, vocab_limit)?;
+                profile.decode_argmax_ms += elapsed_ms(argmax_started);
+                profile.host_argmax_reads = profile.host_argmax_reads.saturating_add(1);
                 if next == specials.im_end
                     || next == specials.eos
                     || specials.eos_alt == Some(next)
@@ -249,7 +304,9 @@ impl Lfm25AudioModel {
                 }
 
                 generated_ids.push(next);
+                let tokenizer_started = Instant::now();
                 let decoded = self.tokenizer.decode_text(&generated_ids)?;
+                profile.tokenizer_decode_ms += elapsed_ms(tokenizer_started);
                 let delta = text_delta(&assembled, &decoded);
                 if !delta.is_empty() {
                     for ch in delta.chars() {
@@ -263,17 +320,77 @@ impl Lfm25AudioModel {
                     break;
                 }
 
+                let token_tensor_started = Instant::now();
                 let next_tensor = Tensor::from_vec(vec![next], (1, 1), &self.device.device)?;
+                profile.decode_token_tensor_ms += elapsed_ms(token_tensor_started);
+                let decode_forward_started = Instant::now();
                 logits = main_backbone.forward_tokens(&next_tensor, position)?;
+                profile.decode_forward_ms += elapsed_ms(decode_forward_started);
                 position += 1;
             }
+            profile.decode_loop_ms = elapsed_ms(decode_started);
 
-            Ok(Lfm25AudioTextOutput {
-                text: assembled.trim().to_string(),
-                prompt_tokens,
-                tokens_generated: generated_ids.len(),
-            })
-        })
+            Ok((
+                Lfm25AudioTextOutput {
+                    text: assembled.trim().to_string(),
+                    prompt_tokens,
+                    tokens_generated: generated_ids.len(),
+                    diagnostics: None,
+                },
+                profile,
+            ))
+        })?;
+        let main_backbone_ms = elapsed_ms(main_started);
+        let model_total_ms = elapsed_ms(total_started);
+        output.diagnostics = Some(serde_json::json!({
+            "model": "lfm25_audio",
+            "task": "asr",
+            "timings_ms": {
+                "resample": resample_ms,
+                "feature_extract": feature_extract_ms,
+                "mel": feature_extract_ms,
+                "encoder_forward": encoder_forward_ms,
+                "audio_encode": encoder_forward_ms,
+                "prompt_build": prompt_build_ms,
+                "prompt_embed": profile.prompt_embed_ms,
+                "prompt_concat": profile.prompt_concat_ms,
+                "prefill": profile.main_prefill_ms,
+                "main_prefill": profile.main_prefill_ms,
+                "decode": profile.decode_loop_ms,
+                "decode_argmax": profile.decode_argmax_ms,
+                "decode_token_tensor": profile.decode_token_tensor_ms,
+                "decode_forward": profile.decode_forward_ms,
+                "tokenizer_decode": profile.tokenizer_decode_ms,
+                "main_backbone": main_backbone_ms,
+                "model_total": model_total_ms
+            },
+            "prompt": {
+                "prompt_tokens": output.prompt_tokens,
+                "prefix_tokens": prefix_ids.len(),
+                "suffix_tokens": suffix_ids.len()
+            },
+            "audio": {
+                "input_samples": audio.len(),
+                "input_sample_rate": sample_rate,
+                "resampled_samples": mono_16khz.len(),
+                "feature_frames": feature_frames,
+                "audio_tokens": audio_tokens
+            },
+            "decode": {
+                "generated_tokens": output.tokens_generated,
+                "max_new_tokens": max_new_tokens,
+                "host_argmax_reads": profile.host_argmax_reads,
+                "profile": {
+                    "enabled": true,
+                    "sampling_ms": profile.decode_argmax_ms,
+                    "token_tensor_ms": profile.decode_token_tensor_ms,
+                    "decoder_forward_ms": profile.decode_forward_ms,
+                    "tokenizer_decode_ms": profile.tokenizer_decode_ms,
+                    "step_total_ms": profile.decode_loop_ms
+                }
+            }
+        }));
+        Ok(output)
     }
 
     pub fn generate_sequential(
@@ -306,22 +423,31 @@ impl Lfm25AudioModel {
         generation_config: &Lfm25AudioGenerationConfig,
         on_text_delta: &mut dyn FnMut(&str),
     ) -> Result<Lfm25AudioGenerationOutput> {
+        let total_started = Instant::now();
+        let prompt_build_started = Instant::now();
         let prompt_ids = self.build_chat_prompt(messages)?;
+        let prompt_build_ms = elapsed_ms(prompt_build_started);
         let vocab_limit = self.tokenizer.vocab_size();
         let specials = self.tokenizer.specials().clone();
         let codebooks = self.decoder_config.codebooks;
 
-        let (text, prompt_tokens, tokens_generated, audio_codes) =
-            self.with_main_backbone(|main_backbone| {
+        let main_started = Instant::now();
+        let (text, prompt_tokens, tokens_generated, audio_codes, profile) = self
+            .with_main_backbone(|main_backbone| {
+                let mut profile = Lfm25TtsProfile::default();
                 let mut rng = SimpleRng::new(generation_config.seed);
                 main_backbone.reset_state();
 
+                let prompt_embed_started = Instant::now();
                 let prompt_embeds =
                     embed_token_ids(main_backbone, &self.device.device, &prompt_ids)?;
+                profile.prompt_embed_ms = elapsed_ms(prompt_embed_started);
                 let prompt_tokens = prompt_embeds.dim(1)?;
+                let prefill_started = Instant::now();
                 let prompt_hidden = main_backbone.forward_embeds(&prompt_embeds, 0)?;
                 let mut last_hidden = last_hidden_state(&prompt_hidden)?;
                 let mut logits = main_backbone.project_last_hidden(&prompt_hidden)?;
+                profile.main_prefill_ms = elapsed_ms(prefill_started);
                 let mut position = prompt_tokens;
                 let mut visible_text_ids = Vec::new();
                 let mut visible_text = String::new();
@@ -332,12 +458,15 @@ impl Lfm25AudioModel {
 
                 while tokens_generated < max_new_tokens {
                     if !in_audio {
+                        let sampling_started = Instant::now();
                         let next = sample_from_logits(
                             &logits,
                             vocab_limit,
                             &generation_config.text,
                             &mut rng,
                         )?;
+                        profile.text_sampling_ms += elapsed_ms(sampling_started);
+                        profile.text_sample_calls = profile.text_sample_calls.saturating_add(1);
                         tokens_generated += 1;
 
                         if next == specials.im_end
@@ -351,7 +480,9 @@ impl Lfm25AudioModel {
                             in_audio = true;
                         } else if next != specials.text_end {
                             visible_text_ids.push(next);
+                            let tokenizer_started = Instant::now();
                             let decoded = self.tokenizer.decode_text(&visible_text_ids)?;
+                            profile.tokenizer_decode_ms += elapsed_ms(tokenizer_started);
                             let delta = text_delta(&visible_text, &decoded);
                             if !delta.is_empty() {
                                 for ch in delta.chars() {
@@ -362,22 +493,27 @@ impl Lfm25AudioModel {
                             visible_text = decoded;
                         }
 
+                        let text_forward_started = Instant::now();
                         let next_embed =
                             embed_token_ids(main_backbone, &self.device.device, &[next])?;
                         let step_hidden = main_backbone.forward_embeds(&next_embed, position)?;
                         position += 1;
                         last_hidden = last_hidden_state(&step_hidden)?;
                         logits = main_backbone.project_last_hidden(&step_hidden)?;
+                        profile.text_forward_ms += elapsed_ms(text_forward_started);
 
                         if has_token_repetition_loop(&visible_text_ids) {
                             break;
                         }
                     } else {
+                        let audio_head_started = Instant::now();
                         let frame = self.audio_head.sample_audio_frame(
                             &last_hidden,
                             &generation_config.audio,
                             &mut rng,
                         )?;
+                        profile.audio_head_ms += elapsed_ms(audio_head_started);
+                        profile.audio_head_calls = profile.audio_head_calls.saturating_add(1);
                         tokens_generated += 1;
                         let is_end =
                             frame.first().copied() == Some(self.audio_head.audio_end_token_id());
@@ -387,12 +523,16 @@ impl Lfm25AudioModel {
                             }
                         }
 
+                        let audio_embed_started = Instant::now();
                         let audio_embed = self
                             .audio_head
                             .embed_audio_frame(&frame, &self.device.device)?;
+                        profile.audio_embed_ms += elapsed_ms(audio_embed_started);
+                        let audio_forward_started = Instant::now();
                         let step_hidden = main_backbone.forward_embeds(&audio_embed, position)?;
                         position += 1;
                         last_hidden = last_hidden_state(&step_hidden)?;
+                        profile.audio_forward_ms += elapsed_ms(audio_forward_started);
 
                         if is_end {
                             in_audio = false;
@@ -406,17 +546,57 @@ impl Lfm25AudioModel {
                     prompt_tokens,
                     tokens_generated,
                     audio_codes,
+                    profile,
                 ))
             })?;
+        let main_backbone_ms = elapsed_ms(main_started);
 
+        let detokenizer_started = Instant::now();
         let samples = self.detokenizer.decode(&audio_codes, &self.device.device)?;
+        let detokenizer_ms = elapsed_ms(detokenizer_started);
+        let model_total_ms = elapsed_ms(total_started);
+        let audio_frames_generated = audio_codes.first().map(Vec::len).unwrap_or(0);
+        let samples_len = samples.len();
         Ok(Lfm25AudioGenerationOutput {
             text,
             prompt_tokens,
             tokens_generated,
-            audio_frames_generated: audio_codes.first().map(Vec::len).unwrap_or(0),
+            audio_frames_generated,
             samples,
             sample_rate: self.decoder_config.output_sample_rate,
+            diagnostics: Some(serde_json::json!({
+                "model": "lfm25_audio",
+                "task": "tts",
+                "timings_ms": {
+                    "prompt_build": prompt_build_ms,
+                    "prompt_embed": profile.prompt_embed_ms,
+                    "prefill": profile.main_prefill_ms,
+                    "main_prefill": profile.main_prefill_ms,
+                    "text_sampling": profile.text_sampling_ms,
+                    "tokenizer_decode": profile.tokenizer_decode_ms,
+                    "text_forward": profile.text_forward_ms,
+                    "audio_head": profile.audio_head_ms,
+                    "audio_embed": profile.audio_embed_ms,
+                    "audio_forward": profile.audio_forward_ms,
+                    "main_backbone": main_backbone_ms,
+                    "detokenizer": detokenizer_ms,
+                    "model_total": model_total_ms
+                },
+                "prompt": {
+                    "prompt_tokens": prompt_tokens
+                },
+                "decode": {
+                    "generated_tokens": tokens_generated,
+                    "max_new_tokens": max_new_tokens,
+                    "text_sample_calls": profile.text_sample_calls,
+                    "audio_head_calls": profile.audio_head_calls
+                },
+                "audio": {
+                    "audio_frames": audio_frames_generated,
+                    "sample_rate": self.decoder_config.output_sample_rate,
+                    "samples": samples_len
+                }
+            })),
         })
     }
 
@@ -624,6 +804,7 @@ impl Lfm25AudioModel {
             audio_frames_generated: audio_codes.first().map(Vec::len).unwrap_or(0),
             samples,
             sample_rate: self.decoder_config.output_sample_rate,
+            diagnostics: None,
         })
     }
 
@@ -845,6 +1026,10 @@ fn embed_token_ids(
 ) -> Result<Tensor> {
     let ids = Tensor::from_vec(token_ids.to_vec(), (1, token_ids.len()), device)?;
     backbone.embed_tokens(&ids)
+}
+
+fn elapsed_ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
 }
 
 fn last_hidden_state(hidden_states: &Tensor) -> Result<Tensor> {

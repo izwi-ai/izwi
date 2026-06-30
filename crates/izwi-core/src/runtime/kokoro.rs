@@ -70,6 +70,7 @@ impl RuntimeService {
             sample_rate: result.sample_rate,
             total_tokens: result.tokens_generated,
             total_time_ms,
+            diagnostics: None,
         })
     }
 

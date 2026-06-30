@@ -1,11 +1,11 @@
 //! OpenAI-compatible speech synthesis endpoints.
 
 use axum::{
-    Json,
     body::Body,
     extract::{Extension, State},
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     response::Response,
+    Json,
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -22,11 +22,11 @@ use izwi_core::audio::{AudioEncoder, AudioFormat};
 use izwi_core::runtime_models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
 use izwi_core::runtime_models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use izwi_core::{
-    AudioChunk, GenerationConfig, GenerationRequest, ModelVariant, parse_tts_model_variant,
+    parse_tts_model_variant, AudioChunk, GenerationConfig, GenerationRequest, ModelVariant,
 };
 
 const DEFAULT_STREAM_EVENT_QUEUE_CAPACITY: usize = 32;
-const SPEECH_RESPONSE_EXPOSED_HEADERS: &str = "X-Generation-Time-Ms, X-Audio-Duration-Secs, X-RTF, X-Tokens-Generated, X-Audio-Sample-Rate, X-Requested-Response-Format, X-Actual-Response-Format, X-Response-Format-Fallback";
+const SPEECH_RESPONSE_EXPOSED_HEADERS: &str = "X-Generation-Time-Ms, X-Audio-Duration-Secs, X-RTF, X-Tokens-Generated, X-Audio-Sample-Rate, X-Izwi-Tts-Diagnostics, X-Requested-Response-Format, X-Actual-Response-Format, X-Response-Format-Fallback";
 
 /// OpenAI-compatible speech synthesis request.
 #[derive(Debug, Deserialize)]
@@ -210,6 +210,9 @@ pub async fn speech(
                     "299 Izwi \"Requested response_format returned {actual_format}; fallback was explicitly enabled\""
                 ),
             );
+    }
+    if let Some(diagnostics) = result.diagnostics.as_ref() {
+        builder = builder.header("X-Izwi-Tts-Diagnostics", diagnostics.to_string());
     }
     Ok(builder.body(Body::from(audio_bytes)).unwrap())
 }

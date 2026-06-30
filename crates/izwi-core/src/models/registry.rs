@@ -504,6 +504,7 @@ pub struct NativeAudioChatGeneration {
     pub audio_frames_generated: usize,
     pub samples: Vec<f32>,
     pub sample_rate: u32,
+    pub diagnostics: Option<serde_json::Value>,
 }
 
 pub enum NativeAsrDecodeState {
@@ -1150,6 +1151,7 @@ impl NativeAudioChatModel {
                     audio_frames_generated: output.audio_frames_generated,
                     samples: output.samples,
                     sample_rate: output.sample_rate,
+                    diagnostics: output.diagnostics,
                 })
             }
         }
@@ -1188,6 +1190,7 @@ impl NativeAudioChatModel {
                     audio_frames_generated: output.audio_frames_generated,
                     samples: output.samples,
                     sample_rate: output.sample_rate,
+                    diagnostics: output.diagnostics,
                 })
             }
         }
@@ -1210,7 +1213,7 @@ impl NativeAudioChatModel {
                 Ok(NativeAsrTranscription {
                     text: output.text,
                     language: None,
-                    diagnostics: None,
+                    diagnostics: output.diagnostics,
                 })
             }
         }

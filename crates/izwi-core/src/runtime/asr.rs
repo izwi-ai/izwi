@@ -237,7 +237,7 @@ impl RuntimeService {
             } else {
                 0.0
             },
-            asr_diagnostics: None,
+            asr_diagnostics: output.diagnostics,
         })
     }
 
