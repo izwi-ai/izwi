@@ -9,8 +9,8 @@ use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 
 use crate::error::{Error, Result};
 use crate::kernels::{
-    try_fused_decode_gqa_attention_with_kv_len, try_fused_qk_rms_norm, try_fused_rope_pair_bshd,
-    try_fused_silu_mul_with_status,
+    try_fused_decode_gqa_attention_with_kv_len, try_fused_qk_rms_norm, try_fused_rms_norm,
+    try_fused_rope_pair_bshd, try_fused_silu_mul_with_status,
 };
 use crate::models::shared::telemetry::{
     record_decode_attention_path, record_fused_attention_attempt, record_fused_attention_fallback,
@@ -308,6 +308,16 @@ impl DepthRmsNorm {
     }
 
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        if input.device().is_metal() {
+            let input = if input.is_contiguous() {
+                input.clone()
+            } else {
+                input.contiguous()?
+            };
+            if let Some(output) = try_fused_rms_norm(&input, &self.weight, self.eps) {
+                return Ok(output);
+            }
+        }
         candle_nn::ops::rms_norm(input, &self.weight, self.eps as f32).map_err(Error::from)
     }
 
