@@ -13,11 +13,16 @@ use crate::error::{Error, Result};
 pub mod artifacts;
 pub mod codec;
 pub mod config;
+pub mod contracts;
 pub mod tokenizer;
 
 pub use artifacts::FishS2ArtifactManifest;
 pub use codec::{FishS2CodecArtifact, FishS2CodecSupport};
 pub use config::{FishS2AudioDecoderConfig, FishS2Config, FishS2TextConfig};
+pub use contracts::{
+    build_semantic_allowed_mask, remap_fish_qwen3_omni_key, semantic_code_from_token_id,
+    semantic_token_id, FishS2DacContract, FishS2PromptTensorShape,
+};
 pub use tokenizer::{FishS2PromptTokenizer, FishS2SpecialTokens};
 
 #[derive(Debug, Clone)]
