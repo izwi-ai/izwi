@@ -623,6 +623,9 @@ fn fish_s2_codec_support_name(support: FishS2CodecSupport) -> &'static str {
 }
 
 #[cfg(test)]
+mod smoke;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use candle_core::Device;
