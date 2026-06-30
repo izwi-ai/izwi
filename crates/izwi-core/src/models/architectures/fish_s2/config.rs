@@ -112,6 +112,13 @@ impl FishS2Config {
                 "Fish S2 semantic token range is empty".to_string(),
             ));
         }
+        if self.semantic_vocab_size() != self.codebook_size {
+            return Err(Error::ModelLoadError(format!(
+                "Fish S2 semantic token range has {} entries but codebook_size is {}",
+                self.semantic_vocab_size(),
+                self.codebook_size
+            )));
+        }
         if self.audio_pad_token_id == self.semantic_start_token_id {
             return Err(Error::ModelLoadError(
                 "Fish S2 audio pad token must differ from semantic start token".to_string(),
@@ -123,7 +130,7 @@ impl FishS2Config {
     }
 
     pub fn semantic_vocab_size(&self) -> usize {
-        (self.semantic_end_token_id - self.semantic_start_token_id) as usize
+        (self.semantic_end_token_id - self.semantic_start_token_id + 1) as usize
     }
 }
 
@@ -170,11 +177,8 @@ impl FishS2AudioDecoderConfig {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn current_config_json() -> &'static str {
-        r#"{
+pub(crate) fn current_config_json() -> &'static str {
+    r#"{
           "architectures": ["DualARTransformer"],
           "model_type": "fish_qwen3_omni",
           "torch_dtype": "bfloat16",
@@ -209,7 +213,16 @@ mod tests {
             "max_seq_len": 11
           }
         }"#
-    }
+}
+
+#[cfg(test)]
+pub(crate) fn current_config() -> FishS2Config {
+    serde_json::from_str(current_config_json()).expect("current Fish S2 config")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     #[test]
     fn parses_current_fish_s2_config_shape() {
@@ -217,7 +230,7 @@ mod tests {
         config.validate().unwrap();
         assert_eq!(config.num_codebooks, 10);
         assert_eq!(config.codebook_size, 4096);
-        assert_eq!(config.semantic_vocab_size(), 4095);
+        assert_eq!(config.semantic_vocab_size(), 4096);
         assert_eq!(config.text_config.hidden_size, 2560);
         assert_eq!(config.text_config.num_hidden_layers, 36);
         assert_eq!(config.text_config.num_attention_heads, 32);
