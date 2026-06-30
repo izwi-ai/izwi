@@ -165,6 +165,8 @@ struct TtsStageTimings {
     audio_head_sample: Option<f64>,
     audio_head_embed_step: Option<f64>,
     audio_head_materialize: Option<f64>,
+    audio_head_materialize_pack: Option<f64>,
+    audio_head_materialize_readback: Option<f64>,
     audio_embed: Option<f64>,
     audio_forward: Option<f64>,
     main_backbone: Option<f64>,
@@ -2761,6 +2763,12 @@ fn tts_stage_timings_from_diagnostics(diagnostics: &serde_json::Value) -> Option
         audio_head_materialize: timings
             .get("audio_head_materialize")
             .and_then(|value| value.as_f64()),
+        audio_head_materialize_pack: timings
+            .get("audio_head_materialize_pack")
+            .and_then(|value| value.as_f64()),
+        audio_head_materialize_readback: timings
+            .get("audio_head_materialize_readback")
+            .and_then(|value| value.as_f64()),
         audio_embed: timings.get("audio_embed").and_then(|value| value.as_f64()),
         audio_forward: timings
             .get("audio_forward")
@@ -3278,6 +3286,8 @@ fn print_tts_stage_timing_summary(samples: &[TtsStageTimings]) {
     let mut audio_head_sample = Vec::new();
     let mut audio_head_embed_step = Vec::new();
     let mut audio_head_materialize = Vec::new();
+    let mut audio_head_materialize_pack = Vec::new();
+    let mut audio_head_materialize_readback = Vec::new();
     let mut audio_embed = Vec::new();
     let mut audio_forward = Vec::new();
     let mut main_backbone = Vec::new();
@@ -3342,6 +3352,12 @@ fn print_tts_stage_timing_summary(samples: &[TtsStageTimings]) {
         }
         if let Some(value) = sample.audio_head_materialize {
             audio_head_materialize.push(value);
+        }
+        if let Some(value) = sample.audio_head_materialize_pack {
+            audio_head_materialize_pack.push(value);
+        }
+        if let Some(value) = sample.audio_head_materialize_readback {
+            audio_head_materialize_readback.push(value);
         }
         if let Some(value) = sample.audio_embed {
             audio_embed.push(value);
@@ -3420,6 +3436,8 @@ fn print_tts_stage_timing_summary(samples: &[TtsStageTimings]) {
     summarize_stage("ah_sample", &audio_head_sample);
     summarize_stage("ah_embed", &audio_head_embed_step);
     summarize_stage("ah_material", &audio_head_materialize);
+    summarize_stage("ah_pack", &audio_head_materialize_pack);
+    summarize_stage("ah_read", &audio_head_materialize_readback);
     summarize_stage("audio_embed", &audio_embed);
     summarize_stage("audio_forward", &audio_forward);
     summarize_stage("main_backbone", &main_backbone);
@@ -4287,6 +4305,8 @@ mod tests {
                 "audio_head_depthformer": 5.2,
                 "audio_head_sample": 5.3,
                 "audio_head_materialize": 5.4,
+                "audio_head_materialize_pack": 5.41,
+                "audio_head_materialize_readback": 5.42,
                 "detokenizer": 6.0,
                 "detokenizer_backbone": 6.1,
                 "detokenizer_readback": 6.2,
@@ -4317,6 +4337,8 @@ mod tests {
         assert_eq!(timings.audio_head_depthformer, Some(5.2));
         assert_eq!(timings.audio_head_sample, Some(5.3));
         assert_eq!(timings.audio_head_materialize, Some(5.4));
+        assert_eq!(timings.audio_head_materialize_pack, Some(5.41));
+        assert_eq!(timings.audio_head_materialize_readback, Some(5.42));
         assert_eq!(timings.detokenizer, Some(6.0));
         assert_eq!(timings.detokenizer_backbone, Some(6.1));
         assert_eq!(timings.detokenizer_readback, Some(6.2));
