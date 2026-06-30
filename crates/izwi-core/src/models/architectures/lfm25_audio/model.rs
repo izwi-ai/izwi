@@ -31,7 +31,7 @@ use super::LFM25_AUDIO_DEFAULT_INTERLEAVED_SYSTEM_PROMPT;
 const DEFAULT_MAX_NEW_TOKENS: usize = 1024;
 const DEFAULT_AUDIO_STREAM_DECODE_STRIDE_FRAMES: usize = 6;
 const DEFAULT_AUDIO_STREAM_HOLDBACK_FRAMES: usize = 2;
-const DEFAULT_ASR_STOP_CHECK_INTERVAL: usize = 8;
+const DEFAULT_ASR_STOP_CHECK_INTERVAL: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct Lfm25AudioTextOutput {
@@ -1226,8 +1226,11 @@ fn is_asr_stop_token(next: u32, specials: &Lfm25SpecialTokenIds) -> bool {
 }
 
 fn lfm25_asr_stop_check_interval() -> usize {
-    std::env::var("IZWI_LFM25_ASR_STOP_CHECK_INTERVAL")
-        .ok()
+    lfm25_asr_stop_check_interval_from_env(std::env::var("IZWI_LFM25_ASR_STOP_CHECK_INTERVAL").ok())
+}
+
+fn lfm25_asr_stop_check_interval_from_env(value: Option<String>) -> usize {
+    value
         .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_ASR_STOP_CHECK_INTERVAL)
         .clamp(1, 64)
@@ -1338,6 +1341,31 @@ mod tests {
         assert_eq!(
             strip_past_assistant_thinking("<think>plan</think>final answer"),
             "final answer"
+        );
+    }
+
+    #[test]
+    fn asr_stop_check_interval_defaults_to_sixteen() {
+        assert_eq!(lfm25_asr_stop_check_interval_from_env(None), 16);
+        assert_eq!(
+            lfm25_asr_stop_check_interval_from_env(Some("bad".to_string())),
+            16
+        );
+    }
+
+    #[test]
+    fn asr_stop_check_interval_clamps_override() {
+        assert_eq!(
+            lfm25_asr_stop_check_interval_from_env(Some("0".to_string())),
+            1
+        );
+        assert_eq!(
+            lfm25_asr_stop_check_interval_from_env(Some("128".to_string())),
+            64
+        );
+        assert_eq!(
+            lfm25_asr_stop_check_interval_from_env(Some("32".to_string())),
+            32
         );
     }
 
