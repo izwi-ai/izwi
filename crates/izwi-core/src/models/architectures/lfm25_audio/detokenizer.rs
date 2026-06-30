@@ -23,6 +23,7 @@ pub struct Lfm25AudioDetokenizer {
     hop_length: usize,
     codebooks: usize,
     codebook_offsets: Vec<u32>,
+    codebook_offsets_tensor: Tensor,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -69,6 +70,11 @@ impl Lfm25AudioDetokenizer {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let codebook_offsets_tensor = Tensor::from_vec(
+            codebook_offsets.clone(),
+            (decoder_config.codebooks,),
+            device,
+        )?;
 
         Ok(Self {
             fused_embedding,
@@ -81,6 +87,7 @@ impl Lfm25AudioDetokenizer {
             hop_length: decoder_config.output_hop_length,
             codebooks: decoder_config.codebooks,
             codebook_offsets,
+            codebook_offsets_tensor,
         })
     }
 
@@ -151,6 +158,51 @@ impl Lfm25AudioDetokenizer {
         Ok((samples, profile))
     }
 
+    pub fn decode_token_ids_with_profile(
+        &self,
+        audio_codes: &Tensor,
+    ) -> Result<(Vec<f32>, Lfm25DetokenizerProfile)> {
+        let mut profile = Lfm25DetokenizerProfile::default();
+        let (frames, codebooks) = audio_codes.dims2()?;
+        if codebooks != self.codebooks {
+            return Err(Error::InvalidInput(format!(
+                "Expected {} audio codebooks, received {codebooks}",
+                self.codebooks
+            )));
+        }
+        if frames == 0 {
+            return Ok((Vec::new(), profile));
+        }
+
+        let embedding_started = Instant::now();
+        let embeds = self.fused_embeddings_from_token_ids(audio_codes)?;
+        profile.embedding_ms = elapsed_ms(embedding_started);
+
+        let upsample_started = Instant::now();
+        let upsampled = self.upsample_nearest(&embeds)?;
+        profile.upsample_ms = elapsed_ms(upsample_started);
+
+        let projected = {
+            let mut guard = self.backbone.lock().map_err(|_| {
+                Error::InferenceError("LFM2.5 Audio detokenizer mutex poisoned".to_string())
+            })?;
+            guard.reset_state();
+            let backbone_started = Instant::now();
+            let hidden = guard.forward_embeds(&upsampled, 0)?;
+            profile.backbone_forward_ms = elapsed_ms(backbone_started);
+            let projection_started = Instant::now();
+            let projected = guard.project_hidden(&hidden)?;
+            profile.projection_ms = elapsed_ms(projection_started);
+            projected
+        };
+
+        let (samples, waveform_profile) = self.projected_to_waveform_with_profile(&projected)?;
+        profile.waveform_prepare_ms = waveform_profile.waveform_prepare_ms;
+        profile.readback_ms = waveform_profile.readback_ms;
+        profile.istft_ms = waveform_profile.istft_ms;
+        Ok((samples, profile))
+    }
+
     fn fused_embeddings(&self, audio_codes: &[Vec<u32>], device: &Device) -> Result<Tensor> {
         let frames = audio_codes[0].len();
         let mut flat = Vec::with_capacity(frames * self.codebooks);
@@ -161,6 +213,15 @@ impl Lfm25AudioDetokenizer {
         }
 
         let ids = Tensor::from_vec(flat, (frames, self.codebooks), device)?;
+        let embeds = self.fused_embedding.forward(&ids)?; // [T, C, D]
+        let embeds = embeds.sum(1)?.affine(1.0 / self.codebooks as f64, 0.0)?;
+        embeds.unsqueeze(0).map_err(Error::from)
+    }
+
+    fn fused_embeddings_from_token_ids(&self, audio_codes: &Tensor) -> Result<Tensor> {
+        let ids = audio_codes
+            .broadcast_add(&self.codebook_offsets_tensor)?
+            .contiguous()?;
         let embeds = self.fused_embedding.forward(&ids)?; // [T, C, D]
         let embeds = embeds.sum(1)?.affine(1.0 / self.codebooks as f64, 0.0)?;
         embeds.unsqueeze(0).map_err(Error::from)
