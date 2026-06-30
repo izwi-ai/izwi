@@ -207,6 +207,7 @@ impl RuntimeService {
         variant: ModelVariant,
         samples: Vec<f32>,
         sample_rate: u32,
+        max_tokens: Option<usize>,
         mut on_delta: F,
     ) -> Result<AsrTranscription>
     where
@@ -227,7 +228,12 @@ impl RuntimeService {
                 on_delta(delta.to_string());
             }
         };
-        let output = model.transcribe_with_callback(&samples, sample_rate, &mut delta_sink)?;
+        let output = model.transcribe_with_callback_and_max_tokens(
+            &samples,
+            sample_rate,
+            max_tokens,
+            &mut delta_sink,
+        )?;
 
         Ok(AsrTranscription {
             text: output.text,
@@ -245,6 +251,7 @@ impl RuntimeService {
         &self,
         variant: ModelVariant,
         audio_base64: &str,
+        max_tokens: Option<usize>,
         on_delta: F,
     ) -> Result<AsrTranscription>
     where
@@ -252,7 +259,7 @@ impl RuntimeService {
     {
         let audio_bytes = base64_decode(audio_base64)?;
         let (samples, sample_rate) = decode_audio_bytes(&audio_bytes)?;
-        self.asr_transcribe_audio_chat_samples(variant, samples, sample_rate, on_delta)
+        self.asr_transcribe_audio_chat_samples(variant, samples, sample_rate, max_tokens, on_delta)
             .await
     }
 
@@ -260,13 +267,14 @@ impl RuntimeService {
         &self,
         variant: ModelVariant,
         audio_bytes: &[u8],
+        max_tokens: Option<usize>,
         on_delta: F,
     ) -> Result<AsrTranscription>
     where
         F: FnMut(String),
     {
         let (samples, sample_rate) = decode_audio_bytes(audio_bytes)?;
-        self.asr_transcribe_audio_chat_samples(variant, samples, sample_rate, on_delta)
+        self.asr_transcribe_audio_chat_samples(variant, samples, sample_rate, max_tokens, on_delta)
             .await
     }
 
@@ -354,7 +362,7 @@ impl RuntimeService {
         if variant.is_audio_chat() {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
             return self
-                .asr_transcribe_audio_chat_base64(variant, audio_base64, |_delta| {})
+                .asr_transcribe_audio_chat_base64(variant, audio_base64, max_tokens, |_delta| {})
                 .await;
         }
 
@@ -441,7 +449,7 @@ impl RuntimeService {
         if variant.is_audio_chat() {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), true)?;
             return self
-                .asr_transcribe_audio_chat_base64(variant, audio_base64, on_delta)
+                .asr_transcribe_audio_chat_base64(variant, audio_base64, max_tokens, on_delta)
                 .await;
         }
 
@@ -525,7 +533,7 @@ impl RuntimeService {
         if variant.is_audio_chat() {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
             return self
-                .asr_transcribe_audio_chat_bytes(variant, audio_bytes, |_delta| {})
+                .asr_transcribe_audio_chat_bytes(variant, audio_bytes, max_tokens, |_delta| {})
                 .await;
         }
 
@@ -644,7 +652,7 @@ impl RuntimeService {
         if variant.is_audio_chat() {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), true)?;
             return self
-                .asr_transcribe_audio_chat_bytes(variant, audio_bytes, on_delta)
+                .asr_transcribe_audio_chat_bytes(variant, audio_bytes, max_tokens, on_delta)
                 .await;
         }
 

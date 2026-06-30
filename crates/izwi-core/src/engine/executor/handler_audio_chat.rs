@@ -65,7 +65,9 @@ impl NativeExecutor {
             })
         })?;
 
-        let input_transcription = Self::run_blocking(|| model.transcribe(&samples, sample_rate))?;
+        let input_transcription = Self::run_blocking(|| {
+            model.transcribe_long_form_with_callback(&samples, sample_rate, None, &mut |_delta| {})
+        })?;
         let output = Self::run_blocking(|| {
             if let Some(tx) = stream_tx.as_ref() {
                 let stream_sequence = std::cell::Cell::new(0usize);
