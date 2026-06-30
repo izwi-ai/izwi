@@ -98,6 +98,9 @@ struct Lfm25AsrProfile {
     host_token_reads: u64,
     host_read_chunks: u64,
     device_token_steps: u64,
+    token_repetition_loop: bool,
+    text_repetition_loop: bool,
+    stop_reason: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -314,6 +317,7 @@ impl Lfm25AudioModel {
             let mut generated_ids = Vec::new();
             let mut assembled = String::new();
             let max_new_tokens = max_new_tokens.max(1);
+            let mut stop_reason = "max_tokens";
             let stop_check_interval = lfm25_asr_stop_check_interval();
             let use_deferred_device_decode = (self.device.device.is_metal()
                 || self.device.device.is_cuda())
@@ -363,18 +367,27 @@ impl Lfm25AudioModel {
                     let mut should_stop = false;
                     for next in host_tokens {
                         if is_asr_stop_token(next, &specials) {
+                            stop_reason = "stop_token";
                             should_stop = true;
                             break;
                         }
 
-                        if append_asr_text_token(
+                        let append_status = append_asr_text_token(
                             &self.tokenizer,
                             &mut generated_ids,
                             &mut assembled,
                             next,
                             &mut profile,
                             on_delta,
-                        )? {
+                        )?;
+                        if append_status.should_stop() {
+                            profile.token_repetition_loop |= append_status.token_repetition_loop;
+                            profile.text_repetition_loop |= append_status.text_repetition_loop;
+                            stop_reason = if append_status.text_repetition_loop {
+                                "text_repetition_loop"
+                            } else {
+                                "token_repetition_loop"
+                            };
                             should_stop = true;
                             break;
                         }
@@ -391,17 +404,26 @@ impl Lfm25AudioModel {
                     profile.token_select_reads = profile.token_select_reads.saturating_add(1);
                     profile.host_token_reads = profile.host_token_reads.saturating_add(1);
                     if is_asr_stop_token(next, &specials) {
+                        stop_reason = "stop_token";
                         break;
                     }
 
-                    if append_asr_text_token(
+                    let append_status = append_asr_text_token(
                         &self.tokenizer,
                         &mut generated_ids,
                         &mut assembled,
                         next,
                         &mut profile,
                         on_delta,
-                    )? {
+                    )?;
+                    if append_status.should_stop() {
+                        profile.token_repetition_loop |= append_status.token_repetition_loop;
+                        profile.text_repetition_loop |= append_status.text_repetition_loop;
+                        stop_reason = if append_status.text_repetition_loop {
+                            "text_repetition_loop"
+                        } else {
+                            "token_repetition_loop"
+                        };
                         break;
                     }
 
@@ -415,6 +437,7 @@ impl Lfm25AudioModel {
                 }
             }
             profile.decode_loop_ms = elapsed_ms(decode_started);
+            profile.stop_reason = Some(stop_reason);
 
             Ok((
                 Lfm25AudioTextOutput {
@@ -474,6 +497,10 @@ impl Lfm25AudioModel {
             "decode": {
                 "generated_tokens": output.tokens_generated,
                 "max_new_tokens": max_new_tokens,
+                "stop_reason": profile.stop_reason.unwrap_or("unknown"),
+                "repetition_loop": profile.token_repetition_loop || profile.text_repetition_loop,
+                "token_repetition_loop": profile.token_repetition_loop,
+                "text_repetition_loop": profile.text_repetition_loop,
                 "token_select_reads": profile.token_select_reads,
                 "device_argmax_reads": device_token_select_reads,
                 "host_argmax_reads": host_argmax_reads,
@@ -1317,6 +1344,18 @@ fn text_delta(previous: &str, current: &str) -> String {
     current.chars().skip(common).collect()
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct Lfm25AsrAppendStatus {
+    token_repetition_loop: bool,
+    text_repetition_loop: bool,
+}
+
+impl Lfm25AsrAppendStatus {
+    fn should_stop(self) -> bool {
+        self.token_repetition_loop || self.text_repetition_loop
+    }
+}
+
 fn append_asr_text_token(
     tokenizer: &Lfm25TextTokenizer,
     generated_ids: &mut Vec<u32>,
@@ -1324,11 +1363,18 @@ fn append_asr_text_token(
     next: u32,
     profile: &mut Lfm25AsrProfile,
     on_delta: &mut dyn FnMut(&str),
-) -> Result<bool> {
+) -> Result<Lfm25AsrAppendStatus> {
     generated_ids.push(next);
     let tokenizer_started = Instant::now();
-    let decoded = tokenizer.decode_text(generated_ids)?;
+    let mut decoded = tokenizer.decode_text(generated_ids)?;
     profile.tokenizer_decode_ms += elapsed_ms(tokenizer_started);
+    let token_repetition_loop = has_token_repetition_loop(generated_ids);
+    let text_repetition_loop = if let Some(trimmed) = trim_repeated_phrase_tail(&decoded) {
+        decoded = trimmed;
+        true
+    } else {
+        false
+    };
     let delta = text_delta(assembled, &decoded);
     if !delta.is_empty() {
         for ch in delta.chars() {
@@ -1337,7 +1383,10 @@ fn append_asr_text_token(
         }
     }
     *assembled = decoded;
-    Ok(has_token_repetition_loop(generated_ids))
+    Ok(Lfm25AsrAppendStatus {
+        token_repetition_loop,
+        text_repetition_loop,
+    })
 }
 
 fn is_asr_stop_token(next: u32, specials: &Lfm25SpecialTokenIds) -> bool {
@@ -1419,6 +1468,83 @@ fn has_token_repetition_loop(ids: &[u32]) -> bool {
         .any(|(span, repeats)| has_suffix_repeat(ids, *span, *repeats))
 }
 
+#[derive(Debug, Clone)]
+struct NormalizedTextWord {
+    normalized: String,
+    end: usize,
+}
+
+fn trim_repeated_phrase_tail(input: &str) -> Option<String> {
+    let words = normalized_text_words(input);
+    const MIN_REPEAT_COUNT: usize = 4;
+    const MIN_PHRASE_WORDS: usize = 2;
+    const MAX_PHRASE_WORDS: usize = 8;
+    let max_phrase_words = MAX_PHRASE_WORDS.min(words.len() / MIN_REPEAT_COUNT);
+    for phrase_words in MIN_PHRASE_WORDS..=max_phrase_words {
+        let mut repeat_count = 1usize;
+        while words.len() >= phrase_words.saturating_mul(repeat_count + 1) {
+            let right_start = words.len() - phrase_words * repeat_count;
+            let left_start = right_start.saturating_sub(phrase_words);
+            if !normalized_word_ranges_equal(&words, left_start, right_start, phrase_words) {
+                break;
+            }
+            repeat_count += 1;
+        }
+
+        if repeat_count >= MIN_REPEAT_COUNT {
+            let keep_words = words.len() - phrase_words * (repeat_count - 1);
+            let end = words[keep_words - 1].end;
+            return Some(input[..end].trim_end().to_string());
+        }
+    }
+    None
+}
+
+fn normalized_word_ranges_equal(
+    words: &[NormalizedTextWord],
+    left_start: usize,
+    right_start: usize,
+    len: usize,
+) -> bool {
+    (0..len).all(|offset| {
+        words[left_start + offset].normalized == words[right_start + offset].normalized
+    })
+}
+
+fn normalized_text_words(input: &str) -> Vec<NormalizedTextWord> {
+    let mut words = Vec::new();
+    let mut start = None;
+    for (idx, ch) in input.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(word_start) = start.take() {
+                push_normalized_text_word(input, word_start, idx, &mut words);
+            }
+        } else if start.is_none() {
+            start = Some(idx);
+        }
+    }
+    if let Some(word_start) = start {
+        push_normalized_text_word(input, word_start, input.len(), &mut words);
+    }
+    words
+}
+
+fn push_normalized_text_word(
+    input: &str,
+    start: usize,
+    end: usize,
+    words: &mut Vec<NormalizedTextWord>,
+) {
+    let raw = &input[start..end];
+    let normalized = raw
+        .trim_matches(|ch: char| !ch.is_alphanumeric())
+        .to_ascii_lowercase();
+    if normalized.is_empty() {
+        return;
+    }
+    words.push(NormalizedTextWord { normalized, end });
+}
+
 fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
     if src_rate == dst_rate || audio.len() < 2 {
         return audio.to_vec();
@@ -1478,6 +1604,26 @@ mod tests {
             strip_past_assistant_thinking("<think>plan</think>final answer"),
             "final answer"
         );
+    }
+
+    #[test]
+    fn repeated_phrase_tail_trim_keeps_one_tail_occurrence() {
+        let text = "So, human spaceflight is very expensive, and it's very expensive. It's very expensive. It's very expensive. It's very expensive.";
+        let trimmed = trim_repeated_phrase_tail(text).expect("repeated phrase tail");
+
+        assert_eq!(
+            trimmed,
+            "So, human spaceflight is very expensive, and it's very expensive."
+        );
+    }
+
+    #[test]
+    fn repeated_phrase_tail_trim_ignores_short_repeats() {
+        assert!(trim_repeated_phrase_tail(
+            "This is very expensive. It is very expensive, but it may be worth it."
+        )
+        .is_none());
+        assert!(trim_repeated_phrase_tail("yes yes yes yes yes yes").is_none());
     }
 
     #[test]
