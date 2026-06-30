@@ -6,6 +6,7 @@ use candle_nn::ops;
 use candle_nn::{Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, LayerNorm, Linear, Module};
 
 use crate::error::{Error, Result};
+use crate::models::architectures::parakeet::asr::metal_kernels as parakeet_metal_kernels;
 use crate::models::shared::weights::gguf::GgufLoader;
 
 use super::config::Lfm25AudioEncoderConfig;
@@ -206,11 +207,11 @@ impl ConvSubsamplingDw {
         x = self.conv0.forward(&x)?;
         x = x.relu()?;
 
-        x = self.conv2.forward(&x)?;
+        x = forward_depthwise_conv2d(&self.conv2, &x)?;
         x = self.conv3.forward(&x)?;
         x = x.relu()?;
 
-        x = self.conv5.forward(&x)?;
+        x = forward_depthwise_conv2d(&self.conv5, &x)?;
         x = self.conv6.forward(&x)?;
         x = x.relu()?;
 
@@ -513,13 +514,53 @@ impl ConformerConv {
         let x_b = x.i((.., hidden.., ..))?;
         x = x_a.broadcast_mul(&ops::sigmoid(&x_b)?)?;
 
-        x = self.depthwise_conv.forward(&x)?;
+        x = forward_depthwise_conv1d(&self.depthwise_conv, &x)?;
         x = self.affine_norm.forward(&x)?;
         x = swish(&x)?;
         x = self.pointwise_conv2.forward(&x)?;
 
         x.transpose(1, 2).map_err(Error::from)
     }
+}
+
+fn forward_depthwise_conv1d(conv: &Conv1d, x: &Tensor) -> Result<Tensor> {
+    let cfg = conv.config();
+    let Some(mut y) = parakeet_metal_kernels::try_depthwise_conv1d(
+        x,
+        conv.weight(),
+        cfg.padding,
+        cfg.stride,
+        cfg.dilation,
+    ) else {
+        return conv.forward(x).map_err(Error::from);
+    };
+
+    if let Some(bias) = conv.bias() {
+        let channels = bias.dims1()?;
+        y = y.broadcast_add(&bias.reshape((1, channels, 1))?)?;
+    }
+
+    Ok(y)
+}
+
+fn forward_depthwise_conv2d(conv: &Conv2d, x: &Tensor) -> Result<Tensor> {
+    let cfg = conv.config();
+    let Some(mut y) = parakeet_metal_kernels::try_depthwise_conv2d(
+        x,
+        conv.weight(),
+        cfg.padding,
+        cfg.stride,
+        cfg.dilation,
+    ) else {
+        return conv.forward(x).map_err(Error::from);
+    };
+
+    if let Some(bias) = conv.bias() {
+        let channels = bias.dims1()?;
+        y = y.broadcast_add(&bias.reshape((1, channels, 1, 1))?)?;
+    }
+
+    Ok(y)
 }
 
 struct RelPosSelfAttention {
