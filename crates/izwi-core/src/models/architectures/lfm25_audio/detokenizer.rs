@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{Embedding, Module};
@@ -22,6 +23,17 @@ pub struct Lfm25AudioDetokenizer {
     hop_length: usize,
     codebooks: usize,
     codebook_offsets: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Lfm25DetokenizerProfile {
+    pub embedding_ms: f64,
+    pub upsample_ms: f64,
+    pub backbone_forward_ms: f64,
+    pub projection_ms: f64,
+    pub waveform_prepare_ms: f64,
+    pub readback_ms: f64,
+    pub istft_ms: f64,
 }
 
 impl Lfm25AudioDetokenizer {
@@ -73,6 +85,16 @@ impl Lfm25AudioDetokenizer {
     }
 
     pub fn decode(&self, audio_codes: &[Vec<u32>], device: &Device) -> Result<Vec<f32>> {
+        self.decode_with_profile(audio_codes, device)
+            .map(|(samples, _profile)| samples)
+    }
+
+    pub fn decode_with_profile(
+        &self,
+        audio_codes: &[Vec<u32>],
+        device: &Device,
+    ) -> Result<(Vec<f32>, Lfm25DetokenizerProfile)> {
+        let mut profile = Lfm25DetokenizerProfile::default();
         if audio_codes.len() != self.codebooks {
             return Err(Error::InvalidInput(format!(
                 "Expected {} audio codebooks, received {}",
@@ -83,7 +105,7 @@ impl Lfm25AudioDetokenizer {
 
         let frames = audio_codes.first().map(Vec::len).unwrap_or(0);
         if frames == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), profile));
         }
         if audio_codes.iter().any(|codes| codes.len() != frames) {
             return Err(Error::InvalidInput(
@@ -100,19 +122,33 @@ impl Lfm25AudioDetokenizer {
             ));
         }
 
+        let embedding_started = Instant::now();
         let embeds = self.fused_embeddings(audio_codes, device)?;
+        profile.embedding_ms = elapsed_ms(embedding_started);
+
+        let upsample_started = Instant::now();
         let upsampled = self.upsample_nearest(&embeds)?;
+        profile.upsample_ms = elapsed_ms(upsample_started);
 
         let projected = {
             let mut guard = self.backbone.lock().map_err(|_| {
                 Error::InferenceError("LFM2.5 Audio detokenizer mutex poisoned".to_string())
             })?;
             guard.reset_state();
+            let backbone_started = Instant::now();
             let hidden = guard.forward_embeds(&upsampled, 0)?;
-            guard.project_hidden(&hidden)?
+            profile.backbone_forward_ms = elapsed_ms(backbone_started);
+            let projection_started = Instant::now();
+            let projected = guard.project_hidden(&hidden)?;
+            profile.projection_ms = elapsed_ms(projection_started);
+            projected
         };
 
-        self.projected_to_waveform(&projected)
+        let (samples, waveform_profile) = self.projected_to_waveform_with_profile(&projected)?;
+        profile.waveform_prepare_ms = waveform_profile.waveform_prepare_ms;
+        profile.readback_ms = waveform_profile.readback_ms;
+        profile.istft_ms = waveform_profile.istft_ms;
+        Ok((samples, profile))
     }
 
     fn fused_embeddings(&self, audio_codes: &[Vec<u32>], device: &Device) -> Result<Tensor> {
@@ -140,6 +176,16 @@ impl Lfm25AudioDetokenizer {
     }
 
     fn projected_to_waveform(&self, projected: &Tensor) -> Result<Vec<f32>> {
+        self.projected_to_waveform_with_profile(projected)
+            .map(|(samples, _profile)| samples)
+    }
+
+    fn projected_to_waveform_with_profile(
+        &self,
+        projected: &Tensor,
+    ) -> Result<(Vec<f32>, Lfm25DetokenizerProfile)> {
+        let mut profile = Lfm25DetokenizerProfile::default();
+        let waveform_prepare_started = Instant::now();
         let projected = projected.i(0)?.to_dtype(DType::F32)?;
         let (_frames, width) = projected.dims2()?;
         let freq_bins = self.n_fft / 2 + 1;
@@ -149,9 +195,16 @@ impl Lfm25AudioDetokenizer {
                 freq_bins * 2
             )));
         }
+        profile.waveform_prepare_ms = elapsed_ms(waveform_prepare_started);
 
+        let readback_started = Instant::now();
         let projected = projected.to_vec2::<f32>()?;
-        self.istft_same(&projected, freq_bins)
+        profile.readback_ms = elapsed_ms(readback_started);
+
+        let istft_started = Instant::now();
+        let samples = self.istft_same(&projected, freq_bins)?;
+        profile.istft_ms = elapsed_ms(istft_started);
+        Ok((samples, profile))
     }
 
     fn istft_same(&self, projected: &[Vec<f32>], freq_bins: usize) -> Result<Vec<f32>> {
@@ -201,6 +254,10 @@ impl Lfm25AudioDetokenizer {
 
         Ok(cropped)
     }
+}
+
+fn elapsed_ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
 }
 
 fn load_embedding_any(loader: &GgufLoader, device: &Device, names: &[String]) -> Result<Embedding> {

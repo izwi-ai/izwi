@@ -101,9 +101,25 @@ struct Lfm25TtsProfile {
     tokenizer_decode_ms: f64,
     text_forward_ms: f64,
     audio_head_ms: f64,
+    audio_head_depth_linear_ms: f64,
+    audio_head_depth_reshape_ms: f64,
+    audio_head_cache_setup_ms: f64,
+    audio_head_codebook_input_ms: f64,
+    audio_head_depthformer_ms: f64,
+    audio_head_sample_ms: f64,
+    audio_head_embed_step_ms: f64,
+    audio_head_materialize_ms: f64,
     audio_embed_ms: f64,
     audio_forward_ms: f64,
+    detokenizer_embedding_ms: f64,
+    detokenizer_upsample_ms: f64,
+    detokenizer_backbone_ms: f64,
+    detokenizer_projection_ms: f64,
+    detokenizer_waveform_prepare_ms: f64,
+    detokenizer_readback_ms: f64,
+    detokenizer_istft_ms: f64,
     audio_head_calls: u64,
+    audio_head_codebook_steps: u64,
     text_sample_calls: u64,
 }
 
@@ -445,7 +461,7 @@ impl Lfm25AudioModel {
         let codebooks = self.decoder_config.codebooks;
 
         let main_started = Instant::now();
-        let (text, prompt_tokens, tokens_generated, audio_codes, profile) = self
+        let (text, prompt_tokens, tokens_generated, audio_codes, mut profile) = self
             .with_main_backbone(|main_backbone| {
                 let mut profile = Lfm25TtsProfile::default();
                 let mut rng = SimpleRng::new(generation_config.seed);
@@ -520,13 +536,26 @@ impl Lfm25AudioModel {
                         }
                     } else {
                         let audio_head_started = Instant::now();
-                        let frame = self.audio_head.sample_audio_frame(
-                            &last_hidden,
-                            &generation_config.audio,
-                            &mut rng,
-                        )?;
+                        let (frame, audio_head_profile) =
+                            self.audio_head.sample_audio_frame_with_profile(
+                                &last_hidden,
+                                &generation_config.audio,
+                                &mut rng,
+                            )?;
                         profile.audio_head_ms += elapsed_ms(audio_head_started);
+                        profile.audio_head_depth_linear_ms += audio_head_profile.depth_linear_ms;
+                        profile.audio_head_depth_reshape_ms += audio_head_profile.depth_reshape_ms;
+                        profile.audio_head_cache_setup_ms += audio_head_profile.cache_setup_ms;
+                        profile.audio_head_codebook_input_ms +=
+                            audio_head_profile.codebook_input_ms;
+                        profile.audio_head_depthformer_ms += audio_head_profile.depthformer_ms;
+                        profile.audio_head_sample_ms += audio_head_profile.sample_ms;
+                        profile.audio_head_embed_step_ms += audio_head_profile.embed_ms;
+                        profile.audio_head_materialize_ms += audio_head_profile.materialize_ms;
                         profile.audio_head_calls = profile.audio_head_calls.saturating_add(1);
+                        profile.audio_head_codebook_steps = profile
+                            .audio_head_codebook_steps
+                            .saturating_add(audio_head_profile.codebook_steps);
                         tokens_generated += 1;
                         let is_end =
                             frame.first().copied() == Some(self.audio_head.audio_end_token_id());
@@ -565,8 +594,17 @@ impl Lfm25AudioModel {
         let main_backbone_ms = elapsed_ms(main_started);
 
         let detokenizer_started = Instant::now();
-        let samples = self.detokenizer.decode(&audio_codes, &self.device.device)?;
+        let (samples, detokenizer_profile) = self
+            .detokenizer
+            .decode_with_profile(&audio_codes, &self.device.device)?;
         let detokenizer_ms = elapsed_ms(detokenizer_started);
+        profile.detokenizer_embedding_ms = detokenizer_profile.embedding_ms;
+        profile.detokenizer_upsample_ms = detokenizer_profile.upsample_ms;
+        profile.detokenizer_backbone_ms = detokenizer_profile.backbone_forward_ms;
+        profile.detokenizer_projection_ms = detokenizer_profile.projection_ms;
+        profile.detokenizer_waveform_prepare_ms = detokenizer_profile.waveform_prepare_ms;
+        profile.detokenizer_readback_ms = detokenizer_profile.readback_ms;
+        profile.detokenizer_istft_ms = detokenizer_profile.istft_ms;
         let model_total_ms = elapsed_ms(total_started);
         let audio_frames_generated = audio_codes.first().map(Vec::len).unwrap_or(0);
         let samples_len = samples.len();
@@ -589,10 +627,25 @@ impl Lfm25AudioModel {
                     "tokenizer_decode": profile.tokenizer_decode_ms,
                     "text_forward": profile.text_forward_ms,
                     "audio_head": profile.audio_head_ms,
+                    "audio_head_depth_linear": profile.audio_head_depth_linear_ms,
+                    "audio_head_depth_reshape": profile.audio_head_depth_reshape_ms,
+                    "audio_head_cache_setup": profile.audio_head_cache_setup_ms,
+                    "audio_head_codebook_input": profile.audio_head_codebook_input_ms,
+                    "audio_head_depthformer": profile.audio_head_depthformer_ms,
+                    "audio_head_sample": profile.audio_head_sample_ms,
+                    "audio_head_embed_step": profile.audio_head_embed_step_ms,
+                    "audio_head_materialize": profile.audio_head_materialize_ms,
                     "audio_embed": profile.audio_embed_ms,
                     "audio_forward": profile.audio_forward_ms,
                     "main_backbone": main_backbone_ms,
                     "detokenizer": detokenizer_ms,
+                    "detokenizer_embedding": profile.detokenizer_embedding_ms,
+                    "detokenizer_upsample": profile.detokenizer_upsample_ms,
+                    "detokenizer_backbone": profile.detokenizer_backbone_ms,
+                    "detokenizer_projection": profile.detokenizer_projection_ms,
+                    "detokenizer_waveform_prepare": profile.detokenizer_waveform_prepare_ms,
+                    "detokenizer_readback": profile.detokenizer_readback_ms,
+                    "detokenizer_istft": profile.detokenizer_istft_ms,
                     "model_total": model_total_ms
                 },
                 "prompt": {
@@ -602,7 +655,8 @@ impl Lfm25AudioModel {
                     "generated_tokens": tokens_generated,
                     "max_new_tokens": max_new_tokens,
                     "text_sample_calls": profile.text_sample_calls,
-                    "audio_head_calls": profile.audio_head_calls
+                    "audio_head_calls": profile.audio_head_calls,
+                    "audio_head_codebook_steps": profile.audio_head_codebook_steps
                 },
                 "audio": {
                     "audio_frames": audio_frames_generated,

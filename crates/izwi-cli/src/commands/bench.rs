@@ -157,15 +157,31 @@ struct TtsStageTimings {
     tokenizer_decode: Option<f64>,
     text_forward: Option<f64>,
     audio_head: Option<f64>,
+    audio_head_depth_linear: Option<f64>,
+    audio_head_depth_reshape: Option<f64>,
+    audio_head_cache_setup: Option<f64>,
+    audio_head_codebook_input: Option<f64>,
+    audio_head_depthformer: Option<f64>,
+    audio_head_sample: Option<f64>,
+    audio_head_embed_step: Option<f64>,
+    audio_head_materialize: Option<f64>,
     audio_embed: Option<f64>,
     audio_forward: Option<f64>,
     main_backbone: Option<f64>,
     detokenizer: Option<f64>,
+    detokenizer_embedding: Option<f64>,
+    detokenizer_upsample: Option<f64>,
+    detokenizer_backbone: Option<f64>,
+    detokenizer_projection: Option<f64>,
+    detokenizer_waveform_prepare: Option<f64>,
+    detokenizer_readback: Option<f64>,
+    detokenizer_istft: Option<f64>,
     model_total: Option<f64>,
     prompt_tokens: Option<u64>,
     generated_tokens: Option<u64>,
     audio_frames: Option<u64>,
     audio_head_calls: Option<u64>,
+    audio_head_codebook_steps: Option<u64>,
     text_sample_calls: Option<u64>,
 }
 
@@ -187,8 +203,15 @@ struct AsrStageTimings {
     mel: Option<f64>,
     mel_flatten_upload: Option<f64>,
     audio_encode: Option<f64>,
+    prompt_embed: Option<f64>,
+    prompt_concat: Option<f64>,
     prefill: Option<f64>,
     decode: Option<f64>,
+    decode_argmax: Option<f64>,
+    decode_token_tensor: Option<f64>,
+    decode_forward: Option<f64>,
+    tokenizer_decode: Option<f64>,
+    main_backbone: Option<f64>,
     model_total: Option<f64>,
     prompt_tokens: Option<u64>,
     audio_tokens: Option<u64>,
@@ -2714,6 +2737,30 @@ fn tts_stage_timings_from_diagnostics(diagnostics: &serde_json::Value) -> Option
             .and_then(|value| value.as_f64()),
         text_forward: timings.get("text_forward").and_then(|value| value.as_f64()),
         audio_head: timings.get("audio_head").and_then(|value| value.as_f64()),
+        audio_head_depth_linear: timings
+            .get("audio_head_depth_linear")
+            .and_then(|value| value.as_f64()),
+        audio_head_depth_reshape: timings
+            .get("audio_head_depth_reshape")
+            .and_then(|value| value.as_f64()),
+        audio_head_cache_setup: timings
+            .get("audio_head_cache_setup")
+            .and_then(|value| value.as_f64()),
+        audio_head_codebook_input: timings
+            .get("audio_head_codebook_input")
+            .and_then(|value| value.as_f64()),
+        audio_head_depthformer: timings
+            .get("audio_head_depthformer")
+            .and_then(|value| value.as_f64()),
+        audio_head_sample: timings
+            .get("audio_head_sample")
+            .and_then(|value| value.as_f64()),
+        audio_head_embed_step: timings
+            .get("audio_head_embed_step")
+            .and_then(|value| value.as_f64()),
+        audio_head_materialize: timings
+            .get("audio_head_materialize")
+            .and_then(|value| value.as_f64()),
         audio_embed: timings.get("audio_embed").and_then(|value| value.as_f64()),
         audio_forward: timings
             .get("audio_forward")
@@ -2722,11 +2769,33 @@ fn tts_stage_timings_from_diagnostics(diagnostics: &serde_json::Value) -> Option
             .get("main_backbone")
             .and_then(|value| value.as_f64()),
         detokenizer: timings.get("detokenizer").and_then(|value| value.as_f64()),
+        detokenizer_embedding: timings
+            .get("detokenizer_embedding")
+            .and_then(|value| value.as_f64()),
+        detokenizer_upsample: timings
+            .get("detokenizer_upsample")
+            .and_then(|value| value.as_f64()),
+        detokenizer_backbone: timings
+            .get("detokenizer_backbone")
+            .and_then(|value| value.as_f64()),
+        detokenizer_projection: timings
+            .get("detokenizer_projection")
+            .and_then(|value| value.as_f64()),
+        detokenizer_waveform_prepare: timings
+            .get("detokenizer_waveform_prepare")
+            .and_then(|value| value.as_f64()),
+        detokenizer_readback: timings
+            .get("detokenizer_readback")
+            .and_then(|value| value.as_f64()),
+        detokenizer_istft: timings
+            .get("detokenizer_istft")
+            .and_then(|value| value.as_f64()),
         model_total: timings.get("model_total").and_then(|value| value.as_f64()),
         prompt_tokens: diagnostic_u64(prompt, &["prompt_tokens", "tokens"]),
         generated_tokens: diagnostic_u64(decode, &["generated_tokens"]),
         audio_frames: diagnostic_u64(audio, &["audio_frames", "acoustic_frames"]),
         audio_head_calls: diagnostic_u64(decode, &["audio_head_calls"]),
+        audio_head_codebook_steps: diagnostic_u64(decode, &["audio_head_codebook_steps"]),
         text_sample_calls: diagnostic_u64(decode, &["text_sample_calls"]),
     })
 }
@@ -2769,8 +2838,27 @@ fn asr_stage_timings_from_diagnostics(diagnostics: &serde_json::Value) -> Option
             .get("mel_flatten_upload")
             .and_then(|value| value.as_f64()),
         audio_encode: timings.get("audio_encode").and_then(|value| value.as_f64()),
+        prompt_embed: timings.get("prompt_embed").and_then(|value| value.as_f64()),
+        prompt_concat: timings
+            .get("prompt_concat")
+            .and_then(|value| value.as_f64()),
         prefill: timings.get("prefill").and_then(|value| value.as_f64()),
         decode: timings.get("decode").and_then(|value| value.as_f64()),
+        decode_argmax: timings
+            .get("decode_argmax")
+            .and_then(|value| value.as_f64()),
+        decode_token_tensor: timings
+            .get("decode_token_tensor")
+            .and_then(|value| value.as_f64()),
+        decode_forward: timings
+            .get("decode_forward")
+            .and_then(|value| value.as_f64()),
+        tokenizer_decode: timings
+            .get("tokenizer_decode")
+            .and_then(|value| value.as_f64()),
+        main_backbone: timings
+            .get("main_backbone")
+            .and_then(|value| value.as_f64()),
         model_total: timings.get("model_total").and_then(|value| value.as_f64()),
         prompt_tokens: diagnostic_u64(prompt, &["prompt_tokens", "tokens"]),
         audio_tokens: diagnostic_u64(audio, &["audio_tokens", "acoustic_frames"]),
@@ -3179,15 +3267,31 @@ fn print_tts_stage_timing_summary(samples: &[TtsStageTimings]) {
     let mut tokenizer_decode = Vec::new();
     let mut text_forward = Vec::new();
     let mut audio_head = Vec::new();
+    let mut audio_head_depth_linear = Vec::new();
+    let mut audio_head_depth_reshape = Vec::new();
+    let mut audio_head_cache_setup = Vec::new();
+    let mut audio_head_codebook_input = Vec::new();
+    let mut audio_head_depthformer = Vec::new();
+    let mut audio_head_sample = Vec::new();
+    let mut audio_head_embed_step = Vec::new();
+    let mut audio_head_materialize = Vec::new();
     let mut audio_embed = Vec::new();
     let mut audio_forward = Vec::new();
     let mut main_backbone = Vec::new();
     let mut detokenizer = Vec::new();
+    let mut detokenizer_embedding = Vec::new();
+    let mut detokenizer_upsample = Vec::new();
+    let mut detokenizer_backbone = Vec::new();
+    let mut detokenizer_projection = Vec::new();
+    let mut detokenizer_waveform_prepare = Vec::new();
+    let mut detokenizer_readback = Vec::new();
+    let mut detokenizer_istft = Vec::new();
     let mut model_total = Vec::new();
     let mut prompt_tokens = Vec::new();
     let mut generated_tokens = Vec::new();
     let mut audio_frames = Vec::new();
     let mut audio_head_calls = Vec::new();
+    let mut audio_head_codebook_steps = Vec::new();
     let mut text_sample_calls = Vec::new();
 
     for sample in samples {
@@ -3212,6 +3316,30 @@ fn print_tts_stage_timing_summary(samples: &[TtsStageTimings]) {
         if let Some(value) = sample.audio_head {
             audio_head.push(value);
         }
+        if let Some(value) = sample.audio_head_depth_linear {
+            audio_head_depth_linear.push(value);
+        }
+        if let Some(value) = sample.audio_head_depth_reshape {
+            audio_head_depth_reshape.push(value);
+        }
+        if let Some(value) = sample.audio_head_cache_setup {
+            audio_head_cache_setup.push(value);
+        }
+        if let Some(value) = sample.audio_head_codebook_input {
+            audio_head_codebook_input.push(value);
+        }
+        if let Some(value) = sample.audio_head_depthformer {
+            audio_head_depthformer.push(value);
+        }
+        if let Some(value) = sample.audio_head_sample {
+            audio_head_sample.push(value);
+        }
+        if let Some(value) = sample.audio_head_embed_step {
+            audio_head_embed_step.push(value);
+        }
+        if let Some(value) = sample.audio_head_materialize {
+            audio_head_materialize.push(value);
+        }
         if let Some(value) = sample.audio_embed {
             audio_embed.push(value);
         }
@@ -3223,6 +3351,27 @@ fn print_tts_stage_timing_summary(samples: &[TtsStageTimings]) {
         }
         if let Some(value) = sample.detokenizer {
             detokenizer.push(value);
+        }
+        if let Some(value) = sample.detokenizer_embedding {
+            detokenizer_embedding.push(value);
+        }
+        if let Some(value) = sample.detokenizer_upsample {
+            detokenizer_upsample.push(value);
+        }
+        if let Some(value) = sample.detokenizer_backbone {
+            detokenizer_backbone.push(value);
+        }
+        if let Some(value) = sample.detokenizer_projection {
+            detokenizer_projection.push(value);
+        }
+        if let Some(value) = sample.detokenizer_waveform_prepare {
+            detokenizer_waveform_prepare.push(value);
+        }
+        if let Some(value) = sample.detokenizer_readback {
+            detokenizer_readback.push(value);
+        }
+        if let Some(value) = sample.detokenizer_istft {
+            detokenizer_istft.push(value);
         }
         if let Some(value) = sample.model_total {
             model_total.push(value);
@@ -3238,6 +3387,9 @@ fn print_tts_stage_timing_summary(samples: &[TtsStageTimings]) {
         }
         if let Some(value) = sample.audio_head_calls {
             audio_head_calls.push(value);
+        }
+        if let Some(value) = sample.audio_head_codebook_steps {
+            audio_head_codebook_steps.push(value);
         }
         if let Some(value) = sample.text_sample_calls {
             text_sample_calls.push(value);
@@ -3257,15 +3409,31 @@ fn print_tts_stage_timing_summary(samples: &[TtsStageTimings]) {
     summarize_stage("tokenizer", &tokenizer_decode);
     summarize_stage("text_forward", &text_forward);
     summarize_stage("audio_head", &audio_head);
+    summarize_stage("ah_depth_lin", &audio_head_depth_linear);
+    summarize_stage("ah_reshape", &audio_head_depth_reshape);
+    summarize_stage("ah_cache", &audio_head_cache_setup);
+    summarize_stage("ah_input", &audio_head_codebook_input);
+    summarize_stage("ah_depthform", &audio_head_depthformer);
+    summarize_stage("ah_sample", &audio_head_sample);
+    summarize_stage("ah_embed", &audio_head_embed_step);
+    summarize_stage("ah_material", &audio_head_materialize);
     summarize_stage("audio_embed", &audio_embed);
     summarize_stage("audio_forward", &audio_forward);
     summarize_stage("main_backbone", &main_backbone);
     summarize_stage("detokenizer", &detokenizer);
+    summarize_stage("detok_embed", &detokenizer_embedding);
+    summarize_stage("detok_up", &detokenizer_upsample);
+    summarize_stage("detok_backbn", &detokenizer_backbone);
+    summarize_stage("detok_proj", &detokenizer_projection);
+    summarize_stage("detok_prep", &detokenizer_waveform_prepare);
+    summarize_stage("detok_read", &detokenizer_readback);
+    summarize_stage("detok_istft", &detokenizer_istft);
     summarize_stage("model_total", &model_total);
     summarize_count("prompt_tokens", &prompt_tokens);
     summarize_count("gen_tokens", &generated_tokens);
     summarize_count("audio_frames", &audio_frames);
     summarize_count("audio_head", &audio_head_calls);
+    summarize_count("ah_codebooks", &audio_head_codebook_steps);
     summarize_count("text_sample", &text_sample_calls);
 }
 
@@ -3290,8 +3458,15 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     let mut mel = Vec::new();
     let mut mel_flatten_upload = Vec::new();
     let mut audio_encode = Vec::new();
+    let mut prompt_embed = Vec::new();
+    let mut prompt_concat = Vec::new();
     let mut prefill = Vec::new();
     let mut decode = Vec::new();
+    let mut decode_argmax = Vec::new();
+    let mut decode_token_tensor = Vec::new();
+    let mut decode_forward = Vec::new();
+    let mut tokenizer_decode = Vec::new();
+    let mut main_backbone = Vec::new();
     let mut model_total = Vec::new();
     let mut prompt_tokens = Vec::new();
     let mut audio_tokens = Vec::new();
@@ -3386,11 +3561,32 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         if let Some(value) = sample.audio_encode {
             audio_encode.push(value);
         }
+        if let Some(value) = sample.prompt_embed {
+            prompt_embed.push(value);
+        }
+        if let Some(value) = sample.prompt_concat {
+            prompt_concat.push(value);
+        }
         if let Some(value) = sample.prefill {
             prefill.push(value);
         }
         if let Some(value) = sample.decode {
             decode.push(value);
+        }
+        if let Some(value) = sample.decode_argmax {
+            decode_argmax.push(value);
+        }
+        if let Some(value) = sample.decode_token_tensor {
+            decode_token_tensor.push(value);
+        }
+        if let Some(value) = sample.decode_forward {
+            decode_forward.push(value);
+        }
+        if let Some(value) = sample.tokenizer_decode {
+            tokenizer_decode.push(value);
+        }
+        if let Some(value) = sample.main_backbone {
+            main_backbone.push(value);
         }
         if let Some(value) = sample.model_total {
             model_total.push(value);
@@ -3546,8 +3742,15 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         && mel.is_empty()
         && mel_flatten_upload.is_empty()
         && audio_encode.is_empty()
+        && prompt_embed.is_empty()
+        && prompt_concat.is_empty()
         && prefill.is_empty()
         && decode.is_empty()
+        && decode_argmax.is_empty()
+        && decode_token_tensor.is_empty()
+        && decode_forward.is_empty()
+        && tokenizer_decode.is_empty()
+        && main_backbone.is_empty()
         && model_total.is_empty()
         && prompt_tokens.is_empty()
         && audio_tokens.is_empty()
@@ -3618,8 +3821,15 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     summarize_stage("mel", &mel);
     summarize_stage("mel_flat_upload", &mel_flatten_upload);
     summarize_stage("audio_encode", &audio_encode);
+    summarize_stage("prompt_embed", &prompt_embed);
+    summarize_stage("prompt_concat", &prompt_concat);
     summarize_stage("prefill", &prefill);
     summarize_stage("decode", &decode);
+    summarize_stage("decode_argmax", &decode_argmax);
+    summarize_stage("token_tensor", &decode_token_tensor);
+    summarize_stage("decode_fwd", &decode_forward);
+    summarize_stage("tokenizer", &tokenizer_decode);
+    summarize_stage("main_backbone", &main_backbone);
     summarize_stage("model_total", &model_total);
     summarize_count("prompt_tokens", &prompt_tokens);
     summarize_count("audio_tokens", &audio_tokens);
@@ -4070,7 +4280,14 @@ mod tests {
                 "prefill": 3.0,
                 "text_sampling": 4.0,
                 "audio_head": 5.0,
+                "audio_head_depth_linear": 5.1,
+                "audio_head_depthformer": 5.2,
+                "audio_head_sample": 5.3,
+                "audio_head_materialize": 5.4,
                 "detokenizer": 6.0,
+                "detokenizer_backbone": 6.1,
+                "detokenizer_readback": 6.2,
+                "detokenizer_istft": 6.3,
                 "model_total": 21.0
             },
             "prompt": {
@@ -4079,6 +4296,7 @@ mod tests {
             "decode": {
                 "generated_tokens": 42,
                 "audio_head_calls": 7,
+                "audio_head_codebook_steps": 56,
                 "text_sample_calls": 3
             },
             "audio": {
@@ -4092,12 +4310,20 @@ mod tests {
         assert_eq!(timings.prompt_build, Some(1.0));
         assert_eq!(timings.prefill, Some(3.0));
         assert_eq!(timings.audio_head, Some(5.0));
+        assert_eq!(timings.audio_head_depth_linear, Some(5.1));
+        assert_eq!(timings.audio_head_depthformer, Some(5.2));
+        assert_eq!(timings.audio_head_sample, Some(5.3));
+        assert_eq!(timings.audio_head_materialize, Some(5.4));
         assert_eq!(timings.detokenizer, Some(6.0));
+        assert_eq!(timings.detokenizer_backbone, Some(6.1));
+        assert_eq!(timings.detokenizer_readback, Some(6.2));
+        assert_eq!(timings.detokenizer_istft, Some(6.3));
         assert_eq!(timings.model_total, Some(21.0));
         assert_eq!(timings.prompt_tokens, Some(11));
         assert_eq!(timings.generated_tokens, Some(42));
         assert_eq!(timings.audio_frames, Some(6));
         assert_eq!(timings.audio_head_calls, Some(7));
+        assert_eq!(timings.audio_head_codebook_steps, Some(56));
         assert_eq!(timings.text_sample_calls, Some(3));
     }
 
@@ -4173,8 +4399,15 @@ mod tests {
                 "mel": 12.5,
                 "mel_flatten_upload": 0.75,
                 "audio_encode": 820.0,
+                "prompt_embed": 4.0,
+                "prompt_concat": 5.0,
                 "prefill": 1080.0,
                 "decode": 21230.0,
+                "decode_argmax": 77.0,
+                "decode_token_tensor": 2.0,
+                "decode_forward": 700.0,
+                "tokenizer_decode": 9.0,
+                "main_backbone": 1800.0,
                 "model_total": 22360.0
             }
         });
@@ -4185,8 +4418,15 @@ mod tests {
         assert_eq!(samples[0].mel, Some(12.5));
         assert_eq!(samples[0].mel_flatten_upload, Some(0.75));
         assert_eq!(samples[0].audio_encode, Some(820.0));
+        assert_eq!(samples[0].prompt_embed, Some(4.0));
+        assert_eq!(samples[0].prompt_concat, Some(5.0));
         assert_eq!(samples[0].prefill, Some(1080.0));
         assert_eq!(samples[0].decode, Some(21230.0));
+        assert_eq!(samples[0].decode_argmax, Some(77.0));
+        assert_eq!(samples[0].decode_token_tensor, Some(2.0));
+        assert_eq!(samples[0].decode_forward, Some(700.0));
+        assert_eq!(samples[0].tokenizer_decode, Some(9.0));
+        assert_eq!(samples[0].main_backbone, Some(1800.0));
         assert_eq!(samples[0].prompt_tokens, Some(482));
         assert_eq!(samples[0].audio_tokens, Some(355));
         assert_eq!(samples[0].generated_tokens, Some(93));
