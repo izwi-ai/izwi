@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use candle_core::{DType, IndexOp, Tensor};
+use candle_core::{DType, IndexOp, Tensor, D};
 
 use crate::error::{Error, Result};
 
@@ -68,13 +68,14 @@ pub fn sample_from_logits(
     config: &Lfm25SamplingConfig,
     rng: &mut SimpleRng,
 ) -> Result<u32> {
-    let mut values = logits_to_vec(logits)?;
-    clamp_logits_to_vocab(&mut values, vocab_limit);
+    let logits = logits_row(logits)?;
+    let vocab_limit = effective_vocab_limit(&logits, vocab_limit)?;
 
     if config.temperature <= 1e-5 {
-        return argmax_values(&values);
+        return greedy_from_logits_row(&logits, vocab_limit);
     }
 
+    let mut values = logits_to_vec(&logits.narrow(0, 0, vocab_limit)?)?;
     let temperature = config.temperature.max(1e-5);
     for value in &mut values {
         if value.is_finite() {
@@ -150,9 +151,15 @@ pub fn sample_from_logits(
         .ok_or_else(|| Error::InferenceError("Failed to sample LFM2.5 Audio token".to_string()))
 }
 
-fn logits_to_vec(logits: &Tensor) -> Result<Vec<f32>> {
-    let logits = match logits.rank() {
-        1 => logits.clone(),
+pub fn greedy_from_logits(logits: &Tensor, vocab_limit: usize) -> Result<u32> {
+    let logits = logits_row(logits)?;
+    let vocab_limit = effective_vocab_limit(&logits, vocab_limit)?;
+    greedy_from_logits_row(&logits, vocab_limit)
+}
+
+fn logits_row(logits: &Tensor) -> Result<Tensor> {
+    match logits.rank() {
+        1 => Ok(logits.clone()),
         2 => {
             let (rows, _cols) = logits.dims2()?;
             if rows != 1 {
@@ -161,25 +168,57 @@ fn logits_to_vec(logits: &Tensor) -> Result<Vec<f32>> {
                     logits.shape().dims()
                 )));
             }
-            logits.i(0)?
+            Ok(logits.i(0)?)
         }
         rank => {
             return Err(Error::InferenceError(format!(
                 "Unexpected LFM2.5 Audio logits rank for sampling: {rank}"
             )));
         }
-    };
+    }
+}
 
+fn logits_to_vec(logits: &Tensor) -> Result<Vec<f32>> {
     logits
         .to_dtype(DType::F32)?
         .to_vec1::<f32>()
         .map_err(Error::from)
 }
 
-fn clamp_logits_to_vocab(values: &mut [f32], vocab_size: usize) {
-    if vocab_size < values.len() {
-        values[vocab_size..].fill(f32::NEG_INFINITY);
+fn effective_vocab_limit(logits: &Tensor, vocab_limit: usize) -> Result<usize> {
+    let vocab = logits.dim(0)?;
+    let limit = vocab.min(vocab_limit);
+    if limit == 0 {
+        return Err(Error::InferenceError(
+            "Cannot sample from zero-sized LFM2.5 Audio vocabulary".to_string(),
+        ));
     }
+    Ok(limit)
+}
+
+fn greedy_from_logits_row(logits: &Tensor, vocab_limit: usize) -> Result<u32> {
+    if logits.device().is_metal() || logits.device().is_cuda() {
+        return argmax_row_device(logits, vocab_limit);
+    }
+    argmax_row_host(logits, vocab_limit)
+}
+
+fn argmax_row_device(logits: &Tensor, vocab_limit: usize) -> Result<u32> {
+    let logits = logits.narrow(0, 0, vocab_limit)?;
+    let idx = logits.argmax(D::Minus1)?;
+    let idx = if idx.rank() == 0 {
+        idx
+    } else {
+        idx.squeeze(0)?
+    };
+    idx.to_dtype(DType::U32)?
+        .to_scalar::<u32>()
+        .map_err(Error::from)
+}
+
+fn argmax_row_host(logits: &Tensor, vocab_limit: usize) -> Result<u32> {
+    let values = logits_to_vec(&logits.narrow(0, 0, vocab_limit)?)?;
+    argmax_values(&values)
 }
 
 fn argmax_values(values: &[f32]) -> Result<u32> {
@@ -217,6 +256,28 @@ mod tests {
         let config = Lfm25SamplingConfig::default();
         let token =
             sample_from_logits(&logits, 3, &config, &mut SimpleRng::new(7)).expect("sample token");
+        assert_eq!(token, 1);
+    }
+
+    #[test]
+    fn greedy_sampling_respects_vocab_limit() {
+        let logits = Tensor::from_vec(vec![0.1f32, 0.9, 7.0], (3,), &candle_core::Device::Cpu)
+            .expect("logits");
+        let token = greedy_from_logits(&logits, 2).expect("sample token");
+        assert_eq!(token, 1);
+    }
+
+    #[test]
+    fn non_greedy_sampling_respects_vocab_limit() {
+        let logits = Tensor::from_vec(vec![0.1f32, 0.9, 7.0], (3,), &candle_core::Device::Cpu)
+            .expect("logits");
+        let config = Lfm25SamplingConfig {
+            temperature: 1.0,
+            top_k: 1,
+            top_p: 1.0,
+        };
+        let token =
+            sample_from_logits(&logits, 2, &config, &mut SimpleRng::new(7)).expect("sample token");
         assert_eq!(token, 1);
     }
 }

@@ -195,6 +195,7 @@ struct AsrStageTimings {
     generated_tokens: Option<u64>,
     max_new_tokens: Option<u64>,
     rnnt_joint_steps: Option<u64>,
+    token_select_reads: Option<u64>,
     host_argmax_reads: Option<u64>,
     device_argmax_reads: Option<u64>,
     execution: Option<AsrExecutionDiagnostics>,
@@ -2788,6 +2789,7 @@ fn asr_stage_timings_from_diagnostics(diagnostics: &serde_json::Value) -> Option
             })
             .and_then(|value| value.as_u64()),
         rnnt_joint_steps: diagnostic_u64(decode, &["joint_steps", "rnnt_joint_steps"]),
+        token_select_reads: diagnostic_u64(decode, &["token_select_reads"]),
         host_argmax_reads: diagnostic_u64(decode, &["host_argmax_reads"]),
         device_argmax_reads: diagnostic_u64(decode, &["device_argmax_reads"]),
         execution,
@@ -3296,6 +3298,7 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     let mut generated_tokens = Vec::new();
     let mut max_new_tokens = Vec::new();
     let mut rnnt_joint_steps = Vec::new();
+    let mut token_select_reads = Vec::new();
     let mut host_argmax_reads = Vec::new();
     let mut device_argmax_reads = Vec::new();
     let mut flash_attention_requested = Vec::new();
@@ -3406,6 +3409,9 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         }
         if let Some(value) = sample.rnnt_joint_steps {
             rnnt_joint_steps.push(value);
+        }
+        if let Some(value) = sample.token_select_reads {
+            token_select_reads.push(value);
         }
         if let Some(value) = sample.host_argmax_reads {
             host_argmax_reads.push(value);
@@ -3548,6 +3554,7 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
         && generated_tokens.is_empty()
         && max_new_tokens.is_empty()
         && rnnt_joint_steps.is_empty()
+        && token_select_reads.is_empty()
         && host_argmax_reads.is_empty()
         && device_argmax_reads.is_empty()
         && flash_attention_requested.is_empty()
@@ -3619,6 +3626,7 @@ fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
     summarize_count("gen_tokens", &generated_tokens);
     summarize_count("max_new_tokens", &max_new_tokens);
     summarize_count("rnnt_steps", &rnnt_joint_steps);
+    summarize_count("token_select", &token_select_reads);
     summarize_count("host_argmax", &host_argmax_reads);
     summarize_count("dev_argmax", &device_argmax_reads);
     summarize_bool_count("flash_req", &flash_attention_requested);

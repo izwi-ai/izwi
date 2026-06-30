@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use candle_core::{DType, IndexOp, Tensor, D};
+use candle_core::{IndexOp, Tensor};
 use tracing::info;
 
 use crate::backends::{BackendKind, DeviceProfile};
@@ -21,7 +21,9 @@ use super::config::{
 use super::conformer::Lfm25AudioEncoder;
 use super::detokenizer::Lfm25AudioDetokenizer;
 use super::preprocessor::Lfm25AudioPreprocessor;
-use super::sampling::{sample_from_logits, Lfm25AudioGenerationConfig, SimpleRng};
+use super::sampling::{
+    greedy_from_logits, sample_from_logits, Lfm25AudioGenerationConfig, SimpleRng,
+};
 use super::tokenizer::Lfm25TextTokenizer;
 use super::LFM25_AUDIO_DEFAULT_INTERLEAVED_SYSTEM_PROMPT;
 
@@ -88,7 +90,7 @@ struct Lfm25AsrProfile {
     decode_token_tensor_ms: f64,
     decode_forward_ms: f64,
     tokenizer_decode_ms: f64,
-    host_argmax_reads: u64,
+    token_select_reads: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -291,9 +293,9 @@ impl Lfm25AudioModel {
             let decode_started = Instant::now();
             while generated_ids.len() < max_new_tokens {
                 let argmax_started = Instant::now();
-                let next = argmax(&logits, vocab_limit)?;
+                let next = greedy_from_logits(&logits, vocab_limit)?;
                 profile.decode_argmax_ms += elapsed_ms(argmax_started);
-                profile.host_argmax_reads = profile.host_argmax_reads.saturating_add(1);
+                profile.token_select_reads = profile.token_select_reads.saturating_add(1);
                 if next == specials.im_end
                     || next == specials.eos
                     || specials.eos_alt == Some(next)
@@ -342,6 +344,15 @@ impl Lfm25AudioModel {
         })?;
         let main_backbone_ms = elapsed_ms(main_started);
         let model_total_ms = elapsed_ms(total_started);
+        let device_token_select_reads =
+            if self.device.device.is_metal() || self.device.device.is_cuda() {
+                profile.token_select_reads
+            } else {
+                0
+            };
+        let host_argmax_reads = profile
+            .token_select_reads
+            .saturating_sub(device_token_select_reads);
         output.diagnostics = Some(serde_json::json!({
             "model": "lfm25_audio",
             "task": "asr",
@@ -379,7 +390,9 @@ impl Lfm25AudioModel {
             "decode": {
                 "generated_tokens": output.tokens_generated,
                 "max_new_tokens": max_new_tokens,
-                "host_argmax_reads": profile.host_argmax_reads,
+                "token_select_reads": profile.token_select_reads,
+                "device_argmax_reads": device_token_select_reads,
+                "host_argmax_reads": host_argmax_reads,
                 "profile": {
                     "enabled": true,
                     "sampling_ms": profile.decode_argmax_ms,
@@ -1036,45 +1049,6 @@ fn last_hidden_state(hidden_states: &Tensor) -> Result<Tensor> {
     let seq_len = hidden_states.dim(1)?;
     hidden_states
         .i((0, seq_len.saturating_sub(1)))
-        .map_err(Error::from)
-}
-
-fn argmax(logits: &Tensor, vocab_limit: usize) -> Result<u32> {
-    if vocab_limit == 0 {
-        return Err(Error::InferenceError(
-            "Cannot sample from zero-sized vocabulary".to_string(),
-        ));
-    }
-
-    let logits = match logits.rank() {
-        1 => {
-            let vocab = logits.dim(0)?;
-            logits.narrow(0, 0, vocab.min(vocab_limit))?
-        }
-        2 => {
-            let (batch, vocab) = logits.dims2()?;
-            if batch != 1 {
-                return Err(Error::InferenceError(format!(
-                    "Unexpected batched logits for argmax: expected batch=1, got {batch}"
-                )));
-            }
-            logits.i(0)?.narrow(0, 0, vocab.min(vocab_limit))?
-        }
-        rank => {
-            return Err(Error::InferenceError(format!(
-                "Unexpected logits rank for argmax: {rank}"
-            )));
-        }
-    };
-
-    let idx = logits.argmax(D::Minus1)?;
-    let idx = if idx.rank() == 0 {
-        idx
-    } else {
-        idx.squeeze(0)?
-    };
-    idx.to_dtype(DType::U32)?
-        .to_scalar::<u32>()
         .map_err(Error::from)
 }
 
