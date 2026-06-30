@@ -921,9 +921,7 @@ impl ModelVariant {
             Self::WhisperLargeV3Turbo => true,
             Self::DiarStreamingSortformer4SpkV21 => true,
             Self::Qwen3ForcedAligner06B => true,
-            // Keep S2 Pro discoverable in metadata, but do not expose it as an
-            // installable runtime model until native DualAR + codec inference lands.
-            Self::FishAudioS2Pro => false,
+            Self::FishAudioS2Pro => true,
             _ => !self.is_quantized(),
         }
     }
@@ -1253,7 +1251,7 @@ mod tests {
     fn fish_s2_pro_exposes_reference_voice_tts_contract() {
         let variant = ModelVariant::FishAudioS2Pro;
         assert!(variant.is_tts());
-        assert!(!variant.is_enabled());
+        assert!(variant.is_enabled());
         assert_eq!(variant.primary_task(), ModelTask::Tts);
         assert_eq!(variant.repo_id(), "fishaudio/s2-pro");
         assert_eq!(variant.dir_name(), "FishAudio-S2-Pro");

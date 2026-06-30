@@ -1629,6 +1629,17 @@ mod tests {
                 .any(|modality| modality.as_str() == Some("audio_output"))
         );
 
+        let fish_s2_model = find_model("FishAudio-S2-Pro");
+        assert_eq!(fish_s2_model["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            fish_s2_model["route_capabilities"]["openai_audio_speech"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            fish_s2_model["speech_capabilities"]["supports_reference_voice"].as_bool(),
+            Some(true)
+        );
+
         let aligner_model = find_model("Qwen3-ForcedAligner-0.6B");
         assert_eq!(
             aligner_model["route_capabilities"]["forced_alignment"].as_bool(),
