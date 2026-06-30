@@ -92,6 +92,8 @@ impl FishS2PromptTensorShape {
 pub fn remap_fish_qwen3_omni_key(key: &str) -> String {
     if let Some(suffix) = key.strip_prefix("text_model.model.") {
         suffix.to_string()
+    } else if let Some(suffix) = key.strip_prefix("text_model.") {
+        suffix.to_string()
     } else if let Some(suffix) = key.strip_prefix("audio_decoder.") {
         if suffix.starts_with("codebook_embeddings.") {
             suffix.to_string()
@@ -180,6 +182,10 @@ mod tests {
         assert_eq!(
             remap_fish_qwen3_omni_key("audio_decoder.codebook_embeddings.weight"),
             "codebook_embeddings.weight"
+        );
+        assert_eq!(
+            remap_fish_qwen3_omni_key("text_model.lm_head.weight"),
+            "lm_head.weight"
         );
         assert_eq!(
             remap_fish_qwen3_omni_key("lm_head.weight"),
