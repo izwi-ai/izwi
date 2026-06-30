@@ -230,6 +230,18 @@ pub fn try_fused_decode_gqa_attention_with_kv_len(
     None
 }
 
+pub fn try_lfm_shortconv_decode3(cache: &Tensor, bx: &Tensor, conv: &Tensor) -> Option<Tensor> {
+    if !use_fused_kernels_for_device(cache.device()) {
+        return None;
+    }
+
+    if cache.device().is_metal() {
+        return metal::try_lfm_shortconv_decode3(cache, bx, conv);
+    }
+
+    None
+}
+
 pub fn try_fused_gated_rms_norm(
     hidden: &Tensor,
     gate: &Tensor,
