@@ -225,6 +225,15 @@ pub enum ModelVariant {
         alias = "vibevoice-1.5b"
     )]
     VibeVoice15BTts,
+    /// Fish Audio S2 Pro multilingual TTS model
+    #[serde(
+        rename = "FishAudio-S2-Pro",
+        alias = "fishaudio/s2-pro",
+        alias = "s2-pro",
+        alias = "Fish Audio S2 Pro",
+        alias = "FishAudio S2 Pro"
+    )]
+    FishAudioS2Pro,
 }
 
 impl ModelVariant {
@@ -241,6 +250,8 @@ impl ModelVariant {
     pub const VOXTRAL_TTS_FRAME_RATE_HZ: f32 = 12.5;
     pub const VIBEVOICE_TTS_MAX_OUTPUT_FRAMES: usize = 40_500;
     pub const VIBEVOICE_TTS_FRAME_RATE_HZ: f32 = 7.5;
+    pub const FISH_S2_PRO_MAX_OUTPUT_FRAMES: usize = 4096;
+    pub const FISH_S2_PRO_FRAME_RATE_HZ: f32 = 21.5;
 
     /// Get HuggingFace repository ID
     pub fn repo_id(&self) -> &'static str {
@@ -307,6 +318,7 @@ impl ModelVariant {
             Self::VoxtralMini4BRealtime2602 => "mistralai/Voxtral-Mini-4B-Realtime-2602",
             Self::Voxtral4BTts2603 => "mistralai/Voxtral-4B-TTS-2603",
             Self::VibeVoice15BTts => "microsoft/VibeVoice-1.5B",
+            Self::FishAudioS2Pro => "fishaudio/s2-pro",
         }
     }
 
@@ -362,6 +374,7 @@ impl ModelVariant {
             Self::VoxtralMini4BRealtime2602 => "Voxtral Mini 4B Realtime",
             Self::Voxtral4BTts2603 => "Voxtral 4B TTS",
             Self::VibeVoice15BTts => "VibeVoice 1.5B TTS",
+            Self::FishAudioS2Pro => "Fish Audio S2 Pro",
         }
     }
 
@@ -417,6 +430,7 @@ impl ModelVariant {
             Self::VoxtralMini4BRealtime2602 => "Voxtral-Mini-4B-Realtime-2602",
             Self::Voxtral4BTts2603 => "Voxtral-4B-TTS-2603",
             Self::VibeVoice15BTts => "VibeVoice-1.5B",
+            Self::FishAudioS2Pro => "FishAudio-S2-Pro",
         }
     }
 
@@ -472,6 +486,7 @@ impl ModelVariant {
             Self::VoxtralMini4BRealtime2602 => 8_000_000_000, // ~7.45 GB (est)
             Self::Voxtral4BTts2603 => 8_650_000_000, // ~8.04 GB plus voice assets
             Self::VibeVoice15BTts => 5_408_043_974, // safetensors index metadata total_size
+            Self::FishAudioS2Pro => 11_520_000_000, // ~10.7 GiB current HF bundle, including codec.pth
         }
     }
 
@@ -526,6 +541,7 @@ impl ModelVariant {
             Self::VoxtralMini4BRealtime2602 => 16.0,
             Self::Voxtral4BTts2603 => 16.0,
             Self::VibeVoice15BTts => 12.0,
+            Self::FishAudioS2Pro => 24.0,
         }
     }
 
@@ -601,6 +617,7 @@ impl ModelVariant {
                 | crate::catalog::ModelFamily::KokoroTts
                 | crate::catalog::ModelFamily::VoxtralTts
                 | crate::catalog::ModelFamily::VibeVoiceTts
+                | crate::catalog::ModelFamily::FishS2Tts
         )
     }
 
@@ -610,6 +627,7 @@ impl ModelVariant {
         match self {
             Self::Voxtral4BTts2603 => Some("CC BY-NC 4.0"),
             Self::VibeVoiceAsr | Self::VibeVoice15BTts => Some("MIT"),
+            Self::FishAudioS2Pro => Some("Fish Audio Research License"),
             Self::Nemotron35AsrStreaming06B => Some("OpenMDW-1.1"),
             Self::GraniteSpeech412BPlus => Some("Apache-2.0"),
             _ => None,
@@ -703,6 +721,15 @@ impl ModelVariant {
                 supports_speed_control: false,
                 supports_auto_long_form: true,
             },
+            Self::FishAudioS2Pro => SpeechModelCapabilities {
+                supports_builtin_voices: false,
+                built_in_voice_count: None,
+                supports_reference_voice: true,
+                supports_voice_description: false,
+                supports_streaming: false,
+                supports_speed_control: false,
+                supports_auto_long_form: false,
+            },
             _ => return None,
         };
 
@@ -717,6 +744,7 @@ impl ModelVariant {
             crate::catalog::ModelFamily::VibeVoiceTts => {
                 Some(Self::VIBEVOICE_TTS_MAX_OUTPUT_FRAMES)
             }
+            crate::catalog::ModelFamily::FishS2Tts => Some(Self::FISH_S2_PRO_MAX_OUTPUT_FRAMES),
             _ => None,
         }
     }
@@ -727,6 +755,7 @@ impl ModelVariant {
             crate::catalog::ModelFamily::Qwen3Tts => Some(Self::QWEN3_TTS_FRAME_RATE_HZ),
             crate::catalog::ModelFamily::VoxtralTts => Some(Self::VOXTRAL_TTS_FRAME_RATE_HZ),
             crate::catalog::ModelFamily::VibeVoiceTts => Some(Self::VIBEVOICE_TTS_FRAME_RATE_HZ),
+            crate::catalog::ModelFamily::FishS2Tts => Some(Self::FISH_S2_PRO_FRAME_RATE_HZ),
             _ => None,
         }
     }
@@ -892,6 +921,7 @@ impl ModelVariant {
             Self::WhisperLargeV3Turbo => true,
             Self::DiarStreamingSortformer4SpkV21 => true,
             Self::Qwen3ForcedAligner06B => true,
+            Self::FishAudioS2Pro => false,
             _ => !self.is_quantized(),
         }
     }
@@ -948,6 +978,7 @@ impl ModelVariant {
             Self::VoxtralMini4BRealtime2602,
             Self::Voxtral4BTts2603,
             Self::VibeVoice15BTts,
+            Self::FishAudioS2Pro,
         ]
     }
 }
@@ -1212,6 +1243,38 @@ mod tests {
                 supports_streaming: false,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
+            })
+        );
+    }
+
+    #[test]
+    fn fish_s2_pro_exposes_reference_voice_tts_contract() {
+        let variant = ModelVariant::FishAudioS2Pro;
+        assert!(variant.is_tts());
+        assert!(!variant.is_enabled());
+        assert_eq!(variant.primary_task(), ModelTask::Tts);
+        assert_eq!(variant.repo_id(), "fishaudio/s2-pro");
+        assert_eq!(variant.dir_name(), "FishAudio-S2-Pro");
+        assert_eq!(variant.license_label(), Some("Fish Audio Research License"));
+        assert_eq!(variant.memory_required_gb(), 24.0);
+        assert_eq!(
+            variant.tts_max_output_frames_hint(),
+            Some(ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES)
+        );
+        assert_eq!(
+            variant.tts_output_frame_rate_hz_hint(),
+            Some(ModelVariant::FISH_S2_PRO_FRAME_RATE_HZ)
+        );
+        assert_eq!(
+            variant.speech_capabilities(),
+            Some(SpeechModelCapabilities {
+                supports_builtin_voices: false,
+                built_in_voice_count: None,
+                supports_reference_voice: true,
+                supports_voice_description: false,
+                supports_streaming: false,
+                supports_speed_control: false,
+                supports_auto_long_form: false,
             })
         );
     }

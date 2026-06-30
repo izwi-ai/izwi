@@ -14,6 +14,7 @@ export const TEXT_TO_SPEECH_PREFERRED_MODELS = [
 ] as const;
 
 export const VOICE_CLONING_PREFERRED_MODELS = [
+  "FishAudio-S2-Pro",
   "Qwen3-TTS-12Hz-0.6B-Base-4bit",
   "Qwen3-TTS-12Hz-0.6B-Base-8bit",
   "Qwen3-TTS-12Hz-0.6B-Base-bf16",

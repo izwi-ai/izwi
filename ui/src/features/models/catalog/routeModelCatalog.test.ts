@@ -7,6 +7,7 @@ import {
   DIARIZATION_PREFERRED_SUMMARY_MODELS,
   SPEAKER_ATTRIBUTED_ASR_PREFERRED_MODELS,
   TRANSCRIPTION_PREFERRED_MODELS,
+  VOICE_CLONING_PREFERRED_MODELS,
   getChatRouteModelLabel,
   isThinkingChatModel,
   resolvePreferredRouteModel,
@@ -107,6 +108,10 @@ describe("route model catalog", () => {
       "Granite-Speech-4.1-2B-Plus",
     );
     expect(TRANSCRIPTION_PREFERRED_MODELS[0]).toBe("Qwen3-ASR-0.6B-GGUF");
+  });
+
+  it("keeps Fish S2 discoverable in the voice cloning route", () => {
+    expect(VOICE_CLONING_PREFERRED_MODELS[0]).toBe("FishAudio-S2-Pro");
   });
 
   it("keeps Granite as the preferred speaker-attributed ASR model", () => {

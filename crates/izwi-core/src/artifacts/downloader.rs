@@ -105,6 +105,20 @@ const VIBEVOICE_QWEN_TOKENIZER_FILES: &[&str] = &[
     "special_tokens_map.json",
 ];
 
+const FISH_S2_PRO_FILES: &[&str] = &[
+    "README.md",
+    "LICENSE.md",
+    "chat_template.jinja",
+    "codec.pth",
+    "config.json",
+    "model.safetensors.index.json",
+    "model-00001-of-00002.safetensors",
+    "model-00002-of-00002.safetensors",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+];
+
 fn vibevoice_tokenizer_repo(variant: ModelVariant) -> Option<&'static str> {
     match variant {
         ModelVariant::VibeVoice15BTts => Some("Qwen/Qwen2.5-1.5B"),
@@ -635,6 +649,9 @@ impl ModelDownloader {
                         .iter()
                         .all(|file| path.join(file).exists())
             }
+            ModelFamily::FishS2Tts => FISH_S2_PRO_FILES
+                .iter()
+                .all(|file| path.join(file).exists()),
             ModelFamily::Tokenizer => {
                 path.join("tokenizer.json").exists() || path.join("vocab.json").exists()
             }
@@ -1251,6 +1268,10 @@ impl ModelDownloader {
                 );
                 files
             }
+            ModelFamily::FishS2Tts => FISH_S2_PRO_FILES
+                .iter()
+                .map(|file| (*file).to_string())
+                .collect(),
             ModelFamily::Tokenizer => vec![
                 "config.json".to_string(),
                 "generation_config.json".to_string(),
@@ -2102,6 +2123,48 @@ mod tests {
 
         std::fs::write(model_dir.join("model-00003-of-00003.safetensors"), [0u8])
             .expect("last shard");
+        assert!(downloader.is_downloaded(variant));
+
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn fish_s2_files_include_required_model_and_codec_bundle() {
+        let (downloader, temp_dir) = test_downloader();
+        let files = downloader.get_model_files(ModelVariant::FishAudioS2Pro);
+
+        assert!(files.contains(&"config.json".to_string()));
+        assert!(files.contains(&"chat_template.jinja".to_string()));
+        assert!(files.contains(&"codec.pth".to_string()));
+        assert!(files.contains(&"model.safetensors.index.json".to_string()));
+        assert!(files.contains(&"model-00001-of-00002.safetensors".to_string()));
+        assert!(files.contains(&"model-00002-of-00002.safetensors".to_string()));
+        assert!(files.contains(&"tokenizer.json".to_string()));
+        assert!(files.contains(&"tokenizer_config.json".to_string()));
+        assert!(files.contains(&"special_tokens_map.json".to_string()));
+
+        let specs = downloader.get_model_file_specs(ModelVariant::FishAudioS2Pro);
+        assert!(specs
+            .iter()
+            .all(|spec| spec.source_repo == "fishaudio/s2-pro"));
+
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn fish_s2_is_downloaded_only_when_required_assets_exist() {
+        let (downloader, temp_dir) = test_downloader();
+        let variant = ModelVariant::FishAudioS2Pro;
+        let model_dir = downloader.model_path(variant);
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+
+        for file in FISH_S2_PRO_FILES.iter().take(FISH_S2_PRO_FILES.len() - 1) {
+            std::fs::write(model_dir.join(file), [0u8]).expect("partial fish s2 asset");
+        }
+        assert!(!downloader.is_downloaded(variant));
+
+        std::fs::write(model_dir.join(FISH_S2_PRO_FILES.last().unwrap()), [0u8])
+            .expect("last fish s2 asset");
         assert!(downloader.is_downloaded(variant));
 
         std::fs::remove_dir_all(temp_dir).ok();

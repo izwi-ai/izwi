@@ -241,6 +241,9 @@ fn resolve_speech_timeout_secs(
         Some(0) | None if variant == ModelVariant::VibeVoice15BTts => {
             vibevoice_tts_auto_max_frames_for_text(&req.input)
         }
+        Some(0) | None if variant == ModelVariant::FishAudioS2Pro => {
+            fish_s2_tts_auto_max_frames_for_text(&req.input)
+        }
         Some(0) | None => model_max_frames,
         Some(value) => value.clamp(1, model_max_frames),
     };
@@ -270,6 +273,16 @@ fn resolve_speech_timeout_secs(
         .min(timeout_max_secs.max(1));
 
     default_timeout_secs.max(suggested_secs).max(1)
+}
+
+fn fish_s2_tts_auto_max_frames_for_text(text: &str) -> usize {
+    // S2 Pro advertises roughly 21.5 codec tokens/sec. Keep the first API
+    // budget conservative until native generation and long-form chunking have
+    // real-model parity evidence.
+    let word_count = text.split_whitespace().count().max(1);
+    let estimated_secs = ((word_count as f32) / 2.6).clamp(4.0, 120.0);
+    let frames = (estimated_secs * ModelVariant::FISH_S2_PRO_FRAME_RATE_HZ).ceil() as usize;
+    frames.clamp(96, ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES)
 }
 
 fn normalize_speech_request(mut req: SpeechRequest) -> SpeechRequest {
@@ -364,10 +377,18 @@ fn validate_speech_voice_contract(
         }
     }
 
-    if variant == ModelVariant::VibeVoice15BTts && !has_direct_reference_audio {
-        return Err(ApiError::bad_request(
-            "VibeVoice-1.5B requires `saved_voice_id` or both `reference_audio` and `reference_text`.",
-        ));
+    match variant {
+        ModelVariant::VibeVoice15BTts if !has_direct_reference_audio => {
+            return Err(ApiError::bad_request(
+                "VibeVoice-1.5B requires `saved_voice_id` or both `reference_audio` and `reference_text`.",
+            ));
+        }
+        ModelVariant::FishAudioS2Pro if !has_direct_reference_audio => {
+            return Err(ApiError::bad_request(
+                "FishAudio-S2-Pro requires `saved_voice_id` or both `reference_audio` and `reference_text`.",
+            ));
+        }
+        _ => {}
     }
 
     Ok(())
@@ -633,7 +654,9 @@ fn build_generation_request(
         gen_config.options.max_tokens = max_tokens;
     } else if matches!(
         variant,
-        ModelVariant::Voxtral4BTts2603 | ModelVariant::VibeVoice15BTts
+        ModelVariant::Voxtral4BTts2603
+            | ModelVariant::VibeVoice15BTts
+            | ModelVariant::FishAudioS2Pro
     ) {
         gen_config.options.max_tokens = 0;
     }
@@ -897,6 +920,40 @@ mod tests {
     }
 
     #[test]
+    fn fish_s2_tts_omitted_max_tokens_uses_text_sized_auto_budget() {
+        let req = SpeechRequest {
+            model: "FishAudio-S2-Pro".to_string(),
+            input: "The costs split cleanly into three buckets".to_string(),
+            voice: None,
+            response_format: Some("wav".to_string()),
+            allow_format_fallback: None,
+            speed: None,
+            language: None,
+            temperature: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            top_k: None,
+            stream: Some(false),
+            stream_format: None,
+            instructions: None,
+            reference_audio: Some("UklGRg==".to_string()),
+            reference_text: Some("hello".to_string()),
+            saved_voice_id: None,
+        };
+
+        let timeout = resolve_speech_timeout_secs(1, ModelVariant::FishAudioS2Pro, &req);
+        assert_eq!(timeout, 66);
+
+        let generation = build_generation_request(
+            &req,
+            "test-correlation".to_string(),
+            false,
+            ModelVariant::FishAudioS2Pro,
+        );
+        assert_eq!(generation.config.options.max_tokens, 0);
+    }
+
+    #[test]
     fn vibevoice_speech_requests_require_reference_voice() {
         let req = SpeechRequest {
             model: "VibeVoice-1.5B".to_string(),
@@ -921,6 +978,33 @@ mod tests {
         let err = validate_speech_voice_contract(&req, ModelVariant::VibeVoice15BTts)
             .expect_err("missing reference should fail");
         assert!(err.message.contains("requires `saved_voice_id`"));
+    }
+
+    #[test]
+    fn fish_s2_speech_requests_require_reference_voice() {
+        let req = SpeechRequest {
+            model: "FishAudio-S2-Pro".to_string(),
+            input: "hello".to_string(),
+            voice: None,
+            response_format: Some("wav".to_string()),
+            allow_format_fallback: None,
+            speed: None,
+            language: None,
+            temperature: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            top_k: None,
+            stream: Some(false),
+            stream_format: None,
+            instructions: None,
+            reference_audio: None,
+            reference_text: None,
+            saved_voice_id: None,
+        };
+
+        let err = validate_speech_voice_contract(&req, ModelVariant::FishAudioS2Pro)
+            .expect_err("missing reference should fail");
+        assert!(err.message.contains("FishAudio-S2-Pro requires"));
     }
 
     #[test]

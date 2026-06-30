@@ -1,5 +1,5 @@
 use crate::catalog::ModelFamily;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::runtime::lifecycle::instantiate::{InstantiatedModelLoad, InstantiatedPayload};
 use crate::runtime::service::RuntimeService;
 
@@ -45,6 +45,11 @@ impl RuntimeService {
                     self.set_active_tts_variant(variant).await;
                 }
                 self.model_manager.mark_loaded(variant).await;
+            }
+            ModelFamily::FishS2Tts => {
+                return Err(Error::ModelLoadError(
+                    "Fish Audio S2 Pro native TTS loading is not implemented yet".to_string(),
+                ));
             }
             ModelFamily::Tokenizer => {
                 if let InstantiatedPayload::Tokenizer(Some(tokenizer)) = payload {
