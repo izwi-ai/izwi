@@ -285,9 +285,9 @@ fn load_vibevoice_tts_model(
 fn load_fish_s2_tts_model(
     model_dir: &Path,
     variant: ModelVariant,
-    _device: DeviceProfile,
+    device: DeviceProfile,
 ) -> Result<FishS2TtsModel> {
-    FishS2TtsModel::load_metadata(model_dir, variant)
+    FishS2TtsModel::load(model_dir, variant, device)
 }
 
 fn load_qwen_tts_model(

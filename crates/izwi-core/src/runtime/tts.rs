@@ -386,7 +386,7 @@ impl RuntimeService {
             sample_rate: output.sample_rate,
             total_tokens: output.frames_generated,
             total_time_ms,
-            diagnostics: None,
+            diagnostics: serde_json::to_value(output.diagnostics).ok(),
         })
     }
 

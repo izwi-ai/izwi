@@ -382,6 +382,10 @@ impl RuntimeService {
                 let model = self.model_registry.get_vibevoice_tts(variant).await?;
                 serde_json::to_value(model.diagnostics()).ok()
             }
+            crate::catalog::ModelFamily::FishS2Tts => {
+                let model = self.model_registry.get_fish_s2_tts(variant).await?;
+                serde_json::to_value(model.diagnostics()).ok()
+            }
             _ => None,
         }
     }
