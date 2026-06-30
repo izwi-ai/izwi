@@ -1,5 +1,6 @@
 //! Model registry to ensure models are loaded once and shared across the app.
 
+use izwi_asr_toolkit::{plan_audio_chunks, AsrLongFormConfig, TranscriptAssembler};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -59,6 +60,11 @@ type VoxtralTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<Voxtr
 type VibeVoiceTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VibeVoiceTtsModel>;
 type QwenTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile, usize, &str) -> Result<Qwen3TtsModel>;
 type KokoroLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<KokoroTtsModel>;
+
+const LFM25_AUDIO_ASR_DEFAULT_MAX_NEW_TOKENS: usize = 1024;
+const LFM25_AUDIO_ASR_MIN_CHUNK_NEW_TOKENS: usize = 128;
+const LFM25_AUDIO_ASR_MAX_CHUNK_NEW_TOKENS: usize = 256;
+const LFM25_AUDIO_ASR_TOKENS_PER_SECOND: f32 = 8.0;
 
 struct AsrLoaderRegistration {
     name: &'static str,
@@ -1122,6 +1128,93 @@ impl NativeAsrModel {
     }
 }
 
+fn lfm25_audio_asr_long_form_config() -> AsrLongFormConfig {
+    let mut cfg = AsrLongFormConfig::default();
+    if let Some(value) = env_positive_f32("IZWI_ASR_CHUNK_TARGET_SECS") {
+        cfg.target_chunk_secs = value;
+    }
+    if let Some(value) = env_positive_f32("IZWI_ASR_CHUNK_MAX_SECS") {
+        cfg.hard_max_chunk_secs = value;
+    }
+    if let Some(value) = env_positive_f32("IZWI_ASR_CHUNK_OVERLAP_SECS") {
+        cfg.overlap_secs = value;
+    }
+    if let Some(value) = env_positive_f32("IZWI_LFM25_ASR_CHUNK_TARGET_SECS") {
+        cfg.target_chunk_secs = value;
+    }
+    if let Some(value) = env_positive_f32("IZWI_LFM25_ASR_CHUNK_MAX_SECS") {
+        cfg.hard_max_chunk_secs = value;
+    }
+    if let Some(value) = env_positive_f32("IZWI_LFM25_ASR_CHUNK_OVERLAP_SECS") {
+        cfg.overlap_secs = value;
+    }
+    if cfg.hard_max_chunk_secs < cfg.min_chunk_secs {
+        cfg.hard_max_chunk_secs = cfg.min_chunk_secs;
+    }
+    cfg.target_chunk_secs = cfg
+        .target_chunk_secs
+        .max(cfg.min_chunk_secs.max(1.0))
+        .min(cfg.hard_max_chunk_secs);
+    cfg.overlap_secs = cfg.overlap_secs.clamp(0.0, cfg.target_chunk_secs * 0.45);
+    cfg
+}
+
+fn lfm25_audio_asr_single_pass_max_new_tokens(max_tokens: Option<usize>) -> usize {
+    max_tokens
+        .or_else(|| env_positive_usize("IZWI_LFM25_ASR_MAX_NEW_TOKENS"))
+        .unwrap_or(LFM25_AUDIO_ASR_DEFAULT_MAX_NEW_TOKENS)
+        .max(1)
+}
+
+fn lfm25_audio_asr_chunk_max_new_tokens(duration_secs: f32, max_tokens: Option<usize>) -> usize {
+    if let Some(max_tokens) = max_tokens {
+        return max_tokens.max(1);
+    }
+    if let Some(max_tokens) = env_positive_usize("IZWI_LFM25_ASR_CHUNK_MAX_NEW_TOKENS") {
+        return max_tokens;
+    }
+
+    let duration_budget = if duration_secs.is_finite() && duration_secs > 0.0 {
+        (duration_secs * LFM25_AUDIO_ASR_TOKENS_PER_SECOND).ceil() as usize
+    } else {
+        0
+    };
+    duration_budget.clamp(
+        LFM25_AUDIO_ASR_MIN_CHUNK_NEW_TOKENS,
+        LFM25_AUDIO_ASR_MAX_CHUNK_NEW_TOKENS,
+    )
+}
+
+fn audio_duration_secs(audio: &[f32], sample_rate: u32) -> f32 {
+    if sample_rate > 0 {
+        audio.len() as f32 / sample_rate as f32
+    } else {
+        0.0
+    }
+}
+
+fn samples_to_seconds_f64(samples: usize, sample_rate: u32) -> f64 {
+    if sample_rate > 0 {
+        samples as f64 / sample_rate as f64
+    } else {
+        0.0
+    }
+}
+
+fn env_positive_f32(key: &str) -> Option<f32> {
+    std::env::var(key)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f32>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+}
+
+fn env_positive_usize(key: &str) -> Option<usize> {
+    std::env::var(key)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+}
+
 impl NativeAudioChatModel {
     pub fn generate_sequential(
         &self,
@@ -1197,7 +1290,7 @@ impl NativeAudioChatModel {
     }
 
     pub fn transcribe(&self, audio: &[f32], sample_rate: u32) -> Result<NativeAsrTranscription> {
-        self.transcribe_with_callback(audio, sample_rate, &mut |_delta| {})
+        self.transcribe_long_form_with_callback(audio, sample_rate, None, &mut |_delta| {})
     }
 
     pub fn transcribe_with_callback(
@@ -1206,10 +1299,34 @@ impl NativeAudioChatModel {
         sample_rate: u32,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<NativeAsrTranscription> {
+        self.transcribe_long_form_with_callback(audio, sample_rate, None, on_delta)
+    }
+
+    pub fn transcribe_with_callback_and_max_tokens(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        max_tokens: Option<usize>,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<NativeAsrTranscription> {
+        self.transcribe_long_form_with_callback(audio, sample_rate, max_tokens, on_delta)
+    }
+
+    pub fn transcribe_single_pass_with_callback_and_options(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        options: NativeAsrGenerationOptions,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<NativeAsrTranscription> {
         match self {
             Self::Lfm25Audio(model) => {
-                let output =
-                    model.transcribe_to_output_with_callback(audio, sample_rate, 1024, on_delta)?;
+                let output = model.transcribe_to_output_with_callback(
+                    audio,
+                    sample_rate,
+                    options.max_new_tokens.max(1),
+                    on_delta,
+                )?;
                 Ok(NativeAsrTranscription {
                     text: output.text,
                     language: None,
@@ -1217,6 +1334,107 @@ impl NativeAudioChatModel {
                 })
             }
         }
+    }
+
+    pub fn transcribe_long_form_with_callback(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        max_tokens: Option<usize>,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<NativeAsrTranscription> {
+        let duration_secs = audio_duration_secs(audio, sample_rate);
+        let chunk_cfg = lfm25_audio_asr_long_form_config();
+        let chunks = plan_audio_chunks(audio, sample_rate, &chunk_cfg, None);
+        if chunks.len() <= 1 {
+            return self.transcribe_single_pass_with_callback_and_options(
+                audio,
+                sample_rate,
+                NativeAsrGenerationOptions {
+                    max_new_tokens: lfm25_audio_asr_single_pass_max_new_tokens(max_tokens),
+                    ..NativeAsrGenerationOptions::default()
+                },
+                on_delta,
+            );
+        }
+
+        let mut assembler = TranscriptAssembler::new(chunk_cfg.clone());
+        let mut chunk_diagnostics = Vec::with_capacity(chunks.len());
+        for (idx, chunk) in chunks.iter().enumerate() {
+            if chunk.end_sample <= chunk.start_sample || chunk.end_sample > audio.len() {
+                chunk_diagnostics.push(serde_json::json!({
+                    "index": idx,
+                    "skipped": true,
+                    "skip_reason": "invalid_bounds",
+                    "start_sample": chunk.start_sample,
+                    "end_sample": chunk.end_sample
+                }));
+                continue;
+            }
+
+            let chunk_audio = &audio[chunk.start_sample..chunk.end_sample];
+            let chunk_duration_secs = audio_duration_secs(chunk_audio, sample_rate);
+            let chunk_max_tokens =
+                lfm25_audio_asr_chunk_max_new_tokens(chunk_duration_secs, max_tokens);
+            let output = self.transcribe_single_pass_with_callback_and_options(
+                chunk_audio,
+                sample_rate,
+                NativeAsrGenerationOptions {
+                    max_new_tokens: chunk_max_tokens,
+                    ..NativeAsrGenerationOptions::default()
+                },
+                &mut |_delta| {},
+            )?;
+            let delta = assembler.push_chunk_text(&output.text);
+            if !delta.is_empty() {
+                on_delta(&delta);
+            }
+
+            chunk_diagnostics.push(serde_json::json!({
+                "index": idx,
+                "start_sample": chunk.start_sample,
+                "end_sample": chunk.end_sample,
+                "start_seconds": samples_to_seconds_f64(chunk.start_sample, sample_rate),
+                "end_seconds": samples_to_seconds_f64(chunk.end_sample, sample_rate),
+                "duration_seconds": chunk_duration_secs,
+                "max_new_tokens": chunk_max_tokens,
+                "text_chars": output.text.len(),
+                "model_diagnostics": output.diagnostics
+            }));
+        }
+
+        Ok(NativeAsrTranscription {
+            text: assembler.text().to_string(),
+            language: None,
+            diagnostics: Some(serde_json::json!({
+                "model": "lfm25_audio",
+                "task": "asr",
+                "chunking": {
+                    "enabled": true,
+                    "planner": "duration",
+                    "input_samples": audio.len(),
+                    "input_sample_rate": sample_rate,
+                    "duration_seconds": duration_secs,
+                    "target_chunk_seconds": chunk_cfg.target_chunk_secs,
+                    "hard_max_chunk_seconds": chunk_cfg.hard_max_chunk_secs,
+                    "overlap_seconds": chunk_cfg.overlap_secs,
+                    "chunks": chunks.iter().map(|chunk| serde_json::json!({
+                        "start_sample": chunk.start_sample,
+                        "end_sample": chunk.end_sample,
+                        "start_seconds": samples_to_seconds_f64(chunk.start_sample, sample_rate),
+                        "end_seconds": samples_to_seconds_f64(chunk.end_sample, sample_rate),
+                    })).collect::<Vec<_>>(),
+                    "chunk_transcriptions": chunk_diagnostics
+                },
+                "decode": {
+                    "requested_max_tokens": max_tokens,
+                    "default_single_pass_max_tokens": LFM25_AUDIO_ASR_DEFAULT_MAX_NEW_TOKENS,
+                    "chunk_tokens_per_second": LFM25_AUDIO_ASR_TOKENS_PER_SECOND,
+                    "chunk_min_new_tokens": LFM25_AUDIO_ASR_MIN_CHUNK_NEW_TOKENS,
+                    "chunk_max_new_tokens": LFM25_AUDIO_ASR_MAX_CHUNK_NEW_TOKENS
+                }
+            })),
+        })
     }
 }
 
@@ -1998,6 +2216,12 @@ impl ModelRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn resolves_vibevoice_asr_loader_registration() {
@@ -2038,5 +2262,44 @@ mod tests {
 
         assert_eq!(registration.name, "vibevoice_tts");
         assert_eq!(registration.family, ModelFamily::VibeVoiceTts);
+    }
+
+    #[test]
+    fn lfm_audio_asr_chunk_budget_scales_and_caps() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let previous = std::env::var("IZWI_LFM25_ASR_CHUNK_MAX_NEW_TOKENS").ok();
+        std::env::remove_var("IZWI_LFM25_ASR_CHUNK_MAX_NEW_TOKENS");
+
+        assert_eq!(
+            lfm25_audio_asr_chunk_max_new_tokens(0.0, None),
+            LFM25_AUDIO_ASR_MIN_CHUNK_NEW_TOKENS
+        );
+        assert_eq!(lfm25_audio_asr_chunk_max_new_tokens(24.0, None), 192);
+        assert_eq!(
+            lfm25_audio_asr_chunk_max_new_tokens(60.0, None),
+            LFM25_AUDIO_ASR_MAX_CHUNK_NEW_TOKENS
+        );
+        assert_eq!(lfm25_audio_asr_chunk_max_new_tokens(24.0, Some(42)), 42);
+
+        if let Some(previous) = previous {
+            std::env::set_var("IZWI_LFM25_ASR_CHUNK_MAX_NEW_TOKENS", previous);
+        }
+    }
+
+    #[test]
+    fn lfm_audio_asr_single_pass_preserves_legacy_default_cap() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let previous = std::env::var("IZWI_LFM25_ASR_MAX_NEW_TOKENS").ok();
+        std::env::remove_var("IZWI_LFM25_ASR_MAX_NEW_TOKENS");
+
+        assert_eq!(
+            lfm25_audio_asr_single_pass_max_new_tokens(None),
+            LFM25_AUDIO_ASR_DEFAULT_MAX_NEW_TOKENS
+        );
+        assert_eq!(lfm25_audio_asr_single_pass_max_new_tokens(Some(64)), 64);
+
+        if let Some(previous) = previous {
+            std::env::set_var("IZWI_LFM25_ASR_MAX_NEW_TOKENS", previous);
+        }
     }
 }
