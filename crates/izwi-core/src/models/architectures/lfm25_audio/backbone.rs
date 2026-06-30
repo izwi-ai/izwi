@@ -10,7 +10,7 @@ use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 use crate::error::{Error, Result};
 use crate::kernels::{
     try_fused_decode_gqa_attention_with_kv_len, try_fused_qk_rms_norm, try_fused_rope_pair_bshd,
-    try_fused_silu_mul_with_status, try_lfm_shortconv_decode3,
+    try_fused_silu_mul_with_status, try_lfm_shortconv_decode3, try_lfm_shortconv_sequence3,
 };
 use crate::models::shared::attention::flash::{
     flash_attention_requested, try_fused_self_attention_with_options, CudaFlashAttentionOptions,
@@ -416,19 +416,28 @@ impl ShortConvLayer {
                     .contiguous()?
             }
         } else {
-            let conv = Conv1d::new(
-                conv_weight
-                    .reshape((hidden_size, 1, self.l_cache))?
-                    .contiguous()?,
-                None,
-                Conv1dConfig {
-                    padding: self.l_cache.saturating_sub(1),
-                    groups: hidden_size,
-                    ..Default::default()
-                },
-            );
-            let mut out = conv.forward(&bx.contiguous()?)?;
-            out = out.narrow(2, 0, seq_len)?;
+            let bx = bx.contiguous()?;
+            let out = if self.l_cache == 3 {
+                try_lfm_shortconv_sequence3(&bx, conv_weight)
+            } else {
+                None
+            };
+            let out = if let Some(out) = out {
+                out
+            } else {
+                let conv = Conv1d::new(
+                    conv_weight
+                        .reshape((hidden_size, 1, self.l_cache))?
+                        .contiguous()?,
+                    None,
+                    Conv1dConfig {
+                        padding: self.l_cache.saturating_sub(1),
+                        groups: hidden_size,
+                        ..Default::default()
+                    },
+                );
+                conv.forward(&bx)?.narrow(2, 0, seq_len)?
+            };
 
             if self.l_cache > 0 {
                 let (_, _, cur_len) = bx.dims3()?;
