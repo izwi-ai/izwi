@@ -14,6 +14,7 @@ pub mod artifacts;
 pub mod codec;
 pub mod config;
 pub mod contracts;
+pub mod slow;
 pub mod tokenizer;
 pub mod weights;
 
@@ -24,6 +25,7 @@ pub use contracts::{
     build_semantic_allowed_mask, remap_fish_qwen3_omni_key, semantic_code_from_token_id,
     semantic_token_id, FishS2DacContract, FishS2PromptTensorShape,
 };
+pub use slow::{FishS2SlowCache, FishS2SlowConfig, FishS2SlowOutput, FishS2SlowTransformer};
 pub use tokenizer::{
     FishS2ConditioningPrompt, FishS2PromptTokenizer, FishS2SpecialTokens, FishS2VqCodes,
 };
