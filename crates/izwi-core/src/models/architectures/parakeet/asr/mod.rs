@@ -1,5 +1,5 @@
 mod decode;
-mod metal_kernels;
+pub(crate) mod metal_kernels;
 mod nemo;
 mod preprocessor;
 
