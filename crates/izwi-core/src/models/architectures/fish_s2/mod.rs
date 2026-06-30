@@ -24,7 +24,9 @@ pub use contracts::{
     build_semantic_allowed_mask, remap_fish_qwen3_omni_key, semantic_code_from_token_id,
     semantic_token_id, FishS2DacContract, FishS2PromptTensorShape,
 };
-pub use tokenizer::{FishS2PromptTokenizer, FishS2SpecialTokens};
+pub use tokenizer::{
+    FishS2ConditioningPrompt, FishS2PromptTokenizer, FishS2SpecialTokens, FishS2VqCodes,
+};
 pub use weights::{FishS2TensorSpec, FishS2WeightIndex, FishS2Weights};
 
 #[derive(Debug, Clone)]
