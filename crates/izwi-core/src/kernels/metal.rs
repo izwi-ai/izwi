@@ -314,6 +314,7 @@ kernel void izwi_decode_gqa_attention_f32(
     constant uint& total_len [[buffer(6)]],
     constant uint& head_dim [[buffer(7)]],
     constant float& scale [[buffer(8)]],
+    constant uint& kv_capacity_len [[buffer(9)]],
     uint tid [[thread_index_in_threadgroup]],
     uint head [[threadgroup_position_in_grid]],
     uint threads_per_threadgroup [[threads_per_threadgroup]]
@@ -331,7 +332,7 @@ kernel void izwi_decode_gqa_attention_f32(
     for (uint pos = tid; pos < total_len; pos += threads_per_threadgroup) {
         float dot = 0.0f;
         const uint q_base = head * head_dim;
-        const uint k_base = (kv_head * total_len + pos) * head_dim;
+        const uint k_base = (kv_head * kv_capacity_len + pos) * head_dim;
         for (uint dim = 0; dim < head_dim; dim++) {
             dot += q[q_base + dim] * k[k_base + dim];
         }
@@ -372,7 +373,7 @@ kernel void izwi_decode_gqa_attention_f32(
         float acc = 0.0f;
         for (uint pos = 0; pos < total_len; pos++) {
             const float prob = scores[pos] * inv_sum;
-            const uint v_base = (kv_head * total_len + pos) * head_dim;
+            const uint v_base = (kv_head * kv_capacity_len + pos) * head_dim;
             acc += prob * v[v_base + dim];
         }
         output[out_base + dim] = acc;
@@ -389,6 +390,7 @@ kernel void izwi_decode_gqa_attention_f16(
     constant uint& total_len [[buffer(6)]],
     constant uint& head_dim [[buffer(7)]],
     constant float& scale [[buffer(8)]],
+    constant uint& kv_capacity_len [[buffer(9)]],
     uint tid [[thread_index_in_threadgroup]],
     uint head [[threadgroup_position_in_grid]],
     uint threads_per_threadgroup [[threads_per_threadgroup]]
@@ -406,7 +408,7 @@ kernel void izwi_decode_gqa_attention_f16(
     for (uint pos = tid; pos < total_len; pos += threads_per_threadgroup) {
         float dot = 0.0f;
         const uint q_base = head * head_dim;
-        const uint k_base = (kv_head * total_len + pos) * head_dim;
+        const uint k_base = (kv_head * kv_capacity_len + pos) * head_dim;
         for (uint dim = 0; dim < head_dim; dim++) {
             dot += float(q[q_base + dim]) * float(k[k_base + dim]);
         }
@@ -447,7 +449,7 @@ kernel void izwi_decode_gqa_attention_f16(
         float acc = 0.0f;
         for (uint pos = 0; pos < total_len; pos++) {
             const float prob = scores[pos] * inv_sum;
-            const uint v_base = (kv_head * total_len + pos) * head_dim;
+            const uint v_base = (kv_head * kv_capacity_len + pos) * head_dim;
             acc += prob * float(v[v_base + dim]);
         }
         output[out_base + dim] = half(acc);
@@ -1071,7 +1073,8 @@ fn rope_pair_bshd_pipeline(device: &MetalDevice, dtype: DType) -> CandleResult<C
 struct DecodeGqaAttentionOp {
     num_heads: usize,
     num_kv_heads: usize,
-    total_len: usize,
+    kv_len: usize,
+    kv_capacity_len: usize,
     head_dim: usize,
     scale: f32,
 }
@@ -1115,8 +1118,9 @@ impl CustomOp3 for DecodeGqaAttentionOp {
         }
         if self.num_heads == 0
             || self.num_kv_heads == 0
-            || self.total_len == 0
-            || self.total_len > 2048
+            || self.kv_len == 0
+            || self.kv_len > self.kv_capacity_len
+            || self.kv_len > 2048
             || self.head_dim == 0
             || self.num_heads % self.num_kv_heads != 0
         {
@@ -1127,7 +1131,7 @@ impl CustomOp3 for DecodeGqaAttentionOp {
         }
         let kv_elems = self
             .num_kv_heads
-            .saturating_mul(self.total_len)
+            .saturating_mul(self.kv_capacity_len)
             .saturating_mul(self.head_dim);
         if k_layout.shape().elem_count() != kv_elems || v_layout.shape().elem_count() != kv_elems {
             bail!("izwi-decode-gqa-attention-metal k/v shape mismatch")
@@ -1136,7 +1140,8 @@ impl CustomOp3 for DecodeGqaAttentionOp {
         if elem_count > u32::MAX as usize
             || self.num_heads > u32::MAX as usize
             || self.num_kv_heads > u32::MAX as usize
-            || self.total_len > u32::MAX as usize
+            || self.kv_len > u32::MAX as usize
+            || self.kv_capacity_len > u32::MAX as usize
             || self.head_dim > u32::MAX as usize
         {
             bail!("izwi-decode-gqa-attention-metal tensor is too large")
@@ -1167,9 +1172,10 @@ impl CustomOp3 for DecodeGqaAttentionOp {
         encoder.set_buffer(3, Some(&output), 0);
         encoder.set_bytes(4, &(self.num_heads as u32));
         encoder.set_bytes(5, &(self.num_kv_heads as u32));
-        encoder.set_bytes(6, &(self.total_len as u32));
+        encoder.set_bytes(6, &(self.kv_len as u32));
         encoder.set_bytes(7, &(self.head_dim as u32));
         encoder.set_bytes(8, &self.scale);
+        encoder.set_bytes(9, &(self.kv_capacity_len as u32));
 
         let threads_per_threadgroup = self
             .head_dim
@@ -1628,8 +1634,31 @@ pub fn try_fused_decode_gqa_attention(
     head_dim: usize,
     scale: f32,
 ) -> Option<Tensor> {
+    let total_len = k.dims4().ok()?.2;
+    try_fused_decode_gqa_attention_with_kv_len(
+        q,
+        k,
+        v,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        total_len,
+        scale,
+    )
+}
+
+pub fn try_fused_decode_gqa_attention_with_kv_len(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+    scale: f32,
+) -> Option<Tensor> {
     #[cfg(not(feature = "metal"))]
-    let _ = (q, k, v, num_heads, num_kv_heads, head_dim, scale);
+    let _ = (q, k, v, num_heads, num_kv_heads, head_dim, kv_len, scale);
 
     if !use_fused_kernels() {
         return None;
@@ -1638,8 +1667,8 @@ pub fn try_fused_decode_gqa_attention(
     #[cfg(feature = "metal")]
     {
         let (q_bsz, q_heads, q_seq, q_head_dim) = q.dims4().ok()?;
-        let (k_bsz, k_heads, total_len, k_head_dim) = k.dims4().ok()?;
-        let (v_bsz, v_heads, v_total_len, v_head_dim) = v.dims4().ok()?;
+        let (k_bsz, k_heads, kv_capacity_len, k_head_dim) = k.dims4().ok()?;
+        let (v_bsz, v_heads, v_capacity_len, v_head_dim) = v.dims4().ok()?;
         if q_bsz != 1
             || k_bsz != 1
             || v_bsz != 1
@@ -1650,9 +1679,10 @@ pub fn try_fused_decode_gqa_attention(
             || q_head_dim != head_dim
             || k_head_dim != head_dim
             || v_head_dim != head_dim
-            || total_len != v_total_len
-            || total_len == 0
-            || total_len > 2048
+            || kv_capacity_len != v_capacity_len
+            || kv_len == 0
+            || kv_len > kv_capacity_len
+            || kv_len > 2048
             || num_heads == 0
             || num_kv_heads == 0
             || num_heads % num_kv_heads != 0
@@ -1678,7 +1708,8 @@ pub fn try_fused_decode_gqa_attention(
                 &DecodeGqaAttentionOp {
                     num_heads,
                     num_kv_heads,
-                    total_len,
+                    kv_len,
+                    kv_capacity_len,
                     head_dim,
                     scale,
                 },
@@ -2369,6 +2400,52 @@ mod tests {
                 assert!(
                     (actual - expected).abs() <= tolerance,
                     "{dtype:?} mismatch at {idx}: {actual} != {expected}"
+                );
+            }
+
+            let k_padded = Tensor::from_vec(
+                vec![
+                    0.3f32, -0.5, 0.7, -0.9, //
+                    1.1, -1.3, 1.5, -1.7, //
+                    1.9, -2.1, 2.3, -2.5, //
+                    90.0, 91.0, 92.0, 93.0, //
+                    -90.0, -91.0, -92.0, -93.0,
+                ],
+                (1, 1, 5, 4),
+                &device,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            let v_padded = Tensor::from_vec(
+                vec![
+                    -0.2f32, 0.4, -0.6, 0.8, //
+                    1.0, -1.2, 1.4, -1.6, //
+                    -1.8, 2.0, -2.2, 2.4, //
+                    80.0, 81.0, 82.0, 83.0, //
+                    -80.0, -81.0, -82.0, -83.0,
+                ],
+                (1, 1, 5, 4),
+                &device,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            let padded_out = try_fused_decode_gqa_attention_with_kv_len(
+                &q, &k_padded, &v_padded, 2, 1, 4, 3, scale,
+            )
+            .expect("fused decode GQA attention should ignore padded cache tail");
+            let padded_out = padded_out
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            for (idx, (actual, expected)) in padded_out.iter().zip(reference.iter()).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "{dtype:?} padded mismatch at {idx}: {actual} != {expected}"
                 );
             }
         }
