@@ -1,5 +1,5 @@
 use crate::catalog::ModelFamily;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::runtime::lifecycle::instantiate::{InstantiatedModelLoad, InstantiatedPayload};
 use crate::runtime::service::RuntimeService;
 
@@ -33,7 +33,8 @@ impl RuntimeService {
             | ModelFamily::Qwen3Tts
             | ModelFamily::KokoroTts
             | ModelFamily::VoxtralTts
-            | ModelFamily::VibeVoiceTts => {
+            | ModelFamily::VibeVoiceTts
+            | ModelFamily::FishS2Tts => {
                 if matches!(
                     family,
                     ModelFamily::Qwen3Tts
@@ -41,15 +42,11 @@ impl RuntimeService {
                         | ModelFamily::Lfm25Audio
                         | ModelFamily::VoxtralTts
                         | ModelFamily::VibeVoiceTts
+                        | ModelFamily::FishS2Tts
                 ) {
                     self.set_active_tts_variant(variant).await;
                 }
                 self.model_manager.mark_loaded(variant).await;
-            }
-            ModelFamily::FishS2Tts => {
-                return Err(Error::ModelLoadError(
-                    "Fish Audio S2 Pro native TTS loading is not implemented yet".to_string(),
-                ));
             }
             ModelFamily::Tokenizer => {
                 if let InstantiatedPayload::Tokenizer(Some(tokenizer)) = payload {

@@ -60,6 +60,7 @@ impl RuntimeService {
                 self.clear_active_tts_variant(variant).await;
             }
             ModelFamily::FishS2Tts => {
+                self.model_registry.unload_fish_s2_tts(variant).await;
                 self.clear_active_tts_variant(variant).await;
             }
             ModelFamily::Tokenizer => {
