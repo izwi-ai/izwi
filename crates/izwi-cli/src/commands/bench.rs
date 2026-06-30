@@ -116,6 +116,7 @@ struct TtsBenchSample {
     audio_duration_secs: Option<f64>,
     rtf: Option<f64>,
     tokens_generated: Option<u64>,
+    diagnostics: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -145,6 +146,27 @@ struct AsrBenchResponse {
 struct AsrBenchSample {
     total_ms: f64,
     response: AsrBenchResponse,
+}
+
+#[derive(Debug, Clone)]
+struct TtsStageTimings {
+    prompt_build: Option<f64>,
+    prompt_embed: Option<f64>,
+    prefill: Option<f64>,
+    text_sampling: Option<f64>,
+    tokenizer_decode: Option<f64>,
+    text_forward: Option<f64>,
+    audio_head: Option<f64>,
+    audio_embed: Option<f64>,
+    audio_forward: Option<f64>,
+    main_backbone: Option<f64>,
+    detokenizer: Option<f64>,
+    model_total: Option<f64>,
+    prompt_tokens: Option<u64>,
+    generated_tokens: Option<u64>,
+    audio_frames: Option<u64>,
+    audio_head_calls: Option<u64>,
+    text_sample_calls: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -364,6 +386,8 @@ struct BenchmarkSample {
     audio_duration_secs: Option<f64>,
     rtf: Option<f64>,
     tokens_generated: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tts_diagnostics: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     asr_execution: Option<AsrExecutionDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1547,6 +1571,7 @@ async fn bench_chat(
                 audio_duration_secs: None,
                 rtf: None,
                 tokens_generated: None,
+                tts_diagnostics: None,
                 asr_execution: None,
                 asr_text: None,
                 asr_diagnostics: None,
@@ -1670,6 +1695,11 @@ async fn bench_tts(
             },
         )
         .collect();
+    let tts_stage_samples: Vec<TtsStageTimings> = samples
+        .iter()
+        .filter_map(|sample| sample.diagnostics.as_ref())
+        .filter_map(tts_stage_timings_from_diagnostics)
+        .collect();
     let avg = times.iter().sum::<f64>() / times.len() as f64;
     let min = times.iter().cloned().fold(f64::INFINITY, f64::min);
     let max = times.iter().cloned().fold(0.0, f64::max);
@@ -1723,6 +1753,7 @@ async fn bench_tts(
                 percentile(&tokens_per_second, 0.95)
             );
         }
+        print_tts_stage_timing_summary(&tts_stage_samples);
     }
     let metrics_after = fetch_runtime_metrics(server).await;
     if options.human_output() {
@@ -1794,6 +1825,7 @@ async fn bench_tts(
                 audio_duration_secs: sample.audio_duration_secs,
                 rtf: sample.rtf,
                 tokens_generated: sample.tokens_generated,
+                tts_diagnostics: sample.diagnostics.clone(),
                 asr_execution: None,
                 asr_text: None,
                 asr_diagnostics: None,
@@ -2060,6 +2092,7 @@ async fn bench_asr(
                 audio_duration_secs: sample.response.duration,
                 rtf: sample.response.rtf,
                 tokens_generated: None,
+                tts_diagnostics: None,
                 asr_execution: sample
                     .response
                     .izwi_asr_diagnostics
@@ -2214,6 +2247,14 @@ fn header_u64(response: &reqwest::Response, name: &'static str) -> Option<u64> {
         .and_then(|value| value.parse::<u64>().ok())
 }
 
+fn header_json(response: &reqwest::Response, name: &'static str) -> Option<serde_json::Value> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| serde_json::from_str(value).ok())
+}
+
 async fn resolve_tts_bench_reference(
     speaker: Option<&str>,
     saved_voice_id: Option<&str>,
@@ -2316,6 +2357,7 @@ async fn run_tts_request(
         audio_duration_secs: header_f64(&response, "x-audio-duration-secs"),
         rtf: header_f64(&response, "x-rtf"),
         tokens_generated: header_u64(&response, "x-tokens-generated"),
+        diagnostics: header_json(&response, "x-izwi-tts-diagnostics"),
     })
 }
 
@@ -2649,6 +2691,43 @@ async fn fetch_runtime_metrics(server: &str) -> Option<RuntimeTelemetrySnapshot>
     }
 
     None
+}
+
+fn tts_stage_timings_from_diagnostics(diagnostics: &serde_json::Value) -> Option<TtsStageTimings> {
+    let timings = diagnostics.get("timings_ms")?.as_object()?;
+    let prompt = diagnostics.get("prompt");
+    let decode = diagnostics.get("decode");
+    let audio = diagnostics.get("audio");
+    Some(TtsStageTimings {
+        prompt_build: timings.get("prompt_build").and_then(|value| value.as_f64()),
+        prompt_embed: timings.get("prompt_embed").and_then(|value| value.as_f64()),
+        prefill: timings
+            .get("prefill")
+            .or_else(|| timings.get("main_prefill"))
+            .and_then(|value| value.as_f64()),
+        text_sampling: timings
+            .get("text_sampling")
+            .and_then(|value| value.as_f64()),
+        tokenizer_decode: timings
+            .get("tokenizer_decode")
+            .and_then(|value| value.as_f64()),
+        text_forward: timings.get("text_forward").and_then(|value| value.as_f64()),
+        audio_head: timings.get("audio_head").and_then(|value| value.as_f64()),
+        audio_embed: timings.get("audio_embed").and_then(|value| value.as_f64()),
+        audio_forward: timings
+            .get("audio_forward")
+            .and_then(|value| value.as_f64()),
+        main_backbone: timings
+            .get("main_backbone")
+            .and_then(|value| value.as_f64()),
+        detokenizer: timings.get("detokenizer").and_then(|value| value.as_f64()),
+        model_total: timings.get("model_total").and_then(|value| value.as_f64()),
+        prompt_tokens: diagnostic_u64(prompt, &["prompt_tokens", "tokens"]),
+        generated_tokens: diagnostic_u64(decode, &["generated_tokens"]),
+        audio_frames: diagnostic_u64(audio, &["audio_frames", "acoustic_frames"]),
+        audio_head_calls: diagnostic_u64(decode, &["audio_head_calls"]),
+        text_sample_calls: diagnostic_u64(decode, &["text_sample_calls"]),
+    })
 }
 
 fn asr_stage_timings_from_diagnostics(diagnostics: &serde_json::Value) -> Option<AsrStageTimings> {
@@ -3084,6 +3163,108 @@ fn summarize_bool_count(stage: &str, values: &[bool]) {
     }
     let enabled = values.iter().filter(|value| **value).count();
     println!("  {:<14} enabled: {}/{}", stage, enabled, values.len());
+}
+
+fn print_tts_stage_timing_summary(samples: &[TtsStageTimings]) {
+    if samples.is_empty() {
+        return;
+    }
+
+    let mut prompt_build = Vec::new();
+    let mut prompt_embed = Vec::new();
+    let mut prefill = Vec::new();
+    let mut text_sampling = Vec::new();
+    let mut tokenizer_decode = Vec::new();
+    let mut text_forward = Vec::new();
+    let mut audio_head = Vec::new();
+    let mut audio_embed = Vec::new();
+    let mut audio_forward = Vec::new();
+    let mut main_backbone = Vec::new();
+    let mut detokenizer = Vec::new();
+    let mut model_total = Vec::new();
+    let mut prompt_tokens = Vec::new();
+    let mut generated_tokens = Vec::new();
+    let mut audio_frames = Vec::new();
+    let mut audio_head_calls = Vec::new();
+    let mut text_sample_calls = Vec::new();
+
+    for sample in samples {
+        if let Some(value) = sample.prompt_build {
+            prompt_build.push(value);
+        }
+        if let Some(value) = sample.prompt_embed {
+            prompt_embed.push(value);
+        }
+        if let Some(value) = sample.prefill {
+            prefill.push(value);
+        }
+        if let Some(value) = sample.text_sampling {
+            text_sampling.push(value);
+        }
+        if let Some(value) = sample.tokenizer_decode {
+            tokenizer_decode.push(value);
+        }
+        if let Some(value) = sample.text_forward {
+            text_forward.push(value);
+        }
+        if let Some(value) = sample.audio_head {
+            audio_head.push(value);
+        }
+        if let Some(value) = sample.audio_embed {
+            audio_embed.push(value);
+        }
+        if let Some(value) = sample.audio_forward {
+            audio_forward.push(value);
+        }
+        if let Some(value) = sample.main_backbone {
+            main_backbone.push(value);
+        }
+        if let Some(value) = sample.detokenizer {
+            detokenizer.push(value);
+        }
+        if let Some(value) = sample.model_total {
+            model_total.push(value);
+        }
+        if let Some(value) = sample.prompt_tokens {
+            prompt_tokens.push(value);
+        }
+        if let Some(value) = sample.generated_tokens {
+            generated_tokens.push(value);
+        }
+        if let Some(value) = sample.audio_frames {
+            audio_frames.push(value);
+        }
+        if let Some(value) = sample.audio_head_calls {
+            audio_head_calls.push(value);
+        }
+        if let Some(value) = sample.text_sample_calls {
+            text_sample_calls.push(value);
+        }
+    }
+
+    println!(
+        "\n{}",
+        console::style("TTS Stage Timings (run-local):")
+            .bold()
+            .underlined()
+    );
+    summarize_stage("prompt_build", &prompt_build);
+    summarize_stage("prompt_embed", &prompt_embed);
+    summarize_stage("prefill", &prefill);
+    summarize_stage("text_sample", &text_sampling);
+    summarize_stage("tokenizer", &tokenizer_decode);
+    summarize_stage("text_forward", &text_forward);
+    summarize_stage("audio_head", &audio_head);
+    summarize_stage("audio_embed", &audio_embed);
+    summarize_stage("audio_forward", &audio_forward);
+    summarize_stage("main_backbone", &main_backbone);
+    summarize_stage("detokenizer", &detokenizer);
+    summarize_stage("model_total", &model_total);
+    summarize_count("prompt_tokens", &prompt_tokens);
+    summarize_count("gen_tokens", &generated_tokens);
+    summarize_count("audio_frames", &audio_frames);
+    summarize_count("audio_head", &audio_head_calls);
+    summarize_count("text_sample", &text_sample_calls);
 }
 
 fn print_asr_stage_timing_summary(samples: &[AsrStageTimings]) {
@@ -3871,6 +4052,48 @@ mod tests {
     }
 
     #[test]
+    fn lfm25_tts_stage_timing_collection_reads_diagnostics_header_shape() {
+        let diagnostics = serde_json::json!({
+            "model": "lfm25_audio",
+            "task": "tts",
+            "timings_ms": {
+                "prompt_build": 1.0,
+                "prompt_embed": 2.0,
+                "prefill": 3.0,
+                "text_sampling": 4.0,
+                "audio_head": 5.0,
+                "detokenizer": 6.0,
+                "model_total": 21.0
+            },
+            "prompt": {
+                "prompt_tokens": 11
+            },
+            "decode": {
+                "generated_tokens": 42,
+                "audio_head_calls": 7,
+                "text_sample_calls": 3
+            },
+            "audio": {
+                "audio_frames": 6
+            }
+        });
+
+        let timings = tts_stage_timings_from_diagnostics(&diagnostics)
+            .expect("LFM2.5 TTS diagnostics should parse");
+
+        assert_eq!(timings.prompt_build, Some(1.0));
+        assert_eq!(timings.prefill, Some(3.0));
+        assert_eq!(timings.audio_head, Some(5.0));
+        assert_eq!(timings.detokenizer, Some(6.0));
+        assert_eq!(timings.model_total, Some(21.0));
+        assert_eq!(timings.prompt_tokens, Some(11));
+        assert_eq!(timings.generated_tokens, Some(42));
+        assert_eq!(timings.audio_frames, Some(6));
+        assert_eq!(timings.audio_head_calls, Some(7));
+        assert_eq!(timings.text_sample_calls, Some(3));
+    }
+
+    #[test]
     fn whisper_stage_timing_collection_includes_chunk_model_diagnostics() {
         let diagnostics = serde_json::json!({
             "chunking": {
@@ -4216,6 +4439,7 @@ mod tests {
             audio_duration_secs: Some(10.0),
             rtf: Some(0.012),
             tokens_generated: None,
+            tts_diagnostics: None,
             asr_execution: None,
             asr_text: Some("hello granite".to_string()),
             asr_diagnostics: Some(diagnostics.clone()),

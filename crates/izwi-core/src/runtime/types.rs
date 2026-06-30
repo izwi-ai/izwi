@@ -324,6 +324,7 @@ pub struct GenerationResult {
     pub sample_rate: u32,
     pub total_tokens: usize,
     pub total_time_ms: f32,
+    pub diagnostics: Option<serde_json::Value>,
 }
 
 impl GenerationResult {
