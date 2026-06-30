@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 
-use super::audio_output::Lfm25AudioHead;
+use super::audio_output::{Lfm25AudioHead, Lfm25SampledAudioFrame};
 use super::backbone::QuantizedLfm2Backbone;
 use super::bundle::{Lfm25AudioBundle, Lfm25AudioBundleInfo};
 use super::config::{
@@ -32,6 +32,7 @@ const DEFAULT_MAX_NEW_TOKENS: usize = 1024;
 const DEFAULT_AUDIO_STREAM_DECODE_STRIDE_FRAMES: usize = 6;
 const DEFAULT_AUDIO_STREAM_HOLDBACK_FRAMES: usize = 2;
 const DEFAULT_ASR_STOP_CHECK_INTERVAL: usize = 92;
+const DEFAULT_TTS_AUDIO_STOP_CHECK_INTERVAL: usize = 20;
 
 #[derive(Debug, Clone)]
 pub struct Lfm25AudioTextOutput {
@@ -537,148 +538,261 @@ impl Lfm25AudioModel {
         let vocab_limit = self.tokenizer.vocab_size();
         let specials = self.tokenizer.specials().clone();
         let codebooks = self.decoder_config.codebooks;
+        let audio_stop_check_interval = lfm25_tts_audio_stop_check_interval();
+        let chunked_audio_stop_check =
+            generation_config.audio.temperature <= 1e-5 && audio_stop_check_interval > 1;
 
         let main_started = Instant::now();
-        let (text, prompt_tokens, tokens_generated, audio_codes, mut profile) = self
-            .with_main_backbone(|main_backbone| {
-                let mut profile = Lfm25TtsProfile::default();
-                let mut rng = SimpleRng::new(generation_config.seed);
-                main_backbone.reset_state();
+        let (
+            text,
+            prompt_tokens,
+            tokens_generated,
+            audio_codes,
+            device_audio_codes,
+            audio_frames_generated,
+            mut profile,
+        ) = self.with_main_backbone(|main_backbone| {
+            let mut profile = Lfm25TtsProfile::default();
+            let mut rng = SimpleRng::new(generation_config.seed);
+            main_backbone.reset_state();
 
-                let prompt_embed_started = Instant::now();
-                let prompt_embeds =
-                    embed_token_ids(main_backbone, &self.device.device, &prompt_ids)?;
-                profile.prompt_embed_ms = elapsed_ms(prompt_embed_started);
-                let prompt_tokens = prompt_embeds.dim(1)?;
-                let prefill_started = Instant::now();
-                let prompt_hidden = main_backbone.forward_embeds(&prompt_embeds, 0)?;
-                let mut last_hidden = last_hidden_state(&prompt_hidden)?;
-                let mut logits = main_backbone.project_last_hidden(&prompt_hidden)?;
-                profile.main_prefill_ms = elapsed_ms(prefill_started);
-                let mut position = prompt_tokens;
-                let mut visible_text_ids = Vec::new();
-                let mut visible_text = String::new();
-                let mut audio_codes = vec![Vec::new(); codebooks];
-                let mut tokens_generated = 0usize;
-                let mut in_audio = false;
-                let max_new_tokens = max_new_tokens.max(1);
+            let prompt_embed_started = Instant::now();
+            let prompt_embeds = embed_token_ids(main_backbone, &self.device.device, &prompt_ids)?;
+            profile.prompt_embed_ms = elapsed_ms(prompt_embed_started);
+            let prompt_tokens = prompt_embeds.dim(1)?;
+            let prefill_started = Instant::now();
+            let prompt_hidden = main_backbone.forward_embeds(&prompt_embeds, 0)?;
+            let mut last_hidden = last_hidden_state(&prompt_hidden)?;
+            let mut logits = main_backbone.project_last_hidden(&prompt_hidden)?;
+            profile.main_prefill_ms = elapsed_ms(prefill_started);
+            let mut position = prompt_tokens;
+            let mut visible_text_ids = Vec::new();
+            let mut visible_text = String::new();
+            let mut audio_codes = vec![Vec::new(); codebooks];
+            let mut tokens_generated = 0usize;
+            let mut in_audio = false;
+            let mut generation_done = false;
+            let mut sampled_audio_frames: Vec<Lfm25SampledAudioFrame> = Vec::new();
+            let mut audio_stop_check_chunk: Vec<Lfm25SampledAudioFrame> = Vec::new();
+            let max_new_tokens = max_new_tokens.max(1);
 
-                while tokens_generated < max_new_tokens {
-                    if !in_audio {
-                        let sampling_started = Instant::now();
-                        let next = sample_from_logits(
-                            &logits,
-                            vocab_limit,
-                            &generation_config.text,
+            while tokens_generated < max_new_tokens && !generation_done {
+                if !in_audio {
+                    let sampling_started = Instant::now();
+                    let next = sample_from_logits(
+                        &logits,
+                        vocab_limit,
+                        &generation_config.text,
+                        &mut rng,
+                    )?;
+                    profile.text_sampling_ms += elapsed_ms(sampling_started);
+                    profile.text_sample_calls = profile.text_sample_calls.saturating_add(1);
+                    tokens_generated += 1;
+
+                    if next == specials.im_end
+                        || next == specials.eos
+                        || specials.eos_alt == Some(next)
+                    {
+                        break;
+                    }
+
+                    if next == specials.audio_start {
+                        in_audio = true;
+                    } else if next != specials.text_end {
+                        visible_text_ids.push(next);
+                        let tokenizer_started = Instant::now();
+                        let decoded = self.tokenizer.decode_text(&visible_text_ids)?;
+                        profile.tokenizer_decode_ms += elapsed_ms(tokenizer_started);
+                        let delta = text_delta(&visible_text, &decoded);
+                        if !delta.is_empty() {
+                            for ch in delta.chars() {
+                                let mut buf = [0u8; 4];
+                                on_text_delta(ch.encode_utf8(&mut buf));
+                            }
+                        }
+                        visible_text = decoded;
+                    }
+
+                    let text_forward_started = Instant::now();
+                    let next_embed = embed_token_ids(main_backbone, &self.device.device, &[next])?;
+                    let step_hidden = main_backbone.forward_embeds(&next_embed, position)?;
+                    position += 1;
+                    last_hidden = last_hidden_state(&step_hidden)?;
+                    logits = main_backbone.project_last_hidden(&step_hidden)?;
+                    profile.text_forward_ms += elapsed_ms(text_forward_started);
+
+                    if has_token_repetition_loop(&visible_text_ids) {
+                        break;
+                    }
+                } else if chunked_audio_stop_check {
+                    let audio_head_started = Instant::now();
+                    let (frame, audio_head_profile) =
+                        self.audio_head.sample_audio_frame_embedded_with_profile(
+                            &last_hidden,
+                            &generation_config.audio,
                             &mut rng,
                         )?;
-                        profile.text_sampling_ms += elapsed_ms(sampling_started);
-                        profile.text_sample_calls = profile.text_sample_calls.saturating_add(1);
-                        tokens_generated += 1;
+                    profile.audio_head_ms += elapsed_ms(audio_head_started);
+                    profile.audio_head_depth_linear_ms += audio_head_profile.depth_linear_ms;
+                    profile.audio_head_depth_reshape_ms += audio_head_profile.depth_reshape_ms;
+                    profile.audio_head_cache_setup_ms += audio_head_profile.cache_setup_ms;
+                    profile.audio_head_codebook_input_ms += audio_head_profile.codebook_input_ms;
+                    profile.audio_head_depthformer_ms += audio_head_profile.depthformer_ms;
+                    profile.audio_head_sample_ms += audio_head_profile.sample_ms;
+                    profile.audio_head_embed_step_ms += audio_head_profile.embed_ms;
+                    profile.audio_head_materialize_ms += audio_head_profile.materialize_ms;
+                    profile.audio_head_materialize_pack_ms +=
+                        audio_head_profile.materialize_pack_ms;
+                    profile.audio_head_materialize_readback_ms +=
+                        audio_head_profile.materialize_readback_ms;
+                    profile.audio_head_calls = profile.audio_head_calls.saturating_add(1);
+                    profile.audio_head_codebook_steps = profile
+                        .audio_head_codebook_steps
+                        .saturating_add(audio_head_profile.codebook_steps);
+                    tokens_generated += 1;
 
-                        if next == specials.im_end
-                            || next == specials.eos
-                            || specials.eos_alt == Some(next)
-                        {
-                            break;
-                        }
+                    let audio_embed_started = Instant::now();
+                    let audio_embed = frame.embedding().clone();
+                    profile.audio_embed_ms += elapsed_ms(audio_embed_started);
+                    let audio_forward_started = Instant::now();
+                    let step_hidden = main_backbone.forward_embeds(&audio_embed, position)?;
+                    position += 1;
+                    last_hidden = last_hidden_state(&step_hidden)?;
+                    profile.audio_forward_ms += elapsed_ms(audio_forward_started);
 
-                        if next == specials.audio_start {
-                            in_audio = true;
-                        } else if next != specials.text_end {
-                            visible_text_ids.push(next);
-                            let tokenizer_started = Instant::now();
-                            let decoded = self.tokenizer.decode_text(&visible_text_ids)?;
-                            profile.tokenizer_decode_ms += elapsed_ms(tokenizer_started);
-                            let delta = text_delta(&visible_text, &decoded);
-                            if !delta.is_empty() {
-                                for ch in delta.chars() {
-                                    let mut buf = [0u8; 4];
-                                    on_text_delta(ch.encode_utf8(&mut buf));
-                                }
-                            }
-                            visible_text = decoded;
-                        }
-
-                        let text_forward_started = Instant::now();
-                        let next_embed =
-                            embed_token_ids(main_backbone, &self.device.device, &[next])?;
-                        let step_hidden = main_backbone.forward_embeds(&next_embed, position)?;
-                        position += 1;
-                        last_hidden = last_hidden_state(&step_hidden)?;
-                        logits = main_backbone.project_last_hidden(&step_hidden)?;
-                        profile.text_forward_ms += elapsed_ms(text_forward_started);
-
-                        if has_token_repetition_loop(&visible_text_ids) {
-                            break;
-                        }
-                    } else {
-                        let audio_head_started = Instant::now();
-                        let (frame, audio_head_profile) =
-                            self.audio_head.sample_audio_frame_with_profile(
-                                &last_hidden,
-                                &generation_config.audio,
-                                &mut rng,
-                            )?;
-                        profile.audio_head_ms += elapsed_ms(audio_head_started);
-                        profile.audio_head_depth_linear_ms += audio_head_profile.depth_linear_ms;
-                        profile.audio_head_depth_reshape_ms += audio_head_profile.depth_reshape_ms;
-                        profile.audio_head_cache_setup_ms += audio_head_profile.cache_setup_ms;
-                        profile.audio_head_codebook_input_ms +=
-                            audio_head_profile.codebook_input_ms;
-                        profile.audio_head_depthformer_ms += audio_head_profile.depthformer_ms;
-                        profile.audio_head_sample_ms += audio_head_profile.sample_ms;
-                        profile.audio_head_embed_step_ms += audio_head_profile.embed_ms;
-                        profile.audio_head_materialize_ms += audio_head_profile.materialize_ms;
-                        profile.audio_head_materialize_pack_ms +=
-                            audio_head_profile.materialize_pack_ms;
-                        profile.audio_head_materialize_readback_ms +=
-                            audio_head_profile.materialize_readback_ms;
-                        profile.audio_head_calls = profile.audio_head_calls.saturating_add(1);
-                        profile.audio_head_codebook_steps = profile
-                            .audio_head_codebook_steps
-                            .saturating_add(audio_head_profile.codebook_steps);
-                        tokens_generated += 1;
-                        let is_end =
-                            frame.first().copied() == Some(self.audio_head.audio_end_token_id());
-                        if !is_end {
-                            for (codebook_idx, token) in frame.iter().copied().enumerate() {
-                                audio_codes[codebook_idx].push(token);
-                            }
-                        }
-
-                        let audio_embed_started = Instant::now();
-                        let audio_embed = self
+                    audio_stop_check_chunk.push(frame);
+                    let should_check_audio_stop = audio_stop_check_chunk.len()
+                        >= audio_stop_check_interval
+                        || tokens_generated >= max_new_tokens;
+                    if should_check_audio_stop {
+                        let first_tokens = self
                             .audio_head
-                            .embed_audio_frame(&frame, &self.device.device)?;
-                        profile.audio_embed_ms += elapsed_ms(audio_embed_started);
-                        let audio_forward_started = Instant::now();
-                        let step_hidden = main_backbone.forward_embeds(&audio_embed, position)?;
-                        position += 1;
-                        last_hidden = last_hidden_state(&step_hidden)?;
-                        profile.audio_forward_ms += elapsed_ms(audio_forward_started);
+                            .first_tokens_with_profile(&audio_stop_check_chunk)?;
+                        profile.audio_head_ms += first_tokens.materialize_ms;
+                        profile.audio_head_materialize_ms += first_tokens.materialize_ms;
+                        profile.audio_head_materialize_pack_ms += first_tokens.pack_ms;
+                        profile.audio_head_materialize_readback_ms += first_tokens.readback_ms;
 
-                        if is_end {
+                        if let Some(end_idx) = first_tokens
+                            .tokens
+                            .iter()
+                            .position(|token| *token == self.audio_head.audio_end_token_id())
+                        {
+                            let speculative_after_end =
+                                audio_stop_check_chunk.len().saturating_sub(end_idx + 1);
+                            tokens_generated =
+                                tokens_generated.saturating_sub(speculative_after_end);
+                            sampled_audio_frames.extend(audio_stop_check_chunk.drain(..end_idx));
+                            audio_stop_check_chunk.clear();
                             in_audio = false;
-                            logits = main_backbone.project_last_hidden(&step_hidden)?;
+                            generation_done = true;
+                        } else {
+                            sampled_audio_frames.append(&mut audio_stop_check_chunk);
                         }
+                    }
+                } else {
+                    let audio_head_started = Instant::now();
+                    let (frame, audio_head_profile) =
+                        self.audio_head.sample_audio_frame_with_profile(
+                            &last_hidden,
+                            &generation_config.audio,
+                            &mut rng,
+                        )?;
+                    profile.audio_head_ms += elapsed_ms(audio_head_started);
+                    profile.audio_head_depth_linear_ms += audio_head_profile.depth_linear_ms;
+                    profile.audio_head_depth_reshape_ms += audio_head_profile.depth_reshape_ms;
+                    profile.audio_head_cache_setup_ms += audio_head_profile.cache_setup_ms;
+                    profile.audio_head_codebook_input_ms += audio_head_profile.codebook_input_ms;
+                    profile.audio_head_depthformer_ms += audio_head_profile.depthformer_ms;
+                    profile.audio_head_sample_ms += audio_head_profile.sample_ms;
+                    profile.audio_head_embed_step_ms += audio_head_profile.embed_ms;
+                    profile.audio_head_materialize_ms += audio_head_profile.materialize_ms;
+                    profile.audio_head_materialize_pack_ms +=
+                        audio_head_profile.materialize_pack_ms;
+                    profile.audio_head_materialize_readback_ms +=
+                        audio_head_profile.materialize_readback_ms;
+                    profile.audio_head_calls = profile.audio_head_calls.saturating_add(1);
+                    profile.audio_head_codebook_steps = profile
+                        .audio_head_codebook_steps
+                        .saturating_add(audio_head_profile.codebook_steps);
+                    tokens_generated += 1;
+                    let is_end =
+                        frame.first().copied() == Some(self.audio_head.audio_end_token_id());
+                    if !is_end {
+                        for (codebook_idx, token) in frame.iter().copied().enumerate() {
+                            audio_codes[codebook_idx].push(token);
+                        }
+                    }
+
+                    let audio_embed_started = Instant::now();
+                    let audio_embed = self
+                        .audio_head
+                        .embed_audio_frame(&frame, &self.device.device)?;
+                    profile.audio_embed_ms += elapsed_ms(audio_embed_started);
+                    let audio_forward_started = Instant::now();
+                    let step_hidden = main_backbone.forward_embeds(&audio_embed, position)?;
+                    position += 1;
+                    last_hidden = last_hidden_state(&step_hidden)?;
+                    profile.audio_forward_ms += elapsed_ms(audio_forward_started);
+
+                    if is_end {
+                        in_audio = false;
+                        logits = main_backbone.project_last_hidden(&step_hidden)?;
+                    }
+                }
+            }
+
+            let (device_audio_codes, audio_frames_generated) = if chunked_audio_stop_check {
+                if !audio_stop_check_chunk.is_empty() {
+                    let first_tokens = self
+                        .audio_head
+                        .first_tokens_with_profile(&audio_stop_check_chunk)?;
+                    profile.audio_head_ms += first_tokens.materialize_ms;
+                    profile.audio_head_materialize_ms += first_tokens.materialize_ms;
+                    profile.audio_head_materialize_pack_ms += first_tokens.pack_ms;
+                    profile.audio_head_materialize_readback_ms += first_tokens.readback_ms;
+                    if let Some(end_idx) = first_tokens
+                        .tokens
+                        .iter()
+                        .position(|token| *token == self.audio_head.audio_end_token_id())
+                    {
+                        sampled_audio_frames.extend(audio_stop_check_chunk.drain(..end_idx));
+                    } else {
+                        sampled_audio_frames.append(&mut audio_stop_check_chunk);
                     }
                 }
 
-                Ok((
-                    visible_text.trim().to_string(),
-                    prompt_tokens,
-                    tokens_generated,
-                    audio_codes,
-                    profile,
-                ))
-            })?;
+                let stacked = self
+                    .audio_head
+                    .stack_frame_tokens_with_profile(&sampled_audio_frames, &self.device.device)?;
+                profile.audio_head_ms += stacked.materialize_ms;
+                profile.audio_head_materialize_ms += stacked.materialize_ms;
+                profile.audio_head_materialize_pack_ms += stacked.pack_ms;
+                (Some(stacked.tokens), sampled_audio_frames.len())
+            } else {
+                (None, audio_codes.first().map(Vec::len).unwrap_or(0))
+            };
+
+            Ok((
+                visible_text.trim().to_string(),
+                prompt_tokens,
+                tokens_generated,
+                audio_codes,
+                device_audio_codes,
+                audio_frames_generated,
+                profile,
+            ))
+        })?;
         let main_backbone_ms = elapsed_ms(main_started);
 
         let detokenizer_started = Instant::now();
-        let (samples, detokenizer_profile) = self
-            .detokenizer
-            .decode_with_profile(&audio_codes, &self.device.device)?;
+        let (samples, detokenizer_profile) = if let Some(device_audio_codes) = device_audio_codes {
+            self.detokenizer
+                .decode_token_ids_with_profile(&device_audio_codes)?
+        } else {
+            self.detokenizer
+                .decode_with_profile(&audio_codes, &self.device.device)?
+        };
         let detokenizer_ms = elapsed_ms(detokenizer_started);
         profile.detokenizer_embedding_ms = detokenizer_profile.embedding_ms;
         profile.detokenizer_upsample_ms = detokenizer_profile.upsample_ms;
@@ -688,7 +802,6 @@ impl Lfm25AudioModel {
         profile.detokenizer_readback_ms = detokenizer_profile.readback_ms;
         profile.detokenizer_istft_ms = detokenizer_profile.istft_ms;
         let model_total_ms = elapsed_ms(total_started);
-        let audio_frames_generated = audio_codes.first().map(Vec::len).unwrap_or(0);
         let samples_len = samples.len();
         Ok(Lfm25AudioGenerationOutput {
             text,
@@ -740,7 +853,9 @@ impl Lfm25AudioModel {
                     "max_new_tokens": max_new_tokens,
                     "text_sample_calls": profile.text_sample_calls,
                     "audio_head_calls": profile.audio_head_calls,
-                    "audio_head_codebook_steps": profile.audio_head_codebook_steps
+                    "audio_head_codebook_steps": profile.audio_head_codebook_steps,
+                    "chunked_audio_stop_check": chunked_audio_stop_check,
+                    "audio_stop_check_interval": audio_stop_check_interval
                 },
                 "audio": {
                     "audio_frames": audio_frames_generated,
@@ -1244,6 +1359,19 @@ fn lfm25_asr_stop_check_interval_from_env(value: Option<String>) -> usize {
         .clamp(1, 128)
 }
 
+fn lfm25_tts_audio_stop_check_interval() -> usize {
+    lfm25_tts_audio_stop_check_interval_from_env(
+        std::env::var("IZWI_LFM25_TTS_AUDIO_STOP_CHECK_INTERVAL").ok(),
+    )
+}
+
+fn lfm25_tts_audio_stop_check_interval_from_env(value: Option<String>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_TTS_AUDIO_STOP_CHECK_INTERVAL)
+        .clamp(1, 32)
+}
+
 fn next_audio_delta_stable(
     all_samples: &[f32],
     emitted_samples: &mut usize,
@@ -1378,6 +1506,35 @@ mod tests {
         assert_eq!(
             lfm25_asr_stop_check_interval_from_env(Some("96".to_string())),
             96
+        );
+    }
+
+    #[test]
+    fn tts_audio_stop_check_interval_defaults_to_twenty() {
+        assert_eq!(lfm25_tts_audio_stop_check_interval_from_env(None), 20);
+        assert_eq!(
+            lfm25_tts_audio_stop_check_interval_from_env(Some("bad".to_string())),
+            20
+        );
+    }
+
+    #[test]
+    fn tts_audio_stop_check_interval_clamps_override() {
+        assert_eq!(
+            lfm25_tts_audio_stop_check_interval_from_env(Some("0".to_string())),
+            1
+        );
+        assert_eq!(
+            lfm25_tts_audio_stop_check_interval_from_env(Some("32".to_string())),
+            32
+        );
+        assert_eq!(
+            lfm25_tts_audio_stop_check_interval_from_env(Some("64".to_string())),
+            32
+        );
+        assert_eq!(
+            lfm25_tts_audio_stop_check_interval_from_env(Some("4".to_string())),
+            4
         );
     }
 

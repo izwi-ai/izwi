@@ -33,6 +33,7 @@ const DEPTHFORMER_ROPE_BASE: f32 = 10_000.0;
 pub struct Lfm25AudioHead {
     frame_embedding: Embedding,
     codebook_offsets: Vec<u32>,
+    codebook_offsets_tensor: Tensor,
     depth_linear: QLinear,
     depthformer: Depthformer,
     depth_embeddings: Vec<CodebookEmbeddingHead>,
@@ -54,6 +55,32 @@ pub struct Lfm25AudioHeadProfile {
     pub materialize_pack_ms: f64,
     pub materialize_readback_ms: f64,
     pub codebook_steps: u64,
+}
+
+pub struct Lfm25SampledAudioFrame {
+    samples: Vec<CodebookSample>,
+    embedding: Tensor,
+}
+
+impl Lfm25SampledAudioFrame {
+    pub fn embedding(&self) -> &Tensor {
+        &self.embedding
+    }
+}
+
+#[derive(Debug)]
+pub struct Lfm25StackedAudioFrameTokens {
+    pub tokens: Tensor,
+    pub materialize_ms: f64,
+    pub pack_ms: f64,
+}
+
+#[derive(Debug)]
+pub struct Lfm25AudioFirstTokens {
+    pub tokens: Vec<u32>,
+    pub materialize_ms: f64,
+    pub pack_ms: f64,
+    pub readback_ms: f64,
 }
 
 impl Lfm25AudioHead {
@@ -93,6 +120,8 @@ impl Lfm25AudioHead {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let codebook_offsets_tensor =
+            Tensor::from_vec(codebook_offsets.clone(), (cfg.codebooks,), device)?;
 
         if hidden_size == 0 || cfg.depthformer_dim == 0 {
             return Err(Error::ModelLoadError(
@@ -103,6 +132,7 @@ impl Lfm25AudioHead {
         Ok(Self {
             frame_embedding,
             codebook_offsets,
+            codebook_offsets_tensor,
             depth_linear,
             depthformer,
             depth_embeddings,
@@ -152,6 +182,22 @@ impl Lfm25AudioHead {
         config: &Lfm25SamplingConfig,
         rng: &mut SimpleRng,
     ) -> Result<(Vec<u32>, Lfm25AudioHeadProfile)> {
+        let (frame, mut profile) =
+            self.sample_audio_frame_embedded_with_profile(hidden, config, rng)?;
+        let materialize_started = Instant::now();
+        let materialized = materialize_codebook_samples_with_profile(&frame.samples)?;
+        profile.materialize_ms = elapsed_ms(materialize_started);
+        profile.materialize_pack_ms = materialized.pack_ms;
+        profile.materialize_readback_ms = materialized.readback_ms;
+        Ok((materialized.samples, profile))
+    }
+
+    pub fn sample_audio_frame_embedded_with_profile(
+        &self,
+        hidden: &Tensor,
+        config: &Lfm25SamplingConfig,
+        rng: &mut SimpleRng,
+    ) -> Result<(Lfm25SampledAudioFrame, Lfm25AudioHeadProfile)> {
         let mut profile = Lfm25AudioHeadProfile::default();
         let hidden = ensure_rank3(hidden)?;
         let depth_linear_started = Instant::now();
@@ -193,12 +239,169 @@ impl Lfm25AudioHead {
             profile.codebook_steps = profile.codebook_steps.saturating_add(1);
         }
 
+        let embedding = self.embed_sampled_audio_frame(&samples, hidden.device())?;
+        Ok((Lfm25SampledAudioFrame { samples, embedding }, profile))
+    }
+
+    pub fn first_tokens_with_profile(
+        &self,
+        frames: &[Lfm25SampledAudioFrame],
+    ) -> Result<Lfm25AudioFirstTokens> {
         let materialize_started = Instant::now();
-        let materialized = materialize_codebook_samples_with_profile(&samples)?;
-        profile.materialize_ms = elapsed_ms(materialize_started);
-        profile.materialize_pack_ms = materialized.pack_ms;
-        profile.materialize_readback_ms = materialized.readback_ms;
-        Ok((materialized.samples, profile))
+        if frames.is_empty() {
+            return Ok(Lfm25AudioFirstTokens {
+                tokens: Vec::new(),
+                materialize_ms: elapsed_ms(materialize_started),
+                pack_ms: 0.0,
+                readback_ms: 0.0,
+            });
+        }
+
+        let device_tokens = frames
+            .iter()
+            .map(|frame| frame.samples.first())
+            .collect::<Option<Vec<_>>>();
+        if let Some(samples) = device_tokens {
+            if samples
+                .iter()
+                .all(|sample| matches!(sample, CodebookSample::DeviceGreedy(_)))
+            {
+                let tensors = samples
+                    .iter()
+                    .filter_map(|sample| match sample {
+                        CodebookSample::DeviceGreedy(token) => Some(token),
+                        CodebookSample::Host(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+                let pack_started = Instant::now();
+                let packed = Tensor::cat(&tensors, 0)?;
+                let pack_ms = elapsed_ms(pack_started);
+                let readback_started = Instant::now();
+                let tokens = packed.to_vec1::<u32>().map_err(Error::from)?;
+                let readback_ms = elapsed_ms(readback_started);
+                return Ok(Lfm25AudioFirstTokens {
+                    tokens,
+                    materialize_ms: elapsed_ms(materialize_started),
+                    pack_ms,
+                    readback_ms,
+                });
+            }
+        }
+
+        let readback_started = Instant::now();
+        let tokens = frames
+            .iter()
+            .map(|frame| {
+                frame
+                    .samples
+                    .first()
+                    .ok_or_else(|| {
+                        Error::InferenceError("Empty LFM2.5 Audio sampled frame".to_string())
+                    })?
+                    .to_token()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Lfm25AudioFirstTokens {
+            tokens,
+            materialize_ms: elapsed_ms(materialize_started),
+            pack_ms: 0.0,
+            readback_ms: elapsed_ms(readback_started),
+        })
+    }
+
+    pub fn stack_frame_tokens_with_profile(
+        &self,
+        frames: &[Lfm25SampledAudioFrame],
+        device: &Device,
+    ) -> Result<Lfm25StackedAudioFrameTokens> {
+        let materialize_started = Instant::now();
+        if frames.is_empty() {
+            return Ok(Lfm25StackedAudioFrameTokens {
+                tokens: Tensor::zeros((0, self.codebooks), DType::U32, device)?,
+                materialize_ms: elapsed_ms(materialize_started),
+                pack_ms: 0.0,
+            });
+        }
+
+        if frames
+            .iter()
+            .flat_map(|frame| frame.samples.iter())
+            .all(|sample| matches!(sample, CodebookSample::DeviceGreedy(_)))
+        {
+            let tensors = frames
+                .iter()
+                .flat_map(|frame| frame.samples.iter())
+                .filter_map(|sample| match sample {
+                    CodebookSample::DeviceGreedy(token) => Some(token),
+                    CodebookSample::Host(_) => None,
+                })
+                .collect::<Vec<_>>();
+            let pack_started = Instant::now();
+            let tokens = Tensor::cat(&tensors, 0)?
+                .reshape((frames.len(), self.codebooks))?
+                .contiguous()?;
+            let pack_ms = elapsed_ms(pack_started);
+            return Ok(Lfm25StackedAudioFrameTokens {
+                tokens,
+                materialize_ms: elapsed_ms(materialize_started),
+                pack_ms,
+            });
+        }
+
+        let pack_started = Instant::now();
+        let mut flat = Vec::with_capacity(frames.len() * self.codebooks);
+        for frame in frames {
+            for sample in &frame.samples {
+                flat.push(sample.to_token()?);
+            }
+        }
+        let tokens = Tensor::from_vec(flat, (frames.len(), self.codebooks), device)?;
+        let pack_ms = elapsed_ms(pack_started);
+        Ok(Lfm25StackedAudioFrameTokens {
+            tokens,
+            materialize_ms: elapsed_ms(materialize_started),
+            pack_ms,
+        })
+    }
+
+    fn embed_sampled_audio_frame(
+        &self,
+        samples: &[CodebookSample],
+        device: &Device,
+    ) -> Result<Tensor> {
+        if samples.len() != self.codebooks {
+            return Err(Error::InvalidInput(format!(
+                "Expected {} audio codebooks, received {}",
+                self.codebooks,
+                samples.len()
+            )));
+        }
+
+        if samples
+            .iter()
+            .all(|sample| matches!(sample, CodebookSample::DeviceGreedy(_)))
+        {
+            let tensors = samples
+                .iter()
+                .filter_map(|sample| match sample {
+                    CodebookSample::DeviceGreedy(token) => Some(token),
+                    CodebookSample::Host(_) => None,
+                })
+                .collect::<Vec<_>>();
+            let token_ids = Tensor::cat(&tensors, 0)?
+                .broadcast_add(&self.codebook_offsets_tensor)?
+                .reshape((1, self.codebooks))?
+                .contiguous()?;
+            let embeds = self.frame_embedding.forward(&token_ids)?;
+            let embeds = embeds.sum(1)?;
+            return embeds.unsqueeze(1).map_err(Error::from);
+        }
+
+        let tokens = samples
+            .iter()
+            .map(CodebookSample::to_token)
+            .collect::<Result<Vec<_>>>()?;
+        self.embed_audio_frame(&tokens, device)
     }
 }
 
@@ -606,6 +809,17 @@ struct CodebookEmbeddingHead {
 enum CodebookSample {
     Host(u32),
     DeviceGreedy(Tensor),
+}
+
+impl CodebookSample {
+    fn to_token(&self) -> Result<u32> {
+        match self {
+            CodebookSample::Host(token) => Ok(*token),
+            CodebookSample::DeviceGreedy(token) => {
+                token.squeeze(0)?.to_scalar::<u32>().map_err(Error::from)
+            }
+        }
+    }
 }
 
 impl CodebookEmbeddingHead {
