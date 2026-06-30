@@ -20,7 +20,9 @@ use crate::models::shared::weights::gguf::GgufLoader;
 
 use super::cache::DenseKvCache;
 use super::config::Lfm25AudioDecoderConfig;
-use super::sampling::{sample_from_logits, Lfm25SamplingConfig, SimpleRng};
+use super::sampling::{
+    greedy_token_tensor_from_logits, sample_from_logits, Lfm25SamplingConfig, SimpleRng,
+};
 
 const DEPTHFORMER_HEADS: usize = 32;
 const DEPTHFORMER_KV_HEADS: usize = 8;
@@ -133,18 +135,19 @@ impl Lfm25AudioHead {
 
         let mut next_embed = Tensor::zeros(self.depthformer_dim, hidden.dtype(), hidden.device())?;
         let mut caches = self.depthformer.empty_cache();
-        let mut tokens = Vec::with_capacity(self.codebooks);
+        let mut samples = Vec::with_capacity(self.codebooks);
 
         for codebook_idx in 0..self.codebooks {
             let cur = depth_input.i(codebook_idx)?.broadcast_add(&next_embed)?;
             let cur = cur.unsqueeze(0)?.unsqueeze(0)?;
             let out = self.depthformer.forward_cached(&cur, &mut caches)?;
-            let token = self.depth_embeddings[codebook_idx].sample(&out, config, rng)?;
-            next_embed = self.depth_embeddings[codebook_idx].embed(token, hidden.device())?;
-            tokens.push(token);
+            let sample = self.depth_embeddings[codebook_idx].sample(&out, config, rng)?;
+            next_embed =
+                self.depth_embeddings[codebook_idx].embed_sample(&sample, hidden.device())?;
+            samples.push(sample);
         }
 
-        Ok(tokens)
+        materialize_codebook_samples(&samples)
     }
 }
 
@@ -539,6 +542,11 @@ struct CodebookEmbeddingHead {
     to_logits: QLinear,
 }
 
+enum CodebookSample {
+    Host(u32),
+    DeviceGreedy(Tensor),
+}
+
 impl CodebookEmbeddingHead {
     fn load(loader: &GgufLoader, device: &Device, idx: usize) -> Result<Self> {
         let embedding = load_embedding_any(
@@ -566,7 +574,18 @@ impl CodebookEmbeddingHead {
 
     fn embed(&self, token: u32, device: &Device) -> Result<Tensor> {
         let token = Tensor::from_vec(vec![token], (1,), device)?;
-        let embed = self.embedding.forward(&token)?;
+        self.embed_token_tensor(&token)
+    }
+
+    fn embed_sample(&self, sample: &CodebookSample, device: &Device) -> Result<Tensor> {
+        match sample {
+            CodebookSample::Host(token) => self.embed(*token, device),
+            CodebookSample::DeviceGreedy(token) => self.embed_token_tensor(token),
+        }
+    }
+
+    fn embed_token_tensor(&self, token: &Tensor) -> Result<Tensor> {
+        let embed = self.embedding.forward(token)?;
         embed.squeeze(0).map_err(Error::from)
     }
 
@@ -582,10 +601,46 @@ impl CodebookEmbeddingHead {
         hidden: &Tensor,
         config: &Lfm25SamplingConfig,
         rng: &mut SimpleRng,
-    ) -> Result<u32> {
+    ) -> Result<CodebookSample> {
         let logits = self.logits(hidden)?;
-        sample_from_logits(&logits, logits.dim(0)?, config, rng)
+        let vocab_limit = logits.dim(0)?;
+        if config.temperature <= 1e-5 {
+            if let Some(token) = greedy_token_tensor_from_logits(&logits, vocab_limit)? {
+                return Ok(CodebookSample::DeviceGreedy(token));
+            }
+        }
+        sample_from_logits(&logits, vocab_limit, config, rng).map(CodebookSample::Host)
     }
+}
+
+fn materialize_codebook_samples(samples: &[CodebookSample]) -> Result<Vec<u32>> {
+    if samples
+        .iter()
+        .all(|sample| matches!(sample, CodebookSample::DeviceGreedy(_)))
+    {
+        let tensors = samples
+            .iter()
+            .filter_map(|sample| match sample {
+                CodebookSample::DeviceGreedy(token) => Some(token),
+                CodebookSample::Host(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if !tensors.is_empty() {
+            return Tensor::cat(&tensors, 0)?
+                .to_vec1::<u32>()
+                .map_err(Error::from);
+        }
+    }
+
+    samples
+        .iter()
+        .map(|sample| match sample {
+            CodebookSample::Host(token) => Ok(*token),
+            CodebookSample::DeviceGreedy(token) => {
+                token.squeeze(0)?.to_scalar::<u32>().map_err(Error::from)
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug)]
