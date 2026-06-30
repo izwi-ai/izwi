@@ -31,7 +31,7 @@ use super::LFM25_AUDIO_DEFAULT_INTERLEAVED_SYSTEM_PROMPT;
 const DEFAULT_MAX_NEW_TOKENS: usize = 1024;
 const DEFAULT_AUDIO_STREAM_DECODE_STRIDE_FRAMES: usize = 6;
 const DEFAULT_AUDIO_STREAM_HOLDBACK_FRAMES: usize = 2;
-const DEFAULT_ASR_STOP_CHECK_INTERVAL: usize = 96;
+const DEFAULT_ASR_STOP_CHECK_INTERVAL: usize = 92;
 
 #[derive(Debug, Clone)]
 pub struct Lfm25AudioTextOutput {
@@ -1353,11 +1353,11 @@ mod tests {
     }
 
     #[test]
-    fn asr_stop_check_interval_defaults_to_ninety_six() {
-        assert_eq!(lfm25_asr_stop_check_interval_from_env(None), 96);
+    fn asr_stop_check_interval_defaults_to_ninety_two() {
+        assert_eq!(lfm25_asr_stop_check_interval_from_env(None), 92);
         assert_eq!(
             lfm25_asr_stop_check_interval_from_env(Some("bad".to_string())),
-            96
+            92
         );
     }
 
