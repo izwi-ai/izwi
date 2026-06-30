@@ -115,6 +115,8 @@ struct Lfm25TtsProfile {
     audio_head_sample_ms: f64,
     audio_head_embed_step_ms: f64,
     audio_head_materialize_ms: f64,
+    audio_head_materialize_pack_ms: f64,
+    audio_head_materialize_readback_ms: f64,
     audio_embed_ms: f64,
     audio_forward_ms: f64,
     detokenizer_embedding_ms: f64,
@@ -628,6 +630,10 @@ impl Lfm25AudioModel {
                         profile.audio_head_sample_ms += audio_head_profile.sample_ms;
                         profile.audio_head_embed_step_ms += audio_head_profile.embed_ms;
                         profile.audio_head_materialize_ms += audio_head_profile.materialize_ms;
+                        profile.audio_head_materialize_pack_ms +=
+                            audio_head_profile.materialize_pack_ms;
+                        profile.audio_head_materialize_readback_ms +=
+                            audio_head_profile.materialize_readback_ms;
                         profile.audio_head_calls = profile.audio_head_calls.saturating_add(1);
                         profile.audio_head_codebook_steps = profile
                             .audio_head_codebook_steps
@@ -711,6 +717,8 @@ impl Lfm25AudioModel {
                     "audio_head_sample": profile.audio_head_sample_ms,
                     "audio_head_embed_step": profile.audio_head_embed_step_ms,
                     "audio_head_materialize": profile.audio_head_materialize_ms,
+                    "audio_head_materialize_pack": profile.audio_head_materialize_pack_ms,
+                    "audio_head_materialize_readback": profile.audio_head_materialize_readback_ms,
                     "audio_embed": profile.audio_embed_ms,
                     "audio_forward": profile.audio_forward_ms,
                     "main_backbone": main_backbone_ms,

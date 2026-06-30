@@ -51,6 +51,8 @@ pub struct Lfm25AudioHeadProfile {
     pub sample_ms: f64,
     pub embed_ms: f64,
     pub materialize_ms: f64,
+    pub materialize_pack_ms: f64,
+    pub materialize_readback_ms: f64,
     pub codebook_steps: u64,
 }
 
@@ -192,9 +194,11 @@ impl Lfm25AudioHead {
         }
 
         let materialize_started = Instant::now();
-        let samples = materialize_codebook_samples(&samples)?;
+        let materialized = materialize_codebook_samples_with_profile(&samples)?;
         profile.materialize_ms = elapsed_ms(materialize_started);
-        Ok((samples, profile))
+        profile.materialize_pack_ms = materialized.pack_ms;
+        profile.materialize_readback_ms = materialized.readback_ms;
+        Ok((materialized.samples, profile))
     }
 }
 
@@ -660,7 +664,15 @@ impl CodebookEmbeddingHead {
     }
 }
 
-fn materialize_codebook_samples(samples: &[CodebookSample]) -> Result<Vec<u32>> {
+struct MaterializedCodebookSamples {
+    samples: Vec<u32>,
+    pack_ms: f64,
+    readback_ms: f64,
+}
+
+fn materialize_codebook_samples_with_profile(
+    samples: &[CodebookSample],
+) -> Result<MaterializedCodebookSamples> {
     if samples
         .iter()
         .all(|sample| matches!(sample, CodebookSample::DeviceGreedy(_)))
@@ -673,13 +685,22 @@ fn materialize_codebook_samples(samples: &[CodebookSample]) -> Result<Vec<u32>> 
             })
             .collect::<Vec<_>>();
         if !tensors.is_empty() {
-            return Tensor::cat(&tensors, 0)?
-                .to_vec1::<u32>()
-                .map_err(Error::from);
+            let pack_started = Instant::now();
+            let packed = Tensor::cat(&tensors, 0)?;
+            let pack_ms = elapsed_ms(pack_started);
+            let readback_started = Instant::now();
+            let samples = packed.to_vec1::<u32>().map_err(Error::from)?;
+            let readback_ms = elapsed_ms(readback_started);
+            return Ok(MaterializedCodebookSamples {
+                samples,
+                pack_ms,
+                readback_ms,
+            });
         }
     }
 
-    samples
+    let readback_started = Instant::now();
+    let samples = samples
         .iter()
         .map(|sample| match sample {
             CodebookSample::Host(token) => Ok(*token),
@@ -687,7 +708,12 @@ fn materialize_codebook_samples(samples: &[CodebookSample]) -> Result<Vec<u32>> 
                 token.squeeze(0)?.to_scalar::<u32>().map_err(Error::from)
             }
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok(MaterializedCodebookSamples {
+        samples,
+        pack_ms: 0.0,
+        readback_ms: elapsed_ms(readback_started),
+    })
 }
 
 #[derive(Debug)]
