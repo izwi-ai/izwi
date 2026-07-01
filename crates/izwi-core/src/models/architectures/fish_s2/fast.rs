@@ -75,6 +75,8 @@ struct FishS2FastLayer {
 struct FishS2FastAttention {
     qkv_proj: Linear,
     o_proj: Linear,
+    q_norm: Option<RmsNorm>,
+    k_norm: Option<RmsNorm>,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -309,6 +311,24 @@ impl FishS2FastAttention {
         Ok(Self {
             qkv_proj: candle_nn::linear_no_bias(cfg.hidden_size, total, vb.pp("qkv_proj"))?,
             o_proj: candle_nn::linear_no_bias(cfg.q_size(), cfg.hidden_size, vb.pp("o_proj"))?,
+            q_norm: if vb.contains_tensor("q_norm.weight") {
+                Some(candle_nn::rms_norm(
+                    cfg.head_dim,
+                    cfg.rms_norm_eps,
+                    vb.pp("q_norm"),
+                )?)
+            } else {
+                None
+            },
+            k_norm: if vb.contains_tensor("k_norm.weight") {
+                Some(candle_nn::rms_norm(
+                    cfg.head_dim,
+                    cfg.rms_norm_eps,
+                    vb.pp("k_norm"),
+                )?)
+            } else {
+                None
+            },
             num_heads: cfg.num_attention_heads,
             num_kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
@@ -342,6 +362,14 @@ impl FishS2FastAttention {
             self.num_kv_heads,
             self.head_dim,
         ))?;
+        let q = match &self.q_norm {
+            Some(norm) => norm.forward(&q)?,
+            None => q,
+        };
+        let k = match &self.k_norm {
+            Some(norm) => norm.forward(&k)?,
+            None => k,
+        };
 
         let (cos, sin) = build_rope_cache(
             seq_len,
@@ -508,6 +536,8 @@ fn semantic_code_from_token_id_from_fast_config(
                 head_dim: Some(cfg.head_dim),
                 intermediate_size: Some(cfg.intermediate_size),
                 max_seq_len: Some(cfg.num_codebooks + 1),
+                num_codebooks: Some(cfg.num_codebooks),
+                vocab_size: Some(cfg.codebook_size),
             },
         num_codebooks: cfg.num_codebooks,
         codebook_size: cfg.codebook_size,

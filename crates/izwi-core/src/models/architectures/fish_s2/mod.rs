@@ -109,6 +109,7 @@ pub struct FishS2TtsGenerationDiagnostics {
 
 const FISH_S2_SEMANTIC_SAMPLER_SEED: u64 = 0;
 const FISH_S2_FAST_SAMPLER_SEED: u64 = 1;
+const FISH_S2_DTYPE_ENV: &str = "IZWI_FISH_S2_DTYPE";
 const RAS_WIN_SIZE: usize = 10;
 const RAS_HIGH_TEMP: f32 = 1.0;
 const RAS_HIGH_TOP_P: f32 = 0.9;
@@ -205,7 +206,8 @@ impl FishS2NativeRuntime {
     ) -> Result<Self> {
         codec.ensure_native_supported()?;
         let tokenizer = FishS2PromptTokenizer::load(model_dir, config)?;
-        let weights = FishS2Weights::load(model_dir, device, None)?;
+        let dtype_override = std::env::var(FISH_S2_DTYPE_ENV).ok();
+        let weights = FishS2Weights::load(model_dir, device, dtype_override.as_deref())?;
         let slow = FishS2SlowTransformer::load(
             FishS2SlowConfig::from_config(config)?,
             weights.var_builder(),

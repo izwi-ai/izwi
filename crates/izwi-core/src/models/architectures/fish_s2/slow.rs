@@ -64,6 +64,8 @@ struct FishS2SlowLayer {
 struct FishS2PackedAttention {
     qkv_proj: Linear,
     o_proj: Linear,
+    q_norm: Option<RmsNorm>,
+    k_norm: Option<RmsNorm>,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -154,7 +156,11 @@ impl FishS2SlowTransformer {
             &vb,
             &["norm", "model.norm"],
         )?;
-        let lm_head = candle_nn::linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
+        let lm_head = if vb.contains_tensor("lm_head.weight") {
+            candle_nn::linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
+        } else {
+            Linear::new(embeddings.embeddings().clone(), None)
+        };
         Ok(Self {
             cfg,
             embeddings,
@@ -334,6 +340,8 @@ impl FishS2SlowTransformer {
                     head_dim: Some(self.cfg.head_dim),
                     intermediate_size: Some(self.cfg.intermediate_size),
                     max_seq_len: Some(self.cfg.num_codebooks + 1),
+                    num_codebooks: Some(self.cfg.num_codebooks),
+                    vocab_size: Some(self.cfg.codebook_size),
                 },
             num_codebooks: self.cfg.num_codebooks,
             codebook_size: self.cfg.codebook_size,
@@ -395,6 +403,24 @@ impl FishS2PackedAttention {
         Ok(Self {
             qkv_proj: candle_nn::linear_no_bias(cfg.hidden_size, total, vb.pp("qkv_proj"))?,
             o_proj: candle_nn::linear_no_bias(cfg.q_size(), cfg.hidden_size, vb.pp("o_proj"))?,
+            q_norm: if vb.contains_tensor("q_norm.weight") {
+                Some(candle_nn::rms_norm(
+                    cfg.head_dim,
+                    cfg.rms_norm_eps,
+                    vb.pp("q_norm"),
+                )?)
+            } else {
+                None
+            },
+            k_norm: if vb.contains_tensor("k_norm.weight") {
+                Some(candle_nn::rms_norm(
+                    cfg.head_dim,
+                    cfg.rms_norm_eps,
+                    vb.pp("k_norm"),
+                )?)
+            } else {
+                None
+            },
             num_heads: cfg.num_attention_heads,
             num_kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
@@ -428,6 +454,14 @@ impl FishS2PackedAttention {
             self.num_kv_heads,
             self.head_dim,
         ))?;
+        let q = match &self.q_norm {
+            Some(norm) => norm.forward(&q)?,
+            None => q,
+        };
+        let k = match &self.k_norm {
+            Some(norm) => norm.forward(&k)?,
+            None => k,
+        };
 
         let (cos, sin) = build_rope_cache(
             seq_len,
@@ -578,10 +612,6 @@ mod tests {
             tensor(device, (cfg.hidden_size,), 1.0),
         );
         tensors.insert(
-            "lm_head.weight".to_string(),
-            tensor(device, (cfg.vocab_size, cfg.hidden_size), 0.03),
-        );
-        tensors.insert(
             "layers.0.input_layernorm.weight".to_string(),
             tensor(device, (cfg.hidden_size,), 1.0),
         );
@@ -596,6 +626,14 @@ mod tests {
                 (cfg.q_size() + 2 * cfg.kv_size(), cfg.hidden_size),
                 0.01,
             ),
+        );
+        tensors.insert(
+            "layers.0.self_attn.q_norm.weight".to_string(),
+            tensor(device, (cfg.head_dim,), 1.0),
+        );
+        tensors.insert(
+            "layers.0.self_attn.k_norm.weight".to_string(),
+            tensor(device, (cfg.head_dim,), 1.0),
         );
         tensors.insert(
             "layers.0.self_attn.o_proj.weight".to_string(),
