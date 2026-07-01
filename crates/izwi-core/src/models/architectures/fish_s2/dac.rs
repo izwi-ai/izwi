@@ -882,14 +882,9 @@ impl FishS2CausalConv1d {
             groups,
             ..Default::default()
         };
-        let conv = load_conv1d_weight(
-            in_channels,
-            out_channels,
-            kernel_size,
-            groups,
-            cfg,
-            vb.pp("conv"),
-        )?;
+        let conv_vb = conv_weight_vb(&vb);
+        let conv =
+            load_conv1d_weight(in_channels, out_channels, kernel_size, groups, cfg, conv_vb)?;
         let effective_kernel = (kernel_size - 1) * dilation + 1;
         let padding_total = effective_kernel.saturating_sub(stride);
         Ok(Self {
@@ -928,13 +923,9 @@ impl FishS2CausalConvTranspose1d {
             dilation: 1,
             groups: 1,
         };
-        let conv = load_conv_transpose1d_weight(
-            in_channels,
-            out_channels,
-            kernel_size,
-            cfg,
-            vb.pp("conv"),
-        )?;
+        let conv_vb = conv_weight_vb(&vb);
+        let conv =
+            load_conv_transpose1d_weight(in_channels, out_channels, kernel_size, cfg, conv_vb)?;
         let pad = kernel_size.saturating_sub(stride);
         Ok(Self {
             conv,
@@ -1276,6 +1267,22 @@ fn load_conv1d_weight(
         None
     };
     Ok(Conv1d::new(weight, bias, cfg))
+}
+
+fn conv_weight_vb<'a>(vb: &VarBuilder<'a>) -> VarBuilder<'a> {
+    let nested = vb.pp("conv");
+    if has_conv_weight(&nested) {
+        nested
+    } else {
+        vb.clone()
+    }
+}
+
+fn has_conv_weight(vb: &VarBuilder) -> bool {
+    vb.contains_tensor("weight")
+        || (vb.contains_tensor("weight_g") && vb.contains_tensor("weight_v"))
+        || (vb.contains_tensor("parametrizations.weight.original0")
+            && vb.contains_tensor("parametrizations.weight.original1"))
 }
 
 fn load_conv_transpose1d_weight(
@@ -1627,6 +1634,20 @@ mod tests {
 
         let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
         FishS2DacDecoder::load(config, vb).unwrap()
+    }
+
+    #[test]
+    fn causal_conv_loads_direct_weight_norm_without_conv_child() {
+        let device = Device::Cpu;
+        let mut tensors = HashMap::new();
+        tensors.insert("weight_g".to_string(), tensor(&device, (4, 1, 1), 1.0));
+        tensors.insert("weight_v".to_string(), tensor(&device, (4, 2, 1), 0.5));
+        tensors.insert("bias".to_string(), tensor(&device, (4,), 0.0));
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
+        let conv = FishS2CausalConv1d::load(2, 4, 1, 1, 1, vb).unwrap();
+        let input = Tensor::zeros((1, 2, 3), DType::F32, &device).unwrap();
+        let output = conv.forward(&input).unwrap();
+        assert_eq!(output.dims(), &[1, 4, 3]);
     }
 
     #[test]

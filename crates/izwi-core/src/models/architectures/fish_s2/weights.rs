@@ -149,7 +149,6 @@ impl FishS2WeightIndex {
         for name in [
             "embed_tokens.weight",
             "norm.weight",
-            "lm_head.weight",
             "codebook_embeddings.weight",
             "fast_embeddings.weight",
             "fast_norm.weight",
@@ -179,8 +178,19 @@ impl FishS2Weights {
         let dtype = select_fish_s2_dtype(&device, dtype_override, checkpoint_dtype);
         let index = FishS2WeightIndex::load(model_dir)?;
         let shard_paths = index.shard_paths();
+        let remapped_to_source = index
+            .source_to_remapped()
+            .iter()
+            .map(|(source, remapped)| (remapped.clone(), source.clone()))
+            .collect::<BTreeMap<_, _>>();
         let vb =
             unsafe { VarBuilder::from_mmaped_safetensors(&shard_paths, dtype, &device.device)? };
+        let vb = vb.rename_f(move |name| {
+            remapped_to_source
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| name.to_string())
+        });
         Ok(Self {
             dtype,
             device: device.device,
@@ -220,8 +230,11 @@ pub fn select_fish_s2_dtype(
         }
     }
 
-    if device.kind.is_cpu() || device.kind.is_metal() {
+    if device.kind.is_cpu() {
         return DType::F32;
+    }
+    if device.kind.is_metal() {
+        return DType::F16;
     }
 
     checkpoint_dtype.unwrap_or(DType::BF16)
@@ -282,14 +295,13 @@ mod tests {
         std::fs::write(
             dir.join("model.safetensors.index.json"),
             r#"{"weight_map":{
-                "text_model.model.embed_tokens.weight":"model-00001-of-00002.safetensors",
+                "text_model.model.embeddings.weight":"model-00001-of-00002.safetensors",
                 "text_model.model.norm.weight":"model-00001-of-00002.safetensors",
-                "text_model.lm_head.weight":"model-00001-of-00002.safetensors",
                 "audio_decoder.codebook_embeddings.weight":"model-00002-of-00002.safetensors",
                 "audio_decoder.embeddings.weight":"model-00002-of-00002.safetensors",
                 "audio_decoder.norm.weight":"model-00002-of-00002.safetensors",
                 "audio_decoder.output.weight":"model-00002-of-00002.safetensors",
-                "audio_decoder.layers.0.self_attn.qkv_proj.weight":"model-00002-of-00002.safetensors"
+                "audio_decoder.layers.0.attention.wqkv.weight":"model-00002-of-00002.safetensors"
             }}"#,
         )
         .unwrap();
@@ -297,12 +309,11 @@ mod tests {
             &dir.join("model-00001-of-00002.safetensors"),
             &[
                 (
-                    "text_model.model.embed_tokens.weight",
+                    "text_model.model.embeddings.weight",
                     vec![4, 3],
                     vec![0.0; 12],
                 ),
                 ("text_model.model.norm.weight", vec![3], vec![1.0; 3]),
-                ("text_model.lm_head.weight", vec![4, 3], vec![0.0; 12]),
             ],
         );
         write_shard(
@@ -317,7 +328,7 @@ mod tests {
                 ("audio_decoder.norm.weight", vec![5], vec![1.0; 5]),
                 ("audio_decoder.output.weight", vec![4, 5], vec![0.0; 20]),
                 (
-                    "audio_decoder.layers.0.self_attn.qkv_proj.weight",
+                    "audio_decoder.layers.0.attention.wqkv.weight",
                     vec![15, 5],
                     vec![0.0; 75],
                 ),
@@ -334,7 +345,7 @@ mod tests {
         assert_eq!(
             index
                 .source_to_remapped()
-                .get("audio_decoder.layers.0.self_attn.qkv_proj.weight")
+                .get("audio_decoder.layers.0.attention.wqkv.weight")
                 .unwrap(),
             "fast_layers.0.self_attn.qkv_proj.weight"
         );
@@ -353,13 +364,29 @@ mod tests {
     }
 
     #[test]
+    fn var_builder_loads_remapped_source_tensor_names() {
+        let dir = temp_model_dir();
+        write_minimal_index(&dir);
+        std::fs::write(dir.join("config.json"), r#"{"torch_dtype":"float32"}"#).unwrap();
+        let weights = FishS2Weights::load(&dir, DeviceProfile::cpu(), None).expect("weights");
+        let vb = weights.var_builder();
+        assert!(vb.contains_tensor("embed_tokens.weight"));
+        assert!(vb.contains_tensor("fast_layers.0.self_attn.qkv_proj.weight"));
+        assert!(vb.get((4, 3), "embed_tokens.weight").is_ok());
+        assert!(vb
+            .get((15, 5), "fast_layers.0.self_attn.qkv_proj.weight")
+            .is_ok());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn rejects_missing_required_contract_tensor() {
         let dir = temp_model_dir();
         write_minimal_index(&dir);
         std::fs::write(
             dir.join("model.safetensors.index.json"),
             r#"{"weight_map":{
-                "text_model.model.embed_tokens.weight":"model-00001-of-00002.safetensors",
+                "text_model.model.embeddings.weight":"model-00001-of-00002.safetensors",
                 "audio_decoder.codebook_embeddings.weight":"model-00002-of-00002.safetensors"
             }}"#,
         )
@@ -379,6 +406,28 @@ mod tests {
         assert_eq!(
             select_fish_s2_dtype(&device, Some("bf16"), Some(DType::F32)),
             DType::BF16
+        );
+    }
+
+    #[test]
+    fn dtype_policy_uses_f16_on_metal_to_avoid_f32_checkpoint_expansion() {
+        let device = DeviceProfile {
+            device: Device::Cpu,
+            kind: crate::backends::DeviceKind::Metal,
+            capabilities: crate::backends::DeviceCapabilities {
+                supports_f16: true,
+                prefers_f32: true,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+        assert_eq!(
+            select_fish_s2_dtype(&device, None, Some(DType::BF16)),
+            DType::F16
+        );
+        assert_eq!(
+            select_fish_s2_dtype(&device, Some("f32"), Some(DType::BF16)),
+            DType::F32
         );
     }
 }

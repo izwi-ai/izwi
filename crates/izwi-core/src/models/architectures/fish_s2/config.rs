@@ -3,17 +3,14 @@
 use std::fs;
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::error::{Error, Result};
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FishS2Config {
-    #[serde(default)]
     pub architectures: Vec<String>,
-    #[serde(default)]
     pub model_type: String,
-    #[serde(default)]
     pub torch_dtype: Option<String>,
     pub text_config: FishS2TextConfig,
     pub audio_decoder_config: FishS2AudioDecoderConfig,
@@ -26,28 +23,58 @@ pub struct FishS2Config {
     pub audio_pad_token_id: u32,
     pub semantic_start_token_id: u32,
     pub semantic_end_token_id: u32,
-    #[serde(default)]
     pub sample_rate: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FishS2RawConfig {
+    #[serde(default)]
+    architectures: Vec<String>,
+    #[serde(default)]
+    model_type: String,
+    #[serde(default, alias = "dtype")]
+    torch_dtype: Option<String>,
+    text_config: FishS2TextConfig,
+    audio_decoder_config: FishS2AudioDecoderConfig,
+    #[serde(default)]
+    num_codebooks: Option<usize>,
+    #[serde(default)]
+    codebook_size: Option<usize>,
+    #[serde(default)]
+    max_seq_len: Option<usize>,
+    #[serde(default)]
+    bos_token_id: Option<u32>,
+    eos_token_id: u32,
+    pad_token_id: u32,
+    audio_pad_token_id: u32,
+    semantic_start_token_id: u32,
+    semantic_end_token_id: u32,
+    #[serde(default)]
+    sample_rate: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct FishS2TextConfig {
     #[serde(alias = "hidden_size", alias = "dim")]
     pub hidden_size: usize,
-    #[serde(alias = "num_hidden_layers", alias = "n_layers")]
+    #[serde(alias = "num_hidden_layers", alias = "n_layer", alias = "n_layers")]
     pub num_hidden_layers: usize,
-    #[serde(alias = "num_attention_heads", alias = "n_heads")]
+    #[serde(alias = "num_attention_heads", alias = "n_head", alias = "n_heads")]
     pub num_attention_heads: usize,
-    #[serde(alias = "num_key_value_heads", alias = "n_kv_heads")]
+    #[serde(
+        alias = "num_key_value_heads",
+        alias = "n_local_heads",
+        alias = "n_kv_heads"
+    )]
     pub num_key_value_heads: usize,
     #[serde(default, alias = "head_dim")]
     pub head_dim: Option<usize>,
     pub vocab_size: usize,
     #[serde(alias = "max_position_embeddings")]
     pub max_seq_len: usize,
-    #[serde(default)]
+    #[serde(default, alias = "rope_base")]
     pub rope_theta: Option<f64>,
-    #[serde(default)]
+    #[serde(default, alias = "norm_eps")]
     pub rms_norm_eps: Option<f64>,
     #[serde(default)]
     pub intermediate_size: Option<usize>,
@@ -59,11 +86,15 @@ pub struct FishS2TextConfig {
 pub struct FishS2AudioDecoderConfig {
     #[serde(alias = "hidden_size", alias = "dim")]
     pub hidden_size: usize,
-    #[serde(alias = "num_hidden_layers", alias = "n_layers")]
+    #[serde(alias = "num_hidden_layers", alias = "n_layer", alias = "n_layers")]
     pub num_hidden_layers: usize,
-    #[serde(alias = "num_attention_heads", alias = "n_heads")]
+    #[serde(alias = "num_attention_heads", alias = "n_head", alias = "n_heads")]
     pub num_attention_heads: usize,
-    #[serde(alias = "num_key_value_heads", alias = "n_kv_heads")]
+    #[serde(
+        alias = "num_key_value_heads",
+        alias = "n_local_heads",
+        alias = "n_kv_heads"
+    )]
     pub num_key_value_heads: usize,
     #[serde(default, alias = "head_dim")]
     pub head_dim: Option<usize>,
@@ -71,6 +102,63 @@ pub struct FishS2AudioDecoderConfig {
     pub intermediate_size: Option<usize>,
     #[serde(default)]
     pub max_seq_len: Option<usize>,
+    #[serde(default)]
+    pub num_codebooks: Option<usize>,
+    #[serde(default)]
+    pub vocab_size: Option<usize>,
+}
+
+impl<'de> Deserialize<'de> for FishS2Config {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = FishS2RawConfig::deserialize(deserializer)?;
+        let semantic_vocab_size = raw
+            .semantic_end_token_id
+            .checked_sub(raw.semantic_start_token_id)
+            .ok_or_else(|| {
+                serde::de::Error::custom(
+                    "semantic_end_token_id must be greater than semantic_start_token_id",
+                )
+            })?
+            + 1;
+        let codebook_size = raw
+            .codebook_size
+            .or(raw.audio_decoder_config.vocab_size)
+            .unwrap_or(semantic_vocab_size as usize);
+        let num_codebooks = raw
+            .num_codebooks
+            .or(raw.audio_decoder_config.num_codebooks)
+            .ok_or_else(|| {
+                serde::de::Error::custom(
+                    "Fish S2 config missing num_codebooks/audio_decoder_config.num_codebooks",
+                )
+            })?;
+        let max_seq_len = raw.max_seq_len.unwrap_or(raw.text_config.max_seq_len);
+
+        Ok(Self {
+            architectures: if raw.architectures.is_empty() {
+                vec!["DualARTransformer".to_string()]
+            } else {
+                raw.architectures
+            },
+            model_type: raw.model_type,
+            torch_dtype: raw.torch_dtype,
+            text_config: raw.text_config,
+            audio_decoder_config: raw.audio_decoder_config,
+            num_codebooks,
+            codebook_size,
+            max_seq_len,
+            bos_token_id: raw.bos_token_id.unwrap_or(raw.pad_token_id),
+            eos_token_id: raw.eos_token_id,
+            pad_token_id: raw.pad_token_id,
+            audio_pad_token_id: raw.audio_pad_token_id,
+            semantic_start_token_id: raw.semantic_start_token_id,
+            semantic_end_token_id: raw.semantic_end_token_id,
+            sample_rate: raw.sample_rate,
+        })
+    }
 }
 
 impl FishS2Config {
@@ -194,23 +282,26 @@ pub(crate) fn current_config_json() -> &'static str {
           "sample_rate": null,
           "text_config": {
             "dim": 2560,
-            "n_layers": 36,
-            "n_heads": 32,
-            "n_kv_heads": 8,
+            "n_layer": 36,
+            "n_head": 32,
+            "n_local_heads": 8,
             "head_dim": 128,
             "vocab_size": 155776,
             "max_seq_len": 32768,
-            "rope_theta": 1000000.0,
-            "rms_norm_eps": 0.000001,
+            "rope_base": 1000000.0,
+            "norm_eps": 0.000001,
             "intermediate_size": 9728
           },
           "audio_decoder_config": {
-            "dim": 5120,
-            "n_layers": 6,
-            "n_heads": 32,
-            "n_kv_heads": 8,
+            "dim": 2560,
+            "n_layer": 4,
+            "n_head": 32,
+            "n_local_heads": 8,
             "head_dim": 128,
-            "max_seq_len": 11
+            "intermediate_size": 9728,
+            "max_seq_len": 11,
+            "num_codebooks": 10,
+            "vocab_size": 4096
           }
         }"#
 }
@@ -235,8 +326,58 @@ mod tests {
         assert_eq!(config.text_config.num_hidden_layers, 36);
         assert_eq!(config.text_config.num_attention_heads, 32);
         assert_eq!(config.text_config.num_key_value_heads, 8);
-        assert_eq!(config.audio_decoder_config.hidden_size, 5120);
-        assert_eq!(config.audio_decoder_config.num_hidden_layers, 6);
+        assert_eq!(config.audio_decoder_config.hidden_size, 2560);
+        assert_eq!(config.audio_decoder_config.num_hidden_layers, 4);
+    }
+
+    #[test]
+    fn parses_downloaded_hf_config_shape_without_flat_dualar_fields() {
+        let raw = r#"{
+          "audio_decoder_config": {
+            "dim": 2560,
+            "head_dim": 128,
+            "intermediate_size": 9728,
+            "max_seq_len": 11,
+            "model_type": "fish_qwen3_audio_decoder",
+            "n_head": 32,
+            "n_layer": 4,
+            "n_local_heads": 8,
+            "num_codebooks": 10,
+            "rope_base": 1000000,
+            "text_dim": 2560,
+            "vocab_size": 4096
+          },
+          "audio_pad_token_id": 151677,
+          "dtype": "bfloat16",
+          "eos_token_id": 151645,
+          "model_type": "fish_qwen3_omni",
+          "pad_token_id": 151669,
+          "semantic_end_token_id": 155773,
+          "semantic_start_token_id": 151678,
+          "text_config": {
+            "dim": 2560,
+            "head_dim": 128,
+            "intermediate_size": 9728,
+            "max_seq_len": 32768,
+            "model_type": "fish_qwen3",
+            "n_head": 32,
+            "n_layer": 36,
+            "n_local_heads": 8,
+            "norm_eps": 1e-06,
+            "rope_base": 1000000,
+            "vocab_size": 155776
+          }
+        }"#;
+        let config: FishS2Config = serde_json::from_str(raw).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.architectures, vec!["DualARTransformer"]);
+        assert_eq!(config.torch_dtype.as_deref(), Some("bfloat16"));
+        assert_eq!(config.bos_token_id, 151669);
+        assert_eq!(config.num_codebooks, 10);
+        assert_eq!(config.codebook_size, 4096);
+        assert_eq!(config.max_seq_len, 32768);
+        assert_eq!(config.audio_decoder_config.hidden_size, 2560);
+        assert_eq!(config.audio_decoder_config.num_hidden_layers, 4);
     }
 
     #[test]

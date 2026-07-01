@@ -91,18 +91,43 @@ impl FishS2PromptTensorShape {
 
 pub fn remap_fish_qwen3_omni_key(key: &str) -> String {
     if let Some(suffix) = key.strip_prefix("text_model.model.") {
-        suffix.to_string()
+        remap_fish_transformer_suffix(suffix)
     } else if let Some(suffix) = key.strip_prefix("text_model.") {
-        suffix.to_string()
+        remap_fish_transformer_suffix(suffix)
     } else if let Some(suffix) = key.strip_prefix("audio_decoder.") {
         if suffix.starts_with("codebook_embeddings.") {
             suffix.to_string()
+        } else if suffix == "embeddings.weight" {
+            "fast_embeddings.weight".to_string()
+        } else if suffix == "norm.weight" {
+            "fast_norm.weight".to_string()
+        } else if suffix == "output.weight" {
+            "fast_output.weight".to_string()
         } else {
-            format!("fast_{suffix}")
+            format!("fast_{}", remap_fish_transformer_suffix(suffix))
         }
     } else {
         key.to_string()
     }
+}
+
+fn remap_fish_transformer_suffix(suffix: &str) -> String {
+    let suffix = match suffix {
+        "embeddings.weight" => return "embed_tokens.weight".to_string(),
+        "output.weight" => return "lm_head.weight".to_string(),
+        _ => suffix,
+    };
+
+    suffix
+        .replace(".attention.wqkv.", ".self_attn.qkv_proj.")
+        .replace(".attention.wo.", ".self_attn.o_proj.")
+        .replace(".attention.q_norm.", ".self_attn.q_norm.")
+        .replace(".attention.k_norm.", ".self_attn.k_norm.")
+        .replace(".attention_norm.", ".input_layernorm.")
+        .replace(".ffn_norm.", ".post_attention_layernorm.")
+        .replace(".feed_forward.w1.", ".mlp.gate_proj.")
+        .replace(".feed_forward.w3.", ".mlp.up_proj.")
+        .replace(".feed_forward.w2.", ".mlp.down_proj.")
 }
 
 pub fn semantic_token_id(config: &FishS2Config, semantic_code: u32) -> Result<u32> {
@@ -176,7 +201,15 @@ mod tests {
             "layers.0.self_attn.qkv_proj.weight"
         );
         assert_eq!(
-            remap_fish_qwen3_omni_key("audio_decoder.layers.0.self_attn.qkv_proj.weight"),
+            remap_fish_qwen3_omni_key("text_model.model.layers.0.attention.wqkv.weight"),
+            "layers.0.self_attn.qkv_proj.weight"
+        );
+        assert_eq!(
+            remap_fish_qwen3_omni_key("text_model.model.layers.0.feed_forward.w3.weight"),
+            "layers.0.mlp.up_proj.weight"
+        );
+        assert_eq!(
+            remap_fish_qwen3_omni_key("audio_decoder.layers.0.attention.wqkv.weight"),
             "fast_layers.0.self_attn.qkv_proj.weight"
         );
         assert_eq!(
@@ -184,7 +217,15 @@ mod tests {
             "codebook_embeddings.weight"
         );
         assert_eq!(
-            remap_fish_qwen3_omni_key("text_model.lm_head.weight"),
+            remap_fish_qwen3_omni_key("audio_decoder.embeddings.weight"),
+            "fast_embeddings.weight"
+        );
+        assert_eq!(
+            remap_fish_qwen3_omni_key("audio_decoder.output.weight"),
+            "fast_output.weight"
+        );
+        assert_eq!(
+            remap_fish_qwen3_omni_key("text_model.output.weight"),
             "lm_head.weight"
         );
         assert_eq!(

@@ -8,6 +8,20 @@ use crate::error::{Error, Result};
 use super::{FishS2DacConfig, FishS2GenerationParams, FishS2Reference, FishS2TtsModel};
 
 #[test]
+#[ignore = "requires local fishaudio/s2-pro artifacts"]
+fn fish_s2_real_artifacts_load_native_modules() -> Result<()> {
+    let model_dir = required_env_path("IZWI_FISH_S2_MODEL_DIR")?;
+    let backend = env_backend()?;
+    let device = DeviceSelector::detect_for_preference(backend)?;
+    let model = FishS2TtsModel::load(&model_dir, ModelVariant::FishAudioS2Pro, device)?;
+
+    assert!(model.runtime.is_some());
+    assert_eq!(model.config.num_codebooks, 10);
+    assert_eq!(model.config.codebook_size, 4096);
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires local fishaudio/s2-pro artifacts and a short reference WAV"]
 fn fish_s2_real_model_smoke_generates_finite_audio() -> Result<()> {
     let model_dir = required_env_path("IZWI_FISH_S2_MODEL_DIR")?;
