@@ -310,10 +310,15 @@ impl FishS2NativeRuntime {
 
         let started = Instant::now();
         for _ in 0..max_frames {
+            let allow_im_end = generated_codebooks
+                .first()
+                .map(|codebook| !codebook.is_empty())
+                .unwrap_or(false);
             let semantic_token_id = sample_semantic_token(
                 &slow_output.logits,
                 &self.semantic_allowed_mask,
                 im_end_token_id,
+                allow_im_end,
                 &recent_semantic_tokens,
                 &mut semantic_sampler,
             )?;
@@ -414,6 +419,7 @@ fn sample_semantic_token(
     logits: &Tensor,
     allowed_mask: &[bool],
     im_end_token_id: u32,
+    allow_im_end: bool,
     previous_semantic_tokens: &[u32],
     sampler: &mut FishS2SemanticSampler,
 ) -> Result<u32> {
@@ -427,20 +433,34 @@ fn sample_semantic_token(
         )));
     }
 
+    let mut first_frame_mask;
+    let sampling_mask = if allow_im_end {
+        allowed_mask
+    } else {
+        first_frame_mask = allowed_mask.to_vec();
+        if let Some(allowed) = first_frame_mask.get_mut(im_end_token_id as usize) {
+            *allowed = false;
+        }
+        &first_frame_mask
+    };
+
     let mut sampled = sample_masked_values(
         &values,
-        allowed_mask,
+        sampling_mask,
         sampler.temperature,
         sampler.top_p,
         &mut sampler.rng,
     )?;
     if sampled != im_end_token_id
         && previous_semantic_tokens.contains(&sampled)
-        && allowed_mask.get(sampled as usize).copied().unwrap_or(false)
+        && sampling_mask
+            .get(sampled as usize)
+            .copied()
+            .unwrap_or(false)
     {
         sampled = sample_masked_values(
             &values,
-            allowed_mask,
+            sampling_mask,
             RAS_HIGH_TEMP,
             RAS_HIGH_TOP_P,
             &mut sampler.rng,
@@ -649,8 +669,28 @@ mod tests {
         let logits = Tensor::from_vec(vec![100.0f32, 2.0, 3.0, 4.0], (1, 1, 4), &device).unwrap();
         let allowed = vec![false, true, false, true];
         let mut sampler = FishS2SemanticSampler::new(0.0, 1.0, 0);
-        let token = sample_semantic_token(&logits, &allowed, 1, &[], &mut sampler).unwrap();
+        let token = sample_semantic_token(&logits, &allowed, 1, true, &[], &mut sampler).unwrap();
         assert_eq!(token, 3);
+    }
+
+    #[test]
+    fn semantic_sampler_masks_im_end_before_first_audio_frame() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![0.0f32, 100.0, 98.0, 4.0], (1, 1, 4), &device).unwrap();
+        let allowed = vec![false, true, true, true];
+        let mut sampler = FishS2SemanticSampler::new(0.0, 1.0, 0);
+        let token = sample_semantic_token(&logits, &allowed, 1, false, &[], &mut sampler).unwrap();
+        assert_eq!(token, 2);
+    }
+
+    #[test]
+    fn semantic_sampler_allows_im_end_after_audio_frame() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![0.0f32, 100.0, 98.0, 4.0], (1, 1, 4), &device).unwrap();
+        let allowed = vec![false, true, true, true];
+        let mut sampler = FishS2SemanticSampler::new(0.0, 1.0, 0);
+        let token = sample_semantic_token(&logits, &allowed, 1, true, &[2], &mut sampler).unwrap();
+        assert_eq!(token, 1);
     }
 
     #[test]
