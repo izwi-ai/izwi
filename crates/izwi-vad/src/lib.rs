@@ -665,7 +665,7 @@ impl StreamingLinearResampler {
             self.next_src_pos += step;
         }
 
-        let drain = self.next_src_pos.floor() as usize;
+        let drain = (self.next_src_pos.floor() as usize).min(self.input.len());
         if drain > 0 {
             self.input.drain(0..drain);
             self.next_src_pos -= drain as f64;
@@ -701,6 +701,34 @@ mod tests {
         assert!(frames
             .iter()
             .all(|frame| frame.score.is_finite() && (0.0..=1.0).contains(&frame.score)));
+    }
+
+    #[test]
+    fn scorer_accepts_browser_sized_48khz_chunks() {
+        let mut scorer = VadScorer::new();
+        let samples = vec![0i16; 2048];
+
+        let first = scorer.push_i16(&samples, 48_000).unwrap();
+        let second = scorer.push_i16(&samples, 48_000).unwrap();
+
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 3);
+        assert!(first
+            .iter()
+            .chain(second.iter())
+            .all(|frame| frame.score.is_finite() && (0.0..=1.0).contains(&frame.score)));
+    }
+
+    #[test]
+    fn streaming_resampler_caps_drain_for_exact_ratio_chunks() {
+        let mut resampler = StreamingLinearResampler::new(48_000, VAD_SAMPLE_RATE);
+        let samples = vec![0.0f32; 2048];
+
+        let first = resampler.push(&samples);
+        let second = resampler.push(&samples);
+
+        assert_eq!(first.len(), 683);
+        assert_eq!(second.len(), 682);
     }
 
     #[test]
