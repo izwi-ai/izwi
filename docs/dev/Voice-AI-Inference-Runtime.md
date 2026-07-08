@@ -83,6 +83,26 @@ The data plane performs **the actual work**.
 
 This separation is essential. Without it, model execution logic, user workflows, safety rules, and media handling become tightly coupled, making the runtime hard to evolve.
 
+## 2.3 Izwi Implementation Alignment
+
+Izwi is converging on this reference architecture through a two-layer runtime:
+
+| Reference component | Izwi implementation | Current status |
+| ------------------- | ------------------- | -------------- |
+| API gateway | `crates/izwi-server/src/api/*` Axum routes for OpenAI-compatible audio/chat/responses plus first-party media, transcription, speech history, jobs, realtime, and admin surfaces. | Implemented for the current product routes. |
+| Model registry | `ModelVariant`, `ModelInfo`, `ModelRegistry`, and admin model capability payloads. | Implemented, with capability metadata still being unified under runtime adapters. |
+| Routing policy engine | `runtime/adapters.rs`, `runtime/capabilities`, `runtime/broker.rs`, and the P0 runtime router foundation. | Partially implemented; broker validation is shadow-capable and execution cutover is deliberately gated. |
+| Backend router | `BackendRouter` selects CPU, Metal, or CUDA Candle backends and records diagnostics. | Implemented. |
+| Durable batch jobs | `crates/izwi-server/src/batch_runtime/*` plus ASR and TTS route handlers. | Implemented for one-stage ASR/TTS jobs; multi-stage graph materialization is the next foundation step. |
+| Task graph creation | `runtime/pipeline.rs` defines voice and diarization graph contracts. | Contract-only for several graph shapes; batch routes currently enqueue one executable stage each. |
+| Model workers | `RuntimeService`, `CoreEngine`, task-specific runtime handlers, and direct model paths. | Implemented across ASR, TTS, chat, speech-to-speech, diarization, forced alignment, and tokenizer capability surfaces where models exist. |
+| Media and artifact handling | Server media/text assets and runtime artifacts in the batch runtime store. | Implemented for current batch routes and media registration. |
+| Streaming gateway | Realtime transcription and voice websocket handlers. | Implemented at route/session level; not yet fully routed through a unified runtime router. |
+| Observability | Runtime telemetry, Prometheus output, tracing contracts, replay redaction, broker and pipeline counters. | Implemented for core runtime and scaffolding; routing-decision telemetry is being added incrementally. |
+| Governance and safety | Enterprise request context, retention metadata, voice capability flags, and audit-oriented records. | Partial; deeper tenant policy, model approval, cost, and consent enforcement remain planned. |
+
+The architectural gap is therefore not the absence of runtime foundations. The gap is that route selection, adapter validation, backend selection, batch graph creation, and realtime/session routing are not yet one authoritative decision path. P0 work should make that decision path explicit, observable, and shadow-safe before changing production execution behavior.
+
 ---
 
 # 3. High-Level System Architecture
