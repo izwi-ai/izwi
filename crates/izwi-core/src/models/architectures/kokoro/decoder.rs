@@ -28,6 +28,8 @@ use rustfft::num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 
 use crate::error::{Error, Result};
+#[cfg(feature = "metal")]
+use crate::kernels::metal_encoder::IzwiMetalCommandEncoderExt;
 
 use super::config::{KokoroConfig, KokoroIstftNetConfig};
 use super::prosody::{
@@ -971,22 +973,22 @@ impl CustomOp3 for KokoroConvTranspose1dStrideMetalOp {
         let pipeline = kokoro_conv_transpose1d_stride_pipeline(device.metal_device())?;
         encoder.set_compute_pipeline_state(&pipeline);
 
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             0,
             Some(input_storage.buffer()),
             input_layout.start_offset() * DType::F32.size_in_bytes(),
         );
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             1,
             Some(weight_storage.buffer()),
             weight_layout.start_offset() * DType::F32.size_in_bytes(),
         );
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             2,
             Some(bias_storage.buffer()),
             bias_layout.start_offset() * DType::F32.size_in_bytes(),
         );
-        encoder.set_buffer(3, Some(&output), 0);
+        encoder.set_output_buffer(3, Some(&output), 0);
         encoder.set_bytes(4, &(batch as u32));
         encoder.set_bytes(5, &(c_in as u32));
         encoder.set_bytes(6, &(c_out as u32));
@@ -1009,6 +1011,8 @@ impl CustomOp3 for KokoroConvTranspose1dStrideMetalOp {
                 depth: 1,
             },
         );
+
+        drop(encoder);
 
         Ok((
             MetalStorage::new(output, device, elem_count, DType::F32),

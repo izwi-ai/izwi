@@ -13,6 +13,9 @@ use candle_core::{
 use candle_metal_kernels::metal::{ComputePipeline, Device as MetalDevice};
 
 #[cfg(feature = "metal")]
+use crate::kernels::metal_encoder::IzwiMetalCommandEncoderExt;
+
+#[cfg(feature = "metal")]
 const NEMOTRON_METAL_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -190,17 +193,17 @@ impl CustomOp2 for DepthwiseConv1dOp {
         let pipeline = depthwise_conv1d_pipeline(device.metal_device())?;
         encoder.set_compute_pipeline_state(&pipeline);
 
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             0,
             Some(input_storage.buffer()),
             input_layout.start_offset() * DType::F32.size_in_bytes(),
         );
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             1,
             Some(weight_storage.buffer()),
             weight_layout.start_offset() * DType::F32.size_in_bytes(),
         );
-        encoder.set_buffer(2, Some(&output), 0);
+        encoder.set_output_buffer(2, Some(&output), 0);
         encoder.set_bytes(3, &(batch as u32));
         encoder.set_bytes(4, &(channels as u32));
         encoder.set_bytes(5, &(input_width as u32));
@@ -223,6 +226,8 @@ impl CustomOp2 for DepthwiseConv1dOp {
                 depth: 1,
             },
         );
+
+        drop(encoder);
 
         Ok((
             MetalStorage::new(output, device, elem_count, DType::F32),
@@ -314,22 +319,22 @@ impl CustomOp3 for DepthwiseConv2dBiasOp {
         let pipeline = depthwise_conv2d_bias_pipeline(device.metal_device())?;
         encoder.set_compute_pipeline_state(&pipeline);
 
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             0,
             Some(input_storage.buffer()),
             input_layout.start_offset() * DType::F32.size_in_bytes(),
         );
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             1,
             Some(weight_storage.buffer()),
             weight_layout.start_offset() * DType::F32.size_in_bytes(),
         );
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             2,
             Some(bias_storage.buffer()),
             bias_layout.start_offset() * DType::F32.size_in_bytes(),
         );
-        encoder.set_buffer(3, Some(&output), 0);
+        encoder.set_output_buffer(3, Some(&output), 0);
         encoder.set_bytes(4, &(batch as u32));
         encoder.set_bytes(5, &(channels as u32));
         encoder.set_bytes(6, &(input_height as u32));
@@ -355,6 +360,8 @@ impl CustomOp3 for DepthwiseConv2dBiasOp {
                 depth: 1,
             },
         );
+
+        drop(encoder);
 
         Ok((
             MetalStorage::new(output, device, elem_count, DType::F32),
