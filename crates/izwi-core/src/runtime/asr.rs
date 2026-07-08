@@ -642,15 +642,50 @@ impl RuntimeService {
         prompt: Option<&str>,
         max_tokens: Option<usize>,
         correlation_id: Option<&str>,
+        on_delta: F,
+        on_progress: P,
+    ) -> Result<AsrTranscription>
+    where
+        F: FnMut(String) + Send + 'static,
+        P: FnMut(AsrProgress) + Send + 'static,
+    {
+        self.asr_transcribe_bytes_with_variant_callback_and_prompt_options_with_progress(
+            variant,
+            audio_bytes,
+            language,
+            prompt,
+            max_tokens,
+            correlation_id,
+            on_delta,
+            on_progress,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn asr_transcribe_bytes_with_variant_callback_and_prompt_options_with_progress<F, P>(
+        &self,
+        variant: ModelVariant,
+        audio_bytes: &[u8],
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_tokens: Option<usize>,
+        correlation_id: Option<&str>,
         mut on_delta: F,
         mut on_progress: P,
+        broker_streaming_required: bool,
     ) -> Result<AsrTranscription>
     where
         F: FnMut(String) + Send + 'static,
         P: FnMut(AsrProgress) + Send + 'static,
     {
         if variant.is_audio_chat() {
-            self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), true)?;
+            self.observe_broker_capability_request(
+                CapabilityKind::Asr,
+                Some(variant),
+                broker_streaming_required,
+            )?;
             return self
                 .asr_transcribe_audio_chat_bytes(variant, audio_bytes, max_tokens, on_delta)
                 .await;
@@ -667,20 +702,24 @@ impl RuntimeService {
             )
             .await?;
         let mut streamed_text = String::new();
-        let output = self
-            .run_streaming_request(request, |chunk| {
-                if let Some(progress) = chunk.asr_progress {
-                    on_progress(progress);
+        let handle_chunk = |chunk: crate::engine::StreamingOutput| {
+            if let Some(progress) = chunk.asr_progress {
+                on_progress(progress);
+            }
+            if let Some(delta) = chunk.text {
+                if !delta.is_empty() {
+                    streamed_text.push_str(&delta);
+                    on_delta(delta);
                 }
-                if let Some(delta) = chunk.text {
-                    if !delta.is_empty() {
-                        streamed_text.push_str(&delta);
-                        on_delta(delta);
-                    }
-                }
-                std::future::ready(Ok(()))
-            })
-            .await?;
+            }
+            std::future::ready(Ok(()))
+        };
+        let output = if broker_streaming_required {
+            self.run_streaming_request(request, handle_chunk).await?
+        } else {
+            self.run_transport_streaming_request(request, handle_chunk)
+                .await?
+        };
         let text = output.text.unwrap_or(streamed_text);
 
         Ok(AsrTranscription {
@@ -1057,6 +1096,34 @@ impl RuntimeService {
             correlation_id,
             on_delta,
             on_progress,
+        )
+        .await
+    }
+
+    pub async fn asr_transcribe_bytes_with_progress_and_correlation<F, P>(
+        &self,
+        audio_bytes: &[u8],
+        model_id: Option<&str>,
+        language: Option<&str>,
+        correlation_id: Option<&str>,
+        on_delta: F,
+        on_progress: P,
+    ) -> Result<AsrTranscription>
+    where
+        F: FnMut(String) + Send + 'static,
+        P: FnMut(AsrProgress) + Send + 'static,
+    {
+        let variant = resolve_asr_model_variant(model_id);
+        self.asr_transcribe_bytes_with_variant_callback_and_prompt_options_with_progress(
+            variant,
+            audio_bytes,
+            language,
+            None,
+            None,
+            correlation_id,
+            on_delta,
+            on_progress,
+            false,
         )
         .await
     }
