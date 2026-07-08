@@ -156,11 +156,26 @@ impl InferenceBroker {
         adapters: &RuntimeAdapterRegistry,
         backend_router: &BackendRouter,
     ) -> Option<InferenceBrokerObservation> {
+        self.observe_engine_request_with_streaming_required(
+            request,
+            request.streaming,
+            adapters,
+            backend_router,
+        )
+    }
+
+    pub(crate) fn observe_engine_request_with_streaming_required(
+        &self,
+        request: &EngineCoreRequest,
+        streaming_required: bool,
+        adapters: &RuntimeAdapterRegistry,
+        backend_router: &BackendRouter,
+    ) -> Option<InferenceBrokerObservation> {
         self.observe_capability_request(
             RouteSource::InternalEngine,
             capability_for_task(request.task_type),
             request.model_variant,
-            request.streaming,
+            streaming_required,
             adapters,
             backend_router,
         )
@@ -318,6 +333,29 @@ mod tests {
         assert_eq!(observation.capability, CapabilityKind::Chat);
         assert!(observation.shadow_enabled);
         assert!(!observation.execution_enabled);
+        assert!(observation.routing_decision.is_some());
+        assert!(observation.validation_error.is_none());
+    }
+
+    #[test]
+    fn broker_can_validate_transport_streaming_as_offline_execution() {
+        let broker = InferenceBroker::with_mode(InferenceBrokerMode::Shadow);
+        let (adapters, backend_router) = route_test_fixture();
+        let mut request =
+            EngineCoreRequest::asr("audio").with_model_variant(ModelVariant::ParakeetTdt06BV3);
+        request.streaming = true;
+
+        let observation = broker
+            .observe_engine_request_with_streaming_required(
+                &request,
+                false,
+                &adapters,
+                &backend_router,
+            )
+            .expect("shadow mode should observe transport streaming request");
+
+        assert_eq!(observation.source, RouteSource::InternalEngine);
+        assert_eq!(observation.capability, CapabilityKind::Asr);
         assert!(observation.routing_decision.is_some());
         assert!(observation.validation_error.is_none());
     }

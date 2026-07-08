@@ -243,15 +243,34 @@ impl RuntimeService {
     }
 
     fn observe_broker_request(&self, request: &EngineCoreRequest) -> Result<()> {
-        let Some(observation) = self.inference_broker.observe_engine_request(
-            request,
-            &self.adapter_registry,
-            &self.backend_router,
-        ) else {
+        self.observe_broker_request_with_streaming_required(request, request.streaming)
+    }
+
+    fn observe_broker_request_with_streaming_required(
+        &self,
+        request: &EngineCoreRequest,
+        streaming_required: bool,
+    ) -> Result<()> {
+        let Some(observation) = self
+            .inference_broker
+            .observe_engine_request_with_streaming_required(
+                request,
+                streaming_required,
+                &self.adapter_registry,
+                &self.backend_router,
+            )
+        else {
             return Ok(());
         };
 
         self.record_broker_observation(observation)
+    }
+
+    fn observe_broker_request_with_transport_streaming(
+        &self,
+        request: &EngineCoreRequest,
+    ) -> Result<()> {
+        self.observe_broker_request_with_streaming_required(request, false)
     }
 
     pub(crate) fn observe_broker_capability_request(
@@ -709,15 +728,46 @@ impl RuntimeService {
 
     pub(crate) async fn run_streaming_request<F, Fut>(
         &self,
+        request: EngineCoreRequest,
+        on_chunk: F,
+    ) -> Result<EngineOutput>
+    where
+        F: FnMut(StreamingOutput) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        self.run_streaming_request_with_broker_streaming(request, on_chunk, true)
+            .await
+    }
+
+    pub(crate) async fn run_transport_streaming_request<F, Fut>(
+        &self,
+        request: EngineCoreRequest,
+        on_chunk: F,
+    ) -> Result<EngineOutput>
+    where
+        F: FnMut(StreamingOutput) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        self.run_streaming_request_with_broker_streaming(request, on_chunk, false)
+            .await
+    }
+
+    async fn run_streaming_request_with_broker_streaming<F, Fut>(
+        &self,
         mut request: EngineCoreRequest,
         mut on_chunk: F,
+        broker_streaming_required: bool,
     ) -> Result<EngineOutput>
     where
         F: FnMut(StreamingOutput) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
         request.streaming = true;
-        self.observe_broker_request(&request)?;
+        if broker_streaming_required {
+            self.observe_broker_request(&request)?;
+        } else {
+            self.observe_broker_request_with_transport_streaming(&request)?;
+        }
         let observation_request = request.clone();
         let _residency_lease = request
             .model_variant
@@ -1107,6 +1157,40 @@ mod tests {
                 .error_kind
                 .as_deref(),
             Some("routing_validation_failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_streaming_requests_can_validate_as_offline_broker_execution() {
+        let mut runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        runtime.inference_broker = InferenceBroker::with_mode(InferenceBrokerMode::Shadow);
+        let mut request =
+            EngineCoreRequest::asr("audio").with_model_variant(ModelVariant::ParakeetTdt06BV3);
+        request.streaming = true;
+
+        runtime
+            .observe_broker_request_with_streaming_required(&request, false)
+            .expect("transport streaming should validate as offline ASR execution");
+
+        let snapshot = runtime.telemetry_snapshot().await;
+        assert_eq!(snapshot.broker.shadow_requests, 1);
+        assert_eq!(snapshot.broker.route_decisions, 1);
+        assert_eq!(snapshot.broker.validation_failures, 0);
+        assert_eq!(snapshot.observability.stage_observations_total, 1);
+        assert_eq!(snapshot.observability.stage_failures_total, 0);
+        assert_eq!(
+            snapshot.observability.recent_stage_samples[0]
+                .context
+                .execution_target
+                .as_deref(),
+            Some("BatchRunner")
+        );
+        assert_eq!(
+            snapshot.observability.recent_stage_samples[0]
+                .context
+                .streaming_mode
+                .as_deref(),
+            Some("None")
         );
     }
 
