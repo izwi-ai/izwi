@@ -18,6 +18,13 @@ license = "Apache-2.0"
 repository = "https://github.com/izwi-ai/izwi"
 authors = ["Izwi <hi@izwiai.com>"]
 
+[patch.crates-io]
+# Candle 0.11.0's Apple Silicon NEON fp16 specialization reaches unstable
+# stdarch float16 vector types on stable Rust. Keep the exact crate version but
+# use a local patch that falls back to Candle's existing f32-widening path on
+# macOS ARM until upstream publishes a stable-compatible fix.
+candle-core = { path = "vendor/candle-core-0.11.0" }
+
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }

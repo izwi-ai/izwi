@@ -1,6 +1,0 @@
-[target.aarch64-apple-darwin]
-# Candle 0.11.0 enables a NEON fp16 path that currently reaches unstable
-# stdarch_neon_f16 symbols on stable Rust. Disabling the CPU fp16 target feature
-# keeps macOS Apple Silicon builds on stable until upstream no longer needs this
-# workaround. This does not disable Candle's Metal backend.
-rustflags = ["-C", "target-feature=-fp16"]
