@@ -10,6 +10,7 @@ use crate::error::{Error, Result};
 use crate::runtime::adapters::{
     AdapterMetadata, CapabilityKind, ExecutionTargetKind, RuntimeAdapterRegistry, StreamingMode,
 };
+use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CapabilityExecutionRequest {
@@ -33,7 +34,7 @@ impl CapabilityExecutionRequest {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub(crate) struct CapabilityExecutionPlan {
     pub(crate) adapter_id: &'static str,
     pub(crate) capability: CapabilityKind,

@@ -7,10 +7,9 @@ use std::time::Instant;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
-use crate::KernelPathTelemetrySnapshot;
 use crate::engine::{
-    EngineMetricDescriptor, EngineOutput, engine_metric_catalog, prometheus_engine_metric_name,
-    prometheus_engine_metric_type,
+    engine_metric_catalog, prometheus_engine_metric_name, prometheus_engine_metric_type,
+    EngineMetricDescriptor, EngineOutput,
 };
 use crate::models::shared::telemetry::{
     prometheus as kernel_path_prometheus, snapshot as kernel_path_telemetry_snapshot,
@@ -19,10 +18,11 @@ use crate::runtime::pipeline::{
     PipelineExecutionSummary, PipelineExecutor, PipelineGraph, PipelineKind,
 };
 use crate::runtime::voice_metrics::{
-    VOICE_BARGE_IN_TOTAL, VOICE_SESSION_CLOSED_TOTAL, VOICE_SESSION_INTERRUPTED_TOTAL,
-    VOICE_SESSION_STARTED_TOTAL, VOICE_STREAM_BACKPRESSURE_TOTAL, VoiceMetricDescriptor,
     prometheus_voice_metric_name, voice_metric_catalog, voice_metric_prometheus_contract,
+    VoiceMetricDescriptor, VOICE_BARGE_IN_TOTAL, VOICE_SESSION_CLOSED_TOTAL,
+    VOICE_SESSION_INTERRUPTED_TOTAL, VOICE_SESSION_STARTED_TOTAL, VOICE_STREAM_BACKPRESSURE_TOTAL,
 };
+use crate::KernelPathTelemetrySnapshot;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VoiceRuntimeTelemetrySnapshot {
@@ -37,6 +37,7 @@ pub struct VoiceRuntimeTelemetrySnapshot {
 pub struct InferenceBrokerRuntimeTelemetrySnapshot {
     pub shadow_requests: u64,
     pub execution_requests: u64,
+    pub route_decisions: u64,
     pub validation_failures: u64,
 }
 
@@ -110,6 +111,7 @@ pub(crate) struct RuntimeTelemetryCollector {
     voice_stream_backpressure: AtomicU64,
     broker_shadow_requests: AtomicU64,
     broker_execution_requests: AtomicU64,
+    broker_route_decisions: AtomicU64,
     broker_validation_failures: AtomicU64,
     pipeline_modular_voice_turns: AtomicU64,
     pipeline_unified_voice_turns: AtomicU64,
@@ -140,6 +142,7 @@ impl RuntimeTelemetryCollector {
             voice_stream_backpressure: AtomicU64::new(0),
             broker_shadow_requests: AtomicU64::new(0),
             broker_execution_requests: AtomicU64::new(0),
+            broker_route_decisions: AtomicU64::new(0),
             broker_validation_failures: AtomicU64::new(0),
             pipeline_modular_voice_turns: AtomicU64::new(0),
             pipeline_unified_voice_turns: AtomicU64::new(0),
@@ -251,6 +254,10 @@ impl RuntimeTelemetryCollector {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_broker_route_decision(&self) {
+        self.broker_route_decisions.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_broker_validation_failure(&self) {
         self.broker_validation_failures
             .fetch_add(1, Ordering::Relaxed);
@@ -322,6 +329,7 @@ impl RuntimeTelemetryCollector {
             broker: InferenceBrokerRuntimeTelemetrySnapshot {
                 shadow_requests: self.broker_shadow_requests.load(Ordering::Relaxed),
                 execution_requests: self.broker_execution_requests.load(Ordering::Relaxed),
+                route_decisions: self.broker_route_decisions.load(Ordering::Relaxed),
                 validation_failures: self.broker_validation_failures.load(Ordering::Relaxed),
             },
             pipelines: PipelineRuntimeTelemetrySnapshot {
@@ -407,9 +415,11 @@ impl RuntimeTelemetryCollector {
         payload.push_str(&format!(
             "# TYPE izwi_inference_broker_shadow_requests_total counter\nizwi_inference_broker_shadow_requests_total {}\n\
 # TYPE izwi_inference_broker_execution_requests_total counter\nizwi_inference_broker_execution_requests_total {}\n\
+# TYPE izwi_inference_broker_route_decisions_total counter\nizwi_inference_broker_route_decisions_total {}\n\
 # TYPE izwi_inference_broker_validation_failures_total counter\nizwi_inference_broker_validation_failures_total {}\n",
             snapshot.broker.shadow_requests,
             snapshot.broker.execution_requests,
+            snapshot.broker.route_decisions,
             snapshot.broker.validation_failures
         ));
         payload.push_str(&format!(
@@ -488,12 +498,10 @@ mod tests {
         assert_eq!(snapshot.voice.interruptions, 1);
         assert_eq!(snapshot.voice.barge_ins, 1);
         assert_eq!(snapshot.voice.stream_backpressure_total, 1);
-        assert!(
-            snapshot
-                .voice_metrics
-                .iter()
-                .any(|metric| metric.name == VOICE_SESSION_STARTED_TOTAL)
-        );
+        assert!(snapshot
+            .voice_metrics
+            .iter()
+            .any(|metric| metric.name == VOICE_SESSION_STARTED_TOTAL));
 
         let payload = telemetry.prometheus().await;
         assert!(payload.contains("izwi_voice_session_started_total 1"));
@@ -510,16 +518,19 @@ mod tests {
 
         telemetry.record_broker_shadow_request();
         telemetry.record_broker_execution_request();
+        telemetry.record_broker_route_decision();
         telemetry.record_broker_validation_failure();
 
         let snapshot = telemetry.snapshot().await;
         assert_eq!(snapshot.broker.shadow_requests, 1);
         assert_eq!(snapshot.broker.execution_requests, 1);
+        assert_eq!(snapshot.broker.route_decisions, 1);
         assert_eq!(snapshot.broker.validation_failures, 1);
 
         let payload = telemetry.prometheus().await;
         assert!(payload.contains("izwi_inference_broker_shadow_requests_total 1"));
         assert!(payload.contains("izwi_inference_broker_execution_requests_total 1"));
+        assert!(payload.contains("izwi_inference_broker_route_decisions_total 1"));
         assert!(payload.contains("izwi_inference_broker_validation_failures_total 1"));
     }
 

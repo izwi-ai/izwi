@@ -6,9 +6,10 @@
 
 use serde::Serialize;
 
+use crate::backends::BackendRouter;
 use crate::engine::{EngineCoreRequest, TaskType};
 use crate::runtime::adapters::{CapabilityKind, RuntimeAdapterRegistry};
-use crate::runtime::capabilities::{CapabilityExecutionRegistry, CapabilityExecutionRequest};
+use crate::runtime::routing::{RouteSource, RoutingDecision, RoutingRequest, RuntimeRouter};
 
 const BROKER_MODE_ENV: &str = "IZWI_INFERENCE_BROKER";
 const DEPLOYMENT_MODE_ENV: &str = "IZWI_INFERENCE_DEPLOYMENT_MODE";
@@ -76,8 +77,10 @@ pub(crate) struct InferenceBrokerSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InferenceBrokerObservation {
+    pub(crate) source: RouteSource,
     pub(crate) capability: CapabilityKind,
     pub(crate) model_variant: Option<crate::model::ModelVariant>,
+    pub(crate) routing_decision: Option<RoutingDecision>,
     pub(crate) shadow_enabled: bool,
     pub(crate) execution_enabled: bool,
     pub(crate) validation_error: Option<String>,
@@ -151,43 +154,45 @@ impl InferenceBroker {
         &self,
         request: &EngineCoreRequest,
         adapters: &RuntimeAdapterRegistry,
+        backend_router: &BackendRouter,
     ) -> Option<InferenceBrokerObservation> {
         self.observe_capability_request(
+            RouteSource::InternalEngine,
             capability_for_task(request.task_type),
             request.model_variant,
             request.streaming,
             adapters,
+            backend_router,
         )
     }
 
     pub(crate) fn observe_capability_request(
         &self,
+        source: RouteSource,
         capability: CapabilityKind,
         model_variant: Option<crate::model::ModelVariant>,
         streaming_required: bool,
         adapters: &RuntimeAdapterRegistry,
+        backend_router: &BackendRouter,
     ) -> Option<InferenceBrokerObservation> {
         if !self.shadow_enabled() && !self.execution_enabled() {
             return None;
         }
 
-        let execution_registry = CapabilityExecutionRegistry::new(adapters);
-        let validation_error = match model_variant {
-            Some(model_variant) => execution_registry
-                .plan(
-                    CapabilityExecutionRequest::new(capability, model_variant)
-                        .with_streaming_required(streaming_required),
-                )
-                .err()
-                .map(|err| err.to_string()),
-            None => Some(format!(
-                "Inference broker could not validate {capability:?}: request missing model variant"
-            )),
+        let router = RuntimeRouter::new(adapters, backend_router);
+        let route_request = RoutingRequest::new(source, capability)
+            .with_optional_model_variant(model_variant)
+            .with_streaming_required(streaming_required);
+        let (routing_decision, validation_error) = match router.plan(route_request) {
+            Ok(decision) => (Some(decision), None),
+            Err(err) => (None, Some(err.to_string())),
         };
 
         Some(InferenceBrokerObservation {
+            source,
             capability,
             model_variant,
+            routing_decision,
             shadow_enabled: self.shadow_enabled(),
             execution_enabled: self.execution_enabled(),
             validation_error,
@@ -207,9 +212,17 @@ fn capability_for_task(task_type: TaskType) -> CapabilityKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::{BackendPreference, BackendRouter};
     use crate::engine::EngineCoreRequest;
     use crate::model::ModelVariant;
     use crate::runtime::adapters::RuntimeAdapterRegistry;
+
+    fn route_test_fixture() -> (RuntimeAdapterRegistry, BackendRouter) {
+        (
+            RuntimeAdapterRegistry::built_in(),
+            BackendRouter::from_preference(BackendPreference::Cpu),
+        )
+    }
 
     #[test]
     fn broker_mode_defaults_unknown_values_to_off() {
@@ -294,51 +307,58 @@ mod tests {
     #[test]
     fn broker_shadow_observes_and_validates_engine_requests() {
         let broker = InferenceBroker::with_mode(InferenceBrokerMode::Shadow);
-        let adapters = RuntimeAdapterRegistry::built_in();
+        let (adapters, backend_router) = route_test_fixture();
         let request = EngineCoreRequest::chat(vec![]).with_model_variant(ModelVariant::Qwen38BGguf);
 
         let observation = broker
-            .observe_engine_request(&request, &adapters)
+            .observe_engine_request(&request, &adapters, &backend_router)
             .expect("shadow mode should observe request");
 
+        assert_eq!(observation.source, RouteSource::InternalEngine);
         assert_eq!(observation.capability, CapabilityKind::Chat);
         assert!(observation.shadow_enabled);
         assert!(!observation.execution_enabled);
+        assert!(observation.routing_decision.is_some());
         assert!(observation.validation_error.is_none());
     }
 
     #[test]
     fn broker_on_reports_adapter_validation_errors() {
         let broker = InferenceBroker::with_mode(InferenceBrokerMode::On);
-        let adapters = RuntimeAdapterRegistry::built_in();
+        let (adapters, backend_router) = route_test_fixture();
         let request = EngineCoreRequest::chat(vec![]).with_model_variant(ModelVariant::Kokoro82M);
 
         let observation = broker
-            .observe_engine_request(&request, &adapters)
+            .observe_engine_request(&request, &adapters, &backend_router)
             .expect("on mode should observe request");
 
         assert!(observation.execution_enabled);
+        assert!(observation.routing_decision.is_none());
         assert!(observation.validation_error.is_some());
     }
 
     #[test]
     fn broker_observes_direct_capability_requests() {
         let broker = InferenceBroker::with_mode(InferenceBrokerMode::Shadow);
-        let adapters = RuntimeAdapterRegistry::built_in();
+        let (adapters, backend_router) = route_test_fixture();
 
         let observation = broker
             .observe_capability_request(
+                RouteSource::InternalRuntime,
                 CapabilityKind::Tts,
                 Some(ModelVariant::Kokoro82M),
                 true,
                 &adapters,
+                &backend_router,
             )
             .expect("shadow broker should observe direct TTS request");
 
+        assert_eq!(observation.source, RouteSource::InternalRuntime);
         assert_eq!(observation.capability, CapabilityKind::Tts);
         assert_eq!(observation.model_variant, Some(ModelVariant::Kokoro82M));
         assert!(observation.shadow_enabled);
         assert!(!observation.execution_enabled);
+        assert!(observation.routing_decision.is_some());
         assert!(observation.validation_error.is_none());
     }
 }

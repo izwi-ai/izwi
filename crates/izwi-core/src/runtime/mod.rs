@@ -16,6 +16,7 @@ mod kokoro;
 mod lifecycle;
 mod pipeline;
 mod request;
+mod routing;
 mod service;
 mod speech_to_speech;
 mod telemetry;
