@@ -107,6 +107,7 @@ struct ChatBenchSample {
     prompt_tokens: usize,
     completion_tokens: usize,
     generation_time_ms: Option<f64>,
+    saw_text_delta: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -322,6 +323,7 @@ struct ChatStreamUsage {
 struct BenchOptions {
     output_format: OutputFormat,
     quiet: bool,
+    quality_mode: BenchmarkQualityMode,
 }
 
 impl BenchOptions {
@@ -331,6 +333,28 @@ impl BenchOptions {
 
     fn interactive(&self) -> bool {
         self.human_output() && !self.quiet
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchmarkQualityMode {
+    Strict,
+    Warn,
+}
+
+impl BenchmarkQualityMode {
+    fn from_env() -> Self {
+        match std::env::var("IZWI_BENCH_QUALITY_MODE") {
+            Ok(value)
+                if matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "warn" | "warning" | "warnings"
+                ) =>
+            {
+                Self::Warn
+            }
+            _ => Self::Strict,
+        }
     }
 }
 
@@ -384,6 +408,7 @@ struct BenchmarkSummary {
     successful: Option<u64>,
     failed: Option<u64>,
     total: Option<u64>,
+    quality_gates: BenchmarkQualityGateSummary,
 }
 
 #[derive(Debug, Serialize)]
@@ -420,6 +445,7 @@ struct BenchmarkSample {
     asr_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     asr_diagnostics: Option<serde_json::Value>,
+    quality_gates: Vec<BenchmarkQualityGate>,
 }
 
 #[derive(Debug, Serialize)]
@@ -427,6 +453,38 @@ struct RuntimeTelemetryReport {
     delta_available: bool,
     before: Option<RuntimeTelemetrySnapshot>,
     after: Option<RuntimeTelemetrySnapshot>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct BenchmarkQualityGateSummary {
+    total: usize,
+    passed: usize,
+    warnings: usize,
+    failed: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct BenchmarkQualityGate {
+    name: String,
+    status: BenchmarkQualityGateStatus,
+    severity: BenchmarkQualityGateSeverity,
+    message: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum BenchmarkQualityGateStatus {
+    Pass,
+    Warn,
+    Fail,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum BenchmarkQualityGateSeverity {
+    Info,
+    Warning,
+    Error,
 }
 
 #[derive(Debug, Deserialize)]
@@ -553,8 +611,18 @@ struct BenchmarkCompareReport {
     current: String,
     baseline: String,
     tolerance_percent: f64,
+    quality_failures: Vec<BenchmarkQualityFailure>,
     regressions: usize,
     checks: Vec<BenchmarkComparison>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BenchmarkQualityFailure {
+    case: String,
+    report: String,
+    sample_index: Option<usize>,
+    gate: String,
+    message: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -572,6 +640,14 @@ struct BenchmarkComparison {
 struct ReportEntry {
     name: String,
     summary: serde_json::Value,
+    quality_failures: Vec<ReportQualityFailure>,
+}
+
+#[derive(Debug, Clone)]
+struct ReportQualityFailure {
+    sample_index: Option<usize>,
+    gate: String,
+    message: String,
 }
 
 pub async fn execute(
@@ -584,6 +660,7 @@ pub async fn execute(
     let options = BenchOptions {
         output_format,
         quiet,
+        quality_mode: BenchmarkQualityMode::from_env(),
     };
     match command {
         BenchCommands::Chat {
@@ -607,7 +684,7 @@ pub async fn execute(
             theme,
         )
         .await
-        .and_then(|report| emit_report(&options, &report)),
+        .and_then(|report| finish_report(&options, &report)),
         BenchCommands::Tts {
             model,
             iterations,
@@ -635,7 +712,7 @@ pub async fn execute(
             theme,
         )
         .await
-        .and_then(|report| emit_report(&options, &report)),
+        .and_then(|report| finish_report(&options, &report)),
         BenchCommands::Asr {
             model,
             iterations,
@@ -657,13 +734,13 @@ pub async fn execute(
             theme,
         )
         .await
-        .and_then(|report| emit_report(&options, &report)),
+        .and_then(|report| finish_report(&options, &report)),
         BenchCommands::Throughput {
             duration,
             concurrent,
         } => bench_throughput(server, duration, concurrent, &options, theme)
             .await
-            .and_then(|report| emit_report(&options, &report)),
+            .and_then(|report| finish_report(&options, &report)),
         BenchCommands::Run {
             manifest,
             artifact_dir,
@@ -711,6 +788,30 @@ async fn bench_compare(
         )));
     }
 
+    let quality_failures = collect_report_quality_failures(&current_reports, "current")
+        .into_iter()
+        .chain(collect_report_quality_failures(
+            &baseline_reports,
+            "baseline",
+        ))
+        .collect::<Vec<_>>();
+    if !quality_failures.is_empty() {
+        let report = BenchmarkCompareReport {
+            schema_version: 1,
+            current: current_path.display().to_string(),
+            baseline: baseline_path.display().to_string(),
+            tolerance_percent,
+            quality_failures,
+            regressions: 0,
+            checks: Vec::new(),
+        };
+        let failure_count = report.quality_failures.len();
+        emit_compare_report(options, &report)?;
+        return Err(CliError::Other(format!(
+            "Benchmark comparison failed: {failure_count} quality gate failure(s)"
+        )));
+    }
+
     let mut checks = Vec::new();
     for (case, current) in &current_reports {
         let baseline = baseline_reports
@@ -740,6 +841,7 @@ async fn bench_compare(
         current: current_path.display().to_string(),
         baseline: baseline_path.display().to_string(),
         tolerance_percent,
+        quality_failures,
         regressions,
         checks,
     };
@@ -752,6 +854,27 @@ async fn bench_compare(
     }
 
     Ok(())
+}
+
+fn collect_report_quality_failures(
+    reports: &BTreeMap<String, ReportEntry>,
+    label: &str,
+) -> Vec<BenchmarkQualityFailure> {
+    reports
+        .iter()
+        .flat_map(|(case, entry)| {
+            entry
+                .quality_failures
+                .iter()
+                .map(move |failure| BenchmarkQualityFailure {
+                    case: case.clone(),
+                    report: label.to_string(),
+                    sample_index: failure.sample_index,
+                    gate: failure.gate.clone(),
+                    message: failure.message.clone(),
+                })
+        })
+        .collect()
 }
 
 fn report_entry_map(
@@ -1036,7 +1159,12 @@ fn report_entries(value: &serde_json::Value) -> Result<Vec<ReportEntry>> {
                     .or_else(|| report.get("command").and_then(|value| value.as_str()))
                     .map(str::to_string)
                     .unwrap_or_else(|| format!("case-{}", index + 1));
-                Ok(ReportEntry { name, summary })
+                let quality_failures = report_quality_failures(report);
+                Ok(ReportEntry {
+                    name,
+                    summary,
+                    quality_failures,
+                })
             })
             .collect();
     }
@@ -1050,7 +1178,51 @@ fn report_entries(value: &serde_json::Value) -> Result<Vec<ReportEntry>> {
         .and_then(|value| value.as_str())
         .unwrap_or("benchmark")
         .to_string();
-    Ok(vec![ReportEntry { name, summary }])
+    let quality_failures = report_quality_failures(value);
+    Ok(vec![ReportEntry {
+        name,
+        summary,
+        quality_failures,
+    }])
+}
+
+fn report_quality_failures(report: &serde_json::Value) -> Vec<ReportQualityFailure> {
+    let Some(samples) = report.get("samples").and_then(|value| value.as_array()) else {
+        return Vec::new();
+    };
+
+    samples
+        .iter()
+        .flat_map(|sample| {
+            let sample_index = sample
+                .get("index")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok());
+            sample
+                .get("quality_gates")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+                .filter(|gate| {
+                    gate.get("status")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|status| status == "fail")
+                })
+                .map(move |gate| ReportQualityFailure {
+                    sample_index,
+                    gate: gate
+                        .get("name")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown_quality_gate")
+                        .to_string(),
+                    message: gate
+                        .get("message")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("Quality gate failed.")
+                        .to_string(),
+                })
+        })
+        .collect()
 }
 
 fn collect_metric_comparisons(
@@ -1260,6 +1432,7 @@ async fn bench_manifest(
             }
         };
 
+        validate_benchmark_quality(&report, options)?;
         reports.push(BenchmarkSuiteCaseReport {
             name: case.name.clone(),
             report,
@@ -1535,6 +1708,35 @@ async fn bench_chat(
         );
     }
     let ended_at = Utc::now();
+    let benchmark_samples: Vec<_> = samples
+        .iter()
+        .enumerate()
+        .map(|(index, sample)| BenchmarkSample {
+            index: index + 1,
+            latency_ms: Some(sample.total_ms),
+            ttft_ms: Some(sample.ttft_ms),
+            end_to_end_ms: Some(sample.total_ms),
+            completion_tps: Some(if sample.total_ms > 0.0 {
+                sample.completion_tokens as f64 * 1000.0 / sample.total_ms
+            } else {
+                0.0
+            }),
+            tokens_per_second: None,
+            prompt_tokens: Some(sample.prompt_tokens),
+            completion_tokens: Some(sample.completion_tokens),
+            server_generation_ms: sample.generation_time_ms,
+            server_processing_ms: None,
+            audio_duration_secs: None,
+            rtf: None,
+            tokens_generated: None,
+            tts_diagnostics: None,
+            asr_execution: None,
+            asr_text: None,
+            asr_diagnostics: None,
+            quality_gates: chat_quality_gates(sample),
+        })
+        .collect();
+    let quality_gates = benchmark_quality_summary(&benchmark_samples);
     Ok(BenchmarkReport {
         schema_version: 1,
         command: "chat",
@@ -1575,34 +1777,9 @@ async fn bench_chat(
             successful: Some(iterations as u64),
             failed: Some(0),
             total: Some(iterations as u64),
+            quality_gates,
         },
-        samples: samples
-            .iter()
-            .enumerate()
-            .map(|(index, sample)| BenchmarkSample {
-                index: index + 1,
-                latency_ms: Some(sample.total_ms),
-                ttft_ms: Some(sample.ttft_ms),
-                end_to_end_ms: Some(sample.total_ms),
-                completion_tps: Some(if sample.total_ms > 0.0 {
-                    sample.completion_tokens as f64 * 1000.0 / sample.total_ms
-                } else {
-                    0.0
-                }),
-                tokens_per_second: None,
-                prompt_tokens: Some(sample.prompt_tokens),
-                completion_tokens: Some(sample.completion_tokens),
-                server_generation_ms: sample.generation_time_ms,
-                server_processing_ms: None,
-                audio_duration_secs: None,
-                rtf: None,
-                tokens_generated: None,
-                tts_diagnostics: None,
-                asr_execution: None,
-                asr_text: None,
-                asr_diagnostics: None,
-            })
-            .collect(),
+        samples: benchmark_samples,
         telemetry: RuntimeTelemetryReport {
             delta_available: metrics_before.is_some() && metrics_after.is_some(),
             before: metrics_before,
@@ -1790,6 +1967,34 @@ async fn bench_tts(
         );
     }
     let ended_at = Utc::now();
+    let benchmark_samples: Vec<_> = samples
+        .iter()
+        .enumerate()
+        .map(|(index, sample)| BenchmarkSample {
+            index: index + 1,
+            latency_ms: Some(sample.total_ms),
+            ttft_ms: None,
+            end_to_end_ms: Some(sample.total_ms),
+            completion_tps: None,
+            tokens_per_second: match (sample.tokens_generated, sample.generation_time_ms) {
+                (Some(tokens), Some(ms)) if ms > 0.0 => Some(tokens as f64 * 1000.0 / ms),
+                _ => None,
+            },
+            prompt_tokens: None,
+            completion_tokens: None,
+            server_generation_ms: sample.generation_time_ms,
+            server_processing_ms: None,
+            audio_duration_secs: sample.audio_duration_secs,
+            rtf: sample.rtf,
+            tokens_generated: sample.tokens_generated,
+            tts_diagnostics: sample.diagnostics.clone(),
+            asr_execution: None,
+            asr_text: None,
+            asr_diagnostics: None,
+            quality_gates: tts_quality_gates(sample, text.as_str()),
+        })
+        .collect();
+    let quality_gates = benchmark_quality_summary(&benchmark_samples);
     Ok(BenchmarkReport {
         schema_version: 1,
         command: "tts",
@@ -1830,33 +2035,9 @@ async fn bench_tts(
             successful: Some(iterations as u64),
             failed: Some(0),
             total: Some(iterations as u64),
+            quality_gates,
         },
-        samples: samples
-            .iter()
-            .enumerate()
-            .map(|(index, sample)| BenchmarkSample {
-                index: index + 1,
-                latency_ms: Some(sample.total_ms),
-                ttft_ms: None,
-                end_to_end_ms: Some(sample.total_ms),
-                completion_tps: None,
-                tokens_per_second: match (sample.tokens_generated, sample.generation_time_ms) {
-                    (Some(tokens), Some(ms)) if ms > 0.0 => Some(tokens as f64 * 1000.0 / ms),
-                    _ => None,
-                },
-                prompt_tokens: None,
-                completion_tokens: None,
-                server_generation_ms: sample.generation_time_ms,
-                server_processing_ms: None,
-                audio_duration_secs: sample.audio_duration_secs,
-                rtf: sample.rtf,
-                tokens_generated: sample.tokens_generated,
-                tts_diagnostics: sample.diagnostics.clone(),
-                asr_execution: None,
-                asr_text: None,
-                asr_diagnostics: None,
-            })
-            .collect(),
+        samples: benchmark_samples,
         telemetry: RuntimeTelemetryReport {
             delta_available: metrics_before.is_some() && metrics_after.is_some(),
             before: metrics_before,
@@ -2060,6 +2241,35 @@ async fn bench_asr(
         );
     }
     let ended_at = Utc::now();
+    let benchmark_samples: Vec<_> = samples
+        .iter()
+        .enumerate()
+        .map(|(index, sample)| BenchmarkSample {
+            index: index + 1,
+            latency_ms: Some(sample.total_ms),
+            ttft_ms: None,
+            end_to_end_ms: Some(sample.total_ms),
+            completion_tps: None,
+            tokens_per_second: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            server_generation_ms: None,
+            server_processing_ms: sample.response.processing_time_ms,
+            audio_duration_secs: sample.response.duration,
+            rtf: sample.response.rtf,
+            tokens_generated: None,
+            tts_diagnostics: None,
+            asr_execution: sample
+                .response
+                .izwi_asr_diagnostics
+                .as_ref()
+                .and_then(asr_execution_from_diagnostics),
+            asr_text: sample.response.text.clone(),
+            asr_diagnostics: sample.response.izwi_asr_diagnostics.clone(),
+            quality_gates: asr_quality_gates(&sample.response),
+        })
+        .collect();
+    let quality_gates = benchmark_quality_summary(&benchmark_samples);
     Ok(BenchmarkReport {
         schema_version: 1,
         command: "asr",
@@ -2100,34 +2310,9 @@ async fn bench_asr(
             successful: Some(iterations as u64),
             failed: Some(0),
             total: Some(iterations as u64),
+            quality_gates,
         },
-        samples: samples
-            .iter()
-            .enumerate()
-            .map(|(index, sample)| BenchmarkSample {
-                index: index + 1,
-                latency_ms: Some(sample.total_ms),
-                ttft_ms: None,
-                end_to_end_ms: Some(sample.total_ms),
-                completion_tps: None,
-                tokens_per_second: None,
-                prompt_tokens: None,
-                completion_tokens: None,
-                server_generation_ms: None,
-                server_processing_ms: sample.response.processing_time_ms,
-                audio_duration_secs: sample.response.duration,
-                rtf: sample.response.rtf,
-                tokens_generated: None,
-                tts_diagnostics: None,
-                asr_execution: sample
-                    .response
-                    .izwi_asr_diagnostics
-                    .as_ref()
-                    .and_then(asr_execution_from_diagnostics),
-                asr_text: sample.response.text.clone(),
-                asr_diagnostics: sample.response.izwi_asr_diagnostics.clone(),
-            })
-            .collect(),
+        samples: benchmark_samples,
         telemetry: RuntimeTelemetryReport {
             delta_available: metrics_before.is_some() && metrics_after.is_some(),
             before: metrics_before,
@@ -2247,6 +2432,7 @@ async fn bench_throughput(
             successful: Some(success),
             failed: Some(failed),
             total: Some(total),
+            quality_gates: BenchmarkQualityGateSummary::default(),
         },
         samples: Vec::new(),
         telemetry: RuntimeTelemetryReport {
@@ -2592,6 +2778,7 @@ fn handle_chat_stream_event(
                 prompt_tokens: *prompt_tokens,
                 completion_tokens: *completion_tokens,
                 generation_time_ms: *generation_time_ms,
+                saw_text_delta: first_delta_at.is_some(),
             }));
         }
     }
@@ -2643,6 +2830,363 @@ fn progress_bar(visible: bool, len: u64) -> ProgressBar {
     }
 }
 
+fn finish_report(options: &BenchOptions, report: &BenchmarkReport) -> Result<()> {
+    validate_benchmark_quality(report, options)?;
+    emit_report(options, report)
+}
+
+fn validate_benchmark_quality(report: &BenchmarkReport, options: &BenchOptions) -> Result<()> {
+    let failed = report.summary.quality_gates.failed;
+    let warnings = report.summary.quality_gates.warnings;
+    if options.human_output() && (failed > 0 || warnings > 0) {
+        println!(
+            "\nQuality gates: {} passed, {} warning(s), {} failed",
+            report.summary.quality_gates.passed, warnings, failed
+        );
+    }
+    if failed > 0 && options.quality_mode == BenchmarkQualityMode::Strict {
+        return Err(CliError::Other(format!(
+            "Benchmark quality gates failed for {}: {failed} failure(s). Set IZWI_BENCH_QUALITY_MODE=warn for exploratory runs.",
+            report.command
+        )));
+    }
+    Ok(())
+}
+
+fn benchmark_quality_summary(samples: &[BenchmarkSample]) -> BenchmarkQualityGateSummary {
+    let mut summary = BenchmarkQualityGateSummary::default();
+    for gate in samples
+        .iter()
+        .flat_map(|sample| sample.quality_gates.iter())
+    {
+        summary.total += 1;
+        match gate.status {
+            BenchmarkQualityGateStatus::Pass => summary.passed += 1,
+            BenchmarkQualityGateStatus::Warn => summary.warnings += 1,
+            BenchmarkQualityGateStatus::Fail => summary.failed += 1,
+        }
+    }
+    summary
+}
+
+fn quality_pass(name: &str, message: impl Into<String>) -> BenchmarkQualityGate {
+    BenchmarkQualityGate {
+        name: name.to_string(),
+        status: BenchmarkQualityGateStatus::Pass,
+        severity: BenchmarkQualityGateSeverity::Info,
+        message: message.into(),
+    }
+}
+
+fn quality_warn(name: &str, message: impl Into<String>) -> BenchmarkQualityGate {
+    BenchmarkQualityGate {
+        name: name.to_string(),
+        status: BenchmarkQualityGateStatus::Warn,
+        severity: BenchmarkQualityGateSeverity::Warning,
+        message: message.into(),
+    }
+}
+
+fn quality_fail(name: &str, message: impl Into<String>) -> BenchmarkQualityGate {
+    BenchmarkQualityGate {
+        name: name.to_string(),
+        status: BenchmarkQualityGateStatus::Fail,
+        severity: BenchmarkQualityGateSeverity::Error,
+        message: message.into(),
+    }
+}
+
+fn chat_quality_gates(sample: &ChatBenchSample) -> Vec<BenchmarkQualityGate> {
+    let mut gates = Vec::new();
+    if sample.completion_tokens == 0 {
+        gates.push(quality_fail(
+            "chat_completion_tokens_non_empty",
+            "Chat completion produced zero completion tokens.",
+        ));
+    } else {
+        gates.push(quality_pass(
+            "chat_completion_tokens_non_empty",
+            format!(
+                "Chat completion produced {} token(s).",
+                sample.completion_tokens
+            ),
+        ));
+    }
+
+    if sample.saw_text_delta {
+        gates.push(quality_pass(
+            "chat_stream_text_delta_seen",
+            "Chat stream emitted at least one non-empty text delta.",
+        ));
+    } else {
+        gates.push(quality_fail(
+            "chat_stream_text_delta_seen",
+            "Chat stream completed without a non-empty text delta.",
+        ));
+    }
+    gates
+}
+
+fn tts_quality_gates(sample: &TtsBenchSample, text: &str) -> Vec<BenchmarkQualityGate> {
+    let mut gates = Vec::new();
+    let text_chars = text.trim().chars().count();
+
+    match sample.audio_duration_secs {
+        Some(duration) if duration > 0.05 => gates.push(quality_pass(
+            "tts_audio_duration_non_empty",
+            format!("Generated audio duration was {duration:.3}s."),
+        )),
+        Some(duration) => gates.push(quality_fail(
+            "tts_audio_duration_non_empty",
+            format!("Generated audio duration was too short ({duration:.3}s)."),
+        )),
+        None => gates.push(quality_fail(
+            "tts_audio_duration_non_empty",
+            "TTS response did not report generated audio duration.",
+        )),
+    }
+
+    if let Some(duration) = sample.audio_duration_secs {
+        let expected_min = (text_chars as f64 * 0.015).clamp(0.15, 1.5);
+        if text_chars > 0 && duration < expected_min {
+            gates.push(quality_warn(
+                "tts_audio_duration_plausible_for_text",
+                format!(
+                    "Generated audio duration {duration:.3}s is short for {text_chars} input character(s)."
+                ),
+            ));
+        } else {
+            gates.push(quality_pass(
+                "tts_audio_duration_plausible_for_text",
+                "Generated audio duration is plausible for the input length.",
+            ));
+        }
+    }
+
+    match sample.tokens_generated {
+        Some(tokens) if tokens > 0 => gates.push(quality_pass(
+            "tts_tokens_generated_non_empty",
+            format!("TTS reported {tokens} generated token(s)."),
+        )),
+        Some(_) => gates.push(quality_fail(
+            "tts_tokens_generated_non_empty",
+            "TTS reported zero generated tokens.",
+        )),
+        None => gates.push(quality_warn(
+            "tts_tokens_generated_non_empty",
+            "TTS response did not report generated token count.",
+        )),
+    }
+
+    let peak = diagnostic_first_f64(
+        sample.diagnostics.as_ref(),
+        &[
+            &["audio", "peak_amplitude"],
+            &["audio", "peak"],
+            &["peak_amplitude"],
+            &["peak"],
+        ],
+    );
+    match peak {
+        Some(value) if value >= 0.999 => gates.push(quality_fail(
+            "tts_audio_not_clipped",
+            format!("Generated audio peak amplitude was clipped or near clipped ({value:.4})."),
+        )),
+        Some(value) => gates.push(quality_pass(
+            "tts_audio_not_clipped",
+            format!("Generated audio peak amplitude was {value:.4}."),
+        )),
+        None => gates.push(quality_warn(
+            "tts_audio_not_clipped",
+            "TTS diagnostics did not include audio peak amplitude.",
+        )),
+    }
+
+    let rms = diagnostic_first_f64(
+        sample.diagnostics.as_ref(),
+        &[
+            &["audio", "rms_amplitude"],
+            &["audio", "rms"],
+            &["rms_amplitude"],
+            &["rms"],
+        ],
+    );
+    match rms {
+        Some(value) if value <= 0.0001 => gates.push(quality_fail(
+            "tts_audio_not_silent",
+            format!("Generated audio RMS amplitude was near silent ({value:.6})."),
+        )),
+        Some(value) => gates.push(quality_pass(
+            "tts_audio_not_silent",
+            format!("Generated audio RMS amplitude was {value:.6}."),
+        )),
+        None => gates.push(quality_warn(
+            "tts_audio_not_silent",
+            "TTS diagnostics did not include audio RMS amplitude.",
+        )),
+    }
+
+    if diagnostic_first_string(
+        sample.diagnostics.as_ref(),
+        &[
+            &["stop_reason"],
+            &["finish_reason"],
+            &["generation", "stop_reason"],
+        ],
+    )
+    .is_some()
+    {
+        gates.push(quality_pass(
+            "tts_stop_reason_present",
+            "TTS diagnostics included a stop reason.",
+        ));
+    } else {
+        gates.push(quality_warn(
+            "tts_stop_reason_present",
+            "TTS diagnostics did not include a stop reason.",
+        ));
+    }
+
+    gates
+}
+
+fn asr_quality_gates(sample: &AsrBenchResponse) -> Vec<BenchmarkQualityGate> {
+    let mut gates = Vec::new();
+    let text = sample.text.as_deref().unwrap_or_default().trim();
+
+    if text.is_empty() {
+        gates.push(quality_fail(
+            "asr_text_non_empty",
+            "ASR response produced an empty transcript.",
+        ));
+    } else {
+        gates.push(quality_pass(
+            "asr_text_non_empty",
+            format!(
+                "ASR response produced {} transcript character(s).",
+                text.chars().count()
+            ),
+        ));
+    }
+
+    if has_repeated_text_pattern(text) {
+        gates.push(quality_fail(
+            "asr_text_not_repeated",
+            "ASR transcript contains an obvious repeated-token pattern.",
+        ));
+    } else {
+        gates.push(quality_pass(
+            "asr_text_not_repeated",
+            "ASR transcript did not contain an obvious repeated-token pattern.",
+        ));
+    }
+
+    match sample.duration {
+        Some(duration) if duration > 0.0 => gates.push(quality_pass(
+            "asr_audio_duration_present",
+            format!("ASR response reported {duration:.3}s of source audio."),
+        )),
+        Some(_) => gates.push(quality_fail(
+            "asr_audio_duration_present",
+            "ASR response reported zero source audio duration.",
+        )),
+        None => gates.push(quality_warn(
+            "asr_audio_duration_present",
+            "ASR response did not report source audio duration.",
+        )),
+    }
+
+    if sample.processing_time_ms.is_some() {
+        gates.push(quality_pass(
+            "asr_processing_time_present",
+            "ASR response reported server processing time.",
+        ));
+    } else {
+        gates.push(quality_warn(
+            "asr_processing_time_present",
+            "ASR response did not report server processing time.",
+        ));
+    }
+
+    gates
+}
+
+fn has_repeated_text_pattern(text: &str) -> bool {
+    let tokens: Vec<String> = text
+        .split_whitespace()
+        .map(|token| {
+            token
+                .trim_matches(|ch: char| !ch.is_alphanumeric())
+                .to_ascii_lowercase()
+        })
+        .filter(|token| !token.is_empty())
+        .collect();
+    if tokens.len() < 8 {
+        return false;
+    }
+
+    let mut run = 1usize;
+    for pair in tokens.windows(2) {
+        if pair[0] == pair[1] {
+            run += 1;
+            if run >= 5 {
+                return true;
+            }
+        } else {
+            run = 1;
+        }
+    }
+
+    for phrase_len in 2..=4 {
+        if tokens.len() < phrase_len * 4 {
+            continue;
+        }
+        for start in 0..=tokens.len() - phrase_len * 4 {
+            let phrase = &tokens[start..start + phrase_len];
+            let repeated = (1..4).all(|offset| {
+                let next_start = start + offset * phrase_len;
+                phrase == &tokens[next_start..next_start + phrase_len]
+            });
+            if repeated {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn diagnostic_first_f64(diagnostics: Option<&serde_json::Value>, paths: &[&[&str]]) -> Option<f64> {
+    paths
+        .iter()
+        .find_map(|path| diagnostic_path(diagnostics?, path).and_then(json_value_as_f64))
+}
+
+fn diagnostic_first_string(
+    diagnostics: Option<&serde_json::Value>,
+    paths: &[&[&str]],
+) -> Option<String> {
+    paths.iter().find_map(|path| {
+        diagnostic_path(diagnostics?, path)
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    })
+}
+
+fn diagnostic_path<'a>(
+    value: &'a serde_json::Value,
+    path: &[&str],
+) -> Option<&'a serde_json::Value> {
+    path.iter()
+        .try_fold(value, |current, key| current.get(*key))
+}
+
+fn json_value_as_f64(value: &serde_json::Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|value| value.parse::<f64>().ok()))
+}
+
 fn emit_report(options: &BenchOptions, report: &BenchmarkReport) -> Result<()> {
     if matches!(options.output_format, OutputFormat::Json) {
         let payload = serde_json::to_string_pretty(&report)
@@ -2678,6 +3222,19 @@ fn emit_compare_report(options: &BenchOptions, report: &BenchmarkCompareReport) 
     println!("  Current:   {}", report.current);
     println!("  Baseline:  {}", report.baseline);
     println!("  Tolerance: {:.2}%", report.tolerance_percent);
+    if !report.quality_failures.is_empty() {
+        println!("  Quality failures:");
+        for failure in &report.quality_failures {
+            let sample = failure
+                .sample_index
+                .map(|index| format!(" sample={index}"))
+                .unwrap_or_default();
+            println!(
+                "    [{}] {}{} {}: {}",
+                failure.report, failure.case, sample, failure.gate, failure.message
+            );
+        }
+    }
     for check in &report.checks {
         let marker = if check.status == "regression" {
             console::style("REGRESSION").red().to_string()
@@ -4716,12 +5273,82 @@ mod tests {
             asr_execution: None,
             asr_text: Some("hello granite".to_string()),
             asr_diagnostics: Some(diagnostics.clone()),
+            quality_gates: vec![quality_pass(
+                "asr_text_non_empty",
+                "ASR response produced transcript text.",
+            )],
         };
 
         let serialized = serde_json::to_value(sample).expect("sample should serialize");
 
         assert_eq!(serialized["asr_text"], "hello granite");
         assert_eq!(serialized["asr_diagnostics"], diagnostics);
+        assert_eq!(serialized["quality_gates"][0]["status"], "pass");
+    }
+
+    #[test]
+    fn tts_quality_gates_flag_empty_clipped_and_silent_audio() {
+        let sample = TtsBenchSample {
+            total_ms: 100.0,
+            generation_time_ms: Some(90.0),
+            audio_duration_secs: Some(0.0),
+            rtf: None,
+            tokens_generated: Some(0),
+            diagnostics: Some(serde_json::json!({
+                "audio": {
+                    "peak_amplitude": 1.0,
+                    "rms_amplitude": 0.0
+                },
+                "stop_reason": "max_tokens"
+            })),
+        };
+
+        let gates = tts_quality_gates(&sample, "hello world");
+
+        assert!(gates.iter().any(|gate| {
+            gate.name == "tts_audio_duration_non_empty"
+                && gate.status == BenchmarkQualityGateStatus::Fail
+        }));
+        assert!(gates.iter().any(|gate| {
+            gate.name == "tts_tokens_generated_non_empty"
+                && gate.status == BenchmarkQualityGateStatus::Fail
+        }));
+        assert!(gates.iter().any(|gate| {
+            gate.name == "tts_audio_not_clipped" && gate.status == BenchmarkQualityGateStatus::Fail
+        }));
+        assert!(gates.iter().any(|gate| {
+            gate.name == "tts_audio_not_silent" && gate.status == BenchmarkQualityGateStatus::Fail
+        }));
+    }
+
+    #[test]
+    fn asr_quality_gates_flag_empty_and_repeated_text() {
+        let empty = AsrBenchResponse {
+            text: Some(" ".to_string()),
+            duration: Some(0.0),
+            processing_time_ms: Some(12.0),
+            ..AsrBenchResponse::default()
+        };
+        let repeated = AsrBenchResponse {
+            text: Some("hello world hello world hello world hello world".to_string()),
+            duration: Some(2.0),
+            processing_time_ms: Some(12.0),
+            ..AsrBenchResponse::default()
+        };
+
+        let empty_gates = asr_quality_gates(&empty);
+        let repeated_gates = asr_quality_gates(&repeated);
+
+        assert!(empty_gates.iter().any(|gate| {
+            gate.name == "asr_text_non_empty" && gate.status == BenchmarkQualityGateStatus::Fail
+        }));
+        assert!(empty_gates.iter().any(|gate| {
+            gate.name == "asr_audio_duration_present"
+                && gate.status == BenchmarkQualityGateStatus::Fail
+        }));
+        assert!(repeated_gates.iter().any(|gate| {
+            gate.name == "asr_text_not_repeated" && gate.status == BenchmarkQualityGateStatus::Fail
+        }));
     }
 
     #[tokio::test]
@@ -4913,10 +5540,81 @@ mod tests {
             &BenchOptions {
                 output_format: OutputFormat::Json,
                 quiet: true,
+                quality_mode: BenchmarkQualityMode::Strict,
             },
         )
         .await
         .expect("reordered same-name suite cases should compare successfully");
+    }
+
+    #[tokio::test]
+    async fn bench_compare_fails_on_quality_gate_before_latency_comparison() {
+        let dir = tempdir().expect("temp dir should be created");
+        let baseline = dir.path().join("baseline.json");
+        let current = dir.path().join("current.json");
+        let baseline_report = serde_json::json!({
+            "command": "tts",
+            "summary": {
+                "latency_ms": { "p95": 100.0 }
+            },
+            "samples": [
+                {
+                    "index": 1,
+                    "quality_gates": [
+                        {
+                            "name": "tts_audio_duration_non_empty",
+                            "status": "pass",
+                            "severity": "info",
+                            "message": "Generated audio duration was 1.0s."
+                        }
+                    ]
+                }
+            ]
+        });
+        let current_report = serde_json::json!({
+            "command": "tts",
+            "summary": {
+                "latency_ms": { "p95": 80.0 }
+            },
+            "samples": [
+                {
+                    "index": 1,
+                    "quality_gates": [
+                        {
+                            "name": "tts_audio_duration_non_empty",
+                            "status": "fail",
+                            "severity": "error",
+                            "message": "Generated audio duration was too short."
+                        }
+                    ]
+                }
+            ]
+        });
+        std::fs::write(
+            &baseline,
+            serde_json::to_vec(&baseline_report).expect("baseline should serialize"),
+        )
+        .expect("baseline should be written");
+        std::fs::write(
+            &current,
+            serde_json::to_vec(&current_report).expect("current should serialize"),
+        )
+        .expect("current should be written");
+
+        let err = bench_compare(
+            &current,
+            &baseline,
+            5.0,
+            &BenchOptions {
+                output_format: OutputFormat::Json,
+                quiet: true,
+                quality_mode: BenchmarkQualityMode::Strict,
+            },
+        )
+        .await
+        .expect_err("quality failure should stop comparison before metrics");
+
+        assert!(format!("{err}").contains("quality gate failure"));
     }
 
     #[test]
