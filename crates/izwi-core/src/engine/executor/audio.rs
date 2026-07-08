@@ -1519,7 +1519,7 @@ mod tests {
             end_sample: samples.len(),
         }];
         let long_delta = "word ".repeat(1024);
-        let (tx, mut rx) = mpsc::channel(2);
+        let (tx, mut rx) = mpsc::channel(6);
         let mut sequence = 0usize;
 
         let merged = NativeExecutor::transcribe_with_chunk_plan(
@@ -1536,14 +1536,38 @@ mod tests {
         .expect("large chunk delta should fit as one streaming event");
 
         assert_eq!(merged, long_delta.trim());
-        assert_eq!(sequence, 2);
+        assert_eq!(sequence, 6);
 
-        let text_event = rx.try_recv().expect("text delta event");
-        assert_eq!(text_event.sequence, 0);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        assert_eq!(events.len(), 6);
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.asr_progress.as_ref().map(|progress| progress.phase))
+                .collect::<Vec<_>>(),
+            vec![
+                AsrProgressPhase::Processing,
+                AsrProgressPhase::ChunkStarted,
+                AsrProgressPhase::ChunkFinished,
+                AsrProgressPhase::Complete,
+            ]
+        );
+
+        let text_events = events
+            .iter()
+            .filter(|event| event.text.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(text_events.len(), 1);
+        let text_event = text_events[0];
+        assert_eq!(text_event.sequence, 3);
         assert_eq!(text_event.text.as_deref(), Some(long_delta.trim()));
 
-        let final_event = rx.try_recv().expect("final marker");
-        assert_eq!(final_event.sequence, 1);
+        let final_event = events.iter().find(|event| event.is_final).expect("final marker");
+        assert_eq!(final_event.sequence, 5);
         assert!(final_event.is_final);
     }
 }
