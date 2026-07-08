@@ -4,21 +4,27 @@ use std::time::Instant;
 
 use anyhow::Context;
 use axum::{
-    Json, RequestExt,
     extract::{Extension, Multipart, Path, Request, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{header, HeaderValue, StatusCode},
     response::{
-        IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
     },
+    Json, RequestExt,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use crate::api::audio_payload::{
+    decode_base64_audio_payload, inspect_audio_payload_bytes,
+    inspect_audio_payload_with_diagnostics, read_multipart_audio_base64_payload,
+    read_multipart_audio_file_payload,
+};
+use crate::api::request_context::RequestContext;
 use crate::batch_runtime::{
     store::{
-        BatchRuntimeStore, NewIdempotencyRecord, NewJobStage, NewMediaAsset, NewRuntimeArtifact,
-        NewRuntimeJob, NewTextAsset, sha256_hex,
+        sha256_hex, BatchRuntimeStore, NewIdempotencyRecord, NewJobStage, NewMediaAsset,
+        NewRuntimeArtifact, NewRuntimeJob, NewTextAsset,
     },
     types::{
         ClaimedStage, RuntimeArtifactKind, RuntimeArtifactRole, RuntimeJobKind, RuntimeJobStatus,
@@ -26,12 +32,6 @@ use crate::batch_runtime::{
     },
     worker::{StageExecutionOutcome, StageExecutor},
 };
-use crate::api::audio_payload::{
-    decode_base64_audio_payload, inspect_audio_payload_with_diagnostics,
-    inspect_audio_payload_bytes, read_multipart_audio_base64_payload,
-    read_multipart_audio_file_payload,
-};
-use crate::api::request_context::RequestContext;
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::transcription_store::{
@@ -40,12 +40,12 @@ use crate::transcription_store::{
     TranscriptionRecordMode, TranscriptionSegmentRecord, TranscriptionStore,
     TranscriptionSummaryStatus, TranscriptionWordRecord, UpdateTranscriptionSummary,
 };
+use async_trait::async_trait;
 use izwi_core::runtime::SpeakerAttributedAsrStatus as RuntimeSpeakerAttributedAsrStatus;
 use izwi_core::{
-    AsrProgress, AsrProgressPhase, ChatMessage, ChatRequestConfig, ChatRole, GenerationParams,
-    ModelVariant, RuntimeService, parse_chat_model_variant, parse_model_variant,
+    parse_chat_model_variant, parse_model_variant, AsrProgress, AsrProgressPhase, ChatMessage,
+    ChatRequestConfig, ChatRole, GenerationParams, ModelVariant, RuntimeService,
 };
-use async_trait::async_trait;
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
 use crate::api::speech_text_upload::{multipart_upload_error, resolve_source_audio_mime_type};
@@ -436,8 +436,8 @@ async fn enqueue_batch_transcription_job(
         .ok_or_else(|| ApiError::not_found("Transcription audio payload not found"))?;
     let inspection = inspect_audio_payload_bytes(audio.audio_bytes.as_slice())?;
     let request_snapshot = BatchTranscriptionRequest::from_parsed(parsed);
-    let request_json =
-        serde_json::to_value(&request_snapshot).map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let request_json = serde_json::to_value(&request_snapshot)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
     let request_hash = sha256_hex(
         serde_json::to_string(&request_json)
             .unwrap_or_default()
@@ -537,7 +537,9 @@ async fn enqueue_batch_transcription_job(
                 idempotency_key,
                 expires_at: None,
                 request_hash,
-                response_json: Some(serde_json::json!({"record_id": placeholder.id, "job_id": job.id})),
+                response_json: Some(
+                    serde_json::json!({"record_id": placeholder.id, "job_id": job.id}),
+                ),
                 runtime_job_id: Some(job.id),
                 conflict_message: None,
                 metadata_json: serde_json::json!({}),
@@ -978,7 +980,7 @@ where
     let progress_callback = std::sync::Arc::new(std::sync::Mutex::new(on_progress));
     let runtime_progress_callback = progress_callback.clone();
     let output = runtime
-        .asr_transcribe_streaming_bytes_with_progress_and_correlation(
+        .asr_transcribe_bytes_with_progress_and_correlation(
             audio_bytes,
             model_id,
             requested_language,
@@ -1758,18 +1760,18 @@ fn map_store_error(err: anyhow::Error) -> ApiError {
 mod tests {
     use axum::{
         body::Body,
-        http::{StatusCode, header},
+        http::{header, StatusCode},
     };
     use base64::Engine as _;
     use izwi_core::audio::{AudioEncoder, AudioFormat};
     use izwi_core::{AsrProgress, AsrProgressPhase};
 
     use super::{
-        TranscriptionSummaryStatus, TranscriptionWordRecord, alignments_to_word_records,
-        build_segment_records, initial_summary_state, multipart_field_api_error, parse_bool,
-        parse_create_request, progress_event_payload, sanitize_summary_output,
-        should_retry_transcription_summary_generation, transcription_summary_messages,
-        transcription_summary_params, validate_batch_transcription_model,
+        alignments_to_word_records, build_segment_records, initial_summary_state,
+        multipart_field_api_error, parse_bool, parse_create_request, progress_event_payload,
+        sanitize_summary_output, should_retry_transcription_summary_generation,
+        transcription_summary_messages, transcription_summary_params,
+        validate_batch_transcription_model, TranscriptionSummaryStatus, TranscriptionWordRecord,
     };
 
     fn wav_bytes() -> Vec<u8> {
