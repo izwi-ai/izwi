@@ -527,6 +527,8 @@ async fn enqueue_batch_transcription_job(
         .await
         .map_err(map_store_error)?;
 
+    state.runtime.record_batch_asr_pipeline_job();
+
     if let Some(idempotency_key) = idempotency_key {
         state
             .batch_runtime_store

@@ -585,6 +585,8 @@ async fn enqueue_batch_speech_job(
         .await
         .map_err(map_store_error)?;
 
+    state.runtime.record_batch_tts_pipeline_job();
+
     if let Some(idempotency_key) = idempotency_key {
         state
             .batch_runtime_store

@@ -8,11 +8,16 @@ pub(crate) enum PipelineKind {
     ModularVoiceTurn,
     UnifiedVoiceTurn,
     DiarizationTranscript,
+    BatchAsrTranscription,
+    BatchTtsSpeech,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PipelineStageKind {
+    RegisterMedia,
+    RegisterText,
     DecodeAudio,
+    NormalizeText,
     Vad,
     Endpointing,
     Asr,
@@ -23,6 +28,14 @@ pub(crate) enum PipelineStageKind {
     ForcedAlignment,
     SpeakerAttribution,
     LlmRefinement,
+    PersistArtifact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PipelineStageExecutionMode {
+    Inline,
+    DurableStage,
+    ContractOnly,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +43,7 @@ pub(crate) struct PipelineStage {
     pub(crate) kind: PipelineStageKind,
     pub(crate) name: &'static str,
     pub(crate) required: bool,
+    pub(crate) execution_mode: PipelineStageExecutionMode,
 }
 
 impl PipelineStage {
@@ -38,6 +52,7 @@ impl PipelineStage {
             kind,
             name,
             required: true,
+            execution_mode: PipelineStageExecutionMode::ContractOnly,
         }
     }
 
@@ -46,6 +61,25 @@ impl PipelineStage {
             kind,
             name,
             required: false,
+            execution_mode: PipelineStageExecutionMode::ContractOnly,
+        }
+    }
+
+    const fn inline(kind: PipelineStageKind, name: &'static str) -> Self {
+        Self {
+            kind,
+            name,
+            required: true,
+            execution_mode: PipelineStageExecutionMode::Inline,
+        }
+    }
+
+    const fn durable(kind: PipelineStageKind, name: &'static str) -> Self {
+        Self {
+            kind,
+            name,
+            required: true,
+            execution_mode: PipelineStageExecutionMode::DurableStage,
         }
     }
 }
@@ -66,6 +100,7 @@ pub(crate) struct PipelineStageExecution {
     pub(crate) kind: PipelineStageKind,
     pub(crate) name: &'static str,
     pub(crate) required: bool,
+    pub(crate) execution_mode: PipelineStageExecutionMode,
     pub(crate) status: PipelineStageStatus,
 }
 
@@ -97,6 +132,7 @@ impl PipelineExecutor {
                 kind: stage.kind,
                 name: stage.name,
                 required: stage.required,
+                execution_mode: stage.execution_mode,
                 status: PipelineStageStatus::Recorded,
             })
             .collect();
@@ -158,8 +194,44 @@ impl PipelineGraph {
         }
     }
 
+    pub(crate) fn batch_asr_transcription() -> Self {
+        Self {
+            kind: PipelineKind::BatchAsrTranscription,
+            stages: vec![
+                PipelineStage::inline(PipelineStageKind::RegisterMedia, "batch.asr.register_media"),
+                PipelineStage::inline(PipelineStageKind::DecodeAudio, "batch.asr.decode_audio"),
+                PipelineStage::durable(PipelineStageKind::Asr, "asr_transcribe"),
+                PipelineStage::inline(
+                    PipelineStageKind::PersistArtifact,
+                    "batch.asr.persist_transcript",
+                ),
+            ],
+        }
+    }
+
+    pub(crate) fn batch_tts_speech() -> Self {
+        Self {
+            kind: PipelineKind::BatchTtsSpeech,
+            stages: vec![
+                PipelineStage::inline(PipelineStageKind::RegisterText, "batch.tts.register_text"),
+                PipelineStage::inline(PipelineStageKind::NormalizeText, "batch.tts.normalize_text"),
+                PipelineStage::durable(PipelineStageKind::Tts, "tts_synthesize"),
+                PipelineStage::inline(
+                    PipelineStageKind::PersistArtifact,
+                    "batch.tts.persist_audio",
+                ),
+            ],
+        }
+    }
+
     pub(crate) fn stages(&self) -> &[PipelineStage] {
         &self.stages
+    }
+
+    pub(crate) fn durable_stages(&self) -> impl Iterator<Item = &PipelineStage> {
+        self.stages
+            .iter()
+            .filter(|stage| stage.execution_mode == PipelineStageExecutionMode::DurableStage)
     }
 }
 
@@ -253,5 +325,71 @@ mod tests {
             .stages()
             .iter()
             .all(|stage| stage.status == PipelineStageStatus::Recorded));
+    }
+
+    #[test]
+    fn batch_asr_graph_marks_current_worker_stage_as_durable() {
+        let graph = PipelineGraph::batch_asr_transcription();
+
+        assert_eq!(graph.kind, PipelineKind::BatchAsrTranscription);
+        assert_eq!(
+            stage_kinds(&graph),
+            vec![
+                PipelineStageKind::RegisterMedia,
+                PipelineStageKind::DecodeAudio,
+                PipelineStageKind::Asr,
+                PipelineStageKind::PersistArtifact,
+            ]
+        );
+        assert_eq!(
+            graph
+                .durable_stages()
+                .map(|stage| stage.name)
+                .collect::<Vec<_>>(),
+            vec!["asr_transcribe"]
+        );
+    }
+
+    #[test]
+    fn batch_tts_graph_marks_current_worker_stage_as_durable() {
+        let graph = PipelineGraph::batch_tts_speech();
+
+        assert_eq!(graph.kind, PipelineKind::BatchTtsSpeech);
+        assert_eq!(
+            stage_kinds(&graph),
+            vec![
+                PipelineStageKind::RegisterText,
+                PipelineStageKind::NormalizeText,
+                PipelineStageKind::Tts,
+                PipelineStageKind::PersistArtifact,
+            ]
+        );
+        assert_eq!(
+            graph
+                .durable_stages()
+                .map(|stage| stage.name)
+                .collect::<Vec<_>>(),
+            vec!["tts_synthesize"]
+        );
+    }
+
+    #[test]
+    fn pipeline_executor_records_stage_execution_modes() {
+        let graph = PipelineGraph::batch_asr_transcription();
+        let summary = PipelineExecutor.execute_contract(&graph);
+
+        assert_eq!(
+            summary
+                .stages()
+                .iter()
+                .map(|stage| stage.execution_mode)
+                .collect::<Vec<_>>(),
+            vec![
+                PipelineStageExecutionMode::Inline,
+                PipelineStageExecutionMode::Inline,
+                PipelineStageExecutionMode::DurableStage,
+                PipelineStageExecutionMode::Inline,
+            ]
+        );
     }
 }

@@ -786,6 +786,18 @@ impl RuntimeService {
         let summary = PipelineExecutor.execute_contract(&graph);
         self.telemetry.record_pipeline_execution(&summary);
     }
+
+    pub fn record_batch_asr_pipeline_job(&self) {
+        let graph = PipelineGraph::batch_asr_transcription();
+        let summary = PipelineExecutor.execute_contract(&graph);
+        self.telemetry.record_pipeline_execution(&summary);
+    }
+
+    pub fn record_batch_tts_pipeline_job(&self) {
+        let graph = PipelineGraph::batch_tts_speech();
+        let summary = PipelineExecutor.execute_contract(&graph);
+        self.telemetry.record_pipeline_execution(&summary);
+    }
 }
 
 fn configure_runtime_threading(num_threads: usize) {
@@ -907,5 +919,18 @@ mod tests {
         assert_eq!(snapshot.broker.execution_requests, 0);
         assert_eq!(snapshot.broker.route_decisions, 1);
         assert_eq!(snapshot.broker.validation_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn batch_pipeline_observation_records_pipeline_telemetry() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+
+        runtime.record_batch_asr_pipeline_job();
+        runtime.record_batch_tts_pipeline_job();
+
+        let snapshot = runtime.telemetry_snapshot().await;
+        assert_eq!(snapshot.pipelines.batch_asr_transcriptions, 1);
+        assert_eq!(snapshot.pipelines.batch_tts_speech, 1);
+        assert_eq!(snapshot.pipelines.stages_recorded, 8);
     }
 }
