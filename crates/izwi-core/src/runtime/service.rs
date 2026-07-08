@@ -17,7 +17,7 @@ use crate::catalog::{ModelInfo, ModelVariant};
 use crate::config::EngineConfig;
 use crate::engine::{
     engine_stream_backpressure_total, Engine as CoreEngine, EngineCoreConfig, EngineCoreRequest,
-    EngineOutput, StreamingOutput, WorkerConfig, ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
+    EngineOutput, StreamingOutput, TaskType, WorkerConfig, ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
     ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_HITS_TOTAL, ENGINE_KV_CACHE_MISSES_TOTAL,
     ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL, ENGINE_SCHEDULER_QUEUE_DEPTH,
     ENGINE_SCHEDULER_RUNNING_REQUESTS, ENGINE_STREAM_BACKPRESSURE_TOTAL,
@@ -32,8 +32,9 @@ use crate::runtime::broker::{
 use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
 use crate::runtime::routing::RouteSource;
 use crate::runtime::telemetry::{
-    push_engine_metric, EngineRuntimeTelemetrySnapshot, RuntimeTelemetryCollector,
-    RuntimeTelemetrySnapshot,
+    push_engine_metric, EngineRuntimeTelemetrySnapshot, RuntimeObservationContext,
+    RuntimeStageObservation, RuntimeStageOutcome, RuntimeStageOutputCounters, RuntimeStageTiming,
+    RuntimeTelemetryCollector, RuntimeTelemetrySnapshot,
 };
 use crate::runtime_models::ModelRegistry;
 use crate::tokenizer::Tokenizer;
@@ -237,6 +238,10 @@ impl RuntimeService {
         self.model_manager.active_residency_leases(variant)
     }
 
+    pub fn record_stage_observation(&self, observation: RuntimeStageObservation) {
+        self.telemetry.record_stage_observation(observation);
+    }
+
     fn observe_broker_request(&self, request: &EngineCoreRequest) -> Result<()> {
         let Some(observation) = self.inference_broker.observe_engine_request(
             request,
@@ -282,6 +287,21 @@ impl RuntimeService {
 
         if let Some(message) = observation.validation_error {
             self.telemetry.record_broker_validation_failure();
+            self.telemetry.record_stage_observation(
+                RuntimeStageObservation::new(
+                    RuntimeObservationContext {
+                        route_source: Some(format!("{:?}", observation.source)),
+                        capability: Some(format!("{:?}", observation.capability)),
+                        model_variant: observation
+                            .model_variant
+                            .map(|variant| variant.dir_name().to_string()),
+                        pipeline_stage: Some("runtime.routing".to_string()),
+                        ..RuntimeObservationContext::default()
+                    },
+                    RuntimeStageOutcome::Failed,
+                )
+                .with_error_kind("routing_validation_failed"),
+            );
             if observation.execution_enabled {
                 return Err(Error::InvalidInput(message));
             }
@@ -292,6 +312,26 @@ impl RuntimeService {
                 "Inference broker shadow validation failed: {message}"
             );
         } else if let Some(decision) = observation.routing_decision {
+            self.telemetry
+                .record_stage_observation(RuntimeStageObservation::new(
+                    RuntimeObservationContext {
+                        route_source: Some(format!("{:?}", observation.source)),
+                        capability: Some(format!("{:?}", observation.capability)),
+                        model_variant: Some(decision.selected_model_variant.dir_name().to_string()),
+                        backend_kind: Some(decision.backend_kind.as_str().to_string()),
+                        execution_target: Some(format!(
+                            "{:?}",
+                            decision.execution_plan.execution_target
+                        )),
+                        streaming_mode: Some(format!(
+                            "{:?}",
+                            decision.execution_plan.streaming_mode
+                        )),
+                        pipeline_stage: Some("runtime.routing".to_string()),
+                        ..RuntimeObservationContext::default()
+                    },
+                    RuntimeStageOutcome::Observed,
+                ));
             debug!(
                 source = ?observation.source,
                 capability = ?observation.capability,
@@ -535,8 +575,94 @@ impl RuntimeService {
         })?
     }
 
+    fn engine_observation_context(
+        &self,
+        request: &EngineCoreRequest,
+        streaming: bool,
+    ) -> RuntimeObservationContext {
+        RuntimeObservationContext {
+            route_source: Some(format!("{:?}", RouteSource::InternalEngine)),
+            capability: Some(capability_name_for_task(request.task_type).to_string()),
+            model_variant: request
+                .model_variant
+                .map(|variant| variant.dir_name().to_string()),
+            backend_kind: Some(
+                self.backend_router
+                    .default_backend()
+                    .kind()
+                    .as_str()
+                    .to_string(),
+            ),
+            pipeline_stage: Some(if streaming {
+                "engine.streaming_request".to_string()
+            } else {
+                "engine.request".to_string()
+            }),
+            request_id: Some(request.id.clone()),
+            correlation_id: request.correlation_id.clone(),
+            ..RuntimeObservationContext::default()
+        }
+    }
+
+    fn record_engine_output_observation(
+        &self,
+        request: &EngineCoreRequest,
+        output: &EngineOutput,
+        streaming: bool,
+    ) {
+        let mut timing = RuntimeStageTiming {
+            total_ms: Some(output.generation_time.as_secs_f64() * 1000.0),
+            ..RuntimeStageTiming::default()
+        };
+        if let Some(latency) = output.latency_breakdown.as_ref() {
+            timing.queue_wait_ms = Some(latency.queue_wait_ms);
+            timing.prefill_ms = Some(latency.prefill_ms);
+            timing.decode_ms = Some(latency.decode_ms);
+            timing.total_ms = Some(latency.total_ms);
+        }
+
+        let outcome = if output.error.is_some() {
+            RuntimeStageOutcome::Failed
+        } else {
+            RuntimeStageOutcome::Completed
+        };
+        let mut observation = RuntimeStageObservation::new(
+            self.engine_observation_context(request, streaming),
+            outcome,
+        );
+        observation.timing = timing;
+        observation.outputs = RuntimeStageOutputCounters {
+            prompt_tokens: Some(output.token_stats.prompt_tokens as u64),
+            generated_tokens: Some(output.token_stats.generated_tokens as u64),
+            audio_samples: Some(output.audio.samples.len() as u64),
+            transcript_chars: output.text.as_ref().map(|text| text.chars().count() as u64),
+            stop_reason: output.finish_reason.map(|reason| format!("{reason:?}")),
+            ..RuntimeStageOutputCounters::default()
+        };
+        if let Some(error) = output.error.as_ref() {
+            observation.error_kind = Some(error.clone());
+        }
+        self.telemetry.record_stage_observation(observation);
+    }
+
+    fn record_engine_error_observation(
+        &self,
+        request: &EngineCoreRequest,
+        streaming: bool,
+        error_kind: impl Into<String>,
+    ) {
+        self.telemetry.record_stage_observation(
+            RuntimeStageObservation::new(
+                self.engine_observation_context(request, streaming),
+                RuntimeStageOutcome::Failed,
+            )
+            .with_error_kind(error_kind),
+        );
+    }
+
     pub(crate) async fn run_request(&self, request: EngineCoreRequest) -> Result<EngineOutput> {
         self.observe_broker_request(&request)?;
+        let observation_request = request.clone();
         let _residency_lease = request
             .model_variant
             .map(|variant| self.acquire_model_residency_lease(variant));
@@ -556,6 +682,7 @@ impl RuntimeService {
 
         if let Err(err) = self.core_engine.add_request(request).await {
             self.remove_waiter(&request_id).await;
+            self.record_engine_error_observation(&observation_request, false, err.to_string());
             return Err(err);
         }
         self.telemetry.record_request_queued().await;
@@ -566,7 +693,16 @@ impl RuntimeService {
             self.core_engine.clone(),
             self.completion_waiters.clone(),
         );
-        let output = self.await_completion(&request_id, completion_rx).await?;
+        let completion = self.await_completion(&request_id, completion_rx).await;
+        match completion.as_ref() {
+            Ok(output) => {
+                self.record_engine_output_observation(&observation_request, output, false)
+            }
+            Err(err) => {
+                self.record_engine_error_observation(&observation_request, false, err.to_string())
+            }
+        }
+        let output = completion?;
         guard.disarm();
         Ok(output)
     }
@@ -582,6 +718,7 @@ impl RuntimeService {
     {
         request.streaming = true;
         self.observe_broker_request(&request)?;
+        let observation_request = request.clone();
         let _residency_lease = request
             .model_variant
             .map(|variant| self.acquire_model_residency_lease(variant));
@@ -598,14 +735,18 @@ impl RuntimeService {
 
         let request_id = request.id.clone();
         let mut completion_rx = self.register_waiter(&request_id).await;
-        let (stream_request_id, mut stream_rx) =
-            match self.core_engine.generate_streaming(request).await {
-                Ok(v) => v,
-                Err(err) => {
-                    self.remove_waiter(&request_id).await;
-                    return Err(err);
-                }
-            };
+        let (stream_request_id, mut stream_rx) = match self
+            .core_engine
+            .generate_streaming(request)
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                self.remove_waiter(&request_id).await;
+                self.record_engine_error_observation(&observation_request, true, err.to_string());
+                return Err(err);
+            }
+        };
         self.telemetry.record_request_queued().await;
         self.step_driver_wakeup.notify_one();
         debug_assert_eq!(stream_request_id, request_id);
@@ -630,6 +771,11 @@ impl RuntimeService {
                     if let Err(err) = on_chunk(chunk).await {
                         self.remove_waiter(&stream_request_id).await;
                         let _ = self.core_engine.abort_request(&stream_request_id).await;
+                        self.record_engine_error_observation(
+                            &observation_request,
+                            true,
+                            err.to_string(),
+                        );
                         return Err(err);
                     }
                 }
@@ -649,6 +795,11 @@ impl RuntimeService {
                             // If engine worker panics, fail fast so streaming callers
                             // don't hang waiting for a chunk channel that may never close.
                             let _ = self.core_engine.abort_request(&stream_request_id).await;
+                            self.record_engine_error_observation(
+                                &observation_request,
+                                true,
+                                err.to_string(),
+                            );
                             return Err(err);
                         }
                     }
@@ -659,9 +810,22 @@ impl RuntimeService {
         let output = if let Some(output) = completion_result {
             output
         } else {
-            self.await_completion(&stream_request_id, completion_rx)
-                .await?
+            match self
+                .await_completion(&stream_request_id, completion_rx)
+                .await
+            {
+                Ok(output) => output,
+                Err(err) => {
+                    self.record_engine_error_observation(
+                        &observation_request,
+                        true,
+                        err.to_string(),
+                    );
+                    return Err(err);
+                }
+            }
         };
+        self.record_engine_output_observation(&observation_request, &output, true);
         guard.disarm();
         // Allow pending tasks to progress before returning to upper layers.
         yield_now().await;
@@ -751,22 +915,27 @@ impl RuntimeService {
 
     pub fn record_voice_session_started(&self) {
         self.telemetry.record_voice_session_started();
+        self.record_voice_stage_observation("voice.session_started");
     }
 
     pub fn record_voice_session_closed(&self) {
         self.telemetry.record_voice_session_closed();
+        self.record_voice_stage_observation("voice.session_closed");
     }
 
     pub fn record_voice_interruption(&self) {
         self.telemetry.record_voice_interruption();
+        self.record_voice_stage_observation("voice.interruption");
     }
 
     pub fn record_voice_barge_in(&self) {
         self.telemetry.record_voice_barge_in();
+        self.record_voice_stage_observation("voice.barge_in");
     }
 
     pub fn record_voice_stream_backpressure(&self) {
         self.telemetry.record_voice_stream_backpressure();
+        self.record_voice_stage_observation("voice.stream_backpressure");
     }
 
     pub fn record_modular_voice_pipeline_turn(&self) {
@@ -797,6 +966,29 @@ impl RuntimeService {
         let graph = PipelineGraph::batch_tts_speech();
         let summary = PipelineExecutor.execute_contract(&graph);
         self.telemetry.record_pipeline_execution(&summary);
+    }
+
+    fn record_voice_stage_observation(&self, pipeline_stage: &'static str) {
+        self.telemetry
+            .record_stage_observation(RuntimeStageObservation::new(
+                RuntimeObservationContext {
+                    route_source: Some(format!("{:?}", RouteSource::RealtimeVoice)),
+                    capability: Some(format!("{:?}", CapabilityKind::SpeechToSpeech)),
+                    pipeline_kind: Some("realtime_voice".to_string()),
+                    pipeline_stage: Some(pipeline_stage.to_string()),
+                    ..RuntimeObservationContext::default()
+                },
+                RuntimeStageOutcome::Observed,
+            ));
+    }
+}
+
+fn capability_name_for_task(task_type: TaskType) -> &'static str {
+    match task_type {
+        TaskType::TTS => "tts",
+        TaskType::ASR => "asr",
+        TaskType::Chat => "chat",
+        TaskType::SpeechToSpeech => "speech_to_speech",
     }
 }
 
@@ -899,6 +1091,48 @@ mod tests {
             .expect_err("batch-only ASR should be rejected before streaming execution");
 
         assert!(err.to_string().contains("not streaming execution"));
+
+        let snapshot = runtime.telemetry_snapshot().await;
+        assert_eq!(snapshot.observability.stage_observations_total, 1);
+        assert_eq!(snapshot.observability.stage_failures_total, 1);
+        assert_eq!(
+            snapshot.observability.recent_stage_samples[0]
+                .context
+                .pipeline_stage
+                .as_deref(),
+            Some("runtime.routing")
+        );
+        assert_eq!(
+            snapshot.observability.recent_stage_samples[0]
+                .error_kind
+                .as_deref(),
+            Some("routing_validation_failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_runtime_events_record_stage_observations() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+
+        runtime.record_voice_session_started();
+
+        let snapshot = runtime.telemetry_snapshot().await;
+        assert_eq!(snapshot.voice.sessions_started, 1);
+        assert_eq!(snapshot.observability.stage_observations_total, 1);
+        assert_eq!(
+            snapshot.observability.recent_stage_samples[0]
+                .context
+                .route_source
+                .as_deref(),
+            Some("RealtimeVoice")
+        );
+        assert_eq!(
+            snapshot.observability.recent_stage_samples[0]
+                .context
+                .pipeline_stage
+                .as_deref(),
+            Some("voice.session_started")
+        );
     }
 
     #[tokio::test]
@@ -919,6 +1153,22 @@ mod tests {
         assert_eq!(snapshot.broker.execution_requests, 0);
         assert_eq!(snapshot.broker.route_decisions, 1);
         assert_eq!(snapshot.broker.validation_failures, 0);
+        assert_eq!(snapshot.observability.stage_observations_total, 1);
+        assert_eq!(snapshot.observability.stage_failures_total, 0);
+        assert_eq!(
+            snapshot.observability.recent_stage_samples[0]
+                .context
+                .pipeline_stage
+                .as_deref(),
+            Some("runtime.routing")
+        );
+        assert_eq!(
+            snapshot.observability.recent_stage_samples[0]
+                .context
+                .model_variant
+                .as_deref(),
+            Some(ModelVariant::Kokoro82M.dir_name())
+        );
     }
 
     #[tokio::test]
