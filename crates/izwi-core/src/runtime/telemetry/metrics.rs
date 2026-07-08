@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex as StdMutex;
 use std::time::Instant;
 
 use serde::Serialize;
@@ -63,6 +64,149 @@ pub struct PipelineRuntimeTelemetrySnapshot {
     pub stages_recorded: u64,
 }
 
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct RuntimeObservationContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_variant: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub streaming_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline_stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_job_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_stage_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_record_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeStageOutcome {
+    Created,
+    Claimed,
+    Started,
+    Completed,
+    Failed,
+    Retried,
+    Skipped,
+    Cancelled,
+    Observed,
+}
+
+impl RuntimeStageOutcome {
+    fn is_failure(self) -> bool {
+        matches!(self, Self::Failed)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct RuntimeStageTiming {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_wait_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_decode_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normalization_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codec_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub postprocess_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_write_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct RuntimeStageOutputCounters {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generated_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_frames: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_samples: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript_chars: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript_segments: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_artifacts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RuntimeStageObservation {
+    pub context: RuntimeObservationContext,
+    pub outcome: RuntimeStageOutcome,
+    #[serde(default)]
+    pub timing: RuntimeStageTiming,
+    #[serde(default)]
+    pub outputs: RuntimeStageOutputCounters,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub quality_flags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
+}
+
+impl RuntimeStageObservation {
+    pub fn new(context: RuntimeObservationContext, outcome: RuntimeStageOutcome) -> Self {
+        Self {
+            context,
+            outcome,
+            timing: RuntimeStageTiming::default(),
+            outputs: RuntimeStageOutputCounters::default(),
+            quality_flags: Vec::new(),
+            error_kind: None,
+        }
+    }
+
+    pub fn with_total_ms(mut self, total_ms: f64) -> Self {
+        self.timing.total_ms = Some(total_ms.max(0.0));
+        self
+    }
+
+    pub fn with_error_kind(mut self, error_kind: impl Into<String>) -> Self {
+        self.error_kind = Some(error_kind.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RuntimeObservabilityTelemetrySnapshot {
+    pub stage_observations_total: u64,
+    pub stage_failures_total: u64,
+    pub stage_duration_ms_avg: f64,
+    pub stage_duration_ms_p50: f64,
+    pub stage_duration_ms_p95: f64,
+    pub recent_stage_samples: Vec<RuntimeStageObservation>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeTelemetrySnapshot {
     pub uptime_secs: f64,
@@ -92,6 +236,7 @@ pub struct RuntimeTelemetrySnapshot {
     pub voice: VoiceRuntimeTelemetrySnapshot,
     pub broker: InferenceBrokerRuntimeTelemetrySnapshot,
     pub pipelines: PipelineRuntimeTelemetrySnapshot,
+    pub observability: RuntimeObservabilityTelemetrySnapshot,
     pub engine_metrics: &'static [EngineMetricDescriptor],
     pub voice_metrics: &'static [VoiceMetricDescriptor],
 }
@@ -121,6 +266,10 @@ pub(crate) struct RuntimeTelemetryCollector {
     pipeline_batch_asr_transcriptions: AtomicU64,
     pipeline_batch_tts_speech: AtomicU64,
     pipeline_stages_recorded: AtomicU64,
+    stage_observations_total: AtomicU64,
+    stage_failures_total: AtomicU64,
+    stage_duration_ms_samples: StdMutex<VecDeque<f64>>,
+    stage_observation_samples: StdMutex<VecDeque<RuntimeStageObservation>>,
     queue_wait_ms_samples: Mutex<VecDeque<f64>>,
     prefill_ms_samples: Mutex<VecDeque<f64>>,
     decode_ms_samples: Mutex<VecDeque<f64>>,
@@ -154,6 +303,10 @@ impl RuntimeTelemetryCollector {
             pipeline_batch_asr_transcriptions: AtomicU64::new(0),
             pipeline_batch_tts_speech: AtomicU64::new(0),
             pipeline_stages_recorded: AtomicU64::new(0),
+            stage_observations_total: AtomicU64::new(0),
+            stage_failures_total: AtomicU64::new(0),
+            stage_duration_ms_samples: StdMutex::new(VecDeque::with_capacity(max_samples.max(64))),
+            stage_observation_samples: StdMutex::new(VecDeque::with_capacity(max_samples.max(64))),
             queue_wait_ms_samples: Mutex::new(VecDeque::with_capacity(max_samples.max(64))),
             prefill_ms_samples: Mutex::new(VecDeque::with_capacity(max_samples.max(64))),
             decode_ms_samples: Mutex::new(VecDeque::with_capacity(max_samples.max(64))),
@@ -301,12 +454,41 @@ impl RuntimeTelemetryCollector {
             .fetch_add(summary.stages().len() as u64, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_stage_observation(&self, observation: RuntimeStageObservation) {
+        self.stage_observations_total
+            .fetch_add(1, Ordering::Relaxed);
+        if observation.outcome.is_failure() {
+            self.stage_failures_total.fetch_add(1, Ordering::Relaxed);
+        }
+
+        if let Some(total_ms) = observation.timing.total_ms {
+            Self::push_sample_sync(&self.stage_duration_ms_samples, self.max_samples, total_ms);
+        }
+        Self::push_observation_sample_sync(
+            &self.stage_observation_samples,
+            self.max_samples,
+            observation,
+        );
+    }
+
     pub(crate) async fn snapshot(&self) -> RuntimeTelemetrySnapshot {
         let queue = self.queue_wait_ms_samples.lock().await.clone();
         let prefill = self.prefill_ms_samples.lock().await.clone();
         let decode = self.decode_ms_samples.lock().await.clone();
         let ttft = self.ttft_ms_samples.lock().await.clone();
         let end_to_end = self.end_to_end_ms_samples.lock().await.clone();
+        let stage_duration = self
+            .stage_duration_ms_samples
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let recent_stage_samples = self
+            .stage_observation_samples
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
 
         RuntimeTelemetrySnapshot {
             uptime_secs: self.start_time.elapsed().as_secs_f64(),
@@ -357,6 +539,14 @@ impl RuntimeTelemetryCollector {
                     .load(Ordering::Relaxed),
                 batch_tts_speech: self.pipeline_batch_tts_speech.load(Ordering::Relaxed),
                 stages_recorded: self.pipeline_stages_recorded.load(Ordering::Relaxed),
+            },
+            observability: RuntimeObservabilityTelemetrySnapshot {
+                stage_observations_total: self.stage_observations_total.load(Ordering::Relaxed),
+                stage_failures_total: self.stage_failures_total.load(Ordering::Relaxed),
+                stage_duration_ms_avg: mean(&stage_duration),
+                stage_duration_ms_p50: percentile(&stage_duration, 0.50),
+                stage_duration_ms_p95: percentile(&stage_duration, 0.95),
+                recent_stage_samples,
             },
             engine_metrics: engine_metric_catalog(),
             voice_metrics: voice_metric_catalog(),
@@ -454,6 +644,16 @@ impl RuntimeTelemetryCollector {
             snapshot.pipelines.batch_tts_speech,
             snapshot.pipelines.stages_recorded
         ));
+        payload.push_str(&format!(
+            "# TYPE izwi_runtime_stage_observations_total counter\nizwi_runtime_stage_observations_total {}\n\
+# TYPE izwi_runtime_stage_failures_total counter\nizwi_runtime_stage_failures_total {}\n\
+# TYPE izwi_runtime_stage_duration_ms gauge\nizwi_runtime_stage_duration_ms{{quantile=\"avg\"}} {:.6}\nizwi_runtime_stage_duration_ms{{quantile=\"p50\"}} {:.6}\nizwi_runtime_stage_duration_ms{{quantile=\"p95\"}} {:.6}\n",
+            snapshot.observability.stage_observations_total,
+            snapshot.observability.stage_failures_total,
+            snapshot.observability.stage_duration_ms_avg,
+            snapshot.observability.stage_duration_ms_p50,
+            snapshot.observability.stage_duration_ms_p95
+        ));
         payload.push_str(&voice_metric_prometheus_contract());
         payload
     }
@@ -464,6 +664,26 @@ impl RuntimeTelemetryCollector {
             guard.pop_front();
         }
         guard.push_back(value.max(0.0));
+    }
+
+    fn push_sample_sync(buffer: &StdMutex<VecDeque<f64>>, max_samples: usize, value: f64) {
+        let mut guard = buffer.lock().unwrap_or_else(|poison| poison.into_inner());
+        if guard.len() >= max_samples {
+            guard.pop_front();
+        }
+        guard.push_back(value.max(0.0));
+    }
+
+    fn push_observation_sample_sync(
+        buffer: &StdMutex<VecDeque<RuntimeStageObservation>>,
+        max_samples: usize,
+        value: RuntimeStageObservation,
+    ) {
+        let mut guard = buffer.lock().unwrap_or_else(|poison| poison.into_inner());
+        if guard.len() >= max_samples {
+            guard.pop_front();
+        }
+        guard.push_back(value);
     }
 }
 
@@ -581,6 +801,106 @@ mod tests {
         assert!(payload.contains("izwi_inference_pipeline_batch_asr_transcriptions_total 1"));
         assert!(payload.contains("izwi_inference_pipeline_batch_tts_speech_total 1"));
         assert!(payload.contains("izwi_inference_pipeline_stages_recorded_total 22"));
+    }
+
+    #[tokio::test]
+    async fn stage_observation_snapshot_and_prometheus_include_safe_aggregates() {
+        let telemetry = RuntimeTelemetryCollector::new(64);
+        let context = RuntimeObservationContext {
+            route_source: Some("openai_audio_speech".to_string()),
+            capability: Some("tts".to_string()),
+            model_variant: Some("Kokoro-82M".to_string()),
+            backend_kind: Some("cpu".to_string()),
+            pipeline_stage: Some("tts_synthesize".to_string()),
+            request_id: Some("req-1".to_string()),
+            correlation_id: Some("corr-1".to_string()),
+            runtime_job_id: Some("job-1".to_string()),
+            job_stage_id: Some("stage-1".to_string()),
+            ..RuntimeObservationContext::default()
+        };
+
+        telemetry.record_stage_observation(
+            RuntimeStageObservation::new(context, RuntimeStageOutcome::Completed)
+                .with_total_ms(42.0),
+        );
+        telemetry.record_stage_observation(
+            RuntimeStageObservation::new(
+                RuntimeObservationContext {
+                    pipeline_stage: Some("tts_synthesize".to_string()),
+                    ..RuntimeObservationContext::default()
+                },
+                RuntimeStageOutcome::Failed,
+            )
+            .with_total_ms(100.0)
+            .with_error_kind("executor_failed"),
+        );
+
+        let snapshot = telemetry.snapshot().await;
+        assert_eq!(snapshot.observability.stage_observations_total, 2);
+        assert_eq!(snapshot.observability.stage_failures_total, 1);
+        assert_eq!(snapshot.observability.stage_duration_ms_avg, 71.0);
+        assert_eq!(snapshot.observability.stage_duration_ms_p50, 42.0);
+        assert_eq!(snapshot.observability.recent_stage_samples.len(), 2);
+        assert_eq!(
+            snapshot.observability.recent_stage_samples[0]
+                .context
+                .request_id
+                .as_deref(),
+            Some("req-1")
+        );
+
+        let payload = telemetry.prometheus().await;
+        assert!(payload.contains("izwi_runtime_stage_observations_total 2"));
+        assert!(payload.contains("izwi_runtime_stage_failures_total 1"));
+        assert!(payload.contains("izwi_runtime_stage_duration_ms{quantile=\"avg\"} 71.000000"));
+        assert!(!payload.contains("req-1"));
+        assert!(!payload.contains("job-1"));
+    }
+
+    #[tokio::test]
+    async fn stage_observation_samples_are_bounded() {
+        let telemetry = RuntimeTelemetryCollector::new(64);
+
+        for idx in 0..70 {
+            telemetry.record_stage_observation(RuntimeStageObservation::new(
+                RuntimeObservationContext {
+                    request_id: Some(format!("req-{idx}")),
+                    ..RuntimeObservationContext::default()
+                },
+                RuntimeStageOutcome::Observed,
+            ));
+        }
+
+        let snapshot = telemetry.snapshot().await;
+        assert_eq!(snapshot.observability.stage_observations_total, 70);
+        assert_eq!(snapshot.observability.recent_stage_samples.len(), 64);
+        assert_eq!(
+            snapshot.observability.recent_stage_samples[0]
+                .context
+                .request_id
+                .as_deref(),
+            Some("req-6")
+        );
+    }
+
+    #[test]
+    fn stage_observation_contract_is_metadata_only() {
+        let observation = RuntimeStageObservation::new(
+            RuntimeObservationContext {
+                route_source: Some("openai_audio_transcriptions".to_string()),
+                capability: Some("asr".to_string()),
+                request_id: Some("req-redacted".to_string()),
+                ..RuntimeObservationContext::default()
+            },
+            RuntimeStageOutcome::Completed,
+        );
+
+        let payload = serde_json::to_string(&observation).expect("serialize observation");
+        assert!(payload.contains("openai_audio_transcriptions"));
+        assert!(!payload.contains("prompt"));
+        assert!(!payload.contains("transcript_text"));
+        assert!(!payload.contains("audio_samples"));
+        assert!(!payload.contains("reference_audio"));
     }
 
     #[test]
