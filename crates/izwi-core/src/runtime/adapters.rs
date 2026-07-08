@@ -6,11 +6,14 @@
 
 use std::collections::HashMap;
 
+use serde::Serialize;
+
 use crate::catalog::ModelVariant;
 use crate::error::{Error, Result};
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum CapabilityKind {
     Asr,
     RealtimeAsr,
@@ -27,7 +30,8 @@ pub(crate) enum CapabilityKind {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum StreamingMode {
     None,
     Chunked,
@@ -35,7 +39,8 @@ pub(crate) enum StreamingMode {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ExecutionTargetKind {
     TokenEngine,
     BatchRunner,
@@ -491,21 +496,15 @@ mod tests {
                 .streaming_mode,
             StreamingMode::None
         );
-        assert!(
-            registry
-                .require(CapabilityKind::RealtimeAsr, variant)
-                .is_err()
-        );
-        assert!(
-            registry
-                .require(CapabilityKind::AudioChat, variant)
-                .is_err()
-        );
-        assert!(
-            registry
-                .require(CapabilityKind::SpeechToSpeech, variant)
-                .is_err()
-        );
+        assert!(registry
+            .require(CapabilityKind::RealtimeAsr, variant)
+            .is_err());
+        assert!(registry
+            .require(CapabilityKind::AudioChat, variant)
+            .is_err());
+        assert!(registry
+            .require(CapabilityKind::SpeechToSpeech, variant)
+            .is_err());
     }
 
     #[test]
@@ -518,17 +517,15 @@ mod tests {
             .expect("granite speech asr adapter");
         assert_eq!(adapter.execution_target, ExecutionTargetKind::BatchRunner);
         assert_eq!(adapter.streaming_mode, StreamingMode::None);
-        assert!(
-            registry
-                .require(CapabilityKind::Diarization, variant)
-                .is_err()
-        );
-        assert!(
-            registry
-                .require(CapabilityKind::RealtimeAsr, variant)
-                .is_err()
-        );
-        assert!(registry.require(CapabilityKind::AudioChat, variant).is_err());
+        assert!(registry
+            .require(CapabilityKind::Diarization, variant)
+            .is_err());
+        assert!(registry
+            .require(CapabilityKind::RealtimeAsr, variant)
+            .is_err());
+        assert!(registry
+            .require(CapabilityKind::AudioChat, variant)
+            .is_err());
     }
 
     #[test]
@@ -541,11 +538,9 @@ mod tests {
             .expect("voxtral tts adapter");
         assert_eq!(adapter.execution_target, ExecutionTargetKind::DirectModel);
         assert_eq!(adapter.streaming_mode, StreamingMode::Chunked);
-        assert!(
-            registry
-                .require(CapabilityKind::StreamingTts, variant)
-                .is_err()
-        );
+        assert!(registry
+            .require(CapabilityKind::StreamingTts, variant)
+            .is_err());
     }
 
     #[test]
@@ -558,11 +553,9 @@ mod tests {
             .expect("vibevoice tts adapter");
         assert_eq!(adapter.execution_target, ExecutionTargetKind::DirectModel);
         assert_eq!(adapter.streaming_mode, StreamingMode::Chunked);
-        assert!(
-            registry
-                .require(CapabilityKind::StreamingTts, variant)
-                .is_err()
-        );
+        assert!(registry
+            .require(CapabilityKind::StreamingTts, variant)
+            .is_err());
     }
 
     #[test]

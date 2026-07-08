@@ -2,11 +2,11 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use futures::FutureExt;
-use tokio::sync::{Mutex, Notify, RwLock, broadcast, oneshot};
+use tokio::sync::{broadcast, oneshot, Mutex, Notify, RwLock};
 use tokio::task::yield_now;
 use tracing::{debug, error, info_span};
 
@@ -16,11 +16,11 @@ use crate::backends::{BackendPreference, BackendRouter, BackendSelectionSource, 
 use crate::catalog::{ModelInfo, ModelVariant};
 use crate::config::EngineConfig;
 use crate::engine::{
-    ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_HITS_TOTAL,
-    ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL,
-    ENGINE_SCHEDULER_QUEUE_DEPTH, ENGINE_SCHEDULER_RUNNING_REQUESTS,
-    ENGINE_STREAM_BACKPRESSURE_TOTAL, Engine as CoreEngine, EngineCoreConfig, EngineCoreRequest,
-    EngineOutput, StreamingOutput, WorkerConfig, engine_stream_backpressure_total,
+    engine_stream_backpressure_total, Engine as CoreEngine, EngineCoreConfig, EngineCoreRequest,
+    EngineOutput, StreamingOutput, WorkerConfig, ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
+    ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_HITS_TOTAL, ENGINE_KV_CACHE_MISSES_TOTAL,
+    ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL, ENGINE_SCHEDULER_QUEUE_DEPTH,
+    ENGINE_SCHEDULER_RUNNING_REQUESTS, ENGINE_STREAM_BACKPRESSURE_TOTAL,
 };
 use crate::error::{Error, Result};
 use crate::model::ModelResidencyLease;
@@ -30,9 +30,10 @@ use crate::runtime::broker::{
     InferenceBroker, InferenceBrokerObservation, InferenceBrokerSnapshot,
 };
 use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
+use crate::runtime::routing::RouteSource;
 use crate::runtime::telemetry::{
-    EngineRuntimeTelemetrySnapshot, RuntimeTelemetryCollector, RuntimeTelemetrySnapshot,
-    push_engine_metric,
+    push_engine_metric, EngineRuntimeTelemetrySnapshot, RuntimeTelemetryCollector,
+    RuntimeTelemetrySnapshot,
 };
 use crate::runtime_models::ModelRegistry;
 use crate::tokenizer::Tokenizer;
@@ -237,10 +238,11 @@ impl RuntimeService {
     }
 
     fn observe_broker_request(&self, request: &EngineCoreRequest) -> Result<()> {
-        let Some(observation) = self
-            .inference_broker
-            .observe_engine_request(request, &self.adapter_registry)
-        else {
+        let Some(observation) = self.inference_broker.observe_engine_request(
+            request,
+            &self.adapter_registry,
+            &self.backend_router,
+        ) else {
             return Ok(());
         };
 
@@ -254,10 +256,12 @@ impl RuntimeService {
         streaming_required: bool,
     ) -> Result<()> {
         let Some(observation) = self.inference_broker.observe_capability_request(
+            RouteSource::InternalRuntime,
             capability,
             model_variant,
             streaming_required,
             &self.adapter_registry,
+            &self.backend_router,
         ) else {
             return Ok(());
         };
@@ -272,6 +276,9 @@ impl RuntimeService {
         if observation.execution_enabled {
             self.telemetry.record_broker_execution_request();
         }
+        if observation.routing_decision.is_some() {
+            self.telemetry.record_broker_route_decision();
+        }
 
         if let Some(message) = observation.validation_error {
             self.telemetry.record_broker_validation_failure();
@@ -279,9 +286,20 @@ impl RuntimeService {
                 return Err(Error::InvalidInput(message));
             }
             debug!(
+                source = ?observation.source,
                 capability = ?observation.capability,
                 model_variant = ?observation.model_variant,
                 "Inference broker shadow validation failed: {message}"
+            );
+        } else if let Some(decision) = observation.routing_decision {
+            debug!(
+                source = ?observation.source,
+                capability = ?observation.capability,
+                requested_model_variant = ?observation.model_variant,
+                selected_model_variant = ?decision.selected_model_variant,
+                execution_target = ?decision.execution_plan.execution_target,
+                backend_kind = ?decision.backend_kind,
+                "Inference broker route decision recorded"
             );
         }
 
@@ -887,6 +905,7 @@ mod tests {
         let snapshot = runtime.telemetry_snapshot().await;
         assert_eq!(snapshot.broker.shadow_requests, 1);
         assert_eq!(snapshot.broker.execution_requests, 0);
+        assert_eq!(snapshot.broker.route_decisions, 1);
         assert_eq!(snapshot.broker.validation_failures, 0);
     }
 }
