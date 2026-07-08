@@ -58,6 +58,8 @@ pub struct PipelineRuntimeTelemetrySnapshot {
     pub modular_voice_turns: u64,
     pub unified_voice_turns: u64,
     pub diarization_transcripts: u64,
+    pub batch_asr_transcriptions: u64,
+    pub batch_tts_speech: u64,
     pub stages_recorded: u64,
 }
 
@@ -116,6 +118,8 @@ pub(crate) struct RuntimeTelemetryCollector {
     pipeline_modular_voice_turns: AtomicU64,
     pipeline_unified_voice_turns: AtomicU64,
     pipeline_diarization_transcripts: AtomicU64,
+    pipeline_batch_asr_transcriptions: AtomicU64,
+    pipeline_batch_tts_speech: AtomicU64,
     pipeline_stages_recorded: AtomicU64,
     queue_wait_ms_samples: Mutex<VecDeque<f64>>,
     prefill_ms_samples: Mutex<VecDeque<f64>>,
@@ -147,6 +151,8 @@ impl RuntimeTelemetryCollector {
             pipeline_modular_voice_turns: AtomicU64::new(0),
             pipeline_unified_voice_turns: AtomicU64::new(0),
             pipeline_diarization_transcripts: AtomicU64::new(0),
+            pipeline_batch_asr_transcriptions: AtomicU64::new(0),
+            pipeline_batch_tts_speech: AtomicU64::new(0),
             pipeline_stages_recorded: AtomicU64::new(0),
             queue_wait_ms_samples: Mutex::new(VecDeque::with_capacity(max_samples.max(64))),
             prefill_ms_samples: Mutex::new(VecDeque::with_capacity(max_samples.max(64))),
@@ -282,6 +288,14 @@ impl RuntimeTelemetryCollector {
                 self.pipeline_diarization_transcripts
                     .fetch_add(1, Ordering::Relaxed);
             }
+            PipelineKind::BatchAsrTranscription => {
+                self.pipeline_batch_asr_transcriptions
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            PipelineKind::BatchTtsSpeech => {
+                self.pipeline_batch_tts_speech
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
         self.pipeline_stages_recorded
             .fetch_add(summary.stages().len() as u64, Ordering::Relaxed);
@@ -338,6 +352,10 @@ impl RuntimeTelemetryCollector {
                 diarization_transcripts: self
                     .pipeline_diarization_transcripts
                     .load(Ordering::Relaxed),
+                batch_asr_transcriptions: self
+                    .pipeline_batch_asr_transcriptions
+                    .load(Ordering::Relaxed),
+                batch_tts_speech: self.pipeline_batch_tts_speech.load(Ordering::Relaxed),
                 stages_recorded: self.pipeline_stages_recorded.load(Ordering::Relaxed),
             },
             engine_metrics: engine_metric_catalog(),
@@ -426,10 +444,14 @@ impl RuntimeTelemetryCollector {
             "# TYPE izwi_inference_pipeline_modular_voice_turns_total counter\nizwi_inference_pipeline_modular_voice_turns_total {}\n\
 # TYPE izwi_inference_pipeline_unified_voice_turns_total counter\nizwi_inference_pipeline_unified_voice_turns_total {}\n\
 # TYPE izwi_inference_pipeline_diarization_transcripts_total counter\nizwi_inference_pipeline_diarization_transcripts_total {}\n\
+# TYPE izwi_inference_pipeline_batch_asr_transcriptions_total counter\nizwi_inference_pipeline_batch_asr_transcriptions_total {}\n\
+# TYPE izwi_inference_pipeline_batch_tts_speech_total counter\nizwi_inference_pipeline_batch_tts_speech_total {}\n\
 # TYPE izwi_inference_pipeline_stages_recorded_total counter\nizwi_inference_pipeline_stages_recorded_total {}\n",
             snapshot.pipelines.modular_voice_turns,
             snapshot.pipelines.unified_voice_turns,
             snapshot.pipelines.diarization_transcripts,
+            snapshot.pipelines.batch_asr_transcriptions,
+            snapshot.pipelines.batch_tts_speech,
             snapshot.pipelines.stages_recorded
         ));
         payload.push_str(&voice_metric_prometheus_contract());
@@ -541,18 +563,24 @@ mod tests {
         telemetry.record_pipeline_graph(&PipelineGraph::modular_voice_turn());
         telemetry.record_pipeline_graph(&PipelineGraph::unified_voice_turn());
         telemetry.record_pipeline_graph(&PipelineGraph::diarization_transcript(true));
+        telemetry.record_pipeline_graph(&PipelineGraph::batch_asr_transcription());
+        telemetry.record_pipeline_graph(&PipelineGraph::batch_tts_speech());
 
         let snapshot = telemetry.snapshot().await;
         assert_eq!(snapshot.pipelines.modular_voice_turns, 1);
         assert_eq!(snapshot.pipelines.unified_voice_turns, 1);
         assert_eq!(snapshot.pipelines.diarization_transcripts, 1);
-        assert_eq!(snapshot.pipelines.stages_recorded, 14);
+        assert_eq!(snapshot.pipelines.batch_asr_transcriptions, 1);
+        assert_eq!(snapshot.pipelines.batch_tts_speech, 1);
+        assert_eq!(snapshot.pipelines.stages_recorded, 22);
 
         let payload = telemetry.prometheus().await;
         assert!(payload.contains("izwi_inference_pipeline_modular_voice_turns_total 1"));
         assert!(payload.contains("izwi_inference_pipeline_unified_voice_turns_total 1"));
         assert!(payload.contains("izwi_inference_pipeline_diarization_transcripts_total 1"));
-        assert!(payload.contains("izwi_inference_pipeline_stages_recorded_total 14"));
+        assert!(payload.contains("izwi_inference_pipeline_batch_asr_transcriptions_total 1"));
+        assert!(payload.contains("izwi_inference_pipeline_batch_tts_speech_total 1"));
+        assert!(payload.contains("izwi_inference_pipeline_stages_recorded_total 22"));
     }
 
     #[test]
