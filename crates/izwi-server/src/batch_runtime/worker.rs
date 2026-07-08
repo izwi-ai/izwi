@@ -1,14 +1,18 @@
 use super::{
     store::{BatchRuntimeStore, WorkerHeartbeatUpdate},
-    types::ClaimedStage,
+    types::{ClaimedStage, RuntimeJobKind},
 };
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use async_trait::async_trait;
+use izwi_core::{
+    RuntimeObservationContext, RuntimeService, RuntimeStageObservation, RuntimeStageOutcome,
+    RuntimeStageOutputCounters,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info};
@@ -147,6 +151,7 @@ pub struct BatchWorkerRunner {
     executors: Arc<HashMap<String, Arc<dyn StageExecutor>>>,
     config: BatchWorkerConfig,
     health: BatchWorkerHealth,
+    runtime_observer: Option<Arc<RuntimeService>>,
 }
 
 impl BatchWorkerRunner {
@@ -165,7 +170,13 @@ impl BatchWorkerRunner {
             executors: Arc::new(executors),
             config,
             health,
+            runtime_observer: None,
         }
+    }
+
+    pub fn with_runtime_observer(mut self, runtime: Arc<RuntimeService>) -> Self {
+        self.runtime_observer = Some(runtime);
+        self
     }
 
     pub fn health(&self) -> BatchWorkerHealth {
@@ -191,14 +202,22 @@ impl BatchWorkerRunner {
         };
 
         self.health.record_claim(claimed.stage.id.clone());
+        self.record_stage_observation(&claimed, RuntimeStageOutcome::Claimed, None, None, None);
         self.record_heartbeat(
             "running",
             Some((claimed.job.id.clone(), claimed.stage.id.clone())),
         )
         .await?;
 
-        let Some(executor) = self.executors.get(claimed.stage.stage_kind.as_str()).cloned() else {
-            let message = format!("No executor registered for stage {}", claimed.stage.stage_kind);
+        let Some(executor) = self
+            .executors
+            .get(claimed.stage.stage_kind.as_str())
+            .cloned()
+        else {
+            let message = format!(
+                "No executor registered for stage {}",
+                claimed.stage.stage_kind
+            );
             self.health.record_error(message.clone());
             self.store
                 .fail_stage(
@@ -208,14 +227,31 @@ impl BatchWorkerRunner {
                     Some(message),
                 )
                 .await?;
+            self.record_stage_observation(
+                &claimed,
+                RuntimeStageOutcome::Failed,
+                None,
+                None,
+                Some("missing_executor".to_string()),
+            );
             return Ok(true);
         };
 
+        self.record_stage_observation(&claimed, RuntimeStageOutcome::Started, None, None, None);
+        let stage_started = Instant::now();
         match executor.execute(claimed.clone()).await {
             Ok(outcome) => {
+                let output_artifact_count = outcome.output_artifact_ids.len();
                 self.store
                     .complete_stage(claimed.stage.id.as_str(), outcome.output_artifact_ids)
                     .await?;
+                self.record_stage_observation(
+                    &claimed,
+                    RuntimeStageOutcome::Completed,
+                    Some(stage_started.elapsed().as_secs_f64() * 1000.0),
+                    Some(output_artifact_count),
+                    None,
+                );
                 self.record_heartbeat("idle", None).await?;
             }
             Err(err) => {
@@ -229,6 +265,13 @@ impl BatchWorkerRunner {
                         Some(message),
                     )
                     .await?;
+                self.record_stage_observation(
+                    &claimed,
+                    RuntimeStageOutcome::Failed,
+                    Some(stage_started.elapsed().as_secs_f64() * 1000.0),
+                    None,
+                    Some("executor_failed".to_string()),
+                );
                 self.record_heartbeat("idle", None).await?;
             }
         }
@@ -287,8 +330,8 @@ impl BatchWorkerRunner {
         status: &str,
         current: Option<(String, String)>,
     ) -> anyhow::Result<()> {
-        let (current_job_id, current_stage_id) =
-            current.map_or((None, None), |(job_id, stage_id)| {
+        let (current_job_id, current_stage_id) = current
+            .map_or((None, None), |(job_id, stage_id)| {
                 (Some(job_id), Some(stage_id))
             });
         self.store
@@ -302,6 +345,59 @@ impl BatchWorkerRunner {
             })
             .await?;
         Ok(())
+    }
+
+    fn record_stage_observation(
+        &self,
+        claimed: &ClaimedStage,
+        outcome: RuntimeStageOutcome,
+        total_ms: Option<f64>,
+        output_artifacts: Option<usize>,
+        error_kind: Option<String>,
+    ) {
+        let Some(runtime) = self.runtime_observer.as_ref() else {
+            return;
+        };
+
+        let mut observation =
+            RuntimeStageObservation::new(Self::stage_observation_context(claimed), outcome);
+        if let Some(total_ms) = total_ms {
+            observation = observation.with_total_ms(total_ms);
+        }
+        if let Some(output_artifacts) = output_artifacts {
+            observation.outputs = RuntimeStageOutputCounters {
+                output_artifacts: Some(output_artifacts as u64),
+                ..RuntimeStageOutputCounters::default()
+            };
+        }
+        if let Some(error_kind) = error_kind {
+            observation = observation.with_error_kind(error_kind);
+        }
+
+        runtime.record_stage_observation(observation);
+    }
+
+    fn stage_observation_context(claimed: &ClaimedStage) -> RuntimeObservationContext {
+        RuntimeObservationContext {
+            route_source: Some("batch_runtime".to_string()),
+            capability: claimed
+                .stage
+                .capability
+                .clone()
+                .or_else(|| claimed.job.capability.clone()),
+            model_variant: claimed
+                .stage
+                .model_id
+                .clone()
+                .or_else(|| claimed.job.model_id.clone()),
+            pipeline_kind: Some(batch_pipeline_kind(claimed.job.job_kind).to_string()),
+            pipeline_stage: Some(claimed.stage.stage_kind.clone()),
+            runtime_job_id: Some(claimed.job.id.clone()),
+            job_stage_id: Some(claimed.stage.id.clone()),
+            route_record_id: claimed.job.route_record_id.clone(),
+            correlation_id: claimed.job.correlation_id.clone(),
+            ..RuntimeObservationContext::default()
+        }
     }
 }
 
@@ -334,6 +430,13 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+fn batch_pipeline_kind(kind: RuntimeJobKind) -> &'static str {
+    match kind {
+        RuntimeJobKind::AsrTranscription => "batch_asr_transcription",
+        RuntimeJobKind::TtsSpeech => "batch_tts_speech",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,6 +447,7 @@ mod tests {
         },
         db::StoreDatabase,
     };
+    use izwi_core::{EngineConfig, RuntimeStageOutcome};
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -372,9 +476,9 @@ mod tests {
     fn build_store() -> Arc<BatchRuntimeStore> {
         let root = tempfile::tempdir().expect("temp dir");
         let db_path = root.keep().join("runtime.sqlite");
-        Arc::new(BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
-            db_path,
-        )))
+        Arc::new(BatchRuntimeStore::initialize_with_database(
+            StoreDatabase::new(db_path),
+        ))
     }
 
     async fn create_queued_fake_stage(
@@ -418,9 +522,7 @@ mod tests {
     #[tokio::test]
     async fn runner_claims_and_completes_stage() {
         let store = build_store();
-        let (job_id, stage_id) = create_queued_fake_stage(&store, 1)
-            .await
-            .expect("stage");
+        let (job_id, stage_id) = create_queued_fake_stage(&store, 1).await.expect("stage");
         let health = BatchWorkerHealth::new("worker-test");
         let runner = BatchWorkerRunner::new(
             store.clone(),
@@ -455,11 +557,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runner_records_runtime_stage_observations_when_attached() {
+        let store = build_store();
+        let (job_id, stage_id) = create_queued_fake_stage(&store, 1).await.expect("stage");
+        let runtime = Arc::new(RuntimeService::new(EngineConfig::default()).expect("runtime"));
+        let runner = BatchWorkerRunner::new(
+            store,
+            vec![Arc::new(FakeExecutor {
+                calls: AtomicUsize::new(0),
+                fail_first: false,
+            })],
+            BatchWorkerConfig::local("worker-test"),
+            BatchWorkerHealth::new("worker-test"),
+        )
+        .with_runtime_observer(runtime.clone());
+
+        assert!(runner.run_once().await.expect("processed"));
+
+        let snapshot = runtime.telemetry_snapshot().await;
+        assert_eq!(snapshot.observability.stage_observations_total, 3);
+        assert_eq!(snapshot.observability.stage_failures_total, 0);
+        let samples = snapshot.observability.recent_stage_samples;
+        assert_eq!(samples[0].outcome, RuntimeStageOutcome::Claimed);
+        assert_eq!(samples[1].outcome, RuntimeStageOutcome::Started);
+        assert_eq!(samples[2].outcome, RuntimeStageOutcome::Completed);
+        assert_eq!(
+            samples[2].context.runtime_job_id.as_deref(),
+            Some(job_id.as_str())
+        );
+        assert_eq!(
+            samples[2].context.job_stage_id.as_deref(),
+            Some(stage_id.as_str())
+        );
+        assert_eq!(
+            samples[2].outputs.output_artifacts,
+            Some(1),
+            "completed stage should report output artifact count"
+        );
+    }
+
+    #[tokio::test]
     async fn runner_retries_then_completes_stage() {
         let store = build_store();
-        let (job_id, stage_id) = create_queued_fake_stage(&store, 2)
-            .await
-            .expect("stage");
+        let (job_id, stage_id) = create_queued_fake_stage(&store, 2).await.expect("stage");
         let runner = BatchWorkerRunner::new(
             store.clone(),
             vec![Arc::new(FakeExecutor {
