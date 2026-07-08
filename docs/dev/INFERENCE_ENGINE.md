@@ -78,7 +78,7 @@ Izwi is a **multi-modal audio inference server** built in Rust. Its inference en
 │                                                                 │
 │  ┌─────────────────────────────────────────────────────────┐    │
 │  │               Runtime Layer (runtime/)                  │    │
-│  │   RuntimeService → Engine → EngineCore                  │    │
+│  │   RuntimeService → broker/adapters/pipelines → EngineCore│   │
 │  └──────────────────────┬──────────────────────────────────┘    │
 │                         │                                       │
 │  ┌──────────────────────▼──────────────────────────────────┐    │
@@ -121,8 +121,16 @@ crates/izwi-core/src/
 ├── runtime/
 │   ├── mod.rs               # Runtime module exports
 │   ├── service.rs           # RuntimeService — top-level orchestrator
+│   ├── adapters.rs          # Capability-to-model adapter metadata
+│   ├── capabilities/        # Executable capability planning contracts
+│   ├── broker.rs            # Rollout-aware routing/broker shadow gate
+│   ├── pipeline.rs          # Multi-stage voice graph contracts
+│   ├── asr.rs               # ASR runtime handlers
+│   ├── tts.rs               # TTS runtime handlers
+│   ├── chat.rs              # Chat runtime handlers
+│   ├── speech_to_speech.rs  # Speech-to-speech runtime handlers
 │   ├── diarization.rs       # Speaker diarization runtime handler
-│   └── lfm2.rs              # LFM-2 TTS runtime handler
+│   └── kokoro.rs            # Kokoro direct-model TTS handler
 ├── catalog/
 │   └── variant.rs           # ModelVariant, ModelFamily, ModelTask, InferenceBackendHint
 ├── backends/
@@ -145,15 +153,20 @@ crates/izwi-core/src/
 
 ### 4.1 Runtime Orchestration (`runtime/`)
 
-The runtime layer is the **top-level owner of all engine state**. `RuntimeService` holds an `Arc<Engine>`, a model manager, and a telemetry snapshot (`RuntimeTelemetrySnapshot`). It exposes a unified interface consumed by the HTTP layer.
+The runtime layer is the **top-level owner of all engine state**. `RuntimeService` holds the `CoreEngine`, `BackendRouter`, rollout-aware `InferenceBroker`, runtime adapter registry, model manager, model registry, codec state, residency tracking, and telemetry collector. It exposes the unified interface consumed by the HTTP layer.
 
 Sub-modules handle task-specific orchestration:
 
 | Module | Responsibility |
 |---|---|
-| `service.rs` | Lifecycle management, telemetry, model hot-swap |
-| `diarization.rs` | Speaker diarization pipeline orchestration |
-| `lfm2.rs` | LFM-2 TTS pipeline orchestration |
+| `service.rs` | Lifecycle management, backend selection, telemetry, broker observation, model residency, and task dispatch |
+| `adapters.rs` | Capability metadata for ASR, realtime ASR, TTS, streaming TTS, chat, audio chat, speech-to-speech, diarization, forced alignment, VAD, endpointing, and tokenizers |
+| `capabilities/` | Capability execution planning and validation against adapter metadata |
+| `broker.rs` | Shadow/on rollout gate for routing validation before execution cutover |
+| `pipeline.rs` | Contract graphs for modular voice turns, unified voice turns, and diarization transcripts |
+| `asr.rs`, `tts.rs`, `chat.rs`, `speech_to_speech.rs`, `diarization.rs`, `kokoro.rs` | Task-specific orchestration and direct-model paths |
+
+The server also owns a durable batch runtime in `crates/izwi-server/src/batch_runtime`. Current ASR and TTS product routes create durable jobs, input artifacts, and one queued executable stage each. Multi-stage graph materialization is being introduced as a routing/runtime foundation before broader worker cutover.
 
 ### 4.2 Model Catalog (`catalog/`)
 
