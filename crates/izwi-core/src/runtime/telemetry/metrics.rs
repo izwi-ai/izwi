@@ -1,6 +1,6 @@
 //! Runtime metrics, snapshots, and Prometheus formatting.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::time::Instant;
@@ -131,6 +131,8 @@ pub struct RuntimeStageTiming {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decode_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codec_ms: Option<f64>,
@@ -206,7 +208,39 @@ pub struct RuntimeObservabilityTelemetrySnapshot {
     pub stage_duration_ms_avg: f64,
     pub stage_duration_ms_p50: f64,
     pub stage_duration_ms_p95: f64,
+    pub workload_classes: Vec<RuntimeWorkloadClassTelemetrySnapshot>,
     pub recent_stage_samples: Vec<RuntimeStageObservation>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RuntimeLatencyStats {
+    pub count: usize,
+    pub avg: f64,
+    pub p50: f64,
+    pub p95: f64,
+}
+
+impl RuntimeLatencyStats {
+    fn from_slice(values: &[f64]) -> Self {
+        Self {
+            count: values.len(),
+            avg: mean_slice(values),
+            p50: percentile_slice(values, 0.50),
+            p95: percentile_slice(values, 0.95),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RuntimeWorkloadClassTelemetrySnapshot {
+    pub workload_class: String,
+    pub observations: u64,
+    pub failures: u64,
+    pub queue_wait_ms: RuntimeLatencyStats,
+    pub prefill_ms: RuntimeLatencyStats,
+    pub decode_ms: RuntimeLatencyStats,
+    pub ttft_ms: RuntimeLatencyStats,
+    pub stage_duration_ms: RuntimeLatencyStats,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -491,6 +525,7 @@ impl RuntimeTelemetryCollector {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
+        let workload_classes = workload_class_latency_snapshots(&recent_stage_samples);
 
         RuntimeTelemetrySnapshot {
             uptime_secs: self.start_time.elapsed().as_secs_f64(),
@@ -548,6 +583,7 @@ impl RuntimeTelemetryCollector {
                 stage_duration_ms_avg: mean(&stage_duration),
                 stage_duration_ms_p50: percentile(&stage_duration, 0.50),
                 stage_duration_ms_p95: percentile(&stage_duration, 0.95),
+                workload_classes,
                 recent_stage_samples,
             },
             engine_metrics: engine_metric_catalog(),
@@ -656,6 +692,7 @@ impl RuntimeTelemetryCollector {
             snapshot.observability.stage_duration_ms_p50,
             snapshot.observability.stage_duration_ms_p95
         ));
+        push_workload_class_prometheus(&mut payload, &snapshot.observability.workload_classes);
         payload.push_str(&voice_metric_prometheus_contract());
         payload
     }
@@ -689,6 +726,159 @@ impl RuntimeTelemetryCollector {
     }
 }
 
+#[derive(Default)]
+struct WorkloadClassLatencyAccumulator {
+    observations: u64,
+    failures: u64,
+    queue_wait_ms: Vec<f64>,
+    prefill_ms: Vec<f64>,
+    decode_ms: Vec<f64>,
+    ttft_ms: Vec<f64>,
+    stage_duration_ms: Vec<f64>,
+}
+
+impl WorkloadClassLatencyAccumulator {
+    fn record(&mut self, observation: &RuntimeStageObservation) {
+        self.observations = self.observations.saturating_add(1);
+        if observation.outcome.is_failure() {
+            self.failures = self.failures.saturating_add(1);
+        }
+        push_optional_sample(&mut self.queue_wait_ms, observation.timing.queue_wait_ms);
+        push_optional_sample(&mut self.prefill_ms, observation.timing.prefill_ms);
+        push_optional_sample(&mut self.decode_ms, observation.timing.decode_ms);
+        push_optional_sample(&mut self.ttft_ms, observation.timing.ttft_ms);
+        push_optional_sample(&mut self.stage_duration_ms, observation.timing.total_ms);
+    }
+
+    fn into_snapshot(self, workload_class: String) -> RuntimeWorkloadClassTelemetrySnapshot {
+        RuntimeWorkloadClassTelemetrySnapshot {
+            workload_class,
+            observations: self.observations,
+            failures: self.failures,
+            queue_wait_ms: RuntimeLatencyStats::from_slice(&self.queue_wait_ms),
+            prefill_ms: RuntimeLatencyStats::from_slice(&self.prefill_ms),
+            decode_ms: RuntimeLatencyStats::from_slice(&self.decode_ms),
+            ttft_ms: RuntimeLatencyStats::from_slice(&self.ttft_ms),
+            stage_duration_ms: RuntimeLatencyStats::from_slice(&self.stage_duration_ms),
+        }
+    }
+}
+
+fn workload_class_latency_snapshots(
+    observations: &[RuntimeStageObservation],
+) -> Vec<RuntimeWorkloadClassTelemetrySnapshot> {
+    let mut by_class = BTreeMap::<String, WorkloadClassLatencyAccumulator>::new();
+    for observation in observations {
+        let Some(workload_class) = observation
+            .context
+            .workload_class
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        by_class
+            .entry(workload_class.to_string())
+            .or_default()
+            .record(observation);
+    }
+    by_class
+        .into_iter()
+        .map(|(workload_class, accumulator)| accumulator.into_snapshot(workload_class))
+        .collect()
+}
+
+fn push_optional_sample(samples: &mut Vec<f64>, value: Option<f64>) {
+    if let Some(value) = value {
+        samples.push(value.max(0.0));
+    }
+}
+
+fn push_workload_class_prometheus(
+    payload: &mut String,
+    classes: &[RuntimeWorkloadClassTelemetrySnapshot],
+) {
+    if classes.is_empty() {
+        return;
+    }
+    payload.push_str("# TYPE izwi_runtime_workload_stage_observations gauge\n");
+    for class in classes {
+        let label = prometheus_label_value(&class.workload_class);
+        payload.push_str(&format!(
+            "izwi_runtime_workload_stage_observations{{workload_class=\"{label}\"}} {}\n",
+            class.observations
+        ));
+    }
+    payload.push_str("# TYPE izwi_runtime_workload_stage_failures gauge\n");
+    for class in classes {
+        let label = prometheus_label_value(&class.workload_class);
+        payload.push_str(&format!(
+            "izwi_runtime_workload_stage_failures{{workload_class=\"{label}\"}} {}\n",
+            class.failures
+        ));
+    }
+    payload.push_str("# TYPE izwi_runtime_workload_queue_wait_ms gauge\n");
+    for class in classes {
+        push_workload_class_stats(
+            payload,
+            "izwi_runtime_workload_queue_wait_ms",
+            class,
+            &class.queue_wait_ms,
+        );
+    }
+    payload.push_str("# TYPE izwi_runtime_workload_prefill_ms gauge\n");
+    for class in classes {
+        push_workload_class_stats(
+            payload,
+            "izwi_runtime_workload_prefill_ms",
+            class,
+            &class.prefill_ms,
+        );
+    }
+    payload.push_str("# TYPE izwi_runtime_workload_decode_ms gauge\n");
+    for class in classes {
+        push_workload_class_stats(
+            payload,
+            "izwi_runtime_workload_decode_ms",
+            class,
+            &class.decode_ms,
+        );
+    }
+    payload.push_str("# TYPE izwi_runtime_workload_ttft_ms gauge\n");
+    for class in classes {
+        push_workload_class_stats(
+            payload,
+            "izwi_runtime_workload_ttft_ms",
+            class,
+            &class.ttft_ms,
+        );
+    }
+    payload.push_str("# TYPE izwi_runtime_workload_stage_duration_ms gauge\n");
+    for class in classes {
+        push_workload_class_stats(
+            payload,
+            "izwi_runtime_workload_stage_duration_ms",
+            class,
+            &class.stage_duration_ms,
+        );
+    }
+}
+
+fn push_workload_class_stats(
+    payload: &mut String,
+    metric_name: &str,
+    class: &RuntimeWorkloadClassTelemetrySnapshot,
+    stats: &RuntimeLatencyStats,
+) {
+    let workload_class = prometheus_label_value(&class.workload_class);
+    for (quantile, value) in [("avg", stats.avg), ("p50", stats.p50), ("p95", stats.p95)] {
+        payload.push_str(&format!(
+            "{metric_name}{{workload_class=\"{workload_class}\",quantile=\"{quantile}\"}} {value:.6}\n"
+        ));
+    }
+}
+
 fn push_voice_counter(payload: &mut String, name: &str, help: &str, value: u64) {
     let prometheus_name = prometheus_voice_metric_name(name);
     payload.push_str(&format!(
@@ -711,6 +901,13 @@ fn mean(values: &VecDeque<f64>) -> f64 {
     values.iter().sum::<f64>() / values.len() as f64
 }
 
+fn mean_slice(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.iter().sum::<f64>() / values.len() as f64
+}
+
 fn percentile(values: &VecDeque<f64>, q: f64) -> f64 {
     if values.is_empty() {
         return 0.0;
@@ -719,6 +916,23 @@ fn percentile(values: &VecDeque<f64>, q: f64) -> f64 {
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let idx = ((sorted.len().saturating_sub(1)) as f64 * q.clamp(0.0, 1.0)) as usize;
     sorted[idx]
+}
+
+fn percentile_slice(values: &[f64], q: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((sorted.len().saturating_sub(1)) as f64 * q.clamp(0.0, 1.0)) as usize;
+    sorted[idx]
+}
+
+fn prometheus_label_value(value: &str) -> String {
+    value
+        .replace('\\', r"\\")
+        .replace('"', r#"\""#)
+        .replace('\n', r"\n")
 }
 
 #[cfg(test)]
@@ -813,6 +1027,7 @@ mod tests {
             capability: Some("tts".to_string()),
             model_variant: Some("Kokoro-82M".to_string()),
             backend_kind: Some("cpu".to_string()),
+            workload_class: Some("interactive".to_string()),
             pipeline_stage: Some("tts_synthesize".to_string()),
             request_id: Some("req-1".to_string()),
             correlation_id: Some("corr-1".to_string()),
@@ -821,13 +1036,17 @@ mod tests {
             ..RuntimeObservationContext::default()
         };
 
-        telemetry.record_stage_observation(
-            RuntimeStageObservation::new(context, RuntimeStageOutcome::Completed)
-                .with_total_ms(42.0),
-        );
+        let mut completed = RuntimeStageObservation::new(context, RuntimeStageOutcome::Completed)
+            .with_total_ms(42.0);
+        completed.timing.queue_wait_ms = Some(5.0);
+        completed.timing.prefill_ms = Some(7.0);
+        completed.timing.decode_ms = Some(11.0);
+        completed.timing.ttft_ms = Some(13.0);
+        telemetry.record_stage_observation(completed);
         telemetry.record_stage_observation(
             RuntimeStageObservation::new(
                 RuntimeObservationContext {
+                    workload_class: Some("batch".to_string()),
                     pipeline_stage: Some("tts_synthesize".to_string()),
                     ..RuntimeObservationContext::default()
                 },
@@ -843,6 +1062,18 @@ mod tests {
         assert_eq!(snapshot.observability.stage_duration_ms_avg, 71.0);
         assert_eq!(snapshot.observability.stage_duration_ms_p50, 42.0);
         assert_eq!(snapshot.observability.recent_stage_samples.len(), 2);
+        let interactive = snapshot
+            .observability
+            .workload_classes
+            .iter()
+            .find(|class| class.workload_class == "interactive")
+            .expect("interactive class aggregate");
+        assert_eq!(interactive.observations, 1);
+        assert_eq!(interactive.failures, 0);
+        assert_eq!(interactive.queue_wait_ms.avg, 5.0);
+        assert_eq!(interactive.prefill_ms.avg, 7.0);
+        assert_eq!(interactive.decode_ms.avg, 11.0);
+        assert_eq!(interactive.ttft_ms.avg, 13.0);
         assert_eq!(
             snapshot.observability.recent_stage_samples[0]
                 .context
@@ -855,6 +1086,15 @@ mod tests {
         assert!(payload.contains("izwi_runtime_stage_observations_total 2"));
         assert!(payload.contains("izwi_runtime_stage_failures_total 1"));
         assert!(payload.contains("izwi_runtime_stage_duration_ms{quantile=\"avg\"} 71.000000"));
+        assert!(payload.contains(
+            "izwi_runtime_workload_stage_observations{workload_class=\"interactive\"} 1"
+        ));
+        assert!(payload.contains(
+            "izwi_runtime_workload_queue_wait_ms{workload_class=\"interactive\",quantile=\"avg\"} 5.000000"
+        ));
+        assert!(
+            payload.contains("izwi_runtime_workload_stage_failures{workload_class=\"batch\"} 1")
+        );
         assert!(!payload.contains("req-1"));
         assert!(!payload.contains("job-1"));
     }

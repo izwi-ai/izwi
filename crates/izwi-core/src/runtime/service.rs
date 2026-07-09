@@ -639,6 +639,7 @@ impl RuntimeService {
             timing.queue_wait_ms = Some(latency.queue_wait_ms);
             timing.prefill_ms = Some(latency.prefill_ms);
             timing.decode_ms = Some(latency.decode_ms);
+            timing.ttft_ms = latency.ttft_ms;
             timing.total_ms = Some(latency.total_ms);
         }
 

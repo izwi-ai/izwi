@@ -44,6 +44,39 @@ struct RuntimeTelemetrySnapshot {
     end_to_end_ms_p95: f64,
     #[serde(default)]
     kernel_path: KernelPathTelemetrySnapshot,
+    #[serde(default)]
+    observability: RuntimeObservabilityTelemetrySnapshot,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct RuntimeObservabilityTelemetrySnapshot {
+    #[serde(default)]
+    workload_classes: Vec<RuntimeWorkloadClassTelemetrySnapshot>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct RuntimeWorkloadClassTelemetrySnapshot {
+    workload_class: String,
+    observations: u64,
+    failures: u64,
+    #[serde(default)]
+    queue_wait_ms: RuntimeLatencyStats,
+    #[serde(default)]
+    prefill_ms: RuntimeLatencyStats,
+    #[serde(default)]
+    decode_ms: RuntimeLatencyStats,
+    #[serde(default)]
+    ttft_ms: RuntimeLatencyStats,
+    #[serde(default)]
+    stage_duration_ms: RuntimeLatencyStats,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct RuntimeLatencyStats {
+    count: usize,
+    avg: f64,
+    p50: f64,
+    p95: f64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -601,6 +634,7 @@ struct BenchmarkObservabilityBundle {
 struct ObservabilitySnapshot {
     captured_at: DateTime<Utc>,
     health: Option<serde_json::Value>,
+    readiness: Option<serde_json::Value>,
     metrics: Option<serde_json::Value>,
     prometheus: Option<String>,
 }
@@ -1489,6 +1523,10 @@ async fn bench_manifest(
 }
 
 async fn capture_observability(server: &str) -> ObservabilitySnapshot {
+    let readiness = match fetch_json(server, "/v1/ready").await {
+        Some(value) => Some(value),
+        None => fetch_json(server, "/internal/ready").await,
+    };
     let metrics = match fetch_json(server, "/internal/metrics").await {
         Some(value) => Some(value),
         None => fetch_json(server, "/v1/metrics").await,
@@ -1500,6 +1538,7 @@ async fn capture_observability(server: &str) -> ObservabilitySnapshot {
     ObservabilitySnapshot {
         captured_at: Utc::now(),
         health: fetch_json(server, "/v1/health").await,
+        readiness,
         metrics,
         prometheus,
     }
@@ -4643,6 +4682,23 @@ fn print_runtime_delta(
         "  End-to-end rolling(avg/p50/p95): {:.2} / {:.2} / {:.2} ms",
         after.end_to_end_ms_avg, after.end_to_end_ms_p50, after.end_to_end_ms_p95
     );
+    if !after.observability.workload_classes.is_empty() {
+        println!("  Workload class rolling samples:");
+        for class in &after.observability.workload_classes {
+            println!(
+                "    {:<12} samples={}, failures={}, queue avg/p95={:.2}/{:.2} ms, ttft avg/p95={:.2}/{:.2} ms, total avg/p95={:.2}/{:.2} ms",
+                class.workload_class,
+                class.observations,
+                class.failures,
+                class.queue_wait_ms.avg,
+                class.queue_wait_ms.p95,
+                class.ttft_ms.avg,
+                class.ttft_ms.p95,
+                class.stage_duration_ms.avg,
+                class.stage_duration_ms.p95
+            );
+        }
+    }
     let kernel_before = &before.kernel_path;
     let kernel_after = &after.kernel_path;
     let prefill_token_mode_delta = kernel_after
@@ -5474,6 +5530,49 @@ mod tests {
             kernel_path.fused_attention_fallback_flash_runtime_error_total,
             0
         );
+    }
+
+    #[test]
+    fn workload_class_telemetry_deserializes_for_benchmark_reports() {
+        let observability: RuntimeObservabilityTelemetrySnapshot =
+            serde_json::from_value(serde_json::json!({
+                "workload_classes": [
+                    {
+                        "workload_class": "interactive",
+                        "observations": 2,
+                        "failures": 0,
+                        "queue_wait_ms": {
+                            "count": 2,
+                            "avg": 4.5,
+                            "p50": 3.0,
+                            "p95": 6.0
+                        },
+                        "ttft_ms": {
+                            "count": 2,
+                            "avg": 18.0,
+                            "p50": 12.0,
+                            "p95": 24.0
+                        },
+                        "stage_duration_ms": {
+                            "count": 2,
+                            "avg": 40.0,
+                            "p50": 35.0,
+                            "p95": 45.0
+                        }
+                    }
+                ]
+            }))
+            .expect("workload class telemetry should deserialize");
+
+        let interactive = observability
+            .workload_classes
+            .iter()
+            .find(|class| class.workload_class == "interactive")
+            .expect("interactive workload class");
+        assert_eq!(interactive.observations, 2);
+        assert_eq!(interactive.queue_wait_ms.avg, 4.5);
+        assert_eq!(interactive.ttft_ms.p95, 24.0);
+        assert_eq!(interactive.prefill_ms.count, 0);
     }
 
     #[tokio::test]

@@ -7,10 +7,10 @@ mod tracing;
 pub(crate) use metrics::{push_engine_metric, RuntimeTelemetryCollector};
 pub use metrics::{
     EngineRuntimeTelemetrySnapshot, InferenceBrokerRuntimeTelemetrySnapshot,
-    PipelineRuntimeTelemetrySnapshot, RuntimeObservabilityTelemetrySnapshot,
+    PipelineRuntimeTelemetrySnapshot, RuntimeLatencyStats, RuntimeObservabilityTelemetrySnapshot,
     RuntimeObservationContext, RuntimeStageObservation, RuntimeStageOutcome,
     RuntimeStageOutputCounters, RuntimeStageTiming, RuntimeTelemetrySnapshot,
-    VoiceRuntimeTelemetrySnapshot,
+    RuntimeWorkloadClassTelemetrySnapshot, VoiceRuntimeTelemetrySnapshot,
 };
 pub use replay::{
     sanitized_replay_record, ReplayRedaction, RuntimeReplayRecord, RUNTIME_REPLAY_REDACTION,
