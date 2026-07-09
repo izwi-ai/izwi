@@ -1,0 +1,5 @@
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))']
+# Candle 0.11.0's Apple Silicon NEON fp16 path uses unstable stdarch types on
+# stable Rust. Disable the CPU fp16 target feature so crates.io Candle uses its
+# stable fallback while Metal acceleration remains available.
+rustflags = ["-C", "target-feature=-fp16"]

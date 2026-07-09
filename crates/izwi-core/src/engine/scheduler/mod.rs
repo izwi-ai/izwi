@@ -458,9 +458,10 @@ impl Scheduler {
         let mut decode_budget = total_budget;
         let mut reserved_prefill_budget = 0;
         if self.config.enable_adaptive_batching && total_budget > 0 {
-            let mut prefill_share = if self.telemetry.avg_ttft_ms > self.config.target_ttft_ms {
+            let target_ttft_ms = self.config.target_ttft_ms;
+            let mut prefill_share: f64 = if self.telemetry.avg_ttft_ms > target_ttft_ms {
                 0.55
-            } else if self.telemetry.avg_ttft_ms > self.config.target_ttft_ms * 0.8 {
+            } else if self.telemetry.avg_ttft_ms > target_ttft_ms * 0.8 {
                 0.40
             } else {
                 0.25

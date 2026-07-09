@@ -13,16 +13,18 @@ This keeps Docker, CI, local development, and release packaging on the same
 dependency source. It also avoids requiring every reduced build context to copy
 a local Candle checkout before running `cargo build --locked`.
 
-Known local caveat:
+Apple Silicon stable Rust caveat:
 
 - On the Apple Silicon stable Rust toolchain used during the upgrade, upstream
   `candle-core 0.11.0` can hit unstable `stdarch_neon_f16` code in Candle's
   NEON fp16 specialization.
-- Do not add a local vendored Candle patch for this. Treat it as an upstream
-  Candle/toolchain compatibility issue and verify Linux Docker/CI paths against
-  the crates.io dependency.
-- Global `RUSTFLAGS='-C target-feature=-fp16'` is not a general workaround for
-  this workspace because it can break other dependencies such as `gemm-f16`.
+- The workspace keeps using crates.io Candle and handles this with
+  `.cargo/config.toml`, disabling the CPU `fp16` target feature only for
+  `aarch64-apple-darwin`. This routes Candle through its stable fallback while
+  leaving Metal acceleration available.
+- Do not add a local vendored Candle patch for this. Treat any future removal of
+  the Cargo config as an upstream Candle/toolchain compatibility decision, and
+  verify Linux Docker/CI paths against the crates.io dependency.
 
 ## Metal API Migration
 

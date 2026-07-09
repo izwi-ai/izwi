@@ -677,6 +677,30 @@ impl NemotronDecodeRequest {
 }
 
 impl NemotronAsrModel {
+    pub fn diagnostics(&self) -> serde_json::Value {
+        json!({
+            "variant": self.variant.dir_name(),
+            "repo_id": self.variant.repo_id(),
+            "device": format!("{:?}", self.device_profile.kind),
+            "nemo_path": self.artifacts.nemo_path.display().to_string(),
+            "checkpoint_path": self.artifacts.checkpoint_path.display().to_string(),
+            "model_config_path": self.artifacts.model_config_path.display().to_string(),
+            "tokenizer_vocab_size": self.decoder.vocab_size(),
+            "decoder_vocabulary_size": self.decoder.vocab_size(),
+            "decoder_source": self.decoder.source(),
+            "runtime": self.runtime_plan.diagnostics(),
+            "dtype_plan": nemotron_dtype_diagnostics(
+                &self.dtype_selection,
+                &self.device_profile,
+                self.network.dtype()
+            ),
+            "blank_id": self.network.blank_idx(),
+            "native_forward_status": "enabled_offline_fastconformer_rnnt",
+            "supports_realtime_cache_decode": false,
+            "supports_realtime_stream_decode": true,
+        })
+    }
+
     pub fn load(
         model_dir: &Path,
         variant: ModelVariant,
