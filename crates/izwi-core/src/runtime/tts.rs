@@ -21,11 +21,51 @@ use crate::runtime::adapters::CapabilityKind;
 use crate::runtime::audio_io::{base64_decode, decode_audio_bytes};
 use crate::runtime::request::TtsRuntimeRequest;
 use crate::runtime::service::RuntimeService;
+use crate::runtime::telemetry::{
+    RuntimeObservationContext, RuntimeStageObservation, RuntimeStageOutcome,
+    RuntimeStageOutputCounters, RuntimeStageTiming,
+};
 use crate::runtime::types::{
     AudioChunk, ChunkStats, GenerationConfig, GenerationRequest, GenerationResult,
 };
 
 const LFM25_AUDIO_DEFAULT_MAX_NEW_TOKENS: usize = 1024;
+
+#[derive(Debug, Clone)]
+struct DirectTtsObservationContext {
+    request_id: String,
+    correlation_id: Option<String>,
+    model_variant: ModelVariant,
+    workload_class: String,
+    admission_ms: Option<f64>,
+    streaming: bool,
+    started: Instant,
+}
+
+impl DirectTtsObservationContext {
+    fn new(request: &GenerationRequest, model_variant: ModelVariant, streaming: bool) -> Self {
+        Self {
+            request_id: request.id.clone(),
+            correlation_id: request.correlation_id.clone(),
+            model_variant,
+            workload_class: request.runtime_context.workload_class.as_str().to_string(),
+            admission_ms: request.runtime_context.admission_ms,
+            streaming,
+            started: Instant::now(),
+        }
+    }
+}
+
+fn uses_direct_tts_runtime(variant: ModelVariant) -> bool {
+    matches!(
+        variant.family(),
+        ModelFamily::KokoroTts
+            | ModelFamily::Lfm25Audio
+            | ModelFamily::VoxtralTts
+            | ModelFamily::VibeVoiceTts
+            | ModelFamily::FishS2Tts
+    )
+}
 
 fn vibevoice_reference_from_request(
     request: &GenerationRequest,
@@ -101,6 +141,61 @@ fn lfm25_audio_prompt_messages(text: &str, speaker: Option<&str>) -> Vec<ChatMes
 }
 
 impl RuntimeService {
+    fn record_direct_tts_observation(
+        &self,
+        context: DirectTtsObservationContext,
+        result: std::result::Result<Option<&GenerationResult>, &Error>,
+    ) {
+        let backend = self.backend_context();
+        let outcome = if result.is_ok() {
+            RuntimeStageOutcome::Completed
+        } else {
+            RuntimeStageOutcome::Failed
+        };
+        let mut observation = RuntimeStageObservation::new(
+            RuntimeObservationContext {
+                route_source: Some("direct_model".to_string()),
+                capability: Some("tts".to_string()),
+                model_variant: Some(context.model_variant.dir_name().to_string()),
+                backend_kind: Some(backend.backend_kind.as_str().to_string()),
+                pipeline_stage: Some(if context.streaming {
+                    "tts.direct.streaming".to_string()
+                } else {
+                    "tts.direct.request".to_string()
+                }),
+                workload_class: Some(context.workload_class),
+                request_id: Some(context.request_id),
+                correlation_id: context.correlation_id,
+                ..RuntimeObservationContext::default()
+            },
+            outcome,
+        );
+        observation.timing = RuntimeStageTiming {
+            admission_ms: context.admission_ms,
+            total_ms: Some(
+                result
+                    .as_ref()
+                    .ok()
+                    .and_then(|generation| generation.as_ref())
+                    .map(|generation| f64::from(generation.total_time_ms))
+                    .unwrap_or_else(|| context.started.elapsed().as_secs_f64() * 1000.0),
+            ),
+            ..RuntimeStageTiming::default()
+        };
+        match result {
+            Ok(Some(generation)) => {
+                observation.outputs = RuntimeStageOutputCounters {
+                    generated_tokens: Some(generation.total_tokens as u64),
+                    audio_samples: Some(generation.samples.len() as u64),
+                    ..RuntimeStageOutputCounters::default()
+                };
+            }
+            Ok(None) => {}
+            Err(err) => observation.error_kind = Some(err.to_string()),
+        }
+        self.record_stage_observation(observation);
+    }
+
     async fn resolve_tts_variant_for_request(
         &self,
         request: &GenerationRequest,
@@ -448,28 +543,31 @@ impl RuntimeService {
     /// Generate audio from text using the unified core engine.
     pub async fn generate(&self, request: GenerationRequest) -> Result<GenerationResult> {
         let resolved_variant = self.resolve_tts_variant_for_request(&request).await?;
-        if matches!(resolved_variant.family(), ModelFamily::KokoroTts) {
-            return self.kokoro_tts_generate(request).await;
-        }
-        if matches!(resolved_variant.family(), ModelFamily::Lfm25Audio) {
-            return self
-                .lfm25_audio_tts_generate(request, resolved_variant, false)
-                .await;
-        }
-        if matches!(resolved_variant.family(), ModelFamily::VoxtralTts) {
-            return self
-                .voxtral_tts_generate(request, resolved_variant, false)
-                .await;
-        }
-        if matches!(resolved_variant.family(), ModelFamily::VibeVoiceTts) {
-            return self
-                .vibevoice_tts_generate(request, resolved_variant, false)
-                .await;
-        }
-        if matches!(resolved_variant.family(), ModelFamily::FishS2Tts) {
-            return self
-                .fish_s2_tts_generate(request, resolved_variant, false)
-                .await;
+        if uses_direct_tts_runtime(resolved_variant) {
+            let observation =
+                DirectTtsObservationContext::new(&request, resolved_variant, false);
+            let result = match resolved_variant.family() {
+                ModelFamily::KokoroTts => self.kokoro_tts_generate(request).await,
+                ModelFamily::Lfm25Audio => {
+                    self.lfm25_audio_tts_generate(request, resolved_variant, false)
+                        .await
+                }
+                ModelFamily::VoxtralTts => {
+                    self.voxtral_tts_generate(request, resolved_variant, false)
+                        .await
+                }
+                ModelFamily::VibeVoiceTts => {
+                    self.vibevoice_tts_generate(request, resolved_variant, false)
+                        .await
+                }
+                ModelFamily::FishS2Tts => {
+                    self.fish_s2_tts_generate(request, resolved_variant, false)
+                        .await
+                }
+                _ => unreachable!("direct TTS family checked above"),
+            };
+            self.record_direct_tts_observation(observation, result.as_ref().map(Some));
+            return result;
         }
         self.load_model(resolved_variant).await?;
 
@@ -509,28 +607,32 @@ impl RuntimeService {
         chunk_tx: mpsc::Sender<AudioChunk>,
     ) -> Result<()> {
         let resolved_variant = self.resolve_tts_variant_for_request(&request).await?;
-        if matches!(resolved_variant.family(), ModelFamily::KokoroTts) {
-            return self.kokoro_tts_generate_streaming(request, chunk_tx).await;
-        }
-        if matches!(resolved_variant.family(), ModelFamily::Lfm25Audio) {
-            return self
-                .lfm25_audio_tts_generate_streaming(request, resolved_variant, chunk_tx)
-                .await;
-        }
-        if matches!(resolved_variant.family(), ModelFamily::VoxtralTts) {
-            return self
-                .voxtral_tts_generate_streaming(request, resolved_variant, chunk_tx)
-                .await;
-        }
-        if matches!(resolved_variant.family(), ModelFamily::VibeVoiceTts) {
-            return self
-                .vibevoice_tts_generate_streaming(request, resolved_variant, chunk_tx)
-                .await;
-        }
-        if matches!(resolved_variant.family(), ModelFamily::FishS2Tts) {
-            return self
-                .fish_s2_tts_generate_streaming(request, resolved_variant, chunk_tx)
-                .await;
+        if uses_direct_tts_runtime(resolved_variant) {
+            let observation = DirectTtsObservationContext::new(&request, resolved_variant, true);
+            let result = match resolved_variant.family() {
+                ModelFamily::KokoroTts => {
+                    self.kokoro_tts_generate_streaming(request, chunk_tx).await
+                }
+                ModelFamily::Lfm25Audio => {
+                    self.lfm25_audio_tts_generate_streaming(request, resolved_variant, chunk_tx)
+                        .await
+                }
+                ModelFamily::VoxtralTts => {
+                    self.voxtral_tts_generate_streaming(request, resolved_variant, chunk_tx)
+                        .await
+                }
+                ModelFamily::VibeVoiceTts => {
+                    self.vibevoice_tts_generate_streaming(request, resolved_variant, chunk_tx)
+                        .await
+                }
+                ModelFamily::FishS2Tts => {
+                    self.fish_s2_tts_generate_streaming(request, resolved_variant, chunk_tx)
+                        .await
+                }
+                _ => unreachable!("direct TTS family checked above"),
+            };
+            self.record_direct_tts_observation(observation, result.as_ref().map(|_| None));
+            return result;
         }
         if qwen_tts_streaming_uses_final_only(
             self.device.kind.is_cuda(),

@@ -44,7 +44,8 @@ use async_trait::async_trait;
 use izwi_core::runtime::SpeakerAttributedAsrStatus as RuntimeSpeakerAttributedAsrStatus;
 use izwi_core::{
     parse_chat_model_variant, parse_model_variant, AsrProgress, AsrProgressPhase, ChatMessage,
-    ChatRequestConfig, ChatRole, GenerationParams, ModelVariant, RuntimeService, WorkloadClass,
+    ChatRequestConfig, ChatRole, GenerationParams, ModelVariant, RuntimeRequestContext,
+    RuntimeService, WorkloadClass,
 };
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
@@ -690,7 +691,7 @@ fn spawn_transcription_processing_task(
             }
         };
 
-        let _permit = match state.acquire_owned_workload_permit(workload_class).await {
+        let permit = match state.acquire_owned_workload_permit(workload_class).await {
             Ok(permit) => permit,
             Err(_) => {
                 let error_message = "Server is shutting down".to_string();
@@ -714,6 +715,7 @@ fn spawn_transcription_processing_task(
                 return;
             }
         };
+        let runtime_context = permit.runtime_context();
 
         let _ = transcription_store
             .update_processing_status(
@@ -801,6 +803,7 @@ fn spawn_transcription_processing_task(
                     requested_language.as_deref(),
                     include_timestamps,
                     correlation_id_ref.as_deref(),
+                    runtime_context,
                     move |delta| {
                         if let Some(tx) = &delta_tx {
                             let _ = tx.send(
@@ -961,6 +964,7 @@ async fn generate_transcription_artifacts<F, P>(
     requested_language: Option<&str>,
     include_timestamps: bool,
     correlation_id: Option<&str>,
+    runtime_context: RuntimeRequestContext,
     on_delta: F,
     on_progress: P,
 ) -> Result<GeneratedTranscriptionArtifacts, ApiError>
@@ -971,11 +975,12 @@ where
     let progress_callback = std::sync::Arc::new(std::sync::Mutex::new(on_progress));
     let runtime_progress_callback = progress_callback.clone();
     let output = runtime
-        .asr_transcribe_bytes_with_progress_and_correlation(
+        .asr_transcribe_bytes_with_progress_and_runtime_context(
             audio_bytes,
             model_id,
             requested_language,
             correlation_id,
+            runtime_context,
             on_delta,
             move |progress| {
                 if let Ok(mut callback) = runtime_progress_callback.lock() {
@@ -1540,7 +1545,7 @@ fn spawn_summary_generation_task(
     tokio::spawn(async move {
         let runtime = state.runtime.clone();
         let transcription_store = state.transcription_store.clone();
-        let _permit = match state
+        let permit = match state
             .acquire_owned_workload_permit(WorkloadClass::Background)
             .await
         {
@@ -1555,6 +1560,7 @@ fn spawn_summary_generation_task(
                 runtime,
                 transcription.as_str(),
                 correlation_id.as_deref(),
+                permit.runtime_context(),
             )
             .await
         };
@@ -1593,6 +1599,7 @@ async fn generate_transcription_summary(
     runtime: Arc<RuntimeService>,
     transcription: &str,
     correlation_id: Option<&str>,
+    runtime_context: RuntimeRequestContext,
 ) -> Result<String, String> {
     let variant =
         parse_chat_model_variant(Some(DEFAULT_TRANSCRIPTION_SUMMARY_MODEL)).map_err(|err| {
@@ -1605,6 +1612,7 @@ async fn generate_transcription_summary(
         transcription,
         correlation_id,
         None,
+        runtime_context,
     )
     .await;
     match first {
@@ -1621,6 +1629,7 @@ async fn generate_transcription_summary(
                 transcription,
                 correlation_id,
                 Some(false),
+                runtime_context,
             )
             .await
             .map_err(|retry_err| format!("{err}; retry with thinking disabled failed: {retry_err}"))
@@ -1635,9 +1644,10 @@ async fn generate_transcription_summary_attempt(
     transcription: &str,
     correlation_id: Option<&str>,
     enable_thinking: Option<bool>,
+    runtime_context: RuntimeRequestContext,
 ) -> Result<String, String> {
     let generation = runtime
-        .chat_generate_with_generation_params_and_chat_config_and_correlation(
+        .chat_generate_with_runtime_context(
             variant,
             transcription_summary_messages(transcription),
             transcription_summary_params(),
@@ -1647,6 +1657,7 @@ async fn generate_transcription_summary_attempt(
                 media_inputs: Vec::new(),
             },
             correlation_id,
+            runtime_context,
         )
         .await
         .map_err(|err| format!("Summary generation failed: {err}"))?;

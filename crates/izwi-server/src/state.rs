@@ -13,12 +13,12 @@ use crate::transcription_store::TranscriptionStore;
 use crate::voice_observation_store::VoiceObservationStore;
 use crate::voice_store::VoiceStore;
 use izwi_agent::planner::PlanningMode;
-use izwi_core::{RuntimeService, ServeRuntimeConfig, WorkloadClass};
+use izwi_core::{RuntimeRequestContext, RuntimeService, ServeRuntimeConfig, WorkloadClass};
 use izwi_hooks::EnterpriseHooks;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, SemaphorePermit};
 
 const DEFAULT_RESPONSE_STORE_LIMIT: usize = 512;
@@ -33,6 +33,7 @@ pub struct RequestAdmissionClassSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RequestAdmissionSnapshot {
     pub global: RequestAdmissionClassSnapshot,
+    pub non_realtime: RequestAdmissionClassSnapshot,
     pub realtime: RequestAdmissionClassSnapshot,
     pub interactive: RequestAdmissionClassSnapshot,
     pub streaming: RequestAdmissionClassSnapshot,
@@ -43,6 +44,7 @@ pub struct RequestAdmissionSnapshot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RequestAdmissionLimits {
+    global: usize,
     realtime: usize,
     interactive: usize,
     streaming: usize,
@@ -60,6 +62,7 @@ impl RequestAdmissionLimits {
             1
         };
         Self {
+            global: global_capacity,
             realtime: class_limit_from_env("IZWI_MAX_REALTIME_REQUESTS", global_capacity),
             interactive: class_limit_from_env("IZWI_MAX_INTERACTIVE_REQUESTS", global_capacity),
             streaming: class_limit_from_env("IZWI_MAX_STREAMING_REQUESTS", global_capacity),
@@ -73,6 +76,8 @@ impl RequestAdmissionLimits {
 #[derive(Clone)]
 pub struct RequestAdmissionLimiter {
     limits: RequestAdmissionLimits,
+    non_realtime_limit: usize,
+    non_realtime: Arc<Semaphore>,
     realtime: Arc<Semaphore>,
     interactive: Arc<Semaphore>,
     streaming: Arc<Semaphore>,
@@ -83,25 +88,33 @@ pub struct RequestAdmissionLimiter {
 
 pub struct AdmissionPermit<'a> {
     _class_permit: SemaphorePermit<'a>,
+    _non_realtime_permit: Option<SemaphorePermit<'a>>,
     _global_permit: SemaphorePermit<'a>,
     class: WorkloadClass,
+    wait_ms: f64,
 }
 
 impl AdmissionPermit<'_> {
-    pub fn class(&self) -> WorkloadClass {
-        self.class
+    pub fn wait_ms(&self) -> f64 {
+        self.wait_ms
+    }
+
+    pub fn runtime_context(&self) -> RuntimeRequestContext {
+        RuntimeRequestContext::new(self.class).with_admission_ms(self.wait_ms)
     }
 }
 
 pub struct OwnedAdmissionPermit {
     _class_permit: OwnedSemaphorePermit,
+    _non_realtime_permit: Option<OwnedSemaphorePermit>,
     _global_permit: OwnedSemaphorePermit,
     class: WorkloadClass,
+    wait_ms: f64,
 }
 
 impl OwnedAdmissionPermit {
-    pub fn class(&self) -> WorkloadClass {
-        self.class
+    pub fn runtime_context(&self) -> RuntimeRequestContext {
+        RuntimeRequestContext::new(self.class).with_admission_ms(self.wait_ms)
     }
 }
 
@@ -111,8 +124,15 @@ impl RequestAdmissionLimiter {
     }
 
     fn from_limits(limits: RequestAdmissionLimits) -> Self {
+        let non_realtime_capacity = if limits.global > 1 {
+            limits.global - 1
+        } else {
+            1
+        };
         Self {
             limits,
+            non_realtime_limit: non_realtime_capacity,
+            non_realtime: Arc::new(Semaphore::new(non_realtime_capacity)),
             realtime: Arc::new(Semaphore::new(limits.realtime)),
             interactive: Arc::new(Semaphore::new(limits.interactive)),
             streaming: Arc::new(Semaphore::new(limits.streaming)),
@@ -127,19 +147,32 @@ impl RequestAdmissionLimiter {
         class: WorkloadClass,
         global: &'a Semaphore,
     ) -> AdmissionPermit<'a> {
+        let started = Instant::now();
         let class_permit = self
             .semaphore_for(class)
             .acquire()
             .await
             .expect("class admission semaphore should never be closed");
+        let non_realtime_permit = if class == WorkloadClass::Realtime {
+            None
+        } else {
+            Some(
+                self.non_realtime
+                    .acquire()
+                    .await
+                    .expect("non-realtime admission semaphore should never be closed"),
+            )
+        };
         let global_permit = global
             .acquire()
             .await
             .expect("global request semaphore should never be closed");
         AdmissionPermit {
             _class_permit: class_permit,
+            _non_realtime_permit: non_realtime_permit,
             _global_permit: global_permit,
             class,
+            wait_ms: started.elapsed().as_secs_f64() * 1000.0,
         }
     }
 
@@ -148,12 +181,20 @@ impl RequestAdmissionLimiter {
         class: WorkloadClass,
         global: Arc<Semaphore>,
     ) -> Result<OwnedAdmissionPermit, tokio::sync::AcquireError> {
+        let started = Instant::now();
         let class_permit = self.semaphore_for(class).clone().acquire_owned().await?;
+        let non_realtime_permit = if class == WorkloadClass::Realtime {
+            None
+        } else {
+            Some(self.non_realtime.clone().acquire_owned().await?)
+        };
         let global_permit = global.acquire_owned().await?;
         Ok(OwnedAdmissionPermit {
             _class_permit: class_permit,
+            _non_realtime_permit: non_realtime_permit,
             _global_permit: global_permit,
             class,
+            wait_ms: started.elapsed().as_secs_f64() * 1000.0,
         })
     }
 
@@ -162,6 +203,10 @@ impl RequestAdmissionLimiter {
             global: RequestAdmissionClassSnapshot {
                 capacity: global_capacity,
                 available: global.available_permits(),
+            },
+            non_realtime: RequestAdmissionClassSnapshot {
+                capacity: self.non_realtime_limit,
+                available: self.non_realtime.available_permits(),
             },
             realtime: self.class_snapshot(WorkloadClass::Realtime),
             interactive: self.class_snapshot(WorkloadClass::Interactive),
@@ -512,11 +557,6 @@ impl AppState {
         })
     }
 
-    /// Acquire a permit for concurrent online request processing.
-    pub async fn acquire_permit(&self) -> AdmissionPermit<'_> {
-        self.acquire_workload_permit(WorkloadClass::Online).await
-    }
-
     /// Acquire a permit for a specific workload class.
     pub async fn acquire_workload_permit(&self, class: WorkloadClass) -> AdmissionPermit<'_> {
         self.request_admission
@@ -732,6 +772,7 @@ mod tests {
     #[tokio::test]
     async fn admission_limiter_reserves_capacity_from_batch_by_default() {
         let limits = RequestAdmissionLimits {
+            global: 4,
             realtime: 4,
             interactive: 4,
             streaming: 4,
@@ -767,6 +808,49 @@ mod tests {
         .expect("realtime should not wait behind saturated batch class")
         .expect("realtime permit should acquire");
         assert_eq!(global.available_permits(), 0);
+    }
+
+    #[tokio::test]
+    async fn admission_limiter_reserves_realtime_capacity_across_non_realtime_classes() {
+        let limits = RequestAdmissionLimits {
+            global: 4,
+            realtime: 4,
+            interactive: 4,
+            streaming: 4,
+            online: 4,
+            batch: 4,
+            background: 4,
+        };
+        let limiter = RequestAdmissionLimiter::from_limits(limits);
+        let global = Arc::new(Semaphore::new(4));
+
+        let _interactive = limiter
+            .acquire_owned(WorkloadClass::Interactive, global.clone())
+            .await
+            .expect("interactive permit should acquire");
+        let _batch = limiter
+            .acquire_owned(WorkloadClass::Batch, global.clone())
+            .await
+            .expect("batch permit should acquire");
+        let _background = limiter
+            .acquire_owned(WorkloadClass::Background, global.clone())
+            .await
+            .expect("background permit should acquire");
+
+        let snapshot = limiter.snapshot(&global, 4);
+        assert_eq!(snapshot.non_realtime.available, 0);
+        assert_eq!(snapshot.global.available, 1);
+
+        let realtime = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            limiter.acquire_owned(WorkloadClass::Realtime, global.clone()),
+        )
+        .await
+        .expect("realtime should retain reserved global capacity")
+        .expect("realtime permit should acquire");
+        let context = realtime.runtime_context();
+        assert_eq!(context.workload_class, WorkloadClass::Realtime);
+        assert!(context.admission_ms.is_some_and(|wait_ms| wait_ms >= 0.0));
     }
 
     #[test]

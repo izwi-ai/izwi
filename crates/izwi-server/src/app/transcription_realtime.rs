@@ -852,15 +852,18 @@ async fn run_inference(
 ) -> Result<InferenceResult, String> {
     let wav_bytes = wav_bytes_from_pcm16_mono(&samples_i16, sample_rate)?;
 
-    let permit_wait_started = Instant::now();
-    let _permit = state.acquire_workload_permit(WorkloadClass::Realtime).await;
-    let queue_wait_ms = permit_wait_started.elapsed().as_secs_f64() * 1000.0;
+    let permit = state.acquire_workload_permit(WorkloadClass::Realtime).await;
+    let queue_wait_ms = permit.wait_ms();
     let output = state
         .runtime
-        .asr_transcribe_bytes(
+        .asr_transcribe_bytes_with_runtime_context(
             wav_bytes.as_slice(),
             model_id.as_deref(),
             language.as_deref(),
+            None,
+            None,
+            Some(correlation_id.as_str()),
+            permit.runtime_context(),
         )
         .await
         .map_err(|err| err.to_string())?;

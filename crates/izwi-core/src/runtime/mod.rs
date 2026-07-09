@@ -47,7 +47,7 @@ pub use telemetry::{
 pub use types::{
     AsrTranscription, AudioChunk, ChatGeneration, ChunkStats, DiarizationConfig, DiarizationResult,
     DiarizationSegment, DiarizationTranscriptResult, DiarizationUtterance, DiarizationWord,
-    GenerationConfig, GenerationRequest, GenerationResult, InferenceOptions,
+    GenerationConfig, GenerationRequest, GenerationResult, InferenceOptions, RuntimeRequestContext,
     SpeakerAttributedAsrResult, SpeakerAttributedAsrStatus, SpeakerAttributedAsrTurn,
     SpeechToSpeechGeneration,
 };

@@ -378,8 +378,6 @@ async fn create_record(
     validate_reference_voice_selection(&req)?;
     req = resolve_saved_voice_selection(&state, req).await?;
     req = normalize_for_model_capabilities(route_kind, variant, req)?;
-    state.runtime.load_model(variant).await?;
-
     if req.stream.unwrap_or(false) && route_kind != SpeechRouteKind::TextToSpeech {
         return Err(ApiError::bad_request(
             "Streaming is currently supported only on text-to-speech generation resources",
@@ -438,7 +436,15 @@ async fn create_record(
     }
 
     let record = synthesize_record_internal(
-        &state, &ctx, req, route_kind, variant, model_id, input_text, None,
+        &state,
+        &ctx,
+        req,
+        route_kind,
+        variant,
+        model_id,
+        input_text,
+        None,
+        WorkloadClass::Online,
     )
     .await?;
 
@@ -635,8 +641,6 @@ impl StageExecutor for BatchTtsStageExecutor {
             .context("Failed to decode TTS batch request")?;
         let variant = parse_tts_model_variant(request.model_id.as_str())
             .map_err(|err| anyhow::anyhow!("Unsupported TTS model: {err}"))?;
-        self.state.runtime.load_model(variant).await?;
-
         let ctx = RequestContext {
             correlation_id: claimed
                 .job
@@ -666,6 +670,7 @@ impl StageExecutor for BatchTtsStageExecutor {
             request.model_id,
             request.input_text,
             Some(record_id.clone()),
+            WorkloadClass::Batch,
         )
         .await
         {
@@ -776,10 +781,16 @@ pub(crate) async fn synthesize_record(
     validate_reference_voice_selection(&req)?;
     req = resolve_saved_voice_selection(state, req).await?;
     req = normalize_for_model_capabilities(route_kind, variant, req)?;
-    state.runtime.load_model(variant).await?;
-
     synthesize_record_internal(
-        state, ctx, req, route_kind, variant, model_id, input_text, None,
+        state,
+        ctx,
+        req,
+        route_kind,
+        variant,
+        model_id,
+        input_text,
+        None,
+        WorkloadClass::Online,
     )
     .await
 }
@@ -793,18 +804,20 @@ async fn synthesize_record_internal(
     model_id: String,
     input_text: String,
     target_record_id: Option<String>,
+    workload_class: WorkloadClass,
 ) -> Result<SpeechHistoryRecord, ApiError> {
-    let generation_request = build_generation_request(
+    let mut generation_request = build_generation_request(
         req.clone(),
         ctx.correlation_id.clone(),
         input_text.clone(),
         false,
         variant,
     );
+    let permit = state.acquire_workload_permit(workload_class).await;
+    state.runtime.load_model(variant).await?;
+    generation_request = generation_request.with_runtime_context(permit.runtime_context());
     let planned_request_count =
         expand_generation_requests_for_long_form(&generation_request, variant).len();
-
-    let _permit = state.acquire_workload_permit(WorkloadClass::Online).await;
     let timeout = Duration::from_secs(resolve_generation_timeout_secs(
         state.request_timeout_secs,
         variant,
@@ -900,7 +913,7 @@ async fn stream_record_creation(
         true,
         variant,
     );
-    let planned_requests = expand_generation_requests_for_long_form(&generation_request, variant);
+    let mut planned_requests = expand_generation_requests_for_long_form(&generation_request, variant);
     let stream_request_id = generation_request.id.clone();
     let placeholder_record_id = placeholder.id.clone();
 
@@ -966,7 +979,7 @@ async fn stream_record_creation(
             }
         };
 
-        let _permit = match admission_state
+        let permit = match admission_state
             .acquire_owned_workload_permit(WorkloadClass::Streaming)
             .await
         {
@@ -995,6 +1008,14 @@ async fn stream_record_creation(
                 return;
             }
         };
+        if let Err(err) = runtime.load_model(variant).await {
+            mark_failed(err.to_string()).await;
+            return;
+        }
+        let runtime_context = permit.runtime_context();
+        for request in &mut planned_requests {
+            request.runtime_context = runtime_context;
+        }
 
         let _ = speech_store
             .update_processing_status(
@@ -1390,6 +1411,7 @@ fn build_generation_request(
         id: uuid::Uuid::new_v4().to_string(),
         model_variant: Some(variant),
         correlation_id: Some(correlation_id),
+        runtime_context: Default::default(),
         text,
         config: generation_config,
         language: req.language,

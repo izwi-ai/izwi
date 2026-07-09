@@ -146,19 +146,20 @@ pub async fn transcriptions(
         ));
     }
 
-    let _permit = state
+    let permit = state
         .acquire_workload_permit(WorkloadClass::Interactive)
         .await;
     let started = Instant::now();
     let output = state
         .runtime
-        .asr_transcribe_bytes_with_prompt_max_tokens_and_correlation(
+        .asr_transcribe_bytes_with_runtime_context(
             audio_bytes.as_slice(),
             req.model.as_deref(),
             req.language.as_deref(),
             req.prompt.as_deref(),
             req.max_tokens,
             Some(&ctx.correlation_id),
+            permit.runtime_context(),
         )
         .await?;
 
@@ -312,7 +313,7 @@ async fn transcriptions_stream(
     let admission_state = state.clone();
 
     tokio::spawn(async move {
-        let _permit = match admission_state
+        let permit = match admission_state
             .acquire_owned_workload_permit(WorkloadClass::Streaming)
             .await
         {
@@ -327,13 +328,14 @@ async fn transcriptions_stream(
         // Keep transcription streaming unbounded by wall-clock timeout so valid
         // long jobs are not cut off mid-flight.
         let result = engine
-            .asr_transcribe_streaming_bytes_with_prompt_max_tokens_and_correlation(
+            .asr_transcribe_streaming_bytes_with_runtime_context(
                 audio_bytes.as_slice(),
                 model.as_deref(),
                 language.as_deref(),
                 prompt.as_deref(),
                 max_tokens,
                 Some(correlation_id.as_str()),
+                permit.runtime_context(),
                 move |delta| {
                     let _ = delta_tx.send(transcript_delta_event_payload(delta));
                 },

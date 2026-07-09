@@ -25,8 +25,9 @@ use crate::diarization_store::{
 use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::{
-    parse_chat_model_variant, parse_model_variant, ChatMessage, ChatRole, DiarizationConfig,
-    GenerationParams, ModelVariant, RuntimeService, WorkloadClass,
+    parse_chat_model_variant, parse_model_variant, ChatMessage, ChatRequestConfig, ChatRole,
+    DiarizationConfig, GenerationParams, ModelVariant, RuntimeRequestContext, RuntimeService,
+    WorkloadClass,
 };
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
@@ -720,6 +721,7 @@ fn spawn_summary_generation_task(
                 transcript.as_str(),
                 correlation_id.as_deref(),
                 summary_timeout_secs,
+                permit.runtime_context(),
             )
             .await
         };
@@ -746,10 +748,11 @@ async fn generate_diarization_summary_with_timeout(
     transcript: &str,
     correlation_id: Option<&str>,
     timeout_secs: u64,
+    runtime_context: RuntimeRequestContext,
 ) -> Result<String, String> {
     tokio::time::timeout(
         Duration::from_secs(timeout_secs.max(1)),
-        generate_diarization_summary(runtime, transcript, correlation_id),
+        generate_diarization_summary(runtime, transcript, correlation_id, runtime_context),
     )
     .await
     .map_err(|_| summary_timeout_error(timeout_secs))?
@@ -759,6 +762,7 @@ async fn generate_diarization_summary(
     runtime: Arc<RuntimeService>,
     transcript: &str,
     correlation_id: Option<&str>,
+    runtime_context: RuntimeRequestContext,
 ) -> Result<String, String> {
     let variant =
         parse_chat_model_variant(Some(DEFAULT_DIARIZATION_SUMMARY_MODEL)).map_err(|err| {
@@ -770,7 +774,7 @@ async fn generate_diarization_summary(
     params.top_p = 0.9;
 
     let generation = runtime
-        .chat_generate_with_generation_params_and_correlation(
+        .chat_generate_with_runtime_context(
             variant,
             vec![
                 ChatMessage {
@@ -786,7 +790,9 @@ async fn generate_diarization_summary(
                 },
             ],
             params,
+            ChatRequestConfig::default(),
             correlation_id,
+            runtime_context,
         )
         .await
         .map_err(|err| format!("Summary generation failed: {err}"))?;

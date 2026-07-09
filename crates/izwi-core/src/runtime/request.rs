@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::shared::chat::{ChatMessage, ChatRequestConfig};
 use crate::runtime::adapters::CapabilityKind;
-use crate::runtime::types::{DiarizationConfig, GenerationRequest};
+use crate::runtime::types::{DiarizationConfig, GenerationRequest, RuntimeRequestContext};
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -68,6 +68,7 @@ pub(crate) struct RequestEnvelope {
     pub(crate) deadline: Option<Instant>,
     pub(crate) stream_policy: RuntimeStreamPolicy,
     pub(crate) workload_class: WorkloadClass,
+    pub(crate) admission_ms: Option<f64>,
 }
 
 impl RequestEnvelope {
@@ -81,6 +82,7 @@ impl RequestEnvelope {
             deadline: None,
             stream_policy: RuntimeStreamPolicy::default(),
             workload_class: WorkloadClass::Online,
+            admission_ms: None,
         }
     }
 
@@ -111,6 +113,12 @@ impl RequestEnvelope {
 
     pub(crate) fn with_workload_class(mut self, workload_class: WorkloadClass) -> Self {
         self.workload_class = workload_class;
+        self
+    }
+
+    pub(crate) fn with_runtime_context(mut self, context: RuntimeRequestContext) -> Self {
+        self.workload_class = context.workload_class;
+        self.admission_ms = context.admission_ms;
         self
     }
 }
@@ -158,7 +166,8 @@ impl TtsRuntimeRequest {
         Ok(Self {
             envelope: RequestEnvelope::new(CapabilityKind::Tts, model_variant)
                 .with_request_id(request.id)
-                .with_correlation_id(request.correlation_id),
+                .with_correlation_id(request.correlation_id)
+                .with_runtime_context(request.runtime_context),
             text: request.text,
             language: request.language,
             reference_audio: request.reference_audio,
@@ -174,6 +183,7 @@ impl TtsRuntimeRequest {
         request.correlation_id = self.envelope.correlation_id;
         request.stream_policy = self.envelope.stream_policy.into();
         request.workload_class = self.envelope.workload_class;
+        request.admission_ms = self.envelope.admission_ms;
         request.language = self.language;
         request.reference_audio = self.reference_audio;
         request.reference_text = self.reference_text;
@@ -198,12 +208,14 @@ impl AsrRuntimeRequest {
         model_variant: ModelVariant,
         language: Option<String>,
         correlation_id: Option<String>,
+        runtime_context: RuntimeRequestContext,
     ) -> Result<Self> {
         let audio = RuntimeAudioInput::Base64(audio_base64.into());
         audio.validate("ASR")?;
         Ok(Self {
             envelope: RequestEnvelope::new(CapabilityKind::Asr, model_variant)
-                .with_correlation_id(correlation_id),
+                .with_correlation_id(correlation_id)
+                .with_runtime_context(runtime_context),
             audio,
             language,
             prompt: None,
@@ -215,12 +227,14 @@ impl AsrRuntimeRequest {
         model_variant: ModelVariant,
         language: Option<String>,
         correlation_id: Option<String>,
+        runtime_context: RuntimeRequestContext,
     ) -> Result<Self> {
         let audio = RuntimeAudioInput::Bytes(audio_bytes.into());
         audio.validate("ASR")?;
         Ok(Self {
             envelope: RequestEnvelope::new(CapabilityKind::Asr, model_variant)
-                .with_correlation_id(correlation_id),
+                .with_correlation_id(correlation_id)
+                .with_runtime_context(runtime_context),
             audio,
             language,
             prompt: None,
@@ -249,6 +263,7 @@ impl AsrRuntimeRequest {
         request.correlation_id = self.envelope.correlation_id;
         request.stream_policy = self.envelope.stream_policy.into();
         request.workload_class = self.envelope.workload_class;
+        request.admission_ms = self.envelope.admission_ms;
         if let Some(language) = self.language {
             request = request.with_language(language);
         }
@@ -277,6 +292,7 @@ impl ChatRuntimeRequest {
         chat_config: ChatRequestConfig,
         prompt_tokens: Vec<u32>,
         correlation_id: Option<String>,
+        runtime_context: RuntimeRequestContext,
     ) -> Result<Self> {
         if messages.is_empty() {
             return Err(Error::InvalidInput(
@@ -286,7 +302,8 @@ impl ChatRuntimeRequest {
 
         Ok(Self {
             envelope: RequestEnvelope::new(CapabilityKind::Chat, model_variant)
-                .with_correlation_id(correlation_id),
+                .with_correlation_id(correlation_id)
+                .with_runtime_context(runtime_context),
             messages,
             params,
             chat_config,
@@ -301,6 +318,7 @@ impl ChatRuntimeRequest {
         request.correlation_id = self.envelope.correlation_id;
         request.stream_policy = self.envelope.stream_policy.into();
         request.workload_class = self.envelope.workload_class;
+        request.admission_ms = self.envelope.admission_ms;
         request.params = self.params;
         request.chat_config = self.chat_config;
         request.prompt_tokens = self.prompt_tokens;
@@ -326,12 +344,14 @@ impl AudioChatRuntimeRequest {
         params: CoreGenerationParams,
         system_prompt: Option<String>,
         correlation_id: Option<String>,
+        runtime_context: RuntimeRequestContext,
     ) -> Result<Self> {
         let audio = RuntimeAudioInput::Bytes(audio_bytes.into());
         audio.validate("speech-to-speech")?;
         Ok(Self {
             envelope: RequestEnvelope::new(CapabilityKind::SpeechToSpeech, model_variant)
-                .with_correlation_id(correlation_id),
+                .with_correlation_id(correlation_id)
+                .with_runtime_context(runtime_context),
             audio,
             messages,
             params,
@@ -346,12 +366,14 @@ impl AudioChatRuntimeRequest {
         params: CoreGenerationParams,
         system_prompt: Option<String>,
         correlation_id: Option<String>,
+        runtime_context: RuntimeRequestContext,
     ) -> Result<Self> {
         let audio = RuntimeAudioInput::Base64(audio_base64.into());
         audio.validate("speech-to-speech")?;
         Ok(Self {
             envelope: RequestEnvelope::new(CapabilityKind::SpeechToSpeech, model_variant)
-                .with_correlation_id(correlation_id),
+                .with_correlation_id(correlation_id)
+                .with_runtime_context(runtime_context),
             audio,
             messages,
             params,
@@ -373,6 +395,7 @@ impl AudioChatRuntimeRequest {
         request.correlation_id = self.envelope.correlation_id;
         request.stream_policy = self.envelope.stream_policy.into();
         request.workload_class = self.envelope.workload_class;
+        request.admission_ms = self.envelope.admission_ms;
         request.chat_messages = (!self.messages.is_empty()).then_some(self.messages);
         request.system_prompt = self
             .system_prompt
@@ -582,6 +605,7 @@ mod tests {
             ModelVariant::WhisperLargeV3Turbo,
             Some("en".to_string()),
             Some("corr-asr".to_string()),
+            RuntimeRequestContext::new(WorkloadClass::Batch).with_admission_ms(3.5),
         )
         .expect("valid ASR request");
 
@@ -594,6 +618,8 @@ mod tests {
         assert_eq!(core_request.audio_bytes.as_deref(), Some(&[1, 2, 3][..]));
         assert_eq!(core_request.language.as_deref(), Some("en"));
         assert_eq!(core_request.correlation_id.as_deref(), Some("corr-asr"));
+        assert_eq!(core_request.workload_class, WorkloadClass::Batch);
+        assert_eq!(core_request.admission_ms, Some(3.5));
     }
 
     #[test]
@@ -603,6 +629,7 @@ mod tests {
             ModelVariant::WhisperLargeV3Turbo,
             None,
             None,
+            RuntimeRequestContext::default(),
         )
         .expect("valid ASR request")
         .with_prompt(Some("  spell Izwi correctly  ".to_string()));
@@ -623,8 +650,14 @@ mod tests {
 
     #[test]
     fn asr_runtime_request_rejects_empty_audio() {
-        let err = AsrRuntimeRequest::from_base64("", ModelVariant::WhisperLargeV3Turbo, None, None)
-            .expect_err("empty audio should be rejected");
+        let err = AsrRuntimeRequest::from_base64(
+            "",
+            ModelVariant::WhisperLargeV3Turbo,
+            None,
+            None,
+            RuntimeRequestContext::default(),
+        )
+        .expect_err("empty audio should be rejected");
 
         assert!(matches!(err, Error::InvalidInput(_)));
     }
@@ -647,6 +680,7 @@ mod tests {
             chat_config,
             vec![10, 11],
             Some("corr-chat".to_string()),
+            RuntimeRequestContext::default(),
         )
         .expect("valid chat request");
         let core_request = runtime_request.into_engine_request();
@@ -675,6 +709,7 @@ mod tests {
             ChatRequestConfig::default(),
             Vec::new(),
             None,
+            RuntimeRequestContext::default(),
         )
         .expect_err("empty chat messages should be rejected");
 
@@ -695,6 +730,7 @@ mod tests {
             GenerationParams::default(),
             Some("  helpful voice  ".to_string()),
             Some("corr-audio".to_string()),
+            RuntimeRequestContext::default(),
         )
         .expect("valid audio-chat request");
 

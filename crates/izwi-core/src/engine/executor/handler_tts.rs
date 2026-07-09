@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::tts::{
     SpeakerReference, TtsGenerationParams, TtsStreamingConfig,
@@ -7,7 +9,9 @@ use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
 use super::state::ActiveQwenTtsDecode;
-use super::{decode_audio_base64_with_rate, ExecutorOutput, NativeExecutor};
+use super::{
+    decode_audio_base64_with_rate, ExecutorOutput, ExecutorPhaseTiming, NativeExecutor,
+};
 
 impl NativeExecutor {
     pub(super) fn to_tts_params(request: &EngineCoreRequest) -> TtsGenerationParams {
@@ -69,6 +73,7 @@ impl NativeExecutor {
         request: &EngineCoreRequest,
         scheduled: &ScheduledRequest,
     ) -> Result<ExecutorOutput> {
+        let execution_started = Instant::now();
         let stream_tx = Self::stream_sender(request);
         let stream_policy = request.stream_policy;
         let variant = request.model_variant;
@@ -94,6 +99,7 @@ impl NativeExecutor {
             let mut active_state = if let Some(state) = active_state {
                 state
             } else {
+                let normalization_started = Instant::now();
                 let text = request
                     .text
                     .as_deref()
@@ -111,6 +117,8 @@ impl NativeExecutor {
                 } else {
                     TtsStreamingConfig::final_only()
                 };
+                let normalization_ms = normalization_started.elapsed().as_secs_f64() * 1000.0;
+                let prefill_started = Instant::now();
 
                 let decode_state = if let Some(reference) = reference {
                     Self::run_blocking(|| {
@@ -154,6 +162,15 @@ impl NativeExecutor {
                     last_frames_generated: 0,
                     stream_sequence: 0,
                     audio_samples_accum: Vec::new(),
+                    execution_started,
+                    normalization_ms,
+                    prefill_ms: prefill_started.elapsed().as_secs_f64() * 1000.0,
+                    sampling_ms: 0.0,
+                    decode_ms: 0.0,
+                    codec_ms: 0.0,
+                    postprocess_ms: 0.0,
+                    first_output_ms_since_start: None,
+                    decode_steps: 0,
                 }
             };
 
@@ -168,6 +185,10 @@ impl NativeExecutor {
 
             for _ in 0..decode_iterations {
                 let step = Self::run_blocking(|| model.tts_decode_step(&mut active_state.state))?;
+                active_state.sampling_ms += step.sampling_ms;
+                active_state.decode_ms += step.decode_ms;
+                active_state.codec_ms += step.codec_ms;
+                active_state.decode_steps = active_state.decode_steps.saturating_add(1);
                 decode_steps_ran = decode_steps_ran.saturating_add(1);
                 let step_tokens_generated = step
                     .frames_generated
@@ -177,6 +198,11 @@ impl NativeExecutor {
                     total_tokens_generated.saturating_add(step_tokens_generated);
 
                 if !step.samples.is_empty() {
+                    if active_state.first_output_ms_since_start.is_none() {
+                        active_state.first_output_ms_since_start = Some(
+                            active_state.execution_started.elapsed().as_secs_f64() * 1000.0,
+                        );
+                    }
                     active_state
                         .audio_samples_accum
                         .extend_from_slice(&step.samples);
@@ -217,11 +243,26 @@ impl NativeExecutor {
                 tokens_processed = tokens_processed.saturating_add(request.num_prompt_tokens());
             }
 
+            let postprocess_started = Instant::now();
             let finished_samples = if finished {
                 active_state.audio_samples_accum.clone()
             } else {
                 Vec::new()
             };
+            active_state.postprocess_ms += postprocess_started.elapsed().as_secs_f64() * 1000.0;
+
+            let phase_timing_override = Some(ExecutorPhaseTiming {
+                normalization_ms: Some(active_state.normalization_ms),
+                prefill_ms: Some(active_state.prefill_ms),
+                decode_ms: Some(active_state.decode_ms),
+                sampling_ms: Some(active_state.sampling_ms),
+                codec_ms: Some(active_state.codec_ms),
+                postprocess_ms: Some(active_state.postprocess_ms),
+                first_output_ms_since_start: active_state.first_output_ms_since_start,
+                prefill_steps: Some(1),
+                decode_steps: Some(active_state.decode_steps),
+                ..ExecutorPhaseTiming::default()
+            });
 
             if !finished {
                 let mut guard = self.qwen_tts_decode_states.lock().map_err(|_| {
@@ -238,7 +279,7 @@ impl NativeExecutor {
                 tokens_processed,
                 tokens_generated: total_tokens_generated,
                 finished,
-                phase_timing_override: None,
+                phase_timing_override,
                 asr_diagnostics: None,
                 error: None,
             })

@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::{future::Future, sync::Arc};
 
 use tokio::sync::mpsc;
@@ -81,18 +82,19 @@ pub async fn generate_chat(
     let variant = request.variant;
     let messages = request.messages;
     let correlation_id = request.correlation_id;
-    let _permit = state
+    let permit = state
         .acquire_workload_permit(WorkloadClass::Interactive)
         .await;
 
     state
         .runtime
-        .chat_generate_with_generation_params_and_chat_config_and_correlation(
+        .chat_generate_with_runtime_context(
             variant,
             messages,
             params,
             chat_config,
             correlation_id.as_deref(),
+            permit.runtime_context(),
         )
         .await
         .map_err(ApiError::from)
@@ -111,7 +113,7 @@ pub fn spawn_chat_stream(
 
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        let _permit = match state
+        let permit = match state
             .acquire_owned_workload_permit(WorkloadClass::Streaming)
             .await
         {
@@ -125,12 +127,13 @@ pub fn spawn_chat_stream(
         let _ = event_tx.send(ChatStreamEvent::Started);
 
         match runtime
-            .chat_generate_streaming_with_generation_params_and_chat_config_and_correlation(
+            .chat_generate_streaming_with_runtime_context(
                 variant,
                 messages,
                 params,
                 chat_config,
                 correlation_id.as_deref(),
+                permit.runtime_context(),
                 {
                     let event_tx = event_tx.clone();
                     move |delta| {
@@ -152,6 +155,7 @@ pub fn spawn_chat_stream(
     event_rx
 }
 
+#[cfg(test)]
 fn spawn_chat_stream_with_task<G, Fut>(
     semaphore: Arc<tokio::sync::Semaphore>,
     generation_task: G,

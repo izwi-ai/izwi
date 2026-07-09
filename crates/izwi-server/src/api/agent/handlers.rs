@@ -11,7 +11,9 @@ use izwi_agent::{
     MemoryMessageMeta, MemoryMessageRole, MemoryStore, ModelBackend, ModelOutput, ModelRequest,
     NoopTool, TimeTool, ToolRegistry, TurnInput,
 };
-use izwi_core::{parse_chat_model_variant, ChatMessage, ChatRole};
+use izwi_core::{
+    parse_chat_model_variant, ChatMessage, ChatRole, RuntimeRequestContext, WorkloadClass,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::api::request_context::RequestContext;
@@ -163,10 +165,14 @@ pub async fn create_turn(
         updated_at: session_record.updated_at,
     };
 
+    let permit = state
+        .acquire_workload_permit(WorkloadClass::Interactive)
+        .await;
     let memory = ChatStoreMemory::new(state.chat_store.clone());
     let backend = IzwiRuntimeBackend {
         runtime: state.runtime.clone(),
         correlation_id: ctx.correlation_id,
+        runtime_context: permit.runtime_context(),
     };
     let planner = SimplePlanner;
     let mut tools = ToolRegistry::new();
@@ -332,6 +338,7 @@ impl MemoryStore for ChatStoreMemory {
 struct IzwiRuntimeBackend {
     runtime: Arc<izwi_core::RuntimeService>,
     correlation_id: String,
+    runtime_context: RuntimeRequestContext,
 }
 
 #[async_trait::async_trait]
@@ -355,11 +362,12 @@ impl ModelBackend for IzwiRuntimeBackend {
 
         let generation = self
             .runtime
-            .chat_generate_with_correlation(
+            .chat_generate_with_correlation_and_runtime_context(
                 variant,
                 runtime_messages,
                 request.max_output_tokens.clamp(1, 4096),
                 Some(&self.correlation_id),
+                self.runtime_context,
             )
             .await
             .map_err(|err| izwi_agent::AgentError::Model(err.to_string()))?;

@@ -206,6 +206,8 @@ pub struct EngineCoreRequest {
     pub priority: Priority,
     /// Coarse latency/throughput class for scheduling and admission.
     pub workload_class: WorkloadClass,
+    /// Time spent waiting for server-side admission before entering the runtime.
+    pub admission_ms: Option<f64>,
     /// Arrival timestamp
     pub arrival_time: Instant,
     /// Prompt token IDs (set by processor)
@@ -315,6 +317,7 @@ impl EngineCoreRequest {
             params: GenerationParams::default(),
             priority: Priority::Normal,
             workload_class: WorkloadClass::Online,
+            admission_ms: None,
             arrival_time: Instant::now(),
             prompt_tokens: Vec::new(),
             streaming: false,
@@ -351,6 +354,7 @@ impl EngineCoreRequest {
             params: GenerationParams::default(),
             priority: Priority::Normal,
             workload_class: WorkloadClass::Online,
+            admission_ms: None,
             arrival_time: Instant::now(),
             prompt_tokens: Vec::new(),
             streaming: false,
@@ -387,6 +391,7 @@ impl EngineCoreRequest {
             params: GenerationParams::default(),
             priority: Priority::Normal,
             workload_class: WorkloadClass::Online,
+            admission_ms: None,
             arrival_time: Instant::now(),
             prompt_tokens: Vec::new(),
             streaming: false,
@@ -422,6 +427,7 @@ impl EngineCoreRequest {
             params: GenerationParams::default(),
             priority: Priority::Normal,
             workload_class: WorkloadClass::Online,
+            admission_ms: None,
             arrival_time: Instant::now(),
             prompt_tokens: Vec::new(),
             streaming: false,
@@ -458,6 +464,7 @@ impl EngineCoreRequest {
             params: GenerationParams::default(),
             priority: Priority::Normal,
             workload_class: WorkloadClass::Online,
+            admission_ms: None,
             arrival_time: Instant::now(),
             prompt_tokens: Vec::new(),
             streaming: false,
@@ -494,6 +501,7 @@ impl EngineCoreRequest {
             params: GenerationParams::default(),
             priority: Priority::Normal,
             workload_class: WorkloadClass::Online,
+            admission_ms: None,
             arrival_time: Instant::now(),
             prompt_tokens: Vec::new(),
             streaming: false,
