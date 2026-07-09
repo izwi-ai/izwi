@@ -222,10 +222,25 @@ pub struct TokenStats {
 pub struct LatencyBreakdown {
     /// Time spent waiting in queue before first scheduling.
     pub queue_wait_ms: f64,
+    /// Time spent decoding input media before model execution, when measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_decode_ms: Option<f64>,
+    /// Time spent normalizing/preparing inputs, when measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalization_ms: Option<f64>,
     /// Total scheduler prefill phase wall-clock time attributed to this request.
     pub prefill_ms: f64,
     /// Total scheduler decode phase wall-clock time attributed to this request.
     pub decode_ms: f64,
+    /// Time spent sampling model outputs, when measured separately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling_ms: Option<f64>,
+    /// Time spent encoding or decoding codec/audio representations, when measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec_ms: Option<f64>,
+    /// Time spent on final postprocessing and artifact preparation, when measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postprocess_ms: Option<f64>,
     /// Time to first user-visible output in milliseconds, when observed.
     pub ttft_ms: Option<f64>,
     /// End-to-end request time in milliseconds.

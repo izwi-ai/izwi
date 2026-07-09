@@ -123,15 +123,13 @@ impl NativeExecutor {
                     if let Some(tx) = stream_tx.as_ref() {
                         if stream_err.is_none() {
                             if let Some(chunk) = stream_batch.push(delta) {
-                                if let Err(err) =
-                                    Self::stream_text_with_policy(
-                                        tx,
-                                        stream_policy,
-                                        &request.id,
-                                        &mut sequence,
-                                        chunk,
-                                    )
-                                {
+                                if let Err(err) = Self::stream_text_with_policy(
+                                    tx,
+                                    stream_policy,
+                                    &request.id,
+                                    &mut sequence,
+                                    chunk,
+                                ) {
                                     stream_err = Some(err);
                                 }
                             }
@@ -149,15 +147,13 @@ impl NativeExecutor {
                 if let Some(tx) = stream_tx.as_ref() {
                     if stream_err.is_none() {
                         if let Some(chunk) = stream_batch.finish() {
-                            if let Err(err) =
-                                Self::stream_text_with_policy(
-                                    tx,
-                                    stream_policy,
-                                    &request.id,
-                                    &mut sequence,
-                                    chunk,
-                                )
-                            {
+                            if let Err(err) = Self::stream_text_with_policy(
+                                tx,
+                                stream_policy,
+                                &request.id,
+                                &mut sequence,
+                                chunk,
+                            ) {
                                 stream_err = Some(err);
                             }
                         }
@@ -184,11 +180,12 @@ impl NativeExecutor {
                     0
                 };
                 phase_timing_override = Some(ExecutorPhaseTiming {
-                    prefill_ms: prefill_ms.max(0.0),
-                    decode_ms,
+                    prefill_ms: Some(prefill_ms.max(0.0)),
+                    decode_ms: Some(decode_ms),
                     first_output_ms_since_start,
-                    prefill_steps: 1,
-                    decode_steps,
+                    prefill_steps: Some(1),
+                    decode_steps: Some(decode_steps),
+                    ..ExecutorPhaseTiming::default()
                 });
 
                 Ok(output)

@@ -637,9 +637,14 @@ impl RuntimeService {
         };
         if let Some(latency) = output.latency_breakdown.as_ref() {
             timing.queue_wait_ms = Some(latency.queue_wait_ms);
+            timing.media_decode_ms = latency.media_decode_ms;
+            timing.normalization_ms = latency.normalization_ms;
             timing.prefill_ms = Some(latency.prefill_ms);
             timing.decode_ms = Some(latency.decode_ms);
             timing.ttft_ms = latency.ttft_ms;
+            timing.sampling_ms = latency.sampling_ms;
+            timing.codec_ms = latency.codec_ms;
+            timing.postprocess_ms = latency.postprocess_ms;
             timing.total_ms = Some(latency.total_ms);
         }
 

@@ -190,18 +190,37 @@ pub struct ExecutorOutput {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ExecutorPhaseTiming {
+    /// Audio/media decode duration in milliseconds.
+    pub media_decode_ms: Option<f64>,
+    /// Input normalization duration in milliseconds.
+    pub normalization_ms: Option<f64>,
     /// Prefill phase duration in milliseconds.
-    pub prefill_ms: f64,
+    pub prefill_ms: Option<f64>,
     /// Decode phase duration in milliseconds.
-    pub decode_ms: f64,
+    pub decode_ms: Option<f64>,
+    /// Sampling duration in milliseconds.
+    pub sampling_ms: Option<f64>,
+    /// Codec encode/decode duration in milliseconds.
+    pub codec_ms: Option<f64>,
+    /// Postprocess duration in milliseconds.
+    pub postprocess_ms: Option<f64>,
     /// Time to first user-visible output in milliseconds since model execution start.
     pub first_output_ms_since_start: Option<f64>,
     /// Number of prefill steps attributed to this request.
-    pub prefill_steps: u32,
+    pub prefill_steps: Option<u32>,
     /// Number of decode steps attributed to this request.
-    pub decode_steps: u32,
+    pub decode_steps: Option<u32>,
+}
+
+impl ExecutorPhaseTiming {
+    pub fn with_media_decode_ms(media_decode_ms: f64) -> Self {
+        Self {
+            media_decode_ms: Some(media_decode_ms.max(0.0)),
+            ..Self::default()
+        }
+    }
 }
 
 impl ExecutorOutput {
