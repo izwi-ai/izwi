@@ -43,7 +43,7 @@ use crate::runtime::telemetry::{
     RuntimeStageOutcome, RuntimeStageOutputCounters, RuntimeStageTiming, RuntimeTelemetryCollector,
     RuntimeTelemetrySnapshot,
 };
-use crate::runtime_models::ModelRegistry;
+use crate::runtime_models::{LoadedModelDiagnostics, ModelRegistry};
 use crate::tokenizer::Tokenizer;
 
 fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
@@ -462,6 +462,10 @@ impl RuntimeService {
     pub async fn loaded_tts_model_diagnostics(&self) -> Option<serde_json::Value> {
         let variant = (*self.loaded_tts_variant.read().await)?;
         match variant.family() {
+            crate::catalog::ModelFamily::Qwen3Tts => {
+                let model = self.model_registry.get_qwen_tts(variant).await?;
+                serde_json::to_value(model.diagnostics()).ok()
+            }
             crate::catalog::ModelFamily::VibeVoiceTts => {
                 let model = self.model_registry.get_vibevoice_tts(variant).await?;
                 serde_json::to_value(model.diagnostics()).ok()
@@ -472,6 +476,11 @@ impl RuntimeService {
             }
             _ => None,
         }
+    }
+
+    /// Registry-backed diagnostics for native model handles loaded in memory.
+    pub async fn loaded_model_diagnostics(&self) -> Vec<LoadedModelDiagnostics> {
+        self.model_registry.loaded_model_diagnostics().await
     }
 
     async fn ensure_step_driver_started(&self) {
@@ -905,6 +914,7 @@ impl RuntimeService {
     pub async fn telemetry_snapshot(&self) -> RuntimeTelemetrySnapshot {
         let mut snapshot = self.telemetry.snapshot().await;
         snapshot.engine = self.engine_telemetry_snapshot().await;
+        snapshot.models = self.loaded_model_diagnostics().await;
         snapshot
     }
 

@@ -18,6 +18,7 @@ pub use tokenizer::{SpeakerReference, TtsSpecialTokens, TtsTokenizer};
 
 use candle_core::{DType, IndexOp, Tensor, D};
 use candle_nn::VarBuilder;
+use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -192,6 +193,24 @@ pub struct Qwen3TtsModel {
     kv_page_size: usize,
     /// KV cache quantization mode.
     kv_quantization: KvCacheQuantization,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Qwen3TtsDiagnostics {
+    pub model_family: &'static str,
+    pub model_type: String,
+    pub model_size: String,
+    pub device_kind: String,
+    pub talker_dtype: String,
+    pub code_predictor_dtype: String,
+    pub speech_tokenizer_dtype: String,
+    pub kv_page_size: usize,
+    pub kv_quantization: String,
+    pub speaker_count: usize,
+    pub vocab_size: usize,
+    pub text_vocab_size: usize,
+    pub num_code_groups: usize,
+    pub cuda_sampling: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,6 +390,25 @@ impl Qwen3TtsModel {
             kv_page_size: kv_page_size.max(1),
             kv_quantization,
         })
+    }
+
+    pub fn diagnostics(&self) -> Qwen3TtsDiagnostics {
+        Qwen3TtsDiagnostics {
+            model_family: "qwen3_tts",
+            model_type: self.config.tts_model_type.clone(),
+            model_size: self.config.tts_model_size.clone(),
+            device_kind: format!("{:?}", self.device.kind),
+            talker_dtype: format!("{:?}", self.dtype),
+            code_predictor_dtype: format!("{:?}", self.code_predictor_dtype),
+            speech_tokenizer_dtype: format!("{:?}", self.speech_tokenizer_dtype),
+            kv_page_size: self.kv_page_size,
+            kv_quantization: format!("{:?}", self.kv_quantization).to_ascii_lowercase(),
+            speaker_count: self.config.talker_config.spk_id.len(),
+            vocab_size: self.config.talker_config.vocab_size,
+            text_vocab_size: self.config.talker_config.text_vocab_size,
+            num_code_groups: self.config.talker_config.num_code_groups,
+            cuda_sampling: qwen_tts_uses_cuda_sampling(&self.device),
+        }
     }
 
     /// Generate speech using a preset speaker (CustomVoice mode)

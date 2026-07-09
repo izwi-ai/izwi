@@ -106,7 +106,8 @@ pub use runtime_models::shared::chat::{
 pub use backends::{DeviceProfile, DeviceSelector};
 pub use runtime_models::{
     model_family_registrations, registration_for_variant, registrations_for_capability,
-    FamilyRegistration, LoadedModelRegistry, ModelRegistry, MODEL_FAMILY_REGISTRATIONS,
+    FamilyRegistration, LoadedModelDiagnostics, LoadedModelRegistry, ModelRegistry,
+    MODEL_FAMILY_REGISTRATIONS,
 };
 
 #[cfg(test)]

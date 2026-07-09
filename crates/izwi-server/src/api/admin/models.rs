@@ -7,6 +7,7 @@ use axum::{
 };
 use futures::stream::Stream;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::pin::Pin;
 use tokio::sync::broadcast::error::RecvError;
@@ -43,6 +44,8 @@ pub struct AdminModelInfo {
     pub speech_capabilities: Option<AdminSpeechModelCapabilities>,
     pub cuda_support: serde_json::Value,
     pub cuda_quantization: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_diagnostics: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -111,6 +114,12 @@ pub struct AdminModelDownloadProgressEvent {
 
 impl From<ModelInfo> for AdminModelInfo {
     fn from(info: ModelInfo) -> Self {
+        Self::from_model_info(info, None)
+    }
+}
+
+impl AdminModelInfo {
+    fn from_model_info(info: ModelInfo, runtime_diagnostics: Option<serde_json::Value>) -> Self {
         let variant = info.variant;
         Self {
             variant: variant.dir_name().to_string(),
@@ -134,6 +143,7 @@ impl From<ModelInfo> for AdminModelInfo {
                 .unwrap_or(serde_json::Value::Null),
             cuda_quantization: serde_json::to_value(info.cuda_quantization)
                 .unwrap_or(serde_json::Value::Null),
+            runtime_diagnostics,
         }
     }
 }
@@ -293,8 +303,15 @@ pub async fn list_models(
         .filter(|model| model.enabled)
         .collect();
     models.sort_by_key(model_sort_key);
+    let runtime_diagnostics = loaded_model_diagnostics_by_variant(&state).await;
     Ok(Json(AdminModelsResponse {
-        models: models.into_iter().map(AdminModelInfo::from).collect(),
+        models: models
+            .into_iter()
+            .map(|info| {
+                let diagnostics = runtime_diagnostics.get(info.variant.dir_name()).cloned();
+                AdminModelInfo::from_model_info(info, diagnostics)
+            })
+            .collect(),
     }))
 }
 
@@ -315,7 +332,27 @@ pub async fn get_model_info(
         .await
         .ok_or_else(|| ApiError::not_found("Model not found"))?;
 
-    Ok(Json(AdminModelInfo::from(info)))
+    let runtime_diagnostics = loaded_model_diagnostics_by_variant(&state).await;
+    Ok(Json(AdminModelInfo::from_model_info(
+        info,
+        runtime_diagnostics.get(variant.dir_name()).cloned(),
+    )))
+}
+
+async fn loaded_model_diagnostics_by_variant(
+    state: &AppState,
+) -> HashMap<String, serde_json::Value> {
+    state
+        .runtime
+        .loaded_model_diagnostics()
+        .await
+        .into_iter()
+        .filter_map(|diagnostics| {
+            serde_json::to_value(&diagnostics)
+                .ok()
+                .map(|value| (diagnostics.variant_id, value))
+        })
+        .collect()
 }
 
 /// SSE progress event

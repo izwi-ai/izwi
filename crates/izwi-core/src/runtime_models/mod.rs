@@ -5,6 +5,6 @@
 
 pub use crate::models::{
     architectures, families, model_family_registrations, registration_for_variant,
-    registrations_for_capability, registry, shared, FamilyRegistration, LoadedModelRegistry,
-    ModelRegistry, MODEL_FAMILY_REGISTRATIONS,
+    registrations_for_capability, registry, shared, FamilyRegistration, LoadedModelDiagnostics,
+    LoadedModelRegistry, ModelRegistry, MODEL_FAMILY_REGISTRATIONS,
 };
