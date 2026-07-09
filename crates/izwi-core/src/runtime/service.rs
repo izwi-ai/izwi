@@ -18,8 +18,13 @@ use crate::config::EngineConfig;
 use crate::engine::{
     engine_stream_backpressure_total, Engine as CoreEngine, EngineCoreConfig, EngineCoreRequest,
     EngineOutput, StreamingOutput, TaskType, WorkerConfig, WorkloadClass,
-    ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_HITS_TOTAL,
-    ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL,
+    ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_CHURN_RATIO,
+    ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL, ENGINE_KV_CACHE_EVICTIONS_TOTAL,
+    ENGINE_KV_CACHE_FREE_BLOCKS, ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
+    ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES, ENGINE_KV_CACHE_MEMORY_USED_BYTES,
+    ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_PINNED_BLOCKS,
+    ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL, ENGINE_KV_CACHE_SHARED_PREFIXES,
+    ENGINE_KV_CACHE_SOFT_MAX_BLOCKS, ENGINE_KV_CACHE_UTILIZATION_RATIO,
     ENGINE_SCHEDULER_QUEUE_DEPTH, ENGINE_SCHEDULER_RUNNING_REQUESTS,
     ENGINE_STREAM_BACKPRESSURE_TOTAL,
 };
@@ -33,9 +38,10 @@ use crate::runtime::broker::{
 use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
 use crate::runtime::routing::RouteSource;
 use crate::runtime::telemetry::{
-    push_engine_metric, EngineRuntimeTelemetrySnapshot, RuntimeObservationContext,
-    RuntimeStageObservation, RuntimeStageOutcome, RuntimeStageOutputCounters, RuntimeStageTiming,
-    RuntimeTelemetryCollector, RuntimeTelemetrySnapshot,
+    push_engine_metric, push_engine_metric_f64, EngineKvCacheRuntimeSnapshot,
+    EngineRuntimeTelemetrySnapshot, RuntimeObservationContext, RuntimeStageObservation,
+    RuntimeStageOutcome, RuntimeStageOutputCounters, RuntimeStageTiming, RuntimeTelemetryCollector,
+    RuntimeTelemetrySnapshot,
 };
 use crate::runtime_models::ModelRegistry;
 use crate::tokenizer::Tokenizer;
@@ -919,6 +925,26 @@ impl RuntimeService {
             .telemetry
             .total_allocations
             .saturating_sub(kv_cache_hits_total);
+        let kv_cache_snapshot = EngineKvCacheRuntimeSnapshot {
+            total_blocks: kv_cache.total_blocks as u64,
+            soft_max_blocks: kv_cache.soft_max_blocks as u64,
+            allocated_blocks: kv_cache.allocated_blocks as u64,
+            free_blocks: kv_cache.free_blocks as u64,
+            block_size: kv_cache.block_size as u64,
+            dtype_bytes: kv_cache.dtype_bytes as u64,
+            block_memory_bytes: kv_cache.block_memory_bytes as u64,
+            memory_used_bytes: kv_cache.memory_used_bytes as u64,
+            memory_capacity_bytes: kv_cache.memory_capacity_bytes as u64,
+            utilization_ratio: kv_cache.utilization(),
+            gpu_resident_blocks: kv_cache.gpu_resident_blocks as u64,
+            pinned_blocks: kv_cache.pinned_blocks as u64,
+            shared_prefixes: kv_cache.shared_prefixes as u64,
+            total_allocations: kv_cache.telemetry.total_allocations,
+            total_frees: kv_cache.telemetry.total_frees,
+            shared_prefix_hits: kv_cache.telemetry.shared_prefix_hits,
+            copy_on_write_splits: kv_cache.telemetry.copy_on_write_splits,
+            last_churn_ratio: kv_cache.telemetry.last_churn_ratio,
+        };
 
         EngineRuntimeTelemetrySnapshot {
             scheduler_queue_depth: queue_depth,
@@ -929,6 +955,7 @@ impl RuntimeService {
             kv_cache_allocated_blocks: kv_cache.allocated_blocks as u64,
             kv_cache_prefix_reuse_blocks_total: kv_cache_hits_total,
             stream_backpressure_total,
+            kv_cache: kv_cache_snapshot,
         }
     }
 
@@ -966,8 +993,58 @@ impl RuntimeService {
         );
         push_engine_metric(
             payload,
+            ENGINE_KV_CACHE_FREE_BLOCKS,
+            snapshot.kv_cache.free_blocks,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_KV_CACHE_SOFT_MAX_BLOCKS,
+            snapshot.kv_cache.soft_max_blocks,
+        );
+        push_engine_metric_f64(
+            payload,
+            ENGINE_KV_CACHE_UTILIZATION_RATIO,
+            snapshot.kv_cache.utilization_ratio,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_KV_CACHE_MEMORY_USED_BYTES,
+            snapshot.kv_cache.memory_used_bytes,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES,
+            snapshot.kv_cache.memory_capacity_bytes,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_KV_CACHE_SHARED_PREFIXES,
+            snapshot.kv_cache.shared_prefixes,
+        );
+        push_engine_metric(
+            payload,
             ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL,
             snapshot.kv_cache_prefix_reuse_blocks_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL,
+            snapshot.kv_cache.copy_on_write_splits,
+        );
+        push_engine_metric_f64(
+            payload,
+            ENGINE_KV_CACHE_CHURN_RATIO,
+            snapshot.kv_cache.last_churn_ratio,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS,
+            snapshot.kv_cache.gpu_resident_blocks,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_KV_CACHE_PINNED_BLOCKS,
+            snapshot.kv_cache.pinned_blocks,
         );
         push_engine_metric(
             payload,
@@ -1138,7 +1215,14 @@ mod tests {
         assert!(payload.contains("izwi_engine_scheduler_queue_depth"));
         assert!(payload.contains("izwi_engine_scheduler_running_requests"));
         assert!(payload.contains("izwi_engine_kv_cache_allocated_blocks"));
+        assert!(payload.contains("izwi_engine_kv_cache_soft_max_blocks"));
+        assert!(payload.contains("izwi_engine_kv_cache_utilization_ratio"));
+        assert!(payload.contains("izwi_engine_kv_cache_copy_on_write_splits_total"));
         assert!(payload.contains("izwi_engine_stream_backpressure_total"));
+
+        let snapshot = runtime.telemetry_snapshot().await;
+        assert!(snapshot.engine.kv_cache.total_blocks > 0);
+        assert!(snapshot.engine.kv_cache.block_size > 0);
     }
 
     #[tokio::test]

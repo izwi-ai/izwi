@@ -52,6 +52,29 @@ pub struct EngineRuntimeTelemetrySnapshot {
     pub kv_cache_allocated_blocks: u64,
     pub kv_cache_prefix_reuse_blocks_total: u64,
     pub stream_backpressure_total: u64,
+    pub kv_cache: EngineKvCacheRuntimeSnapshot,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct EngineKvCacheRuntimeSnapshot {
+    pub total_blocks: u64,
+    pub soft_max_blocks: u64,
+    pub allocated_blocks: u64,
+    pub free_blocks: u64,
+    pub block_size: u64,
+    pub dtype_bytes: u64,
+    pub block_memory_bytes: u64,
+    pub memory_used_bytes: u64,
+    pub memory_capacity_bytes: u64,
+    pub utilization_ratio: f64,
+    pub gpu_resident_blocks: u64,
+    pub pinned_blocks: u64,
+    pub shared_prefixes: u64,
+    pub total_allocations: u64,
+    pub total_frees: u64,
+    pub shared_prefix_hits: u64,
+    pub copy_on_write_splits: u64,
+    pub last_churn_ratio: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -891,6 +914,14 @@ pub(crate) fn push_engine_metric(payload: &mut String, name: &str, value: u64) {
     let metric_type = prometheus_engine_metric_type(name);
     payload.push_str(&format!(
         "# TYPE {prometheus_name} {metric_type}\n{prometheus_name} {value}\n"
+    ));
+}
+
+pub(crate) fn push_engine_metric_f64(payload: &mut String, name: &str, value: f64) {
+    let prometheus_name = prometheus_engine_metric_name(name);
+    let metric_type = prometheus_engine_metric_type(name);
+    payload.push_str(&format!(
+        "# TYPE {prometheus_name} {metric_type}\n{prometheus_name} {value:.6}\n"
     ));
 }
 

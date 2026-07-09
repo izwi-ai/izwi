@@ -29,8 +29,19 @@ pub const ENGINE_KV_CACHE_HITS_TOTAL: &str = "engine.kv_cache.hits_total";
 pub const ENGINE_KV_CACHE_MISSES_TOTAL: &str = "engine.kv_cache.misses_total";
 pub const ENGINE_KV_CACHE_EVICTIONS_TOTAL: &str = "engine.kv_cache.evictions_total";
 pub const ENGINE_KV_CACHE_ALLOCATED_BLOCKS: &str = "engine.kv_cache.allocated_blocks";
+pub const ENGINE_KV_CACHE_FREE_BLOCKS: &str = "engine.kv_cache.free_blocks";
+pub const ENGINE_KV_CACHE_SOFT_MAX_BLOCKS: &str = "engine.kv_cache.soft_max_blocks";
+pub const ENGINE_KV_CACHE_UTILIZATION_RATIO: &str = "engine.kv_cache.utilization_ratio";
+pub const ENGINE_KV_CACHE_MEMORY_USED_BYTES: &str = "engine.kv_cache.memory_used_bytes";
+pub const ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES: &str = "engine.kv_cache.memory_capacity_bytes";
+pub const ENGINE_KV_CACHE_SHARED_PREFIXES: &str = "engine.kv_cache.shared_prefixes";
 pub const ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL: &str =
     "engine.kv_cache.prefix_reuse_blocks_total";
+pub const ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL: &str =
+    "engine.kv_cache.copy_on_write_splits_total";
+pub const ENGINE_KV_CACHE_CHURN_RATIO: &str = "engine.kv_cache.churn_ratio";
+pub const ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS: &str = "engine.kv_cache.gpu_resident_blocks";
+pub const ENGINE_KV_CACHE_PINNED_BLOCKS: &str = "engine.kv_cache.pinned_blocks";
 pub const ENGINE_STREAM_BACKPRESSURE_TOTAL: &str = "engine.stream.backpressure_total";
 
 pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
@@ -67,8 +78,48 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
         description: "Currently allocated KV-cache blocks.",
     },
     EngineMetricDescriptor {
+        name: ENGINE_KV_CACHE_FREE_BLOCKS,
+        description: "Currently free KV-cache blocks.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_KV_CACHE_SOFT_MAX_BLOCKS,
+        description: "Current adaptive KV-cache soft block cap.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_KV_CACHE_UTILIZATION_RATIO,
+        description: "KV-cache allocated block utilization ratio.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_KV_CACHE_MEMORY_USED_BYTES,
+        description: "Estimated KV-cache memory currently allocated in bytes.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES,
+        description: "Estimated KV-cache memory capacity in bytes.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_KV_CACHE_SHARED_PREFIXES,
+        description: "Active and persistent shared-prefix entries in the KV cache.",
+    },
+    EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL,
         description: "Prompt blocks reused from prefix cache.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL,
+        description: "Copy-on-write KV block splits.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_KV_CACHE_CHURN_RATIO,
+        description: "Last sampled KV-cache churn ratio used by soft-cap tuning.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS,
+        description: "KV-cache blocks currently marked GPU resident.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_KV_CACHE_PINNED_BLOCKS,
+        description: "KV-cache blocks pinned for backend execution.",
     },
     EngineMetricDescriptor {
         name: ENGINE_STREAM_BACKPRESSURE_TOTAL,
