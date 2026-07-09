@@ -17,21 +17,21 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 use izwi_agent::{
+    planner::{PlanningMode, SimplePlanner},
     AgentDefinition, AgentEngine, AgentSession, AgentTurnOptions, MemoryMessage, MemoryMessageMeta,
     MemoryMessageRole, MemoryStore, ModelBackend, ModelOutput, ModelRequest, NoopTool, TimeTool,
     ToolRegistry, TurnInput,
-    planner::{PlanningMode, SimplePlanner},
 };
 use izwi_core::{
-    ChatMessage, ChatRole, GenerationConfig, GenerationParams, GenerationRequest, RuntimeService,
-    VoiceSession,
     audio::{AudioEncoder, AudioFormat},
-    parse_chat_model_variant, parse_model_variant, parse_tts_model_variant,
+    parse_chat_model_variant, parse_model_variant, parse_tts_model_variant, ChatMessage, ChatRole,
+    GenerationConfig, GenerationParams, GenerationRequest, RuntimeService, VoiceSession,
+    WorkloadClass,
 };
 use izwi_vad::{
-    DEFAULT_MAX_UTTERANCE_MS, DEFAULT_MIN_SPEECH_MS, DEFAULT_PRE_ROLL_MS, DEFAULT_SILENCE_MS,
-    DEFAULT_SPEECH_THRESHOLD, EndpointConfig, EndpointDetector, EndpointEndReason, EndpointEvent,
-    VAD_FRAME_MS, VAD_SAMPLE_RATE, VadScorer, sanitize_score_threshold,
+    sanitize_score_threshold, EndpointConfig, EndpointDetector, EndpointEndReason, EndpointEvent,
+    VadScorer, DEFAULT_MAX_UTTERANCE_MS, DEFAULT_MIN_SPEECH_MS, DEFAULT_PRE_ROLL_MS,
+    DEFAULT_SILENCE_MS, DEFAULT_SPEECH_THRESHOLD, VAD_FRAME_MS, VAD_SAMPLE_RATE,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -1181,9 +1181,7 @@ fn spawn_turn_task(
 
         let turn_future = async {
             let _permit = state
-                .request_semaphore
-                .clone()
-                .acquire_owned()
+                .acquire_owned_workload_permit(WorkloadClass::Realtime)
                 .await
                 .map_err(|_| "Server is shutting down".to_string())?;
 

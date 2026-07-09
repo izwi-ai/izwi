@@ -23,6 +23,7 @@ use izwi_core::runtime_models::architectures::vibevoice::tts::vibevoice_tts_auto
 use izwi_core::runtime_models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use izwi_core::{
     parse_tts_model_variant, AudioChunk, GenerationConfig, GenerationRequest, ModelVariant,
+    WorkloadClass,
 };
 
 const DEFAULT_STREAM_EVENT_QUEUE_CAPACITY: usize = 32;
@@ -151,7 +152,9 @@ pub async fn speech(
         return stream_speech(state, req, ctx.correlation_id, variant, resolved_format).await;
     }
 
-    let _permit = state.acquire_permit().await;
+    let _permit = state
+        .acquire_workload_permit(WorkloadClass::Interactive)
+        .await;
 
     let timeout = Duration::from_secs(resolve_speech_timeout_secs(
         state.request_timeout_secs,
@@ -409,9 +412,12 @@ async fn stream_speech(
     let (event_tx, mut event_rx) = mpsc::channel::<String>(stream_event_queue_capacity());
 
     let engine = state.runtime.clone();
-    let semaphore = state.request_semaphore.clone();
+    let admission_state = state.clone();
     tokio::spawn(async move {
-        let _permit = match semaphore.acquire_owned().await {
+        let _permit = match admission_state
+            .acquire_owned_workload_permit(WorkloadClass::Streaming)
+            .await
+        {
             Ok(permit) => permit,
             Err(_) => {
                 let error_event = SpeechStreamEvent {

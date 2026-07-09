@@ -6,7 +6,7 @@ use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::{
     parse_chat_model_variant, ChatGeneration, ChatMessage, ChatRequestConfig, GenerationParams,
-    ModelVariant,
+    ModelVariant, WorkloadClass,
 };
 
 #[derive(Debug, Clone)]
@@ -81,7 +81,9 @@ pub async fn generate_chat(
     let variant = request.variant;
     let messages = request.messages;
     let correlation_id = request.correlation_id;
-    let _permit = state.acquire_permit().await;
+    let _permit = state
+        .acquire_workload_permit(WorkloadClass::Interactive)
+        .await;
 
     state
         .runtime
@@ -100,7 +102,6 @@ pub fn spawn_chat_stream(
     state: AppState,
     request: ChatExecutionRequest,
 ) -> mpsc::UnboundedReceiver<ChatStreamEvent> {
-    let semaphore = state.request_semaphore.clone();
     let runtime = state.runtime.clone();
     let params = request.resolved_generation_params();
     let chat_config = request.resolved_chat_config();
@@ -108,23 +109,47 @@ pub fn spawn_chat_stream(
     let messages = request.messages;
     let correlation_id = request.correlation_id;
 
-    // Streamed chat should be allowed to finish once generation starts; a hard
-    // wall-clock timeout cuts off active responses mid-stream.
-    spawn_chat_stream_with_task(semaphore, move |event_tx| async move {
-        runtime
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let _permit = match state
+            .acquire_owned_workload_permit(WorkloadClass::Streaming)
+            .await
+        {
+            Ok(permit) => permit,
+            Err(_) => {
+                let _ = event_tx.send(ChatStreamEvent::ShuttingDown);
+                return;
+            }
+        };
+
+        let _ = event_tx.send(ChatStreamEvent::Started);
+
+        match runtime
             .chat_generate_streaming_with_generation_params_and_chat_config_and_correlation(
                 variant,
                 messages,
                 params,
                 chat_config,
                 correlation_id.as_deref(),
-                move |delta| {
-                    let _ = event_tx.send(ChatStreamEvent::Delta(delta));
+                {
+                    let event_tx = event_tx.clone();
+                    move |delta| {
+                        let _ = event_tx.send(ChatStreamEvent::Delta(delta));
+                    }
                 },
             )
             .await
-            .map_err(|err| err.to_string())
-    })
+        {
+            Ok(generation) => {
+                let _ = event_tx.send(ChatStreamEvent::Completed(generation));
+            }
+            Err(err) => {
+                let _ = event_tx.send(ChatStreamEvent::Failed(err.to_string()));
+            }
+        }
+    });
+
+    event_rx
 }
 
 fn spawn_chat_stream_with_task<G, Fut>(

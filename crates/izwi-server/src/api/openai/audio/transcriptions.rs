@@ -24,7 +24,7 @@ use crate::api::request_context::RequestContext;
 use crate::api::speech_text_upload::multipart_upload_api_error;
 use crate::error::ApiError;
 use crate::state::AppState;
-use izwi_core::parse_model_variant;
+use izwi_core::{parse_model_variant, WorkloadClass};
 
 #[derive(Debug, Default)]
 struct TranscriptionRequest {
@@ -146,7 +146,9 @@ pub async fn transcriptions(
         ));
     }
 
-    let _permit = state.acquire_permit().await;
+    let _permit = state
+        .acquire_workload_permit(WorkloadClass::Interactive)
+        .await;
     let started = Instant::now();
     let output = state
         .runtime
@@ -307,10 +309,13 @@ async fn transcriptions_stream(
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<String>();
     let engine = state.runtime.clone();
-    let semaphore = state.request_semaphore.clone();
+    let admission_state = state.clone();
 
     tokio::spawn(async move {
-        let _permit = match semaphore.acquire_owned().await {
+        let _permit = match admission_state
+            .acquire_owned_workload_permit(WorkloadClass::Streaming)
+            .await
+        {
             Ok(permit) => permit,
             Err(_) => {
                 let _ = event_tx.send(transcript_error_event_payload("Server is shutting down"));

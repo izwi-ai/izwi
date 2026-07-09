@@ -2,7 +2,7 @@
 
 use axum::Json;
 use serde::Serialize;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use utoipa::{OpenApi, ToSchema};
 
 use crate::api::admin::models::{
@@ -67,6 +67,8 @@ use crate::api::openai::audio::align::{
         OpenAiModelsResponse,
         ProbeCheck,
         ReadyResponse,
+        RequestAdmissionClassSnapshot,
+        RequestAdmissionSnapshot,
         ResponseDeletedObject,
         ResponseInputItemsList,
         ResponseObject,
@@ -1857,8 +1859,28 @@ pub struct ReadyResponse {
     pub phase: String,
     pub draining: bool,
     pub uptime_secs: u64,
+    pub request_admission: RequestAdmissionSnapshot,
     pub checks: Vec<ProbeCheck>,
     pub startup_warnings: Vec<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RequestAdmissionClassSnapshot {
+    pub capacity: usize,
+    pub available: usize,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RequestAdmissionSnapshot {
+    pub global: RequestAdmissionClassSnapshot,
+    pub realtime: RequestAdmissionClassSnapshot,
+    pub interactive: RequestAdmissionClassSnapshot,
+    pub streaming: RequestAdmissionClassSnapshot,
+    pub online: RequestAdmissionClassSnapshot,
+    pub batch: RequestAdmissionClassSnapshot,
+    pub background: RequestAdmissionClassSnapshot,
 }
 
 #[allow(dead_code)]
@@ -2291,10 +2313,10 @@ mod tests {
     #[test]
     fn openapi_documents_transcription_json_and_multipart_request_bodies() {
         let openapi = document();
-        let content =
-            openapi["paths"]["/v1/audio/transcriptions"]["post"]["requestBody"]["content"]
-                .as_object()
-                .expect("transcription request body content should exist");
+        let content = openapi["paths"]["/v1/audio/transcriptions"]["post"]["requestBody"]
+            ["content"]
+            .as_object()
+            .expect("transcription request body content should exist");
 
         assert_eq!(
             content["application/json"]["schema"]["$ref"].as_str(),

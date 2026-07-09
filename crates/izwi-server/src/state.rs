@@ -1,13 +1,10 @@
 //! Application state management with high-concurrency optimizations
 
+use crate::batch_runtime::{store::BatchRuntimeStore, worker::BatchWorkerHealth};
 use crate::chat_store::ChatStore;
 use crate::db::StoreDatabase;
 use crate::diarization_store::DiarizationStore;
 use crate::onboarding_store::OnboardingStore;
-use crate::batch_runtime::{
-    store::BatchRuntimeStore,
-    worker::BatchWorkerHealth,
-};
 use crate::persistence::PersistenceContext;
 use crate::saved_voice_store::SavedVoiceStore;
 use crate::speech_history_store::SpeechHistoryStore;
@@ -16,16 +13,194 @@ use crate::transcription_store::TranscriptionStore;
 use crate::voice_observation_store::VoiceObservationStore;
 use crate::voice_store::VoiceStore;
 use izwi_agent::planner::PlanningMode;
-use izwi_core::{RuntimeService, ServeRuntimeConfig};
+use izwi_core::{RuntimeService, ServeRuntimeConfig, WorkloadClass};
 use izwi_hooks::EnterpriseHooks;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, SemaphorePermit};
 
 const DEFAULT_RESPONSE_STORE_LIMIT: usize = 512;
 const DEFAULT_AGENT_SESSION_STORE_LIMIT: usize = 512;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RequestAdmissionClassSnapshot {
+    pub capacity: usize,
+    pub available: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RequestAdmissionSnapshot {
+    pub global: RequestAdmissionClassSnapshot,
+    pub realtime: RequestAdmissionClassSnapshot,
+    pub interactive: RequestAdmissionClassSnapshot,
+    pub streaming: RequestAdmissionClassSnapshot,
+    pub online: RequestAdmissionClassSnapshot,
+    pub batch: RequestAdmissionClassSnapshot,
+    pub background: RequestAdmissionClassSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequestAdmissionLimits {
+    realtime: usize,
+    interactive: usize,
+    streaming: usize,
+    online: usize,
+    batch: usize,
+    background: usize,
+}
+
+impl RequestAdmissionLimits {
+    fn from_env(global_capacity: usize) -> Self {
+        let global_capacity = global_capacity.max(1);
+        let throughput_default = if global_capacity > 1 {
+            global_capacity - 1
+        } else {
+            1
+        };
+        Self {
+            realtime: class_limit_from_env("IZWI_MAX_REALTIME_REQUESTS", global_capacity),
+            interactive: class_limit_from_env("IZWI_MAX_INTERACTIVE_REQUESTS", global_capacity),
+            streaming: class_limit_from_env("IZWI_MAX_STREAMING_REQUESTS", global_capacity),
+            online: class_limit_from_env("IZWI_MAX_ONLINE_REQUESTS", global_capacity),
+            batch: class_limit_from_env("IZWI_MAX_BATCH_REQUESTS", throughput_default),
+            background: class_limit_from_env("IZWI_MAX_BACKGROUND_REQUESTS", throughput_default),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RequestAdmissionLimiter {
+    limits: RequestAdmissionLimits,
+    realtime: Arc<Semaphore>,
+    interactive: Arc<Semaphore>,
+    streaming: Arc<Semaphore>,
+    online: Arc<Semaphore>,
+    batch: Arc<Semaphore>,
+    background: Arc<Semaphore>,
+}
+
+pub struct AdmissionPermit<'a> {
+    _class_permit: SemaphorePermit<'a>,
+    _global_permit: SemaphorePermit<'a>,
+    class: WorkloadClass,
+}
+
+impl AdmissionPermit<'_> {
+    pub fn class(&self) -> WorkloadClass {
+        self.class
+    }
+}
+
+pub struct OwnedAdmissionPermit {
+    _class_permit: OwnedSemaphorePermit,
+    _global_permit: OwnedSemaphorePermit,
+    class: WorkloadClass,
+}
+
+impl OwnedAdmissionPermit {
+    pub fn class(&self) -> WorkloadClass {
+        self.class
+    }
+}
+
+impl RequestAdmissionLimiter {
+    fn new(global_capacity: usize) -> Self {
+        Self::from_limits(RequestAdmissionLimits::from_env(global_capacity))
+    }
+
+    fn from_limits(limits: RequestAdmissionLimits) -> Self {
+        Self {
+            limits,
+            realtime: Arc::new(Semaphore::new(limits.realtime)),
+            interactive: Arc::new(Semaphore::new(limits.interactive)),
+            streaming: Arc::new(Semaphore::new(limits.streaming)),
+            online: Arc::new(Semaphore::new(limits.online)),
+            batch: Arc::new(Semaphore::new(limits.batch)),
+            background: Arc::new(Semaphore::new(limits.background)),
+        }
+    }
+
+    async fn acquire<'a>(
+        &'a self,
+        class: WorkloadClass,
+        global: &'a Semaphore,
+    ) -> AdmissionPermit<'a> {
+        let class_permit = self
+            .semaphore_for(class)
+            .acquire()
+            .await
+            .expect("class admission semaphore should never be closed");
+        let global_permit = global
+            .acquire()
+            .await
+            .expect("global request semaphore should never be closed");
+        AdmissionPermit {
+            _class_permit: class_permit,
+            _global_permit: global_permit,
+            class,
+        }
+    }
+
+    async fn acquire_owned(
+        &self,
+        class: WorkloadClass,
+        global: Arc<Semaphore>,
+    ) -> Result<OwnedAdmissionPermit, tokio::sync::AcquireError> {
+        let class_permit = self.semaphore_for(class).clone().acquire_owned().await?;
+        let global_permit = global.acquire_owned().await?;
+        Ok(OwnedAdmissionPermit {
+            _class_permit: class_permit,
+            _global_permit: global_permit,
+            class,
+        })
+    }
+
+    fn snapshot(&self, global: &Semaphore, global_capacity: usize) -> RequestAdmissionSnapshot {
+        RequestAdmissionSnapshot {
+            global: RequestAdmissionClassSnapshot {
+                capacity: global_capacity,
+                available: global.available_permits(),
+            },
+            realtime: self.class_snapshot(WorkloadClass::Realtime),
+            interactive: self.class_snapshot(WorkloadClass::Interactive),
+            streaming: self.class_snapshot(WorkloadClass::Streaming),
+            online: self.class_snapshot(WorkloadClass::Online),
+            batch: self.class_snapshot(WorkloadClass::Batch),
+            background: self.class_snapshot(WorkloadClass::Background),
+        }
+    }
+
+    fn class_snapshot(&self, class: WorkloadClass) -> RequestAdmissionClassSnapshot {
+        RequestAdmissionClassSnapshot {
+            capacity: self.limit_for(class),
+            available: self.semaphore_for(class).available_permits(),
+        }
+    }
+
+    fn limit_for(&self, class: WorkloadClass) -> usize {
+        match class {
+            WorkloadClass::Realtime => self.limits.realtime,
+            WorkloadClass::Interactive => self.limits.interactive,
+            WorkloadClass::Streaming => self.limits.streaming,
+            WorkloadClass::Online => self.limits.online,
+            WorkloadClass::Batch => self.limits.batch,
+            WorkloadClass::Background => self.limits.background,
+        }
+    }
+
+    fn semaphore_for(&self, class: WorkloadClass) -> &Arc<Semaphore> {
+        match class {
+            WorkloadClass::Realtime => &self.realtime,
+            WorkloadClass::Interactive => &self.interactive,
+            WorkloadClass::Streaming => &self.streaming,
+            WorkloadClass::Online => &self.online,
+            WorkloadClass::Batch => &self.batch,
+            WorkloadClass::Background => &self.background,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredResponseInputItem {
@@ -160,6 +335,10 @@ pub struct AppState {
     pub lifecycle: ServerLifecycle,
     /// Concurrency limiter to prevent resource exhaustion
     pub request_semaphore: Arc<Semaphore>,
+    /// Configured global request limit used for admission snapshots.
+    pub request_global_capacity: usize,
+    /// Class-aware limiter layered in front of the global request semaphore.
+    pub request_admission: RequestAdmissionLimiter,
     /// Request timeout configuration (seconds)
     pub request_timeout_secs: u64,
     /// Max retained OpenAI-compatible response objects in memory.
@@ -235,6 +414,8 @@ impl AppState {
             persistence: None,
             lifecycle: ServerLifecycle::new(),
             request_semaphore: Arc::new(Semaphore::new(max_concurrent_requests)),
+            request_global_capacity: max_concurrent_requests,
+            request_admission: RequestAdmissionLimiter::new(max_concurrent_requests),
             request_timeout_secs,
             response_store_limit,
             agent_session_store_limit,
@@ -310,6 +491,8 @@ impl AppState {
             persistence: Some(persistence),
             lifecycle: ServerLifecycle::new(),
             request_semaphore: Arc::new(Semaphore::new(max_concurrent_requests)),
+            request_global_capacity: max_concurrent_requests,
+            request_admission: RequestAdmissionLimiter::new(max_concurrent_requests),
             request_timeout_secs,
             response_store_limit,
             agent_session_store_limit,
@@ -329,12 +512,31 @@ impl AppState {
         })
     }
 
-    /// Acquire a permit for concurrent request processing
-    pub async fn acquire_permit(&self) -> tokio::sync::SemaphorePermit<'_> {
-        self.request_semaphore
-            .acquire()
+    /// Acquire a permit for concurrent online request processing.
+    pub async fn acquire_permit(&self) -> AdmissionPermit<'_> {
+        self.acquire_workload_permit(WorkloadClass::Online).await
+    }
+
+    /// Acquire a permit for a specific workload class.
+    pub async fn acquire_workload_permit(&self, class: WorkloadClass) -> AdmissionPermit<'_> {
+        self.request_admission
+            .acquire(class, &self.request_semaphore)
             .await
-            .expect("Semaphore should never be closed")
+    }
+
+    /// Acquire an owned permit for spawned tasks.
+    pub async fn acquire_owned_workload_permit(
+        &self,
+        class: WorkloadClass,
+    ) -> Result<OwnedAdmissionPermit, tokio::sync::AcquireError> {
+        self.request_admission
+            .acquire_owned(class, self.request_semaphore.clone())
+            .await
+    }
+
+    pub fn request_admission_snapshot(&self) -> RequestAdmissionSnapshot {
+        self.request_admission
+            .snapshot(&self.request_semaphore, self.request_global_capacity)
     }
 
     pub async fn store_response_record(&self, record: StoredResponseRecord) {
@@ -389,6 +591,14 @@ fn store_limit_from_env(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn class_limit_from_env(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default.max(1))
+}
+
 fn trim_store_by<T>(
     store: &mut HashMap<String, T>,
     max_entries: usize,
@@ -413,13 +623,18 @@ fn trim_store_by<T>(
 #[cfg(test)]
 mod tests {
     use super::{
-        now_unix_secs, request_limits, trim_store_by, AppState, ServerLifecycle,
-        StoredAgentSessionRecord, StoredResponseInputItem, StoredResponseRecord,
+        now_unix_secs, request_limits, trim_store_by, AppState, RequestAdmissionLimiter,
+        RequestAdmissionLimits, ServerLifecycle, StoredAgentSessionRecord, StoredResponseInputItem,
+        StoredResponseRecord,
     };
     use crate::test_support::env_lock;
     use izwi_agent::planner::PlanningMode;
-    use izwi_core::{backends::BackendPreference, RuntimeService, ServeRuntimeConfig};
+    use izwi_core::{
+        backends::BackendPreference, RuntimeService, ServeRuntimeConfig, WorkloadClass,
+    };
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
 
     #[test]
     fn trim_store_by_evicts_oldest_response_record() {
@@ -512,6 +727,62 @@ mod tests {
 
         assert_eq!(request_timeout_secs, 91);
         assert_eq!(max_concurrent_requests, 7);
+    }
+
+    #[tokio::test]
+    async fn admission_limiter_reserves_capacity_from_batch_by_default() {
+        let limits = RequestAdmissionLimits {
+            realtime: 4,
+            interactive: 4,
+            streaming: 4,
+            online: 4,
+            batch: 3,
+            background: 3,
+        };
+        let limiter = RequestAdmissionLimiter::from_limits(limits);
+        let global = Arc::new(Semaphore::new(4));
+
+        let _batch_1 = limiter
+            .acquire_owned(WorkloadClass::Batch, global.clone())
+            .await
+            .expect("batch permit should acquire");
+        let _batch_2 = limiter
+            .acquire_owned(WorkloadClass::Batch, global.clone())
+            .await
+            .expect("batch permit should acquire");
+        let _batch_3 = limiter
+            .acquire_owned(WorkloadClass::Batch, global.clone())
+            .await
+            .expect("batch permit should acquire");
+
+        let snapshot = limiter.snapshot(&global, 4);
+        assert_eq!(snapshot.global.available, 1);
+        assert_eq!(snapshot.batch.available, 0);
+
+        let _realtime = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            limiter.acquire_owned(WorkloadClass::Realtime, global.clone()),
+        )
+        .await
+        .expect("realtime should not wait behind saturated batch class")
+        .expect("realtime permit should acquire");
+        assert_eq!(global.available_permits(), 0);
+    }
+
+    #[test]
+    fn admission_limits_leave_one_slot_for_non_batch_work_when_possible() {
+        let _guard = env_lock();
+        clear_admission_env();
+
+        let limits = RequestAdmissionLimits::from_env(4);
+        assert_eq!(limits.realtime, 4);
+        assert_eq!(limits.interactive, 4);
+        assert_eq!(limits.streaming, 4);
+        assert_eq!(limits.online, 4);
+        assert_eq!(limits.batch, 3);
+        assert_eq!(limits.background, 3);
+
+        clear_admission_env();
     }
 
     #[test]
@@ -642,6 +913,19 @@ mod tests {
         std::env::remove_var("IZWI_MEDIA_DIR");
         std::env::remove_var("IZWI_MAX_RESPONSE_STORE_ENTRIES");
         std::env::remove_var("IZWI_MAX_AGENT_SESSION_STORE_ENTRIES");
+    }
+
+    fn clear_admission_env() {
+        for key in [
+            "IZWI_MAX_REALTIME_REQUESTS",
+            "IZWI_MAX_INTERACTIVE_REQUESTS",
+            "IZWI_MAX_STREAMING_REQUESTS",
+            "IZWI_MAX_ONLINE_REQUESTS",
+            "IZWI_MAX_BATCH_REQUESTS",
+            "IZWI_MAX_BACKGROUND_REQUESTS",
+        ] {
+            std::env::remove_var(key);
+        }
     }
 
     fn with_suppressed_panic_hook<T>(f: impl FnOnce() -> T) -> T {

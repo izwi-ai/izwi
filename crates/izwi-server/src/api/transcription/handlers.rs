@@ -44,7 +44,7 @@ use async_trait::async_trait;
 use izwi_core::runtime::SpeakerAttributedAsrStatus as RuntimeSpeakerAttributedAsrStatus;
 use izwi_core::{
     parse_chat_model_variant, parse_model_variant, AsrProgress, AsrProgressPhase, ChatMessage,
-    ChatRequestConfig, ChatRole, GenerationParams, ModelVariant, RuntimeService,
+    ChatRequestConfig, ChatRole, GenerationParams, ModelVariant, RuntimeService, WorkloadClass,
 };
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
@@ -248,13 +248,7 @@ pub async fn regenerate_summary(
         .map_err(map_store_error)?
         .ok_or_else(|| ApiError::not_found("Transcription record not found"))?;
 
-    maybe_spawn_summary_generation(
-        state.runtime.clone(),
-        state.transcription_store.clone(),
-        state.request_semaphore.clone(),
-        &record,
-        Some(ctx.correlation_id),
-    );
+    maybe_spawn_summary_generation(state.clone(), &record, Some(ctx.correlation_id));
 
     Ok(Json(record))
 }
@@ -336,12 +330,11 @@ async fn create_record_stream(
     );
 
     spawn_transcription_processing_task(
-        state.runtime.clone(),
-        state.transcription_store.clone(),
-        state.request_semaphore.clone(),
+        state.clone(),
         placeholder.id.clone(),
         parsed,
         Some(correlation_id),
+        WorkloadClass::Streaming,
         Some(event_tx),
     );
 
@@ -577,12 +570,11 @@ impl StageExecutor for BatchAsrStageExecutor {
         let parsed = request.into_parsed();
 
         spawn_transcription_processing_task(
-            self.state.runtime.clone(),
-            self.state.transcription_store.clone(),
-            self.state.request_semaphore.clone(),
+            self.state.clone(),
             record_id.clone(),
             parsed,
             claimed.job.correlation_id.clone(),
+            WorkloadClass::Batch,
             None,
         );
 
@@ -682,22 +674,23 @@ async fn create_transcript_runtime_artifact(
 }
 
 fn spawn_transcription_processing_task(
-    runtime: Arc<RuntimeService>,
-    transcription_store: Arc<TranscriptionStore>,
-    semaphore: Arc<tokio::sync::Semaphore>,
+    state: AppState,
     record_id: String,
     parsed: ParsedTranscriptionCreateRequest,
     correlation_id: Option<String>,
+    workload_class: WorkloadClass,
     event_tx: Option<mpsc::UnboundedSender<String>>,
 ) {
     tokio::spawn(async move {
+        let runtime = state.runtime.clone();
+        let transcription_store = state.transcription_store.clone();
         let send_event = |payload: String| {
             if let Some(tx) = &event_tx {
                 let _ = tx.send(payload);
             }
         };
 
-        let _permit = match semaphore.clone().acquire_owned().await {
+        let _permit = match state.acquire_owned_workload_permit(workload_class).await {
             Ok(permit) => permit,
             Err(_) => {
                 let error_message = "Server is shutting down".to_string();
@@ -898,9 +891,7 @@ fn spawn_transcription_processing_task(
                 {
                     Ok(Some(record)) => {
                         maybe_spawn_summary_generation(
-                            runtime.clone(),
-                            transcription_store.clone(),
-                            semaphore.clone(),
+                            state.clone(),
                             &record,
                             correlation_id.clone(),
                         );
@@ -1524,9 +1515,7 @@ fn initial_summary_state(
 }
 
 fn maybe_spawn_summary_generation(
-    runtime: Arc<RuntimeService>,
-    transcription_store: Arc<TranscriptionStore>,
-    semaphore: Arc<tokio::sync::Semaphore>,
+    state: AppState,
     record: &TranscriptionRecord,
     correlation_id: Option<String>,
 ) {
@@ -1535,9 +1524,7 @@ fn maybe_spawn_summary_generation(
     }
 
     spawn_summary_generation_task(
-        runtime,
-        transcription_store,
-        semaphore,
+        state,
         record.id.clone(),
         record.transcription.clone(),
         correlation_id,
@@ -1545,15 +1532,18 @@ fn maybe_spawn_summary_generation(
 }
 
 fn spawn_summary_generation_task(
-    runtime: Arc<RuntimeService>,
-    transcription_store: Arc<TranscriptionStore>,
-    semaphore: Arc<tokio::sync::Semaphore>,
+    state: AppState,
     record_id: String,
     transcription: String,
     correlation_id: Option<String>,
 ) {
     tokio::spawn(async move {
-        let _permit = match semaphore.acquire_owned().await {
+        let runtime = state.runtime.clone();
+        let transcription_store = state.transcription_store.clone();
+        let _permit = match state
+            .acquire_owned_workload_permit(WorkloadClass::Background)
+            .await
+        {
             Ok(permit) => permit,
             Err(_) => return,
         };
