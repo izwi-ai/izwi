@@ -36,6 +36,7 @@ RUN apt-get update && apt-get install -y \
 
 # Copy Cargo files first for dependency caching
 COPY Cargo.toml Cargo.lock ./
+COPY vendor/candle-core-0.11.0/ vendor/candle-core-0.11.0/
 COPY crates/ crates/
 
 # Build CPU release binary (server only for Docker)
@@ -70,6 +71,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
 
 # Copy Cargo files first for dependency caching
 COPY Cargo.toml Cargo.lock ./
+COPY vendor/candle-core-0.11.0/ vendor/candle-core-0.11.0/
 COPY crates/ crates/
 
 # Build CUDA release binary (server only for Docker)
