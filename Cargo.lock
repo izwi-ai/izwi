@@ -721,6 +721,8 @@ dependencies = [
 [[package]]
 name = "candle-core"
 version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ecb245093b0f791b89d3420c3df9c6d49c60ab63ba54db896bf8a3baf486706"
 dependencies = [
  "accelerate-src",
  "byteorder",

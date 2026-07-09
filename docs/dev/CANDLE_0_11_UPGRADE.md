@@ -3,26 +3,26 @@
 Izwi is pinned to Candle `0.11.0` for `candle-core`, `candle-nn`,
 `candle-transformers`, `candle-metal-kernels`, and `candle-flash-attn`.
 
-## Local Candle Core Patch
+## Candle Dependency Source
 
-The workspace patches `candle-core` to `vendor/candle-core-0.11.0` from
-`[patch.crates-io]` in the root `Cargo.toml`.
+Izwi uses Candle directly from crates.io. The root `Cargo.toml` intentionally
+does not carry a `[patch.crates-io]` override, and the repository does not
+vendor Candle source.
 
-The patch is intentionally narrow:
+This keeps Docker, CI, local development, and release packaging on the same
+dependency source. It also avoids requiring every reduced build context to copy
+a local Candle checkout before running `cargo build --locked`.
 
-- Apple Silicon stable Rust exposes the `fp16` target feature, but Candle
-  `0.11.0`'s NEON fp16 specialization reaches unstable `stdarch_neon_f16`.
-- Global `RUSTFLAGS='-C target-feature=-fp16'` lets Candle compile, but breaks
-  other dependencies such as `gemm-f16`.
-- The local patch keeps Candle at version `0.11.0` and routes macOS ARM through
-  Candle's existing f32-widening NEON fallback while leaving other platforms on
-  the upstream native fp16 path.
-- The patch also removes one unused Metal backend import so local warning-free
-  checks stay clean.
+Known local caveat:
 
-Remove the patch when an upstream Candle release or `0.11.x` patch compiles on
-Apple Silicon stable Rust without global target-feature overrides and without
-breaking `gemm-f16`.
+- On the Apple Silicon stable Rust toolchain used during the upgrade, upstream
+  `candle-core 0.11.0` can hit unstable `stdarch_neon_f16` code in Candle's
+  NEON fp16 specialization.
+- Do not add a local vendored Candle patch for this. Treat it as an upstream
+  Candle/toolchain compatibility issue and verify Linux Docker/CI paths against
+  the crates.io dependency.
+- Global `RUSTFLAGS='-C target-feature=-fp16'` is not a general workaround for
+  this workspace because it can break other dependencies such as `gemm-f16`.
 
 ## Metal API Migration
 
