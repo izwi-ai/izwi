@@ -17,10 +17,11 @@ use crate::catalog::{ModelInfo, ModelVariant};
 use crate::config::EngineConfig;
 use crate::engine::{
     engine_stream_backpressure_total, Engine as CoreEngine, EngineCoreConfig, EngineCoreRequest,
-    EngineOutput, StreamingOutput, TaskType, WorkerConfig, ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
-    ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_HITS_TOTAL, ENGINE_KV_CACHE_MISSES_TOTAL,
-    ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL, ENGINE_SCHEDULER_QUEUE_DEPTH,
-    ENGINE_SCHEDULER_RUNNING_REQUESTS, ENGINE_STREAM_BACKPRESSURE_TOTAL,
+    EngineOutput, StreamingOutput, TaskType, WorkerConfig, WorkloadClass,
+    ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_HITS_TOTAL,
+    ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL,
+    ENGINE_SCHEDULER_QUEUE_DEPTH, ENGINE_SCHEDULER_RUNNING_REQUESTS,
+    ENGINE_STREAM_BACKPRESSURE_TOTAL,
 };
 use crate::error::{Error, Result};
 use crate::model::ModelResidencyLease;
@@ -617,6 +618,7 @@ impl RuntimeService {
             } else {
                 "engine.request".to_string()
             }),
+            workload_class: Some(request.workload_class.as_str().to_string()),
             request_id: Some(request.id.clone()),
             correlation_id: request.correlation_id.clone(),
             ..RuntimeObservationContext::default()
@@ -692,6 +694,7 @@ impl RuntimeService {
             request_id = %request.id,
             correlation_id = ?request.correlation_id,
             task = ?request.task_type,
+            workload_class = ?request.workload_class,
             streaming = false
         );
         let _entered = span.enter();
@@ -763,6 +766,9 @@ impl RuntimeService {
         Fut: Future<Output = Result<()>>,
     {
         request.streaming = true;
+        if request.workload_class == WorkloadClass::Online {
+            request.workload_class = WorkloadClass::Streaming;
+        }
         if broker_streaming_required {
             self.observe_broker_request(&request)?;
         } else {
@@ -779,6 +785,7 @@ impl RuntimeService {
             request_id = %request.id,
             correlation_id = ?request.correlation_id,
             task = ?request.task_type,
+            workload_class = ?request.workload_class,
             streaming = true
         );
         let _entered = span.enter();

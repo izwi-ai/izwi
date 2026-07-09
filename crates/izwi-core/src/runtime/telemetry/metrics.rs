@@ -79,6 +79,8 @@ pub struct RuntimeObservationContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub streaming_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub workload_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pipeline_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pipeline_stage: Option<String>,

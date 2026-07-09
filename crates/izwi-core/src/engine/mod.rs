@@ -58,7 +58,7 @@ pub use metrics::{
 pub use output::{AsrProgress, AsrProgressPhase, OutputProcessor, StreamingOutput};
 pub use request::{
     AsrEngineInput, AudioChatEngineInput, ChatEngineInput, EngineAudioInput, EngineCoreRequest,
-    EngineStreamPolicy, EngineTask, RequestProcessor, RequestStatus, TtsEngineInput,
+    EngineStreamPolicy, EngineTask, RequestProcessor, RequestStatus, TtsEngineInput, WorkloadClass,
 };
 pub use scheduler::{ScheduleResult, Scheduler, SchedulerConfig, SchedulingPolicy};
 pub use types::{

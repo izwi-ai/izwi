@@ -47,7 +47,7 @@ pub use engine::{
     AsrProgress, AsrProgressPhase, EngineCore, EngineCoreConfig, EngineCoreRequest, EngineMetrics,
     EngineOutput, EngineTask, GenerationParams, KVCacheManager, ModelExecutor, OutputProcessor,
     PinnedBlockHandle, RequestProcessor, RequestStatus, Scheduler, SchedulerConfig,
-    SchedulingPolicy, StreamingOutput, TtsEngineInput,
+    SchedulingPolicy, StreamingOutput, TtsEngineInput, WorkloadClass,
 };
 
 // Legacy re-exports for backward compatibility

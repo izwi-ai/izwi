@@ -5,7 +5,7 @@
 //! capability that needs them while preserving the existing engine contract.
 
 use crate::engine::{
-    EngineCoreRequest, EngineStreamPolicy, GenerationParams as CoreGenerationParams,
+    EngineCoreRequest, EngineStreamPolicy, GenerationParams as CoreGenerationParams, WorkloadClass,
 };
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
@@ -67,6 +67,7 @@ pub(crate) struct RequestEnvelope {
     pub(crate) priority: RequestPriority,
     pub(crate) deadline: Option<Instant>,
     pub(crate) stream_policy: RuntimeStreamPolicy,
+    pub(crate) workload_class: WorkloadClass,
 }
 
 impl RequestEnvelope {
@@ -79,6 +80,7 @@ impl RequestEnvelope {
             priority: RequestPriority::default(),
             deadline: None,
             stream_policy: RuntimeStreamPolicy::default(),
+            workload_class: WorkloadClass::Online,
         }
     }
 
@@ -104,6 +106,11 @@ impl RequestEnvelope {
 
     pub(crate) fn with_stream_policy(mut self, stream_policy: RuntimeStreamPolicy) -> Self {
         self.stream_policy = stream_policy;
+        self
+    }
+
+    pub(crate) fn with_workload_class(mut self, workload_class: WorkloadClass) -> Self {
+        self.workload_class = workload_class;
         self
     }
 }
@@ -166,6 +173,7 @@ impl TtsRuntimeRequest {
         request.model_variant = Some(self.envelope.model_variant);
         request.correlation_id = self.envelope.correlation_id;
         request.stream_policy = self.envelope.stream_policy.into();
+        request.workload_class = self.envelope.workload_class;
         request.language = self.language;
         request.reference_audio = self.reference_audio;
         request.reference_text = self.reference_text;
@@ -240,6 +248,7 @@ impl AsrRuntimeRequest {
         request.model_variant = Some(self.envelope.model_variant);
         request.correlation_id = self.envelope.correlation_id;
         request.stream_policy = self.envelope.stream_policy.into();
+        request.workload_class = self.envelope.workload_class;
         if let Some(language) = self.language {
             request = request.with_language(language);
         }
@@ -291,6 +300,7 @@ impl ChatRuntimeRequest {
         request.model_variant = Some(self.envelope.model_variant);
         request.correlation_id = self.envelope.correlation_id;
         request.stream_policy = self.envelope.stream_policy.into();
+        request.workload_class = self.envelope.workload_class;
         request.params = self.params;
         request.chat_config = self.chat_config;
         request.prompt_tokens = self.prompt_tokens;
@@ -362,6 +372,7 @@ impl AudioChatRuntimeRequest {
         request.model_variant = Some(self.envelope.model_variant);
         request.correlation_id = self.envelope.correlation_id;
         request.stream_policy = self.envelope.stream_policy.into();
+        request.workload_class = self.envelope.workload_class;
         request.chat_messages = (!self.messages.is_empty()).then_some(self.messages);
         request.system_prompt = self
             .system_prompt
@@ -551,7 +562,8 @@ mod tests {
             .with_correlation_id(Some("corr-1".to_string()))
             .with_priority(RequestPriority::Interactive)
             .with_deadline(Some(deadline))
-            .with_stream_policy(RuntimeStreamPolicy::Coalesce);
+            .with_stream_policy(RuntimeStreamPolicy::Coalesce)
+            .with_workload_class(WorkloadClass::Streaming);
 
         assert_eq!(envelope.request_id, "req-1");
         assert_eq!(envelope.capability, CapabilityKind::Chat);
@@ -560,6 +572,7 @@ mod tests {
         assert_eq!(envelope.priority, RequestPriority::Interactive);
         assert_eq!(envelope.deadline, Some(deadline));
         assert_eq!(envelope.stream_policy, RuntimeStreamPolicy::Coalesce);
+        assert_eq!(envelope.workload_class, WorkloadClass::Streaming);
     }
 
     #[test]

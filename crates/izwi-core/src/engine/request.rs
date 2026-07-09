@@ -42,6 +42,73 @@ impl Default for EngineStreamPolicy {
     }
 }
 
+/// Coarse workload class used by admission and latency-aware scheduling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadClass {
+    /// Realtime voice or transcription work where first output latency matters most.
+    Realtime,
+    /// Interactive non-streaming user work.
+    Interactive,
+    /// User-visible streaming work such as chat or TTS over SSE/websocket.
+    Streaming,
+    /// Default online API work.
+    Online,
+    /// Offline batch jobs.
+    Batch,
+    /// Opportunistic background work.
+    Background,
+}
+
+impl Default for WorkloadClass {
+    fn default() -> Self {
+        Self::Online
+    }
+}
+
+impl WorkloadClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Realtime => "realtime",
+            Self::Interactive => "interactive",
+            Self::Streaming => "streaming",
+            Self::Online => "online",
+            Self::Batch => "batch",
+            Self::Background => "background",
+        }
+    }
+
+    pub fn is_latency_sensitive(self) -> bool {
+        matches!(self, Self::Realtime | Self::Interactive | Self::Streaming)
+    }
+
+    pub fn prefers_single_token_decode(self) -> bool {
+        self.is_latency_sensitive()
+    }
+
+    pub fn adaptive_score_boost(self) -> f64 {
+        match self {
+            Self::Realtime => 3.0,
+            Self::Interactive => 2.0,
+            Self::Streaming => 1.75,
+            Self::Online => 0.0,
+            Self::Batch => -0.35,
+            Self::Background => -0.75,
+        }
+    }
+
+    pub fn deadline_scale(self) -> f64 {
+        match self {
+            Self::Realtime => 0.45,
+            Self::Interactive => 0.65,
+            Self::Streaming => 0.75,
+            Self::Online => 1.0,
+            Self::Batch => 1.75,
+            Self::Background => 2.50,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum EngineAudioInput {
     Base64(String),
@@ -137,6 +204,8 @@ pub struct EngineCoreRequest {
     pub params: GenerationParams,
     /// Request priority
     pub priority: Priority,
+    /// Coarse latency/throughput class for scheduling and admission.
+    pub workload_class: WorkloadClass,
     /// Arrival timestamp
     pub arrival_time: Instant,
     /// Prompt token IDs (set by processor)
@@ -245,6 +314,7 @@ impl EngineCoreRequest {
             system_prompt: None,
             params: GenerationParams::default(),
             priority: Priority::Normal,
+            workload_class: WorkloadClass::Online,
             arrival_time: Instant::now(),
             prompt_tokens: Vec::new(),
             streaming: false,
@@ -280,6 +350,7 @@ impl EngineCoreRequest {
             system_prompt: None,
             params: GenerationParams::default(),
             priority: Priority::Normal,
+            workload_class: WorkloadClass::Online,
             arrival_time: Instant::now(),
             prompt_tokens: Vec::new(),
             streaming: false,
@@ -315,6 +386,7 @@ impl EngineCoreRequest {
             system_prompt: None,
             params: GenerationParams::default(),
             priority: Priority::Normal,
+            workload_class: WorkloadClass::Online,
             arrival_time: Instant::now(),
             prompt_tokens: Vec::new(),
             streaming: false,
@@ -349,6 +421,7 @@ impl EngineCoreRequest {
             system_prompt: None,
             params: GenerationParams::default(),
             priority: Priority::Normal,
+            workload_class: WorkloadClass::Online,
             arrival_time: Instant::now(),
             prompt_tokens: Vec::new(),
             streaming: false,
@@ -384,6 +457,7 @@ impl EngineCoreRequest {
             system_prompt: None,
             params: GenerationParams::default(),
             priority: Priority::Normal,
+            workload_class: WorkloadClass::Online,
             arrival_time: Instant::now(),
             prompt_tokens: Vec::new(),
             streaming: false,
@@ -419,6 +493,7 @@ impl EngineCoreRequest {
             system_prompt: None,
             params: GenerationParams::default(),
             priority: Priority::Normal,
+            workload_class: WorkloadClass::Online,
             arrival_time: Instant::now(),
             prompt_tokens: Vec::new(),
             streaming: false,
@@ -445,9 +520,18 @@ impl EngineCoreRequest {
         self
     }
 
+    /// Set workload class.
+    pub fn with_workload_class(mut self, workload_class: WorkloadClass) -> Self {
+        self.workload_class = workload_class;
+        self
+    }
+
     /// Enable streaming.
     pub fn with_streaming(mut self, streaming: bool) -> Self {
         self.streaming = streaming;
+        if streaming && self.workload_class == WorkloadClass::Online {
+            self.workload_class = WorkloadClass::Streaming;
+        }
         self
     }
 
@@ -783,9 +867,18 @@ impl RequestBuilder {
         self
     }
 
+    /// Set workload class.
+    pub fn workload_class(mut self, workload_class: WorkloadClass) -> Self {
+        self.request.workload_class = workload_class;
+        self
+    }
+
     /// Enable streaming.
     pub fn streaming(mut self) -> Self {
         self.request.streaming = true;
+        if self.request.workload_class == WorkloadClass::Online {
+            self.request.workload_class = WorkloadClass::Streaming;
+        }
         self
     }
 
@@ -859,11 +952,24 @@ mod tests {
     fn test_tts_request() {
         let request = EngineCoreRequest::tts("Hello, world!");
         assert_eq!(request.task_type, TaskType::TTS);
+        assert_eq!(request.workload_class, WorkloadClass::Online);
         assert_eq!(request.text.as_deref(), Some("Hello, world!"));
         match &request.task {
             EngineTask::Tts(input) => assert_eq!(input.text, "Hello, world!"),
             other => panic!("unexpected task payload: {other:?}"),
         }
+    }
+
+    #[test]
+    fn streaming_request_defaults_to_streaming_workload_class() {
+        let request = EngineCoreRequest::tts("Hello").with_streaming(true);
+        assert_eq!(request.workload_class, WorkloadClass::Streaming);
+
+        let request = RequestBuilder::tts("Hello")
+            .workload_class(WorkloadClass::Realtime)
+            .streaming()
+            .build();
+        assert_eq!(request.workload_class, WorkloadClass::Realtime);
     }
 
     #[test]
