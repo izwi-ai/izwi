@@ -301,8 +301,14 @@ pub struct KVCacheTelemetry {
     pub total_allocations: u64,
     /// Number of physical block frees (refcount reached zero).
     pub total_frees: u64,
-    /// Number of shared-prefix hits.
+    /// Number of request-level prefix lookups that reused at least one logical block.
     pub shared_prefix_hits: u64,
+    /// Number of request-level prefix lookups that reused no logical blocks.
+    pub shared_prefix_misses: u64,
+    /// Number of logical blocks successfully reused from prefix cache.
+    pub shared_prefix_blocks_reused: u64,
+    /// Number of persistent prefix entries evicted by TTL, capacity, or entry cap.
+    pub persistent_prefix_evictions: u64,
     /// Number of copy-on-write splits.
     pub copy_on_write_splits: u64,
     /// Last sampled churn ratio used for tuning.
@@ -347,6 +353,9 @@ impl KVCacheManager {
                 total_allocations: 0,
                 total_frees: 0,
                 shared_prefix_hits: 0,
+                shared_prefix_misses: 0,
+                shared_prefix_blocks_reused: 0,
+                persistent_prefix_evictions: 0,
                 copy_on_write_splits: 0,
                 last_churn_ratio: 0.0,
                 soft_max_blocks,
@@ -386,9 +395,19 @@ impl KVCacheManager {
                     }
                 }
                 if !block_ids.is_empty() {
-                    self.telemetry.shared_prefix_hits += 1;
                     prefix_used = Some(hash);
                 }
+            }
+        }
+
+        let reused_blocks = block_ids.len();
+        if prefix_hash.is_some() {
+            if reused_blocks > 0 {
+                self.telemetry.shared_prefix_hits =
+                    self.telemetry.shared_prefix_hits.saturating_add(1);
+            } else {
+                self.telemetry.shared_prefix_misses =
+                    self.telemetry.shared_prefix_misses.saturating_add(1);
             }
         }
 
@@ -420,6 +439,10 @@ impl KVCacheManager {
             .entry(request_id.clone())
             .or_default()
             .extend(block_ids.iter().copied());
+        self.telemetry.shared_prefix_blocks_reused = self
+            .telemetry
+            .shared_prefix_blocks_reused
+            .saturating_add(reused_blocks as u64);
 
         // Register this request with shared-prefix bookkeeping if applicable.
         if let Some(hash) = prefix_hash {
@@ -562,13 +585,23 @@ impl KVCacheManager {
                     }
                     if ok && acquired.len() == blocks {
                         reused = acquired;
-                        self.telemetry.shared_prefix_hits += 1;
                         break;
                     }
                     if !acquired.is_empty() {
                         self.allocator.free_blocks(&acquired);
                     }
                 }
+            }
+        }
+
+        let reused_blocks = reused.len();
+        if max_reusable_blocks > 0 {
+            if reused_blocks > 0 {
+                self.telemetry.shared_prefix_hits =
+                    self.telemetry.shared_prefix_hits.saturating_add(1);
+            } else {
+                self.telemetry.shared_prefix_misses =
+                    self.telemetry.shared_prefix_misses.saturating_add(1);
             }
         }
 
@@ -600,6 +633,10 @@ impl KVCacheManager {
             .entry(request_id.clone())
             .or_default()
             .extend(block_ids.iter().copied());
+        self.telemetry.shared_prefix_blocks_reused = self
+            .telemetry
+            .shared_prefix_blocks_reused
+            .saturating_add(reused_blocks as u64);
 
         self.register_prefix_levels_for_request(request_id, &block_ids, prompt_tokens);
         self.maybe_tune_soft_limit();
@@ -786,6 +823,10 @@ impl KVCacheManager {
         let Some(entry) = self.persistent_prefix_entries.remove(&key) else {
             return;
         };
+        self.telemetry.persistent_prefix_evictions = self
+            .telemetry
+            .persistent_prefix_evictions
+            .saturating_add(1);
         self.persistent_prefix_lru
             .retain(|existing| existing != &key);
         let allocated_before = self.allocator.num_allocated();
@@ -1473,6 +1514,9 @@ impl StreamingKVCacheManager {
                     total_allocations: 0,
                     total_frees: 0,
                     shared_prefix_hits: 0,
+                    shared_prefix_misses: 0,
+                    shared_prefix_blocks_reused: 0,
+                    persistent_prefix_evictions: 0,
                     copy_on_write_splits: 0,
                     last_churn_ratio: 0.0,
                     soft_max_blocks: self.allocator.soft_max_blocks(),
@@ -1575,7 +1619,9 @@ mod tests {
         assert_eq!(blocks2, blocks1);
         let stats_after_req2 = manager.stats();
         assert_eq!(stats_after_req2.allocated_blocks, 4);
-        assert!(stats_after_req2.telemetry.shared_prefix_hits >= 1);
+        assert_eq!(stats_after_req2.telemetry.shared_prefix_hits, 1);
+        assert_eq!(stats_after_req2.telemetry.shared_prefix_misses, 1);
+        assert_eq!(stats_after_req2.telemetry.shared_prefix_blocks_reused, 4);
 
         manager.free(&"req1".to_string());
         assert_eq!(manager.stats().allocated_blocks, 4);
@@ -1631,7 +1677,9 @@ mod tests {
 
         let stats = manager.stats();
         assert_eq!(stats.allocated_blocks, 4);
-        assert!(stats.telemetry.shared_prefix_hits >= 1);
+        assert_eq!(stats.telemetry.shared_prefix_hits, 1);
+        assert_eq!(stats.telemetry.shared_prefix_misses, 1);
+        assert_eq!(stats.telemetry.shared_prefix_blocks_reused, 2);
     }
 
     #[test]

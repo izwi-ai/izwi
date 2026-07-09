@@ -772,3 +772,44 @@ fn model_precision_rank(dir_name: &str) -> u8 {
         0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use izwi_core::LoadedModelDiagnostics;
+
+    #[test]
+    fn admin_model_runtime_diagnostics_preserve_actual_and_policy_values() {
+        let diagnostics = LoadedModelDiagnostics {
+            variant_id: ModelVariant::Qwen306BGguf.dir_name().to_string(),
+            variant: ModelVariant::Qwen306BGguf.to_string(),
+            family: "qwen3_chat",
+            task: "chat",
+            handle_kind: "native_chat",
+            loaded_model_kind: "qwen3_chat",
+            backend_kind: "cuda".to_string(),
+            device_kind: "Cuda".to_string(),
+            actual_device_kind: Some("cuda".to_string()),
+            actual_compute_dtype: Some("f16".to_string()),
+            default_compute_dtype: "bf16".to_string(),
+            default_dtype_reason: "CUDA policy prefers BF16".to_string(),
+            supports_incremental_decode: Some(true),
+            supports_realtime_stream_decode: None,
+            family_diagnostics: None,
+        };
+        let model = AdminModelInfo::from_model_info(
+            ModelInfo::new(ModelVariant::Qwen306BGguf),
+            Some(serde_json::to_value(diagnostics).expect("serialize runtime diagnostics")),
+        );
+
+        let value = serde_json::to_value(model).expect("serialize admin model");
+        assert_eq!(
+            value["runtime_diagnostics"]["actual_compute_dtype"],
+            "f16"
+        );
+        assert_eq!(
+            value["runtime_diagnostics"]["default_compute_dtype"],
+            "bf16"
+        );
+    }
+}

@@ -242,6 +242,8 @@ mod tests {
                 loaded_model_kind: "vibevoice_tts",
                 backend_kind: "cuda".to_string(),
                 device_kind: "Cuda".to_string(),
+                actual_device_kind: Some("cuda".to_string()),
+                actual_compute_dtype: Some("f16".to_string()),
                 default_compute_dtype: "bf16".to_string(),
                 default_dtype_reason: "CUDA default uses BF16".to_string(),
                 supports_incremental_decode: None,
@@ -268,6 +270,14 @@ mod tests {
         assert_eq!(value["loaded_tts_model"]["device_kind"], "Cuda");
         assert_eq!(value["loaded_tts_model"]["dtype"], "BF16");
         assert_eq!(value["loaded_models"][0]["family"], "vibevoice_tts");
+        assert_eq!(
+            value["loaded_models"][0]["actual_compute_dtype"],
+            "f16"
+        );
+        assert_eq!(
+            value["loaded_models"][0]["default_compute_dtype"],
+            "bf16"
+        );
         assert_eq!(
             value["loaded_models"][0]["family_diagnostics"]["dtype"],
             "BF16"

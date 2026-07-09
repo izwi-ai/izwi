@@ -63,11 +63,11 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_HITS_TOTAL,
-        description: "KV-cache or prefix-cache hits.",
+        description: "Request-level prefix-cache lookups that reused at least one logical block.",
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_MISSES_TOTAL,
-        description: "KV-cache or prefix-cache misses.",
+        description: "Request-level prefix-cache lookups that reused no logical blocks.",
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_EVICTIONS_TOTAL,
@@ -75,27 +75,27 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
-        description: "Currently allocated KV-cache blocks.",
+        description: "Currently allocated logical KV-cache blocks.",
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_FREE_BLOCKS,
-        description: "Currently free KV-cache blocks.",
+        description: "Currently free logical KV-cache blocks.",
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_SOFT_MAX_BLOCKS,
-        description: "Current adaptive KV-cache soft block cap.",
+        description: "Current adaptive soft cap for logical KV-cache blocks.",
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_UTILIZATION_RATIO,
-        description: "KV-cache allocated block utilization ratio.",
+        description: "Logical KV-cache block utilization ratio.",
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_MEMORY_USED_BYTES,
-        description: "Estimated KV-cache memory currently allocated in bytes.",
+        description: "Estimated KV-cache bytes implied by allocated logical blocks; not measured residency.",
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES,
-        description: "Estimated KV-cache memory capacity in bytes.",
+        description: "Estimated KV-cache bytes implied by logical block capacity; not measured residency.",
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_SHARED_PREFIXES,
@@ -103,23 +103,23 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL,
-        description: "Prompt blocks reused from prefix cache.",
+        description: "Logical prompt blocks reused from prefix cache.",
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL,
-        description: "Copy-on-write KV block splits.",
+        description: "Copy-on-write logical KV-block splits.",
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_CHURN_RATIO,
-        description: "Last sampled KV-cache churn ratio used by soft-cap tuning.",
+        description: "Last sampled logical KV-block churn ratio used by soft-cap tuning.",
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS,
-        description: "KV-cache blocks currently marked GPU resident.",
+        description: "Logical KV blocks marked device-resident by scheduler tiering; not measured GPU memory.",
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_PINNED_BLOCKS,
-        description: "KV-cache blocks pinned for backend execution.",
+        description: "Logical KV blocks pinned for backend execution.",
     },
     EngineMetricDescriptor {
         name: ENGINE_STREAM_BACKPRESSURE_TOTAL,

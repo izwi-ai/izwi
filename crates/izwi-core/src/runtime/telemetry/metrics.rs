@@ -58,6 +58,8 @@ pub struct EngineRuntimeTelemetrySnapshot {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct EngineKvCacheRuntimeSnapshot {
+    pub block_accounting: &'static str,
+    pub memory_accounting: &'static str,
     pub total_blocks: u64,
     pub soft_max_blocks: u64,
     pub allocated_blocks: u64,
@@ -74,6 +76,9 @@ pub struct EngineKvCacheRuntimeSnapshot {
     pub total_allocations: u64,
     pub total_frees: u64,
     pub shared_prefix_hits: u64,
+    pub shared_prefix_misses: u64,
+    pub shared_prefix_blocks_reused: u64,
+    pub persistent_prefix_evictions: u64,
     pub copy_on_write_splits: u64,
     pub last_churn_ratio: f64,
 }
@@ -261,6 +266,7 @@ pub struct RuntimeWorkloadClassTelemetrySnapshot {
     pub observations: u64,
     pub failures: u64,
     pub queue_wait_ms: RuntimeLatencyStats,
+    pub admission_ms: RuntimeLatencyStats,
     pub prefill_ms: RuntimeLatencyStats,
     pub decode_ms: RuntimeLatencyStats,
     pub ttft_ms: RuntimeLatencyStats,
@@ -300,6 +306,18 @@ pub struct RuntimeTelemetrySnapshot {
     pub observability: RuntimeObservabilityTelemetrySnapshot,
     pub engine_metrics: &'static [EngineMetricDescriptor],
     pub voice_metrics: &'static [VoiceMetricDescriptor],
+    #[serde(skip_serializing)]
+    latency_sample_counts: RuntimeLatencySampleCounts,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RuntimeLatencySampleCounts {
+    queue_wait: usize,
+    prefill: usize,
+    decode: usize,
+    ttft: usize,
+    end_to_end: usize,
+    stage_duration: usize,
 }
 
 #[derive(Debug)]
@@ -614,6 +632,14 @@ impl RuntimeTelemetryCollector {
             },
             engine_metrics: engine_metric_catalog(),
             voice_metrics: voice_metric_catalog(),
+            latency_sample_counts: RuntimeLatencySampleCounts {
+                queue_wait: queue.len(),
+                prefill: prefill.len(),
+                decode: decode.len(),
+                ttft: ttft.len(),
+                end_to_end: end_to_end.len(),
+                stage_duration: stage_duration.len(),
+            },
         }
     }
 
@@ -625,30 +651,50 @@ impl RuntimeTelemetryCollector {
 # TYPE izwi_requests_failed_total counter\nizwi_requests_failed_total {}\n\
 # TYPE izwi_requests_active gauge\nizwi_requests_active {}\n\
 # TYPE izwi_worker_restarts_total counter\nizwi_worker_restarts_total {}\n\
-# TYPE izwi_worker_panics_total counter\nizwi_worker_panics_total {}\n\
-# TYPE izwi_latency_queue_wait_ms gauge\nizwi_latency_queue_wait_ms{{quantile=\"avg\"}} {:.6}\nizwi_latency_queue_wait_ms{{quantile=\"p50\"}} {:.6}\nizwi_latency_queue_wait_ms{{quantile=\"p95\"}} {:.6}\n\
-# TYPE izwi_latency_prefill_ms gauge\nizwi_latency_prefill_ms{{quantile=\"avg\"}} {:.6}\nizwi_latency_prefill_ms{{quantile=\"p50\"}} {:.6}\nizwi_latency_prefill_ms{{quantile=\"p95\"}} {:.6}\n\
-# TYPE izwi_latency_decode_ms gauge\nizwi_latency_decode_ms{{quantile=\"avg\"}} {:.6}\nizwi_latency_decode_ms{{quantile=\"p50\"}} {:.6}\nizwi_latency_decode_ms{{quantile=\"p95\"}} {:.6}\n\
-# TYPE izwi_latency_ttft_ms gauge\nizwi_latency_ttft_ms{{quantile=\"avg\"}} {:.6}\nizwi_latency_ttft_ms{{quantile=\"p50\"}} {:.6}\nizwi_latency_ttft_ms{{quantile=\"p95\"}} {:.6}\n\
-# TYPE izwi_latency_end_to_end_ms gauge\nizwi_latency_end_to_end_ms{{quantile=\"avg\"}} {:.6}\nizwi_latency_end_to_end_ms{{quantile=\"p50\"}} {:.6}\nizwi_latency_end_to_end_ms{{quantile=\"p95\"}} {:.6}\n",
+# TYPE izwi_worker_panics_total counter\nizwi_worker_panics_total {}\n",
             snapshot.requests_queued,
             snapshot.requests_completed,
             snapshot.requests_failed,
             snapshot.requests_active,
             snapshot.worker_restarts,
             snapshot.worker_panics,
+        );
+        push_latency_gauges(
+            &mut payload,
+            "izwi_latency_queue_wait_ms",
+            snapshot.latency_sample_counts.queue_wait,
             snapshot.queue_wait_ms_avg,
             snapshot.queue_wait_ms_p50,
             snapshot.queue_wait_ms_p95,
+        );
+        push_latency_gauges(
+            &mut payload,
+            "izwi_latency_prefill_ms",
+            snapshot.latency_sample_counts.prefill,
             snapshot.prefill_ms_avg,
             snapshot.prefill_ms_p50,
             snapshot.prefill_ms_p95,
+        );
+        push_latency_gauges(
+            &mut payload,
+            "izwi_latency_decode_ms",
+            snapshot.latency_sample_counts.decode,
             snapshot.decode_ms_avg,
             snapshot.decode_ms_p50,
             snapshot.decode_ms_p95,
+        );
+        push_latency_gauges(
+            &mut payload,
+            "izwi_latency_ttft_ms",
+            snapshot.latency_sample_counts.ttft,
             snapshot.ttft_ms_avg,
             snapshot.ttft_ms_p50,
             snapshot.ttft_ms_p95,
+        );
+        push_latency_gauges(
+            &mut payload,
+            "izwi_latency_end_to_end_ms",
+            snapshot.latency_sample_counts.end_to_end,
             snapshot.end_to_end_ms_avg,
             snapshot.end_to_end_ms_p50,
             snapshot.end_to_end_ms_p95,
@@ -710,14 +756,18 @@ impl RuntimeTelemetryCollector {
         ));
         payload.push_str(&format!(
             "# TYPE izwi_runtime_stage_observations_total counter\nizwi_runtime_stage_observations_total {}\n\
-# TYPE izwi_runtime_stage_failures_total counter\nizwi_runtime_stage_failures_total {}\n\
-# TYPE izwi_runtime_stage_duration_ms gauge\nizwi_runtime_stage_duration_ms{{quantile=\"avg\"}} {:.6}\nizwi_runtime_stage_duration_ms{{quantile=\"p50\"}} {:.6}\nizwi_runtime_stage_duration_ms{{quantile=\"p95\"}} {:.6}\n",
+# TYPE izwi_runtime_stage_failures_total counter\nizwi_runtime_stage_failures_total {}\n",
             snapshot.observability.stage_observations_total,
             snapshot.observability.stage_failures_total,
+        ));
+        push_latency_gauges(
+            &mut payload,
+            "izwi_runtime_stage_duration_ms",
+            snapshot.latency_sample_counts.stage_duration,
             snapshot.observability.stage_duration_ms_avg,
             snapshot.observability.stage_duration_ms_p50,
-            snapshot.observability.stage_duration_ms_p95
-        ));
+            snapshot.observability.stage_duration_ms_p95,
+        );
         push_workload_class_prometheus(&mut payload, &snapshot.observability.workload_classes);
         payload.push_str(&voice_metric_prometheus_contract());
         payload
@@ -757,6 +807,7 @@ struct WorkloadClassLatencyAccumulator {
     observations: u64,
     failures: u64,
     queue_wait_ms: Vec<f64>,
+    admission_ms: Vec<f64>,
     prefill_ms: Vec<f64>,
     decode_ms: Vec<f64>,
     ttft_ms: Vec<f64>,
@@ -770,6 +821,7 @@ impl WorkloadClassLatencyAccumulator {
             self.failures = self.failures.saturating_add(1);
         }
         push_optional_sample(&mut self.queue_wait_ms, observation.timing.queue_wait_ms);
+        push_optional_sample(&mut self.admission_ms, observation.timing.admission_ms);
         push_optional_sample(&mut self.prefill_ms, observation.timing.prefill_ms);
         push_optional_sample(&mut self.decode_ms, observation.timing.decode_ms);
         push_optional_sample(&mut self.ttft_ms, observation.timing.ttft_ms);
@@ -782,6 +834,7 @@ impl WorkloadClassLatencyAccumulator {
             observations: self.observations,
             failures: self.failures,
             queue_wait_ms: RuntimeLatencyStats::from_slice(&self.queue_wait_ms),
+            admission_ms: RuntimeLatencyStats::from_slice(&self.admission_ms),
             prefill_ms: RuntimeLatencyStats::from_slice(&self.prefill_ms),
             decode_ms: RuntimeLatencyStats::from_slice(&self.decode_ms),
             ttft_ms: RuntimeLatencyStats::from_slice(&self.ttft_ms),
@@ -853,6 +906,15 @@ fn push_workload_class_prometheus(
             &class.queue_wait_ms,
         );
     }
+    payload.push_str("# TYPE izwi_runtime_workload_admission_ms gauge\n");
+    for class in classes {
+        push_workload_class_stats(
+            payload,
+            "izwi_runtime_workload_admission_ms",
+            class,
+            &class.admission_ms,
+        );
+    }
     payload.push_str("# TYPE izwi_runtime_workload_prefill_ms gauge\n");
     for class in classes {
         push_workload_class_stats(
@@ -897,10 +959,32 @@ fn push_workload_class_stats(
     class: &RuntimeWorkloadClassTelemetrySnapshot,
     stats: &RuntimeLatencyStats,
 ) {
+    if stats.count == 0 {
+        return;
+    }
     let workload_class = prometheus_label_value(&class.workload_class);
     for (quantile, value) in [("avg", stats.avg), ("p50", stats.p50), ("p95", stats.p95)] {
         payload.push_str(&format!(
             "{metric_name}{{workload_class=\"{workload_class}\",quantile=\"{quantile}\"}} {value:.6}\n"
+        ));
+    }
+}
+
+fn push_latency_gauges(
+    payload: &mut String,
+    metric_name: &str,
+    count: usize,
+    avg: f64,
+    p50: f64,
+    p95: f64,
+) {
+    if count == 0 {
+        return;
+    }
+    payload.push_str(&format!("# TYPE {metric_name} gauge\n"));
+    for (quantile, value) in [("avg", avg), ("p50", p50), ("p95", p95)] {
+        payload.push_str(&format!(
+            "{metric_name}{{quantile=\"{quantile}\"}} {value:.6}\n"
         ));
     }
 }
@@ -915,6 +999,7 @@ fn push_voice_counter(payload: &mut String, name: &str, help: &str, value: u64) 
 pub(crate) fn push_engine_metric(payload: &mut String, name: &str, value: u64) {
     let prometheus_name = prometheus_engine_metric_name(name);
     let metric_type = prometheus_engine_metric_type(name);
+    push_engine_metric_help(payload, name, &prometheus_name);
     payload.push_str(&format!(
         "# TYPE {prometheus_name} {metric_type}\n{prometheus_name} {value}\n"
     ));
@@ -923,9 +1008,22 @@ pub(crate) fn push_engine_metric(payload: &mut String, name: &str, value: u64) {
 pub(crate) fn push_engine_metric_f64(payload: &mut String, name: &str, value: f64) {
     let prometheus_name = prometheus_engine_metric_name(name);
     let metric_type = prometheus_engine_metric_type(name);
+    push_engine_metric_help(payload, name, &prometheus_name);
     payload.push_str(&format!(
         "# TYPE {prometheus_name} {metric_type}\n{prometheus_name} {value:.6}\n"
     ));
+}
+
+fn push_engine_metric_help(payload: &mut String, name: &str, prometheus_name: &str) {
+    if let Some(descriptor) = engine_metric_catalog()
+        .iter()
+        .find(|descriptor| descriptor.name == name)
+    {
+        payload.push_str(&format!(
+            "# HELP {prometheus_name} {}\n",
+            descriptor.description
+        ));
+    }
 }
 
 fn mean(values: &VecDeque<f64>) -> f64 {
@@ -1073,6 +1171,7 @@ mod tests {
         let mut completed = RuntimeStageObservation::new(context, RuntimeStageOutcome::Completed)
             .with_total_ms(42.0);
         completed.timing.queue_wait_ms = Some(5.0);
+        completed.timing.admission_ms = Some(3.0);
         completed.timing.prefill_ms = Some(7.0);
         completed.timing.decode_ms = Some(11.0);
         completed.timing.ttft_ms = Some(13.0);
@@ -1105,6 +1204,7 @@ mod tests {
         assert_eq!(interactive.observations, 1);
         assert_eq!(interactive.failures, 0);
         assert_eq!(interactive.queue_wait_ms.avg, 5.0);
+        assert_eq!(interactive.admission_ms.avg, 3.0);
         assert_eq!(interactive.prefill_ms.avg, 7.0);
         assert_eq!(interactive.decode_ms.avg, 11.0);
         assert_eq!(interactive.ttft_ms.avg, 13.0);
@@ -1125,6 +1225,12 @@ mod tests {
         ));
         assert!(payload.contains(
             "izwi_runtime_workload_queue_wait_ms{workload_class=\"interactive\",quantile=\"avg\"} 5.000000"
+        ));
+        assert!(payload.contains(
+            "izwi_runtime_workload_admission_ms{workload_class=\"interactive\",quantile=\"avg\"} 3.000000"
+        ));
+        assert!(!payload.contains(
+            "izwi_runtime_workload_queue_wait_ms{workload_class=\"batch\""
         ));
         assert!(
             payload.contains("izwi_runtime_workload_stage_failures{workload_class=\"batch\"} 1")
@@ -1185,5 +1291,20 @@ mod tests {
         push_engine_metric(&mut payload, ENGINE_SCHEDULER_QUEUE_DEPTH, 7);
 
         assert!(payload.contains("izwi_engine_scheduler_queue_depth 7"));
+        assert!(payload.contains("# HELP izwi_engine_scheduler_queue_depth"));
+    }
+
+    #[tokio::test]
+    async fn prometheus_omits_latency_gauges_without_samples() {
+        let telemetry = RuntimeTelemetryCollector::new(64);
+
+        let payload = telemetry.prometheus().await;
+
+        assert!(!payload.contains("izwi_latency_queue_wait_ms"));
+        assert!(!payload.contains("izwi_latency_prefill_ms"));
+        assert!(!payload.contains("izwi_latency_decode_ms"));
+        assert!(!payload.contains("izwi_latency_ttft_ms"));
+        assert!(!payload.contains("izwi_latency_end_to_end_ms"));
+        assert!(!payload.contains("izwi_runtime_stage_duration_ms"));
     }
 }

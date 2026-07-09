@@ -66,7 +66,13 @@ struct LoadedModelTelemetrySnapshot {
     #[serde(default)]
     backend_kind: String,
     #[serde(default)]
+    actual_device_kind: Option<String>,
+    #[serde(default)]
+    actual_compute_dtype: Option<String>,
+    #[serde(default)]
     default_compute_dtype: String,
+    #[serde(default)]
+    default_dtype_reason: String,
     #[serde(default)]
     family_diagnostics: Option<serde_json::Value>,
 }
@@ -95,6 +101,10 @@ struct EngineRuntimeTelemetrySnapshot {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct EngineKvCacheRuntimeSnapshot {
+    #[serde(default)]
+    block_accounting: String,
+    #[serde(default)]
+    memory_accounting: String,
     #[serde(default)]
     total_blocks: u64,
     #[serde(default)]
@@ -128,6 +138,12 @@ struct EngineKvCacheRuntimeSnapshot {
     #[serde(default)]
     shared_prefix_hits: u64,
     #[serde(default)]
+    shared_prefix_misses: u64,
+    #[serde(default)]
+    shared_prefix_blocks_reused: u64,
+    #[serde(default)]
+    persistent_prefix_evictions: u64,
+    #[serde(default)]
     copy_on_write_splits: u64,
     #[serde(default)]
     last_churn_ratio: f64,
@@ -146,6 +162,8 @@ struct RuntimeWorkloadClassTelemetrySnapshot {
     failures: u64,
     #[serde(default)]
     queue_wait_ms: RuntimeLatencyStats,
+    #[serde(default)]
+    admission_ms: RuntimeLatencyStats,
     #[serde(default)]
     prefill_ms: RuntimeLatencyStats,
     #[serde(default)]
@@ -4770,7 +4788,7 @@ fn print_runtime_delta(
     if after.engine.kv_cache.total_blocks > 0 {
         let kv = &after.engine.kv_cache;
         println!(
-            "  KV cache blocks used/free/soft/total: {} / {} / {} / {} (util {:.1}%, churn {:.3})",
+            "  KV cache logical blocks used/free/soft/total: {} / {} / {} / {} (util {:.1}%, churn {:.3})",
             kv.allocated_blocks,
             kv.free_blocks,
             kv.soft_max_blocks,
@@ -4778,28 +4796,30 @@ fn print_runtime_delta(
             kv.utilization_ratio * 100.0,
             kv.last_churn_ratio
         );
+        println!(
+            "  KV cache estimated memory used/capacity: {} / {} bytes ({})",
+            kv.memory_used_bytes, kv.memory_capacity_bytes, kv.memory_accounting
+        );
     }
     if !after.models.is_empty() {
         println!("  Loaded models:");
         for model in &after.models {
-            let dtype =
-                loaded_model_runtime_dtype(model).unwrap_or(model.default_compute_dtype.as_str());
-            println!(
-                "    {:<28} {:<10} {} on {} (dtype {})",
-                model.variant_id, model.task, model.loaded_model_kind, model.backend_kind, dtype
-            );
+            println!("{}", loaded_model_runtime_summary(model));
         }
     }
     if !after.observability.workload_classes.is_empty() {
         println!("  Workload class rolling samples:");
         for class in &after.observability.workload_classes {
             println!(
-                "    {:<12} samples={}, failures={}, queue avg/p95={:.2}/{:.2} ms, ttft avg/p95={:.2}/{:.2} ms, total avg/p95={:.2}/{:.2} ms",
+                "    {:<12} samples={}, failures={}, queue avg/p95={:.2}/{:.2} ms, admission avg/p95={:.2}/{:.2} ms (n={}), ttft avg/p95={:.2}/{:.2} ms, total avg/p95={:.2}/{:.2} ms",
                 class.workload_class,
                 class.observations,
                 class.failures,
                 class.queue_wait_ms.avg,
                 class.queue_wait_ms.p95,
+                class.admission_ms.avg,
+                class.admission_ms.p95,
+                class.admission_ms.count,
                 class.ttft_ms.avg,
                 class.ttft_ms.p95,
                 class.stage_duration_ms.avg,
@@ -4967,11 +4987,31 @@ fn print_runtime_delta(
     }
 }
 
-fn loaded_model_runtime_dtype(model: &LoadedModelTelemetrySnapshot) -> Option<&str> {
-    let diagnostics = model.family_diagnostics.as_ref()?;
-    ["dtype", "talker_dtype", "default_compute_dtype"]
-        .into_iter()
-        .find_map(|key| diagnostics.get(key).and_then(|value| value.as_str()))
+fn loaded_model_runtime_summary(model: &LoadedModelTelemetrySnapshot) -> String {
+    let actual_device = model.actual_device_kind.as_deref().unwrap_or("unknown");
+    let actual_dtype = model.actual_compute_dtype.as_deref().unwrap_or("unknown");
+    let policy_dtype = if model.default_compute_dtype.trim().is_empty() {
+        "unknown"
+    } else {
+        model.default_compute_dtype.as_str()
+    };
+    let policy_reason = if model.default_dtype_reason.trim().is_empty() {
+        "reason unavailable"
+    } else {
+        model.default_dtype_reason.as_str()
+    };
+
+    format!(
+        "    {:<28} {:<10} {} actual_device={}, actual_dtype={}; policy_backend={}, policy_default_dtype={} ({})",
+        model.variant_id,
+        model.task,
+        model.loaded_model_kind,
+        actual_device,
+        actual_dtype,
+        model.backend_kind,
+        policy_dtype,
+        policy_reason
+    )
 }
 
 #[cfg(test)]
@@ -5662,6 +5702,12 @@ mod tests {
                             "p50": 3.0,
                             "p95": 6.0
                         },
+                        "admission_ms": {
+                            "count": 2,
+                            "avg": 1.5,
+                            "p50": 1.0,
+                            "p95": 2.0
+                        },
                         "ttft_ms": {
                             "count": 2,
                             "avg": 18.0,
@@ -5686,6 +5732,7 @@ mod tests {
             .expect("interactive workload class");
         assert_eq!(interactive.observations, 2);
         assert_eq!(interactive.queue_wait_ms.avg, 4.5);
+        assert_eq!(interactive.admission_ms.p95, 2.0);
         assert_eq!(interactive.ttft_ms.p95, 24.0);
         assert_eq!(interactive.prefill_ms.count, 0);
     }
@@ -5697,6 +5744,8 @@ mod tests {
             "scheduler_running_requests": 2,
             "kv_cache_hits_total": 3,
             "kv_cache": {
+                "block_accounting": "logical",
+                "memory_accounting": "estimated_from_config",
                 "total_blocks": 128,
                 "soft_max_blocks": 96,
                 "allocated_blocks": 48,
@@ -5706,6 +5755,9 @@ mod tests {
                 "block_memory_bytes": 786432,
                 "utilization_ratio": 0.375,
                 "shared_prefixes": 4,
+                "shared_prefix_hits": 3,
+                "shared_prefix_misses": 2,
+                "shared_prefix_blocks_reused": 7,
                 "copy_on_write_splits": 5,
                 "last_churn_ratio": 1.25
             }
@@ -5714,6 +5766,13 @@ mod tests {
 
         assert_eq!(engine.scheduler_queue_depth, 1);
         assert_eq!(engine.kv_cache.total_blocks, 128);
+        assert_eq!(engine.kv_cache.block_accounting, "logical");
+        assert_eq!(
+            engine.kv_cache.memory_accounting,
+            "estimated_from_config"
+        );
+        assert_eq!(engine.kv_cache.shared_prefix_misses, 2);
+        assert_eq!(engine.kv_cache.shared_prefix_blocks_reused, 7);
         assert_eq!(engine.kv_cache.soft_max_blocks, 96);
         assert_eq!(engine.kv_cache.copy_on_write_splits, 5);
         assert_eq!(engine.kv_cache.last_churn_ratio, 1.25);
@@ -5729,7 +5788,10 @@ mod tests {
                     "task": "tts",
                     "loaded_model_kind": "qwen3_tts",
                     "backend_kind": "cuda",
+                    "actual_device_kind": "cuda",
+                    "actual_compute_dtype": "f16",
                     "default_compute_dtype": "bf16",
+                    "default_dtype_reason": "CUDA policy prefers BF16",
                     "family_diagnostics": {
                         "talker_dtype": "BF16",
                         "kv_page_size": 64,
@@ -5742,10 +5804,24 @@ mod tests {
 
         assert_eq!(telemetry.models.len(), 1);
         assert_eq!(telemetry.models[0].family, "qwen3_tts");
-        assert_eq!(
-            loaded_model_runtime_dtype(&telemetry.models[0]),
-            Some("BF16")
-        );
+        let summary = loaded_model_runtime_summary(&telemetry.models[0]);
+        assert!(summary.contains("actual_device=cuda, actual_dtype=f16"));
+        assert!(summary.contains("policy_default_dtype=bf16"));
+        assert!(!summary.contains("actual_dtype=BF16"));
+    }
+
+    #[test]
+    fn loaded_model_summary_reports_unknown_actual_values_without_using_policy() {
+        let model = LoadedModelTelemetrySnapshot {
+            variant_id: "unknown-runtime".to_string(),
+            default_compute_dtype: "bf16".to_string(),
+            default_dtype_reason: "policy".to_string(),
+            ..LoadedModelTelemetrySnapshot::default()
+        };
+
+        let summary = loaded_model_runtime_summary(&model);
+        assert!(summary.contains("actual_device=unknown, actual_dtype=unknown"));
+        assert!(summary.contains("policy_default_dtype=bf16"));
     }
 
     #[tokio::test]

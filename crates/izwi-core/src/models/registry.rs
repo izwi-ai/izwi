@@ -1713,6 +1713,8 @@ pub struct LoadedModelDiagnostics {
     pub loaded_model_kind: &'static str,
     pub backend_kind: String,
     pub device_kind: String,
+    pub actual_device_kind: Option<String>,
+    pub actual_compute_dtype: Option<String>,
     pub default_compute_dtype: String,
     pub default_dtype_reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1723,11 +1725,43 @@ pub struct LoadedModelDiagnostics {
     pub family_diagnostics: Option<Value>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LoadedModelActualRuntime {
+    device_kind: Option<String>,
+    compute_dtype: Option<String>,
+}
+
+impl LoadedModelActualRuntime {
+    fn from_values(device_kind: Option<&str>, compute_dtype: Option<&str>) -> Self {
+        Self {
+            device_kind: device_kind.and_then(normalize_observed_runtime_value),
+            compute_dtype: compute_dtype.and_then(normalize_observed_runtime_value),
+        }
+    }
+
+    fn from_diagnostics(
+        diagnostics: &Value,
+        device_pointer: &str,
+        dtype_pointer: &str,
+    ) -> Self {
+        Self::from_values(
+            diagnostics.pointer(device_pointer).and_then(Value::as_str),
+            diagnostics.pointer(dtype_pointer).and_then(Value::as_str),
+        )
+    }
+}
+
+fn normalize_observed_runtime_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_ascii_lowercase())
+}
+
 fn loaded_model_diagnostics_entry(
     device: &DeviceProfile,
     variant: ModelVariant,
     handle_kind: &'static str,
     loaded_model_kind: &'static str,
+    actual_runtime: LoadedModelActualRuntime,
     supports_incremental_decode: Option<bool>,
     supports_realtime_stream_decode: Option<bool>,
     family_diagnostics: Option<Value>,
@@ -1745,6 +1779,8 @@ fn loaded_model_diagnostics_entry(
         loaded_model_kind,
         backend_kind: format!("{:?}", device.kind).to_ascii_lowercase(),
         device_kind: format!("{:?}", device.kind),
+        actual_device_kind: actual_runtime.device_kind,
+        actual_compute_dtype: actual_runtime.compute_dtype,
         default_compute_dtype: format!("{:?}", dtype_selection.dtype).to_ascii_lowercase(),
         default_dtype_reason: dtype_selection.reason.into_owned(),
         supports_incremental_decode,
@@ -1801,11 +1837,29 @@ fn native_asr_model_kind(model: &NativeAsrModel) -> &'static str {
     }
 }
 
-fn native_asr_family_diagnostics(model: &NativeAsrModel) -> Option<Value> {
+fn native_asr_runtime_diagnostics(
+    model: &NativeAsrModel,
+) -> (LoadedModelActualRuntime, Option<Value>) {
     match model {
-        NativeAsrModel::Nemotron(model) => Some(model.diagnostics()),
-        NativeAsrModel::GraniteSpeech(model) => Some(model.diagnostics_summary()),
-        _ => None,
+        NativeAsrModel::Nemotron(model) => {
+            let diagnostics = model.diagnostics();
+            let actual_runtime = LoadedModelActualRuntime::from_diagnostics(
+                &diagnostics,
+                "/device",
+                "/dtype_plan/activations",
+            );
+            (actual_runtime, Some(diagnostics))
+        }
+        NativeAsrModel::GraniteSpeech(model) => {
+            let diagnostics = model.diagnostics_summary();
+            let actual_runtime = LoadedModelActualRuntime::from_diagnostics(
+                &diagnostics,
+                "/device_kind",
+                "/dtype",
+            );
+            (actual_runtime, Some(diagnostics))
+        }
+        _ => (LoadedModelActualRuntime::default(), None),
     }
 }
 
@@ -1865,14 +1919,17 @@ impl ModelRegistry {
                 let Some(model) = cell.get() else {
                     continue;
                 };
+                let (actual_runtime, family_diagnostics) =
+                    native_asr_runtime_diagnostics(model);
                 diagnostics.push(loaded_model_diagnostics_entry(
                     &self.device,
                     *variant,
                     "native_asr",
                     native_asr_model_kind(model),
+                    actual_runtime,
                     Some(model.supports_incremental_decode()),
                     Some(model.supports_realtime_stream_decode()),
-                    native_asr_family_diagnostics(model),
+                    family_diagnostics,
                 ));
             }
         }
@@ -1888,6 +1945,14 @@ impl ModelRegistry {
                     *variant,
                     "native_audio_chat",
                     native_audio_chat_model_kind(model),
+                    match model.as_ref() {
+                        NativeAudioChatModel::Lfm25Audio(model) => {
+                            LoadedModelActualRuntime::from_values(
+                                Some(&format!("{:?}", model.device().kind)),
+                                None,
+                            )
+                        }
+                    },
                     None,
                     None,
                     None,
@@ -1906,6 +1971,7 @@ impl ModelRegistry {
                     *variant,
                     "native_diarization",
                     native_diarization_model_kind(model),
+                    LoadedModelActualRuntime::default(),
                     None,
                     None,
                     None,
@@ -1924,6 +1990,17 @@ impl ModelRegistry {
                     *variant,
                     "native_chat",
                     native_chat_model_kind(model),
+                    match model.as_ref() {
+                        NativeChatModel::Qwen3(model) => LoadedModelActualRuntime::from_values(
+                            Some(model.runtime_device_kind().as_str()),
+                            model.runtime_compute_dtype().as_deref(),
+                        ),
+                        NativeChatModel::Qwen35(model) => LoadedModelActualRuntime::from_values(
+                            Some(model.device_kind().as_str()),
+                            None,
+                        ),
+                        _ => LoadedModelActualRuntime::default(),
+                    },
                     Some(model.supports_incremental_decode()),
                     None,
                     None,
@@ -1940,6 +2017,7 @@ impl ModelRegistry {
                         *variant,
                         "voxtral_realtime",
                         "voxtral_realtime",
+                        LoadedModelActualRuntime::default(),
                         None,
                         Some(true),
                         None,
@@ -1957,6 +2035,7 @@ impl ModelRegistry {
                         *variant,
                         "voxtral_tts",
                         "voxtral_tts",
+                        LoadedModelActualRuntime::default(),
                         None,
                         None,
                         None,
@@ -1971,14 +2050,20 @@ impl ModelRegistry {
                 let Some(model) = cell.get() else {
                     continue;
                 };
+                let model_diagnostics = model.diagnostics();
+                let actual_runtime = LoadedModelActualRuntime::from_values(
+                    Some(&model_diagnostics.device_kind),
+                    Some(&model_diagnostics.dtype),
+                );
                 diagnostics.push(loaded_model_diagnostics_entry(
                     &self.device,
                     *variant,
                     "vibevoice_tts",
                     "vibevoice_tts",
+                    actual_runtime,
                     None,
                     None,
-                    serde_json::to_value(model.diagnostics()).ok(),
+                    serde_json::to_value(model_diagnostics).ok(),
                 ));
             }
         }
@@ -1994,6 +2079,7 @@ impl ModelRegistry {
                     *variant,
                     "fish_s2_tts",
                     "fish_s2_tts",
+                    LoadedModelActualRuntime::default(),
                     None,
                     None,
                     serde_json::to_value(model.diagnostics()).ok(),
@@ -2007,14 +2093,20 @@ impl ModelRegistry {
                 let Some(model) = cell.get() else {
                     continue;
                 };
+                let model_diagnostics = model.diagnostics();
+                let actual_runtime = LoadedModelActualRuntime::from_values(
+                    Some(&model_diagnostics.device_kind),
+                    Some(&model_diagnostics.talker_dtype),
+                );
                 diagnostics.push(loaded_model_diagnostics_entry(
                     &self.device,
                     *variant,
                     "qwen3_tts",
                     "qwen3_tts",
+                    actual_runtime,
                     None,
                     None,
-                    serde_json::to_value(model.diagnostics()).ok(),
+                    serde_json::to_value(model_diagnostics).ok(),
                 ));
             }
         }
@@ -2028,6 +2120,7 @@ impl ModelRegistry {
                         *variant,
                         "kokoro_tts",
                         "kokoro_tts",
+                        LoadedModelActualRuntime::default(),
                         None,
                         None,
                         None,
@@ -2635,6 +2728,7 @@ mod tests {
             ModelVariant::Qwen306BGguf,
             "native_chat",
             "qwen3_chat",
+            LoadedModelActualRuntime::default(),
             Some(true),
             None,
             None,
@@ -2647,9 +2741,29 @@ mod tests {
         assert_eq!(diagnostics.loaded_model_kind, "qwen3_chat");
         assert_eq!(diagnostics.backend_kind, "cpu");
         assert_eq!(diagnostics.device_kind, "Cpu");
+        assert_eq!(diagnostics.actual_device_kind, None);
+        assert_eq!(diagnostics.actual_compute_dtype, None);
         assert_eq!(diagnostics.default_compute_dtype, "f32");
         assert_eq!(diagnostics.supports_incremental_decode, Some(true));
         assert!(diagnostics.default_dtype_reason.contains("CPU"));
+    }
+
+    #[test]
+    fn loaded_model_diagnostics_keeps_observed_runtime_separate_from_policy() {
+        let diagnostics = loaded_model_diagnostics_entry(
+            &DeviceProfile::cpu(),
+            ModelVariant::Qwen306BGguf,
+            "native_chat",
+            "qwen3_chat",
+            LoadedModelActualRuntime::from_values(Some("CUDA"), Some("BF16")),
+            Some(true),
+            None,
+            None,
+        );
+
+        assert_eq!(diagnostics.actual_device_kind.as_deref(), Some("cuda"));
+        assert_eq!(diagnostics.actual_compute_dtype.as_deref(), Some("bf16"));
+        assert_eq!(diagnostics.default_compute_dtype, "f32");
     }
 
     #[tokio::test]

@@ -142,6 +142,7 @@ enum Qwen3ChatBackend {
 
 pub struct Qwen3ChatModel {
     device: DeviceProfile,
+    compute_dtype: Option<DType>,
     tokenizer: ChatTokenizer,
     backend: Qwen3ChatBackend,
 }
@@ -201,6 +202,7 @@ impl Qwen3ChatModel {
 
         Ok(Self {
             device,
+            compute_dtype: Some(dtype),
             tokenizer,
             backend: Qwen3ChatBackend::Native { text_model },
         })
@@ -244,12 +246,22 @@ impl Qwen3ChatModel {
 
         Ok(Self {
             device,
+            compute_dtype: None,
             tokenizer,
             backend: Qwen3ChatBackend::Gguf {
                 text_model: Mutex::new(text_model),
                 gguf_file: gguf_name.to_string(),
             },
         })
+    }
+
+    pub fn runtime_device_kind(&self) -> String {
+        format!("{:?}", self.device.kind).to_ascii_lowercase()
+    }
+
+    pub fn runtime_compute_dtype(&self) -> Option<String> {
+        self.compute_dtype
+            .map(|dtype| format!("{dtype:?}").to_ascii_lowercase())
     }
 
     pub fn generate(

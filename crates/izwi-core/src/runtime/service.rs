@@ -12,7 +12,9 @@ use tracing::{debug, error, info_span};
 
 use crate::artifacts::{DownloadProgress, ModelLifecycleSnapshot, ModelManager};
 use crate::audio::{AudioCodec, AudioEncoder, StreamingConfig};
-use crate::backends::{BackendPreference, BackendRouter, BackendSelectionSource, DeviceProfile};
+use crate::backends::{
+    BackendKind, BackendPreference, BackendRouter, BackendSelectionSource, DeviceProfile,
+};
 use crate::catalog::{ModelInfo, ModelVariant};
 use crate::config::EngineConfig;
 use crate::engine::{
@@ -54,6 +56,14 @@ fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
         return msg.clone();
     }
     "unknown panic payload".to_string()
+}
+
+fn reported_gpu_resident_blocks(backend_kind: BackendKind, logical_blocks: u64) -> u64 {
+    if backend_kind == BackendKind::Cpu {
+        0
+    } else {
+        logical_blocks
+    }
 }
 
 /// Main inference engine runtime.
@@ -647,6 +657,7 @@ impl RuntimeService {
         streaming: bool,
     ) {
         let mut timing = RuntimeStageTiming {
+            admission_ms: request.admission_ms,
             total_ms: Some(output.generation_time.as_secs_f64() * 1000.0),
             ..RuntimeStageTiming::default()
         };
@@ -693,13 +704,13 @@ impl RuntimeService {
         streaming: bool,
         error_kind: impl Into<String>,
     ) {
-        self.telemetry.record_stage_observation(
-            RuntimeStageObservation::new(
+        let mut observation = RuntimeStageObservation::new(
                 self.engine_observation_context(request, streaming),
                 RuntimeStageOutcome::Failed,
             )
-            .with_error_kind(error_kind),
-        );
+            .with_error_kind(error_kind);
+        observation.timing.admission_ms = request.admission_ms;
+        self.telemetry.record_stage_observation(observation);
     }
 
     pub(crate) async fn run_request(&self, request: EngineCoreRequest) -> Result<EngineOutput> {
@@ -931,11 +942,11 @@ impl RuntimeService {
         let kv_cache = self.core_engine.kv_cache_stats().await;
         let stream_backpressure_total = engine_stream_backpressure_total();
         let kv_cache_hits_total = kv_cache.telemetry.shared_prefix_hits;
-        let kv_cache_misses_total = kv_cache
-            .telemetry
-            .total_allocations
-            .saturating_sub(kv_cache_hits_total);
+        let kv_cache_misses_total = kv_cache.telemetry.shared_prefix_misses;
+        let backend_kind = self.backend_context().backend_kind;
         let kv_cache_snapshot = EngineKvCacheRuntimeSnapshot {
+            block_accounting: "logical",
+            memory_accounting: "estimated_from_config",
             total_blocks: kv_cache.total_blocks as u64,
             soft_max_blocks: kv_cache.soft_max_blocks as u64,
             allocated_blocks: kv_cache.allocated_blocks as u64,
@@ -946,12 +957,18 @@ impl RuntimeService {
             memory_used_bytes: kv_cache.memory_used_bytes as u64,
             memory_capacity_bytes: kv_cache.memory_capacity_bytes as u64,
             utilization_ratio: kv_cache.utilization(),
-            gpu_resident_blocks: kv_cache.gpu_resident_blocks as u64,
+            gpu_resident_blocks: reported_gpu_resident_blocks(
+                backend_kind,
+                kv_cache.gpu_resident_blocks as u64,
+            ),
             pinned_blocks: kv_cache.pinned_blocks as u64,
             shared_prefixes: kv_cache.shared_prefixes as u64,
             total_allocations: kv_cache.telemetry.total_allocations,
             total_frees: kv_cache.telemetry.total_frees,
             shared_prefix_hits: kv_cache.telemetry.shared_prefix_hits,
+            shared_prefix_misses: kv_cache.telemetry.shared_prefix_misses,
+            shared_prefix_blocks_reused: kv_cache.telemetry.shared_prefix_blocks_reused,
+            persistent_prefix_evictions: kv_cache.telemetry.persistent_prefix_evictions,
             copy_on_write_splits: kv_cache.telemetry.copy_on_write_splits,
             last_churn_ratio: kv_cache.telemetry.last_churn_ratio,
         };
@@ -961,9 +978,9 @@ impl RuntimeService {
             scheduler_running_requests: running_requests,
             kv_cache_hits_total,
             kv_cache_misses_total,
-            kv_cache_evictions_total: kv_cache.telemetry.total_frees,
+            kv_cache_evictions_total: kv_cache.telemetry.persistent_prefix_evictions,
             kv_cache_allocated_blocks: kv_cache.allocated_blocks as u64,
-            kv_cache_prefix_reuse_blocks_total: kv_cache_hits_total,
+            kv_cache_prefix_reuse_blocks_total: kv_cache.telemetry.shared_prefix_blocks_reused,
             stream_backpressure_total,
             kv_cache: kv_cache_snapshot,
         }
@@ -1228,11 +1245,24 @@ mod tests {
         assert!(payload.contains("izwi_engine_kv_cache_soft_max_blocks"));
         assert!(payload.contains("izwi_engine_kv_cache_utilization_ratio"));
         assert!(payload.contains("izwi_engine_kv_cache_copy_on_write_splits_total"));
+        assert!(payload.contains("allocated logical KV-cache blocks"));
+        assert!(payload.contains("Estimated KV-cache bytes"));
         assert!(payload.contains("izwi_engine_stream_backpressure_total"));
 
         let snapshot = runtime.telemetry_snapshot().await;
         assert!(snapshot.engine.kv_cache.total_blocks > 0);
         assert!(snapshot.engine.kv_cache.block_size > 0);
+        assert_eq!(snapshot.engine.kv_cache.block_accounting, "logical");
+        assert_eq!(
+            snapshot.engine.kv_cache.memory_accounting,
+            "estimated_from_config"
+        );
+    }
+
+    #[test]
+    fn cpu_backend_never_reports_logical_blocks_as_gpu_resident() {
+        assert_eq!(reported_gpu_resident_blocks(BackendKind::Cpu, 17), 0);
+        assert_eq!(reported_gpu_resident_blocks(BackendKind::Cuda, 17), 17);
     }
 
     #[tokio::test]

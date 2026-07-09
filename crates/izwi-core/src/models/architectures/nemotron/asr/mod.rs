@@ -682,9 +682,9 @@ impl NemotronAsrModel {
             "variant": self.variant.dir_name(),
             "repo_id": self.variant.repo_id(),
             "device": format!("{:?}", self.device_profile.kind),
-            "nemo_path": self.artifacts.nemo_path.display().to_string(),
-            "checkpoint_path": self.artifacts.checkpoint_path.display().to_string(),
-            "model_config_path": self.artifacts.model_config_path.display().to_string(),
+            "nemo_file": public_artifact_filename(&self.artifacts.nemo_path),
+            "checkpoint_file": public_artifact_filename(&self.artifacts.checkpoint_path),
+            "model_config_file": public_artifact_filename(&self.artifacts.model_config_path),
             "tokenizer_vocab_size": self.decoder.vocab_size(),
             "decoder_vocabulary_size": self.decoder.vocab_size(),
             "decoder_source": self.decoder.source(),
@@ -1046,9 +1046,9 @@ impl NemotronAsrModel {
             "variant": self.variant.dir_name(),
             "repo_id": self.variant.repo_id(),
             "device": format!("{:?}", self.device_profile.kind),
-            "nemo_path": self.artifacts.nemo_path.display().to_string(),
-            "checkpoint_path": self.artifacts.checkpoint_path.display().to_string(),
-            "model_config_path": self.artifacts.model_config_path.display().to_string(),
+            "nemo_file": public_artifact_filename(&self.artifacts.nemo_path),
+            "checkpoint_file": public_artifact_filename(&self.artifacts.checkpoint_path),
+            "model_config_file": public_artifact_filename(&self.artifacts.model_config_path),
             "tokenizer_vocab_size": self.decoder.vocab_size(),
             "decoder_vocabulary_size": self.decoder.vocab_size(),
             "decoder_source": self.decoder.source(),
@@ -1232,6 +1232,11 @@ impl NemotronAsrModel {
             })),
         }
     }
+}
+
+fn public_artifact_filename(path: &Path) -> Option<String> {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
 }
 
 fn select_device_for_nemotron(device_profile: &DeviceProfile) -> Device {
@@ -1660,6 +1665,19 @@ mod tests {
         assert_eq!(diagnostics["encode_ms"], 2.0);
         assert_eq!(diagnostics["rnnt_decode_ms"], 3.25);
         assert_eq!(diagnostics["text_assembly_ms"], 4.0);
+    }
+
+    #[test]
+    fn public_artifact_diagnostics_only_expose_filenames() {
+        let path = Path::new("/private/models/Nemotron/native/model_weights.ckpt");
+
+        assert_eq!(
+            public_artifact_filename(path).as_deref(),
+            Some("model_weights.ckpt")
+        );
+        assert!(!public_artifact_filename(path)
+            .expect("artifact filename")
+            .contains("/private/models"));
     }
 
     #[test]
