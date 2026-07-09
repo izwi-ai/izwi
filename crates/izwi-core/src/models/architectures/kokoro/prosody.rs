@@ -18,6 +18,8 @@ use candle_nn::{LSTMConfig, RNN};
 use rayon::prelude::*;
 
 use crate::error::{Error, Result};
+#[cfg(feature = "metal")]
+use crate::kernels::metal_encoder::IzwiMetalCommandEncoderExt;
 
 use super::config::KokoroConfig;
 
@@ -717,22 +719,22 @@ impl CustomOp3 for AdaIN1dSnakeMetalOp {
         let pipeline = adain1d_snake_pipeline(device.metal_device())?;
         encoder.set_compute_pipeline_state(&pipeline);
 
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             0,
             Some(x_storage.buffer()),
             x_layout.start_offset() * DType::F32.size_in_bytes(),
         );
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             1,
             Some(h_storage.buffer()),
             h_layout.start_offset() * DType::F32.size_in_bytes(),
         );
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             2,
             Some(alpha_storage.buffer()),
             alpha_layout.start_offset() * DType::F32.size_in_bytes(),
         );
-        encoder.set_buffer(3, Some(&output), 0);
+        encoder.set_output_buffer(3, Some(&output), 0);
         encoder.set_bytes(4, &(rows as u32));
         encoder.set_bytes(5, &(channels as u32));
         encoder.set_bytes(6, &(time as u32));
@@ -751,6 +753,8 @@ impl CustomOp3 for AdaIN1dSnakeMetalOp {
                 depth: 1,
             },
         );
+
+        drop(encoder);
 
         Ok((
             MetalStorage::new(output, device, elem_count, DType::F32),

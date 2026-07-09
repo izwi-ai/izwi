@@ -11,6 +11,8 @@
 pub mod buffer_pool;
 pub mod cuda;
 pub mod metal;
+#[cfg(feature = "metal")]
+pub(crate) mod metal_encoder;
 
 use crate::error::Error;
 use candle_core::{Device, Tensor};

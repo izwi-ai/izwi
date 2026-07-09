@@ -18,6 +18,8 @@ use candle_core::{DType, Tensor};
 #[cfg(feature = "metal")]
 use candle_metal_kernels::metal::{ComputePipeline, Device as MetalDevice};
 
+#[cfg(feature = "metal")]
+use super::metal_encoder::IzwiMetalCommandEncoderExt;
 use super::{FusedKernelError, FusedResult, FusedSiluMulResult};
 
 #[cfg(feature = "metal")]
@@ -581,17 +583,17 @@ impl CustomOp2 for SiluMulOp {
         let pipeline = silu_mul_pipeline(device.metal_device(), dtype)?;
         encoder.set_compute_pipeline_state(&pipeline);
 
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             0,
             Some(gate_storage.buffer()),
             gate_layout.start_offset() * dtype.size_in_bytes(),
         );
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             1,
             Some(up_storage.buffer()),
             up_layout.start_offset() * dtype.size_in_bytes(),
         );
-        encoder.set_buffer(2, Some(&output), 0);
+        encoder.set_output_buffer(2, Some(&output), 0);
         encoder.set_bytes(3, &(elem_count as u32));
 
         let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
@@ -607,6 +609,8 @@ impl CustomOp2 for SiluMulOp {
                 depth: 1,
             },
         );
+
+        drop(encoder);
 
         Ok((
             MetalStorage::new(output, device, elem_count, dtype),
@@ -731,22 +735,22 @@ impl CustomOp3 for QkRmsNormOp {
         let pipeline = qk_rms_norm_pipeline(device.metal_device(), dtype)?;
         encoder.set_compute_pipeline_state(&pipeline);
 
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             0,
             Some(q_storage.buffer()),
             q_layout.start_offset() * dtype.size_in_bytes(),
         );
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             1,
             Some(k_storage.buffer()),
             k_layout.start_offset() * dtype.size_in_bytes(),
         );
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             2,
             Some(weight_storage.buffer()),
             weight_layout.start_offset() * dtype.size_in_bytes(),
         );
-        encoder.set_buffer(3, Some(&output), 0);
+        encoder.set_output_buffer(3, Some(&output), 0);
         encoder.set_bytes(4, &(self.q_rows as u32));
         encoder.set_bytes(5, &(self.k_rows as u32));
         encoder.set_bytes(6, &(self.head_dim as u32));
@@ -770,6 +774,8 @@ impl CustomOp3 for QkRmsNormOp {
                 depth: 1,
             },
         );
+
+        drop(encoder);
 
         Ok((
             MetalStorage::new(output, device, elem_count, dtype),
@@ -882,17 +888,17 @@ impl CustomOp2 for RmsNormOp {
         let pipeline = rms_norm_pipeline(device.metal_device(), dtype)?;
         encoder.set_compute_pipeline_state(&pipeline);
 
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             0,
             Some(input_storage.buffer()),
             input_layout.start_offset() * dtype.size_in_bytes(),
         );
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             1,
             Some(weight_storage.buffer()),
             weight_layout.start_offset() * dtype.size_in_bytes(),
         );
-        encoder.set_buffer(2, Some(&output), 0);
+        encoder.set_output_buffer(2, Some(&output), 0);
         encoder.set_bytes(3, &(self.rows as u32));
         encoder.set_bytes(4, &(self.hidden_dim as u32));
         encoder.set_bytes(5, &self.eps);
@@ -915,6 +921,8 @@ impl CustomOp2 for RmsNormOp {
                 depth: 1,
             },
         );
+
+        drop(encoder);
 
         Ok((
             MetalStorage::new(output, device, elem_count, dtype),
@@ -1056,22 +1064,22 @@ impl CustomOp3 for RopePairBshdOp {
         let pipeline = rope_pair_bshd_pipeline(device.metal_device(), dtype)?;
         encoder.set_compute_pipeline_state(&pipeline);
 
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             0,
             Some(q_storage.buffer()),
             q_layout.start_offset() * dtype.size_in_bytes(),
         );
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             1,
             Some(k_storage.buffer()),
             k_layout.start_offset() * dtype.size_in_bytes(),
         );
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             2,
             Some(cos_sin_storage.buffer()),
             cos_sin_layout.start_offset() * dtype.size_in_bytes(),
         );
-        encoder.set_buffer(3, Some(&output), 0);
+        encoder.set_output_buffer(3, Some(&output), 0);
         encoder.set_bytes(4, &(self.q_rows as u32));
         encoder.set_bytes(5, &(self.k_rows as u32));
         encoder.set_bytes(6, &(self.seq_len as u32));
@@ -1092,6 +1100,8 @@ impl CustomOp3 for RopePairBshdOp {
                 depth: 1,
             },
         );
+
+        drop(encoder);
 
         Ok((
             MetalStorage::new(output, device, elem_count, dtype),
@@ -1247,22 +1257,22 @@ impl CustomOp3 for DecodeGqaAttentionOp {
         let pipeline = decode_gqa_attention_pipeline(device.metal_device(), dtype)?;
         encoder.set_compute_pipeline_state(&pipeline);
 
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             0,
             Some(q_storage.buffer()),
             q_layout.start_offset() * dtype.size_in_bytes(),
         );
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             1,
             Some(k_storage.buffer()),
             k_layout.start_offset() * dtype.size_in_bytes(),
         );
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             2,
             Some(v_storage.buffer()),
             v_layout.start_offset() * dtype.size_in_bytes(),
         );
-        encoder.set_buffer(3, Some(&output), 0);
+        encoder.set_output_buffer(3, Some(&output), 0);
         encoder.set_bytes(4, &(self.num_heads as u32));
         encoder.set_bytes(5, &(self.num_kv_heads as u32));
         encoder.set_bytes(6, &(self.kv_len as u32));
@@ -1288,6 +1298,8 @@ impl CustomOp3 for DecodeGqaAttentionOp {
                 depth: 1,
             },
         );
+
+        drop(encoder);
 
         Ok((
             MetalStorage::new(output, device, elem_count, dtype),
@@ -1398,22 +1410,22 @@ impl CustomOp3 for LfmShortConvDecode3Op {
         let pipeline = lfm_shortconv_decode3_pipeline(device.metal_device())?;
         encoder.set_compute_pipeline_state(&pipeline);
 
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             0,
             Some(cache_storage.buffer()),
             cache_layout.start_offset() * DType::F32.size_in_bytes(),
         );
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             1,
             Some(bx_storage.buffer()),
             bx_layout.start_offset() * DType::F32.size_in_bytes(),
         );
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             2,
             Some(conv_storage.buffer()),
             conv_layout.start_offset() * DType::F32.size_in_bytes(),
         );
-        encoder.set_buffer(3, Some(&output), 0);
+        encoder.set_output_buffer(3, Some(&output), 0);
         encoder.set_bytes(4, &(self.hidden_size as u32));
         encoder.set_bytes(5, &(elem_count as u32));
 
@@ -1430,6 +1442,8 @@ impl CustomOp3 for LfmShortConvDecode3Op {
                 depth: 1,
             },
         );
+
+        drop(encoder);
 
         Ok((
             MetalStorage::new(output, device, elem_count, DType::F32),
@@ -1524,17 +1538,17 @@ impl CustomOp2 for LfmShortConvUpdate3Op {
         let pipeline = lfm_shortconv_update3_pipeline(device.metal_device())?;
         encoder.set_compute_pipeline_state(&pipeline);
 
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             0,
             Some(cache_storage.buffer()),
             cache_layout.start_offset() * DType::F32.size_in_bytes(),
         );
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             1,
             Some(bx_storage.buffer()),
             bx_layout.start_offset() * DType::F32.size_in_bytes(),
         );
-        encoder.set_buffer(2, Some(&output), 0);
+        encoder.set_output_buffer(2, Some(&output), 0);
         encoder.set_bytes(3, &(self.hidden_size as u32));
         encoder.set_bytes(4, &(elem_count as u32));
 
@@ -1551,6 +1565,8 @@ impl CustomOp2 for LfmShortConvUpdate3Op {
                 depth: 1,
             },
         );
+
+        drop(encoder);
 
         Ok((
             MetalStorage::new(output, device, elem_count.saturating_mul(3), DType::F32),
@@ -1647,17 +1663,17 @@ impl CustomOp2 for LfmShortConvSequence3Op {
         let pipeline = lfm_shortconv_sequence3_pipeline(device.metal_device())?;
         encoder.set_compute_pipeline_state(&pipeline);
 
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             0,
             Some(bx_storage.buffer()),
             bx_layout.start_offset() * DType::F32.size_in_bytes(),
         );
-        encoder.set_buffer(
+        encoder.set_input_buffer(
             1,
             Some(conv_storage.buffer()),
             conv_layout.start_offset() * DType::F32.size_in_bytes(),
         );
-        encoder.set_buffer(2, Some(&output), 0);
+        encoder.set_output_buffer(2, Some(&output), 0);
         encoder.set_bytes(3, &(self.hidden_size as u32));
         encoder.set_bytes(4, &(self.seq_len as u32));
         encoder.set_bytes(5, &(elem_count as u32));
@@ -1675,6 +1691,8 @@ impl CustomOp2 for LfmShortConvSequence3Op {
                 depth: 1,
             },
         );
+
+        drop(encoder);
 
         Ok((
             MetalStorage::new(output, device, elem_count, DType::F32),
