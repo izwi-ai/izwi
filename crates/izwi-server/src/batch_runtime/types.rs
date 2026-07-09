@@ -342,3 +342,20 @@ pub struct ClaimedStage {
     pub job: RuntimeJob,
     pub stage: JobStage,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StageLease {
+    pub stage_id: String,
+    pub worker_id: String,
+    pub attempt_count: u32,
+}
+
+impl ClaimedStage {
+    pub fn lease(&self) -> Option<StageLease> {
+        Some(StageLease {
+            stage_id: self.stage.id.clone(),
+            worker_id: self.stage.worker_id.clone()?,
+            attempt_count: self.stage.attempt_count,
+        })
+    }
+}
