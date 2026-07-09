@@ -22,9 +22,15 @@ Apple Silicon stable Rust caveat:
   `.cargo/config.toml`, disabling the CPU `fp16` target feature only for
   `aarch64-apple-darwin`. This routes Candle through its stable fallback while
   leaving Metal acceleration available.
+- Disabling `fp16` exposes a `gemm-f16 0.19.0` debug-codegen bug where its
+  unoptimized inline assembly is emitted outside the required `fullfp16`
+  target-feature context. The root `Cargo.toml` therefore uses `opt-level = 1`
+  for that exact package in the dev profile. Cargo's test profile inherits the
+  override; release builds are already optimized.
 - Do not add a local vendored Candle patch for this. Treat any future removal of
-  the Cargo config as an upstream Candle/toolchain compatibility decision, and
-  verify Linux Docker/CI paths against the crates.io dependency.
+  the Cargo config or profile override as an upstream Candle/toolchain
+  compatibility decision, and verify Linux Docker/CI paths against the
+  crates.io dependency.
 
 ## Metal API Migration
 
@@ -46,13 +52,13 @@ The migrated launch sites are in:
 Local CPU and Metal verification used serialized jobs to reduce memory pressure:
 
 ```sh
-cargo check --locked -p izwi-core --no-default-features
-cargo check --locked -p izwi-cli --no-default-features
-cargo check --locked -p izwi-agent --no-default-features
-cargo check --locked -p izwi-server
-cargo check --locked -p izwi-cli --features metal
-cargo test --locked -p izwi-core --no-default-features --jobs 1 -- --test-threads=1
-cargo test --locked -p izwi-core --features metal,accelerate --jobs 1 metal -- --test-threads=1
+cargo check --locked -j 1 -p izwi-core --no-default-features
+cargo check --locked -j 1 -p izwi-cli --no-default-features
+cargo check --locked -j 1 -p izwi-agent --no-default-features
+cargo check --locked -j 1 -p izwi-server
+cargo build --release --locked -j 1 -p izwi-cli --features metal
+cargo test --locked -j 1 -p izwi-core --no-default-features -- --test-threads=1
+cargo test --locked -j 1 -p izwi-core --features metal,accelerate metal -- --test-threads=1
 scripts/ci/check-backend-truth.sh cargo-cpu
 ```
 
