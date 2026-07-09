@@ -1,5 +1,5 @@
 use super::{
-    store::{BatchRuntimeStore, WorkerHeartbeatUpdate},
+    store::{BatchRuntimeStore, StageClaimFilter, WorkerHeartbeatUpdate},
     types::{ClaimedStage, RuntimeJobKind},
 };
 use anyhow::{anyhow, Context};
@@ -21,6 +21,10 @@ use tracing::{debug, error, info};
 pub struct BatchWorkerConfig {
     pub worker_id: String,
     pub queue_names: Vec<String>,
+    pub capabilities: Vec<String>,
+    pub model_ids: Vec<String>,
+    pub stage_kinds: Vec<String>,
+    pub draining: bool,
     pub poll_interval: Duration,
     pub lease_duration: Duration,
 }
@@ -30,6 +34,10 @@ impl BatchWorkerConfig {
         Self {
             worker_id: worker_id.into(),
             queue_names: vec!["batch".to_string()],
+            capabilities: Vec::new(),
+            model_ids: Vec::new(),
+            stage_kinds: Vec::new(),
+            draining: false,
             poll_interval: Duration::from_millis(250),
             lease_duration: Duration::from_secs(60),
         }
@@ -188,13 +196,19 @@ impl BatchWorkerRunner {
             .recover_expired_stage_leases()
             .await
             .context("Failed to recover expired runtime stage leases")?;
+        if self.config.draining {
+            self.record_heartbeat("draining", None).await?;
+            return Ok(false);
+        }
         self.record_heartbeat("polling", None).await?;
+        let claim_filter = self.claim_filter();
 
         let Some(claimed) = self
             .store
-            .claim_next_stage(
+            .claim_next_stage_with_filter(
                 self.config.worker_id.as_str(),
                 self.config.lease_duration.as_millis() as u64,
+                &claim_filter,
             )
             .await?
         else {
@@ -347,6 +361,14 @@ impl BatchWorkerRunner {
         Ok(())
     }
 
+    fn claim_filter(&self) -> StageClaimFilter {
+        let mut filter = StageClaimFilter::for_worker_queues(&self.config.queue_names);
+        filter.capabilities = normalized_claim_values(&self.config.capabilities);
+        filter.model_ids = normalized_claim_values(&self.config.model_ids);
+        filter.stage_kinds = normalized_claim_values(&self.config.stage_kinds);
+        filter
+    }
+
     fn record_stage_observation(
         &self,
         claimed: &ClaimedStage,
@@ -435,6 +457,15 @@ fn batch_pipeline_kind(kind: RuntimeJobKind) -> &'static str {
         RuntimeJobKind::AsrTranscription => "batch_asr_transcription",
         RuntimeJobKind::TtsSpeech => "batch_tts_speech",
     }
+}
+
+fn normalized_claim_values(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]
@@ -554,6 +585,39 @@ mod tests {
             health.snapshot().last_claimed_stage_id.as_deref(),
             Some(stage_id.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn draining_runner_records_heartbeat_without_claiming() {
+        let store = build_store();
+        let (_job_id, stage_id) = create_queued_fake_stage(&store, 1).await.expect("stage");
+        let mut config = BatchWorkerConfig::local("worker-test");
+        config.draining = true;
+        let runner = BatchWorkerRunner::new(
+            store.clone(),
+            vec![Arc::new(FakeExecutor {
+                calls: AtomicUsize::new(0),
+                fail_first: false,
+            })],
+            config,
+            BatchWorkerHealth::new("worker-test"),
+        );
+
+        assert!(!runner.run_once().await.expect("run once"));
+
+        let stage = store
+            .get_stage(&stage_id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        assert_eq!(stage.status, RuntimeStageStatus::Queued);
+        assert_eq!(stage.worker_id, None);
+        let heartbeat = store
+            .get_worker_heartbeat("worker-test")
+            .await
+            .expect("heartbeat")
+            .expect("heartbeat exists");
+        assert_eq!(heartbeat.status, "draining");
     }
 
     #[tokio::test]

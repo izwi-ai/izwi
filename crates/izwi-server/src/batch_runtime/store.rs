@@ -79,6 +79,92 @@ pub struct NewJobStage {
     pub input_artifact_ids: Vec<String>,
 }
 
+const DEFAULT_STAGE_CLAIM_CANDIDATE_LIMIT: usize = 64;
+const MAX_STAGE_CLAIM_CANDIDATE_LIMIT: usize = 512;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageClaimFilter {
+    pub queue_names: Vec<String>,
+    pub capabilities: Vec<String>,
+    pub model_ids: Vec<String>,
+    pub stage_kinds: Vec<String>,
+    pub max_candidates: usize,
+}
+
+impl Default for StageClaimFilter {
+    fn default() -> Self {
+        Self {
+            queue_names: vec!["batch".to_string()],
+            capabilities: Vec::new(),
+            model_ids: Vec::new(),
+            stage_kinds: Vec::new(),
+            max_candidates: DEFAULT_STAGE_CLAIM_CANDIDATE_LIMIT,
+        }
+    }
+}
+
+impl StageClaimFilter {
+    pub fn for_worker_queues(queue_names: &[String]) -> Self {
+        let mut filter = Self::default();
+        filter.queue_names = normalize_filter_values(queue_names);
+        if filter.queue_names.is_empty() {
+            filter.queue_names.push("batch".to_string());
+        }
+        filter
+    }
+
+    fn normalized(&self) -> Self {
+        Self {
+            queue_names: normalize_filter_values(&self.queue_names),
+            capabilities: normalize_filter_values(&self.capabilities),
+            model_ids: normalize_filter_values(&self.model_ids),
+            stage_kinds: normalize_filter_values(&self.stage_kinds),
+            max_candidates: self.max_candidates,
+        }
+    }
+
+    pub fn matches(&self, candidate: &StageClaimCandidate) -> bool {
+        self.queue_matches(candidate)
+            && optional_filter_matches(&self.capabilities, candidate.capability.as_deref())
+            && optional_filter_matches(&self.model_ids, candidate.model_id.as_deref())
+            && optional_filter_matches(&self.stage_kinds, Some(candidate.stage_kind.as_str()))
+    }
+
+    fn queue_matches(&self, candidate: &StageClaimCandidate) -> bool {
+        if self.queue_names.is_empty() {
+            return true;
+        }
+
+        self.queue_names.iter().any(|queue| {
+            queue == "batch"
+                || queue == candidate.stage_kind.as_str()
+                || queue == candidate.job_kind.as_db_value()
+                || candidate
+                    .capability
+                    .as_deref()
+                    .is_some_and(|capability| queue == capability)
+                || candidate
+                    .model_id
+                    .as_deref()
+                    .is_some_and(|model_id| queue == model_id)
+        })
+    }
+
+    fn candidate_limit(&self) -> usize {
+        self.max_candidates
+            .clamp(1, MAX_STAGE_CLAIM_CANDIDATE_LIMIT)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageClaimCandidate {
+    pub stage_id: String,
+    pub stage_kind: String,
+    pub job_kind: RuntimeJobKind,
+    pub capability: Option<String>,
+    pub model_id: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewRuntimeArtifact {
     pub job_id: String,
@@ -532,31 +618,84 @@ impl BatchRuntimeStore {
         worker_id: &str,
         lease_duration_ms: u64,
     ) -> anyhow::Result<Option<ClaimedStage>> {
+        self.claim_next_stage_with_filter(
+            worker_id,
+            lease_duration_ms,
+            &StageClaimFilter::default(),
+        )
+        .await
+    }
+
+    pub async fn claim_next_stage_with_filter(
+        &self,
+        worker_id: &str,
+        lease_duration_ms: u64,
+        filter: &StageClaimFilter,
+    ) -> anyhow::Result<Option<ClaimedStage>> {
         let db = self.db.connection().await?;
         let now = current_timestamp_millis();
         let lease_expires_at = now.saturating_add(i64::try_from(lease_duration_ms)?);
+        let filter = filter.normalized();
+        let mut params: Vec<Value> = vec![now.into()];
+        let mut claim_filter_sql = String::new();
+        push_claim_queue_clause(&mut claim_filter_sql, &mut params, &filter.queue_names);
+        push_claim_string_filter_clause(
+            &mut claim_filter_sql,
+            &mut params,
+            "COALESCE(s.capability, j.capability)",
+            &filter.capabilities,
+        );
+        push_claim_string_filter_clause(
+            &mut claim_filter_sql,
+            &mut params,
+            "COALESCE(s.model_id, j.model_id)",
+            &filter.model_ids,
+        );
+        push_claim_string_filter_clause(
+            &mut claim_filter_sql,
+            &mut params,
+            "s.stage_kind",
+            &filter.stage_kinds,
+        );
+        let limit_placeholder = params.len() + 1;
+        params.push(i64::try_from(filter.candidate_limit())?.into());
 
-        let row = db
-            .query_one_raw(raw::statement(
+        let rows = db
+            .query_all_raw(raw::statement(
                 db,
-                r#"
-                SELECT s.id
+                format!(
+                    r#"
+                SELECT
+                    s.id,
+                    s.stage_kind,
+                    j.job_kind,
+                    COALESCE(s.capability, j.capability),
+                    COALESCE(s.model_id, j.model_id)
                 FROM job_stages s
                 INNER JOIN runtime_jobs j ON j.id = s.job_id
                 WHERE s.status IN ('queued', 'retrying')
                   AND (s.lease_expires_at IS NULL OR s.lease_expires_at <= ?1)
                   AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+                  {claim_filter_sql}
                 ORDER BY j.priority DESC, s.sequence ASC, s.created_at ASC, s.id ASC
-                LIMIT 1
+                LIMIT ?{limit_placeholder}
                 "#,
-                vec![now.into()],
+                ),
+                params,
             )?)
             .await
             .context("Failed to select next runtime job stage")?;
-        let Some(row) = row else {
+        let candidates = rows
+            .iter()
+            .map(map_stage_claim_candidate)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let Some(candidate) = candidates
+            .into_iter()
+            .find(|candidate| filter.matches(candidate))
+        else {
             return Ok(None);
         };
-        let stage_id: String = row.try_get_by_index(0)?;
+        let stage_id = candidate.stage_id;
 
         let result = db
             .execute_raw(raw::statement(
@@ -1437,6 +1576,19 @@ fn map_job_stage(row: &QueryResult) -> anyhow::Result<JobStage> {
     })
 }
 
+fn map_stage_claim_candidate(row: &QueryResult) -> anyhow::Result<StageClaimCandidate> {
+    let job_kind_raw: String = row.try_get_by_index(2)?;
+
+    Ok(StageClaimCandidate {
+        stage_id: row.try_get_by_index(0)?,
+        stage_kind: row.try_get_by_index(1)?,
+        job_kind: RuntimeJobKind::from_db_value(job_kind_raw.as_str())
+            .ok_or_else(|| anyhow!("Unknown runtime job kind: {job_kind_raw}"))?,
+        capability: row.try_get_by_index(3)?,
+        model_id: row.try_get_by_index(4)?,
+    })
+}
+
 fn map_runtime_artifact(row: &QueryResult) -> anyhow::Result<RuntimeArtifact> {
     let kind_raw: String = row.try_get_by_index(4)?;
     let role_raw: String = row.try_get_by_index(5)?;
@@ -1503,6 +1655,94 @@ fn parse_json_value(raw: String, fallback: serde_json::Value) -> serde_json::Val
 
 fn parse_string_array(raw: String) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(raw.as_str()).unwrap_or_default()
+}
+
+fn normalize_filter_values(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn push_claim_queue_clause(sql: &mut String, params: &mut Vec<Value>, queue_names: &[String]) {
+    if queue_names.is_empty() || queue_names.iter().any(|queue| queue == "batch") {
+        return;
+    }
+
+    sql.push_str(" AND (");
+    let mut first = true;
+    push_claim_string_filter_expr(&mut first, sql, params, "s.stage_kind", queue_names);
+    push_claim_string_filter_expr(&mut first, sql, params, "j.job_kind", queue_names);
+    push_claim_string_filter_expr(
+        &mut first,
+        sql,
+        params,
+        "COALESCE(s.capability, j.capability)",
+        queue_names,
+    );
+    push_claim_string_filter_expr(
+        &mut first,
+        sql,
+        params,
+        "COALESCE(s.model_id, j.model_id)",
+        queue_names,
+    );
+    sql.push(')');
+}
+
+fn push_claim_string_filter_clause(
+    sql: &mut String,
+    params: &mut Vec<Value>,
+    expression: &str,
+    values: &[String],
+) {
+    if values.is_empty() {
+        return;
+    }
+
+    sql.push_str(" AND ");
+    push_claim_in_expression(sql, params, expression, values);
+}
+
+fn push_claim_string_filter_expr(
+    first: &mut bool,
+    sql: &mut String,
+    params: &mut Vec<Value>,
+    expression: &str,
+    values: &[String],
+) {
+    if !*first {
+        sql.push_str(" OR ");
+    }
+    *first = false;
+    push_claim_in_expression(sql, params, expression, values);
+}
+
+fn push_claim_in_expression(
+    sql: &mut String,
+    params: &mut Vec<Value>,
+    expression: &str,
+    values: &[String],
+) {
+    sql.push_str(expression);
+    sql.push_str(" IN (");
+    for (idx, value) in values.iter().enumerate() {
+        if idx > 0 {
+            sql.push_str(", ");
+        }
+        let placeholder = params.len() + 1;
+        sql.push('?');
+        sql.push_str(placeholder.to_string().as_str());
+        params.push(value.clone().into());
+    }
+    sql.push(')');
+}
+
+fn optional_filter_matches(filter: &[String], value: Option<&str>) -> bool {
+    filter.is_empty()
+        || value.is_some_and(|value| filter.iter().any(|entry| entry.as_str() == value))
 }
 
 fn opt_string(value: Option<String>) -> Value {
@@ -1853,6 +2093,99 @@ mod tests {
             .expect("stage")
             .expect("stage exists");
         assert_eq!(cancelled_stage.status, RuntimeStageStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn filtered_stage_claim_skips_incompatible_higher_priority_stage() {
+        let (store, _root) = build_store();
+        let tts_job = store
+            .create_job(NewRuntimeJob {
+                job_kind: RuntimeJobKind::TtsSpeech,
+                status: RuntimeJobStatus::Queued,
+                priority: 50,
+                model_id: Some("Qwen3-TTS-0.6B".to_string()),
+                capability: Some("tts".to_string()),
+                route_record_kind: Some("speech_history".to_string()),
+                route_record_id: Some("speech-1".to_string()),
+                input_media_asset_id: None,
+                input_text_asset_id: None,
+                request_json: json!({}),
+                model_snapshot_json: json!({}),
+                retry_policy_json: json!({}),
+                max_attempts: 1,
+                idempotency_key: None,
+                correlation_id: None,
+            })
+            .await
+            .expect("tts job");
+        let tts_stage = store
+            .create_stage(NewJobStage {
+                job_id: tts_job.id.clone(),
+                sequence: 0,
+                stage_kind: "tts_generate".to_string(),
+                status: RuntimeStageStatus::Queued,
+                capability: Some("tts".to_string()),
+                model_id: tts_job.model_id.clone(),
+                max_attempts: 1,
+                input_artifact_ids: vec![],
+            })
+            .await
+            .expect("tts stage");
+
+        let asr_job = store
+            .create_job(NewRuntimeJob {
+                job_kind: RuntimeJobKind::AsrTranscription,
+                status: RuntimeJobStatus::Queued,
+                priority: 10,
+                model_id: Some("Parakeet-TDT-0.6B-v3".to_string()),
+                capability: Some("asr".to_string()),
+                route_record_kind: Some("transcription".to_string()),
+                route_record_id: Some("transcription-1".to_string()),
+                input_media_asset_id: None,
+                input_text_asset_id: None,
+                request_json: json!({}),
+                model_snapshot_json: json!({}),
+                retry_policy_json: json!({}),
+                max_attempts: 1,
+                idempotency_key: None,
+                correlation_id: None,
+            })
+            .await
+            .expect("asr job");
+        let asr_stage = store
+            .create_stage(NewJobStage {
+                job_id: asr_job.id.clone(),
+                sequence: 0,
+                stage_kind: "asr_infer".to_string(),
+                status: RuntimeStageStatus::Queued,
+                capability: Some("asr".to_string()),
+                model_id: asr_job.model_id.clone(),
+                max_attempts: 1,
+                input_artifact_ids: vec![],
+            })
+            .await
+            .expect("asr stage");
+
+        let mut filter = StageClaimFilter::for_worker_queues(&["asr".to_string()]);
+        filter.capabilities = vec!["asr".to_string()];
+
+        let claimed = store
+            .claim_next_stage_with_filter("asr-worker", 60_000, &filter)
+            .await
+            .expect("claim")
+            .expect("asr stage should be claimed");
+
+        assert_eq!(claimed.stage.id, asr_stage.id);
+        assert_eq!(claimed.stage.capability.as_deref(), Some("asr"));
+        assert_eq!(claimed.stage.worker_id.as_deref(), Some("asr-worker"));
+
+        let tts_stage = store
+            .get_stage(&tts_stage.id)
+            .await
+            .expect("fetch tts stage")
+            .expect("tts stage exists");
+        assert_eq!(tts_stage.status, RuntimeStageStatus::Queued);
+        assert_eq!(tts_stage.worker_id, None);
     }
 
     #[tokio::test]
