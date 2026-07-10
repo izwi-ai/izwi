@@ -44,18 +44,6 @@ impl RuntimeService {
         let variant = resolved.variant;
         let _backend = resolved.backend_plan.backend;
 
-        if let Some(model_path) = self
-            .model_manager
-            .get_model_info(variant)
-            .await
-            .and_then(|i| i.local_path)
-        {
-            return Ok(AcquiredModelLoad {
-                variant,
-                model_path,
-            });
-        }
-
         if self.model_manager.is_download_active(variant).await {
             if let Some(model_path) = self.model_manager.wait_for_download(variant).await? {
                 return Ok(AcquiredModelLoad {
@@ -63,6 +51,13 @@ impl RuntimeService {
                     model_path,
                 });
             }
+        }
+
+        if let Some(model_path) = self.model_manager.downloaded_model_path(variant) {
+            return Ok(AcquiredModelLoad {
+                variant,
+                model_path,
+            });
         }
 
         Err(Error::ModelNotFound(format!(
