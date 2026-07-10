@@ -18,6 +18,7 @@ mod entity;
 mod error;
 mod ids;
 mod logging;
+pub mod media_ingest;
 mod onboarding_store;
 mod persistence;
 mod saved_voice_store;

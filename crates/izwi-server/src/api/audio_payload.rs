@@ -159,25 +159,6 @@ pub(crate) fn inspect_audio_payload_bytes(bytes: &[u8]) -> Result<AudioInspectio
     })
 }
 
-pub(crate) fn inspect_audio_payload_bytes_with_diagnostics(
-    route: &str,
-    bytes: &[u8],
-    source_mime_type: Option<&str>,
-    filename: Option<&str>,
-) -> Result<AudioInspection, ApiError> {
-    let inspection = inspect_audio_payload_bytes(bytes)?;
-    AudioIngestDiagnostics::from_parts(
-        route,
-        bytes.len(),
-        source_mime_type,
-        None,
-        filename,
-        &inspection,
-    )
-    .emit();
-    Ok(inspection)
-}
-
 pub(crate) fn is_audio_content_type(content_type: &str) -> bool {
     content_type
         .split(';')

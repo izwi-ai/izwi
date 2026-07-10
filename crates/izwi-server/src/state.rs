@@ -4,17 +4,19 @@ use crate::batch_runtime::{store::BatchRuntimeStore, worker::BatchWorkerHealth};
 use crate::chat_store::ChatStore;
 use crate::db::StoreDatabase;
 use crate::diarization_store::DiarizationStore;
+use crate::media_ingest::MediaIngestService;
 use crate::onboarding_store::OnboardingStore;
-use crate::persistence::PersistenceContext;
+use crate::persistence::{LocalMediaStorageProvider, PersistenceContext};
 use crate::saved_voice_store::SavedVoiceStore;
 use crate::speech_history_store::SpeechHistoryStore;
+use crate::storage_layout;
 use crate::studio_project_store::StudioProjectStore;
 use crate::transcription_store::TranscriptionStore;
 use crate::voice_observation_store::VoiceObservationStore;
 use crate::voice_store::VoiceStore;
 use izwi_agent::planner::PlanningMode;
 use izwi_core::{RuntimeRequestContext, RuntimeService, ServeRuntimeConfig, WorkloadClass};
-use izwi_hooks::EnterpriseHooks;
+use izwi_hooks::{EnterpriseHooks, MediaStorageProvider};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -414,6 +416,8 @@ pub struct AppState {
     pub voice_observation_store: Arc<VoiceObservationStore>,
     /// Durable batch runtime store for media/text assets, jobs, stages, and artifacts.
     pub batch_runtime_store: Arc<BatchRuntimeStore>,
+    /// Shared strict media validation, canonicalization, storage, and asset registration service.
+    pub media_ingest: Arc<MediaIngestService>,
     /// In-process batch worker health snapshot used by readiness and diagnostics.
     pub batch_worker_health: BatchWorkerHealth,
 }
@@ -451,6 +455,13 @@ impl AppState {
         let batch_runtime_store = Arc::new(BatchRuntimeStore::initialize_with_database(
             StoreDatabase::from_default_path()?,
         ));
+        let media_storage: Arc<dyn MediaStorageProvider> = Arc::new(
+            LocalMediaStorageProvider::new(storage_layout::resolve_media_root()),
+        );
+        let media_ingest = Arc::new(MediaIngestService::new(
+            media_storage,
+            batch_runtime_store.clone(),
+        ));
         let batch_worker_health = BatchWorkerHealth::new("local-batch-worker");
 
         Ok(Self {
@@ -476,6 +487,7 @@ impl AppState {
             voice_store,
             voice_observation_store,
             batch_runtime_store,
+            media_ingest,
             batch_worker_health,
         })
     }
@@ -513,7 +525,7 @@ impl AppState {
         ));
         let saved_voice_store = Arc::new(SavedVoiceStore::initialize_with_storage(
             store_database.clone(),
-            media_storage,
+            media_storage.clone(),
         ));
         let studio_store = Arc::new(StudioProjectStore::initialize_with_database(
             store_database.clone(),
@@ -527,6 +539,10 @@ impl AppState {
         ));
         let batch_runtime_store = Arc::new(BatchRuntimeStore::initialize_with_database(
             store_database.clone(),
+        ));
+        let media_ingest = Arc::new(MediaIngestService::new(
+            media_storage,
+            batch_runtime_store.clone(),
         ));
         let batch_worker_health = BatchWorkerHealth::new("local-batch-worker");
 
@@ -553,6 +569,7 @@ impl AppState {
             voice_store,
             voice_observation_store,
             batch_runtime_store,
+            media_ingest,
             batch_worker_health,
         })
     }
