@@ -271,6 +271,31 @@ impl MediaIngestService {
         policy: AudioIngestPolicy,
         canonical_profile: CanonicalAudioProfile,
     ) -> Result<MediaIngestResult, MediaIngestError> {
+        self.ingest_inner(request, policy, canonical_profile, false)
+            .await
+    }
+
+    /// Strictly ingest a payload that the calling route requires to be audio.
+    ///
+    /// Unlike the general `/v1/media` entry point, this never treats an unrecognized payload as
+    /// opaque media. Reference-voice and other model inputs therefore fail before job creation.
+    pub async fn ingest_audio(
+        &self,
+        request: MediaIngestRequest,
+        policy: AudioIngestPolicy,
+        canonical_profile: CanonicalAudioProfile,
+    ) -> Result<MediaIngestResult, MediaIngestError> {
+        self.ingest_inner(request, policy, canonical_profile, true)
+            .await
+    }
+
+    async fn ingest_inner(
+        &self,
+        request: MediaIngestRequest,
+        policy: AudioIngestPolicy,
+        canonical_profile: CanonicalAudioProfile,
+        require_audio: bool,
+    ) -> Result<MediaIngestResult, MediaIngestError> {
         let MediaIngestRequest {
             bytes,
             content_type,
@@ -292,7 +317,7 @@ impl MediaIngestService {
             )));
         }
 
-        let audio_like = is_audio_like(&bytes, &content_type, filename.as_deref());
+        let audio_like = require_audio || is_audio_like(&bytes, &content_type, filename.as_deref());
         let (prepared, opaque_bytes) = if audio_like {
             (
                 Some(self.prepare_audio(bytes, policy, canonical_profile).await?),
@@ -330,10 +355,12 @@ impl MediaIngestService {
 
         let canonical_namespace = format!("media/{namespace}/canonical");
         let canonical_filename = canonical_filename(filename.as_deref());
+        let canonical_record_id =
+            canonical_derivative_record_id(&original_storage_key, canonical_profile);
         let canonical_storage_key = match self
             .persist(
                 MediaNamespace::Other(canonical_namespace.clone()),
-                record_id,
+                canonical_record_id,
                 canonical_filename.as_deref(),
                 canonical_profile.content_type(),
                 &prepared.canonical_bytes,
@@ -387,6 +414,9 @@ impl MediaIngestService {
                 return Err(err);
             }
         };
+        if canonical_asset.storage_key != canonical_storage_key {
+            self.compensate_delete(&canonical_storage_key).await;
+        }
 
         info!(
             target: "izwi.audio",
@@ -406,7 +436,7 @@ impl MediaIngestService {
             source_size_bytes,
             source_asset: Some(source_asset),
             canonical: Some(CanonicalMediaIngestResult {
-                storage_key: canonical_storage_key,
+                storage_key: canonical_asset.storage_key.clone(),
                 asset: canonical_asset,
             }),
         })
@@ -429,7 +459,7 @@ impl MediaIngestService {
             storage_namespace,
             content_type,
             filename,
-            record_id,
+            record_id: _,
             route,
         } = request;
         if bytes.is_empty() {
@@ -441,10 +471,11 @@ impl MediaIngestService {
         let prepared = self.prepare_audio(bytes, policy, canonical_profile).await?;
         let canonical_namespace = format!("{storage_namespace}/canonical");
         let canonical_filename = canonical_filename(filename.as_deref());
+        let canonical_record_id = canonical_derivative_record_id(&storage_key, canonical_profile);
         let canonical_storage_key = self
             .persist(
                 MediaNamespace::Other(canonical_namespace.clone()),
-                record_id,
+                canonical_record_id,
                 canonical_filename.as_deref(),
                 canonical_profile.content_type(),
                 &prepared.canonical_bytes,
@@ -487,13 +518,16 @@ impl MediaIngestService {
                 return Err(err);
             }
         };
+        if canonical_asset.storage_key != canonical_storage_key {
+            self.compensate_delete(&canonical_storage_key).await;
+        }
 
         Ok(MediaIngestResult {
             original_storage_key: storage_key,
             source_size_bytes: prepared.source_bytes.len() as u64,
             source_asset: Some(source_asset),
             canonical: Some(CanonicalMediaIngestResult {
-                storage_key: canonical_storage_key,
+                storage_key: canonical_asset.storage_key.clone(),
                 asset: canonical_asset,
             }),
         })
@@ -560,7 +594,9 @@ impl MediaIngestService {
         route: &str,
         prepared: &PreparedAudio,
     ) -> Result<MediaAsset, MediaIngestError> {
-        self.batch_store
+        let source_sha256 = sha256_hex(&prepared.source_bytes);
+        let result = self
+            .batch_store
             .create_media_asset(NewMediaAsset {
                 asset_kind: "audio_original".to_string(),
                 storage_namespace: storage_namespace.to_string(),
@@ -568,12 +604,14 @@ impl MediaIngestService {
                 content_type: content_type.to_string(),
                 filename: filename.map(ToOwned::to_owned),
                 size_bytes: prepared.source_bytes.len() as u64,
-                sha256: Some(sha256_hex(&prepared.source_bytes)),
+                sha256: Some(source_sha256.clone()),
                 duration_secs: Some(prepared.source_inspection.duration_secs as f64),
                 sample_rate_hz: Some(prepared.source.sample_rate),
                 channel_count: Some(prepared.source.channel_count),
                 peak_amplitude: Some(prepared.source_inspection.peak),
                 rms_amplitude: Some(prepared.source_inspection.rms),
+                source_asset_id: None,
+                canonical_profile_version: None,
                 scan_status: SECURITY_SCAN_STATUS_NOT_SCANNED.to_string(),
                 retention_policy: "default".to_string(),
                 metadata_json: serde_json::json!({
@@ -595,8 +633,27 @@ impl MediaIngestService {
                     }
                 }),
             })
-            .await
-            .map_err(MediaIngestError::AssetRegistration)
+            .await;
+        match result {
+            Ok(asset) => Ok(asset),
+            Err(create_error) => match self
+                .batch_store
+                .get_media_asset_by_storage_key(storage_key)
+                .await
+            {
+                Ok(Some(asset)) if asset.sha256.as_deref() == Some(source_sha256.as_str()) => {
+                    Ok(asset)
+                }
+                Ok(Some(asset)) => Err(MediaIngestError::AssetRegistration(anyhow::anyhow!(
+                    "Media storage key `{storage_key}` is already registered with checksum {:?}; refusing to replace immutable source bytes",
+                    asset.sha256
+                ))),
+                Ok(None) => Err(MediaIngestError::AssetRegistration(create_error)),
+                Err(lookup_error) => Err(MediaIngestError::AssetRegistration(anyhow::anyhow!(
+                    "{create_error}; failed to resolve the existing media asset: {lookup_error}"
+                ))),
+            },
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -610,7 +667,9 @@ impl MediaIngestService {
         source_asset: &MediaAsset,
         prepared: &PreparedAudio,
     ) -> Result<MediaAsset, MediaIngestError> {
-        self.batch_store
+        let canonical_sha256 = sha256_hex(&prepared.canonical_bytes);
+        let result = self
+            .batch_store
             .create_media_asset(NewMediaAsset {
                 asset_kind: profile.asset_kind().to_string(),
                 storage_namespace: storage_namespace.to_string(),
@@ -618,12 +677,14 @@ impl MediaIngestService {
                 content_type: profile.content_type().to_string(),
                 filename: filename.map(ToOwned::to_owned),
                 size_bytes: prepared.canonical_bytes.len() as u64,
-                sha256: Some(sha256_hex(&prepared.canonical_bytes)),
+                sha256: Some(canonical_sha256.clone()),
                 duration_secs: Some(prepared.canonical_inspection.duration_secs as f64),
                 sample_rate_hz: Some(prepared.canonical_inspection.sample_rate),
                 channel_count: Some(1),
                 peak_amplitude: Some(prepared.canonical_inspection.peak),
                 rms_amplitude: Some(prepared.canonical_inspection.rms),
+                source_asset_id: Some(source_asset.id.clone()),
+                canonical_profile_version: Some(profile.id().to_string()),
                 scan_status: SECURITY_SCAN_STATUS_NOT_SCANNED.to_string(),
                 retention_policy: "default".to_string(),
                 metadata_json: serde_json::json!({
@@ -648,8 +709,29 @@ impl MediaIngestService {
                     }
                 }),
             })
-            .await
-            .map_err(MediaIngestError::AssetRegistration)
+            .await;
+        match result {
+            Ok(asset) => Ok(asset),
+            Err(create_error) => match self
+                .batch_store
+                .get_canonical_media_asset(&source_asset.id, profile.id())
+                .await
+            {
+                Ok(Some(asset)) if asset.sha256.as_deref() == Some(canonical_sha256.as_str()) => {
+                    Ok(asset)
+                }
+                Ok(Some(asset)) => Err(MediaIngestError::AssetRegistration(anyhow::anyhow!(
+                    "Canonical profile `{}` for source asset `{}` already has checksum {:?}; refusing divergent derivative bytes",
+                    profile.id(),
+                    source_asset.id,
+                    asset.sha256
+                ))),
+                Ok(None) => Err(MediaIngestError::AssetRegistration(create_error)),
+                Err(lookup_error) => Err(MediaIngestError::AssetRegistration(anyhow::anyhow!(
+                    "{create_error}; failed to resolve the existing canonical asset: {lookup_error}"
+                ))),
+            },
+        }
     }
 
     async fn compensate_delete(&self, key: &str) {
@@ -856,11 +938,23 @@ fn canonical_filename(filename: Option<&str>) -> Option<String> {
     ))
 }
 
+fn canonical_derivative_record_id(
+    source_storage_key: &str,
+    profile: CanonicalAudioProfile,
+) -> String {
+    let identity = format!("{source_storage_key}\0{}", profile.id());
+    let digest = sha256_hex(identity.as_bytes());
+    format!("canonical-{}", &digest[..32])
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
         collections::HashMap,
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
     };
 
     use izwi_hooks::{
@@ -877,6 +971,7 @@ mod tests {
     struct RecordingMediaProvider {
         objects: Mutex<HashMap<String, Vec<u8>>>,
         deleted: Mutex<Vec<String>>,
+        next_key: AtomicUsize,
     }
 
     #[async_trait::async_trait]
@@ -886,7 +981,7 @@ mod tests {
             request: MediaWriteRequest,
             bytes: Vec<u8>,
         ) -> HookResult<StoredMediaObject> {
-            let suffix = self.objects.lock().expect("objects").len() + 1;
+            let suffix = self.next_key.fetch_add(1, Ordering::AcqRel) + 1;
             let key = format!("test/{}/{suffix}", request.record_id);
             self.objects
                 .lock()
@@ -1062,6 +1157,8 @@ mod tests {
         assert_eq!(source_asset.content_type, "application/octet-stream");
         assert_eq!(source_asset.sample_rate_hz, Some(48_000));
         assert_eq!(source_asset.channel_count, Some(2));
+        assert_eq!(source_asset.source_asset_id, None);
+        assert_eq!(source_asset.canonical_profile_version, None);
         assert_eq!(source_asset.scan_status, SECURITY_SCAN_STATUS_NOT_SCANNED);
         assert_eq!(
             source_asset.metadata_json["decode_validation"]["status"],
@@ -1071,6 +1168,14 @@ mod tests {
         let canonical = result.canonical.expect("canonical asset");
         assert_eq!(canonical.asset.sample_rate_hz, Some(16_000));
         assert_eq!(canonical.asset.channel_count, Some(1));
+        assert_eq!(
+            canonical.asset.source_asset_id.as_deref(),
+            Some(source_asset.id.as_str())
+        );
+        assert_eq!(
+            canonical.asset.canonical_profile_version.as_deref(),
+            Some(CanonicalAudioProfile::SpeechRecognition16KhzMonoWav.id())
+        );
         assert_eq!(
             canonical.asset.metadata_json["canonical_profile"],
             CanonicalAudioProfile::SpeechRecognition16KhzMonoWav.id()
@@ -1116,6 +1221,80 @@ mod tests {
         );
         assert_eq!(provider.objects.lock().expect("objects").len(), 1);
         assert!(result.canonical.is_some());
+    }
+
+    #[tokio::test]
+    async fn concurrent_existing_audio_ingest_reuses_one_source_profile_derivative() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider = Arc::new(RecordingMediaProvider::default());
+        let store = Arc::new(BatchRuntimeStore::initialize_with_database(
+            StoreDatabase::new(temp.path().join("runtime.sqlite")),
+        ));
+        let service = MediaIngestService::with_decode_lane_capacity(provider.clone(), store, 2);
+        let source_bytes = stereo_wav_bytes();
+        let ingest = |record_id: &str| ExistingAudioIngestRequest {
+            bytes: source_bytes.clone(),
+            storage_key: "saved_voice/immutable-reference.wav".to_string(),
+            storage_namespace: "saved_voice".to_string(),
+            content_type: "audio/wav".to_string(),
+            filename: Some("reference.wav".to_string()),
+            record_id: record_id.to_string(),
+            route: "text_to_speech".to_string(),
+        };
+
+        let (first, second) = tokio::join!(
+            service.ingest_existing_audio(
+                ingest("record-1"),
+                AudioIngestPolicy::media_upload(1_000_000),
+                CanonicalAudioProfile::ReferenceVoiceSourceRateMonoWav,
+            ),
+            service.ingest_existing_audio(
+                ingest("record-2"),
+                AudioIngestPolicy::media_upload(1_000_000),
+                CanonicalAudioProfile::ReferenceVoiceSourceRateMonoWav,
+            )
+        );
+        let first = first.expect("first ingest");
+        let second = second.expect("second ingest");
+        let first_source = first.source_asset.expect("first source");
+        let second_source = second.source_asset.expect("second source");
+        let first_canonical = first.canonical.expect("first canonical");
+        let second_canonical = second.canonical.expect("second canonical");
+
+        assert_eq!(first_source.id, second_source.id);
+        assert_eq!(first_canonical.asset.id, second_canonical.asset.id);
+        assert_eq!(first_canonical.storage_key, second_canonical.storage_key);
+        assert_eq!(
+            first_canonical.asset.source_asset_id.as_deref(),
+            Some(first_source.id.as_str())
+        );
+        assert_eq!(
+            first_canonical.asset.canonical_profile_version.as_deref(),
+            Some(CanonicalAudioProfile::ReferenceVoiceSourceRateMonoWav.id())
+        );
+        assert_eq!(provider.objects.lock().expect("objects").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn strict_audio_ingest_rejects_opaque_bytes_before_storage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider = Arc::new(RecordingMediaProvider::default());
+        let store = Arc::new(BatchRuntimeStore::initialize_with_database(
+            StoreDatabase::new(temp.path().join("runtime.sqlite")),
+        ));
+        let service = MediaIngestService::with_decode_lane_capacity(provider.clone(), store, 1);
+
+        let error = service
+            .ingest_audio(
+                request(b"this is not audio".to_vec()),
+                AudioIngestPolicy::media_upload(1_000_000),
+                CanonicalAudioProfile::ReferenceVoiceSourceRateMonoWav,
+            )
+            .await
+            .expect_err("opaque bytes must not pass an audio-only boundary");
+
+        assert!(error.is_invalid_input());
+        assert!(provider.objects.lock().expect("objects").is_empty());
     }
 
     #[tokio::test]

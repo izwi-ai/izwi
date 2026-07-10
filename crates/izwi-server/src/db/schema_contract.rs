@@ -317,6 +317,8 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "channel_count",
             "peak_amplitude",
             "rms_amplitude",
+            "source_asset_id",
+            "canonical_profile_version",
             "scan_status",
             "retention_policy",
             "deleted_at",

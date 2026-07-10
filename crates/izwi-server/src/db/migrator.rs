@@ -364,10 +364,13 @@ const BASELINE_SCHEMA: &[&str] = &[
         channel_count INTEGER NULL,
         peak_amplitude REAL NULL,
         rms_amplitude REAL NULL,
+        source_asset_id TEXT NULL,
+        canonical_profile_version TEXT NULL,
         scan_status TEXT NOT NULL DEFAULT 'not_scanned',
         retention_policy TEXT NOT NULL DEFAULT 'default',
         deleted_at INTEGER NULL,
-        metadata_json TEXT NOT NULL DEFAULT '{}'
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        FOREIGN KEY(source_asset_id) REFERENCES media_assets(id) ON DELETE RESTRICT
     );
     "#,
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_media_assets_storage_key ON media_assets(storage_key);",
@@ -532,9 +535,20 @@ const POST_COMPATIBILITY_SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_job_stages_queue_claim_ready ON job_stages(queue_class, status, available_at, lease_expires_at, sequence);",
     "CREATE INDEX IF NOT EXISTS idx_job_stages_queue_resources ON job_stages(queue_class, resource_target, required_backend, required_device_class, min_resource_memory_bytes, resource_concurrency_weight, status);",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_artifacts_attempt_publication ON runtime_artifacts(stage_id, producer_attempt_token, publication_key);",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_media_assets_source_profile ON media_assets(source_asset_id, canonical_profile_version);",
 ];
 
 const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
+    CompatibilityColumn {
+        table: "media_assets",
+        column: "source_asset_id",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "media_assets",
+        column: "canonical_profile_version",
+        definition: "TEXT NULL",
+    },
     CompatibilityColumn {
         table: "job_stages",
         column: "queue_class",

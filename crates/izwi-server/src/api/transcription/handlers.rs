@@ -762,11 +762,15 @@ async fn resolve_batch_asr_audio(
     state: &AppState,
     claimed: &ClaimedStage,
 ) -> anyhow::Result<Vec<u8>> {
+    let mut legacy_original_only = true;
     for artifact_id in &claimed.stage.input_artifact_ids {
-        let Some(artifact) = state.batch_runtime_store.get_artifact(artifact_id).await? else {
-            continue;
-        };
+        let artifact = state
+            .batch_runtime_store
+            .get_artifact(artifact_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("ASR input artifact `{artifact_id}` was not found"))?;
         if artifact.artifact_role != RuntimeArtifactRole::InputCanonical {
+            legacy_original_only &= artifact.artifact_role == RuntimeArtifactRole::InputOriginal;
             continue;
         }
         let storage_key = artifact
@@ -779,6 +783,10 @@ async fn resolve_batch_asr_audio(
             .await
             .map(|stored| stored.bytes)
             .context("Failed to read canonical ASR input artifact");
+    }
+
+    if !legacy_original_only {
+        anyhow::bail!("ASR stage has explicit inputs but no canonical media artifact");
     }
 
     let record_id = claimed

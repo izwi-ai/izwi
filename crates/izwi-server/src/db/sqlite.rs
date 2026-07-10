@@ -273,10 +273,13 @@ mod tests {
         "studio_project_pronunciations",
         "studio_project_snapshots",
         "studio_project_render_jobs",
+        "media_assets",
     ];
 
     const EXPECTED_COMPAT_COLUMNS: &[(&str, &str)] = &[
         ("chat_messages", "content_parts"),
+        ("media_assets", "source_asset_id"),
+        ("media_assets", "canonical_profile_version"),
         ("onboarding_state", "analytics_opt_in"),
         ("transcription_records", "transcription_mode"),
         ("transcription_records", "aligner_model_id"),
@@ -339,6 +342,28 @@ mod tests {
         CREATE TABLE onboarding_state (
             id TEXT PRIMARY KEY,
             completed_at INTEGER NULL
+        );
+
+        CREATE TABLE media_assets (
+            id TEXT PRIMARY KEY,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            asset_kind TEXT NOT NULL,
+            storage_namespace TEXT NOT NULL,
+            storage_key TEXT NOT NULL,
+            content_type TEXT NOT NULL,
+            filename TEXT NULL,
+            size_bytes INTEGER NOT NULL,
+            sha256 TEXT NULL,
+            duration_secs REAL NULL,
+            sample_rate_hz INTEGER NULL,
+            channel_count INTEGER NULL,
+            peak_amplitude REAL NULL,
+            rms_amplitude REAL NULL,
+            scan_status TEXT NOT NULL DEFAULT 'not_scanned',
+            retention_policy TEXT NOT NULL DEFAULT 'default',
+            deleted_at INTEGER NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}'
         );
 
         CREATE TABLE transcription_records (

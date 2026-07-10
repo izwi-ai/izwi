@@ -566,7 +566,7 @@ async fn ingest_batch_reference_audio(
         .to_string();
     state
         .media_ingest
-        .ingest(
+        .ingest_audio(
             MediaIngestRequest {
                 bytes: payload.bytes,
                 content_type,
@@ -1011,7 +1011,9 @@ async fn create_speech_audio_runtime_artifact(
             channel_count: Some(1),
             peak_amplitude: Some(inspection.peak),
             rms_amplitude: Some(inspection.rms),
-            scan_status: "passed".to_string(),
+            source_asset_id: None,
+            canonical_profile_version: None,
+            scan_status: "not_scanned".to_string(),
             retention_policy: "default".to_string(),
             metadata_json: serde_json::json!({
                 "route_record_id": record.id.clone(),

@@ -450,6 +450,8 @@ pub struct MediaAsset {
     pub channel_count: Option<u16>,
     pub peak_amplitude: Option<f32>,
     pub rms_amplitude: Option<f32>,
+    pub source_asset_id: Option<String>,
+    pub canonical_profile_version: Option<String>,
     pub scan_status: String,
     pub retention_policy: String,
     pub deleted_at: Option<u64>,

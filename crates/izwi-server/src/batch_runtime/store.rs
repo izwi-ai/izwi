@@ -43,6 +43,8 @@ pub struct NewMediaAsset {
     pub channel_count: Option<u16>,
     pub peak_amplitude: Option<f32>,
     pub rms_amplitude: Option<f32>,
+    pub source_asset_id: Option<String>,
+    pub canonical_profile_version: Option<String>,
     pub scan_status: String,
     pub retention_policy: String,
     pub metadata_json: serde_json::Value,
@@ -378,12 +380,14 @@ impl BatchRuntimeStore {
                 channel_count,
                 peak_amplitude,
                 rms_amplitude,
+                source_asset_id,
+                canonical_profile_version,
                 scan_status,
                 retention_policy,
                 deleted_at,
                 metadata_json
             )
-            VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, NULL, ?17)
+            VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL, ?19)
             "#,
             vec![
                 id.clone().into(),
@@ -400,6 +404,8 @@ impl BatchRuntimeStore {
                 opt_u16(input.channel_count),
                 opt_f32(input.peak_amplitude),
                 opt_f32(input.rms_amplitude),
+                opt_string(input.source_asset_id),
+                opt_string(input.canonical_profile_version),
                 input.scan_status.into(),
                 input.retention_policy.into(),
                 metadata_json.into(),
@@ -423,6 +429,41 @@ impl BatchRuntimeStore {
             )?)
             .await
             .context("Failed to load media asset")?;
+
+        row.as_ref().map(map_media_asset).transpose()
+    }
+
+    pub async fn get_media_asset_by_storage_key(
+        &self,
+        storage_key: &str,
+    ) -> anyhow::Result<Option<MediaAsset>> {
+        let db = self.db.connection().await?;
+        let row = db
+            .query_one_raw(raw::statement(
+                db,
+                MEDIA_ASSET_BY_STORAGE_KEY_SQL,
+                vec![storage_key.into()],
+            )?)
+            .await
+            .context("Failed to load media asset by storage key")?;
+
+        row.as_ref().map(map_media_asset).transpose()
+    }
+
+    pub async fn get_canonical_media_asset(
+        &self,
+        source_asset_id: &str,
+        canonical_profile_version: &str,
+    ) -> anyhow::Result<Option<MediaAsset>> {
+        let db = self.db.connection().await?;
+        let row = db
+            .query_one_raw(raw::statement(
+                db,
+                MEDIA_ASSET_BY_SOURCE_PROFILE_SQL,
+                vec![source_asset_id.into(), canonical_profile_version.into()],
+            )?)
+            .await
+            .context("Failed to load canonical media asset by source and profile")?;
 
         row.as_ref().map(map_media_asset).transpose()
     }
@@ -2343,7 +2384,11 @@ pub fn current_timestamp_millis() -> i64 {
 }
 
 const MEDIA_ASSET_COLUMNS_SQL: &str =
-    "SELECT id, created_at, updated_at, asset_kind, storage_namespace, storage_key, content_type, filename, size_bytes, sha256, duration_secs, sample_rate_hz, channel_count, peak_amplitude, rms_amplitude, scan_status, retention_policy, deleted_at, metadata_json FROM media_assets WHERE id = ?1";
+    "SELECT id, created_at, updated_at, asset_kind, storage_namespace, storage_key, content_type, filename, size_bytes, sha256, duration_secs, sample_rate_hz, channel_count, peak_amplitude, rms_amplitude, source_asset_id, canonical_profile_version, scan_status, retention_policy, deleted_at, metadata_json FROM media_assets WHERE id = ?1";
+const MEDIA_ASSET_BY_STORAGE_KEY_SQL: &str =
+    "SELECT id, created_at, updated_at, asset_kind, storage_namespace, storage_key, content_type, filename, size_bytes, sha256, duration_secs, sample_rate_hz, channel_count, peak_amplitude, rms_amplitude, source_asset_id, canonical_profile_version, scan_status, retention_policy, deleted_at, metadata_json FROM media_assets WHERE storage_key = ?1 AND deleted_at IS NULL";
+const MEDIA_ASSET_BY_SOURCE_PROFILE_SQL: &str =
+    "SELECT id, created_at, updated_at, asset_kind, storage_namespace, storage_key, content_type, filename, size_bytes, sha256, duration_secs, sample_rate_hz, channel_count, peak_amplitude, rms_amplitude, source_asset_id, canonical_profile_version, scan_status, retention_policy, deleted_at, metadata_json FROM media_assets WHERE source_asset_id = ?1 AND canonical_profile_version = ?2 AND deleted_at IS NULL";
 const TEXT_ASSET_COLUMNS_SQL: &str =
     "SELECT id, created_at, updated_at, raw_text, normalized_text, language_hint, character_count, sha256, safety_status, retention_policy, structure_json FROM text_assets WHERE id = ?1";
 const RUNTIME_JOB_COLUMNS_SQL: &str =
@@ -2489,10 +2534,12 @@ fn map_media_asset(row: &QueryResult) -> anyhow::Result<MediaAsset> {
         rms_amplitude: row
             .try_get_by_index::<Option<f64>>(14)?
             .map(|value| value as f32),
-        scan_status: row.try_get_by_index(15)?,
-        retention_policy: row.try_get_by_index(16)?,
-        deleted_at: opt_i64_to_u64(row.try_get_by_index(17)?)?,
-        metadata_json: parse_json_value(row.try_get_by_index::<String>(18)?, json!({})),
+        source_asset_id: row.try_get_by_index(15)?,
+        canonical_profile_version: row.try_get_by_index(16)?,
+        scan_status: row.try_get_by_index(17)?,
+        retention_policy: row.try_get_by_index(18)?,
+        deleted_at: opt_i64_to_u64(row.try_get_by_index(19)?)?,
+        metadata_json: parse_json_value(row.try_get_by_index::<String>(20)?, json!({})),
     })
 }
 
@@ -3039,6 +3086,8 @@ mod tests {
                 channel_count: Some(1),
                 peak_amplitude: Some(0.5),
                 rms_amplitude: Some(0.1),
+                source_asset_id: None,
+                canonical_profile_version: None,
                 scan_status: "passed".to_string(),
                 retention_policy: "default".to_string(),
                 metadata_json: json!({"source": "test"}),
