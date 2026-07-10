@@ -1069,6 +1069,57 @@ impl BatchRuntimeStore {
         Ok(result.rows_affected() == 1)
     }
 
+    pub async fn update_stage_progress(
+        &self,
+        lease: &StageLease,
+        progress: serde_json::Value,
+    ) -> anyhow::Result<bool> {
+        let db = self.db.connection().await?;
+        let now = current_timestamp_millis();
+        let progress_json = json_to_db_string(&progress, "{}")?;
+        let result = db
+            .execute_raw(raw::statement(
+                db,
+                r#"
+                UPDATE job_stages
+                SET progress_json = ?1, updated_at = ?2
+                WHERE id = ?3
+                  AND status IN ('running', 'postprocessing')
+                  AND worker_id = ?4
+                  AND attempt_count = ?5
+                  AND (attempt_token = ?6 OR (attempt_token IS NULL AND ?6 IS NULL))
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at > ?2
+                  AND EXISTS (
+                      SELECT 1 FROM runtime_jobs
+                      WHERE runtime_jobs.id = job_stages.job_id
+                        AND runtime_jobs.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+                  )
+                "#,
+                vec![
+                    progress_json.into(),
+                    now.into(),
+                    lease.stage_id.clone().into(),
+                    lease.worker_id.clone().into(),
+                    u32_to_i64_value(lease.attempt_count).into(),
+                    opt_string(lease.attempt_token.clone()),
+                ],
+            )?)
+            .await
+            .context("Failed to update runtime stage progress")?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn relinquish_stage_lease(
+        &self,
+        lease: &StageLease,
+        error_code: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> anyhow::Result<Option<JobStage>> {
+        self.fail_stage(lease, true, Some(error_code.into()), Some(reason.into()))
+            .await
+    }
+
     pub async fn fail_stage(
         &self,
         lease: &StageLease,
@@ -1620,7 +1671,11 @@ impl BatchRuntimeStore {
         let diagnostic_json = update.diagnostic_json;
         let details = RuntimeWorkerHeartbeatDetails {
             version: WORKER_HEARTBEAT_DETAILS_VERSION,
-            available_slots: if update.current_stage_id.is_none() { 1 } else { 0 },
+            available_slots: if update.current_stage_id.is_none() {
+                1
+            } else {
+                0
+            },
             active_lease_ids: update.current_stage_id.clone().into_iter().collect(),
             last_error: None,
             health_json: diagnostic_json.clone(),
@@ -2498,12 +2553,7 @@ fn push_claim_resource_clause(
         .iter()
         .map(|device| device.as_db_value().to_string())
         .collect::<Vec<_>>();
-    push_optional_resource_requirement(
-        sql,
-        params,
-        "s.required_device_class",
-        &device_classes,
-    );
+    push_optional_resource_requirement(sql, params, "s.required_device_class", &device_classes);
 
     match resources.memory_bytes {
         Some(memory_bytes) => {
