@@ -1,6 +1,7 @@
 //! Realtime transcription websocket endpoint for `/transcription`.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
@@ -11,13 +12,13 @@ use izwi_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tracing::{debug, info, warn};
 
 use crate::app::realtime_protocol::{
     RealtimeAudioGapAction, RealtimeClose, RealtimeCloseCode, RealtimeCloseReason,
-    RealtimeErrorCode, RealtimeEventEnvelope, RealtimeProtocol, RealtimeServerEnvelope,
-    RealtimeServerEvent, TRANSCRIPTION_REALTIME_VERSION,
+    RealtimeDeliveryClass, RealtimeErrorCode, RealtimeEventEnvelope, RealtimeProtocol,
+    RealtimeServerEnvelope, RealtimeServerEvent, TRANSCRIPTION_REALTIME_VERSION,
 };
 use crate::state::AppState;
 
@@ -57,29 +58,191 @@ const REPETITION_APPROX_MIN_PREFIX_MATCH_WORDS: usize = 2;
 
 #[derive(Clone)]
 struct OutboundTx {
-    tx: mpsc::Sender<Message>,
+    mailbox: Arc<OutboundMailbox>,
     runtime: Arc<RuntimeService>,
     label: &'static str,
 }
 
 impl OutboundTx {
-    fn new(tx: mpsc::Sender<Message>, runtime: Arc<RuntimeService>, label: &'static str) -> Self {
-        Self { tx, runtime, label }
+    fn new(runtime: Arc<RuntimeService>, label: &'static str) -> Self {
+        Self::with_capacity(runtime, label, WS_OUTBOUND_QUEUE_CAPACITY)
+    }
+
+    fn with_capacity(runtime: Arc<RuntimeService>, label: &'static str, capacity: usize) -> Self {
+        Self {
+            mailbox: Arc::new(OutboundMailbox::new(capacity)),
+            runtime,
+            label,
+        }
     }
 
     fn send(&self, message: Message) -> bool {
-        match self.tx.try_send(message) {
+        self.send_class(message, OutboundClass::Critical)
+    }
+
+    fn send_snapshot(&self, key: &'static str, message: Message) -> bool {
+        self.send_class(message, OutboundClass::Coalescible(key))
+    }
+
+    fn send_diagnostic(&self, message: Message) -> bool {
+        self.send_class(message, OutboundClass::Droppable)
+    }
+
+    fn send_class(&self, message: Message, class: OutboundClass) -> bool {
+        match self.mailbox.enqueue(OutboundItem { message, class }) {
             Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => {
+            Err(OutboundEnqueueError::Closed) => false,
+            Err(err) => {
                 self.runtime.record_transcription_stream_backpressure();
                 warn!(
-                    "{} outbound websocket queue is full; dropping message",
-                    self.label
+                    label = self.label,
+                    error = ?err,
+                    "transcription outbound delivery rejected"
                 );
                 false
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
+    }
+
+    async fn next(&self) -> Option<MailboxOutput> {
+        self.mailbox.next().await
+    }
+
+    fn close(&self) {
+        self.mailbox.close();
+    }
+
+    fn fail(&self, reason: &'static str) {
+        self.mailbox.fail(reason);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundClass {
+    Critical,
+    Coalescible(&'static str),
+    Droppable,
+}
+
+struct OutboundItem {
+    message: Message,
+    class: OutboundClass,
+}
+
+struct OutboundMailbox {
+    capacity: usize,
+    state: Mutex<OutboundMailboxState>,
+    notify: Notify,
+}
+
+#[derive(Default)]
+struct OutboundMailboxState {
+    queue: VecDeque<OutboundItem>,
+    close_reason: Option<String>,
+    closed: bool,
+}
+
+enum MailboxOutput {
+    Message(Message),
+    Close(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundEnqueueError {
+    QueueSaturated,
+    DroppedDiagnostic,
+    Closed,
+}
+
+impl OutboundMailbox {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            state: Mutex::new(OutboundMailboxState::default()),
+            notify: Notify::new(),
+        }
+    }
+
+    fn enqueue(&self, item: OutboundItem) -> Result<(), OutboundEnqueueError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state.closed {
+            return Err(OutboundEnqueueError::Closed);
+        }
+        if let OutboundClass::Coalescible(key) = item.class {
+            if let Some(existing) = state
+                .queue
+                .iter_mut()
+                .find(|queued| queued.class == OutboundClass::Coalescible(key))
+            {
+                existing.message = item.message;
+                return Ok(());
+            }
+        }
+        if state.queue.len() >= self.capacity {
+            return match item.class {
+                OutboundClass::Critical => {
+                    state.close_reason = Some("critical_outbound_queue_saturated".to_string());
+                    drop(state);
+                    self.notify.notify_one();
+                    Err(OutboundEnqueueError::QueueSaturated)
+                }
+                OutboundClass::Coalescible(_) => Err(OutboundEnqueueError::QueueSaturated),
+                OutboundClass::Droppable => Err(OutboundEnqueueError::DroppedDiagnostic),
+            };
+        }
+        state.queue.push_back(item);
+        drop(state);
+        self.notify.notify_one();
+        Ok(())
+    }
+
+    async fn next(&self) -> Option<MailboxOutput> {
+        loop {
+            let notified = self.notify.notified();
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                if let Some(reason) = state.close_reason.take() {
+                    state.queue.clear();
+                    state.closed = true;
+                    return Some(MailboxOutput::Close(reason));
+                }
+                if let Some(item) = state.queue.pop_front() {
+                    return Some(MailboxOutput::Message(item.message));
+                }
+                if state.closed {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.closed = true;
+        drop(state);
+        self.notify.notify_waiters();
+    }
+
+    fn fail(&self, reason: &'static str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if !state.closed {
+            state.close_reason = Some(reason.to_string());
+        }
+        drop(state);
+        self.notify.notify_one();
     }
 }
 
@@ -196,9 +359,24 @@ impl TypedTranscriptionSession {
     }
 
     fn send(&mut self, out_tx: &OutboundTx, event: RealtimeServerEvent) -> bool {
+        let delivery_class = match event.delivery_class() {
+            RealtimeDeliveryClass::Critical
+            | RealtimeDeliveryClass::LosslessStream
+            | RealtimeDeliveryClass::CoalescibleSnapshot => {
+                // Typed envelopes carry a strict contiguous sequence. Until sequence assignment
+                // moves to mailbox dequeue, replacing an already-numbered snapshot would create
+                // a client-visible gap, so saturation closes explicitly instead of coalescing.
+                OutboundClass::Critical
+            }
+            RealtimeDeliveryClass::Droppable => {
+                // Dropping an already-numbered typed diagnostic would also violate the envelope
+                // successor contract. Close explicitly at saturation for the v3 adapter.
+                OutboundClass::Critical
+            }
+        };
         let envelope = self.next_envelope(event);
         match serde_json::to_string(&envelope) {
-            Ok(text) => out_tx.send(Message::Text(text.into())),
+            Ok(text) => out_tx.send_class(Message::Text(text.into()), delivery_class),
             Err(err) => {
                 warn!("failed to serialize typed transcription event: {err}");
                 false
@@ -370,16 +548,25 @@ pub async fn handle_socket(mut socket: WebSocket, state: AppState, correlation_i
     };
 
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let (raw_out_tx, mut out_rx) = mpsc::channel::<Message>(WS_OUTBOUND_QUEUE_CAPACITY);
-    let out_tx = OutboundTx::new(raw_out_tx, state.runtime.clone(), "transcription realtime");
+    let out_tx = OutboundTx::new(state.runtime.clone(), "transcription realtime");
     let (worker_tx, worker_rx) = mpsc::channel::<WorkerCommand>(WORKER_COMMAND_QUEUE_CAPACITY);
 
+    let writer_tx = out_tx.clone();
     let writer = tokio::spawn(async move {
-        while let Some(message) = out_rx.recv().await {
+        while let Some(output) = writer_tx.next().await {
+            let message = match output {
+                MailboxOutput::Message(message) => message,
+                MailboxOutput::Close(reason) => Message::Close(Some(CloseFrame {
+                    code: 1011,
+                    reason: reason.into(),
+                })),
+            };
+            let terminal = matches!(message, Message::Close(_));
             if !matches!(
                 tokio::time::timeout(WS_WRITER_SEND_TIMEOUT, ws_tx.send(message)).await,
                 Ok(Ok(()))
-            ) {
+            ) || terminal
+            {
                 break;
             }
         }
@@ -430,15 +617,28 @@ pub async fn handle_socket(mut socket: WebSocket, state: AppState, correlation_i
                             payload,
                         },
                     ) {
+                        send_json(
+                            &out_tx,
+                            json!({
+                                "type": "error",
+                                "code": "input_command_queue_saturated",
+                                "message": "Realtime transcription input queue is saturated",
+                                "fatal": true,
+                            }),
+                        );
+                        out_tx.fail("input_command_queue_saturated");
                         break;
                     }
                 }
                 Err(err) => {
-                    let _ = send_worker_command(&worker_tx, WorkerCommand::ProtocolError(err));
+                    if !send_worker_command(&worker_tx, WorkerCommand::ProtocolError(err)) {
+                        out_tx.fail("input_command_queue_saturated");
+                        break;
+                    }
                 }
             },
             Message::Ping(payload) => {
-                let _ = out_tx.send(Message::Pong(payload));
+                let _ = out_tx.send_diagnostic(Message::Pong(payload));
             }
             Message::Close(_) => break,
             Message::Pong(_) => {}
@@ -446,9 +646,14 @@ pub async fn handle_socket(mut socket: WebSocket, state: AppState, correlation_i
     }
 
     let _ = send_worker_command(&worker_tx, WorkerCommand::Shutdown);
+    drop(worker_tx);
     let _ = worker.await;
 
-    drop(out_tx);
+    let _ = out_tx.send(Message::Close(Some(CloseFrame {
+        code: 1000,
+        reason: "transcription_session_complete".into(),
+    })));
+    out_tx.close();
     let _ = writer.await;
 }
 
@@ -498,12 +703,24 @@ fn handle_text_message(
                     wire_protocol,
                 },
             ) {
+                send_json(
+                    out_tx,
+                    json!({
+                        "type": "error",
+                        "code": "input_command_queue_saturated",
+                        "message": "Realtime transcription input queue is saturated",
+                        "fatal": true,
+                    }),
+                );
+                out_tx.fail("input_command_queue_saturated");
                 return true;
             }
             false
         }
         ClientEvent::SessionStop => {
-            let _ = send_worker_command(worker_tx, WorkerCommand::SessionStop);
+            if !send_worker_command(worker_tx, WorkerCommand::SessionStop) {
+                out_tx.fail("input_command_queue_saturated");
+            }
             true
         }
         ClientEvent::Ping { timestamp_ms } => {
@@ -815,7 +1032,7 @@ fn send_session_pong(
 ) {
     match session.wire_protocol {
         TranscriptionWireProtocol::LegacyV2 => {
-            send_json(
+            send_json_diagnostic(
                 out_tx,
                 json!({ "type": "pong", "timestamp_ms": timestamp_ms }),
             );
@@ -886,8 +1103,9 @@ fn send_transcript_partial(
     stable_prefix_chars: usize,
 ) {
     match session.wire_protocol {
-        TranscriptionWireProtocol::LegacyV2 => send_json(
+        TranscriptionWireProtocol::LegacyV2 => send_json_snapshot(
             out_tx,
+            "legacy_transcript",
             json!({
                 "type": "transcript_partial",
                 "sequence": sequence,
@@ -941,9 +1159,8 @@ fn send_native_transcript(
     is_final: bool,
 ) {
     match session.wire_protocol {
-        TranscriptionWireProtocol::LegacyV2 => send_json(
-            out_tx,
-            json!({
+        TranscriptionWireProtocol::LegacyV2 => {
+            let payload = json!({
                 "type": "transcript_partial",
                 "sequence": sequence,
                 "text": text,
@@ -953,8 +1170,13 @@ fn send_native_transcript(
                 "rtf": rtf,
                 "native_stream": true,
                 "is_final": is_final,
-            }),
-        ),
+            });
+            if is_final {
+                send_json(out_tx, payload);
+            } else {
+                send_json_snapshot(out_tx, "legacy_transcript", payload);
+            }
+        }
         TranscriptionWireProtocol::TypedV3 => {
             let Some(typed) = session.typed_session.as_mut() else {
                 return;
@@ -1860,6 +2082,14 @@ fn send_json(tx: &OutboundTx, value: serde_json::Value) {
     let _ = tx.send(Message::Text(value.to_string().into()));
 }
 
+fn send_json_snapshot(tx: &OutboundTx, key: &'static str, value: serde_json::Value) {
+    let _ = tx.send_snapshot(key, Message::Text(value.to_string().into()));
+}
+
+fn send_json_diagnostic(tx: &OutboundTx, value: serde_json::Value) {
+    let _ = tx.send_diagnostic(Message::Text(value.to_string().into()));
+}
+
 fn now_unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1882,14 +2112,10 @@ fn send_worker_command(tx: &mpsc::Sender<WorkerCommand>, command: WorkerCommand)
 mod tests {
     use std::sync::Arc;
 
-    use axum::extract::ws::Message;
-    use izwi_core::{EngineConfig, RuntimeService};
-    use tokio::sync::mpsc;
-
     use super::{
         collapse_unstable_repetition, ingest_audio_frame, merge_online_transcript,
         negotiate_transcription_protocol, pcm16_i16_to_f32, send_session_finished,
-        strip_suffix_prefix_overlap_with_lookahead_by_words, OutboundTx,
+        strip_suffix_prefix_overlap_with_lookahead_by_words, MailboxOutput, OutboundTx,
         RealtimeInferenceDiagnostics, RealtimeSessionState, TranscriptionWireProtocol,
         TypedTranscriptionSession,
     };
@@ -1897,6 +2123,8 @@ mod tests {
         RealtimeEventFinality, RealtimeServerEnvelope, RealtimeServerEvent,
         TRANSCRIPTION_REALTIME_VERSION,
     };
+    use axum::extract::ws::Message;
+    use izwi_core::{EngineConfig, RuntimeService};
 
     #[test]
     fn realtime_protocol_negotiation_defaults_to_legacy_and_requires_explicit_v3() {
@@ -1949,11 +2177,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn typed_session_finish_emits_final_then_closing_then_closed() {
+    #[tokio::test]
+    async fn typed_session_finish_emits_final_then_closing_then_closed() {
         let runtime = Arc::new(RuntimeService::new(EngineConfig::default()).expect("runtime"));
-        let (tx, mut rx) = mpsc::channel(8);
-        let outbound = OutboundTx::new(tx, runtime, "transcription test");
+        let outbound = OutboundTx::with_capacity(runtime, "transcription test", 8);
         let mut session = RealtimeSessionState {
             started: true,
             wire_protocol: TranscriptionWireProtocol::TypedV3,
@@ -1967,15 +2194,16 @@ mod tests {
 
         send_session_finished(&outbound, &mut session);
 
-        let events = (0..3)
-            .map(|_| {
-                let Message::Text(text) = rx.try_recv().expect("typed terminal event") else {
-                    panic!("expected a text event");
-                };
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            let Some(MailboxOutput::Message(Message::Text(text))) = outbound.next().await else {
+                panic!("expected a text event");
+            };
+            events.push(
                 serde_json::from_str::<RealtimeServerEnvelope>(text.as_str())
-                    .expect("typed event envelope")
-            })
-            .collect::<Vec<_>>();
+                    .expect("typed event envelope"),
+            );
+        }
 
         assert!(matches!(
             &events[0].event,
@@ -2002,17 +2230,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outbound_tx_drops_full_queue_and_records_backpressure() {
+    async fn outbound_tx_closes_explicitly_when_a_critical_event_cannot_queue() {
         let runtime = Arc::new(RuntimeService::new(EngineConfig::default()).expect("runtime"));
         let before = runtime
             .telemetry_snapshot()
             .await
             .realtime
             .transcription_stream_backpressure_total;
-        let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(Message::Text("occupied".into()))
-            .expect("queue should accept first message");
-        let outbound = OutboundTx::new(tx, runtime.clone(), "transcription test");
+        let outbound = OutboundTx::with_capacity(runtime.clone(), "transcription test", 1);
+        assert!(outbound.send(Message::Text("occupied".into())));
 
         assert!(!outbound.send(Message::Text("dropped".into())));
 
@@ -2022,11 +2248,26 @@ mod tests {
             .realtime
             .transcription_stream_backpressure_total;
         assert_eq!(after, before + 1);
-        assert!(rx.try_recv().is_ok());
         assert!(matches!(
-            rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
+            outbound.next().await,
+            Some(MailboxOutput::Close(reason)) if reason == "critical_outbound_queue_saturated"
         ));
+    }
+
+    #[tokio::test]
+    async fn outbound_tx_coalesces_replaceable_transcript_snapshots() {
+        let runtime = Arc::new(RuntimeService::new(EngineConfig::default()).expect("runtime"));
+        let outbound = OutboundTx::with_capacity(runtime, "transcription test", 1);
+
+        assert!(outbound.send_snapshot("transcript", Message::Text("first hypothesis".into())));
+        assert!(
+            outbound.send_snapshot("transcript", Message::Text("replacement hypothesis".into()))
+        );
+
+        let Some(MailboxOutput::Message(Message::Text(text))) = outbound.next().await else {
+            panic!("expected coalesced text snapshot");
+        };
+        assert_eq!(text.as_str(), "replacement hypothesis");
     }
 
     #[test]
