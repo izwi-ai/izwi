@@ -141,7 +141,6 @@ pub struct StoredSpeechAudio {
     pub audio_bytes: Vec<u8>,
     pub audio_mime_type: String,
     pub audio_filename: Option<String>,
-    pub audio_storage_path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -318,7 +317,6 @@ impl SpeechHistoryStore {
             audio_bytes: audio.bytes,
             audio_mime_type,
             audio_filename,
-            audio_storage_path,
         }))
     }
 
@@ -1400,12 +1398,20 @@ mod tests {
             .expect("record completion should succeed")
             .expect("record should exist");
 
+        let db = store.db.connection().await.expect("database should open");
+        let persisted_path =
+            fetch_audio_storage_path(db, SpeechRouteKind::TextToSpeech, pending.id.as_str())
+                .await
+                .expect("storage path lookup should succeed")
+                .expect("record should exist")
+                .expect("storage path should exist");
+        assert_eq!(persisted_path, storage_path);
+
         let stored = store
             .get_audio(SpeechRouteKind::TextToSpeech, pending.id)
             .await
             .expect("stored audio should load")
             .expect("stored audio should exist");
-        assert_eq!(stored.audio_storage_path, storage_path);
         assert_eq!(stored.audio_bytes, audio_bytes);
 
         clear_env();

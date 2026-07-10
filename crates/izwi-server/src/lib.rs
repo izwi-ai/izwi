@@ -10,6 +10,7 @@ use tracing::{info, warn};
 
 mod api;
 mod app;
+pub use app::realtime_protocol;
 pub mod batch_runtime;
 mod chat_store;
 mod db;
