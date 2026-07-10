@@ -1,10 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tracing::{info, warn};
+use tracing::info;
 
-use crate::error::Result;
-use crate::model::ModelStatus;
+use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::runtime::service::RuntimeService;
 
@@ -16,12 +15,12 @@ fn now_unix_millis() -> u64 {
 }
 
 fn select_lru_eviction_candidate(
-    loaded_variants: &[ModelVariant],
+    resident_variants: &[ModelVariant],
     requested_variant: ModelVariant,
     active_variants: &HashSet<ModelVariant>,
     last_used: &HashMap<ModelVariant, u64>,
 ) -> Option<ModelVariant> {
-    loaded_variants
+    resident_variants
         .iter()
         .copied()
         .filter(|variant| *variant != requested_variant && !active_variants.contains(variant))
@@ -35,6 +34,14 @@ fn select_lru_eviction_candidate(
         })
 }
 
+fn residency_budget_has_capacity(
+    resident_variants: &[ModelVariant],
+    requested_variant: ModelVariant,
+    max_loaded_models: usize,
+) -> bool {
+    resident_variants.contains(&requested_variant) || resident_variants.len() < max_loaded_models
+}
+
 impl RuntimeService {
     pub(super) async fn touch_model_usage(&self, variant: ModelVariant) {
         let mut last_used = self.model_last_used.lock().await;
@@ -46,63 +53,71 @@ impl RuntimeService {
         last_used.remove(&variant);
     }
 
-    async fn evict_idle_model_for_budget(&self, requested_variant: ModelVariant) -> Result<()> {
+    async fn ensure_model_budget_before_load(&self, requested_variant: ModelVariant) -> Result<()> {
         let Some(max_loaded_models) = self.max_loaded_models else {
             return Ok(());
         };
 
-        let loaded_variants = self
-            .model_manager
-            .list_models()
-            .await
-            .into_iter()
-            .filter(|info| matches!(info.status, ModelStatus::Ready))
-            .map(|info| info.variant)
-            .collect::<Vec<_>>();
-        if loaded_variants.len() <= max_loaded_models {
-            return Ok(());
+        loop {
+            let resident_variants = self.model_manager.resident_variants().await;
+            if residency_budget_has_capacity(
+                &resident_variants,
+                requested_variant,
+                max_loaded_models,
+            ) {
+                return Ok(());
+            }
+
+            let mut active_variants = self.core_engine.active_model_variants().await;
+            active_variants.extend(
+                resident_variants
+                    .iter()
+                    .copied()
+                    .filter(|variant| self.active_model_residency_leases(*variant) > 0),
+            );
+            let mut ready_variants = Vec::with_capacity(resident_variants.len());
+            for variant in &resident_variants {
+                if self.model_manager.is_ready(*variant).await {
+                    ready_variants.push(*variant);
+                }
+            }
+            let last_used = self.model_last_used.lock().await.clone();
+            let Some(victim) = select_lru_eviction_candidate(
+                &ready_variants,
+                requested_variant,
+                &active_variants,
+                &last_used,
+            ) else {
+                return Err(Error::ModelLoadError(format!(
+                    "Cannot load {requested_variant}: the {max_loaded_models}-model residency budget is full and no resident model is idle and ready for eviction"
+                )));
+            };
+
+            info!(
+                requested_variant = %requested_variant,
+                victim = %victim,
+                max_loaded_models,
+                "Evicting idle model before loading its replacement"
+            );
+            self.unload_model(victim).await?;
         }
-
-        let mut active_variants = self.core_engine.active_model_variants().await;
-        active_variants.extend(
-            loaded_variants
-                .iter()
-                .copied()
-                .filter(|variant| self.active_model_residency_leases(*variant) > 0),
-        );
-        let last_used = self.model_last_used.lock().await.clone();
-        let Some(victim) = select_lru_eviction_candidate(
-            &loaded_variants,
-            requested_variant,
-            &active_variants,
-            &last_used,
-        ) else {
-            return Ok(());
-        };
-
-        info!(
-            requested_variant = %requested_variant,
-            victim = %victim,
-            max_loaded_models,
-            "Evicting idle model to honor residency budget"
-        );
-        self.unload_model(victim).await
     }
 
     /// Load a model for inference.
     pub async fn load_model(&self, variant: ModelVariant) -> Result<()> {
         let resolved = self.resolve_model_load(variant).await?;
         let acquired = self.acquire_model_artifacts(resolved).await?;
+
+        let _load_guard = self.model_load_lock.lock().await;
+        if self.model_manager.is_ready(variant).await {
+            self.touch_model_usage(variant).await;
+            return Ok(());
+        }
+
+        self.ensure_model_budget_before_load(variant).await?;
         let instantiated = self.instantiate_model(acquired).await?;
         self.publish_loaded_model(instantiated).await?;
         self.touch_model_usage(variant).await;
-
-        if let Err(err) = self.evict_idle_model_for_budget(variant).await {
-            warn!(
-                current_variant = %variant,
-                "Model residency budget eviction failed: {err}"
-            );
-        }
 
         Ok(())
     }
@@ -110,13 +125,17 @@ impl RuntimeService {
 
 #[cfg(test)]
 mod tests {
-    use super::select_lru_eviction_candidate;
+    use super::{residency_budget_has_capacity, select_lru_eviction_candidate};
+    use crate::backends::BackendPreference;
+    use crate::config::EngineConfig;
     use crate::model::ModelVariant;
+    use crate::runtime::service::RuntimeService;
     use std::collections::{HashMap, HashSet};
+    use uuid::Uuid;
 
     #[test]
     fn select_lru_eviction_candidate_skips_requested_and_active_models() {
-        let loaded_variants = vec![
+        let resident_variants = vec![
             ModelVariant::Qwen3Tts12Hz06BCustomVoice,
             ModelVariant::Qwen38BGguf,
             ModelVariant::Kokoro82M,
@@ -130,12 +149,59 @@ mod tests {
         ]);
 
         let candidate = select_lru_eviction_candidate(
-            &loaded_variants,
+            &resident_variants,
             requested_variant,
             &active_variants,
             &last_used,
         );
 
         assert_eq!(candidate, Some(ModelVariant::Qwen3Tts12Hz06BCustomVoice));
+    }
+
+    #[test]
+    fn residency_budget_requires_space_before_loading_a_replacement() {
+        let resident_variants = vec![ModelVariant::Kokoro82M];
+
+        assert!(!residency_budget_has_capacity(
+            &resident_variants,
+            ModelVariant::Qwen38BGguf,
+            1,
+        ));
+        assert!(residency_budget_has_capacity(
+            &resident_variants,
+            ModelVariant::Kokoro82M,
+            1,
+        ));
+        assert!(residency_budget_has_capacity(
+            &resident_variants,
+            ModelVariant::Qwen38BGguf,
+            2,
+        ));
+    }
+
+    #[tokio::test]
+    async fn residency_budget_evicts_granite_before_loading_another_asr_model() {
+        let models_dir =
+            std::env::temp_dir().join(format!("izwi-runtime-residency-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let mut runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        runtime.max_loaded_models = Some(1);
+        runtime
+            .model_manager
+            .mark_loaded(ModelVariant::GraniteSpeech412BPlus)
+            .await;
+
+        runtime
+            .ensure_model_budget_before_load(ModelVariant::WhisperLargeV3Turbo)
+            .await
+            .unwrap();
+
+        assert!(runtime.model_manager.resident_variants().await.is_empty());
+        std::fs::remove_dir_all(models_dir).unwrap();
     }
 }

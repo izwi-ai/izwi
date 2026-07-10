@@ -579,6 +579,29 @@ fn granite_f16_attention_output_policy(
     override_enabled.unwrap_or(is_metal && dtype == DType::F32)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GraniteTextExecutionPlan {
+    selective_f16_lm_head: bool,
+    selective_f16_qkv: bool,
+    f16_attention_core: bool,
+    selective_f16_mlp: bool,
+    selective_f16_attention_output: bool,
+}
+
+impl GraniteTextExecutionPlan {
+    fn for_device(device: &Device, dtype: DType) -> Self {
+        let selective_f16_qkv = granite_f16_qkv_enabled(device, dtype);
+        Self {
+            selective_f16_lm_head: granite_f16_lm_head_enabled(device, dtype),
+            selective_f16_qkv,
+            f16_attention_core: selective_f16_qkv
+                && granite_f16_attention_core_enabled(device, dtype),
+            selective_f16_mlp: granite_f16_mlp_enabled(device, dtype),
+            selective_f16_attention_output: granite_f16_attention_output_enabled(device, dtype),
+        }
+    }
+}
+
 fn parse_env_bool(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -602,6 +625,8 @@ impl GraniteSpeechRuntime {
         device: &DeviceProfile,
         dtype: DType,
     ) -> Result<Self> {
+        let load_started = Instant::now();
+        let mmap_started = Instant::now();
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(shard_paths, dtype, &device.device).map_err(
                 |err| {
@@ -611,9 +636,40 @@ impl GraniteSpeechRuntime {
                 },
             )?
         };
+        let mmap_elapsed = mmap_started.elapsed();
+
+        let encoder_started = Instant::now();
         let encoder = GraniteSpeechEncoder::load(&config.encoder_config, vb.pp("encoder"))?;
+        let encoder_elapsed = encoder_started.elapsed();
+
+        let projector_started = Instant::now();
         let projector = GraniteSpeechProjector::load(config, vb.pp("projector"))?;
+        let projector_elapsed = projector_started.elapsed();
+
+        let language_model_started = Instant::now();
         let text_model = GraniteLanguageModel::load(&config.text_config, vb.pp("language_model"))?;
+        let language_model_elapsed = language_model_started.elapsed();
+
+        // Model construction has consumed the VarBuilder, so release the source
+        // mappings before waiting for queued device uploads, casts, and fusions.
+        drop(vb);
+        let synchronize_started = Instant::now();
+        synchronize_granite_load(&device.device)?;
+        let synchronize_elapsed = synchronize_started.elapsed();
+        let total_elapsed = load_started.elapsed();
+
+        tracing::info!(
+            shard_count = shard_paths.len(),
+            dtype = ?dtype,
+            mmap_host_ms = mmap_elapsed.as_secs_f64() * 1_000.0,
+            encoder_enqueue_ms = encoder_elapsed.as_secs_f64() * 1_000.0,
+            projector_enqueue_ms = projector_elapsed.as_secs_f64() * 1_000.0,
+            language_model_enqueue_ms = language_model_elapsed.as_secs_f64() * 1_000.0,
+            device_sync_ms = synchronize_elapsed.as_secs_f64() * 1_000.0,
+            total_ms = total_elapsed.as_secs_f64() * 1_000.0,
+            "Granite Speech checkpoint materialization completed"
+        );
+
         Ok(Self {
             device: device.device.clone(),
             dtype,
@@ -955,6 +1011,14 @@ impl GraniteSpeechRuntime {
             },
         })
     }
+}
+
+fn synchronize_granite_load(device: &Device) -> Result<()> {
+    device.synchronize().map_err(|err| {
+        Error::ModelLoadError(format!(
+            "Failed to synchronize Granite Speech checkpoint materialization: {err}"
+        ))
+    })
 }
 
 fn expand_audio_tokens(
@@ -1772,14 +1836,23 @@ struct GraniteLanguageModel {
     layers: Vec<GraniteDecoderLayer>,
     norm: RmsNorm,
     lm_head: GraniteLinearNoBias,
-    lm_head_f16: Option<GraniteLinearNoBias>,
     cfg: GraniteTextConfig,
     device: Device,
     residual_branches_prescaled: bool,
+    execution_plan: GraniteTextExecutionPlan,
 }
 
 impl GraniteLanguageModel {
     fn load(config: &GraniteTextConfig, vb: VarBuilder) -> Result<Self> {
+        let execution_plan = GraniteTextExecutionPlan::for_device(vb.device(), vb.dtype());
+        Self::load_with_execution_plan(config, vb, execution_plan)
+    }
+
+    fn load_with_execution_plan(
+        config: &GraniteTextConfig,
+        vb: VarBuilder,
+        execution_plan: GraniteTextExecutionPlan,
+    ) -> Result<Self> {
         let embed_tokens = embedding(
             config.vocab_size,
             config.hidden_size,
@@ -1792,33 +1865,40 @@ impl GraniteLanguageModel {
                 config,
                 vb.pp(format!("model.layers.{idx}")),
                 residual_branches_prescaled,
+                execution_plan,
             )?);
         }
         let norm =
             candle_nn::rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("model.norm"))?;
         let lm_head = if config.tie_word_embeddings {
-            Linear::new(embed_tokens.embeddings().clone(), None)
+            let weight = if execution_plan.selective_f16_lm_head {
+                embed_tokens.embeddings().to_dtype(DType::F16)?
+            } else {
+                embed_tokens.embeddings().clone()
+            };
+            Linear::new(weight, None)
         } else {
-            linear_no_bias(config.hidden_size, config.vocab_size, vb.pp("lm_head"))?
+            let lm_head_vb = if execution_plan.selective_f16_lm_head {
+                vb.to_dtype(DType::F16)
+            } else {
+                vb.clone()
+            };
+            linear_no_bias(
+                config.hidden_size,
+                config.vocab_size,
+                lm_head_vb.pp("lm_head"),
+            )?
         };
         let lm_head = GraniteLinearNoBias::new(lm_head)?;
-        let lm_head_f16 =
-            if granite_f16_lm_head_enabled(vb.device(), embed_tokens.embeddings().dtype()) {
-                Some(GraniteLinearNoBias::from_weight(
-                    lm_head.weight().to_dtype(DType::F16)?,
-                )?)
-            } else {
-                None
-            };
         Ok(Self {
             embed_tokens,
             layers,
             norm,
             lm_head,
-            lm_head_f16,
             cfg: config.clone(),
             device: vb.device().clone(),
             residual_branches_prescaled,
+            execution_plan,
         })
     }
 
@@ -1831,35 +1911,23 @@ impl GraniteLanguageModel {
     }
 
     fn f16_lm_head(&self) -> bool {
-        self.lm_head_f16.is_some()
+        self.execution_plan.selective_f16_lm_head
     }
 
     fn f16_qkv(&self) -> bool {
-        self.layers
-            .first()
-            .map(|layer| layer.f16_qkv())
-            .unwrap_or(false)
+        self.execution_plan.selective_f16_qkv
     }
 
     fn f16_attention_core(&self) -> bool {
-        self.layers
-            .first()
-            .map(|layer| layer.f16_attention_core())
-            .unwrap_or(false)
+        self.execution_plan.f16_attention_core
     }
 
     fn f16_mlp(&self) -> bool {
-        self.layers
-            .first()
-            .map(|layer| layer.f16_mlp())
-            .unwrap_or(false)
+        self.execution_plan.selective_f16_mlp
     }
 
     fn f16_attention_output(&self) -> bool {
-        self.layers
-            .first()
-            .map(|layer| layer.f16_attention_output())
-            .unwrap_or(false)
+        self.execution_plan.selective_f16_attention_output
     }
 
     fn qkv_projection_fused(&self) -> bool {
@@ -2047,7 +2115,7 @@ impl GraniteLanguageModel {
         }
         let hidden = last_hidden_for_logits(&hidden)?;
         let lm_head_start = profile_start(profiling);
-        let use_f16_lm_head = self.lm_head_f16.is_some();
+        let use_f16_lm_head = self.execution_plan.selective_f16_lm_head;
         if let Some(profile) = profile.as_deref_mut() {
             if use_f16_lm_head {
                 profile.profile.forward.lm_head_f16_calls += 1;
@@ -2055,10 +2123,11 @@ impl GraniteLanguageModel {
                 profile.profile.forward.lm_head_f32_calls += 1;
             }
         }
-        let logits = if let Some(lm_head_f16) = self.lm_head_f16.as_ref() {
-            lm_head_f16.forward(&hidden.to_dtype(DType::F16)?)?
-        } else {
+        let logits = if hidden.dtype() == self.lm_head.weight().dtype() {
             self.lm_head.forward(&hidden)?
+        } else {
+            self.lm_head
+                .forward(&hidden.to_dtype(self.lm_head.weight().dtype())?)?
         };
         if let Some(profile) = profile.as_deref_mut() {
             profile.profile.forward.lm_head += profile_elapsed(lm_head_start);
@@ -2087,6 +2156,7 @@ impl GraniteDecoderLayer {
         config: &GraniteTextConfig,
         vb: VarBuilder,
         residual_branches_prescaled: bool,
+        execution_plan: GraniteTextExecutionPlan,
     ) -> Result<Self> {
         Ok(Self {
             input_layernorm: candle_nn::rms_norm(
@@ -2098,13 +2168,19 @@ impl GraniteDecoderLayer {
                 config,
                 vb.pp("self_attn"),
                 residual_branches_prescaled,
+                execution_plan,
             )?,
             post_attention_layernorm: candle_nn::rms_norm(
                 config.hidden_size,
                 config.rms_norm_eps,
                 vb.pp("post_attention_layernorm"),
             )?,
-            mlp: GraniteTextMlp::load(config, vb.pp("mlp"), residual_branches_prescaled)?,
+            mlp: GraniteTextMlp::load(
+                config,
+                vb.pp("mlp"),
+                residual_branches_prescaled,
+                execution_plan,
+            )?,
             residual_multiplier: config.residual_multiplier,
             residual_branches_prescaled,
         })
@@ -2180,22 +2256,6 @@ impl GraniteDecoderLayer {
     fn gate_up_projection_fused(&self) -> bool {
         self.mlp.gate_up_projection_fused()
     }
-
-    fn f16_qkv(&self) -> bool {
-        self.self_attn.f16_qkv()
-    }
-
-    fn f16_attention_core(&self) -> bool {
-        self.self_attn.f16_attention_core()
-    }
-
-    fn f16_mlp(&self) -> bool {
-        self.mlp.f16_mlp()
-    }
-
-    fn f16_attention_output(&self) -> bool {
-        self.self_attn.f16_attention_output()
-    }
 }
 
 struct GraniteTextFusedQkvProjection {
@@ -2235,15 +2295,6 @@ impl GraniteTextFusedQkvProjection {
         let k = qkv.narrow(last_dim, self.q_out, self.k_out)?;
         let v = qkv.narrow(last_dim, self.q_out + self.k_out, self.v_out)?;
         Ok((q, k, v))
-    }
-
-    fn to_dtype(&self, dtype: DType) -> Result<Self> {
-        Ok(Self {
-            fused: GraniteLinearNoBias::from_weight(self.fused.weight().to_dtype(dtype)?)?,
-            q_out: self.q_out,
-            k_out: self.k_out,
-            v_out: self.v_out,
-        })
     }
 }
 
@@ -2300,47 +2351,26 @@ impl GraniteTextQkvProjectionParts {
     fn is_fused(&self) -> bool {
         matches!(self, Self::Fused(_))
     }
-
-    fn to_dtype(&self, dtype: DType) -> Result<Self> {
-        match self {
-            Self::Fused(fused) => fused.to_dtype(dtype).map(Self::Fused),
-            Self::Separate {
-                q_proj,
-                k_proj,
-                v_proj,
-            } => Ok(Self::Separate {
-                q_proj: Linear::new(q_proj.weight().to_dtype(dtype)?, None),
-                k_proj: Linear::new(k_proj.weight().to_dtype(dtype)?, None),
-                v_proj: Linear::new(v_proj.weight().to_dtype(dtype)?, None),
-            }),
-        }
-    }
 }
 
 struct GraniteTextQkvProjection {
     projection: GraniteTextQkvProjectionParts,
-    f16_projection: Option<GraniteTextQkvProjectionParts>,
 }
 
 impl GraniteTextQkvProjection {
-    fn load(config: &GraniteTextConfig, head_dim: usize, vb: VarBuilder) -> Result<Self> {
-        let projection = GraniteTextQkvProjectionParts::load(config, head_dim, vb.clone())?;
-        let f16_projection = if granite_f16_qkv_enabled(vb.device(), projection.weight_dtype()?) {
-            Some(projection.to_dtype(DType::F16)?)
+    fn load(
+        config: &GraniteTextConfig,
+        head_dim: usize,
+        vb: VarBuilder,
+        selective_f16: bool,
+    ) -> Result<Self> {
+        let projection_vb = if selective_f16 {
+            vb.to_dtype(DType::F16)
         } else {
-            None
+            vb
         };
-        Ok(Self {
-            projection,
-            f16_projection,
-        })
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
-        if let Some(f16_projection) = self.f16_projection.as_ref() {
-            return self.forward_to_dtype_with_projection(x, x.dtype(), f16_projection);
-        }
-        self.projection.forward(x)
+        let projection = GraniteTextQkvProjectionParts::load(config, head_dim, projection_vb)?;
+        Ok(Self { projection })
     }
 
     fn forward_to_dtype(
@@ -2348,29 +2378,18 @@ impl GraniteTextQkvProjection {
         x: &Tensor,
         output_dtype: DType,
     ) -> Result<(Tensor, Tensor, Tensor)> {
-        if let Some(f16_projection) = self.f16_projection.as_ref() {
-            return self.forward_to_dtype_with_projection(x, output_dtype, f16_projection);
-        }
-        let qkv = self.projection.forward(x)?;
-        cast_qkv_dtype(qkv, output_dtype)
-    }
-
-    fn forward_to_dtype_with_projection(
-        &self,
-        x: &Tensor,
-        output_dtype: DType,
-        projection: &GraniteTextQkvProjectionParts,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
-        let (q, k, v) = projection.forward(&x.to_dtype(DType::F16)?)?;
+        let execution_dtype = self.projection.weight_dtype()?;
+        let projected = if x.dtype() == execution_dtype {
+            self.projection.forward(x)?
+        } else {
+            self.projection.forward(&x.to_dtype(execution_dtype)?)?
+        };
+        let (q, k, v) = projected;
         cast_qkv_dtype((q, k, v), output_dtype)
     }
 
     fn is_fused(&self) -> bool {
         self.projection.is_fused()
-    }
-
-    fn f16_qkv(&self) -> bool {
-        self.f16_projection.is_some()
     }
 }
 
@@ -2405,7 +2424,6 @@ fn granite_rms_norm_forward(norm: &RmsNorm, x: &Tensor) -> Result<Tensor> {
 struct GraniteTextAttention {
     qkv_proj: GraniteTextQkvProjection,
     o_proj: GraniteLinearNoBias,
-    o_proj_f16: Option<GraniteLinearNoBias>,
     f16_attention_core: bool,
     num_heads: usize,
     num_kv_heads: usize,
@@ -2415,7 +2433,12 @@ struct GraniteTextAttention {
 }
 
 impl GraniteTextAttention {
-    fn load(config: &GraniteTextConfig, vb: VarBuilder, prescale_residual: bool) -> Result<Self> {
+    fn load(
+        config: &GraniteTextConfig,
+        vb: VarBuilder,
+        prescale_residual: bool,
+        execution_plan: GraniteTextExecutionPlan,
+    ) -> Result<Self> {
         let head_dim = config.hidden_size / config.num_attention_heads;
         let o_proj = linear_no_bias(
             config.num_attention_heads * head_dim,
@@ -2424,23 +2447,18 @@ impl GraniteTextAttention {
         )?;
         let o_proj =
             maybe_prescale_residual_linear(o_proj, config.residual_multiplier, prescale_residual)?;
+        let o_proj = if execution_plan.selective_f16_attention_output {
+            Linear::new(o_proj.weight().to_dtype(DType::F16)?, None)
+        } else {
+            o_proj
+        };
         let o_proj = GraniteLinearNoBias::new(o_proj)?;
-        let qkv_proj = GraniteTextQkvProjection::load(config, head_dim, vb.clone())?;
-        let o_proj_f16 =
-            if granite_f16_attention_output_enabled(vb.device(), o_proj.weight().dtype()) {
-                Some(GraniteLinearNoBias::from_weight(
-                    o_proj.weight().to_dtype(DType::F16)?,
-                )?)
-            } else {
-                None
-            };
-        let f16_attention_core = qkv_proj.f16_qkv()
-            && granite_f16_attention_core_enabled(vb.device(), o_proj.weight().dtype());
+        let qkv_proj =
+            GraniteTextQkvProjection::load(config, head_dim, vb, execution_plan.selective_f16_qkv)?;
         Ok(Self {
             qkv_proj,
             o_proj,
-            o_proj_f16,
-            f16_attention_core,
+            f16_attention_core: execution_plan.f16_attention_core,
             num_heads: config.num_attention_heads,
             num_kv_heads: config.num_key_value_heads,
             head_dim,
@@ -2644,22 +2662,8 @@ impl GraniteTextAttention {
         self.qkv_proj.is_fused()
     }
 
-    fn f16_qkv(&self) -> bool {
-        self.qkv_proj.f16_qkv()
-    }
-
-    fn f16_attention_core(&self) -> bool {
-        self.f16_attention_core
-    }
-
-    fn f16_attention_output(&self) -> bool {
-        self.o_proj_f16.is_some()
-    }
-
     fn output_projection(&self, x: &Tensor, output_dtype: DType) -> Result<Tensor> {
-        let out = if let Some(o_proj_f16) = self.o_proj_f16.as_ref() {
-            o_proj_f16.forward(&x.to_dtype(DType::F16)?)?
-        } else if x.dtype() == self.o_proj.weight().dtype() {
+        let out = if x.dtype() == self.o_proj.weight().dtype() {
             self.o_proj.forward(x)?
         } else {
             self.o_proj
@@ -3000,13 +3004,6 @@ impl GraniteTextFusedGateUpProjection {
         let up = gate_up.narrow(last_dim, self.intermediate_size, self.intermediate_size)?;
         Ok((gate, up))
     }
-
-    fn to_dtype(&self, dtype: DType) -> Result<Self> {
-        Ok(Self {
-            fused: GraniteLinearNoBias::from_weight(self.fused.weight().to_dtype(dtype)?)?,
-            intermediate_size: self.intermediate_size,
-        })
-    }
 }
 
 enum GraniteTextGateUpProjection {
@@ -3047,22 +3044,14 @@ impl GraniteTextGateUpProjection {
     fn is_fused(&self) -> bool {
         matches!(self, Self::Fused(_))
     }
-
-    fn to_dtype(&self, dtype: DType) -> Result<Self> {
-        match self {
-            Self::Fused(fused) => fused.to_dtype(dtype).map(Self::Fused),
-            Self::Separate { gate_proj, up_proj } => Ok(Self::Separate {
-                gate_proj: Linear::new(gate_proj.weight().to_dtype(dtype)?, None),
-                up_proj: Linear::new(up_proj.weight().to_dtype(dtype)?, None),
-            }),
-        }
-    }
 }
 
-struct GraniteTextMlp {
-    gate_up_proj: GraniteTextGateUpProjection,
-    down_proj: GraniteLinearNoBias,
-    f16_mlp: Option<GraniteTextF16Mlp>,
+enum GraniteTextMlp {
+    Model {
+        gate_up_proj: GraniteTextGateUpProjection,
+        down_proj: GraniteLinearNoBias,
+    },
+    SelectiveF16(GraniteTextF16Mlp),
 }
 
 struct GraniteTextF16Mlp {
@@ -3071,16 +3060,6 @@ struct GraniteTextF16Mlp {
 }
 
 impl GraniteTextF16Mlp {
-    fn new(
-        gate_up_proj: &GraniteTextGateUpProjection,
-        down_proj: &GraniteLinearNoBias,
-    ) -> Result<Self> {
-        Ok(Self {
-            gate_up_proj: gate_up_proj.to_dtype(DType::F16)?,
-            down_proj: GraniteLinearNoBias::from_weight(down_proj.weight().to_dtype(DType::F16)?)?,
-        })
-    }
-
     fn forward(
         &self,
         x: &Tensor,
@@ -3099,29 +3078,37 @@ impl GraniteTextF16Mlp {
 }
 
 impl GraniteTextMlp {
-    fn load(config: &GraniteTextConfig, vb: VarBuilder, prescale_residual: bool) -> Result<Self> {
+    fn load(
+        config: &GraniteTextConfig,
+        vb: VarBuilder,
+        prescale_residual: bool,
+        execution_plan: GraniteTextExecutionPlan,
+    ) -> Result<Self> {
         let down_proj = linear_no_bias(
             config.intermediate_size,
             config.hidden_size,
             vb.pp("down_proj"),
         )?;
-        let gate_up_proj = GraniteTextGateUpProjection::load(config, vb.clone())?;
         let down_proj = maybe_prescale_residual_linear(
             down_proj,
             config.residual_multiplier,
             prescale_residual,
         )?;
-        let down_proj = GraniteLinearNoBias::new(down_proj)?;
-        let f16_mlp = if granite_f16_mlp_enabled(vb.device(), down_proj.weight().dtype()) {
-            Some(GraniteTextF16Mlp::new(&gate_up_proj, &down_proj)?)
+        if execution_plan.selective_f16_mlp {
+            let gate_up_proj = GraniteTextGateUpProjection::load(config, vb.to_dtype(DType::F16))?;
+            let down_proj =
+                GraniteLinearNoBias::from_weight(down_proj.weight().to_dtype(DType::F16)?)?;
+            Ok(Self::SelectiveF16(GraniteTextF16Mlp {
+                gate_up_proj,
+                down_proj,
+            }))
         } else {
-            None
-        };
-        Ok(Self {
-            gate_up_proj,
-            down_proj,
-            f16_mlp,
-        })
+            let gate_up_proj = GraniteTextGateUpProjection::load(config, vb)?;
+            Ok(Self::Model {
+                gate_up_proj,
+                down_proj: GraniteLinearNoBias::new(down_proj)?,
+            })
+        }
     }
 
     fn forward(
@@ -3129,10 +3116,13 @@ impl GraniteTextMlp {
         x: &Tensor,
         profile: Option<&mut GraniteSpeechMlpDecodeProfile>,
     ) -> Result<Tensor> {
-        if let Some(f16_mlp) = self.f16_mlp.as_ref() {
-            return f16_mlp.forward(x, profile);
+        match self {
+            Self::SelectiveF16(mlp) => mlp.forward(x, profile),
+            Self::Model {
+                gate_up_proj,
+                down_proj,
+            } => Self::forward_with_parts(gate_up_proj, down_proj, x, profile),
         }
-        Self::forward_with_parts(&self.gate_up_proj, &self.down_proj, x, profile)
     }
 
     fn forward_with_parts(
@@ -3187,11 +3177,10 @@ impl GraniteTextMlp {
     }
 
     fn gate_up_projection_fused(&self) -> bool {
-        self.gate_up_proj.is_fused()
-    }
-
-    fn f16_mlp(&self) -> bool {
-        self.f16_mlp.is_some()
+        match self {
+            Self::Model { gate_up_proj, .. } => gate_up_proj.is_fused(),
+            Self::SelectiveF16(mlp) => mlp.gate_up_proj.is_fused(),
+        }
     }
 }
 
@@ -3215,6 +3204,126 @@ fn maybe_prescale_residual_linear(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn granite_load_completion_synchronizes_cpu_device() {
+        synchronize_granite_load(&Device::Cpu).unwrap();
+    }
+
+    fn tiny_granite_text_config() -> GraniteTextConfig {
+        GraniteTextConfig {
+            attention_multiplier: 0.5,
+            bos_token_id: 1,
+            dtype: Some("float32".to_string()),
+            embedding_multiplier: 1.0,
+            eos_token_id: 2,
+            hidden_size: 4,
+            intermediate_size: 8,
+            logits_scaling: 1.0,
+            max_position_embeddings: 32,
+            model_type: Some("granite".to_string()),
+            num_attention_heads: 2,
+            num_hidden_layers: 1,
+            num_key_value_heads: 1,
+            pad_token_id: 0,
+            residual_multiplier: 0.22,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            tie_word_embeddings: true,
+            use_cache: true,
+            vocab_size: 16,
+        }
+    }
+
+    fn tiny_granite_text_tensors(device: &Device) -> HashMap<String, Tensor> {
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "model.embed_tokens.weight".to_string(),
+            Tensor::zeros((16, 4), DType::F32, device).unwrap(),
+        );
+        for name in [
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+            "model.norm.weight",
+        ] {
+            tensors.insert(
+                name.to_string(),
+                Tensor::ones(4, DType::F32, device).unwrap(),
+            );
+        }
+        tensors.insert(
+            "model.layers.0.self_attn.q_proj.weight".to_string(),
+            Tensor::zeros((4, 4), DType::F32, device).unwrap(),
+        );
+        for name in [
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+        ] {
+            tensors.insert(
+                name.to_string(),
+                Tensor::zeros((2, 4), DType::F32, device).unwrap(),
+            );
+        }
+        tensors.insert(
+            "model.layers.0.self_attn.o_proj.weight".to_string(),
+            Tensor::zeros((4, 4), DType::F32, device).unwrap(),
+        );
+        for name in [
+            "model.layers.0.mlp.gate_proj.weight",
+            "model.layers.0.mlp.up_proj.weight",
+        ] {
+            tensors.insert(
+                name.to_string(),
+                Tensor::zeros((8, 4), DType::F32, device).unwrap(),
+            );
+        }
+        tensors.insert(
+            "model.layers.0.mlp.down_proj.weight".to_string(),
+            Tensor::zeros((4, 8), DType::F32, device).unwrap(),
+        );
+        tensors
+    }
+
+    #[test]
+    fn selective_f16_plan_retains_one_decoder_execution_representation() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::from_tensors(tiny_granite_text_tensors(&device), DType::F32, &device);
+        let plan = GraniteTextExecutionPlan {
+            selective_f16_lm_head: true,
+            selective_f16_qkv: true,
+            f16_attention_core: true,
+            selective_f16_mlp: true,
+            selective_f16_attention_output: true,
+        };
+
+        let model =
+            GraniteLanguageModel::load_with_execution_plan(&tiny_granite_text_config(), vb, plan)
+                .unwrap();
+        let layer = &model.layers[0];
+
+        assert_eq!(model.embed_tokens.embeddings().dtype(), DType::F32);
+        assert_eq!(model.lm_head.weight().dtype(), DType::F16);
+        assert_eq!(
+            layer.self_attn.qkv_proj.projection.weight_dtype().unwrap(),
+            DType::F16
+        );
+        assert_eq!(layer.self_attn.o_proj.weight().dtype(), DType::F16);
+        match &layer.mlp {
+            GraniteTextMlp::SelectiveF16(mlp) => {
+                let gate_up_dtype = match &mlp.gate_up_proj {
+                    GraniteTextGateUpProjection::Fused(fused) => fused.fused.weight().dtype(),
+                    GraniteTextGateUpProjection::Separate { gate_proj, .. } => {
+                        gate_proj.weight().dtype()
+                    }
+                };
+                assert_eq!(gate_up_dtype, DType::F16);
+                assert_eq!(mlp.down_proj.weight().dtype(), DType::F16);
+            }
+            GraniteTextMlp::Model { .. } => panic!("expected selective F16 MLP"),
+        }
+        assert_eq!(model.execution_plan, plan);
+    }
 
     fn assert_tensor_close(lhs: &Tensor, rhs: &Tensor) {
         assert_eq!(lhs.dims(), rhs.dims());

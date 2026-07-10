@@ -148,6 +148,22 @@ impl ModelResidency {
             .unwrap_or(ModelResidencyState::NotResident)
     }
 
+    pub async fn resident_variants(&self) -> Vec<ModelVariant> {
+        let states = self.states.read().await;
+        let mut variants = states
+            .iter()
+            .filter_map(|(variant, state)| {
+                matches!(
+                    state,
+                    ModelResidencyState::Loading | ModelResidencyState::Ready
+                )
+                .then_some(*variant)
+            })
+            .collect::<Vec<_>>();
+        variants.sort_by_key(|variant| variant.to_string());
+        variants
+    }
+
     pub async fn mark_loading(&self, variant: ModelVariant) {
         self.states
             .write()
@@ -212,5 +228,28 @@ mod tests {
         drop(first);
         assert_eq!(residency.active_leases(ModelVariant::Kokoro82M), 0);
         assert!(!residency.has_active_leases(ModelVariant::Kokoro82M));
+    }
+
+    #[tokio::test]
+    async fn resident_variants_include_loading_and_ready_models() {
+        let residency = ModelResidency::default();
+        residency
+            .mark_loading(ModelVariant::Qwen3Tts12Hz06BCustomVoice)
+            .await;
+        residency.mark_ready(ModelVariant::Kokoro82M).await;
+
+        let variants = residency.resident_variants().await;
+
+        assert_eq!(variants.len(), 2);
+        assert!(variants.contains(&ModelVariant::Qwen3Tts12Hz06BCustomVoice));
+        assert!(variants.contains(&ModelVariant::Kokoro82M));
+
+        residency
+            .clear(ModelVariant::Qwen3Tts12Hz06BCustomVoice)
+            .await;
+        assert_eq!(
+            residency.resident_variants().await,
+            vec![ModelVariant::Kokoro82M]
+        );
     }
 }

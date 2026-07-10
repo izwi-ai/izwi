@@ -7,7 +7,7 @@ use futures::stream::{self, StreamExt};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{broadcast, RwLock};
 use tracing::info;
 
 use crate::artifacts::ModelWeights;
@@ -175,6 +175,14 @@ impl ModelManager {
         models.get(&variant).map(|s| s.info.clone())
     }
 
+    /// Return the local path for a fully downloaded model without refreshing
+    /// catalog metadata or consulting a remote artifact source.
+    pub fn downloaded_model_path(&self, variant: ModelVariant) -> Option<PathBuf> {
+        self.downloader
+            .is_downloaded(variant)
+            .then(|| self.downloader.model_path(variant))
+    }
+
     /// Get explicit artifact and residency state for a specific model.
     pub async fn lifecycle_snapshot(
         &self,
@@ -203,6 +211,11 @@ impl ModelManager {
     /// Number of active leases for a resident model.
     pub fn active_residency_leases(&self, variant: ModelVariant) -> usize {
         self.residency.active_leases(variant)
+    }
+
+    /// Return models currently loading or ready without refreshing artifact metadata.
+    pub async fn resident_variants(&self) -> Vec<ModelVariant> {
+        self.residency.resident_variants().await
     }
 
     /// Download a model from HuggingFace
@@ -538,6 +551,33 @@ mod tests {
         assert_eq!(info.status, ModelStatus::Downloaded);
         assert_eq!(info.local_path, Some(model_dir));
         assert!(info.size_bytes.is_some_and(|bytes| bytes >= 4));
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn downloaded_model_path_uses_exact_local_artifact_check() {
+        let temp_dir = std::env::temp_dir().join(format!("izwi-manager-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let variant = ModelVariant::Qwen34BGguf;
+        let model_dir = temp_dir.join(variant.dir_name());
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("Qwen3-4B-Q4_K_M.gguf"), [0u8]).unwrap();
+        std::fs::write(model_dir.join("tokenizer.json"), "{}").unwrap();
+        std::fs::write(model_dir.join("tokenizer_config.json"), "{}").unwrap();
+
+        let manager = ModelManager::new(EngineConfig {
+            models_dir: temp_dir.clone(),
+            ..EngineConfig::default()
+        })
+        .unwrap();
+
+        assert_eq!(manager.downloaded_model_path(variant), Some(model_dir));
+        assert_eq!(
+            manager.downloaded_model_path(ModelVariant::Qwen38BGguf),
+            None
+        );
 
         std::fs::remove_dir_all(&temp_dir).unwrap();
     }

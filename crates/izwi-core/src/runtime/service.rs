@@ -87,6 +87,7 @@ pub struct RuntimeService {
     pub(crate) loaded_tts_variant: RwLock<Option<ModelVariant>>,
     pub(crate) max_loaded_models: Option<usize>,
     pub(crate) model_last_used: Arc<Mutex<HashMap<ModelVariant, u64>>>,
+    pub(crate) model_load_lock: Mutex<()>,
     pub(crate) device: DeviceProfile,
 }
 
@@ -208,6 +209,7 @@ impl RuntimeService {
             loaded_tts_variant: RwLock::new(None),
             max_loaded_models: positive_usize_env("IZWI_MAX_LOADED_MODELS"),
             model_last_used: Arc::new(Mutex::new(HashMap::new())),
+            model_load_lock: Mutex::new(()),
             device,
         })
     }
