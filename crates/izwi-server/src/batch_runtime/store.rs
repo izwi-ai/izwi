@@ -197,6 +197,22 @@ pub struct NewRuntimeArtifact {
 }
 
 #[derive(Debug, Clone)]
+pub struct NewStageOutputArtifact {
+    pub publication_key: String,
+    pub artifact_kind: RuntimeArtifactKind,
+    pub artifact_role: RuntimeArtifactRole,
+    pub media_asset_id: Option<String>,
+    pub text_asset_id: Option<String>,
+    pub storage_key: Option<String>,
+    pub content_type: Option<String>,
+    pub filename: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub sha256: Option<String>,
+    pub metadata_json: serde_json::Value,
+    pub retention_policy: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct NewIdempotencyRecord {
     pub operation: String,
     pub idempotency_key: String,
@@ -1069,6 +1085,39 @@ impl BatchRuntimeStore {
         Ok(result.rows_affected() == 1)
     }
 
+    pub async fn stage_lease_is_active(&self, lease: &StageLease) -> anyhow::Result<bool> {
+        let db = self.db.connection().await?;
+        let now = current_timestamp_millis();
+        let row = db
+            .query_one_raw(raw::statement(
+                db,
+                r#"
+                SELECT 1
+                FROM job_stages s
+                JOIN runtime_jobs j ON j.id = s.job_id
+                WHERE s.id = ?1
+                  AND s.status IN ('running', 'postprocessing')
+                  AND s.worker_id = ?2
+                  AND s.attempt_count = ?3
+                  AND (s.attempt_token = ?4 OR (s.attempt_token IS NULL AND ?4 IS NULL))
+                  AND s.lease_expires_at IS NOT NULL
+                  AND s.lease_expires_at > ?5
+                  AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+                LIMIT 1
+                "#,
+                vec![
+                    lease.stage_id.clone().into(),
+                    lease.worker_id.clone().into(),
+                    u32_to_i64_value(lease.attempt_count).into(),
+                    opt_string(lease.attempt_token.clone()),
+                    now.into(),
+                ],
+            )?)
+            .await
+            .context("Failed to verify runtime stage lease ownership")?;
+        Ok(row.is_some())
+    }
+
     pub async fn update_stage_progress(
         &self,
         lease: &StageLease,
@@ -1544,6 +1593,180 @@ impl BatchRuntimeStore {
         self.get_artifact(&id)
             .await?
             .ok_or_else(|| anyhow!("Created runtime artifact was not found"))
+    }
+
+    pub async fn publish_stage_output_artifact(
+        &self,
+        lease: &StageLease,
+        input: NewStageOutputArtifact,
+    ) -> anyhow::Result<Option<RuntimeArtifact>> {
+        if !matches!(
+            input.artifact_role,
+            RuntimeArtifactRole::OutputPrimary
+                | RuntimeArtifactRole::OutputIntermediate
+                | RuntimeArtifactRole::Debug
+        ) {
+            bail!("Attempt-owned artifact publication requires an output or debug role");
+        }
+        let publication_key = input.publication_key.trim().to_string();
+        if publication_key.is_empty() {
+            bail!("Attempt-owned artifact publication requires a publication key");
+        }
+        let Some(attempt_token) = lease.attempt_token.as_ref() else {
+            return Ok(None);
+        };
+
+        let db = self.db.connection().await?;
+        let tx = db
+            .begin()
+            .await
+            .context("Failed to start runtime artifact publication transaction")?;
+        let now = current_timestamp_millis();
+        let id = new_uuid();
+        let metadata_json = json_to_db_string(&input.metadata_json, "{}")?;
+        let conflict_clause = match tx.get_database_backend() {
+            DbBackend::Sqlite | DbBackend::Postgres => {
+                "ON CONFLICT(stage_id, producer_attempt_token, publication_key) DO NOTHING"
+            }
+            DbBackend::MySql => "ON DUPLICATE KEY UPDATE id = id",
+            backend => bail!("Unsupported runtime artifact database backend: {backend:?}"),
+        };
+        let insert_sql = format!(
+            r#"
+            INSERT INTO runtime_artifacts (
+                id,
+                job_id,
+                stage_id,
+                producer_attempt_count,
+                producer_attempt_token,
+                publication_key,
+                created_at,
+                artifact_kind,
+                artifact_role,
+                media_asset_id,
+                text_asset_id,
+                storage_key,
+                content_type,
+                filename,
+                size_bytes,
+                sha256,
+                metadata_json,
+                retention_policy
+            )
+            SELECT
+                ?1,
+                s.job_id,
+                s.id,
+                ?2,
+                ?3,
+                ?4,
+                ?5,
+                ?6,
+                ?7,
+                ?8,
+                ?9,
+                ?10,
+                ?11,
+                ?12,
+                ?13,
+                ?14,
+                ?15,
+                ?16
+            FROM job_stages s
+            JOIN runtime_jobs j ON j.id = s.job_id
+            WHERE s.id = ?17
+              AND s.status IN ('running', 'postprocessing')
+              AND s.worker_id = ?18
+              AND s.attempt_count = ?2
+              AND s.attempt_token = ?3
+              AND s.lease_expires_at IS NOT NULL
+              AND s.lease_expires_at > ?5
+              AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+            {conflict_clause}
+            "#
+        );
+        tx.execute_raw(raw::statement(
+            &tx,
+            insert_sql,
+            vec![
+                id.into(),
+                u32_to_i64_value(lease.attempt_count).into(),
+                attempt_token.clone().into(),
+                publication_key.clone().into(),
+                now.into(),
+                input.artifact_kind.as_db_value().into(),
+                input.artifact_role.as_db_value().into(),
+                opt_string(input.media_asset_id),
+                opt_string(input.text_asset_id),
+                opt_string(input.storage_key),
+                opt_string(input.content_type),
+                opt_string(input.filename),
+                opt_u64(input.size_bytes),
+                opt_string(input.sha256),
+                metadata_json.into(),
+                input.retention_policy.into(),
+                lease.stage_id.clone().into(),
+                lease.worker_id.clone().into(),
+            ],
+        )?)
+        .await
+        .context("Failed to publish attempt-owned runtime artifact")?;
+
+        let row = tx
+            .query_one_raw(raw::statement(
+                &tx,
+                r#"
+                SELECT
+                    a.id,
+                    a.job_id,
+                    a.stage_id,
+                    a.producer_attempt_count,
+                    a.producer_attempt_token,
+                    a.publication_key,
+                    a.created_at,
+                    a.artifact_kind,
+                    a.artifact_role,
+                    a.media_asset_id,
+                    a.text_asset_id,
+                    a.storage_key,
+                    a.content_type,
+                    a.filename,
+                    a.size_bytes,
+                    a.sha256,
+                    a.metadata_json,
+                    a.retention_policy
+                FROM runtime_artifacts a
+                JOIN job_stages s ON s.id = a.stage_id
+                JOIN runtime_jobs j ON j.id = s.job_id
+                WHERE a.stage_id = ?1
+                  AND a.producer_attempt_count = ?2
+                  AND a.producer_attempt_token = ?3
+                  AND a.publication_key = ?4
+                  AND s.status IN ('running', 'postprocessing')
+                  AND s.worker_id = ?5
+                  AND s.attempt_count = ?2
+                  AND s.attempt_token = ?3
+                  AND s.lease_expires_at IS NOT NULL
+                  AND s.lease_expires_at > ?6
+                  AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+                LIMIT 1
+                "#,
+                vec![
+                    lease.stage_id.clone().into(),
+                    u32_to_i64_value(lease.attempt_count).into(),
+                    attempt_token.clone().into(),
+                    publication_key.into(),
+                    lease.worker_id.clone().into(),
+                    now.into(),
+                ],
+            )?)
+            .await
+            .context("Failed to load attempt-owned runtime artifact")?;
+        let artifact = row.as_ref().map(map_runtime_artifact).transpose()?;
+        tx.commit()
+            .await
+            .context("Failed to commit runtime artifact publication transaction")?;
+        Ok(artifact)
     }
 
     pub async fn get_artifact(&self, id: &str) -> anyhow::Result<Option<RuntimeArtifact>> {
@@ -2130,9 +2353,9 @@ const JOB_STAGE_COLUMNS_SQL: &str =
 const JOB_STAGE_LIST_FOR_JOB_SQL: &str =
     "SELECT id, job_id, created_at, updated_at, sequence, stage_kind, queue_class, resource_hints_json, status, capability, model_id, worker_id, lease_expires_at, available_at, attempt_token, attempt_count, max_attempts, input_artifact_ids_json, output_artifact_ids_json, progress_json, started_at, finished_at, error_code, error_message FROM job_stages WHERE job_id = ?1 ORDER BY sequence ASC, created_at ASC, id ASC";
 const RUNTIME_ARTIFACT_COLUMNS_SQL: &str =
-    "SELECT id, job_id, stage_id, created_at, artifact_kind, artifact_role, media_asset_id, text_asset_id, storage_key, content_type, filename, size_bytes, sha256, metadata_json, retention_policy FROM runtime_artifacts WHERE id = ?1";
+    "SELECT id, job_id, stage_id, producer_attempt_count, producer_attempt_token, publication_key, created_at, artifact_kind, artifact_role, media_asset_id, text_asset_id, storage_key, content_type, filename, size_bytes, sha256, metadata_json, retention_policy FROM runtime_artifacts WHERE id = ?1";
 const RUNTIME_ARTIFACT_LIST_FOR_JOB_SQL: &str =
-    "SELECT id, job_id, stage_id, created_at, artifact_kind, artifact_role, media_asset_id, text_asset_id, storage_key, content_type, filename, size_bytes, sha256, metadata_json, retention_policy FROM runtime_artifacts WHERE job_id = ?1 ORDER BY created_at ASC, id ASC";
+    "SELECT id, job_id, stage_id, producer_attempt_count, producer_attempt_token, publication_key, created_at, artifact_kind, artifact_role, media_asset_id, text_asset_id, storage_key, content_type, filename, size_bytes, sha256, metadata_json, retention_policy FROM runtime_artifacts WHERE job_id = ?1 ORDER BY created_at ASC, id ASC";
 const IDEMPOTENCY_RECORD_COLUMNS_SQL: &str =
     "SELECT operation, idempotency_key, created_at, expires_at, request_hash, response_json, runtime_job_id, conflict_message, metadata_json FROM idempotency_keys WHERE operation = ?1 AND idempotency_key = ?2";
 const WORKER_HEARTBEAT_COLUMNS_SQL: &str =
@@ -2381,27 +2604,30 @@ fn map_stage_claim_candidate(row: &QueryResult) -> anyhow::Result<StageClaimCand
 }
 
 fn map_runtime_artifact(row: &QueryResult) -> anyhow::Result<RuntimeArtifact> {
-    let kind_raw: String = row.try_get_by_index(4)?;
-    let role_raw: String = row.try_get_by_index(5)?;
+    let kind_raw: String = row.try_get_by_index(7)?;
+    let role_raw: String = row.try_get_by_index(8)?;
 
     Ok(RuntimeArtifact {
         id: row.try_get_by_index(0)?,
         job_id: row.try_get_by_index(1)?,
         stage_id: row.try_get_by_index(2)?,
-        created_at: i64_to_u64(row.try_get_by_index(3)?)?,
+        producer_attempt_count: opt_i64_to_u32(row.try_get_by_index(3)?)?,
+        producer_attempt_token: row.try_get_by_index(4)?,
+        publication_key: row.try_get_by_index(5)?,
+        created_at: i64_to_u64(row.try_get_by_index(6)?)?,
         artifact_kind: RuntimeArtifactKind::from_db_value(kind_raw.as_str())
             .ok_or_else(|| anyhow!("Unknown runtime artifact kind: {kind_raw}"))?,
         artifact_role: RuntimeArtifactRole::from_db_value(role_raw.as_str())
             .ok_or_else(|| anyhow!("Unknown runtime artifact role: {role_raw}"))?,
-        media_asset_id: row.try_get_by_index(6)?,
-        text_asset_id: row.try_get_by_index(7)?,
-        storage_key: row.try_get_by_index(8)?,
-        content_type: row.try_get_by_index(9)?,
-        filename: row.try_get_by_index(10)?,
-        size_bytes: opt_i64_to_u64(row.try_get_by_index(11)?)?,
-        sha256: row.try_get_by_index(12)?,
-        metadata_json: parse_json_value(row.try_get_by_index::<String>(13)?, json!({})),
-        retention_policy: row.try_get_by_index(14)?,
+        media_asset_id: row.try_get_by_index(9)?,
+        text_asset_id: row.try_get_by_index(10)?,
+        storage_key: row.try_get_by_index(11)?,
+        content_type: row.try_get_by_index(12)?,
+        filename: row.try_get_by_index(13)?,
+        size_bytes: opt_i64_to_u64(row.try_get_by_index(14)?)?,
+        sha256: row.try_get_by_index(15)?,
+        metadata_json: parse_json_value(row.try_get_by_index::<String>(16)?, json!({})),
+        retention_policy: row.try_get_by_index(17)?,
     })
 }
 
@@ -2778,6 +3004,23 @@ mod tests {
         job
     }
 
+    fn test_stage_output(publication_key: &str) -> NewStageOutputArtifact {
+        NewStageOutputArtifact {
+            publication_key: publication_key.to_string(),
+            artifact_kind: RuntimeArtifactKind::Metadata,
+            artifact_role: RuntimeArtifactRole::OutputPrimary,
+            media_asset_id: None,
+            text_asset_id: None,
+            storage_key: Some(format!("outputs/{publication_key}.json")),
+            content_type: Some("application/json".to_string()),
+            filename: Some(format!("{publication_key}.json")),
+            size_bytes: Some(2),
+            sha256: Some(sha256_hex(b"{}")),
+            metadata_json: json!({"publication_key": publication_key}),
+            retention_policy: "default".to_string(),
+        }
+    }
+
     #[tokio::test]
     async fn creates_runtime_foundation_records() {
         let (store, _root) = build_store();
@@ -2901,6 +3144,9 @@ mod tests {
             .expect("heartbeat");
 
         assert_eq!(artifact.stage_id.as_deref(), Some(stage.id.as_str()));
+        assert_eq!(artifact.producer_attempt_count, None);
+        assert_eq!(artifact.producer_attempt_token, None);
+        assert_eq!(artifact.publication_key, None);
         assert_eq!(idempotency.runtime_job_id.as_deref(), Some(job.id.as_str()));
         assert_eq!(heartbeat.queue_names, vec!["batch"]);
         assert_eq!(heartbeat.instance_id, "worker-1");
@@ -3797,6 +4043,116 @@ mod tests {
             .await
             .expect("owned completion")
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn attempt_owned_artifact_publication_is_idempotent() {
+        let (store, _root) = build_store();
+        let (job, _stage) = create_test_job_and_stage(&store, 0, "fake_stage", 1).await;
+        let claimed = store
+            .claim_next_stage("worker-1", 60_000)
+            .await
+            .expect("claim")
+            .expect("attempt");
+        let lease = claimed.lease().expect("lease");
+        assert!(store
+            .stage_lease_is_active(&lease)
+            .await
+            .expect("active lease"));
+
+        let first = store
+            .publish_stage_output_artifact(&lease, test_stage_output("primary-result"))
+            .await
+            .expect("first publication")
+            .expect("active publication");
+        let duplicate = store
+            .publish_stage_output_artifact(&lease, test_stage_output("primary-result"))
+            .await
+            .expect("duplicate publication")
+            .expect("idempotent publication");
+
+        assert_eq!(duplicate.id, first.id);
+        assert_eq!(first.job_id, job.id);
+        assert_eq!(first.stage_id.as_deref(), Some(lease.stage_id.as_str()));
+        assert_eq!(first.producer_attempt_count, Some(lease.attempt_count));
+        assert_eq!(
+            first.producer_attempt_token.as_deref(),
+            lease.attempt_token.as_deref()
+        );
+        assert_eq!(first.publication_key.as_deref(), Some("primary-result"));
+        let artifacts = store
+            .list_artifacts_for_job(&job.id)
+            .await
+            .expect("artifacts");
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].id, first.id);
+    }
+
+    #[tokio::test]
+    async fn stale_and_cancelled_attempts_cannot_publish_artifacts() {
+        let (store, _root) = build_store();
+        let (job, _stage) = create_test_job_and_stage(&store, 0, "fake_stage", 2).await;
+        let first = store
+            .claim_next_stage("worker-1", 60_000)
+            .await
+            .expect("first claim")
+            .expect("first attempt");
+        let first_lease = first.lease().expect("first lease");
+        assert!(store
+            .stage_lease_is_active(&first_lease)
+            .await
+            .expect("first lease active"));
+
+        store
+            .fail_stage(
+                &first_lease,
+                true,
+                Some("retry".to_string()),
+                Some("replace attempt".to_string()),
+            )
+            .await
+            .expect("retry first attempt")
+            .expect("retrying stage");
+        let second = store
+            .claim_next_stage("worker-2", 60_000)
+            .await
+            .expect("second claim")
+            .expect("replacement attempt");
+        let second_lease = second.lease().expect("second lease");
+
+        assert!(!store
+            .stage_lease_is_active(&first_lease)
+            .await
+            .expect("stale lease check"));
+        assert!(store
+            .stage_lease_is_active(&second_lease)
+            .await
+            .expect("replacement lease check"));
+        assert!(store
+            .publish_stage_output_artifact(&first_lease, test_stage_output("stale-result"))
+            .await
+            .expect("stale publication")
+            .is_none());
+
+        store
+            .cancel_job(&job.id, Some("cancel active attempt".to_string()))
+            .await
+            .expect("cancel job")
+            .expect("cancelled job");
+        assert!(!store
+            .stage_lease_is_active(&second_lease)
+            .await
+            .expect("cancelled lease check"));
+        assert!(store
+            .publish_stage_output_artifact(&second_lease, test_stage_output("cancelled-result"))
+            .await
+            .expect("cancelled publication")
+            .is_none());
+        assert!(store
+            .list_artifacts_for_job(&job.id)
+            .await
+            .expect("artifacts")
+            .is_empty());
     }
 
     #[tokio::test]

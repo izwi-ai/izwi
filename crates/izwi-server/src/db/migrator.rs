@@ -144,6 +144,8 @@ const BASELINE_SCHEMA: &[&str] = &[
         processing_status TEXT NOT NULL DEFAULT 'ready',
         processing_error TEXT NULL,
         processing_progress_json TEXT NULL,
+        runtime_stage_id TEXT NULL,
+        runtime_attempt_token TEXT NULL,
         duration_secs REAL NULL,
         processing_time_ms REAL NOT NULL,
         rtf REAL NULL,
@@ -212,6 +214,8 @@ const BASELINE_SCHEMA: &[&str] = &[
         route_kind TEXT NOT NULL,
         processing_status TEXT NOT NULL DEFAULT 'ready',
         processing_error TEXT NULL,
+        runtime_stage_id TEXT NULL,
+        runtime_attempt_token TEXT NULL,
         model_id TEXT NULL,
         speaker TEXT NULL,
         language TEXT NULL,
@@ -460,6 +464,9 @@ const BASELINE_SCHEMA: &[&str] = &[
         id TEXT PRIMARY KEY,
         job_id TEXT NOT NULL,
         stage_id TEXT NULL,
+        producer_attempt_count INTEGER NULL,
+        producer_attempt_token TEXT NULL,
+        publication_key TEXT NULL,
         created_at INTEGER NOT NULL,
         artifact_kind TEXT NOT NULL,
         artifact_role TEXT NOT NULL,
@@ -524,6 +531,7 @@ const POST_COMPATIBILITY_SCHEMA: &[&str] = &[
     "UPDATE job_stages SET queue_class = CASE WHEN stage_kind IN ('asr_transcribe', 'asr_infer') THEN 'batch_asr' WHEN stage_kind IN ('tts_synthesize', 'tts_generate') THEN 'batch_tts' WHEN stage_kind IN ('diarization', 'diarization_segment') THEN 'diarization' WHEN stage_kind IN ('export', 'encode', 'notify') THEN 'export' WHEN stage_kind IN ('evaluation', 'evaluate') THEN 'evaluation' ELSE queue_class END WHERE queue_class = 'batch';",
     "CREATE INDEX IF NOT EXISTS idx_job_stages_queue_claim_ready ON job_stages(queue_class, status, available_at, lease_expires_at, sequence);",
     "CREATE INDEX IF NOT EXISTS idx_job_stages_queue_resources ON job_stages(queue_class, resource_target, required_backend, required_device_class, min_resource_memory_bytes, resource_concurrency_weight, status);",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_artifacts_attempt_publication ON runtime_artifacts(stage_id, producer_attempt_token, publication_key);",
 ];
 
 const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
@@ -603,6 +611,21 @@ const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
         definition: "TEXT NULL",
     },
     CompatibilityColumn {
+        table: "runtime_artifacts",
+        column: "producer_attempt_count",
+        definition: "INTEGER NULL",
+    },
+    CompatibilityColumn {
+        table: "runtime_artifacts",
+        column: "producer_attempt_token",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "runtime_artifacts",
+        column: "publication_key",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
         table: "chat_messages",
         column: "content_parts",
         definition: "TEXT NULL",
@@ -635,6 +658,16 @@ const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
     CompatibilityColumn {
         table: "transcription_records",
         column: "processing_progress_json",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "runtime_stage_id",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "runtime_attempt_token",
         definition: "TEXT NULL",
     },
     CompatibilityColumn {
@@ -710,6 +743,16 @@ const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
     CompatibilityColumn {
         table: "speech_history_records",
         column: "processing_error",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "speech_history_records",
+        column: "runtime_stage_id",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "speech_history_records",
+        column: "runtime_attempt_token",
         definition: "TEXT NULL",
     },
     CompatibilityColumn {

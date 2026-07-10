@@ -3,14 +3,16 @@
 use anyhow::{anyhow, Context};
 use izwi_hooks::{HookMetadata, MediaNamespace, MediaStorageProvider};
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryResult, Set};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryResult, Set,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     db::{raw, StoreDatabase},
-    entity::speech_history_records,
+    entity::{speech_history_records, RuntimeProjectionAttempt},
     ids::new_uuid,
     persistence::{
         delete_media_object, persist_audio_object, read_media_object, LocalMediaStorageProvider,
@@ -392,6 +394,8 @@ impl SpeechHistoryStore {
                 route_kind: Set(route_kind.as_db_value().to_string()),
                 processing_status: Set(processing_status.as_db_value().to_string()),
                 processing_error: Set(processing_error),
+                runtime_stage_id: Set(None),
+                runtime_attempt_token: Set(None),
                 model_id: Set(model_id),
                 speaker: Set(speaker),
                 language: Set(language),
@@ -422,6 +426,40 @@ impl SpeechHistoryStore {
             .ok_or_else(|| anyhow!("Failed to fetch created speech history record"))
     }
 
+    pub async fn bind_runtime_attempt(
+        &self,
+        route_kind: SpeechRouteKind,
+        record_id: String,
+        attempt: &RuntimeProjectionAttempt,
+    ) -> anyhow::Result<Option<SpeechHistoryRecord>> {
+        validate_runtime_projection_attempt(attempt)?;
+        let db = self.db.connection().await?;
+        let result = speech_history_records::Entity::update_many()
+            .col_expr(
+                speech_history_records::Column::RuntimeStageId,
+                Expr::value(attempt.stage_id.clone()),
+            )
+            .col_expr(
+                speech_history_records::Column::RuntimeAttemptToken,
+                Expr::value(attempt.attempt_token.clone()),
+            )
+            .filter(speech_history_records::Column::RouteKind.eq(route_kind.as_db_value()))
+            .filter(speech_history_records::Column::Id.eq(record_id.clone()))
+            .filter(active_speech_attempt_condition(
+                db.get_database_backend(),
+                route_kind,
+                attempt,
+                now_unix_millis_i64(),
+            ))
+            .exec(db)
+            .await
+            .context("Failed to bind speech history record to runtime attempt")?;
+        if result.rows_affected == 0 {
+            return Ok(None);
+        }
+        fetch_record_without_audio(db, route_kind, &record_id).await
+    }
+
     pub async fn update_processing_status(
         &self,
         route_kind: SpeechRouteKind,
@@ -429,9 +467,59 @@ impl SpeechHistoryStore {
         status: SpeechHistoryProcessingStatus,
         processing_error: Option<String>,
     ) -> anyhow::Result<Option<SpeechHistoryRecord>> {
+        self.update_processing_status_inner(route_kind, record_id, None, status, processing_error)
+            .await
+    }
+
+    pub async fn update_processing_status_for_attempt(
+        &self,
+        route_kind: SpeechRouteKind,
+        record_id: String,
+        attempt: &RuntimeProjectionAttempt,
+        status: SpeechHistoryProcessingStatus,
+        processing_error: Option<String>,
+    ) -> anyhow::Result<Option<SpeechHistoryRecord>> {
+        validate_runtime_projection_attempt(attempt)?;
+        self.update_processing_status_inner(
+            route_kind,
+            record_id,
+            Some(attempt),
+            status,
+            processing_error,
+        )
+        .await
+    }
+
+    pub async fn fail_record_for_attempt(
+        &self,
+        route_kind: SpeechRouteKind,
+        record_id: String,
+        attempt: &RuntimeProjectionAttempt,
+        error: String,
+    ) -> anyhow::Result<Option<SpeechHistoryRecord>> {
+        let error = sanitize_optional_text(Some(error.as_str()), 1_200)
+            .unwrap_or_else(|| "Speech generation attempt failed".to_string());
+        self.update_processing_status_for_attempt(
+            route_kind,
+            record_id,
+            attempt,
+            SpeechHistoryProcessingStatus::Failed,
+            Some(error),
+        )
+        .await
+    }
+
+    async fn update_processing_status_inner(
+        &self,
+        route_kind: SpeechRouteKind,
+        record_id: String,
+        attempt: Option<&RuntimeProjectionAttempt>,
+        status: SpeechHistoryProcessingStatus,
+        processing_error: Option<String>,
+    ) -> anyhow::Result<Option<SpeechHistoryRecord>> {
         let db = self.db.connection().await?;
         let sanitized_error = sanitize_optional_text(processing_error.as_deref(), 1_200);
-        speech_history_records::Entity::update_many()
+        let mut update = speech_history_records::Entity::update_many()
             .col_expr(
                 speech_history_records::Column::ProcessingStatus,
                 Expr::value(status.as_db_value()),
@@ -441,10 +529,29 @@ impl SpeechHistoryStore {
                 Expr::value(sanitized_error),
             )
             .filter(speech_history_records::Column::RouteKind.eq(route_kind.as_db_value()))
-            .filter(speech_history_records::Column::Id.eq(record_id.clone()))
+            .filter(speech_history_records::Column::Id.eq(record_id.clone()));
+        if let Some(attempt) = attempt {
+            update = update
+                .filter(speech_history_records::Column::RuntimeStageId.eq(attempt.stage_id.clone()))
+                .filter(
+                    speech_history_records::Column::RuntimeAttemptToken
+                        .eq(attempt.attempt_token.clone()),
+                )
+                .filter(active_speech_attempt_condition(
+                    db.get_database_backend(),
+                    route_kind,
+                    attempt,
+                    now_unix_millis_i64(),
+                ));
+        }
+        let result = update
             .exec(db)
             .await
             .context("Failed to update speech history processing status")?;
+
+        if result.rows_affected == 0 {
+            return Ok(None);
+        }
 
         fetch_record_without_audio(db, route_kind, &record_id).await
     }
@@ -453,6 +560,29 @@ impl SpeechHistoryStore {
         &self,
         route_kind: SpeechRouteKind,
         record_id: String,
+        record: CompleteSpeechHistoryRecord,
+    ) -> anyhow::Result<Option<SpeechHistoryRecord>> {
+        self.complete_record_inner(route_kind, record_id, None, record)
+            .await
+    }
+
+    pub async fn complete_record_for_attempt(
+        &self,
+        route_kind: SpeechRouteKind,
+        record_id: String,
+        attempt: &RuntimeProjectionAttempt,
+        record: CompleteSpeechHistoryRecord,
+    ) -> anyhow::Result<Option<SpeechHistoryRecord>> {
+        validate_runtime_projection_attempt(attempt)?;
+        self.complete_record_inner(route_kind, record_id, Some(attempt), record)
+            .await
+    }
+
+    async fn complete_record_inner(
+        &self,
+        route_kind: SpeechRouteKind,
+        record_id: String,
+        attempt: Option<&RuntimeProjectionAttempt>,
         record: CompleteSpeechHistoryRecord,
     ) -> anyhow::Result<Option<SpeechHistoryRecord>> {
         let db = self.db.connection().await?;
@@ -495,10 +625,18 @@ impl SpeechHistoryStore {
             "route_kind".to_string(),
             route_kind.as_db_value().to_string(),
         );
+        let previous_audio_storage_path = fetch_audio_storage_path(db, route_kind, &record_id)
+            .await?
+            .flatten();
+        let storage_record_id = if attempt.is_some() {
+            format!("{record_id}-attempt-{}", new_uuid())
+        } else {
+            record_id.clone()
+        };
         let next_audio_storage_path = persist_audio_object(
             &self.media_storage,
             MediaNamespace::GeneratedSpeech,
-            &record_id,
+            storage_record_id,
             audio_filename.as_deref(),
             audio_mime_type.as_str(),
             &record.audio_bytes,
@@ -506,11 +644,7 @@ impl SpeechHistoryStore {
         )
         .await?;
 
-        let previous_audio_storage_path = fetch_audio_storage_path(db, route_kind, &record_id)
-            .await?
-            .flatten();
-
-        let result = speech_history_records::Entity::update_many()
+        let mut update = speech_history_records::Entity::update_many()
             .col_expr(
                 speech_history_records::Column::ProcessingStatus,
                 Expr::value(SpeechHistoryProcessingStatus::Ready.as_db_value()),
@@ -574,10 +708,32 @@ impl SpeechHistoryStore {
                 Expr::value(next_audio_storage_path.clone()),
             )
             .filter(speech_history_records::Column::RouteKind.eq(route_kind.as_db_value()))
-            .filter(speech_history_records::Column::Id.eq(record_id.clone()))
-            .exec(db)
-            .await
-            .context("Failed to complete speech history record")?;
+            .filter(speech_history_records::Column::Id.eq(record_id.clone()));
+        if let Some(attempt) = attempt {
+            update = update
+                .filter(speech_history_records::Column::RuntimeStageId.eq(attempt.stage_id.clone()))
+                .filter(
+                    speech_history_records::Column::RuntimeAttemptToken
+                        .eq(attempt.attempt_token.clone()),
+                )
+                .filter(active_speech_attempt_condition(
+                    db.get_database_backend(),
+                    route_kind,
+                    attempt,
+                    now_unix_millis_i64(),
+                ));
+        }
+        let result = match update.exec(db).await {
+            Ok(result) => result,
+            Err(err) => {
+                let _ = delete_media_object(
+                    &self.media_storage,
+                    Some(next_audio_storage_path.as_str()),
+                )
+                .await;
+                return Err(err).context("Failed to complete speech history record");
+            }
+        };
 
         if result.rows_affected == 0 {
             let _ =
@@ -586,7 +742,9 @@ impl SpeechHistoryStore {
             return Ok(None);
         }
 
-        if let Some(previous_path) = sanitize_media_path(previous_audio_storage_path.as_deref()) {
+        if let Some(previous_path) = sanitize_media_path(previous_audio_storage_path.as_deref())
+            .filter(|previous_path| previous_path != &next_audio_storage_path)
+        {
             let _ = delete_media_object(&self.media_storage, Some(previous_path.as_str())).await;
         }
 
@@ -857,6 +1015,52 @@ fn truncate_string(input: &str, max_chars: usize) -> String {
     result
 }
 
+fn validate_runtime_projection_attempt(attempt: &RuntimeProjectionAttempt) -> anyhow::Result<()> {
+    if !attempt.is_valid() {
+        return Err(anyhow!(
+            "Runtime projection attempt requires a stage id and attempt token"
+        ));
+    }
+    Ok(())
+}
+
+fn active_speech_attempt_condition(
+    backend: DbBackend,
+    route_kind: SpeechRouteKind,
+    attempt: &RuntimeProjectionAttempt,
+    now: i64,
+) -> Expr {
+    let (stage_placeholder, token_placeholder, now_placeholder, route_placeholder) = match backend {
+        DbBackend::Postgres => ("$1", "$2", "$3", "$4"),
+        _ => ("?", "?", "?", "?"),
+    };
+    Expr::cust_with_exprs(
+        format!(
+            r#"
+        EXISTS (
+            SELECT 1
+            FROM job_stages s
+            INNER JOIN runtime_jobs j ON j.id = s.job_id
+            WHERE s.id = {stage_placeholder}
+              AND s.attempt_token = {token_placeholder}
+              AND s.status IN ('running', 'postprocessing')
+              AND s.lease_expires_at IS NOT NULL
+              AND s.lease_expires_at > {now_placeholder}
+              AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+              AND j.route_record_id = speech_history_records.id
+              AND j.route_record_kind = {route_placeholder}
+        )
+        "#
+        ),
+        [
+            Expr::value(attempt.stage_id.clone()),
+            Expr::value(attempt.attempt_token.clone()),
+            Expr::value(now),
+            Expr::value(route_kind.as_db_value()),
+        ],
+    )
+}
+
 fn now_unix_millis_i64() -> i64 {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -888,6 +1092,10 @@ pub const fn default_list_limit() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::batch_runtime::{
+        store::{BatchRuntimeStore, NewJobStage, NewRuntimeJob},
+        types::{RuntimeJobKind, RuntimeJobStatus, RuntimeStageStatus},
+    };
     use crate::test_support::env_lock;
 
     fn setup_store() -> (tempfile::TempDir, SpeechHistoryStore) {
@@ -926,6 +1134,94 @@ mod tests {
             audio_filename: Some("hello.wav".to_string()),
             audio_bytes: vec![5, 6, 7],
         }
+    }
+
+    fn completed_record(audio_bytes: Vec<u8>) -> CompleteSpeechHistoryRecord {
+        CompleteSpeechHistoryRecord {
+            model_id: Some("model-b".to_string()),
+            speaker: Some("Alex".to_string()),
+            language: Some("en".to_string()),
+            saved_voice_id: None,
+            speed: Some(1.0),
+            input_text: "Attempt-fenced speech".to_string(),
+            voice_description: None,
+            reference_text: None,
+            generation_time_ms: 30.0,
+            audio_duration_secs: Some(2.0),
+            rtf: Some(0.3),
+            tokens_generated: Some(18),
+            audio_mime_type: "audio/wav".to_string(),
+            audio_filename: Some("attempt.wav".to_string()),
+            audio_bytes,
+        }
+    }
+
+    async fn claim_projection_attempt(
+        store: &SpeechHistoryStore,
+        route_kind: SpeechRouteKind,
+        route_record_id: &str,
+    ) -> (BatchRuntimeStore, RuntimeProjectionAttempt) {
+        let runtime = BatchRuntimeStore::initialize_with_database(store.db.clone());
+        let job = runtime
+            .create_job(NewRuntimeJob {
+                job_kind: RuntimeJobKind::TtsSpeech,
+                status: RuntimeJobStatus::Queued,
+                priority: 0,
+                model_id: Some("test-tts".to_string()),
+                capability: Some("tts".to_string()),
+                route_record_kind: Some(route_kind.as_db_value().to_string()),
+                route_record_id: Some(route_record_id.to_string()),
+                input_media_asset_id: None,
+                input_text_asset_id: None,
+                request_json: serde_json::json!({}),
+                model_snapshot_json: serde_json::json!({}),
+                retry_policy_json: serde_json::json!({"max_attempts": 2}),
+                max_attempts: 2,
+                idempotency_key: None,
+                correlation_id: None,
+            })
+            .await
+            .expect("runtime job");
+        runtime
+            .create_stage(NewJobStage {
+                job_id: job.id,
+                sequence: 0,
+                stage_kind: "tts_synthesize".to_string(),
+                status: RuntimeStageStatus::Queued,
+                capability: Some("tts".to_string()),
+                model_id: Some("test-tts".to_string()),
+                max_attempts: 2,
+                input_artifact_ids: Vec::new(),
+            })
+            .await
+            .expect("runtime stage");
+        let claimed = runtime
+            .claim_next_stage("speech-projection-test-worker", 60_000)
+            .await
+            .expect("stage claim")
+            .expect("claimable stage");
+        let attempt = RuntimeProjectionAttempt::new(
+            claimed.stage.id,
+            claimed.stage.attempt_token.expect("attempt token"),
+        );
+        (runtime, attempt)
+    }
+
+    fn regular_file_count(path: &std::path::Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return 0;
+        };
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    regular_file_count(&path)
+                } else {
+                    usize::from(path.is_file())
+                }
+            })
+            .sum()
     }
 
     #[tokio::test]
@@ -1043,6 +1339,113 @@ mod tests {
             .expect("audio should load")
             .expect("audio should exist");
         assert_eq!(audio.audio_bytes, vec![8, 9]);
+
+        clear_env();
+    }
+
+    #[tokio::test]
+    async fn fences_completion_and_compensates_stale_attempt_audio() {
+        let _guard = env_lock();
+        let (temp, store) = setup_store();
+        let media_dir = temp.path().join("media");
+        let pending = store
+            .create_record(NewSpeechHistoryRecord {
+                processing_status: SpeechHistoryProcessingStatus::Pending,
+                audio_bytes: Vec::new(),
+                audio_filename: None,
+                ..ready_record()
+            })
+            .await
+            .expect("pending record");
+        let (runtime, attempt) =
+            claim_projection_attempt(&store, SpeechRouteKind::TextToSpeech, pending.id.as_str())
+                .await;
+        store
+            .bind_runtime_attempt(SpeechRouteKind::TextToSpeech, pending.id.clone(), &attempt)
+            .await
+            .expect("attempt binding")
+            .expect("active attempt should bind");
+
+        let stale = RuntimeProjectionAttempt::new(attempt.stage_id.clone(), "stale-token");
+        assert!(store
+            .complete_record_for_attempt(
+                SpeechRouteKind::TextToSpeech,
+                pending.id.clone(),
+                &stale,
+                completed_record(vec![1, 2, 3]),
+            )
+            .await
+            .expect("stale completion should be ignored")
+            .is_none());
+        assert_eq!(
+            regular_file_count(&media_dir),
+            0,
+            "stale completion audio should be deleted"
+        );
+        assert!(store
+            .get_audio(SpeechRouteKind::TextToSpeech, pending.id.clone())
+            .await
+            .expect("audio lookup")
+            .is_none());
+
+        let completed = store
+            .complete_record_for_attempt(
+                SpeechRouteKind::TextToSpeech,
+                pending.id.clone(),
+                &attempt,
+                completed_record(vec![8, 9]),
+            )
+            .await
+            .expect("active completion")
+            .expect("active attempt should complete");
+        assert_eq!(
+            completed.processing_status,
+            SpeechHistoryProcessingStatus::Ready
+        );
+        assert_eq!(regular_file_count(&media_dir), 1);
+        assert_eq!(
+            store
+                .get_audio(SpeechRouteKind::TextToSpeech, pending.id.clone())
+                .await
+                .expect("audio lookup")
+                .expect("completed audio")
+                .audio_bytes,
+            vec![8, 9]
+        );
+
+        let db = runtime.connection().await.expect("runtime database");
+        db.execute_raw(
+            raw::statement(
+                db,
+                "UPDATE job_stages SET lease_expires_at = ?1 WHERE id = ?2",
+                vec![
+                    now_unix_millis_i64().saturating_sub(1).into(),
+                    attempt.stage_id.clone().into(),
+                ],
+            )
+            .expect("expiry statement"),
+        )
+        .await
+        .expect("expire lease");
+        assert!(store
+            .fail_record_for_attempt(
+                SpeechRouteKind::TextToSpeech,
+                pending.id.clone(),
+                &attempt,
+                "late failure".to_string(),
+            )
+            .await
+            .expect("expired failure should be ignored")
+            .is_none());
+        let unchanged = store
+            .get_record(SpeechRouteKind::TextToSpeech, pending.id)
+            .await
+            .expect("record lookup")
+            .expect("record");
+        assert_eq!(
+            unchanged.processing_status,
+            SpeechHistoryProcessingStatus::Ready
+        );
 
         clear_env();
     }

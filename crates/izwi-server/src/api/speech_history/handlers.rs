@@ -22,14 +22,15 @@ use crate::api::tts_long_form::{expand_generation_requests_for_long_form, genera
 use crate::batch_runtime::{
     store::{
         sha256_hex, BatchRuntimeStore, NewIdempotencyRecord, NewJobStage, NewJobStageDispatch,
-        NewMediaAsset, NewRuntimeArtifact, NewRuntimeJob, NewTextAsset,
+        NewMediaAsset, NewRuntimeArtifact, NewRuntimeJob, NewStageOutputArtifact, NewTextAsset,
     },
     types::{
         ClaimedStage, QueueClass, RuntimeArtifactKind, RuntimeArtifactRole, RuntimeJobKind,
         RuntimeJobStatus, RuntimeStageStatus, StageResourceHints,
     },
-    worker::{StageExecutionOutcome, StageExecutor},
+    worker::{StageExecutionContext, StageExecutionOutcome, StageExecutor},
 };
+use crate::entity::RuntimeProjectionAttempt;
 use crate::error::ApiError;
 use crate::media_ingest::{
     AudioIngestPolicy, CanonicalAudioProfile, ExistingAudioIngestRequest, MediaIngestError,
@@ -468,6 +469,8 @@ async fn create_record(
         input_text,
         None,
         WorkloadClass::Online,
+        None,
+        None,
     )
     .await?;
 
@@ -799,28 +802,68 @@ impl StageExecutor for BatchTtsStageExecutor {
     }
 
     async fn execute(&self, claimed: ClaimedStage) -> anyhow::Result<StageExecutionOutcome> {
-        let record_id = claimed
-            .job
-            .route_record_id
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("TTS batch job is missing route_record_id"))?;
-        let mut request: BatchSpeechRequest =
-            serde_json::from_value(claimed.job.request_json.clone())
-                .context("Failed to decode TTS batch request")?;
-        hydrate_batch_reference_audio(&self.state, &claimed, &mut request.request).await?;
-        let variant = parse_tts_model_variant(request.model_id.as_str())
-            .map_err(|err| anyhow::anyhow!("Unsupported TTS model: {err}"))?;
-        let ctx = RequestContext {
-            correlation_id: claimed
-                .job
-                .correlation_id
-                .clone()
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-            principal: Principal::local_anonymous(),
-        };
+        execute_batch_tts_stage(&self.state, claimed, None).await
+    }
 
-        let _ = self
-            .state
+    async fn execute_with_context(
+        &self,
+        context: StageExecutionContext,
+    ) -> anyhow::Result<StageExecutionOutcome> {
+        let claimed = context.claimed().clone();
+        execute_batch_tts_stage(&self.state, claimed, Some(context)).await
+    }
+}
+
+async fn execute_batch_tts_stage(
+    state: &AppState,
+    claimed: ClaimedStage,
+    attempt: Option<StageExecutionContext>,
+) -> anyhow::Result<StageExecutionOutcome> {
+    if let Some(attempt) = attempt.as_ref() {
+        attempt.ensure_active().await?;
+    }
+    let record_id = claimed
+        .job
+        .route_record_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("TTS batch job is missing route_record_id"))?;
+    let projection_attempt = attempt
+        .as_ref()
+        .map(runtime_projection_attempt)
+        .transpose()?;
+    let mut request: BatchSpeechRequest = serde_json::from_value(claimed.job.request_json.clone())
+        .context("Failed to decode TTS batch request")?;
+    hydrate_batch_reference_audio(state, &claimed, &mut request.request).await?;
+    let variant = parse_tts_model_variant(request.model_id.as_str())
+        .map_err(|err| anyhow::anyhow!("Unsupported TTS model: {err}"))?;
+    let ctx = RequestContext {
+        correlation_id: claimed
+            .job
+            .correlation_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        principal: Principal::local_anonymous(),
+    };
+
+    if let Some(projection_attempt) = projection_attempt.as_ref() {
+        state
+            .speech_history_store
+            .bind_runtime_attempt(request.route_kind, record_id.clone(), projection_attempt)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("TTS attempt no longer owns its route projection"))?;
+        state
+            .speech_history_store
+            .update_processing_status_for_attempt(
+                request.route_kind,
+                record_id.clone(),
+                projection_attempt,
+                SpeechHistoryProcessingStatus::Processing,
+                None,
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("TTS attempt lost its route projection"))?;
+    } else {
+        let _ = state
             .speech_history_store
             .update_processing_status(
                 request.route_kind,
@@ -829,49 +872,80 @@ impl StageExecutor for BatchTtsStageExecutor {
                 None,
             )
             .await;
-
-        let record = match synthesize_record_internal(
-            &self.state,
-            &ctx,
-            request.request,
-            request.route_kind,
-            variant,
-            request.model_id,
-            request.input_text,
-            Some(record_id.clone()),
-            WorkloadClass::Batch,
-        )
-        .await
-        {
-            Ok(record) => record,
-            Err(err) => {
-                let _ = self
-                    .state
-                    .speech_history_store
-                    .update_processing_status(
-                        request.route_kind,
-                        record_id,
-                        SpeechHistoryProcessingStatus::Failed,
-                        Some(err.message.clone()),
-                    )
-                    .await;
-                anyhow::bail!("{}", err.message);
-            }
-        };
-
-        let output_artifact = create_speech_audio_runtime_artifact(
-            self.state.batch_runtime_store.clone(),
-            &self.state,
-            &claimed,
-            request.route_kind,
-            &record,
-        )
-        .await?;
-
-        Ok(StageExecutionOutcome {
-            output_artifact_ids: vec![output_artifact.id],
-        })
     }
+
+    let record = match synthesize_record_internal(
+        state,
+        &ctx,
+        request.request,
+        request.route_kind,
+        variant,
+        request.model_id,
+        request.input_text,
+        Some(record_id.clone()),
+        WorkloadClass::Batch,
+        attempt.as_ref(),
+        projection_attempt.as_ref(),
+    )
+    .await
+    {
+        Ok(record) => record,
+        Err(err) => {
+            match projection_attempt.as_ref() {
+                Some(projection_attempt) => {
+                    let _ = state
+                        .speech_history_store
+                        .fail_record_for_attempt(
+                            request.route_kind,
+                            record_id,
+                            projection_attempt,
+                            err.message.clone(),
+                        )
+                        .await;
+                }
+                None => {
+                    let _ = state
+                        .speech_history_store
+                        .update_processing_status(
+                            request.route_kind,
+                            record_id,
+                            SpeechHistoryProcessingStatus::Failed,
+                            Some(err.message.clone()),
+                        )
+                        .await;
+                }
+            }
+            anyhow::bail!("{}", err.message);
+        }
+    };
+
+    let output_artifact = create_speech_audio_runtime_artifact(
+        state.batch_runtime_store.clone(),
+        state,
+        &claimed,
+        request.route_kind,
+        &record,
+        attempt.as_ref(),
+    )
+    .await?;
+
+    Ok(StageExecutionOutcome {
+        output_artifact_ids: vec![output_artifact.id],
+    })
+}
+
+fn runtime_projection_attempt(
+    context: &StageExecutionContext,
+) -> anyhow::Result<RuntimeProjectionAttempt> {
+    let attempt_token = context
+        .lease()
+        .attempt_token
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Stage attempt is missing its publication token"))?;
+    Ok(RuntimeProjectionAttempt::new(
+        context.lease().stage_id.clone(),
+        attempt_token,
+    ))
 }
 
 async fn hydrate_batch_reference_audio(
@@ -914,6 +988,7 @@ async fn create_speech_audio_runtime_artifact(
     claimed: &ClaimedStage,
     route_kind: SpeechRouteKind,
     record: &SpeechHistoryRecord,
+    attempt: Option<&StageExecutionContext>,
 ) -> anyhow::Result<crate::batch_runtime::types::RuntimeArtifact> {
     let audio = state
         .speech_history_store
@@ -945,28 +1020,45 @@ async fn create_speech_audio_runtime_artifact(
         })
         .await?;
 
-    batch_store
-        .create_artifact(NewRuntimeArtifact {
-            job_id: claimed.job.id.clone(),
-            stage_id: Some(claimed.stage.id.clone()),
-            artifact_kind: RuntimeArtifactKind::Audio,
-            artifact_role: RuntimeArtifactRole::OutputPrimary,
-            media_asset_id: Some(media_asset.id),
-            text_asset_id: None,
-            storage_key: Some(media_asset.storage_key),
-            content_type: Some(media_asset.content_type),
-            filename: media_asset.filename,
-            size_bytes: Some(media_asset.size_bytes),
-            sha256: media_asset.sha256,
-            metadata_json: serde_json::json!({
-                "route_record_id": record.id.clone(),
-                "route_kind": route_kind.as_db_value(),
-                "duration_secs": record.audio_duration_secs,
-                "tokens_generated": record.tokens_generated
-            }),
-            retention_policy: "default".to_string(),
-        })
-        .await
+    let artifact = NewRuntimeArtifact {
+        job_id: claimed.job.id.clone(),
+        stage_id: Some(claimed.stage.id.clone()),
+        artifact_kind: RuntimeArtifactKind::Audio,
+        artifact_role: RuntimeArtifactRole::OutputPrimary,
+        media_asset_id: Some(media_asset.id),
+        text_asset_id: None,
+        storage_key: Some(media_asset.storage_key),
+        content_type: Some(media_asset.content_type),
+        filename: media_asset.filename,
+        size_bytes: Some(media_asset.size_bytes),
+        sha256: media_asset.sha256,
+        metadata_json: serde_json::json!({
+            "route_record_id": record.id.clone(),
+            "route_kind": route_kind.as_db_value(),
+            "duration_secs": record.audio_duration_secs,
+            "tokens_generated": record.tokens_generated
+        }),
+        retention_policy: "default".to_string(),
+    };
+    if let Some(attempt) = attempt {
+        return attempt
+            .publish_output_artifact(NewStageOutputArtifact {
+                publication_key: "primary_audio".to_string(),
+                artifact_kind: artifact.artifact_kind,
+                artifact_role: artifact.artifact_role,
+                media_asset_id: artifact.media_asset_id,
+                text_asset_id: artifact.text_asset_id,
+                storage_key: artifact.storage_key,
+                content_type: artifact.content_type,
+                filename: artifact.filename,
+                size_bytes: artifact.size_bytes,
+                sha256: artifact.sha256,
+                metadata_json: artifact.metadata_json,
+                retention_policy: artifact.retention_policy,
+            })
+            .await;
+    }
+    batch_store.create_artifact(artifact).await
 }
 
 pub(crate) async fn synthesize_record(
@@ -994,6 +1086,8 @@ pub(crate) async fn synthesize_record(
         input_text,
         None,
         WorkloadClass::Online,
+        None,
+        None,
     )
     .await
 }
@@ -1008,7 +1102,15 @@ async fn synthesize_record_internal(
     input_text: String,
     target_record_id: Option<String>,
     workload_class: WorkloadClass,
+    attempt: Option<&StageExecutionContext>,
+    projection_attempt: Option<&RuntimeProjectionAttempt>,
 ) -> Result<SpeechHistoryRecord, ApiError> {
+    if let Some(attempt) = attempt {
+        attempt
+            .ensure_active()
+            .await
+            .map_err(|err| ApiError::internal(err.to_string()))?;
+    }
     let mut generation_request = build_generation_request(
         req.clone(),
         ctx.correlation_id.clone(),
@@ -1044,33 +1146,52 @@ async fn synthesize_record_internal(
             .await
             .map_err(|err| ApiError::internal(format!("Audio encoding failed: {err}")))??;
 
-    if let Some(record_id) = target_record_id {
-        return state
-            .speech_history_store
-            .complete_record(
-                route_kind,
-                record_id,
-                CompleteSpeechHistoryRecord {
-                    model_id: Some(model_id),
-                    speaker: req.speaker,
-                    language: req.language,
-                    saved_voice_id: req.saved_voice_id,
-                    speed: req.speed.map(f64::from),
-                    input_text,
-                    voice_description: req.voice_description,
-                    reference_text: req.reference_text,
-                    generation_time_ms: output.total_time_ms as f64,
-                    audio_duration_secs: Some(output.duration_secs() as f64),
-                    rtf: Some(output.rtf() as f64),
-                    tokens_generated: Some(output.total_tokens),
-                    audio_mime_type: AudioEncoder::content_type(AudioFormat::Wav).to_string(),
-                    audio_filename: Some(default_audio_filename(route_kind, "wav")),
-                    audio_bytes: encoded_audio,
-                },
-            )
+    if let Some(attempt) = attempt {
+        attempt
+            .ensure_active()
             .await
-            .map_err(map_store_error)?
-            .ok_or_else(|| ApiError::not_found("History record not found"));
+            .map_err(|err| ApiError::internal(err.to_string()))?;
+    }
+
+    if let Some(record_id) = target_record_id {
+        let completion = CompleteSpeechHistoryRecord {
+            model_id: Some(model_id),
+            speaker: req.speaker,
+            language: req.language,
+            saved_voice_id: req.saved_voice_id,
+            speed: req.speed.map(f64::from),
+            input_text,
+            voice_description: req.voice_description,
+            reference_text: req.reference_text,
+            generation_time_ms: output.total_time_ms as f64,
+            audio_duration_secs: Some(output.duration_secs() as f64),
+            rtf: Some(output.rtf() as f64),
+            tokens_generated: Some(output.total_tokens),
+            audio_mime_type: AudioEncoder::content_type(AudioFormat::Wav).to_string(),
+            audio_filename: Some(default_audio_filename(route_kind, "wav")),
+            audio_bytes: encoded_audio,
+        };
+        return match projection_attempt {
+            Some(projection_attempt) => {
+                state
+                    .speech_history_store
+                    .complete_record_for_attempt(
+                        route_kind,
+                        record_id,
+                        projection_attempt,
+                        completion,
+                    )
+                    .await
+            }
+            None => {
+                state
+                    .speech_history_store
+                    .complete_record(route_kind, record_id, completion)
+                    .await
+            }
+        }
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::internal("TTS attempt lost its route projection"));
     }
 
     state

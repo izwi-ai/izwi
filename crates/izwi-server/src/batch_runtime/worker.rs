@@ -1,7 +1,10 @@
 use super::{
-    store::{BatchRuntimeStore, RegisteredWorkerHeartbeatUpdate, StageClaimFilter},
+    store::{
+        BatchRuntimeStore, NewStageOutputArtifact, RegisteredWorkerHeartbeatUpdate,
+        StageClaimFilter,
+    },
     types::{
-        ClaimedStage, QueueClass, RuntimeJobKind, RuntimeWorkerHeartbeatDetails,
+        ClaimedStage, QueueClass, RuntimeArtifact, RuntimeJobKind, RuntimeWorkerHeartbeatDetails,
         RuntimeWorkerRegistration, WorkerResourceCapacity, WORKER_HEARTBEAT_DETAILS_VERSION,
         WORKER_REGISTRATION_VERSION,
     },
@@ -377,6 +380,35 @@ impl StageExecutionContext {
         }
         self.record_runtime_observation(RuntimeStageOutcome::Observed, None);
         Ok(())
+    }
+
+    pub async fn ensure_active(&self) -> anyhow::Result<()> {
+        self.check_cancelled()?;
+        if !self.store.stage_lease_is_active(&self.lease).await? {
+            self.cancellation.cancel(StageCancellationReason::LeaseLost);
+            return Err(anyhow!("Stage attempt no longer owns an active lease"));
+        }
+        Ok(())
+    }
+
+    pub async fn publish_output_artifact(
+        &self,
+        artifact: NewStageOutputArtifact,
+    ) -> anyhow::Result<RuntimeArtifact> {
+        self.ensure_active().await?;
+        match self
+            .store
+            .publish_stage_output_artifact(&self.lease, artifact)
+            .await?
+        {
+            Some(artifact) => Ok(artifact),
+            None => {
+                self.cancellation.cancel(StageCancellationReason::LeaseLost);
+                Err(anyhow!(
+                    "Stage attempt lost ownership before artifact publication"
+                ))
+            }
+        }
     }
 
     pub fn record_runtime_observation(
