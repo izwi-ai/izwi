@@ -34,24 +34,30 @@ const DEFAULT_ALLOWED_CODECS: &[&str] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalAudioProfile {
     SpeechRecognition16KhzMonoWav,
+    ReferenceVoiceSourceRateMonoWav,
 }
 
 impl CanonicalAudioProfile {
     pub const fn id(self) -> &'static str {
         match self {
             Self::SpeechRecognition16KhzMonoWav => "asr_16khz_mono_pcm16_wav_v1",
+            Self::ReferenceVoiceSourceRateMonoWav => {
+                "reference_voice_source_rate_mono_pcm16_wav_v1"
+            }
         }
     }
 
-    pub const fn sample_rate(self) -> u32 {
+    pub const fn target_sample_rate(self, source_sample_rate: u32) -> u32 {
         match self {
             Self::SpeechRecognition16KhzMonoWav => 16_000,
+            Self::ReferenceVoiceSourceRateMonoWav => source_sample_rate,
         }
     }
 
     pub const fn asset_kind(self) -> &'static str {
         match self {
             Self::SpeechRecognition16KhzMonoWav => "audio_canonical_wav",
+            Self::ReferenceVoiceSourceRateMonoWav => "audio_reference_canonical_wav",
         }
     }
 
@@ -151,6 +157,17 @@ pub struct MediaIngestRequest {
     pub content_type: String,
     pub filename: Option<String>,
     pub namespace: String,
+    pub record_id: String,
+    pub route: String,
+}
+
+#[derive(Debug)]
+pub struct ExistingAudioIngestRequest {
+    pub bytes: Vec<u8>,
+    pub storage_key: String,
+    pub storage_namespace: String,
+    pub content_type: String,
+    pub filename: Option<String>,
     pub record_id: String,
     pub route: String,
 }
@@ -350,13 +367,100 @@ impl MediaIngestService {
             source_channel_count = prepared.source.channel_count,
             source_duration_secs = prepared.source_inspection.duration_secs,
             canonical_profile = canonical_profile.id(),
-            canonical_sample_rate = canonical_profile.sample_rate(),
+            canonical_sample_rate = prepared.canonical_inspection.sample_rate,
             "strict audio media ingest completed"
         );
 
         Ok(MediaIngestResult {
             original_storage_key,
             source_size_bytes,
+            source_asset: Some(source_asset),
+            canonical: Some(CanonicalMediaIngestResult {
+                storage_key: canonical_storage_key,
+                asset: canonical_asset,
+            }),
+        })
+    }
+
+    /// Register and canonicalize an audio object that is already durably stored.
+    ///
+    /// This is used when a product projection owns the original download object. The original
+    /// bytes are decoded once, its existing key becomes the runtime source asset, and only the
+    /// immutable canonical derivative is written.
+    pub async fn ingest_existing_audio(
+        &self,
+        request: ExistingAudioIngestRequest,
+        policy: AudioIngestPolicy,
+        canonical_profile: CanonicalAudioProfile,
+    ) -> Result<MediaIngestResult, MediaIngestError> {
+        let ExistingAudioIngestRequest {
+            bytes,
+            storage_key,
+            storage_namespace,
+            content_type,
+            filename,
+            record_id,
+            route,
+        } = request;
+        if bytes.is_empty() {
+            return Err(MediaIngestError::InvalidInput(
+                "Media payload cannot be empty".to_string(),
+            ));
+        }
+
+        let prepared = self.prepare_audio(bytes, policy, canonical_profile).await?;
+        let canonical_namespace = format!("{storage_namespace}/canonical");
+        let canonical_filename = canonical_filename(filename.as_deref());
+        let canonical_storage_key = self
+            .persist(
+                MediaNamespace::Other(canonical_namespace.clone()),
+                record_id,
+                canonical_filename.as_deref(),
+                canonical_profile.content_type(),
+                &prepared.canonical_bytes,
+                canonical_storage_metadata(&route, canonical_profile),
+            )
+            .await?;
+
+        let source_asset = match self
+            .register_source_asset(
+                &storage_namespace,
+                &storage_key,
+                &content_type,
+                filename.as_deref(),
+                &route,
+                &prepared,
+            )
+            .await
+        {
+            Ok(asset) => asset,
+            Err(err) => {
+                self.compensate_delete(&canonical_storage_key).await;
+                return Err(err);
+            }
+        };
+        let canonical_asset = match self
+            .register_canonical_asset(
+                &canonical_namespace,
+                &canonical_storage_key,
+                canonical_filename.as_deref(),
+                &route,
+                canonical_profile,
+                &source_asset,
+                &prepared,
+            )
+            .await
+        {
+            Ok(asset) => asset,
+            Err(err) => {
+                self.compensate_delete(&canonical_storage_key).await;
+                return Err(err);
+            }
+        };
+
+        Ok(MediaIngestResult {
+            original_storage_key: storage_key,
+            source_size_bytes: prepared.source_bytes.len() as u64,
             source_asset: Some(source_asset),
             canonical: Some(CanonicalMediaIngestResult {
                 storage_key: canonical_storage_key,
@@ -484,7 +588,7 @@ impl MediaIngestService {
                 size_bytes: prepared.canonical_bytes.len() as u64,
                 sha256: Some(sha256_hex(&prepared.canonical_bytes)),
                 duration_secs: Some(prepared.canonical_inspection.duration_secs as f64),
-                sample_rate_hz: Some(profile.sample_rate()),
+                sample_rate_hz: Some(prepared.canonical_inspection.sample_rate),
                 channel_count: Some(1),
                 peak_amplitude: Some(prepared.canonical_inspection.peak),
                 rms_amplitude: Some(prepared.canonical_inspection.rms),
@@ -541,17 +645,18 @@ fn prepare_audio_blocking(
     }
     .map_err(|err| MediaIngestError::InvalidInput(format!("Invalid audio payload: {err}")))?;
     policy.validate_source(source_bytes.len(), &decoded.source, &decoded.inspection)?;
+    let target_sample_rate = profile.target_sample_rate(decoded.source.sample_rate);
     let canonical_samples = resample_mono_high_quality(
         &decoded.mono_samples,
         decoded.source.sample_rate,
-        profile.sample_rate(),
+        target_sample_rate,
     )
     .map_err(|err| {
         MediaIngestError::InvalidInput(format!("Failed to canonicalize audio: {err}"))
     })?;
     let canonical_inspection =
-        AudioInspection::from_mono_samples(&canonical_samples, profile.sample_rate());
-    let canonical_bytes = AudioEncoder::new(profile.sample_rate(), 1)
+        AudioInspection::from_mono_samples(&canonical_samples, target_sample_rate);
+    let canonical_bytes = AudioEncoder::new(target_sample_rate, 1)
         .encode(&canonical_samples, AudioFormat::Wav)
         .map_err(|err| MediaIngestError::ProcessingTask(err.to_string()))?;
 
@@ -907,6 +1012,75 @@ mod tests {
             Some(&source_bytes)
         );
         assert!(objects.get(&canonical.storage_key).is_some());
+    }
+
+    #[tokio::test]
+    async fn existing_audio_reuses_original_storage_key_and_writes_only_derivative() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider = Arc::new(RecordingMediaProvider::default());
+        let store = Arc::new(BatchRuntimeStore::initialize_with_database(
+            StoreDatabase::new(temp.path().join("runtime.sqlite")),
+        ));
+        let service = MediaIngestService::with_decode_lane_capacity(provider.clone(), store, 1);
+        let source_bytes = stereo_wav_bytes();
+
+        let result = service
+            .ingest_existing_audio(
+                ExistingAudioIngestRequest {
+                    bytes: source_bytes.clone(),
+                    storage_key: "transcription/original.wav".to_string(),
+                    storage_namespace: "transcription_upload".to_string(),
+                    content_type: "audio/wav".to_string(),
+                    filename: Some("original.wav".to_string()),
+                    record_id: "record-1".to_string(),
+                    route: "speech_to_text".to_string(),
+                },
+                AudioIngestPolicy::media_upload(1_000_000),
+                CanonicalAudioProfile::SpeechRecognition16KhzMonoWav,
+            )
+            .await
+            .expect("existing ingest");
+
+        assert_eq!(
+            result.source_asset.expect("source asset").storage_key,
+            "transcription/original.wav"
+        );
+        assert_eq!(provider.objects.lock().expect("objects").len(), 1);
+        assert!(result.canonical.is_some());
+    }
+
+    #[tokio::test]
+    async fn reference_voice_canonicalization_preserves_source_rate_and_downmixes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider = Arc::new(RecordingMediaProvider::default());
+        let store = Arc::new(BatchRuntimeStore::initialize_with_database(
+            StoreDatabase::new(temp.path().join("runtime.sqlite")),
+        ));
+        let service = MediaIngestService::with_decode_lane_capacity(provider, store, 1);
+
+        let result = service
+            .ingest(
+                MediaIngestRequest {
+                    bytes: stereo_wav_bytes(),
+                    content_type: "audio/wav".to_string(),
+                    filename: Some("reference.wav".to_string()),
+                    namespace: "tts_reference".to_string(),
+                    record_id: "record-1".to_string(),
+                    route: "text_to_speech".to_string(),
+                },
+                AudioIngestPolicy::media_upload(1_000_000),
+                CanonicalAudioProfile::ReferenceVoiceSourceRateMonoWav,
+            )
+            .await
+            .expect("reference ingest");
+
+        let canonical = result.canonical.expect("canonical reference").asset;
+        assert_eq!(canonical.sample_rate_hz, Some(48_000));
+        assert_eq!(canonical.channel_count, Some(1));
+        assert_eq!(
+            canonical.metadata_json["canonical_profile"],
+            CanonicalAudioProfile::ReferenceVoiceSourceRateMonoWav.id()
+        );
     }
 
     #[tokio::test]

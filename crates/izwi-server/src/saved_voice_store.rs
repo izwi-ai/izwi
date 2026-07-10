@@ -105,6 +105,7 @@ pub struct SavedVoiceListCursor {
 #[derive(Debug, Clone)]
 pub struct StoredSavedVoiceAudio {
     pub audio_bytes: Vec<u8>,
+    pub audio_storage_path: String,
     pub audio_mime_type: String,
     pub audio_filename: Option<String>,
 }
@@ -239,6 +240,7 @@ impl SavedVoiceStore {
 
         Ok(Some(StoredSavedVoiceAudio {
             audio_bytes: audio.bytes,
+            audio_storage_path,
             audio_mime_type,
             audio_filename,
         }))

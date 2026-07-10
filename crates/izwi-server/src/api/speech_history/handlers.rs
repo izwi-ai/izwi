@@ -14,22 +14,27 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use crate::api::audio_payload::decode_base64_audio_payload;
 use crate::api::pagination::{encode_cursor, CursorPagination, CursorPaginationQuery};
 use crate::api::request_context::RequestContext;
 use crate::api::saved_voices::resolve_saved_voice_reference;
 use crate::api::tts_long_form::{expand_generation_requests_for_long_form, generate_long_form_tts};
 use crate::batch_runtime::{
     store::{
-        sha256_hex, BatchRuntimeStore, NewIdempotencyRecord, NewJobStage, NewMediaAsset,
-        NewRuntimeArtifact, NewRuntimeJob, NewTextAsset,
+        sha256_hex, BatchRuntimeStore, NewIdempotencyRecord, NewJobStage, NewJobStageDispatch,
+        NewMediaAsset, NewRuntimeArtifact, NewRuntimeJob, NewTextAsset,
     },
     types::{
-        ClaimedStage, RuntimeArtifactKind, RuntimeArtifactRole, RuntimeJobKind, RuntimeJobStatus,
-        RuntimeStageStatus,
+        ClaimedStage, QueueClass, RuntimeArtifactKind, RuntimeArtifactRole, RuntimeJobKind,
+        RuntimeJobStatus, RuntimeStageStatus, StageResourceHints,
     },
     worker::{StageExecutionOutcome, StageExecutor},
 };
 use crate::error::ApiError;
+use crate::media_ingest::{
+    AudioIngestPolicy, CanonicalAudioProfile, ExistingAudioIngestRequest, MediaIngestError,
+    MediaIngestRequest, MediaIngestResult,
+};
 use crate::speech_history_store::{
     CompleteSpeechHistoryRecord, NewSpeechHistoryRecord, SpeechHistoryProcessingStatus,
     SpeechHistoryRecord, SpeechHistoryRecordListCursor, SpeechHistoryRecordSummary,
@@ -49,6 +54,7 @@ const HISTORY_LIST_LIMIT: usize = 200;
 const DEFAULT_STREAM_EVENT_QUEUE_CAPACITY: usize = 32;
 const STREAM_CLIENT_DISCONNECTED_MESSAGE: &str = "Streaming client disconnected before completion";
 const BATCH_TTS_STAGE_KIND: &str = "tts_synthesize";
+const REFERENCE_AUDIO_UPLOAD_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct RecordAudioQuery {
@@ -106,6 +112,23 @@ struct BatchSpeechRequest {
     model_id: String,
     input_text: String,
     request: CreateSpeechHistoryRecordRequest,
+}
+
+impl BatchSpeechRequest {
+    fn for_durable_job(
+        route_kind: SpeechRouteKind,
+        model_id: String,
+        input_text: String,
+        mut request: CreateSpeechHistoryRecordRequest,
+    ) -> Self {
+        request.reference_audio = None;
+        Self {
+            route_kind,
+            model_id,
+            input_text,
+            request,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -494,6 +517,87 @@ fn extract_idempotency_key(headers: &HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
+async fn ingest_batch_reference_audio(
+    state: &AppState,
+    placeholder: &SpeechHistoryRecord,
+    route_kind: SpeechRouteKind,
+    req: &CreateSpeechHistoryRecordRequest,
+) -> Result<Option<MediaIngestResult>, ApiError> {
+    let Some(reference_audio) = req.reference_audio.as_deref() else {
+        return Ok(None);
+    };
+    let policy = AudioIngestPolicy::media_upload(REFERENCE_AUDIO_UPLOAD_LIMIT_BYTES);
+    let profile = CanonicalAudioProfile::ReferenceVoiceSourceRateMonoWav;
+
+    if let Some(saved_voice_id) = req.saved_voice_id.as_deref() {
+        let saved_audio = state
+            .saved_voice_store
+            .get_audio(saved_voice_id.to_string())
+            .await
+            .map_err(map_store_error)?
+            .ok_or_else(|| ApiError::not_found("Saved voice audio not found"))?;
+        return state
+            .media_ingest
+            .ingest_existing_audio(
+                ExistingAudioIngestRequest {
+                    bytes: saved_audio.audio_bytes,
+                    storage_key: saved_audio.audio_storage_path,
+                    storage_namespace: "saved_voice".to_string(),
+                    content_type: saved_audio.audio_mime_type,
+                    filename: saved_audio.audio_filename,
+                    record_id: placeholder.id.clone(),
+                    route: route_kind.as_db_value().to_string(),
+                },
+                policy,
+                profile,
+            )
+            .await
+            .map(Some)
+            .map_err(map_media_ingest_error);
+    }
+
+    let payload = decode_base64_audio_payload(reference_audio)?;
+    let content_type = payload
+        .content_type_hint()
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    state
+        .media_ingest
+        .ingest(
+            MediaIngestRequest {
+                bytes: payload.bytes,
+                content_type,
+                filename: payload.filename,
+                namespace: "tts_reference".to_string(),
+                record_id: placeholder.id.clone(),
+                route: route_kind.as_db_value().to_string(),
+            },
+            policy,
+            profile,
+        )
+        .await
+        .map(Some)
+        .map_err(map_media_ingest_error)
+}
+
+fn durable_tts_request_hash(
+    request_json: &serde_json::Value,
+    reference_ingest: Option<&MediaIngestResult>,
+) -> String {
+    let reference_sha256 = reference_ingest
+        .and_then(|ingest| ingest.source_asset.as_ref())
+        .and_then(|asset| asset.sha256.as_deref());
+    let hash_input = serde_json::json!({
+        "request": request_json,
+        "reference_audio_sha256": reference_sha256
+    });
+    sha256_hex(
+        serde_json::to_string(&hash_input)
+            .unwrap_or_default()
+            .as_bytes(),
+    )
+}
+
 async fn enqueue_batch_speech_job(
     state: &AppState,
     placeholder: &SpeechHistoryRecord,
@@ -504,19 +608,13 @@ async fn enqueue_batch_speech_job(
     correlation_id: Option<String>,
     idempotency_key: Option<String>,
 ) -> Result<(), ApiError> {
-    let request_snapshot = BatchSpeechRequest {
-        route_kind,
-        model_id: model_id.clone(),
-        input_text: input_text.clone(),
-        request: req,
-    };
+    let reference_ingest =
+        ingest_batch_reference_audio(state, placeholder, route_kind, &req).await?;
+    let request_snapshot =
+        BatchSpeechRequest::for_durable_job(route_kind, model_id.clone(), input_text.clone(), req);
     let request_json = serde_json::to_value(&request_snapshot)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    let request_hash = sha256_hex(
-        serde_json::to_string(&request_json)
-            .unwrap_or_default()
-            .as_bytes(),
-    );
+    let request_hash = durable_tts_request_hash(&request_json, reference_ingest.as_ref());
 
     let text_asset = state
         .batch_runtime_store
@@ -545,7 +643,10 @@ async fn enqueue_batch_speech_job(
             capability: Some("tts".to_string()),
             route_record_kind: Some(route_kind.as_db_value().to_string()),
             route_record_id: Some(placeholder.id.clone()),
-            input_media_asset_id: None,
+            input_media_asset_id: reference_ingest
+                .as_ref()
+                .and_then(|ingest| ingest.source_asset.as_ref())
+                .map(|asset| asset.id.clone()),
             input_text_asset_id: Some(text_asset.id.clone()),
             request_json: request_json.clone(),
             model_snapshot_json: serde_json::json!({}),
@@ -557,7 +658,7 @@ async fn enqueue_batch_speech_job(
         .await
         .map_err(map_store_error)?;
 
-    let input_artifact = state
+    let text_input_artifact = state
         .batch_runtime_store
         .create_artifact(NewRuntimeArtifact {
             job_id: job.id.clone(),
@@ -571,23 +672,89 @@ async fn enqueue_batch_speech_job(
             filename: Some(format!("{}.input.txt", placeholder.id)),
             size_bytes: Some(input_text.len() as u64),
             sha256: Some(sha256_hex(input_text.as_bytes())),
-            metadata_json: serde_json::json!({"route_record_id": placeholder.id.clone()}),
+            metadata_json: serde_json::json!({
+                "route_record_id": placeholder.id.clone(),
+                "input_kind": "text"
+            }),
             retention_policy: "default".to_string(),
         })
         .await
         .map_err(map_store_error)?;
 
+    let mut stage_input_artifact_ids = vec![text_input_artifact.id];
+    if let Some(reference_ingest) = reference_ingest {
+        let source_asset = reference_ingest.source_asset.ok_or_else(|| {
+            ApiError::internal("Reference audio ingest did not register its source asset")
+        })?;
+        let canonical = reference_ingest.canonical.ok_or_else(|| {
+            ApiError::internal("Reference audio ingest did not create a canonical asset")
+        })?;
+        let original_artifact = state
+            .batch_runtime_store
+            .create_artifact(NewRuntimeArtifact {
+                job_id: job.id.clone(),
+                stage_id: None,
+                artifact_kind: RuntimeArtifactKind::Media,
+                artifact_role: RuntimeArtifactRole::InputOriginal,
+                media_asset_id: Some(source_asset.id),
+                text_asset_id: None,
+                storage_key: Some(source_asset.storage_key),
+                content_type: Some(source_asset.content_type),
+                filename: source_asset.filename,
+                size_bytes: Some(source_asset.size_bytes),
+                sha256: source_asset.sha256,
+                metadata_json: serde_json::json!({
+                    "route_record_id": placeholder.id.clone(),
+                    "input_kind": "reference_audio",
+                    "canonical_profile": CanonicalAudioProfile::ReferenceVoiceSourceRateMonoWav.id()
+                }),
+                retention_policy: "default".to_string(),
+            })
+            .await
+            .map_err(map_store_error)?;
+        let canonical_artifact = state
+            .batch_runtime_store
+            .create_artifact(NewRuntimeArtifact {
+                job_id: job.id.clone(),
+                stage_id: None,
+                artifact_kind: RuntimeArtifactKind::Media,
+                artifact_role: RuntimeArtifactRole::InputCanonical,
+                media_asset_id: Some(canonical.asset.id),
+                text_asset_id: None,
+                storage_key: Some(canonical.asset.storage_key),
+                content_type: Some(canonical.asset.content_type),
+                filename: canonical.asset.filename,
+                size_bytes: Some(canonical.asset.size_bytes),
+                sha256: canonical.asset.sha256,
+                metadata_json: serde_json::json!({
+                    "route_record_id": placeholder.id.clone(),
+                    "input_kind": "reference_audio",
+                    "source_artifact_id": original_artifact.id,
+                    "canonical_profile": CanonicalAudioProfile::ReferenceVoiceSourceRateMonoWav.id(),
+                    "sample_rate_hz": canonical.asset.sample_rate_hz
+                }),
+                retention_policy: "default".to_string(),
+            })
+            .await
+            .map_err(map_store_error)?;
+        stage_input_artifact_ids.push(canonical_artifact.id);
+    }
+
     state
         .batch_runtime_store
-        .create_stage(NewJobStage {
-            job_id: job.id.clone(),
-            sequence: 0,
-            stage_kind: BATCH_TTS_STAGE_KIND.to_string(),
-            status: RuntimeStageStatus::Queued,
-            capability: Some("tts".to_string()),
-            model_id: Some(request_snapshot.model_id.clone()),
-            max_attempts: 2,
-            input_artifact_ids: vec![input_artifact.id],
+        .create_stage_with_dispatch(NewJobStageDispatch {
+            stage: NewJobStage {
+                job_id: job.id.clone(),
+                sequence: 0,
+                stage_kind: BATCH_TTS_STAGE_KIND.to_string(),
+                status: RuntimeStageStatus::Queued,
+                capability: Some("tts".to_string()),
+                model_id: Some(request_snapshot.model_id.clone()),
+                max_attempts: 2,
+                input_artifact_ids: stage_input_artifact_ids,
+            },
+            queue_class: QueueClass::BatchTts,
+            resource_hints: StageResourceHints::default(),
         })
         .await
         .map_err(map_store_error)?;
@@ -637,8 +804,10 @@ impl StageExecutor for BatchTtsStageExecutor {
             .route_record_id
             .clone()
             .ok_or_else(|| anyhow::anyhow!("TTS batch job is missing route_record_id"))?;
-        let request: BatchSpeechRequest = serde_json::from_value(claimed.job.request_json.clone())
-            .context("Failed to decode TTS batch request")?;
+        let mut request: BatchSpeechRequest =
+            serde_json::from_value(claimed.job.request_json.clone())
+                .context("Failed to decode TTS batch request")?;
+        hydrate_batch_reference_audio(&self.state, &claimed, &mut request.request).await?;
         let variant = parse_tts_model_variant(request.model_id.as_str())
             .map_err(|err| anyhow::anyhow!("Unsupported TTS model: {err}"))?;
         let ctx = RequestContext {
@@ -703,6 +872,40 @@ impl StageExecutor for BatchTtsStageExecutor {
             output_artifact_ids: vec![output_artifact.id],
         })
     }
+}
+
+async fn hydrate_batch_reference_audio(
+    state: &AppState,
+    claimed: &ClaimedStage,
+    request: &mut CreateSpeechHistoryRecordRequest,
+) -> anyhow::Result<()> {
+    if request.reference_audio.is_some() || request.reference_text.is_none() {
+        return Ok(());
+    }
+
+    for artifact_id in &claimed.stage.input_artifact_ids {
+        let Some(artifact) = state.batch_runtime_store.get_artifact(artifact_id).await? else {
+            continue;
+        };
+        if artifact.artifact_role != RuntimeArtifactRole::InputCanonical
+            || artifact.metadata_json["input_kind"] != "reference_audio"
+        {
+            continue;
+        }
+        let storage_key = artifact.storage_key.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("Canonical TTS reference artifact is missing storage_key")
+        })?;
+        let stored = state
+            .media_ingest
+            .read_object(storage_key)
+            .await
+            .context("Failed to read canonical TTS reference artifact")?;
+        request.reference_audio =
+            Some(base64::engine::general_purpose::STANDARD.encode(stored.bytes));
+        return Ok(());
+    }
+
+    anyhow::bail!("TTS batch request is missing its reference-audio input artifact")
 }
 
 async fn create_speech_audio_runtime_artifact(
@@ -913,7 +1116,8 @@ async fn stream_record_creation(
         true,
         variant,
     );
-    let mut planned_requests = expand_generation_requests_for_long_form(&generation_request, variant);
+    let mut planned_requests =
+        expand_generation_requests_for_long_form(&generation_request, variant);
     let stream_request_id = generation_request.id.clone();
     let placeholder_record_id = placeholder.id.clone();
 
@@ -1670,6 +1874,45 @@ mod tests {
     }
 
     #[test]
+    fn new_batch_request_json_omits_embedded_reference_audio() {
+        let mut request = base_request();
+        request.reference_audio = Some("large-base64-audio".to_string());
+        request.reference_text = Some("Reference words".to_string());
+
+        let snapshot = BatchSpeechRequest::for_durable_job(
+            SpeechRouteKind::TextToSpeech,
+            "Qwen3-TTS-12Hz-1.7B-Base".to_string(),
+            "Hello".to_string(),
+            request,
+        );
+        let json = serde_json::to_value(snapshot).expect("serialize batch request");
+
+        assert!(json["request"]["reference_audio"].is_null());
+        assert_eq!(json["request"]["reference_text"], "Reference words");
+    }
+
+    #[test]
+    fn legacy_batch_request_json_still_reads_embedded_reference_audio() {
+        let mut request = base_request();
+        request.reference_audio = Some("legacy-base64-audio".to_string());
+        request.reference_text = Some("Reference words".to_string());
+        let json = serde_json::to_value(BatchSpeechRequest {
+            route_kind: SpeechRouteKind::TextToSpeech,
+            model_id: "Qwen3-TTS-12Hz-1.7B-Base".to_string(),
+            input_text: "Hello".to_string(),
+            request,
+        })
+        .expect("serialize legacy request");
+
+        let decoded: BatchSpeechRequest =
+            serde_json::from_value(json).expect("decode legacy batch request");
+        assert_eq!(
+            decoded.request.reference_audio.as_deref(),
+            Some("legacy-base64-audio")
+        );
+    }
+
+    #[test]
     fn normalize_create_request_trims_optional_fields() {
         let normalized = normalize_create_request(CreateSpeechHistoryRecordRequest {
             model_id: Some("  Qwen3-TTS-12Hz-1.7B-Base  ".to_string()),
@@ -1909,4 +2152,12 @@ fn audio_response(audio: StoredSpeechAudio, as_attachment: bool) -> Response {
 
 fn map_store_error(err: anyhow::Error) -> ApiError {
     ApiError::internal(format!("Speech history storage error: {err}"))
+}
+
+fn map_media_ingest_error(err: MediaIngestError) -> ApiError {
+    if err.is_invalid_input() {
+        ApiError::bad_request(err.to_string())
+    } else {
+        ApiError::internal(format!("Speech reference media ingest error: {err}"))
+    }
 }

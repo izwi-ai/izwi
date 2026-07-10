@@ -16,23 +16,25 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::api::audio_payload::{
-    decode_base64_audio_payload, inspect_audio_payload_bytes,
-    inspect_audio_payload_with_diagnostics, read_multipart_audio_base64_payload,
-    read_multipart_audio_file_payload,
+    decode_base64_audio_payload, inspect_audio_payload_with_diagnostics,
+    read_multipart_audio_base64_payload, read_multipart_audio_file_payload,
 };
 use crate::api::request_context::RequestContext;
 use crate::batch_runtime::{
     store::{
-        sha256_hex, BatchRuntimeStore, NewIdempotencyRecord, NewJobStage, NewMediaAsset,
+        sha256_hex, BatchRuntimeStore, NewIdempotencyRecord, NewJobStage, NewJobStageDispatch,
         NewRuntimeArtifact, NewRuntimeJob, NewTextAsset,
     },
     types::{
-        ClaimedStage, RuntimeArtifactKind, RuntimeArtifactRole, RuntimeJobKind, RuntimeJobStatus,
-        RuntimeStageStatus,
+        ClaimedStage, QueueClass, RuntimeArtifactKind, RuntimeArtifactRole, RuntimeJobKind,
+        RuntimeJobStatus, RuntimeStageStatus, StageResourceHints,
     },
     worker::{StageExecutionOutcome, StageExecutor},
 };
 use crate::error::ApiError;
+use crate::media_ingest::{
+    AudioIngestPolicy, CanonicalAudioProfile, ExistingAudioIngestRequest, MediaIngestError,
+};
 use crate::state::AppState;
 use crate::transcription_store::{
     CompleteTranscriptionRecord, NewTranscriptionRecord, SpeakerAttributedAsrStatus,
@@ -61,6 +63,7 @@ const MAX_SEGMENT_DURATION_SECS: f32 = 9.0;
 const MIN_SENTENCE_BREAK_WORDS: usize = 5;
 const SEGMENT_GAP_BREAK_SECS: f32 = 0.85;
 const BATCH_ASR_STAGE_KIND: &str = "asr_transcribe";
+const LONG_FORM_ASR_THRESHOLD_SECS: f64 = 5.0 * 60.0;
 
 #[derive(Debug, Serialize)]
 pub struct DeleteTranscriptionRecordResponse {
@@ -428,7 +431,6 @@ async fn enqueue_batch_transcription_job(
         .await
         .map_err(map_store_error)?
         .ok_or_else(|| ApiError::not_found("Transcription audio payload not found"))?;
-    let inspection = inspect_audio_payload_bytes(audio.audio_bytes.as_slice())?;
     let request_snapshot = BatchTranscriptionRequest::from_parsed(parsed);
     let request_json = serde_json::to_value(&request_snapshot)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
@@ -438,31 +440,30 @@ async fn enqueue_batch_transcription_job(
             .as_bytes(),
     );
 
-    let media_asset = state
-        .batch_runtime_store
-        .create_media_asset(NewMediaAsset {
-            asset_kind: "audio_original".to_string(),
-            storage_namespace: "transcription_upload".to_string(),
-            storage_key: audio.audio_storage_path,
-            content_type: audio.audio_mime_type,
-            filename: audio.audio_filename,
-            size_bytes: audio.audio_bytes.len() as u64,
-            sha256: Some(sha256_hex(audio.audio_bytes.as_slice())),
-            duration_secs: Some(inspection.duration_secs as f64),
-            sample_rate_hz: Some(inspection.sample_rate),
-            channel_count: Some(1),
-            peak_amplitude: Some(inspection.peak),
-            rms_amplitude: Some(inspection.rms),
-            scan_status: "passed".to_string(),
-            retention_policy: "default".to_string(),
-            metadata_json: serde_json::json!({
-                "route_record_id": placeholder.id,
-                "route": "speech_to_text",
-                "normalized": false
-            }),
-        })
+    let ingested = state
+        .media_ingest
+        .ingest_existing_audio(
+            ExistingAudioIngestRequest {
+                bytes: audio.audio_bytes,
+                storage_key: audio.audio_storage_path,
+                storage_namespace: "transcription_upload".to_string(),
+                content_type: audio.audio_mime_type,
+                filename: audio.audio_filename,
+                record_id: placeholder.id.clone(),
+                route: "speech_to_text".to_string(),
+            },
+            AudioIngestPolicy::media_upload(AUDIO_UPLOAD_LIMIT_BYTES),
+            CanonicalAudioProfile::SpeechRecognition16KhzMonoWav,
+        )
         .await
-        .map_err(map_store_error)?;
+        .map_err(map_media_ingest_error)?;
+    let source_asset = ingested
+        .source_asset
+        .ok_or_else(|| ApiError::internal("Audio ingest did not register its source asset"))?;
+    let canonical = ingested
+        .canonical
+        .ok_or_else(|| ApiError::internal("Audio ingest did not create a canonical asset"))?;
+    let duration_secs = source_asset.duration_secs.unwrap_or_default();
 
     let job = state
         .batch_runtime_store
@@ -474,7 +475,7 @@ async fn enqueue_batch_transcription_job(
             capability: Some("asr".to_string()),
             route_record_kind: Some(request_snapshot.record_mode.as_db_value().to_string()),
             route_record_id: Some(placeholder.id.clone()),
-            input_media_asset_id: Some(media_asset.id.clone()),
+            input_media_asset_id: Some(source_asset.id.clone()),
             input_text_asset_id: None,
             request_json: request_json.clone(),
             model_snapshot_json: serde_json::json!({}),
@@ -486,21 +487,53 @@ async fn enqueue_batch_transcription_job(
         .await
         .map_err(map_store_error)?;
 
-    let input_artifact = state
+    let original_artifact = state
         .batch_runtime_store
         .create_artifact(NewRuntimeArtifact {
             job_id: job.id.clone(),
             stage_id: None,
             artifact_kind: RuntimeArtifactKind::Media,
             artifact_role: RuntimeArtifactRole::InputOriginal,
-            media_asset_id: Some(media_asset.id),
+            media_asset_id: Some(source_asset.id),
             text_asset_id: None,
-            storage_key: Some(media_asset.storage_key),
-            content_type: Some(media_asset.content_type),
-            filename: media_asset.filename,
-            size_bytes: Some(media_asset.size_bytes),
-            sha256: media_asset.sha256,
-            metadata_json: serde_json::json!({"route_record_id": placeholder.id}),
+            storage_key: Some(source_asset.storage_key),
+            content_type: Some(source_asset.content_type),
+            filename: source_asset.filename,
+            size_bytes: Some(source_asset.size_bytes),
+            sha256: source_asset.sha256,
+            metadata_json: serde_json::json!({
+                "route_record_id": placeholder.id,
+                "source_sample_rate_hz": source_asset.sample_rate_hz,
+                "canonical_profile": CanonicalAudioProfile::SpeechRecognition16KhzMonoWav.id()
+            }),
+            retention_policy: "default".to_string(),
+        })
+        .await
+        .map_err(map_store_error)?;
+
+    let canonical_artifact = state
+        .batch_runtime_store
+        .create_artifact(NewRuntimeArtifact {
+            job_id: job.id.clone(),
+            stage_id: None,
+            artifact_kind: RuntimeArtifactKind::Media,
+            artifact_role: RuntimeArtifactRole::InputCanonical,
+            media_asset_id: Some(canonical.asset.id),
+            text_asset_id: None,
+            storage_key: Some(canonical.asset.storage_key),
+            content_type: Some(canonical.asset.content_type),
+            filename: canonical.asset.filename,
+            size_bytes: Some(canonical.asset.size_bytes),
+            sha256: canonical.asset.sha256,
+            metadata_json: serde_json::json!({
+                "route_record_id": placeholder.id,
+                "source_artifact_id": original_artifact.id,
+                "canonical_profile": CanonicalAudioProfile::SpeechRecognition16KhzMonoWav.id(),
+                "timebase": {
+                    "source_sample_rate_hz": source_asset.sample_rate_hz,
+                    "canonical_sample_rate_hz": canonical.asset.sample_rate_hz
+                }
+            }),
             retention_policy: "default".to_string(),
         })
         .await
@@ -508,15 +541,22 @@ async fn enqueue_batch_transcription_job(
 
     state
         .batch_runtime_store
-        .create_stage(NewJobStage {
-            job_id: job.id.clone(),
-            sequence: 0,
-            stage_kind: BATCH_ASR_STAGE_KIND.to_string(),
-            status: RuntimeStageStatus::Queued,
-            capability: Some("asr".to_string()),
-            model_id: request_snapshot.model_id,
-            max_attempts: 2,
-            input_artifact_ids: vec![input_artifact.id],
+        .create_stage_with_dispatch(NewJobStageDispatch {
+            stage: NewJobStage {
+                job_id: job.id.clone(),
+                sequence: 0,
+                stage_kind: BATCH_ASR_STAGE_KIND.to_string(),
+                status: RuntimeStageStatus::Queued,
+                capability: Some("asr".to_string()),
+                model_id: request_snapshot.model_id,
+                max_attempts: 2,
+                input_artifact_ids: vec![canonical_artifact.id],
+            },
+            queue_class: asr_queue_class(duration_secs),
+            resource_hints: StageResourceHints {
+                estimated_duration_ms: Some((duration_secs.max(0.0) * 1_000.0) as u64),
+                ..StageResourceHints::default()
+            },
         })
         .await
         .map_err(map_store_error)?;
@@ -545,6 +585,14 @@ async fn enqueue_batch_transcription_job(
     Ok(())
 }
 
+fn asr_queue_class(duration_secs: f64) -> QueueClass {
+    if duration_secs >= LONG_FORM_ASR_THRESHOLD_SECS {
+        QueueClass::LongFormAsr
+    } else {
+        QueueClass::BatchAsr
+    }
+}
+
 pub(crate) fn batch_asr_stage_executor(state: AppState) -> Arc<dyn StageExecutor> {
     Arc::new(BatchAsrStageExecutor { state })
 }
@@ -569,6 +617,7 @@ impl StageExecutor for BatchAsrStageExecutor {
             serde_json::from_value(claimed.job.request_json.clone())
                 .context("Failed to decode ASR batch request")?;
         let parsed = request.into_parsed();
+        let canonical_audio = resolve_batch_asr_audio(&self.state, &claimed).await?;
 
         let record = process_transcription_record(
             self.state.clone(),
@@ -577,6 +626,7 @@ impl StageExecutor for BatchAsrStageExecutor {
             claimed.job.correlation_id.clone(),
             WorkloadClass::Batch,
             None,
+            Some(canonical_audio),
         )
         .await
         .map_err(|err| anyhow::anyhow!(err.message))?;
@@ -642,6 +692,42 @@ async fn create_transcript_runtime_artifact(
         .await
 }
 
+async fn resolve_batch_asr_audio(
+    state: &AppState,
+    claimed: &ClaimedStage,
+) -> anyhow::Result<Vec<u8>> {
+    for artifact_id in &claimed.stage.input_artifact_ids {
+        let Some(artifact) = state.batch_runtime_store.get_artifact(artifact_id).await? else {
+            continue;
+        };
+        if artifact.artifact_role != RuntimeArtifactRole::InputCanonical {
+            continue;
+        }
+        let storage_key = artifact
+            .storage_key
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Canonical ASR artifact is missing storage_key"))?;
+        return state
+            .media_ingest
+            .read_object(storage_key)
+            .await
+            .map(|stored| stored.bytes)
+            .context("Failed to read canonical ASR input artifact");
+    }
+
+    let record_id = claimed
+        .job
+        .route_record_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("ASR batch job is missing route_record_id"))?;
+    state
+        .transcription_store
+        .get_audio(record_id)
+        .await?
+        .map(|audio| audio.audio_bytes)
+        .ok_or_else(|| anyhow::anyhow!("Legacy ASR route audio payload was not found"))
+}
+
 fn spawn_transcription_processing_task(
     state: AppState,
     record_id: String,
@@ -658,6 +744,7 @@ fn spawn_transcription_processing_task(
             correlation_id,
             workload_class,
             event_tx.clone(),
+            None,
         )
         .await;
         if let Some(tx) = event_tx {
@@ -688,6 +775,7 @@ async fn process_transcription_record(
     correlation_id: Option<String>,
     workload_class: WorkloadClass,
     event_tx: Option<mpsc::UnboundedSender<String>>,
+    audio_override: Option<Vec<u8>>,
 ) -> Result<TranscriptionRecord, ApiError> {
     let transcription_store = state.transcription_store.clone();
     let result = process_transcription_record_inner(
@@ -697,6 +785,7 @@ async fn process_transcription_record(
         correlation_id,
         workload_class,
         event_tx,
+        audio_override,
     )
     .await;
     if let Err(err) = &result {
@@ -718,6 +807,7 @@ async fn process_transcription_record_inner(
     correlation_id: Option<String>,
     workload_class: WorkloadClass,
     event_tx: Option<mpsc::UnboundedSender<String>>,
+    audio_override: Option<Vec<u8>>,
 ) -> Result<TranscriptionRecord, ApiError> {
     let runtime = state.runtime.clone();
     let transcription_store = state.transcription_store.clone();
@@ -748,12 +838,17 @@ async fn process_transcription_record_inner(
     send_event(progress_event_payload(initial_progress));
     send_event(serde_json::to_string(&StreamStartEvent { event: "start" }).unwrap_or_default());
 
-    let audio = transcription_store
-        .get_audio(record_id.clone())
-        .await
-        .map_err(map_store_error)?
-        .ok_or_else(|| ApiError::not_found("Transcription audio payload not found"))?;
-    let audio_bytes = audio.audio_bytes;
+    let audio_bytes = match audio_override {
+        Some(audio_bytes) => audio_bytes,
+        None => {
+            transcription_store
+                .get_audio(record_id.clone())
+                .await
+                .map_err(map_store_error)?
+                .ok_or_else(|| ApiError::not_found("Transcription audio payload not found"))?
+                .audio_bytes
+        }
+    };
     let delta_tx = event_tx.clone();
     let progress_tx = event_tx.clone();
     let progress_store = transcription_store.clone();
@@ -1662,6 +1757,14 @@ fn map_store_error(err: anyhow::Error) -> ApiError {
     ApiError::internal(format!("Transcription storage error: {err}"))
 }
 
+fn map_media_ingest_error(err: MediaIngestError) -> ApiError {
+    if err.is_invalid_input() {
+        ApiError::bad_request(err.to_string())
+    } else {
+        ApiError::internal(format!("Transcription media ingest error: {err}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::{
@@ -1673,11 +1776,12 @@ mod tests {
     use izwi_core::{AsrProgress, AsrProgressPhase};
 
     use super::{
-        alignments_to_word_records, build_segment_records, initial_summary_state,
+        alignments_to_word_records, asr_queue_class, build_segment_records, initial_summary_state,
         multipart_field_api_error, parse_bool, parse_create_request, progress_event_payload,
         sanitize_summary_output, should_retry_transcription_summary_generation,
         transcription_summary_messages, transcription_summary_params,
-        validate_batch_transcription_model, TranscriptionSummaryStatus, TranscriptionWordRecord,
+        validate_batch_transcription_model, QueueClass, TranscriptionSummaryStatus,
+        TranscriptionWordRecord,
     };
 
     fn wav_bytes() -> Vec<u8> {
@@ -1689,6 +1793,12 @@ mod tests {
     fn wav_data_url(content_type: &str) -> String {
         let b64 = base64::engine::general_purpose::STANDARD.encode(wav_bytes());
         format!("data:{content_type};base64, {b64}\n")
+    }
+
+    #[test]
+    fn durable_asr_uses_a_separate_queue_for_long_form_audio() {
+        assert_eq!(asr_queue_class(299.999), QueueClass::BatchAsr);
+        assert_eq!(asr_queue_class(300.0), QueueClass::LongFormAsr);
     }
 
     #[tokio::test]
