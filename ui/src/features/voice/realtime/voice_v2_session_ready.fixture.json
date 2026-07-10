@@ -1,0 +1,16 @@
+{
+  "protocol": "voice_realtime",
+  "version": 2,
+  "event_id": 1,
+  "sequence": 0,
+  "session_id": "voice-session-1",
+  "connection_epoch": 0,
+  "timestamp_ms": 1725000000123,
+  "type": "session_ready",
+  "data": {
+    "accepted_version": 2,
+    "owner_instance_id": "process-42",
+    "resumable": false,
+    "resume_window_ms": 0
+  }
+}

@@ -32,6 +32,7 @@ import {
   UNIFIED_VOICE_PIPELINE_LABEL,
   VOICE_PIPELINE_LABEL,
   VOICE_AGENT_SYSTEM_PROMPT,
+  buildVoiceRealtimeV2SessionStart,
   buildVoiceRealtimeWebSocketUrl,
   decodePcmI16Bytes,
   encodeLiveMicPcm16,
@@ -41,10 +42,13 @@ import {
   formatModelVariantLabel,
   isRunnableModelStatus,
   isUnifiedAudioChatVariant,
+  isValidVoiceRealtimeV2Successor,
+  isVoiceRealtimeV2ServerEnvelope,
   isVoiceRealtimeServerEvent,
   makeTranscriptEntryId,
   mergeSampleChunks,
   parseFinalAnswer,
+  normalizeVoiceRealtimeV2Event,
   shouldStopVoiceRealtimePlayback,
   type VoiceRealtimeMode,
   parseVoiceRealtimeAssistantAudioBinaryChunk,
@@ -54,6 +58,7 @@ import {
   type VoiceRealtimeAssistantAudioBinaryChunk,
   type VoiceRealtimeClientMessage,
   type VoiceRealtimeServerEvent,
+  type VoiceRealtimeV2ServerEnvelope,
 } from "@/features/voice/realtime/support";
 import { getSpeakerProfilesForVariant } from "@/types";
 
@@ -166,6 +171,7 @@ export function VoicePage({
     ((error?: Error) => void) | null
   >(null);
   const voiceWsInputFrameSeqRef = useRef(0);
+  const voiceWsV2EventRef = useRef<VoiceRealtimeV2ServerEnvelope | null>(null);
   const voiceMinAcceptedAssistantSeqRef = useRef(0);
   const voiceUserEntryIdsRef = useRef<Map<string, string>>(new Map());
   const voiceAssistantEntryIdsRef = useRef<Map<string, string>>(new Map());
@@ -589,6 +595,7 @@ export function VoicePage({
       voiceWsSessionReadyRef.current = false;
       voiceWsInputStreamStartedRef.current = false;
       voiceWsInputFrameSeqRef.current = 0;
+      voiceWsV2EventRef.current = null;
       voiceWsInputStreamStartingRef.current = null;
       voiceWsConnectingRef.current = null;
       settleVoiceRealtimeInputStreamReady(
@@ -1172,12 +1179,12 @@ export function VoicePage({
           voiceWsSessionReadyRef.current = false;
           voiceWsInputStreamStartedRef.current = false;
           voiceWsInputFrameSeqRef.current = 0;
+          voiceWsV2EventRef.current = null;
           try {
             ws.send(
-              JSON.stringify({
-                type: "session_start",
-                system_prompt: activeVoiceSystemPrompt,
-              } satisfies VoiceRealtimeClientMessage),
+              JSON.stringify(
+                buildVoiceRealtimeV2SessionStart(activeVoiceSystemPrompt),
+              ),
             );
           } catch (error) {
             settle(() => {
@@ -1215,6 +1222,28 @@ export function VoicePage({
           if (typeof messageEvent.data !== "string") return;
           try {
             const parsed: unknown = JSON.parse(messageEvent.data);
+            if (isVoiceRealtimeV2ServerEnvelope(parsed)) {
+              if (
+                !isValidVoiceRealtimeV2Successor(
+                  voiceWsV2EventRef.current,
+                  parsed,
+                )
+              ) {
+                setError("Voice realtime event sequence was invalid");
+                try {
+                  ws.close(1002, "invalid_event_sequence");
+                } catch {
+                  // Best effort protocol close.
+                }
+                return;
+              }
+              voiceWsV2EventRef.current = parsed;
+              const normalized = normalizeVoiceRealtimeV2Event(parsed);
+              if (normalized) {
+                handleVoiceRealtimeServerEvent(normalized);
+              }
+              return;
+            }
             if (!isVoiceRealtimeServerEvent(parsed)) {
               return;
             }
@@ -1251,6 +1280,7 @@ export function VoicePage({
           voiceWsSessionReadyRef.current = false;
           voiceWsInputStreamStartedRef.current = false;
           voiceWsInputFrameSeqRef.current = 0;
+          voiceWsV2EventRef.current = null;
           voiceWsInputStreamStartingRef.current = null;
           voiceWsConnectingRef.current = null;
           settleVoiceRealtimeInputStreamReady(

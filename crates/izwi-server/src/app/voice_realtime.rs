@@ -40,6 +40,12 @@ use serde_json::json;
 use tokio::sync::Notify;
 use tracing::warn;
 
+use crate::app::realtime_protocol::{
+    RealtimeAudioFormat, RealtimeAudioGapAction, RealtimeClose, RealtimeCloseCode,
+    RealtimeCloseReason, RealtimeErrorCode, RealtimeEventEnvelope, RealtimeInterruptionReason,
+    RealtimeProtocol, RealtimeServerEvent, RealtimeSpeechEndReason, RealtimeTurnStatus,
+    VOICE_REALTIME_VERSION,
+};
 use crate::chat_store::ChatStore;
 use crate::ids::new_uuid;
 use crate::state::{AppState, StoredAgentSessionRecord};
@@ -68,10 +74,105 @@ const WS_OUTBOUND_AUDIO_MAX_MS: u64 = 5_000;
 const WS_WRITER_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const TURN_CANCELLATION_TIMEOUT: Duration = Duration::from_millis(750);
 const SESSION_ACTOR_TICK: Duration = Duration::from_millis(100);
+const LEGACY_VOICE_REALTIME_PROTOCOL: &str = "voice_realtime_v1";
+const TYPED_VOICE_REALTIME_PROTOCOL: &str = "voice_realtime";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum VoiceWireProtocol {
+    #[default]
+    LegacyV1,
+    TypedV2,
+}
+
+fn negotiate_voice_protocol(
+    protocol: Option<&str>,
+    version: Option<u16>,
+    resume_from_event_id: Option<u64>,
+) -> Result<VoiceWireProtocol, String> {
+    match (protocol.map(str::trim), version) {
+        (None, None) => Ok(VoiceWireProtocol::LegacyV1),
+        (Some(TYPED_VOICE_REALTIME_PROTOCOL), Some(VOICE_REALTIME_VERSION)) => {
+            if resume_from_event_id.is_some() {
+                return Err(
+                    "voice_realtime v2 sessions are process-owned and non-resumable".to_string(),
+                );
+            }
+            Ok(VoiceWireProtocol::TypedV2)
+        }
+        (Some(LEGACY_VOICE_REALTIME_PROTOCOL), Some(1)) => Ok(VoiceWireProtocol::LegacyV1),
+        (Some(protocol), Some(version)) => Err(format!(
+            "Unsupported realtime voice protocol negotiation `{protocol}` version {version}"
+        )),
+        _ => Err(
+            "Realtime voice protocol negotiation requires both `protocol` and `version`"
+                .to_string(),
+        ),
+    }
+}
+
+struct TypedVoiceSession {
+    session_id: String,
+    owner_instance_id: String,
+    connection_epoch: u64,
+    next_event_id: u64,
+    next_sequence: u64,
+    next_revision: u64,
+    last_audio_chunk_sequence: u64,
+}
+
+impl TypedVoiceSession {
+    fn new(session_id: String, owner_instance_id: String) -> Self {
+        Self {
+            session_id,
+            owner_instance_id,
+            connection_epoch: 0,
+            next_event_id: 1,
+            next_sequence: 0,
+            next_revision: 1,
+            last_audio_chunk_sequence: 0,
+        }
+    }
+
+    fn next_revision(&mut self) -> u64 {
+        let revision = self.next_revision;
+        self.next_revision = self.next_revision.saturating_add(1);
+        revision
+    }
+
+    fn envelope(
+        &mut self,
+        event: RealtimeServerEvent,
+        utterance_id: Option<String>,
+        turn_id: Option<String>,
+    ) -> RealtimeEventEnvelope<RealtimeServerEvent> {
+        let envelope = RealtimeEventEnvelope {
+            protocol: RealtimeProtocol::VoiceRealtime,
+            version: VOICE_REALTIME_VERSION,
+            event_id: self.next_event_id,
+            sequence: self.next_sequence,
+            session_id: self.session_id.clone(),
+            connection_epoch: self.connection_epoch,
+            timestamp_ms: now_unix_millis(),
+            utterance_id,
+            turn_id,
+            segment_id: None,
+            event,
+        };
+        self.next_event_id = self.next_event_id.saturating_add(1);
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        envelope
+    }
+}
+
+#[derive(Default)]
+struct VoiceOutboundWireState {
+    typed: Option<TypedVoiceSession>,
+}
 
 #[derive(Clone)]
 struct OutboundTx {
     mailbox: Arc<OutboundMailbox>,
+    wire: Arc<Mutex<VoiceOutboundWireState>>,
     runtime: Arc<RuntimeService>,
     label: &'static str,
 }
@@ -80,6 +181,7 @@ impl OutboundTx {
     fn new(runtime: Arc<RuntimeService>, label: &'static str) -> Self {
         Self {
             mailbox: Arc::new(OutboundMailbox::new(OutboundLimits::from_env())),
+            wire: Arc::new(Mutex::new(VoiceOutboundWireState::default())),
             runtime,
             label,
         }
@@ -110,6 +212,24 @@ impl OutboundTx {
         bytes: usize,
         duration_ms: u64,
     ) -> Result<(), OutboundEnqueueError> {
+        if let Message::Binary(frame) = &message {
+            if frame.len() >= WS_BIN_ASSISTANT_HEADER_LEN
+                && frame.get(..4) == Some(WS_BIN_MAGIC.as_slice())
+                && frame.get(5).copied() == Some(WS_BIN_KIND_ASSISTANT_PCM16)
+            {
+                let chunk_sequence =
+                    u32::from_le_bytes([frame[16], frame[17], frame[18], frame[19]]) as u64;
+                if let Some(typed) = self
+                    .wire
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .typed
+                    .as_mut()
+                {
+                    typed.last_audio_chunk_sequence = chunk_sequence;
+                }
+            }
+        }
         self.enqueue(
             message,
             OutboundClass::Audio { bytes, duration_ms },
@@ -144,6 +264,66 @@ impl OutboundTx {
 
     fn cutoff_turn(&self, generation: u64) {
         self.mailbox.cutoff_turn(generation);
+    }
+
+    fn accepts_turn_generation(&self, generation: u64) -> bool {
+        self.mailbox.accepts_turn_generation(generation)
+    }
+
+    fn configure_wire_protocol(
+        &self,
+        protocol: VoiceWireProtocol,
+        session_id: String,
+        owner_instance_id: String,
+    ) {
+        let mut wire = self
+            .wire
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        wire.typed = match protocol {
+            VoiceWireProtocol::LegacyV1 => None,
+            VoiceWireProtocol::TypedV2 => {
+                Some(TypedVoiceSession::new(session_id, owner_instance_id))
+            }
+        };
+    }
+
+    fn typed_protocol_enabled(&self) -> bool {
+        self.wire
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .typed
+            .is_some()
+    }
+
+    fn advance_typed_output_epoch(&self) {
+        if let Some(typed) = self
+            .wire
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .typed
+            .as_mut()
+        {
+            typed.connection_epoch = typed.connection_epoch.saturating_add(1);
+            typed.next_sequence = 0;
+        }
+    }
+
+    fn encode_json_event(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<Option<String>, serde_json::Error> {
+        let mut wire = self
+            .wire
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(typed) = wire.typed.as_mut() else {
+            return serde_json::to_string(value).map(Some);
+        };
+        let Some((event, utterance_id, turn_id)) = map_typed_voice_event(value, typed) else {
+            return Ok(None);
+        };
+        serde_json::to_string(&typed.envelope(event, utterance_id, turn_id)).map(Some)
     }
 
     async fn next(&self) -> Option<MailboxOutput> {
@@ -312,6 +492,10 @@ impl OutboundMailbox {
         state.queue = retained;
     }
 
+    fn accepts_turn_generation(&self, generation: u64) -> bool {
+        generation >= self.minimum_turn_generation.load(Ordering::Acquire)
+    }
+
     async fn next(&self) -> Option<MailboxOutput> {
         loop {
             let notified = self.notify.notified();
@@ -379,6 +563,12 @@ enum ClientEvent {
     SessionStart {
         #[serde(default)]
         system_prompt: Option<String>,
+        #[serde(default)]
+        protocol: Option<String>,
+        #[serde(default)]
+        version: Option<u16>,
+        #[serde(default)]
+        resume_from_event_id: Option<u64>,
     },
     InputStreamStart {
         #[serde(default)]
@@ -1243,7 +1433,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: AppState, correlation_i
         &out_tx,
         json!({
             "type": "connected",
-            "protocol": "voice_realtime_v1",
+            "protocol": LEGACY_VOICE_REALTIME_PROTOCOL,
             "server_time_ms": now_unix_millis(),
         }),
     );
@@ -1356,7 +1546,14 @@ async fn handle_text_message(
         serde_json::from_str(text).map_err(|err| format!("Invalid websocket payload: {err}"))?;
 
     match event {
-        ClientEvent::SessionStart { system_prompt } => {
+        ClientEvent::SessionStart {
+            system_prompt,
+            protocol,
+            version,
+            resume_from_event_id,
+        } => {
+            let wire_protocol =
+                negotiate_voice_protocol(protocol.as_deref(), version, resume_from_event_id)?;
             let profile = state
                 .voice_store
                 .get_default_profile()
@@ -1378,11 +1575,19 @@ async fn handle_text_message(
             conn.started = true;
             let transport_session_id = conn.transport_session_id.clone();
             let owner_instance_id = conn.owner_instance_id.clone();
+            out_tx.configure_wire_protocol(
+                wire_protocol,
+                transport_session_id.clone(),
+                owner_instance_id.clone(),
+            );
             send_json(
                 out_tx,
                 json!({
                     "type": "session_ready",
-                    "protocol": "voice_realtime_v1",
+                    "protocol": match wire_protocol {
+                        VoiceWireProtocol::LegacyV1 => LEGACY_VOICE_REALTIME_PROTOCOL,
+                        VoiceWireProtocol::TypedV2 => TYPED_VOICE_REALTIME_PROTOCOL,
+                    },
                     "session_id": transport_session_id,
                     "owner_instance_id": owner_instance_id,
                     "connection_epoch": 0,
@@ -2508,6 +2713,7 @@ async fn interrupt_active_turn(
             ),
         )
         .await;
+        out_tx.advance_typed_output_epoch();
         send_json(
             out_tx,
             json!({
@@ -2742,9 +2948,211 @@ fn resolve_chat_model_id(raw: Option<&str>) -> Result<String, String> {
     Ok(variant.dir_name().to_string())
 }
 
+fn map_typed_voice_event(
+    value: &serde_json::Value,
+    typed: &mut TypedVoiceSession,
+) -> Option<(RealtimeServerEvent, Option<String>, Option<String>)> {
+    let event_type = value.get("type")?.as_str()?;
+    let utterance_id = value
+        .get("utterance_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let turn_id = value
+        .get("utterance_seq")
+        .and_then(serde_json::Value::as_u64)
+        .map(|sequence| format!("turn-{sequence}"));
+    let event = match event_type {
+        "session_ready" => RealtimeServerEvent::SessionReady {
+            accepted_version: VOICE_REALTIME_VERSION,
+            owner_instance_id: typed.owner_instance_id.clone(),
+            resumable: false,
+            resume_window_ms: 0,
+        },
+        "input_stream_ready" => RealtimeServerEvent::SessionStarted,
+        "user_speech_start" => RealtimeServerEvent::SpeechStarted,
+        "user_speech_end" => RealtimeServerEvent::SpeechEnded {
+            reason: match value
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("silence")
+            {
+                "max_duration" => RealtimeSpeechEndReason::MaxDuration,
+                "client_pause" => RealtimeSpeechEndReason::ClientPause,
+                "stream_stopped" => RealtimeSpeechEndReason::StreamStopped,
+                _ => RealtimeSpeechEndReason::Silence,
+            },
+        },
+        "input_sequence_gap" => {
+            let expected_frame_sequence = value
+                .get("expected_frame_sequence")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default();
+            let received_frame_sequence = value
+                .get("received_frame_sequence")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default();
+            RealtimeServerEvent::AudioGap {
+                expected_frame_sequence,
+                received_frame_sequence,
+                missing_frames: value
+                    .get("missing_frames")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_else(|| {
+                        received_frame_sequence.saturating_sub(expected_frame_sequence)
+                    }),
+                action: RealtimeAudioGapAction::Continue,
+            }
+        }
+        "user_speech_rejected" => RealtimeServerEvent::TurnCompleted {
+            status: RealtimeTurnStatus::NoInput,
+        },
+        "user_transcript_snapshot" => RealtimeServerEvent::TranscriptPartial {
+            text: value
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            revision: typed.next_revision(),
+            language: None,
+        },
+        "user_transcript_final" => RealtimeServerEvent::TranscriptFinal {
+            text: value
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            revision: typed.next_revision(),
+            language: value
+                .get("language")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        },
+        "assistant_text_start" => RealtimeServerEvent::AssistantTextStarted,
+        "assistant_text_snapshot" => RealtimeServerEvent::AssistantTextPartial {
+            text: value
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            revision: typed.next_revision(),
+        },
+        "assistant_text_final" => RealtimeServerEvent::AssistantTextFinal {
+            text: value
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        },
+        "assistant_audio_start" => RealtimeServerEvent::AssistantAudioStarted {
+            sample_rate: value
+                .get("sample_rate")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|sample_rate| u32::try_from(sample_rate).ok())
+                .unwrap_or(24_000),
+            channels: 1,
+            format: match value
+                .get("audio_format")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("pcm_f32") => RealtimeAudioFormat::PcmF32,
+                _ => RealtimeAudioFormat::PcmI16,
+            },
+        },
+        "assistant_audio_done" => RealtimeServerEvent::AssistantAudioCompleted {
+            last_chunk_sequence: typed.last_audio_chunk_sequence,
+        },
+        "turn_interrupted" => RealtimeServerEvent::Interruption {
+            reason: match value
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("client_request")
+            {
+                "barge_in" => RealtimeInterruptionReason::BargeIn,
+                "preempted_by_new_turn" => RealtimeInterruptionReason::PreemptedByNewTurn,
+                "outbound_audio_saturated" => RealtimeInterruptionReason::Backpressure,
+                "socket_closed" => RealtimeInterruptionReason::SessionClosing,
+                _ => RealtimeInterruptionReason::ClientRequest,
+            },
+            cutoff_event_id: typed.next_event_id.saturating_sub(1),
+            cutoff_sequence: typed.next_sequence.saturating_sub(1),
+        },
+        "turn_done" => RealtimeServerEvent::TurnCompleted {
+            status: match value
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("error")
+            {
+                "ok" => RealtimeTurnStatus::Ok,
+                "no_input" => RealtimeTurnStatus::NoInput,
+                "interrupted" => RealtimeTurnStatus::Interrupted,
+                "timeout" => RealtimeTurnStatus::Timeout,
+                _ => RealtimeTurnStatus::Error,
+            },
+        },
+        "error" => {
+            let message = value
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Voice realtime error")
+                .to_string();
+            let code = match value
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+            {
+                "realtime_session_capacity" => RealtimeErrorCode::Backpressure,
+                "buffer_limit" => RealtimeErrorCode::BufferLimit,
+                "model_unavailable" => RealtimeErrorCode::ModelUnavailable,
+                _ => RealtimeErrorCode::InferenceFailed,
+            };
+            if value
+                .get("fatal")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                RealtimeServerEvent::FatalError {
+                    code,
+                    message,
+                    close: RealtimeClose {
+                        code: RealtimeCloseCode::InternalError,
+                        reason: RealtimeCloseReason::InternalError,
+                        message: "voice realtime session failed".to_string(),
+                        retryable: false,
+                    },
+                }
+            } else {
+                RealtimeServerEvent::RecoverableError {
+                    code,
+                    message,
+                    retry_after_ms: None,
+                }
+            }
+        }
+        "pong" => RealtimeServerEvent::Pong {
+            client_timestamp_ms: value
+                .get("timestamp_ms")
+                .and_then(serde_json::Value::as_u64),
+            server_timestamp_ms: value
+                .get("server_time_ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_else(now_unix_millis),
+        },
+        // These legacy-only state markers either have no typed equivalent or would encode
+        // append-only deltas. Typed clients reconstruct state from full snapshots/finals.
+        "input_stream_stopped"
+        | "turn_processing"
+        | "user_transcript_start"
+        | "user_transcript_delta"
+        | "assistant_text_delta" => return None,
+        _ => return None,
+    };
+    Some((event, utterance_id, turn_id))
+}
+
 fn send_json(out_tx: &OutboundTx, value: serde_json::Value) -> bool {
-    match serde_json::to_string(&value) {
-        Ok(text) => out_tx.send(Message::Text(text.into())),
+    match out_tx.encode_json_event(&value) {
+        Ok(Some(text)) => out_tx.send(Message::Text(text.into())),
+        Ok(None) => true,
         Err(err) => {
             warn!("failed to serialize voice ws event: {err}");
             false
@@ -2753,8 +3161,12 @@ fn send_json(out_tx: &OutboundTx, value: serde_json::Value) -> bool {
 }
 
 fn send_turn_json(out_tx: &OutboundTx, output_generation: u64, value: serde_json::Value) -> bool {
-    match serde_json::to_string(&value) {
-        Ok(text) => out_tx.send_turn(output_generation, Message::Text(text.into())),
+    if !out_tx.accepts_turn_generation(output_generation) {
+        return false;
+    }
+    match out_tx.encode_json_event(&value) {
+        Ok(Some(text)) => out_tx.send_turn(output_generation, Message::Text(text.into())),
+        Ok(None) => true,
         Err(err) => {
             warn!("failed to serialize voice ws turn event: {err}");
             false
@@ -2768,8 +3180,17 @@ fn send_turn_text_snapshot(
     key: String,
     value: serde_json::Value,
 ) -> bool {
-    match serde_json::to_string(&value) {
-        Ok(text) => out_tx.send_text_snapshot(output_generation, key, Message::Text(text.into())),
+    if !out_tx.accepts_turn_generation(output_generation) {
+        return false;
+    }
+    match out_tx.encode_json_event(&value) {
+        Ok(Some(text)) if out_tx.typed_protocol_enabled() => {
+            out_tx.send_turn(output_generation, Message::Text(text.into()))
+        }
+        Ok(Some(text)) => {
+            out_tx.send_text_snapshot(output_generation, key, Message::Text(text.into()))
+        }
+        Ok(None) => true,
         Err(err) => {
             warn!("failed to serialize voice ws text snapshot: {err}");
             false
@@ -2778,8 +3199,12 @@ fn send_turn_text_snapshot(
 }
 
 fn send_diagnostic_json(out_tx: &OutboundTx, value: serde_json::Value) -> bool {
-    match serde_json::to_string(&value) {
-        Ok(text) => out_tx.send_diagnostic(Message::Text(text.into())),
+    match out_tx.encode_json_event(&value) {
+        Ok(Some(text)) if out_tx.typed_protocol_enabled() => {
+            out_tx.send(Message::Text(text.into()))
+        }
+        Ok(Some(text)) => out_tx.send_diagnostic(Message::Text(text.into())),
+        Ok(None) => true,
         Err(err) => {
             warn!("failed to serialize voice ws diagnostic: {err}");
             false
@@ -2995,6 +3420,95 @@ mod tests {
             pre_roll_ms: 100,
             input_sample_rate_hint: Some(16_000),
         })
+    }
+
+    #[test]
+    fn voice_protocol_negotiation_preserves_legacy_and_requires_explicit_v2() {
+        assert_eq!(
+            negotiate_voice_protocol(None, None, None),
+            Ok(VoiceWireProtocol::LegacyV1)
+        );
+        assert_eq!(
+            negotiate_voice_protocol(
+                Some(TYPED_VOICE_REALTIME_PROTOCOL),
+                Some(VOICE_REALTIME_VERSION),
+                None,
+            ),
+            Ok(VoiceWireProtocol::TypedV2)
+        );
+        assert!(negotiate_voice_protocol(
+            Some(TYPED_VOICE_REALTIME_PROTOCOL),
+            Some(VOICE_REALTIME_VERSION),
+            Some(7),
+        )
+        .expect_err("resume must be rejected")
+        .contains("non-resumable"));
+    }
+
+    #[test]
+    fn typed_voice_session_ready_has_a_stable_golden_shape() {
+        let mut typed =
+            TypedVoiceSession::new("voice-session-1".to_string(), "process-42".to_string());
+        let (event, utterance_id, turn_id) = map_typed_voice_event(
+            &json!({
+                "type": "session_ready",
+                "session_id": "voice-session-1",
+                "owner_instance_id": "process-42",
+            }),
+            &mut typed,
+        )
+        .expect("typed session ready mapping");
+        let mut envelope = typed.envelope(event, utterance_id, turn_id);
+        envelope.timestamp_ms = 1_725_000_000_123;
+
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../ui/src/features/voice/realtime/voice_v2_session_ready.fixture.json"
+        ))
+        .expect("shared voice v2 SessionReady fixture");
+        assert_eq!(
+            serde_json::to_value(&envelope).expect("serialize typed voice SessionReady"),
+            fixture
+        );
+    }
+
+    #[test]
+    fn typed_voice_output_cutoff_starts_a_contiguous_new_epoch() {
+        let runtime =
+            Arc::new(RuntimeService::new(izwi_core::EngineConfig::default()).expect("runtime"));
+        let outbound = OutboundTx::new(runtime, "voice typed test");
+        outbound.configure_wire_protocol(
+            VoiceWireProtocol::TypedV2,
+            "voice-session-1".to_string(),
+            "process-42".to_string(),
+        );
+        let first: RealtimeEventEnvelope<RealtimeServerEvent> = serde_json::from_str(
+            outbound
+                .encode_json_event(&json!({"type": "input_stream_ready"}))
+                .expect("encode first event")
+                .expect("mapped first event")
+                .as_str(),
+        )
+        .expect("first envelope");
+        outbound.advance_typed_output_epoch();
+        let next: RealtimeEventEnvelope<RealtimeServerEvent> = serde_json::from_str(
+            outbound
+                .encode_json_event(&json!({
+                    "type": "turn_interrupted",
+                    "utterance_id": "utterance-1",
+                    "utterance_seq": 1,
+                    "reason": "barge_in",
+                }))
+                .expect("encode cutoff event")
+                .expect("mapped cutoff event")
+                .as_str(),
+        )
+        .expect("cutoff envelope");
+
+        assert_eq!(first.connection_epoch, 0);
+        assert_eq!(first.sequence, 0);
+        assert_eq!(next.connection_epoch, 1);
+        assert_eq!(next.sequence, 0);
+        assert_eq!(next.validate_successor(&first), Ok(()));
     }
 
     #[tokio::test]

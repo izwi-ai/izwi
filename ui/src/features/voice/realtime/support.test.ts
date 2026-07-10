@@ -1,17 +1,23 @@
 import { describe, expect, it } from "vitest";
+import voiceV2SessionReadyFixture from "./voice_v2_session_ready.fixture.json";
 import {
+  buildVoiceRealtimeV2SessionStart,
   buildVoiceRealtimeWebSocketUrl,
   encodeVoiceRealtimeClientPcm16Frame,
   formatModelVariantLabel,
   isAsrVariant,
+  isValidVoiceRealtimeV2Successor,
+  isVoiceRealtimeV2ServerEnvelope,
   isVoiceRealtimeServerEvent,
   isUnifiedAudioChatVariant,
   makeTranscriptEntryId,
   mergeSampleChunks,
+  normalizeVoiceRealtimeV2Event,
   parseFinalAnswer,
   parseVoiceRealtimeAssistantAudioBinaryChunk,
   shouldStopVoiceRealtimePlayback,
   type VoiceRealtimeServerEvent,
+  type VoiceRealtimeV2ServerEnvelope,
 } from "./support";
 
 describe("voice realtime support", () => {
@@ -120,6 +126,55 @@ describe("voice realtime support", () => {
     expect(event.resume_window_ms).toBe(0);
   });
 
+  it("serializes the opt-in v2 session negotiation with a stable shape", () => {
+    expect(
+      JSON.stringify(buildVoiceRealtimeV2SessionStart("Be concise.")),
+    ).toBe(
+      '{"type":"session_start","protocol":"voice_realtime","version":2,"system_prompt":"Be concise."}',
+    );
+  });
+
+  it("recognizes and normalizes the typed voice SessionReady golden envelope", () => {
+    const ready = voiceV2Envelope(0, {
+      type: "session_ready",
+      data: {
+        accepted_version: 2,
+        owner_instance_id: "process-42",
+        resumable: false,
+        resume_window_ms: 0,
+      },
+    });
+
+    expect(isVoiceRealtimeV2ServerEnvelope(ready)).toBe(true);
+    expect(ready).toEqual(voiceV2SessionReadyFixture);
+    expect(normalizeVoiceRealtimeV2Event(ready)).toEqual({
+      type: "session_ready",
+      protocol: "voice_realtime",
+      session_id: "voice-session-1",
+      owner_instance_id: "process-42",
+      connection_epoch: 0,
+      resumable: false,
+      resume_window_ms: 0,
+    });
+  });
+
+  it("enforces contiguous typed voice sequences and explicit cutoff epochs", () => {
+    const first = voiceV2Envelope(0, { type: "session_started" });
+    const next = voiceV2Envelope(1, { type: "session_started" });
+    const cutoff = {
+      ...voiceV2Envelope(0, { type: "session_started" }),
+      event_id: 3,
+      connection_epoch: 1,
+    };
+
+    expect(isValidVoiceRealtimeV2Successor(null, first)).toBe(true);
+    expect(isValidVoiceRealtimeV2Successor(first, next)).toBe(true);
+    expect(isValidVoiceRealtimeV2Successor(next, cutoff)).toBe(true);
+    expect(isValidVoiceRealtimeV2Successor(next, { ...next, event_id: 3 })).toBe(
+      false,
+    );
+  });
+
   it("rejects unknown and malformed voice server events", () => {
     expect(isVoiceRealtimeServerEvent({ type: "made_up" })).toBe(false);
     expect(
@@ -173,3 +228,20 @@ describe("voice realtime support", () => {
     ).toBe(false);
   });
 });
+
+function voiceV2Envelope(
+  sequence: number,
+  payload: Pick<VoiceRealtimeV2ServerEnvelope, "type"> &
+    Partial<VoiceRealtimeV2ServerEnvelope>,
+): VoiceRealtimeV2ServerEnvelope {
+  return {
+    protocol: "voice_realtime",
+    version: 2,
+    event_id: sequence + 1,
+    sequence,
+    session_id: "voice-session-1",
+    connection_epoch: 0,
+    timestamp_ms: 1_725_000_000_123,
+    ...payload,
+  } as VoiceRealtimeV2ServerEnvelope;
+}

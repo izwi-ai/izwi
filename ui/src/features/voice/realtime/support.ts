@@ -10,6 +10,8 @@ export type RuntimeStatus =
   | "assistant_speaking";
 
 export type VoiceRealtimeMode = "modular" | "unified";
+export const VOICE_REALTIME_PROTOCOL = "voice_realtime" as const;
+export const VOICE_REALTIME_VERSION = 2 as const;
 
 export type VoiceRealtimeServerEvent =
   | { type: "connected"; protocol: string; server_time_ms?: number }
@@ -131,8 +133,122 @@ export type VoiceRealtimeServerEvent =
     }
   | { type: "pong"; timestamp_ms?: number; server_time_ms?: number };
 
+type VoiceRealtimeV2Payload =
+  | {
+      type: "session_ready";
+      data: {
+        accepted_version: typeof VOICE_REALTIME_VERSION;
+        owner_instance_id: string;
+        resumable: false;
+        resume_window_ms: 0;
+      };
+    }
+  | { type: "session_started" }
+  | {
+      type: "audio_accepted";
+      data: {
+        frame_sequence: number;
+        buffer_depth_samples: number;
+        ingress_queue_depth: number;
+      };
+    }
+  | {
+      type: "audio_gap";
+      data: {
+        expected_frame_sequence: number;
+        received_frame_sequence: number;
+        missing_frames: number;
+        action: "continue" | "reset_segment" | "close_session";
+      };
+    }
+  | { type: "speech_started" }
+  | {
+      type: "speech_ended";
+      data: {
+        reason: "silence" | "max_duration" | "client_pause" | "stream_stopped";
+      };
+    }
+  | {
+      type: "transcript_partial" | "transcript_stable" | "transcript_correction";
+      data: { text: string; revision: number; language?: string | null };
+    }
+  | {
+      type: "transcript_final";
+      data: { text: string; revision: number; language?: string | null };
+    }
+  | { type: "assistant_text_started" }
+  | {
+      type: "assistant_text_partial";
+      data: { text: string; revision: number };
+    }
+  | { type: "assistant_text_final"; data: { text: string } }
+  | {
+      type: "assistant_audio_started";
+      data: { sample_rate: number; channels: number; format: "pcm_i16" | "pcm_f32" };
+    }
+  | {
+      type: "assistant_audio_completed";
+      data: { last_chunk_sequence: number };
+    }
+  | {
+      type: "interruption";
+      data: {
+        reason:
+          | "client_request"
+          | "barge_in"
+          | "preempted_by_new_turn"
+          | "backpressure"
+          | "session_closing";
+        cutoff_event_id: number;
+        cutoff_sequence: number;
+      };
+    }
+  | {
+      type: "turn_completed";
+      data: { status: "ok" | "no_input" | "interrupted" | "error" | "timeout" };
+    }
+  | {
+      type: "recoverable_error";
+      data: { code: string; message: string; retry_after_ms?: number | null };
+    }
+  | {
+      type: "fatal_error";
+      data: { code: string; message: string; close: RealtimeVoiceClose };
+    }
+  | { type: "closing" | "closed"; data: { close: RealtimeVoiceClose } }
+  | {
+      type: "pong";
+      data: { client_timestamp_ms?: number | null; server_timestamp_ms: number };
+    };
+
+type RealtimeVoiceClose = {
+  code: string;
+  reason: string;
+  message: string;
+  retryable: boolean;
+};
+
+export type VoiceRealtimeV2ServerEnvelope = {
+  protocol: typeof VOICE_REALTIME_PROTOCOL;
+  version: typeof VOICE_REALTIME_VERSION;
+  event_id: number;
+  sequence: number;
+  session_id: string;
+  connection_epoch: number;
+  timestamp_ms: number;
+  utterance_id?: string;
+  turn_id?: string;
+  segment_id?: string;
+} & VoiceRealtimeV2Payload;
+
 export type VoiceRealtimeClientMessage =
-  | { type: "session_start"; system_prompt?: string }
+  | {
+      type: "session_start";
+      system_prompt?: string;
+      protocol?: typeof VOICE_REALTIME_PROTOCOL;
+      version?: typeof VOICE_REALTIME_VERSION;
+      resume_from_event_id?: number;
+    }
   | {
       type: "input_stream_start";
       mode?: VoiceRealtimeMode;
@@ -459,6 +575,290 @@ export function buildVoiceRealtimeWebSocketUrl(apiBaseUrl: string): string {
   base.search = "";
   base.hash = "";
   return base.toString();
+}
+
+export function buildVoiceRealtimeV2SessionStart(
+  systemPrompt?: string,
+): VoiceRealtimeClientMessage {
+  return {
+    type: "session_start",
+    protocol: VOICE_REALTIME_PROTOCOL,
+    version: VOICE_REALTIME_VERSION,
+    ...(systemPrompt?.trim() ? { system_prompt: systemPrompt } : {}),
+  };
+}
+
+export function isVoiceRealtimeV2ServerEnvelope(
+  value: unknown,
+): value is VoiceRealtimeV2ServerEnvelope {
+  if (!value || typeof value !== "object") return false;
+  const event = value as Record<string, unknown>;
+  if (
+    event.protocol !== VOICE_REALTIME_PROTOCOL ||
+    event.version !== VOICE_REALTIME_VERSION ||
+    !isNonNegativeSafeInteger(event.event_id) ||
+    !isNonNegativeSafeInteger(event.sequence) ||
+    typeof event.session_id !== "string" ||
+    !event.session_id ||
+    !isNonNegativeSafeInteger(event.connection_epoch) ||
+    !isNonNegativeSafeInteger(event.timestamp_ms) ||
+    typeof event.type !== "string"
+  ) {
+    return false;
+  }
+  if (event.utterance_id !== undefined && typeof event.utterance_id !== "string") {
+    return false;
+  }
+  const data = event.data;
+  const record = data && typeof data === "object" ? (data as Record<string, unknown>) : null;
+  const hasTextRevision = () =>
+    record !== null &&
+    typeof record.text === "string" &&
+    isNonNegativeSafeInteger(record.revision);
+
+  switch (event.type) {
+    case "session_ready":
+      return (
+        record !== null &&
+        record.accepted_version === VOICE_REALTIME_VERSION &&
+        typeof record.owner_instance_id === "string" &&
+        record.resumable === false &&
+        record.resume_window_ms === 0
+      );
+    case "session_started":
+    case "speech_started":
+    case "assistant_text_started":
+      return data === undefined;
+    case "audio_accepted":
+      return (
+        record !== null &&
+        isNonNegativeSafeInteger(record.frame_sequence) &&
+        isNonNegativeSafeInteger(record.buffer_depth_samples) &&
+        isNonNegativeSafeInteger(record.ingress_queue_depth)
+      );
+    case "audio_gap":
+      return (
+        record !== null &&
+        isNonNegativeSafeInteger(record.expected_frame_sequence) &&
+        isNonNegativeSafeInteger(record.received_frame_sequence) &&
+        isNonNegativeSafeInteger(record.missing_frames) &&
+        ["continue", "reset_segment", "close_session"].includes(
+          String(record.action),
+        )
+      );
+    case "speech_ended":
+      return (
+        record !== null &&
+        ["silence", "max_duration", "client_pause", "stream_stopped"].includes(
+          String(record.reason),
+        )
+      );
+    case "transcript_partial":
+    case "transcript_stable":
+    case "transcript_correction":
+    case "transcript_final":
+    case "assistant_text_partial":
+      return hasTextRevision();
+    case "assistant_text_final":
+      return record !== null && typeof record.text === "string";
+    case "assistant_audio_started":
+      return (
+        record !== null &&
+        isPositiveSafeInteger(record.sample_rate) &&
+        isPositiveSafeInteger(record.channels) &&
+        ["pcm_i16", "pcm_f32"].includes(String(record.format))
+      );
+    case "assistant_audio_completed":
+      return record !== null && isNonNegativeSafeInteger(record.last_chunk_sequence);
+    case "interruption":
+      return (
+        record !== null &&
+        [
+          "client_request",
+          "barge_in",
+          "preempted_by_new_turn",
+          "backpressure",
+          "session_closing",
+        ].includes(String(record.reason)) &&
+        isNonNegativeSafeInteger(record.cutoff_event_id) &&
+        isNonNegativeSafeInteger(record.cutoff_sequence)
+      );
+    case "turn_completed":
+      return (
+        record !== null &&
+        ["ok", "no_input", "interrupted", "error", "timeout"].includes(
+          String(record.status),
+        )
+      );
+    case "recoverable_error":
+      return (
+        record !== null &&
+        typeof record.code === "string" &&
+        typeof record.message === "string"
+      );
+    case "fatal_error":
+      return (
+        record !== null &&
+        typeof record.code === "string" &&
+        typeof record.message === "string" &&
+        isRealtimeVoiceClose(record.close)
+      );
+    case "closing":
+    case "closed":
+      return record !== null && isRealtimeVoiceClose(record.close);
+    case "pong":
+      return record !== null && isNonNegativeSafeInteger(record.server_timestamp_ms);
+    default:
+      return false;
+  }
+}
+
+export function isValidVoiceRealtimeV2Successor(
+  previous: VoiceRealtimeV2ServerEnvelope | null,
+  current: VoiceRealtimeV2ServerEnvelope,
+): boolean {
+  if (previous === null) {
+    return current.sequence === 0 && current.connection_epoch === 0;
+  }
+  if (
+    current.session_id !== previous.session_id ||
+    current.event_id <= previous.event_id ||
+    current.connection_epoch < previous.connection_epoch
+  ) {
+    return false;
+  }
+  if (current.connection_epoch === previous.connection_epoch) {
+    return current.sequence === previous.sequence + 1;
+  }
+  return (
+    current.connection_epoch === previous.connection_epoch + 1 &&
+    current.sequence === 0
+  );
+}
+
+export function normalizeVoiceRealtimeV2Event(
+  envelope: VoiceRealtimeV2ServerEnvelope,
+): VoiceRealtimeServerEvent | null {
+  const identity = typedVoiceIdentity(envelope);
+  switch (envelope.type) {
+    case "session_ready":
+      return {
+        type: "session_ready",
+        protocol: VOICE_REALTIME_PROTOCOL,
+        session_id: envelope.session_id,
+        owner_instance_id: envelope.data.owner_instance_id,
+        connection_epoch: envelope.connection_epoch,
+        resumable: false,
+        resume_window_ms: 0,
+      };
+    case "session_started":
+      return { type: "input_stream_ready" };
+    case "audio_accepted":
+    case "audio_gap":
+      return null;
+    case "speech_started":
+      return identity ? { type: "user_speech_start", ...identity } : null;
+    case "speech_ended":
+      return identity
+        ? { type: "user_speech_end", ...identity, reason: envelope.data.reason }
+        : null;
+    case "transcript_partial":
+    case "transcript_stable":
+    case "transcript_correction":
+      return identity
+        ? { type: "user_transcript_snapshot", ...identity, text: envelope.data.text }
+        : null;
+    case "transcript_final":
+      return identity
+        ? {
+            type: "user_transcript_final",
+            ...identity,
+            text: envelope.data.text,
+            language: envelope.data.language,
+          }
+        : null;
+    case "assistant_text_started":
+      return identity ? { type: "assistant_text_start", ...identity } : null;
+    case "assistant_text_partial":
+      return identity
+        ? { type: "assistant_text_snapshot", ...identity, text: envelope.data.text }
+        : null;
+    case "assistant_text_final":
+      return identity
+        ? { type: "assistant_text_final", ...identity, text: envelope.data.text }
+        : null;
+    case "assistant_audio_started":
+      return identity
+        ? {
+            type: "assistant_audio_start",
+            ...identity,
+            sample_rate: envelope.data.sample_rate,
+            audio_format: envelope.data.format,
+          }
+        : null;
+    case "assistant_audio_completed":
+      return identity ? { type: "assistant_audio_done", ...identity } : null;
+    case "interruption":
+      return identity
+        ? { type: "turn_interrupted", ...identity, reason: envelope.data.reason }
+        : null;
+    case "turn_completed":
+      return identity
+        ? { type: "turn_done", ...identity, status: envelope.data.status }
+        : null;
+    case "recoverable_error":
+      return { type: "error", code: envelope.data.code, message: envelope.data.message };
+    case "fatal_error":
+      return {
+        type: "error",
+        code: envelope.data.code,
+        message: envelope.data.message,
+        fatal: true,
+      };
+    case "closing":
+    case "closed":
+      return null;
+    case "pong":
+      return {
+        type: "pong",
+        timestamp_ms: envelope.data.client_timestamp_ms ?? undefined,
+        server_time_ms: envelope.data.server_timestamp_ms,
+      };
+  }
+  return null;
+}
+
+function typedVoiceIdentity(
+  envelope: VoiceRealtimeV2ServerEnvelope,
+): { utterance_id: string; utterance_seq: number } | null {
+  if (typeof envelope.utterance_id !== "string" || !envelope.utterance_id) {
+    return null;
+  }
+  const match = /^turn-(\d+)$/.exec(envelope.turn_id ?? "");
+  const utteranceSeq = match ? Number(match[1]) : Number.NaN;
+  if (!Number.isSafeInteger(utteranceSeq) || utteranceSeq < 0) {
+    return null;
+  }
+  return { utterance_id: envelope.utterance_id, utterance_seq: utteranceSeq };
+}
+
+function isRealtimeVoiceClose(value: unknown): value is RealtimeVoiceClose {
+  if (!value || typeof value !== "object") return false;
+  const close = value as Record<string, unknown>;
+  return (
+    typeof close.code === "string" &&
+    typeof close.reason === "string" &&
+    typeof close.message === "string" &&
+    typeof close.retryable === "boolean"
+  );
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+function isPositiveSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) > 0;
 }
 
 export function isVoiceRealtimeServerEvent(
