@@ -3,12 +3,13 @@
 
 mod handlers;
 
-use axum::{Router, extract::DefaultBodyLimit, routing::get};
+use axum::{extract::DefaultBodyLimit, routing::get, Router};
 
 use crate::state::AppState;
 
 pub(crate) use handlers::{
-    CreateSpeechHistoryRecordRequest, batch_tts_stage_executor, synthesize_record,
+    batch_tts_stage_executor, synthesize_record, CreateSpeechHistoryRecordRequest,
+    BATCH_TTS_STAGE_KIND,
 };
 
 pub fn router() -> Router<AppState> {
