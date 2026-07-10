@@ -485,6 +485,7 @@ struct TurnControl {
 
 struct TurnControlInner {
     cancelled: AtomicBool,
+    reason: Mutex<Option<String>>,
     notify: Notify,
 }
 
@@ -493,19 +494,37 @@ impl TurnControl {
         Self {
             inner: Arc::new(TurnControlInner {
                 cancelled: AtomicBool::new(false),
+                reason: Mutex::new(None),
                 notify: Notify::new(),
             }),
         }
     }
 
-    fn cancel(&self) {
-        if !self.inner.cancelled.swap(true, Ordering::AcqRel) {
-            self.inner.notify.notify_waiters();
+    fn cancel(&self, reason: impl Into<String>) {
+        let mut stored_reason = self
+            .inner
+            .reason
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if self.inner.cancelled.load(Ordering::Acquire) {
+            return;
         }
+        *stored_reason = Some(reason.into());
+        self.inner.cancelled.store(true, Ordering::Release);
+        drop(stored_reason);
+        self.inner.notify.notify_waiters();
     }
 
     fn is_cancelled(&self) -> bool {
         self.inner.cancelled.load(Ordering::Acquire)
+    }
+
+    fn reason(&self) -> Option<String> {
+        self.inner
+            .reason
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
     }
 
     async fn cancelled(&self) {
@@ -2045,7 +2064,43 @@ fn spawn_turn_task(
         };
 
         let turn_result = tokio::select! {
-            _ = control.cancelled() => return,
+            _ = control.cancelled() => {
+                let reason = control.reason().unwrap_or_else(|| "cancelled".to_string());
+                if matches!(
+                    state
+                        .voice_store
+                        .complete_turn(
+                            turn_record_id.clone(),
+                            "interrupted",
+                            Some(reason.clone()),
+                        )
+                        .await,
+                    Ok(true)
+                ) {
+                    send_turn_json(
+                        &out_tx,
+                        output_generation,
+                        json!({
+                            "type": "turn_interrupted",
+                            "utterance_id": commit.utterance_id,
+                            "utterance_seq": commit.utterance_seq,
+                            "reason": reason,
+                        }),
+                    );
+                    send_turn_json(
+                        &out_tx,
+                        output_generation,
+                        json!({
+                            "type": "turn_done",
+                            "utterance_id": commit.utterance_id,
+                            "utterance_seq": commit.utterance_seq,
+                            "status": "interrupted",
+                            "reason": reason,
+                        }),
+                    );
+                }
+                return;
+            },
             result = tokio::time::timeout(timeout, turn_future) => result,
         };
 
@@ -2381,7 +2436,7 @@ async fn stream_unified_s2s_to_socket(
                                         .lock()
                                         .unwrap_or_else(|poison| poison.into_inner()) =
                                         Some(format!("Outbound audio delivery failed: {err:?}"));
-                                    control.cancel();
+                                    control.cancel("outbound_audio_saturated");
                                 }
                             }
                             Err(err) => {
@@ -2429,21 +2484,13 @@ async fn interrupt_active_turn(
 ) -> bool {
     if let Some(mut turn) = active_turn.take() {
         out_tx.cutoff_turn(turn.output_generation);
-        if turn.task.is_finished() {
+        let was_running = !turn.task.is_finished();
+        if !was_running {
             let _ = turn.task.await;
             return false;
         }
 
-        turn.control.cancel();
-        send_json(
-            out_tx,
-            json!({
-                "type": "turn_interrupted",
-                "utterance_id": turn.utterance_id,
-                "utterance_seq": turn.utterance_seq,
-                "reason": reason,
-            }),
-        );
+        turn.control.cancel(reason);
         if tokio::time::timeout(TURN_CANCELLATION_TIMEOUT, &mut turn.task)
             .await
             .is_err()
@@ -2461,6 +2508,15 @@ async fn interrupt_active_turn(
             ),
         )
         .await;
+        send_json(
+            out_tx,
+            json!({
+                "type": "turn_interrupted",
+                "utterance_id": turn.utterance_id,
+                "utterance_seq": turn.utterance_seq,
+                "reason": reason,
+            }),
+        );
         send_json(
             out_tx,
             json!({
@@ -3077,12 +3133,13 @@ mod tests {
             waiting_control.is_cancelled()
         });
 
-        control.cancel();
+        control.cancel("test_cancel");
 
         assert!(tokio::time::timeout(Duration::from_millis(50), waiter)
             .await
             .expect("cancellation should wake waiter")
             .expect("waiter should finish"));
+        assert_eq!(control.reason().as_deref(), Some("test_cancel"));
     }
 
     #[test]

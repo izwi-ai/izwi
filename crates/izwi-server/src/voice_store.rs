@@ -1,11 +1,11 @@
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryResult, Set,
 };
 use serde::Serialize;
 
-use crate::db::{StoreDatabase, raw};
+use crate::db::{raw, StoreDatabase};
 use crate::entity::{voice_profiles, voice_sessions, voice_turns};
 use crate::ids::new_uuid;
 use crate::voice_defaults::{DEFAULT_VOICE_AGENT_SYSTEM_PROMPT, DEFAULT_VOICE_PROFILE_ID};
@@ -415,32 +415,38 @@ impl VoiceStore {
         turn_id: String,
         status: &str,
         status_reason: Option<String>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let status = sanitize_turn_status(status)?;
         let db = self.db.connection().await?;
         let now = now_unix_millis_i64();
         let session_id = fetch_turn_session_id(db, &turn_id)
             .await?
             .ok_or_else(|| anyhow!("Voice turn not found"))?;
-        db.execute_raw(raw::statement(
-            db,
-            r#"
+        let completed = db
+            .execute_raw(raw::statement(
+                db,
+                r#"
             UPDATE voice_turns
             SET status = ?1,
                 status_reason = ?2,
                 updated_at = ?3
             WHERE id = ?4
+              AND status = 'processing'
             "#,
-            vec![
-                status.into(),
-                sanitize_optional_text(status_reason.as_deref(), 160).into(),
-                now.into(),
-                turn_id.into(),
-            ],
-        )?)
-        .await
-        .context("Failed to complete voice turn")?;
-        touch_session_updated_at(db, session_id.as_str(), now).await
+                vec![
+                    status.into(),
+                    sanitize_optional_text(status_reason.as_deref(), 160).into(),
+                    now.into(),
+                    turn_id.into(),
+                ],
+            )?)
+            .await
+            .context("Failed to complete voice turn")?;
+        if completed.rows_affected() == 0 {
+            return Ok(false);
+        }
+        touch_session_updated_at(db, session_id.as_str(), now).await?;
+        Ok(true)
     }
 }
 
@@ -728,7 +734,11 @@ fn sanitize_optional_text(raw: Option<&str>, max_len: usize) -> Option<String> {
 }
 
 fn bool_to_i64(value: bool) -> i64 {
-    if value { 1 } else { 0 }
+    if value {
+        1
+    } else {
+        0
+    }
 }
 
 fn i64_to_bool(value: i64) -> bool {
@@ -816,10 +826,19 @@ mod tests {
             )
             .await
             .expect("assistant");
-        store
+        let completed = store
             .complete_turn(turn.id.clone(), "ok", None)
             .await
             .expect("complete");
+        assert!(completed);
+        assert!(!store
+            .complete_turn(
+                turn.id.clone(),
+                "interrupted",
+                Some("late cancellation".to_string()),
+            )
+            .await
+            .expect("duplicate completion should be fenced"));
         store
             .end_session(session.id.clone())
             .await
@@ -857,13 +876,11 @@ mod tests {
             .await
             .expect("delete session");
         assert!(deleted);
-        assert!(
-            store
-                .get_session(session.id)
-                .await
-                .expect("get deleted session")
-                .is_none()
-        );
+        assert!(store
+            .get_session(session.id)
+            .await
+            .expect("get deleted session")
+            .is_none());
 
         std::env::remove_var("IZWI_DB_PATH");
         std::env::remove_var("IZWI_MEDIA_DIR");
