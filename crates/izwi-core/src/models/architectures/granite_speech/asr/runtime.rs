@@ -602,6 +602,8 @@ impl GraniteSpeechRuntime {
         device: &DeviceProfile,
         dtype: DType,
     ) -> Result<Self> {
+        let load_started = Instant::now();
+        let mmap_started = Instant::now();
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(shard_paths, dtype, &device.device).map_err(
                 |err| {
@@ -611,9 +613,40 @@ impl GraniteSpeechRuntime {
                 },
             )?
         };
+        let mmap_elapsed = mmap_started.elapsed();
+
+        let encoder_started = Instant::now();
         let encoder = GraniteSpeechEncoder::load(&config.encoder_config, vb.pp("encoder"))?;
+        let encoder_elapsed = encoder_started.elapsed();
+
+        let projector_started = Instant::now();
         let projector = GraniteSpeechProjector::load(config, vb.pp("projector"))?;
+        let projector_elapsed = projector_started.elapsed();
+
+        let language_model_started = Instant::now();
         let text_model = GraniteLanguageModel::load(&config.text_config, vb.pp("language_model"))?;
+        let language_model_elapsed = language_model_started.elapsed();
+
+        // Model construction has consumed the VarBuilder, so release the source
+        // mappings before waiting for queued device uploads, casts, and fusions.
+        drop(vb);
+        let synchronize_started = Instant::now();
+        synchronize_granite_load(&device.device)?;
+        let synchronize_elapsed = synchronize_started.elapsed();
+        let total_elapsed = load_started.elapsed();
+
+        tracing::info!(
+            shard_count = shard_paths.len(),
+            dtype = ?dtype,
+            mmap_ms = mmap_elapsed.as_secs_f64() * 1_000.0,
+            encoder_ms = encoder_elapsed.as_secs_f64() * 1_000.0,
+            projector_ms = projector_elapsed.as_secs_f64() * 1_000.0,
+            language_model_ms = language_model_elapsed.as_secs_f64() * 1_000.0,
+            synchronize_ms = synchronize_elapsed.as_secs_f64() * 1_000.0,
+            total_ms = total_elapsed.as_secs_f64() * 1_000.0,
+            "Granite Speech checkpoint materialization completed"
+        );
+
         Ok(Self {
             device: device.device.clone(),
             dtype,
@@ -955,6 +988,14 @@ impl GraniteSpeechRuntime {
             },
         })
     }
+}
+
+fn synchronize_granite_load(device: &Device) -> Result<()> {
+    device.synchronize().map_err(|err| {
+        Error::ModelLoadError(format!(
+            "Failed to synchronize Granite Speech checkpoint materialization: {err}"
+        ))
+    })
 }
 
 fn expand_audio_tokens(
@@ -3215,6 +3256,11 @@ fn maybe_prescale_residual_linear(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn granite_load_completion_synchronizes_cpu_device() {
+        synchronize_granite_load(&Device::Cpu).unwrap();
+    }
 
     fn assert_tensor_close(lhs: &Tensor, rhs: &Tensor) {
         assert_eq!(lhs.dims(), rhs.dims());
