@@ -197,7 +197,7 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
 }
 
 fn start_batch_runtime_worker(state: &AppState) -> BatchWorkerSupervisor {
-    let mut config = BatchWorkerConfig::local(format!("local-batch-worker-{}", std::process::id()));
+    let mut config = BatchWorkerConfig::local("local-batch-worker");
     config.capabilities = vec!["asr".to_string(), "tts".to_string()];
     BatchWorkerRunner::new(
         state.batch_runtime_store.clone(),

@@ -1,8 +1,12 @@
 use super::types::{
-    ClaimedStage, IdempotencyRecord, JobStage, MediaAsset, RuntimeArtifact, RuntimeArtifactKind,
-    RuntimeArtifactRole, RuntimeJob, RuntimeJobKind, RuntimeJobStatus, RuntimeStageStatus,
-    RuntimeWorkerHeartbeat, StageLease, TextAsset,
+    ClaimedStage, IdempotencyRecord, JobStage, MediaAsset, QueueClass, RuntimeArtifact,
+    RuntimeArtifactKind, RuntimeArtifactRole, RuntimeJob, RuntimeJobKind, RuntimeJobStatus,
+    RuntimeStageStatus, RuntimeWorkerHeartbeat, RuntimeWorkerHeartbeatDetails,
+    RuntimeWorkerRegistration, StageLease, StageResourceHints, TextAsset, WorkerResourceCapacity,
+    WORKER_HEARTBEAT_DETAILS_VERSION, WORKER_REGISTRATION_VERSION,
 };
+#[cfg(test)]
+use super::types::{DeviceClass, ResourceTarget, RuntimeBackendClass};
 use crate::{
     db::{raw, StoreDatabase},
     ids::new_uuid,
@@ -86,6 +90,13 @@ pub struct NewJobStage {
     pub input_artifact_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct NewJobStageDispatch {
+    pub stage: NewJobStage,
+    pub queue_class: QueueClass,
+    pub resource_hints: StageResourceHints,
+}
+
 const DEFAULT_STAGE_CLAIM_CANDIDATE_LIMIT: usize = 64;
 const MAX_STAGE_CLAIM_CANDIDATE_LIMIT: usize = 512;
 
@@ -95,6 +106,7 @@ pub struct StageClaimFilter {
     pub capabilities: Vec<String>,
     pub model_ids: Vec<String>,
     pub stage_kinds: Vec<String>,
+    pub resources: WorkerResourceCapacity,
     pub max_candidates: usize,
 }
 
@@ -105,6 +117,7 @@ impl Default for StageClaimFilter {
             capabilities: Vec::new(),
             model_ids: Vec::new(),
             stage_kinds: Vec::new(),
+            resources: WorkerResourceCapacity::default(),
             max_candidates: DEFAULT_STAGE_CLAIM_CANDIDATE_LIMIT,
         }
     }
@@ -126,6 +139,7 @@ impl StageClaimFilter {
             capabilities: normalize_filter_values(&self.capabilities),
             model_ids: normalize_filter_values(&self.model_ids),
             stage_kinds: normalize_filter_values(&self.stage_kinds),
+            resources: self.resources.clone(),
             max_candidates: self.max_candidates,
         }
     }
@@ -135,6 +149,7 @@ impl StageClaimFilter {
             && optional_filter_matches(&self.capabilities, candidate.capability.as_deref())
             && optional_filter_matches(&self.model_ids, candidate.model_id.as_deref())
             && optional_filter_matches(&self.stage_kinds, Some(candidate.stage_kind.as_str()))
+            && self.resources.supports(&candidate.resource_hints)
     }
 
     fn queue_matches(&self, candidate: &StageClaimCandidate) -> bool {
@@ -143,17 +158,7 @@ impl StageClaimFilter {
         }
 
         self.queue_names.iter().any(|queue| {
-            queue == "batch"
-                || queue == candidate.stage_kind.as_str()
-                || queue == candidate.job_kind.as_db_value()
-                || candidate
-                    .capability
-                    .as_deref()
-                    .is_some_and(|capability| queue == capability)
-                || candidate
-                    .model_id
-                    .as_deref()
-                    .is_some_and(|model_id| queue == model_id)
+            queue == QueueClass::Batch.as_db_value() || queue == candidate.queue_class.as_db_value()
         })
     }
 
@@ -168,6 +173,8 @@ pub struct StageClaimCandidate {
     pub stage_id: String,
     pub stage_kind: String,
     pub job_kind: RuntimeJobKind,
+    pub queue_class: QueueClass,
+    pub resource_hints: StageResourceHints,
     pub capability: Option<String>,
     pub model_id: Option<String>,
 }
@@ -208,6 +215,16 @@ pub struct WorkerHeartbeatUpdate {
     pub queue_names: Vec<String>,
     pub current_job_id: Option<String>,
     pub current_stage_id: Option<String>,
+    pub diagnostic_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct RegisteredWorkerHeartbeatUpdate {
+    pub registration: RuntimeWorkerRegistration,
+    pub status: String,
+    pub current_job_id: Option<String>,
+    pub current_stage_id: Option<String>,
+    pub details: RuntimeWorkerHeartbeatDetails,
     pub diagnostic_json: serde_json::Value,
 }
 
@@ -762,6 +779,7 @@ impl BatchRuntimeStore {
         let mut params: Vec<Value> = vec![now.into()];
         let mut claim_filter_sql = String::new();
         push_claim_queue_clause(&mut claim_filter_sql, &mut params, &filter.queue_names);
+        push_claim_resource_clause(&mut claim_filter_sql, &mut params, &filter.resources);
         push_claim_string_filter_clause(
             &mut claim_filter_sql,
             &mut params,
@@ -793,7 +811,9 @@ impl BatchRuntimeStore {
                     s.stage_kind,
                     j.job_kind,
                     COALESCE(s.capability, j.capability),
-                    COALESCE(s.model_id, j.model_id)
+                    COALESCE(s.model_id, j.model_id),
+                    s.queue_class,
+                    s.resource_hints_json
                 FROM job_stages s
                 INNER JOIN runtime_jobs j ON j.id = s.job_id
                 WHERE s.status IN ('queued', 'retrying')
@@ -1301,10 +1321,26 @@ impl BatchRuntimeStore {
     }
 
     pub async fn create_stage(&self, input: NewJobStage) -> anyhow::Result<JobStage> {
+        let queue_class = queue_class_for_stage_kind(&input.stage_kind);
+        self.create_stage_with_dispatch(NewJobStageDispatch {
+            stage: input,
+            queue_class,
+            resource_hints: StageResourceHints::default(),
+        })
+        .await
+    }
+
+    pub async fn create_stage_with_dispatch(
+        &self,
+        input: NewJobStageDispatch,
+    ) -> anyhow::Result<JobStage> {
         let db = self.db.connection().await?;
         let now = current_timestamp_millis();
         let id = new_uuid();
-        let input_artifact_ids_json = json_to_db_string(&json!(input.input_artifact_ids), "[]")?;
+        let stage = input.stage;
+        let resource_hints = input.resource_hints.normalized();
+        let resource_hints_json = json_to_db_string(&json!(resource_hints), "{}")?;
+        let input_artifact_ids_json = json_to_db_string(&json!(stage.input_artifact_ids), "[]")?;
 
         db.execute_raw(raw::statement(
             db,
@@ -1316,6 +1352,13 @@ impl BatchRuntimeStore {
                 updated_at,
                 sequence,
                 stage_kind,
+                queue_class,
+                resource_hints_json,
+                resource_target,
+                required_backend,
+                required_device_class,
+                min_resource_memory_bytes,
+                resource_concurrency_weight,
                 status,
                 capability,
                 model_id,
@@ -1333,18 +1376,33 @@ impl BatchRuntimeStore {
                 error_code,
                 error_message
             )
-            VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, ?3, NULL, 0, ?9, ?10, '[]', NULL, NULL, NULL, NULL, NULL)
+            VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, NULL, NULL, ?3, NULL, 0, ?16, ?17, '[]', NULL, NULL, NULL, NULL, NULL)
             "#,
             vec![
                 id.clone().into(),
-                input.job_id.into(),
+                stage.job_id.into(),
                 now.into(),
-                u32_to_i64_value(input.sequence).into(),
-                input.stage_kind.into(),
-                input.status.as_db_value().into(),
-                opt_string(input.capability),
-                opt_string(input.model_id),
-                u32_to_i64_value(input.max_attempts).into(),
+                u32_to_i64_value(stage.sequence).into(),
+                stage.stage_kind.into(),
+                input.queue_class.as_db_value().into(),
+                resource_hints_json.into(),
+                resource_hints.target.as_db_value().into(),
+                opt_string(
+                    resource_hints
+                        .backend
+                        .map(|backend| backend.as_db_value().to_string()),
+                ),
+                opt_string(
+                    resource_hints
+                        .device_class
+                        .map(|device| device.as_db_value().to_string()),
+                ),
+                opt_u64(resource_hints.min_memory_bytes),
+                u32_to_i64_value(resource_hints.concurrency_weight).into(),
+                stage.status.as_db_value().into(),
+                opt_string(stage.capability),
+                opt_string(stage.model_id),
+                u32_to_i64_value(stage.max_attempts).into(),
                 input_artifact_ids_json.into(),
             ],
         )?)
@@ -1539,9 +1597,60 @@ impl BatchRuntimeStore {
         &self,
         update: WorkerHeartbeatUpdate,
     ) -> anyhow::Result<RuntimeWorkerHeartbeat> {
+        let queue_classes = update
+            .queue_names
+            .iter()
+            .filter_map(|queue| QueueClass::from_db_value(queue))
+            .collect::<Vec<_>>();
+        let registration = RuntimeWorkerRegistration {
+            version: WORKER_REGISTRATION_VERSION,
+            worker_id: update.worker_id.clone(),
+            instance_id: update.worker_id.clone(),
+            queue_classes: if queue_classes.is_empty() {
+                vec![QueueClass::Batch]
+            } else {
+                queue_classes
+            },
+            capabilities: Vec::new(),
+            model_ids: Vec::new(),
+            stage_kinds: Vec::new(),
+            resources: WorkerResourceCapacity::default(),
+            software_version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+        let diagnostic_json = update.diagnostic_json;
+        let details = RuntimeWorkerHeartbeatDetails {
+            version: WORKER_HEARTBEAT_DETAILS_VERSION,
+            available_slots: if update.current_stage_id.is_none() { 1 } else { 0 },
+            active_lease_ids: update.current_stage_id.clone().into_iter().collect(),
+            last_error: None,
+            health_json: diagnostic_json.clone(),
+        };
+        self.upsert_registered_worker_heartbeat(RegisteredWorkerHeartbeatUpdate {
+            registration,
+            status: update.status,
+            current_job_id: update.current_job_id,
+            current_stage_id: update.current_stage_id,
+            details,
+            diagnostic_json,
+        })
+        .await
+    }
+
+    pub async fn upsert_registered_worker_heartbeat(
+        &self,
+        update: RegisteredWorkerHeartbeatUpdate,
+    ) -> anyhow::Result<RuntimeWorkerHeartbeat> {
         let db = self.db.connection().await?;
         let now = current_timestamp_millis();
-        let queue_names_json = json_to_db_string(&json!(update.queue_names), "[]")?;
+        let queue_names = update
+            .registration
+            .queue_classes
+            .iter()
+            .map(|queue| queue.as_db_value())
+            .collect::<Vec<_>>();
+        let queue_names_json = json_to_db_string(&json!(queue_names), "[]")?;
+        let registration_json = json_to_db_string(&json!(update.registration), "{}")?;
+        let heartbeat_details_json = json_to_db_string(&json!(update.details), "{}")?;
         let diagnostic_json = json_to_db_string(&update.diagnostic_json, "{}")?;
 
         db.execute_raw(worker_heartbeat_upsert_statement(
@@ -1549,12 +1658,14 @@ impl BatchRuntimeStore {
             now,
             &update,
             queue_names_json,
+            registration_json,
+            heartbeat_details_json,
             diagnostic_json,
         )?)
         .await
         .context("Failed to upsert runtime worker heartbeat")?;
 
-        self.get_worker_heartbeat(&update.worker_id)
+        self.get_worker_heartbeat(&update.registration.worker_id)
             .await?
             .ok_or_else(|| anyhow!("Runtime worker heartbeat was not found after upsert"))
     }
@@ -1960,9 +2071,9 @@ const TEXT_ASSET_COLUMNS_SQL: &str =
 const RUNTIME_JOB_COLUMNS_SQL: &str =
     "SELECT id, created_at, updated_at, queued_at, started_at, finished_at, job_kind, status, priority, model_id, capability, route_record_kind, route_record_id, input_media_asset_id, input_text_asset_id, request_json, model_snapshot_json, progress_json, error_code, error_message, attempt_count, max_attempts, retry_policy_json, idempotency_key, correlation_id, cancellation_reason FROM runtime_jobs WHERE id = ?1";
 const JOB_STAGE_COLUMNS_SQL: &str =
-    "SELECT id, job_id, created_at, updated_at, sequence, stage_kind, status, capability, model_id, worker_id, lease_expires_at, available_at, attempt_token, attempt_count, max_attempts, input_artifact_ids_json, output_artifact_ids_json, progress_json, started_at, finished_at, error_code, error_message FROM job_stages WHERE id = ?1";
+    "SELECT id, job_id, created_at, updated_at, sequence, stage_kind, queue_class, resource_hints_json, status, capability, model_id, worker_id, lease_expires_at, available_at, attempt_token, attempt_count, max_attempts, input_artifact_ids_json, output_artifact_ids_json, progress_json, started_at, finished_at, error_code, error_message FROM job_stages WHERE id = ?1";
 const JOB_STAGE_LIST_FOR_JOB_SQL: &str =
-    "SELECT id, job_id, created_at, updated_at, sequence, stage_kind, status, capability, model_id, worker_id, lease_expires_at, available_at, attempt_token, attempt_count, max_attempts, input_artifact_ids_json, output_artifact_ids_json, progress_json, started_at, finished_at, error_code, error_message FROM job_stages WHERE job_id = ?1 ORDER BY sequence ASC, created_at ASC, id ASC";
+    "SELECT id, job_id, created_at, updated_at, sequence, stage_kind, queue_class, resource_hints_json, status, capability, model_id, worker_id, lease_expires_at, available_at, attempt_token, attempt_count, max_attempts, input_artifact_ids_json, output_artifact_ids_json, progress_json, started_at, finished_at, error_code, error_message FROM job_stages WHERE job_id = ?1 ORDER BY sequence ASC, created_at ASC, id ASC";
 const RUNTIME_ARTIFACT_COLUMNS_SQL: &str =
     "SELECT id, job_id, stage_id, created_at, artifact_kind, artifact_role, media_asset_id, text_asset_id, storage_key, content_type, filename, size_bytes, sha256, metadata_json, retention_policy FROM runtime_artifacts WHERE id = ?1";
 const RUNTIME_ARTIFACT_LIST_FOR_JOB_SQL: &str =
@@ -1970,20 +2081,28 @@ const RUNTIME_ARTIFACT_LIST_FOR_JOB_SQL: &str =
 const IDEMPOTENCY_RECORD_COLUMNS_SQL: &str =
     "SELECT operation, idempotency_key, created_at, expires_at, request_hash, response_json, runtime_job_id, conflict_message, metadata_json FROM idempotency_keys WHERE operation = ?1 AND idempotency_key = ?2";
 const WORKER_HEARTBEAT_COLUMNS_SQL: &str =
-    "SELECT worker_id, started_at, last_heartbeat_at, status, queue_names_json, current_job_id, current_stage_id, diagnostic_json FROM runtime_worker_heartbeats WHERE worker_id = ?1";
+    "SELECT worker_id, started_at, last_heartbeat_at, status, queue_names_json, instance_id, registration_version, registration_json, heartbeat_version, available_slots, heartbeat_details_json, current_job_id, current_stage_id, diagnostic_json FROM runtime_worker_heartbeats WHERE worker_id = ?1";
 
 fn worker_heartbeat_upsert_statement(
     db: &DatabaseConnection,
     now: i64,
-    update: &WorkerHeartbeatUpdate,
+    update: &RegisteredWorkerHeartbeatUpdate,
     queue_names_json: String,
+    registration_json: String,
+    heartbeat_details_json: String,
     diagnostic_json: String,
 ) -> anyhow::Result<sea_orm::Statement> {
     let values = vec![
-        update.worker_id.clone().into(),
+        update.registration.worker_id.clone().into(),
         now.into(),
         update.status.clone().into(),
         queue_names_json.into(),
+        update.registration.instance_id.clone().into(),
+        i64::from(update.registration.version).into(),
+        registration_json.into(),
+        i64::from(update.details.version).into(),
+        i64::from(update.details.available_slots).into(),
+        heartbeat_details_json.into(),
         opt_string(update.current_job_id.clone()),
         opt_string(update.current_stage_id.clone()),
         diagnostic_json.into(),
@@ -1999,15 +2118,31 @@ fn worker_heartbeat_upsert_statement(
                 last_heartbeat_at,
                 status,
                 queue_names_json,
+                instance_id,
+                registration_version,
+                registration_json,
+                heartbeat_version,
+                available_slots,
+                heartbeat_details_json,
                 current_job_id,
                 current_stage_id,
                 diagnostic_json
             )
-            VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7)
+            VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             ON CONFLICT(worker_id) DO UPDATE SET
+                started_at = CASE
+                    WHEN runtime_worker_heartbeats.instance_id <> excluded.instance_id THEN excluded.started_at
+                    ELSE runtime_worker_heartbeats.started_at
+                END,
                 last_heartbeat_at = excluded.last_heartbeat_at,
                 status = excluded.status,
                 queue_names_json = excluded.queue_names_json,
+                instance_id = excluded.instance_id,
+                registration_version = excluded.registration_version,
+                registration_json = excluded.registration_json,
+                heartbeat_version = excluded.heartbeat_version,
+                available_slots = excluded.available_slots,
+                heartbeat_details_json = excluded.heartbeat_details_json,
                 current_job_id = excluded.current_job_id,
                 current_stage_id = excluded.current_stage_id,
                 diagnostic_json = excluded.diagnostic_json
@@ -2023,15 +2158,28 @@ fn worker_heartbeat_upsert_statement(
                 last_heartbeat_at,
                 status,
                 queue_names_json,
+                instance_id,
+                registration_version,
+                registration_json,
+                heartbeat_version,
+                available_slots,
+                heartbeat_details_json,
                 current_job_id,
                 current_stage_id,
                 diagnostic_json
             )
-            VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7)
+            VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             ON DUPLICATE KEY UPDATE
+                started_at = IF(instance_id <> VALUES(instance_id), VALUES(started_at), started_at),
                 last_heartbeat_at = VALUES(last_heartbeat_at),
                 status = VALUES(status),
                 queue_names_json = VALUES(queue_names_json),
+                instance_id = VALUES(instance_id),
+                registration_version = VALUES(registration_version),
+                registration_json = VALUES(registration_json),
+                heartbeat_version = VALUES(heartbeat_version),
+                available_slots = VALUES(available_slots),
+                heartbeat_details_json = VALUES(heartbeat_details_json),
                 current_job_id = VALUES(current_job_id),
                 current_stage_id = VALUES(current_stage_id),
                 diagnostic_json = VALUES(diagnostic_json)
@@ -2125,7 +2273,8 @@ fn map_runtime_job(row: &QueryResult) -> anyhow::Result<RuntimeJob> {
 }
 
 fn map_job_stage(row: &QueryResult) -> anyhow::Result<JobStage> {
-    let status_raw: String = row.try_get_by_index(6)?;
+    let queue_class_raw: String = row.try_get_by_index(6)?;
+    let status_raw: String = row.try_get_by_index(8)?;
 
     Ok(JobStage {
         id: row.try_get_by_index(0)?,
@@ -2134,36 +2283,43 @@ fn map_job_stage(row: &QueryResult) -> anyhow::Result<JobStage> {
         updated_at: i64_to_u64(row.try_get_by_index(3)?)?,
         sequence: i64_to_u32(row.try_get_by_index(4)?)?,
         stage_kind: row.try_get_by_index(5)?,
+        queue_class: QueueClass::from_db_value(&queue_class_raw)
+            .ok_or_else(|| anyhow!("Unknown runtime queue class: {queue_class_raw}"))?,
+        resource_hints: parse_resource_hints(row.try_get_by_index(7)?),
         status: RuntimeStageStatus::from_db_value(status_raw.as_str())
             .ok_or_else(|| anyhow!("Unknown runtime stage status: {status_raw}"))?,
-        capability: row.try_get_by_index(7)?,
-        model_id: row.try_get_by_index(8)?,
-        worker_id: row.try_get_by_index(9)?,
-        lease_expires_at: opt_i64_to_u64(row.try_get_by_index(10)?)?,
-        available_at: opt_i64_to_u64(row.try_get_by_index(11)?)?,
-        attempt_token: row.try_get_by_index(12)?,
-        attempt_count: i64_to_u32(row.try_get_by_index(13)?)?,
-        max_attempts: i64_to_u32(row.try_get_by_index(14)?)?,
-        input_artifact_ids: parse_string_array(row.try_get_by_index::<String>(15)?),
-        output_artifact_ids: parse_string_array(row.try_get_by_index::<String>(16)?),
+        capability: row.try_get_by_index(9)?,
+        model_id: row.try_get_by_index(10)?,
+        worker_id: row.try_get_by_index(11)?,
+        lease_expires_at: opt_i64_to_u64(row.try_get_by_index(12)?)?,
+        available_at: opt_i64_to_u64(row.try_get_by_index(13)?)?,
+        attempt_token: row.try_get_by_index(14)?,
+        attempt_count: i64_to_u32(row.try_get_by_index(15)?)?,
+        max_attempts: i64_to_u32(row.try_get_by_index(16)?)?,
+        input_artifact_ids: parse_string_array(row.try_get_by_index::<String>(17)?),
+        output_artifact_ids: parse_string_array(row.try_get_by_index::<String>(18)?),
         progress_json: row
-            .try_get_by_index::<Option<String>>(17)?
+            .try_get_by_index::<Option<String>>(19)?
             .map(|raw| parse_json_value(raw, json!({}))),
-        started_at: opt_i64_to_u64(row.try_get_by_index(18)?)?,
-        finished_at: opt_i64_to_u64(row.try_get_by_index(19)?)?,
-        error_code: row.try_get_by_index(20)?,
-        error_message: row.try_get_by_index(21)?,
+        started_at: opt_i64_to_u64(row.try_get_by_index(20)?)?,
+        finished_at: opt_i64_to_u64(row.try_get_by_index(21)?)?,
+        error_code: row.try_get_by_index(22)?,
+        error_message: row.try_get_by_index(23)?,
     })
 }
 
 fn map_stage_claim_candidate(row: &QueryResult) -> anyhow::Result<StageClaimCandidate> {
     let job_kind_raw: String = row.try_get_by_index(2)?;
+    let queue_class_raw: String = row.try_get_by_index(5)?;
 
     Ok(StageClaimCandidate {
         stage_id: row.try_get_by_index(0)?,
         stage_kind: row.try_get_by_index(1)?,
         job_kind: RuntimeJobKind::from_db_value(job_kind_raw.as_str())
             .ok_or_else(|| anyhow!("Unknown runtime job kind: {job_kind_raw}"))?,
+        queue_class: QueueClass::from_db_value(&queue_class_raw)
+            .ok_or_else(|| anyhow!("Unknown runtime queue class: {queue_class_raw}"))?,
+        resource_hints: parse_resource_hints(row.try_get_by_index(6)?),
         capability: row.try_get_by_index(3)?,
         model_id: row.try_get_by_index(4)?,
     })
@@ -2211,15 +2367,55 @@ fn map_idempotency_record(row: &QueryResult) -> anyhow::Result<IdempotencyRecord
 }
 
 fn map_worker_heartbeat(row: &QueryResult) -> anyhow::Result<RuntimeWorkerHeartbeat> {
+    let worker_id: String = row.try_get_by_index(0)?;
+    let queue_names = parse_string_array(row.try_get_by_index::<String>(4)?);
+    let stored_instance_id: String = row.try_get_by_index(5)?;
+    let instance_id = if stored_instance_id.is_empty() {
+        worker_id.clone()
+    } else {
+        stored_instance_id
+    };
+    let registration_version = i64_to_u32(row.try_get_by_index(6)?)? as u16;
+    let registration =
+        serde_json::from_str::<RuntimeWorkerRegistration>(&row.try_get_by_index::<String>(7)?)
+            .unwrap_or_else(|_| RuntimeWorkerRegistration {
+                version: registration_version,
+                worker_id: worker_id.clone(),
+                instance_id: instance_id.clone(),
+                queue_classes: queue_names
+                    .iter()
+                    .filter_map(|queue| QueueClass::from_db_value(queue))
+                    .collect(),
+                capabilities: Vec::new(),
+                model_ids: Vec::new(),
+                stage_kinds: Vec::new(),
+                resources: WorkerResourceCapacity::default(),
+                software_version: "legacy".to_string(),
+            });
+    let heartbeat_version = i64_to_u32(row.try_get_by_index(8)?)? as u16;
+    let available_slots = i64_to_u32(row.try_get_by_index(9)?)?;
+    let details =
+        serde_json::from_str::<RuntimeWorkerHeartbeatDetails>(&row.try_get_by_index::<String>(10)?)
+            .unwrap_or_else(|_| RuntimeWorkerHeartbeatDetails {
+                version: heartbeat_version,
+                available_slots,
+                active_lease_ids: Vec::new(),
+                last_error: None,
+                health_json: json!({}),
+            });
+
     Ok(RuntimeWorkerHeartbeat {
-        worker_id: row.try_get_by_index(0)?,
+        worker_id,
         started_at: i64_to_u64(row.try_get_by_index(1)?)?,
         last_heartbeat_at: i64_to_u64(row.try_get_by_index(2)?)?,
         status: row.try_get_by_index(3)?,
-        queue_names: parse_string_array(row.try_get_by_index::<String>(4)?),
-        current_job_id: row.try_get_by_index(5)?,
-        current_stage_id: row.try_get_by_index(6)?,
-        diagnostic_json: parse_json_value(row.try_get_by_index::<String>(7)?, json!({})),
+        queue_names,
+        instance_id,
+        registration,
+        details,
+        current_job_id: row.try_get_by_index(11)?,
+        current_stage_id: row.try_get_by_index(12)?,
+        diagnostic_json: parse_json_value(row.try_get_by_index::<String>(13)?, json!({})),
     })
 }
 
@@ -2237,6 +2433,21 @@ fn parse_string_array(raw: String) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(raw.as_str()).unwrap_or_default()
 }
 
+fn parse_resource_hints(raw: String) -> StageResourceHints {
+    serde_json::from_str::<StageResourceHints>(&raw).unwrap_or_default()
+}
+
+fn queue_class_for_stage_kind(stage_kind: &str) -> QueueClass {
+    match stage_kind {
+        "asr_transcribe" | "asr_infer" => QueueClass::BatchAsr,
+        "tts_synthesize" | "tts_generate" => QueueClass::BatchTts,
+        "diarization" | "diarization_segment" => QueueClass::Diarization,
+        "export" | "encode" | "notify" => QueueClass::Export,
+        "evaluation" | "evaluate" => QueueClass::Evaluation,
+        _ => QueueClass::Batch,
+    }
+}
+
 fn normalize_filter_values(values: &[String]) -> Vec<String> {
     values
         .iter()
@@ -2247,28 +2458,85 @@ fn normalize_filter_values(values: &[String]) -> Vec<String> {
 }
 
 fn push_claim_queue_clause(sql: &mut String, params: &mut Vec<Value>, queue_names: &[String]) {
-    if queue_names.is_empty() || queue_names.iter().any(|queue| queue == "batch") {
+    if queue_names.is_empty()
+        || queue_names
+            .iter()
+            .any(|queue| queue == QueueClass::Batch.as_db_value())
+    {
         return;
     }
 
+    sql.push_str(" AND ");
+    push_claim_in_expression(sql, params, "s.queue_class", queue_names);
+}
+
+fn push_claim_resource_clause(
+    sql: &mut String,
+    params: &mut Vec<Value>,
+    resources: &WorkerResourceCapacity,
+) {
+    let targets = resources
+        .targets
+        .iter()
+        .map(|target| target.as_db_value().to_string())
+        .collect::<Vec<_>>();
+    sql.push_str(" AND (s.resource_target = 'any'");
+    if !targets.is_empty() {
+        sql.push_str(" OR ");
+        push_claim_in_expression(sql, params, "s.resource_target", &targets);
+    }
+    sql.push(')');
+
+    let backends = resources
+        .backends
+        .iter()
+        .map(|backend| backend.as_db_value().to_string())
+        .collect::<Vec<_>>();
+    push_optional_resource_requirement(sql, params, "s.required_backend", &backends);
+    let device_classes = resources
+        .device_classes
+        .iter()
+        .map(|device| device.as_db_value().to_string())
+        .collect::<Vec<_>>();
+    push_optional_resource_requirement(
+        sql,
+        params,
+        "s.required_device_class",
+        &device_classes,
+    );
+
+    match resources.memory_bytes {
+        Some(memory_bytes) => {
+            let placeholder = params.len() + 1;
+            sql.push_str(
+                " AND (s.min_resource_memory_bytes IS NULL OR s.min_resource_memory_bytes <= ?",
+            );
+            sql.push_str(&placeholder.to_string());
+            sql.push(')');
+            params.push(u64_to_i64_value(memory_bytes).unwrap_or(Value::BigInt(Some(i64::MAX))));
+        }
+        None => sql.push_str(" AND s.min_resource_memory_bytes IS NULL"),
+    }
+
+    let placeholder = params.len() + 1;
+    sql.push_str(" AND s.resource_concurrency_weight <= ?");
+    sql.push_str(&placeholder.to_string());
+    params.push(u32_to_i64_value(resources.concurrency_slots).into());
+}
+
+fn push_optional_resource_requirement(
+    sql: &mut String,
+    params: &mut Vec<Value>,
+    expression: &str,
+    values: &[String],
+) {
     sql.push_str(" AND (");
-    let mut first = true;
-    push_claim_string_filter_expr(&mut first, sql, params, "s.stage_kind", queue_names);
-    push_claim_string_filter_expr(&mut first, sql, params, "j.job_kind", queue_names);
-    push_claim_string_filter_expr(
-        &mut first,
-        sql,
-        params,
-        "COALESCE(s.capability, j.capability)",
-        queue_names,
-    );
-    push_claim_string_filter_expr(
-        &mut first,
-        sql,
-        params,
-        "COALESCE(s.model_id, j.model_id)",
-        queue_names,
-    );
+    sql.push_str(expression);
+    sql.push_str(" IS NULL");
+    if !values.is_empty() {
+        sql.push_str(" OR ");
+        push_claim_in_expression(sql, params, expression, values);
+    }
     sql.push(')');
 }
 
@@ -2283,20 +2551,6 @@ fn push_claim_string_filter_clause(
     }
 
     sql.push_str(" AND ");
-    push_claim_in_expression(sql, params, expression, values);
-}
-
-fn push_claim_string_filter_expr(
-    first: &mut bool,
-    sql: &mut String,
-    params: &mut Vec<Value>,
-    expression: &str,
-    values: &[String],
-) {
-    if !*first {
-        sql.push_str(" OR ");
-    }
-    *first = false;
     push_claim_in_expression(sql, params, expression, values);
 }
 
@@ -2429,6 +2683,28 @@ mod tests {
         stage_kind: &str,
         max_attempts: u32,
     ) -> (RuntimeJob, JobStage) {
+        let job = create_test_job(store, priority, max_attempts).await;
+        let stage = store
+            .create_stage(NewJobStage {
+                job_id: job.id.clone(),
+                sequence: 0,
+                stage_kind: stage_kind.to_string(),
+                status: RuntimeStageStatus::Queued,
+                capability: Some("test".to_string()),
+                model_id: None,
+                max_attempts,
+                input_artifact_ids: vec![],
+            })
+            .await
+            .expect("test stage");
+        (job, stage)
+    }
+
+    async fn create_test_job(
+        store: &BatchRuntimeStore,
+        priority: i32,
+        max_attempts: u32,
+    ) -> RuntimeJob {
         let job = store
             .create_job(NewRuntimeJob {
                 job_kind: RuntimeJobKind::TtsSpeech,
@@ -2449,20 +2725,7 @@ mod tests {
             })
             .await
             .expect("test job");
-        let stage = store
-            .create_stage(NewJobStage {
-                job_id: job.id.clone(),
-                sequence: 0,
-                stage_kind: stage_kind.to_string(),
-                status: RuntimeStageStatus::Queued,
-                capability: Some("test".to_string()),
-                model_id: None,
-                max_attempts,
-                input_artifact_ids: vec![],
-            })
-            .await
-            .expect("test stage");
-        (job, stage)
+        job
     }
 
     #[tokio::test]
@@ -2590,6 +2853,81 @@ mod tests {
         assert_eq!(artifact.stage_id.as_deref(), Some(stage.id.as_str()));
         assert_eq!(idempotency.runtime_job_id.as_deref(), Some(job.id.as_str()));
         assert_eq!(heartbeat.queue_names, vec!["batch"]);
+        assert_eq!(heartbeat.instance_id, "worker-1");
+        assert_eq!(
+            heartbeat.registration.queue_classes,
+            vec![QueueClass::Batch]
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_worker_heartbeat_tracks_instance_resources_and_capacity() {
+        let (store, _root) = build_store();
+        let registration = RuntimeWorkerRegistration {
+            version: WORKER_REGISTRATION_VERSION,
+            worker_id: "worker-logical".to_string(),
+            instance_id: "instance-a".to_string(),
+            queue_classes: vec![QueueClass::BatchAsr, QueueClass::Evaluation],
+            capabilities: vec!["asr".to_string()],
+            model_ids: vec!["model-a".to_string()],
+            stage_kinds: vec!["asr_transcribe".to_string()],
+            resources: WorkerResourceCapacity {
+                targets: vec![ResourceTarget::Gpu],
+                memory_bytes: Some(24 * 1024 * 1024 * 1024),
+                concurrency_slots: 2,
+                ..WorkerResourceCapacity::default()
+            },
+            software_version: "test-version".to_string(),
+        };
+        let details = RuntimeWorkerHeartbeatDetails {
+            version: WORKER_HEARTBEAT_DETAILS_VERSION,
+            available_slots: 1,
+            active_lease_ids: vec!["stage-a".to_string()],
+            last_error: None,
+            health_json: json!({"temperature_c": 60}),
+        };
+
+        let heartbeat = store
+            .upsert_registered_worker_heartbeat(RegisteredWorkerHeartbeatUpdate {
+                registration: registration.clone(),
+                status: "running".to_string(),
+                current_job_id: None,
+                current_stage_id: None,
+                details: details.clone(),
+                diagnostic_json: json!({"source": "test"}),
+            })
+            .await
+            .expect("registered heartbeat");
+        assert_eq!(heartbeat.instance_id, "instance-a");
+        assert_eq!(heartbeat.registration, registration);
+        assert_eq!(heartbeat.details, details);
+        assert_eq!(
+            heartbeat.queue_names,
+            vec!["batch_asr".to_string(), "evaluation".to_string()]
+        );
+
+        let replacement = RuntimeWorkerRegistration {
+            instance_id: "instance-b".to_string(),
+            ..heartbeat.registration
+        };
+        let replaced = store
+            .upsert_registered_worker_heartbeat(RegisteredWorkerHeartbeatUpdate {
+                registration: replacement,
+                status: "idle".to_string(),
+                current_job_id: None,
+                current_stage_id: None,
+                details: RuntimeWorkerHeartbeatDetails {
+                    available_slots: 2,
+                    active_lease_ids: vec![],
+                    ..heartbeat.details
+                },
+                diagnostic_json: json!({"source": "replacement"}),
+            })
+            .await
+            .expect("replacement heartbeat");
+        assert_eq!(replaced.instance_id, "instance-b");
+        assert_eq!(replaced.status, "idle");
+        assert_eq!(replaced.details.available_slots, 2);
     }
 
     #[tokio::test]
@@ -2799,7 +3137,7 @@ mod tests {
             .await
             .expect("asr stage");
 
-        let mut filter = StageClaimFilter::for_worker_queues(&["asr".to_string()]);
+        let mut filter = StageClaimFilter::for_worker_queues(&["batch_asr".to_string()]);
         filter.capabilities = vec!["asr".to_string()];
 
         let claimed = store
@@ -2809,6 +3147,7 @@ mod tests {
             .expect("asr stage should be claimed");
 
         assert_eq!(claimed.stage.id, asr_stage.id);
+        assert_eq!(claimed.stage.queue_class, QueueClass::BatchAsr);
         assert_eq!(claimed.stage.capability.as_deref(), Some("asr"));
         assert_eq!(claimed.stage.worker_id.as_deref(), Some("asr-worker"));
 
@@ -2819,6 +3158,101 @@ mod tests {
             .expect("tts stage exists");
         assert_eq!(tts_stage.status, RuntimeStageStatus::Queued);
         assert_eq!(tts_stage.worker_id, None);
+
+        let wildcard_claim = store
+            .claim_next_stage("general-batch-worker", 60_000)
+            .await
+            .expect("wildcard claim")
+            .expect("legacy batch wildcard should claim remaining TTS stage");
+        assert_eq!(wildcard_claim.stage.id, tts_stage.id);
+        assert_eq!(wildcard_claim.stage.queue_class, QueueClass::BatchTts);
+    }
+
+    #[tokio::test]
+    async fn resource_aware_claim_rejects_backend_device_and_capacity_mismatch() {
+        let (store, _root) = build_store();
+        let gpu_job = create_test_job(&store, 50, 1).await;
+        let gpu_stage = store
+            .create_stage_with_dispatch(NewJobStageDispatch {
+                stage: NewJobStage {
+                    job_id: gpu_job.id,
+                    sequence: 0,
+                    stage_kind: "gpu_evaluation".to_string(),
+                    status: RuntimeStageStatus::Queued,
+                    capability: Some("test".to_string()),
+                    model_id: None,
+                    max_attempts: 1,
+                    input_artifact_ids: vec![],
+                },
+                queue_class: QueueClass::Evaluation,
+                resource_hints: StageResourceHints {
+                    target: ResourceTarget::Gpu,
+                    backend: Some(RuntimeBackendClass::Metal),
+                    device_class: Some(DeviceClass::AppleGpu),
+                    min_memory_bytes: Some(16 * 1024 * 1024 * 1024),
+                    concurrency_weight: 2,
+                    ..StageResourceHints::default()
+                },
+            })
+            .await
+            .expect("GPU stage");
+        let cpu_job = create_test_job(&store, 10, 1).await;
+        let cpu_stage = store
+            .create_stage_with_dispatch(NewJobStageDispatch {
+                stage: NewJobStage {
+                    job_id: cpu_job.id,
+                    sequence: 0,
+                    stage_kind: "cpu_evaluation".to_string(),
+                    status: RuntimeStageStatus::Queued,
+                    capability: Some("test".to_string()),
+                    model_id: None,
+                    max_attempts: 1,
+                    input_artifact_ids: vec![],
+                },
+                queue_class: QueueClass::Evaluation,
+                resource_hints: StageResourceHints {
+                    target: ResourceTarget::Gpu,
+                    backend: Some(RuntimeBackendClass::Cuda),
+                    device_class: Some(DeviceClass::NvidiaGpu),
+                    min_memory_bytes: Some(2 * 1024 * 1024 * 1024),
+                    ..StageResourceHints::default()
+                },
+            })
+            .await
+            .expect("CPU stage");
+
+        let mut filter = StageClaimFilter::for_worker_queues(&["evaluation".to_string()]);
+        filter.resources = WorkerResourceCapacity {
+            targets: vec![ResourceTarget::Gpu],
+            backends: vec![RuntimeBackendClass::Cuda],
+            device_classes: vec![DeviceClass::NvidiaGpu],
+            memory_bytes: Some(8 * 1024 * 1024 * 1024),
+            concurrency_slots: 1,
+            ..WorkerResourceCapacity::default()
+        };
+        let claimed = store
+            .claim_next_stage_with_filter("cpu-worker", 60_000, &filter)
+            .await
+            .expect("resource-aware claim")
+            .expect("compatible CUDA stage");
+        assert_eq!(claimed.stage.id, cpu_stage.id);
+        assert_eq!(claimed.stage.queue_class, QueueClass::Evaluation);
+        assert_eq!(
+            claimed.stage.resource_hints.backend,
+            Some(RuntimeBackendClass::Cuda)
+        );
+        assert_eq!(
+            claimed.stage.resource_hints.device_class,
+            Some(DeviceClass::NvidiaGpu)
+        );
+
+        let gpu_stage = store
+            .get_stage(&gpu_stage.id)
+            .await
+            .expect("GPU stage fetch")
+            .expect("GPU stage exists");
+        assert_eq!(gpu_stage.status, RuntimeStageStatus::Queued);
+        assert_eq!(gpu_stage.worker_id, None);
     }
 
     #[tokio::test]
@@ -2908,6 +3342,8 @@ mod tests {
                     stage_id: stage.id.clone(),
                     stage_kind: stage.stage_kind.clone(),
                     job_kind: job.job_kind,
+                    queue_class: stage.queue_class,
+                    resource_hints: stage.resource_hints.clone(),
                     capability: stage.capability.clone(),
                     model_id: stage.model_id.clone(),
                 },

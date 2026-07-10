@@ -1,7 +1,12 @@
 use super::{
-    store::{BatchRuntimeStore, StageClaimFilter, WorkerHeartbeatUpdate},
-    types::{ClaimedStage, RuntimeJobKind},
+    store::{BatchRuntimeStore, RegisteredWorkerHeartbeatUpdate, StageClaimFilter},
+    types::{
+        ClaimedStage, QueueClass, RuntimeJobKind, RuntimeWorkerHeartbeatDetails,
+        RuntimeWorkerRegistration, WorkerResourceCapacity, WORKER_HEARTBEAT_DETAILS_VERSION,
+        WORKER_REGISTRATION_VERSION,
+    },
 };
+use crate::ids::new_uuid;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use izwi_core::{
@@ -23,10 +28,12 @@ use tracing::{debug, error, info};
 #[derive(Debug, Clone)]
 pub struct BatchWorkerConfig {
     pub worker_id: String,
+    pub instance_id: String,
     pub queue_names: Vec<String>,
     pub capabilities: Vec<String>,
     pub model_ids: Vec<String>,
     pub stage_kinds: Vec<String>,
+    pub resources: WorkerResourceCapacity,
     pub draining: bool,
     pub poll_interval: Duration,
     pub lease_duration: Duration,
@@ -35,12 +42,15 @@ pub struct BatchWorkerConfig {
 
 impl BatchWorkerConfig {
     pub fn local(worker_id: impl Into<String>) -> Self {
+        let worker_id = worker_id.into();
         Self {
-            worker_id: worker_id.into(),
+            worker_id,
+            instance_id: new_uuid(),
             queue_names: vec!["batch".to_string()],
             capabilities: Vec::new(),
             model_ids: Vec::new(),
             stage_kinds: Vec::new(),
+            resources: WorkerResourceCapacity::default(),
             draining: false,
             poll_interval: Duration::from_millis(250),
             lease_duration: Duration::from_secs(60),
@@ -94,12 +104,15 @@ impl BatchWorkerDrain {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BatchWorkerSnapshot {
     pub worker_id: String,
+    pub instance_id: String,
     pub running: bool,
     pub last_heartbeat_at: u64,
     pub last_claimed_stage_id: Option<String>,
     pub last_error: Option<String>,
     pub configured_capabilities: Vec<String>,
     pub configured_stage_kinds: Vec<String>,
+    pub configured_queue_names: Vec<String>,
+    pub configured_resources: WorkerResourceCapacity,
 }
 
 #[derive(Debug, Clone)]
@@ -110,12 +123,15 @@ pub struct BatchWorkerHealth {
 #[derive(Debug)]
 struct BatchWorkerHealthInner {
     worker_id: String,
+    instance_id: String,
     running: bool,
     last_heartbeat_at: u64,
     last_claimed_stage_id: Option<String>,
     last_error: Option<String>,
     configured_capabilities: Vec<String>,
     configured_stage_kinds: Vec<String>,
+    configured_queue_names: Vec<String>,
+    configured_resources: WorkerResourceCapacity,
 }
 
 impl BatchWorkerHealth {
@@ -124,12 +140,15 @@ impl BatchWorkerHealth {
         Self {
             inner: Arc::new(RwLock::new(BatchWorkerHealthInner {
                 worker_id,
+                instance_id: String::new(),
                 running: false,
                 last_heartbeat_at: now_secs(),
                 last_claimed_stage_id: None,
                 last_error: None,
                 configured_capabilities: Vec::new(),
                 configured_stage_kinds: Vec::new(),
+                configured_queue_names: Vec::new(),
+                configured_resources: WorkerResourceCapacity::default(),
             })),
         }
     }
@@ -165,8 +184,12 @@ impl BatchWorkerHealth {
 
     fn configure(&self, config: &BatchWorkerConfig) {
         self.update(|inner| {
+            inner.worker_id = config.worker_id.clone();
+            inner.instance_id = config.instance_id.clone();
             inner.configured_capabilities = config.capabilities.clone();
             inner.configured_stage_kinds = config.stage_kinds.clone();
+            inner.configured_queue_names = config.queue_names.clone();
+            inner.configured_resources = config.resources.clone();
         });
     }
 
@@ -177,12 +200,15 @@ impl BatchWorkerHealth {
             .unwrap_or_else(|poison| poison.into_inner());
         BatchWorkerSnapshot {
             worker_id: guard.worker_id.clone(),
+            instance_id: guard.instance_id.clone(),
             running: guard.running,
             last_heartbeat_at: guard.last_heartbeat_at,
             last_claimed_stage_id: guard.last_claimed_stage_id.clone(),
             last_error: guard.last_error.clone(),
             configured_capabilities: guard.configured_capabilities.clone(),
             configured_stage_kinds: guard.configured_stage_kinds.clone(),
+            configured_queue_names: guard.configured_queue_names.clone(),
+            configured_resources: guard.configured_resources.clone(),
         }
     }
 
@@ -553,17 +579,61 @@ impl BatchWorkerRunner {
             .map_or((None, None), |(job_id, stage_id)| {
                 (Some(job_id), Some(stage_id))
             });
+        let health = self.health.snapshot();
+        let queue_classes = self
+            .config
+            .queue_names
+            .iter()
+            .filter_map(|queue| QueueClass::from_db_value(queue))
+            .collect::<Vec<_>>();
+        let registration = RuntimeWorkerRegistration {
+            version: WORKER_REGISTRATION_VERSION,
+            worker_id: self.config.worker_id.clone(),
+            instance_id: self.config.instance_id.clone(),
+            queue_classes: if queue_classes.is_empty() {
+                vec![QueueClass::Batch]
+            } else {
+                queue_classes
+            },
+            capabilities: self.config.capabilities.clone(),
+            model_ids: self.config.model_ids.clone(),
+            stage_kinds: self.config.stage_kinds.clone(),
+            resources: self.config.resources.clone(),
+            software_version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+        let active_lease_ids = current_stage_id.clone().into_iter().collect::<Vec<_>>();
+        let available_slots = if self.drain.is_draining() {
+            0
+        } else {
+            self.config
+                .resources
+                .concurrency_slots
+                .saturating_sub(if active_lease_ids.is_empty() { 0 } else { 1 })
+        };
+        let details = RuntimeWorkerHeartbeatDetails {
+            version: WORKER_HEARTBEAT_DETAILS_VERSION,
+            available_slots,
+            active_lease_ids,
+            last_error: health.last_error.clone(),
+            health_json: serde_json::json!({
+                "running": health.running,
+                "draining": self.drain.is_draining(),
+                "last_claimed_stage_id": health.last_claimed_stage_id,
+            }),
+        };
         self.store
-            .upsert_worker_heartbeat(WorkerHeartbeatUpdate {
-                worker_id: self.config.worker_id.clone(),
+            .upsert_registered_worker_heartbeat(RegisteredWorkerHeartbeatUpdate {
+                registration,
                 status: status.to_string(),
-                queue_names: self.config.queue_names.clone(),
                 current_job_id,
                 current_stage_id,
+                details,
                 diagnostic_json: serde_json::json!({
-                    "capabilities": self.config.capabilities.clone(),
-                    "model_ids": self.config.model_ids.clone(),
-                    "stage_kinds": self.config.stage_kinds.clone(),
+                    "capabilities": self.config.capabilities,
+                    "model_ids": self.config.model_ids,
+                    "stage_kinds": self.config.stage_kinds,
+                    "instance_id": self.config.instance_id,
+                    "resources": self.config.resources,
                 }),
             })
             .await?;
@@ -575,6 +645,7 @@ impl BatchWorkerRunner {
         filter.capabilities = normalized_claim_values(&self.config.capabilities);
         filter.model_ids = normalized_claim_values(&self.config.model_ids);
         filter.stage_kinds = normalized_claim_values(&self.config.stage_kinds);
+        filter.resources = self.config.resources.clone();
         filter
     }
 
@@ -909,11 +980,9 @@ mod tests {
             .await
             .expect("heartbeat")
             .expect("heartbeat exists");
-        assert_eq!(heartbeat.diagnostic_json["capabilities"], json!(["test"]));
-        assert_eq!(
-            heartbeat.diagnostic_json["stage_kinds"],
-            json!(["fake_stage"])
-        );
+        assert_eq!(heartbeat.registration.capabilities, vec!["test"]);
+        assert_eq!(heartbeat.registration.stage_kinds, vec!["fake_stage"]);
+        assert_eq!(heartbeat.instance_id, heartbeat.registration.instance_id);
     }
 
     #[tokio::test]

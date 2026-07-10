@@ -427,6 +427,13 @@ const BASELINE_SCHEMA: &[&str] = &[
         updated_at INTEGER NOT NULL,
         sequence INTEGER NOT NULL,
         stage_kind TEXT NOT NULL,
+        queue_class TEXT NOT NULL DEFAULT 'batch',
+        resource_hints_json TEXT NOT NULL DEFAULT '{"version":1}',
+        resource_target TEXT NOT NULL DEFAULT 'any',
+        required_backend TEXT NULL,
+        required_device_class TEXT NULL,
+        min_resource_memory_bytes INTEGER NULL,
+        resource_concurrency_weight INTEGER NOT NULL DEFAULT 1,
         status TEXT NOT NULL CHECK(status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing', 'completed', 'failed', 'cancelled', 'expired', 'skipped')),
         capability TEXT NULL,
         model_id TEXT NULL,
@@ -496,6 +503,12 @@ const BASELINE_SCHEMA: &[&str] = &[
         last_heartbeat_at INTEGER NOT NULL,
         status TEXT NOT NULL,
         queue_names_json TEXT NOT NULL DEFAULT '[]',
+        instance_id TEXT NOT NULL DEFAULT '',
+        registration_version INTEGER NOT NULL DEFAULT 1,
+        registration_json TEXT NOT NULL DEFAULT '{}',
+        heartbeat_version INTEGER NOT NULL DEFAULT 1,
+        available_slots INTEGER NOT NULL DEFAULT 0,
+        heartbeat_details_json TEXT NOT NULL DEFAULT '{}',
         current_job_id TEXT NULL,
         current_stage_id TEXT NULL,
         diagnostic_json TEXT NOT NULL DEFAULT '{}',
@@ -508,9 +521,77 @@ const BASELINE_SCHEMA: &[&str] = &[
 
 const POST_COMPATIBILITY_SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_job_stages_claim_ready ON job_stages(status, available_at, lease_expires_at, sequence);",
+    "UPDATE job_stages SET queue_class = CASE WHEN stage_kind IN ('asr_transcribe', 'asr_infer') THEN 'batch_asr' WHEN stage_kind IN ('tts_synthesize', 'tts_generate') THEN 'batch_tts' WHEN stage_kind IN ('diarization', 'diarization_segment') THEN 'diarization' WHEN stage_kind IN ('export', 'encode', 'notify') THEN 'export' WHEN stage_kind IN ('evaluation', 'evaluate') THEN 'evaluation' ELSE queue_class END WHERE queue_class = 'batch';",
+    "CREATE INDEX IF NOT EXISTS idx_job_stages_queue_claim_ready ON job_stages(queue_class, status, available_at, lease_expires_at, sequence);",
+    "CREATE INDEX IF NOT EXISTS idx_job_stages_queue_resources ON job_stages(queue_class, resource_target, required_backend, required_device_class, min_resource_memory_bytes, resource_concurrency_weight, status);",
 ];
 
 const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "queue_class",
+        definition: "TEXT NOT NULL DEFAULT 'batch'",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "resource_hints_json",
+        definition: "TEXT NOT NULL DEFAULT '{\"version\":1}'",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "resource_target",
+        definition: "TEXT NOT NULL DEFAULT 'any'",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "required_backend",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "required_device_class",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "min_resource_memory_bytes",
+        definition: "INTEGER NULL",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "resource_concurrency_weight",
+        definition: "INTEGER NOT NULL DEFAULT 1",
+    },
+    CompatibilityColumn {
+        table: "runtime_worker_heartbeats",
+        column: "instance_id",
+        definition: "TEXT NOT NULL DEFAULT ''",
+    },
+    CompatibilityColumn {
+        table: "runtime_worker_heartbeats",
+        column: "registration_version",
+        definition: "INTEGER NOT NULL DEFAULT 1",
+    },
+    CompatibilityColumn {
+        table: "runtime_worker_heartbeats",
+        column: "registration_json",
+        definition: "TEXT NOT NULL DEFAULT '{}'",
+    },
+    CompatibilityColumn {
+        table: "runtime_worker_heartbeats",
+        column: "heartbeat_version",
+        definition: "INTEGER NOT NULL DEFAULT 1",
+    },
+    CompatibilityColumn {
+        table: "runtime_worker_heartbeats",
+        column: "available_slots",
+        definition: "INTEGER NOT NULL DEFAULT 0",
+    },
+    CompatibilityColumn {
+        table: "runtime_worker_heartbeats",
+        column: "heartbeat_details_json",
+        definition: "TEXT NOT NULL DEFAULT '{}'",
+    },
     CompatibilityColumn {
         table: "job_stages",
         column: "available_at",
