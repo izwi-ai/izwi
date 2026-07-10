@@ -213,6 +213,11 @@ impl ModelManager {
         self.residency.active_leases(variant)
     }
 
+    /// Return models currently loading or ready without refreshing artifact metadata.
+    pub async fn resident_variants(&self) -> Vec<ModelVariant> {
+        self.residency.resident_variants().await
+    }
+
     /// Download a model from HuggingFace
     pub async fn download_model(&self, variant: ModelVariant) -> Result<PathBuf> {
         if !variant.is_enabled() {

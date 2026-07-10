@@ -1,6 +1,5 @@
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
-use crate::model::ModelStatus;
 use crate::model::ModelVariant;
 use crate::models::shared::memory::metal::MetalPoolManager;
 use crate::runtime::service::RuntimeService;
@@ -71,15 +70,7 @@ impl RuntimeService {
 
         self.model_manager.unload_model(variant).await?;
 
-        let has_other_loaded_models =
-            self.model_manager
-                .list_models()
-                .await
-                .into_iter()
-                .any(|info| {
-                    info.variant != variant
-                        && matches!(info.status, ModelStatus::Ready | ModelStatus::Loading)
-                });
+        let has_other_loaded_models = !self.model_manager.resident_variants().await.is_empty();
         if !has_other_loaded_models {
             MetalPoolManager::global().clear_all();
         }
@@ -91,14 +82,7 @@ impl RuntimeService {
 
     /// Unload every model currently resident in memory.
     pub async fn unload_all_models(&self) -> Result<usize> {
-        let loaded_variants = self
-            .model_manager
-            .list_models()
-            .await
-            .into_iter()
-            .filter(|info| matches!(info.status, ModelStatus::Ready | ModelStatus::Loading))
-            .map(|info| info.variant)
-            .collect::<Vec<_>>();
+        let loaded_variants = self.model_manager.resident_variants().await;
 
         let mut unloaded_count = 0usize;
         for variant in loaded_variants {
