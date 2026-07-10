@@ -8,8 +8,11 @@ use axum::{
 };
 use serde::Serialize;
 
+use crate::batch_runtime::store::{current_timestamp_millis, RuntimeQueueHealthSnapshot};
 use crate::media_ingest::MediaIngestLaneSnapshot;
 use crate::state::{AppState, RealtimeSessionAdmissionSnapshot, RequestAdmissionSnapshot};
+
+const DEFAULT_BATCH_HEARTBEAT_STALE_SECS: u64 = 5;
 
 #[derive(Debug, Serialize)]
 pub struct ProbeCheck {
@@ -37,6 +40,7 @@ pub struct ReadyResponse {
     pub request_admission: RequestAdmissionSnapshot,
     pub realtime_session_admission: RealtimeSessionAdmissionSnapshot,
     pub media_ingest: MediaIngestLaneSnapshot,
+    pub batch_runtime: Option<RuntimeQueueHealthSnapshot>,
     pub checks: Vec<ProbeCheck>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub startup_warnings: Vec<String>,
@@ -70,6 +74,11 @@ async fn readiness_response(state: &AppState) -> ReadyResponse {
     let request_admission = state.request_admission_snapshot();
     let realtime_session_admission = state.realtime_session_admission_snapshot();
     let media_ingest = state.media_ingest.lane_snapshot();
+    let heartbeat_stale_after_ms = resolve_batch_heartbeat_stale_after_ms();
+    let batch_runtime = state
+        .batch_runtime_store
+        .runtime_queue_health(heartbeat_stale_after_ms)
+        .await;
 
     let mut checks = vec![
         ProbeCheck {
@@ -132,14 +141,72 @@ async fn readiness_response(state: &AppState) -> ReadyResponse {
         message: batch_worker.last_error,
     });
 
-    let batch_store_check = state.batch_runtime_store.queued_stage_count().await;
     checks.push(ProbeCheck {
         name: "batch_runtime_store",
-        ok: batch_store_check.is_ok(),
-        message: batch_store_check
+        ok: batch_runtime.is_ok(),
+        message: batch_runtime
+            .as_ref()
             .err()
             .map(|err| format!("batch runtime store unavailable: {err}")),
     });
+    if let Ok(queue_health) = batch_runtime.as_ref() {
+        checks.push(ProbeCheck {
+            name: "batch_queue_coverage",
+            ok: queue_health.uncovered_queue_classes.is_empty(),
+            message: (!queue_health.uncovered_queue_classes.is_empty()).then(|| {
+                format!(
+                    "no fresh eligible worker heartbeat covers queues: {}",
+                    queue_health
+                        .uncovered_queue_classes
+                        .iter()
+                        .map(|queue| queue.as_db_value())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }),
+        });
+    }
+
+    if batch_worker.running {
+        let durable_heartbeat = state
+            .batch_runtime_store
+            .get_worker_heartbeat(&batch_worker.worker_id)
+            .await;
+        let (heartbeat_ok, heartbeat_message) = match durable_heartbeat {
+            Ok(Some(heartbeat)) => {
+                let now = u64::try_from(current_timestamp_millis()).unwrap_or_default();
+                let age_ms = now.saturating_sub(heartbeat.last_heartbeat_at);
+                let fresh = age_ms <= heartbeat_stale_after_ms;
+                let active = matches!(heartbeat.status.as_str(), "polling" | "idle" | "running");
+                let same_instance = batch_worker.instance_id.is_empty()
+                    || batch_worker.instance_id == heartbeat.instance_id;
+                let ok = fresh && active && same_instance;
+                let message = (!ok).then(|| {
+                    format!(
+                        "local worker heartbeat status={}, age_ms={}, expected_instance={}, durable_instance={}",
+                        heartbeat.status,
+                        age_ms,
+                        batch_worker.instance_id,
+                        heartbeat.instance_id
+                    )
+                });
+                (ok, message)
+            }
+            Ok(None) => (
+                false,
+                Some("local batch worker has not published a durable heartbeat".to_string()),
+            ),
+            Err(err) => (
+                false,
+                Some(format!("local batch worker heartbeat unavailable: {err}")),
+            ),
+        };
+        checks.push(ProbeCheck {
+            name: "batch_worker_heartbeat",
+            ok: heartbeat_ok,
+            message: heartbeat_message,
+        });
+    }
 
     let ready = checks.iter().all(|check| check.ok);
 
@@ -153,9 +220,19 @@ async fn readiness_response(state: &AppState) -> ReadyResponse {
         request_admission,
         realtime_session_admission,
         media_ingest,
+        batch_runtime: batch_runtime.ok(),
         checks,
         startup_warnings,
     }
+}
+
+pub(super) fn resolve_batch_heartbeat_stale_after_ms() -> u64 {
+    std::env::var("IZWI_BATCH_WORKER_HEARTBEAT_STALE_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_BATCH_HEARTBEAT_STALE_SECS)
+        .saturating_mul(1_000)
 }
 
 fn now_saturating_sub(started_at: u64) -> u64 {
@@ -169,6 +246,7 @@ fn now_saturating_sub(started_at: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::batch_runtime::store::WorkerHeartbeatUpdate;
     use crate::state::AppState;
     use crate::test_support::env_lock;
     use izwi_core::{backends::BackendPreference, RuntimeService, ServeRuntimeConfig};
@@ -244,6 +322,40 @@ mod tests {
         assert_eq!(response.realtime_session_admission.active, 1);
         assert_eq!(response.realtime_session_admission.available, 0);
         assert!(response.checks.iter().all(|check| check.ok));
+    }
+
+    #[tokio::test]
+    async fn readiness_requires_a_fresh_durable_heartbeat_for_a_running_local_worker() {
+        let (_guard, state) = test_state("readiness_worker_heartbeat");
+        state.lifecycle.mark_ready();
+        state.batch_worker_health.mark_running();
+
+        let missing = readiness_response(&state).await;
+        assert!(!missing.ready);
+        assert!(missing
+            .checks
+            .iter()
+            .any(|check| check.name == "batch_worker_heartbeat" && !check.ok));
+
+        state
+            .batch_runtime_store
+            .upsert_worker_heartbeat(WorkerHeartbeatUpdate {
+                worker_id: "local-batch-worker".to_string(),
+                status: "idle".to_string(),
+                queue_names: vec!["batch".to_string()],
+                current_job_id: None,
+                current_stage_id: None,
+                diagnostic_json: serde_json::json!({}),
+            })
+            .await
+            .expect("durable heartbeat");
+
+        let fresh = readiness_response(&state).await;
+        assert!(fresh.ready);
+        assert_eq!(
+            fresh.batch_runtime.expect("batch health").healthy_workers,
+            1
+        );
     }
 
     fn test_state(name: &str) -> (TempDirGuard, AppState) {

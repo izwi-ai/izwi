@@ -258,6 +258,23 @@ pub struct RuntimeStageStatusCount {
     pub count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RuntimeQueueDepth {
+    pub queue_class: QueueClass,
+    pub count: u64,
+    pub oldest_age_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RuntimeQueueHealthSnapshot {
+    pub heartbeat_stale_after_ms: u64,
+    pub active_workers: u64,
+    pub healthy_workers: u64,
+    pub stale_workers: u64,
+    pub queues: Vec<RuntimeQueueDepth>,
+    pub uncovered_queue_classes: Vec<QueueClass>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct RuntimeReconciliationReport {
     pub jobs_repaired: u64,
@@ -1439,6 +1456,82 @@ impl BatchRuntimeStore {
         i64_to_u64(count)
     }
 
+    pub async fn runtime_queue_health(
+        &self,
+        heartbeat_stale_after_ms: u64,
+    ) -> anyhow::Result<RuntimeQueueHealthSnapshot> {
+        let db = self.db.connection().await?;
+        let now = current_timestamp_millis();
+        let queue_rows = db
+            .query_all_raw(raw::statement(
+                db,
+                r#"
+                SELECT queue_class, COUNT(*), MIN(created_at)
+                FROM job_stages
+                WHERE status IN ('queued', 'retrying')
+                GROUP BY queue_class
+                ORDER BY queue_class
+                "#,
+                vec![],
+            )?)
+            .await
+            .context("Failed to load runtime queue depth and age")?;
+        let queues = queue_rows
+            .iter()
+            .map(|row| {
+                let queue_raw: String = row.try_get_by_index(0)?;
+                let queue_class = QueueClass::from_db_value(&queue_raw)
+                    .ok_or_else(|| anyhow!("Unknown runtime queue class: {queue_raw}"))?;
+                let count = i64_to_u64(row.try_get_by_index(1)?)?;
+                let oldest_created_at = row.try_get_by_index::<Option<i64>>(2)?.unwrap_or(now);
+                Ok(RuntimeQueueDepth {
+                    queue_class,
+                    count,
+                    oldest_age_ms: i64_to_u64(now.saturating_sub(oldest_created_at).max(0))?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let heartbeats = self.list_worker_heartbeats().await?;
+        let stale_cutoff = now.saturating_sub(i64::try_from(heartbeat_stale_after_ms)?);
+        let active_workers = heartbeats
+            .iter()
+            .filter(|heartbeat| worker_heartbeat_accepts_claims(heartbeat))
+            .count() as u64;
+        let healthy = heartbeats
+            .iter()
+            .filter(|heartbeat| {
+                worker_heartbeat_accepts_claims(heartbeat)
+                    && i64::try_from(heartbeat.last_heartbeat_at)
+                        .is_ok_and(|last| last >= stale_cutoff)
+            })
+            .collect::<Vec<_>>();
+        let stale_workers = active_workers.saturating_sub(healthy.len() as u64);
+        let uncovered_queue_classes = queues
+            .iter()
+            .filter(|queue| {
+                !healthy.iter().any(|heartbeat| {
+                    heartbeat
+                        .registration
+                        .queue_classes
+                        .iter()
+                        .any(|worker_queue| {
+                            *worker_queue == QueueClass::Batch || *worker_queue == queue.queue_class
+                        })
+                })
+            })
+            .map(|queue| queue.queue_class)
+            .collect();
+
+        Ok(RuntimeQueueHealthSnapshot {
+            heartbeat_stale_after_ms,
+            active_workers,
+            healthy_workers: healthy.len() as u64,
+            stale_workers,
+            queues,
+            uncovered_queue_classes,
+        })
+    }
+
     pub async fn stage_status_counts(&self) -> anyhow::Result<Vec<RuntimeStageStatusCount>> {
         let db = self.db.connection().await?;
         let rows = db
@@ -2006,6 +2099,15 @@ impl BatchRuntimeStore {
         row.as_ref().map(map_worker_heartbeat).transpose()
     }
 
+    pub async fn list_worker_heartbeats(&self) -> anyhow::Result<Vec<RuntimeWorkerHeartbeat>> {
+        let db = self.db.connection().await?;
+        let rows = db
+            .query_all_raw(raw::statement(db, RUNTIME_WORKER_HEARTBEATS_SQL, vec![])?)
+            .await
+            .context("Failed to list runtime worker heartbeats")?;
+        rows.iter().map(map_worker_heartbeat).collect()
+    }
+
     async fn retry_stage<C: ConnectionTrait>(
         &self,
         db: &C,
@@ -2405,6 +2507,8 @@ const IDEMPOTENCY_RECORD_COLUMNS_SQL: &str =
     "SELECT operation, idempotency_key, created_at, expires_at, request_hash, response_json, runtime_job_id, conflict_message, metadata_json FROM idempotency_keys WHERE operation = ?1 AND idempotency_key = ?2";
 const WORKER_HEARTBEAT_COLUMNS_SQL: &str =
     "SELECT worker_id, started_at, last_heartbeat_at, status, queue_names_json, instance_id, registration_version, registration_json, heartbeat_version, available_slots, heartbeat_details_json, current_job_id, current_stage_id, diagnostic_json FROM runtime_worker_heartbeats WHERE worker_id = ?1";
+const RUNTIME_WORKER_HEARTBEATS_SQL: &str =
+    "SELECT worker_id, started_at, last_heartbeat_at, status, queue_names_json, instance_id, registration_version, registration_json, heartbeat_version, available_slots, heartbeat_details_json, current_job_id, current_stage_id, diagnostic_json FROM runtime_worker_heartbeats ORDER BY worker_id";
 
 fn worker_heartbeat_upsert_statement(
     db: &DatabaseConnection,
@@ -2745,6 +2849,10 @@ fn map_worker_heartbeat(row: &QueryResult) -> anyhow::Result<RuntimeWorkerHeartb
         current_stage_id: row.try_get_by_index(12)?,
         diagnostic_json: parse_json_value(row.try_get_by_index::<String>(13)?, json!({})),
     })
+}
+
+fn worker_heartbeat_accepts_claims(heartbeat: &RuntimeWorkerHeartbeat) -> bool {
+    matches!(heartbeat.status.as_str(), "polling" | "idle" | "running")
 }
 
 fn json_to_db_string(value: &serde_json::Value, fallback: &str) -> anyhow::Result<String> {
@@ -3273,6 +3381,71 @@ mod tests {
         assert_eq!(replaced.instance_id, "instance-b");
         assert_eq!(replaced.status, "idle");
         assert_eq!(replaced.details.available_slots, 2);
+    }
+
+    #[tokio::test]
+    async fn queue_health_requires_fresh_queue_coverage() {
+        let (store, _root) = build_store();
+        let (_job, stage) = create_test_job_and_stage(&store, 0, "asr_infer", 1).await;
+        assert_eq!(stage.queue_class, QueueClass::BatchAsr);
+
+        let uncovered = store.runtime_queue_health(5_000).await.expect("health");
+        assert_eq!(uncovered.queues.len(), 1);
+        assert_eq!(
+            uncovered.uncovered_queue_classes,
+            vec![QueueClass::BatchAsr]
+        );
+
+        store
+            .upsert_registered_worker_heartbeat(RegisteredWorkerHeartbeatUpdate {
+                registration: RuntimeWorkerRegistration {
+                    version: WORKER_REGISTRATION_VERSION,
+                    worker_id: "asr-worker".to_string(),
+                    instance_id: "asr-worker-instance".to_string(),
+                    queue_classes: vec![QueueClass::BatchAsr],
+                    capabilities: vec!["asr".to_string()],
+                    model_ids: vec![],
+                    stage_kinds: vec!["asr_infer".to_string()],
+                    resources: WorkerResourceCapacity::default(),
+                    software_version: "test".to_string(),
+                },
+                status: "idle".to_string(),
+                current_job_id: None,
+                current_stage_id: None,
+                details: RuntimeWorkerHeartbeatDetails {
+                    version: WORKER_HEARTBEAT_DETAILS_VERSION,
+                    available_slots: 1,
+                    active_lease_ids: vec![],
+                    last_error: None,
+                    health_json: json!({}),
+                },
+                diagnostic_json: json!({}),
+            })
+            .await
+            .expect("worker heartbeat");
+
+        let covered = store.runtime_queue_health(5_000).await.expect("health");
+        assert_eq!(covered.healthy_workers, 1);
+        assert!(covered.uncovered_queue_classes.is_empty());
+
+        let db = store.connection().await.expect("database");
+        db.execute_raw(
+            crate::db::raw::statement(
+                db,
+                "UPDATE runtime_worker_heartbeats SET last_heartbeat_at = ?1 WHERE worker_id = ?2",
+                vec![
+                    current_timestamp_millis().saturating_sub(10_000).into(),
+                    "asr-worker".into(),
+                ],
+            )
+            .expect("statement"),
+        )
+        .await
+        .expect("stale heartbeat update");
+
+        let stale = store.runtime_queue_health(1_000).await.expect("health");
+        assert_eq!(stale.stale_workers, 1);
+        assert_eq!(stale.uncovered_queue_classes, vec![QueueClass::BatchAsr]);
     }
 
     #[tokio::test]

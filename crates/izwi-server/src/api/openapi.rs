@@ -67,6 +67,9 @@ use crate::api::openai::audio::align::{
         OpenAiModelsResponse,
         ProbeCheck,
         ReadyResponse,
+        RuntimeQueueClass,
+        RuntimeQueueDepth,
+        RuntimeQueueHealthSnapshot,
         MediaIngestLaneSnapshot,
         RealtimeSessionAdmissionSnapshot,
         RequestAdmissionClassSnapshot,
@@ -1864,6 +1867,7 @@ pub struct ReadyResponse {
     pub request_admission: RequestAdmissionSnapshot,
     pub realtime_session_admission: RealtimeSessionAdmissionSnapshot,
     pub media_ingest: MediaIngestLaneSnapshot,
+    pub batch_runtime: Option<RuntimeQueueHealthSnapshot>,
     pub checks: Vec<ProbeCheck>,
     pub startup_warnings: Vec<String>,
 }
@@ -1890,6 +1894,40 @@ pub struct MediaIngestLaneSnapshot {
     pub active: usize,
     pub available: usize,
     pub queued: usize,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeQueueClass {
+    InteractiveAsr,
+    BatchAsr,
+    LongFormAsr,
+    BatchTts,
+    StreamingTts,
+    Diarization,
+    Export,
+    Evaluation,
+    Batch,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RuntimeQueueDepth {
+    pub queue_class: RuntimeQueueClass,
+    pub count: u64,
+    pub oldest_age_ms: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RuntimeQueueHealthSnapshot {
+    pub heartbeat_stale_after_ms: u64,
+    pub active_workers: u64,
+    pub healthy_workers: u64,
+    pub stale_workers: u64,
+    pub queues: Vec<RuntimeQueueDepth>,
+    pub uncovered_queue_classes: Vec<RuntimeQueueClass>,
 }
 
 #[allow(dead_code)]
@@ -2222,6 +2260,23 @@ mod tests {
             assert!(
                 media_properties.contains_key(field),
                 "media ingest schema should document {field}"
+            );
+        }
+
+        let batch_properties = schemas["RuntimeQueueHealthSnapshot"]["properties"]
+            .as_object()
+            .expect("batch runtime health properties should exist");
+        for field in [
+            "heartbeat_stale_after_ms",
+            "active_workers",
+            "healthy_workers",
+            "stale_workers",
+            "queues",
+            "uncovered_queue_classes",
+        ] {
+            assert!(
+                batch_properties.contains_key(field),
+                "batch runtime health schema should document {field}"
             );
         }
     }
