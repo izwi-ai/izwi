@@ -4,7 +4,20 @@ use std::io::Cursor;
 
 use tracing::debug;
 
+use crate::audio::AudioSourceMetadata;
 use crate::error::{Error, Result};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodeErrorMode {
+    Permissive,
+    Strict,
+}
+
+impl DecodeErrorMode {
+    fn is_strict(self) -> bool {
+        self == Self::Strict
+    }
+}
 
 pub(crate) fn base64_decode(data: &str) -> Result<Vec<u8>> {
     use base64::Engine;
@@ -25,6 +38,53 @@ pub(crate) fn base64_decode(data: &str) -> Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(normalized.as_bytes())
         .map_err(|e| Error::InferenceError(format!("Base64 decode error: {}", e)))
+}
+
+pub(crate) fn decode_audio_bytes_with_metadata(
+    audio_bytes: &[u8],
+) -> Result<(Vec<f32>, AudioSourceMetadata)> {
+    if audio_bytes.is_empty() {
+        return Err(Error::InvalidInput("Empty audio input".to_string()));
+    }
+
+    if is_riff_wave(audio_bytes) {
+        validate_riff_wave_structure(audio_bytes).map_err(|err| {
+            Error::InferenceError(format!("Failed to decode WAV strictly: {err}"))
+        })?;
+        match decode_wav_bytes_with_metadata(audio_bytes, DecodeErrorMode::Strict) {
+            Ok((samples, source)) => {
+                return finalize_decoded_audio_with_metadata(samples, source);
+            }
+            Err(wav_err) => {
+                return match decode_audio_bytes_symphonia_with_metadata(
+                    audio_bytes,
+                    DecodeErrorMode::Strict,
+                ) {
+                    Ok((samples, source)) => {
+                        finalize_decoded_audio_with_metadata(samples, source)
+                    }
+                    Err(symphonia_err) => Err(Error::InferenceError(format!(
+                        "Failed to decode WAV strictly. WAV path: {wav_err}; Symphonia: {symphonia_err}"
+                    ))),
+                };
+            }
+        }
+    }
+
+    match decode_audio_bytes_symphonia_with_metadata(audio_bytes, DecodeErrorMode::Strict) {
+        Ok((samples, source)) => finalize_decoded_audio_with_metadata(samples, source),
+        Err(symphonia_err) => {
+            let (samples, source) =
+                decode_wav_bytes_hound_with_metadata(audio_bytes, DecodeErrorMode::Strict).map_err(
+                    |wav_err| {
+                        Error::InferenceError(format!(
+                            "Failed to decode audio strictly. Symphonia: {symphonia_err}; WAV fallback: {wav_err}"
+                        ))
+                    },
+                )?;
+            finalize_decoded_audio_with_metadata(samples, source)
+        }
+    }
 }
 
 pub(crate) fn decode_audio_bytes(audio_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
@@ -66,6 +126,45 @@ pub(crate) fn decode_wav_bytes(wav_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
 
 fn is_riff_wave(bytes: &[u8]) -> bool {
     bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE"
+}
+
+fn validate_riff_wave_structure(wav_bytes: &[u8]) -> Result<()> {
+    let mut offset = 12usize;
+    while offset < wav_bytes.len() {
+        if offset.saturating_add(8) > wav_bytes.len() {
+            return Err(Error::InferenceError(format!(
+                "truncated WAV chunk header at byte {offset}"
+            )));
+        }
+        let chunk_size = u32::from_le_bytes([
+            wav_bytes[offset + 4],
+            wav_bytes[offset + 5],
+            wav_bytes[offset + 6],
+            wav_bytes[offset + 7],
+        ]) as usize;
+        let chunk_start = offset + 8;
+        let chunk_end = chunk_start.checked_add(chunk_size).ok_or_else(|| {
+            Error::InferenceError(format!(
+                "WAV chunk at byte {offset} exceeds addressable size"
+            ))
+        })?;
+        if chunk_end > wav_bytes.len() {
+            return Err(Error::InferenceError(format!(
+                "truncated WAV chunk at byte {offset}: declared {chunk_size} bytes, only {} remain",
+                wav_bytes.len().saturating_sub(chunk_start)
+            )));
+        }
+        let padded_end = chunk_end.checked_add(chunk_size & 1).ok_or_else(|| {
+            Error::InferenceError(format!("WAV chunk padding at byte {offset} overflowed"))
+        })?;
+        if padded_end > wav_bytes.len() {
+            return Err(Error::InferenceError(format!(
+                "truncated WAV padding after chunk at byte {offset}"
+            )));
+        }
+        offset = padded_end;
+    }
+    Ok(())
 }
 
 pub(crate) fn wav_duration_seconds_fast(wav_bytes: &[u8]) -> Option<f32> {
@@ -129,10 +228,22 @@ pub(crate) fn wav_duration_seconds_fast(wav_bytes: &[u8]) -> Option<f32> {
 }
 
 fn decode_wav_bytes_fast(wav_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
-    decode_wav_pcm16_mono_fast(wav_bytes).or_else(|_| decode_wav_bytes_hound(wav_bytes))
+    decode_wav_bytes_with_metadata(wav_bytes, DecodeErrorMode::Permissive)
+        .map(|(samples, source)| (samples, source.sample_rate))
 }
 
-fn decode_wav_pcm16_mono_fast(wav_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
+fn decode_wav_bytes_with_metadata(
+    wav_bytes: &[u8],
+    error_mode: DecodeErrorMode,
+) -> Result<(Vec<f32>, AudioSourceMetadata)> {
+    decode_wav_pcm16_mono_with_metadata(wav_bytes, error_mode)
+        .or_else(|_| decode_wav_bytes_hound_with_metadata(wav_bytes, error_mode))
+}
+
+fn decode_wav_pcm16_mono_with_metadata(
+    wav_bytes: &[u8],
+    error_mode: DecodeErrorMode,
+) -> Result<(Vec<f32>, AudioSourceMetadata)> {
     let mut offset = 12usize;
     let mut audio_format = None;
     let mut channels = None;
@@ -211,6 +322,7 @@ fn decode_wav_pcm16_mono_fast(wav_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
             "WAV fast path only supports PCM16 audio".to_string(),
         ));
     }
+    let source_channel_count = channels;
     let channels = channels as usize;
     let block_align = block_align as usize;
     if block_align != channels * 2 {
@@ -220,6 +332,12 @@ fn decode_wav_pcm16_mono_fast(wav_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
     }
 
     let data = &wav_bytes[data_range];
+    if error_mode.is_strict() && data.len() % block_align != 0 {
+        return Err(Error::InferenceError(format!(
+            "WAV PCM16 data length {} is not aligned to {block_align}-byte frames",
+            data.len()
+        )));
+    }
     let frame_count = data.len() / block_align;
     if frame_count == 0 {
         return Err(Error::InferenceError(
@@ -244,10 +362,26 @@ fn decode_wav_pcm16_mono_fast(wav_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
         }
     }
 
-    Ok((samples, sample_rate))
+    Ok((
+        samples,
+        AudioSourceMetadata {
+            container: "wav".to_string(),
+            codec: "pcm_s16le".to_string(),
+            sample_rate,
+            channel_count: source_channel_count,
+        },
+    ))
 }
 
 fn decode_audio_bytes_symphonia(audio_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
+    decode_audio_bytes_symphonia_with_metadata(audio_bytes, DecodeErrorMode::Permissive)
+        .map(|(samples, source)| (samples, source.sample_rate))
+}
+
+fn decode_audio_bytes_symphonia_with_metadata(
+    audio_bytes: &[u8],
+    error_mode: DecodeErrorMode,
+) -> Result<(Vec<f32>, AudioSourceMetadata)> {
     use symphonia::core::codecs::DecoderOptions;
     use symphonia::core::errors::Error as SymphoniaError;
     use symphonia::core::formats::FormatOptions;
@@ -256,6 +390,7 @@ fn decode_audio_bytes_symphonia(audio_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
     use symphonia::core::probe::Hint;
     use symphonia::default::{get_codecs, get_probe};
 
+    let container = detect_audio_container(audio_bytes).to_string();
     let media_source = MediaSourceStream::new(
         Box::new(Cursor::new(audio_bytes.to_vec())),
         Default::default(),
@@ -268,16 +403,30 @@ fn decode_audio_bytes_symphonia(audio_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
             &FormatOptions::default(),
             &MetadataOptions::default(),
         )
-        .map_err(|e| Error::InferenceError(format!("Symphonia probe failed: {e}")))?;
+        .map_err(|e| {
+            Error::InferenceError(format!(
+                "Symphonia probe failed for container={container}: {e}"
+            ))
+        })?;
 
     let mut format = probed.format;
-    let track = format
-        .default_track()
-        .ok_or_else(|| Error::InferenceError("No default audio track found".to_string()))?;
-    let track_id = track.id;
-    let mut sample_rate = track.codec_params.sample_rate.unwrap_or(0);
+    let (track_id, codec_params) = {
+        let track = format
+            .default_track()
+            .ok_or_else(|| Error::InferenceError("No default audio track found".to_string()))?;
+        (track.id, track.codec_params.clone())
+    };
+    let codec = get_codecs()
+        .get_codec(codec_params.codec)
+        .map(|descriptor| descriptor.short_name.to_string())
+        .unwrap_or_else(|| format!("{:?}", codec_params.codec));
+    let mut sample_rate = codec_params.sample_rate.unwrap_or(0);
+    let mut channel_count = codec_params
+        .channels
+        .map(|channels| u16::try_from(channels.count()).unwrap_or(u16::MAX))
+        .unwrap_or(0);
     let mut decoder = get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
+        .make(&codec_params, &DecoderOptions::default())
         .map_err(|e| Error::InferenceError(format!("Failed to create audio decoder: {e}")))?;
 
     let mut samples = Vec::new();
@@ -294,7 +443,17 @@ fn decode_audio_bytes_symphonia(audio_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
                     "Audio stream format reset is not supported".to_string(),
                 ));
             }
-            Err(SymphoniaError::IoError(_)) => break,
+            Err(SymphoniaError::IoError(err))
+                if err.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(SymphoniaError::IoError(_)) if !error_mode.is_strict() => break,
+            Err(SymphoniaError::IoError(err)) => {
+                return Err(Error::InferenceError(format!(
+                    "Failed reading {container}/{codec} audio packets: {err}"
+                )));
+            }
             Err(err) => {
                 return Err(Error::InferenceError(format!(
                     "Failed reading audio packets: {err}"
@@ -308,7 +467,12 @@ fn decode_audio_bytes_symphonia(audio_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
 
         let decoded = match decoder.decode(&packet) {
             Ok(decoded) => decoded,
-            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(SymphoniaError::DecodeError(_)) if !error_mode.is_strict() => continue,
+            Err(SymphoniaError::DecodeError(err)) => {
+                return Err(Error::InferenceError(format!(
+                    "Failed decoding {container}/{codec} audio packet ({channel_count} channels at {sample_rate} Hz): {err}"
+                )));
+            }
             Err(SymphoniaError::IoError(err))
                 if err.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
@@ -328,8 +492,21 @@ fn decode_audio_bytes_symphonia(audio_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
 
         if sample_rate == 0 {
             sample_rate = decoded.spec().rate;
+        } else if error_mode.is_strict() && sample_rate != decoded.spec().rate {
+            return Err(Error::InferenceError(format!(
+                "Audio sample rate changed while decoding {container}/{codec} ({sample_rate} -> {})",
+                decoded.spec().rate
+            )));
         }
         let channels = decoded.spec().channels.count().max(1);
+        let decoded_channel_count = u16::try_from(channels).unwrap_or(u16::MAX);
+        if channel_count == 0 {
+            channel_count = decoded_channel_count;
+        } else if error_mode.is_strict() && channel_count != decoded_channel_count {
+            return Err(Error::InferenceError(format!(
+                "Audio channel count changed while decoding {container}/{codec} ({channel_count} -> {decoded_channel_count})"
+            )));
+        }
         append_decoded_packet(decoded, channels, &mut samples);
     }
 
@@ -343,8 +520,21 @@ fn decode_audio_bytes_symphonia(audio_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
             "Decoded audio produced zero samples".to_string(),
         ));
     }
+    if channel_count == 0 {
+        return Err(Error::InferenceError(
+            "Decoded audio is missing channel metadata".to_string(),
+        ));
+    }
 
-    Ok((samples, sample_rate))
+    Ok((
+        samples,
+        AudioSourceMetadata {
+            container,
+            codec,
+            sample_rate,
+            channel_count,
+        },
+    ))
 }
 
 fn append_decoded_packet(
@@ -373,13 +563,27 @@ fn append_decoded_packet(
 }
 
 fn decode_wav_bytes_hound(wav_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
+    decode_wav_bytes_hound_with_metadata(wav_bytes, DecodeErrorMode::Permissive)
+        .map(|(samples, source)| (samples, source.sample_rate))
+}
+
+fn decode_wav_bytes_hound_with_metadata(
+    wav_bytes: &[u8],
+    error_mode: DecodeErrorMode,
+) -> Result<(Vec<f32>, AudioSourceMetadata)> {
     let cursor = Cursor::new(wav_bytes);
     let mut reader = hound::WavReader::new(cursor)
         .map_err(|e| Error::InferenceError(format!("Failed to parse WAV: {}", e)))?;
 
     let spec = reader.spec();
     let sample_rate = spec.sample_rate;
-    let channels = spec.channels.max(1) as usize;
+    if error_mode.is_strict() && spec.channels == 0 {
+        return Err(Error::InferenceError(
+            "WAV source has zero channels".to_string(),
+        ));
+    }
+    let source_channel_count = spec.channels.max(1);
+    let channels = source_channel_count as usize;
 
     let mut samples: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Int => {
@@ -389,14 +593,47 @@ fn decode_wav_bytes_hound(wav_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
             } else {
                 1.0
             };
-            reader
-                .samples::<i32>()
-                .filter_map(|s| s.ok())
-                .map(|s| (s as f32 / max_val).clamp(-1.0, 1.0))
-                .collect()
+            if error_mode.is_strict() {
+                reader
+                    .samples::<i32>()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|err| {
+                        Error::InferenceError(format!("Failed decoding WAV sample: {err}"))
+                    })?
+                    .into_iter()
+                    .map(|sample| (sample as f32 / max_val).clamp(-1.0, 1.0))
+                    .collect()
+            } else {
+                reader
+                    .samples::<i32>()
+                    .filter_map(|sample| sample.ok())
+                    .map(|sample| (sample as f32 / max_val).clamp(-1.0, 1.0))
+                    .collect()
+            }
         }
-        hound::SampleFormat::Float => reader.samples::<f32>().filter_map(|s| s.ok()).collect(),
+        hound::SampleFormat::Float => {
+            if error_mode.is_strict() {
+                reader
+                    .samples::<f32>()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|err| {
+                        Error::InferenceError(format!("Failed decoding WAV sample: {err}"))
+                    })?
+            } else {
+                reader
+                    .samples::<f32>()
+                    .filter_map(|sample| sample.ok())
+                    .collect()
+            }
+        }
     };
+
+    if error_mode.is_strict() && samples.len() % channels != 0 {
+        return Err(Error::InferenceError(format!(
+            "WAV sample count {} is not aligned to {channels} channels",
+            samples.len()
+        )));
+    }
 
     if channels > 1 {
         let mut mono = Vec::with_capacity(samples.len() / channels + 1);
@@ -410,7 +647,60 @@ fn decode_wav_bytes_hound(wav_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
         samples = mono;
     }
 
-    Ok((samples, sample_rate))
+    Ok((
+        samples,
+        AudioSourceMetadata {
+            container: "wav".to_string(),
+            codec: hound_codec_name(spec.sample_format, spec.bits_per_sample),
+            sample_rate,
+            channel_count: source_channel_count,
+        },
+    ))
+}
+
+fn hound_codec_name(sample_format: hound::SampleFormat, bits_per_sample: u16) -> String {
+    match sample_format {
+        hound::SampleFormat::Int => format!("pcm_s{bits_per_sample}le"),
+        hound::SampleFormat::Float => format!("pcm_f{bits_per_sample}le"),
+    }
+}
+
+fn detect_audio_container(audio_bytes: &[u8]) -> &'static str {
+    if is_riff_wave(audio_bytes) {
+        "wav"
+    } else if audio_bytes.starts_with(b"fLaC") {
+        "flac"
+    } else if audio_bytes.starts_with(b"OggS") {
+        "ogg"
+    } else if audio_bytes.starts_with(b"ID3") {
+        "mp3"
+    } else if audio_bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        "matroska"
+    } else if audio_bytes.len() >= 12 && &audio_bytes[4..8] == b"ftyp" {
+        "mp4"
+    } else if audio_bytes.starts_with(b"FORM")
+        && audio_bytes
+            .get(8..12)
+            .is_some_and(|kind| kind == b"AIFF" || kind == b"AIFC")
+    {
+        "aiff"
+    } else if audio_bytes.starts_with(b"caff") {
+        "caf"
+    } else if looks_like_adts_frame(audio_bytes) {
+        "aac"
+    } else if looks_like_mpeg_audio_frame(audio_bytes) {
+        "mp3"
+    } else {
+        "unknown"
+    }
+}
+
+fn looks_like_mpeg_audio_frame(audio_bytes: &[u8]) -> bool {
+    audio_bytes.len() >= 2 && audio_bytes[0] == 0xff && audio_bytes[1] & 0xe0 == 0xe0
+}
+
+fn looks_like_adts_frame(audio_bytes: &[u8]) -> bool {
+    audio_bytes.len() >= 2 && audio_bytes[0] == 0xff && audio_bytes[1] & 0xf6 == 0xf0
 }
 
 fn finalize_decoded_audio(mut samples: Vec<f32>, sample_rate: u32) -> Result<(Vec<f32>, u32)> {
@@ -434,6 +724,20 @@ fn finalize_decoded_audio(mut samples: Vec<f32>, sample_rate: u32) -> Result<(Ve
     }
 
     Ok((samples, sample_rate))
+}
+
+fn finalize_decoded_audio_with_metadata(
+    samples: Vec<f32>,
+    source: AudioSourceMetadata,
+) -> Result<(Vec<f32>, AudioSourceMetadata)> {
+    if source.channel_count == 0 {
+        return Err(Error::InferenceError(
+            "Decoded audio has invalid source channel count 0".to_string(),
+        ));
+    }
+    let (samples, sample_rate) = finalize_decoded_audio(samples, source.sample_rate)?;
+    debug_assert_eq!(sample_rate, source.sample_rate);
+    Ok((samples, source))
 }
 
 pub(crate) fn preprocess_reference_audio(mut samples: Vec<f32>, sample_rate: u32) -> Vec<f32> {
@@ -594,6 +898,31 @@ mod tests {
             samples[0]
         );
         assert!(samples[1].abs() < 0.02, "second sample {}", samples[1]);
+    }
+
+    #[test]
+    fn strict_metadata_decode_reports_truncated_wav_samples() {
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut wav_bytes = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut wav_bytes);
+            let mut writer = hound::WavWriter::new(cursor, spec).expect("writer");
+            for sample in [1_i16, 2, 3, 4] {
+                writer.write_sample(sample).expect("sample");
+            }
+            writer.finalize().expect("finalize");
+        }
+        wav_bytes.pop();
+
+        let error = decode_audio_bytes_with_metadata(&wav_bytes)
+            .expect_err("strict decode must reject a truncated WAV frame");
+
+        assert!(error.to_string().contains("Failed to decode WAV strictly"));
     }
 
     #[test]
