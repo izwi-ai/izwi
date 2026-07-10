@@ -707,10 +707,10 @@ impl RuntimeService {
         error_kind: impl Into<String>,
     ) {
         let mut observation = RuntimeStageObservation::new(
-                self.engine_observation_context(request, streaming),
-                RuntimeStageOutcome::Failed,
-            )
-            .with_error_kind(error_kind);
+            self.engine_observation_context(request, streaming),
+            RuntimeStageOutcome::Failed,
+        )
+        .with_error_kind(error_kind);
         observation.timing.admission_ms = request.admission_ms;
         self.telemetry.record_stage_observation(observation);
     }
@@ -1105,6 +1105,21 @@ impl RuntimeService {
     pub fn record_voice_stream_backpressure(&self) {
         self.telemetry.record_voice_stream_backpressure();
         self.record_voice_stage_observation("voice.stream_backpressure");
+    }
+
+    pub fn record_transcription_stream_backpressure(&self) {
+        self.telemetry.record_transcription_stream_backpressure();
+        self.telemetry
+            .record_stage_observation(RuntimeStageObservation::new(
+                RuntimeObservationContext {
+                    route_source: Some("realtime_transcription".to_string()),
+                    capability: Some("asr".to_string()),
+                    pipeline_kind: Some("realtime_transcription".to_string()),
+                    pipeline_stage: Some("transcription.stream_backpressure".to_string()),
+                    ..RuntimeObservationContext::default()
+                },
+                RuntimeStageOutcome::Observed,
+            ));
     }
 
     pub fn record_modular_voice_pipeline_turn(&self) {

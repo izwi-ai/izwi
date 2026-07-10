@@ -30,10 +30,11 @@ pub enum RequestStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EngineStreamPolicy {
     FailOnFull,
-    BlockWithDeadline,
-    DropOldest,
-    Coalesce,
-    Sample,
+    BlockWithDeadline {
+        timeout_ms: u64,
+    },
+    /// Drop the newly produced output when the bounded queue is full.
+    DropNewest,
 }
 
 impl Default for EngineStreamPolicy {

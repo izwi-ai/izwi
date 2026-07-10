@@ -10,6 +10,7 @@ use tracing::{info, warn};
 
 mod api;
 mod app;
+pub use app::realtime_protocol;
 pub mod batch_runtime;
 mod chat_store;
 mod db;
@@ -18,6 +19,7 @@ mod entity;
 mod error;
 mod ids;
 mod logging;
+pub mod media_ingest;
 mod onboarding_store;
 mod persistence;
 mod saved_voice_store;
@@ -33,10 +35,13 @@ mod voice_memory;
 mod voice_observation_store;
 mod voice_store;
 
+use batch_runtime::types::{
+    DeviceClass, QueueClass, ResourceTarget, RuntimeBackendClass, WorkerResourceCapacity,
+};
 use batch_runtime::worker::{
     BatchWorkerConfig, BatchWorkerDrain, BatchWorkerRunner, BatchWorkerSupervisor,
 };
-use izwi_core::backends::{self, BackendPreference, CudaRuntimeDiagnostics};
+use izwi_core::backends::{self, BackendKind, BackendPreference, CudaRuntimeDiagnostics};
 use izwi_core::{
     parse_model_variant, RuntimeService, ServeRuntimeConfig, ServeRuntimeConfigOverrides,
 };
@@ -196,8 +201,20 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
 }
 
 fn start_batch_runtime_worker(state: &AppState) -> BatchWorkerSupervisor {
-    let mut config = BatchWorkerConfig::local(format!("local-batch-worker-{}", std::process::id()));
+    let mut config = BatchWorkerConfig::local("local-batch-worker");
+    config.queue_names = local_batch_worker_queue_names();
     config.capabilities = vec!["asr".to_string(), "tts".to_string()];
+    config.stage_kinds = vec![
+        api::transcription::BATCH_ASR_STAGE_KIND.to_string(),
+        api::speech_history::BATCH_TTS_STAGE_KIND.to_string(),
+    ];
+    let backend_context = state.runtime.backend_context();
+    config.resources = local_batch_worker_resources(
+        backend_context.backend_kind,
+        backend_context.device.capabilities.available_memory_bytes,
+    );
+    config.execution_timeout = batch_stage_execution_timeout();
+    config.drain_timeout = batch_worker_drain_timeout();
     BatchWorkerRunner::new(
         state.batch_runtime_store.clone(),
         vec![
@@ -209,6 +226,70 @@ fn start_batch_runtime_worker(state: &AppState) -> BatchWorkerSupervisor {
     )
     .with_runtime_observer(state.runtime.clone())
     .spawn()
+}
+
+fn local_batch_worker_queue_names() -> Vec<String> {
+    [
+        QueueClass::BatchAsr,
+        QueueClass::LongFormAsr,
+        QueueClass::BatchTts,
+    ]
+    .into_iter()
+    .map(|queue| queue.as_db_value().to_string())
+    .collect()
+}
+
+fn local_batch_worker_resources(
+    backend: BackendKind,
+    available_memory_bytes: Option<usize>,
+) -> WorkerResourceCapacity {
+    let (target, backend, device_class) = match backend {
+        BackendKind::Cpu => (
+            ResourceTarget::Cpu,
+            RuntimeBackendClass::Cpu,
+            DeviceClass::Cpu,
+        ),
+        BackendKind::Metal => (
+            ResourceTarget::Gpu,
+            RuntimeBackendClass::Metal,
+            DeviceClass::AppleGpu,
+        ),
+        BackendKind::Cuda => (
+            ResourceTarget::Gpu,
+            RuntimeBackendClass::Cuda,
+            DeviceClass::NvidiaGpu,
+        ),
+    };
+    WorkerResourceCapacity {
+        targets: vec![target],
+        backends: vec![backend],
+        device_classes: vec![device_class],
+        memory_bytes: available_memory_bytes.and_then(|bytes| u64::try_from(bytes).ok()),
+        concurrency_slots: 1,
+        ..WorkerResourceCapacity::default()
+    }
+}
+
+fn batch_stage_execution_timeout() -> Option<Duration> {
+    duration_secs_from_env("IZWI_BATCH_STAGE_TIMEOUT_SECS", 0, 30, 86_400)
+}
+
+fn batch_worker_drain_timeout() -> Duration {
+    duration_secs_from_env("IZWI_BATCH_WORKER_DRAIN_TIMEOUT_SECS", 20, 1, 300)
+        .unwrap_or_else(|| Duration::from_secs(20))
+}
+
+fn duration_secs_from_env(
+    name: &str,
+    default_secs: u64,
+    min_secs: u64,
+    max_secs: u64,
+) -> Option<Duration> {
+    let configured = std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(default_secs);
+    (configured > 0).then(|| Duration::from_secs(configured.clamp(min_secs, max_secs)))
 }
 
 fn maybe_delegate_to_private_cuda_runtime(args: &ServerArgs) -> anyhow::Result<()> {
@@ -548,6 +629,54 @@ mod tests {
     use super::*;
     use crate::test_support::env_lock;
 
+    #[test]
+    fn local_batch_worker_subscribes_to_explicit_runtime_queues() {
+        assert_eq!(
+            local_batch_worker_queue_names(),
+            vec!["batch_asr", "long_form_asr", "batch_tts"]
+        );
+    }
+
+    #[test]
+    fn local_batch_worker_reports_selected_backend_resources() {
+        let cpu = local_batch_worker_resources(BackendKind::Cpu, Some(1024));
+        assert_eq!(cpu.targets, vec![ResourceTarget::Cpu]);
+        assert_eq!(cpu.backends, vec![RuntimeBackendClass::Cpu]);
+        assert_eq!(cpu.device_classes, vec![DeviceClass::Cpu]);
+        assert_eq!(cpu.memory_bytes, Some(1024));
+
+        let metal = local_batch_worker_resources(BackendKind::Metal, None);
+        assert_eq!(metal.targets, vec![ResourceTarget::Gpu]);
+        assert_eq!(metal.backends, vec![RuntimeBackendClass::Metal]);
+        assert_eq!(metal.device_classes, vec![DeviceClass::AppleGpu]);
+
+        let cuda = local_batch_worker_resources(BackendKind::Cuda, Some(2048));
+        assert_eq!(cuda.targets, vec![ResourceTarget::Gpu]);
+        assert_eq!(cuda.backends, vec![RuntimeBackendClass::Cuda]);
+        assert_eq!(cuda.device_classes, vec![DeviceClass::NvidiaGpu]);
+        assert_eq!(cuda.memory_bytes, Some(2048));
+    }
+
+    #[test]
+    fn local_batch_worker_timeouts_are_configurable_and_bounded() {
+        let _guard = env_lock();
+        std::env::remove_var("IZWI_BATCH_STAGE_TIMEOUT_SECS");
+        std::env::remove_var("IZWI_BATCH_WORKER_DRAIN_TIMEOUT_SECS");
+        assert_eq!(batch_stage_execution_timeout(), None);
+        assert_eq!(batch_worker_drain_timeout(), Duration::from_secs(20));
+
+        std::env::set_var("IZWI_BATCH_STAGE_TIMEOUT_SECS", "1");
+        std::env::set_var("IZWI_BATCH_WORKER_DRAIN_TIMEOUT_SECS", "999");
+        assert_eq!(
+            batch_stage_execution_timeout(),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(batch_worker_drain_timeout(), Duration::from_secs(300));
+
+        std::env::remove_var("IZWI_BATCH_STAGE_TIMEOUT_SECS");
+        std::env::remove_var("IZWI_BATCH_WORKER_DRAIN_TIMEOUT_SECS");
+    }
+
     fn clear_bind_env() {
         std::env::remove_var("IZWI_HOST");
         std::env::remove_var("IZWI_PORT");
@@ -568,6 +697,8 @@ mod tests {
         std::env::remove_var("IZWI_ASR_WARMUP_DURATION_MS");
         std::env::remove_var("IZWI_GRANITE_DECODE_PROFILE");
         std::env::remove_var("IZWI_GRANITE_SPEECH_DTYPE");
+        std::env::remove_var("IZWI_BATCH_STAGE_TIMEOUT_SECS");
+        std::env::remove_var("IZWI_BATCH_WORKER_DRAIN_TIMEOUT_SECS");
     }
 
     fn parse(args: &[&str]) -> ServerArgs {

@@ -7,7 +7,7 @@ use tracing::warn;
 
 use crate::{
     batch_runtime::{
-        store::{RuntimeJobStatusCount, RuntimeStageStatusCount},
+        store::{RuntimeJobStatusCount, RuntimeQueueHealthSnapshot, RuntimeStageStatusCount},
         worker::BatchWorkerSnapshot,
     },
     error::ApiError,
@@ -19,6 +19,7 @@ pub struct BatchRuntimeMetricsResponse {
     pub queued_stages: u64,
     pub jobs_by_status: Vec<RuntimeJobStatusCount>,
     pub stages_by_status: Vec<RuntimeStageStatusCount>,
+    pub queue_health: RuntimeQueueHealthSnapshot,
     pub worker: BatchWorkerSnapshot,
 }
 
@@ -46,6 +47,7 @@ pub async fn metrics_prometheus(State(state): State<AppState>) -> Response<Body>
             payload.push_str("izwi_batch_runtime_metrics_collect_error 1\n");
         }
     }
+    append_server_admission_prometheus_metrics(&mut payload, &state);
     Response::builder()
         .header(
             header::CONTENT_TYPE,
@@ -55,6 +57,47 @@ pub async fn metrics_prometheus(State(state): State<AppState>) -> Response<Body>
         .unwrap()
 }
 
+fn append_server_admission_prometheus_metrics(payload: &mut String, state: &AppState) {
+    let realtime = state.realtime_session_admission_snapshot();
+    let media = state.media_ingest.lane_snapshot();
+    payload.push_str(
+        "# HELP izwi_realtime_sessions Active and available realtime websocket session slots.\n",
+    );
+    payload.push_str("# TYPE izwi_realtime_sessions gauge\n");
+    payload.push_str(&format!(
+        "izwi_realtime_sessions{{state=\"active\"}} {}\n",
+        realtime.active
+    ));
+    payload.push_str(&format!(
+        "izwi_realtime_sessions{{state=\"available\"}} {}\n",
+        realtime.available
+    ));
+    payload.push_str(&format!(
+        "izwi_realtime_sessions{{state=\"capacity\"}} {}\n",
+        realtime.capacity
+    ));
+    payload.push_str(
+        "# HELP izwi_media_ingest_decode_lanes Active and available bounded media decode lanes.\n",
+    );
+    payload.push_str("# TYPE izwi_media_ingest_decode_lanes gauge\n");
+    payload.push_str(&format!(
+        "izwi_media_ingest_decode_lanes{{state=\"active\"}} {}\n",
+        media.active
+    ));
+    payload.push_str(&format!(
+        "izwi_media_ingest_decode_lanes{{state=\"available\"}} {}\n",
+        media.available
+    ));
+    payload.push_str(&format!(
+        "izwi_media_ingest_decode_lanes{{state=\"capacity\"}} {}\n",
+        media.capacity
+    ));
+    payload.push_str(&format!(
+        "izwi_media_ingest_decode_lanes{{state=\"queued\"}} {}\n",
+        media.queued
+    ));
+}
+
 async fn collect_batch_runtime_metrics(
     state: &AppState,
 ) -> anyhow::Result<BatchRuntimeMetricsResponse> {
@@ -62,6 +105,10 @@ async fn collect_batch_runtime_metrics(
         queued_stages: state.batch_runtime_store.queued_stage_count().await?,
         jobs_by_status: state.batch_runtime_store.job_status_counts().await?,
         stages_by_status: state.batch_runtime_store.stage_status_counts().await?,
+        queue_health: state
+            .batch_runtime_store
+            .runtime_queue_health(super::probes::resolve_batch_heartbeat_stale_after_ms())
+            .await?,
         worker: state.batch_worker_health.snapshot(),
     })
 }
@@ -95,6 +142,55 @@ fn append_batch_prometheus_metrics(payload: &mut String, batch: &BatchRuntimeMet
             count.count
         ));
     }
+
+    payload
+        .push_str("# HELP izwi_batch_runtime_queue_depth Queued stages by durable queue class.\n");
+    payload.push_str("# TYPE izwi_batch_runtime_queue_depth gauge\n");
+    payload.push_str(
+        "# HELP izwi_batch_runtime_queue_oldest_age_ms Oldest queued-stage age by durable queue class.\n",
+    );
+    payload.push_str("# TYPE izwi_batch_runtime_queue_oldest_age_ms gauge\n");
+    payload.push_str(
+        "# HELP izwi_batch_runtime_queue_uncovered Whether a queued durable class has no fresh eligible worker heartbeat.\n",
+    );
+    payload.push_str("# TYPE izwi_batch_runtime_queue_uncovered gauge\n");
+    for queue in &batch.queue_health.queues {
+        let label = escape_prometheus_label(queue.queue_class.as_db_value());
+        payload.push_str(&format!(
+            "izwi_batch_runtime_queue_depth{{queue_class=\"{label}\"}} {}\n",
+            queue.count
+        ));
+        payload.push_str(&format!(
+            "izwi_batch_runtime_queue_oldest_age_ms{{queue_class=\"{label}\"}} {}\n",
+            queue.oldest_age_ms
+        ));
+        payload.push_str(&format!(
+            "izwi_batch_runtime_queue_uncovered{{queue_class=\"{label}\"}} {}\n",
+            u8::from(
+                batch
+                    .queue_health
+                    .uncovered_queue_classes
+                    .contains(&queue.queue_class)
+            )
+        ));
+    }
+
+    payload.push_str(
+        "# HELP izwi_batch_runtime_workers Durable worker heartbeat state after freshness filtering.\n",
+    );
+    payload.push_str("# TYPE izwi_batch_runtime_workers gauge\n");
+    payload.push_str(&format!(
+        "izwi_batch_runtime_workers{{state=\"active\"}} {}\n",
+        batch.queue_health.active_workers
+    ));
+    payload.push_str(&format!(
+        "izwi_batch_runtime_workers{{state=\"healthy\"}} {}\n",
+        batch.queue_health.healthy_workers
+    ));
+    payload.push_str(&format!(
+        "izwi_batch_runtime_workers{{state=\"stale\"}} {}\n",
+        batch.queue_health.stale_workers
+    ));
 
     payload
         .push_str("# HELP izwi_batch_runtime_worker_running Local batch worker running state.\n");

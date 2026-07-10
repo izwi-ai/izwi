@@ -1,9 +1,10 @@
 //! Realtime transcription websocket endpoint for `/transcription`.
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::ws::{Message, WebSocket};
+use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 use izwi_core::{
     audio::{AudioEncoder, AudioFormat},
@@ -11,12 +12,18 @@ use izwi_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tracing::{debug, info, warn};
 
+use crate::app::realtime_protocol::{
+    RealtimeAudioGapAction, RealtimeClose, RealtimeCloseCode, RealtimeCloseReason,
+    RealtimeDeliveryClass, RealtimeErrorCode, RealtimeEventEnvelope, RealtimeProtocol,
+    RealtimeServerEnvelope, RealtimeServerEvent, TRANSCRIPTION_REALTIME_VERSION,
+};
 use crate::state::AppState;
 
-const REALTIME_PROTOCOL: &str = "transcription_realtime_v2";
+const LEGACY_REALTIME_PROTOCOL: &str = "transcription_realtime_v2";
+const TYPED_REALTIME_PROTOCOL: &str = "transcription_realtime";
 
 const WS_BIN_MAGIC: &[u8; 4] = b"ITRW";
 const WS_BIN_VERSION: u8 = 1;
@@ -30,6 +37,7 @@ const INFERENCE_MIN_INTERVAL_MS: u64 = 350;
 const MIN_INFERENCE_AUDIO_MS: u32 = 180;
 const WS_OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const WORKER_COMMAND_QUEUE_CAPACITY: usize = 512;
+const WS_WRITER_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 // LocalAgreement-2 style stabilization (as used in whisper_streaming):
 // commit only the common prefix between the previous and current hypothesis.
 // Text-only approximation of whisper_streaming's timestamp boundary filtering:
@@ -50,29 +58,191 @@ const REPETITION_APPROX_MIN_PREFIX_MATCH_WORDS: usize = 2;
 
 #[derive(Clone)]
 struct OutboundTx {
-    tx: mpsc::Sender<Message>,
+    mailbox: Arc<OutboundMailbox>,
     runtime: Arc<RuntimeService>,
     label: &'static str,
 }
 
 impl OutboundTx {
-    fn new(tx: mpsc::Sender<Message>, runtime: Arc<RuntimeService>, label: &'static str) -> Self {
-        Self { tx, runtime, label }
+    fn new(runtime: Arc<RuntimeService>, label: &'static str) -> Self {
+        Self::with_capacity(runtime, label, WS_OUTBOUND_QUEUE_CAPACITY)
+    }
+
+    fn with_capacity(runtime: Arc<RuntimeService>, label: &'static str, capacity: usize) -> Self {
+        Self {
+            mailbox: Arc::new(OutboundMailbox::new(capacity)),
+            runtime,
+            label,
+        }
     }
 
     fn send(&self, message: Message) -> bool {
-        match self.tx.try_send(message) {
+        self.send_class(message, OutboundClass::Critical)
+    }
+
+    fn send_snapshot(&self, key: &'static str, message: Message) -> bool {
+        self.send_class(message, OutboundClass::Coalescible(key))
+    }
+
+    fn send_diagnostic(&self, message: Message) -> bool {
+        self.send_class(message, OutboundClass::Droppable)
+    }
+
+    fn send_class(&self, message: Message, class: OutboundClass) -> bool {
+        match self.mailbox.enqueue(OutboundItem { message, class }) {
             Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.runtime.record_voice_stream_backpressure();
+            Err(OutboundEnqueueError::Closed) => false,
+            Err(err) => {
+                self.runtime.record_transcription_stream_backpressure();
                 warn!(
-                    "{} outbound websocket queue is full; dropping message",
-                    self.label
+                    label = self.label,
+                    error = ?err,
+                    "transcription outbound delivery rejected"
                 );
                 false
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
+    }
+
+    async fn next(&self) -> Option<MailboxOutput> {
+        self.mailbox.next().await
+    }
+
+    fn close(&self) {
+        self.mailbox.close();
+    }
+
+    fn fail(&self, reason: &'static str) {
+        self.mailbox.fail(reason);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundClass {
+    Critical,
+    Coalescible(&'static str),
+    Droppable,
+}
+
+struct OutboundItem {
+    message: Message,
+    class: OutboundClass,
+}
+
+struct OutboundMailbox {
+    capacity: usize,
+    state: Mutex<OutboundMailboxState>,
+    notify: Notify,
+}
+
+#[derive(Default)]
+struct OutboundMailboxState {
+    queue: VecDeque<OutboundItem>,
+    close_reason: Option<String>,
+    closed: bool,
+}
+
+enum MailboxOutput {
+    Message(Message),
+    Close(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundEnqueueError {
+    QueueSaturated,
+    DroppedDiagnostic,
+    Closed,
+}
+
+impl OutboundMailbox {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            state: Mutex::new(OutboundMailboxState::default()),
+            notify: Notify::new(),
+        }
+    }
+
+    fn enqueue(&self, item: OutboundItem) -> Result<(), OutboundEnqueueError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state.closed {
+            return Err(OutboundEnqueueError::Closed);
+        }
+        if let OutboundClass::Coalescible(key) = item.class {
+            if let Some(existing) = state
+                .queue
+                .iter_mut()
+                .find(|queued| queued.class == OutboundClass::Coalescible(key))
+            {
+                existing.message = item.message;
+                return Ok(());
+            }
+        }
+        if state.queue.len() >= self.capacity {
+            return match item.class {
+                OutboundClass::Critical => {
+                    state.close_reason = Some("critical_outbound_queue_saturated".to_string());
+                    drop(state);
+                    self.notify.notify_one();
+                    Err(OutboundEnqueueError::QueueSaturated)
+                }
+                OutboundClass::Coalescible(_) => Err(OutboundEnqueueError::QueueSaturated),
+                OutboundClass::Droppable => Err(OutboundEnqueueError::DroppedDiagnostic),
+            };
+        }
+        state.queue.push_back(item);
+        drop(state);
+        self.notify.notify_one();
+        Ok(())
+    }
+
+    async fn next(&self) -> Option<MailboxOutput> {
+        loop {
+            let notified = self.notify.notified();
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                if let Some(reason) = state.close_reason.take() {
+                    state.queue.clear();
+                    state.closed = true;
+                    return Some(MailboxOutput::Close(reason));
+                }
+                if let Some(item) = state.queue.pop_front() {
+                    return Some(MailboxOutput::Message(item.message));
+                }
+                if state.closed {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.closed = true;
+        drop(state);
+        self.notify.notify_waiters();
+    }
+
+    fn fail(&self, reason: &'static str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if !state.closed {
+            state.close_reason = Some(reason.to_string());
+        }
+        drop(state);
+        self.notify.notify_one();
     }
 }
 
@@ -84,6 +254,12 @@ enum ClientEvent {
         model_id: Option<String>,
         #[serde(default)]
         language: Option<String>,
+        #[serde(default)]
+        protocol: Option<String>,
+        #[serde(default)]
+        version: Option<u16>,
+        #[serde(default)]
+        resume_from_event_id: Option<u64>,
     },
     SessionStop,
     Ping {
@@ -106,14 +282,107 @@ enum WorkerCommand {
     SessionStart {
         model_id: Option<String>,
         language: Option<String>,
+        wire_protocol: TranscriptionWireProtocol,
     },
     AudioFrame {
         frame_seq: u32,
         sample_rate: u32,
         payload: Vec<u8>,
     },
+    Ping {
+        timestamp_ms: Option<u64>,
+    },
+    ProtocolError(String),
     SessionStop,
     Shutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptionWireProtocol {
+    LegacyV2,
+    TypedV3,
+}
+
+struct TypedTranscriptionSession {
+    session_id: String,
+    owner_instance_id: String,
+    next_event_id: u64,
+    next_sequence: u64,
+    next_revision: u64,
+    last_stable_prefix_chars: usize,
+    final_sent: bool,
+}
+
+impl TypedTranscriptionSession {
+    fn process_owned() -> Self {
+        Self::with_identity(
+            uuid::Uuid::new_v4().to_string(),
+            format!("process-{}", std::process::id()),
+        )
+    }
+
+    fn with_identity(session_id: String, owner_instance_id: String) -> Self {
+        Self {
+            session_id,
+            owner_instance_id,
+            next_event_id: 1,
+            next_sequence: 0,
+            next_revision: 1,
+            last_stable_prefix_chars: 0,
+            final_sent: false,
+        }
+    }
+
+    fn next_revision(&mut self) -> u64 {
+        let revision = self.next_revision;
+        self.next_revision = self.next_revision.saturating_add(1);
+        revision
+    }
+
+    fn next_envelope(&mut self, event: RealtimeServerEvent) -> RealtimeServerEnvelope {
+        let envelope = RealtimeEventEnvelope {
+            protocol: RealtimeProtocol::TranscriptionRealtime,
+            version: TRANSCRIPTION_REALTIME_VERSION,
+            event_id: self.next_event_id,
+            sequence: self.next_sequence,
+            session_id: self.session_id.clone(),
+            connection_epoch: 0,
+            timestamp_ms: now_unix_millis(),
+            utterance_id: None,
+            turn_id: None,
+            segment_id: None,
+            event,
+        };
+        self.next_event_id = self.next_event_id.saturating_add(1);
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        envelope
+    }
+
+    fn send(&mut self, out_tx: &OutboundTx, event: RealtimeServerEvent) -> bool {
+        let delivery_class = match event.delivery_class() {
+            RealtimeDeliveryClass::Critical
+            | RealtimeDeliveryClass::LosslessStream
+            | RealtimeDeliveryClass::CoalescibleSnapshot => {
+                // Typed envelopes carry a strict contiguous sequence. Until sequence assignment
+                // moves to mailbox dequeue, replacing an already-numbered snapshot would create
+                // a client-visible gap, so saturation closes explicitly instead of coalescing.
+                OutboundClass::Critical
+            }
+            RealtimeDeliveryClass::Droppable => {
+                // Dropping an already-numbered typed diagnostic would also violate the envelope
+                // successor contract. Close explicitly at saturation for the v3 adapter.
+                OutboundClass::Critical
+            }
+        };
+        let envelope = self.next_envelope(event);
+        match serde_json::to_string(&envelope) {
+            Ok(text) => out_tx.send_class(Message::Text(text.into()), delivery_class),
+            Err(err) => {
+                warn!("failed to serialize typed transcription event: {err}");
+                false
+            }
+        }
+    }
 }
 
 struct PendingInference {
@@ -155,6 +424,8 @@ struct RealtimeSessionState {
     trailing_text: String,
     native_stream_checked: bool,
     native_asr_stream: Option<RuntimeAsrRealtimeStream>,
+    wire_protocol: TranscriptionWireProtocol,
+    typed_session: Option<TypedTranscriptionSession>,
 }
 
 impl Default for RealtimeSessionState {
@@ -175,6 +446,8 @@ impl Default for RealtimeSessionState {
             trailing_text: String::new(),
             native_stream_checked: false,
             native_asr_stream: None,
+            wire_protocol: TranscriptionWireProtocol::LegacyV2,
+            typed_session: None,
         }
     }
 }
@@ -251,15 +524,49 @@ impl RealtimeInferenceDiagnostics {
     }
 }
 
-pub async fn handle_socket(socket: WebSocket, state: AppState, correlation_id: String) {
+pub async fn handle_socket(mut socket: WebSocket, state: AppState, correlation_id: String) {
+    let Some(_session_permit) = state.try_acquire_realtime_session() else {
+        let _ = socket
+            .send(Message::Text(
+                json!({
+                    "type": "error",
+                    "code": "realtime_session_capacity",
+                    "message": "Realtime websocket session capacity is exhausted",
+                    "fatal": true,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await;
+        let _ = socket
+            .send(Message::Close(Some(CloseFrame {
+                code: 1013,
+                reason: "realtime_session_capacity".into(),
+            })))
+            .await;
+        return;
+    };
+
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let (raw_out_tx, mut out_rx) = mpsc::channel::<Message>(WS_OUTBOUND_QUEUE_CAPACITY);
-    let out_tx = OutboundTx::new(raw_out_tx, state.runtime.clone(), "transcription realtime");
+    let out_tx = OutboundTx::new(state.runtime.clone(), "transcription realtime");
     let (worker_tx, worker_rx) = mpsc::channel::<WorkerCommand>(WORKER_COMMAND_QUEUE_CAPACITY);
 
+    let writer_tx = out_tx.clone();
     let writer = tokio::spawn(async move {
-        while let Some(message) = out_rx.recv().await {
-            if ws_tx.send(message).await.is_err() {
+        while let Some(output) = writer_tx.next().await {
+            let message = match output {
+                MailboxOutput::Message(message) => message,
+                MailboxOutput::Close(reason) => Message::Close(Some(CloseFrame {
+                    code: 1011,
+                    reason: reason.into(),
+                })),
+            };
+            let terminal = matches!(message, Message::Close(_));
+            if !matches!(
+                tokio::time::timeout(WS_WRITER_SEND_TIMEOUT, ws_tx.send(message)).await,
+                Ok(Ok(()))
+            ) || terminal
+            {
                 break;
             }
         }
@@ -276,7 +583,7 @@ pub async fn handle_socket(socket: WebSocket, state: AppState, correlation_id: S
         &out_tx,
         json!({
             "type": "session_ready",
-            "protocol": REALTIME_PROTOCOL,
+            "protocol": LEGACY_REALTIME_PROTOCOL,
             "correlation_id": correlation_id,
         }),
     );
@@ -310,21 +617,28 @@ pub async fn handle_socket(socket: WebSocket, state: AppState, correlation_id: S
                             payload,
                         },
                     ) {
+                        send_json(
+                            &out_tx,
+                            json!({
+                                "type": "error",
+                                "code": "input_command_queue_saturated",
+                                "message": "Realtime transcription input queue is saturated",
+                                "fatal": true,
+                            }),
+                        );
+                        out_tx.fail("input_command_queue_saturated");
                         break;
                     }
                 }
                 Err(err) => {
-                    send_json(
-                        &out_tx,
-                        json!({
-                            "type": "error",
-                            "message": err,
-                        }),
-                    );
+                    if !send_worker_command(&worker_tx, WorkerCommand::ProtocolError(err)) {
+                        out_tx.fail("input_command_queue_saturated");
+                        break;
+                    }
                 }
             },
             Message::Ping(payload) => {
-                let _ = out_tx.send(Message::Pong(payload));
+                let _ = out_tx.send_diagnostic(Message::Pong(payload));
             }
             Message::Close(_) => break,
             Message::Pong(_) => {}
@@ -332,9 +646,14 @@ pub async fn handle_socket(socket: WebSocket, state: AppState, correlation_id: S
     }
 
     let _ = send_worker_command(&worker_tx, WorkerCommand::Shutdown);
+    drop(worker_tx);
     let _ = worker.await;
 
-    drop(out_tx);
+    let _ = out_tx.send(Message::Close(Some(CloseFrame {
+        code: 1000,
+        reason: "transcription_session_complete".into(),
+    })));
+    out_tx.close();
     let _ = writer.await;
 }
 
@@ -358,28 +677,80 @@ fn handle_text_message(
     };
 
     match event {
-        ClientEvent::SessionStart { model_id, language } => {
+        ClientEvent::SessionStart {
+            model_id,
+            language,
+            protocol,
+            version,
+            resume_from_event_id,
+        } => {
+            let wire_protocol = match negotiate_transcription_protocol(
+                protocol.as_deref(),
+                version,
+                resume_from_event_id,
+            ) {
+                Ok(protocol) => protocol,
+                Err(err) => {
+                    send_json(out_tx, json!({ "type": "error", "message": err }));
+                    return false;
+                }
+            };
             if !send_worker_command(
                 worker_tx,
-                WorkerCommand::SessionStart { model_id, language },
+                WorkerCommand::SessionStart {
+                    model_id,
+                    language,
+                    wire_protocol,
+                },
             ) {
+                send_json(
+                    out_tx,
+                    json!({
+                        "type": "error",
+                        "code": "input_command_queue_saturated",
+                        "message": "Realtime transcription input queue is saturated",
+                        "fatal": true,
+                    }),
+                );
+                out_tx.fail("input_command_queue_saturated");
                 return true;
             }
             false
         }
         ClientEvent::SessionStop => {
-            let _ = send_worker_command(worker_tx, WorkerCommand::SessionStop);
+            if !send_worker_command(worker_tx, WorkerCommand::SessionStop) {
+                out_tx.fail("input_command_queue_saturated");
+            }
             true
         }
         ClientEvent::Ping { timestamp_ms } => {
-            send_json(
-                out_tx,
-                json!({
-                    "type": "pong",
-                    "timestamp_ms": timestamp_ms,
-                }),
-            );
+            let _ = send_worker_command(worker_tx, WorkerCommand::Ping { timestamp_ms });
             false
+        }
+    }
+}
+
+fn negotiate_transcription_protocol(
+    protocol: Option<&str>,
+    version: Option<u16>,
+    resume_from_event_id: Option<u64>,
+) -> Result<TranscriptionWireProtocol, String> {
+    match (protocol.map(str::trim), version) {
+        (None, None) => Ok(TranscriptionWireProtocol::LegacyV2),
+        (Some(TYPED_REALTIME_PROTOCOL), Some(TRANSCRIPTION_REALTIME_VERSION)) => {
+            if resume_from_event_id.is_some() {
+                return Err(
+                    "transcription_realtime v3 sessions are process-owned and non-resumable"
+                        .to_string(),
+                );
+            }
+            Ok(TranscriptionWireProtocol::TypedV3)
+        }
+        (Some(protocol), Some(version)) => Err(format!(
+            "Unsupported realtime protocol negotiation `{protocol}` version {version}"
+        )),
+        _ => {
+            Err("Realtime protocol negotiation requires both `protocol` and `version`".to_string())
         }
     }
 }
@@ -416,8 +787,16 @@ async fn run_worker(
 
         match event {
             LoopEvent::Command(Some(command)) => {
-                if handle_worker_command(&state, &correlation_id, &out_tx, &mut session, command)
-                    .await
+                let ingress_queue_depth = worker_rx.len();
+                if handle_worker_command(
+                    &state,
+                    &correlation_id,
+                    &out_tx,
+                    &mut session,
+                    command,
+                    ingress_queue_depth,
+                )
+                .await
                 {
                     break;
                 }
@@ -427,7 +806,12 @@ async fn run_worker(
                 if let Err(err) =
                     maybe_schedule_inference(&state, &correlation_id, &mut session, false)
                 {
-                    send_json(&out_tx, json!({ "type": "error", "message": err }));
+                    send_session_error_with_code(
+                        &out_tx,
+                        &mut session,
+                        RealtimeErrorCode::InferenceFailed,
+                        err,
+                    );
                 }
             }
             LoopEvent::InferenceDone(result) => {
@@ -438,7 +822,12 @@ async fn run_worker(
                 if let Err(err) =
                     maybe_schedule_inference(&state, &correlation_id, &mut session, true)
                 {
-                    send_json(&out_tx, json!({ "type": "error", "message": err }));
+                    send_session_error_with_code(
+                        &out_tx,
+                        &mut session,
+                        RealtimeErrorCode::InferenceFailed,
+                        err,
+                    );
                 }
             }
         }
@@ -455,9 +844,14 @@ async fn handle_worker_command(
     out_tx: &OutboundTx,
     session: &mut RealtimeSessionState,
     command: WorkerCommand,
+    ingress_queue_depth: usize,
 ) -> bool {
     match command {
-        WorkerCommand::SessionStart { model_id, language } => {
+        WorkerCommand::SessionStart {
+            model_id,
+            language,
+            wire_protocol,
+        } => {
             if let Some(in_flight) = session.in_flight.take() {
                 in_flight.task.abort();
             }
@@ -476,8 +870,15 @@ async fn handle_worker_command(
             session.trailing_text.clear();
             session.native_stream_checked = false;
             session.native_asr_stream = None;
+            session.wire_protocol = wire_protocol;
+            session.typed_session = match wire_protocol {
+                TranscriptionWireProtocol::LegacyV2 => None,
+                TranscriptionWireProtocol::TypedV3 => {
+                    Some(TypedTranscriptionSession::process_owned())
+                }
+            };
 
-            send_json(out_tx, json!({ "type": "session_started" }));
+            send_session_started(out_tx, session);
             false
         }
         WorkerCommand::AudioFrame {
@@ -485,14 +886,25 @@ async fn handle_worker_command(
             sample_rate,
             payload,
         } => {
+            let previous_frame_seq = session.last_frame_seq;
             let frame_samples = match ingest_audio_frame(session, frame_seq, sample_rate, &payload)
             {
                 Ok(samples) => samples,
                 Err(err) => {
-                    send_json(out_tx, json!({ "type": "error", "message": err }));
+                    send_session_error(out_tx, session, err);
                     return false;
                 }
             };
+
+            if !frame_samples.is_empty() {
+                send_audio_ingress_events(
+                    out_tx,
+                    session,
+                    previous_frame_seq,
+                    frame_seq,
+                    ingress_queue_depth,
+                );
+            }
 
             match maybe_process_native_stream_frame(
                 state,
@@ -508,22 +920,335 @@ async fn handle_worker_command(
                     if let Err(err) =
                         maybe_schedule_inference(state, correlation_id, session, false)
                     {
-                        send_json(out_tx, json!({ "type": "error", "message": err }));
+                        send_session_error_with_code(
+                            out_tx,
+                            session,
+                            RealtimeErrorCode::InferenceFailed,
+                            err,
+                        );
                     }
                 }
-                Err(err) => send_json(out_tx, json!({ "type": "error", "message": err })),
+                Err(err) => send_session_error_with_code(
+                    out_tx,
+                    session,
+                    RealtimeErrorCode::InferenceFailed,
+                    err,
+                ),
             }
             false
         }
+        WorkerCommand::Ping { timestamp_ms } => {
+            send_session_pong(out_tx, session, timestamp_ms);
+            false
+        }
+        WorkerCommand::ProtocolError(err) => {
+            send_session_error(out_tx, session, err);
+            false
+        }
         WorkerCommand::SessionStop => {
-            if let Err(err) = finish_native_stream_if_needed(state, out_tx, session).await {
-                send_json(out_tx, json!({ "type": "error", "message": err }));
+            let had_native_stream = session.native_asr_stream.is_some();
+            let finish_result = if had_native_stream {
+                finish_native_stream_if_needed(state, out_tx, session).await
+            } else {
+                finish_fallback_stream(state, correlation_id, out_tx, session).await
+            };
+            if let Err(err) = finish_result {
+                send_session_error_with_code(
+                    out_tx,
+                    session,
+                    RealtimeErrorCode::InferenceFailed,
+                    err,
+                );
             }
-            send_json(out_tx, json!({ "type": "session_done" }));
+            send_session_finished(out_tx, session);
             true
         }
         WorkerCommand::Shutdown => true,
     }
+}
+
+fn send_session_started(out_tx: &OutboundTx, session: &mut RealtimeSessionState) {
+    match session.wire_protocol {
+        TranscriptionWireProtocol::LegacyV2 => {
+            send_json(out_tx, json!({ "type": "session_started" }));
+        }
+        TranscriptionWireProtocol::TypedV3 => {
+            let Some(typed) = session.typed_session.as_mut() else {
+                return;
+            };
+            let owner_instance_id = typed.owner_instance_id.clone();
+            typed.send(
+                out_tx,
+                RealtimeServerEvent::SessionReady {
+                    accepted_version: TRANSCRIPTION_REALTIME_VERSION,
+                    owner_instance_id,
+                    resumable: false,
+                    resume_window_ms: 0,
+                },
+            );
+            typed.send(out_tx, RealtimeServerEvent::SessionStarted);
+        }
+    }
+}
+
+fn send_session_error(
+    out_tx: &OutboundTx,
+    session: &mut RealtimeSessionState,
+    message: impl Into<String>,
+) {
+    send_session_error_with_code(out_tx, session, RealtimeErrorCode::InvalidMessage, message);
+}
+
+fn send_session_error_with_code(
+    out_tx: &OutboundTx,
+    session: &mut RealtimeSessionState,
+    code: RealtimeErrorCode,
+    message: impl Into<String>,
+) {
+    let message = message.into();
+    match session.wire_protocol {
+        TranscriptionWireProtocol::LegacyV2 => {
+            send_json(out_tx, json!({ "type": "error", "message": message }));
+        }
+        TranscriptionWireProtocol::TypedV3 => {
+            if let Some(typed) = session.typed_session.as_mut() {
+                typed.send(
+                    out_tx,
+                    RealtimeServerEvent::RecoverableError {
+                        code,
+                        message,
+                        retry_after_ms: None,
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn send_session_pong(
+    out_tx: &OutboundTx,
+    session: &mut RealtimeSessionState,
+    timestamp_ms: Option<u64>,
+) {
+    match session.wire_protocol {
+        TranscriptionWireProtocol::LegacyV2 => {
+            send_json_diagnostic(
+                out_tx,
+                json!({ "type": "pong", "timestamp_ms": timestamp_ms }),
+            );
+        }
+        TranscriptionWireProtocol::TypedV3 => {
+            if let Some(typed) = session.typed_session.as_mut() {
+                typed.send(
+                    out_tx,
+                    RealtimeServerEvent::Pong {
+                        client_timestamp_ms: timestamp_ms,
+                        server_timestamp_ms: now_unix_millis(),
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn send_audio_ingress_events(
+    out_tx: &OutboundTx,
+    session: &mut RealtimeSessionState,
+    previous_frame_seq: Option<u32>,
+    frame_seq: u32,
+    ingress_queue_depth: usize,
+) {
+    if session.wire_protocol != TranscriptionWireProtocol::TypedV3 {
+        return;
+    }
+    let Some(typed) = session.typed_session.as_mut() else {
+        return;
+    };
+
+    if let Some(previous) = previous_frame_seq {
+        let expected = previous.saturating_add(1);
+        if frame_seq > expected {
+            typed.send(
+                out_tx,
+                RealtimeServerEvent::AudioGap {
+                    expected_frame_sequence: expected as u64,
+                    received_frame_sequence: frame_seq as u64,
+                    missing_frames: frame_seq.saturating_sub(expected) as u64,
+                    action: RealtimeAudioGapAction::Continue,
+                },
+            );
+        }
+    }
+
+    typed.send(
+        out_tx,
+        RealtimeServerEvent::AudioAccepted {
+            frame_sequence: frame_seq as u64,
+            buffer_depth_samples: session.samples_i16.len(),
+            ingress_queue_depth,
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_transcript_partial(
+    out_tx: &OutboundTx,
+    session: &mut RealtimeSessionState,
+    sequence: u64,
+    text: String,
+    language: Option<String>,
+    audio_duration_secs: f32,
+    processing_time_ms: f64,
+    rtf: Option<f64>,
+    stable_prefix_chars: usize,
+) {
+    match session.wire_protocol {
+        TranscriptionWireProtocol::LegacyV2 => send_json_snapshot(
+            out_tx,
+            "legacy_transcript",
+            json!({
+                "type": "transcript_partial",
+                "sequence": sequence,
+                "text": text,
+                "language": language,
+                "audio_duration_secs": audio_duration_secs,
+                "processing_time_ms": processing_time_ms,
+                "rtf": rtf,
+            }),
+        ),
+        TranscriptionWireProtocol::TypedV3 => {
+            let Some(typed) = session.typed_session.as_mut() else {
+                return;
+            };
+            let revision = typed.next_revision();
+            typed.send(
+                out_tx,
+                RealtimeServerEvent::TranscriptPartial {
+                    text: text.clone(),
+                    revision,
+                    language,
+                },
+            );
+
+            if stable_prefix_chars > typed.last_stable_prefix_chars {
+                typed.last_stable_prefix_chars = stable_prefix_chars;
+                let revision = typed.next_revision();
+                typed.send(
+                    out_tx,
+                    RealtimeServerEvent::TranscriptStable {
+                        text,
+                        revision,
+                        stable_prefix_chars,
+                    },
+                );
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_native_transcript(
+    out_tx: &OutboundTx,
+    session: &mut RealtimeSessionState,
+    sequence: u64,
+    text: String,
+    language: Option<String>,
+    audio_duration_secs: f32,
+    processing_time_ms: f64,
+    rtf: Option<f64>,
+    is_final: bool,
+) {
+    match session.wire_protocol {
+        TranscriptionWireProtocol::LegacyV2 => {
+            let payload = json!({
+                "type": "transcript_partial",
+                "sequence": sequence,
+                "text": text,
+                "language": language,
+                "audio_duration_secs": audio_duration_secs,
+                "processing_time_ms": processing_time_ms,
+                "rtf": rtf,
+                "native_stream": true,
+                "is_final": is_final,
+            });
+            if is_final {
+                send_json(out_tx, payload);
+            } else {
+                send_json_snapshot(out_tx, "legacy_transcript", payload);
+            }
+        }
+        TranscriptionWireProtocol::TypedV3 => {
+            let Some(typed) = session.typed_session.as_mut() else {
+                return;
+            };
+            if is_final {
+                if typed.final_sent {
+                    return;
+                }
+                typed.final_sent = true;
+                let revision = typed.next_revision();
+                typed.send(
+                    out_tx,
+                    RealtimeServerEvent::TranscriptFinal {
+                        text,
+                        revision,
+                        language,
+                    },
+                );
+            } else {
+                let stable_prefix_chars = text.chars().count();
+                typed.last_stable_prefix_chars = stable_prefix_chars;
+                let revision = typed.next_revision();
+                typed.send(
+                    out_tx,
+                    RealtimeServerEvent::TranscriptStable {
+                        text,
+                        revision,
+                        stable_prefix_chars,
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn send_session_finished(out_tx: &OutboundTx, session: &mut RealtimeSessionState) {
+    if session.wire_protocol == TranscriptionWireProtocol::LegacyV2 {
+        send_json(out_tx, json!({ "type": "session_done" }));
+        return;
+    }
+
+    let final_text = concat_transcript(&session.committed_text, &session.trailing_text);
+    let language = session.language.clone();
+    let Some(typed) = session.typed_session.as_mut() else {
+        return;
+    };
+    if !typed.final_sent {
+        typed.final_sent = true;
+        let revision = typed.next_revision();
+        typed.send(
+            out_tx,
+            RealtimeServerEvent::TranscriptFinal {
+                text: final_text,
+                revision,
+                language,
+            },
+        );
+    }
+
+    let close = RealtimeClose {
+        code: RealtimeCloseCode::Normal,
+        reason: RealtimeCloseReason::ClientRequest,
+        message: "transcription session stopped by client".to_string(),
+        retryable: false,
+    };
+    typed.send(
+        out_tx,
+        RealtimeServerEvent::Closing {
+            close: close.clone(),
+        },
+    );
+    typed.send(out_tx, RealtimeServerEvent::Closed { close });
 }
 
 fn ingest_audio_frame(
@@ -653,6 +1378,39 @@ async fn finish_native_stream_if_needed(
     Ok(())
 }
 
+async fn finish_fallback_stream(
+    state: &AppState,
+    correlation_id: &str,
+    out_tx: &OutboundTx,
+    session: &mut RealtimeSessionState,
+) -> Result<(), String> {
+    loop {
+        if session.in_flight.is_none() {
+            maybe_schedule_inference(state, correlation_id, session, true)?;
+        }
+        let Some(mut pending) = session.in_flight.take() else {
+            return Ok(());
+        };
+
+        let result = match tokio::time::timeout(
+            Duration::from_secs(state.request_timeout_secs.max(1)),
+            &mut pending.receiver,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                pending.task.abort();
+                return Err("Final realtime transcription timed out while draining".to_string());
+            }
+        };
+        handle_inference_result(out_tx, session, pending, result);
+        if !session.pending_recompute {
+            return Ok(());
+        }
+    }
+}
+
 fn emit_native_stream_events(
     out_tx: &OutboundTx,
     session: &mut RealtimeSessionState,
@@ -675,19 +1433,17 @@ fn emit_native_stream_events(
         session.committed_text = event.text.clone();
         session.trailing_text.clear();
         session.last_emitted_sequence = event.chunk_index as u64;
-        send_json(
+        let language = session.language.clone();
+        send_native_transcript(
             out_tx,
-            json!({
-                "type": "transcript_partial",
-                "sequence": event.chunk_index,
-                "text": event.text,
-                "language": session.language.clone(),
-                "audio_duration_secs": audio_duration_secs,
-                "processing_time_ms": processing_time_ms,
-                "rtf": rtf,
-                "native_stream": true,
-                "is_final": event.is_final,
-            }),
+            session,
+            event.chunk_index as u64,
+            event.text,
+            language,
+            audio_duration_secs,
+            processing_time_ms,
+            rtf,
+            event.is_final,
         );
     }
 }
@@ -795,17 +1551,17 @@ fn handle_inference_result(
             RealtimeInferenceDiagnostics::success(&pending, &output, processing_time_ms, rtf)
                 .emit();
 
-            send_json(
+            let stable_prefix_chars = session.committed_text.chars().count();
+            send_transcript_partial(
                 out_tx,
-                json!({
-                    "type": "transcript_partial",
-                    "sequence": sequence,
-                    "text": merged_text,
-                    "language": output.language,
-                    "audio_duration_secs": output.duration_secs,
-                    "processing_time_ms": processing_time_ms,
-                    "rtf": rtf,
-                }),
+                session,
+                sequence,
+                merged_text,
+                output.language,
+                output.duration_secs,
+                processing_time_ms,
+                rtf,
+                stable_prefix_chars,
             );
             session.last_emitted_sequence = sequence;
         }
@@ -816,12 +1572,11 @@ fn handle_inference_result(
                 "asr_failed",
             )
             .emit();
-            send_json(
+            send_session_error_with_code(
                 out_tx,
-                json!({
-                    "type": "error",
-                    "message": format!("ASR failed: {err}"),
-                }),
+                session,
+                RealtimeErrorCode::InferenceFailed,
+                format!("ASR failed: {err}"),
             );
         }
         Err(err) => {
@@ -831,12 +1586,11 @@ fn handle_inference_result(
                 "task_failed",
             )
             .emit();
-            send_json(
+            send_session_error_with_code(
                 out_tx,
-                json!({
-                    "type": "error",
-                    "message": format!("Realtime inference task failed: {err}"),
-                }),
+                session,
+                RealtimeErrorCode::InferenceFailed,
+                format!("Realtime inference task failed: {err}"),
             );
         }
     }
@@ -1328,6 +2082,21 @@ fn send_json(tx: &OutboundTx, value: serde_json::Value) {
     let _ = tx.send(Message::Text(value.to_string().into()));
 }
 
+fn send_json_snapshot(tx: &OutboundTx, key: &'static str, value: serde_json::Value) {
+    let _ = tx.send_snapshot(key, Message::Text(value.to_string().into()));
+}
+
+fn send_json_diagnostic(tx: &OutboundTx, value: serde_json::Value) {
+    let _ = tx.send_diagnostic(Message::Text(value.to_string().into()));
+}
+
+fn now_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 fn send_worker_command(tx: &mpsc::Sender<WorkerCommand>, command: WorkerCommand) -> bool {
     match tx.try_send(command) {
         Ok(()) => true,
@@ -1343,42 +2112,162 @@ fn send_worker_command(tx: &mpsc::Sender<WorkerCommand>, command: WorkerCommand)
 mod tests {
     use std::sync::Arc;
 
-    use axum::extract::ws::Message;
-    use izwi_core::{EngineConfig, RuntimeService};
-    use tokio::sync::mpsc;
-
     use super::{
         collapse_unstable_repetition, ingest_audio_frame, merge_online_transcript,
-        pcm16_i16_to_f32, strip_suffix_prefix_overlap_with_lookahead_by_words, OutboundTx,
-        RealtimeInferenceDiagnostics, RealtimeSessionState,
+        negotiate_transcription_protocol, pcm16_i16_to_f32, send_session_finished,
+        strip_suffix_prefix_overlap_with_lookahead_by_words, MailboxOutput, OutboundTx,
+        RealtimeInferenceDiagnostics, RealtimeSessionState, TranscriptionWireProtocol,
+        TypedTranscriptionSession,
     };
+    use crate::app::realtime_protocol::{
+        RealtimeEventFinality, RealtimeServerEnvelope, RealtimeServerEvent,
+        TRANSCRIPTION_REALTIME_VERSION,
+    };
+    use axum::extract::ws::Message;
+    use izwi_core::{EngineConfig, RuntimeService};
+
+    #[test]
+    fn realtime_protocol_negotiation_defaults_to_legacy_and_requires_explicit_v3() {
+        assert_eq!(
+            negotiate_transcription_protocol(None, None, None),
+            Ok(TranscriptionWireProtocol::LegacyV2)
+        );
+        assert_eq!(
+            negotiate_transcription_protocol(
+                Some("transcription_realtime"),
+                Some(TRANSCRIPTION_REALTIME_VERSION),
+                None,
+            ),
+            Ok(TranscriptionWireProtocol::TypedV3)
+        );
+        assert!(negotiate_transcription_protocol(
+            Some("transcription_realtime"),
+            Some(TRANSCRIPTION_REALTIME_VERSION),
+            Some(9),
+        )
+        .expect_err("v3 resume must be rejected")
+        .contains("non-resumable"));
+    }
+
+    #[test]
+    fn typed_session_ready_wire_shape_and_order_are_stable() {
+        let mut session = TypedTranscriptionSession::with_identity(
+            "session-1".to_string(),
+            "process-42".to_string(),
+        );
+        let owner_instance_id = session.owner_instance_id.clone();
+        let mut ready = session.next_envelope(RealtimeServerEvent::SessionReady {
+            accepted_version: TRANSCRIPTION_REALTIME_VERSION,
+            owner_instance_id,
+            resumable: false,
+            resume_window_ms: 0,
+        });
+        let started = session.next_envelope(RealtimeServerEvent::SessionStarted);
+
+        assert_eq!(ready.event_id, 1);
+        assert_eq!(ready.sequence, 0);
+        assert_eq!(started.event_id, 2);
+        assert_eq!(started.sequence, 1);
+        assert_eq!(started.validate_successor(&ready), Ok(()));
+
+        ready.timestamp_ms = 1_725_000_000_123;
+        assert_eq!(
+            serde_json::to_string(&ready).expect("serialize typed SessionReady"),
+            r#"{"protocol":"transcription_realtime","version":3,"event_id":1,"sequence":0,"session_id":"session-1","connection_epoch":0,"timestamp_ms":1725000000123,"type":"session_ready","data":{"accepted_version":3,"owner_instance_id":"process-42","resumable":false,"resume_window_ms":0}}"#
+        );
+    }
 
     #[tokio::test]
-    async fn outbound_tx_drops_full_queue_and_records_backpressure() {
+    async fn typed_session_finish_emits_final_then_closing_then_closed() {
+        let runtime = Arc::new(RuntimeService::new(EngineConfig::default()).expect("runtime"));
+        let outbound = OutboundTx::with_capacity(runtime, "transcription test", 8);
+        let mut session = RealtimeSessionState {
+            started: true,
+            wire_protocol: TranscriptionWireProtocol::TypedV3,
+            typed_session: Some(TypedTranscriptionSession::with_identity(
+                "session-1".to_string(),
+                "process-42".to_string(),
+            )),
+            committed_text: "stable text".to_string(),
+            ..RealtimeSessionState::default()
+        };
+
+        send_session_finished(&outbound, &mut session);
+
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            let Some(MailboxOutput::Message(Message::Text(text))) = outbound.next().await else {
+                panic!("expected a text event");
+            };
+            events.push(
+                serde_json::from_str::<RealtimeServerEnvelope>(text.as_str())
+                    .expect("typed event envelope"),
+            );
+        }
+
+        assert!(matches!(
+            &events[0].event,
+            RealtimeServerEvent::TranscriptFinal { .. }
+        ));
+        assert_eq!(
+            events[0].event.finality(),
+            RealtimeEventFinality::SegmentFinal
+        );
+        assert!(matches!(
+            &events[1].event,
+            RealtimeServerEvent::Closing { .. }
+        ));
+        assert!(matches!(
+            &events[2].event,
+            RealtimeServerEvent::Closed { .. }
+        ));
+        assert_eq!(events[1].validate_successor(&events[0]), Ok(()));
+        assert_eq!(events[2].validate_successor(&events[1]), Ok(()));
+        assert_eq!(
+            events[2].event.finality(),
+            RealtimeEventFinality::SessionFinal
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_tx_closes_explicitly_when_a_critical_event_cannot_queue() {
         let runtime = Arc::new(RuntimeService::new(EngineConfig::default()).expect("runtime"));
         let before = runtime
             .telemetry_snapshot()
             .await
-            .voice
-            .stream_backpressure_total;
-        let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(Message::Text("occupied".into()))
-            .expect("queue should accept first message");
-        let outbound = OutboundTx::new(tx, runtime.clone(), "transcription test");
+            .realtime
+            .transcription_stream_backpressure_total;
+        let outbound = OutboundTx::with_capacity(runtime.clone(), "transcription test", 1);
+        assert!(outbound.send(Message::Text("occupied".into())));
 
         assert!(!outbound.send(Message::Text("dropped".into())));
 
         let after = runtime
             .telemetry_snapshot()
             .await
-            .voice
-            .stream_backpressure_total;
+            .realtime
+            .transcription_stream_backpressure_total;
         assert_eq!(after, before + 1);
-        assert!(rx.try_recv().is_ok());
         assert!(matches!(
-            rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
+            outbound.next().await,
+            Some(MailboxOutput::Close(reason)) if reason == "critical_outbound_queue_saturated"
         ));
+    }
+
+    #[tokio::test]
+    async fn outbound_tx_coalesces_replaceable_transcript_snapshots() {
+        let runtime = Arc::new(RuntimeService::new(EngineConfig::default()).expect("runtime"));
+        let outbound = OutboundTx::with_capacity(runtime, "transcription test", 1);
+
+        assert!(outbound.send_snapshot("transcript", Message::Text("first hypothesis".into())));
+        assert!(
+            outbound.send_snapshot("transcript", Message::Text("replacement hypothesis".into()))
+        );
+
+        let Some(MailboxOutput::Message(Message::Text(text))) = outbound.next().await else {
+            panic!("expected coalesced text snapshot");
+        };
+        assert_eq!(text.as_str(), "replacement hypothesis");
     }
 
     #[test]

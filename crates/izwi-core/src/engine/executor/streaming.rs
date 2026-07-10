@@ -1,3 +1,4 @@
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::error::{Error, Result};
@@ -35,12 +36,10 @@ impl<'a> StreamSink<'a> {
             StreamBackpressurePolicy::FailOnFull => {
                 self.tx.try_send(output).map_err(stream_send_error)
             }
-            StreamBackpressurePolicy::BlockWithDeadline => {
-                self.tx.try_send(output).map_err(stream_send_error)
+            StreamBackpressurePolicy::BlockWithDeadline { timeout_ms } => {
+                self.send_with_deadline(output, Duration::from_millis(timeout_ms.max(1)))
             }
-            StreamBackpressurePolicy::DropOldest
-            | StreamBackpressurePolicy::Coalesce
-            | StreamBackpressurePolicy::Sample => match self.tx.try_send(output) {
+            StreamBackpressurePolicy::DropNewest => match self.tx.try_send(output) {
                 Ok(()) => Ok(()),
                 Err(mpsc::error::TrySendError::Closed(output)) => {
                     Err(stream_send_error(mpsc::error::TrySendError::Closed(output)))
@@ -50,6 +49,30 @@ impl<'a> StreamSink<'a> {
                     Ok(())
                 }
             },
+        }
+    }
+
+    fn send_with_deadline(&self, mut output: StreamingOutput, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.tx.try_send(output) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::error::TrySendError::Closed(output)) => {
+                    return Err(stream_send_error(mpsc::error::TrySendError::Closed(output)));
+                }
+                Err(mpsc::error::TrySendError::Full(returned)) => {
+                    output = returned;
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(stream_send_error(mpsc::error::TrySendError::Full(output)));
+                    }
+                    std::thread::sleep(
+                        deadline
+                            .saturating_duration_since(now)
+                            .min(Duration::from_millis(1)),
+                    );
+                }
+            }
         }
     }
 }
@@ -308,7 +331,7 @@ mod tests {
     #[test]
     fn stream_sink_lossy_policies_drop_when_queue_is_full() {
         let (tx, _rx) = mpsc::channel(1);
-        let sink = StreamSink::with_policy(&tx, StreamBackpressurePolicy::Coalesce);
+        let sink = StreamSink::with_policy(&tx, StreamBackpressurePolicy::DropNewest);
 
         sink.send(StreamingOutput {
             request_id: "req-1".to_string(),
@@ -333,5 +356,42 @@ mod tests {
             asr_progress: None,
         })
         .expect("lossy policy should drop full-queue chunk");
+    }
+
+    #[test]
+    fn stream_sink_block_with_deadline_times_out_truthfully() {
+        let (tx, _rx) = mpsc::channel(1);
+        let sink = StreamSink::with_policy(
+            &tx,
+            StreamBackpressurePolicy::BlockWithDeadline { timeout_ms: 5 },
+        );
+        sink.send(StreamingOutput {
+            request_id: "req-1".to_string(),
+            sequence: 0,
+            samples: vec![0.0],
+            sample_rate: 24_000,
+            is_final: false,
+            text: None,
+            stats: None,
+            asr_progress: None,
+        })
+        .expect("first chunk should fit");
+
+        let started = std::time::Instant::now();
+        let error = sink
+            .send(StreamingOutput {
+                request_id: "req-1".to_string(),
+                sequence: 1,
+                samples: vec![0.0],
+                sample_rate: 24_000,
+                is_final: false,
+                text: None,
+                stats: None,
+                asr_progress: None,
+            })
+            .expect_err("deadline policy must fail after its bounded wait");
+
+        assert!(started.elapsed() >= std::time::Duration::from_millis(5));
+        assert!(error.to_string().contains("backpressure"));
     }
 }

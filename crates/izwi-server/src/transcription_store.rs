@@ -1,21 +1,23 @@
 //! Persistent transcription history storage backed by SQLite.
 
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use izwi_core::AsrProgress;
 use izwi_hooks::{HookMetadata, MediaNamespace, MediaStorageProvider};
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryResult, Set};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryResult, Set,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    db::{StoreDatabase, raw},
-    entity::transcription_records,
+    db::{raw, StoreDatabase},
+    entity::{transcription_records, RuntimeProjectionAttempt},
     ids::new_uuid,
     persistence::{
-        LocalMediaStorageProvider, delete_media_object, persist_audio_object, read_media_object,
+        delete_media_object, persist_audio_object, read_media_object, LocalMediaStorageProvider,
     },
     storage_layout,
 };
@@ -545,6 +547,8 @@ impl TranscriptionStore {
                 processing_status: Set(processing_status.as_db_value().to_string()),
                 processing_error: Set(processing_error),
                 processing_progress_json: Set(processing_progress_json),
+                runtime_stage_id: Set(None),
+                runtime_attempt_token: Set(None),
                 duration_secs: Set(duration_secs),
                 processing_time_ms: Set(processing_time_ms),
                 rtf: Set(rtf),
@@ -630,16 +634,87 @@ impl TranscriptionStore {
         fetch_record_without_audio(db, &record_id).await
     }
 
+    pub async fn bind_runtime_attempt(
+        &self,
+        record_id: String,
+        attempt: &RuntimeProjectionAttempt,
+    ) -> anyhow::Result<Option<TranscriptionRecord>> {
+        validate_runtime_projection_attempt(attempt)?;
+        let db = self.db.connection().await?;
+        let result = transcription_records::Entity::update_many()
+            .col_expr(
+                transcription_records::Column::RuntimeStageId,
+                Expr::value(attempt.stage_id.clone()),
+            )
+            .col_expr(
+                transcription_records::Column::RuntimeAttemptToken,
+                Expr::value(attempt.attempt_token.clone()),
+            )
+            .filter(transcription_records::Column::Id.eq(record_id.clone()))
+            .filter(active_transcription_attempt_condition(
+                db.get_database_backend(),
+                attempt,
+                now_unix_millis_i64(),
+            ))
+            .exec(db)
+            .await
+            .context("Failed to bind transcription record to runtime attempt")?;
+        if result.rows_affected == 0 {
+            return Ok(None);
+        }
+        fetch_record_without_audio(db, &record_id).await
+    }
+
     pub async fn update_processing_status(
         &self,
         record_id: String,
         status: TranscriptionProcessingStatus,
         error: Option<String>,
     ) -> anyhow::Result<Option<TranscriptionRecord>> {
+        self.update_processing_status_inner(record_id, None, status, error)
+            .await
+    }
+
+    pub async fn update_processing_status_for_attempt(
+        &self,
+        record_id: String,
+        attempt: &RuntimeProjectionAttempt,
+        status: TranscriptionProcessingStatus,
+        error: Option<String>,
+    ) -> anyhow::Result<Option<TranscriptionRecord>> {
+        validate_runtime_projection_attempt(attempt)?;
+        self.update_processing_status_inner(record_id, Some(attempt), status, error)
+            .await
+    }
+
+    pub async fn fail_record_for_attempt(
+        &self,
+        record_id: String,
+        attempt: &RuntimeProjectionAttempt,
+        error: String,
+    ) -> anyhow::Result<Option<TranscriptionRecord>> {
+        let error = sanitize_optional_text(Some(error.as_str()), 1_000)
+            .unwrap_or_else(|| "Runtime attempt failed".to_string());
+        self.update_processing_status_for_attempt(
+            record_id,
+            attempt,
+            TranscriptionProcessingStatus::Failed,
+            Some(error),
+        )
+        .await
+    }
+
+    async fn update_processing_status_inner(
+        &self,
+        record_id: String,
+        attempt: Option<&RuntimeProjectionAttempt>,
+        status: TranscriptionProcessingStatus,
+        error: Option<String>,
+    ) -> anyhow::Result<Option<TranscriptionRecord>> {
         let db = self.db.connection().await?;
         let processing_error = sanitize_optional_text(error.as_deref(), 1_000);
         let processing_status = normalize_processing_status(status, processing_error.as_deref());
-        let result = transcription_records::Entity::update_many()
+        let mut update = transcription_records::Entity::update_many()
             .col_expr(
                 transcription_records::Column::ProcessingStatus,
                 Expr::value(processing_status.as_db_value()),
@@ -648,7 +723,21 @@ impl TranscriptionStore {
                 transcription_records::Column::ProcessingError,
                 Expr::value(processing_error),
             )
-            .filter(transcription_records::Column::Id.eq(record_id.clone()))
+            .filter(transcription_records::Column::Id.eq(record_id.clone()));
+        if let Some(attempt) = attempt {
+            update = update
+                .filter(transcription_records::Column::RuntimeStageId.eq(attempt.stage_id.clone()))
+                .filter(
+                    transcription_records::Column::RuntimeAttemptToken
+                        .eq(attempt.attempt_token.clone()),
+                )
+                .filter(active_transcription_attempt_condition(
+                    db.get_database_backend(),
+                    attempt,
+                    now_unix_millis_i64(),
+                ));
+        }
+        let result = update
             .exec(db)
             .await
             .context("Failed to update transcription processing status")?;
@@ -663,9 +752,30 @@ impl TranscriptionStore {
         record_id: String,
         progress: Option<AsrProgress>,
     ) -> anyhow::Result<Option<TranscriptionRecord>> {
+        self.update_processing_progress_inner(record_id, None, progress)
+            .await
+    }
+
+    pub async fn update_processing_progress_for_attempt(
+        &self,
+        record_id: String,
+        attempt: &RuntimeProjectionAttempt,
+        progress: Option<AsrProgress>,
+    ) -> anyhow::Result<Option<TranscriptionRecord>> {
+        validate_runtime_projection_attempt(attempt)?;
+        self.update_processing_progress_inner(record_id, Some(attempt), progress)
+            .await
+    }
+
+    async fn update_processing_progress_inner(
+        &self,
+        record_id: String,
+        attempt: Option<&RuntimeProjectionAttempt>,
+        progress: Option<AsrProgress>,
+    ) -> anyhow::Result<Option<TranscriptionRecord>> {
         let db = self.db.connection().await?;
         let processing_progress_json = serialize_processing_progress(progress.as_ref())?;
-        let result = transcription_records::Entity::update_many()
+        let mut update = transcription_records::Entity::update_many()
             .col_expr(
                 transcription_records::Column::ProcessingProgressJson,
                 Expr::value(processing_progress_json),
@@ -674,7 +784,21 @@ impl TranscriptionStore {
             .filter(transcription_records::Column::ProcessingStatus.is_in([
                 TranscriptionProcessingStatus::Pending.as_db_value(),
                 TranscriptionProcessingStatus::Processing.as_db_value(),
-            ]))
+            ]));
+        if let Some(attempt) = attempt {
+            update = update
+                .filter(transcription_records::Column::RuntimeStageId.eq(attempt.stage_id.clone()))
+                .filter(
+                    transcription_records::Column::RuntimeAttemptToken
+                        .eq(attempt.attempt_token.clone()),
+                )
+                .filter(active_transcription_attempt_condition(
+                    db.get_database_backend(),
+                    attempt,
+                    now_unix_millis_i64(),
+                ));
+        }
+        let result = update
             .exec(db)
             .await
             .context("Failed to update transcription processing progress")?;
@@ -687,6 +811,26 @@ impl TranscriptionStore {
     pub async fn complete_record(
         &self,
         record_id: String,
+        record: CompleteTranscriptionRecord,
+    ) -> anyhow::Result<Option<TranscriptionRecord>> {
+        self.complete_record_inner(record_id, None, record).await
+    }
+
+    pub async fn complete_record_for_attempt(
+        &self,
+        record_id: String,
+        attempt: &RuntimeProjectionAttempt,
+        record: CompleteTranscriptionRecord,
+    ) -> anyhow::Result<Option<TranscriptionRecord>> {
+        validate_runtime_projection_attempt(attempt)?;
+        self.complete_record_inner(record_id, Some(attempt), record)
+            .await
+    }
+
+    async fn complete_record_inner(
+        &self,
+        record_id: String,
+        attempt: Option<&RuntimeProjectionAttempt>,
         record: CompleteTranscriptionRecord,
     ) -> anyhow::Result<Option<TranscriptionRecord>> {
         let db = self.db.connection().await?;
@@ -729,7 +873,7 @@ impl TranscriptionStore {
             serde_json::to_string(&speaker_turns).context("Failed serializing SAA turns")?;
         let saa_warnings_json =
             serde_json::to_string(&saa_warnings).context("Failed serializing SAA warnings")?;
-        let result = transcription_records::Entity::update_many()
+        let mut update = transcription_records::Entity::update_many()
             .col_expr(
                 transcription_records::Column::TranscriptionMode,
                 Expr::value(transcription_mode.as_db_value()),
@@ -815,7 +959,21 @@ impl TranscriptionStore {
                 transcription_records::Column::SummaryUpdatedAt,
                 Expr::value(summary_updated_at),
             )
-            .filter(transcription_records::Column::Id.eq(record_id.clone()))
+            .filter(transcription_records::Column::Id.eq(record_id.clone()));
+        if let Some(attempt) = attempt {
+            update = update
+                .filter(transcription_records::Column::RuntimeStageId.eq(attempt.stage_id.clone()))
+                .filter(
+                    transcription_records::Column::RuntimeAttemptToken
+                        .eq(attempt.attempt_token.clone()),
+                )
+                .filter(active_transcription_attempt_condition(
+                    db.get_database_backend(),
+                    attempt,
+                    now_unix_millis_i64(),
+                ));
+        }
+        let result = update
             .exec(db)
             .await
             .context("Failed to complete transcription record")?;
@@ -1406,6 +1564,50 @@ fn truncate_string(input: &str, max_chars: usize) -> String {
     result
 }
 
+fn validate_runtime_projection_attempt(attempt: &RuntimeProjectionAttempt) -> anyhow::Result<()> {
+    if !attempt.is_valid() {
+        return Err(anyhow!(
+            "Runtime projection attempt requires a stage id and attempt token"
+        ));
+    }
+    Ok(())
+}
+
+fn active_transcription_attempt_condition(
+    backend: DbBackend,
+    attempt: &RuntimeProjectionAttempt,
+    now: i64,
+) -> Expr {
+    let (stage_placeholder, token_placeholder, now_placeholder) = match backend {
+        DbBackend::Postgres => ("$1", "$2", "$3"),
+        _ => ("?", "?", "?"),
+    };
+    Expr::cust_with_exprs(
+        format!(
+            r#"
+        EXISTS (
+            SELECT 1
+            FROM job_stages s
+            INNER JOIN runtime_jobs j ON j.id = s.job_id
+            WHERE s.id = {stage_placeholder}
+              AND s.attempt_token = {token_placeholder}
+              AND s.status IN ('running', 'postprocessing')
+              AND s.lease_expires_at IS NOT NULL
+              AND s.lease_expires_at > {now_placeholder}
+              AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+              AND j.route_record_id = transcription_records.id
+              AND j.route_record_kind IN ('transcription', 'speaker_attributed_asr')
+        )
+        "#
+        ),
+        [
+            Expr::value(attempt.stage_id.clone()),
+            Expr::value(attempt.attempt_token.clone()),
+            Expr::value(now),
+        ],
+    )
+}
+
 fn now_unix_millis_i64() -> i64 {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1414,7 +1616,11 @@ fn now_unix_millis_i64() -> i64 {
 }
 
 fn i64_to_u64(value: i64) -> u64 {
-    if value.is_negative() { 0 } else { value as u64 }
+    if value.is_negative() {
+        0
+    } else {
+        value as u64
+    }
 }
 
 #[allow(dead_code)]
@@ -1425,6 +1631,10 @@ pub const fn default_list_limit() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::batch_runtime::{
+        store::{BatchRuntimeStore, NewJobStage, NewRuntimeJob},
+        types::{RuntimeJobKind, RuntimeJobStatus, RuntimeStageStatus},
+    };
 
     fn build_test_store() -> (TranscriptionStore, PathBuf) {
         let root = std::env::temp_dir().join(format!(
@@ -1501,6 +1711,81 @@ mod tests {
             summary_error: None,
             summary_updated_at: Some(1),
         }
+    }
+
+    fn completed_record() -> CompleteTranscriptionRecord {
+        CompleteTranscriptionRecord {
+            transcription_mode: TranscriptionRecordMode::Transcription,
+            model_id: Some("Parakeet-TDT-0.6B-v3".to_string()),
+            aligner_model_id: None,
+            language: Some("English".to_string()),
+            duration_secs: Some(1.0),
+            processing_time_ms: 20.0,
+            rtf: Some(0.02),
+            transcription: "Attempt-fenced transcript".to_string(),
+            segments: Vec::new(),
+            words: Vec::new(),
+            speaker_attributed_text: None,
+            speaker_turns: Vec::new(),
+            saa_status: SpeakerAttributedAsrStatus::NotRequested,
+            saa_warnings: Vec::new(),
+            summary_status: TranscriptionSummaryStatus::NotRequested,
+            summary_model_id: None,
+            summary_text: None,
+            summary_error: None,
+            summary_updated_at: None,
+        }
+    }
+
+    async fn claim_projection_attempt(
+        store: &TranscriptionStore,
+        route_record_kind: &str,
+        route_record_id: &str,
+    ) -> (BatchRuntimeStore, RuntimeProjectionAttempt) {
+        let runtime = BatchRuntimeStore::initialize_with_database(store.db.clone());
+        let job = runtime
+            .create_job(NewRuntimeJob {
+                job_kind: RuntimeJobKind::AsrTranscription,
+                status: RuntimeJobStatus::Queued,
+                priority: 0,
+                model_id: Some("test-asr".to_string()),
+                capability: Some("asr".to_string()),
+                route_record_kind: Some(route_record_kind.to_string()),
+                route_record_id: Some(route_record_id.to_string()),
+                input_media_asset_id: None,
+                input_text_asset_id: None,
+                request_json: serde_json::json!({}),
+                model_snapshot_json: serde_json::json!({}),
+                retry_policy_json: serde_json::json!({"max_attempts": 2}),
+                max_attempts: 2,
+                idempotency_key: None,
+                correlation_id: None,
+            })
+            .await
+            .expect("runtime job");
+        runtime
+            .create_stage(NewJobStage {
+                job_id: job.id,
+                sequence: 0,
+                stage_kind: "asr_decode".to_string(),
+                status: RuntimeStageStatus::Queued,
+                capability: Some("asr".to_string()),
+                model_id: Some("test-asr".to_string()),
+                max_attempts: 2,
+                input_artifact_ids: Vec::new(),
+            })
+            .await
+            .expect("runtime stage");
+        let claimed = runtime
+            .claim_next_stage("projection-test-worker", 60_000)
+            .await
+            .expect("stage claim")
+            .expect("claimable stage");
+        let attempt = RuntimeProjectionAttempt::new(
+            claimed.stage.id,
+            claimed.stage.attempt_token.expect("attempt token"),
+        );
+        (runtime, attempt)
     }
 
     #[tokio::test]
@@ -1898,6 +2183,108 @@ mod tests {
             TranscriptionProcessingStatus::Failed
         );
         assert_eq!(summaries[0].transcription_preview, "Runtime unavailable");
+
+        std::fs::remove_dir_all(root).expect("test temp dir should be removable");
+    }
+
+    #[tokio::test]
+    async fn fences_projection_writes_to_the_bound_active_attempt() {
+        let (store, root) = build_test_store();
+        let mut record = sample_record();
+        record.processing_status = TranscriptionProcessingStatus::Pending;
+        record.transcription = String::new();
+        record.segments.clear();
+        record.words.clear();
+        let created = store.create_record(record).await.expect("pending record");
+        let (runtime, attempt) = claim_projection_attempt(
+            &store,
+            TranscriptionRecordMode::Transcription.as_db_value(),
+            &created.id,
+        )
+        .await;
+
+        store
+            .bind_runtime_attempt(created.id.clone(), &attempt)
+            .await
+            .expect("attempt binding")
+            .expect("active attempt should bind");
+        let processing = store
+            .update_processing_status_for_attempt(
+                created.id.clone(),
+                &attempt,
+                TranscriptionProcessingStatus::Processing,
+                None,
+            )
+            .await
+            .expect("processing update")
+            .expect("bound attempt should update");
+        assert_eq!(
+            processing.processing_status,
+            TranscriptionProcessingStatus::Processing
+        );
+
+        let stale = RuntimeProjectionAttempt::new(attempt.stage_id.clone(), "stale-token");
+        assert!(store
+            .update_processing_progress_for_attempt(
+                created.id.clone(),
+                &stale,
+                Some(AsrProgress {
+                    phase: izwi_core::AsrProgressPhase::ChunkFinished,
+                    current_chunk: Some(1),
+                    total_chunks: Some(1),
+                    processed_audio_secs: Some(1.0),
+                    total_audio_secs: Some(1.0),
+                    percent: Some(100.0),
+                }),
+            )
+            .await
+            .expect("stale progress should be ignored")
+            .is_none());
+        assert!(store
+            .complete_record_for_attempt(created.id.clone(), &stale, completed_record())
+            .await
+            .expect("stale completion should be ignored")
+            .is_none());
+
+        let completed = store
+            .complete_record_for_attempt(created.id.clone(), &attempt, completed_record())
+            .await
+            .expect("active completion")
+            .expect("active attempt should complete");
+        assert_eq!(
+            completed.processing_status,
+            TranscriptionProcessingStatus::Ready
+        );
+        assert_eq!(completed.transcription, "Attempt-fenced transcript");
+
+        let db = runtime.connection().await.expect("runtime database");
+        db.execute_raw(
+            raw::statement(
+                db,
+                "UPDATE job_stages SET lease_expires_at = ?1 WHERE id = ?2",
+                vec![
+                    now_unix_millis_i64().saturating_sub(1).into(),
+                    attempt.stage_id.clone().into(),
+                ],
+            )
+            .expect("expiry statement"),
+        )
+        .await
+        .expect("expire lease");
+        assert!(store
+            .fail_record_for_attempt(created.id.clone(), &attempt, "late failure".to_string(),)
+            .await
+            .expect("expired attempt should be ignored")
+            .is_none());
+        let unchanged = store
+            .get_record(created.id)
+            .await
+            .expect("record lookup")
+            .expect("record");
+        assert_eq!(
+            unchanged.processing_status,
+            TranscriptionProcessingStatus::Ready
+        );
 
         std::fs::remove_dir_all(root).expect("test temp dir should be removable");
     }

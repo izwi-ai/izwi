@@ -2,6 +2,25 @@
 
 use sea_orm::entity::prelude::*;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeProjectionAttempt {
+    pub stage_id: String,
+    pub attempt_token: String,
+}
+
+impl RuntimeProjectionAttempt {
+    pub fn new(stage_id: impl Into<String>, attempt_token: impl Into<String>) -> Self {
+        Self {
+            stage_id: stage_id.into(),
+            attempt_token: attempt_token.into(),
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        !self.stage_id.trim().is_empty() && !self.attempt_token.trim().is_empty()
+    }
+}
+
 macro_rules! empty_relation {
     () => {
         #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -158,6 +177,8 @@ pub mod transcription_records {
         pub processing_status: String,
         pub processing_error: Option<String>,
         pub processing_progress_json: Option<String>,
+        pub runtime_stage_id: Option<String>,
+        pub runtime_attempt_token: Option<String>,
         pub duration_secs: Option<f64>,
         pub processing_time_ms: f64,
         pub rtf: Option<f64>,
@@ -236,6 +257,8 @@ pub mod speech_history_records {
         pub route_kind: String,
         pub processing_status: String,
         pub processing_error: Option<String>,
+        pub runtime_stage_id: Option<String>,
+        pub runtime_attempt_token: Option<String>,
         pub model_id: Option<String>,
         pub speaker: Option<String>,
         pub language: Option<String>,

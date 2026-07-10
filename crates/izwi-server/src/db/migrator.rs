@@ -16,6 +16,10 @@ impl Migrator {
             ensure_column(db, column).await?;
         }
 
+        for statement in POST_COMPATIBILITY_SCHEMA {
+            db.execute_unprepared(statement).await?;
+        }
+
         ensure_default_voice_profile(db).await?;
         Ok(())
     }
@@ -140,6 +144,8 @@ const BASELINE_SCHEMA: &[&str] = &[
         processing_status TEXT NOT NULL DEFAULT 'ready',
         processing_error TEXT NULL,
         processing_progress_json TEXT NULL,
+        runtime_stage_id TEXT NULL,
+        runtime_attempt_token TEXT NULL,
         duration_secs REAL NULL,
         processing_time_ms REAL NOT NULL,
         rtf REAL NULL,
@@ -208,6 +214,8 @@ const BASELINE_SCHEMA: &[&str] = &[
         route_kind TEXT NOT NULL,
         processing_status TEXT NOT NULL DEFAULT 'ready',
         processing_error TEXT NULL,
+        runtime_stage_id TEXT NULL,
+        runtime_attempt_token TEXT NULL,
         model_id TEXT NULL,
         speaker TEXT NULL,
         language TEXT NULL,
@@ -356,10 +364,13 @@ const BASELINE_SCHEMA: &[&str] = &[
         channel_count INTEGER NULL,
         peak_amplitude REAL NULL,
         rms_amplitude REAL NULL,
+        source_asset_id TEXT NULL,
+        canonical_profile_version TEXT NULL,
         scan_status TEXT NOT NULL DEFAULT 'not_scanned',
         retention_policy TEXT NOT NULL DEFAULT 'default',
         deleted_at INTEGER NULL,
-        metadata_json TEXT NOT NULL DEFAULT '{}'
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        FOREIGN KEY(source_asset_id) REFERENCES media_assets(id) ON DELETE RESTRICT
     );
     "#,
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_media_assets_storage_key ON media_assets(storage_key);",
@@ -423,11 +434,20 @@ const BASELINE_SCHEMA: &[&str] = &[
         updated_at INTEGER NOT NULL,
         sequence INTEGER NOT NULL,
         stage_kind TEXT NOT NULL,
+        queue_class TEXT NOT NULL DEFAULT 'batch',
+        resource_hints_json TEXT NOT NULL DEFAULT '{"version":1}',
+        resource_target TEXT NOT NULL DEFAULT 'any',
+        required_backend TEXT NULL,
+        required_device_class TEXT NULL,
+        min_resource_memory_bytes INTEGER NULL,
+        resource_concurrency_weight INTEGER NOT NULL DEFAULT 1,
         status TEXT NOT NULL CHECK(status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing', 'completed', 'failed', 'cancelled', 'expired', 'skipped')),
         capability TEXT NULL,
         model_id TEXT NULL,
         worker_id TEXT NULL,
         lease_expires_at INTEGER NULL,
+        available_at INTEGER NULL,
+        attempt_token TEXT NULL,
         attempt_count INTEGER NOT NULL DEFAULT 0,
         max_attempts INTEGER NOT NULL DEFAULT 1,
         input_artifact_ids_json TEXT NOT NULL DEFAULT '[]',
@@ -447,6 +467,9 @@ const BASELINE_SCHEMA: &[&str] = &[
         id TEXT PRIMARY KEY,
         job_id TEXT NOT NULL,
         stage_id TEXT NULL,
+        producer_attempt_count INTEGER NULL,
+        producer_attempt_token TEXT NULL,
+        publication_key TEXT NULL,
         created_at INTEGER NOT NULL,
         artifact_kind TEXT NOT NULL,
         artifact_role TEXT NOT NULL,
@@ -490,6 +513,12 @@ const BASELINE_SCHEMA: &[&str] = &[
         last_heartbeat_at INTEGER NOT NULL,
         status TEXT NOT NULL,
         queue_names_json TEXT NOT NULL DEFAULT '[]',
+        instance_id TEXT NOT NULL DEFAULT '',
+        registration_version INTEGER NOT NULL DEFAULT 1,
+        registration_json TEXT NOT NULL DEFAULT '{}',
+        heartbeat_version INTEGER NOT NULL DEFAULT 1,
+        available_slots INTEGER NOT NULL DEFAULT 0,
+        heartbeat_details_json TEXT NOT NULL DEFAULT '{}',
         current_job_id TEXT NULL,
         current_stage_id TEXT NULL,
         diagnostic_json TEXT NOT NULL DEFAULT '{}',
@@ -500,7 +529,116 @@ const BASELINE_SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_runtime_worker_heartbeats_last ON runtime_worker_heartbeats(last_heartbeat_at DESC);",
 ];
 
+const POST_COMPATIBILITY_SCHEMA: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS idx_job_stages_claim_ready ON job_stages(status, available_at, lease_expires_at, sequence);",
+    "UPDATE job_stages SET queue_class = CASE WHEN stage_kind IN ('asr_transcribe', 'asr_infer') THEN 'batch_asr' WHEN stage_kind IN ('tts_synthesize', 'tts_generate') THEN 'batch_tts' WHEN stage_kind IN ('diarization', 'diarization_segment') THEN 'diarization' WHEN stage_kind IN ('export', 'encode', 'notify') THEN 'export' WHEN stage_kind IN ('evaluation', 'evaluate') THEN 'evaluation' ELSE queue_class END WHERE queue_class = 'batch';",
+    "CREATE INDEX IF NOT EXISTS idx_job_stages_queue_claim_ready ON job_stages(queue_class, status, available_at, lease_expires_at, sequence);",
+    "CREATE INDEX IF NOT EXISTS idx_job_stages_queue_resources ON job_stages(queue_class, resource_target, required_backend, required_device_class, min_resource_memory_bytes, resource_concurrency_weight, status);",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_artifacts_attempt_publication ON runtime_artifacts(stage_id, producer_attempt_token, publication_key);",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_media_assets_source_profile ON media_assets(source_asset_id, canonical_profile_version);",
+];
+
 const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
+    CompatibilityColumn {
+        table: "media_assets",
+        column: "source_asset_id",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "media_assets",
+        column: "canonical_profile_version",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "queue_class",
+        definition: "TEXT NOT NULL DEFAULT 'batch'",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "resource_hints_json",
+        definition: "TEXT NOT NULL DEFAULT '{\"version\":1}'",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "resource_target",
+        definition: "TEXT NOT NULL DEFAULT 'any'",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "required_backend",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "required_device_class",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "min_resource_memory_bytes",
+        definition: "INTEGER NULL",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "resource_concurrency_weight",
+        definition: "INTEGER NOT NULL DEFAULT 1",
+    },
+    CompatibilityColumn {
+        table: "runtime_worker_heartbeats",
+        column: "instance_id",
+        definition: "TEXT NOT NULL DEFAULT ''",
+    },
+    CompatibilityColumn {
+        table: "runtime_worker_heartbeats",
+        column: "registration_version",
+        definition: "INTEGER NOT NULL DEFAULT 1",
+    },
+    CompatibilityColumn {
+        table: "runtime_worker_heartbeats",
+        column: "registration_json",
+        definition: "TEXT NOT NULL DEFAULT '{}'",
+    },
+    CompatibilityColumn {
+        table: "runtime_worker_heartbeats",
+        column: "heartbeat_version",
+        definition: "INTEGER NOT NULL DEFAULT 1",
+    },
+    CompatibilityColumn {
+        table: "runtime_worker_heartbeats",
+        column: "available_slots",
+        definition: "INTEGER NOT NULL DEFAULT 0",
+    },
+    CompatibilityColumn {
+        table: "runtime_worker_heartbeats",
+        column: "heartbeat_details_json",
+        definition: "TEXT NOT NULL DEFAULT '{}'",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "available_at",
+        definition: "INTEGER NULL",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "attempt_token",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "runtime_artifacts",
+        column: "producer_attempt_count",
+        definition: "INTEGER NULL",
+    },
+    CompatibilityColumn {
+        table: "runtime_artifacts",
+        column: "producer_attempt_token",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "runtime_artifacts",
+        column: "publication_key",
+        definition: "TEXT NULL",
+    },
     CompatibilityColumn {
         table: "chat_messages",
         column: "content_parts",
@@ -534,6 +672,16 @@ const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
     CompatibilityColumn {
         table: "transcription_records",
         column: "processing_progress_json",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "runtime_stage_id",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "runtime_attempt_token",
         definition: "TEXT NULL",
     },
     CompatibilityColumn {
@@ -609,6 +757,16 @@ const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
     CompatibilityColumn {
         table: "speech_history_records",
         column: "processing_error",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "speech_history_records",
+        column: "runtime_stage_id",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "speech_history_records",
+        column: "runtime_attempt_token",
         definition: "TEXT NULL",
     },
     CompatibilityColumn {

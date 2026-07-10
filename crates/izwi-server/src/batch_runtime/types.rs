@@ -1,5 +1,237 @@
 use serde::{Deserialize, Serialize};
 
+pub const STAGE_RESOURCE_HINTS_VERSION: u16 = 1;
+pub const WORKER_REGISTRATION_VERSION: u16 = 1;
+pub const WORKER_HEARTBEAT_DETAILS_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueClass {
+    Batch,
+    InteractiveAsr,
+    BatchAsr,
+    LongFormAsr,
+    BatchTts,
+    StreamingTts,
+    Diarization,
+    Export,
+    Evaluation,
+}
+
+impl QueueClass {
+    pub const fn as_db_value(self) -> &'static str {
+        match self {
+            Self::Batch => "batch",
+            Self::InteractiveAsr => "interactive_asr",
+            Self::BatchAsr => "batch_asr",
+            Self::LongFormAsr => "long_form_asr",
+            Self::BatchTts => "batch_tts",
+            Self::StreamingTts => "streaming_tts",
+            Self::Diarization => "diarization",
+            Self::Export => "export",
+            Self::Evaluation => "evaluation",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "batch" => Some(Self::Batch),
+            "interactive_asr" => Some(Self::InteractiveAsr),
+            "batch_asr" => Some(Self::BatchAsr),
+            "long_form_asr" => Some(Self::LongFormAsr),
+            "batch_tts" => Some(Self::BatchTts),
+            "streaming_tts" => Some(Self::StreamingTts),
+            "diarization" => Some(Self::Diarization),
+            "export" => Some(Self::Export),
+            "evaluation" => Some(Self::Evaluation),
+            _ => None,
+        }
+    }
+}
+
+impl Default for QueueClass {
+    fn default() -> Self {
+        Self::Batch
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceTarget {
+    Any,
+    Cpu,
+    Gpu,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeBackendClass {
+    Cpu,
+    Metal,
+    Cuda,
+}
+
+impl RuntimeBackendClass {
+    pub const fn as_db_value(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Metal => "metal",
+            Self::Cuda => "cuda",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceClass {
+    Cpu,
+    AppleGpu,
+    NvidiaGpu,
+}
+
+impl DeviceClass {
+    pub const fn as_db_value(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::AppleGpu => "apple_gpu",
+            Self::NvidiaGpu => "nvidia_gpu",
+        }
+    }
+}
+
+impl ResourceTarget {
+    pub const fn as_db_value(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::Cpu => "cpu",
+            Self::Gpu => "gpu",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "any" => Some(Self::Any),
+            "cpu" => Some(Self::Cpu),
+            "gpu" => Some(Self::Gpu),
+            _ => None,
+        }
+    }
+}
+
+impl Default for ResourceTarget {
+    fn default() -> Self {
+        Self::Any
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct StageResourceHints {
+    pub version: u16,
+    pub target: ResourceTarget,
+    pub backend: Option<RuntimeBackendClass>,
+    pub device_class: Option<DeviceClass>,
+    pub min_memory_bytes: Option<u64>,
+    pub estimated_memory_bytes: Option<u64>,
+    pub estimated_duration_ms: Option<u64>,
+    pub concurrency_weight: u32,
+}
+
+impl Default for StageResourceHints {
+    fn default() -> Self {
+        Self {
+            version: STAGE_RESOURCE_HINTS_VERSION,
+            target: ResourceTarget::Any,
+            backend: None,
+            device_class: None,
+            min_memory_bytes: None,
+            estimated_memory_bytes: None,
+            estimated_duration_ms: None,
+            concurrency_weight: 1,
+        }
+    }
+}
+
+impl StageResourceHints {
+    pub fn normalized(mut self) -> Self {
+        self.version = STAGE_RESOURCE_HINTS_VERSION;
+        self.concurrency_weight = self.concurrency_weight.max(1);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct WorkerResourceCapacity {
+    pub version: u16,
+    pub targets: Vec<ResourceTarget>,
+    pub backends: Vec<RuntimeBackendClass>,
+    pub device_classes: Vec<DeviceClass>,
+    pub memory_bytes: Option<u64>,
+    pub concurrency_slots: u32,
+}
+
+impl Default for WorkerResourceCapacity {
+    fn default() -> Self {
+        Self {
+            version: WORKER_REGISTRATION_VERSION,
+            targets: vec![ResourceTarget::Any],
+            backends: Vec::new(),
+            device_classes: Vec::new(),
+            memory_bytes: None,
+            concurrency_slots: 1,
+        }
+    }
+}
+
+impl WorkerResourceCapacity {
+    pub fn supports(&self, hints: &StageResourceHints) -> bool {
+        if hints.version != STAGE_RESOURCE_HINTS_VERSION {
+            return false;
+        }
+        let target_supported =
+            hints.target == ResourceTarget::Any || self.targets.contains(&hints.target);
+        let memory_supported = match (hints.min_memory_bytes, self.memory_bytes) {
+            (None, _) => true,
+            (Some(required), Some(available)) => required <= available,
+            (Some(_), None) => false,
+        };
+        let backend_supported = hints
+            .backend
+            .is_none_or(|backend| self.backends.contains(&backend));
+        let device_supported = hints
+            .device_class
+            .is_none_or(|device| self.device_classes.contains(&device));
+        target_supported
+            && backend_supported
+            && device_supported
+            && memory_supported
+            && self.concurrency_slots >= hints.concurrency_weight
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeWorkerRegistration {
+    pub version: u16,
+    pub worker_id: String,
+    pub instance_id: String,
+    pub queue_classes: Vec<QueueClass>,
+    pub capabilities: Vec<String>,
+    pub model_ids: Vec<String>,
+    pub stage_kinds: Vec<String>,
+    pub resources: WorkerResourceCapacity,
+    pub software_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RuntimeWorkerHeartbeatDetails {
+    pub version: u16,
+    pub available_slots: u32,
+    pub active_lease_ids: Vec<String>,
+    pub last_error: Option<String>,
+    pub health_json: serde_json::Value,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeJobStatus {
@@ -218,6 +450,8 @@ pub struct MediaAsset {
     pub channel_count: Option<u16>,
     pub peak_amplitude: Option<f32>,
     pub rms_amplitude: Option<f32>,
+    pub source_asset_id: Option<String>,
+    pub canonical_profile_version: Option<String>,
     pub scan_status: String,
     pub retention_policy: String,
     pub deleted_at: Option<u64>,
@@ -277,11 +511,17 @@ pub struct JobStage {
     pub updated_at: u64,
     pub sequence: u32,
     pub stage_kind: String,
+    pub queue_class: QueueClass,
+    pub resource_hints: StageResourceHints,
     pub status: RuntimeStageStatus,
     pub capability: Option<String>,
     pub model_id: Option<String>,
     pub worker_id: Option<String>,
     pub lease_expires_at: Option<u64>,
+    /// Earliest wall-clock time at which a queued/retrying stage may be claimed.
+    pub available_at: Option<u64>,
+    /// Opaque identity for the current or most recently completed execution attempt.
+    pub attempt_token: Option<String>,
     pub attempt_count: u32,
     pub max_attempts: u32,
     pub input_artifact_ids: Vec<String>,
@@ -298,6 +538,9 @@ pub struct RuntimeArtifact {
     pub id: String,
     pub job_id: String,
     pub stage_id: Option<String>,
+    pub producer_attempt_count: Option<u32>,
+    pub producer_attempt_token: Option<String>,
+    pub publication_key: Option<String>,
     pub created_at: u64,
     pub artifact_kind: RuntimeArtifactKind,
     pub artifact_role: RuntimeArtifactRole,
@@ -332,6 +575,9 @@ pub struct RuntimeWorkerHeartbeat {
     pub last_heartbeat_at: u64,
     pub status: String,
     pub queue_names: Vec<String>,
+    pub instance_id: String,
+    pub registration: RuntimeWorkerRegistration,
+    pub details: RuntimeWorkerHeartbeatDetails,
     pub current_job_id: Option<String>,
     pub current_stage_id: Option<String>,
     pub diagnostic_json: serde_json::Value,
@@ -348,6 +594,7 @@ pub struct StageLease {
     pub stage_id: String,
     pub worker_id: String,
     pub attempt_count: u32,
+    pub attempt_token: Option<String>,
 }
 
 impl ClaimedStage {
@@ -356,6 +603,7 @@ impl ClaimedStage {
             stage_id: self.stage.id.clone(),
             worker_id: self.stage.worker_id.clone()?,
             attempt_count: self.stage.attempt_count,
+            attempt_token: self.stage.attempt_token.clone(),
         })
     }
 }

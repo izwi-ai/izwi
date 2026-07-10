@@ -16,29 +16,32 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::api::audio_payload::{
-    decode_base64_audio_payload, inspect_audio_payload_bytes,
-    inspect_audio_payload_with_diagnostics, read_multipart_audio_base64_payload,
-    read_multipart_audio_file_payload,
+    decode_base64_audio_payload, inspect_audio_payload_with_diagnostics,
+    read_multipart_audio_base64_payload, read_multipart_audio_file_payload,
 };
 use crate::api::request_context::RequestContext;
 use crate::batch_runtime::{
     store::{
-        sha256_hex, BatchRuntimeStore, NewIdempotencyRecord, NewJobStage, NewMediaAsset,
-        NewRuntimeArtifact, NewRuntimeJob, NewTextAsset,
+        sha256_hex, BatchRuntimeStore, NewIdempotencyRecord, NewJobStage, NewJobStageDispatch,
+        NewRuntimeArtifact, NewRuntimeJob, NewStageOutputArtifact, NewTextAsset,
     },
     types::{
-        ClaimedStage, RuntimeArtifactKind, RuntimeArtifactRole, RuntimeJobKind, RuntimeJobStatus,
-        RuntimeStageStatus,
+        ClaimedStage, QueueClass, RuntimeArtifactKind, RuntimeArtifactRole, RuntimeJobKind,
+        RuntimeJobStatus, RuntimeStageStatus, StageResourceHints,
     },
-    worker::{StageExecutionOutcome, StageExecutor},
+    worker::{StageExecutionContext, StageExecutionOutcome, StageExecutor},
 };
+use crate::entity::RuntimeProjectionAttempt;
 use crate::error::ApiError;
+use crate::media_ingest::{
+    AudioIngestPolicy, CanonicalAudioProfile, ExistingAudioIngestRequest, MediaIngestError,
+};
 use crate::state::AppState;
 use crate::transcription_store::{
     CompleteTranscriptionRecord, NewTranscriptionRecord, SpeakerAttributedAsrStatus,
     SpeakerAttributedTurnRecord, TranscriptionProcessingStatus, TranscriptionRecord,
-    TranscriptionRecordMode, TranscriptionSegmentRecord, TranscriptionStore,
-    TranscriptionSummaryStatus, TranscriptionWordRecord, UpdateTranscriptionSummary,
+    TranscriptionRecordMode, TranscriptionSegmentRecord, TranscriptionSummaryStatus,
+    TranscriptionWordRecord, UpdateTranscriptionSummary,
 };
 use async_trait::async_trait;
 use izwi_core::runtime::SpeakerAttributedAsrStatus as RuntimeSpeakerAttributedAsrStatus;
@@ -60,7 +63,8 @@ const MAX_SEGMENT_WORDS: usize = 18;
 const MAX_SEGMENT_DURATION_SECS: f32 = 9.0;
 const MIN_SENTENCE_BREAK_WORDS: usize = 5;
 const SEGMENT_GAP_BREAK_SECS: f32 = 0.85;
-const BATCH_ASR_STAGE_KIND: &str = "asr_transcribe";
+pub(crate) const BATCH_ASR_STAGE_KIND: &str = "asr_transcribe";
+const LONG_FORM_ASR_THRESHOLD_SECS: f64 = 5.0 * 60.0;
 
 #[derive(Debug, Serialize)]
 pub struct DeleteTranscriptionRecordResponse {
@@ -428,7 +432,6 @@ async fn enqueue_batch_transcription_job(
         .await
         .map_err(map_store_error)?
         .ok_or_else(|| ApiError::not_found("Transcription audio payload not found"))?;
-    let inspection = inspect_audio_payload_bytes(audio.audio_bytes.as_slice())?;
     let request_snapshot = BatchTranscriptionRequest::from_parsed(parsed);
     let request_json = serde_json::to_value(&request_snapshot)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
@@ -438,31 +441,30 @@ async fn enqueue_batch_transcription_job(
             .as_bytes(),
     );
 
-    let media_asset = state
-        .batch_runtime_store
-        .create_media_asset(NewMediaAsset {
-            asset_kind: "audio_original".to_string(),
-            storage_namespace: "transcription_upload".to_string(),
-            storage_key: audio.audio_storage_path,
-            content_type: audio.audio_mime_type,
-            filename: audio.audio_filename,
-            size_bytes: audio.audio_bytes.len() as u64,
-            sha256: Some(sha256_hex(audio.audio_bytes.as_slice())),
-            duration_secs: Some(inspection.duration_secs as f64),
-            sample_rate_hz: Some(inspection.sample_rate),
-            channel_count: Some(1),
-            peak_amplitude: Some(inspection.peak),
-            rms_amplitude: Some(inspection.rms),
-            scan_status: "passed".to_string(),
-            retention_policy: "default".to_string(),
-            metadata_json: serde_json::json!({
-                "route_record_id": placeholder.id,
-                "route": "speech_to_text",
-                "normalized": false
-            }),
-        })
+    let ingested = state
+        .media_ingest
+        .ingest_existing_audio(
+            ExistingAudioIngestRequest {
+                bytes: audio.audio_bytes,
+                storage_key: audio.audio_storage_path,
+                storage_namespace: "transcription_upload".to_string(),
+                content_type: audio.audio_mime_type,
+                filename: audio.audio_filename,
+                record_id: placeholder.id.clone(),
+                route: "speech_to_text".to_string(),
+            },
+            AudioIngestPolicy::media_upload(AUDIO_UPLOAD_LIMIT_BYTES),
+            CanonicalAudioProfile::SpeechRecognition16KhzMonoWav,
+        )
         .await
-        .map_err(map_store_error)?;
+        .map_err(map_media_ingest_error)?;
+    let source_asset = ingested
+        .source_asset
+        .ok_or_else(|| ApiError::internal("Audio ingest did not register its source asset"))?;
+    let canonical = ingested
+        .canonical
+        .ok_or_else(|| ApiError::internal("Audio ingest did not create a canonical asset"))?;
+    let duration_secs = source_asset.duration_secs.unwrap_or_default();
 
     let job = state
         .batch_runtime_store
@@ -474,7 +476,7 @@ async fn enqueue_batch_transcription_job(
             capability: Some("asr".to_string()),
             route_record_kind: Some(request_snapshot.record_mode.as_db_value().to_string()),
             route_record_id: Some(placeholder.id.clone()),
-            input_media_asset_id: Some(media_asset.id.clone()),
+            input_media_asset_id: Some(source_asset.id.clone()),
             input_text_asset_id: None,
             request_json: request_json.clone(),
             model_snapshot_json: serde_json::json!({}),
@@ -486,21 +488,53 @@ async fn enqueue_batch_transcription_job(
         .await
         .map_err(map_store_error)?;
 
-    let input_artifact = state
+    let original_artifact = state
         .batch_runtime_store
         .create_artifact(NewRuntimeArtifact {
             job_id: job.id.clone(),
             stage_id: None,
             artifact_kind: RuntimeArtifactKind::Media,
             artifact_role: RuntimeArtifactRole::InputOriginal,
-            media_asset_id: Some(media_asset.id),
+            media_asset_id: Some(source_asset.id),
             text_asset_id: None,
-            storage_key: Some(media_asset.storage_key),
-            content_type: Some(media_asset.content_type),
-            filename: media_asset.filename,
-            size_bytes: Some(media_asset.size_bytes),
-            sha256: media_asset.sha256,
-            metadata_json: serde_json::json!({"route_record_id": placeholder.id}),
+            storage_key: Some(source_asset.storage_key),
+            content_type: Some(source_asset.content_type),
+            filename: source_asset.filename,
+            size_bytes: Some(source_asset.size_bytes),
+            sha256: source_asset.sha256,
+            metadata_json: serde_json::json!({
+                "route_record_id": placeholder.id,
+                "source_sample_rate_hz": source_asset.sample_rate_hz,
+                "canonical_profile": CanonicalAudioProfile::SpeechRecognition16KhzMonoWav.id()
+            }),
+            retention_policy: "default".to_string(),
+        })
+        .await
+        .map_err(map_store_error)?;
+
+    let canonical_artifact = state
+        .batch_runtime_store
+        .create_artifact(NewRuntimeArtifact {
+            job_id: job.id.clone(),
+            stage_id: None,
+            artifact_kind: RuntimeArtifactKind::Media,
+            artifact_role: RuntimeArtifactRole::InputCanonical,
+            media_asset_id: Some(canonical.asset.id),
+            text_asset_id: None,
+            storage_key: Some(canonical.asset.storage_key),
+            content_type: Some(canonical.asset.content_type),
+            filename: canonical.asset.filename,
+            size_bytes: Some(canonical.asset.size_bytes),
+            sha256: canonical.asset.sha256,
+            metadata_json: serde_json::json!({
+                "route_record_id": placeholder.id,
+                "source_artifact_id": original_artifact.id,
+                "canonical_profile": CanonicalAudioProfile::SpeechRecognition16KhzMonoWav.id(),
+                "timebase": {
+                    "source_sample_rate_hz": source_asset.sample_rate_hz,
+                    "canonical_sample_rate_hz": canonical.asset.sample_rate_hz
+                }
+            }),
             retention_policy: "default".to_string(),
         })
         .await
@@ -508,15 +542,22 @@ async fn enqueue_batch_transcription_job(
 
     state
         .batch_runtime_store
-        .create_stage(NewJobStage {
-            job_id: job.id.clone(),
-            sequence: 0,
-            stage_kind: BATCH_ASR_STAGE_KIND.to_string(),
-            status: RuntimeStageStatus::Queued,
-            capability: Some("asr".to_string()),
-            model_id: request_snapshot.model_id,
-            max_attempts: 2,
-            input_artifact_ids: vec![input_artifact.id],
+        .create_stage_with_dispatch(NewJobStageDispatch {
+            stage: NewJobStage {
+                job_id: job.id.clone(),
+                sequence: 0,
+                stage_kind: BATCH_ASR_STAGE_KIND.to_string(),
+                status: RuntimeStageStatus::Queued,
+                capability: Some("asr".to_string()),
+                model_id: request_snapshot.model_id,
+                max_attempts: 2,
+                input_artifact_ids: vec![canonical_artifact.id],
+            },
+            queue_class: asr_queue_class(duration_secs),
+            resource_hints: StageResourceHints {
+                estimated_duration_ms: Some((duration_secs.max(0.0) * 1_000.0) as u64),
+                ..StageResourceHints::default()
+            },
         })
         .await
         .map_err(map_store_error)?;
@@ -545,6 +586,14 @@ async fn enqueue_batch_transcription_job(
     Ok(())
 }
 
+fn asr_queue_class(duration_secs: f64) -> QueueClass {
+    if duration_secs >= LONG_FORM_ASR_THRESHOLD_SECS {
+        QueueClass::LongFormAsr
+    } else {
+        QueueClass::BatchAsr
+    }
+}
+
 pub(crate) fn batch_asr_stage_executor(state: AppState) -> Arc<dyn StageExecutor> {
     Arc::new(BatchAsrStageExecutor { state })
 }
@@ -560,118 +609,194 @@ impl StageExecutor for BatchAsrStageExecutor {
     }
 
     async fn execute(&self, claimed: ClaimedStage) -> anyhow::Result<StageExecutionOutcome> {
-        let record_id = claimed
-            .job
-            .route_record_id
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("ASR batch job is missing route_record_id"))?;
-        let request: BatchTranscriptionRequest =
-            serde_json::from_value(claimed.job.request_json.clone())
-                .context("Failed to decode ASR batch request")?;
-        let parsed = request.into_parsed();
+        execute_batch_asr_stage(&self.state, claimed, None).await
+    }
 
-        spawn_transcription_processing_task(
-            self.state.clone(),
-            record_id.clone(),
-            parsed,
-            claimed.job.correlation_id.clone(),
-            WorkloadClass::Batch,
-            None,
-        );
-
-        let record = wait_for_transcription_completion(
-            self.state.transcription_store.clone(),
-            record_id.as_str(),
-        )
-        .await?;
-        let output_artifact = create_transcript_runtime_artifact(
-            self.state.batch_runtime_store.clone(),
-            &claimed,
-            &record,
-        )
-        .await?;
-
-        Ok(StageExecutionOutcome {
-            output_artifact_ids: vec![output_artifact.id],
-        })
+    async fn execute_with_context(
+        &self,
+        context: StageExecutionContext,
+    ) -> anyhow::Result<StageExecutionOutcome> {
+        let claimed = context.claimed().clone();
+        execute_batch_asr_stage(&self.state, claimed, Some(context)).await
     }
 }
 
-async fn wait_for_transcription_completion(
-    transcription_store: Arc<TranscriptionStore>,
-    record_id: &str,
-) -> anyhow::Result<TranscriptionRecord> {
-    loop {
-        let record = transcription_store
-            .get_record(record_id.to_string())
-            .await
-            .context("Failed to poll transcription record")?
-            .ok_or_else(|| anyhow::anyhow!("Transcription record disappeared while processing"))?;
-
-        match record.processing_status {
-            TranscriptionProcessingStatus::Ready => return Ok(record),
-            TranscriptionProcessingStatus::Failed => {
-                anyhow::bail!(
-                    "{}",
-                    record
-                        .processing_error
-                        .unwrap_or_else(|| "Transcription processing failed".to_string())
-                );
-            }
-            TranscriptionProcessingStatus::Pending | TranscriptionProcessingStatus::Processing => {
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
-        }
+async fn execute_batch_asr_stage(
+    state: &AppState,
+    claimed: ClaimedStage,
+    attempt: Option<StageExecutionContext>,
+) -> anyhow::Result<StageExecutionOutcome> {
+    if let Some(attempt) = attempt.as_ref() {
+        attempt.ensure_active().await?;
     }
+    let record_id = claimed
+        .job
+        .route_record_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("ASR batch job is missing route_record_id"))?;
+    let projection_attempt = attempt
+        .as_ref()
+        .map(runtime_projection_attempt)
+        .transpose()?;
+    if let Some(projection_attempt) = projection_attempt.as_ref() {
+        state
+            .transcription_store
+            .bind_runtime_attempt(record_id.clone(), projection_attempt)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("ASR attempt no longer owns its route projection"))?;
+    }
+    let request: BatchTranscriptionRequest =
+        serde_json::from_value(claimed.job.request_json.clone())
+            .context("Failed to decode ASR batch request")?;
+    let parsed = request.into_parsed();
+    let canonical_audio = resolve_batch_asr_audio(state, &claimed).await?;
+
+    let (_record, output_artifact) = process_transcription_record(
+        state.clone(),
+        record_id.clone(),
+        parsed,
+        claimed.job.correlation_id.clone(),
+        WorkloadClass::Batch,
+        None,
+        Some(canonical_audio),
+        attempt.as_ref(),
+        projection_attempt.as_ref(),
+        Some(&claimed),
+    )
+    .await
+    .map_err(|err| anyhow::anyhow!(err.message))?;
+    let output_artifact = output_artifact
+        .ok_or_else(|| anyhow::anyhow!("ASR stage did not publish its primary transcript"))?;
+
+    Ok(StageExecutionOutcome {
+        output_artifact_ids: vec![output_artifact.id],
+    })
+}
+
+fn runtime_projection_attempt(
+    context: &StageExecutionContext,
+) -> anyhow::Result<RuntimeProjectionAttempt> {
+    let attempt_token = context
+        .lease()
+        .attempt_token
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Stage attempt is missing its publication token"))?;
+    Ok(RuntimeProjectionAttempt::new(
+        context.lease().stage_id.clone(),
+        attempt_token,
+    ))
 }
 
 async fn create_transcript_runtime_artifact(
     batch_store: Arc<BatchRuntimeStore>,
     claimed: &ClaimedStage,
-    record: &TranscriptionRecord,
+    record_id: &str,
+    completion: &CompleteTranscriptionRecord,
+    attempt: Option<&StageExecutionContext>,
 ) -> anyhow::Result<crate::batch_runtime::types::RuntimeArtifact> {
     let transcript_payload = serde_json::json!({
-        "record_id": record.id,
-        "text": record.transcription.clone(),
-        "segments": record.segments.clone(),
-        "words": record.words.clone(),
-        "speaker_attributed_text": record.speaker_attributed_text.clone(),
-        "speaker_turns": record.speaker_turns.clone(),
-        "summary_status": record.summary_status,
+        "record_id": record_id,
+        "text": completion.transcription.clone(),
+        "segments": completion.segments.clone(),
+        "words": completion.words.clone(),
+        "speaker_attributed_text": completion.speaker_attributed_text.clone(),
+        "speaker_turns": completion.speaker_turns.clone(),
+        "summary_status": completion.summary_status,
     });
     let transcript_json = serde_json::to_string(&transcript_payload)?;
     let text_asset = batch_store
         .create_text_asset(NewTextAsset {
-            raw_text: record.transcription.clone(),
-            normalized_text: Some(record.transcription.clone()),
-            language_hint: record.language.clone(),
-            sha256: Some(sha256_hex(record.transcription.as_bytes())),
+            raw_text: completion.transcription.clone(),
+            normalized_text: Some(completion.transcription.clone()),
+            language_hint: completion.language.clone(),
+            sha256: Some(sha256_hex(completion.transcription.as_bytes())),
             safety_status: "unchecked".to_string(),
             retention_policy: "default".to_string(),
             structure_json: serde_json::json!({
                 "source": "asr_transcript",
-                "record_id": record.id
+                "record_id": record_id
             }),
         })
         .await?;
 
-    batch_store
-        .create_artifact(NewRuntimeArtifact {
-            job_id: claimed.job.id.clone(),
-            stage_id: Some(claimed.stage.id.clone()),
-            artifact_kind: RuntimeArtifactKind::Transcript,
-            artifact_role: RuntimeArtifactRole::OutputPrimary,
-            media_asset_id: None,
-            text_asset_id: Some(text_asset.id),
-            storage_key: None,
-            content_type: Some("application/json".to_string()),
-            filename: Some(format!("{}.transcript.json", record.id)),
-            size_bytes: Some(transcript_json.len() as u64),
-            sha256: Some(sha256_hex(transcript_json.as_bytes())),
-            metadata_json: transcript_payload,
-            retention_policy: "default".to_string(),
-        })
-        .await
+    let artifact = NewRuntimeArtifact {
+        job_id: claimed.job.id.clone(),
+        stage_id: Some(claimed.stage.id.clone()),
+        artifact_kind: RuntimeArtifactKind::Transcript,
+        artifact_role: RuntimeArtifactRole::OutputPrimary,
+        media_asset_id: None,
+        text_asset_id: Some(text_asset.id),
+        storage_key: None,
+        content_type: Some("application/json".to_string()),
+        filename: Some(format!("{record_id}.transcript.json")),
+        size_bytes: Some(transcript_json.len() as u64),
+        sha256: Some(sha256_hex(transcript_json.as_bytes())),
+        metadata_json: transcript_payload,
+        retention_policy: "default".to_string(),
+    };
+    if let Some(attempt) = attempt {
+        return attempt
+            .publish_output_artifact(NewStageOutputArtifact {
+                publication_key: "primary_transcript".to_string(),
+                artifact_kind: artifact.artifact_kind,
+                artifact_role: artifact.artifact_role,
+                media_asset_id: artifact.media_asset_id,
+                text_asset_id: artifact.text_asset_id,
+                storage_key: artifact.storage_key,
+                content_type: artifact.content_type,
+                filename: artifact.filename,
+                size_bytes: artifact.size_bytes,
+                sha256: artifact.sha256,
+                metadata_json: artifact.metadata_json,
+                retention_policy: artifact.retention_policy,
+            })
+            .await;
+    }
+    batch_store.create_artifact(artifact).await
+}
+
+async fn resolve_batch_asr_audio(
+    state: &AppState,
+    claimed: &ClaimedStage,
+) -> anyhow::Result<Vec<u8>> {
+    let mut legacy_original_only = true;
+    for artifact_id in &claimed.stage.input_artifact_ids {
+        let artifact = state
+            .batch_runtime_store
+            .get_artifact(artifact_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("ASR input artifact `{artifact_id}` was not found"))?;
+        if artifact.artifact_role != RuntimeArtifactRole::InputCanonical {
+            legacy_original_only &= artifact.artifact_role == RuntimeArtifactRole::InputOriginal;
+            continue;
+        }
+        let storage_key = artifact
+            .storage_key
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Canonical ASR artifact is missing storage_key"))?;
+        return state
+            .media_ingest
+            .read_object(storage_key)
+            .await
+            .map(|stored| stored.bytes)
+            .context("Failed to read canonical ASR input artifact");
+    }
+
+    if !legacy_original_only {
+        anyhow::bail!("ASR stage has explicit inputs but no canonical media artifact");
+    }
+
+    let record_id = claimed
+        .job
+        .route_record_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("ASR batch job is missing route_record_id"))?;
+    state
+        .transcription_store
+        .get_audio(record_id)
+        .await?
+        .map(|audio| audio.audio_bytes)
+        .ok_or_else(|| anyhow::anyhow!("Legacy ASR route audio payload was not found"))
 }
 
 fn spawn_transcription_processing_task(
@@ -683,277 +808,343 @@ fn spawn_transcription_processing_task(
     event_tx: Option<mpsc::UnboundedSender<String>>,
 ) {
     tokio::spawn(async move {
-        let runtime = state.runtime.clone();
-        let transcription_store = state.transcription_store.clone();
-        let send_event = |payload: String| {
-            if let Some(tx) = &event_tx {
-                let _ = tx.send(payload);
-            }
-        };
+        let result = process_transcription_record(
+            state,
+            record_id,
+            parsed,
+            correlation_id,
+            workload_class,
+            event_tx.clone(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        if let Some(tx) = event_tx {
+            let payload = match result {
+                Ok((record, _)) => serde_json::to_string(&StreamFinalEvent {
+                    event: "final",
+                    record,
+                })
+                .unwrap_or_default(),
+                Err(err) => serde_json::to_string(&StreamErrorEvent {
+                    event: "error",
+                    error: err.message,
+                })
+                .unwrap_or_default(),
+            };
+            let _ = tx.send(payload);
+            let _ = tx.send(
+                serde_json::to_string(&StreamDoneEvent { event: "done" }).unwrap_or_default(),
+            );
+        }
+    });
+}
 
-        let permit = match state.acquire_owned_workload_permit(workload_class).await {
-            Ok(permit) => permit,
-            Err(_) => {
-                let error_message = "Server is shutting down".to_string();
+async fn process_transcription_record(
+    state: AppState,
+    record_id: String,
+    parsed: ParsedTranscriptionCreateRequest,
+    correlation_id: Option<String>,
+    workload_class: WorkloadClass,
+    event_tx: Option<mpsc::UnboundedSender<String>>,
+    audio_override: Option<Vec<u8>>,
+    attempt: Option<&StageExecutionContext>,
+    projection_attempt: Option<&RuntimeProjectionAttempt>,
+    batch_publication: Option<&ClaimedStage>,
+) -> Result<
+    (
+        TranscriptionRecord,
+        Option<crate::batch_runtime::types::RuntimeArtifact>,
+    ),
+    ApiError,
+> {
+    let transcription_store = state.transcription_store.clone();
+    let result = process_transcription_record_inner(
+        state,
+        record_id.clone(),
+        parsed,
+        correlation_id,
+        workload_class,
+        event_tx,
+        audio_override,
+        attempt,
+        projection_attempt,
+        batch_publication,
+    )
+    .await;
+    if let Err(err) = &result {
+        match projection_attempt {
+            Some(projection_attempt) => {
+                let _ = transcription_store
+                    .fail_record_for_attempt(record_id, projection_attempt, err.message.clone())
+                    .await;
+            }
+            None => {
                 let _ = transcription_store
                     .update_processing_status(
-                        record_id.clone(),
+                        record_id,
                         TranscriptionProcessingStatus::Failed,
-                        Some(error_message.clone()),
+                        Some(err.message.clone()),
                     )
                     .await;
-                send_event(
-                    serde_json::to_string(&StreamErrorEvent {
-                        event: "error",
-                        error: error_message,
-                    })
-                    .unwrap_or_default(),
-                );
-                send_event(
-                    serde_json::to_string(&StreamDoneEvent { event: "done" }).unwrap_or_default(),
-                );
-                return;
             }
-        };
-        let runtime_context = permit.runtime_context();
+        }
+    }
+    result
+}
 
-        let _ = transcription_store
+async fn process_transcription_record_inner(
+    state: AppState,
+    record_id: String,
+    parsed: ParsedTranscriptionCreateRequest,
+    correlation_id: Option<String>,
+    workload_class: WorkloadClass,
+    event_tx: Option<mpsc::UnboundedSender<String>>,
+    audio_override: Option<Vec<u8>>,
+    attempt: Option<&StageExecutionContext>,
+    projection_attempt: Option<&RuntimeProjectionAttempt>,
+    batch_publication: Option<&ClaimedStage>,
+) -> Result<
+    (
+        TranscriptionRecord,
+        Option<crate::batch_runtime::types::RuntimeArtifact>,
+    ),
+    ApiError,
+> {
+    if let Some(attempt) = attempt {
+        attempt
+            .ensure_active()
+            .await
+            .map_err(|err| ApiError::internal(err.to_string()))?;
+    }
+    let runtime = state.runtime.clone();
+    let transcription_store = state.transcription_store.clone();
+    let send_event = |payload: String| {
+        if let Some(tx) = &event_tx {
+            let _ = tx.send(payload);
+        }
+    };
+    let permit = state
+        .acquire_owned_workload_permit(workload_class)
+        .await
+        .map_err(|_| ApiError::internal("Server is shutting down"))?;
+    let runtime_context = permit.runtime_context();
+
+    match projection_attempt {
+        Some(projection_attempt) => transcription_store
+            .update_processing_status_for_attempt(
+                record_id.clone(),
+                projection_attempt,
+                TranscriptionProcessingStatus::Processing,
+                None,
+            )
+            .await
+            .map_err(map_store_error)?
+            .ok_or_else(|| ApiError::internal("ASR attempt lost its route projection"))?,
+        None => transcription_store
             .update_processing_status(
                 record_id.clone(),
                 TranscriptionProcessingStatus::Processing,
                 None,
             )
-            .await;
-        let initial_progress = transcription_processing_progress();
-        let _ = transcription_store
+            .await
+            .map_err(map_store_error)?
+            .ok_or_else(|| ApiError::not_found("Transcription record not found"))?,
+    };
+    let initial_progress = transcription_processing_progress();
+    match projection_attempt {
+        Some(projection_attempt) => transcription_store
+            .update_processing_progress_for_attempt(
+                record_id.clone(),
+                projection_attempt,
+                Some(initial_progress.clone()),
+            )
+            .await
+            .map_err(map_store_error)?,
+        None => transcription_store
             .update_processing_progress(record_id.clone(), Some(initial_progress.clone()))
-            .await;
-        send_event(progress_event_payload(initial_progress));
-        send_event(serde_json::to_string(&StreamStartEvent { event: "start" }).unwrap_or_default());
+            .await
+            .map_err(map_store_error)?,
+    };
+    send_event(progress_event_payload(initial_progress));
+    send_event(serde_json::to_string(&StreamStartEvent { event: "start" }).unwrap_or_default());
 
-        let delta_tx = event_tx.clone();
-        let progress_tx = event_tx.clone();
-        let progress_store = transcription_store.clone();
-        let progress_record_id = record_id.clone();
-        let started = Instant::now();
-        let model_id = parsed.model_id.clone();
-        let aligner_model_id = parsed.aligner_model_id.clone();
-        let requested_language = parsed.language.clone();
-        let include_timestamps = parsed.include_timestamps;
-        let generate_summary = parsed.generate_summary;
-        let record_mode = parsed.record_mode;
-        let min_speakers = parsed.min_speakers;
-        let max_speakers = parsed.max_speakers;
-        let correlation_id_ref = correlation_id.clone();
-        let audio_bytes = match transcription_store.get_audio(record_id.clone()).await {
-            Ok(Some(audio)) => audio.audio_bytes,
-            Ok(None) => {
-                let message = "Transcription audio payload not found".to_string();
-                let _ = transcription_store
-                    .update_processing_status(
-                        record_id.clone(),
-                        TranscriptionProcessingStatus::Failed,
-                        Some(message.clone()),
-                    )
-                    .await;
-                send_event(
-                    serde_json::to_string(&StreamErrorEvent {
-                        event: "error",
-                        error: message,
-                    })
-                    .unwrap_or_default(),
-                );
-                send_event(
-                    serde_json::to_string(&StreamDoneEvent { event: "done" }).unwrap_or_default(),
-                );
-                return;
-            }
-            Err(err) => {
-                let message = format!("Failed to read transcription audio payload: {err}");
-                let _ = transcription_store
-                    .update_processing_status(
-                        record_id.clone(),
-                        TranscriptionProcessingStatus::Failed,
-                        Some(message.clone()),
-                    )
-                    .await;
-                send_event(
-                    serde_json::to_string(&StreamErrorEvent {
-                        event: "error",
-                        error: message,
-                    })
-                    .unwrap_or_default(),
-                );
-                send_event(
-                    serde_json::to_string(&StreamDoneEvent { event: "done" }).unwrap_or_default(),
-                );
-                return;
-            }
-        };
-
-        // Keep transcription processing unbounded by wall-clock timeout so
-        // valid long jobs can finish and persist successfully.
-        let generation_result = match record_mode {
-            TranscriptionRecordMode::Transcription => {
-                generate_transcription_artifacts(
-                    runtime.clone(),
-                    audio_bytes.as_slice(),
-                    model_id.as_deref(),
-                    aligner_model_id.as_deref(),
-                    requested_language.as_deref(),
-                    include_timestamps,
-                    correlation_id_ref.as_deref(),
-                    runtime_context,
-                    move |delta| {
-                        if let Some(tx) = &delta_tx {
-                            let _ = tx.send(
-                                serde_json::to_string(&StreamDeltaEvent {
-                                    event: "delta",
-                                    delta,
-                                })
-                                .unwrap_or_default(),
-                            );
-                        }
-                    },
-                    move |progress| {
-                        if let Some(tx) = &progress_tx {
-                            let _ = tx.send(progress_event_payload(progress.clone()));
-                        }
-                        let store = progress_store.clone();
-                        let id = progress_record_id.clone();
-                        tokio::spawn(async move {
-                            let _ = store.update_processing_progress(id, Some(progress)).await;
-                        });
-                    },
-                )
+    let audio_bytes = match audio_override {
+        Some(audio_bytes) => audio_bytes,
+        None => {
+            transcription_store
+                .get_audio(record_id.clone())
                 .await
-            }
-            TranscriptionRecordMode::SpeakerAttributedAsr => {
-                let saa_progress_tx = progress_tx.clone();
-                let saa_progress_store = progress_store.clone();
-                let saa_progress_record_id = progress_record_id.clone();
-                generate_speaker_attributed_asr_artifacts(
-                    runtime.clone(),
-                    audio_bytes.as_slice(),
-                    model_id.as_deref(),
-                    requested_language.as_deref(),
-                    min_speakers,
-                    max_speakers,
-                    move |progress| {
-                        if let Some(tx) = &saa_progress_tx {
-                            let _ = tx.send(progress_event_payload(progress.clone()));
-                        }
-                        let store = saa_progress_store.clone();
-                        let id = saa_progress_record_id.clone();
-                        tokio::spawn(async move {
-                            let _ = store.update_processing_progress(id, Some(progress)).await;
-                        });
-                    },
-                )
-                .await
-            }
-        };
-
-        match generation_result {
-            Ok(artifacts) => {
-                let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-                let rtf = if artifacts.duration_secs > 0.0 {
-                    Some((elapsed_ms / 1000.0) / artifacts.duration_secs)
-                } else {
-                    None
-                };
-                let (summary_status, summary_model_id) =
-                    initial_summary_state(artifacts.text.as_str(), generate_summary);
-
-                match transcription_store
-                    .complete_record(
-                        record_id.clone(),
-                        CompleteTranscriptionRecord {
-                            transcription_mode: artifacts.transcription_mode,
-                            model_id,
-                            aligner_model_id: artifacts.aligner_model_id,
-                            language: artifacts.language,
-                            duration_secs: Some(artifacts.duration_secs),
-                            processing_time_ms: elapsed_ms,
-                            rtf,
-                            transcription: artifacts.text,
-                            segments: artifacts.segments,
-                            words: artifacts.words,
-                            speaker_attributed_text: artifacts.speaker_attributed_text,
-                            speaker_turns: artifacts.speaker_turns,
-                            saa_status: artifacts.saa_status,
-                            saa_warnings: artifacts.saa_warnings,
-                            summary_status,
-                            summary_model_id,
-                            summary_text: None,
-                            summary_error: None,
-                            summary_updated_at: None,
-                        },
-                    )
-                    .await
-                {
-                    Ok(Some(record)) => {
-                        maybe_spawn_summary_generation(
-                            state.clone(),
-                            &record,
-                            correlation_id.clone(),
-                        );
-                        send_event(
-                            serde_json::to_string(&StreamFinalEvent {
-                                event: "final",
-                                record,
-                            })
-                            .unwrap_or_default(),
-                        );
-                    }
-                    Ok(None) => {
-                        send_event(
-                            serde_json::to_string(&StreamErrorEvent {
-                                event: "error",
-                                error: "Transcription record not found".to_string(),
-                            })
-                            .unwrap_or_default(),
-                        );
-                    }
-                    Err(err) => {
-                        let message = format!("Failed to save transcription record: {err}");
-                        let _ = transcription_store
-                            .update_processing_status(
-                                record_id.clone(),
-                                TranscriptionProcessingStatus::Failed,
-                                Some(message.clone()),
-                            )
-                            .await;
-                        send_event(
-                            serde_json::to_string(&StreamErrorEvent {
-                                event: "error",
-                                error: message,
-                            })
-                            .unwrap_or_default(),
-                        );
-                    }
-                }
-            }
-            Err(err) => {
-                let _ = transcription_store
-                    .update_processing_status(
-                        record_id.clone(),
-                        TranscriptionProcessingStatus::Failed,
-                        Some(err.message.clone()),
-                    )
-                    .await;
-                send_event(
-                    serde_json::to_string(&StreamErrorEvent {
-                        event: "error",
-                        error: err.message,
-                    })
-                    .unwrap_or_default(),
-                );
-            }
+                .map_err(map_store_error)?
+                .ok_or_else(|| ApiError::not_found("Transcription audio payload not found"))?
+                .audio_bytes
         }
+    };
+    let delta_tx = event_tx.clone();
+    let progress_tx = event_tx.clone();
+    let progress_store = transcription_store.clone();
+    let progress_record_id = record_id.clone();
+    let progress_attempt = projection_attempt.cloned();
+    let started = Instant::now();
+    let model_id = parsed.model_id.clone();
+    let aligner_model_id = parsed.aligner_model_id.clone();
+    let requested_language = parsed.language.clone();
+    let generate_summary = parsed.generate_summary;
 
-        send_event(serde_json::to_string(&StreamDoneEvent { event: "done" }).unwrap_or_default());
-    });
+    // Keep transcription processing unbounded by wall-clock timeout so valid
+    // long jobs can finish and persist successfully.
+    let artifacts = match parsed.record_mode {
+        TranscriptionRecordMode::Transcription => {
+            generate_transcription_artifacts(
+                runtime.clone(),
+                audio_bytes.as_slice(),
+                model_id.as_deref(),
+                aligner_model_id.as_deref(),
+                requested_language.as_deref(),
+                parsed.include_timestamps,
+                correlation_id.as_deref(),
+                runtime_context,
+                move |delta| {
+                    if let Some(tx) = &delta_tx {
+                        let _ = tx.send(
+                            serde_json::to_string(&StreamDeltaEvent {
+                                event: "delta",
+                                delta,
+                            })
+                            .unwrap_or_default(),
+                        );
+                    }
+                },
+                move |progress| {
+                    if let Some(tx) = &progress_tx {
+                        let _ = tx.send(progress_event_payload(progress.clone()));
+                    }
+                    let store = progress_store.clone();
+                    let id = progress_record_id.clone();
+                    let attempt = progress_attempt.clone();
+                    tokio::spawn(async move {
+                        let _ = match attempt.as_ref() {
+                            Some(attempt) => {
+                                store
+                                    .update_processing_progress_for_attempt(
+                                        id,
+                                        attempt,
+                                        Some(progress),
+                                    )
+                                    .await
+                            }
+                            None => store.update_processing_progress(id, Some(progress)).await,
+                        };
+                    });
+                },
+            )
+            .await?
+        }
+        TranscriptionRecordMode::SpeakerAttributedAsr => {
+            generate_speaker_attributed_asr_artifacts(
+                runtime,
+                audio_bytes.as_slice(),
+                model_id.as_deref(),
+                requested_language.as_deref(),
+                parsed.min_speakers,
+                parsed.max_speakers,
+                move |progress| {
+                    if let Some(tx) = &progress_tx {
+                        let _ = tx.send(progress_event_payload(progress.clone()));
+                    }
+                    let store = progress_store.clone();
+                    let id = progress_record_id.clone();
+                    let attempt = progress_attempt.clone();
+                    tokio::spawn(async move {
+                        let _ = match attempt.as_ref() {
+                            Some(attempt) => {
+                                store
+                                    .update_processing_progress_for_attempt(
+                                        id,
+                                        attempt,
+                                        Some(progress),
+                                    )
+                                    .await
+                            }
+                            None => store.update_processing_progress(id, Some(progress)).await,
+                        };
+                    });
+                },
+            )
+            .await?
+        }
+    };
+
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let rtf =
+        (artifacts.duration_secs > 0.0).then_some((elapsed_ms / 1000.0) / artifacts.duration_secs);
+    let (summary_status, summary_model_id) =
+        initial_summary_state(artifacts.text.as_str(), generate_summary);
+    if let Some(attempt) = attempt {
+        attempt
+            .ensure_active()
+            .await
+            .map_err(|err| ApiError::internal(err.to_string()))?;
+    }
+    let completion = CompleteTranscriptionRecord {
+        transcription_mode: artifacts.transcription_mode,
+        model_id,
+        aligner_model_id: artifacts.aligner_model_id,
+        language: artifacts.language,
+        duration_secs: Some(artifacts.duration_secs),
+        processing_time_ms: elapsed_ms,
+        rtf,
+        transcription: artifacts.text,
+        segments: artifacts.segments,
+        words: artifacts.words,
+        speaker_attributed_text: artifacts.speaker_attributed_text,
+        speaker_turns: artifacts.speaker_turns,
+        saa_status: artifacts.saa_status,
+        saa_warnings: artifacts.saa_warnings,
+        summary_status,
+        summary_model_id,
+        summary_text: None,
+        summary_error: None,
+        summary_updated_at: None,
+    };
+    let output_artifact = match batch_publication {
+        Some(claimed) => Some(
+            create_transcript_runtime_artifact(
+                state.batch_runtime_store.clone(),
+                claimed,
+                &record_id,
+                &completion,
+                attempt,
+            )
+            .await
+            .map_err(|err| ApiError::internal(err.to_string()))?,
+        ),
+        None => None,
+    };
+    if let Some(attempt) = attempt {
+        attempt
+            .ensure_active()
+            .await
+            .map_err(|err| ApiError::internal(err.to_string()))?;
+    }
+    let record = match projection_attempt {
+        Some(projection_attempt) => {
+            transcription_store
+                .complete_record_for_attempt(record_id, projection_attempt, completion)
+                .await
+        }
+        None => {
+            transcription_store
+                .complete_record(record_id, completion)
+                .await
+        }
+    }
+    .map_err(map_store_error)?
+    .ok_or_else(|| ApiError::internal("ASR attempt lost its route projection"))?;
+    maybe_spawn_summary_generation(state, &record, correlation_id);
+    Ok((record, output_artifact))
 }
 
 async fn generate_transcription_artifacts<F, P>(
@@ -1757,6 +1948,14 @@ fn map_store_error(err: anyhow::Error) -> ApiError {
     ApiError::internal(format!("Transcription storage error: {err}"))
 }
 
+fn map_media_ingest_error(err: MediaIngestError) -> ApiError {
+    if err.is_invalid_input() {
+        ApiError::bad_request(err.to_string())
+    } else {
+        ApiError::internal(format!("Transcription media ingest error: {err}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::{
@@ -1768,11 +1967,12 @@ mod tests {
     use izwi_core::{AsrProgress, AsrProgressPhase};
 
     use super::{
-        alignments_to_word_records, build_segment_records, initial_summary_state,
+        alignments_to_word_records, asr_queue_class, build_segment_records, initial_summary_state,
         multipart_field_api_error, parse_bool, parse_create_request, progress_event_payload,
         sanitize_summary_output, should_retry_transcription_summary_generation,
         transcription_summary_messages, transcription_summary_params,
-        validate_batch_transcription_model, TranscriptionSummaryStatus, TranscriptionWordRecord,
+        validate_batch_transcription_model, QueueClass, TranscriptionSummaryStatus,
+        TranscriptionWordRecord,
     };
 
     fn wav_bytes() -> Vec<u8> {
@@ -1784,6 +1984,12 @@ mod tests {
     fn wav_data_url(content_type: &str) -> String {
         let b64 = base64::engine::general_purpose::STANDARD.encode(wav_bytes());
         format!("data:{content_type};base64, {b64}\n")
+    }
+
+    #[test]
+    fn durable_asr_uses_a_separate_queue_for_long_form_audio() {
+        assert_eq!(asr_queue_class(299.999), QueueClass::BatchAsr);
+        assert_eq!(asr_queue_class(300.0), QueueClass::LongFormAsr);
     }
 
     #[tokio::test]

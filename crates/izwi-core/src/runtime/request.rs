@@ -33,10 +33,8 @@ impl Default for RequestPriority {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeStreamPolicy {
     FailOnFull,
-    BlockWithDeadline,
-    DropOldest,
-    Coalesce,
-    Sample,
+    BlockWithDeadline { timeout_ms: u64 },
+    DropNewest,
 }
 
 impl Default for RuntimeStreamPolicy {
@@ -49,10 +47,10 @@ impl From<RuntimeStreamPolicy> for EngineStreamPolicy {
     fn from(policy: RuntimeStreamPolicy) -> Self {
         match policy {
             RuntimeStreamPolicy::FailOnFull => Self::FailOnFull,
-            RuntimeStreamPolicy::BlockWithDeadline => Self::BlockWithDeadline,
-            RuntimeStreamPolicy::DropOldest => Self::DropOldest,
-            RuntimeStreamPolicy::Coalesce => Self::Coalesce,
-            RuntimeStreamPolicy::Sample => Self::Sample,
+            RuntimeStreamPolicy::BlockWithDeadline { timeout_ms } => {
+                Self::BlockWithDeadline { timeout_ms }
+            }
+            RuntimeStreamPolicy::DropNewest => Self::DropNewest,
         }
     }
 }
@@ -585,7 +583,7 @@ mod tests {
             .with_correlation_id(Some("corr-1".to_string()))
             .with_priority(RequestPriority::Interactive)
             .with_deadline(Some(deadline))
-            .with_stream_policy(RuntimeStreamPolicy::Coalesce)
+            .with_stream_policy(RuntimeStreamPolicy::DropNewest)
             .with_workload_class(WorkloadClass::Streaming);
 
         assert_eq!(envelope.request_id, "req-1");
@@ -594,7 +592,7 @@ mod tests {
         assert_eq!(envelope.correlation_id.as_deref(), Some("corr-1"));
         assert_eq!(envelope.priority, RequestPriority::Interactive);
         assert_eq!(envelope.deadline, Some(deadline));
-        assert_eq!(envelope.stream_policy, RuntimeStreamPolicy::Coalesce);
+        assert_eq!(envelope.stream_policy, RuntimeStreamPolicy::DropNewest);
         assert_eq!(envelope.workload_class, WorkloadClass::Streaming);
     }
 

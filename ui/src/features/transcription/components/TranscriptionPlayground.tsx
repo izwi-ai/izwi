@@ -35,12 +35,16 @@ import {
   LIVE_MIC_PCM_FRAME_SIZE,
   type ProcessAudioOptions,
   type TranscriptionPlaygroundProps,
+  type TranscriptionRealtimeV3ServerEnvelope,
+  buildTranscriptionRealtimeV3SessionStart,
   buildTranscriptionRealtimeWebSocketUrl,
   encodeLiveMicChunk,
   encodeTranscriptionRealtimePcm16Frame,
   formatAudioDuration,
   formatCreatedAt,
   isTranscriptionRealtimeServerEvent,
+  isTranscriptionRealtimeV3ServerEnvelope,
+  isValidTranscriptionRealtimeV3Successor,
   normalizeSummaryStatus,
   summaryStatusLabel,
   summaryStatusTone,
@@ -144,6 +148,8 @@ export function TranscriptionPlayground({
   const liveMicWsReadyRef = useRef(false);
   const liveMicSessionRef = useRef(0);
   const liveMicInputFrameSeqRef = useRef(0);
+  const liveMicV3EventRef =
+    useRef<TranscriptionRealtimeV3ServerEnvelope | null>(null);
   const liveMicAudioContextRef = useRef<AudioContext | null>(null);
   const liveMicAudioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const liveMicProcessorRef = useRef<ScriptProcessorNode | null>(null);
@@ -589,6 +595,7 @@ export function TranscriptionPlayground({
     stopLiveMicAudioPipeline();
     liveMicWsReadyRef.current = false;
     liveMicInputFrameSeqRef.current = 0;
+    liveMicV3EventRef.current = null;
     const ws = liveMicWsRef.current;
     liveMicWsRef.current = null;
     if (
@@ -780,6 +787,7 @@ export function TranscriptionPlayground({
       ws.binaryType = "arraybuffer";
       liveMicWsRef.current = ws;
       liveMicWsReadyRef.current = false;
+      liveMicV3EventRef.current = null;
 
       ws.onopen = () => {
         if (liveMicSessionRef.current !== recordingSession) {
@@ -791,11 +799,12 @@ export function TranscriptionPlayground({
           return;
         }
         ws.send(
-          JSON.stringify({
-            type: "session_start",
-            model_id: selectedModel || undefined,
-            language: selectedLanguage,
-          }),
+          JSON.stringify(
+            buildTranscriptionRealtimeV3SessionStart(
+              selectedModel,
+              selectedLanguage,
+            ),
+          ),
         );
       };
 
@@ -816,11 +825,76 @@ export function TranscriptionPlayground({
           return;
         }
 
+        if (isTranscriptionRealtimeV3ServerEnvelope(parsed)) {
+          if (
+            !isValidTranscriptionRealtimeV3Successor(
+              liveMicV3EventRef.current,
+              parsed,
+            )
+          ) {
+            setError("Realtime transcription event sequence was invalid");
+            liveMicWsReadyRef.current = false;
+            try {
+              ws.close(1002, "invalid_event_sequence");
+            } catch {
+              // Best effort protocol close.
+            }
+            return;
+          }
+          liveMicV3EventRef.current = parsed;
+
+          switch (parsed.type) {
+            case "session_ready":
+              if (
+                parsed.data.accepted_version === 3 &&
+                parsed.data.resumable === false
+              ) {
+                liveMicWsReadyRef.current = true;
+              }
+              return;
+            case "session_started":
+            case "audio_accepted":
+            case "audio_gap":
+            case "pong":
+              return;
+            case "transcript_partial":
+            case "transcript_final":
+              setTranscription(parsed.data.text || "");
+              setDetectedLanguage(parsed.data.language || null);
+              return;
+            case "transcript_stable":
+            case "transcript_correction":
+              setTranscription(parsed.data.text || "");
+              return;
+            case "recoverable_error":
+              setError(parsed.data.message || "Realtime transcription error");
+              return;
+            case "fatal_error":
+              liveMicWsReadyRef.current = false;
+              setError(parsed.data.message || "Realtime transcription failed");
+              return;
+            case "closing":
+              liveMicWsReadyRef.current = false;
+              return;
+            case "closed":
+              liveMicWsReadyRef.current = false;
+              setIsStreaming(false);
+              try {
+                ws.close(1000, "session_complete");
+              } catch {
+                // Best effort protocol close after the terminal event.
+              }
+              return;
+          }
+        }
+
         switch (parsed.type) {
           case "session_ready":
-            liveMicWsReadyRef.current = true;
+            // The v3 client waits for its negotiated typed SessionReady. A
+            // legacy SessionStarted below remains a compatibility fallback.
             break;
           case "session_started":
+            liveMicWsReadyRef.current = true;
             break;
           case "transcript_partial":
             setTranscription(parsed.text || "");
@@ -830,6 +904,14 @@ export function TranscriptionPlayground({
             setError(parsed.message || "Realtime transcription error");
             break;
           case "session_done":
+            liveMicWsReadyRef.current = false;
+            setIsStreaming(false);
+            try {
+              ws.close(1000, "session_complete");
+            } catch {
+              // Best effort compatibility close.
+            }
+            break;
           case "pong":
             break;
         }
@@ -839,7 +921,12 @@ export function TranscriptionPlayground({
         if (liveMicWsRef.current === ws) {
           liveMicWsRef.current = null;
         }
+        if (liveMicSessionRef.current === recordingSession) {
+          liveMicSessionRef.current = 0;
+        }
         liveMicWsReadyRef.current = false;
+        liveMicV3EventRef.current = null;
+        setIsStreaming(false);
       };
 
       ws.onerror = () => {
@@ -942,9 +1029,8 @@ export function TranscriptionPlayground({
       };
 
       mediaRecorder.onstop = async () => {
-        liveMicSessionRef.current = 0;
-        abortLiveMicStream();
-        setIsStreaming(false);
+        stopLiveMicAudioPipeline();
+        liveMicWsReadyRef.current = false;
         const audioBlob = new Blob(audioChunksRef.current, {
           type: mediaRecorder?.mimeType || "audio/webm",
         });
@@ -969,11 +1055,11 @@ export function TranscriptionPlayground({
     requireTimestampAligner,
     selectedLanguage,
     selectedModel,
+    stopLiveMicAudioPipeline,
   ]);
 
   const stopRecording = useCallback(() => {
     if (mediaRecorderRef.current && isRecording) {
-      liveMicSessionRef.current = 0;
       const ws = liveMicWsRef.current;
       if (ws && ws.readyState === WebSocket.OPEN) {
         try {
@@ -981,13 +1067,22 @@ export function TranscriptionPlayground({
         } catch {
           // Best effort.
         }
+        window.setTimeout(() => {
+          if (liveMicWsRef.current === ws) {
+            try {
+              ws.close(1000, "session_stop_timeout");
+            } catch {
+              // Best effort timeout cleanup.
+            }
+          }
+        }, 6000);
       }
-      abortLiveMicStream();
-      setIsStreaming(false);
+      stopLiveMicAudioPipeline();
+      liveMicWsReadyRef.current = false;
       mediaRecorderRef.current.stop();
       setIsRecording(false);
     }
-  }, [abortLiveMicStream, isRecording]);
+  }, [isRecording, stopLiveMicAudioPipeline]);
 
   const handleFileUpload = async (
     event: React.ChangeEvent<HTMLInputElement>,
