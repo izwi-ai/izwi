@@ -541,6 +541,27 @@ impl MediaIngestService {
         delete_media_object(&self.media_storage, Some(key)).await
     }
 
+    pub async fn persist_generated_audio(
+        &self,
+        record_id: String,
+        filename: Option<&str>,
+        content_type: &str,
+        bytes: &[u8],
+        route: &str,
+    ) -> Result<String, MediaIngestError> {
+        let mut metadata = HookMetadata::new();
+        metadata.insert("route".to_string(), route.to_string());
+        self.persist(
+            MediaNamespace::GeneratedSpeech,
+            record_id,
+            filename,
+            content_type,
+            bytes,
+            metadata,
+        )
+        .await
+    }
+
     async fn prepare_audio(
         &self,
         source_bytes: Vec<u8>,

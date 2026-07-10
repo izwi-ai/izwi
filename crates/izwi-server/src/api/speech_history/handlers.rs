@@ -21,8 +21,8 @@ use crate::api::saved_voices::resolve_saved_voice_reference;
 use crate::api::tts_long_form::{expand_generation_requests_for_long_form, generate_long_form_tts};
 use crate::batch_runtime::{
     store::{
-        sha256_hex, BatchRuntimeStore, NewIdempotencyRecord, NewJobStage, NewJobStageDispatch,
-        NewMediaAsset, NewRuntimeArtifact, NewRuntimeJob, NewStageOutputArtifact, NewTextAsset,
+        sha256_hex, NewIdempotencyRecord, NewJobStage, NewJobStageDispatch, NewMediaAsset,
+        NewRuntimeArtifact, NewRuntimeJob, NewStageOutputArtifact, NewTextAsset,
     },
     types::{
         ClaimedStage, QueueClass, RuntimeArtifactKind, RuntimeArtifactRole, RuntimeJobKind,
@@ -54,7 +54,7 @@ use izwi_hooks::Principal;
 const HISTORY_LIST_LIMIT: usize = 200;
 const DEFAULT_STREAM_EVENT_QUEUE_CAPACITY: usize = 32;
 const STREAM_CLIENT_DISCONNECTED_MESSAGE: &str = "Streaming client disconnected before completion";
-const BATCH_TTS_STAGE_KIND: &str = "tts_synthesize";
+pub(crate) const BATCH_TTS_STAGE_KIND: &str = "tts_synthesize";
 const REFERENCE_AUDIO_UPLOAD_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Deserialize, Default)]
@@ -459,7 +459,7 @@ async fn create_record(
         return Ok((StatusCode::ACCEPTED, Json(placeholder)).into_response());
     }
 
-    let record = synthesize_record_internal(
+    let (record, _) = synthesize_record_internal(
         &state,
         &ctx,
         req,
@@ -469,6 +469,7 @@ async fn create_record(
         input_text,
         None,
         WorkloadClass::Online,
+        None,
         None,
         None,
     )
@@ -874,7 +875,7 @@ async fn execute_batch_tts_stage(
             .await;
     }
 
-    let record = match synthesize_record_internal(
+    let (_record, output_artifact) = match synthesize_record_internal(
         state,
         &ctx,
         request.request,
@@ -886,6 +887,7 @@ async fn execute_batch_tts_stage(
         WorkloadClass::Batch,
         attempt.as_ref(),
         projection_attempt.as_ref(),
+        Some(&claimed),
     )
     .await
     {
@@ -919,15 +921,8 @@ async fn execute_batch_tts_stage(
         }
     };
 
-    let output_artifact = create_speech_audio_runtime_artifact(
-        state.batch_runtime_store.clone(),
-        state,
-        &claimed,
-        request.route_kind,
-        &record,
-        attempt.as_ref(),
-    )
-    .await?;
+    let output_artifact = output_artifact
+        .ok_or_else(|| anyhow::anyhow!("TTS stage did not publish its primary audio"))?;
 
     Ok(StageExecutionOutcome {
         output_artifact_ids: vec![output_artifact.id],
@@ -982,30 +977,37 @@ async fn hydrate_batch_reference_audio(
     anyhow::bail!("TTS batch request is missing its reference-audio input artifact")
 }
 
-async fn create_speech_audio_runtime_artifact(
-    batch_store: Arc<BatchRuntimeStore>,
+async fn publish_speech_audio_runtime_artifact(
     state: &AppState,
     claimed: &ClaimedStage,
     route_kind: SpeechRouteKind,
-    record: &SpeechHistoryRecord,
+    record_id: &str,
+    completion: &CompleteSpeechHistoryRecord,
     attempt: Option<&StageExecutionContext>,
-) -> anyhow::Result<crate::batch_runtime::types::RuntimeArtifact> {
-    let audio = state
-        .speech_history_store
-        .get_audio(route_kind, record.id.clone())
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("Generated speech audio not found"))?;
-    let inspection = inspect_audio_bytes(audio.audio_bytes.as_slice())
+) -> anyhow::Result<(crate::batch_runtime::types::RuntimeArtifact, String)> {
+    let inspection = inspect_audio_bytes(completion.audio_bytes.as_slice())
         .context("Failed to inspect generated speech audio")?;
-    let media_asset = batch_store
+    let storage_key = state
+        .media_ingest
+        .persist_generated_audio(
+            format!("{record_id}-output-{}", uuid::Uuid::new_v4()),
+            completion.audio_filename.as_deref(),
+            &completion.audio_mime_type,
+            &completion.audio_bytes,
+            route_kind.as_db_value(),
+        )
+        .await
+        .context("Failed to persist generated speech output")?;
+    let media_asset = match state
+        .batch_runtime_store
         .create_media_asset(NewMediaAsset {
             asset_kind: "audio_generated".to_string(),
             storage_namespace: "generated_speech".to_string(),
-            storage_key: audio.audio_storage_path,
-            content_type: audio.audio_mime_type,
-            filename: audio.audio_filename,
-            size_bytes: audio.audio_bytes.len() as u64,
-            sha256: Some(sha256_hex(audio.audio_bytes.as_slice())),
+            storage_key: storage_key.clone(),
+            content_type: completion.audio_mime_type.clone(),
+            filename: completion.audio_filename.clone(),
+            size_bytes: completion.audio_bytes.len() as u64,
+            sha256: Some(sha256_hex(completion.audio_bytes.as_slice())),
             duration_secs: Some(inspection.duration_secs as f64),
             sample_rate_hz: Some(inspection.sample_rate),
             channel_count: Some(1),
@@ -1016,11 +1018,18 @@ async fn create_speech_audio_runtime_artifact(
             scan_status: "not_scanned".to_string(),
             retention_policy: "default".to_string(),
             metadata_json: serde_json::json!({
-                "route_record_id": record.id.clone(),
+                "route_record_id": record_id,
                 "route_kind": route_kind.as_db_value()
             }),
         })
-        .await?;
+        .await
+    {
+        Ok(asset) => asset,
+        Err(err) => {
+            let _ = state.media_ingest.delete_object(&storage_key).await;
+            return Err(err);
+        }
+    };
 
     let artifact = NewRuntimeArtifact {
         job_id: claimed.job.id.clone(),
@@ -1035,15 +1044,15 @@ async fn create_speech_audio_runtime_artifact(
         size_bytes: Some(media_asset.size_bytes),
         sha256: media_asset.sha256,
         metadata_json: serde_json::json!({
-            "route_record_id": record.id.clone(),
+            "route_record_id": record_id,
             "route_kind": route_kind.as_db_value(),
-            "duration_secs": record.audio_duration_secs,
-            "tokens_generated": record.tokens_generated
+            "duration_secs": completion.audio_duration_secs,
+            "tokens_generated": completion.tokens_generated
         }),
         retention_policy: "default".to_string(),
     };
-    if let Some(attempt) = attempt {
-        return attempt
+    let artifact = if let Some(attempt) = attempt {
+        attempt
             .publish_output_artifact(NewStageOutputArtifact {
                 publication_key: "primary_audio".to_string(),
                 artifact_kind: artifact.artifact_kind,
@@ -1058,9 +1067,11 @@ async fn create_speech_audio_runtime_artifact(
                 metadata_json: artifact.metadata_json,
                 retention_policy: artifact.retention_policy,
             })
-            .await;
-    }
-    batch_store.create_artifact(artifact).await
+            .await?
+    } else {
+        state.batch_runtime_store.create_artifact(artifact).await?
+    };
+    Ok((artifact, storage_key))
 }
 
 pub(crate) async fn synthesize_record(
@@ -1090,8 +1101,10 @@ pub(crate) async fn synthesize_record(
         WorkloadClass::Online,
         None,
         None,
+        None,
     )
     .await
+    .map(|(record, _)| record)
 }
 
 async fn synthesize_record_internal(
@@ -1106,7 +1119,14 @@ async fn synthesize_record_internal(
     workload_class: WorkloadClass,
     attempt: Option<&StageExecutionContext>,
     projection_attempt: Option<&RuntimeProjectionAttempt>,
-) -> Result<SpeechHistoryRecord, ApiError> {
+    batch_publication: Option<&ClaimedStage>,
+) -> Result<
+    (
+        SpeechHistoryRecord,
+        Option<crate::batch_runtime::types::RuntimeArtifact>,
+    ),
+    ApiError,
+> {
     if let Some(attempt) = attempt {
         attempt
             .ensure_active()
@@ -1156,7 +1176,7 @@ async fn synthesize_record_internal(
     }
 
     if let Some(record_id) = target_record_id {
-        let completion = CompleteSpeechHistoryRecord {
+        let mut completion = CompleteSpeechHistoryRecord {
             model_id: Some(model_id),
             speaker: req.speaker,
             language: req.language,
@@ -1172,8 +1192,32 @@ async fn synthesize_record_internal(
             audio_mime_type: AudioEncoder::content_type(AudioFormat::Wav).to_string(),
             audio_filename: Some(default_audio_filename(route_kind, "wav")),
             audio_bytes: encoded_audio,
+            preexisting_audio_storage_path: None,
         };
-        return match projection_attempt {
+        let output_artifact = match batch_publication {
+            Some(claimed) => {
+                let (artifact, storage_key) = publish_speech_audio_runtime_artifact(
+                    state,
+                    claimed,
+                    route_kind,
+                    &record_id,
+                    &completion,
+                    attempt,
+                )
+                .await
+                .map_err(|err| ApiError::internal(err.to_string()))?;
+                completion.preexisting_audio_storage_path = Some(storage_key);
+                Some(artifact)
+            }
+            None => None,
+        };
+        if let Some(attempt) = attempt {
+            attempt
+                .ensure_active()
+                .await
+                .map_err(|err| ApiError::internal(err.to_string()))?;
+        }
+        let record = match projection_attempt {
             Some(projection_attempt) => {
                 state
                     .speech_history_store
@@ -1193,7 +1237,8 @@ async fn synthesize_record_internal(
             }
         }
         .map_err(map_store_error)?
-        .ok_or_else(|| ApiError::internal("TTS attempt lost its route projection"));
+        .ok_or_else(|| ApiError::internal("TTS attempt lost its route projection"))?;
+        return Ok((record, output_artifact));
     }
 
     state
@@ -1220,6 +1265,7 @@ async fn synthesize_record_internal(
         })
         .await
         .map_err(map_store_error)
+        .map(|record| (record, None))
 }
 
 async fn stream_record_creation(
@@ -1566,6 +1612,7 @@ async fn stream_record_creation(
                                     .to_string(),
                                 audio_filename: Some(default_audio_filename(route_kind, "wav")),
                                 audio_bytes: wav_bytes,
+                                preexisting_audio_storage_path: None,
                             },
                         )
                         .await;

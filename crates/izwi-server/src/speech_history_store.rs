@@ -183,6 +183,8 @@ pub struct CompleteSpeechHistoryRecord {
     pub audio_mime_type: String,
     pub audio_filename: Option<String>,
     pub audio_bytes: Vec<u8>,
+    /// Attempt-owned output already persisted before the route projection is made ready.
+    pub preexisting_audio_storage_path: Option<String>,
 }
 
 #[derive(Clone)]
@@ -628,21 +630,29 @@ impl SpeechHistoryStore {
         let previous_audio_storage_path = fetch_audio_storage_path(db, route_kind, &record_id)
             .await?
             .flatten();
-        let storage_record_id = if attempt.is_some() {
-            format!("{record_id}-attempt-{}", new_uuid())
-        } else {
-            record_id.clone()
+        let preexisting_audio_storage_path =
+            sanitize_media_path(record.preexisting_audio_storage_path.as_deref());
+        let owns_next_audio_object = preexisting_audio_storage_path.is_none();
+        let next_audio_storage_path = match preexisting_audio_storage_path {
+            Some(path) => path,
+            None => {
+                let storage_record_id = if attempt.is_some() {
+                    format!("{record_id}-attempt-{}", new_uuid())
+                } else {
+                    record_id.clone()
+                };
+                persist_audio_object(
+                    &self.media_storage,
+                    MediaNamespace::GeneratedSpeech,
+                    storage_record_id,
+                    audio_filename.as_deref(),
+                    audio_mime_type.as_str(),
+                    &record.audio_bytes,
+                    metadata,
+                )
+                .await?
+            }
         };
-        let next_audio_storage_path = persist_audio_object(
-            &self.media_storage,
-            MediaNamespace::GeneratedSpeech,
-            storage_record_id,
-            audio_filename.as_deref(),
-            audio_mime_type.as_str(),
-            &record.audio_bytes,
-            metadata,
-        )
-        .await?;
 
         let mut update = speech_history_records::Entity::update_many()
             .col_expr(
@@ -726,19 +736,25 @@ impl SpeechHistoryStore {
         let result = match update.exec(db).await {
             Ok(result) => result,
             Err(err) => {
-                let _ = delete_media_object(
-                    &self.media_storage,
-                    Some(next_audio_storage_path.as_str()),
-                )
-                .await;
+                if owns_next_audio_object {
+                    let _ = delete_media_object(
+                        &self.media_storage,
+                        Some(next_audio_storage_path.as_str()),
+                    )
+                    .await;
+                }
                 return Err(err).context("Failed to complete speech history record");
             }
         };
 
         if result.rows_affected == 0 {
-            let _ =
-                delete_media_object(&self.media_storage, Some(next_audio_storage_path.as_str()))
-                    .await;
+            if owns_next_audio_object {
+                let _ = delete_media_object(
+                    &self.media_storage,
+                    Some(next_audio_storage_path.as_str()),
+                )
+                .await;
+            }
             return Ok(None);
         }
 
@@ -1153,6 +1169,7 @@ mod tests {
             audio_mime_type: "audio/wav".to_string(),
             audio_filename: Some("attempt.wav".to_string()),
             audio_bytes,
+            preexisting_audio_storage_path: None,
         }
     }
 
@@ -1322,6 +1339,7 @@ mod tests {
                     audio_mime_type: "audio/wav".to_string(),
                     audio_filename: Some("completed.wav".to_string()),
                     audio_bytes: vec![8, 9],
+                    preexisting_audio_storage_path: None,
                 },
             )
             .await
@@ -1339,6 +1357,56 @@ mod tests {
             .expect("audio should load")
             .expect("audio should exist");
         assert_eq!(audio.audio_bytes, vec![8, 9]);
+
+        clear_env();
+    }
+
+    #[tokio::test]
+    async fn completion_reuses_preexisting_attempt_audio() {
+        let _guard = env_lock();
+        let (_temp, store) = setup_store();
+
+        let pending = store
+            .create_record(NewSpeechHistoryRecord {
+                processing_status: SpeechHistoryProcessingStatus::Pending,
+                audio_bytes: Vec::new(),
+                audio_filename: None,
+                ..ready_record()
+            })
+            .await
+            .expect("pending record should create");
+        let audio_bytes = vec![8, 9, 10];
+        let storage_path = persist_audio_object(
+            &store.media_storage,
+            MediaNamespace::GeneratedSpeech,
+            format!("{}-published", pending.id),
+            Some("published.wav"),
+            "audio/wav",
+            &audio_bytes,
+            HookMetadata::new(),
+        )
+        .await
+        .expect("published audio should persist");
+        let mut completion = completed_record(audio_bytes.clone());
+        completion.preexisting_audio_storage_path = Some(storage_path.clone());
+
+        store
+            .complete_record(
+                SpeechRouteKind::TextToSpeech,
+                pending.id.clone(),
+                completion,
+            )
+            .await
+            .expect("record completion should succeed")
+            .expect("record should exist");
+
+        let stored = store
+            .get_audio(SpeechRouteKind::TextToSpeech, pending.id)
+            .await
+            .expect("stored audio should load")
+            .expect("stored audio should exist");
+        assert_eq!(stored.audio_storage_path, storage_path);
+        assert_eq!(stored.audio_bytes, audio_bytes);
 
         clear_env();
     }
